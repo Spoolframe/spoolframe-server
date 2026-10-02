@@ -18,7 +18,7 @@ mod servers;
 mod session;
 pub mod storage;
 
-pub use client::{Client, Device};
+pub use client::{Client, Device, ServersWatch};
 pub use error::SdkError;
 pub use link::{ConnectionState, StateWatch};
 pub use servers::ServerEntry;

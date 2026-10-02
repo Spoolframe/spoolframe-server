@@ -170,6 +170,43 @@ pub async fn user(listen: SocketAddr, command: UserCommand) -> Result<()> {
     result
 }
 
+/// Sync watch state with Plex now, or with `dry_run` print what would
+/// change, logged in as an admin.
+pub async fn plex_sync(listen: SocketAddr, dry_run: bool) -> Result<()> {
+    let login = connect(listen, None)
+        .await?
+        .login(admin_credentials()?)
+        .await
+        .map_err(api_error)?;
+    let api = connect(listen, Some(&login.token)).await?;
+    let result = api.plex_watch_sync(dry_run).await.map_err(api_error);
+    if let Err(e) = api.logout().await {
+        tracing::debug!(error = %e, "logout");
+    }
+    let report = result?;
+    let (pull, push) = if dry_run {
+        ("would pull", "would push")
+    } else {
+        ("pulled", "pushed")
+    };
+    for line in &report.pulled {
+        println!("{pull}  {line}");
+    }
+    for line in &report.pushed {
+        println!("{push}  {line}");
+    }
+    for line in &report.failed {
+        println!("failed  {line}");
+    }
+    println!(
+        "{} pulled, {} pushed, {} failed",
+        report.pulled.len(),
+        report.pushed.len(),
+        report.failed.len()
+    );
+    Ok(())
+}
+
 /// Print the server's status, logged in as an admin.
 pub async fn status(listen: SocketAddr) -> Result<()> {
     let login = connect(listen, None)

@@ -22,6 +22,7 @@ use spoolframe_media::Prober;
 use crate::artwork::ArtworkCache;
 use crate::auth::Auth;
 use crate::client::{self, ClientProtocol};
+use crate::encode::job::Jobs;
 use crate::playback::Playbacks;
 use crate::transcode::Transcoding;
 use crate::watch::Watch;
@@ -102,6 +103,8 @@ pub struct Services {
     pub watch: Arc<Watch>,
     /// The encoders the planner may use (P2-02).
     pub transcoding: Arc<Transcoding>,
+    /// Running encodes (P2-03).
+    pub jobs: Arc<Jobs>,
 }
 
 impl std::fmt::Debug for Services {
@@ -162,6 +165,18 @@ impl Server {
             .await
             .map_err(|e| bind_failed(e.to_string()))?;
 
+        // Idle playbacks end on their own, conversions with them.
+        let playbacks = Arc::downgrade(&services.playbacks);
+        let every = services.playbacks.sweep_every();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(playbacks) = playbacks.upgrade() else {
+                    return;
+                };
+                playbacks.sweep();
+            }
+        });
         let info = ServerInfo {
             name: name.to_owned(),
             endpoint_id: endpoint.id().to_string(),

@@ -60,7 +60,15 @@ pub struct Prober {
     ffprobe: PathBuf,
     timeout: Duration,
     cache: Mutex<HashMap<PathBuf, (Stamp, Arc<MediaDescriptor>)>>,
+    keyframes: Mutex<HashMap<PathBuf, (Stamp, Keyframes)>>,
 }
+
+/// A file's keyframe times, ms.
+type Keyframes = Arc<Vec<u64>>;
+
+/// How long listing a file's keyframes may take: it reads the whole file,
+/// which on a network mount is minutes for a large remux.
+const KEYFRAME_TIMEOUT: Duration = Duration::from_secs(600);
 
 impl Prober {
     /// How long one ffprobe run may take by default. Generous because the
@@ -73,6 +81,7 @@ impl Prober {
             ffprobe: ffprobe.into(),
             timeout,
             cache: Mutex::new(HashMap::new()),
+            keyframes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -147,6 +156,63 @@ impl Prober {
     }
 
     /// One ffprobe run. The process is killed if it outlives the timeout.
+    /// The times of the main video stream's keyframes, in milliseconds,
+    /// ascending: where a copied video can be cut (P2-05's HLS segments).
+    /// Read once per file from the packets' flags, without decoding, and
+    /// remembered until the file changes.
+    pub async fn keyframes(&self, path: &Path) -> Result<Keyframes, ProbeError> {
+        let stamp = stamp(path).await?;
+        if let Some((cached, times)) = self
+            .keyframes
+            .lock()
+            .expect("the cache lock is never held across a panic")
+            .get(path)
+            && *cached == stamp
+        {
+            return Ok(times.clone());
+        }
+        let mut cmd = tokio::process::Command::new(&self.ffprobe);
+        cmd.args(["-v", "error", "-select_streams", "v:0"])
+            .args([
+                "-show_entries",
+                "packet=pts_time,flags",
+                "-of",
+                "csv=p=0",
+                "-i",
+            ])
+            .arg(path)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = match tokio::time::timeout(KEYFRAME_TIMEOUT, cmd.output()).await {
+            Err(_) => {
+                return Err(ProbeError::TimedOut {
+                    path: path.to_owned(),
+                    after: KEYFRAME_TIMEOUT,
+                });
+            }
+            Ok(Err(source)) => {
+                return Err(ProbeError::Spawn {
+                    ffprobe: self.ffprobe.clone(),
+                    source,
+                });
+            }
+            Ok(Ok(output)) => output,
+        };
+        if !output.status.success() {
+            return Err(ProbeError::Failed {
+                path: path.to_owned(),
+                status: output.status.to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let times = Arc::new(keyframe_times(&String::from_utf8_lossy(&output.stdout)));
+        self.keyframes
+            .lock()
+            .expect("the cache lock is never held across a panic")
+            .insert(path.to_owned(), (stamp, times.clone()));
+        Ok(times)
+    }
+
     async fn run(&self, path: &Path) -> Result<FfProbe, ProbeError> {
         let mut cmd = tokio::process::Command::new(&self.ffprobe);
         cmd.args([
@@ -192,6 +258,25 @@ impl Prober {
     }
 }
 
+/// `pts_time,flags` lines (`12.345000,K__`) → the keyframes' times in ms,
+/// ascending.
+fn keyframe_times(csv: &str) -> Vec<u64> {
+    let mut times: Vec<u64> = csv
+        .lines()
+        .filter_map(|line| {
+            let (time, flags) = line.trim().split_once(',')?;
+            if !flags.starts_with('K') {
+                return None;
+            }
+            let seconds: f64 = time.parse().ok()?;
+            (seconds >= 0.0).then(|| (seconds * 1000.0).round() as u64)
+        })
+        .collect();
+    times.sort_unstable();
+    times.dedup();
+    times
+}
+
 async fn stamp(path: &Path) -> Result<Stamp, ProbeError> {
     let meta = tokio::fs::metadata(path)
         .await
@@ -211,4 +296,15 @@ async fn stamp(path: &Path) -> Result<Stamp, ProbeError> {
         modified: meta.modified().ok(),
         dir_modified,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keyframe_times;
+
+    #[test]
+    fn only_keyframes_count_in_order() {
+        let csv = "2.000000,K__\n0.040000,___\n0.000000,K__\nN/A,K__\n4.000000,K_D\n";
+        assert_eq!(keyframe_times(csv), [0, 2000, 4000]);
+    }
 }

@@ -51,6 +51,7 @@
     transcode {
       hardware = ${quote hardware};
       vaapi_device = ${quote cfg.transcode.vaapiDevice};
+      scratch_dir = "/var/cache/spoolframe/transcode";
     }
     ${cfg.extraConfig}
   '';
@@ -249,6 +250,9 @@ in {
         Group = "spoolframe";
         StateDirectory = lib.removePrefix "/var/lib/" cfg.stateDir;
         StateDirectoryMode = "0700";
+        # Encode output (P2-03): emptied by the server at start.
+        CacheDirectory = "spoolframe";
+        CacheDirectoryMode = "0700";
         LoadCredential = lib.optional (cfg.plex.tokenFile != null) "plex-token:${cfg.plex.tokenFile}";
         Restart = "on-failure";
         RestartSec = 2;

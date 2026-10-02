@@ -79,6 +79,9 @@ pub struct Show {
 pub struct Season {
     pub id: MediaId,
     pub show_id: MediaId,
+    /// The show's title, so a season shown alone needs no second request.
+    #[serde(default)]
+    pub show_title: Option<String>,
     /// The season number; 0 is specials.
     pub season: u32,
     pub title: String,
@@ -89,6 +92,10 @@ pub struct Season {
 pub struct Episode {
     pub id: MediaId,
     pub show_id: MediaId,
+    /// The show's title, so an episode shown alone (Continue watching)
+    /// needs no second request.
+    #[serde(default)]
+    pub show_title: Option<String>,
     pub season_id: MediaId,
     pub season: u32,
     pub episode: u32,
@@ -112,6 +119,9 @@ pub struct Artist {
 pub struct Album {
     pub id: MediaId,
     pub artist_id: MediaId,
+    /// The artist's name, for the same reason.
+    #[serde(default)]
+    pub artist_name: Option<String>,
     pub title: String,
     pub year: Option<u16>,
     pub artwork: Vec<Artwork>,
@@ -252,6 +262,7 @@ mod tests {
         round_trip(Season {
             id: media(MediaKind::Season, "21"),
             show_id: media(MediaKind::Show, "20"),
+            show_title: Some("The Expanse".into()),
             season: 1,
             title: "Season 1".into(),
             artwork: Vec::new(),
@@ -259,6 +270,7 @@ mod tests {
         round_trip(Episode {
             id: media(MediaKind::Episode, "22"),
             show_id: media(MediaKind::Show, "20"),
+            show_title: Some("The Expanse".into()),
             season_id: media(MediaKind::Season, "21"),
             season: 1,
             episode: 1,
@@ -277,6 +289,7 @@ mod tests {
         round_trip(Album {
             id: media(MediaKind::Album, "31"),
             artist_id: media(MediaKind::Artist, "30"),
+            artist_name: Some("Boards of Canada".into()),
             title: "Music Has the Right to Children".into(),
             year: Some(1998),
             artwork: poster(),

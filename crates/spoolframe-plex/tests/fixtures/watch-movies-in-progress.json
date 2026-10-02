@@ -1,0 +1,287 @@
+{
+    "MediaContainer": {
+        "size": 2,
+        "totalSize": 32,
+        "offset": 0,
+        "allowSync": true,
+        "art": "/:/resources/movie-fanart.jpg",
+        "identifier": "com.plexapp.plugins.library",
+        "librarySectionID": 2,
+        "librarySectionTitle": "Movies",
+        "librarySectionUUID": "900c68d5-f879-4227-9104-200ffeadddd3",
+        "mediaTagPrefix": "/system/bundle/media/flags/",
+        "mediaTagVersion": 1,
+        "sortAsc": true,
+        "thumb": "/:/resources/movie.png",
+        "title1": "Movies",
+        "title2": "All Movies",
+        "viewGroup": "movie",
+        "viewMode": 131122,
+        "Metadata": [
+            {
+                "ratingKey": "219079",
+                "key": "/library/metadata/219079",
+                "guid": "plex://movie/5d776824f54112001f5bbdd7",
+                "slug": "28-days-later",
+                "studio": "DNA Films",
+                "type": "movie",
+                "title": "28 Days Later",
+                "contentRating": "R",
+                "contentRatingAge": 16,
+                "summary": "Twenty-eight days after a killer virus was accidentally unleashed from a British research facility, a small group of London survivors are caught in a desperate struggle to protect themselves from the infected. Carried by animals and humans, the virus turns those it infects into homicidal maniacs -- and it's absolutely impossible to contain.",
+                "rating": 8.7,
+                "audienceRating": 8.5,
+                "viewOffset": 2186392,
+                "skipCount": 1,
+                "lastViewedAt": 1750648035,
+                "year": 2002,
+                "tagline": "The days are numbered.",
+                "thumb": "/library/metadata/219079/thumb/1784732318",
+                "art": "/library/metadata/219079/art/1784732318",
+                "duration": 6787296,
+                "originallyAvailableAt": "2002-11-01",
+                "addedAt": 1750440213,
+                "updatedAt": 1784732318,
+                "audienceRatingImage": "rottentomatoes://image.rating.upright",
+                "chapterSource": "media",
+                "primaryExtraKey": "/library/metadata/219080",
+                "ratingImage": "rottentomatoes://image.rating.ripe",
+                "Media": [
+                    {
+                        "id": 524536,
+                        "duration": 6787296,
+                        "bitrate": 34878,
+                        "width": 1920,
+                        "height": 1080,
+                        "aspectRatio": 1.78,
+                        "audioChannels": 6,
+                        "audioCodec": "dca-ma",
+                        "videoCodec": "h264",
+                        "videoResolution": "1080",
+                        "container": "mkv",
+                        "videoFrameRate": "24p",
+                        "audioProfile": "ma",
+                        "videoProfile": "high",
+                        "hasVoiceActivity": false,
+                        "Part": [
+                            {
+                                "id": 785814,
+                                "key": "/library/parts/785814/1665075857/file.mkv",
+                                "duration": 6787296,
+                                "file": "/slow/media/Movies/28 Days Later (2002)/28.Days.Later.2002.Remux-1080p.mkv",
+                                "size": 29591108340,
+                                "audioProfile": "ma",
+                                "container": "mkv",
+                                "indexes": "sd",
+                                "videoProfile": "high"
+                            }
+                        ]
+                    }
+                ],
+                "Image": [
+                    {
+                        "alt": "28 Days Later",
+                        "type": "coverPoster",
+                        "url": "/library/metadata/219079/thumb/1784732318"
+                    },
+                    {
+                        "alt": "28 Days Later",
+                        "type": "background",
+                        "url": "/library/metadata/219079/art/1784732318"
+                    },
+                    {
+                        "alt": "28 Days Later",
+                        "type": "clearLogo",
+                        "url": "/library/metadata/219079/clearLogo/1784732318"
+                    },
+                    {
+                        "alt": "28 Days Later",
+                        "type": "backgroundSquare",
+                        "url": "/library/metadata/219079/squareArt/1784732318"
+                    }
+                ],
+                "UltraBlurColors": {
+                    "topLeft": "571002",
+                    "topRight": "6e190f",
+                    "bottomRight": "9f1a03",
+                    "bottomLeft": "430b04"
+                },
+                "Guid": [
+                    {
+                        "id": "imdb://tt0289043"
+                    },
+                    {
+                        "id": "tmdb://170"
+                    },
+                    {
+                        "id": "tvdb://871"
+                    }
+                ],
+                "Genre": [
+                    {
+                        "tag": "Horror"
+                    },
+                    {
+                        "tag": "Science Fiction"
+                    }
+                ],
+                "Country": [
+                    {
+                        "tag": "United Kingdom"
+                    }
+                ],
+                "Director": [
+                    {
+                        "tag": "Danny Boyle"
+                    }
+                ],
+                "Writer": [
+                    {
+                        "tag": "Alex Garland"
+                    }
+                ],
+                "Role": [
+                    {
+                        "tag": "Cillian Murphy"
+                    },
+                    {
+                        "tag": "Naomie Harris"
+                    },
+                    {
+                        "tag": "Brendan Gleeson"
+                    }
+                ]
+            },
+            {
+                "ratingKey": "1689",
+                "key": "/library/metadata/1689",
+                "guid": "plex://movie/5d7768478718ba001e317f7e",
+                "slug": "across-the-hall",
+                "studio": "Godfather Entertainment",
+                "type": "movie",
+                "title": "Across the Hall",
+                "contentRating": "R",
+                "summary": "The unbalanced Terry calls his best friend Julian that is having a bath telling that his beloved fianc\u00e9e June is cheating him. Terry has followed her to the decadent Riverview Hotel, where she checked in to meet her lover in room 507. Terry explains to Julian that he brought a revolver to shoot her lover and is waiting for him in room 508, but his friend asks him to be calm that he will meet Terry in the hotel.",
+                "audienceRating": 3.9,
+                "viewOffset": 580000,
+                "lastViewedAt": 1432614352,
+                "year": 2009,
+                "tagline": "Your worst fears are waiting...",
+                "thumb": "/library/metadata/1689/thumb/1789307331",
+                "art": "/library/metadata/1689/art/1789307331",
+                "duration": 5595000,
+                "originallyAvailableAt": "2009-12-04",
+                "addedAt": 1432583109,
+                "updatedAt": 1789307331,
+                "audienceRatingImage": "rottentomatoes://image.rating.spilled",
+                "chapterSource": "media",
+                "primaryExtraKey": "/library/metadata/172109",
+                "Media": [
+                    {
+                        "id": 1607,
+                        "duration": 5595000,
+                        "bitrate": 6581,
+                        "width": 1280,
+                        "height": 720,
+                        "aspectRatio": 1.78,
+                        "audioChannels": 6,
+                        "audioCodec": "dca",
+                        "videoCodec": "h264",
+                        "videoResolution": "720",
+                        "container": "mkv",
+                        "videoFrameRate": "24p",
+                        "audioProfile": "dts",
+                        "videoProfile": "high",
+                        "hasVoiceActivity": false,
+                        "Part": [
+                            {
+                                "id": 445832,
+                                "key": "/library/parts/445832/1359684115/file.mkv",
+                                "duration": 5595000,
+                                "file": "/slow/media/Movies/Across the Hall (2009)/Across the HallH264720pDTS.mkv",
+                                "size": 4602745119,
+                                "audioProfile": "dts",
+                                "container": "mkv",
+                                "indexes": "sd",
+                                "videoProfile": "high"
+                            }
+                        ]
+                    }
+                ],
+                "Image": [
+                    {
+                        "alt": "Across the Hall",
+                        "type": "coverPoster",
+                        "url": "/library/metadata/1689/thumb/1789307331"
+                    },
+                    {
+                        "alt": "Across the Hall",
+                        "type": "background",
+                        "url": "/library/metadata/1689/art/1789307331"
+                    },
+                    {
+                        "alt": "Across the Hall",
+                        "type": "clearLogo",
+                        "url": "/library/metadata/1689/clearLogo/1789307331"
+                    },
+                    {
+                        "alt": "Across the Hall",
+                        "type": "backgroundSquare",
+                        "url": "/library/metadata/1689/squareArt/1789307331"
+                    }
+                ],
+                "UltraBlurColors": {
+                    "topLeft": "48220a",
+                    "topRight": "8e3627",
+                    "bottomRight": "121012",
+                    "bottomLeft": "34130f"
+                },
+                "Guid": [
+                    {
+                        "id": "imdb://tt1176724"
+                    },
+                    {
+                        "id": "tmdb://21469"
+                    },
+                    {
+                        "id": "tvdb://20849"
+                    }
+                ],
+                "Genre": [
+                    {
+                        "tag": "Thriller"
+                    },
+                    {
+                        "tag": "Mystery"
+                    }
+                ],
+                "Country": [
+                    {
+                        "tag": "United States of America"
+                    }
+                ],
+                "Director": [
+                    {
+                        "tag": "Alex Merkin"
+                    }
+                ],
+                "Writer": [
+                    {
+                        "tag": "Alex Merkin"
+                    }
+                ],
+                "Role": [
+                    {
+                        "tag": "Mike Vogel"
+                    },
+                    {
+                        "tag": "Brittany Murphy"
+                    },
+                    {
+                        "tag": "Danny Pino"
+                    }
+                ]
+            }
+        ]
+    }
+}

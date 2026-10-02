@@ -1,0 +1,299 @@
+{
+    "MediaContainer": {
+        "size": 2,
+        "totalSize": 128,
+        "offset": 0,
+        "allowSync": true,
+        "art": "/:/resources/movie-fanart.jpg",
+        "identifier": "com.plexapp.plugins.library",
+        "librarySectionID": 2,
+        "librarySectionTitle": "Movies",
+        "librarySectionUUID": "900c68d5-f879-4227-9104-200ffeadddd3",
+        "mediaTagPrefix": "/system/bundle/media/flags/",
+        "mediaTagVersion": 1,
+        "sortAsc": true,
+        "thumb": "/:/resources/movie.png",
+        "title1": "Movies",
+        "title2": "All Movies",
+        "viewGroup": "movie",
+        "viewMode": 131122,
+        "Metadata": [
+            {
+                "ratingKey": "206736",
+                "key": "/library/metadata/206736",
+                "guid": "plex://movie/5d7768254de0ee001fcc83a5",
+                "slug": "alien",
+                "studio": "Brandywine Productions",
+                "type": "movie",
+                "title": "Alien",
+                "contentRating": "R",
+                "contentRatingAge": 15,
+                "summary": "During its return to the earth, commercial spaceship Nostromo intercepts a distress signal from a distant planet. When a three-member team of the crew discovers a chamber containing thousands of eggs on the planet, a creature inside one of the eggs attacks an explorer. The entire crew is unaware of the impending nightmare set to descend upon them when the alien parasite planted inside its unfortunate host is birthed.",
+                "rating": 9.3,
+                "audienceRating": 9.4,
+                "viewCount": 2,
+                "lastViewedAt": 1719196946,
+                "year": 1979,
+                "tagline": "In space no one can hear you scream.",
+                "thumb": "/library/metadata/206736/thumb/1790505697",
+                "art": "/library/metadata/206736/art/1790505697",
+                "duration": 6996990,
+                "originallyAvailableAt": "1979-05-25",
+                "addedAt": 1716531416,
+                "updatedAt": 1790505697,
+                "audienceRatingImage": "rottentomatoes://image.rating.upright",
+                "chapterSource": "media",
+                "primaryExtraKey": "/library/metadata/206738",
+                "ratingImage": "rottentomatoes://image.rating.ripe",
+                "Media": [
+                    {
+                        "id": 508738,
+                        "duration": 6996990,
+                        "bitrate": 52971,
+                        "width": 3840,
+                        "height": 2160,
+                        "aspectRatio": 1.78,
+                        "audioChannels": 6,
+                        "audioCodec": "dca-ma",
+                        "videoCodec": "hevc",
+                        "videoResolution": "4k",
+                        "container": "mkv",
+                        "videoFrameRate": "24p",
+                        "audioProfile": "ma",
+                        "videoProfile": "main 10",
+                        "hasVoiceActivity": false,
+                        "Part": [
+                            {
+                                "id": 723396,
+                                "key": "/library/parts/723396/1605543240/file.mkv",
+                                "duration": 6996990,
+                                "file": "/slow/media/Movies/Alien (1979)/Alien.1979.Remux-2160p.mkv",
+                                "size": 46329459434,
+                                "audioProfile": "ma",
+                                "container": "mkv",
+                                "indexes": "sd",
+                                "videoProfile": "main 10"
+                            }
+                        ]
+                    }
+                ],
+                "Image": [
+                    {
+                        "alt": "Alien",
+                        "type": "coverPoster",
+                        "url": "/library/metadata/206736/thumb/1790505697"
+                    },
+                    {
+                        "alt": "Alien",
+                        "type": "background",
+                        "url": "/library/metadata/206736/art/1790505697"
+                    },
+                    {
+                        "alt": "Alien",
+                        "type": "clearLogo",
+                        "url": "/library/metadata/206736/clearLogo/1790505697"
+                    },
+                    {
+                        "alt": "Alien",
+                        "type": "backgroundSquare",
+                        "url": "/library/metadata/206736/squareArt/1790505697"
+                    }
+                ],
+                "UltraBlurColors": {
+                    "topLeft": "282e36",
+                    "topRight": "1b1c23",
+                    "bottomRight": "1a244d",
+                    "bottomLeft": "2c657f"
+                },
+                "Guid": [
+                    {
+                        "id": "imdb://tt0078748"
+                    },
+                    {
+                        "id": "tmdb://348"
+                    },
+                    {
+                        "id": "tvdb://264"
+                    }
+                ],
+                "Genre": [
+                    {
+                        "tag": "Science Fiction"
+                    },
+                    {
+                        "tag": "Horror"
+                    }
+                ],
+                "Country": [
+                    {
+                        "tag": "United States of America"
+                    },
+                    {
+                        "tag": "United Kingdom"
+                    }
+                ],
+                "Director": [
+                    {
+                        "tag": "Ridley Scott"
+                    }
+                ],
+                "Writer": [
+                    {
+                        "tag": "Dan O'Bannon"
+                    },
+                    {
+                        "tag": "Ronald Shusett"
+                    }
+                ],
+                "Role": [
+                    {
+                        "tag": "Tom Skerritt"
+                    },
+                    {
+                        "tag": "Sigourney Weaver"
+                    },
+                    {
+                        "tag": "Veronica Cartwright"
+                    }
+                ]
+            },
+            {
+                "ratingKey": "208473",
+                "key": "/library/metadata/208473",
+                "guid": "plex://movie/5d776988ad5437001f75fc38",
+                "slug": "alien-covenant",
+                "studio": "20th Century Fox",
+                "type": "movie",
+                "title": "Alien: Covenant",
+                "contentRating": "R",
+                "contentRatingAge": 15,
+                "summary": "The crew of a colony ship, bound for a remote planet, discover an uncharted paradise with a threat beyond their imagination, and must attempt a harrowing escape.",
+                "rating": 6.5,
+                "audienceRating": 5.5,
+                "viewCount": 2,
+                "lastViewedAt": 1719809751,
+                "year": 2017,
+                "tagline": "The path to paradise begins in hell.",
+                "thumb": "/library/metadata/208473/thumb/1786042666",
+                "art": "/library/metadata/208473/art/1786042666",
+                "duration": 7323455,
+                "originallyAvailableAt": "2017-05-09",
+                "addedAt": 1719802190,
+                "updatedAt": 1786042666,
+                "audienceRatingImage": "rottentomatoes://image.rating.spilled",
+                "chapterSource": "media",
+                "primaryExtraKey": "/library/metadata/208480",
+                "ratingImage": "rottentomatoes://image.rating.ripe",
+                "Media": [
+                    {
+                        "id": 511361,
+                        "duration": 7323455,
+                        "bitrate": 50883,
+                        "width": 3840,
+                        "height": 2160,
+                        "aspectRatio": 1.78,
+                        "audioChannels": 8,
+                        "audioCodec": "truehd",
+                        "videoCodec": "hevc",
+                        "videoResolution": "4k",
+                        "container": "mkv",
+                        "videoFrameRate": "24p",
+                        "audioProfile": "dolby truehd + dolby atmos",
+                        "videoProfile": "main 10",
+                        "hasVoiceActivity": false,
+                        "Part": [
+                            {
+                                "id": 731041,
+                                "key": "/library/parts/731041/1507450615/file.mkv",
+                                "duration": 7323455,
+                                "file": "/slow/media/Movies/Alien Covenant (2017)/Alien.Covenant.2017.Remux-2160p.mkv",
+                                "size": 46579931053,
+                                "audioProfile": "dolby truehd + dolby atmos",
+                                "container": "mkv",
+                                "hasThumbnail": "1",
+                                "indexes": "sd",
+                                "videoProfile": "main 10"
+                            }
+                        ]
+                    }
+                ],
+                "Image": [
+                    {
+                        "alt": "Alien: Covenant",
+                        "type": "coverPoster",
+                        "url": "/library/metadata/208473/thumb/1786042666"
+                    },
+                    {
+                        "alt": "Alien: Covenant",
+                        "type": "background",
+                        "url": "/library/metadata/208473/art/1786042666"
+                    },
+                    {
+                        "alt": "Alien: Covenant",
+                        "type": "clearLogo",
+                        "url": "/library/metadata/208473/clearLogo/1786042666"
+                    },
+                    {
+                        "alt": "Alien: Covenant",
+                        "type": "backgroundSquare",
+                        "url": "/library/metadata/208473/squareArt/1786042666"
+                    }
+                ],
+                "UltraBlurColors": {
+                    "topLeft": "1e242b",
+                    "topRight": "030310",
+                    "bottomRight": "353f4a",
+                    "bottomLeft": "0d122d"
+                },
+                "Guid": [
+                    {
+                        "id": "imdb://tt2316204"
+                    },
+                    {
+                        "id": "tmdb://126889"
+                    },
+                    {
+                        "id": "tvdb://199"
+                    }
+                ],
+                "Genre": [
+                    {
+                        "tag": "Horror"
+                    },
+                    {
+                        "tag": "Science Fiction"
+                    }
+                ],
+                "Country": [
+                    {
+                        "tag": "United States of America"
+                    }
+                ],
+                "Director": [
+                    {
+                        "tag": "Ridley Scott"
+                    }
+                ],
+                "Writer": [
+                    {
+                        "tag": "Dante Harper"
+                    },
+                    {
+                        "tag": "Dan O'Bannon"
+                    }
+                ],
+                "Role": [
+                    {
+                        "tag": "Michael Fassbender"
+                    },
+                    {
+                        "tag": "Katherine Waterston"
+                    },
+                    {
+                        "tag": "Billy Crudup"
+                    }
+                ]
+            }
+        ]
+    }
+}

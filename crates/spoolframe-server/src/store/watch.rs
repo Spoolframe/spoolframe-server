@@ -37,6 +37,18 @@ impl Store {
         principal: Principal,
         update: WatchUpdate<'_>,
     ) -> Result<(), StoreError> {
+        self.save_watch_at(principal, update, now()).await
+    }
+
+    /// [`Store::save_watch`], as of `updated_at` (Unix seconds) rather than
+    /// now: for state taken from elsewhere (PX-04's Plex sync), which keeps
+    /// the time it changed there.
+    pub async fn save_watch_at(
+        &self,
+        principal: Principal,
+        update: WatchUpdate<'_>,
+        updated_at: i64,
+    ) -> Result<(), StoreError> {
         let principal = principal.to_string();
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -56,7 +68,7 @@ impl Store {
         .bind(update.position_ms)
         .bind(update.duration_ms)
         .bind(update.watched)
-        .bind(now())
+        .bind(updated_at)
         .execute(&mut *tx)
         .await?;
         for id in update.external_ids {
@@ -122,6 +134,17 @@ impl Store {
         tx.commit().await?;
         tracing::info!(%principal, from = %old, to = %media_id, "watch state re-linked");
         Ok(true)
+    }
+
+    /// Every state `principal` has.
+    pub async fn all_watch(&self, principal: Principal) -> Result<Vec<WatchRow>, StoreError> {
+        Ok(sqlx::query_as(
+            "SELECT media_id, show_id, position_ms, duration_ms, watched, updated_at \
+             FROM watch_state WHERE principal = ?1",
+        )
+        .bind(principal.to_string())
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// The states of `media_ids`, in one query.

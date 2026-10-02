@@ -15,12 +15,13 @@ use jsonrpsee::server::{HttpRequest, Server, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
 use spoolframe_admin_api::{
-    AdminApiServer, Credentials, LoggedIn, NewUser, ServerStatus, SetupRequest, TranscodingStatus,
-    UserInfo, error_code,
+    AdminApiServer, Credentials, LoggedIn, NewUser, PlexSyncReport, ServerStatus, SetupRequest,
+    TranscodingStatus, UserInfo, error_code,
 };
 use tower::{Layer, Service};
 
 use crate::auth::{Auth, LoginError, PasswordError, hash_password};
+use crate::plex_sync::{PlexSync, SyncError};
 use crate::store::sessions::{ApiSessionUser, SessionBinding};
 use crate::store::users::{UserError, normalize_username};
 use crate::transcode::Transcoding;
@@ -139,6 +140,7 @@ pub async fn serve(
     auth: Auth,
     setup_code: Option<SetupCode>,
     status: Arc<StatusSource>,
+    plex_sync: Option<Arc<PlexSync>>,
 ) -> std::io::Result<(SocketAddr, ServerHandle)> {
     let server = Server::builder()
         .set_http_middleware(tower::ServiceBuilder::new().layer(BearerLayer))
@@ -150,6 +152,7 @@ pub async fn serve(
             auth,
             setup_code,
             status,
+            plex_sync,
         }
         .into_rpc(),
     );
@@ -160,6 +163,7 @@ struct AdminApi {
     auth: Auth,
     setup_code: Option<SetupCode>,
     status: Arc<StatusSource>,
+    plex_sync: Option<Arc<PlexSync>>,
 }
 
 fn error(code: i32, message: impl Into<String>) -> ErrorObjectOwned {
@@ -364,6 +368,25 @@ impl AdminApiServer for AdminApi {
     async fn server_status(&self, ext: &Extensions) -> RpcResult<ServerStatus> {
         self.admin(ext).await?;
         Ok(self.status.status())
+    }
+
+    async fn plex_watch_sync(&self, ext: &Extensions, dry_run: bool) -> RpcResult<PlexSyncReport> {
+        self.admin(ext).await?;
+        let Some(sync) = &self.plex_sync else {
+            return Err(error(
+                error_code::NOT_CONFIGURED,
+                "Plex watch sync is off: set plex { watch_sync { user = …; } }",
+            ));
+        };
+        let report = sync.run(dry_run).await.map_err(|e| match e {
+            SyncError::Plex(e) => error(error_code::UNAVAILABLE, e.to_string()),
+            SyncError::Store(e) => internal(e),
+        })?;
+        Ok(PlexSyncReport {
+            pulled: report.pulled,
+            pushed: report.pushed,
+            failed: report.failed,
+        })
     }
 }
 

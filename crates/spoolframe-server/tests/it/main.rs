@@ -8,6 +8,7 @@ mod support;
 mod admin;
 mod artwork;
 mod cli;
+mod encode;
 mod endpoint;
 mod lan;
 mod license_boundary;

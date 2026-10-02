@@ -26,6 +26,8 @@ use spoolframe_protocol::{
 use spoolframe_protocol::{MediaRead, MediaReadResponse, PlaybackHandle};
 use spoolframe_server::artwork::ArtworkCache;
 use spoolframe_server::auth::{Auth, hash_password};
+use spoolframe_server::encode::JobLimits;
+use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
 use spoolframe_server::network::{EndpointOptions, Relay, Server, Services};
 use spoolframe_server::playback::Playbacks;
@@ -94,6 +96,7 @@ fn season(key: &str, number: u32) -> Item {
     Item::Season(Season {
         id: media(MediaKind::Season, key),
         show_id: media(MediaKind::Show, "10"),
+        show_title: Some("The Expanse".into()),
         season: number,
         title: format!("Season {number}"),
         artwork: Vec::new(),
@@ -105,6 +108,7 @@ pub fn episode(key: &str, season_key: &str, season: u32, episode: u32) -> Item {
     Item::Episode(Episode {
         id: media(MediaKind::Episode, key),
         show_id: media(MediaKind::Show, "10"),
+        show_title: Some("The Expanse".into()),
         season_id: media(MediaKind::Season, season_key),
         season,
         episode,
@@ -251,6 +255,32 @@ fn fake_ffprobe(dir: &Path) -> PathBuf {
     script
 }
 
+/// A Linux-client-like device that takes a progressive stream: H.264 and
+/// AAC in Matroska, so an AC-3 file needs its audio converted.
+pub fn progressive_capabilities() -> ClientCapabilities {
+    use spoolframe_types::{AudioCodec, Container, Delivery, VideoCodec};
+    ClientCapabilities {
+        video: [VideoCodec::H264].into(),
+        audio: [AudioCodec::Aac].into(),
+        containers: [Container::Matroska].into(),
+        delivery: vec![Delivery::Progressive],
+        ..ClientCapabilities::default()
+    }
+}
+
+/// An Apple-like device that takes HLS: H.264 and AAC in MP4, so an AC-3
+/// file has its audio converted and its video copied.
+pub fn hls_capabilities() -> ClientCapabilities {
+    use spoolframe_types::{AudioCodec, Container, Delivery, VideoCodec};
+    ClientCapabilities {
+        video: [VideoCodec::H264].into(),
+        audio: [AudioCodec::Aac].into(),
+        containers: [Container::Mp4, Container::MpegTs].into(),
+        delivery: vec![Delivery::Hls],
+        ..ClientCapabilities::default()
+    }
+}
+
 /// What the stand-in media needs: the formats of the forced-subtitle MKV.
 pub fn mkv_capabilities() -> ClientCapabilities {
     use spoolframe_types::{AudioCodec, Container, SubtitleFormat, VideoCodec};
@@ -270,6 +300,14 @@ pub struct ServerOptions {
     pub name: String,
     pub port: Option<u16>,
     pub mdns: bool,
+    /// Real ffprobe and ffmpeg, on a file made with [`TestServer::generate_media`],
+    /// for converted playback (P2-03). Off: the stand-in ffprobe and its
+    /// fixtures.
+    pub real_media: bool,
+    pub max_jobs: usize,
+    pub read_ahead: Duration,
+    /// The encoder jobs run: real ffmpeg, or a stand-in script.
+    pub ffmpeg: PathBuf,
 }
 
 impl Default for ServerOptions {
@@ -278,6 +316,10 @@ impl Default for ServerOptions {
             name: "Home Media".into(),
             port: None,
             mdns: false,
+            real_media: false,
+            max_jobs: 2,
+            read_ahead: Duration::from_secs(5),
+            ffmpeg: PathBuf::from("ffmpeg"),
         }
     }
 }
@@ -331,7 +373,22 @@ impl TestServer {
         });
         let artwork =
             ArtworkCache::open(&dir.join("cache/artwork"), 64 << 20, catalog.clone()).unwrap();
-        let prober = Arc::new(Prober::new(fake_ffprobe(&dir), Prober::DEFAULT_TIMEOUT));
+        let ffprobe = if options.real_media {
+            PathBuf::from("ffprobe")
+        } else {
+            fake_ffprobe(&dir)
+        };
+        let prober = Arc::new(Prober::new(ffprobe, Prober::DEFAULT_TIMEOUT));
+        let jobs = Jobs::new(
+            JobLimits {
+                max_jobs: options.max_jobs,
+                scratch_dir: dir.join("cache").join("transcode"),
+                scratch_limit_bytes: 1 << 30,
+                read_ahead: options.read_ahead,
+            },
+            options.ffmpeg.clone(),
+        )
+        .unwrap();
         let watch = Arc::new(Watch::new(
             store.clone(),
             catalog.clone(),
@@ -346,6 +403,7 @@ impl TestServer {
             artwork: Arc::new(artwork),
             playbacks: Arc::new(Playbacks::new(PLAYBACK_IDLE, PLAYBACK_RECHECK)),
             transcoding: transcoding(),
+            jobs: Arc::new(jobs),
         };
         let endpoint = EndpointOptions {
             port: options.port,
@@ -386,6 +444,32 @@ impl TestServer {
         let path = episode_media(&self.media, &id);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"stand-in").unwrap();
+    }
+
+    /// Make the movie's file with real ffmpeg: `secs` of a 640×360 test
+    /// pattern in `video` and a tone in `audio` (encoder names), with a
+    /// keyframe every 2 s, in Matroska.
+    pub fn generate_media(&self, secs: u32, video: &str, audio: &str) {
+        std::fs::create_dir_all(self.media.parent().unwrap()).unwrap();
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
+            .args(["-t", &secs.to_string(), "-pix_fmt", "yuv420p", "-g", "50"])
+            .args(["-c:v", video, "-c:a", audio, "-ac", "2"])
+            .arg(&self.media)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not make the test media");
+    }
+
+    /// Where a converted playback's job writes, for epoch `epoch`.
+    pub fn job_dir(&self, handle: &PlaybackHandle, epoch: u32) -> PathBuf {
+        self.dir
+            .join("cache")
+            .join("transcode")
+            .join(&handle.0)
+            .join(epoch.to_string())
     }
 
     /// Write a subtitle file next to the movie; returns its bytes.
@@ -531,6 +615,37 @@ impl TestClient {
         (response, bytes)
     }
 
+    /// A read of a converted playback's output in `epoch` (P2-04).
+    pub async fn read_at(
+        &self,
+        session: &SessionId,
+        handle: &PlaybackHandle,
+        epoch: u32,
+        offset: u64,
+        length: u64,
+    ) -> (MediaReadResponse, Vec<u8>) {
+        self.media(MediaRead {
+            session: session.clone(),
+            handle: handle.clone(),
+            offset,
+            length,
+            epoch,
+            segment: None,
+        })
+        .await
+    }
+
+    /// One MEDIA stream: `read` out, the response frame and the bytes back.
+    pub async fn media(&self, read: MediaRead) -> (MediaReadResponse, Vec<u8>) {
+        let (mut send, mut recv) = self.conn.open_bi().await.unwrap();
+        send.write_u8(bi::MEDIA).await.unwrap();
+        write_frame(&mut send, &read).await.unwrap();
+        send.finish().unwrap();
+        let response: MediaReadResponse = read_frame(&mut recv).await.unwrap();
+        let bytes = recv.read_to_end(64 << 20).await.unwrap();
+        (response, bytes)
+    }
+
     /// One range read on a MEDIA stream: the response frame and the bytes
     /// after it.
     pub async fn read(
@@ -540,19 +655,7 @@ impl TestClient {
         offset: u64,
         length: u64,
     ) -> (MediaReadResponse, Vec<u8>) {
-        let (mut send, mut recv) = self.conn.open_bi().await.unwrap();
-        send.write_u8(bi::MEDIA).await.unwrap();
-        let read = MediaRead {
-            session: session.clone(),
-            handle: handle.clone(),
-            offset,
-            length,
-        };
-        write_frame(&mut send, &read).await.unwrap();
-        send.finish().unwrap();
-        let response: MediaReadResponse = read_frame(&mut recv).await.unwrap();
-        let bytes = recv.read_to_end(64 << 20).await.unwrap();
-        (response, bytes)
+        self.read_at(session, handle, 0, offset, length).await
     }
 
     pub async fn close(self) {

@@ -323,3 +323,37 @@ async fn the_client_announces_nothing() {
     client.close().await;
     server.stop().await;
 }
+
+#[tokio::test]
+async fn the_server_list_tells_when_a_server_is_heard() {
+    if !private_lan("the_server_list_tells_when_a_server_is_heard") {
+        return;
+    }
+    let client = open(&Arc::new(MemoryStorage::default())).await;
+    // An app lists at once: nothing heard yet.
+    let mut changes = client.watch_servers();
+    assert!(client.servers().await.unwrap().is_empty());
+
+    let server = TestServer::start_with(fresh_dir("watch"), on_lan("Den")).await;
+    let id = server.server.id().to_string();
+    // No polling: each change is the cue to list again.
+    let listed = tokio::time::timeout(HEAR_WITHIN, async {
+        loop {
+            assert!(changes.changed().await, "the client went away");
+            if let Some(entry) = client
+                .servers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|e| e.endpoint_id == id)
+            {
+                return entry;
+            }
+        }
+    })
+    .await
+    .expect("no change listed the server");
+    assert_eq!(listed.name, "Den");
+    client.close().await;
+    server.stop().await;
+}

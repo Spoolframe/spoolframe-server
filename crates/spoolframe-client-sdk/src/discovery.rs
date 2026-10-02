@@ -14,6 +14,7 @@ use futures_util::StreamExt;
 use iroh::EndpointId;
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use spoolframe_protocol::lan;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 /// A server's latest record.
@@ -27,6 +28,9 @@ type HeardMap = Arc<Mutex<HashMap<EndpointId, Heard>>>;
 
 pub(crate) struct Discovery {
     heard: HeardMap,
+    /// Bumped whenever what `Client::servers` returns may have changed:
+    /// a server heard, changed or gone here, or a pin saved or forgotten.
+    changes: watch::Sender<u64>,
     task: JoinHandle<()>,
 }
 
@@ -37,10 +41,12 @@ impl Discovery {
         let mut events = mdns.subscribe().await;
         let heard = HeardMap::default();
         let map = heard.clone();
+        let changes = watch::Sender::new(0u64);
+        let notify = changes.clone();
         let task = tokio::spawn(async move {
             while let Some(event) = events.next().await {
                 let mut map = map.lock().expect("never poisoned");
-                match event {
+                let changed = match event {
                     DiscoveryEvent::Discovered { endpoint_info, .. } => {
                         let Some(advert) = endpoint_info
                             .user_data()
@@ -49,22 +55,35 @@ impl Discovery {
                             continue;
                         };
                         tracing::debug!(id = %endpoint_info.endpoint_id, name = advert.name, "heard a server");
-                        map.insert(
-                            endpoint_info.endpoint_id,
-                            Heard {
-                                name: advert.name,
-                                addrs: endpoint_info.data.ip_addrs().copied().collect(),
-                            },
-                        );
+                        let heard = Heard {
+                            name: advert.name,
+                            addrs: endpoint_info.data.ip_addrs().copied().collect(),
+                        };
+                        map.insert(endpoint_info.endpoint_id, heard.clone()) != Some(heard)
                     }
-                    DiscoveryEvent::Expired { endpoint_id } => {
-                        map.remove(&endpoint_id);
-                    }
-                    _ => {}
+                    DiscoveryEvent::Expired { endpoint_id } => map.remove(&endpoint_id).is_some(),
+                    _ => false,
+                };
+                drop(map);
+                if changed {
+                    notify.send_modify(|n| *n += 1);
                 }
             }
         });
-        Self { heard, task }
+        Self {
+            heard,
+            changes,
+            task,
+        }
+    }
+
+    /// Tell watchers the server list may have changed.
+    pub fn changed(&self) {
+        self.changes.send_modify(|n| *n += 1);
+    }
+
+    pub fn watch(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     pub fn heard(&self) -> HashMap<EndpointId, Heard> {

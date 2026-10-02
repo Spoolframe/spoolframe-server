@@ -66,15 +66,29 @@ pub struct Metadata {
     pub parent_index: Option<u32>,
     pub parent_rating_key: Option<String>,
     pub grandparent_rating_key: Option<String>,
+    /// An episode's show's title.
+    pub grandparent_title: Option<String>,
+    /// A season's show's title, an album's artist's name.
+    pub parent_title: Option<String>,
+    /// The parent's and grandparent's images: an episode's season poster
+    /// and show poster.
+    pub parent_thumb: Option<String>,
+    pub grandparent_thumb: Option<String>,
     pub thumb: Option<String>,
     pub art: Option<String>,
     #[serde(rename = "Media", default)]
     pub media: Vec<Media>,
     /// Plex's own stable id, `plex://movie/…`.
     pub guid: Option<String>,
-    /// Other agents' ids (`imdb://…`); only on single-item responses.
+    /// Other agents' ids (`imdb://…`); only on single-item responses, or
+    /// listings asked with `includeGuids=1`.
     #[serde(rename = "Guid", default)]
     pub guids: Vec<GuidRef>,
+    /// The token's account's views: how many times it was watched to the
+    /// end, where it stopped (ms), and when it was last viewed (Unix s).
+    pub view_count: Option<u32>,
+    pub view_offset: Option<u64>,
+    pub last_viewed_at: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

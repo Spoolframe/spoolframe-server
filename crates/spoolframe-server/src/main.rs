@@ -12,8 +12,11 @@ use spoolframe_server::admin::{self, SetupCode, StatusSource};
 use spoolframe_server::artwork::ArtworkCache;
 use spoolframe_server::auth::Auth;
 use spoolframe_server::config::ServerConfig;
+use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
 use spoolframe_server::network::{Server, Services};
+use spoolframe_server::plex_sync::PlexSync;
+use spoolframe_server::principal::Principal;
 use spoolframe_server::store::Store;
 use spoolframe_server::transcode::{self, Transcoding};
 use spoolframe_server::watch::Watch;
@@ -103,6 +106,13 @@ enum PlexCommand {
         #[arg(long)]
         library: Option<String>,
     },
+    /// Sync watch state with the Plex account now (PX-04), through the
+    /// running server, logged in as an admin.
+    SyncWatch {
+        /// Only print what would change.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -147,6 +157,9 @@ async fn main() -> Result<()> {
         Some(Command::Plex {
             command: PlexCommand::CheckPaths { library },
         }) => check_paths(&plex(&config)?, library.as_deref()).await,
+        Some(Command::Plex {
+            command: PlexCommand::SyncWatch { dry_run },
+        }) => admin_cli::plex_sync(config.admin.listen()?, dry_run).await,
         Some(Command::Media {
             command: MediaCommand::Probe { id },
         }) => probe(&plex(&config)?, &id, config.media.ffprobe()).await,
@@ -180,6 +193,15 @@ async fn run(config: &ServerConfig) -> Result<()> {
         config.state_dir.join("cache").join("encoder-test"),
     ));
     transcode::spawn_detection(transcoding.clone());
+    let limits = config.transcode.limits(&config.state_dir)?;
+    let jobs = Arc::new(
+        Jobs::new(limits.clone(), config.media.ffmpeg()).with_context(|| {
+            format!(
+                "cannot prepare the scratch directory {}",
+                limits.scratch_dir.display()
+            )
+        })?,
+    );
     let status = Arc::new(StatusSource::new(config.server_name(), transcoding.clone()));
     let artwork_dir = config.state_dir.join("cache").join("artwork");
     let artwork = Arc::new(
@@ -195,6 +217,7 @@ async fn run(config: &ServerConfig) -> Result<()> {
         prober.clone(),
         config.watch.rules()?,
     ));
+    let plex_sync = plex_sync(config, &plex, auth.store(), &watch).await?;
     let admin_listen = config.admin.listen()?;
     // Only a server with no users offers setup, and only to someone who
     // can read this log.
@@ -207,9 +230,15 @@ async fn run(config: &ServerConfig) -> Result<()> {
     } else {
         None
     };
-    let (admin_addr, admin) = admin::serve(admin_listen, auth.clone(), setup_code, status.clone())
-        .await
-        .with_context(|| format!("cannot start the admin API on {admin_listen}"))?;
+    let (admin_addr, admin) = admin::serve(
+        admin_listen,
+        auth.clone(),
+        setup_code,
+        status.clone(),
+        plex_sync,
+    )
+    .await
+    .with_context(|| format!("cannot start the admin API on {admin_listen}"))?;
     tracing::info!(addr = %admin_addr, "admin API listening");
     let server = Server::start(
         key,
@@ -223,6 +252,7 @@ async fn run(config: &ServerConfig) -> Result<()> {
             playbacks: Arc::default(),
             watch,
             transcoding,
+            jobs,
         },
     )
     .await?;
@@ -236,6 +266,37 @@ async fn run(config: &ServerConfig) -> Result<()> {
     let _ = admin.stop();
     admin.stopped().await;
     Ok(())
+}
+
+/// The Plex watch sync, started, if the config asks for one and its user
+/// exists.
+async fn plex_sync(
+    config: &ServerConfig,
+    plex: &Arc<PlexCatalog>,
+    store: &Store,
+    watch: &Arc<Watch>,
+) -> Result<Option<Arc<PlexSync>>> {
+    let Some(sync) = &config.plex.watch_sync else {
+        return Ok(None);
+    };
+    let Some(user) = store.password_login(&sync.user).await? else {
+        tracing::warn!(
+            user = sync.user,
+            "plex.watch_sync.user does not exist; not syncing watch state with Plex"
+        );
+        return Ok(None);
+    };
+    let started = config.watch.rules()?.started_after;
+    let syncer = Arc::new(PlexSync::new(
+        plex.clone(),
+        store.clone(),
+        Principal::LocalUser(user.id),
+        started,
+        sync.interval(),
+    ));
+    syncer.clone().spawn(watch.changes());
+    tracing::info!(user = sync.user, "syncing watch state with Plex");
+    Ok(Some(syncer))
 }
 
 async fn shutdown_signal() -> Result<()> {

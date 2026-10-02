@@ -28,6 +28,7 @@ async fn start(client: &TestClient, session: &SessionId, selection: Selection) -
             Request::StartPlayback {
                 id: movie().id().clone(),
                 selection: Some(selection),
+                start_ms: None,
             },
         )
         .await
@@ -255,6 +256,28 @@ async fn a_plan_that_is_not_direct_starts_nothing() {
         start(&client, &session, Selection::default()).await,
         Response::Err(Error::CannotPlay { .. })
     ));
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn stop_playback_ends_the_handle() {
+    let (server, client, session) = ready("stop").await;
+    server.write_media(1000);
+    let (handle, _) = started(&client, &session).await;
+    assert_eq!(
+        client
+            .call(
+                Some(&session),
+                Request::StopPlayback {
+                    handle: handle.clone()
+                }
+            )
+            .await,
+        Response::Ok(Reply::Done)
+    );
+    let (response, _) = client.read(&session, &handle, 0, 10).await;
+    assert_eq!(err(response), Error::PlaybackExpired);
     client.close().await;
     server.stop().await;
 }

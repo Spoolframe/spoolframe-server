@@ -9,6 +9,7 @@
 pub mod check;
 mod convert;
 pub mod paths;
+mod watch;
 mod wire;
 
 use std::fmt;
@@ -25,6 +26,7 @@ use url::Url;
 
 pub use crate::check::{Failures, LibraryPaths, Scope};
 pub use crate::paths::{PathMap, PathMapping};
+pub use crate::watch::PlexWatch;
 
 use crate::convert::ConvertError;
 use crate::wire::{Envelope, MediaContainer, Metadata};

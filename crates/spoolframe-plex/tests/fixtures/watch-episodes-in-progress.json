@@ -1,0 +1,270 @@
+{
+    "MediaContainer": {
+        "size": 2,
+        "totalSize": 24,
+        "offset": 0,
+        "allowSync": true,
+        "art": "/:/resources/show-fanart.jpg",
+        "identifier": "com.plexapp.plugins.library",
+        "librarySectionID": 1,
+        "librarySectionTitle": "TV Shows",
+        "librarySectionUUID": "3a66592d-64dd-497a-8b5d-4b99f63b5b1c",
+        "mediaTagPrefix": "/system/bundle/media/flags/",
+        "mediaTagVersion": 1,
+        "nocache": true,
+        "sortAsc": true,
+        "thumb": "/:/resources/show.png",
+        "title1": "TV Shows",
+        "title2": "All Shows",
+        "viewGroup": "show",
+        "viewMode": 131122,
+        "Metadata": [
+            {
+                "ratingKey": "144520",
+                "key": "/library/metadata/144520",
+                "parentRatingKey": "144519",
+                "grandparentRatingKey": "144518",
+                "guid": "plex://episode/5e83399114c90e003fdcd808",
+                "parentGuid": "plex://season/606ef477cc0fca002d43d2ff",
+                "grandparentGuid": "plex://show/5df5b930237002001def94cc",
+                "grandparentSlug": "azur-lane",
+                "type": "episode",
+                "title": "ACTIVATION - The Girls Who Soar on the Seas",
+                "grandparentKey": "/library/metadata/144518",
+                "parentKey": "/library/metadata/144519",
+                "grandparentTitle": "Azur Lane",
+                "parentTitle": "Season 1",
+                "originalTitle": "\u3010\u8d77\u52d5\u3011\u6d77\u3092\u99c6\u3051\u308b\u5c11\u5973\u305f\u3061",
+                "contentRating": "TV-14",
+                "summary": "Upon learning that former Azur Lane alliance members Sakura Empire and Iron Blood are ready to go to war, forces from the current Azur Lane, Eagle Union and Royal Navy, assemble at a forward base.",
+                "index": 1,
+                "parentIndex": 1,
+                "viewOffset": 446464,
+                "lastViewedAt": 1618387569,
+                "year": 2019,
+                "thumb": "/library/metadata/144520/thumb/1696804255",
+                "art": "/library/metadata/144518/art/1787233046",
+                "grandparentThumb": "/library/metadata/144518/thumb/1787233046",
+                "grandparentArt": "/library/metadata/144518/art/1787233046",
+                "duration": 1431052,
+                "originallyAvailableAt": "2019-10-03",
+                "addedAt": 1574463494,
+                "updatedAt": 1696804255,
+                "chapterSource": "media",
+                "Media": [
+                    {
+                        "id": 439246,
+                        "duration": 1431052,
+                        "bitrate": 11327,
+                        "width": 1920,
+                        "height": 1080,
+                        "aspectRatio": 1.78,
+                        "audioChannels": 6,
+                        "audioCodec": "flac",
+                        "videoCodec": "h264",
+                        "videoResolution": "1080",
+                        "container": "mkv",
+                        "videoFrameRate": "24p",
+                        "videoProfile": "high 10",
+                        "hasVoiceActivity": false,
+                        "Part": [
+                            {
+                                "id": 484103,
+                                "key": "/library/parts/484103/1615478847/file.mkv",
+                                "duration": 1431052,
+                                "file": "/slow/media//TVShows/Azur Lane/Season 1/Azur.Lane.S01E01.MOBILIZATION.-.The.Girls.of.the.Sea.Bluray-1080p.mkv",
+                                "size": 2026125947,
+                                "container": "mkv",
+                                "indexes": "sd",
+                                "videoProfile": "high 10"
+                            }
+                        ]
+                    }
+                ],
+                "Image": [
+                    {
+                        "alt": "ACTIVATION - The Girls Who Soar on the Seas",
+                        "type": "coverPoster",
+                        "url": "/library/metadata/144518/thumb/1787233046"
+                    },
+                    {
+                        "alt": "ACTIVATION - The Girls Who Soar on the Seas",
+                        "type": "snapshot",
+                        "url": "/library/metadata/144520/thumb/1696804255"
+                    },
+                    {
+                        "alt": "ACTIVATION - The Girls Who Soar on the Seas",
+                        "type": "background",
+                        "url": "/library/metadata/144518/art/1787233046"
+                    },
+                    {
+                        "alt": "ACTIVATION - The Girls Who Soar on the Seas",
+                        "type": "clearLogo",
+                        "url": "/library/metadata/144518/clearLogo/1787233046"
+                    },
+                    {
+                        "alt": "ACTIVATION - The Girls Who Soar on the Seas",
+                        "type": "backgroundSquare",
+                        "url": "/library/metadata/144518/squareArt/1787233046"
+                    }
+                ],
+                "UltraBlurColors": {
+                    "topLeft": "092963",
+                    "topRight": "8a3c75",
+                    "bottomRight": "1b51c9",
+                    "bottomLeft": "263669"
+                },
+                "Guid": [
+                    {
+                        "id": "imdb://tt10980990"
+                    },
+                    {
+                        "id": "tmdb://1860236"
+                    },
+                    {
+                        "id": "tvdb://7317492"
+                    }
+                ],
+                "Writer": [
+                    {
+                        "tag": "Renji Oki"
+                    }
+                ]
+            },
+            {
+                "ratingKey": "202523",
+                "key": "/library/metadata/202523",
+                "parentRatingKey": "202522",
+                "grandparentRatingKey": "202521",
+                "guid": "plex://episode/64ea846a2f46e420afc68a88",
+                "parentGuid": "plex://season/6198def0046272df65732674",
+                "grandparentGuid": "plex://show/6198def0046272df6573266f",
+                "grandparentSlug": "demon-slave",
+                "type": "episode",
+                "title": "Curiosity, Shushu, Undress",
+                "grandparentKey": "/library/metadata/202521",
+                "parentKey": "/library/metadata/202522",
+                "grandparentTitle": "Chained Soldier",
+                "parentTitle": "Season 1",
+                "originalTitle": "Demon Slave",
+                "contentRating": "TV-MA",
+                "summary": "Yuuki is recruited to work as a caretaker at the 7th Squadron\u2019s dorm in Mato. Shushu catches him unaware and turns him into her boy toy. Suddenly, a giant Shuuki attacks!",
+                "index": 2,
+                "parentIndex": 1,
+                "audienceRating": 4.7,
+                "viewOffset": 547213,
+                "lastViewedAt": 1708153638,
+                "year": 2024,
+                "thumb": "/library/metadata/202523/thumb/1708661681",
+                "art": "/library/metadata/202521/art/1790945519",
+                "parentThumb": "/library/metadata/202522/thumb/1706044899",
+                "grandparentThumb": "/library/metadata/202521/thumb/1790945519",
+                "grandparentArt": "/library/metadata/202521/art/1790945519",
+                "grandparentTheme": "/library/metadata/202521/theme/1790945519",
+                "duration": 1420044,
+                "originallyAvailableAt": "2024-01-11",
+                "addedAt": 1706044893,
+                "updatedAt": 1708661681,
+                "audienceRatingImage": "themoviedb://image.rating",
+                "chapterSource": "media",
+                "Media": [
+                    {
+                        "id": 504071,
+                        "duration": 1420044,
+                        "bitrate": 3262,
+                        "width": 1920,
+                        "height": 1080,
+                        "aspectRatio": 1.78,
+                        "audioChannels": 2,
+                        "audioCodec": "aac",
+                        "videoCodec": "h264",
+                        "videoResolution": "1080",
+                        "container": "mkv",
+                        "videoFrameRate": "24p",
+                        "audioProfile": "lc",
+                        "videoProfile": "high",
+                        "hasVoiceActivity": false,
+                        "Part": [
+                            {
+                                "id": 700807,
+                                "key": "/library/parts/700807/1706044842/file.mkv",
+                                "duration": 1420044,
+                                "file": "/slow/media//TVShows/Chained Soldier/Season 1/Chained.Soldier.S01E02.Curiosity,.Shushu,.Undress.WEBDL-1080p.mkv",
+                                "size": 579038761,
+                                "audioProfile": "lc",
+                                "container": "mkv",
+                                "indexes": "sd",
+                                "videoProfile": "high"
+                            }
+                        ]
+                    }
+                ],
+                "Image": [
+                    {
+                        "alt": "Curiosity, Shushu, Undress",
+                        "type": "coverPoster",
+                        "url": "/library/metadata/202521/thumb/1790945519"
+                    },
+                    {
+                        "alt": "Curiosity, Shushu, Undress",
+                        "type": "snapshot",
+                        "url": "/library/metadata/202523/thumb/1708661681"
+                    },
+                    {
+                        "alt": "Curiosity, Shushu, Undress",
+                        "type": "background",
+                        "url": "/library/metadata/202521/art/1790945519"
+                    },
+                    {
+                        "alt": "Curiosity, Shushu, Undress",
+                        "type": "clearLogo",
+                        "url": "/library/metadata/202521/clearLogo/1790945519"
+                    },
+                    {
+                        "alt": "Curiosity, Shushu, Undress",
+                        "type": "backgroundSquare",
+                        "url": "/library/metadata/202521/squareArt/1790945519"
+                    }
+                ],
+                "UltraBlurColors": {
+                    "topLeft": "570f0d",
+                    "topRight": "a72524",
+                    "bottomRight": "963325",
+                    "bottomLeft": "4d1b1a"
+                },
+                "Guid": [
+                    {
+                        "id": "imdb://tt27375366"
+                    },
+                    {
+                        "id": "tmdb://4680647"
+                    },
+                    {
+                        "id": "tvdb://10190277"
+                    }
+                ],
+                "Director": [
+                    {
+                        "tag": "Kazunobu Fuseki"
+                    }
+                ],
+                "Writer": [
+                    {
+                        "tag": "Yasuhiro Nakanishi"
+                    }
+                ],
+                "Role": [
+                    {
+                        "tag": "Yuya Hirose"
+                    },
+                    {
+                        "tag": "Akari Kito"
+                    },
+                    {
+                        "tag": "Yume Miyamoto"
+                    }
+                ]
+            }
+        ]
+    }
+}

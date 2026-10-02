@@ -136,6 +136,14 @@ impl Client {
         Ok(entries)
     }
 
+    /// Changes of [`Client::servers`]: a server heard or gone on the LAN, or
+    /// one pinned or forgotten. The first answer comes before mDNS has had
+    /// time to hear anything (about a second), so an app lists once, then
+    /// again on every change.
+    pub fn watch_servers(&self) -> ServersWatch {
+        ServersWatch(self.inner.discovery.watch())
+    }
+
     /// Where to find server `endpoint_id`, from outside the LAN's records:
     /// typed in, or (P6) from an invite. A hint like any other: the key is
     /// still proven on connect.
@@ -184,6 +192,7 @@ impl Client {
         storage
             .set_secret(&keys::sessions(endpoint_id), None)
             .await?;
+        self.inner.discovery.changed();
         Ok(())
     }
 
@@ -369,6 +378,7 @@ impl Client {
             }
         }
         servers::save(storage, &saved).await?;
+        self.inner.discovery.changed();
         Ok(())
     }
 
@@ -401,6 +411,17 @@ impl Client {
 fn parse_id(endpoint_id: &str) -> Result<EndpointId, SdkError> {
     EndpointId::from_str(endpoint_id)
         .map_err(|e| SdkError::UnknownServer(format!("{endpoint_id:?} is not a server key: {e}")))
+}
+
+/// Changes of the server list; see [`Client::watch_servers`].
+#[derive(Debug, Clone)]
+pub struct ServersWatch(tokio::sync::watch::Receiver<u64>);
+
+impl ServersWatch {
+    /// Waits for the next change; `false` once the client is gone.
+    pub async fn changed(&mut self) -> bool {
+        self.0.changed().await.is_ok()
+    }
 }
 
 /// The device's key, made and stored only if storage says there is none.

@@ -10,9 +10,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use std::sync::Arc;
+
 use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::{PlaybackHandle, SessionId};
 use spoolframe_types::SubtitleFormat;
+
+use crate::encode::Conversion;
 
 /// How long a handle lives without reads.
 pub const IDLE: Duration = Duration::from_secs(5 * 60);
@@ -36,6 +40,9 @@ pub struct Playback {
     pub path: PathBuf,
     pub size: u64,
     pub subtitle: Option<Sidecar>,
+    /// For a converted playback, its encode (P2-03). Ending the handle
+    /// drops it, which stops ffmpeg and removes its files.
+    pub conversion: Option<Arc<Conversion>>,
     last_used: Instant,
     last_checked: Instant,
 }
@@ -83,35 +90,48 @@ impl Playbacks {
         self.handles.lock().expect("never held across a panic")
     }
 
-    /// Open a playback; the session was checked by the caller just now.
+    /// A new, unguessable handle, before its playback is opened: a
+    /// conversion names its files after it.
+    pub fn new_handle() -> PlaybackHandle {
+        let mut bytes = [0u8; 16];
+        OsRng.fill_bytes(&mut bytes);
+        PlaybackHandle(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// Open a playback as `handle`; the session was checked by the caller
+    /// just now.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site, each a different part of the playback"
+    )]
     pub fn start(
         &self,
+        handle: PlaybackHandle,
         session: SessionId,
         endpoint: String,
         path: PathBuf,
         size: u64,
         subtitle: Option<Sidecar>,
+        conversion: Option<Arc<Conversion>>,
     ) -> PlaybackHandle {
-        let mut bytes = [0u8; 16];
-        OsRng.fill_bytes(&mut bytes);
-        let handle: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let now = Instant::now();
         let mut handles = self.lock();
         // Forget idle handles here rather than on a timer.
         handles.retain(|_, p| now.duration_since(p.last_used) < self.idle);
         handles.insert(
-            handle.clone(),
+            handle.0.clone(),
             Playback {
                 session,
                 endpoint,
                 path,
                 size,
                 subtitle,
+                conversion,
                 last_used: now,
                 last_checked: now,
             },
         );
-        PlaybackHandle(handle)
+        handle
     }
 
     /// Use `handle` from `session` on `endpoint`: refused if it is not
@@ -145,9 +165,40 @@ impl Playbacks {
         })
     }
 
-    /// End a playback whose session failed its re-check.
+    /// Mark `handle` used now, as a read that is still waiting for an
+    /// encode does, so the playback does not idle out under it.
+    pub fn touch(&self, handle: &PlaybackHandle) {
+        if let Some(p) = self.lock().get_mut(&handle.0) {
+            p.last_used = Instant::now();
+        }
+    }
+
+    /// End a playback: its session failed its re-check, or the client
+    /// stopped it.
     pub fn end(&self, handle: &PlaybackHandle) {
-        self.lock().remove(&handle.0);
+        // Dropped outside the lock: ending a conversion removes files.
+        let ended = self.lock().remove(&handle.0);
+        drop(ended);
+    }
+
+    /// End every playback idle past the limit. Run now and then, so a
+    /// conversion does not outlive its handle by long.
+    pub fn sweep(&self) {
+        let now = Instant::now();
+        let mut ended = Vec::new();
+        self.lock().retain(|_, p| {
+            let alive = now.duration_since(p.last_used) < self.idle;
+            if !alive {
+                ended.push(p.conversion.take());
+            }
+            alive
+        });
+        drop(ended);
+    }
+
+    /// How often [`Playbacks::sweep`] should run.
+    pub fn sweep_every(&self) -> Duration {
+        (self.idle / 2).min(Duration::from_secs(30))
     }
 }
 
@@ -157,10 +208,12 @@ mod tests {
 
     fn start(p: &Playbacks) -> PlaybackHandle {
         p.start(
+            Playbacks::new_handle(),
             SessionId("s".into()),
             "e".into(),
             "/media/a.mkv".into(),
             10,
+            None,
             None,
         )
     }

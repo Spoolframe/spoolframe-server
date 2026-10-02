@@ -1,0 +1,294 @@
+{
+    "MediaContainer": {
+        "size": 2,
+        "totalSize": 928,
+        "offset": 0,
+        "allowSync": true,
+        "art": "/:/resources/show-fanart.jpg",
+        "identifier": "com.plexapp.plugins.library",
+        "librarySectionID": 1,
+        "librarySectionTitle": "TV Shows",
+        "librarySectionUUID": "3a66592d-64dd-497a-8b5d-4b99f63b5b1c",
+        "mediaTagPrefix": "/system/bundle/media/flags/",
+        "mediaTagVersion": 1,
+        "nocache": true,
+        "sortAsc": true,
+        "thumb": "/:/resources/show.png",
+        "title1": "TV Shows",
+        "title2": "All Shows",
+        "viewGroup": "show",
+        "viewMode": 131122,
+        "Metadata": [
+            {
+                "ratingKey": "208620",
+                "key": "/library/metadata/208620",
+                "parentRatingKey": "208619",
+                "grandparentRatingKey": "208618",
+                "guid": "plex://episode/5d9c10307b5c2e001e6ac51a",
+                "parentGuid": "plex://season/602e62dfc96042002d07c0fc",
+                "grandparentGuid": "plex://show/5d9c083d7b5c2e001e6578f9",
+                "grandparentSlug": "12-monkeys",
+                "type": "episode",
+                "title": "Splinter",
+                "grandparentKey": "/library/metadata/208618",
+                "parentKey": "/library/metadata/208619",
+                "grandparentTitle": "12 Monkeys",
+                "parentTitle": "Season 1",
+                "contentRating": "TV-14",
+                "summary": "27 years after a virus wipes out most of humanity, scientists send a man back to 2015 to stop the plague from ever happening. Cole's only lead is a virologist, who knows the dangerous source of the outbreak.",
+                "index": 1,
+                "parentIndex": 1,
+                "audienceRating": 7.7,
+                "viewCount": 2,
+                "lastViewedAt": 1720402357,
+                "year": 2015,
+                "thumb": "/library/metadata/208620/thumb/1720258080",
+                "art": "/library/metadata/208618/art/1789149282",
+                "parentThumb": "/library/metadata/208619/thumb/1720224131",
+                "grandparentThumb": "/library/metadata/208618/thumb/1789149282",
+                "grandparentArt": "/library/metadata/208618/art/1789149282",
+                "grandparentTheme": "/library/metadata/208618/theme/1789149282",
+                "duration": 2852688,
+                "originallyAvailableAt": "2015-01-16",
+                "addedAt": 1720224129,
+                "updatedAt": 1720258080,
+                "audienceRatingImage": "themoviedb://image.rating",
+                "chapterSource": "media",
+                "Media": [
+                    {
+                        "id": 511562,
+                        "duration": 2852688,
+                        "bitrate": 27463,
+                        "width": 1920,
+                        "height": 1080,
+                        "aspectRatio": 1.78,
+                        "audioChannels": 6,
+                        "audioCodec": "dca-ma",
+                        "videoCodec": "h264",
+                        "videoResolution": "1080",
+                        "container": "mkv",
+                        "videoFrameRate": "24p",
+                        "audioProfile": "ma",
+                        "videoProfile": "high",
+                        "hasVoiceActivity": false,
+                        "Part": [
+                            {
+                                "id": 731914,
+                                "key": "/library/parts/731914/1611575775/file.mkv",
+                                "duration": 2852688,
+                                "file": "/slow/media//TVShows/12 Monkeys/Season 1/12.Monkeys.S01E01.Splinter.Bluray-1080p.Remux.mkv",
+                                "size": 9793008828,
+                                "audioProfile": "ma",
+                                "container": "mkv",
+                                "indexes": "sd",
+                                "videoProfile": "high"
+                            }
+                        ]
+                    }
+                ],
+                "Image": [
+                    {
+                        "alt": "Splinter",
+                        "type": "coverPoster",
+                        "url": "/library/metadata/208618/thumb/1789149282"
+                    },
+                    {
+                        "alt": "Splinter",
+                        "type": "snapshot",
+                        "url": "/library/metadata/208620/thumb/1720258080"
+                    },
+                    {
+                        "alt": "Splinter",
+                        "type": "background",
+                        "url": "/library/metadata/208618/art/1789149282"
+                    },
+                    {
+                        "alt": "Splinter",
+                        "type": "clearLogo",
+                        "url": "/library/metadata/208618/clearLogo/1789149282"
+                    },
+                    {
+                        "alt": "Splinter",
+                        "type": "backgroundSquare",
+                        "url": "/library/metadata/208618/squareArt/1789149282"
+                    }
+                ],
+                "UltraBlurColors": {
+                    "topLeft": "34200c",
+                    "topRight": "365d99",
+                    "bottomRight": "365d98",
+                    "bottomLeft": "774126"
+                },
+                "Guid": [
+                    {
+                        "id": "imdb://tt4135892"
+                    },
+                    {
+                        "id": "tmdb://991306"
+                    },
+                    {
+                        "id": "tvdb://4961780"
+                    }
+                ],
+                "Director": [
+                    {
+                        "tag": "Jeffrey Reiner"
+                    }
+                ],
+                "Writer": [
+                    {
+                        "tag": "Terry Matalas"
+                    },
+                    {
+                        "tag": "Travis Fickett"
+                    }
+                ],
+                "Role": [
+                    {
+                        "tag": "Aaron Stanford"
+                    },
+                    {
+                        "tag": "Amanda Schull"
+                    },
+                    {
+                        "tag": "Kirk Acevedo"
+                    }
+                ]
+            },
+            {
+                "ratingKey": "208627",
+                "key": "/library/metadata/208627",
+                "parentRatingKey": "208619",
+                "grandparentRatingKey": "208618",
+                "guid": "plex://episode/5d9c10307b5c2e001e6ac50b",
+                "parentGuid": "plex://season/602e62dfc96042002d07c0fc",
+                "grandparentGuid": "plex://show/5d9c083d7b5c2e001e6578f9",
+                "grandparentSlug": "12-monkeys",
+                "type": "episode",
+                "title": "Mentally Divergent",
+                "grandparentKey": "/library/metadata/208618",
+                "parentKey": "/library/metadata/208619",
+                "grandparentTitle": "12 Monkeys",
+                "parentTitle": "Season 1",
+                "contentRating": "TV-14",
+                "summary": "The trail of a mysterious organization called the \u201cArmy of the 12 Monkeys\u201d leads Cole to a mental institution in 2015, where a patient holds the key to the plague that destroys the world. Meanwhile, despite warnings that her involvement may disrupt the course of history, Dr. Railly risks her life to help him.",
+                "index": 2,
+                "parentIndex": 1,
+                "audienceRating": 7.2,
+                "viewCount": 2,
+                "skipCount": 1,
+                "lastViewedAt": 1720405977,
+                "year": 2015,
+                "thumb": "/library/metadata/208627/thumb/1720259905",
+                "art": "/library/metadata/208618/art/1789149282",
+                "parentThumb": "/library/metadata/208619/thumb/1720224131",
+                "grandparentThumb": "/library/metadata/208618/thumb/1789149282",
+                "grandparentArt": "/library/metadata/208618/art/1789149282",
+                "grandparentTheme": "/library/metadata/208618/theme/1789149282",
+                "duration": 2612443,
+                "originallyAvailableAt": "2015-01-22",
+                "addedAt": 1720228739,
+                "updatedAt": 1720259905,
+                "audienceRatingImage": "themoviedb://image.rating",
+                "chapterSource": "media",
+                "Media": [
+                    {
+                        "id": 511570,
+                        "duration": 2612443,
+                        "bitrate": 26700,
+                        "width": 1920,
+                        "height": 1080,
+                        "aspectRatio": 1.78,
+                        "audioChannels": 6,
+                        "audioCodec": "dca-ma",
+                        "videoCodec": "h264",
+                        "videoResolution": "1080",
+                        "container": "mkv",
+                        "videoFrameRate": "24p",
+                        "audioProfile": "ma",
+                        "videoProfile": "high",
+                        "hasVoiceActivity": false,
+                        "Part": [
+                            {
+                                "id": 731928,
+                                "key": "/library/parts/731928/1611576011/file.mkv",
+                                "duration": 2612443,
+                                "file": "/slow/media//TVShows/12 Monkeys/Season 1/12.Monkeys.S01E02.Mentally.Divergent.Bluray-1080p.Remux.mkv",
+                                "size": 8719119581,
+                                "audioProfile": "ma",
+                                "container": "mkv",
+                                "indexes": "sd",
+                                "videoProfile": "high"
+                            }
+                        ]
+                    }
+                ],
+                "Image": [
+                    {
+                        "alt": "Mentally Divergent",
+                        "type": "coverPoster",
+                        "url": "/library/metadata/208618/thumb/1789149282"
+                    },
+                    {
+                        "alt": "Mentally Divergent",
+                        "type": "snapshot",
+                        "url": "/library/metadata/208627/thumb/1720259905"
+                    },
+                    {
+                        "alt": "Mentally Divergent",
+                        "type": "background",
+                        "url": "/library/metadata/208618/art/1789149282"
+                    },
+                    {
+                        "alt": "Mentally Divergent",
+                        "type": "clearLogo",
+                        "url": "/library/metadata/208618/clearLogo/1789149282"
+                    },
+                    {
+                        "alt": "Mentally Divergent",
+                        "type": "backgroundSquare",
+                        "url": "/library/metadata/208618/squareArt/1789149282"
+                    }
+                ],
+                "UltraBlurColors": {
+                    "topLeft": "171e20",
+                    "topRight": "173f3f",
+                    "bottomRight": "705a29",
+                    "bottomLeft": "131718"
+                },
+                "Guid": [
+                    {
+                        "id": "imdb://tt4135886"
+                    },
+                    {
+                        "id": "tmdb://1021632"
+                    },
+                    {
+                        "id": "tvdb://5028338"
+                    }
+                ],
+                "Director": [
+                    {
+                        "tag": "David Grossman"
+                    }
+                ],
+                "Writer": [
+                    {
+                        "tag": "Natalie Chaidez"
+                    }
+                ],
+                "Role": [
+                    {
+                        "tag": "Aaron Stanford"
+                    },
+                    {
+                        "tag": "Amanda Schull"
+                    },
+                    {
+                        "tag": "Kirk Acevedo"
+                    }
+                ]
+            }
+        ]
+    }
+}

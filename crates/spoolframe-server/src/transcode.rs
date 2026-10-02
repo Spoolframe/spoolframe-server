@@ -33,6 +33,10 @@ impl Transcoding {
         }
     }
 
+    pub fn settings(&self) -> &TranscodeSettings {
+        &self.settings
+    }
+
     pub fn encoders(&self) -> Arc<Encoders> {
         self.current
             .read()

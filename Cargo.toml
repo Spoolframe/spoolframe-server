@@ -69,9 +69,14 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"
 wiremock = "0.6"
+# Checks the HLS playlists the server writes (P2-05), in tests.
+m3u8-rs = "6"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+
+# Pausing and resuming encodes (SIGSTOP/SIGCONT, P2-03).
+libc = "0.2"
 
 # Logging
 tracing = "0.1"

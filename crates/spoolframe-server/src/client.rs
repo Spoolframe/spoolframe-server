@@ -5,7 +5,7 @@
 //! Only the pre-auth requests are served without a session.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -29,13 +29,17 @@ use tokio::sync::Mutex;
 
 use crate::artwork::{Artwork, ArtworkError};
 use crate::auth::{LoginError, SessionToken};
+use crate::encode::job::{EncodeJob, JobError, Progress};
+use crate::encode::{Conversion, ConversionSource};
 use crate::network::{ConnectionAuth, Connections, Services};
 use crate::planner;
-use crate::playback::{Playback, Refusal, Sidecar};
+use crate::playback::{Playback, Playbacks, Refusal, Sidecar};
 use crate::principal::Principal;
 use crate::store::sessions::{SessionBinding, SessionUser};
 use crate::tracks::{self, TrackOverride};
 use crate::watch::WatchError;
+use spoolframe_protocol::ConvertedVideo;
+use spoolframe_types::Delivery;
 
 /// How long shutdown waits to deliver `ShuttingDown` to one client.
 const SHUTDOWN_NOTICE: Duration = Duration::from_millis(500);
@@ -312,6 +316,10 @@ impl ClientProtocol {
         let playback = self
             .use_playback(connection, &read.handle, &read.session)
             .await?;
+        if let Some(conversion) = &playback.conversion {
+            let keep_alive = || self.services.playbacks.touch(&read.handle);
+            return converted_range(conversion, read, &keep_alive).await;
+        }
         let size = playback.size;
         let sent = read
             .length
@@ -331,7 +339,15 @@ impl ClientProtocol {
                 .await
                 .map_err(unreadable)?;
         }
-        Ok((file, MediaReadReply { sent, size }))
+        Ok((
+            file,
+            MediaReadReply {
+                sent,
+                size,
+                complete: true,
+                epoch: 0,
+            },
+        ))
     }
 
     /// Fill in `principal`'s watch state on `items`, in one lookup.
@@ -529,7 +545,11 @@ impl ClientProtocol {
                     chosen,
                 })
             }
-            Request::StartPlayback { id, selection } => {
+            Request::StartPlayback {
+                id,
+                selection,
+                start_ms,
+            } => {
                 let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
                 let (path, descriptor) = self.describe(&id).await?;
                 let (selection, chosen) = self
@@ -541,27 +561,71 @@ impl ClientProtocol {
                     selection,
                     &self.services.transcoding.encoders(),
                 );
-                let subtitle = match &plan {
-                    PlaybackPlan::Direct { subtitle, .. } => subtitle.and_then(|planned| {
-                        match &descriptor.subtitles.get(planned.index as usize)?.source {
-                            SubtitleSource::External { path } => Some(Sidecar {
-                                path: path.clone(),
-                                format: planned.format,
-                            }),
-                            SubtitleSource::Embedded { .. } => None,
-                        }
-                    }),
+                let handle = Playbacks::new_handle();
+                let (subtitle, size, conversion) = match &plan {
+                    PlaybackPlan::Direct { subtitle, .. } => {
+                        let subtitle = subtitle.and_then(|planned| {
+                            match &descriptor.subtitles.get(planned.index as usize)?.source {
+                                SubtitleSource::External { path } => Some(Sidecar {
+                                    path: path.clone(),
+                                    format: planned.format,
+                                }),
+                                SubtitleSource::Embedded { .. } => None,
+                            }
+                        });
+                        let size = tokio::fs::metadata(&path)
+                            .await
+                            .map_err(|e| {
+                                tracing::warn!(%id, error = %e, "cannot stat a media file");
+                                Error::Unavailable {
+                                    message: "the media file could not be read".into(),
+                                }
+                            })?
+                            .len();
+                        (subtitle, size, None)
+                    }
+                    PlaybackPlan::Converted {
+                        delivery, video, ..
+                    } => {
+                        // HLS of a copied video is cut at its keyframes.
+                        let keyframes = match (delivery, video) {
+                            (Delivery::Hls, Some(ConvertedVideo::Copy { .. })) => {
+                                Some(self.services.prober.keyframes(&path).await.map_err(|e| {
+                                    tracing::warn!(%id, error = %e, "cannot list keyframes");
+                                    Error::PlaybackFailed {
+                                        reason: "the file's keyframes could not be read".into(),
+                                    }
+                                })?)
+                            }
+                            _ => None,
+                        };
+                        let transcoding = &self.services.transcoding;
+                        let conversion = Conversion::start(
+                            self.services.jobs.clone(),
+                            ConversionSource {
+                                handle: &handle.0,
+                                path: &path,
+                                descriptor: descriptor.clone(),
+                                plan: &plan,
+                                encoders: transcoding.encoders(),
+                                vaapi_device: &transcoding.settings().vaapi_device,
+                                keyframes,
+                            },
+                            start_ms.map(Duration::from_millis),
+                        )
+                        .map_err(|e| match e {
+                            JobError::Busy => Error::Busy,
+                            JobError::Prepare(reason) => {
+                                tracing::warn!(%id, reason, "cannot start a conversion");
+                                Error::PlaybackFailed { reason }
+                            }
+                        })?;
+                        (None, 0, Some(conversion))
+                    }
                     PlaybackPlan::Unsupported { reasons } => {
                         return Err(Error::CannotPlay {
                             reasons: reasons.clone(),
                         });
-                    }
-                    // Converting is planned (P2-01) but not yet served
-                    // (P2-03): say why it would be converted, and that.
-                    PlaybackPlan::Converted { reasons, .. } => {
-                        let mut reasons = reasons.clone();
-                        reasons.push("this server cannot stream a conversion yet".into());
-                        return Err(Error::CannotPlay { reasons });
                     }
                     other => {
                         return Err(Error::CannotPlay {
@@ -569,21 +633,14 @@ impl ClientProtocol {
                         });
                     }
                 };
-                let size = tokio::fs::metadata(&path)
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(%id, error = %e, "cannot stat a media file");
-                        Error::Unavailable {
-                            message: "the media file could not be read".into(),
-                        }
-                    })?
-                    .len();
                 let handle = self.services.playbacks.start(
+                    handle,
                     session,
                     connection.remote_id().to_string(),
                     path,
                     size,
                     subtitle,
+                    conversion,
                 );
                 tracing::info!(%id, user = %user.username, "playback started");
                 Ok(Reply::PlaybackStarted {
@@ -591,7 +648,45 @@ impl ClientProtocol {
                     plan,
                     size,
                     chosen,
+                    epoch: 0,
                 })
+            }
+            Request::StopPlayback { handle } => {
+                // Only the session and endpoint that started it may end it.
+                self.use_playback(connection, &handle, &session).await?;
+                self.services.playbacks.end(&handle);
+                Ok(Reply::Done)
+            }
+            // Converted playback only; served from P2-04 and P2-05.
+            Request::SeekPlayback {
+                handle,
+                position_ms,
+            } => {
+                let playback = self.use_playback(connection, &handle, &session).await?;
+                let Some(conversion) = playback.conversion else {
+                    // A direct-play client seeks by reading elsewhere.
+                    return Err(Error::NotFound {
+                        what: "a conversion in this playback".into(),
+                    });
+                };
+                let epoch = conversion
+                    .restart(Duration::from_millis(position_ms), 1)
+                    .map_err(|e| match e {
+                        JobError::Busy => Error::Busy,
+                        JobError::Prepare(reason) => Error::PlaybackFailed { reason },
+                    })?;
+                tracing::debug!(epoch, position_ms, "conversion restarted at a seek");
+                Ok(Reply::PlaybackSeeked { epoch })
+            }
+            Request::GetManifest { handle, kind } => {
+                let playback = self.use_playback(connection, &handle, &session).await?;
+                playback
+                    .conversion
+                    .and_then(|c| c.manifest(kind))
+                    .map(|text| Reply::Manifest { text })
+                    .ok_or_else(|| Error::NotFound {
+                        what: "an HLS conversion in this playback".into(),
+                    })
             }
             Request::ReadSubtitle { handle } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
@@ -795,6 +890,170 @@ const MAX_PAGE: u32 = 500;
 fn internal(e: impl std::fmt::Display) -> Error {
     tracing::error!(error = %e, "request failed");
     Error::Internal
+}
+
+/// How long a read past what an encode has written waits for more.
+const READ_WAIT: Duration = Duration::from_secs(10);
+
+/// A range of a converted playback's progressive output (P2-04): the bytes
+/// written so far, waiting a while for more when the read is past them.
+async fn converted_range(
+    conversion: &Conversion,
+    read: &MediaRead,
+    keep_alive: &(dyn Fn() + Sync),
+) -> Result<(tokio::fs::File, MediaReadReply), Error> {
+    if let Some(n) = read.segment {
+        return segment_range(conversion, n, read, keep_alive).await;
+    }
+    let job = conversion.job();
+    if read.epoch != job.epoch {
+        return Err(Error::PlaybackRestarted { epoch: job.epoch });
+    }
+    // Asking for bytes ahead is reading: it may let a paused encode go on.
+    job.read_to(read.offset);
+    let offset = read.offset;
+    // Still nothing after the wait: say so, and the client asks again.
+    let now = wait_for(&job, keep_alive, |p| p.bytes > offset || p.done.is_some()).await;
+    if let Some(Err(reason)) = &now.done {
+        return Err(Error::PlaybackFailed {
+            reason: reason.clone(),
+        });
+    }
+    let size = now.bytes;
+    let sent = read
+        .length
+        .min(MAX_READ)
+        .min(size.saturating_sub(read.offset));
+    job.read_to(read.offset + sent);
+    let file = job.dir().join("out.mkv");
+    let unreadable = |e: std::io::Error| {
+        tracing::warn!(path = %file.display(), error = %e, "cannot read an encode's output");
+        Error::PlaybackFailed {
+            reason: "the conversion's output could not be read".into(),
+        }
+    };
+    let handle = open_at(&file, read.offset, sent)
+        .await
+        .map_err(unreadable)?;
+    Ok((
+        handle,
+        MediaReadReply {
+            sent,
+            size,
+            complete: matches!(now.done, Some(Ok(()))),
+            epoch: job.epoch,
+        },
+    ))
+}
+
+/// Wait up to [`READ_WAIT`] for `job` to get where `ready` says, keeping
+/// the playback alive meanwhile; then how far it has got.
+async fn wait_for(
+    job: &EncodeJob,
+    keep_alive: &(dyn Fn() + Sync),
+    ready: impl Fn(&Progress) -> bool,
+) -> Progress {
+    let mut progress = job.progress();
+    let deadline = tokio::time::Instant::now() + READ_WAIT;
+    loop {
+        keep_alive();
+        let slice = tokio::time::timeout(Duration::from_secs(1), progress.wait_for(&ready)).await;
+        match slice {
+            Ok(Ok(p)) => return p.clone(),
+            Ok(Err(_)) => break,
+            Err(_) if tokio::time::Instant::now() >= deadline => break,
+            Err(_) => {}
+        }
+    }
+    job.progress().borrow().clone()
+}
+
+/// `file` at `offset`, to send `sent` bytes from. With nothing to send the
+/// file may not exist yet; an empty stand-in does.
+async fn open_at(file: &Path, offset: u64, sent: u64) -> std::io::Result<tokio::fs::File> {
+    if sent == 0 {
+        return tokio::fs::File::open("/dev/null").await;
+    }
+    let mut handle = tokio::fs::File::open(file).await?;
+    handle.seek(std::io::SeekFrom::Start(offset)).await?;
+    Ok(handle)
+}
+
+/// A range of HLS segment `n` (P2-05), 0 being the init segment. Segments
+/// are addressed by number, not by epoch: a read far from what is written
+/// restarts the encode there and waits for it.
+async fn segment_range(
+    conversion: &Conversion,
+    n: u32,
+    read: &MediaRead,
+    keep_alive: &(dyn Fn() + Sync),
+) -> Result<(tokio::fs::File, MediaReadReply), Error> {
+    let segments = conversion.segments().ok_or_else(|| Error::NotFound {
+        what: "an HLS conversion in this playback".into(),
+    })?;
+    if n > segments.count() {
+        return Err(Error::NotFound {
+            what: format!("segment {n}"),
+        });
+    }
+    let job = if n == 0 {
+        conversion.job()
+    } else {
+        conversion.job_for_segment(n).map_err(|e| match e {
+            JobError::Busy => Error::Busy,
+            JobError::Prepare(reason) => Error::PlaybackFailed { reason },
+        })?
+    };
+    // A segment is final once ffmpeg has finished it or the encode has
+    // ended; the init segment once the first media segment is finished.
+    let wanted = if n == 0 { job.first_segment } else { n };
+    // The reader is at the end of the segment it waits for, as far as the
+    // throttle is concerned, or the encode pauses just short of finishing
+    // it.
+    job.reader_at(segments.start(wanted + 1).unwrap_or(segments.total_ms));
+    let now = wait_for(&job, keep_alive, |p| {
+        p.last_segment.is_some_and(|l| l >= wanted) || p.done.is_some()
+    })
+    .await;
+    if let Some(Err(reason)) = &now.done {
+        return Err(Error::PlaybackFailed {
+            reason: reason.clone(),
+        });
+    }
+    let complete = now.last_segment.is_some_and(|l| l >= wanted) || now.done.is_some();
+    let name = if n == 0 {
+        "init.mp4".to_owned()
+    } else {
+        format!("seg{n}.m4s")
+    };
+    let file = job.dir().join(name);
+    let size = if complete {
+        std::fs::metadata(&file).map_or(0, |m| m.len())
+    } else {
+        0
+    };
+    let sent = read
+        .length
+        .min(MAX_READ)
+        .min(size.saturating_sub(read.offset));
+    let unreadable = |e: std::io::Error| {
+        tracing::warn!(path = %file.display(), error = %e, "cannot read a segment");
+        Error::PlaybackFailed {
+            reason: "a segment of the conversion could not be read".into(),
+        }
+    };
+    let handle = open_at(&file, read.offset, sent)
+        .await
+        .map_err(unreadable)?;
+    Ok((
+        handle,
+        MediaReadReply {
+            sent,
+            size,
+            complete,
+            epoch: job.epoch,
+        },
+    ))
 }
 
 /// A catalog failure as the client sees it. Backend details (the PMS URL,

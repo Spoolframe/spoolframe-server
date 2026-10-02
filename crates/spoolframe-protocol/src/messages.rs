@@ -93,6 +93,25 @@ pub enum Request {
         id: MediaId,
         #[serde(default)]
         selection: Option<Selection>,
+        /// Where to start, for a converted playback (P2-03): the encode
+        /// begins there. Direct play reads from wherever the client likes.
+        #[serde(default)]
+        start_ms: Option<u64>,
+    },
+    /// End a playback now, and any encode for it.
+    StopPlayback {
+        handle: PlaybackHandle,
+    },
+    /// Restart a converted playback's encode at `position_ms` (P2-04):
+    /// reads then name the new epoch and start at offset 0.
+    SeekPlayback {
+        handle: PlaybackHandle,
+        position_ms: u64,
+    },
+    /// A converted playback's HLS playlist (P2-05).
+    GetManifest {
+        handle: PlaybackHandle,
+        kind: ManifestKind,
     },
     /// The selected external subtitle of a playback, whole.
     ReadSubtitle {
@@ -266,6 +285,17 @@ pub enum Reply {
         /// The tracks the server chose, when the request had no selection.
         #[serde(default)]
         chosen: Option<ChosenTracks>,
+        /// The encode reads name; 0 for direct play.
+        #[serde(default)]
+        epoch: u32,
+    },
+    /// A seek restarted the encode: reads name this epoch from offset 0.
+    PlaybackSeeked {
+        epoch: u32,
+    },
+    /// An HLS playlist, as text.
+    Manifest {
+        text: String,
     },
     Subtitle {
         format: SubtitleFormat,
@@ -276,6 +306,18 @@ pub enum Reply {
     Done,
     Home(HomeScreen),
     TrackPreferences(TrackPreferences),
+}
+
+/// Which HLS playlist (P2-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestKind {
+    /// The top playlist, naming the variant.
+    Multivariant,
+    /// The variant's segments.
+    Media,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Rows for a home screen. Every item carries the user's playback state.
@@ -356,6 +398,16 @@ pub enum Error {
     /// `StartPlayback` again and go on from where playback was.
     #[error("the playback has expired; start it again")]
     PlaybackExpired,
+    /// The server is converting as many files as it may at once.
+    #[error("the server is busy converting; try again later")]
+    Busy,
+    /// The encode for this playback failed; `reason` is ffmpeg's.
+    #[error("the conversion failed: {reason}")]
+    PlaybackFailed { reason: String },
+    /// The read names an encode that a seek replaced; read `epoch` from
+    /// offset 0.
+    #[error("the playback restarted at a seek (epoch {epoch})")]
+    PlaybackRestarted { epoch: u32 },
     /// Something the server depends on (Plex, a media mount) is down.
     #[error("unavailable: {message}")]
     Unavailable { message: String },

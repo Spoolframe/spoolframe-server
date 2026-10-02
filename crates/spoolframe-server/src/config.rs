@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use spoolframe_media::encoders::{Hardware, HardwarePolicy, TranscodeSettings};
 use spoolframe_plex::{PathMap, PathMapping};
 
+use crate::encode::JobLimits;
 use crate::network::{EndpointOptions, Relay};
 use crate::watch::WatchRules;
 use std::time::Duration;
@@ -140,8 +141,9 @@ impl MediaConfig {
     }
 }
 
-/// `transcode { hardware = "nvenc,vaapi"; vaapi_device = "/dev/dri/renderD128"; }`,
-/// all optional.
+/// `transcode { hardware = "nvenc,vaapi"; vaapi_device = "/dev/dri/renderD128";
+/// max_jobs = 2; scratch_dir = "…"; scratch_limit_mb = 20480;
+/// read_ahead_secs = 60; }`, all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct TranscodeConfig {
@@ -152,9 +154,41 @@ pub struct TranscodeConfig {
     pub hardware: Option<String>,
     #[ucl(default)]
     pub vaapi_device: Option<PathBuf>,
+    /// Encodes at once; 2 if left out.
+    #[ucl(default)]
+    pub max_jobs: Option<u32>,
+    /// Where encodes write; `state_dir/cache/transcode` if left out.
+    #[ucl(default)]
+    pub scratch_dir: Option<PathBuf>,
+    /// The most all encodes may write together, in MiB; 20 GiB if left out.
+    #[ucl(default)]
+    pub scratch_limit_mb: Option<u64>,
+    /// How far an encode may run ahead of its reader; 60 s if left out.
+    #[ucl(default)]
+    pub read_ahead_secs: Option<u64>,
 }
 
 impl TranscodeConfig {
+    /// The job limits, with `state_dir` for the default scratch directory.
+    pub fn limits(&self, state_dir: &Path) -> Result<JobLimits, ConfigError> {
+        let max_jobs = self.max_jobs.unwrap_or(2);
+        if max_jobs == 0 {
+            return Err(ConfigError::Invalid {
+                key: "transcode.max_jobs",
+                message: "0 would refuse every conversion; use at least 1".into(),
+            });
+        }
+        Ok(JobLimits {
+            max_jobs: max_jobs as usize,
+            scratch_dir: self
+                .scratch_dir
+                .clone()
+                .unwrap_or_else(|| state_dir.join("cache").join("transcode")),
+            scratch_limit_bytes: self.scratch_limit_mb.unwrap_or(20 * 1024) << 20,
+            read_ahead: Duration::from_secs(self.read_ahead_secs.unwrap_or(60)),
+        })
+    }
+
     pub fn settings(&self) -> Result<TranscodeSettings, ConfigError> {
         let invalid = |message: String| ConfigError::Invalid {
             key: "transcode.hardware",
@@ -313,6 +347,27 @@ pub struct PlexConfig {
     /// (ARCHITECTURE §7).
     #[ucl(default)]
     pub path_mapping: Vec<PathMappingConfig>,
+    /// Two-way watch state sync with the Plex account this server reads
+    /// as (PX-04). Off unless set.
+    #[ucl(default)]
+    pub watch_sync: Option<WatchSyncConfig>,
+}
+
+/// `watch_sync { user = "andoriyu"; interval_secs = 120; }`
+#[derive(Debug, Clone, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct WatchSyncConfig {
+    /// The Spoolframe user whose state is the Plex account's.
+    pub user: String,
+    /// How often to sync when nothing changes here; 120 if left out.
+    #[ucl(default)]
+    pub interval_secs: Option<u64>,
+}
+
+impl WatchSyncConfig {
+    pub fn interval(&self) -> Duration {
+        Duration::from_secs(self.interval_secs.unwrap_or(120).max(10))
+    }
 }
 
 /// `{ library = "Music"; from = "/data"; to = "/mnt/nas/music"; }`
@@ -421,6 +476,7 @@ impl ServerConfig {
         parsed.admin.listen()?;
         parsed.watch.rules()?;
         parsed.transcode.settings()?;
+        parsed.transcode.limits(&parsed.state_dir)?;
         Ok(parsed)
     }
 
@@ -598,6 +654,30 @@ mod tests {
     }
 
     #[test]
+    fn job_limits_default_under_the_state_dir() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        let limits = config.transcode.limits(Path::new("/var/lib/sf")).unwrap();
+        assert_eq!(limits.max_jobs, 2);
+        assert_eq!(
+            limits.scratch_dir,
+            PathBuf::from("/var/lib/sf/cache/transcode")
+        );
+        assert_eq!(limits.scratch_limit_bytes, 20 << 30);
+        assert_eq!(limits.read_ahead, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn zero_jobs_is_refused() {
+        assert!(matches!(
+            plex(r#"plex { url = "http://nas:32400"; } transcode { max_jobs = 0; }"#),
+            Err(ConfigError::Invalid {
+                key: "transcode.max_jobs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn a_hardware_family_is_read_and_a_bad_one_refused() {
         let config = plex(
             r#"plex { url = "http://nas:32400"; } transcode { hardware = "none"; vaapi_device = "/dev/dri/renderD129"; }"#,
@@ -620,6 +700,17 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn plex_watch_sync_is_off_unless_set() {
+        let off = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert!(off.plex.watch_sync.is_none());
+        let on = plex(r#"plex { url = "http://nas:32400"; watch_sync { user = "andoriyu"; } }"#)
+            .unwrap();
+        let sync = on.plex.watch_sync.unwrap();
+        assert_eq!(sync.user, "andoriyu");
+        assert_eq!(sync.interval(), Duration::from_secs(120));
     }
 
     #[test]
@@ -766,6 +857,7 @@ mod tests {
             url: "http://nas:32400".into(),
             token_file: Some(file),
             path_mapping: Vec::new(),
+            watch_sync: None,
         };
         assert_eq!(config.token().unwrap().as_deref(), Some("abc123"));
     }
@@ -776,6 +868,7 @@ mod tests {
             url: "http://nas:32400".into(),
             token_file: Some(PathBuf::from("/nonexistent/plex-token")),
             path_mapping: Vec::new(),
+            watch_sync: None,
         };
         let err = config.token().unwrap_err();
         assert!(err.to_string().contains("/nonexistent/plex-token"), "{err}");
@@ -791,6 +884,7 @@ mod tests {
             url: "http://nas:32400".into(),
             token_file: Some(file),
             path_mapping: Vec::new(),
+            watch_sync: None,
         };
         assert!(matches!(
             config.token(),

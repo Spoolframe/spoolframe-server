@@ -19,8 +19,8 @@ pub mod streams;
 pub use artwork::{ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
 pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle};
 pub use messages::{
-    AuthMethod, Error, Event, Hello, HomeScreen, LoginPassword, PROTOCOL_VERSION, Reply, Request,
-    RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
+    AuthMethod, Error, Event, Hello, HomeScreen, LoginPassword, ManifestKind, PROTOCOL_VERSION,
+    Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
 };
 pub use playback::{
     AudioAction, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, PlannedAudio,

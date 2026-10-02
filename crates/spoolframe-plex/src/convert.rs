@@ -105,6 +105,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
         MediaKind::Season => Item::Season(Season {
             id,
             show_id: parent(m, MediaKind::Show)?,
+            show_title: m.parent_title.clone(),
             season: required(m, m.index, "index")?,
             title: m.title.clone(),
             artwork: artwork(m, ArtworkKind::Poster)?,
@@ -112,14 +113,20 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
         MediaKind::Episode => Item::Episode(Episode {
             id,
             show_id: grandparent(m, MediaKind::Show)?,
+            show_title: m.grandparent_title.clone(),
             season_id: parent(m, MediaKind::Season)?,
             season: required(m, m.parent_index, "parentIndex")?,
             episode: required(m, m.index, "index")?,
             title: m.title.clone(),
             summary: summary(m),
             duration: duration(m),
-            // An episode's thumb is a still from it, not a poster.
-            artwork: artwork(m, ArtworkKind::Thumb)?,
+            // An episode's thumb is a still from it, not a poster; its
+            // poster is its season's, else its show's.
+            artwork: with_poster(
+                artwork(m, ArtworkKind::Thumb)?,
+                m,
+                m.parent_thumb.as_deref().or(m.grandparent_thumb.as_deref()),
+            )?,
             playback: PlaybackState::default(),
         }),
         MediaKind::Artist => Item::Artist(Artist {
@@ -131,6 +138,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
         MediaKind::Album => Item::Album(Album {
             id,
             artist_id: parent(m, MediaKind::Artist)?,
+            artist_name: m.parent_title.clone(),
             title: m.title.clone(),
             year: m.year,
             artwork: artwork(m, ArtworkKind::Poster)?,
@@ -225,6 +233,23 @@ fn artwork(m: &Metadata, primary: ArtworkKind) -> Result<Vec<Artwork>, ConvertEr
                 .map_err(|e| ConvertError::in_item(m, e.to_string()))
         })
         .collect()
+}
+
+/// `artwork` with `poster` added as the poster, when there is one.
+fn with_poster(
+    mut artwork: Vec<Artwork>,
+    m: &Metadata,
+    poster: Option<&str>,
+) -> Result<Vec<Artwork>, ConvertError> {
+    if let Some(path) = poster {
+        let id = ArtworkId::new(Namespace::Plex, path)
+            .map_err(|e| ConvertError::in_item(m, e.to_string()))?;
+        artwork.push(Artwork {
+            id,
+            kind: ArtworkKind::Poster,
+        });
+    }
+    Ok(artwork)
 }
 
 #[cfg(test)]
@@ -353,6 +378,38 @@ mod tests {
         assert_eq!((ep.season, ep.episode), (1, 1));
         assert_eq!(ep.title, "Splinter");
         assert_eq!(ep.artwork[0].kind, ArtworkKind::Thumb);
+    }
+
+    #[test]
+    fn an_episode_carries_its_show_s_title_and_its_season_s_poster() {
+        let Item::Episode(ep) = only_item("metadata-episode") else {
+            panic!("not an episode")
+        };
+        assert_eq!(ep.show_title.as_deref(), Some("12 Monkeys"));
+        let poster = ep
+            .artwork
+            .iter()
+            .find(|a| a.kind == ArtworkKind::Poster)
+            .expect("a poster");
+        assert!(
+            poster
+                .id
+                .key()
+                .starts_with("/library/metadata/208619/thumb/"),
+            "{poster:?}"
+        );
+    }
+
+    #[test]
+    fn a_season_and_an_album_carry_their_parent_s_name() {
+        let Item::Season(season) = only_item("metadata-season") else {
+            panic!("not a season")
+        };
+        assert_eq!(season.show_title.as_deref(), Some("12 Monkeys"));
+        let Item::Album(album) = only_item("metadata-album") else {
+            panic!("not an album")
+        };
+        assert_eq!(album.artist_name.as_deref(), Some("The Cranberries"));
     }
 
     #[test]

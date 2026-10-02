@@ -33,6 +33,7 @@ async fn server(test: &str) -> SocketAddr {
         auth,
         Some(SetupCode::new(CODE)),
         status(),
+        None,
     )
     .await
     .unwrap();
@@ -172,6 +173,13 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
         .await
         .unwrap_err();
     assert_eq!(code(err), error_code::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn plex_watch_sync_says_when_it_is_not_configured() {
+    let (_, admin) = admin_client("no-plex-sync").await;
+    let err = admin.plex_watch_sync(true).await.unwrap_err();
+    assert_eq!(code(err), error_code::NOT_CONFIGURED);
 }
 
 #[tokio::test]
@@ -318,7 +326,7 @@ async fn a_server_started_with_users_offers_no_setup() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let auth = Auth::new(Store::open(&dir).await.unwrap());
-    let (addr, handle) = admin::serve("127.0.0.1:0".parse().unwrap(), auth, None, status())
+    let (addr, handle) = admin::serve("127.0.0.1:0".parse().unwrap(), auth, None, status(), None)
         .await
         .unwrap();
     std::mem::forget(handle);

@@ -89,10 +89,23 @@ fn every_request_round_trips() {
         Request::StartPlayback {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
             selection: Some(Selection::default()),
+            start_ms: Some(1_800_000),
         },
         Request::StartPlayback {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
             selection: None,
+            start_ms: None,
+        },
+        Request::StopPlayback {
+            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+        },
+        Request::SeekPlayback {
+            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            position_ms: 600_000,
+        },
+        Request::GetManifest {
+            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            kind: spoolframe_protocol::ManifestKind::Media,
         },
         Request::GetTrackPreferences,
         Request::SetTrackPreferences {
@@ -181,6 +194,10 @@ fn every_reply_round_trips() {
         }),
         Reply::LoggedOut,
         Reply::Done,
+        Reply::PlaybackSeeked { epoch: 1 },
+        Reply::Manifest {
+            text: "#EXTM3U\n".into(),
+        },
         Reply::Home(spoolframe_protocol::HomeScreen {
             continue_watching: vec![movie()],
             next_up: Vec::new(),
@@ -190,6 +207,7 @@ fn every_reply_round_trips() {
             handle: spoolframe_protocol::PlaybackHandle("h".into()),
             plan: PlaybackPlan::Unsupported { reasons: vec![] },
             size: 12_345,
+            epoch: 0,
             chosen: Some(ChosenTracks {
                 selection: Selection {
                     audio: Some(2),
@@ -371,16 +389,42 @@ fn media_reads_round_trip() {
         handle: spoolframe_protocol::PlaybackHandle("h".into()),
         offset: 1 << 30,
         length: spoolframe_protocol::MAX_READ,
+        epoch: 2,
+        segment: Some(14),
     });
     round_trip(spoolframe_protocol::MediaReadResponse::Ok(
         spoolframe_protocol::MediaReadReply {
             sent: 4096,
             size: 1 << 33,
+            complete: false,
+            epoch: 2,
         },
     ));
-    round_trip(spoolframe_protocol::MediaReadResponse::Err(
+    for error in [
         Error::PlaybackExpired,
-    ));
+        Error::Busy,
+        Error::PlaybackFailed {
+            reason: "Invalid data found when processing input".into(),
+        },
+        Error::PlaybackRestarted { epoch: 3 },
+    ] {
+        round_trip(spoolframe_protocol::MediaReadResponse::Err(error));
+    }
+}
+
+/// A reply from a server before P2-04 has neither `complete` nor `epoch`:
+/// it was direct play, so the whole file.
+#[test]
+fn an_older_server_s_read_reply_is_complete_at_epoch_0() {
+    #[derive(Serialize)]
+    struct OldReply {
+        sent: u64,
+        size: u64,
+    }
+    let bytes = codec::encode(&OldReply { sent: 10, size: 20 }).unwrap();
+    let reply: spoolframe_protocol::MediaReadReply = codec::decode(&bytes).unwrap();
+    assert!(reply.complete);
+    assert_eq!(reply.epoch, 0);
 }
 
 #[test]

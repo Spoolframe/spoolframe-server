@@ -115,3 +115,24 @@ async fn every_library_walks_down_to_a_playable_item() {
         }
     }
 }
+
+/// Read-only: the account's watched and in-progress items (PX-04). Never
+/// writes to the PMS.
+#[tokio::test]
+async fn the_account_s_watch_state_is_read() {
+    let Some(catalog) = live_catalog() else {
+        return;
+    };
+    let states = catalog.watch_states().await.unwrap();
+    let watched = states.iter().filter(|w| w.watched).count();
+    let started = states.iter().filter(|w| w.position_ms.is_some()).count();
+    eprintln!(
+        "{} items: {watched} watched, {started} in progress",
+        states.len()
+    );
+    for w in states.iter().filter(|w| w.position_ms.is_some()).take(5) {
+        eprintln!("  in progress: {}", w.title);
+    }
+    assert!(!states.is_empty());
+    assert!(states.iter().all(|w| w.watched || w.position_ms.is_some()));
+}

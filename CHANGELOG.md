@@ -158,3 +158,33 @@
   the detected encoders; a Phase 1 client gets the plans it got before.
   `StartPlayback` refuses a converted plan until conversions are served
   (P2-03), naming why it would convert.
+- Two-way watch state sync with the Plex account the server reads as
+  (PX-04): `plex { watch_sync { user = "…"; interval_secs = 120; } }`.
+  Watched marks and resume positions move both ways, the newer side
+  winning; a run happens at start, every interval, and a few seconds
+  after the user's state changes here. `spoolframe-server plex sync-watch
+  [--dry-run]` runs one now and prints it.
+- Wire and config for converted playback (P2-03, P2-04, P2-05):
+  `StartPlayback.start_ms`, `StopPlayback`, `SeekPlayback`, `GetManifest`,
+  `epoch` and `segment` on media reads, `complete` and `epoch` on their
+  replies, and the errors `Busy`, `PlaybackFailed` and `PlaybackRestarted`.
+  `transcode { max_jobs; scratch_dir; scratch_limit_mb; read_ahead_secs; }`.
+  `StopPlayback` works now; seeking and manifests come with the encodes.
+- Encode jobs (P2-03): `StartPlayback` on a converted plan starts ffmpeg
+  for the handle, from `start_ms` in the film's own time, into the
+  scratch directory. It is paused once `read_ahead_secs` ahead of its
+  reader and ends with the handle (stop, idle expiry, revoked session),
+  taking its files with it. Over `max_jobs` the answer is `Busy`; leftover
+  files are removed at start.
+- Progressive delivery (P2-04): a converted playback's Matroska output is
+  read over the same MEDIA range reads as a file, while it is encoded.
+  `size` is what is written so far, a read past it waits up to 10 s, and
+  `complete` says the encode has ended. `SeekPlayback` restarts the
+  encode at a position as a new `epoch`; reads of the old one get
+  `PlaybackRestarted`. A failed encode fails reads with ffmpeg's reason.
+- HLS (P2-05): a converted playback for an HLS client is encoded into fMP4
+  segments; `GetManifest` returns the multivariant and the VOD media
+  playlist covering the whole file, and `MediaRead { segment }` reads a
+  segment (0 is init). An encoded video is a 6 s grid; a copied one is
+  cut at the source's keyframes, which the server lists once per file. A
+  segment far ahead of the encode restarts it there.

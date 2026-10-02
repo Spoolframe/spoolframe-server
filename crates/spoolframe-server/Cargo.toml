@@ -23,6 +23,7 @@ jsonrpsee = { workspace = true, features = ["server", "ws-client"] }
 rpassword = { workspace = true }
 spoolframe-admin-api = { workspace = true, features = ["server", "client"] }
 tower = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spoolframe-catalog = { workspace = true }
@@ -42,5 +43,6 @@ url = { workspace = true }
 
 [dev-dependencies]
 cargo_metadata = { workspace = true }
+m3u8-rs = { workspace = true }
 futures-util = { workspace = true }
 spoolframe-client-sdk = { workspace = true }

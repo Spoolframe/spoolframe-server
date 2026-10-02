@@ -259,6 +259,7 @@ impl Session {
         let request = Request::StartPlayback {
             id: id.clone(),
             selection,
+            start_ms: None,
         };
         match self.call(request).await? {
             Reply::PlaybackStarted {
@@ -266,6 +267,7 @@ impl Session {
                 plan,
                 size,
                 chosen,
+                ..
             } => Ok(Playback {
                 handle,
                 plan,
@@ -329,6 +331,8 @@ impl Session {
             handle: handle.clone(),
             offset,
             length,
+            epoch: 0,
+            segment: None,
         };
         let conn = self.client.connection(self.server).await?;
         match conn.read(&request).await? {

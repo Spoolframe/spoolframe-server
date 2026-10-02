@@ -27,6 +27,10 @@ pub mod error_code {
     pub const INVALID_INPUT: i32 = -32008;
     /// `setup` with a setup code that is not the one in the server's log.
     pub const INVALID_SETUP_CODE: i32 = -32009;
+    /// A feature the server's config does not turn on.
+    pub const NOT_CONFIGURED: i32 = -32010;
+    /// A backend the server depends on (Plex) failed.
+    pub const UNAVAILABLE: i32 = -32011;
 }
 
 /// A username and password.
@@ -146,6 +150,15 @@ pub struct TranscodingStatus {
     pub hardware_decoders: Vec<String>,
 }
 
+/// What a Plex watch sync run did, or would do (PX-04): one line per item.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexSyncReport {
+    pub pulled: Vec<String>,
+    pub pushed: Vec<String>,
+    pub failed: Vec<String>,
+}
+
 #[cfg_attr(
     all(feature = "client", feature = "server"),
     jsonrpsee::proc_macros::rpc(client, server, namespace = "admin")
@@ -190,4 +203,9 @@ pub trait AdminApi {
     /// The server's name, key, version and encoders. Admins only.
     #[method(name = "serverStatus", with_extensions)]
     async fn server_status(&self) -> jsonrpsee::core::RpcResult<ServerStatus>;
+
+    /// Sync watch state with Plex now (PX-04); with `dryRun`, only say
+    /// what would change. Admins only.
+    #[method(name = "plexWatchSync", with_extensions)]
+    async fn plex_watch_sync(&self, dry_run: bool) -> jsonrpsee::core::RpcResult<PlexSyncReport>;
 }

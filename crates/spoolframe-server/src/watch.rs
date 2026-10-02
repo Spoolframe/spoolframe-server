@@ -78,6 +78,8 @@ pub struct Watch {
     /// When each (principal, item)'s progress was last written.
     written: Mutex<HashMap<(Principal, String), Instant>>,
     next_up: Mutex<HashMap<Principal, (Instant, Vec<Item>)>>,
+    /// Who saved a state last, for whoever mirrors it elsewhere (PX-04).
+    changed: tokio::sync::watch::Sender<Option<Principal>>,
 }
 
 impl std::fmt::Debug for Watch {
@@ -110,7 +112,13 @@ impl Watch {
             rules,
             written: Mutex::default(),
             next_up: Mutex::default(),
+            changed: tokio::sync::watch::Sender::new(None),
         }
+    }
+
+    /// Fires after each state saved through [`Watch`], with its principal.
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<Option<Principal>> {
+        self.changed.subscribe()
     }
 
     /// Record that `principal` is at `position` in `id`. Written at most
@@ -212,6 +220,7 @@ impl Watch {
             .lock()
             .expect("never held across a panic")
             .remove(&principal);
+        self.changed.send_replace(Some(principal));
         Ok(())
     }
 
