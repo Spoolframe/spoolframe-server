@@ -22,6 +22,10 @@
 
   quote = builtins.toJSON;
 
+  # Reads bitmap subtitles as text (P2-07), with only the languages asked
+  # for: all of tesseract's data is over a gigabyte.
+  tesseract = pkgs.tesseract.override {enableLanguages = cfg.subtitles.ocrLanguages;};
+
   pathMapping = m:
     "{ "
     + lib.optionalString (m.library != null) "library = ${quote m.library}; "
@@ -52,6 +56,13 @@
       hardware = ${quote hardware};
       vaapi_device = ${quote cfg.transcode.vaapiDevice};
       scratch_dir = "/var/cache/spoolframe/transcode";
+    }
+    media {
+      tesseract = ${quote "${tesseract}/bin/tesseract"};
+    }
+    subtitles {
+      ocr = ${lib.boolToString (cfg.subtitles.ocrLanguages != [])};
+      cache_dir = "/var/cache/spoolframe/subtitles";
     }
     ${cfg.extraConfig}
   '';
@@ -197,6 +208,18 @@ in {
       };
     };
 
+    subtitles.ocrLanguages = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = ["eng"];
+      example = ["eng" "fra" "deu"];
+      description = ''
+        tesseract languages for reading bitmap (PGS) subtitles as text, for
+        clients that cannot draw them or that ask for text. A track is read
+        only with its own language's data; tracks in other languages are
+        burned in instead. Empty turns reading off.
+      '';
+    };
+
     mediaGroups = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [];
@@ -250,7 +273,8 @@ in {
         Group = "spoolframe";
         StateDirectory = lib.removePrefix "/var/lib/" cfg.stateDir;
         StateDirectoryMode = "0700";
-        # Encode output (P2-03): emptied by the server at start.
+        # Encode output (P2-03), emptied by the server at start, and
+        # subtitles read as text (P2-07), kept.
         CacheDirectory = "spoolframe";
         CacheDirectoryMode = "0700";
         LoadCredential = lib.optional (cfg.plex.tokenFile != null) "plex-token:${cfg.plex.tokenFile}";

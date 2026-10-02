@@ -169,12 +169,10 @@ mod tests {
         assert_eq!(parse(STEM, &name(".sub")), None);
     }
 
-    #[test]
-    fn find_lists_matching_files_in_name_order() {
-        let dir =
-            std::env::temp_dir().join(format!("spoolframe-external-find-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    #[tokio::test]
+    async fn find_lists_matching_files_in_name_order() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-external-find").await;
+        let dir = tmp.as_ref();
         for f in [
             "Movie.mkv",
             "Movie.srt",

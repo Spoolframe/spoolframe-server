@@ -13,10 +13,12 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 use password_hash::rand_core::{OsRng, RngCore};
-use spoolframe_protocol::{PlaybackHandle, SessionId};
-use spoolframe_types::SubtitleFormat;
+use spoolframe_protocol::{PlaybackHandle, Selection, SessionId};
+use spoolframe_types::{MediaId, SubtitleFormat};
+use tokio::sync::watch;
 
 use crate::encode::Conversion;
+use crate::subtitles::TextState;
 
 /// How long a handle lives without reads.
 pub const IDLE: Duration = Duration::from_secs(5 * 60);
@@ -24,11 +26,20 @@ pub const IDLE: Duration = Duration::from_secs(5 * 60);
 /// revoked session or a disabled user stops playback promptly.
 pub const RECHECK: Duration = Duration::from_secs(30);
 
-/// A selected external subtitle: the file and what it is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Sidecar {
-    pub path: PathBuf,
-    pub format: SubtitleFormat,
+/// A selected subtitle the client fetches whole.
+#[derive(Debug, Clone)]
+pub enum Sidecar {
+    /// A file next to the media file (P1-08).
+    File {
+        path: PathBuf,
+        format: SubtitleFormat,
+    },
+    /// Text the server makes from a track (P2-07): a bitmap track read as
+    /// text, or a text track converted; there once it is made.
+    Made {
+        state: watch::Receiver<TextState>,
+        format: SubtitleFormat,
+    },
 }
 
 /// One playback.
@@ -37,6 +48,10 @@ pub struct Playback {
     pub session: SessionId,
     /// Hex `EndpointId`.
     pub endpoint: String,
+    /// What is played, and with which tracks: a subtitle change re-plans
+    /// it (P2-07).
+    pub item: MediaId,
+    pub selection: Selection,
     pub path: PathBuf,
     pub size: u64,
     pub subtitle: Option<Sidecar>,
@@ -45,6 +60,28 @@ pub struct Playback {
     pub conversion: Option<Arc<Conversion>>,
     last_used: Instant,
     last_checked: Instant,
+}
+
+/// A playback to open.
+#[derive(Debug)]
+pub struct Opened {
+    pub session: SessionId,
+    pub endpoint: String,
+    pub item: MediaId,
+    pub selection: Selection,
+    pub path: PathBuf,
+    pub size: u64,
+    pub subtitle: Option<Sidecar>,
+    pub conversion: Option<Arc<Conversion>>,
+}
+
+/// What a playback becomes when its subtitle changes.
+#[derive(Debug)]
+pub struct Changed {
+    pub selection: Selection,
+    pub size: u64,
+    pub subtitle: Option<Sidecar>,
+    pub conversion: Option<Arc<Conversion>>,
 }
 
 /// Why a handle cannot be used.
@@ -98,22 +135,9 @@ impl Playbacks {
         PlaybackHandle(bytes.iter().map(|b| format!("{b:02x}")).collect())
     }
 
-    /// Open a playback as `handle`; the session was checked by the caller
+    /// Open `opened` as `handle`; the session was checked by the caller
     /// just now.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one call site, each a different part of the playback"
-    )]
-    pub fn start(
-        &self,
-        handle: PlaybackHandle,
-        session: SessionId,
-        endpoint: String,
-        path: PathBuf,
-        size: u64,
-        subtitle: Option<Sidecar>,
-        conversion: Option<Arc<Conversion>>,
-    ) -> PlaybackHandle {
+    pub fn start(&self, handle: PlaybackHandle, opened: Opened) -> PlaybackHandle {
         let now = Instant::now();
         let mut handles = self.lock();
         // Forget idle handles here rather than on a timer.
@@ -121,17 +145,31 @@ impl Playbacks {
         handles.insert(
             handle.0.clone(),
             Playback {
-                session,
-                endpoint,
-                path,
-                size,
-                subtitle,
-                conversion,
+                session: opened.session,
+                endpoint: opened.endpoint,
+                item: opened.item,
+                selection: opened.selection,
+                path: opened.path,
+                size: opened.size,
+                subtitle: opened.subtitle,
+                conversion: opened.conversion,
                 last_used: now,
                 last_checked: now,
             },
         );
         handle
+    }
+
+    /// Play `handle` as `changed` from now (a subtitle change, P2-07). The
+    /// conversion it replaces is returned, to be dropped outside the lock:
+    /// dropping it stops its encode and removes its files.
+    pub fn change(&self, handle: &PlaybackHandle, changed: Changed) -> Option<Arc<Conversion>> {
+        let mut handles = self.lock();
+        let playback = handles.get_mut(&handle.0)?;
+        playback.selection = changed.selection;
+        playback.size = changed.size;
+        playback.subtitle = changed.subtitle;
+        std::mem::replace(&mut playback.conversion, changed.conversion)
     }
 
     /// Use `handle` from `session` on `endpoint`: refused if it is not
@@ -209,12 +247,16 @@ mod tests {
     fn start(p: &Playbacks) -> PlaybackHandle {
         p.start(
             Playbacks::new_handle(),
-            SessionId("s".into()),
-            "e".into(),
-            "/media/a.mkv".into(),
-            10,
-            None,
-            None,
+            Opened {
+                session: SessionId("s".into()),
+                endpoint: "e".into(),
+                item: "plex:movie:1".parse().unwrap(),
+                selection: Selection::default(),
+                path: "/media/a.mkv".into(),
+                size: 10,
+                subtitle: None,
+                conversion: None,
+            },
         )
     }
 

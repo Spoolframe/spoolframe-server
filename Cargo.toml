@@ -16,6 +16,9 @@ authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
 repository = "https://git.coldsteel.casa/Coldsteel/foundry"
 
 [workspace.dependencies]
+# A test's own directory under a random name, removed with it, so tests
+# running at once never share one.
+tmpdir = "1"
 # Internal crates
 spoolframe-types = { path = "crates/spoolframe-types" }
 spoolframe-catalog = { path = "crates/spoolframe-catalog" }
@@ -24,6 +27,7 @@ spoolframe-media = { path = "crates/spoolframe-media" }
 spoolframe-protocol = { path = "crates/spoolframe-protocol" }
 spoolframe-admin-api = { path = "crates/spoolframe-admin-api" }
 spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk" }
+spoolframe-test-dir = { path = "crates/spoolframe-test-dir" }
 
 # Vendored (vendor/easy-ffprobe/VENDORED.md). Only the typed model of
 # ffprobe's JSON is used.
@@ -52,6 +56,8 @@ argon2 = "0.5"
 # Only for its `getrandom` feature: OsRng for salts and session tokens.
 password-hash = { version = "0.5", features = ["getrandom"] }
 blake3 = "1"
+# Server key fingerprints (P1-21): SHA-256, as the format specifies.
+sha2 = "0.10"
 
 # The admin API: JSON-RPC over WebSocket, as the other foundry services
 # serve theirs. Crates opt into server/client features.

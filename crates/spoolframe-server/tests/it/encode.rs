@@ -25,7 +25,7 @@ async fn ready(
     secs: u32,
 ) -> (TestServer, TestClient, SessionId) {
     let server = TestServer::start_with(
-        fresh_dir(test),
+        fresh_dir(test).await,
         ServerOptions {
             real_media: true,
             ..options
@@ -50,6 +50,7 @@ async fn start(client: &TestClient, session: &SessionId, start_ms: Option<u64>) 
                 id: movie().id().clone(),
                 selection: None,
                 start_ms,
+                bitmap: Default::default(),
             },
         )
         .await
@@ -331,16 +332,13 @@ async fn a_seek_restarts_the_encode_in_a_new_epoch() {
 
 #[tokio::test]
 async fn a_failed_encode_fails_its_reads_with_ffmpeg_s_reason() {
-    let dir = fresh_dir("encode-failed");
+    let dir = fresh_dir("encode-failed").await;
     std::fs::create_dir_all(&dir).unwrap();
     let stub = dir.join("failing-ffmpeg");
-    std::fs::write(
+    crate::support::write_script(
         &stub,
         "#!/bin/sh\necho 'input: Invalid data found when processing input' >&2\nexit 1\n",
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let server = TestServer::start_with(
         dir,
         ServerOptions {
@@ -372,11 +370,11 @@ async fn a_failed_encode_fails_its_reads_with_ffmpeg_s_reason() {
 /// A server with a 30 s H.264 + AC-3 file (keyframes every 2 s), and a
 /// client signed in with `caps`.
 async fn hls_ready(test: &str, caps: ClientCapabilities) -> (TestServer, TestClient, SessionId) {
-    hls_ready_with(fresh_dir(test), caps, ServerOptions::default()).await
+    hls_ready_with(fresh_dir(test).await, caps, ServerOptions::default()).await
 }
 
 async fn hls_ready_with(
-    dir: PathBuf,
+    dir: crate::support::StateDir,
     caps: ClientCapabilities,
     options: ServerOptions,
 ) -> (TestServer, TestClient, SessionId) {
@@ -543,12 +541,10 @@ async fn hls_plays_whole_with_a_read_ahead_shorter_than_a_segment() {
     };
     // At full speed the encode can finish between two throttle checks and
     // never be paused; at 4× real time the throttle always catches it.
-    let dir = fresh_dir("hls-short-ahead");
+    let dir = fresh_dir("hls-short-ahead").await;
     std::fs::create_dir_all(&dir).unwrap();
     let slow = dir.join("slow-ffmpeg");
-    std::fs::write(&slow, "#!/bin/sh\nexec ffmpeg -readrate 4 \"$@\"\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::support::write_script(&slow, "#!/bin/sh\nexec ffmpeg -readrate 4 \"$@\"\n");
     let options = ServerOptions {
         ffmpeg: slow,
         read_ahead: Duration::from_millis(500),
@@ -578,6 +574,268 @@ async fn asking_for_a_late_segment_first_restarts_the_encode_there() {
     // The first run's files are gone; the new one is epoch 1.
     assert!(!server.job_dir(&handle, 0).exists());
     assert!(server.job_dir(&handle, 1).exists());
+    client.close().await;
+    server.stop().await;
+}
+
+/// A text subtitle goes to an HLS client as a WebVTT rendition on the
+/// video's cuts, each cue in the segment that holds its time (P2-07).
+#[tokio::test]
+async fn an_hls_playback_carries_its_subtitle_as_a_webvtt_rendition() {
+    use spoolframe_protocol::Selection;
+    use spoolframe_types::SubtitleFormat;
+    let caps = ClientCapabilities {
+        subtitles: [SubtitleFormat::WebVtt].into(),
+        ..hls_capabilities()
+    };
+    let (server, client, session) = hls_ready("hls-subs", caps).await;
+    server.add_text_track(
+        "1\n00:00:01,000 --> 00:00:02,000\nOne\n\n\
+         2\n00:00:13,000 --> 00:00:14,500\nThirteen\n\n",
+        "subrip",
+    );
+    let response = client
+        .call(
+            Some(&session),
+            Request::StartPlayback {
+                id: movie().id().clone(),
+                selection: Some(Selection {
+                    audio: Some(0),
+                    subtitle: Some(0),
+                }),
+                start_ms: None,
+                bitmap: Default::default(),
+            },
+        )
+        .await;
+    let Response::Ok(Reply::PlaybackStarted { handle, .. }) = response else {
+        panic!("no playback: {response:?}");
+    };
+
+    let multivariant = manifest(&client, &session, &handle, ManifestKind::Multivariant).await;
+    assert!(
+        multivariant.contains("TYPE=SUBTITLES") && multivariant.contains("SUBTITLES=\"subs\""),
+        "{multivariant}"
+    );
+    let subtitles = manifest(&client, &session, &handle, ManifestKind::Subtitles).await;
+    let video = manifest(&client, &session, &handle, ManifestKind::Media).await;
+    // The same cuts as the video.
+    let durations = media_segments(&subtitles);
+    assert_eq!(durations, media_segments(&video));
+
+    // The segment that holds 13 s, and the first.
+    let mut start = 0.0;
+    let holding_13 = durations
+        .iter()
+        .position(|d| {
+            let holds = start <= 13.0 && 13.0 < start + d;
+            start += d;
+            holds
+        })
+        .unwrap() as u32
+        + 1;
+    let read = |n: u32| {
+        let client = &client;
+        let session = &session;
+        let handle = &handle;
+        async move {
+            loop {
+                let response = client
+                    .call(
+                        Some(session),
+                        Request::ReadSubtitleSegment {
+                            handle: handle.clone(),
+                            n,
+                        },
+                    )
+                    .await;
+                match response {
+                    Response::Ok(Reply::Subtitle { format, bytes }) => {
+                        assert_eq!(format, SubtitleFormat::WebVtt);
+                        return String::from_utf8(bytes).unwrap();
+                    }
+                    Response::Err(spoolframe_protocol::Error::SubtitleNotReady { .. }) => {}
+                    other => panic!("segment {n}: {other:?}"),
+                }
+            }
+        }
+    };
+    let at_13 = read(holding_13).await;
+    assert!(at_13.contains("X-TIMESTAMP-MAP="), "{at_13}");
+    assert!(
+        at_13.contains("00:00:13.000 --> 00:00:14.500\nThirteen"),
+        "{at_13}"
+    );
+    assert!(!at_13.contains("One"), "{at_13}");
+    let first = read(1).await;
+    assert!(
+        first.contains("One") && !first.contains("Thirteen"),
+        "{first}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+async fn change(
+    client: &TestClient,
+    session: &SessionId,
+    handle: &PlaybackHandle,
+    subtitle: Option<u32>,
+    position_ms: u64,
+) -> (PlaybackPlan, u32) {
+    let response = client
+        .call(
+            Some(session),
+            Request::ChangeSubtitle {
+                handle: handle.clone(),
+                subtitle,
+                bitmap: Default::default(),
+                position_ms,
+            },
+        )
+        .await;
+    match response {
+        Response::Ok(Reply::PlaybackChanged { plan, epoch, .. }) => (plan, epoch),
+        other => panic!("not changed: {other:?}"),
+    }
+}
+
+/// Picking a subtitle the client cannot draw burns it in: the encode
+/// restarts where the viewer is, as a new epoch; dropping it again goes
+/// back to the copied video (P2-07).
+#[tokio::test]
+async fn a_subtitle_change_restarts_a_converted_playback_where_it_is() {
+    use spoolframe_protocol::{ConvertedSubtitle, ConvertedVideo, SubtitleAction};
+    let (server, client, session) = ready("subtitle-change", ServerOptions::default(), 12).await;
+    server.add_pgs(&[("Hello there", 1_000, 3_500)]);
+    let handle = started(&client, &session, None).await;
+
+    let (plan, epoch) = change(&client, &session, &handle, Some(0), 4_000).await;
+    assert_eq!(epoch, 1);
+    let PlaybackPlan::Converted {
+        video, subtitle, ..
+    } = plan
+    else {
+        panic!("not converted: {plan:?}");
+    };
+    assert!(
+        matches!(video, Some(ConvertedVideo::Encode { .. })),
+        "{video:?}"
+    );
+    assert!(
+        matches!(
+            subtitle,
+            Some(ConvertedSubtitle {
+                action: SubtitleAction::BurnIn { .. },
+                ..
+            })
+        ),
+        "{subtitle:?}"
+    );
+    let (stale, _) = client.read_at(&session, &handle, 0, 0, 100).await;
+    assert_eq!(
+        stale,
+        MediaReadResponse::Err(Error::PlaybackRestarted { epoch: 1 })
+    );
+    let (bytes, _) = read_all(&client, &session, &handle, 1).await;
+    let (first, _) = probe(&write(&server, "burned.mkv", &bytes));
+    assert!((3.5..=4.5).contains(&first), "first packet at {first}");
+
+    let (plan, epoch) = change(&client, &session, &handle, None, 6_000).await;
+    assert_eq!(epoch, 2);
+    assert!(
+        matches!(
+            plan,
+            PlaybackPlan::Converted {
+                video: Some(ConvertedVideo::Copy { .. }),
+                subtitle: None,
+                ..
+            }
+        ),
+        "{plan:?}"
+    );
+    let (stale, _) = client.read_at(&session, &handle, 1, 0, 100).await;
+    assert_eq!(
+        stale,
+        MediaReadResponse::Err(Error::PlaybackRestarted { epoch: 2 })
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// One frame at `secs` of `file`, grey, 640×360.
+fn frame(file: &Path, secs: f64) -> Vec<u8> {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", &secs.to_string(), "-i"])
+        .arg(file)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.stdout.len(),
+        640 * 360,
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// How many pixels inside a box two frames clearly differ in: by more
+/// than re-encoding moves a pixel. Subtitle strokes are thin, so their
+/// count says more than an average over the box.
+fn changed(a: &[u8], b: &[u8], (x0, y0, x1, y1): (usize, usize, usize, usize)) -> usize {
+    (y0..y1)
+        .flat_map(|y| (x0..x1).map(move |x| y * 640 + x))
+        .filter(|&i| a[i].abs_diff(b[i]) > 40)
+        .count()
+}
+
+/// A burned-in PGS cue shows in the picture where it was placed, scaled
+/// from the subtitle's canvas (1920×1080, as Blu-ray PGS is, also over 4K
+/// video) to the video's (640×360).
+#[tokio::test]
+async fn a_burned_in_subtitle_shows_in_the_picture_where_it_was_placed() {
+    use spoolframe_protocol::{BitmapSubtitles, Selection};
+    let (server, client, session) = ready("burn-in", unthrottled(), 6).await;
+    // At (640, 960) on the canvas, 640×64: (213, 320) to (427, 341) scaled.
+    server.add_pgs(&[("Hello there", 1_000, 3_500)]);
+    let response = client
+        .call(
+            Some(&session),
+            Request::StartPlayback {
+                id: movie().id().clone(),
+                selection: Some(Selection {
+                    audio: Some(0),
+                    subtitle: Some(0),
+                }),
+                start_ms: None,
+                bitmap: BitmapSubtitles::BurnIn,
+            },
+        )
+        .await;
+    let Response::Ok(Reply::PlaybackStarted { handle, .. }) = response else {
+        panic!("no playback: {response:?}");
+    };
+    let (bytes, _) = read_all(&client, &session, &handle, 0).await;
+    let burned = frame(&write(&server, "burned.mkv", &bytes), 2.0);
+    let source = frame(&server.media, 2.0);
+    let text = changed(&burned, &source, (213, 320, 427, 341));
+    let elsewhere = changed(&burned, &source, (0, 0, 640, 300));
+    assert!(text > 100, "only {text} pixels changed in the cue's box");
+    assert!(
+        elsewhere < 50,
+        "{elsewhere} pixels changed away from the cue"
+    );
+    // After the cue, nothing is burned in.
+    let after = changed(
+        &frame(&write(&server, "burned.mkv", &bytes), 5.0),
+        &frame(&server.media, 5.0),
+        (213, 320, 427, 341),
+    );
+    assert!(
+        after < 20,
+        "{after} pixels changed in the cue's box after it"
+    );
     client.close().await;
     server.stop().await;
 }

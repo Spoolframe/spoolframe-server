@@ -15,6 +15,7 @@ pub mod language;
 pub mod media;
 pub mod model;
 pub mod preferences;
+pub mod role;
 
 pub use codec::{
     AudioCodec, ClientCapabilities, Container, Delivery, HdrFormat, SubtitleFormat, VideoCodec,
@@ -29,3 +30,4 @@ pub use model::{
 pub use preferences::{
     AudioPreferences, SdhPreference, SubtitleMode, SubtitlePreferences, TrackPreferences,
 };
+pub use role::Role;

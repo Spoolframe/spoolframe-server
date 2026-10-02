@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use spoolframe_client_sdk::types::{ClientCapabilities, Item, PlaybackState};
 use spoolframe_client_sdk::{
-    ArtworkSize, Client, ConnectionState, Device, MemoryStorage, SdkError, Selection, Session,
+    ArtworkSize, BitmapSubtitles, Client, ConnectionState, Device, MAX_READ, ManifestKind,
+    MemoryStorage, PlaybackHandle, PlaybackOptions, PlaybackPlan, SdkError, Selection, Session,
     Storage,
 };
 use support::{TestServer, episode, library, mkv_capabilities, movie, poster, show};
@@ -32,7 +33,16 @@ async fn client_on(server: &TestServer, storage: &Arc<MemoryStorage>) -> Client 
     client
         .add_address(&server.server.id().to_string(), addrs)
         .unwrap();
+    pin(&client, server).await;
     client
+}
+
+/// Connect and pin, as an app does once the user has checked the
+/// fingerprint (P1-21).
+async fn pin(client: &Client, server: &TestServer) {
+    let entry = client.connect(&id(server)).await.unwrap();
+    assert!(!entry.pinned || entry.verified, "{entry:?}");
+    client.pin(&id(server), true).await.unwrap();
 }
 
 /// A server with alice and bob, and a client of it.
@@ -209,6 +219,7 @@ async fn a_device_that_cannot_play_is_told_why() {
         .unwrap();
     let addrs = server.server.addr().ip_addrs().copied().collect();
     client.add_address(&id(&server), addrs).unwrap();
+    pin(&client, &server).await;
     let alice = alice(&server, &client).await;
     assert!(matches!(
         alice
@@ -249,6 +260,12 @@ async fn progress_shows_on_home_and_in_items() {
     };
     assert!(matches!(e.playback, PlaybackState { watched: true, .. }));
     alice.mark_unwatched(watched.id()).await.unwrap();
+
+    // "Remove from Continue watching", then "Undo" (P1-22).
+    alice.hide_from_continue(movie().id()).await.unwrap();
+    assert!(alice.home().await.unwrap().continue_watching.is_empty());
+    alice.unhide_from_continue(movie().id()).await.unwrap();
+    assert_eq!(alice.home().await.unwrap().continue_watching.len(), 1);
     client.close().await;
     server.stop().await;
 }
@@ -341,6 +358,208 @@ async fn track_preferences_round_trip_and_choose() {
     let chosen = plan.chosen.unwrap();
     assert_eq!(chosen.selection.audio, Some(2));
     assert_eq!(chosen.subtitle, TrackReason::NotWanted);
+    client.close().await;
+    server.stop().await;
+}
+
+/// A server converting a real file, and alice signed in on a device with
+/// `capabilities`.
+async fn converting(
+    test: &str,
+    capabilities: ClientCapabilities,
+    ocr: bool,
+) -> (TestServer, Client, Session) {
+    let server = TestServer::start_with(
+        support::fresh_dir(test).await,
+        support::ServerOptions {
+            real_media: true,
+            ocr,
+            ..support::ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_media(12, "libx264", "ac3");
+    server.add_user("alice", "correct horse", None).await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = Client::open(storage, device(capabilities)).await.unwrap();
+    let addrs = server.server.addr().ip_addrs().copied().collect();
+    client.add_address(&id(&server), addrs).unwrap();
+    pin(&client, &server).await;
+    let alice = client
+        .sign_in(&id(&server), "alice", "correct horse")
+        .await
+        .unwrap();
+    (server, client, alice)
+}
+
+/// Every byte of `epoch`'s output, read as a player would.
+async fn read_all(alice: &Session, handle: &PlaybackHandle, epoch: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = alice
+            .read_chunk(handle, epoch, bytes.len() as u64, MAX_READ)
+            .await
+            .unwrap();
+        assert_eq!(chunk.epoch, epoch);
+        bytes.extend(chunk.bytes);
+        if chunk.complete && bytes.len() as u64 == chunk.size {
+            return bytes;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_converted_playback_reads_to_complete_and_seeks() {
+    let (server, client, alice) =
+        converting("sdk-converted", support::progressive_capabilities(), false).await;
+    let playback = alice
+        .start_playback_with(movie().id(), None, PlaybackOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        matches!(playback.plan, PlaybackPlan::Converted { .. }),
+        "{:?}",
+        playback.plan
+    );
+    assert_eq!(playback.epoch, 0);
+    let whole = read_all(&alice, &playback.handle, 0).await;
+    assert!(whole.len() > 10_000, "{} bytes", whole.len());
+
+    let epoch = alice
+        .seek_playback(&playback.handle, Duration::from_secs(6))
+        .await
+        .unwrap();
+    assert_eq!(epoch, 1);
+    assert_eq!(
+        alice.read_chunk(&playback.handle, 0, 0, 1024).await,
+        Err(SdkError::PlaybackRestarted { epoch: 1 })
+    );
+    let rest = read_all(&alice, &playback.handle, 1).await;
+    assert!(
+        rest.len() < whole.len(),
+        "{} of {}",
+        rest.len(),
+        whole.len()
+    );
+
+    alice.stop_playback(&playback.handle).await.unwrap();
+    assert_eq!(
+        alice.read_chunk(&playback.handle, 1, 0, 1024).await,
+        Err(SdkError::PlaybackExpired)
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_hls_playback_gives_its_playlist_and_segments() {
+    let (server, client, alice) = converting("sdk-hls", support::hls_capabilities(), false).await;
+    let playback = alice
+        .start_playback_with(movie().id(), None, PlaybackOptions::default())
+        .await
+        .unwrap();
+    let media = alice
+        .manifest(&playback.handle, ManifestKind::Media)
+        .await
+        .unwrap();
+    assert!(
+        media.contains("seg1.m4s") && media.contains("#EXT-X-ENDLIST"),
+        "{media}"
+    );
+    for n in [0, 1] {
+        let mut got = 0;
+        loop {
+            let chunk = alice
+                .read_segment(&playback.handle, playback.epoch, n, got, MAX_READ)
+                .await
+                .unwrap();
+            got += chunk.bytes.len() as u64;
+            if chunk.complete && got == chunk.size {
+                break;
+            }
+        }
+        assert!(got > 0, "segment {n} is empty");
+    }
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_pgs_subtitle_asked_for_as_text_arrives_as_text() {
+    use spoolframe_client_sdk::types::{AudioCodec, Container, SubtitleFormat, VideoCodec};
+    let capabilities = ClientCapabilities {
+        video: [VideoCodec::H264].into(),
+        audio: [AudioCodec::Ac3].into(),
+        containers: [Container::Matroska].into(),
+        subtitles: [SubtitleFormat::Srt, SubtitleFormat::Pgs].into(),
+        ..ClientCapabilities::default()
+    };
+    let (server, client, alice) = converting("sdk-ocr", capabilities, true).await;
+    server.add_pgs(&[("Hello there", 1_000, 3_500)]);
+    let playback = alice
+        .start_playback_with(
+            movie().id(),
+            Some(Selection {
+                audio: Some(0),
+                subtitle: Some(0),
+            }),
+            PlaybackOptions {
+                bitmap: BitmapSubtitles::Text,
+                ..PlaybackOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let subtitle = loop {
+        match alice.read_subtitle(&playback.handle).await {
+            Ok(subtitle) => break subtitle,
+            Err(SdkError::SubtitleNotReady { .. }) => continue,
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert_eq!(subtitle.format, SubtitleFormat::Srt);
+    assert_eq!(
+        String::from_utf8(subtitle.bytes).unwrap(),
+        "1\n00:00:01,000 --> 00:00:03,500\nHello there\n\n"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// A profile with its PIN required on this device is locked when the app
+/// opens again: "Who's watching" shows it so, its calls are refused, and
+/// its PIN opens it (P2-08).
+#[tokio::test]
+async fn a_pin_required_here_locks_the_profile_when_the_app_opens_again() {
+    let (server, client, storage) = ready("sdk-pin").await;
+    let alice = alice(&server, &client).await;
+    assert_eq!(
+        alice.set_pin("12").await,
+        Err(SdkError::InvalidInput("a PIN is 4 to 8 digits".into()))
+    );
+    alice.set_pin("4321").await.unwrap();
+    alice.set_pin_required(None, true).await.unwrap();
+    let devices = alice.devices().await.unwrap();
+    assert!(
+        devices.iter().any(|d| d.this_device && d.pin_required),
+        "{devices:?}"
+    );
+    client.close().await;
+
+    let client = client_on(&server, &storage).await;
+    let profiles = client.profiles(&id(&server)).await.unwrap();
+    let alice = profiles
+        .into_iter()
+        .find(|p| p.user().username == "alice")
+        .unwrap();
+    assert!(alice.user().locked);
+    assert_eq!(alice.libraries().await, Err(SdkError::ProfileLocked));
+    assert_eq!(
+        alice.unlock("0000").await,
+        Err(SdkError::InvalidCredentials)
+    );
+    alice.unlock("4321").await.unwrap();
+    alice.libraries().await.unwrap();
     client.close().await;
     server.stop().await;
 }

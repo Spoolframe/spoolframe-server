@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
 use spoolframe_media::encoders::FfmpegCommand;
+use spoolframe_media::ocr::Ocr;
 use spoolframe_plex::{Failures, LibraryPaths, PlexCatalog, Scope};
 use spoolframe_server::admin::{self, SetupCode, StatusSource};
 use spoolframe_server::artwork::ArtworkCache;
@@ -18,6 +19,7 @@ use spoolframe_server::network::{Server, Services};
 use spoolframe_server::plex_sync::PlexSync;
 use spoolframe_server::principal::Principal;
 use spoolframe_server::store::Store;
+use spoolframe_server::subtitles::Subtitles;
 use spoolframe_server::transcode::{self, Transcoding};
 use spoolframe_server::watch::Watch;
 use spoolframe_types::MediaId;
@@ -63,6 +65,10 @@ enum Command {
     /// Print the server's EndpointId, the identity clients pin. Creates the
     /// server key if this is the first start.
     Id,
+    /// Print the server key's fingerprint, to compare with what a client
+    /// shows before it pins this server. Works with the server stopped;
+    /// creates the key if this is the first start, as `id` does.
+    Fingerprint,
     /// The running server's name, key, version and encoders, as an admin
     /// sees them.
     Status,
@@ -154,6 +160,13 @@ async fn main() -> Result<()> {
             println!("{}", identity::load_or_create(&config.state_dir)?.public());
             Ok(())
         }
+        Some(Command::Fingerprint) => {
+            println!(
+                "{}",
+                identity::fingerprint(&identity::load_or_create(&config.state_dir)?)
+            );
+            Ok(())
+        }
         Some(Command::Plex {
             command: PlexCommand::CheckPaths { library },
         }) => check_paths(&plex(&config)?, library.as_deref()).await,
@@ -181,8 +194,18 @@ async fn probe(catalog: &dyn Catalog, id: &MediaId, ffprobe: PathBuf) -> Result<
 
 /// Run the server until SIGINT or SIGTERM.
 async fn run(config: &ServerConfig) -> Result<()> {
+    // Before anything is logged: whatever waits for "listening" (a service
+    // manager, the CLI tests) may send SIGTERM the moment it sees it, and a
+    // signal with no handler yet kills the process instead of stopping it.
+    let shutdown = shutdown_signal()?;
     // The key first: if it cannot be loaded nothing else should start.
     let key = identity::load_or_create(&config.state_dir)?;
+    // What a person compares with a client's screen before pinning (P1-21).
+    tracing::info!(
+        server = config.server_name(),
+        fingerprint = identity::fingerprint(&key),
+        "server identity"
+    );
     let plex = Arc::new(plex(config)?);
     let catalog: Arc<dyn Catalog> = plex.clone();
     check_catalog(&plex, catalog.as_ref()).await;
@@ -199,6 +222,20 @@ async fn run(config: &ServerConfig) -> Result<()> {
             format!(
                 "cannot prepare the scratch directory {}",
                 limits.scratch_dir.display()
+            )
+        })?,
+    );
+    let ocr_settings = config.subtitles.ocr_settings(&config.state_dir)?;
+    let ocr = if ocr_settings.enabled {
+        Ocr::detect(&config.media.tesseract()).await
+    } else {
+        Ocr::disabled()
+    };
+    let subtitles = Arc::new(
+        Subtitles::new(ocr, config.media.ffmpeg(), &ocr_settings).with_context(|| {
+            format!(
+                "cannot prepare the subtitle cache {}",
+                ocr_settings.cache_dir.display()
             )
         })?,
     );
@@ -253,6 +290,7 @@ async fn run(config: &ServerConfig) -> Result<()> {
             watch,
             transcoding,
             jobs,
+            subtitles,
         },
     )
     .await?;
@@ -260,7 +298,7 @@ async fn run(config: &ServerConfig) -> Result<()> {
     let addrs: Vec<_> = server.addr().ip_addrs().map(ToString::to_string).collect();
     tracing::info!(endpoint_id = %server.id(), ?addrs, "listening");
 
-    shutdown_signal().await?;
+    shutdown.await;
     tracing::info!("shutting down");
     server.shutdown().await;
     let _ = admin.stop();
@@ -299,13 +337,18 @@ async fn plex_sync(
     Ok(Some(syncer))
 }
 
-async fn shutdown_signal() -> Result<()> {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        r = tokio::signal::ctrl_c() => r?,
-        _ = term.recv() => {}
-    }
-    Ok(())
+/// SIGINT or SIGTERM, handled from now on. `ctrl_c()` would only start
+/// handling SIGINT once polled.
+fn shutdown_signal() -> Result<impl Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    })
 }
 
 /// Check Plex and a sample of media paths, and warn about what is wrong.

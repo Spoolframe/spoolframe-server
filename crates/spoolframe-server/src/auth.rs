@@ -13,8 +13,10 @@ use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use password_hash::rand_core::{OsRng, RngCore};
 
+use spoolframe_types::Role;
+
 use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionUser};
-use crate::store::users::LocalUserId;
+use crate::store::users::{LocalUserId, PasswordLogin};
 use crate::store::{Store, StoreError, now};
 
 /// How long a client (Iroh endpoint) session lasts after its last use.
@@ -58,7 +60,7 @@ impl SessionToken {
 #[derive(Debug, Clone)]
 pub struct Login {
     pub user: LocalUserId,
-    pub is_admin: bool,
+    pub role: Role,
     pub token: SessionToken,
 }
 
@@ -100,7 +102,24 @@ pub async fn hash_password(password: &str) -> Result<String, PasswordError> {
     if password.chars().count() < MIN_PASSWORD_LEN {
         return Err(PasswordError::TooShort);
     }
-    let password = password.to_owned();
+    hash_secret(password).await
+}
+
+/// Wrong PINs in a row after which a device's session is revoked (P2-08).
+pub const MAX_WRONG_PINS: u32 = 10;
+
+/// A PIN as a user may set it: 4 to 8 digits.
+pub fn valid_pin(pin: &str) -> bool {
+    (4..=8).contains(&pin.len()) && pin.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Hash a new PIN as passwords are (Argon2id, PHC string).
+pub async fn hash_pin(pin: &str) -> Result<String, PasswordError> {
+    hash_secret(pin).await
+}
+
+async fn hash_secret(secret: &str) -> Result<String, PasswordError> {
+    let password = secret.to_owned();
     tokio::task::spawn_blocking(move || {
         let salt = SaltString::generate(&mut OsRng);
         Argon2::default()
@@ -144,13 +163,36 @@ fn decoy_hash() -> String {
         .clone()
 }
 
+/// The failure limit's keys for a user's PIN from `source`: apart from
+/// password logins, so wrong PINs and wrong passwords do not use up each
+/// other's tries.
+fn pin_keys(user: LocalUserId, source: &str) -> (String, String) {
+    (format!("pin:{}", user.0), format!("pin@{source}"))
+}
+
 /// Failed logins, per username and per source, within a sliding window.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RateLimiter {
     failures: Mutex<HashMap<String, VecDeque<Instant>>>,
+    window: Duration,
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::with_window(FAILURE_WINDOW)
+    }
 }
 
 impl RateLimiter {
+    /// Failures count for `window` ([`FAILURE_WINDOW`] by default; tests
+    /// that need many failures shorten it).
+    pub fn with_window(window: Duration) -> Self {
+        Self {
+            failures: Mutex::default(),
+            window,
+        }
+    }
+
     fn keys(username: &str, source: &str) -> [String; 2] {
         [
             format!("user:{}", username.trim().to_lowercase()),
@@ -167,11 +209,11 @@ impl RateLimiter {
                 let times = failures.get_mut(key)?;
                 while times
                     .front()
-                    .is_some_and(|t| now.duration_since(*t) >= FAILURE_WINDOW)
+                    .is_some_and(|t| now.duration_since(*t) >= self.window)
                 {
                     times.pop_front();
                 }
-                (times.len() >= MAX_FAILURES).then(|| FAILURE_WINDOW - now.duration_since(times[0]))
+                (times.len() >= MAX_FAILURES).then(|| self.window - now.duration_since(times[0]))
             })
             .max()
     }
@@ -193,19 +235,92 @@ impl RateLimiter {
     }
 }
 
+/// Why a PIN did not unlock a profile (P2-08).
+#[derive(Debug, thiserror::Error)]
+pub enum UnlockError {
+    #[error("wrong PIN")]
+    Wrong,
+    #[error("too many wrong PINs; try again in {retry_after:?}")]
+    RateLimited { retry_after: Duration },
+    /// The last of [`MAX_WRONG_PINS`] in a row: the session on this device
+    /// is revoked.
+    #[error("too many wrong PINs; sign in again")]
+    Revoked,
+    #[error("unlock failed: {0}")]
+    Internal(String),
+}
+
+impl From<StoreError> for UnlockError {
+    fn from(e: StoreError) -> Self {
+        UnlockError::Internal(e.to_string())
+    }
+}
+
 /// Logins and sessions.
 #[derive(Debug, Clone)]
 pub struct Auth {
     store: Store,
     limiter: Arc<RateLimiter>,
+    /// Wrong PINs in a row, per user and device.
+    wrong_pins: Arc<Mutex<HashMap<(LocalUserId, String), u32>>>,
 }
 
 impl Auth {
     pub fn new(store: Store) -> Self {
+        Self::with_failure_window(store, FAILURE_WINDOW)
+    }
+
+    /// As [`Auth::new`], with failures counting for `window`.
+    pub fn with_failure_window(store: Store, window: Duration) -> Self {
         Self {
             store,
-            limiter: Arc::default(),
+            limiter: Arc::new(RateLimiter::with_window(window)),
+            wrong_pins: Arc::default(),
         }
+    }
+
+    /// Unlock `user`'s profile on `endpoint` with `pin`. A user without a
+    /// PIN has nothing to unlock. Wrong PINs are limited as passwords are,
+    /// on keys of their own; [`MAX_WRONG_PINS`] in a row revoke the user's
+    /// sessions on that device.
+    pub async fn unlock(
+        &self,
+        user: LocalUserId,
+        endpoint: &str,
+        pin: &str,
+    ) -> Result<(), UnlockError> {
+        let (what, from) = pin_keys(user, endpoint);
+        if let Some(retry_after) = self.limiter.check(&what, &from, Instant::now()) {
+            return Err(UnlockError::RateLimited { retry_after });
+        }
+        let Some(phc) = self.store.pin_phc(user).await? else {
+            return Ok(());
+        };
+        let key = (user, endpoint.to_owned());
+        if valid_pin(pin) && verify_password(pin, phc).await {
+            self.limiter.record_success(&what, &from);
+            self.wrong_pins.lock().expect("never poisoned").remove(&key);
+            return Ok(());
+        }
+        self.limiter.record_failure(&what, &from, Instant::now());
+        let wrong = {
+            let mut counts = self.wrong_pins.lock().expect("never poisoned");
+            let count = counts.entry(key.clone()).or_default();
+            *count += 1;
+            *count
+        };
+        if wrong >= MAX_WRONG_PINS {
+            self.wrong_pins.lock().expect("never poisoned").remove(&key);
+            let revoked = self.store.revoke_device_sessions(user, endpoint).await?;
+            tracing::warn!(
+                user = user.0,
+                endpoint,
+                revoked,
+                "too many wrong PINs; sessions revoked"
+            );
+            return Err(UnlockError::Revoked);
+        }
+        Err(UnlockError::Wrong)
     }
 
     pub fn store(&self) -> &Store {
@@ -232,6 +347,36 @@ impl Auth {
         binding: SessionBinding,
         source: &str,
     ) -> Result<Login, LoginError> {
+        let account = self.check_password(username, password, source).await?;
+        let lifetime = match binding {
+            SessionBinding::Endpoint { .. } => ENDPOINT_SESSION,
+            SessionBinding::Api => API_SESSION,
+        };
+
+        let token = SessionToken::generate();
+        self.store
+            .create_session(
+                &token.hash(),
+                account.id,
+                &binding,
+                now() + lifetime.as_secs() as i64,
+            )
+            .await?;
+        Ok(Login {
+            user: account.id,
+            role: account.role,
+            token,
+        })
+    }
+
+    /// `username`'s account if `password` is theirs and they may log in,
+    /// under the failure limit for `username` from `source`.
+    pub async fn check_password(
+        &self,
+        username: &str,
+        password: &str,
+        source: &str,
+    ) -> Result<PasswordLogin, LoginError> {
         if let Some(retry_after) = self.limiter.check(username, source, Instant::now()) {
             return Err(LoginError::RateLimited { retry_after });
         }
@@ -253,25 +398,7 @@ impl Auth {
             }
         };
         self.limiter.record_success(username, source);
-
-        let lifetime = match binding {
-            SessionBinding::Endpoint { .. } => ENDPOINT_SESSION,
-            SessionBinding::Api => API_SESSION,
-        };
-        let token = SessionToken::generate();
-        self.store
-            .create_session(
-                &token.hash(),
-                account.id,
-                &binding,
-                now() + lifetime.as_secs() as i64,
-            )
-            .await?;
-        Ok(Login {
-            user: account.id,
-            is_admin: account.is_admin,
-            token,
-        })
+        Ok(account)
     }
 
     /// Open an API session for a user who just proved who they are some
@@ -324,11 +451,34 @@ mod tests {
     use super::*;
     use crate::store::tests::state_dir;
 
-    async fn auth_with_alice(test: &str) -> Auth {
-        let store = Store::open(&state_dir(test)).await.unwrap();
+    /// Auth over a store in a state directory of its own, which goes
+    /// with it.
+    struct TestAuth {
+        // Declared first, so the store closes before its directory goes.
+        auth: Auth,
+        _dir: spoolframe_test_dir::TestDir,
+    }
+
+    impl std::ops::Deref for TestAuth {
+        type Target = Auth;
+
+        fn deref(&self) -> &Auth {
+            &self.auth
+        }
+    }
+
+    async fn auth_with_alice(test: &str) -> TestAuth {
+        let dir = state_dir(test).await;
+        let store = Store::open(dir.as_ref()).await.unwrap();
         let phc = hash_password("correct horse").await.unwrap();
-        store.add_user("alice", None, &phc, false).await.unwrap();
-        Auth::new(store)
+        store
+            .add_user("alice", None, &phc, Role::Consumer)
+            .await
+            .unwrap();
+        TestAuth {
+            auth: Auth::new(store),
+            _dir: dir,
+        }
     }
 
     async fn login(auth: &Auth, user: &str, password: &str) -> Result<Login, LoginError> {

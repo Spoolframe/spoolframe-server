@@ -260,6 +260,8 @@ impl PlexSync {
                             position_ms: w.position_ms.map(|p| p as i64),
                             duration_ms: w.duration_ms.map(|d| d as i64),
                             watched: w.watched,
+                            // Hides are this server's own (P1-22).
+                            unhide: false,
                         },
                         w.last_viewed_at.unwrap_or(0),
                     )

@@ -3885,6 +3885,7 @@ version = "0.1.0"
 dependencies = [
  "jsonrpsee",
  "serde",
+ "spoolframe-types",
 ]
 
 [[package]]
@@ -3923,6 +3924,8 @@ dependencies = [
  "easy-ffprobe",
  "serde",
  "serde_json",
+ "spoolframe-media",
+ "spoolframe-test-dir",
  "spoolframe-types",
  "thiserror 2.0.21",
  "tokio",
@@ -3938,6 +3941,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spoolframe-catalog",
+ "spoolframe-test-dir",
  "spoolframe-types",
  "tokio",
  "tracing",
@@ -3953,6 +3957,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2 0.10.9",
  "spoolframe-types",
  "thiserror 2.0.21",
  "tokio",
@@ -3985,6 +3990,7 @@ dependencies = [
  "spoolframe-media",
  "spoolframe-plex",
  "spoolframe-protocol",
+ "spoolframe-test-dir",
  "spoolframe-types",
  "sqlx",
  "thiserror 2.0.21",
@@ -3994,6 +4000,14 @@ dependencies = [
  "tracing-subscriber",
  "uclicious",
  "url",
+]
+
+[[package]]
+name = "spoolframe-test-dir"
+version = "0.1.0"
+dependencies = [
+ "tmpdir",
+ "tokio",
 ]
 
 [[package]]
@@ -4414,6 +4428,17 @@ name = "tinyvec"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
+name = "tmpdir"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4d51942bbd63241e665ca0cc613f56dfaee117b41d5288a6cb3fca5cdab2415"
+dependencies = [
+ "futures",
+ "rand 0.8.8",
+ "tokio",
+]
 
 [[package]]
 name = "tokio"

@@ -12,6 +12,7 @@ use spoolframe_plex::{PathMap, PathMapping};
 
 use crate::encode::JobLimits;
 use crate::network::{EndpointOptions, Relay};
+use crate::subtitles::OcrSettings;
 use crate::watch::WatchRules;
 use std::time::Duration;
 use uclicious::Uclicious;
@@ -81,6 +82,9 @@ pub struct ServerConfig {
     /// Which encoders to use (P2-02).
     #[ucl(default)]
     pub transcode: TranscodeConfig,
+    /// Bitmap subtitles read as text (P2-07).
+    #[ucl(default)]
+    pub subtitles: SubtitlesConfig,
 }
 
 /// `watch { started_after_secs = 60; watched_percent = 90;
@@ -120,8 +124,9 @@ impl WatchConfig {
     }
 }
 
-/// `media { ffmpeg = "ffmpeg"; ffprobe = "ffprobe"; }`, all optional: by
-/// default whatever is on `PATH`, which the nix package wraps.
+/// `media { ffmpeg = "ffmpeg"; ffprobe = "ffprobe"; tesseract = "tesseract"; }`,
+/// all optional: by default whatever is on `PATH`, which the nix package
+/// wraps.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct MediaConfig {
@@ -129,6 +134,8 @@ pub struct MediaConfig {
     pub ffmpeg: Option<PathBuf>,
     #[ucl(default)]
     pub ffprobe: Option<PathBuf>,
+    #[ucl(default)]
+    pub tesseract: Option<PathBuf>,
 }
 
 impl MediaConfig {
@@ -138,6 +145,50 @@ impl MediaConfig {
 
     pub fn ffprobe(&self) -> PathBuf {
         self.ffprobe.clone().unwrap_or_else(|| "ffprobe".into())
+    }
+
+    pub fn tesseract(&self) -> PathBuf {
+        self.tesseract.clone().unwrap_or_else(|| "tesseract".into())
+    }
+}
+
+/// `subtitles { ocr = true; ocr_threads = 4; cache_dir = "…"; }`, all
+/// optional.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct SubtitlesConfig {
+    /// Read bitmap subtitles as text; on if left out (it is off anyway
+    /// without tesseract).
+    #[ucl(default)]
+    pub ocr: Option<bool>,
+    /// tesseract processes at once; half the CPUs if left out.
+    #[ucl(default)]
+    pub ocr_threads: Option<u32>,
+    /// Where the text is kept; `state_dir/cache/subtitles` if left out.
+    #[ucl(default)]
+    pub cache_dir: Option<PathBuf>,
+}
+
+impl SubtitlesConfig {
+    pub fn ocr_settings(&self, state_dir: &Path) -> Result<OcrSettings, ConfigError> {
+        let threads = match self.ocr_threads {
+            Some(0) => {
+                return Err(ConfigError::Invalid {
+                    key: "subtitles.ocr_threads",
+                    message: "0 would never read anything; use at least 1, or ocr = false".into(),
+                });
+            }
+            Some(n) => n as usize,
+            None => std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)),
+        };
+        Ok(OcrSettings {
+            enabled: self.ocr.unwrap_or(true),
+            threads,
+            cache_dir: self
+                .cache_dir
+                .clone()
+                .unwrap_or_else(|| state_dir.join("cache").join("subtitles")),
+        })
     }
 }
 
@@ -477,6 +528,7 @@ impl ServerConfig {
         parsed.watch.rules()?;
         parsed.transcode.settings()?;
         parsed.transcode.limits(&parsed.state_dir)?;
+        parsed.subtitles.ocr_settings(&parsed.state_dir)?;
         Ok(parsed)
     }
 
@@ -651,6 +703,39 @@ mod tests {
             TranscodeSettings::default()
         );
         assert_eq!(config.media.ffmpeg(), PathBuf::from("ffmpeg"));
+    }
+
+    #[test]
+    fn ocr_is_on_with_its_cache_under_the_state_dir() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        let ocr = config
+            .subtitles
+            .ocr_settings(Path::new("/var/lib/sf"))
+            .unwrap();
+        assert!(ocr.enabled);
+        assert!(ocr.threads >= 1);
+        assert_eq!(ocr.cache_dir, PathBuf::from("/var/lib/sf/cache/subtitles"));
+        assert_eq!(config.media.tesseract(), PathBuf::from("tesseract"));
+    }
+
+    #[test]
+    fn ocr_with_no_threads_is_refused() {
+        assert!(matches!(
+            plex(r#"plex { url = "http://nas:32400"; } subtitles { ocr_threads = 0; }"#),
+            Err(ConfigError::Invalid {
+                key: "subtitles.ocr_threads",
+                ..
+            })
+        ));
+        let off = plex(
+            r#"plex { url = "http://nas:32400"; } subtitles { ocr = false; ocr_threads = 2; }"#,
+        )
+        .unwrap()
+        .subtitles
+        .ocr_settings(Path::new("/s"))
+        .unwrap();
+        assert!(!off.enabled);
+        assert_eq!(off.threads, 2);
     }
 
     #[test]
@@ -847,11 +932,10 @@ mod tests {
         assert_eq!(config.plex.token().unwrap(), None);
     }
 
-    #[test]
-    fn the_token_is_trimmed() {
-        let dir = std::env::temp_dir().join(format!("spoolframe-config-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("token");
+    #[tokio::test]
+    async fn the_token_is_trimmed() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-config").await;
+        let file = dir.as_ref().join("token");
         std::fs::write(&file, "abc123\n").unwrap();
         let config = PlexConfig {
             url: "http://nas:32400".into(),
@@ -874,11 +958,10 @@ mod tests {
         assert!(err.to_string().contains("/nonexistent/plex-token"), "{err}");
     }
 
-    #[test]
-    fn an_empty_token_file_is_rejected() {
-        let dir = std::env::temp_dir().join(format!("spoolframe-config-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("empty-token");
+    #[tokio::test]
+    async fn an_empty_token_file_is_rejected() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-config").await;
+        let file = dir.as_ref().join("empty-token");
         std::fs::write(&file, " \n").unwrap();
         let config = PlexConfig {
             url: "http://nas:32400".into(),

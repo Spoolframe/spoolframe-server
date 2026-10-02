@@ -437,25 +437,45 @@ mod tests {
         assert_eq!(last_listed("#EXTM3U\n#EXT-X-VERSION:7\n"), None);
     }
 
-    fn scratch(test: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("spoolframe-jobs-{}-{test}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// A directory of the test's own, removed when dropped.
+    async fn scratch(test: &str) -> spoolframe_test_dir::TestDir {
+        spoolframe_test_dir::TestDir::new(&format!("spoolframe-jobs-{test}")).await
+    }
+
+    /// Writes an executable script. The text goes to a plain file first and
+    /// `install` makes the script from it, so this process never holds the
+    /// script open for writing: a child another test forks at that moment
+    /// would inherit the handle, and running the script would then fail with
+    /// "Text file busy" (ETXTBSY).
+    fn write_script(path: &Path, text: &str) {
+        let source = path.with_extension("txt");
+        std::fs::write(&source, text).unwrap();
+        let status = std::process::Command::new("install")
+            .args(["-m", "755"])
+            .arg(&source)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "install {} failed", path.display());
     }
 
     /// A stand-in for ffmpeg: a shell script.
     fn ffmpeg(dir: &Path, body: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join("ffmpeg");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
 
-    fn jobs(test: &str, body: &str, max_jobs: usize, read_ahead: Duration) -> (Jobs, PathBuf) {
-        let root = scratch(test);
+    /// Jobs running `body` as ffmpeg, in a directory kept for the test.
+    async fn jobs(
+        test: &str,
+        body: &str,
+        max_jobs: usize,
+        read_ahead: Duration,
+    ) -> (Jobs, spoolframe_test_dir::TestDir) {
+        let tmp = scratch(test).await;
+        let root = tmp.as_ref().to_path_buf();
         let bin = ffmpeg(&root.join("bin"), body);
         let limits = JobLimits {
             max_jobs,
@@ -463,7 +483,7 @@ mod tests {
             scratch_limit_bytes: 1 << 30,
             read_ahead,
         };
-        (Jobs::new(limits, bin).unwrap(), root)
+        (Jobs::new(limits, bin).unwrap(), tmp)
     }
 
     async fn done(job: &EncodeJob) -> Result<(), String> {
@@ -488,12 +508,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_encode_reports_ffmpeg_s_last_words() {
-        let (jobs, _) = jobs(
+        let (jobs, _dir) = jobs(
             "fail",
             "echo 'out.mkv: Invalid data found when processing input' >&2; exit 1",
             2,
             Duration::from_secs(60),
-        );
+        )
+        .await;
         let dir = jobs.limits().scratch_dir.join("h/0");
         let job = jobs.start(dir, Vec::new(), Written::Hls, 0, 0, 0).unwrap();
         assert_eq!(
@@ -504,12 +525,13 @@ mod tests {
 
     #[tokio::test]
     async fn what_a_job_writes_is_measured() {
-        let (jobs, _) = jobs(
+        let (jobs, _dir) = jobs(
             "write",
             "printf 'abcdefghij' > \"$1\"; echo out_time_us=4000000",
             2,
             Duration::from_secs(60),
-        );
+        )
+        .await;
         let dir = jobs.limits().scratch_dir.join("h/0");
         let file = dir.join("out.mkv");
         let job = jobs
@@ -530,7 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_job_too_many_is_busy_until_one_stops() {
-        let (jobs, _) = jobs("busy", "exec sleep 30", 1, Duration::from_secs(60));
+        let (jobs, _dir) = jobs("busy", "exec sleep 30", 1, Duration::from_secs(60)).await;
         let scratch = jobs.limits().scratch_dir.clone();
         let first = jobs
             .start(scratch.join("a/0"), Vec::new(), Written::Hls, 0, 0, 0)
@@ -546,7 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_job_kills_ffmpeg_and_removes_its_files() {
-        let (jobs, _) = jobs("drop", "exec sleep 30", 2, Duration::from_secs(60));
+        let (jobs, _dir) = jobs("drop", "exec sleep 30", 2, Duration::from_secs(60)).await;
         let dir = jobs.limits().scratch_dir.join("h/0");
         let job = jobs
             .start(dir.clone(), Vec::new(), Written::Hls, 0, 0, 0)
@@ -563,12 +585,13 @@ mod tests {
     async fn an_encode_far_ahead_of_its_reader_is_paused_and_resumed() {
         // Reports a minute of encoded time at once, writes 100 bytes, then
         // waits.
-        let (jobs, _) = jobs(
+        let (jobs, _dir) = jobs(
             "throttle",
             "head -c 100 /dev/zero > \"$1\"; echo out_time_us=60000000; exec sleep 30",
             2,
             Duration::from_secs(10),
-        );
+        )
+        .await;
         let dir = jobs.limits().scratch_dir.join("h/0");
         let file = dir.join("out.mkv");
         let job = jobs
@@ -604,7 +627,8 @@ mod tests {
 
     #[tokio::test]
     async fn leftovers_from_a_previous_run_are_removed() {
-        let root = scratch("leftovers");
+        let tmp = scratch("leftovers").await;
+        let root = tmp.as_ref();
         let old = root.join("scratch/oldhandle/0");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("out.mkv"), b"stale").unwrap();

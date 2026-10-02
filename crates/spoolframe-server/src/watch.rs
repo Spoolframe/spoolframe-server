@@ -148,11 +148,15 @@ impl Watch {
                 .store
                 .watch_states(principal, std::slice::from_ref(&key.1))
                 .await?;
-            let duration = stored
-                .get(&key.1)
+            let row = stored.get(&key.1);
+            let duration = row
                 .and_then(|r| r.duration_ms)
                 .map(|d| Duration::from_millis(d.max(0) as u64));
             if !self.rules.is_watched(position, duration) {
+                // Not written, but played: it is back in Continue watching
+                // (P1-22).
+                let show = row.and_then(|r| r.show_id.as_deref());
+                self.store.clear_hidden(principal, &key.1, show).await?;
                 return Ok(());
             }
         }
@@ -166,6 +170,42 @@ impl Watch {
             .expect("never held across a panic")
             .insert(key, Instant::now());
         Ok(())
+    }
+
+    /// Remove `id` from `principal`'s Continue watching (P1-22): a movie
+    /// itself, an episode its show (from Next up too). Its watch state does
+    /// not change; the next one written clears this.
+    pub async fn hide(&self, principal: Principal, id: &MediaId) -> Result<(), WatchError> {
+        let (target, external_ids) = self.hide_target(id).await?;
+        self.store
+            .hide_continue(principal, &target.to_string(), &external_ids)
+            .await?;
+        Ok(())
+    }
+
+    /// Undo [`Watch::hide`].
+    pub async fn unhide(&self, principal: Principal, id: &MediaId) -> Result<(), WatchError> {
+        let (target, _) = self.hide_target(id).await?;
+        self.store
+            .unhide_continue(principal, &target.to_string())
+            .await?;
+        Ok(())
+    }
+
+    /// What hiding `id` hides, with its external ids: the movie, or the
+    /// episode's show.
+    async fn hide_target(&self, id: &MediaId) -> Result<(MediaId, Vec<String>), WatchError> {
+        if !tracked(id) {
+            return Err(WatchError::NotTracked(id.clone()));
+        }
+        let found = self.catalog.item(id).await?;
+        match &found.item {
+            Item::Episode(e) => {
+                let show = self.catalog.item(&e.show_id).await?;
+                Ok((e.show_id.clone(), show.external_ids))
+            }
+            _ => Ok((id.clone(), found.external_ids)),
+        }
     }
 
     /// Mark `id` watched or not. Either way its progress starts over.
@@ -198,6 +238,9 @@ impl Watch {
         self.store
             .relink_watch(principal, &media_id, &found.external_ids)
             .await?;
+        self.store
+            .relink_hidden(principal, &media_id, &found.external_ids)
+            .await?;
         let show_id = match &found.item {
             Item::Episode(e) => Some(e.show_id.to_string()),
             _ => None,
@@ -212,6 +255,7 @@ impl Watch {
                     position_ms: position.map(ms),
                     duration_ms: duration.map(ms),
                     watched,
+                    unhide: true,
                 },
             )
             .await?;
@@ -256,6 +300,10 @@ impl Watch {
                 .relink_watch(principal, &id.to_string(), external_ids)
                 .await?;
         }
+        // A show's hide follows it too (P1-22).
+        self.store
+            .relink_hidden(principal, &id.to_string(), external_ids)
+            .await?;
         Ok(())
     }
 
@@ -295,9 +343,21 @@ impl Watch {
 
     /// `principal`'s home screen.
     pub async fn home(&self, principal: Principal) -> Result<HomeScreen, WatchError> {
+        // Removed from Continue watching (P1-22): movies, and shows.
+        let hidden = self.store.hidden(principal).await?;
         let mut continue_watching = Vec::new();
         let min = ms(self.rules.started_after);
-        for row in self.store.in_progress(principal, min, ROW as u32).await? {
+        // As many more as are hidden, so the row stays full.
+        let wanted = (ROW + hidden.len()) as u32;
+        for row in self.store.in_progress(principal, min, wanted).await? {
+            if continue_watching.len() == ROW {
+                break;
+            }
+            if hidden.contains(&row.media_id)
+                || row.show_id.as_ref().is_some_and(|s| hidden.contains(s))
+            {
+                continue;
+            }
             let Ok(id) = row.media_id.parse::<MediaId>() else {
                 continue;
             };
@@ -308,7 +368,11 @@ impl Watch {
                 Err(e) => return Err(e.into()),
             }
         }
-        let next_up = self.next_up(principal).await?;
+        let mut next_up = self.next_up(principal).await?;
+        next_up.retain(|item| match item {
+            Item::Episode(e) => !hidden.contains(&e.show_id.to_string()),
+            _ => true,
+        });
         let recently_added = self.catalog.recently_added(ROW as u32).await?;
         let mut home = HomeScreen {
             continue_watching,

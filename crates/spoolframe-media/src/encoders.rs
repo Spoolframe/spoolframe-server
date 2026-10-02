@@ -495,8 +495,9 @@ mod tests {
         }
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("spoolframe-encoders-{}-{name}", std::process::id()))
+    /// A directory of the test's own, removed when dropped.
+    async fn scratch(name: &str) -> spoolframe_test_dir::TestDir {
+        spoolframe_test_dir::TestDir::new(&format!("spoolframe-encoders-{name}")).await
     }
 
     fn names(e: &Encoders) -> Vec<&str> {
@@ -515,7 +516,12 @@ mod tests {
             "libsvtav1",
             "decode_vaapi",
         ]);
-        let e = detect(&ffmpeg, &TranscodeSettings::default(), &scratch("auto")).await;
+        let e = detect(
+            &ffmpeg,
+            &TranscodeSettings::default(),
+            scratch("auto").await.as_ref(),
+        )
+        .await;
         assert_eq!(
             names(&e),
             [
@@ -543,7 +549,12 @@ mod tests {
     #[tokio::test]
     async fn qsv_is_not_tried_when_ffmpeg_does_not_list_it() {
         let ffmpeg = Recorded::new(&["libx264"]);
-        detect(&ffmpeg, &TranscodeSettings::default(), &scratch("qsv")).await;
+        detect(
+            &ffmpeg,
+            &TranscodeSettings::default(),
+            scratch("qsv").await.as_ref(),
+        )
+        .await;
         let runs = ffmpeg.runs.lock().unwrap();
         assert!(runs.iter().all(|r| !r.iter().any(|a| a.contains("_qsv"))));
     }
@@ -551,7 +562,12 @@ mod tests {
     #[tokio::test]
     async fn a_failed_hardware_probe_falls_back_to_software() {
         let ffmpeg = Recorded::new(&["libx264", "libx265", "aac"]);
-        let e = detect(&ffmpeg, &TranscodeSettings::default(), &scratch("fallback")).await;
+        let e = detect(
+            &ffmpeg,
+            &TranscodeSettings::default(),
+            scratch("fallback").await.as_ref(),
+        )
+        .await;
         assert_eq!(e.video_encoder(VideoCodec::H264).unwrap().hardware, None);
         assert!(e.hardware_decoders.is_empty());
     }
@@ -563,7 +579,7 @@ mod tests {
             hardware: HardwarePolicy::None,
             ..TranscodeSettings::default()
         };
-        let e = detect(&ffmpeg, &settings, &scratch("none")).await;
+        let e = detect(&ffmpeg, &settings, scratch("none").await.as_ref()).await;
         assert_eq!(names(&e), ["libx264"]);
         assert!(e.unusable.is_empty());
         let runs = ffmpeg.runs.lock().unwrap();
@@ -577,7 +593,7 @@ mod tests {
             hardware: HardwarePolicy::Ordered(vec![Hardware::Nvenc]),
             ..TranscodeSettings::default()
         };
-        let e = detect(&ffmpeg, &settings, &scratch("nvenc")).await;
+        let e = detect(&ffmpeg, &settings, scratch("nvenc").await.as_ref()).await;
         assert_eq!(names(&e), ["libx264"]);
         assert_eq!(e.unusable, [Hardware::Nvenc]);
     }
@@ -587,7 +603,7 @@ mod tests {
         let e = detect(
             &Recorded::new(&[]),
             &TranscodeSettings::default(),
-            &scratch("audio"),
+            scratch("audio").await.as_ref(),
         )
         .await;
         let audio: Vec<_> = e.audio.iter().map(|a| a.codec).collect();
@@ -618,7 +634,7 @@ mod tests {
             hardware: HardwarePolicy::Ordered(vec![Hardware::Nvenc, Hardware::Vaapi]),
             ..TranscodeSettings::default()
         };
-        let e = detect(&ffmpeg, &settings, &scratch("ordered")).await;
+        let e = detect(&ffmpeg, &settings, scratch("ordered").await.as_ref()).await;
         assert_eq!(
             e.video_encoder(VideoCodec::H264).unwrap().name,
             "h264_nvenc"

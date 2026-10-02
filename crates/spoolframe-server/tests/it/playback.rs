@@ -29,6 +29,7 @@ async fn start(client: &TestClient, session: &SessionId, selection: Selection) -
                 id: movie().id().clone(),
                 selection: Some(selection),
                 start_ms: None,
+                bitmap: Default::default(),
             },
         )
         .await

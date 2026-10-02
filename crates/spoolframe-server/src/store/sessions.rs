@@ -2,7 +2,9 @@
 //! hash of the token, so the database alone cannot be used to act as a
 //! user.
 
-use super::users::LocalUserId;
+use spoolframe_types::Role;
+
+use super::users::{LocalUserId, role};
 use super::{Store, StoreError, now};
 
 /// What a session is bound to.
@@ -22,7 +24,8 @@ pub enum SessionBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiSessionUser {
     pub user: LocalUserId,
-    pub is_admin: bool,
+    /// Read from the user on each request, so a change applies at once.
+    pub role: Role,
 }
 
 /// The user behind a live endpoint session.
@@ -32,7 +35,9 @@ pub struct SessionUser {
     pub username: String,
     /// The display name, or the username when there is none.
     pub display_name: String,
-    pub is_admin: bool,
+    pub role: Role,
+    /// The user's PIN is asked for on this session's device (P2-08).
+    pub pin_required: bool,
 }
 
 /// One of a user's live sessions, as the user may see it: never the token.
@@ -108,8 +113,8 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<ApiSessionUser>, StoreError> {
-        let row: Option<(i64, bool)> = sqlx::query_as(
-            "SELECT u.id, u.is_admin FROM sessions s JOIN users u ON u.id = s.user_id \
+        let row: Option<(i64, String)> = sqlx::query_as(
+            "SELECT u.id, u.role FROM sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.token_hash = ?1 AND s.kind = 'api' AND s.revoked_at IS NULL \
                AND s.expires_at > ?2 AND u.disabled_at IS NULL",
         )
@@ -117,9 +122,9 @@ impl Store {
         .bind(now())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, is_admin)| ApiSessionUser {
+        Ok(row.map(|(id, stored)| ApiSessionUser {
             user: LocalUserId(id),
-            is_admin,
+            role: role(stored),
         }))
     }
 
@@ -134,8 +139,11 @@ impl Store {
         lifetime_secs: i64,
     ) -> Result<Option<SessionUser>, StoreError> {
         let now = now();
-        let row: Option<(i64, String, Option<String>, bool, i64)> = sqlx::query_as(
-            "SELECT u.id, u.username, u.display_name, u.is_admin, s.last_used_at \
+        let row: Option<(i64, String, Option<String>, String, i64, bool)> = sqlx::query_as(
+            "SELECT u.id, u.username, u.display_name, u.role, s.last_used_at, \
+                    EXISTS (SELECT 1 FROM pin_credentials p WHERE p.user_id = u.id) \
+                    AND EXISTS (SELECT 1 FROM pin_required r \
+                                WHERE r.user_id = u.id AND r.endpoint_id = s.endpoint_id) \
              FROM sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.token_hash = ?1 AND s.kind = 'endpoint' AND s.endpoint_id = ?2 \
                AND s.revoked_at IS NULL AND s.expires_at > ?3 AND u.disabled_at IS NULL",
@@ -145,7 +153,7 @@ impl Store {
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((id, username, display_name, is_admin, last_used_at)) = row else {
+        let Some((id, username, display_name, stored, last_used_at, pin_required)) = row else {
             return Ok(None);
         };
         if now - last_used_at >= RENEW_EVERY_SECS {
@@ -169,7 +177,8 @@ impl Store {
             user: LocalUserId(id),
             display_name: display_name.unwrap_or_else(|| username.clone()),
             username,
-            is_admin,
+            role: role(stored),
+            pin_required,
         }))
     }
 
@@ -204,12 +213,15 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::state_dir;
+    use super::super::tests::{TestStore, test_store};
     use super::*;
 
-    async fn store_with_alice(test: &str) -> (Store, LocalUserId) {
-        let store = Store::open(&state_dir(test)).await.unwrap();
-        let id = store.add_user("alice", None, "phc", false).await.unwrap();
+    async fn store_with_alice(test: &str) -> (TestStore, LocalUserId) {
+        let store = test_store(test).await;
+        let id = store
+            .add_user("alice", None, "phc", Role::Consumer)
+            .await
+            .unwrap();
         (store, id)
     }
 

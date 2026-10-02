@@ -188,3 +188,128 @@
   segment (0 is init). An encoded video is a 6 s grid; a copied one is
   cut at the source's keyframes, which the server lists once per file. A
   segment far ahead of the encode restarts it there.
+- `spoolframe-media::pgs` (P2-07): the cues of a PGS (`.sup`) subtitle
+  stream, each with its times and its picture as dark text on white, for
+  OCR. Objects in fragments, several objects on screen at once, cropping
+  and fades (one cue, not several) are handled. The `fixtures` feature
+  writes PGS streams for tests, since ffmpeg cannot encode PGS.
+- `spoolframe-media::ocr` (P2-07): PGS cues read as text by tesseract
+  (several processes side by side, a list of pictures each), written as
+  SubRip or WebVTT. A track is read with its own language's data, from its
+  tag (Matroska's 639-2/B codes mapped to tesseract's), or English if
+  untagged; a language without data is not guessed at. The dev shell has
+  tesseract with English.
+- Bitmap subtitles read as text (P2-07). A PGS track a client cannot draw
+  is read with tesseract and sent as an external SubRip (or WebVTT)
+  subtitle, so the file itself still plays directly; a converted playback
+  keeps its video copied (`SubtitleAction::Ocr`) instead of burning the
+  subtitle in. The first playback of a track starts the reading (the
+  playback starts at once), `ReadSubtitle` answers `SubtitleNotReady {
+  done_percent }` until it is done, and the text is cached, so later
+  playbacks get it at once. `PlaybackPlan` and `StartPlayback` take
+  `bitmap: auto | text | burn_in`: `text` reads even a track the client
+  could draw (or is `CannotPlay`, saying why), `burn_in` burns it in.
+  Config: `media { tesseract }`, `subtitles { ocr; ocr_threads;
+  cache_dir; }`; the NixOS module's `subtitles.ocrLanguages` (default
+  English) picks tesseract's languages.
+- Client SDK: converted playback (P2-03 to P2-05) and bitmap subtitles
+  (P2-07). `start_playback_with(id, selection, PlaybackOptions { start,
+  bitmap })` and `playback_plan_with(id, selection, bitmap)` beside the
+  existing calls, which keep their signatures; `Playback.epoch`;
+  `read_chunk(handle, epoch, offset, len)` and `read_segment(handle,
+  epoch, n, offset, len)` give a `Chunk { bytes, size, complete, epoch }`;
+  `seek_playback(handle, position) -> epoch`, `stop_playback(handle)`,
+  `manifest(handle, kind)`. `SdkError` gains `Busy`,
+  `PlaybackFailed(reason)`, `PlaybackRestarted { epoch }` and
+  `SubtitleNotReady { done_percent }`.
+- Server key fingerprints (P1-21): `spoolframe_protocol::fingerprint`,
+  SHA-256 over a label and the `EndpointId`, 80 bits in Crockford base32
+  (`K7QX-3MPA-9TRD-WF2H`), with test vectors computed apart from the code.
+  The server logs it at start (`server identity`), `spoolframe-server
+  fingerprint` prints it with the server stopped, and the admin API's
+  `serverStatus` (and `spoolframe status`) include it.
+- Client SDK pins only on the user's word (P1-21, P1-13). `connect` says
+  who answered (`ServerEntry.fingerprint`) and saves nothing; `pin(id,
+  verified)` saves the server, and pinning a saved one only sets
+  `verified` ("Verify now", no reconnect). Nothing but `Hello` goes to an
+  unpinned server (`SdkError::NotPinned`). A saved server that seems to
+  answer with another key (heard under its name while its own key is not)
+  is `SdkError::IdentityChanged { saved, now }`, listed once, and never
+  replaced by a connect or a pin; `trust_new_identity(saved, now)`
+  replaces the pin, verified, and forgets the old key's sessions. Saved
+  servers from before are `verified: false`.
+- Remove from Continue watching (P1-22): `HideFromContinueWatching { id }`
+  and `UnhideFromContinueWatching { id }`, and the SDK's
+  `hide_from_continue` / `unhide_from_continue`. Per user; position and
+  watched state stay. A movie hides itself, an episode its show (from
+  Continue watching and Next up). The next watch-state write for the item
+  or any episode of the show clears it, in the same transaction, and so
+  does progress the write throttle skips; Plex sync's writes leave it.
+  Hides follow an item to a new key by its external ids, like watch state
+  (migration 0005).
+- User roles (P2-09): `Role { Admin, Consumer }` (with `Unknown` for a
+  newer server's) replaces `is_admin` on users (migration 0006), in
+  `UserSummary`/`WhoAmI` and the admin API. The admin API splits into
+  `me.*`, the caller's own account for every role (`login`, `logout`,
+  `whoAmI`, `setPassword` with the current password, `sessions`,
+  `revokeSession`), and `admin.*`, other users and the server, admins only
+  (`FORBIDDEN` otherwise; `admin.setup` still makes the first admin). The
+  role is read on every call, so a demoted admin's next `admin.*` call is
+  refused without signing them out. `admin.userSetRole`; the last enabled
+  admin cannot be demoted or disabled (`LAST_ADMIN`). CLI: `user add
+  --role admin|consumer` (`--admin` kept, hidden), `user role <name>
+  <role>`, and `user list` shows each role.
+- Text subtitles converted once and cached (P2-07). A text subtitle the
+  client cannot show (ASS, `mov_text`, …) but whose text it can take is
+  converted to SubRip or WebVTT by ffmpeg and sent beside the file, as
+  read-as-text bitmap subtitles are, so the file still plays directly;
+  ASS styling is lost. Conversions share the OCR cache, its key and its
+  `SubtitleNotReady` answer.
+- HLS subtitle rendition (P2-07): an HLS playback's subtitle (copied,
+  converted or read from pictures) goes as WebVTT. The multivariant
+  playlist names it (`#EXT-X-MEDIA:TYPE=SUBTITLES`, with the BCP 47
+  language); `GetManifest { kind: Subtitles }` is its playlist, on the
+  video's own cuts; `ReadSubtitleSegment { handle, n }` (SDK
+  `read_subtitle_segment`) is segment n's cues, with `X-TIMESTAMP-MAP`
+  tying them to the video's timestamps. An empty `CODECS` is no longer
+  written.
+- Changing subtitles mid-playback (P2-07): `ChangeSubtitle { handle,
+  subtitle, bitmap, position_ms }` (SDK `change_subtitle`) plans the
+  playback again with the same audio. Direct play changes only what
+  `ReadSubtitle` gives; a converted playback restarts its encode at the
+  position as the next epoch (`PlaybackChanged { plan, size, epoch }`),
+  so reads of the old one get `PlaybackRestarted`; a choice that cannot
+  play is `CannotPlay` and leaves the playback as it was.
+- Burned-in PGS is scaled to the video (P2-07): the subtitle's canvas is
+  scaled to the picture before it is laid over it. Blu-ray PGS is 1080p
+  even over 4K video, and was burned in small at the top left (or off
+  the picture). Tested on a decoded frame: the cue shows where it was
+  placed, nothing else changes, and nothing shows after the cue.
+- Profile PIN storage (P2-08): a PIN per user, hashed like a password
+  (migration 0007), and on which of the user's devices it is asked for
+  (`pin_required`, per user and endpoint, outliving sign-outs). Clearing
+  the PIN clears its requirement everywhere; requiring needs a PIN; a
+  device is one the user has signed in from. The session lookup reports
+  whether this device requires the user's PIN.
+- Profile PIN lock (P2-08): on a device where the user's PIN is
+  required, their session starts locked on every connection. Locked, it
+  answers only `WhoAmI` (`locked: true`) and `UnlockProfile { pin }`;
+  everything else is `ProfileLocked` on every stream (RPC, range reads,
+  artwork). Using another profile on the connection locks it again.
+  Wrong PINs are rate-limited apart from passwords, and 10 in a row
+  revoke the session on that device. `SetPin`, `ClearPin`,
+  `ListDevices` and `SetPinRequired { device, required }`. A PIN is never
+  a way to sign in: it only locks and unlocks a session that a real
+  sign-in (the password; later SSO or a passkey) made, so an unlocked
+  session is all these take.
+- Profile PINs in the admin API and CLI (P2-08): `me.pinSet`,
+  `me.pinClear`, `me.devices` and `me.setPinRequired` for the caller's
+  own account; `admin.userClearPin`, `admin.userDevices` and
+  `admin.userSetPinRequired` for anyone's (an admin clears a PIN, never
+  sets one). CLI: `user pin set <name>` (signed in as that user with
+  their password), `user pin clear <name>`, `user devices <name>`, and `user
+  pin require <name> --device <name> [--off]`.
+- Client SDK: profile PINs (P2-08). `Session::unlock(pin)`, `set_pin`,
+  `clear_pin`, `devices` and `set_pin_required(device, required)`; a
+  locked profile's `user().locked` from `Client::profiles`, and
+  `SdkError::ProfileLocked` and `InvalidInput` from its calls.

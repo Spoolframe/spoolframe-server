@@ -42,7 +42,10 @@ uclicious = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+spoolframe-test-dir = { workspace = true }
 cargo_metadata = { workspace = true }
 m3u8-rs = { workspace = true }
 futures-util = { workspace = true }
 spoolframe-client-sdk = { workspace = true }
+# PGS tracks for the OCR tests.
+spoolframe-media = { workspace = true, features = ["fixtures"] }

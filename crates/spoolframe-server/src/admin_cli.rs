@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use jsonrpsee::core::ClientError;
 use jsonrpsee::ws_client::{HeaderMap, WsClient, WsClientBuilder};
-use spoolframe_admin_api::{AdminApiClient, Credentials, NewUser, SetupRequest};
+use spoolframe_admin_api::{AdminApiClient, Credentials, MeApiClient, NewUser, Role, SetupRequest};
 
 #[derive(Subcommand)]
 pub enum UserCommand {
@@ -22,8 +22,11 @@ pub enum UserCommand {
         /// What clients show for them; the username if left out.
         #[arg(long)]
         display_name: Option<String>,
-        /// Make them an admin.
-        #[arg(long)]
+        /// `admin` or `consumer`.
+        #[arg(long, default_value = "consumer")]
+        role: Role,
+        /// The same as `--role admin`.
+        #[arg(long, hide = true)]
         admin: bool,
         /// Read their password from standard input instead of prompting.
         #[arg(long)]
@@ -35,12 +38,48 @@ pub enum UserCommand {
         #[arg(long)]
         password_stdin: bool,
     },
-    /// List users.
+    /// Make a user an admin or a consumer. The last enabled admin stays
+    /// one.
+    Role { username: String, role: Role },
+    /// A user's profile PIN (P2-08).
+    Pin {
+        #[command(subcommand)]
+        command: PinCommand,
+    },
+    /// The devices a user has signed in from, and where their PIN is asked
+    /// for.
+    Devices { username: String },
+    /// List users, with their roles.
     List,
     /// Disable a user and end their sessions.
     Disable { username: String },
     /// Let a disabled user log in again.
     Enable { username: String },
+}
+
+#[derive(Subcommand)]
+pub enum PinCommand {
+    /// Set or change a user's PIN, as that user: prompts for their password,
+    /// to sign in as them, and the new PIN.
+    Set {
+        username: String,
+        /// Read the password and the PIN from standard input, a line each.
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Remove a user's PIN, and where it is asked for. Admins only.
+    Clear { username: String },
+    /// Ask for a user's PIN on one of their devices (`--off`: stop asking).
+    /// Admins only.
+    Require {
+        username: String,
+        /// The device's name, as `user devices` lists it, or the start of
+        /// its endpoint id.
+        #[arg(long)]
+        device: String,
+        #[arg(long)]
+        off: bool,
+    },
 }
 
 /// The URL to reach the admin API listening on `listen`. A wildcard
@@ -148,6 +187,13 @@ pub async fn setup(
 }
 
 pub async fn user(listen: SocketAddr, command: UserCommand) -> Result<()> {
+    // Set as the user, not an admin: an admin cannot set anyone's PIN.
+    if let UserCommand::Pin {
+        command: PinCommand::Set { username, stdin },
+    } = command
+    {
+        return pin_set(listen, &username, stdin).await;
+    }
     // Read a new password before logging in, so both prompts do not race
     // for standard input.
     let new = match &command {
@@ -168,6 +214,63 @@ pub async fn user(listen: SocketAddr, command: UserCommand) -> Result<()> {
         tracing::debug!(error = %e, "logout");
     }
     result
+}
+
+/// Set `username`'s PIN, signed in as them with their password: a PIN is
+/// set from a session a real sign-in made, never by an admin.
+async fn pin_set(listen: SocketAddr, username: &str, from_stdin: bool) -> Result<()> {
+    let (password, pin) = if from_stdin {
+        let mut lines = std::io::stdin().lock().lines();
+        let mut next = || -> Result<String> {
+            Ok(lines
+                .next()
+                .context("expected the password, then the PIN, a line each")??
+                .trim_end_matches('\r')
+                .to_owned())
+        };
+        (next()?, next()?)
+    } else {
+        let password = rpassword::prompt_password(format!("Password for {username}: "))?;
+        let pin = rpassword::prompt_password("New PIN (4 to 8 digits): ")?;
+        if rpassword::prompt_password("Repeat it: ")? != pin {
+            bail!("the PINs do not match");
+        }
+        (password, pin)
+    };
+    let login = connect(listen, None)
+        .await?
+        .login(Credentials {
+            username: username.to_owned(),
+            password,
+        })
+        .await
+        .map_err(api_error)?;
+    let api = connect(listen, Some(&login.token)).await?;
+    let result = api.pin_set(pin).await.map_err(api_error);
+    if let Err(e) = api.logout().await {
+        tracing::debug!(error = %e, "logout");
+    }
+    result?;
+    println!("PIN set for {username}");
+    Ok(())
+}
+
+/// The endpoint of `username`'s device named `device` (or whose endpoint
+/// id starts with it).
+async fn find_device(api: &WsClient, username: &str, device: &str) -> Result<String> {
+    let devices = api
+        .user_devices(username.to_owned())
+        .await
+        .map_err(api_error)?;
+    let matching: Vec<_> = devices
+        .iter()
+        .filter(|d| d.name.as_deref() == Some(device) || d.endpoint_id.starts_with(device))
+        .collect();
+    match matching.as_slice() {
+        [one] => Ok(one.endpoint_id.clone()),
+        [] => bail!("{username} has no device {device:?}; see `user devices {username}`"),
+        _ => bail!("{device:?} names more than one of {username}'s devices; give its endpoint id"),
+    }
 }
 
 /// Sync watch state with Plex now, or with `dry_run` print what would
@@ -234,6 +337,10 @@ pub async fn status(listen: SocketAddr) -> Result<()> {
         status.endpoint_id.as_deref().unwrap_or("starting")
     );
     println!(
+        "fingerprint: {}",
+        status.fingerprint.as_deref().unwrap_or("starting")
+    );
+    println!(
         "video encoders: {}",
         list(&status.transcoding.video_encoders)
     );
@@ -254,6 +361,7 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
         UserCommand::Add {
             username,
             display_name,
+            role,
             admin,
             ..
         } => {
@@ -262,15 +370,15 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
                     username,
                     display_name,
                     password: new_password(),
-                    admin,
+                    role: if admin { Role::Admin } else { role },
                 })
                 .await
                 .map_err(api_error)?;
-            println!(
-                "added {}{}",
-                user.username,
-                if user.is_admin { " (admin)" } else { "" }
-            );
+            println!("added {} ({})", user.username, user.role);
+        }
+        UserCommand::Role { username, role } => {
+            let user = api.user_set_role(username, role).await.map_err(api_error)?;
+            println!("{} is now {}", user.username, user.role);
         }
         UserCommand::Passwd { username, .. } => {
             api.user_set_password(Credentials {
@@ -283,10 +391,7 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
         }
         UserCommand::List => {
             for user in api.user_list().await.map_err(api_error)? {
-                let mut flags = Vec::new();
-                if user.is_admin {
-                    flags.push("admin");
-                }
+                let mut flags = vec![user.role.as_str()];
                 if user.disabled {
                     flags.push("disabled");
                 }
@@ -297,10 +402,44 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
                 if let Some(name) = user.display_name {
                     line.push_str(&format!(" \"{name}\""));
                 }
-                if !flags.is_empty() {
-                    line.push_str(&format!(" ({})", flags.join(", ")));
-                }
+                line.push_str(&format!(" ({})", flags.join(", ")));
                 println!("{line}");
+            }
+        }
+        UserCommand::Pin { command } => match command {
+            PinCommand::Set { .. } => unreachable!("set signs in as the user, before this"),
+            PinCommand::Clear { username } => {
+                api.user_clear_pin(username.clone())
+                    .await
+                    .map_err(api_error)?;
+                println!("PIN cleared for {username}; it is asked for nowhere");
+            }
+            PinCommand::Require {
+                username,
+                device,
+                off,
+            } => {
+                let endpoint = find_device(api, &username, &device).await?;
+                api.user_set_pin_required(username.clone(), endpoint, !off)
+                    .await
+                    .map_err(api_error)?;
+                let state = if off {
+                    "no longer asked for"
+                } else {
+                    "asked for"
+                };
+                println!("{username}'s PIN is {state} on {device}");
+            }
+        },
+        UserCommand::Devices { username } => {
+            for d in api.user_devices(username).await.map_err(api_error)? {
+                println!(
+                    "{}  {}  last used {}{}",
+                    d.name.as_deref().unwrap_or("(unnamed)"),
+                    &d.endpoint_id[..d.endpoint_id.len().min(10)],
+                    when(d.last_seen_at),
+                    if d.pin_required { "  PIN required" } else { "" }
+                );
             }
         }
         UserCommand::Disable { username } => {
@@ -318,9 +457,41 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
     Ok(())
 }
 
+/// Unix seconds as a UTC date and time, to the minute.
+fn when(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rest = secs.rem_euclid(86_400);
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rest / 3600,
+        rest / 60 % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn times_read_as_utc_dates() {
+        assert_eq!(when(0), "1970-01-01 00:00 UTC");
+        // A leap day, and a date this century.
+        assert_eq!(
+            when(951_782_400 + 13 * 3600 + 7 * 60),
+            "2000-02-29 13:07 UTC"
+        );
+        assert_eq!(when(1_790_000_000), "2026-09-21 14:13 UTC");
+    }
 
     #[test]
     fn a_wildcard_listen_address_is_reached_over_loopback() {

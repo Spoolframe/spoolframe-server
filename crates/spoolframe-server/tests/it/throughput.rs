@@ -42,6 +42,7 @@ async fn read_a_large_file() {
                 id: movie().id().clone(),
                 selection: Some(Selection::default()),
                 start_ms: None,
+                bitmap: Default::default(),
             },
         )
         .await

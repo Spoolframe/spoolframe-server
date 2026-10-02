@@ -12,7 +12,7 @@ use std::time::Duration;
 use spoolframe_media::MediaDescriptor;
 use spoolframe_media::encoders::Encoders;
 use spoolframe_protocol::{
-    ConvertedAudio, ConvertedSubtitle, ConvertedVideo, ManifestKind, PlaybackPlan,
+    ConvertedAudio, ConvertedSubtitle, ConvertedVideo, ManifestKind, PlaybackPlan, SubtitleAction,
 };
 use spoolframe_types::Delivery;
 
@@ -73,10 +73,14 @@ pub struct ConversionSource<'a> {
     pub vaapi_device: &'a Path,
     /// For HLS of a copied video: the source's keyframes, its only cuts.
     pub keyframes: Option<Arc<Vec<u64>>>,
+    /// The epoch of its first encode: 0 for a new playback; one past the
+    /// last for a conversion that replaces another (a subtitle change), so
+    /// reads of the old one are told to start over.
+    pub first_epoch: u32,
 }
 
 impl Conversion {
-    /// Start converting `source` at `start`, as epoch 0.
+    /// Start converting `source` at `start`, as epoch `source.first_epoch`.
     pub fn start(
         jobs: Arc<Jobs>,
         source: ConversionSource<'_>,
@@ -93,7 +97,15 @@ impl Conversion {
             return Err(JobError::Prepare("not a converted plan".into()));
         };
         let prepare = |e: std::io::Error| JobError::Prepare(e.to_string());
-        let dir = jobs.limits().scratch_dir.join(source.handle);
+        // A replacing conversion gets a directory of its own: the one it
+        // replaces removes its own when the last read of it ends.
+        let dir = match source.first_epoch {
+            0 => jobs.limits().scratch_dir.join(source.handle),
+            epoch => jobs
+                .limits()
+                .scratch_dir
+                .join(format!("{}~{epoch}", source.handle)),
+        };
         std::fs::create_dir_all(&dir).map_err(prepare)?;
         // Plain names for ffmpeg's filters (see `args::filter_path`).
         let input = dir.join("input");
@@ -143,7 +155,7 @@ impl Conversion {
             (*delivery, *video, *audio, *subtitle),
             &source.encoders,
             source.vaapi_device,
-            0,
+            source.first_epoch,
             start,
             first_segment,
         );
@@ -179,10 +191,37 @@ impl Conversion {
     /// For HLS, a playlist.
     pub fn manifest(&self, kind: ManifestKind) -> Option<String> {
         let segments = self.segments.as_ref()?;
+        let rendition = self
+            .subtitle_rendition()
+            .and_then(|index| self.descriptor.subtitles.get(index as usize));
         Some(match kind {
             ManifestKind::Media => segments.media_playlist(),
-            _ => hls::multivariant_playlist(&self.descriptor, self.video, self.audio),
+            ManifestKind::Subtitles => {
+                rendition?;
+                segments.subtitle_playlist()
+            }
+            _ => hls::multivariant_playlist(&self.descriptor, self.video, self.audio, rendition),
         })
+    }
+
+    /// For HLS, the subtitle track that goes as a WebVTT rendition (P2-07):
+    /// any text the plan keeps, copied, converted or read from pictures,
+    /// since segments carry no text.
+    pub fn subtitle_rendition(&self) -> Option<u32> {
+        let subtitle = self.subtitle?;
+        let text = matches!(
+            subtitle.action,
+            SubtitleAction::Copy { .. }
+                | SubtitleAction::Convert { .. }
+                | SubtitleAction::Ocr { .. }
+        );
+        (self.delivery == Delivery::Hls && text).then_some(subtitle.index)
+    }
+
+    /// For HLS, where segment `n` (from 1) starts and ends.
+    pub fn segment_span(&self, n: u32) -> Option<(u64, u64)> {
+        let segments = self.segments.as_ref()?;
+        Some((segments.start(n)?, segments.end(n)?))
     }
 
     /// The job that writes HLS segment `n`: the running one, or, if `n` is

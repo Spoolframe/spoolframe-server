@@ -17,6 +17,7 @@ pub mod playback;
 pub mod plex_sync;
 pub mod principal;
 pub mod store;
+pub mod subtitles;
 pub mod tracks;
 pub mod transcode;
 pub mod watch;

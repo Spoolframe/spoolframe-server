@@ -1,7 +1,5 @@
 //! `PlexCatalog` against a fake PMS serving the recorded fixtures.
 
-use std::path::PathBuf;
-
 use spoolframe_catalog::{Catalog, CatalogError, Page};
 use spoolframe_plex::{PathMap, PathMapping, PlexCatalog};
 use spoolframe_types::{Item, LibraryId, LibraryKind, MediaId, MediaKind, Namespace};
@@ -170,12 +168,10 @@ async fn search_honours_the_overall_limit() {
     assert_eq!(items.len(), 2);
 }
 
-/// A scratch media tree for one test, standing in for the local mount.
-fn media_root(test: &str) -> PathBuf {
-    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(test);
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    root
+/// A scratch media tree for one test, standing in for the local mount: a
+/// directory of its own under a random name, removed when dropped.
+async fn media_root(test: &str) -> spoolframe_test_dir::TestDir {
+    spoolframe_test_dir::TestDir::new(&format!("spoolframe-plex-{test}")).await
 }
 
 const EPISODE: &str =
@@ -193,11 +189,12 @@ fn mapping(library: Option<&str>, from: &str, to: &std::path::Path) -> PathMappi
 async fn an_episode_resolves_to_its_mapped_local_file() {
     let server = MockServer::start().await;
     serve(&server, "/library/metadata/208620", "metadata-episode").await;
-    let root = media_root("mapped-episode");
+    let tmp = media_root("mapped-episode").await;
+    let root = tmp.as_ref();
     let local = root.join(EPISODE);
     std::fs::create_dir_all(local.parent().unwrap()).unwrap();
     std::fs::write(&local, b"").unwrap();
-    let catalog = catalog(&server).with_paths(PathMap::new(vec![mapping(None, "/data", &root)]));
+    let catalog = catalog(&server).with_paths(PathMap::new(vec![mapping(None, "/data", root)]));
     let path = catalog
         .media_path(&id(MediaKind::Episode, "208620"))
         .await
@@ -209,13 +206,14 @@ async fn an_episode_resolves_to_its_mapped_local_file() {
 async fn a_library_scoped_mapping_matches_the_plex_library_title() {
     let server = MockServer::start().await;
     serve(&server, "/library/metadata/208620", "metadata-episode").await;
-    let root = media_root("scoped-episode");
+    let tmp = media_root("scoped-episode").await;
+    let root = tmp.as_ref();
     let local = root.join(EPISODE);
     std::fs::create_dir_all(local.parent().unwrap()).unwrap();
     std::fs::write(&local, b"").unwrap();
     let catalog = catalog(&server).with_paths(PathMap::new(vec![
         mapping(None, "/data", std::path::Path::new("/nowhere")),
-        mapping(Some("TV Shows"), "/data", &root),
+        mapping(Some("TV Shows"), "/data", root),
     ]));
     let path = catalog
         .media_path(&id(MediaKind::Episode, "208620"))
@@ -228,8 +226,9 @@ async fn a_library_scoped_mapping_matches_the_plex_library_title() {
 async fn a_missing_file_names_the_plex_path_the_mapping_and_the_mapped_path() {
     let server = MockServer::start().await;
     serve(&server, "/library/metadata/208620", "metadata-episode").await;
-    let root = media_root("missing-episode");
-    let catalog = catalog(&server).with_paths(PathMap::new(vec![mapping(None, "/data", &root)]));
+    let tmp = media_root("missing-episode").await;
+    let root = tmp.as_ref();
+    let catalog = catalog(&server).with_paths(PathMap::new(vec![mapping(None, "/data", root)]));
     let err = catalog
         .media_path(&id(MediaKind::Episode, "208620"))
         .await

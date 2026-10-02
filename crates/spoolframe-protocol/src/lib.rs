@@ -10,6 +10,7 @@
 
 pub mod artwork;
 pub mod codec;
+pub mod fingerprint;
 pub mod lan;
 pub mod media;
 pub mod messages;
@@ -19,12 +20,14 @@ pub mod streams;
 pub use artwork::{ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
 pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle};
 pub use messages::{
-    AuthMethod, Error, Event, Hello, HomeScreen, LoginPassword, ManifestKind, PROTOCOL_VERSION,
-    Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
+    AuthMethod, DeviceInfo, Error, Event, Hello, HomeScreen, LoginPassword, ManifestKind,
+    PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId,
+    SessionInfo, UserSummary,
 };
 pub use playback::{
-    AudioAction, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, PlannedAudio,
-    PlannedSubtitle, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery, TrackReason,
+    AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
+    PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
+    TrackReason,
 };
 
 /// The ALPN of the client protocol, version 1. A breaking change to the

@@ -1,7 +1,6 @@
 //! `Prober` with stand-in ffprobe scripts, so timeouts, failures and the
 //! cache can be tested without real media.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,21 +10,39 @@ fn fixture(name: &str) -> String {
     format!("{}/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"))
 }
 
-/// A fresh media directory for one test. The stand-in ffprobe and its
-/// call log live in its `bin` sibling, so they never change the media
-/// directory the cache watches.
-fn scratch(test: &str) -> PathBuf {
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("prober")
-        .join(test);
-    let _ = std::fs::remove_dir_all(&root);
+/// A fresh media directory for one test, in a directory of its own under
+/// a random name (removed when the first value is dropped), so runs at
+/// once never share one. The stand-in ffprobe and its call log live in its
+/// `bin` sibling, so they never change the media directory the cache
+/// watches.
+async fn scratch(test: &str) -> (spoolframe_test_dir::TestDir, PathBuf) {
+    let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-prober-{test}")).await;
+    let root = tmp.as_ref();
     std::fs::create_dir_all(root.join("bin")).unwrap();
     std::fs::create_dir_all(root.join("media")).unwrap();
-    root.join("media")
+    let media = root.join("media");
+    (tmp, media)
 }
 
 fn bin(dir: &Path) -> PathBuf {
     dir.parent().unwrap().join("bin")
+}
+
+/// Writes an executable script. The text goes to a plain file first and
+/// `install` makes the script from it, so this process never holds the
+/// script open for writing: a child another test forks at that moment
+/// would inherit the handle, and running the script would then fail with
+/// "Text file busy" (ETXTBSY).
+fn write_script(path: &Path, text: &str) {
+    let source = path.with_extension("txt");
+    std::fs::write(&source, text).unwrap();
+    let status = std::process::Command::new("install")
+        .args(["-m", "755"])
+        .arg(&source)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "install {} failed", path.display());
 }
 
 /// A stand-in ffprobe: logs each path it is asked about to `calls`, then
@@ -33,15 +50,13 @@ fn bin(dir: &Path) -> PathBuf {
 fn fake_ffprobe(dir: &Path, body: &str) -> PathBuf {
     let script = bin(dir).join("ffprobe");
     let calls = bin(dir).join("calls");
-    std::fs::write(
+    write_script(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\nfor path; do :; done\necho \"$path\" >> '{}'\n{body}\n",
             calls.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     script
 }
 
@@ -76,7 +91,7 @@ fn prober(ffprobe: PathBuf) -> Prober {
 
 #[tokio::test]
 async fn a_subtitle_file_beside_the_media_is_added_with_its_name_s_language() {
-    let dir = scratch("external");
+    let (_tmp, dir) = scratch("external").await;
     let movie = media(&dir);
     std::fs::write(dir.join("Movie.en.forced.srt"), b"").unwrap();
     let d = prober(ffprobe_with_fixtures(&dir))
@@ -98,7 +113,7 @@ async fn a_subtitle_file_beside_the_media_is_added_with_its_name_s_language() {
 
 #[tokio::test]
 async fn an_sdh_subtitle_file_gets_the_sdh_role() {
-    let dir = scratch("external-sdh");
+    let (_tmp, dir) = scratch("external-sdh").await;
     let movie = media(&dir);
     std::fs::write(dir.join("Movie.en.sdh.srt"), b"").unwrap();
     let d = prober(ffprobe_with_fixtures(&dir))
@@ -112,7 +127,7 @@ async fn an_sdh_subtitle_file_gets_the_sdh_role() {
 
 #[tokio::test]
 async fn an_unchanged_file_is_probed_once() {
-    let dir = scratch("cache-hit");
+    let (_tmp, dir) = scratch("cache-hit").await;
     let movie = media(&dir);
     let prober = prober(ffprobe_with_fixtures(&dir));
     let first = prober.describe(&movie).await.unwrap();
@@ -123,7 +138,7 @@ async fn an_unchanged_file_is_probed_once() {
 
 #[tokio::test]
 async fn a_changed_file_is_probed_again() {
-    let dir = scratch("cache-size");
+    let (_tmp, dir) = scratch("cache-size").await;
     let movie = media(&dir);
     let prober = prober(ffprobe_with_fixtures(&dir));
     prober.describe(&movie).await.unwrap();
@@ -134,7 +149,7 @@ async fn a_changed_file_is_probed_again() {
 
 #[tokio::test]
 async fn a_new_subtitle_file_is_noticed() {
-    let dir = scratch("cache-new-subtitle");
+    let (_tmp, dir) = scratch("cache-new-subtitle").await;
     let movie = media(&dir);
     let prober = prober(ffprobe_with_fixtures(&dir));
     let before = prober.describe(&movie).await.unwrap().subtitles.len();
@@ -145,7 +160,7 @@ async fn a_new_subtitle_file_is_noticed() {
 
 #[tokio::test]
 async fn a_hung_ffprobe_is_stopped_and_named_by_path() {
-    let dir = scratch("timeout");
+    let (_tmp, dir) = scratch("timeout").await;
     let movie = media(&dir);
     let prober = Prober::new(fake_ffprobe(&dir, "sleep 30"), Duration::from_millis(200));
     let err = prober.describe(&movie).await.unwrap_err();
@@ -155,7 +170,7 @@ async fn a_hung_ffprobe_is_stopped_and_named_by_path() {
 
 #[tokio::test]
 async fn a_failing_ffprobe_reports_its_stderr_and_the_path() {
-    let dir = scratch("failure");
+    let (_tmp, dir) = scratch("failure").await;
     let movie = media(&dir);
     let err = prober(fake_ffprobe(&dir, "echo 'Invalid data found' >&2; exit 1"))
         .describe(&movie)
@@ -168,7 +183,7 @@ async fn a_failing_ffprobe_reports_its_stderr_and_the_path() {
 
 #[tokio::test]
 async fn a_missing_ffprobe_is_named() {
-    let dir = scratch("no-ffprobe");
+    let (_tmp, dir) = scratch("no-ffprobe").await;
     let movie = media(&dir);
     let err = prober(dir.join("no-such-ffprobe"))
         .describe(&movie)
@@ -180,7 +195,7 @@ async fn a_missing_ffprobe_is_named() {
 
 #[tokio::test]
 async fn garbage_output_is_an_error_not_an_empty_descriptor() {
-    let dir = scratch("garbage");
+    let (_tmp, dir) = scratch("garbage").await;
     let movie = media(&dir);
     let err = prober(fake_ffprobe(&dir, "echo 'not json'"))
         .describe(&movie)
@@ -191,7 +206,7 @@ async fn garbage_output_is_an_error_not_an_empty_descriptor() {
 
 #[tokio::test]
 async fn a_file_with_no_audio_or_video_is_an_error() {
-    let dir = scratch("no-media");
+    let (_tmp, dir) = scratch("no-media").await;
     let movie = media(&dir);
     let err = prober(fake_ffprobe(
         &dir,
@@ -205,7 +220,7 @@ async fn a_file_with_no_audio_or_video_is_an_error() {
 
 #[tokio::test]
 async fn a_broken_subtitle_file_is_skipped() {
-    let dir = scratch("broken-subtitle");
+    let (_tmp, dir) = scratch("broken-subtitle").await;
     let movie = media(&dir);
     std::fs::write(dir.join("Movie.srt"), b"").unwrap();
     let ffprobe = fake_ffprobe(
@@ -225,7 +240,7 @@ async fn a_broken_subtitle_file_is_skipped() {
 
 #[tokio::test]
 async fn a_missing_media_file_is_named() {
-    let dir = scratch("missing-media");
+    let (_tmp, dir) = scratch("missing-media").await;
     let err = prober(ffprobe_with_fixtures(&dir))
         .describe(&dir.join("Gone.mkv"))
         .await

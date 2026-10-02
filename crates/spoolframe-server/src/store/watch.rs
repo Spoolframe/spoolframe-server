@@ -28,6 +28,10 @@ pub struct WatchUpdate<'a> {
     pub position_ms: Option<i64>,
     pub duration_ms: Option<i64>,
     pub watched: bool,
+    /// Clear a "removed from Continue watching" for the item or its show
+    /// (P1-22): the user played or marked it. Not for state taken from
+    /// elsewhere (PX-04): hides are this server's own.
+    pub unhide: bool,
 }
 
 impl Store {
@@ -82,6 +86,127 @@ impl Store {
             .bind(&principal)
             .bind(update.media_id)
             .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if update.unhide {
+            clear_hidden(&mut tx, &principal, update.media_id, update.show_id).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove `media_id` (a movie, or an episode's show) from `principal`'s
+    /// Continue watching and Next up, until its watch state changes
+    /// (P1-22). `external_ids` let the hide follow the item to a new key.
+    pub async fn hide_continue(
+        &self,
+        principal: Principal,
+        media_id: &str,
+        external_ids: &[String],
+    ) -> Result<(), StoreError> {
+        let principal = principal.to_string();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO continue_hidden (principal, media_id, hidden_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (principal, media_id) DO UPDATE SET hidden_at = excluded.hidden_at",
+        )
+        .bind(&principal)
+        .bind(media_id)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+        for id in external_ids {
+            sqlx::query(
+                "INSERT INTO continue_hidden_ids (principal, media_id, external_id) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (principal, external_id) DO UPDATE SET media_id = excluded.media_id",
+            )
+            .bind(&principal)
+            .bind(media_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Undo [`Store::hide_continue`].
+    pub async fn unhide_continue(
+        &self,
+        principal: Principal,
+        media_id: &str,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        clear_hidden(&mut tx, &principal.to_string(), media_id, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Clear the hide of `media_id` or its show without a state written:
+    /// progress within the write throttle still counts as playing it.
+    pub async fn clear_hidden(
+        &self,
+        principal: Principal,
+        media_id: &str,
+        show_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        clear_hidden(&mut tx, &principal.to_string(), media_id, show_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// What `principal` removed from Continue watching.
+    pub async fn hidden(&self, principal: Principal) -> Result<HashSet<String>, StoreError> {
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT media_id FROM continue_hidden WHERE principal = ?1")
+                .bind(principal.to_string())
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    /// If `media_id` is not hidden but an item with one of `external_ids`
+    /// is, move the hide to `media_id` (the item got a new key).
+    pub async fn relink_hidden(
+        &self,
+        principal: Principal,
+        media_id: &str,
+        external_ids: &[String],
+    ) -> Result<(), StoreError> {
+        if external_ids.is_empty() {
+            return Ok(());
+        }
+        let principal = principal.to_string();
+        let mut tx = self.pool.begin().await?;
+        let has_own: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM continue_hidden WHERE principal = ?1 AND media_id = ?2",
+        )
+        .bind(&principal)
+        .bind(media_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if has_own.is_some() {
+            return Ok(());
+        }
+        let mut query: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT media_id FROM continue_hidden_ids WHERE principal = ");
+        query.push_bind(&principal).push(" AND external_id IN (");
+        let mut ids = query.separated(", ");
+        for id in external_ids {
+            ids.push_bind(id);
+        }
+        query.push(") LIMIT 1");
+        let old: Option<String> = query.build_query_scalar().fetch_optional(&mut *tx).await?;
+        if let Some(old) = old {
+            sqlx::query(
+                "UPDATE continue_hidden SET media_id = ?3 WHERE principal = ?1 AND media_id = ?2",
+            )
+            .bind(&principal)
+            .bind(&old)
+            .bind(media_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -231,9 +356,24 @@ impl Store {
     }
 }
 
+async fn clear_hidden(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    principal: &str,
+    media_id: &str,
+    show_id: Option<&str>,
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM continue_hidden WHERE principal = ?1 AND media_id IN (?2, ?3)")
+        .bind(principal)
+        .bind(media_id)
+        .bind(show_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::tests::state_dir;
+    use super::super::tests::{TestStore, test_store};
     use super::*;
     use crate::store::users::LocalUserId;
 
@@ -248,11 +388,72 @@ mod tests {
             position_ms: Some(position_ms),
             duration_ms: Some(7_000_000),
             watched: false,
+            unhide: true,
         }
     }
 
-    async fn store(test: &str) -> Store {
-        Store::open(&state_dir(test)).await.unwrap()
+    #[tokio::test]
+    async fn a_hide_is_per_principal_and_cleared_by_a_write_for_it_or_its_show() {
+        let store = store("hidden").await;
+        store
+            .hide_continue(ALICE, "plex:movie:1", &[])
+            .await
+            .unwrap();
+        store
+            .hide_continue(ALICE, "plex:show:7", &[])
+            .await
+            .unwrap();
+        assert_eq!(store.hidden(ALICE).await.unwrap().len(), 2);
+        assert!(store.hidden(BOB).await.unwrap().is_empty());
+
+        store
+            .save_watch(ALICE, at("plex:movie:1", 120_000, &[]))
+            .await
+            .unwrap();
+        // An episode of the show clears the show.
+        let episode = WatchUpdate {
+            show_id: Some("plex:show:7"),
+            ..at("plex:episode:70", 120_000, &[])
+        };
+        store.save_watch(ALICE, episode).await.unwrap();
+        assert!(store.hidden(ALICE).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_write_from_elsewhere_leaves_a_hide_alone() {
+        let store = store("hidden-sync").await;
+        store
+            .hide_continue(ALICE, "plex:movie:1", &[])
+            .await
+            .unwrap();
+        let synced = WatchUpdate {
+            unhide: false,
+            ..at("plex:movie:1", 120_000, &[])
+        };
+        store.save_watch_at(ALICE, synced, 1).await.unwrap();
+        assert!(store.hidden(ALICE).await.unwrap().contains("plex:movie:1"));
+        store.unhide_continue(ALICE, "plex:movie:1").await.unwrap();
+        assert!(store.hidden(ALICE).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hide_moves_to_an_item_s_new_key_through_its_external_ids() {
+        let store = store("hidden-relink").await;
+        let ids = vec!["imdb://tt0078748".to_owned()];
+        store
+            .hide_continue(ALICE, "plex:movie:1", &ids)
+            .await
+            .unwrap();
+        store
+            .relink_hidden(ALICE, "plex:movie:99", &ids)
+            .await
+            .unwrap();
+        let hidden = store.hidden(ALICE).await.unwrap();
+        assert!(hidden.contains("plex:movie:99") && !hidden.contains("plex:movie:1"));
+    }
+
+    async fn store(test: &str) -> TestStore {
+        test_store(test).await
     }
 
     #[tokio::test]

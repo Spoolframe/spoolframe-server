@@ -58,6 +58,13 @@ fn canonical(code: &str) -> String {
         .map_or(code, |codes| codes[0].to_owned())
 }
 
+/// A language code as BCP 47 (HLS's `LANGUAGE`) writes it: the two-letter
+/// code where the language has one (`eng` and `en` are `en`), else the
+/// code as it is, lowercased.
+pub fn bcp47(code: &str) -> String {
+    canonical(code)
+}
+
 /// Whether two language codes name the same language.
 pub fn same_language(a: &str, b: &str) -> bool {
     canonical(a) == canonical(b)

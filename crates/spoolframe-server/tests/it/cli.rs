@@ -10,8 +10,8 @@ fn server() -> Command {
     cmd
 }
 
-#[test]
-fn version_names_the_binary_and_its_version() {
+#[tokio::test]
+async fn version_names_the_binary_and_its_version() {
     let output = server().arg("--version").output().expect("the binary runs");
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("--version prints UTF-8");
@@ -21,21 +21,20 @@ fn version_names_the_binary_and_its_version() {
     );
 }
 
-/// Write `body` as a config file under the test's own tmp dir.
-fn config_file(name: &str, body: &str) -> std::path::PathBuf {
-    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    std::fs::write(&path, body).unwrap();
-    path
-}
-
-/// A config for a server whose state lives in its own tmp dir.
+/// A config for a server whose state lives in a directory of the test's
+/// own, under a random name so runs at once never share one; the config
+/// file is in it too. The directory goes when the first value is dropped.
 /// Its admin API is on a port of its own, so test servers never share one.
-fn config_with_state(name: &str, plex_url: &str) -> std::path::PathBuf {
-    let state = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-state"));
-    let _ = std::fs::remove_dir_all(&state);
-    config_file(
-        &format!("{name}.ucl"),
-        &format!(
+async fn config_with_state(
+    name: &str,
+    plex_url: &str,
+) -> (spoolframe_test_dir::TestDir, std::path::PathBuf) {
+    let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-cli-{name}")).await;
+    let state = tmp.as_ref().join("state");
+    let path = tmp.as_ref().join(format!("{name}.ucl"));
+    std::fs::write(
+        &path,
+        format!(
             r#"
             schema = "spoolframe.server.v1";
             state_dir = "{}";
@@ -46,9 +45,10 @@ fn config_with_state(name: &str, plex_url: &str) -> std::path::PathBuf {
             free_port()
         ),
     )
+    .unwrap();
+    (tmp, path)
 }
 
-/// A port that was just free.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -107,10 +107,10 @@ impl Drop for Running {
     }
 }
 
-#[test]
-fn an_unreachable_plex_is_reported_and_the_server_keeps_running() {
+#[tokio::test]
+async fn an_unreachable_plex_is_reported_and_the_server_keeps_running() {
     let url = closed_port_url();
-    let config = config_with_state("unreachable-plex", &url);
+    let (_tmp, config) = config_with_state("unreachable-plex", &url).await;
     let (running, log) = Running::start(&config);
     assert!(log.contains("Plex catalog unavailable"), "{log}");
     assert!(log.contains(&url), "{log}");
@@ -150,9 +150,9 @@ fn cli(config: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Outpu
     child.wait_with_output().unwrap()
 }
 
-#[test]
-fn setup_then_manage_users_from_the_cli() {
-    let config = config_with_state("cli-users", &closed_port_url());
+#[tokio::test]
+async fn setup_then_manage_users_from_the_cli() {
+    let (_tmp, config) = config_with_state("cli-users", &closed_port_url()).await;
     let (running, log) = Running::start(&config);
     let code = setup_code(&log);
     let admin = [
@@ -183,10 +183,59 @@ fn setup_then_manage_users_from_the_cli() {
     );
     assert!(out.status.success(), "{out:?}");
 
-    let out = cli(&config, &["user", "list"], "", &admin);
+    let list = |admin: &[(&str, &str)]| {
+        let out = cli(&config, &["user", "list"], "", admin);
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(list(&admin), "alice (consumer)\nroot (admin)\n");
+
+    // The last admin cannot step down; once alice is one, root can.
+    let out = cli(&config, &["user", "role", "root", "consumer"], "", &admin);
+    assert!(!out.status.success(), "{out:?}");
+    let out = cli(&config, &["user", "role", "alice", "admin"], "", &admin);
     assert!(out.status.success(), "{out:?}");
-    let listed = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(listed, "alice\nroot (admin)\n");
+    let out = cli(&config, &["user", "role", "root", "consumer"], "", &admin);
+    assert!(out.status.success(), "{out:?}");
+    // root is a consumer now: the CLI's admin calls are refused for them.
+    let out = cli(&config, &["user", "list"], "", &admin);
+    assert!(!out.status.success(), "{out:?}");
+    let alice = [
+        ("SPOOLFRAME_ADMIN_USER", "alice"),
+        ("SPOOLFRAME_ADMIN_PASSWORD", "battery staple"),
+    ];
+    assert_eq!(list(&alice), "alice (admin)\nroot (consumer)\n");
+
+    // Alice's PIN, set as her; cleared by an admin.
+    let out = cli(
+        &config,
+        &["user", "pin", "set", "root", "--stdin"],
+        "correct horse\n4321\n",
+        &[],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let out = cli(&config, &["user", "devices", "root"], "", &alice);
+    assert!(out.status.success(), "{out:?}");
+    // No client has signed in as root: no device to require it on.
+    let out = cli(
+        &config,
+        &["user", "pin", "require", "root", "--device", "TV"],
+        "",
+        &alice,
+    );
+    assert!(!out.status.success(), "{out:?}");
+    let out = cli(&config, &["user", "pin", "clear", "root"], "", &alice);
+    assert!(out.status.success(), "{out:?}");
+
+    // The hidden `--admin` still means `--role admin`.
+    let out = cli(
+        &config,
+        &["user", "add", "bob", "--admin", "--password-stdin"],
+        "bob's password\n",
+        &alice,
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(list(&alice).contains("bob (admin)"));
 
     let out = cli(
         &config,
@@ -202,9 +251,9 @@ fn setup_then_manage_users_from_the_cli() {
     running.stop();
 }
 
-#[test]
-fn the_cli_says_when_the_server_is_not_running() {
-    let config = config_with_state("cli-no-server", &closed_port_url());
+#[tokio::test]
+async fn the_cli_says_when_the_server_is_not_running() {
+    let (_tmp, config) = config_with_state("cli-no-server", &closed_port_url()).await;
     let out = cli(
         &config,
         &["user", "list"],
@@ -219,9 +268,40 @@ fn the_cli_says_when_the_server_is_not_running() {
     assert!(stderr.contains("is the server running?"), "{stderr}");
 }
 
-#[test]
-fn id_prints_the_same_endpoint_id_every_time() {
-    let config = config_with_state("id", &closed_port_url());
+/// What `spoolframe-server <command>` prints, trimmed.
+fn printed(config: &Path, command: &str) -> String {
+    let output = server()
+        .arg("--config")
+        .arg(config)
+        .arg(command)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[tokio::test]
+async fn the_fingerprint_is_the_key_s_and_the_server_logs_it() {
+    let (_tmp, config) = config_with_state("fingerprint", &closed_port_url()).await;
+    // With the server stopped.
+    let fingerprint = printed(&config, "fingerprint");
+    let id = printed(&config, "id");
+    assert_eq!(
+        spoolframe_protocol::fingerprint::of_hex(&id).as_deref(),
+        Some(fingerprint.as_str())
+    );
+    let (running, log) = Running::start(&config);
+    assert!(
+        log.lines()
+            .any(|l| l.contains("server identity") && l.contains(&fingerprint)),
+        "{log}"
+    );
+    assert!(running.stop().success());
+}
+
+#[tokio::test]
+async fn id_prints_the_same_endpoint_id_every_time() {
+    let (_tmp, config) = config_with_state("id", &closed_port_url()).await;
     let id = || {
         let output = server()
             .arg("--config")

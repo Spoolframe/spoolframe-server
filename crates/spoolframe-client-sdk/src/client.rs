@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
-use spoolframe_protocol::{LoginPassword, Reply, Request, Response, SessionId, lan};
+use spoolframe_protocol::{LoginPassword, Reply, Request, Response, SessionId, fingerprint, lan};
 use spoolframe_types::ClientCapabilities;
 
 use crate::connection::ServerConnection;
@@ -103,18 +103,29 @@ impl Client {
 
     /// The servers this device knows: saved ones and ones heard on the LAN,
     /// one entry per key. Saved first, then heard, each by name.
+    ///
+    /// A server heard under a saved server's name, with another key, while
+    /// the saved key is not heard, is not listed apart: it is that server's
+    /// entry, whose connect says [`SdkError::IdentityChanged`] (P1-13).
     pub async fn servers(&self) -> Result<Vec<ServerEntry>, SdkError> {
         let saved = servers::load(self.inner.storage.as_ref()).await?;
         let mut heard = self.inner.discovery.heard();
+        let away: Vec<String> = saved
+            .iter()
+            .filter(|s| parse_id(&s.endpoint_id).map_or(true, |id| !heard.contains_key(&id)))
+            .map(|s| s.name.clone())
+            .collect();
         let mut entries: Vec<ServerEntry> = saved
             .into_iter()
             .map(|s| {
                 let id = EndpointId::from_str(&s.endpoint_id).ok();
                 let on_lan = id.and_then(|id| heard.remove(&id));
                 ServerEntry {
+                    fingerprint: fingerprint::of_hex(&s.endpoint_id).unwrap_or_default(),
                     endpoint_id: s.endpoint_id,
                     name: s.name,
                     pinned: true,
+                    verified: s.verified,
                     on_network: on_lan.is_some(),
                     addrs: on_lan.map_or(s.last_known_addrs, |h| h.addrs),
                 }
@@ -122,11 +133,14 @@ impl Client {
             .collect();
         let mut unsaved: Vec<ServerEntry> = heard
             .into_iter()
+            .filter(|(_, h)| !away.contains(&h.name))
             .map(|(id, h)| ServerEntry {
                 endpoint_id: id.to_string(),
+                fingerprint: fingerprint::fingerprint(id.as_bytes()),
                 name: h.name,
                 addrs: h.addrs,
                 pinned: false,
+                verified: false,
                 on_network: true,
             })
             .collect();
@@ -157,25 +171,206 @@ impl Client {
         Ok(())
     }
 
-    /// Connect to server `endpoint_id`, or use the open connection. A server
-    /// not saved yet must have been heard on the LAN or given an address;
-    /// the first connect saves it, pinning its key (TOFU, §19).
+    /// Connect to server `endpoint_id`, or use the open connection, and say
+    /// who answered: its name and its key's fingerprint. A server not saved
+    /// yet must have been heard on the LAN or given an address, and is not
+    /// saved by this: the app shows the fingerprint, then calls
+    /// [`Client::pin`] (P1-21). Until then only `Hello` is sent to it.
+    ///
+    /// [`SdkError::IdentityChanged`] when a saved server seems to answer
+    /// with another key (P1-13): `endpoint_id` is heard under a saved
+    /// server's name while that server's own key is not, or a saved server
+    /// cannot be reached and another key is heard under its name. Nothing
+    /// is connected or saved; [`Client::trust_new_identity`] replaces the
+    /// pin if the user says so.
     pub async fn connect(&self, endpoint_id: &str) -> Result<ServerEntry, SdkError> {
         let id = parse_id(endpoint_id)?;
-        self.connection(id).await?;
         let saved = servers::load(self.inner.storage.as_ref()).await?;
-        let server = saved
-            .into_iter()
-            .find(|s| s.endpoint_id == endpoint_id)
-            .expect("a connected server is saved");
-        let heard = self.inner.discovery.get(&id);
-        Ok(ServerEntry {
-            endpoint_id: server.endpoint_id,
-            name: server.name,
-            addrs: server.last_known_addrs,
-            pinned: true,
-            on_network: heard.is_some(),
+        let pinned = saved.iter().find(|s| s.endpoint_id == endpoint_id).cloned();
+        if pinned.is_none()
+            && let Some(old) = self.replaced_by(&saved, id)
+        {
+            return Err(SdkError::IdentityChanged {
+                saved: old.endpoint_id.clone(),
+                now: endpoint_id.to_owned(),
+            });
+        }
+        let conn = match self.link(id).connection(self).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                if let Some(old) = &pinned
+                    && let Some(now) = self.replacement(old)
+                {
+                    return Err(SdkError::IdentityChanged {
+                        saved: old.endpoint_id.clone(),
+                        now: now.to_string(),
+                    });
+                }
+                return Err(e);
+            }
+        };
+        Ok(self.entry(id, &conn, pinned.as_ref()))
+    }
+
+    /// Save server `endpoint_id`, which [`Client::connect`] reached, with
+    /// `verified` saying whether the user confirmed its fingerprint (P1-21).
+    /// A saved server keeps its pin and only has `verified` set: "Verify
+    /// now", with no reconnect.
+    pub async fn pin(&self, endpoint_id: &str, verified: bool) -> Result<ServerEntry, SdkError> {
+        let id = parse_id(endpoint_id)?;
+        {
+            let storage = self.inner.storage.as_ref();
+            let _saving = self.inner.saving.lock().await;
+            let mut saved = servers::load(storage).await?;
+            if let Some(server) = saved.iter_mut().find(|s| s.endpoint_id == endpoint_id) {
+                server.verified = verified;
+                let entry = ServerEntry {
+                    endpoint_id: server.endpoint_id.clone(),
+                    name: server.name.clone(),
+                    addrs: server.last_known_addrs.clone(),
+                    fingerprint: fingerprint::fingerprint(id.as_bytes()),
+                    pinned: true,
+                    verified,
+                    on_network: self.inner.discovery.get(&id).is_some(),
+                };
+                servers::save(storage, &saved).await?;
+                self.inner.discovery.changed();
+                return Ok(entry);
+            }
+            // A pin is never taken over this way: that is
+            // `trust_new_identity`, which the user has to choose.
+            if let Some(old) = self.replaced_by(&saved, id) {
+                return Err(SdkError::IdentityChanged {
+                    saved: old.endpoint_id.clone(),
+                    now: endpoint_id.to_owned(),
+                });
+            }
+        }
+        let conn = self.link(id).connection(self).await?;
+        let server = SavedServer {
+            name: conn.info.name.clone(),
+            endpoint_id: endpoint_id.to_owned(),
+            last_known_addrs: conn.remote_addrs(),
+            verified,
+        };
+        let storage = self.inner.storage.as_ref();
+        let _saving = self.inner.saving.lock().await;
+        let mut saved = servers::load(storage).await?;
+        saved.retain(|s| s.endpoint_id != endpoint_id);
+        tracing::info!(
+            id = endpoint_id,
+            name = server.name,
+            verified,
+            "pinned a new server"
+        );
+        saved.push(server.clone());
+        servers::save(storage, &saved).await?;
+        self.inner.discovery.changed();
+        Ok(self.entry(id, &conn, Some(&server)))
+    }
+
+    /// Replace saved server `saved_id`'s pin with `new_id`, which answered in
+    /// its place (P1-13), after the user checked `new_id`'s fingerprint.
+    /// The old key's sessions are forgotten: they belonged to the server
+    /// that key was, so everyone signs in again.
+    pub async fn trust_new_identity(
+        &self,
+        saved_id: &str,
+        new_id: &str,
+    ) -> Result<ServerEntry, SdkError> {
+        let old = parse_id(saved_id)?;
+        let new = parse_id(new_id)?;
+        let conn = self.link(new).connection(self).await?;
+        if let Some(link) = self
+            .inner
+            .links
+            .lock()
+            .expect("never poisoned")
+            .remove(&old)
+        {
+            link.close();
+        }
+        let server = SavedServer {
+            name: conn.info.name.clone(),
+            endpoint_id: new_id.to_owned(),
+            last_known_addrs: conn.remote_addrs(),
+            verified: true,
+        };
+        let storage = self.inner.storage.as_ref();
+        let _saving = self.inner.saving.lock().await;
+        let mut saved = servers::load(storage).await?;
+        let Some(at) = saved.iter().position(|s| s.endpoint_id == saved_id) else {
+            return Err(SdkError::UnknownServer(saved_id.to_owned()));
+        };
+        tracing::warn!(
+            old = saved_id,
+            new = new_id,
+            "replaced a server's pin, as the user asked"
+        );
+        saved[at] = server.clone();
+        servers::save(storage, &saved).await?;
+        storage.set_secret(&keys::sessions(saved_id), None).await?;
+        self.inner.discovery.changed();
+        Ok(self.entry(new, &conn, Some(&server)))
+    }
+
+    /// A saved server that `id` answers in place of: `id` is heard under its
+    /// name, and its own key is not heard.
+    fn replaced_by<'a>(&self, saved: &'a [SavedServer], id: EndpointId) -> Option<&'a SavedServer> {
+        let heard = self.inner.discovery.get(&id)?;
+        saved.iter().find(|s| {
+            s.name == heard.name
+                && s.endpoint_id != id.to_string()
+                && parse_id(&s.endpoint_id)
+                    .map_or(true, |own| self.inner.discovery.get(&own).is_none())
         })
+    }
+
+    /// Another key heard under saved server `server`'s name while its own is
+    /// not heard.
+    fn replacement(&self, server: &SavedServer) -> Option<EndpointId> {
+        let heard = self.inner.discovery.heard();
+        if parse_id(&server.endpoint_id).is_ok_and(|own| heard.contains_key(&own)) {
+            return None;
+        }
+        heard
+            .into_iter()
+            .find(|(id, h)| h.name == server.name && id.to_string() != server.endpoint_id)
+            .map(|(id, _)| id)
+    }
+
+    /// `id` as `conn` reached it, saved as `saved` says.
+    fn entry(
+        &self,
+        id: EndpointId,
+        conn: &ServerConnection,
+        saved: Option<&SavedServer>,
+    ) -> ServerEntry {
+        let mut addrs = conn.remote_addrs();
+        if addrs.is_empty() {
+            addrs = saved
+                .map(|s| s.last_known_addrs.clone())
+                .unwrap_or_default();
+        }
+        ServerEntry {
+            endpoint_id: id.to_string(),
+            name: conn.info.name.clone(),
+            addrs,
+            fingerprint: fingerprint::fingerprint(id.as_bytes()),
+            pinned: saved.is_some(),
+            verified: saved.is_some_and(|s| s.verified),
+            on_network: self.inner.discovery.get(&id).is_some(),
+        }
+    }
+
+    /// Requests other than `Hello` go only to a pinned server (P1-21).
+    async fn require_pinned(&self, id: EndpointId) -> Result<(), SdkError> {
+        let saved = servers::load(self.inner.storage.as_ref()).await?;
+        if saved.iter().any(|s| s.endpoint_id == id.to_string()) {
+            Ok(())
+        } else {
+            Err(SdkError::NotPinned(id.to_string()))
+        }
     }
 
     /// Forget server `endpoint_id`: its pin and every session on it.
@@ -205,6 +400,7 @@ impl Client {
         password: &str,
     ) -> Result<Session, SdkError> {
         let server = parse_id(endpoint_id)?;
+        self.require_pinned(server).await?;
         let conn = self.connection(server).await?;
         let login = Request::LoginPassword(LoginPassword {
             username: username.to_owned(),
@@ -249,6 +445,7 @@ impl Client {
     /// longer knows are forgotten; their users have to sign in again.
     pub async fn profiles(&self, endpoint_id: &str) -> Result<Vec<Session>, SdkError> {
         let server = parse_id(endpoint_id)?;
+        self.require_pinned(server).await?;
         let stored = session::load(self.inner.storage.as_ref(), &server).await?;
         let conn = self.connection(server).await?;
         let mut profiles = Vec::new();
@@ -311,7 +508,8 @@ impl Client {
         self.link(id).connection(self).await
     }
 
-    /// Dial `id` and, once it answers as itself, pin it or refresh its pin.
+    /// Dial `id`. Once it answers as itself, a saved server's name and
+    /// addresses are refreshed; an unsaved one stays unsaved.
     pub(crate) async fn dial(&self, id: EndpointId) -> Result<ServerConnection, SdkError> {
         let saved = servers::load(self.inner.storage.as_ref()).await?;
         let pinned = saved.iter().find(|s| s.endpoint_id == id.to_string());
@@ -348,35 +546,26 @@ impl Client {
             fresh = addrs;
         }
         self.inner.discovery.refresh(&id, &fresh);
-        self.pin(SavedServer {
-            name: conn.info.name.clone(),
-            endpoint_id: id.to_string(),
-            last_known_addrs: fresh,
-        })
-        .await?;
+        self.refresh(id, &conn.info.name, fresh).await?;
         Ok(conn)
     }
 
-    /// Save `server`, or refresh its name and addresses. The key is the
-    /// match, so a pin is never moved to another key.
-    async fn pin(&self, server: SavedServer) -> Result<(), SdkError> {
+    /// A saved server's name and addresses, as it answered now. The key is
+    /// the match, so a pin is never moved to another key.
+    async fn refresh(
+        &self,
+        id: EndpointId,
+        name: &str,
+        addrs: Vec<SocketAddr>,
+    ) -> Result<(), SdkError> {
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
         let mut saved = servers::load(storage).await?;
-        match saved
-            .iter_mut()
-            .find(|s| s.endpoint_id == server.endpoint_id)
-        {
-            Some(existing) => *existing = server,
-            None => {
-                tracing::info!(
-                    id = server.endpoint_id,
-                    name = server.name,
-                    "pinned a new server"
-                );
-                saved.push(server);
-            }
-        }
+        let Some(server) = saved.iter_mut().find(|s| s.endpoint_id == id.to_string()) else {
+            return Ok(());
+        };
+        server.name = name.to_owned();
+        server.last_known_addrs = addrs;
         servers::save(storage, &saved).await?;
         self.inner.discovery.changed();
         Ok(())
@@ -459,6 +648,17 @@ mod tests {
             client_version: "0".into(),
             capabilities: ClientCapabilities::default(),
         }
+    }
+
+    /// Heard servers are fingerprinted from their key, saved ones from the
+    /// key as iroh prints it: the same code either way.
+    #[test]
+    fn a_key_and_its_printed_form_have_one_fingerprint() {
+        let id = SecretKey::generate().public();
+        assert_eq!(
+            Some(fingerprint::fingerprint(id.as_bytes())),
+            fingerprint::of_hex(&id.to_string())
+        );
     }
 
     #[tokio::test]

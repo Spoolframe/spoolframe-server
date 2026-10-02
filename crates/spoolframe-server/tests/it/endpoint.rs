@@ -3,7 +3,6 @@
 
 use crate::support;
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use iroh::endpoint::{ApplicationClose, ConnectionError, VarInt, presets};
@@ -11,16 +10,8 @@ use iroh::{Endpoint, RelayMode};
 use spoolframe_protocol::{CLIENT_ALPN, FEDERATION_ALPN, close};
 use spoolframe_server::network::{ConnectionAuth, Server};
 
-fn state_dir(test: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("endpoint")
-        .join(test);
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
-
-async fn server(state_dir: &Path) -> Server {
-    support::TestServer::start_in(state_dir.to_owned())
+async fn server(state_dir: &support::StateDir) -> Server {
+    support::TestServer::start_in(state_dir.clone())
         .await
         .server
 }
@@ -46,7 +37,8 @@ async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
 
 #[tokio::test]
 async fn a_client_connection_is_anonymous_and_tracked_until_it_closes() {
-    let server = server(&state_dir("client")).await;
+    let dir = support::fresh_dir("client").await;
+    let server = server(&dir).await;
     let client = client().await;
     let conn = client.connect(server.addr(), CLIENT_ALPN).await.unwrap();
 
@@ -69,7 +61,8 @@ async fn a_client_connection_is_anonymous_and_tracked_until_it_closes() {
 
 #[tokio::test]
 async fn federation_is_refused_with_a_reason() {
-    let server = server(&state_dir("federation")).await;
+    let dir = support::fresh_dir("federation").await;
+    let server = server(&dir).await;
     let client = client().await;
     let conn = client
         .connect(server.addr(), FEDERATION_ALPN)
@@ -90,7 +83,8 @@ async fn federation_is_refused_with_a_reason() {
 
 #[tokio::test]
 async fn an_unknown_alpn_is_refused() {
-    let server = server(&state_dir("unknown-alpn")).await;
+    let dir = support::fresh_dir("unknown-alpn").await;
+    let server = server(&dir).await;
     let client = client().await;
     let result = client.connect(server.addr(), b"spoolframe/client/2").await;
     assert!(result.is_err(), "connected with an unknown ALPN");
@@ -100,7 +94,7 @@ async fn an_unknown_alpn_is_refused() {
 
 #[tokio::test]
 async fn a_restart_keeps_the_endpoint_id() {
-    let dir = state_dir("restart");
+    let dir = support::fresh_dir("restart").await;
     let first = server(&dir).await;
     let id = first.id();
     first.shutdown().await;

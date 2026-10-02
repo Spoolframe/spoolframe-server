@@ -4,6 +4,7 @@
 //! Only the running server opens it. Admin tools go through the admin
 //! API, so users, sessions and rate limits have a single owner.
 
+pub mod pins;
 pub mod sessions;
 pub mod tracks;
 pub mod users;
@@ -81,19 +82,37 @@ pub(crate) fn now() -> i64 {
 pub(crate) mod tests {
     use super::*;
 
-    /// A fresh state directory for one test.
-    pub(crate) fn state_dir(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("spoolframe-store-{}", std::process::id()))
-            .join(test);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A fresh state directory for one test, under a random name, so
+    /// tests running at once (in this run or another) never share one.
+    /// Removed when dropped.
+    pub(crate) async fn state_dir(test: &str) -> spoolframe_test_dir::TestDir {
+        spoolframe_test_dir::TestDir::new(&format!("spoolframe-store-{test}")).await
+    }
+
+    /// A store in a state directory of its own, which goes with it.
+    pub(crate) struct TestStore {
+        // Declared first, so it closes before its directory goes.
+        pub(crate) store: Store,
+        _dir: spoolframe_test_dir::TestDir,
+    }
+
+    impl std::ops::Deref for TestStore {
+        type Target = Store;
+
+        fn deref(&self) -> &Store {
+            &self.store
+        }
+    }
+
+    pub(crate) async fn test_store(test: &str) -> TestStore {
+        let dir = state_dir(test).await;
+        let store = Store::open(dir.as_ref()).await.unwrap();
+        TestStore { store, _dir: dir }
     }
 
     #[tokio::test]
     async fn a_new_database_gets_every_migration() {
-        let store = Store::open(&state_dir("new")).await.unwrap();
+        let store = test_store("new").await;
         let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&store.pool)
             .await
@@ -106,15 +125,15 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn opening_again_applies_nothing_twice() {
-        let dir = state_dir("reopen");
-        Store::open(&dir).await.unwrap().pool.close().await;
+        let dir = state_dir("reopen").await;
+        Store::open(dir.as_ref()).await.unwrap().pool.close().await;
         // A migration applied twice would fail on CREATE TABLE.
-        Store::open(&dir).await.unwrap();
+        Store::open(dir.as_ref()).await.unwrap();
     }
 
     #[tokio::test]
     async fn foreign_keys_are_enforced() {
-        let store = Store::open(&state_dir("fk")).await.unwrap();
+        let store = test_store("fk").await;
         let orphan = sqlx::query(
             "INSERT INTO password_credentials (user_id, phc, updated_at) VALUES (42, 'x', 0)",
         )

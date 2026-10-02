@@ -11,12 +11,12 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{
-    ClientCapabilities, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat,
+    ClientCapabilities, Item, Library, LibraryId, MediaId, MediaTracks, Role, SubtitleFormat,
     TrackPreferences,
 };
 
 use crate::media::PlaybackHandle;
-use crate::playback::{ChosenTracks, PlaybackPlan, Selection};
+use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Selection};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// when features are added; a breaking change is a new ALPN instead.
@@ -86,6 +86,9 @@ pub enum Request {
         id: MediaId,
         #[serde(default)]
         selection: Option<Selection>,
+        /// How a picked bitmap subtitle is shown (P2-07).
+        #[serde(default)]
+        bitmap: BitmapSubtitles,
     },
     /// Plan `id` and, if it plays directly, open a playback session to
     /// read it through. Without a selection, as for `PlaybackPlan`.
@@ -97,6 +100,9 @@ pub enum Request {
         /// begins there. Direct play reads from wherever the client likes.
         #[serde(default)]
         start_ms: Option<u64>,
+        /// How a picked bitmap subtitle is shown (P2-07).
+        #[serde(default)]
+        bitmap: BitmapSubtitles,
     },
     /// End a playback now, and any encode for it.
     StopPlayback {
@@ -108,14 +114,64 @@ pub enum Request {
         handle: PlaybackHandle,
         position_ms: u64,
     },
+    /// Set or change the session user's PIN (P2-08): 4 to 8 digits. A PIN
+    /// only locks and unlocks a session a real sign-in made, so the
+    /// unlocked session is all this needs. `Done`.
+    SetPin {
+        pin: String,
+    },
+    /// Remove the session user's PIN, and its requirement on every device.
+    /// `Done`.
+    ClearPin,
+    /// Unlock this session on this connection with the user's PIN (P2-08).
+    /// Wrong PINs are rate-limited; after 10 in a row the session on this
+    /// device is revoked (`Unauthenticated`): sign in with the password.
+    /// `Done`.
+    UnlockProfile {
+        pin: String,
+    },
+    /// The devices the session user has signed in from. `Devices`.
+    ListDevices,
+    /// Ask for the session user's PIN on `device` (an endpoint id from
+    /// `Devices`; this device if left out), or stop asking. A locked
+    /// session cannot ask this (nor anything but `WhoAmI` and
+    /// `UnlockProfile`). `Done`.
+    SetPinRequired {
+        #[serde(default)]
+        device: Option<String>,
+        required: bool,
+    },
+    /// Pick another subtitle (or none) for a playing playback (P2-07): it
+    /// is planned again with the same audio. A plan that plays directly
+    /// only changes what `ReadSubtitle` gives; a converted one restarts its
+    /// encode at `position_ms` as a new epoch, from offset 0 (a burned-in
+    /// subtitle is in the picture). `PlaybackChanged`; `CannotPlay` leaves
+    /// the playback as it was.
+    ChangeSubtitle {
+        handle: PlaybackHandle,
+        subtitle: Option<u32>,
+        #[serde(default)]
+        bitmap: BitmapSubtitles,
+        position_ms: u64,
+    },
     /// A converted playback's HLS playlist (P2-05).
     GetManifest {
         handle: PlaybackHandle,
         kind: ManifestKind,
     },
-    /// The selected external subtitle of a playback, whole.
+    /// The selected external subtitle of a playback, whole. One the server
+    /// reads as text (P2-07) answers `SubtitleNotReady` until it is done:
+    /// ask again.
     ReadSubtitle {
         handle: PlaybackHandle,
+    },
+    /// Segment `n` (from 1) of an HLS playback's subtitle rendition (P2-07):
+    /// `Subtitle { format: WebVtt, .. }`, the cues over that segment's time,
+    /// timed with `X-TIMESTAMP-MAP` to the video. `SubtitleNotReady` while
+    /// the subtitle is made.
+    ReadSubtitleSegment {
+        handle: PlaybackHandle,
+        n: u32,
     },
     /// Where playback of a movie or episode has got to. Send it now and
     /// then while playing and on pause or stop; the server decides what is
@@ -128,6 +184,17 @@ pub enum Request {
         id: MediaId,
     },
     MarkUnwatched {
+        id: MediaId,
+    },
+    /// Remove `id` from the session user's Continue watching (P1-22),
+    /// leaving its progress and watched state: a movie itself, an episode
+    /// its show (from Next up too). Playing or marking it again brings it
+    /// back. `Done`.
+    HideFromContinueWatching {
+        id: MediaId,
+    },
+    /// Undo a hide (an "Undo" toast). `Done`.
+    UnhideFromContinueWatching {
         id: MediaId,
     },
     /// The session user's home screen.
@@ -293,6 +360,17 @@ pub enum Reply {
     PlaybackSeeked {
         epoch: u32,
     },
+    /// The session user's devices (P2-08), most recently seen first.
+    Devices {
+        devices: Vec<DeviceInfo>,
+    },
+    /// The playback's new plan after `ChangeSubtitle`: read `epoch` (0 for
+    /// direct play), whose size is `size` (0 while a conversion writes it).
+    PlaybackChanged {
+        plan: PlaybackPlan,
+        size: u64,
+        epoch: u32,
+    },
     /// An HLS playlist, as text.
     Manifest {
         text: String,
@@ -316,6 +394,9 @@ pub enum ManifestKind {
     Multivariant,
     /// The variant's segments.
     Media,
+    /// The subtitle rendition's WebVTT segments (P2-07), read with
+    /// `ReadSubtitleSegment`; there when the plan has a subtitle.
+    Subtitles,
     #[serde(other)]
     Unknown,
 }
@@ -338,7 +419,28 @@ pub struct UserSummary {
     pub username: String,
     /// What to show; the username when the user has no display name.
     pub display_name: String,
-    pub is_admin: bool,
+    /// What the user may do (P2-09).
+    pub role: Role,
+    /// The session needs the user's PIN on this connection before anything
+    /// but `WhoAmI` and `UnlockProfile` (P2-08).
+    #[serde(default)]
+    pub locked: bool,
+}
+
+/// One of a user's devices (P2-08).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    /// Hex `EndpointId`: what `SetPinRequired { device }` takes.
+    pub endpoint_id: String,
+    /// What the device calls itself.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Unix seconds.
+    pub last_seen_at: i64,
+    /// The user's PIN is asked for on it.
+    pub pin_required: bool,
+    /// The device this request came from.
+    pub this_device: bool,
 }
 
 /// One live session, without its token.
@@ -408,6 +510,18 @@ pub enum Error {
     /// offset 0.
     #[error("the playback restarted at a seek (epoch {epoch})")]
     PlaybackRestarted { epoch: u32 },
+    /// The subtitle is still being read as text (P2-07); `done_percent` of
+    /// its cues are read. Ask again in a few seconds.
+    #[error("the subtitle is still being read ({done_percent}% done)")]
+    SubtitleNotReady { done_percent: u8 },
+    /// The session's profile is locked on this connection: `UnlockProfile`
+    /// with the user's PIN first (P2-08).
+    #[error("this profile is locked; enter its PIN")]
+    ProfileLocked,
+    /// A value the request carries is not acceptable (a PIN that is not 4
+    /// to 8 digits, say); the message says why.
+    #[error("{message}")]
+    InvalidInput { message: String },
     /// Something the server depends on (Plex, a media mount) is down.
     #[error("unavailable: {message}")]
     Unavailable { message: String },

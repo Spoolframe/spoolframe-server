@@ -15,15 +15,17 @@ use jsonrpsee::server::{HttpRequest, Server, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
 use spoolframe_admin_api::{
-    AdminApiServer, Credentials, LoggedIn, NewUser, PlexSyncReport, ServerStatus, SetupRequest,
-    TranscodingStatus, UserInfo, error_code,
+    AdminApiServer, Credentials, DeviceEntry, LoggedIn, MeApiServer, NewUser, PasswordChange,
+    PlexSyncReport, Role, ServerStatus, SessionEntry, SetupRequest, TranscodingStatus, UserInfo,
+    error_code,
 };
 use tower::{Layer, Service};
 
-use crate::auth::{Auth, LoginError, PasswordError, hash_password};
+use crate::auth::{Auth, LoginError, PasswordError, hash_password, hash_pin, valid_pin};
 use crate::plex_sync::{PlexSync, SyncError};
+use crate::store::pins::{DeviceRecord, PinError};
 use crate::store::sessions::{ApiSessionUser, SessionBinding};
-use crate::store::users::{UserError, normalize_username};
+use crate::store::users::{UserError, UserRecord, normalize_username};
 use crate::transcode::Transcoding;
 
 /// What the failure limit counts for admin logins besides the username.
@@ -120,6 +122,10 @@ impl StatusSource {
             name: self.name.clone(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             endpoint_id: self.endpoint_id.get().cloned(),
+            fingerprint: self
+                .endpoint_id
+                .get()
+                .and_then(|id| spoolframe_protocol::fingerprint::of_hex(id)),
             transcoding: TranscodingStatus {
                 video_encoders: encoders.video.iter().map(|e| e.name.clone()).collect(),
                 audio_encoders: encoders.audio.iter().map(|e| e.name.clone()).collect(),
@@ -147,18 +153,21 @@ pub async fn serve(
         .build(listen)
         .await?;
     let addr = server.local_addr()?;
-    let handle = server.start(
-        AdminApi {
-            auth,
-            setup_code,
-            status,
-            plex_sync,
-        }
-        .into_rpc(),
-    );
+    let api = AdminApi {
+        auth,
+        setup_code,
+        status,
+        plex_sync,
+    };
+    let mut methods = AdminApiServer::into_rpc(api.clone());
+    methods
+        .merge(MeApiServer::into_rpc(api))
+        .expect("the me and admin namespaces never share a name");
+    let handle = server.start(methods);
     Ok((addr, handle))
 }
 
+#[derive(Clone)]
 struct AdminApi {
     auth: Auth,
     setup_code: Option<SetupCode>,
@@ -201,6 +210,7 @@ impl From<UserError> for ErrorObjectOwned {
             UserError::NoSuchUser(_) => error(error_code::NO_SUCH_USER, e.to_string()),
             UserError::InvalidUsername(_) => error(error_code::INVALID_INPUT, e.to_string()),
             UserError::AlreadySetUp => error(error_code::ALREADY_SET_UP, e.to_string()),
+            UserError::LastAdmin(_) => error(error_code::LAST_ADMIN, e.to_string()),
             UserError::Store(_) => internal(e),
         }
     }
@@ -228,9 +238,11 @@ impl AdminApi {
         }
     }
 
+    /// The caller, if an admin. The role is the user's now, not when the
+    /// session began: a demoted admin's next `admin.*` call is refused.
     async fn admin(&self, ext: &Extensions) -> RpcResult<ApiSessionUser> {
         let (_, user) = self.caller(ext).await?;
-        if user.is_admin {
+        if user.role.is_admin() {
             Ok(user)
         } else {
             Err(error(error_code::FORBIDDEN, "admins only"))
@@ -243,15 +255,203 @@ impl AdminApi {
         users
             .into_iter()
             .find(|u| u.username == name)
-            .map(|u| UserInfo {
-                username: u.username,
-                display_name: u.display_name,
-                is_admin: u.is_admin,
-                created_at: u.created_at,
-                disabled: u.disabled_at.is_some(),
-                has_password: u.has_password,
-            })
+            .map(info)
             .ok_or_else(|| UserError::NoSuchUser(name).into())
+    }
+}
+
+impl From<PinError> for ErrorObjectOwned {
+    fn from(e: PinError) -> Self {
+        match &e {
+            PinError::NoPin => error(error_code::INVALID_INPUT, e.to_string()),
+            PinError::NoSuchDevice => error(error_code::NO_SUCH_DEVICE, e.to_string()),
+            PinError::Store(_) => internal(e),
+        }
+    }
+}
+
+fn device(d: DeviceRecord) -> DeviceEntry {
+    DeviceEntry {
+        endpoint_id: d.endpoint_id,
+        name: d.name,
+        last_seen_at: d.last_seen_at,
+        pin_required: d.pin_required,
+    }
+}
+
+impl AdminApi {
+    /// The caller's own account.
+    async fn me(&self, ext: &Extensions) -> RpcResult<UserRecord> {
+        let (_, user) = self.caller(ext).await?;
+        self.auth
+            .store()
+            .user_by_id(user.user)
+            .await?
+            .ok_or_else(|| error(error_code::UNAUTHENTICATED, "session is not valid"))
+    }
+
+    /// The account called `username`.
+    async fn record(&self, username: &str) -> RpcResult<UserRecord> {
+        let name = normalize_username(username)?;
+        self.auth
+            .store()
+            .list_users()
+            .await?
+            .into_iter()
+            .find(|u| u.username == name)
+            .ok_or_else(|| UserError::NoSuchUser(name).into())
+    }
+}
+
+fn info(u: UserRecord) -> UserInfo {
+    UserInfo {
+        username: u.username,
+        display_name: u.display_name,
+        role: u.role,
+        created_at: u.created_at,
+        disabled: u.disabled_at.is_some(),
+        has_password: u.has_password,
+    }
+}
+
+/// A session's id for `me.revokeSession`: derived from its row's key, so it
+/// is stable, and of no use without the session itself.
+fn session_id(token_hash: &str) -> String {
+    blake3::hash(format!("spoolframe session id {token_hash}").as_bytes()).to_hex()[..16].to_owned()
+}
+
+#[async_trait]
+impl MeApiServer for AdminApi {
+    async fn login(&self, credentials: Credentials) -> RpcResult<LoggedIn> {
+        let login = self
+            .auth
+            .login_password(
+                &credentials.username,
+                &credentials.password,
+                SessionBinding::Api,
+                SOURCE,
+            )
+            .await?;
+        Ok(LoggedIn {
+            token: login.token.0,
+            username: normalize_username(&credentials.username)?,
+            role: login.role,
+        })
+    }
+
+    async fn logout(&self, ext: &Extensions) -> RpcResult<()> {
+        let (token, _) = self.caller(ext).await?;
+        self.auth.logout(&token).await.map_err(internal)
+    }
+
+    async fn who_am_i(&self, ext: &Extensions) -> RpcResult<UserInfo> {
+        let (_, user) = self.caller(ext).await?;
+        let record = self.auth.store().user_by_id(user.user).await?;
+        record
+            .map(info)
+            .ok_or_else(|| error(error_code::UNAUTHENTICATED, "session is not valid"))
+    }
+
+    async fn set_password(&self, ext: &Extensions, change: PasswordChange) -> RpcResult<()> {
+        let (_, user) = self.caller(ext).await?;
+        let Some(me) = self.auth.store().user_by_id(user.user).await? else {
+            return Err(error(error_code::UNAUTHENTICATED, "session is not valid"));
+        };
+        self.auth
+            .check_password(&me.username, &change.current_password, SOURCE)
+            .await?;
+        let phc = hash_password(&change.new_password).await?;
+        self.auth.store().set_password(&me.username, &phc).await?;
+        tracing::info!(username = %me.username, "password changed by its user");
+        Ok(())
+    }
+
+    async fn sessions(&self, ext: &Extensions) -> RpcResult<Vec<SessionEntry>> {
+        let (token, user) = self.caller(ext).await?;
+        let current = crate::auth::SessionToken(token).hash();
+        let sessions = self
+            .auth
+            .store()
+            .list_sessions(user.user)
+            .await
+            .map_err(internal)?;
+        Ok(sessions
+            .into_iter()
+            .map(|s| SessionEntry {
+                id: session_id(&s.token_hash),
+                current: s.token_hash == current,
+                device_name: s.device_name,
+                created_at: s.created_at,
+                last_used_at: s.last_used_at,
+            })
+            .collect())
+    }
+
+    async fn pin_set(&self, ext: &Extensions, pin: String) -> RpcResult<()> {
+        let me = self.me(ext).await?;
+        if !valid_pin(&pin) {
+            return Err(error(error_code::INVALID_INPUT, "a PIN is 4 to 8 digits"));
+        }
+        let phc = hash_pin(&pin).await?;
+        self.auth
+            .store()
+            .set_pin(me.id, &phc)
+            .await
+            .map_err(internal)?;
+        tracing::info!(username = %me.username, "PIN set");
+        Ok(())
+    }
+
+    async fn pin_clear(&self, ext: &Extensions) -> RpcResult<()> {
+        let me = self.me(ext).await?;
+        self.auth.store().clear_pin(me.id).await.map_err(internal)
+    }
+
+    async fn devices(&self, ext: &Extensions) -> RpcResult<Vec<DeviceEntry>> {
+        let me = self.me(ext).await?;
+        let devices = self
+            .auth
+            .store()
+            .user_devices(me.id)
+            .await
+            .map_err(internal)?;
+        Ok(devices.into_iter().map(device).collect())
+    }
+
+    async fn set_pin_required(
+        &self,
+        ext: &Extensions,
+        endpoint_id: String,
+        required: bool,
+    ) -> RpcResult<()> {
+        let me = self.me(ext).await?;
+        Ok(self
+            .auth
+            .store()
+            .set_pin_required(me.id, &endpoint_id, required)
+            .await?)
+    }
+
+    async fn revoke_session(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        let (_, user) = self.caller(ext).await?;
+        // Only among the caller's own: anyone else's is not found.
+        let sessions = self
+            .auth
+            .store()
+            .list_sessions(user.user)
+            .await
+            .map_err(internal)?;
+        let Some(session) = sessions
+            .into_iter()
+            .find(|s| session_id(&s.token_hash) == id)
+        else {
+            return Err(error(error_code::NO_SUCH_SESSION, "no such session"));
+        };
+        self.auth
+            .store()
+            .revoke_session(&session.token_hash)
+            .await
+            .map_err(internal)
     }
 }
 
@@ -282,30 +482,8 @@ impl AdminApiServer for AdminApi {
         Ok(LoggedIn {
             token: token.0,
             username: normalize_username(&request.username)?,
-            is_admin: true,
+            role: Role::Admin,
         })
-    }
-
-    async fn login(&self, credentials: Credentials) -> RpcResult<LoggedIn> {
-        let login = self
-            .auth
-            .login_password(
-                &credentials.username,
-                &credentials.password,
-                SessionBinding::Api,
-                SOURCE,
-            )
-            .await?;
-        Ok(LoggedIn {
-            token: login.token.0,
-            username: normalize_username(&credentials.username)?,
-            is_admin: login.is_admin,
-        })
-    }
-
-    async fn logout(&self, ext: &Extensions) -> RpcResult<()> {
-        let (token, _) = self.caller(ext).await?;
-        self.auth.logout(&token).await.map_err(internal)
     }
 
     async fn user_list(&self, ext: &Extensions) -> RpcResult<Vec<UserInfo>> {
@@ -316,19 +494,15 @@ impl AdminApiServer for AdminApi {
             .list_users()
             .await?
             .into_iter()
-            .map(|u| UserInfo {
-                username: u.username,
-                display_name: u.display_name,
-                is_admin: u.is_admin,
-                created_at: u.created_at,
-                disabled: u.disabled_at.is_some(),
-                has_password: u.has_password,
-            })
+            .map(info)
             .collect())
     }
 
     async fn user_add(&self, ext: &Extensions, user: NewUser) -> RpcResult<UserInfo> {
         self.admin(ext).await?;
+        if user.role == Role::Unknown {
+            return Err(error(error_code::INVALID_INPUT, "use admin or consumer"));
+        }
         let phc = hash_password(&user.password).await?;
         self.auth
             .store()
@@ -336,10 +510,10 @@ impl AdminApiServer for AdminApi {
                 &user.username,
                 user.display_name.as_deref(),
                 &phc,
-                user.admin,
+                user.role,
             )
             .await?;
-        tracing::info!(username = %user.username, admin = user.admin, "user added");
+        tracing::info!(username = %user.username, role = %user.role, "user added");
         self.user_info(&user.username).await
     }
 
@@ -353,6 +527,21 @@ impl AdminApiServer for AdminApi {
         Ok(())
     }
 
+    async fn user_set_role(
+        &self,
+        ext: &Extensions,
+        username: String,
+        role: Role,
+    ) -> RpcResult<UserInfo> {
+        self.admin(ext).await?;
+        if role == Role::Unknown {
+            return Err(error(error_code::INVALID_INPUT, "use admin or consumer"));
+        }
+        self.auth.store().set_role(&username, role).await?;
+        tracing::info!(%username, %role, "role changed");
+        self.user_info(&username).await
+    }
+
     async fn user_disable(&self, ext: &Extensions, username: String) -> RpcResult<u64> {
         self.admin(ext).await?;
         let revoked = self.auth.store().disable_user(&username).await?;
@@ -363,6 +552,51 @@ impl AdminApiServer for AdminApi {
     async fn user_enable(&self, ext: &Extensions, username: String) -> RpcResult<()> {
         self.admin(ext).await?;
         Ok(self.auth.store().enable_user(&username).await?)
+    }
+
+    async fn user_clear_pin(&self, ext: &Extensions, username: String) -> RpcResult<()> {
+        self.admin(ext).await?;
+        let user = self.record(&username).await?;
+        self.auth
+            .store()
+            .clear_pin(user.id)
+            .await
+            .map_err(internal)?;
+        tracing::info!(%username, "PIN cleared by an admin");
+        Ok(())
+    }
+
+    async fn user_devices(
+        &self,
+        ext: &Extensions,
+        username: String,
+    ) -> RpcResult<Vec<DeviceEntry>> {
+        self.admin(ext).await?;
+        let user = self.record(&username).await?;
+        let devices = self
+            .auth
+            .store()
+            .user_devices(user.id)
+            .await
+            .map_err(internal)?;
+        Ok(devices.into_iter().map(device).collect())
+    }
+
+    async fn user_set_pin_required(
+        &self,
+        ext: &Extensions,
+        username: String,
+        endpoint_id: String,
+        required: bool,
+    ) -> RpcResult<()> {
+        self.admin(ext).await?;
+        let user = self.record(&username).await?;
+        self.auth
+            .store()
+            .set_pin_required(user.id, &endpoint_id, required)
+            .await?;
+        tracing::info!(%username, endpoint_id, required, "PIN requirement changed by an admin");
+        Ok(())
     }
 
     async fn server_status(&self, ext: &Extensions) -> RpcResult<ServerStatus> {

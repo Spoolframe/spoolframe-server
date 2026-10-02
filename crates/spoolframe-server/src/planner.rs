@@ -9,25 +9,39 @@
 //!    become text is burned in, which forces a video encode.
 //! 3. `Unsupported`: nothing above works, e.g. a Phase 1 client (range
 //!    reads only) with a file it cannot play.
+//!
+//! The picked subtitle is decided first, since it decides whether the file
+//! can play directly (P2-07). A bitmap one (PGS): the client draws it, the
+//! server reads it as text (sent as an external text subtitle, so the file
+//! still plays directly), or it is burned in; the client's
+//! [`BitmapSubtitles`] mode picks, and `Auto` takes the first that works. A
+//! text one the client cannot show is converted to SubRip or WebVTT and
+//! sent beside the file the same way.
 
 use spoolframe_media::encoders::Encoders;
-use spoolframe_media::{MediaDescriptor, SubtitleKind, SubtitleSource, VideoStream, codecs};
+use spoolframe_media::ocr::Ocr;
+use spoolframe_media::{
+    MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, VideoStream, codecs,
+};
 use spoolframe_protocol::{
-    AudioAction, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, PlannedAudio, PlannedSubtitle,
-    PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
+    AudioAction, BitmapSubtitles, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, PlannedAudio,
+    PlannedSubtitle, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
 };
 use spoolframe_types::{
     AudioCodec, ClientCapabilities, Container, Delivery, SubtitleFormat, VideoCodec,
 };
 
 /// Plan `descriptor` for a client with `capabilities` (`None`: it sent
-/// none) and `selection`, encoding with `encoders` if it must. Only the
-/// container, the video and the selected tracks count.
+/// none) and `selection`, showing a bitmap subtitle as `bitmap` says,
+/// encoding with `encoders` and reading pictures as text with `ocr` if it
+/// must. Only the container, the video and the selected tracks count.
 pub fn plan(
     descriptor: &MediaDescriptor,
     capabilities: Option<&ClientCapabilities>,
     selection: Selection,
+    bitmap: BitmapSubtitles,
     encoders: &Encoders,
+    ocr: &Ocr,
 ) -> PlaybackPlan {
     let Some(caps) = capabilities else {
         return plan_without_capabilities();
@@ -52,11 +66,30 @@ pub fn plan(
     if !missing.is_empty() {
         return PlaybackPlan::Unsupported { reasons: missing };
     }
+    let shown = match subtitle
+        .map(|picked| {
+            subtitle_shown(
+                &descriptor.subtitles[picked as usize],
+                picked,
+                caps,
+                bitmap,
+                ocr,
+            )
+        })
+        .transpose()
+    {
+        Ok(shown) => shown.flatten(),
+        Err(reason) => {
+            return PlaybackPlan::Unsupported {
+                reasons: vec![reason],
+            };
+        }
+    };
 
-    let fit = Fit::check(descriptor, caps, audio, subtitle);
+    let fit = Fit::check(descriptor, caps, audio, subtitle, shown);
     let deliveries = caps.deliveries();
     if fit.reasons().is_empty() && deliveries.contains(&Delivery::Range) {
-        return direct(descriptor, audio, subtitle);
+        return direct(descriptor, audio, subtitle, shown);
     }
     // The first way in the client takes that is not the file itself.
     let Some(delivery) = deliveries
@@ -86,6 +119,95 @@ pub fn plan_without_capabilities() -> PlaybackPlan {
     }
 }
 
+/// How the picked subtitle is shown, when the server has a say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shown {
+    /// The client draws the pictures.
+    Native,
+    /// The server makes text of it (reads the pictures, or converts the
+    /// text), sent beside the file as `to`.
+    Text { to: SubtitleFormat },
+    /// Into the video; `asked` if the client asked for it rather than it
+    /// being the only way.
+    BurnIn { asked: bool },
+}
+
+/// How subtitle `stream` is shown: a bitmap one as `mode` says; a text one
+/// the client cannot show as text it can (`None` when it shows it as it
+/// is, or cannot take any text). An error is a `Text` the server cannot
+/// do: the plan is unsupported, rather than quietly something else.
+fn subtitle_shown(
+    stream: &SubtitleStream,
+    picked: u32,
+    caps: &ClientCapabilities,
+    mode: BitmapSubtitles,
+    ocr: &Ocr,
+) -> Result<Option<Shown>, String> {
+    if stream.kind == SubtitleKind::Text {
+        return Ok(converted_text(stream, caps));
+    }
+    let format = codecs::subtitle_format(&stream.codec);
+    let native = format != SubtitleFormat::Unknown && caps.subtitles.contains(&format);
+    let text = as_text(stream, format, caps, ocr);
+    Ok(Some(match mode {
+        BitmapSubtitles::Text => match text {
+            Ok(to) => Shown::Text { to },
+            Err(why) => {
+                return Err(format!(
+                    "subtitle {picked}: {} cannot be read as text: {why}",
+                    name(format.as_str(), &stream.codec)
+                ));
+            }
+        },
+        BitmapSubtitles::BurnIn => Shown::BurnIn { asked: true },
+        BitmapSubtitles::Auto | BitmapSubtitles::Unknown => match text {
+            _ if native => Shown::Native,
+            Ok(to) => Shown::Text { to },
+            Err(_) => Shown::BurnIn { asked: false },
+        },
+    }))
+}
+
+/// A text subtitle the client cannot show, converted to SubRip or WebVTT
+/// and sent beside the file (P2-07), so the file can still play directly.
+fn converted_text(stream: &SubtitleStream, caps: &ClientCapabilities) -> Option<Shown> {
+    let format = codecs::subtitle_format(&stream.codec);
+    // Shown as it is, or a format ffmpeg's name did not map to.
+    if format == SubtitleFormat::Unknown || caps.subtitles.contains(&format) {
+        return None;
+    }
+    [SubtitleFormat::Srt, SubtitleFormat::WebVtt]
+        .into_iter()
+        .find(|f| caps.subtitles.contains(f))
+        .map(|to| Shown::Text { to })
+}
+
+/// The text format the server would send `stream` as, read with `ocr`;
+/// or why it cannot.
+fn as_text(
+    stream: &SubtitleStream,
+    format: SubtitleFormat,
+    caps: &ClientCapabilities,
+    ocr: &Ocr,
+) -> Result<SubtitleFormat, String> {
+    if format != SubtitleFormat::Pgs {
+        return Err("only PGS is read".into());
+    }
+    if ocr.languages().is_empty() {
+        return Err("the server has no text recognition (tesseract)".into());
+    }
+    if ocr.language_for(stream.language.as_deref()).is_none() {
+        return Err(format!(
+            "the server has no text recognition data for {}",
+            stream.language.as_deref().unwrap_or("English")
+        ));
+    }
+    [SubtitleFormat::Srt, SubtitleFormat::WebVtt]
+        .into_iter()
+        .find(|f| caps.subtitles.contains(f))
+        .ok_or_else(|| "the client shows neither SubRip nor WebVTT".into())
+}
+
 /// What does not fit the client as the file is, per part, each with the
 /// reason. Empty everywhere: it plays directly.
 #[derive(Debug, Default)]
@@ -94,6 +216,8 @@ struct Fit {
     video: Vec<String>,
     audio: Vec<String>,
     subtitle: Vec<String>,
+    /// How the picked subtitle is shown.
+    shown: Option<Shown>,
 }
 
 impl Fit {
@@ -102,8 +226,12 @@ impl Fit {
         caps: &ClientCapabilities,
         audio: Option<usize>,
         subtitle: Option<u32>,
+        shown: Option<Shown>,
     ) -> Self {
-        let mut fit = Fit::default();
+        let mut fit = Fit {
+            shown,
+            ..Fit::default()
+        };
         let container = codecs::container(&descriptor.container);
         if !supported(&caps.containers, container, Container::Unknown) {
             fit.container.push(format!(
@@ -150,7 +278,14 @@ impl Fit {
         if let Some(picked) = subtitle {
             let stream = &descriptor.subtitles[picked as usize];
             let format = codecs::subtitle_format(&stream.codec);
-            if !supported(&caps.subtitles, format, SubtitleFormat::Unknown) {
+            if shown == Some(Shown::BurnIn { asked: true }) {
+                fit.subtitle.push(format!(
+                    "subtitle {picked}: {} burned into the video, as asked",
+                    name(format.as_str(), &stream.codec)
+                ));
+            } else if matches!(shown, Some(Shown::Text { .. })) {
+                // Read as text and sent beside the file: it fits.
+            } else if !supported(&caps.subtitles, format, SubtitleFormat::Unknown) {
                 fit.subtitle.push(format!(
                     "subtitle {picked}: {} not supported",
                     name(format.as_str(), &stream.codec)
@@ -214,6 +349,7 @@ fn direct(
     descriptor: &MediaDescriptor,
     audio: Option<usize>,
     subtitle: Option<u32>,
+    shown: Option<Shown>,
 ) -> PlaybackPlan {
     PlaybackPlan::Direct {
         container: codecs::container(&descriptor.container),
@@ -227,6 +363,13 @@ fn direct(
         }),
         subtitle: subtitle.map(|picked| {
             let stream = &descriptor.subtitles[picked as usize];
+            if let Some(Shown::Text { to }) = shown {
+                return PlannedSubtitle {
+                    index: picked,
+                    format: to,
+                    delivery: SubtitleDelivery::External,
+                };
+            }
             PlannedSubtitle {
                 index: picked,
                 format: codecs::subtitle_format(&stream.codec),
@@ -273,6 +416,7 @@ fn converted(
     subtitle: Option<u32>,
     fit: &Fit,
 ) -> Result<PlaybackPlan, String> {
+    let treatment = fit.shown;
     let container = output_container(caps, delivery)
         .ok_or_else(|| format!("delivery: no container this client plays can carry {delivery}"))?;
     let mut reasons = fit.reasons();
@@ -286,7 +430,21 @@ fn converted(
             SubtitleKind::Bitmap => container == Container::Matroska,
             SubtitleKind::Text => text_formats(container).contains(&format),
         };
-        let action = if shown && carried {
+        let action = if let (Some(Shown::Text { to }), SubtitleKind::Bitmap) =
+            (treatment, stream.kind)
+        {
+            // HLS sends text as a WebVTT rendition (P2-07).
+            let to =
+                if delivery == Delivery::Hls && caps.subtitles.contains(&SubtitleFormat::WebVtt) {
+                    SubtitleFormat::WebVtt
+                } else {
+                    to
+                };
+            SubtitleAction::Ocr { from: format, to }
+        } else if treatment == Some(Shown::BurnIn { asked: true }) {
+            // The fit's reasons already say so.
+            SubtitleAction::BurnIn { format }
+        } else if shown && carried {
             SubtitleAction::Copy { format }
         } else if let (SubtitleKind::Text, Some(to)) = (
             stream.kind,
@@ -486,7 +644,24 @@ mod tests {
 
     /// The Phase 1 call: nothing detected, the software baseline.
     fn plan(d: &MediaDescriptor, caps: Option<&ClientCapabilities>, s: Selection) -> PlaybackPlan {
-        super::plan(d, caps, s, &Encoders::software_baseline())
+        plan_with(d, caps, s, &Encoders::software_baseline())
+    }
+
+    /// `Auto` bitmap subtitles, and no text recognition.
+    fn plan_with(
+        d: &MediaDescriptor,
+        caps: Option<&ClientCapabilities>,
+        s: Selection,
+        encoders: &Encoders,
+    ) -> PlaybackPlan {
+        super::plan(
+            d,
+            caps,
+            s,
+            BitmapSubtitles::Auto,
+            encoders,
+            &Ocr::disabled(),
+        )
     }
 
     /// What the dev machine detected (P2-02).
@@ -797,7 +972,7 @@ mod tests {
 
     #[test]
     fn avplayer_gets_hls_with_the_video_copied_and_dts_encoded() {
-        let (delivery, container, video, audio, subtitle, reasons) = converted(super::plan(
+        let (delivery, container, video, audio, subtitle, reasons) = converted(plan_with(
             &hevc_dts(),
             Some(&avplayer()),
             picked(0, None),
@@ -830,7 +1005,7 @@ mod tests {
 
     #[test]
     fn a_pgs_subtitle_avplayer_cannot_show_is_burned_in_and_says_so() {
-        let (_, _, video, _, subtitle, reasons) = converted(super::plan(
+        let (_, _, video, _, subtitle, reasons) = converted(plan_with(
             &hevc_dts(),
             Some(&avplayer()),
             picked(1, Some(0)),
@@ -851,7 +1026,7 @@ mod tests {
 
     #[test]
     fn a_text_subtitle_is_converted_to_webvtt_for_hls() {
-        let (_, _, video, _, subtitle, _) = converted(super::plan(
+        let (_, _, video, _, subtitle, _) = converted(plan_with(
             &hevc_dts(),
             Some(&avplayer()),
             picked(1, Some(1)),
@@ -876,7 +1051,7 @@ mod tests {
     fn a_bitrate_cap_under_the_file_s_encodes_the_video_under_it() {
         let mut caps = avplayer();
         caps.max_bitrate = Some(8_000_000);
-        let (_, _, video, _, _, reasons) = converted(super::plan(
+        let (_, _, video, _, _, reasons) = converted(plan_with(
             &hevc_dts(),
             Some(&caps),
             picked(1, None),
@@ -900,7 +1075,7 @@ mod tests {
             hdr: Some(BTreeSet::new()),
             ..VideoLimits::default()
         });
-        let (_, _, video, _, _, _) = converted(super::plan(
+        let (_, _, video, _, _, _) = converted(plan_with(
             &hevc_dts(),
             Some(&caps),
             picked(1, None),
@@ -925,7 +1100,7 @@ mod tests {
             ..caps()
         };
         // DTS does not fit; the H.264 video and the container do.
-        let (delivery, container, video, audio, _, _) = converted(super::plan(
+        let (delivery, container, video, audio, _, _) = converted(plan_with(
             &dts_aac_pgs(),
             Some(&caps),
             picked(0, None),
@@ -958,7 +1133,7 @@ mod tests {
             ..caps()
         };
         assert!(matches!(
-            super::plan(
+            plan_with(
                 &dts_aac_pgs(),
                 Some(&caps),
                 picked(1, None),
@@ -974,7 +1149,7 @@ mod tests {
             delivery: vec![Delivery::Hls],
             ..caps()
         };
-        let (_, container, video, audio, _, reasons) = converted(super::plan(
+        let (_, container, video, audio, _, reasons) = converted(plan_with(
             &dts_aac_pgs(),
             Some(&caps),
             picked(1, None),
@@ -994,7 +1169,7 @@ mod tests {
     #[test]
     fn a_range_only_client_that_cannot_play_directly_is_unsupported_as_before() {
         assert_eq!(
-            reasons(super::plan(
+            reasons(plan_with(
                 &hevc_dts(),
                 Some(&caps()),
                 picked(0, None),
@@ -1008,7 +1183,7 @@ mod tests {
     fn no_encoder_for_any_codec_the_client_plays_is_unsupported() {
         let mut caps = avplayer();
         caps.video = [VideoCodec::Av1].into();
-        let all = reasons(super::plan(
+        let all = reasons(plan_with(
             &hevc_dts(),
             Some(&caps),
             picked(1, None),
@@ -1017,6 +1192,227 @@ mod tests {
         assert_eq!(
             all.last().unwrap(),
             "video: the server can encode no codec this client plays"
+        );
+    }
+
+    /// tesseract with English data.
+    fn english() -> Ocr {
+        Ocr::new(PathBuf::from("tesseract"), ["eng".to_owned()])
+    }
+
+    fn with_mode(
+        d: &MediaDescriptor,
+        caps: &ClientCapabilities,
+        s: Selection,
+        mode: BitmapSubtitles,
+        ocr: &Ocr,
+    ) -> PlaybackPlan {
+        super::plan(d, Some(caps), s, mode, &dev_encoders(), ocr)
+    }
+
+    fn sent_as_srt() -> Option<PlannedSubtitle> {
+        Some(PlannedSubtitle {
+            index: 0,
+            format: SubtitleFormat::Srt,
+            delivery: SubtitleDelivery::External,
+        })
+    }
+
+    fn direct_subtitle(plan: PlaybackPlan) -> Option<PlannedSubtitle> {
+        match plan {
+            PlaybackPlan::Direct { subtitle, .. } => subtitle,
+            other => panic!("not direct: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_reads_a_pgs_the_client_cannot_draw_and_the_file_plays_directly() {
+        // AAC audio fits; the PGS track goes out beside it as SubRip.
+        let plan = with_mode(
+            &dts_aac_pgs(),
+            &caps(),
+            picked(1, Some(0)),
+            BitmapSubtitles::Auto,
+            &english(),
+        );
+        assert_eq!(direct_subtitle(plan), sent_as_srt());
+    }
+
+    #[test]
+    fn auto_lets_a_client_that_draws_pgs_draw_it() {
+        let caps = ClientCapabilities {
+            subtitles: [SubtitleFormat::Srt, SubtitleFormat::Pgs].into(),
+            ..caps()
+        };
+        let plan = with_mode(
+            &dts_aac_pgs(),
+            &caps,
+            picked(1, Some(0)),
+            BitmapSubtitles::Auto,
+            &english(),
+        );
+        assert_eq!(
+            direct_subtitle(plan),
+            Some(PlannedSubtitle {
+                index: 0,
+                format: SubtitleFormat::Pgs,
+                delivery: SubtitleDelivery::Embedded,
+            })
+        );
+    }
+
+    #[test]
+    fn text_reads_it_even_for_a_client_that_draws_pgs() {
+        let caps = ClientCapabilities {
+            subtitles: [SubtitleFormat::Srt, SubtitleFormat::Pgs].into(),
+            ..caps()
+        };
+        let plan = with_mode(
+            &dts_aac_pgs(),
+            &caps,
+            picked(1, Some(0)),
+            BitmapSubtitles::Text,
+            &english(),
+        );
+        assert_eq!(direct_subtitle(plan), sent_as_srt());
+    }
+
+    #[test]
+    fn text_the_server_cannot_read_is_unsupported_and_says_why() {
+        let mut french = dts_aac_pgs();
+        french.subtitles[0].language = Some("fre".into());
+        let text = |d: &MediaDescriptor, ocr: &Ocr| {
+            reasons(with_mode(
+                d,
+                &caps(),
+                picked(1, Some(0)),
+                BitmapSubtitles::Text,
+                ocr,
+            ))
+        };
+        assert_eq!(
+            text(&french, &english()),
+            [
+                "subtitle 0: pgs cannot be read as text: the server has no text recognition data for fre"
+            ]
+        );
+        assert_eq!(
+            text(&dts_aac_pgs(), &Ocr::disabled()),
+            [
+                "subtitle 0: pgs cannot be read as text: the server has no text recognition (tesseract)"
+            ]
+        );
+        // Auto with the same file burns it in where it can, or names the
+        // format as before.
+        assert_eq!(
+            reasons(with_mode(
+                &french,
+                &caps(),
+                picked(1, Some(0)),
+                BitmapSubtitles::Auto,
+                &english(),
+            )),
+            ["subtitle 0: pgs not supported"]
+        );
+    }
+
+    #[test]
+    fn burn_in_asked_for_encodes_the_video_even_for_a_client_that_draws_pgs() {
+        let caps = ClientCapabilities {
+            subtitles: [SubtitleFormat::Srt, SubtitleFormat::Pgs].into(),
+            delivery: vec![Delivery::Range, Delivery::Progressive],
+            ..caps()
+        };
+        let (_, _, video, _, subtitle, reasons) = converted(with_mode(
+            &dts_aac_pgs(),
+            &caps,
+            picked(1, Some(0)),
+            BitmapSubtitles::BurnIn,
+            &english(),
+        ));
+        assert!(matches!(video, ConvertedVideo::Encode { .. }), "{video:?}");
+        assert_eq!(
+            subtitle,
+            Some(ConvertedSubtitle {
+                index: 0,
+                action: SubtitleAction::BurnIn {
+                    format: SubtitleFormat::Pgs
+                },
+            })
+        );
+        assert_eq!(reasons, ["subtitle 0: pgs burned into the video, as asked"]);
+    }
+
+    #[test]
+    fn a_converted_plan_reads_the_pgs_and_keeps_the_video_copied() {
+        // DTS needs encoding; the PGS no longer forces a video encode.
+        let caps = ClientCapabilities {
+            delivery: vec![Delivery::Range, Delivery::Progressive],
+            ..caps()
+        };
+        let (_, _, video, _, subtitle, _) = converted(with_mode(
+            &dts_aac_pgs(),
+            &caps,
+            picked(0, Some(0)),
+            BitmapSubtitles::Auto,
+            &english(),
+        ));
+        assert_eq!(
+            video,
+            ConvertedVideo::Copy {
+                codec: VideoCodec::H264
+            }
+        );
+        assert_eq!(
+            subtitle,
+            Some(ConvertedSubtitle {
+                index: 0,
+                action: SubtitleAction::Ocr {
+                    from: SubtitleFormat::Pgs,
+                    to: SubtitleFormat::Srt,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn the_mode_leaves_text_subtitles_alone() {
+        let plan = with_mode(
+            &dts_aac_pgs(),
+            &caps(),
+            picked(1, Some(1)),
+            BitmapSubtitles::BurnIn,
+            &english(),
+        );
+        assert_eq!(
+            direct_subtitle(plan),
+            Some(PlannedSubtitle {
+                index: 1,
+                format: SubtitleFormat::Srt,
+                delivery: SubtitleDelivery::External,
+            })
+        );
+    }
+
+    #[test]
+    fn a_text_subtitle_the_client_cannot_show_is_converted_beside_the_file() {
+        let mut file = dts_aac_pgs();
+        file.subtitles[1] = subtitle(SubtitleSource::Embedded { index: 4 }, "ass");
+        // Takes SubRip, not ASS: the file still plays directly.
+        let plan = with_mode(
+            &file,
+            &caps(),
+            picked(1, Some(1)),
+            BitmapSubtitles::Auto,
+            &Ocr::disabled(),
+        );
+        assert_eq!(
+            direct_subtitle(plan),
+            Some(PlannedSubtitle {
+                index: 1,
+                format: SubtitleFormat::Srt,
+                delivery: SubtitleDelivery::External,
+            })
         );
     }
 }

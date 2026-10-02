@@ -1,7 +1,8 @@
 # The NixOS module in a VM: the service starts without a reachable Plex,
 # prints a setup code, takes its first admin and users through the CLI,
 # listens on its UDP port, finds only software encoders without a GPU,
-# and keeps its key over a restart.
+# reads subtitles with the tesseract languages it was given, and keeps its
+# key over a restart.
 {
   pkgs,
   spoolframePackage,
@@ -25,6 +26,7 @@ pkgs.testers.runNixOSTest {
         }
       ];
       openFirewall = true;
+      subtitles.ocrLanguages = ["eng" "fra"];
     };
   };
 
@@ -54,6 +56,12 @@ pkgs.testers.runNixOSTest {
     status = server.succeed(f"{admin} spoolframe status")
     assert "libx264" in status, status
     assert "vaapi" not in status and "nvenc" not in status, status
+
+    # tesseract with the languages asked for, and the cache for its text.
+    ocr = [line for line in journal().splitlines() if "subtitle OCR available" in line]
+    assert ocr, journal()
+    assert '"eng"' in ocr[-1] and '"fra"' in ocr[-1], ocr[-1]
+    server.succeed("test -d /var/cache/spoolframe/subtitles")
 
     # The state survives a restart: same key, and no new setup code.
     server.succeed("systemctl restart spoolframe.service")

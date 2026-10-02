@@ -24,6 +24,7 @@ use crate::auth::Auth;
 use crate::client::{self, ClientProtocol};
 use crate::encode::job::Jobs;
 use crate::playback::Playbacks;
+use crate::subtitles::Subtitles;
 use crate::transcode::Transcoding;
 use crate::watch::Watch;
 use url::Url;
@@ -105,6 +106,8 @@ pub struct Services {
     pub transcoding: Arc<Transcoding>,
     /// Running encodes (P2-03).
     pub jobs: Arc<Jobs>,
+    /// Bitmap subtitles read as text (P2-07).
+    pub subtitles: Arc<Subtitles>,
 }
 
 impl std::fmt::Debug for Services {

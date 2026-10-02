@@ -17,6 +17,27 @@ pub struct Selection {
     pub subtitle: Option<u32>,
 }
 
+/// How a picked bitmap subtitle (PGS) is shown (P2-07): drawn by the
+/// client, read as text by the server, or burned into the video. Text
+/// subtitles are not affected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BitmapSubtitles {
+    /// As the client shows it if it can; else read as text if the server
+    /// can; else burned in.
+    #[default]
+    Auto,
+    /// Read as text and sent as a text subtitle, even to a client that
+    /// could draw the pictures. The plan is `Unsupported` if the server
+    /// cannot read this track.
+    Text,
+    /// Burned into the video, even if the client could show it otherwise.
+    BurnIn,
+    /// A mode this build does not know: treated as `Auto`.
+    #[serde(other)]
+    Unknown,
+}
+
 /// The tracks the server chose when the client sent no [`Selection`]
 /// (P1-20), and why, so the client can show it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,9 +164,17 @@ pub enum SubtitleAction {
         from: SubtitleFormat,
         to: SubtitleFormat,
     },
-    /// Drawn into the picture: the client cannot show this format, and
-    /// pictures cannot be turned into text. Forces a video encode.
+    /// Drawn into the picture: the client cannot show this format and the
+    /// server cannot read it as text, or the client asked for it. Forces a
+    /// video encode.
     BurnIn { format: SubtitleFormat },
+    /// A bitmap subtitle read as text by the server (P2-07). It is not in
+    /// the output: the client fetches it whole with `ReadSubtitle`, which
+    /// answers `SubtitleNotReady` until the reading is done.
+    Ocr {
+        from: SubtitleFormat,
+        to: SubtitleFormat,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -169,7 +198,9 @@ pub struct PlannedSubtitle {
 pub enum SubtitleDelivery {
     /// A stream inside the media file it plays.
     Embedded,
-    /// A separate file the client fetches whole (P1-08).
+    /// A separate file the client fetches whole (P1-08). A bitmap track
+    /// planned as a text format is one the server reads as text (P2-07):
+    /// `ReadSubtitle` answers `SubtitleNotReady` until it is done.
     External,
     #[serde(other)]
     Unknown,

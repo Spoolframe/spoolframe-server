@@ -7,9 +7,9 @@ use std::time::Duration;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::{
-    ArtworkRequest, ArtworkResponse, ArtworkSize, ChosenTracks, HomeScreen, MediaRead,
-    MediaReadResponse, PlaybackHandle, PlaybackPlan, Reply, Request, Response, Selection,
-    SessionId, SessionInfo, UserSummary,
+    ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo,
+    HomeScreen, ManifestKind, MediaRead, MediaReadResponse, PlaybackHandle, PlaybackPlan, Reply,
+    Request, Response, Selection, SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat, TrackPreferences,
@@ -80,10 +80,46 @@ pub struct Plan {
 pub struct Playback {
     pub handle: PlaybackHandle,
     pub plan: PlaybackPlan,
-    /// The size of the file the handle reads.
+    /// The size of the file the handle reads; 0 for a converted playback,
+    /// whose size grows as it is encoded (see [`Chunk::size`]).
     pub size: u64,
     /// The tracks the server chose, when none were asked for.
     pub chosen: Option<ChosenTracks>,
+    /// The encode the reads are of: 0 at the start, one more after each
+    /// [`Session::seek_playback`].
+    pub epoch: u32,
+}
+
+/// A playback after [`Session::change_subtitle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackChange {
+    pub plan: PlaybackPlan,
+    /// As [`Playback::size`].
+    pub size: u64,
+    /// As [`Playback::epoch`]; 0 for direct play.
+    pub epoch: u32,
+}
+
+/// How to start a playback, beyond its tracks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlaybackOptions {
+    /// Where a converted playback's encode begins (P2-03). Direct play
+    /// reads from wherever the app likes.
+    pub start: Option<Duration>,
+    /// How a picked bitmap subtitle (PGS) is shown (P2-07).
+    pub bitmap: BitmapSubtitles,
+}
+
+/// Part of a converted playback's output (P2-04, P2-05).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    pub bytes: Vec<u8>,
+    /// Bytes written so far: the whole output (or segment) once
+    /// `complete`.
+    pub size: u64,
+    /// The encode has finished it: no more bytes will come.
+    pub complete: bool,
+    pub epoch: u32,
 }
 
 /// An external subtitle, whole.
@@ -239,9 +275,22 @@ impl Session {
         id: &MediaId,
         selection: Option<Selection>,
     ) -> Result<Plan, SdkError> {
+        self.playback_plan_with(id, selection, BitmapSubtitles::Auto)
+            .await
+    }
+
+    /// [`Session::playback_plan`], showing a picked bitmap subtitle as
+    /// `bitmap` says.
+    pub async fn playback_plan_with(
+        &self,
+        id: &MediaId,
+        selection: Option<Selection>,
+        bitmap: BitmapSubtitles,
+    ) -> Result<Plan, SdkError> {
         let request = Request::PlaybackPlan {
             id: id.clone(),
             selection,
+            bitmap,
         };
         match self.call(request).await? {
             Reply::PlaybackPlan { plan, chosen } => Ok(Plan { plan, chosen }),
@@ -256,10 +305,26 @@ impl Session {
         id: &MediaId,
         selection: Option<Selection>,
     ) -> Result<Playback, SdkError> {
+        self.start_playback_with(id, selection, PlaybackOptions::default())
+            .await
+    }
+
+    /// [`Session::start_playback`], with `options`. A converted plan
+    /// (P2-03) starts the server's encode: read it with
+    /// [`Session::read_chunk`] (progressive) or [`Session::manifest`] and
+    /// [`Session::read_segment`] (HLS). [`SdkError::Busy`] means the
+    /// server is converting all it may.
+    pub async fn start_playback_with(
+        &self,
+        id: &MediaId,
+        selection: Option<Selection>,
+        options: PlaybackOptions,
+    ) -> Result<Playback, SdkError> {
         let request = Request::StartPlayback {
             id: id.clone(),
             selection,
-            start_ms: None,
+            start_ms: options.start.map(millis),
+            bitmap: options.bitmap,
         };
         match self.call(request).await? {
             Reply::PlaybackStarted {
@@ -267,14 +332,193 @@ impl Session {
                 plan,
                 size,
                 chosen,
-                ..
+                epoch,
             } => Ok(Playback {
                 handle,
                 plan,
                 size,
                 chosen,
+                epoch,
             }),
             other => Err(unexpected(other)),
+        }
+    }
+
+    /// Restart a converted playback's encode at `position` (P2-04). Reads
+    /// go on with the returned epoch, from offset 0 (or from the segment
+    /// at `position`).
+    pub async fn seek_playback(
+        &self,
+        handle: &PlaybackHandle,
+        position: Duration,
+    ) -> Result<u32, SdkError> {
+        let request = Request::SeekPlayback {
+            handle: handle.clone(),
+            position_ms: millis(position),
+        };
+        match self.call(request).await? {
+            Reply::PlaybackSeeked { epoch } => Ok(epoch),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Unlock this profile on this device with its PIN (P2-08). A wrong
+    /// PIN is [`SdkError::InvalidCredentials`], too many in a while
+    /// [`SdkError::RateLimited`]; after 10 wrong in a row the session here
+    /// is ended ([`SdkError::SignInRequired`]) and the user signs in with
+    /// their password. Switching to another profile and back locks it
+    /// again.
+    pub async fn unlock(&self, pin: &str) -> Result<(), SdkError> {
+        self.done(Request::UnlockProfile {
+            pin: pin.to_owned(),
+        })
+        .await
+    }
+
+    /// Set or change this user's PIN: 4 to 8 digits. The PIN only locks and
+    /// unlocks this session, which a real sign-in made, so the unlocked
+    /// session is all it takes.
+    pub async fn set_pin(&self, pin: &str) -> Result<(), SdkError> {
+        self.done(Request::SetPin {
+            pin: pin.to_owned(),
+        })
+        .await
+    }
+
+    /// Remove this user's PIN, and where it is asked for.
+    pub async fn clear_pin(&self) -> Result<(), SdkError> {
+        self.done(Request::ClearPin).await
+    }
+
+    /// The devices this user has signed in from, with where the PIN is
+    /// asked for.
+    pub async fn devices(&self) -> Result<Vec<DeviceInfo>, SdkError> {
+        match self.call(Request::ListDevices).await? {
+            Reply::Devices { devices } => Ok(devices),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Ask for this user's PIN on `device` (an endpoint id from
+    /// [`Session::devices`]; this device for `None`), or stop asking.
+    pub async fn set_pin_required(
+        &self,
+        device: Option<&str>,
+        required: bool,
+    ) -> Result<(), SdkError> {
+        self.done(Request::SetPinRequired {
+            device: device.map(str::to_owned),
+            required,
+        })
+        .await
+    }
+
+    /// Pick another subtitle (`None`: none) for a playing playback, shown
+    /// as `bitmap` says (P2-07). Direct play only changes what
+    /// [`Session::read_subtitle`] gives; a converted playback restarts its
+    /// encode at `position`: read the returned plan's epoch from offset 0.
+    pub async fn change_subtitle(
+        &self,
+        handle: &PlaybackHandle,
+        subtitle: Option<u32>,
+        bitmap: BitmapSubtitles,
+        position: Duration,
+    ) -> Result<PlaybackChange, SdkError> {
+        let request = Request::ChangeSubtitle {
+            handle: handle.clone(),
+            subtitle,
+            bitmap,
+            position_ms: millis(position),
+        };
+        match self.call(request).await? {
+            Reply::PlaybackChanged { plan, size, epoch } => {
+                Ok(PlaybackChange { plan, size, epoch })
+            }
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// End a playback now, and its encode. Otherwise it ends when it has
+    /// not been read for a while.
+    pub async fn stop_playback(&self, handle: &PlaybackHandle) -> Result<(), SdkError> {
+        self.done(Request::StopPlayback {
+            handle: handle.clone(),
+        })
+        .await
+    }
+
+    /// An HLS playback's playlist (P2-05). The media playlist's segment
+    /// URIs (`seg3.m4s`, `init.mp4`) name what [`Session::read_segment`]
+    /// reads: 3, and 0.
+    pub async fn manifest(
+        &self,
+        handle: &PlaybackHandle,
+        kind: ManifestKind,
+    ) -> Result<String, SdkError> {
+        let request = Request::GetManifest {
+            handle: handle.clone(),
+            kind,
+        };
+        match self.call(request).await? {
+            Reply::Manifest { text } => Ok(text),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Up to `length` bytes of a converted playback's output from
+    /// `offset`, for its `epoch`. A read past what is encoded waits up to
+    /// 10 s and may come back empty and not `complete`: ask again. Read
+    /// until `complete` and `offset` reaches `size`.
+    /// [`SdkError::PlaybackRestarted`] means a seek replaced `epoch`.
+    pub async fn read_chunk(
+        &self,
+        handle: &PlaybackHandle,
+        epoch: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<Chunk, SdkError> {
+        self.media(handle, epoch, None, offset, length).await
+    }
+
+    /// As [`Session::read_chunk`], within HLS segment `n` (0 is the init
+    /// segment). A segment far from what is encoded restarts the encode
+    /// there; the chunk's epoch says so.
+    pub async fn read_segment(
+        &self,
+        handle: &PlaybackHandle,
+        epoch: u32,
+        n: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<Chunk, SdkError> {
+        self.media(handle, epoch, Some(n), offset, length).await
+    }
+
+    async fn media(
+        &self,
+        handle: &PlaybackHandle,
+        epoch: u32,
+        segment: Option<u32>,
+        offset: u64,
+        length: u64,
+    ) -> Result<Chunk, SdkError> {
+        let request = MediaRead {
+            session: self.token.clone(),
+            handle: handle.clone(),
+            offset,
+            length,
+            epoch,
+            segment,
+        };
+        let conn = self.client.connection(self.server).await?;
+        match conn.read(&request).await? {
+            (MediaReadResponse::Ok(reply), bytes) => Ok(Chunk {
+                bytes,
+                size: reply.size,
+                complete: reply.complete,
+                epoch: reply.epoch,
+            }),
+            (MediaReadResponse::Err(e), _) => Err(self.failed(e).await),
         }
     }
 
@@ -341,10 +585,30 @@ impl Session {
         }
     }
 
-    /// The selected external subtitle of a playback.
+    /// The selected external subtitle of a playback. One the server reads
+    /// as text (P2-07) is [`SdkError::SubtitleNotReady`] until it is done:
+    /// play on, and ask again in a few seconds.
     pub async fn read_subtitle(&self, handle: &PlaybackHandle) -> Result<Subtitle, SdkError> {
         let request = Request::ReadSubtitle {
             handle: handle.clone(),
+        };
+        match self.call(request).await? {
+            Reply::Subtitle { format, bytes } => Ok(Subtitle { format, bytes }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Segment `n` (from 1) of an HLS playback's subtitle rendition (P2-07):
+    /// WebVTT, its URI `subs<n>.vtt` in [`ManifestKind::Subtitles`]'s
+    /// playlist. [`SdkError::SubtitleNotReady`] while the server makes it.
+    pub async fn read_subtitle_segment(
+        &self,
+        handle: &PlaybackHandle,
+        n: u32,
+    ) -> Result<Subtitle, SdkError> {
+        let request = Request::ReadSubtitleSegment {
+            handle: handle.clone(),
+            n,
         };
         match self.call(request).await? {
             Reply::Subtitle { format, bytes } => Ok(Subtitle { format, bytes }),
@@ -371,7 +635,7 @@ impl Session {
     pub async fn update_progress(&self, id: &MediaId, position: Duration) -> Result<(), SdkError> {
         let request = Request::UpdatePlaybackProgress {
             id: id.clone(),
-            position_ms: u64::try_from(position.as_millis()).unwrap_or(u64::MAX),
+            position_ms: millis(position),
         };
         self.done(request).await
     }
@@ -384,10 +648,29 @@ impl Session {
         self.done(Request::MarkUnwatched { id: id.clone() }).await
     }
 
+    /// "Remove from Continue watching" (P1-22): `id` leaves this user's
+    /// Continue watching, an episode's show leaves Next up too, and its
+    /// progress and watched state stay. Playing or marking it brings it
+    /// back.
+    pub async fn hide_from_continue(&self, id: &MediaId) -> Result<(), SdkError> {
+        self.done(Request::HideFromContinueWatching { id: id.clone() })
+            .await
+    }
+
+    /// Undo [`Session::hide_from_continue`].
+    pub async fn unhide_from_continue(&self, id: &MediaId) -> Result<(), SdkError> {
+        self.done(Request::UnhideFromContinueWatching { id: id.clone() })
+            .await
+    }
+
     async fn done(&self, request: Request) -> Result<(), SdkError> {
         match self.call(request).await? {
             Reply::Done => Ok(()),
             other => Err(unexpected(other)),
         }
     }
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }

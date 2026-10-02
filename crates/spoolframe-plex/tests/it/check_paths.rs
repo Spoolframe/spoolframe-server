@@ -1,8 +1,6 @@
 //! `PlexCatalog::check_paths` against a fake PMS: one library maps to
 //! files that exist, one has no mapping, one has a wrong mapping.
 
-use std::path::{Path, PathBuf};
-
 use spoolframe_catalog::CatalogError;
 use spoolframe_plex::{LibraryPaths, PathMap, PathMapping, PlexCatalog, Scope};
 use wiremock::matchers::{header, path, query_param};
@@ -37,12 +35,11 @@ async fn pms() -> MockServer {
 }
 
 /// A local tree holding the two recorded movies, and nothing else. One
-/// per test: tests run in parallel, and each rebuilds its own tree.
-fn movies_root(test: &str) -> PathBuf {
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("check-paths")
-        .join(test);
-    let _ = std::fs::remove_dir_all(&root);
+/// per test, in a directory of its own under a random name (removed when
+/// dropped): tests run in parallel, and each builds its own tree.
+async fn movies_root(test: &str) -> spoolframe_test_dir::TestDir {
+    let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-check-paths-{test}")).await;
+    let root = tmp.as_ref();
     for movie in [
         "6.Below.Miracle.on.the.Mountain.2017/6 Below Miracle on the Mountain 2017 720p WEB-DL MkvCage.mkv",
         "24 Days (2014)/24 DaysH2641080pAC3.mkv",
@@ -51,26 +48,29 @@ fn movies_root(test: &str) -> PathBuf {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"").unwrap();
     }
-    root
+    tmp
 }
 
 /// Movies map to files that exist; TV Shows have no mapping; Music has
 /// one that points nowhere.
-fn catalog(server: &MockServer, test: &str) -> PlexCatalog {
-    PlexCatalog::new(server.uri().parse().unwrap(), None)
+/// The catalog, and the movies' tree, kept for the test.
+async fn catalog(server: &MockServer, test: &str) -> (PlexCatalog, spoolframe_test_dir::TestDir) {
+    let movies = movies_root(test).await;
+    let catalog = PlexCatalog::new(server.uri().parse().unwrap(), None)
         .unwrap()
         .with_paths(PathMap::new(vec![
             PathMapping {
                 library: None,
                 from: "/data/Movies".into(),
-                to: movies_root(test),
+                to: movies.to_path_buf(),
             },
             PathMapping {
                 library: Some("Music".into()),
                 from: "/data".into(),
                 to: "/nonexistent/music".into(),
             },
-        ]))
+        ]));
+    (catalog, movies)
 }
 
 fn report<'r>(reports: &'r [LibraryPaths], library: &str) -> &'r LibraryPaths {
@@ -83,10 +83,8 @@ fn report<'r>(reports: &'r [LibraryPaths], library: &str) -> &'r LibraryPaths {
 #[tokio::test]
 async fn each_library_is_reported_with_its_failures() {
     let server = pms().await;
-    let reports = catalog(&server, "each_library_is_reported_with_its_failures")
-        .check_paths(None, Scope::All)
-        .await
-        .unwrap();
+    let (plex, _movies) = catalog(&server, "each_library_is_reported_with_its_failures").await;
+    let reports = plex.check_paths(None, Scope::All).await.unwrap();
 
     let movies = report(&reports, "Movies");
     assert_eq!(movies.ok, 2);
@@ -113,10 +111,8 @@ async fn each_library_is_reported_with_its_failures() {
 #[tokio::test]
 async fn one_library_can_be_checked_alone() {
     let server = pms().await;
-    let reports = catalog(&server, "one_library_can_be_checked_alone")
-        .check_paths(Some("Movies"), Scope::All)
-        .await
-        .unwrap();
+    let (plex, _movies) = catalog(&server, "one_library_can_be_checked_alone").await;
+    let reports = plex.check_paths(Some("Movies"), Scope::All).await.unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].library, "Movies");
 }
@@ -124,7 +120,8 @@ async fn one_library_can_be_checked_alone() {
 #[tokio::test]
 async fn an_unknown_library_is_not_found() {
     let server = pms().await;
-    let err = catalog(&server, "an_unknown_library_is_not_found")
+    let (plex, _movies) = catalog(&server, "an_unknown_library_is_not_found").await;
+    let err = plex
         .check_paths(Some("Photos"), Scope::All)
         .await
         .unwrap_err();
@@ -144,8 +141,8 @@ async fn a_sample_asks_plex_for_only_a_few_items() {
         .expect(1)
         .mount(&server)
         .await;
-    catalog(&server, "a_sample_asks_plex_for_only_a_few_items")
-        .check_paths(Some("Movies"), Scope::Sample(3))
+    let (plex, _movies) = catalog(&server, "a_sample_asks_plex_for_only_a_few_items").await;
+    plex.check_paths(Some("Movies"), Scope::Sample(3))
         .await
         .unwrap();
 }

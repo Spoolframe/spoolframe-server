@@ -238,3 +238,113 @@ async fn shows_have_no_watch_state() {
     tv.close().await;
     server.stop().await;
 }
+
+async fn hide(tv: &TestClient, who: &SessionId, id: &MediaId) {
+    let response = tv
+        .call(
+            Some(who),
+            Request::HideFromContinueWatching { id: id.clone() },
+        )
+        .await;
+    assert_eq!(response, Response::Ok(Reply::Done));
+}
+
+#[tokio::test]
+async fn a_hidden_movie_leaves_only_that_user_s_home_and_keeps_its_state() {
+    let (server, tv, alice, bob) = alice_and_bob("hide-movie").await;
+    let id = movie().id().clone();
+    progress(&tv, &alice, &id, 600).await;
+    progress(&tv, &bob, &id, 600).await;
+    hide(&tv, &alice, &id).await;
+    assert!(home(&tv, &alice).await.continue_watching.is_empty());
+    assert_eq!(
+        ids(&home(&tv, &bob).await.continue_watching),
+        [id.to_string()]
+    );
+    // Resume still resumes.
+    assert_eq!(
+        state_of(&tv, &alice, &id).await.position,
+        Some(Duration::from_secs(600))
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn playing_a_hidden_movie_brings_it_back() {
+    let (server, tv, alice, _) = alice_and_bob("hide-play").await;
+    let id = movie().id().clone();
+    progress(&tv, &alice, &id, 600).await;
+    hide(&tv, &alice, &id).await;
+    // Within the write throttle of the last update: not written, but played.
+    progress(&tv, &alice, &id, 610).await;
+    assert_eq!(
+        ids(&home(&tv, &alice).await.continue_watching),
+        [id.to_string()]
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_hidden_episode_hides_its_show_until_an_episode_is_played() {
+    let (server, tv, alice, _) = alice_and_bob("hide-show").await;
+    let watched = episode("12", "11", 1, 1).id().clone();
+    let started = episode("13", "11", 1, 2).id().clone();
+    mark_watched(&tv, &alice, &watched).await;
+    progress(&tv, &alice, &started, 300).await;
+    let before = home(&tv, &alice).await;
+    assert_eq!(ids(&before.continue_watching), [started.to_string()]);
+    assert!(!before.next_up.is_empty());
+
+    hide(&tv, &alice, &started).await;
+    let hidden = home(&tv, &alice).await;
+    assert!(hidden.continue_watching.is_empty());
+    assert!(hidden.next_up.is_empty());
+    // Recently added is not Continue watching.
+    assert!(!hidden.recently_added.is_empty());
+
+    // Another episode of the show, marked: the show is back.
+    mark_watched(&tv, &alice, &watched).await;
+    let back = home(&tv, &alice).await;
+    assert_eq!(ids(&back.continue_watching), [started.to_string()]);
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn unhide_restores_at_once() {
+    let (server, tv, alice, _) = alice_and_bob("unhide").await;
+    let id = movie().id().clone();
+    progress(&tv, &alice, &id, 600).await;
+    hide(&tv, &alice, &id).await;
+    let response = tv
+        .call(
+            Some(&alice),
+            Request::UnhideFromContinueWatching { id: id.clone() },
+        )
+        .await;
+    assert_eq!(response, Response::Ok(Reply::Done));
+    assert_eq!(
+        ids(&home(&tv, &alice).await.continue_watching),
+        [id.to_string()]
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_hide_survives_a_restart() {
+    let (server, tv, alice, _) = alice_and_bob("hide-restart").await;
+    let id = movie().id().clone();
+    progress(&tv, &alice, &id, 600).await;
+    hide(&tv, &alice, &id).await;
+    tv.close().await;
+    let server = server.restart().await;
+    let tv = server.client().await;
+    tv.hello().await;
+    let alice = tv.login("alice", "correct horse").await;
+    assert!(home(&tv, &alice).await.continue_watching.is_empty());
+    tv.close().await;
+    server.stop().await;
+}

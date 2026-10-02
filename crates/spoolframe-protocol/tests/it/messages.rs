@@ -8,8 +8,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use spoolframe_protocol::codec::{self, CodecError, MAX_FRAME};
 use spoolframe_protocol::{
-    AudioAction, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, SubtitleAction,
-    TrackReason,
+    AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
+    SubtitleAction, TrackReason,
 };
 use spoolframe_protocol::{
     AuthMethod, Error, Event, Hello, LoginPassword, PROTOCOL_VERSION, Reply, Request,
@@ -90,14 +90,38 @@ fn every_request_round_trips() {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
             selection: Some(Selection::default()),
             start_ms: Some(1_800_000),
+            bitmap: BitmapSubtitles::Text,
         },
         Request::StartPlayback {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
             selection: None,
             start_ms: None,
+            bitmap: BitmapSubtitles::Auto,
         },
         Request::StopPlayback {
             handle: spoolframe_protocol::PlaybackHandle("h".into()),
+        },
+        Request::SetPin { pin: "4321".into() },
+        Request::ClearPin,
+        Request::UnlockProfile { pin: "4321".into() },
+        Request::ListDevices,
+        Request::SetPinRequired {
+            device: None,
+            required: false,
+        },
+        Request::ChangeSubtitle {
+            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            subtitle: Some(2),
+            bitmap: BitmapSubtitles::BurnIn,
+            position_ms: 61_000,
+        },
+        Request::ReadSubtitleSegment {
+            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            n: 7,
+        },
+        Request::GetManifest {
+            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            kind: spoolframe_protocol::ManifestKind::Subtitles,
         },
         Request::SeekPlayback {
             handle: spoolframe_protocol::PlaybackHandle("h".into()),
@@ -131,6 +155,12 @@ fn every_request_round_trips() {
         Request::MarkUnwatched {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
         },
+        Request::HideFromContinueWatching {
+            id: MediaId::new(Namespace::Plex, MediaKind::Episode, "70").unwrap(),
+        },
+        Request::UnhideFromContinueWatching {
+            id: MediaId::new(Namespace::Plex, MediaKind::Episode, "70").unwrap(),
+        },
         Request::Home,
         Request::ReadSubtitle {
             handle: spoolframe_protocol::PlaybackHandle("h".into()),
@@ -141,6 +171,7 @@ fn every_request_round_trips() {
                 audio: Some(1),
                 subtitle: None,
             }),
+            bitmap: BitmapSubtitles::BurnIn,
         },
     ] {
         round_trip(RequestEnvelope {
@@ -190,11 +221,28 @@ fn every_reply_round_trips() {
             user_id: "local:1".into(),
             username: "alice".into(),
             display_name: "Alice".into(),
-            is_admin: false,
+            role: spoolframe_types::Role::Consumer,
+            locked: true,
         }),
+        Reply::Devices {
+            devices: vec![spoolframe_protocol::DeviceInfo {
+                endpoint_id: "ab".repeat(32),
+                name: Some("Living room TV".into()),
+                last_seen_at: 1_790_000_000,
+                pin_required: true,
+                this_device: false,
+            }],
+        },
         Reply::LoggedOut,
         Reply::Done,
         Reply::PlaybackSeeked { epoch: 1 },
+        Reply::PlaybackChanged {
+            plan: PlaybackPlan::Unsupported {
+                reasons: Vec::new(),
+            },
+            size: 0,
+            epoch: 3,
+        },
         Reply::Manifest {
             text: "#EXTM3U\n".into(),
         },
@@ -326,6 +374,22 @@ fn every_plan_kind_round_trips_phase_2_ones_included() {
             }),
             reasons: vec!["subtitle 0: pgs cannot be shown; burned into the video".into()],
         },
+        PlaybackPlan::Converted {
+            delivery: Delivery::Progressive,
+            container: Container::Matroska,
+            video: Some(ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+            }),
+            audio: None,
+            subtitle: Some(ConvertedSubtitle {
+                index: 2,
+                action: SubtitleAction::Ocr {
+                    from: SubtitleFormat::Pgs,
+                    to: SubtitleFormat::Srt,
+                },
+            }),
+            reasons: vec!["subtitle 2: pgs read as text".into()],
+        },
         PlaybackPlan::Unsupported {
             reasons: vec!["audio 0: dts not supported".into()],
         },
@@ -407,6 +471,8 @@ fn media_reads_round_trip() {
             reason: "Invalid data found when processing input".into(),
         },
         Error::PlaybackRestarted { epoch: 3 },
+        Error::SubtitleNotReady { done_percent: 42 },
+        Error::ProfileLocked,
     ] {
         round_trip(spoolframe_protocol::MediaReadResponse::Err(error));
     }
@@ -608,7 +674,15 @@ fn an_older_client_s_selection_is_still_explicit() {
         decoded.request,
         Request::StartPlayback {
             selection: Some(_),
+            // Before P2-07: the mode a client never names is `Auto`.
+            bitmap: BitmapSubtitles::Auto,
             ..
         }
     ));
+}
+
+#[test]
+fn a_bitmap_mode_from_a_newer_client_is_unknown() {
+    let mode: BitmapSubtitles = codec::decode(&codec::encode(&"draw_in_3d").unwrap()).unwrap();
+    assert_eq!(mode, BitmapSubtitles::Unknown);
 }

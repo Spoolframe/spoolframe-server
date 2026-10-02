@@ -12,30 +12,33 @@ use std::time::Duration;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use spoolframe_catalog::{CatalogError, Page};
-use spoolframe_media::{MediaDescriptor, SubtitleSource};
+use spoolframe_media::{MediaDescriptor, SubtitleSource, SubtitleStream, codecs};
 use spoolframe_protocol::codec::{self, read_frame_bytes, write_frame};
 use spoolframe_protocol::streams::{bi, reset, uni};
 use spoolframe_protocol::{
-    ArtworkReply, ArtworkRequest, ArtworkResponse, ChosenTracks, MAX_READ, MediaRead,
-    MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan, Selection,
+    ArtworkReply, ArtworkRequest, ArtworkResponse, ChosenTracks, ConvertedSubtitle, MAX_READ,
+    MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan, Selection,
+    SubtitleAction,
 };
 use spoolframe_protocol::{
-    AuthMethod, Error, Event, Hello, LoginPassword, Reply, Request, RequestEnvelope, Response,
-    ServerInfo, SessionId, SessionInfo, UserSummary,
+    AuthMethod, DeviceInfo, Error, Event, Hello, LoginPassword, Reply, Request, RequestEnvelope,
+    Response, ServerInfo, SessionId, SessionInfo, UserSummary,
 };
-use spoolframe_types::{Item, MediaId, MediaKind};
+use spoolframe_types::{Item, MediaId, MediaKind, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::artwork::{Artwork, ArtworkError};
-use crate::auth::{LoginError, SessionToken};
+use crate::auth::{self, LoginError, SessionToken, UnlockError};
 use crate::encode::job::{EncodeJob, JobError, Progress};
-use crate::encode::{Conversion, ConversionSource};
+use crate::encode::{Conversion, ConversionSource, hls};
 use crate::network::{ConnectionAuth, Connections, Services};
 use crate::planner;
-use crate::playback::{Playback, Playbacks, Refusal, Sidecar};
+use crate::playback::{Changed, Opened, Playback, Playbacks, Refusal, Sidecar};
 use crate::principal::Principal;
+use crate::store::pins::PinError;
 use crate::store::sessions::{SessionBinding, SessionUser};
+use crate::subtitles::{TextSource, TextState};
 use crate::tracks::{self, TrackOverride};
 use crate::watch::WatchError;
 use spoolframe_protocol::ConvertedVideo;
@@ -58,6 +61,61 @@ pub(crate) struct ClientProtocol {
 #[derive(Debug, Default)]
 struct ConnectionState {
     hello: OnceLock<Hello>,
+    /// Profile locks (P2-08).
+    locks: std::sync::Mutex<Locks>,
+}
+
+/// Which sessions on one connection need their user's PIN, and which are
+/// unlocked (P2-08). Kept per connection: a new connection starts locked,
+/// whatever an earlier one unlocked.
+#[derive(Debug, Default)]
+struct Locks {
+    /// Each session looked up on this connection: whether its device asks
+    /// for its user's PIN.
+    needs_pin: HashMap<String, bool>,
+    unlocked: std::collections::HashSet<String>,
+    /// The session the last request came from. Using another one locks it
+    /// again: a switch to another profile and back asks for the PIN, and
+    /// the server keeps to that whatever the client does.
+    active: Option<String>,
+}
+
+impl Locks {
+    fn knows(&self, session: &SessionId) -> bool {
+        self.needs_pin.contains_key(&session.0)
+    }
+
+    fn learn(&mut self, session: &SessionId, needs_pin: bool) {
+        self.needs_pin.insert(session.0.clone(), needs_pin);
+    }
+
+    fn locked(&self, session: &SessionId) -> bool {
+        self.needs_pin.get(&session.0) == Some(&true) && !self.unlocked.contains(&session.0)
+    }
+
+    /// `session` makes a request: refused while it is locked; otherwise it
+    /// is the active one from now, and the one before is locked again.
+    fn use_session(&mut self, session: &SessionId) -> Result<(), Error> {
+        if self.locked(session) {
+            return Err(Error::ProfileLocked);
+        }
+        self.activate(session);
+        Ok(())
+    }
+
+    fn activate(&mut self, session: &SessionId) {
+        if self.active.as_deref() != Some(session.0.as_str()) {
+            if let Some(previous) = self.active.take() {
+                self.unlocked.remove(&previous);
+            }
+            self.active = Some(session.0.clone());
+        }
+    }
+
+    fn unlock(&mut self, session: &SessionId) {
+        self.activate(session);
+        self.unlocked.insert(session.0.clone());
+    }
 }
 
 impl ClientProtocol {
@@ -83,11 +141,11 @@ impl ClientProtocol {
             return;
         };
         if kind == bi::ARTWORK {
-            self.artwork(&connection, send, recv).await;
+            self.artwork(&connection, &state, send, recv).await;
             return;
         }
         if kind == bi::MEDIA {
-            self.media_read(&connection, send, recv).await;
+            self.media_read(&connection, &state, send, recv).await;
             return;
         }
         if kind != bi::RPC {
@@ -149,8 +207,24 @@ impl ClientProtocol {
             // Everything else needs a session that is live on this
             // endpoint. Each request names its own, so one connection can
             // serve several users at once (§15).
-            request => match self.authenticate(connection, envelope.session).await {
-                Ok((session, user)) => self.serve(connection, state, session, user, request).await,
+            request => match self.authenticate(connection, state, envelope.session).await {
+                Ok((session, user)) => {
+                    // Locked, only these two (P2-08).
+                    let exempt = matches!(request, Request::WhoAmI | Request::UnlockProfile { .. });
+                    let allowed = if exempt {
+                        Ok(())
+                    } else {
+                        state
+                            .locks
+                            .lock()
+                            .expect("never poisoned")
+                            .use_session(&session)
+                    };
+                    match allowed {
+                        Ok(()) => self.serve(connection, state, session, user, request).await,
+                        Err(e) => Err(e),
+                    }
+                }
                 Err(e) => Err(e),
             },
         };
@@ -158,10 +232,12 @@ impl ClientProtocol {
     }
 
     /// The user of `session`, if it is live and bound to this connection's
-    /// endpoint. Every failure is the same `Unauthenticated`.
+    /// endpoint. Every failure is the same `Unauthenticated`. Whether its
+    /// device asks for the user's PIN is noted for the connection's locks.
     async fn authenticate(
         &self,
         connection: &Connection,
+        state: &ConnectionState,
         session: Option<SessionId>,
     ) -> Result<(SessionId, SessionUser), Error> {
         let session = session.ok_or(Error::Unauthenticated)?;
@@ -172,7 +248,14 @@ impl ClientProtocol {
             .endpoint_session(&session.0, &endpoint)
             .await
         {
-            Ok(Some(user)) => Ok((session, user)),
+            Ok(Some(user)) => {
+                state
+                    .locks
+                    .lock()
+                    .expect("never poisoned")
+                    .learn(&session, user.pin_required);
+                Ok((session, user))
+            }
             Ok(None) => Err(Error::Unauthenticated),
             Err(e) => Err(internal(e)),
         }
@@ -180,9 +263,15 @@ impl ClientProtocol {
 
     /// One image on its own stream: a request frame in; a response frame
     /// and, if it is `ok`, the image's bytes out.
-    async fn artwork(&self, connection: &Connection, mut send: SendStream, mut recv: RecvStream) {
+    async fn artwork(
+        &self,
+        connection: &Connection,
+        state: &ConnectionState,
+        mut send: SendStream,
+        mut recv: RecvStream,
+    ) {
         let answer = match codec::read_frame::<_, ArtworkRequest>(&mut recv).await {
-            Ok(request) => self.find_artwork(connection, request).await,
+            Ok(request) => self.find_artwork(connection, state, request).await,
             Err(e) => Err(Error::Malformed {
                 message: e.to_string(),
             }),
@@ -214,9 +303,17 @@ impl ClientProtocol {
     async fn find_artwork(
         &self,
         connection: &Connection,
+        state: &ConnectionState,
         request: ArtworkRequest,
     ) -> Result<Artwork, Error> {
-        self.authenticate(connection, Some(request.session)).await?;
+        let (session, _) = self
+            .authenticate(connection, state, Some(request.session))
+            .await?;
+        state
+            .locks
+            .lock()
+            .expect("never poisoned")
+            .use_session(&session)?;
         self.services
             .artwork
             .get(&request.id, request.size)
@@ -267,11 +364,12 @@ impl ClientProtocol {
     async fn media_read(
         &self,
         connection: &Connection,
+        state: &ConnectionState,
         mut send: SendStream,
         mut recv: RecvStream,
     ) {
         let opened = match codec::read_frame::<_, MediaRead>(&mut recv).await {
-            Ok(read) => self.open_range(connection, &read).await,
+            Ok(read) => self.open_range(connection, state, &read).await,
             Err(e) => Err(Error::Malformed {
                 message: e.to_string(),
             }),
@@ -311,11 +409,29 @@ impl ClientProtocol {
     async fn open_range(
         &self,
         connection: &Connection,
+        state: &ConnectionState,
         read: &MediaRead,
     ) -> Result<(tokio::fs::File, MediaReadReply), Error> {
         let playback = self
             .use_playback(connection, &read.handle, &read.session)
             .await?;
+        // The lock, in memory, on every read. A session this connection
+        // has not looked up yet (a playback started before a reconnect) is
+        // looked up first, so a new connection does not skip its lock.
+        let known = state
+            .locks
+            .lock()
+            .expect("never poisoned")
+            .knows(&read.session);
+        if !known {
+            self.authenticate(connection, state, Some(read.session.clone()))
+                .await?;
+        }
+        state
+            .locks
+            .lock()
+            .expect("never poisoned")
+            .use_session(&read.session)?;
         if let Some(conversion) = &playback.conversion {
             let keep_alive = || self.services.playbacks.touch(&read.handle);
             return converted_range(conversion, read, &keep_alive).await;
@@ -380,8 +496,89 @@ impl ClientProtocol {
                 user_id: format!("local:{}", user.user.0),
                 username: user.username,
                 display_name: user.display_name,
-                is_admin: user.is_admin,
+                role: user.role,
+                locked: state.locks.lock().expect("never poisoned").locked(&session),
             })),
+            Request::UnlockProfile { pin } => {
+                let endpoint = connection.remote_id().to_string();
+                match self.services.auth.unlock(user.user, &endpoint, &pin).await {
+                    Ok(()) => {
+                        state.locks.lock().expect("never poisoned").unlock(&session);
+                        Ok(Reply::Done)
+                    }
+                    Err(UnlockError::Wrong) => Err(Error::InvalidCredentials),
+                    Err(UnlockError::RateLimited { retry_after }) => Err(Error::RateLimited {
+                        retry_after_ms: retry_after.as_millis() as u64,
+                    }),
+                    Err(UnlockError::Revoked) => Err(Error::Unauthenticated),
+                    Err(UnlockError::Internal(e)) => Err(internal(e)),
+                }
+            }
+            // The PIN, and where it is asked for, need only the session:
+            // a real sign-in made it, a locked one never gets here, and a
+            // PIN is never a way to sign in.
+            Request::SetPin { pin } => {
+                if !auth::valid_pin(&pin) {
+                    return Err(Error::InvalidInput {
+                        message: "a PIN is 4 to 8 digits".into(),
+                    });
+                }
+                let phc = auth::hash_pin(&pin).await.map_err(internal)?;
+                self.store()
+                    .set_pin(user.user, &phc)
+                    .await
+                    .map_err(internal)?;
+                tracing::info!(user = %user.username, "PIN set");
+                Ok(Reply::Done)
+            }
+            Request::ClearPin => {
+                self.store().clear_pin(user.user).await.map_err(internal)?;
+                tracing::info!(user = %user.username, "PIN cleared");
+                Ok(Reply::Done)
+            }
+            Request::ListDevices => {
+                let this = connection.remote_id().to_string();
+                let devices = self
+                    .store()
+                    .user_devices(user.user)
+                    .await
+                    .map_err(internal)?
+                    .into_iter()
+                    .map(|d| DeviceInfo {
+                        this_device: d.endpoint_id == this,
+                        endpoint_id: d.endpoint_id,
+                        name: d.name,
+                        last_seen_at: d.last_seen_at,
+                        pin_required: d.pin_required,
+                    })
+                    .collect();
+                Ok(Reply::Devices { devices })
+            }
+            Request::SetPinRequired { device, required } => {
+                let this = connection.remote_id().to_string();
+                let device = device.unwrap_or_else(|| this.clone());
+                self.store()
+                    .set_pin_required(user.user, &device, required)
+                    .await
+                    .map_err(|e| match e {
+                        PinError::NoPin => Error::InvalidInput {
+                            message: "set a PIN first".into(),
+                        },
+                        PinError::NoSuchDevice => Error::NotFound {
+                            what: format!("device {device}"),
+                        },
+                        PinError::Store(e) => internal(e),
+                    })?;
+                if required && device == this {
+                    // Who turns it on here is not locked out mid-use: this
+                    // connection stays unlocked; the next one asks.
+                    let mut locks = state.locks.lock().expect("never poisoned");
+                    locks.learn(&session, true);
+                    locks.unlock(&session);
+                }
+                tracing::info!(user = %user.username, %device, required, "PIN requirement changed");
+                Ok(Reply::Done)
+            }
             Request::Logout => {
                 self.services
                     .auth
@@ -479,6 +676,22 @@ impl ClientProtocol {
                     .map_err(watch_error)?;
                 Ok(Reply::Done)
             }
+            Request::HideFromContinueWatching { id } => {
+                self.services
+                    .watch
+                    .hide(principal, &id)
+                    .await
+                    .map_err(watch_error)?;
+                Ok(Reply::Done)
+            }
+            Request::UnhideFromContinueWatching { id } => {
+                self.services
+                    .watch
+                    .unhide(principal, &id)
+                    .await
+                    .map_err(watch_error)?;
+                Ok(Reply::Done)
+            }
             Request::Home => Ok(Reply::Home(
                 self.services
                     .watch
@@ -521,7 +734,11 @@ impl ClientProtocol {
                     .map_err(internal)?;
                 Ok(Reply::Done)
             }
-            Request::PlaybackPlan { id, selection } => {
+            Request::PlaybackPlan {
+                id,
+                selection,
+                bitmap,
+            } => {
                 // Capabilities belong to the connection: they came with Hello.
                 let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
                 if caps.is_none() {
@@ -540,7 +757,9 @@ impl ClientProtocol {
                         &descriptor,
                         caps,
                         selection,
+                        bitmap,
                         &self.services.transcoding.encoders(),
+                        self.services.subtitles.ocr(),
                     ),
                     chosen,
                 })
@@ -549,6 +768,7 @@ impl ClientProtocol {
                 id,
                 selection,
                 start_ms,
+                bitmap,
             } => {
                 let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
                 let (path, descriptor) = self.describe(&id).await?;
@@ -559,88 +779,33 @@ impl ClientProtocol {
                     &descriptor,
                     caps,
                     selection,
+                    bitmap,
                     &self.services.transcoding.encoders(),
+                    self.services.subtitles.ocr(),
                 );
                 let handle = Playbacks::new_handle();
-                let (subtitle, size, conversion) = match &plan {
-                    PlaybackPlan::Direct { subtitle, .. } => {
-                        let subtitle = subtitle.and_then(|planned| {
-                            match &descriptor.subtitles.get(planned.index as usize)?.source {
-                                SubtitleSource::External { path } => Some(Sidecar {
-                                    path: path.clone(),
-                                    format: planned.format,
-                                }),
-                                SubtitleSource::Embedded { .. } => None,
-                            }
-                        });
-                        let size = tokio::fs::metadata(&path)
-                            .await
-                            .map_err(|e| {
-                                tracing::warn!(%id, error = %e, "cannot stat a media file");
-                                Error::Unavailable {
-                                    message: "the media file could not be read".into(),
-                                }
-                            })?
-                            .len();
-                        (subtitle, size, None)
-                    }
-                    PlaybackPlan::Converted {
-                        delivery, video, ..
-                    } => {
-                        // HLS of a copied video is cut at its keyframes.
-                        let keyframes = match (delivery, video) {
-                            (Delivery::Hls, Some(ConvertedVideo::Copy { .. })) => {
-                                Some(self.services.prober.keyframes(&path).await.map_err(|e| {
-                                    tracing::warn!(%id, error = %e, "cannot list keyframes");
-                                    Error::PlaybackFailed {
-                                        reason: "the file's keyframes could not be read".into(),
-                                    }
-                                })?)
-                            }
-                            _ => None,
-                        };
-                        let transcoding = &self.services.transcoding;
-                        let conversion = Conversion::start(
-                            self.services.jobs.clone(),
-                            ConversionSource {
-                                handle: &handle.0,
-                                path: &path,
-                                descriptor: descriptor.clone(),
-                                plan: &plan,
-                                encoders: transcoding.encoders(),
-                                vaapi_device: &transcoding.settings().vaapi_device,
-                                keyframes,
-                            },
-                            start_ms.map(Duration::from_millis),
-                        )
-                        .map_err(|e| match e {
-                            JobError::Busy => Error::Busy,
-                            JobError::Prepare(reason) => {
-                                tracing::warn!(%id, reason, "cannot start a conversion");
-                                Error::PlaybackFailed { reason }
-                            }
-                        })?;
-                        (None, 0, Some(conversion))
-                    }
-                    PlaybackPlan::Unsupported { reasons } => {
-                        return Err(Error::CannotPlay {
-                            reasons: reasons.clone(),
-                        });
-                    }
-                    other => {
-                        return Err(Error::CannotPlay {
-                            reasons: vec![format!("{other:?} is not served yet")],
-                        });
-                    }
-                };
+                let (subtitle, size, conversion) = self
+                    .prepare(
+                        &handle,
+                        &id,
+                        (&path, &descriptor),
+                        &plan,
+                        start_ms.map(Duration::from_millis),
+                        0,
+                    )
+                    .await?;
                 let handle = self.services.playbacks.start(
                     handle,
-                    session,
-                    connection.remote_id().to_string(),
-                    path,
-                    size,
-                    subtitle,
-                    conversion,
+                    Opened {
+                        session,
+                        endpoint: connection.remote_id().to_string(),
+                        item: id.clone(),
+                        selection,
+                        path,
+                        size,
+                        subtitle,
+                        conversion,
+                    },
                 );
                 tracing::info!(%id, user = %user.username, "playback started");
                 Ok(Reply::PlaybackStarted {
@@ -650,6 +815,54 @@ impl ClientProtocol {
                     chosen,
                     epoch: 0,
                 })
+            }
+            Request::ChangeSubtitle {
+                handle,
+                subtitle,
+                bitmap,
+                position_ms,
+            } => {
+                let playback = self.use_playback(connection, &handle, &session).await?;
+                let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
+                let (path, descriptor) = self.describe(&playback.item).await?;
+                let selection = Selection {
+                    audio: playback.selection.audio,
+                    subtitle,
+                };
+                let plan = planner::plan(
+                    &descriptor,
+                    caps,
+                    selection,
+                    bitmap,
+                    &self.services.transcoding.encoders(),
+                    self.services.subtitles.ocr(),
+                );
+                // A new conversion's first epoch is past the old one's, so
+                // reads of the old one are told to start over.
+                let first_epoch = playback.conversion.as_ref().map_or(0, |c| c.job().epoch) + 1;
+                let (subtitle, size, conversion) = self
+                    .prepare(
+                        &handle,
+                        &playback.item,
+                        (&path, &descriptor),
+                        &plan,
+                        Some(Duration::from_millis(position_ms)),
+                        first_epoch,
+                    )
+                    .await?;
+                let epoch = conversion.as_ref().map_or(0, |c| c.job().epoch);
+                let replaced = self.services.playbacks.change(
+                    &handle,
+                    Changed {
+                        selection,
+                        size,
+                        subtitle,
+                        conversion,
+                    },
+                );
+                drop(replaced);
+                tracing::info!(id = %playback.item, epoch, "playback's subtitle changed");
+                Ok(Reply::PlaybackChanged { plan, size, epoch })
             }
             Request::StopPlayback { handle } => {
                 // Only the session and endpoint that started it may end it.
@@ -690,20 +903,47 @@ impl ClientProtocol {
             }
             Request::ReadSubtitle { handle } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
-                let Some(sidecar) = playback.subtitle else {
+                let (path, format) = match playback.subtitle {
+                    None => {
+                        return Err(Error::NotFound {
+                            what: "an external subtitle in this playback".into(),
+                        });
+                    }
+                    Some(Sidecar::File { path, format }) => (path, format),
+                    Some(Sidecar::Made { state, format }) => (read_text(state).await?, format),
+                };
+                let bytes = tokio::fs::read(&path).await.map_err(|e| {
+                    tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
+                    Error::Unavailable {
+                        message: "the subtitle file could not be read".into(),
+                    }
+                })?;
+                Ok(Reply::Subtitle { format, bytes })
+            }
+            Request::ReadSubtitleSegment { handle, n } => {
+                let playback = self.use_playback(connection, &handle, &session).await?;
+                let span = playback
+                    .conversion
+                    .as_ref()
+                    .filter(|c| c.subtitle_rendition().is_some())
+                    .and_then(|c| c.segment_span(n));
+                let (Some((start_ms, end_ms)), Some(Sidecar::Made { state, .. })) =
+                    (span, playback.subtitle)
+                else {
                     return Err(Error::NotFound {
-                        what: "an external subtitle in this playback".into(),
+                        what: format!("subtitle segment {n} in this playback"),
                     });
                 };
-                let bytes = tokio::fs::read(&sidecar.path).await.map_err(|e| {
-                    tracing::warn!(path = %sidecar.path.display(), error = %e, "cannot read a subtitle");
+                let path = read_text(state).await?;
+                let vtt = tokio::fs::read_to_string(&path).await.map_err(|e| {
+                    tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
                     Error::Unavailable {
                         message: "the subtitle file could not be read".into(),
                     }
                 })?;
                 Ok(Reply::Subtitle {
-                    format: sidecar.format,
-                    bytes,
+                    format: SubtitleFormat::WebVtt,
+                    bytes: hls::subtitle_segment(&vtt, start_ms, end_ms).into_bytes(),
                 })
             }
             Request::Hello(_)
@@ -755,6 +995,154 @@ impl ClientProtocol {
 
     fn store(&self) -> &crate::store::Store {
         self.services.auth.store()
+    }
+
+    /// `stream` of the file at `path` as `to` text: reading it starts now
+    /// (or is joined, or is cached) and the client fetches it when done.
+    async fn read_as_text(
+        &self,
+        path: &Path,
+        stream: &SubtitleStream,
+        to: SubtitleFormat,
+    ) -> Sidecar {
+        let state = self
+            .services
+            .subtitles
+            .text(TextSource { path, stream, to })
+            .await;
+        Sidecar::Made { state, format: to }
+    }
+
+    /// What `plan` needs to play as `handle`: the subtitle the client
+    /// fetches beside it, the size of what it reads (0 while a conversion
+    /// writes it), and the conversion, started at `start` as epoch
+    /// `first_epoch`.
+    async fn prepare(
+        &self,
+        handle: &PlaybackHandle,
+        id: &MediaId,
+        (path, descriptor): (&Path, &Arc<MediaDescriptor>),
+        plan: &PlaybackPlan,
+        start: Option<Duration>,
+        first_epoch: u32,
+    ) -> Result<(Option<Sidecar>, u64, Option<Arc<Conversion>>), Error> {
+        Ok(match plan {
+            PlaybackPlan::Direct { subtitle, .. } => {
+                let subtitle = match subtitle {
+                    Some(planned) => {
+                        let stream = &descriptor.subtitles[planned.index as usize];
+                        // Planned as another format than its own: read
+                        // as text (P2-07).
+                        if planned.format != codecs::subtitle_format(&stream.codec) {
+                            Some(self.read_as_text(path, stream, planned.format).await)
+                        } else if let SubtitleSource::External { path } = &stream.source {
+                            Some(Sidecar::File {
+                                path: path.clone(),
+                                format: planned.format,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                let size = tokio::fs::metadata(path)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(%id, error = %e, "cannot stat a media file");
+                        Error::Unavailable {
+                            message: "the media file could not be read".into(),
+                        }
+                    })?
+                    .len();
+                (subtitle, size, None)
+            }
+            PlaybackPlan::Converted {
+                delivery,
+                video,
+                subtitle,
+                ..
+            } => {
+                // Text the client fetches beside the stream: read from
+                // pictures; or, for HLS, any text, as the WebVTT of
+                // its subtitle rendition (P2-07).
+                let text = match (delivery, subtitle) {
+                    (
+                        Delivery::Hls,
+                        Some(ConvertedSubtitle {
+                            index,
+                            action:
+                                SubtitleAction::Copy { .. }
+                                | SubtitleAction::Convert { .. }
+                                | SubtitleAction::Ocr { .. },
+                        }),
+                    ) => Some(
+                        self.read_as_text(
+                            path,
+                            &descriptor.subtitles[*index as usize],
+                            SubtitleFormat::WebVtt,
+                        )
+                        .await,
+                    ),
+                    (
+                        _,
+                        Some(ConvertedSubtitle {
+                            index,
+                            action: SubtitleAction::Ocr { to, .. },
+                        }),
+                    ) => Some(
+                        self.read_as_text(path, &descriptor.subtitles[*index as usize], *to)
+                            .await,
+                    ),
+                    _ => None,
+                };
+                // HLS of a copied video is cut at its keyframes.
+                let keyframes = match (delivery, video) {
+                    (Delivery::Hls, Some(ConvertedVideo::Copy { .. })) => {
+                        Some(self.services.prober.keyframes(path).await.map_err(|e| {
+                            tracing::warn!(%id, error = %e, "cannot list keyframes");
+                            Error::PlaybackFailed {
+                                reason: "the file's keyframes could not be read".into(),
+                            }
+                        })?)
+                    }
+                    _ => None,
+                };
+                let transcoding = &self.services.transcoding;
+                let conversion = Conversion::start(
+                    self.services.jobs.clone(),
+                    ConversionSource {
+                        handle: &handle.0,
+                        path,
+                        descriptor: descriptor.clone(),
+                        plan,
+                        encoders: transcoding.encoders(),
+                        vaapi_device: &transcoding.settings().vaapi_device,
+                        keyframes,
+                        first_epoch,
+                    },
+                    start,
+                )
+                .map_err(|e| match e {
+                    JobError::Busy => Error::Busy,
+                    JobError::Prepare(reason) => {
+                        tracing::warn!(%id, reason, "cannot start a conversion");
+                        Error::PlaybackFailed { reason }
+                    }
+                })?;
+                (text, 0, Some(conversion))
+            }
+            PlaybackPlan::Unsupported { reasons } => {
+                return Err(Error::CannotPlay {
+                    reasons: reasons.clone(),
+                });
+            }
+            other => {
+                return Err(Error::CannotPlay {
+                    reasons: vec![format!("{other:?} is not served yet")],
+                });
+            }
+        })
     }
 
     /// `id`'s media file and Spoolframe's description of it.
@@ -1054,6 +1442,22 @@ async fn segment_range(
             epoch: job.epoch,
         },
     ))
+}
+
+/// The text a reading made: waits for it a while, then tells the client to
+/// ask again.
+async fn read_text(mut state: watch::Receiver<TextState>) -> Result<PathBuf, Error> {
+    let _ = tokio::time::timeout(READ_WAIT, state.wait_for(TextState::finished)).await;
+    let now = state.borrow().clone();
+    match now {
+        TextState::Ready(path) => Ok(path),
+        // The reason is in the log.
+        TextState::Failed(_) => Err(Error::Unavailable {
+            message: "the subtitle could not be read as text".into(),
+        }),
+        TextState::Waiting => Err(Error::SubtitleNotReady { done_percent: 0 }),
+        TextState::Reading { done_percent } => Err(Error::SubtitleNotReady { done_percent }),
+    }
 }
 
 /// A catalog failure as the client sees it. Backend details (the PMS URL,

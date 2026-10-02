@@ -1,0 +1,12 @@
+[package]
+name = "spoolframe-test-dir"
+description = "A test's own directory: tmpdir's random name, removed for certain when dropped."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+tmpdir = { workspace = true }
+tokio = { workspace = true }

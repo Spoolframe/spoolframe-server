@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 ciborium = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
+sha2 = { workspace = true }
 spoolframe-types = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

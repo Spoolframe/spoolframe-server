@@ -54,6 +54,12 @@ pub fn load_or_create(state_dir: &Path) -> Result<SecretKey, IdentityError> {
     }
 }
 
+/// The fingerprint a person compares with a client's before it pins this
+/// key (P1-21).
+pub fn fingerprint(key: &SecretKey) -> String {
+    spoolframe_protocol::fingerprint::fingerprint(key.public().as_bytes())
+}
+
 fn load(path: &Path) -> Result<SecretKey, IdentityError> {
     let bytes = fs::read(path).map_err(|source| IdentityError::Read {
         path: path.to_owned(),
@@ -98,17 +104,17 @@ fn create(state_dir: &Path, path: &Path) -> Result<SecretKey, IdentityError> {
 mod tests {
     use super::*;
 
-    fn state_dir(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("spoolframe-identity-{}", std::process::id()))
-            .join(test);
-        let _ = fs::remove_dir_all(&dir);
-        dir
+    /// A directory of the test's own, removed when dropped, and a state
+    /// directory in it, not made yet.
+    async fn state_dir(test: &str) -> (spoolframe_test_dir::TestDir, PathBuf) {
+        let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-identity-{test}")).await;
+        let dir = tmp.as_ref().join("state");
+        (tmp, dir)
     }
 
-    #[test]
-    fn a_new_key_is_created_private() {
-        let dir = state_dir("create");
+    #[tokio::test]
+    async fn a_new_key_is_created_private() {
+        let (_tmp, dir) = state_dir("create").await;
         load_or_create(&dir).unwrap();
         let mode = fs::metadata(dir.join(KEY_FILE))
             .unwrap()
@@ -117,17 +123,17 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
-    #[test]
-    fn the_same_key_is_loaded_again() {
-        let dir = state_dir("reload");
+    #[tokio::test]
+    async fn the_same_key_is_loaded_again() {
+        let (_tmp, dir) = state_dir("reload").await;
         let first = load_or_create(&dir).unwrap();
         let second = load_or_create(&dir).unwrap();
         assert_eq!(first.public(), second.public());
     }
 
-    #[test]
-    fn an_unreadable_key_is_fatal_and_left_alone() {
-        let dir = state_dir("unreadable");
+    #[tokio::test]
+    async fn an_unreadable_key_is_fatal_and_left_alone() {
+        let (_tmp, dir) = state_dir("unreadable").await;
         load_or_create(&dir).unwrap();
         let path = dir.join(KEY_FILE);
         let before = fs::read(&path).unwrap();
@@ -141,9 +147,9 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
-    #[test]
-    fn a_key_of_the_wrong_size_is_fatal() {
-        let dir = state_dir("malformed");
+    #[tokio::test]
+    async fn a_key_of_the_wrong_size_is_fatal() {
+        let (_tmp, dir) = state_dir("malformed").await;
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(KEY_FILE);
         fs::write(&path, b"short").unwrap();
@@ -154,9 +160,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_key_others_can_read_is_refused() {
-        let dir = state_dir("exposed");
+    #[tokio::test]
+    async fn a_key_others_can_read_is_refused() {
+        let (_tmp, dir) = state_dir("exposed").await;
         load_or_create(&dir).unwrap();
         let path = dir.join(KEY_FILE);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();

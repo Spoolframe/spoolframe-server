@@ -16,6 +16,7 @@ use serde::Serialize;
 use spoolframe_catalog::{Catalog, CatalogError, Image, ItemPage, ItemWithChildren, Page};
 use spoolframe_media::Prober;
 use spoolframe_media::encoders::{FfmpegCommand, TranscodeSettings};
+use spoolframe_media::ocr::Ocr;
 use spoolframe_protocol::codec::{read_frame, write_frame};
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{ArtworkRequest, ArtworkResponse, ArtworkSize};
@@ -32,6 +33,7 @@ use spoolframe_server::identity;
 use spoolframe_server::network::{EndpointOptions, Relay, Server, Services};
 use spoolframe_server::playback::Playbacks;
 use spoolframe_server::store::Store;
+use spoolframe_server::subtitles::{OcrSettings, Subtitles};
 use spoolframe_server::transcode::Transcoding;
 use spoolframe_server::watch::{Watch, WatchRules};
 use spoolframe_types::{
@@ -240,18 +242,15 @@ fn fake_ffprobe(dir: &Path) -> PathBuf {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../spoolframe-media/tests/fixtures");
     let script = dir.join("bin").join("ffprobe");
     std::fs::create_dir_all(script.parent().unwrap()).unwrap();
-    std::fs::write(
+    write_script(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\nfor path; do :; done\ncase \"$path\" in *.srt) cat '{}' ;; *.b99.mkv) cat '{}' ;; *) cat '{}' ;; esac\n",
             fixtures.join("external-srt.json").display(),
             fixtures.join("b99-s07e01.json").display(),
             fixtures.join("mkv-forced-subs.json").display(),
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     script
 }
 
@@ -308,6 +307,12 @@ pub struct ServerOptions {
     pub read_ahead: Duration,
     /// The encoder jobs run: real ffmpeg, or a stand-in script.
     pub ffmpeg: PathBuf,
+    /// Read bitmap subtitles as text with real tesseract (P2-07). Off: the
+    /// server cannot.
+    pub ocr: bool,
+    /// How long failed logins and PINs count; tests of many failures
+    /// shorten it.
+    pub failure_window: Duration,
 }
 
 impl Default for ServerOptions {
@@ -320,18 +325,43 @@ impl Default for ServerOptions {
             max_jobs: 2,
             read_ahead: Duration::from_secs(5),
             ffmpeg: PathBuf::from("ffmpeg"),
+            ocr: false,
+            failure_window: spoolframe_server::auth::FAILURE_WINDOW,
         }
     }
 }
 
-/// The state directory for `test`, emptied.
-pub fn fresh_dir(test: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("servers")
-        .join(test_module())
-        .join(test);
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A test's state directory: a tmpdir under a random name, so tests
+/// running at once (in this run or another) never share one. It goes when
+/// the last clone is dropped; a restarted server keeps its clone.
+#[derive(Clone)]
+pub struct StateDir {
+    path: PathBuf,
+    _tmp: Arc<spoolframe_test_dir::TestDir>,
+}
+
+impl std::ops::Deref for StateDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for StateDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// A new, empty state directory for `test`.
+pub async fn fresh_dir(test: &str) -> StateDir {
+    let tmp =
+        spoolframe_test_dir::TestDir::new(&format!("spoolframe-{}-{test}", test_module())).await;
+    StateDir {
+        path: tmp.to_path_buf(),
+        _tmp: Arc::new(tmp),
+    }
 }
 
 /// The module of the running test, so two modules may use the same
@@ -349,22 +379,22 @@ pub struct TestServer {
     pub server: Server,
     pub store: Store,
     pub media: PathBuf,
-    pub dir: PathBuf,
+    pub dir: StateDir,
 }
 
 impl TestServer {
     /// A fresh server whose state lives in a directory named for `test`.
     pub async fn start(test: &str) -> Self {
-        Self::start_in(fresh_dir(test)).await
+        Self::start_in(fresh_dir(test).await).await
     }
 
     /// A server on an existing state directory, as after a restart.
-    pub async fn start_in(dir: PathBuf) -> Self {
+    pub async fn start_in(dir: StateDir) -> Self {
         Self::start_with(dir, ServerOptions::default()).await
     }
 
     /// A server on `dir` (its key and database), run as `options` say.
-    pub async fn start_with(dir: PathBuf, options: ServerOptions) -> Self {
+    pub async fn start_with(dir: StateDir, options: ServerOptions) -> Self {
         let key = identity::load_or_create(&dir).unwrap();
         let store = Store::open(&dir).await.unwrap();
         let media = dir.join("media").join("movie.mkv");
@@ -389,6 +419,21 @@ impl TestServer {
             options.ffmpeg.clone(),
         )
         .unwrap();
+        let ocr = if options.ocr {
+            Ocr::detect(Path::new("tesseract")).await
+        } else {
+            Ocr::disabled()
+        };
+        let subtitles = Subtitles::new(
+            ocr,
+            PathBuf::from("ffmpeg"),
+            &OcrSettings {
+                enabled: true,
+                threads: 2,
+                cache_dir: dir.join("cache").join("subtitles"),
+            },
+        )
+        .unwrap();
         let watch = Arc::new(Watch::new(
             store.clone(),
             catalog.clone(),
@@ -396,7 +441,7 @@ impl TestServer {
             WatchRules::default(),
         ));
         let services = Services {
-            auth: Auth::new(store.clone()),
+            auth: Auth::with_failure_window(store.clone(), options.failure_window),
             watch,
             catalog,
             prober,
@@ -404,6 +449,7 @@ impl TestServer {
             playbacks: Arc::new(Playbacks::new(PLAYBACK_IDLE, PLAYBACK_RECHECK)),
             transcoding: transcoding(),
             jobs: Arc::new(jobs),
+            subtitles: Arc::new(subtitles),
         };
         let endpoint = EndpointOptions {
             port: options.port,
@@ -463,6 +509,81 @@ impl TestServer {
         assert!(status.success(), "ffmpeg could not make the test media");
     }
 
+    /// Give the movie made with [`TestServer::generate_media`] an English
+    /// PGS subtitle track (stream 2) showing each `(text, start_ms,
+    /// end_ms)`: the text drawn with ffmpeg's drawtext, as a Blu-ray
+    /// subtitle would show it.
+    pub fn add_pgs(&self, cues: &[(&str, u64, u64)]) {
+        use spoolframe_media::pgs::fixture;
+        const WIDTH: u16 = 640;
+        const HEIGHT: u16 = 64;
+        let font =
+            std::env::var("SPOOLFRAME_TEST_FONT").expect("the dev shell sets SPOOLFRAME_TEST_FONT");
+        let shown: Vec<fixture::Cue> = cues
+            .iter()
+            .map(|&(text, start_ms, end_ms)| {
+                let out = std::process::Command::new("ffmpeg")
+                    .args(["-v", "error", "-f", "lavfi", "-i"])
+                    .arg(format!("color=black:s={WIDTH}x{HEIGHT}:d=1"))
+                    .arg("-vf")
+                    .arg(format!(
+                        "drawtext=fontfile={font}:text='{text}':fontcolor=white:fontsize=40:x=12:y=10"
+                    ))
+                    .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+                    .output()
+                    .expect("ffmpeg runs");
+                assert!(out.status.success(), "ffmpeg could not draw {text:?}");
+                fixture::Cue {
+                    start_ms,
+                    end_ms,
+                    x: 640,
+                    y: 960,
+                    width: WIDTH,
+                    height: HEIGHT,
+                    mask: out.stdout.into_iter().map(|p| u8::from(p > 128)).collect(),
+                }
+            })
+            .collect();
+        let sup = self.dir.join("subs.sup");
+        std::fs::write(&sup, fixture::sup(&shown, 65_000)).unwrap();
+        let with = self.media.with_extension("pgs.mkv");
+        // `-copyts`: without it ffmpeg moves the track back by its first
+        // cue's time.
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&self.media)
+            .arg("-i")
+            .arg(&sup)
+            .args(["-map", "0", "-map", "1", "-c", "copy", "-copyts"])
+            .args(["-metadata:s:s:0", "language=eng"])
+            .arg(&with)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not add the PGS track");
+        std::fs::rename(&with, &self.media).unwrap();
+    }
+
+    /// Give the movie made with [`TestServer::generate_media`] a text
+    /// subtitle track (the next stream) of `codec` (`ass`, `mov_text`, …),
+    /// English, with the cues of SubRip `srt`.
+    pub fn add_text_track(&self, srt: &str, codec: &str) {
+        let source = self.dir.join("subs.srt");
+        std::fs::write(&source, srt).unwrap();
+        let with = self.media.with_extension("text.mkv");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&self.media)
+            .arg("-i")
+            .arg(&source)
+            .args(["-map", "0", "-map", "1", "-c", "copy", "-c:s", codec])
+            .args(["-metadata:s:s:0", "language=eng"])
+            .arg(&with)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not add the {codec} track");
+        std::fs::rename(&with, &self.media).unwrap();
+    }
+
     /// Where a converted playback's job writes, for epoch `epoch`.
     pub fn job_dir(&self, handle: &PlaybackHandle, epoch: u32) -> PathBuf {
         self.dir
@@ -482,7 +603,12 @@ impl TestServer {
     pub async fn add_user(&self, username: &str, password: &str, display_name: Option<&str>) {
         let phc = hash_password(password).await.unwrap();
         self.store
-            .add_user(username, display_name, &phc, false)
+            .add_user(
+                username,
+                display_name,
+                &phc,
+                spoolframe_types::Role::Consumer,
+            )
             .await
             .unwrap();
     }
@@ -533,6 +659,22 @@ pub struct TestClient {
 }
 
 impl TestClient {
+    /// A new connection from the same endpoint (the same device), as after
+    /// a restart of the app. It says Hello again.
+    pub async fn reconnect(&self, server: &TestServer) -> TestClient {
+        let conn = self
+            .endpoint
+            .connect(server.server.addr(), CLIENT_ALPN)
+            .await
+            .unwrap();
+        let client = TestClient {
+            endpoint: self.endpoint.clone(),
+            conn,
+        };
+        client.hello().await;
+        client
+    }
+
     /// Send any serializable envelope as one RPC.
     pub async fn send<T: Serialize>(&self, envelope: &T) -> Response {
         let (mut send, mut recv) = self.conn.open_bi().await.unwrap();
@@ -662,4 +804,21 @@ impl TestClient {
         self.conn.close(0u32.into(), b"done");
         self.endpoint.close().await;
     }
+}
+
+/// Writes an executable script. The text goes to a plain file first and
+/// `install` makes the script from it, so this process never holds the
+/// script open for writing: a child another test forks at that moment
+/// would inherit the handle, and running the script would then fail with
+/// "Text file busy" (ETXTBSY).
+pub fn write_script(path: &Path, text: &str) {
+    let source = path.with_extension("txt");
+    std::fs::write(&source, text).unwrap();
+    let status = std::process::Command::new("install")
+        .args(["-m", "755"])
+        .arg(&source)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "install {} failed", path.display());
 }

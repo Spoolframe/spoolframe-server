@@ -9,7 +9,12 @@
   libucl,
   makeWrapper,
   ffmpeg-headless,
+  tesseract,
 }: let
+  # English by default; the NixOS module points the server at a tesseract
+  # with the languages the host asks for.
+  ocr = tesseract.override {enableLanguages = ["eng"];};
+
   # lib.cleanSource (not a .rs/.toml filter) so `.cargo/config.toml` — which
   # declares the coldsteel registry for vendoring — is kept in the build source.
   src = lib.cleanSource ./..;
@@ -33,15 +38,16 @@ in
 
       cargoExtraArgs = "-p spoolframe-server";
 
-      # The server runs ffprobe on every file it serves (P1-06) and ffmpeg
-      # to encode (P2-02); put them on the binary's PATH rather than relying
-      # on the host having one. nixpkgs' ffmpeg-headless already has VA-API
+      # The server runs ffprobe on every file it serves (P1-06), ffmpeg to
+      # encode (P2-02) and tesseract to read bitmap subtitles (P2-07); put
+      # them on the binary's PATH rather than relying on the host having
+      # them. nixpkgs' ffmpeg-headless already has VA-API
       # and NVENC (the CUDA driver is loaded at run time), so no override:
       # QSV is the one it lacks, and Intel GPUs encode through VA-API.
       nativeBuildInputs = commonArgs.nativeBuildInputs ++ [makeWrapper];
       postInstall = ''
         wrapProgram $out/bin/spoolframe-server \
-          --prefix PATH : ${lib.makeBinPath [ffmpeg-headless]}
+          --prefix PATH : ${lib.makeBinPath [ffmpeg-headless ocr]}
       '';
       # Tests run in devenv/CI; the license-boundary test shells out to
       # `cargo metadata`, which the package build has no reason to do.

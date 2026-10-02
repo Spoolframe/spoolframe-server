@@ -113,7 +113,10 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 SubtitleSource::Embedded { .. } => None,
             });
     if let (Some(path), Some(sub)) = (&sidecar, spec.subtitle)
-        && !matches!(sub.action, SubtitleAction::BurnIn { .. })
+        && !matches!(
+            sub.action,
+            SubtitleAction::BurnIn { .. } | SubtitleAction::Ocr { .. }
+        )
     {
         seek(&mut args);
         args.extend([s("-i"), s(path.display())]);
@@ -152,8 +155,14 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                         .ok_or_else(|| format!("subtitle {}: no such track", sub.index))?;
                     match (&picked.source, picked.kind) {
                         (SubtitleSource::Embedded { index }, SubtitleKind::Bitmap) => {
-                            // Pictures go over the picture.
-                            source = format!("[0:{}][0:{index}]overlay", stream.index);
+                            // Pictures go over the picture, their canvas
+                            // scaled to it first: Blu-ray PGS is 1080p even
+                            // over 4K video, and unscaled it would land
+                            // small in the top left.
+                            source = format!(
+                                "[0:{index}]scale={}:{}[subs];[0:{}][subs]overlay",
+                                stream.width, stream.height, stream.index
+                            );
                         }
                         (SubtitleSource::Embedded { .. }, SubtitleKind::Text) => {
                             let nth = d.subtitles[..sub.index as usize]
@@ -265,7 +274,10 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 SubtitleFormat::MovText => "mov_text",
                 _ => "srt",
             }),
-            SubtitleAction::BurnIn { .. } | SubtitleAction::Unknown => None,
+            // Read as text by the server and fetched beside the stream.
+            SubtitleAction::BurnIn { .. }
+            | SubtitleAction::Ocr { .. }
+            | SubtitleAction::Unknown => None,
         };
         if let (Some(from), Some(codec)) = (from, codec) {
             args.extend([s("-map"), from, s("-c:s"), s(codec)]);
@@ -559,7 +571,10 @@ mod tests {
         ))
         .unwrap();
         let graph = after(&args, "-filter_complex");
-        assert_eq!(graph, "[0:0][0:2]overlay,format=yuv420p[v]");
+        assert_eq!(
+            graph,
+            "[0:2]scale=3840:2160[subs];[0:0][subs]overlay,format=yuv420p[v]"
+        );
         // Burned in: not also a subtitle stream.
         assert!(!args.contains(&s("-c:s")));
     }
@@ -694,5 +709,27 @@ mod tests {
             &ffmpeg_args(&spec).unwrap(),
             &["-i", "/scratch/h/0/sidecar"]
         ));
+    }
+
+    #[test]
+    fn a_subtitle_read_as_text_is_not_in_the_output() {
+        let (film, enc) = (film(), encoders(false));
+        let ocr = ConvertedSubtitle {
+            index: 0,
+            action: SubtitleAction::Ocr {
+                from: SubtitleFormat::Pgs,
+                to: SubtitleFormat::Srt,
+            },
+        };
+        let args = ffmpeg_args(&spec(
+            &film,
+            &enc,
+            COPY_HEVC,
+            COPY_DTS,
+            Some(ocr),
+            progressive(),
+        ))
+        .unwrap();
+        assert!(!args.iter().any(|a| a == "-c:s" || a == "0:2"), "{args:?}");
     }
 }

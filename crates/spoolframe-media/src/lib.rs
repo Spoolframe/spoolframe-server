@@ -9,6 +9,8 @@ pub mod codecs;
 mod descriptor;
 pub mod encoders;
 mod external;
+pub mod ocr;
+pub mod pgs;
 mod probe;
 pub mod roles;
 

@@ -18,7 +18,7 @@ use iroh::endpoint::presets;
 use iroh::endpoint_info::UserData;
 use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
-use spoolframe_client_sdk::{Client, Device, MemoryStorage, ServerEntry};
+use spoolframe_client_sdk::{Client, Device, MemoryStorage, SdkError, ServerEntry};
 use spoolframe_protocol::lan;
 use spoolframe_types::ClientCapabilities;
 use support::{ServerOptions, TestServer, fresh_dir};
@@ -178,61 +178,160 @@ async fn the_server_announces_itself_with_its_name() {
         return;
     }
     let listener = Listener::on(lan::MDNS_SERVICE).await;
-    let server = TestServer::start_with(fresh_dir("announce"), on_lan("Den")).await;
+    let server = TestServer::start_with(fresh_dir("announce").await, on_lan("Den")).await;
     let data = listener.hear(&server.server.id()).await.unwrap();
     assert_eq!(lan::parse_advert(&data).unwrap().name, "Den");
     server.stop().await;
 }
 
 #[tokio::test]
-async fn a_server_heard_on_the_lan_is_pinned_on_connect_and_stays_pinned() {
-    if !private_lan("a_server_heard_on_the_lan_is_pinned_on_connect_and_stays_pinned") {
+async fn a_server_is_saved_only_when_pinned_and_stays_pinned() {
+    if !private_lan("a_server_is_saved_only_when_pinned_and_stays_pinned") {
         return;
     }
-    let server = TestServer::start_with(fresh_dir("pin"), on_lan("Den")).await;
+    let server = TestServer::start_with(fresh_dir("pin").await, on_lan("Den")).await;
     let storage = Arc::new(MemoryStorage::default());
     let client = open(&storage).await;
     let heard = entry(&client, &server, |e| e.on_network).await;
     assert_eq!(heard.name, "Den");
     assert!(!heard.pinned);
 
+    // Connecting shows who answered, and saves nothing (P1-21).
     let connected = client.connect(&heard.endpoint_id).await.unwrap();
-    assert!(connected.pinned);
+    assert!(!connected.pinned);
+    assert_eq!(
+        Some(connected.fingerprint.clone()),
+        spoolframe_protocol::fingerprint::of_hex(&server.server.id().to_string())
+    );
+    assert!(matches!(
+        client.profiles(&heard.endpoint_id).await,
+        Err(SdkError::NotPinned(_))
+    ));
+
+    // "Skip": saved, not verified; "Verify now": verified, same pin.
+    let pinned = client.pin(&heard.endpoint_id, false).await.unwrap();
+    assert!(pinned.pinned && !pinned.verified, "{pinned:?}");
+    let verified = client.pin(&heard.endpoint_id, true).await.unwrap();
+    assert!(verified.pinned && verified.verified, "{verified:?}");
     client.close().await;
 
-    // The app restarts: the same device, and the same pin.
+    // The app restarts: the same device, and the same pin, still verified.
     let again = open(&storage).await;
     assert_eq!(again.id(), client.id());
     let saved = again.servers().await.unwrap();
     let pinned: Vec<_> = saved.iter().filter(|e| e.pinned).collect();
     assert_eq!(pinned.len(), 1);
     assert_eq!(pinned[0].endpoint_id, server.server.id().to_string());
+    assert!(pinned[0].verified);
     again.close().await;
     server.stop().await;
 }
 
 #[tokio::test]
-async fn another_server_with_the_same_name_is_a_different_server() {
-    if !private_lan("another_server_with_the_same_name_is_a_different_server") {
+async fn a_server_connected_but_not_pinned_is_forgotten() {
+    if !private_lan("a_server_connected_but_not_pinned_is_forgotten") {
         return;
     }
-    let first = TestServer::start_with(fresh_dir("same-name-1"), on_lan("Home Media")).await;
+    let server = TestServer::start_with(fresh_dir("cancel").await, on_lan("Den")).await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = open(&storage).await;
+    let heard = entry(&client, &server, |e| e.on_network).await;
+    client.connect(&heard.endpoint_id).await.unwrap();
+    client.close().await;
+    // "Cancel": nothing was saved, so nothing is listed once the server
+    // is not heard.
+    let again = open(&storage).await;
+    server.stop().await;
+    assert!(again.servers().await.unwrap().iter().all(|e| !e.pinned));
+    again.close().await;
+}
+
+#[tokio::test]
+async fn another_server_with_the_same_name_beside_it_is_a_different_server() {
+    if !private_lan("another_server_with_the_same_name_beside_it_is_a_different_server") {
+        return;
+    }
+    let first = TestServer::start_with(fresh_dir("same-name-1").await, on_lan("Home Media")).await;
     let storage = Arc::new(MemoryStorage::default());
     let client = open(&storage).await;
     let pinned = entry(&client, &first, |e| e.on_network).await;
     client.connect(&pinned.endpoint_id).await.unwrap();
+    client.pin(&pinned.endpoint_id, true).await.unwrap();
 
-    let impostor = TestServer::start_with(fresh_dir("same-name-2"), on_lan("Home Media")).await;
+    let impostor =
+        TestServer::start_with(fresh_dir("same-name-2").await, on_lan("Home Media")).await;
     let other = entry(&client, &impostor, |e| e.on_network).await;
     assert_eq!(other.name, "Home Media");
     assert!(!other.pinned);
+    assert_ne!(other.fingerprint, pinned.fingerprint);
     let servers = client.servers().await.unwrap();
     assert_eq!(servers.len(), 2);
     let still = servers.iter().find(|e| e.pinned).unwrap();
     assert_eq!(still.endpoint_id, pinned.endpoint_id);
+    // Both are on the air: the second is another server, not a new key.
+    assert!(!client.connect(&other.endpoint_id).await.unwrap().pinned);
     client.close().await;
     first.stop().await;
     impostor.stop().await;
+}
+
+/// The saved server is gone and another key answers under its name
+/// (P1-13): reinstalled, or a different server. Nothing connects or saves
+/// on its own; the user's Cancel keeps the pin, Trust replaces it.
+#[tokio::test]
+async fn a_new_key_under_a_saved_name_is_an_identity_change() {
+    if !private_lan("a_new_key_under_a_saved_name_is_an_identity_change") {
+        return;
+    }
+    let first = TestServer::start_with(fresh_dir("reinstall-1").await, on_lan("Home Media")).await;
+    first.add_user("alice", "correct horse", None).await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = open(&storage).await;
+    let old = entry(&client, &first, |e| e.on_network).await.endpoint_id;
+    client.connect(&old).await.unwrap();
+    client.pin(&old, true).await.unwrap();
+    client
+        .sign_in(&old, "alice", "correct horse")
+        .await
+        .unwrap();
+
+    first.stop().await;
+    let second = TestServer::start_with(fresh_dir("reinstall-2").await, on_lan("Home Media")).await;
+    let new = second.server.id().to_string();
+    let changed = SdkError::IdentityChanged {
+        saved: old.clone(),
+        now: new.clone(),
+    };
+    // Once the old record is gone and the new one heard, picking it says
+    // so, rather than connecting.
+    until("the new key is an identity change", || async {
+        (client.connect(&new).await == Err(changed.clone())).then_some(())
+    })
+    .await;
+    // One entry, the saved one; and the saved one says the same.
+    let listed = client.servers().await.unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].endpoint_id, old);
+    assert_eq!(client.connect(&old).await, Err(changed.clone()));
+    // A pin is not taken over by pinning.
+    assert_eq!(client.pin(&new, true).await, Err(changed.clone()));
+    // Cancel: nothing changed.
+    assert_eq!(client.servers().await.unwrap()[0].endpoint_id, old);
+
+    // Trust: the new key is the pin, verified, and the old sessions are
+    // gone with the old key.
+    let trusted = client.trust_new_identity(&old, &new).await.unwrap();
+    assert!(trusted.pinned && trusted.verified, "{trusted:?}");
+    let listed = client.servers().await.unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].endpoint_id, new);
+    assert!(client.profiles(&new).await.unwrap().is_empty());
+    assert!(matches!(
+        client.profiles(&old).await,
+        Err(SdkError::NotPinned(_))
+    ));
+    client.close().await;
+    second.stop().await;
 }
 
 #[tokio::test]
@@ -251,7 +350,7 @@ async fn endpoints_that_are_not_spoolframe_servers_are_not_listed() {
     ours.hear(&no_advert.id()).await;
     ours.hear(&other_protocol.id()).await;
     // ...and a real server, heard after them, is the only one listed.
-    let server = TestServer::start_with(fresh_dir("decoys"), on_lan("Den")).await;
+    let server = TestServer::start_with(fresh_dir("decoys").await, on_lan("Den")).await;
     entry(&client, &server, |e| e.on_network).await;
     let listed: Vec<_> = client
         .servers()
@@ -273,13 +372,14 @@ async fn a_pinned_server_on_a_new_address_is_found_again_by_its_key() {
     if !private_lan("a_pinned_server_on_a_new_address_is_found_again_by_its_key") {
         return;
     }
-    let dir = fresh_dir("new-address");
+    let dir = fresh_dir("new-address").await;
     let server = TestServer::start_with(dir.clone(), on_lan("Den")).await;
     let id = server.server.id();
     let old_addrs: Vec<_> = server.server.addr().ip_addrs().copied().collect();
     let client = open(&Arc::new(MemoryStorage::default())).await;
     let heard = entry(&client, &server, |e| e.on_network).await;
     client.connect(&heard.endpoint_id).await.unwrap();
+    client.pin(&heard.endpoint_id, true).await.unwrap();
 
     // A new lease: the same server, its same key, another address.
     server.stop().await;
@@ -309,7 +409,7 @@ async fn the_client_announces_nothing() {
     }
     let ours = Listener::on(lan::MDNS_SERVICE).await;
     let iroh_default = Listener::on("irohv1").await;
-    let server = TestServer::start_with(fresh_dir("silent"), on_lan("Den")).await;
+    let server = TestServer::start_with(fresh_dir("silent").await, on_lan("Den")).await;
     let client = open(&Arc::new(MemoryStorage::default())).await;
     let heard = entry(&client, &server, |e| e.on_network).await;
     client.connect(&heard.endpoint_id).await.unwrap();
@@ -334,7 +434,7 @@ async fn the_server_list_tells_when_a_server_is_heard() {
     let mut changes = client.watch_servers();
     assert!(client.servers().await.unwrap().is_empty());
 
-    let server = TestServer::start_with(fresh_dir("watch"), on_lan("Den")).await;
+    let server = TestServer::start_with(fresh_dir("watch").await, on_lan("Den")).await;
     let id = server.server.id().to_string();
     // No polling: each change is the cue to list again.
     let listed = tokio::time::timeout(HEAR_WITHIN, async {

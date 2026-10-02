@@ -406,23 +406,29 @@ mod tests {
         }
     }
 
-    fn dir(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("spoolframe-artwork-{}", std::process::id()))
-            .join(test);
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// A directory of the test's own, removed when dropped, and the
+    /// cache's place in it, not made yet.
+    async fn dir(test: &str) -> (spoolframe_test_dir::TestDir, PathBuf) {
+        let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-artwork-{test}")).await;
+        let path = tmp.as_ref().join("cache");
+        (tmp, path)
     }
 
     fn id(n: u32) -> ArtworkId {
         ArtworkId::new(Namespace::Plex, format!("/library/metadata/{n}/thumb/1")).unwrap()
     }
 
-    fn cache(test: &str, limit: u64) -> (ArtworkCache, Arc<Counting>) {
+    /// The cache, its catalog, and its directory, kept for the test.
+    async fn cache(
+        test: &str,
+        limit: u64,
+    ) -> (ArtworkCache, Arc<Counting>, spoolframe_test_dir::TestDir) {
         let catalog = Arc::new(Counting::default());
+        let (tmp, path) = dir(test).await;
         (
-            ArtworkCache::open(&dir(test), limit, catalog.clone()).unwrap(),
+            ArtworkCache::open(&path, limit, catalog.clone()).unwrap(),
             catalog,
+            tmp,
         )
     }
 
@@ -432,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_request_is_served_from_the_cache() {
-        let (cache, catalog) = cache("hit", u64::MAX);
+        let (cache, catalog, _dir) = cache("hit", u64::MAX).await;
         let first = cache.get(&id(1), ArtworkSize::Original).await.unwrap();
         let second = cache.get(&id(1), ArtworkSize::Original).await.unwrap();
         assert_eq!(first, second);
@@ -441,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_requests_share_one_fetch() {
-        let (cache, catalog) = cache("single-flight", u64::MAX);
+        let (cache, catalog, _dir) = cache("single-flight", u64::MAX).await;
         let cache = Arc::new(cache);
         let tasks: Vec<_> = (0..8)
             .map(|_| {
@@ -457,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn sizes_are_made_from_one_fetch_of_the_original() {
-        let (cache, catalog) = cache("sizes", u64::MAX);
+        let (cache, catalog, _dir) = cache("sizes", u64::MAX).await;
         let small = cache.get(&id(1), ArtworkSize::Small).await.unwrap();
         let medium = cache.get(&id(1), ArtworkSize::Medium).await.unwrap();
         assert_eq!(fetches(&catalog), 1);
@@ -469,7 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_size_larger_than_the_original_is_not_scaled_up() {
-        let (cache, _) = cache("no-upscale", u64::MAX);
+        let (cache, _, _dir) = cache("no-upscale", u64::MAX).await;
         let large = cache.get(&id(1), ArtworkSize::Large).await.unwrap();
         assert_eq!(image::load_from_memory(&large.bytes).unwrap().width(), 800);
     }
@@ -478,7 +484,7 @@ mod tests {
     async fn the_cache_stays_under_its_limit_evicting_the_least_recently_used() {
         let one = png(800, 400).len() as u64;
         // Room for two originals.
-        let (cache, catalog) = cache("evict", one * 2 + one / 2);
+        let (cache, catalog, _dir) = cache("evict", one * 2 + one / 2).await;
         cache.get(&id(1), ArtworkSize::Original).await.unwrap();
         cache.get(&id(2), ArtworkSize::Original).await.unwrap();
         // Use 1 again, so 2 is the least recently used.
@@ -495,7 +501,7 @@ mod tests {
     #[tokio::test]
     async fn a_restart_keeps_what_is_on_disk() {
         let catalog = Arc::new(Counting::default());
-        let path = dir("restart");
+        let (_dir, path) = dir("restart").await;
         let first = ArtworkCache::open(&path, u64::MAX, catalog.clone()).unwrap();
         first.get(&id(1), ArtworkSize::Small).await.unwrap();
         drop(first);
@@ -507,7 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_image_is_not_cached_and_says_not_found() {
-        let (cache, catalog) = cache("missing", u64::MAX);
+        let (cache, catalog, _dir) = cache("missing", u64::MAX).await;
         let missing = ArtworkId::new(Namespace::Plex, "/library/metadata/1/thumb/404").unwrap();
         for _ in 0..2 {
             assert!(matches!(
@@ -521,7 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_size_is_refused() {
-        let (cache, catalog) = cache("bad-size", u64::MAX);
+        let (cache, catalog, _dir) = cache("bad-size", u64::MAX).await;
         assert!(matches!(
             cache.get(&id(1), ArtworkSize::Unknown).await,
             Err(ArtworkError::BadSize(_))

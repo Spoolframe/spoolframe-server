@@ -108,7 +108,7 @@ impl Store {
 mod tests {
     use spoolframe_types::{SubtitleMode, SubtitleRole};
 
-    use super::super::tests::state_dir;
+    use super::super::tests::test_store;
     use super::*;
     use crate::store::users::LocalUserId;
     use crate::tracks::SubtitleChoice;
@@ -118,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn preferences_are_per_principal_with_defaults() {
-        let store = Store::open(&state_dir("track-preferences")).await.unwrap();
+        let store = test_store("track-preferences").await;
         let mut always = TrackPreferences::default();
         always.subtitles.mode = SubtitleMode::Always;
         store.set_track_preferences(ALICE, &always).await.unwrap();
@@ -131,7 +131,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_override_is_kept_cleared_and_scoped() {
-        let store = Store::open(&state_dir("track-overrides")).await.unwrap();
+        let store = test_store("track-overrides").await;
         let sdh = TrackOverride {
             audio: None,
             subtitle: Some(SubtitleChoice::Track {

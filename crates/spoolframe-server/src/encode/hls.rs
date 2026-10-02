@@ -18,9 +18,9 @@
 
 use std::fmt::Write as _;
 
-use spoolframe_media::MediaDescriptor;
+use spoolframe_media::{MediaDescriptor, SubtitleStream};
 use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo};
-use spoolframe_types::{AudioCodec, VideoCodec};
+use spoolframe_types::{AudioCodec, VideoCodec, language};
 
 use super::args::SEGMENT_SECS;
 
@@ -76,14 +76,31 @@ impl Segments {
         self.starts_ms.get(n.checked_sub(1)? as usize).copied()
     }
 
+    /// Where segment `n` (from 1) ends.
+    pub fn end(&self, n: u32) -> Option<u64> {
+        self.start(n)?;
+        Some(self.start(n + 1).unwrap_or(self.total_ms))
+    }
+
     fn duration_ms(&self, i: usize) -> u64 {
         let end = self.starts_ms.get(i + 1).copied().unwrap_or(self.total_ms);
         end.saturating_sub(self.starts_ms[i])
     }
 
+    /// The subtitle rendition's playlist (P2-07): WebVTT segments on the
+    /// video's own cuts, so a cue is in the segment its picture is in.
+    /// URIs (`subs3.vtt`) map to `ReadSubtitleSegment { n: 3 }`.
+    pub fn subtitle_playlist(&self) -> String {
+        self.playlist(None, "subs", "vtt")
+    }
+
     /// The VOD media playlist. Segment URIs are relative names
     /// (`seg3.m4s`) that a client maps to a segment read.
     pub fn media_playlist(&self) -> String {
+        self.playlist(Some("init.mp4"), "seg", "m4s")
+    }
+
+    fn playlist(&self, init: Option<&str>, name: &str, extension: &str) -> String {
         let longest = (0..self.starts_ms.len())
             .map(|i| self.duration_ms(i))
             .max()
@@ -95,11 +112,13 @@ impl Segments {
             longest.div_ceil(1000).max(1)
         );
         text.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-        text.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
+        if let Some(init) = init {
+            let _ = writeln!(text, "#EXT-X-MAP:URI=\"{init}\"");
+        }
         for i in 0..self.starts_ms.len() {
             let _ = writeln!(
                 text,
-                "#EXTINF:{:.3},\nseg{}.m4s",
+                "#EXTINF:{:.3},\n{name}{}.{extension}",
                 self.duration_ms(i) as f64 / 1000.0,
                 i + 1
             );
@@ -109,11 +128,13 @@ impl Segments {
     }
 }
 
-/// The multivariant playlist: the one variant, described for the player.
+/// The multivariant playlist: the one variant, described for the player,
+/// with `subtitle` (the picked track) as its subtitle rendition.
 pub fn multivariant_playlist(
     descriptor: &MediaDescriptor,
     video: Option<ConvertedVideo>,
     audio: Option<ConvertedAudio>,
+    subtitle: Option<&SubtitleStream>,
 ) -> String {
     let mut codecs = Vec::new();
     let mut resolution = None;
@@ -148,17 +169,120 @@ pub fn multivariant_playlist(
         audio_bits = bitrate;
     }
     let mut text = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    if let Some(track) = subtitle {
+        let name = track
+            .title
+            .clone()
+            .or_else(|| track.language.clone())
+            .unwrap_or_else(|| "Subtitles".into())
+            .replace('"', "'");
+        let _ = write!(
+            text,
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",DEFAULT=YES,\
+             AUTOSELECT=YES,FORCED={},URI=\"subtitles.m3u8\"",
+            if track.forced { "YES" } else { "NO" }
+        );
+        if let Some(language) = &track.language {
+            let _ = write!(text, ",LANGUAGE=\"{}\"", language::bcp47(language));
+        }
+        text.push('\n');
+    }
     let _ = write!(
         text,
-        "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{}\"",
-        video_bits + audio_bits,
-        codecs.join(",")
+        "#EXT-X-STREAM-INF:BANDWIDTH={}",
+        video_bits + audio_bits
     );
+    // An empty CODECS is not valid HLS; none is.
+    if !codecs.is_empty() {
+        let _ = write!(text, ",CODECS=\"{}\"", codecs.join(","));
+    }
     if let Some((w, h)) = resolution {
         let _ = write!(text, ",RESOLUTION={w}x{h}");
     }
+    if subtitle.is_some() {
+        text.push_str(",SUBTITLES=\"subs\"");
+    }
     text.push_str("\nmedia.m3u8\n");
     text
+}
+
+/// The cues of WebVTT `vtt` that show during `start_ms..end_ms`, as one
+/// WebVTT segment. A cue across a cut is in both segments; players show it
+/// once. `X-TIMESTAMP-MAP` ties WebVTT time 0 to media time 0: the video
+/// keeps the film's own timestamps (P2-05), and so do the cues.
+pub fn subtitle_segment(vtt: &str, start_ms: u64, end_ms: u64) -> String {
+    let mut out = String::from("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n");
+    for cue in vtt_cues(vtt) {
+        if cue.start_ms < end_ms && cue.end_ms > start_ms {
+            let _ = write!(
+                out,
+                "{} --> {}\n{}\n\n",
+                vtt_time(cue.start_ms),
+                vtt_time(cue.end_ms),
+                cue.text
+            );
+        }
+    }
+    out
+}
+
+/// One WebVTT cue: its times and its text, settings dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VttCue {
+    start_ms: u64,
+    end_ms: u64,
+    text: String,
+}
+
+/// The cues of a WebVTT file, as ffmpeg and the OCR write them: blocks
+/// separated by blank lines, each with a timing line (`a --> b`, settings
+/// after), optionally an identifier before it, and text after. NOTE, STYLE
+/// and REGION blocks have no timing line and are skipped.
+fn vtt_cues(vtt: &str) -> Vec<VttCue> {
+    let normalized = vtt.replace("\r\n", "\n");
+    let mut cues = Vec::new();
+    for block in normalized.split("\n\n") {
+        let mut lines = block.lines().skip_while(|l| !l.contains("-->"));
+        let Some(timing) = lines.next() else {
+            continue;
+        };
+        let Some((start, rest)) = timing.split_once("-->") else {
+            continue;
+        };
+        let end = rest.split_whitespace().next().unwrap_or_default();
+        let (Some(start_ms), Some(end_ms)) = (parse_time(start.trim()), parse_time(end)) else {
+            continue;
+        };
+        let text = lines.collect::<Vec<_>>().join("\n");
+        if !text.trim().is_empty() {
+            cues.push(VttCue {
+                start_ms,
+                end_ms,
+                text,
+            });
+        }
+    }
+    cues
+}
+
+/// `hh:mm:ss.ttt` or `mm:ss.ttt`.
+fn parse_time(t: &str) -> Option<u64> {
+    let (clock, millis) = t.split_once('.')?;
+    let mut secs = 0u64;
+    for part in clock.split(':') {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(secs * 1000 + millis.parse::<u64>().ok()?)
+}
+
+fn vtt_time(ms: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1000 % 60,
+        ms % 1000
+    )
 }
 
 /// RFC 6381 names, as Apple's HLS spec wants them. The levels are the
@@ -257,5 +381,82 @@ mod tests {
         );
         assert_eq!(video_codec_string(VideoCodec::H264, 8, 720), "avc1.640028");
         assert_eq!(audio_codec_string(AudioCodec::Eac3), Some("ec-3"));
+    }
+
+    const VTT: &str = "WEBVTT\n\n\
+                       1\n00:09:58.000 --> 00:10:01.500 line:90%\nAt ten minutes\n\n\
+                       NOTE a comment, not a cue\n\n\
+                       10:05.000 --> 10:06.000\nFive seconds after\n\n";
+
+    #[test]
+    fn a_cue_is_in_the_segment_that_holds_its_time() {
+        let grid = Segments::grid(7_200_000);
+        // 10:00 is the start of segment 101 (6 s each, from 1).
+        assert_eq!(grid.start(101), Some(600_000));
+        let at_ten = subtitle_segment(VTT, 600_000, grid.end(101).unwrap());
+        assert!(at_ten.starts_with("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n"));
+        assert!(
+            at_ten.contains("00:09:58.000 --> 00:10:01.500\nAt ten minutes"),
+            "{at_ten}"
+        );
+        assert!(
+            at_ten.contains("00:10:05.000 --> 00:10:06.000\nFive seconds after"),
+            "{at_ten}"
+        );
+        // Across the cut at 10:00, the first cue is in the segment before
+        // too; neither is in the one after.
+        let before = subtitle_segment(VTT, 594_000, 600_000);
+        assert!(before.contains("At ten minutes") && !before.contains("Five seconds"));
+        let after = subtitle_segment(VTT, 606_000, 612_000);
+        assert!(!after.contains("-->"), "{after}");
+    }
+
+    #[test]
+    fn the_subtitle_playlist_is_on_the_video_s_cuts() {
+        let s = Segments::at_keyframes(&[2000, 4000, 9000], 10_000);
+        let subs = s.subtitle_playlist();
+        assert!(!subs.contains("EXT-X-MAP"), "{subs}");
+        match m3u8_rs::parse_playlist_res(subs.as_bytes()).unwrap() {
+            m3u8_rs::Playlist::MediaPlaylist(p) => {
+                let uris: Vec<_> = p.segments.iter().map(|s| s.uri.as_str()).collect();
+                assert_eq!(uris, ["subs1.vtt", "subs2.vtt", "subs3.vtt", "subs4.vtt"]);
+                let durations: Vec<_> = p.segments.iter().map(|s| s.duration).collect();
+                assert_eq!(durations, [2.0, 2.0, 5.0, 1.0]);
+            }
+            other => panic!("not a media playlist: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_multivariant_playlist_names_the_subtitle_rendition() {
+        let descriptor = MediaDescriptor {
+            container: "matroska,webm".into(),
+            duration: None,
+            bit_rate: None,
+            video: None,
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        };
+        let track = SubtitleStream {
+            source: spoolframe_media::SubtitleSource::Embedded { index: 3 },
+            codec: "subrip".into(),
+            kind: spoolframe_media::SubtitleKind::Text,
+            language: Some("eng".into()),
+            title: None,
+            forced: false,
+            default: false,
+            role: spoolframe_types::SubtitleRole::Full,
+        };
+        let text = multivariant_playlist(&descriptor, None, None, Some(&track));
+        match m3u8_rs::parse_playlist_res(text.as_bytes()).unwrap() {
+            m3u8_rs::Playlist::MasterPlaylist(p) => {
+                let subs = &p.alternatives[0];
+                assert_eq!(subs.media_type, m3u8_rs::AlternativeMediaType::Subtitles);
+                assert_eq!(subs.language.as_deref(), Some("en"));
+                assert_eq!(subs.uri.as_deref(), Some("subtitles.m3u8"));
+                assert_eq!(p.variants[0].subtitles.as_deref(), Some("subs"));
+            }
+            other => panic!("not a multivariant playlist: {other:?}"),
+        }
     }
 }
