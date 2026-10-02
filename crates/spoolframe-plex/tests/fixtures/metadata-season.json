@@ -18,7 +18,12 @@
         "viewCount": 14,
         "thumb": "/library/metadata/208619/thumb/1720224131",
         "art": "/library/metadata/208618/art/1789149282",
-        "addedAt": 1720224129
+        "addedAt": 1720224129,
+        "Guid": [
+          {
+            "id": "tvdb://591220"
+          }
+        ]
       }
     ]
   }

@@ -8,3 +8,12 @@ repository.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+ciborium = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+spoolframe-types = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

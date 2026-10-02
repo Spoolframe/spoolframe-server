@@ -11,7 +11,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use spoolframe_types::{Item, Library, LibraryId, MediaId};
+use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId};
 
 /// Which slice of a library to list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,11 @@ pub struct ItemPage {
 pub struct ItemWithChildren {
     pub item: Item,
     pub children: Vec<Item>,
+    /// The item's stable identities outside this catalog's own keys
+    /// (`plex://movie/…`, `imdb://tt…`, `tmdb://…`). Server side only:
+    /// watch state is re-linked through them when an item's `MediaId`
+    /// changes (a Plex rebuild, or the move to a native catalog).
+    pub external_ids: Vec<String>,
 }
 
 /// Why a catalog call failed. A catalog never answers a failure with an
@@ -121,6 +126,30 @@ pub trait Catalog: Send + Sync {
     /// The local path of the item's media file: what the catalog reports,
     /// mapped to this host, and checked to be a readable file.
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError>;
+
+    /// The most recently added items, newest first, at most `limit`.
+    async fn recently_added(&self, limit: u32) -> Result<Vec<Item>, CatalogError>;
+
+    /// The image an `ArtworkId` names, at the size the catalog has it.
+    /// Never anything but an image.
+    async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError>;
+}
+
+/// An image and its media type.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Image {
+    pub bytes: Vec<u8>,
+    /// e.g. `image/jpeg`.
+    pub content_type: String,
+}
+
+impl fmt::Debug for Image {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Image")
+            .field("content_type", &self.content_type)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@
 //! planner works from. [`MediaDescriptor::tracks`] is the part a client
 //! sees.
 
+pub mod codecs;
 mod descriptor;
 mod external;
 mod probe;

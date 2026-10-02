@@ -1,0 +1,54 @@
+{
+  "MediaContainer": {
+    "size": 3,
+    "totalSize": 50,
+    "offset": 0,
+    "Metadata": [
+      {
+        "librarySectionID": 1,
+        "ratingKey": "229399",
+        "key": "/library/metadata/229399/children",
+        "parentRatingKey": "227652",
+        "guid": "plex://season/602e67b6b2c087002d0c6c2b",
+        "type": "season",
+        "title": "Season 2",
+        "summary": "",
+        "index": 2,
+        "parentIndex": 1,
+        "thumb": "/library/metadata/229399/thumb/1790839617",
+        "art": "/library/metadata/227652/art/1790247730",
+        "addedAt": 1790839616
+      },
+      {
+        "librarySectionID": 1,
+        "ratingKey": "229386",
+        "key": "/library/metadata/229386/children",
+        "parentRatingKey": "229297",
+        "guid": "plex://season/602e59e3c4f5e6002c24448d",
+        "type": "season",
+        "title": "Season 5",
+        "summary": "",
+        "index": 5,
+        "parentIndex": 1,
+        "thumb": "/library/metadata/229386/thumb/1790567709",
+        "art": "/library/metadata/229297/art/1790564510",
+        "addedAt": 1790567708
+      },
+      {
+        "librarySectionID": 1,
+        "ratingKey": "229370",
+        "key": "/library/metadata/229370/children",
+        "parentRatingKey": "229297",
+        "guid": "plex://season/602e59e3c4f5e6002c24448b",
+        "type": "season",
+        "title": "Season 4",
+        "summary": "",
+        "index": 4,
+        "parentIndex": 1,
+        "thumb": "/library/metadata/229370/thumb/1790567624",
+        "art": "/library/metadata/229297/art/1790564510",
+        "addedAt": 1790567623
+      }
+    ]
+  }
+}

@@ -2,16 +2,25 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
 use spoolframe_plex::{Failures, LibraryPaths, PlexCatalog, Scope};
+use spoolframe_server::admin::{self, SetupCode};
+use spoolframe_server::artwork::ArtworkCache;
+use spoolframe_server::auth::Auth;
 use spoolframe_server::config::ServerConfig;
 use spoolframe_server::identity;
-use spoolframe_server::network::Server;
+use spoolframe_server::network::{Server, Services};
+use spoolframe_server::store::Store;
+use spoolframe_server::watch::Watch;
 use spoolframe_types::MediaId;
 use tracing_subscriber::EnvFilter;
+
+mod admin_cli;
+
+use admin_cli::UserCommand;
 
 /// How many items per library the startup check samples.
 const STARTUP_SAMPLE: u32 = 5;
@@ -49,6 +58,25 @@ enum Command {
     /// Print the server's EndpointId, the identity clients pin. Creates the
     /// server key if this is the first start.
     Id,
+    /// Register the first admin on a server that has no users yet. The
+    /// server must be running.
+    Setup {
+        /// The setup code from the server's log; prompted for if left out.
+        #[arg(long)]
+        code: Option<String>,
+        /// Prompted for if left out.
+        #[arg(long)]
+        username: Option<String>,
+        /// Read the password from standard input instead of prompting.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Manage users through the running server's admin API, logged in as an
+    /// admin.
+    User {
+        #[command(subcommand)]
+        command: UserCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -100,6 +128,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => run(&config).await,
+        Some(Command::Setup {
+            code,
+            username,
+            password_stdin,
+        }) => admin_cli::setup(config.admin.listen()?, code, username, password_stdin).await,
+        Some(Command::User { command }) => admin_cli::user(config.admin.listen()?, command).await,
         Some(Command::Id) => {
             println!("{}", identity::load_or_create(&config.state_dir)?.public());
             Ok(())
@@ -133,14 +167,59 @@ async fn run(config: &ServerConfig) -> Result<()> {
     let plex = Arc::new(plex(config)?);
     let catalog: Arc<dyn Catalog> = plex.clone();
     check_catalog(&plex, catalog.as_ref()).await;
+    let prober = Arc::new(Prober::new("ffprobe", Prober::DEFAULT_TIMEOUT));
+    let artwork_dir = config.state_dir.join("cache").join("artwork");
+    let artwork = Arc::new(
+        ArtworkCache::open(&artwork_dir, config.artwork.cache_bytes(), catalog.clone())
+            .with_context(|| format!("cannot open the artwork cache {}", artwork_dir.display()))?,
+    );
 
-    let server = Server::start(key, &config.network.endpoint_options()?).await?;
+    let store = Store::open(&config.state_dir).await?;
+    let auth = Auth::new(store);
+    let watch = Arc::new(Watch::new(
+        auth.store().clone(),
+        catalog.clone(),
+        prober.clone(),
+        config.watch.rules()?,
+    ));
+    let admin_listen = config.admin.listen()?;
+    // Only a server with no users offers setup, and only to someone who
+    // can read this log.
+    let setup_code = if auth.store().user_count().await? == 0 {
+        let code = SetupCode::generate();
+        tracing::warn!(
+            "no users yet: register the first admin with `spoolframe-server setup`; the setup code is {code}"
+        );
+        Some(code)
+    } else {
+        None
+    };
+    let (admin_addr, admin) = admin::serve(admin_listen, auth.clone(), setup_code)
+        .await
+        .with_context(|| format!("cannot start the admin API on {admin_listen}"))?;
+    tracing::info!(addr = %admin_addr, "admin API listening");
+    let server = Server::start(
+        key,
+        &config.network.endpoint_options()?,
+        config.server_name(),
+        Services {
+            auth,
+            catalog,
+            prober,
+            artwork,
+            playbacks: Arc::default(),
+            watch,
+        },
+    )
+    .await?;
     let addrs: Vec<_> = server.addr().ip_addrs().map(ToString::to_string).collect();
     tracing::info!(endpoint_id = %server.id(), ?addrs, "listening");
 
     shutdown_signal().await?;
     tracing::info!("shutting down");
     server.shutdown().await;
+    let _ = admin.stop();
+    admin.stopped().await;
     Ok(())
 }
 

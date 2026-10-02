@@ -1,0 +1,16 @@
+[package]
+name = "spoolframe-admin-api"
+description = "The Spoolframe server's admin JSON-RPC API: types and the jsonrpsee trait."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-or-later"
+
+[features]
+client = ["jsonrpsee/client-core"]
+server = ["jsonrpsee/server"]
+
+[dependencies]
+jsonrpsee = { workspace = true, features = ["macros"] }
+serde = { workspace = true }

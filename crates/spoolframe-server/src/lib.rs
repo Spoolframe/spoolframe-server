@@ -4,6 +4,15 @@
 //! AGPL-3.0-or-later. Clients reach it only over the protocol; they never
 //! link this crate.
 
+pub mod admin;
+pub mod artwork;
+pub mod auth;
+mod client;
 pub mod config;
 pub mod identity;
 pub mod network;
+pub mod planner;
+pub mod playback;
+pub mod principal;
+pub mod store;
+pub mod watch;

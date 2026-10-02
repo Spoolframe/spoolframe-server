@@ -94,7 +94,13 @@ async fn every_library_walks_down_to_a_playable_item() {
         };
         assert!(page.total >= 1, "{}", library.title);
         match (library.kind, top) {
-            (LibraryKind::Movies, Item::Movie(movie)) => assert_playable(&catalog, &movie.id).await,
+            (LibraryKind::Movies, Item::Movie(movie)) => {
+                assert_playable(&catalog, &movie.id).await;
+                if let Some(poster) = movie.artwork.first() {
+                    let image = catalog.artwork(&poster.id).await.unwrap();
+                    assert!(image.content_type.starts_with("image/"), "{image:?}");
+                }
+            }
             (LibraryKind::Shows, Item::Show(show)) => {
                 let season = first_child(&catalog, &show.id, MediaKind::Season).await;
                 let episode = first_child(&catalog, &season, MediaKind::Episode).await;

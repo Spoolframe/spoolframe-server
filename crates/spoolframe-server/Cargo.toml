@@ -12,8 +12,17 @@ name = "spoolframe-server"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 anyhow = { workspace = true }
+argon2 = { workspace = true }
+blake3 = { workspace = true }
+password-hash = { workspace = true }
 clap = { workspace = true }
+image = { workspace = true }
+jsonrpsee = { workspace = true, features = ["server", "ws-client"] }
+rpassword = { workspace = true }
+spoolframe-admin-api = { workspace = true, features = ["server", "client"] }
+tower = { workspace = true }
 serde_json = { workspace = true }
 spoolframe-catalog = { workspace = true }
 spoolframe-media = { workspace = true }
@@ -21,6 +30,7 @@ spoolframe-plex = { workspace = true }
 spoolframe-protocol = { workspace = true }
 iroh = { workspace = true }
 spoolframe-types = { workspace = true }
+sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -30,3 +40,4 @@ url = { workspace = true }
 
 [dev-dependencies]
 cargo_metadata = { workspace = true }
+serde = { workspace = true }

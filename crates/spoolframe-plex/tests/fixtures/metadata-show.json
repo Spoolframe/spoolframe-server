@@ -18,7 +18,18 @@
         "thumb": "/library/metadata/208618/thumb/1789149282",
         "art": "/library/metadata/208618/art/1789149282",
         "duration": 2580000,
-        "addedAt": 1720224129
+        "addedAt": 1720224129,
+        "Guid": [
+          {
+            "id": "imdb://tt3148266"
+          },
+          {
+            "id": "tmdb://60948"
+          },
+          {
+            "id": "tvdb://272644"
+          }
+        ]
       }
     ]
   }

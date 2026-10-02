@@ -3,6 +3,25 @@
 //!
 //! Permissively licensed (MIT OR Apache-2.0); it is the boundary that
 //! proprietary clients talk across, so it never depends on an AGPL crate.
+//!
+//! One connection carries many QUIC streams ([`streams`]). Every message
+//! is a length-prefixed CBOR frame ([`codec`]); the messages are in
+//! [`messages`].
+
+pub mod artwork;
+pub mod codec;
+pub mod media;
+pub mod messages;
+pub mod playback;
+pub mod streams;
+
+pub use artwork::{ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
+pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle};
+pub use messages::{
+    AuthMethod, Error, Event, Hello, HomeScreen, LoginPassword, PROTOCOL_VERSION, Reply, Request,
+    RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
+};
+pub use playback::{PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleDelivery};
 
 /// The ALPN of the client protocol, version 1. A breaking change to the
 /// protocol is a new ALPN, so old and new clients can be served side by

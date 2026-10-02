@@ -22,6 +22,7 @@ spoolframe-catalog = { path = "crates/spoolframe-catalog" }
 spoolframe-plex = { path = "crates/spoolframe-plex" }
 spoolframe-media = { path = "crates/spoolframe-media" }
 spoolframe-protocol = { path = "crates/spoolframe-protocol" }
+spoolframe-admin-api = { path = "crates/spoolframe-admin-api" }
 
 # Vendored (vendor/easy-ffprobe/VENDORED.md). Only the typed model of
 # ffprobe's JSON is used.
@@ -30,12 +31,34 @@ easy-ffprobe = { path = "vendor/easy-ffprobe", default-features = false, feature
 # Async. `async-trait` because the server holds the catalog as `dyn Catalog`,
 # and native async trait methods are not object-safe.
 async-trait = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "signal", "io-util"] }
 
 # Transport and endpoint identity (ARCHITECTURE §11). No default features:
 # ring for TLS, and no portmapper (UPnP/NAT-PMP) or metrics while Phase 1
 # is LAN only.
 iroh = { version = "1.3", default-features = false, features = ["tls-ring"] }
+
+# The server database: SQLite through sqlx, with its migrator. Runtime
+# queries only; `macros` is for `migrate!`, which embeds the migrations.
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
+
+# Passwords (Argon2id, PHC strings) and session-token hashes.
+argon2 = "0.5"
+# Only for its `getrandom` feature: OsRng for salts and session tokens.
+password-hash = { version = "0.5", features = ["getrandom"] }
+blake3 = "1"
+
+# The admin API: JSON-RPC over WebSocket, as the other foundry services
+# serve theirs. Crates opt into server/client features.
+jsonrpsee = { version = "0.25", default-features = false }
+# Admin CLI password prompts.
+rpassword = "7"
+# Only for the admin API's HTTP middleware traits.
+tower = "0.5"
+
+# Artwork resizing (P1-05). Decoders for what PMS serves, the JPEG and PNG
+# encoders the cache writes; nothing else.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # HTTP, for the PMS API. rustls, so the build needs no OpenSSL.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -48,6 +71,12 @@ clap = { version = "4", features = ["derive", "env"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The client wire encoding (spoolframe-protocol): self-describing, so peers
+# skip fields and variants they do not know. See the P1-10 commit.
+ciborium = "0.2"
+# Byte strings as CBOR byte strings, not arrays of integers.
+serde_bytes = "0.11"
 
 # Serialization. The client wire codec is P1-10's choice; serde_json here
 # is for tests and for reading the PMS API.

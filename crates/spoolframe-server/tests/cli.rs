@@ -1,7 +1,8 @@
 //! The binary as an operator runs it.
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Child, Command, Output, Stdio};
 
 fn server() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_spoolframe-server"));
@@ -28,6 +29,7 @@ fn config_file(name: &str, body: &str) -> std::path::PathBuf {
 }
 
 /// A config for a server whose state lives in its own tmp dir.
+/// Its admin API is on a port of its own, so test servers never share one.
 fn config_with_state(name: &str, plex_url: &str) -> std::path::PathBuf {
     let state = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-state"));
     let _ = std::fs::remove_dir_all(&state);
@@ -38,60 +40,183 @@ fn config_with_state(name: &str, plex_url: &str) -> std::path::PathBuf {
             schema = "spoolframe.server.v1";
             state_dir = "{}";
             plex {{ url = "{plex_url}"; }}
+            admin {{ listen = "127.0.0.1:{}"; }}
             "#,
-            state.display()
+            state.display(),
+            free_port()
         ),
     )
 }
 
-/// A port that was just free: nothing is listening on it.
-fn closed_port_url() -> String {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
+/// A port that was just free.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
-        .port();
-    format!("http://127.0.0.1:{port}")
+        .port()
+}
+
+/// A port that was just free: nothing is listening on it.
+fn closed_port_url() -> String {
+    format!("http://127.0.0.1:{}", free_port())
+}
+
+/// A running server, stopped with SIGTERM when dropped.
+struct Running(Child);
+
+impl Running {
+    /// Start a server and wait until both its endpoint and admin API are
+    /// up. Returns the log so far.
+    fn start(config: &Path) -> (Self, String) {
+        let mut child = server()
+            .arg("--config")
+            .arg(config)
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the binary runs");
+        let stderr = child.stderr.take().unwrap();
+        let mut log = String::new();
+        let mut lines = BufReader::new(stderr).lines();
+        for line in lines.by_ref() {
+            let line = line.unwrap();
+            log.push_str(&line);
+            log.push('\n');
+            if line.contains("listening") && line.contains("endpoint_id") {
+                break;
+            }
+        }
+        // Keep draining so the server never blocks on a full pipe.
+        std::thread::spawn(move || lines.for_each(drop));
+        (Self(child), log)
+    }
+
+    fn stop(mut self) -> std::process::ExitStatus {
+        let killed = Command::new("kill")
+            .args(["-TERM", &self.0.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        self.0.wait().unwrap()
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
 }
 
 #[test]
 fn an_unreachable_plex_is_reported_and_the_server_keeps_running() {
     let url = closed_port_url();
     let config = config_with_state("unreachable-plex", &url);
-    let mut child = server()
-        .arg("--config")
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the binary runs");
-
-    // Read the log until the endpoint is up; the Plex warning comes first.
-    let mut log = String::new();
-    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
-    for line in lines.by_ref() {
-        let line = line.unwrap();
-        log.push_str(&line);
-        log.push('\n');
-        if line.contains("listening") {
-            break;
-        }
-    }
+    let (running, log) = Running::start(&config);
     assert!(log.contains("Plex catalog unavailable"), "{log}");
     assert!(log.contains(&url), "{log}");
-    assert!(log.contains("listening"), "{log}");
-
+    assert!(log.contains("admin API listening"), "{log}");
     // SIGTERM is a clean stop, not a failure.
-    let killed = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
+    assert!(running.stop().success());
+}
+
+/// The setup code a fresh server printed in its log.
+fn setup_code(log: &str) -> String {
+    let marker = "the setup code is ";
+    let start = log
+        .find(marker)
+        .unwrap_or_else(|| panic!("no setup code in: {log}"))
+        + marker.len();
+    log[start..start + 14].to_owned()
+}
+
+/// Run a CLI command against `config`, with `stdin` and environment.
+fn cli(config: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
+    let mut child = server()
+        .arg("--config")
+        .arg(config)
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(killed.success());
-    let status = child.wait().unwrap();
-    for line in lines {
-        log.push_str(&line.unwrap());
-    }
-    assert!(status.success(), "{status:?}\n{log}");
-    assert!(log.contains("shutting down"), "{log}");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn setup_then_manage_users_from_the_cli() {
+    let config = config_with_state("cli-users", &closed_port_url());
+    let (running, log) = Running::start(&config);
+    let code = setup_code(&log);
+    let admin = [
+        ("SPOOLFRAME_ADMIN_USER", "root"),
+        ("SPOOLFRAME_ADMIN_PASSWORD", "correct horse"),
+    ];
+
+    let out = cli(
+        &config,
+        &[
+            "setup",
+            "--code",
+            &code,
+            "--username",
+            "root",
+            "--password-stdin",
+        ],
+        "correct horse\n",
+        &[],
+    );
+    assert!(out.status.success(), "{out:?}");
+
+    let out = cli(
+        &config,
+        &["user", "add", "alice", "--password-stdin"],
+        "battery staple\n",
+        &admin,
+    );
+    assert!(out.status.success(), "{out:?}");
+
+    let out = cli(&config, &["user", "list"], "", &admin);
+    assert!(out.status.success(), "{out:?}");
+    let listed = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(listed, "alice\nroot (admin)\n");
+
+    let out = cli(
+        &config,
+        &["user", "list"],
+        "",
+        &[
+            ("SPOOLFRAME_ADMIN_USER", "root"),
+            ("SPOOLFRAME_ADMIN_PASSWORD", "wrong"),
+        ],
+    );
+    assert!(!out.status.success(), "{out:?}");
+
+    running.stop();
+}
+
+#[test]
+fn the_cli_says_when_the_server_is_not_running() {
+    let config = config_with_state("cli-no-server", &closed_port_url());
+    let out = cli(
+        &config,
+        &["user", "list"],
+        "",
+        &[
+            ("SPOOLFRAME_ADMIN_USER", "root"),
+            ("SPOOLFRAME_ADMIN_PASSWORD", "x"),
+        ],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("is the server running?"), "{stderr}");
 }
 
 #[test]

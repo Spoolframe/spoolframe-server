@@ -52,6 +52,11 @@ pub fn library(dir: &Directory) -> Result<Option<Library>, ConvertError> {
     }))
 }
 
+/// Whether Spoolframe models items of Plex `type` `kind`.
+pub fn is_modelled(kind: &str) -> bool {
+    media_kind(kind).is_some()
+}
+
 /// Plex's name for a media kind, as in the `type` field.
 fn media_kind(plex: &str) -> Option<MediaKind> {
     Some(match plex {
@@ -151,6 +156,18 @@ pub fn search_results(hubs: &[Hub]) -> Result<Vec<Item>, ConvertError> {
         .flat_map(|h| &h.metadata)
         .filter(|m| media_kind(&m.kind).is_some())
         .map(item)
+        .collect()
+}
+
+/// The item's stable ids: Plex's guid, then the other agents'. Local-only
+/// guids (`local://…`, from items Plex could not match) are not stable
+/// across a rebuild and are left out.
+pub fn external_ids(m: &Metadata) -> Vec<String> {
+    m.guid
+        .iter()
+        .chain(m.guids.iter().map(|g| &g.id))
+        .filter(|id| !id.starts_with("local://"))
+        .cloned()
         .collect()
 }
 
@@ -401,6 +418,19 @@ mod tests {
                 assert_eq!(item(m).unwrap().id().kind(), kind, "{name}");
             }
         }
+    }
+
+    #[test]
+    fn external_ids_are_plex_s_guid_and_the_agents() {
+        assert_eq!(
+            external_ids(&fixture("metadata-movie").metadata[0]),
+            [
+                "plex://movie/5d776c85fb0d55001f589f07",
+                "imdb://tt5503688",
+                "tmdb://423087",
+                "tvdb://4670"
+            ]
+        );
     }
 
     #[test]

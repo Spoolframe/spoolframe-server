@@ -12,7 +12,16 @@ use std::sync::{Arc, Mutex};
 use iroh::endpoint::{Connection, VarInt, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
-use spoolframe_protocol::{CLIENT_ALPN, FEDERATION_ALPN, close};
+use spoolframe_protocol::{CLIENT_ALPN, FEDERATION_ALPN, PROTOCOL_VERSION, ServerInfo, close};
+
+use spoolframe_catalog::Catalog;
+use spoolframe_media::Prober;
+
+use crate::artwork::ArtworkCache;
+use crate::auth::Auth;
+use crate::client::{self, ClientProtocol};
+use crate::playback::Playbacks;
+use crate::watch::Watch;
 use url::Url;
 
 /// Which relays the endpoint uses to reach peers it cannot dial directly.
@@ -61,12 +70,37 @@ impl Connections {
     pub fn snapshot(&self) -> Vec<ConnectionAuth> {
         self.lock().values().cloned().collect()
     }
+
+    pub(crate) fn insert(&self, id: usize, auth: ConnectionAuth) {
+        self.lock().insert(id, auth);
+    }
+
+    pub(crate) fn remove(&self, id: usize) {
+        self.lock().remove(&id);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetworkError {
     #[error("cannot bind the endpoint on port {port:?}: {message}")]
     Bind { port: Option<u16>, message: String },
+}
+
+/// What the client protocol serves from.
+#[derive(Clone)]
+pub struct Services {
+    pub auth: Auth,
+    pub catalog: Arc<dyn Catalog>,
+    pub prober: Arc<Prober>,
+    pub artwork: Arc<ArtworkCache>,
+    pub playbacks: Arc<Playbacks>,
+    pub watch: Arc<Watch>,
+}
+
+impl std::fmt::Debug for Services {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Services").finish_non_exhaustive()
+    }
 }
 
 /// The running endpoint.
@@ -77,8 +111,14 @@ pub struct Server {
 }
 
 impl Server {
-    /// Bind the endpoint with `key` and start accepting connections.
-    pub async fn start(key: SecretKey, options: &EndpointOptions) -> Result<Self, NetworkError> {
+    /// Bind the endpoint with `key` and start accepting connections, as
+    /// the server called `name`.
+    pub async fn start(
+        key: SecretKey,
+        options: &EndpointOptions,
+        name: &str,
+        services: Services,
+    ) -> Result<Self, NetworkError> {
         let relay = match &options.relay {
             Relay::Disabled => RelayMode::Disabled,
             Relay::Default => RelayMode::Default,
@@ -107,14 +147,19 @@ impl Server {
             .await
             .map_err(|e| bind_failed(e.to_string()))?;
 
+        let info = ServerInfo {
+            name: name.to_owned(),
+            endpoint_id: endpoint.id().to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            auth_methods: client::auth_methods(),
+        };
         let connections = Connections::default();
         // Unknown ALPNs never get this far: the TLS handshake refuses them.
         let router = Router::builder(endpoint)
             .accept(
                 CLIENT_ALPN,
-                ClientProtocol {
-                    connections: connections.clone(),
-                },
+                ClientProtocol::new(connections.clone(), info, services),
             )
             .accept(FEDERATION_ALPN, Unsupported("spoolframe/federation/1"))
             .spawn();
@@ -143,28 +188,6 @@ impl Server {
         if let Err(e) = self.router.shutdown().await {
             tracing::warn!(error = %e, "endpoint shutdown");
         }
-    }
-}
-
-/// `spoolframe/client/1`. Until the protocol exists (P1-10) a connection is
-/// recorded and held open until the client closes it.
-#[derive(Debug, Clone)]
-struct ClientProtocol {
-    connections: Connections,
-}
-
-impl ProtocolHandler for ClientProtocol {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let id = connection.stable_id();
-        let auth = ConnectionAuth::Anonymous {
-            endpoint: connection.remote_id(),
-        };
-        tracing::info!(?auth, "client connected");
-        self.connections.lock().insert(id, auth.clone());
-        let reason = connection.closed().await;
-        self.connections.lock().remove(&id);
-        tracing::info!(?auth, %reason, "client disconnected");
-        Ok(())
     }
 }
 

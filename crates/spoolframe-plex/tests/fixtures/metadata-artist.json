@@ -15,7 +15,12 @@
         "index": 1,
         "thumb": "/library/metadata/222392/thumb/1790331023",
         "art": "/library/metadata/222392/art/1790331023",
-        "addedAt": 1758693234
+        "addedAt": 1758693234,
+        "Guid": [
+          {
+            "id": "mbid://c98d40fd-f6cf-4b26-883e-eaa515ee2851"
+          }
+        ]
       }
     ]
   }

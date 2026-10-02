@@ -4,11 +4,14 @@
 //! a misspelt or duplicated setting fails at startup instead of being
 //! quietly ignored.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use spoolframe_plex::{PathMap, PathMapping};
 
 use crate::network::{EndpointOptions, Relay};
+use crate::watch::WatchRules;
+use std::time::Duration;
 use uclicious::Uclicious;
 use url::Url;
 
@@ -50,6 +53,9 @@ pub enum ConfigError {
 pub struct ServerConfig {
     /// Schema discriminator; must be `spoolframe.server.v1`.
     pub schema: String,
+    /// What clients show for this server; "Spoolframe" if left out.
+    #[ucl(default)]
+    pub name: Option<String>,
     /// Where the server keeps its state: its endpoint key, its database
     /// and its caches.
     pub state_dir: PathBuf,
@@ -58,6 +64,109 @@ pub struct ServerConfig {
     /// The Iroh endpoint clients connect to.
     #[ucl(default)]
     pub network: NetworkConfig,
+    /// The admin API (JSON-RPC over WebSocket) the CLI and web UI use.
+    #[ucl(default)]
+    pub admin: AdminConfig,
+    /// The artwork cache.
+    #[ucl(default)]
+    pub artwork: ArtworkConfig,
+    /// When an item counts as started and watched.
+    #[ucl(default)]
+    pub watch: WatchConfig,
+}
+
+/// `watch { started_after_secs = 60; watched_percent = 90;
+/// watched_remaining_secs = 300; }`, all optional.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct WatchConfig {
+    #[ucl(default)]
+    pub started_after_secs: Option<u64>,
+    #[ucl(default)]
+    pub watched_percent: Option<u64>,
+    #[ucl(default)]
+    pub watched_remaining_secs: Option<u64>,
+}
+
+impl WatchConfig {
+    /// The rules, defaults filled in.
+    pub fn rules(&self) -> Result<WatchRules, ConfigError> {
+        let defaults = WatchRules::default();
+        let percent = self.watched_percent.unwrap_or(90);
+        if !(1..=100).contains(&percent) {
+            return Err(ConfigError::Invalid {
+                key: "watch.watched_percent",
+                message: format!("{percent} is not between 1 and 100"),
+            });
+        }
+        Ok(WatchRules {
+            started_after: self
+                .started_after_secs
+                .map_or(defaults.started_after, Duration::from_secs),
+            watched_fraction: percent as f64 / 100.0,
+            watched_remaining: self
+                .watched_remaining_secs
+                .map_or(defaults.watched_remaining, Duration::from_secs),
+            ..defaults
+        })
+    }
+}
+
+/// `artwork { cache_mb = 1024; }`, optional.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct ArtworkConfig {
+    /// The most the cache under `state_dir/cache/artwork` may hold, in
+    /// MiB; 1024 if left out.
+    #[ucl(default)]
+    pub cache_mb: Option<u64>,
+}
+
+impl ArtworkConfig {
+    pub const DEFAULT_CACHE_MB: u64 = 1024;
+
+    /// The cache limit in bytes.
+    pub fn cache_bytes(&self) -> u64 {
+        self.cache_mb.unwrap_or(Self::DEFAULT_CACHE_MB) << 20
+    }
+}
+
+/// `admin { listen = "127.0.0.1:7421"; allow_remote = false; }`, all
+/// optional.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Where the admin API listens; `127.0.0.1:7421` if left out.
+    #[ucl(default)]
+    pub listen: Option<String>,
+    /// Allow a non-loopback `listen`. Passwords and tokens cross the API
+    /// in clear, so only behind a TLS reverse proxy.
+    #[ucl(default)]
+    pub allow_remote: Option<bool>,
+}
+
+impl AdminConfig {
+    pub const DEFAULT_LISTEN: &'static str = "127.0.0.1:7421";
+
+    /// The address to listen on, refused if it is not loopback and
+    /// `allow_remote` is not set.
+    pub fn listen(&self) -> Result<SocketAddr, ConfigError> {
+        let text = self.listen.as_deref().unwrap_or(Self::DEFAULT_LISTEN);
+        let addr: SocketAddr = text.parse().map_err(|e| ConfigError::Invalid {
+            key: "admin.listen",
+            message: format!("{text:?}: {e}"),
+        })?;
+        if !addr.ip().is_loopback() && !self.allow_remote.unwrap_or(false) {
+            return Err(ConfigError::Invalid {
+                key: "admin.listen",
+                message: format!(
+                    "{addr} is not a loopback address; passwords cross the admin API \
+                     in clear, so put it behind a TLS proxy and set allow_remote = true"
+                ),
+            });
+        }
+        Ok(addr)
+    }
 }
 
 /// `network { port = 7420; relay = "disabled"; }`, all optional.
@@ -192,6 +301,11 @@ impl PlexConfig {
 }
 
 impl ServerConfig {
+    /// The server's display name.
+    pub fn server_name(&self) -> &str {
+        self.name.as_deref().unwrap_or("Spoolframe")
+    }
+
     /// The `schema` value this type accepts.
     pub const SCHEMA: &'static str = "spoolframe.server.v1";
 
@@ -218,6 +332,8 @@ impl ServerConfig {
         parsed.plex.url()?;
         parsed.plex.path_map()?;
         parsed.network.endpoint_options()?;
+        parsed.admin.listen()?;
+        parsed.watch.rules()?;
         Ok(parsed)
     }
 
@@ -408,6 +524,67 @@ mod tests {
                 "{relay}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_admin_api_listens_on_loopback_by_default() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(
+            config.admin.listen().unwrap(),
+            AdminConfig::DEFAULT_LISTEN.parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_non_loopback_admin_address_needs_allow_remote() {
+        let err = plex(r#"plex { url = "http://nas:32400"; } admin { listen = "0.0.0.0:7421"; }"#)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    key: "admin.listen",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; } admin { listen = "0.0.0.0:7421"; allow_remote = true; }"#,
+        )
+        .unwrap();
+        assert!(config.admin.listen().is_ok());
+    }
+
+    #[test]
+    fn the_artwork_cache_limit_is_read_in_mib() {
+        let config =
+            plex(r#"plex { url = "http://nas:32400"; } artwork { cache_mb = 64; }"#).unwrap();
+        assert_eq!(config.artwork.cache_bytes(), 64 << 20);
+        let default = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(default.artwork.cache_bytes(), 1024 << 20);
+    }
+
+    #[test]
+    fn watch_rules_default_and_can_be_set() {
+        let default = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(default.watch.rules().unwrap(), WatchRules::default());
+        let set = plex(
+            r#"plex { url = "http://nas:32400"; } watch { watched_percent = 95; started_after_secs = 30; }"#,
+        )
+        .unwrap();
+        let rules = set.watch.rules().unwrap();
+        assert_eq!(rules.watched_fraction, 0.95);
+        assert_eq!(rules.started_after, Duration::from_secs(30));
+        let bad = plex(r#"plex { url = "http://nas:32400"; } watch { watched_percent = 0; }"#)
+            .unwrap_err();
+        assert!(matches!(
+            bad,
+            ConfigError::Invalid {
+                key: "watch.watched_percent",
+                ..
+            }
+        ));
     }
 
     #[test]

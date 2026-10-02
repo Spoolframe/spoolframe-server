@@ -70,6 +70,16 @@ pub struct Metadata {
     pub art: Option<String>,
     #[serde(rename = "Media", default)]
     pub media: Vec<Media>,
+    /// Plex's own stable id, `plex://movie/…`.
+    pub guid: Option<String>,
+    /// Other agents' ids (`imdb://…`); only on single-item responses.
+    #[serde(rename = "Guid", default)]
+    pub guids: Vec<GuidRef>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GuidRef {
+    pub id: String,
 }
 
 /// One version of an item's media.

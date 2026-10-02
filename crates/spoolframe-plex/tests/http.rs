@@ -348,3 +348,88 @@ async fn an_unreachable_pms_is_named_in_the_error() {
     assert!(matches!(err, CatalogError::Unreachable { .. }), "{err}");
     assert!(err.to_string().contains(&url), "{err}");
 }
+
+fn artwork_id(key: &str) -> spoolframe_types::ArtworkId {
+    spoolframe_types::ArtworkId::new(Namespace::Plex, key).unwrap()
+}
+
+#[tokio::test]
+async fn artwork_is_fetched_with_its_content_type() {
+    let server = MockServer::start().await;
+    Mock::given(path("/library/metadata/134883/thumb/1786645049"))
+        .and(header("accept", "image/*"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(b"\x89PNG fake".to_vec(), "image/png"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let image = catalog(&server)
+        .artwork(&artwork_id("/library/metadata/134883/thumb/1786645049"))
+        .await
+        .unwrap();
+    assert_eq!(image.content_type, "image/png");
+    assert_eq!(image.bytes, b"\x89PNG fake");
+}
+
+#[tokio::test]
+async fn an_artwork_key_that_is_not_an_image_path_never_reaches_the_pms() {
+    let server = MockServer::start().await;
+    for key in ["/library/sections/1/all", "/:/prefs"] {
+        let err = catalog(&server)
+            .artwork(&artwork_id(key))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::NotFound(_)), "{key}: {err}");
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_reply_that_is_not_an_image_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(path("/library/metadata/1/art/2"))
+        .respond_with(json("sections"))
+        .mount(&server)
+        .await;
+    let err = catalog(&server)
+        .artwork(&artwork_id("/library/metadata/1/art/2"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::Backend { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn an_item_comes_with_its_external_ids() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/metadata/208618", "metadata-show").await;
+    serve(
+        &server,
+        "/library/metadata/208618/children",
+        "children-show",
+    )
+    .await;
+    let got = catalog(&server)
+        .item(&id(MediaKind::Show, "208618"))
+        .await
+        .unwrap();
+    assert!(
+        got.external_ids.contains(&"imdb://tt3148266".to_owned()),
+        "{:?}",
+        got.external_ids
+    );
+}
+
+#[tokio::test]
+async fn recently_added_is_read_newest_first() {
+    let server = MockServer::start().await;
+    Mock::given(path("/library/recentlyAdded"))
+        .and(header("X-Plex-Container-Size", "3"))
+        .respond_with(json("recently-added"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let items = catalog(&server).recently_added(3).await.unwrap();
+    assert_eq!(items.len(), 3);
+    assert!(items.iter().all(|i| i.id().kind() == MediaKind::Season));
+}

@@ -1,14 +1,15 @@
 //! The server endpoint, dialled by a real Iroh client endpoint over
 //! loopback with relays off.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use iroh::endpoint::{ApplicationClose, ConnectionError, VarInt, presets};
 use iroh::{Endpoint, RelayMode};
 use spoolframe_protocol::{CLIENT_ALPN, FEDERATION_ALPN, close};
-use spoolframe_server::identity;
-use spoolframe_server::network::{ConnectionAuth, EndpointOptions, Relay, Server};
+use spoolframe_server::network::{ConnectionAuth, Server};
 
 fn state_dir(test: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -18,14 +19,10 @@ fn state_dir(test: &str) -> PathBuf {
     dir
 }
 
-const LAN_ONLY: EndpointOptions = EndpointOptions {
-    port: None,
-    relay: Relay::Disabled,
-};
-
 async fn server(state_dir: &Path) -> Server {
-    let key = identity::load_or_create(state_dir).unwrap();
-    Server::start(key, &LAN_ONLY).await.unwrap()
+    support::TestServer::start_in(state_dir.to_owned())
+        .await
+        .server
 }
 
 async fn client() -> Endpoint {
