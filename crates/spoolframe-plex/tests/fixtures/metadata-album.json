@@ -1,0 +1,24 @@
+{
+  "MediaContainer": {
+    "size": 1,
+    "librarySectionID": 12,
+    "librarySectionTitle": "Music",
+    "Metadata": [
+      {
+        "ratingKey": "223609",
+        "key": "/library/metadata/223609/children",
+        "parentRatingKey": "222392",
+        "guid": "plex://album/5d07cce9403c640290ec0d5c",
+        "type": "album",
+        "title": "In the End",
+        "librarySectionID": 12,
+        "summary": "In the months following the unexpected passing of Dolores O'Riordan, the surv...",
+        "index": 1,
+        "year": 2019,
+        "thumb": "/library/metadata/223609/thumb/1783793666",
+        "art": "/library/metadata/222392/art/1790331023",
+        "addedAt": 1758698249
+      }
+    ]
+  }
+}

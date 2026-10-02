@@ -1,0 +1,32 @@
+[package]
+name = "spoolframe-server"
+description = "The Spoolframe media server."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "spoolframe-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+spoolframe-catalog = { workspace = true }
+spoolframe-media = { workspace = true }
+spoolframe-plex = { workspace = true }
+spoolframe-protocol = { workspace = true }
+iroh = { workspace = true }
+spoolframe-types = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+uclicious = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+cargo_metadata = { workspace = true }

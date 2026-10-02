@@ -1,0 +1,351 @@
+//! Identifiers. On the wire each one is a namespaced string, for example
+//! `plex:movie:12345`.
+//!
+//! Clients treat them as opaque: they compare them and send them back, and
+//! never take them apart. The namespace is part of the ID so that `native:`
+//! IDs (and, with federation, IDs from another server) can be added without
+//! a format change. Only the server reads the parts, through the accessors.
+
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+
+/// Why a string is not a valid identifier.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IdError {
+    #[error("{0:?} is not a known ID namespace")]
+    UnknownNamespace(String),
+    #[error("{0:?} is not a known media kind")]
+    UnknownKind(String),
+    #[error("{0:?} has no key")]
+    MissingKey(String),
+}
+
+/// Which catalog an ID belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Namespace {
+    /// An item in the Plex library; the key is its Plex `ratingKey`.
+    Plex,
+}
+
+impl Namespace {
+    fn as_str(self) -> &'static str {
+        match self {
+            Namespace::Plex => "plex",
+        }
+    }
+}
+
+impl FromStr for Namespace {
+    type Err = IdError;
+
+    fn from_str(s: &str) -> Result<Self, IdError> {
+        match s {
+            "plex" => Ok(Namespace::Plex),
+            other => Err(IdError::UnknownNamespace(other.to_owned())),
+        }
+    }
+}
+
+/// What kind of item a [`MediaId`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaKind {
+    Movie,
+    Show,
+    Season,
+    Episode,
+    Artist,
+    Album,
+    Track,
+}
+
+impl MediaKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            MediaKind::Movie => "movie",
+            MediaKind::Show => "show",
+            MediaKind::Season => "season",
+            MediaKind::Episode => "episode",
+            MediaKind::Artist => "artist",
+            MediaKind::Album => "album",
+            MediaKind::Track => "track",
+        }
+    }
+}
+
+impl FromStr for MediaKind {
+    type Err = IdError;
+
+    fn from_str(s: &str) -> Result<Self, IdError> {
+        Ok(match s {
+            "movie" => MediaKind::Movie,
+            "show" => MediaKind::Show,
+            "season" => MediaKind::Season,
+            "episode" => MediaKind::Episode,
+            "artist" => MediaKind::Artist,
+            "album" => MediaKind::Album,
+            "track" => MediaKind::Track,
+            other => return Err(IdError::UnknownKind(other.to_owned())),
+        })
+    }
+}
+
+/// A key must be non-empty; it may contain `:` (only the leading parts are
+/// split off).
+fn key(whole: &str, key: Option<&str>) -> Result<String, IdError> {
+    match key {
+        Some(k) if !k.is_empty() => Ok(k.to_owned()),
+        _ => Err(IdError::MissingKey(whole.to_owned())),
+    }
+}
+
+/// A movie, show, season, episode, artist, album or track:
+/// `<namespace>:<kind>:<key>`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct MediaId {
+    namespace: Namespace,
+    kind: MediaKind,
+    key: String,
+}
+
+impl MediaId {
+    /// Build an ID. The server does this; clients only receive them.
+    pub fn new(
+        namespace: Namespace,
+        kind: MediaKind,
+        key: impl Into<String>,
+    ) -> Result<Self, IdError> {
+        let key = key.into();
+        if key.is_empty() {
+            return Err(IdError::MissingKey(format!(
+                "{}:{}:",
+                namespace.as_str(),
+                kind.as_str()
+            )));
+        }
+        Ok(Self {
+            namespace,
+            kind,
+            key,
+        })
+    }
+
+    /// For the server: which catalog resolves this ID.
+    pub fn namespace(&self) -> Namespace {
+        self.namespace
+    }
+
+    /// For the server: what kind of item this is.
+    pub fn kind(&self) -> MediaKind {
+        self.kind
+    }
+
+    /// For the server: the catalog's own key for the item.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl fmt::Display for MediaId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}:{}:{}",
+            self.namespace.as_str(),
+            self.kind.as_str(),
+            self.key
+        )
+    }
+}
+
+impl FromStr for MediaId {
+    type Err = IdError;
+
+    fn from_str(s: &str) -> Result<Self, IdError> {
+        let mut parts = s.splitn(3, ':');
+        let namespace = parts.next().unwrap_or_default().parse()?;
+        let kind = parts.next().unwrap_or_default().parse()?;
+        let key = key(s, parts.next())?;
+        Ok(Self {
+            namespace,
+            kind,
+            key,
+        })
+    }
+}
+
+/// Defines an ID made of a namespace and a key: `<namespace>:<key>`.
+macro_rules! namespaced_id {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name {
+            namespace: Namespace,
+            key: String,
+        }
+
+        impl $name {
+            /// Build an ID. The server does this; clients only receive them.
+            pub fn new(namespace: Namespace, key: impl Into<String>) -> Result<Self, IdError> {
+                let key = key.into();
+                if key.is_empty() {
+                    return Err(IdError::MissingKey(format!("{}:", namespace.as_str())));
+                }
+                Ok(Self { namespace, key })
+            }
+
+            /// For the server: which catalog resolves this ID.
+            pub fn namespace(&self) -> Namespace {
+                self.namespace
+            }
+
+            /// For the server: the catalog's own key.
+            pub fn key(&self) -> &str {
+                &self.key
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}:{}", self.namespace.as_str(), self.key)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = IdError;
+
+            fn from_str(s: &str) -> Result<Self, IdError> {
+                let mut parts = s.splitn(2, ':');
+                let namespace = parts.next().unwrap_or_default().parse()?;
+                let key = key(s, parts.next())?;
+                Ok(Self { namespace, key })
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = IdError;
+
+            fn try_from(s: String) -> Result<Self, IdError> {
+                s.parse()
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(id: $name) -> String {
+                id.to_string()
+            }
+        }
+    };
+}
+
+namespaced_id!(
+    /// A library (a Plex library section today): `<namespace>:<key>`.
+    LibraryId
+);
+
+namespaced_id!(
+    /// A piece of artwork, fetched through the client protocol, never from
+    /// Plex directly: `<namespace>:<key>`.
+    ArtworkId
+);
+
+impl TryFrom<String> for MediaId {
+    type Error = IdError;
+
+    fn try_from(s: String) -> Result<Self, IdError> {
+        s.parse()
+    }
+}
+
+impl From<MediaId> for String {
+    fn from(id: MediaId) -> String {
+        id.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_media_id_prints_as_namespace_kind_key() {
+        let id = MediaId::new(Namespace::Plex, MediaKind::Movie, "12345").unwrap();
+        assert_eq!(id.to_string(), "plex:movie:12345");
+    }
+
+    #[test]
+    fn a_media_id_survives_a_round_trip_through_its_string() {
+        let id: MediaId = "plex:episode:98321".parse().unwrap();
+        assert_eq!(id.to_string().parse::<MediaId>().unwrap(), id);
+    }
+
+    #[test]
+    fn a_media_id_on_the_wire_is_a_plain_string() {
+        let id = MediaId::new(Namespace::Plex, MediaKind::Track, "7").unwrap();
+        assert_eq!(serde_json::to_string(&id).unwrap(), r#""plex:track:7""#);
+    }
+
+    #[test]
+    fn a_key_may_contain_colons() {
+        let id: MediaId = "plex:movie:a:b".parse().unwrap();
+        assert_eq!(id.key(), "a:b");
+    }
+
+    #[test]
+    fn an_unknown_namespace_is_rejected() {
+        assert_eq!(
+            "nope:movie:1".parse::<MediaId>(),
+            Err(IdError::UnknownNamespace("nope".into()))
+        );
+    }
+
+    #[test]
+    fn an_unknown_kind_is_rejected() {
+        assert_eq!(
+            "plex:photo:1".parse::<MediaId>(),
+            Err(IdError::UnknownKind("photo".into()))
+        );
+    }
+
+    #[test]
+    fn an_empty_key_is_rejected() {
+        assert_eq!(
+            "plex:movie:".parse::<MediaId>(),
+            Err(IdError::MissingKey("plex:movie:".into()))
+        );
+        assert!(MediaId::new(Namespace::Plex, MediaKind::Movie, "").is_err());
+    }
+
+    #[test]
+    fn a_missing_key_is_rejected() {
+        assert!("plex:movie".parse::<MediaId>().is_err());
+    }
+
+    #[test]
+    fn deserializing_a_bad_media_id_fails() {
+        assert!(serde_json::from_str::<MediaId>(r#""nope:movie:1""#).is_err());
+    }
+
+    #[test]
+    fn a_library_id_round_trips_through_its_string() {
+        let id = LibraryId::new(Namespace::Plex, "3").unwrap();
+        assert_eq!(id.to_string(), "plex:3");
+        assert_eq!("plex:3".parse::<LibraryId>().unwrap(), id);
+    }
+
+    #[test]
+    fn an_artwork_id_keeps_a_path_like_key() {
+        let id: ArtworkId = "plex:/library/metadata/123/thumb/1699".parse().unwrap();
+        assert_eq!(id.key(), "/library/metadata/123/thumb/1699");
+    }
+
+    #[test]
+    fn an_artwork_id_without_a_key_is_rejected() {
+        assert!("plex:".parse::<ArtworkId>().is_err());
+        assert!("plex".parse::<ArtworkId>().is_err());
+    }
+}

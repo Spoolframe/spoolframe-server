@@ -1,0 +1,13 @@
+[package]
+name = "spoolframe-catalog"
+description = "The Catalog trait: where Spoolframe's library comes from."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+async-trait = { workspace = true }
+spoolframe-types = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "spoolframe-types"
+description = "Spoolframe's client-facing types: the media model and its identifiers."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

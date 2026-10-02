@@ -1,0 +1,37 @@
+{
+  "MediaContainer": {
+    "size": 2,
+    "totalSize": 29,
+    "offset": 0,
+    "librarySectionID": 12,
+    "librarySectionTitle": "Music",
+    "title1": "Music",
+    "title2": "All Artists",
+    "Metadata": [
+      {
+        "ratingKey": "222392",
+        "key": "/library/metadata/222392/children",
+        "guid": "plex://artist/5d07bbfc403c6402904a6084",
+        "type": "artist",
+        "title": "The Cranberries",
+        "summary": "Combining the melodic jangle of post-Smiths indie guitar pop with the lilting...",
+        "index": 1,
+        "thumb": "/library/metadata/222392/thumb/1790331023",
+        "art": "/library/metadata/222392/art/1790331023",
+        "addedAt": 1758693234
+      },
+      {
+        "ratingKey": "224303",
+        "key": "/library/metadata/224303/children",
+        "guid": "plex://artist/5d07bbfc403c6402904a5bc5",
+        "type": "artist",
+        "title": "The Cure",
+        "summary": "Out of all the bands that emerged in the immediate aftermath of punk rock in...",
+        "index": 1,
+        "thumb": "/library/metadata/224303/thumb/1790331117",
+        "art": "/library/metadata/224303/art/1790331117",
+        "addedAt": 1758736291
+      }
+    ]
+  }
+}

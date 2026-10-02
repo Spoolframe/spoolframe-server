@@ -1,0 +1,38 @@
+{
+  "MediaContainer": {
+    "size": 1,
+    "librarySectionID": 12,
+    "librarySectionTitle": "Music",
+    "Metadata": [
+      {
+        "ratingKey": "223610",
+        "key": "/library/metadata/223610",
+        "parentRatingKey": "223609",
+        "grandparentRatingKey": "222392",
+        "guid": "plex://track/5d080936403c6402904d6ae2",
+        "type": "track",
+        "title": "All Over Now",
+        "librarySectionID": 12,
+        "summary": "",
+        "index": 1,
+        "parentIndex": 1,
+        "thumb": "/library/metadata/223609/thumb/1783793666",
+        "art": "/library/metadata/222392/art/1790331023",
+        "duration": 257386,
+        "addedAt": 1758698249,
+        "Media": [
+          {
+            "id": 529616,
+            "container": "flac",
+            "Part": [
+              {
+                "id": 790894,
+                "file": "/data/Music/The Cranberries/In the End (2019)/The Cranberries - In the End - 01 - All Over Now.flac"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

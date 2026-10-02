@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# Third-party crates carried with local changes; see each one's VENDORED.md.
+# Not members: they keep their own license and are not linted as ours.
+exclude = ["vendor"]
+
+# No workspace-wide license: the protocol, types and client SDK are
+# permissive so that any client may link them, the server crates are AGPL
+# (ARCHITECTURE §56). Each crate states its own, and
+# `spoolframe-server/tests/license_boundary.rs` keeps the two sides apart.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
+repository = "https://git.coldsteel.casa/Coldsteel/foundry"
+
+[workspace.dependencies]
+# Internal crates
+spoolframe-types = { path = "crates/spoolframe-types" }
+spoolframe-catalog = { path = "crates/spoolframe-catalog" }
+spoolframe-plex = { path = "crates/spoolframe-plex" }
+spoolframe-media = { path = "crates/spoolframe-media" }
+spoolframe-protocol = { path = "crates/spoolframe-protocol" }
+
+# Vendored (vendor/easy-ffprobe/VENDORED.md). Only the typed model of
+# ffprobe's JSON is used.
+easy-ffprobe = { path = "vendor/easy-ffprobe", default-features = false, features = ["format", "streams"] }
+
+# Async. `async-trait` because the server holds the catalog as `dyn Catalog`,
+# and native async trait methods are not object-safe.
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "signal"] }
+
+# Transport and endpoint identity (ARCHITECTURE §11). No default features:
+# ring for TLS, and no portmapper (UPnP/NAT-PMP) or metrics while Phase 1
+# is LAN only.
+iroh = { version = "1.3", default-features = false, features = ["tls-ring"] }
+
+# HTTP, for the PMS API. rustls, so the build needs no OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"
+wiremock = "0.6"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization. The client wire codec is P1-10's choice; serde_json here
+# is for tests and for reading the PMS API.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Server configuration is UCL, as in kiln and steward. From the coldsteel
+# registry — the crates.io `uclicious` is a stale 0.1.x. Not a path dep: the
+# subflake is copied to the store without its siblings, so `../uclicious`
+# would not exist in the nix build.
+uclicious = { version = "0.9.1", registry = "coldsteel" }
+
+# Reads the workspace graph for the license-boundary test.
+cargo_metadata = "0.23"

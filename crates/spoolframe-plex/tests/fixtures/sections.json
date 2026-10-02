@@ -1,0 +1,26 @@
+{
+  "MediaContainer": {
+    "size": 3,
+    "title1": "Plex Library",
+    "Directory": [
+      {
+        "key": "2",
+        "type": "movie",
+        "title": "Movies",
+        "agent": "tv.plex.agents.movie"
+      },
+      {
+        "key": "1",
+        "type": "show",
+        "title": "TV Shows",
+        "agent": "tv.plex.agents.series"
+      },
+      {
+        "key": "12",
+        "type": "artist",
+        "title": "Music",
+        "agent": "tv.plex.agents.music"
+      }
+    ]
+  }
+}

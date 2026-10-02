@@ -1,0 +1,35 @@
+{
+  "MediaContainer": {
+    "size": 1,
+    "librarySectionID": 2,
+    "librarySectionTitle": "Movies",
+    "Metadata": [
+      {
+        "ratingKey": "134883",
+        "key": "/library/metadata/134883",
+        "guid": "plex://movie/5d776c85fb0d55001f589f07",
+        "type": "movie",
+        "title": "6 Below: Miracle on the Mountain",
+        "librarySectionID": 2,
+        "summary": "An adrenaline seeking snowboarder gets lost in a massive winter storm in the...",
+        "year": 2017,
+        "thumb": "/library/metadata/134883/thumb/1786645049",
+        "art": "/library/metadata/134883/art/1786645049",
+        "duration": 5863942,
+        "addedAt": 1507951743,
+        "Media": [
+          {
+            "id": 311416,
+            "container": "mkv",
+            "Part": [
+              {
+                "id": 445739,
+                "file": "/data/Movies/6.Below.Miracle.on.the.Mountain.2017/6 Below Miracle on the Mountain 2017 720p WEB-DL MkvCage.mkv"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "MediaContainer": {
+    "size": 1,
+    "librarySectionID": 1,
+    "librarySectionTitle": "TV Shows",
+    "Metadata": [
+      {
+        "ratingKey": "208619",
+        "key": "/library/metadata/208619/children",
+        "parentRatingKey": "208618",
+        "guid": "plex://season/602e62dfc96042002d07c0fc",
+        "type": "season",
+        "title": "Season 1",
+        "librarySectionID": 1,
+        "summary": "",
+        "index": 1,
+        "parentIndex": 1,
+        "viewCount": 14,
+        "thumb": "/library/metadata/208619/thumb/1720224131",
+        "art": "/library/metadata/208618/art/1789149282",
+        "addedAt": 1720224129
+      }
+    ]
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "MediaContainer": {
+    "size": 2,
+    "totalSize": 770,
+    "offset": 0,
+    "librarySectionID": 2,
+    "librarySectionTitle": "Movies",
+    "title1": "Movies",
+    "title2": "All Movies",
+    "Metadata": [
+      {
+        "ratingKey": "134883",
+        "key": "/library/metadata/134883",
+        "guid": "plex://movie/5d776c85fb0d55001f589f07",
+        "type": "movie",
+        "title": "6 Below: Miracle on the Mountain",
+        "summary": "An adrenaline seeking snowboarder gets lost in a massive winter storm in the...",
+        "year": 2017,
+        "thumb": "/library/metadata/134883/thumb/1786645049",
+        "art": "/library/metadata/134883/art/1786645049",
+        "duration": 5863942,
+        "addedAt": 1507951743,
+        "Media": [
+          {
+            "id": 311416,
+            "container": "mkv",
+            "Part": [
+              {
+                "id": 445739,
+                "file": "/data/Movies/6.Below.Miracle.on.the.Mountain.2017/6 Below Miracle on the Mountain 2017 720p WEB-DL MkvCage.mkv"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "ratingKey": "105159",
+        "key": "/library/metadata/105159",
+        "guid": "plex://movie/5d9f395fd74e6700200254f4",
+        "type": "movie",
+        "title": "24 Days",
+        "summary": "When Ilan Halimi is kidnapped for ransom because he's Jewish and supposedly r...",
+        "year": 2014,
+        "thumb": "/library/metadata/105159/thumb/1781438788",
+        "art": "/library/metadata/105159/art/1781438788",
+        "duration": 6637568,
+        "addedAt": 1450091858,
+        "Media": [
+          {
+            "id": 200352,
+            "container": "mkv",
+            "Part": [
+              {
+                "id": 445764,
+                "file": "/data/Movies/24 Days (2014)/24 DaysH2641080pAC3.mkv"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

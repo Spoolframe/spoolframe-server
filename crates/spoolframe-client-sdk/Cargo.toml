@@ -1,0 +1,10 @@
+[package]
+name = "spoolframe-client-sdk"
+description = "Client side of Spoolframe: Iroh transport, saved servers, sessions."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT OR Apache-2.0"
+
+[dependencies]

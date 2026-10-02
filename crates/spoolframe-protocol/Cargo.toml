@@ -1,0 +1,10 @@
+[package]
+name = "spoolframe-protocol"
+description = "The spoolframe/client/1 wire protocol."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT OR Apache-2.0"
+
+[dependencies]

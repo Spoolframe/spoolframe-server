@@ -1,0 +1,71 @@
+{
+  "MediaContainer": {
+    "size": 2,
+    "librarySectionID": 1,
+    "librarySectionTitle": "TV Shows",
+    "title1": "12 Monkeys",
+    "title2": "Season 1",
+    "Metadata": [
+      {
+        "ratingKey": "208620",
+        "key": "/library/metadata/208620",
+        "parentRatingKey": "208619",
+        "grandparentRatingKey": "208618",
+        "guid": "plex://episode/5d9c10307b5c2e001e6ac51a",
+        "type": "episode",
+        "title": "Splinter",
+        "summary": "27 years after a virus wipes out most of humanity, scientists send a man back...",
+        "index": 1,
+        "parentIndex": 1,
+        "viewCount": 2,
+        "year": 2015,
+        "thumb": "/library/metadata/208620/thumb/1720258080",
+        "art": "/library/metadata/208618/art/1789149282",
+        "duration": 2852688,
+        "addedAt": 1720224129,
+        "Media": [
+          {
+            "id": 511562,
+            "container": "mkv",
+            "Part": [
+              {
+                "id": 731914,
+                "file": "/data/TVShows/12 Monkeys/Season 1/12.Monkeys.S01E01.Splinter.Bluray-1080p.Remux.mkv"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "ratingKey": "208627",
+        "key": "/library/metadata/208627",
+        "parentRatingKey": "208619",
+        "grandparentRatingKey": "208618",
+        "guid": "plex://episode/5d9c10307b5c2e001e6ac50b",
+        "type": "episode",
+        "title": "Mentally Divergent",
+        "summary": "The trail of a mysterious organization called the “Army of the 12 Monkeys” le...",
+        "index": 2,
+        "parentIndex": 1,
+        "viewCount": 2,
+        "year": 2015,
+        "thumb": "/library/metadata/208627/thumb/1720259905",
+        "art": "/library/metadata/208618/art/1789149282",
+        "duration": 2612443,
+        "addedAt": 1720228739,
+        "Media": [
+          {
+            "id": 511570,
+            "container": "mkv",
+            "Part": [
+              {
+                "id": 731928,
+                "file": "/data/TVShows/12 Monkeys/Season 1/12.Monkeys.S01E02.Mentally.Divergent.Bluray-1080p.Remux.mkv"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

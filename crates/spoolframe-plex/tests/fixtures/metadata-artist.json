@@ -1,0 +1,22 @@
+{
+  "MediaContainer": {
+    "size": 1,
+    "librarySectionID": 12,
+    "librarySectionTitle": "Music",
+    "Metadata": [
+      {
+        "ratingKey": "222392",
+        "key": "/library/metadata/222392/children",
+        "guid": "plex://artist/5d07bbfc403c6402904a6084",
+        "type": "artist",
+        "title": "The Cranberries",
+        "librarySectionID": 12,
+        "summary": "Combining the melodic jangle of post-Smiths indie guitar pop with the lilting...",
+        "index": 1,
+        "thumb": "/library/metadata/222392/thumb/1790331023",
+        "art": "/library/metadata/222392/art/1790331023",
+        "addedAt": 1758693234
+      }
+    ]
+  }
+}

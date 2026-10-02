@@ -1,0 +1,69 @@
+{
+  "MediaContainer": {
+    "size": 2,
+    "totalSize": 3622,
+    "offset": 0,
+    "librarySectionID": 12,
+    "librarySectionTitle": "Music",
+    "title1": "Music",
+    "title2": "All Artists",
+    "Metadata": [
+      {
+        "ratingKey": "228207",
+        "key": "/library/metadata/228207",
+        "parentRatingKey": "228206",
+        "grandparentRatingKey": "222392",
+        "guid": "plex://track/5d07ce9e403c6402900a2e8b",
+        "type": "track",
+        "title": "Analyse (radio edit)",
+        "summary": "",
+        "index": 1,
+        "parentIndex": 1,
+        "thumb": "/library/metadata/228206/thumb/1783793664",
+        "art": "/library/metadata/222392/art/1790331023",
+        "duration": 238026,
+        "addedAt": 1776375830,
+        "Media": [
+          {
+            "id": 535330,
+            "container": "flac",
+            "Part": [
+              {
+                "id": 796608,
+                "file": "/data/Music/The Cranberries/Analyse (2001)/The Cranberries - Analyse - 01 - Analyse (radio edit).flac"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "ratingKey": "228208",
+        "key": "/library/metadata/228208",
+        "parentRatingKey": "228206",
+        "grandparentRatingKey": "222392",
+        "guid": "plex://track/5d07ce48403c64029002d834",
+        "type": "track",
+        "title": "Analyse (Oceanic radio edit)",
+        "summary": "",
+        "index": 2,
+        "parentIndex": 1,
+        "thumb": "/library/metadata/228206/thumb/1783793664",
+        "art": "/library/metadata/222392/art/1790331023",
+        "duration": 235866,
+        "addedAt": 1776375830,
+        "Media": [
+          {
+            "id": 535331,
+            "container": "flac",
+            "Part": [
+              {
+                "id": 796609,
+                "file": "/data/Music/The Cranberries/Analyse (2001)/The Cranberries - Analyse - 02 - Analyse (Oceanic radio edit).flac"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

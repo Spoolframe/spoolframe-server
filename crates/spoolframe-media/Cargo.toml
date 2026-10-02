@@ -1,0 +1,17 @@
+[package]
+name = "spoolframe-media"
+description = "Spoolframe's own view of a media file: ffprobe into a MediaDescriptor."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+easy-ffprobe = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+spoolframe-types = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
