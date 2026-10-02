@@ -1,6 +1,6 @@
 //! `spoolframe/client/1` as a client sees it, over a real Iroh connection.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 

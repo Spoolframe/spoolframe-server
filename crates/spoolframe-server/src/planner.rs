@@ -1,101 +1,80 @@
 //! The playback planner (ARCHITECTURE §6, §8): from what a file is, what
-//! the client can decode and which tracks it picked, how it will play.
+//! the client can decode and take in, and which tracks it picked, how it
+//! will play. Cheapest first:
 //!
-//! Phase 1 plans only `Direct` play, or says why not. Remux and transcode
-//! (P2) add plans here without changing the protocol.
+//! 1. `Direct`: the container, the picked streams and the file's bitrate
+//!    fit, and the client takes range reads.
+//! 2. `Converted` (P2-01): copy every stream that fits, encode only the
+//!    ones that do not. A subtitle the client cannot show and that cannot
+//!    become text is burned in, which forces a video encode.
+//! 3. `Unsupported`: nothing above works, e.g. a Phase 1 client (range
+//!    reads only) with a file it cannot play.
 
-use spoolframe_media::{MediaDescriptor, SubtitleSource, codecs};
+use spoolframe_media::encoders::Encoders;
+use spoolframe_media::{MediaDescriptor, SubtitleKind, SubtitleSource, VideoStream, codecs};
 use spoolframe_protocol::{
-    PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleDelivery,
+    AudioAction, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, PlannedAudio, PlannedSubtitle,
+    PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
 };
-use spoolframe_types::{AudioCodec, ClientCapabilities, Container, SubtitleFormat, VideoCodec};
+use spoolframe_types::{
+    AudioCodec, ClientCapabilities, Container, Delivery, SubtitleFormat, VideoCodec,
+};
 
 /// Plan `descriptor` for a client with `capabilities` (`None`: it sent
-/// none) and `selection`. Only the container, the video and the selected
-/// tracks count.
+/// none) and `selection`, encoding with `encoders` if it must. Only the
+/// container, the video and the selected tracks count.
 pub fn plan(
     descriptor: &MediaDescriptor,
     capabilities: Option<&ClientCapabilities>,
     selection: Selection,
+    encoders: &Encoders,
 ) -> PlaybackPlan {
     let Some(caps) = capabilities else {
         return plan_without_capabilities();
     };
-    let mut reasons = Vec::new();
 
-    let container = codecs::container(&descriptor.container);
-    if !supported(&caps.containers, container, Container::Unknown) {
-        reasons.push(format!(
-            "container: {} not supported",
-            name(container.as_str(), &descriptor.container)
-        ));
-    }
-
-    let video = descriptor.video.as_ref().map(|v| {
-        let codec = codecs::video_codec(&v.codec);
-        if !supported(&caps.video, codec, VideoCodec::Unknown) {
-            reasons.push(format!(
-                "video: {} not supported",
-                name(codec.as_str(), &v.codec)
-            ));
-        }
-        codec
-    });
-
+    // Tracks that do not exist: no plan fixes that.
+    let mut missing = Vec::new();
     let audio = match audio_index(descriptor, selection.audio) {
-        Ok(None) => None,
-        Ok(Some(index)) => {
-            let stream = &descriptor.audio[index];
-            let codec = codecs::audio_codec(&stream.codec);
-            if !supported(&caps.audio, codec, AudioCodec::Unknown) {
-                reasons.push(format!(
-                    "audio {index}: {} not supported",
-                    name(codec.as_str(), &stream.codec)
-                ));
-            }
-            Some(PlannedAudio {
-                index: index as u32,
-                codec,
-            })
-        }
+        Ok(index) => index,
         Err(reason) => {
-            reasons.push(reason);
+            missing.push(reason);
             None
         }
     };
-
-    let subtitle = selection.subtitle.and_then(|picked| {
-        let Some(stream) = descriptor.subtitles.get(picked as usize) else {
-            reasons.push(format!("subtitle {picked}: no such track"));
-            return None;
-        };
-        let format = codecs::subtitle_format(&stream.codec);
-        if !supported(&caps.subtitles, format, SubtitleFormat::Unknown) {
-            reasons.push(format!(
-                "subtitle {picked}: {} not supported",
-                name(format.as_str(), &stream.codec)
-            ));
+    let subtitle = selection.subtitle.filter(|&picked| {
+        let exists = (picked as usize) < descriptor.subtitles.len();
+        if !exists {
+            missing.push(format!("subtitle {picked}: no such track"));
         }
-        let delivery = match stream.source {
-            SubtitleSource::Embedded { .. } => SubtitleDelivery::Embedded,
-            SubtitleSource::External { .. } => SubtitleDelivery::External,
-        };
-        Some(PlannedSubtitle {
-            index: picked,
-            format,
-            delivery,
-        })
+        exists
     });
+    if !missing.is_empty() {
+        return PlaybackPlan::Unsupported { reasons: missing };
+    }
 
-    if reasons.is_empty() {
-        PlaybackPlan::Direct {
-            container,
-            video,
-            audio,
-            subtitle,
+    let fit = Fit::check(descriptor, caps, audio, subtitle);
+    let deliveries = caps.deliveries();
+    if fit.reasons().is_empty() && deliveries.contains(&Delivery::Range) {
+        return direct(descriptor, audio, subtitle);
+    }
+    // The first way in the client takes that is not the file itself.
+    let Some(delivery) = deliveries
+        .iter()
+        .copied()
+        .find(|d| matches!(d, Delivery::Hls | Delivery::Progressive))
+    else {
+        return PlaybackPlan::Unsupported {
+            reasons: fit.reasons(),
+        };
+    };
+    match converted(descriptor, caps, encoders, delivery, audio, subtitle, &fit) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            let mut reasons = fit.reasons();
+            reasons.push(reason);
+            PlaybackPlan::Unsupported { reasons }
         }
-    } else {
-        PlaybackPlan::Unsupported { reasons }
     }
 }
 
@@ -105,6 +84,367 @@ pub fn plan_without_capabilities() -> PlaybackPlan {
     PlaybackPlan::Unsupported {
         reasons: vec!["the client sent no capabilities".into()],
     }
+}
+
+/// What does not fit the client as the file is, per part, each with the
+/// reason. Empty everywhere: it plays directly.
+#[derive(Debug, Default)]
+struct Fit {
+    container: Vec<String>,
+    video: Vec<String>,
+    audio: Vec<String>,
+    subtitle: Vec<String>,
+}
+
+impl Fit {
+    fn check(
+        descriptor: &MediaDescriptor,
+        caps: &ClientCapabilities,
+        audio: Option<usize>,
+        subtitle: Option<u32>,
+    ) -> Self {
+        let mut fit = Fit::default();
+        let container = codecs::container(&descriptor.container);
+        if !supported(&caps.containers, container, Container::Unknown) {
+            fit.container.push(format!(
+                "container: {} not supported",
+                name(container.as_str(), &descriptor.container)
+            ));
+        }
+        if let Some(v) = &descriptor.video {
+            let codec = codecs::video_codec(&v.codec);
+            if !supported(&caps.video, codec, VideoCodec::Unknown) {
+                fit.video.push(format!(
+                    "video: {} not supported",
+                    name(codec.as_str(), &v.codec)
+                ));
+            }
+            fit.video.extend(over_limits(v, caps));
+            if let (Some(max), Some(rate)) = (caps.max_bitrate, descriptor.bit_rate)
+                && rate > max
+            {
+                fit.video.push(format!(
+                    "bitrate: {} over the client's {}",
+                    mbits(rate),
+                    mbits(max)
+                ));
+            }
+        }
+        if let Some(index) = audio {
+            let stream = &descriptor.audio[index];
+            let codec = codecs::audio_codec(&stream.codec);
+            if !supported(&caps.audio, codec, AudioCodec::Unknown) {
+                fit.audio.push(format!(
+                    "audio {index}: {} not supported",
+                    name(codec.as_str(), &stream.codec)
+                ));
+            }
+            if let (Some(max), Some(channels)) = (caps.max_audio_channels, stream.channels)
+                && channels > max
+            {
+                fit.audio.push(format!(
+                    "audio {index}: {channels} channels, the client takes {max}"
+                ));
+            }
+        }
+        if let Some(picked) = subtitle {
+            let stream = &descriptor.subtitles[picked as usize];
+            let format = codecs::subtitle_format(&stream.codec);
+            if !supported(&caps.subtitles, format, SubtitleFormat::Unknown) {
+                fit.subtitle.push(format!(
+                    "subtitle {picked}: {} not supported",
+                    name(format.as_str(), &stream.codec)
+                ));
+            }
+        }
+        fit
+    }
+
+    /// In the order a person reads a file: container, video, audio,
+    /// subtitle.
+    fn reasons(&self) -> Vec<String> {
+        [&self.container, &self.video, &self.audio, &self.subtitle]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Where `video` goes past the client's `max_video`.
+fn over_limits(video: &VideoStream, caps: &ClientCapabilities) -> Vec<String> {
+    let Some(limits) = &caps.max_video else {
+        return Vec::new();
+    };
+    let mut over = Vec::new();
+    if let Some(max) = limits.height
+        && video.height > max
+    {
+        over.push(format!("video: {}p, the client shows {max}p", video.height));
+    }
+    if let (Some(max), Some(rate)) = (limits.frame_rate, video.frame_rate_millis)
+        && rate > max.saturating_mul(1000)
+    {
+        over.push(format!(
+            "video: {:.3} fps, the client shows {max}",
+            f64::from(rate) / 1000.0
+        ));
+    }
+    if let Some(max) = limits.bit_depth
+        && video.bit_depth > max
+    {
+        over.push(format!(
+            "video: {}-bit, the client shows {max}-bit",
+            video.bit_depth
+        ));
+    }
+    if let (Some(shown), Some(hdr)) = (&limits.hdr, video.hdr)
+        && !shown.contains(&hdr)
+    {
+        over.push(format!("video: {hdr} is not shown as HDR; tone-mapped"));
+    }
+    over
+}
+
+fn mbits(bits: u64) -> String {
+    format!("{:.1} Mbit/s", bits as f64 / 1e6)
+}
+
+fn direct(
+    descriptor: &MediaDescriptor,
+    audio: Option<usize>,
+    subtitle: Option<u32>,
+) -> PlaybackPlan {
+    PlaybackPlan::Direct {
+        container: codecs::container(&descriptor.container),
+        video: descriptor
+            .video
+            .as_ref()
+            .map(|v| codecs::video_codec(&v.codec)),
+        audio: audio.map(|index| PlannedAudio {
+            index: index as u32,
+            codec: codecs::audio_codec(&descriptor.audio[index].codec),
+        }),
+        subtitle: subtitle.map(|picked| {
+            let stream = &descriptor.subtitles[picked as usize];
+            PlannedSubtitle {
+                index: picked,
+                format: codecs::subtitle_format(&stream.codec),
+                delivery: match stream.source {
+                    SubtitleSource::Embedded { .. } => SubtitleDelivery::Embedded,
+                    SubtitleSource::External { .. } => SubtitleDelivery::External,
+                },
+            }
+        }),
+    }
+}
+
+/// The output container for `delivery`: fragmented MP4 for HLS where the
+/// client plays MP4 (it carries HEVC, which TS segments do not for every
+/// player), else TS; for a progressive stream Matroska, which carries
+/// anything, then MP4, then TS.
+fn output_container(caps: &ClientCapabilities, delivery: Delivery) -> Option<Container> {
+    let order: &[Container] = match delivery {
+        Delivery::Hls => &[Container::Mp4, Container::MpegTs],
+        _ => &[Container::Matroska, Container::Mp4, Container::MpegTs],
+    };
+    order.iter().copied().find(|c| caps.containers.contains(c))
+}
+
+/// Text formats `container` can carry, preferred first.
+fn text_formats(container: Container) -> &'static [SubtitleFormat] {
+    match container {
+        Container::Matroska => &[
+            SubtitleFormat::Ass,
+            SubtitleFormat::Srt,
+            SubtitleFormat::WebVtt,
+        ],
+        Container::Mp4 => &[SubtitleFormat::WebVtt, SubtitleFormat::MovText],
+        _ => &[SubtitleFormat::WebVtt],
+    }
+}
+
+fn converted(
+    descriptor: &MediaDescriptor,
+    caps: &ClientCapabilities,
+    encoders: &Encoders,
+    delivery: Delivery,
+    audio: Option<usize>,
+    subtitle: Option<u32>,
+    fit: &Fit,
+) -> Result<PlaybackPlan, String> {
+    let container = output_container(caps, delivery)
+        .ok_or_else(|| format!("delivery: no container this client plays can carry {delivery}"))?;
+    let mut reasons = fit.reasons();
+
+    // Subtitles first: burning one in decides the video.
+    let subtitle = subtitle.map(|picked| {
+        let stream = &descriptor.subtitles[picked as usize];
+        let format = codecs::subtitle_format(&stream.codec);
+        let shown = caps.subtitles.contains(&format) && format != SubtitleFormat::Unknown;
+        let carried = match stream.kind {
+            SubtitleKind::Bitmap => container == Container::Matroska,
+            SubtitleKind::Text => text_formats(container).contains(&format),
+        };
+        let action = if shown && carried {
+            SubtitleAction::Copy { format }
+        } else if let (SubtitleKind::Text, Some(to)) = (
+            stream.kind,
+            text_formats(container)
+                .iter()
+                .copied()
+                .find(|f| caps.subtitles.contains(f)),
+        ) {
+            SubtitleAction::Convert { from: format, to }
+        } else {
+            reasons.push(format!(
+                "subtitle {picked}: {} cannot be shown; burned into the video",
+                name(format.as_str(), &stream.codec)
+            ));
+            SubtitleAction::BurnIn { format }
+        };
+        ConvertedSubtitle {
+            index: picked,
+            action,
+        }
+    });
+    let burn_in = matches!(
+        subtitle,
+        Some(ConvertedSubtitle {
+            action: SubtitleAction::BurnIn { .. },
+            ..
+        })
+    );
+
+    let audio = match audio {
+        None => None,
+        Some(index) if fit.audio.is_empty() => Some(ConvertedAudio {
+            index: index as u32,
+            action: AudioAction::Copy {
+                codec: codecs::audio_codec(&descriptor.audio[index].codec),
+            },
+        }),
+        Some(index) => Some(ConvertedAudio {
+            index: index as u32,
+            action: encode_audio(descriptor, caps, encoders, index)?,
+        }),
+    };
+
+    let video = match &descriptor.video {
+        None => None,
+        Some(v) if fit.video.is_empty() && !burn_in => Some(ConvertedVideo::Copy {
+            codec: codecs::video_codec(&v.codec),
+        }),
+        Some(v) => Some(encode_video(v, caps, encoders, audio.as_ref())?),
+    };
+
+    if reasons.is_empty() {
+        reasons.push(format!(
+            "delivery: the client takes {delivery}, not the file"
+        ));
+    }
+    Ok(PlaybackPlan::Converted {
+        delivery,
+        container,
+        video,
+        audio,
+        subtitle,
+        reasons,
+    })
+}
+
+/// The first codec, in the server's order of preference (hardware first),
+/// that the client plays.
+fn encode_video(
+    video: &VideoStream,
+    caps: &ClientCapabilities,
+    encoders: &Encoders,
+    audio: Option<&ConvertedAudio>,
+) -> Result<ConvertedVideo, String> {
+    let codec = encoders
+        .video
+        .iter()
+        .map(|e| e.codec)
+        .find(|c| caps.video.contains(c))
+        .ok_or("video: the server can encode no codec this client plays")?;
+    let limits = caps.max_video.clone().unwrap_or_default();
+    let height = limits
+        .height
+        .map_or(video.height, |max| video.height.min(max));
+    let hdr_shown = match (&limits.hdr, video.hdr) {
+        (_, None) => true,
+        (None, Some(_)) => true,
+        (Some(shown), Some(hdr)) => shown.contains(&hdr),
+    };
+    // 8-bit output where the client asks for it; H.264 carries no HDR.
+    let eight_bit = limits.bit_depth.is_some_and(|b| b < 10);
+    let tone_map = video.hdr.is_some() && (!hdr_shown || eight_bit || codec == VideoCodec::H264);
+    // Leave room for the audio inside the client's limit.
+    let audio_bits = match audio.map(|a| a.action) {
+        Some(AudioAction::Encode { bitrate, .. }) => bitrate,
+        Some(_) => 640_000,
+        None => 0,
+    };
+    let max_bitrate = caps
+        .max_bitrate
+        .map(|max| max.saturating_sub(audio_bits).max(500_000));
+    Ok(ConvertedVideo::Encode {
+        codec,
+        height,
+        max_bitrate,
+        tone_map,
+    })
+}
+
+/// Surround to the first surround codec the client plays and the server
+/// encodes, else stereo; each at a bitrate fit for its channels.
+fn encode_audio(
+    descriptor: &MediaDescriptor,
+    caps: &ClientCapabilities,
+    encoders: &Encoders,
+    index: usize,
+) -> Result<AudioAction, String> {
+    let source = descriptor.audio[index].channels.unwrap_or(2);
+    let channels = caps
+        .max_audio_channels
+        .map_or(source, |max| source.min(max))
+        .max(1);
+    let order: &[AudioCodec] = if channels > 2 {
+        &[
+            AudioCodec::Eac3,
+            AudioCodec::Ac3,
+            AudioCodec::Aac,
+            AudioCodec::Opus,
+        ]
+    } else {
+        &[
+            AudioCodec::Aac,
+            AudioCodec::Opus,
+            AudioCodec::Eac3,
+            AudioCodec::Ac3,
+        ]
+    };
+    let codec = order
+        .iter()
+        .copied()
+        .find(|c| caps.audio.contains(c) && encoders.audio_encoder(*c).is_some())
+        .ok_or_else(|| {
+            format!("audio {index}: the server can encode no codec this client plays")
+        })?;
+    // AC-3 tops out at 5.1; AAC and Opus beyond stereo stay at 5.1 too.
+    let channels = channels.min(6);
+    let bitrate = match (codec, channels > 2) {
+        (AudioCodec::Eac3 | AudioCodec::Ac3, true) => 640_000,
+        (AudioCodec::Aac, true) => 384_000,
+        (AudioCodec::Opus, true) => 256_000,
+        (AudioCodec::Opus, false) => 128_000,
+        _ => 192_000,
+    };
+    Ok(AudioAction::Encode {
+        codec,
+        channels,
+        bitrate,
+    })
 }
 
 /// Unknown is never supported, whatever the client claims.
@@ -137,7 +477,45 @@ mod tests {
 
     use spoolframe_media::{AudioStream, SubtitleKind, SubtitleStream, VideoStream};
 
+    use std::collections::BTreeSet;
+
+    use spoolframe_media::encoders::{AudioEncoder, Hardware, VideoEncoder};
+    use spoolframe_types::{AudioRole, HdrFormat, SubtitleRole, VideoLimits};
+
     use super::*;
+
+    /// The Phase 1 call: nothing detected, the software baseline.
+    fn plan(d: &MediaDescriptor, caps: Option<&ClientCapabilities>, s: Selection) -> PlaybackPlan {
+        super::plan(d, caps, s, &Encoders::software_baseline())
+    }
+
+    /// What the dev machine detected (P2-02).
+    fn dev_encoders() -> Encoders {
+        let video = |codec, name: &str, hardware| VideoEncoder {
+            codec,
+            name: name.into(),
+            hardware,
+        };
+        let audio = |codec, name: &str| AudioEncoder {
+            codec,
+            name: name.into(),
+        };
+        Encoders {
+            video: vec![
+                video(VideoCodec::H264, "h264_vaapi", Some(Hardware::Vaapi)),
+                video(VideoCodec::H264, "libx264", None),
+                video(VideoCodec::Hevc, "hevc_vaapi", Some(Hardware::Vaapi)),
+                video(VideoCodec::Hevc, "libx265", None),
+            ],
+            audio: vec![
+                audio(AudioCodec::Aac, "aac"),
+                audio(AudioCodec::Eac3, "eac3"),
+                audio(AudioCodec::Ac3, "ac3"),
+            ],
+            hardware_decoders: Vec::new(),
+            unusable: Vec::new(),
+        }
+    }
 
     fn audio(index: u32, codec: &str, default: bool) -> AudioStream {
         AudioStream {
@@ -149,6 +527,7 @@ mod tests {
             language: Some("eng".into()),
             title: None,
             default,
+            role: AudioRole::Main,
         }
     }
 
@@ -161,6 +540,7 @@ mod tests {
             title: None,
             forced: false,
             default: false,
+            role: SubtitleRole::Full,
         }
     }
 
@@ -179,6 +559,9 @@ mod tests {
                 height: 1080,
                 pixel_format: None,
                 color_transfer: None,
+                frame_rate_millis: Some(23_976),
+                bit_depth: 8,
+                hdr: None,
             }),
             audio: vec![audio(1, "dts", true), audio(2, "aac", false)],
             subtitles: vec![
@@ -200,6 +583,7 @@ mod tests {
             audio: [AudioCodec::Aac, AudioCodec::Ac3].into(),
             containers: [Container::Matroska, Container::Mp4].into(),
             subtitles: [SubtitleFormat::Srt].into(),
+            ..ClientCapabilities::default()
         }
     }
 
@@ -345,6 +729,294 @@ mod tests {
                 "audio 0: dts not supported",
                 "subtitle 0: pgs not supported"
             ]
+        );
+    }
+
+    /// An Apple TV-like client: HEVC and H.264, AAC/AC-3/E-AC-3, MP4 and
+    /// TS, WebVTT, HLS only.
+    fn avplayer() -> ClientCapabilities {
+        ClientCapabilities {
+            video: [VideoCodec::H264, VideoCodec::Hevc].into(),
+            audio: [AudioCodec::Aac, AudioCodec::Ac3, AudioCodec::Eac3].into(),
+            containers: [Container::Mp4, Container::MpegTs].into(),
+            subtitles: [SubtitleFormat::WebVtt].into(),
+            delivery: vec![Delivery::Hls],
+            ..ClientCapabilities::default()
+        }
+    }
+
+    /// A 4K HDR10 HEVC MKV with 5.1 DTS, 40 Mbit/s, PGS and SRT.
+    fn hevc_dts() -> MediaDescriptor {
+        let mut d = dts_aac_pgs();
+        d.bit_rate = Some(40_000_000);
+        let v = d.video.as_mut().unwrap();
+        v.codec = "hevc".into();
+        v.width = 3840;
+        v.height = 2160;
+        v.bit_depth = 10;
+        v.hdr = Some(HdrFormat::Hdr10);
+        d
+    }
+
+    fn converted(
+        plan: PlaybackPlan,
+    ) -> (
+        Delivery,
+        Container,
+        ConvertedVideo,
+        ConvertedAudio,
+        Option<ConvertedSubtitle>,
+        Vec<String>,
+    ) {
+        match plan {
+            PlaybackPlan::Converted {
+                delivery,
+                container,
+                video,
+                audio,
+                subtitle,
+                reasons,
+            } => (
+                delivery,
+                container,
+                video.unwrap(),
+                audio.unwrap(),
+                subtitle,
+                reasons,
+            ),
+            other => panic!("not converted: {other:?}"),
+        }
+    }
+
+    fn picked(audio: u32, subtitle: Option<u32>) -> Selection {
+        Selection {
+            audio: Some(audio),
+            subtitle,
+        }
+    }
+
+    #[test]
+    fn avplayer_gets_hls_with_the_video_copied_and_dts_encoded() {
+        let (delivery, container, video, audio, subtitle, reasons) = converted(super::plan(
+            &hevc_dts(),
+            Some(&avplayer()),
+            picked(0, None),
+            &dev_encoders(),
+        ));
+        assert_eq!((delivery, container), (Delivery::Hls, Container::Mp4));
+        assert_eq!(
+            video,
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc
+            }
+        );
+        assert_eq!(
+            audio.action,
+            AudioAction::Encode {
+                codec: AudioCodec::Eac3,
+                channels: 6,
+                bitrate: 640_000,
+            }
+        );
+        assert_eq!(subtitle, None);
+        assert_eq!(
+            reasons,
+            [
+                "container: matroska not supported",
+                "audio 0: dts not supported"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pgs_subtitle_avplayer_cannot_show_is_burned_in_and_says_so() {
+        let (_, _, video, _, subtitle, reasons) = converted(super::plan(
+            &hevc_dts(),
+            Some(&avplayer()),
+            picked(1, Some(0)),
+            &dev_encoders(),
+        ));
+        assert!(matches!(video, ConvertedVideo::Encode { .. }), "{video:?}");
+        assert_eq!(
+            subtitle.unwrap().action,
+            SubtitleAction::BurnIn {
+                format: SubtitleFormat::Pgs
+            }
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("burned into the video")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_text_subtitle_is_converted_to_webvtt_for_hls() {
+        let (_, _, video, _, subtitle, _) = converted(super::plan(
+            &hevc_dts(),
+            Some(&avplayer()),
+            picked(1, Some(1)),
+            &dev_encoders(),
+        ));
+        assert_eq!(
+            video,
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc
+            }
+        );
+        assert_eq!(
+            subtitle.unwrap().action,
+            SubtitleAction::Convert {
+                from: SubtitleFormat::Srt,
+                to: SubtitleFormat::WebVtt
+            }
+        );
+    }
+
+    #[test]
+    fn a_bitrate_cap_under_the_file_s_encodes_the_video_under_it() {
+        let mut caps = avplayer();
+        caps.max_bitrate = Some(8_000_000);
+        let (_, _, video, _, _, reasons) = converted(super::plan(
+            &hevc_dts(),
+            Some(&caps),
+            picked(1, None),
+            &dev_encoders(),
+        ));
+        let ConvertedVideo::Encode { max_bitrate, .. } = video else {
+            panic!("not encoded: {video:?}");
+        };
+        assert!(max_bitrate.unwrap() <= 8_000_000);
+        assert!(
+            reasons.iter().any(|r| r.starts_with("bitrate:")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_1080p_sdr_client_gets_4k_hdr10_scaled_and_tone_mapped() {
+        let mut caps = avplayer();
+        caps.max_video = Some(VideoLimits {
+            height: Some(1080),
+            hdr: Some(BTreeSet::new()),
+            ..VideoLimits::default()
+        });
+        let (_, _, video, _, _, _) = converted(super::plan(
+            &hevc_dts(),
+            Some(&caps),
+            picked(1, None),
+            &dev_encoders(),
+        ));
+        assert_eq!(
+            video,
+            ConvertedVideo::Encode {
+                // The server's first choice the client plays: h264_vaapi.
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: None,
+                tone_map: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_progressive_client_gets_matroska_with_everything_that_fits_copied() {
+        let caps = ClientCapabilities {
+            delivery: vec![Delivery::Range, Delivery::Progressive],
+            ..caps()
+        };
+        // DTS does not fit; the H.264 video and the container do.
+        let (delivery, container, video, audio, _, _) = converted(super::plan(
+            &dts_aac_pgs(),
+            Some(&caps),
+            picked(0, None),
+            &dev_encoders(),
+        ));
+        assert_eq!(
+            (delivery, container),
+            (Delivery::Progressive, Container::Matroska)
+        );
+        assert_eq!(
+            video,
+            ConvertedVideo::Copy {
+                codec: VideoCodec::H264
+            }
+        );
+        assert_eq!(
+            audio.action,
+            AudioAction::Encode {
+                codec: AudioCodec::Ac3,
+                channels: 6,
+                bitrate: 640_000,
+            }
+        );
+    }
+
+    #[test]
+    fn a_client_that_takes_range_reads_still_plays_directly_when_it_can() {
+        let caps = ClientCapabilities {
+            delivery: vec![Delivery::Range, Delivery::Hls],
+            ..caps()
+        };
+        assert!(matches!(
+            super::plan(
+                &dts_aac_pgs(),
+                Some(&caps),
+                picked(1, None),
+                &dev_encoders()
+            ),
+            PlaybackPlan::Direct { .. }
+        ));
+    }
+
+    #[test]
+    fn an_hls_only_client_with_a_file_that_fits_gets_a_remux() {
+        let caps = ClientCapabilities {
+            delivery: vec![Delivery::Hls],
+            ..caps()
+        };
+        let (_, container, video, audio, _, reasons) = converted(super::plan(
+            &dts_aac_pgs(),
+            Some(&caps),
+            picked(1, None),
+            &dev_encoders(),
+        ));
+        assert_eq!(container, Container::Mp4);
+        assert_eq!(
+            video,
+            ConvertedVideo::Copy {
+                codec: VideoCodec::H264
+            }
+        );
+        assert!(matches!(audio.action, AudioAction::Copy { .. }));
+        assert_eq!(reasons, ["delivery: the client takes hls, not the file"]);
+    }
+
+    #[test]
+    fn a_range_only_client_that_cannot_play_directly_is_unsupported_as_before() {
+        assert_eq!(
+            reasons(super::plan(
+                &hevc_dts(),
+                Some(&caps()),
+                picked(0, None),
+                &dev_encoders()
+            )),
+            ["video: hevc not supported", "audio 0: dts not supported"]
+        );
+    }
+
+    #[test]
+    fn no_encoder_for_any_codec_the_client_plays_is_unsupported() {
+        let mut caps = avplayer();
+        caps.video = [VideoCodec::Av1].into();
+        let all = reasons(super::plan(
+            &hevc_dts(),
+            Some(&caps),
+            picked(1, None),
+            &dev_encoders(),
+        ));
+        assert_eq!(
+            all.last().unwrap(),
+            "video: the server can encode no codec this client plays"
         );
     }
 }

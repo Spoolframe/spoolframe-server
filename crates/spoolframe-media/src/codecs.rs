@@ -74,6 +74,10 @@ mod tests {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
+            // ffprobe recordings only; other fixtures sit beside them.
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
             let probe = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             out.push((
                 path.file_name().unwrap().to_string_lossy().into_owned(),

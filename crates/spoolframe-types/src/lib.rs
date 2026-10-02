@@ -11,13 +11,21 @@
 pub mod codec;
 mod duration_ms;
 pub mod id;
+pub mod language;
 pub mod media;
 pub mod model;
+pub mod preferences;
 
-pub use codec::{AudioCodec, ClientCapabilities, Container, SubtitleFormat, VideoCodec};
+pub use codec::{
+    AudioCodec, ClientCapabilities, Container, Delivery, HdrFormat, SubtitleFormat, VideoCodec,
+    VideoLimits,
+};
 pub use id::{ArtworkId, IdError, LibraryId, MediaId, MediaKind, Namespace};
-pub use media::{AudioTrack, MediaTracks, SubtitleTrack};
+pub use media::{AudioRole, AudioTrack, MediaTracks, SubtitleRole, SubtitleTrack};
 pub use model::{
     Album, Artist, Artwork, ArtworkKind, Episode, Item, Library, LibraryKind, Movie, PlaybackState,
     Season, Show, Track,
+};
+pub use preferences::{
+    AudioPreferences, SdhPreference, SubtitleMode, SubtitlePreferences, TrackPreferences,
 };

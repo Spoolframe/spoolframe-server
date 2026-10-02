@@ -7,8 +7,10 @@
 
 pub mod codecs;
 mod descriptor;
+pub mod encoders;
 mod external;
 mod probe;
+pub mod roles;
 
 pub use probe::{ProbeError, Prober};
 

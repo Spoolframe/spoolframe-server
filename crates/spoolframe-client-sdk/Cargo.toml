@@ -8,3 +8,19 @@ repository.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+iroh = { workspace = true }
+iroh-mdns-address-lookup = { workspace = true }
+spoolframe-protocol = { workspace = true }
+spoolframe-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

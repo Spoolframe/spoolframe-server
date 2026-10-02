@@ -5,6 +5,7 @@
 //! API, so users, sessions and rate limits have a single owner.
 
 pub mod sessions;
+pub mod tracks;
 pub mod users;
 pub mod watch;
 

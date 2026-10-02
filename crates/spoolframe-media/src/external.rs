@@ -12,15 +12,23 @@ const EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt", "sup", "idx"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalFile {
     pub path: PathBuf,
+    pub name: NameTags,
+}
+
+/// What a subtitle file's name says about it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NameTags {
     /// The language code in the name (`en`, `eng`), if there is one.
     pub language: Option<String>,
     pub forced: bool,
     pub default: bool,
+    /// `sdh`, `cc` or `hi`: for deaf and hard-of-hearing viewers.
+    pub sdh: bool,
 }
 
 /// What the name `file_name` says about a subtitle for the media file
 /// whose stem is `stem`, or `None` if it is not one.
-fn parse(stem: &str, file_name: &str) -> Option<(Option<String>, bool, bool)> {
+fn parse(stem: &str, file_name: &str) -> Option<NameTags> {
     let rest = file_name.strip_prefix(stem)?.strip_prefix('.')?;
     let (middle, ext) = match rest.rsplit_once('.') {
         Some((middle, ext)) => (middle, ext),
@@ -29,23 +37,24 @@ fn parse(stem: &str, file_name: &str) -> Option<(Option<String>, bool, bool)> {
     if !EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
         return None;
     }
-    let mut language = None;
-    let (mut forced, mut default) = (false, false);
+    let mut tags = NameTags::default();
     for token in middle.split('.').filter(|t| !t.is_empty()) {
         match token.to_ascii_lowercase().as_str() {
-            "forced" => forced = true,
-            "default" => default = true,
-            t if language.is_none()
+            "forced" => tags.forced = true,
+            "default" => tags.default = true,
+            // Before the language rule: "cc" and "hi" would pass for codes.
+            "sdh" | "cc" | "hi" => tags.sdh = true,
+            t if tags.language.is_none()
                 && (2..=3).contains(&t.len())
                 && t.bytes().all(|b| b.is_ascii_alphabetic()) =>
             {
-                language = Some(t.to_owned());
+                tags.language = Some(t.to_owned());
             }
-            // "sdh", "cc", release-group tags…: not something to act on.
+            // Release-group tags and the like: not something to act on.
             _ => {}
         }
     }
-    Some((language, forced, default))
+    Some(tags)
 }
 
 /// The subtitle files beside `media`, in name order. A directory that
@@ -62,12 +71,10 @@ pub fn find(media: &Path) -> Vec<ExternalFile> {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name();
-            let (language, forced, default) = parse(stem, name.to_str()?)?;
+            let tags = parse(stem, name.to_str()?)?;
             Some(ExternalFile {
                 path: entry.path(),
-                language,
-                forced,
-                default,
+                name: tags,
             })
         })
         .collect();
@@ -85,16 +92,25 @@ mod tests {
         format!("{STEM}{rest}")
     }
 
+    fn tags(language: Option<&str>, forced: bool, default: bool, sdh: bool) -> NameTags {
+        NameTags {
+            language: language.map(str::to_owned),
+            forced,
+            default,
+            sdh,
+        }
+    }
+
     #[test]
     fn a_bare_srt_has_no_language() {
-        assert_eq!(parse(STEM, &name(".srt")), Some((None, false, false)));
+        assert_eq!(parse(STEM, &name(".srt")), Some(NameTags::default()));
     }
 
     #[test]
     fn a_language_code_is_read() {
         assert_eq!(
             parse(STEM, &name(".en.vtt")),
-            Some((Some("en".into()), false, false))
+            Some(tags(Some("en"), false, false, false))
         );
     }
 
@@ -102,15 +118,30 @@ mod tests {
     fn forced_and_default_are_read() {
         assert_eq!(
             parse(STEM, &name(".eng.forced.default.srt")),
-            Some((Some("eng".into()), true, true))
+            Some(tags(Some("eng"), true, true, false))
+        );
+    }
+
+    #[test]
+    fn sdh_cc_and_hi_are_read_and_are_not_languages() {
+        for tag in ["sdh", "cc", "hi", "SDH"] {
+            assert_eq!(
+                parse(STEM, &name(&format!(".en.{tag}.srt"))),
+                Some(tags(Some("en"), false, false, true)),
+                "{tag}"
+            );
+        }
+        assert_eq!(
+            parse(STEM, &name(".cc.srt")),
+            Some(tags(None, false, false, true))
         );
     }
 
     #[test]
     fn unknown_tokens_are_ignored() {
         assert_eq!(
-            parse(STEM, &name(".en.sdh.srt")),
-            Some((Some("en".into()), false, false))
+            parse(STEM, &name(".en.rarbg.srt")),
+            Some(tags(Some("en"), false, false, false))
         );
     }
 
@@ -159,6 +190,6 @@ mod tests {
             .map(|f| f.path.file_name().unwrap().to_str().unwrap())
             .collect();
         assert_eq!(names, ["Movie.de.forced.srt", "Movie.srt"]);
-        assert!(found[0].forced);
+        assert!(found[0].name.forced);
     }
 }

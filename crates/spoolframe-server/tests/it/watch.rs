@@ -1,6 +1,6 @@
 //! Watch state per user, and Home (P1-14), over a real Iroh connection.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 

@@ -8,13 +8,20 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use spoolframe_protocol::codec::{self, CodecError, MAX_FRAME};
 use spoolframe_protocol::{
+    AudioAction, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, SubtitleAction,
+    TrackReason,
+};
+use spoolframe_protocol::{
     AuthMethod, Error, Event, Hello, LoginPassword, PROTOCOL_VERSION, Reply, Request,
     RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_protocol::{
     PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleDelivery,
 };
-use spoolframe_types::{AudioCodec, ClientCapabilities, Container, SubtitleFormat, VideoCodec};
+use spoolframe_types::Delivery;
+use spoolframe_types::{
+    AudioCodec, ClientCapabilities, Container, SubtitleFormat, TrackPreferences, VideoCodec,
+};
 use spoolframe_types::{
     Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, MediaTracks, Movie, Namespace,
     PlaybackState,
@@ -48,6 +55,7 @@ fn hello() -> Hello {
             audio: [AudioCodec::Aac].into(),
             containers: [Container::Matroska].into(),
             subtitles: [SubtitleFormat::Srt].into(),
+            ..ClientCapabilities::default()
         }),
     }
 }
@@ -80,7 +88,25 @@ fn every_request_round_trips() {
         Request::ListSessions,
         Request::StartPlayback {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
-            selection: Selection::default(),
+            selection: Some(Selection::default()),
+        },
+        Request::StartPlayback {
+            id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
+            selection: None,
+        },
+        Request::GetTrackPreferences,
+        Request::SetTrackPreferences {
+            preferences: TrackPreferences::default(),
+        },
+        Request::SetTrackOverride {
+            id: MediaId::new(Namespace::Plex, MediaKind::Episode, "12").unwrap(),
+            selection: Selection {
+                audio: Some(2),
+                subtitle: None,
+            },
+        },
+        Request::ClearTrackOverride {
+            id: MediaId::new(Namespace::Plex, MediaKind::Episode, "12").unwrap(),
         },
         Request::UpdatePlaybackProgress {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
@@ -98,10 +124,10 @@ fn every_request_round_trips() {
         },
         Request::PlaybackPlan {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
-            selection: Selection {
+            selection: Some(Selection {
                 audio: Some(1),
                 subtitle: None,
-            },
+            }),
         },
     ] {
         round_trip(RequestEnvelope {
@@ -164,7 +190,16 @@ fn every_reply_round_trips() {
             handle: spoolframe_protocol::PlaybackHandle("h".into()),
             plan: PlaybackPlan::Unsupported { reasons: vec![] },
             size: 12_345,
+            chosen: Some(ChosenTracks {
+                selection: Selection {
+                    audio: Some(2),
+                    subtitle: Some(6),
+                },
+                audio: TrackReason::Preferences,
+                subtitle: TrackReason::Override,
+            }),
         },
+        Reply::TrackPreferences(TrackPreferences::default()),
         Reply::Subtitle {
             format: SubtitleFormat::Srt,
             bytes: b"1\n00:00:01,000 --> 00:00:02,000\nHi\n".to_vec(),
@@ -183,6 +218,7 @@ fn every_reply_round_trips() {
                     delivery: SubtitleDelivery::External,
                 }),
             },
+            chosen: None,
         },
         Reply::Sessions {
             sessions: vec![SessionInfo {
@@ -231,19 +267,67 @@ fn every_error_round_trips() {
 #[test]
 fn every_plan_kind_round_trips_phase_2_ones_included() {
     for plan in [
-        PlaybackPlan::Remux {
+        // A remux: every stream copied.
+        PlaybackPlan::Converted {
+            delivery: Delivery::Progressive,
             container: Container::Mp4,
+            video: Some(ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+            }),
+            audio: Some(ConvertedAudio {
+                index: 0,
+                action: AudioAction::Copy {
+                    codec: AudioCodec::Eac3,
+                },
+            }),
+            subtitle: None,
+            reasons: vec!["container: matroska not supported".into()],
         },
-        PlaybackPlan::Transcode {
-            video: Some(VideoCodec::H264),
-            audio: Some(AudioCodec::Aac),
+        PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: Container::Mp4,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: Some(8_000_000),
+                tone_map: true,
+            }),
+            audio: Some(ConvertedAudio {
+                index: 1,
+                action: AudioAction::Encode {
+                    codec: AudioCodec::Aac,
+                    channels: 2,
+                    bitrate: 192_000,
+                },
+            }),
+            subtitle: Some(ConvertedSubtitle {
+                index: 0,
+                action: SubtitleAction::BurnIn {
+                    format: SubtitleFormat::Pgs,
+                },
+            }),
+            reasons: vec!["subtitle 0: pgs cannot be shown; burned into the video".into()],
         },
         PlaybackPlan::Unsupported {
             reasons: vec!["audio 0: dts not supported".into()],
         },
     ] {
-        round_trip(Response::Ok(Reply::PlaybackPlan { plan }));
+        round_trip(Response::Ok(Reply::PlaybackPlan { plan, chosen: None }));
     }
+}
+
+#[test]
+fn plan_parts_from_a_newer_peer_decode_as_unknown() {
+    // Over the wire's own encoding: a newer peer's CBOR.
+    fn wire<T: DeserializeOwned>(value: serde_json::Value) -> T {
+        codec::decode(&codec::encode(&value).unwrap()).unwrap()
+    }
+    let plan: PlaybackPlan = wire(serde_json::json!({"type": "dash_ladder", "rungs": 4}));
+    assert_eq!(plan, PlaybackPlan::Unknown);
+    let video: ConvertedVideo = wire(serde_json::json!({"type": "super_resolve"}));
+    assert_eq!(video, ConvertedVideo::Unknown);
+    let delivery: Delivery = wire(serde_json::json!("dash"));
+    assert_eq!(delivery, Delivery::Unknown);
 }
 
 #[test]
@@ -450,4 +534,37 @@ async fn an_oversized_frame_is_refused_before_it_is_read() {
         .await
         .unwrap_err();
     assert!(matches!(err, CodecError::TooLarge { .. }), "{err}");
+}
+
+/// A client from before P1-20 sends a selection as a plain struct; it
+/// still decodes, as an explicit one.
+#[test]
+fn an_older_client_s_selection_is_still_explicit() {
+    #[derive(Serialize)]
+    struct OldStart {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        id: &'static str,
+        selection: Selection,
+    }
+    #[derive(Serialize)]
+    struct Envelope {
+        request: OldStart,
+    }
+    let bytes = codec::encode(&Envelope {
+        request: OldStart {
+            kind: "start_playback",
+            id: "plex:movie:1",
+            selection: Selection::default(),
+        },
+    })
+    .unwrap();
+    let decoded: RequestEnvelope = codec::decode(&bytes).unwrap();
+    assert!(matches!(
+        decoded.request,
+        Request::StartPlayback {
+            selection: Some(_),
+            ..
+        }
+    ));
 }

@@ -170,6 +170,47 @@ pub async fn user(listen: SocketAddr, command: UserCommand) -> Result<()> {
     result
 }
 
+/// Print the server's status, logged in as an admin.
+pub async fn status(listen: SocketAddr) -> Result<()> {
+    let login = connect(listen, None)
+        .await?
+        .login(admin_credentials()?)
+        .await
+        .map_err(api_error)?;
+    let api = connect(listen, Some(&login.token)).await?;
+    let result = api.server_status().await.map_err(api_error);
+    if let Err(e) = api.logout().await {
+        tracing::debug!(error = %e, "logout");
+    }
+    let status = result?;
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "none".to_owned()
+        } else {
+            v.join(", ")
+        }
+    };
+    println!("name: {}", status.name);
+    println!("version: {}", status.version);
+    println!(
+        "endpoint: {}",
+        status.endpoint_id.as_deref().unwrap_or("starting")
+    );
+    println!(
+        "video encoders: {}",
+        list(&status.transcoding.video_encoders)
+    );
+    println!(
+        "audio encoders: {}",
+        list(&status.transcoding.audio_encoders)
+    );
+    println!(
+        "hardware decoders: {}",
+        list(&status.transcoding.hardware_decoders)
+    );
+    Ok(())
+}
+
 async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>) -> Result<()> {
     let new_password = || new_password.clone().unwrap_or_default();
     match command {

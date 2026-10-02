@@ -28,6 +28,26 @@ pub struct AudioTrack {
     pub channels: Option<u32>,
     /// The file marks it as the one to play by default.
     pub default: bool,
+    /// What the track is for, whatever its title says (P1-20).
+    #[serde(default)]
+    pub role: AudioRole,
+}
+
+/// What an audio track is for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioRole {
+    /// The programme's own sound.
+    #[default]
+    Main,
+    /// Narration of what is on screen, for blind and partially sighted
+    /// viewers.
+    AudioDescription,
+    Commentary,
+    /// Anything else (karaoke, music and effects only), and any role this
+    /// build does not know.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,11 +56,31 @@ pub struct SubtitleTrack {
     pub language: Option<String>,
     pub title: Option<String>,
     /// Only for foreign-language parts of the dialogue; shown even when
-    /// subtitles are off.
+    /// subtitles are off. The same as `role == Forced`.
     pub forced: bool,
     pub default: bool,
     /// From a separate file next to the media, not inside it.
     pub external: bool,
+    /// What the track is for, whatever its title says (P1-20).
+    #[serde(default)]
+    pub role: SubtitleRole,
+}
+
+/// What a subtitle track is for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubtitleRole {
+    /// For deaf and hard-of-hearing viewers: dialogue plus sounds and
+    /// speakers.
+    Sdh,
+    /// Only foreign-language parts and signs.
+    Forced,
+    Commentary,
+    /// All the dialogue. Also any role this build does not know: showing
+    /// it is the safe guess. (Last, as serde wants of `other`.)
+    #[default]
+    #[serde(other)]
+    Full,
 }
 
 #[cfg(test)]
@@ -56,6 +96,7 @@ mod tests {
                 title: None,
                 channels: Some(6),
                 default: true,
+                role: AudioRole::Main,
             }],
             subtitles: vec![SubtitleTrack {
                 language: Some("eng".into()),
@@ -63,10 +104,26 @@ mod tests {
                 forced: true,
                 default: false,
                 external: true,
+                role: SubtitleRole::Forced,
             }],
         };
         let json = serde_json::to_value(&tracks).unwrap();
         assert_eq!(json["duration"], 6_106_791);
         assert_eq!(serde_json::from_value::<MediaTracks>(json).unwrap(), tracks);
+    }
+
+    #[test]
+    fn roles_from_an_older_or_newer_peer_still_decode() {
+        // Older: no role at all.
+        let old: AudioTrack = serde_json::from_value(serde_json::json!({
+            "language": "eng", "title": null, "channels": 2, "default": false
+        }))
+        .unwrap();
+        assert_eq!(old.role, AudioRole::Main);
+        // Newer: a role this build does not know.
+        let audio: AudioRole = serde_json::from_value(serde_json::json!("karaoke")).unwrap();
+        assert_eq!(audio, AudioRole::Other);
+        let subtitle: SubtitleRole = serde_json::from_value(serde_json::json!("lyrics")).unwrap();
+        assert_eq!(subtitle, SubtitleRole::Full);
     }
 }

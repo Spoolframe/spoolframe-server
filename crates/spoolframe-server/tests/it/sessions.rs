@@ -1,7 +1,7 @@
 //! Sessions bound to the endpoint that logged in, several per connection
 //! (P1-12).
 
-mod support;
+use crate::support;
 
 use spoolframe_protocol::{Error, PlaybackPlan, Reply, Request, Response, UserSummary};
 use spoolframe_types::ClientCapabilities;
@@ -214,6 +214,7 @@ async fn a_client_without_capabilities_gets_an_unsupported_plan() {
     };
     let Response::Ok(Reply::PlaybackPlan {
         plan: PlaybackPlan::Unsupported { reasons },
+        ..
     }) = tv.call(Some(&alice), request).await
     else {
         panic!("not an unsupported plan");

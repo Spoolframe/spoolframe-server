@@ -10,6 +10,7 @@
 
 pub mod artwork;
 pub mod codec;
+pub mod lan;
 pub mod media;
 pub mod messages;
 pub mod playback;
@@ -21,7 +22,10 @@ pub use messages::{
     AuthMethod, Error, Event, Hello, HomeScreen, LoginPassword, PROTOCOL_VERSION, Reply, Request,
     RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
 };
-pub use playback::{PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleDelivery};
+pub use playback::{
+    AudioAction, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, PlannedAudio,
+    PlannedSubtitle, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery, TrackReason,
+};
 
 /// The ALPN of the client protocol, version 1. A breaking change to the
 /// protocol is a new ALPN, so old and new clients can be served side by

@@ -1,6 +1,6 @@
 //! The artwork stream (P1-05) over a real Iroh connection.
 
-mod support;
+use crate::support;
 
 use spoolframe_protocol::{ArtworkResponse, ArtworkSize, Error};
 use spoolframe_types::{ArtworkId, Namespace};

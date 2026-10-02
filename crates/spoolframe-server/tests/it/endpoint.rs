@@ -1,7 +1,7 @@
 //! The server endpoint, dialled by a real Iroh client endpoint over
 //! loopback with relays off.
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

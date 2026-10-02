@@ -97,6 +97,20 @@ async fn a_subtitle_file_beside_the_media_is_added_with_its_name_s_language() {
 }
 
 #[tokio::test]
+async fn an_sdh_subtitle_file_gets_the_sdh_role() {
+    let dir = scratch("external-sdh");
+    let movie = media(&dir);
+    std::fs::write(dir.join("Movie.en.sdh.srt"), b"").unwrap();
+    let d = prober(ffprobe_with_fixtures(&dir))
+        .describe(&movie)
+        .await
+        .unwrap();
+    let last = d.subtitles.last().unwrap();
+    assert_eq!(last.role, spoolframe_types::SubtitleRole::Sdh);
+    assert_eq!(last.language.as_deref(), Some("en"));
+}
+
+#[tokio::test]
 async fn an_unchanged_file_is_probed_once() {
     let dir = scratch("cache-hit");
     let movie = media(&dir);

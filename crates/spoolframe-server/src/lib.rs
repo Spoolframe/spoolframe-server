@@ -15,4 +15,6 @@ pub mod planner;
 pub mod playback;
 pub mod principal;
 pub mod store;
+pub mod tracks;
+pub mod transcode;
 pub mod watch;

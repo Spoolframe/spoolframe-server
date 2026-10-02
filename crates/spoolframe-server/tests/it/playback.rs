@@ -1,6 +1,6 @@
 //! Direct play over Iroh (P1-08): playback sessions and range reads.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ async fn start(client: &TestClient, session: &SessionId, selection: Selection) -
             Some(session),
             Request::StartPlayback {
                 id: movie().id().clone(),
-                selection,
+                selection: Some(selection),
             },
         )
         .await

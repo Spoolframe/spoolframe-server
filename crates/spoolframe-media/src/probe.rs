@@ -10,6 +10,8 @@ use easy_ffprobe::FfProbe;
 
 use crate::descriptor::{MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream};
 use crate::external;
+use crate::roles;
+use spoolframe_types::SubtitleRole;
 
 /// Why a file could not be described. A probe never answers a failure
 /// with an empty descriptor.
@@ -121,15 +123,26 @@ impl Prober {
         file: external::ExternalFile,
     ) -> Result<Option<SubtitleStream>, ProbeError> {
         let probed = MediaDescriptor::from_probe(&self.run(&file.path).await?);
-        Ok(probed.subtitles.into_iter().next().map(|s| SubtitleStream {
-            kind: SubtitleKind::of_codec(&s.codec),
-            codec: s.codec,
+        let name = file.name;
+        Ok(probed.subtitles.into_iter().next().map(|s| {
             // The file name is what people set; the file rarely says.
-            language: file.language.or(s.language),
-            title: s.title,
-            forced: file.forced || s.forced,
-            default: file.default || s.default,
-            source: SubtitleSource::External { path: file.path },
+            let flags = roles::Flags {
+                forced: name.forced || s.role == SubtitleRole::Forced,
+                hearing_impaired: name.sdh || s.role == SubtitleRole::Sdh,
+                comment: s.role == SubtitleRole::Commentary,
+                ..roles::Flags::default()
+            };
+            let role = roles::subtitle_role(flags, s.title.as_deref());
+            SubtitleStream {
+                kind: SubtitleKind::of_codec(&s.codec),
+                codec: s.codec,
+                language: name.language.or(s.language),
+                title: s.title,
+                forced: role == SubtitleRole::Forced,
+                default: name.default || s.default,
+                role,
+                source: SubtitleSource::External { path: file.path },
+            }
         }))
     }
 

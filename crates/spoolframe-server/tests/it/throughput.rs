@@ -3,13 +3,13 @@
 //!
 //! ```text
 //! SPOOLFRAME_THROUGHPUT_FILE=/path/to/big.mkv \
-//!   cargo test --release -p spoolframe-server --test throughput -- --ignored --nocapture
+//!   cargo test --release -p spoolframe-server --test it throughput -- --ignored --nocapture
 //! ```
 //!
 //! `SPOOLFRAME_THROUGHPUT_INFLIGHT` sets how many 16 MiB reads are kept in
 //! flight (default 4), as a client would.
 
-mod support;
+use crate::support;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,7 +40,7 @@ async fn read_a_large_file() {
             Some(&session),
             Request::StartPlayback {
                 id: movie().id().clone(),
-                selection: Selection::default(),
+                selection: Some(Selection::default()),
             },
         )
         .await

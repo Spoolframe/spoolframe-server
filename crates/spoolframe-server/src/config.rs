@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use spoolframe_media::encoders::{Hardware, HardwarePolicy, TranscodeSettings};
 use spoolframe_plex::{PathMap, PathMapping};
 
 use crate::network::{EndpointOptions, Relay};
@@ -73,6 +74,12 @@ pub struct ServerConfig {
     /// When an item counts as started and watched.
     #[ucl(default)]
     pub watch: WatchConfig,
+    /// The ffmpeg tools the server runs.
+    #[ucl(default)]
+    pub media: MediaConfig,
+    /// Which encoders to use (P2-02).
+    #[ucl(default)]
+    pub transcode: TranscodeConfig,
 }
 
 /// `watch { started_after_secs = 60; watched_percent = 90;
@@ -108,6 +115,79 @@ impl WatchConfig {
                 .watched_remaining_secs
                 .map_or(defaults.watched_remaining, Duration::from_secs),
             ..defaults
+        })
+    }
+}
+
+/// `media { ffmpeg = "ffmpeg"; ffprobe = "ffprobe"; }`, all optional: by
+/// default whatever is on `PATH`, which the nix package wraps.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct MediaConfig {
+    #[ucl(default)]
+    pub ffmpeg: Option<PathBuf>,
+    #[ucl(default)]
+    pub ffprobe: Option<PathBuf>,
+}
+
+impl MediaConfig {
+    pub fn ffmpeg(&self) -> PathBuf {
+        self.ffmpeg.clone().unwrap_or_else(|| "ffmpeg".into())
+    }
+
+    pub fn ffprobe(&self) -> PathBuf {
+        self.ffprobe.clone().unwrap_or_else(|| "ffprobe".into())
+    }
+}
+
+/// `transcode { hardware = "nvenc,vaapi"; vaapi_device = "/dev/dri/renderD128"; }`,
+/// all optional.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct TranscodeConfig {
+    /// `auto` (every family that works), `none` for software only, or
+    /// families in order of preference, comma-separated: `nvenc,vaapi`
+    /// encodes on NVIDIA what it can and the rest on VA-API.
+    #[ucl(default)]
+    pub hardware: Option<String>,
+    #[ucl(default)]
+    pub vaapi_device: Option<PathBuf>,
+}
+
+impl TranscodeConfig {
+    pub fn settings(&self) -> Result<TranscodeSettings, ConfigError> {
+        let invalid = |message: String| ConfigError::Invalid {
+            key: "transcode.hardware",
+            message,
+        };
+        let hardware = match self.hardware.as_deref().unwrap_or("auto").trim() {
+            "auto" => HardwarePolicy::Auto,
+            "none" => HardwarePolicy::None,
+            list => {
+                let mut order = Vec::new();
+                for name in list.split(',').map(str::trim) {
+                    let family = match name {
+                        "vaapi" => Hardware::Vaapi,
+                        "nvenc" => Hardware::Nvenc,
+                        "qsv" => Hardware::Qsv,
+                        other => {
+                            return Err(invalid(format!(
+                                "{other:?}: expected auto, none, or a list of vaapi, nvenc and qsv"
+                            )));
+                        }
+                    };
+                    if order.contains(&family) {
+                        return Err(invalid(format!("{name:?} is listed twice")));
+                    }
+                    order.push(family);
+                }
+                HardwarePolicy::Ordered(order)
+            }
+        };
+        let defaults = TranscodeSettings::default();
+        Ok(TranscodeSettings {
+            hardware,
+            vaapi_device: self.vaapi_device.clone().unwrap_or(defaults.vaapi_device),
         })
     }
 }
@@ -169,7 +249,8 @@ impl AdminConfig {
     }
 }
 
-/// `network { port = 7420; relay = "disabled"; }`, all optional.
+/// `network { port = 7420; relay = "disabled"; mdns = true; }`, all
+/// optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct NetworkConfig {
@@ -179,9 +260,13 @@ pub struct NetworkConfig {
     pub port: Option<u16>,
     /// `"disabled"` (the default), `"default"` for the public n0 relays,
     /// or a relay URL. Phase 1 is LAN only and accepts only `"disabled"`;
-    /// the others are parsed so remote access (P3) only has to lift that.
+    /// the others are parsed so remote access (P6) only has to lift that.
     #[ucl(default)]
     pub relay: Option<String>,
+    /// Announce the server on the LAN over mDNS (P1-13), so clients list
+    /// it without being told its address. On unless set to `false`.
+    #[ucl(default)]
+    pub mdns: Option<bool>,
 }
 
 impl NetworkConfig {
@@ -207,6 +292,7 @@ impl NetworkConfig {
         Ok(EndpointOptions {
             port: self.port,
             relay,
+            mdns: self.mdns.unwrap_or(true),
         })
     }
 }
@@ -334,6 +420,7 @@ impl ServerConfig {
         parsed.network.endpoint_options()?;
         parsed.admin.listen()?;
         parsed.watch.rules()?;
+        parsed.transcode.settings()?;
         Ok(parsed)
     }
 
@@ -497,6 +584,49 @@ mod tests {
         let options = config.network.endpoint_options().unwrap();
         assert_eq!(options.relay, Relay::Disabled);
         assert_eq!(options.port, None);
+        assert!(options.mdns);
+    }
+
+    #[test]
+    fn transcoding_defaults_to_auto_on_the_first_render_node() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(
+            config.transcode.settings().unwrap(),
+            TranscodeSettings::default()
+        );
+        assert_eq!(config.media.ffmpeg(), PathBuf::from("ffmpeg"));
+    }
+
+    #[test]
+    fn a_hardware_family_is_read_and_a_bad_one_refused() {
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; } transcode { hardware = "none"; vaapi_device = "/dev/dri/renderD129"; }"#,
+        )
+        .unwrap();
+        let settings = config.transcode.settings().unwrap();
+        assert_eq!(settings.hardware, HardwarePolicy::None);
+        assert_eq!(settings.vaapi_device, PathBuf::from("/dev/dri/renderD129"));
+        let ordered =
+            plex(r#"plex { url = "http://nas:32400"; } transcode { hardware = "nvenc, vaapi"; }"#)
+                .unwrap();
+        assert_eq!(
+            ordered.transcode.settings().unwrap().hardware,
+            HardwarePolicy::Ordered(vec![Hardware::Nvenc, Hardware::Vaapi])
+        );
+        assert!(matches!(
+            plex(r#"plex { url = "http://nas:32400"; } transcode { hardware = "cuda"; }"#),
+            Err(ConfigError::Invalid {
+                key: "transcode.hardware",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mdns_can_be_turned_off() {
+        let config =
+            plex(r#"plex { url = "http://nas:32400"; } network { mdns = false; }"#).unwrap();
+        assert!(!config.network.endpoint_options().unwrap().mdns);
     }
 
     #[test]

@@ -33,8 +33,11 @@ in
 
       cargoExtraArgs = "-p spoolframe-server";
 
-      # The server runs ffprobe on every file it serves (P1-06); put it on
-      # the binary's PATH rather than relying on the host having one.
+      # The server runs ffprobe on every file it serves (P1-06) and ffmpeg
+      # to encode (P2-02); put them on the binary's PATH rather than relying
+      # on the host having one. nixpkgs' ffmpeg-headless already has VA-API
+      # and NVENC (the CUDA driver is loaded at run time), so no override:
+      # QSV is the one it lacks, and Intel GPUs encode through VA-API.
       nativeBuildInputs = commonArgs.nativeBuildInputs ++ [makeWrapper];
       postInstall = ''
         wrapProgram $out/bin/spoolframe-server \

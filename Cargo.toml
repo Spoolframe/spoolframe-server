@@ -8,7 +8,7 @@ exclude = ["vendor"]
 # No workspace-wide license: the protocol, types and client SDK are
 # permissive so that any client may link them, the server crates are AGPL
 # (ARCHITECTURE §56). Each crate states its own, and
-# `spoolframe-server/tests/license_boundary.rs` keeps the two sides apart.
+# `spoolframe-server/tests/it/license_boundary.rs` keeps the two sides apart.
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -23,6 +23,7 @@ spoolframe-plex = { path = "crates/spoolframe-plex" }
 spoolframe-media = { path = "crates/spoolframe-media" }
 spoolframe-protocol = { path = "crates/spoolframe-protocol" }
 spoolframe-admin-api = { path = "crates/spoolframe-admin-api" }
+spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk" }
 
 # Vendored (vendor/easy-ffprobe/VENDORED.md). Only the typed model of
 # ffprobe's JSON is used.
@@ -31,12 +32,16 @@ easy-ffprobe = { path = "vendor/easy-ffprobe", default-features = false, feature
 # Async. `async-trait` because the server holds the catalog as `dyn Catalog`,
 # and native async trait methods are not object-safe.
 async-trait = "0.1"
+# Streams (mDNS discovery events).
+futures-util = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "signal", "io-util"] }
 
 # Transport and endpoint identity (ARCHITECTURE §11). No default features:
 # ring for TLS, and no portmapper (UPnP/NAT-PMP) or metrics while Phase 1
 # is LAN only.
 iroh = { version = "1.3", default-features = false, features = ["tls-ring"] }
+# LAN discovery (P1-13). Iroh keeps mDNS out of its own crate since 1.0.
+iroh-mdns-address-lookup = "0.6"
 
 # The server database: SQLite through sqlx, with its migrator. Runtime
 # queries only; `macros` is for `migrate!`, which embeds the migrations.

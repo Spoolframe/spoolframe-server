@@ -6,14 +6,16 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
+use spoolframe_media::encoders::FfmpegCommand;
 use spoolframe_plex::{Failures, LibraryPaths, PlexCatalog, Scope};
-use spoolframe_server::admin::{self, SetupCode};
+use spoolframe_server::admin::{self, SetupCode, StatusSource};
 use spoolframe_server::artwork::ArtworkCache;
 use spoolframe_server::auth::Auth;
 use spoolframe_server::config::ServerConfig;
 use spoolframe_server::identity;
 use spoolframe_server::network::{Server, Services};
 use spoolframe_server::store::Store;
+use spoolframe_server::transcode::{self, Transcoding};
 use spoolframe_server::watch::Watch;
 use spoolframe_types::MediaId;
 use tracing_subscriber::EnvFilter;
@@ -58,6 +60,9 @@ enum Command {
     /// Print the server's EndpointId, the identity clients pin. Creates the
     /// server key if this is the first start.
     Id,
+    /// The running server's name, key, version and encoders, as an admin
+    /// sees them.
+    Status,
     /// Register the first admin on a server that has no users yet. The
     /// server must be running.
     Setup {
@@ -134,6 +139,7 @@ async fn main() -> Result<()> {
             password_stdin,
         }) => admin_cli::setup(config.admin.listen()?, code, username, password_stdin).await,
         Some(Command::User { command }) => admin_cli::user(config.admin.listen()?, command).await,
+        Some(Command::Status) => admin_cli::status(config.admin.listen()?).await,
         Some(Command::Id) => {
             println!("{}", identity::load_or_create(&config.state_dir)?.public());
             Ok(())
@@ -143,7 +149,7 @@ async fn main() -> Result<()> {
         }) => check_paths(&plex(&config)?, library.as_deref()).await,
         Some(Command::Media {
             command: MediaCommand::Probe { id },
-        }) => probe(&plex(&config)?, &id).await,
+        }) => probe(&plex(&config)?, &id, config.media.ffprobe()).await,
     }
 }
 
@@ -152,9 +158,9 @@ fn plex(config: &ServerConfig) -> Result<PlexCatalog> {
         .with_paths(config.plex.path_map()?))
 }
 
-async fn probe(catalog: &dyn Catalog, id: &MediaId) -> Result<()> {
+async fn probe(catalog: &dyn Catalog, id: &MediaId, ffprobe: PathBuf) -> Result<()> {
     let path = catalog.media_path(id).await?;
-    let prober = Prober::new("ffprobe", Prober::DEFAULT_TIMEOUT);
+    let prober = Prober::new(ffprobe, Prober::DEFAULT_TIMEOUT);
     let descriptor = prober.describe(&path).await?;
     println!("{}", serde_json::to_string_pretty(&*descriptor)?);
     Ok(())
@@ -167,7 +173,14 @@ async fn run(config: &ServerConfig) -> Result<()> {
     let plex = Arc::new(plex(config)?);
     let catalog: Arc<dyn Catalog> = plex.clone();
     check_catalog(&plex, catalog.as_ref()).await;
-    let prober = Arc::new(Prober::new("ffprobe", Prober::DEFAULT_TIMEOUT));
+    let prober = Arc::new(Prober::new(config.media.ffprobe(), Prober::DEFAULT_TIMEOUT));
+    let transcoding = Arc::new(Transcoding::new(
+        Box::new(FfmpegCommand::new(config.media.ffmpeg())),
+        config.transcode.settings()?,
+        config.state_dir.join("cache").join("encoder-test"),
+    ));
+    transcode::spawn_detection(transcoding.clone());
+    let status = Arc::new(StatusSource::new(config.server_name(), transcoding.clone()));
     let artwork_dir = config.state_dir.join("cache").join("artwork");
     let artwork = Arc::new(
         ArtworkCache::open(&artwork_dir, config.artwork.cache_bytes(), catalog.clone())
@@ -194,7 +207,7 @@ async fn run(config: &ServerConfig) -> Result<()> {
     } else {
         None
     };
-    let (admin_addr, admin) = admin::serve(admin_listen, auth.clone(), setup_code)
+    let (admin_addr, admin) = admin::serve(admin_listen, auth.clone(), setup_code, status.clone())
         .await
         .with_context(|| format!("cannot start the admin API on {admin_listen}"))?;
     tracing::info!(addr = %admin_addr, "admin API listening");
@@ -209,9 +222,11 @@ async fn run(config: &ServerConfig) -> Result<()> {
             artwork,
             playbacks: Arc::default(),
             watch,
+            transcoding,
         },
     )
     .await?;
+    status.set_endpoint_id(server.id().to_string());
     let addrs: Vec<_> = server.addr().ip_addrs().map(ToString::to_string).collect();
     tracing::info!(endpoint_id = %server.id(), ?addrs, "listening");
 

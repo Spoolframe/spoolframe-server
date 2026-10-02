@@ -101,3 +101,60 @@
   carries the user's own `PlaybackState`.
 - `Home`: continue watching, next up (the episode after the latest
   watched one of recently watched shows) and recently added.
+- The server announces itself on the LAN over mDNS (service
+  `_spoolframe._udp.local`, its name in the record); `network { mdns =
+  false; }` keeps it off. Hosts need inbound UDP 5353 open to hear it.
+- `spoolframe-client-sdk`: `Client::open(storage, device)` with the
+  app's `Storage` (secrets and plain data). The device key is made once
+  and never replaced; unreadable storage is an error. The client lists
+  servers heard on the LAN and saved ones (`servers()`), takes typed-in
+  addresses (`add_address`), and pins a server's key on first `connect`;
+  a server with the same name and another key stays a separate server.
+  The client never announces itself.
+- SDK sessions: `sign_in`, `profiles` ("who's watching", named by
+  `WhoAmI`), and a `Session` per user with typed calls: home, libraries,
+  items, item, search, tracks, playback plan, start playback, range reads,
+  subtitles, artwork, progress and watched marks, sessions and sign-out.
+  Every session shares the device's one connection to a server. A session
+  the server no longer knows is forgotten, and the call says
+  `SignInRequired`.
+- The SDK keeps each server connected: when the connection is lost or the
+  server says it is shutting down, it dials the pinned key again (backoff
+  from 250 ms to 10 s) and the sessions go on working. `Client::state`
+  reports `Disconnected`, `Connecting`, `Connected` and `Reconnecting {
+  attempt }`. A call made while reconnecting waits up to 10 s, then fails
+  with `Unreachable`.
+- Track roles: every audio track is `main`, `audio_description`,
+  `commentary` or `other`, every subtitle `full`, `sdh`, `forced` or
+  `commentary`, from the file's disposition flags and then its title
+  (whole words: "Audio Description", "SDH", "Forced", …) or, for subtitle
+  files, `.sdh`/`.cc`/`.hi` in the name. `Tracks` replies carry them.
+- Track preferences per user (`GetTrackPreferences`,
+  `SetTrackPreferences`): audio languages and roles to avoid; subtitle
+  mode (`always`, `foreign_only`, `forced_only`, `off`), languages and
+  SDH. `PlaybackPlan` and `StartPlayback` without a `selection` let the
+  server choose the tracks; the reply's `chosen` says which and why. A
+  pick can be kept for the rest of a series or for a movie
+  (`SetTrackOverride`, `ClearTrackOverride`), by language and role.
+- A NixOS module, `services.spoolframe` (`nixosModules.spoolframe`, also
+  re-exported by foundry's root flake): a hardened service under its own
+  user, the Plex token as a systemd credential, path mappings, the port
+  and mDNS, and a `spoolframe` admin CLI that knows the host's config.
+  `checks.nixos-module` runs it in a VM.
+- Encoder detection (P2-02): at start and on SIGHUP the server
+  test-encodes with every VA-API, NVENC, QSV and software video encoder
+  ffmpeg lists and keeps the ones that work, hardware first; audio
+  encoders come from ffmpeg's list. `transcode { hardware = "auto" |
+  "vaapi" | "nvenc" | "qsv" | "none"; vaapi_device; }`, and `media {
+  ffmpeg; ffprobe; }` for the tool paths. `spoolframe-server status` (the
+  admin API's `serverStatus`) shows what was found. The NixOS module
+  gives the service the GPU's device nodes when hardware may be used.
+- Converted playback plans (P2-01). Capabilities gain `delivery` (range,
+  hls, progressive), `max_video` (height, frame rate, bit depth, HDR
+  formats shown), `max_audio_channels` and `max_bitrate`, all optional.
+  `Remux` and `Transcode` become one `Converted` plan: per stream copy or
+  encode, subtitles copied, converted (to WebVTT for HLS) or burned in,
+  with reasons. The planner copies what fits and encodes the rest with
+  the detected encoders; a Phase 1 client gets the plans it got before.
+  `StartPlayback` refuses a converted plan until conversions are served
+  (P2-03), naming why it would convert.

@@ -14,7 +14,7 @@ pub enum SessionBinding {
         endpoint_id: String,
         device_name: Option<String>,
     },
-    /// The admin API: the CLI, and the web UI (P1-17).
+    /// The admin API: the CLI, and the web UI (P3-01).
     Api,
 }
 

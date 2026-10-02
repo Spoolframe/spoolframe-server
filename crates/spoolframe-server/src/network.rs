@@ -10,9 +10,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 
 use iroh::endpoint::{Connection, VarInt, presets};
+use iroh::endpoint_info::UserData;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
-use spoolframe_protocol::{CLIENT_ALPN, FEDERATION_ALPN, PROTOCOL_VERSION, ServerInfo, close};
+use iroh_mdns_address_lookup::MdnsAddressLookup;
+use spoolframe_protocol::{CLIENT_ALPN, FEDERATION_ALPN, PROTOCOL_VERSION, ServerInfo, close, lan};
 
 use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
@@ -21,6 +23,7 @@ use crate::artwork::ArtworkCache;
 use crate::auth::Auth;
 use crate::client::{self, ClientProtocol};
 use crate::playback::Playbacks;
+use crate::transcode::Transcoding;
 use crate::watch::Watch;
 use url::Url;
 
@@ -41,6 +44,8 @@ pub struct EndpointOptions {
     /// The UDP port to listen on (IPv4 and IPv6); `None` picks a free one.
     pub port: Option<u16>,
     pub relay: Relay,
+    /// Announce the server on the LAN over mDNS (P1-13).
+    pub mdns: bool,
 }
 
 /// What the server knows about who is on the other end of a connection.
@@ -95,6 +100,8 @@ pub struct Services {
     pub artwork: Arc<ArtworkCache>,
     pub playbacks: Arc<Playbacks>,
     pub watch: Arc<Watch>,
+    /// The encoders the planner may use (P2-02).
+    pub transcoding: Arc<Transcoding>,
 }
 
 impl std::fmt::Debug for Services {
@@ -128,12 +135,20 @@ impl Server {
             port: options.port,
             message,
         };
-        // Minimal: no address lookup services. LAN discovery is added
-        // with mDNS (P1-13), and pkarr/DNS lookup with remote access (P3).
+        // Minimal: no address lookup services but the mDNS added here;
+        // pkarr/DNS lookup comes with remote access (P6).
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(key)
             .relay_mode(relay)
             .alpns(vec![CLIENT_ALPN.to_vec(), FEDERATION_ALPN.to_vec()]);
+        if options.mdns {
+            let advert: UserData = lan::advert(name)
+                .parse()
+                .expect("lan::advert fits the record");
+            builder = builder
+                .address_lookup(MdnsAddressLookup::builder().service_name(lan::MDNS_SERVICE))
+                .user_data_for_address_lookup(advert);
+        }
         if let Some(port) = options.port {
             builder = builder
                 .clear_ip_transports()

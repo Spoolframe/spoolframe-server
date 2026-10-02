@@ -10,6 +10,11 @@
 
   outputs = inputs @ {flake-parts, ...}:
     flake-parts.lib.mkFlake {inherit inputs;} {
+      flake.nixosModules = {
+        default = ./nix/nixos-module.nix;
+        spoolframe = ./nix/nixos-module.nix;
+      };
+
       systems = [
         "x86_64-linux"
         "aarch64-linux"
@@ -34,6 +39,13 @@
       in {
         packages.default = pkgs.callPackage ./nix/package.nix {
           inherit lib craneLib;
+        };
+        checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          nixos-module = import ./nix/tests.nix {
+            inherit pkgs;
+            spoolframePackage = pkgs.callPackage ./nix/package.nix {inherit lib craneLib;};
+            spoolframeModule = ./nix/nixos-module.nix;
+          };
         };
         formatter = pkgs.alejandra;
       };

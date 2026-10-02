@@ -6,6 +6,7 @@
 //! an explicit `allow_remote`.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use jsonrpsee::Extensions;
@@ -14,13 +15,15 @@ use jsonrpsee::server::{HttpRequest, Server, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
 use spoolframe_admin_api::{
-    AdminApiServer, Credentials, LoggedIn, NewUser, SetupRequest, UserInfo, error_code,
+    AdminApiServer, Credentials, LoggedIn, NewUser, ServerStatus, SetupRequest, TranscodingStatus,
+    UserInfo, error_code,
 };
 use tower::{Layer, Service};
 
 use crate::auth::{Auth, LoginError, PasswordError, hash_password};
 use crate::store::sessions::{ApiSessionUser, SessionBinding};
 use crate::store::users::{UserError, normalize_username};
+use crate::transcode::Transcoding;
 
 /// What the failure limit counts for admin logins besides the username.
 /// The API listens on loopback, where the peer address says nothing.
@@ -88,25 +91,75 @@ impl SetupCode {
     }
 }
 
+/// What `serverStatus` reports. The endpoint starts after the admin API,
+/// so its key is filled in when it is known.
+#[derive(Debug)]
+pub struct StatusSource {
+    pub name: String,
+    pub transcoding: Arc<Transcoding>,
+    endpoint_id: OnceLock<String>,
+}
+
+impl StatusSource {
+    pub fn new(name: impl Into<String>, transcoding: Arc<Transcoding>) -> Self {
+        Self {
+            name: name.into(),
+            transcoding,
+            endpoint_id: OnceLock::new(),
+        }
+    }
+
+    pub fn set_endpoint_id(&self, id: String) {
+        let _ = self.endpoint_id.set(id);
+    }
+
+    fn status(&self) -> ServerStatus {
+        let encoders = self.transcoding.encoders();
+        ServerStatus {
+            name: self.name.clone(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            endpoint_id: self.endpoint_id.get().cloned(),
+            transcoding: TranscodingStatus {
+                video_encoders: encoders.video.iter().map(|e| e.name.clone()).collect(),
+                audio_encoders: encoders.audio.iter().map(|e| e.name.clone()).collect(),
+                hardware_decoders: encoders
+                    .hardware_decoders
+                    .iter()
+                    .map(|d| format!("{} ({:?})", d.codec, d.hardware).to_lowercase())
+                    .collect(),
+            },
+        }
+    }
+}
+
 /// Start the admin API on `listen`. `setup_code` is the code `setup`
 /// accepts; `None` when the server already had users at start.
 pub async fn serve(
     listen: SocketAddr,
     auth: Auth,
     setup_code: Option<SetupCode>,
+    status: Arc<StatusSource>,
 ) -> std::io::Result<(SocketAddr, ServerHandle)> {
     let server = Server::builder()
         .set_http_middleware(tower::ServiceBuilder::new().layer(BearerLayer))
         .build(listen)
         .await?;
     let addr = server.local_addr()?;
-    let handle = server.start(AdminApi { auth, setup_code }.into_rpc());
+    let handle = server.start(
+        AdminApi {
+            auth,
+            setup_code,
+            status,
+        }
+        .into_rpc(),
+    );
     Ok((addr, handle))
 }
 
 struct AdminApi {
     auth: Auth,
     setup_code: Option<SetupCode>,
+    status: Arc<StatusSource>,
 }
 
 fn error(code: i32, message: impl Into<String>) -> ErrorObjectOwned {
@@ -306,6 +359,11 @@ impl AdminApiServer for AdminApi {
     async fn user_enable(&self, ext: &Extensions, username: String) -> RpcResult<()> {
         self.admin(ext).await?;
         Ok(self.auth.store().enable_user(&username).await?)
+    }
+
+    async fn server_status(&self, ext: &Extensions) -> RpcResult<ServerStatus> {
+        self.admin(ext).await?;
+        Ok(self.status.status())
     }
 }
 

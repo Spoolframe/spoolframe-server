@@ -1,6 +1,6 @@
 //! The server's admin API: JSON-RPC over WebSocket (ARCHITECTURE §35).
 //!
-//! The `spoolframe-server` CLI uses it now and the web UI (P1-17, P6)
+//! The `spoolframe-server` CLI uses it now and the web UI (P3-01, P3-02)
 //! later. Methods are in the `admin` namespace (`admin.login`,
 //! `admin.userAdd`, …). A session token from `setup` or `login` goes in
 //! the `Authorization: Bearer` header of the WebSocket upgrade.
@@ -123,6 +123,29 @@ impl fmt::Debug for NewUser {
     }
 }
 
+/// What the server is and can do, for an admin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerStatus {
+    pub name: String,
+    pub version: String,
+    /// The key clients pin; `None` while the endpoint is starting.
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
+    pub transcoding: TranscodingStatus,
+}
+
+/// The encoders that work on this machine (P2-02), preferred first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscodingStatus {
+    /// ffmpeg's names, e.g. `hevc_vaapi`, `libx264`.
+    pub video_encoders: Vec<String>,
+    pub audio_encoders: Vec<String>,
+    /// Codecs with a working hardware decoder, as `hevc (vaapi)`.
+    pub hardware_decoders: Vec<String>,
+}
+
 #[cfg_attr(
     all(feature = "client", feature = "server"),
     jsonrpsee::proc_macros::rpc(client, server, namespace = "admin")
@@ -163,4 +186,8 @@ pub trait AdminApi {
 
     #[method(name = "userEnable", with_extensions)]
     async fn user_enable(&self, username: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// The server's name, key, version and encoders. Admins only.
+    #[method(name = "serverStatus", with_extensions)]
+    async fn server_status(&self) -> jsonrpsee::core::RpcResult<ServerStatus>;
 }

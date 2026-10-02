@@ -12,10 +12,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{
     ClientCapabilities, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat,
+    TrackPreferences,
 };
 
 use crate::media::PlaybackHandle;
-use crate::playback::{PlaybackPlan, Selection};
+use crate::playback::{ChosenTracks, PlaybackPlan, Selection};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// when features are added; a breaking change is a new ALPN instead.
@@ -79,17 +80,19 @@ pub enum Request {
     /// The session user's live sessions on every device.
     ListSessions,
     /// How the server would play `id` for this client with these tracks.
+    /// Without a selection the server chooses them from the user's
+    /// preferences (P1-20) and says which in the reply.
     PlaybackPlan {
         id: MediaId,
         #[serde(default)]
-        selection: Selection,
+        selection: Option<Selection>,
     },
     /// Plan `id` and, if it plays directly, open a playback session to
-    /// read it through.
+    /// read it through. Without a selection, as for `PlaybackPlan`.
     StartPlayback {
         id: MediaId,
         #[serde(default)]
-        selection: Selection,
+        selection: Option<Selection>,
     },
     /// The selected external subtitle of a playback, whole.
     ReadSubtitle {
@@ -110,6 +113,23 @@ pub enum Request {
     },
     /// The session user's home screen.
     Home,
+    /// How the session user wants tracks chosen (P1-20).
+    GetTrackPreferences,
+    /// Replace them, for every device of the user.
+    SetTrackPreferences {
+        preferences: TrackPreferences,
+    },
+    /// Use the tracks of `selection` in `id` for the rest of its series
+    /// (an episode) or for it (anything else), by language and role. No
+    /// subtitle in `selection` means subtitles off.
+    SetTrackOverride {
+        id: MediaId,
+        selection: Selection,
+    },
+    /// Back to the preferences for `id`'s series or for it.
+    ClearTrackOverride {
+        id: MediaId,
+    },
 
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
@@ -233,6 +253,9 @@ pub enum Reply {
     },
     PlaybackPlan {
         plan: PlaybackPlan,
+        /// The tracks the server chose, when the request had no selection.
+        #[serde(default)]
+        chosen: Option<ChosenTracks>,
     },
     PlaybackStarted {
         handle: PlaybackHandle,
@@ -240,6 +263,9 @@ pub enum Reply {
         plan: PlaybackPlan,
         /// The size of the file the handle reads.
         size: u64,
+        /// The tracks the server chose, when the request had no selection.
+        #[serde(default)]
+        chosen: Option<ChosenTracks>,
     },
     Subtitle {
         format: SubtitleFormat,
@@ -249,6 +275,7 @@ pub enum Reply {
     /// The request was carried out; there is nothing to return.
     Done,
     Home(HomeScreen),
+    TrackPreferences(TrackPreferences),
 }
 
 /// Rows for a home screen. Every item carries the user's playback state.

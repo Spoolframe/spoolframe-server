@@ -5,23 +5,25 @@
 //! Only the pre-auth requests are served without a session.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use spoolframe_catalog::{CatalogError, Page};
-use spoolframe_media::SubtitleSource;
+use spoolframe_media::{MediaDescriptor, SubtitleSource};
 use spoolframe_protocol::codec::{self, read_frame_bytes, write_frame};
 use spoolframe_protocol::streams::{bi, reset, uni};
 use spoolframe_protocol::{
-    ArtworkReply, ArtworkRequest, ArtworkResponse, MAX_READ, MediaRead, MediaReadReply,
-    MediaReadResponse, PlaybackHandle, PlaybackPlan,
+    ArtworkReply, ArtworkRequest, ArtworkResponse, ChosenTracks, MAX_READ, MediaRead,
+    MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan, Selection,
 };
 use spoolframe_protocol::{
     AuthMethod, Error, Event, Hello, LoginPassword, Reply, Request, RequestEnvelope, Response,
     ServerInfo, SessionId, SessionInfo, UserSummary,
 };
+use spoolframe_types::{Item, MediaId, MediaKind};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
@@ -32,6 +34,7 @@ use crate::planner;
 use crate::playback::{Playback, Refusal, Sidecar};
 use crate::principal::Principal;
 use crate::store::sessions::{SessionBinding, SessionUser};
+use crate::tracks::{self, TrackOverride};
 use crate::watch::WatchError;
 
 /// How long shutdown waits to deliver `ShuttingDown` to one client.
@@ -468,14 +471,39 @@ impl ClientProtocol {
                     .map_err(watch_error)?,
             )),
             Request::Tracks { id } => {
-                let path = catalog.media_path(&id).await.map_err(catalog_error)?;
-                let descriptor = self.services.prober.describe(&path).await.map_err(|e| {
-                    tracing::warn!(%id, error = %e, "cannot describe a media file");
-                    Error::Unavailable {
-                        message: "the media file could not be read".into(),
-                    }
-                })?;
+                let (_, descriptor) = self.describe(&id).await?;
                 Ok(Reply::Tracks(descriptor.tracks()))
+            }
+            Request::GetTrackPreferences => Ok(Reply::TrackPreferences(
+                self.store()
+                    .track_preferences(principal)
+                    .await
+                    .map_err(internal)?,
+            )),
+            Request::SetTrackPreferences { preferences } => {
+                self.store()
+                    .set_track_preferences(principal, &preferences)
+                    .await
+                    .map_err(internal)?;
+                Ok(Reply::Done)
+            }
+            Request::SetTrackOverride { id, selection } => {
+                let (_, descriptor) = self.describe(&id).await?;
+                let override_ = TrackOverride::from_selection(&descriptor.tracks(), selection);
+                let scope = self.override_scope(&id).await?;
+                self.store()
+                    .set_track_override(principal, &scope, &override_)
+                    .await
+                    .map_err(internal)?;
+                Ok(Reply::Done)
+            }
+            Request::ClearTrackOverride { id } => {
+                let scope = self.override_scope(&id).await?;
+                self.store()
+                    .clear_track_override(principal, &scope)
+                    .await
+                    .map_err(internal)?;
+                Ok(Reply::Done)
             }
             Request::PlaybackPlan { id, selection } => {
                 // Capabilities belong to the connection: they came with Hello.
@@ -484,29 +512,35 @@ impl ClientProtocol {
                     // No file needs reading to know the answer.
                     return Ok(Reply::PlaybackPlan {
                         plan: planner::plan_without_capabilities(),
+                        chosen: None,
                     });
                 }
-                let path = catalog.media_path(&id).await.map_err(catalog_error)?;
-                let descriptor = self.services.prober.describe(&path).await.map_err(|e| {
-                    tracing::warn!(%id, error = %e, "cannot describe a media file");
-                    Error::Unavailable {
-                        message: "the media file could not be read".into(),
-                    }
-                })?;
+                let (_, descriptor) = self.describe(&id).await?;
+                let (selection, chosen) = self
+                    .selection(principal, &id, &descriptor, selection)
+                    .await?;
                 Ok(Reply::PlaybackPlan {
-                    plan: planner::plan(&descriptor, caps, selection),
+                    plan: planner::plan(
+                        &descriptor,
+                        caps,
+                        selection,
+                        &self.services.transcoding.encoders(),
+                    ),
+                    chosen,
                 })
             }
             Request::StartPlayback { id, selection } => {
                 let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
-                let path = catalog.media_path(&id).await.map_err(catalog_error)?;
-                let descriptor = self.services.prober.describe(&path).await.map_err(|e| {
-                    tracing::warn!(%id, error = %e, "cannot describe a media file");
-                    Error::Unavailable {
-                        message: "the media file could not be read".into(),
-                    }
-                })?;
-                let plan = planner::plan(&descriptor, caps, selection);
+                let (path, descriptor) = self.describe(&id).await?;
+                let (selection, chosen) = self
+                    .selection(principal, &id, &descriptor, selection)
+                    .await?;
+                let plan = planner::plan(
+                    &descriptor,
+                    caps,
+                    selection,
+                    &self.services.transcoding.encoders(),
+                );
                 let subtitle = match &plan {
                     PlaybackPlan::Direct { subtitle, .. } => subtitle.and_then(|planned| {
                         match &descriptor.subtitles.get(planned.index as usize)?.source {
@@ -522,7 +556,13 @@ impl ClientProtocol {
                             reasons: reasons.clone(),
                         });
                     }
-                    // Phase 1 plans nothing else.
+                    // Converting is planned (P2-01) but not yet served
+                    // (P2-03): say why it would be converted, and that.
+                    PlaybackPlan::Converted { reasons, .. } => {
+                        let mut reasons = reasons.clone();
+                        reasons.push("this server cannot stream a conversion yet".into());
+                        return Err(Error::CannotPlay { reasons });
+                    }
                     other => {
                         return Err(Error::CannotPlay {
                             reasons: vec![format!("{other:?} is not served yet")],
@@ -546,7 +586,12 @@ impl ClientProtocol {
                     subtitle,
                 );
                 tracing::info!(%id, user = %user.username, "playback started");
-                Ok(Reply::PlaybackStarted { handle, plan, size })
+                Ok(Reply::PlaybackStarted {
+                    handle,
+                    plan,
+                    size,
+                    chosen,
+                })
             }
             Request::ReadSubtitle { handle } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
@@ -611,6 +656,68 @@ impl ClientProtocol {
                 Err(Error::Internal)
             }
         }
+    }
+
+    fn store(&self) -> &crate::store::Store {
+        self.services.auth.store()
+    }
+
+    /// `id`'s media file and Spoolframe's description of it.
+    async fn describe(&self, id: &MediaId) -> Result<(PathBuf, Arc<MediaDescriptor>), Error> {
+        let path = self
+            .services
+            .catalog
+            .media_path(id)
+            .await
+            .map_err(catalog_error)?;
+        let descriptor = self.services.prober.describe(&path).await.map_err(|e| {
+            tracing::warn!(%id, error = %e, "cannot describe a media file");
+            Error::Unavailable {
+                message: "the media file could not be read".into(),
+            }
+        })?;
+        Ok((path, descriptor))
+    }
+
+    /// The tracks to plan with: the client's, or, when it sent none, the
+    /// ones the principal's preferences and override choose (P1-20).
+    async fn selection(
+        &self,
+        principal: Principal,
+        id: &MediaId,
+        descriptor: &MediaDescriptor,
+        selection: Option<Selection>,
+    ) -> Result<(Selection, Option<ChosenTracks>), Error> {
+        if let Some(selection) = selection {
+            return Ok((selection, None));
+        }
+        let store = self.store();
+        let preferences = store.track_preferences(principal).await.map_err(internal)?;
+        let scope = self.override_scope(id).await?;
+        let override_ = store
+            .track_override(principal, &scope)
+            .await
+            .map_err(internal)?;
+        let chosen = tracks::choose(&descriptor.tracks(), &preferences, override_.as_ref());
+        Ok((chosen.selection, Some(chosen)))
+    }
+
+    /// What a track override for `id` applies to: its show for an episode,
+    /// so a pick carries to the rest of the series; else `id` itself.
+    async fn override_scope(&self, id: &MediaId) -> Result<String, Error> {
+        if id.kind() != MediaKind::Episode {
+            return Ok(id.to_string());
+        }
+        let found = self
+            .services
+            .catalog
+            .item(id)
+            .await
+            .map_err(catalog_error)?;
+        Ok(match found.item {
+            Item::Episode(e) => e.show_id.to_string(),
+            _ => id.to_string(),
+        })
     }
 
     /// Open the server→client events stream for `connection`.

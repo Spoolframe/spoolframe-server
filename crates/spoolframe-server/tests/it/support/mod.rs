@@ -15,6 +15,7 @@ use iroh::{Endpoint, RelayMode};
 use serde::Serialize;
 use spoolframe_catalog::{Catalog, CatalogError, Image, ItemPage, ItemWithChildren, Page};
 use spoolframe_media::Prober;
+use spoolframe_media::encoders::{FfmpegCommand, TranscodeSettings};
 use spoolframe_protocol::codec::{read_frame, write_frame};
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{ArtworkRequest, ArtworkResponse, ArtworkSize};
@@ -29,12 +30,23 @@ use spoolframe_server::identity;
 use spoolframe_server::network::{EndpointOptions, Relay, Server, Services};
 use spoolframe_server::playback::Playbacks;
 use spoolframe_server::store::Store;
+use spoolframe_server::transcode::Transcoding;
 use spoolframe_server::watch::{Watch, WatchRules};
 use spoolframe_types::{
     ArtworkId, ClientCapabilities, Episode, Item, Library, LibraryId, LibraryKind, MediaId,
     MediaKind, Movie, Namespace, PlaybackState, Season, Show,
 };
 use tokio::io::AsyncWriteExt;
+
+/// Transcoding that has not detected anything: the software baseline.
+/// No test runs a real ffmpeg.
+pub fn transcoding() -> Arc<Transcoding> {
+    Arc::new(Transcoding::new(
+        Box::new(FfmpegCommand::new("/nonexistent/ffmpeg")),
+        TranscodeSettings::default(),
+        std::env::temp_dir(),
+    ))
+}
 
 /// The fake catalog's one image.
 pub const POSTER: &str = "/library/metadata/1/thumb/1";
@@ -174,8 +186,13 @@ impl Catalog for FakeCatalog {
     }
 
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
-        if id == movie().id() && self.media.exists() {
-            Ok(self.media.clone())
+        let path = if id == movie().id() {
+            self.media.clone()
+        } else {
+            episode_media(&self.media, id)
+        };
+        if path.exists() {
+            Ok(path)
         } else {
             Err(CatalogError::NotFound(id.to_string()))
         }
@@ -209,6 +226,12 @@ pub const PLAYBACK_RECHECK: Duration = Duration::from_millis(300);
 
 /// A stand-in ffprobe answering with recorded output: the forced-subtitle
 /// MKV (matroska, hevc, eac3, subrip) for media, the SRT for `.srt` files.
+/// Where an episode's file goes, next to the movie's. The stand-in ffprobe
+/// describes it as Brooklyn Nine-Nine S07E01 (P1-20's fixture).
+fn episode_media(movie: &Path, id: &MediaId) -> PathBuf {
+    movie.with_file_name(format!("episode-{}.b99.mkv", id.key()))
+}
+
 fn fake_ffprobe(dir: &Path) -> PathBuf {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../spoolframe-media/tests/fixtures");
     let script = dir.join("bin").join("ffprobe");
@@ -216,8 +239,9 @@ fn fake_ffprobe(dir: &Path) -> PathBuf {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nfor path; do :; done\ncase \"$path\" in *.srt) cat '{}' ;; *) cat '{}' ;; esac\n",
+            "#!/bin/sh\nfor path; do :; done\ncase \"$path\" in *.srt) cat '{}' ;; *.b99.mkv) cat '{}' ;; *) cat '{}' ;; esac\n",
             fixtures.join("external-srt.json").display(),
+            fixtures.join("b99-s07e01.json").display(),
             fixtures.join("mkv-forced-subs.json").display(),
         ),
     )
@@ -235,7 +259,47 @@ pub fn mkv_capabilities() -> ClientCapabilities {
         audio: [AudioCodec::Eac3].into(),
         containers: [Container::Matroska].into(),
         subtitles: [SubtitleFormat::Srt].into(),
+        ..ClientCapabilities::default()
     }
+}
+
+/// How a [`TestServer`] runs. Off the LAN by default: only the tests about
+/// discovery announce themselves.
+#[derive(Debug, Clone)]
+pub struct ServerOptions {
+    pub name: String,
+    pub port: Option<u16>,
+    pub mdns: bool,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            name: "Home Media".into(),
+            port: None,
+            mdns: false,
+        }
+    }
+}
+
+/// The state directory for `test`, emptied.
+pub fn fresh_dir(test: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("servers")
+        .join(test_module())
+        .join(test);
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// The module of the running test, so two modules may use the same
+/// `test` name. libtest names each test's thread by its path,
+/// `sessions::two_users`, and a `#[tokio::test]` body runs on that thread.
+fn test_module() -> String {
+    std::thread::current()
+        .name()
+        .and_then(|name| name.split_once("::"))
+        .map_or_else(|| "it".to_owned(), |(module, _)| module.to_owned())
 }
 
 /// A running server on loopback, with its database at hand.
@@ -249,17 +313,16 @@ pub struct TestServer {
 impl TestServer {
     /// A fresh server whose state lives in a directory named for `test`.
     pub async fn start(test: &str) -> Self {
-        // Per test file too: two files may use the same test name.
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("servers")
-            .join(env!("CARGO_CRATE_NAME"))
-            .join(test);
-        let _ = std::fs::remove_dir_all(&dir);
-        Self::start_in(dir).await
+        Self::start_in(fresh_dir(test)).await
     }
 
     /// A server on an existing state directory, as after a restart.
     pub async fn start_in(dir: PathBuf) -> Self {
+        Self::start_with(dir, ServerOptions::default()).await
+    }
+
+    /// A server on `dir` (its key and database), run as `options` say.
+    pub async fn start_with(dir: PathBuf, options: ServerOptions) -> Self {
         let key = identity::load_or_create(&dir).unwrap();
         let store = Store::open(&dir).await.unwrap();
         let media = dir.join("media").join("movie.mkv");
@@ -282,12 +345,14 @@ impl TestServer {
             prober,
             artwork: Arc::new(artwork),
             playbacks: Arc::new(Playbacks::new(PLAYBACK_IDLE, PLAYBACK_RECHECK)),
+            transcoding: transcoding(),
         };
-        let options = EndpointOptions {
-            port: None,
+        let endpoint = EndpointOptions {
+            port: options.port,
             relay: Relay::Disabled,
+            mdns: options.mdns,
         };
-        let server = Server::start(key, &options, "Home Media", services)
+        let server = Server::start(key, &endpoint, &options.name, services)
             .await
             .unwrap();
         Self {
@@ -313,6 +378,14 @@ impl TestServer {
         std::fs::create_dir_all(self.media.parent().unwrap()).unwrap();
         std::fs::write(&self.media, &bytes).unwrap();
         bytes
+    }
+
+    /// Write episode `key`'s file; ffprobe describes it as B99 S07E01.
+    pub fn write_episode(&self, key: &str) {
+        let id = MediaId::new(Namespace::Plex, MediaKind::Episode, key).unwrap();
+        let path = episode_media(&self.media, &id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"stand-in").unwrap();
     }
 
     /// Write a subtitle file next to the movie; returns its bytes.
@@ -347,6 +420,25 @@ impl TestServer {
 
     pub async fn stop(self) {
         self.server.shutdown().await;
+    }
+
+    /// Stop and start again on the same directory (key, database) and
+    /// UDP port, as a restarted server is.
+    pub async fn restart(self) -> Self {
+        let port = self
+            .server
+            .addr()
+            .ip_addrs()
+            .find(|a| a.is_ipv4())
+            .expect("an IPv4 address")
+            .port();
+        let dir = self.dir.clone();
+        self.stop().await;
+        let options = ServerOptions {
+            port: Some(port),
+            ..ServerOptions::default()
+        };
+        Self::start_with(dir, options).await
     }
 }
 

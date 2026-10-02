@@ -7,6 +7,10 @@
     libucl
     # ffprobe, which the server runs on every media file it serves (P1-06).
     ffmpeg-headless
+    # The LAN tests (P1-13) run in a private network namespace: unshare
+    # makes it, ip brings up loopback with multicast.
+    util-linux
+    iproute2
   ];
 
   enterShell = ''

@@ -14,6 +14,13 @@ use spoolframe_server::store::Store;
 /// The setup code the test servers accept.
 const CODE: &str = "K7QD-M2XP-9RTB";
 
+fn status() -> std::sync::Arc<admin::StatusSource> {
+    std::sync::Arc::new(admin::StatusSource::new(
+        "Den",
+        crate::support::transcoding(),
+    ))
+}
+
 async fn server(test: &str) -> SocketAddr {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("admin")
@@ -25,6 +32,7 @@ async fn server(test: &str) -> SocketAddr {
         "127.0.0.1:0".parse().unwrap(),
         auth,
         Some(SetupCode::new(CODE)),
+        status(),
     )
     .await
     .unwrap();
@@ -132,6 +140,38 @@ async fn an_admin_manages_users() {
         .await
         .unwrap();
     assert!(!login.is_admin);
+}
+
+#[tokio::test]
+async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
+    let (addr, admin) = admin_client("status").await;
+    let status = admin.server_status().await.unwrap();
+    assert_eq!(status.name, "Den");
+    assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
+    // Nothing detected in tests: the software baseline.
+    assert_eq!(status.transcoding.video_encoders, ["libx264"]);
+    assert_eq!(status.transcoding.audio_encoders, ["aac"]);
+
+    admin
+        .user_add(NewUser {
+            username: "alice".into(),
+            display_name: None,
+            password: "battery staple".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+    let alice = anonymous(addr)
+        .await
+        .login(creds("alice", "battery staple"))
+        .await
+        .unwrap();
+    let err = with_token(addr, &alice.token)
+        .await
+        .server_status()
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), error_code::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -278,7 +318,7 @@ async fn a_server_started_with_users_offers_no_setup() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let auth = Auth::new(Store::open(&dir).await.unwrap());
-    let (addr, handle) = admin::serve("127.0.0.1:0".parse().unwrap(), auth, None)
+    let (addr, handle) = admin::serve("127.0.0.1:0".parse().unwrap(), auth, None, status())
         .await
         .unwrap();
     std::mem::forget(handle);
