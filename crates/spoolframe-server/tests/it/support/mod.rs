@@ -313,6 +313,8 @@ pub struct ServerOptions {
     /// How long failed logins and PINs count; tests of many failures
     /// shorten it.
     pub failure_window: Duration,
+    /// How long device sign-in codes live (P3-07).
+    pub sign_in_lifetime: Duration,
 }
 
 impl Default for ServerOptions {
@@ -327,6 +329,7 @@ impl Default for ServerOptions {
             ffmpeg: PathBuf::from("ffmpeg"),
             ocr: false,
             failure_window: spoolframe_server::auth::FAILURE_WINDOW,
+            sign_in_lifetime: spoolframe_server::device_sign_in::LIFETIME,
         }
     }
 }
@@ -441,7 +444,8 @@ impl TestServer {
             WatchRules::default(),
         ));
         let services = Services {
-            auth: Auth::with_failure_window(store.clone(), options.failure_window),
+            auth: Auth::with_failure_window(store.clone(), options.failure_window)
+                .with_sign_in_lifetime(options.sign_in_lifetime),
             watch,
             catalog,
             prober,

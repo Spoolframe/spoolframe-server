@@ -1116,6 +1116,12 @@ The tvOS client does not need to expose the full provider login UI itself.
 
 Spoolframe can act as the OIDC relying party while the Apple TV participates in a device-style login flow.
 
+The first way to complete the pending request is not OIDC but approval from
+the Spoolframe app on a phone that is already signed in (P3-07): the phone
+scans the QR code or takes the short code, shows the device's name, and
+approves it as its own user. OIDC in the phone's browser (P3-04, P3-06)
+completes the same pending request, so the TV side is one flow either way.
+
 ---
 
 # 24E. OIDC Account Linking

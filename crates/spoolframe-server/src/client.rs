@@ -14,6 +14,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use spoolframe_catalog::{CatalogError, Page};
 use spoolframe_media::{MediaDescriptor, SubtitleSource, SubtitleStream, codecs};
 use spoolframe_protocol::codec::{self, read_frame_bytes, write_frame};
+use spoolframe_protocol::device_sign_in::normalize as device_sign_in_code;
 use spoolframe_protocol::streams::{bi, reset, uni};
 use spoolframe_protocol::{
     ArtworkReply, ArtworkRequest, ArtworkResponse, ChosenTracks, ConvertedSubtitle, MAX_READ,
@@ -21,8 +22,8 @@ use spoolframe_protocol::{
     SubtitleAction,
 };
 use spoolframe_protocol::{
-    AuthMethod, DeviceInfo, Error, Event, Hello, LoginPassword, Reply, Request, RequestEnvelope,
-    Response, ServerInfo, SessionId, SessionInfo, UserSummary,
+    AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, LoginPassword, Reply,
+    Request, RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_types::{Item, MediaId, MediaKind, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -30,6 +31,7 @@ use tokio::sync::{Mutex, watch};
 
 use crate::artwork::{Artwork, ArtworkError};
 use crate::auth::{self, LoginError, SessionToken, UnlockError};
+use crate::device_sign_in::{self, ClaimError, Outcome, Waiting};
 use crate::encode::job::{EncodeJob, JobError, Progress};
 use crate::encode::{Conversion, ConversionSource, hls};
 use crate::network::{ConnectionAuth, Connections, Services};
@@ -203,6 +205,45 @@ impl ClientProtocol {
             Request::LoginPassword(login) => {
                 let device_name = state.hello.get().and_then(|h| h.device_name.clone());
                 self.login_password(connection, login, device_name).await
+            }
+            Request::BeginDeviceSignIn => {
+                let hello = state.hello.get().expect("checked above");
+                let started = self.services.auth.sign_ins().begin(Waiting {
+                    endpoint: connection.remote_id().to_string(),
+                    device_name: hello.device_name.clone(),
+                    client_name: hello.client_name.clone(),
+                    requested_at: crate::store::now(),
+                });
+                match started {
+                    Some(started) => Ok(Reply::DeviceSignInStarted {
+                        request: started.request,
+                        code: started.code,
+                        expires_in_ms: started.expires_in.as_millis() as u64,
+                    }),
+                    None => Err(Error::RateLimited {
+                        retry_after_ms: device_sign_in::LIFETIME.as_millis() as u64,
+                    }),
+                }
+            }
+            Request::AwaitDeviceSignIn { request } => {
+                let endpoint = connection.remote_id().to_string();
+                let outcome = self
+                    .services
+                    .auth
+                    .sign_ins()
+                    .wait(&request, &endpoint, device_sign_in::AWAIT)
+                    .await;
+                match outcome {
+                    Outcome::Approved(token) => {
+                        tracing::info!(%endpoint, "device signed in by approval");
+                        Ok(Reply::LoggedIn {
+                            session: SessionId(token.0),
+                        })
+                    }
+                    Outcome::Pending => Ok(Reply::DeviceSignInPending),
+                    Outcome::Denied => Err(Error::DeviceSignInDenied),
+                    Outcome::Expired => Err(Error::DeviceSignInExpired),
+                }
             }
             // Everything else needs a session that is live on this
             // endpoint. Each request names its own, so one connection can
@@ -946,10 +987,63 @@ impl ClientProtocol {
                     bytes: hls::subtitle_segment(&vtt, start_ms, end_ms).into_bytes(),
                 })
             }
+            Request::LookupDeviceSignIn { code } => {
+                let code = self.sign_in_code(connection, &user, &code)?;
+                match self.services.auth.sign_ins().lookup(&code) {
+                    Some(waiting) => Ok(Reply::DeviceSignInRequest(DeviceSignInRequest {
+                        device_name: waiting.device_name,
+                        client_name: waiting.client_name,
+                        requested_at: waiting.requested_at,
+                    })),
+                    None => Err(self.wrong_sign_in_code(connection, &user)),
+                }
+            }
+            Request::ApproveDeviceSignIn { code } => {
+                let code = self.sign_in_code(connection, &user, &code)?;
+                let approver = connection.remote_id().to_string();
+                let sign_ins = self.services.auth.sign_ins();
+                let claim = match sign_ins.claim(&code, &approver) {
+                    Ok(claim) => claim,
+                    Err(ClaimError::Unknown) => {
+                        return Err(self.wrong_sign_in_code(connection, &user));
+                    }
+                    Err(ClaimError::SameDevice) => {
+                        return Err(Error::InvalidInput {
+                            message: "approve this device's sign-in on another device".into(),
+                        });
+                    }
+                };
+                match self.services.auth.approve_device(user.user, &claim).await {
+                    Ok(token) => {
+                        sign_ins.fulfil(&claim.request, Some(token));
+                        tracing::info!(
+                            user = %user.username,
+                            device = %claim.endpoint,
+                            "device sign-in approved"
+                        );
+                        Ok(Reply::Done)
+                    }
+                    Err(e) => {
+                        sign_ins.fulfil(&claim.request, None);
+                        Err(internal(e))
+                    }
+                }
+            }
+            Request::DenyDeviceSignIn { code } => {
+                let code = self.sign_in_code(connection, &user, &code)?;
+                if self.services.auth.sign_ins().deny(&code) {
+                    tracing::info!(user = %user.username, "device sign-in denied");
+                    Ok(Reply::Done)
+                } else {
+                    Err(self.wrong_sign_in_code(connection, &user))
+                }
+            }
             Request::Hello(_)
             | Request::AuthMethods
             | Request::LoginPassword(_)
             | Request::Ping
+            | Request::BeginDeviceSignIn
+            | Request::AwaitDeviceSignIn { .. }
             | Request::Unknown => {
                 unreachable!("pre-auth and unknown requests are answered before the session check")
             }
@@ -990,6 +1084,33 @@ impl ClientProtocol {
                 tracing::error!(error = %e, "login failed");
                 Err(Error::Internal)
             }
+        }
+    }
+
+    /// `typed` as a device sign-in code, if `user` on this endpoint may
+    /// try one now. A malformed code is a wrong one.
+    fn sign_in_code(
+        &self,
+        connection: &Connection,
+        user: &SessionUser,
+        typed: &str,
+    ) -> Result<String, Error> {
+        let (what, from) = sign_in_code_keys(connection, user);
+        if let Some(retry_after) = self.services.auth.attempt_limited(&what, &from) {
+            return Err(Error::RateLimited {
+                retry_after_ms: retry_after.as_millis() as u64,
+            });
+        }
+        device_sign_in_code(typed).ok_or_else(|| self.wrong_sign_in_code(connection, user))
+    }
+
+    /// Count a code that is not pending against `user` and this endpoint:
+    /// codes are short, so guessing them is limited as passwords are.
+    fn wrong_sign_in_code(&self, connection: &Connection, user: &SessionUser) -> Error {
+        let (what, from) = sign_in_code_keys(connection, user);
+        self.services.auth.attempt_failed(&what, &from);
+        Error::NotFound {
+            what: "sign-in code".into(),
         }
     }
 
@@ -1494,6 +1615,15 @@ fn watch_error(e: WatchError) -> Error {
 }
 
 /// The auth methods this server offers.
+/// The failure limit's keys for device sign-in codes tried by `user` on
+/// this connection's endpoint: apart from passwords and PINs.
+fn sign_in_code_keys(connection: &Connection, user: &SessionUser) -> (String, String) {
+    (
+        format!("devcode:{}", user.user.0),
+        format!("devcode@{}", connection.remote_id()),
+    )
+}
+
 pub(crate) fn auth_methods() -> Vec<AuthMethod> {
-    vec![AuthMethod::Password]
+    vec![AuthMethod::Password, AuthMethod::DeviceApproval]
 }

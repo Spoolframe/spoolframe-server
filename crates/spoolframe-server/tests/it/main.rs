@@ -8,6 +8,7 @@ mod support;
 mod admin;
 mod artwork;
 mod cli;
+mod device_sign_in;
 mod encode;
 mod endpoint;
 mod lan;

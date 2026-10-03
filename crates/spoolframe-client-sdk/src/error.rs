@@ -69,6 +69,12 @@ pub enum SdkError {
     /// few seconds.
     #[error("the subtitle is still being read ({done_percent}% done)")]
     SubtitleNotReady { done_percent: u8 },
+    /// The device sign-in was refused on the approving device (P3-07).
+    #[error("the sign-in was denied")]
+    SignInDenied,
+    /// The device sign-in is over (it timed out): begin another.
+    #[error("the sign-in code has expired")]
+    SignInExpired,
     /// Any other error the server answered with.
     #[error("server: {0}")]
     Server(String),
@@ -98,6 +104,8 @@ impl SdkError {
             ServerError::SubtitleNotReady { done_percent } => {
                 SdkError::SubtitleNotReady { done_percent }
             }
+            ServerError::DeviceSignInDenied => SdkError::SignInDenied,
+            ServerError::DeviceSignInExpired => SdkError::SignInExpired,
             other => SdkError::Server(other.to_string()),
         }
     }

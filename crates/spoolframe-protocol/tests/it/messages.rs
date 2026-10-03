@@ -71,6 +71,19 @@ fn every_request_round_trips() {
             password: "hunter2".into(),
         }),
         Request::Ping,
+        Request::BeginDeviceSignIn,
+        Request::AwaitDeviceSignIn {
+            request: "r".into(),
+        },
+        Request::LookupDeviceSignIn {
+            code: "BCDFGHJK".into(),
+        },
+        Request::ApproveDeviceSignIn {
+            code: "BCDFGHJK".into(),
+        },
+        Request::DenyDeviceSignIn {
+            code: "BCDFGHJK".into(),
+        },
         Request::Libraries,
         Request::Items {
             library: LibraryId::new(Namespace::Plex, "2").unwrap(),
@@ -192,8 +205,19 @@ fn every_reply_round_trips() {
             auth_methods: vec![AuthMethod::Password],
         }),
         Reply::AuthMethods {
-            methods: vec![AuthMethod::Password],
+            methods: vec![AuthMethod::Password, AuthMethod::DeviceApproval],
         },
+        Reply::DeviceSignInStarted {
+            request: "r".into(),
+            code: "BCDFGHJK".into(),
+            expires_in_ms: 300_000,
+        },
+        Reply::DeviceSignInPending,
+        Reply::DeviceSignInRequest(spoolframe_protocol::DeviceSignInRequest {
+            device_name: Some("Living room TV".into()),
+            client_name: "spoolframe-tvos".into(),
+            requested_at: 1_790_000_000,
+        }),
         Reply::LoggedIn {
             session: SessionId("s".into()),
         },
@@ -314,6 +338,8 @@ fn every_error_round_trips() {
             what: "plex:movie:1".into(),
         },
         Error::InvalidCredentials,
+        Error::DeviceSignInDenied,
+        Error::DeviceSignInExpired,
         Error::CannotPlay {
             reasons: vec!["audio 0: dts not supported".into()],
         },
@@ -598,9 +624,23 @@ fn request_types_are_snake_case() {
 }
 
 #[test]
-fn only_hello_auth_methods_login_and_ping_are_pre_auth() {
+fn only_hello_auth_methods_logins_and_ping_are_pre_auth() {
     assert!(Request::Hello(hello()).is_pre_auth());
     assert!(Request::Ping.is_pre_auth());
+    assert!(Request::BeginDeviceSignIn.is_pre_auth());
+    assert!(
+        Request::AwaitDeviceSignIn {
+            request: "r".into()
+        }
+        .is_pre_auth()
+    );
+    // Approving signs someone in: only a session may.
+    assert!(
+        !Request::ApproveDeviceSignIn {
+            code: "BCDFGHJK".into()
+        }
+        .is_pre_auth()
+    );
     assert!(!Request::Libraries.is_pre_auth());
     assert!(!Request::WhoAmI.is_pre_auth());
     assert!(!Request::Unknown.is_pre_auth());

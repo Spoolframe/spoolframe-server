@@ -8,7 +8,11 @@ use std::sync::{Arc, Mutex};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
-use spoolframe_protocol::{LoginPassword, Reply, Request, Response, SessionId, fingerprint, lan};
+use std::time::Duration;
+
+use spoolframe_protocol::{
+    LoginPassword, Reply, Request, Response, SessionId, device_sign_in, fingerprint, lan,
+};
 use spoolframe_types::ClientCapabilities;
 
 use crate::connection::ServerConnection;
@@ -30,6 +34,33 @@ pub struct Device {
     pub client_version: String,
     /// What this device can play, from its decoders (P1-07).
     pub capabilities: ClientCapabilities,
+}
+
+/// A sign-in of this device waiting for approval on another (P3-07).
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeviceSignIn {
+    /// The server's key.
+    pub server: String,
+    /// The code as typed (`BCDFGHJK`).
+    pub code: String,
+    /// The code as shown, large: `BCDF-GHJK`.
+    pub display_code: String,
+    /// What to show as a QR code, for the phone's camera.
+    pub link: String,
+    /// How long it can be approved, from when it began.
+    pub expires_in: Duration,
+    /// Only this device can collect the session with it.
+    request: String,
+}
+
+impl std::fmt::Debug for DeviceSignIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceSignIn")
+            .field("server", &self.server)
+            .field("code", &self.display_code)
+            .field("expires_in", &self.expires_in)
+            .finish_non_exhaustive()
+    }
 }
 
 /// This device. Cheap to clone: every clone is the same device.
@@ -413,6 +444,71 @@ impl Client {
             }
             Response::Err(e) => return Err(SdkError::from_server(e)),
         };
+        self.keep_session(server, &conn, token).await
+    }
+
+    /// Ask server `endpoint_id` to sign this device in by someone approving
+    /// it on another device they are signed in on (P3-07): show the code
+    /// and a QR code of the link, then [`Client::await_device_sign_in`].
+    /// For a device without a keyboard (a TV).
+    pub async fn begin_device_sign_in(&self, endpoint_id: &str) -> Result<DeviceSignIn, SdkError> {
+        let server = parse_id(endpoint_id)?;
+        self.require_pinned(server).await?;
+        let conn = self.connection(server).await?;
+        match conn.call(None, Request::BeginDeviceSignIn).await? {
+            Response::Ok(Reply::DeviceSignInStarted {
+                request,
+                code,
+                expires_in_ms,
+            }) => Ok(DeviceSignIn {
+                server: server.to_string(),
+                link: device_sign_in::link(&server.to_string(), &code),
+                display_code: device_sign_in::display(&code),
+                code,
+                request,
+                expires_in: Duration::from_millis(expires_in_ms),
+            }),
+            Response::Ok(other) => Err(SdkError::Protocol(format!(
+                "BeginDeviceSignIn answered {other:?}"
+            ))),
+            Response::Err(e) => Err(SdkError::from_server(e)),
+        }
+    }
+
+    /// Wait until `sign_in` is approved, and keep the session it brings:
+    /// [`SdkError::SignInDenied`] if it was refused, [`SdkError::SignInExpired`]
+    /// once it is over (begin another). Drop the future to stop waiting.
+    pub async fn await_device_sign_in(&self, sign_in: &DeviceSignIn) -> Result<Session, SdkError> {
+        let server = parse_id(&sign_in.server)?;
+        loop {
+            // Asked again on each round: the connection may have been
+            // replaced since, and the request lives on the server.
+            let conn = self.connection(server).await?;
+            let request = Request::AwaitDeviceSignIn {
+                request: sign_in.request.clone(),
+            };
+            match conn.call(None, request).await? {
+                Response::Ok(Reply::LoggedIn { session }) => {
+                    return self.keep_session(server, &conn, session).await;
+                }
+                Response::Ok(Reply::DeviceSignInPending) => {}
+                Response::Ok(other) => {
+                    return Err(SdkError::Protocol(format!(
+                        "AwaitDeviceSignIn answered {other:?}"
+                    )));
+                }
+                Response::Err(e) => return Err(SdkError::from_server(e)),
+            }
+        }
+    }
+
+    /// Keep `token`, a new session on `server`, under the user it is.
+    async fn keep_session(
+        &self,
+        server: EndpointId,
+        conn: &ServerConnection,
+        token: SessionId,
+    ) -> Result<Session, SdkError> {
         let user = match conn.call(Some(&token), Request::WhoAmI).await? {
             Response::Ok(Reply::WhoAmI(user)) => user,
             Response::Ok(other) => {

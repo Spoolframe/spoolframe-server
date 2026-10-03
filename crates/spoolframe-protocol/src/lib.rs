@@ -10,6 +10,7 @@
 
 pub mod artwork;
 pub mod codec;
+pub mod device_sign_in;
 pub mod fingerprint;
 pub mod lan;
 pub mod media;
@@ -20,9 +21,9 @@ pub mod streams;
 pub use artwork::{ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
 pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle};
 pub use messages::{
-    AuthMethod, DeviceInfo, Error, Event, Hello, HomeScreen, LoginPassword, ManifestKind,
-    PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId,
-    SessionInfo, UserSummary,
+    AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, HomeScreen, LoginPassword,
+    ManifestKind, PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, ServerInfo,
+    SessionId, SessionInfo, UserSummary,
 };
 pub use playback::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,

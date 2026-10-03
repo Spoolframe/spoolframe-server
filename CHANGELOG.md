@@ -313,3 +313,24 @@
   `clear_pin`, `devices` and `set_pin_required(device, required)`; a
   locked profile's `user().locked` from `Client::profiles`, and
   `SdkError::ProfileLocked` and `InvalidInput` from its calls.
+- Device sign-in by approval (P3-07): a device that cannot type a
+  password (an Apple TV) sends the pre-auth `BeginDeviceSignIn` and shows
+  the code (`BCDF-GHJK`, 8 letters without vowels) and its QR link
+  (`spoolframe://approve?server=…&code=…`, in
+  `spoolframe_protocol::device_sign_in`); a signed-in, unlocked phone
+  `LookupDeviceSignIn`s and `ApproveDeviceSignIn`s (or `Deny…`) it, and
+  the device's `AwaitDeviceSignIn` (up to 25 s, then `Pending`) gets a
+  session of its own, bound to its endpoint, as the approver's user.
+  Codes live 5 minutes, are used once, are never approvable from the
+  device that shows them, and wrong ones are rate-limited per user and
+  per device; only the device that began a request may await it, and one
+  device has at most 3 pending. Pending sign-ins are only in memory.
+  `AuthMethods` lists `device_approval`.
+- Client SDK: device sign-in by approval (P3-07). On the TV,
+  `Client::begin_device_sign_in(server)` gives a `DeviceSignIn` (`code`,
+  `display_code`, the QR `link`, `expires_in`) and
+  `Client::await_device_sign_in` waits and keeps the session as
+  `sign_in` does (`SdkError::SignInDenied` / `SignInExpired`). On the
+  phone, `device_sign_in::parse_link` reads a scanned code, and
+  `Session::lookup_device_sign_in`, `approve_device_sign_in` and
+  `deny_device_sign_in` answer it.

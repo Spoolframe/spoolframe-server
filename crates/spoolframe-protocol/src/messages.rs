@@ -55,6 +55,18 @@ pub enum Request {
     AuthMethods,
     LoginPassword(LoginPassword),
     Ping,
+    /// Ask to be signed in by someone approving this device on another
+    /// one they are signed in on (P3-07). Show the code (and its
+    /// [`crate::device_sign_in::link`] as a QR code), then
+    /// `AwaitDeviceSignIn`. `DeviceSignInStarted`.
+    BeginDeviceSignIn,
+    /// Wait, up to about 25 s, for `request` to be approved: `LoggedIn`
+    /// with a session for this device, `DeviceSignInPending` (ask again),
+    /// or `DeviceSignInDenied` / `DeviceSignInExpired`. Only the device
+    /// that began the request may ask.
+    AwaitDeviceSignIn {
+        request: String,
+    },
 
     // Need a session.
     Libraries,
@@ -140,6 +152,20 @@ pub enum Request {
         #[serde(default)]
         device: Option<String>,
         required: bool,
+    },
+    /// Which device shows sign-in code `code` (P3-07), to ask the user
+    /// before approving it. `DeviceSignInRequest`; `NotFound` for a code
+    /// that is not pending (guesses are rate-limited).
+    LookupDeviceSignIn {
+        code: String,
+    },
+    /// Sign the device showing `code` in as the session user. `Done`.
+    ApproveDeviceSignIn {
+        code: String,
+    },
+    /// Refuse it: the device stops waiting. `Done`.
+    DenyDeviceSignIn {
+        code: String,
     },
     /// Pick another subtitle (or none) for a playing playback (P2-07): it
     /// is planned again with the same audio. A plan that plays directly
@@ -228,7 +254,12 @@ impl Request {
     pub fn is_pre_auth(&self) -> bool {
         matches!(
             self,
-            Request::Hello(_) | Request::AuthMethods | Request::LoginPassword(_) | Request::Ping
+            Request::Hello(_)
+                | Request::AuthMethods
+                | Request::LoginPassword(_)
+                | Request::Ping
+                | Request::BeginDeviceSignIn
+                | Request::AwaitDeviceSignIn { .. }
         )
     }
 }
@@ -271,6 +302,8 @@ impl fmt::Debug for LoginPassword {
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
     Password,
+    /// Approval on another signed-in device (P3-07): `BeginDeviceSignIn`.
+    DeviceApproval,
     /// A method this build does not know.
     #[serde(other)]
     Unknown,
@@ -317,6 +350,17 @@ pub enum Reply {
         session: SessionId,
     },
     Pong,
+    /// A device sign-in is pending (P3-07). Show `code` (see
+    /// [`crate::device_sign_in::display`]); keep `request` to await it.
+    DeviceSignInStarted {
+        request: String,
+        code: String,
+        expires_in_ms: u64,
+    },
+    /// Not approved yet: `AwaitDeviceSignIn` again.
+    DeviceSignInPending,
+    /// The device a sign-in code belongs to.
+    DeviceSignInRequest(DeviceSignInRequest),
     Libraries {
         libraries: Vec<Library>,
     },
@@ -443,6 +487,18 @@ pub struct DeviceInfo {
     pub this_device: bool,
 }
 
+/// A device waiting to be signed in (P3-07), as the approver sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceSignInRequest {
+    /// What the device calls itself (from its `Hello`).
+    #[serde(default)]
+    pub device_name: Option<String>,
+    /// Its app, e.g. `spoolframe-tvos`.
+    pub client_name: String,
+    /// Unix seconds.
+    pub requested_at: i64,
+}
+
 /// One live session, without its token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -522,6 +578,13 @@ pub enum Error {
     /// to 8 digits, say); the message says why.
     #[error("{message}")]
     InvalidInput { message: String },
+    /// The device sign-in was refused on the approving device (P3-07).
+    #[error("the sign-in was denied")]
+    DeviceSignInDenied,
+    /// The device sign-in is over: it timed out, or is not this device's.
+    /// Begin a new one.
+    #[error("the sign-in code has expired")]
+    DeviceSignInExpired,
     /// Something the server depends on (Plex, a media mount) is down.
     #[error("unavailable: {message}")]
     Unavailable { message: String },

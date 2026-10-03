@@ -8,8 +8,8 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::{
     ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo,
-    HomeScreen, ManifestKind, MediaRead, MediaReadResponse, PlaybackHandle, PlaybackPlan, Reply,
-    Request, Response, Selection, SessionId, SessionInfo, UserSummary,
+    DeviceSignInRequest, HomeScreen, ManifestKind, MediaRead, MediaReadResponse, PlaybackHandle,
+    PlaybackPlan, Reply, Request, Response, Selection, SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat, TrackPreferences,
@@ -409,6 +409,37 @@ impl Session {
         self.done(Request::SetPinRequired {
             device: device.map(str::to_owned),
             required,
+        })
+        .await
+    }
+
+    /// The device showing sign-in code `code` (P3-07; typed any way, or
+    /// from a scanned [`crate::device_sign_in::parse_link`]), to ask "Sign
+    /// in on 'Living room TV'?". A code that is not pending is
+    /// [`SdkError::NotFound`]; too many of those [`SdkError::RateLimited`].
+    pub async fn lookup_device_sign_in(&self, code: &str) -> Result<DeviceSignInRequest, SdkError> {
+        let request = Request::LookupDeviceSignIn {
+            code: code.to_owned(),
+        };
+        match self.call(request).await? {
+            Reply::DeviceSignInRequest(waiting) => Ok(waiting),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Sign the device showing `code` in as this user. It cannot be this
+    /// device ([`SdkError::InvalidInput`]).
+    pub async fn approve_device_sign_in(&self, code: &str) -> Result<(), SdkError> {
+        self.done(Request::ApproveDeviceSignIn {
+            code: code.to_owned(),
+        })
+        .await
+    }
+
+    /// Refuse it; the device stops waiting.
+    pub async fn deny_device_sign_in(&self, code: &str) -> Result<(), SdkError> {
+        self.done(Request::DenyDeviceSignIn {
+            code: code.to_owned(),
         })
         .await
     }

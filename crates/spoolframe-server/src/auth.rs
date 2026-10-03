@@ -15,6 +15,7 @@ use password_hash::rand_core::{OsRng, RngCore};
 
 use spoolframe_types::Role;
 
+use crate::device_sign_in::{Claim, DeviceSignIns};
 use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionUser};
 use crate::store::users::{LocalUserId, PasswordLogin};
 use crate::store::{Store, StoreError, now};
@@ -44,7 +45,7 @@ impl fmt::Debug for SessionToken {
 }
 
 impl SessionToken {
-    fn generate() -> Self {
+    pub(crate) fn generate() -> Self {
         let mut bytes = [0u8; 32];
         OsRng.fill_bytes(&mut bytes);
         Self(bytes.iter().map(|b| format!("{b:02x}")).collect())
@@ -263,6 +264,8 @@ pub struct Auth {
     limiter: Arc<RateLimiter>,
     /// Wrong PINs in a row, per user and device.
     wrong_pins: Arc<Mutex<HashMap<(LocalUserId, String), u32>>>,
+    /// Devices waiting to be approved on another (P3-07).
+    sign_ins: Arc<DeviceSignIns>,
 }
 
 impl Auth {
@@ -276,7 +279,42 @@ impl Auth {
             store,
             limiter: Arc::new(RateLimiter::with_window(window)),
             wrong_pins: Arc::default(),
+            sign_ins: Arc::default(),
         }
+    }
+
+    /// Device sign-in codes live `lifetime` (tests shorten it).
+    pub fn with_sign_in_lifetime(mut self, lifetime: Duration) -> Self {
+        self.sign_ins = Arc::new(DeviceSignIns::with_lifetime(lifetime));
+        self
+    }
+
+    pub fn sign_ins(&self) -> &DeviceSignIns {
+        &self.sign_ins
+    }
+
+    /// Open a session on the device `claim` names, as `user`, who approved
+    /// it from a session of their own (P3-07): that session is the proof.
+    /// The device gets the token through [`DeviceSignIns::fulfil`].
+    pub async fn approve_device(
+        &self,
+        user: LocalUserId,
+        claim: &Claim,
+    ) -> Result<SessionToken, StoreError> {
+        let token = SessionToken::generate();
+        let binding = SessionBinding::Endpoint {
+            endpoint_id: claim.endpoint.clone(),
+            device_name: claim.device_name.clone(),
+        };
+        self.store
+            .create_session(
+                &token.hash(),
+                user,
+                &binding,
+                now() + ENDPOINT_SESSION.as_secs() as i64,
+            )
+            .await?;
+        Ok(token)
     }
 
     /// Unlock `user`'s profile on `endpoint` with `pin`. A user without a

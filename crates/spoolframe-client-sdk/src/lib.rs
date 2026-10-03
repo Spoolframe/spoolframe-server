@@ -18,7 +18,7 @@ mod servers;
 mod session;
 pub mod storage;
 
-pub use client::{Client, Device, ServersWatch};
+pub use client::{Client, Device, DeviceSignIn, ServersWatch};
 pub use error::SdkError;
 pub use link::{ConnectionState, StateWatch};
 pub use servers::ServerEntry;
@@ -28,10 +28,13 @@ pub use session::{
 };
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{
-    ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo, HomeScreen, MAX_READ, ManifestKind,
-    PlaybackHandle, PlaybackPlan, Selection, SessionInfo, TrackReason, UserSummary,
+    ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen,
+    MAX_READ, ManifestKind, PlaybackHandle, PlaybackPlan, Selection, SessionInfo, TrackReason,
+    UserSummary,
 };
 // Fingerprints for the "Server identity changed" alert (P1-13, P1-21).
 pub use spoolframe_protocol::fingerprint;
+// Sign-in codes and the links their QR codes carry (P3-07).
+pub use spoolframe_protocol::device_sign_in;
 pub use spoolframe_types as types;
 pub use storage::{MemoryStorage, Storage, StorageError};

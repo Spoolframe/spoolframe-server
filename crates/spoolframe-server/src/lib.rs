@@ -9,6 +9,7 @@ pub mod artwork;
 pub mod auth;
 mod client;
 pub mod config;
+pub mod device_sign_in;
 pub mod encode;
 pub mod identity;
 pub mod network;

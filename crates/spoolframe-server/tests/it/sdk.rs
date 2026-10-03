@@ -563,3 +563,46 @@ async fn a_pin_required_here_locks_the_profile_when_the_app_opens_again() {
     client.close().await;
     server.stop().await;
 }
+
+#[tokio::test]
+async fn a_tv_is_signed_in_from_a_phone_by_its_qr_code() {
+    let (server, phone, _) = ready("sdk-device-sign-in").await;
+    let alice = alice(&server, &phone).await;
+    let tv_storage = Arc::new(MemoryStorage::default());
+    let tv = client_on(&server, &tv_storage).await;
+
+    let sign_in = tv.begin_device_sign_in(&id(&server)).await.unwrap();
+    assert_eq!(
+        sign_in.display_code,
+        format!("{}-{}", &sign_in.code[..4], &sign_in.code[4..])
+    );
+    let waiting = {
+        let tv = tv.clone();
+        let sign_in = sign_in.clone();
+        tokio::spawn(async move { tv.await_device_sign_in(&sign_in).await })
+    };
+    // The phone scans the QR code: which server, and which code.
+    let scanned = spoolframe_client_sdk::device_sign_in::parse_link(&sign_in.link).unwrap();
+    assert_eq!(scanned.server, id(&server));
+    let device = alice.lookup_device_sign_in(&scanned.code).await.unwrap();
+    assert_eq!(device.device_name.as_deref(), Some("living room"));
+    alice.approve_device_sign_in(&scanned.code).await.unwrap();
+
+    let on_tv = waiting.await.unwrap().unwrap();
+    assert_eq!(on_tv.user().username, "alice");
+    on_tv.libraries().await.unwrap();
+    // Kept, as a password sign-in is: the TV's profiles list it.
+    let profiles = tv.profiles(&id(&server)).await.unwrap();
+    assert_eq!(profiles.len(), 1);
+
+    // A second one, refused.
+    let sign_in = tv.begin_device_sign_in(&id(&server)).await.unwrap();
+    alice.deny_device_sign_in(&sign_in.code).await.unwrap();
+    assert_eq!(
+        tv.await_device_sign_in(&sign_in).await.unwrap_err(),
+        SdkError::SignInDenied
+    );
+    tv.close().await;
+    phone.close().await;
+    server.stop().await;
+}

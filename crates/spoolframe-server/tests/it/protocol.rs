@@ -43,7 +43,10 @@ async fn hello_is_answered_with_server_info() {
     assert_eq!(info.name, "Home Media");
     assert_eq!(info.endpoint_id, server.server.id().to_string());
     assert_eq!(info.protocol_version, PROTOCOL_VERSION);
-    assert_eq!(info.auth_methods, [AuthMethod::Password]);
+    assert_eq!(
+        info.auth_methods,
+        [AuthMethod::Password, AuthMethod::DeviceApproval]
+    );
     close(server, client).await;
 }
 
@@ -68,7 +71,7 @@ async fn ping_and_auth_methods_need_no_session() {
     assert_eq!(
         client.call(None, Request::AuthMethods).await,
         Response::Ok(Reply::AuthMethods {
-            methods: vec![AuthMethod::Password]
+            methods: vec![AuthMethod::Password, AuthMethod::DeviceApproval]
         })
     );
     close(server, client).await;
