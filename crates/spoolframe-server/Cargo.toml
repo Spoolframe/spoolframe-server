@@ -11,8 +11,15 @@ license = "AGPL-3.0-or-later"
 name = "spoolframe-server"
 path = "src/main.rs"
 
+[features]
+# Carry the web UI (P3-01): the `dx bundle` output at SPOOLFRAME_WEB_DIST,
+# as `nix build` makes it.
+embed-web = ["dep:rust-embed"]
+
 [dependencies]
+rust-embed = { workspace = true, optional = true, features = ["mime-guess"] }
 async-trait = { workspace = true }
+axum = { workspace = true }
 anyhow = { workspace = true }
 argon2 = { workspace = true }
 blake3 = { workspace = true }
@@ -42,6 +49,9 @@ uclicious = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+reqwest = { workspace = true }
+# A stand-in PMS for the admin API's Plex status.
+wiremock = { workspace = true }
 spoolframe-test-dir = { workspace = true }
 cargo_metadata = { workspace = true }
 m3u8-rs = { workspace = true }

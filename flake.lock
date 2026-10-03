@@ -430,6 +430,36 @@
         "type": "github"
       }
     },
+    "ports": {
+      "inputs": {
+        "flake-parts": [
+          "ports",
+          "molds",
+          "flake-parts"
+        ],
+        "molds": [
+          "molds"
+        ],
+        "nixpkgs": [
+          "ports",
+          "molds",
+          "nixpkgs-unstable"
+        ]
+      },
+      "locked": {
+        "lastModified": 1790130298,
+        "narHash": "sha256-l1gfFyj0N9/wbls/KkbT7N740mP2QvUmvsfCN5o0jXk=",
+        "ref": "refs/heads/master",
+        "rev": "626d99d6d788c7da387c21f157622c60b02a391e",
+        "revCount": 47,
+        "type": "git",
+        "url": "ssh://forgejo@git.coldsteel.casa/Coldsteel/ports.git"
+      },
+      "original": {
+        "type": "git",
+        "url": "ssh://forgejo@git.coldsteel.casa/Coldsteel/ports.git"
+      }
+    },
     "quickshell": {
       "inputs": {
         "nixpkgs": [
@@ -465,7 +495,8 @@
         "nixpkgs": [
           "molds",
           "nixpkgs-unstable"
-        ]
+        ],
+        "ports": "ports"
       }
     },
     "rust-analyzer-src": {

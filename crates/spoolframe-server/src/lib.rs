@@ -5,6 +5,7 @@
 //! link this crate.
 
 pub mod admin;
+mod admin_http;
 pub mod artwork;
 pub mod auth;
 mod client;
@@ -22,3 +23,4 @@ pub mod subtitles;
 pub mod tracks;
 pub mod transcode;
 pub mod watch;
+mod web;

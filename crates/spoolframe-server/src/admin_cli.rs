@@ -49,6 +49,10 @@ pub enum UserCommand {
     /// The devices a user has signed in from, and where their PIN is asked
     /// for.
     Devices { username: String },
+    /// A user's live sessions, on every device and the web.
+    Sessions { username: String },
+    /// End one of a user's sessions, by the id `user sessions` shows.
+    RevokeSession { username: String, id: String },
     /// List users, with their roles.
     List,
     /// Disable a user and end their sessions.
@@ -318,11 +322,16 @@ pub async fn status(listen: SocketAddr) -> Result<()> {
         .await
         .map_err(api_error)?;
     let api = connect(listen, Some(&login.token)).await?;
-    let result = api.server_status().await.map_err(api_error);
+    let result = async {
+        let status = api.server_status().await.map_err(api_error)?;
+        let plex = api.plex_status().await.map_err(api_error)?;
+        Ok::<_, anyhow::Error>((status, plex))
+    }
+    .await;
     if let Err(e) = api.logout().await {
         tracing::debug!(error = %e, "logout");
     }
-    let status = result?;
+    let (status, plex) = result?;
     let list = |v: &[String]| {
         if v.is_empty() {
             "none".to_owned()
@@ -352,6 +361,21 @@ pub async fn status(listen: SocketAddr) -> Result<()> {
         "hardware decoders: {}",
         list(&status.transcoding.hardware_decoders)
     );
+    println!("mDNS: {}", if status.mdns { "on" } else { "off" });
+    println!("addresses: {}", list(&status.addresses));
+    match plex.error {
+        None => println!(
+            "Plex: {}",
+            plex.server_name.as_deref().unwrap_or("reachable")
+        ),
+        Some(e) => println!("Plex: unreachable ({e})"),
+    }
+    for library in plex.libraries {
+        println!(
+            "  {} ({:?}): {} items",
+            library.title, library.kind, library.items
+        );
+    }
     Ok(())
 }
 
@@ -403,6 +427,10 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
                     line.push_str(&format!(" \"{name}\""));
                 }
                 line.push_str(&format!(" ({})", flags.join(", ")));
+                match user.last_seen_at {
+                    Some(at) => line.push_str(&format!("  last seen {}", when(at))),
+                    None => line.push_str("  never signed in"),
+                }
                 println!("{line}");
             }
         }
@@ -441,6 +469,27 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
                     if d.pin_required { "  PIN required" } else { "" }
                 );
             }
+        }
+        UserCommand::Sessions { username } => {
+            for s in api.user_sessions(username).await.map_err(api_error)? {
+                let what = match (&s.endpoint_id, &s.device_name) {
+                    (Some(_), Some(name)) => name.clone(),
+                    (Some(id), None) => format!("device {}", &id[..id.len().min(10)]),
+                    (None, _) => "web or CLI".to_owned(),
+                };
+                println!(
+                    "{}  {what}  since {}  last used {}",
+                    s.id,
+                    when(s.created_at),
+                    when(s.last_used_at)
+                );
+            }
+        }
+        UserCommand::RevokeSession { username, id } => {
+            api.user_revoke_session(username.clone(), id)
+                .await
+                .map_err(api_error)?;
+            println!("ended that session of {username}");
         }
         UserCommand::Disable { username } => {
             let revoked = api

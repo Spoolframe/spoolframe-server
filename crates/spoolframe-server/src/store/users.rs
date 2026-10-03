@@ -20,6 +20,8 @@ pub struct UserRecord {
     pub created_at: i64,
     pub disabled_at: Option<i64>,
     pub has_password: bool,
+    /// When any of their sessions was last used.
+    pub last_seen_at: Option<i64>,
 }
 
 /// What a password login needs about a user.
@@ -224,7 +226,9 @@ impl Store {
     pub async fn list_users(&self) -> Result<Vec<UserRecord>, UserError> {
         let rows = sqlx::query(
             "SELECT u.id, u.username, u.display_name, u.role, u.created_at, u.disabled_at, \
-                    p.user_id IS NOT NULL AS has_password \
+                    p.user_id IS NOT NULL AS has_password, \
+                    (SELECT max(s.last_used_at) FROM sessions s WHERE s.user_id = u.id) \
+                        AS last_seen_at \
              FROM users u LEFT JOIN password_credentials p ON p.user_id = u.id \
              ORDER BY u.username",
         )
@@ -240,6 +244,7 @@ impl Store {
                     created_at: row.try_get("created_at")?,
                     disabled_at: row.try_get("disabled_at")?,
                     has_password: row.try_get("has_password")?,
+                    last_seen_at: row.try_get("last_seen_at")?,
                 })
             })
             .collect()

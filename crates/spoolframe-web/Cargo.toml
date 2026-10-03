@@ -1,0 +1,32 @@
+[package]
+name = "spoolframe-web"
+description = "The Spoolframe web UI (P3): sign-in, the admin pages and My profile."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-or-later"
+publish = false
+
+# The app is wasm only (`dx bundle --platform web`). On the host the crate
+# is its plain logic and that logic's tests, so a workspace build or test
+# never compiles Dioxus for nothing.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Its types build only with a side chosen.
+spoolframe-admin-api = { workspace = true, features = ["client"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+dioxus = { workspace = true }
+dioxus-logger = { workspace = true }
+gloo-net = { workspace = true }
+js-sys = "0.3"
+jsonrpsee = { workspace = true, features = ["wasm-client"] }
+tracing = { workspace = true }
+wasm-bindgen = { workspace = true }
+web-sys = { workspace = true, features = ["Navigator", "Clipboard"] }
+
+# dx looks for it even for a web-only bundle.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+dioxus-fullstack = "=0.7.10"

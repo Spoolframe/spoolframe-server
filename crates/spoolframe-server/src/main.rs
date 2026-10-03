@@ -9,7 +9,7 @@ use spoolframe_media::Prober;
 use spoolframe_media::encoders::FfmpegCommand;
 use spoolframe_media::ocr::Ocr;
 use spoolframe_plex::{Failures, LibraryPaths, PlexCatalog, Scope};
-use spoolframe_server::admin::{self, SetupCode, StatusSource};
+use spoolframe_server::admin::{self, Admin, SetupCode, StatusSource};
 use spoolframe_server::artwork::ArtworkCache;
 use spoolframe_server::auth::Auth;
 use spoolframe_server::config::ServerConfig;
@@ -239,7 +239,10 @@ async fn run(config: &ServerConfig) -> Result<()> {
             )
         })?,
     );
-    let status = Arc::new(StatusSource::new(config.server_name(), transcoding.clone()));
+    let status = Arc::new(
+        StatusSource::new(config.server_name(), transcoding.clone())
+            .with_mdns(config.network.endpoint_options()?.mdns),
+    );
     let artwork_dir = config.state_dir.join("cache").join("artwork");
     let artwork = Arc::new(
         ArtworkCache::open(&artwork_dir, config.artwork.cache_bytes(), catalog.clone())
@@ -256,6 +259,7 @@ async fn run(config: &ServerConfig) -> Result<()> {
     ));
     let plex_sync = plex_sync(config, &plex, auth.store(), &watch).await?;
     let admin_listen = config.admin.listen()?;
+    let admin_origins = config.admin.origins()?;
     // Only a server with no users offers setup, and only to someone who
     // can read this log.
     let setup_code = if auth.store().user_count().await? == 0 {
@@ -269,10 +273,14 @@ async fn run(config: &ServerConfig) -> Result<()> {
     };
     let (admin_addr, admin) = admin::serve(
         admin_listen,
-        auth.clone(),
-        setup_code,
-        status.clone(),
-        plex_sync,
+        Admin {
+            auth: auth.clone(),
+            setup_code,
+            status: status.clone(),
+            plex_sync,
+            plex: Some(plex.clone()),
+        },
+        admin_origins,
     )
     .await
     .with_context(|| format!("cannot start the admin API on {admin_listen}"))?;
@@ -296,6 +304,7 @@ async fn run(config: &ServerConfig) -> Result<()> {
     .await?;
     status.set_endpoint_id(server.id().to_string());
     let addrs: Vec<_> = server.addr().ip_addrs().map(ToString::to_string).collect();
+    status.set_addresses(addrs.clone());
     tracing::info!(endpoint_id = %server.id(), ?addrs, "listening");
 
     shutdown.await;

@@ -296,8 +296,8 @@ impl ArtworkConfig {
     }
 }
 
-/// `admin { listen = "127.0.0.1:7421"; allow_remote = false; }`, all
-/// optional.
+/// `admin { listen = "127.0.0.1:7421"; allow_remote = false;
+/// public_url = "https://media.example.org"; }`, all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct AdminConfig {
@@ -308,10 +308,35 @@ pub struct AdminConfig {
     /// in clear, so only behind a TLS reverse proxy.
     #[ucl(default)]
     pub allow_remote: Option<bool>,
+    /// Where browsers reach the web UI, when it is behind a TLS proxy
+    /// (P3-01): the only origin then allowed to sign in and use it. Left
+    /// out, a browser must be on the listener's own host, as it is directly
+    /// or through an SSH tunnel.
+    #[ucl(default)]
+    pub public_url: Option<String>,
 }
 
 impl AdminConfig {
     pub const DEFAULT_LISTEN: &'static str = "127.0.0.1:7421";
+
+    /// The origins browsers may use the admin listener from: `public_url`'s
+    /// (scheme, host and port; any path dropped), or the listener's own.
+    pub fn origins(&self) -> Result<crate::admin::Origins, ConfigError> {
+        let Some(text) = &self.public_url else {
+            return Ok(crate::admin::Origins::SameHost);
+        };
+        let invalid = |message: String| ConfigError::Invalid {
+            key: "admin.public_url",
+            message,
+        };
+        let url = url::Url::parse(text).map_err(|e| invalid(format!("{text:?}: {e}")))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+            return Err(invalid(format!("{text:?} is not an http(s) URL")));
+        }
+        Ok(crate::admin::Origins::Exactly(
+            url.origin().ascii_serialization(),
+        ))
+    }
 
     /// The address to listen on, refused if it is not loopback and
     /// `allow_remote` is not set.
@@ -525,6 +550,7 @@ impl ServerConfig {
         parsed.plex.path_map()?;
         parsed.network.endpoint_options()?;
         parsed.admin.listen()?;
+        parsed.admin.origins()?;
         parsed.watch.rules()?;
         parsed.transcode.settings()?;
         parsed.transcode.limits(&parsed.state_dir)?;
@@ -860,6 +886,37 @@ mod tests {
         )
         .unwrap();
         assert!(config.admin.listen().is_ok());
+    }
+
+    #[test]
+    fn a_public_url_is_the_one_origin_browsers_may_use() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(
+            config.admin.origins().unwrap(),
+            crate::admin::Origins::SameHost
+        );
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; } admin { public_url = "https://Media.Example.org/spoolframe/"; }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.admin.origins().unwrap(),
+            crate::admin::Origins::Exactly("https://media.example.org".into())
+        );
+        let err = plex(
+            r#"plex { url = "http://nas:32400"; } admin { public_url = "media.example.org"; }"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    key: "admin.public_url",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -206,13 +206,109 @@ async fn one_conversion_too_many_is_busy() {
         read_ahead: Duration::from_millis(500),
         ..ServerOptions::default()
     };
-    let (server, client, session) = ready("encode-busy", options, 120).await;
-    started(&client, &session, None).await;
+    let (server, tv, session) = ready("encode-busy", options, 120).await;
+    started(&tv, &session, None).await;
+    // Another device, while the TV's encode holds the only slot.
+    let desktop = server.client().await;
+    desktop
+        .hello_with(None, Some(progressive_capabilities()))
+        .await;
+    let other = desktop.login("alice", "correct horse").await;
     assert!(matches!(
-        start(&client, &session, None).await,
+        start(&desktop, &other, None).await,
         Response::Err(Error::Busy)
     ));
-    client.close().await;
+    tv.close().await;
+    desktop.close().await;
+    server.stop().await;
+}
+
+/// An app killed mid-film and opened again starts the film again: its
+/// abandoned encode must not hold the slot the new one needs.
+#[tokio::test]
+async fn a_device_starting_again_ends_its_earlier_encode() {
+    let options = ServerOptions {
+        max_jobs: 1,
+        read_ahead: Duration::from_millis(500),
+        ..ServerOptions::default()
+    };
+    let (server, tv, session) = ready("encode-restart", options, 120).await;
+    let first = started(&tv, &session, None).await;
+    until("ffmpeg runs", Duration::from_secs(10), || {
+        !ffmpeg_for(&first).is_empty()
+    })
+    .await;
+    let restarted = tv
+        .reconnect_with(&server, Some(progressive_capabilities()))
+        .await;
+    let second = started(&restarted, &session, None).await;
+    assert!(ffmpeg_for(&first).is_empty());
+    assert!(!server.job_dir(&first, 0).exists());
+    until("the new ffmpeg runs", Duration::from_secs(10), || {
+        !ffmpeg_for(&second).is_empty()
+    })
+    .await;
+    tv.close().await;
+    restarted.close().await;
+    server.stop().await;
+}
+
+/// A killed app that does not come back: its encode ends once its
+/// connection is gone past the grace, not when the playback idles out.
+#[tokio::test]
+async fn a_gone_device_s_encode_ends_after_the_grace() {
+    let options = ServerOptions {
+        max_jobs: 1,
+        read_ahead: Duration::from_millis(500),
+        disconnect_grace: Duration::from_millis(300),
+        ..ServerOptions::default()
+    };
+    let (server, tv, session) = ready("encode-gone", options, 120).await;
+    let handle = started(&tv, &session, None).await;
+    until("ffmpeg runs", Duration::from_secs(10), || {
+        !ffmpeg_for(&handle).is_empty()
+    })
+    .await;
+    tv.close().await;
+    until(
+        "the gone device's ffmpeg is gone",
+        Duration::from_secs(10),
+        || ffmpeg_for(&handle).is_empty(),
+    )
+    .await;
+    // The slot is free for someone else.
+    let desktop = server.client().await;
+    desktop
+        .hello_with(None, Some(progressive_capabilities()))
+        .await;
+    let other = desktop.login("alice", "correct horse").await;
+    started(&desktop, &other, None).await;
+    desktop.close().await;
+    server.stop().await;
+}
+
+/// A device that reconnects within the grace keeps its playback.
+#[tokio::test]
+async fn a_device_back_within_the_grace_keeps_its_encode() {
+    let options = ServerOptions {
+        read_ahead: Duration::from_millis(500),
+        disconnect_grace: Duration::from_millis(500),
+        ..ServerOptions::default()
+    };
+    let (server, tv, session) = ready("encode-back", options, 120).await;
+    let handle = started(&tv, &session, None).await;
+    until("ffmpeg runs", Duration::from_secs(10), || {
+        !ffmpeg_for(&handle).is_empty()
+    })
+    .await;
+    let back = tv.reconnect(&server).await;
+    // The old connection closes; the device (its endpoint) stays.
+    tv.conn.close(0u32.into(), b"replaced");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // Still its playback: it reads on from where it was.
+    let (response, _) = back.read_at(&session, &handle, 0, 0, 4096).await;
+    assert!(matches!(response, MediaReadResponse::Ok(_)), "{response:?}");
+    back.close().await;
     server.stop().await;
 }
 

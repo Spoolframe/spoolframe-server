@@ -51,6 +51,7 @@
     admin {
       listen = ${quote cfg.admin.listen};
       allow_remote = ${lib.boolToString cfg.admin.allowRemote};
+      ${lib.optionalString (cfg.admin.publicUrl != null) "public_url = ${quote cfg.admin.publicUrl};"}
     }
     transcode {
       hardware = ${quote hardware};
@@ -178,6 +179,18 @@ in {
         description = ''
           Allow a non-loopback {option}`admin.listen`. Passwords cross the
           admin API in clear, so only behind a TLS reverse proxy.
+        '';
+      };
+
+      publicUrl = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "https://media.example.org";
+        description = ''
+          Where browsers reach the web UI through a TLS reverse proxy: the
+          only origin then allowed to sign in and use it. Left unset, a
+          browser must be on the listener's own host (directly, or through
+          an SSH tunnel).
         '';
       };
     };

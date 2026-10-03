@@ -390,7 +390,7 @@ impl Watch {
     }
 
     /// For each show with an episode watched or in progress lately, the
-    /// first unwatched episode after the latest watched one. It walks the
+    /// episode after the one watched most recently. It walks the
     /// show through the catalog, so it covers recent shows only, and is
     /// cached briefly.
     async fn next_up(&self, principal: Principal) -> Result<Vec<Item>, WatchError> {
@@ -467,16 +467,19 @@ impl Watch {
             });
             episodes.extend(in_season);
         }
-        let Some(latest) = episodes
+        // The most recently watched, not the furthest: a rewatch (or a
+        // show picked up again from the middle) goes on from where the
+        // person is, as Plex's On Deck does. A season marked watched at
+        // once ties; the later episode wins.
+        let Some((_, latest)) = episodes
             .iter()
-            .rposition(|e| watched.contains(&e.id().to_string()))
+            .enumerate()
+            .filter_map(|(i, e)| watched.get(&e.id().to_string()).map(|at| (*at, i)))
+            .max()
         else {
             return Ok(None);
         };
-        Ok(episodes
-            .into_iter()
-            .skip(latest + 1)
-            .find(|e| !watched.contains(&e.id().to_string())))
+        Ok(episodes.into_iter().nth(latest + 1))
     }
 }
 

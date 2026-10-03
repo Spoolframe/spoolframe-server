@@ -1,5 +1,6 @@
 //! The admin API server: JSON-RPC over WebSocket on TCP (ARCHITECTURE
-//! §35), as the other foundry services serve theirs.
+//! §35), as the other foundry services serve theirs. The listener's HTTP
+//! side (the browser's sign-in, the pages) is `crate::admin_http`.
 //!
 //! Loopback by default: passwords and session tokens cross it in clear,
 //! so reaching it from elsewhere means a TLS reverse proxy in front, and
@@ -7,24 +8,26 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
 
 use jsonrpsee::Extensions;
 use jsonrpsee::core::{RpcResult, async_trait};
-use jsonrpsee::server::{HttpRequest, Server, ServerHandle};
+use jsonrpsee::server::ServerHandle;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
 use spoolframe_admin_api::{
-    AdminApiServer, Credentials, DeviceEntry, LoggedIn, MeApiServer, NewUser, PasswordChange,
-    PlexSyncReport, Role, ServerStatus, SessionEntry, SetupRequest, TranscodingStatus, UserInfo,
-    error_code,
+    AdminApiServer, Credentials, DeviceEntry, LibraryStatus, LoggedIn, MeApiServer, NewUser,
+    PasswordChange, PathFailures, PathReport, PlexStatus, PlexSyncReport, Role, ServerStatus,
+    SessionEntry, SetupRequest, TranscodingStatus, UserInfo, error_code,
 };
-use tower::{Layer, Service};
+use spoolframe_catalog::Catalog;
+use spoolframe_plex::PlexCatalog;
+use spoolframe_plex::check::Scope;
 
+pub use crate::admin_http::Origins;
 use crate::auth::{Auth, LoginError, PasswordError, hash_password, hash_pin, valid_pin};
 use crate::plex_sync::{PlexSync, SyncError};
 use crate::store::pins::{DeviceRecord, PinError};
-use crate::store::sessions::{ApiSessionUser, SessionBinding};
+use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionRecord};
 use crate::store::users::{UserError, UserRecord, normalize_username};
 use crate::transcode::Transcoding;
 
@@ -32,11 +35,11 @@ use crate::transcode::Transcoding;
 /// The API listens on loopback, where the peer address says nothing.
 const SOURCE: &str = "admin-api";
 
-/// The bearer token of the WebSocket upgrade, if there was one.
+/// The caller's session token, from the upgrade's Bearer header or the
+/// browser's cookie (`crate::admin_http`), if there was one.
 #[derive(Debug, Clone)]
-struct Bearer(String);
+pub(crate) struct Bearer(pub(crate) String);
 
-/// Start the admin API on `listen`.
 /// The one-time code that `setup` needs: printed in the server's log at
 /// start while there are no users, so only someone who can read that log
 /// (the person installing the server) can claim the first admin.
@@ -100,7 +103,10 @@ impl SetupCode {
 pub struct StatusSource {
     pub name: String,
     pub transcoding: Arc<Transcoding>,
+    /// Whether the endpoint announces itself on the LAN.
+    pub mdns: bool,
     endpoint_id: OnceLock<String>,
+    addresses: OnceLock<Vec<String>>,
 }
 
 impl StatusSource {
@@ -108,12 +114,24 @@ impl StatusSource {
         Self {
             name: name.into(),
             transcoding,
+            mdns: false,
             endpoint_id: OnceLock::new(),
+            addresses: OnceLock::new(),
         }
+    }
+
+    pub fn with_mdns(mut self, mdns: bool) -> Self {
+        self.mdns = mdns;
+        self
     }
 
     pub fn set_endpoint_id(&self, id: String) {
         let _ = self.endpoint_id.set(id);
+    }
+
+    /// Where the endpoint listens, once it does.
+    pub fn set_addresses(&self, addresses: Vec<String>) {
+        let _ = self.addresses.set(addresses);
     }
 
     fn status(&self) -> ServerStatus {
@@ -135,44 +153,50 @@ impl StatusSource {
                     .map(|d| format!("{} ({:?})", d.codec, d.hardware).to_lowercase())
                     .collect(),
             },
+            mdns: self.mdns,
+            addresses: self.addresses.get().cloned().unwrap_or_default(),
         }
     }
 }
 
-/// Start the admin API on `listen`. `setup_code` is the code `setup`
-/// accepts; `None` when the server already had users at start.
+/// What the admin API acts on.
+pub struct Admin {
+    pub auth: Auth,
+    /// The code `setup` accepts; `None` when the server had users at start.
+    pub setup_code: Option<SetupCode>,
+    pub status: Arc<StatusSource>,
+    pub plex_sync: Option<Arc<PlexSync>>,
+    /// For `plexStatus` and `plexCheckPaths`; `None` in tests without one.
+    pub plex: Option<Arc<PlexCatalog>>,
+}
+
+/// Start the admin API on `listen`. Browsers are let in from `origins`.
 pub async fn serve(
     listen: SocketAddr,
-    auth: Auth,
-    setup_code: Option<SetupCode>,
-    status: Arc<StatusSource>,
-    plex_sync: Option<Arc<PlexSync>>,
+    admin: Admin,
+    origins: Origins,
 ) -> std::io::Result<(SocketAddr, ServerHandle)> {
-    let server = Server::builder()
-        .set_http_middleware(tower::ServiceBuilder::new().layer(BearerLayer))
-        .build(listen)
-        .await?;
-    let addr = server.local_addr()?;
     let api = AdminApi {
-        auth,
-        setup_code,
-        status,
-        plex_sync,
+        auth: admin.auth,
+        setup_code: admin.setup_code,
+        status: admin.status,
+        plex_sync: admin.plex_sync,
+        plex: admin.plex,
     };
     let mut methods = AdminApiServer::into_rpc(api.clone());
     methods
-        .merge(MeApiServer::into_rpc(api))
+        .merge(MeApiServer::into_rpc(api.clone()))
         .expect("the me and admin namespaces never share a name");
-    let handle = server.start(methods);
-    Ok((addr, handle))
+    crate::admin_http::serve(listen, api, methods.into(), origins).await
 }
 
 #[derive(Clone)]
-struct AdminApi {
+pub(crate) struct AdminApi {
     auth: Auth,
     setup_code: Option<SetupCode>,
     status: Arc<StatusSource>,
     plex_sync: Option<Arc<PlexSync>>,
+    plex: Option<Arc<PlexCatalog>>,
 }
 
 fn error(code: i32, message: impl Into<String>) -> ErrorObjectOwned {
@@ -226,6 +250,15 @@ impl From<PasswordError> for ErrorObjectOwned {
 }
 
 impl AdminApi {
+    /// Whether `setup` would take a code now: no users, and a code was
+    /// made at start. What a browser's first page decides on.
+    pub(crate) async fn setup_open(&self) -> RpcResult<bool> {
+        if self.setup_code.is_none() {
+            return Ok(false);
+        }
+        Ok(self.auth.store().user_count().await? == 0)
+    }
+
     /// The caller's live session, checked on every call so a revoked
     /// session or a disabled user stops at once.
     async fn caller(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
@@ -280,6 +313,12 @@ fn device(d: DeviceRecord) -> DeviceEntry {
 }
 
 impl AdminApi {
+    fn plex(&self) -> RpcResult<&PlexCatalog> {
+        self.plex
+            .as_deref()
+            .ok_or_else(|| error(error_code::NOT_CONFIGURED, "no Plex server is configured"))
+    }
+
     /// The caller's own account.
     async fn me(&self, ext: &Extensions) -> RpcResult<UserRecord> {
         let (_, user) = self.caller(ext).await?;
@@ -311,6 +350,19 @@ fn info(u: UserRecord) -> UserInfo {
         created_at: u.created_at,
         disabled: u.disabled_at.is_some(),
         has_password: u.has_password,
+        last_seen_at: u.last_seen_at,
+    }
+}
+
+/// A session as the API shows it; `current` is the caller's own.
+fn session_entry(s: SessionRecord, current: &str) -> SessionEntry {
+    SessionEntry {
+        id: session_id(&s.token_hash),
+        current: s.token_hash == current,
+        device_name: s.device_name,
+        created_at: s.created_at,
+        last_used_at: s.last_used_at,
+        endpoint_id: s.endpoint_id,
     }
 }
 
@@ -377,13 +429,7 @@ impl MeApiServer for AdminApi {
             .map_err(internal)?;
         Ok(sessions
             .into_iter()
-            .map(|s| SessionEntry {
-                id: session_id(&s.token_hash),
-                current: s.token_hash == current,
-                device_name: s.device_name,
-                created_at: s.created_at,
-                last_used_at: s.last_used_at,
-            })
+            .map(|s| session_entry(s, &current))
             .collect())
     }
 
@@ -599,6 +645,128 @@ impl AdminApiServer for AdminApi {
         Ok(())
     }
 
+    async fn user_sessions(
+        &self,
+        ext: &Extensions,
+        username: String,
+    ) -> RpcResult<Vec<SessionEntry>> {
+        let (token, _) = self.caller(ext).await?;
+        self.admin(ext).await?;
+        let user = self.record(&username).await?;
+        let current = crate::auth::SessionToken(token).hash();
+        let sessions = self
+            .auth
+            .store()
+            .list_sessions(user.id)
+            .await
+            .map_err(internal)?;
+        Ok(sessions
+            .into_iter()
+            .map(|s| session_entry(s, &current))
+            .collect())
+    }
+
+    async fn user_revoke_session(
+        &self,
+        ext: &Extensions,
+        username: String,
+        id: String,
+    ) -> RpcResult<()> {
+        self.admin(ext).await?;
+        let user = self.record(&username).await?;
+        let sessions = self
+            .auth
+            .store()
+            .list_sessions(user.id)
+            .await
+            .map_err(internal)?;
+        let Some(session) = sessions
+            .into_iter()
+            .find(|s| session_id(&s.token_hash) == id)
+        else {
+            return Err(error(error_code::NO_SUCH_SESSION, "no such session"));
+        };
+        self.auth
+            .store()
+            .revoke_session(&session.token_hash)
+            .await
+            .map_err(internal)?;
+        tracing::info!(%username, "session revoked by an admin");
+        Ok(())
+    }
+
+    async fn plex_status(&self, ext: &Extensions) -> RpcResult<PlexStatus> {
+        self.admin(ext).await?;
+        let plex = self.plex()?;
+        let down = |e: spoolframe_catalog::CatalogError| PlexStatus {
+            reachable: false,
+            error: Some(e.to_string()),
+            server_name: None,
+            libraries: Vec::new(),
+        };
+        let server_name = match plex.server_name().await {
+            Ok(name) => name,
+            Err(e) => return Ok(down(e)),
+        };
+        let libraries = match plex.libraries().await {
+            Ok(libraries) => libraries,
+            Err(e) => return Ok(down(e)),
+        };
+        let mut status = Vec::with_capacity(libraries.len());
+        for library in libraries {
+            let page = spoolframe_catalog::Page {
+                offset: 0,
+                limit: 1,
+            };
+            let items = match plex.items(&library.id, page).await {
+                Ok(page) => page.total,
+                Err(e) => return Ok(down(e)),
+            };
+            status.push(LibraryStatus {
+                title: library.title,
+                kind: library.kind,
+                items,
+            });
+        }
+        Ok(PlexStatus {
+            reachable: true,
+            error: None,
+            server_name,
+            libraries: status,
+        })
+    }
+
+    async fn plex_check_paths(
+        &self,
+        ext: &Extensions,
+        library: Option<String>,
+    ) -> RpcResult<Vec<PathReport>> {
+        self.admin(ext).await?;
+        let reports = self
+            .plex()?
+            .check_paths(library.as_deref(), Scope::All)
+            .await
+            .map_err(|e| match e {
+                spoolframe_catalog::CatalogError::NotFound(what) => {
+                    error(error_code::INVALID_INPUT, format!("no {what}"))
+                }
+                other => error(error_code::UNAVAILABLE, other.to_string()),
+            })?;
+        let failures = |f: spoolframe_plex::check::Failures| PathFailures {
+            count: f.count,
+            examples: f.examples,
+        };
+        Ok(reports
+            .into_iter()
+            .map(|r| PathReport {
+                library: r.library,
+                ok: r.ok,
+                no_mapping: failures(r.no_mapping),
+                unreadable: failures(r.unreadable),
+            })
+            .collect())
+    }
+
     async fn server_status(&self, ext: &Extensions) -> RpcResult<ServerStatus> {
         self.admin(ext).await?;
         Ok(self.status.status())
@@ -621,50 +789,6 @@ impl AdminApiServer for AdminApi {
             pushed: report.pushed,
             failed: report.failed,
         })
-    }
-}
-
-/// Puts the upgrade's bearer token, if any, into the request extensions,
-/// where methods find it. It refuses nothing: `setup` and `login` are
-/// called without one.
-#[derive(Debug, Clone)]
-struct BearerLayer;
-
-impl<S> Layer<S> for BearerLayer {
-    type Service = BearerService<S>;
-    fn layer(&self, inner: S) -> Self::Service {
-        BearerService { inner }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct BearerService<S> {
-    inner: S,
-}
-
-impl<S, B> Service<HttpRequest<B>> for BearerService<S>
-where
-    S: Service<HttpRequest<B>>,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
-        let bearer = req
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|t| Bearer(t.trim().to_owned()));
-        if let Some(bearer) = bearer {
-            req.extensions_mut().insert(bearer);
-        }
-        self.inner.call(req)
     }
 }
 

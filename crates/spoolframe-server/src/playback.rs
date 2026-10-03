@@ -22,6 +22,10 @@ use crate::subtitles::TextState;
 
 /// How long a handle lives without reads.
 pub const IDLE: Duration = Duration::from_secs(5 * 60);
+/// How long a device's playbacks outlive its last connection: long enough
+/// for a reconnect (a network change, an app brought back), short of
+/// holding an encode slot for [`IDLE`] for an app that was killed.
+pub const DISCONNECT_GRACE: Duration = Duration::from_secs(30);
 /// How often, while a handle is used, its session is checked again, so a
 /// revoked session or a disabled user stops playback promptly.
 pub const RECHECK: Duration = Duration::from_secs(30);
@@ -105,6 +109,7 @@ pub struct Use {
 pub struct Playbacks {
     idle: Duration,
     recheck: Duration,
+    disconnect_grace: Duration,
     handles: Mutex<HashMap<String, Playback>>,
 }
 
@@ -119,8 +124,20 @@ impl Playbacks {
         Self {
             idle,
             recheck,
+            disconnect_grace: DISCONNECT_GRACE,
             handles: Mutex::default(),
         }
+    }
+
+    /// Playbacks end `grace` after their device's last connection closes
+    /// ([`DISCONNECT_GRACE`]; tests shorten it).
+    pub fn with_disconnect_grace(mut self, grace: Duration) -> Self {
+        self.disconnect_grace = grace;
+        self
+    }
+
+    pub fn disconnect_grace(&self) -> Duration {
+        self.disconnect_grace
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Playback>> {
@@ -219,6 +236,34 @@ impl Playbacks {
         drop(ended);
     }
 
+    /// End `endpoint`'s converted playbacks: it is starting another, and a
+    /// device plays one thing at a time, so their encodes would only hold
+    /// slots (an app killed mid-film and opened again). Returns how many.
+    pub fn end_conversions_on(&self, endpoint: &str) -> usize {
+        self.end_where(|p| p.endpoint == endpoint && p.conversion.is_some())
+    }
+
+    /// End every playback of `endpoint`: it has been gone longer than the
+    /// grace. Returns how many.
+    pub fn end_device(&self, endpoint: &str) -> usize {
+        self.end_where(|p| p.endpoint == endpoint)
+    }
+
+    fn end_where(&self, ends: impl Fn(&Playback) -> bool) -> usize {
+        let mut ended = Vec::new();
+        self.lock().retain(|_, p| {
+            let end = ends(p);
+            if end {
+                ended.push(p.conversion.take());
+            }
+            !end
+        });
+        // Dropped outside the lock: ending a conversion removes files.
+        let count = ended.len();
+        drop(ended);
+        count
+    }
+
     /// End every playback idle past the limit. Run now and then, so a
     /// conversion does not outlive its handle by long.
     pub fn sweep(&self) {
@@ -245,11 +290,15 @@ mod tests {
     use super::*;
 
     fn start(p: &Playbacks) -> PlaybackHandle {
+        start_on(p, "e")
+    }
+
+    fn start_on(p: &Playbacks, endpoint: &str) -> PlaybackHandle {
         p.start(
             Playbacks::new_handle(),
             Opened {
                 session: SessionId("s".into()),
-                endpoint: "e".into(),
+                endpoint: endpoint.into(),
                 item: "plex:movie:1".parse().unwrap(),
                 selection: Selection::default(),
                 path: "/media/a.mkv".into(),
@@ -306,6 +355,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         assert!(p.use_handle(&h, &s, "e").unwrap().recheck);
         assert!(!p.use_handle(&h, &s, "e").unwrap().recheck);
+    }
+
+    #[test]
+    fn a_gone_device_s_playbacks_end_and_no_one_else_s() {
+        let p = Playbacks::default();
+        let tv = start_on(&p, "tv");
+        let phone = start_on(&p, "phone");
+        assert_eq!(p.end_device("tv"), 1);
+        let s = SessionId("s".into());
+        assert_eq!(p.use_handle(&tv, &s, "tv").unwrap_err(), Refusal::Expired);
+        assert!(p.use_handle(&phone, &s, "phone").is_ok());
+    }
+
+    #[test]
+    fn a_new_playback_ends_only_converted_ones() {
+        let p = Playbacks::default();
+        let direct = start_on(&p, "tv");
+        // Direct play holds no slot: it stays.
+        assert_eq!(p.end_conversions_on("tv"), 0);
+        assert!(p.use_handle(&direct, &SessionId("s".into()), "tv").is_ok());
     }
 
     #[test]

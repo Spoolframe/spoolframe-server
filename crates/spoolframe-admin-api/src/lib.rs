@@ -119,6 +119,10 @@ pub struct UserInfo {
     pub created_at: i64,
     pub disabled: bool,
     pub has_password: bool,
+    /// When any of their sessions was last used, Unix seconds; `None` if
+    /// they have never signed in.
+    #[serde(default)]
+    pub last_seen_at: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +179,10 @@ pub struct SessionEntry {
     pub last_used_at: i64,
     /// The session this call is made in.
     pub current: bool,
+    /// The device's key (hex `EndpointId`) for a client session; `None` for
+    /// a web or CLI session.
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
 }
 
 /// One of a user's devices (P2-08).
@@ -204,6 +212,57 @@ pub struct ServerStatus {
     #[serde(default)]
     pub fingerprint: Option<String>,
     pub transcoding: TranscodingStatus,
+    /// Whether the server announces itself on the LAN (mDNS).
+    #[serde(default)]
+    pub mdns: bool,
+    /// Where clients reach it: the endpoint's bound addresses.
+    #[serde(default)]
+    pub addresses: Vec<String>,
+}
+
+/// Plex as the server sees it now (P3-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexStatus {
+    pub reachable: bool,
+    /// Why not, when it is not.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// What the PMS calls itself.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub libraries: Vec<LibraryStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryStatus {
+    pub title: String,
+    pub kind: spoolframe_types::LibraryKind,
+    /// Its top-level items: movies, shows or artists.
+    pub items: u32,
+}
+
+/// One library's media paths, checked (P1-04).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathReport {
+    pub library: String,
+    /// Files this host can read.
+    pub ok: u64,
+    /// Unreadable, and no mapping matched: a mapping is probably missing.
+    pub no_mapping: PathFailures,
+    /// Unreadable though a mapping matched: wrong mapping or missing mount.
+    pub unreadable: PathFailures,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathFailures {
+    pub count: u64,
+    /// `"<plex path> -> <local path>: <reason>"`, a few.
+    pub examples: Vec<String>,
 }
 
 /// The encoders that work on this machine (P2-02), preferred first.
@@ -350,6 +409,35 @@ pub trait AdminApi {
         endpoint_id: String,
         required: bool,
     ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A user's live sessions on every device, most recently used first.
+    #[method(name = "userSessions", with_extensions)]
+    async fn user_sessions(
+        &self,
+        username: String,
+    ) -> jsonrpsee::core::RpcResult<Vec<SessionEntry>>;
+
+    /// End one of a user's sessions, by its id from `userSessions`.
+    #[method(name = "userRevokeSession", with_extensions)]
+    async fn user_revoke_session(
+        &self,
+        username: String,
+        id: String,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Plex now: reachable or not, its name, and the libraries with their
+    /// item counts. Plex being down is an answer here, not an error.
+    #[method(name = "plexStatus", with_extensions)]
+    async fn plex_status(&self) -> jsonrpsee::core::RpcResult<PlexStatus>;
+
+    /// Check every media path of every library, or of the one titled
+    /// `library`, as `plex check-paths` does. Reads the whole library: it
+    /// takes a while.
+    #[method(name = "plexCheckPaths", with_extensions)]
+    async fn plex_check_paths(
+        &self,
+        library: Option<String>,
+    ) -> jsonrpsee::core::RpcResult<Vec<PathReport>>;
 
     /// The server's name, key, version and encoders.
     #[method(name = "serverStatus", with_extensions)]

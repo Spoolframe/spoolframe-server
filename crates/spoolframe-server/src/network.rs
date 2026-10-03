@@ -85,6 +85,13 @@ impl Connections {
     pub(crate) fn remove(&self, id: usize) {
         self.lock().remove(&id);
     }
+
+    /// Whether `endpoint` has a connection open.
+    pub(crate) fn has_endpoint(&self, endpoint: &EndpointId) -> bool {
+        self.lock()
+            .values()
+            .any(|auth| matches!(auth, ConnectionAuth::Anonymous { endpoint: e } if e == endpoint))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

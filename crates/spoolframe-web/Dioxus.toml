@@ -1,0 +1,18 @@
+[application]
+name = "spoolframe-web"
+default_platform = "web"
+out_dir = "dist"
+asset_dir = "assets"
+
+# Tailwind is compiled on its own (`tailwindcss -i input.css -o
+# assets/tailwind.css`); Dioxus 0.7 dropped its [web.tailwind] section.
+
+[web.app]
+title = "Spoolframe"
+
+[web.wasm_opt]
+level = "z"
+
+[web.watcher]
+index_on_404 = true
+watch_path = ["src", "assets"]

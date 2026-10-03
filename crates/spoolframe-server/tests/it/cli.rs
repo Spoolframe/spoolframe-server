@@ -183,12 +183,22 @@ async fn setup_then_manage_users_from_the_cli() {
     );
     assert!(out.status.success(), "{out:?}");
 
+    // Each line without when the user was last seen, which is a clock.
     let list = |admin: &[(&str, &str)]| {
         let out = cli(&config, &["user", "list"], "", admin);
         assert!(out.status.success(), "{out:?}");
-        String::from_utf8(out.stdout).unwrap()
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| l.split("  ").next().unwrap().to_owned() + "\n")
+            .collect::<String>()
     };
     assert_eq!(list(&admin), "alice (consumer)\nroot (admin)\n");
+    // Alice has never signed in; root just did.
+    let out = cli(&config, &["user", "list"], "", &admin);
+    let full = String::from_utf8(out.stdout).unwrap();
+    assert!(full.contains("alice (consumer)  never signed in"), "{full}");
+    assert!(full.contains("root (admin)  last seen "), "{full}");
 
     // The last admin cannot step down; once alice is one, root can.
     let out = cli(&config, &["user", "role", "root", "consumer"], "", &admin);

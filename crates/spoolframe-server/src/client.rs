@@ -825,6 +825,13 @@ impl ClientProtocol {
                     self.services.subtitles.ocr(),
                 );
                 let handle = Playbacks::new_handle();
+                // This device's earlier encodes are abandoned: free their
+                // slots before this one takes one.
+                let endpoint = connection.remote_id().to_string();
+                let ended = self.services.playbacks.end_conversions_on(&endpoint);
+                if ended > 0 {
+                    tracing::info!(%endpoint, ended, "a device's earlier conversions ended");
+                }
                 let (subtitle, size, conversion) = self
                     .prepare(
                         &handle,
@@ -839,7 +846,7 @@ impl ClientProtocol {
                     handle,
                     Opened {
                         session,
-                        endpoint: connection.remote_id().to_string(),
+                        endpoint,
                         item: id.clone(),
                         selection,
                         path,
@@ -1114,6 +1121,24 @@ impl ClientProtocol {
         }
     }
 
+    /// A device's last connection closed: end its playbacks, and their
+    /// encodes, unless it is back within the grace. A killed app's encode
+    /// would otherwise hold a slot until it idles out.
+    fn end_playbacks_unless_back(&self, endpoint: iroh::EndpointId) {
+        let connections = self.connections.clone();
+        let playbacks = self.services.playbacks.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(playbacks.disconnect_grace()).await;
+            if connections.has_endpoint(&endpoint) {
+                return;
+            }
+            let ended = playbacks.end_device(&endpoint.to_string());
+            if ended > 0 {
+                tracing::info!(%endpoint, ended, "a gone device's playbacks ended");
+            }
+        });
+    }
+
     fn store(&self) -> &crate::store::Store {
         self.services.auth.store()
     }
@@ -1368,6 +1393,7 @@ impl ProtocolHandler for ClientProtocol {
         self.events.lock().await.remove(&id);
         self.connections.remove(id);
         tracing::info!(?auth, %reason, "client disconnected");
+        self.end_playbacks_unless_back(connection.remote_id());
         Ok(())
     }
 

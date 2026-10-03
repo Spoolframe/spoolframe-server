@@ -8,6 +8,13 @@ inputs:
     follows: molds/nixpkgs-unstable
   rust-overlay:
     follows: molds/rust-overlay
+  # The web UI's tools (P3-01): `dx` and `wasm-bindgen-cli`, pinned with
+  # the `dioxus` and `wasm-bindgen` crates.
+  ports:
+    url: git+ssh://forgejo@git.coldsteel.casa/Coldsteel/ports.git
+    flake: true
 imports:
   - molds/devenv/common
   - molds/devenv/rust
+  # The wasm32 target, for spoolframe-web.
+  - molds/devenv/rust-wasm

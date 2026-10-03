@@ -10,6 +10,13 @@
   makeWrapper,
   ffmpeg-headless,
   tesseract,
+  # The web UI (P3-01).
+  dioxus-cli,
+  wasm-bindgen-cli,
+  binaryen,
+  tailwindcss_4,
+  # rustc links wasm32 with `lld`, which nixpkgs' rustc does not carry.
+  lld,
 }: let
   # English by default; the NixOS module points the server at a tesseract
   # with the languages the host asks for.
@@ -36,7 +43,17 @@ in
     // {
       inherit cargoArtifacts;
 
-      cargoExtraArgs = "-p spoolframe-server";
+      # The web UI first, then the server carrying it: Tailwind, `dx bundle`
+      # (from the workspace root, where dx resolves members), then the server
+      # with `embed-web` reading the bundle from SPOOLFRAME_WEB_DIST.
+      WASM_BINDGEN = "${wasm-bindgen-cli}/bin/wasm-bindgen";
+      buildPhaseCargoCommand = ''
+        tailwindcss -i crates/spoolframe-web/input.css -o crates/spoolframe-web/assets/tailwind.css
+        dx bundle --package spoolframe-web --platform web --release --profile wasm-release
+        export SPOOLFRAME_WEB_DIST="$PWD/target/dx/spoolframe-web/release/web/public"
+        cargoBuildLog=$(mktemp cargoBuildLogXXXX.json)
+        cargoWithProfile build -p spoolframe-server --features embed-web --message-format json-render-diagnostics >"$cargoBuildLog"
+      '';
 
       # The server runs ffprobe on every file it serves (P1-06), ffmpeg to
       # encode (P2-02) and tesseract to read bitmap subtitles (P2-07); put
@@ -44,7 +61,16 @@ in
       # them. nixpkgs' ffmpeg-headless already has VA-API
       # and NVENC (the CUDA driver is loaded at run time), so no override:
       # QSV is the one it lacks, and Intel GPUs encode through VA-API.
-      nativeBuildInputs = commonArgs.nativeBuildInputs ++ [makeWrapper];
+      nativeBuildInputs =
+        commonArgs.nativeBuildInputs
+        ++ [
+          makeWrapper
+          dioxus-cli
+          wasm-bindgen-cli
+          binaryen
+          tailwindcss_4
+          lld
+        ];
       postInstall = ''
         wrapProgram $out/bin/spoolframe-server \
           --prefix PATH : ${lib.makeBinPath [ffmpeg-headless ocr]}

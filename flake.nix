@@ -6,6 +6,11 @@
     nixpkgs.follows = "molds/nixpkgs-unstable";
     flake-parts.follows = "molds/flake-parts";
     crane.follows = "molds/crane";
+    # dx and wasm-bindgen-cli for the web UI (P3-01), at named versions.
+    ports = {
+      url = "git+ssh://forgejo@git.coldsteel.casa/Coldsteel/ports.git";
+      inputs.molds.follows = "molds";
+    };
   };
 
   outputs = inputs @ {flake-parts, ...}:
@@ -25,6 +30,7 @@
       perSystem = {
         pkgs,
         lib,
+        system,
         ...
       }: let
         craneLibBase = inputs.crane.mkLib pkgs;
@@ -36,14 +42,20 @@
             configSha256 = "sha256-HqSvh8XOBRcuVdl0VYapaNbQfPXNgjiZOG0oe17zziA=";
           })
         ];
-      in {
-        packages.default = pkgs.callPackage ./nix/package.nix {
+        # Named versions, not ports' floating `dioxus-cli`: dx, the dioxus
+        # crate and wasm-bindgen move together, and dx refuses to bundle on a
+        # mismatch (scribe's FD-451 found the floating one moving under it).
+        spoolframe = pkgs.callPackage ./nix/package.nix {
           inherit lib craneLib;
+          dioxus-cli = inputs.ports.packages.${system}.dioxus-cli_0_7_10;
+          wasm-bindgen-cli = inputs.ports.packages.${system}.wasm-bindgen-cli_0_2_126;
         };
+      in {
+        packages.default = spoolframe;
         checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           nixos-module = import ./nix/tests.nix {
             inherit pkgs;
-            spoolframePackage = pkgs.callPackage ./nix/package.nix {inherit lib craneLib;};
+            spoolframePackage = spoolframe;
             spoolframeModule = ./nix/nixos-module.nix;
           };
         };

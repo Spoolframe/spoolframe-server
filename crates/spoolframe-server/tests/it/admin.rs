@@ -9,12 +9,12 @@ use spoolframe_admin_api::{
     AdminApiClient, Credentials, MeApiClient, NewUser, PasswordChange, Role, SetupRequest,
     error_code,
 };
-use spoolframe_server::admin::{self, SetupCode};
+use spoolframe_server::admin::{self, Admin, Origins, SetupCode};
 use spoolframe_server::auth::Auth;
 use spoolframe_server::store::Store;
 
 /// The setup code the test servers accept.
-const CODE: &str = "K7QD-M2XP-9RTB";
+pub(crate) const CODE: &str = "K7QD-M2XP-9RTB";
 
 /// The status of a server whose key is the first fingerprint test vector.
 fn status() -> std::sync::Arc<admin::StatusSource> {
@@ -25,6 +25,17 @@ fn status() -> std::sync::Arc<admin::StatusSource> {
 
 const VECTOR: (&str, &str) = spoolframe_protocol::fingerprint::TEST_VECTORS[0];
 
+/// The admin API over `auth`, without Plex.
+fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
+    Admin {
+        auth,
+        setup_code,
+        status: status(),
+        plex_sync: None,
+        plex: None,
+    }
+}
+
 /// A directory of the test's own under a random name, removed when
 /// dropped, so runs at once never share one.
 async fn state_dir(test: &str) -> spoolframe_test_dir::TestDir {
@@ -32,15 +43,13 @@ async fn state_dir(test: &str) -> spoolframe_test_dir::TestDir {
 }
 
 /// An admin API on a store in a directory kept for the test.
-async fn server(test: &str) -> (SocketAddr, spoolframe_test_dir::TestDir) {
+pub(crate) async fn server(test: &str) -> (SocketAddr, spoolframe_test_dir::TestDir) {
     let dir = state_dir(test).await;
     let auth = Auth::new(Store::open(dir.as_ref()).await.unwrap());
     let (addr, handle) = admin::serve(
         "127.0.0.1:0".parse().unwrap(),
-        auth,
-        Some(SetupCode::new(CODE)),
-        status(),
-        None,
+        admin(auth, Some(SetupCode::new(CODE))),
+        Origins::default(),
     )
     .await
     .unwrap();
@@ -49,7 +58,7 @@ async fn server(test: &str) -> (SocketAddr, spoolframe_test_dir::TestDir) {
     (addr, dir)
 }
 
-async fn anonymous(addr: SocketAddr) -> WsClient {
+pub(crate) async fn anonymous(addr: SocketAddr) -> WsClient {
     WsClientBuilder::default()
         .build(format!("ws://{addr}"))
         .await
@@ -332,9 +341,13 @@ async fn guessing_the_setup_code_is_rate_limited() {
 async fn a_server_started_with_users_offers_no_setup() {
     let dir = state_dir("no-setup").await;
     let auth = Auth::new(Store::open(dir.as_ref()).await.unwrap());
-    let (addr, handle) = admin::serve("127.0.0.1:0".parse().unwrap(), auth, None, status(), None)
-        .await
-        .unwrap();
+    let (addr, handle) = admin::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        admin(auth, None),
+        Origins::default(),
+    )
+    .await
+    .unwrap();
     std::mem::forget(handle);
     let err = anonymous(addr)
         .await
@@ -535,4 +548,166 @@ async fn a_user_sets_their_pin_and_where_it_is_asked_for_and_an_admin_clears_it(
         .await
         .unwrap_err();
     assert_eq!(code(no_pin), error_code::INVALID_INPUT);
+}
+
+/// The admin API over `auth`, with Plex at `url`.
+async fn server_with_plex(test: &str, url: &str) -> (SocketAddr, spoolframe_test_dir::TestDir) {
+    let dir = state_dir(test).await;
+    let auth = Auth::new(Store::open(dir.as_ref()).await.unwrap());
+    let plex = spoolframe_plex::PlexCatalog::new(url.parse().unwrap(), None).unwrap();
+    let (addr, handle) = admin::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        Admin {
+            plex: Some(std::sync::Arc::new(plex)),
+            ..admin(auth, Some(SetupCode::new(CODE)))
+        },
+        Origins::default(),
+    )
+    .await
+    .unwrap();
+    std::mem::forget(handle);
+    (addr, dir)
+}
+
+async fn root_on(addr: SocketAddr) -> WsClient {
+    let setup = anonymous(addr)
+        .await
+        .setup(setup(CODE, "root", "correct horse"))
+        .await
+        .unwrap();
+    with_token(addr, &setup.token).await
+}
+
+#[tokio::test]
+async fn users_show_when_they_were_last_seen() {
+    let (addr, root, _dir) = admin_client("last-seen").await;
+    root.user_add(NewUser {
+        username: "bob".into(),
+        display_name: None,
+        password: "battery staple".into(),
+        role: Role::Consumer,
+    })
+    .await
+    .unwrap();
+    let users = root.user_list().await.unwrap();
+    let seen = |name: &str| {
+        users
+            .iter()
+            .find(|u| u.username == name)
+            .unwrap()
+            .last_seen_at
+    };
+    assert!(seen("root").is_some());
+    assert_eq!(seen("bob"), None);
+    let _ = addr;
+}
+
+#[tokio::test]
+async fn an_admin_lists_and_ends_another_user_s_sessions() {
+    let (addr, root, _dir) = admin_client("user-sessions").await;
+    root.user_add(NewUser {
+        username: "bob".into(),
+        display_name: None,
+        password: "battery staple".into(),
+        role: Role::Consumer,
+    })
+    .await
+    .unwrap();
+    let login = anonymous(addr)
+        .await
+        .login(creds("bob", "battery staple"))
+        .await
+        .unwrap();
+    let bob = with_token(addr, &login.token).await;
+    // Bob may not look at anyone's, his own included, through admin.*.
+    assert_eq!(
+        code(bob.user_sessions("bob".into()).await.unwrap_err()),
+        error_code::FORBIDDEN
+    );
+
+    let sessions = root.user_sessions("bob".into()).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    // A CLI session: no device.
+    assert_eq!(sessions[0].endpoint_id, None);
+    assert!(!sessions[0].current);
+    assert_eq!(
+        code(
+            root.user_revoke_session("bob".into(), "nope".into())
+                .await
+                .unwrap_err()
+        ),
+        error_code::NO_SUCH_SESSION
+    );
+    root.user_revoke_session("bob".into(), sessions[0].id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        code(bob.who_am_i().await.unwrap_err()),
+        error_code::UNAUTHENTICATED
+    );
+    // Root's own is untouched.
+    root.who_am_i().await.unwrap();
+}
+
+#[tokio::test]
+async fn plex_down_is_an_answer_not_an_error() {
+    // Nothing listens on port 9 here.
+    let (addr, _dir) = server_with_plex("plex-down", "http://127.0.0.1:9").await;
+    let root = root_on(addr).await;
+    let status = root.plex_status().await.unwrap();
+    assert!(!status.reachable);
+    assert!(status.error.is_some());
+    assert!(status.libraries.is_empty());
+}
+
+#[tokio::test]
+async fn plex_status_names_the_server_and_counts_each_library() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let pms = MockServer::start().await;
+    let json = |body: serde_json::Value| ResponseTemplate::new(200).set_body_json(body);
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(json(
+            serde_json::json!({ "MediaContainer": { "friendlyName": "Den" } }),
+        ))
+        .mount(&pms)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections"))
+        .respond_with(json(serde_json::json!({ "MediaContainer": { "Directory": [
+            { "key": "1", "type": "movie", "title": "Movies" },
+            { "key": "2", "type": "show", "title": "TV" },
+        ] } })))
+        .mount(&pms)
+        .await;
+    for (key, total) in [("1", 770), ("2", 41)] {
+        Mock::given(method("GET"))
+            .and(path(format!("/library/sections/{key}/all")))
+            .respond_with(json(
+                serde_json::json!({ "MediaContainer": { "totalSize": total } }),
+            ))
+            .mount(&pms)
+            .await;
+    }
+    let (addr, _dir) = server_with_plex("plex-up", &pms.uri()).await;
+    let root = root_on(addr).await;
+    let status = root.plex_status().await.unwrap();
+    assert!(status.reachable, "{status:?}");
+    assert_eq!(status.server_name.as_deref(), Some("Den"));
+    let counts: Vec<_> = status
+        .libraries
+        .iter()
+        .map(|l| (l.title.as_str(), l.items))
+        .collect();
+    assert_eq!(counts, [("Movies", 770), ("TV", 41)]);
+}
+
+#[tokio::test]
+async fn without_plex_its_methods_say_so() {
+    let (_addr, root, _dir) = admin_client("no-plex").await;
+    assert_eq!(
+        code(root.plex_status().await.unwrap_err()),
+        error_code::NOT_CONFIGURED
+    );
 }

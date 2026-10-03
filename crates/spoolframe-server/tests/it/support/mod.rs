@@ -315,6 +315,8 @@ pub struct ServerOptions {
     pub failure_window: Duration,
     /// How long device sign-in codes live (P3-07).
     pub sign_in_lifetime: Duration,
+    /// How long a device's playbacks outlive its last connection.
+    pub disconnect_grace: Duration,
 }
 
 impl Default for ServerOptions {
@@ -330,6 +332,7 @@ impl Default for ServerOptions {
             ocr: false,
             failure_window: spoolframe_server::auth::FAILURE_WINDOW,
             sign_in_lifetime: spoolframe_server::device_sign_in::LIFETIME,
+            disconnect_grace: spoolframe_server::playback::DISCONNECT_GRACE,
         }
     }
 }
@@ -450,7 +453,10 @@ impl TestServer {
             catalog,
             prober,
             artwork: Arc::new(artwork),
-            playbacks: Arc::new(Playbacks::new(PLAYBACK_IDLE, PLAYBACK_RECHECK)),
+            playbacks: Arc::new(
+                Playbacks::new(PLAYBACK_IDLE, PLAYBACK_RECHECK)
+                    .with_disconnect_grace(options.disconnect_grace),
+            ),
             transcoding: transcoding(),
             jobs: Arc::new(jobs),
             subtitles: Arc::new(subtitles),
@@ -666,6 +672,15 @@ impl TestClient {
     /// A new connection from the same endpoint (the same device), as after
     /// a restart of the app. It says Hello again.
     pub async fn reconnect(&self, server: &TestServer) -> TestClient {
+        self.reconnect_with(server, None).await
+    }
+
+    /// As [`TestClient::reconnect`], saying what the device plays.
+    pub async fn reconnect_with(
+        &self,
+        server: &TestServer,
+        capabilities: Option<ClientCapabilities>,
+    ) -> TestClient {
         let conn = self
             .endpoint
             .connect(server.server.addr(), CLIENT_ALPN)
@@ -675,7 +690,10 @@ impl TestClient {
             endpoint: self.endpoint.clone(),
             conn,
         };
-        client.hello().await;
+        assert!(matches!(
+            client.hello_with(None, capabilities).await,
+            Response::Ok(Reply::ServerInfo(_))
+        ));
         client
     }
 

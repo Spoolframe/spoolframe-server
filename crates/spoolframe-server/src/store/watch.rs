@@ -338,21 +338,22 @@ impl Store {
         .await?)
     }
 
-    /// The watched episodes of `show_id`.
+    /// The watched episodes of `show_id`, with when each was last
+    /// watched (Unix seconds).
     pub async fn watched_in_show(
         &self,
         principal: Principal,
         show_id: &str,
-    ) -> Result<HashSet<String>, StoreError> {
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT media_id FROM watch_state \
+    ) -> Result<HashMap<String, i64>, StoreError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT media_id, updated_at FROM watch_state \
              WHERE principal = ?1 AND show_id = ?2 AND watched = 1",
         )
         .bind(principal.to_string())
         .bind(show_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(ids.into_iter().collect())
+        Ok(rows.into_iter().collect())
     }
 }
 

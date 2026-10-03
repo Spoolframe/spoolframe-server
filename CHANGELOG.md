@@ -334,3 +334,58 @@
   phone, `device_sign_in::parse_link` reads a scanned code, and
   `Session::lookup_device_sign_in`, `approve_device_sign_in` and
   `deny_device_sign_in` answer it.
+- The admin listener's browser side (P3-01): axum now fronts the admin
+  JSON-RPC socket (at `/jsonrpc`, and at any path for the CLI as before)
+  and serves `POST /auth/setup`, `/auth/login` and `/auth/logout` and
+  `GET /auth/me`. Setup and login set the `spoolframe_session` cookie
+  (`HttpOnly; Secure; SameSite=Strict`, an API session like the CLI's),
+  which the socket accepts as it does the CLI's Bearer token (the header
+  wins when both are sent); logout revokes it and clears the cookie. A
+  POST or socket upgrade from another `Origin` is refused: the listener's
+  own host by default, or exactly `admin.public_url` (config, and the
+  NixOS module's `admin.publicUrl`) behind a TLS proxy.
+- A killed app no longer keeps the server busy: a device starting a
+  playback ends its own earlier converted playbacks (a device plays one
+  thing at a time), and a device's playbacks end 30 s after its last
+  connection closes, unless it reconnects. Before, an app killed
+  mid-film held its encode slot until the playback idled out after 5
+  minutes, and the next start was refused as `Busy`.
+- Next up follows the episode watched most recently, not the furthest one
+  watched: a rewatch (or a show picked up again from the middle) goes on
+  from where the person is, as Plex's On Deck does. Before, a show whose
+  finale had ever been watched never came back to Next up.
+- The web UI (P3-01): `spoolframe-web`, a Dioxus 0.7.10 app built to wasm
+  with `dx bundle` (its own `wasm-release` profile: wasm-opt aborts on a
+  module with debug sections) and carried by the server behind the
+  `embed-web` feature, which `nix build` turns on. The admin listener
+  serves it on every path that is not `/auth`, the socket or a file; a
+  server built without it says so. Pages: setup (with the code from the
+  log) while the server has no users, login, then an admin's Server page
+  or a consumer's My profile, by the role read at each load; sign out.
+  Catppuccin Latte or Mocha by the browser's preference. `GET /auth/setup`
+  tells a signed-out page whether setup is open. devenv gains dx,
+  wasm-bindgen and Tailwind (`spoolframe:web` bundles), `ci:static` a
+  wasm clippy pass, and `ci:style` a check that the committed stylesheet
+  is fresh.
+- Admin API for the admin pages (P3-02): users carry `lastSeenAt`;
+  `admin.userSessions` and `admin.userRevokeSession` list and end anyone's
+  sessions, each with its device's `endpointId` (none for web or CLI);
+  `admin.plexStatus` says whether Plex answers, its name and each
+  library's item count (Plex down is an answer, not an error);
+  `admin.plexCheckPaths` runs the path check over the API; `serverStatus`
+  adds `mdns` and the endpoint's `addresses`. The CLI matches: `user list`
+  shows when each user was last seen, `user sessions <name>`, `user
+  revoke-session <name> <id>`, and `status` prints Plex, its libraries,
+  mDNS and the addresses. `admin::serve` takes its services as one
+  `Admin`.
+- The admin pages (P3-02), under `/admin`: Users lists everyone with
+  their role, whether they are enabled and when they were last seen, and
+  adds a user, resets a password, makes an admin or a consumer, and
+  disables or enables; the last enabled admin's "Make consumer" and
+  "Disable" are greyed with the reason, rather than refused after a
+  click. A user's Sessions lists each (its device, or "Web or CLI"; this
+  browser marked) with when it began and was last used, and ends one.
+  Server shows the name, version, fingerprint and key (with a copy
+  button), LAN discovery and addresses; Plex reachable or not, its name
+  and each library's item count; and a path check of every file, with
+  examples of the failures.

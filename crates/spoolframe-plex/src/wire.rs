@@ -22,6 +22,8 @@ pub struct MediaContainer {
     /// The library the items belong to, on item and listing responses.
     /// Library-scoped path mappings match on it.
     pub library_section_title: Option<String>,
+    /// What the PMS calls itself, on its root (`/`).
+    pub friendly_name: Option<String>,
     #[serde(rename = "Directory", default)]
     pub directories: Vec<Directory>,
     #[serde(rename = "Metadata", default)]

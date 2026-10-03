@@ -64,8 +64,11 @@ sha2 = "0.10"
 jsonrpsee = { version = "0.25", default-features = false }
 # Admin CLI password prompts.
 rpassword = "7"
-# Only for the admin API's HTTP middleware traits.
+# Tower services: the admin listener mounts jsonrpsee as one.
 tower = "0.5"
+# The admin listener's HTTP side (P3-01): the browser's sign-in and the web
+# UI's pages beside the JSON-RPC socket.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 
 # Artwork resizing (P1-05). Decoders for what PMS serves, the JPEG and PNG
 # encoders the cache writes; nothing else.
@@ -77,6 +80,17 @@ url = "2"
 wiremock = "0.6"
 # Checks the HLS playlists the server writes (P2-05), in tests.
 m3u8-rs = "6"
+
+# The web UI (P3-01), built to wasm with `dx bundle`. dx, `dioxus` and
+# `wasm-bindgen` are pinned together: dx refuses to bundle on a mismatch
+# (devenv.nix and nix/package.nix name the same versions).
+dioxus = { version = "=0.7.10", features = ["router", "web"] }
+dioxus-logger = "=0.7.10"
+wasm-bindgen = "=0.2.126"
+web-sys = { version = "0.3", features = ["Window", "Location", "RequestCredentials"] }
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+# The server embeds the bundle (feature `embed-web`).
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -111,3 +125,16 @@ uclicious = { version = "0.9.1", registry = "coldsteel" }
 
 # Reads the workspace graph for the license-boundary test.
 cargo_metadata = "0.23"
+
+# The web UI's wasm (`dx bundle --profile wasm-release`). binaryen's
+# wasm-opt aborts on a module carrying DWARF, so nothing of it may survive:
+# symbols stripped, no debug info, and one codegen unit with LTO for a
+# small download. Its own profile, so the server's release build keeps its
+# usual settings (scribe met the abort first, and put these on release).
+[profile.wasm-release]
+inherits = "release"
+lto = true
+codegen-units = 1
+strip = "symbols"
+debug = false
+opt-level = "z"

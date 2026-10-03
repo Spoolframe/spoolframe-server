@@ -126,6 +126,11 @@ impl PlexCatalog {
         self
     }
 
+    /// What the PMS calls itself; asking is also how to tell it is up.
+    pub async fn server_name(&self) -> Result<Option<String>, CatalogError> {
+        Ok(self.fetch(&Call::get("/")).await?.friendly_name)
+    }
+
     async fn fetch(&self, call: &Call<'_>) -> Result<MediaContainer, CatalogError> {
         let body = self.get_bytes(call, "application/json").await?.0;
         serde_json::from_slice::<Envelope>(&body)

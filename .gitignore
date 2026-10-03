@@ -1,2 +1,6 @@
 target/
 .dev-state/
+# The dev server started in the background logs here.
+/dev-server.log
+# dx bundle output.
+/crates/spoolframe-web/dist/

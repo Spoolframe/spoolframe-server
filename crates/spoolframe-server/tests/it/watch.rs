@@ -165,6 +165,20 @@ async fn next_up_is_after_the_latest_watched_episode() {
     server.stop().await;
 }
 
+/// A rewatch: the whole show was watched once, and the person is back at
+/// the start. Next up follows what they watched last, not the finale.
+#[tokio::test]
+async fn next_up_follows_the_most_recently_watched_episode() {
+    let (server, tv, alice, _) = alice_and_bob("next-up-rewatch").await;
+    mark_watched(&tv, &alice, episode("15", "14", 2, 1).id()).await;
+    // updated_at has one-second resolution.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    mark_watched(&tv, &alice, episode("12", "11", 1, 1).id()).await;
+    assert_eq!(ids(&home(&tv, &alice).await.next_up), ["plex:episode:13"]);
+    tv.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn pages_and_searches_carry_the_user_s_state() {
     let (server, tv, alice, bob) = alice_and_bob("filled").await;

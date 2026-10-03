@@ -6,6 +6,7 @@
 mod support;
 
 mod admin;
+mod admin_web;
 mod artwork;
 mod cli;
 mod device_sign_in;
