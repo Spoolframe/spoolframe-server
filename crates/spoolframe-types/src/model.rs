@@ -141,6 +141,32 @@ pub struct Track {
     pub playback: PlaybackState,
 }
 
+/// What a marked stretch of an item is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerKind {
+    Intro,
+    Credits,
+    /// A kind this build does not know, from a newer server. Show nothing
+    /// for it.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A stretch of a movie or episode a viewer may want to skip (P2-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Marker {
+    pub kind: MarkerKind,
+    /// Where it starts, in milliseconds from the start of the item.
+    pub start_ms: u64,
+    /// Where it ends. On a marker that runs to the end this may be a
+    /// little off the item's duration, either way: go by `to_end`.
+    pub end_ms: u64,
+    /// Nothing follows it: credits with no scene after them. The catalog
+    /// says so; it is never worked out from `end_ms` and the duration.
+    pub to_end: bool,
+}
+
 /// Any one item a catalog returns. On the wire it is the item's own object
 /// with a `kind` field added, for example `{"kind": "movie", "id": …}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +245,35 @@ mod tests {
             serde_json::to_string(&LibraryKind::Movies).unwrap(),
             r#""movies""#
         );
+    }
+
+    #[test]
+    fn a_marker_is_milliseconds_and_a_snake_case_kind_on_the_wire() {
+        let marker = Marker {
+            kind: MarkerKind::Credits,
+            start_ms: 2_662_962,
+            end_ms: 2_709_958,
+            to_end: true,
+        };
+        assert_eq!(
+            serde_json::to_value(marker).unwrap(),
+            serde_json::json!({
+                "kind": "credits",
+                "start_ms": 2_662_962,
+                "end_ms": 2_709_958,
+                "to_end": true,
+            })
+        );
+        round_trip(marker);
+    }
+
+    #[test]
+    fn a_marker_kind_from_a_newer_server_is_unknown() {
+        let marker: Marker = serde_json::from_str(
+            r#"{"kind": "recap", "start_ms": 0, "end_ms": 30000, "to_end": false}"#,
+        )
+        .unwrap();
+        assert_eq!(marker.kind, MarkerKind::Unknown);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use spoolframe_admin_api::{
     AdminApiClient, Credentials, MeApiClient, NewUser, PasswordChange, Role, SetupRequest,
     error_code,
 };
-use spoolframe_server::admin::{self, Admin, Origins, SetupCode};
+use spoolframe_server::admin::{self, Admin, Origins, SetupCode, TrustedProxies};
 use spoolframe_server::auth::Auth;
 use spoolframe_server::store::Store;
 
@@ -50,10 +50,30 @@ pub(crate) async fn server(test: &str) -> (SocketAddr, spoolframe_test_dir::Test
         "127.0.0.1:0".parse().unwrap(),
         admin(auth, Some(SetupCode::new(CODE))),
         Origins::default(),
+        TrustedProxies::default(),
     )
     .await
     .unwrap();
     // Runs for the life of the test process.
+    std::mem::forget(handle);
+    (addr, dir)
+}
+
+/// As [`server`], behind a reverse proxy on this machine: connections from
+/// loopback are the proxy's.
+pub(crate) async fn server_behind_a_proxy(
+    test: &str,
+) -> (SocketAddr, spoolframe_test_dir::TestDir) {
+    let dir = state_dir(test).await;
+    let auth = Auth::new(Store::open(dir.as_ref()).await.unwrap());
+    let (addr, handle) = admin::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        admin(auth, Some(SetupCode::new(CODE))),
+        Origins::default(),
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await
+    .unwrap();
     std::mem::forget(handle);
     (addr, dir)
 }
@@ -367,6 +387,7 @@ async fn a_server_started_with_users_offers_no_setup() {
         "127.0.0.1:0".parse().unwrap(),
         admin(auth, None),
         Origins::default(),
+        TrustedProxies::default(),
     )
     .await
     .unwrap();
@@ -584,6 +605,7 @@ async fn server_with_plex(test: &str, url: &str) -> (SocketAddr, spoolframe_test
             ..admin(auth, Some(SetupCode::new(CODE)))
         },
         Origins::default(),
+        TrustedProxies::default(),
     )
     .await
     .unwrap();

@@ -434,10 +434,12 @@
 - A PGS file beside the film (`Movie.en.sup`) can be burned into the
   video: its pictures are laid over the video, as an embedded PGS
   track's are. Before, it went to the filter that draws text, ffmpeg
-  refused it, and a playback the server had offered failed. A VobSub
-  file beside the film (`.idx` and `.sub`) cannot be burned in: a plan
-  that would need that is now `Unsupported` and says why. Before, that
-  playback too started and then failed (P2-07).
+  refused it, and a playback the server had offered failed (P2-07).
+- A VobSub subtitle beside the film (`Movie.en.idx` with its
+  `Movie.en.sub`) plays in a converted playback, sent on as a stream to
+  a client that draws VobSub or burned into the video. Before, ffmpeg
+  was given the `.idx` under a name it could not find the `.sub` by,
+  and the playback started and then failed (P2-07).
 - At start the server removes only its own leftover conversions: they
   are kept in a directory of their own, `spoolframe-jobs`, under
   `transcode.scratch_dir`, and only that is emptied. Before, the whole
@@ -446,21 +448,31 @@
   directory other programs use lost the server's key and database, the
   subtitle texts or the other programs' files. `scratch_limit` counts
   only what is in `spoolframe-jobs` (P2-03).
-- A short item is watched only at 90% of it. The "less than 5 minutes
-  left" rule now applies only to an item at least four times that long
-  (20 minutes), so it never marks an item watched before three quarters
-  of it. Before, a 4-minute clip was watched at its first progress report
-  and a 7-minute episode at 2:00 (P1-14).
+- An item is watched at 95% of its duration (`watch.watched_percent`,
+  before 90), unless it has credits that run to its end (below). The
+  "less than 5 minutes left" rule is gone, and its config key
+  `watch.watched_remaining_secs` with it: a config that still has the
+  key does not load. Before, a 4-minute clip was watched at its first
+  progress report and a 7-minute episode at 2:00 (P2-10, P1-14).
 - The end of an item is written as seldom as the rest of it: once at the
   crossing into watched, then at most once every 10 seconds. Before,
-  every progress report in the last 5 minutes (or last 10%) of an item
+  every progress report after the crossing
   was a full write, however often the client sent them (P1-14).
 - The same film in two libraries (two items with the same external ids)
   keeps a watch state for each copy. Before, to open one copy's page
   moved the other copy's progress, and its "removed from Continue
-  watching", to it. State now moves to a new key only when the catalog
-  no longer has the old one, which is the re-added item re-linking is
-  for (P1-14).
+  watching", to it. State moves to a new key only when the item has
+  left the old one: the catalog has nothing under it, or another item
+  (after a rebuild Plex hands the same keys out again), or it is not
+  this catalog's key. Before, an old key that another film had taken
+  kept the state for good, and one that a show had taken made the
+  item's page and every progress write for it fail. If the catalog
+  cannot say what the old key holds, the state stays and the next look
+  asks again; the item itself works. A state written for the new key
+  in the meantime (by the Plex sync) is kept, and nothing moves onto
+  it; before, the request failed. A look at a second copy asks the
+  catalog about the first with one small request (the new
+  `Catalog::external_ids`), at most once a minute (P1-14).
 - A subtitle file beside the film that is edited in place is converted
   again at the next playback. Before, the text made of it the first time
   was served until the media file itself changed (P2-07).
@@ -475,3 +487,95 @@
   film larger than 1 MiB could not be read and the client was not told
   why. Such a subtitle still cannot be sent; now the client can say so.
   An older client decodes the new error as `Unknown` (P1-10).
+- `spoolframe-types`: `Marker { kind, start_ms, end_ms, to_end }`, an
+  intro or the credits of a movie or episode. `Catalog::item` returns an
+  item's markers, in order of start. `PlexCatalog` reads them from Plex
+  (`includeMarkers=1`, asked only with a movie's or episode's details);
+  Plex's other marker types are left out, and an item Plex has no markers
+  for (no Plex Pass, detection off) has an empty list. A marker that
+  cannot be read (an offset missing or not a whole number, no type), of
+  any type, or that does not end after it starts, is left out too; the
+  item loads without it. Before, one such marker made the item's page,
+  `StartPlayback` and every progress write for it fail (P2-10).
+- The item reply and `StartPlayback`'s reply carry the item's `markers`,
+  and the SDK passes them on as `ItemDetail::markers` and
+  `Playback::markers`. The field is optional on the wire: an older client
+  ignores it, a reply from an older server decodes with an empty list,
+  and a marker kind this build does not know decodes as
+  `MarkerKind::Unknown` (P2-10).
+- An item with credits that run to its end (a `Credits` marker with
+  `to_end`) is watched once playback reaches the start of those credits,
+  and not before: the 95% rule does not apply to it (P2-10, P1-14).
+- HLS of a copied video whose first keyframe is before time 0 (an MP4
+  cut with stream copy starts at the keyframe before the cut) lists the
+  segments ffmpeg writes. That keyframe was left out of the file's
+  keyframes, the second was taken for the first, and the playlist had
+  no cut where ffmpeg made its first: it listed one segment fewer, and
+  every segment after the first held the time the playlist gave to the
+  one before it (P2-05).
+- A PGS file beside the film that is sent on as a stream (the client
+  draws PGS, and the film is converted for another reason) keeps its
+  cues' times when played from the start. Before, every cue showed
+  early by the first cue's time; after a seek they were right (P2-07).
+- An HLS playback that seeks back to a part still converted keeps it
+  while the scratch space is full. The server took the furthest segment
+  ever asked for as where the player was, so after a seek back it
+  removed the segments the player was reading to make room, and each
+  such read started the conversion again. It now goes by the segment
+  asked for last. A conversion held back for its player is no longer
+  failed for space it cannot free at that moment (P2-03).
+- An HLS segment removed just as it is read (for room in the scratch
+  space, or with a conversion that fails for a full one) is answered as
+  not ready, and the client asks again: the conversion restarts there,
+  or the read fails with the conversion's reason. Before, the read
+  could be answered as the whole of an empty segment, which a player
+  takes for the segment, or fail with "a segment of the conversion
+  could not be read" (P2-05, P2-03).
+- `admin.trusted_proxies` (`services.spoolframe.admin.trustedProxies`):
+  the reverse proxies in front of the admin listener, as addresses and
+  CIDR ranges, comma-separated. The limit on failed logins counts a
+  connection from one of them under the caller its `X-Forwarded-For`
+  names: the right-most address that is not itself a trusted proxy
+  (`Forwarded` is not read). Before, with the proxy on another host or
+  in a container, everyone behind it was one source, and five wrong
+  passwords from anyone locked all of them out. A trusted proxy that
+  sends no usable header counts under no address, as a loopback
+  connection does, and the server warns. Without the setting nothing
+  changes: no header is read, a connection counts under its own
+  address, and a loopback one under none (P1-11).
+- The limit on failed logins costs the same however many names and
+  sources have failed. It looks through all of them once a minute, not
+  at every attempt, and judges the name and source of an attempt as of
+  that moment. It holds at most 100 000 of them: while it is full, an
+  attempt under a name or from a source it does not hold is refused as
+  `RateLimited`, until old failures leave the window. Before, a LAN
+  peer sending logins with a new name and a new Iroh key each time made
+  every login wait behind a scan of all of its earlier attempts
+  (P1-11).
+- `spoolframe-server` allocates with snmalloc, with its hardening checks
+  on, as mainframe's daemons do.
+- A subtitle can be read in chunks. `ReadSubtitle` takes an optional
+  `offset`: with it the server answers at most 512 KiB of the file from
+  that byte (`SUBTITLE_CHUNK`) and `total`, the file's length, and reads
+  only that chunk from the disk; an `offset` at or past the end answers
+  no bytes. Without `offset`, as an older client asks, the reply is the
+  whole file as before, and a file over the 1 MiB frame limit is refused
+  with `ReplyTooLarge { bytes }`, where `bytes` is now the file's size.
+  Before, the server read such a file whole and encoded it only to find
+  that it could not be sent, at every request (P2-11).
+- The SDK's `read_subtitle` reads the subtitle in chunks and returns the
+  whole file as before, so a subtitle over 1 MiB now arrives; an app
+  changes nothing. If the file changes on the server while it is read
+  (another length or format between two chunks, or a chunk with no
+  bytes before the end), the call fails with `SdkError::Protocol` and
+  returns no mix of two files. A server from before chunks answers the
+  whole file, which the SDK returns as it did (P2-11).
+- HLS segments store the film's own time. A run that started at a
+  position (a resume, a start offset, a far seek) stored its fMP4
+  fragments from 0 and put where it started in `init.mp4` as an empty
+  edit. AVPlayer places WebVTT cues on the stored times and does not
+  apply that edit to them, so a playback started past 0 showed no
+  subtitles, or showed them late. ffmpeg now writes each fragment's own
+  time (`-hls_segment_options movflags=+frag_discont`): a segment the
+  playlist puts at 400 s is stored at 400 s, in every run, and
+  `init.mp4` has no empty edit (P2-05).

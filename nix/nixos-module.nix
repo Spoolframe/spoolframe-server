@@ -52,6 +52,7 @@
       listen = ${quote cfg.admin.listen};
       allow_remote = ${lib.boolToString cfg.admin.allowRemote};
       ${lib.optionalString (cfg.admin.publicUrl != null) "public_url = ${quote cfg.admin.publicUrl};"}
+      ${lib.optionalString (cfg.admin.trustedProxies != []) "trusted_proxies = ${quote (lib.concatStringsSep ", " cfg.admin.trustedProxies)};"}
     }
     transcode {
       hardware = ${quote hardware};
@@ -191,6 +192,22 @@ in {
           only origin then allowed to sign in and use it. Left unset, a
           browser must be on the listener's own host (directly, or through
           an SSH tunnel).
+        '';
+      };
+
+      trustedProxies = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [];
+        example = ["10.0.0.5" "172.17.0.0/16"];
+        description = ''
+          The reverse proxies in front of {option}`admin.listen`, as
+          addresses and CIDR ranges. The limit on failed logins counts a
+          connection from one of them under the caller its
+          `X-Forwarded-For` names (the right-most address that is not a
+          trusted proxy; `Forwarded` is not read), and under no address
+          if it names none. Left empty, no header is read: every
+          connection counts under its own address, and a loopback one
+          under none.
         '';
       };
     };

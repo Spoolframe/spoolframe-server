@@ -191,9 +191,11 @@ impl Jobs {
 #[derive(Debug)]
 struct Shared {
     furthest_bytes: AtomicU64,
-    /// For HLS: the media time of the furthest segment asked for.
+    /// For HLS: the media time of the segment asked for last.
     reader_ms: AtomicU64,
-    /// For HLS: the number of the furthest segment asked for.
+    /// For HLS: the number of the segment asked for last. Not the furthest:
+    /// a reader that seeks back to a segment still on disk reads on from
+    /// there.
     reader_segment: AtomicU32,
     /// For HLS: the first segment still on disk. Those before it were
     /// never written by this run, or removed to make room.
@@ -260,8 +262,16 @@ impl EncodeJob {
     }
 
     /// A reader asked for HLS segment `n`, which ends at `ms` (media
-    /// time).
+    /// time): that is where the reader is now.
     pub fn reader_at(&self, n: u32, ms: u64) {
+        self.shared.reader_segment.store(n, Ordering::Relaxed);
+        self.shared.reader_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// A reader waits for HLS segment `n`, which ends at `ms`, to be
+    /// finished, without reading it (the init segment is ready with the
+    /// run's first): the reader is there if it was not further already.
+    pub fn reader_at_least(&self, n: u32, ms: u64) {
         self.shared.reader_segment.fetch_max(n, Ordering::Relaxed);
         self.shared.reader_ms.fetch_max(ms, Ordering::Relaxed);
     }
@@ -372,7 +382,10 @@ impl Supervisor {
                     // is left alone, whoever fills it.
                     if bytes > seen {
                         let _one_job_at_a_time = self.scratch_check.lock().await;
-                        if !self.make_room() {
+                        // A job just held back for its reader writes no
+                        // more: what it cannot free now it can once the
+                        // reader has moved on and it writes again.
+                        if !self.make_room() && !self.shared.paused.load(Ordering::Relaxed) {
                             let _ = child.start_kill();
                             let _ = child.wait().await;
                             // Of no use now, and in the way of the other
@@ -424,8 +437,8 @@ impl Supervisor {
 
     /// Whether the scratch directory is within its limit. When it is not,
     /// an HLS job first removes its own segments behind its reader, the
-    /// oldest first, until it is (P2-03). The segment before the furthest
-    /// one asked for stays: a reader may still be fetching it.
+    /// oldest first, until it is (P2-03). The segment before the one
+    /// asked for last stays: a reader may still be fetching it.
     fn make_room(&self) -> bool {
         let mut total = dir_size(&self.scratch);
         if total > self.scratch_limit && self.written == Written::Hls {
@@ -761,6 +774,21 @@ mod tests {
 
     const FULL: &str = "the server's scratch space for conversions is full";
 
+    /// Waits until `job` has looked at its output `times` more times. A
+    /// job tells its progress at every look, changed or not, and only
+    /// then looks at the scratch space: with the next look told, the one
+    /// before is over.
+    async fn looked(job: &EncodeJob, times: usize) {
+        let mut progress = job.progress();
+        progress.borrow_and_update();
+        for _ in 0..times {
+            tokio::time::timeout(Duration::from_secs(5), progress.changed())
+                .await
+                .expect("the job looks at its output")
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn the_job_that_fills_the_scratch_space_fails_and_no_other() {
         // `quiet` writes 100 bytes and waits; the other writes on and on.
@@ -781,49 +809,110 @@ mod tests {
         let (quiet, kept) = start("a", "quiet");
         let mut progress = quiet.progress();
         progress.wait_for(|p| p.bytes == 100).await.unwrap();
+        // It has seen its 100 bytes, in a space with room.
+        looked(&quiet, 1).await;
+        // Something else fills the space, and it stays full: the quiet job
+        // looks at its output twice more, so once at least with the space
+        // full and that look over.
+        let other = jobs.dir().join("c/0");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("out.mkv"), vec![0; 30_000]).unwrap();
+        looked(&quiet, 2).await;
+        assert_eq!(quiet.progress().borrow().done, None);
+        // The job that writes into the full space is the one that fails.
         let (greedy, removed) = start("b", "greedy");
         assert_eq!(done(&greedy).await.unwrap_err(), FULL);
-        // What it wrote is gone, so the space is there for the others.
+        // What it wrote is gone.
         assert!(!removed.exists());
-        // Long enough for the other job to look at the scratch space.
-        tokio::time::sleep(POLL * 3).await;
         assert_eq!(quiet.progress().borrow().done, None);
         assert!(alive(quiet.pid()));
         assert!(kept.exists());
     }
 
-    #[tokio::test]
-    async fn a_full_scratch_space_takes_the_segments_behind_the_reader_first() {
-        // Eight segments of 1000 bytes, written once `go` is there.
-        let (jobs, _dir) = jobs_within(
-            "trim",
-            "while [ ! -e \"$1/go\" ]; do sleep 0.02; done\n\
-             for n in 1 2 3 4 5 6 7 8; do head -c 1000 /dev/zero > \"$1/seg$n.m4s\"; done\n\
-             exec sleep 30",
-            5_500,
-        )
-        .await;
-        let dir = jobs.dir().join("h/0");
-        let args = vec![dir.display().to_string()];
-        let job = jobs
-            .start(dir.clone(), args, Written::Hls, 0, 1, 0, None)
-            .unwrap();
-        // The reader asked for segment 7: 6 stays too, 1 to 5 may go.
-        job.reader_at(7, 42_000);
-        std::fs::write(dir.join("go"), b"").unwrap();
+    /// Writes segments 1 to 8 of 1000 bytes into `dir`, as ffmpeg would,
+    /// and waits until `job` has made room for them and that look at the
+    /// scratch space is over (or the job has ended). The job sees the
+    /// eight files at once: its task runs on the test's thread, only while
+    /// the test waits. It has finished the look that removed a segment
+    /// when it counts a byte written after.
+    async fn eight_segments(job: &EncodeJob, dir: &Path) {
+        for n in 1..=8 {
+            std::fs::write(dir.join(format!("seg{n}.m4s")), [0; 1000]).unwrap();
+        }
+        let mut progress = job.progress();
         tokio::time::timeout(Duration::from_secs(5), async {
             while job.first_kept() == 1 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            std::fs::write(dir.join("mark"), [0]).unwrap();
+            let counted = |p: &Progress| p.bytes % 1000 == 1 || p.done.is_some();
+            progress.wait_for(counted).await.unwrap();
         })
         .await
         .expect("no segment removed");
+    }
+
+    /// Which of segments 1 to 8 are in `dir`.
+    fn segments_left(dir: &Path) -> Vec<bool> {
+        (1..=8)
+            .map(|n| dir.join(format!("seg{n}.m4s")).exists())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_full_scratch_space_takes_the_segments_behind_the_reader_first() {
+        let (jobs, _dir) = jobs_within("trim", "exec sleep 30", 5_500).await;
+        let dir = jobs.dir().join("h/0");
+        let job = jobs
+            .start(dir.clone(), Vec::new(), Written::Hls, 0, 1, 0, None)
+            .unwrap();
+        // The reader asked for segment 7: 6 stays too, 1 to 5 may go.
+        job.reader_at(7, 42_000);
+        eight_segments(&job, &dir).await;
         // 8000 bytes, 5500 allowed: the three oldest went, and no more.
         assert_eq!(job.first_kept(), 4);
-        let left: Vec<bool> = (1..=8)
-            .map(|n| dir.join(format!("seg{n}.m4s")).exists())
-            .collect();
-        assert_eq!(left, [false, false, false, true, true, true, true, true]);
+        assert_eq!(
+            segments_left(&dir),
+            [false, false, false, true, true, true, true, true]
+        );
+        assert_eq!(job.progress().borrow().done, None);
+    }
+
+    /// A player that seeks back to a segment still on disk reads there
+    /// again. The job once kept only the furthest segment ever asked for,
+    /// so it took the segments the player was now reading for ones behind
+    /// it, and removed them for room.
+    #[tokio::test]
+    async fn a_reader_that_went_back_keeps_the_segments_it_now_reads() {
+        // Says it has encoded two minutes, then waits.
+        let (jobs, _dir) =
+            jobs_within("back", "echo out_time_us=120000000; exec sleep 30", 5_500).await;
+        let dir = jobs.dir().join("h/0");
+        let job = jobs
+            .start(dir.clone(), Vec::new(), Written::Hls, 0, 1, 0, None)
+            .unwrap();
+        // The reader got to segment 7, then went back to 4.
+        job.reader_at(7, 42_000);
+        job.reader_at(4, 24_000);
+        // Far behind what is encoded: the job is held back for it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !job.paused() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("not paused");
+        eight_segments(&job, &dir).await;
+        // 8000 bytes, 5500 allowed. Segments 1 and 2 are behind the reader
+        // and went; 3 is the one before the reader's and stays, with all
+        // after it, though that leaves 6000.
+        assert_eq!(job.first_kept(), 3);
+        assert_eq!(
+            segments_left(&dir),
+            [false, false, true, true, true, true, true, true]
+        );
+        // The job is held back and writes no more: it is not failed for
+        // the space it cannot free yet.
         assert_eq!(job.progress().borrow().done, None);
     }
 

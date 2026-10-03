@@ -17,6 +17,7 @@ path = "src/main.rs"
 embed-web = ["dep:rust-embed"]
 
 [dependencies]
+snmalloc-rs.workspace = true
 rust-embed = { workspace = true, optional = true, features = ["mime-guess"] }
 async-trait = { workspace = true }
 axum = { workspace = true }

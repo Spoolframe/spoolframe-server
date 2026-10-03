@@ -12,7 +12,7 @@
 //! set of errors whichever way it comes.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
@@ -68,6 +68,115 @@ impl Origins {
     }
 }
 
+/// The reverse proxies in front of the admin listener
+/// (`admin.trusted_proxies`): addresses and CIDR ranges. Only a connection
+/// from one of them is believed about who it carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedProxies(Vec<Network>);
+
+/// An address range: `addr/prefix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Network {
+    addr: IpAddr,
+    prefix: u32,
+}
+
+impl Network {
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip.to_canonical()) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = u32::MAX.checked_shl(32 - self.prefix).unwrap_or(0);
+                (u32::from(net) ^ u32::from(ip)) & mask == 0
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = u128::MAX.checked_shl(128 - self.prefix).unwrap_or(0);
+                (u128::from(net) ^ u128::from(ip)) & mask == 0
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::str::FromStr for Network {
+    type Err = String;
+
+    /// `10.0.0.5`, `172.17.0.0/16`, `fd00::/8`.
+    fn from_str(text: &str) -> Result<Self, String> {
+        let (addr, prefix) = match text.split_once('/') {
+            Some((addr, prefix)) => (addr, Some(prefix)),
+            None => (text, None),
+        };
+        let addr: IpAddr = addr
+            .parse()
+            .map_err(|_| format!("{text:?} is not an address or a CIDR range"))?;
+        let addr = addr.to_canonical();
+        let bits = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            None => bits,
+            Some(prefix) => prefix
+                .parse()
+                .ok()
+                .filter(|p| *p <= bits)
+                .ok_or_else(|| format!("{text:?}: the prefix is not a number up to {bits}"))?,
+        };
+        Ok(Self { addr, prefix })
+    }
+}
+
+impl std::str::FromStr for TrustedProxies {
+    type Err = String;
+
+    /// A comma-separated list of addresses and CIDR ranges.
+    fn from_str(list: &str) -> Result<Self, String> {
+        list.split(',')
+            .map(|entry| entry.trim().parse())
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+}
+
+/// The header a trusted proxy names its caller in. `Forwarded` (RFC 7239)
+/// is not read.
+const FORWARDED_FOR: &str = "x-forwarded-for";
+
+impl TrustedProxies {
+    fn contains(&self, ip: IpAddr) -> bool {
+        self.0.iter().any(|network| network.contains(ip))
+    }
+
+    /// The address the caller of a request from `peer` is at, for the
+    /// failure limit. From anyone but a trusted proxy that is `peer`, and
+    /// the header is not read: anyone can send one. From a trusted proxy
+    /// it is the right-most `X-Forwarded-For` address that is not a
+    /// trusted proxy itself: each proxy appends the address it was called
+    /// from, so that is the first one a proxy of ours did not write, and
+    /// what is left of it is the caller's own claim. `None` when a trusted
+    /// proxy sent no such address: then nothing says who the caller is,
+    /// and the proxy's own address would name everyone behind it.
+    pub(crate) fn caller(&self, peer: IpAddr, headers: &HeaderMap) -> Option<IpAddr> {
+        if !self.contains(peer) {
+            return Some(peer);
+        }
+        let hops: Vec<Option<IpAddr>> = headers
+            .get_all(FORWARDED_FOR)
+            .iter()
+            .flat_map(|value| match value.to_str() {
+                Ok(list) => list.split(',').map(|hop| hop.trim().parse().ok()).collect(),
+                Err(_) => vec![None],
+            })
+            .collect();
+        for hop in hops.into_iter().rev() {
+            match hop {
+                Some(ip) if self.contains(ip) => {}
+                // An entry that is not an address is not one a proxy of
+                // ours wrote; nothing left of it can be believed.
+                other => return other,
+            }
+        }
+        None
+    }
+}
+
 /// Serve `methods`, the `/auth` endpoints and the web UI's pages on
 /// `listen`.
 pub(crate) async fn serve(
@@ -75,11 +184,12 @@ pub(crate) async fn serve(
     api: AdminApi,
     methods: Methods,
     origins: Origins,
+    proxies: TrustedProxies,
 ) -> std::io::Result<(SocketAddr, ServerHandle)> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
     let (stop, handle) = stop_channel();
-    let app = router(api, methods, stop.clone(), origins);
+    let app = router(api, methods, stop.clone(), origins, proxies);
     tokio::spawn(async move {
         let shutdown = stop.shutdown();
         // With each connection's address, which the failure limit counts.
@@ -94,7 +204,13 @@ pub(crate) async fn serve(
     Ok((addr, handle))
 }
 
-fn router(api: AdminApi, methods: Methods, stop: StopHandle, origins: Origins) -> Router {
+fn router(
+    api: AdminApi,
+    methods: Methods,
+    stop: StopHandle,
+    origins: Origins,
+    proxies: TrustedProxies,
+) -> Router {
     let rpc = tower::service_fn(move |req: Request| {
         // Built per connection: building is what gives each its own id.
         let mut service = jsonrpsee::server::ServerBuilder::default()
@@ -129,7 +245,7 @@ fn router(api: AdminApi, methods: Methods, stop: StopHandle, origins: Origins) -
                 Ok::<_, Infallible>(crate::web::page(req.uri().path()))
             }
         }))
-        .layer(middleware::from_fn(credentials))
+        .layer(middleware::from_fn_with_state(proxies, credentials))
         .layer(middleware::from_fn_with_state(origins, check_origin))
 }
 
@@ -154,13 +270,21 @@ async fn check_origin(State(origins): State<Origins>, req: Request, next: Next) 
 
 /// The request's session token where the methods find it: the Bearer
 /// header (the CLI) or else the cookie (a browser). A wrong Bearer token
-/// is not rescued by a cookie. And the address it came from.
+/// is not rescued by a cookie. And the address its caller is at.
 async fn credentials(
+    State(proxies): State<TrustedProxies>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     mut req: Request,
     next: Next,
 ) -> Response<Body> {
-    req.extensions_mut().insert(Peer(peer.ip()));
+    let caller = proxies.caller(peer.ip(), req.headers());
+    if caller.is_none() {
+        tracing::warn!(
+            proxy = %peer.ip(),
+            "a trusted proxy sent no usable X-Forwarded-For; the failure limit cannot count its callers by address"
+        );
+    }
+    req.extensions_mut().insert(Peer(caller));
     if let Some(token) = token(req.headers()) {
         req.extensions_mut().insert(Bearer(token));
     }
@@ -365,6 +489,106 @@ mod tests {
             (header::HOST, "127.0.0.1:7421"),
             (header::ORIGIN, "http://127.0.0.1:7421"),
         ])));
+    }
+
+    fn proxies(list: &str) -> TrustedProxies {
+        list.parse().unwrap()
+    }
+
+    fn forwarded(values: &[&str]) -> HeaderMap {
+        let pairs: Vec<_> = values
+            .iter()
+            .map(|v| (header::HeaderName::from_static(FORWARDED_FOR), *v))
+            .collect();
+        headers(&pairs)
+    }
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn a_trusted_proxy_s_caller_is_the_address_it_forwards_for() {
+        let proxies = proxies("10.0.0.5, 172.17.0.0/16");
+        let from = forwarded(&["203.0.113.9"]);
+        assert_eq!(
+            proxies.caller(ip("10.0.0.5"), &from),
+            Some(ip("203.0.113.9"))
+        );
+        assert_eq!(
+            proxies.caller(ip("172.17.0.1"), &from),
+            Some(ip("203.0.113.9"))
+        );
+        assert_eq!(
+            proxies.caller(ip("::ffff:10.0.0.5"), &from),
+            Some(ip("203.0.113.9"))
+        );
+    }
+
+    #[test]
+    fn a_forwarding_header_from_anyone_else_is_not_read() {
+        let from = forwarded(&["203.0.113.9"]);
+        let proxies = proxies("10.0.0.5, 172.17.0.0/16");
+        assert_eq!(proxies.caller(ip("10.0.0.6"), &from), Some(ip("10.0.0.6")));
+        assert_eq!(
+            proxies.caller(ip("172.18.0.1"), &from),
+            Some(ip("172.18.0.1"))
+        );
+        // With no proxies set, the connection's address, loopback too.
+        let none = TrustedProxies::default();
+        assert_eq!(none.caller(ip("127.0.0.1"), &from), Some(ip("127.0.0.1")));
+        assert_eq!(none.caller(ip("10.0.0.5"), &from), Some(ip("10.0.0.5")));
+    }
+
+    #[test]
+    fn the_caller_is_the_right_most_address_no_trusted_proxy_wrote() {
+        let proxies = proxies("10.0.0.0/24");
+        // The caller sent a header of its own; two of our proxies in a row.
+        let chain = forwarded(&["198.51.100.1, 203.0.113.9, 10.0.0.6"]);
+        assert_eq!(
+            proxies.caller(ip("10.0.0.5"), &chain),
+            Some(ip("203.0.113.9"))
+        );
+        // The same over two header lines.
+        let lines = forwarded(&["198.51.100.1", "203.0.113.9, 10.0.0.6"]);
+        assert_eq!(
+            proxies.caller(ip("10.0.0.5"), &lines),
+            Some(ip("203.0.113.9"))
+        );
+    }
+
+    #[test]
+    fn a_trusted_proxy_without_a_usable_header_names_no_caller() {
+        let proxies = proxies("10.0.0.0/24");
+        assert_eq!(proxies.caller(ip("10.0.0.5"), &HeaderMap::new()), None);
+        // Only our own proxies.
+        assert_eq!(
+            proxies.caller(ip("10.0.0.5"), &forwarded(&["10.0.0.6"])),
+            None
+        );
+        // Not an address where the caller's should be.
+        assert_eq!(
+            proxies.caller(ip("10.0.0.5"), &forwarded(&["203.0.113.9, unknown"])),
+            None
+        );
+    }
+
+    #[test]
+    fn trusted_proxies_are_addresses_and_ranges() {
+        let proxies = proxies("10.0.0.5,fd00::/8, 0.0.0.0/0");
+        assert!(proxies.contains(ip("10.0.0.5")));
+        assert!(proxies.contains(ip("fd12::1")));
+        assert!(proxies.contains(ip("192.0.2.1")));
+        assert!(!proxies.contains(ip("2001:db8::1")));
+        for bad in [
+            "",
+            "10.0.0.5,",
+            "proxy.example.org",
+            "10.0.0.0/33",
+            "fd00::/x",
+        ] {
+            assert!(bad.parse::<TrustedProxies>().is_err(), "{bad:?}");
+        }
     }
 
     #[test]

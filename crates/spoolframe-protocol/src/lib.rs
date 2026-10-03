@@ -22,8 +22,8 @@ pub use artwork::{ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
 pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle};
 pub use messages::{
     AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, HomeScreen, LoginPassword,
-    ManifestKind, PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, ServerInfo,
-    SessionId, SessionInfo, UserSummary,
+    ManifestKind, PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, SUBTITLE_CHUNK,
+    ServerInfo, SessionId, SessionInfo, UserSummary,
 };
 pub use playback::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,

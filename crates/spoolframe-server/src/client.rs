@@ -18,8 +18,8 @@ use spoolframe_protocol::device_sign_in::normalize as device_sign_in_code;
 use spoolframe_protocol::streams::{bi, reset, uni};
 use spoolframe_protocol::{
     ArtworkReply, ArtworkRequest, ArtworkResponse, ChosenTracks, ConvertedSubtitle, MAX_READ,
-    MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan, Selection,
-    SubtitleAction,
+    MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan, SUBTITLE_CHUNK,
+    Selection, SubtitleAction,
 };
 use spoolframe_protocol::{
     AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, LoginPassword, Reply,
@@ -695,6 +695,7 @@ impl ClientProtocol {
                 Ok(Reply::Item {
                     item: found.item,
                     children: found.children,
+                    markers: found.markers,
                 })
             }
             Request::Search { query, limit } => {
@@ -836,6 +837,9 @@ impl ClientProtocol {
                     &self.services.transcoding.encoders(),
                     self.services.subtitles.ocr(),
                 );
+                // The item's markers go with the playback (P2-10), so a
+                // player needs no second request for them.
+                let markers = catalog.item(&id).await.map_err(catalog_error)?.markers;
                 let handle = Playbacks::new_handle();
                 // This device's earlier encodes are abandoned: free their
                 // slots before this one takes one.
@@ -874,6 +878,7 @@ impl ClientProtocol {
                     size,
                     chosen,
                     epoch: 0,
+                    markers,
                 })
             }
             Request::ChangeSubtitle {
@@ -958,7 +963,7 @@ impl ClientProtocol {
                         what: "an HLS conversion in this playback".into(),
                     })
             }
-            Request::ReadSubtitle { handle } => {
+            Request::ReadSubtitle { handle, offset } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
                 let (path, format) = match playback.subtitle {
                     None => {
@@ -969,13 +974,12 @@ impl ClientProtocol {
                     Some(Sidecar::File { path, format }) => (path, format),
                     Some(Sidecar::Made { state, format }) => (read_text(state).await?, format),
                 };
-                let bytes = tokio::fs::read(&path).await.map_err(|e| {
-                    tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
-                    Error::Unavailable {
-                        message: "the subtitle file could not be read".into(),
-                    }
-                })?;
-                Ok(Reply::Subtitle { format, bytes })
+                let (bytes, total) = read_subtitle(&path, offset).await?;
+                Ok(Reply::Subtitle {
+                    format,
+                    bytes,
+                    total,
+                })
             }
             Request::ReadSubtitleSegment { handle, n } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
@@ -1001,6 +1005,7 @@ impl ClientProtocol {
                 Ok(Reply::Subtitle {
                     format: SubtitleFormat::WebVtt,
                     bytes: hls::subtitle_segment(&vtt, start_ms, end_ms).into_bytes(),
+                    total: None,
                 })
             }
             Request::LookupDeviceSignIn { code } => {
@@ -1570,11 +1575,13 @@ async fn segment_range(
     let wanted = if n == 0 { job.first_segment } else { n };
     // The reader is at the end of the segment it waits for, as far as the
     // throttle is concerned, or the encode pauses just short of finishing
-    // it.
-    job.reader_at(
-        wanted,
-        segments.start(wanted + 1).unwrap_or(segments.total_ms),
-    );
+    // it. A read of the init segment does not move a reader back.
+    let end = segments.start(wanted + 1).unwrap_or(segments.total_ms);
+    if n == 0 {
+        job.reader_at_least(wanted, end);
+    } else {
+        job.reader_at(wanted, end);
+    }
     let now = wait_for(&job, keep_alive, |p| {
         p.last_segment.is_some_and(|l| l >= wanted) || p.done.is_some()
     })
@@ -1586,7 +1593,7 @@ async fn segment_range(
     }
     // Not a segment removed meanwhile to make room: asked for again, the
     // encode restarts there.
-    let complete = (now.last_segment.is_some_and(|l| l >= wanted) || now.done.is_some())
+    let finished = (now.last_segment.is_some_and(|l| l >= wanted) || now.done.is_some())
         && (n == 0 || n >= job.first_kept());
     let name = if n == 0 {
         "init.mp4".to_owned()
@@ -1594,24 +1601,53 @@ async fn segment_range(
         format!("seg{n}.m4s")
     };
     let file = job.dir().join(name);
-    let size = if complete {
-        std::fs::metadata(&file).map_or(0, |m| m.len())
-    } else {
-        0
-    };
-    let sent = read
-        .length
-        .min(MAX_READ)
-        .min(size.saturating_sub(read.offset));
     let unreadable = |e: std::io::Error| {
         tracing::warn!(path = %file.display(), error = %e, "cannot read a segment");
         Error::PlaybackFailed {
             reason: "a segment of the conversion could not be read".into(),
         }
     };
-    let handle = open_at(&file, read.offset, sent)
-        .await
-        .map_err(unreadable)?;
+    // Opened first and measured through the handle: a segment can be
+    // removed after the check above (for room, or with all the job's
+    // files when the job fails), and an open file stays readable.
+    let opened = if finished {
+        match tokio::fs::File::open(&file).await {
+            Ok(handle) => {
+                let size = handle.metadata().await.map_err(unreadable)?.len();
+                Some((handle, size))
+            }
+            // Gone since the check: not ready, as a removed segment is,
+            // unless the job has failed by now.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(Err(reason)) = &job.progress().borrow().done {
+                    return Err(Error::PlaybackFailed {
+                        reason: reason.clone(),
+                    });
+                }
+                None
+            }
+            Err(e) => return Err(unreadable(e)),
+        }
+    } else {
+        None
+    };
+    let complete = opened.is_some();
+    let size = opened.as_ref().map_or(0, |(_, size)| *size);
+    let sent = read
+        .length
+        .min(MAX_READ)
+        .min(size.saturating_sub(read.offset));
+    let handle = match opened {
+        Some((mut handle, _)) if sent > 0 => {
+            handle
+                .seek(std::io::SeekFrom::Start(read.offset))
+                .await
+                .map_err(unreadable)?;
+            handle
+        }
+        // Nothing to send: an empty stand-in.
+        _ => open_at(&file, read.offset, 0).await.map_err(unreadable)?,
+    };
     Ok((
         handle,
         MediaReadReply {
@@ -1621,6 +1657,46 @@ async fn segment_range(
             epoch: job.epoch,
         },
     ))
+}
+
+/// A subtitle file's bytes for one reply, which is one frame (P2-11).
+///
+/// With an `offset`: at most [`SUBTITLE_CHUNK`] bytes from it, and the
+/// file's length. At or past the end that is no bytes, so a client's loop
+/// ends. Only the chunk is read, however large the file.
+///
+/// Without one (an older client): the whole file and no length. A file
+/// that cannot fit a frame is refused by its size alone, not read first.
+async fn read_subtitle(path: &Path, offset: Option<u64>) -> Result<(Vec<u8>, Option<u64>), Error> {
+    let unreadable = |e: std::io::Error| {
+        tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
+        Error::Unavailable {
+            message: "the subtitle file could not be read".into(),
+        }
+    };
+    let mut file = tokio::fs::File::open(path).await.map_err(unreadable)?;
+    let total = file.metadata().await.map_err(unreadable)?.len();
+    let mut bytes = Vec::new();
+    let Some(offset) = offset else {
+        let limit = u64::from(codec::MAX_FRAME);
+        if total > limit {
+            tracing::warn!(total, "a subtitle read whole is over the frame limit");
+            return Err(Error::ReplyTooLarge { bytes: total });
+        }
+        // One byte over the limit at most: a file that grew since is still
+        // refused when the frame is written, never cut.
+        let mut whole = file.take(limit + 1);
+        whole.read_to_end(&mut bytes).await.map_err(unreadable)?;
+        return Ok((bytes, None));
+    };
+    if offset < total {
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(unreadable)?;
+        let mut chunk = file.take(SUBTITLE_CHUNK);
+        chunk.read_to_end(&mut bytes).await.map_err(unreadable)?;
+    }
+    Ok((bytes, Some(total)))
 }
 
 /// The text a reading made: waits for it a while, then tells the client to

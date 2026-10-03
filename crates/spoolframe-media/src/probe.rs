@@ -157,7 +157,8 @@ impl Prober {
 
     /// One ffprobe run. The process is killed if it outlives the timeout.
     /// The times of the main video stream's keyframes, in milliseconds,
-    /// ascending: where a copied video can be cut (P2-05's HLS segments).
+    /// ascending, one before time 0 as 0: where a copied video can be cut
+    /// (P2-05's HLS segments).
     /// Read once per file from the packets' flags, without decoding, and
     /// remembered until the file changes.
     pub async fn keyframes(&self, path: &Path) -> Result<Keyframes, ProbeError> {
@@ -259,7 +260,10 @@ impl Prober {
 }
 
 /// `pts_time,flags` lines (`12.345000,K__`) → the keyframes' times in ms,
-/// ascending.
+/// ascending. A keyframe before time 0 counts as at 0: it is still the
+/// file's first keyframe (an MP4 cut with stream copy starts at the
+/// keyframe before the cut), and a list without it would start at the
+/// second.
 fn keyframe_times(csv: &str) -> Vec<u64> {
     let mut times: Vec<u64> = csv
         .lines()
@@ -269,7 +273,7 @@ fn keyframe_times(csv: &str) -> Vec<u64> {
                 return None;
             }
             let seconds: f64 = time.parse().ok()?;
-            (seconds >= 0.0).then(|| (seconds * 1000.0).round() as u64)
+            Some((seconds.max(0.0) * 1000.0).round() as u64)
         })
         .collect();
     times.sort_unstable();
@@ -306,5 +310,13 @@ mod tests {
     fn only_keyframes_count_in_order() {
         let csv = "2.000000,K__\n0.040000,___\n0.000000,K__\nN/A,K__\n4.000000,K_D\n";
         assert_eq!(keyframe_times(csv), [0, 2000, 4000]);
+    }
+
+    /// An MP4 cut with stream copy starts at the keyframe before the cut,
+    /// a little before its time 0. It is the file's first keyframe.
+    #[test]
+    fn a_keyframe_before_zero_is_the_first_at_zero() {
+        let csv = "-0.040000,KD_\n0.000000,___\n1.960000,K__\n3.960000,K__\n";
+        assert_eq!(keyframe_times(csv), [0, 1960, 3960]);
     }
 }

@@ -213,7 +213,10 @@ pub fn multivariant_playlist(
 /// The cues of WebVTT `vtt` that show during `start_ms..end_ms`, as one
 /// WebVTT segment. A cue across a cut is in both segments; players show it
 /// once. `X-TIMESTAMP-MAP` ties WebVTT time 0 to media time 0: the video
-/// keeps the film's own timestamps (P2-05), and so do the cues.
+/// segments store the film's own timestamps (P2-05, `frag_discont` in
+/// `args`), in every run, and so do the cues. A run from 0 stores them a
+/// few frames late (ffmpeg moves it forward until no decode time is
+/// negative); a run from a seek stores them as they are.
 pub fn subtitle_segment(vtt: &str, start_ms: u64, end_ms: u64) -> String {
     let mut out = String::from("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n");
     for cue in vtt_cues(vtt) {

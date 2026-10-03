@@ -1,0 +1,86 @@
+{
+    "MediaContainer": {
+        "size": 1,
+        "librarySectionID": 1,
+        "librarySectionTitle": "TV Shows",
+        "Metadata": [
+            {
+                "ratingKey": "208620",
+                "key": "/library/metadata/208620",
+                "parentRatingKey": "208619",
+                "grandparentRatingKey": "208618",
+                "guid": "plex://episode/5d9c10307b5c2e001e6ac51a",
+                "type": "episode",
+                "title": "Splinter",
+                "librarySectionID": 1,
+                "summary": "27 years after a virus wipes out most of humanity, scientists send a man back...",
+                "index": 1,
+                "parentIndex": 1,
+                "viewCount": 2,
+                "year": 2015,
+                "thumb": "/library/metadata/208620/thumb/1720258080",
+                "art": "/library/metadata/208618/art/1789149282",
+                "duration": 2852688,
+                "addedAt": 1720224129,
+                "Media": [
+                    {
+                        "id": 511562,
+                        "container": "mkv",
+                        "Part": [
+                            {
+                                "id": 731914,
+                                "file": "/data/TVShows/12 Monkeys/Season 1/12.Monkeys.S01E01.Splinter.Bluray-1080p.Remux.mkv"
+                            }
+                        ]
+                    }
+                ],
+                "Guid": [
+                    {
+                        "id": "imdb://tt4135892"
+                    },
+                    {
+                        "id": "tmdb://991306"
+                    },
+                    {
+                        "id": "tvdb://4961780"
+                    }
+                ],
+                "grandparentTitle": "12 Monkeys",
+                "parentTitle": "Season 1",
+                "parentThumb": "/library/metadata/208619/thumb/1720224131",
+                "grandparentThumb": "/library/metadata/208618/thumb/1789149282",
+                "Marker": [
+                    {
+                        "final": true,
+                        "id": 105025,
+                        "type": "credits",
+                        "startTimeOffset": 2815419,
+                        "endTimeOffset": 2852689,
+                        "Attributes": {
+                            "id": 105025,
+                            "version": 4
+                        }
+                    },
+                    {
+                        "id": 105026,
+                        "type": "commercial",
+                        "startTimeOffset": 900000,
+                        "endTimeOffset": 960000,
+                        "Attributes": {
+                            "id": 105026
+                        }
+                    },
+                    {
+                        "id": 105024,
+                        "type": "intro",
+                        "startTimeOffset": 258865,
+                        "endTimeOffset": 319865,
+                        "Attributes": {
+                            "id": 105024
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+}

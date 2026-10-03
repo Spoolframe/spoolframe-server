@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use spoolframe_media::MediaDescriptor;
 use spoolframe_media::encoders::Encoders;
+use spoolframe_media::{MediaDescriptor, codecs};
 use spoolframe_protocol::{
     ConvertedAudio, ConvertedSubtitle, ConvertedVideo, ManifestKind, PlaybackPlan, SubtitleAction,
 };
-use spoolframe_types::Delivery;
+use spoolframe_types::{Delivery, SubtitleFormat};
 
 use self::args::{EncodeSpec, Output, ffmpeg_args};
 use self::hls::Segments;
@@ -116,6 +116,20 @@ impl Conversion {
         std::os::unix::fs::symlink(source.path, &input).map_err(prepare)?;
         let sidecar = match subtitle.and_then(|s| source.descriptor.subtitles.get(s.index as usize))
         {
+            Some(spoolframe_media::SubtitleStream {
+                source: spoolframe_media::SubtitleSource::External { path },
+                codec,
+                ..
+            }) if codecs::subtitle_format(codec) == SubtitleFormat::VobSub => {
+                // VobSub is two files: the `.idx`, and the `.sub` with the
+                // pictures, which ffmpeg finds by the `.idx`'s name. Both
+                // are linked, under names that match.
+                let link = dir.join("sidecar.idx");
+                std::os::unix::fs::symlink(path, &link).map_err(prepare)?;
+                std::os::unix::fs::symlink(path.with_extension("sub"), dir.join("sidecar.sub"))
+                    .map_err(prepare)?;
+                Some(link)
+            }
             Some(spoolframe_media::SubtitleStream {
                 source: spoolframe_media::SubtitleSource::External { path },
                 ..

@@ -9,7 +9,7 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 use spoolframe_admin_api::{AdminApiClient, MeApiClient, NewUser, Role, error_code};
 
-use crate::admin::{CODE, anonymous, server};
+use crate::admin::{CODE, anonymous, server, server_behind_a_proxy};
 
 const PASSWORD: &str = "correct horse";
 
@@ -260,5 +260,38 @@ async fn without_a_cookie_there_is_no_one() {
     assert_eq!(
         call_code(cli.who_am_i().await.unwrap_err()),
         error_code::UNAUTHENTICATED
+    );
+}
+
+/// A login as the proxy passes it on from the caller at `from`.
+async fn login_from(addr: SocketAddr, from: &str, username: &str, password: &str) -> StatusCode {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/auth/login"))
+        .header("x-forwarded-for", from)
+        .json(&json!({ "username": username, "password": password }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Behind a trusted proxy every connection comes from the proxy's address.
+/// The failure limit counts the caller the proxy names: one caller's
+/// failures do not lock out the others behind it.
+#[tokio::test]
+async fn behind_a_trusted_proxy_the_failure_limit_counts_each_caller() {
+    let (addr, _dir) = server_behind_a_proxy("web-proxy-source").await;
+    set_up(addr).await;
+    for n in 0..5 {
+        let status = login_from(addr, "203.0.113.1", &format!("guess{n}"), "wrong").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        login_from(addr, "203.0.113.1", "root", PASSWORD).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        login_from(addr, "203.0.113.2", "root", PASSWORD).await,
+        StatusCode::OK
     );
 }

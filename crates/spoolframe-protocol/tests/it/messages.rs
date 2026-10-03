@@ -23,8 +23,8 @@ use spoolframe_types::{
     AudioCodec, ClientCapabilities, Container, SubtitleFormat, TrackPreferences, VideoCodec,
 };
 use spoolframe_types::{
-    Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, MediaTracks, Movie, Namespace,
-    PlaybackState,
+    Item, Library, LibraryId, LibraryKind, Marker, MarkerKind, MediaId, MediaKind, MediaTracks,
+    Movie, Namespace, PlaybackState,
 };
 
 fn round_trip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: T) {
@@ -42,6 +42,23 @@ fn movie() -> Item {
         artwork: Vec::new(),
         playback: PlaybackState::default(),
     })
+}
+
+fn markers() -> Vec<Marker> {
+    vec![
+        Marker {
+            kind: MarkerKind::Intro,
+            start_ms: 258_865,
+            end_ms: 319_865,
+            to_end: false,
+        },
+        Marker {
+            kind: MarkerKind::Credits,
+            start_ms: 2_662_962,
+            end_ms: 2_709_958,
+            to_end: true,
+        },
+    ]
 }
 
 fn hello() -> Hello {
@@ -177,6 +194,11 @@ fn every_request_round_trips() {
         Request::Home,
         Request::ReadSubtitle {
             handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            offset: None,
+        },
+        Request::ReadSubtitle {
+            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            offset: Some(spoolframe_protocol::SUBTITLE_CHUNK),
         },
         Request::PlaybackPlan {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
@@ -236,6 +258,7 @@ fn every_reply_round_trips() {
         Reply::Item {
             item: movie(),
             children: Vec::new(),
+            markers: markers(),
         },
         Reply::Search {
             items: vec![movie()],
@@ -288,11 +311,18 @@ fn every_reply_round_trips() {
                 audio: TrackReason::Preferences,
                 subtitle: TrackReason::Override,
             }),
+            markers: markers(),
         },
         Reply::TrackPreferences(TrackPreferences::default()),
         Reply::Subtitle {
             format: SubtitleFormat::Srt,
             bytes: b"1\n00:00:01,000 --> 00:00:02,000\nHi\n".to_vec(),
+            total: None,
+        },
+        Reply::Subtitle {
+            format: SubtitleFormat::Srt,
+            bytes: b"1\n00:00:01,000 --> 00:00:02,000\nHi\n".to_vec(),
+            total: Some(1_600_000),
         },
         Reply::PlaybackPlan {
             plan: PlaybackPlan::Direct {
@@ -525,6 +555,7 @@ fn subtitle_bytes_are_a_cbor_byte_string() {
     let reply = Reply::Subtitle {
         format: SubtitleFormat::Srt,
         bytes: vec![0xAB; 100],
+        total: None,
     };
     // A byte string is about as long as its bytes; an array of integers
     // would take about two bytes each.
@@ -726,4 +757,249 @@ fn an_older_client_s_selection_is_still_explicit() {
 fn a_bitmap_mode_from_a_newer_client_is_unknown() {
     let mode: BitmapSubtitles = codec::decode(&codec::encode(&"draw_in_3d").unwrap()).unwrap();
     assert_eq!(mode, BitmapSubtitles::Unknown);
+}
+
+/// The item and started-playback replies as they were before P2-10, with
+/// no `markers`: what an older server sends and an older client reads.
+mod before_markers {
+    use serde::{Deserialize, Serialize};
+    use spoolframe_protocol::{PlaybackHandle, PlaybackPlan};
+    use spoolframe_types::Item;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum Reply {
+        Item {
+            item: Item,
+            children: Vec<Item>,
+        },
+        PlaybackStarted {
+            handle: PlaybackHandle,
+            plan: PlaybackPlan,
+            size: u64,
+            epoch: u32,
+        },
+    }
+}
+
+fn playback_started(markers: Vec<Marker>) -> Reply {
+    Reply::PlaybackStarted {
+        handle: spoolframe_protocol::PlaybackHandle("h".into()),
+        plan: PlaybackPlan::Unsupported { reasons: vec![] },
+        size: 12_345,
+        chosen: None,
+        epoch: 0,
+        markers,
+    }
+}
+
+#[test]
+fn an_older_server_s_item_has_no_markers() {
+    let bytes = codec::encode(&before_markers::Reply::Item {
+        item: movie(),
+        children: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(
+        codec::decode::<Reply>(&bytes).unwrap(),
+        Reply::Item {
+            item: movie(),
+            children: Vec::new(),
+            markers: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn an_older_server_s_started_playback_has_no_markers() {
+    let bytes = codec::encode(&before_markers::Reply::PlaybackStarted {
+        handle: spoolframe_protocol::PlaybackHandle("h".into()),
+        plan: PlaybackPlan::Unsupported { reasons: vec![] },
+        size: 12_345,
+        epoch: 0,
+    })
+    .unwrap();
+    assert_eq!(
+        codec::decode::<Reply>(&bytes).unwrap(),
+        playback_started(Vec::new())
+    );
+}
+
+#[test]
+fn an_older_client_reads_an_item_that_has_markers() {
+    let bytes = codec::encode(&Reply::Item {
+        item: movie(),
+        children: Vec::new(),
+        markers: markers(),
+    })
+    .unwrap();
+    let before_markers::Reply::Item { item, children } = codec::decode(&bytes).unwrap() else {
+        panic!("not an item")
+    };
+    assert_eq!((item, children), (movie(), Vec::new()));
+}
+
+#[test]
+fn an_older_client_reads_a_started_playback_that_has_markers() {
+    let bytes = codec::encode(&playback_started(markers())).unwrap();
+    let before_markers::Reply::PlaybackStarted { handle, size, .. } =
+        codec::decode(&bytes).unwrap()
+    else {
+        panic!("not a started playback")
+    };
+    assert_eq!((handle.0.as_str(), size), ("h", 12_345));
+}
+
+/// `ReadSubtitle` and its reply as they were before P2-11, with no `offset`
+/// and no `total`: what an older client and an older server send and read.
+mod before_chunks {
+    use serde::{Deserialize, Serialize};
+    use spoolframe_protocol::PlaybackHandle;
+    use spoolframe_types::SubtitleFormat;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum Request {
+        ReadSubtitle { handle: PlaybackHandle },
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct Envelope {
+        pub session: Option<String>,
+        pub request: Request,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum Reply {
+        Subtitle {
+            format: SubtitleFormat,
+            #[serde(with = "serde_bytes")]
+            bytes: Vec<u8>,
+        },
+    }
+}
+
+fn read_subtitle(offset: Option<u64>) -> Request {
+    Request::ReadSubtitle {
+        handle: spoolframe_protocol::PlaybackHandle("h".into()),
+        offset,
+    }
+}
+
+/// An older client asks for the whole file: no `offset`.
+#[test]
+fn an_older_client_s_subtitle_read_has_no_offset() {
+    let bytes = codec::encode(&before_chunks::Envelope {
+        session: None,
+        request: before_chunks::Request::ReadSubtitle {
+            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+        },
+    })
+    .unwrap();
+    let decoded: RequestEnvelope = codec::decode(&bytes).unwrap();
+    assert_eq!(decoded.request, read_subtitle(None));
+}
+
+/// An older server reads a request with an `offset` as one for the whole
+/// file.
+#[test]
+fn an_older_server_reads_a_subtitle_read_that_has_an_offset() {
+    let bytes = codec::encode(&RequestEnvelope {
+        session: None,
+        request: read_subtitle(Some(524_288)),
+    })
+    .unwrap();
+    let decoded: before_chunks::Envelope = codec::decode(&bytes).unwrap();
+    let before_chunks::Request::ReadSubtitle { handle } = decoded.request;
+    assert_eq!(handle.0, "h");
+}
+
+/// An older server answers with the whole file and no `total`.
+#[test]
+fn an_older_server_s_subtitle_has_no_total() {
+    let bytes = codec::encode(&before_chunks::Reply::Subtitle {
+        format: SubtitleFormat::Srt,
+        bytes: b"whole".to_vec(),
+    })
+    .unwrap();
+    assert_eq!(
+        codec::decode::<Reply>(&bytes).unwrap(),
+        Reply::Subtitle {
+            format: SubtitleFormat::Srt,
+            bytes: b"whole".to_vec(),
+            total: None,
+        }
+    );
+}
+
+#[test]
+fn an_older_client_reads_a_subtitle_that_has_a_total() {
+    let bytes = codec::encode(&Reply::Subtitle {
+        format: SubtitleFormat::Srt,
+        bytes: b"whole".to_vec(),
+        total: Some(5),
+    })
+    .unwrap();
+    let before_chunks::Reply::Subtitle { format, bytes } = codec::decode(&bytes).unwrap();
+    assert_eq!((format, bytes), (SubtitleFormat::Srt, b"whole".to_vec()));
+}
+
+/// A reply is one frame: a whole chunk has to fit one, with its framing.
+#[test]
+fn a_whole_subtitle_chunk_fits_a_frame() {
+    let reply = Response::Ok(Reply::Subtitle {
+        format: SubtitleFormat::WebVtt,
+        bytes: vec![0xAB; spoolframe_protocol::SUBTITLE_CHUNK as usize],
+        total: Some(u64::MAX),
+    });
+    assert!(codec::encode(&reply).unwrap().len() < MAX_FRAME as usize);
+}
+
+/// A marker kind from a newer server does not cost the client the item or
+/// its other markers.
+#[test]
+fn a_marker_kind_from_a_newer_server_is_unknown() {
+    #[derive(Serialize)]
+    struct NewerMarker {
+        kind: &'static str,
+        start_ms: u64,
+        end_ms: u64,
+        to_end: bool,
+    }
+    #[derive(Serialize)]
+    struct NewerItem {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        item: Item,
+        children: Vec<Item>,
+        markers: Vec<NewerMarker>,
+    }
+    let bytes = codec::encode(&NewerItem {
+        kind: "item",
+        item: movie(),
+        children: Vec::new(),
+        markers: vec![
+            NewerMarker {
+                kind: "recap",
+                start_ms: 0,
+                end_ms: 45_000,
+                to_end: false,
+            },
+            NewerMarker {
+                kind: "intro",
+                start_ms: 45_000,
+                end_ms: 105_000,
+                to_end: false,
+            },
+        ],
+    })
+    .unwrap();
+    let Reply::Item { markers, .. } = codec::decode(&bytes).unwrap() else {
+        panic!("not an item")
+    };
+    assert_eq!(
+        markers.iter().map(|m| m.kind).collect::<Vec<_>>(),
+        [MarkerKind::Unknown, MarkerKind::Intro]
+    );
 }

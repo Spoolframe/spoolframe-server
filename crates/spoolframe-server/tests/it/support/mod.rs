@@ -5,8 +5,9 @@
 // Each test file uses part of this module.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -37,8 +38,8 @@ use spoolframe_server::subtitles::{OcrSettings, Subtitles};
 use spoolframe_server::transcode::Transcoding;
 use spoolframe_server::watch::{Watch, WatchRules};
 use spoolframe_types::{
-    ArtworkId, ClientCapabilities, Episode, Item, Library, LibraryId, LibraryKind, MediaId,
-    MediaKind, Movie, Namespace, PlaybackState, Season, Show,
+    ArtworkId, ClientCapabilities, Episode, Item, Library, LibraryId, LibraryKind, Marker,
+    MarkerKind, MediaId, MediaKind, Movie, Namespace, PlaybackState, Season, Show,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -64,6 +65,71 @@ pub fn poster() -> ArtworkId {
 pub struct FakeCatalog {
     /// The movie's file, once a test writes it.
     media: PathBuf,
+    /// What the catalog answers for keys items had before it was rebuilt.
+    old_keys: Mutex<HashMap<MediaId, OldKey>>,
+    /// Each `item` and `external_ids` call: the method and the id.
+    calls: Mutex<Vec<(&'static str, MediaId)>>,
+}
+
+/// What a key holds after the catalog gave its item a new one. A key the
+/// fake knows nothing of is not found.
+#[derive(Debug, Clone)]
+pub enum OldKey {
+    /// Another item of the same kind, with these external ids.
+    AnotherItem(Vec<String>),
+    /// An item of another kind: `PlexCatalog` cannot read it as `item`,
+    /// and has no `external_ids` for it.
+    AnotherKind,
+    /// The key is another catalog's.
+    Foreign,
+    /// The catalog cannot be asked.
+    Unreachable,
+}
+
+impl FakeCatalog {
+    pub fn set_old_key(&self, id: &MediaId, holds: OldKey) {
+        self.old_keys.lock().unwrap().insert(id.clone(), holds);
+    }
+
+    pub fn forget_old_key(&self, id: &MediaId) {
+        self.old_keys.lock().unwrap().remove(id);
+    }
+
+    /// The `item` and `external_ids` calls since the last time, by method.
+    pub fn take_calls(&self, id: &MediaId) -> Vec<&'static str> {
+        let mut calls = self.calls.lock().unwrap();
+        let about = calls.iter().filter(|(_, i)| i == id).map(|(m, _)| *m);
+        let about = about.collect();
+        calls.clear();
+        about
+    }
+
+    fn called(&self, method: &'static str, id: &MediaId) {
+        self.calls.lock().unwrap().push((method, id.clone()));
+    }
+
+    fn old_key(&self, id: &MediaId) -> Option<OldKey> {
+        self.old_keys.lock().unwrap().get(id).cloned()
+    }
+
+    fn unreachable() -> CatalogError {
+        CatalogError::Unreachable {
+            url: "http://fake".into(),
+            call: "GET /library/metadata".into(),
+            source: "connection refused".into(),
+        }
+    }
+}
+
+/// The external ids of an item of the fake's tree.
+fn external_ids(item: &Item) -> Vec<String> {
+    let first = movie();
+    let of = if item.id() == second_copy().id() {
+        &first
+    } else {
+        item
+    };
+    vec![format!("test://{}", of.id().key())]
 }
 
 pub fn movie() -> Item {
@@ -136,6 +202,26 @@ pub fn episode(key: &str, season_key: &str, season: u32, episode: u32) -> Item {
     })
 }
 
+/// The markers of episode 15, the only item that has any: an intro, and
+/// credits that run to the end, starting after the point P1-14's rule
+/// calls the episode watched at (39:00 of its 44:00).
+pub fn markers() -> Vec<Marker> {
+    vec![
+        Marker {
+            kind: MarkerKind::Intro,
+            start_ms: 30_000,
+            end_ms: 90_000,
+            to_end: false,
+        },
+        Marker {
+            kind: MarkerKind::Credits,
+            start_ms: 2_400_000,
+            end_ms: 2_640_001,
+            to_end: true,
+        },
+    ]
+}
+
 /// Every item the fake catalog has, with its children.
 fn tree() -> Vec<(Item, Vec<Item>)> {
     vec![
@@ -185,21 +271,67 @@ impl Catalog for FakeCatalog {
     }
 
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
+        self.called("item", id);
+        match self.old_key(id) {
+            Some(OldKey::AnotherItem(external_ids)) => {
+                let Item::Movie(movie) = movie() else {
+                    unreachable!()
+                };
+                return Ok(ItemWithChildren {
+                    item: Item::Movie(Movie {
+                        id: id.clone(),
+                        title: "Aliens".into(),
+                        ..movie
+                    }),
+                    children: Vec::new(),
+                    external_ids,
+                    markers: Vec::new(),
+                });
+            }
+            Some(OldKey::AnotherKind) => {
+                return Err(CatalogError::Backend {
+                    url: "http://fake".into(),
+                    call: "GET /library/metadata".into(),
+                    item: Some(id.to_string()),
+                    message: format!("the PMS returned another kind, not {id}"),
+                });
+            }
+            Some(OldKey::Foreign) => return Err(CatalogError::ForeignId(id.to_string())),
+            Some(OldKey::Unreachable) => return Err(Self::unreachable()),
+            None => {}
+        }
         tree()
             .into_iter()
             .find(|(item, _)| item.id() == id)
             .map(|(item, children)| {
-                let key = if item.id() == second_copy().id() {
-                    movie().id().key().to_owned()
+                let markers = if id.key() == "15" {
+                    markers()
                 } else {
-                    item.id().key().to_owned()
+                    Vec::new()
                 };
                 ItemWithChildren {
-                    external_ids: vec![format!("test://{key}")],
+                    external_ids: external_ids(&item),
                     item,
                     children,
+                    markers,
                 }
             })
+            .ok_or_else(|| CatalogError::NotFound(id.to_string()))
+    }
+
+    async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
+        self.called("external_ids", id);
+        match self.old_key(id) {
+            Some(OldKey::AnotherItem(external_ids)) => return Ok(external_ids),
+            Some(OldKey::AnotherKind) => return Err(CatalogError::NotFound(id.to_string())),
+            Some(OldKey::Foreign) => return Err(CatalogError::ForeignId(id.to_string())),
+            Some(OldKey::Unreachable) => return Err(Self::unreachable()),
+            None => {}
+        }
+        tree()
+            .iter()
+            .find(|(item, _)| item.id() == id)
+            .map(|(item, _)| external_ids(item))
             .ok_or_else(|| CatalogError::NotFound(id.to_string()))
     }
 
@@ -334,6 +466,8 @@ pub struct ServerOptions {
     /// Read bitmap subtitles as text with real tesseract (P2-07). Off: the
     /// server cannot.
     pub ocr: bool,
+    /// The tesseract that reads them: the real one, or a stand-in script.
+    pub tesseract: PathBuf,
     /// How long failed logins and PINs count; tests of many failures
     /// shorten it.
     pub failure_window: Duration,
@@ -355,6 +489,7 @@ impl Default for ServerOptions {
             read_ahead: Duration::from_secs(5),
             ffmpeg: PathBuf::from("ffmpeg"),
             ocr: false,
+            tesseract: PathBuf::from("tesseract"),
             failure_window: spoolframe_server::auth::FAILURE_WINDOW,
             sign_in_lifetime: spoolframe_server::device_sign_in::LIFETIME,
             disconnect_grace: spoolframe_server::playback::DISCONNECT_GRACE,
@@ -409,6 +544,7 @@ fn test_module() -> String {
 pub struct TestServer {
     pub server: Server,
     pub store: Store,
+    pub catalog: Arc<FakeCatalog>,
     pub media: PathBuf,
     pub dir: StateDir,
 }
@@ -429,9 +565,12 @@ impl TestServer {
         let key = identity::load_or_create(&dir).unwrap();
         let store = Store::open(&dir).await.unwrap();
         let media = dir.join("media").join("movie.mkv");
-        let catalog: Arc<dyn Catalog> = Arc::new(FakeCatalog {
+        let fake = Arc::new(FakeCatalog {
             media: media.clone(),
+            old_keys: Mutex::default(),
+            calls: Mutex::default(),
         });
+        let catalog: Arc<dyn Catalog> = fake.clone();
         let artwork =
             ArtworkCache::open(&dir.join("cache/artwork"), 64 << 20, catalog.clone()).unwrap();
         let ffprobe = if options.real_media {
@@ -451,7 +590,7 @@ impl TestServer {
         )
         .unwrap();
         let ocr = if options.ocr {
-            Ocr::detect(Path::new("tesseract")).await
+            Ocr::detect(&options.tesseract).await
         } else {
             Ocr::disabled()
         };
@@ -497,6 +636,7 @@ impl TestServer {
         Self {
             server,
             store,
+            catalog: fake,
             dir,
             media,
         }
@@ -539,6 +679,25 @@ impl TestServer {
     /// 0.5 s, 2.5 s and so on, none at 0.
     pub fn generate_media_with_late_video(&self, secs: u32, video: &str, audio: &str) {
         self.generate(secs, video, audio, "0.5");
+    }
+
+    /// As [`TestServer::generate_media`], then cut with stream copy 40 ms
+    /// after its second keyframe, into MP4: the file starts at that
+    /// keyframe, at -0.04 s, and the next are at 1.96 s, 3.96 s and so on.
+    pub fn generate_media_cut_after_a_keyframe(&self, secs: u32, video: &str, audio: &str) {
+        self.generate(secs + 2, video, audio, "0");
+        let whole = self.media.with_extension("whole.mkv");
+        std::fs::rename(&self.media, &whole).unwrap();
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-ss", "2.04", "-i"])
+            .arg(&whole)
+            .args(["-c", "copy", "-f", "mp4"])
+            .arg(&self.media)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not cut the test media");
+        std::fs::remove_file(&whole).unwrap();
     }
 
     fn generate(&self, secs: u32, video: &str, audio: &str, video_offset: &str) {
@@ -584,6 +743,65 @@ impl TestServer {
     /// English `.sup` file next to the movie.
     pub fn write_pgs_sidecar(&self, cues: &[(&str, u64, u64)]) {
         std::fs::write(self.media.with_extension("en.sup"), Self::pgs(cues)).unwrap();
+    }
+
+    /// Write a VobSub subtitle showing each `(text, start_ms, end_ms)` as
+    /// [`TestServer::add_pgs`] shows it, as English `.idx` and `.sub`
+    /// files next to the movie. ffmpeg has no VobSub muxer: it encodes
+    /// the pictures into an MPEG program stream, which is what a `.sub`
+    /// is, and the `.idx` (the palette, and where each cue is in the
+    /// `.sub`) is written here.
+    ///
+    /// Give it two cues or more. ffmpeg 9.0 can wait for ever when it lays
+    /// a picture subtitle file with a single packet over the video: the
+    /// file's end reaches the filters before they are set up, and is lost.
+    pub fn write_vobsub_sidecar(&self, cues: &[(&str, u64, u64)]) {
+        // ffmpeg's own default, said here so the `.idx` can repeat it.
+        const PALETTE: [&str; 16] = [
+            "000000", "0000ff", "00ff00", "ff0000", "ffff00", "ff00ff", "00ffff", "ffffff",
+            "808000", "8080ff", "800080", "80ff80", "008080", "ff8080", "555555", "aaaaaa",
+        ];
+        /// An MPEG program stream pack. A cue this small is one pack.
+        const PACK: usize = 2048;
+        let sup = self.dir.join("vobsub.sup");
+        std::fs::write(&sup, Self::pgs(cues)).unwrap();
+        let sub = self.media.with_extension("en.sub");
+        // `-fix_sub_duration`: a PGS cue ends with a packet of its own,
+        // a VobSub one carries its length.
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-copyts", "-fix_sub_duration", "-i"])
+            .arg(&sup)
+            .args(["-c:s", "dvdsub", "-palette", &PALETTE.join(",")])
+            .args(["-f", "vob"])
+            .arg(&sub)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not write the VobSub file");
+        assert_eq!(
+            std::fs::metadata(&sub).unwrap().len() as usize,
+            cues.len() * PACK,
+            "one pack per cue"
+        );
+        let mut idx = format!(
+            "# VobSub index file, v7 (do not modify this line!)\n\
+             size: 1920x1080\n\
+             palette: {}\n\
+             langidx: 0\n\
+             id: en, index: 0\n",
+            PALETTE.join(", ")
+        );
+        for (i, &(_, start_ms, _)) in cues.iter().enumerate() {
+            idx.push_str(&format!(
+                "timestamp: {:02}:{:02}:{:02}:{:03}, filepos: {:09x}\n",
+                start_ms / 3_600_000,
+                start_ms / 60_000 % 60,
+                start_ms / 1000 % 60,
+                start_ms % 1000,
+                i * PACK
+            ));
+        }
+        std::fs::write(self.media.with_extension("en.idx"), idx).unwrap();
     }
 
     /// A PGS (`.sup`) stream showing each `(text, start_ms, end_ms)`.

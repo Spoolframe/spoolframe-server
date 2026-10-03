@@ -11,7 +11,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId};
+use spoolframe_types::{ArtworkId, Item, Library, LibraryId, Marker, MediaId};
 
 /// Which slice of a library to list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,9 @@ pub struct ItemWithChildren {
     /// watch state is re-linked through them when an item's `MediaId`
     /// changes (a Plex rebuild, or the move to a native catalog).
     pub external_ids: Vec<String>,
+    /// The item's intro and credits (P2-10), in order of their start.
+    /// Empty when the catalog knows of none; never `MarkerKind::Unknown`.
+    pub markers: Vec<Marker>,
 }
 
 /// Why a catalog call failed. A catalog never answers a failure with an
@@ -119,6 +122,13 @@ pub trait Catalog: Send + Sync {
 
     /// One item, with its direct children.
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError>;
+
+    /// The stable identities of the item now under `id`, as
+    /// [`ItemWithChildren::external_ids`], without its children or
+    /// markers: the cheapest way to ask what a key holds. `NotFound` when
+    /// the catalog has no item of that kind under that key, also when the
+    /// key now names an item of another kind.
+    async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError>;
 
     /// Items whose titles match `query`, at most `limit` of them.
     async fn search(&self, query: &str, limit: u32) -> Result<Vec<Item>, CatalogError>;

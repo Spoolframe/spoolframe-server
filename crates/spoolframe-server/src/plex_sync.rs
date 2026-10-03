@@ -545,6 +545,8 @@ mod tests {
         assert_eq!(*runs.lock().unwrap(), [0, 60, 120, 180, 240, 300]);
     }
 
+    /// The minute is counted from the last run, not from the change, and
+    /// the change still gets its 5 seconds to settle.
     #[tokio::test(start_paused = true)]
     async fn a_change_a_while_after_the_last_run_is_synced_within_seconds() {
         let (changed, runs) = scheduled();
@@ -554,10 +556,14 @@ mod tests {
         assert_eq!(*runs.lock().unwrap(), [0, 75]);
     }
 
+    /// The interval's run is due at 120 s. A change 3 s before it does not
+    /// put it off to settle, and the intervals go on from that run.
     #[tokio::test(start_paused = true)]
-    async fn without_changes_the_sync_runs_every_interval() {
-        let (_changed, runs) = scheduled();
-        tokio::time::sleep(Duration::from_secs(250)).await;
+    async fn a_change_just_before_the_interval_s_run_does_not_put_it_off() {
+        let (changed, runs) = scheduled();
+        tokio::time::sleep(Duration::from_secs(117)).await;
+        changed.send_replace(Some(ME));
+        tokio::time::sleep(Duration::from_secs(133)).await;
         assert_eq!(*runs.lock().unwrap(), [0, 120, 240]);
     }
 

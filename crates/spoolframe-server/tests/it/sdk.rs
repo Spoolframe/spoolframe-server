@@ -7,13 +7,13 @@ use crate::support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use spoolframe_client_sdk::types::{ClientCapabilities, Item, PlaybackState};
+use spoolframe_client_sdk::types::{ClientCapabilities, Item, PlaybackState, VideoCodec};
 use spoolframe_client_sdk::{
     ArtworkSize, BitmapSubtitles, Client, ConnectionState, Device, MAX_READ, ManifestKind,
     MemoryStorage, PlaybackHandle, PlaybackOptions, PlaybackPlan, SdkError, Selection, Session,
     Storage,
 };
-use support::{TestServer, episode, library, mkv_capabilities, movie, poster, show};
+use support::{TestServer, episode, library, markers, mkv_capabilities, movie, poster, show};
 
 fn device(capabilities: ClientCapabilities) -> Device {
     Device {
@@ -26,7 +26,16 @@ fn device(capabilities: ClientCapabilities) -> Device {
 
 /// A client on `storage` that knows where `server` is.
 async fn client_on(server: &TestServer, storage: &Arc<MemoryStorage>) -> Client {
-    let client = Client::open(storage.clone(), device(mkv_capabilities()))
+    client_with(server, storage, mkv_capabilities()).await
+}
+
+/// [`client_on`], for a device that can play `capabilities`.
+async fn client_with(
+    server: &TestServer,
+    storage: &Arc<MemoryStorage>,
+    capabilities: ClientCapabilities,
+) -> Client {
+    let client = Client::open(storage.clone(), device(capabilities))
         .await
         .unwrap();
     let addrs = server.server.addr().ip_addrs().copied().collect();
@@ -204,6 +213,42 @@ async fn a_movie_plays_through_range_reads() {
             .unwrap()
             .is_empty()
     );
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_episode_s_markers_come_with_its_details_and_its_playback() {
+    let (server, first, _) = ready("markers").await;
+    first.close().await;
+    server.write_episode("15");
+    // A device that plays the episode's file (h264) as it is.
+    let mut capabilities = mkv_capabilities();
+    capabilities.video.insert(VideoCodec::H264);
+    let client = client_with(&server, &Arc::default(), capabilities).await;
+    let alice = alice(&server, &client).await;
+    let with_markers = episode("15", "14", 2, 1);
+    assert_eq!(
+        alice.item(with_markers.id()).await.unwrap().markers,
+        markers()
+    );
+    let playback = alice.start_playback(with_markers.id(), None).await.unwrap();
+    assert_eq!(playback.markers, markers());
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_item_without_markers_has_none_and_plays() {
+    let (server, client, _) = ready("no-markers").await;
+    server.write_media(1 << 10);
+    let alice = alice(&server, &client).await;
+    assert!(alice.item(movie().id()).await.unwrap().markers.is_empty());
+    let playback = alice
+        .start_playback(movie().id(), Some(Selection::default()))
+        .await
+        .unwrap();
+    assert!(playback.markers.is_empty());
     client.close().await;
     server.stop().await;
 }
@@ -480,6 +525,36 @@ async fn an_hls_playback_gives_its_playlist_and_segments() {
         }
         assert!(got > 0, "segment {n} is empty");
     }
+    client.close().await;
+    server.stop().await;
+}
+
+/// A subtitle too large for one frame (P2-11): the SDK reads it in chunks
+/// and gives the caller the file.
+#[tokio::test]
+async fn a_subtitle_over_a_frame_arrives_whole() {
+    let (server, client, _) = ready("sdk-large-subtitle").await;
+    let alice = alice(&server, &client).await;
+    server.write_media(1000);
+    // No two chunks alike: 251 does not divide the chunk size. Three
+    // chunks, the last a short one.
+    let sidecar: Vec<u8> = (0..(1usize << 20) + 4321)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(server.media.with_extension("en.srt"), &sidecar).unwrap();
+    let tracks = alice.tracks(movie().id()).await.unwrap();
+    let external = tracks.subtitles.iter().position(|s| s.external).unwrap() as u32;
+    let selection = Selection {
+        audio: None,
+        subtitle: Some(external),
+    };
+    let playback = alice
+        .start_playback(movie().id(), Some(selection))
+        .await
+        .unwrap();
+
+    let subtitle = alice.read_subtitle(&playback.handle).await.unwrap();
+    assert!(subtitle.bytes == sidecar, "{} bytes", subtitle.bytes.len());
     client.close().await;
     server.stop().await;
 }

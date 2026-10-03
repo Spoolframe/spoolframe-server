@@ -171,13 +171,36 @@ fn pin_keys(user: LocalUserId, source: &str) -> (String, String) {
     (format!("pin:{}", user.0), format!("pin@{source}"))
 }
 
+/// How often every key is looked at for failures out of the window. In
+/// between, only the keys asked about are.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The most keys held. A key costs a name of up to 64 characters and a
+/// few timestamps, so this is a few tens of megabytes at worst.
+const MAX_KEYS: usize = 100_000;
+
 /// Failed logins, per username and per source, within a sliding window.
 /// A caller whose source says nothing about who it is (a loopback peer of
 /// the admin API) gives none, and only the username counts.
+///
+/// What an attempt costs does not grow with the attempts of others: the
+/// keys it names are judged exactly, all the others are swept once per
+/// [`SWEEP_INTERVAL`], and at most [`MAX_KEYS`] are held. While it is
+/// full, an attempt under a key it does not hold is refused as limited:
+/// there is no room to count it, and an attempt that cannot be counted
+/// must not be let through.
 #[derive(Debug)]
 pub struct RateLimiter {
-    failures: Mutex<HashMap<String, VecDeque<Instant>>>,
+    failures: Mutex<Failures>,
     window: Duration,
+    max_keys: usize,
+}
+
+#[derive(Debug, Default)]
+struct Failures {
+    by_key: HashMap<String, VecDeque<Instant>>,
+    /// When every key was last looked at.
+    swept: Option<Instant>,
 }
 
 impl Default for RateLimiter {
@@ -193,13 +216,14 @@ impl RateLimiter {
         Self {
             failures: Mutex::default(),
             window,
+            max_keys: MAX_KEYS,
         }
     }
 
     /// How many keys are held.
     #[cfg(test)]
     fn held(&self) -> usize {
-        self.failures.lock().unwrap().len()
+        self.failures.lock().unwrap().by_key.len()
     }
 
     fn user_key(username: &str) -> String {
@@ -216,49 +240,90 @@ impl RateLimiter {
             .flatten()
     }
 
-    /// `Some(wait)` if either key has used up its failures.
+    /// `Some(wait)` if either key has used up its failures, or the limiter
+    /// is full and does not hold one of them.
     pub fn check(&self, username: &str, source: Option<&str>, now: Instant) -> Option<Duration> {
         let mut failures = self.failures.lock().expect("never held across a panic");
         self.limited(&mut failures, username, source, now)
     }
 
-    /// Drop every failure older than the window, and every key left with
-    /// none: under all keys, not only the ones asked about, or a name
-    /// tried once and never again would be kept for the life of the
-    /// process.
-    fn expire(&self, failures: &mut HashMap<String, VecDeque<Instant>>, now: Instant) {
-        failures.retain(|_, times| {
-            while times
-                .front()
-                .is_some_and(|t| now.duration_since(*t) >= self.window)
-            {
+    fn expired(&self, at: Instant, now: Instant) -> bool {
+        now.duration_since(at) >= self.window
+    }
+
+    /// Once per [`SWEEP_INTERVAL`], drop every failure older than the
+    /// window, and every key left with none: under all keys, not only the
+    /// ones asked about, or a name tried once and never again would be
+    /// kept for the life of the process.
+    fn sweep(&self, failures: &mut Failures, now: Instant) {
+        if failures
+            .swept
+            .is_some_and(|at| now.duration_since(at) < SWEEP_INTERVAL)
+        {
+            return;
+        }
+        failures.swept = Some(now);
+        failures.by_key.retain(|_, times| {
+            while times.front().is_some_and(|t| self.expired(*t, now)) {
                 times.pop_front();
             }
             !times.is_empty()
         });
     }
 
+    /// Drop `key`'s failures older than the window, and `key` with them if
+    /// none is left: what is asked about is judged as of now, whenever the
+    /// last sweep was.
+    fn prune(&self, failures: &mut Failures, key: &str, now: Instant) {
+        let Some(times) = failures.by_key.get_mut(key) else {
+            return;
+        };
+        while times.front().is_some_and(|t| self.expired(*t, now)) {
+            times.pop_front();
+        }
+        if times.is_empty() {
+            failures.by_key.remove(key);
+        }
+    }
+
     fn limited(
         &self,
-        failures: &mut HashMap<String, VecDeque<Instant>>,
+        failures: &mut Failures,
         username: &str,
         source: Option<&str>,
         now: Instant,
     ) -> Option<Duration> {
-        self.expire(failures, now);
-        Self::keys(username, source)
-            .filter_map(|key| {
-                let times = failures.get(&key)?;
-                (times.len() >= MAX_FAILURES).then(|| self.window - now.duration_since(times[0]))
-            })
-            .max()
+        self.sweep(failures, now);
+        let mut wait = None;
+        let mut new = 0;
+        for key in Self::keys(username, source) {
+            self.prune(failures, &key, now);
+            match failures.by_key.get(&key) {
+                Some(times) if times.len() >= MAX_FAILURES => {
+                    wait = wait.max(Some(self.window - now.duration_since(times[0])));
+                }
+                Some(_) => {}
+                None => new += 1,
+            }
+        }
+        if wait.is_none() && failures.by_key.len() + new > self.max_keys {
+            // Room comes with a sweep.
+            return Some(SWEEP_INTERVAL);
+        }
+        wait
     }
 
+    /// Count a failure. While the limiter is full, not under a key it does
+    /// not hold: [`RateLimiter::check`] refuses such an attempt before it
+    /// is made.
     pub fn record_failure(&self, username: &str, source: Option<&str>, now: Instant) {
         let mut failures = self.failures.lock().expect("never held across a panic");
-        self.expire(&mut failures, now);
+        self.sweep(&mut failures, now);
         for key in Self::keys(username, source) {
-            failures.entry(key).or_default().push_back(now);
+            self.prune(&mut failures, &key, now);
+            if failures.by_key.contains_key(&key) || failures.by_key.len() < self.max_keys {
+                failures.by_key.entry(key).or_default().push_back(now);
+            }
         }
     }
 
@@ -278,7 +343,7 @@ impl RateLimiter {
             return Err(wait);
         }
         for key in Self::keys(username, source) {
-            failures.entry(key).or_default().push_back(now);
+            failures.by_key.entry(key).or_default().push_back(now);
         }
         Ok(())
     }
@@ -289,16 +354,16 @@ impl RateLimiter {
     /// the same place.
     pub fn record_success(&self, username: &str, source: Option<&str>, began: Instant) {
         let mut failures = self.failures.lock().expect("never held across a panic");
-        failures.remove(&Self::user_key(username));
+        failures.by_key.remove(&Self::user_key(username));
         let Some(source) = source.map(Self::source_key) else {
             return;
         };
-        if let Some(times) = failures.get_mut(&source)
+        if let Some(times) = failures.by_key.get_mut(&source)
             && let Some(at) = times.iter().position(|t| *t == began)
         {
             times.remove(at);
             if times.is_empty() {
-                failures.remove(&source);
+                failures.by_key.remove(&source);
             }
         }
     }
@@ -781,6 +846,53 @@ mod tests {
         // Nobody asks about those names again; the next failure drops them.
         limiter.record_failure("dave", Some("d"), t0 + FAILURE_WINDOW);
         assert_eq!(limiter.held(), 2);
+    }
+
+    /// Every call used to walk every key. Between two sweeps a key nobody
+    /// asks about is left alone, and still never counts once it is asked
+    /// about.
+    #[test]
+    fn between_sweeps_only_the_keys_asked_about_are_looked_at() {
+        let limiter = RateLimiter::default();
+        let t0 = Instant::now();
+        for _ in 0..MAX_FAILURES {
+            limiter.record_failure("alice", Some("a"), t0);
+        }
+        // The last sweep before alice's failures are out of the window.
+        let swept = t0 + FAILURE_WINDOW - Duration::from_secs(10);
+        limiter.record_failure("bob", Some("b"), swept);
+        let later = swept + Duration::from_secs(20);
+        limiter.record_failure("carol", Some("c"), later);
+        assert_eq!(limiter.held(), 6);
+        assert!(limiter.check("alice", Some("a"), later).is_none());
+        assert_eq!(limiter.held(), 4);
+    }
+
+    /// A limiter with room for `max_keys`.
+    fn limiter_of(max_keys: usize) -> RateLimiter {
+        RateLimiter {
+            max_keys,
+            ..RateLimiter::default()
+        }
+    }
+
+    #[test]
+    fn a_full_limiter_refuses_what_it_cannot_count_and_judges_what_it_holds() {
+        let limiter = limiter_of(4);
+        let t0 = Instant::now();
+        limiter.record_failure("alice", Some("a"), t0);
+        limiter.record_failure("bob", Some("b"), t0);
+        // No room for carol's name or her source.
+        assert_eq!(limiter.check("carol", Some("c"), t0), Some(SWEEP_INTERVAL));
+        assert!(limiter.begin("carol", Some("a"), t0).is_err());
+        limiter.record_failure("carol", Some("c"), t0);
+        assert_eq!(limiter.held(), 4);
+        // The names and sources it holds are judged as ever.
+        assert!(limiter.check("alice", Some("b"), t0).is_none());
+        limiter.begin("alice", Some("a"), t0).unwrap();
+        // With the old failures gone there is room again.
+        let later = t0 + FAILURE_WINDOW;
+        assert!(limiter.check("carol", Some("c"), later).is_none());
     }
 
     #[test]

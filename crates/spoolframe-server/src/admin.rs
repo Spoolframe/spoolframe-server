@@ -23,7 +23,7 @@ use spoolframe_catalog::Catalog;
 use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
 
-pub use crate::admin_http::Origins;
+pub use crate::admin_http::{Origins, TrustedProxies};
 use crate::auth::{Auth, LoginError, PasswordError, hash_password, hash_pin, valid_pin};
 use crate::plex_sync::{PlexSync, SyncError};
 use crate::store::pins::{DeviceRecord, PinError};
@@ -31,17 +31,20 @@ use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionRecord};
 use crate::store::users::{UserError, UserRecord, normalize_username};
 use crate::transcode::Transcoding;
 
-/// The address the caller's connection comes from (`crate::admin_http`).
+/// The address the caller is at: its connection's, or behind a trusted
+/// proxy the one the proxy forwards for, `None` if the proxy named none
+/// ([`TrustedProxies::caller`]).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Peer(pub(crate) IpAddr);
+pub(crate) struct Peer(pub(crate) Option<IpAddr>);
 
 impl Peer {
     /// What the failure limit counts for this caller besides the username:
     /// its address. A loopback address is shared by everyone who comes
     /// through this machine (the CLI, an SSH tunnel, a proxy), so it names
     /// no one: counting it would let any of them lock all the others out.
+    /// So does a trusted proxy that did not say whom it carries.
     fn source(self) -> Option<String> {
-        let ip = self.0.to_canonical();
+        let ip = self.0?.to_canonical();
         (!ip.is_loopback()).then(|| ip.to_string())
     }
 }
@@ -189,11 +192,13 @@ pub struct Admin {
     pub plex: Option<Arc<PlexCatalog>>,
 }
 
-/// Start the admin API on `listen`. Browsers are let in from `origins`.
+/// Start the admin API on `listen`. Browsers are let in from `origins`;
+/// `proxies` are believed about whom they carry.
 pub async fn serve(
     listen: SocketAddr,
     admin: Admin,
     origins: Origins,
+    proxies: TrustedProxies,
 ) -> std::io::Result<(SocketAddr, ServerHandle)> {
     let api = AdminApi {
         auth: admin.auth,
@@ -206,7 +211,7 @@ pub async fn serve(
     methods
         .merge(MeApiServer::into_rpc(api.clone()))
         .expect("the me and admin namespaces never share a name");
-    crate::admin_http::serve(listen, api, methods.into(), origins).await
+    crate::admin_http::serve(listen, api, methods.into(), origins, proxies).await
 }
 
 #[derive(Clone)]
@@ -830,13 +835,14 @@ mod tests {
 
     #[test]
     fn a_loopback_peer_is_no_source_and_any_other_is_its_address() {
-        let source = |ip: &str| Peer(ip.parse().unwrap()).source();
+        let source = |ip: &str| Peer(Some(ip.parse().unwrap())).source();
         assert_eq!(source("127.0.0.1"), None);
         assert_eq!(source("::1"), None);
         assert_eq!(source("::ffff:127.0.0.1"), None);
         assert_eq!(source("192.0.2.7").as_deref(), Some("192.0.2.7"));
         assert_eq!(source("::ffff:192.0.2.7").as_deref(), Some("192.0.2.7"));
         assert_eq!(source("2001:db8::7").as_deref(), Some("2001:db8::7"));
+        assert_eq!(Peer(None).source(), None);
     }
 
     #[test]

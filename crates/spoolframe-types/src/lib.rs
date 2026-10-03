@@ -24,8 +24,8 @@ pub use codec::{
 pub use id::{ArtworkId, IdError, LibraryId, MediaId, MediaKind, Namespace};
 pub use media::{AudioRole, AudioTrack, MediaTracks, SubtitleRole, SubtitleTrack};
 pub use model::{
-    Album, Artist, Artwork, ArtworkKind, Episode, Item, Library, LibraryKind, Movie, PlaybackState,
-    Season, Show, Track,
+    Album, Artist, Artwork, ArtworkKind, Episode, Item, Library, LibraryKind, Marker, MarkerKind,
+    Movie, PlaybackState, Season, Show, Track,
 };
 pub use preferences::{
     AudioPreferences, SdhPreference, SubtitleMode, SubtitlePreferences, TrackPreferences,

@@ -212,10 +212,14 @@ impl PlexCatalog {
     }
 
     /// The single item at `/library/metadata/{key}`, checked to be the
-    /// kind the ID says, both as Plex sent it and converted.
-    async fn metadata(&self, id: &MediaId) -> Result<Fetched, CatalogError> {
+    /// kind the ID says, both as Plex sent it and converted. Plex leaves
+    /// the item's markers out unless `with_markers` asks for them.
+    async fn metadata(&self, id: &MediaId, with_markers: bool) -> Result<Fetched, CatalogError> {
         let key = plex_key(id.namespace(), id.key(), id)?;
-        let call = Call::get(format!("/library/metadata/{key}")).about(id);
+        let mut call = Call::get(format!("/library/metadata/{key}")).about(id);
+        if with_markers {
+            call.query = vec![("includeMarkers", "1")];
+        }
         let mut container = self.fetch(&call).await?;
         if container.metadata.is_empty() {
             return Err(CatalogError::NotFound(id.to_string()));
@@ -309,6 +313,11 @@ fn has_children(kind: MediaKind) -> bool {
     )
 }
 
+/// The kinds Plex finds intros and credits in.
+fn has_markers(kind: MediaKind) -> bool {
+    matches!(kind, MediaKind::Movie | MediaKind::Episode)
+}
+
 #[async_trait]
 impl Catalog for PlexCatalog {
     async fn libraries(&self) -> Result<Vec<Library>, CatalogError> {
@@ -343,7 +352,7 @@ impl Catalog for PlexCatalog {
             call,
             metadata,
             ..
-        } = self.metadata(id).await?;
+        } = self.metadata(id, has_markers(id.kind())).await?;
         let children = if has_children(id.kind()) {
             let children = Call::get(format!("{}/children", call.path)).about(id);
             // Only `Metadata` entries are children; a show's "All episodes"
@@ -357,7 +366,22 @@ impl Catalog for PlexCatalog {
             item,
             children,
             external_ids: convert::external_ids(&metadata),
+            markers: convert::markers(&metadata),
         })
+    }
+
+    async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
+        let key = plex_key(id.namespace(), id.key(), id)?;
+        let call = Call::get(format!("/library/metadata/{key}")).about(id);
+        let container = self.fetch(&call).await?;
+        // Plex's keys are one sequence for all kinds: a key it gave to an
+        // item of another kind since is not this item.
+        match container.metadata.first() {
+            Some(m) if convert::media_kind(&m.kind) == Some(id.kind()) => {
+                Ok(convert::external_ids(m))
+            }
+            _ => Err(CatalogError::NotFound(id.to_string())),
+        }
     }
 
     async fn recently_added(&self, limit: u32) -> Result<Vec<Item>, CatalogError> {
@@ -425,7 +449,7 @@ impl Catalog for PlexCatalog {
         ) {
             return Err(CatalogError::NotPlayable(id.clone()));
         }
-        let fetched = self.metadata(id).await?;
+        let fetched = self.metadata(id, false).await?;
         let files = convert::media_files(&fetched.metadata);
         if files.is_empty() {
             return Err(self.backend(&fetched.call, None, "the PMS lists no media file".into()));

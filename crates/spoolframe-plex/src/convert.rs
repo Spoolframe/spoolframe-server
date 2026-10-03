@@ -7,10 +7,12 @@ use std::time::Duration;
 
 use spoolframe_types::{
     Album, Artist, Artwork, ArtworkId, ArtworkKind, Episode, Item, Library, LibraryId, LibraryKind,
-    MediaId, MediaKind, Movie, Namespace, PlaybackState, Season, Show, Track,
+    Marker, MarkerKind, MediaId, MediaKind, Movie, Namespace, PlaybackState, Season, Show, Track,
 };
 
-use crate::wire::{Directory, Hub, Metadata};
+use serde::Deserialize;
+
+use crate::wire::{self, Directory, Hub, Metadata};
 
 /// Why a PMS item could not be converted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +60,7 @@ pub fn is_modelled(kind: &str) -> bool {
 }
 
 /// Plex's name for a media kind, as in the `type` field.
-fn media_kind(plex: &str) -> Option<MediaKind> {
+pub fn media_kind(plex: &str) -> Option<MediaKind> {
     Some(match plex {
         "movie" => MediaKind::Movie,
         "show" => MediaKind::Show,
@@ -177,6 +179,53 @@ pub fn external_ids(m: &Metadata) -> Vec<String> {
         .filter(|id| !id.starts_with("local://"))
         .cloned()
         .collect()
+}
+
+/// The item's intros and credits, in order of start. Plex's other marker
+/// types (`commercial`) are left out, and so is a marker that cannot be
+/// read or that does not end after it starts: the item is whole without
+/// it.
+pub fn markers(m: &Metadata) -> Vec<Marker> {
+    let mut markers: Vec<_> = m
+        .markers
+        .iter()
+        .filter_map(|marker| {
+            let marker = match wire::Marker::deserialize(marker) {
+                Ok(marker) => marker,
+                Err(e) => {
+                    tracing::debug!(
+                        rating_key = %m.rating_key,
+                        error = %e,
+                        "skipping a Plex marker that cannot be read"
+                    );
+                    return None;
+                }
+            };
+            let kind = match marker.kind.as_str() {
+                "intro" => MarkerKind::Intro,
+                "credits" => MarkerKind::Credits,
+                _ => return None,
+            };
+            if marker.end_time_offset <= marker.start_time_offset {
+                tracing::debug!(
+                    rating_key = %m.rating_key,
+                    kind = %marker.kind,
+                    start_ms = marker.start_time_offset,
+                    end_ms = marker.end_time_offset,
+                    "skipping a Plex marker that does not end after it starts"
+                );
+                return None;
+            }
+            Some(Marker {
+                kind,
+                start_ms: marker.start_time_offset,
+                end_ms: marker.end_time_offset,
+                to_end: marker.is_final,
+            })
+        })
+        .collect();
+    markers.sort_by_key(|marker| marker.start_ms);
+    markers
 }
 
 /// The media files Plex reports for the item: every part of its first

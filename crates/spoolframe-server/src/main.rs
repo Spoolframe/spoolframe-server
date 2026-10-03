@@ -27,6 +27,9 @@ use tracing_subscriber::EnvFilter;
 
 mod admin_cli;
 
+#[global_allocator]
+static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
 use admin_cli::UserCommand;
 
 /// How many items per library the startup check samples.
@@ -260,6 +263,7 @@ async fn run(config: &ServerConfig) -> Result<()> {
     let plex_sync = plex_sync(config, &plex, auth.store(), &watch).await?;
     let admin_listen = config.admin.listen()?;
     let admin_origins = config.admin.origins()?;
+    let admin_proxies = config.admin.trusted_proxies()?;
     // Only a server with no users offers setup, and only to someone who
     // can read this log.
     let setup_code = if auth.store().user_count().await? == 0 {
@@ -281,6 +285,7 @@ async fn run(config: &ServerConfig) -> Result<()> {
             plex: Some(plex.clone()),
         },
         admin_origins,
+        admin_proxies,
     )
     .await
     .with_context(|| format!("cannot start the admin API on {admin_listen}"))?;

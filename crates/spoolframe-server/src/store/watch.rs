@@ -170,7 +170,7 @@ impl Store {
 
     /// The key an item with one of `external_ids` is hidden under, when
     /// `media_id` itself is not hidden. That key is the item's earlier one
-    /// only if it has left the catalog, which the caller checks before
+    /// only if the item has left it, which the caller checks before
     /// [`Store::move_hidden`].
     pub async fn hidden_under_another_key(
         &self,
@@ -206,7 +206,8 @@ impl Store {
             .await?)
     }
 
-    /// Move the hide of `from` to `to` (the item got a new key).
+    /// Move the hide of `from` to `to` (the item got a new key), unless
+    /// `to` is hidden by now.
     pub async fn move_hidden(
         &self,
         principal: Principal,
@@ -215,7 +216,8 @@ impl Store {
     ) -> Result<(), StoreError> {
         // The ids follow through ON UPDATE CASCADE.
         sqlx::query(
-            "UPDATE continue_hidden SET media_id = ?3 WHERE principal = ?1 AND media_id = ?2",
+            "UPDATE continue_hidden SET media_id = ?3 WHERE principal = ?1 AND media_id = ?2 \
+             AND NOT EXISTS (SELECT 1 FROM continue_hidden WHERE principal = ?1 AND media_id = ?3)",
         )
         .bind(principal.to_string())
         .bind(from)
@@ -227,7 +229,7 @@ impl Store {
 
     /// The key an item with one of `external_ids` has state under, when
     /// `media_id` itself has none. That key is the item's earlier one only
-    /// if it has left the catalog, which the caller checks before
+    /// if the item has left it, which the caller checks before
     /// [`Store::move_watch`]: the same film in two libraries is two items
     /// with the same external ids.
     pub async fn watch_under_another_key(
@@ -263,7 +265,10 @@ impl Store {
             .await?)
     }
 
-    /// Move the state under `from` to `to` (the item got a new key).
+    /// Move the state under `from` to `to` (the item got a new key). The
+    /// caller looked for `from` and asked the catalog about it before
+    /// this, and `to` may have a state by now (the Plex sync wrote one):
+    /// then nothing moves, in the one statement that checks.
     pub async fn move_watch(
         &self,
         principal: Principal,
@@ -272,13 +277,19 @@ impl Store {
     ) -> Result<(), StoreError> {
         let principal = principal.to_string();
         // The ids follow through ON UPDATE CASCADE.
-        sqlx::query("UPDATE watch_state SET media_id = ?3 WHERE principal = ?1 AND media_id = ?2")
-            .bind(&principal)
-            .bind(from)
-            .bind(to)
-            .execute(&self.pool)
-            .await?;
-        tracing::info!(%principal, %from, %to, "watch state re-linked");
+        let moved = sqlx::query(
+            "UPDATE watch_state SET media_id = ?3 WHERE principal = ?1 AND media_id = ?2 \
+             AND NOT EXISTS (SELECT 1 FROM watch_state WHERE principal = ?1 AND media_id = ?3)",
+        )
+        .bind(&principal)
+        .bind(from)
+        .bind(to)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if moved > 0 {
+            tracing::info!(%principal, %from, %to, "watch state re-linked");
+        }
         Ok(())
     }
 
@@ -549,6 +560,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again, None);
+    }
+
+    /// Between the search for an earlier key and the move, something else
+    /// (the Plex sync) wrote a state for the new key.
+    #[tokio::test]
+    async fn a_state_is_not_moved_onto_a_key_that_has_one() {
+        let store = store("relink-taken").await;
+        let ids = vec!["imdb://tt0078748".to_owned()];
+        store
+            .save_watch(ALICE, at("plex:movie:1", 120_000, &ids))
+            .await
+            .unwrap();
+        store
+            .save_watch(ALICE, at("plex:movie:99", 900_000, &[]))
+            .await
+            .unwrap();
+        store
+            .move_watch(ALICE, "plex:movie:1", "plex:movie:99")
+            .await
+            .unwrap();
+        let found = store
+            .watch_states(
+                ALICE,
+                &["plex:movie:99".to_owned(), "plex:movie:1".to_owned()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(found["plex:movie:1"].position_ms, Some(120_000));
+        assert_eq!(found["plex:movie:99"].position_ms, Some(900_000));
+    }
+
+    #[tokio::test]
+    async fn a_hide_is_not_moved_onto_a_key_that_has_one() {
+        let store = store("hidden-relink-taken").await;
+        store
+            .hide_continue(ALICE, "plex:movie:1", &[])
+            .await
+            .unwrap();
+        store
+            .hide_continue(ALICE, "plex:movie:99", &[])
+            .await
+            .unwrap();
+        store
+            .move_hidden(ALICE, "plex:movie:1", "plex:movie:99")
+            .await
+            .unwrap();
+        assert_eq!(store.hidden(ALICE).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

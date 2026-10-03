@@ -87,8 +87,8 @@ pub struct ServerConfig {
     pub subtitles: SubtitlesConfig,
 }
 
-/// `watch { started_after_secs = 60; watched_percent = 90;
-/// watched_remaining_secs = 300; }`, all optional.
+/// `watch { started_after_secs = 60; watched_percent = 95; }`, both
+/// optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct WatchConfig {
@@ -96,29 +96,27 @@ pub struct WatchConfig {
     pub started_after_secs: Option<u64>,
     #[ucl(default)]
     pub watched_percent: Option<u64>,
-    #[ucl(default)]
-    pub watched_remaining_secs: Option<u64>,
 }
 
 impl WatchConfig {
     /// The rules, defaults filled in.
     pub fn rules(&self) -> Result<WatchRules, ConfigError> {
         let defaults = WatchRules::default();
-        let percent = self.watched_percent.unwrap_or(90);
-        if !(1..=100).contains(&percent) {
-            return Err(ConfigError::Invalid {
-                key: "watch.watched_percent",
-                message: format!("{percent} is not between 1 and 100"),
-            });
-        }
+        let watched_fraction = match self.watched_percent {
+            None => defaults.watched_fraction,
+            Some(percent) if (1..=100).contains(&percent) => percent as f64 / 100.0,
+            Some(percent) => {
+                return Err(ConfigError::Invalid {
+                    key: "watch.watched_percent",
+                    message: format!("{percent} is not between 1 and 100"),
+                });
+            }
+        };
         Ok(WatchRules {
             started_after: self
                 .started_after_secs
                 .map_or(defaults.started_after, Duration::from_secs),
-            watched_fraction: percent as f64 / 100.0,
-            watched_remaining: self
-                .watched_remaining_secs
-                .map_or(defaults.watched_remaining, Duration::from_secs),
+            watched_fraction,
             ..defaults
         })
     }
@@ -298,7 +296,8 @@ impl ArtworkConfig {
 }
 
 /// `admin { listen = "127.0.0.1:7421"; allow_remote = false;
-/// public_url = "https://media.example.org"; }`, all optional.
+/// public_url = "https://media.example.org";
+/// trusted_proxies = "10.0.0.5, 172.17.0.0/16"; }`, all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct AdminConfig {
@@ -315,6 +314,15 @@ pub struct AdminConfig {
     /// or through an SSH tunnel.
     #[ucl(default)]
     pub public_url: Option<String>,
+    /// The reverse proxies in front of the listener, as addresses and CIDR
+    /// ranges, comma-separated. A connection from one of them is counted
+    /// by the failure limit under the caller its `X-Forwarded-For` names
+    /// (the right-most address that is not a trusted proxy; `Forwarded` is
+    /// not read), and under no address if it names none. Left out, no
+    /// header is read: every connection counts under its own address, and
+    /// a loopback one under none.
+    #[ucl(default)]
+    pub trusted_proxies: Option<String>,
 }
 
 impl AdminConfig {
@@ -337,6 +345,17 @@ impl AdminConfig {
         Ok(crate::admin::Origins::Exactly(
             url.origin().ascii_serialization(),
         ))
+    }
+
+    /// The proxies whose `X-Forwarded-For` is believed; none if left out.
+    pub fn trusted_proxies(&self) -> Result<crate::admin::TrustedProxies, ConfigError> {
+        let Some(list) = &self.trusted_proxies else {
+            return Ok(crate::admin::TrustedProxies::default());
+        };
+        list.parse().map_err(|message| ConfigError::Invalid {
+            key: "admin.trusted_proxies",
+            message,
+        })
     }
 
     /// The address to listen on, refused if it is not loopback and
@@ -890,6 +909,42 @@ mod tests {
     }
 
     #[test]
+    fn trusted_proxies_are_none_by_default_and_a_list_when_set() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(
+            config.admin.trusted_proxies().unwrap(),
+            crate::admin::TrustedProxies::default()
+        );
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; } admin { trusted_proxies = "10.0.0.5, 172.17.0.0/16"; }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.admin.trusted_proxies().unwrap(),
+            "10.0.0.5,172.17.0.0/16".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_trusted_proxy_that_is_not_an_address_or_range_is_rejected() {
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; } admin { trusted_proxies = "proxy.example.org"; }"#,
+        )
+        .unwrap();
+        let err = config.admin.trusted_proxies().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    key: "admin.trusted_proxies",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn a_public_url_is_the_one_origin_browsers_may_use() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         assert_eq!(
@@ -930,15 +985,28 @@ mod tests {
     }
 
     #[test]
+    fn an_item_is_watched_at_95_percent_by_default() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(config.watch.rules().unwrap().watched_fraction, 0.95);
+    }
+
+    #[test]
+    fn the_time_left_key_of_the_old_watched_rule_is_rejected() {
+        let result =
+            plex(r#"plex { url = "http://nas:32400"; } watch { watched_remaining_secs = 300; }"#);
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    #[test]
     fn watch_rules_default_and_can_be_set() {
         let default = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         assert_eq!(default.watch.rules().unwrap(), WatchRules::default());
         let set = plex(
-            r#"plex { url = "http://nas:32400"; } watch { watched_percent = 95; started_after_secs = 30; }"#,
+            r#"plex { url = "http://nas:32400"; } watch { watched_percent = 80; started_after_secs = 30; }"#,
         )
         .unwrap();
         let rules = set.watch.rules().unwrap();
-        assert_eq!(rules.watched_fraction, 0.95);
+        assert_eq!(rules.watched_fraction, 0.8);
         assert_eq!(rules.started_after, Duration::from_secs(30));
         let bad = plex(r#"plex { url = "http://nas:32400"; } watch { watched_percent = 0; }"#)
             .unwrap_err();

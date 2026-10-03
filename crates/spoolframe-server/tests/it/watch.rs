@@ -8,7 +8,7 @@ use spoolframe_protocol::{HomeScreen, Reply, Request, Response, SessionId};
 use spoolframe_server::principal::Principal;
 use spoolframe_server::store::watch::WatchUpdate;
 use spoolframe_types::{Item, MediaId, PlaybackState};
-use support::{TestClient, TestServer, episode, movie, second_copy};
+use support::{OldKey, TestClient, TestServer, episode, movie, second_copy};
 
 async fn alice_and_bob(test: &str) -> (TestServer, TestClient, SessionId, SessionId) {
     let server = TestServer::start(test).await;
@@ -84,8 +84,8 @@ async fn each_user_has_their_own_progress() {
 async fn progress_past_the_threshold_marks_watched() {
     let (server, tv, alice, _) = alice_and_bob("threshold").await;
     let id = movie().id().clone();
-    // The fake movie is 7020 s long: 90% is 6318 s.
-    progress(&tv, &alice, &id, 6400).await;
+    // The fake movie is 7020 s long: 95% is 6669 s.
+    progress(&tv, &alice, &id, 6669).await;
     let state = state_of(&tv, &alice, &id).await;
     assert!(state.watched);
     assert_eq!(state.position, None);
@@ -140,6 +140,56 @@ async fn fast_updates_after_the_crossing_into_watched_are_coalesced() {
     assert_eq!(rows.len(), 1);
     assert!(rows[0].watched);
     assert_eq!(rows[0].position_ms, Some(6_900_000));
+    tv.close().await;
+    server.stop().await;
+}
+
+/// Episode 15 is 2640 s long, with credits from 2400 s to its end: without
+/// them it would be watched at 95%, 2508 s.
+#[tokio::test]
+async fn an_item_is_watched_at_the_start_of_credits_that_run_to_its_end() {
+    let (server, tv, alice, bob) = alice_and_bob("credits").await;
+    let id = episode("15", "14", 2, 1).id().clone();
+    progress(&tv, &alice, &id, 2399).await;
+    let state = state_of(&tv, &alice, &id).await;
+    assert!(!state.watched);
+    assert_eq!(state.position, Some(Duration::from_secs(2399)));
+    progress(&tv, &bob, &id, 2400).await;
+    assert!(state_of(&tv, &bob, &id).await.watched);
+    tv.close().await;
+    server.stop().await;
+}
+
+/// The crossing into watched is written inside the throttle interval, and
+/// is judged there by the same credits as the write before it.
+#[tokio::test]
+async fn the_crossing_at_the_credits_is_written_within_the_throttle() {
+    let (server, tv, alice, _) = alice_and_bob("credits-throttle").await;
+    let id = episode("15", "14", 2, 1).id().clone();
+    progress(&tv, &alice, &id, 2380).await;
+    // Before the credits: no crossing, so not written.
+    progress(&tv, &alice, &id, 2390).await;
+    let state = state_of(&tv, &alice, &id).await;
+    assert!(!state.watched);
+    assert_eq!(state.position, Some(Duration::from_secs(2380)));
+    progress(&tv, &alice, &id, 2400).await;
+    assert!(state_of(&tv, &alice, &id).await.watched);
+    tv.close().await;
+    server.stop().await;
+}
+
+/// An item with no such credits is watched at 95% and not before: episode
+/// 12 is as long as episode 15, and at 2507 s it has 133 s left.
+#[tokio::test]
+async fn an_item_without_credits_that_run_to_its_end_is_watched_at_95_percent() {
+    let (server, tv, alice, bob) = alice_and_bob("no-credits").await;
+    let id = episode("12", "11", 1, 1).id().clone();
+    progress(&tv, &alice, &id, 2507).await;
+    let state = state_of(&tv, &alice, &id).await;
+    assert!(!state.watched);
+    assert_eq!(state.position, Some(Duration::from_secs(2507)));
+    progress(&tv, &bob, &id, 2508).await;
+    assert!(state_of(&tv, &bob, &id).await.watched);
     tv.close().await;
     server.stop().await;
 }
@@ -253,19 +303,20 @@ async fn a_second_copy_of_a_film_does_not_take_the_first_copy_s_hide() {
     server.stop().await;
 }
 
-/// Plex gave the film a new key: the state under the old one, which the
-/// catalog no longer has, moves when the item is looked at.
-#[tokio::test]
-async fn state_under_a_key_gone_from_the_catalog_moves_to_the_new_key() {
-    let (server, tv, alice, _) = alice_and_bob("relink").await;
-    let id = movie().id().clone();
-    let external_ids = [format!("test://{}", id.key())];
+/// The key the film had before Plex gave it a new one.
+fn old_key() -> MediaId {
+    "plex:movie:99".parse().unwrap()
+}
+
+/// Alice is 10 minutes into the film, under its old key.
+async fn started_under_the_old_key(server: &TestServer) {
+    let external_ids = [format!("test://{}", movie().id().key())];
     server
         .store
         .save_watch(
-            principal(&server, "alice").await,
+            principal(server, "alice").await,
             WatchUpdate {
-                media_id: "plex:movie:99",
+                media_id: &old_key().to_string(),
                 show_id: None,
                 external_ids: &external_ids,
                 position_ms: Some(600_000),
@@ -276,10 +327,98 @@ async fn state_under_a_key_gone_from_the_catalog_moves_to_the_new_key() {
         )
         .await
         .unwrap();
+}
+
+/// Plex rebuilt its database and the keys started over: the film's old
+/// key is another film's now.
+#[tokio::test]
+async fn state_under_a_key_that_now_holds_another_film_moves_to_the_new_key() {
+    let (server, tv, alice, _) = alice_and_bob("relink-other-film").await;
+    let id = movie().id().clone();
+    started_under_the_old_key(&server).await;
+    server.catalog.set_old_key(
+        &old_key(),
+        OldKey::AnotherItem(vec!["test://another-film".into()]),
+    );
     assert_eq!(
         state_of(&tv, &alice, &id).await.position,
         Some(Duration::from_secs(600))
     );
+    tv.close().await;
+    server.stop().await;
+}
+
+/// The old key is a show's now: the item still opens, with its state.
+#[tokio::test]
+async fn state_under_a_key_that_now_holds_another_kind_moves_to_the_new_key() {
+    let (server, tv, alice, _) = alice_and_bob("relink-other-kind").await;
+    let id = movie().id().clone();
+    started_under_the_old_key(&server).await;
+    server.catalog.set_old_key(&old_key(), OldKey::AnotherKind);
+    assert_eq!(
+        state_of(&tv, &alice, &id).await.position,
+        Some(Duration::from_secs(600))
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+/// The old key is one this catalog does not serve (the state was written
+/// with another catalog, P9).
+#[tokio::test]
+async fn state_under_another_catalog_s_key_moves_to_the_new_key() {
+    let (server, tv, alice, _) = alice_and_bob("relink-foreign").await;
+    let id = movie().id().clone();
+    started_under_the_old_key(&server).await;
+    server.catalog.set_old_key(&old_key(), OldKey::Foreign);
+    assert_eq!(
+        state_of(&tv, &alice, &id).await.position,
+        Some(Duration::from_secs(600))
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+/// A catalog that cannot say what the old key holds: the item opens
+/// without the state, the state stays where it is, and it moves at the
+/// next look once the catalog answers.
+#[tokio::test]
+async fn state_stays_while_the_catalog_cannot_answer_for_the_old_key() {
+    let (server, tv, alice, _) = alice_and_bob("relink-unreachable").await;
+    let id = movie().id().clone();
+    started_under_the_old_key(&server).await;
+    server.catalog.set_old_key(&old_key(), OldKey::Unreachable);
+    assert_eq!(state_of(&tv, &alice, &id).await, PlaybackState::default());
+    let rows = server
+        .store
+        .all_watch(principal(&server, "alice").await)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].media_id, old_key().to_string());
+
+    server.catalog.forget_old_key(&old_key());
+    assert_eq!(
+        state_of(&tv, &alice, &id).await.position,
+        Some(Duration::from_secs(600))
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+/// The second copy has no state, so each look at it asks whether the
+/// first copy's key still holds the film: with the narrow call, and the
+/// answer is kept for the next look.
+#[tokio::test]
+async fn looks_at_a_second_copy_ask_about_the_first_copy_once() {
+    let (server, tv, alice, _) = alice_and_bob("two-copies-asked-once").await;
+    let first = movie().id().clone();
+    let second = second_copy().id().clone();
+    progress(&tv, &alice, &first, 600).await;
+    server.catalog.take_calls(&first);
+    state_of(&tv, &alice, &second).await;
+    state_of(&tv, &alice, &second).await;
+    assert_eq!(server.catalog.take_calls(&first), ["external_ids"]);
     tv.close().await;
     server.stop().await;
 }

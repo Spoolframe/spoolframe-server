@@ -2,7 +2,9 @@
 
 use spoolframe_catalog::{Catalog, CatalogError, Page};
 use spoolframe_plex::{PathMap, PathMapping, PlexCatalog};
-use spoolframe_types::{Item, LibraryId, LibraryKind, MediaId, MediaKind, Namespace};
+use spoolframe_types::{
+    Item, LibraryId, LibraryKind, Marker, MarkerKind, MediaId, MediaKind, Namespace,
+};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -134,6 +136,141 @@ async fn a_movie_has_no_children_and_none_are_fetched() {
 }
 
 #[tokio::test]
+async fn an_episode_comes_with_its_intro_and_credits() {
+    let server = MockServer::start().await;
+    // Plex sends markers only when asked to.
+    Mock::given(path("/library/metadata/208620"))
+        .and(query_param("includeMarkers", "1"))
+        .respond_with(json("metadata-episode-markers"))
+        .mount(&server)
+        .await;
+    serve(&server, "/library/metadata/208620", "metadata-episode").await;
+    let got = catalog(&server)
+        .item(&id(MediaKind::Episode, "208620"))
+        .await
+        .unwrap();
+    // In order of start, whatever order Plex lists them in; its
+    // `commercial` marker is left out.
+    assert_eq!(
+        got.markers,
+        [
+            Marker {
+                kind: MarkerKind::Intro,
+                start_ms: 258_865,
+                end_ms: 319_865,
+                to_end: false,
+            },
+            Marker {
+                kind: MarkerKind::Credits,
+                start_ms: 2_815_419,
+                // 1 ms past the episode's duration, as Plex has it.
+                end_ms: 2_852_689,
+                to_end: true,
+            },
+        ]
+    );
+}
+
+/// The recorded episode, with `markers` for its `Marker` list.
+async fn serve_episode_with_markers(server: &MockServer, markers: serde_json::Value) {
+    let mut body: serde_json::Value =
+        serde_json::from_str(&fixture("metadata-episode-markers")).unwrap();
+    body["MediaContainer"]["Metadata"][0]["Marker"] = markers;
+    Mock::given(path("/library/metadata/208620"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
+/// Markers are extra: one Plex sends in a shape this build cannot read,
+/// of a type it uses or not, is left out, and the item still loads.
+#[tokio::test]
+async fn a_marker_that_cannot_be_read_is_left_out_and_the_item_loads() {
+    let server = MockServer::start().await;
+    let markers = serde_json::json!([
+        { "type": "commercial", "startTimeOffset": 600_000 },
+        { "type": "credits", "startTimeOffset": "soon", "endTimeOffset": 2_852_689, "final": true },
+        { "type": "intro", "startTimeOffset": 258_865.5, "endTimeOffset": 319_865 },
+        { "startTimeOffset": 1, "endTimeOffset": 2 },
+        "not a marker",
+        { "type": "intro", "startTimeOffset": 30_000, "endTimeOffset": 90_000 },
+    ]);
+    serve_episode_with_markers(&server, markers).await;
+    let got = catalog(&server)
+        .item(&id(MediaKind::Episode, "208620"))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.markers,
+        [Marker {
+            kind: MarkerKind::Intro,
+            start_ms: 30_000,
+            end_ms: 90_000,
+            to_end: false,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_marker_that_does_not_end_after_it_starts_is_left_out() {
+    let server = MockServer::start().await;
+    let markers = serde_json::json!([
+        { "type": "intro", "startTimeOffset": 90_000, "endTimeOffset": 30_000 },
+        { "type": "credits", "startTimeOffset": 2_815_419, "endTimeOffset": 2_815_419, "final": true },
+    ]);
+    serve_episode_with_markers(&server, markers).await;
+    let got = catalog(&server)
+        .item(&id(MediaKind::Episode, "208620"))
+        .await
+        .unwrap();
+    assert_eq!(got.markers, []);
+}
+
+#[tokio::test]
+async fn an_item_plex_has_no_markers_for_has_none() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/metadata/208620", "metadata-episode").await;
+    let got = catalog(&server)
+        .item(&id(MediaKind::Episode, "208620"))
+        .await
+        .unwrap();
+    assert!(got.markers.is_empty());
+}
+
+#[tokio::test]
+async fn markers_are_asked_for_only_with_a_movie_s_or_episode_s_details() {
+    let server = MockServer::start().await;
+    Mock::given(query_param("includeMarkers", "1"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    serve(&server, "/library/metadata/208620", "metadata-episode").await;
+    serve(&server, "/library/metadata/208619", "metadata-season").await;
+    serve(
+        &server,
+        "/library/metadata/208619/children",
+        "children-season",
+    )
+    .await;
+    let tmp = media_root("no-markers-for-a-path").await;
+    let local = tmp.as_ref().join(EPISODE);
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::fs::write(&local, b"").unwrap();
+    let catalog =
+        catalog(&server).with_paths(PathMap::new(vec![mapping(None, "/data", tmp.as_ref())]));
+    // Neither the file's path nor a season and its episodes need them.
+    catalog
+        .media_path(&id(MediaKind::Episode, "208620"))
+        .await
+        .unwrap();
+    catalog
+        .item(&id(MediaKind::Season, "208619"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn an_id_of_the_wrong_kind_is_an_error() {
     let server = MockServer::start().await;
     serve(&server, "/library/metadata/208618", "metadata-show").await;
@@ -143,6 +280,39 @@ async fn an_id_of_the_wrong_kind_is_an_error() {
         .unwrap_err();
     assert!(
         matches!(&err, CatalogError::Backend { message, .. } if message.contains("plex:show:208618")),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn external_ids_take_one_request_without_children_or_markers() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/metadata/208618", "metadata-show").await;
+    let ids = catalog(&server)
+        .external_ids(&id(MediaKind::Show, "208618"))
+        .await
+        .unwrap();
+    assert!(
+        ids.iter().any(|id| id.starts_with("plex://show/")),
+        "{ids:?}"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.query(), None);
+}
+
+/// Plex rebuilt its database and the key is a show's now: the movie that
+/// had it is not there.
+#[tokio::test]
+async fn external_ids_of_a_key_plex_gave_to_another_kind_are_not_found() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/metadata/208618", "metadata-show").await;
+    let err = catalog(&server)
+        .external_ids(&id(MediaKind::Movie, "208618"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, CatalogError::NotFound(what) if what == "plex:movie:208618"),
         "{err}"
     );
 }

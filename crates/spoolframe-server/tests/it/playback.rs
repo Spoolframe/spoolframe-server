@@ -7,7 +7,7 @@ use std::time::Duration;
 use spoolframe_protocol::codec::MAX_FRAME;
 use spoolframe_protocol::{
     Error, MAX_READ, MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan, Reply,
-    Request, Response, Selection, SessionId,
+    Request, Response, SUBTITLE_CHUNK, Selection, SessionId,
 };
 use support::{PLAYBACK_IDLE, PLAYBACK_RECHECK, TestClient, TestServer, mkv_capabilities, movie};
 
@@ -226,7 +226,13 @@ async fn a_selected_external_subtitle_is_read_whole() {
         }
     ));
     let response = client
-        .call(Some(&session), Request::ReadSubtitle { handle })
+        .call(
+            Some(&session),
+            Request::ReadSubtitle {
+                handle,
+                offset: None,
+            },
+        )
         .await;
     let Response::Ok(Reply::Subtitle { bytes, .. }) = response else {
         panic!("no subtitle: {response:?}");
@@ -237,7 +243,13 @@ async fn a_selected_external_subtitle_is_read_whole() {
     let (handle, _) = started(&client, &session).await;
     assert!(matches!(
         client
-            .call(Some(&session), Request::ReadSubtitle { handle })
+            .call(
+                Some(&session),
+                Request::ReadSubtitle {
+                    handle,
+                    offset: None,
+                },
+            )
             .await,
         Response::Err(Error::NotFound { .. })
     ));
@@ -275,15 +287,131 @@ async fn a_subtitle_too_large_for_a_frame_is_refused_with_the_reason() {
         panic!("did not start");
     };
     let response = client
-        .call(Some(&session), Request::ReadSubtitle { handle })
+        .call(
+            Some(&session),
+            Request::ReadSubtitle {
+                handle,
+                offset: None,
+            },
+        )
         .await;
     let Response::Err(Error::ReplyTooLarge { bytes }) = response else {
         panic!("not refused: {response:?}");
     };
-    assert!(bytes > sidecar.len() as u64, "{bytes}");
+    // The file's size, from a stat: the server did not read it to say so.
+    assert_eq!(bytes, sidecar.len() as u64);
     assert_eq!(
         client.call(None, Request::Ping).await,
         Response::Ok(Reply::Pong)
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// A playback of the movie with the subtitle file beside it selected.
+async fn started_with_sidecar(client: &TestClient, session: &SessionId) -> PlaybackHandle {
+    let Response::Ok(Reply::Tracks(tracks)) = client
+        .call(
+            Some(session),
+            Request::Tracks {
+                id: movie().id().clone(),
+            },
+        )
+        .await
+    else {
+        panic!("no tracks");
+    };
+    let external = tracks.subtitles.iter().position(|s| s.external).unwrap() as u32;
+    let selection = Selection {
+        audio: None,
+        subtitle: Some(external),
+    };
+    match start(client, session, selection).await {
+        Response::Ok(Reply::PlaybackStarted { handle, .. }) => handle,
+        other => panic!("playback did not start: {other:?}"),
+    }
+}
+
+/// One chunk of the playback's subtitle from `offset`, and the file's
+/// length as the reply gives it.
+async fn subtitle_chunk(
+    client: &TestClient,
+    session: &SessionId,
+    handle: &PlaybackHandle,
+    offset: u64,
+) -> (Vec<u8>, Option<u64>) {
+    let response = client
+        .call(
+            Some(session),
+            Request::ReadSubtitle {
+                handle: handle.clone(),
+                offset: Some(offset),
+            },
+        )
+        .await;
+    match response {
+        Response::Ok(Reply::Subtitle { bytes, total, .. }) => (bytes, total),
+        other => panic!("no subtitle: {other:?}"),
+    }
+}
+
+/// A subtitle too large for one frame is read in chunks, each from the
+/// byte the one before ended at (P2-11).
+#[tokio::test]
+async fn a_subtitle_too_large_for_a_frame_is_read_in_chunks() {
+    let (server, client, session) = ready("subtitle-chunks").await;
+    server.write_media(1000);
+    // No two chunks alike: 251 does not divide the chunk size.
+    let sidecar: Vec<u8> = (0..MAX_FRAME as usize + 1)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(server.media.with_extension("en.srt"), &sidecar).unwrap();
+    let handle = started_with_sidecar(&client, &session).await;
+    let total = sidecar.len() as u64;
+
+    let (first, said) = subtitle_chunk(&client, &session, &handle, 0).await;
+    assert_eq!(said, Some(total));
+    assert_eq!(first.len() as u64, SUBTITLE_CHUNK);
+    let mut whole = first;
+    while (whole.len() as u64) < total {
+        let (chunk, said) = subtitle_chunk(&client, &session, &handle, whole.len() as u64).await;
+        assert_eq!(said, Some(total));
+        assert!(!chunk.is_empty(), "nothing at {}", whole.len());
+        whole.extend(chunk);
+    }
+    assert!(whole == sidecar, "the chunks are not the file");
+    client.close().await;
+    server.stop().await;
+}
+
+/// A client's loop ends there: no bytes, and the length it has reached.
+#[tokio::test]
+async fn a_subtitle_read_at_or_past_the_end_answers_no_bytes() {
+    let (server, client, session) = ready("subtitle-past-end").await;
+    server.write_media(1000);
+    let total = server.write_sidecar().len() as u64;
+    let handle = started_with_sidecar(&client, &session).await;
+    for offset in [total, total + 1, u64::MAX] {
+        assert_eq!(
+            subtitle_chunk(&client, &session, &handle, offset).await,
+            (Vec::new(), Some(total)),
+            "at {offset}"
+        );
+    }
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_small_subtitle_read_with_an_offset_arrives_in_one_chunk() {
+    let (server, client, session) = ready("subtitle-one-chunk").await;
+    server.write_media(1000);
+    let sidecar = server.write_sidecar();
+    let handle = started_with_sidecar(&client, &session).await;
+    let total = Some(sidecar.len() as u64);
+    assert_eq!(
+        subtitle_chunk(&client, &session, &handle, 0).await,
+        (sidecar, total)
     );
     client.close().await;
     server.stop().await;

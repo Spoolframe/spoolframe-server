@@ -12,7 +12,8 @@ use spoolframe_protocol::{
     PlaybackPlan, Reply, Request, Response, Selection, SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_types::{
-    ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat, TrackPreferences,
+    ArtworkId, Item, Library, LibraryId, Marker, MediaId, MediaTracks, SubtitleFormat,
+    TrackPreferences,
 };
 
 use crate::client::Client;
@@ -65,6 +66,9 @@ pub struct ItemsPage {
 pub struct ItemDetail {
     pub item: Item,
     pub children: Vec<Item>,
+    /// The item's intro and credits (P2-10), in order of start. Empty when
+    /// it has none, or the server is too old to send them.
+    pub markers: Vec<Marker>,
 }
 
 /// How the server would play an item.
@@ -88,6 +92,9 @@ pub struct Playback {
     /// The encode the reads are of: 0 at the start, one more after each
     /// [`Session::seek_playback`].
     pub epoch: u32,
+    /// The item's intro and credits, as in [`ItemDetail::markers`]. Their
+    /// times are the item's own, wherever the playback started.
+    pub markers: Vec<Marker>,
 }
 
 /// A playback after [`Session::change_subtitle`].
@@ -127,6 +134,53 @@ pub struct Chunk {
 pub struct Subtitle {
     pub format: SubtitleFormat,
     pub bytes: Vec<u8>,
+}
+
+/// A subtitle as its chunks arrive (P2-11): `bytes` of the `total` the
+/// first chunk named.
+struct Chunks {
+    format: SubtitleFormat,
+    total: u64,
+    bytes: Vec<u8>,
+}
+
+impl Chunks {
+    fn complete(&self) -> bool {
+        self.bytes.len() as u64 == self.total
+    }
+
+    /// Join the next chunk, as the server answered it. The read fails
+    /// when the chunk is not the next part of the same file: joined, it
+    /// would be a wrong file that looks whole, or a read that never ends.
+    fn add(
+        &mut self,
+        format: SubtitleFormat,
+        chunk: Vec<u8>,
+        total: Option<u64>,
+    ) -> Result<(), SdkError> {
+        if format != self.format || total != Some(self.total) {
+            return Err(SdkError::Protocol(format!(
+                "the subtitle changed while it was read: {:?} of {} bytes, then {format:?} of {total:?}",
+                self.format, self.total
+            )));
+        }
+        let have = self.bytes.len() as u64;
+        if chunk.is_empty() && have < self.total {
+            return Err(SdkError::Protocol(format!(
+                "no bytes of the subtitle at {have} of {}",
+                self.total
+            )));
+        }
+        let now = have + chunk.len() as u64;
+        if now > self.total {
+            return Err(SdkError::Protocol(format!(
+                "{now} bytes of a subtitle of {}",
+                self.total
+            )));
+        }
+        self.bytes.extend(chunk);
+        Ok(())
+    }
 }
 
 /// One signed-in user on one server. Cheap to clone.
@@ -243,7 +297,15 @@ impl Session {
 
     pub async fn item(&self, id: &MediaId) -> Result<ItemDetail, SdkError> {
         match self.call(Request::Item { id: id.clone() }).await? {
-            Reply::Item { item, children } => Ok(ItemDetail { item, children }),
+            Reply::Item {
+                item,
+                children,
+                markers,
+            } => Ok(ItemDetail {
+                item,
+                children,
+                markers,
+            }),
             other => Err(unexpected(other)),
         }
     }
@@ -333,12 +395,14 @@ impl Session {
                 size,
                 chosen,
                 epoch,
+                markers,
             } => Ok(Playback {
                 handle,
                 plan,
                 size,
                 chosen,
                 epoch,
+                markers,
             }),
             other => Err(unexpected(other)),
         }
@@ -616,15 +680,55 @@ impl Session {
         }
     }
 
-    /// The selected external subtitle of a playback. One the server reads
-    /// as text (P2-07) is [`SdkError::SubtitleNotReady`] until it is done:
-    /// play on, and ask again in a few seconds.
+    /// The selected external subtitle of a playback, whole. One the server
+    /// reads as text (P2-07) is [`SdkError::SubtitleNotReady`] until it is
+    /// done: play on, and ask again in a few seconds.
+    ///
+    /// The file is read in chunks (P2-11), so one larger than a frame
+    /// arrives too. One that changes on the server while it is read is
+    /// [`SdkError::Protocol`], never a mix of the old and the new: read it
+    /// again.
     pub async fn read_subtitle(&self, handle: &PlaybackHandle) -> Result<Subtitle, SdkError> {
+        let (format, bytes, total) = self.subtitle_chunk(handle, 0).await?;
+        let Some(total) = total else {
+            // A server from before P2-11 does not know `offset`: this is
+            // the whole file.
+            return Ok(Subtitle { format, bytes });
+        };
+        let mut chunks = Chunks {
+            format,
+            total,
+            bytes: Vec::new(),
+        };
+        chunks.add(format, bytes, Some(total))?;
+        while !chunks.complete() {
+            let offset = chunks.bytes.len() as u64;
+            let (format, bytes, total) = self.subtitle_chunk(handle, offset).await?;
+            chunks.add(format, bytes, total)?;
+        }
+        Ok(Subtitle {
+            format: chunks.format,
+            bytes: chunks.bytes,
+        })
+    }
+
+    /// One chunk of a playback's subtitle, from `offset`, and the file's
+    /// length if the server gave it.
+    async fn subtitle_chunk(
+        &self,
+        handle: &PlaybackHandle,
+        offset: u64,
+    ) -> Result<(SubtitleFormat, Vec<u8>, Option<u64>), SdkError> {
         let request = Request::ReadSubtitle {
             handle: handle.clone(),
+            offset: Some(offset),
         };
         match self.call(request).await? {
-            Reply::Subtitle { format, bytes } => Ok(Subtitle { format, bytes }),
+            Reply::Subtitle {
+                format,
+                bytes,
+                total,
+            } => Ok((format, bytes, total)),
             other => Err(unexpected(other)),
         }
     }
@@ -642,7 +746,7 @@ impl Session {
             n,
         };
         match self.call(request).await? {
-            Reply::Subtitle { format, bytes } => Ok(Subtitle { format, bytes }),
+            Reply::Subtitle { format, bytes, .. } => Ok(Subtitle { format, bytes }),
             other => Err(unexpected(other)),
         }
     }
@@ -704,4 +808,94 @@ impl Session {
 
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Six bytes of SubRip, of which `have` have arrived.
+    fn chunks(have: &[u8]) -> Chunks {
+        Chunks {
+            format: SubtitleFormat::Srt,
+            total: 6,
+            bytes: have.to_vec(),
+        }
+    }
+
+    fn protocol_error(result: Result<(), SdkError>) -> String {
+        match result {
+            Err(SdkError::Protocol(message)) => message,
+            other => panic!("not a protocol error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chunks_join_in_order_until_the_total() {
+        let mut chunks = chunks(b"");
+        chunks
+            .add(SubtitleFormat::Srt, b"abcd".to_vec(), Some(6))
+            .unwrap();
+        assert!(!chunks.complete());
+        chunks
+            .add(SubtitleFormat::Srt, b"ef".to_vec(), Some(6))
+            .unwrap();
+        assert!(chunks.complete());
+        assert_eq!(chunks.bytes, b"abcdef");
+    }
+
+    #[test]
+    fn an_empty_subtitle_is_complete_with_its_empty_chunk() {
+        let mut chunks = Chunks {
+            format: SubtitleFormat::Srt,
+            total: 0,
+            bytes: Vec::new(),
+        };
+        chunks
+            .add(SubtitleFormat::Srt, Vec::new(), Some(0))
+            .unwrap();
+        assert!(chunks.complete());
+    }
+
+    /// The file was replaced by a longer or a shorter one between two
+    /// chunks: the bytes read so far are of another file.
+    #[test]
+    fn a_total_that_changes_between_chunks_fails_the_read() {
+        for now in [5, 7] {
+            let error =
+                protocol_error(chunks(b"abcd").add(SubtitleFormat::Srt, b"e".to_vec(), Some(now)));
+            assert!(error.contains("changed"), "{error}");
+        }
+    }
+
+    /// A read that would never end: the server says there is more, and
+    /// sends none of it.
+    #[test]
+    fn a_chunk_with_no_bytes_before_the_total_fails_the_read() {
+        let error = protocol_error(chunks(b"abcd").add(SubtitleFormat::Srt, Vec::new(), Some(6)));
+        assert!(error.contains("no bytes"), "{error}");
+    }
+
+    #[test]
+    fn a_chunk_that_passes_the_total_fails_the_read() {
+        let error =
+            protocol_error(chunks(b"abcd").add(SubtitleFormat::Srt, b"efg".to_vec(), Some(6)));
+        assert!(error.contains("7 bytes"), "{error}");
+    }
+
+    /// `ChangeSubtitle` between two chunks: the rest is another subtitle.
+    #[test]
+    fn a_format_that_changes_between_chunks_fails_the_read() {
+        let error =
+            protocol_error(chunks(b"abcd").add(SubtitleFormat::WebVtt, b"ef".to_vec(), Some(6)));
+        assert!(error.contains("changed"), "{error}");
+    }
+
+    /// A server that answered the first chunk with a `total` and a later
+    /// one without: not chunks of one file.
+    #[test]
+    fn a_later_chunk_without_a_total_fails_the_read() {
+        let error = protocol_error(chunks(b"abcd").add(SubtitleFormat::Srt, b"ef".to_vec(), None));
+        assert!(error.contains("changed"), "{error}");
+    }
 }

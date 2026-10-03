@@ -91,6 +91,30 @@ pub struct Metadata {
     pub view_count: Option<u32>,
     pub view_offset: Option<u64>,
     pub last_viewed_at: Option<i64>,
+    /// The intros, credits and the like Plex found in the item; only on
+    /// single-item responses asked with `includeMarkers=1`, and absent
+    /// without Plex Pass or with detection off. Each is read as a
+    /// [`Marker`] on its own (`convert::markers`): markers are extra, and
+    /// one in another shape must not make the item unreadable.
+    #[serde(rename = "Marker", default)]
+    pub markers: Vec<serde_json::Value>,
+}
+
+/// A stretch of an item Plex detected.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Marker {
+    /// `intro`, `credits`, and others (`commercial`).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Milliseconds.
+    pub start_time_offset: u64,
+    /// Milliseconds; on a `final` marker it can be 1 ms past the item's
+    /// `duration`.
+    pub end_time_offset: u64,
+    /// Set on credits that run to the end of the item.
+    #[serde(rename = "final", default)]
+    pub is_final: bool,
 }
 
 #[derive(Debug, Deserialize)]

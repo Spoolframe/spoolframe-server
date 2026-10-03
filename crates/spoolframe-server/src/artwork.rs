@@ -383,6 +383,9 @@ mod tests {
         async fn item(&self, _: &MediaId) -> Result<ItemWithChildren, CatalogError> {
             unreachable!()
         }
+        async fn external_ids(&self, _: &MediaId) -> Result<Vec<String>, CatalogError> {
+            unreachable!()
+        }
         async fn search(&self, _: &str, _: u32) -> Result<Vec<Item>, CatalogError> {
             unreachable!()
         }

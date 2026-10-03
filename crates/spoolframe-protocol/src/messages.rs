@@ -11,8 +11,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{
-    ClientCapabilities, Item, Library, LibraryId, MediaId, MediaTracks, Role, SubtitleFormat,
-    TrackPreferences,
+    ClientCapabilities, Item, Library, LibraryId, Marker, MediaId, MediaTracks, Role,
+    SubtitleFormat, TrackPreferences,
 };
 
 use crate::media::PlaybackHandle;
@@ -21,6 +21,11 @@ use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Selection};
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// when features are added; a breaking change is a new ALPN instead.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The most bytes of a subtitle one `ReadSubtitle` with an `offset`
+/// returns (P2-11): half a frame ([`crate::codec::MAX_FRAME`]), so a chunk
+/// and its framing always fit one.
+pub const SUBTITLE_CHUNK: u64 = 512 << 10;
 
 /// An opaque session token from a login (P1-12). It is only valid from
 /// the endpoint that logged in.
@@ -185,11 +190,21 @@ pub enum Request {
         handle: PlaybackHandle,
         kind: ManifestKind,
     },
-    /// The selected external subtitle of a playback, whole. One the server
-    /// reads as text (P2-07) answers `SubtitleNotReady` until it is done:
-    /// ask again.
+    /// The selected external subtitle of a playback. One the server reads
+    /// as text (P2-07) answers `SubtitleNotReady` until it is done: ask
+    /// again.
+    ///
+    /// With `offset` (P2-11) the reply is one chunk: at most
+    /// [`SUBTITLE_CHUNK`] bytes of the file from that byte, and `total`,
+    /// the file's length. Ask from the end of each chunk until `total`
+    /// bytes are read; an `offset` at or past the end answers no bytes.
+    /// Without `offset` the reply is the whole file, or `ReplyTooLarge`
+    /// when that does not fit a frame: an older client never gets a part
+    /// that it would take for the whole.
     ReadSubtitle {
         handle: PlaybackHandle,
+        #[serde(default)]
+        offset: Option<u64>,
     },
     /// Segment `n` (from 1) of an HLS playback's subtitle rendition (P2-07):
     /// `Subtitle { format: WebVtt, .. }`, the cues over that segment's time,
@@ -371,6 +386,10 @@ pub enum Reply {
     Item {
         item: Item,
         children: Vec<Item>,
+        /// The item's intro and credits (P2-10), in order of start; empty
+        /// for an item that has none, and from a server that sends none.
+        #[serde(default)]
+        markers: Vec<Marker>,
     },
     Search {
         items: Vec<Item>,
@@ -399,6 +418,11 @@ pub enum Reply {
         /// The encode reads name; 0 for direct play.
         #[serde(default)]
         epoch: u32,
+        /// The item's intro and credits, as in `Item`, so a player needs
+        /// no second request for them. Their times are the item's own,
+        /// wherever the playback starts.
+        #[serde(default)]
+        markers: Vec<Marker>,
     },
     /// A seek restarted the encode: reads name this epoch from offset 0.
     PlaybackSeeked {
@@ -419,10 +443,16 @@ pub enum Reply {
     Manifest {
         text: String,
     },
+    /// A subtitle, whole, or the chunk of it that `ReadSubtitle` asked for
+    /// with an `offset`.
     Subtitle {
         format: SubtitleFormat,
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
+        /// The whole file's length, when `bytes` is a chunk of it (P2-11).
+        /// Without it `bytes` is the whole file.
+        #[serde(default)]
+        total: Option<u64>,
     },
     /// The request was carried out; there is nothing to return.
     Done,
@@ -585,9 +615,11 @@ pub enum Error {
     /// Begin a new one.
     #[error("the sign-in code has expired")]
     DeviceSignInExpired,
-    /// The reply would be `bytes` long, over the frame limit
-    /// ([`crate::codec::MAX_FRAME`]): a subtitle file larger than that,
-    /// or a page of items to ask for in smaller pages.
+    /// The reply would be over the frame limit
+    /// ([`crate::codec::MAX_FRAME`]). `bytes` is its length, or the length
+    /// of the subtitle file it would carry: read that in chunks, with
+    /// `ReadSubtitle`'s `offset`. A page of items is to ask for in smaller
+    /// pages.
     #[error("the reply is too large to send ({bytes} bytes)")]
     ReplyTooLarge { bytes: u64 },
     /// Something the server depends on (Plex, a media mount) is down.

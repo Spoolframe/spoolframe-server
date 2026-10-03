@@ -16,6 +16,12 @@ authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
 repository = "https://git.coldsteel.casa/Coldsteel/foundry"
 
 [workspace.dependencies]
+# The server's global allocator, the one mainframe's daemons use. Built
+# with the `cc` crate rather than its default cmake: neither the devshell
+# nor the nix build carries cmake, and `cc` needs only the C++ compiler
+# both have. `check`: snmalloc's hardening checks, a few percent of speed
+# for a daemon that parses what clients and Plex send it.
+snmalloc-rs = { version = "0.7.5", default-features = false, features = ["build_cc", "check"] }
 # A test's own directory under a random name, removed with it, so tests
 # running at once never share one.
 tmpdir = "1"

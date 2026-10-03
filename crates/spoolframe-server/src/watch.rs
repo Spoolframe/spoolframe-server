@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::Prober;
 use spoolframe_protocol::HomeScreen;
-use spoolframe_types::{Item, MediaId, MediaKind, PlaybackState};
+use spoolframe_types::{Item, Marker, MarkerKind, MediaId, MediaKind, PlaybackState};
 
 use crate::principal::Principal;
 use crate::store::watch::WatchUpdate;
@@ -20,11 +20,9 @@ use crate::store::{Store, StoreError, now};
 pub struct WatchRules {
     /// Under this, an item is not in progress.
     pub started_after: Duration,
-    /// Watched at this share of the duration…
+    /// Watched at this share of the duration, for an item with no credits
+    /// that run to its end.
     pub watched_fraction: f64,
-    /// …or with less than this left, whichever comes first (credits); only
-    /// for items at least four times this long.
-    pub watched_remaining: Duration,
     /// At most one progress write per principal and item this often.
     pub throttle: Duration,
     /// Shows with activity this recent get a next-up episode.
@@ -37,8 +35,7 @@ impl Default for WatchRules {
     fn default() -> Self {
         Self {
             started_after: Duration::from_secs(60),
-            watched_fraction: 0.9,
-            watched_remaining: Duration::from_secs(5 * 60),
+            watched_fraction: 0.95,
             throttle: Duration::from_secs(10),
             next_up_window: Duration::from_secs(30 * 24 * 3600),
             next_up_cache: Duration::from_secs(60),
@@ -48,24 +45,24 @@ impl Default for WatchRules {
 
 impl WatchRules {
     /// Whether `position` into an item of `duration` counts as watched.
-    pub fn is_watched(&self, position: Duration, duration: Option<Duration>) -> bool {
+    /// `credits` is where the credits that run to its end start, when the
+    /// catalog knows (P2-10): then that is the point, exactly, and the
+    /// share of the duration does not apply.
+    pub fn is_watched(
+        &self,
+        position: Duration,
+        duration: Option<Duration>,
+        credits: Option<Duration>,
+    ) -> bool {
+        if let Some(credits) = credits {
+            return position >= credits;
+        }
         let Some(duration) = duration.filter(|d| !d.is_zero()) else {
             return false;
         };
-        let past_fraction =
-            position.as_secs_f64() >= duration.as_secs_f64() * self.watched_fraction;
-        // The time-left rule is for credits. On a short item it would be
-        // most of the item, so there only the fraction counts.
-        let in_credits = duration >= self.watched_remaining * REMAINING_RULE_MIN_LENGTHS
-            && duration.saturating_sub(position) < self.watched_remaining;
-        past_fraction || in_credits
+        position.as_secs_f64() >= duration.as_secs_f64() * self.watched_fraction
     }
 }
-
-/// The time-left rule applies to items at least this many times
-/// `watched_remaining` long: it never calls an item watched before three
-/// quarters of it.
-const REMAINING_RULE_MIN_LENGTHS: u32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
@@ -78,6 +75,11 @@ pub enum WatchError {
     Store(#[from] StoreError),
 }
 
+/// How long "that key still holds this item" is remembered. A second copy
+/// with no state of its own asks at each look; a real re-key waits at most
+/// this long to be seen.
+const SAME_ITEM_CACHE: Duration = Duration::from_secs(60);
+
 const ROW: usize = 20;
 const NEXT_UP_SHOWS: u32 = 20;
 
@@ -86,11 +88,22 @@ pub struct Watch {
     catalog: Arc<dyn Catalog>,
     prober: Arc<Prober>,
     rules: WatchRules,
-    /// When each (principal, item)'s progress was last written.
-    written: Mutex<HashMap<(Principal, String), Instant>>,
+    /// Each (principal, item)'s last progress write.
+    written: Mutex<HashMap<(Principal, String), Written>>,
     next_up: Mutex<HashMap<Principal, (Instant, Vec<Item>)>>,
+    /// (Another key, an item): when the catalog last said that the key
+    /// holds a copy of the item, so its state is not the item's to take.
+    copies: Mutex<HashMap<(String, String), Instant>>,
     /// Who saved a state last, for whoever mirrors it elsewhere (PX-04).
     changed: tokio::sync::watch::Sender<Option<Principal>>,
+}
+
+/// A progress write, for judging the reports the throttle skips.
+#[derive(Debug, Clone, Copy)]
+struct Written {
+    at: Instant,
+    /// The item's [`credits_to_end`], as the catalog had them then.
+    credits: Option<Duration>,
 }
 
 impl std::fmt::Debug for Watch {
@@ -99,6 +112,16 @@ impl std::fmt::Debug for Watch {
             .field("rules", &self.rules)
             .finish_non_exhaustive()
     }
+}
+
+/// Where the credits that run to the end of the item start, if `markers`
+/// has such credits.
+fn credits_to_end(markers: &[Marker]) -> Option<Duration> {
+    markers
+        .iter()
+        .filter(|m| m.kind == MarkerKind::Credits && m.to_end)
+        .map(|m| Duration::from_millis(m.start_ms))
+        .min()
 }
 
 fn tracked(id: &MediaId) -> bool {
@@ -123,6 +146,7 @@ impl Watch {
             rules,
             written: Mutex::default(),
             next_up: Mutex::default(),
+            copies: Mutex::default(),
             changed: tokio::sync::watch::Sender::new(None),
         }
     }
@@ -150,12 +174,13 @@ impl Watch {
             .lock()
             .expect("never held across a panic")
             .get(&key)
-            .is_some_and(|at| at.elapsed() < self.rules.throttle);
-        if recent {
+            .copied()
+            .filter(|written| written.at.elapsed() < self.rules.throttle);
+        if let Some(written) = recent {
             // Within the throttle only a crossing into watched is written,
-            // judged on the row of the last write (its duration, and whether
-            // it is watched already): no catalog or probe work for the many
-            // updates in between.
+            // judged on what the last write knew (the row's duration and
+            // whether it is watched already, and the item's credits): no
+            // catalog or probe work for the many updates in between.
             let stored = self
                 .store
                 .watch_states(principal, std::slice::from_ref(&key.1))
@@ -164,8 +189,8 @@ impl Watch {
             let duration = row
                 .and_then(|r| r.duration_ms)
                 .map(|d| Duration::from_millis(d.max(0) as u64));
-            let crossing =
-                self.rules.is_watched(position, duration) && !row.is_some_and(|r| r.watched);
+            let crossing = self.rules.is_watched(position, duration, written.credits)
+                && !row.is_some_and(|r| r.watched);
             if !crossing {
                 // Not written, but played: it is back in Continue watching
                 // (P1-22).
@@ -176,13 +201,20 @@ impl Watch {
         }
         let found = self.catalog.item(id).await?;
         let duration = self.duration(id, &found.item).await;
-        let watched = self.rules.is_watched(position, duration);
+        let credits = credits_to_end(&found.markers);
+        let watched = self.rules.is_watched(position, duration, credits);
         self.save(principal, id, &found, Some(position), duration, watched)
             .await?;
         self.written
             .lock()
             .expect("never held across a panic")
-            .insert(key, Instant::now());
+            .insert(
+                key,
+                Written {
+                    at: Instant::now(),
+                    credits,
+                },
+            );
         Ok(())
     }
 
@@ -298,9 +330,10 @@ impl Watch {
 
     /// If `id` had state under an earlier key, bring it over (P1-14's
     /// re-linking, for an item a client is looking at). An earlier key is
-    /// one the catalog no longer has: a key still there is another item
-    /// with the same external ids, such as a second copy of the film, and
-    /// keeps its state.
+    /// one that no longer holds the item: a key that still does is a copy
+    /// of it, such as the same film in a second library, and keeps its
+    /// state. A catalog that cannot say leaves the state where it is, and
+    /// the next call asks again.
     pub async fn relink(
         &self,
         principal: Principal,
@@ -313,7 +346,7 @@ impl Watch {
                 .store
                 .watch_under_another_key(principal, &media_id, external_ids)
                 .await?
-            && self.gone(&old).await?
+            && self.left(&old, &media_id, external_ids).await
         {
             self.store.move_watch(principal, &old, &media_id).await?;
         }
@@ -322,22 +355,50 @@ impl Watch {
             .store
             .hidden_under_another_key(principal, &media_id, external_ids)
             .await?
-            && self.gone(&old).await?
+            && self.left(&old, &media_id, external_ids).await
         {
             self.store.move_hidden(principal, &old, &media_id).await?;
         }
         Ok(())
     }
 
-    /// Whether the item stored under `key` has left the catalog.
-    async fn gone(&self, key: &str) -> Result<bool, WatchError> {
+    /// Whether the item `media_id`, with `external_ids`, has left `key`:
+    /// the catalog has nothing under it now, or another item (after a
+    /// rebuild Plex hands the same keys out again), or it is not a key of
+    /// this catalog. It has not if what is under `key` shares an external
+    /// id with the item. If the catalog cannot say, it has not, for now.
+    async fn left(&self, key: &str, media_id: &str, external_ids: &[String]) -> bool {
         let Ok(id) = key.parse::<MediaId>() else {
-            return Ok(false);
+            return false;
         };
-        match self.catalog.item(&id).await {
-            Ok(_) => Ok(false),
-            Err(CatalogError::NotFound(_)) => Ok(true),
-            Err(e) => Err(e.into()),
+        let pair = (key.to_owned(), media_id.to_owned());
+        let fresh = |at: &Instant| at.elapsed() < SAME_ITEM_CACHE;
+        if self
+            .copies
+            .lock()
+            .expect("never held across a panic")
+            .get(&pair)
+            .is_some_and(fresh)
+        {
+            return false;
+        }
+        match self.catalog.external_ids(&id).await {
+            Ok(there) if there.iter().any(|id| external_ids.contains(id)) => {
+                let mut copies = self.copies.lock().expect("never held across a panic");
+                copies.retain(|_, at| fresh(at));
+                copies.insert(pair, Instant::now());
+                false
+            }
+            Ok(_) | Err(CatalogError::NotFound(_) | CatalogError::ForeignId(_)) => true,
+            Err(e) => {
+                tracing::warn!(
+                    from = key,
+                    to = media_id,
+                    error = %e,
+                    "cannot tell whether watch state is to be re-linked; left where it is"
+                );
+                false
+            }
         }
     }
 
@@ -522,37 +583,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn watched_at_ninety_percent_or_five_minutes_left() {
+    fn without_credits_an_item_is_watched_at_ninety_five_percent() {
         let rules = WatchRules::default();
+        // 95% of 2 h is 114 min.
         let movie = Some(Duration::from_secs(7200));
-        assert!(!rules.is_watched(Duration::from_secs(6000), movie));
-        // 90% of 2 h is 108 min.
-        assert!(rules.is_watched(Duration::from_secs(6480), movie));
-        let short = Some(Duration::from_secs(1200));
-        // 20 min: 5 minutes left comes before 90%.
-        assert!(rules.is_watched(Duration::from_secs(901), short));
-        assert!(!rules.is_watched(Duration::from_secs(800), short));
+        assert!(!rules.is_watched(Duration::from_secs(6839), movie, None));
+        assert!(rules.is_watched(Duration::from_secs(6840), movie, None));
     }
 
     #[test]
-    fn a_short_item_is_watched_only_at_ninety_percent() {
+    fn time_left_does_not_make_an_item_watched() {
         let rules = WatchRules::default();
+        // 44 min, with 4 minutes left: 91%.
+        let episode = Some(Duration::from_secs(2640));
+        assert!(!rules.is_watched(Duration::from_secs(2400), episode, None));
         // A 4-minute clip always has less than 5 minutes left.
         let clip = Some(Duration::from_secs(240));
-        assert!(!rules.is_watched(Duration::from_secs(10), clip));
-        assert!(!rules.is_watched(Duration::from_secs(215), clip));
-        assert!(rules.is_watched(Duration::from_secs(216), clip));
-        // 7 min: 2:00 is 5 minutes from the end, and 29% in.
-        let episode = Some(Duration::from_secs(420));
-        assert!(!rules.is_watched(Duration::from_secs(121), episode));
-        // Just under 20 min: the 5 minutes would be more than a quarter.
-        let under = Some(Duration::from_secs(1199));
-        assert!(!rules.is_watched(Duration::from_secs(1000), under));
-        assert!(rules.is_watched(Duration::from_secs(1080), under));
+        assert!(!rules.is_watched(Duration::from_secs(10), clip, None));
+        assert!(!rules.is_watched(Duration::from_secs(227), clip, None));
+        assert!(rules.is_watched(Duration::from_secs(228), clip, None));
     }
 
     #[test]
     fn without_a_duration_nothing_is_watched_by_progress() {
-        assert!(!WatchRules::default().is_watched(Duration::from_secs(99_999), None));
+        assert!(!WatchRules::default().is_watched(Duration::from_secs(99_999), None, None));
+    }
+
+    #[test]
+    fn with_credits_that_run_to_the_end_watched_is_at_their_start_exactly() {
+        let rules = WatchRules::default();
+        let episode = Some(Duration::from_secs(2640));
+        // Short credits, from 98%: 95% (41:48) is not the point.
+        let credits = Some(Duration::from_secs(2590));
+        assert!(!rules.is_watched(Duration::from_secs(2589), episode, credits));
+        assert!(rules.is_watched(Duration::from_secs(2590), episode, credits));
+        // Long credits: before 95%.
+        let long = Some(Duration::from_secs(1800));
+        assert!(rules.is_watched(Duration::from_secs(1800), episode, long));
+    }
+
+    #[test]
+    fn credits_that_run_to_the_end_need_no_duration() {
+        let rules = WatchRules::default();
+        let credits = Some(Duration::from_secs(2400));
+        assert!(rules.is_watched(Duration::from_secs(2400), None, credits));
+        assert!(!rules.is_watched(Duration::from_secs(2399), None, credits));
+    }
+
+    fn marker(kind: MarkerKind, start_ms: u64, to_end: bool) -> Marker {
+        Marker {
+            kind,
+            start_ms,
+            end_ms: start_ms + 60_000,
+            to_end,
+        }
+    }
+
+    #[test]
+    fn only_credits_that_run_to_the_end_give_the_watched_point() {
+        // An intro, and credits with a scene after them, do not.
+        assert_eq!(
+            credits_to_end(&[
+                marker(MarkerKind::Intro, 30_000, false),
+                marker(MarkerKind::Credits, 2_000_000, false),
+            ]),
+            None
+        );
+        assert_eq!(
+            credits_to_end(&[
+                marker(MarkerKind::Credits, 2_000_000, false),
+                marker(MarkerKind::Credits, 2_400_000, true),
+            ]),
+            Some(Duration::from_secs(2400))
+        );
     }
 }

@@ -124,12 +124,14 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 ..
             })
         );
+    let mut second_input = false;
     if let (Some(path), Some(sub)) = (&sidecar, spec.subtitle) {
         if burned_pictures {
             // A second input, read from its start: a cue that began
             // before the seek is still drawn, and ffmpeg waits for ever
             // on a picture file sought past its last cue.
             args.extend([s("-i"), s(path.display())]);
+            second_input = true;
         } else if !matches!(
             sub.action,
             SubtitleAction::BurnIn { .. } | SubtitleAction::Ocr { .. }
@@ -137,12 +139,15 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
             // A second input, sought the same way.
             seek(&mut args);
             args.extend([s("-i"), s(path.display())]);
+            second_input = true;
         }
     }
-    if spec.start.is_some() || burned_pictures {
-        // The film's own time, not 0, so the player shows where it is.
-        // And for a picture file: without it ffmpeg moves the file's
-        // times back by its first cue's, and every cue shows early.
+    if spec.start.is_some() || second_input {
+        // The film's own time, not 0, so the player shows where it is
+        // and HLS segments line up with the playlist and the cues.
+        // And for a subtitle file, burned in or kept as a stream: without
+        // it ffmpeg moves a picture file's times back by its first cue's,
+        // and every cue shows early.
         args.push(s("-copyts"));
     }
 
@@ -340,6 +345,13 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 s("fmp4"),
                 s("-hls_fmp4_init_filename"),
                 s("init.mp4"),
+                // The segments store the times ffmpeg gives them: after a
+                // seek, the film's own (`-copyts`). Without this the MP4
+                // muxer stores every run from 0 and puts where it started
+                // in `init.mp4` as an empty edit, which AVPlayer does not
+                // apply when it places WebVTT cues (P2-07).
+                s("-hls_segment_options"),
+                s("movflags=+frag_discont"),
                 s("-hls_segment_filename"),
                 s(dir.join("seg%d.m4s").display()),
                 s("-start_number"),
@@ -544,6 +556,10 @@ mod tests {
             "/scratch/h/0/seg%d.m4s"
         );
         assert_eq!(after(&args, "-start_number"), "1");
+        assert_eq!(
+            after(&args, "-hls_segment_options"),
+            "movflags=+frag_discont"
+        );
         // Copied video keeps the source's keyframes.
         assert!(!args.contains(&s("-force_key_frames")));
     }
@@ -660,6 +676,32 @@ mod tests {
                 "-copyts"
             ]
         ));
+    }
+
+    #[test]
+    fn an_external_pgs_copy_is_a_second_input_with_its_times_kept() {
+        let (film, enc) = (film(), encoders(false));
+        let copy = ConvertedSubtitle {
+            index: 3,
+            action: SubtitleAction::Copy {
+                format: SubtitleFormat::Pgs,
+            },
+        };
+        let mut spec = spec(&film, &enc, COPY_HEVC, COPY_DTS, Some(copy), progressive());
+        spec.sidecar = Some(Path::new("/scratch/h/0/sidecar"));
+        let args = ffmpeg_args(&spec).unwrap();
+        // From the start too: there is no seek to ask for it.
+        assert!(has(
+            &args,
+            &[
+                "-i",
+                "/media/Film.mkv",
+                "-i",
+                "/scratch/h/0/sidecar",
+                "-copyts"
+            ]
+        ));
+        assert!(has(&args, &["-map", "1:0", "-c:s", "copy"]));
     }
 
     #[test]

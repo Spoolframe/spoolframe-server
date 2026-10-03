@@ -94,11 +94,12 @@ async fn text(client: &TestClient, session: &SessionId, handle: &PlaybackHandle)
                 Some(session),
                 Request::ReadSubtitle {
                     handle: handle.clone(),
+                    offset: None,
                 },
             )
             .await;
         match response {
-            Response::Ok(Reply::Subtitle { format, bytes }) => {
+            Response::Ok(Reply::Subtitle { format, bytes, .. }) => {
                 assert_eq!(format, SubtitleFormat::Srt);
                 return String::from_utf8(bytes).unwrap();
             }
@@ -117,6 +118,57 @@ fn read_as_srt() -> Option<PlannedSubtitle> {
         format: SubtitleFormat::Srt,
         delivery: SubtitleDelivery::External,
     })
+}
+
+/// The first chunk of a subtitle that is still being read answers as the
+/// whole read does (P2-11). The stand-in tesseract never finishes a cue.
+#[tokio::test]
+async fn the_first_chunk_of_a_subtitle_still_being_read_is_not_ready() {
+    let dir = fresh_dir("ocr-chunk-not-ready").await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let tesseract = dir.join("endless-tesseract");
+    support::write_script(
+        &tesseract,
+        "#!/bin/sh\n\
+         if [ \"$1\" = --list-langs ]; then\n\
+         printf 'List of available languages (1):\\neng\\n'\n\
+         exit 0\n\
+         fi\n\
+         exec sleep 600\n",
+    );
+    let server = TestServer::start_with(
+        dir,
+        ServerOptions {
+            real_media: true,
+            ocr: true,
+            tesseract,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_media(10, "libx264", "aac");
+    server.add_pgs(&[("Hello there", 1_000, 3_500)]);
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client.hello_with(None, Some(capabilities(false))).await;
+    let session = client.login("alice", "correct horse").await;
+    let (handle, _) = start(&client, &session, BitmapSubtitles::Auto).await;
+
+    let response = client
+        .call(
+            Some(&session),
+            Request::ReadSubtitle {
+                handle,
+                offset: Some(0),
+            },
+        )
+        .await;
+    assert!(
+        matches!(response, Response::Err(Error::SubtitleNotReady { .. })),
+        "{response:?}"
+    );
+    client.close().await;
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -321,6 +373,7 @@ async fn a_subtitle_change_in_direct_play_changes_only_the_text() {
             Some(&session),
             Request::ReadSubtitle {
                 handle: handle.clone(),
+                offset: None,
             },
         )
         .await;
