@@ -585,6 +585,11 @@ pub enum Error {
     /// Begin a new one.
     #[error("the sign-in code has expired")]
     DeviceSignInExpired,
+    /// The reply would be `bytes` long, over the frame limit
+    /// ([`crate::codec::MAX_FRAME`]): a subtitle file larger than that,
+    /// or a page of items to ask for in smaller pages.
+    #[error("the reply is too large to send ({bytes} bytes)")]
+    ReplyTooLarge { bytes: u64 },
     /// Something the server depends on (Plex, a media mount) is down.
     #[error("unavailable: {message}")]
     Unavailable { message: String },

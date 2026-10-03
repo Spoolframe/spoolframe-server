@@ -347,6 +347,7 @@ fn every_error_round_trips() {
         Error::RateLimited {
             retry_after_ms: 60_000,
         },
+        Error::ReplyTooLarge { bytes: 1_600_000 },
         Error::Unavailable {
             message: "Plex is down".into(),
         },

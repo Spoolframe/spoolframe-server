@@ -14,20 +14,20 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 
-use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
+use axum::{Extension, Router};
 use jsonrpsee::Extensions;
 use jsonrpsee::server::{Methods, ServerHandle, StopHandle, stop_channel};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
 use spoolframe_admin_api::{AdminApiServer, Credentials, MeApiServer, SetupRequest, error_code};
 
-use crate::admin::{AdminApi, Bearer};
+use crate::admin::{AdminApi, Bearer, Peer};
 use crate::auth::API_SESSION;
 
 /// The browser's session cookie: an admin API session token, as the CLI's
@@ -82,6 +82,8 @@ pub(crate) async fn serve(
     let app = router(api, methods, stop.clone(), origins);
     tokio::spawn(async move {
         let shutdown = stop.shutdown();
+        // With each connection's address, which the failure limit counts.
+        let app = app.into_make_service_with_connect_info::<SocketAddr>();
         if let Err(e) = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
             .await
@@ -152,8 +154,13 @@ async fn check_origin(State(origins): State<Origins>, req: Request, next: Next) 
 
 /// The request's session token where the methods find it: the Bearer
 /// header (the CLI) or else the cookie (a browser). A wrong Bearer token
-/// is not rescued by a cookie.
-async fn credentials(mut req: Request, next: Next) -> Response<Body> {
+/// is not rescued by a cookie. And the address it came from.
+async fn credentials(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut req: Request,
+    next: Next,
+) -> Response<Body> {
+    req.extensions_mut().insert(Peer(peer.ip()));
     if let Some(token) = token(req.headers()) {
         req.extensions_mut().insert(Bearer(token));
     }
@@ -225,12 +232,16 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ErrorObjectOw
         .map_err(|e| ErrorObjectOwned::owned::<()>(error_code::INVALID_INPUT, e.to_string(), None))
 }
 
-async fn login(State(api): State<AdminApi>, body: axum::body::Bytes) -> Response<Body> {
+async fn login(
+    State(api): State<AdminApi>,
+    Extension(peer): Extension<Peer>,
+    body: axum::body::Bytes,
+) -> Response<Body> {
     let credentials: Credentials = match parse(&body) {
         Ok(c) => c,
         Err(e) => return failure(e),
     };
-    match MeApiServer::login(&api, credentials).await {
+    match MeApiServer::login(&api, &from(peer), credentials).await {
         Ok(done) => signed_in(
             &done.token,
             json!({ "username": done.username, "role": done.role }),
@@ -239,12 +250,16 @@ async fn login(State(api): State<AdminApi>, body: axum::body::Bytes) -> Response
     }
 }
 
-async fn setup(State(api): State<AdminApi>, body: axum::body::Bytes) -> Response<Body> {
+async fn setup(
+    State(api): State<AdminApi>,
+    Extension(peer): Extension<Peer>,
+    body: axum::body::Bytes,
+) -> Response<Body> {
     let request: SetupRequest = match parse(&body) {
         Ok(r) => r,
         Err(e) => return failure(e),
     };
-    match AdminApiServer::setup(&api, request).await {
+    match AdminApiServer::setup(&api, &from(peer), request).await {
         Ok(done) => signed_in(
             &done.token,
             json!({ "username": done.username, "role": done.role }),
@@ -260,6 +275,14 @@ async fn setup_open(State(api): State<AdminApi>) -> Response<Body> {
         Ok(open) => axum::Json(json!({ "open": open })).into_response(),
         Err(e) => failure(e),
     }
+}
+
+/// What a method called before there is a session gets, as the socket
+/// would give it: where the caller is.
+fn from(peer: Peer) -> Extensions {
+    let mut ext = Extensions::new();
+    ext.insert(peer);
+    ext
 }
 
 /// The session's methods, called as the socket would call them.

@@ -277,21 +277,22 @@ impl Job {
 
 /// The track's name in the cache: the file as it is now (path, size,
 /// modification time), the track, how it is made (the OCR language) and
-/// the format. A file replaced by a new rip is made again.
+/// the format. A file replaced by a new rip is made again; so is a
+/// subtitle file beside it that was edited, which is named as it is now
+/// too.
 async fn key(source: &TextSource<'_>, how: &How) -> std::io::Result<String> {
-    let meta = tokio::fs::metadata(source.path).await?;
-    let modified = meta
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
+    let (size, modified) = stamp(source.path).await?;
     let track = match &source.stream.source {
         SubtitleSource::Embedded { index } => format!("stream {index}"),
-        SubtitleSource::External { path } => format!("file {}", path.display()),
+        SubtitleSource::External { path } => {
+            let (size, modified) = stamp(path).await?;
+            format!("file {} {size} {modified}", path.display())
+        }
     };
     let mut hash = blake3::Hasher::new();
     for part in [
         source.path.display().to_string(),
-        meta.len().to_string(),
+        size.to_string(),
         modified.to_string(),
         track,
         match how {
@@ -304,6 +305,16 @@ async fn key(source: &TextSource<'_>, how: &How) -> std::io::Result<String> {
         hash.update(&[0]);
     }
     Ok(hash.finalize().to_hex().to_string())
+}
+
+/// A file's size and modification time (nanoseconds).
+async fn stamp(path: &Path) -> std::io::Result<(u64, u128)> {
+    let meta = tokio::fs::metadata(path).await?;
+    let modified = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    Ok((meta.len(), modified))
 }
 
 fn extension(format: SubtitleFormat) -> &'static str {

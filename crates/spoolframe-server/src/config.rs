@@ -208,7 +208,8 @@ pub struct TranscodeConfig {
     /// Encodes at once; 2 if left out.
     #[ucl(default)]
     pub max_jobs: Option<u32>,
-    /// Where encodes write; `state_dir/cache/transcode` if left out.
+    /// Where encodes write, in a directory of their own made there;
+    /// `state_dir/cache/transcode` if left out.
     #[ucl(default)]
     pub scratch_dir: Option<PathBuf>,
     /// The most all encodes may write together, in MiB; 20 GiB if left out.

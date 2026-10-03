@@ -299,7 +299,7 @@ pub struct PlexSyncReport {
     jsonrpsee::proc_macros::rpc(server, namespace = "me")
 )]
 pub trait MeApi {
-    #[method(name = "login")]
+    #[method(name = "login", with_extensions)]
     async fn login(&self, credentials: Credentials) -> jsonrpsee::core::RpcResult<LoggedIn>;
 
     /// End the caller's session.
@@ -362,7 +362,7 @@ pub trait MeApi {
 pub trait AdminApi {
     /// Create the first admin. Works only while the server has no users,
     /// and only with the setup code from the server's log.
-    #[method(name = "setup")]
+    #[method(name = "setup", with_extensions)]
     async fn setup(&self, request: SetupRequest) -> jsonrpsee::core::RpcResult<LoggedIn>;
 
     #[method(name = "userList", with_extensions)]

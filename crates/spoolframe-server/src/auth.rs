@@ -17,7 +17,7 @@ use spoolframe_types::Role;
 
 use crate::device_sign_in::{Claim, DeviceSignIns};
 use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionUser};
-use crate::store::users::{LocalUserId, PasswordLogin};
+use crate::store::users::{LocalUserId, PasswordLogin, normalize_username};
 use crate::store::{Store, StoreError, now};
 
 /// How long a client (Iroh endpoint) session lasts after its last use.
@@ -172,6 +172,8 @@ fn pin_keys(user: LocalUserId, source: &str) -> (String, String) {
 }
 
 /// Failed logins, per username and per source, within a sliding window.
+/// A caller whose source says nothing about who it is (a loopback peer of
+/// the admin API) gives none, and only the username counts.
 #[derive(Debug)]
 pub struct RateLimiter {
     failures: Mutex<HashMap<String, VecDeque<Instant>>>,
@@ -194,45 +196,111 @@ impl RateLimiter {
         }
     }
 
-    fn keys(username: &str, source: &str) -> [String; 2] {
-        [
-            format!("user:{}", username.trim().to_lowercase()),
-            format!("source:{source}"),
-        ]
+    /// How many keys are held.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.failures.lock().unwrap().len()
+    }
+
+    fn user_key(username: &str) -> String {
+        format!("user:{}", username.trim().to_lowercase())
+    }
+
+    fn source_key(source: &str) -> String {
+        format!("source:{source}")
+    }
+
+    fn keys(username: &str, source: Option<&str>) -> impl Iterator<Item = String> {
+        [Some(Self::user_key(username)), source.map(Self::source_key)]
+            .into_iter()
+            .flatten()
     }
 
     /// `Some(wait)` if either key has used up its failures.
-    pub fn check(&self, username: &str, source: &str, now: Instant) -> Option<Duration> {
+    pub fn check(&self, username: &str, source: Option<&str>, now: Instant) -> Option<Duration> {
         let mut failures = self.failures.lock().expect("never held across a panic");
+        self.limited(&mut failures, username, source, now)
+    }
+
+    /// Drop every failure older than the window, and every key left with
+    /// none: under all keys, not only the ones asked about, or a name
+    /// tried once and never again would be kept for the life of the
+    /// process.
+    fn expire(&self, failures: &mut HashMap<String, VecDeque<Instant>>, now: Instant) {
+        failures.retain(|_, times| {
+            while times
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= self.window)
+            {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
+    }
+
+    fn limited(
+        &self,
+        failures: &mut HashMap<String, VecDeque<Instant>>,
+        username: &str,
+        source: Option<&str>,
+        now: Instant,
+    ) -> Option<Duration> {
+        self.expire(failures, now);
         Self::keys(username, source)
-            .iter()
             .filter_map(|key| {
-                let times = failures.get_mut(key)?;
-                while times
-                    .front()
-                    .is_some_and(|t| now.duration_since(*t) >= self.window)
-                {
-                    times.pop_front();
-                }
+                let times = failures.get(&key)?;
                 (times.len() >= MAX_FAILURES).then(|| self.window - now.duration_since(times[0]))
             })
             .max()
     }
 
-    pub fn record_failure(&self, username: &str, source: &str, now: Instant) {
+    pub fn record_failure(&self, username: &str, source: Option<&str>, now: Instant) {
         let mut failures = self.failures.lock().expect("never held across a panic");
+        self.expire(&mut failures, now);
         for key in Self::keys(username, source) {
             failures.entry(key).or_default().push_back(now);
         }
     }
 
-    /// A successful login clears the username's failures. The source's
-    /// stay: one account's right password must not reset guessing at
-    /// others from the same place.
-    pub fn record_success(&self, username: &str, source: &str) {
+    /// Count an attempt at `now`, before it is checked: `Err(wait)`, and
+    /// nothing counted, if either key has used up its failures. It stays
+    /// counted as a failure unless [`RateLimiter::record_success`] takes it
+    /// back, so attempts sent at once cannot all be checked before the
+    /// first of them has failed.
+    pub fn begin(
+        &self,
+        username: &str,
+        source: Option<&str>,
+        now: Instant,
+    ) -> Result<(), Duration> {
         let mut failures = self.failures.lock().expect("never held across a panic");
-        let [user, _] = Self::keys(username, source);
-        failures.remove(&user);
+        if let Some(wait) = self.limited(&mut failures, username, source, now) {
+            return Err(wait);
+        }
+        for key in Self::keys(username, source) {
+            failures.entry(key).or_default().push_back(now);
+        }
+        Ok(())
+    }
+
+    /// The attempt begun at `began` was right: it is taken back, and the
+    /// username's failures are cleared. The source's other failures stay:
+    /// one account's right password must not reset guessing at others from
+    /// the same place.
+    pub fn record_success(&self, username: &str, source: Option<&str>, began: Instant) {
+        let mut failures = self.failures.lock().expect("never held across a panic");
+        failures.remove(&Self::user_key(username));
+        let Some(source) = source.map(Self::source_key) else {
+            return;
+        };
+        if let Some(times) = failures.get_mut(&source)
+            && let Some(at) = times.iter().position(|t| *t == began)
+        {
+            times.remove(at);
+            if times.is_empty() {
+                failures.remove(&source);
+            }
+        }
     }
 }
 
@@ -327,20 +395,22 @@ impl Auth {
         endpoint: &str,
         pin: &str,
     ) -> Result<(), UnlockError> {
-        let (what, from) = pin_keys(user, endpoint);
-        if let Some(retry_after) = self.limiter.check(&what, &from, Instant::now()) {
-            return Err(UnlockError::RateLimited { retry_after });
-        }
         let Some(phc) = self.store.pin_phc(user).await? else {
             return Ok(());
         };
+        // Counted as wrong before it is checked: PINs sent at once would
+        // otherwise all be checked against a limit none had yet reached.
+        let (what, from) = pin_keys(user, endpoint);
+        let began = Instant::now();
+        if let Err(retry_after) = self.limiter.begin(&what, Some(&from), began) {
+            return Err(UnlockError::RateLimited { retry_after });
+        }
         let key = (user, endpoint.to_owned());
         if valid_pin(pin) && verify_password(pin, phc).await {
-            self.limiter.record_success(&what, &from);
+            self.limiter.record_success(&what, Some(&from), began);
             self.wrong_pins.lock().expect("never poisoned").remove(&key);
             return Ok(());
         }
-        self.limiter.record_failure(&what, &from, Instant::now());
         let wrong = {
             let mut counts = self.wrong_pins.lock().expect("never poisoned");
             let count = counts.entry(key.clone()).or_default();
@@ -367,23 +437,24 @@ impl Auth {
 
     /// The failure limit, for an attempt that is not a password login
     /// (a setup code): `Some(wait)` if `what` from `source` is limited.
-    pub fn attempt_limited(&self, what: &str, source: &str) -> Option<Duration> {
+    pub fn attempt_limited(&self, what: &str, source: Option<&str>) -> Option<Duration> {
         self.limiter.check(what, source, Instant::now())
     }
 
-    pub fn attempt_failed(&self, what: &str, source: &str) {
+    pub fn attempt_failed(&self, what: &str, source: Option<&str>) {
         self.limiter.record_failure(what, source, Instant::now());
     }
 
     /// Log in with a password and open a session bound as `binding`.
     /// `source` (an EndpointId, a remote address) is what the failure
-    /// limit counts besides the username.
+    /// limit counts besides the username; `None` if it says nothing about
+    /// who is trying.
     pub async fn login_password(
         &self,
         username: &str,
         password: &str,
         binding: SessionBinding,
-        source: &str,
+        source: Option<&str>,
     ) -> Result<Login, LoginError> {
         let account = self.check_password(username, password, source).await?;
         let lifetime = match binding {
@@ -413,11 +484,15 @@ impl Auth {
         &self,
         username: &str,
         password: &str,
-        source: &str,
+        source: Option<&str>,
     ) -> Result<PasswordLogin, LoginError> {
-        if let Some(retry_after) = self.limiter.check(username, source, Instant::now()) {
-            return Err(LoginError::RateLimited { retry_after });
-        }
+        // A name no user can have is not looked up, checked or counted:
+        // the limiter keeps what it counts, and this is as long as the
+        // caller likes.
+        let Ok(username) = normalize_username(username) else {
+            return Err(LoginError::InvalidCredentials);
+        };
+        let username = username.as_str();
         let account = self.store.password_login(username).await?;
         let (phc, usable) = match &account {
             Some(a) => (
@@ -426,17 +501,21 @@ impl Auth {
             ),
             None => (decoy_hash(), false),
         };
+        // Counted as a failure before it is checked: logins sent at once
+        // would otherwise all be checked against a limit none had yet
+        // reached.
+        let began = Instant::now();
+        if let Err(retry_after) = self.limiter.begin(username, source, began) {
+            return Err(LoginError::RateLimited { retry_after });
+        }
         let verified = verify_password(password, phc).await;
-        let account = match account {
-            Some(account) if verified && usable => account,
-            _ => {
-                self.limiter
-                    .record_failure(username, source, Instant::now());
-                return Err(LoginError::InvalidCredentials);
+        match account {
+            Some(account) if verified && usable => {
+                self.limiter.record_success(username, source, began);
+                Ok(account)
             }
-        };
-        self.limiter.record_success(username, source);
-        Ok(account)
+            _ => Err(LoginError::InvalidCredentials),
+        }
     }
 
     /// Open an API session for a user who just proved who they are some
@@ -520,7 +599,7 @@ mod tests {
     }
 
     async fn login(auth: &Auth, user: &str, password: &str) -> Result<Login, LoginError> {
-        auth.login_password(user, password, SessionBinding::Api, "127.0.0.1")
+        auth.login_password(user, password, SessionBinding::Api, Some("192.0.2.1"))
             .await
     }
 
@@ -567,6 +646,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logins_sent_at_once_are_limited_as_if_sent_in_turn() {
+        let auth = auth_with_alice("burst").await;
+        let guesses: Vec<String> = (0..MAX_FAILURES + 3)
+            .map(|i| format!("wrong guess {i}"))
+            .collect();
+        let answers = futures_util::future::join_all(
+            guesses.iter().map(|guess| login(&auth, "alice", guess)),
+        )
+        .await;
+        let checked = answers
+            .iter()
+            .filter(|answer| matches!(answer, Err(LoginError::InvalidCredentials)))
+            .count();
+        let refused = answers
+            .iter()
+            .filter(|answer| matches!(answer, Err(LoginError::RateLimited { .. })))
+            .count();
+        assert_eq!((checked, refused), (MAX_FAILURES, 3));
+    }
+
+    #[tokio::test]
+    async fn pins_sent_at_once_are_limited_as_if_sent_in_turn() {
+        let auth = auth_with_alice("pin-burst").await;
+        let alice = auth.store().password_login("alice").await.unwrap().unwrap();
+        let phc = hash_pin("4321").await.unwrap();
+        auth.store().set_pin(alice.id, &phc).await.unwrap();
+        let guesses: Vec<String> = (0..MAX_FAILURES + 3).map(|i| format!("000{i}")).collect();
+        let answers = futures_util::future::join_all(
+            guesses
+                .iter()
+                .map(|guess| auth.unlock(alice.id, "tv", guess)),
+        )
+        .await;
+        let checked = answers
+            .iter()
+            .filter(|answer| matches!(answer, Err(UnlockError::Wrong)))
+            .count();
+        let refused = answers
+            .iter()
+            .filter(|answer| matches!(answer, Err(UnlockError::RateLimited { .. })))
+            .count();
+        assert_eq!((checked, refused), (MAX_FAILURES, 3));
+    }
+
+    #[tokio::test]
+    async fn a_name_no_user_can_have_is_refused_and_not_kept() {
+        let auth = auth_with_alice("long-name").await;
+        for name in ["a".repeat(65), "x".repeat(1 << 20), "al ice".to_owned()] {
+            assert!(matches!(
+                login(&auth, &name, "correct horse").await,
+                Err(LoginError::InvalidCredentials)
+            ));
+        }
+        assert_eq!(auth.limiter.held(), 0);
+    }
+
+    #[tokio::test]
     async fn the_token_is_not_stored() {
         let auth = auth_with_alice("hashed").await;
         let login = login(&auth, "alice", "correct horse").await.unwrap();
@@ -608,14 +744,14 @@ mod tests {
         let limiter = RateLimiter::default();
         let t0 = Instant::now();
         for _ in 0..MAX_FAILURES {
-            limiter.record_failure("alice", "a", t0);
+            limiter.record_failure("alice", Some("a"), t0);
         }
         // Alice is limited from anywhere.
-        assert!(limiter.check("alice", "b", t0).is_some());
+        assert!(limiter.check("alice", Some("b"), t0).is_some());
         // Source "a" is limited for anyone.
-        assert!(limiter.check("bob", "a", t0).is_some());
+        assert!(limiter.check("bob", Some("a"), t0).is_some());
         // Others are not.
-        assert!(limiter.check("bob", "b", t0).is_none());
+        assert!(limiter.check("bob", Some("b"), t0).is_none());
     }
 
     #[test]
@@ -623,22 +759,54 @@ mod tests {
         let limiter = RateLimiter::default();
         let t0 = Instant::now();
         for _ in 0..MAX_FAILURES {
-            limiter.record_failure("alice", "a", t0);
+            limiter.record_failure("alice", Some("a"), t0);
         }
-        let wait = limiter.check("alice", "a", t0).unwrap();
+        let wait = limiter.check("alice", Some("a"), t0).unwrap();
         assert_eq!(wait, FAILURE_WINDOW);
-        assert!(limiter.check("alice", "a", t0 + FAILURE_WINDOW).is_none());
+        assert!(
+            limiter
+                .check("alice", Some("a"), t0 + FAILURE_WINDOW)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failures_older_than_the_window_are_not_kept() {
+        let limiter = RateLimiter::default();
+        let t0 = Instant::now();
+        for name in ["alice", "bob", "carol"] {
+            limiter.record_failure(name, Some(name), t0);
+        }
+        assert_eq!(limiter.held(), 6);
+        // Nobody asks about those names again; the next failure drops them.
+        limiter.record_failure("dave", Some("d"), t0 + FAILURE_WINDOW);
+        assert_eq!(limiter.held(), 2);
+    }
+
+    #[test]
+    fn a_right_attempt_leaves_nothing_behind() {
+        let limiter = RateLimiter::default();
+        let t0 = Instant::now();
+        limiter.begin("alice", Some("a"), t0).unwrap();
+        limiter.record_success("alice", Some("a"), t0);
+        assert_eq!(limiter.held(), 0);
     }
 
     #[test]
     fn success_clears_the_username_but_not_the_source() {
         let limiter = RateLimiter::default();
         let t0 = Instant::now();
-        for _ in 0..MAX_FAILURES {
-            limiter.record_failure("alice", "a", t0);
+        for _ in 0..MAX_FAILURES - 1 {
+            limiter.record_failure("alice", Some("a"), t0);
         }
-        limiter.record_success("alice", "a");
-        assert!(limiter.check("alice", "b", t0).is_none());
-        assert!(limiter.check("bob", "a", t0).is_some());
+        limiter.begin("alice", Some("a"), t0).unwrap();
+        // The source is at its limit while the attempt is being checked.
+        assert!(limiter.check("bob", Some("a"), t0).is_some());
+        limiter.record_success("alice", Some("a"), t0);
+        assert!(limiter.check("alice", Some("b"), t0).is_none());
+        // The right attempt is taken back; the wrong ones before it stay.
+        assert!(limiter.check("bob", Some("a"), t0).is_none());
+        limiter.record_failure("bob", Some("a"), t0);
+        assert!(limiter.check("carol", Some("a"), t0).is_some());
     }
 }

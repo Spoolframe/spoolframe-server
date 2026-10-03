@@ -103,26 +103,46 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
     };
     seek(&mut args);
     args.extend([s("-i"), s(spec.input.display())]);
-    // An external subtitle is a second input, sought the same way.
-    let sidecar =
-        spec.subtitle
-            .and_then(|sub| match &d.subtitles.get(sub.index as usize)?.source {
-                SubtitleSource::External { path } => {
-                    Some(spec.sidecar.map_or_else(|| path.clone(), Path::to_path_buf))
-                }
-                SubtitleSource::Embedded { .. } => None,
-            });
-    if let (Some(path), Some(sub)) = (&sidecar, spec.subtitle)
-        && !matches!(
+    let picked = spec
+        .subtitle
+        .and_then(|sub| d.subtitles.get(sub.index as usize));
+    let sidecar = picked.and_then(|track| match &track.source {
+        SubtitleSource::External { path } => {
+            Some(spec.sidecar.map_or_else(|| path.clone(), Path::to_path_buf))
+        }
+        SubtitleSource::Embedded { .. } => None,
+    });
+    // External pictures to burn in: laid over the video, as embedded ones
+    // are. (External text is burned in by a filter that reads the file
+    // itself.)
+    let burned_pictures = sidecar.is_some()
+        && picked.is_some_and(|track| track.kind == SubtitleKind::Bitmap)
+        && matches!(
+            spec.subtitle,
+            Some(ConvertedSubtitle {
+                action: SubtitleAction::BurnIn { .. },
+                ..
+            })
+        );
+    if let (Some(path), Some(sub)) = (&sidecar, spec.subtitle) {
+        if burned_pictures {
+            // A second input, read from its start: a cue that began
+            // before the seek is still drawn, and ffmpeg waits for ever
+            // on a picture file sought past its last cue.
+            args.extend([s("-i"), s(path.display())]);
+        } else if !matches!(
             sub.action,
             SubtitleAction::BurnIn { .. } | SubtitleAction::Ocr { .. }
-        )
-    {
-        seek(&mut args);
-        args.extend([s("-i"), s(path.display())]);
+        ) {
+            // A second input, sought the same way.
+            seek(&mut args);
+            args.extend([s("-i"), s(path.display())]);
+        }
     }
-    if spec.start.is_some() {
+    if spec.start.is_some() || burned_pictures {
         // The film's own time, not 0, so the player shows where it is.
+        // And for a picture file: without it ffmpeg moves the file's
+        // times back by its first cue's, and every cue shows early.
         args.push(s("-copyts"));
     }
 
@@ -154,13 +174,18 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                         .get(sub.index as usize)
                         .ok_or_else(|| format!("subtitle {}: no such track", sub.index))?;
                     match (&picked.source, picked.kind) {
-                        (SubtitleSource::Embedded { index }, SubtitleKind::Bitmap) => {
+                        (source_of, SubtitleKind::Bitmap) => {
+                            // An external file is the second input.
+                            let pictures = match source_of {
+                                SubtitleSource::Embedded { index } => format!("0:{index}"),
+                                SubtitleSource::External { .. } => s("1:0"),
+                            };
                             // Pictures go over the picture, their canvas
                             // scaled to it first: Blu-ray PGS is 1080p even
                             // over 4K video, and unscaled it would land
                             // small in the top left.
                             source = format!(
-                                "[0:{index}]scale={}:{}[subs];[0:{}][subs]overlay",
+                                "[{pictures}]scale={}:{}[subs];[0:{}][subs]overlay",
                                 stream.width, stream.height, stream.index
                             );
                         }
@@ -174,7 +199,7 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                                 filter_path(spec.input)?
                             ));
                         }
-                        (SubtitleSource::External { path }, _) => {
+                        (SubtitleSource::External { path }, SubtitleKind::Text) => {
                             let path = spec.sidecar.unwrap_or(path);
                             chain.push(format!("subtitles=filename={}", filter_path(path)?));
                         }
@@ -342,7 +367,7 @@ mod tests {
     use super::*;
 
     /// A 4K HDR10 HEVC MKV: stream 0 video, 1 DTS 5.1, 2 PGS, 3 SRT, and an
-    /// external SRT.
+    /// external SRT and an external PGS file.
     fn film() -> MediaDescriptor {
         let sub = |source, codec: &str| SubtitleStream {
             source,
@@ -389,6 +414,12 @@ mod tests {
                         path: "/media/Film.en.srt".into(),
                     },
                     "subrip",
+                ),
+                sub(
+                    SubtitleSource::External {
+                        path: "/media/Film.en.sup".into(),
+                    },
+                    "hdmv_pgs_subtitle",
                 ),
             ],
         }
@@ -577,6 +608,58 @@ mod tests {
         );
         // Burned in: not also a subtitle stream.
         assert!(!args.contains(&s("-c:s")));
+    }
+
+    #[test]
+    fn an_external_pgs_burn_in_overlays_the_file_s_pictures() {
+        let (film, enc) = (film(), encoders(false));
+        let video = ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height: 2160,
+            max_bitrate: None,
+            tone_map: false,
+        };
+        let burn = ConvertedSubtitle {
+            index: 3,
+            action: SubtitleAction::BurnIn {
+                format: SubtitleFormat::Pgs,
+            },
+        };
+        let mut spec = spec(&film, &enc, video, COPY_DTS, Some(burn), progressive());
+        spec.sidecar = Some(Path::new("/scratch/h/0/sidecar"));
+        let args = ffmpeg_args(&spec).unwrap();
+        // The file is the second input, and its times are kept.
+        assert!(has(
+            &args,
+            &[
+                "-i",
+                "/media/Film.mkv",
+                "-i",
+                "/scratch/h/0/sidecar",
+                "-copyts"
+            ]
+        ));
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[1:0]scale=3840:2160[subs];[0:0][subs]overlay,format=yuv420p[v]"
+        );
+        assert!(!args.contains(&s("-c:s")));
+
+        // At a seek only the film is sought.
+        spec.start = Some(Duration::from_secs(1800));
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(has(
+            &args,
+            &[
+                "-ss",
+                "1800.000",
+                "-i",
+                "/media/Film.mkv",
+                "-i",
+                "/scratch/h/0/sidecar",
+                "-copyts"
+            ]
+        ));
     }
 
     #[test]

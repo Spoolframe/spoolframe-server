@@ -22,7 +22,8 @@ pub struct WatchRules {
     pub started_after: Duration,
     /// Watched at this share of the duration…
     pub watched_fraction: f64,
-    /// …or with less than this left, whichever comes first (credits).
+    /// …or with less than this left, whichever comes first (credits); only
+    /// for items at least four times this long.
     pub watched_remaining: Duration,
     /// At most one progress write per principal and item this often.
     pub throttle: Duration,
@@ -51,10 +52,20 @@ impl WatchRules {
         let Some(duration) = duration.filter(|d| !d.is_zero()) else {
             return false;
         };
-        position.as_secs_f64() >= duration.as_secs_f64() * self.watched_fraction
-            || duration.saturating_sub(position) < self.watched_remaining
+        let past_fraction =
+            position.as_secs_f64() >= duration.as_secs_f64() * self.watched_fraction;
+        // The time-left rule is for credits. On a short item it would be
+        // most of the item, so there only the fraction counts.
+        let in_credits = duration >= self.watched_remaining * REMAINING_RULE_MIN_LENGTHS
+            && duration.saturating_sub(position) < self.watched_remaining;
+        past_fraction || in_credits
     }
 }
+
+/// The time-left rule applies to items at least this many times
+/// `watched_remaining` long: it never calls an item watched before three
+/// quarters of it.
+const REMAINING_RULE_MIN_LENGTHS: u32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
@@ -142,8 +153,9 @@ impl Watch {
             .is_some_and(|at| at.elapsed() < self.rules.throttle);
         if recent {
             // Within the throttle only a crossing into watched is written,
-            // judged on the duration stored with the last write: no catalog
-            // or probe work for the many updates in between.
+            // judged on the row of the last write (its duration, and whether
+            // it is watched already): no catalog or probe work for the many
+            // updates in between.
             let stored = self
                 .store
                 .watch_states(principal, std::slice::from_ref(&key.1))
@@ -152,7 +164,9 @@ impl Watch {
             let duration = row
                 .and_then(|r| r.duration_ms)
                 .map(|d| Duration::from_millis(d.max(0) as u64));
-            if !self.rules.is_watched(position, duration) {
+            let crossing =
+                self.rules.is_watched(position, duration) && !row.is_some_and(|r| r.watched);
+            if !crossing {
                 // Not written, but played: it is back in Continue watching
                 // (P1-22).
                 let show = row.and_then(|r| r.show_id.as_deref());
@@ -235,12 +249,7 @@ impl Watch {
     ) -> Result<(), WatchError> {
         let media_id = id.to_string();
         // Bring over any state this item had under an earlier key first.
-        self.store
-            .relink_watch(principal, &media_id, &found.external_ids)
-            .await?;
-        self.store
-            .relink_hidden(principal, &media_id, &found.external_ids)
-            .await?;
+        self.relink(principal, id, &found.external_ids).await?;
         let show_id = match &found.item {
             Item::Episode(e) => Some(e.show_id.to_string()),
             _ => None,
@@ -288,23 +297,48 @@ impl Watch {
     }
 
     /// If `id` had state under an earlier key, bring it over (P1-14's
-    /// re-linking, for an item a client is looking at).
+    /// re-linking, for an item a client is looking at). An earlier key is
+    /// one the catalog no longer has: a key still there is another item
+    /// with the same external ids, such as a second copy of the film, and
+    /// keeps its state.
     pub async fn relink(
         &self,
         principal: Principal,
         id: &MediaId,
         external_ids: &[String],
     ) -> Result<(), WatchError> {
-        if tracked(id) {
-            self.store
-                .relink_watch(principal, &id.to_string(), external_ids)
-                .await?;
+        let media_id = id.to_string();
+        if tracked(id)
+            && let Some(old) = self
+                .store
+                .watch_under_another_key(principal, &media_id, external_ids)
+                .await?
+            && self.gone(&old).await?
+        {
+            self.store.move_watch(principal, &old, &media_id).await?;
         }
         // A show's hide follows it too (P1-22).
-        self.store
-            .relink_hidden(principal, &id.to_string(), external_ids)
-            .await?;
+        if let Some(old) = self
+            .store
+            .hidden_under_another_key(principal, &media_id, external_ids)
+            .await?
+            && self.gone(&old).await?
+        {
+            self.store.move_hidden(principal, &old, &media_id).await?;
+        }
         Ok(())
+    }
+
+    /// Whether the item stored under `key` has left the catalog.
+    async fn gone(&self, key: &str) -> Result<bool, WatchError> {
+        let Ok(id) = key.parse::<MediaId>() else {
+            return Ok(false);
+        };
+        match self.catalog.item(&id).await {
+            Ok(_) => Ok(false),
+            Err(CatalogError::NotFound(_)) => Ok(true),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Fill in `principal`'s state on every movie and episode in `items`,
@@ -498,6 +532,23 @@ mod tests {
         // 20 min: 5 minutes left comes before 90%.
         assert!(rules.is_watched(Duration::from_secs(901), short));
         assert!(!rules.is_watched(Duration::from_secs(800), short));
+    }
+
+    #[test]
+    fn a_short_item_is_watched_only_at_ninety_percent() {
+        let rules = WatchRules::default();
+        // A 4-minute clip always has less than 5 minutes left.
+        let clip = Some(Duration::from_secs(240));
+        assert!(!rules.is_watched(Duration::from_secs(10), clip));
+        assert!(!rules.is_watched(Duration::from_secs(215), clip));
+        assert!(rules.is_watched(Duration::from_secs(216), clip));
+        // 7 min: 2:00 is 5 minutes from the end, and 29% in.
+        let episode = Some(Duration::from_secs(420));
+        assert!(!rules.is_watched(Duration::from_secs(121), episode));
+        // Just under 20 min: the 5 minutes would be more than a quarter.
+        let under = Some(Duration::from_secs(1199));
+        assert!(!rules.is_watched(Duration::from_secs(1000), under));
+        assert!(rules.is_watched(Duration::from_secs(1080), under));
     }
 
     #[test]

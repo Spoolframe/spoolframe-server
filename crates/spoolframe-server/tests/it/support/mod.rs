@@ -78,6 +78,20 @@ pub fn movie() -> Item {
     })
 }
 
+/// The same film in a second library, `plex:movie:2`: its own key, and
+/// the first copy's external ids.
+pub fn second_copy() -> Item {
+    Item::Movie(Movie {
+        id: MediaId::new(Namespace::Plex, MediaKind::Movie, "2").unwrap(),
+        title: "Alien (4K)".into(),
+        year: Some(1979),
+        summary: None,
+        duration: Some(Duration::from_secs(7020)),
+        artwork: Vec::new(),
+        playback: PlaybackState::default(),
+    })
+}
+
 fn media(kind: MediaKind, key: &str) -> MediaId {
     MediaId::new(Namespace::Plex, kind, key).unwrap()
 }
@@ -126,6 +140,7 @@ pub fn episode(key: &str, season_key: &str, season: u32, episode: u32) -> Item {
 fn tree() -> Vec<(Item, Vec<Item>)> {
     vec![
         (movie(), Vec::new()),
+        (second_copy(), Vec::new()),
         (
             show(),
             vec![season("20", 0), season("11", 1), season("14", 2)],
@@ -173,10 +188,17 @@ impl Catalog for FakeCatalog {
         tree()
             .into_iter()
             .find(|(item, _)| item.id() == id)
-            .map(|(item, children)| ItemWithChildren {
-                external_ids: vec![format!("test://{}", item.id().key())],
-                item,
-                children,
+            .map(|(item, children)| {
+                let key = if item.id() == second_copy().id() {
+                    movie().id().key().to_owned()
+                } else {
+                    item.id().key().to_owned()
+                };
+                ItemWithChildren {
+                    external_ids: vec![format!("test://{key}")],
+                    item,
+                    children,
+                }
             })
             .ok_or_else(|| CatalogError::NotFound(id.to_string()))
     }
@@ -304,6 +326,8 @@ pub struct ServerOptions {
     /// fixtures.
     pub real_media: bool,
     pub max_jobs: usize,
+    /// The most all conversions may write together, in bytes.
+    pub scratch_limit: u64,
     pub read_ahead: Duration,
     /// The encoder jobs run: real ffmpeg, or a stand-in script.
     pub ffmpeg: PathBuf,
@@ -327,6 +351,7 @@ impl Default for ServerOptions {
             mdns: false,
             real_media: false,
             max_jobs: 2,
+            scratch_limit: 1 << 30,
             read_ahead: Duration::from_secs(5),
             ffmpeg: PathBuf::from("ffmpeg"),
             ocr: false,
@@ -419,7 +444,7 @@ impl TestServer {
             JobLimits {
                 max_jobs: options.max_jobs,
                 scratch_dir: dir.join("cache").join("transcode"),
-                scratch_limit_bytes: 1 << 30,
+                scratch_limit_bytes: options.scratch_limit,
                 read_ahead: options.read_ahead,
             },
             options.ffmpeg.clone(),
@@ -506,10 +531,22 @@ impl TestServer {
     /// pattern in `video` and a tone in `audio` (encoder names), with a
     /// keyframe every 2 s, in Matroska.
     pub fn generate_media(&self, secs: u32, video: &str, audio: &str) {
+        self.generate(secs, video, audio, "0");
+    }
+
+    /// As [`TestServer::generate_media`], with the picture starting 0.5 s
+    /// after the sound, as in many real files: the keyframes are at about
+    /// 0.5 s, 2.5 s and so on, none at 0.
+    pub fn generate_media_with_late_video(&self, secs: u32, video: &str, audio: &str) {
+        self.generate(secs, video, audio, "0.5");
+    }
+
+    fn generate(&self, secs: u32, video: &str, audio: &str, video_offset: &str) {
         std::fs::create_dir_all(self.media.parent().unwrap()).unwrap();
         let status = std::process::Command::new("ffmpeg")
             .args(["-hide_banner", "-loglevel", "error", "-y"])
-            .args(["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25"])
+            .args(["-f", "lavfi", "-itsoffset", video_offset])
+            .args(["-i", "testsrc2=size=640x360:rate=25"])
             .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
             .args(["-t", &secs.to_string(), "-pix_fmt", "yuv420p", "-g", "50"])
             .args(["-c:v", video, "-c:a", audio, "-ac", "2"])
@@ -524,6 +561,33 @@ impl TestServer {
     /// end_ms)`: the text drawn with ffmpeg's drawtext, as a Blu-ray
     /// subtitle would show it.
     pub fn add_pgs(&self, cues: &[(&str, u64, u64)]) {
+        let sup = self.dir.join("subs.sup");
+        std::fs::write(&sup, Self::pgs(cues)).unwrap();
+        let with = self.media.with_extension("pgs.mkv");
+        // `-copyts`: without it ffmpeg moves the track back by its first
+        // cue's time.
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&self.media)
+            .arg("-i")
+            .arg(&sup)
+            .args(["-map", "0", "-map", "1", "-c", "copy", "-copyts"])
+            .args(["-metadata:s:s:0", "language=eng"])
+            .arg(&with)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not add the PGS track");
+        std::fs::rename(&with, &self.media).unwrap();
+    }
+
+    /// Write the same PGS subtitle as [`TestServer::add_pgs`] makes, as an
+    /// English `.sup` file next to the movie.
+    pub fn write_pgs_sidecar(&self, cues: &[(&str, u64, u64)]) {
+        std::fs::write(self.media.with_extension("en.sup"), Self::pgs(cues)).unwrap();
+    }
+
+    /// A PGS (`.sup`) stream showing each `(text, start_ms, end_ms)`.
+    fn pgs(cues: &[(&str, u64, u64)]) -> Vec<u8> {
         use spoolframe_media::pgs::fixture;
         const WIDTH: u16 = 640;
         const HEIGHT: u16 = 64;
@@ -554,23 +618,7 @@ impl TestServer {
                 }
             })
             .collect();
-        let sup = self.dir.join("subs.sup");
-        std::fs::write(&sup, fixture::sup(&shown, 65_000)).unwrap();
-        let with = self.media.with_extension("pgs.mkv");
-        // `-copyts`: without it ffmpeg moves the track back by its first
-        // cue's time.
-        let status = std::process::Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-            .arg(&self.media)
-            .arg("-i")
-            .arg(&sup)
-            .args(["-map", "0", "-map", "1", "-c", "copy", "-copyts"])
-            .args(["-metadata:s:s:0", "language=eng"])
-            .arg(&with)
-            .status()
-            .expect("ffmpeg runs");
-        assert!(status.success(), "ffmpeg could not add the PGS track");
-        std::fs::rename(&with, &self.media).unwrap();
+        fixture::sup(&shown, 65_000)
     }
 
     /// Give the movie made with [`TestServer::generate_media`] a text
@@ -594,11 +642,26 @@ impl TestServer {
         std::fs::rename(&with, &self.media).unwrap();
     }
 
+    /// Write an English ASS subtitle file next to the movie, with the cues
+    /// of SubRip `srt`.
+    pub fn write_ass_sidecar(&self, srt: &str) {
+        let source = self.dir.join("sidecar.srt");
+        std::fs::write(&source, srt).unwrap();
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&source)
+            .arg(self.media.with_extension("en.ass"))
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not write the ASS file");
+    }
+
     /// Where a converted playback's job writes, for epoch `epoch`.
     pub fn job_dir(&self, handle: &PlaybackHandle, epoch: u32) -> PathBuf {
         self.dir
             .join("cache")
             .join("transcode")
+            .join(spoolframe_server::encode::job::JOBS_DIR)
             .join(&handle.0)
             .join(epoch.to_string())
     }

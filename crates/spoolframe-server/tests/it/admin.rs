@@ -338,6 +338,28 @@ async fn guessing_the_setup_code_is_rate_limited() {
 }
 
 #[tokio::test]
+async fn failed_logins_as_one_user_do_not_lock_the_others_out() {
+    let (addr, _admin, _dir) = admin_client("login-others").await;
+    let client = anonymous(addr).await;
+    for _ in 0..spoolframe_server::auth::MAX_FAILURES {
+        let err = client
+            .login(creds("mallory", "wrong guess"))
+            .await
+            .unwrap_err();
+        assert_eq!(code(err), error_code::INVALID_CREDENTIALS);
+    }
+    // The name that was guessed at is limited.
+    let err = client
+        .login(creds("mallory", "wrong guess"))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), error_code::RATE_LIMITED);
+    // Everyone else on this machine, from the same address, is not.
+    let root = client.login(creds("root", "correct horse")).await.unwrap();
+    assert_eq!(root.role, Role::Admin);
+}
+
+#[tokio::test]
 async fn a_server_started_with_users_offers_no_setup() {
     let dir = state_dir("no-setup").await;
     let auth = Auth::new(Store::open(dir.as_ref()).await.unwrap());

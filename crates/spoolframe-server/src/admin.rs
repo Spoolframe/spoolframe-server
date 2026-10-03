@@ -6,7 +6,7 @@
 //! so reaching it from elsewhere means a TLS reverse proxy in front, and
 //! an explicit `allow_remote`.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 
 use jsonrpsee::Extensions;
@@ -31,9 +31,28 @@ use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionRecord};
 use crate::store::users::{UserError, UserRecord, normalize_username};
 use crate::transcode::Transcoding;
 
-/// What the failure limit counts for admin logins besides the username.
-/// The API listens on loopback, where the peer address says nothing.
-const SOURCE: &str = "admin-api";
+/// The address the caller's connection comes from (`crate::admin_http`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Peer(pub(crate) IpAddr);
+
+impl Peer {
+    /// What the failure limit counts for this caller besides the username:
+    /// its address. A loopback address is shared by everyone who comes
+    /// through this machine (the CLI, an SSH tunnel, a proxy), so it names
+    /// no one: counting it would let any of them lock all the others out.
+    fn source(self) -> Option<String> {
+        let ip = self.0.to_canonical();
+        (!ip.is_loopback()).then(|| ip.to_string())
+    }
+}
+
+/// The failure limit's source for the caller.
+fn source(ext: &Extensions) -> RpcResult<Option<String>> {
+    match ext.get::<Peer>() {
+        Some(peer) => Ok(peer.source()),
+        None => Err(internal("a request without its peer address")),
+    }
+}
 
 /// The caller's session token, from the upgrade's Bearer header or the
 /// browser's cookie (`crate::admin_http`), if there was one.
@@ -374,14 +393,15 @@ fn session_id(token_hash: &str) -> String {
 
 #[async_trait]
 impl MeApiServer for AdminApi {
-    async fn login(&self, credentials: Credentials) -> RpcResult<LoggedIn> {
+    async fn login(&self, ext: &Extensions, credentials: Credentials) -> RpcResult<LoggedIn> {
+        let source = source(ext)?;
         let login = self
             .auth
             .login_password(
                 &credentials.username,
                 &credentials.password,
                 SessionBinding::Api,
-                SOURCE,
+                source.as_deref(),
             )
             .await?;
         Ok(LoggedIn {
@@ -409,8 +429,9 @@ impl MeApiServer for AdminApi {
         let Some(me) = self.auth.store().user_by_id(user.user).await? else {
             return Err(error(error_code::UNAUTHENTICATED, "session is not valid"));
         };
+        let source = source(ext)?;
         self.auth
-            .check_password(&me.username, &change.current_password, SOURCE)
+            .check_password(&me.username, &change.current_password, source.as_deref())
             .await?;
         let phc = hash_password(&change.new_password).await?;
         self.auth.store().set_password(&me.username, &phc).await?;
@@ -503,15 +524,16 @@ impl MeApiServer for AdminApi {
 
 #[async_trait]
 impl AdminApiServer for AdminApi {
-    async fn setup(&self, request: SetupRequest) -> RpcResult<LoggedIn> {
+    async fn setup(&self, ext: &Extensions, request: SetupRequest) -> RpcResult<LoggedIn> {
         let Some(code) = &self.setup_code else {
             return Err(UserError::AlreadySetUp.into());
         };
-        if let Some(retry_after) = self.auth.attempt_limited("setup", SOURCE) {
+        let source = source(ext)?;
+        if let Some(retry_after) = self.auth.attempt_limited("setup", source.as_deref()) {
             return Err(LoginError::RateLimited { retry_after }.into());
         }
         if !code.matches(&request.code) {
-            self.auth.attempt_failed("setup", SOURCE);
+            self.auth.attempt_failed("setup", source.as_deref());
             return Err(error(
                 error_code::INVALID_SETUP_CODE,
                 "that is not the setup code in the server's log",
@@ -804,6 +826,17 @@ mod tests {
         assert!(code.matches("K7QD M2XP 9RTB"));
         assert!(!code.matches("K7QD-M2XP-9RTC"));
         assert!(!code.matches(""));
+    }
+
+    #[test]
+    fn a_loopback_peer_is_no_source_and_any_other_is_its_address() {
+        let source = |ip: &str| Peer(ip.parse().unwrap()).source();
+        assert_eq!(source("127.0.0.1"), None);
+        assert_eq!(source("::1"), None);
+        assert_eq!(source("::ffff:127.0.0.1"), None);
+        assert_eq!(source("192.0.2.7").as_deref(), Some("192.0.2.7"));
+        assert_eq!(source("::ffff:192.0.2.7").as_deref(), Some("192.0.2.7"));
+        assert_eq!(source("2001:db8::7").as_deref(), Some("2001:db8::7"));
     }
 
     #[test]

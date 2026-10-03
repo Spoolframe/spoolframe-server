@@ -159,13 +159,25 @@ impl ClientProtocol {
             let _ = recv.stop(code);
             return;
         }
-        let response = match read_frame_bytes(&mut recv).await {
-            Ok(bytes) => self.answer(&connection, &state, &bytes).await,
+        let request = read_frame_bytes(&mut recv).await;
+        let response = match &request {
+            Ok(bytes) => self.answer(&connection, &state, bytes).await,
             Err(e) => Response::Err(Error::Malformed {
                 message: e.to_string(),
             }),
         };
-        if let Err(e) = write_frame(&mut send, &response).await {
+        let sent = match write_frame(&mut send, &response).await {
+            // Nothing of it was written. The client gets the reason, not a
+            // stream that ends with no response.
+            Err(codec::CodecError::TooLarge { len }) => {
+                let request = request.ok().and_then(|bytes| codec::request_type(&bytes));
+                tracing::warn!(request, len, "a reply is over the frame limit");
+                let refusal = Response::Err(Error::ReplyTooLarge { bytes: len });
+                write_frame(&mut send, &refusal).await
+            }
+            sent => sent,
+        };
+        if let Err(e) = sent {
             tracing::debug!(error = %e, "cannot send a response");
             return;
         }
@@ -839,7 +851,7 @@ impl ClientProtocol {
                         (&path, &descriptor),
                         &plan,
                         start_ms.map(Duration::from_millis),
-                        0,
+                        None,
                     )
                     .await?;
                 let handle = self.services.playbacks.start(
@@ -885,9 +897,6 @@ impl ClientProtocol {
                     &self.services.transcoding.encoders(),
                     self.services.subtitles.ocr(),
                 );
-                // A new conversion's first epoch is past the old one's, so
-                // reads of the old one are told to start over.
-                let first_epoch = playback.conversion.as_ref().map_or(0, |c| c.job().epoch) + 1;
                 let (subtitle, size, conversion) = self
                     .prepare(
                         &handle,
@@ -895,7 +904,7 @@ impl ClientProtocol {
                         (&path, &descriptor),
                         &plan,
                         Some(Duration::from_millis(position_ms)),
-                        first_epoch,
+                        Some(&playback),
                     )
                     .await?;
                 let epoch = conversion.as_ref().map_or(0, |c| c.job().epoch);
@@ -1074,7 +1083,12 @@ impl ClientProtocol {
         match self
             .services
             .auth
-            .login_password(&login.username, &login.password, binding, &endpoint_id)
+            .login_password(
+                &login.username,
+                &login.password,
+                binding,
+                Some(&endpoint_id),
+            )
             .await
         {
             Ok(done) => {
@@ -1103,7 +1117,7 @@ impl ClientProtocol {
         typed: &str,
     ) -> Result<String, Error> {
         let (what, from) = sign_in_code_keys(connection, user);
-        if let Some(retry_after) = self.services.auth.attempt_limited(&what, &from) {
+        if let Some(retry_after) = self.services.auth.attempt_limited(&what, Some(&from)) {
             return Err(Error::RateLimited {
                 retry_after_ms: retry_after.as_millis() as u64,
             });
@@ -1115,7 +1129,7 @@ impl ClientProtocol {
     /// codes are short, so guessing them is limited as passwords are.
     fn wrong_sign_in_code(&self, connection: &Connection, user: &SessionUser) -> Error {
         let (what, from) = sign_in_code_keys(connection, user);
-        self.services.auth.attempt_failed(&what, &from);
+        self.services.auth.attempt_failed(&what, Some(&from));
         Error::NotFound {
             what: "sign-in code".into(),
         }
@@ -1161,8 +1175,8 @@ impl ClientProtocol {
 
     /// What `plan` needs to play as `handle`: the subtitle the client
     /// fetches beside it, the size of what it reads (0 while a conversion
-    /// writes it), and the conversion, started at `start` as epoch
-    /// `first_epoch`.
+    /// writes it), and the conversion, started at `start`. `replaces` is
+    /// the playback as it was, when this is a subtitle change.
     async fn prepare(
         &self,
         handle: &PlaybackHandle,
@@ -1170,7 +1184,7 @@ impl ClientProtocol {
         (path, descriptor): (&Path, &Arc<MediaDescriptor>),
         plan: &PlaybackPlan,
         start: Option<Duration>,
-        first_epoch: u32,
+        replaces: Option<&Playback>,
     ) -> Result<(Option<Sidecar>, u64, Option<Arc<Conversion>>), Error> {
         Ok(match plan {
             PlaybackPlan::Direct { subtitle, .. } => {
@@ -1254,6 +1268,17 @@ impl ClientProtocol {
                     }
                     _ => None,
                 };
+                // A new conversion's first epoch is past the old one's, so
+                // reads of the old one are told to start over. The old one
+                // runs until the new one has started, so the new one takes
+                // no slot of its own: it shares the old one's.
+                let replaced = replaces
+                    .and_then(|p| p.conversion.as_ref())
+                    .map(|c| c.job());
+                let first_epoch = match replaces {
+                    Some(_) => replaced.as_ref().map_or(0, |job| job.epoch) + 1,
+                    None => 0,
+                };
                 let transcoding = &self.services.transcoding;
                 let conversion = Conversion::start(
                     self.services.jobs.clone(),
@@ -1266,6 +1291,7 @@ impl ClientProtocol {
                         vaapi_device: &transcoding.settings().vaapi_device,
                         keyframes,
                         first_epoch,
+                        slot: replaced.and_then(|job| job.slot()),
                     },
                     start,
                 )
@@ -1545,7 +1571,10 @@ async fn segment_range(
     // The reader is at the end of the segment it waits for, as far as the
     // throttle is concerned, or the encode pauses just short of finishing
     // it.
-    job.reader_at(segments.start(wanted + 1).unwrap_or(segments.total_ms));
+    job.reader_at(
+        wanted,
+        segments.start(wanted + 1).unwrap_or(segments.total_ms),
+    );
     let now = wait_for(&job, keep_alive, |p| {
         p.last_segment.is_some_and(|l| l >= wanted) || p.done.is_some()
     })
@@ -1555,7 +1584,10 @@ async fn segment_range(
             reason: reason.clone(),
         });
     }
-    let complete = now.last_segment.is_some_and(|l| l >= wanted) || now.done.is_some();
+    // Not a segment removed meanwhile to make room: asked for again, the
+    // encode restarts there.
+    let complete = (now.last_segment.is_some_and(|l| l >= wanted) || now.done.is_some())
+        && (n == 0 || n >= job.first_kept());
     let name = if n == 0 {
         "init.mp4".to_owned()
     } else {

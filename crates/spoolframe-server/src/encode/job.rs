@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -53,29 +53,52 @@ pub enum JobError {
     Prepare(String),
 }
 
+/// One of the `max_jobs` places. A job that replaces another (a seek, a
+/// subtitle change) shares the place of the one it replaces, so nobody
+/// else can take it between the two; it is free once both have let go of
+/// it.
+#[derive(Debug, Clone)]
+pub struct Slot {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+/// The directory under `transcode.scratch_dir` that jobs write in. The
+/// server makes it, and it is the only thing there the server removes.
+pub const JOBS_DIR: &str = "spoolframe-jobs";
+
 /// The jobs of this server: the limit, and where they write.
 #[derive(Debug)]
 pub struct Jobs {
     limits: JobLimits,
+    /// [`JOBS_DIR`] in the scratch directory.
+    dir: PathBuf,
     ffmpeg: PathBuf,
     slots: Arc<Semaphore>,
+    /// Held by the job that looks at a full scratch directory and makes
+    /// room in it, so the next job to look sees what the first one freed.
+    scratch_check: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Jobs {
-    /// Jobs with `limits`, run with `ffmpeg`. The scratch directory is
-    /// emptied: whatever is there is a previous run's.
+    /// Jobs with `limits`, run with `ffmpeg`. The jobs' own directory in
+    /// the scratch directory is emptied: whatever is there is a previous
+    /// run's. Nothing else in the scratch directory is touched: it may be
+    /// a directory other things are kept in.
     pub fn new(limits: JobLimits, ffmpeg: PathBuf) -> std::io::Result<Self> {
-        match std::fs::remove_dir_all(&limits.scratch_dir) {
+        let dir = limits.scratch_dir.join(JOBS_DIR);
+        match std::fs::remove_dir_all(&dir) {
             Ok(()) => {
-                tracing::info!(dir = %limits.scratch_dir.display(), "removed leftover encodes")
+                tracing::info!(dir = %dir.display(), "removed leftover encodes")
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        std::fs::create_dir_all(&limits.scratch_dir)?;
+        std::fs::create_dir_all(&dir)?;
         Ok(Self {
             slots: Arc::new(Semaphore::new(limits.max_jobs)),
+            scratch_check: Arc::default(),
             limits,
+            dir,
             ffmpeg,
         })
     }
@@ -84,8 +107,18 @@ impl Jobs {
         &self.limits
     }
 
+    /// Where jobs write: a directory per playback handle in it.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Run ffmpeg with `args` into `dir` (created), which the job owns and
-    /// removes when dropped.
+    /// removes when dropped. It runs in `slot`, the place of the job it
+    /// replaces, or takes a free one.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one caller, which names each part"
+    )]
     pub fn start(
         &self,
         dir: PathBuf,
@@ -94,12 +127,19 @@ impl Jobs {
         epoch: u32,
         first_segment: u32,
         start_ms: u64,
+        slot: Option<Slot>,
     ) -> Result<Arc<EncodeJob>, JobError> {
-        let permit = self
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| JobError::Busy)?;
+        let slot = match slot {
+            Some(slot) => slot,
+            None => Slot {
+                _permit: Arc::new(
+                    self.slots
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| JobError::Busy)?,
+                ),
+            },
+        };
         std::fs::create_dir_all(&dir).map_err(|e| JobError::Prepare(e.to_string()))?;
         let mut child = tokio::process::Command::new(&self.ffmpeg)
             .args(&args)
@@ -114,6 +154,8 @@ impl Jobs {
         let shared = Arc::new(Shared {
             furthest_bytes: AtomicU64::new(0),
             reader_ms: AtomicU64::new(0),
+            reader_segment: AtomicU32::new(0),
+            first_kept: AtomicU32::new(first_segment),
             paused: AtomicBool::new(false),
         });
         let supervisor = Supervisor {
@@ -121,8 +163,9 @@ impl Jobs {
             start_ms,
             dir: dir.clone(),
             written,
-            scratch: self.limits.scratch_dir.clone(),
+            scratch: self.dir.clone(),
             scratch_limit: self.limits.scratch_limit_bytes,
+            scratch_check: self.scratch_check.clone(),
             read_ahead: self.limits.read_ahead,
             shared: shared.clone(),
             progress: progress_tx,
@@ -139,7 +182,7 @@ impl Jobs {
             progress,
             shared,
             task,
-            slot: std::sync::Mutex::new(Some(permit)),
+            slot: std::sync::Mutex::new(Some(slot)),
         }))
     }
 }
@@ -150,6 +193,11 @@ struct Shared {
     furthest_bytes: AtomicU64,
     /// For HLS: the media time of the furthest segment asked for.
     reader_ms: AtomicU64,
+    /// For HLS: the number of the furthest segment asked for.
+    reader_segment: AtomicU32,
+    /// For HLS: the first segment still on disk. Those before it were
+    /// never written by this run, or removed to make room.
+    first_kept: AtomicU32,
     paused: AtomicBool,
 }
 
@@ -165,12 +213,12 @@ pub struct EncodeJob {
     shared: Arc<Shared>,
     task: JoinHandle<()>,
     /// Held while ffmpeg may run; released by [`EncodeJob::stop`].
-    slot: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
+    slot: std::sync::Mutex<Option<Slot>>,
 }
 
 impl EncodeJob {
-    /// Kill ffmpeg now and free its slot, though readers may still hold
-    /// the job: a seek's next job needs the slot at once.
+    /// Kill ffmpeg now and let go of its slot, though readers may still
+    /// hold the job: one replaced at a seek must not encode on.
     pub fn stop(&self) {
         self.task.abort();
         if self.progress.borrow().done.is_none() {
@@ -180,6 +228,11 @@ impl EncodeJob {
             signal(self.pid, libc::SIGKILL);
         }
         self.slot.lock().expect("never poisoned").take();
+    }
+
+    /// The job's slot, for the job that replaces it; none once stopped.
+    pub fn slot(&self) -> Option<Slot> {
+        self.slot.lock().expect("never poisoned").clone()
     }
 
     pub fn dir(&self) -> &Path {
@@ -206,9 +259,18 @@ impl EncodeJob {
             .fetch_max(bytes, Ordering::Relaxed);
     }
 
-    /// A reader asked for an HLS segment starting at `ms` (media time).
-    pub fn reader_at(&self, ms: u64) {
+    /// A reader asked for HLS segment `n`, which ends at `ms` (media
+    /// time).
+    pub fn reader_at(&self, n: u32, ms: u64) {
+        self.shared.reader_segment.fetch_max(n, Ordering::Relaxed);
         self.shared.reader_ms.fetch_max(ms, Ordering::Relaxed);
+    }
+
+    /// For HLS, the first segment this run still has: the one it started
+    /// at, or a later one once a full scratch directory made it remove
+    /// those behind its reader.
+    pub fn first_kept(&self) -> u32 {
+        self.shared.first_kept.load(Ordering::Relaxed)
     }
 }
 
@@ -245,8 +307,10 @@ struct Supervisor {
     start_ms: u64,
     dir: PathBuf,
     written: Written,
+    /// The jobs' directory: what all jobs have written.
     scratch: PathBuf,
     scratch_limit: u64,
+    scratch_check: Arc<tokio::sync::Mutex<()>>,
     read_ahead: Duration,
     shared: Arc<Shared>,
     progress: watch::Sender<Progress>,
@@ -263,6 +327,8 @@ impl Supervisor {
         let mut err = BufReader::new(stderr).lines();
         let mut tail: VecDeque<String> = VecDeque::new();
         let mut encoded_ms = 0u64;
+        // What the job had written when it last looked.
+        let mut seen = 0u64;
         // With `-copyts` a run started at a seek reports the film's own
         // time, from where it started.
         let base_ms = self.start_ms;
@@ -301,11 +367,23 @@ impl Supervisor {
                         p.encoded_ms = encoded_ms;
                         p.last_segment = last_segment;
                     });
-                    if dir_size(&self.scratch) > self.scratch_limit {
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        self.finish(Err("the server's scratch space for conversions is full".into()));
-                        return;
+                    // Only a job that wrote since it last looked can be the
+                    // one that fills the scratch directory: a paused one
+                    // is left alone, whoever fills it.
+                    if bytes > seen {
+                        let _one_job_at_a_time = self.scratch_check.lock().await;
+                        if !self.make_room() {
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                            // Of no use now, and in the way of the other
+                            // jobs for as long as the playback lives.
+                            if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+                                tracing::warn!(dir = %self.dir.display(), error = %e, "cannot remove an encode's files");
+                            }
+                            self.finish(Err("the server's scratch space for conversions is full".into()));
+                            return;
+                        }
+                        seen = self.measure().0;
                     }
                 }
             }
@@ -342,6 +420,39 @@ impl Supervisor {
     fn finish(&self, done: Result<(), String>) {
         self.shared.paused.store(false, Ordering::Relaxed);
         self.progress.send_modify(|p| p.done = Some(done));
+    }
+
+    /// Whether the scratch directory is within its limit. When it is not,
+    /// an HLS job first removes its own segments behind its reader, the
+    /// oldest first, until it is (P2-03). The segment before the furthest
+    /// one asked for stays: a reader may still be fetching it.
+    fn make_room(&self) -> bool {
+        let mut total = dir_size(&self.scratch);
+        if total > self.scratch_limit && self.written == Written::Hls {
+            let behind = self
+                .shared
+                .reader_segment
+                .load(Ordering::Relaxed)
+                .saturating_sub(1);
+            let mut n = self.shared.first_kept.load(Ordering::Relaxed);
+            while total > self.scratch_limit && n < behind {
+                // Said first, so no reader takes the missing file for an
+                // empty segment.
+                self.shared.first_kept.store(n + 1, Ordering::Relaxed);
+                let file = self.dir.join(format!("seg{n}.m4s"));
+                let size = std::fs::metadata(&file).map_or(0, |m| m.len());
+                if std::fs::remove_file(&file).is_ok() {
+                    total = total.saturating_sub(size);
+                }
+                n += 1;
+            }
+            tracing::debug!(
+                pid = self.pid,
+                first_kept = n,
+                "segments behind the reader removed for room"
+            );
+        }
+        total <= self.scratch_limit
     }
 
     /// Bytes written, and for HLS the highest segment on disk.
@@ -402,7 +513,7 @@ impl Supervisor {
 }
 
 /// The bytes under `dir`, one level of subdirectories deep per handle and
-/// epoch: `scratch/<handle>/<epoch>/…`.
+/// epoch: `<jobs>/<handle>/<epoch>/…`.
 fn dir_size(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -515,8 +626,10 @@ mod tests {
             Duration::from_secs(60),
         )
         .await;
-        let dir = jobs.limits().scratch_dir.join("h/0");
-        let job = jobs.start(dir, Vec::new(), Written::Hls, 0, 0, 0).unwrap();
+        let dir = jobs.dir().join("h/0");
+        let job = jobs
+            .start(dir, Vec::new(), Written::Hls, 0, 0, 0, None)
+            .unwrap();
         assert_eq!(
             done(&job).await.unwrap_err(),
             "out.mkv: Invalid data found when processing input"
@@ -532,7 +645,7 @@ mod tests {
             Duration::from_secs(60),
         )
         .await;
-        let dir = jobs.limits().scratch_dir.join("h/0");
+        let dir = jobs.dir().join("h/0");
         let file = dir.join("out.mkv");
         let job = jobs
             .start(
@@ -542,6 +655,7 @@ mod tests {
                 0,
                 0,
                 0,
+                None,
             )
             .unwrap();
         done(&job).await.unwrap();
@@ -553,25 +667,25 @@ mod tests {
     #[tokio::test]
     async fn one_job_too_many_is_busy_until_one_stops() {
         let (jobs, _dir) = jobs("busy", "exec sleep 30", 1, Duration::from_secs(60)).await;
-        let scratch = jobs.limits().scratch_dir.clone();
+        let scratch = jobs.dir().to_path_buf();
         let first = jobs
-            .start(scratch.join("a/0"), Vec::new(), Written::Hls, 0, 0, 0)
+            .start(scratch.join("a/0"), Vec::new(), Written::Hls, 0, 0, 0, None)
             .unwrap();
         assert!(matches!(
-            jobs.start(scratch.join("b/0"), Vec::new(), Written::Hls, 0, 0, 0),
+            jobs.start(scratch.join("b/0"), Vec::new(), Written::Hls, 0, 0, 0, None),
             Err(JobError::Busy)
         ));
         first.stop();
-        jobs.start(scratch.join("b/0"), Vec::new(), Written::Hls, 0, 0, 0)
+        jobs.start(scratch.join("b/0"), Vec::new(), Written::Hls, 0, 0, 0, None)
             .unwrap();
     }
 
     #[tokio::test]
     async fn dropping_a_job_kills_ffmpeg_and_removes_its_files() {
         let (jobs, _dir) = jobs("drop", "exec sleep 30", 2, Duration::from_secs(60)).await;
-        let dir = jobs.limits().scratch_dir.join("h/0");
+        let dir = jobs.dir().join("h/0");
         let job = jobs
-            .start(dir.clone(), Vec::new(), Written::Hls, 0, 0, 0)
+            .start(dir.clone(), Vec::new(), Written::Hls, 0, 0, 0, None)
             .unwrap();
         let pid = job.pid();
         assert!(alive(pid));
@@ -592,7 +706,7 @@ mod tests {
             Duration::from_secs(10),
         )
         .await;
-        let dir = jobs.limits().scratch_dir.join("h/0");
+        let dir = jobs.dir().join("h/0");
         let file = dir.join("out.mkv");
         let job = jobs
             .start(
@@ -602,6 +716,7 @@ mod tests {
                 0,
                 0,
                 0,
+                None,
             )
             .unwrap();
         let pid = job.pid();
@@ -625,11 +740,98 @@ mod tests {
         assert!(!job.paused());
     }
 
+    /// Jobs running `body` as ffmpeg, which may write `scratch_limit`
+    /// bytes together.
+    async fn jobs_within(
+        test: &str,
+        body: &str,
+        scratch_limit: u64,
+    ) -> (Jobs, spoolframe_test_dir::TestDir) {
+        let tmp = scratch(test).await;
+        let root = tmp.as_ref().to_path_buf();
+        let bin = ffmpeg(&root.join("bin"), body);
+        let limits = JobLimits {
+            max_jobs: 2,
+            scratch_dir: root.join("scratch"),
+            scratch_limit_bytes: scratch_limit,
+            read_ahead: Duration::from_secs(60),
+        };
+        (Jobs::new(limits, bin).unwrap(), tmp)
+    }
+
+    const FULL: &str = "the server's scratch space for conversions is full";
+
+    #[tokio::test]
+    async fn the_job_that_fills_the_scratch_space_fails_and_no_other() {
+        // `quiet` writes 100 bytes and waits; the other writes on and on.
+        let (jobs, _dir) = jobs_within(
+            "full",
+            "if [ \"$2\" = quiet ]; then head -c 100 /dev/zero > \"$1\"; exec sleep 30; fi\n\
+             while :; do head -c 1000 /dev/zero >> \"$1\"; sleep 0.01; done",
+            20_000,
+        )
+        .await;
+        let start = |name: &str, mode: &str| {
+            let dir = jobs.dir().join(name).join("0");
+            let file = dir.join("out.mkv");
+            let args = vec![file.display().to_string(), mode.to_owned()];
+            let written = Written::Progressive { file: file.clone() };
+            (jobs.start(dir, args, written, 0, 0, 0, None).unwrap(), file)
+        };
+        let (quiet, kept) = start("a", "quiet");
+        let mut progress = quiet.progress();
+        progress.wait_for(|p| p.bytes == 100).await.unwrap();
+        let (greedy, removed) = start("b", "greedy");
+        assert_eq!(done(&greedy).await.unwrap_err(), FULL);
+        // What it wrote is gone, so the space is there for the others.
+        assert!(!removed.exists());
+        // Long enough for the other job to look at the scratch space.
+        tokio::time::sleep(POLL * 3).await;
+        assert_eq!(quiet.progress().borrow().done, None);
+        assert!(alive(quiet.pid()));
+        assert!(kept.exists());
+    }
+
+    #[tokio::test]
+    async fn a_full_scratch_space_takes_the_segments_behind_the_reader_first() {
+        // Eight segments of 1000 bytes, written once `go` is there.
+        let (jobs, _dir) = jobs_within(
+            "trim",
+            "while [ ! -e \"$1/go\" ]; do sleep 0.02; done\n\
+             for n in 1 2 3 4 5 6 7 8; do head -c 1000 /dev/zero > \"$1/seg$n.m4s\"; done\n\
+             exec sleep 30",
+            5_500,
+        )
+        .await;
+        let dir = jobs.dir().join("h/0");
+        let args = vec![dir.display().to_string()];
+        let job = jobs
+            .start(dir.clone(), args, Written::Hls, 0, 1, 0, None)
+            .unwrap();
+        // The reader asked for segment 7: 6 stays too, 1 to 5 may go.
+        job.reader_at(7, 42_000);
+        std::fs::write(dir.join("go"), b"").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while job.first_kept() == 1 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("no segment removed");
+        // 8000 bytes, 5500 allowed: the three oldest went, and no more.
+        assert_eq!(job.first_kept(), 4);
+        let left: Vec<bool> = (1..=8)
+            .map(|n| dir.join(format!("seg{n}.m4s")).exists())
+            .collect();
+        assert_eq!(left, [false, false, false, true, true, true, true, true]);
+        assert_eq!(job.progress().borrow().done, None);
+    }
+
     #[tokio::test]
     async fn leftovers_from_a_previous_run_are_removed() {
         let tmp = scratch("leftovers").await;
         let root = tmp.as_ref();
-        let old = root.join("scratch/oldhandle/0");
+        let old = root.join("scratch").join(JOBS_DIR).join("oldhandle/0");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("out.mkv"), b"stale").unwrap();
         let limits = JobLimits {
@@ -638,8 +840,31 @@ mod tests {
             scratch_limit_bytes: 1 << 30,
             read_ahead: Duration::from_secs(60),
         };
+        let jobs = Jobs::new(limits, "ffmpeg".into()).unwrap();
+        assert!(!jobs.dir().join("oldhandle").exists());
+        assert!(jobs.dir().is_dir());
+    }
+
+    /// `transcode.scratch_dir` may name a directory other things are in:
+    /// the state directory, the parent of the subtitle cache, a mount
+    /// other programs use. Once, all of it was removed at every start.
+    #[tokio::test]
+    async fn what_else_is_in_the_scratch_directory_is_left_alone() {
+        let tmp = scratch("not-ours").await;
+        let root = tmp.as_ref();
+        let key = root.join("state/endpoint.key");
+        let text = root.join("state/subtitles/film.vtt");
+        std::fs::create_dir_all(text.parent().unwrap()).unwrap();
+        std::fs::write(&key, b"secret").unwrap();
+        std::fs::write(&text, b"WEBVTT").unwrap();
+        let limits = JobLimits {
+            max_jobs: 1,
+            scratch_dir: root.join("state"),
+            scratch_limit_bytes: 1 << 30,
+            read_ahead: Duration::from_secs(60),
+        };
         Jobs::new(limits, "ffmpeg".into()).unwrap();
-        assert!(!root.join("scratch/oldhandle").exists());
-        assert!(root.join("scratch").is_dir());
+        assert_eq!(std::fs::read(&key).unwrap(), b"secret");
+        assert_eq!(std::fs::read(&text).unwrap(), b"WEBVTT");
     }
 }

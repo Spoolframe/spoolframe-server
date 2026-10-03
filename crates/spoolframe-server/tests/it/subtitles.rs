@@ -215,6 +215,40 @@ async fn a_text_track_the_client_cannot_show_arrives_converted_beside_the_file()
     server.stop().await;
 }
 
+/// The text made of a subtitle file beside the film is of the file as it
+/// is now: one edited in place is converted again.
+#[tokio::test]
+async fn a_subtitle_file_edited_in_place_is_converted_again() {
+    const FIXED: &str = "1\n00:00:02,000 --> 00:00:04,500\nHello there, again\n\n";
+    let server = TestServer::start_with(
+        fresh_dir("convert-edited").await,
+        ServerOptions {
+            real_media: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_media(10, "libx264", "aac");
+    server.write_ass_sidecar(SRT);
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    // SubRip, not ASS.
+    client.hello_with(None, Some(capabilities(false))).await;
+    let session = client.login("alice", "correct horse").await;
+    let (first, plan) = start(&client, &session, BitmapSubtitles::Auto).await;
+    assert!(
+        matches!(&plan, PlaybackPlan::Direct { subtitle, .. } if *subtitle == read_as_srt()),
+        "{plan:?}"
+    );
+    assert_eq!(text(&client, &session, &first).await, SRT);
+
+    server.write_ass_sidecar(FIXED);
+    let (second, _) = start(&client, &session, BitmapSubtitles::Auto).await;
+    assert_eq!(text(&client, &session, &second).await, FIXED);
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn a_subtitle_change_in_direct_play_changes_only_the_text() {
     let server = TestServer::start_with(

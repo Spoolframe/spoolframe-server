@@ -48,6 +48,8 @@ pub fn request_type(envelope: &[u8]) -> Option<String> {
     decode::<Envelope>(envelope).ok().map(|e| e.request.kind)
 }
 
+/// Write `value` as one frame. One over [`MAX_FRAME`] is refused before
+/// anything is written, so the writer can send something else instead.
 pub async fn write_frame<W, T>(writer: &mut W, value: &T) -> Result<(), CodecError>
 where
     W: AsyncWrite + Unpin,

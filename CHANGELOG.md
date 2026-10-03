@@ -389,3 +389,89 @@
   button), LAN discovery and addresses; Plex reachable or not, its name
   and each library's item count; and a path check of every file, with
   examples of the failures.
+- Failed logins on the admin API count per username and per caller's
+  address, not under one name shared by every caller: five wrong passwords
+  for any name used to lock everyone out of login, `me.setPassword` and
+  setup, for as long as someone kept guessing. A loopback address (the
+  CLI, an SSH tunnel, a proxy on this machine) is shared by all who come
+  through it, so it counts for no one, and only the username is limited
+  there (P1-11).
+- A login or a PIN counts against the failure limit from the moment its
+  check begins, and is taken back if it was right. Before, the limit was
+  read before the slow check and written after it, so many wrong
+  passwords or PINs sent at once were all checked: five tries per 15
+  minutes was as many as fit in one burst (P1-11, P2-08).
+- The failure limit forgets what it no longer needs: failures older than
+  15 minutes and names with none left are dropped, and a login under a
+  name no user can have (longer than 64 characters, or with other
+  characters) is refused at once and not counted. Before, every name
+  ever tried, up to 1 MiB each, was kept until the server stopped, so
+  anyone on the LAN could fill its memory (P1-11).
+- HLS of a copied video whose first keyframe is not at 0 lists the
+  segments ffmpeg writes. ffmpeg never cuts at the first keyframe, but the
+  playlist had a cut there: it listed one segment too many, each segment
+  held the time the playlist gave to the next, and the last was empty.
+  The first segment now runs from 0 to the second keyframe (P2-05).
+- A subtitle change in a converted playback needs no free conversion
+  slot: the new conversion runs in the slot of the one it replaces.
+  Before, it asked for a second slot while the first was still held, so
+  with `transcode.max_jobs = 1`, or with every slot in use, each change
+  was refused as busy (P2-03, P2-07).
+- A seek whose new encode cannot start leaves the playback playing. The
+  new encode starts in the slot of the one it replaces, and only then is
+  the old one stopped. Before, the old one was stopped first: its slot
+  could go to another viewer, and if the new encode did not start, the
+  playback kept a dead encode whose reads returned nothing, at once and
+  for ever (P2-03).
+- A full conversion scratch directory (`transcode.scratch_limit`) fails
+  one conversion, not all of them. Only a conversion that is writing can
+  be the one that fills it: an HLS one first removes its own segments
+  behind its reader, the oldest first (one asked for again is encoded
+  again), and if that is not enough it fails with `PlaybackFailed` and
+  its files are removed at once. Before, every conversion, paused ones
+  too, failed within a moment of the directory going over, and the files
+  stayed, so new conversions failed as well (P2-03).
+- A PGS file beside the film (`Movie.en.sup`) can be burned into the
+  video: its pictures are laid over the video, as an embedded PGS
+  track's are. Before, it went to the filter that draws text, ffmpeg
+  refused it, and a playback the server had offered failed. A VobSub
+  file beside the film (`.idx` and `.sub`) cannot be burned in: a plan
+  that would need that is now `Unsupported` and says why. Before, that
+  playback too started and then failed (P2-07).
+- At start the server removes only its own leftover conversions: they
+  are kept in a directory of their own, `spoolframe-jobs`, under
+  `transcode.scratch_dir`, and only that is emptied. Before, the whole
+  of `scratch_dir` was removed at every start, so a `scratch_dir` set to
+  the state directory, to the parent of the subtitle cache or to a
+  directory other programs use lost the server's key and database, the
+  subtitle texts or the other programs' files. `scratch_limit` counts
+  only what is in `spoolframe-jobs` (P2-03).
+- A short item is watched only at 90% of it. The "less than 5 minutes
+  left" rule now applies only to an item at least four times that long
+  (20 minutes), so it never marks an item watched before three quarters
+  of it. Before, a 4-minute clip was watched at its first progress report
+  and a 7-minute episode at 2:00 (P1-14).
+- The end of an item is written as seldom as the rest of it: once at the
+  crossing into watched, then at most once every 10 seconds. Before,
+  every progress report in the last 5 minutes (or last 10%) of an item
+  was a full write, however often the client sent them (P1-14).
+- The same film in two libraries (two items with the same external ids)
+  keeps a watch state for each copy. Before, to open one copy's page
+  moved the other copy's progress, and its "removed from Continue
+  watching", to it. State now moves to a new key only when the catalog
+  no longer has the old one, which is the re-added item re-linking is
+  for (P1-14).
+- A subtitle file beside the film that is edited in place is converted
+  again at the next playback. Before, the text made of it the first time
+  was served until the media file itself changed (P2-07).
+- During a playback the Plex watch sync runs at most once a minute.
+  A change in Spoolframe still starts a run 5 seconds later, but not
+  less than 60 seconds after the run before. Before, each progress
+  write (one every 10 seconds) started a run, and each run reads all
+  of Plex's watch state (PX-04).
+- A reply too large for one frame (1 MiB) is answered with the new
+  `Error::ReplyTooLarge { bytes }`, and the connection carries on.
+  Before, the stream ended with no response: a subtitle file beside the
+  film larger than 1 MiB could not be read and the client was not told
+  why. Such a subtitle still cannot be sent; now the client can say so.
+  An older client decodes the new error as `Unknown` (P1-10).

@@ -59,3 +59,5 @@ futures-util = { workspace = true }
 spoolframe-client-sdk = { workspace = true }
 # PGS tracks for the OCR tests.
 spoolframe-media = { workspace = true, features = ["fixtures"] }
+# Paused time, for the Plex sync's schedule.
+tokio = { workspace = true, features = ["test-util"] }

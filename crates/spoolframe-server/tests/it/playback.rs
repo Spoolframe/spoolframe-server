@@ -4,6 +4,7 @@ use crate::support;
 
 use std::time::Duration;
 
+use spoolframe_protocol::codec::MAX_FRAME;
 use spoolframe_protocol::{
     Error, MAX_READ, MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan, Reply,
     Request, Response, Selection, SessionId,
@@ -240,6 +241,50 @@ async fn a_selected_external_subtitle_is_read_whole() {
             .await,
         Response::Err(Error::NotFound { .. })
     ));
+    client.close().await;
+    server.stop().await;
+}
+
+/// A reply is one frame, and a frame has a size limit. A subtitle file
+/// over it is refused with the reason, and the connection carries on.
+#[tokio::test]
+async fn a_subtitle_too_large_for_a_frame_is_refused_with_the_reason() {
+    let (server, client, session) = ready("subtitle-too-large").await;
+    server.write_media(1000);
+    let sidecar = vec![b'a'; MAX_FRAME as usize + 1];
+    std::fs::write(server.media.with_extension("en.srt"), &sidecar).unwrap();
+    let Response::Ok(Reply::Tracks(tracks)) = client
+        .call(
+            Some(&session),
+            Request::Tracks {
+                id: movie().id().clone(),
+            },
+        )
+        .await
+    else {
+        panic!("no tracks");
+    };
+    let external = tracks.subtitles.iter().position(|s| s.external).unwrap() as u32;
+    let selection = Selection {
+        audio: None,
+        subtitle: Some(external),
+    };
+    let Response::Ok(Reply::PlaybackStarted { handle, .. }) =
+        start(&client, &session, selection).await
+    else {
+        panic!("did not start");
+    };
+    let response = client
+        .call(Some(&session), Request::ReadSubtitle { handle })
+        .await;
+    let Response::Err(Error::ReplyTooLarge { bytes }) = response else {
+        panic!("not refused: {response:?}");
+    };
+    assert!(bytes > sidecar.len() as u64, "{bytes}");
+    assert_eq!(
+        client.call(None, Request::Ping).await,
+        Response::Ok(Reply::Pong)
+    );
     client.close().await;
     server.stop().await;
 }

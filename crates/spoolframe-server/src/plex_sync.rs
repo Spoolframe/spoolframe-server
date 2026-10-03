@@ -29,6 +29,11 @@ const SAME_POSITION_MS: u64 = 30_000;
 /// progress reports is one run.
 const SETTLE: Duration = Duration::from_secs(5);
 
+/// The least time between a run and the next one a Spoolframe change
+/// asks for. A run reads all of Plex's watch state, and during a playback
+/// progress changes every few seconds.
+const CHANGE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// One side's state of one item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct State {
@@ -278,30 +283,54 @@ impl PlexSync {
 
     /// Run now, every interval, and shortly after this principal's state
     /// changes in Spoolframe, for as long as the server runs.
-    pub fn spawn(self: Arc<Self>, mut changes: tokio::sync::watch::Receiver<Option<Principal>>) {
+    pub fn spawn(self: Arc<Self>, changes: tokio::sync::watch::Receiver<Option<Principal>>) {
         tokio::spawn(async move {
-            loop {
-                match self.run(false).await {
-                    Ok(r) if r.pulled.is_empty() && r.pushed.is_empty() && r.failed.is_empty() => {}
-                    Ok(r) => tracing::info!(
-                        pulled = r.pulled.len(),
-                        pushed = r.pushed.len(),
-                        failed = r.failed.len(),
-                        "Plex watch sync"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "Plex watch sync; trying again later"),
-                }
-                tokio::select! {
-                    () = tokio::time::sleep(self.interval) => {}
-                    changed = wait_for(&mut changes, self.principal) => {
-                        if !changed {
-                            return;
-                        }
-                        tokio::time::sleep(SETTLE).await;
-                    }
-                }
-            }
+            schedule(self.interval, changes, self.principal, || self.run_logged()).await;
         });
+    }
+
+    async fn run_logged(&self) {
+        match self.run(false).await {
+            Ok(r) if r.pulled.is_empty() && r.pushed.is_empty() && r.failed.is_empty() => {}
+            Ok(r) => tracing::info!(
+                pulled = r.pulled.len(),
+                pushed = r.pushed.len(),
+                failed = r.failed.len(),
+                "Plex watch sync"
+            ),
+            Err(e) => tracing::warn!(error = %e, "Plex watch sync; trying again later"),
+        }
+    }
+}
+
+/// When the sync runs: now, every `interval`, and shortly after a change
+/// of `principal`'s state, until nothing can change any more. A change
+/// brings the next run forward to [`SETTLE`] after it, but to no sooner
+/// than [`CHANGE_INTERVAL`] after the run before.
+async fn schedule<F, Fut>(
+    interval: Duration,
+    mut changes: tokio::sync::watch::Receiver<Option<Principal>>,
+    principal: Principal,
+    mut run: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    loop {
+        run().await;
+        let ran = tokio::time::Instant::now();
+        let timer = ran + interval;
+        tokio::select! {
+            () = tokio::time::sleep_until(timer) => {}
+            changed = wait_for(&mut changes, principal) => {
+                if !changed {
+                    return;
+                }
+                let settled = tokio::time::Instant::now() + SETTLE;
+                let soonest = settled.max(ran + CHANGE_INTERVAL);
+                tokio::time::sleep_until(soonest.min(timer)).await;
+            }
+        }
     }
 }
 
@@ -483,6 +512,53 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    const ME: Principal = Principal::LocalUser(crate::store::users::LocalUserId(1));
+
+    /// Run [`schedule`] every 2 minutes; the seconds at which it ran.
+    fn scheduled() -> (
+        tokio::sync::watch::Sender<Option<Principal>>,
+        Arc<std::sync::Mutex<Vec<u64>>>,
+    ) {
+        let (changed, changes) = tokio::sync::watch::channel(None);
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ran = runs.clone();
+        let start = tokio::time::Instant::now();
+        tokio::spawn(schedule(Duration::from_secs(120), changes, ME, move || {
+            ran.lock().unwrap().push(start.elapsed().as_secs());
+            async {}
+        }));
+        (changed, runs)
+    }
+
+    /// A film playing: progress is written every 10 s. Each run reads all
+    /// of Plex's watch state, so it is not one run per write.
+    #[tokio::test(start_paused = true)]
+    async fn changes_all_through_a_playback_run_the_sync_once_a_minute() {
+        let (changed, runs) = scheduled();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for _ in 0..30 {
+            changed.send_replace(Some(ME));
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+        assert_eq!(*runs.lock().unwrap(), [0, 60, 120, 180, 240, 300]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_a_while_after_the_last_run_is_synced_within_seconds() {
+        let (changed, runs) = scheduled();
+        tokio::time::sleep(Duration::from_secs(70)).await;
+        changed.send_replace(Some(ME));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(*runs.lock().unwrap(), [0, 75]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_changes_the_sync_runs_every_interval() {
+        let (_changed, runs) = scheduled();
+        tokio::time::sleep(Duration::from_secs(250)).await;
+        assert_eq!(*runs.lock().unwrap(), [0, 120, 240]);
     }
 
     #[test]

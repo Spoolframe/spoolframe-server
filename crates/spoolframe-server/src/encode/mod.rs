@@ -18,7 +18,7 @@ use spoolframe_types::Delivery;
 
 use self::args::{EncodeSpec, Output, ffmpeg_args};
 use self::hls::Segments;
-use self::job::{EncodeJob, JobError, Jobs, Written};
+use self::job::{EncodeJob, JobError, Jobs, Slot, Written};
 
 /// What the server allows encodes (`transcode { … }`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,8 +26,8 @@ pub struct JobLimits {
     /// Encodes at once, copy-only ones too. One more is refused with
     /// `Busy`, never queued.
     pub max_jobs: usize,
-    /// Where jobs write. Emptied at start: anything there is a previous
-    /// run's.
+    /// Where jobs write, in a directory of their own
+    /// ([`job::JOBS_DIR`]). Only that is emptied at start.
     pub scratch_dir: PathBuf,
     /// The most all jobs may write together.
     pub scratch_limit_bytes: u64,
@@ -38,10 +38,14 @@ pub struct JobLimits {
 /// A playback's conversion: what to encode, and the encode running now.
 /// A seek replaces the job; dropping the conversion (the handle ended)
 /// stops it and removes everything it wrote.
+///
+/// The job that replaces another is started first, in the same slot, and
+/// only then is the old one stopped: a replacement that cannot start
+/// leaves the old one running, and the playback as it was.
 #[derive(Debug)]
 pub struct Conversion {
     jobs: Arc<Jobs>,
-    /// `scratch/<handle>`: the links to the input, and one directory per
+    /// `<jobs>/<handle>`: the links to the input, and one directory per
     /// epoch.
     dir: PathBuf,
     input: PathBuf,
@@ -77,6 +81,9 @@ pub struct ConversionSource<'a> {
     /// last for a conversion that replaces another (a subtitle change), so
     /// reads of the old one are told to start over.
     pub first_epoch: u32,
+    /// The slot of the conversion it replaces, which still runs: the two
+    /// share it, so a subtitle change needs no second one.
+    pub slot: Option<Slot>,
 }
 
 impl Conversion {
@@ -100,11 +107,8 @@ impl Conversion {
         // A replacing conversion gets a directory of its own: the one it
         // replaces removes its own when the last read of it ends.
         let dir = match source.first_epoch {
-            0 => jobs.limits().scratch_dir.join(source.handle),
-            epoch => jobs
-                .limits()
-                .scratch_dir
-                .join(format!("{}~{epoch}", source.handle)),
+            0 => jobs.dir().join(source.handle),
+            epoch => jobs.dir().join(format!("{}~{epoch}", source.handle)),
         };
         std::fs::create_dir_all(&dir).map_err(prepare)?;
         // Plain names for ffmpeg's filters (see `args::filter_path`).
@@ -158,6 +162,7 @@ impl Conversion {
             source.first_epoch,
             start,
             first_segment,
+            source.slot,
         );
         let job = match job {
             Ok(job) => job,
@@ -225,7 +230,8 @@ impl Conversion {
     }
 
     /// The job that writes HLS segment `n`: the running one, or, if `n` is
-    /// behind where it started or far past what it has written, a new one
+    /// behind where it started (or behind what it has kept, with the
+    /// scratch space full) or far past what it has written, a new one
     /// started at `n`.
     pub fn job_for_segment(&self, n: u32) -> Result<Arc<EncodeJob>, JobError> {
         let segments = self
@@ -235,13 +241,12 @@ impl Conversion {
         let mut current = self.current.lock().expect("never poisoned");
         let written = current.progress().borrow().last_segment;
         let head = written.unwrap_or(current.first_segment.saturating_sub(1));
-        if n >= current.first_segment && n <= head + SEGMENTS_AHEAD {
+        if n >= current.first_kept() && n <= head + SEGMENTS_AHEAD {
             return Ok(current.clone());
         }
         let start = segment_seek(segments, n, self.video);
         let epoch = current.epoch + 1;
-        current.stop();
-        *current = spawn(
+        let job = spawn(
             &self.jobs,
             &self.dir,
             &self.input,
@@ -253,7 +258,10 @@ impl Conversion {
             epoch,
             start,
             n,
+            current.slot(),
         )?;
+        current.stop();
+        *current = job;
         tracing::debug!(segment = n, epoch, "HLS encode restarted at a segment");
         Ok(current.clone())
     }
@@ -263,12 +271,11 @@ impl Conversion {
         self.current.lock().expect("never poisoned").clone()
     }
 
-    /// Stop the job and start the next epoch at `start` (progressive; HLS
+    /// Start the next epoch at `start` and stop the job (progressive; HLS
     /// restarts at a segment, [`Conversion::job_for_segment`]). Returns the
     /// new epoch.
     pub fn restart(&self, start: Duration, start_number: u32) -> Result<u32, JobError> {
         let mut current = self.current.lock().expect("never poisoned");
-        current.stop();
         let epoch = current.epoch + 1;
         let job = spawn(
             &self.jobs,
@@ -282,7 +289,9 @@ impl Conversion {
             epoch,
             Some(start),
             start_number,
+            current.slot(),
         )?;
+        current.stop();
         *current = job;
         Ok(epoch)
     }
@@ -328,7 +337,7 @@ type Parts = (
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "the two call sites name each part; a struct would only repeat them"
+    reason = "the call sites name each part; a struct would only repeat them"
 )]
 fn spawn(
     jobs: &Jobs,
@@ -342,6 +351,7 @@ fn spawn(
     epoch: u32,
     start: Option<Duration>,
     start_number: u32,
+    slot: Option<Slot>,
 ) -> Result<Arc<EncodeJob>, JobError> {
     let job_dir = dir.join(epoch.to_string());
     let (output, written) = match delivery {
@@ -379,7 +389,7 @@ fn spawn(
         0
     };
     let start_ms = start.map_or(0, |s| s.as_millis() as u64);
-    jobs.start(job_dir, args, written, epoch, first_segment, start_ms)
+    jobs.start(job_dir, args, written, epoch, first_segment, start_ms, slot)
 }
 
 #[cfg(test)]

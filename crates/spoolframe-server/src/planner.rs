@@ -473,6 +473,20 @@ fn converted(
             ..
         })
     );
+    // A VobSub file's pictures are in the `.sub` beside its `.idx`, which
+    // ffmpeg finds by the `.idx`'s name; the job reads its inputs through
+    // links with plain names, where it does not find it. Refused here,
+    // rather than a playback that starts and fails.
+    if burn_in
+        && let Some(ConvertedSubtitle { index, .. }) = subtitle
+        && let stream = &descriptor.subtitles[index as usize]
+        && matches!(stream.source, SubtitleSource::External { .. })
+        && codecs::subtitle_format(&stream.codec) == SubtitleFormat::VobSub
+    {
+        return Err(format!(
+            "subtitle {index}: a VobSub file beside the film cannot be burned into the video"
+        ));
+    }
 
     let audio = match audio {
         None => None,
@@ -1313,6 +1327,35 @@ mod tests {
                 &english(),
             )),
             ["subtitle 0: pgs not supported"]
+        );
+    }
+
+    #[test]
+    fn a_vobsub_file_beside_the_film_is_not_offered_burned_in() {
+        let mut film = dts_aac_pgs();
+        film.subtitles = vec![subtitle(
+            SubtitleSource::External {
+                path: PathBuf::from("/media/Movie.en.idx"),
+            },
+            "dvd_subtitle",
+        )];
+        let caps = ClientCapabilities {
+            delivery: vec![Delivery::Range, Delivery::Progressive],
+            ..caps()
+        };
+        let plan = with_mode(
+            &film,
+            &caps,
+            picked(1, Some(0)),
+            BitmapSubtitles::Auto,
+            &Ocr::disabled(),
+        );
+        let PlaybackPlan::Unsupported { reasons } = plan else {
+            panic!("offered: {plan:?}");
+        };
+        assert_eq!(
+            reasons.last().map(String::as_str),
+            Some("subtitle 0: a VobSub file beside the film cannot be burned into the video")
         );
     }
 

@@ -426,6 +426,115 @@ async fn a_seek_restarts_the_encode_in_a_new_epoch() {
     server.stop().await;
 }
 
+/// A state directory with a stand-in for ffmpeg that runs the real one,
+/// and can be removed so that the next encode cannot start.
+async fn removable_ffmpeg(test: &str) -> (crate::support::StateDir, PathBuf) {
+    let dir = fresh_dir(test).await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let ffmpeg = dir.join("removable-ffmpeg");
+    crate::support::write_script(&ffmpeg, "#!/bin/sh\nexec ffmpeg \"$@\"\n");
+    (dir, ffmpeg)
+}
+
+/// A seek once stopped the encode before it started the next. When the
+/// next could not start, the playback was left with a dead encode whose
+/// reads returned nothing, at once, for ever.
+#[tokio::test]
+async fn a_seek_that_cannot_start_leaves_the_playback_playing() {
+    let (dir, ffmpeg) = removable_ffmpeg("progressive-seek-failed").await;
+    let server = TestServer::start_with(
+        dir,
+        ServerOptions {
+            real_media: true,
+            max_jobs: 1,
+            ffmpeg: ffmpeg.clone(),
+            // Holds the job still, so it is surely running at the seek.
+            read_ahead: Duration::from_millis(500),
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_media(12, "libx264", "ac3");
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client
+        .hello_with(None, Some(progressive_capabilities()))
+        .await;
+    let session = client.login("alice", "correct horse").await;
+    let handle = started(&client, &session, None).await;
+    let file = output(&server, &handle);
+    until("the encode writes", Duration::from_secs(10), || {
+        file.exists()
+    })
+    .await;
+    std::fs::remove_file(&ffmpeg).unwrap();
+    let seeked = client
+        .call(
+            Some(&session),
+            Request::SeekPlayback {
+                handle: handle.clone(),
+                position_ms: 6_000,
+            },
+        )
+        .await;
+    assert!(
+        matches!(seeked, Response::Err(Error::PlaybackFailed { .. })),
+        "{seeked:?}"
+    );
+    // Epoch 0 still encodes, to its end.
+    let read = read_all(&client, &session, &handle, 0);
+    let (bytes, _) = tokio::time::timeout(Duration::from_secs(20), read)
+        .await
+        .expect("the first epoch is read to its end");
+    let (_, last) = probe(&write(&server, "kept.mkv", &bytes));
+    assert!((last - 12.0).abs() < 0.5, "last packet at {last}");
+    client.close().await;
+    server.stop().await;
+}
+
+/// The same for HLS, where a read of a far segment restarts the encode.
+#[tokio::test]
+async fn an_hls_restart_that_cannot_start_leaves_the_playback_playing() {
+    let (dir, ffmpeg) = removable_ffmpeg("hls-restart-failed").await;
+    let options = ServerOptions {
+        max_jobs: 1,
+        ffmpeg: ffmpeg.clone(),
+        ..ServerOptions::default()
+    };
+    let (server, client, session) = hls_ready_with(dir, hls_capabilities(), options).await;
+    let handle = started(&client, &session, None).await;
+    let init = server.job_dir(&handle, 0).join("init.mp4");
+    until("the encode writes", Duration::from_secs(10), || {
+        init.exists()
+    })
+    .await;
+    std::fs::remove_file(&ffmpeg).unwrap();
+    let (far, _) = client
+        .media(MediaRead {
+            session: session.clone(),
+            handle: handle.clone(),
+            offset: 0,
+            length: MAX_READ,
+            epoch: 0,
+            segment: Some(15),
+        })
+        .await;
+    assert!(
+        matches!(far, MediaReadResponse::Err(Error::PlaybackFailed { .. })),
+        "{far:?}"
+    );
+    // The first run still encodes: its first segment arrives.
+    let first = tokio::time::timeout(
+        Duration::from_secs(20),
+        segment(&client, &session, &handle, 1),
+    )
+    .await
+    .expect("segment 1 arrives");
+    assert!(!first.is_empty());
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn a_failed_encode_fails_its_reads_with_ffmpeg_s_reason() {
     let dir = fresh_dir("encode-failed").await;
@@ -657,6 +766,47 @@ async fn hls_plays_whole_with_a_read_ahead_shorter_than_a_segment() {
     server.stop().await;
 }
 
+/// A film longer than the scratch space holds: the encode removes the
+/// segments behind its reader to make room, and a segment asked for again
+/// after that is encoded again (P2-03).
+#[tokio::test]
+async fn hls_plays_whole_in_a_scratch_space_smaller_than_the_film() {
+    // At 8× real time the encode is still writing when the space fills;
+    // at full speed it would write the whole film before the first read.
+    let dir = fresh_dir("hls-small-scratch").await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let slow = dir.join("slow-ffmpeg");
+    crate::support::write_script(&slow, "#!/bin/sh\nexec ffmpeg -readrate 8 \"$@\"\n");
+    let options = ServerOptions {
+        ffmpeg: slow,
+        read_ahead: Duration::from_secs(2),
+        // The 40 s film's segments are about 4.5 MiB together.
+        scratch_limit: 2 << 20,
+        ..ServerOptions::default()
+    };
+    let (server, client, session) = hls_ready_with(dir, hls_capabilities(), options).await;
+    server.generate_media(40, "libx264", "ac3");
+    let handle = started(&client, &session, None).await;
+    let play = play_hls(&server, &client, &session, &handle, "small-scratch.mp4");
+    let (durations, (first, last)) = tokio::time::timeout(Duration::from_secs(60), play)
+        .await
+        .expect("every segment arrives");
+    assert_eq!(durations.len(), 20, "{durations:?}");
+    assert!(first < 0.1, "first packet at {first}");
+    assert!((last - 40.0).abs() < 0.5, "last packet at {last}");
+    // The first segment went to make room: it is encoded again.
+    assert!(!server.job_dir(&handle, 0).join("seg1.m4s").exists());
+    let again = tokio::time::timeout(
+        Duration::from_secs(20),
+        segment(&client, &session, &handle, 1),
+    )
+    .await
+    .expect("segment 1 arrives again");
+    assert!(!again.is_empty());
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn asking_for_a_late_segment_first_restarts_the_encode_there() {
     let (server, client, session) = hls_ready("hls-jump", hls_capabilities()).await;
@@ -670,6 +820,49 @@ async fn asking_for_a_late_segment_first_restarts_the_encode_there() {
     // The first run's files are gone; the new one is epoch 1.
     assert!(!server.job_dir(&handle, 0).exists());
     assert!(server.job_dir(&handle, 1).exists());
+    client.close().await;
+    server.stop().await;
+}
+
+/// Where each segment of `durations` starts, in seconds.
+fn segment_starts(durations: &[f32]) -> Vec<f64> {
+    durations
+        .iter()
+        .scan(0.0, |at, d| {
+            let start = *at;
+            *at += f64::from(*d);
+            Some(start)
+        })
+        .collect()
+}
+
+/// ffmpeg does not cut at the first keyframe it sees. A playlist with a
+/// cut there listed one segment more than ffmpeg wrote, and every segment
+/// held the time the playlist gave to the one after it.
+#[tokio::test]
+async fn hls_of_a_copied_video_with_a_late_first_keyframe_lists_what_ffmpeg_writes() {
+    let (server, client, session) = hls_ready("hls-late-keyframe", hls_capabilities()).await;
+    // 10 s, the first keyframe at about 0.5 s.
+    server.generate_media_with_late_video(10, "libx264", "ac3");
+    let handle = started(&client, &session, None).await;
+    let durations =
+        media_segments(&manifest(&client, &session, &handle, ManifestKind::Media).await);
+    let init = segment(&client, &session, &handle, 0).await;
+    let mut firsts = Vec::new();
+    for n in 1..=durations.len() as u32 {
+        let bytes = segment(&client, &session, &handle, n).await;
+        assert!(!bytes.is_empty(), "segment {n} of {durations:?} is empty");
+        let file = write(&server, "late.mp4", &[init.clone(), bytes].concat());
+        firsts.push(probe(&file).0);
+    }
+    // The first holds 0 to the second keyframe (2.5 s); then one per GOP.
+    assert_eq!(durations.len(), 5, "{durations:?}");
+    for (first, start) in firsts.iter().zip(segment_starts(&durations)) {
+        assert!(
+            (first - start).abs() < 0.1,
+            "segments start at {firsts:?}, the playlist says {durations:?}"
+        );
+    }
     client.close().await;
     server.stop().await;
 }
@@ -859,6 +1052,35 @@ async fn a_subtitle_change_restarts_a_converted_playback_where_it_is() {
     server.stop().await;
 }
 
+/// A subtitle change replaces the playback's conversion while it still
+/// holds its slot. The new one runs in that slot: it once asked for
+/// another, and with none free every change was refused as `Busy`.
+#[tokio::test]
+async fn a_subtitle_change_needs_no_second_slot() {
+    let options = ServerOptions {
+        max_jobs: 1,
+        ..ServerOptions::default()
+    };
+    let (server, tv, session) = ready("subtitle-change-slot", options, 12).await;
+    server.add_pgs(&[("Hello there", 1_000, 3_500)]);
+    let handle = started(&tv, &session, None).await;
+    let (_, epoch) = change(&tv, &session, &handle, Some(0), 4_000).await;
+    assert_eq!(epoch, 1);
+    // Still one slot, and the TV's playback holds it.
+    let desktop = server.client().await;
+    desktop
+        .hello_with(None, Some(progressive_capabilities()))
+        .await;
+    let other = desktop.login("alice", "correct horse").await;
+    assert!(matches!(
+        start(&desktop, &other, None).await,
+        Response::Err(Error::Busy)
+    ));
+    tv.close().await;
+    desktop.close().await;
+    server.stop().await;
+}
+
 /// One frame at `secs` of `file`, grey, 640×360.
 fn frame(file: &Path, secs: f64) -> Vec<u8> {
     let out = std::process::Command::new("ffmpeg")
@@ -933,5 +1155,88 @@ async fn a_burned_in_subtitle_shows_in_the_picture_where_it_was_placed() {
         "{after} pixels changed in the cue's box after it"
     );
     client.close().await;
+    server.stop().await;
+}
+
+/// Start the film at `start_ms` with a PGS file beside it burned in, and
+/// read it whole: the output, and the time of its first packet.
+async fn burned_pgs_sidecar(test: &str, start_ms: Option<u64>) -> (TestServer, PathBuf, f64) {
+    use spoolframe_protocol::{BitmapSubtitles, Selection};
+    let (server, client, session) = ready(test, unthrottled(), 6).await;
+    // The cue of the test above, in the same place.
+    server.write_pgs_sidecar(&[("Hello there", 1_000, 3_500)]);
+    let response = client
+        .call(
+            Some(&session),
+            Request::StartPlayback {
+                id: movie().id().clone(),
+                selection: Some(Selection {
+                    audio: Some(0),
+                    subtitle: Some(0),
+                }),
+                start_ms,
+                bitmap: BitmapSubtitles::BurnIn,
+            },
+        )
+        .await;
+    let Response::Ok(Reply::PlaybackStarted { handle, .. }) = response else {
+        panic!("no playback: {response:?}");
+    };
+    let read = read_all(&client, &session, &handle, 0);
+    let (bytes, _) = tokio::time::timeout(Duration::from_secs(30), read)
+        .await
+        .expect("the encode ends");
+    let burned = write(&server, "burned.mkv", &bytes);
+    let (first, _) = probe(&burned);
+    client.close().await;
+    (server, burned, first)
+}
+
+/// How many pixels of the cue's box differ between `burned` (whose first
+/// packet is at `first`) and the film, at `secs` of the film.
+fn in_cue_box(server: &TestServer, burned: &Path, first: f64, secs: f64) -> usize {
+    changed(
+        &frame(burned, secs - first),
+        &frame(&server.media, secs),
+        (213, 320, 427, 341),
+    )
+}
+
+/// A PGS file beside the film is burned in as an embedded PGS track is:
+/// its pictures laid over the video, at their own times. It once went to
+/// the filter that draws text, which refuses pictures, and the playback
+/// failed.
+#[tokio::test]
+async fn a_burned_in_pgs_file_beside_the_film_shows_in_the_picture() {
+    let (server, burned, first) = burned_pgs_sidecar("burn-in-sidecar", None).await;
+    // The cue is shown from 1 s to 3.5 s: late in it, and after it.
+    let during = in_cue_box(&server, &burned, first, 3.2);
+    assert!(
+        during > 100,
+        "only {during} pixels changed in the cue's box"
+    );
+    let after = in_cue_box(&server, &burned, first, 5.0);
+    assert!(
+        after < 20,
+        "{after} pixels changed in the cue's box after it"
+    );
+    server.stop().await;
+}
+
+/// Started in the middle of a cue, the cue is in the picture.
+#[tokio::test]
+async fn a_burned_in_pgs_file_shows_a_cue_that_began_before_the_start() {
+    let (server, burned, first) = burned_pgs_sidecar("burn-in-sidecar-seek", Some(2_000)).await;
+    assert!((1.5..=2.5).contains(&first), "first packet at {first}");
+    let during = in_cue_box(&server, &burned, first, 3.0);
+    assert!(
+        during > 100,
+        "only {during} pixels changed in the cue's box"
+    );
+    let after = in_cue_box(&server, &burned, first, 5.0);
+    assert!(
+        after < 20,
+        "{after} pixels changed in the cue's box after it"
+    );
     server.stop().await;
 }

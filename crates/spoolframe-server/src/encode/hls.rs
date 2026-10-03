@@ -13,7 +13,9 @@
 //!   counts its 6 s from where a run starts, so a restart at a keyframe off
 //!   the grid would cut elsewhere than a run from 0. Instead every keyframe
 //!   is a cut: the segments are the source's GOPs (1 to 10 s in practice),
-//!   the same whatever a run started from.
+//!   the same whatever a run started from. Only the first keyframe is not
+//!   one: ffmpeg never cuts at the first keyframe of a run, so the first
+//!   segment runs from 0 to the second keyframe.
 //! - Audio alone cuts anywhere: a 6 s grid.
 
 use std::fmt::Write as _;
@@ -43,11 +45,13 @@ impl Segments {
         Self::tidy((0..count).map(|i| i * step).collect(), total_ms)
     }
 
-    /// A cut at every keyframe. The first segment starts at 0 whatever the
-    /// first keyframe's time.
+    /// A cut at every keyframe but the first: the first segment starts at 0
+    /// whatever the first keyframe's time, and holds the first GOP whole,
+    /// as ffmpeg writes it.
     pub fn at_keyframes(keyframes: &[u64], total_ms: u64) -> Self {
         let mut starts_ms = vec![0];
-        starts_ms.extend(keyframes.iter().copied().filter(|&t| t > 0 && t < total_ms));
+        let later = keyframes.iter().skip(1).copied();
+        starts_ms.extend(later.filter(|&t| t > 0 && t < total_ms));
         Self::tidy(starts_ms, total_ms)
     }
 
@@ -352,11 +356,19 @@ mod tests {
 
     #[test]
     fn keyframes_are_the_cuts_and_the_first_segment_starts_at_zero() {
-        let s = Segments::at_keyframes(&[40, 2000, 4000, 9000], 10_000);
-        assert_eq!(s.starts_ms, [0, 40, 2000, 4000, 9000]);
+        let s = Segments::at_keyframes(&[0, 2000, 4000, 9000], 10_000);
+        assert_eq!(s.starts_ms, [0, 2000, 4000, 9000]);
         let playlist = s.media_playlist();
         // The longest is 5 s (4000 to 9000).
         assert!(playlist.contains("#EXT-X-TARGETDURATION:5\n"), "{playlist}");
+    }
+
+    /// ffmpeg's HLS muxer never cuts at the first keyframe it sees: its
+    /// first segment runs to the second one.
+    #[test]
+    fn a_late_first_keyframe_is_not_a_cut() {
+        let s = Segments::at_keyframes(&[520, 2520, 4520, 6520, 8520], 10_000);
+        assert_eq!(s.starts_ms, [0, 2520, 4520, 6520, 8520]);
     }
 
     #[test]
@@ -413,7 +425,7 @@ mod tests {
 
     #[test]
     fn the_subtitle_playlist_is_on_the_video_s_cuts() {
-        let s = Segments::at_keyframes(&[2000, 4000, 9000], 10_000);
+        let s = Segments::at_keyframes(&[0, 2000, 4000, 9000], 10_000);
         let subs = s.subtitle_playlist();
         assert!(!subs.contains("EXT-X-MAP"), "{subs}");
         match m3u8_rs::parse_playlist_res(subs.as_bytes()).unwrap() {

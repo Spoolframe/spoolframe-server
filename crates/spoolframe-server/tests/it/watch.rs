@@ -5,8 +5,10 @@ use crate::support;
 use std::time::Duration;
 
 use spoolframe_protocol::{HomeScreen, Reply, Request, Response, SessionId};
+use spoolframe_server::principal::Principal;
+use spoolframe_server::store::watch::WatchUpdate;
 use spoolframe_types::{Item, MediaId, PlaybackState};
-use support::{TestClient, TestServer, episode, movie};
+use support::{TestClient, TestServer, episode, movie, second_copy};
 
 async fn alice_and_bob(test: &str) -> (TestServer, TestClient, SessionId, SessionId) {
     let server = TestServer::start(test).await;
@@ -121,6 +123,27 @@ async fn fast_updates_are_coalesced() {
     server.stop().await;
 }
 
+/// The end of an item is throttled like the rest of it: one write at the
+/// crossing into watched, not one per report after it.
+#[tokio::test]
+async fn fast_updates_after_the_crossing_into_watched_are_coalesced() {
+    let (server, tv, alice, _) = alice_and_bob("throttle-watched").await;
+    let id = movie().id().clone();
+    progress(&tv, &alice, &id, 6900).await;
+    progress(&tv, &alice, &id, 6910).await;
+    progress(&tv, &alice, &id, 6920).await;
+    let rows = server
+        .store
+        .all_watch(principal(&server, "alice").await)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].watched);
+    assert_eq!(rows[0].position_ms, Some(6_900_000));
+    tv.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn continue_watching_is_newest_first() {
     let (server, tv, alice, _) = alice_and_bob("continue").await;
@@ -175,6 +198,88 @@ async fn next_up_follows_the_most_recently_watched_episode() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     mark_watched(&tv, &alice, episode("12", "11", 1, 1).id()).await;
     assert_eq!(ids(&home(&tv, &alice).await.next_up), ["plex:episode:13"]);
+    tv.close().await;
+    server.stop().await;
+}
+
+async fn principal(server: &TestServer, username: &str) -> Principal {
+    let user = server
+        .store
+        .password_login(username)
+        .await
+        .unwrap()
+        .unwrap();
+    Principal::LocalUser(user.id)
+}
+
+/// The same film in two libraries: two items with the same external ids.
+/// Each keeps its own state.
+#[tokio::test]
+async fn a_second_copy_of_a_film_does_not_take_the_first_copy_s_state() {
+    let (server, tv, alice, _) = alice_and_bob("two-copies").await;
+    let first = movie().id().clone();
+    let second = second_copy().id().clone();
+    progress(&tv, &alice, &first, 600).await;
+    assert_eq!(
+        state_of(&tv, &alice, &second).await,
+        PlaybackState::default()
+    );
+    assert_eq!(
+        state_of(&tv, &alice, &first).await.position,
+        Some(Duration::from_secs(600))
+    );
+    assert_eq!(
+        ids(&home(&tv, &alice).await.continue_watching),
+        [first.to_string()]
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_second_copy_of_a_film_does_not_take_the_first_copy_s_hide() {
+    let (server, tv, alice, _) = alice_and_bob("two-copies-hide").await;
+    let first = movie().id().clone();
+    progress(&tv, &alice, &first, 600).await;
+    hide(&tv, &alice, &first).await;
+    state_of(&tv, &alice, second_copy().id()).await;
+    let hidden = server
+        .store
+        .hidden(principal(&server, "alice").await)
+        .await
+        .unwrap();
+    assert_eq!(hidden, [first.to_string()].into());
+    tv.close().await;
+    server.stop().await;
+}
+
+/// Plex gave the film a new key: the state under the old one, which the
+/// catalog no longer has, moves when the item is looked at.
+#[tokio::test]
+async fn state_under_a_key_gone_from_the_catalog_moves_to_the_new_key() {
+    let (server, tv, alice, _) = alice_and_bob("relink").await;
+    let id = movie().id().clone();
+    let external_ids = [format!("test://{}", id.key())];
+    server
+        .store
+        .save_watch(
+            principal(&server, "alice").await,
+            WatchUpdate {
+                media_id: "plex:movie:99",
+                show_id: None,
+                external_ids: &external_ids,
+                position_ms: Some(600_000),
+                duration_ms: Some(7_020_000),
+                watched: false,
+                unhide: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        state_of(&tv, &alice, &id).await.position,
+        Some(Duration::from_secs(600))
+    );
     tv.close().await;
     server.stop().await;
 }
