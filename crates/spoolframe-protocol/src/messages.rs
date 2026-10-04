@@ -373,6 +373,10 @@ pub enum Reply {
         request: String,
         code: String,
         expires_in_ms: u64,
+        /// Where a browser approves it
+        /// ([`crate::device_sign_in::web_link`]), for a QR code a phone's
+        /// camera opens; `None` if the server's web UI has no public URL.
+        web_url: Option<String>,
     },
     /// Not approved yet: `AwaitDeviceSignIn` again.
     DeviceSignInPending,

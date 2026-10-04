@@ -47,6 +47,22 @@ pub mod error_code {
     pub const NO_SUCH_SESSION: i32 = -32013;
     /// Not a device the user has signed in from.
     pub const NO_SUCH_DEVICE: i32 = -32014;
+    /// A sensitive change (adding or removing a passkey, a first password)
+    /// in a session whose user last proved who they are more than 10
+    /// minutes ago: confirm with `me.confirmPassword` or `me.confirmPasskey`,
+    /// or sign in again.
+    pub const RECENT_SIGN_IN_REQUIRED: i32 = -32015;
+    /// Not one of the user's passkeys.
+    pub const NO_SUCH_PASSKEY: i32 = -32016;
+    /// Removing the user's last way to sign in.
+    pub const LAST_SIGN_IN_METHOD: i32 = -32017;
+    /// A passkey sign-in that did not sign anyone in: an unknown or removed
+    /// passkey, a request that is over, a signature that does not verify,
+    /// a disabled user. Deliberately one answer.
+    pub const PASSKEY_REFUSED: i32 = -32018;
+    /// Not a device sign-in code that can be approved: a typo, a guess, or
+    /// one already used or expired.
+    pub const NO_SUCH_SIGN_IN_CODE: i32 = -32019;
 }
 
 /// A username and password.
@@ -87,6 +103,46 @@ impl fmt::Debug for SetupRequest {
     }
 }
 
+/// The first admin's registration with a passkey and no password (P3-01,
+/// P3-05): the setup code and the username, as `SetupRequest` has them.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeySetupBegin {
+    pub code: String,
+    pub username: String,
+}
+
+impl fmt::Debug for PasskeySetupBegin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasskeySetupBegin")
+            .field("code", &"<redacted>")
+            .field("username", &self.username)
+            .finish()
+    }
+}
+
+/// Finishing it: the setup code again, so a request cannot outlive it, the
+/// `ceremony` from `setupPasskeyBegin`, what the passkey is called, and
+/// what the browser made (`RegistrationResponseJSON`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeySetupFinish {
+    pub code: String,
+    pub ceremony: String,
+    pub name: String,
+    pub credential: serde_json::Value,
+}
+
+impl fmt::Debug for PasskeySetupFinish {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasskeySetupFinish")
+            .field("code", &"<redacted>")
+            .field("ceremony", &"<redacted>")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A new API session.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,6 +179,17 @@ pub struct UserInfo {
     /// they have never signed in.
     #[serde(default)]
     pub last_seen_at: Option<i64>,
+    /// They have a passkey (P3-05): with `has_password`, how they can sign
+    /// in.
+    pub has_passkey: bool,
+    /// They have a profile PIN (P2-08): `admin.userClearPin` has
+    /// something to clear, and a device can be set to ask for it.
+    pub has_pin: bool,
+    /// The devices they have signed in from, as `admin.userDevices` lists
+    /// them.
+    pub device_count: u64,
+    /// Their live sessions, as `admin.userSessions` lists them.
+    pub session_count: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,7 +216,9 @@ impl fmt::Debug for NewUser {
 }
 
 /// A change of the caller's own password: the current one proves it is
-/// them, not someone holding their session.
+/// them, not someone holding their session. A user who has no password
+/// yet (passkeys only) proves it with a recent sign-in instead, and
+/// `current_password` is not read.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PasswordChange {
@@ -199,6 +268,66 @@ pub struct DeviceEntry {
     pub pin_required: bool,
 }
 
+/// Where passkeys work (P3-05): WebAuthn ties each one to a host, the
+/// relying party, which is the host of the server's `admin.public_url`, or
+/// `localhost` without one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyHost {
+    /// The relying-party ID: the host passkeys are bound to.
+    pub rp_id: String,
+    /// The one origin a browser can make or use them at; any port when
+    /// `rp_id` is `localhost`.
+    pub origin: String,
+}
+
+/// A passkey sign-in that was begun (P3-05), or a first admin's
+/// registration with one (`setupPasskeyBegin`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyChallenge {
+    /// Names the request when finishing it; of use once, for 5 minutes.
+    pub ceremony: String,
+    /// For a sign-in, what `navigator.credentials.get` takes, as JSON
+    /// (`{"publicKey": PublicKeyCredentialRequestOptionsJSON}`, binary
+    /// fields base64url). No credentials are listed: the browser offers
+    /// the passkeys it finds for this host. For a registration, what
+    /// `navigator.credentials.create` takes, as `me.passkeyAddBegin`
+    /// answers it.
+    pub options: serde_json::Value,
+}
+
+/// One of a user's passkeys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyEntry {
+    /// For `me.passkeyRename` and `me.passkeyRemove`: its credential id.
+    pub id: String,
+    /// What its user called it.
+    pub name: String,
+    /// Unix seconds.
+    pub created_at: i64,
+    /// `None` if it has never signed them in.
+    pub last_used_at: Option<i64>,
+    /// The host it was made for.
+    pub rp_id: String,
+    /// Whether that is the host the server is at now: one made for another
+    /// host (before `admin.public_url` changed) signs no one in.
+    pub usable: bool,
+}
+
+/// A device waiting to be signed in by someone approving its code (P3-07).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSignIn {
+    /// What the device calls itself; `None` if it gave no name.
+    pub device_name: Option<String>,
+    /// The app on it, e.g. `spoolframe-linux`.
+    pub client_name: String,
+    /// Unix seconds.
+    pub requested_at: i64,
+}
+
 /// What the server is and can do, for an admin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -231,6 +360,8 @@ pub struct PlexStatus {
     /// What the PMS calls itself.
     #[serde(default)]
     pub server_name: Option<String>,
+    /// Where the server reaches it: `plex.url`, without the token.
+    pub url: Option<String>,
     #[serde(default)]
     pub libraries: Vec<LibraryStatus>,
 }
@@ -302,6 +433,22 @@ pub trait MeApi {
     #[method(name = "login", with_extensions)]
     async fn login(&self, credentials: Credentials) -> jsonrpsee::core::RpcResult<LoggedIn>;
 
+    /// Begin signing in with a passkey, without a username (P3-05).
+    /// `NOT_CONFIGURED`, saying why, where the server has no passkeys.
+    #[method(name = "passkeyLoginBegin", with_extensions)]
+    async fn passkey_login_begin(&self) -> jsonrpsee::core::RpcResult<PasskeyChallenge>;
+
+    /// Finish it: `credential` is what the browser's passkey signed
+    /// (`AuthenticationResponseJSON`). The session is an ordinary one, as
+    /// `login` opens. A failure is `PASSKEY_REFUSED`, and counts in the
+    /// limit on failed logins (`RATE_LIMITED`).
+    #[method(name = "passkeyLoginFinish", with_extensions)]
+    async fn passkey_login_finish(
+        &self,
+        ceremony: String,
+        credential: serde_json::Value,
+    ) -> jsonrpsee::core::RpcResult<LoggedIn>;
+
     /// End the caller's session.
     #[method(name = "logout", with_extensions)]
     async fn logout(&self) -> jsonrpsee::core::RpcResult<()>;
@@ -311,6 +458,9 @@ pub trait MeApi {
     #[method(name = "whoAmI", with_extensions)]
     async fn who_am_i(&self) -> jsonrpsee::core::RpcResult<UserInfo>;
 
+    /// Change the caller's password, given the current one. A caller with
+    /// no password (passkeys only) sets their first one instead, which
+    /// needs a recent sign-in (`RECENT_SIGN_IN_REQUIRED`).
     #[method(name = "setPassword", with_extensions)]
     async fn set_password(&self, change: PasswordChange) -> jsonrpsee::core::RpcResult<()>;
 
@@ -344,6 +494,74 @@ pub trait MeApi {
         endpoint_id: String,
         required: bool,
     ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Prove again who the caller is, with their password: for the next 10
+    /// minutes the session may make sensitive changes
+    /// (`RECENT_SIGN_IN_REQUIRED`), as one just signed in may.
+    #[method(name = "confirmPassword", with_extensions)]
+    async fn confirm_password(&self, password: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// The device showing sign-in code `code` (P3-07), typed in any case,
+    /// with or without its dash, to ask "Sign in on '<device>'?" before
+    /// approving it. A code that is not pending is `NO_SUCH_SIGN_IN_CODE`,
+    /// and such codes are limited as failed logins are (`RATE_LIMITED`).
+    #[method(name = "deviceSignInLookup", with_extensions)]
+    async fn device_sign_in_lookup(&self, code: String)
+    -> jsonrpsee::core::RpcResult<DeviceSignIn>;
+
+    /// Sign that device in as the caller: it gets a session of its own. A
+    /// code is good once.
+    #[method(name = "deviceSignInApprove", with_extensions)]
+    async fn device_sign_in_approve(&self, code: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Refuse it: the device is told so.
+    #[method(name = "deviceSignInDeny", with_extensions)]
+    async fn device_sign_in_deny(&self, code: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// As `confirmPassword`, with one of the caller's own passkeys: begin
+    /// with `passkeyLoginBegin` (or `/auth/passkey/begin`), then pass what
+    /// the passkey signed. Another user's passkey is `PASSKEY_REFUSED`.
+    #[method(name = "confirmPasskey", with_extensions)]
+    async fn confirm_passkey(
+        &self,
+        ceremony: String,
+        credential: serde_json::Value,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// The host passkeys are bound to here; `NOT_CONFIGURED`, saying why,
+    /// where the server cannot offer them (plain HTTP on another host than
+    /// `localhost`).
+    #[method(name = "passkeyHost", with_extensions)]
+    async fn passkey_host(&self) -> jsonrpsee::core::RpcResult<PasskeyHost>;
+
+    /// The caller's passkeys, oldest first.
+    #[method(name = "passkeys", with_extensions)]
+    async fn passkeys(&self) -> jsonrpsee::core::RpcResult<Vec<PasskeyEntry>>;
+
+    /// Begin adding a passkey (P3-05). Needs a recent sign-in. The answer
+    /// is what `navigator.credentials.create` takes, as JSON
+    /// (`{"publicKey": PublicKeyCredentialCreationOptionsJSON}`, binary
+    /// fields base64url); the challenge is kept for this session for 5
+    /// minutes.
+    #[method(name = "passkeyAddBegin", with_extensions)]
+    async fn passkey_add_begin(&self) -> jsonrpsee::core::RpcResult<serde_json::Value>;
+
+    /// Finish adding it: `credential` is what the browser made
+    /// (`RegistrationResponseJSON`), `name` what the user calls it.
+    #[method(name = "passkeyAddFinish", with_extensions)]
+    async fn passkey_add_finish(
+        &self,
+        name: String,
+        credential: serde_json::Value,
+    ) -> jsonrpsee::core::RpcResult<PasskeyEntry>;
+
+    #[method(name = "passkeyRename", with_extensions)]
+    async fn passkey_rename(&self, id: String, name: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Remove one of the caller's passkeys. Needs a recent sign-in; their
+    /// last way to sign in stays (`LAST_SIGN_IN_METHOD`).
+    #[method(name = "passkeyRemove", with_extensions)]
+    async fn passkey_remove(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
 }
 
 /// Other users and the server: admins only.
@@ -365,13 +583,34 @@ pub trait AdminApi {
     #[method(name = "setup", with_extensions)]
     async fn setup(&self, request: SetupRequest) -> jsonrpsee::core::RpcResult<LoggedIn>;
 
+    /// Begin creating the first admin with a passkey instead of a password
+    /// (P3-01, P3-05), under the same rules as `setup`: no users yet, the
+    /// code from the server's log (`INVALID_SETUP_CODE`, limited as
+    /// `setup` is). `NOT_CONFIGURED`, saying why, where the server has no
+    /// passkeys.
+    #[method(name = "setupPasskeyBegin", with_extensions)]
+    async fn setup_passkey_begin(
+        &self,
+        request: PasskeySetupBegin,
+    ) -> jsonrpsee::core::RpcResult<PasskeyChallenge>;
+
+    /// Finish it: the admin is created with the passkey as their only way
+    /// to sign in, and signed in. `ALREADY_SET_UP` if another setup
+    /// finished first.
+    #[method(name = "setupPasskeyFinish", with_extensions)]
+    async fn setup_passkey_finish(
+        &self,
+        request: PasskeySetupFinish,
+    ) -> jsonrpsee::core::RpcResult<LoggedIn>;
+
     #[method(name = "userList", with_extensions)]
     async fn user_list(&self) -> jsonrpsee::core::RpcResult<Vec<UserInfo>>;
 
     #[method(name = "userAdd", with_extensions)]
     async fn user_add(&self, user: NewUser) -> jsonrpsee::core::RpcResult<UserInfo>;
 
-    /// Set anyone's password, without the current one.
+    /// Set anyone's password, without the current one; for a user with
+    /// passkeys only, that adds one.
     #[method(name = "userSetPassword", with_extensions)]
     async fn user_set_password(&self, credentials: Credentials) -> jsonrpsee::core::RpcResult<()>;
 
@@ -420,6 +659,22 @@ pub trait AdminApi {
     /// End one of a user's sessions, by its id from `userSessions`.
     #[method(name = "userRevokeSession", with_extensions)]
     async fn user_revoke_session(
+        &self,
+        username: String,
+        id: String,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A user's passkeys (P3-05). An admin can see and remove them, never
+    /// add one: only its user can.
+    #[method(name = "userPasskeys", with_extensions)]
+    async fn user_passkeys(
+        &self,
+        username: String,
+    ) -> jsonrpsee::core::RpcResult<Vec<PasskeyEntry>>;
+
+    /// Remove one of a user's passkeys, by its id from `userPasskeys`.
+    #[method(name = "userRemovePasskey", with_extensions)]
+    async fn user_remove_passkey(
         &self,
         username: String,
         id: String,

@@ -26,6 +26,9 @@ pub struct ApiSessionUser {
     pub user: LocalUserId,
     /// Read from the user on each request, so a change applies at once.
     pub role: Role,
+    /// When they last proved who they are in this session (Unix seconds):
+    /// at sign-in, or since ([`Store::confirm_session`]).
+    pub authenticated_at: i64,
 }
 
 /// The user behind a live endpoint session.
@@ -92,8 +95,9 @@ impl Store {
         };
         sqlx::query(
             "INSERT INTO sessions \
-               (token_hash, user_id, kind, endpoint_id, created_at, last_used_at, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+               (token_hash, user_id, kind, endpoint_id, created_at, last_used_at, \
+                authenticated_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6)",
         )
         .bind(token_hash)
         .bind(user.0)
@@ -113,8 +117,9 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<ApiSessionUser>, StoreError> {
-        let row: Option<(i64, String)> = sqlx::query_as(
-            "SELECT u.id, u.role FROM sessions s JOIN users u ON u.id = s.user_id \
+        let row: Option<(i64, String, i64)> = sqlx::query_as(
+            "SELECT u.id, u.role, s.authenticated_at \
+             FROM sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.token_hash = ?1 AND s.kind = 'api' AND s.revoked_at IS NULL \
                AND s.expires_at > ?2 AND u.disabled_at IS NULL",
         )
@@ -122,10 +127,34 @@ impl Store {
         .bind(now())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, stored)| ApiSessionUser {
+        Ok(row.map(|(id, stored, authenticated_at)| ApiSessionUser {
             user: LocalUserId(id),
             role: role(stored),
+            authenticated_at,
         }))
+    }
+
+    /// The session's user proved who they are again, now.
+    pub async fn confirm_session(&self, token_hash: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE sessions SET authenticated_at = ?2 WHERE token_hash = ?1")
+            .bind(token_hash)
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Make the session's sign-in `secs` older than it is.
+    #[cfg(test)]
+    pub(crate) async fn age_session(&self, token_hash: &str, secs: i64) {
+        sqlx::query(
+            "UPDATE sessions SET authenticated_at = authenticated_at - ?2 WHERE token_hash = ?1",
+        )
+        .bind(token_hash)
+        .bind(secs)
+        .execute(&self.pool)
+        .await
+        .unwrap();
     }
 
     /// The user of a live endpoint session used from `endpoint_id`: the
@@ -238,6 +267,32 @@ mod tests {
         );
         store.revoke_session("h").await.unwrap();
         assert_eq!(store.api_session("h").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_session_is_as_fresh_as_its_sign_in_or_its_last_confirmation() {
+        let (store, alice) = store_with_alice("fresh").await;
+        store
+            .create_session("h", alice, &SessionBinding::Api, now() + 3600)
+            .await
+            .unwrap();
+        let at = |store: &Store| {
+            let store = store.clone();
+            async move {
+                store
+                    .api_session("h")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .authenticated_at
+            }
+        };
+        let signed_in = at(&store).await;
+        assert!(now() - signed_in < 5);
+        store.age_session("h", 900).await;
+        assert_eq!(at(&store).await, signed_in - 900);
+        store.confirm_session("h").await.unwrap();
+        assert!(now() - at(&store).await < 5);
     }
 
     #[tokio::test]

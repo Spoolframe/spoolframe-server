@@ -191,7 +191,9 @@ in {
           Where browsers reach the web UI through a TLS reverse proxy: the
           only origin then allowed to sign in and use it. Left unset, a
           browser must be on the listener's own host (directly, or through
-          an SSH tunnel).
+          an SSH tunnel). Its host is also what passkeys are bound to
+          (`localhost` when unset): they need HTTPS, and changing the host
+          orphans the ones already made, which the log names at start.
         '';
       };
 

@@ -41,6 +41,13 @@ pub fn link(server: &str, code: &str) -> String {
     format!("{LINK_PREFIX}server={server}&code={code}")
 }
 
+/// The page of the web UI at `origin` (`https://media.example.org`) that
+/// approves `code`: what the QR code carries for a phone with a browser
+/// and no Spoolframe app (P3-05).
+pub fn web_link(origin: &str, code: &str) -> String {
+    format!("{origin}/auth/device?code={code}")
+}
+
 /// A link a phone scanned or was opened with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
@@ -110,6 +117,14 @@ mod tests {
                 server: SERVER.into(),
                 code: "BCDFGHJK".into()
             })
+        );
+    }
+
+    #[test]
+    fn a_web_link_is_the_approval_page_with_the_code() {
+        assert_eq!(
+            web_link("https://media.example.org", "BCDFGHJK"),
+            "https://media.example.org/auth/device?code=BCDFGHJK"
         );
     }
 

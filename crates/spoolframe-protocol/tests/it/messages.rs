@@ -235,6 +235,13 @@ fn every_reply_round_trips() {
             request: "r".into(),
             code: "BCDFGHJK".into(),
             expires_in_ms: 300_000,
+            web_url: Some("https://media.example.org/auth/device?code=BCDFGHJK".into()),
+        },
+        Reply::DeviceSignInStarted {
+            request: "r".into(),
+            code: "BCDFGHJK".into(),
+            expires_in_ms: 300_000,
+            web_url: None,
         },
         Reply::DeviceSignInPending,
         Reply::DeviceSignInRequest(spoolframe_protocol::DeviceSignInRequest {

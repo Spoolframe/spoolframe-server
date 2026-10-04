@@ -45,8 +45,15 @@ pub struct DeviceSignIn {
     pub code: String,
     /// The code as shown, large: `BCDF-GHJK`.
     pub display_code: String,
-    /// What to show as a QR code, for the phone's camera.
+    /// What to show as a QR code for a phone with the Spoolframe app:
+    /// `spoolframe://approve?server=…&code=…`.
     pub link: String,
+    /// What to show as a QR code for any phone: the page of the server's
+    /// web UI that approves this code, which its camera opens in a browser
+    /// (`https://media.example.org/auth/device?code=BCDFGHJK`). `None` if
+    /// the server's web UI has no public URL: then only `link` and the
+    /// code typed by hand can approve.
+    pub web_url: Option<String>,
     /// How long it can be approved, from when it began.
     pub expires_in: Duration,
     /// Only this device can collect the session with it.
@@ -460,7 +467,9 @@ impl Client {
                 request,
                 code,
                 expires_in_ms,
+                web_url,
             }) => Ok(DeviceSignIn {
+                web_url,
                 server: server.to_string(),
                 link: device_sign_in::link(&server.to_string(), &code),
                 display_code: device_sign_in::display(&code),

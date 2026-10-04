@@ -126,6 +126,12 @@ impl PlexCatalog {
         self
     }
 
+    /// Where the PMS is reached, as configured: no token, no trailing
+    /// slash.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     /// What the PMS calls itself; asking is also how to tell it is up.
     pub async fn server_name(&self) -> Result<Option<String>, CatalogError> {
         Ok(self.fetch(&Call::get("/")).await?.friendly_name)

@@ -14,6 +14,8 @@ mod encode;
 mod endpoint;
 mod lan;
 mod license_boundary;
+mod passkey_setup;
+mod passkeys;
 mod pin;
 mod playback;
 mod protocol;

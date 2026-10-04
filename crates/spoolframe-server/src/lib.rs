@@ -14,6 +14,7 @@ pub mod device_sign_in;
 pub mod encode;
 pub mod identity;
 pub mod network;
+pub mod passkeys;
 pub mod planner;
 pub mod playback;
 pub mod plex_sync;

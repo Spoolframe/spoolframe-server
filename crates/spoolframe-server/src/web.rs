@@ -3,47 +3,81 @@
 //! Built with `embed-web`, the server carries the `dx bundle` output named
 //! by `SPOOLFRAME_WEB_DIST` at compile time: `nix build` puts it there. A
 //! debug build reads that directory at run time instead (rust-embed's own
-//! behaviour), so `dx bundle` and a page reload are the whole loop. Without
-//! the feature there are no pages, and the server says so.
+//! behaviour), so `dx bundle` and a page reload are the whole loop. A
+//! debug build without the feature takes every page from `dx serve`
+//! ([`dev_server`]), hot reload included. A release build without it has
+//! no pages, and says so.
 
 use axum::body::Body;
+use axum::extract::Request;
+use axum::http::Response;
 #[cfg(feature = "embed-web")]
 use axum::http::header;
-use axum::http::{Response, StatusCode};
-use axum::response::IntoResponse;
+#[cfg(not(all(debug_assertions, not(feature = "embed-web"))))]
+use axum::{http::StatusCode, response::IntoResponse};
+
+#[cfg(all(debug_assertions, not(feature = "embed-web")))]
+mod dev_server;
 
 #[cfg(feature = "embed-web")]
 #[derive(rust_embed::RustEmbed)]
 #[folder = "$SPOOLFRAME_WEB_DIST"]
 struct Bundle;
 
+/// The web UI's pages, as this build has them.
+#[derive(Debug, Clone, Default)]
+pub struct Web {
+    #[cfg(all(debug_assertions, not(feature = "embed-web")))]
+    dev_server: dev_server::DevServer,
+}
+
+impl Web {
+    /// The answer to `req`, which no route of the listener took.
+    pub async fn page(&self, req: Request) -> Response<Body> {
+        #[cfg(feature = "embed-web")]
+        {
+            bundled(req.uri().path())
+        }
+        #[cfg(all(debug_assertions, not(feature = "embed-web")))]
+        {
+            self.dev_server.proxy(req).await
+        }
+        #[cfg(all(not(debug_assertions), not(feature = "embed-web")))]
+        {
+            let _ = req;
+            (
+                StatusCode::NOT_FOUND,
+                "the web UI is not built into this server",
+            )
+                .into_response()
+        }
+    }
+
+    /// Whether a WebSocket upgrade at `path` is the pages' rather than the
+    /// admin API's: dx serve's hot-reload socket, in a build that takes
+    /// its pages from dx serve. A build that cannot have it lets the API
+    /// answer every upgrade, as it always has.
+    pub fn takes_upgrade(&self, path: &str) -> bool {
+        cfg!(all(debug_assertions, not(feature = "embed-web"))) && path.starts_with("/_dioxus")
+    }
+}
+
 /// The file at `path`, or the app's page for any path that is not a file:
 /// the app routes `/admin`, `/login` and the rest itself.
-pub fn page(path: &str) -> Response<Body> {
-    #[cfg(feature = "embed-web")]
-    {
-        let path = path.trim_start_matches('/');
-        if let Some(file) = Bundle::get(path) {
-            return file_response(path, file);
-        }
-        // A missing file with an extension is a missing file, not a route.
-        let last = path.rsplit('/').next().unwrap_or_default();
-        if !last.contains('.')
-            && let Some(index) = Bundle::get("index.html")
-        {
-            return file_response("index.html", index);
-        }
-        (StatusCode::NOT_FOUND, "no such file").into_response()
+#[cfg(feature = "embed-web")]
+fn bundled(path: &str) -> Response<Body> {
+    let path = path.trim_start_matches('/');
+    if let Some(file) = Bundle::get(path) {
+        return file_response(path, file);
     }
-    #[cfg(not(feature = "embed-web"))]
+    // A missing file with an extension is a missing file, not a route.
+    let last = path.rsplit('/').next().unwrap_or_default();
+    if !last.contains('.')
+        && let Some(index) = Bundle::get("index.html")
     {
-        let _ = path;
-        (
-            StatusCode::NOT_FOUND,
-            "the web UI is not built into this server",
-        )
-            .into_response()
+        return file_response("index.html", index);
     }
+    (StatusCode::NOT_FOUND, "no such file").into_response()
 }
 
 #[cfg(feature = "embed-web")]
@@ -70,12 +104,16 @@ fn file_response(path: &str, file: rust_embed::EmbeddedFile) -> Response<Body> {
     response
 }
 
-#[cfg(all(test, not(feature = "embed-web")))]
+#[cfg(all(test, debug_assertions, not(feature = "embed-web")))]
 mod tests {
     use super::*;
 
     #[test]
-    fn without_the_bundle_every_page_says_so() {
-        assert_eq!(page("/admin").status(), StatusCode::NOT_FOUND);
+    fn only_dx_serve_s_own_socket_is_taken_from_the_api() {
+        let web = Web::default();
+        assert!(web.takes_upgrade("/_dioxus"));
+        // Where the CLI and the web UI open the admin API's socket.
+        assert!(!web.takes_upgrade("/"));
+        assert!(!web.takes_upgrade("/jsonrpc"));
     }
 }

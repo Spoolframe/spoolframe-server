@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use spoolframe_admin_api::{AdminApiClient, MeApiClient, NewUser, Role, error_code};
 
 use crate::admin::{CODE, anonymous, server, server_behind_a_proxy};
+use crate::support::logs;
 
 const PASSWORD: &str = "correct horse";
 
@@ -80,10 +81,15 @@ fn call_code(err: ClientError) -> i32 {
 
 /// The first admin, set up from a browser: their cookie.
 async fn set_up(addr: SocketAddr) -> String {
+    set_up_at(addr, &page(addr)).await
+}
+
+/// As [`set_up`], from a page at `origin`.
+async fn set_up_at(addr: SocketAddr, origin: &str) -> String {
     let response = post(
         addr,
         "/auth/setup",
-        Some(&page(addr)),
+        Some(origin),
         None,
         json!({ "code": CODE, "username": "root", "password": PASSWORD }),
     )
@@ -127,6 +133,30 @@ async fn a_browser_sets_up_the_first_admin_and_uses_the_socket_with_its_cookie()
     assert_eq!(again.status(), StatusCode::CONFLICT);
     let body: Value = again.json().await.unwrap();
     assert_eq!(body["code"], error_code::ALREADY_SET_UP);
+}
+
+/// What a page knows before anyone signs in: the server's name for its
+/// title, and the public URL to send a browser to when its own address
+/// cannot keep the session (plain HTTP on a real host).
+#[tokio::test]
+async fn a_signed_out_page_learns_the_server_s_name_and_public_url() {
+    let (addr, _dir) = server("web-site").await;
+    let site: Value = reqwest::get(format!("http://{addr}/auth/site"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(site, json!({ "name": "Den", "publicUrl": null }));
+    let (addr, _dir) =
+        crate::admin::server_at("web-site-public", "https://media.example.org").await;
+    let site: Value = reqwest::get(format!("http://{addr}/auth/site"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(site["publicUrl"], "https://media.example.org");
 }
 
 #[tokio::test]
@@ -294,4 +324,57 @@ async fn behind_a_trusted_proxy_the_failure_limit_counts_each_caller() {
         login_from(addr, "203.0.113.2", "root", PASSWORD).await,
         StatusCode::OK
     );
+}
+
+/// A browser's password sign-in, from a page at `origin` that reached the
+/// listener as `host`.
+async fn login_at(addr: SocketAddr, host: &str, origin: &str) -> StatusCode {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/auth/login"))
+        .header("host", host)
+        .header("origin", origin)
+        .json(&json!({ "username": "root", "password": PASSWORD }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// What the warning says, beside the page's origin.
+const DROPPED: &str = "the browser will drop the session cookie";
+
+/// The sign-in works on the server's side, and the browser throws the
+/// Secure cookie away: the log is the only place that can say so.
+#[tokio::test]
+async fn a_sign_in_from_a_plain_http_page_on_a_real_host_is_warned_about() {
+    logs::keep();
+    let (addr, _dir) = server("web-plain-http").await;
+    set_up(addr).await;
+    let status = login_at(addr, "192.168.86.10:7431", "http://192.168.86.10:7431").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(logs::has(&["http://192.168.86.10:7431", DROPPED]));
+}
+
+/// Browsers keep a Secure cookie from `http://localhost`, and from HTTPS.
+#[tokio::test]
+async fn a_sign_in_at_localhost_or_over_https_is_not_warned_about() {
+    logs::keep();
+    let (addr, _dir) = server("web-localhost").await;
+    set_up(addr).await;
+    let local = format!("localhost:{}", addr.port());
+    let status = login_at(addr, &local, &format!("http://{local}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!logs::has(&[&local, DROPPED]));
+
+    let (addr, _dir) =
+        crate::admin::server_at("web-https-sign-in", "https://plain-http-test.example.org").await;
+    set_up_at(addr, "https://plain-http-test.example.org").await;
+    let status = login_at(
+        addr,
+        &addr.to_string(),
+        "https://plain-http-test.example.org",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!logs::has(&["plain-http-test.example.org", DROPPED]));
 }

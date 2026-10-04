@@ -4,8 +4,11 @@
 
 use crate::support;
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
+use jsonrpsee::ws_client::WsClient;
+use spoolframe_admin_api::{MeApiClient, error_code};
 use spoolframe_protocol::{
     AuthMethod, DeviceSignInRequest, Error, Reply, Request, Response, SessionId,
 };
@@ -28,8 +31,16 @@ async fn tv_begins(server: &TestServer) -> (TestClient, String, String) {
             request,
             code,
             expires_in_ms,
+            web_url,
         }) => {
             assert!(expires_in_ms > 0);
+            // Where a browser approves it, if the server's web UI has a
+            // public URL.
+            let page = server
+                .public_url
+                .as_ref()
+                .map(|origin| format!("{origin}/auth/device?code={code}"));
+            assert_eq!(web_url, page);
             (tv, request, code)
         }
         other => panic!("not started: {other:?}"),
@@ -339,6 +350,213 @@ async fn a_device_has_few_codes_pending() {
         tv.call(None, Request::BeginDeviceSignIn).await,
         Response::Err(Error::RateLimited { .. })
     ));
+    tv.close().await;
+    server.stop().await;
+}
+
+/// Where browsers reach the web UI of the servers below.
+const WEB: &str = "https://media.example.org";
+
+/// A server whose web UI has a public URL, and its admin API: what a
+/// browser on a phone talks to.
+async fn server_with_web(test: &str, options: ServerOptions) -> (TestServer, SocketAddr) {
+    let server = server(
+        test,
+        ServerOptions {
+            public_url: Some(WEB.into()),
+            ..options
+        },
+    )
+    .await;
+    let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
+    (server, web)
+}
+
+/// Alice signed in to the web UI with her password.
+async fn alice_on_the_web(web: SocketAddr) -> WsClient {
+    let login = crate::admin::anonymous(web)
+        .await
+        .login(crate::admin::creds("alice", PASSWORD))
+        .await
+        .unwrap();
+    crate::admin::with_token(web, &login.token).await
+}
+
+/// The third of the user's cases: the app shows a QR code of the web
+/// UI's approval page, a phone's camera opens it, its user signs in
+/// there and approves. No Spoolframe app on the phone.
+#[tokio::test]
+async fn a_tv_approved_in_a_browser_gets_a_session_as_the_web_user() {
+    let (server, web) = server_with_web("dsi-web", ServerOptions::default()).await;
+    let (tv, request, code) = tv_begins(&server).await;
+    let alice = alice_on_the_web(web).await;
+
+    // The page asks whose code it is, as the QR code or a person gives it.
+    let typed = format!("{}-{}", &code[..4], &code[4..]).to_lowercase();
+    let device = alice.device_sign_in_lookup(typed.clone()).await.unwrap();
+    assert_eq!(device.device_name.as_deref(), Some("Living room TV"));
+    assert_eq!(device.client_name, "test");
+    assert!(device.requested_at > 0);
+
+    let waiting = tv_awaits(&tv, &request);
+    alice.device_sign_in_approve(typed).await.unwrap();
+    let session = match waiting.await.unwrap() {
+        Response::Ok(Reply::LoggedIn { session }) => session,
+        other => panic!("not signed in: {other:?}"),
+    };
+    // Alice's, on the TV, and one of her devices from now on.
+    match tv.call(Some(&session), Request::WhoAmI).await {
+        Response::Ok(Reply::WhoAmI(user)) => assert_eq!(user.username, "alice"),
+        other => panic!("{other:?}"),
+    }
+    let devices = alice.devices().await.unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].name.as_deref(), Some("Living room TV"));
+
+    // The code is spent.
+    assert_eq!(
+        crate::admin::code(
+            alice
+                .device_sign_in_approve(code.clone())
+                .await
+                .unwrap_err()
+        ),
+        error_code::NO_SUCH_SIGN_IN_CODE
+    );
+    assert_eq!(
+        crate::admin::code(alice.device_sign_in_lookup(code).await.unwrap_err()),
+        error_code::NO_SUCH_SIGN_IN_CODE
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+/// The iPhone's part of that case: its browser signs in with the phone's
+/// passkey, and that session approves.
+#[tokio::test]
+async fn a_web_session_made_with_a_passkey_approves_a_tv() {
+    use crate::passkeys::{Authenticator, add_passkey, cookie, sign_in_with};
+    assert_eq!(WEB, crate::passkeys::ORIGIN);
+    let (server, web) = server_with_web("dsi-web-passkey", ServerOptions::default()).await;
+    let mut iphone = Authenticator::new();
+    add_passkey(&alice_on_the_web(web).await, &mut iphone, "iPhone").await;
+    let (tv, request, code) = tv_begins(&server).await;
+
+    let signed_in = sign_in_with(web, &mut iphone).await;
+    let session = cookie(&signed_in);
+    let token = session.split_once('=').unwrap().1;
+    let alice = crate::admin::with_token(web, token).await;
+    let waiting = tv_awaits(&tv, &request);
+    alice.device_sign_in_approve(code).await.unwrap();
+    let session = match waiting.await.unwrap() {
+        Response::Ok(Reply::LoggedIn { session }) => session,
+        other => panic!("not signed in: {other:?}"),
+    };
+    match tv.call(Some(&session), Request::WhoAmI).await {
+        Response::Ok(Reply::WhoAmI(user)) => assert_eq!(user.username, "alice"),
+        other => panic!("{other:?}"),
+    }
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_tv_denied_in_a_browser_is_told_so() {
+    let (server, web) = server_with_web("dsi-web-deny", ServerOptions::default()).await;
+    let (tv, request, code) = tv_begins(&server).await;
+    let alice = alice_on_the_web(web).await;
+    alice.device_sign_in_deny(code.clone()).await.unwrap();
+    assert_eq!(
+        tv.call(None, Request::AwaitDeviceSignIn { request }).await,
+        Response::Err(Error::DeviceSignInDenied)
+    );
+    assert_eq!(
+        crate::admin::code(alice.device_sign_in_deny(code).await.unwrap_err()),
+        error_code::NO_SUCH_SIGN_IN_CODE
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn nobody_approves_in_a_browser_without_signing_in() {
+    let (server, web) = server_with_web("dsi-web-anonymous", ServerOptions::default()).await;
+    let (tv, _request, code) = tv_begins(&server).await;
+    let nobody = crate::admin::anonymous(web).await;
+    for refused in [
+        nobody.device_sign_in_lookup(code.clone()).await.map(|_| ()),
+        nobody.device_sign_in_approve(code.clone()).await,
+        nobody.device_sign_in_deny(code.clone()).await,
+    ] {
+        assert_eq!(
+            crate::admin::code(refused.unwrap_err()),
+            error_code::UNAUTHENTICATED
+        );
+    }
+    // Still pending: nothing was decided.
+    assert!(server.auth.sign_ins().lookup(&code).is_some());
+    tv.close().await;
+    server.stop().await;
+}
+
+/// Codes are short, so guessing them from a browser is limited as it is
+/// from a phone, and under the same count for the user.
+#[tokio::test]
+async fn wrong_codes_from_a_browser_are_limited() {
+    let (server, web) = server_with_web("dsi-web-limit", ServerOptions::default()).await;
+    let (tv, _request, code) = tv_begins(&server).await;
+    let alice = alice_on_the_web(web).await;
+    // Three wrong ones from the browser (one of them not a code at all),
+    // two from her phone.
+    for wrong in ["BBBB-BBBB", "CCCCCCCC", "not a code"] {
+        assert_eq!(
+            crate::admin::code(alice.device_sign_in_lookup(wrong.into()).await.unwrap_err()),
+            error_code::NO_SUCH_SIGN_IN_CODE
+        );
+    }
+    let (phone, session) = phone(&server).await;
+    for wrong in ["DDDDDDDD", "FFFFFFFF"] {
+        assert!(matches!(
+            phone
+                .call(
+                    Some(&session),
+                    Request::LookupDeviceSignIn { code: wrong.into() }
+                )
+                .await,
+            Response::Err(Error::NotFound { .. })
+        ));
+    }
+    // The sixth is not looked at, though the code is right.
+    for limited in [
+        alice.device_sign_in_lookup(code.clone()).await.map(|_| ()),
+        alice.device_sign_in_approve(code.clone()).await,
+        alice.device_sign_in_deny(code.clone()).await,
+    ] {
+        assert_eq!(
+            crate::admin::code(limited.unwrap_err()),
+            error_code::RATE_LIMITED
+        );
+    }
+    assert!(server.auth.sign_ins().lookup(&code).is_some());
+    tv.close().await;
+    phone.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_expired_code_is_not_approved_in_a_browser() {
+    let options = ServerOptions {
+        sign_in_lifetime: Duration::from_millis(300),
+        ..ServerOptions::default()
+    };
+    let (server, web) = server_with_web("dsi-web-expired", options).await;
+    let (tv, _request, code) = tv_begins(&server).await;
+    let alice = alice_on_the_web(web).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        crate::admin::code(alice.device_sign_in_approve(code).await.unwrap_err()),
+        error_code::NO_SUCH_SIGN_IN_CODE
+    );
     tv.close().await;
     server.stop().await;
 }

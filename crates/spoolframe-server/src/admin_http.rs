@@ -25,7 +25,10 @@ use jsonrpsee::Extensions;
 use jsonrpsee::server::{Methods, ServerHandle, StopHandle, stop_channel};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
-use spoolframe_admin_api::{AdminApiServer, Credentials, MeApiServer, SetupRequest, error_code};
+use spoolframe_admin_api::{
+    AdminApiServer, Credentials, LoggedIn, MeApiServer, PasskeySetupBegin, PasskeySetupFinish,
+    SetupRequest, error_code,
+};
 
 use crate::admin::{AdminApi, Bearer, Peer};
 use crate::auth::API_SESSION;
@@ -48,6 +51,15 @@ pub enum Origins {
 }
 
 impl Origins {
+    /// The web UI's public origin, if it has one: where a link to one of
+    /// its pages can point from another device.
+    pub fn public_url(&self) -> Option<&str> {
+        match self {
+            Origins::SameHost => None,
+            Origins::Exactly(origin) => Some(origin),
+        }
+    }
+
     /// Whether a request with these headers may act. Without `Origin` it
     /// is not a browser acting for another site (browsers send it on every
     /// POST and WebSocket upgrade): the CLI, curl.
@@ -227,22 +239,30 @@ fn router(
             Ok::<_, Infallible>(response)
         }
     });
+    let web = crate::web::Web::default();
     Router::new()
         .route("/auth/login", post(login))
+        .route("/auth/passkey/begin", post(passkey_begin))
+        .route("/auth/passkey/finish", post(passkey_finish))
         .route("/auth/setup", get(setup_open).post(setup))
+        .route("/auth/setup/passkey/begin", post(setup_passkey_begin))
+        .route("/auth/setup/passkey/finish", post(setup_passkey_finish))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        .route("/auth/site", get(site))
         .with_state(api)
         // The socket: `/jsonrpc` for the web UI, and any other path's
-        // upgrade too, which is where the CLI has always connected.
+        // upgrade too, which is where the CLI has always connected. Except
+        // dx serve's own in a debug build that takes its pages from it.
         .route_service("/jsonrpc", rpc.clone())
         .fallback_service(tower::service_fn(move |req: Request| {
             let mut rpc = rpc.clone();
+            let web = web.clone();
             async move {
-                if is_upgrade(req.headers()) {
+                if is_upgrade(req.headers()) && !web.takes_upgrade(req.uri().path()) {
                     return tower::Service::call(&mut rpc, req).await;
                 }
-                Ok::<_, Infallible>(crate::web::page(req.uri().path()))
+                Ok::<_, Infallible>(web.page(req).await)
             }
         }))
         .layer(middleware::from_fn_with_state(proxies, credentials))
@@ -330,24 +350,60 @@ fn clear_cookie() -> HeaderValue {
 /// the web UI reads both alike.
 fn failure(e: ErrorObjectOwned) -> Response<Body> {
     let status = match e.code() {
-        error_code::UNAUTHENTICATED | error_code::INVALID_CREDENTIALS => StatusCode::UNAUTHORIZED,
+        error_code::UNAUTHENTICATED
+        | error_code::INVALID_CREDENTIALS
+        | error_code::PASSKEY_REFUSED => StatusCode::UNAUTHORIZED,
         error_code::FORBIDDEN | error_code::INVALID_SETUP_CODE => StatusCode::FORBIDDEN,
         error_code::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
         error_code::ALREADY_SET_UP | error_code::USER_EXISTS => StatusCode::CONFLICT,
         error_code::INVALID_INPUT => StatusCode::BAD_REQUEST,
+        error_code::NOT_CONFIGURED => StatusCode::NOT_IMPLEMENTED,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let body = json!({ "code": e.code(), "message": e.message(), "data": e.data() });
     (status, axum::Json(body)).into_response()
 }
 
-/// Signed in: the cookie, and who.
-fn signed_in(token: &str, body: serde_json::Value) -> Response<Body> {
-    let mut response = axum::Json(body).into_response();
+/// Signed in: the cookie, and who. From a page the browser will not keep
+/// the cookie for, the sign-in looks to its user as if nothing happened,
+/// and only this log can say why.
+fn signed_in(headers: &HeaderMap, done: LoggedIn) -> Response<Body> {
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
+        && drops_secure_cookies(origin)
+    {
+        tracing::warn!(
+            username = %done.username,
+            origin,
+            "signed in from a plain HTTP page: the browser will drop the session cookie, so the \
+             sign-in will appear to do nothing; open the web UI over HTTPS (admin.public_url) or \
+             at http://localhost"
+        );
+    }
+    let mut response =
+        axum::Json(json!({ "username": done.username, "role": done.role })).into_response();
     response
         .headers_mut()
-        .insert(header::SET_COOKIE, set_cookie(token));
+        .insert(header::SET_COOKIE, set_cookie(&done.token));
     response
+}
+
+/// Whether a page at `origin` is one a browser keeps no `Secure` cookie
+/// for: plain HTTP on anything but loopback. `Origin` is the page's own
+/// scheme and host as the browser sees them, which `Host` and the
+/// listener's plain HTTP are not behind a TLS proxy.
+fn drops_secure_cookies(origin: &str) -> bool {
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(name)) => name != "localhost" && !name.ends_with(".localhost"),
+        Some(url::Host::Ipv4(ip)) => !ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => !ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// The JSON body as `T`, or why not (answered as a 400).
@@ -359,6 +415,7 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ErrorObjectOw
 async fn login(
     State(api): State<AdminApi>,
     Extension(peer): Extension<Peer>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
     let credentials: Credentials = match parse(&body) {
@@ -366,10 +423,46 @@ async fn login(
         Err(e) => return failure(e),
     };
     match MeApiServer::login(&api, &from(peer), credentials).await {
-        Ok(done) => signed_in(
-            &done.token,
-            json!({ "username": done.username, "role": done.role }),
-        ),
+        Ok(done) => signed_in(&headers, done),
+        Err(e) => failure(e),
+    }
+}
+
+/// Begin a passkey sign-in (P3-05): the ceremony and the options for the
+/// browser's `navigator.credentials.get`.
+async fn passkey_begin(
+    State(api): State<AdminApi>,
+    Extension(peer): Extension<Peer>,
+) -> Response<Body> {
+    match MeApiServer::passkey_login_begin(&api, &from(peer)).await {
+        Ok(challenge) => axum::Json(challenge).into_response(),
+        Err(e) => failure(e),
+    }
+}
+
+/// What finishes a passkey sign-in.
+#[derive(serde::Deserialize)]
+struct PasskeyAssertion {
+    ceremony: String,
+    credential: serde_json::Value,
+}
+
+/// Finish it: signed in as a password signs in, with the same cookie.
+async fn passkey_finish(
+    State(api): State<AdminApi>,
+    Extension(peer): Extension<Peer>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    let PasskeyAssertion {
+        ceremony,
+        credential,
+    } = match parse(&body) {
+        Ok(assertion) => assertion,
+        Err(e) => return failure(e),
+    };
+    match MeApiServer::passkey_login_finish(&api, &from(peer), ceremony, credential).await {
+        Ok(done) => signed_in(&headers, done),
         Err(e) => failure(e),
     }
 }
@@ -377,6 +470,7 @@ async fn login(
 async fn setup(
     State(api): State<AdminApi>,
     Extension(peer): Extension<Peer>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
     let request: SetupRequest = match parse(&body) {
@@ -384,21 +478,63 @@ async fn setup(
         Err(e) => return failure(e),
     };
     match AdminApiServer::setup(&api, &from(peer), request).await {
-        Ok(done) => signed_in(
-            &done.token,
-            json!({ "username": done.username, "role": done.role }),
-        ),
+        Ok(done) => signed_in(&headers, done),
+        Err(e) => failure(e),
+    }
+}
+
+/// Begin creating the first admin with a passkey (P3-01): the ceremony and
+/// the options for the browser's `navigator.credentials.create`.
+async fn setup_passkey_begin(
+    State(api): State<AdminApi>,
+    Extension(peer): Extension<Peer>,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    let request: PasskeySetupBegin = match parse(&body) {
+        Ok(r) => r,
+        Err(e) => return failure(e),
+    };
+    match AdminApiServer::setup_passkey_begin(&api, &from(peer), request).await {
+        Ok(challenge) => axum::Json(challenge).into_response(),
+        Err(e) => failure(e),
+    }
+}
+
+/// Finish it: the admin exists, signed in as `setup` signs them in.
+async fn setup_passkey_finish(
+    State(api): State<AdminApi>,
+    Extension(peer): Extension<Peer>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    let request: PasskeySetupFinish = match parse(&body) {
+        Ok(r) => r,
+        Err(e) => return failure(e),
+    };
+    match AdminApiServer::setup_passkey_finish(&api, &from(peer), request).await {
+        Ok(done) => signed_in(&headers, done),
         Err(e) => failure(e),
     }
 }
 
 /// `{"open": true}` while the first admin can still be set up: a signed-out
-/// browser shows setup rather than login.
+/// browser shows setup rather than login. `passkeysUnavailable` says why
+/// the server cannot make the admin a passkey, if it cannot: then the page
+/// offers a password only.
 async fn setup_open(State(api): State<AdminApi>) -> Response<Body> {
     match api.setup_open().await {
-        Ok(open) => axum::Json(json!({ "open": open })).into_response(),
+        Ok(open) => axum::Json(json!({
+            "open": open,
+            "passkeysUnavailable": api.passkeys_unavailable(),
+        }))
+        .into_response(),
         Err(e) => failure(e),
     }
+}
+
+/// The server's name and public URL, for a signed-out page.
+async fn site(State(api): State<AdminApi>) -> Response<Body> {
+    axum::Json(api.site()).into_response()
 }
 
 /// What a method called before there is a session gets, as the socket

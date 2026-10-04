@@ -14,7 +14,9 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use spoolframe_catalog::{CatalogError, Page};
 use spoolframe_media::{MediaDescriptor, SubtitleSource, SubtitleStream, codecs};
 use spoolframe_protocol::codec::{self, read_frame_bytes, write_frame};
-use spoolframe_protocol::device_sign_in::normalize as device_sign_in_code;
+use spoolframe_protocol::device_sign_in::{
+    normalize as device_sign_in_code, web_link as device_sign_in_web_link,
+};
 use spoolframe_protocol::streams::{bi, reset, uni};
 use spoolframe_protocol::{
     ArtworkReply, ArtworkRequest, ArtworkResponse, ChosenTracks, ConvertedSubtitle, MAX_READ,
@@ -228,6 +230,11 @@ impl ClientProtocol {
                 });
                 match started {
                     Some(started) => Ok(Reply::DeviceSignInStarted {
+                        web_url: self
+                            .services
+                            .public_url
+                            .as_deref()
+                            .map(|origin| device_sign_in_web_link(origin, &started.code)),
                         request: started.request,
                         code: started.code,
                         expires_in_ms: started.expires_in.as_millis() as u64,
@@ -1042,7 +1049,7 @@ impl ClientProtocol {
                 let code = self.sign_in_code(connection, &user, &code)?;
                 let approver = connection.remote_id().to_string();
                 let sign_ins = self.services.auth.sign_ins();
-                let claim = match sign_ins.claim(&code, &approver) {
+                let claim = match sign_ins.claim(&code, Some(&approver)) {
                     Ok(claim) => claim,
                     Err(ClaimError::Unknown) => {
                         return Err(self.wrong_sign_in_code(connection, &user));

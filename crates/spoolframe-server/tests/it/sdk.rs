@@ -13,7 +13,10 @@ use spoolframe_client_sdk::{
     MemoryStorage, PlaybackHandle, PlaybackOptions, PlaybackPlan, SdkError, Selection, Session,
     Storage,
 };
-use support::{TestServer, episode, library, markers, mkv_capabilities, movie, poster, show};
+use support::{
+    ServerOptions, TestServer, episode, fresh_dir, library, markers, mkv_capabilities, movie,
+    poster, show,
+};
 
 fn device(capabilities: ClientCapabilities) -> Device {
     Device {
@@ -651,6 +654,8 @@ async fn a_tv_is_signed_in_from_a_phone_by_its_qr_code() {
         sign_in.display_code,
         format!("{}-{}", &sign_in.code[..4], &sign_in.code[4..])
     );
+    // This server's web UI has no public URL: no page to point a camera at.
+    assert_eq!(sign_in.web_url, None);
     let waiting = {
         let tv = tv.clone();
         let sign_in = sign_in.clone();
@@ -679,5 +684,50 @@ async fn a_tv_is_signed_in_from_a_phone_by_its_qr_code() {
     );
     tv.close().await;
     phone.close().await;
+    server.stop().await;
+}
+
+/// The app's QR code for a phone without the app (P3-05): the web UI's
+/// approval page, opened in the phone's browser, signed in to there.
+#[tokio::test]
+async fn a_tv_is_signed_in_from_a_browser_by_its_web_qr_code() {
+    use spoolframe_admin_api::MeApiClient;
+    const WEB: &str = "https://media.example.org";
+    let options = ServerOptions {
+        public_url: Some(WEB.into()),
+        ..ServerOptions::default()
+    };
+    let server = TestServer::start_with(fresh_dir("sdk-device-sign-in-web").await, options).await;
+    server
+        .add_user("alice", "correct horse", Some("Alice"))
+        .await;
+    let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
+    let tv = client_on(&server, &Arc::new(MemoryStorage::default())).await;
+
+    let sign_in = tv.begin_device_sign_in(&id(&server)).await.unwrap();
+    let page = sign_in.web_url.clone().expect("a page to approve on");
+    assert_eq!(page, format!("{WEB}/auth/device?code={}", sign_in.code));
+    let waiting = {
+        let tv = tv.clone();
+        let sign_in = sign_in.clone();
+        tokio::spawn(async move { tv.await_device_sign_in(&sign_in).await })
+    };
+    // The phone's camera opens the page; its user signs in and approves
+    // the code the page was opened with.
+    let code = page.split_once("?code=").unwrap().1.to_owned();
+    let login = crate::admin::anonymous(web)
+        .await
+        .login(crate::admin::creds("alice", "correct horse"))
+        .await
+        .unwrap();
+    let alice = crate::admin::with_token(web, &login.token).await;
+    let device = alice.device_sign_in_lookup(code.clone()).await.unwrap();
+    assert_eq!(device.device_name.as_deref(), Some("living room"));
+    alice.device_sign_in_approve(code).await.unwrap();
+
+    let on_tv = waiting.await.unwrap().unwrap();
+    assert_eq!(on_tv.user().username, "alice");
+    on_tv.libraries().await.unwrap();
+    tv.close().await;
     server.stop().await;
 }

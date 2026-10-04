@@ -22,6 +22,14 @@ pub struct UserRecord {
     pub has_password: bool,
     /// When any of their sessions was last used.
     pub last_seen_at: Option<i64>,
+    pub has_passkey: bool,
+    pub has_pin: bool,
+    /// The devices they have signed in from (any session, revoked too),
+    /// as `user_devices` lists them.
+    pub device_count: u64,
+    /// Their live sessions: not revoked, not expired, as `list_sessions`
+    /// lists them.
+    pub session_count: u64,
 }
 
 /// What a password login needs about a user.
@@ -116,24 +124,12 @@ impl Store {
         username: &str,
         phc: &str,
     ) -> Result<LocalUserId, UserError> {
-        let name = normalize_username(username)?;
         let now = now();
         let mut tx = self.pool.begin().await?;
-        let inserted = sqlx::query(
-            "INSERT INTO users (username, role, created_at) \
-             SELECT ?1, 'admin', ?2 WHERE NOT EXISTS (SELECT 1 FROM users)",
-        )
-        .bind(&name)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        if inserted.rows_affected() == 0 {
-            return Err(UserError::AlreadySetUp);
-        }
-        let id = inserted.last_insert_rowid();
-        add_password(&mut tx, id, phc, now).await?;
+        let id = add_first_user(&mut tx, username, now).await?;
+        add_password(&mut tx, id.0, phc, now).await?;
         tx.commit().await?;
-        Ok(LocalUserId(id))
+        Ok(id)
     }
 
     /// Replace a user's password hash.
@@ -228,10 +224,18 @@ impl Store {
             "SELECT u.id, u.username, u.display_name, u.role, u.created_at, u.disabled_at, \
                     p.user_id IS NOT NULL AS has_password, \
                     (SELECT max(s.last_used_at) FROM sessions s WHERE s.user_id = u.id) \
-                        AS last_seen_at \
+                        AS last_seen_at, \
+                    EXISTS (SELECT 1 FROM passkeys k WHERE k.user_id = u.id) AS has_passkey, \
+                    EXISTS (SELECT 1 FROM pin_credentials c WHERE c.user_id = u.id) AS has_pin, \
+                    (SELECT count(DISTINCT s.endpoint_id) FROM sessions s \
+                     WHERE s.user_id = u.id) AS device_count, \
+                    (SELECT count(*) FROM sessions s \
+                     WHERE s.user_id = u.id AND s.revoked_at IS NULL AND s.expires_at > ?1) \
+                        AS session_count \
              FROM users u LEFT JOIN password_credentials p ON p.user_id = u.id \
              ORDER BY u.username",
         )
+        .bind(now())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -245,6 +249,10 @@ impl Store {
                     disabled_at: row.try_get("disabled_at")?,
                     has_password: row.try_get("has_password")?,
                     last_seen_at: row.try_get("last_seen_at")?,
+                    has_passkey: row.try_get("has_passkey")?,
+                    has_pin: row.try_get("has_pin")?,
+                    device_count: row.try_get::<i64, _>("device_count")? as u64,
+                    session_count: row.try_get::<i64, _>("session_count")? as u64,
                 })
             })
             .collect()
@@ -288,6 +296,28 @@ pub(crate) fn stored(role: Role) -> &'static str {
 /// A role as the database has it.
 pub(crate) fn role(stored: String) -> Role {
     stored.parse().unwrap_or(Role::Unknown)
+}
+
+/// Add `username` as an admin, in `tx`, only if there are no users yet: of
+/// two setups at once exactly one gets past this.
+pub(super) async fn add_first_user(
+    tx: &mut sqlx::SqliteConnection,
+    username: &str,
+    now: i64,
+) -> Result<LocalUserId, UserError> {
+    let name = normalize_username(username)?;
+    let inserted = sqlx::query(
+        "INSERT INTO users (username, role, created_at) \
+         SELECT ?1, 'admin', ?2 WHERE NOT EXISTS (SELECT 1 FROM users)",
+    )
+    .bind(&name)
+    .bind(now)
+    .execute(tx)
+    .await?;
+    if inserted.rows_affected() == 0 {
+        return Err(UserError::AlreadySetUp);
+    }
+    Ok(LocalUserId(inserted.last_insert_rowid()))
 }
 
 async fn add_password(

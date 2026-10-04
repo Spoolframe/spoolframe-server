@@ -313,7 +313,10 @@ pub struct AdminConfig {
     /// Where browsers reach the web UI, when it is behind a TLS proxy
     /// (P3-01): the only origin then allowed to sign in and use it. Left
     /// out, a browser must be on the listener's own host, as it is directly
-    /// or through an SSH tunnel.
+    /// or through an SSH tunnel. Its host is also what passkeys are bound
+    /// to (P3-05; `localhost` when left out): they need HTTPS, and one made
+    /// under one host works under no other, so changing this orphans them
+    /// (the log names each at start).
     #[ucl(default)]
     pub public_url: Option<String>,
     /// The reverse proxies in front of the listener, as addresses and CIDR

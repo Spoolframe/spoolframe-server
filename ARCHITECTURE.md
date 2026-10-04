@@ -850,13 +850,17 @@ Standard WebAuthn/passkeys are supported where practical while normal Internet/d
 
 However, passkeys are not the fundamental decentralized identity mechanism because WebAuthn relies on a relying-party domain model.
 
-Therefore Spoolframe retains:
+Therefore Spoolframe keeps available:
 
 - username/password
 - trusted-device authentication
 - explicit device pairing
 
-as independent fallback mechanisms.
+as independent fallback mechanisms. They are available, not required of
+every user: a user may sign in with a passkey alone (the user's decision,
+P3-05). The UI recommends a password or SSO next to a passkey, because a
+user, or a sole admin, who loses their only passkey has no other way in
+short of shell access to the server.
 
 Hardware security keys may continue to work locally where the WebAuthn/RP setup remains valid, but Spoolframe must not depend on that for offline survival.
 

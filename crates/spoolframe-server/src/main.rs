@@ -16,6 +16,7 @@ use spoolframe_server::config::ServerConfig;
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
 use spoolframe_server::network::{Server, Services};
+use spoolframe_server::passkeys::Passkeys;
 use spoolframe_server::plex_sync::PlexSync;
 use spoolframe_server::principal::Principal;
 use spoolframe_server::store::Store;
@@ -264,6 +265,20 @@ async fn run(config: &ServerConfig) -> Result<()> {
     let admin_listen = config.admin.listen()?;
     let admin_origins = config.admin.origins()?;
     let admin_proxies = config.admin.trusted_proxies()?;
+    let public_url = admin_origins.public_url().map(str::to_owned);
+    if !admin_listen.ip().is_loopback() && public_url.is_none() {
+        tracing::warn!(
+            listen = %admin_listen,
+            "admin.public_url is not set: browsers keep the session cookie only over HTTPS or at \
+             localhost, so signing in to the web UI at this address will appear to do nothing"
+        );
+    }
+    let passkeys = Arc::new(Passkeys::new(&admin_origins));
+    match (passkeys.rp_id(), passkeys.unavailable()) {
+        (Some(rp_id), _) => tracing::info!(rp_id, "passkeys are bound to this host"),
+        (None, why) => tracing::warn!(why, "no passkeys"),
+    }
+    passkeys.log_orphans(auth.store()).await?;
     // Only a server with no users offers setup, and only to someone who
     // can read this log.
     let setup_code = if auth.store().user_count().await? == 0 {
@@ -283,6 +298,7 @@ async fn run(config: &ServerConfig) -> Result<()> {
             status: status.clone(),
             plex_sync,
             plex: Some(plex.clone()),
+            passkeys,
         },
         admin_origins,
         admin_proxies,
@@ -295,6 +311,7 @@ async fn run(config: &ServerConfig) -> Result<()> {
         &config.network.endpoint_options()?,
         config.server_name(),
         Services {
+            public_url,
             auth,
             catalog,
             prober,

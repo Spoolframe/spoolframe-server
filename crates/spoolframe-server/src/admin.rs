@@ -15,7 +15,8 @@ use jsonrpsee::server::ServerHandle;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
 use spoolframe_admin_api::{
-    AdminApiServer, Credentials, DeviceEntry, LibraryStatus, LoggedIn, MeApiServer, NewUser,
+    AdminApiServer, Credentials, DeviceEntry, DeviceSignIn, LibraryStatus, LoggedIn, MeApiServer,
+    NewUser, PasskeyChallenge, PasskeyEntry, PasskeyHost, PasskeySetupBegin, PasskeySetupFinish,
     PasswordChange, PathFailures, PathReport, PlexStatus, PlexSyncReport, Role, ServerStatus,
     SessionEntry, SetupRequest, TranscodingStatus, UserInfo, error_code,
 };
@@ -24,8 +25,14 @@ use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
 
 pub use crate::admin_http::{Origins, TrustedProxies};
-use crate::auth::{Auth, LoginError, PasswordError, hash_password, hash_pin, valid_pin};
+use crate::auth::{
+    Auth, LoginError, PasswordError, RECENT_SIGN_IN, SessionToken, hash_password, hash_pin,
+    valid_pin,
+};
+use crate::device_sign_in::ClaimError;
+use crate::passkeys::{CeremonyError, Passkeys, SignInError};
 use crate::plex_sync::{PlexSync, SyncError};
+use crate::store::passkeys::{FirstPasskey, PasskeyError, PasskeyRecord, passkey_name};
 use crate::store::pins::{DeviceRecord, PinError};
 use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionRecord};
 use crate::store::users::{UserError, UserRecord, normalize_username};
@@ -190,6 +197,8 @@ pub struct Admin {
     pub plex_sync: Option<Arc<PlexSync>>,
     /// For `plexStatus` and `plexCheckPaths`; `None` in tests without one.
     pub plex: Option<Arc<PlexCatalog>>,
+    /// The relying party passkeys are bound to (P3-05).
+    pub passkeys: Arc<Passkeys>,
 }
 
 /// Start the admin API on `listen`. Browsers are let in from `origins`;
@@ -206,6 +215,8 @@ pub async fn serve(
         status: admin.status,
         plex_sync: admin.plex_sync,
         plex: admin.plex,
+        passkeys: admin.passkeys,
+        public_url: origins.public_url().map(str::to_owned),
     };
     let mut methods = AdminApiServer::into_rpc(api.clone());
     methods
@@ -221,6 +232,9 @@ pub(crate) struct AdminApi {
     status: Arc<StatusSource>,
     plex_sync: Option<Arc<PlexSync>>,
     plex: Option<Arc<PlexCatalog>>,
+    passkeys: Arc<Passkeys>,
+    /// Where browsers reach the web UI (`admin.public_url`), if anywhere.
+    public_url: Option<String>,
 }
 
 fn error(code: i32, message: impl Into<String>) -> ErrorObjectOwned {
@@ -273,7 +287,58 @@ impl From<PasswordError> for ErrorObjectOwned {
     }
 }
 
+impl From<PasskeyError> for ErrorObjectOwned {
+    fn from(e: PasskeyError) -> Self {
+        match &e {
+            PasskeyError::NoSuchPasskey => error(error_code::NO_SUCH_PASSKEY, e.to_string()),
+            PasskeyError::Exists | PasskeyError::InvalidName => {
+                error(error_code::INVALID_INPUT, e.to_string())
+            }
+            PasskeyError::LastSignInMethod => error(error_code::LAST_SIGN_IN_METHOD, e.to_string()),
+            PasskeyError::Store(_) => internal(e),
+        }
+    }
+}
+
+impl From<SignInError> for ErrorObjectOwned {
+    fn from(e: SignInError) -> Self {
+        match e {
+            SignInError::Refused => error(error_code::PASSKEY_REFUSED, e.to_string()),
+            SignInError::RateLimited { retry_after } => {
+                LoginError::RateLimited { retry_after }.into()
+            }
+            SignInError::Unavailable(why) => error(error_code::NOT_CONFIGURED, why),
+            SignInError::Internal(e) => internal(e),
+        }
+    }
+}
+
+impl From<CeremonyError> for ErrorObjectOwned {
+    fn from(e: CeremonyError) -> Self {
+        match e {
+            CeremonyError::Unavailable(why) => error(error_code::NOT_CONFIGURED, why),
+            CeremonyError::NoCeremony | CeremonyError::Refused(_) => {
+                error(error_code::INVALID_INPUT, e.to_string())
+            }
+            CeremonyError::Passkey(e) => e.into(),
+            CeremonyError::Internal(e) => internal(e),
+        }
+    }
+}
+
 impl AdminApi {
+    /// What a signed-out page shows and says: the server's name, and the
+    /// public URL to send a browser to when its own address cannot keep
+    /// the session cookie (plain HTTP on a real host).
+    pub(crate) fn site(&self) -> serde_json::Value {
+        json!({ "name": self.status.name, "publicUrl": self.public_url })
+    }
+
+    /// Why the server cannot offer passkeys, if it cannot.
+    pub(crate) fn passkeys_unavailable(&self) -> Option<&str> {
+        self.passkeys.unavailable()
+    }
+
     /// Whether `setup` would take a code now: no users, and a code was
     /// made at start. What a browser's first page decides on.
     pub(crate) async fn setup_open(&self) -> RpcResult<bool> {
@@ -281,6 +346,26 @@ impl AdminApi {
             return Ok(false);
         }
         Ok(self.auth.store().user_count().await? == 0)
+    }
+
+    /// Whether `given` is the setup code, while setup can be done at all;
+    /// guesses are limited as failed logins are, under one name.
+    fn setup_code(&self, ext: &Extensions, given: &str) -> RpcResult<()> {
+        let Some(code) = &self.setup_code else {
+            return Err(UserError::AlreadySetUp.into());
+        };
+        let source = source(ext)?;
+        if let Some(retry_after) = self.auth.attempt_limited("setup", source.as_deref()) {
+            return Err(LoginError::RateLimited { retry_after }.into());
+        }
+        if !code.matches(given) {
+            self.auth.attempt_failed("setup", source.as_deref());
+            return Err(error(
+                error_code::INVALID_SETUP_CODE,
+                "that is not the setup code in the server's log",
+            ));
+        }
+        Ok(())
     }
 
     /// The caller's live session, checked on every call so a revoked
@@ -306,6 +391,94 @@ impl AdminApi {
         }
     }
 
+    /// The caller, if they proved who they are in this session within
+    /// [`RECENT_SIGN_IN`] (P3-03): what a sensitive change needs, so a
+    /// session left open, or its stolen cookie, cannot make one.
+    async fn recently_signed_in(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
+        let (token, user) = self.caller(ext).await?;
+        let age = crate::store::now() - user.authenticated_at;
+        if age > RECENT_SIGN_IN.as_secs() as i64 {
+            return Err(error(
+                error_code::RECENT_SIGN_IN_REQUIRED,
+                "confirm it is you: enter your password, or sign in again",
+            ));
+        }
+        Ok((token, user))
+    }
+
+    /// The caller and `typed` as a device sign-in code (P3-07), if they
+    /// may try one now. Any live web session may: it was made by a full
+    /// sign-in, and the PIN lock (P2-08) is a device's, which a browser is
+    /// not. A malformed code is a wrong one.
+    async fn sign_in_code(
+        &self,
+        ext: &Extensions,
+        typed: &str,
+    ) -> RpcResult<(ApiSessionUser, String)> {
+        let (_, user) = self.caller(ext).await?;
+        let (what, from) = sign_in_code_keys(ext, user)?;
+        if let Some(retry_after) = self.auth.attempt_limited(&what, from.as_deref()) {
+            return Err(LoginError::RateLimited { retry_after }.into());
+        }
+        match spoolframe_protocol::device_sign_in::normalize(typed) {
+            Some(code) => Ok((user, code)),
+            None => Err(self.wrong_sign_in_code(ext, user)?),
+        }
+    }
+
+    /// Count a code that is not pending against `user` and where they
+    /// are: codes are short, so guessing them is limited as passwords are.
+    /// The answer for such a code; `Err` only if the request has no peer.
+    fn wrong_sign_in_code(
+        &self,
+        ext: &Extensions,
+        user: ApiSessionUser,
+    ) -> RpcResult<ErrorObjectOwned> {
+        let (what, from) = sign_in_code_keys(ext, user)?;
+        self.auth.attempt_failed(&what, from.as_deref());
+        Ok(error(
+            error_code::NO_SUCH_SIGN_IN_CODE,
+            "that is not a sign-in code a device is showing now",
+        ))
+    }
+
+    /// The account `user` is.
+    async fn account(&self, user: ApiSessionUser) -> RpcResult<UserRecord> {
+        self.auth
+            .store()
+            .user_by_id(user.user)
+            .await?
+            .ok_or_else(|| error(error_code::UNAUTHENTICATED, "session is not valid"))
+    }
+
+    /// A stored passkey as the API shows it.
+    fn passkey_entry(&self, p: PasskeyRecord) -> PasskeyEntry {
+        PasskeyEntry {
+            usable: self.passkeys.rp_id() == Some(p.rp_id.as_str()),
+            id: p.credential_id,
+            name: p.name,
+            created_at: p.created_at,
+            last_used_at: p.last_used_at,
+            rp_id: p.rp_id,
+        }
+    }
+
+    async fn passkey_entries(
+        &self,
+        user: crate::store::users::LocalUserId,
+    ) -> RpcResult<Vec<PasskeyEntry>> {
+        let passkeys = self
+            .auth
+            .store()
+            .list_passkeys(user)
+            .await
+            .map_err(internal)?;
+        Ok(passkeys
+            .into_iter()
+            .map(|p| self.passkey_entry(p))
+            .collect())
+    }
+
     async fn user_info(&self, username: &str) -> RpcResult<UserInfo> {
         let name = normalize_username(username)?;
         let users = self.auth.store().list_users().await?;
@@ -325,6 +498,19 @@ impl From<PinError> for ErrorObjectOwned {
             PinError::Store(_) => internal(e),
         }
     }
+}
+
+/// The failure limit's keys for device sign-in codes tried by `user` from
+/// a browser: the user's is the one their phone counts under too
+/// (`crate::client`), so both share one allowance.
+fn sign_in_code_keys(
+    ext: &Extensions,
+    user: ApiSessionUser,
+) -> RpcResult<(String, Option<String>)> {
+    Ok((
+        format!("devcode:{}", user.user.0),
+        source(ext)?.map(|address| format!("devcode@{address}")),
+    ))
 }
 
 fn device(d: DeviceRecord) -> DeviceEntry {
@@ -375,6 +561,10 @@ fn info(u: UserRecord) -> UserInfo {
         disabled: u.disabled_at.is_some(),
         has_password: u.has_password,
         last_seen_at: u.last_seen_at,
+        has_passkey: u.has_passkey,
+        has_pin: u.has_pin,
+        device_count: u.device_count,
+        session_count: u.session_count,
     }
 }
 
@@ -409,10 +599,58 @@ impl MeApiServer for AdminApi {
                 source.as_deref(),
             )
             .await?;
+        let username = normalize_username(&credentials.username)?;
+        tracing::info!(
+            username = %username,
+            peer = ?ext.get::<Peer>().and_then(|p| p.0),
+            "signed in with a password (API session)"
+        );
         Ok(LoggedIn {
             token: login.token.0,
-            username: normalize_username(&credentials.username)?,
+            username,
             role: login.role,
+        })
+    }
+
+    async fn passkey_login_begin(&self, _ext: &Extensions) -> RpcResult<PasskeyChallenge> {
+        let (ceremony, options) = self.passkeys.begin_sign_in()?;
+        Ok(PasskeyChallenge {
+            ceremony,
+            options: serde_json::to_value(options).map_err(internal)?,
+        })
+    }
+
+    async fn passkey_login_finish(
+        &self,
+        ext: &Extensions,
+        ceremony: String,
+        credential: serde_json::Value,
+    ) -> RpcResult<LoggedIn> {
+        let source = source(ext)?;
+        let signed = serde_json::from_value(credential).map_err(|e| {
+            error(
+                error_code::INVALID_INPUT,
+                format!("not what a browser's passkey signs: {e}"),
+            )
+        })?;
+        let user = self
+            .passkeys
+            .finish_sign_in(&self.auth, &ceremony, &signed, source.as_deref())
+            .await?;
+        let token = self
+            .auth
+            .open_api_session(user.id)
+            .await
+            .map_err(internal)?;
+        tracing::info!(
+            username = %user.username,
+            peer = ?ext.get::<Peer>().and_then(|p| p.0),
+            "signed in with a passkey (API session)"
+        );
+        Ok(LoggedIn {
+            token: token.0,
+            username: user.username,
+            role: user.role,
         })
     }
 
@@ -431,13 +669,17 @@ impl MeApiServer for AdminApi {
 
     async fn set_password(&self, ext: &Extensions, change: PasswordChange) -> RpcResult<()> {
         let (_, user) = self.caller(ext).await?;
-        let Some(me) = self.auth.store().user_by_id(user.user).await? else {
-            return Err(error(error_code::UNAUTHENTICATED, "session is not valid"));
-        };
-        let source = source(ext)?;
-        self.auth
-            .check_password(&me.username, &change.current_password, source.as_deref())
-            .await?;
+        let me = self.account(user).await?;
+        if me.has_password {
+            let source = source(ext)?;
+            self.auth
+                .check_password(&me.username, &change.current_password, source.as_deref())
+                .await?;
+        } else {
+            // Set up with a passkey, with no password to prove it is them:
+            // a recent sign-in does, as for adding a passkey.
+            self.recently_signed_in(ext).await?;
+        }
         let phc = hash_password(&change.new_password).await?;
         self.auth.store().set_password(&me.username, &phc).await?;
         tracing::info!(username = %me.username, "password changed by its user");
@@ -504,6 +746,174 @@ impl MeApiServer for AdminApi {
             .await?)
     }
 
+    async fn confirm_password(&self, ext: &Extensions, password: String) -> RpcResult<()> {
+        let (token, user) = self.caller(ext).await?;
+        let me = self.account(user).await?;
+        let source = source(ext)?;
+        self.auth
+            .check_password(&me.username, &password, source.as_deref())
+            .await?;
+        self.auth
+            .store()
+            .confirm_session(&SessionToken(token).hash())
+            .await
+            .map_err(internal)
+    }
+
+    async fn device_sign_in_lookup(
+        &self,
+        ext: &Extensions,
+        code: String,
+    ) -> RpcResult<DeviceSignIn> {
+        let (user, code) = self.sign_in_code(ext, &code).await?;
+        match self.auth.sign_ins().lookup(&code) {
+            Some(waiting) => Ok(DeviceSignIn {
+                device_name: waiting.device_name,
+                client_name: waiting.client_name,
+                requested_at: waiting.requested_at,
+            }),
+            None => Err(self.wrong_sign_in_code(ext, user)?),
+        }
+    }
+
+    async fn device_sign_in_approve(&self, ext: &Extensions, code: String) -> RpcResult<()> {
+        let (user, code) = self.sign_in_code(ext, &code).await?;
+        let sign_ins = self.auth.sign_ins();
+        // No endpoint approves here: a web session is never the device
+        // that waits.
+        let claim = match sign_ins.claim(&code, None) {
+            Ok(claim) => claim,
+            Err(ClaimError::Unknown | ClaimError::SameDevice) => {
+                return Err(self.wrong_sign_in_code(ext, user)?);
+            }
+        };
+        match self.auth.approve_device(user.user, &claim).await {
+            Ok(token) => {
+                sign_ins.fulfil(&claim.request, Some(token));
+                tracing::info!(
+                    user = user.user.0,
+                    device = %claim.endpoint,
+                    "device sign-in approved from the web"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                sign_ins.fulfil(&claim.request, None);
+                Err(internal(e))
+            }
+        }
+    }
+
+    async fn device_sign_in_deny(&self, ext: &Extensions, code: String) -> RpcResult<()> {
+        let (user, code) = self.sign_in_code(ext, &code).await?;
+        if self.auth.sign_ins().deny(&code) {
+            tracing::info!(user = user.user.0, "device sign-in denied from the web");
+            Ok(())
+        } else {
+            Err(self.wrong_sign_in_code(ext, user)?)
+        }
+    }
+
+    async fn confirm_passkey(
+        &self,
+        ext: &Extensions,
+        ceremony: String,
+        credential: serde_json::Value,
+    ) -> RpcResult<()> {
+        let (token, user) = self.caller(ext).await?;
+        let source = source(ext)?;
+        let signed = serde_json::from_value(credential).map_err(|e| {
+            error(
+                error_code::INVALID_INPUT,
+                format!("not what a browser's passkey signs: {e}"),
+            )
+        })?;
+        let signer = self
+            .passkeys
+            .finish_sign_in(&self.auth, &ceremony, &signed, source.as_deref())
+            .await?;
+        if signer.id != user.user {
+            tracing::warn!(
+                user = user.user.0,
+                passkey_of = %signer.username,
+                "a passkey of another user's was offered as a confirmation"
+            );
+            return Err(SignInError::Refused.into());
+        }
+        self.auth
+            .store()
+            .confirm_session(&SessionToken(token).hash())
+            .await
+            .map_err(internal)
+    }
+
+    async fn passkey_host(&self, ext: &Extensions) -> RpcResult<PasskeyHost> {
+        self.caller(ext).await?;
+        let (rp_id, origin) = self.passkeys.host()?;
+        Ok(PasskeyHost {
+            rp_id: rp_id.to_owned(),
+            origin: origin.to_owned(),
+        })
+    }
+
+    async fn passkeys(&self, ext: &Extensions) -> RpcResult<Vec<PasskeyEntry>> {
+        let (_, user) = self.caller(ext).await?;
+        self.passkey_entries(user.user).await
+    }
+
+    async fn passkey_add_begin(&self, ext: &Extensions) -> RpcResult<serde_json::Value> {
+        let (token, user) = self.recently_signed_in(ext).await?;
+        let me = self.account(user).await?;
+        let options = self
+            .passkeys
+            .begin_registration(self.auth.store(), &SessionToken(token).hash(), &me)
+            .await?;
+        serde_json::to_value(options).map_err(internal)
+    }
+
+    async fn passkey_add_finish(
+        &self,
+        ext: &Extensions,
+        name: String,
+        credential: serde_json::Value,
+    ) -> RpcResult<PasskeyEntry> {
+        let (token, user) = self.caller(ext).await?;
+        let me = self.account(user).await?;
+        let made = serde_json::from_value(credential).map_err(|e| {
+            error(
+                error_code::INVALID_INPUT,
+                format!("not what a browser makes: {e}"),
+            )
+        })?;
+        let record = self
+            .passkeys
+            .finish_registration(
+                self.auth.store(),
+                &SessionToken(token).hash(),
+                &me,
+                &name,
+                &made,
+            )
+            .await?;
+        Ok(self.passkey_entry(record))
+    }
+
+    async fn passkey_rename(&self, ext: &Extensions, id: String, name: String) -> RpcResult<()> {
+        let (_, user) = self.caller(ext).await?;
+        Ok(self
+            .auth
+            .store()
+            .rename_passkey(user.user, &id, &name)
+            .await?)
+    }
+
+    async fn passkey_remove(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        let (_, user) = self.recently_signed_in(ext).await?;
+        self.auth.store().remove_passkey(user.user, &id).await?;
+        tracing::info!(user = user.user.0, "passkey removed by its user");
+        Ok(())
+    }
+
     async fn revoke_session(&self, ext: &Extensions, id: String) -> RpcResult<()> {
         let (_, user) = self.caller(ext).await?;
         // Only among the caller's own: anyone else's is not found.
@@ -530,20 +940,7 @@ impl MeApiServer for AdminApi {
 #[async_trait]
 impl AdminApiServer for AdminApi {
     async fn setup(&self, ext: &Extensions, request: SetupRequest) -> RpcResult<LoggedIn> {
-        let Some(code) = &self.setup_code else {
-            return Err(UserError::AlreadySetUp.into());
-        };
-        let source = source(ext)?;
-        if let Some(retry_after) = self.auth.attempt_limited("setup", source.as_deref()) {
-            return Err(LoginError::RateLimited { retry_after }.into());
-        }
-        if !code.matches(&request.code) {
-            self.auth.attempt_failed("setup", source.as_deref());
-            return Err(error(
-                error_code::INVALID_SETUP_CODE,
-                "that is not the setup code in the server's log",
-            ));
-        }
+        self.setup_code(ext, &request.code)?;
         let phc = hash_password(&request.password).await?;
         let user = self
             .auth
@@ -555,6 +952,69 @@ impl AdminApiServer for AdminApi {
         Ok(LoggedIn {
             token: token.0,
             username: normalize_username(&request.username)?,
+            role: Role::Admin,
+        })
+    }
+
+    async fn setup_passkey_begin(
+        &self,
+        ext: &Extensions,
+        request: PasskeySetupBegin,
+    ) -> RpcResult<PasskeyChallenge> {
+        self.setup_code(ext, &request.code)?;
+        // Refused now rather than after the browser's prompt: a passkey
+        // made for nothing stays on the device.
+        if !self.setup_open().await? {
+            return Err(UserError::AlreadySetUp.into());
+        }
+        let username = normalize_username(&request.username)?;
+        let (ceremony, options) = self.passkeys.begin_setup(&username)?;
+        Ok(PasskeyChallenge {
+            ceremony,
+            options: serde_json::to_value(options).map_err(internal)?,
+        })
+    }
+
+    async fn setup_passkey_finish(
+        &self,
+        ext: &Extensions,
+        request: PasskeySetupFinish,
+    ) -> RpcResult<LoggedIn> {
+        // Again here: a request begun with the code does not outlive it.
+        self.setup_code(ext, &request.code)?;
+        let made = serde_json::from_value(request.credential).map_err(|e| {
+            error(
+                error_code::INVALID_INPUT,
+                format!("not what a browser makes: {e}"),
+            )
+        })?;
+        // Before the request is used up: a name can be typed again.
+        let name = passkey_name(&request.name)?;
+        let passkey = self.passkeys.finish_setup(&request.ceremony, &made)?;
+        let user = self
+            .auth
+            .store()
+            .add_first_admin_with_passkey(
+                &passkey.username,
+                FirstPasskey {
+                    handle: &passkey.handle,
+                    credential_id: &passkey.credential_id,
+                    name,
+                    credential: &passkey.credential,
+                    rp_id: &passkey.rp_id,
+                },
+            )
+            .await?;
+        let token = self.auth.open_api_session(user).await.map_err(internal)?;
+        tracing::info!(
+            username = %passkey.username,
+            passkey = name,
+            rp_id = %passkey.rp_id,
+            "first admin created, with a passkey and no password"
+        );
+        Ok(LoggedIn {
+            token: token.0,
+            username: passkey.username,
             role: Role::Admin,
         })
     }
@@ -722,6 +1182,29 @@ impl AdminApiServer for AdminApi {
         Ok(())
     }
 
+    async fn user_passkeys(
+        &self,
+        ext: &Extensions,
+        username: String,
+    ) -> RpcResult<Vec<PasskeyEntry>> {
+        self.admin(ext).await?;
+        let user = self.record(&username).await?;
+        self.passkey_entries(user.id).await
+    }
+
+    async fn user_remove_passkey(
+        &self,
+        ext: &Extensions,
+        username: String,
+        id: String,
+    ) -> RpcResult<()> {
+        self.admin(ext).await?;
+        let user = self.record(&username).await?;
+        self.auth.store().remove_passkey(user.id, &id).await?;
+        tracing::info!(%username, "passkey removed by an admin");
+        Ok(())
+    }
+
     async fn plex_status(&self, ext: &Extensions) -> RpcResult<PlexStatus> {
         self.admin(ext).await?;
         let plex = self.plex()?;
@@ -729,6 +1212,7 @@ impl AdminApiServer for AdminApi {
             reachable: false,
             error: Some(e.to_string()),
             server_name: None,
+            url: Some(plex.base_url().to_owned()),
             libraries: Vec::new(),
         };
         let server_name = match plex.server_name().await {
@@ -759,6 +1243,7 @@ impl AdminApiServer for AdminApi {
             reachable: true,
             error: None,
             server_name,
+            url: Some(plex.base_url().to_owned()),
             libraries: status,
         })
     }
@@ -843,6 +1328,137 @@ mod tests {
         assert_eq!(source("::ffff:192.0.2.7").as_deref(), Some("192.0.2.7"));
         assert_eq!(source("2001:db8::7").as_deref(), Some("2001:db8::7"));
         assert_eq!(Peer(None).source(), None);
+    }
+
+    /// The API over a store of its own, and alice's session in it: what
+    /// her calls carry, and the session's key in the store.
+    async fn api_with_alice(test: &str) -> (AdminApi, Extensions, String, impl Sized) {
+        let dir = crate::store::tests::state_dir(test).await;
+        let store = crate::store::Store::open(dir.as_ref()).await.unwrap();
+        let phc = hash_password("correct horse").await.unwrap();
+        store
+            .add_user("alice", None, &phc, Role::Consumer)
+            .await
+            .unwrap();
+        let auth = Auth::new(store);
+        let login = auth
+            .login_password("alice", "correct horse", SessionBinding::Api, None)
+            .await
+            .unwrap();
+        let mut ext = Extensions::new();
+        ext.insert(Bearer(login.token.0.clone()));
+        ext.insert(Peer(Some("127.0.0.1".parse().unwrap())));
+        (api(auth), ext, login.token.hash(), dir)
+    }
+
+    /// The API over `auth`, at `https://media.example.org`.
+    fn api(auth: Auth) -> AdminApi {
+        let transcoding = Transcoding::new(
+            Box::new(spoolframe_media::encoders::FfmpegCommand::new(
+                "/nonexistent/ffmpeg",
+            )),
+            Default::default(),
+            std::env::temp_dir(),
+        );
+        let origins = Origins::Exactly("https://media.example.org".into());
+        AdminApi {
+            auth,
+            setup_code: None,
+            status: Arc::new(StatusSource::new("Den", Arc::new(transcoding))),
+            plex_sync: None,
+            plex: None,
+            passkeys: Arc::new(Passkeys::new(&origins)),
+            public_url: origins.public_url().map(str::to_owned),
+        }
+    }
+
+    /// A user set up with a passkey has no password to prove it is them
+    /// with, so a first password needs a recent sign-in, as a passkey does.
+    #[tokio::test]
+    async fn a_first_password_is_set_only_soon_after_signing_in() {
+        let dir = crate::store::tests::state_dir("first-password").await;
+        let store = crate::store::Store::open(dir.as_ref()).await.unwrap();
+        let root = store
+            .add_first_admin_with_passkey(
+                "root",
+                FirstPasskey {
+                    handle: "handle-1",
+                    credential_id: "cred-1",
+                    name: "iPhone",
+                    credential: "{}",
+                    rp_id: "media.example.org",
+                },
+            )
+            .await
+            .unwrap();
+        let auth = Auth::new(store.clone());
+        let token = auth.open_api_session(root).await.unwrap();
+        let api = api(auth);
+        let mut ext = Extensions::new();
+        ext.insert(Bearer(token.0.clone()));
+        ext.insert(Peer(Some("127.0.0.1".parse().unwrap())));
+        let first = || PasswordChange {
+            current_password: String::new(),
+            new_password: "correct horse".into(),
+        };
+        store
+            .age_session(&token.hash(), RECENT_SIGN_IN.as_secs() as i64 + 1)
+            .await;
+        let stale = api.set_password(&ext, first()).await.unwrap_err();
+        assert_eq!(stale.code(), error_code::RECENT_SIGN_IN_REQUIRED);
+        assert!(!api.who_am_i(&ext).await.unwrap().has_password);
+
+        store
+            .age_session(&token.hash(), -(RECENT_SIGN_IN.as_secs() as i64))
+            .await;
+        api.set_password(&ext, first()).await.unwrap();
+        api.auth
+            .login_password("root", "correct horse", SessionBinding::Api, None)
+            .await
+            .unwrap();
+    }
+
+    /// P3-03: a sensitive change needs a sign-in, or a confirmation, within
+    /// the last 10 minutes.
+    #[tokio::test]
+    async fn a_passkey_is_added_or_removed_only_soon_after_signing_in() {
+        let (api, ext, session, _dir) = api_with_alice("recent").await;
+        let store = api.auth.store().clone();
+        let half = RECENT_SIGN_IN.as_secs() as i64 / 2;
+        store.age_session(&session, half).await;
+        api.passkey_add_begin(&ext).await.unwrap();
+
+        let (_, alice) = api.caller(&ext).await.unwrap();
+        store
+            .add_passkey(alice.user, "cred-1", "MacBook", "{}", "media.example.org")
+            .await
+            .unwrap();
+        store.age_session(&session, half + 1).await;
+        let stale = api.passkey_add_begin(&ext).await.unwrap_err();
+        assert_eq!(stale.code(), error_code::RECENT_SIGN_IN_REQUIRED);
+        let stale = api.passkey_remove(&ext, "cred-1".into()).await.unwrap_err();
+        assert_eq!(stale.code(), error_code::RECENT_SIGN_IN_REQUIRED);
+        // What is not sensitive still works.
+        api.passkey_rename(&ext, "cred-1".into(), "Laptop".into())
+            .await
+            .unwrap();
+        assert_eq!(api.passkeys(&ext).await.unwrap()[0].name, "Laptop");
+
+        // A wrong password confirms nothing.
+        let wrong = api
+            .confirm_password(&ext, "battery staple".into())
+            .await
+            .unwrap_err();
+        assert_eq!(wrong.code(), error_code::INVALID_CREDENTIALS);
+        let stale = api.passkey_remove(&ext, "cred-1".into()).await.unwrap_err();
+        assert_eq!(stale.code(), error_code::RECENT_SIGN_IN_REQUIRED);
+
+        api.confirm_password(&ext, "correct horse".into())
+            .await
+            .unwrap();
+        api.passkey_remove(&ext, "cred-1".into()).await.unwrap();
+        assert_eq!(api.passkeys(&ext).await.unwrap(), []);
+        api.passkey_add_begin(&ext).await.unwrap();
     }
 
     #[test]

@@ -25,7 +25,16 @@ js-sys = "0.3"
 jsonrpsee = { workspace = true, features = ["wasm-client"] }
 tracing = { workspace = true }
 wasm-bindgen = { workspace = true }
-web-sys = { workspace = true, features = ["Navigator", "Clipboard"] }
+# Awaits the passkey prompt's promise (P3-05).
+wasm-bindgen-futures = "0.4"
+web-sys = { workspace = true, features = [
+    "Navigator",
+    "Clipboard",
+    # The browser's passkey prompts.
+    "CredentialsContainer",
+    "CredentialCreationOptions",
+    "CredentialRequestOptions",
+] }
 
 # dx looks for it even for a web-only bundle.
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

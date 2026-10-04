@@ -7,6 +7,11 @@
 //! carries between the two, so it is short, dies in [`LIFETIME`], is used
 //! once, and guessing it is rate-limited by the caller.
 //!
+//! The approver is a phone with the app, over the client protocol, or any
+//! browser signed in to the web UI (P3-05): the device's QR code can carry
+//! the page that approves its code, so a phone needs no app, only a way
+//! to sign in there.
+//!
 //! Pending sign-ins are only in memory: a restart drops them, and the TV
 //! begins again.
 
@@ -178,13 +183,14 @@ impl DeviceSignIns {
         Some(inner.by_request[request].waiting.clone())
     }
 
-    /// Take `code` to approve from `approver` (an endpoint): from now on
-    /// nobody else can claim or deny it.
-    pub fn claim(&self, code: &str, approver: &str) -> Result<Claim, ClaimError> {
+    /// Take `code` to approve from `approver`: from now on nobody else can
+    /// claim or deny it. The approver is an endpoint, or `None` for a web
+    /// session, which is no endpoint and so never the one waiting.
+    pub fn claim(&self, code: &str, approver: Option<&str>) -> Result<Claim, ClaimError> {
         let mut inner = self.lock();
         let request = inner.by_code.get(code).ok_or(ClaimError::Unknown)?;
         let waiting = &inner.by_request[request].waiting;
-        if waiting.endpoint == approver {
+        if approver == Some(waiting.endpoint.as_str()) {
             return Err(ClaimError::SameDevice);
         }
         let claim = Claim {
@@ -303,11 +309,11 @@ mod tests {
     async fn an_approved_sign_in_is_handed_over_once() {
         let sign_ins = DeviceSignIns::default();
         let started = sign_ins.begin(tv("tv")).unwrap();
-        let claim = sign_ins.claim(&started.code, "phone").unwrap();
+        let claim = sign_ins.claim(&started.code, Some("phone")).unwrap();
         assert_eq!(claim.endpoint, "tv");
         // Claimed: nobody can claim, deny or look it up again.
         assert_eq!(
-            sign_ins.claim(&started.code, "phone"),
+            sign_ins.claim(&started.code, Some("phone")),
             Err(ClaimError::Unknown)
         );
         assert!(!sign_ins.deny(&started.code));
@@ -338,9 +344,11 @@ mod tests {
         let sign_ins = DeviceSignIns::default();
         let started = sign_ins.begin(tv("tv")).unwrap();
         assert_eq!(
-            sign_ins.claim(&started.code, "tv"),
+            sign_ins.claim(&started.code, Some("tv")),
             Err(ClaimError::SameDevice)
         );
+        // A web session is no device at all.
+        assert_eq!(sign_ins.claim(&started.code, None).unwrap().endpoint, "tv");
     }
 
     #[test]

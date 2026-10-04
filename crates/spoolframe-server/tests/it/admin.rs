@@ -11,6 +11,7 @@ use spoolframe_admin_api::{
 };
 use spoolframe_server::admin::{self, Admin, Origins, SetupCode, TrustedProxies};
 use spoolframe_server::auth::Auth;
+use spoolframe_server::passkeys::Passkeys;
 use spoolframe_server::store::Store;
 
 /// The setup code the test servers accept.
@@ -33,6 +34,7 @@ fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
         status: status(),
         plex_sync: None,
         plex: None,
+        passkeys: std::sync::Arc::new(Passkeys::new(&Origins::default())),
     }
 }
 
@@ -57,6 +59,58 @@ pub(crate) async fn server(test: &str) -> (SocketAddr, spoolframe_test_dir::Test
     // Runs for the life of the test process.
     std::mem::forget(handle);
     (addr, dir)
+}
+
+/// As [`server`], where browsers reach it at `public_url`, which is also
+/// what passkeys are bound to.
+pub(crate) async fn server_at(
+    test: &str,
+    public_url: &str,
+) -> (SocketAddr, spoolframe_test_dir::TestDir) {
+    server_at_behind(test, public_url, TrustedProxies::default()).await
+}
+
+/// As [`server_at`], with `proxies` believed about whom they carry.
+pub(crate) async fn server_at_behind(
+    test: &str,
+    public_url: &str,
+    proxies: TrustedProxies,
+) -> (SocketAddr, spoolframe_test_dir::TestDir) {
+    let dir = state_dir(test).await;
+    let auth = Auth::new(Store::open(dir.as_ref()).await.unwrap());
+    let origins = Origins::Exactly(public_url.to_owned());
+    let (addr, handle) = admin::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        Admin {
+            passkeys: std::sync::Arc::new(Passkeys::new(&origins)),
+            ..admin(auth, Some(SetupCode::new(CODE)))
+        },
+        origins,
+        proxies,
+    )
+    .await
+    .unwrap();
+    std::mem::forget(handle);
+    (addr, dir)
+}
+
+/// The admin API beside a client endpoint: over the `auth` they share,
+/// with browsers reaching it at `public_url`.
+pub(crate) async fn serve_beside(auth: Auth, public_url: &str) -> SocketAddr {
+    let origins = Origins::Exactly(public_url.to_owned());
+    let (addr, handle) = admin::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        Admin {
+            passkeys: std::sync::Arc::new(Passkeys::new(&origins)),
+            ..admin(auth, None)
+        },
+        origins,
+        TrustedProxies::default(),
+    )
+    .await
+    .unwrap();
+    std::mem::forget(handle);
+    addr
 }
 
 /// As [`server`], behind a reverse proxy on this machine: connections from
@@ -85,7 +139,7 @@ pub(crate) async fn anonymous(addr: SocketAddr) -> WsClient {
         .unwrap()
 }
 
-async fn with_token(addr: SocketAddr, token: &str) -> WsClient {
+pub(crate) async fn with_token(addr: SocketAddr, token: &str) -> WsClient {
     let mut headers = HeaderMap::new();
     headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
     WsClientBuilder::default()
@@ -95,7 +149,7 @@ async fn with_token(addr: SocketAddr, token: &str) -> WsClient {
         .unwrap()
 }
 
-fn setup(code: &str, username: &str, password: &str) -> SetupRequest {
+pub(crate) fn setup(code: &str, username: &str, password: &str) -> SetupRequest {
     SetupRequest {
         code: code.into(),
         username: username.into(),
@@ -103,14 +157,14 @@ fn setup(code: &str, username: &str, password: &str) -> SetupRequest {
     }
 }
 
-fn creds(username: &str, password: &str) -> Credentials {
+pub(crate) fn creds(username: &str, password: &str) -> Credentials {
     Credentials {
         username: username.into(),
         password: password.into(),
     }
 }
 
-fn code(err: ClientError) -> i32 {
+pub(crate) fn code(err: ClientError) -> i32 {
     match err {
         ClientError::Call(e) => e.code(),
         other => panic!("not a call error: {other}"),
@@ -646,6 +700,66 @@ async fn users_show_when_they_were_last_seen() {
     let _ = addr;
 }
 
+/// The user page's PIN section: whether there is a PIN to clear.
+#[tokio::test]
+async fn the_user_list_says_who_has_a_pin() {
+    let (addr, root, _dir) = admin_client("user-has-pin").await;
+    let (alice, _) = consumer(addr, &root).await;
+    let has_pin = |users: &[spoolframe_admin_api::UserInfo]| {
+        users
+            .iter()
+            .find(|u| u.username == "alice")
+            .unwrap()
+            .has_pin
+    };
+    assert!(!has_pin(&root.user_list().await.unwrap()));
+    alice.pin_set("4321".into()).await.unwrap();
+    assert!(has_pin(&root.user_list().await.unwrap()));
+    root.user_clear_pin("alice".into()).await.unwrap();
+    assert!(!has_pin(&root.user_list().await.unwrap()));
+}
+
+/// The users page's columns, from the list itself: a row per user, not a
+/// call per user.
+#[tokio::test]
+async fn the_user_list_counts_each_user_s_devices_and_live_sessions() {
+    let (addr, root, dir) = admin_client("user-counts").await;
+    let _alice = consumer(addr, &root).await;
+    let tv = sign_in_on_tv(dir.as_ref()).await;
+    // A second session on the TV: still one device.
+    let store = Store::open(dir.as_ref()).await.unwrap();
+    let alice_id = store.password_login("alice").await.unwrap().unwrap().id;
+    store
+        .create_session(
+            "tv-token-hash-2",
+            alice_id,
+            &spoolframe_server::store::sessions::SessionBinding::Endpoint {
+                endpoint_id: tv,
+                device_name: Some("Living room TV".into()),
+            },
+            i64::MAX / 2,
+        )
+        .await
+        .unwrap();
+    let counts = |users: &[spoolframe_admin_api::UserInfo], name: &str| {
+        let user = users.iter().find(|u| u.username == name).unwrap();
+        (user.device_count, user.session_count)
+    };
+
+    let users = root.user_list().await.unwrap();
+    // Her browser and the TV twice; the TV is her one device.
+    assert_eq!(counts(&users, "alice"), (1, 3));
+    assert_eq!(counts(&users, "root"), (0, 1));
+
+    // A revoked session is not live; the device it was on is still hers.
+    let sessions = root.user_sessions("alice".into()).await.unwrap();
+    let browser = sessions.iter().find(|s| s.endpoint_id.is_none()).unwrap();
+    root.user_revoke_session("alice".into(), browser.id.clone())
+        .await
+        .unwrap();
+    assert_eq!(counts(&root.user_list().await.unwrap(), "alice"), (1, 2));
+}
+
 #[tokio::test]
 async fn an_admin_lists_and_ends_another_user_s_sessions() {
     let (addr, root, _dir) = admin_client("user-sessions").await;
@@ -702,6 +816,8 @@ async fn plex_down_is_an_answer_not_an_error() {
     assert!(!status.reachable);
     assert!(status.error.is_some());
     assert!(status.libraries.is_empty());
+    // Where it was tried, for the page to say.
+    assert_eq!(status.url.as_deref(), Some("http://127.0.0.1:9"));
 }
 
 #[tokio::test]
@@ -739,6 +855,7 @@ async fn plex_status_names_the_server_and_counts_each_library() {
     let status = root.plex_status().await.unwrap();
     assert!(status.reachable, "{status:?}");
     assert_eq!(status.server_name.as_deref(), Some("Den"));
+    assert_eq!(status.url.as_deref(), Some(pms.uri().as_str()));
     let counts: Vec<_> = status
         .libraries
         .iter()

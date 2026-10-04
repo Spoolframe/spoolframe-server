@@ -491,6 +491,8 @@ pub struct ServerOptions {
     pub sign_in_lifetime: Duration,
     /// How long a device's playbacks outlive its last connection.
     pub disconnect_grace: Duration,
+    /// Where browsers reach the web UI (`admin.public_url`), if anywhere.
+    pub public_url: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -510,6 +512,7 @@ impl Default for ServerOptions {
             failure_window: spoolframe_server::auth::FAILURE_WINDOW,
             sign_in_lifetime: spoolframe_server::device_sign_in::LIFETIME,
             disconnect_grace: spoolframe_server::playback::DISCONNECT_GRACE,
+            public_url: None,
         }
     }
 }
@@ -561,9 +564,14 @@ fn test_module() -> String {
 pub struct TestServer {
     pub server: Server,
     pub store: Store,
+    /// Its logins, sessions and pending device sign-ins: what an admin
+    /// API beside it shares.
+    pub auth: Auth,
     pub catalog: Arc<FakeCatalog>,
     pub media: PathBuf,
     pub dir: StateDir,
+    /// Where browsers reach its web UI, if anywhere.
+    pub public_url: Option<String>,
 }
 
 impl TestServer {
@@ -628,9 +636,11 @@ impl TestServer {
             prober.clone(),
             WatchRules::default(),
         ));
+        let auth = Auth::with_failure_window(store.clone(), options.failure_window)
+            .with_sign_in_lifetime(options.sign_in_lifetime);
         let services = Services {
-            auth: Auth::with_failure_window(store.clone(), options.failure_window)
-                .with_sign_in_lifetime(options.sign_in_lifetime),
+            auth: auth.clone(),
+            public_url: options.public_url.clone(),
             watch,
             catalog,
             prober,
@@ -654,6 +664,8 @@ impl TestServer {
         Self {
             server,
             store,
+            auth,
+            public_url: options.public_url,
             catalog: fake,
             dir,
             media,
@@ -1142,4 +1154,48 @@ pub fn write_script(path: &Path, text: &str) {
         .status()
         .unwrap();
     assert!(status.success(), "install {} failed", path.display());
+}
+
+/// The warnings the servers in this test binary log, kept so a test can
+/// check that something was said. All tests share them: look for a line
+/// by what only that test's server would say.
+pub mod logs {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    static LINES: OnceLock<&'static Mutex<Vec<u8>>> = OnceLock::new();
+
+    struct Kept(&'static Mutex<Vec<u8>>);
+
+    impl Write for Kept {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Keep warnings from now on. Call before what should log.
+    pub fn keep() {
+        LINES.get_or_init(|| {
+            let lines: &'static Mutex<Vec<u8>> = Box::leak(Box::default());
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || Kept(lines))
+                .init();
+            lines
+        });
+    }
+
+    /// Whether a kept line has every one of `parts`.
+    pub fn has(parts: &[&str]) -> bool {
+        let lines = LINES.get().expect("logs::keep() first").lock().unwrap();
+        String::from_utf8_lossy(&lines)
+            .lines()
+            .any(|line| parts.iter().all(|part| line.contains(part)))
+    }
 }

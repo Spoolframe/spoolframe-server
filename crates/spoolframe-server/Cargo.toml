@@ -21,8 +21,13 @@ snmalloc-rs.workspace = true
 rust-embed = { workspace = true, optional = true, features = ["mime-guess"] }
 async-trait = { workspace = true }
 axum = { workspace = true }
+# A debug build's proxy to `dx serve` (web/dev_server.rs); unused in release.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+reqwest = { workspace = true }
 anyhow = { workspace = true }
 argon2 = { workspace = true }
+base64 = { workspace = true }
 blake3 = { workspace = true }
 password-hash = { workspace = true }
 clap = { workspace = true }
@@ -47,10 +52,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 uclicious = { workspace = true }
+webauthn-rs = { workspace = true }
+webauthn-rs-proto = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-reqwest = { workspace = true }
 # A stand-in PMS for the admin API's Plex status.
 wiremock = { workspace = true }
 spoolframe-test-dir = { workspace = true }
@@ -58,6 +64,7 @@ cargo_metadata = { workspace = true }
 m3u8-rs = { workspace = true }
 futures-util = { workspace = true }
 spoolframe-client-sdk = { workspace = true }
+webauthn-authenticator-rs = { workspace = true }
 # PGS tracks for the OCR tests.
 spoolframe-media = { workspace = true, features = ["fixtures"] }
 # Paused time, for the Plex sync's schedule.

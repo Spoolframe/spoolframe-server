@@ -624,3 +624,91 @@
   in `CODECS` with its own level (`hvc1.2.4.L123.B0` for Main 10 at 4.1)
   where it was guessed from the height. The media descriptor has the
   video's `level` (P2-05).
+- Passkeys on existing accounts, the server side of adding them. The
+  relying party is the host of `admin.public_url` (HTTPS), or `localhost`
+  without one; a plain-HTTP `public_url` on another host, or one that
+  names an address, has no passkeys, and the API says why
+  (`NOT_CONFIGURED`). `me.passkeyAddBegin` and `me.passkeyAddFinish` add
+  one, named by its user: stored on the authenticator (`residentKey:
+  required`), with user verification, and with no say on where the
+  authenticator is or how it is reached, so the device's own store, a
+  password manager, a security key and a phone over the browser's QR
+  code all work. `me.passkeys`, `me.passkeyRename`, `me.passkeyRemove`
+  and `me.passkeyHost` manage them; admins have `admin.userPasskeys` and
+  `admin.userRemovePasskey`, and cannot add one for someone else. Each
+  passkey keeps the host it was made for; at start the log names those
+  made for another host than the server has now. The build links
+  OpenSSL (webauthn-rs) (P3-05).
+- Adding or removing a passkey needs a recent sign-in: a session whose
+  user signed in, or confirmed it with `me.confirmPassword`, more than 10
+  minutes ago is refused with `RECENT_SIGN_IN_REQUIRED`. A user's last
+  way to sign in cannot be removed (`LAST_SIGN_IN_METHOD`) (P3-03,
+  P3-05).
+- Signing in with a passkey, with no username. `POST /auth/passkey/begin`
+  answers a request (`ceremony`, and the options for the browser's
+  `navigator.credentials.get`: no credentials listed, user verification
+  required), `POST /auth/passkey/finish` takes what the passkey signed and
+  answers as `/auth/login` does, with the same cookie; `me.passkeyLoginBegin`
+  and `me.passkeyLoginFinish` are the same on the socket. A request is
+  good once, for 5 minutes. Every failure is `PASSKEY_REFUSED` and the
+  log says why: an unknown or removed passkey, another relying party or
+  origin, no user verification, a user handle that is not its user's, a
+  disabled user, or a signature counter that went backwards (a copied
+  passkey). Failures count in the limit on failed logins, under the
+  passkey's user and the caller's address (P3-05).
+- A device's sign-in can be approved in a browser. `BeginDeviceSignIn`
+  answers `web_url` too, the web UI's page for the code
+  (`<admin.public_url>/auth/device?code=<code>`; absent without a public
+  URL), for a QR code any phone's camera opens; the SDK's `DeviceSignIn`
+  has it as `web_url`. A web session, made by a password or a passkey,
+  completes the pending request with `me.deviceSignInLookup`,
+  `me.deviceSignInApprove` and `me.deviceSignInDeny`: the same codes, one
+  use, 5 minutes, and wrong codes limited under the count the user's
+  phone shares (`NO_SUCH_SIGN_IN_CODE`, `RATE_LIMITED`). Every role may
+  approve for themselves. Wire change: `DeviceSignInStarted` has a new
+  field, so clients rebuild on this SDK (P3-07, P3-05).
+- The web UI has passkeys. The login page has "Sign in with a passkey"
+  (the browser's own prompt, no username; hidden where the page has no
+  secure context or the browser no WebAuthn). "My profile", every role's
+  own page and a menu entry for an admin, has the sign-in methods: the
+  password, changed with the current one, and the passkeys, listed with
+  their name, when they were added and last used, renamed and removed;
+  "Add a passkey" names the new one, says which host it is bound to and
+  warns when that is `localhost`. A session older than 10 minutes is
+  asked for the password first. An admin's page for a user lists the
+  user's passkeys and removes them. `/auth/device?code=…`, what a
+  device's QR code opens on a phone, signs in there if need be (password
+  or passkey), shows "Sign in on '<device>'?" with the code, and
+  approves or denies; without a code it asks for one (P3-05, P3-03,
+  P3-07).
+- `GET /auth/site` tells a signed-out page the server's name and its
+  `admin.public_url`, if any. The server logs every password and passkey
+  sign-in on the admin API with the user and the caller's address, and
+  warns at start when the admin listener is not loopback and no
+  `admin.public_url` is set: browsers keep the session cookie only over
+  HTTPS or at `localhost`, so signing in at such an address looks like
+  nothing happened. `me.confirmPasskey` confirms a session with one of
+  its user's own passkeys, as `me.confirmPassword` does with the password
+  (P3-05, P3-03).
+- The web UI's login, My profile, "Add a passkey", "Confirm it's you",
+  device approval and a user's passkeys follow the "Spoolframe UI"
+  design boards: the signed-out card over the colour blobs with the
+  mark and "Sign in to <server>", the sidebar (a bar on a phone), the
+  cards and rows, the dialogs, the design's icons, and its fonts
+  (Outfit, Figtree, JetBrains Mono, Bricolage Grotesque), which the build
+  copies into the bundle from nixpkgs, so nothing is fetched at run
+  time. In an insecure context (plain HTTP on a real host) the sign-in
+  card says the browser would drop the session, names
+  `admin.public_url` or `localhost` instead, and takes nothing (P3-05,
+  P3-03, P3-07).
+- A debug server built without `embed-web` takes the web UI's pages from
+  `dx serve` on `127.0.0.1:8080` and tunnels its hot-reload WebSocket
+  (`/_dioxus`), so the browser opens only the admin listener; without
+  `dx serve` each page says how to start it. `devenv up` runs `dx serve`
+  (fonts copied first) and Tailwind in watch mode. Builds with
+  `embed-web`, and release builds without it, are unchanged.
+- A sign-in on the admin listener's HTTP side (password, passkey or
+  setup) from a plain-HTTP page on anything but loopback, as its
+  `Origin` names it, logs a warning. The browser will drop the Secure
+  session cookie, so the sign-in appears to do nothing, and the warning
+  names HTTPS (`admin.public_url`) or `http://localhost` instead.

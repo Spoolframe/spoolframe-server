@@ -7,6 +7,7 @@
   lib,
   pkg-config,
   libucl,
+  openssl,
   makeWrapper,
   ffmpeg-headless,
   tesseract,
@@ -15,12 +16,18 @@
   wasm-bindgen-cli,
   binaryen,
   tailwindcss_4,
+  # The web UI's fonts, carried in the bundle (nothing is fetched at run
+  # time). devenv.nix names the same four.
+  google-fonts,
   # rustc links wasm32 with `lld`, which nixpkgs' rustc does not carry.
   lld,
 }: let
   # English by default; the NixOS module points the server at a tesseract
   # with the languages the host asks for.
   ocr = tesseract.override {enableLanguages = ["eng"];};
+  webFonts = google-fonts.override {
+    fonts = ["Outfit" "Figtree" "JetBrains Mono" "Bricolage Grotesque"];
+  };
 
   # lib.cleanSource (not a .rs/.toml filter) so `.cargo/config.toml` — which
   # declares the coldsteel registry for vendoring — is kept in the build source.
@@ -31,9 +38,10 @@
     strictDeps = true;
     pname = "spoolframe-server";
     version = (lib.importTOML ../Cargo.toml).workspace.package.version;
-    # uclicious-libucl-sys links libucl via pkg-config.
+    # uclicious-libucl-sys links libucl via pkg-config; so does
+    # openssl-sys OpenSSL, for webauthn-rs (passkeys, P3-05).
     nativeBuildInputs = [pkg-config];
-    buildInputs = [libucl];
+    buildInputs = [libucl openssl];
   };
 
   # Build dependencies separately for caching.
@@ -48,6 +56,12 @@ in
       # with `embed-web` reading the bundle from SPOOLFRAME_WEB_DIST.
       WASM_BINDGEN = "${wasm-bindgen-cli}/bin/wasm-bindgen";
       buildPhaseCargoCommand = ''
+        t="${webFonts}/share/fonts/truetype"
+        d=crates/spoolframe-web/assets/fonts
+        install -m 644 "$t/Outfit[wght].ttf" "$d/Outfit.ttf"
+        install -m 644 "$t/Figtree[wght].ttf" "$d/Figtree.ttf"
+        install -m 644 "$t/JetBrainsMono[wght].ttf" "$d/JetBrainsMono.ttf"
+        install -m 644 "$t/BricolageGrotesque[opsz,wdth,wght].ttf" "$d/BricolageGrotesque.ttf"
         tailwindcss -i crates/spoolframe-web/input.css -o crates/spoolframe-web/assets/tailwind.css
         dx bundle --package spoolframe-web --platform web --release --profile wasm-release
         export SPOOLFRAME_WEB_DIST="$PWD/target/dx/spoolframe-web/release/web/public"

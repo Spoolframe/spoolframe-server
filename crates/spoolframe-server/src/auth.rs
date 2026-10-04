@@ -31,6 +31,10 @@ pub const API_SESSION: Duration = Duration::from_secs(12 * 3600);
 pub const MAX_FAILURES: usize = 5;
 pub const FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 
+/// How long after its user proved who they are (signed in, or confirmed it
+/// since) a session may make sensitive changes (P3-03).
+pub const RECENT_SIGN_IN: Duration = Duration::from_secs(10 * 60);
+
 /// The shortest password accepted when one is set.
 pub const MIN_PASSWORD_LEN: usize = 8;
 
@@ -508,6 +512,19 @@ impl Auth {
 
     pub fn attempt_failed(&self, what: &str, source: Option<&str>) {
         self.limiter.record_failure(what, source, Instant::now());
+    }
+
+    /// Count an attempt that is not a password login (a passkey's
+    /// assertion) before it is checked, as [`RateLimiter::begin`] does:
+    /// `Err(wait)` if `what` from `source` is limited. It stays counted as
+    /// a failure unless [`Auth::attempt_succeeded`] takes it back.
+    pub fn attempt_begin(&self, what: &str, source: Option<&str>) -> Result<Instant, Duration> {
+        let began = Instant::now();
+        self.limiter.begin(what, source, began).map(|()| began)
+    }
+
+    pub fn attempt_succeeded(&self, what: &str, source: Option<&str>, began: Instant) {
+        self.limiter.record_success(what, source, began);
     }
 
     /// Log in with a password and open a session bound as `binding`.

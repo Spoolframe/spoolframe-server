@@ -7,6 +7,22 @@
   # refuses to bundle on a mismatch. Named versions, so a ports bump is a
   # change here rather than a surprise (as scribe learnt, FD-451).
   dioxusPackages = pkgs.callPackage "${inputs.ports}/dioxus-cli/package.nix" {};
+  # The web UI's fonts (the design's: Outfit, Figtree, JetBrains Mono,
+  # Bricolage Grotesque), from nixpkgs so the bundle carries them and a
+  # LAN without the Internet renders the pages as designed.
+  webFonts = pkgs.google-fonts.override {
+    fonts = ["Outfit" "Figtree" "JetBrains Mono" "Bricolage Grotesque"];
+  };
+  # The upright variable files only, under the names
+  # crates/spoolframe-web/src/app/mod.rs' @font-face rules name.
+  webFontsCopy = fonts: ''
+    t="${fonts}/share/fonts/truetype"
+    d=crates/spoolframe-web/assets/fonts
+    install -m 644 "$t/Outfit[wght].ttf" "$d/Outfit.ttf"
+    install -m 644 "$t/Figtree[wght].ttf" "$d/Figtree.ttf"
+    install -m 644 "$t/JetBrainsMono[wght].ttf" "$d/JetBrainsMono.ttf"
+    install -m 644 "$t/BricolageGrotesque[opsz,wdth,wght].ttf" "$d/BricolageGrotesque.ttf"
+  '';
 in {
   # The Rust toolchain, nextest and the ci:* tasks come from
   # molds/devenv/rust. uclicious -> uclicious-libucl-sys links libucl via
@@ -14,6 +30,8 @@ in {
   packages = with pkgs; [
     pkg-config
     libucl
+    # webauthn-rs (passkeys, P3-05) verifies signatures with OpenSSL.
+    openssl
     # ffprobe, which the server runs on every media file it serves (P1-06).
     ffmpeg-headless
     # Reads bitmap subtitles as text (P2-07); English is what the tests
@@ -56,6 +74,16 @@ in {
     # Additive: molds keeps owning the rustfmt check.
     "ci:style".after = ["spoolframe:tailwind-fresh"];
 
+    # The fonts the bundle carries, into the asset folder the app embeds
+    # (ignored by git: they come from nixpkgs).
+    "spoolframe:fonts" = {
+      description = "Copy the web UI's fonts into crates/spoolframe-web/assets/fonts";
+      exec = ''
+        set -euo pipefail
+        ${webFontsCopy webFonts}
+      '';
+    };
+
     # The web UI's bundle, for `cargo run --features embed-web` with
     # SPOOLFRAME_WEB_DIST=target/dx/spoolframe-web/release/web/public. A
     # debug server reads that directory as it is, so bundle and reload.
@@ -63,12 +91,29 @@ in {
       description = "Build the web UI bundle (Tailwind, then dx bundle)";
       exec = ''
         set -euo pipefail
+        ${webFontsCopy webFonts}
         tailwindcss -i crates/spoolframe-web/input.css -o crates/spoolframe-web/assets/tailwind.css
         rm -rf target/dx/spoolframe-web/release/web/public
         WASM_BINDGEN="$(command -v wasm-bindgen)" \
           dx bundle --package spoolframe-web --platform web --release --profile wasm-release
       '';
     };
+  };
+
+  # The web UI's dev loop (`devenv up`): a debug server without
+  # `embed-web` takes every page from dx serve on 127.0.0.1:8080 (the port
+  # crates/spoolframe-server/src/web/dev_server.rs names) and tunnels its
+  # hot-reload socket, so the browser only ever opens the admin listener.
+  # Tailwind runs beside it: dx does not build the stylesheet.
+  processes = {
+    web.exec = ''
+      set -euo pipefail
+      ${webFontsCopy webFonts}
+      export WASM_BINDGEN="$(command -v wasm-bindgen)"
+      exec dx serve --package spoolframe-web --platform web --port 8080 \
+        --hot-reload true --watch true --open false --interactive false
+    '';
+    tailwind.exec = "exec tailwindcss -i crates/spoolframe-web/input.css -o crates/spoolframe-web/assets/tailwind.css --watch=always";
   };
 
   # molds' host clippy never builds the app: it is wasm only. A wasm pass

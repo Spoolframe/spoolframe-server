@@ -8,7 +8,8 @@
 
 /* Catppuccin: Latte when the browser prefers light, Mocha when it prefers
  * dark, as the Linux client and the design do. The utilities name the
- * variables, so one class set serves both. */
+ * variables, so one class set serves both. The design's boards are Mocha;
+ * its values are the Mocha ones below. */
 :root {
   --ctp-base: #eff1f5;
   --ctp-mantle: #e6e9ef;
@@ -25,6 +26,11 @@
   --ctp-green: #40a02b;
   --ctp-yellow: #df8e1d;
   --ctp-blue: #1e66f5;
+  --ctp-teal: #179299;
+  --ctp-pink: #ea76cb;
+  --ctp-peach: #fe640b;
+  /* The card over the login page's colour blobs: the mantle, nearly opaque. */
+  --ctp-mantle-glass: rgba(230, 233, 239, 0.92);
   color-scheme: light;
 }
 
@@ -45,6 +51,10 @@
     --ctp-green: #a6e3a1;
     --ctp-yellow: #f9e2af;
     --ctp-blue: #89b4fa;
+    --ctp-teal: #94e2d5;
+    --ctp-pink: #f5c2e7;
+    --ctp-peach: #fab387;
+    --ctp-mantle-glass: rgba(24, 24, 37, 0.92);
     color-scheme: dark;
   }
 }
@@ -65,12 +75,977 @@
   --color-ctp-green: var(--ctp-green);
   --color-ctp-yellow: var(--ctp-yellow);
   --color-ctp-blue: var(--ctp-blue);
+  --color-ctp-teal: var(--ctp-teal);
+  --color-ctp-pink: var(--ctp-pink);
+  --color-ctp-peach: var(--ctp-peach);
+  /* The design's families; the files come with the bundle (see
+   * `app::launch`), and a system face stands in until they load. */
+  --font-sans: Figtree, system-ui, sans-serif;
+  --font-display: Outfit, Figtree, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --font-wordmark: "Bricolage Grotesque", Figtree, system-ui, sans-serif;
 }
 
 @layer base {
   body {
     background-color: var(--ctp-base);
     color: var(--ctp-text);
-    font-family: system-ui, sans-serif;
+    font-family: var(--font-sans);
+  }
+  h1, h2, h3 {
+    font-family: var(--font-display);
+  }
+  a {
+    color: var(--ctp-teal);
+  }
+}
+
+/* The design's parts (the "Spoolframe UI" boards), as classes, so a page
+ * names the part and the numbers live here once. */
+@layer components {
+  /* The blurred colour blobs behind a signed-out page's card. */
+  .blobs {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    pointer-events: none;
+  }
+  .blob-teal {
+    position: absolute;
+    left: -120px;
+    top: 120px;
+    width: 640px;
+    height: 640px;
+    border-radius: 320px;
+    background: var(--ctp-teal);
+    opacity: 0.22;
+  }
+  .blob-blue {
+    position: absolute;
+    right: -80px;
+    top: -140px;
+    width: 560px;
+    height: 560px;
+    border-radius: 280px;
+    background: var(--ctp-blue);
+    opacity: 0.176;
+  }
+  .blob-mauve {
+    position: absolute;
+    right: 20%;
+    bottom: -180px;
+    width: 520px;
+    height: 420px;
+    border-radius: 90px;
+    background: var(--ctp-mauve);
+    opacity: 0.154;
+  }
+  /* The card of a signed-out page: 420px wide for a form, phone-wide on
+   * a phone. */
+  .glass-card {
+    position: relative;
+    width: 420px;
+    max-width: calc(100% - 32px);
+    background: var(--ctp-mantle-glass);
+    border: 1px solid var(--ctp-surface0);
+    border-radius: 18px;
+    padding: 32px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    box-shadow: 0 30px 70px rgba(0, 0, 0, 0.45);
+  }
+  @media (max-width: 480px) {
+    .glass-card {
+      padding: 22px;
+    }
+  }
+  .glass-card-wide {
+    width: 460px;
+  }
+  /* A labelled input: the label above, 12px semibold. */
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ctp-subtext0);
+  }
+  .field input {
+    height: 40px;
+    border-radius: 8px;
+    border: 1px solid var(--ctp-surface1);
+    background: var(--ctp-base);
+    color: var(--ctp-text);
+    padding: 0 12px;
+    font: 500 14px var(--font-sans);
+  }
+  .field input:focus {
+    outline: none;
+    border-color: var(--ctp-teal);
+  }
+  .field input:disabled {
+    opacity: 0.5;
+  }
+  .field-bad input {
+    border-color: var(--ctp-red);
+  }
+  .field-error {
+    font-weight: 500;
+    color: var(--ctp-red);
+  }
+  /* The login card's taller inputs: 44px, 48px on a phone. */
+  .field-tall input {
+    height: 44px;
+  }
+  @media (max-width: 480px) {
+    .field-tall input {
+      height: 48px;
+    }
+  }
+  .btn {
+    height: 30px;
+    padding: 0 18px;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--ctp-text);
+    border: 1px solid var(--ctp-surface2);
+    font: 600 13px var(--font-sans);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn:hover {
+    background: var(--ctp-surface0);
+  }
+  .btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .btn-danger {
+    color: var(--ctp-red);
+  }
+  .btn-grey {
+    background: var(--ctp-surface1);
+    border: 0;
+    height: 34px;
+  }
+  .btn-grey:hover {
+    background: var(--ctp-surface2);
+  }
+  /* The one action of a card: teal, full width, 44px. */
+  .btn-primary {
+    width: 100%;
+    height: 44px;
+    padding: 0 18px;
+    border-radius: 10px;
+    background: var(--ctp-teal);
+    color: var(--ctp-crust);
+    border: 0;
+    font: 600 15px var(--font-sans);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    cursor: pointer;
+  }
+  .btn-primary:hover {
+    opacity: 0.9;
+  }
+  .btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  /* The not-found page's way back: as tall as a dialog's, as wide as
+   * its words. */
+  .btn-start {
+    width: auto;
+    height: 42px;
+    text-decoration: none;
+  }
+  /* The other way in: grey, beside the primary one. */
+  .btn-secondary {
+    width: 100%;
+    height: 44px;
+    padding: 0 18px;
+    border-radius: 10px;
+    background: var(--ctp-surface1);
+    color: var(--ctp-text);
+    border: 0;
+    font: 600 15px var(--font-sans);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    cursor: pointer;
+  }
+  .btn-secondary:hover {
+    background: var(--ctp-surface2);
+  }
+  .btn-secondary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  /* A dialog's buttons: 38px. */
+  .btn-dialog {
+    height: 38px;
+    padding: 0 18px;
+    border-radius: 8px;
+    font: 600 14px var(--font-sans);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    cursor: pointer;
+  }
+  .btn-dialog-grey {
+    background: var(--ctp-surface1);
+    color: var(--ctp-text);
+    border: 0;
+  }
+  .btn-dialog-outline {
+    background: transparent;
+    color: var(--ctp-text);
+    border: 1px solid var(--ctp-surface2);
+  }
+  .btn-dialog-primary {
+    background: var(--ctp-teal);
+    color: var(--ctp-crust);
+    border: 0;
+  }
+  .btn-dialog:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn-plain {
+    height: 36px;
+    padding: 0 18px;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--ctp-text);
+    border: 0;
+    font: 600 14px var(--font-sans);
+    cursor: pointer;
+  }
+  /* "or" between two ways in. */
+  .or-divider {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: var(--ctp-overlay0);
+    font-size: 12px;
+  }
+  .or-divider::before,
+  .or-divider::after {
+    content: "";
+    flex-grow: 1;
+    height: 1px;
+    background: var(--ctp-surface1);
+  }
+  /* What went wrong, or what to know: an icon and a line. */
+  .alert {
+    display: flex;
+    gap: 10px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  .alert svg {
+    flex-shrink: 0;
+  }
+  .alert-error {
+    background: color-mix(in srgb, var(--ctp-red) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ctp-red) 40%, transparent);
+    color: var(--ctp-pink);
+  }
+  .alert-error svg {
+    color: var(--ctp-red);
+  }
+  .alert-warning {
+    background: color-mix(in srgb, var(--ctp-yellow) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ctp-yellow) 45%, transparent);
+    color: var(--ctp-yellow);
+    font-size: 13px;
+  }
+  /* A signed-in page's card: a header with an icon, then rows. */
+  .card {
+    background: var(--ctp-mantle);
+    border: 1px solid var(--ctp-surface0);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .card-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--ctp-surface0);
+  }
+  .card-head svg {
+    color: var(--ctp-teal);
+  }
+  .card-head h2 {
+    margin: 0;
+    font: 700 16px var(--font-sans);
+    flex-grow: 1;
+  }
+  .card-body {
+    padding: 14px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  /* A row of a card: what it is on the left, what to do on the right. */
+  .row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 14px;
+  }
+  .row-what {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .row-what b {
+    font-weight: 700;
+  }
+  .row-what svg {
+    display: inline;
+    vertical-align: -2px;
+    margin-right: 4px;
+  }
+  .row-sub {
+    font-size: 12px;
+    color: var(--ctp-subtext0);
+  }
+  .row-do {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-shrink: 0;
+  }
+  .row-label {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--ctp-subtext0);
+    margin-top: 4px;
+    text-transform: uppercase;
+  }
+  /* A dialog over the page. */
+  .scrim {
+    position: fixed;
+    inset: 0;
+    background: rgba(17, 17, 27, 0.65);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    z-index: 10;
+  }
+  .dialog {
+    width: 420px;
+    max-width: 100%;
+    background: var(--ctp-surface0);
+    border-radius: 16px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+    padding: 26px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .dialog-wide {
+    width: 480px;
+  }
+  .dialog-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .dialog-head svg {
+    color: var(--ctp-teal);
+  }
+  .dialog-head-danger svg {
+    color: var(--ctp-red);
+  }
+  .dialog-head h1 {
+    margin: 0;
+    font: 700 20px var(--font-sans);
+  }
+  /* The signed-in pages' frame: a sidebar on a wide screen, a bar on a
+   * phone. */
+  /* As tall as the window at least, so its user card sits at the
+   * bottom: the frame's lines start at the top (see `SignedIn`), and a
+   * line is only as tall as what is in it. */
+  .sidebar {
+    min-height: 100vh;
+    width: 240px;
+    flex-shrink: 0;
+    background: var(--ctp-mantle);
+    border-right: 1px solid var(--ctp-crust);
+    padding: 18px 12px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .nav-link {
+    height: 38px;
+    padding: 0 12px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--ctp-subtext1);
+    font-size: 14px;
+    text-decoration: none;
+  }
+  .nav-link:hover {
+    color: var(--ctp-text);
+  }
+  .nav-link-here {
+    background: var(--ctp-surface0);
+    color: var(--ctp-text);
+    font-weight: 600;
+  }
+  .nav-divider {
+    margin-top: 12px;
+    border-top: 1px solid var(--ctp-surface0);
+    padding-top: 12px;
+  }
+  .wordmark {
+    font-family: var(--font-wordmark);
+    font-weight: 700;
+    font-size: 18px;
+    letter-spacing: -0.03em;
+  }
+  .avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 16px;
+    background: var(--ctp-mauve);
+    color: var(--ctp-crust);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 800;
+    flex-shrink: 0;
+  }
+  .phone-bar {
+    height: 56px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--ctp-surface0);
+    background: var(--ctp-mantle);
+  }
+  .page-title {
+    margin: 0;
+    font: 700 28px var(--font-display);
+  }
+  /* Cards side by side where there is room, one above the other on a
+   * phone. */
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr));
+    gap: 16px;
+    align-items: start;
+  }
+  .mono {
+    font-family: var(--font-mono);
+  }
+  /* The setup card: wider, for its list of ways to sign in. */
+  .glass-card-setup {
+    width: 640px;
+    padding: 28px;
+    gap: 18px;
+  }
+  /* One way to sign in, on the setup page: an icon, what it is, and its
+   * state or what to do. */
+  .method {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 16px;
+    border-radius: 12px;
+    background: var(--ctp-base);
+    border: 1px solid var(--ctp-surface0);
+  }
+  .method .btn {
+    height: 34px;
+    padding: 0 14px;
+  }
+  .method-icon {
+    width: 36px;
+    height: 36px;
+    flex-shrink: 0;
+    border-radius: 10px;
+    background: var(--ctp-surface0);
+    color: var(--ctp-teal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .method-what {
+    flex-grow: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 13px;
+    color: var(--ctp-subtext0);
+  }
+  .method-what b {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--ctp-text);
+  }
+  /* A method's own form, under it, lined up with its text. */
+  .method-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 4px 16px 6px 66px;
+  }
+  @media (max-width: 480px) {
+    .method-form {
+      padding: 4px 0 6px;
+    }
+  }
+  .chip {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--ctp-subtext0);
+    background: var(--ctp-surface0);
+    padding: 2px 8px;
+    border-radius: 999px;
+    margin-left: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .added {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ctp-green);
+    white-space: nowrap;
+  }
+  .btn-teal {
+    background: var(--ctp-teal);
+    color: var(--ctp-crust);
+    border: 0;
+  }
+  .btn-teal:hover {
+    background: var(--ctp-teal);
+    opacity: 0.9;
+  }
+  .alert-success {
+    align-items: center;
+    background: color-mix(in srgb, var(--ctp-green) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ctp-green) 35%, transparent);
+    font-size: 13px;
+  }
+  .alert-success svg {
+    color: var(--ctp-green);
+  }
+  /* A person's colour (`logic::avatar_class`), grey while disabled. */
+  .avatar-teal { background: var(--ctp-teal); }
+  .avatar-mauve { background: var(--ctp-mauve); }
+  .avatar-peach { background: var(--ctp-peach); }
+  .avatar-blue { background: var(--ctp-blue); }
+  .avatar-pink { background: var(--ctp-pink); }
+  .avatar-green { background: var(--ctp-green); }
+  .avatar-off { background: var(--ctp-surface2); }
+  .avatar-md {
+    width: 30px;
+    height: 30px;
+    font: 600 14px var(--font-display);
+  }
+  .avatar-lg {
+    width: 44px;
+    height: 44px;
+    border-radius: 22px;
+    font-size: 17px;
+  }
+  .avatar-card {
+    width: 36px;
+    height: 36px;
+    border-radius: 18px;
+    font-size: 14px;
+  }
+  /* An admin page's title row: the title, and its one action. */
+  .page-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .page-title-admin {
+    font-size: 30px;
+    font-weight: 600;
+  }
+  .btn-add {
+    height: 40px;
+    padding: 0 18px;
+    border-radius: 8px;
+    border: 0;
+    background: var(--ctp-teal);
+    color: var(--ctp-crust);
+    font: 600 14px var(--font-sans);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+  }
+  .btn-add:hover {
+    opacity: 0.9;
+  }
+  /* A section of a page that is not a card: its title and a line. */
+  .section-head {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 6px;
+  }
+  .section-head h2 {
+    margin: 0;
+    font: 700 18px var(--font-display);
+  }
+  .section-head span {
+    font-size: 13px;
+    color: var(--ctp-subtext0);
+  }
+  /* A table in a card: small upper-case heads, rows between lines. */
+  .table-card {
+    background: var(--ctp-mantle);
+    border: 1px solid var(--ctp-surface0);
+    border-radius: 12px;
+    overflow-x: auto;
+  }
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  .table th {
+    text-align: left;
+    padding: 12px 18px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ctp-subtext0);
+    white-space: nowrap;
+  }
+  .table td {
+    padding: 12px 18px;
+    border-top: 1px solid var(--ctp-surface0);
+  }
+  @media (max-width: 480px) {
+    .table th,
+    .table td {
+      padding: 10px 12px;
+    }
+  }
+  .table td.end {
+    text-align: right;
+  }
+  .table td.quiet {
+    color: var(--ctp-subtext1);
+  }
+  .table tr.opens {
+    cursor: pointer;
+  }
+  .table tr.opens:hover td {
+    background: var(--ctp-base);
+  }
+  .table tr.off {
+    opacity: 0.75;
+  }
+  .who {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .who-name {
+    display: flex;
+    flex-direction: column;
+    color: var(--ctp-text);
+    text-decoration: none;
+  }
+  .who-name span {
+    font-size: 12px;
+    color: var(--ctp-subtext0);
+  }
+  .pill {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--ctp-surface0);
+    color: var(--ctp-subtext1);
+    white-space: nowrap;
+  }
+  .pill-admin {
+    background: color-mix(in srgb, var(--ctp-teal) 18%, transparent);
+    color: var(--ctp-teal);
+  }
+  .state {
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .state-ok {
+    color: var(--ctp-green);
+  }
+  .state-warn {
+    color: var(--ctp-yellow);
+  }
+  .state-bad {
+    color: var(--ctp-red);
+  }
+  /* An on/off switch: a button with role="switch". */
+  .switch {
+    width: 42px;
+    height: 24px;
+    border-radius: 12px;
+    border: 0;
+    padding: 0;
+    background: var(--ctp-surface1);
+    position: relative;
+    flex-shrink: 0;
+    cursor: pointer;
+  }
+  .switch::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 20px;
+    height: 20px;
+    border-radius: 10px;
+    background: var(--ctp-crust);
+    transition: left 0.15s;
+  }
+  .switch[aria-checked="true"] {
+    background: var(--ctp-teal);
+  }
+  .switch[aria-checked="true"]::after {
+    left: 20px;
+  }
+  .switch:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  /* What a change did, over the page's corner until dismissed. */
+  .toast {
+    position: fixed;
+    right: 24px;
+    bottom: 24px;
+    z-index: 20;
+    width: 440px;
+    max-width: calc(100% - 32px);
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-radius: 12px;
+    background: var(--ctp-surface0);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+    font-size: 14px;
+  }
+  @media (max-width: 480px) {
+    .toast {
+      right: 16px;
+      bottom: 16px;
+    }
+  }
+  .toast > span {
+    flex-grow: 1;
+  }
+  .toast-ok svg:first-child {
+    color: var(--ctp-green);
+  }
+  .toast-bad svg:first-child {
+    color: var(--ctp-red);
+  }
+  .toast button {
+    border: 0;
+    background: transparent;
+    color: var(--ctp-subtext0);
+    cursor: pointer;
+    display: flex;
+  }
+  /* A dialog's line under a field. */
+  .hint {
+    font-size: 12px;
+    color: var(--ctp-subtext0);
+    margin-top: -8px;
+  }
+  .dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+  .dialog p {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ctp-subtext1);
+  }
+  .field select {
+    height: 40px;
+    border-radius: 8px;
+    border: 1px solid var(--ctp-surface1);
+    background: var(--ctp-base);
+    color: var(--ctp-text);
+    padding: 0 10px;
+    font: 500 14px var(--font-sans);
+  }
+  /* A card that stands for an empty list, or for one that did not load. */
+  .empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    text-align: center;
+    padding: 28px 20px;
+  }
+  .empty > svg {
+    color: var(--ctp-teal);
+  }
+  .empty b {
+    font-size: 16px;
+  }
+  .empty span {
+    font-size: 13px;
+    color: var(--ctp-subtext0);
+  }
+  .back-link {
+    font-size: 14px;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    align-self: flex-start;
+  }
+  /* A user as a phone shows them: a card that opens their page. */
+  .user-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px;
+    border-radius: 12px;
+    background: var(--ctp-mantle);
+    border: 1px solid var(--ctp-surface0);
+    color: var(--ctp-text);
+    text-decoration: none;
+  }
+  .user-card.off {
+    opacity: 0.75;
+  }
+  .user-card > span:nth-child(2) {
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+    min-width: 0;
+  }
+  .user-card > span:nth-child(2) span {
+    font-size: 12px;
+    color: var(--ctp-subtext0);
+  }
+  .user-card > svg {
+    color: var(--ctp-subtext0);
+    flex-shrink: 0;
+  }
+  /* The phone's menu: the sidebar's links, over the page under the bar. */
+  .drawer-scrim {
+    position: fixed;
+    inset: 56px 0 0 0;
+    background: rgba(17, 17, 27, 0.6);
+    z-index: 15;
+  }
+  .drawer {
+    position: fixed;
+    top: 56px;
+    left: 0;
+    bottom: 0;
+    width: 280px;
+    max-width: 85%;
+    background: var(--ctp-mantle);
+    padding: 14px 12px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    z-index: 16;
+  }
+  .icon-button {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    border: 0;
+    background: transparent;
+    color: var(--ctp-text);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  /* The Server page: its card beside Plex's and the paths', or under
+   * them on a phone. */
+  .server-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
+    gap: 16px;
+    align-items: start;
+  }
+  /* A label and its value in a card. */
+  .pair {
+    display: grid;
+    grid-template-columns: 150px 1fr;
+    gap: 12px;
+    align-items: start;
+    font-size: 14px;
+    padding: 4px 0;
+  }
+  @media (max-width: 480px) {
+    .pair {
+      grid-template-columns: 96px 1fr;
+    }
+  }
+  .pair-label {
+    color: var(--ctp-subtext0);
+  }
+  .mono-value {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--ctp-text);
+    overflow-wrap: anywhere;
+  }
+  /* The key's fingerprint: what a client shows, to be compared. */
+  .fingerprint {
+    font-family: var(--font-mono);
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+    color: var(--ctp-teal);
   }
 }

@@ -1,0 +1,3 @@
+# The design's fonts, copied in by the build (devenv task spoolframe:fonts,
+# nix/package.nix) from nixpkgs' google-fonts; never fetched at run time.
+*.ttf
