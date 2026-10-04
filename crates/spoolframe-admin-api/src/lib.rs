@@ -16,7 +16,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-pub use spoolframe_types::Role;
+pub use spoolframe_types::{LibraryKind, Role};
 
 /// JSON-RPC error codes the admin API returns, beside the standard ones.
 pub mod error_code {
@@ -63,6 +63,9 @@ pub mod error_code {
     /// Not a device sign-in code that can be approved: a typo, a guess, or
     /// one already used or expired.
     pub const NO_SUCH_SIGN_IN_CODE: i32 = -32019;
+    /// A setting the server's locked config file sets (P3-10): only that
+    /// file can change it.
+    pub const SETTING_LOCKED: i32 = -32020;
 }
 
 /// A username and password.
@@ -347,6 +350,11 @@ pub struct ServerStatus {
     /// Where clients reach it: the endpoint's bound addresses.
     #[serde(default)]
     pub addresses: Vec<String>,
+    /// The tesseract languages bitmap subtitles are read as text in
+    /// (P2-07), as tesseract names them (`eng`); none when OCR is off.
+    pub ocr_languages: Vec<String>,
+    /// Where the web UI answers (P3-10): `http://<address>:<port>/`.
+    pub web_urls: Vec<String>,
 }
 
 /// Plex as the server sees it now (P3-02).
@@ -360,6 +368,8 @@ pub struct PlexStatus {
     /// What the PMS calls itself.
     #[serde(default)]
     pub server_name: Option<String>,
+    /// The PMS's version.
+    pub version: Option<String>,
     /// Where the server reaches it: `plex.url`, without the token.
     pub url: Option<String>,
     #[serde(default)]
@@ -405,6 +415,141 @@ pub struct TranscodingStatus {
     pub audio_encoders: Vec<String>,
     /// Codecs with a working hardware decoder, as `hevc (vaapi)`.
     pub hardware_decoders: Vec<String>,
+}
+
+/// Where a setting's value comes from (P3-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SettingLayer {
+    /// The built-in defaults.
+    Default,
+    /// The server's config file (`--config`).
+    File,
+    /// Changed in the web UI or with `config set`.
+    Runtime,
+}
+
+/// When a change to a setting takes effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SettingApply {
+    /// At once.
+    Live,
+    /// At the next start.
+    Restart,
+}
+
+/// One setting as the server has it now (P3-10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingEntry {
+    /// Dotted, as `config show` names it: `plex.url`.
+    pub key: String,
+    /// The value in effect, as JSON; `None` when no layer sets it, and
+    /// always for a secret.
+    pub value: Option<serde_json::Value>,
+    /// A secret (the Plex token): never shown, only whether it is set.
+    pub secret: bool,
+    /// For a secret, whether it is set; otherwise whether `value` is.
+    pub set: bool,
+    /// Where `value` comes from; `None` when nothing sets it.
+    pub layer: Option<SettingLayer>,
+    /// Set by the server's config file, which is locked: it cannot be
+    /// changed here.
+    pub locked: bool,
+    /// What the config file says, when a runtime value overrides it.
+    pub overrides: Option<serde_json::Value>,
+    pub apply: SettingApply,
+    /// A restart setting changed since the server started: what the
+    /// server runs with is not `value` yet.
+    pub restart_pending: bool,
+}
+
+/// Every setting, and what the page around them needs to know.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    pub entries: Vec<SettingEntry>,
+    /// The server's config file, if it has one.
+    pub config_file: Option<String>,
+    /// The server runs under a supervisor (systemd) that starts it again,
+    /// so `admin.restart` can apply restart settings.
+    pub can_restart: bool,
+}
+
+/// The setup wizard's progress (P3-10): which steps are confirmed, by
+/// their ids (`admin`, `server`, `plex`, …), and whether it is over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupState {
+    pub finished: bool,
+    pub done: Vec<String>,
+}
+
+/// A Plex Media Server that answered Plex's LAN discovery (GDM).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredPlex {
+    pub name: String,
+    /// `http://<address>:<port>`.
+    pub url: String,
+    pub version: Option<String>,
+}
+
+/// A plex.tv PIN to approve (Sign in with Plex).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexPin {
+    /// For `plexPinCheck`.
+    pub id: u64,
+    /// What a person types at plex.tv/link.
+    pub code: String,
+    /// Plex's sign-in page for it, to open in a new tab.
+    pub auth_url: String,
+    /// Seconds until plex.tv forgets it.
+    pub expires_in: Option<u64>,
+}
+
+/// Where a PIN is. The token itself never leaves the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum PlexPinState {
+    Waiting,
+    /// Approved: the server keeps the token as `plex.token`. `account` is
+    /// who it signs in, when plex.tv says.
+    Linked {
+        account: Option<String>,
+    },
+    /// plex.tv has forgotten it: begin another.
+    Expired,
+}
+
+/// One `plex.path_mapping` rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathMappingEntry {
+    /// The Plex library it is for; every library if `None`.
+    pub library: Option<String>,
+    pub from: String,
+    pub to: String,
+}
+
+/// One library's sample of media files, checked with some mappings
+/// (P3-10): the wizard's live check, before the mappings are saved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryPathCheck {
+    pub library: String,
+    /// The library's folders, as Plex sees them.
+    pub roots: Vec<String>,
+    /// How many files were looked at.
+    pub checked: u64,
+    pub ok: u64,
+    /// `"<plex path> -> <local path>: <reason>"`, a few.
+    pub failures: Vec<String>,
+    /// A mapping that would make the failing files readable, found by
+    /// looking for them in the usual mount points.
+    pub suggestion: Option<PathMappingEntry>,
 }
 
 /// What a Plex watch sync run did, or would do (PX-04): one line per item.
@@ -702,4 +847,77 @@ pub trait AdminApi {
     /// what would change.
     #[method(name = "plexWatchSync", with_extensions)]
     async fn plex_watch_sync(&self, dry_run: bool) -> jsonrpsee::core::RpcResult<PlexSyncReport>;
+
+    /// Every setting: its value, where it comes from, and whether it
+    /// applies now or after a restart (P3-10).
+    #[method(name = "settings", with_extensions)]
+    async fn settings(&self) -> jsonrpsee::core::RpcResult<Settings>;
+
+    /// Set `key` in the runtime settings. The value is checked as a config
+    /// file is at start: one the server would refuse is `INVALID_INPUT`
+    /// with the message the file would get. `SETTING_LOCKED` for what the
+    /// locked config file sets. A live setting applies at once; a restart
+    /// one is saved, and `restartPending`. `plex.token` is kept as a
+    /// secret, never in the runtime settings.
+    #[method(name = "settingSet", with_extensions)]
+    async fn setting_set(
+        &self,
+        key: String,
+        value: serde_json::Value,
+    ) -> jsonrpsee::core::RpcResult<SettingEntry>;
+
+    /// Take `key` out of the runtime settings: the config file's value or
+    /// the default applies again.
+    #[method(name = "settingUnset", with_extensions)]
+    async fn setting_unset(&self, key: String) -> jsonrpsee::core::RpcResult<SettingEntry>;
+
+    /// Stop the server so its supervisor starts it again, with the restart
+    /// settings applied. `NOT_CONFIGURED` where nothing would start it
+    /// again (`Settings::can_restart`).
+    #[method(name = "restart", with_extensions)]
+    async fn restart(&self) -> jsonrpsee::core::RpcResult<()>;
+
+    /// The setup wizard's progress (P3-10).
+    #[method(name = "setupState", with_extensions)]
+    async fn setup_state(&self) -> jsonrpsee::core::RpcResult<SetupState>;
+
+    /// Step `step` is confirmed: a wizard opened later resumes after it.
+    #[method(name = "setupStepDone", with_extensions)]
+    async fn setup_step_done(&self, step: String) -> jsonrpsee::core::RpcResult<SetupState>;
+
+    /// The wizard is over: the web UI opens the admin pages from now on.
+    #[method(name = "setupFinish", with_extensions)]
+    async fn setup_finish(&self) -> jsonrpsee::core::RpcResult<SetupState>;
+
+    /// The Plex Media Servers that answer Plex's LAN discovery, within
+    /// about a second and a half.
+    #[method(name = "plexDiscover", with_extensions)]
+    async fn plex_discover(&self) -> jsonrpsee::core::RpcResult<Vec<DiscoveredPlex>>;
+
+    /// The PMS at `url` as `plexStatus` would show it, without saving
+    /// anything: with `token`, or else the one the server has.
+    #[method(name = "plexProbe", with_extensions)]
+    async fn plex_probe(
+        &self,
+        url: String,
+        token: Option<String>,
+    ) -> jsonrpsee::core::RpcResult<PlexStatus>;
+
+    /// Begin signing in with Plex: a plex.tv PIN. `UNAVAILABLE` when
+    /// plex.tv cannot be reached.
+    #[method(name = "plexPinBegin", with_extensions)]
+    async fn plex_pin_begin(&self) -> jsonrpsee::core::RpcResult<PlexPin>;
+
+    /// Whether PIN `id` (from `plexPinBegin`) is approved; once it is, the
+    /// server keeps the account's token as `plex.token`.
+    #[method(name = "plexPinCheck", with_extensions)]
+    async fn plex_pin_check(&self, id: u64) -> jsonrpsee::core::RpcResult<PlexPinState>;
+
+    /// A few media files of each library, checked with `mappings` instead
+    /// of the saved ones, with a suggested mapping where they fail.
+    #[method(name = "plexPathCheck", with_extensions)]
+    async fn plex_path_check(
+        &self,
+        mappings: Vec<PathMappingEntry>,
+    ) -> jsonrpsee::core::RpcResult<Vec<LibraryPathCheck>>;
 }

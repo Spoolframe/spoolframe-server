@@ -1637,7 +1637,7 @@ while preserving the client-facing protocol and federation model.
 
 These are the decisions that should remain stable unless there is a strong reason to revisit them.
 
-1. **Plex is temporary metadata/library infrastructure, not the streaming engine.**
+1. **Plex is one optional library source, never the streaming engine.** (Was: "temporary infrastructure"; the user made Plex libraries first class, next to Spoolframe's own, P9.)
 2. **Spoolframe always runs its own ffprobe and ffmpeg logic.**
 3. **Clients see Spoolframe models, never Plex models.**
 4. **Linux is a first-class client.**
@@ -1655,7 +1655,7 @@ These are the decisions that should remain stable unless there is a strong reaso
 16. **Federation shares metadata and authorization; it does not require proxying the media path.**
 17. **Relays are optional transport infrastructure, never identity authorities.**
 18. **The system must continue to function on a surviving LAN without public Internet infrastructure.**
-19. **The eventual removal of Plex must not require redesigning clients or federation.**
+19. **Adding or removing Plex libraries, or a server without Plex at all, must not require redesigning clients or federation.**
 
 ---
 

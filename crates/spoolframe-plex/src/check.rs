@@ -2,7 +2,7 @@
 //! library, which ones this host can read (P1-04). A bad mapping shows up
 //! when the admin sets it up, not when somebody presses play.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use spoolframe_catalog::CatalogError;
 use spoolframe_types::LibraryKind;
@@ -37,6 +37,11 @@ impl Failures {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LibraryPaths {
     pub library: String,
+    /// The library's folders, as Plex sees them.
+    pub roots: Vec<PathBuf>,
+    /// The Plex paths of the first few files that cannot be read, for
+    /// suggesting a mapping ([`crate::paths::suggest`]).
+    pub failed: Vec<PathBuf>,
     /// Files that are readable after mapping.
     pub ok: u64,
     /// Unreadable files that no mapping matched: probably a mapping is
@@ -109,6 +114,11 @@ impl PlexCatalog {
     ) -> Result<LibraryPaths, CatalogError> {
         let mut report = LibraryPaths {
             library: dir.title.clone(),
+            roots: dir
+                .locations
+                .iter()
+                .map(|l| PathBuf::from(&l.path))
+                .collect(),
             ..LibraryPaths::default()
         };
         let limit = match scope {
@@ -147,6 +157,9 @@ impl PlexCatalog {
             report.ok += 1;
             return;
         };
+        if report.failed.len() < EXAMPLES {
+            report.failed.push(file.to_owned());
+        }
         let example = || format!("{} -> {}: {reason}", file.display(), mapped.local.display());
         match mapped.mapping {
             None => report.no_mapping.add(example),

@@ -79,6 +79,9 @@ pub enum CatalogError {
         item: Option<String>,
         message: String,
     },
+    /// There is no catalog yet: the server has not been set up (P3-10).
+    #[error("this server is not set up yet: it has no library")]
+    NotSetUp,
 }
 
 /// A media file that cannot be read on this host. Names the path the

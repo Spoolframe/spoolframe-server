@@ -31,7 +31,7 @@ use spoolframe_server::auth::{Auth, hash_password};
 use spoolframe_server::encode::JobLimits;
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
-use spoolframe_server::network::{EndpointOptions, Relay, Server, Services};
+use spoolframe_server::network::{EndpointOptions, Relay, Server, ServerName, Services};
 use spoolframe_server::playback::Playbacks;
 use spoolframe_server::store::Store;
 use spoolframe_server::subtitles::{OcrSettings, Subtitles};
@@ -493,6 +493,9 @@ pub struct ServerOptions {
     pub disconnect_grace: Duration,
     /// Where browsers reach the web UI (`admin.public_url`), if anywhere.
     pub public_url: Option<String>,
+    /// Serve from a catalog that is not set up yet (P3-10) instead of the
+    /// fake one.
+    pub not_set_up: bool,
 }
 
 impl Default for ServerOptions {
@@ -513,6 +516,7 @@ impl Default for ServerOptions {
             sign_in_lifetime: spoolframe_server::device_sign_in::LIFETIME,
             disconnect_grace: spoolframe_server::playback::DISCONNECT_GRACE,
             public_url: None,
+            not_set_up: false,
         }
     }
 }
@@ -563,6 +567,8 @@ fn test_module() -> String {
 /// A running server on loopback, with its database at hand.
 pub struct TestServer {
     pub server: Server,
+    /// What it is called: a live setting (P3-10).
+    pub name: ServerName,
     pub store: Store,
     /// Its logins, sessions and pending device sign-ins: what an admin
     /// API beside it shares.
@@ -595,7 +601,11 @@ impl TestServer {
             old_keys: Mutex::default(),
             calls: Mutex::default(),
         });
-        let catalog: Arc<dyn Catalog> = fake.clone();
+        let catalog: Arc<dyn Catalog> = if options.not_set_up {
+            Arc::new(spoolframe_server::catalog::LiveCatalog::default())
+        } else {
+            fake.clone()
+        };
         let artwork =
             ArtworkCache::open(&dir.join("cache/artwork"), 64 << 20, catalog.clone()).unwrap();
         let ffprobe = if options.real_media {
@@ -603,7 +613,7 @@ impl TestServer {
         } else {
             fake_ffprobe(&dir)
         };
-        let prober = Arc::new(Prober::new(ffprobe, Prober::DEFAULT_TIMEOUT));
+        let prober = Arc::new(Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT));
         let jobs = Jobs::new(
             JobLimits {
                 max_jobs: options.max_jobs,
@@ -623,6 +633,7 @@ impl TestServer {
         let subtitles = Subtitles::new(
             ocr,
             PathBuf::from("ffmpeg"),
+            ffprobe,
             &OcrSettings {
                 enabled: true,
                 threads: 2,
@@ -658,11 +669,13 @@ impl TestServer {
             relay: Relay::Disabled,
             mdns: options.mdns,
         };
-        let server = Server::start(key, &endpoint, &options.name, services)
+        let name = ServerName::new(options.name.clone());
+        let server = Server::start(key, &endpoint, &name, services)
             .await
             .unwrap();
         Self {
             server,
+            name,
             store,
             auth,
             public_url: options.public_url,
@@ -766,6 +779,28 @@ impl TestServer {
             .status()
             .expect("ffmpeg runs");
         assert!(status.success(), "ffmpeg could not add the PGS track");
+        std::fs::rename(&with, &self.media).unwrap();
+    }
+
+    /// Give the movie made with [`TestServer::generate_media`] an English
+    /// track (stream 2) of what [`TestServer::add_pgs`] shows, encoded by
+    /// ffmpeg's `codec`: `dvdsub` (VobSub) or `dvbsub`. `-fix_sub_duration`
+    /// gives each cue the length PGS says with a packet of its own.
+    pub fn add_bitmap_track(&self, codec: &str, cues: &[(&str, u64, u64)]) {
+        let sup = self.dir.join("bitmap.sup");
+        std::fs::write(&sup, Self::pgs(cues)).unwrap();
+        let with = self.media.with_extension("bitmap.mkv");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&self.media)
+            .args(["-copyts", "-fix_sub_duration", "-i"])
+            .arg(&sup)
+            .args(["-map", "0", "-map", "1", "-c", "copy", "-c:s", codec])
+            .args(["-metadata:s:s:0", "language=eng"])
+            .arg(&with)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not add the {codec} track");
         std::fs::rename(&with, &self.media).unwrap();
     }
 

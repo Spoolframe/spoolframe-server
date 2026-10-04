@@ -12,7 +12,9 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use jsonrpsee::core::ClientError;
 use jsonrpsee::ws_client::{HeaderMap, WsClient, WsClientBuilder};
-use spoolframe_admin_api::{AdminApiClient, Credentials, MeApiClient, NewUser, Role, SetupRequest};
+use spoolframe_admin_api::{
+    AdminApiClient, Credentials, MeApiClient, NewUser, Role, SetupRequest, error_code,
+};
 
 #[derive(Subcommand)]
 pub enum UserCommand {
@@ -324,7 +326,12 @@ pub async fn status(listen: SocketAddr) -> Result<()> {
     let api = connect(listen, Some(&login.token)).await?;
     let result = async {
         let status = api.server_status().await.map_err(api_error)?;
-        let plex = api.plex_status().await.map_err(api_error)?;
+        // A server that is not set up has no Plex to ask about.
+        let plex = match api.plex_status().await {
+            Ok(plex) => Some(plex),
+            Err(ClientError::Call(e)) if e.code() == error_code::NOT_CONFIGURED => None,
+            Err(e) => return Err(api_error(e)),
+        };
         Ok::<_, anyhow::Error>((status, plex))
     }
     .await;
@@ -363,6 +370,10 @@ pub async fn status(listen: SocketAddr) -> Result<()> {
     );
     println!("mDNS: {}", if status.mdns { "on" } else { "off" });
     println!("addresses: {}", list(&status.addresses));
+    let Some(plex) = plex else {
+        println!("Plex: not set up");
+        return Ok(());
+    };
     match plex.error {
         None => println!(
             "Plex: {}",
@@ -525,6 +536,45 @@ fn when(secs: i64) -> String {
         rest / 3600,
         rest / 60 % 60
     )
+}
+
+/// `config set` and `config unset`: a runtime setting, through the
+/// running server, which checks it as a config file is checked and
+/// applies it. `value` is JSON (`3`, `true`, `[{"from": "/a", "to": "/b"}]`)
+/// or else a string; `None` unsets.
+pub async fn config_change(listen: SocketAddr, key: &str, value: Option<&str>) -> Result<()> {
+    let login = connect(listen, None)
+        .await?
+        .login(admin_credentials()?)
+        .await
+        .map_err(api_error)?;
+    let api = connect(listen, Some(&login.token)).await?;
+    let result = match value {
+        Some(text) => {
+            // A token is a string whatever it looks like.
+            let value = match serde_json::from_str(text) {
+                Ok(value) if key != "plex.token" => value,
+                _ => serde_json::Value::String(text.to_owned()),
+            };
+            api.setting_set(key.to_owned(), value).await
+        }
+        None => api.setting_unset(key.to_owned()).await,
+    };
+    if let Err(e) = api.logout().await {
+        tracing::debug!(error = %e, "logout");
+    }
+    let entry = result.map_err(api_error)?;
+    let value = match (&entry.value, entry.secret) {
+        (_, true) if entry.set => "(set)".to_owned(),
+        (_, true) => "(not set)".to_owned(),
+        (Some(value), false) => value.to_string(),
+        (None, false) => "(not set)".to_owned(),
+    };
+    println!("{} = {value}", entry.key);
+    if entry.restart_pending {
+        println!("applies after a restart");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

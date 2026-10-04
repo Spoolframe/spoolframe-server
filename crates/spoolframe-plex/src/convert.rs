@@ -366,6 +366,7 @@ mod tests {
             key: "5".into(),
             kind: Some("photo".into()),
             title: "Photos".into(),
+            locations: Vec::new(),
         };
         assert_eq!(library(&dir), Ok(None));
     }

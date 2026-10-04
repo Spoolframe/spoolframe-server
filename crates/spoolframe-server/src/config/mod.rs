@@ -3,6 +3,16 @@
 //! Every section is `deny_unknown_fields`, and a repeated key is an error:
 //! a misspelt or duplicated setting fails at startup instead of being
 //! quietly ignored.
+//!
+//! A server's settings come from three layers merged key by key
+//! ([`layers`], P3-10): the built-in defaults, the provided file, and the
+//! runtime layer the server writes itself. [`ServerConfig`] is what they
+//! make together.
+
+pub mod layers;
+pub mod secrets;
+pub mod settings;
+pub mod tree;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -48,6 +58,26 @@ pub enum ConfigError {
     /// The Plex token file holds no token.
     #[error("plex.token_file {path} is empty")]
     EmptyToken { path: PathBuf },
+    /// A layer's mistake, with the file it is in.
+    #[error("{}: {source}", path.display())]
+    File {
+        path: PathBuf,
+        source: Box<ConfigError>,
+    },
+    /// The provided file names the state directory, which only the
+    /// command line or the environment say now (P3-10).
+    #[error(
+        "{}: state_dir is no longer read from the config file: remove it, and pass \
+         --state-dir {value} (or set SPOOLFRAME_STATE_DIR={value}) instead",
+        path.display()
+    )]
+    StateDirKey { path: PathBuf, value: String },
+    /// Nothing says where the state directory is.
+    #[error(
+        "no state directory: pass --state-dir <dir> or set SPOOLFRAME_STATE_DIR \
+         (or XDG_STATE_HOME, or HOME)"
+    )]
+    NoStateDir,
 }
 
 /// A parsed `spoolframe.server.v1` config.
@@ -59,11 +89,10 @@ pub struct ServerConfig {
     /// What clients show for this server; "Spoolframe" if left out.
     #[ucl(default)]
     pub name: Option<String>,
-    /// Where the server keeps its state: its endpoint key, its database
-    /// and its caches.
-    pub state_dir: PathBuf,
-    /// The Plex Media Server the catalog reads from.
-    pub plex: PlexConfig,
+    /// The Plex Media Server the catalog reads from. Without one the
+    /// server is not set up (P3-10): clients are told so.
+    #[ucl(default)]
+    pub plex: Option<PlexConfig>,
     /// The Iroh endpoint clients connect to.
     #[ucl(default)]
     pub network: NetworkConfig,
@@ -85,6 +114,22 @@ pub struct ServerConfig {
     /// Bitmap subtitles read as text (P2-07).
     #[ucl(default)]
     pub subtitles: SubtitlesConfig,
+    /// The setup wizard's progress (P3-10): the server's own, kept in the
+    /// runtime layer, not a setting.
+    #[ucl(default)]
+    pub setup: SetupConfig,
+}
+
+/// `setup { done = ["admin", "server"]; finished = false; }`: written by
+/// the server as the wizard's steps are confirmed.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct SetupConfig {
+    /// The ids of the confirmed steps.
+    #[ucl(default)]
+    pub done: Vec<String>,
+    #[ucl(default)]
+    pub finished: Option<bool>,
 }
 
 /// `watch { started_after_secs = 60; watched_percent = 95; }`, both
@@ -297,19 +342,17 @@ impl ArtworkConfig {
     }
 }
 
-/// `admin { listen = "127.0.0.1:7421"; allow_remote = false;
-/// public_url = "https://media.example.org";
-/// trusted_proxies = "10.0.0.5, 172.17.0.0/16"; }`, all optional.
+/// `admin { listen = "0.0.0.0:7421"; public_url = "https://media.example.org";
+/// trusted_proxies = "10.0.0.5, 172.17.0.0/16"; insecure_cookies = false; }`,
+/// all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct AdminConfig {
-    /// Where the admin API listens; `127.0.0.1:7421` if left out.
+    /// Where the admin API and the web UI listen; every IPv4 interface on
+    /// port 7421 if left out (P3-10). Loopback, for a host whose TLS proxy
+    /// runs on the same machine.
     #[ucl(default)]
     pub listen: Option<String>,
-    /// Allow a non-loopback `listen`. Passwords and tokens cross the API
-    /// in clear, so only behind a TLS reverse proxy.
-    #[ucl(default)]
-    pub allow_remote: Option<bool>,
     /// Where browsers reach the web UI, when it is behind a TLS proxy
     /// (P3-01): the only origin then allowed to sign in and use it. Left
     /// out, a browser must be on the listener's own host, as it is directly
@@ -328,10 +371,19 @@ pub struct AdminConfig {
     /// a loopback one under none.
     #[ucl(default)]
     pub trusted_proxies: Option<String>,
+    /// Send the session cookie without `Secure` and `HttpOnly`, so signing
+    /// in over plain HTTP on the LAN works: the cookie then crosses the
+    /// network in clear, and page scripts can read it. Off if left out.
+    #[ucl(default)]
+    pub insecure_cookies: Option<bool>,
 }
 
 impl AdminConfig {
-    pub const DEFAULT_LISTEN: &'static str = "127.0.0.1:7421";
+    pub const DEFAULT_LISTEN: &'static str = "0.0.0.0:7421";
+
+    pub fn insecure_cookies(&self) -> bool {
+        self.insecure_cookies.unwrap_or(false)
+    }
 
     /// The origins browsers may use the admin listener from: `public_url`'s
     /// (scheme, host and port; any path dropped), or the listener's own.
@@ -363,24 +415,13 @@ impl AdminConfig {
         })
     }
 
-    /// The address to listen on, refused if it is not loopback and
-    /// `allow_remote` is not set.
+    /// The address to listen on.
     pub fn listen(&self) -> Result<SocketAddr, ConfigError> {
         let text = self.listen.as_deref().unwrap_or(Self::DEFAULT_LISTEN);
-        let addr: SocketAddr = text.parse().map_err(|e| ConfigError::Invalid {
+        text.parse().map_err(|e| ConfigError::Invalid {
             key: "admin.listen",
             message: format!("{text:?}: {e}"),
-        })?;
-        if !addr.ip().is_loopback() && !self.allow_remote.unwrap_or(false) {
-            return Err(ConfigError::Invalid {
-                key: "admin.listen",
-                message: format!(
-                    "{addr} is not a loopback address; passwords cross the admin API \
-                     in clear, so put it behind a TLS proxy and set allow_remote = true"
-                ),
-            });
-        }
-        Ok(addr)
+        })
     }
 }
 
@@ -571,25 +612,25 @@ impl ServerConfig {
                 found: parsed.schema,
             });
         }
-        parsed.plex.url()?;
-        parsed.plex.path_map()?;
+        if let Some(plex) = &parsed.plex {
+            plex.url()?;
+            plex.path_map()?;
+        }
         parsed.network.endpoint_options()?;
         parsed.admin.listen()?;
         parsed.admin.origins()?;
+        parsed.admin.trusted_proxies()?;
         parsed.watch.rules()?;
         parsed.transcode.settings()?;
-        parsed.transcode.limits(&parsed.state_dir)?;
-        parsed.subtitles.ocr_settings(&parsed.state_dir)?;
+        // Any directory: only the values are checked here.
+        parsed.transcode.limits(Path::new("/"))?;
+        parsed.subtitles.ocr_settings(Path::new("/"))?;
         Ok(parsed)
     }
 
-    /// Read and parse the config file at `path`.
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.to_owned(),
-            source,
-        })?;
-        Self::parse(&text)
+    /// Parse merged layers.
+    pub fn from_table(table: &tree::Table) -> Result<Self, ConfigError> {
+        Self::parse(&tree::to_document(table))
     }
 }
 
@@ -602,12 +643,11 @@ mod tests {
         let config = ServerConfig::parse(
             r#"
             schema = "spoolframe.server.v1";
-            state_dir = "/var/lib/spoolframe";
             plex { url = "http://nas:32400"; }
             "#,
         )
         .unwrap();
-        assert_eq!(config.state_dir, PathBuf::from("/var/lib/spoolframe"));
+        assert_eq!(config.plex.unwrap().url, "http://nas:32400");
     }
 
     #[test]
@@ -615,8 +655,7 @@ mod tests {
         let err = ServerConfig::parse(
             r#"
             schema = "spoolframe.server.v1";
-            state_dir = "/var/lib/spoolframe";
-            state_dri = "/tmp";
+            nmae = "Den";
             plex { url = "http://nas:32400"; }
             "#,
         )
@@ -629,8 +668,8 @@ mod tests {
         let err = ServerConfig::parse(
             r#"
             schema = "spoolframe.server.v1";
-            state_dir = "/var/lib/spoolframe";
-            state_dir = "/srv/spoolframe";
+            name = "Den";
+            name = "Attic";
             plex { url = "http://nas:32400"; }
             "#,
         )
@@ -643,7 +682,6 @@ mod tests {
         let err = ServerConfig::parse(
             r#"
             schema = "spoolframe.server.v2";
-            state_dir = "/var/lib/spoolframe";
             plex { url = "http://nas:32400"; }
             "#,
         )
@@ -656,7 +694,11 @@ mod tests {
 
     #[test]
     fn a_missing_file_names_its_path() {
-        let err = ServerConfig::load(Path::new("/nonexistent/spoolframe.ucl")).unwrap_err();
+        let locations = layers::Locations {
+            state_dir: PathBuf::from("/nonexistent/state"),
+            config: Some(PathBuf::from("/nonexistent/spoolframe.ucl")),
+        };
+        let err = layers::Layers::load(&locations).unwrap_err();
         assert!(
             err.to_string().contains("/nonexistent/spoolframe.ucl"),
             "{err}"
@@ -667,16 +709,14 @@ mod tests {
         ServerConfig::parse(&format!(
             r#"
             schema = "spoolframe.server.v1";
-            state_dir = "/var/lib/spoolframe";
             {section}
             "#
         ))
     }
 
     #[test]
-    fn the_plex_section_is_required() {
-        let err = plex("").unwrap_err();
-        assert!(matches!(err, ConfigError::Ucl(_)), "{err:?}");
+    fn the_plex_section_is_optional() {
+        assert!(plex("").unwrap().plex.is_none());
     }
 
     #[test]
@@ -686,11 +726,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.plex.url().unwrap().as_str(),
+            config.plex.as_ref().unwrap().url().unwrap().as_str(),
             "http://192.168.1.20:32400/"
         );
         assert_eq!(
-            config.plex.token_file,
+            config.plex.unwrap().token_file,
             Some(PathBuf::from("/run/secrets/plex"))
         );
     }
@@ -730,7 +770,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let mappings = &config.plex.path_mapping;
+        let mappings = &config.plex.as_ref().unwrap().path_mapping;
         assert_eq!(mappings.len(), 2);
         assert_eq!(mappings[0].library, None);
         assert_eq!(mappings[1].library.as_deref(), Some("Music"));
@@ -841,10 +881,10 @@ mod tests {
     #[test]
     fn plex_watch_sync_is_off_unless_set() {
         let off = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
-        assert!(off.plex.watch_sync.is_none());
+        assert!(off.plex.unwrap().watch_sync.is_none());
         let on = plex(r#"plex { url = "http://nas:32400"; watch_sync { user = "andoriyu"; } }"#)
             .unwrap();
-        let sync = on.plex.watch_sync.unwrap();
+        let sync = on.plex.unwrap().watch_sync.unwrap();
         assert_eq!(sync.user, "andoriyu");
         assert_eq!(sync.interval(), Duration::from_secs(120));
     }
@@ -884,33 +924,20 @@ mod tests {
     }
 
     #[test]
-    fn the_admin_api_listens_on_loopback_by_default() {
-        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
-        assert_eq!(
-            config.admin.listen().unwrap(),
-            AdminConfig::DEFAULT_LISTEN.parse::<SocketAddr>().unwrap()
-        );
+    fn the_admin_api_listens_on_every_interface_by_default() {
+        let config = plex("").unwrap();
+        let listen = config.admin.listen().unwrap();
+        assert!(listen.ip().is_unspecified(), "{listen}");
+        assert_eq!(listen.port(), 7421);
+        assert!(!config.admin.insecure_cookies());
     }
 
     #[test]
-    fn a_non_loopback_admin_address_needs_allow_remote() {
-        let err = plex(r#"plex { url = "http://nas:32400"; } admin { listen = "0.0.0.0:7421"; }"#)
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ConfigError::Invalid {
-                    key: "admin.listen",
-                    ..
-                }
-            ),
-            "{err:?}"
-        );
-        let config = plex(
-            r#"plex { url = "http://nas:32400"; } admin { listen = "0.0.0.0:7421"; allow_remote = true; }"#,
-        )
-        .unwrap();
-        assert!(config.admin.listen().is_ok());
+    fn the_admin_api_can_still_listen_on_loopback_only() {
+        let config =
+            plex(r#"admin { listen = "127.0.0.1:7421"; insecure_cookies = true; }"#).unwrap();
+        assert!(config.admin.listen().unwrap().ip().is_loopback());
+        assert!(config.admin.insecure_cookies());
     }
 
     #[test]
@@ -932,11 +959,12 @@ mod tests {
 
     #[test]
     fn a_trusted_proxy_that_is_not_an_address_or_range_is_rejected() {
-        let config = plex(
+        // At parse, not only at start: a setting changed at run time is
+        // checked by the parse alone.
+        let err = plex(
             r#"plex { url = "http://nas:32400"; } admin { trusted_proxies = "proxy.example.org"; }"#,
         )
-        .unwrap();
-        let err = config.admin.trusted_proxies().unwrap_err();
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1027,7 +1055,7 @@ mod tests {
     #[test]
     fn path_mapping_is_optional() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
-        assert!(config.plex.path_mapping.is_empty());
+        assert!(config.plex.unwrap().path_mapping.is_empty());
     }
 
     #[test]
@@ -1060,7 +1088,7 @@ mod tests {
     #[test]
     fn without_a_token_file_there_is_no_token() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
-        assert_eq!(config.plex.token().unwrap(), None);
+        assert_eq!(config.plex.unwrap().token().unwrap(), None);
     }
 
     #[tokio::test]

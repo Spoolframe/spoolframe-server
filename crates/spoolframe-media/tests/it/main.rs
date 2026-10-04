@@ -3,5 +3,8 @@
 //! crate and all its dependencies again. A new test goes in as a module
 //! here, never as a new file under `tests/`.
 
+mod dvb;
 mod ocr;
 mod prober;
+mod samples;
+mod vobsub;

@@ -5500,6 +5500,7 @@ dependencies = [
  "spoolframe-catalog",
  "spoolframe-test-dir",
  "spoolframe-types",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "url",

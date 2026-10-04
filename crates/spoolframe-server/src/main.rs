@@ -1,5 +1,5 @@
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -9,16 +9,20 @@ use spoolframe_media::Prober;
 use spoolframe_media::encoders::FfmpegCommand;
 use spoolframe_media::ocr::Ocr;
 use spoolframe_plex::{Failures, LibraryPaths, PlexCatalog, Scope};
-use spoolframe_server::admin::{self, Admin, SetupCode, StatusSource};
+use spoolframe_server::admin::{self, Admin, CookiePolicy, SetupCode, StatusSource};
 use spoolframe_server::artwork::ArtworkCache;
 use spoolframe_server::auth::Auth;
+use spoolframe_server::catalog::LiveCatalog;
 use spoolframe_server::config::ServerConfig;
+use spoolframe_server::config::layers::{DEFAULTS, Layers, Locations};
+use spoolframe_server::config::secrets::Secrets;
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
-use spoolframe_server::network::{Server, Services};
+use spoolframe_server::network::{Server, ServerName, Services};
 use spoolframe_server::passkeys::Passkeys;
 use spoolframe_server::plex_sync::PlexSync;
 use spoolframe_server::principal::Principal;
+use spoolframe_server::runtime::{self, Live, RuntimeSettings};
 use spoolframe_server::store::Store;
 use spoolframe_server::subtitles::Subtitles;
 use spoolframe_server::transcode::{self, Transcoding};
@@ -41,9 +45,17 @@ const STARTUP_SAMPLE: u32 = 5;
 #[command(name = "spoolframe-server")]
 #[command(version)]
 struct Cli {
-    /// Path to the server config (UCL, schema `spoolframe.server.v1`).
-    #[arg(short, long, env = "SPOOLFRAME_CONFIG", global = true)]
+    /// The provided config file (UCL, schema `spoolframe.server.v1`), if
+    /// any; else `SPOOLFRAME_CONFIG`. Optional: the built-in defaults
+    /// (`config defaults`) are a server to set up in the web UI.
+    #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+
+    /// Where the server keeps its key, database, caches and runtime
+    /// settings; else `SPOOLFRAME_STATE_DIR`, systemd's `STATE_DIRECTORY`,
+    /// `$XDG_STATE_HOME/spoolframe`, or `/var/lib/spoolframe` as root.
+    #[arg(long, global = true)]
+    state_dir: Option<PathBuf>,
 
     /// Increase log verbosity (-v = debug, -vv = trace).
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -95,6 +107,39 @@ enum Command {
         #[command(subcommand)]
         command: UserCommand,
     },
+    /// The server's settings, and the layers they come from.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Print the built-in defaults: every setting at its default, with what
+    /// it does.
+    Defaults,
+    /// Print every setting with the layer it comes from: the defaults, the
+    /// provided file, or the runtime settings. Secrets only as set or not.
+    /// Read from the files, so it works with the server stopped.
+    Show,
+    /// Change a runtime setting through the running server, logged in as
+    /// an admin. It is checked as a config file is; a live setting applies
+    /// at once, a restart one at the next start.
+    Set {
+        /// Dotted, as `config show` names it: `transcode.max_jobs`.
+        key: String,
+        /// JSON (`3`, `true`, `[{"from": "/a", "to": "/b"}]`) or a plain
+        /// string. Left out with `--stdin`.
+        value: Option<String>,
+        /// Read the value from standard input: for `plex.token`, which
+        /// should not be on a command line.
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Take a setting out of the runtime settings: the config file's value
+    /// or the default applies again.
+    Unset { key: String },
 }
 
 #[derive(Subcommand)]
@@ -145,14 +190,57 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let Some(config_path) = cli.config else {
-        bail!("no config: pass --config <file> or set SPOOLFRAME_CONFIG");
-    };
-    let config = ServerConfig::load(&config_path)?;
-    tracing::info!(state_dir = %config.state_dir.display(), "config loaded");
+    if let Some(Command::Config {
+        command: ConfigCommand::Defaults,
+    }) = cli.command
+    {
+        print!("{DEFAULTS}");
+        return Ok(());
+    }
+    let locations = Locations::from_env(cli.state_dir, cli.config)?;
+    let layers = Layers::load(&locations)?;
+    let config = layers.config()?;
+    let state_dir = &locations.state_dir;
+    tracing::info!(
+        state_dir = %state_dir.display(),
+        config = ?locations.config,
+        "config loaded"
+    );
+    for key in layers.shadowed() {
+        tracing::warn!(
+            key,
+            "the locked config file sets this; the runtime settings' value is not used"
+        );
+    }
 
     match cli.command {
-        None => run(&config).await,
+        None => run(&config, &layers, state_dir).await,
+        Some(Command::Config {
+            command: ConfigCommand::Defaults,
+        }) => unreachable!("printed before the layers are read"),
+        Some(Command::Config {
+            command: ConfigCommand::Show,
+        }) => {
+            print!("{}", layers.show(&Secrets::new(state_dir)));
+            Ok(())
+        }
+        Some(Command::Config {
+            command: ConfigCommand::Set { key, value, stdin },
+        }) => {
+            let value = match (value, stdin) {
+                (Some(value), false) => value,
+                (None, true) => {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line.trim_end_matches(['\r', '\n']).to_owned()
+                }
+                _ => bail!("give the value, or --stdin"),
+            };
+            admin_cli::config_change(config.admin.listen()?, &key, Some(&value)).await
+        }
+        Some(Command::Config {
+            command: ConfigCommand::Unset { key },
+        }) => admin_cli::config_change(config.admin.listen()?, &key, None).await,
         Some(Command::Setup {
             code,
             username,
@@ -161,31 +249,41 @@ async fn main() -> Result<()> {
         Some(Command::User { command }) => admin_cli::user(config.admin.listen()?, command).await,
         Some(Command::Status) => admin_cli::status(config.admin.listen()?).await,
         Some(Command::Id) => {
-            println!("{}", identity::load_or_create(&config.state_dir)?.public());
+            println!("{}", identity::load_or_create(state_dir)?.public());
             Ok(())
         }
         Some(Command::Fingerprint) => {
             println!(
                 "{}",
-                identity::fingerprint(&identity::load_or_create(&config.state_dir)?)
+                identity::fingerprint(&identity::load_or_create(state_dir)?)
             );
             Ok(())
         }
         Some(Command::Plex {
             command: PlexCommand::CheckPaths { library },
-        }) => check_paths(&plex(&config)?, library.as_deref()).await,
+        }) => check_paths(&plex(&config, &layers, state_dir)?, library.as_deref()).await,
         Some(Command::Plex {
             command: PlexCommand::SyncWatch { dry_run },
         }) => admin_cli::plex_sync(config.admin.listen()?, dry_run).await,
         Some(Command::Media {
             command: MediaCommand::Probe { id },
-        }) => probe(&plex(&config)?, &id, config.media.ffprobe()).await,
+        }) => {
+            probe(
+                &plex(&config, &layers, state_dir)?,
+                &id,
+                config.media.ffprobe(),
+            )
+            .await
+        }
     }
 }
 
-fn plex(config: &ServerConfig) -> Result<PlexCatalog> {
-    Ok(PlexCatalog::new(config.plex.url()?, config.plex.token()?)?
-        .with_paths(config.plex.path_map()?))
+/// The Plex catalog, for the commands that read it directly.
+fn plex(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result<PlexCatalog> {
+    match runtime::plex_catalog(config, layers, &Secrets::new(state_dir))? {
+        Some(plex) => Ok(plex),
+        None => bail!("this server is not set up: no Plex server is configured (plex.url)"),
+    }
 }
 
 async fn probe(catalog: &dyn Catalog, id: &MediaId, ffprobe: PathBuf) -> Result<()> {
@@ -197,30 +295,37 @@ async fn probe(catalog: &dyn Catalog, id: &MediaId, ffprobe: PathBuf) -> Result<
 }
 
 /// Run the server until SIGINT or SIGTERM.
-async fn run(config: &ServerConfig) -> Result<()> {
+async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result<()> {
     // Before anything is logged: whatever waits for "listening" (a service
     // manager, the CLI tests) may send SIGTERM the moment it sees it, and a
     // signal with no handler yet kills the process instead of stopping it.
     let shutdown = shutdown_signal()?;
     // The key first: if it cannot be loaded nothing else should start.
-    let key = identity::load_or_create(&config.state_dir)?;
+    let key = identity::load_or_create(state_dir)?;
     // What a person compares with a client's screen before pinning (P1-21).
     tracing::info!(
         server = config.server_name(),
         fingerprint = identity::fingerprint(&key),
         "server identity"
     );
-    let plex = Arc::new(plex(config)?);
-    let catalog: Arc<dyn Catalog> = plex.clone();
-    check_catalog(&plex, catalog.as_ref()).await;
+    let plex = runtime::plex_catalog(config, layers, &Secrets::new(state_dir))?.map(Arc::new);
+    let live = Arc::new(LiveCatalog::new(plex.clone()));
+    let catalog: Arc<dyn Catalog> = live.clone();
+    match &plex {
+        Some(plex) => check_catalog(plex, catalog.as_ref()).await,
+        None => tracing::warn!(
+            "not set up: no Plex server is configured, so clients are told the server is not \
+             set up yet; set it up in the web UI"
+        ),
+    }
     let prober = Arc::new(Prober::new(config.media.ffprobe(), Prober::DEFAULT_TIMEOUT));
     let transcoding = Arc::new(Transcoding::new(
         Box::new(FfmpegCommand::new(config.media.ffmpeg())),
         config.transcode.settings()?,
-        config.state_dir.join("cache").join("encoder-test"),
+        state_dir.join("cache").join("encoder-test"),
     ));
     transcode::spawn_detection(transcoding.clone());
-    let limits = config.transcode.limits(&config.state_dir)?;
+    let limits = config.transcode.limits(state_dir)?;
     let jobs = Arc::new(
         Jobs::new(limits.clone(), config.media.ffmpeg()).with_context(|| {
             format!(
@@ -229,31 +334,39 @@ async fn run(config: &ServerConfig) -> Result<()> {
             )
         })?,
     );
-    let ocr_settings = config.subtitles.ocr_settings(&config.state_dir)?;
+    let ocr_settings = config.subtitles.ocr_settings(state_dir)?;
     let ocr = if ocr_settings.enabled {
         Ocr::detect(&config.media.tesseract()).await
     } else {
         Ocr::disabled()
     };
     let subtitles = Arc::new(
-        Subtitles::new(ocr, config.media.ffmpeg(), &ocr_settings).with_context(|| {
+        Subtitles::new(
+            ocr,
+            config.media.ffmpeg(),
+            config.media.ffprobe(),
+            &ocr_settings,
+        )
+        .with_context(|| {
             format!(
                 "cannot prepare the subtitle cache {}",
                 ocr_settings.cache_dir.display()
             )
         })?,
     );
+    let name = ServerName::new(config.server_name());
     let status = Arc::new(
-        StatusSource::new(config.server_name(), transcoding.clone())
-            .with_mdns(config.network.endpoint_options()?.mdns),
+        StatusSource::new(name.clone(), transcoding.clone())
+            .with_mdns(config.network.endpoint_options()?.mdns)
+            .with_ocr_languages(subtitles.ocr().languages().iter().cloned().collect()),
     );
-    let artwork_dir = config.state_dir.join("cache").join("artwork");
+    let artwork_dir = state_dir.join("cache").join("artwork");
     let artwork = Arc::new(
         ArtworkCache::open(&artwork_dir, config.artwork.cache_bytes(), catalog.clone())
             .with_context(|| format!("cannot open the artwork cache {}", artwork_dir.display()))?,
     );
 
-    let store = Store::open(&config.state_dir).await?;
+    let store = Store::open(state_dir).await?;
     let auth = Auth::new(store);
     let watch = Arc::new(Watch::new(
         auth.store().clone(),
@@ -261,12 +374,21 @@ async fn run(config: &ServerConfig) -> Result<()> {
         prober.clone(),
         config.watch.rules()?,
     ));
-    let plex_sync = plex_sync(config, &plex, auth.store(), &watch).await?;
+    let plex_sync = match &plex {
+        Some(_) => plex_sync(config, &live, auth.store(), &watch).await?,
+        None => None,
+    };
     let admin_listen = config.admin.listen()?;
     let admin_origins = config.admin.origins()?;
     let admin_proxies = config.admin.trusted_proxies()?;
     let public_url = admin_origins.public_url().map(str::to_owned);
-    if !admin_listen.ip().is_loopback() && public_url.is_none() {
+    let cookies = CookiePolicy::new(config.admin.insecure_cookies());
+    if cookies.insecure() {
+        tracing::warn!(
+            "admin.insecure_cookies is on: the session cookie is sent without Secure and \
+             HttpOnly, so it crosses the network in clear and page scripts can read it"
+        );
+    } else if !admin_listen.ip().is_loopback() && public_url.is_none() {
         tracing::warn!(
             listen = %admin_listen,
             "admin.public_url is not set: browsers keep the session cookie only over HTTPS or at \
@@ -279,37 +401,58 @@ async fn run(config: &ServerConfig) -> Result<()> {
         (None, why) => tracing::warn!(why, "no passkeys"),
     }
     passkeys.log_orphans(auth.store()).await?;
+    // Said by whatever starts the server again when it exits for a restart
+    // (the NixOS module's unit does). Not systemd's INVOCATION_ID: every
+    // process started from a service inherits it, a shell and what it
+    // runs included.
+    let supervised = std::env::var_os("SPOOLFRAME_SUPERVISED").is_some_and(|v| !v.is_empty());
+    let settings = Arc::new(RuntimeSettings::new(
+        layers.clone(),
+        state_dir,
+        Live {
+            name: Some(name.clone()),
+            catalog: live.clone(),
+            cookies: cookies.clone(),
+            watch: Some(watch.clone()),
+            jobs: Some(jobs.clone()),
+        },
+        supervised,
+    ));
     // Only a server with no users offers setup, and only to someone who
     // can read this log.
-    let setup_code = if auth.store().user_count().await? == 0 {
-        let code = SetupCode::generate();
-        tracing::warn!(
-            "no users yet: register the first admin with `spoolframe-server setup`; the setup code is {code}"
-        );
-        Some(code)
-    } else {
-        None
-    };
+    let setup_code = (auth.store().user_count().await? == 0).then(SetupCode::generate);
     let (admin_addr, admin) = admin::serve(
         admin_listen,
         Admin {
             auth: auth.clone(),
-            setup_code,
+            setup_code: setup_code.clone(),
             status: status.clone(),
             plex_sync,
-            plex: Some(plex.clone()),
+            plex: live,
             passkeys,
+            cookies,
+            settings: Some(settings.clone()),
+            wizard: wizard()?,
         },
         admin_origins,
         admin_proxies,
     )
     .await
     .with_context(|| format!("cannot start the admin API on {admin_listen}"))?;
-    tracing::info!(addr = %admin_addr, "admin API listening");
+    let urls = admin::web_urls(admin_addr);
+    status.set_web_urls(urls.clone());
+    tracing::info!(addr = %admin_addr, web = urls.join(" "), "admin API listening");
+    if let Some(code) = setup_code {
+        tracing::warn!(
+            "no users yet: open the web UI to set up this server, at {} (or register the first \
+             admin with `spoolframe-server setup`); the setup code is {code}",
+            urls.join(", ")
+        );
+    }
     let server = Server::start(
         key,
         &config.network.endpoint_options()?,
-        config.server_name(),
+        &name,
         Services {
             public_url,
             auth,
@@ -329,23 +472,57 @@ async fn run(config: &ServerConfig) -> Result<()> {
     status.set_addresses(addrs.clone());
     tracing::info!(endpoint_id = %server.id(), ?addrs, "listening");
 
-    shutdown.await;
-    tracing::info!("shutting down");
+    let restart = tokio::select! {
+        _ = shutdown => false,
+        _ = settings.restart_requested() => true,
+    };
+    tracing::info!(restart, "shutting down");
     server.shutdown().await;
     let _ = admin.stop();
     admin.stopped().await;
+    if restart {
+        // Not a success: systemd's Restart=on-failure starts it again.
+        std::process::exit(RESTART_EXIT);
+    }
     Ok(())
 }
+
+/// What the setup wizard reaches beyond the server: plex.tv, and Plex's
+/// discovery on the LAN, unless `SPOOLFRAME_PLEX_TV_URL`,
+/// `SPOOLFRAME_PLEX_APP_URL` and `SPOOLFRAME_GDM_TARGETS` (addresses,
+/// comma-separated) name stand-ins: for trying the wizard without the real
+/// plex.tv, or a real PMS on the LAN.
+fn wizard() -> Result<admin::Wizard> {
+    let mut wizard = admin::Wizard::default();
+    if let Ok(list) = std::env::var("SPOOLFRAME_GDM_TARGETS") {
+        wizard.gdm = list
+            .split(',')
+            .map(|a| a.trim().parse())
+            .collect::<Result<_, _>>()
+            .context("SPOOLFRAME_GDM_TARGETS")?;
+    }
+    if let Ok(url) = std::env::var("SPOOLFRAME_PLEX_TV_URL") {
+        wizard.plex_tv = url.parse().context("SPOOLFRAME_PLEX_TV_URL")?;
+    }
+    if let Ok(url) = std::env::var("SPOOLFRAME_PLEX_APP_URL") {
+        wizard.plex_app = url.parse().context("SPOOLFRAME_PLEX_APP_URL")?;
+    }
+    Ok(wizard)
+}
+
+/// The exit status of a stop for a restart (EX_TEMPFAIL): a failure to a
+/// supervisor, which starts the server again.
+const RESTART_EXIT: i32 = 75;
 
 /// The Plex watch sync, started, if the config asks for one and its user
 /// exists.
 async fn plex_sync(
     config: &ServerConfig,
-    plex: &Arc<PlexCatalog>,
+    plex: &Arc<LiveCatalog>,
     store: &Store,
     watch: &Arc<Watch>,
 ) -> Result<Option<Arc<PlexSync>>> {
-    let Some(sync) = &config.plex.watch_sync else {
+    let Some(sync) = config.plex.as_ref().and_then(|p| p.watch_sync.as_ref()) else {
         return Ok(None);
     };
     let Some(user) = store.password_login(&sync.user).await? else {
@@ -470,6 +647,7 @@ mod tests {
                     count: 2,
                     examples: vec!["/data/a.flac -> /nas/a.flac: No such file".into()],
                 },
+                ..LibraryPaths::default()
             },
         ];
         assert_eq!(

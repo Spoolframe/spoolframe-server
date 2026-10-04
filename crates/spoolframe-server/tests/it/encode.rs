@@ -1216,6 +1216,50 @@ async fn hls_of_a_copied_hevc_video_is_hvc1_as_the_playlist_says() {
     server.stop().await;
 }
 
+/// WebVTT segment `n` of `handle`'s subtitle rendition, asking again while
+/// its text is being made.
+async fn subtitle_segment(
+    client: &TestClient,
+    session: &SessionId,
+    handle: &PlaybackHandle,
+    n: u32,
+) -> String {
+    use spoolframe_types::SubtitleFormat;
+    loop {
+        let response = client
+            .call(
+                Some(session),
+                Request::ReadSubtitleSegment {
+                    handle: handle.clone(),
+                    n,
+                },
+            )
+            .await;
+        match response {
+            Response::Ok(Reply::Subtitle { format, bytes }) => {
+                assert_eq!(format, SubtitleFormat::WebVtt);
+                return String::from_utf8(bytes).unwrap();
+            }
+            Response::Err(spoolframe_protocol::Error::SubtitleNotReady { .. }) => {}
+            other => panic!("segment {n}: {other:?}"),
+        }
+    }
+}
+
+/// The segment (from 1) of `durations` that holds `secs`.
+fn holding(durations: &[f32], secs: f32) -> u32 {
+    let mut start = 0.0;
+    durations
+        .iter()
+        .position(|d| {
+            let holds = start <= secs && secs < start + d;
+            start += d;
+            holds
+        })
+        .unwrap() as u32
+        + 1
+}
+
 /// A text subtitle goes to an HLS client as a WebVTT rendition on the
 /// video's cuts, each cue in the segment that holds its time (P2-07).
 #[tokio::test]
@@ -1262,42 +1306,8 @@ async fn an_hls_playback_carries_its_subtitle_as_a_webvtt_rendition() {
     assert_eq!(durations, media_segments(&video));
 
     // The segment that holds 13 s, and the first.
-    let mut start = 0.0;
-    let holding_13 = durations
-        .iter()
-        .position(|d| {
-            let holds = start <= 13.0 && 13.0 < start + d;
-            start += d;
-            holds
-        })
-        .unwrap() as u32
-        + 1;
-    let read = |n: u32| {
-        let client = &client;
-        let session = &session;
-        let handle = &handle;
-        async move {
-            loop {
-                let response = client
-                    .call(
-                        Some(session),
-                        Request::ReadSubtitleSegment {
-                            handle: handle.clone(),
-                            n,
-                        },
-                    )
-                    .await;
-                match response {
-                    Response::Ok(Reply::Subtitle { format, bytes }) => {
-                        assert_eq!(format, SubtitleFormat::WebVtt);
-                        return String::from_utf8(bytes).unwrap();
-                    }
-                    Response::Err(spoolframe_protocol::Error::SubtitleNotReady { .. }) => {}
-                    other => panic!("segment {n}: {other:?}"),
-                }
-            }
-        }
-    };
+    let holding_13 = holding(&durations, 13.0);
+    let read = |n: u32| subtitle_segment(&client, &session, &handle, n);
     let at_13 = read(holding_13).await;
     assert!(at_13.contains("X-TIMESTAMP-MAP="), "{at_13}");
     assert!(
@@ -1312,6 +1322,84 @@ async fn an_hls_playback_carries_its_subtitle_as_a_webvtt_rendition() {
     );
     client.close().await;
     server.stop().await;
+}
+
+/// A VobSub or DVB track goes to an HLS client that draws neither as its
+/// text, read by OCR, in the same WebVTT rendition (P3-08).
+#[tokio::test]
+async fn an_hls_playback_reads_a_vobsub_or_dvb_track_into_its_webvtt_rendition() {
+    use spoolframe_protocol::{ConvertedSubtitle, PlaybackPlan, Selection, SubtitleAction};
+    use spoolframe_types::SubtitleFormat;
+    let caps = ClientCapabilities {
+        subtitles: [SubtitleFormat::WebVtt].into(),
+        ..hls_capabilities()
+    };
+    for (codec, from) in [
+        ("dvdsub", SubtitleFormat::VobSub),
+        ("dvbsub", SubtitleFormat::DvbSub),
+    ] {
+        let options = ServerOptions {
+            ocr: true,
+            ..ServerOptions::default()
+        };
+        let dir = fresh_dir(&format!("hls-ocr-{codec}")).await;
+        let (server, client, session) = hls_ready_with(dir, caps.clone(), options).await;
+        // VobSub's stop is in 1024/90000 s: lengths of 512 ms multiples.
+        server.add_bitmap_track(
+            codec,
+            &[
+                ("Hello there", 1_000, 3_560),
+                ("General Kenobi", 13_000, 15_048),
+            ],
+        );
+        let response = client
+            .call(
+                Some(&session),
+                Request::StartPlayback {
+                    id: movie().id().clone(),
+                    selection: Some(Selection {
+                        audio: Some(0),
+                        subtitle: Some(0),
+                    }),
+                    start_ms: None,
+                    bitmap: Default::default(),
+                },
+            )
+            .await;
+        let Response::Ok(Reply::PlaybackStarted {
+            handle,
+            plan: PlaybackPlan::Converted { subtitle, .. },
+            ..
+        }) = response
+        else {
+            panic!("{codec}: no converted playback: {response:?}");
+        };
+        assert_eq!(
+            subtitle,
+            Some(ConvertedSubtitle {
+                index: 0,
+                action: SubtitleAction::Ocr {
+                    from,
+                    to: SubtitleFormat::WebVtt
+                },
+            }),
+            "{codec}"
+        );
+        let video = manifest(&client, &session, &handle, ManifestKind::Media).await;
+        let durations = media_segments(&video);
+        let at_13 = subtitle_segment(&client, &session, &handle, holding(&durations, 13.0)).await;
+        assert!(
+            at_13.contains("00:00:13.000 --> 00:00:15.048\nGeneral Kenobi"),
+            "{codec}: {at_13}"
+        );
+        let first = subtitle_segment(&client, &session, &handle, 1).await;
+        assert!(
+            first.contains("00:00:01.000 --> 00:00:03.560\nHello there"),
+            "{codec}: {first}"
+        );
+        client.close().await;
+        server.stop().await;
+    }
 }
 
 async fn change(

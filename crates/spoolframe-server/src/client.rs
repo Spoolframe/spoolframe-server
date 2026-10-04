@@ -36,7 +36,7 @@ use crate::auth::{self, LoginError, SessionToken, UnlockError};
 use crate::device_sign_in::{self, ClaimError, Outcome, Waiting};
 use crate::encode::job::{EncodeJob, JobError, Progress};
 use crate::encode::{Conversion, ConversionSource, hls};
-use crate::network::{ConnectionAuth, Connections, Services};
+use crate::network::{ConnectionAuth, Connections, ServerName, Services};
 use crate::planner;
 use crate::playback::{Changed, Opened, Playback, Playbacks, Refusal, Sidecar};
 use crate::principal::Principal;
@@ -57,6 +57,8 @@ pub(crate) struct ClientProtocol {
     connections: Connections,
     services: Services,
     info: Arc<ServerInfo>,
+    /// What `info` calls the server, as it is now (P3-10).
+    name: ServerName,
     /// The events stream of each connection that said Hello.
     events: Arc<Mutex<HashMap<usize, SendStream>>>,
 }
@@ -123,11 +125,17 @@ impl Locks {
 }
 
 impl ClientProtocol {
-    pub(crate) fn new(connections: Connections, info: ServerInfo, services: Services) -> Self {
+    pub(crate) fn new(
+        connections: Connections,
+        info: ServerInfo,
+        name: ServerName,
+        services: Services,
+    ) -> Self {
         Self {
             connections,
             services,
             info: Arc::new(info),
+            name,
             events: Arc::default(),
         }
     }
@@ -206,7 +214,10 @@ impl ClientProtocol {
                 if state.hello.set(hello).is_ok() {
                     self.open_events(connection).await;
                 }
-                Ok(Reply::ServerInfo((*self.info).clone()))
+                Ok(Reply::ServerInfo(ServerInfo {
+                    name: self.name.get(),
+                    ..(*self.info).clone()
+                }))
             }
             _ if state.hello.get().is_none() => Err(Error::HandshakeRequired),
             Request::Unknown => Err(Error::Unsupported {
@@ -1782,6 +1793,7 @@ fn catalog_error(e: CatalogError) -> Error {
                 message: "the library is unavailable".into(),
             }
         }
+        CatalogError::NotSetUp => Error::NotSetUp,
     }
 }
 

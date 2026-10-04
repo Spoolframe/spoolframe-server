@@ -95,6 +95,67 @@ pub fn unreadable(local: &Path) -> Option<String> {
     }
 }
 
+/// A mapping that would make `plex`, a media file this host cannot read
+/// at its Plex path, readable (P3-10): the longest tail of `plex` that is a
+/// file under one of `bases`. `/data/movies/A/A.mkv` found as
+/// `/mnt/nas/movies/A/A.mkv` suggests `/data -> /mnt/nas`. The longest
+/// tail wins, so a file name alone that happens to exist somewhere is the
+/// last resort, and the first base wins a tie. `None` when no tail is a
+/// file anywhere.
+pub fn suggest(plex: &Path, bases: &[PathBuf]) -> Option<PathMapping> {
+    let parts: Vec<&std::ffi::OsStr> = plex
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    // Longest tail first; the whole path is the Plex path itself, which
+    // is not readable, so at least one component is left behind.
+    for keep in (1..parts.len()).rev() {
+        let from: PathBuf = std::iter::once(std::ffi::OsStr::new("/"))
+            .chain(parts[..parts.len() - keep].iter().copied())
+            .collect();
+        let tail: PathBuf = parts[parts.len() - keep..].iter().collect();
+        for base in bases {
+            if base != &from && unreadable(&base.join(&tail)).is_none() {
+                return Some(PathMapping {
+                    library: None,
+                    from,
+                    to: base.clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Where to look for media files that are not at their Plex paths: the
+/// usual mount points and the directories in them, one level down
+/// (`/mnt/nas`, `/media/usb`), in that order.
+pub fn usual_bases() -> Vec<PathBuf> {
+    let tops = [
+        "/mnt", "/media", "/srv", "/data", "/storage", "/nas", "/volume1",
+    ];
+    let mut bases = Vec::new();
+    for top in tops.iter().map(PathBuf::from) {
+        if !top.is_dir() {
+            continue;
+        }
+        bases.push(top.clone());
+        if let Ok(entries) = std::fs::read_dir(&top) {
+            let mut children: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            children.sort();
+            bases.extend(children);
+        }
+    }
+    bases
+}
+
 /// `plex` rebuilt from its components, which drops repeated and trailing
 /// slashes.
 fn normalized(plex: &Path) -> PathBuf {
@@ -201,6 +262,26 @@ mod tests {
         let paths = PathMap::new(rules);
         let got = paths.map(Some("Movies"), Path::new("/data/a.mkv"));
         assert_eq!(got.mapping, None);
+    }
+
+    #[tokio::test]
+    async fn a_suggestion_maps_the_plex_prefix_to_where_the_file_is() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-suggest").await;
+        let nas = dir.as_ref().join("nas");
+        let movie = nas.join("movies/Alien (1979)/Alien.mkv");
+        std::fs::create_dir_all(movie.parent().unwrap()).unwrap();
+        std::fs::write(&movie, b"x").unwrap();
+        let elsewhere = dir.as_ref().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let bases = vec![elsewhere, nas.clone()];
+        let found = suggest(Path::new("/data/movies/Alien (1979)/Alien.mkv"), &bases).unwrap();
+        assert_eq!(found.from, PathBuf::from("/data"));
+        assert_eq!(found.to, nas);
+        // The suggestion reads the file.
+        let map = PathMap::new(vec![found]);
+        let mapped = map.map(None, Path::new("/data/movies/Alien (1979)/Alien.mkv"));
+        assert_eq!(unreadable(&mapped.local), None);
+        assert_eq!(suggest(Path::new("/data/movies/Missing.mkv"), &bases), None);
     }
 
     #[test]

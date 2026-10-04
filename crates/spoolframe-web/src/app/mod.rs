@@ -7,7 +7,9 @@ mod http;
 mod icons;
 mod profile;
 mod rpc;
+mod settings;
 mod webauthn;
+mod wizard;
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{MeApiClient, PasswordChange, Role, UserInfo};
@@ -15,8 +17,11 @@ use spoolframe_admin_api::{MeApiClient, PasswordChange, Role, UserInfo};
 use admin::{AdminHome, Server, UserSessions, Users};
 use device::DeviceApproval;
 use profile::Profile;
+use settings::{Settings, SettingsHome};
+use wizard::{Mode, Steps, WizardLayout};
 
 use crate::logic::{ApiError, Landing, avatar_class, landing, setup_without_passkeys};
+use crate::setup;
 
 const STYLES: Asset = asset!("/assets/tailwind.css");
 /// The design's fonts, carried with the bundle (the build copies them in
@@ -38,6 +43,9 @@ enum Route {
     Login {},
     #[route("/setup")]
     Setup {},
+    // The wizard's steps after the first admin (P3-10); signed in.
+    #[route("/setup/:step")]
+    Wizard { step: String },
     // Opened from a device's QR code (P3-05): signs in by itself, and stays
     // on the code.
     #[route("/auth/device?:code")]
@@ -52,6 +60,10 @@ enum Route {
             UserSessions { username: String },
             #[route("/server")]
             Server {},
+            #[route("/settings")]
+            SettingsHome {},
+            #[route("/settings/:tab")]
+            Settings { tab: String },
         #[end_nest]
         #[route("/profile")]
         Profile {},
@@ -103,14 +115,29 @@ fn App() -> Element {
     }
 }
 
-/// Where this browser belongs: setup, login, or the signed-in user's pages.
-async fn where_to() -> Result<Landing, ApiError> {
+/// Where this browser belongs: setup, login, the wizard where an admin
+/// left it, or the signed-in user's pages.
+async fn where_to() -> Result<Route, ApiError> {
     let me = http::me().await?;
     let setup_open = match me {
         Some(_) => false,
         None => http::setup_open().await?,
     };
-    Ok(landing(setup_open, me.map(|u| u.role)))
+    let landing = landing(setup_open, me.map(|u| u.role));
+    if landing == Landing::Admin {
+        let state = wizard::load_setup().await?;
+        if !state.finished {
+            let mut done = state.done;
+            done.push("admin".into());
+            let at = setup::resume(&done);
+            // Straight after the first admin, nothing to welcome back to.
+            let step = if at.id == "server" { at.id } else { "resume" };
+            return Ok(Route::Wizard {
+                step: step.to_owned(),
+            });
+        }
+    }
+    Ok(Route::from(landing))
 }
 
 #[component]
@@ -118,8 +145,8 @@ fn Start() -> Element {
     let nav = navigator();
     let decided = use_resource(where_to);
     use_effect(move || {
-        if let Some(Ok(landing)) = &*decided.read() {
-            nav.replace(Route::from(*landing));
+        if let Some(Ok(route)) = &*decided.read() {
+            nav.replace(route.clone());
         }
     });
     match &*decided.read() {
@@ -248,13 +275,16 @@ fn Login() -> Element {
         .map(|s| s.name.clone())
         .unwrap_or_default();
     let public_url = site.read().as_ref().and_then(|s| s.public_url.clone());
+    let insecure_cookies = site.read().as_ref().is_some_and(|s| s.insecure_cookies);
     rsx! {
         Centered {
             SignInForm {
                 title: if name.is_empty() { "Sign in to Spoolframe".to_owned() } else { format!("Sign in to {name}") },
                 public_url,
-                on_done: move |user: http::SignedIn| {
-                    nav.replace(Route::from(landing(false, Some(user.role))));
+                insecure_cookies,
+                // The start decides: an admin may have a wizard to finish.
+                on_done: move |_: http::SignedIn| {
+                    nav.replace(Route::Start {});
                 },
             }
         }
@@ -295,10 +325,13 @@ async fn passkey_sign_in(
 /// in before they go on. In an insecure context (plain HTTP on a real
 /// host) it says where to go instead and takes nothing: the browser
 /// would drop the session cookie, and signing in would look like nothing.
+/// Unless the server sends insecure cookies (P3-10): then a password
+/// works there, and only passkeys need the secure context.
 #[component]
 fn SignInForm(
     title: String,
     #[props(default)] public_url: Option<String>,
+    #[props(default)] insecure_cookies: bool,
     on_done: EventHandler<http::SignedIn>,
 ) -> Element {
     let username = use_signal(String::new);
@@ -306,7 +339,8 @@ fn SignInForm(
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let mut request = use_resource(passkey_request);
-    let secure = secure_context();
+    let passkeys = secure_context();
+    let secure = passkeys || insecure_cookies;
     let submit = move |e: FormEvent| {
         e.prevent_default();
         busy.set(true);
@@ -370,7 +404,7 @@ fn SignInForm(
                 Alert { text }
             }
             button { class: "btn-primary", r#type: "submit", disabled: busy() || !secure, "Sign in" }
-            if secure && webauthn::supported() {
+            if passkeys && webauthn::supported() {
                 div { class: "or-divider", "or" }
                 button {
                     class: "btn-secondary",
@@ -391,15 +425,18 @@ fn SignInForm(
 /// What a passkey made at setup is called until its user renames it.
 const SETUP_PASSKEY_NAME: &str = "Passkey";
 
-/// The design's "Web · Setup": the first admin's account, made with a
-/// passkey, a password, or both. The passkey makes the account at once
-/// (the server signs its admin in); a password typed before it waits for
-/// it, or makes the account by itself. Where the page cannot make a
-/// passkey, a password only, with a line saying why.
+/// The wizard's first page and step 1 (P3-01, P3-10): the setup code,
+/// with insecure cookies offered where the page is plain HTTP; then the
+/// design's "Web · Setup", the first admin's account, made with a passkey,
+/// a password, or both. The passkey makes the account at once (the server
+/// signs its admin in); a password typed before it waits for it, or makes
+/// the account by itself. Where the page cannot make a passkey, a password
+/// only, with a line saying why.
 #[component]
 fn Setup() -> Element {
     let site = use_resource(site);
     let state = use_resource(http::setup_state);
+    let mut checked = use_signal(|| None::<String>);
     let name = site
         .read()
         .as_ref()
@@ -419,21 +456,113 @@ fn Setup() -> Element {
         server_says.as_deref(),
     );
     rsx! {
-        Centered {
-            div { class: "flex w-full flex-col items-center gap-[22px]",
-                div { class: "flex items-center gap-2.5",
-                    icons::Mark { size: 40 }
-                    Wordmark { class: "text-[24px]" }
+        WizardLayout {
+            match checked() {
+                None => rsx! { CodeCard { name, on_ok: move |code| checked.set(Some(code)) } },
+                Some(code) => rsx! {
+                    Steps { current: "admin", done: Vec::new() }
+                    match without {
+                        Some(why) => rsx! { PasswordSetup { name, why, setup_code: code } },
+                        None => rsx! { MethodsSetup { name, setup_code: code } },
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// The address this page is open at, as the browser shows it.
+fn page_address() -> String {
+    web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .unwrap_or_default()
+}
+
+/// The wizard's first page (the WebSetupCodeHttp board): the setup code
+/// from the log, and over plain HTTP, the offer of insecure cookies.
+#[component]
+fn CodeCard(name: String, on_ok: EventHandler<String>) -> Element {
+    let mut code = use_signal(String::new);
+    let mut insecure = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let plain = !secure_context();
+    let submit = move |e: FormEvent| {
+        e.prevent_default();
+        busy.set(true);
+        spawn(async move {
+            match http::setup_check(&code(), plain && insecure()).await {
+                Ok(()) => on_ok.call(code()),
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+        });
+    };
+    rsx! {
+        form { class: "wizard-card", onsubmit: submit,
+            div { class: "flex flex-col gap-1.5",
+                h1 { "Set up {name}" }
+                p { class: "lede", "Prove you run this server. The setup code is in the server's log; restarting the server makes a new one." }
+            }
+            input {
+                class: "code-input",
+                aria_label: "Setup code",
+                autocomplete: "one-time-code",
+                placeholder: "XXXX-XXXX-XXXX",
+                value: "{code}",
+                oninput: move |e| code.set(e.value()),
+            }
+            if plain {
+                div { class: "alert alert-warning flex-col", role: "note",
+                    div { class: "flex gap-2.5",
+                        icons::Warning {}
+                        span { class: "text-ctp-text",
+                            b { "This page is open over plain HTTP" }
+                            "At "
+                            span { class: "mono-value", "{page_address()}" }
+                            " the browser won't keep you signed in, so setup can't finish here. Open the web UI over HTTPS (through your reverse proxy), or on the server itself at localhost, or allow insecure cookies."
+                        }
+                    }
+                    div { class: "panel flex-row items-start",
+                        button {
+                            class: "switch mt-0.5",
+                            r#type: "button",
+                            role: "switch",
+                            aria_checked: "{insecure()}",
+                            aria_label: "Allow insecure cookies",
+                            onclick: move |_| insecure.toggle(),
+                        }
+                        span { class: "choice-what",
+                            b { "Allow insecure cookies" }
+                            "The session cookie crosses your network unencrypted, and scripts on the page can read it. Anyone on the network who can see the traffic could take over the session. Passkeys still need HTTPS or localhost, so setup here is password-only. You can turn this off later in Server › Settings."
+                        }
+                    }
                 }
-                match without {
-                    Some(why) => rsx! { PasswordSetup { name, why } },
-                    None => rsx! { MethodsSetup { name } },
-                }
-                span { class: "text-xs text-ctp-overlay0",
-                    "First launch · this page closes after the admin account is created"
+            }
+            if let Some(text) = error() {
+                Alert { text }
+            }
+            div { class: "wizard-foot",
+                span {}
+                button { class: "btn-dialog btn-dialog-primary h-10", r#type: "submit", disabled: busy() || code().trim().is_empty(),
+                    icons::ArrowRight {}
+                    "Continue"
                 }
             }
         }
+    }
+}
+
+/// The first admin exists: step 1 is done, and the wizard goes on. Over
+/// plain HTTP without insecure cookies the browser dropped the session,
+/// and the next page sends it to sign in, which says why.
+async fn admin_made() -> Route {
+    if let Ok(client) = rpc::client().await {
+        let _ =
+            spoolframe_admin_api::AdminApiClient::setup_step_done(&*client, "admin".into()).await;
+    }
+    Route::Wizard {
+        step: "server".into(),
     }
 }
 
@@ -446,7 +575,7 @@ fn SetupHeading(name: String) -> Element {
             p { class: "m-0 text-sm leading-relaxed text-ctp-subtext0",
                 "This account manages users, libraries and devices on "
                 b { class: "text-ctp-text", "{name}" }
-                ". Nobody else can open this page once it exists. The setup code is in the server's log."
+                ". Nobody else can open this page once it exists."
             }
         }
     }
@@ -454,9 +583,9 @@ fn SetupHeading(name: String) -> Element {
 
 /// Setup with a password only, where no passkey can be made: `why`.
 #[component]
-fn PasswordSetup(name: String, why: String) -> Element {
+fn PasswordSetup(name: String, why: String, setup_code: String) -> Element {
     let nav = navigator();
-    let code = use_signal(String::new);
+    let code = use_signal(|| setup_code.clone());
     let username = use_signal(String::new);
     let password = use_signal(String::new);
     let again = use_signal(String::new);
@@ -473,7 +602,7 @@ fn PasswordSetup(name: String, why: String) -> Element {
             match http::setup(&code(), &username(), &password()).await {
                 Ok(_) => {
                     rpc::forget();
-                    nav.replace(Route::Users {});
+                    nav.replace(admin_made().await);
                 }
                 Err(e) => error.set(Some(e.explain())),
             }
@@ -484,7 +613,6 @@ fn PasswordSetup(name: String, why: String) -> Element {
         form { class: "glass-card glass-card-wide", onsubmit: submit,
             SetupHeading { name }
             p { class: "m-0 text-xs text-ctp-yellow", "{why}" }
-            Field { label: "Setup code", value: code, autocomplete: "one-time-code", placeholder: "K7QD-M2XP-9RTB" }
             Field { label: "Username", value: username, autocomplete: "username" }
             Field { label: "Password", value: password, kind: "password", autocomplete: "new-password" }
             Field { label: "Password again", value: again, kind: "password", autocomplete: "new-password" }
@@ -508,12 +636,12 @@ async fn first_password(password: String) -> Result<(), ApiError> {
         .map_err(rpc::error)
 }
 
-/// Setup as the board draws it: the code and username, then the ways to
-/// sign in, the passkey first.
+/// Setup as the board draws it: the username, then the ways to sign in,
+/// the passkey first.
 #[component]
-fn MethodsSetup(name: String) -> Element {
+fn MethodsSetup(name: String, setup_code: String) -> Element {
     let nav = navigator();
-    let code = use_signal(String::new);
+    let code = use_signal(|| setup_code.clone());
     let username = use_signal(String::new);
     let password = use_signal(String::new);
     let again = use_signal(String::new);
@@ -592,7 +720,9 @@ fn MethodsSetup(name: String) -> Element {
     };
     let finish = move |_| {
         if made() {
-            nav.replace(Route::Users {});
+            spawn(async move {
+                nav.replace(admin_made().await);
+            });
             return;
         }
         let Some(typed) = waiting() else {
@@ -603,7 +733,7 @@ fn MethodsSetup(name: String) -> Element {
             match http::setup(&code(), &username(), &typed).await {
                 Ok(_) => {
                     rpc::forget();
-                    nav.replace(Route::Users {});
+                    nav.replace(admin_made().await);
                 }
                 Err(e) => error.set(Some(e.explain())),
             }
@@ -614,10 +744,7 @@ fn MethodsSetup(name: String) -> Element {
     rsx! {
         section { class: "glass-card glass-card-setup",
             SetupHeading { name }
-            div { class: "grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-3",
-                Field { label: "Setup code", value: code, autocomplete: "one-time-code", placeholder: "K7QD-M2XP-9RTB", disabled: made() }
-                Field { label: "Username", value: username, autocomplete: "username", disabled: made() }
-            }
+            Field { label: "Username", value: username, autocomplete: "username", disabled: made() }
             div { class: "flex flex-col gap-0.5",
                 h2 { class: "m-0 text-base font-bold", "Ways to sign in" }
                 span { class: "text-[13px] text-ctp-subtext0", "One is enough to finish. Two is safer." }
@@ -684,6 +811,117 @@ fn MethodsSetup(name: String) -> Element {
                     onclick: finish,
                     icons::ArrowRight {}
                     if only_passkey { "Continue with passkey only" } else { "Continue" }
+                }
+            }
+        }
+    }
+}
+
+/// "1 library", "4 libraries".
+fn count_of(n: u64, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// A wizard step after the first admin (P3-10), for a signed-in admin.
+#[component]
+fn Wizard(step: String) -> Element {
+    let nav = navigator();
+    let me = use_resource(http::me);
+    let current = me.read().clone();
+    match current {
+        None => rsx! {
+            Centered { p { class: "text-ctp-subtext0", "Loading…" } }
+        },
+        Some(Err(e)) => rsx! {
+            Centered { Alert { text: e.explain() } }
+        },
+        Some(Ok(None)) => {
+            nav.replace(Route::Start {});
+            rsx! {}
+        }
+        Some(Ok(Some(user))) if user.role != Role::Admin => {
+            nav.replace(Route::Profile {});
+            rsx! {}
+        }
+        Some(Ok(Some(_))) => rsx! {
+            WizardStep { step }
+        },
+    }
+}
+
+#[component]
+fn WizardStep(step: String) -> Element {
+    let nav = navigator();
+    // Read again at each step: the dots follow what is confirmed.
+    let state = use_resource(use_reactive((&step,), |(step,)| async move {
+        let _ = step;
+        wizard::load_setup().await
+    }));
+    let mut error = use_signal(|| None::<String>);
+    let mut done: Vec<String> = state
+        .read()
+        .as_ref()
+        .and_then(|s| s.as_ref().ok())
+        .map(|s| s.done.clone())
+        .unwrap_or_default();
+    // The admin is signed in: step 1 is behind them.
+    if !done.iter().any(|d| d == "admin") {
+        done.push("admin".into());
+    }
+    if step == "admin" {
+        // Made already: their account is in My profile.
+        nav.replace(Route::Profile {});
+        return rsx! {};
+    }
+    if step == "resume" {
+        let at = setup::resume(&done);
+        return rsx! {
+            WizardLayout { wizard::Resume { at, done } }
+        };
+    }
+    if setup::step(&step).is_none() {
+        return rsx! { NotFound { rest: vec![step] } };
+    }
+    let id = step.clone();
+    let on_next = move |_| {
+        let id = id.clone();
+        spawn(async move {
+            let confirmed = async {
+                let client = rpc::client().await?;
+                spoolframe_admin_api::AdminApiClient::setup_step_done(&*client, id.clone())
+                    .await
+                    .map_err(rpc::error)
+            };
+            match confirmed.await {
+                Ok(_) => {
+                    if let Some(next) = setup::next(&id) {
+                        nav.push(Route::Wizard {
+                            step: next.id.to_owned(),
+                        });
+                    }
+                }
+                Err(e) => error.set(Some(e.explain())),
+            }
+        });
+    };
+    rsx! {
+        WizardLayout {
+            Steps { current: step.clone(), done }
+            section { class: "wizard-card",
+                match step.as_str() {
+                    "server" => rsx! { wizard::ServerForm { mode: Mode::Wizard, on_done: on_next } },
+                    "plex" => rsx! { wizard::PlexForm { mode: Mode::Wizard, on_done: on_next } },
+                    "paths" => rsx! { wizard::PathsForm { mode: Mode::Wizard, on_done: on_next } },
+                    "playback" => rsx! { wizard::PlaybackForm { mode: Mode::Wizard, on_done: on_next } },
+                    "access" => rsx! { wizard::AccessForm { mode: Mode::Wizard, on_done: on_next } },
+                    _ => rsx! { wizard::DoneCard {} },
+                }
+                if let Some(text) = error() {
+                    Alert { text }
                 }
             }
         }
@@ -773,8 +1011,11 @@ fn SignedIn(user: UserInfo) -> Element {
     let title = match route {
         Route::Profile {} => "My profile",
         Route::Server {} => "Server",
+        Route::Settings { .. } | Route::SettingsHome {} => "Settings",
         _ => "Users",
     };
+    let site = use_resource(site);
+    let insecure = admin && site.read().as_ref().is_some_and(|s| s.insecure_cookies);
     rsx! {
         // `content-start`: on a phone the bar and the page are two wrapped
         // lines, and stretched lines would leave a gap under the bar.
@@ -795,6 +1036,7 @@ fn SignedIn(user: UserInfo) -> Element {
                     if admin {
                         {link(Route::Users {}, "Users and devices", false)}
                         {link(Route::Server {}, "Server", false)}
+                        {settings_link(&route)}
                         {link(Route::Profile {}, "My profile", true)}
                     } else {
                         {link(Route::Profile {}, "My profile", false)}
@@ -836,12 +1078,35 @@ fn SignedIn(user: UserInfo) -> Element {
                 nav { class: "drawer md:hidden", aria_label: "Admin", onclick: move |_| menu.set(false),
                     {link(Route::Users {}, "Users and devices", false)}
                     {link(Route::Server {}, "Server", false)}
+                    {settings_link(&route)}
                     {link(Route::Profile {}, "My profile", true)}
                 }
             }
             main { class: "box-border min-w-0 flex-[1_1_600px] max-w-[1200px] p-3.5 md:px-10 md:py-8",
+                if insecure {
+                    div { class: "banner", role: "alert",
+                        icons::Warning {}
+                        span {
+                            b { "Insecure cookies are on. " }
+                            "Sessions can be read by anyone watching the network, and by scripts on the page."
+                        }
+                        Link { to: Route::Settings { tab: "security".into() }, "Turn off" }
+                    }
+                }
                 Outlet::<Route> {}
             }
+        }
+    }
+}
+
+/// Server › Settings in the sidebar: under Server, one step in.
+fn settings_link(route: &Route) -> Element {
+    let here = matches!(route, Route::Settings { .. } | Route::SettingsHome {});
+    rsx! {
+        Link {
+            class: if here { "nav-link nav-link-here nav-sub" } else { "nav-link nav-sub" },
+            to: Route::Settings { tab: "server".into() },
+            "Settings"
         }
     }
 }

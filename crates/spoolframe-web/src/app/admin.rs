@@ -25,7 +25,7 @@ async fn users() -> Result<Vec<UserInfo>, ApiError> {
 
 /// What a change did, or why it was not made: the toast in the corner.
 #[derive(Debug, Clone, PartialEq)]
-struct Said {
+pub(super) struct Said {
     ok: bool,
     text: String,
     /// Which toast it is, so an older one's timer leaves a newer one up.
@@ -36,7 +36,7 @@ struct Said {
 const TOAST_MS: i32 = 6000;
 
 /// Show `text` in the corner, for [`TOAST_MS`] or until dismissed.
-fn say(mut toast: Signal<Option<Said>>, ok: bool, text: String) {
+pub(super) fn say(mut toast: Signal<Option<Said>>, ok: bool, text: String) {
     let n = toast.peek().as_ref().map_or(0, |t| t.n) + 1;
     toast.set(Some(Said { ok, text, n }));
     spawn(async move {
@@ -48,7 +48,7 @@ fn say(mut toast: Signal<Option<Said>>, ok: bool, text: String) {
 }
 
 /// Wait `ms` milliseconds, by the browser's timer.
-async fn sleep(ms: i32) {
+pub(super) async fn sleep(ms: i32) {
     let promise = js_sys::Promise::new(&mut |resolve, _| {
         if let Some(window) = web_sys::window() {
             let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
@@ -58,7 +58,7 @@ async fn sleep(ms: i32) {
 }
 
 #[component]
-fn Toast(said: Signal<Option<Said>>) -> Element {
+pub(super) fn Toast(said: Signal<Option<Said>>) -> Element {
     let mut said = said;
     let Some(shown) = said() else {
         return rsx! {};
@@ -1114,7 +1114,7 @@ fn plex_line(url: Option<&str>, libraries: usize) -> String {
 }
 
 #[component]
-fn CopyButton(text: String) -> Element {
+pub(super) fn CopyButton(text: String) -> Element {
     let mut copied = use_signal(|| false);
     rsx! {
         button {

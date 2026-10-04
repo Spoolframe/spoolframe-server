@@ -641,6 +641,12 @@ pub enum Error {
     /// Something the server depends on (Plex, a media mount) is down.
     #[error("unavailable: {message}")]
     Unavailable { message: String },
+    /// The server has no library yet: it is waiting to be set up in its
+    /// web UI (P3-10). Every catalog and playback request gets this until
+    /// it is; show "This server is not set up yet", not an error. Signing
+    /// in and the rest work.
+    #[error("this server is not set up yet")]
+    NotSetUp,
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.

@@ -16,8 +16,10 @@ spoolframe-catalog = { workspace = true }
 spoolframe-types = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+thiserror = { workspace = true }
+# GDM, Plex's LAN discovery (P3-10), over UDP.
+tokio = { workspace = true, features = ["net"] }
 
 [dev-dependencies]
 spoolframe-test-dir = { workspace = true }
-tokio = { workspace = true }
 wiremock = { workspace = true }

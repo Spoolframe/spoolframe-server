@@ -1,13 +1,17 @@
-//! PGS subtitles read back as text with real ffmpeg and tesseract: text
+//! Bitmap subtitles read back as text with real ffmpeg and tesseract: text
 //! drawn by ffmpeg, written as a PGS track (`pgs::fixture`), muxed into
-//! Matroska, then copied out, parsed and read as the server does it.
+//! Matroska, then copied out, parsed and read as the server does it; and
+//! the same as VobSub and DVB (`samples`), at a DVD's size.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use spoolframe_media::ocr::{self, Ocr};
 use spoolframe_media::pgs::{self, fixture};
+use spoolframe_media::{dvb, vobsub};
 use spoolframe_types::SubtitleFormat;
+
+use crate::samples;
 
 const WIDTH: u16 = 640;
 const HEIGHT: u16 = 64;
@@ -124,6 +128,62 @@ async fn a_pgs_track_reads_back_as_its_text_at_its_times() {
         ]
     );
     assert_eq!(done.into_inner().unwrap().last(), Some(&2));
+}
+
+/// What VobSub and DVB samples show. VobSub's stop is in 1024/90000 s,
+/// so the lengths are multiples of 512 ms, which DVB keeps as well.
+const SHOWN: [samples::Shown; 2] = [
+    ("Hello there", 1_000, 3_560),
+    ("General Kenobi", 5_000, 7_048),
+];
+
+/// The text tesseract reads in `cues`, with their times.
+async fn read(cues: &[spoolframe_media::bitmap::Cue], dir: &Path) -> Vec<(u64, u64, String)> {
+    let ocr = Ocr::detect(Path::new("tesseract")).await;
+    let texts = ocr
+        .recognise(cues, "eng", &dir.join("work"), 2, &|_| {})
+        .await
+        .unwrap();
+    ocr::text_cues(cues, texts)
+        .into_iter()
+        .map(|c| (c.start_ms, c.end_ms, c.text))
+        .collect()
+}
+
+fn expected() -> Vec<(u64, u64, String)> {
+    SHOWN
+        .iter()
+        .map(|&(text, start, end)| (start, end, text.to_owned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn vobsub_tracks_read_back_as_their_text_at_their_times() {
+    let tmp = scratch("vobsub").await;
+    let dir = tmp.as_ref();
+    let movie = samples::movie(dir, "movie.mkv", "dvdsub", &SHOWN);
+    let idx = samples::vobsub_pair(dir, &SHOWN);
+    for (input, index, from_start) in [(&movie, 1, true), (&idx, 0, false)] {
+        let track = ocr::read_track(Path::new("ffprobe"), input, index, from_start)
+            .await
+            .unwrap();
+        let cues = vobsub::cues(&track.extradata, &track.packets).unwrap();
+        assert_eq!(read(&cues, dir).await, expected(), "{}", input.display());
+    }
+}
+
+#[tokio::test]
+async fn dvb_tracks_read_back_as_their_text_at_their_times() {
+    let tmp = scratch("dvb").await;
+    let dir = tmp.as_ref();
+    for name in ["movie.mkv", "movie.ts"] {
+        let movie = samples::movie(dir, name, "dvbsub", &SHOWN);
+        let track = ocr::read_track(Path::new("ffprobe"), &movie, 1, true)
+            .await
+            .unwrap();
+        let cues = dvb::cues(&track.packets);
+        assert_eq!(read(&cues, dir).await, expected(), "{name}");
+    }
 }
 
 #[tokio::test]

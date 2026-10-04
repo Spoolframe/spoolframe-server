@@ -31,26 +31,31 @@
     + lib.optionalString (m.library != null) "library = ${quote m.library}; "
     + "from = ${quote m.from}; to = ${quote m.to}; }";
 
+  # The provided layer (P3-10), locked: what it sets, the web UI cannot
+  # change, so the host stays declarative. What it leaves out (Plex, when
+  # plex.url is null) can be set at run time, and is kept in the state
+  # directory's runtime.ucl.
   configFile = pkgs.writeText "spoolframe-server.ucl" ''
     schema = "spoolframe.server.v1";
+    locked = true;
     name = ${quote cfg.name};
-    state_dir = ${quote cfg.stateDir};
-    plex {
-      url = ${quote cfg.plex.url};
-      ${lib.optionalString (cfg.plex.tokenFile != null) "token_file = ${quote tokenCredential};"}
-      ${lib.optionalString (cfg.plex.pathMappings != []) ''
-      path_mapping [
-        ${lib.concatMapStringsSep ",\n    " pathMapping cfg.plex.pathMappings}
-      ]
+    ${lib.optionalString (cfg.plex.url != null) ''
+      plex {
+        url = ${quote cfg.plex.url};
+        ${lib.optionalString (cfg.plex.tokenFile != null) "token_file = ${quote tokenCredential};"}
+        ${lib.optionalString (cfg.plex.pathMappings != []) ''
+        path_mapping [
+          ${lib.concatMapStringsSep ",\n    " pathMapping cfg.plex.pathMappings}
+        ]
+      ''}
+      }
     ''}
-    }
     network {
       port = ${toString cfg.port};
       mdns = ${lib.boolToString cfg.mdns};
     }
     admin {
-      listen = ${quote cfg.admin.listen};
-      allow_remote = ${lib.boolToString cfg.admin.allowRemote};
+      ${lib.optionalString (cfg.admin.listen != null) "listen = ${quote cfg.admin.listen};"}
       ${lib.optionalString (cfg.admin.publicUrl != null) "public_url = ${quote cfg.admin.publicUrl};"}
       ${lib.optionalString (cfg.admin.trustedProxies != []) "trusted_proxies = ${quote (lib.concatStringsSep ", " cfg.admin.trustedProxies)};"}
     }
@@ -72,9 +77,16 @@
   # The admin CLI with this host's config, so `spoolframe user list` works
   # without remembering where the config is.
   cli = pkgs.writeShellScriptBin "spoolframe" ''
-    exec ${cfg.package}/bin/spoolframe-server --config /etc/spoolframe/server.ucl "$@"
+    exec ${cfg.package}/bin/spoolframe-server --config /etc/spoolframe/server.ucl --state-dir ${quote cfg.stateDir} "$@"
   '';
 in {
+  imports = [
+    (lib.mkRemovedOptionModule ["services" "spoolframe" "admin" "allowRemote"] ''
+      The admin listener takes any address now (P3-10): set
+      services.spoolframe.admin.listen, and put a TLS proxy in front of it.
+    '')
+  ];
+
   options.services.spoolframe = {
     enable = lib.mkEnableOption "the Spoolframe media server";
 
@@ -101,9 +113,15 @@ in {
 
     plex = {
       url = lib.mkOption {
-        type = lib.types.str;
+        type = lib.types.nullOr lib.types.str;
+        default = null;
         example = "http://127.0.0.1:32400";
-        description = "The Plex Media Server on the LAN. Never plex.tv.";
+        description = ''
+          The Plex Media Server on the LAN. Never plex.tv. Null leaves Plex
+          to the setup wizard in the web UI, which keeps it (and a token
+          made by signing in with Plex) in the state directory; until then
+          the server runs "not set up".
+        '';
       };
 
       tokenFile = lib.mkOption {
@@ -166,20 +184,18 @@ in {
 
     admin = {
       listen = lib.mkOption {
-        type = lib.types.str;
-        default = "127.0.0.1:7421";
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "127.0.0.1:7421";
         description = ''
-          The admin API (JSON-RPC over WebSocket) that the `spoolframe` CLI
-          uses. Loopback: reach it from elsewhere through an SSH tunnel.
-        '';
-      };
-
-      allowRemote = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = ''
-          Allow a non-loopback {option}`admin.listen`. Passwords cross the
-          admin API in clear, so only behind a TLS reverse proxy.
+          Where the web UI and the admin API (JSON-RPC over WebSocket, the
+          `spoolframe` CLI's) listen; null is the server's default, every
+          IPv4 interface on TCP 7421. Passwords cross it in clear: put a
+          TLS proxy (nginx, Caddy) in front, with {option}`admin.publicUrl`,
+          and listen on loopback when the proxy is on this host. Over plain
+          HTTP on the LAN (the firewall's TCP port opened by hand) the
+          setup code and the wizard work, but signing in sticks only with
+          the web UI's insecure cookies setting.
         '';
       };
 
@@ -245,10 +261,10 @@ in {
       default = ["eng"];
       example = ["eng" "fra" "deu"];
       description = ''
-        tesseract languages for reading bitmap (PGS) subtitles as text, for
-        clients that cannot draw them or that ask for text. A track is read
-        only with its own language's data; tracks in other languages are
-        burned in instead. Empty turns reading off.
+        tesseract languages for reading bitmap (PGS, VobSub, DVB) subtitles
+        as text, for clients that cannot draw them or that ask for text. A
+        track is read only with its own language's data; tracks in other
+        languages are burned in instead. Empty turns reading off.
       '';
     };
 
@@ -300,7 +316,7 @@ in {
       # A new config is a restart: the server reads it once.
       restartTriggers = [configFile];
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/spoolframe-server --config ${configFile}";
+        ExecStart = "${cfg.package}/bin/spoolframe-server --config ${configFile} --state-dir ${cfg.stateDir}";
         User = "spoolframe";
         Group = "spoolframe";
         StateDirectory = lib.removePrefix "/var/lib/" cfg.stateDir;
@@ -310,7 +326,11 @@ in {
         CacheDirectory = "spoolframe";
         CacheDirectoryMode = "0700";
         LoadCredential = lib.optional (cfg.plex.tokenFile != null) "plex-token:${cfg.plex.tokenFile}";
+        # Also how the web UI's "Restart now" (P3-10) brings the server
+        # back: it exits with 75 when asked to restart, and offers it only
+        # where SPOOLFRAME_SUPERVISED says something will.
         Restart = "on-failure";
+        Environment = ["SPOOLFRAME_SUPERVISED=systemd"];
         RestartSec = 2;
 
         # Reads media, writes only its state directory.

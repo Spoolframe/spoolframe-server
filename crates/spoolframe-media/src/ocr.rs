@@ -1,5 +1,6 @@
-//! Bitmap subtitles to text (P2-07): a PGS track's cues ([`crate::pgs`])
-//! read by tesseract, and written out as SubRip or WebVTT.
+//! Bitmap subtitles to text (P2-07, P3-08): a PGS, VobSub or DVB track's
+//! cues ([`crate::bitmap`]) read by tesseract, and written out as SubRip or
+//! WebVTT.
 //!
 //! tesseract runs as a program, as ffmpeg does: a few processes side by
 //! side, each given a list of cue pictures and asked for one page of text
@@ -17,7 +18,7 @@ use tokio::sync::Semaphore;
 
 use spoolframe_types::SubtitleFormat;
 
-use crate::pgs;
+use crate::bitmap::{self, Packet, Track};
 
 /// Cues per tesseract process: enough that loading the model is a small
 /// part of each run, few enough that the work spreads over every thread
@@ -131,7 +132,7 @@ impl Ocr {
     /// owns and removes. `progress` is told how many cues are done.
     pub async fn recognise(
         &self,
-        cues: &[pgs::Cue],
+        cues: &[bitmap::Cue],
         language: &str,
         work: &Path,
         threads: usize,
@@ -246,6 +247,125 @@ pub async fn extract_sup(
     }
 }
 
+/// Subtitle stream `index` (ffprobe's stream index) of `input` as its
+/// packets, read with ffprobe: the way into VobSub and DVB tracks, which
+/// ffmpeg has no raw format to copy them out to. A `.idx` is read the same
+/// way, with ffmpeg pairing it with its `.sub`.
+///
+/// With `from_file_start`, times are from the start of the file, as a
+/// player shows them: an MPEG-TS recording's clock starts anywhere. A
+/// subtitle file of its own already counts from the film's start.
+pub async fn read_track(
+    ffprobe: &Path,
+    input: &Path,
+    index: u32,
+    from_file_start: bool,
+) -> Result<Track, OcrError> {
+    let output = tokio::process::Command::new(ffprobe)
+        .args(["-v", "error", "-select_streams", &index.to_string()])
+        .args(["-show_data", "-show_entries"])
+        .arg("packet=pts,duration,data:stream=time_base,extradata:format=start_time")
+        .args(["-of", "json"])
+        .arg(input)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|source| OcrError::Spawn {
+            program: ffprobe.display().to_string(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(OcrError::Failed {
+            program: "ffprobe".into(),
+            reason: last_line(&output.stderr),
+        });
+    }
+    track(&output.stdout, from_file_start).map_err(|reason| OcrError::Failed {
+        program: "ffprobe".into(),
+        reason,
+    })
+}
+
+/// ffprobe's JSON for one stream's packets, with `-show_data`.
+#[derive(serde::Deserialize)]
+struct Probed {
+    #[serde(default)]
+    packets: Vec<ProbedPacket>,
+    #[serde(default)]
+    streams: Vec<ProbedStream>,
+    format: Option<ProbedFormat>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProbedPacket {
+    pts: Option<i64>,
+    duration: Option<i64>,
+    data: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProbedStream {
+    time_base: String,
+    extradata: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProbedFormat {
+    start_time: Option<String>,
+}
+
+fn track(json: &[u8], from_file_start: bool) -> Result<Track, String> {
+    let probed: Probed = serde_json::from_slice(json).map_err(|e| e.to_string())?;
+    let stream = probed.streams.first().ok_or("no such stream")?;
+    let (num, den) = stream
+        .time_base
+        .split_once('/')
+        .and_then(|(n, d)| Some((n.parse::<i128>().ok()?, d.parse::<i128>().ok()?)))
+        .filter(|&(n, d)| n > 0 && d > 0)
+        .ok_or_else(|| format!("a time base of {}", stream.time_base))?;
+    let ms = |ticks: i64| i128::from(ticks) * num * 1000 / den;
+    let start = match probed.format.and_then(|f| f.start_time) {
+        Some(secs) if from_file_start => {
+            (secs.parse::<f64>().map_err(|e| e.to_string())? * 1000.0).round() as i128
+        }
+        _ => 0,
+    };
+    let packets = probed
+        .packets
+        .into_iter()
+        // A packet with no time cannot be placed.
+        .filter_map(|p| {
+            Some(Packet {
+                pts_ms: (ms(p.pts?) - start).max(0) as u64,
+                duration_ms: p.duration.filter(|&d| d > 0).map(|d| ms(d) as u64),
+                data: hexdump(p.data.as_deref().unwrap_or_default()),
+            })
+        })
+        .collect();
+    Ok(Track {
+        extradata: hexdump(stream.extradata.as_deref().unwrap_or_default()),
+        packets,
+    })
+}
+
+/// The bytes of ffprobe's hex dump: a line per 16 bytes, an offset, the
+/// bytes in hex in the 41 columns after it, then the same as text.
+fn hexdump(text: &str) -> Vec<u8> {
+    let digits: Vec<u8> = text
+        .lines()
+        .filter_map(|line| line.get(10..).map(|rest| rest.get(..41).unwrap_or(rest)))
+        .flat_map(|hex| hex.chars().filter_map(|c| c.to_digit(16)))
+        .map(|d| d as u8)
+        .collect();
+    digits
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[high, low]| (high << 4) | low)
+        .collect()
+}
+
 /// Converts text subtitle stream `index` of `input` (ffprobe's stream
 /// index; 0 for a subtitle file of its own) to `to`, SubRip or WebVTT,
 /// with ffmpeg. Not OCR, but the other way a track becomes the text a
@@ -286,7 +406,7 @@ pub async fn convert_text(
 }
 
 /// The cues with their text; cues tesseract found no text in are left out.
-pub fn text_cues(cues: &[pgs::Cue], texts: Vec<String>) -> Vec<TextCue> {
+pub fn text_cues(cues: &[bitmap::Cue], texts: Vec<String>) -> Vec<TextCue> {
     cues.iter()
         .zip(texts)
         .filter(|(_, text)| !text.is_empty())
@@ -340,13 +460,16 @@ fn timestamp(ms: u64, separator: char) -> String {
     )
 }
 
-/// A page as subtitle text: its non-blank lines, trimmed.
+/// A page as subtitle text: its non-blank lines, trimmed. tesseract reads
+/// a capital I on its own as a bar, about a hundred times a film; a
+/// subtitle never has a bar.
 fn tidy(page: &str) -> String {
     page.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+        .replace('|', "I")
 }
 
 /// `tesseract --list-langs`: a heading, then a code a line. `osd` is
@@ -361,9 +484,53 @@ fn list_langs(text: &str) -> BTreeSet<String> {
 }
 
 /// tesseract names languages by ISO 639-2/T; Matroska tags often use
-/// 639-2/B, which differs for these.
+/// 639-2/B, which differs for these, and a subtitle file's name (and a
+/// `.idx`) ISO 639-1, two letters.
 fn tesseract_code(tag: &str) -> &str {
     match tag {
+        "ar" => "ara",
+        "bg" => "bul",
+        "ca" => "cat",
+        "cs" => "ces",
+        "da" => "dan",
+        "de" => "deu",
+        "el" => "ell",
+        "en" => "eng",
+        "es" => "spa",
+        "et" => "est",
+        "eu" => "eus",
+        "fa" => "fas",
+        "fi" => "fin",
+        "fr" => "fra",
+        "ga" => "gle",
+        "gl" => "glg",
+        "he" => "heb",
+        "hi" => "hin",
+        "hr" => "hrv",
+        "hu" => "hun",
+        "id" => "ind",
+        "is" => "isl",
+        "it" => "ita",
+        "ja" => "jpn",
+        "ko" => "kor",
+        "lt" => "lit",
+        "lv" => "lav",
+        "ms" => "msa",
+        "nl" => "nld",
+        "no" | "nb" => "nor",
+        "pl" => "pol",
+        "pt" => "por",
+        "ro" => "ron",
+        "ru" => "rus",
+        "sk" => "slk",
+        "sl" => "slv",
+        "sr" => "srp",
+        "sv" => "swe",
+        "th" => "tha",
+        "tr" => "tur",
+        "uk" => "ukr",
+        "vi" => "vie",
+        "zh" => "chi_sim",
         "alb" => "sqi",
         "arm" => "hye",
         "baq" => "eus",
@@ -427,6 +594,9 @@ mod tests {
         assert_eq!(ocr.language_for(Some("fre")).as_deref(), Some("fra"));
         assert_eq!(ocr.language_for(Some("GER")).as_deref(), Some("deu"));
         assert_eq!(ocr.language_for(Some("fra")).as_deref(), Some("fra"));
+        // A file's name: `Movie.en.idx`, `Movie.fr.sup`.
+        assert_eq!(ocr.language_for(Some("en")).as_deref(), Some("eng"));
+        assert_eq!(ocr.language_for(Some("fr")).as_deref(), Some("fra"));
         // Russian data is not installed: no guess with English.
         assert_eq!(ocr.language_for(Some("rus")), None);
     }
@@ -470,15 +640,61 @@ mod tests {
         );
     }
 
+    /// ffprobe's answer for a DVB track in an MPEG-TS whose clock starts at
+    /// 1.48 s: packets in 90 kHz ticks, data as hex dumps.
+    const PROBED: &str = r#"{
+        "packets": [
+            {"pts": 223200, "data": "\n00000000: 0f10 0001 0002 1e0b 0f80 0001 0000 6162  ..............ab\n00000010: 6364                                     cd\n"},
+            {"pts": 448200, "duration": 900, "data": "\n00000000: ff                                       .\n"},
+            {"data": "\n00000000: 00                                       .\n"}
+        ],
+        "streams": [{"time_base": "1/90000", "extradata": "\n00000000: 7061 6c65 7474 653a                      palette:\n"}],
+        "format": {"start_time": "1.480000"}
+    }"#;
+
+    #[test]
+    fn a_probed_track_counts_from_the_file_s_start_and_its_dumps_are_bytes() {
+        let read = track(PROBED.as_bytes(), true).unwrap();
+        assert_eq!(read.extradata, b"palette:");
+        let packets: Vec<_> = read
+            .packets
+            .iter()
+            .map(|p| (p.pts_ms, p.duration_ms, p.data.clone()))
+            .collect();
+        // The packet without a time is left out; the text column is not
+        // read as hex, though "abcd" would pass for it.
+        assert_eq!(
+            packets,
+            [
+                (
+                    1_000,
+                    None,
+                    vec![
+                        0x0f, 0x10, 0, 1, 0, 2, 0x1e, 0x0b, 0x0f, 0x80, 0, 1, 0, 0, 0x61, 0x62,
+                        0x63, 0x64
+                    ]
+                ),
+                (3_500, Some(10), vec![0xff]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_subtitle_file_keeps_its_own_times() {
+        let read = track(PROBED.as_bytes(), false).unwrap();
+        assert_eq!(read.packets[0].pts_ms, 2_480);
+    }
+
     #[test]
     fn blank_lines_go_and_empty_cues_are_dropped() {
         assert_eq!(tidy("  Hello \n\n there\n\n"), "Hello\nthere");
-        let image = pgs::Image {
+        assert_eq!(tidy("| said, | know.\n"), "I said, I know.");
+        let image = bitmap::Image {
             width: 1,
             height: 1,
             pixels: vec![255],
         };
-        let cue = |start_ms| pgs::Cue {
+        let cue = |start_ms| bitmap::Cue {
             start_ms,
             end_ms: start_ms + 1,
             image: image.clone(),

@@ -352,6 +352,11 @@ fn example_paths(example: &str) -> (String, String) {
     }
 }
 
+/// Where a path check's example was looked for here: its local path.
+pub fn missing_path(example: &str) -> String {
+    example_paths(example).1
+}
+
 /// `n` with its thousands apart, as the boards write counts: "18,930".
 pub fn thousands(n: u64) -> String {
     let digits = n.to_string();

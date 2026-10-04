@@ -5,14 +5,17 @@
 //! planner works from. [`MediaDescriptor::tracks`] is the part a client
 //! sees.
 
+pub mod bitmap;
 pub mod codecs;
 mod descriptor;
+pub mod dvb;
 pub mod encoders;
 mod external;
 pub mod ocr;
 pub mod pgs;
 mod probe;
 pub mod roles;
+pub mod vobsub;
 
 pub use probe::{ProbeError, Prober};
 

@@ -87,7 +87,8 @@ pub struct Watch {
     store: Store,
     catalog: Arc<dyn Catalog>,
     prober: Arc<Prober>,
-    rules: WatchRules,
+    /// A live setting (P3-10): read at each use.
+    rules: std::sync::RwLock<WatchRules>,
     /// Each (principal, item)'s last progress write.
     written: Mutex<HashMap<(Principal, String), Written>>,
     next_up: Mutex<HashMap<Principal, (Instant, Vec<Item>)>>,
@@ -109,7 +110,7 @@ struct Written {
 impl std::fmt::Debug for Watch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Watch")
-            .field("rules", &self.rules)
+            .field("rules", &self.rules())
             .finish_non_exhaustive()
     }
 }
@@ -143,12 +144,22 @@ impl Watch {
             store,
             catalog,
             prober,
-            rules,
+            rules: std::sync::RwLock::new(rules),
             written: Mutex::default(),
             next_up: Mutex::default(),
             copies: Mutex::default(),
             changed: tokio::sync::watch::Sender::new(None),
         }
+    }
+
+    /// The rules now.
+    pub fn rules(&self) -> WatchRules {
+        *self.rules.read().expect("never held across a panic")
+    }
+
+    /// Judge by `rules` from now on (`watch { … }` changed at run time).
+    pub fn set_rules(&self, rules: WatchRules) {
+        *self.rules.write().expect("never held across a panic") = rules;
     }
 
     /// Fires after each state saved through [`Watch`], with its principal.
@@ -175,7 +186,7 @@ impl Watch {
             .expect("never held across a panic")
             .get(&key)
             .copied()
-            .filter(|written| written.at.elapsed() < self.rules.throttle);
+            .filter(|written| written.at.elapsed() < self.rules().throttle);
         if let Some(written) = recent {
             // Within the throttle only a crossing into watched is written,
             // judged on what the last write knew (the row's duration and
@@ -189,7 +200,7 @@ impl Watch {
             let duration = row
                 .and_then(|r| r.duration_ms)
                 .map(|d| Duration::from_millis(d.max(0) as u64));
-            let crossing = self.rules.is_watched(position, duration, written.credits)
+            let crossing = self.rules().is_watched(position, duration, written.credits)
                 && !row.is_some_and(|r| r.watched);
             if !crossing {
                 // Not written, but played: it is back in Continue watching
@@ -202,7 +213,7 @@ impl Watch {
         let found = self.catalog.item(id).await?;
         let duration = self.duration(id, &found.item).await;
         let credits = credits_to_end(&found.markers);
-        let watched = self.rules.is_watched(position, duration, credits);
+        let watched = self.rules().is_watched(position, duration, credits);
         self.save(principal, id, &found, Some(position), duration, watched)
             .await?;
         self.written
@@ -422,7 +433,7 @@ impl Watch {
             let position = row
                 .position_ms
                 .map(|p| Duration::from_millis(p.max(0) as u64))
-                .filter(|p| *p >= self.rules.started_after && !row.watched);
+                .filter(|p| *p >= self.rules().started_after && !row.watched);
             let state = PlaybackState {
                 position,
                 watched: row.watched,
@@ -441,7 +452,7 @@ impl Watch {
         // Removed from Continue watching (P1-22): movies, and shows.
         let hidden = self.store.hidden(principal).await?;
         let mut continue_watching = Vec::new();
-        let min = ms(self.rules.started_after);
+        let min = ms(self.rules().started_after);
         // As many more as are hidden, so the row stays full.
         let wanted = (ROW + hidden.len()) as u32;
         for row in self.store.in_progress(principal, min, wanted).await? {
@@ -494,11 +505,11 @@ impl Watch {
             .lock()
             .expect("never held across a panic")
             .get(&principal)
-            && at.elapsed() < self.rules.next_up_cache
+            && at.elapsed() < self.rules().next_up_cache
         {
             return Ok(items.clone());
         }
-        let since = now() - self.rules.next_up_window.as_secs() as i64;
+        let since = now() - self.rules().next_up_window.as_secs() as i64;
         let mut next = Vec::new();
         for show in self
             .store

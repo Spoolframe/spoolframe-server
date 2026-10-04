@@ -2,9 +2,10 @@
 //! §35), as the other foundry services serve theirs. The listener's HTTP
 //! side (the browser's sign-in, the pages) is `crate::admin_http`.
 //!
-//! Loopback by default: passwords and session tokens cross it in clear,
-//! so reaching it from elsewhere means a TLS reverse proxy in front, and
-//! an explicit `allow_remote`.
+//! On every interface by default (P3-10): passwords and session tokens
+//! cross it in clear, so the expectation is a TLS reverse proxy in front
+//! (`admin.public_url`). Plain HTTP on the LAN reaches the setup code and
+//! the wizard; staying signed in there needs `admin.insecure_cookies`.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -15,28 +16,37 @@ use jsonrpsee::server::ServerHandle;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
 use spoolframe_admin_api::{
-    AdminApiServer, Credentials, DeviceEntry, DeviceSignIn, LibraryStatus, LoggedIn, MeApiServer,
-    NewUser, PasskeyChallenge, PasskeyEntry, PasskeyHost, PasskeySetupBegin, PasskeySetupFinish,
-    PasswordChange, PathFailures, PathReport, PlexStatus, PlexSyncReport, Role, ServerStatus,
-    SessionEntry, SetupRequest, TranscodingStatus, UserInfo, error_code,
+    AdminApiServer, Credentials, DeviceEntry, DeviceSignIn, DiscoveredPlex, LibraryPathCheck,
+    LibraryStatus, LoggedIn, MeApiServer, NewUser, PasskeyChallenge, PasskeyEntry, PasskeyHost,
+    PasskeySetupBegin, PasskeySetupFinish, PasswordChange, PathFailures, PathMappingEntry,
+    PathReport, PlexPin, PlexPinState, PlexStatus, PlexSyncReport, Role, ServerStatus,
+    SessionEntry, SettingEntry, Settings, SetupRequest, SetupState, TranscodingStatus, UserInfo,
+    error_code,
 };
 use spoolframe_catalog::Catalog;
 use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
 
-pub use crate::admin_http::{Origins, TrustedProxies};
+pub use crate::admin_http::{CookiePolicy, Origins, TrustedProxies};
 use crate::auth::{
     Auth, LoginError, PasswordError, RECENT_SIGN_IN, SessionToken, hash_password, hash_pin,
     valid_pin,
 };
+use crate::catalog::LiveCatalog;
+use crate::config::layers::SettingError;
+use crate::config::settings::PLEX_TOKEN;
+use crate::config::{PathMappingConfig, PlexConfig};
 use crate::device_sign_in::ClaimError;
+use crate::network::ServerName;
 use crate::passkeys::{CeremonyError, Passkeys, SignInError};
 use crate::plex_sync::{PlexSync, SyncError};
+use crate::runtime::{ChangeError, RuntimeSettings};
 use crate::store::passkeys::{FirstPasskey, PasskeyError, PasskeyRecord, passkey_name};
 use crate::store::pins::{DeviceRecord, PinError};
 use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionRecord};
 use crate::store::users::{UserError, UserRecord, normalize_username};
 use crate::transcode::Transcoding;
+use spoolframe_plex::account::{PinState, PlexTv};
 
 /// The address the caller is at: its connection's, or behind a trusted
 /// proxy the one the proxy forwards for, `None` if the proxy named none
@@ -130,23 +140,39 @@ impl SetupCode {
 /// so its key is filled in when it is known.
 #[derive(Debug)]
 pub struct StatusSource {
-    pub name: String,
+    /// A live setting (P3-10): read at each call.
+    pub name: ServerName,
     pub transcoding: Arc<Transcoding>,
     /// Whether the endpoint announces itself on the LAN.
     pub mdns: bool,
     endpoint_id: OnceLock<String>,
     addresses: OnceLock<Vec<String>>,
+    /// The languages subtitles are read as text in.
+    pub ocr_languages: Vec<String>,
+    web_urls: OnceLock<Vec<String>>,
 }
 
 impl StatusSource {
-    pub fn new(name: impl Into<String>, transcoding: Arc<Transcoding>) -> Self {
+    pub fn new(name: ServerName, transcoding: Arc<Transcoding>) -> Self {
         Self {
-            name: name.into(),
+            name,
             transcoding,
             mdns: false,
             endpoint_id: OnceLock::new(),
             addresses: OnceLock::new(),
+            ocr_languages: Vec::new(),
+            web_urls: OnceLock::new(),
         }
+    }
+
+    pub fn with_ocr_languages(mut self, languages: Vec<String>) -> Self {
+        self.ocr_languages = languages;
+        self
+    }
+
+    /// Where the web UI answers, once the listener is up.
+    pub fn set_web_urls(&self, urls: Vec<String>) {
+        let _ = self.web_urls.set(urls);
     }
 
     pub fn with_mdns(mut self, mdns: bool) -> Self {
@@ -166,7 +192,7 @@ impl StatusSource {
     fn status(&self) -> ServerStatus {
         let encoders = self.transcoding.encoders();
         ServerStatus {
-            name: self.name.clone(),
+            name: self.name.get(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             endpoint_id: self.endpoint_id.get().cloned(),
             fingerprint: self
@@ -184,6 +210,8 @@ impl StatusSource {
             },
             mdns: self.mdns,
             addresses: self.addresses.get().cloned().unwrap_or_default(),
+            ocr_languages: self.ocr_languages.clone(),
+            web_urls: self.web_urls.get().cloned().unwrap_or_default(),
         }
     }
 }
@@ -195,10 +223,109 @@ pub struct Admin {
     pub setup_code: Option<SetupCode>,
     pub status: Arc<StatusSource>,
     pub plex_sync: Option<Arc<PlexSync>>,
-    /// For `plexStatus` and `plexCheckPaths`; `None` in tests without one.
-    pub plex: Option<Arc<PlexCatalog>>,
+    /// For `plexStatus` and `plexCheckPaths`: the catalog the server
+    /// serves from, without Plex until it is set up.
+    pub plex: Arc<LiveCatalog>,
     /// The relying party passkeys are bound to (P3-05).
     pub passkeys: Arc<Passkeys>,
+    /// How the browser's session cookie is sent (`admin.insecure_cookies`).
+    pub cookies: CookiePolicy,
+    /// The settings changed at run time (P3-10); `None` in tests without.
+    pub settings: Option<Arc<RuntimeSettings>>,
+    /// What the setup wizard reaches beyond the server.
+    pub wizard: Wizard,
+}
+
+/// What the setup wizard reaches beyond the server (P3-10): plex.tv for
+/// Sign in with Plex, the LAN for Plex's discovery, and the mount points
+/// suggested path mappings are looked for in. Stand-ins in tests.
+#[derive(Debug, Clone)]
+pub struct Wizard {
+    pub plex_tv: url::Url,
+    pub plex_app: url::Url,
+    pub gdm: Vec<SocketAddr>,
+    /// `None`: [`spoolframe_plex::paths::usual_bases`].
+    pub path_bases: Option<Vec<std::path::PathBuf>>,
+}
+
+impl Default for Wizard {
+    fn default() -> Self {
+        Self {
+            plex_tv: spoolframe_plex::account::PLEX_TV
+                .parse()
+                .expect("a fixed URL"),
+            plex_app: spoolframe_plex::account::PLEX_APP
+                .parse()
+                .expect("a fixed URL"),
+            gdm: spoolframe_plex::gdm::TARGETS.to_vec(),
+            path_bases: None,
+        }
+    }
+}
+
+/// Where a browser can open the web UI on a listener bound to `listen`:
+/// that address, or for a wildcard every address of this host's
+/// (link-local IPv6 left out: it needs a zone a URL cannot carry), the
+/// LAN's first and loopback last. What the log prints at start.
+pub fn web_urls(listen: SocketAddr) -> Vec<String> {
+    urls(listen, &host_addresses())
+}
+
+fn urls(listen: SocketAddr, host: &[IpAddr]) -> Vec<String> {
+    let addresses: Vec<IpAddr> = match listen.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            host.iter().copied().filter(IpAddr::is_ipv4).collect()
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => host.to_vec(),
+        ip => vec![ip],
+    };
+    let mut addresses: Vec<IpAddr> = addresses
+        .into_iter()
+        .filter(|ip| match ip {
+            IpAddr::V6(v6) => !v6.is_unicast_link_local(),
+            IpAddr::V4(_) => true,
+        })
+        .collect();
+    addresses.sort_by_key(|ip| (ip.is_loopback(), ip.is_ipv6()));
+    addresses.dedup();
+    addresses
+        .into_iter()
+        .map(|ip| format!("http://{}/", SocketAddr::new(ip, listen.port())))
+        .collect()
+}
+
+/// This host's interface addresses, of the interfaces that are up.
+fn host_addresses() -> Vec<IpAddr> {
+    let mut found = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list it allocates, which is
+    // read only until the freeifaddrs below; each entry's address is read
+    // as the struct its family names.
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return found;
+        }
+        let mut entry = head;
+        while let Some(ifa) = entry.as_ref() {
+            entry = ifa.ifa_next;
+            if ifa.ifa_addr.is_null() || ifa.ifa_flags & libc::IFF_UP as u32 == 0 {
+                continue;
+            }
+            match i32::from((*ifa.ifa_addr).sa_family) {
+                libc::AF_INET => {
+                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    found.push(IpAddr::from(sa.sin_addr.s_addr.to_ne_bytes()));
+                }
+                libc::AF_INET6 => {
+                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    found.push(IpAddr::from(sa.sin6_addr.s6_addr));
+                }
+                _ => {}
+            }
+        }
+        libc::freeifaddrs(head);
+    }
+    found
 }
 
 /// Start the admin API on `listen`. Browsers are let in from `origins`;
@@ -216,6 +343,10 @@ pub async fn serve(
         plex_sync: admin.plex_sync,
         plex: admin.plex,
         passkeys: admin.passkeys,
+        cookies: admin.cookies,
+        settings: admin.settings,
+        wizard: admin.wizard,
+        pins: Arc::default(),
         public_url: origins.public_url().map(str::to_owned),
     };
     let mut methods = AdminApiServer::into_rpc(api.clone());
@@ -231,8 +362,13 @@ pub(crate) struct AdminApi {
     setup_code: Option<SetupCode>,
     status: Arc<StatusSource>,
     plex_sync: Option<Arc<PlexSync>>,
-    plex: Option<Arc<PlexCatalog>>,
+    plex: Arc<LiveCatalog>,
     passkeys: Arc<Passkeys>,
+    cookies: CookiePolicy,
+    settings: Option<Arc<RuntimeSettings>>,
+    wizard: Wizard,
+    /// The plex.tv PINs this server began, so a check is only of those.
+    pins: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
     /// Where browsers reach the web UI (`admin.public_url`), if anywhere.
     public_url: Option<String>,
 }
@@ -331,7 +467,16 @@ impl AdminApi {
     /// public URL to send a browser to when its own address cannot keep
     /// the session cookie (plain HTTP on a real host).
     pub(crate) fn site(&self) -> serde_json::Value {
-        json!({ "name": self.status.name, "publicUrl": self.public_url })
+        json!({
+            "name": self.status.name.get(),
+            "publicUrl": self.public_url,
+            "insecureCookies": self.cookies.insecure(),
+        })
+    }
+
+    /// How the session cookie is sent now.
+    pub(crate) fn cookies(&self) -> &CookiePolicy {
+        &self.cookies
     }
 
     /// Why the server cannot offer passkeys, if it cannot.
@@ -490,6 +635,21 @@ impl AdminApi {
     }
 }
 
+impl From<ChangeError> for ErrorObjectOwned {
+    fn from(e: ChangeError) -> Self {
+        match &e {
+            ChangeError::Setting(SettingError::Locked { .. }) => {
+                error(error_code::SETTING_LOCKED, e.to_string())
+            }
+            ChangeError::Setting(_) | ChangeError::Secret { .. } => {
+                error(error_code::INVALID_INPUT, e.to_string())
+            }
+            ChangeError::NotSupervised => error(error_code::NOT_CONFIGURED, e.to_string()),
+            ChangeError::Write(_) => internal(e),
+        }
+    }
+}
+
 impl From<PinError> for ErrorObjectOwned {
     fn from(e: PinError) -> Self {
         match &e {
@@ -523,10 +683,26 @@ fn device(d: DeviceRecord) -> DeviceEntry {
 }
 
 impl AdminApi {
-    fn plex(&self) -> RpcResult<&PlexCatalog> {
-        self.plex
-            .as_deref()
-            .ok_or_else(|| error(error_code::NOT_CONFIGURED, "no Plex server is configured"))
+    /// The runtime settings, and the admin changing them, by name for the
+    /// log.
+    async fn settings_as_admin(&self, ext: &Extensions) -> RpcResult<(&RuntimeSettings, String)> {
+        let user = self.admin(ext).await?;
+        let Some(settings) = &self.settings else {
+            return Err(error(
+                error_code::NOT_CONFIGURED,
+                "this server does not change settings at run time",
+            ));
+        };
+        Ok((settings, self.account(user).await?.username))
+    }
+
+    fn plex(&self) -> RpcResult<Arc<PlexCatalog>> {
+        self.plex.plex().ok_or_else(|| {
+            error(
+                error_code::NOT_CONFIGURED,
+                "this server is not set up: no Plex server is configured",
+            )
+        })
     }
 
     /// The caller's own account.
@@ -549,6 +725,51 @@ impl AdminApi {
             .into_iter()
             .find(|u| u.username == name)
             .ok_or_else(|| UserError::NoSuchUser(name).into())
+    }
+}
+
+/// Plex as `plexStatus` shows it: reachable or not, and its libraries
+/// with their item counts. Down is an answer, not an error.
+async fn plex_status_of(plex: &PlexCatalog) -> PlexStatus {
+    let down = |e: spoolframe_catalog::CatalogError| PlexStatus {
+        reachable: false,
+        error: Some(e.to_string()),
+        server_name: None,
+        version: None,
+        url: Some(plex.base_url().to_owned()),
+        libraries: Vec::new(),
+    };
+    let (server_name, version) = match plex.identity().await {
+        Ok(identity) => identity,
+        Err(e) => return down(e),
+    };
+    let libraries = match plex.libraries().await {
+        Ok(libraries) => libraries,
+        Err(e) => return down(e),
+    };
+    let mut status = Vec::with_capacity(libraries.len());
+    for library in libraries {
+        let page = spoolframe_catalog::Page {
+            offset: 0,
+            limit: 1,
+        };
+        let items = match plex.items(&library.id, page).await {
+            Ok(page) => page.total,
+            Err(e) => return down(e),
+        };
+        status.push(LibraryStatus {
+            title: library.title,
+            kind: library.kind,
+            items,
+        });
+    }
+    PlexStatus {
+        reachable: true,
+        error: None,
+        server_name,
+        version,
+        url: Some(plex.base_url().to_owned()),
+        libraries: status,
     }
 }
 
@@ -1207,45 +1428,7 @@ impl AdminApiServer for AdminApi {
 
     async fn plex_status(&self, ext: &Extensions) -> RpcResult<PlexStatus> {
         self.admin(ext).await?;
-        let plex = self.plex()?;
-        let down = |e: spoolframe_catalog::CatalogError| PlexStatus {
-            reachable: false,
-            error: Some(e.to_string()),
-            server_name: None,
-            url: Some(plex.base_url().to_owned()),
-            libraries: Vec::new(),
-        };
-        let server_name = match plex.server_name().await {
-            Ok(name) => name,
-            Err(e) => return Ok(down(e)),
-        };
-        let libraries = match plex.libraries().await {
-            Ok(libraries) => libraries,
-            Err(e) => return Ok(down(e)),
-        };
-        let mut status = Vec::with_capacity(libraries.len());
-        for library in libraries {
-            let page = spoolframe_catalog::Page {
-                offset: 0,
-                limit: 1,
-            };
-            let items = match plex.items(&library.id, page).await {
-                Ok(page) => page.total,
-                Err(e) => return Ok(down(e)),
-            };
-            status.push(LibraryStatus {
-                title: library.title,
-                kind: library.kind,
-                items,
-            });
-        }
-        Ok(PlexStatus {
-            reachable: true,
-            error: None,
-            server_name,
-            url: Some(plex.base_url().to_owned()),
-            libraries: status,
-        })
+        Ok(plex_status_of(&*self.plex()?).await)
     }
 
     async fn plex_check_paths(
@@ -1301,6 +1484,275 @@ impl AdminApiServer for AdminApi {
             pushed: report.pushed,
             failed: report.failed,
         })
+    }
+
+    async fn settings(&self, ext: &Extensions) -> RpcResult<Settings> {
+        let (settings, _) = self.settings_as_admin(ext).await?;
+        Ok(settings.settings())
+    }
+
+    async fn setting_set(
+        &self,
+        ext: &Extensions,
+        key: String,
+        value: serde_json::Value,
+    ) -> RpcResult<SettingEntry> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings.set(&key, &value, &by)?)
+    }
+
+    async fn setting_unset(&self, ext: &Extensions, key: String) -> RpcResult<SettingEntry> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings.unset(&key, &by)?)
+    }
+
+    async fn restart(&self, ext: &Extensions) -> RpcResult<()> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings.restart(&by)?)
+    }
+
+    async fn setup_state(&self, ext: &Extensions) -> RpcResult<SetupState> {
+        let (settings, _) = self.settings_as_admin(ext).await?;
+        Ok(setup_state(settings.setup()))
+    }
+
+    async fn setup_step_done(&self, ext: &Extensions, step: String) -> RpcResult<SetupState> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(setup_state(settings.setup_progress(
+            Some(&step),
+            false,
+            &by,
+        )?))
+    }
+
+    async fn setup_finish(&self, ext: &Extensions) -> RpcResult<SetupState> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(setup_state(settings.setup_progress(None, true, &by)?))
+    }
+
+    async fn plex_discover(&self, ext: &Extensions) -> RpcResult<Vec<DiscoveredPlex>> {
+        self.admin(ext).await?;
+        let found = spoolframe_plex::gdm::discover(&self.wizard.gdm, spoolframe_plex::gdm::WAIT)
+            .await
+            .map_err(|e| {
+                error(
+                    error_code::UNAVAILABLE,
+                    format!("cannot search the LAN: {e}"),
+                )
+            })?;
+        Ok(found
+            .into_iter()
+            .map(|f| DiscoveredPlex {
+                name: f.name,
+                url: f.url,
+                version: f.version,
+            })
+            .collect())
+    }
+
+    async fn plex_probe(
+        &self,
+        ext: &Extensions,
+        url: String,
+        token: Option<String>,
+    ) -> RpcResult<PlexStatus> {
+        let (settings, _) = self.settings_as_admin(ext).await?;
+        let plex = PlexConfig {
+            url,
+            token_file: None,
+            path_mapping: Vec::new(),
+            watch_sync: None,
+        };
+        let url = plex
+            .url()
+            .map_err(|e| error(error_code::INVALID_INPUT, e.to_string()))?;
+        let token = match token.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()) {
+            Some(token) => Some(token),
+            None => settings.plex_token(),
+        };
+        let catalog = PlexCatalog::new(url, token).map_err(internal)?;
+        Ok(plex_status_of(&catalog).await)
+    }
+
+    async fn plex_pin_begin(&self, ext: &Extensions) -> RpcResult<PlexPin> {
+        let (settings, _) = self.settings_as_admin(ext).await?;
+        let pin = self
+            .plex_tv(settings)?
+            .begin()
+            .await
+            .map_err(|e| error(error_code::UNAVAILABLE, e.to_string()))?;
+        self.pins
+            .lock()
+            .expect("never held across a panic")
+            .insert(pin.id);
+        Ok(PlexPin {
+            id: pin.id,
+            code: pin.code,
+            auth_url: pin.auth_url,
+            expires_in: pin.expires_in,
+        })
+    }
+
+    async fn plex_pin_check(&self, ext: &Extensions, id: u64) -> RpcResult<PlexPinState> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        if !self
+            .pins
+            .lock()
+            .expect("never held across a panic")
+            .contains(&id)
+        {
+            return Err(error(
+                error_code::INVALID_INPUT,
+                "not a PIN this server began",
+            ));
+        }
+        let plex_tv = self.plex_tv(settings)?;
+        let state = plex_tv
+            .check(id)
+            .await
+            .map_err(|e| error(error_code::UNAVAILABLE, e.to_string()))?;
+        let token = match state {
+            PinState::Waiting => return Ok(PlexPinState::Waiting),
+            PinState::Expired => {
+                self.pins
+                    .lock()
+                    .expect("never held across a panic")
+                    .remove(&id);
+                return Ok(PlexPinState::Expired);
+            }
+            PinState::Linked(token) => token,
+        };
+        self.pins
+            .lock()
+            .expect("never held across a panic")
+            .remove(&id);
+        settings.set(PLEX_TOKEN, &serde_json::Value::String(token.clone()), &by)?;
+        // Only for the page to say who; the token is kept either way.
+        let account = plex_tv.account(&token).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "cannot ask plex.tv whose token it is");
+            None
+        });
+        tracing::info!(
+            by,
+            account,
+            "signed in with Plex: the token is kept as plex.token"
+        );
+        Ok(PlexPinState::Linked { account })
+    }
+
+    async fn plex_path_check(
+        &self,
+        ext: &Extensions,
+        mappings: Vec<PathMappingEntry>,
+    ) -> RpcResult<Vec<LibraryPathCheck>> {
+        self.admin(ext).await?;
+        let plex = self.plex()?;
+        // Checked as the setting will be.
+        let config = PlexConfig {
+            url: plex.base_url().to_owned(),
+            token_file: None,
+            path_mapping: mappings
+                .into_iter()
+                .map(|m| PathMappingConfig {
+                    library: m.library,
+                    from: m.from.into(),
+                    to: m.to.into(),
+                })
+                .collect(),
+            watch_sync: None,
+        };
+        let paths = config
+            .path_map()
+            .map_err(|e| error(error_code::INVALID_INPUT, e.to_string()))?;
+        let reports = plex
+            .trying_paths(paths)
+            .check_paths(None, Scope::Sample(PATH_SAMPLE))
+            .await
+            .map_err(|e| error(error_code::UNAVAILABLE, e.to_string()))?;
+        let bases = self
+            .wizard
+            .path_bases
+            .clone()
+            .unwrap_or_else(spoolframe_plex::paths::usual_bases);
+        Ok(reports
+            .into_iter()
+            .map(|r| {
+                let suggestion = r
+                    .failed
+                    .first()
+                    .and_then(|file| spoolframe_plex::paths::suggest(file, &bases))
+                    .map(|m| PathMappingEntry {
+                        library: Some(r.library.clone()),
+                        from: m.from.display().to_string(),
+                        to: m.to.display().to_string(),
+                    });
+                LibraryPathCheck {
+                    checked: r.ok + r.no_mapping.count + r.unreadable.count,
+                    ok: r.ok,
+                    failures: r
+                        .no_mapping
+                        .examples
+                        .into_iter()
+                        .chain(r.unreadable.examples)
+                        .collect(),
+                    roots: r.roots.iter().map(|p| p.display().to_string()).collect(),
+                    library: r.library,
+                    suggestion,
+                }
+            })
+            .collect())
+    }
+}
+
+/// How many files of each library the wizard's path check reads: as many
+/// as the check at startup.
+pub const PATH_SAMPLE: u32 = 5;
+
+fn setup_state((done, finished): (Vec<String>, bool)) -> SetupState {
+    SetupState { finished, done }
+}
+
+impl AdminApi {
+    /// plex.tv, as this server's installation.
+    fn plex_tv(&self, settings: &RuntimeSettings) -> RpcResult<PlexTv> {
+        let client_id = settings.plex_client_id().map_err(internal)?;
+        PlexTv::new(
+            self.wizard.plex_tv.clone(),
+            self.wizard.plex_app.clone(),
+            client_id,
+        )
+        .map_err(|e| error(error_code::UNAVAILABLE, e.to_string()))
+    }
+
+    /// Before the first admin exists: the setup code from the log is
+    /// right, and with `insecure_cookies` the session cookie is sent
+    /// without `Secure` from now on, so the admin made next stays signed
+    /// in over plain HTTP (P3-10). The code is what authorizes it, as it
+    /// authorizes making the admin.
+    pub(crate) async fn setup_check(
+        &self,
+        ext: &Extensions,
+        code: &str,
+        insecure_cookies: bool,
+    ) -> RpcResult<()> {
+        self.setup_code(ext, code)?;
+        if !self.setup_open().await? {
+            return Err(UserError::AlreadySetUp.into());
+        }
+        if insecure_cookies {
+            let Some(settings) = &self.settings else {
+                return Err(error(
+                    error_code::NOT_CONFIGURED,
+                    "this server does not change settings at run time",
+                ));
+            };
+            settings.set(
+                "admin.insecure_cookies",
+                &serde_json::Value::Bool(true),
+                "the setup code",
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1364,10 +1816,17 @@ mod tests {
         AdminApi {
             auth,
             setup_code: None,
-            status: Arc::new(StatusSource::new("Den", Arc::new(transcoding))),
+            status: Arc::new(StatusSource::new(
+                ServerName::new("Den"),
+                Arc::new(transcoding),
+            )),
             plex_sync: None,
-            plex: None,
+            plex: Arc::default(),
             passkeys: Arc::new(Passkeys::new(&origins)),
+            cookies: CookiePolicy::default(),
+            settings: None,
+            wizard: Wizard::default(),
+            pins: Arc::default(),
             public_url: origins.public_url().map(str::to_owned),
         }
     }
@@ -1459,6 +1918,52 @@ mod tests {
         api.passkey_remove(&ext, "cred-1".into()).await.unwrap();
         assert_eq!(api.passkeys(&ext).await.unwrap(), []);
         api.passkey_add_begin(&ext).await.unwrap();
+    }
+
+    #[test]
+    fn a_wildcard_listener_answers_on_every_address_of_its_family() {
+        let host: Vec<IpAddr> = [
+            "127.0.0.1",
+            "192.168.1.20",
+            "::1",
+            "fe80::1",
+            "fd00::20",
+            "10.0.0.5",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        assert_eq!(
+            urls("0.0.0.0:7421".parse().unwrap(), &host),
+            [
+                "http://192.168.1.20:7421/",
+                "http://10.0.0.5:7421/",
+                "http://127.0.0.1:7421/"
+            ]
+        );
+        assert_eq!(
+            urls("[::]:7421".parse().unwrap(), &host),
+            [
+                "http://192.168.1.20:7421/",
+                "http://10.0.0.5:7421/",
+                "http://[fd00::20]:7421/",
+                "http://127.0.0.1:7421/",
+                "http://[::1]:7421/"
+            ]
+        );
+        assert_eq!(
+            urls("127.0.0.1:7421".parse().unwrap(), &host),
+            ["http://127.0.0.1:7421/"]
+        );
+    }
+
+    #[test]
+    fn this_host_has_a_loopback_address() {
+        assert!(
+            host_addresses().iter().any(IpAddr::is_loopback),
+            "{:?}",
+            host_addresses()
+        );
     }
 
     #[test]

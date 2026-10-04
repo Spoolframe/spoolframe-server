@@ -4,10 +4,13 @@
 //!
 //! It talks to the PMS directly over the LAN and never to plex.tv, so the
 //! catalog keeps working when the Internet is down (ARCHITECTURE §32). It
-//! reads on demand and does not copy the Plex database.
+//! reads on demand and does not copy the Plex database. Only [`account`],
+//! signing in with Plex at setup, reaches plex.tv, and only then.
 
+pub mod account;
 pub mod check;
 mod convert;
+pub mod gdm;
 pub mod paths;
 mod watch;
 mod wire;
@@ -126,6 +129,17 @@ impl PlexCatalog {
         self
     }
 
+    /// The same PMS and token, with other path mappings: for checking
+    /// mappings before they are saved (P3-10).
+    pub fn trying_paths(&self, paths: PathMap) -> Self {
+        Self {
+            base: self.base.clone(),
+            token: self.token.clone(),
+            http: self.http.clone(),
+            paths,
+        }
+    }
+
     /// Where the PMS is reached, as configured: no token, no trailing
     /// slash.
     pub fn base_url(&self) -> &str {
@@ -134,7 +148,13 @@ impl PlexCatalog {
 
     /// What the PMS calls itself; asking is also how to tell it is up.
     pub async fn server_name(&self) -> Result<Option<String>, CatalogError> {
-        Ok(self.fetch(&Call::get("/")).await?.friendly_name)
+        Ok(self.identity().await?.0)
+    }
+
+    /// What the PMS calls itself, and its version.
+    pub async fn identity(&self) -> Result<(Option<String>, Option<String>), CatalogError> {
+        let root = self.fetch(&Call::get("/")).await?;
+        Ok((root.friendly_name, root.version))
     }
 
     async fn fetch(&self, call: &Call<'_>) -> Result<MediaContainer, CatalogError> {

@@ -11,12 +11,12 @@
 //!    reads only) with a file it cannot play.
 //!
 //! The picked subtitle is decided first, since it decides whether the file
-//! can play directly (P2-07). A bitmap one (PGS): the client draws it, the
-//! server reads it as text (sent as an external text subtitle, so the file
-//! still plays directly), or it is burned in; the client's
-//! [`BitmapSubtitles`] mode picks, and `Auto` takes the first that works. A
-//! text one the client cannot show is converted to SubRip or WebVTT and
-//! sent beside the file the same way.
+//! can play directly (P2-07). A bitmap one (PGS; VobSub and DVB since
+//! P3-08): the client draws it, the server reads it as text (sent as an
+//! external text subtitle, so the file still plays directly), or it is
+//! burned in; the client's [`BitmapSubtitles`] mode picks, and `Auto` takes
+//! the first that works. A text one the client cannot show is converted to
+//! SubRip or WebVTT and sent beside the file the same way.
 
 use spoolframe_media::encoders::Encoders;
 use spoolframe_media::ocr::Ocr;
@@ -190,8 +190,11 @@ fn as_text(
     caps: &ClientCapabilities,
     ocr: &Ocr,
 ) -> Result<SubtitleFormat, String> {
-    if format != SubtitleFormat::Pgs {
-        return Err("only PGS is read".into());
+    if !matches!(
+        format,
+        SubtitleFormat::Pgs | SubtitleFormat::VobSub | SubtitleFormat::DvbSub
+    ) {
+        return Err("only PGS, VobSub and DVB are read".into());
     }
     if ocr.languages().is_empty() {
         return Err("the server has no text recognition (tesseract)".into());
@@ -1464,6 +1467,129 @@ mod tests {
                 },
             })
         );
+    }
+
+    /// The ticket's file with its PGS track as DVD (VobSub) or DVB
+    /// subtitles, tagged `language`.
+    fn with_bitmap(codec: &str, language: &str) -> MediaDescriptor {
+        let mut file = dts_aac_pgs();
+        file.subtitles[0] = subtitle(SubtitleSource::Embedded { index: 3 }, codec);
+        file.subtitles[0].language = Some(language.into());
+        file
+    }
+
+    /// A client without DTS, PGS, VobSub or DVB that also takes a
+    /// progressive stream, so burning in is open to it.
+    fn caps_that_can_burn_in() -> ClientCapabilities {
+        ClientCapabilities {
+            delivery: vec![Delivery::Range, Delivery::Progressive],
+            ..caps()
+        }
+    }
+
+    #[test]
+    fn text_reads_vobsub_and_dvb_for_a_client_that_draws_neither() {
+        for codec in ["dvd_subtitle", "dvb_subtitle"] {
+            let plan = with_mode(
+                &with_bitmap(codec, "eng"),
+                &caps(),
+                picked(1, Some(0)),
+                BitmapSubtitles::Text,
+                &english(),
+            );
+            assert_eq!(direct_subtitle(plan), sent_as_srt(), "{codec}");
+        }
+    }
+
+    #[test]
+    fn auto_reads_vobsub_and_dvb_rather_than_burn_them_in() {
+        for codec in ["dvd_subtitle", "dvb_subtitle"] {
+            let plan = with_mode(
+                &with_bitmap(codec, "eng"),
+                &caps_that_can_burn_in(),
+                picked(1, Some(0)),
+                BitmapSubtitles::Auto,
+                &english(),
+            );
+            assert_eq!(direct_subtitle(plan), sent_as_srt(), "{codec}");
+        }
+    }
+
+    #[test]
+    fn hls_reads_vobsub_and_dvb_as_a_webvtt_rendition() {
+        let caps = ClientCapabilities {
+            subtitles: [SubtitleFormat::WebVtt].into(),
+            delivery: vec![Delivery::Hls],
+            ..caps()
+        };
+        for (codec, from) in [
+            ("dvd_subtitle", SubtitleFormat::VobSub),
+            ("dvb_subtitle", SubtitleFormat::DvbSub),
+        ] {
+            let (_, _, video, _, subtitle, _) = converted(with_mode(
+                &with_bitmap(codec, "eng"),
+                &caps,
+                picked(1, Some(0)),
+                BitmapSubtitles::Auto,
+                &english(),
+            ));
+            assert!(matches!(video, ConvertedVideo::Copy { .. }), "{video:?}");
+            assert_eq!(
+                subtitle,
+                Some(ConvertedSubtitle {
+                    index: 0,
+                    action: SubtitleAction::Ocr {
+                        from,
+                        to: SubtitleFormat::WebVtt,
+                    },
+                }),
+                "{codec}"
+            );
+        }
+    }
+
+    #[test]
+    fn vobsub_and_dvb_without_recognition_data_burn_in_or_say_why_not() {
+        for (codec, name) in [("dvd_subtitle", "vob_sub"), ("dvb_subtitle", "dvb_sub")] {
+            let french = with_bitmap(codec, "fre");
+            let (_, _, video, _, subtitle, why) = converted(with_mode(
+                &french,
+                &caps_that_can_burn_in(),
+                picked(1, Some(0)),
+                BitmapSubtitles::Auto,
+                &english(),
+            ));
+            assert!(matches!(video, ConvertedVideo::Encode { .. }), "{video:?}");
+            assert!(
+                matches!(
+                    subtitle,
+                    Some(ConvertedSubtitle {
+                        action: SubtitleAction::BurnIn { .. },
+                        ..
+                    })
+                ),
+                "{subtitle:?}"
+            );
+            assert!(
+                why.contains(&format!(
+                    "subtitle 0: {name} cannot be shown; burned into the video"
+                )),
+                "{why:?}"
+            );
+            assert_eq!(
+                reasons(with_mode(
+                    &french,
+                    &caps_that_can_burn_in(),
+                    picked(1, Some(0)),
+                    BitmapSubtitles::Text,
+                    &english(),
+                )),
+                [format!(
+                    "subtitle 0: {name} cannot be read as text: \
+                     the server has no text recognition data for fre"
+                )]
+            );
+        }
     }
 
     #[test]

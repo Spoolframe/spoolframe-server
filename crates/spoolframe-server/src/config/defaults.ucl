@@ -1,0 +1,128 @@
+# spoolframe-server's built-in defaults (schema spoolframe.server.v1).
+#
+# Every setting is here at its default. A setting that is commented out
+# has no default value: the comment says what the server does without it.
+#
+# The server reads three layers, later ones winning key by key:
+#
+#   1. these defaults, built in (`spoolframe-server config defaults`);
+#   2. the provided file, if any: `--config <file>` or SPOOLFRAME_CONFIG;
+#   3. runtime.ucl in the state directory, which the server writes when a
+#      setting is changed in the web UI or with `config set`. Never edit
+#      it by hand: the server rewrites it whole.
+#
+# A provided file with `locked = true;` locks every key it sets: the web
+# UI and `config set` cannot change them. Keys it leaves out stay
+# editable.
+#
+# Where the layers are is not configuration: the state directory comes
+# from --state-dir, SPOOLFRAME_STATE_DIR, systemd's $STATE_DIRECTORY,
+# $XDG_STATE_HOME/spoolframe, or /var/lib/spoolframe when run as root.
+# The key, the database, the caches and runtime.ucl live there.
+
+schema = "spoolframe.server.v1";
+
+# What clients show for this server.
+name = "Spoolframe";
+
+# The Plex Media Server the catalog reads from. Without it the server runs
+# "not set up": the web UI and the admin API work, and clients are told
+# the server is not set up yet. The setup wizard sets it.
+#
+# plex {
+#   # The PMS on the LAN, never plex.tv: the catalog works without the
+#   # Internet.
+#   url = "http://192.168.1.20:32400";
+#   # A file holding the X-Plex-Token; none for a PMS that lets LAN
+#   # clients in without one. A token set in the web UI is kept in the
+#   # state directory instead (secrets/plex-token), never in a config.
+#   token_file = "/run/secrets/plex-token";
+#   # Rewrites from the paths Plex reports to the paths this host reads,
+#   # for every library or, with `library`, for one.
+#   path_mapping [
+#     { from = "/data/movies"; to = "/mnt/nas/movies"; },
+#     { library = "Music"; from = "/data"; to = "/mnt/nas/music"; },
+#   ]
+#   # Two-way watch state sync with the Plex account the token is for.
+#   watch_sync {
+#     user = "andoriyu";
+#     interval_secs = 120;
+#   }
+# }
+
+# The Iroh endpoint clients connect to.
+network {
+  # The UDP port. Left out, a free one is picked at every start; fix it
+  # when a firewall needs to know.
+  # port = 7420;
+  # "disabled", "default" (the public relays) or a relay URL. Only
+  # "disabled" until remote access.
+  relay = "disabled";
+  # Announce the server on the LAN over mDNS, so clients find it.
+  mdns = true;
+}
+
+# The admin API (JSON-RPC over WebSocket) and the web UI.
+admin {
+  # Every IPv4 interface. Put something that terminates TLS in front of
+  # it (nginx, Caddy) and set public_url: over plain HTTP a browser drops
+  # the Secure session cookie, and passkeys do not work. "127.0.0.1:7421"
+  # for a host whose proxy runs on the same machine.
+  listen = "0.0.0.0:7421";
+  # Where browsers reach the web UI through a TLS reverse proxy. Its host
+  # is what passkeys are bound to. Left out, a browser must be on the
+  # listener's own host.
+  # public_url = "https://media.example.org";
+  # The reverse proxies in front of the listener, as addresses and CIDR
+  # ranges, comma-separated. Left out, no X-Forwarded-For is read.
+  # trusted_proxies = "10.0.0.5, 172.17.0.0/16";
+  # Send the session cookie without Secure and HttpOnly, so signing in
+  # over plain HTTP on the LAN works. The cookie then crosses the LAN in
+  # clear and page scripts can read it; passkeys still need HTTPS.
+  insecure_cookies = false;
+}
+
+# The artwork cache under the state directory, in MiB.
+artwork {
+  cache_mb = 1024;
+}
+
+# When an item counts as started, and as watched (without credits markers).
+watch {
+  started_after_secs = 60;
+  watched_percent = 95;
+}
+
+# The tools the server runs; by default whatever is on PATH.
+media {
+  ffmpeg = "ffmpeg";
+  ffprobe = "ffprobe";
+  tesseract = "tesseract";
+}
+
+# Converting for clients that cannot play a file as it is.
+transcode {
+  # "auto" (every family that works), "none" (software only), or
+  # families in order of preference: "nvenc,vaapi".
+  hardware = "auto";
+  vaapi_device = "/dev/dri/renderD128";
+  # Encodes at once.
+  max_jobs = 2;
+  # Where encodes write; the state directory's cache/transcode if left
+  # out.
+  # scratch_dir = "/var/cache/spoolframe/transcode";
+  # The most all encodes may write together, in MiB.
+  scratch_limit_mb = 20480;
+  # How far an encode may run ahead of its reader.
+  read_ahead_secs = 60;
+}
+
+# Bitmap subtitles (PGS, VobSub, DVB) read as text with tesseract.
+subtitles {
+  ocr = true;
+  # tesseract processes at once; half the CPUs if left out.
+  # ocr_threads = 4;
+  # Where the text is kept; the state directory's cache/subtitles if left
+  # out.
+  # cache_dir = "/var/cache/spoolframe/subtitles";
+}

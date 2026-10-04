@@ -17,6 +17,7 @@ use spoolframe_catalog::CatalogError;
 use spoolframe_plex::{PlexCatalog, PlexWatch};
 use spoolframe_types::{MediaId, MediaKind, Namespace};
 
+use crate::catalog::LiveCatalog;
 use crate::principal::Principal;
 use crate::store::watch::{WatchRow, WatchUpdate};
 use crate::store::{Store, StoreError};
@@ -164,7 +165,9 @@ pub struct Report {
 }
 
 pub struct PlexSync {
-    plex: Arc<PlexCatalog>,
+    /// The Plex catalog as it is at each run: its address and token are
+    /// live settings (P3-10).
+    plex: Arc<LiveCatalog>,
     store: Store,
     principal: Principal,
     started: Duration,
@@ -191,7 +194,7 @@ impl PlexSync {
     /// Mirror `principal`'s state with the account `plex` serves as.
     /// `started` is the watch rules' threshold for "in progress".
     pub fn new(
-        plex: Arc<PlexCatalog>,
+        plex: Arc<LiveCatalog>,
         store: Store,
         principal: Principal,
         started: Duration,
@@ -210,7 +213,8 @@ impl PlexSync {
     /// One run: plan, and apply unless `dry_run`.
     pub async fn run(&self, dry_run: bool) -> Result<Report, SyncError> {
         let _running = self.running.lock().await;
-        let plex = self.plex.watch_states().await?;
+        let catalog = self.plex.plex().ok_or(CatalogError::NotSetUp)?;
+        let plex = catalog.watch_states().await?;
         let rows = self.store.all_watch(self.principal).await?;
         let by_id: HashMap<&MediaId, &PlexWatch> = plex.iter().map(|w| (&w.id, w)).collect();
         let mut report = Report::default();
@@ -231,7 +235,7 @@ impl PlexSync {
                     (format!("{id}: at {}", clock(*position_ms)), false)
                 }
             };
-            if !dry_run && let Err(e) = self.apply(&action, &by_id).await {
+            if !dry_run && let Err(e) = self.apply(&catalog, &action, &by_id).await {
                 tracing::warn!(item = line, error = %e, "Plex watch sync");
                 report.failed.push(format!("{line} ({e})"));
                 continue;
@@ -247,6 +251,7 @@ impl PlexSync {
 
     async fn apply(
         &self,
+        catalog: &PlexCatalog,
         action: &Action,
         plex: &HashMap<&MediaId, &PlexWatch>,
     ) -> Result<(), SyncError> {
@@ -272,10 +277,10 @@ impl PlexSync {
                     )
                     .await?;
             }
-            Action::PushWatched { id } => self.plex.set_watched(id, true).await?,
-            Action::PushUnwatched { id } => self.plex.set_watched(id, false).await?,
+            Action::PushWatched { id } => catalog.set_watched(id, true).await?,
+            Action::PushUnwatched { id } => catalog.set_watched(id, false).await?,
             Action::PushPosition { id, position_ms } => {
-                self.plex.set_position(id, *position_ms).await?;
+                catalog.set_position(id, *position_ms).await?;
             }
         }
         Ok(())

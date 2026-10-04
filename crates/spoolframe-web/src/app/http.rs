@@ -62,6 +62,9 @@ pub struct Site {
     /// `admin.public_url`, where a browser is sent when its own address
     /// cannot keep the session.
     pub public_url: Option<String>,
+    /// `admin.insecure_cookies` (P3-10): the session cookie works over
+    /// plain HTTP, and every admin page says so.
+    pub insecure_cookies: bool,
 }
 
 pub async fn site() -> Result<Site, ApiError> {
@@ -134,6 +137,22 @@ pub async fn setup_passkey_finish(
     )
     .await?;
     signed_in(response).await
+}
+
+/// The wizard's first page (P3-10): whether `code` is the setup code, and
+/// with `insecure_cookies`, the session cookie sent so that plain HTTP
+/// keeps it from now on.
+pub async fn setup_check(code: &str, insecure_cookies: bool) -> Result<(), ApiError> {
+    let response = post(
+        "/auth/setup/check",
+        json!({ "code": code, "insecureCookies": insecure_cookies }),
+    )
+    .await?;
+    if response.ok() {
+        Ok(())
+    } else {
+        Err(error_of(response).await)
+    }
 }
 
 pub async fn setup(code: &str, username: &str, password: &str) -> Result<SignedIn, ApiError> {

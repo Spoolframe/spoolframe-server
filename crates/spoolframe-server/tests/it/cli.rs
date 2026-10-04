@@ -6,7 +6,25 @@ use std::process::{Child, Command, Output, Stdio};
 
 fn server() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_spoolframe-server"));
-    cmd.env_remove("SPOOLFRAME_CONFIG");
+    for var in [
+        "SPOOLFRAME_CONFIG",
+        "SPOOLFRAME_STATE_DIR",
+        "STATE_DIRECTORY",
+        "XDG_STATE_HOME",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// The server with the config `config_with_state` wrote, and its state
+/// directory beside it.
+fn server_with(config: &Path) -> Command {
+    let mut cmd = server();
+    cmd.arg("--config")
+        .arg(config)
+        .arg("--state-dir")
+        .arg(config.with_file_name("state"));
     cmd
 }
 
@@ -23,25 +41,22 @@ async fn version_names_the_binary_and_its_version() {
 
 /// A config for a server whose state lives in a directory of the test's
 /// own, under a random name so runs at once never share one; the config
-/// file is in it too. The directory goes when the first value is dropped.
+/// file is in it too, beside `state/` ([`server_with`]). The directory goes when the first value is dropped.
 /// Its admin API is on a port of its own, so test servers never share one.
 async fn config_with_state(
     name: &str,
     plex_url: &str,
 ) -> (spoolframe_test_dir::TestDir, std::path::PathBuf) {
     let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-cli-{name}")).await;
-    let state = tmp.as_ref().join("state");
     let path = tmp.as_ref().join(format!("{name}.ucl"));
     std::fs::write(
         &path,
         format!(
             r#"
             schema = "spoolframe.server.v1";
-            state_dir = "{}";
             plex {{ url = "{plex_url}"; }}
             admin {{ listen = "127.0.0.1:{}"; }}
             "#,
-            state.display(),
             free_port()
         ),
     )
@@ -62,16 +77,15 @@ fn closed_port_url() -> String {
     format!("http://127.0.0.1:{}", free_port())
 }
 
-/// A running server, stopped with SIGTERM when dropped.
-struct Running(Child);
+/// A running server, stopped with SIGTERM when dropped, and everything it
+/// has logged.
+struct Running(Child, std::sync::Arc<std::sync::Mutex<String>>);
 
 impl Running {
     /// Start a server and wait until both its endpoint and admin API are
     /// up. Returns the log so far.
     fn start(config: &Path) -> (Self, String) {
-        let mut child = server()
-            .arg("--config")
-            .arg(config)
+        let mut child = server_with(config)
             .stderr(Stdio::piped())
             .spawn()
             .expect("the binary runs");
@@ -86,9 +100,22 @@ impl Running {
                 break;
             }
         }
-        // Keep draining so the server never blocks on a full pipe.
-        std::thread::spawn(move || lines.for_each(drop));
-        (Self(child), log)
+        // Keep reading so the server never blocks on a full pipe.
+        let kept = std::sync::Arc::new(std::sync::Mutex::new(log.clone()));
+        let more = kept.clone();
+        std::thread::spawn(move || {
+            for line in lines.map_while(Result::ok) {
+                let mut kept = more.lock().unwrap();
+                kept.push_str(&line);
+                kept.push('\n');
+            }
+        });
+        (Self(child, kept), log)
+    }
+
+    /// Everything logged so far.
+    fn log(&self) -> String {
+        self.1.lock().unwrap().clone()
     }
 
     fn stop(mut self) -> std::process::ExitStatus {
@@ -131,9 +158,7 @@ fn setup_code(log: &str) -> String {
 
 /// Run a CLI command against `config`, with `stdin` and environment.
 fn cli(config: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
-    let mut child = server()
-        .arg("--config")
-        .arg(config)
+    let mut child = server_with(config)
         .args(args)
         .envs(env.iter().copied())
         .stdin(Stdio::piped())
@@ -280,12 +305,7 @@ async fn the_cli_says_when_the_server_is_not_running() {
 
 /// What `spoolframe-server <command>` prints, trimmed.
 fn printed(config: &Path, command: &str) -> String {
-    let output = server()
-        .arg("--config")
-        .arg(config)
-        .arg(command)
-        .output()
-        .unwrap();
+    let output = server_with(config).arg(command).output().unwrap();
     assert!(output.status.success(), "{output:?}");
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
@@ -313,12 +333,7 @@ async fn the_fingerprint_is_the_key_s_and_the_server_logs_it() {
 async fn id_prints_the_same_endpoint_id_every_time() {
     let (_tmp, config) = config_with_state("id", &closed_port_url()).await;
     let id = || {
-        let output = server()
-            .arg("--config")
-            .arg(&config)
-            .arg("id")
-            .output()
-            .unwrap();
+        let output = server_with(&config).arg("id").output().unwrap();
         assert!(output.status.success(), "{output:?}");
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     };
@@ -331,10 +346,331 @@ async fn id_prints_the_same_endpoint_id_every_time() {
 #[test]
 fn a_bad_config_path_fails_and_names_the_path() {
     let output = server()
-        .args(["--config", "/nonexistent/spoolframe.ucl"])
+        .args([
+            "--config",
+            "/nonexistent/spoolframe.ucl",
+            "--state-dir",
+            "/nonexistent/state",
+        ])
         .output()
         .expect("the binary runs");
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("/nonexistent/spoolframe.ucl"), "{stderr}");
+}
+
+#[test]
+fn config_defaults_prints_every_setting_at_its_default() {
+    // No config and no state directory needed.
+    let output = server()
+        .args(["config", "defaults"])
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("schema = \"spoolframe.server.v1\";"),
+        "{text}"
+    );
+    assert!(text.contains("max_jobs = 2;"), "{text}");
+}
+
+/// Whose state directory `id` used: which of `dirs` got the key.
+fn key_written_in(dirs: &[&Path]) -> Vec<bool> {
+    dirs.iter()
+        .map(|d| d.join(spoolframe_server::identity::KEY_FILE).exists())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_state_dir_flag_wins_over_each_variable_in_turn() {
+    let tmp = spoolframe_test_dir::TestDir::new("spoolframe-cli-precedence").await;
+    let [flag, ours, systemd] = ["flag", "ours", "systemd"].map(|d| tmp.as_ref().join(d));
+    let id = |args: &[&str], env: &[(&str, &Path)]| {
+        let output = server()
+            .args(args)
+            .arg("id")
+            .envs(env.iter().map(|(k, v)| (*k, v.as_os_str())))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    let both = [
+        ("SPOOLFRAME_STATE_DIR", ours.as_path()),
+        ("STATE_DIRECTORY", systemd.as_path()),
+    ];
+    id(&["--state-dir", flag.to_str().unwrap()], &both);
+    assert_eq!(
+        key_written_in(&[&flag, &ours, &systemd]),
+        [true, false, false]
+    );
+    id(&[], &both);
+    assert_eq!(
+        key_written_in(&[&flag, &ours, &systemd]),
+        [true, true, false]
+    );
+    id(&[], &both[1..]);
+    assert_eq!(
+        key_written_in(&[&flag, &ours, &systemd]),
+        [true, true, true]
+    );
+}
+
+#[tokio::test]
+async fn the_config_flag_wins_over_the_variable() {
+    let tmp = spoolframe_test_dir::TestDir::new("spoolframe-cli-config-flag").await;
+    let flag = tmp.as_ref().join("flag.ucl");
+    let env = tmp.as_ref().join("env.ucl");
+    std::fs::write(&flag, "name = \"From the flag\";").unwrap();
+    std::fs::write(&env, "name = \"From the variable\";").unwrap();
+    let show = |args: &[&str]| {
+        let output = server()
+            .args(args)
+            .args(["--state-dir", tmp.as_ref().join("state").to_str().unwrap()])
+            .args(["config", "show"])
+            .env("SPOOLFRAME_CONFIG", &env)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(show(&["--config", flag.to_str().unwrap()]).contains("\"From the flag\""));
+    assert!(show(&[]).contains("\"From the variable\""));
+}
+
+#[tokio::test]
+async fn config_show_names_each_value_s_layer_and_never_a_secret() {
+    let tmp = spoolframe_test_dir::TestDir::new("spoolframe-cli-show").await;
+    let config = tmp.as_ref().join("server.ucl");
+    let state = tmp.as_ref().join("state");
+    std::fs::write(
+        &config,
+        r#"name = "Nimble"; plex { url = "http://nas:32400"; } transcode { max_jobs = 4; }"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(state.join("secrets")).unwrap();
+    std::fs::write(state.join("runtime.ucl"), r#"name = "Den";"#).unwrap();
+    std::fs::write(state.join("secrets/plex-token"), "s3cr3t-t0ken").unwrap();
+    let output = server()
+        .args(["--config", config.to_str().unwrap()])
+        .args(["--state-dir", state.to_str().unwrap()])
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let shown = String::from_utf8(output.stdout).unwrap();
+    for line in [
+        r#"name = "Den";  # runtime, over the config file's "Nimble""#,
+        r#"plex.url = "http://nas:32400";  # config file"#,
+        "transcode.max_jobs = 4;  # config file",
+        "transcode.read_ahead_secs = 60;  # default",
+    ] {
+        assert!(shown.lines().any(|l| l == line), "no {line:?} in {shown}");
+    }
+    assert!(shown.contains("plex.token = (set);"), "{shown}");
+    let everything = format!("{shown}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!everything.contains("s3cr3t"), "{everything}");
+}
+
+#[tokio::test]
+async fn a_file_that_still_names_its_state_dir_is_refused_saying_what_to_do() {
+    let tmp = spoolframe_test_dir::TestDir::new("spoolframe-cli-old-state-dir").await;
+    let config = tmp.as_ref().join("old.ucl");
+    std::fs::write(
+        &config,
+        r#"schema = "spoolframe.server.v1"; state_dir = "/srv/spoolframe"; plex { url = "http://nas:32400"; }"#,
+    )
+    .unwrap();
+    let output = server()
+        .args(["--config", config.to_str().unwrap()])
+        .args(["--state-dir", tmp.as_ref().join("state").to_str().unwrap()])
+        .arg("id")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "{}: state_dir is no longer read from the config file: remove it, and pass \
+             --state-dir /srv/spoolframe (or set SPOOLFRAME_STATE_DIR=/srv/spoolframe) instead",
+            config.display()
+        )),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn without_plex_the_server_starts_not_set_up_and_says_where_to_set_it_up() {
+    let tmp = spoolframe_test_dir::TestDir::new("spoolframe-cli-not-set-up").await;
+    // Only where to listen, so test servers never share a port; no Plex.
+    let port = free_port();
+    let config = tmp.as_ref().join("server.ucl");
+    std::fs::write(
+        &config,
+        format!(r#"admin {{ listen = "127.0.0.1:{port}"; }} network {{ mdns = false; }}"#),
+    )
+    .unwrap();
+    let (running, log) = Running::start(&config);
+    assert!(log.contains("not set up"), "{log}");
+    let url = format!("http://127.0.0.1:{port}/");
+    let setup_line = log
+        .lines()
+        .find(|l| l.contains("the setup code is "))
+        .unwrap_or_else(|| panic!("no setup code in: {log}"));
+    assert!(setup_line.contains(&url), "{setup_line}");
+    // The web UI's first page is served: setup is open.
+    let open: serde_json::Value = reqwest::get(format!("{url}auth/setup"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(open["open"], true, "{open}");
+    assert!(running.stop().success());
+}
+
+#[tokio::test]
+async fn config_set_and_unset_change_the_running_server_through_its_admin_api() {
+    let (_tmp, config) = config_with_state("config-set", &closed_port_url()).await;
+    let (running, log) = Running::start(&config);
+    let code = setup_code(&log);
+    let out = cli(
+        &config,
+        &[
+            "setup",
+            "--code",
+            &code,
+            "--username",
+            "root",
+            "--password-stdin",
+        ],
+        "correct horse\n",
+        &[],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let admin = [
+        ("SPOOLFRAME_ADMIN_USER", "root"),
+        ("SPOOLFRAME_ADMIN_PASSWORD", "correct horse"),
+    ];
+    let set = |args: &[&str], stdin: &str| {
+        let out = cli(&config, args, stdin, &admin);
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    // Live: the running server is called so at once.
+    assert_eq!(
+        set(&["config", "set", "name", "Den"], ""),
+        "name = \"Den\"\n"
+    );
+    let status = set(&["status"], "");
+    assert!(status.contains("name: Den"), "{status}");
+    // Restart: saved, and said so.
+    let port = set(&["config", "set", "network.port", "7440"], "");
+    assert_eq!(port, "network.port = 7440\napplies after a restart\n");
+
+    // A refused value says why, as a file with it would.
+    let out = cli(
+        &config,
+        &["config", "set", "transcode.max_jobs", "0"],
+        "",
+        &admin,
+    );
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid config: transcode.max_jobs: 0 would refuse every conversion"),
+        "{stderr}"
+    );
+
+    // The token: kept, and never shown or logged.
+    let token = set(
+        &["config", "set", "plex.token", "--stdin"],
+        "s3cr3t-t0ken\n",
+    );
+    assert_eq!(token, "plex.token = (set)\n");
+    let shown = printed_args(&config, &["config", "show"]);
+    assert!(shown.contains("plex.token = (set);"), "{shown}");
+    assert!(shown.contains(r#"name = "Den";  # runtime"#), "{shown}");
+    let state = config.with_file_name("state");
+    let runtime = std::fs::read_to_string(state.join("runtime.ucl")).unwrap();
+    assert!(runtime.contains("Den"), "{runtime}");
+    for (what, text) in [
+        ("show", &shown),
+        ("runtime.ucl", &runtime),
+        ("log", &running.log()),
+    ] {
+        assert!(
+            !text.contains("s3cr3t"),
+            "the token is in the {what}: {text}"
+        );
+    }
+    assert!(
+        running
+            .log()
+            .lines()
+            .any(|l| l.contains("secret setting changed") && l.contains("root")),
+        "{}",
+        running.log()
+    );
+
+    assert_eq!(
+        set(&["config", "unset", "name"], ""),
+        "name = \"Spoolframe\"\n"
+    );
+    assert!(running.stop().success());
+}
+
+#[tokio::test]
+async fn config_set_is_refused_for_what_a_locked_file_sets() {
+    let tmp = spoolframe_test_dir::TestDir::new("spoolframe-cli-locked").await;
+    let config = tmp.as_ref().join("server.ucl");
+    std::fs::write(
+        &config,
+        format!(
+            r#"locked = true; name = "Nimble"; admin {{ listen = "127.0.0.1:{}"; }} network {{ mdns = false; }}"#,
+            free_port()
+        ),
+    )
+    .unwrap();
+    let (running, log) = Running::start(&config);
+    let code = setup_code(&log);
+    let out = cli(
+        &config,
+        &[
+            "setup",
+            "--code",
+            &code,
+            "--username",
+            "root",
+            "--password-stdin",
+        ],
+        "correct horse\n",
+        &[],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let out = cli(
+        &config,
+        &["config", "set", "name", "Den"],
+        "",
+        &[
+            ("SPOOLFRAME_ADMIN_USER", "root"),
+            ("SPOOLFRAME_ADMIN_PASSWORD", "correct horse"),
+        ],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("name is set by the server's config file") && stderr.contains("locked"),
+        "{stderr}"
+    );
+    assert!(running.stop().success());
+}
+
+/// What `spoolframe-server <args>` prints.
+fn printed_args(config: &Path, args: &[&str]) -> String {
+    let output = server_with(config).args(args).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).unwrap()
 }

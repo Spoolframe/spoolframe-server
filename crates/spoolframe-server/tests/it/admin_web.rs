@@ -136,8 +136,9 @@ async fn a_browser_sets_up_the_first_admin_and_uses_the_socket_with_its_cookie()
 }
 
 /// What a page knows before anyone signs in: the server's name for its
-/// title, and the public URL to send a browser to when its own address
-/// cannot keep the session (plain HTTP on a real host).
+/// title, the public URL to send a browser to when its own address
+/// cannot keep the session (plain HTTP on a real host), and whether
+/// insecure cookies would let it keep it there anyway (P3-10).
 #[tokio::test]
 async fn a_signed_out_page_learns_the_server_s_name_and_public_url() {
     let (addr, _dir) = server("web-site").await;
@@ -147,7 +148,10 @@ async fn a_signed_out_page_learns_the_server_s_name_and_public_url() {
         .json()
         .await
         .unwrap();
-    assert_eq!(site, json!({ "name": "Den", "publicUrl": null }));
+    assert_eq!(
+        site,
+        json!({ "name": "Den", "publicUrl": null, "insecureCookies": false })
+    );
     let (addr, _dir) =
         crate::admin::server_at("web-site-public", "https://media.example.org").await;
     let site: Value = reqwest::get(format!("http://{addr}/auth/site"))

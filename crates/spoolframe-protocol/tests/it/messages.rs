@@ -390,6 +390,7 @@ fn every_error_round_trips() {
         Error::Unavailable {
             message: "Plex is down".into(),
         },
+        Error::NotSetUp,
         Error::Internal,
     ] {
         round_trip(Response::Err(error));
@@ -540,6 +541,7 @@ fn media_reads_round_trip() {
         Error::SubtitleNotReady { done_percent: 42 },
         Error::SubtitleChanged,
         Error::ProfileLocked,
+        Error::NotSetUp,
     ] {
         round_trip(spoolframe_protocol::MediaReadResponse::Err(error));
     }

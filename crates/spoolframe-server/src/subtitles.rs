@@ -1,6 +1,7 @@
 //! Subtitles as a text file a client fetches whole (P2-07), made once per
-//! track: a bitmap track read as text (OCR), or a text track converted to
-//! another text format (ASS or `mov_text` to WebVTT, say).
+//! track: a bitmap track (PGS; VobSub and DVB since P3-08) read as text
+//! (OCR), or a text track converted to another text format (ASS or
+//! `mov_text` to WebVTT, say).
 //!
 //! The first playback that needs a track as text starts making it; the
 //! text is kept in the cache, so every later playback of that track gets it
@@ -17,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use spoolframe_media::ocr::{self, Ocr};
-use spoolframe_media::{SubtitleKind, SubtitleSource, SubtitleStream, pgs};
+use spoolframe_media::{SubtitleKind, SubtitleSource, SubtitleStream, codecs, dvb, pgs, vobsub};
 use spoolframe_types::SubtitleFormat;
 use tokio::sync::{Semaphore, watch};
 
@@ -58,6 +59,7 @@ pub struct TextSource<'a> {
 pub struct Subtitles {
     ocr: Ocr,
     ffmpeg: PathBuf,
+    ffprobe: PathBuf,
     threads: usize,
     cache_dir: PathBuf,
     making: Mutex<HashMap<String, watch::Receiver<TextState>>>,
@@ -74,9 +76,15 @@ impl std::fmt::Debug for Subtitles {
 }
 
 impl Subtitles {
-    /// Reading with `ocr` (or not at all, if `settings` turn it off).
-    /// Work a stopped server left half done is removed.
-    pub fn new(ocr: Ocr, ffmpeg: PathBuf, settings: &OcrSettings) -> std::io::Result<Self> {
+    /// Reading with `ocr` (or not at all, if `settings` turn it off), and
+    /// tracks with ffmpeg and ffprobe. Work a stopped server left half done
+    /// is removed.
+    pub fn new(
+        ocr: Ocr,
+        ffmpeg: PathBuf,
+        ffprobe: PathBuf,
+        settings: &OcrSettings,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&settings.cache_dir)?;
         let work = settings.cache_dir.join("work");
         if work.exists() {
@@ -89,6 +97,7 @@ impl Subtitles {
                 Ocr::disabled()
             },
             ffmpeg,
+            ffprobe,
             threads: settings.threads,
             cache_dir: settings.cache_dir.clone(),
             making: Mutex::new(HashMap::new()),
@@ -139,6 +148,7 @@ impl Subtitles {
             subtitles: self.clone(),
             input: source.path.to_owned(),
             track: source.stream.source.clone(),
+            format: codecs::subtitle_format(&source.stream.codec),
             how,
             to: source.to,
             work: self.cache_dir.join("work").join(&key),
@@ -177,6 +187,7 @@ struct Job {
     subtitles: Arc<Subtitles>,
     input: PathBuf,
     track: SubtitleSource,
+    format: SubtitleFormat,
     how: How,
     to: SubtitleFormat,
     work: PathBuf,
@@ -227,18 +238,7 @@ impl Job {
             .expect("never closed");
         let _ = state.send(TextState::Reading { done_percent: 0 });
         let started = std::time::Instant::now();
-        let sup = match &self.track {
-            SubtitleSource::Embedded { index } => {
-                let sup = self.work.join("track.sup");
-                ocr::extract_sup(&self.subtitles.ffmpeg, &self.input, *index, &sup)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                sup
-            }
-            SubtitleSource::External { path } => path.clone(),
-        };
-        let bytes = tokio::fs::read(&sup).await.map_err(|e| e.to_string())?;
-        let cues = pgs::cues(&bytes).map_err(|e| e.to_string())?;
+        let cues = self.cues().await?;
         let total = cues.len().max(1);
         let texts = self
             .subtitles
@@ -272,6 +272,41 @@ impl Job {
             "read a subtitle as text"
         );
         Ok(())
+    }
+
+    /// The track's cues. PGS is copied out as a `.sup` (a file beside the
+    /// film already is one); VobSub and DVB are read as packets, a `.idx`
+    /// beside the film with its `.sub` as its first stream.
+    async fn cues(&self) -> Result<Vec<spoolframe_media::bitmap::Cue>, String> {
+        if let SubtitleFormat::VobSub | SubtitleFormat::DvbSub = self.format {
+            // An embedded track counts from the file's start; a file of its
+            // own already does.
+            let (input, index, from_start) = match &self.track {
+                SubtitleSource::Embedded { index } => (&self.input, *index, true),
+                SubtitleSource::External { path } => (path, 0, false),
+            };
+            let track = ocr::read_track(&self.subtitles.ffprobe, input, index, from_start)
+                .await
+                .map_err(|e| e.to_string())?;
+            return match self.format {
+                SubtitleFormat::VobSub => {
+                    vobsub::cues(&track.extradata, &track.packets).map_err(|e| e.to_string())
+                }
+                _ => Ok(dvb::cues(&track.packets)),
+            };
+        }
+        let sup = match &self.track {
+            SubtitleSource::Embedded { index } => {
+                let sup = self.work.join("track.sup");
+                ocr::extract_sup(&self.subtitles.ffmpeg, &self.input, *index, &sup)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                sup
+            }
+            SubtitleSource::External { path } => path.clone(),
+        };
+        let bytes = tokio::fs::read(&sup).await.map_err(|e| e.to_string())?;
+        pgs::cues(&bytes).map_err(|e| e.to_string())
     }
 }
 

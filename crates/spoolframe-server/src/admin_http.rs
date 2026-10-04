@@ -13,6 +13,8 @@
 
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
@@ -36,6 +38,56 @@ use crate::auth::API_SESSION;
 /// The browser's session cookie: an admin API session token, as the CLI's
 /// Bearer token is.
 pub const COOKIE: &str = "spoolframe_session";
+
+/// How the session cookie is sent (`admin.insecure_cookies`, P3-10): a
+/// live setting, so the running listener reads it at every sign-in.
+#[derive(Debug, Clone, Default)]
+pub struct CookiePolicy(Arc<AtomicBool>);
+
+impl CookiePolicy {
+    pub fn new(insecure: bool) -> Self {
+        Self(Arc::new(AtomicBool::new(insecure)))
+    }
+
+    /// Whether the cookie goes without `Secure` and `HttpOnly`.
+    pub fn insecure(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn set_insecure(&self, insecure: bool) {
+        self.0.store(insecure, Ordering::Relaxed);
+    }
+
+    /// `Set-Cookie` for a new session. `Secure` and `HttpOnly` unless
+    /// insecure cookies are on: browsers treat `http://localhost` as
+    /// secure, so a `Secure` cookie works on loopback, over an SSH tunnel
+    /// to it, and behind a TLS proxy alike, but on no plain-HTTP LAN
+    /// address. Insecure, it does there too, and page scripts can read it.
+    fn set(&self, token: &str) -> HeaderValue {
+        let value = format!(
+            "{COOKIE}={token}; Path=/; {}SameSite=Strict; Max-Age={}",
+            self.flags(),
+            API_SESSION.as_secs()
+        );
+        HeaderValue::from_str(&value).expect("tokens are hex")
+    }
+
+    fn clear(&self) -> HeaderValue {
+        HeaderValue::from_str(&format!(
+            "{COOKIE}=; Path=/; {}SameSite=Strict; Max-Age=0",
+            self.flags()
+        ))
+        .expect("a fixed cookie")
+    }
+
+    fn flags(&self) -> &'static str {
+        if self.insecure() {
+            ""
+        } else {
+            "HttpOnly; Secure; "
+        }
+    }
+}
 
 /// Where a browser is allowed to come from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -245,6 +297,7 @@ fn router(
         .route("/auth/passkey/begin", post(passkey_begin))
         .route("/auth/passkey/finish", post(passkey_finish))
         .route("/auth/setup", get(setup_open).post(setup))
+        .route("/auth/setup/check", post(setup_check))
         .route("/auth/setup/passkey/begin", post(setup_passkey_begin))
         .route("/auth/setup/passkey/finish", post(setup_passkey_finish))
         .route("/auth/logout", post(logout))
@@ -329,23 +382,6 @@ fn token(headers: &HeaderMap) -> Option<String> {
         .map(|(_, value)| value.to_owned())
 }
 
-/// `Secure` always: browsers treat `http://localhost` as secure, so the
-/// cookie works on loopback, over an SSH tunnel to it, and behind a TLS
-/// proxy alike.
-fn set_cookie(token: &str) -> HeaderValue {
-    let value = format!(
-        "{COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={}",
-        API_SESSION.as_secs()
-    );
-    HeaderValue::from_str(&value).expect("tokens are hex")
-}
-
-fn clear_cookie() -> HeaderValue {
-    HeaderValue::from_static(
-        "spoolframe_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0",
-    )
-}
-
 /// A JSON-RPC error as an HTTP answer, with the same code and message, so
 /// the web UI reads both alike.
 fn failure(e: ErrorObjectOwned) -> Response<Body> {
@@ -355,7 +391,9 @@ fn failure(e: ErrorObjectOwned) -> Response<Body> {
         | error_code::PASSKEY_REFUSED => StatusCode::UNAUTHORIZED,
         error_code::FORBIDDEN | error_code::INVALID_SETUP_CODE => StatusCode::FORBIDDEN,
         error_code::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
-        error_code::ALREADY_SET_UP | error_code::USER_EXISTS => StatusCode::CONFLICT,
+        error_code::ALREADY_SET_UP | error_code::USER_EXISTS | error_code::SETTING_LOCKED => {
+            StatusCode::CONFLICT
+        }
         error_code::INVALID_INPUT => StatusCode::BAD_REQUEST,
         error_code::NOT_CONFIGURED => StatusCode::NOT_IMPLEMENTED,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -367,8 +405,10 @@ fn failure(e: ErrorObjectOwned) -> Response<Body> {
 /// Signed in: the cookie, and who. From a page the browser will not keep
 /// the cookie for, the sign-in looks to its user as if nothing happened,
 /// and only this log can say why.
-fn signed_in(headers: &HeaderMap, done: LoggedIn) -> Response<Body> {
+fn signed_in(api: &AdminApi, headers: &HeaderMap, done: LoggedIn) -> Response<Body> {
+    let cookies = api.cookies();
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
+        && !cookies.insecure()
         && drops_secure_cookies(origin)
     {
         tracing::warn!(
@@ -383,7 +423,7 @@ fn signed_in(headers: &HeaderMap, done: LoggedIn) -> Response<Body> {
         axum::Json(json!({ "username": done.username, "role": done.role })).into_response();
     response
         .headers_mut()
-        .insert(header::SET_COOKIE, set_cookie(&done.token));
+        .insert(header::SET_COOKIE, cookies.set(&done.token));
     response
 }
 
@@ -423,7 +463,7 @@ async fn login(
         Err(e) => return failure(e),
     };
     match MeApiServer::login(&api, &from(peer), credentials).await {
-        Ok(done) => signed_in(&headers, done),
+        Ok(done) => signed_in(&api, &headers, done),
         Err(e) => failure(e),
     }
 }
@@ -462,7 +502,7 @@ async fn passkey_finish(
         Err(e) => return failure(e),
     };
     match MeApiServer::passkey_login_finish(&api, &from(peer), ceremony, credential).await {
-        Ok(done) => signed_in(&headers, done),
+        Ok(done) => signed_in(&api, &headers, done),
         Err(e) => failure(e),
     }
 }
@@ -478,7 +518,34 @@ async fn setup(
         Err(e) => return failure(e),
     };
     match AdminApiServer::setup(&api, &from(peer), request).await {
-        Ok(done) => signed_in(&headers, done),
+        Ok(done) => signed_in(&api, &headers, done),
+        Err(e) => failure(e),
+    }
+}
+
+/// The wizard's first page (P3-10): the setup code from the log, and
+/// whether to send insecure cookies from now on.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetupCheck {
+    code: String,
+    insecure_cookies: bool,
+}
+
+async fn setup_check(
+    State(api): State<AdminApi>,
+    Extension(peer): Extension<Peer>,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    let check: SetupCheck = match parse(&body) {
+        Ok(c) => c,
+        Err(e) => return failure(e),
+    };
+    match api
+        .setup_check(&from(peer), &check.code, check.insecure_cookies)
+        .await
+    {
+        Ok(()) => axum::Json(json!({ "ok": true })).into_response(),
         Err(e) => failure(e),
     }
 }
@@ -512,7 +579,7 @@ async fn setup_passkey_finish(
         Err(e) => return failure(e),
     };
     match AdminApiServer::setup_passkey_finish(&api, &from(peer), request).await {
-        Ok(done) => signed_in(&headers, done),
+        Ok(done) => signed_in(&api, &headers, done),
         Err(e) => failure(e),
     }
 }
@@ -566,7 +633,7 @@ async fn logout(State(api): State<AdminApi>, req: Request) -> Response<Body> {
     let mut response = StatusCode::NO_CONTENT.into_response();
     response
         .headers_mut()
-        .insert(header::SET_COOKIE, clear_cookie());
+        .insert(header::SET_COOKIE, api.cookies().clear());
     response
 }
 
@@ -741,10 +808,26 @@ mod tests {
 
     #[test]
     fn the_cookie_is_http_only_secure_and_strict() {
-        let cookie = set_cookie("abc");
-        let cookie = cookie.to_str().unwrap();
-        for part in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/"] {
-            assert!(cookie.contains(part), "{cookie}");
+        let cookies = CookiePolicy::default();
+        for cookie in [cookies.set("abc"), cookies.clear()] {
+            let cookie = cookie.to_str().unwrap();
+            for part in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/"] {
+                assert!(cookie.contains(part), "{cookie}");
+            }
         }
+    }
+
+    #[test]
+    fn an_insecure_cookie_is_neither_secure_nor_http_only_and_still_strict() {
+        let cookies = CookiePolicy::new(true);
+        for cookie in [cookies.set("abc"), cookies.clear()] {
+            let cookie = cookie.to_str().unwrap();
+            assert!(!cookie.contains("Secure"), "{cookie}");
+            assert!(!cookie.contains("HttpOnly"), "{cookie}");
+            assert!(cookie.contains("SameSite=Strict"), "{cookie}");
+        }
+        // Live: the next sign-in reads it again.
+        cookies.set_insecure(false);
+        assert!(cookies.set("abc").to_str().unwrap().contains("Secure"));
     }
 }

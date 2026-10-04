@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::JobLimits;
@@ -65,7 +65,37 @@ pub enum JobError {
 /// it.
 #[derive(Debug, Clone)]
 pub struct Slot {
-    _permit: Arc<OwnedSemaphorePermit>,
+    _place: Arc<Place>,
+}
+
+/// How many of the places are taken, and how many there are. A counter
+/// rather than a semaphore: `max_jobs` is a live setting (P3-10), and a
+/// lower limit takes effect as jobs end, without stopping any.
+#[derive(Debug, Default)]
+struct Places {
+    taken: usize,
+    max: usize,
+}
+
+/// A taken place, given back when dropped.
+#[derive(Debug)]
+struct Place(Arc<std::sync::Mutex<Places>>);
+
+impl Place {
+    fn take(places: &Arc<std::sync::Mutex<Places>>) -> Option<Self> {
+        let mut now = places.lock().expect("never held across a panic");
+        if now.taken >= now.max {
+            return None;
+        }
+        now.taken += 1;
+        Some(Self(places.clone()))
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        self.0.lock().expect("never held across a panic").taken -= 1;
+    }
 }
 
 /// The directory under `transcode.scratch_dir` that jobs write in. The
@@ -75,11 +105,13 @@ pub const JOBS_DIR: &str = "spoolframe-jobs";
 /// The jobs of this server: the limit, and where they write.
 #[derive(Debug)]
 pub struct Jobs {
-    limits: JobLimits,
+    /// Live (P3-10) but for the scratch directory: a job reads them when
+    /// it starts.
+    limits: std::sync::RwLock<JobLimits>,
     /// [`JOBS_DIR`] in the scratch directory.
     dir: PathBuf,
     ffmpeg: PathBuf,
-    slots: Arc<Semaphore>,
+    places: Arc<std::sync::Mutex<Places>>,
     /// Held by the job that looks at a full scratch directory and makes
     /// room in it, so the next job to look sees what the first one freed.
     scratch_check: Arc<tokio::sync::Mutex<()>>,
@@ -101,16 +133,36 @@ impl Jobs {
         }
         std::fs::create_dir_all(&dir)?;
         Ok(Self {
-            slots: Arc::new(Semaphore::new(limits.max_jobs)),
+            places: Arc::new(std::sync::Mutex::new(Places {
+                taken: 0,
+                max: limits.max_jobs,
+            })),
             scratch_check: Arc::default(),
-            limits,
+            limits: std::sync::RwLock::new(limits),
             dir,
             ffmpeg,
         })
     }
 
-    pub fn limits(&self) -> &JobLimits {
-        &self.limits
+    /// The limits now.
+    pub fn limits(&self) -> JobLimits {
+        self.limits
+            .read()
+            .expect("never held across a panic")
+            .clone()
+    }
+
+    /// Run new jobs under `limits` from now on. Jobs running go on as they
+    /// started; with fewer places than are taken, none is free until
+    /// enough jobs end. The scratch directory stays the one the jobs
+    /// started in: it changes only with a restart.
+    pub fn set_limits(&self, limits: JobLimits) {
+        self.places.lock().expect("never held across a panic").max = limits.max_jobs;
+        let mut now = self.limits.write().expect("never held across a panic");
+        *now = JobLimits {
+            scratch_dir: now.scratch_dir.clone(),
+            ..limits
+        };
     }
 
     /// Where jobs write: a directory per playback handle in it.
@@ -138,12 +190,7 @@ impl Jobs {
         let slot = match slot {
             Some(slot) => slot,
             None => Slot {
-                _permit: Arc::new(
-                    self.slots
-                        .clone()
-                        .try_acquire_owned()
-                        .map_err(|_| JobError::Busy)?,
-                ),
+                _place: Arc::new(Place::take(&self.places).ok_or(JobError::Busy)?),
             },
         };
         let slot = Arc::new(std::sync::Mutex::new(Some(slot)));
@@ -157,6 +204,7 @@ impl Jobs {
             .spawn()
             .map_err(|e| JobError::Prepare(format!("cannot run {}: {e}", self.ffmpeg.display())))?;
         let pid = child.id().unwrap_or(0);
+        let limits = self.limits();
         let (progress_tx, progress) = watch::channel(Progress::default());
         let shared = Arc::new(Shared {
             furthest_bytes: AtomicU64::new(0),
@@ -171,10 +219,10 @@ impl Jobs {
             dir: dir.clone(),
             written,
             scratch: self.dir.clone(),
-            scratch_limit: self.limits.scratch_limit_bytes,
+            scratch_limit: limits.scratch_limit_bytes,
             scratch_check: self.scratch_check.clone(),
-            read_ahead: self.limits.read_ahead,
-            stalled_after: self.limits.stalled_after,
+            read_ahead: limits.read_ahead,
+            stalled_after: limits.stalled_after,
             shared: shared.clone(),
             slot: slot.clone(),
             progress: progress_tx,
@@ -606,6 +654,48 @@ fn last_listed(playlist: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lower_limit_takes_effect_as_jobs_end_and_a_higher_one_at_once() {
+        let places = Arc::new(std::sync::Mutex::new(Places { taken: 0, max: 2 }));
+        let first = Place::take(&places).unwrap();
+        let second = Place::take(&places).unwrap();
+        assert!(Place::take(&places).is_none());
+        places.lock().unwrap().max = 1;
+        drop(first);
+        // Still one taken, and one is all there is.
+        assert!(Place::take(&places).is_none());
+        drop(second);
+        let third = Place::take(&places).unwrap();
+        places.lock().unwrap().max = 3;
+        let _fourth = Place::take(&places).unwrap();
+        drop(third);
+    }
+
+    #[tokio::test]
+    async fn new_limits_apply_to_the_next_job_but_not_the_scratch_directory() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-job-limits").await;
+        let limits = JobLimits {
+            max_jobs: 2,
+            scratch_dir: tmp.as_ref().join("scratch"),
+            scratch_limit_bytes: 1 << 30,
+            read_ahead: Duration::from_secs(60),
+            stalled_after: STALLED_AFTER,
+        };
+        let jobs = Jobs::new(limits.clone(), "ffmpeg".into()).unwrap();
+        jobs.set_limits(JobLimits {
+            max_jobs: 1,
+            scratch_dir: tmp.as_ref().join("elsewhere"),
+            read_ahead: Duration::from_secs(5),
+            ..limits.clone()
+        });
+        let now = jobs.limits();
+        assert_eq!(now.max_jobs, 1);
+        assert_eq!(now.read_ahead, Duration::from_secs(5));
+        assert_eq!(now.scratch_dir, limits.scratch_dir);
+        let _taken = Place::take(&jobs.places).unwrap();
+        assert!(Place::take(&jobs.places).is_none());
+    }
 
     #[test]
     fn a_segment_is_finished_once_ffmpeg_lists_it() {

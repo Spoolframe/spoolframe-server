@@ -1,5 +1,6 @@
-//! Bitmap subtitles read as text (P2-07), through the protocol, with real
-//! ffmpeg, ffprobe and tesseract on a file with a PGS track.
+//! Bitmap subtitles read as text (P2-07, P3-08), through the protocol,
+//! with real ffmpeg, ffprobe and tesseract on a file with a PGS, VobSub or
+//! DVB track.
 
 use crate::support;
 
@@ -184,6 +185,62 @@ async fn a_pgs_track_is_read_as_text_and_the_file_still_plays_directly() {
     assert_eq!(text(&client, &session, &handle).await, SRT);
     client.close().await;
     server.stop().await;
+}
+
+/// What the VobSub and DVB tracks show. VobSub's stop is in 1024/90000 s,
+/// so the lengths are multiples of 512 ms.
+const BITMAP_CUES: [(&str, u64, u64); 2] = [
+    ("Hello there", 1_000, 3_560),
+    ("General Kenobi", 5_000, 7_048),
+];
+
+const BITMAP_SRT: &str = "1\n00:00:01,000 --> 00:00:03,560\nHello there\n\n\
+                          2\n00:00:05,000 --> 00:00:07,048\nGeneral Kenobi\n\n";
+
+/// A server whose film has an English track of `BITMAP_CUES` written by
+/// ffmpeg's `codec`, or beside it as a VobSub pair if `codec` is `None`;
+/// and alice on a client that draws neither VobSub nor DVB.
+async fn bitmap_ready(test: &str, codec: Option<&str>) -> (TestServer, TestClient, SessionId) {
+    let server = TestServer::start_with(
+        fresh_dir(test).await,
+        ServerOptions {
+            real_media: true,
+            ocr: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_media(10, "libx264", "aac");
+    match codec {
+        Some(codec) => server.add_bitmap_track(codec, &BITMAP_CUES),
+        None => server.write_vobsub_sidecar(&BITMAP_CUES),
+    }
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client.hello_with(None, Some(capabilities(false))).await;
+    let session = client.login("alice", "correct horse").await;
+    (server, client, session)
+}
+
+/// `auto` and `text` alike read VobSub and DVB as text for a client that
+/// draws neither, and the file plays directly with it beside it (P3-08).
+#[tokio::test]
+async fn vobsub_and_dvb_tracks_are_read_as_text_and_the_file_still_plays_directly() {
+    for (test, codec, bitmap) in [
+        ("ocr-vobsub", Some("dvdsub"), BitmapSubtitles::Auto),
+        ("ocr-vobsub-pair", None, BitmapSubtitles::Auto),
+        ("ocr-dvb", Some("dvbsub"), BitmapSubtitles::Text),
+    ] {
+        let (server, client, session) = bitmap_ready(test, codec).await;
+        let (handle, plan) = start(&client, &session, bitmap).await;
+        let PlaybackPlan::Direct { subtitle, .. } = plan else {
+            panic!("{test}: not direct: {plan:?}");
+        };
+        assert_eq!(subtitle, read_as_srt(), "{test}");
+        assert_eq!(text(&client, &session, &handle).await, BITMAP_SRT, "{test}");
+        client.close().await;
+        server.stop().await;
+    }
 }
 
 #[tokio::test]

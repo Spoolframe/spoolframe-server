@@ -11,6 +11,7 @@ use spoolframe_admin_api::{
 };
 use spoolframe_server::admin::{self, Admin, Origins, SetupCode, TrustedProxies};
 use spoolframe_server::auth::Auth;
+use spoolframe_server::catalog::LiveCatalog;
 use spoolframe_server::passkeys::Passkeys;
 use spoolframe_server::store::Store;
 
@@ -19,7 +20,10 @@ pub(crate) const CODE: &str = "K7QD-M2XP-9RTB";
 
 /// The status of a server whose key is the first fingerprint test vector.
 fn status() -> std::sync::Arc<admin::StatusSource> {
-    let status = admin::StatusSource::new("Den", crate::support::transcoding());
+    let status = admin::StatusSource::new(
+        spoolframe_server::network::ServerName::new("Den"),
+        crate::support::transcoding(),
+    );
     status.set_endpoint_id(VECTOR.0.to_owned());
     std::sync::Arc::new(status)
 }
@@ -27,20 +31,23 @@ fn status() -> std::sync::Arc<admin::StatusSource> {
 const VECTOR: (&str, &str) = spoolframe_protocol::fingerprint::TEST_VECTORS[0];
 
 /// The admin API over `auth`, without Plex.
-fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
+pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
     Admin {
         auth,
         setup_code,
         status: status(),
         plex_sync: None,
-        plex: None,
+        plex: Default::default(),
+        cookies: Default::default(),
+        settings: None,
+        wizard: Default::default(),
         passkeys: std::sync::Arc::new(Passkeys::new(&Origins::default())),
     }
 }
 
 /// A directory of the test's own under a random name, removed when
 /// dropped, so runs at once never share one.
-async fn state_dir(test: &str) -> spoolframe_test_dir::TestDir {
+pub(crate) async fn state_dir(test: &str) -> spoolframe_test_dir::TestDir {
     spoolframe_test_dir::TestDir::new(&format!("spoolframe-admin-{test}")).await
 }
 
@@ -655,7 +662,7 @@ async fn server_with_plex(test: &str, url: &str) -> (SocketAddr, spoolframe_test
     let (addr, handle) = admin::serve(
         "127.0.0.1:0".parse().unwrap(),
         Admin {
-            plex: Some(std::sync::Arc::new(plex)),
+            plex: std::sync::Arc::new(LiveCatalog::new(Some(std::sync::Arc::new(plex)))),
             ..admin(auth, Some(SetupCode::new(CODE)))
         },
         Origins::default(),

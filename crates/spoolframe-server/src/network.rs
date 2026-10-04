@@ -40,6 +40,30 @@ pub enum Relay {
     Custom(Url),
 }
 
+/// What the server is called (`name`, P3-10): a live setting, so `Hello`,
+/// the mDNS announcement and the admin status read it as it is now.
+#[derive(Debug, Clone)]
+pub struct ServerName(Arc<tokio::sync::watch::Sender<String>>);
+
+impl ServerName {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(name.into())))
+    }
+
+    pub fn get(&self) -> String {
+        self.0.borrow().clone()
+    }
+
+    /// Call the server `name` from now on.
+    pub fn set(&self, name: impl Into<String>) {
+        self.0.send_replace(name.into());
+    }
+
+    fn changes(&self) -> tokio::sync::watch::Receiver<String> {
+        self.0.subscribe()
+    }
+}
+
 /// How to build the endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointOptions {
@@ -139,7 +163,7 @@ impl Server {
     pub async fn start(
         key: SecretKey,
         options: &EndpointOptions,
-        name: &str,
+        name: &ServerName,
         services: Services,
     ) -> Result<Self, NetworkError> {
         let relay = match &options.relay {
@@ -158,7 +182,7 @@ impl Server {
             .relay_mode(relay)
             .alpns(vec![CLIENT_ALPN.to_vec(), FEDERATION_ALPN.to_vec()]);
         if options.mdns {
-            let advert: UserData = lan::advert(name)
+            let advert: UserData = lan::advert(&name.get())
                 .parse()
                 .expect("lan::advert fits the record");
             builder = builder
@@ -190,8 +214,22 @@ impl Server {
                 playbacks.sweep();
             }
         });
+        if options.mdns {
+            // A new name is announced at once, as Hello answers with it.
+            let mut changes = name.changes();
+            let announcing = endpoint.clone();
+            tokio::spawn(async move {
+                while changes.changed().await.is_ok() {
+                    let advert = lan::advert(&changes.borrow_and_update());
+                    match advert.parse::<UserData>() {
+                        Ok(data) => announcing.set_user_data_for_address_lookup(Some(data)),
+                        Err(e) => tracing::warn!(error = %e, "cannot announce the new name"),
+                    }
+                }
+            });
+        }
         let info = ServerInfo {
-            name: name.to_owned(),
+            name: name.get(),
             endpoint_id: endpoint.id().to_string(),
             protocol_version: PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -202,7 +240,7 @@ impl Server {
         let router = Router::builder(endpoint)
             .accept(
                 CLIENT_ALPN,
-                ClientProtocol::new(connections.clone(), info, services),
+                ClientProtocol::new(connections.clone(), info, name.clone(), services),
             )
             .accept(FEDERATION_ALPN, Unsupported("spoolframe/federation/1"))
             .spawn();

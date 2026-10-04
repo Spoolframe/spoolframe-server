@@ -24,6 +24,8 @@ pub struct MediaContainer {
     pub library_section_title: Option<String>,
     /// What the PMS calls itself, on its root (`/`).
     pub friendly_name: Option<String>,
+    /// The PMS's version, on its root (`/`).
+    pub version: Option<String>,
     #[serde(rename = "Directory", default)]
     pub directories: Vec<Directory>,
     #[serde(rename = "Metadata", default)]
@@ -41,6 +43,15 @@ pub struct Directory {
     #[serde(rename = "type")]
     pub kind: Option<String>,
     pub title: String,
+    /// A library section's folders, as Plex sees them.
+    #[serde(rename = "Location", default)]
+    pub locations: Vec<Location>,
+}
+
+/// One folder of a library section.
+#[derive(Debug, Deserialize)]
+pub struct Location {
+    pub path: String,
 }
 
 /// One group of `/hubs/search` results.

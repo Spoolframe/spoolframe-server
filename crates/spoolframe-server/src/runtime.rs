@@ -1,0 +1,527 @@
+//! Settings changed while the server runs (P3-10): from the web UI, the
+//! setup wizard and `config set`, through the admin API.
+//!
+//! A change is checked by the same parse a config file goes through,
+//! written to the runtime layer (or, for a secret, its own file), and then
+//! applied: a live setting reaches the running server at once, a restart
+//! one waits for the next start and says so.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use spoolframe_admin_api::{SettingApply, SettingEntry, SettingLayer, Settings};
+use spoolframe_plex::PlexCatalog;
+
+use crate::admin::CookiePolicy;
+use crate::catalog::LiveCatalog;
+use crate::config::layers::{Layer, Layers, PLEX_TOKEN_SECRET, SettingError};
+use crate::config::secrets::Secrets;
+use crate::config::settings::{self, Apply, PLEX_TOKEN, SETTINGS, Setting};
+use crate::config::tree::{self, Table, Value};
+use crate::config::{ConfigError, ServerConfig};
+use crate::encode::job::Jobs;
+use crate::network::ServerName;
+use crate::watch::Watch;
+
+/// What the live settings reach in the running server.
+#[derive(Debug, Clone, Default)]
+pub struct Live {
+    /// `name`.
+    pub name: Option<ServerName>,
+    /// `plex.*` and the Plex token: the catalog is rebuilt and swapped.
+    pub catalog: Arc<LiveCatalog>,
+    /// `admin.insecure_cookies`.
+    pub cookies: CookiePolicy,
+    /// `watch.*`.
+    pub watch: Option<Arc<Watch>>,
+    /// `transcode.max_jobs`, `scratch_limit_mb` and `read_ahead_secs`.
+    pub jobs: Option<Arc<Jobs>>,
+}
+
+/// Why a change was not made.
+#[derive(Debug, thiserror::Error)]
+pub enum ChangeError {
+    #[error(transparent)]
+    Setting(#[from] SettingError),
+    /// A secret that is no string, or an empty one.
+    #[error("{key} is a string, and cannot be empty")]
+    Secret { key: String },
+    #[error("cannot save the setting: {0}")]
+    Write(std::io::Error),
+    /// Nothing would start the server again.
+    #[error(
+        "the server does not run under a supervisor that would start it again; restart it by hand"
+    )]
+    NotSupervised,
+}
+
+/// The server's settings as they change at run time.
+#[derive(Debug)]
+pub struct RuntimeSettings {
+    layers: Mutex<Layers>,
+    secrets: Secrets,
+    state_dir: PathBuf,
+    /// Every layer merged as the server started: what the restart
+    /// settings in effect are.
+    started: Table,
+    live: Live,
+    /// Under a supervisor that starts the server again when it exits for a
+    /// restart (`SPOOLFRAME_SUPERVISED`, which the NixOS module sets).
+    supervised: bool,
+    restart: tokio::sync::Notify,
+}
+
+/// The Plex catalog `config` and the layers' token make, if `config` has
+/// Plex.
+pub fn plex_catalog(
+    config: &ServerConfig,
+    layers: &Layers,
+    secrets: &Secrets,
+) -> Result<Option<PlexCatalog>, ConfigError> {
+    let Some(plex) = &config.plex else {
+        return Ok(None);
+    };
+    let token = layers.plex_token(plex, secrets)?;
+    let catalog = PlexCatalog::new(plex.url()?, token).map_err(|e| ConfigError::Invalid {
+        key: "plex.url",
+        message: e.to_string(),
+    })?;
+    Ok(Some(catalog.with_paths(plex.path_map()?)))
+}
+
+impl RuntimeSettings {
+    pub fn new(layers: Layers, state_dir: &Path, live: Live, supervised: bool) -> Self {
+        Self {
+            started: layers.merged(),
+            layers: Mutex::new(layers),
+            secrets: Secrets::new(state_dir),
+            state_dir: state_dir.to_owned(),
+            live,
+            supervised,
+            restart: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// The layers now.
+    pub fn layers(&self) -> Layers {
+        self.layers
+            .lock()
+            .expect("never held across a panic")
+            .clone()
+    }
+
+    pub fn secrets(&self) -> &Secrets {
+        &self.secrets
+    }
+
+    /// Every setting, as `admin.settings` answers.
+    pub fn settings(&self) -> Settings {
+        let layers = self.layers();
+        let merged = layers.merged();
+        Settings {
+            entries: SETTINGS
+                .iter()
+                .map(|s| self.entry(&layers, &merged, s))
+                .collect(),
+            config_file: layers.file_path().map(|p| p.display().to_string()),
+            can_restart: self.supervised,
+        }
+    }
+
+    fn entry(&self, layers: &Layers, merged: &Table, setting: &Setting) -> SettingEntry {
+        let apply = match setting.apply {
+            Apply::Live => SettingApply::Live,
+            Apply::Restart => SettingApply::Restart,
+        };
+        if setting.secret {
+            let locked = layers.plex_token_changeable().is_err();
+            let set = !locked && self.secrets.is_set(PLEX_TOKEN_SECRET);
+            return SettingEntry {
+                key: setting.key.to_owned(),
+                value: None,
+                secret: true,
+                set,
+                layer: set.then_some(SettingLayer::Runtime),
+                locked,
+                overrides: None,
+                apply,
+                restart_pending: false,
+            };
+        }
+        let value = tree::get(merged, setting.key);
+        let origin = layers.origin(setting.key);
+        SettingEntry {
+            key: setting.key.to_owned(),
+            value: value.map(Value::to_json),
+            secret: false,
+            set: value.is_some(),
+            layer: origin.layer.map(|layer| match layer {
+                Layer::Default => SettingLayer::Default,
+                Layer::File => SettingLayer::File,
+                Layer::Runtime => SettingLayer::Runtime,
+            }),
+            locked: origin.locked,
+            overrides: origin.overrides.as_ref().map(Value::to_json),
+            apply,
+            restart_pending: setting.apply == Apply::Restart
+                && value != tree::get(&self.started, setting.key),
+        }
+    }
+
+    /// The setting `key` now.
+    pub fn entry_for(&self, key: &str) -> Option<SettingEntry> {
+        let layers = self.layers();
+        let merged = layers.merged();
+        settings::setting(key).map(|s| self.entry(&layers, &merged, s))
+    }
+
+    /// Set `key` to `value`, as admin `by`.
+    pub fn set(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+        by: &str,
+    ) -> Result<SettingEntry, ChangeError> {
+        if key == PLEX_TOKEN {
+            let token = value
+                .as_str()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| ChangeError::Secret { key: key.into() })?;
+            return self.set_secret(key, Some(token), by);
+        }
+        let value = Value::from_json(value).map_err(|message| {
+            SettingError::Invalid(ConfigError::Invalid {
+                key: "value",
+                message,
+            })
+        })?;
+        let shown = value.to_ucl();
+        self.change(key, by, |layers| layers.with_set(key, value))?;
+        tracing::info!(by, key, value = shown, "setting changed");
+        Ok(self.entry_for(key).expect("a known setting"))
+    }
+
+    /// Take `key` out of the runtime settings (or forget a secret), as
+    /// admin `by`.
+    pub fn unset(&self, key: &str, by: &str) -> Result<SettingEntry, ChangeError> {
+        if key == PLEX_TOKEN {
+            return self.set_secret(key, None, by);
+        }
+        self.change(key, by, |layers| layers.with_unset(key))?;
+        tracing::info!(
+            by,
+            key,
+            "setting unset: the config file's value or the default applies"
+        );
+        Ok(self.entry_for(key).expect("a known setting"))
+    }
+
+    /// Make `change` to the layers, write the runtime layer, and apply it.
+    fn change(
+        &self,
+        key: &str,
+        by: &str,
+        change: impl FnOnce(&Layers) -> Result<Layers, SettingError>,
+    ) -> Result<(), ChangeError> {
+        let mut layers = self.layers.lock().expect("never held across a panic");
+        let changed = change(&layers)?;
+        changed.write_runtime().map_err(ChangeError::Write)?;
+        let plex_changed =
+            tree::get(&layers.merged(), "plex") != tree::get(&changed.merged(), "plex");
+        *layers = changed;
+        self.apply(&layers, plex_changed, key, by);
+        Ok(())
+    }
+
+    fn set_secret(
+        &self,
+        key: &str,
+        value: Option<&str>,
+        by: &str,
+    ) -> Result<SettingEntry, ChangeError> {
+        let layers = self.layers.lock().expect("never held across a panic");
+        layers.plex_token_changeable()?;
+        match value {
+            Some(token) => self
+                .secrets
+                .set(PLEX_TOKEN_SECRET, token)
+                .map_err(ChangeError::Write)?,
+            None => {
+                self.secrets
+                    .remove(PLEX_TOKEN_SECRET)
+                    .map_err(ChangeError::Write)?;
+            }
+        }
+        // Never the value: only that it changed, and who changed it.
+        tracing::info!(by, key, set = value.is_some(), "secret setting changed");
+        self.apply(&layers, true, key, by);
+        drop(layers);
+        Ok(self.entry_for(key).expect("a known setting"))
+    }
+
+    /// Bring the live settings to what `layers` say. Every one is set
+    /// again (it is cheap), but the Plex catalog only when its settings
+    /// or token changed: a new one starts without the old one's
+    /// connections.
+    fn apply(&self, layers: &Layers, plex_changed: bool, key: &str, by: &str) {
+        // Checked when the change was made; a failure here is a file
+        // changed under the server, and only logged.
+        let config = match layers.config() {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::error!(error = %e, key, by, "the changed settings do not load");
+                return;
+            }
+        };
+        let live = &self.live;
+        if let Some(name) = &live.name {
+            name.set(config.server_name());
+        }
+        live.cookies.set_insecure(config.admin.insecure_cookies());
+        if let (Some(watch), Ok(rules)) = (&live.watch, config.watch.rules()) {
+            let mut now = watch.rules();
+            now.started_after = rules.started_after;
+            now.watched_fraction = rules.watched_fraction;
+            watch.set_rules(now);
+        }
+        if let (Some(jobs), Ok(limits)) = (&live.jobs, config.transcode.limits(&self.state_dir)) {
+            jobs.set_limits(limits);
+        }
+        if plex_changed {
+            match plex_catalog(&config, layers, &self.secrets) {
+                Ok(plex) => {
+                    let set_up = plex.is_some();
+                    live.catalog.replace(plex.map(Arc::new));
+                    tracing::info!(set_up, "the Plex catalog follows the new settings");
+                }
+                Err(e) => tracing::error!(error = %e, "cannot make the Plex catalog"),
+            }
+        }
+    }
+
+    /// The Plex token the server has now: the one set at run time, else
+    /// the config's token file's.
+    pub fn plex_token(&self) -> Option<String> {
+        let layers = self.layers();
+        let config = layers.config().ok()?;
+        match &config.plex {
+            Some(plex) => layers.plex_token(plex, &self.secrets).ok().flatten(),
+            None => self.secrets.get(PLEX_TOKEN_SECRET).ok().flatten(),
+        }
+    }
+
+    /// This installation's id at plex.tv, which a PIN is bound to: made
+    /// once, and kept beside the secrets.
+    pub fn plex_client_id(&self) -> std::io::Result<String> {
+        const NAME: &str = "plex-client-id";
+        if let Some(id) = self.secrets.get(NAME)? {
+            return Ok(id);
+        }
+        use password_hash::rand_core::{OsRng, RngCore};
+        let mut bytes = [0u8; 16];
+        OsRng.fill_bytes(&mut bytes);
+        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        self.secrets.set(NAME, &id)?;
+        Ok(id)
+    }
+
+    /// The wizard's progress: the confirmed steps, and whether it is over.
+    pub fn setup(&self) -> (Vec<String>, bool) {
+        self.layers().setup()
+    }
+
+    /// Step `step` confirmed, and with `finish` the wizard over, as admin
+    /// `by`. Written to the runtime layer, so a wizard left half-way
+    /// resumes after a restart.
+    pub fn setup_progress(
+        &self,
+        step: Option<&str>,
+        finish: bool,
+        by: &str,
+    ) -> Result<(Vec<String>, bool), ChangeError> {
+        let mut layers = self.layers.lock().expect("never held across a panic");
+        let (mut done, finished) = layers.setup();
+        if let Some(step) = step
+            && !done.iter().any(|d| d == step)
+        {
+            done.push(step.to_owned());
+        }
+        let changed = layers.with_setup(&done, finished || finish);
+        changed.write_runtime().map_err(ChangeError::Write)?;
+        *layers = changed;
+        tracing::info!(by, step, finish, "setup wizard step confirmed");
+        Ok(layers.setup())
+    }
+
+    /// Ask for a restart: the server stops, and its supervisor starts it
+    /// again.
+    pub fn restart(&self, by: &str) -> Result<(), ChangeError> {
+        if !self.supervised {
+            return Err(ChangeError::NotSupervised);
+        }
+        tracing::warn!(by, "restart asked for");
+        self.restart.notify_one();
+        Ok(())
+    }
+
+    /// Done once a restart is asked for.
+    pub async fn restart_requested(&self) {
+        self.restart.notified().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn settings(file: Option<&str>) -> (RuntimeSettings, spoolframe_test_dir::TestDir) {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-runtime").await;
+        let file_path = dir.as_ref().join("server.ucl");
+        let layers = Layers::from_texts(
+            file.map(|t| (file_path.as_path(), t)),
+            None,
+            dir.as_ref().join("runtime.ucl"),
+        )
+        .unwrap();
+        let live = Live {
+            name: Some(ServerName::new("Spoolframe")),
+            ..Live::default()
+        };
+        (RuntimeSettings::new(layers, dir.as_ref(), live, false), dir)
+    }
+
+    #[tokio::test]
+    async fn a_live_setting_reaches_the_running_server_at_once() {
+        let (settings, _dir) = settings(None).await;
+        let entry = settings
+            .set("name", &serde_json::json!("Den"), "root")
+            .unwrap();
+        assert_eq!(entry.value, Some(serde_json::json!("Den")));
+        assert_eq!(entry.layer, Some(SettingLayer::Runtime));
+        assert_eq!(settings.live.name.as_ref().unwrap().get(), "Den");
+        settings
+            .set("admin.insecure_cookies", &serde_json::json!(true), "root")
+            .unwrap();
+        assert!(settings.live.cookies.insecure());
+        settings.unset("admin.insecure_cookies", "root").unwrap();
+        assert!(!settings.live.cookies.insecure());
+    }
+
+    #[tokio::test]
+    async fn watch_rules_change_for_the_next_report_and_keep_what_the_config_does_not_set() {
+        use crate::watch::WatchRules;
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-runtime-watch").await;
+        let store = crate::store::Store::open(dir.as_ref()).await.unwrap();
+        let rules = WatchRules {
+            throttle: std::time::Duration::from_millis(1),
+            ..WatchRules::default()
+        };
+        let watch = Arc::new(Watch::new(
+            store,
+            Arc::new(LiveCatalog::default()),
+            Arc::new(spoolframe_media::Prober::new(
+                std::path::PathBuf::from("ffprobe"),
+                spoolframe_media::Prober::DEFAULT_TIMEOUT,
+            )),
+            rules,
+        ));
+        let layers = Layers::from_texts(None, None, dir.as_ref().join("runtime.ucl")).unwrap();
+        let live = Live {
+            watch: Some(watch.clone()),
+            ..Live::default()
+        };
+        let settings = RuntimeSettings::new(layers, dir.as_ref(), live, false);
+        settings
+            .set("watch.watched_percent", &serde_json::json!(80), "root")
+            .unwrap();
+        assert_eq!(watch.rules().watched_fraction, 0.8);
+        assert_eq!(watch.rules().throttle, std::time::Duration::from_millis(1));
+    }
+
+    #[tokio::test]
+    async fn a_restart_setting_is_saved_and_flagged() {
+        let (settings, dir) = settings(None).await;
+        let entry = settings
+            .set("network.port", &serde_json::json!(7440), "root")
+            .unwrap();
+        assert_eq!(entry.apply, SettingApply::Restart);
+        assert!(entry.restart_pending);
+        let saved = std::fs::read_to_string(dir.as_ref().join("runtime.ucl")).unwrap();
+        assert!(saved.contains("port = 7440;"), "{saved}");
+        // Back to what the server started with: nothing waits.
+        let entry = settings.unset("network.port", "root").unwrap();
+        assert!(!entry.restart_pending);
+        assert!(matches!(
+            settings.restart("root"),
+            Err(ChangeError::NotSupervised)
+        ));
+    }
+
+    #[tokio::test]
+    async fn plex_comes_and_goes_with_its_settings() {
+        let (settings, _dir) = settings(None).await;
+        assert!(settings.live.catalog.plex().is_none());
+        settings
+            .set("plex.url", &serde_json::json!("http://127.0.0.1:9"), "root")
+            .unwrap();
+        let plex = settings.live.catalog.plex().expect("set up");
+        assert_eq!(plex.base_url(), "http://127.0.0.1:9");
+        settings.unset("plex.url", "root").unwrap();
+        assert!(settings.live.catalog.plex().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_token_is_kept_as_a_secret_and_never_shown() {
+        let (settings, dir) = settings(Some(r#"plex { url = "http://127.0.0.1:9"; }"#)).await;
+        let entry = settings
+            .set(PLEX_TOKEN, &serde_json::json!("s3cr3t-t0ken"), "root")
+            .unwrap();
+        assert!(entry.secret && entry.set);
+        assert_eq!(entry.value, None);
+        assert_eq!(
+            settings
+                .secrets()
+                .get(PLEX_TOKEN_SECRET)
+                .unwrap()
+                .as_deref(),
+            Some("s3cr3t-t0ken")
+        );
+        // Not in the runtime layer, nor in what the API answers.
+        assert!(!dir.as_ref().join("runtime.ucl").exists());
+        let all = serde_json::to_string(&settings.settings()).unwrap();
+        assert!(!all.contains("s3cr3t"), "{all}");
+        assert!(matches!(
+            settings.set(PLEX_TOKEN, &serde_json::json!(""), "root"),
+            Err(ChangeError::Secret { .. })
+        ));
+        let entry = settings.unset(PLEX_TOKEN, "root").unwrap();
+        assert!(!entry.set);
+    }
+
+    #[tokio::test]
+    async fn a_locked_key_shows_its_lock_and_is_not_changed() {
+        let (settings, _dir) = settings(Some(r#"locked = true; name = "Nimble";"#)).await;
+        let entry = settings.entry_for("name").unwrap();
+        assert!(entry.locked);
+        assert_eq!(entry.layer, Some(SettingLayer::File));
+        let refused = settings
+            .set("name", &serde_json::json!("Den"), "root")
+            .unwrap_err();
+        assert!(
+            matches!(refused, ChangeError::Setting(SettingError::Locked { .. })),
+            "{refused}"
+        );
+        assert_eq!(settings.live.name.as_ref().unwrap().get(), "Spoolframe");
+    }
+
+    #[tokio::test]
+    async fn an_unlocked_file_value_is_overridden_and_named() {
+        let (settings, _dir) = settings(Some(r#"name = "Nimble";"#)).await;
+        let entry = settings
+            .set("name", &serde_json::json!("Den"), "root")
+            .unwrap();
+        assert_eq!(entry.overrides, Some(serde_json::json!("Nimble")));
+        assert!(!entry.locked);
+    }
+}

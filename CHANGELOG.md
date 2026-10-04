@@ -712,3 +712,90 @@
   `Origin` names it, logs a warning. The browser will drop the Secure
   session cookie, so the sign-in appears to do nothing, and the warning
   names HTTPS (`admin.public_url`) or `http://localhost` instead.
+- VobSub and DVB subtitles read as text (P3-08), as PGS is (P2-07):
+  `spoolframe-media::vobsub` and `::dvb` parse a track's packets, which
+  `ocr::read_track` takes from ffprobe (an embedded track, or a `.idx`
+  with its `.sub`), into cues with their times and pictures. The pictures
+  keep the text and drop its outline, whichever of them is the brighter.
+  `text` now plans OCR for both formats instead of `Unsupported`, and
+  `auto` prefers it to burning in; a track without recognition data for
+  its language still burns in, or is `Unsupported` with `text`, with the
+  reason. Two-letter language codes (a file's `Movie.en.idx`) find their
+  tesseract data, and a bar read alone becomes the capital I it is. No
+  protocol change.
+- Layered configuration (P3-10): a server's settings are the built-in
+  defaults (`spoolframe-server config defaults` prints them, every key with
+  what it does), then the provided file (`--config` or
+  `SPOOLFRAME_CONFIG`, now optional), then `runtime.ucl` in the state
+  directory, which only the server writes (0600, rewritten whole). They
+  merge key by key, later layers winning, except that a provided file with
+  `locked = true;` locks every key it sets. `config show` prints every
+  setting with the layer it comes from; secrets (a Plex token set at run
+  time, kept in `secrets/plex-token`) only as set or not set. The state
+  directory comes from `--state-dir`, `SPOOLFRAME_STATE_DIR`, systemd's
+  `STATE_DIRECTORY`, `$XDG_STATE_HOME/spoolframe`, `/var/lib/spoolframe`
+  as root, or `~/.local/state/spoolframe`. **Config break**: `state_dir`
+  is no longer a key; a file that has it is refused with what to pass
+  instead. The NixOS module passes `--state-dir` and locks its file.
+- Not set up (P3-10): without `plex` the server runs, its web UI and
+  admin API work, and every catalog and playback request is answered with
+  the new protocol error `NotSetUp` (`SdkError::NotSetUp`), until Plex is
+  configured. **Protocol change**: clients built on an older SDK see it as
+  an unknown error. The admin listener listens on every IPv4 interface
+  (`0.0.0.0:7421`) by default; `admin.allow_remote` is gone (refused with
+  a message), and `admin.listen` still takes loopback. At start the log
+  names every address the web UI answers on, and beside them the setup
+  code while there are no users. `admin.insecure_cookies` (off by
+  default) sends the session cookie without `Secure` and `HttpOnly`, so
+  signing in over plain HTTP on the LAN works; the server warns at start
+  while it is on, and `/auth/site` says so. The NixOS module's
+  `plex.url` may be null, its `admin.listen` defaults to the server's,
+  and `admin.allowRemote` is removed.
+- Runtime settings (P3-10): the admin API's `admin.settings` lists every
+  setting with its value, layer, lock, the file value a runtime one
+  overrides, and whether it applies live or after a restart;
+  `admin.settingSet` and `admin.settingUnset` change the runtime layer,
+  checked by the parse a file goes through (a refused value gets the
+  file's message; a locked key is `SETTING_LOCKED`). Live: `name` (Hello,
+  the mDNS announcement and the status), `plex.url`, the token and
+  `plex.path_mapping` (the catalog is rebuilt and swapped),
+  `watch.*`, `transcode.max_jobs`, `scratch_limit_mb` and
+  `read_ahead_secs` (for the next encode), `admin.insecure_cookies`.
+  Everything else is saved and flagged `restartPending`; `admin.restart`
+  exits with 75 for systemd to start the server again, where it runs
+  under one. `plex.token` is kept in `secrets/plex-token`, never in a
+  layer, a reply or the log. Each change is logged with the admin who
+  made it. `spoolframe-server config set <key> <value>` (`--stdin` for a
+  token) and `config unset <key>` do the same through the running
+  server; `status` says "Plex: not set up" instead of failing.
+- The setup wizard's server side (P3-10): `POST /auth/setup/check` checks
+  the setup code before the first admin exists and, asked to, turns
+  `admin.insecure_cookies` on with it as the authority; `admin.setupState`,
+  `setupStepDone` and `setupFinish` keep the wizard's progress in the
+  runtime layer (`setup { done; finished; }`; a server whose file already
+  had Plex counts as set up). `admin.plexDiscover` finds Plex Media
+  Servers with Plex's GDM; `admin.plexProbe` asks a PMS without saving it;
+  `admin.plexPinBegin` and `plexPinCheck` sign in with Plex (plex.tv's PIN
+  flow; the token goes straight to `plex.token`, never to the browser);
+  `admin.plexPathCheck` checks five files per library with unsaved
+  mappings and suggests one where they fail. `ServerStatus` gains the OCR
+  languages and the web UI's addresses, `PlexStatus` the PMS version.
+  `admin.restart` is offered where `SPOOLFRAME_SUPERVISED` is set, which
+  the NixOS module does. `SPOOLFRAME_PLEX_TV_URL`, `SPOOLFRAME_PLEX_APP_URL`
+  and `SPOOLFRAME_GDM_TARGETS` point the wizard at stand-ins.
+- The setup wizard in the web UI (P3-10), as sf-design's WebWizard boards
+  draw it: the setup code's page (over plain HTTP on a LAN address, with
+  the insecure-cookies offer), the first admin (P3-01's page, now step 1
+  of 7), the server's name and fingerprint, Plex (servers found on the
+  LAN or typed, Sign in with Plex or a pasted token, the libraries, OCR),
+  the paths (each library's folder mapped, suggestions, checked again as
+  typed), playback (encoders found, hardware choice, limits, OCR
+  languages), access (public address, trusted proxies, listen address)
+  and a summary. Each step saves what changed as it is confirmed; a
+  signed-in admin with the wizard unfinished is welcomed back at the step
+  where it stopped. Afterwards every step is a tab of Server › Settings
+  (with Security for insecure cookies), each field saying when the locked
+  config file sets it, which file value it overrides (and a way back to
+  it), or that it applies after a restart, with "Restart now" where the
+  server is supervised. Every admin page shows a banner while insecure
+  cookies are on. The login card works over plain HTTP when they are.

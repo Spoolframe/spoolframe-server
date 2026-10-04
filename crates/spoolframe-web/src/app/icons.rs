@@ -369,3 +369,52 @@ pub fn Reel(#[props(default = 28)] size: u32) -> Element {
         }
     }
 }
+
+#[component]
+pub fn Check(#[props(default = 14)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M20 6 9 17l-5-5" }
+        }
+    }
+}
+
+/// A dashed circle: not there, or not used.
+#[component]
+pub fn CircleDashed(#[props(default = 15)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M10.1 2.182a10 10 0 0 1 3.8 0" }
+            path { d: "M13.9 21.818a10 10 0 0 1-3.8 0" }
+            path { d: "M17.609 3.721a10 10 0 0 1 2.69 2.7" }
+            path { d: "M2.182 13.9a10 10 0 0 1 0-3.8" }
+            path { d: "M20.279 17.609a10 10 0 0 1-2.7 2.69" }
+            path { d: "M21.818 10.1a10 10 0 0 1 0 3.8" }
+            path { d: "M3.721 6.391a10 10 0 0 1 2.7-2.69" }
+            path { d: "M6.391 20.279a10 10 0 0 1-2.69-2.7" }
+        }
+    }
+}
+
+#[component]
+pub fn Info(#[props(default = 17)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            circle { cx: "12", cy: "12", r: "10" }
+            path { d: "M12 16v-4" }
+            path { d: "M12 8h.01" }
+        }
+    }
+}
+
+/// A clock turning back: a wizard picked up again.
+#[component]
+pub fn History(#[props(default = 20)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }
+            path { d: "M3 3v5h5" }
+            path { d: "M12 7v5l4 2" }
+        }
+    }
+}

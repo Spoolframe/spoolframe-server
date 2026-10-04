@@ -11,44 +11,13 @@
 
 use std::collections::HashMap;
 
+use crate::bitmap::{Cue, Image, push};
+
 const PCS: u8 = 0x16;
 const WDS: u8 = 0x17;
 const PDS: u8 = 0x14;
 const ODS: u8 = 0x15;
 const END: u8 = 0x80;
-
-/// A grey picture: 0 is black, 255 white.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Image {
-    pub width: usize,
-    pub height: usize,
-    pub pixels: Vec<u8>,
-}
-
-impl Image {
-    fn blank(width: usize, height: usize, value: u8) -> Self {
-        Self {
-            width,
-            height,
-            pixels: vec![value; width * height],
-        }
-    }
-
-    /// As a binary PGM, which tesseract (through Leptonica) reads.
-    pub fn to_pgm(&self) -> Vec<u8> {
-        let mut out = format!("P5\n{} {}\n255\n", self.width, self.height).into_bytes();
-        out.extend_from_slice(&self.pixels);
-        out
-    }
-}
-
-/// One subtitle on screen: its time and its picture, dark text on white.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Cue {
-    pub start_ms: u64,
-    pub end_ms: u64,
-    pub image: Image,
-}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PgsError {
@@ -194,37 +163,6 @@ pub fn cues(stream: &[u8]) -> Result<Vec<Cue>, PgsError> {
     Ok(out)
 }
 
-/// Adds a cue, or lengthens the last one when this is the same picture
-/// straight after it (a palette change, as in a fade).
-fn push(out: &mut Vec<Cue>, start_ms: u64, end_ms: u64, image: Image) {
-    if end_ms <= start_ms {
-        return;
-    }
-    if let Some(last) = out.last_mut()
-        && last.end_ms == start_ms
-        && same_text(&last.image, &image)
-    {
-        last.end_ms = end_ms;
-        return;
-    }
-    out.push(Cue {
-        start_ms,
-        end_ms,
-        image,
-    });
-}
-
-/// The same shapes, whatever their brightness: a fade changes the
-/// palette, not which pixels are text.
-fn same_text(a: &Image, b: &Image) -> bool {
-    a.width == b.width
-        && a.height == b.height
-        && a.pixels
-            .iter()
-            .zip(&b.pixels)
-            .all(|(&p, &q)| (p == 255) == (q == 255))
-}
-
 fn composition(body: &[u8], pts_ms: u64) -> Result<Composition, PgsError> {
     if body.len() < 11 {
         return Err(PgsError::Short("PCS"));
@@ -343,7 +281,7 @@ pub mod fixture {
     use super::{END, ODS, PCS, PDS, WDS};
 
     /// One cue: a `width` × `height` mask at (`x`, `y`) on a 1920×1080
-    /// screen, where non-zero is text.
+    /// screen, where 1 is text and 2 its outline.
     pub struct Cue {
         pub start_ms: u64,
         pub end_ms: u64,
@@ -354,8 +292,8 @@ pub mod fixture {
         pub mask: Vec<u8>,
     }
 
-    /// A stream showing each cue in turn: white text (palette entry 1),
-    /// cleared at its end. Objects longer than `fragment` bytes are split
+    /// A stream showing each cue in turn: white text (palette entry 1)
+    /// with a black outline (entry 2), cleared at its end. Objects longer than `fragment` bytes are split
     /// into fragments, as Blu-ray streams split those over 64 KiB.
     pub fn sup(cues: &[Cue], fragment: usize) -> Vec<u8> {
         let mut out = Vec::new();
@@ -371,8 +309,13 @@ pub mod fixture {
             segment(&mut out, cue.start_ms, PCS, &pcs);
             segment(&mut out, cue.start_ms, WDS, &window(cue));
             // Palette 0, version 0; entry 1 is opaque white
-            // (Y 235, Cr 128, Cb 128, alpha 255).
-            segment(&mut out, cue.start_ms, PDS, &[0, 0, 1, 235, 128, 128, 255]);
+            // (Y 235, Cr 128, Cb 128, alpha 255), entry 2 opaque black.
+            segment(
+                &mut out,
+                cue.start_ms,
+                PDS,
+                &[0, 0, 1, 235, 128, 128, 255, 2, 16, 128, 128, 255],
+            );
             let rle = rle(&cue.mask, usize::from(cue.width));
             let mut data = Vec::new();
             data.extend(&((rle.len() + 4) as u32).to_be_bytes()[1..]);
@@ -434,10 +377,9 @@ pub mod fixture {
         for line in mask.chunks(width) {
             let mut i = 0;
             while i < line.len() {
-                let colour = u8::from(line[i] != 0);
+                let colour = line[i];
                 let mut run = 1;
-                while i + run < line.len() && u8::from(line[i + run] != 0) == colour && run < 0x3fff
-                {
+                while i + run < line.len() && line[i + run] == colour && run < 0x3fff {
                     run += 1;
                 }
                 i += run;

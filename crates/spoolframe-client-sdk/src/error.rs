@@ -74,6 +74,11 @@ pub enum SdkError {
     /// part of it is returned: read it again.
     #[error("the subtitle changed while it was read")]
     SubtitleChanged,
+    /// The server has no library yet (P3-10): it is to be set up in its
+    /// web UI. Show "This server is not set up yet" where the library
+    /// would be; signing in works.
+    #[error("this server is not set up yet")]
+    NotSetUp,
     /// The device sign-in was refused on the approving device (P3-07).
     #[error("the sign-in was denied")]
     SignInDenied,
@@ -112,6 +117,7 @@ impl SdkError {
             ServerError::SubtitleChanged => SdkError::SubtitleChanged,
             ServerError::DeviceSignInDenied => SdkError::SignInDenied,
             ServerError::DeviceSignInExpired => SdkError::SignInExpired,
+            ServerError::NotSetUp => SdkError::NotSetUp,
             other => SdkError::Server(other.to_string()),
         }
     }
