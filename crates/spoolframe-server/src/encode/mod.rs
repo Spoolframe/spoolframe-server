@@ -33,6 +33,10 @@ pub struct JobLimits {
     pub scratch_limit_bytes: u64,
     /// How far an encode may run ahead of its reader before it is paused.
     pub read_ahead: Duration,
+    /// How long an encode that is not held back may go without writing or
+    /// reporting more encoded time before it is ended as stalled
+    /// ([`job::STALLED_AFTER`]; tests shorten it).
+    pub stalled_after: Duration,
 }
 
 /// A playback's conversion: what to encode, and the encode running now.

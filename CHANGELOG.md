@@ -554,22 +554,33 @@
   (P1-11).
 - `spoolframe-server` allocates with snmalloc, with its hardening checks
   on, as mainframe's daemons do.
-- A subtitle can be read in chunks. `ReadSubtitle` takes an optional
-  `offset`: with it the server answers at most 512 KiB of the file from
-  that byte (`SUBTITLE_CHUNK`) and `total`, the file's length, and reads
-  only that chunk from the disk; an `offset` at or past the end answers
-  no bytes. Without `offset`, as an older client asks, the reply is the
-  whole file as before, and a file over the 1 MiB frame limit is refused
-  with `ReplyTooLarge { bytes }`, where `bytes` is now the file's size.
-  Before, the server read such a file whole and encoded it only to find
-  that it could not be sent, at every request (P2-11).
+- A subtitle is read in chunks, so one over the 1 MiB frame limit
+  arrives. `ReadSubtitle { handle, offset, version }` answers
+  `SubtitleChunk { format, bytes, total, version }`: at most 512 KiB of
+  the file from `offset` (`SUBTITLE_CHUNK`), the file's length, and a
+  `version` that names the file as it was when the chunk was read. The
+  server reads only that chunk from the disk; an `offset` at or past the
+  end answers no bytes. Before, the server read a file over the limit
+  whole and encoded it only to find that it could not be sent, at every
+  request (P2-11).
+- A subtitle that changes between two chunks is never joined from two
+  files. A client sends the first chunk's `version` with each later
+  read, and the server answers the new `Error::SubtitleChanged` when the
+  file it opens is not that one: written again in place (another length
+  or modification time), replaced by another file (another inode), or
+  another subtitle after `ChangeSubtitle`. The version is a hash of the
+  open file's device, inode, length and modification time (P2-11).
 - The SDK's `read_subtitle` reads the subtitle in chunks and returns the
-  whole file as before, so a subtitle over 1 MiB now arrives; an app
-  changes nothing. If the file changes on the server while it is read
-  (another length or format between two chunks, or a chunk with no
-  bytes before the end), the call fails with `SdkError::Protocol` and
-  returns no mix of two files. A server from before chunks answers the
-  whole file, which the SDK returns as it did (P2-11).
+  whole file as before; an app changes nothing. When the server says the
+  file changed, the SDK reads it again from the start, once, and returns
+  the new file; if it changes during that read too, the call fails with
+  the new `SdkError::SubtitleChanged` (P2-11).
+- **Breaking on the wire:** `ReadSubtitle` needs `offset`, and answers
+  `SubtitleChunk`, not `Subtitle`, which is now only a segment of an HLS
+  subtitle rendition and has no `total`. A request without `offset` is
+  `Malformed`, and there is no whole-file read any more: an app built on
+  an older SDK cannot read external subtitles from this server until it
+  is built on this SDK (P2-11).
 - HLS segments store the film's own time. A run that started at a
   position (a resume, a start offset, a far seek) stored its fMP4
   fragments from 0 and put where it started in `init.mp4` as an empty
@@ -579,3 +590,37 @@
   time (`-hls_segment_options movflags=+frag_discont`): a segment the
   playlist puts at 400 s is stored at 400 s, in every run, and
   `init.mp4` has no empty edit (P2-05).
+- An encode is never held back while its reader has nothing to read. A
+  progressive encode was paused once ffmpeg reported `read_ahead_secs`
+  of encoded time, though ffmpeg had not yet written its first 2 s
+  cluster: with a read-ahead under 2 s and an encode no faster than a
+  few times real time, the reader waited for bytes that a paused encode
+  never wrote, for ever. An encode is now paused only while its reader
+  has written bytes still to read, or, for HLS, while the segment it
+  asked for last is finished. `read_ahead_secs = 0` also works now: it
+  once paused the encode and never let it go on (P2-04).
+- An encode that stalls is ended. ffmpeg can wait for ever without
+  failing: ffmpeg 9.0 (and 8.1) does when it burns in a picture subtitle
+  file that holds one cue and the file's end reaches its filters before
+  they are set up. Such an encode kept its slot, and its reads waited for
+  as long as the client asked. An encode that is not held back for its
+  reader and has neither written anything nor reported more encoded time
+  for 120 s is now killed; it gives up its slot, and its reads fail with
+  `PlaybackFailed` ("the conversion stalled: ffmpeg made no progress for
+  120s"). The time an encode is held back does not count (P2-03, P2-07).
+- HEVC in HLS is `hvc1`. ffmpeg wrote the video of `init.mp4` under the
+  sample entry `hev1`, for a copied stream and for every HEVC encoder,
+  while the playlist said `hvc1`. Apple's players play HEVC in fMP4 only
+  as `hvc1`: an iPhone given a 4K HEVC film showed nothing, and the
+  server logged no error. ffmpeg is now told the name (`-tag:v hvc1`)
+  for HEVC in HLS; H.264 and progressive Matroska are as they were
+  (P2-05).
+- The HLS multivariant playlist says the video range and the frame rate.
+  `EXT-X-STREAM-INF` now has `VIDEO-RANGE` (`PQ` for SMPTE 2084, `HLG`
+  for ARIB STD-B67, else `SDR`), which Apple's players want for HDR, and
+  `FRAME-RATE` when the file says it. Both describe the output: a copied
+  stream and an encode that is not tone-mapped keep the source's
+  transfer, a tone-mapped encode is `SDR`. A copied HEVC stream is named
+  in `CODECS` with its own level (`hvc1.2.4.L123.B0` for Main 10 at 4.1)
+  where it was guessed from the height. The media descriptor has the
+  video's `level` (P2-05).

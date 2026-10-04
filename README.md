@@ -10,6 +10,10 @@ cargo run -p spoolframe-server -- --config dev.ucl
 devenv --no-tui tasks run --profile ci ci:static ci:style ci:test
 ```
 
+`dev.ucl` is your own config and is not tracked: write one for your Plex
+server, paths and listeners (the keys are in
+`crates/spoolframe-server/src/config.rs`).
+
 ### Web UI
 
 `crates/spoolframe-web` is a Dioxus app, bundled to wasm and embedded in the

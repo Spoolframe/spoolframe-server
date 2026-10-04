@@ -397,6 +397,39 @@ async fn a_read_past_what_is_written_waits_for_it() {
     server.stop().await;
 }
 
+/// ffmpeg keeps each 2 s Matroska cluster to itself until it is whole. A
+/// read-ahead shorter than that once held the encode back before it had
+/// written a byte: the reader had nothing to read, and waited for ever.
+#[tokio::test]
+async fn a_slow_encode_with_a_read_ahead_shorter_than_a_cluster_is_read_to_its_end() {
+    // At twice real time: the job looks at the encode before its first
+    // cluster is written.
+    let (dir, ffmpeg) = removable_ffmpeg("progressive-short-ahead").await;
+    let options = ServerOptions {
+        real_media: true,
+        ffmpeg,
+        read_ahead: Duration::from_millis(500),
+        ..ServerOptions::default()
+    };
+    let server = TestServer::start_with(dir, options).await;
+    server.generate_media(8, "libx264", "ac3");
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client
+        .hello_with(None, Some(progressive_capabilities()))
+        .await;
+    let session = client.login("alice", "correct horse").await;
+    let handle = started(&client, &session, None).await;
+    let read = read_all(&client, &session, &handle, 0);
+    let (bytes, _) = tokio::time::timeout(Duration::from_secs(30), read)
+        .await
+        .expect("the output is read to its end");
+    let (_, last) = probe(&write(&server, "short-ahead.mkv", &bytes));
+    assert!((last - 8.0).abs() < 0.5, "last packet at {last}");
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn a_seek_restarts_the_encode_in_a_new_epoch() {
     let (server, client, session) = ready("progressive-seek", ServerOptions::default(), 20).await;
@@ -441,18 +474,11 @@ async fn removable_ffmpeg(test: &str) -> (crate::support::StateDir, PathBuf) {
 
 /// Whether `handle`'s ffmpeg is held back for its reader (stopped): it
 /// runs, and cannot end until something reads.
-///
-/// The tests that wait for this take a read-ahead of [`HELD_AFTER`].
 fn held_back(handle: &PlaybackHandle) -> bool {
     ffmpeg_for(handle).iter().any(|pid| {
         std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.contains(") T "))
     })
 }
-
-/// A read-ahead longer than ffmpeg keeps to itself before it first writes
-/// (a 2 s cluster, a 2 s segment): a job held back before that has nothing
-/// a reader could read to let it go on.
-const HELD_AFTER: Duration = Duration::from_secs(3);
 
 /// A seek once stopped the encode before it started the next. When the
 /// next could not start, the playback was left with a dead encode whose
@@ -466,7 +492,7 @@ async fn a_seek_that_cannot_start_leaves_the_playback_playing() {
             real_media: true,
             max_jobs: 1,
             ffmpeg: ffmpeg.clone(),
-            read_ahead: HELD_AFTER,
+            read_ahead: Duration::from_millis(500),
             ..ServerOptions::default()
         },
     )
@@ -516,7 +542,9 @@ async fn an_hls_restart_that_cannot_start_leaves_the_playback_playing() {
     let options = ServerOptions {
         max_jobs: 1,
         ffmpeg: ffmpeg.clone(),
-        read_ahead: HELD_AFTER,
+        // Held back with segment 1 (0 to 2 s) written: segment 4 is then
+        // near enough to what is written to be waited for.
+        read_ahead: Duration::from_secs(3),
         ..ServerOptions::default()
     };
     let (server, client, session) = hls_ready_with(dir, hls_capabilities(), options).await;
@@ -586,6 +614,44 @@ async fn a_failed_encode_fails_its_reads_with_ffmpeg_s_reason() {
         response,
         MediaReadResponse::Err(Error::PlaybackFailed {
             reason: "input: Invalid data found when processing input".into()
+        })
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// ffmpeg can wait for ever without failing. Such an encode once kept its
+/// slot and its reads waiting for as long as the client asked; now it is
+/// ended, and its reads say why.
+#[tokio::test]
+async fn a_stalled_encode_fails_its_reads() {
+    let dir = fresh_dir("encode-stalled").await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let stub = dir.join("stalled-ffmpeg");
+    crate::support::write_script(&stub, "#!/bin/sh\nexec sleep 30\n");
+    let server = TestServer::start_with(
+        dir,
+        ServerOptions {
+            real_media: true,
+            ffmpeg: stub,
+            stalled_after: Duration::from_millis(500),
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_media(4, "libx264", "ac3");
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client
+        .hello_with(None, Some(progressive_capabilities()))
+        .await;
+    let session = client.login("alice", "correct horse").await;
+    let handle = started(&client, &session, None).await;
+    let (response, _) = client.read_at(&session, &handle, 0, 0, 100).await;
+    assert_eq!(
+        response,
+        MediaReadResponse::Err(Error::PlaybackFailed {
+            reason: "the conversion stalled: ffmpeg made no progress for 500ms".into()
         })
     );
     client.close().await;
@@ -710,6 +776,11 @@ async fn hls_of_a_copied_video_is_cut_at_its_keyframes_and_plays_whole() {
     );
     assert!(
         multivariant.contains("avc1.640028,mp4a.40.2"),
+        "{multivariant}"
+    );
+    // The 360p test pattern, 25 frames a second, says no transfer.
+    assert!(
+        multivariant.contains(",RESOLUTION=640x360,FRAME-RATE=25.000,VIDEO-RANGE=SDR\n"),
         "{multivariant}"
     );
 
@@ -922,9 +993,12 @@ async fn hls_of_a_copied_video_with_a_first_keyframe_before_zero_lists_what_ffmp
 }
 
 /// The times stored in fMP4, before any edit list is applied: what
-/// AVPlayer places WebVTT cues on.
+/// AVPlayer places WebVTT cues on. And what each track says it holds.
 #[derive(Debug, Default)]
 struct Mp4Times {
+    /// Each track's first `stsd` sample entry (`hvc1`, `mp4a`), in track
+    /// order.
+    sample_entries: Vec<String>,
     /// Each track's `mdhd` timescale, in track order.
     timescales: Vec<u32>,
     /// The media time of every `elst` entry; -1 is an empty edit.
@@ -947,7 +1021,14 @@ fn mp4_times(bytes: &[u8], times: &mut Mp4Times) {
         }
         let body = &rest[8..size];
         match &rest[4..8] {
-            b"moov" | b"trak" | b"edts" | b"mdia" | b"moof" | b"traf" => mp4_times(body, times),
+            b"moov" | b"trak" | b"edts" | b"mdia" | b"minf" | b"stbl" | b"moof" | b"traf" => {
+                mp4_times(body, times);
+            }
+            // After the version and the entry count: the first entry's
+            // size, then its type.
+            b"stsd" => times
+                .sample_entries
+                .push(String::from_utf8_lossy(&body[12..16]).into_owned()),
             // Version 1 has 64-bit dates before the timescale.
             b"mdhd" => {
                 let at = if body[0] == 1 { 20 } else { 12 };
@@ -1083,6 +1164,58 @@ async fn hls_restarted_far_ahead_stores_the_film_s_own_time() {
     server.stop().await;
 }
 
+/// AVPlayer plays HEVC in fMP4 only under the sample entry `hvc1`, and
+/// the playlist says `hvc1`. ffmpeg writes `hev1` unless told: an iPhone
+/// was given a 4K film as `hev1`, and showed nothing.
+#[tokio::test]
+async fn hls_of_a_copied_hevc_video_is_hvc1_as_the_playlist_says() {
+    use spoolframe_protocol::ConvertedVideo;
+    use spoolframe_types::VideoCodec;
+    let caps = ClientCapabilities {
+        video: [VideoCodec::H264, VideoCodec::Hevc].into(),
+        ..hls_capabilities()
+    };
+    let (server, client, session) = hls_ready("hls-hvc1", caps).await;
+    server.generate_media(6, "libx265", "ac3");
+    let handle = match start(&client, &session, None).await {
+        Response::Ok(Reply::PlaybackStarted {
+            handle,
+            plan:
+                PlaybackPlan::Converted {
+                    video:
+                        Some(ConvertedVideo::Copy {
+                            codec: VideoCodec::Hevc,
+                        }),
+                    ..
+                },
+            ..
+        }) => handle,
+        other => panic!("no playback with its HEVC copied: {other:?}"),
+    };
+    let init = segment(&client, &session, &handle, 0).await;
+    let mut boxes = Mp4Times::default();
+    mp4_times(&init, &mut boxes);
+    assert_eq!(boxes.sample_entries, ["hvc1", "mp4a"]);
+
+    let multivariant = manifest(&client, &session, &handle, ManifestKind::Multivariant).await;
+    let declared = multivariant
+        .split_once("CODECS=\"")
+        .and_then(|(_, rest)| rest.split_once('.'))
+        .map(|(entry, _)| entry);
+    assert_eq!(
+        declared,
+        Some(boxes.sample_entries[0].as_str()),
+        "{multivariant}"
+    );
+
+    // And it plays: the first segment's packets are read with that init.
+    let first = segment(&client, &session, &handle, 1).await;
+    let (start, _) = probe(&write(&server, "hvc1.mp4", &[init, first].concat()));
+    assert!(start < 0.1, "first packet at {start}");
+    client.close().await;
+    server.stop().await;
+}
+
 /// A text subtitle goes to an HLS client as a WebVTT rendition on the
 /// video's cuts, each cue in the segment that holds its time (P2-07).
 #[tokio::test]
@@ -1155,7 +1288,7 @@ async fn an_hls_playback_carries_its_subtitle_as_a_webvtt_rendition() {
                     )
                     .await;
                 match response {
-                    Response::Ok(Reply::Subtitle { format, bytes, .. }) => {
+                    Response::Ok(Reply::Subtitle { format, bytes }) => {
                         assert_eq!(format, SubtitleFormat::WebVtt);
                         return String::from_utf8(bytes).unwrap();
                     }

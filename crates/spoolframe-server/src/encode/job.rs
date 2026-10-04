@@ -17,6 +17,12 @@ use super::args::PLAYLIST;
 
 /// How often a job looks at its output.
 const POLL: Duration = Duration::from_millis(200);
+/// How long an encode that is not held back may make no progress before
+/// it is ended as stalled. Long enough for an input on a disk that has to
+/// spin up or a network mount that has to answer, and for a slow software
+/// encoder to fill its lookahead before its first frame comes out; a
+/// viewer has given up long before.
+pub const STALLED_AFTER: Duration = Duration::from_secs(120);
 /// How many of ffmpeg's last stderr lines a failure reports.
 const STDERR_LINES: usize = 20;
 
@@ -140,6 +146,7 @@ impl Jobs {
                 ),
             },
         };
+        let slot = Arc::new(std::sync::Mutex::new(Some(slot)));
         std::fs::create_dir_all(&dir).map_err(|e| JobError::Prepare(e.to_string()))?;
         let mut child = tokio::process::Command::new(&self.ffmpeg)
             .args(&args)
@@ -167,7 +174,9 @@ impl Jobs {
             scratch_limit: self.limits.scratch_limit_bytes,
             scratch_check: self.scratch_check.clone(),
             read_ahead: self.limits.read_ahead,
+            stalled_after: self.limits.stalled_after,
             shared: shared.clone(),
+            slot: slot.clone(),
             progress: progress_tx,
         };
         let stdout = child.stdout.take().expect("piped");
@@ -182,7 +191,7 @@ impl Jobs {
             progress,
             shared,
             task,
-            slot: std::sync::Mutex::new(Some(slot)),
+            slot,
         }))
     }
 }
@@ -214,8 +223,9 @@ pub struct EncodeJob {
     progress: watch::Receiver<Progress>,
     shared: Arc<Shared>,
     task: JoinHandle<()>,
-    /// Held while ffmpeg may run; released by [`EncodeJob::stop`].
-    slot: std::sync::Mutex<Option<Slot>>,
+    /// Held while ffmpeg may run; released by [`EncodeJob::stop`], or by
+    /// the job itself when it ends a stalled ffmpeg.
+    slot: Arc<std::sync::Mutex<Option<Slot>>>,
 }
 
 impl EncodeJob {
@@ -322,7 +332,10 @@ struct Supervisor {
     scratch_limit: u64,
     scratch_check: Arc<tokio::sync::Mutex<()>>,
     read_ahead: Duration,
+    stalled_after: Duration,
     shared: Arc<Shared>,
+    /// The job's slot, let go of when a stalled ffmpeg is ended.
+    slot: Arc<std::sync::Mutex<Option<Slot>>>,
     progress: watch::Sender<Progress>,
 }
 
@@ -339,6 +352,10 @@ impl Supervisor {
         let mut encoded_ms = 0u64;
         // What the job had written when it last looked.
         let mut seen = 0u64;
+        // What it had written and encoded when it last got further, and
+        // when that was.
+        let mut reached = (0u64, 0u64);
+        let mut got_further = tokio::time::Instant::now();
         // With `-copyts` a run started at a seek reports the film's own
         // time, from where it started.
         let base_ms = self.start_ms;
@@ -371,12 +388,36 @@ impl Supervisor {
                 status = child.wait() => break status,
                 _ = tick.tick() => {
                     let (bytes, last_segment) = self.measure();
-                    self.throttle(encoded_ms, base_ms, bytes);
+                    self.throttle(encoded_ms, base_ms, bytes, last_segment);
                     self.progress.send_modify(|p| {
                         p.bytes = bytes;
                         p.encoded_ms = encoded_ms;
                         p.last_segment = last_segment;
                     });
+                    // ffmpeg can wait for ever with nothing wrong that it
+                    // knows of. One held back for its reader is not
+                    // waiting: its time starts again when it goes on.
+                    if reached != (bytes, encoded_ms) || self.shared.paused.load(Ordering::Relaxed) {
+                        reached = (bytes, encoded_ms);
+                        got_further = tokio::time::Instant::now();
+                    } else if got_further.elapsed() >= self.stalled_after {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        tracing::warn!(
+                            pid = self.pid,
+                            after = ?self.stalled_after,
+                            bytes,
+                            encoded_ms,
+                            stderr = ?tail,
+                            "an encode stalled"
+                        );
+                        self.slot.lock().expect("never poisoned").take();
+                        self.finish(Err(format!(
+                            "the conversion stalled: ffmpeg made no progress for {:?}",
+                            self.stalled_after
+                        )));
+                        return;
+                    }
                     // Only a job that wrote since it last looked can be the
                     // one that fills the scratch directory: a paused one
                     // is left alone, whoever fills it.
@@ -494,22 +535,35 @@ impl Supervisor {
     }
 
     /// Pause ffmpeg once it is `read_ahead` past its reader; resume it at
-    /// half that.
-    fn throttle(&self, encoded_ms: u64, base_ms: u64, bytes: u64) {
+    /// half that. Never while the reader has nothing it can read: a held
+    /// encode goes on only when its reader moves on, and a reader that
+    /// waits for the encode cannot.
+    fn throttle(&self, encoded_ms: u64, base_ms: u64, bytes: u64, last_segment: Option<u32>) {
         let reader_ms = match self.written {
-            // A byte offset as a share of what this run encoded: close
-            // enough for a stream of roughly even bitrate.
             Written::Progressive { .. } => {
                 let read = self.shared.furthest_bytes.load(Ordering::Relaxed);
-                let run = encoded_ms.saturating_sub(base_ms);
-                base_ms
-                    + if bytes == 0 {
-                        0
-                    } else {
-                        (u128::from(run) * u128::from(read.min(bytes)) / u128::from(bytes)) as u64
-                    }
+                if read >= bytes {
+                    // It has all that is written, which is nothing until
+                    // ffmpeg has its first cluster whole: it is where the
+                    // encode is.
+                    encoded_ms
+                } else {
+                    // A byte offset as a share of what this run encoded:
+                    // close enough for a stream of roughly even bitrate.
+                    let run = encoded_ms.saturating_sub(base_ms);
+                    base_ms + (u128::from(run) * u128::from(read) / u128::from(bytes)) as u64
+                }
             }
-            Written::Hls => self.shared.reader_ms.load(Ordering::Relaxed).max(base_ms),
+            Written::Hls => {
+                let asked = self.shared.reader_segment.load(Ordering::Relaxed);
+                if asked > 0 && last_segment.is_none_or(|last| last < asked) {
+                    // It waits for a segment ffmpeg has not finished,
+                    // whatever time ffmpeg reports.
+                    encoded_ms
+                } else {
+                    self.shared.reader_ms.load(Ordering::Relaxed).max(base_ms)
+                }
+            }
         };
         let ahead = Duration::from_millis(encoded_ms.saturating_sub(reader_ms));
         let paused = self.shared.paused.load(Ordering::Relaxed);
@@ -517,7 +571,7 @@ impl Supervisor {
             signal(self.pid, libc::SIGSTOP);
             self.shared.paused.store(true, Ordering::Relaxed);
             tracing::debug!(pid = self.pid, ?ahead, "encode paused for its reader");
-        } else if paused && ahead < self.read_ahead / 2 {
+        } else if paused && ahead <= self.read_ahead / 2 {
             signal(self.pid, libc::SIGCONT);
             self.shared.paused.store(false, Ordering::Relaxed);
             tracing::debug!(pid = self.pid, ?ahead, "encode resumed");
@@ -598,6 +652,18 @@ mod tests {
         max_jobs: usize,
         read_ahead: Duration,
     ) -> (Jobs, spoolframe_test_dir::TestDir) {
+        jobs_stalled_after(test, body, max_jobs, read_ahead, STALLED_AFTER).await
+    }
+
+    /// The same, with an encode ended as stalled after `stalled_after`
+    /// without progress.
+    async fn jobs_stalled_after(
+        test: &str,
+        body: &str,
+        max_jobs: usize,
+        read_ahead: Duration,
+        stalled_after: Duration,
+    ) -> (Jobs, spoolframe_test_dir::TestDir) {
         let tmp = scratch(test).await;
         let root = tmp.as_ref().to_path_buf();
         let bin = ffmpeg(&root.join("bin"), body);
@@ -606,6 +672,7 @@ mod tests {
             scratch_dir: root.join("scratch"),
             scratch_limit_bytes: 1 << 30,
             read_ahead,
+            stalled_after,
         };
         (Jobs::new(limits, bin).unwrap(), tmp)
     }
@@ -753,6 +820,229 @@ mod tests {
         assert!(!job.paused());
     }
 
+    /// ffmpeg keeps a Matroska cluster to itself until it is whole, so it
+    /// reports encoded time before it has written a byte. A job held back
+    /// then stayed so for ever: its reader had nothing to read, and only a
+    /// read lets a held job go on.
+    #[tokio::test]
+    async fn an_encode_that_has_written_nothing_is_not_held_back() {
+        // Reports two seconds encoded, and writes them a second later.
+        let (jobs, _dir) = jobs(
+            "nothing-written",
+            "echo out_time_us=2000000; sleep 1; head -c 100 /dev/zero > \"$1\"; exec sleep 30",
+            2,
+            Duration::from_millis(500),
+        )
+        .await;
+        let dir = jobs.dir().join("h/0");
+        let file = dir.join("out.mkv");
+        let job = jobs
+            .start(
+                dir,
+                vec![file.display().to_string()],
+                Written::Progressive { file },
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        let mut progress = job.progress();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            progress.wait_for(|p| p.bytes == 100),
+        )
+        .await
+        .expect("the encode writes on")
+        .unwrap();
+    }
+
+    /// The same for HLS: the reader waits for a segment ffmpeg has not
+    /// finished, though it reports time past the segment's end.
+    #[tokio::test]
+    async fn an_encode_is_not_held_back_before_the_segment_its_reader_waits_for() {
+        // Reports twenty seconds encoded, and lists segment 1 a second later.
+        let (jobs, _dir) = jobs(
+            "segment-awaited",
+            &format!(
+                "echo out_time_us=20000000; sleep 1; echo seg1.m4s > \"$1/{PLAYLIST}\"; exec sleep 30"
+            ),
+            2,
+            Duration::from_millis(500),
+        )
+        .await;
+        let dir = jobs.dir().join("h/0");
+        let args = vec![dir.display().to_string()];
+        let job = jobs.start(dir, args, Written::Hls, 0, 1, 0, None).unwrap();
+        job.reader_at(1, 6_000);
+        let mut progress = job.progress();
+        let listed = progress.wait_for(|p| p.last_segment == Some(1));
+        tokio::time::timeout(Duration::from_secs(5), listed)
+            .await
+            .expect("the encode finishes the segment")
+            .unwrap();
+    }
+
+    /// `read_ahead_secs = 0` holds the encode whenever its reader is
+    /// behind. It once never let it go on: with the reader caught up the
+    /// encode was no longer ahead, but not under half of nothing either.
+    #[tokio::test]
+    async fn an_encode_with_no_read_ahead_goes_on_once_its_reader_has_caught_up() {
+        let (jobs, _dir) = jobs(
+            "no-read-ahead",
+            "head -c 100 /dev/zero > \"$1\"; echo out_time_us=1000000; exec sleep 30",
+            2,
+            Duration::ZERO,
+        )
+        .await;
+        let dir = jobs.dir().join("h/0");
+        let file = dir.join("out.mkv");
+        let job = jobs
+            .start(
+                dir,
+                vec![file.display().to_string()],
+                Written::Progressive { file },
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        let pid = job.pid();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !stopped(pid) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("not paused");
+        job.read_to(100);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stopped(pid) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("not resumed");
+        assert!(!job.paused());
+    }
+
+    /// Short, for the tests of a stalled encode, and over two looks at the
+    /// output long.
+    const STALLED_SOON: Duration = Duration::from_millis(500);
+
+    fn stalled(done: Result<(), String>) -> bool {
+        done.is_err_and(|reason| reason.starts_with("the conversion stalled"))
+    }
+
+    /// ffmpeg can wait for ever with nothing wrong that it knows of (it
+    /// does when it lays a picture subtitle file of one cue over the
+    /// video and loses the file's end). The job once waited with it, in
+    /// its slot, and its reads waited too.
+    #[tokio::test]
+    async fn an_encode_that_makes_no_progress_is_ended_and_gives_up_its_slot() {
+        let (jobs, _dir) = jobs_stalled_after(
+            "stalled",
+            "exec sleep 30",
+            1,
+            Duration::from_secs(60),
+            STALLED_SOON,
+        )
+        .await;
+        let scratch = jobs.dir().to_path_buf();
+        let job = jobs
+            .start(scratch.join("a/0"), Vec::new(), Written::Hls, 0, 0, 0, None)
+            .unwrap();
+        let pid = job.pid();
+        let ended = tokio::time::timeout(Duration::from_secs(5), done(&job))
+            .await
+            .expect("the stalled encode is ended");
+        assert_eq!(
+            ended.unwrap_err(),
+            "the conversion stalled: ffmpeg made no progress for 500ms"
+        );
+        assert!(!alive(pid), "ffmpeg {pid} still runs");
+        // The job is still held, as by a playback not yet stopped: its
+        // slot, the only one, is free.
+        jobs.start(scratch.join("b/0"), Vec::new(), Written::Hls, 0, 0, 0, None)
+            .unwrap();
+    }
+
+    /// An encode held back for its reader makes no progress on purpose,
+    /// for as long as the reader takes. The time it is held does not count:
+    /// let go on, it has the whole time again.
+    #[tokio::test]
+    async fn an_encode_held_back_for_its_reader_is_not_stalled() {
+        // Reports a minute of encoded time, writes 100 bytes, then hangs.
+        let (jobs, _dir) = jobs_stalled_after(
+            "stalled-held",
+            "head -c 100 /dev/zero > \"$1\"; echo out_time_us=60000000; exec sleep 30",
+            2,
+            Duration::from_secs(10),
+            STALLED_SOON,
+        )
+        .await;
+        let dir = jobs.dir().join("h/0");
+        let file = dir.join("out.mkv");
+        let job = jobs
+            .start(
+                dir,
+                vec![file.display().to_string()],
+                Written::Progressive { file },
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !job.paused() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("not paused");
+        // Held for six looks, 1.2 s: over twice the time a stall takes.
+        looked(&job, 6).await;
+        assert_eq!(job.progress().borrow().done, None);
+        assert!(job.paused());
+        // The reader catches up: the encode goes on, and now it hangs.
+        job.read_to(100);
+        let ended = tokio::time::timeout(Duration::from_secs(5), done(&job))
+            .await
+            .expect("the stalled encode is ended");
+        assert!(stalled(ended));
+    }
+
+    /// A slow encode is not a stalled one: while ffmpeg reports more time
+    /// encoded, however little, the job lets it run.
+    #[tokio::test]
+    async fn an_encode_that_gets_on_slowly_is_not_stalled() {
+        // Reports a tenth of a second more every tenth of a second, for
+        // 1.5 s (three times the time a stall takes), says so, then hangs.
+        let (jobs, _dir) = jobs_stalled_after(
+            "stalled-slow",
+            "i=0; while [ $i -lt 15 ]; do i=$((i+1)); echo out_time_us=${i}00000; sleep 0.1; done\n\
+             touch \"$1\"; exec sleep 30",
+            2,
+            Duration::from_secs(60),
+            STALLED_SOON,
+        )
+        .await;
+        let dir = jobs.dir().join("h/0");
+        let slow_part_over = jobs.dir().join("over");
+        let args = vec![slow_part_over.display().to_string()];
+        let job = jobs.start(dir, args, Written::Hls, 0, 0, 0, None).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(10), done(&job))
+            .await
+            .expect("the stalled encode is ended");
+        assert!(stalled(ended));
+        assert!(
+            slow_part_over.exists(),
+            "ended while it still reported progress"
+        );
+    }
+
     /// Jobs running `body` as ffmpeg, which may write `scratch_limit`
     /// bytes together.
     async fn jobs_within(
@@ -768,6 +1058,7 @@ mod tests {
             scratch_dir: root.join("scratch"),
             scratch_limit_bytes: scratch_limit,
             read_ahead: Duration::from_secs(60),
+            stalled_after: STALLED_AFTER,
         };
         (Jobs::new(limits, bin).unwrap(), tmp)
     }
@@ -884,12 +1175,17 @@ mod tests {
     /// it, and removed them for room.
     #[tokio::test]
     async fn a_reader_that_went_back_keeps_the_segments_it_now_reads() {
-        // Says it has encoded two minutes, then waits.
-        let (jobs, _dir) =
-            jobs_within("back", "echo out_time_us=120000000; exec sleep 30", 5_500).await;
+        // Says it has encoded two minutes and lists segments 1 to 8, in a
+        // playlist as large as a segment, then waits.
+        let script = format!(
+            "printf 'seg%s.m4s\\n' 1 2 3 4 5 6 7 8 > \"$1/{PLAYLIST}\"; \
+             truncate -s 1000 \"$1/{PLAYLIST}\"; echo out_time_us=120000000; exec sleep 30"
+        );
+        let (jobs, _dir) = jobs_within("back", &script, 5_500).await;
         let dir = jobs.dir().join("h/0");
+        let args = vec![dir.display().to_string()];
         let job = jobs
-            .start(dir.clone(), Vec::new(), Written::Hls, 0, 1, 0, None)
+            .start(dir.clone(), args, Written::Hls, 0, 1, 0, None)
             .unwrap();
         // The reader got to segment 7, then went back to 4.
         job.reader_at(7, 42_000);
@@ -903,9 +1199,9 @@ mod tests {
         .await
         .expect("not paused");
         eight_segments(&job, &dir).await;
-        // 8000 bytes, 5500 allowed. Segments 1 and 2 are behind the reader
-        // and went; 3 is the one before the reader's and stays, with all
-        // after it, though that leaves 6000.
+        // 9000 bytes with the playlist, 5500 allowed. Segments 1 and 2 are
+        // behind the reader and went; 3 is the one before the reader's and
+        // stays, with all after it, though that leaves 7000.
         assert_eq!(job.first_kept(), 3);
         assert_eq!(
             segments_left(&dir),
@@ -928,6 +1224,7 @@ mod tests {
             scratch_dir: root.join("scratch"),
             scratch_limit_bytes: 1 << 30,
             read_ahead: Duration::from_secs(60),
+            stalled_after: STALLED_AFTER,
         };
         let jobs = Jobs::new(limits, "ffmpeg".into()).unwrap();
         assert!(!jobs.dir().join("oldhandle").exists());
@@ -951,6 +1248,7 @@ mod tests {
             scratch_dir: root.join("state"),
             scratch_limit_bytes: 1 << 30,
             read_ahead: Duration::from_secs(60),
+            stalled_after: STALLED_AFTER,
         };
         Jobs::new(limits, "ffmpeg".into()).unwrap();
         assert_eq!(std::fs::read(&key).unwrap(), b"secret");

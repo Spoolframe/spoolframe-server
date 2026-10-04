@@ -22,9 +22,9 @@ use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Selection};
 /// when features are added; a breaking change is a new ALPN instead.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// The most bytes of a subtitle one `ReadSubtitle` with an `offset`
-/// returns (P2-11): half a frame ([`crate::codec::MAX_FRAME`]), so a chunk
-/// and its framing always fit one.
+/// The most bytes of a subtitle one `ReadSubtitle` returns (P2-11): half a
+/// frame ([`crate::codec::MAX_FRAME`]), so a chunk and its framing always
+/// fit one.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
 
 /// An opaque session token from a login (P1-12). It is only valid from
@@ -190,21 +190,23 @@ pub enum Request {
         handle: PlaybackHandle,
         kind: ManifestKind,
     },
-    /// The selected external subtitle of a playback. One the server reads
-    /// as text (P2-07) answers `SubtitleNotReady` until it is done: ask
-    /// again.
+    /// The selected external subtitle of a playback, one chunk of it
+    /// (P2-11). One the server reads as text (P2-07) answers
+    /// `SubtitleNotReady` until it is done: ask again.
     ///
-    /// With `offset` (P2-11) the reply is one chunk: at most
-    /// [`SUBTITLE_CHUNK`] bytes of the file from that byte, and `total`,
-    /// the file's length. Ask from the end of each chunk until `total`
-    /// bytes are read; an `offset` at or past the end answers no bytes.
-    /// Without `offset` the reply is the whole file, or `ReplyTooLarge`
-    /// when that does not fit a frame: an older client never gets a part
-    /// that it would take for the whole.
+    /// The reply is `SubtitleChunk`: at most [`SUBTITLE_CHUNK`] bytes of
+    /// the file from `offset`, `total`, the file's length, and `version`,
+    /// which names the file as it was when the chunk was read. Ask from
+    /// the end of each chunk, with the first chunk's `version`, until
+    /// `total` bytes are read; an `offset` at or past the end answers no
+    /// bytes. When the file is no longer the one `version` names, the
+    /// answer is `SubtitleChanged`: the chunks read so far are of a file
+    /// that is gone, so start again from 0. The first read has no file
+    /// to hold the server to, and sends no `version`.
     ReadSubtitle {
         handle: PlaybackHandle,
-        #[serde(default)]
-        offset: Option<u64>,
+        offset: u64,
+        version: Option<u64>,
     },
     /// Segment `n` (from 1) of an HLS playback's subtitle rendition (P2-07):
     /// `Subtitle { format: WebVtt, .. }`, the cues over that segment's time,
@@ -443,16 +445,23 @@ pub enum Reply {
     Manifest {
         text: String,
     },
-    /// A subtitle, whole, or the chunk of it that `ReadSubtitle` asked for
-    /// with an `offset`.
+    /// A segment of a subtitle rendition, whole (`ReadSubtitleSegment`).
     Subtitle {
         format: SubtitleFormat,
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
-        /// The whole file's length, when `bytes` is a chunk of it (P2-11).
-        /// Without it `bytes` is the whole file.
-        #[serde(default)]
-        total: Option<u64>,
+    },
+    /// The chunk of a subtitle file that `ReadSubtitle` asked for (P2-11).
+    SubtitleChunk {
+        format: SubtitleFormat,
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+        /// The whole file's length.
+        total: u64,
+        /// The file these bytes are of. It is another value once the file
+        /// is written again or replaced, and means nothing else to a
+        /// client: send it back with the next `ReadSubtitle`.
+        version: u64,
     },
     /// The request was carried out; there is nothing to return.
     Done,
@@ -600,6 +609,11 @@ pub enum Error {
     /// its cues are read. Ask again in a few seconds.
     #[error("the subtitle is still being read ({done_percent}% done)")]
     SubtitleNotReady { done_percent: u8 },
+    /// The subtitle is not the file that `ReadSubtitle`'s `version` names:
+    /// it was written again or replaced since that chunk (P2-11). Read it
+    /// again from offset 0.
+    #[error("the subtitle changed while it was read")]
+    SubtitleChanged,
     /// The session's profile is locked on this connection: `UnlockProfile`
     /// with the user's PIN first (P2-08).
     #[error("this profile is locked; enter its PIN")]
@@ -616,10 +630,8 @@ pub enum Error {
     #[error("the sign-in code has expired")]
     DeviceSignInExpired,
     /// The reply would be over the frame limit
-    /// ([`crate::codec::MAX_FRAME`]). `bytes` is its length, or the length
-    /// of the subtitle file it would carry: read that in chunks, with
-    /// `ReadSubtitle`'s `offset`. A page of items is to ask for in smaller
-    /// pages.
+    /// ([`crate::codec::MAX_FRAME`]); `bytes` is its length. A page of
+    /// items is to ask for in smaller pages.
     #[error("the reply is too large to send ({bytes} bytes)")]
     ReplyTooLarge { bytes: u64 },
     /// Something the server depends on (Plex, a media mount) is down.

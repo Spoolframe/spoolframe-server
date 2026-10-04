@@ -606,6 +606,96 @@ fn encode_audio(
 }
 
 /// Unknown is never supported, whatever the client claims.
+/// A plan in the words of one log line: what the server decided, each
+/// part short enough to read in a row. `none` is no such stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanSummary {
+    /// `direct`, `converted` or `unsupported`.
+    pub kind: &'static str,
+    pub delivery: Delivery,
+    /// `direct:hevc`, `copy:hevc`, `encode:h264:1080p` (`:tonemap` after
+    /// it when HDR is mapped to SDR).
+    pub video: String,
+    /// `direct:eac3`, `copy:eac3`, `encode:eac3:6ch`.
+    pub audio: String,
+    /// `embedded:srt` or `external:srt` beside a file played as it is;
+    /// `copy:srt`, `convert:srt>web_vtt`, `burn_in:pgs`, `ocr:pgs>srt`.
+    pub subtitle: String,
+}
+
+pub fn summary(plan: &PlaybackPlan) -> PlanSummary {
+    let none = || "none".to_owned();
+    match plan {
+        PlaybackPlan::Direct {
+            video,
+            audio,
+            subtitle,
+            ..
+        } => PlanSummary {
+            kind: "direct",
+            delivery: Delivery::Range,
+            video: video.map_or_else(none, |codec| format!("direct:{codec}")),
+            audio: audio.map_or_else(none, |a| format!("direct:{}", a.codec)),
+            subtitle: subtitle.map_or_else(none, |s| {
+                let from = match s.delivery {
+                    SubtitleDelivery::Embedded => "embedded",
+                    SubtitleDelivery::External => "external",
+                    SubtitleDelivery::Unknown => "unknown",
+                };
+                format!("{from}:{}", s.format)
+            }),
+        },
+        PlaybackPlan::Converted {
+            delivery,
+            video,
+            audio,
+            subtitle,
+            ..
+        } => PlanSummary {
+            kind: "converted",
+            delivery: *delivery,
+            video: video.map_or_else(none, |video| match video {
+                ConvertedVideo::Copy { codec } => format!("copy:{codec}"),
+                ConvertedVideo::Encode {
+                    codec,
+                    height,
+                    tone_map,
+                    ..
+                } => format!(
+                    "encode:{codec}:{height}p{}",
+                    if tone_map { ":tonemap" } else { "" }
+                ),
+                ConvertedVideo::Unknown => "unknown".to_owned(),
+            }),
+            audio: audio.map_or_else(none, |audio| match audio.action {
+                AudioAction::Copy { codec } => format!("copy:{codec}"),
+                AudioAction::Encode {
+                    codec, channels, ..
+                } => format!("encode:{codec}:{channels}ch"),
+                AudioAction::Unknown => "unknown".to_owned(),
+            }),
+            subtitle: subtitle.map_or_else(none, |subtitle| match subtitle.action {
+                SubtitleAction::Copy { format } => format!("copy:{format}"),
+                SubtitleAction::Convert { from, to } => format!("convert:{from}>{to}"),
+                SubtitleAction::BurnIn { format } => format!("burn_in:{format}"),
+                SubtitleAction::Ocr { from, to } => format!("ocr:{from}>{to}"),
+                SubtitleAction::Unknown => "unknown".to_owned(),
+            }),
+        },
+        PlaybackPlan::Unsupported { .. } | PlaybackPlan::Unknown => PlanSummary {
+            kind: if matches!(plan, PlaybackPlan::Unknown) {
+                "unknown"
+            } else {
+                "unsupported"
+            },
+            delivery: Delivery::Unknown,
+            video: none(),
+            audio: none(),
+            subtitle: none(),
+        },
+    }
+}
+
 fn supported<T: Ord>(set: &std::collections::BTreeSet<T>, value: T, unknown: T) -> bool {
     value != unknown && set.contains(&value)
 }
@@ -730,6 +820,7 @@ mod tests {
                 index: 0,
                 codec: "h264".into(),
                 profile: None,
+                level: None,
                 width: 1920,
                 height: 1080,
                 pixel_format: None,
@@ -1413,6 +1504,94 @@ mod tests {
                 format: SubtitleFormat::Srt,
                 delivery: SubtitleDelivery::External,
             })
+        );
+    }
+
+    #[test]
+    fn a_plan_is_summed_up_for_the_log() {
+        // The film that did not start on an iPhone: video copied, DTS to
+        // E-AC-3, the SRT as a WebVTT rendition, over HLS.
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: Container::Mp4,
+            video: Some(ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+            }),
+            audio: Some(ConvertedAudio {
+                index: 0,
+                action: AudioAction::Encode {
+                    codec: AudioCodec::Eac3,
+                    channels: 6,
+                    bitrate: 640_000,
+                },
+            }),
+            subtitle: Some(ConvertedSubtitle {
+                index: 0,
+                action: SubtitleAction::Convert {
+                    from: SubtitleFormat::Srt,
+                    to: SubtitleFormat::WebVtt,
+                },
+            }),
+            reasons: Vec::new(),
+        };
+        assert_eq!(
+            summary(&plan),
+            PlanSummary {
+                kind: "converted",
+                delivery: Delivery::Hls,
+                video: "copy:hevc".into(),
+                audio: "encode:eac3:6ch".into(),
+                subtitle: "convert:srt>web_vtt".into(),
+            }
+        );
+
+        let burned = PlaybackPlan::Converted {
+            delivery: Delivery::Progressive,
+            container: Container::Matroska,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: None,
+                tone_map: true,
+            }),
+            audio: Some(ConvertedAudio {
+                index: 0,
+                action: AudioAction::Copy {
+                    codec: AudioCodec::Aac,
+                },
+            }),
+            subtitle: Some(ConvertedSubtitle {
+                index: 0,
+                action: SubtitleAction::BurnIn {
+                    format: SubtitleFormat::Pgs,
+                },
+            }),
+            reasons: Vec::new(),
+        };
+        let burned = summary(&burned);
+        assert_eq!(burned.video, "encode:h264:1080p:tonemap");
+        assert_eq!(burned.audio, "copy:aac");
+        assert_eq!(burned.subtitle, "burn_in:pgs");
+
+        let direct = PlaybackPlan::Direct {
+            container: Container::Matroska,
+            video: Some(VideoCodec::H264),
+            audio: None,
+            subtitle: Some(PlannedSubtitle {
+                index: 0,
+                format: SubtitleFormat::Srt,
+                delivery: SubtitleDelivery::External,
+            }),
+        };
+        assert_eq!(
+            summary(&direct),
+            PlanSummary {
+                kind: "direct",
+                delivery: Delivery::Range,
+                video: "direct:h264".into(),
+                audio: "none".into(),
+                subtitle: "external:srt".into(),
+            }
         );
     }
 }

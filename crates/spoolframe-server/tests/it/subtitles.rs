@@ -94,12 +94,13 @@ async fn text(client: &TestClient, session: &SessionId, handle: &PlaybackHandle)
                 Some(session),
                 Request::ReadSubtitle {
                     handle: handle.clone(),
-                    offset: None,
+                    offset: 0,
+                    version: None,
                 },
             )
             .await;
         match response {
-            Response::Ok(Reply::Subtitle { format, bytes, .. }) => {
+            Response::Ok(Reply::SubtitleChunk { format, bytes, .. }) => {
                 assert_eq!(format, SubtitleFormat::Srt);
                 return String::from_utf8(bytes).unwrap();
             }
@@ -159,7 +160,8 @@ async fn the_first_chunk_of_a_subtitle_still_being_read_is_not_ready() {
             Some(&session),
             Request::ReadSubtitle {
                 handle,
-                offset: Some(0),
+                offset: 0,
+                version: None,
             },
         )
         .await;
@@ -373,7 +375,8 @@ async fn a_subtitle_change_in_direct_play_changes_only_the_text() {
             Some(&session),
             Request::ReadSubtitle {
                 handle: handle.clone(),
-                offset: None,
+                offset: 0,
+                version: None,
             },
         )
         .await;

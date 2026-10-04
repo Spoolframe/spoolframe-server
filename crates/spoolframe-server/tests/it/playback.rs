@@ -191,14 +191,11 @@ async fn revoking_the_session_stops_reads_within_the_recheck_interval() {
     server.stop().await;
 }
 
-#[tokio::test]
-async fn a_selected_external_subtitle_is_read_whole() {
-    let (server, client, session) = ready("subtitle").await;
-    server.write_media(1000);
-    let sidecar = server.write_sidecar();
+/// The external subtitles of the movie, as indexes for a `Selection`.
+async fn sidecars(client: &TestClient, session: &SessionId) -> Vec<u32> {
     let Response::Ok(Reply::Tracks(tracks)) = client
         .call(
-            Some(&session),
+            Some(session),
             Request::Tracks {
                 id: movie().id().clone(),
             },
@@ -207,11 +204,70 @@ async fn a_selected_external_subtitle_is_read_whole() {
     else {
         panic!("no tracks");
     };
-    let external = tracks.subtitles.iter().position(|s| s.external).unwrap() as u32;
+    let external = tracks
+        .subtitles
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.external);
+    external.map(|(index, _)| index as u32).collect()
+}
 
+/// A playback of the movie with the subtitle file beside it selected.
+async fn started_with_sidecar(client: &TestClient, session: &SessionId) -> PlaybackHandle {
     let selection = Selection {
         audio: None,
-        subtitle: Some(external),
+        subtitle: Some(sidecars(client, session).await[0]),
+    };
+    match start(client, session, selection).await {
+        Response::Ok(Reply::PlaybackStarted { handle, .. }) => handle,
+        other => panic!("playback did not start: {other:?}"),
+    }
+}
+
+/// `ReadSubtitle` from `offset`: with `version`, of that file only.
+async fn read_subtitle(
+    client: &TestClient,
+    session: &SessionId,
+    handle: &PlaybackHandle,
+    offset: u64,
+    version: Option<u64>,
+) -> Response {
+    let request = Request::ReadSubtitle {
+        handle: handle.clone(),
+        offset,
+        version,
+    };
+    client.call(Some(session), request).await
+}
+
+/// One chunk of the playback's subtitle from `offset`, whatever file it
+/// is now: its bytes, and the file's length and version as the reply
+/// gives them.
+async fn subtitle_chunk(
+    client: &TestClient,
+    session: &SessionId,
+    handle: &PlaybackHandle,
+    offset: u64,
+) -> (Vec<u8>, u64, u64) {
+    match read_subtitle(client, session, handle, offset, None).await {
+        Response::Ok(Reply::SubtitleChunk {
+            bytes,
+            total,
+            version,
+            ..
+        }) => (bytes, total, version),
+        other => panic!("no subtitle: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_selected_external_subtitle_is_read() {
+    let (server, client, session) = ready("subtitle").await;
+    server.write_media(1000);
+    let sidecar = server.write_sidecar();
+    let selection = Selection {
+        audio: None,
+        subtitle: Some(sidecars(&client, &session).await[0]),
     };
     let Response::Ok(Reply::PlaybackStarted { handle, plan, .. }) =
         start(&client, &session, selection).await
@@ -225,81 +281,38 @@ async fn a_selected_external_subtitle_is_read_whole() {
             ..
         }
     ));
-    let response = client
-        .call(
-            Some(&session),
-            Request::ReadSubtitle {
-                handle,
-                offset: None,
-            },
-        )
-        .await;
-    let Response::Ok(Reply::Subtitle { bytes, .. }) = response else {
-        panic!("no subtitle: {response:?}");
-    };
+    let (bytes, total, _) = subtitle_chunk(&client, &session, &handle, 0).await;
+    assert_eq!(total, sidecar.len() as u64);
     assert_eq!(bytes, sidecar);
 
     // Without an external subtitle selected there is nothing to read.
     let (handle, _) = started(&client, &session).await;
     assert!(matches!(
-        client
-            .call(
-                Some(&session),
-                Request::ReadSubtitle {
-                    handle,
-                    offset: None,
-                },
-            )
-            .await,
+        read_subtitle(&client, &session, &handle, 0, None).await,
         Response::Err(Error::NotFound { .. })
     ));
     client.close().await;
     server.stop().await;
 }
 
-/// A reply is one frame, and a frame has a size limit. A subtitle file
-/// over it is refused with the reason, and the connection carries on.
+/// A reply is one frame, and a frame has a size limit. A reply over it is
+/// refused with the reason, and the connection carries on.
 #[tokio::test]
-async fn a_subtitle_too_large_for_a_frame_is_refused_with_the_reason() {
-    let (server, client, session) = ready("subtitle-too-large").await;
-    server.write_media(1000);
-    let sidecar = vec![b'a'; MAX_FRAME as usize + 1];
-    std::fs::write(server.media.with_extension("en.srt"), &sidecar).unwrap();
-    let Response::Ok(Reply::Tracks(tracks)) = client
-        .call(
-            Some(&session),
-            Request::Tracks {
-                id: movie().id().clone(),
-            },
-        )
-        .await
-    else {
-        panic!("no tracks");
-    };
-    let external = tracks.subtitles.iter().position(|s| s.external).unwrap() as u32;
-    let selection = Selection {
-        audio: None,
-        subtitle: Some(external),
-    };
-    let Response::Ok(Reply::PlaybackStarted { handle, .. }) =
-        start(&client, &session, selection).await
-    else {
-        panic!("did not start");
-    };
+async fn a_reply_too_large_for_a_frame_is_refused_with_the_reason() {
+    let (server, client, session) = ready("reply-too-large").await;
     let response = client
         .call(
             Some(&session),
-            Request::ReadSubtitle {
-                handle,
-                offset: None,
+            Request::Search {
+                query: support::A_TITLE_OVER_A_FRAME.into(),
+                limit: 10,
             },
         )
         .await;
     let Response::Err(Error::ReplyTooLarge { bytes }) = response else {
-        panic!("not refused: {response:?}");
+        panic!("not refused");
     };
-    // The file's size, from a stat: the server did not read it to say so.
-    assert_eq!(bytes, sidecar.len() as u64);
+    assert!(bytes > u64::from(MAX_FRAME), "{bytes}");
     assert_eq!(
         client.call(None, Request::Ping).await,
         Response::Ok(Reply::Pong)
@@ -308,55 +321,9 @@ async fn a_subtitle_too_large_for_a_frame_is_refused_with_the_reason() {
     server.stop().await;
 }
 
-/// A playback of the movie with the subtitle file beside it selected.
-async fn started_with_sidecar(client: &TestClient, session: &SessionId) -> PlaybackHandle {
-    let Response::Ok(Reply::Tracks(tracks)) = client
-        .call(
-            Some(session),
-            Request::Tracks {
-                id: movie().id().clone(),
-            },
-        )
-        .await
-    else {
-        panic!("no tracks");
-    };
-    let external = tracks.subtitles.iter().position(|s| s.external).unwrap() as u32;
-    let selection = Selection {
-        audio: None,
-        subtitle: Some(external),
-    };
-    match start(client, session, selection).await {
-        Response::Ok(Reply::PlaybackStarted { handle, .. }) => handle,
-        other => panic!("playback did not start: {other:?}"),
-    }
-}
-
-/// One chunk of the playback's subtitle from `offset`, and the file's
-/// length as the reply gives it.
-async fn subtitle_chunk(
-    client: &TestClient,
-    session: &SessionId,
-    handle: &PlaybackHandle,
-    offset: u64,
-) -> (Vec<u8>, Option<u64>) {
-    let response = client
-        .call(
-            Some(session),
-            Request::ReadSubtitle {
-                handle: handle.clone(),
-                offset: Some(offset),
-            },
-        )
-        .await;
-    match response {
-        Response::Ok(Reply::Subtitle { bytes, total, .. }) => (bytes, total),
-        other => panic!("no subtitle: {other:?}"),
-    }
-}
-
 /// A subtitle too large for one frame is read in chunks, each from the
-/// byte the one before ended at (P2-11).
+/// byte the one before ended at and of the file the first one was of
+/// (P2-11).
 #[tokio::test]
 async fn a_subtitle_too_large_for_a_frame_is_read_in_chunks() {
     let (server, client, session) = ready("subtitle-chunks").await;
@@ -369,15 +336,25 @@ async fn a_subtitle_too_large_for_a_frame_is_read_in_chunks() {
     let handle = started_with_sidecar(&client, &session).await;
     let total = sidecar.len() as u64;
 
-    let (first, said) = subtitle_chunk(&client, &session, &handle, 0).await;
-    assert_eq!(said, Some(total));
+    let (first, said, version) = subtitle_chunk(&client, &session, &handle, 0).await;
+    assert_eq!(said, total);
     assert_eq!(first.len() as u64, SUBTITLE_CHUNK);
     let mut whole = first;
     while (whole.len() as u64) < total {
-        let (chunk, said) = subtitle_chunk(&client, &session, &handle, whole.len() as u64).await;
-        assert_eq!(said, Some(total));
-        assert!(!chunk.is_empty(), "nothing at {}", whole.len());
-        whole.extend(chunk);
+        let offset = whole.len() as u64;
+        let response = read_subtitle(&client, &session, &handle, offset, Some(version)).await;
+        let Response::Ok(Reply::SubtitleChunk {
+            bytes,
+            total: said,
+            version: same,
+            ..
+        }) = response
+        else {
+            panic!("no chunk at {offset}");
+        };
+        assert_eq!((said, same), (total, version));
+        assert!(!bytes.is_empty(), "nothing at {offset}");
+        whole.extend(bytes);
     }
     assert!(whole == sidecar, "the chunks are not the file");
     client.close().await;
@@ -392,27 +369,147 @@ async fn a_subtitle_read_at_or_past_the_end_answers_no_bytes() {
     let total = server.write_sidecar().len() as u64;
     let handle = started_with_sidecar(&client, &session).await;
     for offset in [total, total + 1, u64::MAX] {
-        assert_eq!(
-            subtitle_chunk(&client, &session, &handle, offset).await,
-            (Vec::new(), Some(total)),
-            "at {offset}"
-        );
+        let (bytes, said, _) = subtitle_chunk(&client, &session, &handle, offset).await;
+        assert_eq!((bytes, said), (Vec::new(), total), "at {offset}");
     }
     client.close().await;
     server.stop().await;
 }
 
-#[tokio::test]
-async fn a_small_subtitle_read_with_an_offset_arrives_in_one_chunk() {
-    let (server, client, session) = ready("subtitle-one-chunk").await;
+fn modified(path: &std::path::Path) -> std::time::SystemTime {
+    std::fs::metadata(path).unwrap().modified().unwrap()
+}
+
+/// Sets the file's modification time. No test waits for the clock to give
+/// a file another one.
+fn set_modified(path: &std::path::Path, to: std::time::SystemTime) {
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(to).unwrap();
+}
+
+/// A started playback of the movie with the subtitle `sidecar` beside it,
+/// the file's path, and the version its first chunk named.
+async fn first_chunk_read(
+    server: &TestServer,
+    client: &TestClient,
+    session: &SessionId,
+    sidecar: &[u8],
+) -> (PlaybackHandle, std::path::PathBuf, u64) {
     server.write_media(1000);
-    let sidecar = server.write_sidecar();
-    let handle = started_with_sidecar(&client, &session).await;
-    let total = Some(sidecar.len() as u64);
+    let path = server.media.with_extension("en.srt");
+    std::fs::write(&path, sidecar).unwrap();
+    let handle = started_with_sidecar(client, session).await;
+    let (bytes, _, version) = subtitle_chunk(client, session, &handle, 0).await;
+    assert_eq!(bytes, sidecar);
+    (handle, path, version)
+}
+
+/// Another file of the same length and the same modification time is
+/// moved over the subtitle between two chunks: only its inode tells it
+/// from the first. The second chunk is refused, not answered from the new
+/// file (P2-11).
+#[tokio::test]
+async fn a_subtitle_replaced_by_one_of_the_same_length_between_chunks_is_refused() {
+    let (server, client, session) = ready("subtitle-replaced").await;
+    let (handle, path, version) = first_chunk_read(&server, &client, &session, b"aaaaaaaa").await;
+
+    let replacement = path.with_extension("replacement");
+    std::fs::write(&replacement, b"bbbbbbbb").unwrap();
+    set_modified(&replacement, modified(&path));
+    std::fs::rename(&replacement, &path).unwrap();
+
     assert_eq!(
-        subtitle_chunk(&client, &session, &handle, 0).await,
-        (sidecar, total)
+        read_subtitle(&client, &session, &handle, 4, Some(version)).await,
+        Response::Err(Error::SubtitleChanged)
     );
+    // From the start, it is the new file, under another version.
+    let (bytes, _, new_version) = subtitle_chunk(&client, &session, &handle, 0).await;
+    assert_eq!(bytes, b"bbbbbbbb");
+    assert_ne!(new_version, version);
+    assert!(matches!(
+        read_subtitle(&client, &session, &handle, 4, Some(new_version)).await,
+        Response::Ok(Reply::SubtitleChunk { .. })
+    ));
+    client.close().await;
+    server.stop().await;
+}
+
+/// The same bytes written into the same file again, a second later: the
+/// length and the inode are the same, the modification time is not.
+#[tokio::test]
+async fn a_subtitle_written_again_in_place_between_chunks_is_refused() {
+    let (server, client, session) = ready("subtitle-rewritten").await;
+    let (handle, path, version) = first_chunk_read(&server, &client, &session, b"aaaaaaaa").await;
+
+    let before = modified(&path);
+    std::fs::write(&path, b"aaaaaaaa").unwrap();
+    set_modified(&path, before + Duration::from_secs(1));
+
+    assert_eq!(
+        read_subtitle(&client, &session, &handle, 4, Some(version)).await,
+        Response::Err(Error::SubtitleChanged)
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// More bytes at the end of the same file, and the modification time put
+/// back: only the length is another.
+#[tokio::test]
+async fn a_subtitle_that_grew_between_chunks_is_refused() {
+    use std::io::Write;
+    let (server, client, session) = ready("subtitle-grew").await;
+    let (handle, path, version) = first_chunk_read(&server, &client, &session, b"aaaaaaaa").await;
+
+    let before = modified(&path);
+    let mut file = std::fs::File::options().append(true).open(&path).unwrap();
+    file.write_all(b"bb").unwrap();
+    drop(file);
+    set_modified(&path, before);
+
+    assert_eq!(
+        read_subtitle(&client, &session, &handle, 4, Some(version)).await,
+        Response::Err(Error::SubtitleChanged)
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// `ChangeSubtitle` to another file of the same length and format between
+/// two chunks: the rest is not read from the other subtitle.
+#[tokio::test]
+async fn a_subtitle_changed_for_another_between_chunks_is_refused() {
+    let (server, client, session) = ready("subtitle-changed-track").await;
+    let other = server.media.with_extension("zz.srt");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, b"bbbbbbbb").unwrap();
+    let (handle, path, version) = first_chunk_read(&server, &client, &session, b"aaaaaaaa").await;
+    set_modified(&other, modified(&path));
+
+    let sidecars = sidecars(&client, &session).await;
+    assert_eq!(sidecars.len(), 2);
+    let response = client
+        .call(
+            Some(&session),
+            Request::ChangeSubtitle {
+                handle: handle.clone(),
+                subtitle: Some(sidecars[1]),
+                bitmap: Default::default(),
+                position_ms: 0,
+            },
+        )
+        .await;
+    assert!(
+        matches!(response, Response::Ok(Reply::PlaybackChanged { .. })),
+        "{response:?}"
+    );
+
+    assert_eq!(
+        read_subtitle(&client, &session, &handle, 4, Some(version)).await,
+        Response::Err(Error::SubtitleChanged)
+    );
+    let (bytes, _, _) = subtitle_chunk(&client, &session, &handle, 0).await;
+    assert_eq!(bytes, b"bbbbbbbb");
     client.close().await;
     server.stop().await;
 }

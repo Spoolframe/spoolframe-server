@@ -17,5 +17,6 @@ pub mod roles;
 pub use probe::{ProbeError, Prober};
 
 pub use descriptor::{
-    AudioStream, MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, VideoStream,
+    AudioStream, MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, VideoRange,
+    VideoStream,
 };

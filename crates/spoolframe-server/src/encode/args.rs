@@ -336,6 +336,23 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 Some(ConvertedVideo::Copy { .. }) => s("0.1"),
                 _ => s(SEGMENT_SECS),
             };
+            // ffmpeg names HEVC in MP4 `hev1`, copied or from any encoder;
+            // Apple's players take only `hvc1`, which is also what the
+            // playlist says (`hls`). The parameter sets are in `init.mp4`
+            // either way.
+            if matches!(
+                spec.video,
+                Some(
+                    ConvertedVideo::Copy {
+                        codec: VideoCodec::Hevc
+                    } | ConvertedVideo::Encode {
+                        codec: VideoCodec::Hevc,
+                        ..
+                    }
+                )
+            ) {
+                args.extend([s("-tag:v"), s("hvc1")]);
+            }
             args.extend([
                 s("-f"),
                 s("hls"),
@@ -399,6 +416,7 @@ mod tests {
                 index: 0,
                 codec: "hevc".into(),
                 profile: Some("Main 10".into()),
+                level: Some(153),
                 width: 3840,
                 height: 2160,
                 pixel_format: Some("yuv420p10le".into()),
@@ -562,6 +580,57 @@ mod tests {
         );
         // Copied video keeps the source's keyframes.
         assert!(!args.contains(&s("-force_key_frames")));
+    }
+
+    fn hls() -> Output {
+        Output::Hls {
+            dir: "/scratch/h/0".into(),
+            start_number: 1,
+        }
+    }
+
+    #[test]
+    fn hevc_in_hls_is_tagged_hvc1_copied_or_encoded() {
+        let film = film();
+        let args = ffmpeg_args(&spec(
+            &film,
+            &encoders(false),
+            COPY_HEVC,
+            COPY_DTS,
+            None,
+            hls(),
+        ))
+        .unwrap();
+        assert!(has(&args, &["-tag:v", "hvc1"]), "{args:?}");
+        // Whatever encodes it: ffmpeg writes `hev1` for all of them.
+        let encode = ConvertedVideo::Encode {
+            codec: VideoCodec::Hevc,
+            height: 1080,
+            max_bitrate: None,
+            tone_map: false,
+        };
+        for vaapi in [false, true] {
+            let enc = encoders(vaapi);
+            let args = ffmpeg_args(&spec(&film, &enc, encode, COPY_DTS, None, hls())).unwrap();
+            assert!(has(&args, &["-tag:v", "hvc1"]), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn only_hevc_in_hls_is_tagged() {
+        let (film, enc) = (film(), encoders(false));
+        // Matroska has no sample entries.
+        let args =
+            ffmpeg_args(&spec(&film, &enc, COPY_HEVC, COPY_DTS, None, progressive())).unwrap();
+        assert!(!args.contains(&s("-tag:v")), "{args:?}");
+        let h264 = ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height: 1080,
+            max_bitrate: None,
+            tone_map: true,
+        };
+        let args = ffmpeg_args(&spec(&film, &enc, h264, COPY_DTS, None, hls())).unwrap();
+        assert!(!args.contains(&s("-tag:v")), "{args:?}");
     }
 
     #[test]

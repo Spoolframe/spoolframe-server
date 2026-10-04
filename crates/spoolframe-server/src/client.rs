@@ -871,7 +871,22 @@ impl ClientProtocol {
                         conversion,
                     },
                 );
-                tracing::info!(%id, user = %user.username, "playback started");
+                // What was decided, so a playback that then goes quiet
+                // can be read from the log; the endpoint as the
+                // connection lines print it.
+                let decided = planner::summary(&plan);
+                tracing::info!(
+                    %id,
+                    user = %user.username,
+                    endpoint = %connection.remote_id().fmt_short(),
+                    plan = %decided.kind,
+                    delivery = %decided.delivery,
+                    video = %decided.video,
+                    audio = %decided.audio,
+                    subtitle = %decided.subtitle,
+                    start_ms = start_ms.unwrap_or(0),
+                    "playback started"
+                );
                 Ok(Reply::PlaybackStarted {
                     handle,
                     plan,
@@ -963,7 +978,11 @@ impl ClientProtocol {
                         what: "an HLS conversion in this playback".into(),
                     })
             }
-            Request::ReadSubtitle { handle, offset } => {
+            Request::ReadSubtitle {
+                handle,
+                offset,
+                version,
+            } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
                 let (path, format) = match playback.subtitle {
                     None => {
@@ -974,11 +993,12 @@ impl ClientProtocol {
                     Some(Sidecar::File { path, format }) => (path, format),
                     Some(Sidecar::Made { state, format }) => (read_text(state).await?, format),
                 };
-                let (bytes, total) = read_subtitle(&path, offset).await?;
-                Ok(Reply::Subtitle {
+                let (bytes, total, version) = read_subtitle(&path, offset, version).await?;
+                Ok(Reply::SubtitleChunk {
                     format,
                     bytes,
                     total,
+                    version,
                 })
             }
             Request::ReadSubtitleSegment { handle, n } => {
@@ -1005,7 +1025,6 @@ impl ClientProtocol {
                 Ok(Reply::Subtitle {
                     format: SubtitleFormat::WebVtt,
                     bytes: hls::subtitle_segment(&vtt, start_ms, end_ms).into_bytes(),
-                    total: None,
                 })
             }
             Request::LookupDeviceSignIn { code } => {
@@ -1659,15 +1678,18 @@ async fn segment_range(
     ))
 }
 
-/// A subtitle file's bytes for one reply, which is one frame (P2-11).
+/// One chunk of a subtitle file (P2-11): at most [`SUBTITLE_CHUNK`] bytes
+/// from `offset`, the file's length and its version. At or past the end
+/// that is no bytes, so a client's loop ends. Only the chunk is read,
+/// however large the file.
 ///
-/// With an `offset`: at most [`SUBTITLE_CHUNK`] bytes from it, and the
-/// file's length. At or past the end that is no bytes, so a client's loop
-/// ends. Only the chunk is read, however large the file.
-///
-/// Without one (an older client): the whole file and no length. A file
-/// that cannot fit a frame is refused by its size alone, not read first.
-async fn read_subtitle(path: &Path, offset: Option<u64>) -> Result<(Vec<u8>, Option<u64>), Error> {
+/// With the `version` of an earlier chunk, a file that is not that one
+/// any more is `SubtitleChanged`, and none of it is read.
+async fn read_subtitle(
+    path: &Path,
+    offset: u64,
+    version: Option<u64>,
+) -> Result<(Vec<u8>, u64, u64), Error> {
     let unreadable = |e: std::io::Error| {
         tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
         Error::Unavailable {
@@ -1675,20 +1697,17 @@ async fn read_subtitle(path: &Path, offset: Option<u64>) -> Result<(Vec<u8>, Opt
         }
     };
     let mut file = tokio::fs::File::open(path).await.map_err(unreadable)?;
-    let total = file.metadata().await.map_err(unreadable)?.len();
+    // Of the open file, not of the path: the version is of the file the
+    // bytes below come from, whatever the path names by then. It is taken
+    // before the bytes, so a write during the read gives the next chunk's
+    // request a version that no longer holds.
+    let metadata = file.metadata().await.map_err(unreadable)?;
+    let now = subtitle_version(&metadata);
+    if version.is_some_and(|read| read != now) {
+        return Err(Error::SubtitleChanged);
+    }
+    let total = metadata.len();
     let mut bytes = Vec::new();
-    let Some(offset) = offset else {
-        let limit = u64::from(codec::MAX_FRAME);
-        if total > limit {
-            tracing::warn!(total, "a subtitle read whole is over the frame limit");
-            return Err(Error::ReplyTooLarge { bytes: total });
-        }
-        // One byte over the limit at most: a file that grew since is still
-        // refused when the frame is written, never cut.
-        let mut whole = file.take(limit + 1);
-        whole.read_to_end(&mut bytes).await.map_err(unreadable)?;
-        return Ok((bytes, None));
-    };
     if offset < total {
         file.seek(std::io::SeekFrom::Start(offset))
             .await
@@ -1696,7 +1715,28 @@ async fn read_subtitle(path: &Path, offset: Option<u64>) -> Result<(Vec<u8>, Opt
         let mut chunk = file.take(SUBTITLE_CHUNK);
         chunk.read_to_end(&mut bytes).await.map_err(unreadable)?;
     }
-    Ok((bytes, Some(total)))
+    Ok((bytes, total, now))
+}
+
+/// A value that names a subtitle file as it is now: another one once the
+/// file is written again (its length or its modification time changes) or
+/// replaced (another inode). A hash, so that a client learns nothing of
+/// the server's disk from it.
+fn subtitle_version(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let mut hash = blake3::Hasher::new();
+    for part in [
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime() as u64,
+        metadata.mtime_nsec() as u64,
+    ] {
+        hash.update(&part.to_le_bytes());
+    }
+    let mut first = [0; 8];
+    first.copy_from_slice(&hash.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(first)
 }
 
 /// The text a reading made: waits for it a while, then tells the client to

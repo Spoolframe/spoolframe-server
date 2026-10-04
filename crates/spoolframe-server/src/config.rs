@@ -214,6 +214,7 @@ pub struct TranscodeConfig {
     #[ucl(default)]
     pub scratch_limit_mb: Option<u64>,
     /// How far an encode may run ahead of its reader; 60 s if left out.
+    /// Any value works: 0 holds the encode whenever its reader is behind.
     #[ucl(default)]
     pub read_ahead_secs: Option<u64>,
 }
@@ -236,6 +237,7 @@ impl TranscodeConfig {
                 .unwrap_or_else(|| state_dir.join("cache").join("transcode")),
             scratch_limit_bytes: self.scratch_limit_mb.unwrap_or(20 * 1024) << 20,
             read_ahead: Duration::from_secs(self.read_ahead_secs.unwrap_or(60)),
+            stalled_after: crate::encode::job::STALLED_AFTER,
         })
     }
 

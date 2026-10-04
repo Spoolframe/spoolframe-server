@@ -1,5 +1,8 @@
 target/
 .dev-state/
+# Your own dev server config: hosts, paths and a listener that fit your
+# machine. Not tracked.
+/dev.ucl
 # The dev server started in the background logs here.
 /dev-server.log
 # dx bundle output.

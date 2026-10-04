@@ -18,7 +18,7 @@ use spoolframe_catalog::{Catalog, CatalogError, Image, ItemPage, ItemWithChildre
 use spoolframe_media::Prober;
 use spoolframe_media::encoders::{FfmpegCommand, TranscodeSettings};
 use spoolframe_media::ocr::Ocr;
-use spoolframe_protocol::codec::{read_frame, write_frame};
+use spoolframe_protocol::codec::{MAX_FRAME, read_frame, write_frame};
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{ArtworkRequest, ArtworkResponse, ArtworkSize};
 use spoolframe_protocol::{
@@ -59,6 +59,10 @@ pub const POSTER: &str = "/library/metadata/1/thumb/1";
 pub fn poster() -> ArtworkId {
     ArtworkId::new(Namespace::Plex, POSTER).unwrap()
 }
+
+/// A search for this finds a movie whose title alone is over a frame: a
+/// reply that cannot be sent.
+pub const A_TITLE_OVER_A_FRAME: &str = "a title over a frame";
 
 /// One library holding one movie, `plex:movie:1`.
 #[derive(Debug)]
@@ -336,6 +340,15 @@ impl Catalog for FakeCatalog {
     }
 
     async fn search(&self, query: &str, _limit: u32) -> Result<Vec<Item>, CatalogError> {
+        if query == A_TITLE_OVER_A_FRAME {
+            let Item::Movie(movie) = movie() else {
+                unreachable!()
+            };
+            return Ok(vec![Item::Movie(Movie {
+                title: "a".repeat(MAX_FRAME as usize),
+                ..movie
+            })]);
+        }
         Ok(
             if "alien".contains(&query.to_lowercase()) && !query.is_empty() {
                 vec![movie()]
@@ -461,6 +474,9 @@ pub struct ServerOptions {
     /// The most all conversions may write together, in bytes.
     pub scratch_limit: u64,
     pub read_ahead: Duration,
+    /// How long an encode may make no progress before it is ended; tests
+    /// of a stalled encode shorten it.
+    pub stalled_after: Duration,
     /// The encoder jobs run: real ffmpeg, or a stand-in script.
     pub ffmpeg: PathBuf,
     /// Read bitmap subtitles as text with real tesseract (P2-07). Off: the
@@ -487,6 +503,7 @@ impl Default for ServerOptions {
             max_jobs: 2,
             scratch_limit: 1 << 30,
             read_ahead: Duration::from_secs(5),
+            stalled_after: spoolframe_server::encode::job::STALLED_AFTER,
             ffmpeg: PathBuf::from("ffmpeg"),
             ocr: false,
             tesseract: PathBuf::from("tesseract"),
@@ -585,6 +602,7 @@ impl TestServer {
                 scratch_dir: dir.join("cache").join("transcode"),
                 scratch_limit_bytes: options.scratch_limit,
                 read_ahead: options.read_ahead,
+                stalled_after: options.stalled_after,
             },
             options.ffmpeg.clone(),
         )

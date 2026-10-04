@@ -33,6 +33,9 @@ pub struct VideoStream {
     pub index: u32,
     pub codec: String,
     pub profile: Option<String>,
+    /// The codec's level as ffprobe gives it: 153 for HEVC 5.1, 41 for
+    /// H.264 4.1; `None` when the file does not say.
+    pub level: Option<u32>,
     pub width: u32,
     pub height: u32,
     pub pixel_format: Option<String>,
@@ -45,6 +48,39 @@ pub struct VideoStream {
     pub bit_depth: u32,
     /// The HDR format, `None` for SDR.
     pub hdr: Option<HdrFormat>,
+}
+
+/// The transfer function of the picture, as HLS names it (`VIDEO-RANGE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoRange {
+    Sdr,
+    /// SMPTE ST 2084: HDR10, and what Dolby Vision profile 8.1 is under
+    /// its own layer.
+    Pq,
+    /// ARIB STD-B67.
+    Hlg,
+}
+
+impl VideoRange {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sdr => "SDR",
+            Self::Pq => "PQ",
+            Self::Hlg => "HLG",
+        }
+    }
+}
+
+impl VideoStream {
+    /// From the transfer function, not from `hdr`: Dolby Vision is over
+    /// either PQ or HLG.
+    pub fn range(&self) -> VideoRange {
+        match self.color_transfer.as_deref() {
+            Some("smpte2084") => VideoRange::Pq,
+            Some("arib-std-b67") => VideoRange::Hlg,
+            _ => VideoRange::Sdr,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -130,6 +166,8 @@ impl MediaDescriptor {
                         index,
                         codec: v.codec_name.clone(),
                         profile: v.profile.clone(),
+                        // ffprobe says -99 for a level it does not know.
+                        level: u32::try_from(v.level).ok().filter(|&l| l > 0),
                         width: dimension(v.width),
                         height: dimension(v.height),
                         pixel_format: v.pix_fmt.clone(),
@@ -343,6 +381,19 @@ mod tests {
         let sdr = describe("b99-s07e01").video.unwrap();
         assert_eq!(sdr.hdr, None);
         assert_eq!(sdr.bit_depth, 8);
+    }
+
+    #[test]
+    fn the_level_and_the_range_are_read() {
+        // HEVC Main 10 at level 5.1, PQ.
+        let hdr = describe("mkv-cover-art").video.unwrap();
+        assert_eq!(hdr.level, Some(153));
+        assert_eq!(hdr.range(), VideoRange::Pq);
+        let mut sdr = describe("b99-s07e01").video.unwrap();
+        assert_eq!(sdr.level, Some(40));
+        assert_eq!(sdr.range(), VideoRange::Sdr);
+        sdr.color_transfer = Some("arib-std-b67".into());
+        assert_eq!(sdr.range(), VideoRange::Hlg);
     }
 
     #[test]
