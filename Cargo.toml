@@ -72,6 +72,12 @@ webauthn-rs = { version = "0.5.5", features = ["conditional-ui"] }
 webauthn-rs-proto = "0.5.5"
 # Credential ids, as base64url text.
 base64 = "0.22"
+# SSO (P3-04): the OpenID Connect client, which checks ID tokens itself
+# (issuer, audience, expiry, nonce, signature from the provider's keys).
+# Its own reqwest feature, on the reqwest 0.12 the server already has.
+openidconnect = { version = "4", default-features = false, features = ["reqwest"] }
+# The stand-in provider's ID token times, in tests (openidconnect's own).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # The software authenticator the passkey tests sign with.
 webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softtoken"] }
 

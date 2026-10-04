@@ -7,16 +7,26 @@
 //! time, as P2-07's subtitle text is) and the interval: a replaced file
 //! gets new previews, and the old ones age out of the cache.
 //!
-//! One file is made at a time, by one worker, at the lowest CPU and I/O
-//! priority, and outside the conversion slots (`transcode.max_jobs`), so
-//! a playback never waits for previews, and never finds the server busy
-//! because of them. A playback, or a client asking, puts its item at the
-//! front of the queue; the queue does not preempt the file being made.
+//! Every ffmpeg run is at the lowest CPU and I/O priority, and outside
+//! the conversion slots (`transcode.max_jobs`), so a playback never waits
+//! for previews, and never finds the server busy because of them.
+//!
+//! Two kinds of work, each with its own workers:
+//!
+//! - Made ahead (`when = ahead`): up to `previews.workers` files at once
+//!   (the physical cores by default, [`workers`]), only while no encode
+//!   runs. When one starts, each file being made stops before its next
+//!   tile and waits, keeping the tiles it has; when the last one ends,
+//!   they go on from there.
+//! - Played, or asked for by a client: one file at a time, at once,
+//!   encodes or not. A file being made ahead that is then played goes on
+//!   at once too, where it is.
 
 pub mod ahead;
 pub mod cache;
 pub mod make;
 pub mod sheets;
+pub mod workers;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -28,10 +38,11 @@ use spoolframe_catalog::{Catalog, CatalogError, PreviewFrame};
 use spoolframe_media::codecs;
 use spoolframe_media::{Prober, VideoRange};
 use spoolframe_types::{ArtworkId, MediaId, MediaKind, Namespace};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use self::cache::Cache;
 pub use self::cache::SetMeta;
+use crate::encode::Encoding;
 use crate::transcode::Transcoding;
 
 /// When previews are made (`previews.when`).
@@ -54,6 +65,8 @@ pub struct PreviewSettings {
     pub interval: Duration,
     /// The most the cache may hold.
     pub cache_limit_bytes: u64,
+    /// Files made ahead at once, while no encode runs.
+    pub workers: usize,
 }
 
 /// Where an item's previews are.
@@ -68,20 +81,34 @@ pub enum PreviewState {
     None,
 }
 
+/// A file being made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Making {
+    /// How far it has got.
+    done_percent: u8,
+    /// Played or asked for: made though encodes run.
+    urgent: bool,
+    /// Held back before its next tile while an encode runs.
+    paused: bool,
+}
+
 #[derive(Debug, Default)]
 struct Queue {
-    /// Played or asked for: first.
+    /// Played or asked for: one at a time, encodes or not.
     urgent: VecDeque<MediaId>,
-    /// Made ahead (`when = ahead`): while nothing is urgent.
+    /// Made ahead (`when = ahead`): `workers` at a time, while no encode
+    /// runs.
     ahead: VecDeque<MediaId>,
     queued: HashSet<MediaId>,
-    /// Being made now, and how far it has got.
-    current: Option<(MediaId, u8)>,
+    /// Being made now.
+    making: HashMap<MediaId, Making>,
 }
 
 impl Queue {
     fn push(&mut self, id: &MediaId, urgent: bool) {
-        if self.current.as_ref().is_some_and(|(c, _)| c == id) {
+        if let Some(making) = self.making.get_mut(id) {
+            // Played while being made ahead: on at once, where it is.
+            making.urgent |= urgent;
             return;
         }
         if self.queued.contains(id) {
@@ -112,20 +139,35 @@ impl Queue {
         }
     }
 
-    fn pop(&mut self) -> Option<(MediaId, bool)> {
-        let (id, urgent) = match self.urgent.pop_front() {
-            Some(id) => (id, true),
-            None => (self.ahead.pop_front()?, false),
-        };
+    /// The next file played or asked for, now being made.
+    fn pop_urgent(&mut self) -> Option<MediaId> {
+        let id = self.urgent.pop_front()?;
+        Some(self.start(id, true))
+    }
+
+    /// The next file to make ahead, now being made.
+    fn pop_ahead(&mut self) -> Option<MediaId> {
+        let id = self.ahead.pop_front()?;
+        Some(self.start(id, false))
+    }
+
+    fn start(&mut self, id: MediaId, urgent: bool) -> MediaId {
         self.queued.remove(&id);
-        self.current = Some((id.clone(), 0));
-        Some((id, urgent))
+        self.making.insert(
+            id.clone(),
+            Making {
+                done_percent: 0,
+                urgent,
+                paused: false,
+            },
+        );
+        id
     }
 
     fn progress(&self, id: &MediaId) -> Option<u8> {
-        match &self.current {
-            Some((current, done)) if current == id => Some(*done),
-            _ => self.queued.contains(id).then_some(0),
+        match self.making.get(id) {
+            Some(making) => Some(making.done_percent),
+            None => self.queued.contains(id).then_some(0),
         }
     }
 }
@@ -137,6 +179,8 @@ pub struct PreviewSources {
     /// The hardware decoders P2-02 found.
     pub transcoding: Arc<Transcoding>,
     pub ffmpeg: PathBuf,
+    /// The encodes running, which previews made ahead wait for.
+    pub encoding: Encoding,
 }
 
 pub struct Previews {
@@ -144,7 +188,11 @@ pub struct Previews {
     dir: PathBuf,
     settings: Mutex<PreviewSettings>,
     sources: PreviewSources,
+    /// What makes the tiles: ffmpeg, but in tests.
+    maker: Arc<dyn make::MakeTile>,
     queue: Mutex<Queue>,
+    /// Woken (all waiters) when anything is queued, a setting changes,
+    /// or the previews stop.
     wake: Arc<Notify>,
     /// Sets that could not be made, by key, and why: not tried again
     /// until the file changes or the server restarts.
@@ -164,11 +212,29 @@ impl std::fmt::Debug for Previews {
 }
 
 impl Previews {
-    /// Previews kept in `dir`, made by a worker started here.
+    /// Previews kept in `dir`, made by workers started here.
     pub fn start(
         dir: &Path,
         settings: PreviewSettings,
         sources: PreviewSources,
+    ) -> std::io::Result<Arc<Self>> {
+        let maker = Arc::new(make::Ffmpeg(sources.ffmpeg.clone()));
+        let default = workers::default_workers();
+        tracing::info!(
+            workers = settings.workers,
+            default = default.count,
+            counted = %default.counted,
+            "previews made ahead at once"
+        );
+        Self::start_with(dir, settings, sources, maker)
+    }
+
+    /// [`Previews::start`], making tiles with `maker`.
+    fn start_with(
+        dir: &Path,
+        settings: PreviewSettings,
+        sources: PreviewSources,
+        maker: Arc<dyn make::MakeTile>,
     ) -> std::io::Result<Arc<Self>> {
         let cache = Cache::open(dir, settings.cache_limit_bytes)?;
         let work = dir.join(WORK);
@@ -180,12 +246,21 @@ impl Previews {
             dir: dir.to_owned(),
             settings: Mutex::new(settings),
             sources,
+            maker,
             queue: Mutex::default(),
             wake: Arc::default(),
             failed: Mutex::default(),
             stopped: AtomicBool::new(false),
         });
-        tokio::spawn(work_loop(Arc::downgrade(&previews), previews.wake.clone()));
+        tokio::spawn(urgent_loop(
+            Arc::downgrade(&previews),
+            previews.wake.clone(),
+        ));
+        tokio::spawn(ahead_loop(
+            Arc::downgrade(&previews),
+            previews.wake.clone(),
+            previews.sources.encoding.watch(),
+        ));
         Ok(previews)
     }
 
@@ -194,7 +269,8 @@ impl Previews {
     }
 
     /// Use `settings` from now on. A new interval names new sets; a lower
-    /// limit evicts at once; `never` empties the queue.
+    /// limit evicts at once; `never` empties the queue; more workers start
+    /// at once, and with fewer the files being made are finished.
     pub fn set_settings(&self, settings: PreviewSettings) {
         self.cache.set_limit(settings.cache_limit_bytes);
         let mut queue = self.queue.lock().expect("never poisoned");
@@ -211,7 +287,9 @@ impl Previews {
             }
             When::Ahead => {}
         }
+        drop(queue);
         *self.settings.lock().expect("never poisoned") = settings;
+        self.wake.notify_waiters();
     }
 
     /// Make nothing more: the file being made is given up after its tile
@@ -223,7 +301,7 @@ impl Previews {
         queue.ahead.clear();
         queue.queued.clear();
         drop(queue);
-        self.wake.notify_one();
+        self.wake.notify_waiters();
     }
 
     /// Bytes in the cache now.
@@ -237,7 +315,7 @@ impl Previews {
 
     fn enqueue(&self, id: &MediaId, urgent: bool) {
         self.lock_queue().push(id, urgent);
-        self.wake.notify_one();
+        self.wake.notify_waiters();
     }
 
     /// `id` is being played: make its previews next, unless they are off.
@@ -256,7 +334,7 @@ impl Previews {
         }
         self.lock_queue()
             .ahead_of_the_rest(ids.into_iter().filter(has_pictures));
-        self.wake.notify_one();
+        self.wake.notify_waiters();
     }
 
     /// [`Previews::stop`] was called.
@@ -292,7 +370,7 @@ impl Previews {
         queue.push(id, true);
         let done_percent = queue.progress(id).unwrap_or(0);
         drop(queue);
-        self.wake.notify_one();
+        self.wake.notify_waiters();
         Ok(PreviewState::Making { done_percent })
     }
 
@@ -301,20 +379,69 @@ impl Previews {
         self.cache.sheet(key, n).await
     }
 
-    /// Make the next item's previews, if anything waits. `false` when the
-    /// queue is empty.
-    async fn work_once(&self) -> bool {
+    /// Make the next played or asked-for item's previews, if one waits.
+    /// `false` when none does.
+    async fn work_urgent(&self) -> bool {
         if self.stopped.load(Ordering::SeqCst) {
             return false;
         }
-        let Some((id, urgent)) = self.lock_queue().pop() else {
+        let Some(id) = self.lock_queue().pop_urgent() else {
             return false;
         };
-        if let Err(e) = self.make(&id, urgent).await {
+        self.work(&id, true).await;
+        true
+    }
+
+    /// Make `id`'s previews, which [`Queue::pop_urgent`] or
+    /// [`Queue::pop_ahead`] marked as being made.
+    async fn work(&self, id: &MediaId, urgent: bool) {
+        if let Err(e) = self.make(id, urgent).await {
             tracing::warn!(%id, error = %e, "cannot make previews");
         }
-        self.lock_queue().current = None;
-        true
+        self.lock_queue().making.remove(id);
+    }
+
+    /// Whether `id` may make its next tile now, once it may: at once when
+    /// it is played or asked for, or no encode runs; otherwise when the
+    /// last encode ends, or it is played. `false` when the previews stop.
+    async fn go_on(&self, id: &MediaId) -> bool {
+        let mut encoding = self.sources.encoding.watch();
+        let mut paused = false;
+        loop {
+            let woken = self.wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if self.stopped.load(Ordering::SeqCst) {
+                return false;
+            }
+            let urgent = self
+                .lock_queue()
+                .making
+                .get(id)
+                .is_none_or(|making| making.urgent);
+            if urgent || *encoding.borrow_and_update() == 0 {
+                if paused {
+                    self.set_paused(id, false);
+                    tracing::debug!(%id, "previews made ahead go on");
+                }
+                return true;
+            }
+            if !paused {
+                paused = true;
+                self.set_paused(id, true);
+                tracing::debug!(%id, "previews made ahead wait for the encodes to end");
+            }
+            tokio::select! {
+                _ = encoding.changed() => {}
+                () = &mut woken => {}
+            }
+        }
+    }
+
+    fn set_paused(&self, id: &MediaId, paused: bool) {
+        if let Some(making) = self.lock_queue().making.get_mut(id) {
+            making.paused = paused;
+        }
     }
 
     async fn make(&self, id: &MediaId, urgent: bool) -> Result<(), String> {
@@ -442,16 +569,14 @@ impl Previews {
             .await
             .map_err(|e| e.to_string())?;
         let made = make::tiles(
-            &self.sources.ffmpeg,
+            self.maker.as_ref(),
             &source,
             interval,
             &work,
-            &self.stopped,
+            || self.go_on(id),
             &|done, total| {
-                if let Some((current, percent)) = &mut self.lock_queue().current
-                    && current == id
-                {
-                    *percent = (done * 100 / total.max(1)).min(99) as u8;
+                if let Some(making) = self.lock_queue().making.get_mut(id) {
+                    making.done_percent = (done * 100 / total.max(1)).min(99) as u8;
                 }
             },
         )
@@ -463,17 +588,18 @@ impl Previews {
 
 impl Drop for Previews {
     fn drop(&mut self) {
-        // The worker holds only a weak reference: wake it to find that
+        // The workers hold only a weak reference: wake them to find that
         // the previews are gone, and end.
-        self.wake.notify_one();
+        self.wake.notify_waiters();
     }
 }
 
 /// Where tiles are made, under the cache; emptied at start.
 const WORK: &str = "work";
 
-/// One item after another, for as long as the previews exist.
-async fn work_loop(previews: Weak<Previews>, wake: Arc<Notify>) {
+/// Played and asked-for items, one after another, for as long as the
+/// previews exist.
+async fn urgent_loop(previews: Weak<Previews>, wake: Arc<Notify>) {
     loop {
         let notified = wake.notified();
         tokio::pin!(notified);
@@ -484,12 +610,52 @@ async fn work_loop(previews: Weak<Previews>, wake: Arc<Notify>) {
         if previews.stopped.load(Ordering::SeqCst) {
             return;
         }
-        let worked = previews.work_once().await;
+        let worked = previews.work_urgent().await;
         drop(previews);
         if !worked {
             notified.await;
         }
     }
+}
+
+/// Items made ahead, up to `workers` at once, started only while no
+/// encode runs, for as long as the previews exist.
+async fn ahead_loop(
+    previews: Weak<Previews>,
+    wake: Arc<Notify>,
+    mut encoding: watch::Receiver<usize>,
+) {
+    let mut running = tokio::task::JoinSet::new();
+    loop {
+        let notified = wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let Some(now) = previews.upgrade() else {
+            break;
+        };
+        if now.stopped.load(Ordering::SeqCst) {
+            break;
+        }
+        let workers = now.settings().workers;
+        while running.len() < workers && *encoding.borrow_and_update() == 0 {
+            let Some(id) = now.lock_queue().pop_ahead() else {
+                break;
+            };
+            let previews = now.clone();
+            running.spawn(async move { previews.work(&id, false).await });
+        }
+        drop(now);
+        tokio::select! {
+            () = &mut notified => {}
+            Some(_) = running.join_next(), if !running.is_empty() => {}
+            changed = encoding.changed() => if changed.is_err() {
+                break;
+            },
+        }
+    }
+    // Stopping: those being made give up before their next tile, and
+    // remove their work.
+    while running.join_next().await.is_some() {}
 }
 
 /// Sheet `n` of the set under `key`, as clients fetch it on the artwork

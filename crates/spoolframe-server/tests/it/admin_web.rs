@@ -150,7 +150,7 @@ async fn a_signed_out_page_learns_the_server_s_name_and_public_url() {
         .unwrap();
     assert_eq!(
         site,
-        json!({ "name": "Den", "publicUrl": null, "insecureCookies": false })
+        json!({ "name": "Den", "publicUrl": null, "insecureCookies": false, "sso": [] })
     );
     let (addr, _dir) =
         crate::admin::server_at("web-site-public", "https://media.example.org").await;

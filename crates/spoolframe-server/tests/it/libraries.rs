@@ -942,6 +942,7 @@ async fn a_film_s_previews_come_from_its_own_plex_server_s_index() {
             when: spoolframe_server::previews::When::OnPlay,
             interval: std::time::Duration::from_secs(10),
             cache_limit_bytes: 1 << 30,
+            workers: 1,
         },
         previews_ffmpeg: "/nonexistent/ffmpeg".into(),
         ..ServerOptions::default()

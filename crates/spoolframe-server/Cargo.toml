@@ -54,6 +54,7 @@ tokio = { workspace = true }
 uclicious = { workspace = true }
 webauthn-rs = { workspace = true }
 webauthn-rs-proto = { workspace = true }
+openidconnect = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
@@ -65,6 +66,8 @@ m3u8-rs = { workspace = true }
 futures-util = { workspace = true }
 spoolframe-client-sdk = { workspace = true }
 webauthn-authenticator-rs = { workspace = true }
+# The stand-in OpenID Connect provider's token times (P3-04).
+chrono = { workspace = true }
 # PGS tracks for the OCR tests.
 spoolframe-media = { workspace = true, features = ["fixtures"] }
 # Paused time, for the Plex sync's schedule.

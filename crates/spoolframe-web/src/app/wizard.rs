@@ -1398,6 +1398,7 @@ fn PlaybackFields(
             .unwrap_or_default()
     });
     let ahead = use_signal(|| text(&settings, "transcode.read_ahead_secs"));
+    let workers = use_signal(|| text(&settings, "previews.workers"));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let s = settings.clone();
@@ -1419,6 +1420,10 @@ fn PlaybackFields(
                 ("transcode.max_jobs", number("Encodes at once", &jobs())?),
                 ("transcode.scratch_limit_mb", scratch),
                 ("transcode.read_ahead_secs", number("Read ahead", &ahead())?),
+                (
+                    "previews.workers",
+                    number("Previews made at once", &workers())?,
+                ),
             ])
         })();
         let changes = match changes {
@@ -1451,6 +1456,11 @@ fn PlaybackFields(
         .map(|s| s.ocr_languages.clone())
         .unwrap_or_default();
     let hw_locked = locked(&settings, "transcode.hardware");
+    // Worked out from the server's CPUs, so the server says it.
+    let workers_default = match status.as_ref().map(|s| s.preview_workers_default) {
+        Some(d) => format!("Default {} ({})", d.count, d.counted.label()),
+        None => "Default: one per physical core".to_owned(),
+    };
     let choice = |here: bool| if here { "choice choice-here" } else { "choice" };
     rsx! {
         if mode == Mode::Wizard {
@@ -1541,6 +1551,16 @@ fn PlaybackFields(
                     Limit { label: "Read ahead", value: ahead, unit: "s", disabled: locked(&settings, "transcode.read_ahead_secs") }
                     span { class: "text-xs text-ctp-subtext0", "Default 60 s · how far an encode may run ahead of the player" }
                     Note { settings: settings.clone(), setting: "transcode.read_ahead_secs", on_changed: move |_| on_reload.call(()) }
+                }
+            }
+        }
+        div { class: "flex flex-col gap-2",
+            h2 { "Frame previews" }
+            div { class: "limits",
+                div { class: "flex flex-col gap-1.5",
+                    Limit { label: "Made at once", value: workers, unit: "", disabled: locked(&settings, "previews.workers") }
+                    span { class: "text-xs text-ctp-subtext0", "{workers_default} · files made ahead together, only while nothing is converted" }
+                    Note { settings: settings.clone(), setting: "previews.workers", on_changed: move |_| on_reload.call(()) }
                 }
             }
         }

@@ -111,6 +111,29 @@ admin {
   insecure_cookies = false;
 }
 
+# Single sign-on (P3-04): OpenID Connect providers a user may link to
+# their account in My profile, and then sign in with ("Continue with
+# <name>"). A provider never makes accounts: an identity not linked to a
+# user is refused. Each needs admin.public_url, since the provider sends
+# the browser back to <public_url>/auth/oidc/callback; register that as
+# the client's redirect URI, with PKCE, scopes "openid profile email".
+# Everything else about a provider (its endpoints, keys, how the client
+# authenticates, PKCE) comes from its discovery document, at
+# <issuer>/.well-known/openid-configuration, whose issuer must be exactly
+# the one configured. Left out, no SSO anywhere.
+#
+# auth {
+#   oidc [
+#     { name = "Pocket ID"; issuer = "https://id.example.org";
+#       client_id = "…";
+#       # A file holding the client secret. Left out, the secret set in
+#       # the web UI, kept as secrets/oidc-<name> in the state directory.
+#       client_secret_file = "/run/secrets/spoolframe-oidc";
+#       # What is asked for; openid is always.
+#       scopes = ["openid", "profile", "email"]; },
+#   ]
+# }
+
 # The artwork cache under the state directory, in MiB.
 artwork {
   cache_mb = 1024;
@@ -157,9 +180,9 @@ subtitles {
 }
 
 # Frame previews for scrubbing: a picture every interval_secs of each film
-# and episode, made in the background, one file at a time, at the lowest
-# CPU and I/O priority. Where a Plex server already made its own preview
-# index for a file, it is read from Plex instead.
+# and episode, made in the background at the lowest CPU and I/O priority.
+# Where a Plex server already made its own preview index for a file, it is
+# read from Plex instead.
 previews {
   # "ahead": for every file, newest and in-progress first, until the cache
   # is full, and at once for anything played; "on_play": only for what is
@@ -170,4 +193,9 @@ previews {
   # take, in MiB; the least recently used go first. A two-hour film's are
   # a few MiB.
   cache_mb = 4096;
+  # Files made ahead at once, only while nothing is being encoded: they
+  # wait while an encode runs, and go on where they were when it ends.
+  # What is played, or asked for, is made at once, encodes or not. The
+  # physical cores the server may use if left out.
+  # workers = 8;
 }

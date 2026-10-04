@@ -226,6 +226,25 @@ impl Store {
         .await?)
     }
 
+    /// Revoke every live session of `user`'s but `keep` (a token hash):
+    /// "sign out everywhere else" (P3-03). How many were revoked.
+    pub async fn revoke_other_sessions(
+        &self,
+        user: LocalUserId,
+        keep: &str,
+    ) -> Result<u64, StoreError> {
+        Ok(sqlx::query(
+            "UPDATE sessions SET revoked_at = ?3 \
+             WHERE user_id = ?1 AND token_hash != ?2 AND revoked_at IS NULL",
+        )
+        .bind(user.0)
+        .bind(keep)
+        .bind(now())
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
     /// Revoke one session. Revoking an unknown or already revoked one is
     /// not an error.
     pub async fn revoke_session(&self, token_hash: &str) -> Result<(), StoreError> {
@@ -409,6 +428,40 @@ mod tests {
         assert_eq!(hashes, ["a", "b"]);
         let device = listed.iter().find(|s| s.token_hash == "a").unwrap();
         assert_eq!(device.device_name.as_deref(), Some("device t"));
+    }
+
+    #[tokio::test]
+    async fn signing_out_everywhere_else_keeps_only_the_one_session() {
+        let (store, alice) = store_with_alice("others").await;
+        let bob = store
+            .add_user("bob", None, "phc", Role::Consumer)
+            .await
+            .unwrap();
+        for (hash, binding) in [
+            ("web", SessionBinding::Api),
+            ("cli", SessionBinding::Api),
+            ("tv", endpoint("t")),
+        ] {
+            store
+                .create_session(hash, alice, &binding, now() + 60)
+                .await
+                .unwrap();
+        }
+        store
+            .create_session("bobs", bob, &SessionBinding::Api, now() + 60)
+            .await
+            .unwrap();
+        assert_eq!(store.revoke_other_sessions(alice, "web").await.unwrap(), 2);
+        let left: Vec<_> = store
+            .list_sessions(alice)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.token_hash)
+            .collect();
+        assert_eq!(left, ["web"]);
+        // Nobody else's.
+        assert_eq!(store.list_sessions(bob).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -63,6 +63,7 @@ pub const SETTINGS: &[Setting] = &[
     restart("admin.public_url"),
     restart("admin.trusted_proxies"),
     live("admin.insecure_cookies"),
+    live("auth.oidc"),
     restart("artwork.cache_mb"),
     live("watch.started_after_secs"),
     live("watch.watched_percent"),
@@ -81,6 +82,7 @@ pub const SETTINGS: &[Setting] = &[
     live("previews.when"),
     live("previews.interval_secs"),
     live("previews.cache_mb"),
+    live("previews.workers"),
 ];
 
 /// The setting called `key`, if there is one.

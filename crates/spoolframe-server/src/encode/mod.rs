@@ -12,13 +12,15 @@ use std::time::Duration;
 use spoolframe_media::encoders::Encoders;
 use spoolframe_media::{MediaDescriptor, codecs};
 use spoolframe_protocol::{
-    ConvertedAudio, ConvertedSubtitle, ConvertedVideo, ManifestKind, PlaybackPlan, SubtitleAction,
+    AudioAction, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, ManifestKind, PlaybackPlan,
+    SubtitleAction,
 };
 use spoolframe_types::{Delivery, SubtitleFormat};
 
 use self::args::{EncodeSpec, Output, ffmpeg_args};
 use self::hls::Segments;
 use self::job::{EncodeJob, JobError, Jobs, Slot, Written};
+pub use self::job::{Encoding, EncodingGuard};
 
 /// What the server allows encodes (`transcode { … }`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,12 +409,64 @@ fn spawn(
         0
     };
     let start_ms = start.map_or(0, |s| s.as_millis() as u64);
-    jobs.start(job_dir, args, written, epoch, first_segment, start_ms, slot)
+    jobs.start(
+        job_dir,
+        args,
+        written,
+        encodes(video, audio),
+        epoch,
+        first_segment,
+        start_ms,
+        slot,
+    )
+}
+
+/// Whether a conversion decodes and encodes a stream again, rather than
+/// only copying them into another container: what holds back frame
+/// previews made ahead (P3-13). A burned-in subtitle is an encoded video.
+fn encodes(video: Option<ConvertedVideo>, audio: Option<ConvertedAudio>) -> bool {
+    matches!(video, Some(ConvertedVideo::Encode { .. }))
+        || matches!(
+            audio,
+            Some(ConvertedAudio {
+                action: AudioAction::Encode { .. },
+                ..
+            })
+        )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_stream_encoded_again_is_encoding() {
+        use spoolframe_types::{AudioCodec, VideoCodec};
+        let copy_video = Some(ConvertedVideo::Copy {
+            codec: VideoCodec::H264,
+        });
+        let encode_video = Some(ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height: 720,
+            max_bitrate: None,
+            tone_map: false,
+        });
+        let audio = |action| Some(ConvertedAudio { index: 1, action });
+        let copy_audio = audio(AudioAction::Copy {
+            codec: AudioCodec::Aac,
+        });
+        // A remux: into another container as it is.
+        assert!(!encodes(copy_video, copy_audio));
+        assert!(!encodes(copy_video, None));
+        assert!(encodes(encode_video, copy_audio));
+        let encode_audio = audio(AudioAction::Encode {
+            codec: AudioCodec::Aac,
+            channels: 2,
+            bitrate: 192_000,
+        });
+        assert!(encodes(copy_video, encode_audio));
+        assert!(encodes(None, encode_audio));
+    }
 
     #[test]
     fn a_copied_restart_aims_halfway_into_the_segment() {

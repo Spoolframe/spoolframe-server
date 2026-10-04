@@ -953,3 +953,124 @@
   minutes, ahead of the rest, so an item added to Plex gets previews
   soon; every library is walked at start, when `ahead` is turned on, and
   every 6 hours.
+- My profile's account, PIN, devices and playback on the server (P3-03).
+  `me.setDisplayName` (64 characters on one line; blank is the
+  username), which clients show at their next `WhoAmI`;
+  `me.revokeOtherSessions` ("sign out everywhere else": every other
+  session of the caller's, web, CLI and devices); `me.trackPreferences`
+  and `me.setTrackPreferences` (the P1-20 preferences a device's next
+  playback uses); `me.trackOverrides` (each series' or movie's pick,
+  with its title when the catalog answers within 3 s) and
+  `me.clearTrackOverride`. `UserInfo.passwordChangedAt`. `me.pinSet`,
+  `me.pinClear`, and `me.setPinRequired` turning the PIN off on a device,
+  now need a recent sign-in (`RECENT_SIGN_IN_REQUIRED`), as P3-03 says
+  of the PIN; asking for it on a device still needs only the session.
+- My profile in full in the web UI (P3-03), as the WebProfile,
+  WebProfilePhone and WebAdminProfile boards draw it. A consumer gets no
+  sidebar: a slim bar (the mark, the server's name, the avatar and Sign
+  out) over one 720 px column, avatar and "Name · username" at its head,
+  then Account, Sign-in methods, Plex account, Devices and sessions,
+  Profile PIN and Playback. An admin keeps My profile in the admin shell,
+  in two columns. Account edits the display name (the bar follows) and
+  says when the password last changed. Profile PIN sets, changes and
+  removes it and switches it on or off per device. Devices and sessions
+  lists every live session with "Sign out", and "Sign out everywhere
+  else" after asking. Playback sets the audio language (one language, or
+  one then the original; a list a device set is kept as its own choice),
+  avoiding audio description and commentary, when subtitles show, their
+  language and SDH, saved as each is chosen, and lists each series' or
+  movie's pick with "Reset". A change that needs a recent sign-in asks
+  "Confirm it's you" first, with the password or a passkey, then goes on.
+- Single sign-on with OpenID Connect on the server (P3-04). Config, live:
+  `auth { oidc [ { name; issuer; client_id; client_secret_file; } ] }`
+  (setting `auth.oidc`); the issuer is HTTPS (HTTP on loopback only),
+  names and issuers are unique, and any provider needs
+  `admin.public_url`, whose `/auth/oidc/callback` is the redirect URI.
+  Without `client_secret_file` the client secret is the one set with
+  `admin.ssoSetClientSecret`, kept as `secrets/oidc-<name>`; never shown
+  or logged. The server is the provider's confidential client with
+  `openidconnect`: authorization code with PKCE (S256), `state` and
+  `nonce`, the discovery document (kept a minute), and the ID token
+  checked for its signature against the provider's own keys (no HMAC,
+  never unsigned), issuer, audience, expiry and nonce. A flow is begun
+  with `POST /auth/oidc/begin {provider, purpose}` (`signIn`; `link`,
+  which needs a recent sign-in; `confirm`, which renews one), lives 10
+  minutes in memory, is good once, and is bound to the browser that
+  began it by a `SameSite=Lax` cookie of its own. `GET
+  /auth/oidc/callback` always redirects: signed in to `/` with the
+  session cookie, or back to `/login` or `/profile` with `?sso=` saying
+  what happened (`linked`, `unlinked`, `taken`, `already`, `confirmed`,
+  `notyours`, `failed`, `unavailable`, `expired`, `cancelled`) and
+  `&provider=`. SSO never makes or finds an account: an identity
+  (issuer and subject, never email) signs in only the user who linked
+  it, one per provider per user, and an identity linked to one user is
+  refused to another. New table `external_identities`. `me.ssoLinks`,
+  `me.ssoUnlink` (recent sign-in), `admin.userSsoLinks`,
+  `admin.userSsoUnlink`; no way to link for someone else. Unlinking, and
+  removing a passkey, keep the user's last way to sign in
+  (`LAST_SIGN_IN_METHOD`). `UserInfo.hasSso`, `/auth/site`'s `sso` (the
+  providers' names; none without a public URL), error codes
+  `NO_SUCH_LINK` and `LINK_REFUSED`. A provider that cannot be reached
+  fails SSO with "<name> can't be reached right now"; passwords,
+  passkeys and sessions are untouched. Tested against a stand-in
+  provider with its own keys.
+- The web UI's marks are the full logo (the reel in its four frame
+  corners) at every size: the admin sidebar, a consumer's top bar and the
+  phone bars too, not only the signed-out cards. The three-hole reel is
+  the favicon's alone.
+- Sign-in providers in the web UI (P3-04), as the WebLogin,
+  WebLoginPhone, WebProfile and WebUserSessions boards draw them. The
+  login page has "Continue with <name>" for each provider and says "A
+  sign-in provider only works once it is linked in My profile"; an
+  account that is not linked gets the board's alert. My profile's
+  Sign-in methods card lists the providers ("Link <name>", or the linked
+  account and "Unlink"; a link to a provider no longer set up is shown,
+  to unlink), and says what the provider's callback did. "Confirm it's
+  you" offers "Continue with <name>" for a provider the user has linked,
+  so a user whose only way in is SSO can still make sensitive changes.
+  An admin's user page lists the user's linked accounts with Unlink, and
+  the users list counts a provider as a way in. The page reads the
+  callback's `?sso=` before the router starts, and takes it out of the
+  address.
+- A sign-in provider is what its discovery document says (P3-04): the
+  token endpoint is called with `client_secret_basic` where offered, else
+  `client_secret_post` (one offering neither is refused); PKCE is S256,
+  and a provider offering only `plain` is refused; a document whose
+  `issuer` is not exactly the configured one is refused, naming both.
+  `auth.oidc[].scopes`, `["openid", "profile", "email"]` if left out
+  (`openid` always). A link shows the account's `preferred_username`,
+  else its email; it is matched by issuer and subject only. The flow's
+  cookie follows `admin.insecure_cookies` as the session's does, so SSO
+  works over a plain-HTTP `public_url` with insecure cookies on.
+- NixOS module: `services.spoolframe.auth.oidc = [ { name; issuer;
+  clientId; clientSecretFile; scopes; } ]` (P3-04), written to the locked
+  config's `auth.oidc`, each secret passed as a systemd credential
+  (`oidc-<n>`) so its file can stay root-only. It asserts
+  `admin.publicUrl` is set.
+- Previews made ahead run beside each other and give way to encodes
+  (P3-13). `previews.workers` (live) is how many files are made ahead at
+  once; left out, it is the physical cores the server may use (read from
+  sysfs' `core_cpus_list`, no more than `available_parallelism`, the
+  logical CPUs where the cores are not known), which the log says at
+  start and Settings › Playback shows ("Default 16 (physical cores)";
+  `ServerStatus.previewWorkersDefault` in the admin API). They start only
+  while no encode runs (a conversion that encodes a stream; a remux does
+  not count), and one being made when an encode starts waits before its
+  next tile, keeping those it has, and goes on from there when the last
+  encode ends. A played or asked-for item is made at once, one at a
+  time, encodes or not; one waiting in the ahead queue moves to it, and
+  one being made ahead goes on at once where it is. Every tile is still
+  nice 19 and the idle I/O class.
+- A sign-in with a provider begun on the device approval page returns
+  to it (P3-04, P3-06). `POST /auth/oidc/begin` takes an optional
+  `return_to` for `signIn`: a path on this server with its query, starting
+  with one `/`, of visible ASCII without a backslash, and still a path
+  here once resolved (`/../..//x` is refused); anything else, or a
+  `return_to` for a link or a confirmation, is refused as invalid input.
+  It is kept with the flow, never read from the callback. Signed in, the
+  callback sends the browser there; not signed in, there with `sso=` and
+  `provider=` after the page's own query. The device page now offers
+  "Continue with <provider>" (it did not), passes `/auth/device?code=…`,
+  and says what went wrong there; the web UI takes `sso=` and `provider=`
+  out of the address and keeps the rest of its query. The login page's
+  sign-in still lands on the start page.

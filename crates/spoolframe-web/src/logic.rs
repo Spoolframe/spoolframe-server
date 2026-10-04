@@ -260,13 +260,27 @@ pub fn date(at: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// How `user` can sign in, as the users page's column says it.
-pub fn sign_in_methods(user: &UserInfo) -> &'static str {
-    match (user.has_password, user.has_passkey) {
-        (true, true) => "Password, passkey",
-        (true, false) => "Password",
-        (false, true) => "Passkey",
-        (false, false) => "None",
+/// How `user` can sign in, as the users page's column says it: the
+/// password, a passkey, a sign-in provider (P3-04).
+pub fn sign_in_methods(user: &UserInfo) -> String {
+    let ways: Vec<&str> = [
+        (user.has_password, "Password"),
+        (user.has_passkey, "passkey"),
+        (user.has_sso, "provider"),
+    ]
+    .into_iter()
+    .filter_map(|(has, way)| has.then_some(way))
+    .collect();
+    match ways.split_first() {
+        None => "None".into(),
+        Some((first, rest)) => {
+            let mut text = format!("{}{}", first[..1].to_uppercase(), &first[1..]);
+            for way in rest {
+                text.push_str(", ");
+                text.push_str(way);
+            }
+            text
+        }
     }
 }
 
@@ -588,8 +602,10 @@ mod tests {
             created_at: 0,
             disabled,
             has_password: true,
+            password_changed_at: None,
             last_seen_at: None,
             has_passkey: false,
+            has_sso: false,
             has_pin: false,
             device_count: 0,
             session_count: 0,
@@ -634,6 +650,12 @@ mod tests {
         assert_eq!(sign_in_methods(&u), "Password, passkey");
         u.has_password = false;
         assert_eq!(sign_in_methods(&u), "Passkey");
+        u.has_sso = true;
+        assert_eq!(sign_in_methods(&u), "Passkey, provider");
+        u.has_passkey = false;
+        assert_eq!(sign_in_methods(&u), "Provider");
+        u.has_sso = false;
+        assert_eq!(sign_in_methods(&u), "None");
     }
 
     #[test]

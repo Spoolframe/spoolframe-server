@@ -5,6 +5,8 @@
 // Each test file uses part of this module.
 #![allow(dead_code)]
 
+pub mod idp;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -563,6 +565,7 @@ impl Default for ServerOptions {
                 when: When::Never,
                 interval: Duration::from_secs(10),
                 cache_limit_bytes: 1 << 30,
+                workers: 1,
             },
             previews_ffmpeg: PathBuf::from("ffmpeg"),
         }
@@ -705,6 +708,7 @@ impl TestServer {
                 prober: prober.clone(),
                 transcoding: transcoding(),
                 ffmpeg: options.previews_ffmpeg.clone(),
+                encoding: jobs.encoding(),
             },
         )
         .unwrap();

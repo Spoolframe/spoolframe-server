@@ -22,6 +22,15 @@
 
   quote = builtins.toJSON;
 
+  # Each sign-in provider's client secret (P3-04), a systemd credential
+  # as the Plex token is, so its file can stay root-only.
+  oidcCredential = i: "/run/credentials/spoolframe.service/oidc-${toString i}";
+  oidcProvider = i: p:
+    "{ name = ${quote p.name}; issuer = ${quote p.issuer}; client_id = ${quote p.clientId}; "
+    + "client_secret_file = ${quote (oidcCredential i)}; "
+    + lib.optionalString (p.scopes != null) "scopes = ${quote p.scopes}; "
+    + "}";
+
   # Reads bitmap subtitles as text (P2-07), with only the languages asked
   # for: all of tesseract's data is over a gigabyte.
   tesseract = pkgs.tesseract.override {enableLanguages = cfg.subtitles.ocrLanguages;};
@@ -71,6 +80,13 @@
       ocr = ${lib.boolToString (cfg.subtitles.ocrLanguages != [])};
       cache_dir = "/var/cache/spoolframe/subtitles";
     }
+    ${lib.optionalString (cfg.auth.oidc != []) ''
+      auth {
+        oidc [
+          ${lib.concatStringsSep ",\n    " (lib.imap0 oidcProvider cfg.auth.oidc)}
+        ]
+      }
+    ''}
     ${cfg.extraConfig}
   '';
 
@@ -230,6 +246,52 @@ in {
       };
     };
 
+    auth.oidc = lib.mkOption {
+      type = lib.types.listOf (lib.types.submodule {
+        options = {
+          name = lib.mkOption {
+            type = lib.types.str;
+            example = "Pocket ID";
+            description = "What the login page's button says: \"Continue with <name>\".";
+          };
+          issuer = lib.mkOption {
+            type = lib.types.str;
+            example = "https://id.example.org";
+            description = ''
+              The provider's issuer, exactly as its ID tokens and its
+              discovery document (<issuer>/.well-known/openid-configuration)
+              say it. Everything else about the provider comes from that
+              document.
+            '';
+          };
+          clientId = lib.mkOption {
+            type = lib.types.str;
+            description = "Spoolframe's client id at the provider.";
+          };
+          clientSecretFile = lib.mkOption {
+            type = lib.types.path;
+            description = ''
+              A file holding the client secret. Passed as a systemd
+              credential, so it may be readable by root only.
+            '';
+          };
+          scopes = lib.mkOption {
+            type = lib.types.nullOr (lib.types.listOf lib.types.str);
+            default = null;
+            description = "The scopes asked for; null is openid, profile and email.";
+          };
+        };
+      });
+      default = [];
+      description = ''
+        Single sign-on (P3-04): OpenID Connect providers a user may link to
+        their account in My profile, and then sign in with. A provider never
+        makes accounts. Needs {option}`admin.publicUrl`: register
+        `<publicUrl>/auth/oidc/callback` as the client's redirect URI, a
+        confidential client with PKCE.
+      '';
+    };
+
     transcode = {
       hardware = lib.mkOption {
         type = lib.types.either (lib.types.enum ["auto" "none"]) (lib.types.nonEmptyListOf (lib.types.enum ["vaapi" "nvenc" "qsv"]));
@@ -289,6 +351,10 @@ in {
         assertion = lib.hasPrefix "/var/lib/" cfg.stateDir;
         message = "services.spoolframe.stateDir (${cfg.stateDir}) must be under /var/lib/.";
       }
+      {
+        assertion = cfg.auth.oidc == [] || cfg.admin.publicUrl != null;
+        message = "services.spoolframe.auth.oidc needs services.spoolframe.admin.publicUrl: the provider sends the browser back to <publicUrl>/auth/oidc/callback.";
+      }
     ];
 
     environment.etc."spoolframe/server.ucl".source = configFile;
@@ -325,7 +391,9 @@ in {
         # subtitles read as text (P2-07), kept.
         CacheDirectory = "spoolframe";
         CacheDirectoryMode = "0700";
-        LoadCredential = lib.optional (cfg.plex.tokenFile != null) "plex-token:${cfg.plex.tokenFile}";
+        LoadCredential =
+          lib.optional (cfg.plex.tokenFile != null) "plex-token:${cfg.plex.tokenFile}"
+          ++ lib.imap0 (i: p: "oidc-${toString i}:${p.clientSecretFile}") cfg.auth.oidc;
         # Also how the web UI's "Restart now" (P3-10) brings the server
         # back: it exits with 75 when asked to restart, and offers it only
         # where SPOOLFRAME_SUPERVISED says something will.

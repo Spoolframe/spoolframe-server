@@ -24,6 +24,9 @@ use spoolframe_admin_api::{
     SettingEntry, Settings, SetupRequest, SetupState, SyncDirection, TranscodingStatus, UserInfo,
     error_code,
 };
+use spoolframe_admin_api::{
+    AudioPick, SsoLink, SubtitlePick, TrackOverrideEntry, TrackPreferences,
+};
 use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
 
@@ -39,14 +42,18 @@ use crate::config::{FIRST_PLEX_SERVER, PlexConfig};
 use crate::device_sign_in::ClaimError;
 use crate::libraries::{self, LibraryError};
 use crate::network::ServerName;
+use crate::oidc::{Begun, Identity, Oidc, OidcError, Purpose, ReturnTo};
 use crate::passkeys::{CeremonyError, Passkeys, SignInError};
 use crate::plex_accounts::{Link, LinkError, Linking, PlexAccounts};
 use crate::plex_sync::{SyncError, WatchSync};
+use crate::principal::Principal;
 use crate::runtime::{ChangeError, RuntimeSettings};
+use crate::store::identities::{IdentityError, IdentityRecord};
 use crate::store::passkeys::{FirstPasskey, PasskeyError, PasskeyRecord, passkey_name};
 use crate::store::pins::{DeviceRecord, PinError};
 use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionRecord};
 use crate::store::users::{UserError, UserRecord, normalize_username};
+use crate::tracks::SubtitleChoice;
 use crate::transcode::Transcoding;
 use spoolframe_plex::account::{PinState, PlexTv};
 
@@ -154,6 +161,21 @@ pub struct StatusSource {
     web_urls: OnceLock<Vec<String>>,
 }
 
+/// The default of `previews.workers` on this machine, as the settings page
+/// shows it.
+fn preview_workers_default() -> spoolframe_admin_api::DefaultWorkers {
+    use crate::previews::workers::{Counted, default_workers};
+    let default = default_workers();
+    spoolframe_admin_api::DefaultWorkers {
+        count: u32::try_from(default.count).unwrap_or(u32::MAX),
+        counted: match default.counted {
+            Counted::PhysicalCores => spoolframe_admin_api::CoreCount::PhysicalCores,
+            Counted::AvailableCpus => spoolframe_admin_api::CoreCount::AvailableCpus,
+            Counted::LogicalCpus => spoolframe_admin_api::CoreCount::LogicalCpus,
+        },
+    }
+}
+
 impl StatusSource {
     pub fn new(name: ServerName, transcoding: Arc<Transcoding>) -> Self {
         Self {
@@ -214,6 +236,7 @@ impl StatusSource {
             addresses: self.addresses.get().cloned().unwrap_or_default(),
             ocr_languages: self.ocr_languages.clone(),
             web_urls: self.web_urls.get().cloned().unwrap_or_default(),
+            preview_workers_default: preview_workers_default(),
         }
     }
 }
@@ -240,6 +263,8 @@ pub struct Admin {
     pub settings: Option<Arc<RuntimeSettings>>,
     /// What the setup wizard reaches beyond the server.
     pub wizard: Wizard,
+    /// Single sign-on (P3-04): the providers, and the flows in progress.
+    pub oidc: Arc<Oidc>,
 }
 
 /// What the setup wizard reaches beyond the server (P3-10): plex.tv for
@@ -364,6 +389,7 @@ pub async fn serve(
         cookies: admin.cookies,
         settings: admin.settings,
         wizard: admin.wizard,
+        oidc: admin.oidc,
         pins: Arc::default(),
         public_url: origins.public_url().map(str::to_owned),
     };
@@ -386,6 +412,7 @@ pub(crate) struct AdminApi {
     cookies: CookiePolicy,
     settings: Option<Arc<RuntimeSettings>>,
     wizard: Wizard,
+    oidc: Arc<Oidc>,
     /// The plex.tv PINs this server began, so a check is only of those.
     pins: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
     /// Where browsers reach the web UI (`admin.public_url`), if anywhere.
@@ -425,7 +452,9 @@ impl From<UserError> for ErrorObjectOwned {
         match &e {
             UserError::Exists(_) => error(error_code::USER_EXISTS, e.to_string()),
             UserError::NoSuchUser(_) => error(error_code::NO_SUCH_USER, e.to_string()),
-            UserError::InvalidUsername(_) => error(error_code::INVALID_INPUT, e.to_string()),
+            UserError::InvalidUsername(_) | UserError::InvalidDisplayName => {
+                error(error_code::INVALID_INPUT, e.to_string())
+            }
             UserError::AlreadySetUp => error(error_code::ALREADY_SET_UP, e.to_string()),
             UserError::LastAdmin(_) => error(error_code::LAST_ADMIN, e.to_string()),
             UserError::Store(_) => internal(e),
@@ -490,6 +519,7 @@ impl AdminApi {
             "name": self.status.name.get(),
             "publicUrl": self.public_url,
             "insecureCookies": self.cookies.insecure(),
+            "sso": self.oidc.names(),
         })
     }
 
@@ -694,6 +724,87 @@ impl From<LinkError> for ErrorObjectOwned {
     }
 }
 
+impl From<IdentityError> for ErrorObjectOwned {
+    fn from(e: IdentityError) -> Self {
+        match &e {
+            IdentityError::NoSuchLink => error(error_code::NO_SUCH_LINK, e.to_string()),
+            IdentityError::LinkedToAnother | IdentityError::ProviderLinked => {
+                error(error_code::LINK_REFUSED, e.to_string())
+            }
+            IdentityError::LastSignInMethod => {
+                error(error_code::LAST_SIGN_IN_METHOD, e.to_string())
+            }
+            IdentityError::Store(_) => internal(e),
+        }
+    }
+}
+
+impl From<OidcError> for ErrorObjectOwned {
+    fn from(e: OidcError) -> Self {
+        match &e {
+            OidcError::NoSuchProvider(_) | OidcError::NotConfigured(_) => {
+                error(error_code::NOT_CONFIGURED, e.to_string())
+            }
+            OidcError::Unavailable { provider, .. } => error(
+                error_code::UNAVAILABLE,
+                format!(
+                    "{provider} can't be reached right now. Sign in another way, or try again later."
+                ),
+            ),
+            OidcError::Busy => error(error_code::UNAVAILABLE, e.to_string()),
+            OidcError::NoFlow | OidcError::Refused { .. } => {
+                error(error_code::INVALID_INPUT, e.to_string())
+            }
+        }
+    }
+}
+
+/// What a sign-in provider's callback comes to (P3-04), for the browser.
+#[derive(Debug)]
+pub(crate) enum SsoOutcome {
+    /// Signed in: the session cookie, then the page the sign-in began on,
+    /// or the start page.
+    SignedIn { done: LoggedIn, to: String },
+    /// Back to a page, which says what happened: `/login?sso=unlinked`.
+    Back(String),
+}
+
+/// Where a sign-in that did not sign in goes: the page it began on, else
+/// the login page.
+fn sign_in_page(return_to: Option<&ReturnTo>) -> &str {
+    return_to.map_or("/login", ReturnTo::as_str)
+}
+
+/// What happened, as the pages read it from `?sso=`, after whatever query
+/// `page` has.
+fn back(page: &str, what: &str, provider: Option<&str>) -> SsoOutcome {
+    let mut url = url::Url::parse("http://page.invalid")
+        .and_then(|base| base.join(page))
+        .expect("a page on this server");
+    url.set_fragment(None);
+    url.query_pairs_mut().append_pair("sso", what);
+    if let Some(name) = provider {
+        url.query_pairs_mut().append_pair("provider", name);
+    }
+    SsoOutcome::Back(format!(
+        "{}?{}",
+        url.path(),
+        url.query().unwrap_or_default()
+    ))
+}
+
+/// A failed flow, as the page it began on says it.
+fn failed(page: &str, e: &OidcError) -> SsoOutcome {
+    match e {
+        OidcError::Unavailable { provider, .. } => back(page, "unavailable", Some(provider)),
+        OidcError::NoFlow => back(page, "expired", None),
+        OidcError::Refused { provider, .. } => back(page, "failed", Some(provider)),
+        OidcError::NoSuchProvider(_) | OidcError::NotConfigured(_) | OidcError::Busy => {
+            back(page, "failed", None)
+        }
+    }
+}
+
 impl From<PinError> for ErrorObjectOwned {
     fn from(e: PinError) -> Self {
         match &e {
@@ -795,6 +906,239 @@ impl AdminApi {
             .ok_or_else(|| error(error_code::UNAUTHENTICATED, "session is not valid"))
     }
 
+    /// A linked identity as the API shows it.
+    fn sso_link(&self, r: IdentityRecord) -> SsoLink {
+        SsoLink {
+            provider: self.oidc.provider_of(&r.issuer),
+            issuer: r.issuer,
+            display: r.display,
+            linked_at: r.linked_at,
+            last_used_at: r.last_used_at,
+        }
+    }
+
+    async fn sso_entries(&self, user: crate::store::users::LocalUserId) -> RpcResult<Vec<SsoLink>> {
+        let links = self
+            .auth
+            .store()
+            .user_identities(user)
+            .await
+            .map_err(internal)?;
+        Ok(links.into_iter().map(|r| self.sso_link(r)).collect())
+    }
+
+    /// Begin a flow with sign-in provider `provider` (P3-04): `signIn`
+    /// with no session; `link` (needs a recent sign-in, as adding a
+    /// passkey does) and `confirm` in the caller's session.
+    pub(crate) async fn sso_begin(
+        &self,
+        ext: &Extensions,
+        provider: &str,
+        purpose: &str,
+        return_to: Option<&str>,
+    ) -> RpcResult<Begun> {
+        // Only a sign-in goes back to where it began; a link or a
+        // confirmation goes back to My profile.
+        if return_to.is_some() && purpose != "signIn" {
+            return Err(error(
+                error_code::INVALID_INPUT,
+                "only a sign-in returns to the page it began on",
+            ));
+        }
+        let return_to = match return_to.map(|r| (r, ReturnTo::parse(r))) {
+            None => None,
+            Some((_, Some(page))) => Some(page),
+            Some((text, None)) => {
+                return Err(error(
+                    error_code::INVALID_INPUT,
+                    format!("{text:?} is not a page on this server: a path starting with one /"),
+                ));
+            }
+        };
+        let purpose = match purpose {
+            "signIn" => Purpose::SignIn { return_to },
+            "link" => {
+                let (token, user) = self.recently_signed_in(ext).await?;
+                Purpose::Link {
+                    user: user.user,
+                    session: SessionToken(token).hash(),
+                }
+            }
+            "confirm" => {
+                let (token, user) = self.caller(ext).await?;
+                Purpose::Confirm {
+                    user: user.user,
+                    session: SessionToken(token).hash(),
+                }
+            }
+            other => {
+                return Err(error(
+                    error_code::INVALID_INPUT,
+                    format!("{other:?} is not signIn, link or confirm"),
+                ));
+            }
+        };
+        Ok(self.oidc.begin(provider, purpose).await?)
+    }
+
+    /// The provider's callback: `code` (or `declined`, its `error`) for
+    /// the flow under `state`, from the browser whose flow cookie is
+    /// `browser`. Never an error: each outcome is a page to go to.
+    pub(crate) async fn sso_callback(
+        &self,
+        state: &str,
+        code: Option<&str>,
+        browser: Option<&str>,
+    ) -> SsoOutcome {
+        let Some(code) = code else {
+            return match self.oidc.decline(state, browser) {
+                Ok(Purpose::SignIn { return_to }) => {
+                    back(sign_in_page(return_to.as_ref()), "cancelled", None)
+                }
+                Ok(_) => back("/profile", "cancelled", None),
+                Err(e) => failed("/login", &e),
+            };
+        };
+        match self.oidc.finish(state, code, browser).await {
+            Ok((purpose, identity)) => match self.sso_done(purpose, identity).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    tracing::error!(error = %e.message(), "single sign-on");
+                    back("/login", "failed", None)
+                }
+            },
+            Err((Some(Purpose::SignIn { return_to }), e)) => {
+                failed(sign_in_page(return_to.as_ref()), &e)
+            }
+            Err((None, e)) => failed("/login", &e),
+            Err((Some(_), e)) => failed("/profile", &e),
+        }
+    }
+
+    async fn sso_done(&self, purpose: Purpose, identity: Identity) -> RpcResult<SsoOutcome> {
+        let store = self.auth.store();
+        let provider = identity.provider.as_str();
+        match purpose {
+            Purpose::SignIn { return_to } => {
+                let page = sign_in_page(return_to.as_ref());
+                let Some(user) = store
+                    .identity_signs_in(&identity.issuer, &identity.subject)
+                    .await
+                    .map_err(internal)?
+                else {
+                    // Never an account made, never one found by email.
+                    tracing::info!(
+                        provider,
+                        "an account not linked to any user tried to sign in"
+                    );
+                    return Ok(back(page, "unlinked", Some(provider)));
+                };
+                let Some(record) = store.user_by_id(user).await? else {
+                    return Ok(back(page, "failed", Some(provider)));
+                };
+                if record.disabled_at.is_some() {
+                    tracing::info!(username = %record.username, provider, "a disabled user tried to sign in");
+                    return Ok(back(page, "failed", Some(provider)));
+                }
+                let token = self.auth.open_api_session(user).await.map_err(internal)?;
+                tracing::info!(username = %record.username, provider, "signed in with a sign-in provider (API session)");
+                Ok(SsoOutcome::SignedIn {
+                    done: LoggedIn {
+                        token: token.0,
+                        username: record.username,
+                        role: record.role,
+                    },
+                    to: return_to.map_or_else(|| "/".to_owned(), |r| r.as_str().to_owned()),
+                })
+            }
+            Purpose::Link { user, session } => {
+                if !self.session_is(&session, user).await? {
+                    return Ok(back("/login", "expired", None));
+                }
+                match store
+                    .link_identity(
+                        user,
+                        &identity.issuer,
+                        &identity.subject,
+                        identity.display.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::info!(user = user.0, provider, "sign-in provider account linked");
+                        Ok(back("/profile", "linked", Some(provider)))
+                    }
+                    Err(IdentityError::LinkedToAnother) => {
+                        tracing::warn!(
+                            user = user.0,
+                            provider,
+                            "refused to link an account another user has linked"
+                        );
+                        Ok(back("/profile", "taken", Some(provider)))
+                    }
+                    Err(IdentityError::ProviderLinked) => {
+                        Ok(back("/profile", "already", Some(provider)))
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Purpose::Confirm { user, session } => {
+                if !self.session_is(&session, user).await? {
+                    return Ok(back("/login", "expired", None));
+                }
+                let owner = store
+                    .identity_owner(&identity.issuer, &identity.subject)
+                    .await
+                    .map_err(internal)?;
+                if owner != Some(user) {
+                    tracing::warn!(
+                        user = user.0,
+                        provider,
+                        "a sign-in provider account not linked to this user was offered as a confirmation"
+                    );
+                    return Ok(back("/profile", "notyours", Some(provider)));
+                }
+                store.confirm_session(&session).await.map_err(internal)?;
+                Ok(back("/profile", "confirmed", Some(provider)))
+            }
+        }
+    }
+
+    /// Whether the session with token hash `session` is live, and
+    /// `user`'s: a link or a confirmation lands only in the session that
+    /// asked for it.
+    async fn session_is(
+        &self,
+        session: &str,
+        user: crate::store::users::LocalUserId,
+    ) -> RpcResult<bool> {
+        Ok(self
+            .auth
+            .store()
+            .api_session(session)
+            .await
+            .map_err(internal)?
+            .is_some_and(|s| s.user == user))
+    }
+
+    /// The title of the series or movie `scope` names, if the catalog
+    /// answers by `until`.
+    async fn title_of(&self, scope: &str, until: tokio::time::Instant) -> Option<String> {
+        use spoolframe_catalog::Catalog as _;
+        let id: spoolframe_types::MediaId = scope.parse().ok()?;
+        let found = tokio::time::timeout_at(until, self.plex.item(&id))
+            .await
+            .ok()?
+            .ok()?;
+        match found.item {
+            spoolframe_types::Item::Movie(m) => Some(m.title),
+            spoolframe_types::Item::Show(s) => Some(s.title),
+            spoolframe_types::Item::Episode(e) => Some(e.title),
+            spoolframe_types::Item::Season(s) => Some(s.title),
+            _ => None,
+        }
+    }
+
     /// The account called `username`.
     async fn record(&self, username: &str) -> RpcResult<UserRecord> {
         let name = normalize_username(username)?;
@@ -808,6 +1152,9 @@ impl AdminApi {
     }
 }
 
+/// How long titles are waited for in a list of track overrides.
+const TITLE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 fn info(u: UserRecord) -> UserInfo {
     UserInfo {
         username: u.username,
@@ -816,8 +1163,10 @@ fn info(u: UserRecord) -> UserInfo {
         created_at: u.created_at,
         disabled: u.disabled_at.is_some(),
         has_password: u.has_password,
+        password_changed_at: u.password_changed_at,
         last_seen_at: u.last_seen_at,
         has_passkey: u.has_passkey,
+        has_sso: u.has_sso,
         has_pin: u.has_pin,
         device_count: u.device_count,
         session_count: u.session_count,
@@ -958,7 +1307,8 @@ impl MeApiServer for AdminApi {
     }
 
     async fn pin_set(&self, ext: &Extensions, pin: String) -> RpcResult<()> {
-        let me = self.me(ext).await?;
+        let (_, user) = self.recently_signed_in(ext).await?;
+        let me = self.account(user).await?;
         if !valid_pin(&pin) {
             return Err(error(error_code::INVALID_INPUT, "a PIN is 4 to 8 digits"));
         }
@@ -973,8 +1323,14 @@ impl MeApiServer for AdminApi {
     }
 
     async fn pin_clear(&self, ext: &Extensions) -> RpcResult<()> {
-        let me = self.me(ext).await?;
-        self.auth.store().clear_pin(me.id).await.map_err(internal)
+        let (_, user) = self.recently_signed_in(ext).await?;
+        self.auth
+            .store()
+            .clear_pin(user.user)
+            .await
+            .map_err(internal)?;
+        tracing::info!(user = user.user.0, "PIN removed by its user");
+        Ok(())
     }
 
     async fn devices(&self, ext: &Extensions) -> RpcResult<Vec<DeviceEntry>> {
@@ -994,11 +1350,17 @@ impl MeApiServer for AdminApi {
         endpoint_id: String,
         required: bool,
     ) -> RpcResult<()> {
-        let me = self.me(ext).await?;
+        // Asking for the PIN guards the device more; no longer asking is
+        // a sensitive change, as removing the PIN is.
+        let (_, user) = if required {
+            self.caller(ext).await?
+        } else {
+            self.recently_signed_in(ext).await?
+        };
         Ok(self
             .auth
             .store()
-            .set_pin_required(me.id, &endpoint_id, required)
+            .set_pin_required(user.user, &endpoint_id, required)
             .await?)
     }
 
@@ -1170,6 +1532,21 @@ impl MeApiServer for AdminApi {
         Ok(())
     }
 
+    async fn sso_links(&self, ext: &Extensions) -> RpcResult<Vec<SsoLink>> {
+        let (_, user) = self.caller(ext).await?;
+        self.sso_entries(user.user).await
+    }
+
+    async fn sso_unlink(&self, ext: &Extensions, issuer: String) -> RpcResult<()> {
+        let (_, user) = self.recently_signed_in(ext).await?;
+        self.auth
+            .store()
+            .unlink_identity(user.user, &issuer)
+            .await?;
+        tracing::info!(user = user.user.0, provider = ?self.oidc.provider_of(&issuer), "sign-in provider account unlinked by its user");
+        Ok(())
+    }
+
     async fn plex_link(&self, ext: &Extensions) -> RpcResult<PlexUser> {
         let me = self.me(ext).await?;
         let link = self.accounts()?.link(me.id).map_err(internal)?;
@@ -1200,6 +1577,97 @@ impl MeApiServer for AdminApi {
         let me = self.me(ext).await?;
         self.accounts()?.unlink(me.id, &me.username)?;
         Ok(())
+    }
+
+    async fn revoke_other_sessions(&self, ext: &Extensions) -> RpcResult<u64> {
+        let (token, user) = self.caller(ext).await?;
+        let revoked = self
+            .auth
+            .store()
+            .revoke_other_sessions(user.user, &SessionToken(token).hash())
+            .await
+            .map_err(internal)?;
+        tracing::info!(
+            user = user.user.0,
+            revoked,
+            "signed out everywhere else by its user"
+        );
+        Ok(revoked)
+    }
+
+    async fn set_display_name(
+        &self,
+        ext: &Extensions,
+        display_name: Option<String>,
+    ) -> RpcResult<UserInfo> {
+        let (_, user) = self.caller(ext).await?;
+        self.auth
+            .store()
+            .set_display_name(user.user, display_name.as_deref())
+            .await?;
+        Ok(info(self.account(user).await?))
+    }
+
+    async fn track_preferences(&self, ext: &Extensions) -> RpcResult<TrackPreferences> {
+        let (_, user) = self.caller(ext).await?;
+        self.auth
+            .store()
+            .track_preferences(Principal::LocalUser(user.user))
+            .await
+            .map_err(internal)
+    }
+
+    async fn set_track_preferences(
+        &self,
+        ext: &Extensions,
+        preferences: TrackPreferences,
+    ) -> RpcResult<()> {
+        let (_, user) = self.caller(ext).await?;
+        self.auth
+            .store()
+            .set_track_preferences(Principal::LocalUser(user.user), &preferences)
+            .await
+            .map_err(internal)
+    }
+
+    async fn track_overrides(&self, ext: &Extensions) -> RpcResult<Vec<TrackOverrideEntry>> {
+        let (_, user) = self.caller(ext).await?;
+        let overrides = self
+            .auth
+            .store()
+            .track_overrides(Principal::LocalUser(user.user))
+            .await
+            .map_err(internal)?;
+        // One wait for all the titles: a list of overrides is not held up
+        // by Plex being down.
+        let until = tokio::time::Instant::now() + TITLE_WAIT;
+        let mut entries = Vec::with_capacity(overrides.len());
+        for (scope, picked) in overrides {
+            entries.push(TrackOverrideEntry {
+                title: self.title_of(&scope, until).await,
+                id: scope,
+                audio: picked.audio.map(|a| AudioPick {
+                    language: a.language,
+                    role: a.role,
+                }),
+                subtitle: picked.subtitle.map(|s| match s {
+                    SubtitleChoice::Track { language, role } => {
+                        SubtitlePick::Track { language, role }
+                    }
+                    SubtitleChoice::Off => SubtitlePick::Off,
+                }),
+            });
+        }
+        Ok(entries)
+    }
+
+    async fn clear_track_override(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        let (_, user) = self.caller(ext).await?;
+        self.auth
+            .store()
+            .clear_track_override(Principal::LocalUser(user.user), &id)
+            .await
+            .map_err(internal)
     }
 
     async fn revoke_session(&self, ext: &Extensions, id: String) -> RpcResult<()> {
@@ -1490,6 +1958,62 @@ impl AdminApiServer for AdminApi {
         let user = self.record(&username).await?;
         self.auth.store().remove_passkey(user.id, &id).await?;
         tracing::info!(%username, "passkey removed by an admin");
+        Ok(())
+    }
+
+    async fn user_sso_links(&self, ext: &Extensions, username: String) -> RpcResult<Vec<SsoLink>> {
+        self.admin(ext).await?;
+        let user = self.record(&username).await?;
+        self.sso_entries(user.id).await
+    }
+
+    async fn user_sso_unlink(
+        &self,
+        ext: &Extensions,
+        username: String,
+        issuer: String,
+    ) -> RpcResult<()> {
+        self.admin(ext).await?;
+        let user = self.record(&username).await?;
+        self.auth.store().unlink_identity(user.id, &issuer).await?;
+        tracing::info!(%username, provider = ?self.oidc.provider_of(&issuer), "sign-in provider account unlinked by an admin");
+        Ok(())
+    }
+
+    async fn sso_set_client_secret(
+        &self,
+        ext: &Extensions,
+        provider: String,
+        secret: Option<String>,
+    ) -> RpcResult<()> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        let config = settings.layers().config().map_err(internal)?;
+        let Some(p) = config.auth.oidc.iter().find(|p| p.name.trim() == provider) else {
+            return Err(OidcError::NoSuchProvider(provider).into());
+        };
+        if let Some(file) = &p.client_secret_file {
+            return Err(error(
+                error_code::SETTING_LOCKED,
+                format!(
+                    "{provider}'s client secret is read from {}, as the config file says",
+                    file.display()
+                ),
+            ));
+        }
+        let name = p.secret_name();
+        match secret.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(value) => settings.secrets().set(&name, value).map_err(internal)?,
+            None => {
+                settings.secrets().remove(&name).map_err(internal)?;
+            }
+        }
+        // Never the secret: only that it changed, and who changed it.
+        tracing::info!(
+            by,
+            provider,
+            set = secret.is_some(),
+            "sign-in provider client secret changed"
+        );
         Ok(())
     }
 
@@ -2109,6 +2633,7 @@ mod tests {
             cookies: CookiePolicy::default(),
             settings: None,
             wizard: Wizard::default(),
+            oidc: Arc::default(),
             pins: Arc::default(),
             public_url: origins.public_url().map(str::to_owned),
         }
@@ -2201,6 +2726,74 @@ mod tests {
         api.passkey_remove(&ext, "cred-1".into()).await.unwrap();
         assert_eq!(api.passkeys(&ext).await.unwrap(), []);
         api.passkey_add_begin(&ext).await.unwrap();
+    }
+
+    /// P3-03: the PIN guards the user's devices, so setting, removing or
+    /// no longer asking for it is a sensitive change; asking for it on a
+    /// device is not.
+    #[tokio::test]
+    async fn the_pin_is_changed_only_soon_after_signing_in() {
+        let (api, ext, session, _dir) = api_with_alice("recent-pin").await;
+        let store = api.auth.store().clone();
+        let (_, alice) = api.caller(&ext).await.unwrap();
+        let tv = "ab".repeat(32);
+        store
+            .create_session(
+                "tv",
+                alice.user,
+                &SessionBinding::Endpoint {
+                    endpoint_id: tv.clone(),
+                    device_name: Some("TV".into()),
+                },
+                i64::MAX / 2,
+            )
+            .await
+            .unwrap();
+        api.pin_set(&ext, "4321".into()).await.unwrap();
+        store
+            .age_session(&session, RECENT_SIGN_IN.as_secs() as i64 + 1)
+            .await;
+        let recent = |r: RpcResult<()>| {
+            assert_eq!(r.unwrap_err().code(), error_code::RECENT_SIGN_IN_REQUIRED);
+        };
+        recent(api.pin_set(&ext, "1234".into()).await);
+        recent(api.pin_clear(&ext).await);
+        api.set_pin_required(&ext, tv.clone(), true).await.unwrap();
+        recent(api.set_pin_required(&ext, tv.clone(), false).await);
+        assert!(api.devices(&ext).await.unwrap()[0].pin_required);
+        assert!(api.who_am_i(&ext).await.unwrap().has_pin);
+
+        api.confirm_password(&ext, "correct horse".into())
+            .await
+            .unwrap();
+        api.set_pin_required(&ext, tv, false).await.unwrap();
+        api.pin_clear(&ext).await.unwrap();
+        assert!(!api.who_am_i(&ext).await.unwrap().has_pin);
+    }
+
+    /// P3-03: a password change from a session signed in long ago asks
+    /// for the current password, and goes through with it.
+    #[tokio::test]
+    async fn an_old_session_changes_the_password_only_with_the_current_one() {
+        let (api, ext, session, _dir) = api_with_alice("old-password").await;
+        api.auth
+            .store()
+            .age_session(&session, RECENT_SIGN_IN.as_secs() as i64 * 6)
+            .await;
+        let change = |current: &str| PasswordChange {
+            current_password: current.into(),
+            new_password: "battery staple".into(),
+        };
+        let wrong = api.set_password(&ext, change("guess")).await.unwrap_err();
+        assert_eq!(wrong.code(), error_code::INVALID_CREDENTIALS);
+        api.set_password(&ext, change("correct horse"))
+            .await
+            .unwrap();
+        let old = api
+            .auth
+            .login_password("alice", "correct horse", SessionBinding::Api, None)
+            .await;
+        assert!(matches!(old, Err(LoginError::InvalidCredentials)));
     }
 
     #[test]

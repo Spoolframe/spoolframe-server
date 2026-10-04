@@ -238,7 +238,7 @@ impl Store {
 
     /// Remove one of `user`'s passkeys, unless it is their last way to
     /// sign in: a user may have no password (set up with a passkey,
-    /// P3-01), and SSO links (P3-04) will count here as the password does.
+    /// P3-01); a linked SSO identity (P3-04) counts as the password does.
     pub async fn remove_passkey(
         &self,
         user: LocalUserId,
@@ -249,7 +249,8 @@ impl Store {
             "SELECT \
                EXISTS (SELECT 1 FROM passkeys WHERE user_id = ?1 AND credential_id = ?2), \
                (SELECT count(*) FROM passkeys WHERE user_id = ?1 AND credential_id != ?2), \
-               EXISTS (SELECT 1 FROM password_credentials WHERE user_id = ?1)",
+               EXISTS (SELECT 1 FROM password_credentials WHERE user_id = ?1) \
+               OR EXISTS (SELECT 1 FROM external_identities WHERE user_id = ?1)",
         )
         .bind(user.0)
         .bind(credential_id)

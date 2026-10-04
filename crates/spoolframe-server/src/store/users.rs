@@ -20,9 +20,13 @@ pub struct UserRecord {
     pub created_at: i64,
     pub disabled_at: Option<i64>,
     pub has_password: bool,
+    /// When their password was set or last changed; `None` without one.
+    pub password_changed_at: Option<i64>,
     /// When any of their sessions was last used.
     pub last_seen_at: Option<i64>,
     pub has_passkey: bool,
+    /// They have linked an SSO identity (P3-04).
+    pub has_sso: bool,
     pub has_pin: bool,
     /// The devices they have signed in from (any session, revoked too),
     /// as `user_devices` lists them.
@@ -56,6 +60,9 @@ pub enum UserError {
     /// Demoting or disabling the last enabled admin (P2-09).
     #[error("{0:?} is the last enabled admin; make another admin first")]
     LastAdmin(String),
+    /// A display name that is too long or has control characters (P3-03).
+    #[error("a display name is at most {MAX_DISPLAY_NAME_LEN} characters, on one line")]
+    InvalidDisplayName,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -68,6 +75,22 @@ impl From<sqlx::Error> for UserError {
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.is_unique_violation())
+}
+
+/// The longest display name a user can give themselves.
+pub const MAX_DISPLAY_NAME_LEN: usize = 64;
+
+/// `name` as a display name is stored: trimmed; `None` when empty, which
+/// shows the username. At most [`MAX_DISPLAY_NAME_LEN`] characters, and
+/// none of them a control character (a line break included).
+pub fn display_name(name: Option<&str>) -> Result<Option<&str>, UserError> {
+    let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+        return Ok(None);
+    };
+    if name.chars().count() > MAX_DISPLAY_NAME_LEN || name.chars().any(char::is_control) {
+        return Err(UserError::InvalidDisplayName);
+    }
+    Ok(Some(name))
 }
 
 /// Usernames are compared without case: stored lowercased.
@@ -168,6 +191,25 @@ impl Store {
         Ok(())
     }
 
+    /// Set what `user` is shown as (P3-03); `None` or blank shows the
+    /// username.
+    pub async fn set_display_name(
+        &self,
+        user: LocalUserId,
+        name: Option<&str>,
+    ) -> Result<(), UserError> {
+        let name = display_name(name)?;
+        let changed = sqlx::query("UPDATE users SET display_name = ?2 WHERE id = ?1")
+            .bind(user.0)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        if changed.rows_affected() == 0 {
+            return Err(UserError::NoSuchUser(format!("#{}", user.0)));
+        }
+        Ok(())
+    }
+
     /// One user, by id.
     pub async fn user_by_id(&self, id: LocalUserId) -> Result<Option<UserRecord>, UserError> {
         Ok(self.list_users().await?.into_iter().find(|u| u.id == id))
@@ -222,10 +264,12 @@ impl Store {
     pub async fn list_users(&self) -> Result<Vec<UserRecord>, UserError> {
         let rows = sqlx::query(
             "SELECT u.id, u.username, u.display_name, u.role, u.created_at, u.disabled_at, \
-                    p.user_id IS NOT NULL AS has_password, \
+                    p.user_id IS NOT NULL AS has_password, p.updated_at AS password_changed_at, \
                     (SELECT max(s.last_used_at) FROM sessions s WHERE s.user_id = u.id) \
                         AS last_seen_at, \
                     EXISTS (SELECT 1 FROM passkeys k WHERE k.user_id = u.id) AS has_passkey, \
+                    EXISTS (SELECT 1 FROM external_identities i WHERE i.user_id = u.id) \
+                        AS has_sso, \
                     EXISTS (SELECT 1 FROM pin_credentials c WHERE c.user_id = u.id) AS has_pin, \
                     (SELECT count(DISTINCT s.endpoint_id) FROM sessions s \
                      WHERE s.user_id = u.id) AS device_count, \
@@ -248,8 +292,10 @@ impl Store {
                     created_at: row.try_get("created_at")?,
                     disabled_at: row.try_get("disabled_at")?,
                     has_password: row.try_get("has_password")?,
+                    password_changed_at: row.try_get("password_changed_at")?,
                     last_seen_at: row.try_get("last_seen_at")?,
                     has_passkey: row.try_get("has_passkey")?,
+                    has_sso: row.try_get("has_sso")?,
                     has_pin: row.try_get("has_pin")?,
                     device_count: row.try_get::<i64, _>("device_count")? as u64,
                     session_count: row.try_get::<i64, _>("session_count")? as u64,
@@ -509,6 +555,33 @@ mod tests {
                 ("root".into(), Role::Admin)
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_display_name_is_set_trimmed_and_cleared() {
+        let store = store("display-name").await;
+        let id = store
+            .add_user("alice", None, "phc", Role::Consumer)
+            .await
+            .unwrap();
+        let shown = |store: &Store| {
+            let store = store.clone();
+            async move { store.user_by_id(id).await.unwrap().unwrap().display_name }
+        };
+        store
+            .set_display_name(id, Some("  Alice A. "))
+            .await
+            .unwrap();
+        assert_eq!(shown(&store).await.as_deref(), Some("Alice A."));
+        store.set_display_name(id, Some("   ")).await.unwrap();
+        assert_eq!(shown(&store).await, None);
+        for bad in ["x".repeat(MAX_DISPLAY_NAME_LEN + 1), "two\nlines".into()] {
+            assert!(matches!(
+                store.set_display_name(id, Some(&bad)).await,
+                Err(UserError::InvalidDisplayName)
+            ));
+        }
+        assert_eq!(shown(&store).await, None);
     }
 
     #[tokio::test]

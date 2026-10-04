@@ -90,6 +90,25 @@ impl Store {
         Ok(())
     }
 
+    /// Every override the principal has, most recently made first: the
+    /// scope (a show's or a movie's id) and what was picked.
+    pub async fn track_overrides(
+        &self,
+        principal: Principal,
+    ) -> Result<Vec<(String, TrackOverride)>, StoreError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT scope, override FROM track_overrides WHERE principal = ?1 \
+             ORDER BY updated_at DESC, scope",
+        )
+        .bind(principal.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(scope, json)| Some((scope, parse("a track override", &json)?)))
+            .collect())
+    }
+
     pub async fn clear_track_override(
         &self,
         principal: Principal,
@@ -141,13 +160,22 @@ mod tests {
         };
         let show = "plex:show:10";
         store.set_track_override(ALICE, show, &sdh).await.unwrap();
-        assert_eq!(store.track_override(ALICE, show).await.unwrap(), Some(sdh));
+        assert_eq!(
+            store.track_override(ALICE, show).await.unwrap(),
+            Some(sdh.clone())
+        );
         assert_eq!(store.track_override(BOB, show).await.unwrap(), None);
         assert_eq!(
             store.track_override(ALICE, "plex:movie:1").await.unwrap(),
             None
         );
+        assert_eq!(
+            store.track_overrides(ALICE).await.unwrap(),
+            [(show.to_owned(), sdh)]
+        );
+        assert_eq!(store.track_overrides(BOB).await.unwrap(), []);
         store.clear_track_override(ALICE, show).await.unwrap();
         assert_eq!(store.track_override(ALICE, show).await.unwrap(), None);
+        assert_eq!(store.track_overrides(ALICE).await.unwrap(), []);
     }
 }

@@ -4,7 +4,7 @@
 //! too.
 
 use dioxus::prelude::*;
-use spoolframe_admin_api::{AdminApiClient, NewUser, PathReport, Role, UserInfo};
+use spoolframe_admin_api::{AdminApiClient, NewUser, PathReport, Role, SsoLink, UserInfo};
 
 use super::{Alert, Field, Route, icons, initial, now, role_name, rpc};
 use crate::logic::{
@@ -525,6 +525,7 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
         }
         UserSessionList { username: username.clone(), name: name.clone(), disabled: user.disabled, toast }
         super::plex::UserPlex { username: username.clone(), name: name.clone(), toast }
+        UserSso { username: username.clone(), name: name.clone(), toast }
         UserDevices {
             username: username.clone(),
             has_pin: user.has_pin,
@@ -1219,4 +1220,134 @@ fn PathRow(report: PathReport) -> Element {
             }
         }
     }
+}
+
+/// The user page's sign-in providers (P3-04), as its Plex account is
+/// shown: each account the user linked, with Unlink only. Only the user
+/// can link one, in My profile.
+#[component]
+fn UserSso(username: String, name: String, toast: Signal<Option<Said>>) -> Element {
+    let who = username.clone();
+    let mut links = use_resource(move || {
+        let who = who.clone();
+        async move {
+            let client = rpc::client().await?;
+            client.user_sso_links(who).await.map_err(rpc::error)
+        }
+    });
+    let site = use_resource(super::http::site);
+    let mut unlinking = use_signal(|| None::<SsoLink>);
+    let providers = site
+        .read()
+        .as_ref()
+        .and_then(|s| s.as_ref().ok())
+        .map(|s| s.sso.clone())
+        .unwrap_or_default();
+    let current = links.read().clone();
+    let any = matches!(&current, Some(Ok(l)) if !l.is_empty());
+    if providers.is_empty() && !any {
+        return rsx! {};
+    }
+    let unlink = {
+        let username = username.clone();
+        let name = name.clone();
+        move |link: SsoLink| {
+            let username = username.clone();
+            let name = name.clone();
+            spawn(async move {
+                let done = async {
+                    let client = rpc::client().await?;
+                    client
+                        .user_sso_unlink(username, link.issuer.clone())
+                        .await
+                        .map_err(rpc::error)
+                };
+                let provider = link.provider.clone().unwrap_or(link.issuer.clone());
+                match done.await {
+                    Ok(()) => say(toast, true, format!("{name}'s {provider} account unlinked")),
+                    Err(e) => say(toast, false, e.explain()),
+                }
+                unlinking.set(None);
+                links.restart();
+            });
+        }
+    };
+    rsx! {
+        div { class: "section-head",
+            h2 { "Sign-in providers" }
+            span { "Accounts {name} signs in with. Only {name} can link one, in My profile." }
+        }
+        match current {
+            None => rsx! { p { class: "m-0 text-sm text-ctp-subtext0", "Loading…" } },
+            Some(Err(e)) => rsx! { Alert { text: e.explain() } },
+            Some(Ok(list)) if list.is_empty() => rsx! {
+                section { class: "card",
+                    div { class: "card-body",
+                        p { class: "m-0 text-sm text-ctp-subtext0", "None linked." }
+                    }
+                }
+            },
+            Some(Ok(list)) => rsx! {
+                section { class: "card",
+                    div { class: "card-body",
+                        for link in list {
+                            div { class: "row", key: "{link.issuer}",
+                                span { class: "flex min-w-0 items-center gap-3",
+                                    span { class: "flex text-ctp-teal", icons::ShieldCheck { size: 18 } }
+                                    span { class: "row-what",
+                                        b { "{link.provider.clone().unwrap_or(link.issuer.clone())}" }
+                                        span { class: "row-sub",
+                                            {sso_line(&link)}
+                                        }
+                                    }
+                                }
+                                span { class: "row-do",
+                                    if unlinking().as_ref().is_some_and(|u| u.issuer == link.issuer) {
+                                        span { class: "text-[13px]", "Unlink it?" }
+                                        button {
+                                            class: "btn btn-danger",
+                                            onclick: {
+                                                let link = link.clone();
+                                                let unlink = unlink.clone();
+                                                move |_| unlink(link.clone())
+                                            },
+                                            "Unlink"
+                                        }
+                                        button { class: "btn", onclick: move |_| unlinking.set(None), "Keep" }
+                                    } else {
+                                        button {
+                                            class: "btn btn-danger",
+                                            onclick: {
+                                                let link = link.clone();
+                                                move |_| unlinking.set(Some(link.clone()))
+                                            },
+                                            icons::Unlink { size: 15 }
+                                            "Unlink"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// "alice@example.org · linked 2026-10-04 · last used 2 hours ago".
+fn sso_line(link: &SsoLink) -> String {
+    let mut parts = Vec::new();
+    if let Some(who) = &link.display {
+        parts.push(who.clone());
+    }
+    parts.push(format!("linked {}", crate::logic::date(link.linked_at)));
+    match link.last_used_at {
+        Some(at) => parts.push(format!("last used {}", ago(now(), at))),
+        None => parts.push("never used".into()),
+    }
+    if link.provider.is_none() {
+        parts.push("provider no longer set up".into());
+    }
+    parts.join(" · ")
 }

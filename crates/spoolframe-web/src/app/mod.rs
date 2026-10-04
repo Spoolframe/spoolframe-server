@@ -33,6 +33,7 @@ const FONTS: Asset = asset!("/assets/fonts", AssetOptions::folder());
 
 pub fn launch() {
     dioxus_logger::init(tracing::Level::INFO).expect("the logger starts once");
+    http::capture_sso_outcome();
     dioxus::launch(App);
 }
 
@@ -285,12 +286,25 @@ fn Login() -> Element {
         .unwrap_or_default();
     let public_url = site.read().as_ref().and_then(|s| s.public_url.clone());
     let insecure_cookies = site.read().as_ref().is_some_and(|s| s.insecure_cookies);
+    let sso = site
+        .read()
+        .as_ref()
+        .map(|s| s.sso.clone())
+        .unwrap_or_default();
+    // What a sign-in provider's callback sent the browser here to say.
+    let said = use_hook(|| {
+        http::sso_outcome("/login")
+            .and_then(|(what, provider)| crate::sso::login_message(&what, provider.as_deref()))
+            .map(|(_, text)| text)
+    });
     rsx! {
         Centered {
             SignInForm {
                 title: if name.is_empty() { "Sign in to Spoolframe".to_owned() } else { format!("Sign in to {name}") },
                 public_url,
                 insecure_cookies,
+                sso,
+                said,
                 // The start decides: an admin may have a wizard to finish.
                 on_done: move |_: http::SignedIn| {
                     nav.replace(Route::Start {});
@@ -336,16 +350,25 @@ async fn passkey_sign_in(
 /// would drop the session cookie, and signing in would look like nothing.
 /// Unless the server sends insecure cookies (P3-10): then a password
 /// works there, and only passkeys need the secure context.
+///
+/// `sso`: the sign-in providers, one "Continue with" button each (P3-04),
+/// which leave for the provider; it sends the browser back signed in.
+/// `said`: why the page was opened, shown at its top (the provider's
+/// account is not linked, …). `return_to`: the page a provider's sign-in
+/// comes back to (path and query), where it is not the start page.
 #[component]
 fn SignInForm(
     title: String,
     #[props(default)] public_url: Option<String>,
     #[props(default)] insecure_cookies: bool,
+    #[props(default)] sso: Vec<String>,
+    #[props(default)] said: Option<String>,
+    #[props(default)] return_to: Option<String>,
     on_done: EventHandler<http::SignedIn>,
 ) -> Element {
     let username = use_signal(String::new);
     let password = use_signal(String::new);
-    let mut error = use_signal(|| None::<String>);
+    let mut error = use_signal(|| said.clone());
     let mut busy = use_signal(|| false);
     let mut request = use_resource(passkey_request);
     let passkeys = secure_context();
@@ -382,6 +405,20 @@ fn SignInForm(
             busy.set(false);
         });
     };
+    let continue_with = use_callback(move |provider: String| {
+        busy.set(true);
+        let return_to = return_to.clone();
+        spawn(async move {
+            match http::sso_begin(&provider, "signIn", return_to.as_deref()).await {
+                // Busy until the page is left.
+                Ok(url) => http::go(&url),
+                Err(e) => {
+                    error.set(Some(e.explain()));
+                    busy.set(false);
+                }
+            }
+        });
+    });
     let elsewhere = match &public_url {
         Some(url) => format!("Open {url} instead."),
         None => "Open it over HTTPS, or as http://localhost through an SSH tunnel, instead.".into(),
@@ -407,11 +444,11 @@ fn SignInForm(
                     }
                 }
             }
-            Field { label: "Username", value: username, autocomplete: "username", placeholder: "Username", tall: true, disabled: !secure }
-            Field { label: "Password", value: password, kind: "password", autocomplete: "current-password", placeholder: "Password", tall: true, disabled: !secure }
             if let Some(text) = error() {
                 Alert { text }
             }
+            Field { label: "Username", value: username, autocomplete: "username", placeholder: "Username", tall: true, disabled: !secure }
+            Field { label: "Password", value: password, kind: "password", autocomplete: "current-password", placeholder: "Password", tall: true, disabled: !secure }
             button { class: "btn-primary", r#type: "submit", disabled: busy() || !secure, "Sign in" }
             if passkeys && webauthn::supported() {
                 div { class: "or-divider", "or" }
@@ -424,8 +461,27 @@ fn SignInForm(
                     "Sign in with a passkey"
                 }
             }
+            if !sso.is_empty() && !(passkeys && webauthn::supported()) {
+                div { class: "or-divider", "or" }
+            }
+            for provider in sso.iter().cloned() {
+                button {
+                    class: "btn-outline",
+                    r#type: "button",
+                    disabled: busy() || !secure,
+                    onclick: {
+                        let provider = provider.clone();
+                        move |_| continue_with.call(provider.clone())
+                    },
+                    icons::ShieldCheck { size: 16 }
+                    "Continue with {provider}"
+                }
+            }
             p { class: "m-0 text-center text-xs text-ctp-subtext0",
                 "Accounts are created by your server's admin."
+                if !sso.is_empty() {
+                    " A sign-in provider only works once it is linked in My profile."
+                }
             }
         }
     }
@@ -800,7 +856,7 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
                     span { class: "flex flex-col gap-1",
                         b { class: "text-sm", "The passkey is your only way in" }
                         span { class: "text-ctp-text",
-                            "If this device is lost or its passkeys are reset, nobody can sign in as admin, and getting back in needs shell access to the server. Add a password as well (single sign-on comes later). You can also do it later in My profile."
+                            "If this device is lost or its passkeys are reset, nobody can sign in as admin, and getting back in needs shell access to the server. Add a password as well. You can also do it later in My profile, where a sign-in provider the server has can be linked too."
                         }
                     }
                 }
@@ -978,18 +1034,27 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
-/// The frame itself (the design's sidebar, or its bar on a phone): the
-/// mark, the pages, and who is signed in. On a phone an admin's pages are
-/// behind the bar's menu button (the WebAdminPhone board).
+/// What the signed-in user is shown as, in the sidebar and the bar: My
+/// profile changes it (P3-03) without signing in again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShownName(pub Signal<String>);
+
+/// The frame itself. An admin's is the design's sidebar, or its bar on a
+/// phone, with the pages behind the bar's menu button (the WebAdminPhone
+/// board): the mark, the pages, and who is signed in. A consumer's is a
+/// slim bar over My profile, their one page (WebProfile).
 #[component]
 fn SignedIn(user: UserInfo) -> Element {
     let nav = navigator();
     use_context_provider(|| user.clone());
     let route = use_route::<Route>();
-    let name = user
-        .display_name
-        .clone()
-        .unwrap_or_else(|| user.username.clone());
+    let shown = use_signal(|| {
+        user.display_name
+            .clone()
+            .unwrap_or_else(|| user.username.clone())
+    });
+    use_context_provider(|| ShownName(shown));
+    let name = shown();
     let admin = user.role == Role::Admin;
     let avatar = avatar_class(&user.username, false);
     let mut menu = use_signal(|| false);
@@ -1026,32 +1091,55 @@ fn SignedIn(user: UserInfo) -> Element {
     };
     let site = use_resource(site);
     let insecure = admin && site.read().as_ref().is_some_and(|s| s.insecure_cookies);
+    if !admin {
+        // A consumer has My profile alone (the WebProfile board): a slim
+        // bar over one column, no sidebar.
+        let server = site
+            .read()
+            .as_ref()
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        return rsx! {
+            div { class: "min-h-screen bg-ctp-base text-ctp-text",
+                header { class: "top-bar",
+                    span { class: "flex min-w-0 items-center gap-2.5",
+                        icons::Mark { size: 28 }
+                        Wordmark { class: "text-lg" }
+                        if !server.is_empty() {
+                            span { class: "top-bar-server hidden sm:inline", "{server}" }
+                        }
+                    }
+                    span { class: "flex items-center gap-2.5",
+                        span { class: "{avatar} avatar-md", "{initial(&name)}" }
+                        b { class: "hidden max-w-[200px] truncate text-sm sm:inline", "{name}" }
+                        button { class: "btn top-bar-out", aria_label: "Sign out", title: "Sign out", onclick: sign_out,
+                            icons::LogOut {}
+                            span { class: "hidden sm:inline", "Sign out" }
+                        }
+                    }
+                }
+                main { class: "consumer-page", Outlet::<Route> {} }
+            }
+        };
+    }
     rsx! {
         // `content-start`: on a phone the bar and the page are two wrapped
         // lines, and stretched lines would leave a gap under the bar.
         div { class: "flex min-h-screen flex-wrap content-start bg-ctp-base text-ctp-text",
             aside { class: "sidebar hidden md:flex",
                 div { class: "flex items-center gap-2.5 px-2",
-                    icons::Reel {}
-                    if admin {
-                        div { class: "flex flex-col",
-                            Wordmark {}
-                            span { class: "text-xs text-ctp-subtext0", "Admin" }
-                        }
-                    } else {
+                    icons::Mark { size: 28 }
+                    div { class: "flex flex-col",
                         Wordmark {}
+                        span { class: "text-xs text-ctp-subtext0", "Admin" }
                     }
                 }
                 nav { class: "flex flex-col gap-0.5",
-                    if admin {
-                        {link(Route::Users {}, "Users and devices", false)}
-                        {link(Route::Server {}, "Server", false)}
-                        {libraries_link(&route)}
-                        {settings_link(&route)}
-                        {link(Route::Profile {}, "My profile", true)}
-                    } else {
-                        {link(Route::Profile {}, "My profile", false)}
-                    }
+                    {link(Route::Users {}, "Users and devices", false)}
+                    {link(Route::Server {}, "Server", false)}
+                    {libraries_link(&route)}
+                    {settings_link(&route)}
+                    {link(Route::Profile {}, "My profile", true)}
                 }
                 div { class: "mt-auto flex items-center gap-2.5 rounded-[10px] bg-ctp-base p-2",
                     span { class: avatar, "{initial(&name)}" }
@@ -1066,16 +1154,14 @@ fn SignedIn(user: UserInfo) -> Element {
             }
             header { class: "phone-bar w-full md:hidden",
                 span { class: "flex items-center gap-2.5",
-                    if admin {
-                        button {
-                            class: "icon-button -ml-1",
-                            aria_label: "Menu",
-                            aria_expanded: "{menu()}",
-                            onclick: move |_| menu.toggle(),
-                            icons::Menu {}
-                        }
+                    button {
+                        class: "icon-button -ml-1",
+                        aria_label: "Menu",
+                        aria_expanded: "{menu()}",
+                        onclick: move |_| menu.toggle(),
+                        icons::Menu {}
                     }
-                    icons::Reel { size: 24 }
+                    icons::Mark { size: 24 }
                     b { class: "font-display text-[17px]", "{title}" }
                 }
                 span { class: "flex items-center gap-3",
@@ -1083,7 +1169,7 @@ fn SignedIn(user: UserInfo) -> Element {
                     span { class: "{avatar} avatar-md", "{initial(&name)}" }
                 }
             }
-            if admin && menu() {
+            if menu() {
                 div { class: "drawer-scrim md:hidden", aria_hidden: "true", onclick: move |_| menu.set(false) }
                 // A link's click comes up here once it has navigated.
                 nav { class: "drawer md:hidden", aria_label: "Admin", onclick: move |_| menu.set(false),

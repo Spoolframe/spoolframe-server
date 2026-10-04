@@ -19,6 +19,7 @@ use spoolframe_server::config::{ServerConfig, WatchSyncConfig};
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
 use spoolframe_server::network::{Server, ServerName, Services};
+use spoolframe_server::oidc::Oidc;
 use spoolframe_server::passkeys::Passkeys;
 use spoolframe_server::plex_accounts::{PlexAccounts, configured_owner};
 use spoolframe_server::plex_sync::WatchSync;
@@ -368,6 +369,7 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             prober: prober.clone(),
             transcoding: transcoding.clone(),
             ffmpeg: config.media.ffmpeg(),
+            encoding: jobs.encoding(),
         },
     )
     .with_context(|| format!("cannot open the previews cache {}", previews_dir.display()))?;
@@ -435,6 +437,15 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
         (None, why) => tracing::warn!(why, "no passkeys"),
     }
     passkeys.log_orphans(auth.store()).await?;
+    // Single sign-on (P3-04): its providers are a live setting.
+    let oidc = Arc::new(Oidc::new(
+        public_url.as_deref(),
+        Some(Secrets::new(state_dir)),
+    ));
+    oidc.set_providers(&config.auth.oidc);
+    if !config.auth.oidc.is_empty() {
+        tracing::info!(providers = oidc.names().join(", "), "single sign-on");
+    }
     // Said by whatever starts the server again when it exits for a restart
     // (the NixOS module's unit does). Not systemd's INVOCATION_ID: every
     // process started from a service inherits it, a shell and what it
@@ -450,6 +461,7 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             watch: Some(watch.clone()),
             jobs: Some(jobs.clone()),
             previews: Some(previews.clone()),
+            oidc: Some(oidc.clone()),
         },
         supervised,
     ));
@@ -469,6 +481,7 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             cookies,
             settings: Some(settings.clone()),
             wizard,
+            oidc,
         },
         admin_origins,
         admin_proxies,

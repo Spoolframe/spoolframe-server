@@ -16,6 +16,7 @@ pub mod encode;
 pub mod identity;
 pub mod libraries;
 pub mod network;
+pub mod oidc;
 pub mod passkeys;
 pub mod planner;
 pub mod playback;

@@ -41,6 +41,8 @@ pub struct Live {
     pub jobs: Option<Arc<Jobs>>,
     /// `previews.*`.
     pub previews: Option<Arc<Previews>>,
+    /// `auth.oidc` (P3-04).
+    pub oidc: Option<Arc<crate::oidc::Oidc>>,
 }
 
 /// Why a change was not made.
@@ -390,6 +392,9 @@ impl RuntimeSettings {
         if let (Some(previews), Ok(settings)) = (&live.previews, config.previews.settings()) {
             previews.set_settings(settings);
         }
+        if let Some(oidc) = &live.oidc {
+            oidc.set_providers(&config.auth.oidc);
+        }
         if plex_changed {
             match plex_catalog(&config, layers, &self.secrets) {
                 Ok(plex) => {
@@ -551,6 +556,7 @@ mod tests {
                     dir.as_ref().join("encoder-test"),
                 )),
                 ffmpeg: "ffmpeg".into(),
+                encoding: Default::default(),
             },
         )
         .unwrap();
@@ -561,9 +567,48 @@ mod tests {
         settings
             .set("previews.interval_secs", &serde_json::json!(4), "root")
             .unwrap();
+        settings
+            .set("previews.workers", &serde_json::json!(3), "root")
+            .unwrap();
         let now = previews.settings();
         assert_eq!(now.when, When::Never);
         assert_eq!(now.interval, std::time::Duration::from_secs(4));
+        assert_eq!(now.workers, 3);
+    }
+
+    #[tokio::test]
+    async fn sign_in_providers_follow_their_setting_at_once() {
+        let (mut settings, _dir) = settings(Some(
+            r#"admin { public_url = "https://media.example.org"; }"#,
+        ))
+        .await;
+        let oidc = Arc::new(crate::oidc::Oidc::new(
+            Some("https://media.example.org"),
+            None,
+        ));
+        settings.live.oidc = Some(oidc.clone());
+        let provider = serde_json::json!([{
+            "name": "Pocket ID",
+            "issuer": "https://id.example.org",
+            "client_id": "spoolframe",
+        }]);
+        let entry = settings.set("auth.oidc", &provider, "root").unwrap();
+        assert_eq!(entry.apply, SettingApply::Live);
+        assert_eq!(oidc.names(), ["Pocket ID"]);
+        settings.unset("auth.oidc", "root").unwrap();
+        assert!(oidc.names().is_empty());
+        // One the server would refuse is refused here, saying why.
+        let refused = settings
+            .set(
+                "auth.oidc",
+                &serde_json::json!([{ "name": "A", "issuer": "http://id.example.org", "client_id": "x" }]),
+                "root",
+            )
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("not an https URL"),
+            "{refused}"
+        );
     }
 
     #[tokio::test]

@@ -2007,4 +2007,114 @@
     line-height: 1.6;
     color: var(--ctp-subtext1);
   }
+
+  /* My profile (P3-03): two columns of cards on a wide screen, one on a
+     phone in the order the cards are numbered. */
+  .profile-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .profile-col {
+    display: contents;
+  }
+  @media (min-width: 960px) {
+    .profile-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-items: start;
+    }
+    .profile-col {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+  }
+  .pref-select {
+    height: 32px;
+    max-width: 220px;
+    border-radius: 8px;
+    border: 1px solid var(--ctp-surface1);
+    background: var(--ctp-base);
+    color: var(--ctp-text);
+    padding: 0 8px;
+    font: 500 13px var(--font-sans);
+  }
+  .pref-select:disabled {
+    opacity: 0.6;
+  }
+  .btn-wide {
+    width: 100%;
+    justify-content: center;
+  }
+
+  /* A consumer's frame (WebProfile): a slim bar, then one column. */
+  .top-bar {
+    height: 56px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 0 18px;
+    border-bottom: 1px solid var(--ctp-surface0);
+    background: var(--ctp-mantle);
+  }
+  .top-bar-server {
+    padding-left: 12px;
+    border-left: 1px solid var(--ctp-surface1);
+    color: var(--ctp-subtext0);
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  .top-bar-out {
+    padding: 0 10px;
+  }
+  .consumer-page {
+    box-sizing: border-box;
+    max-width: 752px;
+    margin: 0 auto;
+    padding: 28px 16px 40px;
+  }
+  .profile-column {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .profile-head {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .profile-head h1 {
+    margin: 0;
+    font: 700 26px var(--font-display);
+  }
+  .avatar-xl {
+    width: 56px;
+    height: 56px;
+    border-radius: 28px;
+    font: 700 22px var(--font-display);
+  }
+
+  /* "Continue with <provider>" (P3-04): the login card's outlined button. */
+  .btn-outline {
+    height: 44px;
+    border-radius: 10px;
+    border: 1px solid var(--ctp-surface2);
+    background: transparent;
+    color: var(--ctp-text);
+    font: 600 15px var(--font-sans);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    cursor: pointer;
+  }
+  .btn-outline:hover {
+    background: var(--ctp-surface0);
+  }
+  .btn-outline:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
 }

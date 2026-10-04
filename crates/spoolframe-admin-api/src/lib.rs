@@ -16,7 +16,9 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-pub use spoolframe_types::{LibraryKind, Role};
+pub use spoolframe_types::{
+    AudioRole, LibraryKind, Role, SdhPreference, SubtitleMode, SubtitleRole, TrackPreferences,
+};
 
 /// JSON-RPC error codes the admin API returns, beside the standard ones.
 pub mod error_code {
@@ -66,6 +68,11 @@ pub mod error_code {
     /// A setting the server's locked config file sets (P3-10): only that
     /// file can change it.
     pub const SETTING_LOCKED: i32 = -32020;
+    /// Not one of the user's linked sign-in provider accounts (P3-04).
+    pub const NO_SUCH_LINK: i32 = -32021;
+    /// The provider account is linked to another user, or the user has
+    /// one linked at that provider already (P3-04).
+    pub const LINK_REFUSED: i32 = -32022;
 }
 
 /// A username and password.
@@ -178,6 +185,9 @@ pub struct UserInfo {
     pub created_at: i64,
     pub disabled: bool,
     pub has_password: bool,
+    /// When the password was set or last changed, Unix seconds; `None`
+    /// without one.
+    pub password_changed_at: Option<i64>,
     /// When any of their sessions was last used, Unix seconds; `None` if
     /// they have never signed in.
     #[serde(default)]
@@ -185,6 +195,8 @@ pub struct UserInfo {
     /// They have a passkey (P3-05): with `has_password`, how they can sign
     /// in.
     pub has_passkey: bool,
+    /// They have linked a sign-in provider account (P3-04).
+    pub has_sso: bool,
     /// They have a profile PIN (P2-08): `admin.userClearPin` has
     /// something to clear, and a device can be set to ask for it.
     pub has_pin: bool,
@@ -319,6 +331,27 @@ pub struct PasskeyEntry {
     pub usable: bool,
 }
 
+/// A user's account at a sign-in provider, linked to them (P3-04). Linking
+/// happens in the browser (`/auth/oidc/begin`, then the provider, then
+/// `/auth/oidc/callback`), never over this API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SsoLink {
+    /// The provider's name as the config gives it; `None` when no
+    /// configured provider has this issuer any more (the link signs no
+    /// one in then).
+    pub provider: Option<String>,
+    /// The provider's issuer: what `ssoUnlink` takes.
+    pub issuer: String,
+    /// Its email or username at the provider, when the provider said, for
+    /// recognising it.
+    pub display: Option<String>,
+    /// Unix seconds.
+    pub linked_at: i64,
+    /// When it last signed them in; `None` if it never has.
+    pub last_used_at: Option<i64>,
+}
+
 /// A device waiting to be signed in by someone approving its code (P3-07).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -355,6 +388,40 @@ pub struct ServerStatus {
     pub ocr_languages: Vec<String>,
     /// Where the web UI answers (P3-10): `http://<address>:<port>/`.
     pub web_urls: Vec<String>,
+    /// How many files frame previews are made of ahead at once when
+    /// `previews.workers` is not set (P3-13).
+    pub preview_workers_default: DefaultWorkers,
+}
+
+/// A default worked out from the machine's CPUs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultWorkers {
+    pub count: u32,
+    pub counted: CoreCount,
+}
+
+/// What a [`DefaultWorkers`] counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CoreCount {
+    /// The machine's physical cores.
+    PhysicalCores,
+    /// The CPUs the server may use, fewer than the cores.
+    AvailableCpus,
+    /// The logical CPUs the server may use: the cores are not known.
+    LogicalCpus,
+}
+
+impl CoreCount {
+    /// As the settings page says it: "8 (physical cores)".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PhysicalCores => "physical cores",
+            Self::AvailableCpus => "CPUs it may use",
+            Self::LogicalCpus => "logical CPUs",
+        }
+    }
 }
 
 /// Plex as the server sees it now (P3-02).
@@ -653,6 +720,41 @@ pub enum PlexPinState {
     Expired,
 }
 
+/// What a user picked for one series or movie (P1-20), which its next
+/// playback uses instead of their preferences (P3-03 lists them).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackOverrideEntry {
+    /// The series' or movie's id: what `me.clearTrackOverride` takes.
+    pub id: String,
+    /// Its title, when the catalog can say.
+    pub title: Option<String>,
+    /// The audio picked; `None` follows the preferences.
+    pub audio: Option<AudioPick>,
+    /// The subtitles picked; `None` follows the preferences.
+    pub subtitle: Option<SubtitlePick>,
+}
+
+/// An audio track, by what it is rather than where.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioPick {
+    /// ISO 639; `None` for a track that does not say.
+    pub language: Option<String>,
+    pub role: AudioRole,
+}
+
+/// Subtitles picked: a track by what it is, or none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum SubtitlePick {
+    Track {
+        language: Option<String>,
+        role: SubtitleRole,
+    },
+    Off,
+}
+
 /// A user's link to their Plex account (P3-12). The token never leaves
 /// the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -846,13 +948,50 @@ pub trait MeApi {
     #[method(name = "revokeSession", with_extensions)]
     async fn revoke_session(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
 
-    /// Set or change the caller's PIN (P2-08): 4 to 8 digits. The PIN, and
-    /// where it is asked for, need only the session: a real sign-in made
-    /// it, and a PIN is never a way to sign in.
+    /// End every session of the caller's but this one, on every device
+    /// (P3-03); how many.
+    #[method(name = "revokeOtherSessions", with_extensions)]
+    async fn revoke_other_sessions(&self) -> jsonrpsee::core::RpcResult<u64>;
+
+    /// What the caller is shown as (P3-03): at most 64 characters, on one
+    /// line (`INVALID_INPUT` otherwise); `None` or blank shows the
+    /// username. The caller as `whoAmI` answers after it.
+    #[method(name = "setDisplayName", with_extensions)]
+    async fn set_display_name(
+        &self,
+        display_name: Option<String>,
+    ) -> jsonrpsee::core::RpcResult<UserInfo>;
+
+    /// How the caller wants tracks chosen (P1-20), as their devices read
+    /// them.
+    #[method(name = "trackPreferences", with_extensions)]
+    async fn track_preferences(&self) -> jsonrpsee::core::RpcResult<TrackPreferences>;
+
+    /// Replace them, for every device of the caller's: the next playback
+    /// anywhere uses them.
+    #[method(name = "setTrackPreferences", with_extensions)]
+    async fn set_track_preferences(
+        &self,
+        preferences: TrackPreferences,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// What the caller picked for each series or movie, most recent first.
+    #[method(name = "trackOverrides", with_extensions)]
+    async fn track_overrides(&self) -> jsonrpsee::core::RpcResult<Vec<TrackOverrideEntry>>;
+
+    /// Back to the preferences for one series or movie, by its `id` from
+    /// `trackOverrides`. One that has none is not an error.
+    #[method(name = "clearTrackOverride", with_extensions)]
+    async fn clear_track_override(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Set or change the caller's PIN (P2-08): 4 to 8 digits. Needs a
+    /// recent sign-in (P3-03, `RECENT_SIGN_IN_REQUIRED`): a session left
+    /// open must not change the PIN that guards the caller's devices.
     #[method(name = "pinSet", with_extensions)]
     async fn pin_set(&self, pin: String) -> jsonrpsee::core::RpcResult<()>;
 
-    /// Remove the caller's PIN, and its requirement on every device.
+    /// Remove the caller's PIN, and its requirement on every device. Needs
+    /// a recent sign-in, as setting it does.
     #[method(name = "pinClear", with_extensions)]
     async fn pin_clear(&self) -> jsonrpsee::core::RpcResult<()>;
 
@@ -861,6 +1000,8 @@ pub trait MeApi {
     async fn devices(&self) -> jsonrpsee::core::RpcResult<Vec<DeviceEntry>>;
 
     /// Ask for the caller's PIN on one of their devices, or stop asking.
+    /// Asking needs only the session; stopping weakens what guards the
+    /// device, so it needs a recent sign-in, as changing the PIN does.
     #[method(name = "setPinRequired", with_extensions)]
     async fn set_pin_required(
         &self,
@@ -935,6 +1076,17 @@ pub trait MeApi {
     /// last way to sign in stays (`LAST_SIGN_IN_METHOD`).
     #[method(name = "passkeyRemove", with_extensions)]
     async fn passkey_remove(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// The caller's linked sign-in provider accounts (P3-04), oldest
+    /// first.
+    #[method(name = "ssoLinks", with_extensions)]
+    async fn sso_links(&self) -> jsonrpsee::core::RpcResult<Vec<SsoLink>>;
+
+    /// Unlink the caller's account at the provider with `issuer`. Needs a
+    /// recent sign-in; their last way to sign in stays
+    /// (`LAST_SIGN_IN_METHOD`). `NO_SUCH_LINK` for one they do not have.
+    #[method(name = "ssoUnlink", with_extensions)]
+    async fn sso_unlink(&self, issuer: String) -> jsonrpsee::core::RpcResult<()>;
 
     /// The caller, their Plex link and their last sync run (P3-12).
     #[method(name = "plexLink", with_extensions)]
@@ -1073,6 +1225,32 @@ pub trait AdminApi {
         &self,
         username: String,
         id: String,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A user's linked sign-in provider accounts (P3-04). An admin can see
+    /// and unlink them (for a lost provider account), never link one: only
+    /// its user can.
+    #[method(name = "userSsoLinks", with_extensions)]
+    async fn user_sso_links(&self, username: String) -> jsonrpsee::core::RpcResult<Vec<SsoLink>>;
+
+    /// Unlink a user's account at the provider with `issuer`, as
+    /// `me.ssoUnlink` does; their last way to sign in stays.
+    #[method(name = "userSsoUnlink", with_extensions)]
+    async fn user_sso_unlink(
+        &self,
+        username: String,
+        issuer: String,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Keep `secret` as the client secret of the sign-in provider called
+    /// `provider` (P3-04), or forget it (`None`): a secret, in the state
+    /// directory, never shown. A provider whose config names a
+    /// `client_secret_file` reads that instead (`SETTING_LOCKED`).
+    #[method(name = "ssoSetClientSecret", with_extensions)]
+    async fn sso_set_client_secret(
+        &self,
+        provider: String,
+        secret: Option<String>,
     ) -> jsonrpsee::core::RpcResult<()>;
 
     /// Plex now: reachable or not, its name, and the libraries with their

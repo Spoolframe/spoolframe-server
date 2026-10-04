@@ -32,12 +32,18 @@ use spoolframe_admin_api::{
     SetupRequest, error_code,
 };
 
-use crate::admin::{AdminApi, Bearer, Peer};
+use crate::admin::{AdminApi, Bearer, Peer, SsoOutcome};
 use crate::auth::API_SESSION;
 
 /// The browser's session cookie: an admin API session token, as the CLI's
 /// Bearer token is.
 pub const COOKIE: &str = "spoolframe_session";
+
+/// A sign-in provider flow's cookie (P3-04): binds the flow to the browser
+/// that began it. `SameSite=Lax`, unlike the session's: the provider sends
+/// the browser back with a top-level navigation from its own site, which
+/// carries only a Lax cookie. It names no one and opens nothing by itself.
+pub const OIDC_COOKIE: &str = "spoolframe_oidc";
 
 /// How the session cookie is sent (`admin.insecure_cookies`, P3-10): a
 /// live setting, so the running listener reads it at every sign-in.
@@ -75,6 +81,25 @@ impl CookiePolicy {
     fn clear(&self) -> HeaderValue {
         HeaderValue::from_str(&format!(
             "{COOKIE}=; Path=/; {}SameSite=Strict; Max-Age=0",
+            self.flags()
+        ))
+        .expect("a fixed cookie")
+    }
+
+    /// `Set-Cookie` for a sign-in provider flow begun in this browser:
+    /// sent back only to `/auth/oidc`, and for as long as the flow lives.
+    fn oidc(&self, value: &str) -> HeaderValue {
+        HeaderValue::from_str(&format!(
+            "{OIDC_COOKIE}={value}; Path=/auth/oidc; {}SameSite=Lax; Max-Age={}",
+            self.flags(),
+            crate::oidc::FLOW_LIFETIME.as_secs()
+        ))
+        .expect("the value is hex")
+    }
+
+    fn oidc_clear(&self) -> HeaderValue {
+        HeaderValue::from_str(&format!(
+            "{OIDC_COOKIE}=; Path=/auth/oidc; {}SameSite=Lax; Max-Age=0",
             self.flags()
         ))
         .expect("a fixed cookie")
@@ -300,6 +325,8 @@ fn router(
         .route("/auth/setup/check", post(setup_check))
         .route("/auth/setup/passkey/begin", post(setup_passkey_begin))
         .route("/auth/setup/passkey/finish", post(setup_passkey_finish))
+        .route("/auth/oidc/begin", post(sso_begin))
+        .route("/auth/oidc/callback", get(sso_callback))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/auth/site", get(site))
@@ -372,13 +399,18 @@ fn token(headers: &HeaderMap) -> Option<String> {
     {
         return Some(bearer.trim().to_owned());
     }
+    cookie(headers, COOKIE)
+}
+
+/// The cookie called `name`, if the request has it.
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(name, _)| *name == COOKIE)
+        .find(|(n, _)| *n == name)
         .map(|(_, value)| value.to_owned())
 }
 
@@ -604,6 +636,110 @@ async fn site(State(api): State<AdminApi>) -> Response<Body> {
     axum::Json(api.site()).into_response()
 }
 
+/// Which provider, and what for (`signIn`, `link`, `confirm`); for a
+/// sign-in, the page to go back to (path and query).
+#[derive(serde::Deserialize)]
+struct SsoBegin {
+    provider: String,
+    purpose: String,
+    #[serde(default)]
+    return_to: Option<String>,
+}
+
+/// The most a request body to `/auth/oidc/begin` may be.
+const SMALL_BODY: usize = 4096;
+
+/// Begin a sign-in provider flow (P3-04): where to send the browser, as
+/// `{"url": …}`, and the flow's cookie. Linking and confirming are in the
+/// caller's session, so the session cookie is read as the socket reads it.
+async fn sso_begin(State(api): State<AdminApi>, req: Request) -> Response<Body> {
+    let mut ext = as_caller(&req);
+    if let Some(peer) = req.extensions().get::<Peer>() {
+        ext.insert(*peer);
+    }
+    let body = match axum::body::to_bytes(req.into_body(), SMALL_BODY).await {
+        Ok(body) => body,
+        Err(e) => {
+            return failure(ErrorObjectOwned::owned::<()>(
+                error_code::INVALID_INPUT,
+                e.to_string(),
+                None,
+            ));
+        }
+    };
+    let SsoBegin {
+        provider,
+        purpose,
+        return_to,
+    } = match parse(&body) {
+        Ok(begin) => begin,
+        Err(e) => return failure(e),
+    };
+    match api
+        .sso_begin(&ext, &provider, &purpose, return_to.as_deref())
+        .await
+    {
+        Ok(begun) => {
+            let mut response = axum::Json(json!({ "url": begun.url })).into_response();
+            response
+                .headers_mut()
+                .insert(header::SET_COOKIE, api.cookies().oidc(&begun.browser));
+            response
+        }
+        Err(e) => failure(e),
+    }
+}
+
+/// Where a provider sends the browser back (P3-04): `state` and `code`,
+/// or `error`. Always a redirect: signed in to the page the sign-in began
+/// on (as the begin named it, never this request) or the start page, or
+/// back to the page that began it, saying what happened (`?sso=`). The flow's
+/// cookie is spent either way.
+async fn sso_callback(State(api): State<AdminApi>, req: Request) -> Response<Body> {
+    let mut state = None;
+    let mut code = None;
+    for (key, value) in
+        url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes())
+    {
+        match key.as_ref() {
+            "state" => state = Some(value.into_owned()),
+            "code" => code = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    let browser = cookie(req.headers(), OIDC_COOKIE);
+    let outcome = match state {
+        Some(state) => {
+            api.sso_callback(&state, code.as_deref(), browser.as_deref())
+                .await
+        }
+        None => SsoOutcome::Back("/login?sso=expired".into()),
+    };
+    let (location, session) = match outcome {
+        SsoOutcome::SignedIn { done, to } => (to, Some(done.token)),
+        SsoOutcome::Back(to) => (to, None),
+    };
+    let mut response = (
+        StatusCode::SEE_OTHER,
+        [(
+            header::LOCATION,
+            HeaderValue::from_str(&location).expect("a path we made"),
+        )],
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.append(header::SET_COOKIE, api.cookies().oidc_clear());
+    if let Some(token) = session {
+        headers.append(header::SET_COOKIE, api.cookies().set(&token));
+    }
+    // The page's address has the code in it; it is not sent on.
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
 /// What a method called before there is a session gets, as the socket
 /// would give it: where the caller is.
 fn from(peer: Peer) -> Extensions {
@@ -814,6 +950,26 @@ mod tests {
             for part in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/"] {
                 assert!(cookie.contains(part), "{cookie}");
             }
+        }
+    }
+
+    /// A provider flow's cookie (P3-04) goes as the session's does: over
+    /// plain HTTP too when insecure cookies are on, or the flow could not
+    /// finish there. Lax either way, for the provider's redirect back.
+    #[test]
+    fn the_flow_cookie_follows_the_cookie_policy_and_is_lax() {
+        let secure = CookiePolicy::default();
+        let insecure = CookiePolicy::new(true);
+        for cookie in [secure.oidc("ab"), secure.oidc_clear()] {
+            let cookie = cookie.to_str().unwrap();
+            for part in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/auth/oidc"] {
+                assert!(cookie.contains(part), "{cookie}");
+            }
+        }
+        for cookie in [insecure.oidc("ab"), insecure.oidc_clear()] {
+            let cookie = cookie.to_str().unwrap();
+            assert!(!cookie.contains("Secure"), "{cookie}");
+            assert!(cookie.contains("SameSite=Lax"), "{cookie}");
         }
     }
 

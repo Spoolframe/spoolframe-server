@@ -115,6 +115,48 @@ pub struct Jobs {
     /// Held by the job that looks at a full scratch directory and makes
     /// room in it, so the next job to look sees what the first one freed.
     scratch_check: Arc<tokio::sync::Mutex<()>>,
+    /// How many jobs that encode a stream run now: frame previews made
+    /// ahead wait while any does (P3-13).
+    encoding: Encoding,
+}
+
+/// How many encodes (a stream decoded and encoded again, not only copied
+/// into another container) run now, and a way to wait for that to change.
+#[derive(Debug, Clone)]
+pub struct Encoding(Arc<watch::Sender<usize>>);
+
+impl Default for Encoding {
+    fn default() -> Self {
+        Self(Arc::new(watch::Sender::new(0)))
+    }
+}
+
+impl Encoding {
+    /// One more encode runs until the guard is dropped.
+    pub fn begin(&self) -> EncodingGuard {
+        self.0.send_modify(|n| *n += 1);
+        EncodingGuard(self.0.clone())
+    }
+
+    /// How many run now.
+    pub fn running(&self) -> usize {
+        *self.0.borrow()
+    }
+
+    /// The count, to wait on.
+    pub fn watch(&self) -> watch::Receiver<usize> {
+        self.0.subscribe()
+    }
+}
+
+/// An encode counted in [`Encoding`] while held.
+#[derive(Debug)]
+pub struct EncodingGuard(Arc<watch::Sender<usize>>);
+
+impl Drop for EncodingGuard {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
 }
 
 impl Jobs {
@@ -138,6 +180,7 @@ impl Jobs {
                 max: limits.max_jobs,
             })),
             scratch_check: Arc::default(),
+            encoding: Encoding::default(),
             limits: std::sync::RwLock::new(limits),
             dir,
             ffmpeg,
@@ -170,9 +213,15 @@ impl Jobs {
         &self.dir
     }
 
+    /// How many jobs that encode run now.
+    pub fn encoding(&self) -> Encoding {
+        self.encoding.clone()
+    }
+
     /// Run ffmpeg with `args` into `dir` (created), which the job owns and
     /// removes when dropped. It runs in `slot`, the place of the job it
-    /// replaces, or takes a free one.
+    /// replaces, or takes a free one. One that `encodes` counts in
+    /// [`Jobs::encoding`] while ffmpeg runs.
     #[expect(
         clippy::too_many_arguments,
         reason = "one caller, which names each part"
@@ -182,6 +231,7 @@ impl Jobs {
         dir: PathBuf,
         args: Vec<String>,
         written: Written,
+        encodes: bool,
         epoch: u32,
         first_segment: u32,
         start_ms: u64,
@@ -226,6 +276,7 @@ impl Jobs {
             shared: shared.clone(),
             slot: slot.clone(),
             progress: progress_tx,
+            _encoding: encodes.then(|| self.encoding.begin()),
         };
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
@@ -385,6 +436,10 @@ struct Supervisor {
     /// The job's slot, let go of when a stalled ffmpeg is ended.
     slot: Arc<std::sync::Mutex<Option<Slot>>>,
     progress: watch::Sender<Progress>,
+    /// Counted as encoding for as long as the supervisor runs: until
+    /// ffmpeg exits, is ended as stalled, or the job is stopped (which
+    /// aborts the supervisor).
+    _encoding: Option<EncodingGuard>,
 }
 
 impl Supervisor {
@@ -798,7 +853,7 @@ mod tests {
         .await;
         let dir = jobs.dir().join("h/0");
         let job = jobs
-            .start(dir, Vec::new(), Written::Hls, 0, 0, 0, None)
+            .start(dir, Vec::new(), Written::Hls, false, 0, 0, 0, None)
             .unwrap();
         assert_eq!(
             done(&job).await.unwrap_err(),
@@ -822,6 +877,7 @@ mod tests {
                 dir,
                 vec![file.display().to_string()],
                 Written::Progressive { file },
+                false,
                 0,
                 0,
                 0,
@@ -839,15 +895,106 @@ mod tests {
         let (jobs, _dir) = jobs("busy", "exec sleep 30", 1, Duration::from_secs(60)).await;
         let scratch = jobs.dir().to_path_buf();
         let first = jobs
-            .start(scratch.join("a/0"), Vec::new(), Written::Hls, 0, 0, 0, None)
+            .start(
+                scratch.join("a/0"),
+                Vec::new(),
+                Written::Hls,
+                false,
+                0,
+                0,
+                0,
+                None,
+            )
             .unwrap();
         assert!(matches!(
-            jobs.start(scratch.join("b/0"), Vec::new(), Written::Hls, 0, 0, 0, None),
+            jobs.start(
+                scratch.join("b/0"),
+                Vec::new(),
+                Written::Hls,
+                false,
+                0,
+                0,
+                0,
+                None
+            ),
             Err(JobError::Busy)
         ));
         first.stop();
-        jobs.start(scratch.join("b/0"), Vec::new(), Written::Hls, 0, 0, 0, None)
+        jobs.start(
+            scratch.join("b/0"),
+            Vec::new(),
+            Written::Hls,
+            false,
+            0,
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_encode_counts_as_encoding_while_ffmpeg_runs_and_a_copy_never_does() {
+        let (some, _dir) = jobs("encoding", "exec sleep 30", 3, Duration::from_secs(60)).await;
+        let encoding = some.encoding();
+        let scratch = some.dir().to_path_buf();
+        let copy = some
+            .start(
+                scratch.join("c/0"),
+                Vec::new(),
+                Written::Hls,
+                false,
+                0,
+                0,
+                0,
+                None,
+            )
             .unwrap();
+        assert_eq!(encoding.running(), 0);
+        let stopped = some
+            .start(
+                scratch.join("a/0"),
+                Vec::new(),
+                Written::Hls,
+                true,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(encoding.running(), 1);
+        stopped.stop();
+        none_encoding(&encoding).await;
+        drop(copy);
+        // One whose ffmpeg exits by itself stops counting then, though
+        // the job (its playback) lives on.
+        let (quick, _dir) = jobs("encoding-exits", "exit 0", 1, Duration::from_secs(60)).await;
+        let encoding = quick.encoding();
+        let exited = quick
+            .start(
+                quick.dir().join("e/0"),
+                Vec::new(),
+                Written::Hls,
+                true,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        done(&exited).await.unwrap();
+        none_encoding(&encoding).await;
+    }
+
+    async fn none_encoding(encoding: &Encoding) {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            encoding.watch().wait_for(|n| *n == 0),
+        )
+        .await
+        .expect("an encode still counts")
+        .unwrap();
     }
 
     #[tokio::test]
@@ -855,7 +1002,7 @@ mod tests {
         let (jobs, _dir) = jobs("drop", "exec sleep 30", 2, Duration::from_secs(60)).await;
         let dir = jobs.dir().join("h/0");
         let job = jobs
-            .start(dir.clone(), Vec::new(), Written::Hls, 0, 0, 0, None)
+            .start(dir.clone(), Vec::new(), Written::Hls, false, 0, 0, 0, None)
             .unwrap();
         let pid = job.pid();
         assert!(alive(pid));
@@ -883,6 +1030,7 @@ mod tests {
                 dir,
                 vec![file.display().to_string()],
                 Written::Progressive { file },
+                false,
                 0,
                 0,
                 0,
@@ -931,6 +1079,7 @@ mod tests {
                 dir,
                 vec![file.display().to_string()],
                 Written::Progressive { file },
+                false,
                 0,
                 0,
                 0,
@@ -963,7 +1112,9 @@ mod tests {
         .await;
         let dir = jobs.dir().join("h/0");
         let args = vec![dir.display().to_string()];
-        let job = jobs.start(dir, args, Written::Hls, 0, 1, 0, None).unwrap();
+        let job = jobs
+            .start(dir, args, Written::Hls, false, 0, 1, 0, None)
+            .unwrap();
         job.reader_at(1, 6_000);
         let mut progress = job.progress();
         let listed = progress.wait_for(|p| p.last_segment == Some(1));
@@ -992,6 +1143,7 @@ mod tests {
                 dir,
                 vec![file.display().to_string()],
                 Written::Progressive { file },
+                false,
                 0,
                 0,
                 0,
@@ -1041,7 +1193,16 @@ mod tests {
         .await;
         let scratch = jobs.dir().to_path_buf();
         let job = jobs
-            .start(scratch.join("a/0"), Vec::new(), Written::Hls, 0, 0, 0, None)
+            .start(
+                scratch.join("a/0"),
+                Vec::new(),
+                Written::Hls,
+                false,
+                0,
+                0,
+                0,
+                None,
+            )
             .unwrap();
         let pid = job.pid();
         let ended = tokio::time::timeout(Duration::from_secs(5), done(&job))
@@ -1054,8 +1215,17 @@ mod tests {
         assert!(!alive(pid), "ffmpeg {pid} still runs");
         // The job is still held, as by a playback not yet stopped: its
         // slot, the only one, is free.
-        jobs.start(scratch.join("b/0"), Vec::new(), Written::Hls, 0, 0, 0, None)
-            .unwrap();
+        jobs.start(
+            scratch.join("b/0"),
+            Vec::new(),
+            Written::Hls,
+            false,
+            0,
+            0,
+            0,
+            None,
+        )
+        .unwrap();
     }
 
     /// An encode held back for its reader makes no progress on purpose,
@@ -1079,6 +1249,7 @@ mod tests {
                 dir,
                 vec![file.display().to_string()],
                 Written::Progressive { file },
+                false,
                 0,
                 0,
                 0,
@@ -1122,7 +1293,9 @@ mod tests {
         let dir = jobs.dir().join("h/0");
         let slow_part_over = jobs.dir().join("over");
         let args = vec![slow_part_over.display().to_string()];
-        let job = jobs.start(dir, args, Written::Hls, 0, 0, 0, None).unwrap();
+        let job = jobs
+            .start(dir, args, Written::Hls, false, 0, 0, 0, None)
+            .unwrap();
         let ended = tokio::time::timeout(Duration::from_secs(10), done(&job))
             .await
             .expect("the stalled encode is ended");
@@ -1185,7 +1358,11 @@ mod tests {
             let file = dir.join("out.mkv");
             let args = vec![file.display().to_string(), mode.to_owned()];
             let written = Written::Progressive { file: file.clone() };
-            (jobs.start(dir, args, written, 0, 0, 0, None).unwrap(), file)
+            (
+                jobs.start(dir, args, written, false, 0, 0, 0, None)
+                    .unwrap(),
+                file,
+            )
         };
         let (quiet, kept) = start("a", "quiet");
         let mut progress = quiet.progress();
@@ -1245,7 +1422,7 @@ mod tests {
         let (jobs, _dir) = jobs_within("trim", "exec sleep 30", 5_500).await;
         let dir = jobs.dir().join("h/0");
         let job = jobs
-            .start(dir.clone(), Vec::new(), Written::Hls, 0, 1, 0, None)
+            .start(dir.clone(), Vec::new(), Written::Hls, false, 0, 1, 0, None)
             .unwrap();
         // The reader asked for segment 7: 6 stays too, 1 to 5 may go.
         job.reader_at(7, 42_000);
@@ -1275,7 +1452,7 @@ mod tests {
         let dir = jobs.dir().join("h/0");
         let args = vec![dir.display().to_string()];
         let job = jobs
-            .start(dir.clone(), args, Written::Hls, 0, 1, 0, None)
+            .start(dir.clone(), args, Written::Hls, false, 0, 1, 0, None)
             .unwrap();
         // The reader got to segment 7, then went back to 4.
         job.reader_at(7, 42_000);

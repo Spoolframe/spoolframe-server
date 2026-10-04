@@ -9,6 +9,14 @@ use spoolframe_admin_api::{DeviceSignIn, MeApiClient, UserInfo};
 use super::{Alert, Centered, Field, Route, SignInForm, http, icons, rpc};
 use crate::logic::{ApiError, display_code};
 
+/// Where the page is.
+const PATH: &str = "/auth/device";
+
+/// `text` as a query value.
+fn encode(text: &str) -> String {
+    js_sys::encode_uri_component(text).into()
+}
+
 #[component]
 pub fn DeviceApproval(code: String) -> Element {
     // Who is signed in is asked first: without anyone, sign in here and
@@ -23,6 +31,20 @@ pub fn DeviceApproval(code: String) -> Element {
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "Spoolframe".into());
     let public_url = site.read().as_ref().and_then(|s| s.public_url.clone());
+    let insecure_cookies = site.read().as_ref().is_some_and(|s| s.insecure_cookies);
+    let sso = site
+        .read()
+        .as_ref()
+        .map(|s| s.sso.clone())
+        .unwrap_or_default();
+    // A provider's sign-in comes back here, to this code, and says here
+    // what went wrong.
+    let said = use_hook(|| {
+        http::sso_outcome(PATH)
+            .and_then(|(what, provider)| crate::sso::login_message(&what, provider.as_deref()))
+            .map(|(_, text)| text)
+    });
+    let return_to = format!("{PATH}?code={}", encode(&code));
     rsx! {
         Centered {
             match current {
@@ -32,6 +54,10 @@ pub fn DeviceApproval(code: String) -> Element {
                     SignInForm {
                         title: "Sign in to {server}",
                         public_url,
+                        insecure_cookies,
+                        sso,
+                        said,
+                        return_to,
                         on_done: move |_| me.restart(),
                     }
                 },

@@ -65,6 +65,10 @@ pub struct Site {
     /// `admin.insecure_cookies` (P3-10): the session cookie works over
     /// plain HTTP, and every admin page says so.
     pub insecure_cookies: bool,
+    /// The sign-in providers' names (P3-04), in the config's order: one
+    /// "Continue with" button each. None: no SSO anywhere.
+    #[serde(default)]
+    pub sso: Vec<String>,
 }
 
 pub async fn site() -> Result<Site, ApiError> {
@@ -79,6 +83,82 @@ pub async fn site() -> Result<Site, ApiError> {
         .json()
         .await
         .map_err(|e| ApiError::transport(e.to_string()))
+}
+
+/// Begin a flow with sign-in provider `provider` (P3-04) for `purpose`
+/// (`signIn`, `link`, `confirm`): the provider's address to send the
+/// browser to. The flow's cookie comes with the answer. A sign-in may
+/// name the page to come back to (`return_to`, path and query); without
+/// one, it comes back to the start page.
+pub async fn sso_begin(
+    provider: &str,
+    purpose: &str,
+    return_to: Option<&str>,
+) -> Result<String, ApiError> {
+    let mut body = json!({ "provider": provider, "purpose": purpose });
+    if let Some(page) = return_to {
+        body["return_to"] = json!(page);
+    }
+    let response = post("/auth/oidc/begin", body).await?;
+    if !response.ok() {
+        return Err(error_of(response).await);
+    }
+    #[derive(Deserialize)]
+    struct Begun {
+        url: String,
+    }
+    response
+        .json::<Begun>()
+        .await
+        .map(|b| b.url)
+        .map_err(|e| ApiError::transport(e.to_string()))
+}
+
+/// Send the browser to `url`: to a sign-in provider, which sends it back.
+pub fn go(url: &str) {
+    if let Some(window) = web_sys::window() {
+        let _ = window.location().set_href(url);
+    }
+}
+
+thread_local! {
+    /// What the server's SSO callback said, read from the address the app
+    /// opened at, with that address's path.
+    static SSO_OUTCOME: std::cell::RefCell<Option<(String, String, Option<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Read what the server's SSO callback said (`?sso=…&provider=…`) from the
+/// address the app opens at, before the router sees it, and take it out
+/// of the address, so a reload does not say it again. The page's own
+/// query stays.
+pub fn capture_sso_outcome() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let location = window.location();
+    let (Ok(search), Ok(path)) = (location.search(), location.pathname()) else {
+        return;
+    };
+    let Some((what, provider)) = crate::sso::outcome(&search) else {
+        return;
+    };
+    let address = format!("{path}{}", crate::sso::without_outcome(&search));
+    SSO_OUTCOME.with(|o| *o.borrow_mut() = Some((path, what, provider)));
+    if let Ok(history) = window.history() {
+        let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&address));
+    }
+}
+
+/// What the SSO callback said, once, if the app opened at `path`.
+pub fn sso_outcome(path: &str) -> Option<(String, Option<String>)> {
+    SSO_OUTCOME.with(|o| {
+        let mut o = o.borrow_mut();
+        match o.as_ref() {
+            Some((at, _, _)) if at == path => o.take().map(|(_, what, provider)| (what, provider)),
+            _ => None,
+        }
+    })
 }
 
 /// Begin a passkey sign-in: the request's id, and the options for the

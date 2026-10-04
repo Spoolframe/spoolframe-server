@@ -74,6 +74,8 @@ impl Catalog for Files {
 struct Setup {
     previews: Arc<Previews>,
     files: Arc<Files>,
+    /// The server's encodes: a test begins one as a conversion would.
+    encoding: Encoding,
     tmp: spoolframe_test_dir::TestDir,
 }
 
@@ -83,8 +85,18 @@ async fn setup(test: &str, settings: PreviewSettings) -> Setup {
 
 /// [`setup`], making previews with `ffmpeg`.
 async fn setup_with(test: &str, settings: PreviewSettings, ffmpeg: &str) -> Setup {
+    setup_making(test, settings, ffmpeg, None).await
+}
+
+async fn setup_making(
+    test: &str,
+    settings: PreviewSettings,
+    ffmpeg: &str,
+    maker: Option<Arc<dyn make::MakeTile>>,
+) -> Setup {
     let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-previews-{test}")).await;
     let files = Arc::new(Files::default());
+    let encoding = Encoding::default();
     let sources = PreviewSources {
         catalog: files.clone(),
         prober: Arc::new(Prober::new("ffprobe", Prober::DEFAULT_TIMEOUT)),
@@ -94,11 +106,18 @@ async fn setup_with(test: &str, settings: PreviewSettings, ffmpeg: &str) -> Setu
             tmp.as_ref().join("encoder-test"),
         )),
         ffmpeg: ffmpeg.into(),
+        encoding: encoding.clone(),
     };
-    let previews = Previews::start(&tmp.as_ref().join("previews"), settings, sources).unwrap();
+    let dir = tmp.as_ref().join("previews");
+    let previews = match maker {
+        Some(maker) => Previews::start_with(&dir, settings, sources, maker),
+        None => Previews::start(&dir, settings, sources),
+    }
+    .unwrap();
     Setup {
         previews,
         files,
+        encoding,
         tmp,
     }
 }
@@ -108,6 +127,7 @@ fn settings() -> PreviewSettings {
         when: When::OnPlay,
         interval: Duration::from_secs(10),
         cache_limit_bytes: 1 << 30,
+        workers: 1,
     }
 }
 
@@ -351,7 +371,7 @@ async fn a_stopping_server_gives_up_the_film_being_made() {
     }
     setup.previews.stop();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while ffmpeg_reading(&path) > 0 || setup.previews.lock_queue().current.is_some() {
+    while ffmpeg_reading(&path) > 0 || !setup.previews.lock_queue().making.is_empty() {
         assert!(std::time::Instant::now() < deadline, "still making");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -461,17 +481,27 @@ fn the_newest_go_ahead_of_what_was_queued_ahead_and_behind_what_is_played() {
     queue.push(&film("9"), true);
     // A later sweep: 3 is newest now, 4 is new.
     queue.ahead_of_the_rest([film("3"), film("4")].into_iter());
-    let order: Vec<_> = std::iter::from_fn(|| queue.pop())
-        .map(|(id, urgent)| (id.key().to_owned(), urgent))
-        .collect();
-    let want = [
-        ("9", true),
-        ("3", false),
-        ("4", false),
-        ("1", false),
-        ("2", false),
-    ];
-    assert_eq!(order, want.map(|(k, u)| (k.to_owned(), u)));
+    let urgent: Vec<_> = std::iter::from_fn(|| queue.pop_urgent()).collect();
+    assert_eq!(keys(&urgent), ["9"]);
+    let ahead: Vec<_> = std::iter::from_fn(|| queue.pop_ahead()).collect();
+    assert_eq!(keys(&ahead), ["3", "4", "1", "2"]);
+}
+
+#[test]
+fn a_file_being_made_ahead_that_is_played_is_made_at_once_where_it_is() {
+    let mut queue = Queue::default();
+    queue.ahead_of_the_rest([film("1"), film("2")].into_iter());
+    let one = queue.pop_ahead().unwrap();
+    queue.push(&one, true);
+    // Not queued to be made again: on where it is, as played.
+    assert!(queue.urgent.is_empty());
+    assert!(queue.making[&one].urgent);
+    // One still waiting is moved to the played ones.
+    queue.push(&film("2"), true);
+    assert_eq!(
+        keys(&queue.urgent.iter().cloned().collect::<Vec<_>>()),
+        ["2"]
+    );
 }
 
 #[tokio::test]
@@ -491,7 +521,7 @@ async fn previews_made_ahead_stop_when_the_cache_is_full_and_a_play_still_gets_i
     setup.previews.ahead([a.clone(), b.clone()]);
     let idle = |previews: &Previews| {
         let queue = previews.lock_queue();
-        queue.current.is_none() && queue.ahead.is_empty()
+        queue.making.is_empty() && queue.ahead.is_empty()
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while !idle(&setup.previews) {
@@ -517,4 +547,191 @@ async fn previews_made_ahead_stop_when_the_cache_is_full_and_a_play_still_gets_i
     // b is played: made, though it evicts a.
     setup.previews.played(&b);
     setup.ready(&b).await;
+}
+
+fn keys(ids: &[MediaId]) -> Vec<&str> {
+    ids.iter().map(MediaId::key).collect()
+}
+
+/// Tiles made only when the test lets them: each tile asked for is told
+/// on `asked` (the film's key and the tile's number), and then waits for
+/// a permit.
+struct Gated {
+    asked: tokio::sync::mpsc::UnboundedSender<(String, u64)>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl make::MakeTile for Gated {
+    async fn tile(
+        &self,
+        source: &make::Source,
+        _: bool,
+        at: Duration,
+        _: &Path,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let key = source
+            .input
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        self.asked.send((key, at.as_secs() / 10)).unwrap();
+        self.permits.acquire().await.unwrap().forget();
+        Ok(Some(sheets::tests::tile(320, 180, 128)))
+    }
+}
+
+/// A [`Setup`] whose tiles are [`Gated`]: the tiles asked for, and the
+/// permits that let them be made.
+struct GatedSetup {
+    setup: Setup,
+    asked: tokio::sync::mpsc::UnboundedReceiver<(String, u64)>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+async fn gated(test: &str, settings: PreviewSettings) -> GatedSetup {
+    let (tx, asked) = tokio::sync::mpsc::unbounded_channel();
+    let permits = Arc::new(tokio::sync::Semaphore::new(0));
+    let maker = Arc::new(Gated {
+        asked: tx,
+        permits: permits.clone(),
+    });
+    let setup = setup_making(test, settings, "ffmpeg", Some(maker)).await;
+    GatedSetup {
+        setup,
+        asked,
+        permits,
+    }
+}
+
+impl GatedSetup {
+    /// The next tile asked for.
+    async fn next_asked(&mut self) -> (String, u64) {
+        tokio::time::timeout(Duration::from_secs(30), self.asked.recv())
+            .await
+            .expect("no tile was asked for")
+            .unwrap()
+    }
+
+    /// Whether `id` is held back before its next tile.
+    async fn until_paused(&self, id: &MediaId) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !self
+            .setup
+            .previews
+            .lock_queue()
+            .making
+            .get(id)
+            .is_some_and(|m| m.paused)
+        {
+            assert!(std::time::Instant::now() < deadline, "{id} never paused");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+fn ahead_settings(workers: usize) -> PreviewSettings {
+    PreviewSettings {
+        when: When::Ahead,
+        workers,
+        ..settings()
+    }
+}
+
+#[tokio::test]
+async fn previews_made_ahead_wait_while_an_encode_runs_and_go_on_where_they_were() {
+    let mut gated = gated("ahead-pause", ahead_settings(1)).await;
+    let a = gated.setup.film("a", 30, 0);
+    gated.setup.previews.ahead([a.clone()]);
+    assert_eq!(gated.next_asked().await, ("a".into(), 0));
+    // A conversion starts while tile 0 is being made: that one is
+    // finished, and the next waits.
+    let encode = gated.setup.encoding.begin();
+    gated.permits.add_permits(1);
+    gated.until_paused(&a).await;
+    assert!(
+        gated.asked.try_recv().is_err(),
+        "a tile was made beside the encode"
+    );
+    // It ends: on from tile 1, tile 0 kept.
+    drop(encode);
+    assert_eq!(gated.next_asked().await, ("a".into(), 1));
+    gated.permits.add_permits(2);
+    let (_, meta) = gated.setup.ready(&a).await;
+    assert_eq!(meta.count, 3);
+}
+
+#[tokio::test]
+async fn nothing_is_started_ahead_while_an_encode_runs_but_a_played_film_is_made_at_once() {
+    let mut gated = gated("on-play-encoding", ahead_settings(4)).await;
+    let a = gated.setup.film("a", 30, 0);
+    let b = gated.setup.film("b", 30, 0);
+    let encode = gated.setup.encoding.begin();
+    gated.setup.previews.ahead([a.clone()]);
+    gated.setup.previews.played(&b);
+    // b, though the encode runs; a, made ahead, is not started.
+    assert_eq!(gated.next_asked().await, ("b".into(), 0));
+    gated.permits.add_permits(3);
+    assert_eq!(gated.next_asked().await, ("b".into(), 1));
+    assert_eq!(gated.next_asked().await, ("b".into(), 2));
+    gated.setup.ready(&b).await;
+    assert!(
+        gated.asked.try_recv().is_err(),
+        "a was started beside the encode"
+    );
+    assert!(gated.setup.previews.lock_queue().ahead.contains(&a));
+    drop(encode);
+    assert_eq!(gated.next_asked().await, ("a".into(), 0));
+}
+
+#[tokio::test]
+async fn a_film_held_back_by_an_encode_goes_on_at_once_when_it_is_played() {
+    let mut gated = gated("promoted", ahead_settings(1)).await;
+    let a = gated.setup.film("a", 30, 0);
+    gated.setup.previews.ahead([a.clone()]);
+    assert_eq!(gated.next_asked().await, ("a".into(), 0));
+    let _encode = gated.setup.encoding.begin();
+    gated.permits.add_permits(1);
+    gated.until_paused(&a).await;
+    // Played: on from tile 1 in the worker it was in, the encode still
+    // running.
+    gated.setup.previews.played(&a);
+    assert_eq!(gated.next_asked().await, ("a".into(), 1));
+    gated.permits.add_permits(2);
+    gated.setup.ready(&a).await;
+}
+
+#[tokio::test]
+async fn n_workers_make_n_files_ahead_at_once() {
+    let mut gated = gated("workers", ahead_settings(2)).await;
+    let films = ["a", "b", "c"].map(|k| gated.setup.film(k, 30, 0));
+    gated.setup.previews.ahead(films.clone());
+    let mut first = [gated.next_asked().await, gated.next_asked().await];
+    first.sort();
+    assert_eq!(first, [("a".into(), 0), ("b".into(), 0)]);
+    {
+        let queue = gated.setup.previews.lock_queue();
+        assert_eq!(queue.making.len(), 2);
+        assert_eq!(
+            keys(&queue.ahead.iter().cloned().collect::<Vec<_>>()),
+            ["c"]
+        );
+    }
+    // a and b finish; c follows.
+    gated.permits.add_permits(6);
+    let mut seen = HashSet::new();
+    while !seen.contains("c") {
+        seen.insert(gated.next_asked().await.0);
+    }
+    gated.permits.add_permits(3);
+    for id in &films {
+        let path = gated.setup.files.files.lock().unwrap()[id.key()].clone();
+        let key = key(&path, Duration::from_secs(10)).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while gated.setup.previews.cache.get(&key).is_none() {
+            assert!(std::time::Instant::now() < deadline, "{id} not made");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 }

@@ -350,3 +350,45 @@ async fn insecure_cookies_turned_on_apply_to_the_next_sign_in() {
         .unwrap();
     assert_eq!(site["insecureCookies"], true);
 }
+
+/// A sign-in provider's client secret set in the web UI (P3-04): kept as a
+/// secret file, readable by the server's user only, and never shown; a
+/// provider whose config names a file reads that file instead.
+#[tokio::test]
+async fn a_sign_in_provider_s_client_secret_is_kept_as_a_secret() {
+    use std::os::unix::fs::PermissionsExt;
+    let file = r#"
+        admin { public_url = "https://media.example.org"; }
+        auth { oidc [
+            { name = "Pocket ID"; issuer = "https://id.example.org"; client_id = "spoolframe"; },
+            { name = "Filed"; issuer = "https://other.example.org"; client_id = "x";
+              client_secret_file = "/run/secrets/filed"; },
+        ] }
+    "#;
+    let (_addr, root, dir) = served("sso-secret", file).await;
+    root.sso_set_client_secret("Pocket ID".into(), Some(" s3cr3t-client \n".into()))
+        .await
+        .unwrap();
+    let kept = dir.as_ref().join("secrets").join("oidc-pocket-id");
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "s3cr3t-client");
+    assert_eq!(
+        std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let all = serde_json::to_string(&root.settings().await.unwrap()).unwrap();
+    assert!(!all.contains("s3cr3t"), "{all}");
+    assert!(all.contains("auth.oidc"), "{all}");
+
+    let locked = root
+        .sso_set_client_secret("Filed".into(), Some("x".into()))
+        .await;
+    assert_eq!(code(locked.unwrap_err()), error_code::SETTING_LOCKED);
+    let unknown = root
+        .sso_set_client_secret("Nobody".into(), Some("x".into()))
+        .await;
+    assert_eq!(code(unknown.unwrap_err()), error_code::NOT_CONFIGURED);
+    root.sso_set_client_secret("Pocket ID".into(), None)
+        .await
+        .unwrap();
+    assert!(!kept.exists());
+}

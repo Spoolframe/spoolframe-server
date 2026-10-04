@@ -13,7 +13,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use spoolframe_media::encoders::Hardware;
@@ -121,29 +120,66 @@ const IOPRIO_WHO_PROCESS: libc::c_int = 1;
 /// wants the disk.
 const IOPRIO_IDLE: libc::c_int = 3 << 13;
 
-/// Make every tile of `source`, telling `done` how many are made, until
-/// `stop` is set. A tile whose seek finds no frame repeats the one before
-/// it, and at the end is left out; a failure with none before is the
-/// film's.
-pub async fn tiles(
-    ffmpeg: &Path,
+/// What makes one tile: ffmpeg ([`Ffmpeg`]), or a stand-in in tests.
+#[async_trait::async_trait]
+pub trait MakeTile: Send + Sync {
+    /// The tile at `at`, written to `out` on the way: its JPEG, or `None`
+    /// when there is no frame there.
+    async fn tile(
+        &self,
+        source: &Source,
+        hardware: bool,
+        at: Duration,
+        out: &Path,
+    ) -> Result<Option<Vec<u8>>, String>;
+}
+
+/// Tiles made by ffmpeg at this path.
+#[derive(Debug, Clone)]
+pub struct Ffmpeg(pub PathBuf);
+
+#[async_trait::async_trait]
+impl MakeTile for Ffmpeg {
+    async fn tile(
+        &self,
+        source: &Source,
+        hardware: bool,
+        at: Duration,
+        out: &Path,
+    ) -> Result<Option<Vec<u8>>, String> {
+        tile(&self.0, source, hardware, at, out).await
+    }
+}
+
+/// Make every tile of `source`, telling `done` how many are made. Before
+/// each tile `go_on` is awaited: it may hold the work back (previews
+/// made ahead wait while an encode runs, P3-13), keeping the tiles made
+/// so far, and `false` gives the file up. A tile whose seek finds no
+/// frame repeats the one before it, and at the end is left out; a
+/// failure with none before is the film's.
+pub async fn tiles<F, G>(
+    maker: &dyn MakeTile,
     source: &Source,
     interval: Duration,
     work: &Path,
-    stop: &AtomicBool,
+    go_on: G,
     done: &(dyn Fn(usize, usize) + Send + Sync),
-) -> Result<Vec<Vec<u8>>, String> {
+) -> Result<Vec<Vec<u8>>, String>
+where
+    G: Fn() -> F,
+    F: Future<Output = bool>,
+{
     let times = times(source.duration, interval);
     let mut hardware = source.hardware.is_some();
     let mut tiles: Vec<Vec<u8>> = Vec::with_capacity(times.len());
     // How many tiles there are up to the last real picture.
     let mut real = 0;
     for (i, at) in times.iter().enumerate() {
-        if stop.load(Ordering::SeqCst) {
+        if !go_on().await {
             return Err("stopped".into());
         }
         let out = work.join(format!("{i}.jpg"));
-        let mut made = tile(ffmpeg, source, hardware, *at, &out).await;
+        let mut made = maker.tile(source, hardware, *at, &out).await;
         if made.is_err() && hardware {
             tracing::info!(
                 input = %source.input.display(),
@@ -151,7 +187,7 @@ pub async fn tiles(
                 "hardware decoding fails for previews; going on in software"
             );
             hardware = false;
-            made = tile(ffmpeg, source, false, *at, &out).await;
+            made = maker.tile(source, false, *at, &out).await;
         }
         match (made, tiles.last()) {
             (Ok(Some(bytes)), _) => {

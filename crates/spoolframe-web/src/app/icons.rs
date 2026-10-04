@@ -335,7 +335,9 @@ pub fn Loader(#[props(default = 16)] size: u32) -> Element {
     }
 }
 
-/// The Spoolframe mark as the signed-out cards show it: a reel in a frame.
+/// The Spoolframe mark: a reel in a frame, at every size the pages show it
+/// (the cards, the sidebar, the bars). The three-hole reel is only the
+/// favicon, in public/.
 #[component]
 pub fn Mark(#[props(default = 56)] size: u32) -> Element {
     rsx! {
@@ -353,19 +355,6 @@ pub fn Mark(#[props(default = 56)] size: u32) -> Element {
             circle { cx: "39.42", cy: "64.56", r: "7", fill: "#1d1d2b" }
             circle { cx: "32.88", cy: "44.44", r: "7", fill: "#1d1d2b" }
             path { d: "M46.5 45 L55.5 50 L46.5 55 Z", fill: "#1d1d2b", stroke: "#1d1d2b", stroke_width: "1.5", stroke_linejoin: "round" }
-        }
-    }
-}
-
-/// The small reel of the sidebar and the phone bar.
-#[component]
-pub fn Reel(#[props(default = 28)] size: u32) -> Element {
-    rsx! {
-        svg { view_box: "12 12 76 76", width: "{size}", height: "{size}", "aria-hidden": "true",
-            circle { cx: "50", cy: "50", r: "38", fill: "var(--ctp-teal)" }
-            circle { cx: "50", cy: "30", r: "10.5", fill: "var(--ctp-mantle)" }
-            circle { cx: "67.32", cy: "60", r: "10.5", fill: "var(--ctp-mantle)" }
-            circle { cx: "32.68", cy: "60", r: "10.5", fill: "var(--ctp-mantle)" }
         }
     }
 }
@@ -522,6 +511,51 @@ pub fn Unlink(#[props(default = 16)] size: u32) -> Element {
             line { x1: "2", x2: "5", y1: "8", y2: "8" }
             line { x1: "16", x2: "16", y1: "19", y2: "22" }
             line { x1: "19", x2: "22", y1: "16", y2: "16" }
+        }
+    }
+}
+
+/// My profile's Playback card (P3-03).
+#[component]
+pub fn Captions(#[props(default = 18)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            rect { width: "18", height: "14", x: "3", y: "5", rx: "2", ry: "2" }
+            path { d: "M7 15h4M15 15h2M7 11h2M13 11h4" }
+        }
+    }
+}
+
+/// A laptop: a device of the user's.
+#[component]
+pub fn Laptop(#[props(default = 15)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M18 5a2 2 0 0 1 2 2v8.526a2 2 0 0 0 .212.897l1.068 2.127a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45l1.068-2.127A2 2 0 0 0 4 15.526V7a2 2 0 0 1 2-2z" }
+            path { d: "M20.054 15.987H3.946" }
+        }
+    }
+}
+
+/// A sign-in provider (P3-04).
+#[component]
+pub fn Globe(#[props(default = 15)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            circle { cx: "12", cy: "12", r: "10" }
+            path { d: "M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" }
+            path { d: "M2 12h20" }
+        }
+    }
+}
+
+/// Linking a sign-in provider (P3-04).
+#[component]
+pub fn LinkChain(#[props(default = 15)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" }
+            path { d: "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" }
         }
     }
 }

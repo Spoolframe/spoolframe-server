@@ -20,6 +20,7 @@ fn on_play() -> PreviewSettings {
         when: When::OnPlay,
         interval: Duration::from_secs(10),
         cache_limit_bytes: 1 << 30,
+        workers: 2,
     }
 }
 

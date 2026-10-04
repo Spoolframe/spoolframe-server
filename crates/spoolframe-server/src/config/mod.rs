@@ -125,10 +125,174 @@ pub struct ServerConfig {
     /// Frame previews for scrubbing (P3-13).
     #[ucl(default)]
     pub previews: PreviewsConfig,
+    /// Ways to sign in besides the password and passkeys: SSO (P3-04).
+    #[ucl(default)]
+    pub auth: AuthConfig,
     /// The setup wizard's progress (P3-10): the server's own, kept in the
     /// runtime layer, not a setting.
     #[ucl(default)]
     pub setup: SetupConfig,
+}
+
+/// `auth { oidc [ { name; issuer; client_id; client_secret_file; } ] }`
+/// (P3-04): the OpenID Connect providers a user may link to their account
+/// and then sign in with. None: no SSO anywhere.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct AuthConfig {
+    #[ucl(default)]
+    pub oidc: Vec<OidcConfig>,
+}
+
+/// One OpenID Connect provider (P3-04): Pocket ID, Authentik, Kanidm,
+/// Keycloak, Google, …. Spoolframe is its confidential client, with PKCE,
+/// and the callback `<admin.public_url>/auth/oidc/callback`.
+#[derive(Debug, Clone, PartialEq, Eq, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct OidcConfig {
+    /// What the buttons say: "Continue with <name>". Unique.
+    pub name: String,
+    /// The issuer, as its ID tokens' `iss` says it; its discovery document
+    /// is at `<issuer>/.well-known/openid-configuration`. HTTPS, or HTTP
+    /// on loopback only.
+    pub issuer: String,
+    pub client_id: String,
+    /// A file holding the client secret. Left out, the secret set in the
+    /// web UI, kept as `secrets/oidc-<name>` under the state directory.
+    #[ucl(default)]
+    pub client_secret_file: Option<PathBuf>,
+    /// The scopes asked for; `openid profile email` if left out. `openid`
+    /// is asked for whether it is listed or not.
+    #[ucl(default)]
+    pub scopes: Option<Vec<String>>,
+}
+
+/// The most characters a provider's name has: it is a button's label.
+pub const MAX_OIDC_NAME_LEN: usize = 40;
+
+impl OidcConfig {
+    /// The issuer, checked: HTTPS, or HTTP on a loopback host (a provider
+    /// on this machine, or a test's), with no query or fragment. Its keys
+    /// are fetched from it, so plain HTTP across a network would let
+    /// anyone on the way sign tokens.
+    pub fn issuer_url(&self) -> Result<Url, ConfigError> {
+        let invalid = |message: String| ConfigError::Invalid {
+            key: "auth.oidc",
+            message: format!("{:?}: {message}", self.name),
+        };
+        let url = Url::parse(&self.issuer)
+            .map_err(|e| invalid(format!("issuer {:?}: {e}", self.issuer)))?;
+        let loopback = match url.host() {
+            Some(url::Host::Domain(d)) => d == "localhost",
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
+        match url.scheme() {
+            "https" => {}
+            "http" if loopback => {}
+            _ => {
+                return Err(invalid(format!(
+                    "issuer {:?} is not an https URL (http only on localhost)",
+                    self.issuer
+                )));
+            }
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(invalid(format!(
+                "issuer {:?} has a query or a fragment",
+                self.issuer
+            )));
+        }
+        Ok(url)
+    }
+
+    /// The scopes asked for.
+    pub fn scopes(&self) -> Vec<String> {
+        match &self.scopes {
+            Some(scopes) => scopes.clone(),
+            None => crate::oidc::DEFAULT_SCOPES.map(str::to_owned).to_vec(),
+        }
+    }
+
+    /// The secret it is kept as when set in the web UI: `oidc-<name>`, the
+    /// name lower-cased with anything but letters and digits as `-`.
+    pub fn secret_name(&self) -> String {
+        oidc_secret_name(&self.name)
+    }
+}
+
+/// See [`OidcConfig::secret_name`].
+pub fn oidc_secret_name(name: &str) -> String {
+    let mut slug = String::new();
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    format!("oidc-{}", slug.trim_matches('-'))
+}
+
+impl AuthConfig {
+    /// Every provider checked: a name, an issuer, a client id, none twice;
+    /// and somewhere for the provider to send the browser back to.
+    fn check(&self, admin: &AdminConfig) -> Result<(), ConfigError> {
+        let mut names: Vec<String> = Vec::new();
+        let mut issuers: Vec<&str> = Vec::new();
+        for p in &self.oidc {
+            let invalid = |message: String| ConfigError::Invalid {
+                key: "auth.oidc",
+                message,
+            };
+            let name = p.name.trim();
+            if name.is_empty() || name.chars().count() > MAX_OIDC_NAME_LEN {
+                return Err(invalid(format!(
+                    "{:?}: a provider's name is 1 to {MAX_OIDC_NAME_LEN} characters",
+                    p.name
+                )));
+            }
+            let secret = p.secret_name();
+            if secret == "oidc-" || names.contains(&secret) {
+                return Err(invalid(format!(
+                    "{:?}: another provider has this name, or one that differs only in case \
+                     and punctuation",
+                    p.name
+                )));
+            }
+            names.push(secret);
+            p.issuer_url()?;
+            if issuers.contains(&p.issuer.as_str()) {
+                return Err(invalid(format!(
+                    "{:?}: issuer {:?} is another provider's too",
+                    p.name, p.issuer
+                )));
+            }
+            issuers.push(&p.issuer);
+            if p.client_id.trim().is_empty() {
+                return Err(invalid(format!("{:?}: client_id is empty", p.name)));
+            }
+            for scope in p.scopes.iter().flatten() {
+                if scope.is_empty() || scope.contains(char::is_whitespace) {
+                    return Err(invalid(format!(
+                        "{:?}: scope {scope:?} is not one scope",
+                        p.name
+                    )));
+                }
+            }
+        }
+        if !self.oidc.is_empty() && admin.public_url.is_none() {
+            return Err(ConfigError::Invalid {
+                key: "auth.oidc",
+                message:
+                    "a provider sends the browser back to <admin.public_url>/auth/oidc/callback: \
+                          set admin.public_url"
+                        .into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// `setup { done = ["admin", "server"]; finished = false; }`: written by
@@ -246,8 +410,8 @@ impl SubtitlesConfig {
     }
 }
 
-/// `previews { when = "ahead"; interval_secs = 10; cache_mb = 4096; }`,
-/// all optional.
+/// `previews { when = "ahead"; interval_secs = 10; cache_mb = 4096;
+/// workers = 8; }`, all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct PreviewsConfig {
@@ -261,6 +425,10 @@ pub struct PreviewsConfig {
     /// out.
     #[ucl(default)]
     pub cache_mb: Option<u64>,
+    /// Files made ahead at once while nothing is encoded; the physical
+    /// cores the server may use if left out.
+    #[ucl(default)]
+    pub workers: Option<u32>,
 }
 
 impl PreviewsConfig {
@@ -286,10 +454,21 @@ impl PreviewsConfig {
                 message: "0 would be a picture for every moment; use at least 1".into(),
             });
         }
+        let workers = match self.workers {
+            Some(0) => {
+                return Err(ConfigError::Invalid {
+                    key: "previews.workers",
+                    message: "0 would make none ahead; use when = \"on_play\" for that".into(),
+                });
+            }
+            Some(n) => n as usize,
+            None => crate::previews::workers::default_workers().count,
+        };
         Ok(PreviewSettings {
             when,
             interval: Duration::from_secs(interval),
             cache_limit_bytes: self.cache_mb.unwrap_or(Self::DEFAULT_CACHE_MB) << 20,
+            workers,
         })
     }
 }
@@ -968,6 +1147,7 @@ impl ServerConfig {
         parsed.admin.listen()?;
         parsed.admin.origins()?;
         parsed.admin.trusted_proxies()?;
+        parsed.auth.check(&parsed.admin)?;
         parsed.watch.rules()?;
         parsed.transcode.settings()?;
         // Any directory: only the values are checked here.
@@ -1187,11 +1367,12 @@ mod tests {
                 when: When::Ahead,
                 interval: Duration::from_secs(10),
                 cache_limit_bytes: 4096 << 20,
+                workers: crate::previews::workers::default_workers().count,
             }
         );
         let config = plex(
             r#"plex { url = "http://nas:32400"; }
-               previews { when = "on_play"; interval_secs = 5; cache_mb = 100; }"#,
+               previews { when = "on_play"; interval_secs = 5; cache_mb = 100; workers = 3; }"#,
         )
         .unwrap();
         assert_eq!(
@@ -1200,6 +1381,7 @@ mod tests {
                 when: When::OnPlay,
                 interval: Duration::from_secs(5),
                 cache_limit_bytes: 100 << 20,
+                workers: 3,
             }
         );
     }
@@ -1209,6 +1391,7 @@ mod tests {
         for (text, key) in [
             (r#"previews { when = "sometimes"; }"#, "previews.when"),
             ("previews { interval_secs = 0; }", "previews.interval_secs"),
+            ("previews { workers = 0; }", "previews.workers"),
         ] {
             let text = format!(r#"plex {{ url = "http://nas:32400"; }} {text}"#);
             assert!(
@@ -1535,6 +1718,95 @@ mod tests {
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    fn oidc(providers: &str, admin: &str) -> Result<ServerConfig, ConfigError> {
+        ServerConfig::parse(&format!(
+            "schema = \"spoolframe.server.v1\"; admin {{ {admin} }} auth {{ oidc [ {providers} ] }}"
+        ))
+    }
+
+    const PUBLIC: &str = r#"public_url = "https://media.example.org";"#;
+
+    #[test]
+    fn oidc_providers_are_read_in_order() {
+        let config = oidc(
+            r#"{ name = "Pocket ID"; issuer = "https://id.example.org";
+                 client_id = "abc"; client_secret_file = "/run/secrets/oidc"; },
+               { name = "Local"; issuer = "http://127.0.0.1:9000/o/"; client_id = "x"; }"#,
+            PUBLIC,
+        )
+        .unwrap();
+        let p = &config.auth.oidc;
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].name, "Pocket ID");
+        assert_eq!(p[0].secret_name(), "oidc-pocket-id");
+        assert_eq!(
+            p[0].client_secret_file,
+            Some(PathBuf::from("/run/secrets/oidc"))
+        );
+        assert_eq!(p[1].client_secret_file, None);
+        assert_eq!(p[0].scopes(), ["openid", "profile", "email"]);
+        // None by default.
+        assert!(
+            ServerConfig::parse(r#"schema = "spoolframe.server.v1";"#)
+                .unwrap()
+                .auth
+                .oidc
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_oidc_provider_that_cannot_work_is_refused() {
+        let one = |p: &str| oidc(p, PUBLIC).unwrap_err().to_string();
+        assert!(
+            one(r#"{ name = "A"; issuer = "http://id.example.org"; client_id = "x"; }"#)
+                .contains("not an https URL")
+        );
+        assert!(
+            one(r#"{ name = "A"; issuer = "https://id.example.org/?x=1"; client_id = "x"; }"#)
+                .contains("query")
+        );
+        assert!(
+            one(r#"{ name = ""; issuer = "https://id.example.org"; client_id = "x"; }"#)
+                .contains("1 to 40")
+        );
+        assert!(
+            one(r#"{ name = "A"; issuer = "https://id.example.org"; client_id = " "; }"#)
+                .contains("client_id")
+        );
+        assert!(
+            one(
+                r#"{ name = "Pocket ID"; issuer = "https://a.example.org"; client_id = "x"; },
+                   { name = "pocket-id"; issuer = "https://b.example.org"; client_id = "x"; }"#
+            )
+            .contains("another provider has this name")
+        );
+        assert!(
+            one(
+                r#"{ name = "A"; issuer = "https://a.example.org"; client_id = "x"; },
+                   { name = "B"; issuer = "https://a.example.org"; client_id = "y"; }"#
+            )
+            .contains("another provider's too")
+        );
+        assert!(
+            one(r#"{ name = "A"; issuer = "https://a.example.org"; client_id = "x"; extra = 1; }"#)
+                .contains("extra")
+        );
+        assert!(
+            one(r#"{ name = "A"; issuer = "https://a.example.org"; client_id = "x"; scopes = ["openid email"]; }"#)
+                .contains("not one scope")
+        );
+        let no_public_url = oidc(
+            r#"{ name = "A"; issuer = "https://a.example.org"; client_id = "x"; }"#,
+            "",
+        )
+        .unwrap_err();
+        assert!(
+            no_public_url.to_string().contains("set admin.public_url"),
+            "{no_public_url}"
         );
     }
 

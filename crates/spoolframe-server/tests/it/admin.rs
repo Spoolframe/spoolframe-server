@@ -43,6 +43,7 @@ pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
         settings: None,
         wizard: Default::default(),
         passkeys: std::sync::Arc::new(Passkeys::new(&Origins::default())),
+        oidc: Default::default(),
     }
 }
 
