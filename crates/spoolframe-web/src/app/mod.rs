@@ -19,6 +19,7 @@ use spoolframe_admin_api::{MeApiClient, PasswordChange, Role, UserInfo};
 use admin::{AdminHome, Server, UserSessions, Users};
 use device::DeviceApproval;
 use libraries::{AddLibrary, Libraries};
+use plex::PlexSignedIn;
 use profile::Profile;
 use settings::{Settings, SettingsHome};
 use wizard::{Mode, Steps, WizardLayout};
@@ -54,6 +55,11 @@ enum Route {
     // on the code.
     #[route("/auth/device?:code")]
     DeviceApproval { code: String },
+    // Where Plex's sign-in ends (P3-10, P3-12): the window it opened in,
+    // which closes itself; the page that opened it is the one waiting.
+    // The server's `forwardUrl` names this path.
+    #[route("/auth/plex")]
+    PlexSignedIn {},
     #[layout(Shell)]
         #[nest("/admin")]
             #[route("/")]
@@ -84,11 +90,12 @@ enum Route {
 
 impl From<Landing> for Route {
     fn from(landing: Landing) -> Self {
-        match landing {
-            Landing::Setup => Route::Setup {},
-            Landing::Login => Route::Login {},
-            Landing::Admin => Route::Users {},
-            Landing::Profile => Route::Profile {},
+        let path = landing.path();
+        match path.parse() {
+            Ok(Route::NotFound { .. }) | Err(_) => {
+                unreachable!("a landing's path is one of the routes: {path}")
+            }
+            Ok(route) => route,
         }
     }
 }
@@ -1102,7 +1109,7 @@ fn SignedIn(user: UserInfo) -> Element {
         return rsx! {
             div { class: "min-h-screen bg-ctp-base text-ctp-text",
                 header { class: "top-bar",
-                    span { class: "flex min-w-0 items-center gap-2.5",
+                    Link { class: "home-link flex min-w-0 items-center gap-2.5", to: Route::from(Landing::Profile),
                         icons::Mark { size: 28 }
                         Wordmark { class: "text-lg" }
                         if !server.is_empty() {
@@ -1127,7 +1134,8 @@ fn SignedIn(user: UserInfo) -> Element {
         // lines, and stretched lines would leave a gap under the bar.
         div { class: "flex min-h-screen flex-wrap content-start bg-ctp-base text-ctp-text",
             aside { class: "sidebar hidden md:flex",
-                div { class: "flex items-center gap-2.5 px-2",
+                // The mark goes to the admin's start, the Server page.
+                Link { class: "home-link flex items-center gap-2.5 px-2", to: Route::from(Landing::Admin),
                     icons::Mark { size: 28 }
                     div { class: "flex flex-col",
                         Wordmark {}
@@ -1161,7 +1169,9 @@ fn SignedIn(user: UserInfo) -> Element {
                         onclick: move |_| menu.toggle(),
                         icons::Menu {}
                     }
-                    icons::Mark { size: 24 }
+                    Link { class: "home-link flex", to: Route::from(Landing::Admin), aria_label: "Server",
+                        icons::Mark { size: 24 }
+                    }
                     b { class: "font-display text-[17px]", "{title}" }
                 }
                 span { class: "flex items-center gap-3",

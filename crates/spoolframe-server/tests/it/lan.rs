@@ -91,6 +91,7 @@ fn device() -> Device {
         name: "laptop".into(),
         client_name: "lan-test".into(),
         client_version: "0".into(),
+        platform: spoolframe_client_sdk::types::Platform::Cli,
         capabilities: ClientCapabilities::default(),
     }
 }

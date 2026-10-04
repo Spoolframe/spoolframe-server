@@ -23,6 +23,7 @@ fn device(capabilities: ClientCapabilities) -> Device {
         name: "living room".into(),
         client_name: "sdk-test".into(),
         client_version: "0".into(),
+        platform: spoolframe_client_sdk::types::Platform::Tvos,
         capabilities,
     }
 }
@@ -615,10 +616,10 @@ async fn a_pin_required_here_locks_the_profile_when_the_app_opens_again() {
     let (server, client, storage) = ready("sdk-pin").await;
     let alice = alice(&server, &client).await;
     assert_eq!(
-        alice.set_pin("12").await,
+        alice.set_pin("12", None).await,
         Err(SdkError::InvalidInput("a PIN is 4 to 8 digits".into()))
     );
-    alice.set_pin("4321").await.unwrap();
+    alice.set_pin("4321", None).await.unwrap();
     alice.set_pin_required(None, true).await.unwrap();
     let devices = alice.devices().await.unwrap();
     assert!(
@@ -641,6 +642,18 @@ async fn a_pin_required_here_locks_the_profile_when_the_app_opens_again() {
     );
     alice.unlock("4321").await.unwrap();
     alice.libraries().await.unwrap();
+    assert_eq!(
+        alice.user().pin,
+        Some(spoolframe_client_sdk::PinState { digits: Some(4) })
+    );
+    // Change PIN and Remove PIN take the current one.
+    assert_eq!(
+        alice.set_pin("98765", Some("0000")).await,
+        Err(SdkError::InvalidCredentials)
+    );
+    alice.set_pin("98765", Some("4321")).await.unwrap();
+    alice.clear_pin("98765").await.unwrap();
+    assert_eq!(alice.whoami().await.unwrap().pin, None);
     client.close().await;
     server.stop().await;
 }
@@ -812,5 +825,107 @@ async fn a_tv_is_signed_in_from_a_browser_by_its_web_qr_code() {
     assert_eq!(on_tv.user().username, "alice");
     on_tv.libraries().await.unwrap();
     tv.close().await;
+    server.stop().await;
+}
+
+/// Preferences' Plex row: whether this user's Plex account is linked, and
+/// as whom; linking itself is in the web UI (P3-12).
+#[tokio::test]
+async fn a_session_reads_its_user_s_plex_link() {
+    let (server, client, _) = ready("sdk-plex-link").await;
+    let alice = alice(&server, &client).await;
+    assert_eq!(alice.plex_link().await.unwrap(), None);
+
+    let alice_id = server
+        .store
+        .password_login("alice")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    server
+        .plex_accounts
+        .save(
+            alice_id,
+            &spoolframe_server::plex_accounts::AccountLink {
+                token: "plex-token".into(),
+                username: Some("alice_plex".into()),
+                email: Some("alice@example.com".into()),
+                linked_at: 1_790_000_000,
+            },
+        )
+        .unwrap();
+    let link = alice.plex_link().await.unwrap().expect("linked");
+    assert_eq!(link.username.as_deref(), Some("alice_plex"));
+    assert_eq!(link.email.as_deref(), Some("alice@example.com"));
+    assert_eq!(link.linked_at, Some(1_790_000_000));
+    assert!(!link.by_config);
+
+    // Only hers: bob's session says he is not linked.
+    let bob = client
+        .sign_in(&id(&server), "bob", "battery staple")
+        .await
+        .unwrap();
+    assert_eq!(bob.plex_link().await.unwrap(), None);
+    client.close().await;
+    server.stop().await;
+}
+
+fn secs(at: Option<std::time::SystemTime>) -> u64 {
+    at.expect("dated")
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Preferences' Servers: when each server's fingerprint was checked and
+/// when it last answered, kept with the saved servers.
+#[tokio::test]
+async fn a_saved_server_is_dated_when_pinned_verified_and_connected() {
+    let server = TestServer::start("sdk-server-dates").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let before = std::time::SystemTime::now();
+    let client = client_on(&server, &storage).await;
+    let entry = client.servers().await.unwrap().remove(0);
+    assert!(entry.pinned && entry.verified);
+    for at in [entry.pinned_at, entry.verified_at, entry.last_connected_at] {
+        assert!(
+            at.is_some_and(|at| at >= before - Duration::from_secs(1)),
+            "{entry:?}"
+        );
+    }
+    client.close().await;
+
+    // Long ago, as far as the store knows.
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&storage.data("servers").await.unwrap().unwrap()).unwrap();
+    saved[0]["pinned_at"] = 1.into();
+    saved[0]["verified_at"] = 2.into();
+    saved[0]["last_connected_at"] = 3.into();
+    storage
+        .set_data("servers", Some(serde_json::to_vec(&saved).unwrap()))
+        .await
+        .unwrap();
+
+    // The app opens again and connects: only the connect is dated anew.
+    let client = Client::open(storage.clone(), device(mkv_capabilities()))
+        .await
+        .unwrap();
+    let addrs = server.server.addr().ip_addrs().copied().collect();
+    client.add_address(&id(&server), addrs).unwrap();
+    let connected = client.connect(&id(&server)).await.unwrap();
+    assert!(secs(connected.last_connected_at) > 3);
+    assert_eq!(
+        (secs(connected.pinned_at), secs(connected.verified_at)),
+        (1, 2)
+    );
+    let listed = client.servers().await.unwrap().remove(0);
+    assert_eq!(listed.last_connected_at, connected.last_connected_at);
+
+    // Not verified after all: no verification date.
+    let unverified = client.pin(&id(&server), false).await.unwrap();
+    assert_eq!(unverified.verified_at, None);
+    assert_eq!(secs(unverified.pinned_at), 1);
+    client.close().await;
     server.stop().await;
 }

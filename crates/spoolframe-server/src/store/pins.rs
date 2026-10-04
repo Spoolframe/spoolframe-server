@@ -1,6 +1,8 @@
 //! Profile PINs and where they are asked for (P2-08). Checking a PIN and
 //! the lock it opens are `crate::auth`'s; this is storage.
 
+use spoolframe_types::Platform;
+
 use super::users::LocalUserId;
 use super::{Store, StoreError, now};
 
@@ -11,10 +13,27 @@ pub struct DeviceRecord {
     pub endpoint_id: String,
     /// What the client called itself.
     pub name: Option<String>,
+    /// Its [`Platform`] by name; see [`DeviceRecord::platform`].
+    platform: Option<String>,
     /// Unix seconds.
     pub last_seen_at: i64,
     /// The user's PIN is asked for on it.
     pub pin_required: bool,
+}
+
+/// What may be said about a user's PIN: never its hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinInfo {
+    /// How many digits it has; `None` for a PIN set before they were kept.
+    pub digits: Option<u8>,
+}
+
+impl DeviceRecord {
+    /// What kind of client it runs; `None` for a device not seen since the
+    /// server began keeping it.
+    pub fn platform(&self) -> Option<Platform> {
+        self.platform.as_deref().map(Platform::from_name)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,15 +65,36 @@ impl Store {
         )
     }
 
-    /// Set or replace `user`'s PIN (its hash). Where it is required stays.
-    pub async fn set_pin(&self, user: LocalUserId, phc: &str) -> Result<(), StoreError> {
+    /// Whether `user` has a PIN, and how long it is.
+    pub async fn pin_info(&self, user: LocalUserId) -> Result<Option<PinInfo>, StoreError> {
+        let digits: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT digits FROM pin_credentials WHERE user_id = ?1")
+                .bind(user.0)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(digits.map(|digits| PinInfo {
+            // The column allows only 4 to 8.
+            digits: digits.and_then(|d| u8::try_from(d).ok()),
+        }))
+    }
+
+    /// Set or replace `user`'s PIN: its hash, and how many digits it has.
+    /// Where it is required stays.
+    pub async fn set_pin(
+        &self,
+        user: LocalUserId,
+        phc: &str,
+        digits: u8,
+    ) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO pin_credentials (user_id, phc, updated_at) VALUES (?1, ?2, ?3) \
-             ON CONFLICT (user_id) DO UPDATE SET phc = excluded.phc, updated_at = excluded.updated_at",
+            "INSERT INTO pin_credentials (user_id, phc, updated_at, digits) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (user_id) DO UPDATE SET phc = excluded.phc, \
+             updated_at = excluded.updated_at, digits = excluded.digits",
         )
         .bind(user.0)
         .bind(phc)
         .bind(now())
+        .bind(i64::from(digits))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -127,7 +167,7 @@ impl Store {
     /// The devices `user` has signed in from, most recently seen first.
     pub async fn user_devices(&self, user: LocalUserId) -> Result<Vec<DeviceRecord>, StoreError> {
         Ok(sqlx::query_as(
-            "SELECT d.endpoint_id, d.display_name AS name, d.last_seen_at, \
+            "SELECT d.endpoint_id, d.display_name AS name, d.platform, d.last_seen_at, \
                     EXISTS (SELECT 1 FROM pin_required r \
                             WHERE r.user_id = ?1 AND r.endpoint_id = d.endpoint_id) AS pin_required \
              FROM devices d \
@@ -180,6 +220,7 @@ mod tests {
                     &SessionBinding::Endpoint {
                         endpoint_id: (*endpoint).into(),
                         device_name: Some(format!("device {n}")),
+                        platform: Platform::Linux,
                     },
                     now() + 3600,
                 )
@@ -198,7 +239,7 @@ mod tests {
             store.set_pin_required(alice, "tv", true).await,
             Err(PinError::NoPin)
         ));
-        store.set_pin(alice, "pin-phc").await.unwrap();
+        store.set_pin(alice, "pin-phc", 4).await.unwrap();
         store.set_pin_required(alice, "tv", true).await.unwrap();
         let required: Vec<_> = store
             .user_devices(alice)
@@ -225,6 +266,34 @@ mod tests {
                 .iter()
                 .all(|d| !d.pin_required)
         );
+    }
+
+    #[tokio::test]
+    async fn a_pin_s_length_is_kept_and_unknown_for_one_set_before_it_was() {
+        let store = test_store("pin-digits").await;
+        let alice = alice_on(&store, &["tv"]).await;
+        assert_eq!(store.pin_info(alice).await.unwrap(), None);
+        store.set_pin(alice, "pin-phc", 6).await.unwrap();
+        assert_eq!(
+            store.pin_info(alice).await.unwrap(),
+            Some(PinInfo { digits: Some(6) })
+        );
+        store.set_pin(alice, "pin-phc", 4).await.unwrap();
+        assert_eq!(
+            store.pin_info(alice).await.unwrap(),
+            Some(PinInfo { digits: Some(4) })
+        );
+        // As a PIN from before migration 0010 is: a hash and no length.
+        sqlx::query("UPDATE pin_credentials SET digits = NULL")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.pin_info(alice).await.unwrap(),
+            Some(PinInfo { digits: None })
+        );
+        store.clear_pin(alice).await.unwrap();
+        assert_eq!(store.pin_info(alice).await.unwrap(), None);
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use spoolframe_admin_api::{
     AdminApiClient, MeApiClient, NewUser, PlexLink, PlexLinkState, Role, error_code,
 };
 use spoolframe_server::admin::Wizard;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::admin::{CODE, anonymous, code, creds, setup, with_token};
@@ -28,8 +28,10 @@ pub(crate) async fn plex_tv(pin: u64, token: &str, username: &str) -> MockServer
 pub(crate) async fn mount_pin(tv: &MockServer, pin: u64, token: &str, username: &str) {
     Mock::given(method("POST"))
         .and(path("/api/v2/pins"))
+        // Plex's sign-in page takes only a strong PIN.
+        .and(query_param("strong", "true"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-            "id": pin, "code": "4F7K", "expiresIn": 900, "authToken": null
+            "id": pin, "code": "q3n8vbx2kd5w7rjh0tyc4mzpf", "expiresIn": 900, "authToken": null
         })))
         .up_to_n_times(1)
         .mount(tv)
@@ -37,7 +39,7 @@ pub(crate) async fn mount_pin(tv: &MockServer, pin: u64, token: &str, username: 
     Mock::given(method("GET"))
         .and(path(format!("/api/v2/pins/{pin}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": pin, "code": "4F7K", "authToken": null
+            "id": pin, "code": "q3n8vbx2kd5w7rjh0tyc4mzpf", "authToken": null
         })))
         .up_to_n_times(1)
         .with_priority(1)
@@ -46,7 +48,7 @@ pub(crate) async fn mount_pin(tv: &MockServer, pin: u64, token: &str, username: 
     Mock::given(method("GET"))
         .and(path(format!("/api/v2/pins/{pin}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": pin, "code": "4F7K", "authToken": token
+            "id": pin, "code": "q3n8vbx2kd5w7rjh0tyc4mzpf", "authToken": token
         })))
         .with_priority(2)
         .mount(tv)
@@ -108,7 +110,11 @@ pub(crate) async fn link(client: &WsClient) -> PlexLink {
         "{}",
         pin.auth_url
     );
-    assert!(pin.auth_url.contains("code=4F7K"), "{}", pin.auth_url);
+    assert!(
+        pin.auth_url.contains("code=q3n8vbx2kd5w7rjh0tyc4mzpf"),
+        "{}",
+        pin.auth_url
+    );
     assert_eq!(
         client.plex_link_check(pin.id).await.unwrap(),
         PlexLinkState::Waiting
@@ -122,6 +128,65 @@ pub(crate) async fn link(client: &WsClient) -> PlexLink {
 /// The user's own secret, as a file under the state directory.
 pub(crate) fn secret(dir: &std::path::Path, user_id: i64) -> Option<String> {
     std::fs::read_to_string(dir.join(format!("secrets/plex-account-{user_id}"))).ok()
+}
+
+/// `forwardUrl` in Plex's sign-in page `auth_url`, if it has one.
+pub(crate) fn forward_url(auth_url: &str) -> Option<String> {
+    let (_, fragment) = auth_url.split_once("#?")?;
+    url::form_urlencoded::parse(fragment.as_bytes())
+        .find(|(k, _)| k == "forwardUrl")
+        .map(|(_, v)| v.into_owned())
+}
+
+/// Signed in as `token` from a browser that has the web UI open at its
+/// own address: the socket's `Origin` is the page's.
+pub(crate) async fn from_browser(addr: SocketAddr, token: &str) -> WsClient {
+    let mut headers = jsonrpsee::ws_client::HeaderMap::new();
+    headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+    headers.insert("origin", format!("http://{addr}").parse().unwrap());
+    jsonrpsee::ws_client::WsClientBuilder::default()
+        .set_headers(headers)
+        .build(format!("ws://{addr}"))
+        .await
+        .unwrap()
+}
+
+/// Plex's sign-in ends on the web UI's page that the browser has open,
+/// rather than on "We were unable to complete this request"; the CLI,
+/// which has no page, gets none.
+#[tokio::test]
+async fn plex_s_sign_in_goes_back_to_the_web_ui_the_browser_has_open() {
+    let tv = plex_tv(77, "tok-root", "root").await;
+    mount_pin(&tv, 78, "tok-root", "root").await;
+    mount_pin(&tv, 79, "tok-root", "root").await;
+    let (addr, _dir) = served_with("plex-forward", "", reaching(&tv)).await;
+    let token = anonymous(addr)
+        .await
+        .setup(setup(CODE, "root", "correct horse"))
+        .await
+        .unwrap()
+        .token;
+
+    let browser = from_browser(addr, &token).await;
+    let pin = browser.plex_link_begin().await.unwrap();
+    assert_eq!(
+        forward_url(&pin.auth_url).as_deref(),
+        Some(format!("http://{addr}/auth/plex").as_str()),
+        "{}",
+        pin.auth_url
+    );
+    // The wizard's Sign in with Plex (P3-10) as well.
+    let pin = browser.plex_pin_begin().await.unwrap();
+    assert_eq!(
+        forward_url(&pin.auth_url).as_deref(),
+        Some(format!("http://{addr}/auth/plex").as_str()),
+        "{}",
+        pin.auth_url
+    );
+
+    let cli = with_token(addr, &token).await;
+    let pin = cli.plex_link_begin().await.unwrap();
+    assert_eq!(forward_url(&pin.auth_url), None, "{}", pin.auth_url);
 }
 
 #[tokio::test]

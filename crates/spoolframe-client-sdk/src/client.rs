@@ -13,7 +13,7 @@ use std::time::Duration;
 use spoolframe_protocol::{
     LoginPassword, Reply, Request, Response, SessionId, device_sign_in, fingerprint, lan,
 };
-use spoolframe_types::ClientCapabilities;
+use spoolframe_types::{ClientCapabilities, Platform};
 
 use crate::connection::ServerConnection;
 use crate::discovery::Discovery;
@@ -32,6 +32,9 @@ pub struct Device {
     /// The app, e.g. `spoolframe-linux`, and its version.
     pub client_name: String,
     pub client_version: String,
+    /// What kind of client the app is: the server shows it in device and
+    /// session lists ("Linux app", "Apple TV app").
+    pub platform: Platform,
     /// What this device can play, from its decoders (P1-07).
     pub capabilities: ClientCapabilities,
 }
@@ -160,6 +163,9 @@ impl Client {
                 let on_lan = id.and_then(|id| heard.remove(&id));
                 ServerEntry {
                     fingerprint: fingerprint::of_hex(&s.endpoint_id).unwrap_or_default(),
+                    pinned_at: servers::time(s.pinned_at),
+                    verified_at: servers::time(s.verified_at),
+                    last_connected_at: servers::time(s.last_connected_at),
                     endpoint_id: s.endpoint_id,
                     name: s.name,
                     pinned: true,
@@ -180,6 +186,9 @@ impl Client {
                 pinned: false,
                 verified: false,
                 on_network: true,
+                pinned_at: None,
+                verified_at: None,
+                last_connected_at: None,
             })
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -247,6 +256,11 @@ impl Client {
                 return Err(e);
             }
         };
+        // Read again: dialling it has just dated the connect.
+        let pinned = servers::load(self.inner.storage.as_ref())
+            .await?
+            .into_iter()
+            .find(|s| s.endpoint_id == endpoint_id);
         Ok(self.entry(id, &conn, pinned.as_ref()))
     }
 
@@ -261,7 +275,7 @@ impl Client {
             let _saving = self.inner.saving.lock().await;
             let mut saved = servers::load(storage).await?;
             if let Some(server) = saved.iter_mut().find(|s| s.endpoint_id == endpoint_id) {
-                server.verified = verified;
+                server.set_verified(verified);
                 let entry = ServerEntry {
                     endpoint_id: server.endpoint_id.clone(),
                     name: server.name.clone(),
@@ -270,6 +284,9 @@ impl Client {
                     pinned: true,
                     verified,
                     on_network: self.inner.discovery.get(&id).is_some(),
+                    pinned_at: servers::time(server.pinned_at),
+                    verified_at: servers::time(server.verified_at),
+                    last_connected_at: servers::time(server.last_connected_at),
                 };
                 servers::save(storage, &saved).await?;
                 self.inner.discovery.changed();
@@ -285,12 +302,12 @@ impl Client {
             }
         }
         let conn = self.link(id).connection(self).await?;
-        let server = SavedServer {
-            name: conn.info.name.clone(),
-            endpoint_id: endpoint_id.to_owned(),
-            last_known_addrs: conn.remote_addrs(),
+        let server = SavedServer::pinned_now(
+            conn.info.name.clone(),
+            endpoint_id.to_owned(),
+            conn.remote_addrs(),
             verified,
-        };
+        );
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
         let mut saved = servers::load(storage).await?;
@@ -328,12 +345,13 @@ impl Client {
         {
             link.close();
         }
-        let server = SavedServer {
-            name: conn.info.name.clone(),
-            endpoint_id: new_id.to_owned(),
-            last_known_addrs: conn.remote_addrs(),
-            verified: true,
-        };
+        // The user checked the new key's fingerprint to get here.
+        let server = SavedServer::pinned_now(
+            conn.info.name.clone(),
+            new_id.to_owned(),
+            conn.remote_addrs(),
+            true,
+        );
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
         let mut saved = servers::load(storage).await?;
@@ -398,6 +416,9 @@ impl Client {
             pinned: saved.is_some(),
             verified: saved.is_some_and(|s| s.verified),
             on_network: self.inner.discovery.get(&id).is_some(),
+            pinned_at: saved.and_then(|s| servers::time(s.pinned_at)),
+            verified_at: saved.and_then(|s| servers::time(s.verified_at)),
+            last_connected_at: saved.and_then(|s| servers::time(s.last_connected_at)),
         }
     }
 
@@ -660,8 +681,9 @@ impl Client {
         Ok(conn)
     }
 
-    /// A saved server's name and addresses, as it answered now. The key is
-    /// the match, so a pin is never moved to another key.
+    /// A saved server's name and addresses, as it answered now, and that it
+    /// answered now. The key is the match, so a pin is never moved to
+    /// another key.
     async fn refresh(
         &self,
         id: EndpointId,
@@ -676,6 +698,7 @@ impl Client {
         };
         server.name = name.to_owned();
         server.last_known_addrs = addrs;
+        server.last_connected_at = Some(servers::now());
         servers::save(storage, &saved).await?;
         self.inner.discovery.changed();
         Ok(())
@@ -756,6 +779,7 @@ mod tests {
             name: "test".into(),
             client_name: "spoolframe-sdk-test".into(),
             client_version: "0".into(),
+            platform: crate::types::Platform::Cli,
             capabilities: ClientCapabilities::default(),
         }
     }

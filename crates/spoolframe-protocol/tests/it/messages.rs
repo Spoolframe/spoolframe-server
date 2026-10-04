@@ -103,6 +103,7 @@ fn hello() -> Hello {
         protocol_version: PROTOCOL_VERSION,
         client_name: "spoolframe-linux".into(),
         client_version: "0.1.0".into(),
+        platform: spoolframe_types::Platform::Linux,
         device_name: Some("Living room".into()),
         capabilities: Some(ClientCapabilities {
             video: [VideoCodec::H264].into(),
@@ -184,10 +185,16 @@ fn every_request_round_trips() {
         Request::StopPlayback {
             handle: spoolframe_protocol::PlaybackHandle("h".into()),
         },
-        Request::SetPin { pin: "4321".into() },
-        Request::ClearPin,
+        Request::SetPin {
+            pin: "4321".into(),
+            current: Some("1234".into()),
+        },
+        Request::ClearPin {
+            current: "4321".into(),
+        },
         Request::UnlockProfile { pin: "4321".into() },
         Request::ListDevices,
+        Request::GetPlexLink,
         Request::SetPinRequired {
             device: None,
             required: false,
@@ -343,15 +350,35 @@ fn every_reply_round_trips() {
             display_name: "Alice".into(),
             role: spoolframe_types::Role::Consumer,
             locked: true,
+            pin: Some(spoolframe_protocol::PinState { digits: Some(6) }),
         }),
         Reply::Devices {
             devices: vec![spoolframe_protocol::DeviceInfo {
                 endpoint_id: "ab".repeat(32),
                 name: Some("Living room TV".into()),
+                platform: Some(spoolframe_types::Platform::Tvos),
                 last_seen_at: 1_790_000_000,
                 pin_required: true,
                 this_device: false,
             }],
+        },
+        Reply::PlexLink { link: None },
+        Reply::PlexLink {
+            link: Some(spoolframe_protocol::PlexLink {
+                username: Some("alice".into()),
+                email: Some("alice@example.com".into()),
+                by_config: false,
+                linked_at: Some(1_790_000_000),
+                last_sync: Some(spoolframe_protocol::PlexSyncSummary {
+                    at: 1_790_000_100,
+                    libraries: 2,
+                    pulled: 3,
+                    pushed: 4,
+                    skipped: 5,
+                    failed: 0,
+                }),
+                syncing: true,
+            }),
         },
         Reply::LoggedOut,
         Reply::Done,
@@ -416,6 +443,7 @@ fn every_reply_round_trips() {
         Reply::Sessions {
             sessions: vec![SessionInfo {
                 device_name: Some("Living room".into()),
+                platform: Some(spoolframe_types::Platform::Linux),
                 created_at: 1,
                 last_used_at: 2,
                 current: true,
@@ -685,6 +713,8 @@ mod newer {
         pub protocol_version: u32,
         pub client_name: String,
         pub client_version: String,
+        /// A platform this build has never heard of.
+        pub platform: String,
         /// A field this build has never heard of.
         pub screen_inches: u32,
     }
@@ -723,11 +753,13 @@ fn a_field_added_by_a_newer_client_is_ignored() {
         protocol_version: 2,
         client_name: "next".into(),
         client_version: "9".into(),
+        platform: "vision_os".into(),
         screen_inches: 65,
     })
     .unwrap();
     let hello: Hello = codec::decode(&bytes).unwrap();
     assert_eq!(hello.protocol_version, 2);
+    assert_eq!(hello.platform, spoolframe_types::Platform::Unknown);
 }
 
 #[test]

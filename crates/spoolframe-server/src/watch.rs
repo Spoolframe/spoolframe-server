@@ -286,13 +286,52 @@ impl Watch {
         id: &MediaId,
         watched: bool,
     ) -> Result<(), WatchError> {
-        if !tracked(id) {
-            return Err(WatchError::NotTracked(id.clone()));
+        match id.kind() {
+            MediaKind::Season | MediaKind::Show => {
+                return self.mark_episodes(principal, id, watched).await;
+            }
+            _ if !tracked(id) => return Err(WatchError::NotTracked(id.clone())),
+            _ => {}
         }
         let found = self.catalog.item(id).await?;
         let duration = self.duration(id, &found.item).await;
         self.save(principal, id, &found, None, duration, watched)
             .await
+    }
+
+    /// Mark every episode of a season, or of a show's seasons (specials
+    /// included), as a client's "mark season watched" means. The state is
+    /// kept per episode, as if each were marked: there is none for a
+    /// season. Durations are the catalog's, not probed: a show can have
+    /// hundreds of files, and a mark does not need the exact length.
+    async fn mark_episodes(
+        &self,
+        principal: Principal,
+        id: &MediaId,
+        watched: bool,
+    ) -> Result<(), WatchError> {
+        let found = self.catalog.item(id).await?;
+        let mut seasons = Vec::new();
+        match found.item {
+            Item::Show(_) => {
+                for child in &found.children {
+                    if let Item::Season(s) = child {
+                        seasons.push(s.id.clone());
+                    }
+                }
+            }
+            _ => seasons.push(id.clone()),
+        }
+        for season in seasons {
+            let season = self.catalog.item(&season).await?;
+            for child in &season.children {
+                let Item::Episode(e) = child else { continue };
+                let episode = self.catalog.item(&e.id).await?;
+                self.save(principal, &e.id, &episode, None, e.duration, watched)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn save(

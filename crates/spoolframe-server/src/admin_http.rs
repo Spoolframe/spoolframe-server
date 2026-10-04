@@ -32,7 +32,7 @@ use spoolframe_admin_api::{
     SetupRequest, error_code,
 };
 
-use crate::admin::{AdminApi, Bearer, Peer, SsoOutcome};
+use crate::admin::{AdminApi, Bearer, PageOrigin, Peer, SsoOutcome};
 use crate::auth::API_SESSION;
 
 /// The browser's session cookie: an admin API session token, as the CLI's
@@ -359,11 +359,26 @@ fn is_upgrade(headers: &HeaderMap) -> bool {
 /// Refuse what another site's page could make a signed-in browser do: a
 /// POST or a WebSocket upgrade from a foreign `Origin`. `SameSite=Strict`
 /// already keeps the cookie off them; this does not rely on it.
-async fn check_origin(State(origins): State<Origins>, req: Request, next: Next) -> Response<Body> {
+async fn check_origin(
+    State(origins): State<Origins>,
+    mut req: Request,
+    next: Next,
+) -> Response<Body> {
     let acts = req.method() == axum::http::Method::POST || is_upgrade(req.headers());
     if acts && !origins.allow(req.headers()) {
         tracing::warn!(origin = ?req.headers().get(header::ORIGIN), "admin request from another origin refused");
         return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+    }
+    // Allowed just now: the web UI's own origin, for the methods.
+    if acts
+        && let Some(origin) = req
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .filter(|o| o.starts_with("http://") || o.starts_with("https://"))
+    {
+        let origin = PageOrigin(origin.to_owned());
+        req.extensions_mut().insert(origin);
     }
     next.run(req).await
 }

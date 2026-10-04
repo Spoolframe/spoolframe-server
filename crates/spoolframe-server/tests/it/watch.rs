@@ -216,6 +216,67 @@ async fn continue_watching_is_newest_first() {
     server.stop().await;
 }
 
+fn season_id(key: &str) -> MediaId {
+    MediaId::new(
+        spoolframe_types::Namespace::Plex,
+        spoolframe_types::MediaKind::Season,
+        key,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn marking_a_season_watched_marks_its_episodes() {
+    let (server, tv, alice, bob) = alice_and_bob("mark-season").await;
+    mark_watched(&tv, &alice, &season_id("11")).await;
+    for e in [episode("12", "11", 1, 1), episode("13", "11", 1, 2)] {
+        assert!(state_of(&tv, &alice, e.id()).await.watched, "{}", e.id());
+    }
+    // Only that season, and only for alice.
+    assert!(
+        !state_of(&tv, &alice, episode("15", "14", 2, 1).id())
+            .await
+            .watched
+    );
+    assert!(
+        !state_of(&tv, &bob, episode("12", "11", 1, 1).id())
+            .await
+            .watched
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn marking_a_show_watched_marks_every_episode_and_unmarking_clears_them() {
+    let (server, tv, alice, _) = alice_and_bob("mark-show").await;
+    let show = support::show().id().clone();
+    let all = [
+        episode("21", "20", 0, 1),
+        episode("12", "11", 1, 1),
+        episode("13", "11", 1, 2),
+        episode("15", "14", 2, 1),
+    ];
+    mark_watched(&tv, &alice, &show).await;
+    for e in &all {
+        assert!(state_of(&tv, &alice, e.id()).await.watched, "{}", e.id());
+    }
+    let response = tv
+        .call(
+            Some(&alice),
+            Request::MarkUnwatched {
+                id: season_id("11"),
+            },
+        )
+        .await;
+    assert_eq!(response, Response::Ok(Reply::Done));
+    assert!(!state_of(&tv, &alice, all[1].id()).await.watched);
+    assert!(!state_of(&tv, &alice, all[2].id()).await.watched);
+    assert!(state_of(&tv, &alice, all[3].id()).await.watched);
+    tv.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn next_up_crosses_a_season_boundary() {
     let (server, tv, alice, _) = alice_and_bob("next-up").await;
@@ -482,25 +543,6 @@ async fn home_lists_recently_added() {
         ids(&home(&tv, &alice).await.recently_added),
         [movie().id().to_string()]
     );
-    tv.close().await;
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn shows_have_no_watch_state() {
-    let (server, tv, alice, _) = alice_and_bob("not-tracked").await;
-    let response = tv
-        .call(
-            Some(&alice),
-            Request::MarkWatched {
-                id: support::show().id().clone(),
-            },
-        )
-        .await;
-    assert!(matches!(
-        response,
-        Response::Err(spoolframe_protocol::Error::NotFound { .. })
-    ));
     tv.close().await;
     server.stop().await;
 }

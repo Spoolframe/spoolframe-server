@@ -608,6 +608,7 @@ async fn sign_in_on_tv(dir: &std::path::Path) -> String {
             &spoolframe_server::store::sessions::SessionBinding::Endpoint {
                 endpoint_id: tv.clone(),
                 device_name: Some("Living room TV".into()),
+                platform: spoolframe_admin_api::Platform::Tvos,
             },
             i64::MAX / 2,
         )
@@ -632,6 +633,10 @@ async fn a_user_sets_their_pin_and_where_it_is_asked_for_and_an_admin_clears_it(
     let devices = alice.devices().await.unwrap();
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].name.as_deref(), Some("Living room TV"));
+    assert_eq!(
+        devices[0].platform,
+        Some(spoolframe_admin_api::Platform::Tvos)
+    );
     assert!(devices[0].pin_required);
     alice.set_pin_required(tv.clone(), false).await.unwrap();
     assert!(!alice.devices().await.unwrap()[0].pin_required);
@@ -747,6 +752,7 @@ async fn the_user_list_counts_each_user_s_devices_and_live_sessions() {
             &spoolframe_server::store::sessions::SessionBinding::Endpoint {
                 endpoint_id: tv,
                 device_name: Some("Living room TV".into()),
+                platform: spoolframe_admin_api::Platform::Tvos,
             },
             i64::MAX / 2,
         )
@@ -765,6 +771,14 @@ async fn the_user_list_counts_each_user_s_devices_and_live_sessions() {
     // A revoked session is not live; the device it was on is still hers.
     let sessions = root.user_sessions("alice".into()).await.unwrap();
     let browser = sessions.iter().find(|s| s.endpoint_id.is_none()).unwrap();
+    // The web UI says "Apple TV app" for the TV's, "Web or CLI" for hers.
+    assert_eq!(browser.platform, None);
+    assert!(
+        sessions
+            .iter()
+            .filter(|s| s.endpoint_id.is_some())
+            .all(|s| s.platform == Some(spoolframe_admin_api::Platform::Tvos))
+    );
     root.user_revoke_session("alice".into(), browser.id.clone())
         .await
         .unwrap();

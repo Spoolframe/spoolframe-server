@@ -11,12 +11,13 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{
-    ClientCapabilities, Item, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId, Role,
-    SubtitleFormat, TrackPreferences,
+    ClientCapabilities, Item, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId, Platform,
+    Role, SubtitleFormat, TrackPreferences,
 };
 
 use crate::media::PlaybackHandle;
 use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Selection};
+use crate::plex::PlexLink;
 use crate::previews::Previews;
 use crate::search::{SearchRequest, SearchResults};
 
@@ -138,15 +139,24 @@ pub enum Request {
         handle: PlaybackHandle,
         position_ms: u64,
     },
-    /// Set or change the session user's PIN (P2-08): 4 to 8 digits. A PIN
-    /// only locks and unlocks a session a real sign-in made, so the
-    /// unlocked session is all this needs. `Done`.
+    /// Set the session user's PIN (P2-08): 4 to 8 digits. `Done`.
+    ///
+    /// A user who has one changes it only with it: `current` is checked as
+    /// `UnlockProfile` checks a PIN, and a wrong one counts towards the
+    /// same limit (`InvalidCredentials`, then `RateLimited`, and after 10
+    /// wrong in a row `Unauthenticated`: the session on this device is
+    /// revoked). Without `current` it is `InvalidInput`. A user with no PIN
+    /// sends none; one sent is not looked at. Checking it unlocks nothing.
     SetPin {
         pin: String,
+        current: Option<String>,
     },
-    /// Remove the session user's PIN, and its requirement on every device.
-    /// `Done`.
-    ClearPin,
+    /// Remove the session user's PIN, and its requirement on every device,
+    /// with the `current` PIN, checked and limited as for `SetPin`. `Done`;
+    /// also for a user with no PIN.
+    ClearPin {
+        current: String,
+    },
     /// Unlock this session on this connection with the user's PIN (P2-08).
     /// Wrong PINs are rate-limited; after 10 in a row the session on this
     /// device is revoked (`Unauthenticated`): sign in with the password.
@@ -156,6 +166,9 @@ pub enum Request {
     },
     /// The devices the session user has signed in from. `Devices`.
     ListDevices,
+    /// The session user's Plex account link (P3-12): `PlexLink`. Read
+    /// only; a client links or unlinks by opening `<web_url>/profile`.
+    GetPlexLink,
     /// Ask for the session user's PIN on `device` (an endpoint id from
     /// `Devices`; this device if left out), or stop asking. A locked
     /// session cannot ask this (nor anything but `WhoAmI` and
@@ -303,6 +316,10 @@ pub struct Hello {
     /// e.g. `spoolframe-linux`.
     pub client_name: String,
     pub client_version: String,
+    /// What kind of client this is: the server keeps it for the device, for
+    /// its device and session lists. Not taken from `client_name`, which
+    /// one app may share across platforms.
+    pub platform: Platform,
     /// What the device calls itself (a hostname, "Living room TV"); shown
     /// in session lists. Optional.
     #[serde(default)]
@@ -450,6 +467,11 @@ pub enum Reply {
     Devices {
         devices: Vec<DeviceInfo>,
     },
+    /// The session user's Plex link; `None`: not linked (or the server
+    /// links no Plex accounts).
+    PlexLink {
+        link: Option<PlexLink>,
+    },
     /// The playback's new plan after `ChangeSubtitle`: read `epoch` (0 for
     /// direct play), whose size is `size` (0 while a conversion writes it).
     PlaybackChanged {
@@ -526,6 +548,17 @@ pub struct UserSummary {
     /// but `WhoAmI` and `UnlockProfile` (P2-08).
     #[serde(default)]
     pub locked: bool,
+    /// The user's PIN, if they have one (P2-08): for "Set · 4 digits", and
+    /// for how many boxes a PIN pad shows. Never the PIN itself.
+    pub pin: Option<PinState>,
+}
+
+/// A user's PIN as clients may know it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinState {
+    /// How many digits it has (4 to 8); `None` for a PIN set before the
+    /// server kept its length, until it is set again.
+    pub digits: Option<u8>,
 }
 
 /// One of a user's devices (P2-08).
@@ -536,6 +569,9 @@ pub struct DeviceInfo {
     /// What the device calls itself.
     #[serde(default)]
     pub name: Option<String>,
+    /// What kind of client it runs, as its `Hello` said; `None` for a
+    /// device not seen since before the server kept it.
+    pub platform: Option<Platform>,
     /// Unix seconds.
     pub last_seen_at: i64,
     /// The user's PIN is asked for on it.
@@ -562,6 +598,10 @@ pub struct SessionInfo {
     /// The device's name; `None` for an admin API session or an unnamed
     /// device.
     pub device_name: Option<String>,
+    /// What kind of client the device runs; `None` for an admin API
+    /// session (the web UI or the CLI) or a device not seen since before
+    /// the server kept it.
+    pub platform: Option<Platform>,
     /// Unix seconds.
     pub created_at: i64,
     /// Unix seconds.

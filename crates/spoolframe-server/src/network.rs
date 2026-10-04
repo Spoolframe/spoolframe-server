@@ -144,6 +144,10 @@ pub struct Services {
     /// The web UI's origin (`admin.public_url`), where a browser approves
     /// a device's sign-in (P3-05); `None` without one.
     pub public_url: Option<String>,
+    /// Users' Plex links and their sync (P3-12), for `GetPlexLink`; `None`
+    /// on a server that links no Plex accounts.
+    pub plex_accounts: Option<Arc<crate::plex_accounts::PlexAccounts>>,
+    pub plex_sync: Option<Arc<crate::plex_sync::WatchSync>>,
 }
 
 impl std::fmt::Debug for Services {

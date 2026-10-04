@@ -353,6 +353,23 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
             ) {
                 args.extend([s("-tag:v"), s("hvc1")]);
             }
+            // `hvc1` also means the parameter sets are in the sample
+            // entry's `hvcC`, and AVPlayer decodes with those alone. A
+            // copied stream's `hvcC` is the source's record as it is, and
+            // some Matroska files (4K WEB-DLs) keep the parameter sets only
+            // in the stream, before each keyframe: the record has none, and
+            // AVPlayer refuses the stream. As Annex B the MP4 muxer reads
+            // them from the first keyframe into a whole record, whatever
+            // the source's was, and stores the samples length-prefixed
+            // again.
+            if matches!(
+                spec.video,
+                Some(ConvertedVideo::Copy {
+                    codec: VideoCodec::Hevc
+                })
+            ) {
+                args.extend([s("-bsf:v"), s("hevc_mp4toannexb")]);
+            }
             args.extend([
                 s("-f"),
                 s("hls"),
@@ -614,6 +631,25 @@ mod tests {
             let args = ffmpeg_args(&spec(&film, &enc, encode, COPY_DTS, None, hls())).unwrap();
             assert!(has(&args, &["-tag:v", "hvc1"]), "{args:?}");
         }
+    }
+
+    #[test]
+    fn only_copied_hevc_in_hls_has_its_parameter_sets_read_from_the_stream() {
+        let (film, enc) = (film(), encoders(false));
+        let args = ffmpeg_args(&spec(&film, &enc, COPY_HEVC, COPY_DTS, None, hls())).unwrap();
+        assert_eq!(after(&args, "-bsf:v"), "hevc_mp4toannexb", "{args:?}");
+        // An encoder gives its own; Matroska keeps the source's record.
+        let encode = ConvertedVideo::Encode {
+            codec: VideoCodec::Hevc,
+            height: 1080,
+            max_bitrate: None,
+            tone_map: false,
+        };
+        let args = ffmpeg_args(&spec(&film, &enc, encode, COPY_DTS, None, hls())).unwrap();
+        assert!(!args.contains(&s("-bsf:v")), "{args:?}");
+        let args =
+            ffmpeg_args(&spec(&film, &enc, COPY_HEVC, COPY_DTS, None, progressive())).unwrap();
+        assert!(!args.contains(&s("-bsf:v")), "{args:?}");
     }
 
     #[test]

@@ -17,7 +17,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 pub use spoolframe_types::{
-    AudioRole, LibraryKind, Role, SdhPreference, SubtitleMode, SubtitleRole, TrackPreferences,
+    AudioRole, LibraryKind, Platform, Role, SdhPreference, SubtitleMode, SubtitleRole,
+    TrackPreferences,
 };
 
 /// JSON-RPC error codes the admin API returns, beside the standard ones.
@@ -267,6 +268,10 @@ pub struct SessionEntry {
     /// a web or CLI session.
     #[serde(default)]
     pub endpoint_id: Option<String>,
+    /// What kind of client the device runs, for a client session; `None`
+    /// for a web or CLI session, or a device not seen since before the
+    /// server kept it.
+    pub platform: Option<Platform>,
 }
 
 /// One of a user's devices (P2-08).
@@ -277,6 +282,9 @@ pub struct DeviceEntry {
     pub endpoint_id: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// What kind of client it runs; `None` for a device not seen since
+    /// before the server kept it.
+    pub platform: Option<Platform>,
     /// Unix seconds.
     pub last_seen_at: i64,
     /// The user's PIN is asked for on it.
@@ -698,9 +706,9 @@ pub struct DiscoveredPlex {
 pub struct PlexPin {
     /// For `plexPinCheck`.
     pub id: u64,
-    /// What a person types at plex.tv/link.
-    pub code: String,
-    /// Plex's sign-in page for it, to open in a new tab.
+    /// Plex's sign-in page for it, to open in a new window. The PIN is a
+    /// strong one, whose code is not for typing at plex.tv/link: it is
+    /// in this address, and nowhere else.
     pub auth_url: String,
     /// Seconds until plex.tv forgets it.
     pub expires_in: Option<u64>,

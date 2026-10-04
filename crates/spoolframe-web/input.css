@@ -522,6 +522,11 @@
     border-top: 1px solid var(--ctp-surface0);
     padding-top: 12px;
   }
+  /* The mark and wordmark as the link home: as they look unlinked. */
+  .home-link {
+    color: inherit;
+    text-decoration: none;
+  }
   .wordmark {
     font-family: var(--font-wordmark);
     font-weight: 700;
@@ -1308,12 +1313,6 @@
   .panel b {
     color: var(--ctp-text);
     font-size: 14px;
-  }
-  .pin-code {
-    font: 600 34px var(--font-mono);
-    letter-spacing: 0.2em;
-    color: var(--ctp-teal);
-    text-align: center;
   }
   /* A list of things, each on a line: libraries, a summary. */
   .lines {

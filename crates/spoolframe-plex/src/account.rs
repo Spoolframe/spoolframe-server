@@ -1,8 +1,12 @@
 //! Sign in with Plex (P3-10): plex.tv's PIN flow, which gets a Plex
 //! account's token without anyone typing it. The server asks plex.tv for a
-//! PIN, the browser opens Plex's sign-in page with it (or the person types
-//! its short code at plex.tv/link), and the server polls the PIN until
-//! plex.tv hands it the token.
+//! strong PIN, the browser opens Plex's sign-in page with it, and the
+//! server polls the PIN until plex.tv hands it the token.
+//!
+//! The PIN is a strong one: app.plex.tv/auth refuses a short one with a
+//! "Security Alert: another device is attempting to sign in". A strong
+//! PIN's code is long and only ever travels inside the sign-in page's
+//! address; nobody types it at plex.tv/link.
 //!
 //! A linked account's token also lists the Plex servers it reaches, each
 //! with a token of its own for that server (P3-12).
@@ -24,6 +28,9 @@ pub const PLEX_TV: &str = "https://plex.tv";
 pub const PLEX_APP: &str = "https://app.plex.tv";
 
 const PRODUCT: &str = "Spoolframe";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// What holds the token: a server, not the browser that signs in.
+const DEVICE: &str = "Server";
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
@@ -38,7 +45,8 @@ pub enum AccountError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pin {
     pub id: u64,
-    /// The short code a person can type at plex.tv/link.
+    /// The strong PIN's code, already in `auth_url`: long, and not for
+    /// typing at plex.tv/link.
     pub code: String,
     /// Seconds until plex.tv forgets it.
     pub expires_in: Option<u64>,
@@ -157,6 +165,17 @@ struct ConnectionReply {
     relay: bool,
 }
 
+/// The server's operating system, as Plex's own apps name theirs.
+fn platform() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "Linux",
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "freebsd" => "FreeBSD",
+        other => other,
+    }
+}
+
 impl PlexTv {
     /// plex.tv at `api`, its sign-in page at `app`, for the installation
     /// `client_id`, which a PIN is bound to.
@@ -182,6 +201,9 @@ impl PlexTv {
             .request(method, self.url(path))
             .header(reqwest::header::ACCEPT, "application/json")
             .header("X-Plex-Product", PRODUCT)
+            .header("X-Plex-Version", VERSION)
+            .header("X-Plex-Platform", platform())
+            .header("X-Plex-Device", DEVICE)
             .header("X-Plex-Client-Identifier", &self.client_id)
     }
 
@@ -192,9 +214,23 @@ impl PlexTv {
             .map_err(|e| AccountError::Unreachable(e.to_string()))
     }
 
-    /// A new PIN, with a short code (typeable at plex.tv/link).
-    pub async fn begin(&self) -> Result<Pin, AccountError> {
-        let response = Self::send(self.request(reqwest::Method::POST, "/api/v2/pins")).await?;
+    /// A new strong PIN and Plex's sign-in page for it. `forward`: the
+    /// page Plex's sign-in goes on to once it is done (`forwardUrl`);
+    /// without one, it ends on "We were unable to complete this request"
+    /// although the PIN was approved. Polling the PIN ([`Self::check`])
+    /// is what links; the page there only tells the person.
+    ///
+    /// The page's address carries `clientID`, `code`, the device context
+    /// and `forwardUrl`. The context is the one every request here sends as
+    /// `X-Plex-*` headers, `clientID` the `X-Plex-Client-Identifier`: plex.tv
+    /// binds the PIN to that installation, and names it by that context in
+    /// its device list and security notices.
+    pub async fn begin(&self, forward: Option<&str>) -> Result<Pin, AccountError> {
+        let response = Self::send(
+            self.request(reqwest::Method::POST, "/api/v2/pins")
+                .query(&[("strong", "true")]),
+        )
+        .await?;
         if !response.status().is_success() {
             return Err(AccountError::Refused(response.status().to_string()));
         }
@@ -204,11 +240,18 @@ impl PlexTv {
             .map_err(|e| AccountError::Refused(format!("an unreadable PIN: {e}")))?;
         let mut auth = self.app.clone();
         auth.set_path("/auth");
-        let query = url::form_urlencoded::Serializer::new(String::new())
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query
             .append_pair("clientID", &self.client_id)
             .append_pair("code", &pin.code)
             .append_pair("context[device][product]", PRODUCT)
-            .finish();
+            .append_pair("context[device][version]", VERSION)
+            .append_pair("context[device][platform]", platform())
+            .append_pair("context[device][device]", DEVICE);
+        if let Some(forward) = forward {
+            query.append_pair("forwardUrl", forward);
+        }
+        let query = query.finish();
         Ok(Pin {
             id: pin.id,
             auth_url: format!("{auth}#?{query}"),
@@ -303,7 +346,7 @@ impl PlexTv {
 
 #[cfg(test)]
 mod tests {
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -322,27 +365,50 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v2/pins"))
+            // app.plex.tv/auth takes only a strong PIN; a short one is
+            // refused there with a "Security Alert".
+            .and(query_param("strong", "true"))
             .and(header("X-Plex-Client-Identifier", "client-1"))
             .and(header("X-Plex-Product", "Spoolframe"))
+            .and(header("X-Plex-Version", VERSION))
+            .and(header("X-Plex-Platform", platform()))
+            .and(header("X-Plex-Device", "Server"))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "id": 77, "code": "4F7K", "expiresIn": 900, "authToken": null
+                "id": 77, "code": "q3n8vbx2kd5w7rjh0tyc4mzpf", "expiresIn": 900, "authToken": null
             })))
             .mount(&server)
             .await;
         let tv = plex_tv(&server).await;
-        let pin = tv.begin().await.unwrap();
+        let pin = tv
+            .begin(Some("http://media.lan:8090/auth/plex"))
+            .await
+            .unwrap();
         assert_eq!(pin.id, 77);
-        assert_eq!(pin.code, "4F7K");
+        assert_eq!(pin.code, "q3n8vbx2kd5w7rjh0tyc4mzpf");
         assert_eq!(pin.expires_in, Some(900));
-        assert_eq!(
-            pin.auth_url,
-            "https://app.example/auth#?clientID=client-1&code=4F7K&context%5Bdevice%5D%5Bproduct%5D=Spoolframe"
-        );
+        let (page, fragment) = pin.auth_url.split_once("#?").unwrap();
+        assert_eq!(page, "https://app.example/auth");
+        let params: Vec<(String, String)> = url::form_urlencoded::parse(fragment.as_bytes())
+            .into_owned()
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("clientID", "client-1"),
+            ("code", "q3n8vbx2kd5w7rjh0tyc4mzpf"),
+            ("context[device][product]", "Spoolframe"),
+            ("context[device][version]", VERSION),
+            ("context[device][platform]", platform()),
+            ("context[device][device]", "Server"),
+            ("forwardUrl", "http://media.lan:8090/auth/plex"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        assert_eq!(params, expected);
 
         let waiting = Mock::given(method("GET"))
             .and(path("/api/v2/pins/77"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": 77, "code": "4F7K", "authToken": null
+                "id": 77, "code": "q3n8vbx2kd5w7rjh0tyc4mzpf", "authToken": null
             })))
             .up_to_n_times(1)
             .mount_as_scoped(&server)
@@ -352,13 +418,28 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v2/pins/77"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": 77, "code": "4F7K", "authToken": "tok-123"
+                "id": 77, "code": "q3n8vbx2kd5w7rjh0tyc4mzpf", "authToken": "tok-123"
             })))
             .mount(&server)
             .await;
         let linked = tv.check(77).await.unwrap();
         assert_eq!(linked, PinState::Linked("tok-123".into()));
         assert!(!format!("{linked:?}").contains("tok-123"));
+    }
+
+    #[tokio::test]
+    async fn without_a_page_to_go_back_to_the_sign_in_has_no_forward_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/pins"))
+            .and(query_param("strong", "true"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 9, "code": "q3n8vbx2kd5w7rjh0tyc4mzpf", "authToken": null
+            })))
+            .mount(&server)
+            .await;
+        let pin = plex_tv(&server).await.begin(None).await.unwrap();
+        assert!(!pin.auth_url.contains("forwardUrl"), "{}", pin.auth_url);
     }
 
     #[tokio::test]

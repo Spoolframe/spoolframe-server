@@ -15,7 +15,7 @@ use spoolframe_admin_api::{
 };
 
 use super::{Alert, Field, Notice, ShownName, http, icons, now, rpc, webauthn};
-use crate::logic::{ApiError, ago, avatar_class, date, page_serves};
+use crate::logic::{ApiError, ago, avatar_class, client_kind, date, page_serves};
 use crate::preferences::{
     self, SDH, SUBTITLE_MODES, audio_choices, avoids_extras, index_of, override_line,
     subtitle_choices,
@@ -1223,13 +1223,9 @@ fn session_name(session: &SessionEntry) -> String {
     }
 }
 
-/// "App · 2 hours ago".
+/// "Linux app · 2 hours ago".
 fn session_line(session: &SessionEntry) -> String {
-    let kind = if session.endpoint_id.is_some() {
-        "App"
-    } else {
-        "Web or CLI"
-    };
+    let kind = client_kind(session.endpoint_id.as_deref(), session.platform);
     let when = if session.current {
         "active now".into()
     } else {

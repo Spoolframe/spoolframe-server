@@ -3,7 +3,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
-use spoolframe_admin_api::{Role, UserInfo, error_code};
+use spoolframe_admin_api::{Platform, Role, UserInfo, error_code};
 
 /// Where a browser opening the web UI belongs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,10 +11,24 @@ pub enum Landing {
     /// A server with no users: register the first admin.
     Setup,
     Login,
-    /// An admin's pages.
+    /// An admin's pages, from the Server page (P3-02): what the server is
+    /// doing is what an admin opens the web UI for.
     Admin,
     /// Everyone else's: their own account.
     Profile,
+}
+
+impl Landing {
+    /// Its page: where the start sends the browser, and where the logo
+    /// goes once signed in.
+    pub fn path(self) -> &'static str {
+        match self {
+            Landing::Setup => "/setup",
+            Landing::Login => "/login",
+            Landing::Admin => "/admin/server",
+            Landing::Profile => "/profile",
+        }
+    }
 }
 
 /// From whether setup is open and who the cookie signs in (`None`: no one).
@@ -397,6 +411,18 @@ fn minutes(n: u64) -> String {
     }
 }
 
+/// What kind of client a session or device is, for its "Kind" and its
+/// "Linux app · 2 hours ago": the platform its app said, "App" for one
+/// that has not said since the server began keeping it, and "Web or CLI"
+/// for a session with no device (the admin API's).
+pub fn client_kind(endpoint_id: Option<&str>, platform: Option<Platform>) -> &'static str {
+    match (endpoint_id, platform) {
+        (None, _) => "Web or CLI",
+        (Some(_), Some(platform)) => platform.label(),
+        (Some(_), None) => "App",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,11 +430,29 @@ mod tests {
     use spoolframe_admin_api::{PathFailures, PathReport};
 
     #[test]
+    fn a_session_or_device_is_named_by_the_kind_of_client_it_runs() {
+        assert_eq!(
+            client_kind(Some("ab"), Some(Platform::Tvos)),
+            "Apple TV app"
+        );
+        assert_eq!(client_kind(Some("ab"), Some(Platform::Linux)), "Linux app");
+        // Not said since the server began keeping it.
+        assert_eq!(client_kind(Some("ab"), None), "App");
+        assert_eq!(client_kind(None, None), "Web or CLI");
+    }
+
+    #[test]
     fn each_role_lands_on_its_own_pages() {
         assert_eq!(landing(false, Some(Role::Admin)), Landing::Admin);
         assert_eq!(landing(false, Some(Role::Consumer)), Landing::Profile);
         // A role this build does not know gets the least.
         assert_eq!(landing(false, Some(Role::Unknown)), Landing::Profile);
+    }
+
+    #[test]
+    fn an_admin_starts_on_the_server_page_and_everyone_else_on_their_profile() {
+        assert_eq!(landing(false, Some(Role::Admin)).path(), "/admin/server");
+        assert_eq!(landing(false, Some(Role::Consumer)).path(), "/profile");
     }
 
     #[test]

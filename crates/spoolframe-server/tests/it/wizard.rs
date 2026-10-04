@@ -10,7 +10,7 @@ use spoolframe_admin_api::{
     AdminApiClient, MeApiClient, PathMappingEntry, PlexPinState, error_code,
 };
 use spoolframe_server::admin::Wizard;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::admin::{CODE, anonymous, code, setup, with_token};
@@ -123,15 +123,17 @@ async fn plex_tv() -> MockServer {
     let tv = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v2/pins"))
+        // Plex's sign-in page takes only a strong PIN.
+        .and(query_param("strong", "true"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-            "id": 77, "code": "4F7K", "expiresIn": 900, "authToken": null
+            "id": 77, "code": "q3n8vbx2kd5w7rjh0tyc4mzpf", "expiresIn": 900, "authToken": null
         })))
         .mount(&tv)
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v2/pins/77"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": 77, "code": "4F7K", "authToken": null
+            "id": 77, "code": "q3n8vbx2kd5w7rjh0tyc4mzpf", "authToken": null
         })))
         .up_to_n_times(1)
         .with_priority(1)
@@ -140,7 +142,7 @@ async fn plex_tv() -> MockServer {
     Mock::given(method("GET"))
         .and(path("/api/v2/pins/77"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": 77, "code": "4F7K", "authToken": "tok-123"
+            "id": 77, "code": "q3n8vbx2kd5w7rjh0tyc4mzpf", "authToken": "tok-123"
         })))
         .with_priority(2)
         .mount(&tv)
@@ -199,7 +201,6 @@ async fn signing_in_with_plex_keeps_the_token_and_never_hands_it_out() {
     assert!(refused.error.unwrap().contains("requires a token"));
 
     let pin = root.plex_pin_begin().await.unwrap();
-    assert_eq!(pin.code, "4F7K");
     assert!(
         pin.auth_url
             .starts_with("https://app.example/auth#?clientID="),

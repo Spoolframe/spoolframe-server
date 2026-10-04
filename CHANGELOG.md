@@ -615,6 +615,21 @@
   server logged no error. ffmpeg is now told the name (`-tag:v hvc1`)
   for HEVC in HLS; H.264 and progressive Matroska are as they were
   (P2-05).
+- A copied HEVC stream in HLS has its parameter sets in `init.mp4`. Some
+  Matroska files (4K WEB-DLs; about one HEVC file in twenty on one Plex
+  library) keep VPS, SPS and PPS only in the stream, and their
+  `CodecPrivate` is an `hvcC` record with none. ffmpeg copied that record
+  into an 8-byte `hvcC` box, and an Apple TV refused the stream as an
+  unsupported format (CoreMediaErrorDomain -19601), with no server error.
+  The copy now goes through `hevc_mp4toannexb`, so the MP4 muxer reads
+  the parameter sets from the first keyframe into a whole record (P2-05).
+- A failed HLS segment read is a warning in the server's log. A client
+  that hands HLS to a local player (the tvOS app and AVPlayer) showed a
+  failed `ReadSegment` or `ReadSubtitleSegment` only to that player, so a
+  playback could fail with nothing in the log. Each read answered with an
+  error is now logged at WARN with the item's id, the endpoint, the
+  segment number and the error; a WebVTT segment that is not ready yet is
+  not (P2-05, P2-07).
 - The HLS multivariant playlist says the video range and the frame rate.
   `EXT-X-STREAM-INF` now has `VIDEO-RANGE` (`PQ` for SMPTE 2084, `HLG`
   for ARIB STD-B67, else `SDR`), which Apple's players want for HDR, and
@@ -1074,3 +1089,74 @@
   and says what went wrong there; the web UI takes `sso=` and `provider=`
   out of the address and keeps the rest of its query. The login page's
   sign-in still lands on the start page.
+- Sign in with Plex finishes at app.plex.tv (P3-10, P3-12). The PIN is
+  now a strong one (`POST /api/v2/pins?strong=true`): Plex's sign-in page
+  refused the short one with "Security Alert: another device is attempting
+  to sign in". Its address now also carries `forwardUrl`, the web UI's
+  new `/auth/plex` page at the browser's own origin (the socket's checked
+  `Origin`; the CLI has none and gets no `forwardUrl`), which closes its
+  window: without it Plex ended on "We were unable to complete this
+  request" although the PIN was approved. Polling the PIN still links.
+  Every plex.tv request and the sign-in address name the same device:
+  product Spoolframe, its version, the server's platform, device
+  `Server`. A strong PIN's code is long and not typeable at plex.tv/link,
+  so `PlexPin` no longer has `code`, and the wizard's Plex step no longer
+  shows a code or plex.tv/link: like My profile's card it says to sign in
+  in the Plex window, with "Open the Plex window again" and the hint that
+  a browser may have blocked it.
+- An admin's web UI starts on the Server page (P3-02): signing in,
+  opening `/` or `/admin`, and finishing the setup wizard land on
+  `/admin/server` rather than Users, and the mark and wordmark in the
+  admin sidebar and the mark in the phone bar link there. A consumer's
+  top-bar mark and wordmark link to My profile, where they land as
+  before. A page to come back to still wins (the device approval page's
+  sign-in returns to the code).
+- Marking a season or a show watched (or unwatched) marks each of its
+  episodes, specials included for a show, as marking them one by one
+  would; before, it was refused as "no watch state". Seasons and shows
+  still keep no state of their own.
+- `WhoAmI` says whether the user has a PIN and how many digits it has
+  (P2-08): `UserSummary.pin: Option<PinState>`, `PinState { digits:
+  Option<u8> }`, for "Set · 4 digits" in a client's preferences and for
+  sizing a PIN pad (a locked session gets it too). The server now keeps
+  each PIN's length (migration 0010, `pin_credentials.digits`) when it is
+  set over the client protocol or `me.pinSet`; a PIN set before has
+  `digits: None` until it is set again, since its hash cannot tell.
+- Changing or removing a PIN over the client protocol takes the current
+  one (P2-08): `SetPin { pin, current: Option<String> }` (`current`
+  required once the user has a PIN, else `InvalidInput`) and `ClearPin {
+  current }`. It is checked as `UnlockProfile` checks a PIN, on the same
+  failure limit and the same count of wrong PINs in a row (so neither is
+  a way round the lock's limit, and 10 wrong revoke the session on that
+  device), and unlocks nothing. SDK: `Session::set_pin(pin, current)`,
+  `Session::clear_pin(current)`. The server's `Auth::unlock` is now
+  `Auth::check_pin`.
+- Each device's kind of client is kept and shown (P2-08, P3-03): `Hello`
+  has a required `platform: Platform` (`linux`, `tvos`, `ios`, `macos`,
+  `cli`; an unknown one decodes as `Unknown`), and the SDK's `Device` has
+  `platform`. The server keeps it per device (migration 0011,
+  `devices.platform`) at sign-in, device approval and every `Hello`, so a
+  device signed in before gets one when it next connects; until then it
+  is `None`. `DeviceInfo.platform` and `SessionInfo.platform` in the
+  client protocol and `DeviceEntry.platform` and `SessionEntry.platform`
+  in the admin API carry it. The web UI's session and device rows say
+  "Linux app", "Apple TV app" and so on in place of "App" ("App" for a
+  device that has not said yet; "Web or CLI" for an admin API session,
+  which the admin's user page called "Browser or CLI").
+  `spoolframe_types::Platform::label` is the shared wording.
+- A client reads the signed-in user's Plex link (P3-12): `GetPlexLink`
+  answers `PlexLink { link: Option<PlexLink> }`, with the account's
+  username and email as My profile shows them (never the token), whether
+  the config file makes the link, when it was linked, the last sync run
+  since the server started (`PlexSyncSummary`: when, libraries, pulled,
+  pushed, skipped, failed) and whether one is running. `None` when not
+  linked. Read only: linking stays in the web UI, `<web_url>/profile`.
+  SDK: `Session::plex_link()`.
+- The SDK's saved servers are dated (P1-13, P1-21): `ServerEntry` has
+  `pinned_at`, `verified_at` (when the user last confirmed the
+  fingerprint: at pinning, or a later "Verify now"; `None` while not
+  verified) and `last_connected_at` (the last connect it answered as
+  itself), as `Option<SystemTime>`. They are kept in the servers file with
+  each server; a file from before keeps every server, with the dates
+  `None` until they happen again. `trust_new_identity` dates the new key
+  as pinned and verified now.

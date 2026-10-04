@@ -287,7 +287,13 @@ async fn a_locked_phone_cannot_approve() {
     let (tv, _, code) = tv_begins(&server).await;
     let (phone, session) = phone(&server).await;
     phone
-        .call(Some(&session), Request::SetPin { pin: "4321".into() })
+        .call(
+            Some(&session),
+            Request::SetPin {
+                pin: "4321".into(),
+                current: None,
+            },
+        )
         .await;
     phone
         .call(

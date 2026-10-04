@@ -4,7 +4,7 @@
 use crate::support;
 
 use spoolframe_protocol::{Error, PlaybackPlan, Reply, Request, Response, UserSummary};
-use spoolframe_types::ClientCapabilities;
+use spoolframe_types::{ClientCapabilities, Platform};
 use support::{TestServer, movie};
 
 async fn who(client: &support::TestClient, session: &spoolframe_protocol::SessionId) -> Response {
@@ -242,6 +242,103 @@ async fn a_plan_for_an_item_without_a_file_is_not_found() {
         tv.call(Some(&alice), request).await,
         Response::Err(Error::NotFound { .. })
     ));
+    tv.close().await;
+    server.stop().await;
+}
+
+/// "Asked for on" and session rows name the kind of client each device
+/// runs, as its Hello said (P2-08, P3-03).
+#[tokio::test]
+async fn devices_and_sessions_say_what_kind_of_client_each_device_runs() {
+    let server = TestServer::start("device-platform").await;
+    server.add_user("alice", "correct horse", None).await;
+    let tv = server.client().await;
+    let desktop = server.client().await;
+    assert!(matches!(
+        tv.hello_from(Platform::Tvos, Some("Living room TV"), None)
+            .await,
+        Response::Ok(Reply::ServerInfo(_))
+    ));
+    desktop.hello().await;
+    let on_tv = tv.login("alice", "correct horse").await;
+    let on_desktop = desktop.login("alice", "correct horse").await;
+
+    let tv_id = tv.endpoint.id().to_string();
+    let Response::Ok(Reply::Devices { devices }) =
+        desktop.call(Some(&on_desktop), Request::ListDevices).await
+    else {
+        panic!("no devices");
+    };
+    let platform_of = |id: &str| {
+        devices
+            .iter()
+            .find(|d| d.endpoint_id == id)
+            .unwrap()
+            .platform
+    };
+    assert_eq!(platform_of(&tv_id), Some(Platform::Tvos));
+    assert_eq!(
+        platform_of(&desktop.endpoint.id().to_string()),
+        Some(Platform::Linux)
+    );
+
+    let Response::Ok(Reply::Sessions { sessions }) =
+        tv.call(Some(&on_tv), Request::ListSessions).await
+    else {
+        panic!("no sessions");
+    };
+    let mut platforms: Vec<_> = sessions.iter().map(|s| (s.current, s.platform)).collect();
+    platforms.sort_by_key(|(current, _)| *current);
+    assert_eq!(
+        platforms,
+        [(false, Some(Platform::Linux)), (true, Some(Platform::Tvos))]
+    );
+    tv.close().await;
+    desktop.close().await;
+    server.stop().await;
+}
+
+/// A device signed in before the server kept platforms has none, until it
+/// next connects and says Hello.
+#[tokio::test]
+async fn a_device_from_before_platforms_were_kept_gets_one_when_it_connects() {
+    let server = TestServer::start("device-platform-later").await;
+    server.add_user("alice", "correct horse", None).await;
+    let tv = server.client().await;
+    tv.hello().await;
+    let session = tv.login("alice", "correct horse").await;
+    let tv_id = tv.endpoint.id().to_string();
+    // As migration 0011 leaves a device it did not know.
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(server.dir.as_ref().join("spoolframe.db")),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE devices SET platform = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let platform = |client: support::TestClient| {
+        let session = session.clone();
+        let tv_id = tv_id.clone();
+        async move {
+            let Response::Ok(Reply::Devices { devices }) =
+                client.call(Some(&session), Request::ListDevices).await
+            else {
+                panic!("no devices");
+            };
+            devices
+                .into_iter()
+                .find(|d| d.endpoint_id == tv_id)
+                .unwrap()
+                .platform
+        }
+    };
+    assert_eq!(platform(tv.clone()).await, None);
+    let tv = tv.reconnect(&server).await;
+    assert_eq!(platform(tv.clone()).await, Some(Platform::Linux));
     tv.close().await;
     server.stop().await;
 }

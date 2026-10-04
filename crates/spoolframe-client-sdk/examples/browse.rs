@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
         name: "browse example".into(),
         client_name: "spoolframe-sdk-browse".into(),
         client_version: env!("CARGO_PKG_VERSION").into(),
+        platform: spoolframe_client_sdk::types::Platform::Cli,
         capabilities: ClientCapabilities::default(),
     };
     let client = Client::open(Arc::new(MemoryStorage::default()), device).await?;

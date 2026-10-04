@@ -16,6 +16,7 @@ pub mod lan;
 pub mod media;
 pub mod messages;
 pub mod playback;
+pub mod plex;
 pub mod previews;
 pub mod search;
 pub mod streams;
@@ -24,14 +25,15 @@ pub use artwork::{ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
 pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle};
 pub use messages::{
     AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, HomeScreen, LoginPassword,
-    ManifestKind, PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, SUBTITLE_CHUNK,
-    ServerInfo, SessionId, SessionInfo, UserSummary,
+    ManifestKind, PROTOCOL_VERSION, PinState, Reply, Request, RequestEnvelope, Response,
+    SUBTITLE_CHUNK, ServerInfo, SessionId, SessionInfo, UserSummary,
 };
 pub use playback::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
     PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
     TrackReason,
 };
+pub use plex::{PlexLink, PlexSyncSummary};
 pub use previews::{PreviewTile, Previews};
 pub use search::{SearchCounts, SearchGroup, SearchRequest, SearchResults};
 

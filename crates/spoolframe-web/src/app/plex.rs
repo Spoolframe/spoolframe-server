@@ -64,10 +64,34 @@ fn PlexHead() -> Element {
 }
 
 /// Open `url` in a new window (plex.tv's sign-in).
-fn open(url: &str) -> bool {
+pub(super) fn open(url: &str) -> bool {
     web_sys::window()
         .and_then(|w| w.open_with_url_and_target(url, "_blank").ok().flatten())
         .is_some()
+}
+
+/// Where Plex's sign-in window ends once Spoolframe is allowed. The page
+/// that opened the window is the one that waits for plex.tv and links, so
+/// this one only closes itself, which a window a script opened may do,
+/// and says so if the browser keeps it open.
+#[component]
+pub fn PlexSignedIn() -> Element {
+    use_hook(|| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.close();
+        }
+    });
+    rsx! {
+        super::Centered {
+            section { class: "glass-card",
+                div { class: "flex flex-col items-center gap-3 text-center",
+                    span { class: "flex text-ctp-green", icons::CircleCheck { size: 28 } }
+                    h1 { class: "m-0 text-2xl font-bold", "Signed in with Plex" }
+                    p { class: "m-0 text-sm text-ctp-subtext1", "You can close this window and go back to Spoolframe." }
+                }
+            }
+        }
+    }
 }
 
 /// WebPlexAccountStates: My profile's Plex account card.

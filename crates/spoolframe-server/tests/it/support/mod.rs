@@ -471,6 +471,40 @@ pub fn progressive_capabilities() -> ClientCapabilities {
 
 /// An Apple-like device that takes HLS: H.264 and AAC in MP4, so an AC-3
 /// file has its audio converted and its video copied.
+/// The server's log at WARN and above, as text, for as long as the guard
+/// is held. Captured on this thread only: a `#[tokio::test]` runtime runs
+/// the server's tasks on the test's own thread.
+#[derive(Clone, Default)]
+pub struct Warnings(Arc<Mutex<Vec<u8>>>);
+
+impl Warnings {
+    pub fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        let warnings = Self::default();
+        let writer = warnings.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        (warnings, tracing::subscriber::set_default(subscriber))
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for Warnings {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub fn hls_capabilities() -> ClientCapabilities {
     use spoolframe_types::{AudioCodec, Container, Delivery, VideoCodec};
     ClientCapabilities {
@@ -629,6 +663,9 @@ pub struct TestServer {
     pub dir: StateDir,
     /// Where browsers reach its web UI, if anywhere.
     pub public_url: Option<String>,
+    /// Users' Plex links (P3-12). Its plex.tv is an address nothing
+    /// answers at: tests save links directly and never reach Plex.
+    pub plex_accounts: Arc<spoolframe_server::plex_accounts::PlexAccounts>,
 }
 
 impl TestServer {
@@ -715,9 +752,20 @@ impl TestServer {
         spoolframe_server::previews::ahead::spawn(&previews, catalog.clone(), store.clone());
         let auth = Auth::with_failure_window(store.clone(), options.failure_window)
             .with_sign_in_lifetime(options.sign_in_lifetime);
+        let plex_accounts = Arc::new(spoolframe_server::plex_accounts::PlexAccounts::new(
+            spoolframe_server::config::secrets::Secrets::new(dir.as_ref()),
+            store.clone(),
+            spoolframe_server::plex_accounts::PlexSite {
+                api: "http://127.0.0.1:9".parse().unwrap(),
+                app: "http://127.0.0.1:9".parse().unwrap(),
+            },
+            None,
+        ));
         let services = Services {
             auth: auth.clone(),
             public_url: options.public_url.clone(),
+            plex_accounts: Some(plex_accounts.clone()),
+            plex_sync: None,
             watch,
             catalog,
             prober,
@@ -746,6 +794,7 @@ impl TestServer {
             store,
             auth,
             public_url: options.public_url,
+            plex_accounts,
             catalog: fake,
             dir,
             media,
@@ -808,6 +857,66 @@ impl TestServer {
             .expect("ffmpeg runs");
         assert!(status.success(), "ffmpeg could not cut the test media");
         std::fs::remove_file(&whole).unwrap();
+    }
+
+    /// `secs` of HEVC (libx265) and AC-3 in Matroska whose parameter sets
+    /// are only in the stream, before each keyframe: the track's
+    /// `CodecPrivate` is an `hvcC` record with no arrays, as in some 4K
+    /// WEB-DLs. ffmpeg never writes one like that (it fills the record from
+    /// the stream), so the record it wrote is cut back to its 23-byte
+    /// header and the bytes freed are covered by an EBML Void element: no
+    /// size of anything around it changes.
+    pub fn generate_hevc_with_parameter_sets_in_the_stream_only(&self, secs: u32) {
+        std::fs::create_dir_all(self.media.parent().unwrap()).unwrap();
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
+            .args(["-t", &secs.to_string(), "-pix_fmt", "yuv420p", "-g", "50"])
+            .args(["-c:v", "libx265"])
+            .args(["-x265-params", "log-level=error:repeat-headers=1"])
+            .args(["-c:a", "ac3", "-ac", "2"])
+            .arg(&self.media)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not make the test media");
+        let mut file = std::fs::read(&self.media).unwrap();
+        // The video track's CodecPrivate (0x63A2), after its CodecID; its
+        // size as an EBML number, then the record: version 1, and its
+        // array count at byte 22.
+        let codec_id = b"V_MPEGH/ISO/HEVC";
+        let track = file
+            .windows(codec_id.len())
+            .position(|w| w == codec_id)
+            .expect("an HEVC track");
+        let at = track
+            + file[track..]
+                .windows(2)
+                .position(|w| w == [0x63, 0xA2])
+                .expect("a CodecPrivate");
+        let first = file[at + 2];
+        let width = first.leading_zeros() as usize + 1;
+        let size = file[at + 3..at + 2 + width]
+            .iter()
+            .fold(u64::from(first) & (0xFF >> width), |n, b| {
+                n << 8 | u64::from(*b)
+            }) as usize;
+        let record = at + 2 + width;
+        assert_eq!(file[record], 1, "CodecPrivate is not an hvcC record");
+        let end = record + size;
+        // [ID ID size] + 23 bytes; then the Void: ID 0xEC and an 8-byte size.
+        let kept = at + 3 + 23;
+        let void = end - kept - 9;
+        assert!(end >= kept + 9, "an hvcC record too short to cut");
+        let mut cut = vec![0x63, 0xA2, 0x80 | 23];
+        cut.extend_from_slice(&file[record..record + 22]);
+        cut.push(0);
+        cut.push(0xEC);
+        cut.push(0x01);
+        cut.extend_from_slice(&(void as u64).to_be_bytes()[1..]);
+        cut.resize(end - at, 0);
+        file.splice(at..end, cut);
+        std::fs::write(&self.media, file).unwrap();
     }
 
     fn generate(&self, secs: u32, video: &str, audio: &str, video_offset: &str) {
@@ -1132,9 +1241,20 @@ impl TestClient {
         self.hello_with(device_name, None).await
     }
 
-    /// `Hello` with everything a client can say.
+    /// `Hello` with everything a client can say, from a Linux app.
     pub async fn hello_with(
         &self,
+        device_name: Option<&str>,
+        capabilities: Option<ClientCapabilities>,
+    ) -> Response {
+        self.hello_from(spoolframe_types::Platform::Linux, device_name, capabilities)
+            .await
+    }
+
+    /// `Hello` from an app on `platform`.
+    pub async fn hello_from(
+        &self,
+        platform: spoolframe_types::Platform,
         device_name: Option<&str>,
         capabilities: Option<ClientCapabilities>,
     ) -> Response {
@@ -1144,6 +1264,7 @@ impl TestClient {
                 protocol_version: PROTOCOL_VERSION,
                 client_name: "test".into(),
                 client_version: "0".into(),
+                platform,
                 device_name: device_name.map(str::to_owned),
                 capabilities,
             }),

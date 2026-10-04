@@ -115,7 +115,13 @@ pub const MAX_WRONG_PINS: u32 = 10;
 
 /// A PIN as a user may set it: 4 to 8 digits.
 pub fn valid_pin(pin: &str) -> bool {
-    (4..=8).contains(&pin.len()) && pin.bytes().all(|b| b.is_ascii_digit())
+    pin_digits(pin).is_some()
+}
+
+/// How many digits `pin` has, if it is a PIN a user may set.
+pub fn pin_digits(pin: &str) -> Option<u8> {
+    let digits = u8::try_from(pin.len()).ok()?;
+    ((4..=8).contains(&digits) && pin.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
 }
 
 /// Hash a new PIN as passwords are (Argon2id, PHC string).
@@ -442,6 +448,7 @@ impl Auth {
         let binding = SessionBinding::Endpoint {
             endpoint_id: claim.endpoint.clone(),
             device_name: claim.device_name.clone(),
+            platform: claim.platform,
         };
         self.store
             .create_session(
@@ -454,11 +461,13 @@ impl Auth {
         Ok(token)
     }
 
-    /// Unlock `user`'s profile on `endpoint` with `pin`. A user without a
-    /// PIN has nothing to unlock. Wrong PINs are limited as passwords are,
-    /// on keys of their own; [`MAX_WRONG_PINS`] in a row revoke the user's
-    /// sessions on that device.
-    pub async fn unlock(
+    /// Check `pin` as `user`'s, entered on `endpoint`: to unlock their
+    /// profile there, or to change or remove the PIN. A user without a PIN
+    /// passes. Wrong PINs are limited as passwords are, on keys of their
+    /// own and the same for every use, so no use is a way round the limit;
+    /// [`MAX_WRONG_PINS`] in a row revoke the user's sessions on that
+    /// device. What a right PIN opens is the caller's.
+    pub async fn check_pin(
         &self,
         user: LocalUserId,
         endpoint: &str,
@@ -753,12 +762,12 @@ mod tests {
         let auth = auth_with_alice("pin-burst").await;
         let alice = auth.store().password_login("alice").await.unwrap().unwrap();
         let phc = hash_pin("4321").await.unwrap();
-        auth.store().set_pin(alice.id, &phc).await.unwrap();
+        auth.store().set_pin(alice.id, &phc, 4).await.unwrap();
         let guesses: Vec<String> = (0..MAX_FAILURES + 3).map(|i| format!("000{i}")).collect();
         let answers = futures_util::future::join_all(
             guesses
                 .iter()
-                .map(|guess| auth.unlock(alice.id, "tv", guess)),
+                .map(|guess| auth.check_pin(alice.id, "tv", guess)),
         )
         .await;
         let checked = answers

@@ -220,6 +220,12 @@ impl Playbacks {
         })
     }
 
+    /// What `handle` plays, if it is open: for the log, which never names
+    /// the handle itself. Not a use of it.
+    pub fn item(&self, handle: &PlaybackHandle) -> Option<MediaId> {
+        self.lock().get(&handle.0).map(|p| p.item.clone())
+    }
+
     /// Mark `handle` used now, as a read that is still waiting for an
     /// encode does, so the playback does not idle out under it.
     pub fn touch(&self, handle: &PlaybackHandle) {

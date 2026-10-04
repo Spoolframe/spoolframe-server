@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::device_sign_in::{ALPHABET, CODE_LEN};
+use spoolframe_types::Platform;
 use tokio::sync::watch;
 
 use crate::auth::SessionToken;
@@ -49,6 +50,7 @@ pub struct Waiting {
     pub endpoint: String,
     pub device_name: Option<String>,
     pub client_name: String,
+    pub platform: Platform,
     /// Unix seconds.
     pub requested_at: i64,
 }
@@ -60,6 +62,7 @@ pub struct Claim {
     pub request: String,
     pub endpoint: String,
     pub device_name: Option<String>,
+    pub platform: Platform,
 }
 
 /// Why a code could not be claimed.
@@ -197,6 +200,7 @@ impl DeviceSignIns {
             request: request.clone(),
             endpoint: waiting.endpoint.clone(),
             device_name: waiting.device_name.clone(),
+            platform: waiting.platform,
         };
         inner.by_code.remove(code);
         Ok(claim)
@@ -290,6 +294,7 @@ mod tests {
             endpoint: endpoint.into(),
             device_name: Some("Living room TV".into()),
             client_name: "spoolframe-tvos".into(),
+            platform: Platform::Tvos,
             requested_at: 0,
         }
     }
@@ -311,6 +316,8 @@ mod tests {
         let started = sign_ins.begin(tv("tv")).unwrap();
         let claim = sign_ins.claim(&started.code, Some("phone")).unwrap();
         assert_eq!(claim.endpoint, "tv");
+        // The session made for it is on a device of the platform it said.
+        assert_eq!(claim.platform, Platform::Tvos);
         // Claimed: nobody can claim, deny or look it up again.
         assert_eq!(
             sign_ins.claim(&started.code, Some("phone")),

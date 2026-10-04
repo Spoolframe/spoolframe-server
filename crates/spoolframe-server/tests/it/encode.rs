@@ -1216,6 +1216,124 @@ async fn hls_of_a_copied_hevc_video_is_hvc1_as_the_playlist_says() {
     server.stop().await;
 }
 
+/// An Apple TV's playback failed with nothing in the server's log: its
+/// app serves the playlists to AVPlayer and fetches each segment as it is
+/// asked for, and a failed fetch was said only to the app. A segment or a
+/// WebVTT segment read answered with an error is now a warning, naming the
+/// playback and the segment.
+#[tokio::test]
+async fn a_failed_hls_segment_read_is_logged() {
+    let (server, client, session) = hls_ready("hls-read-warn", hls_capabilities()).await;
+    let handle = started(&client, &session, None).await;
+    let (warnings, _guard) = crate::support::Warnings::capture();
+    let (response, _) = client
+        .media(MediaRead {
+            session: session.clone(),
+            handle: handle.clone(),
+            offset: 0,
+            length: MAX_READ,
+            epoch: 0,
+            segment: Some(999),
+        })
+        .await;
+    assert!(
+        matches!(response, MediaReadResponse::Err(Error::NotFound { .. })),
+        "{response:?}"
+    );
+    // No subtitle in this playback: no WebVTT segment either.
+    let response = client
+        .call(
+            Some(&session),
+            Request::ReadSubtitleSegment {
+                handle: handle.clone(),
+                n: 1,
+            },
+        )
+        .await;
+    assert!(
+        matches!(response, Response::Err(Error::NotFound { .. })),
+        "{response:?}"
+    );
+    let text = warnings.text();
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains(" WARN ")).collect();
+    // Named by what it plays: the handle is never logged.
+    let id = movie().id().to_string();
+    for wanted in ["segment=999", "subtitle_segment=1"] {
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(wanted) && l.contains(id.as_str())),
+            "no warning with {wanted} for {id}: {text}"
+        );
+    }
+    client.close().await;
+    server.stop().await;
+}
+
+/// The NAL unit types of the arrays in the first `hvcC` record of `init`.
+fn hvcc_arrays(init: &[u8]) -> Vec<u8> {
+    let at = init
+        .windows(4)
+        .position(|w| w == b"hvcC")
+        .expect("no hvcC box");
+    let size = big_endian(&init[at - 4..at]) as usize;
+    let record = &init[at + 4..at - 4 + size];
+    let Some((&count, mut rest)) = record.get(22..).and_then(<[u8]>::split_first) else {
+        return Vec::new();
+    };
+    let mut types = Vec::new();
+    for _ in 0..count {
+        types.push(rest[0] & 0x3F);
+        let units = big_endian(&rest[1..3]);
+        rest = &rest[3..];
+        for _ in 0..units {
+            let length = big_endian(&rest[..2]) as usize;
+            rest = &rest[2 + length..];
+        }
+    }
+    types
+}
+
+/// `hvc1` says the parameter sets are in the sample entry's `hvcC`, and
+/// AVPlayer decodes with those alone. A 4K WEB-DL whose Matroska track
+/// keeps them only in the stream was copied into an `init.mp4` whose `hvcC`
+/// was 8 bytes, a box with no record: an Apple TV refused it as an
+/// unsupported format (CoreMediaErrorDomain -19601).
+#[tokio::test]
+async fn hls_of_a_copied_hevc_video_with_its_parameter_sets_in_the_stream_names_them_in_hvcc() {
+    use spoolframe_protocol::ConvertedVideo;
+    use spoolframe_types::VideoCodec;
+    let caps = ClientCapabilities {
+        video: [VideoCodec::H264, VideoCodec::Hevc].into(),
+        ..hls_capabilities()
+    };
+    let (server, client, session) = hls_ready("hls-hvcc", caps).await;
+    server.generate_hevc_with_parameter_sets_in_the_stream_only(6);
+    let handle = match start(&client, &session, None).await {
+        Response::Ok(Reply::PlaybackStarted {
+            handle,
+            plan:
+                PlaybackPlan::Converted {
+                    video:
+                        Some(ConvertedVideo::Copy {
+                            codec: VideoCodec::Hevc,
+                        }),
+                    ..
+                },
+            ..
+        }) => handle,
+        other => panic!("no playback with its HEVC copied: {other:?}"),
+    };
+    let init = segment(&client, &session, &handle, 0).await;
+    // VPS, SPS and PPS.
+    let types = hvcc_arrays(&init);
+    for nal in [32, 33, 34] {
+        assert!(types.contains(&nal), "hvcC arrays {types:?}, no {nal}");
+    }
+    client.close().await;
+    server.stop().await;
+}
+
 /// WebVTT segment `n` of `handle`'s subtitle rendition, asking again while
 /// its text is being made.
 async fn subtitle_segment(

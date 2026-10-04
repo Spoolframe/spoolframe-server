@@ -44,6 +44,7 @@ impl ServerConnection {
             protocol_version: PROTOCOL_VERSION,
             client_name: device.client_name.clone(),
             client_version: device.client_version.clone(),
+            platform: device.platform,
             device_name: Some(device.name.clone()),
             capabilities: Some(device.capabilities.clone()),
         });

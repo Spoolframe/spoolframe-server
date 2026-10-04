@@ -14,6 +14,7 @@ pub mod id;
 pub mod language;
 pub mod media;
 pub mod model;
+pub mod platform;
 pub mod preferences;
 pub mod role;
 pub mod search;
@@ -28,6 +29,7 @@ pub use model::{
     Album, Artist, Artwork, ArtworkKind, Episode, Item, Library, LibraryKind, Marker, MarkerKind,
     Movie, PlaybackState, Season, Show, Track,
 };
+pub use platform::Platform;
 pub use preferences::{
     AudioPreferences, SdhPreference, SubtitleMode, SubtitlePreferences, TrackPreferences,
 };

@@ -2,7 +2,7 @@
 //! hash of the token, so the database alone cannot be used to act as a
 //! user.
 
-use spoolframe_types::Role;
+use spoolframe_types::{Platform, Role};
 
 use super::users::{LocalUserId, role};
 use super::{Store, StoreError, now};
@@ -15,6 +15,8 @@ pub enum SessionBinding {
     Endpoint {
         endpoint_id: String,
         device_name: Option<String>,
+        /// What kind of client it runs, from its `Hello`.
+        platform: Platform,
     },
     /// The admin API: the CLI, and the web UI (P3-01).
     Api,
@@ -51,8 +53,18 @@ pub struct SessionRecord {
     /// `None` for an admin API session.
     pub device_name: Option<String>,
     pub endpoint_id: Option<String>,
+    /// The device's [`Platform`] by name; see [`SessionRecord::platform`].
+    platform: Option<String>,
     pub created_at: i64,
     pub last_used_at: i64,
+}
+
+impl SessionRecord {
+    /// What kind of client the session's device runs; `None` for an API
+    /// session, or a device not seen since the server began keeping it.
+    pub fn platform(&self) -> Option<Platform> {
+        self.platform.as_deref().map(Platform::from_name)
+    }
 }
 
 /// A session's use is written back (renewing its expiry) at most this
@@ -74,19 +86,24 @@ impl Store {
             SessionBinding::Endpoint {
                 endpoint_id,
                 device_name,
+                platform,
             } => {
                 // The device row appears on the first login from an
-                // endpoint, and keeps the latest name the client gave.
+                // endpoint, and keeps the latest name and platform the
+                // client gave.
                 sqlx::query(
-                    "INSERT INTO devices (endpoint_id, display_name, first_seen_at, last_seen_at) \
-                     VALUES (?1, ?2, ?3, ?3) \
+                    "INSERT INTO devices \
+                       (endpoint_id, display_name, first_seen_at, last_seen_at, platform) \
+                     VALUES (?1, ?2, ?3, ?3, ?4) \
                      ON CONFLICT (endpoint_id) DO UPDATE SET \
                        display_name = coalesce(excluded.display_name, devices.display_name), \
-                       last_seen_at = excluded.last_seen_at",
+                       last_seen_at = excluded.last_seen_at, \
+                       platform = excluded.platform",
                 )
                 .bind(endpoint_id)
                 .bind(device_name)
                 .bind(now)
+                .bind(platform.as_str())
                 .execute(&mut *tx)
                 .await?;
                 ("endpoint", Some(endpoint_id.as_str()))
@@ -214,8 +231,8 @@ impl Store {
     /// `user`'s live sessions, on every device, most recently used first.
     pub async fn list_sessions(&self, user: LocalUserId) -> Result<Vec<SessionRecord>, StoreError> {
         Ok(sqlx::query_as(
-            "SELECT s.token_hash, d.display_name AS device_name, s.endpoint_id, s.created_at, \
-                    s.last_used_at \
+            "SELECT s.token_hash, d.display_name AS device_name, s.endpoint_id, d.platform, \
+                    s.created_at, s.last_used_at \
              FROM sessions s LEFT JOIN devices d ON d.endpoint_id = s.endpoint_id \
              WHERE s.user_id = ?1 AND s.revoked_at IS NULL AND s.expires_at > ?2 \
              ORDER BY s.last_used_at DESC",
@@ -224,6 +241,24 @@ impl Store {
         .bind(now())
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    /// What kind of client `endpoint_id` runs now, as its `Hello` said, if
+    /// it is a device someone has signed in from: so a device signed in
+    /// before the server kept platforms gets one when it next connects.
+    pub async fn note_device_platform(
+        &self,
+        endpoint_id: &str,
+        platform: Platform,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE devices SET platform = ?2 WHERE endpoint_id = ?1 AND platform IS NOT ?2",
+        )
+        .bind(endpoint_id)
+        .bind(platform.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Revoke every live session of `user`'s but `keep` (a token hash):
@@ -339,6 +374,7 @@ mod tests {
         SessionBinding::Endpoint {
             endpoint_id: id.into(),
             device_name: Some(format!("device {id}")),
+            platform: Platform::Tvos,
         }
     }
 
@@ -470,6 +506,7 @@ mod tests {
         let binding = SessionBinding::Endpoint {
             endpoint_id: "e9c1".into(),
             device_name: Some("Living room".into()),
+            platform: Platform::Tvos,
         };
         store
             .create_session("h", alice, &binding, now() + 60)

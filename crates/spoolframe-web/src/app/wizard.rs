@@ -15,7 +15,7 @@ use spoolframe_admin_api::{
 use super::admin::sleep;
 use super::{Alert, Field, Route, icons, now, rpc};
 use crate::libraries;
-use crate::logic::{ApiError, host_port, thousands};
+use crate::logic::{ApiError, Landing, host_port, thousands};
 use crate::setup::{self, Hardware, PathRow, STEPS, Sample, Step};
 
 /// Where a form is: a wizard step (Back and Continue), or a Settings tab
@@ -417,11 +417,11 @@ fn ServerFields(
 enum Account {
     /// Nothing done here yet; `set` says whether the server has a token.
     Idle,
-    /// A PIN is shown, plex.tv not answered yet. `opened`: whether the
-    /// plex.tv tab opened.
+    /// Plex's sign-in is open, plex.tv not answered yet. `opened`: whether
+    /// its window opened. The PIN is a strong one, with no code to show:
+    /// it is only ever typed into plex.tv by the address.
     Waiting {
         id: u64,
-        code: String,
         auth_url: String,
         expires_at: Option<i64>,
         opened: bool,
@@ -577,7 +577,6 @@ fn PlexFields(
             let id = pin.id;
             account.set(Account::Waiting {
                 id,
-                code: pin.code,
                 auth_url: pin.auth_url,
                 expires_at: pin.expires_in.map(|s| now() + s as i64),
                 opened,
@@ -997,7 +996,6 @@ fn AccountPanel(
 ) -> Element {
     match account {
         Account::Waiting {
-            code,
             auth_url,
             expires_at,
             opened,
@@ -1008,23 +1006,26 @@ fn AccountPanel(
                 div { class: "panel items-center text-center",
                     span {
                         if opened {
-                            "A plex.tv tab opened. Approve Spoolframe there, or go to "
+                            "A Plex window opened. Sign in there and allow Spoolframe."
                         } else {
-                            a { href: "{auth_url}", target: "_blank", rel: "noopener", "Open plex.tv" }
-                            " and approve Spoolframe there, or go to "
+                            "Open the Plex window, sign in there and allow Spoolframe."
                         }
-                        a { href: "https://plex.tv/link", target: "_blank", rel: "noopener", "plex.tv/link" }
-                        " and enter:"
                     }
-                    div { class: "pin-code", "{code}" }
                     span { class: "flex items-center gap-2 text-ctp-blue", role: "status",
                         span { class: "flex animate-spin", icons::Loader { size: 14 } }
                         match left {
-                            Some(s) => rsx! { {format!("Waiting for plex.tv · code expires in {}:{:02}", s / 60, s % 60)} },
+                            Some(s) => rsx! { {format!("Waiting for plex.tv · {}:{:02} left", s / 60, s % 60)} },
                             None => rsx! { "Waiting for plex.tv" },
                         }
                     }
-                    button { class: "btn-plain", onclick: move |_| on_cancel.call(()), "Cancel" }
+                    div { class: "flex flex-wrap justify-center gap-2.5",
+                        button { class: "btn", onclick: move |_| { super::plex::open(&auth_url); },
+                            icons::ExternalLink { size: 15 }
+                            if opened { "Open the Plex window again" } else { "Open the Plex window" }
+                        }
+                        button { class: "btn-plain", onclick: move |_| on_cancel.call(()), "Cancel" }
+                    }
+                    span { class: "text-xs text-ctp-subtext0", "If no window appeared, your browser may have blocked it." }
                 }
             }
         }
@@ -1835,7 +1836,7 @@ pub fn DoneCard() -> Element {
             };
             match finished.await {
                 Ok(_) => {
-                    nav.replace(Route::Users {});
+                    nav.replace(Route::from(Landing::Admin));
                 }
                 Err(e) => error.set(Some(e.explain())),
             }

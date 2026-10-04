@@ -33,7 +33,7 @@ use spoolframe_plex::check::Scope;
 pub use crate::admin_http::{CookiePolicy, Origins, TrustedProxies};
 use crate::auth::{
     Auth, LoginError, PasswordError, RECENT_SIGN_IN, SessionToken, hash_password, hash_pin,
-    valid_pin,
+    pin_digits,
 };
 use crate::catalog::LiveCatalog;
 use crate::config::layers::SettingError;
@@ -87,6 +87,23 @@ fn source(ext: &Extensions) -> RpcResult<Option<String>> {
 /// browser's cookie (`crate::admin_http`), if there was one.
 #[derive(Debug, Clone)]
 pub(crate) struct Bearer(pub(crate) String);
+
+/// The web UI's origin as the caller's browser has it open (the socket
+/// upgrade's `Origin`, which [`crate::admin_http`] has already checked):
+/// where a page that leaves for another site can be sent back to. The CLI
+/// sends none.
+#[derive(Debug, Clone)]
+pub(crate) struct PageOrigin(pub(crate) String);
+
+/// The web UI's page that Plex's sign-in goes on to once it is done: it
+/// closes itself, since the page that opened it is the one waiting.
+const PLEX_SIGNED_IN: &str = "/auth/plex";
+
+/// Where Plex's sign-in sends the caller's browser back to, if it has one.
+fn plex_forward(ext: &Extensions) -> Option<String> {
+    ext.get::<PageOrigin>()
+        .map(|PageOrigin(origin)| format!("{}{PLEX_SIGNED_IN}", origin.trim_end_matches('/')))
+}
 
 /// The one-time code that `setup` needs: printed in the server's log at
 /// start while there are no users, so only someone who can read that log
@@ -830,6 +847,7 @@ fn sign_in_code_keys(
 
 fn device(d: DeviceRecord) -> DeviceEntry {
     DeviceEntry {
+        platform: d.platform(),
         endpoint_id: d.endpoint_id,
         name: d.name,
         last_seen_at: d.last_seen_at,
@@ -1176,6 +1194,7 @@ fn info(u: UserRecord) -> UserInfo {
 /// A session as the API shows it; `current` is the caller's own.
 fn session_entry(s: SessionRecord, current: &str) -> SessionEntry {
     SessionEntry {
+        platform: s.platform(),
         id: session_id(&s.token_hash),
         current: s.token_hash == current,
         device_name: s.device_name,
@@ -1309,13 +1328,13 @@ impl MeApiServer for AdminApi {
     async fn pin_set(&self, ext: &Extensions, pin: String) -> RpcResult<()> {
         let (_, user) = self.recently_signed_in(ext).await?;
         let me = self.account(user).await?;
-        if !valid_pin(&pin) {
+        let Some(digits) = pin_digits(&pin) else {
             return Err(error(error_code::INVALID_INPUT, "a PIN is 4 to 8 digits"));
-        }
+        };
         let phc = hash_pin(&pin).await?;
         self.auth
             .store()
-            .set_pin(me.id, &phc)
+            .set_pin(me.id, &phc, digits)
             .await
             .map_err(internal)?;
         tracing::info!(username = %me.username, "PIN set");
@@ -1555,10 +1574,12 @@ impl MeApiServer for AdminApi {
 
     async fn plex_link_begin(&self, ext: &Extensions) -> RpcResult<PlexPin> {
         let (_, user) = self.caller(ext).await?;
-        let pin = self.accounts()?.begin(user.user).await?;
+        let pin = self
+            .accounts()?
+            .begin(user.user, plex_forward(ext).as_deref())
+            .await?;
         Ok(PlexPin {
             id: pin.id,
-            code: pin.code,
             auth_url: pin.auth_url,
             expires_in: pin.expires_in,
         })
@@ -2274,7 +2295,7 @@ impl AdminApiServer for AdminApi {
         let (settings, _) = self.settings_as_admin(ext).await?;
         let pin = self
             .plex_tv(settings)?
-            .begin()
+            .begin(plex_forward(ext).as_deref())
             .await
             .map_err(|e| error(error_code::UNAVAILABLE, e.to_string()))?;
         self.pins
@@ -2283,7 +2304,6 @@ impl AdminApiServer for AdminApi {
             .insert(pin.id);
         Ok(PlexPin {
             id: pin.id,
-            code: pin.code,
             auth_url: pin.auth_url,
             expires_in: pin.expires_in,
         })
@@ -2744,12 +2764,18 @@ mod tests {
                 &SessionBinding::Endpoint {
                     endpoint_id: tv.clone(),
                     device_name: Some("TV".into()),
+                    platform: spoolframe_types::Platform::Tvos,
                 },
                 i64::MAX / 2,
             )
             .await
             .unwrap();
-        api.pin_set(&ext, "4321".into()).await.unwrap();
+        api.pin_set(&ext, "43210".into()).await.unwrap();
+        // Set here, it is as long for the client protocol's WhoAmI.
+        assert_eq!(
+            store.pin_info(alice.user).await.unwrap(),
+            Some(crate::store::pins::PinInfo { digits: Some(5) })
+        );
         store
             .age_session(&session, RECENT_SIGN_IN.as_secs() as i64 + 1)
             .await;

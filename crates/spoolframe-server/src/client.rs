@@ -24,8 +24,9 @@ use spoolframe_protocol::{
     SUBTITLE_CHUNK, Selection, SubtitleAction,
 };
 use spoolframe_protocol::{
-    AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, LoginPassword, Reply,
-    Request, RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
+    AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, LoginPassword, PinState,
+    PlexLink, PlexSyncSummary, Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId,
+    SessionInfo, UserSummary,
 };
 use spoolframe_types::{ArtworkId, Item, MediaId, MediaKind, Namespace, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -39,6 +40,7 @@ use crate::encode::{Conversion, ConversionSource, hls};
 use crate::network::{ConnectionAuth, Connections, ServerName, Services};
 use crate::planner;
 use crate::playback::{Changed, Opened, Playback, Playbacks, Refusal, Sidecar};
+use crate::plex_accounts::Link;
 use crate::previews::{self, PreviewState};
 use crate::principal::Principal;
 use crate::store::pins::PinError;
@@ -46,6 +48,7 @@ use crate::store::sessions::{SessionBinding, SessionUser};
 use crate::subtitles::{TextSource, TextState};
 use crate::tracks::{self, TrackOverride};
 use crate::watch::WatchError;
+use spoolframe_admin_api::PlexSyncRun;
 use spoolframe_protocol::ConvertedVideo;
 use spoolframe_types::Delivery;
 
@@ -212,7 +215,14 @@ impl ClientProtocol {
         let reply = match envelope.request {
             Request::Hello(hello) => {
                 tracing::debug!(?hello, "hello");
+                let platform = hello.platform;
                 if state.hello.set(hello).is_ok() {
+                    // A device signed in before platforms were kept gets
+                    // one now; a failure costs only the label.
+                    let endpoint = connection.remote_id().to_string();
+                    if let Err(e) = self.store().note_device_platform(&endpoint, platform).await {
+                        tracing::warn!(error = %e, %endpoint, "cannot keep the device's platform");
+                    }
                     self.open_events(connection).await;
                 }
                 Ok(Reply::ServerInfo(ServerInfo {
@@ -229,8 +239,8 @@ impl ClientProtocol {
             }),
             Request::Ping => Ok(Reply::Pong),
             Request::LoginPassword(login) => {
-                let device_name = state.hello.get().and_then(|h| h.device_name.clone());
-                self.login_password(connection, login, device_name).await
+                let hello = state.hello.get().expect("checked above");
+                self.login_password(connection, login, hello).await
             }
             Request::BeginDeviceSignIn => {
                 let hello = state.hello.get().expect("checked above");
@@ -238,6 +248,7 @@ impl ClientProtocol {
                     endpoint: connection.remote_id().to_string(),
                     device_name: hello.device_name.clone(),
                     client_name: hello.client_name.clone(),
+                    platform: hello.platform,
                     requested_at: crate::store::now(),
                 });
                 match started {
@@ -486,7 +497,21 @@ impl ClientProtocol {
         mut recv: RecvStream,
     ) {
         let opened = match codec::read_frame::<_, MediaRead>(&mut recv).await {
-            Ok(read) => self.open_range(connection, state, &read).await,
+            Ok(read) => {
+                let opened = self.open_range(connection, state, &read).await;
+                // A client that plays HLS through a local player (AVPlayer)
+                // shows a failed fetch only to that player.
+                if let (Some(n), Err(error)) = (read.segment, &opened) {
+                    tracing::warn!(
+                        id = %self.played(&read.handle),
+                        endpoint = %connection.remote_id().fmt_short(),
+                        segment = n,
+                        %error,
+                        "an HLS segment read failed"
+                    );
+                }
+                opened
+            }
             Err(e) => Err(Error::Malformed {
                 message: e.to_string(),
             }),
@@ -520,6 +545,48 @@ impl ClientProtocol {
                 let _ = send.reset(VarInt::from_u32(0));
             }
         }
+    }
+
+    /// What `handle` plays, for the log; the handle itself is never logged.
+    fn played(&self, handle: &PlaybackHandle) -> String {
+        self.services
+            .playbacks
+            .item(handle)
+            .map_or_else(|| "(no open playback)".to_owned(), |id| id.to_string())
+    }
+
+    /// WebVTT segment `n` of `handle`'s subtitle rendition (P2-07).
+    async fn subtitle_segment(
+        &self,
+        connection: &Connection,
+        session: &SessionId,
+        handle: &PlaybackHandle,
+        n: u32,
+    ) -> Result<Reply, Error> {
+        let playback = self.use_playback(connection, handle, session).await?;
+        let span = playback
+            .conversion
+            .as_ref()
+            .filter(|c| c.subtitle_rendition().is_some())
+            .and_then(|c| c.segment_span(n));
+        let (Some((start_ms, end_ms)), Some(Sidecar::Made { state, .. })) =
+            (span, playback.subtitle)
+        else {
+            return Err(Error::NotFound {
+                what: format!("subtitle segment {n} in this playback"),
+            });
+        };
+        let path = read_text(state).await?;
+        let vtt = tokio::fs::read_to_string(&path).await.map_err(|e| {
+            tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
+            Error::Unavailable {
+                message: "the subtitle file could not be read".into(),
+            }
+        })?;
+        Ok(Reply::Subtitle {
+            format: SubtitleFormat::WebVtt,
+            bytes: hls::subtitle_segment(&vtt, start_ms, end_ms).into_bytes(),
+        })
     }
 
     /// The file positioned for `read`, and the reply that will precede it.
@@ -609,46 +676,79 @@ impl ClientProtocol {
         let catalog = &self.services.catalog;
         let principal = Principal::LocalUser(user.user);
         match request {
-            Request::WhoAmI => Ok(Reply::WhoAmI(UserSummary {
-                user_id: format!("local:{}", user.user.0),
-                username: user.username,
-                display_name: user.display_name,
-                role: user.role,
-                locked: state.locks.lock().expect("never poisoned").locked(&session),
-            })),
+            Request::WhoAmI => {
+                // Asked while locked too: a PIN pad sizes itself by it.
+                let pin = self.store().pin_info(user.user).await.map_err(internal)?;
+                Ok(Reply::WhoAmI(UserSummary {
+                    user_id: format!("local:{}", user.user.0),
+                    username: user.username,
+                    display_name: user.display_name,
+                    role: user.role,
+                    locked: state.locks.lock().expect("never poisoned").locked(&session),
+                    pin: pin.map(|p| PinState { digits: p.digits }),
+                }))
+            }
             Request::UnlockProfile { pin } => {
                 let endpoint = connection.remote_id().to_string();
-                match self.services.auth.unlock(user.user, &endpoint, &pin).await {
-                    Ok(()) => {
-                        state.locks.lock().expect("never poisoned").unlock(&session);
-                        Ok(Reply::Done)
-                    }
-                    Err(UnlockError::Wrong) => Err(Error::InvalidCredentials),
-                    Err(UnlockError::RateLimited { retry_after }) => Err(Error::RateLimited {
-                        retry_after_ms: retry_after.as_millis() as u64,
-                    }),
-                    Err(UnlockError::Revoked) => Err(Error::Unauthenticated),
-                    Err(UnlockError::Internal(e)) => Err(internal(e)),
-                }
+                self.services
+                    .auth
+                    .check_pin(user.user, &endpoint, &pin)
+                    .await
+                    .map_err(pin_error)?;
+                state.locks.lock().expect("never poisoned").unlock(&session);
+                Ok(Reply::Done)
             }
-            // The PIN, and where it is asked for, need only the session:
-            // a real sign-in made it, a locked one never gets here, and a
-            // PIN is never a way to sign in.
-            Request::SetPin { pin } => {
-                if !auth::valid_pin(&pin) {
+            // The PIN, and where it is asked for, need only the session
+            // (a real sign-in made it, a locked one never gets here, and a
+            // PIN is never a way to sign in), and changing or removing the
+            // PIN the current one too: an unlocked session left on a TV
+            // must not let whoever holds the remote take the PIN over.
+            Request::SetPin { pin, current } => {
+                let Some(digits) = auth::pin_digits(&pin) else {
                     return Err(Error::InvalidInput {
                         message: "a PIN is 4 to 8 digits".into(),
                     });
+                };
+                // Checked as at the lock screen, and counted with it, but
+                // never unlocking: the lock stays as it is.
+                match current {
+                    Some(current) => {
+                        let endpoint = connection.remote_id().to_string();
+                        self.services
+                            .auth
+                            .check_pin(user.user, &endpoint, &current)
+                            .await
+                            .map_err(pin_error)?;
+                    }
+                    None => {
+                        if self
+                            .store()
+                            .pin_info(user.user)
+                            .await
+                            .map_err(internal)?
+                            .is_some()
+                        {
+                            return Err(Error::InvalidInput {
+                                message: "enter the current PIN to change it".into(),
+                            });
+                        }
+                    }
                 }
                 let phc = auth::hash_pin(&pin).await.map_err(internal)?;
                 self.store()
-                    .set_pin(user.user, &phc)
+                    .set_pin(user.user, &phc, digits)
                     .await
                     .map_err(internal)?;
                 tracing::info!(user = %user.username, "PIN set");
                 Ok(Reply::Done)
             }
-            Request::ClearPin => {
+            Request::ClearPin { current } => {
+                let endpoint = connection.remote_id().to_string();
+                self.services
+                    .auth
+                    .check_pin(user.user, &endpoint, &current)
+                    .await
+                    .map_err(pin_error)?;
                 self.store().clear_pin(user.user).await.map_err(internal)?;
                 tracing::info!(user = %user.username, "PIN cleared");
                 Ok(Reply::Done)
@@ -663,6 +763,7 @@ impl ClientProtocol {
                     .into_iter()
                     .map(|d| DeviceInfo {
                         this_device: d.endpoint_id == this,
+                        platform: d.platform(),
                         endpoint_id: d.endpoint_id,
                         name: d.name,
                         last_seen_at: d.last_seen_at,
@@ -670,6 +771,19 @@ impl ClientProtocol {
                     })
                     .collect();
                 Ok(Reply::Devices { devices })
+            }
+            Request::GetPlexLink => {
+                let Some(accounts) = &self.services.plex_accounts else {
+                    return Ok(Reply::PlexLink { link: None });
+                };
+                let link = accounts.link(user.user).map_err(internal)?;
+                let sync = match (&self.services.plex_sync, &link) {
+                    (Some(sync), Some(_)) => sync.status(user.user),
+                    _ => (None, false),
+                };
+                Ok(Reply::PlexLink {
+                    link: plex_link(link, sync),
+                })
             }
             Request::SetPinRequired { device, required } => {
                 let this = connection.remote_id().to_string();
@@ -716,6 +830,7 @@ impl ClientProtocol {
                     .into_iter()
                     .map(|s| SessionInfo {
                         current: s.token_hash == current,
+                        platform: s.platform(),
                         device_name: s.device_name,
                         created_at: s.created_at,
                         last_used_at: s.last_used_at,
@@ -1109,30 +1224,23 @@ impl ClientProtocol {
                 })
             }
             Request::ReadSubtitleSegment { handle, n } => {
-                let playback = self.use_playback(connection, &handle, &session).await?;
-                let span = playback
-                    .conversion
-                    .as_ref()
-                    .filter(|c| c.subtitle_rendition().is_some())
-                    .and_then(|c| c.segment_span(n));
-                let (Some((start_ms, end_ms)), Some(Sidecar::Made { state, .. })) =
-                    (span, playback.subtitle)
-                else {
-                    return Err(Error::NotFound {
-                        what: format!("subtitle segment {n} in this playback"),
-                    });
-                };
-                let path = read_text(state).await?;
-                let vtt = tokio::fs::read_to_string(&path).await.map_err(|e| {
-                    tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
-                    Error::Unavailable {
-                        message: "the subtitle file could not be read".into(),
-                    }
-                })?;
-                Ok(Reply::Subtitle {
-                    format: SubtitleFormat::WebVtt,
-                    bytes: hls::subtitle_segment(&vtt, start_ms, end_ms).into_bytes(),
-                })
+                let read = self
+                    .subtitle_segment(connection, &session, &handle, n)
+                    .await;
+                // As for a segment read (`media_read`). Not ready yet is
+                // not a failure: the client asks again.
+                if let Err(error) = &read
+                    && !matches!(error, Error::SubtitleNotReady { .. })
+                {
+                    tracing::warn!(
+                        id = %self.played(&handle),
+                        endpoint = %connection.remote_id().fmt_short(),
+                        subtitle_segment = n,
+                        %error,
+                        "an HLS subtitle segment read failed"
+                    );
+                }
+                read
             }
             Request::LookupDeviceSignIn { code } => {
                 let code = self.sign_in_code(connection, &user, &code)?;
@@ -1204,12 +1312,13 @@ impl ClientProtocol {
         &self,
         connection: &Connection,
         login: LoginPassword,
-        device_name: Option<String>,
+        hello: &Hello,
     ) -> Result<Reply, Error> {
         let endpoint_id = connection.remote_id().to_string();
         let binding = SessionBinding::Endpoint {
             endpoint_id: endpoint_id.clone(),
-            device_name,
+            device_name: hello.device_name.clone(),
+            platform: hello.platform,
         };
         match self
             .services
@@ -1580,6 +1689,43 @@ impl ProtocolHandler for ClientProtocol {
 /// The most items one page or search returns, whatever the client asks.
 const MAX_PAGE: u32 = 500;
 
+/// A user's Plex link and their last sync run, as a client sees them: what
+/// My profile shows (`Link::shown`), and never the token.
+fn plex_link(
+    link: Option<Link>,
+    (last_run, syncing): (Option<PlexSyncRun>, bool),
+) -> Option<PlexLink> {
+    let shown = link?.shown();
+    Some(PlexLink {
+        username: shown.username,
+        email: shown.email,
+        by_config: shown.by_config,
+        linked_at: shown.linked_at,
+        last_sync: last_run.map(|run| PlexSyncSummary {
+            at: run.at,
+            libraries: run.libraries,
+            pulled: run.pulled,
+            pushed: run.pushed,
+            skipped: run.skipped,
+            failed: run.failed,
+        }),
+        syncing,
+    })
+}
+
+/// A PIN that did not pass, for the client: the same answers wherever it
+/// was entered.
+fn pin_error(e: UnlockError) -> Error {
+    match e {
+        UnlockError::Wrong => Error::InvalidCredentials,
+        UnlockError::RateLimited { retry_after } => Error::RateLimited {
+            retry_after_ms: retry_after.as_millis() as u64,
+        },
+        UnlockError::Revoked => Error::Unauthenticated,
+        UnlockError::Internal(e) => internal(e),
+    }
+}
+
 fn internal(e: impl std::fmt::Display) -> Error {
     tracing::error!(error = %e, "request failed");
     Error::Internal
@@ -1912,4 +2058,69 @@ fn sign_in_code_keys(connection: &Connection, user: &SessionUser) -> (String, St
 
 pub(crate) fn auth_methods() -> Vec<AuthMethod> {
     vec![AuthMethod::Password, AuthMethod::DeviceApproval]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plex_accounts::AccountLink;
+
+    fn run() -> PlexSyncRun {
+        PlexSyncRun {
+            at: 1_790_000_100,
+            libraries: 2,
+            pulled: 3,
+            pushed: 4,
+            skipped: 5,
+            failed: 1,
+            notes: vec!["Cabin movies skipped".into()],
+        }
+    }
+
+    #[test]
+    fn a_linked_account_is_shown_with_its_last_sync_and_never_its_token() {
+        let link = Link::Account(AccountLink {
+            token: "plex-token".into(),
+            username: Some("alice_plex".into()),
+            email: Some("alice@example.com".into()),
+            linked_at: 1_790_000_000,
+        });
+        let shown = plex_link(Some(link), (Some(run()), true)).unwrap();
+        assert_eq!(
+            shown,
+            PlexLink {
+                username: Some("alice_plex".into()),
+                email: Some("alice@example.com".into()),
+                by_config: false,
+                linked_at: Some(1_790_000_000),
+                last_sync: Some(PlexSyncSummary {
+                    at: 1_790_000_100,
+                    libraries: 2,
+                    pulled: 3,
+                    pushed: 4,
+                    skipped: 5,
+                    failed: 1,
+                }),
+                syncing: true,
+            }
+        );
+        let wire =
+            spoolframe_protocol::codec::encode(&Reply::PlexLink { link: Some(shown) }).unwrap();
+        assert!(!wire.windows(10).any(|w| w == b"plex-token"));
+    }
+
+    #[test]
+    fn the_config_s_owner_link_has_no_account_details() {
+        let shown = plex_link(Some(Link::Owner), (None, false)).unwrap();
+        assert!(shown.by_config);
+        assert_eq!(
+            (shown.username, shown.linked_at, shown.last_sync),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn no_link_is_none_whatever_the_sync_says() {
+        assert_eq!(plex_link(None, (Some(run()), false)), None);
+    }
 }

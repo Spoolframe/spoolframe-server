@@ -26,6 +26,7 @@ async fn clients_sign_in_and_are_told_the_server_is_not_set_up() {
             name: "living room".into(),
             client_name: "sdk-test".into(),
             client_version: "0".into(),
+            platform: spoolframe_client_sdk::types::Platform::Cli,
             capabilities: mkv_capabilities(),
         },
     )

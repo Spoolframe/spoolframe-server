@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use spoolframe_protocol::{
     ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo,
     DeviceSignInRequest, HomeScreen, ManifestKind, MediaRead, MediaReadResponse, PlaybackHandle,
-    PlaybackPlan, Previews, Reply, Request, Response, SearchRequest, SearchResults, Selection,
-    SessionId, SessionInfo, UserSummary,
+    PlaybackPlan, PlexLink, Previews, Reply, Request, Response, SearchRequest, SearchResults,
+    Selection, SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId, SubtitleFormat,
@@ -542,19 +542,27 @@ impl Session {
         .await
     }
 
-    /// Set or change this user's PIN: 4 to 8 digits. The PIN only locks and
-    /// unlocks this session, which a real sign-in made, so the unlocked
-    /// session is all it takes.
-    pub async fn set_pin(&self, pin: &str) -> Result<(), SdkError> {
+    /// Set or change this user's PIN: 4 to 8 digits. A user who has one
+    /// ([`UserSummary::pin`]) changes it only with it, `current`; it is
+    /// checked as [`Session::unlock`] checks a PIN and counts towards the
+    /// same limit, with the same errors, but unlocks nothing. Without it,
+    /// a user who has a PIN gets [`SdkError::InvalidInput`]. A user with
+    /// none passes `None`.
+    pub async fn set_pin(&self, pin: &str, current: Option<&str>) -> Result<(), SdkError> {
         self.done(Request::SetPin {
             pin: pin.to_owned(),
+            current: current.map(str::to_owned),
         })
         .await
     }
 
-    /// Remove this user's PIN, and where it is asked for.
-    pub async fn clear_pin(&self) -> Result<(), SdkError> {
-        self.done(Request::ClearPin).await
+    /// Remove this user's PIN, and where it is asked for, with the
+    /// `current` PIN, checked as for [`Session::set_pin`].
+    pub async fn clear_pin(&self, current: &str) -> Result<(), SdkError> {
+        self.done(Request::ClearPin {
+            current: current.to_owned(),
+        })
+        .await
     }
 
     /// The devices this user has signed in from, with where the PIN is
@@ -562,6 +570,16 @@ impl Session {
     pub async fn devices(&self) -> Result<Vec<DeviceInfo>, SdkError> {
         match self.call(Request::ListDevices).await? {
             Reply::Devices { devices } => Ok(devices),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// This user's Plex account link (P3-12): `None` when not linked. Read
+    /// only: to link or unlink, open `<web_url>/profile`
+    /// ([`Session::web_url`]) in a browser.
+    pub async fn plex_link(&self) -> Result<Option<PlexLink>, SdkError> {
+        match self.call(Request::GetPlexLink).await? {
+            Reply::PlexLink { link } => Ok(link),
             other => Err(unexpected(other)),
         }
     }

@@ -206,9 +206,10 @@ impl PlexAccounts {
         )?)
     }
 
-    /// Begin linking `user`'s Plex account: a PIN for them to approve.
-    pub async fn begin(&self, user: LocalUserId) -> Result<Pin, LinkError> {
-        let pin = self.plex_tv()?.begin().await?;
+    /// Begin linking `user`'s Plex account: a PIN for them to approve,
+    /// and Plex's sign-in page for it, which goes on to `forward` when done.
+    pub async fn begin(&self, user: LocalUserId, forward: Option<&str>) -> Result<Pin, LinkError> {
+        let pin = self.plex_tv()?.begin(forward).await?;
         self.pins
             .lock()
             .expect("never held across a panic")

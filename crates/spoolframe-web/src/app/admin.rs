@@ -8,13 +8,13 @@ use spoolframe_admin_api::{AdminApiClient, NewUser, PathReport, Role, SsoLink, U
 
 use super::{Alert, Field, Route, icons, initial, now, role_name, rpc};
 use crate::logic::{
-    AddUserError, ApiError, PathState, add_user_error, ago, avatar_class, count, host_port,
-    last_admin, path_state, sign_in_methods, thousands, user_change_error,
+    AddUserError, ApiError, Landing, PathState, add_user_error, ago, avatar_class, client_kind,
+    count, host_port, last_admin, path_state, sign_in_methods, thousands, user_change_error,
 };
 
 #[component]
 pub fn AdminHome() -> Element {
-    navigator().replace(Route::Users {});
+    navigator().replace(Route::from(Landing::Admin));
     rsx! {}
 }
 
@@ -730,7 +730,7 @@ fn UserSessionList(
                                             span { class: "pill ml-2", "This browser" }
                                         }
                                     }
-                                    td { class: "quiet max-md:hidden", if s.endpoint_id.is_some() { "App" } else { "Browser or CLI" } }
+                                    td { class: "quiet max-md:hidden", "{client_kind(s.endpoint_id.as_deref(), s.platform)}" }
                                     td { class: "quiet", "{ago(now(), s.last_used_at)}" }
                                     td { class: "end",
                                         button {
@@ -824,7 +824,7 @@ fn UserDevices(
                             for d in list {
                                 tr { key: "{d.endpoint_id}",
                                     td { b { "{session_device(&Some(d.endpoint_id.clone()), &d.name)}" } }
-                                    td { class: "quiet max-md:hidden", "App" }
+                                    td { class: "quiet max-md:hidden", "{client_kind(Some(&d.endpoint_id), d.platform)}" }
                                     td {
                                         span { class: "flex items-center gap-2",
                                             button {

@@ -6,8 +6,8 @@ use crate::support;
 use std::time::Duration;
 
 use spoolframe_protocol::{
-    ArtworkResponse, ArtworkSize, Error, MediaReadResponse, Reply, Request, Response, Selection,
-    SessionId,
+    ArtworkResponse, ArtworkSize, Error, MediaReadResponse, PinState, Reply, Request, Response,
+    Selection, SessionId,
 };
 use support::{ServerOptions, TestClient, TestServer, fresh_dir, mkv_capabilities, movie, poster};
 
@@ -44,7 +44,15 @@ async fn locked(test: &str, options: ServerOptions) -> (TestServer, TestClient, 
     server.write_media(1000);
     server.add_user("alice", PASSWORD, None).await;
     let (tv, session) = alice_on(&server).await;
-    ok(&tv, &session, Request::SetPin { pin: PIN.into() }).await;
+    ok(
+        &tv,
+        &session,
+        Request::SetPin {
+            pin: PIN.into(),
+            current: None,
+        },
+    )
+    .await;
     ok(
         &tv,
         &session,
@@ -115,7 +123,15 @@ async fn a_locked_session_gets_nothing_on_any_stream() {
         Reply::PlaybackStarted { handle, .. } => handle,
         other => panic!("not started: {other:?}"),
     };
-    ok(&tv, &session, Request::SetPin { pin: PIN.into() }).await;
+    ok(
+        &tv,
+        &session,
+        Request::SetPin {
+            pin: PIN.into(),
+            current: None,
+        },
+    )
+    .await;
     ok(
         &tv,
         &session,
@@ -193,11 +209,26 @@ async fn only_an_unlocked_session_changes_the_pin_or_its_switch() {
     };
     assert_eq!(err(&tv, &session, off.clone()).await, Error::ProfileLocked);
     assert_eq!(
-        err(&tv, &session, Request::ClearPin).await,
+        err(
+            &tv,
+            &session,
+            Request::ClearPin {
+                current: PIN.into()
+            }
+        )
+        .await,
         Error::ProfileLocked
     );
     assert_eq!(
-        err(&tv, &session, Request::SetPin { pin: "0000".into() }).await,
+        err(
+            &tv,
+            &session,
+            Request::SetPin {
+                pin: "0000".into(),
+                current: Some(PIN.into())
+            }
+        )
+        .await,
         Error::ProfileLocked
     );
     ok(&tv, &session, Request::UnlockProfile { pin: PIN.into() }).await;
@@ -215,7 +246,15 @@ async fn a_pin_is_four_to_eight_digits() {
     server.add_user("alice", PASSWORD, None).await;
     let (tv, session) = alice_on(&server).await;
     for bad in ["123", "123456789", "12a4"] {
-        let refused = err(&tv, &session, Request::SetPin { pin: bad.into() }).await;
+        let refused = err(
+            &tv,
+            &session,
+            Request::SetPin {
+                pin: bad.into(),
+                current: None,
+            },
+        )
+        .await;
         assert!(
             matches!(refused, Error::InvalidInput { .. }),
             "{bad}: {refused:?}"
@@ -283,7 +322,15 @@ async fn devices_are_listed_and_set_from_elsewhere() {
     server.add_user("alice", PASSWORD, None).await;
     let (tv, on_tv) = alice_on(&server).await;
     let (desktop, on_desktop) = alice_on(&server).await;
-    ok(&desktop, &on_desktop, Request::SetPin { pin: PIN.into() }).await;
+    ok(
+        &desktop,
+        &on_desktop,
+        Request::SetPin {
+            pin: PIN.into(),
+            current: None,
+        },
+    )
+    .await;
     let Reply::Devices { devices } = ok(&desktop, &on_desktop, Request::ListDevices).await else {
         panic!("no devices");
     };
@@ -312,5 +359,206 @@ async fn devices_are_listed_and_set_from_elsewhere() {
     assert!(!who(&desktop, &on_desktop).await);
     tv.close().await;
     desktop.close().await;
+    server.stop().await;
+}
+
+async fn pin_state(client: &TestClient, session: &SessionId) -> Option<PinState> {
+    match ok(client, session, Request::WhoAmI).await {
+        Reply::WhoAmI(user) => user.pin,
+        other => panic!("not WhoAmI: {other:?}"),
+    }
+}
+
+/// "Set · 4 digits" in a client's preferences, and a PIN pad's boxes.
+#[tokio::test]
+async fn who_am_i_says_whether_there_is_a_pin_and_how_many_digits() {
+    let server =
+        TestServer::start_with(fresh_dir("pin-state").await, ServerOptions::default()).await;
+    server.add_user("alice", PASSWORD, None).await;
+    let (tv, session) = alice_on(&server).await;
+    assert_eq!(pin_state(&tv, &session).await, None);
+    ok(
+        &tv,
+        &session,
+        Request::SetPin {
+            pin: "123456".into(),
+            current: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        pin_state(&tv, &session).await,
+        Some(PinState { digits: Some(6) })
+    );
+    ok(
+        &tv,
+        &session,
+        Request::ClearPin {
+            current: "123456".into(),
+        },
+    )
+    .await;
+    assert_eq!(pin_state(&tv, &session).await, None);
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_locked_profile_says_how_long_its_pin_is() {
+    let (server, tv, session) = locked("pin-state-locked", ServerOptions::default()).await;
+    assert!(who(&tv, &session).await);
+    assert_eq!(
+        pin_state(&tv, &session).await,
+        Some(PinState {
+            digits: Some(PIN.len() as u8)
+        })
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+fn set_pin(pin: &str, current: Option<&str>) -> Request {
+    Request::SetPin {
+        pin: pin.into(),
+        current: current.map(Into::into),
+    }
+}
+
+fn clear_pin(current: &str) -> Request {
+    Request::ClearPin {
+        current: current.into(),
+    }
+}
+
+/// A PIN is changed or removed only with the current one (a Change PIN or
+/// Remove PIN dialog asks for it); a wrong one changes nothing.
+#[tokio::test]
+async fn a_pin_is_changed_or_removed_only_with_the_current_one() {
+    let server =
+        TestServer::start_with(fresh_dir("pin-current").await, ServerOptions::default()).await;
+    server.add_user("alice", PASSWORD, None).await;
+    let (tv, session) = alice_on(&server).await;
+    ok(&tv, &session, set_pin(PIN, None)).await;
+
+    let refused = err(&tv, &session, set_pin("98765", None)).await;
+    assert!(matches!(refused, Error::InvalidInput { .. }), "{refused:?}");
+    assert_eq!(
+        err(&tv, &session, set_pin("98765", Some("0000"))).await,
+        Error::InvalidCredentials
+    );
+    assert_eq!(
+        err(&tv, &session, clear_pin("0000")).await,
+        Error::InvalidCredentials
+    );
+    // Nothing changed: the PIN is the first one still.
+    assert_eq!(
+        pin_state(&tv, &session).await,
+        Some(PinState { digits: Some(4) })
+    );
+
+    ok(&tv, &session, set_pin("98765", Some(PIN))).await;
+    assert_eq!(
+        pin_state(&tv, &session).await,
+        Some(PinState { digits: Some(5) })
+    );
+    assert_eq!(
+        err(&tv, &session, clear_pin(PIN)).await,
+        Error::InvalidCredentials
+    );
+    ok(&tv, &session, clear_pin("98765")).await;
+    assert_eq!(pin_state(&tv, &session).await, None);
+    // Without a PIN there is nothing to check.
+    ok(&tv, &session, set_pin(PIN, None)).await;
+    tv.close().await;
+    server.stop().await;
+}
+
+/// Checking the current PIN does not unlock a locked profile: a locked
+/// session cannot change the PIN at all, and an unlocked one that checks
+/// it gets no further than it was.
+#[tokio::test]
+async fn checking_the_current_pin_unlocks_nothing() {
+    let (server, tv, session) = locked("pin-current-locked", ServerOptions::default()).await;
+    assert_eq!(
+        err(&tv, &session, set_pin("98765", Some(PIN))).await,
+        Error::ProfileLocked
+    );
+    assert!(who(&tv, &session).await);
+    assert_eq!(
+        err(&tv, &session, Request::Libraries).await,
+        Error::ProfileLocked
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+/// Wrong current PINs count towards the same limit as wrong PINs at the
+/// lock screen: guessing through Change PIN, Remove PIN and the lock in
+/// turn is stopped after as many tries as through the lock alone, and
+/// stopped even for the right PIN.
+#[tokio::test]
+async fn wrong_current_pins_share_the_unlock_limit() {
+    let server = TestServer::start_with(
+        fresh_dir("pin-current-limit").await,
+        ServerOptions::default(),
+    )
+    .await;
+    server.add_user("alice", PASSWORD, None).await;
+    let (tv, session) = alice_on(&server).await;
+    ok(&tv, &session, set_pin(PIN, None)).await;
+    let guesses = [
+        set_pin("98765", Some("0000")),
+        clear_pin("0001"),
+        Request::UnlockProfile { pin: "0002".into() },
+        set_pin("98765", Some("0003")),
+        clear_pin("0004"),
+    ];
+    for guess in guesses {
+        assert_eq!(err(&tv, &session, guess).await, Error::InvalidCredentials);
+    }
+    for right in [
+        clear_pin(PIN),
+        set_pin("98765", Some(PIN)),
+        Request::UnlockProfile { pin: PIN.into() },
+    ] {
+        let refused = err(&tv, &session, right).await;
+        assert!(matches!(refused, Error::RateLimited { .. }), "{refused:?}");
+    }
+    assert_eq!(
+        pin_state(&tv, &session).await,
+        Some(PinState { digits: Some(4) })
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn ten_wrong_current_pins_revoke_that_device_s_session() {
+    let options = ServerOptions {
+        failure_window: Duration::from_millis(200),
+        ..ServerOptions::default()
+    };
+    let server = TestServer::start_with(fresh_dir("pin-current-revoke").await, options).await;
+    server.add_user("alice", PASSWORD, None).await;
+    let (tv, session) = alice_on(&server).await;
+    ok(&tv, &session, set_pin(PIN, None)).await;
+    let mut wrong = 0;
+    let last = loop {
+        match tv.call(Some(&session), clear_pin("0000")).await {
+            Response::Err(Error::RateLimited { .. }) => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Response::Err(Error::InvalidCredentials) => wrong += 1,
+            Response::Err(e) => break e,
+            Response::Ok(reply) => panic!("cleared with a wrong PIN: {reply:?}"),
+        }
+    };
+    assert_eq!(wrong, 9);
+    assert_eq!(last, Error::Unauthenticated);
+    assert_eq!(
+        err(&tv, &session, clear_pin(PIN)).await,
+        Error::Unauthenticated
+    );
+    tv.close().await;
     server.stop().await;
 }

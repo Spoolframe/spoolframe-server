@@ -29,8 +29,9 @@ pub use session::{
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{
     ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen,
-    MAX_READ, ManifestKind, PlaybackHandle, PlaybackPlan, PreviewTile, Previews, SearchCounts,
-    SearchGroup, SearchRequest, SearchResults, Selection, SessionInfo, TrackReason, UserSummary,
+    MAX_READ, ManifestKind, PinState, PlaybackHandle, PlaybackPlan, PlexLink, PlexSyncSummary,
+    PreviewTile, Previews, SearchCounts, SearchGroup, SearchRequest, SearchResults, Selection,
+    SessionInfo, TrackReason, UserSummary,
 };
 // Fingerprints for the "Server identity changed" alert (P1-13, P1-21).
 pub use spoolframe_protocol::fingerprint;
