@@ -96,6 +96,16 @@ async fn every_library_walks_down_to_a_playable_item() {
         match (library.kind, top) {
             (LibraryKind::Movies, Item::Movie(movie)) => {
                 assert_playable(&catalog, &movie.id).await;
+                // Plex's own preview index (P3-13), where it made one.
+                match catalog.preview_frames(&movie.id).await.unwrap() {
+                    Some(index) => {
+                        eprintln!("{}: Plex's preview index: {index:?}", movie.title);
+                        let first = &index.frames[0];
+                        assert_eq!(first.jpeg[..3], [0xFF, 0xD8, 0xFF], "a JPEG");
+                        assert!(index.frames.windows(2).all(|w| w[0].at_ms < w[1].at_ms));
+                    }
+                    None => eprintln!("{}: no preview index", movie.title),
+                }
                 if let Some(poster) = movie.artwork.first() {
                     let image = catalog.artwork(&poster.id).await.unwrap();
                     assert!(image.content_type.starts_with("image/"), "{image:?}");
@@ -123,7 +133,7 @@ async fn the_account_s_watch_state_is_read() {
     let Some(catalog) = live_catalog() else {
         return;
     };
-    let states = catalog.watch_states().await.unwrap();
+    let states = catalog.watch_states(None).await.unwrap();
     let watched = states.iter().filter(|w| w.watched).count();
     let started = states.iter().filter(|w| w.position_ms.is_some()).count();
     eprintln!(

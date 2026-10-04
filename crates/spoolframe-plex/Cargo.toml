@@ -9,6 +9,8 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 async-trait = { workspace = true }
+# Searching every section and hub at once (P3-09).
+futures-util = { workspace = true, features = ["alloc"] }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

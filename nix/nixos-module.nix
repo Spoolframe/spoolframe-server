@@ -279,7 +279,7 @@ in {
       type = lib.types.lines;
       default = "";
       example = "artwork { cache_mb = 4096; }";
-      description = "More UCL for the server config (`artwork`, `watch`).";
+      description = "More UCL for the server config (`artwork`, `watch`, `previews`).";
     };
   };
 

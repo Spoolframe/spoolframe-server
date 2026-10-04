@@ -350,6 +350,20 @@ impl Store {
         .await?)
     }
 
+    /// Every user's started and unwatched items, the most recently played
+    /// first, each once: what frame previews are made for first (P3-13).
+    pub async fn in_progress_anyone(&self, limit: u32) -> Result<Vec<String>, StoreError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT media_id FROM watch_state \
+             WHERE watched = 0 AND position_ms > 0 \
+             GROUP BY media_id ORDER BY MAX(updated_at) DESC LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// Shows with an episode watched or in progress since `since` (Unix
     /// seconds), the most recently active first.
     pub async fn active_shows(
@@ -492,6 +506,38 @@ mod tests {
 
     async fn store(test: &str) -> TestStore {
         test_store(test).await
+    }
+
+    #[tokio::test]
+    async fn everyone_s_items_in_progress_come_most_recently_played_first_and_once() {
+        let store = store("in-progress-anyone").await;
+        store
+            .save_watch_at(ALICE, at("plex:movie:1", 60_000, &[]), 100)
+            .await
+            .unwrap();
+        store
+            .save_watch_at(BOB, at("plex:movie:2", 60_000, &[]), 300)
+            .await
+            .unwrap();
+        // Alice plays 2 too, earlier than Bob: listed once, as of Bob.
+        store
+            .save_watch_at(ALICE, at("plex:movie:2", 30_000, &[]), 200)
+            .await
+            .unwrap();
+        let watched = WatchUpdate {
+            watched: true,
+            ..at("plex:movie:3", 60_000, &[])
+        };
+        store.save_watch_at(BOB, watched, 400).await.unwrap();
+        store
+            .save_watch_at(BOB, at("plex:movie:4", 0, &[]), 500)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.in_progress_anyone(10).await.unwrap(),
+            ["plex:movie:2", "plex:movie:1"]
+        );
+        assert_eq!(store.in_progress_anyone(1).await.unwrap(), ["plex:movie:2"]);
     }
 
     #[tokio::test]

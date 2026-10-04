@@ -418,3 +418,110 @@ pub fn History(#[props(default = 20)] size: u32) -> Element {
         }
     }
 }
+
+/// A movie library (P3-11).
+#[component]
+pub fn Film(#[props(default = 18)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            rect { width: "18", height: "18", x: "3", y: "3", rx: "2" }
+            path { d: "M7 3v18" }
+            path { d: "M3 7.5h4" }
+            path { d: "M3 12h18" }
+            path { d: "M3 16.5h4" }
+            path { d: "M17 3v18" }
+            path { d: "M17 7.5h4" }
+            path { d: "M17 16.5h4" }
+        }
+    }
+}
+
+/// A music library.
+#[component]
+pub fn Music(#[props(default = 18)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M9 18V5l12-2v13" }
+            circle { cx: "6", cy: "18", r: "3" }
+            circle { cx: "18", cy: "16", r: "3" }
+        }
+    }
+}
+
+/// A row's handle for reordering.
+#[component]
+pub fn Grip(#[props(default = 15)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            circle { cx: "9", cy: "12", r: "1" }
+            circle { cx: "9", cy: "5", r: "1" }
+            circle { cx: "9", cy: "19", r: "1" }
+            circle { cx: "15", cy: "12", r: "1" }
+            circle { cx: "15", cy: "5", r: "1" }
+            circle { cx: "15", cy: "19", r: "1" }
+        }
+    }
+}
+
+#[component]
+pub fn ChevronDown(#[props(default = 15)] size: u32) -> Element {
+    rsx! {
+        Stroke { size, path { d: "m6 9 6 6 6-6" } }
+    }
+}
+
+#[component]
+pub fn ChevronUp(#[props(default = 15)] size: u32) -> Element {
+    rsx! {
+        Stroke { size, path { d: "m18 15-6-6-6 6" } }
+    }
+}
+
+/// A row's menu.
+#[component]
+pub fn Ellipsis(#[props(default = 18)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            circle { cx: "12", cy: "12", r: "1" }
+            circle { cx: "19", cy: "12", r: "1" }
+            circle { cx: "5", cy: "12", r: "1" }
+        }
+    }
+}
+
+/// Plex's play mark, on the Plex account card (P3-12).
+#[component]
+pub fn Play(#[props(default = 16)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z" }
+        }
+    }
+}
+
+/// Opens in a new window: Plex's sign-in.
+#[component]
+pub fn ExternalLink(#[props(default = 16)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M15 3h6v6" }
+            path { d: "M10 14 21 3" }
+            path { d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" }
+        }
+    }
+}
+
+/// Unlinking a Plex account.
+#[component]
+pub fn Unlink(#[props(default = 16)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "m18.84 12.25 1.72-1.71h-.02a5.004 5.004 0 0 0-.12-7.07 5.006 5.006 0 0 0-6.95 0l-1.72 1.71" }
+            path { d: "m5.17 11.75-1.71 1.71a5.004 5.004 0 0 0 .12 7.07 5.006 5.006 0 0 0 6.95 0l1.71-1.71" }
+            line { x1: "8", x2: "8", y1: "2", y2: "5" }
+            line { x1: "2", x2: "5", y1: "8", y2: "8" }
+            line { x1: "16", x2: "16", y1: "19", y2: "22" }
+            line { x1: "19", x2: "22", y1: "16", y2: "16" }
+        }
+    }
+}

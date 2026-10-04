@@ -18,13 +18,14 @@ use spoolframe_protocol::{
 use spoolframe_protocol::{
     PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleDelivery,
 };
+use spoolframe_protocol::{SearchCounts, SearchGroup, SearchRequest, SearchResults};
 use spoolframe_types::Delivery;
 use spoolframe_types::{
     AudioCodec, ClientCapabilities, Container, SubtitleFormat, TrackPreferences, VideoCodec,
 };
 use spoolframe_types::{
     Item, Library, LibraryId, LibraryKind, Marker, MarkerKind, MediaId, MediaKind, MediaTracks,
-    Movie, Namespace, PlaybackState,
+    Movie, Namespace, Person, PersonId, PersonRole, PlaybackState, SearchKind, SearchScope,
 };
 
 fn round_trip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: T) {
@@ -61,6 +62,42 @@ fn markers() -> Vec<Marker> {
     ]
 }
 
+fn search_results() -> SearchResults {
+    SearchResults {
+        top: Some(movie()),
+        groups: vec![
+            SearchGroup {
+                kind: SearchKind::People,
+                items: Vec::new(),
+                people: vec![Person {
+                    id: PersonId::new(Namespace::Plex, "actor-134469").unwrap(),
+                    name: "Keanu Reeves".into(),
+                    role: PersonRole::Actor,
+                    count: Some(9),
+                }],
+                more: true,
+                hidden: 0,
+            },
+            SearchGroup {
+                kind: SearchKind::Episodes,
+                items: Vec::new(),
+                people: Vec::new(),
+                more: false,
+                hidden: 3,
+            },
+        ],
+        counts: SearchCounts {
+            all: Some(12),
+            movies: Some(1),
+            shows: None,
+            episodes: Some(3),
+            music: Some(0),
+        },
+        year: Some(1979),
+        without_year: vec![movie()],
+    }
+}
+
 fn hello() -> Hello {
     Hello {
         protocol_version: PROTOCOL_VERSION,
@@ -81,6 +118,7 @@ fn hello() -> Hello {
 fn every_request_round_trips() {
     let id = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
     for request in [
+        Request::GetPreviews { id: id.clone() },
         Request::Hello(hello()),
         Request::AuthMethods,
         Request::LoginPassword(LoginPassword {
@@ -108,9 +146,24 @@ fn every_request_round_trips() {
             limit: 20,
         },
         Request::Item { id: id.clone() },
-        Request::Search {
-            query: "alien".into(),
+        Request::Search(SearchRequest {
+            query: "alien 1979".into(),
             limit: 10,
+            scope: SearchScope::Movies,
+            kind: None,
+            library: Some(LibraryId::new(Namespace::Plex, "2").unwrap()),
+        }),
+        Request::Search(SearchRequest {
+            query: "keanu".into(),
+            limit: 50,
+            scope: SearchScope::All,
+            kind: Some(SearchKind::People),
+            library: None,
+        }),
+        Request::PersonItems {
+            person: PersonId::new(Namespace::Plex, "director-131768").unwrap(),
+            offset: 0,
+            limit: 50,
         },
         Request::Tracks { id },
         Request::WhoAmI,
@@ -227,10 +280,23 @@ fn every_reply_round_trips() {
             protocol_version: PROTOCOL_VERSION,
             server_version: "0.1.0".into(),
             auth_methods: vec![AuthMethod::Password],
+            web_url: Some("https://media.example.org".into()),
         }),
         Reply::AuthMethods {
             methods: vec![AuthMethod::Password, AuthMethod::DeviceApproval],
         },
+        Reply::Previews(spoolframe_protocol::Previews {
+            interval_ms: 10_000,
+            tile_width: 320,
+            tile_height: 134,
+            columns: 10,
+            rows: 10,
+            count: 150,
+            sheets: vec![
+                "preview:0f3a/0".parse().unwrap(),
+                "preview:0f3a/1".parse().unwrap(),
+            ],
+        }),
         Reply::DeviceSignInStarted {
             request: "r".into(),
             code: "BCDFGHJK".into(),
@@ -269,9 +335,7 @@ fn every_reply_round_trips() {
             children: Vec::new(),
             markers: markers(),
         },
-        Reply::Search {
-            items: vec![movie()],
-        },
+        Reply::Search(search_results()),
         Reply::Tracks(MediaTracks::default()),
         Reply::WhoAmI(UserSummary {
             user_id: "local:1".into(),
@@ -391,6 +455,8 @@ fn every_error_round_trips() {
             message: "Plex is down".into(),
         },
         Error::NotSetUp,
+        Error::PreviewsNotReady { done_percent: 7 },
+        Error::NoPreviews,
         Error::Internal,
     ] {
         round_trip(Response::Err(error));
@@ -662,6 +728,35 @@ fn a_field_added_by_a_newer_client_is_ignored() {
     .unwrap();
     let hello: Hello = codec::decode(&bytes).unwrap();
     assert_eq!(hello.protocol_version, 2);
+}
+
+#[test]
+fn a_search_is_flat_on_the_wire() {
+    let request = Request::Search(SearchRequest {
+        query: "dune 2021".into(),
+        limit: 6,
+        scope: SearchScope::Music,
+        kind: Some(SearchKind::Artists),
+        library: None,
+    });
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        serde_json::json!({
+            "type": "search",
+            "query": "dune 2021",
+            "limit": 6,
+            "scope": "music",
+            "kind": "artists",
+            "library": null,
+        })
+    );
+    let reply = serde_json::to_value(Reply::Search(search_results())).unwrap();
+    assert_eq!(reply["type"], "search");
+    assert_eq!(reply["year"], 1979);
+    assert_eq!(reply["groups"][0]["kind"], "people");
+    assert_eq!(reply["groups"][0]["people"][0]["id"], "plex:actor-134469");
+    assert_eq!(reply["groups"][1]["hidden"], 3);
+    assert_eq!(reply["counts"]["shows"], serde_json::Value::Null);
 }
 
 #[test]

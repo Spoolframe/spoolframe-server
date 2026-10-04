@@ -1,0 +1,78 @@
+{
+  "query": "dune",
+  "replies": [
+    {
+      "path": "/library/sections/2/search",
+      "type": "1",
+      "year": "2021",
+      "body": {
+        "MediaContainer": {
+          "totalSize": 1,
+          "Metadata": [
+            {
+              "ratingKey": "176423",
+              "type": "movie",
+              "title": "Dune: Part One",
+              "year": 2021
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/library/sections/1/search",
+      "type": "2",
+      "year": "2021",
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/1/search",
+      "type": "4",
+      "year": "2021",
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "8",
+      "year": "2021",
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "9",
+      "year": "2021",
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "10",
+      "year": "2021",
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    }
+  ]
+}

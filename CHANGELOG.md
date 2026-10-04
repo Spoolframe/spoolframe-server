@@ -799,3 +799,157 @@
   it), or that it applies after a restart, with "Restart now" where the
   server is supervised. Every admin page shows a banner while insecure
   cookies are on. The login card works over plain HTTP when they are.
+- Plex libraries are chosen (P3-11): `libraries [ { name; kind; plex {
+  server; section; } } ]` lists the libraries clients see, in order, each
+  one section of a Plex server under a Spoolframe name; left out, every
+  library of the first Plex server is served as before. More Plex servers
+  go in `plex.servers` (`id`, `name`, `url`, `token_file`,
+  `path_mapping`; a token set at run time is `secrets/plex-token-<id>`).
+  The first server's IDs are unchanged (`plex:movie:12`); another's carry
+  its id (`plex:movie:cabin:12`, `plex:cabin:2`), which clients treat as
+  opaque. One catalog routes each call to its server and merges search
+  (round robin) and recently added (newest first). A Plex server that is
+  down leaves its libraries listed and answering `Unavailable`, while
+  search and Home go on with the others. An item in a library that is not
+  served is not found for clients, and its watch state is kept and never
+  re-linked elsewhere, so adding the library back restores it.
+- The admin API manages libraries and Plex servers (P3-11): `libraries`
+  (each library with its server, Plex's name for it, its item count, a
+  sample path check and why it is unavailable; each server reachable or
+  not, with every section marked with the library it is, and those
+  Spoolframe cannot serve apart), `libraryAdd`, `libraryRename`,
+  `libraryMove`, `libraryRemove`, `plexServerAdd` (probed first, named as
+  Plex names itself, with a pasted token or the first server's),
+  `plexServerUpdate`, `plexServerSetToken`, `plexServerSetPaths` and
+  `plexServerRemove` (with its libraries and token; not the first server).
+  The first change to libraries chooses all that were served, then makes
+  itself. `plexPathCheck` takes a server and sections, to check a library
+  before it is added; `plexStatus` and `plexProbe` give each section's key
+  and the library it is.
+- Server › Libraries in the web UI (P3-11), as sf-design's WebLibraries,
+  WebLibraryAdd and WebLibrariesStates boards draw it: the libraries in the
+  order apps show them, each with where it comes from, its size and a
+  sample path check, moved up and down, renamed, re-mapped and removed
+  from its menu; a card for each Plex server that is down, checked again
+  every 30 seconds and on "Check now"; and "Add a library": a Plex server
+  already added, found on the LAN or typed, the first server's token or a
+  pasted one, then its libraries with their Spoolframe names and paths,
+  each checked on a few files before it is added. The wizard's Plex step
+  (and Settings › Plex) chooses its libraries with checkboxes, and "Add
+  another Plex server" opens the add flow. The boards' watch sync column
+  and panel are P3-12's and not here.
+- Sign in with Plex per user (P3-12): every user links their own Plex
+  account with plex.tv's PIN flow (`me.plexLinkBegin`, `me.plexLinkCheck`),
+  and unlinks it (`me.plexUnlink`). The token is kept as the user's secret
+  (`secrets/plex-account-<id>`), never in a reply, a log line or a config
+  layer. `me.plexLink` and `admin.plexSync` show who is linked to which
+  Plex account; an admin can unlink (`admin.userPlexUnlink`), not link.
+  PX-04's `plex.watch_sync.user` is that user's link, made by the config
+  with each server's own token: nothing to change in an existing config,
+  and only the config unlinks it. `watch_sync.user` is now optional, so
+  the interval can be set alone. The linked account lists its Plex servers
+  (`admin.plexAccountServers`), and `plexServerAdd` without a token uses
+  the one the caller's account has for that server. Each library says
+  which way its watch state syncs (`plex { sync = "off" | "from_plex" |
+  "to_plex" | "both"; }`, shown in `libraries`, set with
+  `librarySetSync`); left out, both for the first server's libraries
+  while `watch_sync.user` is set, as PX-04 synced them, else off.
+- Watch sync per library and per user (P3-12): every linked user's state
+  syncs with their own Plex account, on each Plex server their libraries
+  come from, with the token plex.tv gives that account for that server
+  (or, for the config's owner, the server's own). `from_plex` only takes
+  Plex's state, `to_plex` only sends Spoolframe's, `off` does neither, and
+  `both` keeps PX-04's rules. An item only Spoolframe knows is sent only
+  once Plex says which library it is in. Each linked user runs at start,
+  every `watch_sync.interval_secs`, soon after their own state changes
+  and at most once a minute during playback; a new link runs at once,
+  and unlinking stops the runs. Each run's counts (pulled, pushed,
+  skipped, failed) and notes ("Cabin movies skipped: Cabin can't be
+  reached") are logged and kept: `admin.plexSync` and `me.plexLink` show
+  each user's last run. `admin.plexWatchSync` and `plex sync-watch` take a
+  user (`--user`), or run every linked user in turn.
+- Plex links and watch sync in the web UI (P3-12), as sf-design's
+  WebPlexAccountStates, WebUserSessions, WebLibraries and
+  WebLibrariesStates boards draw them. My profile has a Plex account card:
+  what linking grants, "Link with Plex" (Plex's sign-in in a new window,
+  with a countdown, "Open the Plex window again" and Cancel), the linked
+  account with its last run, Unlink after a question, and plex.tv out of
+  reach or a code that expired, each said as such; the config's owner can
+  link their own account in its place. A user's page has a Plex account
+  section for the admin: who the user is linked as, the last sync, "Sync
+  now" and Unlink. Server › Libraries has a watch sync column (off, from
+  Plex, to Plex, both) and a sync panel: how often it runs, each user's
+  last run with its counts and notes, "Sync now" and "Sync everyone",
+  "Not linked to Plex · not synced" for the others, and what each
+  direction does. The add-library flow lists the servers of the admin's
+  linked Plex account ("From your Plex account") and adds one with that
+  account's token for it; `plexProbe` tries that token too.
+- Scoped, grouped search (P3-09). `Search` takes a `scope` (`all`,
+  `movies`, `shows`, `episodes`, `music`), an optional `library`, and an
+  optional `kind` for "See all" (`shows`, `movies`, `people`, `artists`,
+  `albums`, `tracks`, `episodes`). The reply is `{ top, groups, counts,
+  year, without_year }`: the best match (an exact title, then one that
+  starts with the query, a leading article aside; a show before its own
+  episodes), one group per
+  kind with `more` and, for episodes left out of `all` because their
+  show is listed, `hidden`; per-scope counts; a year taken from the end of
+  the query ("dune 2021") as a filter; and up to 3 items from other
+  years. Plex is asked each kind in the sections that hold it
+  (`/library/sections/{id}/search?type=`), with the year, so the scope and
+  the counts are Plex's; people (actors and directors) come from
+  `/hubs/search`, once each across sections. Several Plex servers'
+  results are merged per kind and their counts summed; a library's search
+  asks only its server. Wire-incompatible: clients rebuild on this SDK,
+  whose `Session::search` takes a `SearchRequest` and returns
+  `SearchResults`.
+- Choosing a person lists their items (P3-09): `PersonItems { person,
+  offset, limit }` answers `Items` with what an actor or director a
+  search found is in, in the served libraries, from
+  `/library/all?actor=` (or `director=`) on that person's Plex server.
+  SDK: `Session::person_items`.
+- `ServerInfo`, the answer to `Hello`, has `web_url`: the server's
+  `admin.public_url`, or none. A client links to its web UI (linking a
+  Plex account, P3-12) without beginning a device sign-in, whose web
+  link was the only other place it appeared. Wire-incompatible.
+- SDK: `Session::web_url`, the `web_url` of the Hello of the connection
+  the session is on (the latest, after a reconnect), so an app links into
+  the web UI from a signed-in screen.
+- Frame previews for scrubbing are made on the server (P3-13): for a film
+  or episode, a picture every 10 s, 320 px wide, packed as JPEG sheets of
+  10 × 10. Each tile is one ffmpeg seek and one keyframe
+  (`-skip_frame nokey`), with a hardware decoder where P2-02 found one for
+  the codec, tone-mapped for HDR. On a 4K remux that reads well under
+  1 GB, where one pass over the file reads all of it. One file at a time,
+  by one worker, at nice 19 and the idle I/O class, outside the
+  conversion slots. Sets are kept in `state_dir/cache/previews`, named by
+  the file's path, size and modification time and the interval, so a
+  replaced file gets new ones, under a size limit, least recently used
+  first.
+- Clients get frame previews (P3-13). `GetPreviews { id }` answers
+  `Previews { interval_ms, tile_width, tile_height, columns, rows, count,
+  sheets }`, `PreviewsNotReady { done_percent }` while they are made
+  (asking puts the item first in line), or `NoPreviews` (music, a file
+  they cannot be made of, or `when = never`). Each sheet is an `ArtworkId`
+  in the new `preview:` namespace, read on the artwork stream like any
+  image (Original, or scaled whole). `Previews::tile(position_ms)` names
+  the sheet and the rectangle for a time. Starting a playback makes its
+  item's previews next. SDK: `Session::previews`,
+  `SdkError::PreviewsNotReady` and `NoPreviews`, and `Previews` and
+  `PreviewTile` re-exported. Config, all live: `previews { when =
+  "ahead" | "on_play" | "never"; interval_secs = 10; cache_mb = 4096; }`.
+  A stopping server gives up the file being made. Wire-incompatible.
+- Previews come from Plex's own index where it has one (P3-13): a part
+  whose `indexes` says `sd` has its "video preview thumbnails" at
+  `/library/parts/{id}/indexes/sd`, a BIF file (a 320 px JPEG every 2 s;
+  23.8 MB for a 110-minute film), read from the film's own Plex server
+  and packed into sheets as if made here, with nothing decoded. A part
+  without one, or an index that cannot be read, is decoded as before.
+  `Catalog::preview_frames`, `None` by default.
+- `previews.when = "ahead"` (the default) makes previews before anyone
+  plays (P3-13): what any user has in progress first, then the newest
+  items, then every film and episode of every library, while the cache
+  has room for another set; a play or an ask still goes first and may
+  evict. The newest and in-progress items are queued again every 10
+  minutes, ahead of the rest, so an item added to Plex gets previews
+  soon; every library is walked at start, when `ahead` is turned on, and
+  every 6 hours.

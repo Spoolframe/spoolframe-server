@@ -6,12 +6,16 @@
 //! can implement it and the server can hold either, without the server and
 //! a catalog depending on each other.
 
+mod search;
+
+pub use search::{Found, FoundGroup, SearchQuery, interleave};
+
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use spoolframe_types::{ArtworkId, Item, Library, LibraryId, Marker, MediaId};
+use spoolframe_types::{ArtworkId, Item, Library, LibraryId, Marker, MediaId, PersonId};
 
 /// Which slice of a library to list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +86,12 @@ pub enum CatalogError {
     /// There is no catalog yet: the server has not been set up (P3-10).
     #[error("this server is not set up yet: it has no library")]
     NotSetUp,
+    /// The item is in a library the server does not serve now: one never
+    /// added, or removed (P3-11), or on a Plex server no longer configured.
+    /// Clients see it as not found; its watch state is kept, and nothing
+    /// re-links it elsewhere, so adding the library back restores it.
+    #[error("{0} is in a library this server does not serve")]
+    NotServed(String),
 }
 
 /// A media file that cannot be read on this host. Names the path the
@@ -133,8 +143,14 @@ pub trait Catalog: Send + Sync {
     /// key now names an item of another kind.
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError>;
 
-    /// Items whose titles match `query`, at most `limit` of them.
-    async fn search(&self, query: &str, limit: u32) -> Result<Vec<Item>, CatalogError>;
+    /// Each kind `query` asks for, in the libraries it covers (P3-09).
+    /// The catalog's backend applies the scope; nothing is filtered out
+    /// afterwards.
+    async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError>;
+
+    /// The items a person [`Catalog::search`] found is in, in the
+    /// libraries served (P3-09).
+    async fn person_items(&self, id: &PersonId) -> Result<Vec<Item>, CatalogError>;
 
     /// The local path of the item's media file: what the catalog reports,
     /// mapped to this host, and checked to be a readable file.
@@ -146,6 +162,48 @@ pub trait Catalog: Send + Sync {
     /// The image an `ArtworkId` names, at the size the catalog has it.
     /// Never anything but an image.
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError>;
+
+    /// Frame previews the catalog already made of the item's media file
+    /// (P3-13): Plex's "video preview thumbnails". `None` when it has
+    /// none, and the server makes its own; a catalog that never makes any
+    /// keeps this default.
+    async fn preview_frames(&self, _id: &MediaId) -> Result<Option<PreviewFrames>, CatalogError> {
+        Ok(None)
+    }
+}
+
+/// A catalog's own frame previews of a file: pictures at times through
+/// it, in order.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreviewFrames {
+    pub frames: Vec<PreviewFrame>,
+}
+
+/// One picture of a [`PreviewFrames`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreviewFrame {
+    /// The time in the file it shows.
+    pub at_ms: u64,
+    /// A JPEG.
+    pub jpeg: Vec<u8>,
+}
+
+impl fmt::Debug for PreviewFrames {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreviewFrames")
+            .field("frames", &self.frames.len())
+            .field("last_ms", &self.frames.last().map(|l| l.at_ms))
+            .finish()
+    }
+}
+
+impl fmt::Debug for PreviewFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreviewFrame")
+            .field("at_ms", &self.at_ms)
+            .field("jpeg", &self.jpeg.len())
+            .finish()
+    }
 }
 
 /// An image and its media type.

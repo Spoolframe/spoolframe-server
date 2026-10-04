@@ -7,7 +7,11 @@
 
 // Used by the app, which only the wasm build has; the host has its tests.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod libraries;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod logic;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod plex_sync;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod setup;
 

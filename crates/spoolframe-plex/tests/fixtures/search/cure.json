@@ -1,0 +1,320 @@
+{
+  "query": "cure",
+  "replies": [
+    {
+      "path": "/library/sections/2/search",
+      "type": "1",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 1,
+          "Metadata": [
+            {
+              "ratingKey": "137009",
+              "type": "movie",
+              "title": "The Cured",
+              "year": 2017
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/library/sections/1/search",
+      "type": "2",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/1/search",
+      "type": "4",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "8",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 1,
+          "Metadata": [
+            {
+              "ratingKey": "224303",
+              "type": "artist",
+              "title": "The Cure",
+              "index": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "9",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 1,
+          "Metadata": [
+            {
+              "ratingKey": "224465",
+              "type": "album",
+              "title": "The Cure",
+              "year": 2004,
+              "index": 1,
+              "parentRatingKey": "224303",
+              "parentTitle": "The Cure"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "10",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 1,
+          "Metadata": [
+            {
+              "ratingKey": "223225",
+              "type": "track",
+              "title": "Cure for the Itch",
+              "index": 11,
+              "parentIndex": 1,
+              "parentRatingKey": "223209",
+              "grandparentRatingKey": "222441",
+              "grandparentTitle": "Linkin Park",
+              "parentTitle": "Hybrid Theory (20th anniversary edition)"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/hubs/search",
+      "type": null,
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "Hub": [
+            {
+              "type": "artist",
+              "size": 1,
+              "Metadata": [
+                {
+                  "ratingKey": "224303",
+                  "type": "artist",
+                  "title": "The Cure",
+                  "index": 1,
+                  "librarySectionID": 12
+                }
+              ]
+            },
+            {
+              "type": "album",
+              "size": 10,
+              "Metadata": [
+                {
+                  "ratingKey": "224465",
+                  "type": "album",
+                  "title": "The Cure",
+                  "year": 2004,
+                  "index": 1,
+                  "parentRatingKey": "224303",
+                  "parentTitle": "The Cure",
+                  "librarySectionID": 12
+                },
+                {
+                  "ratingKey": "224395",
+                  "type": "album",
+                  "title": "Alone",
+                  "year": 2024,
+                  "index": 1,
+                  "parentRatingKey": "224303",
+                  "parentTitle": "The Cure",
+                  "librarySectionID": 12
+                },
+                {
+                  "ratingKey": "224397",
+                  "type": "album",
+                  "title": "A Fragile Thing",
+                  "year": 2024,
+                  "index": 1,
+                  "parentRatingKey": "224303",
+                  "parentTitle": "The Cure",
+                  "librarySectionID": 12
+                },
+                {
+                  "ratingKey": "224401",
+                  "type": "album",
+                  "title": "The 13th",
+                  "year": 1996,
+                  "index": 1,
+                  "parentRatingKey": "224303",
+                  "parentTitle": "The Cure",
+                  "librarySectionID": 12
+                },
+                {
+                  "ratingKey": "224439",
+                  "type": "album",
+                  "title": "Charlotte Sometimes",
+                  "year": 1981,
+                  "index": 1,
+                  "parentRatingKey": "224303",
+                  "parentTitle": "The Cure",
+                  "librarySectionID": 12
+                },
+                {
+                  "ratingKey": "224452",
+                  "type": "album",
+                  "title": "Disintegration",
+                  "year": 1989,
+                  "index": 1,
+                  "parentRatingKey": "224303",
+                  "parentTitle": "The Cure",
+                  "librarySectionID": 12
+                },
+                {
+                  "ratingKey": "224516",
+                  "type": "album",
+                  "title": "4:13 Dream",
+                  "year": 2008,
+                  "index": 1,
+                  "parentRatingKey": "224303",
+                  "parentTitle": "The Cure",
+                  "librarySectionID": 12
+                },
+                {
+                  "ratingKey": "224542",
+                  "type": "album",
+                  "title": "Faith",
+                  "year": 1981,
+                  "index": 1,
+                  "parentRatingKey": "224303",
+                  "parentTitle": "The Cure",
+                  "librarySectionID": 12
+                },
+                {
+                  "ratingKey": "224558",
+                  "type": "album",
+                  "title": "Faith",
+                  "year": 1981,
+                  "index": 1,
+                  "parentRatingKey": "224303",
+                  "parentTitle": "The Cure",
+                  "librarySectionID": 12
+                },
+                {
+                  "ratingKey": "224581",
+                  "type": "album",
+                  "title": "Bloodflowers",
+                  "year": 2000,
+                  "index": 1,
+                  "parentRatingKey": "224303",
+                  "parentTitle": "The Cure",
+                  "librarySectionID": 12
+                }
+              ]
+            },
+            {
+              "type": "movie",
+              "size": 1,
+              "Metadata": [
+                {
+                  "ratingKey": "137009",
+                  "type": "movie",
+                  "title": "The Cured",
+                  "year": 2017,
+                  "librarySectionID": 2
+                }
+              ]
+            },
+            {
+              "type": "show",
+              "size": 0
+            },
+            {
+              "type": "episode",
+              "size": 0
+            },
+            {
+              "type": "track",
+              "size": 0
+            },
+            {
+              "type": "photoalbum",
+              "size": 0
+            },
+            {
+              "type": "autotag",
+              "size": 0
+            },
+            {
+              "type": "photo",
+              "size": 0
+            },
+            {
+              "type": "tag",
+              "size": 0
+            },
+            {
+              "type": "actor",
+              "size": 2,
+              "Directory": [
+                {
+                  "tag": "Arkin Cureklibatir",
+                  "id": 246659,
+                  "count": 1,
+                  "librarySectionID": 2
+                },
+                {
+                  "tag": "Jordyn Curet",
+                  "id": 244120,
+                  "count": 1,
+                  "librarySectionID": 2
+                }
+              ]
+            },
+            {
+              "type": "director",
+              "size": 0
+            },
+            {
+              "type": "genre",
+              "size": 0
+            },
+            {
+              "type": "collection",
+              "size": 0
+            },
+            {
+              "type": "playlist",
+              "size": 0
+            },
+            {
+              "type": "shared",
+              "size": 0
+            },
+            {
+              "type": "place",
+              "size": 0
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

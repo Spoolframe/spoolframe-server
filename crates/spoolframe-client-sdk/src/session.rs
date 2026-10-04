@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use spoolframe_protocol::{
     ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo,
     DeviceSignInRequest, HomeScreen, ManifestKind, MediaRead, MediaReadResponse, PlaybackHandle,
-    PlaybackPlan, Reply, Request, Response, Selection, SessionId, SessionInfo, UserSummary,
+    PlaybackPlan, Previews, Reply, Request, Response, SearchRequest, SearchResults, Selection,
+    SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_types::{
-    ArtworkId, Item, Library, LibraryId, Marker, MediaId, MediaTracks, SubtitleFormat,
+    ArtworkId, Item, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId, SubtitleFormat,
     TrackPreferences,
 };
 
@@ -289,6 +290,15 @@ impl Session {
         self.server.to_string()
     }
 
+    /// Where a browser reaches the server's web UI (its `admin.public_url`),
+    /// as the Hello of the connection this session is on said: for links
+    /// into it, such as `<web_url>/profile` to link a Plex account.
+    /// `None` when the server has no public URL. Read it when the link is
+    /// shown, not once: a reconnect may bring a new one.
+    pub fn web_url(&self) -> Option<String> {
+        self.client.server_info(self.server)?.web_url
+    }
+
     /// Who this session is, as of sign-in or the last [`Session::whoami`].
     pub fn user(&self) -> &UserSummary {
         &self.user
@@ -387,13 +397,29 @@ impl Session {
         }
     }
 
-    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<Item>, SdkError> {
-        let request = Request::Search {
-            query: query.to_owned(),
+    /// A scoped, grouped search (P3-09): the top match and a group per
+    /// kind, or, with `request.kind`, one kind's page for "See all".
+    pub async fn search(&self, request: SearchRequest) -> Result<SearchResults, SdkError> {
+        match self.call(Request::Search(request)).await? {
+            Reply::Search(results) => Ok(results),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// One page of the items a person found by [`Self::search`] is in.
+    pub async fn person_items(
+        &self,
+        person: &PersonId,
+        offset: u32,
+        limit: u32,
+    ) -> Result<ItemsPage, SdkError> {
+        let request = Request::PersonItems {
+            person: person.clone(),
+            offset,
             limit,
         };
         match self.call(request).await? {
-            Reply::Search { items } => Ok(items),
+            Reply::Items { items, total } => Ok(ItemsPage { items, total }),
             other => Err(unexpected(other)),
         }
     }
@@ -786,6 +812,19 @@ impl Session {
         };
         match self.call(request).await? {
             Reply::Subtitle { format, bytes } => Ok(Subtitle { format, bytes }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// The frame previews of a movie or episode, for scrubbing (P3-13).
+    /// [`SdkError::PreviewsNotReady`] while the server makes them: show
+    /// the time alone and ask again in a few seconds. [`SdkError::NoPreviews`]
+    /// for an item that will have none. Fetch each of `sheets` once with
+    /// [`Session::artwork`] at [`ArtworkSize::Original`], keep them for the
+    /// item, and draw [`Previews::tile`]'s rectangle for a time.
+    pub async fn previews(&self, id: &MediaId) -> Result<Previews, SdkError> {
+        match self.call(Request::GetPreviews { id: id.clone() }).await? {
+            Reply::Previews(previews) => Ok(previews),
             other => Err(unexpected(other)),
         }
     }

@@ -17,11 +17,14 @@ pub mod tree;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use spoolframe_admin_api::SyncDirection;
 use spoolframe_media::encoders::{Hardware, HardwarePolicy, TranscodeSettings};
 use spoolframe_plex::{PathMap, PathMapping};
+use spoolframe_types::LibraryKind;
 
 use crate::encode::JobLimits;
 use crate::network::{EndpointOptions, Relay};
+use crate::previews::{PreviewSettings, When};
 use crate::subtitles::OcrSettings;
 use crate::watch::WatchRules;
 use std::time::Duration;
@@ -89,10 +92,15 @@ pub struct ServerConfig {
     /// What clients show for this server; "Spoolframe" if left out.
     #[ucl(default)]
     pub name: Option<String>,
-    /// The Plex Media Server the catalog reads from. Without one the
+    /// The Plex Media Servers the catalog reads from. Without one the
     /// server is not set up (P3-10): clients are told so.
     #[ucl(default)]
     pub plex: Option<PlexConfig>,
+    /// The libraries clients see, in order (P3-11). Left out, every
+    /// library of the first Plex server, under Plex's names: what a server
+    /// configured before libraries were chosen has always served.
+    #[ucl(default)]
+    pub libraries: Option<Vec<LibraryConfig>>,
     /// The Iroh endpoint clients connect to.
     #[ucl(default)]
     pub network: NetworkConfig,
@@ -114,6 +122,9 @@ pub struct ServerConfig {
     /// Bitmap subtitles read as text (P2-07).
     #[ucl(default)]
     pub subtitles: SubtitlesConfig,
+    /// Frame previews for scrubbing (P3-13).
+    #[ucl(default)]
+    pub previews: PreviewsConfig,
     /// The setup wizard's progress (P3-10): the server's own, kept in the
     /// runtime layer, not a setting.
     #[ucl(default)]
@@ -231,6 +242,54 @@ impl SubtitlesConfig {
                 .cache_dir
                 .clone()
                 .unwrap_or_else(|| state_dir.join("cache").join("subtitles")),
+        })
+    }
+}
+
+/// `previews { when = "ahead"; interval_secs = 10; cache_mb = 4096; }`,
+/// all optional.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct PreviewsConfig {
+    /// `ahead`, `on_play` or `never`; `ahead` if left out.
+    #[ucl(default)]
+    pub when: Option<String>,
+    /// Seconds between two pictures; 10 if left out.
+    #[ucl(default)]
+    pub interval_secs: Option<u64>,
+    /// The most `state_dir/cache/previews` may hold, in MiB; 4096 if left
+    /// out.
+    #[ucl(default)]
+    pub cache_mb: Option<u64>,
+}
+
+impl PreviewsConfig {
+    pub const DEFAULT_INTERVAL_SECS: u64 = 10;
+    pub const DEFAULT_CACHE_MB: u64 = 4096;
+
+    pub fn settings(&self) -> Result<PreviewSettings, ConfigError> {
+        let when = match self.when.as_deref().unwrap_or("ahead") {
+            "ahead" => When::Ahead,
+            "on_play" => When::OnPlay,
+            "never" => When::Never,
+            other => {
+                return Err(ConfigError::Invalid {
+                    key: "previews.when",
+                    message: format!("{other:?}: expected ahead, on_play or never"),
+                });
+            }
+        };
+        let interval = self.interval_secs.unwrap_or(Self::DEFAULT_INTERVAL_SECS);
+        if interval == 0 {
+            return Err(ConfigError::Invalid {
+                key: "previews.interval_secs",
+                message: "0 would be a picture for every moment; use at least 1".into(),
+            });
+        }
+        Ok(PreviewSettings {
+            when,
+            interval: Duration::from_secs(interval),
+            cache_limit_bytes: self.cache_mb.unwrap_or(Self::DEFAULT_CACHE_MB) << 20,
         })
     }
 }
@@ -473,13 +532,24 @@ impl NetworkConfig {
     }
 }
 
-/// `plex { ... }`: where the PMS is, and how to authenticate to it.
+/// The id of the Plex server `plex { url = …; }` names: the first one,
+/// whose items' IDs have no server in them (`plex:movie:12`), as they had
+/// before a server could have several (P3-11).
+pub const FIRST_PLEX_SERVER: &str = "plex";
+
+/// `plex { ... }`: where the first PMS is, how to authenticate to it, and
+/// the further Plex servers (P3-11).
 #[derive(Debug, Clone, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct PlexConfig {
     /// The PMS base URL on the LAN, e.g. `http://192.168.1.20:32400`.
     /// Never plex.tv: the catalog must work without the Internet (§32).
     pub url: String,
+    /// What Spoolframe calls the server (P3-11): Plex's own name when it
+    /// was added, so a server that is down is still named. Its address's
+    /// host if left out.
+    #[ucl(default)]
+    pub name: Option<String>,
     /// A file holding the `X-Plex-Token`. Leave it out for a PMS that lets
     /// LAN clients in without auth. A file, not the token itself, so the
     /// secret stays out of the config.
@@ -493,27 +563,216 @@ pub struct PlexConfig {
     /// as (PX-04). Off unless set.
     #[ucl(default)]
     pub watch_sync: Option<WatchSyncConfig>,
+    /// Further Plex servers (P3-11), each under an id of its own: their
+    /// items' IDs carry it (`plex:movie:cabin:12`), so it never changes.
+    #[ucl(default)]
+    pub servers: Vec<PlexServerConfig>,
+}
+
+/// `{ id = "cabin"; name = "Cabin"; url = "http://10.0.1.5:32400";
+/// token_file = "…"; path_mapping [ … ]; }`: a Plex server after the first.
+#[derive(Debug, Clone, PartialEq, Eq, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct PlexServerConfig {
+    /// Lower-case letters, digits and dashes, starting with a letter; not
+    /// `plex`, which is the first server's.
+    pub id: String,
+    #[ucl(default)]
+    pub name: Option<String>,
+    pub url: String,
+    #[ucl(default)]
+    pub token_file: Option<PathBuf>,
+    #[ucl(default)]
+    pub path_mapping: Vec<PathMappingConfig>,
+}
+
+/// `{ name = "Films"; kind = "movies"; plex { server = "plex"; section = "2"; } }`:
+/// one library as clients see it (P3-11). Its place in `libraries` is its
+/// position.
+#[derive(Debug, Clone, PartialEq, Eq, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct LibraryConfig {
+    /// What clients call it; Plex keeps its own name.
+    pub name: String,
+    /// `movies`, `shows` or `music`: what it holds, kept so that a library
+    /// whose Plex server is down is still listed, as unavailable.
+    pub kind: String,
+    /// Where it comes from. Plex is the only source until Spoolframe has
+    /// libraries of its own (P9).
+    pub plex: PlexLibraryConfig,
+}
+
+/// `plex { server = "cabin"; section = "3"; }`: one library section of a
+/// configured Plex server.
+#[derive(Debug, Clone, PartialEq, Eq, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct PlexLibraryConfig {
+    /// `plex` for the first server, else one of `plex.servers`' ids.
+    pub server: String,
+    /// The section's key in Plex, as `/library/sections` lists it.
+    pub section: String,
+    /// Which way watch state syncs with each linked user's Plex account
+    /// (P3-12): `off`, `from_plex`, `to_plex` or `both`. Left out, `both`
+    /// for the first server's libraries while `plex.watch_sync.user` is
+    /// set, as PX-04 synced them, and `off` otherwise.
+    #[ucl(default)]
+    pub sync: Option<String>,
+}
+
+impl LibraryConfig {
+    pub fn kind(&self) -> Result<LibraryKind, ConfigError> {
+        library_kind(&self.kind).ok_or_else(|| ConfigError::Invalid {
+            key: "libraries",
+            message: format!(
+                "{:?}: kind {:?} is not movies, shows or music",
+                self.name, self.kind
+            ),
+        })
+    }
+}
+
+/// A library kind by its name in the config: as on the wire.
+pub fn library_kind(name: &str) -> Option<LibraryKind> {
+    match name {
+        "movies" => Some(LibraryKind::Movies),
+        "shows" => Some(LibraryKind::Shows),
+        "music" => Some(LibraryKind::Music),
+        _ => None,
+    }
+}
+
+/// The name a library kind has in the config.
+pub fn library_kind_name(kind: LibraryKind) -> &'static str {
+    match kind {
+        LibraryKind::Movies => "movies",
+        LibraryKind::Shows => "shows",
+        LibraryKind::Music => "music",
+    }
+}
+
+/// Whether `id` may name a Plex server after the first.
+fn is_server_id(id: &str) -> bool {
+    id.len() <= 32
+        && id.starts_with(|c: char| c.is_ascii_lowercase())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && id != FIRST_PLEX_SERVER
+}
+
+/// A PMS base URL, checked: http or https.
+pub(crate) fn plex_url(text: &str, key: &'static str) -> Result<Url, ConfigError> {
+    let url = Url::parse(text).map_err(|e| ConfigError::Invalid {
+        key,
+        message: format!("{text:?}: {e}"),
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(ConfigError::Invalid {
+            key,
+            message: format!("{text:?}: not an http or https URL"),
+        });
+    }
+    Ok(url)
+}
+
+/// Path mappings, each with absolute `from` and `to`.
+pub(crate) fn path_map(
+    mappings: &[PathMappingConfig],
+    key: &'static str,
+) -> Result<PathMap, ConfigError> {
+    mappings
+        .iter()
+        .map(|m| {
+            for (side, path) in [("from", &m.from), ("to", &m.to)] {
+                if !path.is_absolute() {
+                    return Err(ConfigError::Invalid {
+                        key,
+                        message: format!("{side} {:?} is not an absolute path", path),
+                    });
+                }
+            }
+            Ok(PathMapping {
+                library: m.library.clone(),
+                from: m.from.clone(),
+                to: m.to.clone(),
+            })
+        })
+        .collect::<Result<_, _>>()
+        .map(PathMap::new)
+}
+
+/// A token file's token, without surrounding whitespace.
+fn read_token(path: &Path) -> Result<String, ConfigError> {
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Token {
+        path: path.to_owned(),
+        source,
+    })?;
+    let token = text.trim();
+    if token.is_empty() {
+        return Err(ConfigError::EmptyToken {
+            path: path.to_owned(),
+        });
+    }
+    Ok(token.to_owned())
+}
+
+impl PlexServerConfig {
+    pub fn url(&self) -> Result<Url, ConfigError> {
+        plex_url(&self.url, "plex.servers")
+    }
+
+    pub fn path_map(&self) -> Result<PathMap, ConfigError> {
+        path_map(&self.path_mapping, "plex.servers")
+    }
+
+    /// The token from `token_file`, or `None` when there is none.
+    pub fn token(&self) -> Result<Option<String>, ConfigError> {
+        self.token_file.as_deref().map(read_token).transpose()
+    }
+
+    /// What Spoolframe calls it: its name, else its address's host.
+    pub fn display_name(&self) -> String {
+        display_name(self.name.as_deref(), &self.url)
+    }
+}
+
+fn display_name(name: Option<&str>, url: &str) -> String {
+    name.map(str::to_owned)
+        .or_else(|| {
+            Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+        })
+        .unwrap_or_else(|| url.to_owned())
 }
 
 /// `watch_sync { user = "andoriyu"; interval_secs = 120; }`
 #[derive(Debug, Clone, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct WatchSyncConfig {
-    /// The Spoolframe user whose state is the Plex account's.
-    pub user: String,
+    /// The Spoolframe user PX-04 synced with the Plex servers' owner: now
+    /// that user's Plex link (P3-12), made with each server's own token
+    /// (or none, for a LAN PMS that lets clients in without one) rather
+    /// than one from Sign in with Plex. Optional, so the interval can be
+    /// set without it.
+    #[ucl(default)]
+    pub user: Option<String>,
     /// How often to sync when nothing changes here; 120 if left out.
     #[ucl(default)]
     pub interval_secs: Option<u64>,
 }
 
 impl WatchSyncConfig {
+    pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(120);
+
     pub fn interval(&self) -> Duration {
-        Duration::from_secs(self.interval_secs.unwrap_or(120).max(10))
+        self.interval_secs
+            .map_or(Self::DEFAULT_INTERVAL, |s| Duration::from_secs(s.max(10)))
     }
 }
 
 /// `{ library = "Music"; from = "/data"; to = "/mnt/nas/music"; }`
-#[derive(Debug, Clone, Uclicious)]
+#[derive(Debug, Clone, PartialEq, Eq, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct PathMappingConfig {
     /// The Plex library title this rule is for; every library if left out.
@@ -526,60 +785,142 @@ pub struct PathMappingConfig {
 }
 
 impl PlexConfig {
+    /// The Spoolframe user linked as the Plex servers' owner by the config
+    /// (`watch_sync.user`), if any.
+    pub fn owner(&self) -> Option<&str> {
+        self.watch_sync.as_ref()?.user.as_deref()
+    }
+
+    /// How often each linked user is synced when nothing changes.
+    pub fn sync_interval(&self) -> Duration {
+        self.watch_sync
+            .as_ref()
+            .map_or(WatchSyncConfig::DEFAULT_INTERVAL, WatchSyncConfig::interval)
+    }
+
+    /// Which way a library on `server` syncs when it does not say: `both`
+    /// for the first server's while an owner is set, which is everything
+    /// PX-04 synced, so a config written for it syncs as it did; `off`
+    /// otherwise, so a library syncs only once an admin says it should.
+    pub fn default_sync(&self, server: &str) -> SyncDirection {
+        if self.owner().is_some() && server == FIRST_PLEX_SERVER {
+            SyncDirection::Both
+        } else {
+            SyncDirection::Off
+        }
+    }
+
+    /// Which way `library` syncs.
+    pub fn sync(&self, library: &PlexLibraryConfig) -> SyncDirection {
+        library
+            .sync
+            .as_deref()
+            .and_then(SyncDirection::from_config_name)
+            .unwrap_or_else(|| self.default_sync(&library.server))
+    }
+
     /// The PMS base URL.
     pub fn url(&self) -> Result<Url, ConfigError> {
-        let url = Url::parse(&self.url).map_err(|e| ConfigError::Invalid {
-            key: "plex.url",
-            message: format!("{:?}: {e}", self.url),
-        })?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(ConfigError::Invalid {
-                key: "plex.url",
-                message: format!("{:?}: not an http or https URL", self.url),
-            });
-        }
-        Ok(url)
+        plex_url(&self.url, "plex.url")
     }
 
     /// The path mappings, each with absolute `from` and `to`.
     pub fn path_map(&self) -> Result<PathMap, ConfigError> {
-        self.path_mapping
-            .iter()
-            .map(|m| {
-                for (key, path) in [("from", &m.from), ("to", &m.to)] {
-                    if !path.is_absolute() {
-                        return Err(ConfigError::Invalid {
-                            key: "plex.path_mapping",
-                            message: format!("{key} {:?} is not an absolute path", path),
-                        });
-                    }
-                }
-                Ok(PathMapping {
-                    library: m.library.clone(),
-                    from: m.from.clone(),
-                    to: m.to.clone(),
-                })
-            })
-            .collect::<Result<_, _>>()
-            .map(PathMap::new)
+        path_map(&self.path_mapping, "plex.path_mapping")
     }
 
     /// The token from `token_file`, without surrounding whitespace, or
     /// `None` when no file is configured. Read at startup, not at parse
     /// time, so the config can be checked where the secret is not present.
     pub fn token(&self) -> Result<Option<String>, ConfigError> {
-        let Some(path) = &self.token_file else {
-            return Ok(None);
+        self.token_file.as_deref().map(read_token).transpose()
+    }
+
+    /// Every Plex server, the first (as id [`FIRST_PLEX_SERVER`]) first,
+    /// then `servers` in order.
+    pub fn all_servers(&self) -> Vec<PlexServerConfig> {
+        let first = PlexServerConfig {
+            id: FIRST_PLEX_SERVER.to_owned(),
+            name: self.name.clone(),
+            url: self.url.clone(),
+            token_file: self.token_file.clone(),
+            path_mapping: self.path_mapping.clone(),
         };
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Token {
-            path: path.clone(),
-            source,
-        })?;
-        let token = text.trim();
-        if token.is_empty() {
-            return Err(ConfigError::EmptyToken { path: path.clone() });
+        std::iter::once(first)
+            .chain(self.servers.iter().cloned())
+            .collect()
+    }
+
+    /// The servers' ids and URLs checked, and every library's source a
+    /// server of these.
+    fn check(&self, libraries: Option<&[LibraryConfig]>) -> Result<(), ConfigError> {
+        self.url()?;
+        self.path_map()?;
+        let mut ids = vec![FIRST_PLEX_SERVER];
+        for server in &self.servers {
+            if !is_server_id(&server.id) {
+                return Err(ConfigError::Invalid {
+                    key: "plex.servers",
+                    message: format!(
+                        "id {:?}: use lower-case letters, digits and dashes, starting with a \
+                         letter, at most 32, and not \"plex\" (the first server's)",
+                        server.id
+                    ),
+                });
+            }
+            if ids.contains(&server.id.as_str()) {
+                return Err(ConfigError::Invalid {
+                    key: "plex.servers",
+                    message: format!("id {:?} is used twice", server.id),
+                });
+            }
+            ids.push(&server.id);
+            server.url()?;
+            server.path_map()?;
         }
-        Ok(Some(token.to_owned()))
+        let mut sources: Vec<&PlexLibraryConfig> = Vec::new();
+        for library in libraries.unwrap_or_default() {
+            let invalid = |message: String| ConfigError::Invalid {
+                key: "libraries",
+                message: format!("{:?}: {message}", library.name),
+            };
+            library.kind()?;
+            if library.name.trim().is_empty() {
+                return Err(invalid("a library needs a name".into()));
+            }
+            let source = &library.plex;
+            if !ids.contains(&source.server.as_str()) {
+                return Err(invalid(format!(
+                    "no Plex server {:?}: \"plex\" is the first, and the others are \
+                     plex.servers' ids",
+                    source.server
+                )));
+            }
+            if source.section.is_empty() || !source.section.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid(format!(
+                    "section {:?} is not a Plex library key",
+                    source.section
+                )));
+            }
+            if let Some(sync) = &source.sync
+                && SyncDirection::from_config_name(sync).is_none()
+            {
+                return Err(invalid(format!(
+                    "sync {sync:?} is not off, from_plex, to_plex or both"
+                )));
+            }
+            if sources
+                .iter()
+                .any(|s| (&s.server, &s.section) == (&source.server, &source.section))
+            {
+                return Err(invalid(format!(
+                    "section {} of {:?} is already a library",
+                    source.section, source.server
+                )));
+            }
+            sources.push(source);
+        }
+        Ok(())
     }
 }
 
@@ -612,9 +953,16 @@ impl ServerConfig {
                 found: parsed.schema,
             });
         }
-        if let Some(plex) = &parsed.plex {
-            plex.url()?;
-            plex.path_map()?;
+        match (&parsed.plex, &parsed.libraries) {
+            (Some(plex), libraries) => plex.check(libraries.as_deref())?,
+            (None, Some(libraries)) if !libraries.is_empty() => {
+                return Err(ConfigError::Invalid {
+                    key: "libraries",
+                    message: "every library comes from a Plex server, and none is configured"
+                        .into(),
+                });
+            }
+            (None, _) => {}
         }
         parsed.network.endpoint_options()?;
         parsed.admin.listen()?;
@@ -625,6 +973,7 @@ impl ServerConfig {
         // Any directory: only the values are checked here.
         parsed.transcode.limits(Path::new("/"))?;
         parsed.subtitles.ocr_settings(Path::new("/"))?;
+        parsed.previews.settings()?;
         Ok(parsed)
     }
 
@@ -830,6 +1179,46 @@ mod tests {
     }
 
     #[test]
+    fn previews_are_made_ahead_every_10_s_into_4_gib_by_default() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(
+            config.previews.settings().unwrap(),
+            PreviewSettings {
+                when: When::Ahead,
+                interval: Duration::from_secs(10),
+                cache_limit_bytes: 4096 << 20,
+            }
+        );
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; }
+               previews { when = "on_play"; interval_secs = 5; cache_mb = 100; }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.previews.settings().unwrap(),
+            PreviewSettings {
+                when: When::OnPlay,
+                interval: Duration::from_secs(5),
+                cache_limit_bytes: 100 << 20,
+            }
+        );
+    }
+
+    #[test]
+    fn a_previews_setting_that_cannot_work_is_refused() {
+        for (text, key) in [
+            (r#"previews { when = "sometimes"; }"#, "previews.when"),
+            ("previews { interval_secs = 0; }", "previews.interval_secs"),
+        ] {
+            let text = format!(r#"plex {{ url = "http://nas:32400"; }} {text}"#);
+            assert!(
+                matches!(plex(&text), Err(ConfigError::Invalid { key: k, .. }) if k == key),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn job_limits_default_under_the_state_dir() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         let limits = config.transcode.limits(Path::new("/var/lib/sf")).unwrap();
@@ -885,8 +1274,180 @@ mod tests {
         let on = plex(r#"plex { url = "http://nas:32400"; watch_sync { user = "andoriyu"; } }"#)
             .unwrap();
         let sync = on.plex.unwrap().watch_sync.unwrap();
-        assert_eq!(sync.user, "andoriyu");
+        assert_eq!(sync.user.as_deref(), Some("andoriyu"));
         assert_eq!(sync.interval(), Duration::from_secs(120));
+    }
+
+    /// PX-04's config syncs what it synced: every library of the first
+    /// server, both ways; nothing else syncs until an admin says so.
+    #[test]
+    fn a_library_syncs_as_it_says_else_as_px_04_did() {
+        let owner = r#"plex { url = "http://tower:32400"; watch_sync { user = "andoriyu"; }
+            servers [ { id = "cabin"; url = "http://cabin:32400"; } ] }"#;
+        let config = plex(owner).unwrap();
+        let plex_config = config.plex.unwrap();
+        let on = |server: &str, sync: Option<&str>| PlexLibraryConfig {
+            server: server.into(),
+            section: "1".into(),
+            sync: sync.map(Into::into),
+        };
+        assert_eq!(plex_config.sync(&on("plex", None)), SyncDirection::Both);
+        assert_eq!(plex_config.sync(&on("cabin", None)), SyncDirection::Off);
+        assert_eq!(
+            plex_config.sync(&on("plex", Some("from_plex"))),
+            SyncDirection::FromPlex
+        );
+        assert_eq!(
+            plex_config.sync(&on("cabin", Some("to_plex"))),
+            SyncDirection::ToPlex
+        );
+        let no_owner = plex(r#"plex { url = "http://tower:32400"; }"#).unwrap();
+        assert_eq!(
+            no_owner.plex.unwrap().sync(&on("plex", None)),
+            SyncDirection::Off
+        );
+        refused(
+            r#"plex { url = "http://tower:32400"; }
+               libraries [ { name = "F"; kind = "movies"; plex { server = "plex"; section = "1"; sync = "sideways"; } } ]"#,
+            "libraries",
+            "not off, from_plex, to_plex or both",
+        );
+    }
+
+    /// Two Plex servers and three libraries chosen from them (P3-11).
+    const TWO_SERVERS: &str = r#"
+        plex {
+          url = "http://tower:32400";
+          name = "Tower";
+          servers [
+            { id = "cabin"; name = "Cabin"; url = "http://cabin:32400";
+              path_mapping [ { from = "/data"; to = "/mnt/cabin"; } ] },
+          ]
+        }
+        libraries [
+          { name = "Films"; kind = "movies"; plex { server = "plex"; section = "2"; } },
+          { name = "Cabin movies"; kind = "movies"; plex { server = "cabin"; section = "1"; } },
+          { name = "TV"; kind = "shows"; plex { server = "plex"; section = "1"; } },
+        ]
+    "#;
+
+    #[test]
+    fn libraries_and_further_plex_servers_are_read_in_order() {
+        let config = plex(TWO_SERVERS).unwrap();
+        let servers = config.plex.as_ref().unwrap().all_servers();
+        let ids: Vec<_> = servers.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["plex", "cabin"]);
+        assert_eq!(servers[0].display_name(), "Tower");
+        assert_eq!(
+            servers[1]
+                .path_map()
+                .unwrap()
+                .map(None, Path::new("/data/a.mkv"))
+                .local,
+            PathBuf::from("/mnt/cabin/a.mkv")
+        );
+        let libraries = config.libraries.unwrap();
+        let names: Vec<_> = libraries.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Films", "Cabin movies", "TV"]);
+        assert_eq!(libraries[2].kind().unwrap(), LibraryKind::Shows);
+    }
+
+    #[test]
+    fn a_server_without_a_name_is_called_by_its_host() {
+        let config = plex(r#"plex { url = "http://192.168.1.20:32400"; }"#).unwrap();
+        assert_eq!(
+            config.plex.unwrap().all_servers()[0].display_name(),
+            "192.168.1.20"
+        );
+    }
+
+    #[test]
+    fn without_libraries_the_first_server_s_are_served_as_before() {
+        // The shape of every config written before P3-11.
+        let config =
+            plex(r#"plex { url = "http://nas:32400"; watch_sync { user = "andoriyu"; } }"#)
+                .unwrap();
+        assert!(config.libraries.is_none());
+        assert_eq!(config.plex.unwrap().all_servers().len(), 1);
+    }
+
+    fn refused(text: &str, key: &'static str, says: &str) {
+        match plex(text) {
+            Err(ConfigError::Invalid { key: k, message }) if k == key => {
+                assert!(message.contains(says), "{message}");
+            }
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_server_id_is_unique_and_never_the_first_one_s() {
+        for (id, says) in [
+            ("plex", "not \"plex\""),
+            ("Cabin", "lower-case"),
+            ("2nd", "starting with a letter"),
+            ("a:b", "lower-case"),
+        ] {
+            refused(
+                &format!(
+                    r#"plex {{ url = "http://a:32400"; servers [ {{ id = "{id}"; url = "http://b:32400"; }} ] }}"#
+                ),
+                "plex.servers",
+                says,
+            );
+        }
+        refused(
+            r#"plex { url = "http://a:32400"; servers [
+                { id = "b"; url = "http://b:32400"; }, { id = "b"; url = "http://c:32400"; } ] }"#,
+            "plex.servers",
+            "used twice",
+        );
+        refused(
+            r#"plex { url = "http://a:32400"; servers [ { id = "b"; url = "b:32400"; } ] }"#,
+            "plex.servers",
+            "not an http",
+        );
+    }
+
+    #[test]
+    fn a_library_must_come_from_a_configured_section_once() {
+        let library = |server: &str, section: &str, kind: &str| {
+            format!(
+                r#"plex {{ url = "http://a:32400"; }}
+                libraries [ {{ name = "Films"; kind = "{kind}"; plex {{ server = "{server}"; section = "{section}"; }} }} ]"#
+            )
+        };
+        refused(
+            &library("cabin", "1", "movies"),
+            "libraries",
+            "no Plex server \"cabin\"",
+        );
+        refused(
+            &library("plex", "x1", "movies"),
+            "libraries",
+            "not a Plex library key",
+        );
+        refused(
+            &library("plex", "1", "photos"),
+            "libraries",
+            "not movies, shows or music",
+        );
+        refused(
+            r#"plex { url = "http://a:32400"; }
+            libraries [
+              { name = "A"; kind = "movies"; plex { server = "plex"; section = "1"; } },
+              { name = "B"; kind = "movies"; plex { server = "plex"; section = "1"; } },
+            ]"#,
+            "libraries",
+            "already a library",
+        );
+        refused(
+            r#"libraries [ { name = "A"; kind = "movies"; plex { server = "plex"; section = "1"; } } ]"#,
+            "libraries",
+            "none is configured",
+        );
+        // None at all is a server that serves nothing, and fine.
+        assert!(plex(r#"plex { url = "http://a:32400"; } libraries []"#).is_ok());
     }
 
     #[test]
@@ -1097,6 +1658,8 @@ mod tests {
         let file = dir.as_ref().join("token");
         std::fs::write(&file, "abc123\n").unwrap();
         let config = PlexConfig {
+            name: None,
+            servers: Vec::new(),
             url: "http://nas:32400".into(),
             token_file: Some(file),
             path_mapping: Vec::new(),
@@ -1108,6 +1671,8 @@ mod tests {
     #[test]
     fn a_missing_token_file_names_its_path() {
         let config = PlexConfig {
+            name: None,
+            servers: Vec::new(),
             url: "http://nas:32400".into(),
             token_file: Some(PathBuf::from("/nonexistent/plex-token")),
             path_mapping: Vec::new(),
@@ -1123,6 +1688,8 @@ mod tests {
         let file = dir.as_ref().join("empty-token");
         std::fs::write(&file, " \n").unwrap();
         let config = PlexConfig {
+            name: None,
+            servers: Vec::new(),
             url: "http://nas:32400".into(),
             token_file: Some(file),
             path_mapping: Vec::new(),

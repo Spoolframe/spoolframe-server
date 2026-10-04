@@ -49,10 +49,13 @@ pub const SETTINGS: &[Setting] = &[
         apply: Apply::Live,
         secret: true,
     },
+    live("plex.name"),
     live("plex.token_file"),
     live("plex.path_mapping"),
     restart("plex.watch_sync.user"),
     restart("plex.watch_sync.interval_secs"),
+    live("plex.servers"),
+    live("libraries"),
     restart("network.port"),
     restart("network.relay"),
     restart("network.mdns"),
@@ -75,6 +78,9 @@ pub const SETTINGS: &[Setting] = &[
     restart("subtitles.ocr"),
     restart("subtitles.ocr_threads"),
     restart("subtitles.cache_dir"),
+    live("previews.when"),
+    live("previews.interval_secs"),
+    live("previews.cache_mb"),
 ];
 
 /// The setting called `key`, if there is one.

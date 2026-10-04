@@ -303,10 +303,7 @@ async fn a_reply_too_large_for_a_frame_is_refused_with_the_reason() {
     let response = client
         .call(
             Some(&session),
-            Request::Search {
-                query: support::A_TITLE_OVER_A_FRAME.into(),
-                limit: 10,
-            },
+            Request::Search(support::search(support::A_TITLE_OVER_A_FRAME)),
         )
         .await;
     let Response::Err(Error::ReplyTooLarge { bytes }) = response else {

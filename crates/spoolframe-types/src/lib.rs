@@ -16,12 +16,13 @@ pub mod media;
 pub mod model;
 pub mod preferences;
 pub mod role;
+pub mod search;
 
 pub use codec::{
     AudioCodec, ClientCapabilities, Container, Delivery, HdrFormat, SubtitleFormat, VideoCodec,
     VideoLimits,
 };
-pub use id::{ArtworkId, IdError, LibraryId, MediaId, MediaKind, Namespace};
+pub use id::{ArtworkId, IdError, LibraryId, MediaId, MediaKind, Namespace, PersonId};
 pub use media::{AudioRole, AudioTrack, MediaTracks, SubtitleRole, SubtitleTrack};
 pub use model::{
     Album, Artist, Artwork, ArtworkKind, Episode, Item, Library, LibraryKind, Marker, MarkerKind,
@@ -31,3 +32,4 @@ pub use preferences::{
     AudioPreferences, SdhPreference, SubtitleMode, SubtitlePreferences, TrackPreferences,
 };
 pub use role::Role;
+pub use search::{Person, PersonRole, SearchKind, SearchScope};

@@ -524,6 +524,7 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
             }
         }
         UserSessionList { username: username.clone(), name: name.clone(), disabled: user.disabled, toast }
+        super::plex::UserPlex { username: username.clone(), name: name.clone(), toast }
         UserDevices {
             username: username.clone(),
             has_pin: user.has_pin,

@@ -50,7 +50,7 @@ pub struct EncodeSpec<'a> {
 
 /// HDR to SDR (BT.709) with the Hable curve, in software: it works for any
 /// source and any encoder, where `tonemap_vaapi` needs a VA-API decode.
-const TONE_MAP: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,\
+pub(crate) const TONE_MAP: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,\
                         tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,\
                         format=yuv420p";
 

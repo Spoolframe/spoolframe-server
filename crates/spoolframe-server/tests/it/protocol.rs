@@ -51,6 +51,31 @@ async fn hello_is_answered_with_server_info() {
 }
 
 #[tokio::test]
+async fn hello_says_where_the_web_ui_is_when_it_has_a_public_url() {
+    let (server, client) = connect("hello-no-web").await;
+    let Response::Ok(Reply::ServerInfo(info)) = client.hello_as(None).await else {
+        panic!("no ServerInfo");
+    };
+    assert_eq!(info.web_url, None);
+    close(server, client).await;
+
+    let server = TestServer::start_with(
+        support::fresh_dir("hello-web").await,
+        support::ServerOptions {
+            public_url: Some("https://media.example.org".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = server.client().await;
+    let Response::Ok(Reply::ServerInfo(info)) = client.hello_as(None).await else {
+        panic!("no ServerInfo");
+    };
+    assert_eq!(info.web_url.as_deref(), Some("https://media.example.org"));
+    close(server, client).await;
+}
+
+#[tokio::test]
 async fn nothing_is_served_before_hello() {
     let (server, client) = connect("before-hello").await;
     assert_eq!(
@@ -131,10 +156,7 @@ async fn every_other_request_needs_a_session() {
             limit: 10,
         },
         Request::Item { id: id.clone() },
-        Request::Search {
-            query: "alien".into(),
-            limit: 10,
-        },
+        Request::Search(support::search("alien")),
         Request::Tracks { id },
         Request::WhoAmI,
         Request::Logout,

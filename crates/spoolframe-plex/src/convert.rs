@@ -12,7 +12,7 @@ use spoolframe_types::{
 
 use serde::Deserialize;
 
-use crate::wire::{self, Directory, Hub, Metadata};
+use crate::wire::{self, Directory, Metadata};
 
 /// Why a PMS item could not be converted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,17 +156,6 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             playback: PlaybackState::default(),
         }),
     })
-}
-
-/// Every searchable item in a `/hubs/search` response. Hubs of kinds
-/// Spoolframe does not model (actors, genres, photos, playlists) are
-/// skipped; an item of a modelled kind that fails to convert is an error.
-pub fn search_results(hubs: &[Hub]) -> Result<Vec<Item>, ConvertError> {
-    hubs.iter()
-        .flat_map(|h| &h.metadata)
-        .filter(|m| media_kind(&m.kind).is_some())
-        .map(item)
-        .collect()
 }
 
 /// The item's stable ids: Plex's guid, then the other agents'. Local-only
@@ -543,19 +532,6 @@ mod tests {
     #[test]
     fn listings_carry_the_library_total() {
         assert_eq!(fixture("section-all-movie").total_size, Some(770));
-    }
-
-    #[test]
-    fn search_keeps_media_and_skips_other_hubs() {
-        let c = fixture("hubs-search");
-        let kinds: Vec<_> = search_results(&c.hubs)
-            .unwrap()
-            .iter()
-            .map(|i| i.id().kind())
-            .collect();
-        assert!(kinds.contains(&MediaKind::Artist), "{kinds:?}");
-        assert!(kinds.contains(&MediaKind::Movie), "{kinds:?}");
-        assert!(kinds.contains(&MediaKind::Track), "{kinds:?}");
     }
 
     #[test]

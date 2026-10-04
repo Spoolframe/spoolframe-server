@@ -317,7 +317,7 @@ impl ArtworkCache {
 
 /// `original` scaled down to `width` (never up). Transparent images stay
 /// PNG; everything else becomes a JPEG.
-fn resize(original: Artwork, width: u32) -> Result<Image, ArtworkError> {
+pub(crate) fn resize(original: Artwork, width: u32) -> Result<Image, ArtworkError> {
     let decoded =
         image::load_from_memory(&original.bytes).map_err(|e| ArtworkError::Image(e.to_string()))?;
     if decoded.width() <= width {
@@ -352,8 +352,8 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use spoolframe_catalog::{ItemPage, ItemWithChildren, Page};
-    use spoolframe_types::{Item, Library, LibraryId, MediaId, Namespace};
+    use spoolframe_catalog::{Found, ItemPage, ItemWithChildren, Page, SearchQuery};
+    use spoolframe_types::{Item, Library, LibraryId, MediaId, Namespace, PersonId};
 
     use super::*;
 
@@ -386,7 +386,10 @@ mod tests {
         async fn external_ids(&self, _: &MediaId) -> Result<Vec<String>, CatalogError> {
             unreachable!()
         }
-        async fn search(&self, _: &str, _: u32) -> Result<Vec<Item>, CatalogError> {
+        async fn search(&self, _: &SearchQuery) -> Result<Found, CatalogError> {
+            unreachable!()
+        }
+        async fn person_items(&self, _: &PersonId) -> Result<Vec<Item>, CatalogError> {
             unreachable!()
         }
         async fn media_path(&self, _: &MediaId) -> Result<PathBuf, CatalogError> {

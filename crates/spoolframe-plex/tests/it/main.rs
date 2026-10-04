@@ -6,4 +6,5 @@
 mod check_paths;
 mod http;
 mod live_pms;
+mod search;
 mod watch;

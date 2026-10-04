@@ -48,7 +48,7 @@ async fn pms() -> MockServer {
 async fn watched_and_in_progress_items_are_read_with_their_ids() {
     let server = pms().await;
     let catalog = PlexCatalog::new(server.uri().parse().unwrap(), None).unwrap();
-    let states = catalog.watch_states().await.unwrap();
+    let states = catalog.watch_states(None).await.unwrap();
     assert_eq!(states.len(), 8);
 
     let watched = states
@@ -56,6 +56,7 @@ async fn watched_and_in_progress_items_are_read_with_their_ids() {
         .find(|w| w.id == id(MediaKind::Episode, "208620"))
         .unwrap();
     assert!(watched.watched);
+    assert_eq!(watched.section, "1");
     assert_eq!(watched.position_ms, None);
     assert_eq!(watched.show, Some(id(MediaKind::Show, "208618")));
     assert_eq!(watched.last_viewed_at, Some(1_720_402_357));
@@ -74,6 +75,80 @@ async fn watched_and_in_progress_items_are_read_with_their_ids() {
     assert!(!started.watched);
     assert_eq!(started.position_ms, Some(2_186_392));
     assert_eq!(started.show, None);
+}
+
+#[tokio::test]
+async fn only_the_sections_asked_for_are_read() {
+    let server = pms().await;
+    let catalog = PlexCatalog::new(server.uri().parse().unwrap(), None).unwrap();
+    let movies = std::collections::HashSet::from(["2".to_owned()]);
+    let states = catalog.watch_states(Some(&movies)).await.unwrap();
+    assert!(!states.is_empty());
+    assert!(
+        states
+            .iter()
+            .all(|w| w.section == "2" && w.id.kind() == MediaKind::Movie),
+        "{states:?}"
+    );
+    let listed: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_owned())
+        .filter(|p| p.ends_with("/all"))
+        .collect();
+    assert!(
+        listed.iter().all(|p| p == "/library/sections/2/all"),
+        "{listed:?}"
+    );
+}
+
+/// Each user's state is read and written with their own account's token
+/// (P3-12), on the same PMS.
+#[tokio::test]
+async fn another_account_s_token_reads_and_writes_as_that_account() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/:/scrobble"))
+        .and(wiremock::matchers::header("X-Plex-Token", "alice-on-tower"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/identity"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": { "machineIdentifier": "tower-machine" }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/metadata/229060"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": { "librarySectionID": 1, "Metadata": [{
+                "ratingKey": "229060", "type": "episode", "title": "Pilot",
+                "index": 1, "parentIndex": 1, "grandparentTitle": "Banshee",
+                "grandparentRatingKey": "1", "parentRatingKey": "2"
+            }] }
+        })))
+        .mount(&server)
+        .await;
+    let owner = PlexCatalog::new(server.uri().parse().unwrap(), Some("owner".into()))
+        .unwrap()
+        .serving(Some(Default::default()));
+    let alice = owner.with_token(Some("alice-on-tower".into()));
+    let banshee = id(MediaKind::Episode, "229060");
+    alice.set_watched(&banshee, true).await.unwrap();
+    assert_eq!(
+        alice.machine_id().await.unwrap().as_deref(),
+        Some("tower-machine")
+    );
+    // In a section that is not served, and still found.
+    assert_eq!(
+        owner.section_of(&banshee).await.unwrap().as_deref(),
+        Some("1")
+    );
 }
 
 #[tokio::test]

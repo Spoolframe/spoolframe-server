@@ -5,6 +5,8 @@ mod admin;
 mod device;
 mod http;
 mod icons;
+mod libraries;
+mod plex;
 mod profile;
 mod rpc;
 mod settings;
@@ -16,6 +18,7 @@ use spoolframe_admin_api::{MeApiClient, PasswordChange, Role, UserInfo};
 
 use admin::{AdminHome, Server, UserSessions, Users};
 use device::DeviceApproval;
+use libraries::{AddLibrary, Libraries};
 use profile::Profile;
 use settings::{Settings, SettingsHome};
 use wizard::{Mode, Steps, WizardLayout};
@@ -60,6 +63,12 @@ enum Route {
             UserSessions { username: String },
             #[route("/server")]
             Server {},
+            #[route("/libraries")]
+            Libraries {},
+            // `back`: where Cancel and the back link go (the wizard's Plex
+            // step, or Settings › Plex); Libraries when empty.
+            #[route("/libraries/add?:back")]
+            AddLibrary { back: String },
             #[route("/settings")]
             SettingsHome {},
             #[route("/settings/:tab")]
@@ -1011,6 +1020,7 @@ fn SignedIn(user: UserInfo) -> Element {
     let title = match route {
         Route::Profile {} => "My profile",
         Route::Server {} => "Server",
+        Route::Libraries {} | Route::AddLibrary { .. } => "Libraries",
         Route::Settings { .. } | Route::SettingsHome {} => "Settings",
         _ => "Users",
     };
@@ -1036,6 +1046,7 @@ fn SignedIn(user: UserInfo) -> Element {
                     if admin {
                         {link(Route::Users {}, "Users and devices", false)}
                         {link(Route::Server {}, "Server", false)}
+                        {libraries_link(&route)}
                         {settings_link(&route)}
                         {link(Route::Profile {}, "My profile", true)}
                     } else {
@@ -1078,6 +1089,7 @@ fn SignedIn(user: UserInfo) -> Element {
                 nav { class: "drawer md:hidden", aria_label: "Admin", onclick: move |_| menu.set(false),
                     {link(Route::Users {}, "Users and devices", false)}
                     {link(Route::Server {}, "Server", false)}
+                    {libraries_link(&route)}
                     {settings_link(&route)}
                     {link(Route::Profile {}, "My profile", true)}
                 }
@@ -1095,6 +1107,18 @@ fn SignedIn(user: UserInfo) -> Element {
                 }
                 Outlet::<Route> {}
             }
+        }
+    }
+}
+
+/// Server › Libraries in the sidebar (P3-11): under Server, one step in.
+fn libraries_link(route: &Route) -> Element {
+    let here = matches!(route, Route::Libraries {} | Route::AddLibrary { .. });
+    rsx! {
+        Link {
+            class: if here { "nav-link nav-link-here nav-sub" } else { "nav-link nav-sub" },
+            to: Route::Libraries {},
+            "Libraries"
         }
     }
 }

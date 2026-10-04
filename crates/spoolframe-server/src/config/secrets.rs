@@ -59,6 +59,22 @@ impl Secrets {
         std::fs::rename(&partial, &path)
     }
 
+    /// This installation's id at plex.tv, which a PIN is bound to: made
+    /// once, and kept beside the secrets. Shared by the wizard's Sign in
+    /// with Plex (P3-10) and each user's link (P3-12).
+    pub fn plex_client_id(&self) -> std::io::Result<String> {
+        const NAME: &str = "plex-client-id";
+        if let Some(id) = self.get(NAME)? {
+            return Ok(id);
+        }
+        use password_hash::rand_core::{OsRng, RngCore};
+        let mut bytes = [0u8; 16];
+        OsRng.fill_bytes(&mut bytes);
+        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        self.set(NAME, &id)?;
+        Ok(id)
+    }
+
     /// Forget secret `name`; whether it was set.
     pub fn remove(&self, name: &str) -> std::io::Result<bool> {
         match std::fs::remove_file(self.path(name)) {

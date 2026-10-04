@@ -447,22 +447,30 @@ async fn pages_and_searches_carry_the_user_s_state() {
     };
     assert_eq!(m.playback.position, Some(Duration::from_secs(600)));
 
-    let Response::Ok(Reply::Search { items }) = tv
-        .call(
-            Some(&bob),
-            Request::Search {
-                query: "alien".into(),
-                limit: 10,
-            },
-        )
-        .await
-    else {
-        panic!("no search");
+    let searched = |session| {
+        let tv = &tv;
+        async move {
+            let Response::Ok(Reply::Search(results)) = tv
+                .call(Some(session), Request::Search(support::search("alien")))
+                .await
+            else {
+                panic!("no search");
+            };
+            let Some(Item::Movie(m)) = results.top else {
+                panic!("not a movie")
+            };
+            m.playback
+        }
     };
-    let Item::Movie(m) = &items[0] else {
-        panic!("not a movie")
-    };
-    assert_eq!(m.playback, PlaybackState::default(), "bob has no progress");
+    assert_eq!(
+        searched(&alice).await.position,
+        Some(Duration::from_secs(600))
+    );
+    assert_eq!(
+        searched(&bob).await,
+        PlaybackState::default(),
+        "bob has no progress"
+    );
     tv.close().await;
     server.stop().await;
 }

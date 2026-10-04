@@ -11,12 +11,14 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{
-    ClientCapabilities, Item, Library, LibraryId, Marker, MediaId, MediaTracks, Role,
+    ClientCapabilities, Item, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId, Role,
     SubtitleFormat, TrackPreferences,
 };
 
 use crate::media::PlaybackHandle;
 use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Selection};
+use crate::previews::Previews;
+use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// when features are added; a breaking change is a new ALPN instead.
@@ -83,8 +85,13 @@ pub enum Request {
     Item {
         id: MediaId,
     },
-    Search {
-        query: String,
+    /// Scoped, grouped search (P3-09). `Search`.
+    Search(SearchRequest),
+    /// The items a person a search found is in (P3-09), one page at a
+    /// time. `Items`.
+    PersonItems {
+        person: PersonId,
+        offset: u32,
         limit: u32,
     },
     Tracks {
@@ -215,6 +222,13 @@ pub enum Request {
     ReadSubtitleSegment {
         handle: PlaybackHandle,
         n: u32,
+    },
+    /// The frame previews of a movie or episode, for scrubbing (P3-13):
+    /// `Previews`, `PreviewsNotReady` while the server makes them (asking
+    /// puts the item first in line; ask again in a few seconds, and show
+    /// the time alone meanwhile), or `NoPreviews`.
+    GetPreviews {
+        id: MediaId,
     },
     /// Where playback of a movie or episode has got to. Send it now and
     /// then while playing and on pause or stop; the server decides what is
@@ -397,9 +411,7 @@ pub enum Reply {
         #[serde(default)]
         markers: Vec<Marker>,
     },
-    Search {
-        items: Vec<Item>,
-    },
+    Search(SearchResults),
     Tracks(MediaTracks),
     WhoAmI(UserSummary),
     LoggedOut,
@@ -471,6 +483,8 @@ pub enum Reply {
     Done,
     Home(HomeScreen),
     TrackPreferences(TrackPreferences),
+    /// An item's frame previews (`GetPreviews`, P3-13).
+    Previews(Previews),
 }
 
 /// Which HLS playlist (P2-05).
@@ -565,6 +579,11 @@ pub struct ServerInfo {
     pub protocol_version: u32,
     pub server_version: String,
     pub auth_methods: Vec<AuthMethod>,
+    /// Where a browser reaches the server's web UI (`admin.public_url`),
+    /// if it has one: for "open in the browser" links, such as linking a
+    /// Plex account (P3-12). Absent without a public URL, since the
+    /// listener's own address may be loopback or one no browser trusts.
+    pub web_url: Option<String>,
 }
 
 /// Why a request failed. Typed, so clients act on the kind, not on text.
@@ -613,6 +632,15 @@ pub enum Error {
     /// its cues are read. Ask again in a few seconds.
     #[error("the subtitle is still being read ({done_percent}% done)")]
     SubtitleNotReady { done_percent: u8 },
+    /// The item's frame previews are being made (P3-13); `done_percent` of
+    /// them are. Ask again in a few seconds; show the time alone till then.
+    #[error("the previews are being made ({done_percent}% done)")]
+    PreviewsNotReady { done_percent: u8 },
+    /// The item has no frame previews and will not have: music, a file
+    /// they could not be made of, or a server that makes none. Do not ask
+    /// again for this item.
+    #[error("this item has no previews")]
+    NoPreviews,
     /// The subtitle is not the file that `ReadSubtitle`'s `version` names:
     /// it was written again or replaced since that chunk (P2-11). Read it
     /// again from offset 0.

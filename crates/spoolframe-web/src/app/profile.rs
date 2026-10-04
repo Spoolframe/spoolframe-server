@@ -1,7 +1,8 @@
 //! "My profile" (P3-03), as the design's "Web · My profile" board lays it
 //! out: the signed-in user's own account, over the `me.*` methods. So far
 //! the account and the sign-in methods, the password and passkeys
-//! (P3-05); the PIN, devices and playback cards are their own tickets'.
+//! (P3-05), and the Plex account (P3-12); the PIN, devices and playback
+//! cards are their own tickets'.
 
 use dioxus::prelude::*;
 use serde_json::Value;
@@ -23,6 +24,7 @@ pub fn Profile() -> Element {
             div { class: "card-grid",
                 Account { user: user.clone(), has_password }
                 Passkeys { has_password }
+                super::plex::PlexAccountCard {}
             }
         }
     }

@@ -1,0 +1,291 @@
+{
+  "query": "dune",
+  "replies": [
+    {
+      "path": "/library/sections/2/search",
+      "type": "1",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 2,
+          "Metadata": [
+            {
+              "ratingKey": "176423",
+              "type": "movie",
+              "title": "Dune: Part One",
+              "year": 2021
+            },
+            {
+              "ratingKey": "213236",
+              "type": "movie",
+              "title": "Dune: Part Two",
+              "year": 2024
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/library/sections/1/search",
+      "type": "2",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 1,
+          "Metadata": [
+            {
+              "ratingKey": "221521",
+              "type": "show",
+              "title": "Dune: Prophecy",
+              "year": 2024,
+              "index": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/library/sections/1/search",
+      "type": "4",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "8",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "9",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "10",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/hubs/search",
+      "type": null,
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "Hub": [
+            {
+              "type": "show",
+              "size": 1,
+              "Metadata": [
+                {
+                  "ratingKey": "221521",
+                  "type": "show",
+                  "title": "Dune: Prophecy",
+                  "year": 2024,
+                  "index": 1,
+                  "librarySectionID": 1
+                }
+              ]
+            },
+            {
+              "type": "movie",
+              "size": 2,
+              "Metadata": [
+                {
+                  "ratingKey": "213236",
+                  "type": "movie",
+                  "title": "Dune: Part Two",
+                  "year": 2024,
+                  "librarySectionID": 2
+                },
+                {
+                  "ratingKey": "176423",
+                  "type": "movie",
+                  "title": "Dune: Part One",
+                  "year": 2021,
+                  "librarySectionID": 2
+                }
+              ]
+            },
+            {
+              "type": "artist",
+              "size": 0
+            },
+            {
+              "type": "album",
+              "size": 0
+            },
+            {
+              "type": "episode",
+              "size": 6,
+              "Metadata": [
+                {
+                  "ratingKey": "221543",
+                  "type": "episode",
+                  "title": "The High-Handed Enemy",
+                  "year": 2024,
+                  "index": 6,
+                  "parentIndex": 1,
+                  "parentRatingKey": "221522",
+                  "grandparentRatingKey": "221521",
+                  "grandparentTitle": "Dune: Prophecy",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "221523",
+                  "type": "episode",
+                  "title": "The Hidden Hand",
+                  "year": 2024,
+                  "index": 1,
+                  "parentIndex": 1,
+                  "parentRatingKey": "221522",
+                  "grandparentRatingKey": "221521",
+                  "grandparentTitle": "Dune: Prophecy",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "221527",
+                  "type": "episode",
+                  "title": "Two Wolves",
+                  "year": 2024,
+                  "index": 2,
+                  "parentIndex": 1,
+                  "parentRatingKey": "221522",
+                  "grandparentRatingKey": "221521",
+                  "grandparentTitle": "Dune: Prophecy",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "221529",
+                  "type": "episode",
+                  "title": "In Blood, Truth",
+                  "year": 2024,
+                  "index": 5,
+                  "parentIndex": 1,
+                  "parentRatingKey": "221522",
+                  "grandparentRatingKey": "221521",
+                  "grandparentTitle": "Dune: Prophecy",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "221542",
+                  "type": "episode",
+                  "title": "Twice Born",
+                  "year": 2024,
+                  "index": 4,
+                  "parentIndex": 1,
+                  "parentRatingKey": "221522",
+                  "grandparentRatingKey": "221521",
+                  "grandparentTitle": "Dune: Prophecy",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "221528",
+                  "type": "episode",
+                  "title": "Sisterhood Above All",
+                  "year": 2024,
+                  "index": 3,
+                  "parentIndex": 1,
+                  "parentRatingKey": "221522",
+                  "grandparentRatingKey": "221521",
+                  "grandparentTitle": "Dune: Prophecy",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                }
+              ]
+            },
+            {
+              "type": "track",
+              "size": 0
+            },
+            {
+              "type": "photoalbum",
+              "size": 0
+            },
+            {
+              "type": "autotag",
+              "size": 0
+            },
+            {
+              "type": "photo",
+              "size": 0
+            },
+            {
+              "type": "tag",
+              "size": 0
+            },
+            {
+              "type": "actor",
+              "size": 2,
+              "Directory": [
+                {
+                  "tag": "Nea Dune",
+                  "id": 219573,
+                  "count": 1,
+                  "librarySectionID": 2
+                },
+                {
+                  "tag": "Ashley Dunec",
+                  "id": 229703,
+                  "count": 2,
+                  "librarySectionID": 1
+                }
+              ]
+            },
+            {
+              "type": "director",
+              "size": 0
+            },
+            {
+              "type": "genre",
+              "size": 0
+            },
+            {
+              "type": "collection",
+              "size": 0
+            },
+            {
+              "type": "playlist",
+              "size": 0
+            },
+            {
+              "type": "shared",
+              "size": 0
+            },
+            {
+              "type": "place",
+              "size": 0
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

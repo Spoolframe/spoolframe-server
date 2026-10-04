@@ -85,7 +85,13 @@ impl Running {
     /// Start a server and wait until both its endpoint and admin API are
     /// up. Returns the log so far.
     fn start(config: &Path) -> (Self, String) {
+        Self::start_with(config, &[])
+    }
+
+    /// [`Running::start`], with `env` set for the server.
+    fn start_with(config: &Path, env: &[(&str, &str)]) -> (Self, String) {
         let mut child = server_with(config)
+            .envs(env.iter().copied())
             .stderr(Stdio::piped())
             .spawn()
             .expect("the binary runs");
@@ -116,6 +122,19 @@ impl Running {
     /// Everything logged so far.
     fn log(&self) -> String {
         self.1.lock().unwrap().clone()
+    }
+
+    /// Everything logged once `needle` is, waiting up to 10 seconds for
+    /// the line to be read.
+    fn log_with(&self, needle: &str) -> String {
+        for _ in 0..200 {
+            let log = self.log();
+            if log.contains(needle) {
+                return log;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("never logged {needle:?}: {}", self.log());
     }
 
     fn stop(mut self) -> std::process::ExitStatus {
@@ -673,4 +692,131 @@ fn printed_args(config: &Path, args: &[&str]) -> String {
     let output = server_with(config).args(args).output().unwrap();
     assert!(output.status.success(), "{output:?}");
     String::from_utf8(output.stdout).unwrap()
+}
+
+/// The admin API's address `config_with_state` gave the server.
+fn admin_addr(config: &Path) -> std::net::SocketAddr {
+    let text = std::fs::read_to_string(config).unwrap();
+    let start = text.find("listen = \"").unwrap() + "listen = \"".len();
+    let end = start + text[start..].find('"').unwrap();
+    text[start..end].parse().unwrap()
+}
+
+/// Linking a Plex account (P3-12), against a stand-in plex.tv, logs that
+/// it happened and whose it is, and never the token, even at debug level.
+#[tokio::test]
+async fn a_plex_link_is_logged_without_its_token() {
+    use spoolframe_admin_api::{MeApiClient, PlexLinkState};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TOKEN: &str = "tok-never-logged-4b1d";
+    let tv = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/pins"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 5, "code": "LOGS", "expiresIn": 900, "authToken": null
+        })))
+        .mount(&tv)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/pins/5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 5, "code": "LOGS", "authToken": TOKEN
+        })))
+        .mount(&tv)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/user"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "username": "rooty" })),
+        )
+        .mount(&tv)
+        .await;
+    let (_tmp, config) = config_with_state("plex-link-log", &closed_port_url()).await;
+    let tv_url = tv.uri();
+    let (running, log) = Running::start_with(
+        &config,
+        &[
+            ("SPOOLFRAME_PLEX_TV_URL", tv_url.as_str()),
+            ("SPOOLFRAME_PLEX_APP_URL", "https://app.example"),
+            ("SPOOLFRAME_LOG", "debug"),
+        ],
+    );
+    let code = setup_code(&log);
+    let out = cli(
+        &config,
+        &[
+            "setup",
+            "--code",
+            &code,
+            "--username",
+            "root",
+            "--password-stdin",
+        ],
+        "correct horse\n",
+        &[],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let addr = admin_addr(&config);
+    let token = crate::admin::anonymous(addr)
+        .await
+        .login(crate::admin::creds("root", "correct horse"))
+        .await
+        .unwrap()
+        .token;
+    let root = crate::admin::with_token(addr, &token).await;
+    let pin = root.plex_link_begin().await.unwrap();
+    let state = root.plex_link_check(pin.id).await.unwrap();
+    assert!(matches!(state, PlexLinkState::Linked { .. }), "{state:?}");
+    root.plex_unlink().await.unwrap();
+
+    let log = running.log_with("Plex account unlinked");
+    assert!(log.contains("Plex account linked"), "{log}");
+    assert!(log.contains("rooty"), "{log}");
+    assert!(!log.contains(TOKEN), "{log}");
+}
+
+/// `plex sync-watch` runs every linked user's sync through the running
+/// server: here the config's owner, whose Plex server is down, which the
+/// run says rather than fails on.
+#[tokio::test]
+async fn plex_sync_watch_reports_each_linked_user() {
+    let (_tmp, config) = config_with_state("sync-watch", &closed_port_url()).await;
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("plex {", "plex { watch_sync { user = \"root\"; }");
+    std::fs::write(&config, text).unwrap();
+    let (running, log) = Running::start(&config);
+    let code = setup_code(&log);
+    let out = cli(
+        &config,
+        &[
+            "setup",
+            "--code",
+            &code,
+            "--username",
+            "root",
+            "--password-stdin",
+        ],
+        "correct horse\n",
+        &[],
+    );
+    assert!(out.status.success(), "{out:?}");
+    // The owner is found as the server starts.
+    assert!(running.stop().success());
+    let (running, _) = Running::start(&config);
+    let admin = [
+        ("SPOOLFRAME_ADMIN_USER", "root"),
+        ("SPOOLFRAME_ADMIN_PASSWORD", "correct horse"),
+    ];
+    let out = cli(&config, &["plex", "sync-watch", "--dry-run"], "", &admin);
+    assert!(out.status.success(), "{out:?}");
+    let printed = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        printed.contains("root: 0 pulled, 0 pushed, 0 skipped, 0 failed"),
+        "{printed}"
+    );
+    assert!(printed.contains("can't be reached"), "{printed}");
+    drop(running);
 }

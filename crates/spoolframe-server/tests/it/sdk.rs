@@ -92,7 +92,10 @@ async fn sign_in_and_browse() {
     assert!(page.items.contains(&movie()));
     let detail = alice.item(show().id()).await.unwrap();
     assert_eq!(detail.children.len(), 3);
-    assert_eq!(alice.search("ali", 10).await.unwrap(), [movie()]);
+    assert_eq!(
+        alice.search(support::search("ali")).await.unwrap().top,
+        Some(movie())
+    );
     client.close().await;
     server.stop().await;
 }
@@ -684,6 +687,85 @@ async fn a_tv_is_signed_in_from_a_phone_by_its_qr_code() {
     );
     tv.close().await;
     phone.close().await;
+    server.stop().await;
+}
+
+/// Where the server's web UI is, from its Hello, for links into it such as
+/// linking a Plex account at `<web_url>/profile`.
+#[tokio::test]
+async fn a_session_knows_where_the_server_s_web_ui_is() {
+    const WEB: &str = "https://media.example.org";
+    let options = ServerOptions {
+        public_url: Some(WEB.into()),
+        ..ServerOptions::default()
+    };
+    let server = TestServer::start_with(fresh_dir("sdk-web-url").await, options).await;
+    server.add_user("alice", "correct horse", None).await;
+    let client = client_on(&server, &Arc::new(MemoryStorage::default())).await;
+    assert_eq!(
+        alice(&server, &client).await.web_url().as_deref(),
+        Some(WEB)
+    );
+    client.close().await;
+    server.stop().await;
+
+    // No public URL: no link, rather than an address no browser trusts.
+    let (server, client, _) = ready("sdk-no-web-url").await;
+    assert_eq!(alice(&server, &client).await.web_url(), None);
+    client.close().await;
+    server.stop().await;
+}
+
+/// A player scrubbing (P3-13): the previews come once they are made, and
+/// each sheet is an image like any other.
+#[tokio::test]
+async fn a_player_finds_the_frame_for_a_time_in_an_item_s_previews() {
+    use spoolframe_server::previews::{PreviewSettings, When};
+    let options = ServerOptions {
+        real_media: true,
+        previews: PreviewSettings {
+            when: When::OnPlay,
+            interval: Duration::from_secs(10),
+            cache_limit_bytes: 1 << 30,
+        },
+        ..ServerOptions::default()
+    };
+    let server = TestServer::start_with(fresh_dir("sdk-previews").await, options).await;
+    server.generate_media(30, "libx264", "ac3");
+    server.add_user("alice", "correct horse", None).await;
+    let client = client_on(&server, &Arc::new(MemoryStorage::default())).await;
+    let session = alice(&server, &client).await;
+    let previews = loop {
+        match session.previews(movie().id()).await {
+            Ok(previews) => break previews,
+            Err(SdkError::PreviewsNotReady { .. }) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert_eq!(previews.count, 3);
+    let tile = previews.tile(25_000).unwrap();
+    assert_eq!((tile.index, tile.sheet, tile.x, tile.y), (2, 0, 640, 0));
+    let sheet = session
+        .artwork(&previews.sheets[tile.sheet], ArtworkSize::Original)
+        .await
+        .unwrap();
+    let sheet = image::load_from_memory(&sheet).unwrap();
+    assert_eq!(sheet.width(), previews.columns * previews.tile_width);
+    assert_eq!(sheet.height(), previews.rows * previews.tile_height);
+    client.close().await;
+    server.stop().await;
+
+    // A server that makes none.
+    let (server, client, _) = ready("sdk-no-previews").await;
+    server.write_media(1000);
+    let session = alice(&server, &client).await;
+    assert_eq!(
+        session.previews(movie().id()).await.unwrap_err(),
+        SdkError::NoPreviews
+    );
+    client.close().await;
     server.stop().await;
 }
 

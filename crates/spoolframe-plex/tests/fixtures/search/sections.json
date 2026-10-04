@@ -1,0 +1,21 @@
+{
+  "MediaContainer": {
+    "Directory": [
+      {
+        "key": "2",
+        "type": "movie",
+        "title": "Movies"
+      },
+      {
+        "key": "1",
+        "type": "show",
+        "title": "TV Shows"
+      },
+      {
+        "key": "12",
+        "type": "artist",
+        "title": "Music"
+      }
+    ]
+  }
+}

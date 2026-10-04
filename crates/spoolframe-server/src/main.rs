@@ -4,24 +4,25 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use spoolframe_catalog::Catalog;
+use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::Prober;
 use spoolframe_media::encoders::FfmpegCommand;
 use spoolframe_media::ocr::Ocr;
-use spoolframe_plex::{Failures, LibraryPaths, PlexCatalog, Scope};
+use spoolframe_plex::{Failures, LibraryPaths, Scope};
 use spoolframe_server::admin::{self, Admin, CookiePolicy, SetupCode, StatusSource};
 use spoolframe_server::artwork::ArtworkCache;
 use spoolframe_server::auth::Auth;
-use spoolframe_server::catalog::LiveCatalog;
-use spoolframe_server::config::ServerConfig;
+use spoolframe_server::catalog::{Composite, LiveCatalog, PlexSource};
 use spoolframe_server::config::layers::{DEFAULTS, Layers, Locations};
 use spoolframe_server::config::secrets::Secrets;
+use spoolframe_server::config::{ServerConfig, WatchSyncConfig};
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
 use spoolframe_server::network::{Server, ServerName, Services};
 use spoolframe_server::passkeys::Passkeys;
-use spoolframe_server::plex_sync::PlexSync;
-use spoolframe_server::principal::Principal;
+use spoolframe_server::plex_accounts::{PlexAccounts, configured_owner};
+use spoolframe_server::plex_sync::WatchSync;
+use spoolframe_server::previews::{self, PreviewSources, Previews};
 use spoolframe_server::runtime::{self, Live, RuntimeSettings};
 use spoolframe_server::store::Store;
 use spoolframe_server::subtitles::Subtitles;
@@ -161,9 +162,12 @@ enum PlexCommand {
         #[arg(long)]
         library: Option<String>,
     },
-    /// Sync watch state with the Plex account now (PX-04), through the
-    /// running server, logged in as an admin.
+    /// Sync watch state with each linked user's Plex account now (PX-04,
+    /// P3-12), through the running server, logged in as an admin.
     SyncWatch {
+        /// Only this user; every linked user if left out.
+        #[arg(long)]
+        user: Option<String>,
         /// Only print what would change.
         #[arg(long)]
         dry_run: bool,
@@ -263,8 +267,8 @@ async fn main() -> Result<()> {
             command: PlexCommand::CheckPaths { library },
         }) => check_paths(&plex(&config, &layers, state_dir)?, library.as_deref()).await,
         Some(Command::Plex {
-            command: PlexCommand::SyncWatch { dry_run },
-        }) => admin_cli::plex_sync(config.admin.listen()?, dry_run).await,
+            command: PlexCommand::SyncWatch { user, dry_run },
+        }) => admin_cli::plex_sync(config.admin.listen()?, user, dry_run).await,
         Some(Command::Media {
             command: MediaCommand::Probe { id },
         }) => {
@@ -278,8 +282,9 @@ async fn main() -> Result<()> {
     }
 }
 
-/// The Plex catalog, for the commands that read it directly.
-fn plex(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result<PlexCatalog> {
+/// Every Plex server and library, for the commands that read them
+/// directly.
+fn plex(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result<Composite> {
     match runtime::plex_catalog(config, layers, &Secrets::new(state_dir))? {
         Some(plex) => Ok(plex),
         None => bail!("this server is not set up: no Plex server is configured (plex.url)"),
@@ -312,7 +317,7 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
     let live = Arc::new(LiveCatalog::new(plex.clone()));
     let catalog: Arc<dyn Catalog> = live.clone();
     match &plex {
-        Some(plex) => check_catalog(plex, catalog.as_ref()).await,
+        Some(plex) => check_catalog(plex).await,
         None => tracing::warn!(
             "not set up: no Plex server is configured, so clients are told the server is not \
              set up yet; set it up in the web UI"
@@ -354,6 +359,18 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             )
         })?,
     );
+    let previews_dir = state_dir.join("cache").join("previews");
+    let previews = Previews::start(
+        &previews_dir,
+        config.previews.settings()?,
+        PreviewSources {
+            catalog: catalog.clone(),
+            prober: prober.clone(),
+            transcoding: transcoding.clone(),
+            ffmpeg: config.media.ffmpeg(),
+        },
+    )
+    .with_context(|| format!("cannot open the previews cache {}", previews_dir.display()))?;
     let name = ServerName::new(config.server_name());
     let status = Arc::new(
         StatusSource::new(name.clone(), transcoding.clone())
@@ -367,6 +384,8 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
     );
 
     let store = Store::open(state_dir).await?;
+    // Previews made ahead (P3-13) start with what is being watched.
+    previews::ahead::spawn(&previews, catalog.clone(), store.clone());
     let auth = Auth::new(store);
     let watch = Arc::new(Watch::new(
         auth.store().clone(),
@@ -374,10 +393,25 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
         prober.clone(),
         config.watch.rules()?,
     ));
-    let plex_sync = match &plex {
-        Some(_) => plex_sync(config, &live, auth.store(), &watch).await?,
-        None => None,
-    };
+    let wizard = wizard()?;
+    let accounts = Arc::new(PlexAccounts::new(
+        Secrets::new(state_dir),
+        auth.store().clone(),
+        wizard.plex_site(),
+        configured_owner(config, auth.store()).await?,
+    ));
+    // Always: a server set up in the wizard, or a user who links, syncs
+    // without a restart.
+    let plex_sync = Arc::new(WatchSync::new(
+        live.clone(),
+        accounts.clone(),
+        watch.rules().started_after,
+        config
+            .plex
+            .as_ref()
+            .map_or(WatchSyncConfig::DEFAULT_INTERVAL, |p| p.sync_interval()),
+    ));
+    plex_sync.start(watch.changes());
     let admin_listen = config.admin.listen()?;
     let admin_origins = config.admin.origins()?;
     let admin_proxies = config.admin.trusted_proxies()?;
@@ -415,6 +449,7 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             cookies: cookies.clone(),
             watch: Some(watch.clone()),
             jobs: Some(jobs.clone()),
+            previews: Some(previews.clone()),
         },
         supervised,
     ));
@@ -427,12 +462,13 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             auth: auth.clone(),
             setup_code: setup_code.clone(),
             status: status.clone(),
-            plex_sync,
+            plex_sync: Some(plex_sync),
+            accounts: Some(accounts),
             plex: live,
             passkeys,
             cookies,
             settings: Some(settings.clone()),
-            wizard: wizard()?,
+            wizard,
         },
         admin_origins,
         admin_proxies,
@@ -464,6 +500,7 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             transcoding,
             jobs,
             subtitles,
+            previews,
         },
     )
     .await?;
@@ -514,37 +551,6 @@ fn wizard() -> Result<admin::Wizard> {
 /// supervisor, which starts the server again.
 const RESTART_EXIT: i32 = 75;
 
-/// The Plex watch sync, started, if the config asks for one and its user
-/// exists.
-async fn plex_sync(
-    config: &ServerConfig,
-    plex: &Arc<LiveCatalog>,
-    store: &Store,
-    watch: &Arc<Watch>,
-) -> Result<Option<Arc<PlexSync>>> {
-    let Some(sync) = config.plex.as_ref().and_then(|p| p.watch_sync.as_ref()) else {
-        return Ok(None);
-    };
-    let Some(user) = store.password_login(&sync.user).await? else {
-        tracing::warn!(
-            user = sync.user,
-            "plex.watch_sync.user does not exist; not syncing watch state with Plex"
-        );
-        return Ok(None);
-    };
-    let started = config.watch.rules()?.started_after;
-    let syncer = Arc::new(PlexSync::new(
-        plex.clone(),
-        store.clone(),
-        Principal::LocalUser(user.id),
-        started,
-        sync.interval(),
-    ));
-    syncer.clone().spawn(watch.changes());
-    tracing::info!(user = sync.user, "syncing watch state with Plex");
-    Ok(Some(syncer))
-}
-
 /// SIGINT or SIGTERM, handled from now on. `ctrl_c()` would only start
 /// handling SIGINT once polled.
 fn shutdown_signal() -> Result<impl Future<Output = ()>> {
@@ -559,23 +565,39 @@ fn shutdown_signal() -> Result<impl Future<Output = ()>> {
     })
 }
 
-/// Check Plex and a sample of media paths, and warn about what is wrong.
-/// Plex being down must not stop the server (§32): catalog calls report
-/// their own errors until it is back.
-async fn check_catalog(plex: &PlexCatalog, catalog: &dyn Catalog) {
-    match catalog.libraries().await {
+/// Check each Plex server and a sample of media paths, and warn about
+/// what is wrong. Plex being down must not stop the server (§32): catalog
+/// calls report their own errors until it is back, and a server that is
+/// down makes only its libraries unavailable (P3-11).
+async fn check_catalog(plex: &Composite) {
+    match plex.libraries().await {
         Ok(libraries) => tracing::info!(count = libraries.len(), "Plex catalog ready"),
         Err(e) => {
             tracing::warn!(error = %e, "Plex catalog unavailable");
             return;
         }
     }
+    for server in plex.servers() {
+        check_server(server).await;
+    }
+}
+
+async fn check_server(server: &PlexSource) {
+    if let Err(e) = server.catalog.identity().await {
+        tracing::warn!(server = server.name, error = %e, "Plex server unavailable");
+        return;
+    }
     // A few files per library, so a bad path mapping shows in the log at
     // startup rather than when somebody presses play.
-    match plex.check_paths(None, Scope::Sample(STARTUP_SAMPLE)).await {
+    match server
+        .catalog
+        .check_paths(None, Scope::Sample(STARTUP_SAMPLE))
+        .await
+    {
         Ok(reports) => {
             for r in reports.iter().filter(|r| !r.is_ok()) {
                 tracing::warn!(
+                    server = server.name,
                     library = %r.library,
                     no_mapping = r.no_mapping.count,
                     unreadable = r.unreadable.count,
@@ -584,12 +606,32 @@ async fn check_catalog(plex: &PlexCatalog, catalog: &dyn Catalog) {
                 );
             }
         }
-        Err(e) => tracing::warn!(error = %e, "cannot check Plex media paths"),
+        Err(e) => tracing::warn!(server = server.name, error = %e, "cannot check Plex media paths"),
     }
 }
 
-async fn check_paths(plex: &PlexCatalog, library: Option<&str>) -> Result<()> {
-    let reports = plex.check_paths(library, Scope::All).await?;
+/// `plex check-paths`: every served library of every Plex server, or the
+/// one titled `library` in Plex.
+async fn check_paths(plex: &Composite, library: Option<&str>) -> Result<()> {
+    let mut reports = Vec::new();
+    for server in plex.servers() {
+        match server.catalog.check_paths(library, Scope::All).await {
+            Ok(found) => reports.extend(found.into_iter().map(|mut r| {
+                if plex.servers().len() > 1 {
+                    r.library = format!("{} · {}", server.name, r.library);
+                }
+                r
+            })),
+            // Asked for one library: it is on one of the servers.
+            Err(CatalogError::NotFound(_)) if library.is_some() => {}
+            Err(e) => return Err(e).with_context(|| format!("Plex server {}", server.name)),
+        }
+    }
+    if let Some(wanted) = library
+        && reports.is_empty()
+    {
+        bail!("no Plex library {wanted:?} is served");
+    }
     print!("{}", report(&reports));
     let failing = reports.iter().filter(|r| !r.is_ok()).count();
     if failing > 0 {

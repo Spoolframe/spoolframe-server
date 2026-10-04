@@ -25,14 +25,16 @@ schema = "spoolframe.server.v1";
 # What clients show for this server.
 name = "Spoolframe";
 
-# The Plex Media Server the catalog reads from. Without it the server runs
-# "not set up": the web UI and the admin API work, and clients are told
-# the server is not set up yet. The setup wizard sets it.
+# The Plex Media Servers the catalog reads from. Without one the server
+# runs "not set up": the web UI and the admin API work, and clients are
+# told the server is not set up yet. The setup wizard sets the first.
 #
 # plex {
-#   # The PMS on the LAN, never plex.tv: the catalog works without the
-#   # Internet.
+#   # The first PMS, on the LAN, never plex.tv: the catalog works without
+#   # the Internet. Its id, in `libraries`, is "plex".
 #   url = "http://192.168.1.20:32400";
+#   # What Spoolframe calls it; the address's host if left out.
+#   name = "Tower";
 #   # A file holding the X-Plex-Token; none for a PMS that lets LAN
 #   # clients in without one. A token set in the web UI is kept in the
 #   # state directory instead (secrets/plex-token), never in a config.
@@ -43,12 +45,39 @@ name = "Spoolframe";
 #     { from = "/data/movies"; to = "/mnt/nas/movies"; },
 #     { library = "Music"; from = "/data"; to = "/mnt/nas/music"; },
 #   ]
-#   # Two-way watch state sync with the Plex account the token is for.
+#   # Watch state sync with each user's Plex account. Every user links
+#   # their own in My profile (Sign in with Plex); `user` links this one
+#   # by the config, as the Plex servers' owner, with each server's own
+#   # token (or none). While it is set, a library of the first server
+#   # that does not say otherwise syncs both ways. Every linked user is
+#   # synced every `interval_secs`, and soon after their state changes.
 #   watch_sync {
 #     user = "andoriyu";
 #     interval_secs = 120;
 #   }
+#   # Further Plex servers, each with an id of its own that never changes:
+#   # its items' IDs carry it. A token set in the web UI is kept as
+#   # secrets/plex-token-<id>.
+#   servers [
+#     { id = "cabin"; name = "Cabin"; url = "http://10.0.1.5:32400";
+#       token_file = "/run/secrets/plex-cabin";
+#       path_mapping [ { from = "/data"; to = "/mnt/cabin"; } ] },
+#   ]
 # }
+
+# The libraries apps show, in this order, each one library section of a
+# Plex server under the name given here. Left out, every library of the
+# first Plex server is served under Plex's names. `kind` (movies, shows or
+# music) keeps a library listed while its Plex server is down. Removing
+# one hides it; watch state is kept for when it is added back. `sync` is
+# which way its watch state syncs with each linked user's Plex account:
+# off, from_plex, to_plex or both; left out, both for the first server's
+# libraries while plex.watch_sync.user is set, else off.
+#
+# libraries [
+#   { name = "Films"; kind = "movies"; plex { server = "plex"; section = "2"; sync = "both"; } },
+#   { name = "Cabin movies"; kind = "movies"; plex { server = "cabin"; section = "1"; } },
+# ]
 
 # The Iroh endpoint clients connect to.
 network {
@@ -125,4 +154,20 @@ subtitles {
   # Where the text is kept; the state directory's cache/subtitles if left
   # out.
   # cache_dir = "/var/cache/spoolframe/subtitles";
+}
+
+# Frame previews for scrubbing: a picture every interval_secs of each film
+# and episode, made in the background, one file at a time, at the lowest
+# CPU and I/O priority. Where a Plex server already made its own preview
+# index for a file, it is read from Plex instead.
+previews {
+  # "ahead": for every file, newest and in-progress first, until the cache
+  # is full, and at once for anything played; "on_play": only for what is
+  # played; "never": none, and clients show the time alone.
+  when = "ahead";
+  interval_secs = 10;
+  # The most the previews under the state directory's cache/previews may
+  # take, in MiB; the least recently used go first. A two-hour film's are
+  # a few MiB.
+  cache_mb = 4096;
 }

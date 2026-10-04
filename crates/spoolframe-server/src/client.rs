@@ -19,15 +19,15 @@ use spoolframe_protocol::device_sign_in::{
 };
 use spoolframe_protocol::streams::{bi, reset, uni};
 use spoolframe_protocol::{
-    ArtworkReply, ArtworkRequest, ArtworkResponse, ChosenTracks, ConvertedSubtitle, MAX_READ,
-    MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan, SUBTITLE_CHUNK,
-    Selection, SubtitleAction,
+    ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize, ChosenTracks, ConvertedSubtitle,
+    MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan,
+    SUBTITLE_CHUNK, Selection, SubtitleAction,
 };
 use spoolframe_protocol::{
     AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, LoginPassword, Reply,
     Request, RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
 };
-use spoolframe_types::{Item, MediaId, MediaKind, SubtitleFormat};
+use spoolframe_types::{ArtworkId, Item, MediaId, MediaKind, Namespace, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
 
@@ -39,6 +39,7 @@ use crate::encode::{Conversion, ConversionSource, hls};
 use crate::network::{ConnectionAuth, Connections, ServerName, Services};
 use crate::planner;
 use crate::playback::{Changed, Opened, Playback, Playbacks, Refusal, Sidecar};
+use crate::previews::{self, PreviewState};
 use crate::principal::Principal;
 use crate::store::pins::PinError;
 use crate::store::sessions::{SessionBinding, SessionUser};
@@ -385,6 +386,9 @@ impl ClientProtocol {
             .lock()
             .expect("never poisoned")
             .use_session(&session)?;
+        if request.id.namespace() == Namespace::Preview {
+            return self.preview_sheet(&request.id, request.size).await;
+        }
         self.services
             .artwork
             .get(&request.id, request.size)
@@ -396,6 +400,48 @@ impl ClientProtocol {
                 },
                 other => internal(other),
             })
+    }
+
+    /// A sheet of frame previews (P3-13), from the previews cache rather
+    /// than the catalog's. A size below the sheet's scales it whole; the
+    /// client scales the tile rectangles to match.
+    async fn preview_sheet(&self, id: &ArtworkId, size: ArtworkSize) -> Result<Artwork, Error> {
+        let not_found = || Error::NotFound {
+            what: id.to_string(),
+        };
+        let (key, n) = previews::sheet_of(id).ok_or_else(not_found)?;
+        let bytes = self
+            .services
+            .previews
+            .sheet(key, n)
+            .await
+            .ok_or_else(not_found)?;
+        let sheet = Artwork {
+            bytes,
+            content_type: "image/jpeg".into(),
+            etag: format!("{key}-{n}-{}", size.as_str()),
+        };
+        let width = match size {
+            ArtworkSize::Unknown => {
+                return Err(Error::Malformed {
+                    message: format!("artwork size {} is not served", size.as_str()),
+                });
+            }
+            size => size.width(),
+        };
+        let Some(width) = width else {
+            return Ok(sheet);
+        };
+        let etag = sheet.etag.clone();
+        let image = tokio::task::spawn_blocking(move || crate::artwork::resize(sheet, width))
+            .await
+            .map_err(internal)?
+            .map_err(internal)?;
+        Ok(Artwork {
+            bytes: image.bytes,
+            content_type: image.content_type,
+            etag,
+        })
     }
 
     /// The playback behind `handle`, if `session` on this connection's
@@ -716,13 +762,36 @@ impl ClientProtocol {
                     markers: found.markers,
                 })
             }
-            Request::Search { query, limit } => {
-                let mut items = catalog
-                    .search(&query, limit.min(MAX_PAGE))
-                    .await
-                    .map_err(catalog_error)?;
+            Request::Search(mut search) => {
+                search.limit = search.limit.min(MAX_PAGE);
+                let mut results =
+                    crate::search::search(catalog.as_ref(), &search, crate::search::this_year())
+                        .await
+                        .map_err(catalog_error)?;
+                let items = results
+                    .top
+                    .iter_mut()
+                    .chain(results.groups.iter_mut().flat_map(|g| g.items.iter_mut()))
+                    .chain(results.without_year.iter_mut());
+                self.fill(principal, items).await?;
+                Ok(Reply::Search(results))
+            }
+            Request::PersonItems {
+                person,
+                offset,
+                limit,
+            } => {
+                // A person is in few items: the catalog lists them all,
+                // and the page is cut here.
+                let all = catalog.person_items(&person).await.map_err(catalog_error)?;
+                let total = u32::try_from(all.len()).unwrap_or(u32::MAX);
+                let mut items: Vec<_> = all
+                    .into_iter()
+                    .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+                    .take(usize::try_from(limit.min(MAX_PAGE)).unwrap_or(usize::MAX))
+                    .collect();
                 self.fill(principal, items.iter_mut()).await?;
-                Ok(Reply::Search { items })
+                Ok(Reply::Items { items, total })
             }
             Request::UpdatePlaybackProgress { id, position_ms } => {
                 self.services
@@ -774,6 +843,23 @@ impl ClientProtocol {
             Request::Tracks { id } => {
                 let (_, descriptor) = self.describe(&id).await?;
                 Ok(Reply::Tracks(descriptor.tracks()))
+            }
+            Request::GetPreviews { id } => {
+                match self
+                    .services
+                    .previews
+                    .state(&id)
+                    .await
+                    .map_err(catalog_error)?
+                {
+                    PreviewState::Ready { key, meta } => {
+                        Ok(Reply::Previews(previews::reply(&key, &meta)))
+                    }
+                    PreviewState::Making { done_percent } => {
+                        Err(Error::PreviewsNotReady { done_percent })
+                    }
+                    PreviewState::None => Err(Error::NoPreviews),
+                }
             }
             Request::GetTrackPreferences => Ok(Reply::TrackPreferences(
                 self.store()
@@ -876,6 +962,9 @@ impl ClientProtocol {
                         None,
                     )
                     .await?;
+                // Its previews next, if it has none yet: the player asks
+                // for them as soon as it shows a seek bar.
+                self.services.previews.played(&id);
                 let handle = self.services.playbacks.start(
                     handle,
                     Opened {
@@ -1468,6 +1557,7 @@ impl ProtocolHandler for ClientProtocol {
     /// Tell every client the server is going away, before the router
     /// closes the connections.
     async fn shutdown(&self) {
+        self.services.previews.stop();
         let streams: Vec<_> = self.events.lock().await.drain().map(|(_, s)| s).collect();
         for mut stream in streams {
             let notice = async {
@@ -1777,7 +1867,10 @@ async fn read_text(mut state: watch::Receiver<TextState>) -> Result<PathBuf, Err
 /// file paths) go to the log, not to the client.
 fn catalog_error(e: CatalogError) -> Error {
     match e {
-        CatalogError::NotFound(what) | CatalogError::ForeignId(what) => Error::NotFound { what },
+        // A library removed or never added is, to a client, not there.
+        CatalogError::NotFound(what)
+        | CatalogError::ForeignId(what)
+        | CatalogError::NotServed(what) => Error::NotFound { what },
         CatalogError::NotPlayable(id) => Error::NotFound {
             what: format!("a media file for {id}"),
         },

@@ -95,8 +95,9 @@ pub struct Watch {
     /// (Another key, an item): when the catalog last said that the key
     /// holds a copy of the item, so its state is not the item's to take.
     copies: Mutex<HashMap<(String, String), Instant>>,
-    /// Who saved a state last, for whoever mirrors it elsewhere (PX-04).
-    changed: tokio::sync::watch::Sender<Option<Principal>>,
+    /// Whose state was saved, for whoever mirrors it elsewhere (PX-04):
+    /// each one, since every linked user's state syncs (P3-12).
+    changed: tokio::sync::broadcast::Sender<Principal>,
 }
 
 /// A progress write, for judging the reports the throttle skips.
@@ -125,6 +126,19 @@ fn credits_to_end(markers: &[Marker]) -> Option<Duration> {
         .min()
 }
 
+/// Whether `e` is a Plex server that cannot be reached or does not answer
+/// properly: one server's trouble, which Home goes on without.
+fn is_down(e: &CatalogError) -> bool {
+    matches!(
+        e,
+        CatalogError::Unreachable { .. } | CatalogError::Backend { .. }
+    )
+}
+
+/// How many saves a listener may fall behind by; one that does is told
+/// so, and treats it as a change.
+const CHANGES: usize = 256;
+
 fn tracked(id: &MediaId) -> bool {
     matches!(id.kind(), MediaKind::Movie | MediaKind::Episode)
 }
@@ -148,7 +162,7 @@ impl Watch {
             written: Mutex::default(),
             next_up: Mutex::default(),
             copies: Mutex::default(),
-            changed: tokio::sync::watch::Sender::new(None),
+            changed: tokio::sync::broadcast::Sender::new(CHANGES),
         }
     }
 
@@ -163,7 +177,7 @@ impl Watch {
     }
 
     /// Fires after each state saved through [`Watch`], with its principal.
-    pub fn changes(&self) -> tokio::sync::watch::Receiver<Option<Principal>> {
+    pub fn changes(&self) -> tokio::sync::broadcast::Receiver<Principal> {
         self.changed.subscribe()
     }
 
@@ -316,7 +330,8 @@ impl Watch {
             .lock()
             .expect("never held across a panic")
             .remove(&principal);
-        self.changed.send_replace(Some(principal));
+        // Nobody listening is fine: nothing syncs.
+        let _ = self.changed.send(principal);
         Ok(())
     }
 
@@ -401,6 +416,9 @@ impl Watch {
                 false
             }
             Ok(_) | Err(CatalogError::NotFound(_) | CatalogError::ForeignId(_)) => true,
+            // In a library removed for now (P3-11): it has not left, and
+            // adding the library back finds its state where it was.
+            Err(CatalogError::NotServed(_)) => false,
             Err(e) => {
                 tracing::warn!(
                     from = key,
@@ -467,10 +485,15 @@ impl Watch {
             let Ok(id) = row.media_id.parse::<MediaId>() else {
                 continue;
             };
-            // An item gone from the catalog drops out of the row.
+            // An item gone from the catalog, or in a library not served
+            // now, drops out of the row; so does one whose Plex server is
+            // down (P3-11), until it is back, while the others still show.
             match self.catalog.item(&id).await {
                 Ok(found) => continue_watching.push(found.item),
-                Err(CatalogError::NotFound(_)) => {}
+                Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => {}
+                Err(e) if is_down(&e) => {
+                    tracing::warn!(item = %id, error = %e, "Continue watching: left out");
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -519,8 +542,13 @@ impl Watch {
             let Ok(show_id) = show.parse::<MediaId>() else {
                 continue;
             };
-            if let Some(episode) = self.next_in_show(principal, &show_id).await? {
-                next.push(episode);
+            match self.next_in_show(principal, &show_id).await {
+                Ok(Some(episode)) => next.push(episode),
+                Ok(None) => {}
+                Err(WatchError::Catalog(e)) if is_down(&e) => {
+                    tracing::warn!(show = %show_id, error = %e, "Next up: left out");
+                }
+                Err(e) => return Err(e),
             }
         }
         self.next_up
@@ -545,7 +573,7 @@ impl Watch {
         }
         let seasons = match self.catalog.item(show).await {
             Ok(found) => found.children,
-            Err(CatalogError::NotFound(_)) => return Ok(None),
+            Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         // Specials (season 0) are not part of the run.

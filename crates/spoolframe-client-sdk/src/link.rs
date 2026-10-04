@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
-use spoolframe_protocol::Event;
 use spoolframe_protocol::codec::read_frame;
 use spoolframe_protocol::streams::uni;
+use spoolframe_protocol::{Event, ServerInfo};
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
@@ -62,6 +62,8 @@ pub(crate) struct Link {
     id: EndpointId,
     state: watch::Sender<ConnectionState>,
     current: Mutex<Option<Arc<ServerConnection>>>,
+    /// What the latest connection's Hello said, kept while it reconnects.
+    info: Mutex<Option<ServerInfo>>,
     /// One first dial at a time.
     dialing: tokio::sync::Mutex<()>,
     supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -73,6 +75,7 @@ impl Link {
             id,
             state: watch::Sender::new(ConnectionState::Disconnected),
             current: Mutex::default(),
+            info: Mutex::default(),
             dialing: tokio::sync::Mutex::default(),
             supervisor: Mutex::default(),
         })
@@ -91,7 +94,16 @@ impl Link {
             .filter(|c| c.conn.close_reason().is_none())
     }
 
+    /// What the server said in the latest connection's Hello; `None`
+    /// before the first.
+    pub fn info(&self) -> Option<ServerInfo> {
+        self.info.lock().expect("never poisoned").clone()
+    }
+
     fn set(&self, conn: Option<Arc<ServerConnection>>, state: ConnectionState) {
+        if let Some(conn) = &conn {
+            *self.info.lock().expect("never poisoned") = Some(conn.info.clone());
+        }
         *self.current.lock().expect("never poisoned") = conn;
         self.state.send_replace(state);
     }

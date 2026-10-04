@@ -1,0 +1,76 @@
+{
+  "MediaContainer": {
+    "Metadata": [
+      {
+        "ratingKey": "152173",
+        "type": "movie",
+        "title": "Bill & Ted Face the Music",
+        "year": 2020,
+        "librarySectionID": 2
+      },
+      {
+        "ratingKey": "152544",
+        "type": "movie",
+        "title": "John Wick: Chapter 3 - Parabellum",
+        "year": 2019,
+        "librarySectionID": 2
+      },
+      {
+        "ratingKey": "194558",
+        "type": "movie",
+        "title": "John Wick: Chapter 4",
+        "year": 2023,
+        "librarySectionID": 2
+      },
+      {
+        "ratingKey": "215170",
+        "type": "show",
+        "title": "Severance",
+        "year": 2022,
+        "index": 1,
+        "librarySectionID": 1
+      },
+      {
+        "ratingKey": "215174",
+        "type": "episode",
+        "title": "Hello, Ms. Cobel",
+        "year": 2025,
+        "index": 1,
+        "parentIndex": 2,
+        "parentRatingKey": "215171",
+        "grandparentRatingKey": "215170",
+        "grandparentTitle": "Severance",
+        "parentTitle": "Season 2",
+        "librarySectionID": 1
+      },
+      {
+        "ratingKey": "219440",
+        "type": "movie",
+        "title": "Ballerina",
+        "year": 2025,
+        "librarySectionID": 2
+      },
+      {
+        "ratingKey": "221472",
+        "type": "movie",
+        "title": "47 Ronin",
+        "year": 2013,
+        "librarySectionID": 2
+      },
+      {
+        "ratingKey": "225937",
+        "type": "movie",
+        "title": "Good Fortune",
+        "year": 2025,
+        "librarySectionID": 2
+      },
+      {
+        "ratingKey": "229121",
+        "type": "movie",
+        "title": "Toy Story 5",
+        "year": 2026,
+        "librarySectionID": 2
+      }
+    ]
+  }
+}

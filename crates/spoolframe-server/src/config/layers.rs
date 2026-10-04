@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use super::secrets::Secrets;
 use super::settings::{self, PLEX_TOKEN, SETTINGS};
 use super::tree::{self, Table, Value};
-use super::{ConfigError, PlexConfig, ServerConfig};
+use super::{ConfigError, FIRST_PLEX_SERVER, PlexConfig, PlexServerConfig, ServerConfig};
 
 /// The built-in defaults: every setting at its default, with comments.
 /// `spoolframe-server config defaults` prints it.
@@ -22,6 +22,16 @@ pub const RUNTIME_FILE: &str = "runtime.ucl";
 
 /// The secret the Plex token set at run time is kept as.
 pub const PLEX_TOKEN_SECRET: &str = "plex-token";
+
+/// The secret a Plex server's token set at run time is kept as: the first
+/// server's as it always was, another's under its id (P3-11).
+pub fn plex_token_secret(server: &str) -> String {
+    if server == FIRST_PLEX_SERVER {
+        PLEX_TOKEN_SECRET.to_owned()
+    } else {
+        format!("{PLEX_TOKEN_SECRET}-{server}")
+    }
+}
 
 /// Where a setting's value comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,9 +443,21 @@ impl Layers {
     /// Whether the Plex token may be set at run time: not when a locked
     /// file names a token file.
     pub fn plex_token_changeable(&self) -> Result<(), SettingError> {
-        if self.is_locked("plex.token_file") {
+        self.server_token_changeable(FIRST_PLEX_SERVER)
+    }
+
+    /// Whether the token of Plex server `server` may be set at run time:
+    /// not when a locked file says where it is (the first server's
+    /// `token_file`, or the other servers' list).
+    pub fn server_token_changeable(&self, server: &str) -> Result<(), SettingError> {
+        let (key, locked_by) = if server == FIRST_PLEX_SERVER {
+            (PLEX_TOKEN.to_owned(), "plex.token_file")
+        } else {
+            (format!("the token of Plex server {server}"), "plex.servers")
+        };
+        if self.is_locked(locked_by) {
             return Err(SettingError::Locked {
-                key: PLEX_TOKEN.to_owned(),
+                key,
                 path: self.file_path().map(Path::to_owned).unwrap_or_default(),
             });
         }
@@ -449,18 +471,31 @@ impl Layers {
         plex: &PlexConfig,
         secrets: &Secrets,
     ) -> Result<Option<String>, ConfigError> {
-        if self.plex_token_changeable().is_ok() {
-            let secret = secrets
-                .get(PLEX_TOKEN_SECRET)
-                .map_err(|source| ConfigError::Token {
-                    path: secrets.path(PLEX_TOKEN_SECRET),
-                    source,
-                })?;
+        let first = plex
+            .all_servers()
+            .into_iter()
+            .next()
+            .expect("the first server is always there");
+        self.server_token(&first, secrets)
+    }
+
+    /// A Plex server's token, as [`Self::plex_token`] is the first one's.
+    pub fn server_token(
+        &self,
+        server: &PlexServerConfig,
+        secrets: &Secrets,
+    ) -> Result<Option<String>, ConfigError> {
+        if self.server_token_changeable(&server.id).is_ok() {
+            let name = plex_token_secret(&server.id);
+            let secret = secrets.get(&name).map_err(|source| ConfigError::Token {
+                path: secrets.path(&name),
+                source,
+            })?;
             if secret.is_some() {
                 return Ok(secret);
             }
         }
-        plex.token()
+        server.token()
     }
 
     /// Write the runtime layer: a new file (0600) that replaces the old
@@ -654,6 +689,10 @@ mod tests {
         assert_eq!(
             documented.subtitles.ocr_settings(dir).unwrap(),
             bare.subtitles.ocr_settings(dir).unwrap()
+        );
+        assert_eq!(
+            documented.previews.settings().unwrap(),
+            bare.previews.settings().unwrap()
         );
     }
 

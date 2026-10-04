@@ -69,6 +69,14 @@ pub enum SdkError {
     /// few seconds.
     #[error("the subtitle is still being read ({done_percent}% done)")]
     SubtitleNotReady { done_percent: u8 },
+    /// The item's frame previews are being made (P3-13): show the time
+    /// alone, and ask again in a few seconds.
+    #[error("the previews are being made ({done_percent}% done)")]
+    PreviewsNotReady { done_percent: u8 },
+    /// The item has no frame previews, and will not have: show the time
+    /// alone, and do not ask again for it.
+    #[error("this item has no previews")]
+    NoPreviews,
     /// The subtitle was written again or replaced on the server while it
     /// was read, and again while it was read a second time (P2-11). No
     /// part of it is returned: read it again.
@@ -115,6 +123,10 @@ impl SdkError {
                 SdkError::SubtitleNotReady { done_percent }
             }
             ServerError::SubtitleChanged => SdkError::SubtitleChanged,
+            ServerError::PreviewsNotReady { done_percent } => {
+                SdkError::PreviewsNotReady { done_percent }
+            }
+            ServerError::NoPreviews => SdkError::NoPreviews,
             ServerError::DeviceSignInDenied => SdkError::SignInDenied,
             ServerError::DeviceSignInExpired => SdkError::SignInExpired,
             ServerError::NotSetUp => SdkError::NotSetUp,

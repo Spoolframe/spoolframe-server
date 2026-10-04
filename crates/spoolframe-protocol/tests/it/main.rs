@@ -4,3 +4,4 @@
 //! here, never as a new file under `tests/`.
 
 mod messages;
+mod previews;

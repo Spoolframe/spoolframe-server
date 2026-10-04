@@ -8,23 +8,30 @@
 //! signing in with Plex at setup, reaches plex.tv, and only then.
 
 pub mod account;
+mod bif;
 pub mod check;
 mod convert;
 pub mod gdm;
 pub mod paths;
+mod search;
 mod watch;
 mod wire;
 
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use spoolframe_catalog::{
-    Catalog, CatalogError, Image, ItemPage, ItemWithChildren, Page, UnavailableFile,
+    Catalog, CatalogError, Found, Image, ItemPage, ItemWithChildren, Page, PreviewFrames,
+    SearchQuery, UnavailableFile,
 };
-use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId, MediaKind, Namespace};
+use spoolframe_types::{
+    ArtworkId, Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, Namespace, PersonId,
+};
 use url::Url;
 
 pub use crate::check::{Failures, LibraryPaths, Scope};
@@ -32,7 +39,7 @@ pub use crate::paths::{PathMap, PathMapping};
 pub use crate::watch::PlexWatch;
 
 use crate::convert::ConvertError;
-use crate::wire::{Envelope, MediaContainer, Metadata};
+use crate::wire::{Envelope, MediaContainer, Metadata, SectionKey};
 
 /// How long one PMS call may take. Browsing waits on it, so a stuck PMS
 /// should fail fast rather than hang the client.
@@ -50,6 +57,10 @@ pub struct PlexCatalog {
     /// Plex paths → local paths. Applied here and only here: nothing
     /// outside this crate sees a Plex-side path.
     paths: PathMap,
+    /// The library sections served (P3-11), by key; `None` serves every
+    /// one. An item in another is [`CatalogError::NotServed`], and left
+    /// out of listings, search and recently added.
+    sections: Option<Arc<HashSet<String>>>,
 }
 
 /// An item fetched by ID: as Plex sent it, converted, and the library it
@@ -58,8 +69,14 @@ struct Fetched {
     metadata: Metadata,
     item: Item,
     library: Option<String>,
+    /// The key of the section it is in, when Plex says.
+    section: Option<String>,
     call: Call<'static>,
 }
+
+/// An item with when it was added (Unix s), for merging recently added
+/// from several Plex servers (P3-11).
+pub type Dated = (Option<i64>, Item);
 
 impl fmt::Debug for PlexCatalog {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -67,6 +84,7 @@ impl fmt::Debug for PlexCatalog {
             .field("base", &self.base)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("paths", &self.paths)
+            .field("sections", &self.sections)
             .finish_non_exhaustive()
     }
 }
@@ -120,6 +138,7 @@ impl PlexCatalog {
             token,
             http,
             paths: PathMap::default(),
+            sections: None,
         })
     }
 
@@ -137,7 +156,59 @@ impl PlexCatalog {
             token: self.token.clone(),
             http: self.http.clone(),
             paths,
+            sections: self.sections.clone(),
         }
+    }
+
+    /// Serve only the library sections with these keys (P3-11); `None`
+    /// serves every one, as a catalog does by default.
+    pub fn serving(mut self, sections: Option<HashSet<String>>) -> Self {
+        self.sections = sections.map(Arc::new);
+        self
+    }
+
+    /// The same PMS with every section: what an admin chooses libraries
+    /// from, and what the watch sync reads (PX-04 syncs the account's whole
+    /// state).
+    pub fn unrestricted(&self) -> Self {
+        Self {
+            sections: None,
+            ..self.trying_paths(self.paths.clone())
+        }
+    }
+
+    /// Whether the section with key `section` is served. An item whose
+    /// section Plex does not say is served only by an unrestricted catalog.
+    fn serves(&self, section: Option<&SectionKey>) -> bool {
+        match (&self.sections, section) {
+            (None, _) => true,
+            (Some(served), Some(key)) => served.contains(&key.0),
+            (Some(_), None) => false,
+        }
+    }
+
+    /// The same PMS, every section, as the account `token` signs in
+    /// (P3-12): each user's watch state is their own account's.
+    pub fn with_token(&self, token: Option<String>) -> Self {
+        Self {
+            token,
+            ..self.unrestricted()
+        }
+    }
+
+    /// The PMS's machine identifier, which plex.tv's resources list knows
+    /// it by (P3-12). `/identity` answers without a token.
+    pub async fn machine_id(&self) -> Result<Option<String>, CatalogError> {
+        Ok(self
+            .fetch(&Call::get("/identity"))
+            .await?
+            .machine_identifier)
+    }
+
+    /// The key of the library section `id` is in, served or not; `None`
+    /// when Plex does not say.
+    pub async fn section_of(&self, id: &MediaId) -> Result<Option<String>, CatalogError> {
+        Ok(self.unrestricted().metadata(id, false).await?.section)
     }
 
     /// Where the PMS is reached, as configured: no token, no trailing
@@ -251,6 +322,13 @@ impl PlexCatalog {
             return Err(CatalogError::NotFound(id.to_string()));
         }
         let metadata = container.metadata.swap_remove(0);
+        let section = metadata
+            .library_section_id
+            .clone()
+            .or(container.library_section_id);
+        if !self.serves(section.as_ref()) {
+            return Err(CatalogError::NotServed(id.to_string()));
+        }
         let item = convert::item(&metadata).map_err(|e| self.converted(&call, e))?;
         if item.id() != id {
             return Err(self.backend(
@@ -263,6 +341,7 @@ impl PlexCatalog {
             metadata,
             item,
             library: container.library_section_title,
+            section: section.map(|s| s.0),
             call,
         })
     }
@@ -274,6 +353,102 @@ impl PlexCatalog {
             .map(convert::item)
             .collect::<Result<_, _>>()
             .map_err(|e| self.converted(call, e))
+    }
+}
+
+/// One library section of a PMS, whatever it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    /// Its key, as `/library/sections` lists it.
+    pub key: String,
+    pub title: String,
+    /// What it holds, or `None` for what Spoolframe does not serve
+    /// (photos, other videos).
+    pub kind: Option<LibraryKind>,
+    /// Plex's `type`, for naming what it holds when `kind` is `None`.
+    pub plex_type: Option<String>,
+    /// Its folders, as Plex sees them.
+    pub roots: Vec<PathBuf>,
+}
+
+impl PlexCatalog {
+    /// Every library section of the PMS, served or not, in Plex's order:
+    /// what an admin chooses libraries from (P3-11).
+    pub async fn sections(&self) -> Result<Vec<Section>, CatalogError> {
+        let call = Call::get("/library/sections");
+        let container = self.fetch(&call).await?;
+        container
+            .directories
+            .iter()
+            .map(|d| {
+                let kind = convert::library(d)
+                    .map_err(|e| self.converted(&call, e))?
+                    .map(|l| l.kind);
+                Ok(Section {
+                    key: d.key.clone(),
+                    title: d.title.clone(),
+                    kind,
+                    plex_type: d.kind.clone(),
+                    roots: d.locations.iter().map(|l| PathBuf::from(&l.path)).collect(),
+                })
+            })
+            .collect()
+    }
+
+    /// How many top-level items section `key` has, served or not.
+    pub async fn section_size(&self, key: &str) -> Result<u32, CatalogError> {
+        let key = plex_key(Namespace::Plex, key, &key)?;
+        let mut call = Call::get(format!("/library/sections/{key}/all"));
+        call.headers = vec![
+            ("X-Plex-Container-Start", "0".to_owned()),
+            ("X-Plex-Container-Size", "0".to_owned()),
+        ];
+        let container = self.fetch(&call).await?;
+        container
+            .total_size
+            .ok_or_else(|| self.backend(&call, None, "listing has no totalSize".into()))
+    }
+}
+
+/// How many more recently added items are asked for when some sections
+/// are not served, so that filtering them out still leaves enough.
+const RECENT_WINDOW: u32 = 4;
+
+impl PlexCatalog {
+    /// The most recently added items in the served sections, newest first,
+    /// at most `limit`, each with when it was added.
+    pub async fn recently_added_dated(&self, limit: u32) -> Result<Vec<Dated>, CatalogError> {
+        // `/library/recentlyAdded` groups new episodes into their seasons,
+        // which a section's own listing does not: so it is asked for more
+        // and filtered here, rather than asked per section.
+        let window = match self.sections {
+            None => limit,
+            Some(_) => limit.saturating_mul(RECENT_WINDOW),
+        };
+        let mut call = Call::get("/library/recentlyAdded");
+        call.headers = vec![
+            ("X-Plex-Container-Start", "0".to_owned()),
+            ("X-Plex-Container-Size", window.to_string()),
+        ];
+        let container = self.fetch(&call).await?;
+        // Plex may list kinds Spoolframe does not model (photos, clips);
+        // those are skipped.
+        let mut items = container
+            .metadata
+            .iter()
+            .filter(|m| convert::is_modelled(&m.kind))
+            .filter(|m| {
+                self.serves(
+                    m.library_section_id
+                        .as_ref()
+                        .or(container.library_section_id.as_ref()),
+                )
+            })
+            .map(|m| convert::item(m).map(|item| (m.added_at, item)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| self.converted(&call, e))?;
+        items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(items)
     }
 }
 
@@ -321,6 +496,10 @@ impl PlexCatalog {
 /// The largest image passed on; posters and backgrounds are far smaller.
 const MAX_IMAGE_BYTES: usize = 32 << 20;
 
+/// The most of a preview index read: a film's is about 3.6 MB an hour at
+/// a frame every 2 s.
+const MAX_INDEX_BYTES: usize = 256 << 20;
+
 /// Whether `key` is an image path as Plex hands them out:
 /// `/library/metadata/<digits>/(thumb|art)/<digits>`.
 fn is_image_path(key: &str) -> bool {
@@ -352,6 +531,7 @@ impl Catalog for PlexCatalog {
         container
             .directories
             .iter()
+            .filter(|d| self.serves(Some(&SectionKey(d.key.clone()))))
             .filter_map(|d| convert::library(d).transpose())
             .collect::<Result<_, _>>()
             .map_err(|e| self.converted(&call, e))
@@ -359,6 +539,9 @@ impl Catalog for PlexCatalog {
 
     async fn items(&self, library: &LibraryId, page: Page) -> Result<ItemPage, CatalogError> {
         let key = plex_key(library.namespace(), library.key(), library)?;
+        if !self.serves(Some(&SectionKey(key.to_owned()))) {
+            return Err(CatalogError::NotServed(library.to_string()));
+        }
         let mut call = Call::get(format!("/library/sections/{key}/all")).about(library);
         call.headers = vec![
             ("X-Plex-Container-Start", page.offset.to_string()),
@@ -403,6 +586,15 @@ impl Catalog for PlexCatalog {
         // Plex's keys are one sequence for all kinds: a key it gave to an
         // item of another kind since is not this item.
         match container.metadata.first() {
+            Some(m)
+                if !self.serves(
+                    m.library_section_id
+                        .as_ref()
+                        .or(container.library_section_id.as_ref()),
+                ) =>
+            {
+                Err(CatalogError::NotServed(id.to_string()))
+            }
             Some(m) if convert::media_kind(&m.kind) == Some(id.kind()) => {
                 Ok(convert::external_ids(m))
             }
@@ -411,33 +603,56 @@ impl Catalog for PlexCatalog {
     }
 
     async fn recently_added(&self, limit: u32) -> Result<Vec<Item>, CatalogError> {
-        let mut call = Call::get("/library/recentlyAdded");
-        call.headers = vec![
-            ("X-Plex-Container-Start", "0".to_owned()),
-            ("X-Plex-Container-Size", limit.to_string()),
-        ];
-        let container = self.fetch(&call).await?;
-        // Plex groups new episodes into their seasons and may list kinds
-        // Spoolframe does not model (photos, clips); those are skipped.
-        container
-            .metadata
-            .iter()
-            .filter(|m| convert::is_modelled(&m.kind))
-            .map(convert::item)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| self.converted(&call, e))
+        Ok(self
+            .recently_added_dated(limit)
+            .await?
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect())
     }
 
-    async fn search(&self, query: &str, limit: u32) -> Result<Vec<Item>, CatalogError> {
-        let limit_str = limit.to_string();
-        let mut call = Call::get("/hubs/search").about(format!("search {query:?}"));
-        call.query = vec![("query", query), ("limit", &limit_str)];
-        let container = self.fetch(&call).await?;
-        let mut items =
-            convert::search_results(&container.hubs).map_err(|e| self.converted(&call, e))?;
-        // PMS applies `limit` per hub (per kind), not to the whole result.
-        items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        Ok(items)
+    async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
+        self.find(query).await
+    }
+
+    async fn person_items(&self, id: &PersonId) -> Result<Vec<Item>, CatalogError> {
+        self.person_items(id).await
+    }
+
+    /// The `sd` preview index of the part a playback plays (the first of
+    /// the first version), if Plex has made one.
+    async fn preview_frames(&self, id: &MediaId) -> Result<Option<PreviewFrames>, CatalogError> {
+        if !matches!(id.kind(), MediaKind::Movie | MediaKind::Episode) {
+            return Ok(None);
+        }
+        let fetched = self.metadata(id, false).await?;
+        let Some(part) = fetched.metadata.media.first().and_then(|m| m.parts.first()) else {
+            return Ok(None);
+        };
+        let indexed = part
+            .indexes
+            .as_deref()
+            .is_some_and(|i| i.split(',').any(|kind| kind.trim() == "sd"));
+        let (Some(part), true) = (part.id, indexed) else {
+            return Ok(None);
+        };
+        let call = Call::get(format!("/library/parts/{part}/indexes/sd")).about(id);
+        let bytes = match self.get_bytes(&call, "*/*").await {
+            Ok((bytes, _)) => bytes,
+            // Listed, but gone (being made again): as if there were none.
+            Err(CatalogError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if bytes.len() > MAX_INDEX_BYTES {
+            return Err(self.backend(
+                &call,
+                None,
+                format!("a preview index of {} bytes is over the limit", bytes.len()),
+            ));
+        }
+        let frames = bif::frames(&bytes)
+            .map_err(|e| self.backend(&call, None, format!("unreadable preview index: {e}")))?;
+        Ok((!frames.is_empty()).then_some(PreviewFrames { frames }))
     }
 
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {

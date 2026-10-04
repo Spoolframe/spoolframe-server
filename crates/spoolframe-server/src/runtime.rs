@@ -11,16 +11,18 @@ use std::sync::{Arc, Mutex};
 
 use spoolframe_admin_api::{SettingApply, SettingEntry, SettingLayer, Settings};
 use spoolframe_plex::PlexCatalog;
+use spoolframe_types::{Library, LibraryId, Namespace};
 
 use crate::admin::CookiePolicy;
-use crate::catalog::LiveCatalog;
-use crate::config::layers::{Layer, Layers, PLEX_TOKEN_SECRET, SettingError};
+use crate::catalog::{Composite, LiveCatalog, PlexSource, Served, ids};
+use crate::config::layers::{Layer, Layers, PLEX_TOKEN_SECRET, SettingError, plex_token_secret};
 use crate::config::secrets::Secrets;
 use crate::config::settings::{self, Apply, PLEX_TOKEN, SETTINGS, Setting};
 use crate::config::tree::{self, Table, Value};
-use crate::config::{ConfigError, ServerConfig};
+use crate::config::{ConfigError, FIRST_PLEX_SERVER, LibraryConfig, PlexConfig, ServerConfig};
 use crate::encode::job::Jobs;
 use crate::network::ServerName;
+use crate::previews::Previews;
 use crate::watch::Watch;
 
 /// What the live settings reach in the running server.
@@ -28,7 +30,8 @@ use crate::watch::Watch;
 pub struct Live {
     /// `name`.
     pub name: Option<ServerName>,
-    /// `plex.*` and the Plex token: the catalog is rebuilt and swapped.
+    /// `plex.*`, `libraries` and the Plex tokens: the catalog is rebuilt
+    /// and swapped.
     pub catalog: Arc<LiveCatalog>,
     /// `admin.insecure_cookies`.
     pub cookies: CookiePolicy,
@@ -36,6 +39,8 @@ pub struct Live {
     pub watch: Option<Arc<Watch>>,
     /// `transcode.max_jobs`, `scratch_limit_mb` and `read_ahead_secs`.
     pub jobs: Option<Arc<Jobs>>,
+    /// `previews.*`.
+    pub previews: Option<Arc<Previews>>,
 }
 
 /// Why a change was not made.
@@ -71,22 +76,77 @@ pub struct RuntimeSettings {
     restart: tokio::sync::Notify,
 }
 
-/// The Plex catalog `config` and the layers' token make, if `config` has
-/// Plex.
+/// The libraries as clients see them: each with its Spoolframe name, an id
+/// naming its Plex server and section, and which way it syncs.
+fn served(plex: &PlexConfig, libraries: &[LibraryConfig]) -> Result<Vec<Served>, ConfigError> {
+    libraries
+        .iter()
+        .map(|l| {
+            let section =
+                LibraryId::new(Namespace::Plex, l.plex.section.as_str()).map_err(|e| {
+                    ConfigError::Invalid {
+                        key: "libraries",
+                        message: e.to_string(),
+                    }
+                })?;
+            Ok(Served {
+                library: Library {
+                    id: ids::library(&l.plex.server, section),
+                    title: l.name.clone(),
+                    kind: l.kind()?,
+                },
+                server: l.plex.server.clone(),
+                section: l.plex.section.clone(),
+                sync: plex.sync(&l.plex),
+            })
+        })
+        .collect()
+}
+
+/// The catalog `config` and the layers' tokens make, if `config` has
+/// Plex: every Plex server, each serving only its sections that are
+/// libraries (all of the first one's while `libraries` is left out).
 pub fn plex_catalog(
     config: &ServerConfig,
     layers: &Layers,
     secrets: &Secrets,
-) -> Result<Option<PlexCatalog>, ConfigError> {
+) -> Result<Option<Composite>, ConfigError> {
     let Some(plex) = &config.plex else {
         return Ok(None);
     };
-    let token = layers.plex_token(plex, secrets)?;
-    let catalog = PlexCatalog::new(plex.url()?, token).map_err(|e| ConfigError::Invalid {
-        key: "plex.url",
-        message: e.to_string(),
-    })?;
-    Ok(Some(catalog.with_paths(plex.path_map()?)))
+    let libraries = config
+        .libraries
+        .as_deref()
+        .map(|l| served(plex, l))
+        .transpose()?;
+    let mut sources = Vec::new();
+    for server in plex.all_servers() {
+        let token = layers.server_token(&server, secrets)?;
+        let sections = match &libraries {
+            None if server.id == FIRST_PLEX_SERVER => None,
+            None => Some(Default::default()),
+            Some(served) => Some(
+                served
+                    .iter()
+                    .filter(|l| l.server == server.id)
+                    .map(|l| l.section.clone())
+                    .collect(),
+            ),
+        };
+        let url = server.url()?;
+        let catalog = PlexCatalog::new(url, token).map_err(|e| ConfigError::Invalid {
+            key: "plex.url",
+            message: e.to_string(),
+        })?;
+        sources.push(PlexSource {
+            name: server.display_name(),
+            catalog: Arc::new(catalog.with_paths(server.path_map()?).serving(sections)),
+            id: server.id,
+        });
+    }
+    Ok(Some(
+        Composite::new(sources, libraries).with_default_sync(plex.default_sync(FIRST_PLEX_SERVER)),
+    ))
 }
 
 impl RuntimeSettings {
@@ -227,8 +287,10 @@ impl RuntimeSettings {
         let mut layers = self.layers.lock().expect("never held across a panic");
         let changed = change(&layers)?;
         changed.write_runtime().map_err(ChangeError::Write)?;
-        let plex_changed =
-            tree::get(&layers.merged(), "plex") != tree::get(&changed.merged(), "plex");
+        let (before, after) = (layers.merged(), changed.merged());
+        let plex_changed = ["plex", "libraries"]
+            .iter()
+            .any(|key| tree::get(&before, key) != tree::get(&after, key));
         *layers = changed;
         self.apply(&layers, plex_changed, key, by);
         Ok(())
@@ -240,24 +302,61 @@ impl RuntimeSettings {
         value: Option<&str>,
         by: &str,
     ) -> Result<SettingEntry, ChangeError> {
+        self.set_server_token(FIRST_PLEX_SERVER, value, by)?;
+        Ok(self.entry_for(key).expect("a known setting"))
+    }
+
+    /// Keep `value` as Plex server `server`'s token, or forget it, and
+    /// make the catalog use it.
+    pub(crate) fn set_server_token(
+        &self,
+        server: &str,
+        value: Option<&str>,
+        by: &str,
+    ) -> Result<(), ChangeError> {
         let layers = self.layers.lock().expect("never held across a panic");
-        layers.plex_token_changeable()?;
+        layers.server_token_changeable(server)?;
+        let secret = plex_token_secret(server);
         match value {
             Some(token) => self
                 .secrets
-                .set(PLEX_TOKEN_SECRET, token)
+                .set(&secret, token)
                 .map_err(ChangeError::Write)?,
             None => {
-                self.secrets
-                    .remove(PLEX_TOKEN_SECRET)
-                    .map_err(ChangeError::Write)?;
+                self.secrets.remove(&secret).map_err(ChangeError::Write)?;
             }
         }
         // Never the value: only that it changed, and who changed it.
-        tracing::info!(by, key, set = value.is_some(), "secret setting changed");
-        self.apply(&layers, true, key, by);
-        drop(layers);
-        Ok(self.entry_for(key).expect("a known setting"))
+        tracing::info!(by, server, set = value.is_some(), "secret setting changed");
+        self.apply(&layers, true, &secret, by);
+        Ok(())
+    }
+
+    /// Set (or, with `None`, unset) several keys in one change, checked
+    /// together: what one admin action changes at once (P3-11).
+    pub(crate) fn change_keys(
+        &self,
+        what: &str,
+        by: &str,
+        keys: Vec<(&str, Option<Value>)>,
+    ) -> Result<(), ChangeError> {
+        self.change(what, by, |layers| {
+            let mut changed = layers.clone();
+            for (key, value) in keys {
+                changed = match value {
+                    Some(value) => changed.with_set(key, value)?,
+                    None => changed.with_unset(key)?,
+                };
+            }
+            Ok(changed)
+        })?;
+        tracing::info!(by, what, "settings changed");
+        Ok(())
+    }
+
+    /// The catalog the server serves from.
+    pub fn catalog(&self) -> &Arc<LiveCatalog> {
+        &self.live.catalog
     }
 
     /// Bring the live settings to what `layers` say. Every one is set
@@ -288,12 +387,15 @@ impl RuntimeSettings {
         if let (Some(jobs), Ok(limits)) = (&live.jobs, config.transcode.limits(&self.state_dir)) {
             jobs.set_limits(limits);
         }
+        if let (Some(previews), Ok(settings)) = (&live.previews, config.previews.settings()) {
+            previews.set_settings(settings);
+        }
         if plex_changed {
             match plex_catalog(&config, layers, &self.secrets) {
                 Ok(plex) => {
                     let set_up = plex.is_some();
                     live.catalog.replace(plex.map(Arc::new));
-                    tracing::info!(set_up, "the Plex catalog follows the new settings");
+                    tracing::info!(set_up, "the catalog follows the new settings");
                 }
                 Err(e) => tracing::error!(error = %e, "cannot make the Plex catalog"),
             }
@@ -314,16 +416,7 @@ impl RuntimeSettings {
     /// This installation's id at plex.tv, which a PIN is bound to: made
     /// once, and kept beside the secrets.
     pub fn plex_client_id(&self) -> std::io::Result<String> {
-        const NAME: &str = "plex-client-id";
-        if let Some(id) = self.secrets.get(NAME)? {
-            return Ok(id);
-        }
-        use password_hash::rand_core::{OsRng, RngCore};
-        let mut bytes = [0u8; 16];
-        OsRng.fill_bytes(&mut bytes);
-        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        self.secrets.set(NAME, &id)?;
-        Ok(id)
+        self.secrets.plex_client_id()
     }
 
     /// The wizard's progress: the confirmed steps, and whether it is over.
@@ -437,6 +530,40 @@ mod tests {
             .unwrap();
         assert_eq!(watch.rules().watched_fraction, 0.8);
         assert_eq!(watch.rules().throttle, std::time::Duration::from_millis(1));
+    }
+
+    #[tokio::test]
+    async fn previews_settings_reach_the_running_server_at_once() {
+        use crate::previews::{PreviewSources, When};
+        let (mut settings, dir) = settings(None).await;
+        let previews = Previews::start(
+            &dir.as_ref().join("previews"),
+            crate::config::PreviewsConfig::default().settings().unwrap(),
+            PreviewSources {
+                catalog: Arc::new(LiveCatalog::default()),
+                prober: Arc::new(spoolframe_media::Prober::new(
+                    "ffprobe",
+                    spoolframe_media::Prober::DEFAULT_TIMEOUT,
+                )),
+                transcoding: Arc::new(crate::transcode::Transcoding::new(
+                    Box::new(spoolframe_media::encoders::FfmpegCommand::new("ffmpeg")),
+                    Default::default(),
+                    dir.as_ref().join("encoder-test"),
+                )),
+                ffmpeg: "ffmpeg".into(),
+            },
+        )
+        .unwrap();
+        settings.live.previews = Some(previews.clone());
+        settings
+            .set("previews.when", &serde_json::json!("never"), "root")
+            .unwrap();
+        settings
+            .set("previews.interval_secs", &serde_json::json!(4), "root")
+            .unwrap();
+        let now = previews.settings();
+        assert_eq!(now.when, When::Never);
+        assert_eq!(now.interval, std::time::Duration::from_secs(4));
     }
 
     #[tokio::test]

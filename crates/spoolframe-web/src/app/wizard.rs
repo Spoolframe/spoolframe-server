@@ -14,6 +14,7 @@ use spoolframe_admin_api::{
 
 use super::admin::sleep;
 use super::{Alert, Field, Route, icons, now, rpc};
+use crate::libraries;
 use crate::logic::{ApiError, host_port, thousands};
 use crate::setup::{self, Hardware, PathRow, STEPS, Sample, Step};
 
@@ -495,6 +496,15 @@ fn PlexFields(
     let mut ocr = use_signal(|| flag(&settings, "subtitles.ocr"));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
+    // The library sections checked (P3-11), as of the server last probed.
+    let mut shared = use_signal(Vec::<String>::new);
+    use_effect(move || {
+        if let Some(Ok(p)) = &*probed.read()
+            && p.reachable
+        {
+            shared.set(libraries::checked(&p.libraries));
+        }
+    });
 
     // Probe the chosen address again whenever it or the token changes.
     let mut reprobe = move || {
@@ -641,7 +651,11 @@ fn PlexFields(
                 ("plex.url", typed(&url)),
                 ("subtitles.ocr", Some(json!(ocr()))),
             ];
-            match save(&s, changes).await {
+            let saved = match save(&s, changes).await {
+                Ok(()) => choose_libraries(shared.peek().clone()).await,
+                Err(e) => Err(e),
+            };
+            match saved {
                 Ok(()) => on_done.call(()),
                 Err(e) => error.set(Some(e.explain())),
             }
@@ -818,17 +832,44 @@ fn PlexFields(
             div { class: "flex flex-col gap-1",
                 div { class: "flex items-baseline justify-between gap-3",
                     h2 { "Libraries" }
-                    span { class: "text-xs text-ctp-subtext0", {format!("{} on {}", super::count_of(p.libraries.len() as u64, "library", "libraries"), p.server_name.clone().unwrap_or_else(|| "Plex".into()))} }
+                    span { class: "text-xs text-ctp-subtext0",
+                        {format!("{} of {} shared with Spoolframe", shared().len(), p.libraries.len() + p.unsupported.len())}
+                    }
                 }
                 div { class: "lines",
                     for library in p.libraries.clone() {
-                        div { key: "{library.title}",
-                            b { "{library.title}" }
+                        div { key: "{library.section}", class: "library-line",
+                            button {
+                                class: if shared().contains(&library.section) { "box box-on" } else { "box" },
+                                role: "checkbox",
+                                aria_checked: "{shared().contains(&library.section)}",
+                                aria_label: "Share {library.title}",
+                                disabled: url_locked,
+                                onclick: {
+                                    let section = library.section.clone();
+                                    move |_| shared.with_mut(|c| {
+                                        match c.iter().position(|s| *s == section) {
+                                            Some(i) => {
+                                                c.remove(i);
+                                            }
+                                            None => c.push(section.clone()),
+                                        }
+                                    })
+                                },
+                                if shared().contains(&library.section) { icons::Check {} }
+                            }
+                            b { class: "flex-grow", "{library.title}" }
                             span { class: "quiet", {format!("{} · {}", kind_name(library.kind), thousands(library.items as u64))} }
                         }
                     }
+                    for other in p.unsupported.clone() {
+                        div { key: "{other.title}", class: "library-line off",
+                            button { class: "box", role: "checkbox", aria_checked: "false", disabled: true }
+                            b { class: "flex-grow", "{other.title}" }
+                            span { class: "quiet", "Not served by Spoolframe" }
+                        }
+                    }
                 }
-                span { class: "text-xs text-ctp-subtext0", "Every library is served. Choosing which comes in a later version." }
             }
         }
         div { class: "flex flex-col gap-2",
@@ -849,12 +890,43 @@ fn PlexFields(
             }
             Note { settings: settings.clone(), setting: "subtitles.ocr", on_changed: move |_| on_reload.call(()) }
         }
-        span { class: "later", icons::Plus { size: 14 } "Add another Plex server · in a later version" }
+        div { class: "flex flex-wrap items-center gap-3",
+            Link {
+                class: "btn",
+                to: Route::AddLibrary { back: if mode == Mode::Wizard { "wizard".into() } else { "settings".into() } },
+                icons::Plus { size: 14 }
+                "Add another Plex server"
+            }
+            span { class: "text-xs text-ctp-subtext0", "Libraries from several Plex servers show up as one set in the apps." }
+        }
         if let Some(text) = error() {
             Alert { text }
         }
         Footer { mode, step: "plex", busy: busy(), on_save, on_discard: move |_| on_reload.call(()), blocked }
     }
+}
+
+/// Make the first Plex server's libraries the sections `chosen`: those
+/// not yet libraries added, the others removed (their watch state kept).
+/// Asked of the server after its address is saved, so what is a library
+/// already is what it serves now.
+async fn choose_libraries(chosen: Vec<String>) -> Result<(), ApiError> {
+    let client = rpc::client().await?;
+    let status = client.plex_status().await.map_err(rpc::error)?;
+    if !status.reachable {
+        return Ok(());
+    }
+    let change = libraries::choice(&status.libraries, &chosen);
+    for section in change.add {
+        client
+            .library_add("plex".into(), section, None)
+            .await
+            .map_err(rpc::error)?;
+    }
+    for id in change.remove {
+        client.library_remove(id).await.map_err(rpc::error)?;
+    }
+    Ok(())
 }
 
 /// "Found on this network · 192.168.1.10:32400 · Plex Media Server 1.41".
@@ -1049,7 +1121,10 @@ fn saved_mappings(settings: &Settings) -> Vec<PathMappingEntry> {
 
 async fn check_paths(mappings: Vec<PathMappingEntry>) -> Result<Vec<LibraryPathCheck>, ApiError> {
     let client = rpc::client().await?;
-    client.plex_path_check(mappings).await.map_err(rpc::error)
+    client
+        .plex_path_check(mappings, None, None)
+        .await
+        .map_err(rpc::error)
 }
 
 #[component]

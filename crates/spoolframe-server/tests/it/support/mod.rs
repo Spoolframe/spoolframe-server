@@ -14,7 +14,9 @@ use async_trait::async_trait;
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, RelayMode};
 use serde::Serialize;
-use spoolframe_catalog::{Catalog, CatalogError, Image, ItemPage, ItemWithChildren, Page};
+use spoolframe_catalog::{
+    Catalog, CatalogError, Found, FoundGroup, Image, ItemPage, ItemWithChildren, Page, SearchQuery,
+};
 use spoolframe_media::Prober;
 use spoolframe_media::encoders::{FfmpegCommand, TranscodeSettings};
 use spoolframe_media::ocr::Ocr;
@@ -33,13 +35,15 @@ use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
 use spoolframe_server::network::{EndpointOptions, Relay, Server, ServerName, Services};
 use spoolframe_server::playback::Playbacks;
+use spoolframe_server::previews::{PreviewSettings, PreviewSources, Previews, When};
 use spoolframe_server::store::Store;
 use spoolframe_server::subtitles::{OcrSettings, Subtitles};
 use spoolframe_server::transcode::Transcoding;
 use spoolframe_server::watch::{Watch, WatchRules};
 use spoolframe_types::{
     ArtworkId, ClientCapabilities, Episode, Item, Library, LibraryId, LibraryKind, Marker,
-    MarkerKind, MediaId, MediaKind, Movie, Namespace, PlaybackState, Season, Show,
+    MarkerKind, MediaId, MediaKind, Movie, Namespace, PersonId, PlaybackState, SearchKind,
+    SearchScope, Season, Show,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -63,6 +67,17 @@ pub fn poster() -> ArtworkId {
 /// A search for this finds a movie whose title alone is over a frame: a
 /// reply that cannot be sent.
 pub const A_TITLE_OVER_A_FRAME: &str = "a title over a frame";
+
+/// A search of everything for `query`, up to 10 per group.
+pub fn search(query: &str) -> spoolframe_protocol::SearchRequest {
+    spoolframe_protocol::SearchRequest {
+        query: query.into(),
+        limit: 10,
+        scope: SearchScope::All,
+        kind: None,
+        library: None,
+    }
+}
 
 /// One library holding one movie, `plex:movie:1`.
 #[derive(Debug)]
@@ -339,23 +354,41 @@ impl Catalog for FakeCatalog {
             .ok_or_else(|| CatalogError::NotFound(id.to_string()))
     }
 
-    async fn search(&self, query: &str, _limit: u32) -> Result<Vec<Item>, CatalogError> {
-        if query == A_TITLE_OVER_A_FRAME {
+    /// The movie, for a part of "alien" or for [`A_TITLE_OVER_A_FRAME`];
+    /// nothing else.
+    async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
+        let text = query.text.to_lowercase();
+        let found = if text == A_TITLE_OVER_A_FRAME {
             let Item::Movie(movie) = movie() else {
                 unreachable!()
             };
-            return Ok(vec![Item::Movie(Movie {
+            vec![Item::Movie(Movie {
                 title: "a".repeat(MAX_FRAME as usize),
                 ..movie
-            })]);
-        }
-        Ok(
-            if "alien".contains(&query.to_lowercase()) && !query.is_empty() {
-                vec![movie()]
-            } else {
-                Vec::new()
-            },
-        )
+            })]
+        } else if "alien".contains(&text) && !text.is_empty() {
+            vec![movie()]
+        } else {
+            Vec::new()
+        };
+        let groups = query
+            .kinds
+            .iter()
+            .map(|&kind| match kind {
+                SearchKind::Movies => FoundGroup {
+                    total: found.len() as u32,
+                    items: found.clone(),
+                    ..FoundGroup::empty(kind)
+                },
+                _ => FoundGroup::empty(kind),
+            })
+            .collect();
+        Ok(Found { groups })
+    }
+
+    /// The fake knows no people.
+    async fn person_items(&self, id: &PersonId) -> Result<Vec<Item>, CatalogError> {
+        Err(CatalogError::NotFound(id.to_string()))
     }
 
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
@@ -496,6 +529,14 @@ pub struct ServerOptions {
     /// Serve from a catalog that is not set up yet (P3-10) instead of the
     /// fake one.
     pub not_set_up: bool,
+    /// Serve from this catalog (Plex libraries, P3-11) instead of the fake
+    /// one.
+    pub catalog: Option<Arc<spoolframe_server::catalog::LiveCatalog>>,
+    /// When and how frame previews are made (P3-13). Never, unless a test
+    /// is about them: a playback would start making some.
+    pub previews: PreviewSettings,
+    /// The ffmpeg previews are made with: real, or a stand-in script.
+    pub previews_ffmpeg: PathBuf,
 }
 
 impl Default for ServerOptions {
@@ -517,6 +558,13 @@ impl Default for ServerOptions {
             disconnect_grace: spoolframe_server::playback::DISCONNECT_GRACE,
             public_url: None,
             not_set_up: false,
+            catalog: None,
+            previews: PreviewSettings {
+                when: When::Never,
+                interval: Duration::from_secs(10),
+                cache_limit_bytes: 1 << 30,
+            },
+            previews_ffmpeg: PathBuf::from("ffmpeg"),
         }
     }
 }
@@ -601,10 +649,12 @@ impl TestServer {
             old_keys: Mutex::default(),
             calls: Mutex::default(),
         });
-        let catalog: Arc<dyn Catalog> = if options.not_set_up {
-            Arc::new(spoolframe_server::catalog::LiveCatalog::default())
-        } else {
-            fake.clone()
+        let catalog: Arc<dyn Catalog> = match &options.catalog {
+            Some(live) => live.clone(),
+            None if options.not_set_up => {
+                Arc::new(spoolframe_server::catalog::LiveCatalog::default())
+            }
+            None => fake.clone(),
         };
         let artwork =
             ArtworkCache::open(&dir.join("cache/artwork"), 64 << 20, catalog.clone()).unwrap();
@@ -647,6 +697,18 @@ impl TestServer {
             prober.clone(),
             WatchRules::default(),
         ));
+        let previews = Previews::start(
+            &dir.join("cache").join("previews"),
+            options.previews.clone(),
+            PreviewSources {
+                catalog: catalog.clone(),
+                prober: prober.clone(),
+                transcoding: transcoding(),
+                ffmpeg: options.previews_ffmpeg.clone(),
+            },
+        )
+        .unwrap();
+        spoolframe_server::previews::ahead::spawn(&previews, catalog.clone(), store.clone());
         let auth = Auth::with_failure_window(store.clone(), options.failure_window)
             .with_sign_in_lifetime(options.sign_in_lifetime);
         let services = Services {
@@ -663,6 +725,7 @@ impl TestServer {
             transcoding: transcoding(),
             jobs: Arc::new(jobs),
             subtitles: Arc::new(subtitles),
+            previews,
         };
         let endpoint = EndpointOptions {
             port: options.port,

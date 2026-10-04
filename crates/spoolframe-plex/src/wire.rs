@@ -22,16 +22,42 @@ pub struct MediaContainer {
     /// The library the items belong to, on item and listing responses.
     /// Library-scoped path mappings match on it.
     pub library_section_title: Option<String>,
+    /// That library's key, on the same responses.
+    #[serde(rename = "librarySectionID", default)]
+    pub library_section_id: Option<SectionKey>,
     /// What the PMS calls itself, on its root (`/`).
     pub friendly_name: Option<String>,
     /// The PMS's version, on its root (`/`).
     pub version: Option<String>,
+    /// The PMS's own id, on `/identity`: what plex.tv's resources list
+    /// knows it by (P3-12).
+    pub machine_identifier: Option<String>,
     #[serde(rename = "Directory", default)]
     pub directories: Vec<Directory>,
     #[serde(rename = "Metadata", default)]
     pub metadata: Vec<Metadata>,
     #[serde(rename = "Hub", default)]
     pub hubs: Vec<Hub>,
+}
+
+/// A library section's key. Plex sends it as a string in
+/// `/library/sections` and as a number on items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionKey(pub String);
+
+impl<'de> Deserialize<'de> for SectionKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Number(u64),
+            Text(String),
+        }
+        Ok(SectionKey(match Either::deserialize(d)? {
+            Either::Number(n) => n.to_string(),
+            Either::Text(s) => s,
+        }))
+    }
 }
 
 /// A library section in `/library/sections`. Other listings also use
@@ -57,8 +83,27 @@ pub struct Location {
 /// One group of `/hubs/search` results.
 #[derive(Debug, Deserialize)]
 pub struct Hub {
-    #[serde(rename = "Metadata", default)]
-    pub metadata: Vec<Metadata>,
+    /// What the hub holds: `movie`, `episode`, `actor`, `director`…
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    /// The people in an `actor` or `director` hub.
+    #[serde(rename = "Directory", default)]
+    pub tags: Vec<HubTag>,
+}
+
+/// A person in a search hub: a tag, with the section Plex found them in.
+/// Plex lists one person once per section.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubTag {
+    /// Their name.
+    pub tag: String,
+    /// The tag's id: what a listing is filtered by (`actor=<id>`).
+    pub id: u64,
+    /// How many items in that section they are in.
+    pub count: Option<u32>,
+    #[serde(rename = "librarySectionID", default)]
+    pub library_section_id: Option<SectionKey>,
 }
 
 /// An item of any kind; which fields are set depends on `type`.
@@ -102,6 +147,13 @@ pub struct Metadata {
     pub view_count: Option<u32>,
     pub view_offset: Option<u64>,
     pub last_viewed_at: Option<i64>,
+    /// When it came into the library (Unix s): recently added from several
+    /// Plex servers is merged by it (P3-11).
+    pub added_at: Option<i64>,
+    /// The library it is in. Listings that mix libraries (recently added,
+    /// search) have it on every item.
+    #[serde(rename = "librarySectionID", default)]
+    pub library_section_id: Option<SectionKey>,
     /// The intros, credits and the like Plex found in the item; only on
     /// single-item responses asked with `includeMarkers=1`, and absent
     /// without Plex Pass or with detection off. Each is read as a
@@ -143,5 +195,9 @@ pub struct Media {
 /// One file of a version.
 #[derive(Debug, Deserialize)]
 pub struct Part {
+    pub id: Option<u64>,
     pub file: Option<String>,
+    /// The preview indexes Plex made of it: `sd` when it has its "video
+    /// preview thumbnails" (P3-13).
+    pub indexes: Option<String>,
 }

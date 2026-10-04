@@ -1,0 +1,249 @@
+{
+  "query": "keanu",
+  "replies": [
+    {
+      "path": "/library/sections/2/search",
+      "type": "1",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/1/search",
+      "type": "2",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/1/search",
+      "type": "4",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "8",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "9",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "10",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/hubs/search",
+      "type": null,
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "Hub": [
+            {
+              "type": "actor",
+              "size": 6,
+              "Directory": [
+                {
+                  "tag": "Keanu Reeves",
+                  "id": 134469,
+                  "count": 7,
+                  "librarySectionID": 2
+                },
+                {
+                  "tag": "Keanu Karim",
+                  "id": 252503,
+                  "count": 1,
+                  "librarySectionID": 2
+                },
+                {
+                  "tag": "Keanu Lam",
+                  "id": 237634,
+                  "count": 1,
+                  "librarySectionID": 2
+                },
+                {
+                  "tag": "Keanush Tafreshi",
+                  "id": 251228,
+                  "count": 1,
+                  "librarySectionID": 1
+                },
+                {
+                  "tag": "Keanu Reeves",
+                  "id": 134469,
+                  "count": 2,
+                  "librarySectionID": 1
+                },
+                {
+                  "tag": "Cisco Keanu Hoberock",
+                  "id": 253051,
+                  "count": 1,
+                  "librarySectionID": 2
+                }
+              ]
+            },
+            {
+              "type": "show",
+              "size": 1,
+              "Metadata": [
+                {
+                  "ratingKey": "228782",
+                  "type": "show",
+                  "title": "The Agency (2024)",
+                  "year": 2024,
+                  "index": 1,
+                  "librarySectionID": 1
+                }
+              ]
+            },
+            {
+              "type": "artist",
+              "size": 0
+            },
+            {
+              "type": "album",
+              "size": 0
+            },
+            {
+              "type": "episode",
+              "size": 0
+            },
+            {
+              "type": "movie",
+              "size": 7,
+              "Metadata": [
+                {
+                  "ratingKey": "152544",
+                  "type": "movie",
+                  "title": "John Wick: Chapter 3 - Parabellum",
+                  "year": 2019,
+                  "librarySectionID": 2
+                },
+                {
+                  "ratingKey": "229121",
+                  "type": "movie",
+                  "title": "Toy Story 5",
+                  "year": 2026,
+                  "librarySectionID": 2
+                },
+                {
+                  "ratingKey": "194558",
+                  "type": "movie",
+                  "title": "John Wick: Chapter 4",
+                  "year": 2023,
+                  "librarySectionID": 2
+                },
+                {
+                  "ratingKey": "219440",
+                  "type": "movie",
+                  "title": "Ballerina",
+                  "year": 2025,
+                  "librarySectionID": 2
+                },
+                {
+                  "ratingKey": "225937",
+                  "type": "movie",
+                  "title": "Good Fortune",
+                  "year": 2025,
+                  "librarySectionID": 2
+                },
+                {
+                  "ratingKey": "152173",
+                  "type": "movie",
+                  "title": "Bill & Ted Face the Music",
+                  "year": 2020,
+                  "librarySectionID": 2
+                },
+                {
+                  "ratingKey": "221472",
+                  "type": "movie",
+                  "title": "47 Ronin",
+                  "year": 2013,
+                  "librarySectionID": 2
+                }
+              ]
+            },
+            {
+              "type": "track",
+              "size": 0
+            },
+            {
+              "type": "photoalbum",
+              "size": 0
+            },
+            {
+              "type": "autotag",
+              "size": 0
+            },
+            {
+              "type": "photo",
+              "size": 0
+            },
+            {
+              "type": "tag",
+              "size": 0
+            },
+            {
+              "type": "director",
+              "size": 0
+            },
+            {
+              "type": "genre",
+              "size": 0
+            },
+            {
+              "type": "collection",
+              "size": 0
+            },
+            {
+              "type": "playlist",
+              "size": 0
+            },
+            {
+              "type": "shared",
+              "size": 0
+            },
+            {
+              "type": "place",
+              "size": 0
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

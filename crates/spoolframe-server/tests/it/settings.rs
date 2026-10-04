@@ -14,7 +14,10 @@ use spoolframe_server::admin::{
 use spoolframe_server::auth::Auth;
 use spoolframe_server::catalog::LiveCatalog;
 use spoolframe_server::config::ServerConfig;
+use spoolframe_server::config::WatchSyncConfig;
 use spoolframe_server::config::layers::{Layers, Locations};
+use spoolframe_server::plex_accounts::{PlexAccounts, configured_owner};
+use spoolframe_server::plex_sync::WatchSync;
 use spoolframe_server::runtime::{Live, RuntimeSettings};
 use spoolframe_server::store::Store;
 use wiremock::matchers::{method, path};
@@ -24,7 +27,10 @@ use crate::admin::{CODE, admin, anonymous, code, setup, state_dir, with_token};
 
 /// The admin API with runtime settings over the provided file `file`, and
 /// its first admin.
-async fn served(test: &str, file: &str) -> (SocketAddr, WsClient, spoolframe_test_dir::TestDir) {
+pub(crate) async fn served(
+    test: &str,
+    file: &str,
+) -> (SocketAddr, WsClient, spoolframe_test_dir::TestDir) {
     let (addr, dir) = served_with(test, file, Wizard::default()).await;
     let token = anonymous(addr)
         .await
@@ -49,6 +55,18 @@ pub(crate) async fn served_with(
 
 /// The admin API over the state in `dir`, as a server (re)started there.
 pub(crate) async fn serve_in(dir: &std::path::Path, file: &str, wizard: Wizard) -> SocketAddr {
+    serve_syncing(dir, file, wizard, false).await.0
+}
+
+/// [`serve_in`], with its store and Plex watch sync, whose scheduled runs
+/// are started only with `start`: otherwise runs are only the ones a test
+/// asks for.
+pub(crate) async fn serve_syncing(
+    dir: &std::path::Path,
+    file: &str,
+    wizard: Wizard,
+    start: bool,
+) -> (SocketAddr, Store) {
     let file_path = dir.join("server.ucl");
     std::fs::write(&file_path, file).unwrap();
     let layers = Layers::load(&Locations {
@@ -74,12 +92,41 @@ pub(crate) async fn serve_in(dir: &std::path::Path, file: &str, wizard: Wizard) 
         false,
     );
     let auth = Auth::new(Store::open(dir).await.unwrap());
+    let owner = configured_owner(&settings.layers().config().unwrap(), auth.store())
+        .await
+        .unwrap();
+    let config = settings.layers().config().unwrap();
+    let accounts = Arc::new(PlexAccounts::new(
+        secrets,
+        auth.store().clone(),
+        wizard.plex_site(),
+        owner,
+    ));
+    let sync = Arc::new(WatchSync::new(
+        catalog.clone(),
+        accounts.clone(),
+        config.watch.rules().unwrap().started_after,
+        config
+            .plex
+            .as_ref()
+            .map_or(WatchSyncConfig::DEFAULT_INTERVAL, |p| p.sync_interval()),
+    ));
+    if start {
+        // Nothing saves watch state through `Watch` here: no changes.
+        let (never, changes) = tokio::sync::broadcast::channel(1);
+        sync.start(changes);
+        // Closed, the runs would stop after the first.
+        std::mem::forget(never);
+    }
+    let store = auth.store().clone();
     let (addr, handle) = admin::serve(
         "127.0.0.1:0".parse().unwrap(),
         Admin {
             plex: catalog,
             cookies,
             settings: Some(Arc::new(settings)),
+            accounts: Some(accounts),
+            plex_sync: Some(sync),
             wizard,
             ..admin(auth, Some(SetupCode::new(CODE)))
         },
@@ -89,7 +136,7 @@ pub(crate) async fn serve_in(dir: &std::path::Path, file: &str, wizard: Wizard) 
     .await
     .unwrap();
     std::mem::forget(handle);
-    addr
+    (addr, store)
 }
 
 /// A PMS with one movie, whose file Plex has at `/data/movies/a.mkv`.

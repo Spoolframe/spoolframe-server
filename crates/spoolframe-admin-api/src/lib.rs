@@ -372,17 +372,146 @@ pub struct PlexStatus {
     pub version: Option<String>,
     /// Where the server reaches it: `plex.url`, without the token.
     pub url: Option<String>,
+    /// Every library section Spoolframe can serve, served or not.
     #[serde(default)]
     pub libraries: Vec<LibraryStatus>,
+    /// The titles of its sections Spoolframe does not serve (photos,
+    /// other videos), with what they hold: `Photos · photo`.
+    #[serde(default)]
+    pub unsupported: Vec<UnsupportedSection>,
 }
 
+/// One library section of a Plex server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryStatus {
+    /// Its key in Plex (P3-11): what `libraryAdd` takes.
+    pub section: String,
+    /// Plex's name for it.
     pub title: String,
     pub kind: spoolframe_types::LibraryKind,
     /// Its top-level items: movies, shows or artists.
     pub items: u32,
+    /// The Spoolframe library it is, when it is one.
+    pub library: Option<String>,
+}
+
+/// A library section Spoolframe does not serve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnsupportedSection {
+    pub title: String,
+    /// Plex's `type`: `photo`, `clip`.
+    pub plex_type: Option<String>,
+}
+
+/// The libraries clients see and the Plex servers they come from (P3-11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibrariesOverview {
+    /// In the order clients show them.
+    pub libraries: Vec<LibraryEntry>,
+    /// The first server first.
+    pub servers: Vec<PlexServerEntry>,
+    /// Libraries have been chosen. While not, every library of the first
+    /// Plex server is served under Plex's names, and the first change
+    /// chooses them all before it is made.
+    pub chosen: bool,
+    /// The locked config file sets the libraries: only it can change them.
+    pub locked: bool,
+}
+
+/// One library as clients see it, and how it is doing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryEntry {
+    /// What clients know it by: `plex:2`, `plex:cabin:1`.
+    pub id: String,
+    /// Spoolframe's name for it.
+    pub name: String,
+    pub kind: spoolframe_types::LibraryKind,
+    /// Its Plex server's id, and what Spoolframe calls that server.
+    pub server: String,
+    pub server_name: String,
+    /// Its section's key in Plex, and Plex's name for it when the server
+    /// answers.
+    pub section: String,
+    pub plex_title: Option<String>,
+    /// Its top-level items, when the server answers.
+    pub items: Option<u32>,
+    /// A few of its media files checked with the saved path mappings.
+    pub paths: Option<LibraryPathCheck>,
+    /// Why it is unavailable: its server is down, or no longer has it.
+    pub error: Option<String>,
+    /// Which way its watch state syncs with linked Plex accounts (P3-12).
+    pub sync: SyncDirection,
+}
+
+/// Which way a library's watch state is synced with each linked user's
+/// Plex account (P3-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncDirection {
+    /// Spoolframe keeps its own watched state.
+    Off,
+    /// Plays in Plex mark things watched here; nothing is written to Plex.
+    FromPlex,
+    /// Plays here mark things watched in Plex; nothing is taken from it.
+    ToPlex,
+    /// Both ways: the newer change wins, and nothing bounces back.
+    Both,
+}
+
+impl SyncDirection {
+    /// Plex's state is taken into Spoolframe.
+    pub fn pulls(self) -> bool {
+        matches!(self, SyncDirection::FromPlex | SyncDirection::Both)
+    }
+
+    /// Spoolframe's state is sent to Plex.
+    pub fn pushes(self) -> bool {
+        matches!(self, SyncDirection::ToPlex | SyncDirection::Both)
+    }
+
+    /// As the config file says it: `off`, `from_plex`, `to_plex`, `both`.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            SyncDirection::Off => "off",
+            SyncDirection::FromPlex => "from_plex",
+            SyncDirection::ToPlex => "to_plex",
+            SyncDirection::Both => "both",
+        }
+    }
+
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        [
+            SyncDirection::Off,
+            SyncDirection::FromPlex,
+            SyncDirection::ToPlex,
+            SyncDirection::Both,
+        ]
+        .into_iter()
+        .find(|d| d.config_name() == name)
+    }
+}
+
+/// A Plex server the libraries come from (P3-11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexServerEntry {
+    /// `plex` for the first, else the id it was added under.
+    pub id: String,
+    /// What Spoolframe calls it: Plex's own name when it was added.
+    pub name: String,
+    /// Reachable or not, and its sections, served or not.
+    pub status: PlexStatus,
+    /// The server has a token for it (the token itself is never shown).
+    pub token_set: bool,
+    /// The locked config file says where its token is.
+    pub token_locked: bool,
+    /// The locked config file sets it: only that file can change it.
+    pub locked: bool,
+    pub path_mapping: Vec<PathMappingEntry>,
 }
 
 /// One library's media paths, checked (P1-04).
@@ -524,6 +653,99 @@ pub enum PlexPinState {
     Expired,
 }
 
+/// A user's link to their Plex account (P3-12). The token never leaves
+/// the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexLink {
+    /// The Plex account's username and email, as plex.tv said when it was
+    /// linked; both `None` for a link the config makes.
+    pub username: Option<String>,
+    pub email: Option<String>,
+    /// Linked by the server's config file (`plex.watch_sync.user`) as the
+    /// Plex servers' owner, with each server's own token: only that file
+    /// can unlink it.
+    pub by_config: bool,
+    /// When it was linked, Unix seconds; `None` for the config's.
+    pub linked_at: Option<i64>,
+}
+
+/// Where linking a Plex account is (`me.plexLinkCheck`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum PlexLinkState {
+    /// Not approved at plex.tv yet: ask again in a few seconds.
+    Waiting,
+    /// Linked: the token is kept as the user's secret.
+    Linked { link: PlexLink },
+    /// plex.tv has forgotten the PIN (it expired, or was not allowed):
+    /// nothing was linked.
+    Expired,
+}
+
+/// A user and their Plex link, for the admin's Plex sync panel and user
+/// page, and for My profile (P3-12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexUser {
+    pub username: String,
+    pub display_name: Option<String>,
+    /// `None`: not linked, and not synced.
+    pub link: Option<PlexLink>,
+    /// Their last sync run since the server started, if any.
+    pub last_run: Option<PlexSyncRun>,
+    /// A run of theirs is going on now.
+    pub running: bool,
+}
+
+/// What one user's sync run did (P3-12).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexSyncRun {
+    /// When it ended, Unix seconds.
+    pub at: i64,
+    /// The libraries synced.
+    pub libraries: u32,
+    /// Items whose state was taken from Plex, sent to Plex, left as they
+    /// were (the same on both sides, or held back by a library's
+    /// direction), and that failed.
+    pub pulled: u32,
+    pub pushed: u32,
+    pub skipped: u32,
+    pub failed: u32,
+    /// What was skipped whole, for people: "Cabin movies skipped: Cabin
+    /// can't be reached".
+    pub notes: Vec<String>,
+}
+
+/// Every user, their Plex link and their last run (P3-12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexSyncOverview {
+    /// How often each linked user is synced when nothing changes.
+    pub interval_secs: u64,
+    pub users: Vec<PlexUser>,
+}
+
+/// A Plex Media Server the caller's linked Plex account reaches, for
+/// adding its libraries (P3-11's "From your Plex account").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexAccountServer {
+    pub name: String,
+    /// Plex's id for it (its machine identifier).
+    pub machine_id: String,
+    /// The address to add it by: one on the LAN if plex.tv knows one, else
+    /// a direct one; `None` when it is reachable only through Plex's relay.
+    pub url: Option<String>,
+    /// `url` is on the LAN.
+    pub local: bool,
+    /// The account's own server, rather than one shared with it.
+    pub owned: bool,
+    /// The id it is added under here, if it is.
+    pub added: Option<String>,
+}
+
 /// One `plex.path_mapping` rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -552,13 +774,19 @@ pub struct LibraryPathCheck {
     pub suggestion: Option<PathMappingEntry>,
 }
 
-/// What a Plex watch sync run did, or would do (PX-04): one line per item.
+/// What one user's Plex watch sync run did, or would do (PX-04, P3-12):
+/// one line per item.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlexSyncReport {
+    pub username: String,
     pub pulled: Vec<String>,
     pub pushed: Vec<String>,
     pub failed: Vec<String>,
+    /// Items left as they were.
+    pub skipped: u32,
+    /// What was skipped whole, as `PlexSyncRun.notes`.
+    pub notes: Vec<String>,
 }
 
 /// The caller's own account, for every role.
@@ -707,6 +935,28 @@ pub trait MeApi {
     /// last way to sign in stays (`LAST_SIGN_IN_METHOD`).
     #[method(name = "passkeyRemove", with_extensions)]
     async fn passkey_remove(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// The caller, their Plex link and their last sync run (P3-12).
+    #[method(name = "plexLink", with_extensions)]
+    async fn plex_link(&self) -> jsonrpsee::core::RpcResult<PlexUser>;
+
+    /// Begin linking the caller's Plex account: a plex.tv PIN, whose
+    /// `authUrl` the page opens. `UNAVAILABLE` when plex.tv cannot be
+    /// reached.
+    #[method(name = "plexLinkBegin", with_extensions)]
+    async fn plex_link_begin(&self) -> jsonrpsee::core::RpcResult<PlexPin>;
+
+    /// Whether the PIN is approved yet; once it is, the account's token is
+    /// kept as the caller's secret and their state syncs with it. Only a
+    /// PIN the caller began (`INVALID_INPUT` otherwise).
+    #[method(name = "plexLinkCheck", with_extensions)]
+    async fn plex_link_check(&self, id: u64) -> jsonrpsee::core::RpcResult<PlexLinkState>;
+
+    /// Unlink the caller's Plex account: the token is deleted and their
+    /// state stops syncing. Watch state stays as it is on both sides.
+    /// `NOT_CONFIGURED` for a link the config file makes.
+    #[method(name = "plexUnlink", with_extensions)]
+    async fn plex_unlink(&self) -> jsonrpsee::core::RpcResult<()>;
 }
 
 /// Other users and the server: admins only.
@@ -843,10 +1093,32 @@ pub trait AdminApi {
     #[method(name = "serverStatus", with_extensions)]
     async fn server_status(&self) -> jsonrpsee::core::RpcResult<ServerStatus>;
 
-    /// Sync watch state with Plex now (PX-04); with `dryRun`, only say
-    /// what would change.
+    /// Sync `username`'s watch state with their Plex account now, or
+    /// every linked user's without one (P3-12), each in turn; with
+    /// `dryRun`, only say what would change. `NOT_CONFIGURED` for a user
+    /// who has not linked a Plex account.
     #[method(name = "plexWatchSync", with_extensions)]
-    async fn plex_watch_sync(&self, dry_run: bool) -> jsonrpsee::core::RpcResult<PlexSyncReport>;
+    async fn plex_watch_sync(
+        &self,
+        username: Option<String>,
+        dry_run: bool,
+    ) -> jsonrpsee::core::RpcResult<Vec<PlexSyncReport>>;
+
+    /// Every user, their Plex link and their last sync run (P3-12): who
+    /// is linked to which Plex account, and how their sync is going.
+    #[method(name = "plexSync", with_extensions)]
+    async fn plex_sync(&self) -> jsonrpsee::core::RpcResult<PlexSyncOverview>;
+
+    /// Unlink `username`'s Plex account, as `me.plexUnlink` does. An admin
+    /// can unlink, not link.
+    #[method(name = "userPlexUnlink", with_extensions)]
+    async fn user_plex_unlink(&self, username: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// The Plex servers the caller's linked Plex account reaches (P3-11's
+    /// "From your Plex account"): `NOT_CONFIGURED` without a link, and
+    /// `UNAVAILABLE` when plex.tv cannot be reached.
+    #[method(name = "plexAccountServers", with_extensions)]
+    async fn plex_account_servers(&self) -> jsonrpsee::core::RpcResult<Vec<PlexAccountServer>>;
 
     /// Every setting: its value, where it comes from, and whether it
     /// applies now or after a restart (P3-10).
@@ -914,10 +1186,101 @@ pub trait AdminApi {
     async fn plex_pin_check(&self, id: u64) -> jsonrpsee::core::RpcResult<PlexPinState>;
 
     /// A few media files of each library, checked with `mappings` instead
-    /// of the saved ones, with a suggested mapping where they fail.
+    /// of the saved ones, with a suggested mapping where they fail. Of
+    /// Plex server `server` (the first if left out), and of its sections
+    /// `sections` (its served ones if left out): a library about to be
+    /// added is checked before it is (P3-11).
     #[method(name = "plexPathCheck", with_extensions)]
     async fn plex_path_check(
         &self,
         mappings: Vec<PathMappingEntry>,
+        server: Option<String>,
+        sections: Option<Vec<String>>,
     ) -> jsonrpsee::core::RpcResult<Vec<LibraryPathCheck>>;
+
+    /// The libraries clients see and the Plex servers they come from, each
+    /// asked how it is doing now (P3-11). A server that is down is an
+    /// answer here, not an error.
+    #[method(name = "libraries", with_extensions)]
+    async fn libraries(&self) -> jsonrpsee::core::RpcResult<LibrariesOverview>;
+
+    /// Add section `section` of Plex server `server` as a library, last,
+    /// called `name` (Plex's name if left out); its id. The server must
+    /// answer, to say what the section holds. `INVALID_INPUT` for a
+    /// section that is a library already, or that Spoolframe cannot
+    /// serve.
+    #[method(name = "libraryAdd", with_extensions)]
+    async fn library_add(
+        &self,
+        server: String,
+        section: String,
+        name: Option<String>,
+    ) -> jsonrpsee::core::RpcResult<String>;
+
+    /// Call library `id` `name` in Spoolframe; Plex keeps its own name.
+    #[method(name = "libraryRename", with_extensions)]
+    async fn library_rename(&self, id: String, name: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Put library `id` at `position` (0 is first) in the order clients
+    /// show.
+    #[method(name = "libraryMove", with_extensions)]
+    async fn library_move(&self, id: String, position: u32) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Sync library `id`'s watch state with linked Plex accounts this way
+    /// (P3-12).
+    #[method(name = "librarySetSync", with_extensions)]
+    async fn library_set_sync(
+        &self,
+        id: String,
+        sync: SyncDirection,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Stop serving library `id`. Its watch state is kept: adding it back
+    /// restores it. Nothing changes in Plex.
+    #[method(name = "libraryRemove", with_extensions)]
+    async fn library_remove(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Add the Plex server at `url`, with `token`, or else the one the
+    /// caller's linked Plex account has for that server (P3-12), or else
+    /// the token the first server has, which works for every server of its
+    /// account.
+    /// It must answer; it is named by what it calls itself. Without a
+    /// first server, it becomes the first. No library is added.
+    #[method(name = "plexServerAdd", with_extensions)]
+    async fn plex_server_add(
+        &self,
+        url: String,
+        token: Option<String>,
+    ) -> jsonrpsee::core::RpcResult<PlexServerEntry>;
+
+    /// Change where Plex server `id` is reached, or what it is called.
+    #[method(name = "plexServerUpdate", with_extensions)]
+    async fn plex_server_update(
+        &self,
+        id: String,
+        url: Option<String>,
+        name: Option<String>,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Keep `token` as Plex server `id`'s, as a secret.
+    #[method(name = "plexServerSetToken", with_extensions)]
+    async fn plex_server_set_token(
+        &self,
+        id: String,
+        token: String,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Set Plex server `id`'s path mappings.
+    #[method(name = "plexServerSetPaths", with_extensions)]
+    async fn plex_server_set_paths(
+        &self,
+        id: String,
+        mappings: Vec<PathMappingEntry>,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Remove Plex server `id`, its libraries and its token. Their watch
+    /// state is kept. The first server cannot be removed (`INVALID_INPUT`):
+    /// its address and token can be changed.
+    #[method(name = "plexServerRemove", with_extensions)]
+    async fn plex_server_remove(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
 }

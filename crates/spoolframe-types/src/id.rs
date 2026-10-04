@@ -28,12 +28,16 @@ pub enum IdError {
 pub enum Namespace {
     /// An item in the Plex library; the key is its Plex `ratingKey`.
     Plex,
+    /// Something the server made itself rather than a catalog: a sheet of
+    /// frame previews (P3-13), an [`ArtworkId`] like `preview:<set>/<n>`.
+    Preview,
 }
 
 impl Namespace {
     fn as_str(self) -> &'static str {
         match self {
             Namespace::Plex => "plex",
+            Namespace::Preview => "preview",
         }
     }
 }
@@ -44,6 +48,7 @@ impl FromStr for Namespace {
     fn from_str(s: &str) -> Result<Self, IdError> {
         match s {
             "plex" => Ok(Namespace::Plex),
+            "preview" => Ok(Namespace::Preview),
             other => Err(IdError::UnknownNamespace(other.to_owned())),
         }
     }
@@ -253,6 +258,12 @@ namespaced_id!(
     ArtworkId
 );
 
+namespaced_id!(
+    /// A person a search found (P3-09), whose items can be listed:
+    /// `<namespace>:<key>`.
+    PersonId
+);
+
 impl TryFrom<String> for MediaId {
     type Error = IdError;
 
@@ -341,6 +352,14 @@ mod tests {
     fn an_artwork_id_keeps_a_path_like_key() {
         let id: ArtworkId = "plex:/library/metadata/123/thumb/1699".parse().unwrap();
         assert_eq!(id.key(), "/library/metadata/123/thumb/1699");
+    }
+
+    #[test]
+    fn a_preview_sheet_s_id_is_in_a_namespace_of_its_own() {
+        let id: ArtworkId = "preview:0f3a/2".parse().unwrap();
+        assert_eq!(id.namespace(), Namespace::Preview);
+        assert_eq!(id.key(), "0f3a/2");
+        assert_eq!(id.to_string(), "preview:0f3a/2");
     }
 
     #[test]

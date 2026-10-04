@@ -1,44 +1,58 @@
 //! The catalog the server serves from, as it is now (P3-10): none until
-//! the server is set up, and replaced whole when its Plex settings change,
-//! without a restart. Everything that reads the catalog holds this, so a
-//! change reaches the client protocol, the artwork cache, watch state and
-//! the admin API at once.
+//! the server is set up, and replaced whole when its Plex servers or
+//! libraries change (P3-11), without a restart. Everything that reads the
+//! catalog holds this, so a change reaches the client protocol, the
+//! artwork cache, watch state and the admin API at once.
+
+pub mod composite;
+pub mod ids;
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use spoolframe_catalog::{Catalog, CatalogError, Image, ItemPage, ItemWithChildren, Page};
+use spoolframe_catalog::{
+    Catalog, CatalogError, Found, Image, ItemPage, ItemWithChildren, Page, PreviewFrames,
+    SearchQuery,
+};
 use spoolframe_plex::PlexCatalog;
-use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId};
+use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId, PersonId};
 
-/// The Plex catalog now, if there is one. Every call without one is
+pub use composite::{Composite, PlexSource, Served, Synced};
+
+/// The libraries now, if there are any. Every call without them is
 /// [`CatalogError::NotSetUp`].
 #[derive(Debug, Default)]
 pub struct LiveCatalog {
-    plex: RwLock<Option<Arc<PlexCatalog>>>,
+    now: RwLock<Option<Arc<Composite>>>,
 }
 
 impl LiveCatalog {
-    pub fn new(plex: Option<Arc<PlexCatalog>>) -> Self {
+    pub fn new(now: Option<Arc<Composite>>) -> Self {
         Self {
-            plex: RwLock::new(plex),
+            now: RwLock::new(now),
         }
     }
 
-    /// The Plex catalog now. A call in progress keeps the one it began
-    /// with.
+    /// The Plex servers and libraries now. A call in progress keeps the
+    /// ones it began with.
+    pub fn composite(&self) -> Option<Arc<Composite>> {
+        self.now.read().expect("never held across a panic").clone()
+    }
+
+    /// The first Plex server's catalog now: the one PX-04's watch sync and
+    /// the wizard's Plex step are about.
     pub fn plex(&self) -> Option<Arc<PlexCatalog>> {
-        self.plex.read().expect("never held across a panic").clone()
+        self.composite().map(|c| c.first().catalog.clone())
     }
 
-    /// Serve from `plex` from now on; `None` is not set up.
-    pub fn replace(&self, plex: Option<Arc<PlexCatalog>>) {
-        *self.plex.write().expect("never held across a panic") = plex;
+    /// Serve from `now` from now on; `None` is not set up.
+    pub fn replace(&self, now: Option<Arc<Composite>>) {
+        *self.now.write().expect("never held across a panic") = now;
     }
 
-    fn current(&self) -> Result<Arc<PlexCatalog>, CatalogError> {
-        self.plex().ok_or(CatalogError::NotSetUp)
+    fn current(&self) -> Result<Arc<Composite>, CatalogError> {
+        self.composite().ok_or(CatalogError::NotSetUp)
     }
 }
 
@@ -60,8 +74,12 @@ impl Catalog for LiveCatalog {
         self.current()?.external_ids(id).await
     }
 
-    async fn search(&self, query: &str, limit: u32) -> Result<Vec<Item>, CatalogError> {
-        self.current()?.search(query, limit).await
+    async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
+        self.current()?.search(query).await
+    }
+
+    async fn person_items(&self, id: &PersonId) -> Result<Vec<Item>, CatalogError> {
+        self.current()?.person_items(id).await
     }
 
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
@@ -74,6 +92,10 @@ impl Catalog for LiveCatalog {
 
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
         self.current()?.artwork(id).await
+    }
+
+    async fn preview_frames(&self, id: &MediaId) -> Result<Option<PreviewFrames>, CatalogError> {
+        self.current()?.preview_frames(id).await
     }
 }
 
@@ -99,7 +121,7 @@ mod tests {
     async fn a_replaced_catalog_serves_the_next_call() {
         let live = LiveCatalog::default();
         let plex = PlexCatalog::new("http://127.0.0.1:9".parse().unwrap(), None).unwrap();
-        live.replace(Some(Arc::new(plex)));
+        live.replace(Some(Arc::new(Composite::single("Tower", plex))));
         // Plex is not there, but it is asked: the call is no longer
         // refused as not set up.
         assert!(matches!(

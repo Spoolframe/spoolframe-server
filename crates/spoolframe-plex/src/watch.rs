@@ -3,7 +3,11 @@
 //! Without a token, a LAN client of a PMS that allows it acts as the
 //! server's owner; with one, as the token's account. Either way it is one
 //! account. Plex only lists what that account has watched or started, so
-//! reading it needs no scan of the whole library.
+//! reading it needs no scan of the whole library. Each user's own account
+//! is a catalog with that account's token ([`PlexCatalog::with_token`],
+//! P3-12).
+
+use std::collections::HashSet;
 
 use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_types::{LibraryKind, MediaId, MediaKind, Namespace};
@@ -36,23 +40,34 @@ pub struct PlexWatch {
     pub external_ids: Vec<String>,
     /// For people: `Banshee S3E8 All the Wisdom I Got Left`, `Mutiny`.
     pub title: String,
+    /// The key of the library section it is in: what says which way it
+    /// syncs (P3-12).
+    pub section: String,
 }
 
 impl PlexCatalog {
     /// Every movie and episode the account has watched or has in
-    /// progress, in every movie and show library.
-    pub async fn watch_states(&self) -> Result<Vec<PlexWatch>, CatalogError> {
+    /// progress, in the movie and show sections with these keys, or with
+    /// `None` in every one, served or not: which ones sync is the caller's
+    /// to say (P3-12).
+    pub async fn watch_states(
+        &self,
+        sections: Option<&HashSet<String>>,
+    ) -> Result<Vec<PlexWatch>, CatalogError> {
         let mut found: Vec<PlexWatch> = Vec::new();
-        for library in self.libraries().await? {
+        for library in self.unrestricted().libraries().await? {
             let (kind, plex_type) = match library.kind {
                 LibraryKind::Movies => (MediaKind::Movie, "1"),
                 LibraryKind::Shows => (MediaKind::Episode, "4"),
                 _ => continue,
             };
             let section = plex_key(library.id.namespace(), library.id.key(), &library.id)?;
+            if sections.is_some_and(|wanted| !wanted.contains(section)) {
+                continue;
+            }
             for filter in [("unwatched", "0"), ("inProgress", "1")] {
                 for m in self.listing(section, plex_type, filter).await? {
-                    let watch = self.watch(kind, &m)?;
+                    let watch = self.watch(kind, section, &m)?;
                     // A rewatch in progress is in both lists.
                     match found.iter_mut().find(|w| w.id == watch.id) {
                         Some(seen) => {
@@ -92,7 +107,12 @@ impl PlexCatalog {
         }
     }
 
-    fn watch(&self, kind: MediaKind, m: &Metadata) -> Result<PlexWatch, CatalogError> {
+    fn watch(
+        &self,
+        kind: MediaKind,
+        section: &str,
+        m: &Metadata,
+    ) -> Result<PlexWatch, CatalogError> {
         let id = |kind, key: &str| {
             MediaId::new(Namespace::Plex, kind, key).map_err(|e| CatalogError::Backend {
                 url: self.base.clone(),
@@ -118,6 +138,7 @@ impl PlexCatalog {
                 }
                 _ => m.title.clone(),
             },
+            section: section.to_owned(),
         })
     }
 

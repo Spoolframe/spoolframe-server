@@ -273,7 +273,7 @@ async fn the_paths_step_checks_unsaved_mappings_and_suggests_one() {
     .await;
     let root = root(addr).await;
 
-    let unmapped = root.plex_path_check(vec![]).await.unwrap();
+    let unmapped = root.plex_path_check(vec![], None, None).await.unwrap();
     let movies = &unmapped[0];
     assert_eq!(movies.roots, ["/data/movies"]);
     assert_eq!((movies.checked, movies.ok), (1, 0));
@@ -287,17 +287,24 @@ async fn the_paths_step_checks_unsaved_mappings_and_suggests_one() {
         }
     );
 
-    let mapped = root.plex_path_check(vec![suggestion]).await.unwrap();
+    let mapped = root
+        .plex_path_check(vec![suggestion], None, None)
+        .await
+        .unwrap();
     assert_eq!((mapped[0].checked, mapped[0].ok), (1, 1));
     assert_eq!(mapped[0].suggestion, None);
     // Checked, not saved.
     assert!(!dir.as_ref().join("runtime.ucl").exists());
     let relative = root
-        .plex_path_check(vec![PathMappingEntry {
-            library: None,
-            from: "data".into(),
-            to: "/x".into(),
-        }])
+        .plex_path_check(
+            vec![PathMappingEntry {
+                library: None,
+                from: "data".into(),
+                to: "/x".into(),
+            }],
+            None,
+            None,
+        )
         .await
         .unwrap_err();
     assert_eq!(code(relative), error_code::INVALID_INPUT);

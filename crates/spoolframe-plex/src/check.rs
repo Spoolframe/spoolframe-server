@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use spoolframe_catalog::CatalogError;
 use spoolframe_types::LibraryKind;
 
-use crate::wire::Directory;
+use crate::wire::{Directory, SectionKey};
 use crate::{Call, PlexCatalog, convert, paths};
 
 /// How many failing paths a report keeps per kind of failure.
@@ -79,8 +79,8 @@ fn leaf_type(kind: LibraryKind) -> &'static str {
 }
 
 impl PlexCatalog {
-    /// Check the media paths of every library, or only of the one titled
-    /// `library`.
+    /// Check the media paths of every served library, or only of the one
+    /// titled `library`.
     pub async fn check_paths(
         &self,
         library: Option<&str>,
@@ -90,7 +90,9 @@ impl PlexCatalog {
         let sections = self.fetch(&call).await?.directories;
         let mut reports = Vec::new();
         for dir in &sections {
-            if library.is_some_and(|wanted| wanted != dir.title) {
+            if library.is_some_and(|wanted| wanted != dir.title)
+                || !self.serves(Some(&SectionKey(dir.key.clone())))
+            {
                 continue;
             }
             let Some(lib) = convert::library(dir).map_err(|e| self.converted(&call, e))? else {

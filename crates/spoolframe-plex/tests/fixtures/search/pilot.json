@@ -1,0 +1,469 @@
+{
+  "query": "pilot",
+  "replies": [
+    {
+      "path": "/library/sections/2/search",
+      "type": "1",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/1/search",
+      "type": "2",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/1/search",
+      "type": "4",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 14,
+          "Metadata": [
+            {
+              "ratingKey": "225946",
+              "type": "episode",
+              "title": "Pilot",
+              "year": 2013,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "225945",
+              "grandparentRatingKey": "225944",
+              "grandparentTitle": "The Americans (2013)",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "229056",
+              "type": "episode",
+              "title": "Pilot",
+              "year": 2013,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "229055",
+              "grandparentRatingKey": "229054",
+              "grandparentTitle": "Banshee",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "195873",
+              "type": "episode",
+              "title": "Pilot",
+              "year": 2013,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "195872",
+              "grandparentRatingKey": "195871",
+              "grandparentTitle": "Brooklyn Nine-Nine",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "228631",
+              "type": "episode",
+              "title": "Pilot",
+              "year": 2021,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "228618",
+              "grandparentRatingKey": "228617",
+              "grandparentTitle": "Ginny & Georgia",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "229305",
+              "type": "episode",
+              "title": "Pilot",
+              "year": 2009,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "229304",
+              "grandparentRatingKey": "229303",
+              "grandparentTitle": "The Good Wife",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "225909",
+              "type": "episode",
+              "title": "The Pilot",
+              "year": 2025,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "225908",
+              "grandparentRatingKey": "225907",
+              "grandparentTitle": "IT: Welcome to Derry",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "229119",
+              "type": "episode",
+              "title": "Pilot",
+              "year": 2026,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "229118",
+              "grandparentRatingKey": "229117",
+              "grandparentTitle": "Lanterns",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "229299",
+              "type": "episode",
+              "title": "Pilot",
+              "year": 2010,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "229298",
+              "grandparentRatingKey": "229297",
+              "grandparentTitle": "Louie (2010)",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "193550",
+              "type": "episode",
+              "title": "Pilot",
+              "year": 2023,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "193549",
+              "grandparentRatingKey": "193548",
+              "grandparentTitle": "Lucky Hank",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "208815",
+              "type": "episode",
+              "title": "Pilot",
+              "year": 2009,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "208814",
+              "grandparentRatingKey": "208813",
+              "grandparentTitle": "Parks and Recreation",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "228427",
+              "type": "episode",
+              "title": "Pilot",
+              "year": 2018,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "228426",
+              "grandparentRatingKey": "228425",
+              "grandparentTitle": "LA to Vegas",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "228432",
+              "type": "episode",
+              "title": "Two and a Half Pilots",
+              "year": 2018,
+              "index": 3,
+              "parentIndex": 1,
+              "parentRatingKey": "228426",
+              "grandparentRatingKey": "228425",
+              "grandparentTitle": "LA to Vegas",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "228435",
+              "type": "episode",
+              "title": "#Pilotfight",
+              "year": 2018,
+              "index": 6,
+              "parentIndex": 1,
+              "parentRatingKey": "228426",
+              "grandparentRatingKey": "228425",
+              "grandparentTitle": "LA to Vegas",
+              "parentTitle": "Season 1"
+            },
+            {
+              "ratingKey": "202197",
+              "type": "episode",
+              "title": "Pilot",
+              "year": 2021,
+              "index": 1,
+              "parentIndex": 1,
+              "parentRatingKey": "202196",
+              "grandparentRatingKey": "202195",
+              "grandparentTitle": "Yellowjackets",
+              "parentTitle": "Season 1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "8",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "9",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "10",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 0,
+          "Metadata": []
+        }
+      }
+    },
+    {
+      "path": "/hubs/search",
+      "type": null,
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "Hub": [
+            {
+              "type": "episode",
+              "size": 10,
+              "Metadata": [
+                {
+                  "ratingKey": "228631",
+                  "type": "episode",
+                  "title": "Pilot",
+                  "year": 2021,
+                  "index": 1,
+                  "parentIndex": 1,
+                  "parentRatingKey": "228618",
+                  "grandparentRatingKey": "228617",
+                  "grandparentTitle": "Ginny & Georgia",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "225946",
+                  "type": "episode",
+                  "title": "Pilot",
+                  "year": 2013,
+                  "index": 1,
+                  "parentIndex": 1,
+                  "parentRatingKey": "225945",
+                  "grandparentRatingKey": "225944",
+                  "grandparentTitle": "The Americans (2013)",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "229056",
+                  "type": "episode",
+                  "title": "Pilot",
+                  "year": 2013,
+                  "index": 1,
+                  "parentIndex": 1,
+                  "parentRatingKey": "229055",
+                  "grandparentRatingKey": "229054",
+                  "grandparentTitle": "Banshee",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "195873",
+                  "type": "episode",
+                  "title": "Pilot",
+                  "year": 2013,
+                  "index": 1,
+                  "parentIndex": 1,
+                  "parentRatingKey": "195872",
+                  "grandparentRatingKey": "195871",
+                  "grandparentTitle": "Brooklyn Nine-Nine",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "229299",
+                  "type": "episode",
+                  "title": "Pilot",
+                  "year": 2010,
+                  "index": 1,
+                  "parentIndex": 1,
+                  "parentRatingKey": "229298",
+                  "grandparentRatingKey": "229297",
+                  "grandparentTitle": "Louie (2010)",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "229119",
+                  "type": "episode",
+                  "title": "Pilot",
+                  "year": 2026,
+                  "index": 1,
+                  "parentIndex": 1,
+                  "parentRatingKey": "229118",
+                  "grandparentRatingKey": "229117",
+                  "grandparentTitle": "Lanterns",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "208815",
+                  "type": "episode",
+                  "title": "Pilot",
+                  "year": 2009,
+                  "index": 1,
+                  "parentIndex": 1,
+                  "parentRatingKey": "208814",
+                  "grandparentRatingKey": "208813",
+                  "grandparentTitle": "Parks and Recreation",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "229305",
+                  "type": "episode",
+                  "title": "Pilot",
+                  "year": 2009,
+                  "index": 1,
+                  "parentIndex": 1,
+                  "parentRatingKey": "229304",
+                  "grandparentRatingKey": "229303",
+                  "grandparentTitle": "The Good Wife",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "225909",
+                  "type": "episode",
+                  "title": "The Pilot",
+                  "year": 2025,
+                  "index": 1,
+                  "parentIndex": 1,
+                  "parentRatingKey": "225908",
+                  "grandparentRatingKey": "225907",
+                  "grandparentTitle": "IT: Welcome to Derry",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                },
+                {
+                  "ratingKey": "193550",
+                  "type": "episode",
+                  "title": "Pilot",
+                  "year": 2023,
+                  "index": 1,
+                  "parentIndex": 1,
+                  "parentRatingKey": "193549",
+                  "grandparentRatingKey": "193548",
+                  "grandparentTitle": "Lucky Hank",
+                  "parentTitle": "Season 1",
+                  "librarySectionID": 1
+                }
+              ]
+            },
+            {
+              "type": "actor",
+              "size": 1,
+              "Directory": [
+                {
+                  "tag": "Pilot Bunch",
+                  "id": 159421,
+                  "count": 4,
+                  "librarySectionID": 1
+                }
+              ]
+            },
+            {
+              "type": "show",
+              "size": 1,
+              "Metadata": [
+                {
+                  "ratingKey": "221624",
+                  "type": "show",
+                  "title": "Task",
+                  "year": 2025,
+                  "index": 1,
+                  "librarySectionID": 1
+                }
+              ]
+            },
+            {
+              "type": "artist",
+              "size": 0
+            },
+            {
+              "type": "album",
+              "size": 0
+            },
+            {
+              "type": "movie",
+              "size": 0
+            },
+            {
+              "type": "track",
+              "size": 0
+            },
+            {
+              "type": "photoalbum",
+              "size": 0
+            },
+            {
+              "type": "autotag",
+              "size": 0
+            },
+            {
+              "type": "photo",
+              "size": 0
+            },
+            {
+              "type": "tag",
+              "size": 0
+            },
+            {
+              "type": "director",
+              "size": 0
+            },
+            {
+              "type": "genre",
+              "size": 0
+            },
+            {
+              "type": "collection",
+              "size": 0
+            },
+            {
+              "type": "playlist",
+              "size": 0
+            },
+            {
+              "type": "shared",
+              "size": 0
+            },
+            {
+              "type": "place",
+              "size": 0
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

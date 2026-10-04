@@ -4,9 +4,13 @@
 //! its short code at plex.tv/link), and the server polls the PIN until
 //! plex.tv hands it the token.
 //!
+//! A linked account's token also lists the Plex servers it reaches, each
+//! with a token of its own for that server (P3-12).
+//!
 //! The only part of this crate that reaches the Internet, and only while
-//! someone signs in: the catalog itself talks to the PMS on the LAN alone
-//! (ARCHITECTURE §32). Both base URLs are given, so tests use a stand-in.
+//! someone signs in or a linked account's servers are looked up: the
+//! catalog itself talks to the PMS on the LAN alone (ARCHITECTURE §32).
+//! Both base URLs are given, so tests use a stand-in.
 
 use std::fmt;
 use std::time::Duration;
@@ -82,10 +86,75 @@ struct PinReply {
     auth_token: Option<String>,
 }
 
+/// Who a token signs in, as plex.tv says.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct PlexAccount {
+    pub username: Option<String>,
+    pub email: Option<String>,
+}
+
+/// A Plex Media Server an account reaches: its own, or one shared with it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PlexResource {
+    pub name: String,
+    /// The PMS's machine identifier (`/identity`).
+    pub machine_id: String,
+    /// The account's own server, rather than one shared with it.
+    pub owned: bool,
+    /// The token this account uses on this server: plex.tv hands out one
+    /// per server, which is how Plex's own apps reach a shared server.
+    /// Never shown or logged.
+    pub access_token: Option<String>,
+    /// Where it can be reached, the LAN's first.
+    pub connections: Vec<PlexConnection>,
+}
+
+impl fmt::Debug for PlexResource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlexResource")
+            .field("name", &self.name)
+            .field("machine_id", &self.machine_id)
+            .field("owned", &self.owned)
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("connections", &self.connections)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlexConnection {
+    pub uri: String,
+    /// On the server's own network.
+    pub local: bool,
+    /// Through Plex's relay: slow, and never what Spoolframe reads from.
+    pub relay: bool,
+}
+
 #[derive(Deserialize)]
-struct UserReply {
-    username: Option<String>,
-    email: Option<String>,
+#[serde(rename_all = "camelCase")]
+struct ResourceReply {
+    name: String,
+    #[serde(default)]
+    provides: String,
+    client_identifier: String,
+    #[serde(default)]
+    owned: bool,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    connections: Vec<ConnectionReply>,
+}
+
+#[derive(Deserialize)]
+struct ConnectionReply {
+    uri: String,
+    #[serde(default)]
+    local: bool,
+    #[serde(default)]
+    relay: bool,
 }
 
 impl PlexTv {
@@ -170,6 +239,12 @@ impl PlexTv {
 
     /// Who `token` signs in: the account's name, else its email.
     pub async fn account(&self, token: &str) -> Result<Option<String>, AccountError> {
+        let user = self.user(token).await?;
+        Ok(user.username.or(user.email))
+    }
+
+    /// Who `token` signs in: the account's name and email.
+    pub async fn user(&self, token: &str) -> Result<PlexAccount, AccountError> {
         let response = Self::send(
             self.request(reqwest::Method::GET, "/api/v2/user")
                 .header("X-Plex-Token", token),
@@ -178,11 +253,51 @@ impl PlexTv {
         if !response.status().is_success() {
             return Err(AccountError::Refused(response.status().to_string()));
         }
-        let user: UserReply = response
+        response
             .json()
             .await
-            .map_err(|e| AccountError::Refused(format!("an unreadable account: {e}")))?;
-        Ok(user.username.or(user.email))
+            .map_err(|e| AccountError::Refused(format!("an unreadable account: {e}")))
+    }
+
+    /// The Plex Media Servers `token`'s account reaches, its own and those
+    /// shared with it, each with the token it uses there.
+    pub async fn servers(&self, token: &str) -> Result<Vec<PlexResource>, AccountError> {
+        let response = Self::send(
+            self.request(reqwest::Method::GET, "/api/v2/resources")
+                .query(&[("includeHttps", "1"), ("includeRelay", "1")])
+                .header("X-Plex-Token", token),
+        )
+        .await?;
+        if !response.status().is_success() {
+            return Err(AccountError::Refused(response.status().to_string()));
+        }
+        let resources: Vec<ResourceReply> = response
+            .json()
+            .await
+            .map_err(|e| AccountError::Refused(format!("an unreadable server list: {e}")))?;
+        Ok(resources
+            .into_iter()
+            .filter(|r| r.provides.split(',').any(|p| p.trim() == "server"))
+            .map(|r| {
+                let mut connections: Vec<PlexConnection> = r
+                    .connections
+                    .into_iter()
+                    .map(|c| PlexConnection {
+                        uri: c.uri,
+                        local: c.local,
+                        relay: c.relay,
+                    })
+                    .collect();
+                connections.sort_by_key(|c| (c.relay, !c.local));
+                PlexResource {
+                    name: r.name,
+                    machine_id: r.client_identifier,
+                    owned: r.owned,
+                    access_token: r.access_token.filter(|t| !t.is_empty()),
+                    connections,
+                }
+            })
+            .collect())
     }
 }
 
@@ -247,6 +362,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_account_lists_its_servers_with_a_token_for_each_and_the_lan_first() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/resources"))
+            .and(header("X-Plex-Token", "tok-alice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "name": "Alice's phone", "provides": "client,player",
+                  "clientIdentifier": "phone", "owned": true, "connections": [] },
+                { "name": "Tower", "provides": "server", "clientIdentifier": "tower-machine",
+                  "owned": false, "accessToken": "alice-on-tower", "connections": [
+                    { "uri": "https://relay.plex.direct:8443", "local": false, "relay": true },
+                    { "uri": "https://1-2-3-4.tower.plex.direct:32400", "local": false, "relay": false },
+                    { "uri": "http://10.0.0.5:32400", "local": true, "relay": false }
+                ] }
+            ])))
+            .mount(&server)
+            .await;
+        let servers = plex_tv(&server).await.servers("tok-alice").await.unwrap();
+        assert_eq!(servers.len(), 1, "{servers:?}");
+        let tower = &servers[0];
+        assert_eq!(tower.machine_id, "tower-machine");
+        assert!(!tower.owned);
+        assert_eq!(tower.access_token.as_deref(), Some("alice-on-tower"));
+        assert_eq!(tower.connections[0].uri, "http://10.0.0.5:32400");
+        assert!(tower.connections[2].relay);
+        assert!(!format!("{tower:?}").contains("alice-on-tower"));
+    }
+
+    #[tokio::test]
     async fn a_forgotten_pin_is_expired_and_the_account_is_named() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -262,6 +406,10 @@ mod tests {
         assert_eq!(
             tv.account("tok-123").await.unwrap().as_deref(),
             Some("andrey")
+        );
+        assert_eq!(
+            tv.user("tok-123").await.unwrap().email.as_deref(),
+            Some("andrey@example.com")
         );
     }
 }

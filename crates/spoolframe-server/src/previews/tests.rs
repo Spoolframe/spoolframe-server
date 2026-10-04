@@ -1,0 +1,520 @@
+//! The previews worker with real ffmpeg, on films made at test time
+//! whose picture says what time it is: grey level `16 + (s mod 20) × 10`
+//! for the 10-second span `s` it is in.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex as StdMutex;
+
+use async_trait::async_trait;
+use spoolframe_catalog::{
+    Found, Image, ItemPage, ItemWithChildren, Page, PreviewFrames, SearchQuery,
+};
+use spoolframe_media::encoders::{FfmpegCommand, TranscodeSettings};
+use spoolframe_types::{Item, Library, LibraryId, PersonId};
+
+use super::*;
+
+/// Every film's file is the one in `files` under its key; a film in
+/// `indexed` has the catalog's own previews, and one in `broken` an index
+/// that cannot be read.
+#[derive(Debug, Default)]
+struct Files {
+    files: StdMutex<HashMap<String, PathBuf>>,
+    indexed: StdMutex<HashMap<String, PreviewFrames>>,
+    broken: StdMutex<HashSet<String>>,
+}
+
+#[async_trait]
+impl Catalog for Files {
+    async fn libraries(&self) -> Result<Vec<Library>, CatalogError> {
+        unreachable!()
+    }
+    async fn items(&self, _: &LibraryId, _: Page) -> Result<ItemPage, CatalogError> {
+        unreachable!()
+    }
+    async fn item(&self, _: &MediaId) -> Result<ItemWithChildren, CatalogError> {
+        unreachable!()
+    }
+    async fn external_ids(&self, _: &MediaId) -> Result<Vec<String>, CatalogError> {
+        unreachable!()
+    }
+    async fn search(&self, _: &SearchQuery) -> Result<Found, CatalogError> {
+        unreachable!()
+    }
+    async fn person_items(&self, _: &PersonId) -> Result<Vec<Item>, CatalogError> {
+        unreachable!()
+    }
+    async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
+        self.files
+            .lock()
+            .unwrap()
+            .get(id.key())
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound(id.to_string()))
+    }
+    async fn recently_added(&self, _: u32) -> Result<Vec<Item>, CatalogError> {
+        unreachable!()
+    }
+    async fn artwork(&self, _: &ArtworkId) -> Result<Image, CatalogError> {
+        unreachable!()
+    }
+    async fn preview_frames(&self, id: &MediaId) -> Result<Option<PreviewFrames>, CatalogError> {
+        if self.broken.lock().unwrap().contains(id.key()) {
+            return Err(CatalogError::Backend {
+                url: "http://pms".into(),
+                call: "GET /library/parts/1/indexes/sd".into(),
+                item: None,
+                message: "unreadable preview index: not a BIF".into(),
+            });
+        }
+        Ok(self.indexed.lock().unwrap().get(id.key()).cloned())
+    }
+}
+
+struct Setup {
+    previews: Arc<Previews>,
+    files: Arc<Files>,
+    tmp: spoolframe_test_dir::TestDir,
+}
+
+async fn setup(test: &str, settings: PreviewSettings) -> Setup {
+    setup_with(test, settings, "ffmpeg").await
+}
+
+/// [`setup`], making previews with `ffmpeg`.
+async fn setup_with(test: &str, settings: PreviewSettings, ffmpeg: &str) -> Setup {
+    let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-previews-{test}")).await;
+    let files = Arc::new(Files::default());
+    let sources = PreviewSources {
+        catalog: files.clone(),
+        prober: Arc::new(Prober::new("ffprobe", Prober::DEFAULT_TIMEOUT)),
+        transcoding: Arc::new(Transcoding::new(
+            Box::new(FfmpegCommand::new("ffmpeg")),
+            TranscodeSettings::default(),
+            tmp.as_ref().join("encoder-test"),
+        )),
+        ffmpeg: ffmpeg.into(),
+    };
+    let previews = Previews::start(&tmp.as_ref().join("previews"), settings, sources).unwrap();
+    Setup {
+        previews,
+        files,
+        tmp,
+    }
+}
+
+fn settings() -> PreviewSettings {
+    PreviewSettings {
+        when: When::OnPlay,
+        interval: Duration::from_secs(10),
+        cache_limit_bytes: 1 << 30,
+    }
+}
+
+fn film(key: &str) -> MediaId {
+    MediaId::new(Namespace::Plex, MediaKind::Movie, key).unwrap()
+}
+
+impl Setup {
+    /// A film of `secs` seconds as `key`, a keyframe every 4 s, its grey
+    /// level `offset` above the clock's.
+    fn film(&self, key: &str, secs: u32, offset: u32) -> MediaId {
+        let path = self.tmp.as_ref().join(format!("{key}.mkv"));
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!(
+                "color=c=black:s=64x36:r=1:d={secs},\
+                 geq=lum='16+{offset}+mod(floor(T/10),20)*10':cb=128:cr=128"
+            ))
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "4"])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        self.files.files.lock().unwrap().insert(key.into(), path);
+        film(key)
+    }
+
+    async fn ready(&self, id: &MediaId) -> (String, SetMeta) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            match self.previews.state(id).await.unwrap() {
+                PreviewState::Ready { key, meta } => return (key, meta),
+                PreviewState::Making { .. } => {}
+                PreviewState::None => panic!("{id} has no previews"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{id}: not made in time"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The grey level of tile `i` of the set under `key`, as 0–255.
+    async fn grey(&self, key: &str, meta: &SetMeta, i: u32) -> f64 {
+        let per_sheet = meta.columns * meta.rows;
+        let sheet = self.previews.sheet(key, i / per_sheet).await.unwrap();
+        let sheet = image::load_from_memory(&sheet).unwrap().to_rgb8();
+        let at = i % per_sheet;
+        let (x, y) = (
+            (at % meta.columns) * meta.tile_width,
+            (at / meta.columns) * meta.tile_height,
+        );
+        let mut sum = 0u64;
+        // The middle of the tile, away from JPEG's edges.
+        for dy in meta.tile_height / 4..meta.tile_height * 3 / 4 {
+            for dx in meta.tile_width / 4..meta.tile_width * 3 / 4 {
+                sum += u64::from(sheet.get_pixel(x + dx, y + dy).0[0]);
+            }
+        }
+        sum as f64 / f64::from(meta.tile_width / 2 * (meta.tile_height / 2))
+    }
+}
+
+/// The grey a tile of span `s` shows, full range: video's 16–235 as
+/// JPEG's 0–255.
+fn grey_of_span(s: u32, offset: u32) -> f64 {
+    f64::from((s % 20) * 10 + offset) * 255.0 / 219.0
+}
+
+#[tokio::test]
+async fn a_film_gets_a_tile_every_interval_and_1_23_40_shows_that_moment() {
+    let setup = setup("moment", settings()).await;
+    // 85 minutes: past 1:23:40.
+    let id = setup.film("long", 5100, 0);
+    let (key, meta) = setup.ready(&id).await;
+    assert_eq!(meta.count, 510);
+    assert_eq!(meta.interval_ms, 10_000);
+    assert_eq!((meta.columns, meta.rows), (10, 10));
+    assert_eq!(meta.sheets, 6);
+    assert_eq!((meta.tile_width, meta.tile_height), (320, 180));
+    // 1:23:40 is 5020 s: tile 502 of the set, the 3rd of sheet 5. The
+    // picture there is span 502's, or, within one interval, the one before.
+    let i = (5_020_000 / meta.interval_ms) as u32;
+    let grey = setup.grey(&key, &meta, i).await;
+    let near = [501, 502].map(|s| grey_of_span(s, 0));
+    assert!(
+        near.iter().any(|g| (g - grey).abs() < 5.0),
+        "tile {i} is grey {grey:.1}, not one of {near:?}"
+    );
+    // And not a tile far from it.
+    assert!((grey_of_span(510, 0) - grey).abs() > 5.0);
+}
+
+#[tokio::test]
+async fn a_replaced_file_gets_new_previews() {
+    let setup = setup("replaced", settings()).await;
+    let id = setup.film("film", 30, 0);
+    let (first, meta) = setup.ready(&id).await;
+    assert!((setup.grey(&first, &meta, 0).await - grey_of_span(0, 0)).abs() < 5.0);
+    // A new rip under the same name: brighter, and longer.
+    std::thread::sleep(Duration::from_millis(20));
+    setup.film("film", 40, 100);
+    assert!(matches!(
+        setup.previews.state(&id).await.unwrap(),
+        PreviewState::Making { .. }
+    ));
+    let (second, meta) = setup.ready(&id).await;
+    assert_ne!(first, second);
+    assert_eq!(meta.count, 4);
+    assert!((setup.grey(&second, &meta, 0).await - grey_of_span(0, 100)).abs() < 5.0);
+}
+
+#[tokio::test]
+async fn music_has_no_previews() {
+    let setup = setup("music", settings()).await;
+    let track = MediaId::new(Namespace::Plex, MediaKind::Track, "1").unwrap();
+    assert_eq!(
+        setup.previews.state(&track).await.unwrap(),
+        PreviewState::None
+    );
+}
+
+#[tokio::test]
+async fn never_makes_none() {
+    let setup = setup(
+        "never",
+        PreviewSettings {
+            when: When::Never,
+            ..settings()
+        },
+    )
+    .await;
+    let id = setup.film("film", 20, 0);
+    setup.previews.played(&id);
+    assert_eq!(setup.previews.state(&id).await.unwrap(), PreviewState::None);
+    // Turned on while running: made from the next ask.
+    setup.previews.set_settings(settings());
+    setup.ready(&id).await;
+}
+
+#[tokio::test]
+async fn a_file_without_pictures_fails_once_and_is_not_made_again() {
+    let setup = setup("no-video", settings()).await;
+    let path = setup.tmp.as_ref().join("sound.mka");
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=d=5"])
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    setup
+        .previews
+        .sources
+        .catalog
+        .media_path(&film("x"))
+        .await
+        .unwrap_err();
+    setup
+        .files
+        .files
+        .lock()
+        .unwrap()
+        .insert("sound".into(), path);
+    let id = film("sound");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while setup.previews.state(&id).await.unwrap() != PreviewState::None {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn previews_wait_for_nothing_but_the_one_being_made() {
+    // Two films asked for at once: one is made while the other waits,
+    // then the other.
+    let setup = setup("queue", settings()).await;
+    let a = setup.film("a", 600, 0);
+    let b = setup.film("b", 20, 0);
+    setup.previews.played(&a);
+    setup.previews.played(&b);
+    assert!(matches!(
+        setup.previews.state(&b).await.unwrap(),
+        PreviewState::Making { done_percent: 0 }
+    ));
+    setup.ready(&a).await;
+    setup.ready(&b).await;
+}
+
+#[test]
+fn a_sheet_s_id_names_its_set_and_number_and_nothing_else() {
+    let key = "0123456789abcdef0123456789abcdef";
+    let id = sheet_id(key, 3);
+    assert_eq!(id.to_string(), format!("preview:{key}/3"));
+    assert_eq!(sheet_of(&id), Some((key, 3)));
+    for other in [
+        "preview:../../etc/0",
+        "preview:0123456789abcdef0123456789abcdeF/0",
+        "preview:0123456789abcdef0123456789abcde/0",
+        "preview:0123456789abcdef0123456789abcdef/x",
+        "preview:0123456789abcdef0123456789abcdef",
+        "plex:0123456789abcdef0123456789abcdef/0",
+    ] {
+        assert_eq!(sheet_of(&other.parse().unwrap()), None, "{other}");
+    }
+}
+
+/// The ffmpeg processes reading `path`.
+fn ffmpeg_reading(path: &Path) -> usize {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.parse::<u32>().is_ok())
+        })
+        .filter(|e| {
+            std::fs::read(e.path().join("cmdline"))
+                .is_ok_and(|cmd| String::from_utf8_lossy(&cmd).contains(&*path.to_string_lossy()))
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn a_stopping_server_gives_up_the_film_being_made() {
+    let setup = setup("stop", settings()).await;
+    let id = setup.film("long", 7200, 0);
+    let path = setup.files.files.lock().unwrap()["long"].clone();
+    setup.previews.played(&id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let PreviewState::Making { done_percent } = setup.previews.state(&id).await.unwrap()
+            && done_percent > 0
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    setup.previews.stop();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while ffmpeg_reading(&path) > 0 || setup.previews.lock_queue().current.is_some() {
+        assert!(std::time::Instant::now() < deadline, "still making");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Given up, not failed, and nothing is left of its work.
+    assert!(setup.previews.failed.lock().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_dir(setup.tmp.as_ref().join("previews").join(WORK))
+            .map(|d| d.count())
+            .unwrap_or(0),
+        0
+    );
+    assert_eq!(setup.previews.cache_total(), 0);
+}
+
+#[tokio::test]
+async fn sound_that_runs_on_past_the_picture_adds_no_tiles() {
+    let setup = setup("longer-sound", settings()).await;
+    // 30 s of picture and 33 s of sound: a 33 s file.
+    let path = setup.tmp.as_ref().join("film.mkv");
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc2=size=64x36:rate=5:d=30"])
+        .args(["-f", "lavfi", "-i", "sine=d=33"])
+        .args(["-c:v", "libx264", "-g", "10", "-c:a", "aac"])
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    setup
+        .files
+        .files
+        .lock()
+        .unwrap()
+        .insert("film".into(), path);
+    let (_, meta) = setup.ready(&film("film")).await;
+    assert_eq!(meta.count, 3);
+}
+
+/// Frames every 2 s for `secs`, each of grey `at_s × 4`, as Plex's index
+/// has them.
+fn plex_frames(secs: u64) -> PreviewFrames {
+    PreviewFrames {
+        frames: (0..=secs / 2)
+            .map(|i| PreviewFrame {
+                at_ms: i * 2000,
+                jpeg: sheets::tests::tile(320, 132, (i * 8) as u8),
+            })
+            .collect(),
+    }
+}
+
+#[tokio::test]
+async fn the_catalog_s_own_index_is_used_and_the_file_is_never_decoded() {
+    // No ffmpeg at all: the set can only come from the index.
+    let setup = setup_with("plex-index", settings(), "/nonexistent/ffmpeg").await;
+    let path = setup.tmp.as_ref().join("film.mkv");
+    std::fs::write(&path, b"a film").unwrap();
+    setup
+        .files
+        .files
+        .lock()
+        .unwrap()
+        .insert("film".into(), path);
+    setup
+        .files
+        .indexed
+        .lock()
+        .unwrap()
+        .insert("film".into(), plex_frames(60));
+    let (key, meta) = setup.ready(&film("film")).await;
+    // 0, 10, … 60 s.
+    assert_eq!(meta.count, 7);
+    assert_eq!((meta.tile_width, meta.tile_height), (320, 132));
+    for i in 0..7 {
+        let grey = setup.grey(&key, &meta, i).await;
+        let want = f64::from(i * 5 * 8);
+        assert!((grey - want).abs() < 4.0, "tile {i}: {grey:.1}, not {want}");
+    }
+}
+
+#[tokio::test]
+async fn an_index_that_cannot_be_read_is_made_from_the_file() {
+    let setup = setup("plex-index-broken", settings()).await;
+    let id = setup.film("film", 30, 0);
+    setup.files.broken.lock().unwrap().insert("film".into());
+    let (_, meta) = setup.ready(&id).await;
+    assert_eq!((meta.count, meta.tile_height), (3, 180));
+}
+
+#[test]
+fn a_tile_from_an_index_is_its_last_frame_at_or_before_the_tile_s_time() {
+    let frame = |at_ms, n| PreviewFrame {
+        at_ms,
+        jpeg: vec![n],
+    };
+    let frames = [frame(0, 0), frame(2000, 1), frame(4000, 2), frame(7000, 3)];
+    let tiles = pick(&frames, Duration::from_secs(3));
+    // 0 s, 3 s, 6 s: frames 0, 1 (at 2 s) and 2 (at 4 s).
+    assert_eq!(tiles, [vec![0], vec![1], vec![2]]);
+    assert!(pick(&[], Duration::from_secs(3)).is_empty());
+}
+
+#[test]
+fn the_newest_go_ahead_of_what_was_queued_ahead_and_behind_what_is_played() {
+    let mut queue = Queue::default();
+    queue.ahead_of_the_rest([film("1"), film("2"), film("3")].into_iter());
+    queue.push(&film("9"), true);
+    // A later sweep: 3 is newest now, 4 is new.
+    queue.ahead_of_the_rest([film("3"), film("4")].into_iter());
+    let order: Vec<_> = std::iter::from_fn(|| queue.pop())
+        .map(|(id, urgent)| (id.key().to_owned(), urgent))
+        .collect();
+    let want = [
+        ("9", true),
+        ("3", false),
+        ("4", false),
+        ("1", false),
+        ("2", false),
+    ];
+    assert_eq!(order, want.map(|(k, u)| (k.to_owned(), u)));
+}
+
+#[tokio::test]
+async fn previews_made_ahead_stop_when_the_cache_is_full_and_a_play_still_gets_its_own() {
+    let setup = setup(
+        "ahead-full",
+        PreviewSettings {
+            when: When::Ahead,
+            // Room for one set, and not a byte more.
+            cache_limit_bytes: 1,
+            ..settings()
+        },
+    )
+    .await;
+    let a = setup.film("a", 20, 0);
+    let b = setup.film("b", 20, 0);
+    setup.previews.ahead([a.clone(), b.clone()]);
+    let idle = |previews: &Previews| {
+        let queue = previews.lock_queue();
+        queue.current.is_none() && queue.ahead.is_empty()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !idle(&setup.previews) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queue never emptied"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let set = |name: &str| {
+        let path = setup.files.files.lock().unwrap()[name].clone();
+        async move { key(&path, Duration::from_secs(10)).await.unwrap() }
+    };
+    let (key_a, key_b) = (set("a").await, set("b").await);
+    assert!(
+        setup.previews.cache.get(&key_a).is_some(),
+        "a was made ahead"
+    );
+    assert!(
+        setup.previews.cache.get(&key_b).is_none(),
+        "b was made ahead, evicting a"
+    );
+    // b is played: made, though it evicts a.
+    setup.previews.played(&b);
+    setup.ready(&b).await;
+}

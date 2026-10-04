@@ -16,14 +16,14 @@ use jsonrpsee::server::ServerHandle;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
 use spoolframe_admin_api::{
-    AdminApiServer, Credentials, DeviceEntry, DeviceSignIn, DiscoveredPlex, LibraryPathCheck,
-    LibraryStatus, LoggedIn, MeApiServer, NewUser, PasskeyChallenge, PasskeyEntry, PasskeyHost,
+    AdminApiServer, Credentials, DeviceEntry, DeviceSignIn, DiscoveredPlex, LibrariesOverview,
+    LibraryPathCheck, LoggedIn, MeApiServer, NewUser, PasskeyChallenge, PasskeyEntry, PasskeyHost,
     PasskeySetupBegin, PasskeySetupFinish, PasswordChange, PathFailures, PathMappingEntry,
-    PathReport, PlexPin, PlexPinState, PlexStatus, PlexSyncReport, Role, ServerStatus,
-    SessionEntry, SettingEntry, Settings, SetupRequest, SetupState, TranscodingStatus, UserInfo,
+    PathReport, PlexAccountServer, PlexLinkState, PlexPin, PlexPinState, PlexServerEntry,
+    PlexStatus, PlexSyncOverview, PlexSyncReport, PlexUser, Role, ServerStatus, SessionEntry,
+    SettingEntry, Settings, SetupRequest, SetupState, SyncDirection, TranscodingStatus, UserInfo,
     error_code,
 };
-use spoolframe_catalog::Catalog;
 use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
 
@@ -35,11 +35,13 @@ use crate::auth::{
 use crate::catalog::LiveCatalog;
 use crate::config::layers::SettingError;
 use crate::config::settings::PLEX_TOKEN;
-use crate::config::{PathMappingConfig, PlexConfig};
+use crate::config::{FIRST_PLEX_SERVER, PlexConfig};
 use crate::device_sign_in::ClaimError;
+use crate::libraries::{self, LibraryError};
 use crate::network::ServerName;
 use crate::passkeys::{CeremonyError, Passkeys, SignInError};
-use crate::plex_sync::{PlexSync, SyncError};
+use crate::plex_accounts::{Link, LinkError, Linking, PlexAccounts};
+use crate::plex_sync::{SyncError, WatchSync};
 use crate::runtime::{ChangeError, RuntimeSettings};
 use crate::store::passkeys::{FirstPasskey, PasskeyError, PasskeyRecord, passkey_name};
 use crate::store::pins::{DeviceRecord, PinError};
@@ -222,7 +224,11 @@ pub struct Admin {
     /// The code `setup` accepts; `None` when the server had users at start.
     pub setup_code: Option<SetupCode>,
     pub status: Arc<StatusSource>,
-    pub plex_sync: Option<Arc<PlexSync>>,
+    /// Each linked user's watch sync (PX-04, P3-12); `None` in tests
+    /// without.
+    pub plex_sync: Option<Arc<WatchSync>>,
+    /// Each user's Plex link (P3-12); `None` in tests without.
+    pub accounts: Option<Arc<PlexAccounts>>,
     /// For `plexStatus` and `plexCheckPaths`: the catalog the server
     /// serves from, without Plex until it is set up.
     pub plex: Arc<LiveCatalog>,
@@ -259,6 +265,17 @@ impl Default for Wizard {
                 .expect("a fixed URL"),
             gdm: spoolframe_plex::gdm::TARGETS.to_vec(),
             path_bases: None,
+        }
+    }
+}
+
+impl Wizard {
+    /// Where plex.tv is, for each user's Plex link (P3-12) as for the
+    /// wizard's.
+    pub fn plex_site(&self) -> crate::plex_accounts::PlexSite {
+        crate::plex_accounts::PlexSite {
+            api: self.plex_tv.clone(),
+            app: self.plex_app.clone(),
         }
     }
 }
@@ -341,6 +358,7 @@ pub async fn serve(
         setup_code: admin.setup_code,
         status: admin.status,
         plex_sync: admin.plex_sync,
+        accounts: admin.accounts,
         plex: admin.plex,
         passkeys: admin.passkeys,
         cookies: admin.cookies,
@@ -361,7 +379,8 @@ pub(crate) struct AdminApi {
     auth: Auth,
     setup_code: Option<SetupCode>,
     status: Arc<StatusSource>,
-    plex_sync: Option<Arc<PlexSync>>,
+    plex_sync: Option<Arc<WatchSync>>,
+    accounts: Option<Arc<PlexAccounts>>,
     plex: Arc<LiveCatalog>,
     passkeys: Arc<Passkeys>,
     cookies: CookiePolicy,
@@ -650,6 +669,31 @@ impl From<ChangeError> for ErrorObjectOwned {
     }
 }
 
+impl From<LibraryError> for ErrorObjectOwned {
+    fn from(e: LibraryError) -> Self {
+        match e {
+            LibraryError::NoSuchLibrary(_)
+            | LibraryError::NoSuchServer(_)
+            | LibraryError::Invalid(_) => error(error_code::INVALID_INPUT, e.to_string()),
+            LibraryError::Unavailable(_) => error(error_code::UNAVAILABLE, e.to_string()),
+            LibraryError::NotSetUp => error(error_code::NOT_CONFIGURED, e.to_string()),
+            LibraryError::Change(e) => e.into(),
+            LibraryError::Config(e) => internal(e),
+        }
+    }
+}
+
+impl From<LinkError> for ErrorObjectOwned {
+    fn from(e: LinkError) -> Self {
+        match &e {
+            LinkError::NotYourPin => error(error_code::INVALID_INPUT, e.to_string()),
+            LinkError::ByConfig => error(error_code::NOT_CONFIGURED, e.to_string()),
+            LinkError::PlexTv(_) => error(error_code::UNAVAILABLE, e.to_string()),
+            LinkError::Io(_) | LinkError::Users(_) => internal(e),
+        }
+    }
+}
+
 impl From<PinError> for ErrorObjectOwned {
     fn from(e: PinError) -> Self {
         match &e {
@@ -705,6 +749,42 @@ impl AdminApi {
         })
     }
 
+    /// Every user's Plex link (P3-12).
+    fn accounts(&self) -> RpcResult<&PlexAccounts> {
+        self.accounts.as_deref().ok_or_else(|| {
+            error(
+                error_code::NOT_CONFIGURED,
+                "this server does not link Plex accounts",
+            )
+        })
+    }
+
+    /// `user`, their Plex link and their last run, as the API shows them.
+    fn plex_user(&self, user: UserRecord, link: Option<Link>) -> PlexUser {
+        let (last_run, running) = match (&self.plex_sync, &link) {
+            (Some(sync), Some(_)) => sync.status(user.id),
+            _ => (None, false),
+        };
+        PlexUser {
+            username: user.username,
+            display_name: user.display_name,
+            link: link.map(|l| l.shown()),
+            last_run,
+            running,
+        }
+    }
+
+    /// The token the caller's Plex account is reached with: their own
+    /// link's, or, for the config's owner, the first server's.
+    fn account_token(&self, user: crate::store::users::LocalUserId) -> RpcResult<Option<String>> {
+        let accounts = self.accounts()?;
+        Ok(match accounts.link(user).map_err(internal)? {
+            Some(Link::Account(a)) => Some(a.token),
+            Some(Link::Owner) => self.settings.as_ref().and_then(|s| s.plex_token()),
+            None => None,
+        })
+    }
+
     /// The caller's own account.
     async fn me(&self, ext: &Extensions) -> RpcResult<UserRecord> {
         let (_, user) = self.caller(ext).await?;
@@ -725,51 +805,6 @@ impl AdminApi {
             .into_iter()
             .find(|u| u.username == name)
             .ok_or_else(|| UserError::NoSuchUser(name).into())
-    }
-}
-
-/// Plex as `plexStatus` shows it: reachable or not, and its libraries
-/// with their item counts. Down is an answer, not an error.
-async fn plex_status_of(plex: &PlexCatalog) -> PlexStatus {
-    let down = |e: spoolframe_catalog::CatalogError| PlexStatus {
-        reachable: false,
-        error: Some(e.to_string()),
-        server_name: None,
-        version: None,
-        url: Some(plex.base_url().to_owned()),
-        libraries: Vec::new(),
-    };
-    let (server_name, version) = match plex.identity().await {
-        Ok(identity) => identity,
-        Err(e) => return down(e),
-    };
-    let libraries = match plex.libraries().await {
-        Ok(libraries) => libraries,
-        Err(e) => return down(e),
-    };
-    let mut status = Vec::with_capacity(libraries.len());
-    for library in libraries {
-        let page = spoolframe_catalog::Page {
-            offset: 0,
-            limit: 1,
-        };
-        let items = match plex.items(&library.id, page).await {
-            Ok(page) => page.total,
-            Err(e) => return down(e),
-        };
-        status.push(LibraryStatus {
-            title: library.title,
-            kind: library.kind,
-            items,
-        });
-    }
-    PlexStatus {
-        reachable: true,
-        error: None,
-        server_name,
-        version,
-        url: Some(plex.base_url().to_owned()),
-        libraries: status,
     }
 }
 
@@ -1135,6 +1170,38 @@ impl MeApiServer for AdminApi {
         Ok(())
     }
 
+    async fn plex_link(&self, ext: &Extensions) -> RpcResult<PlexUser> {
+        let me = self.me(ext).await?;
+        let link = self.accounts()?.link(me.id).map_err(internal)?;
+        Ok(self.plex_user(me, link))
+    }
+
+    async fn plex_link_begin(&self, ext: &Extensions) -> RpcResult<PlexPin> {
+        let (_, user) = self.caller(ext).await?;
+        let pin = self.accounts()?.begin(user.user).await?;
+        Ok(PlexPin {
+            id: pin.id,
+            code: pin.code,
+            auth_url: pin.auth_url,
+            expires_in: pin.expires_in,
+        })
+    }
+
+    async fn plex_link_check(&self, ext: &Extensions, id: u64) -> RpcResult<PlexLinkState> {
+        let (_, user) = self.caller(ext).await?;
+        Ok(match self.accounts()?.check(user.user, id).await? {
+            Linking::Waiting => PlexLinkState::Waiting,
+            Linking::Expired => PlexLinkState::Expired,
+            Linking::Linked(link) => PlexLinkState::Linked { link: link.shown() },
+        })
+    }
+
+    async fn plex_unlink(&self, ext: &Extensions) -> RpcResult<()> {
+        let me = self.me(ext).await?;
+        self.accounts()?.unlink(me.id, &me.username)?;
+        Ok(())
+    }
+
     async fn revoke_session(&self, ext: &Extensions, id: String) -> RpcResult<()> {
         let (_, user) = self.caller(ext).await?;
         // Only among the caller's own: anyone else's is not found.
@@ -1428,7 +1495,11 @@ impl AdminApiServer for AdminApi {
 
     async fn plex_status(&self, ext: &Extensions) -> RpcResult<PlexStatus> {
         self.admin(ext).await?;
-        Ok(plex_status_of(&*self.plex()?).await)
+        let mut status = libraries::plex_status(&*self.plex()?).await;
+        if let Some(settings) = &self.settings {
+            settings.mark_served(FIRST_PLEX_SERVER, &mut status);
+        }
+        Ok(status)
     }
 
     async fn plex_check_paths(
@@ -1467,23 +1538,106 @@ impl AdminApiServer for AdminApi {
         Ok(self.status.status())
     }
 
-    async fn plex_watch_sync(&self, ext: &Extensions, dry_run: bool) -> RpcResult<PlexSyncReport> {
+    async fn plex_watch_sync(
+        &self,
+        ext: &Extensions,
+        username: Option<String>,
+        dry_run: bool,
+    ) -> RpcResult<Vec<PlexSyncReport>> {
         self.admin(ext).await?;
         let Some(sync) = &self.plex_sync else {
             return Err(error(
                 error_code::NOT_CONFIGURED,
-                "Plex watch sync is off: set plex { watch_sync { user = …; } }",
+                "this server does not sync watch state with Plex",
             ));
         };
-        let report = sync.run(dry_run).await.map_err(|e| match e {
-            SyncError::Plex(e) => error(error_code::UNAVAILABLE, e.to_string()),
-            SyncError::Store(e) => internal(e),
-        })?;
-        Ok(PlexSyncReport {
-            pulled: report.pulled,
-            pushed: report.pushed,
-            failed: report.failed,
+        let report = |user: UserRecord, r: crate::plex_sync::Report| PlexSyncReport {
+            username: user.username,
+            pulled: r.pulled,
+            pushed: r.pushed,
+            failed: r.failed,
+            skipped: r.skipped,
+            notes: r.notes,
+        };
+        if let Some(username) = username {
+            let user = self.record(&username).await?;
+            let done = sync.run(user.id, dry_run).await.map_err(|e| match e {
+                SyncError::NotLinked => error(
+                    error_code::NOT_CONFIGURED,
+                    format!("{} has not linked a Plex account", user.username),
+                ),
+                SyncError::Plex(e) => error(error_code::UNAVAILABLE, e.to_string()),
+                SyncError::Store(_) | SyncError::Link(_) => internal(e),
+            })?;
+            return Ok(vec![report(user, done)]);
+        }
+        // Everyone linked, in turn; one who fails does not stop the rest.
+        let mut reports = Vec::new();
+        for (user, link) in self.accounts()?.users().await? {
+            if link.is_none() {
+                continue;
+            }
+            match sync.run(user.id, dry_run).await {
+                Ok(done) => reports.push(report(user, done)),
+                Err(e) => reports.push(PlexSyncReport {
+                    username: user.username,
+                    notes: vec![format!("Not synced: {e}")],
+                    ..PlexSyncReport::default()
+                }),
+            }
+        }
+        Ok(reports)
+    }
+
+    async fn plex_sync(&self, ext: &Extensions) -> RpcResult<PlexSyncOverview> {
+        self.admin(ext).await?;
+        let users = self.accounts()?.users().await?;
+        let interval = self
+            .plex_sync
+            .as_ref()
+            .map_or(crate::config::WatchSyncConfig::DEFAULT_INTERVAL, |s| {
+                s.interval()
+            });
+        Ok(PlexSyncOverview {
+            interval_secs: interval.as_secs(),
+            users: users
+                .into_iter()
+                .map(|(user, link)| self.plex_user(user, link))
+                .collect(),
         })
+    }
+
+    async fn user_plex_unlink(&self, ext: &Extensions, username: String) -> RpcResult<()> {
+        let by = self.admin(ext).await?;
+        let by = self.account(by).await?.username;
+        let user = self.record(&username).await?;
+        self.accounts()?.unlink(user.id, &by)?;
+        Ok(())
+    }
+
+    async fn plex_account_servers(&self, ext: &Extensions) -> RpcResult<Vec<PlexAccountServer>> {
+        let user = self.admin(ext).await?;
+        let Some(token) = self.account_token(user.user)? else {
+            return Err(error(
+                error_code::NOT_CONFIGURED,
+                "link your Plex account in My profile to list its servers",
+            ));
+        };
+        let resources = self.accounts()?.servers(&token).await?;
+        let configured: Vec<(String, String)> = self
+            .plex
+            .composite()
+            .map(|c| {
+                c.servers()
+                    .iter()
+                    .map(|s| (s.id.clone(), s.catalog.base_url().to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(crate::plex_accounts::account_servers(
+            &resources,
+            &configured,
+        ))
     }
 
     async fn settings(&self, ext: &Extensions) -> RpcResult<Settings> {
@@ -1558,6 +1712,8 @@ impl AdminApiServer for AdminApi {
     ) -> RpcResult<PlexStatus> {
         let (settings, _) = self.settings_as_admin(ext).await?;
         let plex = PlexConfig {
+            name: None,
+            servers: Vec::new(),
             url,
             token_file: None,
             path_mapping: Vec::new(),
@@ -1566,12 +1722,28 @@ impl AdminApiServer for AdminApi {
         let url = plex
             .url()
             .map_err(|e| error(error_code::INVALID_INPUT, e.to_string()))?;
+        // As `plexServerAdd` will add it: a pasted token, else the one the
+        // caller's linked Plex account has for it (P3-12), else the first
+        // server's.
         let token = match token.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()) {
             Some(token) => Some(token),
-            None => settings.plex_token(),
+            None => self
+                .linked_token_for(ext, url.as_str())
+                .await?
+                .or_else(|| settings.plex_token()),
         };
         let catalog = PlexCatalog::new(url, token).map_err(internal)?;
-        Ok(plex_status_of(&catalog).await)
+        let mut status = libraries::plex_status(&catalog).await;
+        // A server already added: its sections say which are libraries.
+        if let Some(source) = self.plex.composite().and_then(|c| {
+            c.servers()
+                .iter()
+                .find(|s| s.catalog.base_url() == catalog.base_url())
+                .cloned()
+        }) {
+            settings.mark_served(&source.id, &mut status);
+        }
+        Ok(status)
     }
 
     async fn plex_pin_begin(&self, ext: &Extensions) -> RpcResult<PlexPin> {
@@ -1644,68 +1816,151 @@ impl AdminApiServer for AdminApi {
         &self,
         ext: &Extensions,
         mappings: Vec<PathMappingEntry>,
+        server: Option<String>,
+        sections: Option<Vec<String>>,
     ) -> RpcResult<Vec<LibraryPathCheck>> {
         self.admin(ext).await?;
-        let plex = self.plex()?;
+        let server = server.unwrap_or_else(|| FIRST_PLEX_SERVER.to_owned());
+        let composite = self.plex.composite().ok_or_else(|| {
+            error(
+                error_code::NOT_CONFIGURED,
+                "this server is not set up: no Plex server is configured",
+            )
+        })?;
+        let source = composite.server(&server).ok_or_else(|| {
+            error(
+                error_code::INVALID_INPUT,
+                format!("there is no Plex server {server}"),
+            )
+        })?;
         // Checked as the setting will be.
-        let config = PlexConfig {
-            url: plex.base_url().to_owned(),
-            token_file: None,
-            path_mapping: mappings
-                .into_iter()
-                .map(|m| PathMappingConfig {
-                    library: m.library,
-                    from: m.from.into(),
-                    to: m.to.into(),
-                })
-                .collect(),
-            watch_sync: None,
-        };
-        let paths = config
-            .path_map()
+        let paths = crate::config::path_map(&libraries::mappings(mappings), "plex.path_mapping")
             .map_err(|e| error(error_code::INVALID_INPUT, e.to_string()))?;
+        let plex = match sections {
+            Some(sections) => source
+                .catalog
+                .unrestricted()
+                .serving(Some(sections.into_iter().collect()))
+                .trying_paths(paths),
+            None => source.catalog.trying_paths(paths),
+        };
         let reports = plex
-            .trying_paths(paths)
             .check_paths(None, Scope::Sample(PATH_SAMPLE))
             .await
             .map_err(|e| error(error_code::UNAVAILABLE, e.to_string()))?;
-        let bases = self
-            .wizard
-            .path_bases
-            .clone()
-            .unwrap_or_else(spoolframe_plex::paths::usual_bases);
+        let bases = self.path_bases();
         Ok(reports
             .into_iter()
-            .map(|r| {
-                let suggestion = r
-                    .failed
-                    .first()
-                    .and_then(|file| spoolframe_plex::paths::suggest(file, &bases))
-                    .map(|m| PathMappingEntry {
-                        library: Some(r.library.clone()),
-                        from: m.from.display().to_string(),
-                        to: m.to.display().to_string(),
-                    });
-                LibraryPathCheck {
-                    checked: r.ok + r.no_mapping.count + r.unreadable.count,
-                    ok: r.ok,
-                    failures: r
-                        .no_mapping
-                        .examples
-                        .into_iter()
-                        .chain(r.unreadable.examples)
-                        .collect(),
-                    roots: r.roots.iter().map(|p| p.display().to_string()).collect(),
-                    library: r.library,
-                    suggestion,
-                }
-            })
+            .map(|r| libraries::path_check(r, &bases))
             .collect())
+    }
+
+    async fn libraries(&self, ext: &Extensions) -> RpcResult<LibrariesOverview> {
+        let (settings, _) = self.settings_as_admin(ext).await?;
+        Ok(settings.libraries_overview(&self.path_bases()).await?)
+    }
+
+    async fn library_add(
+        &self,
+        ext: &Extensions,
+        server: String,
+        section: String,
+        name: Option<String>,
+    ) -> RpcResult<String> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings
+            .library_add(&server, &section, name.as_deref(), &by)
+            .await?)
+    }
+
+    async fn library_rename(&self, ext: &Extensions, id: String, name: String) -> RpcResult<()> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings.library_rename(&id, &name, &by).await?)
+    }
+
+    async fn library_move(&self, ext: &Extensions, id: String, position: u32) -> RpcResult<()> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings
+            .library_move(&id, usize::try_from(position).unwrap_or(usize::MAX), &by)
+            .await?)
+    }
+
+    async fn library_set_sync(
+        &self,
+        ext: &Extensions,
+        id: String,
+        sync: SyncDirection,
+    ) -> RpcResult<()> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings.library_set_sync(&id, sync, &by).await?)
+    }
+
+    async fn library_remove(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings.library_remove(&id, &by).await?)
+    }
+
+    async fn plex_server_add(
+        &self,
+        ext: &Extensions,
+        url: String,
+        token: Option<String>,
+    ) -> RpcResult<PlexServerEntry> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        let token = match token.filter(|t| !t.trim().is_empty()) {
+            Some(token) => Some(token),
+            None => self.linked_token_for(ext, &url).await?,
+        };
+        let id = settings
+            .plex_server_add(&url, token.as_deref(), &by)
+            .await?;
+        let overview = settings.libraries_overview(&self.path_bases()).await?;
+        overview
+            .servers
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| internal("the server added is not configured"))
+    }
+
+    async fn plex_server_update(
+        &self,
+        ext: &Extensions,
+        id: String,
+        url: Option<String>,
+        name: Option<String>,
+    ) -> RpcResult<()> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings.plex_server_update(&id, url.as_deref(), name.as_deref(), &by)?)
+    }
+
+    async fn plex_server_set_token(
+        &self,
+        ext: &Extensions,
+        id: String,
+        token: String,
+    ) -> RpcResult<()> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings.plex_server_set_token(&id, &token, &by)?)
+    }
+
+    async fn plex_server_set_paths(
+        &self,
+        ext: &Extensions,
+        id: String,
+        mappings: Vec<PathMappingEntry>,
+    ) -> RpcResult<()> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings.plex_server_set_paths(&id, libraries::mappings(mappings), &by)?)
+    }
+
+    async fn plex_server_remove(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        Ok(settings.plex_server_remove(&id, &by)?)
     }
 }
 
-/// How many files of each library the wizard's path check reads: as many
-/// as the check at startup.
+/// How many files of each library the wizard's path check, and the
+/// libraries overview, read: as many as the check at startup.
 pub const PATH_SAMPLE: u32 = 5;
 
 fn setup_state((done, finished): (Vec<String>, bool)) -> SetupState {
@@ -1713,7 +1968,34 @@ fn setup_state((done, finished): (Vec<String>, bool)) -> SetupState {
 }
 
 impl AdminApi {
-    /// plex.tv, as this server's installation.
+    /// The token the caller's own linked Plex account has for the server
+    /// at `url`, if it reaches it (P3-12): plex.tv hands out one per
+    /// server. `None` without a link, or when plex.tv cannot be asked.
+    async fn linked_token_for(&self, ext: &Extensions, url: &str) -> RpcResult<Option<String>> {
+        let (_, user) = self.caller(ext).await?;
+        let Some(accounts) = &self.accounts else {
+            return Ok(None);
+        };
+        let Some(link) = accounts.account(user.user).map_err(internal)? else {
+            return Ok(None);
+        };
+        match accounts.servers(&link.token).await {
+            Ok(resources) => Ok(crate::plex_accounts::token_for_url(&resources, url.trim())),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot list the linked Plex account's servers");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Where suggested path mappings are looked for.
+    fn path_bases(&self) -> Vec<std::path::PathBuf> {
+        self.wizard
+            .path_bases
+            .clone()
+            .unwrap_or_else(spoolframe_plex::paths::usual_bases)
+    }
+
     fn plex_tv(&self, settings: &RuntimeSettings) -> RpcResult<PlexTv> {
         let client_id = settings.plex_client_id().map_err(internal)?;
         PlexTv::new(
@@ -1821,6 +2103,7 @@ mod tests {
                 Arc::new(transcoding),
             )),
             plex_sync: None,
+            accounts: None,
             plex: Arc::default(),
             passkeys: Arc::new(Passkeys::new(&origins)),
             cookies: CookiePolicy::default(),

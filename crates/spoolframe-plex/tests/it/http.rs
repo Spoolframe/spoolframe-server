@@ -317,27 +317,6 @@ async fn external_ids_of_a_key_plex_gave_to_another_kind_are_not_found() {
     );
 }
 
-#[tokio::test]
-async fn search_returns_items_of_several_kinds() {
-    let server = MockServer::start().await;
-    Mock::given(path("/hubs/search"))
-        .and(query_param("query", "cure"))
-        .respond_with(json("hubs-search"))
-        .mount(&server)
-        .await;
-    let items = catalog(&server).search("cure", 50).await.unwrap();
-    assert!(items.iter().any(|i| matches!(i, Item::Artist(_))));
-    assert!(items.iter().any(|i| matches!(i, Item::Movie(_))));
-}
-
-#[tokio::test]
-async fn search_honours_the_overall_limit() {
-    let server = MockServer::start().await;
-    serve(&server, "/hubs/search", "hubs-search").await;
-    let items = catalog(&server).search("cure", 2).await.unwrap();
-    assert_eq!(items.len(), 2);
-}
-
 /// A scratch media tree for one test, standing in for the local mount: a
 /// directory of its own under a random name, removed when dropped.
 async fn media_root(test: &str) -> spoolframe_test_dir::TestDir {
@@ -601,4 +580,199 @@ async fn recently_added_is_read_newest_first() {
     let items = catalog(&server).recently_added(3).await.unwrap();
     assert_eq!(items.len(), 3);
     assert!(items.iter().all(|i| i.id().kind() == MediaKind::Season));
+}
+
+/// A catalog serving only the sections with these keys (P3-11).
+fn serving(server: &MockServer, sections: &[&str]) -> PlexCatalog {
+    catalog(server).serving(Some(sections.iter().map(|s| (*s).to_owned()).collect()))
+}
+
+#[tokio::test]
+async fn only_the_served_sections_are_libraries() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/sections", "sections").await;
+    let keys: Vec<_> = serving(&server, &["2", "12"])
+        .libraries()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|l| l.id.to_string())
+        .collect();
+    assert_eq!(keys, ["plex:2", "plex:12"]);
+    // Every one, for whoever chooses what to serve.
+    let all = serving(&server, &["2"]).unrestricted().libraries().await;
+    assert_eq!(all.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn an_item_in_a_section_not_served_is_not_served() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/metadata/134883", "metadata-movie").await;
+    let movie = id(MediaKind::Movie, "134883");
+    // The fixture's movie is in section 2.
+    let hidden = serving(&server, &["1"]);
+    for err in [
+        hidden.item(&movie).await.unwrap_err(),
+        hidden.external_ids(&movie).await.unwrap_err(),
+        hidden.media_path(&movie).await.unwrap_err(),
+    ] {
+        assert!(
+            matches!(&err, CatalogError::NotServed(what) if what == "plex:movie:134883"),
+            "{err}"
+        );
+    }
+    let listing = hidden
+        .items(
+            &LibraryId::new(Namespace::Plex, "2").unwrap(),
+            Page {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(listing, CatalogError::NotServed(_)), "{listing}");
+    serving(&server, &["2"]).item(&movie).await.unwrap();
+}
+
+#[tokio::test]
+async fn recently_added_asks_for_more_and_keeps_only_what_is_served() {
+    let server = MockServer::start().await;
+    // Asked for 2 with sections left out: a wider window, filtered.
+    Mock::given(path("/library/recentlyAdded"))
+        .and(header("X-Plex-Container-Size", "8"))
+        .respond_with(json("recently-added"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let shows = serving(&server, &["1"])
+        .recently_added_dated(2)
+        .await
+        .unwrap();
+    assert_eq!(shows.len(), 2);
+    assert_eq!(shows[0].0, Some(1_790_839_616));
+    assert!(
+        serving(&server, &["2"])
+            .recently_added(2)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn every_section_is_listed_for_choosing_with_its_size() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/sections", "sections").await;
+    Mock::given(path("/library/sections/2/all"))
+        .and(header("X-Plex-Container-Size", "0"))
+        .respond_with(json("section-all-movie"))
+        .mount(&server)
+        .await;
+    // Even from a catalog that serves none of them.
+    let plex = serving(&server, &[]);
+    let sections = plex.sections().await.unwrap();
+    let keys: Vec<_> = sections.iter().map(|s| (s.key.as_str(), s.kind)).collect();
+    assert_eq!(
+        keys,
+        [
+            ("2", Some(LibraryKind::Movies)),
+            ("1", Some(LibraryKind::Shows)),
+            ("12", Some(LibraryKind::Music)),
+        ]
+    );
+    assert_eq!(plex.section_size("2").await.unwrap(), 770);
+}
+
+fn index() -> Vec<u8> {
+    let path = format!(
+        "{}/tests/fixtures/index-sd-trimmed.bif",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+#[tokio::test]
+async fn plex_s_own_preview_index_is_read_for_a_part_that_has_one() {
+    let server = MockServer::start().await;
+    serve(
+        &server,
+        "/library/metadata/134883",
+        "metadata-movie-indexed",
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/library/parts/445739/indexes/sd"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(index(), "application/octet-stream"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let frames = catalog(&server)
+        .preview_frames(&id(MediaKind::Movie, "134883"))
+        .await
+        .unwrap()
+        .expect("Plex has an index for the part");
+    let times: Vec<_> = frames.frames.iter().map(|f| f.at_ms).collect();
+    assert_eq!(times, [0, 2000, 4000]);
+}
+
+#[tokio::test]
+async fn a_part_without_an_index_has_none_and_none_is_asked_for() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/metadata/134883", "metadata-movie").await;
+    Mock::given(path("/library/parts/445739/indexes/sd"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        catalog(&server)
+            .preview_frames(&id(MediaKind::Movie, "134883"))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn an_index_plex_lists_but_no_longer_has_is_none() {
+    let server = MockServer::start().await;
+    serve(
+        &server,
+        "/library/metadata/134883",
+        "metadata-movie-indexed",
+    )
+    .await;
+    Mock::given(path("/library/parts/445739/indexes/sd"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        catalog(&server)
+            .preview_frames(&id(MediaKind::Movie, "134883"))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn an_index_that_is_not_one_is_an_error() {
+    let server = MockServer::start().await;
+    serve(
+        &server,
+        "/library/metadata/134883",
+        "metadata-movie-indexed",
+    )
+    .await;
+    Mock::given(path("/library/parts/445739/indexes/sd"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<html>", "text/html"))
+        .mount(&server)
+        .await;
+    assert!(matches!(
+        catalog(&server)
+            .preview_frames(&id(MediaKind::Movie, "134883"))
+            .await,
+        Err(CatalogError::Backend { .. })
+    ));
 }

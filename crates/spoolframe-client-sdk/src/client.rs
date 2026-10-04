@@ -605,6 +605,11 @@ impl Client {
             .clone()
     }
 
+    /// What `id` said in the latest connection's Hello.
+    pub(crate) fn server_info(&self, id: EndpointId) -> Option<spoolframe_protocol::ServerInfo> {
+        self.link(id).info()
+    }
+
     /// The open connection to `id`: the one there is, or a new one.
     pub(crate) async fn connection(
         &self,

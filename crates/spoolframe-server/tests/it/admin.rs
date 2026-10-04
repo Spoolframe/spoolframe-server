@@ -37,6 +37,7 @@ pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
         setup_code,
         status: status(),
         plex_sync: None,
+        accounts: None,
         plex: Default::default(),
         cookies: Default::default(),
         settings: None,
@@ -278,7 +279,7 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
 #[tokio::test]
 async fn plex_watch_sync_says_when_it_is_not_configured() {
     let (_, admin, _dir) = admin_client("no-plex-sync").await;
-    let err = admin.plex_watch_sync(true).await.unwrap_err();
+    let err = admin.plex_watch_sync(None, true).await.unwrap_err();
     assert_eq!(code(err), error_code::NOT_CONFIGURED);
 }
 
@@ -511,7 +512,7 @@ async fn a_consumer_manages_their_own_account_and_nothing_else() {
     assert!(forbidden(alice.user_disable("root".into()).await.map(drop)));
     assert!(forbidden(alice.user_enable("root".into()).await));
     assert!(forbidden(alice.server_status().await.map(drop)));
-    assert!(forbidden(alice.plex_watch_sync(true).await.map(drop)));
+    assert!(forbidden(alice.plex_watch_sync(None, true).await.map(drop)));
 
     // Her own password: only with the current one.
     let wrong = alice
@@ -662,7 +663,9 @@ async fn server_with_plex(test: &str, url: &str) -> (SocketAddr, spoolframe_test
     let (addr, handle) = admin::serve(
         "127.0.0.1:0".parse().unwrap(),
         Admin {
-            plex: std::sync::Arc::new(LiveCatalog::new(Some(std::sync::Arc::new(plex)))),
+            plex: std::sync::Arc::new(LiveCatalog::new(Some(std::sync::Arc::new(
+                spoolframe_server::catalog::Composite::single("Tower", plex),
+            )))),
             ..admin(auth, Some(SetupCode::new(CODE)))
         },
         Origins::default(),

@@ -46,7 +46,7 @@ async fn clients_sign_in_and_are_told_the_server_is_not_set_up() {
         SdkError::NotSetUp
     );
     assert_eq!(
-        alice.search("ali", 10).await.unwrap_err(),
+        alice.search(support::search("ali")).await.unwrap_err(),
         SdkError::NotSetUp
     );
     assert_eq!(alice.home().await.unwrap_err(), SdkError::NotSetUp);
