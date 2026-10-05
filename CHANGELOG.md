@@ -1412,3 +1412,32 @@
   do not answer, without dialling servers that have none: apps call it
   on returning to the foreground or waking from sleep. The endpoint's
   QUIC idle timeout is 15 s (keep-alive every 5 s), down from 30 s.
+- SDK: a saved profile remembers how it last signed in on this device
+  (PX-07), so "Who's watching" can say "Passkey" for a profile whose
+  session ended, not only "Password". `SavedProfile.method` is
+  `Option<SignInMethod>`: `Password` (`Client::sign_in`), `Passkey`
+  (`Client::finish_passkey_sign_in`) or `Device` (approved on another
+  device, `Client::await_device_sign_in`, P3-07). It is kept with the
+  profile in the sessions store and outlives its session; signing in
+  again records the new method. Profiles stored by an older SDK are
+  kept, with `None`. `SavedProfile.sign_in` is unchanged.
+- A track says whose it is (PX-07). A search result showed only "Can I
+  Get It · Track 6" on a blank tile, with nothing to say it is Adele's.
+  `Track` now has `artist_name` (the track's own artist from its tags,
+  Plex's `originalTitle`, such as "Adele with Chris Stapleton", else the
+  album artist, `grandparentTitle`), `album_title` (`parentTitle`) and
+  `artwork`: the album's cover as the poster (`parentThumb`, else the
+  track's own `thumb`, which Plex sets to the album's) and the artist's
+  background (`art`). Every track carries them: listings, an album's
+  tracks, an item, search and its top match. Another Plex server's
+  track covers name that server, as other artwork does. Wire change:
+  the fields are required, as the wire may break for now.
+- Metrics (P3-14): `GET /metrics` on the admin listener answers with
+  Prometheus text (format 0.0.4). Off by default (`admin.metrics =
+  false`), and then not found; when on, only for the addresses and CIDR
+  ranges in `admin.metrics_from` (default `127.0.0.0/8, ::1`), and 403
+  for anyone else. Behind `admin.trusted_proxies` the address checked is
+  the one the proxy forwards for. Both are live settings. The process
+  series: `spoolframe_process_uptime_seconds`,
+  `spoolframe_process_resident_memory_bytes` and
+  `spoolframe_process_open_files` (the last two on Linux).

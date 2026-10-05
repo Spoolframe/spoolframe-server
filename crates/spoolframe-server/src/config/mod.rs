@@ -614,6 +614,16 @@ pub struct AdminConfig {
     /// network in clear, and page scripts can read it. Off if left out.
     #[ucl(default)]
     pub insecure_cookies: Option<bool>,
+    /// Answer `GET /metrics` with Prometheus text (P3-14). Off if left
+    /// out: the listener says nothing about it.
+    #[ucl(default)]
+    pub metrics: Option<bool>,
+    /// The addresses and CIDR ranges `GET /metrics` answers,
+    /// comma-separated; loopback if left out, so a scraper on the same
+    /// host works and nobody else does. Behind a trusted proxy, the
+    /// address it forwards for.
+    #[ucl(default)]
+    pub metrics_from: Option<String>,
 }
 
 impl AdminConfig {
@@ -649,6 +659,22 @@ impl AdminConfig {
         };
         list.parse().map_err(|message| ConfigError::Invalid {
             key: "admin.trusted_proxies",
+            message,
+        })
+    }
+
+    pub fn metrics(&self) -> bool {
+        self.metrics.unwrap_or(false)
+    }
+
+    /// Who may read `GET /metrics`.
+    pub fn metrics_from(&self) -> Result<crate::admin::AddressRanges, ConfigError> {
+        let list = self
+            .metrics_from
+            .as_deref()
+            .unwrap_or(crate::admin::AddressRanges::LOOPBACK);
+        list.parse().map_err(|message| ConfigError::Invalid {
+            key: "admin.metrics_from",
             message,
         })
     }
@@ -1147,6 +1173,7 @@ impl ServerConfig {
         parsed.admin.listen()?;
         parsed.admin.origins()?;
         parsed.admin.trusted_proxies()?;
+        parsed.admin.metrics_from()?;
         parsed.auth.check(&parsed.admin)?;
         parsed.watch.rules()?;
         parsed.transcode.settings()?;
@@ -1399,6 +1426,30 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn metrics_are_off_and_for_loopback_unless_set() {
+        let config = plex("").unwrap();
+        assert!(!config.admin.metrics());
+        let from = config.admin.metrics_from().unwrap();
+        assert!(from.contains("127.0.0.1".parse().unwrap()));
+        assert!(!from.contains("192.168.1.5".parse().unwrap()));
+        let on = plex(r#"admin { metrics = true; metrics_from = "192.168.1.0/24"; }"#).unwrap();
+        assert!(on.admin.metrics());
+        assert!(
+            on.admin
+                .metrics_from()
+                .unwrap()
+                .contains("192.168.1.5".parse().unwrap())
+        );
+        assert!(matches!(
+            plex(r#"admin { metrics_from = "localhost"; }"#),
+            Err(ConfigError::Invalid {
+                key: "admin.metrics_from",
+                ..
+            })
+        ));
     }
 
     #[test]

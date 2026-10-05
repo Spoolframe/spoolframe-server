@@ -163,6 +163,7 @@ pub fn item(server: &str, item: Item) -> Item {
             id: m(v.id),
             album_id: m(v.album_id),
             artist_id: m(v.artist_id),
+            artwork: artwork(server, v.artwork),
             ..v
         }),
     }
@@ -238,6 +239,39 @@ mod tests {
         assert_eq!(
             e.artwork[0].id.to_string(),
             "plex:cabin:/library/metadata/3/thumb/9"
+        );
+    }
+
+    #[test]
+    fn a_track_s_cover_names_its_server() {
+        let id = |kind, key: &str| MediaId::new(Namespace::Plex, kind, key).unwrap();
+        let track = Item::Track(Track {
+            id: id(MediaKind::Track, "3"),
+            album_id: id(MediaKind::Album, "2"),
+            artist_id: id(MediaKind::Artist, "1"),
+            artist_name: Some("Mara Quell".into()),
+            album_title: Some("Harbour Lights".into()),
+            title: "Low Tide".into(),
+            track: Some(2),
+            disc: Some(1),
+            album_track_count: None,
+            codec: None,
+            bit_depth: None,
+            sample_rate: None,
+            duration: None,
+            artwork: vec![Artwork {
+                id: "plex:/library/metadata/2/thumb/9".parse().unwrap(),
+                kind: ArtworkKind::Poster,
+            }],
+            playback: PlaybackState::default(),
+        });
+        let Item::Track(t) = item("cabin", track) else {
+            unreachable!()
+        };
+        assert_eq!(t.album_id.to_string(), "plex:album:cabin:2");
+        assert_eq!(
+            t.artwork[0].id.to_string(),
+            "plex:cabin:/library/metadata/2/thumb/9"
         );
     }
 }

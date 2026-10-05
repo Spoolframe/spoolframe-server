@@ -1,0 +1,46 @@
+{
+  "query": "low tide",
+  "replies": [
+    {
+      "path": "/library/sections/12/search",
+      "type": "8",
+      "year": null,
+      "body": { "MediaContainer": { "totalSize": 0, "Metadata": [] } }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "9",
+      "year": null,
+      "body": { "MediaContainer": { "totalSize": 0, "Metadata": [] } }
+    },
+    {
+      "path": "/library/sections/12/search",
+      "type": "10",
+      "year": null,
+      "body": {
+        "MediaContainer": {
+          "totalSize": 1,
+          "Metadata": [
+            {
+              "ratingKey": "900102",
+              "key": "/library/metadata/900102",
+              "parentRatingKey": "900100",
+              "grandparentRatingKey": "900001",
+              "type": "track",
+              "title": "Low Tide",
+              "grandparentTitle": "Mara Quell",
+              "parentTitle": "Harbour Lights",
+              "index": 2,
+              "parentIndex": 1,
+              "thumb": "/library/metadata/900100/thumb/1700000100",
+              "parentThumb": "/library/metadata/900100/thumb/1700000100",
+              "grandparentThumb": "/library/metadata/900001/thumb/1700000001",
+              "art": "/library/metadata/900001/art/1700000001",
+              "duration": 201000
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

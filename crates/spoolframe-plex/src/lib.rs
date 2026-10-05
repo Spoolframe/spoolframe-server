@@ -692,16 +692,33 @@ impl Catalog for PlexCatalog {
         Ok((!frames.is_empty()).then_some(PreviewFrames { frames }))
     }
 
-    async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
+    async fn authorize_artwork(&self, id: &ArtworkId) -> Result<(), CatalogError> {
         if id.namespace() != Namespace::Plex {
             return Err(CatalogError::ForeignId(id.to_string()));
         }
-        // The key is a PMS path, so only the image paths Plex hands out
-        // are fetched; anything else would read any PMS endpoint with the
-        // server's token.
         if !is_image_path(id.key()) {
             return Err(CatalogError::NotFound(id.to_string()));
         }
+        let key = id.key().split('/').nth(3).expect("validated image path");
+        let call = Call::get(format!("/library/metadata/{key}")).about(id);
+        let container = self.fetch(&call).await?;
+        let metadata = container
+            .metadata
+            .iter()
+            .find(|m| m.rating_key == key)
+            .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+        let section = metadata
+            .library_section_id
+            .as_ref()
+            .or(container.library_section_id.as_ref());
+        if !self.serves(section) {
+            return Err(CatalogError::NotServed(id.to_string()));
+        }
+        Ok(())
+    }
+
+    async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
+        self.authorize_artwork(id).await?;
         let call = Call::get(id.key()).about(id);
         let (bytes, content_type) = self.get_bytes(&call, "image/*").await?;
         if bytes.len() > MAX_IMAGE_BYTES {

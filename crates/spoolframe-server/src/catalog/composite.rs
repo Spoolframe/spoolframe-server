@@ -383,6 +383,15 @@ impl Catalog for Composite {
             .await
             .map_err(|e| named(e, &local, id))
     }
+
+    async fn authorize_artwork(&self, id: &ArtworkId) -> Result<(), CatalogError> {
+        let (server, local) = ids::artwork_local(id);
+        self.source(server, id)?
+            .catalog
+            .authorize_artwork(&local)
+            .await
+            .map_err(|e| named(e, &local, id))
+    }
 }
 
 /// `row` from `server`, every ID in it naming that server.

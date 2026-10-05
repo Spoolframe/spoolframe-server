@@ -220,7 +220,8 @@ pub enum Request {
     /// Ask for the session user's PIN on `device` (an endpoint id from
     /// `Devices`; this device if left out), or stop asking. A locked
     /// session cannot ask this (nor anything but `WhoAmI` and
-    /// `UnlockProfile`). `Done`.
+    /// `UnlockProfile`). Stopping the requirement needs recent authentication.
+    /// `Done`.
     SetPinRequired {
         #[serde(default)]
         device: Option<String>,
@@ -233,6 +234,7 @@ pub enum Request {
         code: String,
     },
     /// Sign the device showing `code` in as the session user. `Done`.
+    /// Requires recent authentication; an old session cannot mint a fresh one.
     ApproveDeviceSignIn {
         code: String,
     },

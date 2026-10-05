@@ -73,6 +73,7 @@ pub(crate) struct ClientProtocol {
     events: Arc<Mutex<HashMap<usize, SendStream>>>,
     instance: String,
     operations: Arc<crate::operations::Operations>,
+    anonymous_operations: Arc<crate::operations::Operations>,
 }
 
 /// What one connection has said so far.
@@ -152,6 +153,7 @@ impl ClientProtocol {
             events: Arc::default(),
             instance: uuid::Uuid::now_v7().to_string(),
             operations: Arc::default(),
+            anonymous_operations: Arc::new(crate::operations::Operations::anonymous()),
         }
     }
 
@@ -273,7 +275,9 @@ impl ClientProtocol {
                 RpcReply { response, playback }
             }
         };
-        if spoolframe_protocol::policy::retry_safe(&wire.envelope.request) {
+        if spoolframe_protocol::policy::retry_safe(&wire.envelope.request)
+            || matches!(wire.envelope.request, Request::Unknown)
+        {
             return execute.await;
         }
         // Preserve the handshake error even for an old or anonymous request.
@@ -287,20 +291,62 @@ impl ClientProtocol {
             .into();
         };
         let endpoint = connection.remote_id().to_string();
-        let invocation = self.operations.begin(
-            &endpoint,
-            &self.instance,
-            &operation,
-            *blake3::hash(bytes).as_bytes(),
-            crate::operations::now_ms(),
+        let anonymous = matches!(
+            wire.envelope.request,
+            Request::LoginPassword(_)
+                | Request::BeginDeviceSignIn
+                | Request::AwaitDeviceSignIn { .. }
+                | Request::BeginPasskeySignIn { .. }
+                | Request::FinishPasskeySignIn(_)
         );
+        let operations = if anonymous {
+            &self.anonymous_operations
+        } else {
+            &self.operations
+        };
+        let fingerprint = *blake3::hash(bytes).as_bytes();
+        let now = crate::operations::now_ms();
+        let cached =
+            match operations.lookup(&endpoint, &self.instance, &operation, fingerprint, now) {
+                Ok(cached) => cached,
+                Err(error) => return Response::Err(error).into(),
+            };
+        let invocation = if let Some(cached) = cached {
+            Ok(cached)
+        } else {
+            if !anonymous {
+                let (session, _) = match self
+                    .authenticate(connection, state, wire.envelope.session.clone())
+                    .await
+                {
+                    Ok(user) => user,
+                    Err(error) => return Response::Err(error).into(),
+                };
+                if !matches!(wire.envelope.request, Request::UnlockProfile { .. })
+                    && let Err(error) = state
+                        .locks
+                        .lock()
+                        .expect("never poisoned")
+                        .use_session(&session)
+                {
+                    return Response::Err(error).into();
+                }
+            }
+            operations.begin(
+                &endpoint,
+                &self.instance,
+                &operation,
+                fingerprint,
+                crate::operations::now_ms(),
+            )
+        };
         let invocation = match invocation {
             Ok(invocation) => invocation,
             Err(error) => return Response::Err(error).into(),
         };
         let replay = invocation.execute.is_none();
         if let Some(send) = invocation.execute {
-            let operations = self.operations.clone();
+            let operations = operations.clone();
             tokio::spawn(async move {
                 operations.finish(&endpoint, &operation.id, send, execute.await);
             });
@@ -1175,6 +1221,9 @@ impl ClientProtocol {
                 })
             }
             Request::SetPinRequired { device, required } => {
+                if !required {
+                    recently_signed_in(&user)?;
+                }
                 let generation = state.locks.lock().expect("never poisoned").generation;
                 let this = connection.remote_id().to_string();
                 let device = device.unwrap_or_else(|| this.clone());
@@ -1676,6 +1725,7 @@ impl ClientProtocol {
                 }
             }
             Request::ApproveDeviceSignIn { code } => {
+                recently_signed_in(&user)?;
                 let code = self.sign_in_code(connection, &user, &code)?;
                 let approver = connection.remote_id().to_string();
                 let sign_ins = self.services.auth.sign_ins();

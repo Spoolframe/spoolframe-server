@@ -43,6 +43,8 @@ pub struct Live {
     pub previews: Option<Arc<Previews>>,
     /// `auth.oidc` (P3-04).
     pub oidc: Option<Arc<crate::oidc::Oidc>>,
+    /// `admin.metrics` and `admin.metrics_from` (P3-14).
+    pub metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 /// Why a change was not made.
@@ -380,6 +382,9 @@ impl RuntimeSettings {
             name.set(config.server_name());
         }
         live.cookies.set_insecure(config.admin.insecure_cookies());
+        if let (Some(metrics), Ok(from)) = (&live.metrics, config.admin.metrics_from()) {
+            metrics.access().set(config.admin.metrics(), from);
+        }
         if let (Some(watch), Ok(rules)) = (&live.watch, config.watch.rules()) {
             let mut now = watch.rules();
             now.started_after = rules.started_after;
@@ -609,6 +614,29 @@ mod tests {
             refused.to_string().contains("not an https URL"),
             "{refused}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_metrics_endpoint_follows_its_settings_at_once() {
+        let (mut settings, _dir) = settings(None).await;
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        settings.live.metrics = Some(metrics.clone());
+        let entry = settings
+            .set("admin.metrics", &serde_json::json!(true), "root")
+            .unwrap();
+        assert_eq!(entry.apply, SettingApply::Live);
+        assert!(metrics.access().enabled());
+        settings
+            .set(
+                "admin.metrics_from",
+                &serde_json::json!("10.0.0.0/8"),
+                "root",
+            )
+            .unwrap();
+        assert!(metrics.access().allows("10.9.8.7".parse().unwrap()));
+        assert!(!metrics.access().allows("127.0.0.1".parse().unwrap()));
+        settings.unset("admin.metrics", "root").unwrap();
+        assert!(!metrics.access().enabled());
     }
 
     #[tokio::test]

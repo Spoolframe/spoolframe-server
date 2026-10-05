@@ -32,6 +32,10 @@ pub(crate) struct StoredSession {
     pub token: Option<String>,
     pub username: String,
     pub display_name: String,
+    /// How they last signed in on this device. Stores written before it
+    /// was kept have no such field: `None`.
+    #[serde(default)]
+    pub method: Option<SignInMethod>,
 }
 
 /// Someone who signed in on a server from this device, as "Who's
@@ -43,6 +47,23 @@ pub struct SavedProfile {
     /// As of their last sign-in or [`crate::Client::profiles`].
     pub display_name: String,
     pub sign_in: ProfileSignIn,
+    /// How their last successful sign-in on this device was made, so
+    /// "Who's watching" can offer the same again once their session has
+    /// ended. `None` for a profile kept before the SDK remembered it.
+    pub method: Option<SignInMethod>,
+}
+
+/// How a profile signed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInMethod {
+    /// [`crate::Client::sign_in`], with a password.
+    Password,
+    /// [`crate::Client::finish_passkey_sign_in`], with a passkey.
+    Passkey,
+    /// [`crate::Client::await_device_sign_in`]: approved on another device
+    /// they were signed in on (P3-07).
+    Device,
 }
 
 /// How choosing a saved profile signs them in.
@@ -54,7 +75,7 @@ pub enum ProfileSignIn {
     Automatic,
     /// Their session ended (it expired, was revoked, or the server no
     /// longer knows it): they sign in again, with their password or a
-    /// passkey.
+    /// passkey. [`SavedProfile::method`] says which they used last.
     Password,
 }
 
@@ -67,6 +88,7 @@ impl From<&StoredSession> for SavedProfile {
                 Some(_) => ProfileSignIn::Automatic,
                 None => ProfileSignIn::Password,
             },
+            method: stored.method,
         }
     }
 }
@@ -1177,8 +1199,68 @@ mod tests {
                 username: "alice".into(),
                 display_name: "Alice".into(),
                 sign_in: ProfileSignIn::Automatic,
+                method: None,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn a_store_from_before_sign_in_methods_keeps_its_profiles_without_one() {
+        let storage = crate::storage::MemoryStorage::default();
+        let server = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        // As SDKs before sign-in methods wrote it: a kept session and an
+        // ended one, neither with a method.
+        let old = br#"[
+            {"token": "abc", "username": "alice", "display_name": "Alice"},
+            {"token": null, "username": "bob", "display_name": "Bob"}
+        ]"#;
+        storage
+            .set_secret(&keys::sessions(&server.to_string()), Some(old.to_vec()))
+            .await
+            .unwrap();
+        let stored = load(&storage, &server).await.unwrap();
+        let read: Vec<_> = stored
+            .iter()
+            .map(SavedProfile::from)
+            .map(|p| (p.username, p.sign_in, p.method))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("alice".to_owned(), ProfileSignIn::Automatic, None),
+                ("bob".to_owned(), ProfileSignIn::Password, None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile_s_sign_in_method_is_kept_in_the_store() {
+        let storage = crate::storage::MemoryStorage::default();
+        let server = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let profiles = [
+            (SignInMethod::Password, "alice"),
+            (SignInMethod::Passkey, "bob"),
+            (SignInMethod::Device, "carol"),
+        ];
+        let stored: Vec<_> = profiles
+            .iter()
+            .map(|&(method, name)| StoredSession {
+                token: None,
+                username: name.into(),
+                display_name: name.into(),
+                method: Some(method),
+            })
+            .collect();
+        save(&storage, &server, &stored).await.unwrap();
+        let read: Vec<_> = load(&storage, &server)
+            .await
+            .unwrap()
+            .iter()
+            .map(SavedProfile::from)
+            .map(|p| (p.method.unwrap(), p.username))
+            .collect();
+        let expected: Vec<_> = profiles.iter().map(|&(m, n)| (m, n.to_owned())).collect();
+        assert_eq!(read, expected);
     }
 
     /// Six bytes of SubRip, version 1, of which `have` have arrived.

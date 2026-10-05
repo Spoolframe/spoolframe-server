@@ -33,7 +33,7 @@ use spoolframe_admin_api::{
 use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
 
-pub use crate::admin_http::{CookiePolicy, Origins, TrustedProxies};
+pub use crate::admin_http::{AddressRanges, CookiePolicy, Origins, TrustedProxies};
 use crate::auth::{
     Auth, LoginError, PasswordError, RECENT_SIGN_IN, SessionToken, hash_password, hash_pin,
     pin_digits,
@@ -296,6 +296,9 @@ pub struct Admin {
     /// Artwork, resized, for the catalog pages' thumbnails (P3-16);
     /// `None` in tests without, which get the catalog's own images.
     pub artwork: Option<Arc<crate::artwork::ArtworkCache>>,
+    /// What `GET /metrics` answers (P3-14); `None` in tests without, where
+    /// it is not found.
+    pub metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 /// What the setup wizard reaches beyond the server (P3-10): plex.tv for
@@ -423,6 +426,7 @@ pub async fn serve(
         oidc: admin.oidc,
         watch: admin.watch,
         artwork: admin.artwork,
+        metrics: admin.metrics,
         checks: Arc::default(),
         pins: Arc::default(),
         public_url: origins.public_url().map(str::to_owned),
@@ -449,6 +453,7 @@ pub(crate) struct AdminApi {
     oidc: Arc<Oidc>,
     watch: Option<Arc<crate::watch::Watch>>,
     artwork: Option<Arc<crate::artwork::ArtworkCache>>,
+    metrics: Option<Arc<crate::metrics::Metrics>>,
     /// Each library's last path check (P3-16).
     checks: Arc<PathChecks>,
     /// The plex.tv PINs this server began, so a check is only of those.
@@ -559,6 +564,11 @@ impl AdminApi {
             "insecureCookies": self.cookies.insecure(),
             "sso": self.oidc.names(),
         })
+    }
+
+    /// The server's metrics, if it keeps any.
+    pub(crate) fn metrics(&self) -> Option<&crate::metrics::Metrics> {
+        self.metrics.as_deref()
     }
 
     /// How the session cookie is sent now.
@@ -1437,6 +1447,7 @@ impl MeApiServer for AdminApi {
     }
 
     async fn device_sign_in_approve(&self, ext: &Extensions, code: String) -> RpcResult<()> {
+        self.recently_signed_in(ext).await?;
         let (user, code) = self.sign_in_code(ext, &code).await?;
         let sign_ins = self.auth.sign_ins();
         // No endpoint approves here: a web session is never the device
@@ -2731,10 +2742,41 @@ mod tests {
             oidc: Arc::default(),
             watch: None,
             artwork: None,
+            metrics: None,
             checks: Arc::default(),
             pins: Arc::default(),
             public_url: origins.public_url().map(str::to_owned),
         }
+    }
+
+    #[tokio::test]
+    async fn old_web_sessions_cannot_approve_devices() {
+        let (api, ext, hash, _dir) = api_with_alice("device-approval-recent").await;
+        api.auth
+            .store()
+            .age_session(&hash, RECENT_SIGN_IN.as_secs() as i64 + 1)
+            .await;
+        let started = api
+            .auth
+            .sign_ins()
+            .begin(crate::device_sign_in::Waiting {
+                endpoint: "new-device".into(),
+                device_name: None,
+                client_name: "test".into(),
+                platform: spoolframe_types::Platform::Linux,
+                requested_at: crate::store::now(),
+            })
+            .unwrap();
+        let error = api
+            .device_sign_in_approve(&ext, started.code.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), error_code::RECENT_SIGN_IN_REQUIRED);
+        assert!(api.auth.sign_ins().lookup(&started.code).is_some());
+        api.auth.store().confirm_session(&hash).await.unwrap();
+        api.device_sign_in_approve(&ext, started.code)
+            .await
+            .unwrap();
     }
 
     /// A user set up with a passkey has no password to prove it is them

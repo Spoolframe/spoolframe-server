@@ -609,6 +609,7 @@ fn artwork_id(key: &str) -> spoolframe_types::ArtworkId {
 #[tokio::test]
 async fn artwork_is_fetched_with_its_content_type() {
     let server = MockServer::start().await;
+    serve(&server, "/library/metadata/134883", "metadata-movie").await;
     Mock::given(path("/library/metadata/134883/thumb/1786645049"))
         .and(header("accept", "image/*"))
         .respond_with(
@@ -641,12 +642,13 @@ async fn an_artwork_key_that_is_not_an_image_path_never_reaches_the_pms() {
 #[tokio::test]
 async fn a_reply_that_is_not_an_image_is_an_error() {
     let server = MockServer::start().await;
-    Mock::given(path("/library/metadata/1/art/2"))
+    serve(&server, "/library/metadata/134883", "metadata-movie").await;
+    Mock::given(path("/library/metadata/134883/art/2"))
         .respond_with(json("sections"))
         .mount(&server)
         .await;
     let err = catalog(&server)
-        .artwork(&artwork_id("/library/metadata/1/art/2"))
+        .artwork(&artwork_id("/library/metadata/134883/art/2"))
         .await
         .unwrap_err();
     assert!(matches!(err, CatalogError::Backend { .. }), "{err}");
@@ -880,4 +882,26 @@ async fn an_index_that_is_not_one_is_an_error() {
             .await,
         Err(CatalogError::Backend { .. })
     ));
+}
+
+#[tokio::test]
+async fn artwork_in_an_excluded_library_never_fetches_image_bytes() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/metadata/134883", "metadata-movie").await;
+    let restricted = catalog(&server).serving(Some(["3".to_owned()].into()));
+    let image = artwork_id("/library/metadata/134883/thumb/1786645049");
+    assert!(matches!(
+        restricted.artwork(&image).await,
+        Err(CatalogError::NotServed(_))
+    ));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.url.path() == "/library/metadata/134883")
+    );
+    let allowed = catalog(&server).serving(Some(["2".to_owned()].into()));
+    allowed.authorize_artwork(&image).await.unwrap();
 }

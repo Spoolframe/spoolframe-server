@@ -21,7 +21,7 @@ use crate::discovery::Discovery;
 use crate::error::SdkError;
 use crate::link::{ConnectionPath, Link, StateWatch};
 use crate::servers::{self, SavedServer, ServerEntry};
-use crate::session::{self, SavedProfile, Session, StoredSession};
+use crate::session::{self, SavedProfile, Session, SignInMethod, StoredSession};
 use crate::storage::{Storage, StorageError, keys};
 use spoolframe_protocol::policy::retry_safe;
 use spoolframe_protocol::rpc::{OPERATION_WINDOW_MS, Operation, RpcRequest};
@@ -514,7 +514,8 @@ impl Client {
             }
             Response::Err(e) => return Err(SdkError::from_server(e)),
         };
-        self.keep_session(server, token).await
+        self.keep_session(server, token, SignInMethod::Password)
+            .await
     }
 
     /// Begin signing in on server `endpoint_id` with a passkey made in the
@@ -567,7 +568,8 @@ impl Client {
             }
             Response::Err(e) => return Err(SdkError::from_server(e)),
         };
-        self.keep_session(server, token).await
+        self.keep_session(server, token, SignInMethod::Passkey)
+            .await
     }
 
     /// Ask server `endpoint_id` to sign this device in by someone approving
@@ -619,7 +621,9 @@ impl Client {
             };
             match self.call(server, None, request).await? {
                 Response::Ok(Reply::LoggedIn { session }) => {
-                    return self.keep_session(server, session).await;
+                    return self
+                        .keep_session(server, session, SignInMethod::Device)
+                        .await;
                 }
                 Response::Ok(Reply::DeviceSignInPending) => {}
                 Response::Ok(other) => {
@@ -632,11 +636,13 @@ impl Client {
         }
     }
 
-    /// Keep `token`, a new session on `server`, under the user it is.
+    /// Keep `token`, a new session on `server` made by `method`, under the
+    /// user it is.
     async fn keep_session(
         &self,
         server: EndpointId,
         token: SessionId,
+        method: SignInMethod,
     ) -> Result<Session, SdkError> {
         let user = match self.call(server, Some(&token), Request::WhoAmI).await? {
             Response::Ok(Reply::WhoAmI(user)) => user,
@@ -655,6 +661,7 @@ impl Client {
             token: Some(token.0.clone()),
             username: user.username.clone(),
             display_name: user.display_name.clone(),
+            method: Some(method),
         });
         session::save(storage, &server, &stored).await?;
         Ok(Session {

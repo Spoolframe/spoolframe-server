@@ -46,6 +46,7 @@ pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
         oidc: Default::default(),
         watch: None,
         artwork: None,
+        metrics: None,
     }
 }
 

@@ -30,7 +30,7 @@ pub use link::{ConnectionPath, ConnectionState, StateWatch};
 pub use servers::ServerEntry;
 pub use session::{
     ActiveProfile, Chunk, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange, PlaybackOptions,
-    ProfileSignIn, SavedProfile, Session, Subtitle,
+    ProfileSignIn, SavedProfile, Session, SignInMethod, Subtitle,
 };
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{

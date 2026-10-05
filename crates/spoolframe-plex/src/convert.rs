@@ -169,6 +169,15 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             id,
             album_id: parent(m, MediaKind::Album)?,
             artist_id: grandparent(m, MediaKind::Artist)?,
+            // A track's own artist (`originalTitle`, from its tags) is set
+            // only where it is not the album's; the album artist is the
+            // `grandparentTitle`. A compilation's album artist is "Various
+            // Artists", so the track's own name is the one to show.
+            artist_name: m
+                .original_title
+                .clone()
+                .or_else(|| m.grandparent_title.clone()),
+            album_title: m.parent_title.clone(),
             title: m.title.clone(),
             track: m.index,
             disc: m.parent_index,
@@ -181,6 +190,19 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             bit_depth: audio_stream(m).and_then(|s| s.bit_depth),
             sample_rate: audio_stream(m).and_then(|s| s.sampling_rate),
             duration: duration(m),
+            // The album's cover is the poster, as on the album; Plex
+            // gives a track its album's as its own thumb too. `art` is
+            // the artist's background.
+            artwork: images(
+                m,
+                [
+                    (
+                        m.parent_thumb.as_deref().or(m.thumb.as_deref()),
+                        ArtworkKind::Poster,
+                    ),
+                    (m.art.as_deref(), ArtworkKind::Background),
+                ],
+            )?,
             playback: PlaybackState::default(),
         }),
     })
@@ -329,9 +351,23 @@ fn grandparent(m: &Metadata, kind: MediaKind) -> Result<MediaId, ConvertError> {
 /// `thumb` as `primary`, and `art` as the background. The key is the PMS
 /// image path; the artwork proxy (P1-05) fetches it.
 fn artwork(m: &Metadata, primary: ArtworkKind) -> Result<Vec<Artwork>, ConvertError> {
-    [(&m.thumb, primary), (&m.art, ArtworkKind::Background)]
+    images(
+        m,
+        [
+            (m.thumb.as_deref(), primary),
+            (m.art.as_deref(), ArtworkKind::Background),
+        ],
+    )
+}
+
+/// Each PMS image path that is there, as artwork of its kind.
+fn images<const N: usize>(
+    m: &Metadata,
+    paths: [(Option<&str>, ArtworkKind); N],
+) -> Result<Vec<Artwork>, ConvertError> {
+    paths
         .into_iter()
-        .filter_map(|(path, kind)| path.as_deref().map(|p| (p, kind)))
+        .filter_map(|(path, kind)| path.map(|p| (p, kind)))
         .map(|(path, kind)| {
             ArtworkId::new(Namespace::Plex, path)
                 .map(|id| Artwork { id, kind })
@@ -612,6 +648,71 @@ mod tests {
         assert_eq!(track.artist_id, id(MediaKind::Artist, "222392"));
         assert_eq!((track.track, track.disc), (Some(1), Some(1)));
         assert_eq!(track.duration, Some(Duration::from_millis(257_386)));
+    }
+
+    /// An album's own tracks say whose they are too (PX-07), so a track
+    /// queued or shown away from its album still does. The fixture is
+    /// hand-written in the shape the PMS sends.
+    #[test]
+    fn an_album_s_tracks_carry_their_artist_album_and_cover() {
+        let tracks: Vec<_> = fixture("children-album-whose")
+            .metadata
+            .iter()
+            .map(|m| match item(m).unwrap() {
+                Item::Track(t) => t,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let whose: Vec<_> = tracks
+            .iter()
+            .map(|t| (t.artist_name.as_deref(), t.album_title.as_deref()))
+            .collect();
+        assert_eq!(
+            whose,
+            [
+                (Some("Mara Quell"), Some("Harbour Lights")),
+                // The track's own artist, from its tags, over the album's.
+                (Some("Mara Quell with The Lanterns"), Some("Harbour Lights")),
+            ]
+        );
+        for track in &tracks {
+            let artwork: Vec<_> = track
+                .artwork
+                .iter()
+                .map(|a| (a.kind, a.id.key().to_owned()))
+                .collect();
+            assert_eq!(
+                artwork,
+                [
+                    (
+                        ArtworkKind::Poster,
+                        "/library/metadata/900100/thumb/1700000100".to_owned()
+                    ),
+                    (
+                        ArtworkKind::Background,
+                        "/library/metadata/900001/art/1700000001".to_owned()
+                    ),
+                ],
+                "{}",
+                track.title
+            );
+        }
+    }
+
+    /// Without a `parentThumb`, the track's own thumb is the cover: Plex
+    /// gives a track its album's.
+    #[test]
+    fn a_track_without_its_album_s_thumb_takes_its_own_as_the_cover() {
+        let Item::Track(track) = only_item("metadata-track") else {
+            panic!("not a track")
+        };
+        let poster: Vec<_> = track
+            .artwork
+            .iter()
+            .filter(|a| a.kind == ArtworkKind::Poster)
+            .map(|a| a.id.key().to_owned())
+            .collect();
+        assert_eq!(poster, ["/library/metadata/223609/thumb/1783793666"]);
     }
 
     #[test]

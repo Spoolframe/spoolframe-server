@@ -694,6 +694,11 @@ mod tests {
             documented.previews.settings().unwrap(),
             bare.previews.settings().unwrap()
         );
+        assert_eq!(documented.admin.metrics(), bare.admin.metrics());
+        assert_eq!(
+            documented.admin.metrics_from().unwrap(),
+            bare.admin.metrics_from().unwrap()
+        );
     }
 
     #[test]

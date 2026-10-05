@@ -10,7 +10,7 @@ exclude = ["vendor"]
 # (ARCHITECTURE §56). Each crate states its own, and
 # `spoolframe-server/tests/it/license_boundary.rs` keeps the two sides apart.
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
 repository = "https://git.coldsteel.casa/Coldsteel/foundry"

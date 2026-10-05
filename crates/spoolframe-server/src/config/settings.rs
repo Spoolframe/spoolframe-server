@@ -63,6 +63,8 @@ pub const SETTINGS: &[Setting] = &[
     restart("admin.public_url"),
     restart("admin.trusted_proxies"),
     live("admin.insecure_cookies"),
+    live("admin.metrics"),
+    live("admin.metrics_from"),
     live("auth.oidc"),
     restart("artwork.cache_mb"),
     live("watch.started_after_secs"),

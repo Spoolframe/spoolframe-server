@@ -794,3 +794,44 @@ async fn replaying_an_unlock_does_not_unlock_a_new_connection() {
     tv.close().await;
     server.stop().await;
 }
+
+#[tokio::test]
+async fn an_old_unlocked_session_cannot_disable_pin_protection() {
+    let (server, tv, session) = locked("pin-recent", ServerOptions::default()).await;
+    ok(&tv, &session, Request::UnlockProfile { pin: PIN.into() }).await;
+    let hash = SessionToken(session.0.clone()).hash();
+    crate::app_passkeys::sql(
+        &server,
+        "UPDATE sessions SET authenticated_at = authenticated_at - 3600 WHERE token_hash = ?1",
+        &hash,
+    )
+    .await;
+    assert_eq!(
+        err(
+            &tv,
+            &session,
+            Request::SetPinRequired {
+                device: None,
+                required: false
+            }
+        )
+        .await,
+        Error::RecentSignInRequired
+    );
+    let Reply::Devices { devices } = ok(&tv, &session, Request::ListDevices).await else {
+        panic!("devices");
+    };
+    assert!(devices[0].pin_required);
+    server.store.confirm_session(&hash).await.unwrap();
+    ok(
+        &tv,
+        &session,
+        Request::SetPinRequired {
+            device: None,
+            required: false,
+        },
+    )
+    .await;
+    tv.close().await;
+    server.stop().await;
+}

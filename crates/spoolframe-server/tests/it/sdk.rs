@@ -11,7 +11,7 @@ use spoolframe_client_sdk::types::{ClientCapabilities, Item, PlaybackState, Vide
 use spoolframe_client_sdk::{
     ArtworkSize, BitmapSubtitles, Client, ConnectionPath, ConnectionState, Device, MAX_READ,
     ManifestKind, MemoryStorage, PinProof, PlaybackHandle, PlaybackOptions, PlaybackPlan,
-    ProfileSignIn, SdkError, Selection, Session, Storage, TopResult,
+    ProfileSignIn, SdkError, Selection, Session, SignInMethod, Storage, TopResult,
 };
 use support::{
     ServerOptions, TestServer, episode, fresh_dir, library, markers, mkv_capabilities, movie,
@@ -101,12 +101,57 @@ async fn sign_in_and_browse() {
     server.stop().await;
 }
 
+/// `session`'s connection path once it is on the LAN, or whatever it is
+/// after `within`: right after a sign-in iroh may not have selected a
+/// path yet.
+async fn settled_path(session: &Session, within: Duration) -> ConnectionPath {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let path = session.connection_path();
+        if matches!(path, ConnectionPath::Lan { .. }) || tokio::time::Instant::now() >= deadline {
+            return path;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// An address only this network reaches: what `ConnectionPath::Lan` is.
+fn on_the_lan(addr: &std::net::SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
+    }
+}
+
 #[tokio::test]
 async fn a_session_says_its_connection_is_direct_on_the_lan() {
-    let (server, client, _) = ready("path").await;
+    let server = TestServer::start("path").await;
+    server
+        .add_user("alice", "correct horse", Some("Alice"))
+        .await;
+    // Only the server's LAN addresses. Given its public IPv6 address as
+    // well, iroh may take that path first, and keeps it: a path as fast
+    // as this one is good enough, and it looks for a better one only
+    // once a minute.
+    let lan: Vec<_> = server
+        .server
+        .addr()
+        .ip_addrs()
+        .copied()
+        .filter(on_the_lan)
+        .collect();
+    assert!(!lan.is_empty(), "the server has no LAN address");
+    let storage = Arc::new(MemoryStorage::default());
+    let client = Client::open(storage, device(mkv_capabilities()))
+        .await
+        .unwrap();
+    client.add_address(&id(&server), lan).unwrap();
+    pin(&client, &server).await;
     let alice = alice(&server, &client).await;
-    let ConnectionPath::Lan { addr } = alice.connection_path() else {
-        panic!("{:?}", alice.connection_path())
+
+    let path = settled_path(&alice, Duration::from_secs(5)).await;
+    let ConnectionPath::Lan { addr } = path else {
+        panic!("not on the LAN within 5 s: {path:?}")
     };
     assert!(
         server.server.addr().ip_addrs().any(|a| *a == addr),
@@ -185,6 +230,46 @@ async fn saved(client: &Client, server: &TestServer) -> Vec<(String, ProfileSign
         .into_iter()
         .map(|p| (p.username, p.sign_in))
         .collect()
+}
+
+/// How each profile this device keeps last signed in.
+async fn methods(client: &Client, server: &TestServer) -> Vec<(String, Option<SignInMethod>)> {
+    client
+        .saved_profiles(&id(server))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.username, p.method))
+        .collect()
+}
+
+/// A password sign-in is remembered past the end of its session and the
+/// app: "Who's watching" can still say how alice signs in.
+#[tokio::test]
+async fn an_ended_profile_remembers_it_signed_in_with_a_password() {
+    let (server, client, storage) = ready("method-password").await;
+    alice(&server, &client).await;
+    server.store.disable_user("alice").await.unwrap();
+    assert!(client.profiles(&id(&server)).await.unwrap().is_empty());
+    assert_eq!(
+        saved(&client, &server).await,
+        [("alice".to_owned(), ProfileSignIn::Password)]
+    );
+    assert_eq!(
+        methods(&client, &server).await,
+        [("alice".to_owned(), Some(SignInMethod::Password))]
+    );
+    client.close().await;
+
+    let again = Client::open(storage.clone(), device(mkv_capabilities()))
+        .await
+        .unwrap();
+    assert_eq!(
+        methods(&again, &server).await,
+        [("alice".to_owned(), Some(SignInMethod::Password))]
+    );
+    again.close().await;
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -808,6 +893,10 @@ async fn a_tv_is_signed_in_from_a_phone_by_its_qr_code() {
     // Kept, as a password sign-in is: the TV's profiles list it.
     let profiles = tv.profiles(&id(&server)).await.unwrap();
     assert_eq!(profiles.len(), 1);
+    assert_eq!(
+        methods(&tv, &server).await,
+        [("alice".to_owned(), Some(SignInMethod::Device))]
+    );
 
     // A second one, refused.
     let sign_in = tv.begin_device_sign_in(&id(&server)).await.unwrap();
@@ -1080,6 +1169,17 @@ async fn an_app_passkey_made_on_the_phone_signs_the_tv_in() {
             .await
             .unwrap_err(),
         SdkError::InvalidCredentials
+    );
+    // Once the session ends, the TV still knows to offer the passkey.
+    server.store.disable_user("alice").await.unwrap();
+    assert!(tv.profiles(&id(&server)).await.unwrap().is_empty());
+    assert_eq!(
+        saved(&tv, &server).await,
+        [("alice".to_owned(), ProfileSignIn::Password)]
+    );
+    assert_eq!(
+        methods(&tv, &server).await,
+        [("alice".to_owned(), Some(SignInMethod::Passkey))]
     );
     tv.close().await;
     phone.close().await;

@@ -109,6 +109,13 @@ admin {
   # over plain HTTP on the LAN works. The cookie then crosses the LAN in
   # clear and page scripts can read it; passkeys still need HTTPS.
   insecure_cookies = false;
+  # Answer GET /metrics on this listener with Prometheus text. Off, it is
+  # not found.
+  metrics = false;
+  # The addresses and CIDR ranges a scraper may read it from,
+  # comma-separated; anyone else is refused. Behind trusted_proxies, the
+  # address the proxy forwards for.
+  metrics_from = "127.0.0.0/8, ::1";
 }
 
 # Single sign-on (P3-04): OpenID Connect providers a user may link to

@@ -94,6 +94,10 @@ impl Catalog for LiveCatalog {
         self.current()?.artwork(id).await
     }
 
+    async fn authorize_artwork(&self, id: &ArtworkId) -> Result<(), CatalogError> {
+        self.current()?.authorize_artwork(id).await
+    }
+
     async fn preview_frames(&self, id: &MediaId) -> Result<Option<PreviewFrames>, CatalogError> {
         self.current()?.preview_frames(id).await
     }

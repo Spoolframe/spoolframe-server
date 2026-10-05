@@ -419,6 +419,13 @@ impl Catalog for FakeCatalog {
     }
 
     /// A 400×200 PNG at the movie's poster path; nothing else.
+    async fn authorize_artwork(
+        &self,
+        _id: &spoolframe_types::ArtworkId,
+    ) -> Result<(), CatalogError> {
+        Ok(())
+    }
+
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
         if id.key() != POSTER {
             return Err(CatalogError::NotFound(id.to_string()));

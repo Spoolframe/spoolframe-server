@@ -566,3 +566,31 @@ async fn an_expired_code_is_not_approved_in_a_browser() {
     tv.close().await;
     server.stop().await;
 }
+
+#[tokio::test]
+async fn an_old_session_cannot_approve_a_fresh_session() {
+    let server = server("dsi-recent", ServerOptions::default()).await;
+    let (tv, _request, code) = tv_begins(&server).await;
+    let (phone, session) = phone(&server).await;
+    let hash = spoolframe_server::auth::SessionToken(session.0.clone()).hash();
+    crate::app_passkeys::sql(
+        &server,
+        "UPDATE sessions SET authenticated_at = authenticated_at - 3600 WHERE token_hash = ?1",
+        &hash,
+    )
+    .await;
+    assert_eq!(
+        phone.call(Some(&session), approve(&code)).await,
+        Response::Err(Error::RecentSignInRequired)
+    );
+    // Refusal must not consume the sign-in code.
+    assert!(server.auth.sign_ins().lookup(&code).is_some());
+    server.store.confirm_session(&hash).await.unwrap();
+    assert_eq!(
+        phone.call(Some(&session), approve(&code)).await,
+        Response::Ok(Reply::Done)
+    );
+    tv.close().await;
+    phone.close().await;
+    server.stop().await;
+}

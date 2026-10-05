@@ -1,0 +1,48 @@
+{
+  "MediaContainer": {
+    "size": 2,
+    "librarySectionID": 12,
+    "librarySectionTitle": "Music",
+    "title1": "Mara Quell",
+    "title2": "Harbour Lights",
+    "Metadata": [
+      {
+        "ratingKey": "900102",
+        "key": "/library/metadata/900102",
+        "parentRatingKey": "900100",
+        "grandparentRatingKey": "900001",
+        "type": "track",
+        "title": "Low Tide",
+        "grandparentTitle": "Mara Quell",
+        "parentTitle": "Harbour Lights",
+        "index": 2,
+        "parentIndex": 1,
+        "thumb": "/library/metadata/900100/thumb/1700000100",
+        "parentThumb": "/library/metadata/900100/thumb/1700000100",
+        "grandparentThumb": "/library/metadata/900001/thumb/1700000001",
+        "art": "/library/metadata/900001/art/1700000001",
+        "duration": 201000,
+        "Media": [{ "id": 1, "container": "flac", "audioCodec": "flac" }]
+      },
+      {
+        "ratingKey": "900103",
+        "key": "/library/metadata/900103",
+        "parentRatingKey": "900100",
+        "grandparentRatingKey": "900001",
+        "type": "track",
+        "title": "Signal Fire",
+        "originalTitle": "Mara Quell with The Lanterns",
+        "grandparentTitle": "Mara Quell",
+        "parentTitle": "Harbour Lights",
+        "index": 3,
+        "parentIndex": 1,
+        "thumb": "/library/metadata/900100/thumb/1700000100",
+        "parentThumb": "/library/metadata/900100/thumb/1700000100",
+        "grandparentThumb": "/library/metadata/900001/thumb/1700000001",
+        "art": "/library/metadata/900001/art/1700000001",
+        "duration": 188000,
+        "Media": [{ "id": 2, "container": "flac", "audioCodec": "flac" }]
+      }
+    ]
+  }
+}

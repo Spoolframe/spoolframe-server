@@ -17,6 +17,7 @@ mod endpoint;
 mod lan;
 mod libraries;
 mod license_boundary;
+mod metrics;
 mod not_set_up;
 mod passkey_setup;
 mod passkeys;

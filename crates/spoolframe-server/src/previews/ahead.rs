@@ -305,6 +305,13 @@ mod tests {
         async fn recently_added(&self, _: u32) -> Result<Vec<Item>, CatalogError> {
             Ok(vec![movie("m7"), episode("e2")])
         }
+        async fn authorize_artwork(
+            &self,
+            _id: &spoolframe_types::ArtworkId,
+        ) -> Result<(), CatalogError> {
+            Ok(())
+        }
+
         async fn artwork(&self, _: &ArtworkId) -> Result<Image, CatalogError> {
             unreachable!()
         }

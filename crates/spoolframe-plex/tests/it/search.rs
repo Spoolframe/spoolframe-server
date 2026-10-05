@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use spoolframe_catalog::{CatalogError, Found, FoundGroup, SearchQuery};
 use spoolframe_plex::PlexCatalog;
-use spoolframe_types::{Item, PersonRole, SearchKind, SearchScope};
+use spoolframe_types::{ArtworkKind, Item, PersonRole, SearchKind, SearchScope};
 use wiremock::matchers::{method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -154,6 +154,43 @@ async fn music_asks_the_music_section_for_artists_albums_and_tracks_only() {
     let asked = searched(&server).await;
     let music = |t: &str| ("/library/sections/12/search".to_owned(), t.to_owned());
     assert_eq!(asked, HashSet::from([music("8"), music("9"), music("10")]));
+}
+
+/// A track found alone says whose it is (PX-07): the reply is
+/// hand-written in the shape the PMS sends, since a search result has no
+/// album or artist around it to say so.
+#[tokio::test]
+async fn a_track_found_carries_its_artist_album_and_cover() {
+    let server = pms(&["low-tide"]).await;
+    let found = catalog(&server)
+        .find(&query("low tide", SearchScope::Music.kinds()))
+        .await
+        .unwrap();
+    let [Item::Track(track)] = group(&found, SearchKind::Tracks).items.as_slice() else {
+        panic!("{found:?}")
+    };
+    assert_eq!(
+        (track.artist_name.as_deref(), track.album_title.as_deref()),
+        (Some("Mara Quell"), Some("Harbour Lights"))
+    );
+    let artwork: Vec<_> = track
+        .artwork
+        .iter()
+        .map(|a| (a.kind, a.id.to_string()))
+        .collect();
+    assert_eq!(
+        artwork,
+        [
+            (
+                ArtworkKind::Poster,
+                "plex:/library/metadata/900100/thumb/1700000100".to_owned()
+            ),
+            (
+                ArtworkKind::Background,
+                "plex:/library/metadata/900001/art/1700000001".to_owned()
+            ),
+        ]
+    );
 }
 
 #[tokio::test]

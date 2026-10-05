@@ -51,6 +51,10 @@ pub struct SearchResults {
 /// `Request::PersonItems`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per search, built once and encoded at once; boxing would only add noise"
+)]
 pub enum TopResult {
     Item(Item),
     Person(Person),

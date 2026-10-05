@@ -11,7 +11,7 @@ use spoolframe_protocol::{
     Reply, Request, Response, SearchRequest, SearchResults, SessionId, TopResult,
 };
 use spoolframe_server::catalog::{Composite, LiveCatalog};
-use spoolframe_types::{Item, Person, SearchKind, SearchScope};
+use spoolframe_types::{ArtworkKind, Item, Person, SearchKind, SearchScope};
 use wiremock::matchers::{method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -187,6 +187,37 @@ async fn each_scope_returns_only_its_kinds() {
             assert!(scope.kinds().contains(&g.kind), "{query} in {scope:?}");
         }
     }
+    searcher.stop().await;
+}
+
+/// A track that is the top match says whose it is (PX-07), so a client
+/// shows more than its title on a blank tile. `low-tide` is hand-written
+/// in the shape the PMS sends, not recorded.
+#[tokio::test]
+async fn a_track_at_the_top_says_whose_it_is_and_has_its_cover() {
+    let pms = pms(&["low-tide"]).await;
+    let searcher = Searcher::start("search-track-whose", &pms).await;
+    let results = searcher
+        .search(request("low tide", SearchScope::Music))
+        .await;
+    let Some(TopResult::Item(Item::Track(track))) = &results.top else {
+        panic!("{:?}", results.top)
+    };
+    assert_eq!(
+        (
+            track.title.as_str(),
+            track.artist_name.as_deref(),
+            track.album_title.as_deref()
+        ),
+        ("Low Tide", Some("Mara Quell"), Some("Harbour Lights"))
+    );
+    let poster: Vec<_> = track
+        .artwork
+        .iter()
+        .filter(|a| a.kind == ArtworkKind::Poster)
+        .map(|a| a.id.to_string())
+        .collect();
+    assert_eq!(poster, ["plex:/library/metadata/900100/thumb/1700000100"]);
     searcher.stop().await;
 }
 

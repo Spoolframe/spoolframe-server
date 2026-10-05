@@ -153,6 +153,12 @@ pub struct Track {
     pub id: MediaId,
     pub album_id: MediaId,
     pub artist_id: MediaId,
+    /// Who it is by, so a track shown alone (a search result, a queue)
+    /// says whose it is: the track's own artist where its tags name one
+    /// ("Adele with Chris Stapleton"), else its album's.
+    pub artist_name: Option<String>,
+    /// Its album's title, for the same reason.
+    pub album_title: Option<String>,
     pub title: String,
     /// Position on its disc, when the tags say.
     pub track: Option<u32>,
@@ -172,6 +178,8 @@ pub struct Track {
     pub sample_rate: Option<u32>,
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,
+    /// Its album's cover as the poster, and its artist's background.
+    pub artwork: Vec<Artwork>,
     pub playback: PlaybackState,
 }
 
@@ -279,6 +287,8 @@ mod tests {
             id: media(MediaKind::Track, "224630"),
             album_id: media(MediaKind::Album, "224629"),
             artist_id: media(MediaKind::Artist, "224303"),
+            artist_name: None,
+            album_title: None,
             title: "Catch".into(),
             track: Some(1),
             disc: Some(1),
@@ -287,6 +297,7 @@ mod tests {
             bit_depth: Some(24),
             sample_rate: Some(96_000),
             duration: None,
+            artwork: Vec::new(),
             playback: PlaybackState::default(),
         };
         let json = serde_json::to_value(&track).unwrap();
@@ -429,6 +440,8 @@ mod tests {
             id: media(MediaKind::Track, "32"),
             album_id: media(MediaKind::Album, "31"),
             artist_id: media(MediaKind::Artist, "30"),
+            artist_name: Some("Boards of Canada".into()),
+            album_title: Some("Music Has the Right to Children".into()),
             title: "Roygbiv".into(),
             track: Some(10),
             disc: Some(1),
@@ -437,6 +450,7 @@ mod tests {
             bit_depth: Some(16),
             sample_rate: Some(44_100),
             duration: Some(Duration::from_secs(151)),
+            artwork: poster(),
             playback: PlaybackState {
                 position: None,
                 watched: true,

@@ -224,6 +224,40 @@ impl std::str::FromStr for TrustedProxies {
     }
 }
 
+/// Addresses and CIDR ranges a scraper may read `GET /metrics` from
+/// (`admin.metrics_from`, P3-14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressRanges(Vec<Network>);
+
+impl AddressRanges {
+    /// What `admin.metrics_from` is when left out.
+    pub const LOOPBACK: &'static str = "127.0.0.0/8, ::1";
+
+    /// This machine's loopback addresses, IPv4 and IPv6.
+    pub fn loopback() -> Self {
+        Self::LOOPBACK.parse().expect("fixed ranges")
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        self.0.iter().any(|network| network.contains(ip))
+    }
+}
+
+impl std::str::FromStr for AddressRanges {
+    type Err = String;
+
+    /// A comma-separated list of addresses and CIDR ranges; an empty one
+    /// lets nobody in.
+    fn from_str(list: &str) -> Result<Self, String> {
+        list.split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+}
+
 /// The header a trusted proxy names its caller in. `Forwarded` (RFC 7239)
 /// is not read.
 const FORWARDED_FOR: &str = "x-forwarded-for";
@@ -331,6 +365,7 @@ fn router(
         .route("/auth/me", get(me))
         .route("/auth/site", get(site))
         .route("/catalog/artwork", get(catalog_artwork))
+        .route("/metrics", get(metrics))
         .with_state(api)
         // The socket: `/jsonrpc` for the web UI, and any other path's
         // upgrade too, which is where the CLI has always connected. Except
@@ -848,6 +883,30 @@ async fn catalog_artwork(State(api): State<AdminApi>, req: Request) -> Response<
         }
         Err(e) => failure(e),
     }
+}
+
+/// `GET /metrics` (P3-14): Prometheus text, for a scraper at one of
+/// `admin.metrics_from`'s addresses. Not found while `admin.metrics` is
+/// off, so the listener does not even say it could; refused from anywhere
+/// else. The caller is who a trusted proxy says it carries: a proxy on
+/// this machine does not make the Internet loopback.
+async fn metrics(State(api): State<AdminApi>, req: Request) -> Response<Body> {
+    let Some(metrics) = api.metrics().filter(|m| m.access().enabled()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let caller = req.extensions().get::<Peer>().and_then(|peer| peer.0);
+    if !caller.is_some_and(|ip| metrics.access().allows(ip)) {
+        tracing::debug!(
+            ?caller,
+            "metrics refused to an address not in admin.metrics_from"
+        );
+        return (StatusCode::FORBIDDEN, "not from this address").into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, crate::metrics::CONTENT_TYPE)],
+        crate::metrics::render(&metrics.families()),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

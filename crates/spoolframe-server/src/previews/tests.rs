@@ -55,6 +55,13 @@ impl Catalog for Files {
     async fn recently_added(&self, _: u32) -> Result<Vec<Item>, CatalogError> {
         unreachable!()
     }
+    async fn authorize_artwork(
+        &self,
+        _id: &spoolframe_types::ArtworkId,
+    ) -> Result<(), CatalogError> {
+        Ok(())
+    }
+
     async fn artwork(&self, _: &ArtworkId) -> Result<Image, CatalogError> {
         unreachable!()
     }

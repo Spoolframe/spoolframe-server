@@ -1342,7 +1342,7 @@ pub trait MeApi {
     -> jsonrpsee::core::RpcResult<DeviceSignIn>;
 
     /// Sign that device in as the caller: it gets a session of its own. A
-    /// code is good once.
+    /// code is good once. Requires a recent sign-in or confirmation.
     #[method(name = "deviceSignInApprove", with_extensions)]
     async fn device_sign_in_approve(&self, code: String) -> jsonrpsee::core::RpcResult<()>;
 

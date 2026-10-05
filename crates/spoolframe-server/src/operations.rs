@@ -19,8 +19,24 @@ struct Entry {
     outcome: watch::Receiver<Option<RpcReply>>,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct Operations(Mutex<HashMap<(String, String), Entry>>);
+#[derive(Debug)]
+pub(crate) struct Operations {
+    entries: Mutex<HashMap<(String, String), Entry>>,
+    max_operations: usize,
+    max_bytes: usize,
+    per_endpoint: usize,
+}
+
+impl Default for Operations {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::default(),
+            max_operations: MAX_OPERATIONS,
+            max_bytes: MAX_BYTES,
+            per_endpoint: 512,
+        }
+    }
+}
 
 pub(crate) struct Invocation {
     pub outcome: watch::Receiver<Option<RpcReply>>,
@@ -28,14 +44,42 @@ pub(crate) struct Invocation {
 }
 
 impl Operations {
-    pub fn begin(
+    /// Anonymous sign-in outcomes cannot consume authenticated capacity.
+    pub fn anonymous() -> Self {
+        Self {
+            max_operations: 512,
+            max_bytes: 8 << 20,
+            per_endpoint: 64,
+            ..Self::default()
+        }
+    }
+
+    /// Recover an existing invocation without admitting unauthenticated work.
+    /// Exact replays (including logout) keep their outcome after session revocation.
+    pub fn lookup(
         &self,
         endpoint: &str,
         instance: &str,
         operation: &Operation,
         fingerprint: [u8; 32],
         now: u64,
-    ) -> Result<Invocation, Error> {
+    ) -> Result<Option<Invocation>, Error> {
+        Self::validate(instance, operation, now)?;
+        let mut entries = self.entries.lock().expect("never poisoned");
+        entries.retain(|_, entry| entry.expires > now);
+        let Some(entry) = entries.get(&(endpoint.to_owned(), operation.id.clone())) else {
+            return Ok(None);
+        };
+        if entry.fingerprint != fingerprint {
+            return Err(Error::OperationConflict);
+        }
+        Ok(Some(Invocation {
+            outcome: entry.outcome.clone(),
+            execute: None,
+        }))
+    }
+
+    fn validate(instance: &str, operation: &Operation, now: u64) -> Result<(), Error> {
         if operation.instance != instance {
             return Err(Error::ServerRestarted);
         }
@@ -50,8 +94,20 @@ impl Operations {
                 message: "invalid operation ID or expiry".into(),
             });
         }
+        Ok(())
+    }
+
+    pub fn begin(
+        &self,
+        endpoint: &str,
+        instance: &str,
+        operation: &Operation,
+        fingerprint: [u8; 32],
+        now: u64,
+    ) -> Result<Invocation, Error> {
+        Self::validate(instance, operation, now)?;
         let key = (endpoint.to_owned(), operation.id.clone());
-        let mut entries = self.0.lock().expect("never poisoned");
+        let mut entries = self.entries.lock().expect("never poisoned");
         entries.retain(|_, entry| entry.expires > now);
         if let Some(entry) = entries.get(&key) {
             if entry.fingerprint != fingerprint {
@@ -62,8 +118,10 @@ impl Operations {
                 execute: None,
             });
         }
-        if entries.len() >= MAX_OPERATIONS
-            || entries.values().map(|entry| entry.bytes).sum::<usize>() > MAX_BYTES - RESERVATION
+        if entries.len() >= self.max_operations
+            || entries.values().map(|entry| entry.bytes).sum::<usize>()
+                > self.max_bytes - RESERVATION
+            || entries.keys().filter(|(peer, _)| peer == endpoint).count() >= self.per_endpoint
         {
             return Err(Error::RateLimited {
                 retry_after_ms: 1000,
@@ -104,7 +162,7 @@ impl Operations {
                 RESERVATION
             }
         };
-        let mut entries = self.0.lock().expect("never poisoned");
+        let mut entries = self.entries.lock().expect("never poisoned");
         if let Some(entry) = entries.get_mut(&(endpoint.to_owned(), id.to_owned())) {
             entry.bytes = bytes;
         }
@@ -139,6 +197,60 @@ mod tests {
             instance: "process-1".into(),
             expires_at_ms: 10_000,
         }
+    }
+
+    #[test]
+    fn anonymous_capacity_is_isolated_and_replays_still_work_when_full() {
+        let anonymous = Operations::anonymous();
+        let authenticated = Operations::default();
+        let mut op = operation();
+        // Completed failures still count against the anonymous endpoint quota.
+        for i in 0..anonymous.per_endpoint {
+            op.id = i.to_string();
+            let invocation = anonymous
+                .begin("peer", "process-1", &op, [1; 32], 1)
+                .unwrap();
+            anonymous.finish(
+                "peer",
+                &op.id,
+                invocation.execute.unwrap(),
+                Response::Err(Error::Unauthenticated).into(),
+            );
+        }
+        op.id = "overflow".into();
+        assert!(matches!(
+            anonymous.begin("peer", "process-1", &op, [1; 32], 1),
+            Err(Error::RateLimited { .. })
+        ));
+        assert!(
+            authenticated
+                .begin("peer", "process-1", &op, [1; 32], 1)
+                .is_ok()
+        );
+        op.id = "0".into();
+        assert!(
+            anonymous
+                .lookup("peer", "process-1", &op, [1; 32], 1)
+                .unwrap()
+                .unwrap()
+                .execute
+                .is_none()
+        );
+        assert!(matches!(
+            anonymous.lookup("peer", "process-1", &op, [2; 32], 1),
+            Err(Error::OperationConflict)
+        ));
+        // Independent endpoints can fill only the anonymous pool.
+        let mut pending = Vec::new();
+        for i in 0..8 {
+            pending.push(anonymous.begin(&format!("other-{i}"), "process-1", &op, [1; 32], 1));
+        }
+        assert!(pending.iter().any(Result::is_err));
+        assert!(
+            authenticated
+                .begin("legitimate", "process-1", &op, [1; 32], 1)
+                .is_ok()
+        );
     }
 
     #[tokio::test]

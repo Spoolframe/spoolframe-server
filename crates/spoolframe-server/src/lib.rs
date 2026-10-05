@@ -17,6 +17,7 @@ pub mod encode;
 pub mod identity;
 mod keyed_locks;
 pub mod libraries;
+pub mod metrics;
 pub mod network;
 pub mod oidc;
 mod operations;

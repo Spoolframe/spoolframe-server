@@ -222,6 +222,15 @@ impl ArtworkCache {
         if size == ArtworkSize::Unknown {
             return Err(ArtworkError::BadSize(size));
         }
+        self.catalog.authorize_artwork(id).await?;
+        self.get_authorized(id, size).await
+    }
+
+    async fn get_authorized(
+        &self,
+        id: &ArtworkId,
+        size: ArtworkSize,
+    ) -> Result<Artwork, ArtworkError> {
         let key = cache_key(id, size);
         if let Some(hit) = self.read(&key).await? {
             return Ok(hit);
@@ -241,7 +250,7 @@ impl ArtworkCache {
         };
         // Every size is made from the cached original, so the catalog is
         // asked once per artwork, not once per size.
-        let original = Box::pin(self.get(id, ArtworkSize::Original)).await?;
+        let original = Box::pin(self.get_authorized(id, ArtworkSize::Original)).await?;
         tokio::task::spawn_blocking(move || resize(original, width))
             .await
             .map_err(|e| ArtworkError::Image(e.to_string()))?
@@ -340,6 +349,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct Counting {
         fetches: AtomicUsize,
+        denied: std::sync::atomic::AtomicBool,
     }
 
     fn png(width: u32, height: u32) -> Vec<u8> {
@@ -377,6 +387,16 @@ mod tests {
         async fn recently_added(&self, _: u32) -> Result<Vec<Item>, CatalogError> {
             unreachable!()
         }
+        async fn authorize_artwork(
+            &self,
+            id: &spoolframe_types::ArtworkId,
+        ) -> Result<(), CatalogError> {
+            if self.denied.load(Ordering::SeqCst) {
+                return Err(CatalogError::NotServed(id.to_string()));
+            }
+            Ok(())
+        }
+
         async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
             self.fetches.fetch_add(1, Ordering::SeqCst);
             if id.key().ends_with("/404") {
@@ -419,6 +439,21 @@ mod tests {
 
     fn fetches(c: &Counting) -> usize {
         c.fetches.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn removing_a_library_denies_cached_originals_and_resized_images() {
+        let (cache, catalog, _dir) = cache("authorization", u64::MAX).await;
+        cache.get(&id(1), ArtworkSize::Small).await.unwrap();
+        let fetched = catalog.fetches.load(Ordering::SeqCst);
+        catalog.denied.store(true, Ordering::SeqCst);
+        for size in [ArtworkSize::Small, ArtworkSize::Original] {
+            assert!(matches!(
+                cache.get(&id(1), size).await,
+                Err(ArtworkError::Catalog(CatalogError::NotServed(_)))
+            ));
+        }
+        assert_eq!(catalog.fetches.load(Ordering::SeqCst), fetched);
     }
 
     #[tokio::test]

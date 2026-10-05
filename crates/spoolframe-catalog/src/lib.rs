@@ -164,6 +164,10 @@ pub trait Catalog: Send + Sync {
     /// The most recently added items, newest first, at most `limit`.
     async fn recently_added(&self, limit: u32) -> Result<Vec<Item>, CatalogError>;
 
+    /// Check the image's owning item against the libraries currently served.
+    /// Call before serving cached bytes too; a cached image grants no access.
+    async fn authorize_artwork(&self, id: &ArtworkId) -> Result<(), CatalogError>;
+
     /// The image an `ArtworkId` names, at the size the catalog has it.
     /// Never anything but an image.
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError>;

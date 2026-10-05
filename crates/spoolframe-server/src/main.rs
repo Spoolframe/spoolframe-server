@@ -18,6 +18,7 @@ use spoolframe_server::config::secrets::Secrets;
 use spoolframe_server::config::{ServerConfig, WatchSyncConfig};
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
+use spoolframe_server::metrics::Metrics;
 use spoolframe_server::network::{Server, ServerName, Services};
 use spoolframe_server::oidc::Oidc;
 use spoolframe_server::passkeys::Passkeys;
@@ -455,6 +456,11 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
     // process started from a service inherits it, a shell and what it
     // runs included.
     let supervised = std::env::var_os("SPOOLFRAME_SUPERVISED").is_some_and(|v| !v.is_empty());
+    // GET /metrics (P3-14): its settings are live.
+    let metrics = Arc::new(Metrics::default());
+    metrics
+        .access()
+        .set(config.admin.metrics(), config.admin.metrics_from()?);
     let settings = Arc::new(RuntimeSettings::new(
         layers.clone(),
         state_dir,
@@ -466,6 +472,7 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             jobs: Some(jobs.clone()),
             previews: Some(previews.clone()),
             oidc: Some(oidc.clone()),
+            metrics: Some(metrics.clone()),
         },
         supervised,
     ));
@@ -488,6 +495,7 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             oidc,
             watch: Some(watch.clone()),
             artwork: Some(artwork.clone()),
+            metrics: Some(metrics.clone()),
         },
         admin_origins,
         admin_proxies,

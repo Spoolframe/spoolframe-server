@@ -135,12 +135,16 @@ pub struct Metadata {
     pub parent_index: Option<u32>,
     pub parent_rating_key: Option<String>,
     pub grandparent_rating_key: Option<String>,
-    /// An episode's show's title.
+    /// An episode's show's title, a track's album artist's name.
     pub grandparent_title: Option<String>,
-    /// A season's show's title, an album's artist's name.
+    /// A season's show's title, an album's artist's name, a track's
+    /// album's title.
     pub parent_title: Option<String>,
+    /// A track's own artist, from its tags, when it is not the album's:
+    /// "Adele with Chris Stapleton" on an Adele album.
+    pub original_title: Option<String>,
     /// The parent's and grandparent's images: an episode's season poster
-    /// and show poster.
+    /// and show poster, a track's album cover and artist picture.
     pub parent_thumb: Option<String>,
     pub grandparent_thumb: Option<String>,
     pub thumb: Option<String>,

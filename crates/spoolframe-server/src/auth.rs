@@ -435,6 +435,8 @@ impl Auth {
 
     /// Open a session on the device `claim` names, as `user`, who approved
     /// it from a session of their own (P3-07): that session is the proof.
+    /// The caller must require recent authentication before claiming the code:
+    /// the approved session receives a fresh authentication timestamp.
     /// The device gets the token through [`DeviceSignIns::fulfil`].
     pub async fn approve_device(
         &self,

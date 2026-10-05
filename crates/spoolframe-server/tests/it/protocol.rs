@@ -261,3 +261,22 @@ async fn the_server_says_it_is_shutting_down() {
     shutdown.await.unwrap();
     client.endpoint.close().await;
 }
+
+#[tokio::test]
+async fn unauthenticated_mutations_cannot_exhaust_replay_capacity() {
+    let (server, client) = connect("unauthenticated-capacity").await;
+    server.add_user("alice", "correct horse", None).await;
+    client.hello().await;
+    for _ in 0..4100 {
+        assert_eq!(
+            client.call(None, Request::Logout).await,
+            Response::Err(Error::Unauthenticated)
+        );
+    }
+    let session = client.login("alice", "correct horse").await;
+    assert_eq!(
+        client.call(Some(&session), Request::Logout).await,
+        Response::Ok(Reply::LoggedOut)
+    );
+    close(server, client).await;
+}
