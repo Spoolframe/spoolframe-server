@@ -49,6 +49,9 @@ pub enum Sidecar {
 /// One playback.
 #[derive(Debug, Clone)]
 pub struct Playback {
+    pub revision: u64,
+    pub progress_sequence: u64,
+    progress_superseded: bool,
     pub session: SessionId,
     /// Hex `EndpointId`.
     pub endpoint: String,
@@ -111,6 +114,8 @@ pub struct Playbacks {
     recheck: Duration,
     disconnect_grace: Duration,
     handles: Mutex<HashMap<String, Playback>>,
+    controls: crate::keyed_locks::KeyedLocks,
+    progress_controls: crate::keyed_locks::KeyedLocks,
 }
 
 impl Default for Playbacks {
@@ -126,6 +131,8 @@ impl Playbacks {
             recheck,
             disconnect_grace: DISCONNECT_GRACE,
             handles: Mutex::default(),
+            controls: Default::default(),
+            progress_controls: Default::default(),
         }
     }
 
@@ -144,6 +151,25 @@ impl Playbacks {
         self.handles.lock().expect("never held across a panic")
     }
 
+    /// Serialize changes to this handle. The caller must look up the
+    /// playback again after acquiring this guard: a preceding operation
+    /// may have replaced its conversion or stopped it entirely.
+    pub(crate) async fn control(
+        &self,
+        handle: &PlaybackHandle,
+        session: &SessionId,
+        endpoint: &str,
+    ) -> Result<crate::keyed_locks::Guard<'_>, Refusal> {
+        {
+            let handles = self.lock();
+            let playback = handles.get(&handle.0).ok_or(Refusal::Expired)?;
+            if &playback.session != session || playback.endpoint != endpoint {
+                return Err(Refusal::NotYours);
+            }
+        }
+        Ok(self.controls.lock(&handle.0).await)
+    }
+
     /// A new, unguessable handle, before its playback is opened: a
     /// conversion names its files after it.
     pub fn new_handle() -> PlaybackHandle {
@@ -159,9 +185,17 @@ impl Playbacks {
         let mut handles = self.lock();
         // Forget idle handles here rather than on a timer.
         handles.retain(|_, p| now.duration_since(p.last_used) < self.idle);
+        for previous in handles.values_mut() {
+            if previous.session == opened.session && previous.item == opened.item {
+                previous.progress_superseded = true;
+            }
+        }
         handles.insert(
             handle.0.clone(),
             Playback {
+                revision: 0,
+                progress_sequence: 0,
+                progress_superseded: false,
                 session: opened.session,
                 endpoint: opened.endpoint,
                 item: opened.item,
@@ -183,6 +217,7 @@ impl Playbacks {
     pub fn change(&self, handle: &PlaybackHandle, changed: Changed) -> Option<Arc<Conversion>> {
         let mut handles = self.lock();
         let playback = handles.get_mut(&handle.0)?;
+        playback.revision += 1;
         playback.selection = changed.selection;
         playback.size = changed.size;
         playback.subtitle = changed.subtitle;
@@ -231,6 +266,43 @@ impl Playbacks {
     pub fn touch(&self, handle: &PlaybackHandle) {
         if let Some(p) = self.lock().get_mut(&handle.0) {
             p.last_used = Instant::now();
+        }
+    }
+
+    pub fn revised(&self, handle: &PlaybackHandle) {
+        if let Some(playback) = self.lock().get_mut(&handle.0) {
+            playback.revision += 1;
+        }
+    }
+
+    pub(crate) async fn progress_control(
+        &self,
+        session: &SessionId,
+        item: &MediaId,
+    ) -> crate::keyed_locks::Guard<'_> {
+        self.progress_controls
+            .lock(&format!("{}:{item}", session.0))
+            .await
+    }
+
+    pub(crate) fn check_progress(
+        &self,
+        handle: &PlaybackHandle,
+        sequence: u64,
+    ) -> Result<(), spoolframe_protocol::Error> {
+        let handles = self.lock();
+        let playback = handles
+            .get(&handle.0)
+            .ok_or(spoolframe_protocol::Error::PlaybackExpired)?;
+        if playback.progress_superseded || sequence <= playback.progress_sequence {
+            return Err(spoolframe_protocol::Error::StaleProgress);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_progress(&self, handle: &PlaybackHandle, sequence: u64) {
+        if let Some(playback) = self.lock().get_mut(&handle.0) {
+            playback.progress_sequence = sequence;
         }
     }
 

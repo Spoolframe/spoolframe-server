@@ -31,7 +31,7 @@ pub const LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 /// The longest one `AwaitDeviceSignIn` waits before `Pending`: short of
 /// any idle timeout between the TV and the server.
-pub const AWAIT: Duration = Duration::from_secs(25);
+pub const AWAIT: Duration = spoolframe_protocol::policy::wait::SIGN_IN;
 
 /// Sign-ins one device may have pending at once.
 pub const MAX_PENDING_PER_DEVICE: usize = 3;

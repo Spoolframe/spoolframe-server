@@ -35,3 +35,5 @@ pub use preferences::{
 };
 pub use role::Role;
 pub use search::{Person, PersonRole, SearchKind, SearchScope};
+
+pub mod pin;

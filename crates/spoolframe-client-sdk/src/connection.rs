@@ -17,10 +17,14 @@ use serde::de::DeserializeOwned;
 use spoolframe_protocol::codec::{CodecError, read_frame, write_frame};
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{
-    ArtworkRequest, ArtworkResponse, CLIENT_ALPN, Hello, MediaRead, MediaReadResponse,
+    ArtworkRequest, ArtworkResponse, CLIENT_ALPN, Hello, MAX_READ, MediaRead, MediaReadResponse,
     PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId,
 };
 use tokio::io::AsyncWriteExt;
+
+use spoolframe_protocol::policy::{server_wait, wait};
+use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
+use spoolframe_protocol::rpc::{RpcReply, RpcRequest, RpcResponse, ServerInstance};
 
 use crate::client::Device;
 use crate::error::SdkError;
@@ -28,6 +32,10 @@ use crate::link::ConnectionPath;
 
 /// How long a dial may take before the server counts as unreachable.
 pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Local SDK allocation policy, not a new wire restriction. Even an
+/// original image must fit this budget before the SDK buffers it.
+const MAX_ARTWORK_BYTES: u64 = 64 << 20;
 
 /// How long the SDK waits for a server's answers.
 ///
@@ -57,25 +65,6 @@ impl Default for Timeouts {
     }
 }
 
-/// The server's own waits, mirrored from it. Each is how long the server
-/// may take before it answers, not counting the round trip.
-mod wait {
-    use std::time::Duration;
-
-    /// `AwaitDeviceSignIn` (the server's `device_sign_in::AWAIT`).
-    pub const SIGN_IN: Duration = Duration::from_secs(25);
-    /// A read past what an encode has written, or of a subtitle still
-    /// being read as text (the server's `READ_WAIT`).
-    pub const READ: Duration = Duration::from_secs(10);
-    /// A request that may run ffprobe on the file (`Prober::DEFAULT_TIMEOUT`).
-    pub const PROBE: Duration = Duration::from_secs(30);
-    /// Starting a playback, or changing its subtitle: a probe, and for HLS
-    /// of a copied video every keyframe of the file, which the server
-    /// bounds only at 10 minutes. Two minutes is longer than a player
-    /// should spin; past it the user is better told.
-    pub const PLAYBACK: Duration = Duration::from_secs(120);
-}
-
 impl Timeouts {
     /// How long `request` may take to be answered.
     pub(crate) fn of(&self, request: &Request) -> Duration {
@@ -88,88 +77,11 @@ impl Timeouts {
     }
 }
 
-/// How long the server may hold `request` before it answers.
-fn server_wait(request: &Request) -> Duration {
-    match request {
-        Request::AwaitDeviceSignIn { .. } => wait::SIGN_IN,
-        Request::ReadSubtitle { .. } | Request::ReadSubtitleSegment { .. } => wait::READ,
-        Request::Tracks { .. }
-        | Request::PlaybackPlan { .. }
-        | Request::SetTrackOverride { .. } => wait::PROBE,
-        Request::StartPlayback { .. } | Request::ChangeSubtitle { .. } => wait::PLAYBACK,
-        _ => Duration::ZERO,
-    }
-}
-
-/// Whether `request` may be sent a second time, on a new connection, when
-/// the first one died before it was answered. Only requests that read:
-/// one that changes something may have been done before its answer was
-/// lost, and doing it twice is not the same as once (a sign-in approved
-/// twice, a PIN tried twice). Every request is named, so a new one is
-/// decided here when it is added.
-pub(crate) fn retry_safe(request: &Request) -> bool {
-    match request {
-        Request::Hello(_)
-        | Request::AuthMethods
-        | Request::Ping
-        | Request::Libraries
-        | Request::Items { .. }
-        | Request::Item { .. }
-        | Request::Search(_)
-        | Request::PersonItems { .. }
-        | Request::Tracks { .. }
-        | Request::WhoAmI
-        | Request::ListSessions
-        | Request::PlaybackPlan { .. }
-        | Request::ListDevices
-        | Request::ListPasskeys
-        | Request::GetPlexLink
-        | Request::LookupDeviceSignIn { .. }
-        | Request::GetManifest { .. }
-        | Request::ReadSubtitle { .. }
-        | Request::ReadSubtitleSegment { .. }
-        | Request::GetPreviews { .. }
-        | Request::Home
-        | Request::GetTrackPreferences => true,
-        // Signing in: a failed password counts, a challenge is replaced,
-        // an approved sign-in is collected once.
-        Request::LoginPassword(_)
-        | Request::BeginDeviceSignIn
-        | Request::AwaitDeviceSignIn { .. }
-        | Request::BeginPasskeySignIn { .. }
-        | Request::FinishPasskeySignIn(_)
-        | Request::Logout
-        // Playback: each starts, stops or restarts an encode.
-        | Request::StartPlayback { .. }
-        | Request::StopPlayback { .. }
-        | Request::SeekPlayback { .. }
-        | Request::ChangeSubtitle { .. }
-        // PINs: a wrong one counts towards the lock-out.
-        | Request::SetPin { .. }
-        | Request::ClearPin { .. }
-        | Request::UnlockProfile { .. }
-        | Request::SetPinRequired { .. }
-        | Request::BeginPasskeyRegistration
-        | Request::FinishPasskeyRegistration(_)
-        | Request::RenamePasskey { .. }
-        | Request::RemovePasskey { .. }
-        | Request::ApproveDeviceSignIn { .. }
-        | Request::DenyDeviceSignIn { .. }
-        | Request::UpdatePlaybackProgress { .. }
-        | Request::MarkWatched { .. }
-        | Request::MarkUnwatched { .. }
-        | Request::HideFromContinueWatching { .. }
-        | Request::UnhideFromContinueWatching { .. }
-        | Request::SetTrackPreferences { .. }
-        | Request::SetTrackOverride { .. }
-        | Request::ClearTrackOverride { .. }
-        | Request::Unknown => false,
-    }
-}
-
 pub(crate) struct ServerConnection {
     pub conn: Connection,
     pub info: ServerInfo,
+    pub instance: ServerInstance,
+    pub greeted_at: std::time::Instant,
 }
 
 impl ServerConnection {
@@ -207,13 +119,20 @@ impl ServerConnection {
                 });
             }
         };
-        let info = match answer {
+        let instance = answer.server;
+        let info = match answer.reply.response {
             Response::Ok(Reply::ServerInfo(info)) => info,
             Response::Ok(other) => {
                 return Err(SdkError::Protocol(format!("Hello answered with {other:?}")));
             }
             Response::Err(e) => return Err(SdkError::from_server(e)),
         };
+        if info.protocol_version != PROTOCOL_VERSION {
+            conn.close(0u32.into(), b"wrong protocol revision");
+            return Err(SdkError::Protocol(
+                "server and SDK protocol revisions differ".into(),
+            ));
+        }
         // Iroh has proven the key; the server must also say it is that key,
         // or its name and the pin would disagree.
         if info.endpoint_id != expected.to_string() {
@@ -223,7 +142,12 @@ impl ServerConnection {
                 actual: info.endpoint_id,
             });
         }
-        Ok(Self { conn, info })
+        Ok(Self {
+            conn,
+            info,
+            instance,
+            greeted_at: std::time::Instant::now(),
+        })
     }
 
     /// The path packets to the server take now: the selected one.
@@ -257,13 +181,9 @@ impl ServerConnection {
 
 impl ServerConnection {
     /// One request in `session`, answered within `limit`.
-    pub async fn call(
-        &self,
-        session: Option<&SessionId>,
-        request: Request,
-        limit: Duration,
-    ) -> Result<Response, SdkError> {
-        rpc(&self.conn, session, request, limit).await
+    pub async fn call(&self, request: &RpcRequest, limit: Duration) -> Result<RpcReply, SdkError> {
+        let (_, response): (_, RpcResponse) = exchange(&self.conn, bi::RPC, request, limit).await?;
+        Ok(response.reply)
     }
 
     /// Whether the server answers a `Ping` on this connection within
@@ -273,36 +193,90 @@ impl ServerConnection {
             && rpc(&self.conn, None, Request::Ping, limit).await.is_ok()
     }
 
-    /// One image: the response within `limit`, and the image when it is
-    /// `Ok`, with no pause in it longer than `stall`.
+    pub async fn resource(
+        &self,
+        request: &ResourceRequest,
+        maximum: u64,
+        limit: Duration,
+        stall: Duration,
+    ) -> Result<(ResourceResponse, Vec<u8>), SdkError> {
+        let (mut recv, response) = exchange(&self.conn, bi::RESOURCE, request, limit).await?;
+        let bytes = match &response {
+            ResourceResponse::Ready { length, .. } => {
+                body(&self.conn, &mut recv, *length, maximum, stall).await?
+            }
+            ResourceResponse::Error { .. } => Vec::new(),
+        };
+        Ok((response, bytes))
+    }
+
     pub async fn artwork(
         &self,
         request: &ArtworkRequest,
         limit: Duration,
         stall: Duration,
     ) -> Result<(ArtworkResponse, Vec<u8>), SdkError> {
-        let (mut recv, response) = exchange(&self.conn, bi::ARTWORK, request, limit).await?;
-        let bytes = match &response {
-            ArtworkResponse::Ok(reply) => body(&self.conn, &mut recv, reply.length, stall).await?,
-            ArtworkResponse::Err(_) => Vec::new(),
+        let request = ResourceRequest::Artwork {
+            request: request.clone(),
+            max_bytes: MAX_ARTWORK_BYTES,
+        };
+        let (response, bytes) = self
+            .resource(&request, MAX_ARTWORK_BYTES, limit, stall)
+            .await?;
+        let response = match response {
+            ResourceResponse::Ready {
+                length,
+                metadata: ResourceMetadata::Artwork { content_type, etag },
+            } => ArtworkResponse::Ok(spoolframe_protocol::ArtworkReply {
+                length,
+                content_type,
+                etag,
+            }),
+            ResourceResponse::Error { error } => ArtworkResponse::Err(error),
+            _ => {
+                return Err(SdkError::Protocol(
+                    "artwork returned another resource kind".into(),
+                ));
+            }
         };
         Ok((response, bytes))
     }
 
-    /// One range read: the response within `limit`, and the bytes when it
-    /// is `Ok`, with no pause in them longer than `stall`. A read's bytes
-    /// take as long as the link needs for them (16 MiB at most), so only
-    /// a stall is a failure, not a slow link.
     pub async fn read(
         &self,
         request: &MediaRead,
+        revision: u64,
         limit: Duration,
         stall: Duration,
     ) -> Result<(MediaReadResponse, Vec<u8>), SdkError> {
-        let (mut recv, response) = exchange(&self.conn, bi::MEDIA, request, limit).await?;
-        let bytes = match &response {
-            MediaReadResponse::Ok(reply) => body(&self.conn, &mut recv, reply.sent, stall).await?,
-            MediaReadResponse::Err(_) => Vec::new(),
+        let maximum = request.length.min(MAX_READ);
+        let request = ResourceRequest::Media {
+            request: request.clone(),
+            revision,
+        };
+        let (response, bytes) = self.resource(&request, maximum, limit, stall).await?;
+        let response = match response {
+            ResourceResponse::Ready {
+                length,
+                metadata:
+                    ResourceMetadata::Media {
+                        size,
+                        complete,
+                        epoch,
+                        revision: actual,
+                    },
+            } if actual == revision => MediaReadResponse::Ok(spoolframe_protocol::MediaReadReply {
+                sent: length,
+                size,
+                complete,
+                epoch,
+            }),
+            ResourceResponse::Error { error } => MediaReadResponse::Err(error),
+            _ => {
+                return Err(SdkError::Protocol(
+                    "media returned another resource kind or revision".into(),
+                ));
+            }
         };
         Ok((response, bytes))
     }
@@ -326,12 +300,17 @@ async fn rpc(
     session: Option<&SessionId>,
     request: Request,
     limit: Duration,
-) -> Result<Response, SdkError> {
+) -> Result<RpcResponse, SdkError> {
     let envelope = RequestEnvelope {
         session: session.cloned(),
         request,
     };
-    let (_, response) = exchange(conn, bi::RPC, &envelope, limit).await?;
+    let request = RpcRequest {
+        envelope,
+        operation: None,
+        expected_revision: None,
+    };
+    let (_, response) = exchange(conn, bi::RPC, &request, limit).await?;
     Ok(response)
 }
 
@@ -358,7 +337,12 @@ where
         send.write_u8(kind).await.map_err(|e| lost(conn, e))?;
         write_frame(&mut send, request).await.map_err(codec)?;
         send.finish().map_err(|e| lost(conn, e))?;
-        let response = read_frame(&mut recv).await.map_err(codec)?;
+        let response = if kind == bi::RPC {
+            spoolframe_protocol::codec::read_reply(&mut recv).await
+        } else {
+            read_frame(&mut recv).await
+        }
+        .map_err(codec)?;
         Ok((recv, response))
     };
     tokio::time::timeout(limit, exchange)
@@ -368,8 +352,7 @@ where
 
 fn stream_name(kind: u8) -> &'static str {
     match kind {
-        bi::ARTWORK => "an image",
-        bi::MEDIA => "a media read",
+        bi::RESOURCE => "a resource read",
         _ => "a request",
     }
 }
@@ -380,11 +363,20 @@ async fn body(
     conn: &Connection,
     recv: &mut RecvStream,
     length: u64,
+    maximum: u64,
     stall: Duration,
 ) -> Result<Vec<u8>, SdkError> {
+    if length > maximum {
+        return Err(SdkError::Protocol(format!(
+            "a body of {length} bytes exceeds the {maximum}-byte limit"
+        )));
+    }
     let limit = usize::try_from(length)
         .map_err(|_| SdkError::Protocol(format!("a body of {length} bytes")))?;
-    let mut bytes = Vec::with_capacity(limit);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(limit)
+        .map_err(|e| SdkError::Protocol(format!("cannot buffer {length} bytes: {e}")))?;
     let mut buf = vec![0; 64 << 10];
     loop {
         let read = tokio::time::timeout(stall, recv.read(&mut buf))
@@ -395,10 +387,12 @@ async fn body(
         let Some(n) = read else {
             break;
         };
-        bytes.extend_from_slice(&buf[..n]);
-        if bytes.len() > limit {
-            break;
+        if n > limit - bytes.len() {
+            return Err(SdkError::Protocol(format!(
+                "more than {length} bytes followed the response"
+            )));
         }
+        bytes.extend_from_slice(&buf[..n]);
     }
     if bytes.len() as u64 != length {
         return Err(SdkError::Protocol(format!(

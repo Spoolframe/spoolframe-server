@@ -295,10 +295,9 @@ async fn a_selected_external_subtitle_is_read() {
     server.stop().await;
 }
 
-/// A reply is one frame, and a frame has a size limit. A reply over it is
-/// refused with the reason, and the connection carries on.
+/// Large collections span bounded reply chunks; the connection carries on.
 #[tokio::test]
-async fn a_reply_too_large_for_a_frame_is_refused_with_the_reason() {
+async fn a_reply_larger_than_one_frame_is_reassembled() {
     let (server, client, session) = ready("reply-too-large").await;
     let response = client
         .call(
@@ -306,10 +305,11 @@ async fn a_reply_too_large_for_a_frame_is_refused_with_the_reason() {
             Request::Search(support::search(support::A_TITLE_OVER_A_FRAME)),
         )
         .await;
-    let Response::Err(Error::ReplyTooLarge { bytes }) = response else {
-        panic!("not refused");
-    };
-    assert!(bytes > u64::from(MAX_FRAME), "{bytes}");
+    assert!(
+        matches!(response, Response::Ok(Reply::Search(_))),
+        "{response:?}"
+    );
+    assert!(spoolframe_protocol::codec::encode(&response).unwrap().len() > MAX_FRAME as usize);
     assert_eq!(
         client.call(None, Request::Ping).await,
         Response::Ok(Reply::Pong)
@@ -559,6 +559,188 @@ async fn reading_needs_a_valid_session() {
         .read(&SessionId("made-up".into()), &handle, 0, 10)
         .await;
     assert_eq!(err(response), Error::Unauthenticated);
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn mutation_ids_survive_reconnect_and_reject_changed_payloads() {
+    use spoolframe_protocol::resource::{ResourceRequest, ResourceResponse};
+    use spoolframe_protocol::rpc::RpcRequest;
+    use spoolframe_protocol::{MediaRead, RequestEnvelope};
+    let (server, client, session) = ready("wire-replay").await;
+    server.write_media(1000);
+    let mut wire = RpcRequest {
+        envelope: RequestEnvelope {
+            session: Some(session.clone()),
+            request: Request::StartPlayback {
+                id: movie().id().clone(),
+                selection: Some(Selection::default()),
+                start_ms: None,
+                bitmap: Default::default(),
+            },
+        },
+        operation: Some(client.operation()),
+        expected_revision: None,
+    };
+    let (first, duplicate) = tokio::join!(client.wire(&wire), client.wire(&wire));
+    assert_eq!(first.reply, duplicate.reply);
+    let Response::Ok(Reply::PlaybackStarted { handle, .. }) = &first.reply.response else {
+        panic!("{:?}", first.reply)
+    };
+    let reconnected = client
+        .reconnect_with(&server, Some(mkv_capabilities()))
+        .await;
+    assert_eq!(reconnected.wire(&wire).await.reply, first.reply);
+    wire.envelope.request = Request::StopPlayback {
+        handle: handle.clone(),
+    };
+    assert_eq!(
+        reconnected.wire(&wire).await.reply.response,
+        Response::Err(Error::OperationConflict)
+    );
+    wire.operation = Some(reconnected.operation());
+    // Stale control and stale bytes are rejected independently of encode epoch.
+    wire.expected_revision = Some(1);
+    assert_eq!(
+        reconnected.wire(&wire).await.reply.response,
+        Response::Err(Error::RevisionConflict { revision: 0 })
+    );
+    let (response, bytes) = reconnected
+        .resource(&ResourceRequest::Media {
+            request: MediaRead {
+                session: session.clone(),
+                handle: handle.clone(),
+                offset: 0,
+                length: 10,
+                epoch: 0,
+                segment: None,
+            },
+            revision: 1,
+        })
+        .await;
+    assert_eq!(
+        response,
+        ResourceResponse::Error {
+            error: Error::RevisionConflict { revision: 0 }
+        }
+    );
+    assert!(bytes.is_empty());
+    wire.operation = Some(reconnected.operation());
+    wire.expected_revision = Some(0);
+    assert_eq!(
+        reconnected.wire(&wire).await.reply.response,
+        Response::Ok(Reply::Done)
+    );
+    // The stopped handle is gone, but its successful stop remains replayable.
+    assert_eq!(
+        reconnected.wire(&wire).await.reply.response,
+        Response::Ok(Reply::Done)
+    );
+    reconnected.close().await;
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn two_controls_with_the_same_revision_cannot_both_apply() {
+    use spoolframe_protocol::RequestEnvelope;
+    use spoolframe_protocol::rpc::RpcRequest;
+    let (server, client, session) = ready("wire-cas").await;
+    server.write_media(1000);
+    let (handle, _) = started(&client, &session).await;
+    let change = |operation| RpcRequest {
+        envelope: RequestEnvelope {
+            session: Some(session.clone()),
+            request: Request::ChangeSubtitle {
+                handle: handle.clone(),
+                subtitle: None,
+                bitmap: Default::default(),
+                position_ms: 0,
+            },
+        },
+        operation: Some(operation),
+        expected_revision: Some(0),
+    };
+    let one = change(client.operation());
+    let two = change(client.operation());
+    let (one, two) = tokio::join!(client.wire(&one), client.wire(&two));
+    let responses = [one.reply.response, two.reply.response];
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|r| matches!(r, Response::Ok(Reply::PlaybackChanged { .. })))
+            .count(),
+        1
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|r| **r == Response::Err(Error::RevisionConflict { revision: 1 }))
+            .count(),
+        1
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn progress_rejects_old_sequences_superseded_and_stopped_handles() {
+    let (server, client, session) = ready("progress-order").await;
+    server.write_media(1000);
+    let (first, _) = started(&client, &session).await;
+    let report = |handle, sequence, position_ms| Request::UpdatePlaybackProgress {
+        handle,
+        sequence,
+        position_ms,
+    };
+    assert_eq!(
+        client
+            .call(Some(&session), report(first.clone(), 2, 30_000))
+            .await,
+        Response::Ok(Reply::Done)
+    );
+    assert_eq!(
+        client
+            .call(Some(&session), report(first.clone(), 1, 600_000))
+            .await,
+        Response::Err(Error::StaleProgress)
+    );
+    let (second, _) = started(&client, &session).await;
+    assert_eq!(
+        client
+            .call(Some(&session), report(first.clone(), 3, 600_000))
+            .await,
+        Response::Err(Error::StaleProgress)
+    );
+    assert_eq!(
+        client
+            .call(Some(&session), report(second.clone(), 1, 600_000))
+            .await,
+        Response::Ok(Reply::Done)
+    );
+    assert_eq!(
+        client
+            .call(
+                Some(&session),
+                Request::StopPlayback {
+                    handle: second.clone()
+                }
+            )
+            .await,
+        Response::Ok(Reply::Done)
+    );
+    assert_eq!(
+        client
+            .call(Some(&session), report(second, 2, 800_000))
+            .await,
+        Response::Err(Error::PlaybackExpired)
+    );
+    // Stopping the newer playback does not let an older one overwrite it.
+    assert_eq!(
+        client.call(Some(&session), report(first, 4, 900_000)).await,
+        Response::Err(Error::StaleProgress)
+    );
     client.close().await;
     server.stop().await;
 }

@@ -18,7 +18,10 @@ pub mod messages;
 pub mod passkeys;
 pub mod playback;
 pub mod plex;
+pub mod policy;
 pub mod previews;
+pub mod resource;
+pub mod rpc;
 pub mod search;
 pub mod streams;
 
@@ -42,9 +45,8 @@ pub use plex::{PlexLink, PlexSyncSummary};
 pub use previews::{PreviewTile, Previews};
 pub use search::{SearchCounts, SearchGroup, SearchRequest, SearchResults, TopResult};
 
-/// The ALPN of the client protocol, version 1. A breaking change to the
-/// protocol is a new ALPN, so old and new clients can be served side by
-/// side.
+/// Development ALPN. Breaking revisions currently retain `/1` and require
+/// a coordinated server/SDK update; [`PROTOCOL_VERSION`] identifies the revision.
 pub const CLIENT_ALPN: &[u8] = b"spoolframe/client/1";
 
 /// The ALPN of server-to-server federation, version 1 (ARCHITECTURE §26).

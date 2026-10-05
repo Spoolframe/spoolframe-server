@@ -25,12 +25,10 @@ use crate::previews::Previews;
 use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
-/// when features are added; a breaking change is a new ALPN instead.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// for coordinated development releases, including breaking wire changes.
+pub const PROTOCOL_VERSION: u32 = 3;
 
-/// The most bytes of a subtitle one `ReadSubtitle` returns (P2-11): half a
-/// frame ([`crate::codec::MAX_FRAME`]), so a chunk and its framing always
-/// fit one.
+/// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
 
 /// An opaque session token from a login (P1-12). It is only valid from
@@ -66,6 +64,12 @@ pub enum Request {
     AuthMethods,
     LoginPassword(LoginPassword),
     Ping,
+    /// Explicit foreground profile selection. Background requests never select a profile.
+    ActivateProfile,
+    /// Last accepted progress sequence for a restored playback handle.
+    PlaybackProgressSequence {
+        handle: PlaybackHandle,
+    },
     /// Ask to be signed in by someone approving this device on another
     /// one they are signed in on (P3-07). Show the code (and its
     /// [`crate::device_sign_in::link`] as a QR code), then
@@ -146,6 +150,11 @@ pub enum Request {
     },
     /// End a playback now, and any encode for it.
     StopPlayback {
+        handle: PlaybackHandle,
+    },
+    /// Recover a handle's configuration revision after reconnecting or
+    /// reopening an SDK. This does not change the encoder's epoch.
+    PlaybackRevision {
         handle: PlaybackHandle,
     },
     /// Restart a converted playback's encode at `position_ms` (P2-04):
@@ -286,7 +295,8 @@ pub enum Request {
     /// then while playing and on pause or stop; the server decides what is
     /// written, and when.
     UpdatePlaybackProgress {
-        id: MediaId,
+        handle: PlaybackHandle,
+        sequence: u64,
         position_ms: u64,
     },
     MarkWatched {
@@ -461,6 +471,9 @@ impl From<Response> for Result<Reply, Error> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
+    PlaybackProgressSequence {
+        sequence: u64,
+    },
     ServerInfo(ServerInfo),
     AuthMethods {
         methods: Vec<AuthMethod>,
@@ -533,6 +546,9 @@ pub enum Reply {
     /// A seek restarted the encode: reads name this epoch from offset 0.
     PlaybackSeeked {
         epoch: u32,
+    },
+    PlaybackRevision {
+        revision: u64,
     },
     /// The session user's devices (P2-08), most recently seen first.
     Devices {
@@ -714,6 +730,16 @@ pub struct ServerInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Error {
+    #[error("progress belongs to an older playback or sequence")]
+    StaleProgress,
+    #[error("the operation belongs to an earlier server instance")]
+    ServerRestarted,
+    #[error("the operation expired; its outcome is no longer recoverable")]
+    OperationExpired,
+    #[error("the operation ID was already used with different arguments")]
+    OperationConflict,
+    #[error("the playback configuration changed (revision {revision})")]
+    RevisionConflict { revision: u64 },
     /// The connection's first request was not `Hello`.
     #[error("send Hello first")]
     HandshakeRequired,

@@ -79,10 +79,13 @@ async fn a_request_to_a_frozen_server_times_out_and_the_next_one_dials_anew() {
 
         let started = Instant::now();
         let approve = alice.approve_device_sign_in(CODE).await;
-        assert!(matches!(approve, Err(SdkError::TimedOut(_))), "{approve:?}");
-        // The limit, then the Ping that found the connection dead.
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            matches!(approve, Err(SdkError::Unreachable(_))),
+            "{approve:?}"
+        );
+        // Request timeout, dead Ping, then a bounded reconnect attempt.
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
             "{:?}",
             started.elapsed()
         );
@@ -98,15 +101,14 @@ async fn a_request_to_a_frozen_server_times_out_and_the_next_one_dials_anew() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_lookup_on_a_dead_connection_is_asked_again_on_a_new_one() {
+async fn a_read_on_a_dead_connection_is_asked_again_on_a_new_one() {
     within(async {
         let stub = Stub::start().await;
         let (client, alice) = signed_in(&stub).await;
         stub.kill_open_connections();
 
-        let waiting = alice.lookup_device_sign_in(CODE).await.unwrap();
-        assert_eq!(waiting.device_name.as_deref(), Some("Living room TV"));
-        let on = stub.requests_of("lookup_device_sign_in");
+        assert!(alice.libraries().await.unwrap().is_empty());
+        let on = stub.requests_of("libraries");
         assert_eq!(on.len(), 2, "{on:?}");
         assert_eq!(on[0], 0);
         assert_ne!(on[1], 0);
@@ -117,17 +119,77 @@ async fn a_lookup_on_a_dead_connection_is_asked_again_on_a_new_one() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_approval_on_a_dead_connection_is_not_sent_again() {
+async fn a_device_code_lookup_retries_the_same_invocation() {
+    within(async {
+        let stub = Stub::start().await;
+        let (client, alice) = signed_in(&stub).await;
+        stub.kill_open_connections();
+        let lookup = alice.lookup_device_sign_in(CODE).await;
+        assert!(lookup.is_ok(), "{lookup:?}");
+        alice.whoami().await.unwrap();
+        assert_eq!(stub.count("lookup_device_sign_in"), 2);
+        let sent = stub.invocations("lookup_device_sign_in");
+        assert!(sent[0].operation.is_some());
+        assert_eq!(sent[0], sent[1]);
+        client.close().await;
+        stub.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_replies_are_bounded_and_must_match_their_announced_length() {
+    use spoolframe_client_sdk::types::{ArtworkId, Namespace};
+    use spoolframe_client_sdk::{ArtworkSize, MAX_READ, PlaybackHandle};
+    within(async {
+        let stub = Stub::start().await;
+        let (client, alice) = signed_in(&stub).await;
+        let handle = PlaybackHandle("stub".into());
+        // Both the protocol maximum and the requested length are enforced,
+        // before reserving memory. Huge values used to panic or abort.
+        for (announced, requested) in [(u64::MAX, MAX_READ), (MAX_READ + 1, u64::MAX), (5, 4)] {
+            stub.body(announced, &[]);
+            let read = alice.read(&handle, 0, requested).await;
+            assert!(matches!(read, Err(SdkError::Protocol(_))), "{read:?}");
+        }
+        for (announced, body) in [(4, &b"abc"[..]), (2, &b"abc"[..])] {
+            stub.body(announced, body);
+            let read = alice.read(&handle, 0, 4).await;
+            assert!(matches!(read, Err(SdkError::Protocol(_))), "{read:?}");
+        }
+        stub.body(3, b"abc");
+        assert_eq!(alice.read(&handle, 0, 4).await.unwrap(), b"abc");
+        stub.body(0, &[]);
+        assert!(alice.read(&handle, 0, 0).await.unwrap().is_empty());
+        let image = ArtworkId::new(Namespace::Plex, "/library/metadata/1/thumb/1").unwrap();
+        for announced in [u64::MAX, (64 << 20) + 1] {
+            stub.body(announced, &[]);
+            let read = alice.artwork(&image, ArtworkSize::Original).await;
+            assert!(matches!(read, Err(SdkError::Protocol(_))), "{read:?}");
+        }
+        stub.body(3, b"png");
+        assert_eq!(
+            alice.artwork(&image, ArtworkSize::Original).await.unwrap(),
+            b"png"
+        );
+        client.close().await;
+        stub.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_on_a_dead_connection_is_retried() {
     within(async {
         let stub = Stub::start().await;
         let (client, alice) = signed_in(&stub).await;
         stub.kill_open_connections();
 
         let approve = alice.approve_device_sign_in(CODE).await;
-        assert!(matches!(approve, Err(SdkError::TimedOut(_))), "{approve:?}");
+        assert!(approve.is_ok(), "{approve:?}");
         // The dead connection was dropped: the next request works.
         alice.whoami().await.unwrap();
-        assert_eq!(stub.count("approve_device_sign_in"), 1);
+        assert_eq!(stub.count("approve_device_sign_in"), 2);
         client.close().await;
         stub.stop().await;
     })

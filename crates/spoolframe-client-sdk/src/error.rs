@@ -8,6 +8,22 @@ use crate::storage::StorageError;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SdkError {
+    #[error("the operation belongs to an earlier server instance")]
+    ServerRestarted,
+    #[error("the operation expired; its outcome is no longer recoverable")]
+    OperationExpired,
+    #[error("the operation ID was already used with different arguments")]
+    OperationConflict,
+    #[error("the playback is closed")]
+    PlaybackClosed,
+    #[error("the media changed while recovering playback")]
+    PlaybackChanged,
+    #[error("{0}")]
+    Unavailable(String),
+    #[error("an older progress report was rejected")]
+    StaleProgress,
+    #[error("playback revision changed to {revision}")]
+    RevisionConflict { revision: u64 },
     /// The app's storage failed. Show it; the SDK never works around it.
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -137,6 +153,12 @@ impl SdkError {
     /// [`SdkError::SignInRequired`]; the caller forgets the session.
     pub(crate) fn from_server(error: ServerError) -> Self {
         match error {
+            ServerError::ServerRestarted => Self::ServerRestarted,
+            ServerError::OperationExpired => Self::OperationExpired,
+            ServerError::OperationConflict => Self::OperationConflict,
+            ServerError::Unavailable { message } => SdkError::Unavailable(message),
+            ServerError::StaleProgress => SdkError::StaleProgress,
+            ServerError::RevisionConflict { revision } => SdkError::RevisionConflict { revision },
             ServerError::Unauthenticated => SdkError::SignInRequired,
             ServerError::InvalidCredentials => SdkError::InvalidCredentials,
             ServerError::RateLimited { retry_after_ms } => SdkError::RateLimited {

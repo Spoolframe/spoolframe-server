@@ -588,8 +588,20 @@ async fn removing_a_library_and_adding_it_back_keeps_its_watch_state() {
     let served = Served::start("remove-and-add", &file).await;
     served.write_film("cabin", "Arrival", 10);
     served.write_film("tower", "Arrival copy", 10);
+    let Response::Ok(Reply::PlaybackStarted { handle, .. }) = served
+        .call(Request::StartPlayback {
+            id: media("plex:movie:cabin:11"),
+            selection: Some(Default::default()),
+            start_ms: None,
+            bitmap: Default::default(),
+        })
+        .await
+    else {
+        panic!("progress needs a playback")
+    };
     let progress = Request::UpdatePlaybackProgress {
-        id: media("plex:movie:cabin:11"),
+        handle,
+        sequence: 1,
         position_ms: 600_000,
     };
     assert_eq!(served.call(progress).await, Response::Ok(Reply::Done));

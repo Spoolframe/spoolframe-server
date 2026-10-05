@@ -28,6 +28,8 @@ in {
   # molds/devenv/rust. uclicious -> uclicious-libucl-sys links libucl via
   # pkg-config, so the server crates need these at build/link time.
   packages = with pkgs; [
+    cargo-deny
+    jq
     pkg-config
     libucl
     # webauthn-rs (passkeys, P3-05) verifies signatures with OpenSSL.
@@ -56,6 +58,11 @@ in {
   # and no rules behind them, which looks like a styling bug, not a stale
   # file (scribe's FD-488).
   tasks = {
+    "spoolframe:licenses" = {
+      description = "Check server and public SDK license boundaries";
+      exec = "bash scripts/check-licenses.sh";
+    };
+    "ci:static".after = ["spoolframe:licenses"];
     "spoolframe:tailwind-fresh" = {
       description = "The committed Tailwind stylesheet matches a fresh build";
       exec = ''

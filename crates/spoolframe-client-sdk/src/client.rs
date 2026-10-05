@@ -16,13 +16,15 @@ use spoolframe_protocol::{
 };
 use spoolframe_types::{ClientCapabilities, Platform};
 
-use crate::connection::{ServerConnection, Timeouts, retry_safe};
+use crate::connection::{ServerConnection, Timeouts};
 use crate::discovery::Discovery;
 use crate::error::SdkError;
 use crate::link::{ConnectionPath, Link, StateWatch};
 use crate::servers::{self, SavedServer, ServerEntry};
 use crate::session::{self, SavedProfile, Session, StoredSession};
 use crate::storage::{Storage, StorageError, keys};
+use spoolframe_protocol::policy::retry_safe;
+use spoolframe_protocol::rpc::{OPERATION_WINDOW_MS, Operation, RpcRequest};
 
 /// How often the endpoint sends a QUIC keep-alive on an idle connection
 /// (iroh's own default, made explicit: the idle timeout below needs it).
@@ -32,6 +34,9 @@ const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// per-path limit is already 15 s, and a connection is no better than its
 /// paths. The lower of this and the server's own limit applies.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+type RevisionState = Arc<tokio::sync::Mutex<Option<u64>>>;
+type PlaybackKey = (EndpointId, String, String);
 
 /// What the app says about this device and itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +106,9 @@ pub(crate) struct Inner {
     links: Mutex<HashMap<EndpointId, Arc<Link>>>,
     /// Serializes read-modify-write of the saved servers and sessions.
     saving: tokio::sync::Mutex<()>,
+    revisions: Mutex<HashMap<PlaybackKey, RevisionState>>,
+    progress_sequences: Mutex<HashMap<PlaybackKey, RevisionState>>,
+    activating: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for Client {
@@ -170,6 +178,9 @@ impl Client {
                 manual: Mutex::default(),
                 links: Mutex::default(),
                 saving: tokio::sync::Mutex::default(),
+                revisions: Mutex::default(),
+                progress_sequences: Mutex::default(),
+                activating: tokio::sync::Mutex::default(),
             }),
         })
     }
@@ -691,6 +702,34 @@ impl Client {
         Ok(profiles)
     }
 
+    /// Select the foreground profile. Listing profiles or making background
+    /// requests never switches profiles or revokes another profile's PIN unlock.
+    pub async fn activate_profile(
+        &self,
+        profile: &Session,
+    ) -> Result<crate::ActiveProfile, SdkError> {
+        let _activation = self.inner.activating.lock().await;
+        if !Arc::ptr_eq(&self.inner, &profile.client.inner) {
+            return Err(SdkError::InvalidInput(
+                "profile belongs to another client".into(),
+            ));
+        }
+        match self
+            .call(
+                profile.server,
+                Some(&profile.token),
+                Request::ActivateProfile,
+            )
+            .await?
+        {
+            Response::Ok(Reply::Done) => Ok(crate::ActiveProfile(profile.clone())),
+            Response::Err(error) => Err(SdkError::from_server(error)),
+            Response::Ok(other) => Err(SdkError::Protocol(format!(
+                "ActivateProfile answered {other:?}"
+            ))),
+        }
+    }
+
     /// Everyone signed in on server `endpoint_id` from this device, and
     /// whether choosing them signs in by itself or asks for a password: for
     /// "Who's watching" before, or without, a connection. In the order
@@ -795,12 +834,184 @@ impl Client {
         request: Request,
     ) -> Result<Response, SdkError> {
         let limit = self.inner.timeouts.of(&request);
-        let retry = retry_safe(&request);
-        self.on_connection(server, retry, |conn| {
-            let request = request.clone();
-            async move { conn.call(session, request, limit).await }
-        })
-        .await
+        let handle = match &request {
+            Request::ChangeSubtitle { handle, .. }
+            | Request::SeekPlayback { handle, .. }
+            | Request::StopPlayback { handle } => Some(handle.clone()),
+            _ => None,
+        };
+        let state = handle
+            .as_ref()
+            .and_then(|handle| session.map(|session| self.revision_state(server, session, handle)));
+        let mut guard = match &state {
+            Some(state) => Some(state.lock().await),
+            None => None,
+        };
+        if let (Some(guard), Some(handle), Some(session)) = (&mut guard, &handle, session)
+            && guard.is_none()
+        {
+            **guard = Some(self.fetch_revision(server, session, handle).await?);
+        }
+        let conn = self.link(server).connection(self).await?;
+        let operation = (!retry_safe(&request)).then(|| Operation {
+            id: uuid::Uuid::now_v7().to_string(),
+            instance: conn.instance.id.clone(),
+            expires_at_ms: conn
+                .instance
+                .time_ms
+                .saturating_add(conn.greeted_at.elapsed().as_millis() as u64)
+                .saturating_add(OPERATION_WINDOW_MS - 1000),
+        });
+        let wire = RpcRequest {
+            envelope: spoolframe_protocol::RequestEnvelope {
+                session: session.cloned(),
+                request,
+            },
+            operation,
+            expected_revision: guard.as_ref().and_then(|guard| **guard),
+        };
+        // The exact invocation, including its server incarnation and expiry,
+        // is reused on a reconnect. A restarted server refuses it.
+        let reply = self
+            .on_connection(server, true, |conn| {
+                let wire = &wire;
+                async move { conn.call(wire, limit).await }
+            })
+            .await?;
+        if let (Some(revision), Some(session)) = (&reply.playback, session) {
+            if let Some(guard) = &mut guard {
+                **guard = Some(revision.revision);
+            } else {
+                *self
+                    .revision_state(server, session, &revision.handle)
+                    .lock()
+                    .await = Some(revision.revision);
+            }
+        }
+        if let Response::Err(spoolframe_protocol::Error::RevisionConflict { revision }) =
+            &reply.response
+            && let Some(guard) = &mut guard
+        {
+            **guard = Some(*revision);
+        }
+        Ok(reply.response)
+    }
+
+    fn revision_state(
+        &self,
+        server: EndpointId,
+        session: &SessionId,
+        handle: &spoolframe_protocol::PlaybackHandle,
+    ) -> RevisionState {
+        Self::cached_state(
+            &self.inner.revisions,
+            (server, session.0.clone(), handle.0.clone()),
+        )
+    }
+
+    fn cached_state(
+        cache: &Mutex<HashMap<PlaybackKey, RevisionState>>,
+        key: PlaybackKey,
+    ) -> RevisionState {
+        let mut revisions = cache.lock().expect("never poisoned");
+        // Evict only idle entries: a waiter must keep sharing its control
+        // lock. Evicted handles recover their revision from the server.
+        if revisions.len() >= 1024 {
+            revisions.retain(|_, state| Arc::strong_count(state) > 1);
+        }
+        revisions.entry(key).or_default().clone()
+    }
+
+    pub(crate) async fn progress_sequence(
+        &self,
+        server: EndpointId,
+        session: &SessionId,
+        handle: &spoolframe_protocol::PlaybackHandle,
+    ) -> Result<(u64, RevisionState), SdkError> {
+        let state = Self::cached_state(
+            &self.inner.progress_sequences,
+            (server, session.0.clone(), handle.0.clone()),
+        );
+        let mut sequence = state.lock().await;
+        let previous = match *sequence {
+            Some(sequence) => sequence,
+            None => match self
+                .call(
+                    server,
+                    Some(session),
+                    Request::PlaybackProgressSequence {
+                        handle: handle.clone(),
+                    },
+                )
+                .await?
+            {
+                Response::Ok(Reply::PlaybackProgressSequence { sequence }) => sequence,
+                Response::Err(error) => return Err(SdkError::from_server(error)),
+                Response::Ok(other) => {
+                    return Err(SdkError::Protocol(format!(
+                        "PlaybackProgressSequence answered {other:?}"
+                    )));
+                }
+            },
+        };
+        let next = previous
+            .checked_add(1)
+            .ok_or_else(|| SdkError::Protocol("progress sequence exhausted".into()))?;
+        *sequence = Some(next);
+        drop(sequence);
+        Ok((next, state))
+    }
+
+    async fn fetch_revision(
+        &self,
+        server: EndpointId,
+        session: &SessionId,
+        handle: &spoolframe_protocol::PlaybackHandle,
+    ) -> Result<u64, SdkError> {
+        let wire = RpcRequest {
+            envelope: spoolframe_protocol::RequestEnvelope {
+                session: Some(session.clone()),
+                request: Request::PlaybackRevision {
+                    handle: handle.clone(),
+                },
+            },
+            operation: None,
+            expected_revision: None,
+        };
+        let reply = self
+            .on_connection(server, true, |conn| {
+                let wire = &wire;
+                async move { conn.call(wire, self.inner.timeouts.request).await }
+            })
+            .await?;
+        match reply.response {
+            Response::Ok(Reply::PlaybackRevision { revision }) => Ok(revision),
+            Response::Err(error) => {
+                if error == spoolframe_protocol::Error::Unauthenticated {
+                    self.end_session(server, session).await?;
+                }
+                Err(SdkError::from_server(error))
+            }
+            Response::Ok(other) => Err(SdkError::Protocol(format!(
+                "PlaybackRevision answered {other:?}"
+            ))),
+        }
+    }
+
+    pub(crate) async fn playback_revision(
+        &self,
+        server: EndpointId,
+        session: &SessionId,
+        handle: &spoolframe_protocol::PlaybackHandle,
+    ) -> Result<u64, SdkError> {
+        let state = self.revision_state(server, session, handle);
+        let mut revision = state.lock().await;
+        if let Some(revision) = *revision {
+            return Ok(revision);
+        }
+        let found = self.fetch_revision(server, session, handle).await?;
+        *revision = Some(found);
+        Ok(found)
     }
 
     /// Run `exchange` on `server`'s connection. When the connection fails

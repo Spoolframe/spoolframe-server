@@ -1,0 +1,11 @@
+# The public SDK graph must stay usable without copyleft obligations.
+[graph]
+all-features = true
+exclude-dev = true
+
+[licenses]
+confidence-threshold = 0.95
+allow = [
+  "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC",
+  "Unicode-3.0", "Zlib", "CC0-1.0", "Unlicense", "BSL-1.0", "CDLA-Permissive-2.0",
+]

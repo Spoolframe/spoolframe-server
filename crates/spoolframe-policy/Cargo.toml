@@ -1,0 +1,13 @@
+[package]
+name = "spoolframe-policy"
+description = "Shared watch-state and track-selection policy for Spoolframe applications."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+
+[dependencies]
+spoolframe-types = { workspace = true }
+spoolframe-protocol = { workspace = true }
+serde = { workspace = true }

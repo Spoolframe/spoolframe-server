@@ -14,7 +14,7 @@ use spoolframe_protocol::codec::{decode, read_frame_bytes, request_type, write_f
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{
     AuthMethod, CLIENT_ALPN, DeviceSignInRequest, Error, PROTOCOL_VERSION, Reply, Request,
-    RequestEnvelope, Response, ServerInfo, SessionId, UserSummary,
+    Response, ServerInfo, SessionId, UserSummary,
 };
 use spoolframe_types::Role;
 use tokio::io::AsyncReadExt;
@@ -29,6 +29,9 @@ struct State {
     stalled: Mutex<HashSet<String>>,
     /// Each request's type and the connection (from 0) it came on.
     requests: Mutex<Vec<(usize, String)>>,
+    invocations: Mutex<Vec<(String, spoolframe_protocol::rpc::RpcRequest)>>,
+    /// The length advertised by binary replies and the bytes actually sent.
+    body: Mutex<(u64, Vec<u8>)>,
 }
 
 pub struct Stub {
@@ -96,6 +99,21 @@ impl Stub {
         self.requests_of(kind).len()
     }
 
+    pub fn body(&self, announced: u64, bytes: &[u8]) {
+        *self.state.body.lock().unwrap() = (announced, bytes.to_vec());
+    }
+
+    pub fn invocations(&self, kind: &str) -> Vec<spoolframe_protocol::rpc::RpcRequest> {
+        self.state
+            .invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == kind)
+            .map(|(_, request)| request.clone())
+            .collect()
+    }
+
     /// The connection (from 0) each request of type `kind` arrived on.
     pub fn requests_of(&self, kind: &str) -> Vec<usize> {
         self.state
@@ -159,14 +177,46 @@ async fn stream(
     mut send: SendStream,
     mut recv: RecvStream,
 ) {
-    let Ok(bi::RPC) = recv.read_u8().await else {
+    let Ok(stream_kind) = recv.read_u8().await else {
         return;
     };
     let Ok(bytes) = read_frame_bytes(&mut recv).await else {
         return;
     };
-    let kind = request_type(&bytes).unwrap_or_default();
+    if stream_kind == bi::RESOURCE {
+        use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
+        let request: ResourceRequest = decode(&bytes).unwrap();
+        let (length, bytes) = state.body.lock().unwrap().clone();
+        let metadata = match request {
+            ResourceRequest::Media { revision, .. } => ResourceMetadata::Media {
+                size: length,
+                complete: true,
+                epoch: 0,
+                revision,
+            },
+            ResourceRequest::Artwork { .. } => ResourceMetadata::Artwork {
+                content_type: "image/png".into(),
+                etag: "stub".into(),
+            },
+            _ => panic!("unexpected resource"),
+        };
+        let sent = write_frame(&mut send, &ResourceResponse::Ready { length, metadata }).await;
+        if sent.is_ok() && send.write_all(&bytes).await.is_ok() {
+            let _ = send.finish();
+        }
+        let _ = send.stopped().await;
+        return;
+    }
+    assert_eq!(stream_kind, bi::RPC);
+    let wire: spoolframe_protocol::rpc::RpcRequest = decode(&bytes).unwrap();
+    let kind = request_type(&spoolframe_protocol::codec::encode(&wire.envelope).unwrap())
+        .unwrap_or_default();
     state.requests.lock().unwrap().push((index, kind.clone()));
+    state
+        .invocations
+        .lock()
+        .unwrap()
+        .push((kind.clone(), wire.clone()));
     let silent = dead.load(Ordering::SeqCst)
         || state.frozen.load(Ordering::SeqCst)
         || state.stalled.lock().unwrap().contains(&kind);
@@ -176,9 +226,17 @@ async fn stream(
         conn.closed().await;
         return;
     }
-    let envelope: RequestEnvelope = decode(&bytes).unwrap();
-    let response = answer(id, envelope.request);
-    if write_frame(&mut send, &response).await.is_ok() {
+    let response = spoolframe_protocol::rpc::RpcResponse {
+        server: spoolframe_protocol::rpc::ServerInstance {
+            id: id.to_string(),
+            time_ms: 1_000_000,
+        },
+        reply: answer(id, wire.envelope.request).into(),
+    };
+    if spoolframe_protocol::codec::write_reply(&mut send, &response)
+        .await
+        .is_ok()
+    {
         let _ = send.finish();
     }
     // Keep the stream until the client has read it.
@@ -196,6 +254,7 @@ fn answer(id: EndpointId, request: Request) -> Response {
             web_url: None,
         }),
         Request::Ping => Reply::Pong,
+        Request::PlaybackRevision { .. } => Reply::PlaybackRevision { revision: 0 },
         Request::LoginPassword(_) => Reply::LoggedIn {
             session: SessionId("stub-session".into()),
         },

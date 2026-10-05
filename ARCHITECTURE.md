@@ -493,6 +493,10 @@ spoolframe/client/1
 spoolframe/federation/1
 ```
 
+The development client protocol currently uses wire revision 3 under `/1`.
+See [PROTOCOL.md](PROTOCOL.md) for the implemented framing, resource streams,
+mutation replay rules, and coordinated SDK upgrade requirement.
+
 ## Address lookup
 
 Maps an `EndpointId` to possible locations.
@@ -2372,3 +2376,14 @@ The long-term resilience requirement remains:
 
 > A working Spoolframe server, client, and local IP network must be sufficient to browse and play already-available media even if all centralized Internet infrastructure disappears.
 
+### Shared playback implementation
+
+`spoolframe-policy` (GPL-3.0-or-later) owns pure watch thresholds, credits
+interpretation and track selection. The AGPL server and GPL Linux test backend
+use these rules. The public SDK does not depend on this crate.
+
+The MIT OR Apache-2.0 SDK owns managed playback, ordered/coalesced progress,
+cancellation cleanup, profile completion scopes and optional media readers.
+Reader code extracted from the Linux client is relicensed by its copyright
+holder under the SDK's license. GTK/GStreamer integration remains in Linux;
+persistence and transcoding remain in the server. No wire change is required.

@@ -46,6 +46,7 @@ spoolframe-protocol = { workspace = true }
 iroh = { workspace = true }
 iroh-mdns-address-lookup = { workspace = true }
 spoolframe-types = { workspace = true }
+spoolframe-policy = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

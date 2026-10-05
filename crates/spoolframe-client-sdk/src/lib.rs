@@ -29,8 +29,8 @@ pub use error::SdkError;
 pub use link::{ConnectionPath, ConnectionState, StateWatch};
 pub use servers::ServerEntry;
 pub use session::{
-    Chunk, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange, PlaybackOptions, ProfileSignIn,
-    SavedProfile, Session, Subtitle,
+    ActiveProfile, Chunk, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange, PlaybackOptions,
+    ProfileSignIn, SavedProfile, Session, Subtitle,
 };
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{
@@ -51,3 +51,15 @@ pub use spoolframe_protocol::fingerprint;
 pub use spoolframe_protocol::device_sign_in;
 pub use spoolframe_types as types;
 pub use storage::{MemoryStorage, Storage, StorageError};
+
+mod managed;
+pub use managed::{ManagedPlayback, PlaybackBackend};
+mod profile_scope;
+pub use profile_scope::{ProfileScope, ProfileToken};
+
+#[cfg(feature = "media-readers")]
+pub mod progressive;
+#[cfg(feature = "media-readers")]
+pub mod reader;
+#[cfg(all(test, feature = "media-readers"))]
+mod reader_tests;

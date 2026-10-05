@@ -1,0 +1,108 @@
+//! Request retry semantics and wait budgets shared by clients and servers.
+//! These do not change message encoding or protocol negotiation.
+
+use crate::Request;
+use std::time::Duration;
+
+/// Shared server waits and client allowances. Each is how long the server
+/// may take before it answers, not counting the round trip.
+pub mod wait {
+    use std::time::Duration;
+
+    /// `AwaitDeviceSignIn` (the server's `device_sign_in::AWAIT`).
+    pub const SIGN_IN: Duration = Duration::from_secs(25);
+    /// A read past what an encode has written, or of a subtitle still
+    /// being read as text (the server's `READ_WAIT`).
+    pub const READ: Duration = Duration::from_secs(10);
+    /// A request that may run ffprobe on the file (`Prober::DEFAULT_TIMEOUT`).
+    pub const PROBE: Duration = Duration::from_secs(30);
+    /// Starting a playback, or changing its subtitle: a probe, and for HLS
+    /// of a copied video every keyframe of the file, which the server
+    /// bounds only at 10 minutes. Two minutes is longer than a player
+    /// should spin; past it the user is better told.
+    pub const PLAYBACK: Duration = Duration::from_secs(120);
+}
+
+/// How long the server may hold `request` before it answers.
+pub fn server_wait(request: &Request) -> Duration {
+    match request {
+        Request::AwaitDeviceSignIn { .. } => wait::SIGN_IN,
+        Request::ReadSubtitle { .. } | Request::ReadSubtitleSegment { .. } => wait::READ,
+        Request::Tracks { .. }
+        | Request::PlaybackPlan { .. }
+        | Request::SetTrackOverride { .. } => wait::PROBE,
+        Request::StartPlayback { .. } | Request::ChangeSubtitle { .. } => wait::PLAYBACK,
+        _ => Duration::ZERO,
+    }
+}
+
+/// Whether `request` may be sent a second time, on a new connection, when
+/// the first one died before it was answered. Reads and idempotent connection
+/// setup are safe:
+/// one that changes something may have been done before its answer was
+/// lost, and doing it twice is not the same as once (a sign-in approved
+/// twice, a PIN tried twice). Every request is named, so a new one is
+/// decided here when it is added.
+pub fn retry_safe(request: &Request) -> bool {
+    match request {
+        Request::Hello(_)
+        | Request::ActivateProfile
+        | Request::PlaybackProgressSequence { .. }
+        | Request::AuthMethods
+        | Request::Ping
+        | Request::Libraries
+        | Request::Items { .. }
+        | Request::Item { .. }
+        | Request::Search(_)
+        | Request::PersonItems { .. }
+        | Request::Tracks { .. }
+        | Request::WhoAmI
+        | Request::ListSessions
+        | Request::PlaybackPlan { .. }
+        | Request::PlaybackRevision { .. }
+        | Request::ListDevices
+        | Request::ListPasskeys
+        | Request::GetPlexLink
+        | Request::GetManifest { .. }
+        | Request::ReadSubtitle { .. }
+        | Request::ReadSubtitleSegment { .. }
+        | Request::GetPreviews { .. }
+        | Request::Home
+        | Request::GetTrackPreferences => true,
+        // Signing in: a failed password counts, a challenge is replaced,
+        // an approved sign-in is collected once.
+        Request::LoginPassword(_)
+        | Request::BeginDeviceSignIn
+        | Request::AwaitDeviceSignIn { .. }
+        | Request::BeginPasskeySignIn { .. }
+        | Request::FinishPasskeySignIn(_)
+        | Request::Logout
+        // Playback: each starts, stops or restarts an encode.
+        | Request::StartPlayback { .. }
+        | Request::StopPlayback { .. }
+        | Request::SeekPlayback { .. }
+        | Request::ChangeSubtitle { .. }
+        // PINs: a wrong one counts towards the lock-out.
+        | Request::SetPin { .. }
+        | Request::ClearPin { .. }
+        | Request::UnlockProfile { .. }
+        | Request::SetPinRequired { .. }
+        | Request::BeginPasskeyRegistration
+        | Request::FinishPasskeyRegistration(_)
+        | Request::RenamePasskey { .. }
+        | Request::RemovePasskey { .. }
+        // Looking up a wrong code consumes a failure-limit attempt too.
+        | Request::LookupDeviceSignIn { .. }
+        | Request::ApproveDeviceSignIn { .. }
+        | Request::DenyDeviceSignIn { .. }
+        | Request::UpdatePlaybackProgress { .. }
+        | Request::MarkWatched { .. }
+        | Request::MarkUnwatched { .. }
+        | Request::HideFromContinueWatching { .. }
+        | Request::UnhideFromContinueWatching { .. }
+        | Request::SetTrackPreferences { .. }
+        | Request::SetTrackOverride { .. }
+        | Request::ClearTrackOverride { .. }
+        | Request::Unknown => false,
+    }
+}

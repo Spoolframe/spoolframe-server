@@ -17,16 +17,20 @@ use spoolframe_protocol::codec::{self, read_frame_bytes, write_frame};
 use spoolframe_protocol::device_sign_in::{
     normalize as device_sign_in_code, web_link as device_sign_in_web_link,
 };
+use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
+use spoolframe_protocol::rpc::{
+    PlaybackRevision, RpcReply, RpcRequest, RpcResponse, ServerInstance,
+};
 use spoolframe_protocol::streams::{bi, reset, uni};
 use spoolframe_protocol::{
     APP_RP_ID, AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, FinishPasskeySignIn,
     Hello, LoginPassword, PasskeyInfo, PinProof, PinState, PlexLink, PlexSyncSummary, Reply,
-    Request, RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
+    Request, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_protocol::{
-    ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize, ChosenTracks, ConvertedSubtitle,
-    MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan,
-    SUBTITLE_CHUNK, Selection, SubtitleAction, TopResult,
+    ArtworkRequest, ArtworkSize, ChosenTracks, ConvertedSubtitle, MAX_READ, MediaRead,
+    MediaReadReply, PlaybackHandle, PlaybackPlan, SUBTITLE_CHUNK, Selection, SubtitleAction,
+    TopResult,
 };
 use spoolframe_types::{ArtworkId, Item, MediaId, MediaKind, Namespace, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -67,6 +71,8 @@ pub(crate) struct ClientProtocol {
     name: ServerName,
     /// The events stream of each connection that said Hello.
     events: Arc<Mutex<HashMap<usize, SendStream>>>,
+    instance: String,
+    operations: Arc<crate::operations::Operations>,
 }
 
 /// What one connection has said so far.
@@ -86,10 +92,15 @@ struct Locks {
     /// for its user's PIN.
     needs_pin: HashMap<String, bool>,
     unlocked: std::collections::HashSet<String>,
-    /// The session the last request came from. Using another one locks it
-    /// again: a switch to another profile and back asks for the PIN, and
-    /// the server keeps to that whatever the client does.
+    /// The explicitly selected foreground profile. Background requests
+    /// never change it or invalidate its PIN unlock.
     active: Option<String>,
+    generation: u64,
+}
+
+enum ResourceBody {
+    Bytes(Vec<u8>),
+    File(tokio::fs::File),
 }
 
 impl Locks {
@@ -105,27 +116,23 @@ impl Locks {
         self.needs_pin.get(&session.0) == Some(&true) && !self.unlocked.contains(&session.0)
     }
 
-    /// `session` makes a request: refused while it is locked; otherwise it
-    /// is the active one from now, and the one before is locked again.
+    /// Background and foreground requests obey the same PIN check.
     fn use_session(&mut self, session: &SessionId) -> Result<(), Error> {
         if self.locked(session) {
             return Err(Error::ProfileLocked);
         }
-        self.activate(session);
         Ok(())
     }
 
     fn activate(&mut self, session: &SessionId) {
         if self.active.as_deref() != Some(session.0.as_str()) {
-            if let Some(previous) = self.active.take() {
-                self.unlocked.remove(&previous);
-            }
+            self.generation += 1;
+            self.unlocked.retain(|unlocked| unlocked == &session.0);
             self.active = Some(session.0.clone());
         }
     }
 
     fn unlock(&mut self, session: &SessionId) {
-        self.activate(session);
         self.unlocked.insert(session.0.clone());
     }
 }
@@ -143,6 +150,8 @@ impl ClientProtocol {
             info: Arc::new(info),
             name,
             events: Arc::default(),
+            instance: uuid::Uuid::now_v7().to_string(),
+            operations: Arc::default(),
         }
     }
 
@@ -158,12 +167,8 @@ impl ClientProtocol {
         let Ok(kind) = recv.read_u8().await else {
             return;
         };
-        if kind == bi::ARTWORK {
-            self.artwork(&connection, &state, send, recv).await;
-            return;
-        }
-        if kind == bi::MEDIA {
-            self.media_read(&connection, &state, send, recv).await;
+        if kind == bi::RESOURCE {
+            self.resource(&connection, &state, send, recv).await;
             return;
         }
         if kind != bi::RPC {
@@ -180,16 +185,26 @@ impl ClientProtocol {
             Ok(bytes) => self.answer(&connection, &state, bytes).await,
             Err(e) => Response::Err(Error::Malformed {
                 message: e.to_string(),
-            }),
+            })
+            .into(),
         };
-        let sent = match write_frame(&mut send, &response).await {
+        let response = RpcResponse {
+            server: self.instance(),
+            reply: response,
+        };
+        let sent = match codec::write_reply(&mut send, &response).await {
             // Nothing of it was written. The client gets the reason, not a
             // stream that ends with no response.
             Err(codec::CodecError::TooLarge { len }) => {
-                let request = request.ok().and_then(|bytes| codec::request_type(&bytes));
+                let request = request
+                    .ok()
+                    .and_then(|bytes| codec::rpc_request_type(&bytes));
                 tracing::warn!(request, len, "a reply is over the frame limit");
-                let refusal = Response::Err(Error::ReplyTooLarge { bytes: len });
-                write_frame(&mut send, &refusal).await
+                let refusal = RpcResponse {
+                    server: self.instance(),
+                    reply: Response::Err(Error::ReplyTooLarge { bytes: len }).into(),
+                };
+                codec::write_reply(&mut send, &refusal).await
             }
             sent => sent,
         };
@@ -200,13 +215,135 @@ impl ClientProtocol {
         let _ = send.finish();
     }
 
+    fn instance(&self) -> ServerInstance {
+        ServerInstance {
+            id: self.instance.clone(),
+            time_ms: crate::operations::now_ms(),
+        }
+    }
+
     async fn answer(
+        &self,
+        connection: &Connection,
+        state: &Arc<ConnectionState>,
+        bytes: &[u8],
+    ) -> RpcReply {
+        let wire: RpcRequest = match codec::decode(bytes) {
+            Ok(wire) => wire,
+            Err(e) => {
+                return Response::Err(Error::Malformed {
+                    message: e.to_string(),
+                })
+                .into();
+            }
+        };
+        let execute = {
+            let this = self.clone();
+            let connection = connection.clone();
+            let state = state.clone();
+            let bytes = bytes.to_vec();
+            let request = wire.envelope.request.clone();
+            let expected = wire.expected_revision;
+            async move {
+                let response = this.answer_once(&connection, &state, &bytes).await;
+                let playback = match (&response, request) {
+                    (Response::Ok(Reply::PlaybackStarted { handle, .. }), _) => {
+                        Some(PlaybackRevision {
+                            handle: handle.clone(),
+                            revision: 0,
+                        })
+                    }
+                    (
+                        Response::Ok(Reply::PlaybackChanged { .. } | Reply::PlaybackSeeked { .. }),
+                        Request::ChangeSubtitle { handle, .. }
+                        | Request::SeekPlayback { handle, .. },
+                    ) => Some(PlaybackRevision {
+                        handle,
+                        revision: expected.expect("checked by control") + 1,
+                    }),
+                    (
+                        Response::Ok(Reply::PlaybackRevision { revision }),
+                        Request::PlaybackRevision { handle },
+                    ) => Some(PlaybackRevision {
+                        handle,
+                        revision: *revision,
+                    }),
+                    _ => None,
+                };
+                RpcReply { response, playback }
+            }
+        };
+        if spoolframe_protocol::policy::retry_safe(&wire.envelope.request) {
+            return execute.await;
+        }
+        // Preserve the handshake error even for an old or anonymous request.
+        if state.hello.get().is_none() {
+            return Response::Err(Error::HandshakeRequired).into();
+        }
+        let Some(operation) = wire.operation else {
+            return Response::Err(Error::Malformed {
+                message: "mutation requires an operation ID".into(),
+            })
+            .into();
+        };
+        let endpoint = connection.remote_id().to_string();
+        let invocation = self.operations.begin(
+            &endpoint,
+            &self.instance,
+            &operation,
+            *blake3::hash(bytes).as_bytes(),
+            crate::operations::now_ms(),
+        );
+        let invocation = match invocation {
+            Ok(invocation) => invocation,
+            Err(error) => return Response::Err(error).into(),
+        };
+        let replay = invocation.execute.is_none();
+        if let Some(send) = invocation.execute {
+            let operations = self.operations.clone();
+            tokio::spawn(async move {
+                operations.finish(&endpoint, &operation.id, send, execute.await);
+            });
+        }
+        let mut outcome = invocation.outcome;
+        loop {
+            let reply = outcome.borrow().clone();
+            if let Some(reply) = reply {
+                // A replay can recover an outcome, but cannot restore a PIN
+                // unlock from another connection or from before a profile switch.
+                if replay
+                    && matches!(reply.response, Response::Ok(_))
+                    && matches!(
+                        wire.envelope.request,
+                        Request::UnlockProfile { .. } | Request::SetPinRequired { .. }
+                    )
+                {
+                    let (session, _) = match self
+                        .authenticate(connection, state, wire.envelope.session.clone())
+                        .await
+                    {
+                        Ok(user) => user,
+                        Err(error) => return Response::Err(error).into(),
+                    };
+                    if state.locks.lock().expect("never poisoned").locked(&session) {
+                        return Response::Err(Error::ProfileLocked).into();
+                    }
+                }
+                return reply;
+            }
+            if outcome.changed().await.is_err() {
+                return Response::Err(Error::Internal).into();
+            }
+        }
+    }
+
+    async fn answer_once(
         &self,
         connection: &Connection,
         state: &ConnectionState,
         bytes: &[u8],
     ) -> Response {
-        let envelope: RequestEnvelope = match codec::decode(bytes) {
+        let wire: RpcRequest = match codec::decode(bytes) {
             Ok(envelope) => envelope,
             Err(e) => {
                 return Response::Err(Error::Malformed {
@@ -214,8 +351,14 @@ impl ClientProtocol {
                 });
             }
         };
+        let envelope = wire.envelope;
         let reply = match envelope.request {
             Request::Hello(hello) => {
+                if hello.protocol_version != spoolframe_protocol::PROTOCOL_VERSION {
+                    return Response::Err(Error::Unsupported {
+                        request: "protocol revision; update the SDK".into(),
+                    });
+                }
                 tracing::debug!(?hello, "hello");
                 let platform = hello.platform;
                 if state.hello.set(hello).is_ok() {
@@ -233,8 +376,13 @@ impl ClientProtocol {
                 }))
             }
             _ if state.hello.get().is_none() => Err(Error::HandshakeRequired),
+            Request::ReadSubtitle { .. } | Request::ReadSubtitleSegment { .. } => {
+                Err(Error::Unsupported {
+                    request: "subtitle bytes require a resource stream".into(),
+                })
+            }
             Request::Unknown => Err(Error::Unsupported {
-                request: codec::request_type(bytes).unwrap_or_default(),
+                request: codec::rpc_request_type(bytes).unwrap_or_default(),
             }),
             Request::AuthMethods => Ok(Reply::AuthMethods {
                 methods: self.info.auth_methods.clone(),
@@ -309,7 +457,10 @@ impl ClientProtocol {
             request => match self.authenticate(connection, state, envelope.session).await {
                 Ok((session, user)) => {
                     // Locked, only these two (P2-08).
-                    let exempt = matches!(request, Request::WhoAmI | Request::UnlockProfile { .. });
+                    let exempt = matches!(
+                        request,
+                        Request::ActivateProfile | Request::WhoAmI | Request::UnlockProfile { .. }
+                    );
                     let allowed = if exempt {
                         Ok(())
                     } else {
@@ -320,7 +471,17 @@ impl ClientProtocol {
                             .use_session(&session)
                     };
                     match allowed {
-                        Ok(()) => self.serve(connection, state, session, user, request).await,
+                        Ok(()) => {
+                            self.serve(
+                                connection,
+                                state,
+                                session,
+                                user,
+                                request,
+                                wire.expected_revision,
+                            )
+                            .await
+                        }
                         Err(e) => Err(e),
                     }
                 }
@@ -360,43 +521,202 @@ impl ClientProtocol {
         }
     }
 
-    /// One image on its own stream: a request frame in; a response frame
-    /// and, if it is `ok`, the image's bytes out.
-    async fn artwork(
+    async fn resource(
         &self,
         connection: &Connection,
         state: &ConnectionState,
         mut send: SendStream,
         mut recv: RecvStream,
     ) {
-        let answer = match codec::read_frame::<_, ArtworkRequest>(&mut recv).await {
-            Ok(request) => self.find_artwork(connection, state, request).await,
+        let result = match codec::read_frame::<_, ResourceRequest>(&mut recv).await {
+            Ok(request) => self.open_resource(connection, state, request).await,
             Err(e) => Err(Error::Malformed {
                 message: e.to_string(),
             }),
         };
         let sent = async {
-            match answer {
-                Ok(image) => {
-                    let reply = ArtworkReply {
-                        content_type: image.content_type,
-                        length: image.bytes.len() as u64,
-                        etag: image.etag,
-                    };
-                    write_frame(&mut send, &ArtworkResponse::Ok(reply)).await?;
-                    send.write_all(&image.bytes)
-                        .await
-                        .map_err(std::io::Error::other)?;
+            match result {
+                Ok((metadata, length, body)) => {
+                    write_frame(&mut send, &ResourceResponse::Ready { length, metadata }).await?;
+                    match body {
+                        ResourceBody::Bytes(bytes) => send
+                            .write_all(&bytes)
+                            .await
+                            .map_err(std::io::Error::other)?,
+                        ResourceBody::File(file) => {
+                            let copied = tokio::io::copy(&mut file.take(length), &mut send).await?;
+                            if copied != length {
+                                return Err(codec::CodecError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "resource ended before its advertised length",
+                                )));
+                            }
+                        }
+                    }
                 }
-                Err(error) => write_frame(&mut send, &ArtworkResponse::Err(error)).await?,
+                Err(error) => write_frame(&mut send, &ResourceResponse::Error { error }).await?,
             }
             Ok::<_, codec::CodecError>(())
-        };
-        if let Err(e) = sent.await {
-            tracing::debug!(error = %e, "cannot send artwork");
-            return;
         }
-        let _ = send.finish();
+        .await;
+        match sent {
+            Ok(()) => {
+                let _ = send.finish();
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "resource read failed");
+                let _ = send.reset(0u32.into());
+            }
+        }
+    }
+
+    async fn open_resource(
+        &self,
+        connection: &Connection,
+        state: &ConnectionState,
+        request: ResourceRequest,
+    ) -> Result<(ResourceMetadata, u64, ResourceBody), Error> {
+        if state.hello.get().is_none() {
+            return Err(Error::HandshakeRequired);
+        }
+        match request {
+            ResourceRequest::Artwork { request, max_bytes } => {
+                let image = self.find_artwork(connection, state, request).await?;
+                let length = image.bytes.len() as u64;
+                if length > max_bytes {
+                    return Err(Error::ReplyTooLarge { bytes: length });
+                }
+                Ok((
+                    ResourceMetadata::Artwork {
+                        content_type: image.content_type,
+                        etag: image.etag,
+                    },
+                    length,
+                    ResourceBody::Bytes(image.bytes),
+                ))
+            }
+            ResourceRequest::Media { request, revision } => {
+                let result = self.open_range(connection, state, &request, revision).await;
+                if let (Some(n), Err(error)) = (request.segment, &result) {
+                    tracing::warn!(id = %self.played(&request.handle), endpoint = %connection.remote_id().fmt_short(),
+                        segment = n, %error, "an HLS segment read failed");
+                }
+                let (file, reply) = result?;
+                // Seeking can replace the encode while a read waits. Check
+                // again after preparation, outside that wait, before labelling
+                // the pinned file with this revision.
+                let _control = self
+                    .services
+                    .playbacks
+                    .control(
+                        &request.handle,
+                        &request.session,
+                        &connection.remote_id().to_string(),
+                    )
+                    .await
+                    .map_err(playback_refusal)?;
+                let current = self
+                    .use_playback(connection, &request.handle, &request.session)
+                    .await?;
+                if current.revision != revision {
+                    return Err(Error::RevisionConflict {
+                        revision: current.revision,
+                    });
+                }
+                Ok((
+                    ResourceMetadata::Media {
+                        size: reply.size,
+                        complete: reply.complete,
+                        epoch: reply.epoch,
+                        revision,
+                    },
+                    reply.sent,
+                    ResourceBody::File(file),
+                ))
+            }
+            request => {
+                let (session, handle, revision, read) = match request {
+                    ResourceRequest::Subtitle {
+                        session,
+                        handle,
+                        revision,
+                        offset,
+                        version,
+                    } => (
+                        session,
+                        handle.clone(),
+                        revision,
+                        Request::ReadSubtitle {
+                            handle,
+                            offset,
+                            version,
+                        },
+                    ),
+                    ResourceRequest::SubtitleSegment {
+                        session,
+                        handle,
+                        revision,
+                        segment,
+                    } => (
+                        session,
+                        handle.clone(),
+                        revision,
+                        Request::ReadSubtitleSegment { handle, n: segment },
+                    ),
+                    _ => unreachable!(),
+                };
+                let (session, user) = self.authenticate(connection, state, Some(session)).await?;
+                state
+                    .locks
+                    .lock()
+                    .expect("never poisoned")
+                    .use_session(&session)?;
+                // Preparing the selected subtitle and its metadata is atomic
+                // with control changes. Sending its bytes holds no lock.
+                let _control = self
+                    .services
+                    .playbacks
+                    .control(&handle, &session, &connection.remote_id().to_string())
+                    .await
+                    .map_err(playback_refusal)?;
+                let playback = self.use_playback(connection, &handle, &session).await?;
+                if playback.revision != revision {
+                    return Err(Error::RevisionConflict {
+                        revision: playback.revision,
+                    });
+                }
+                let reply = self
+                    .serve(connection, state, session, user, read, None)
+                    .await?;
+                let (format, bytes, total, version) = match reply {
+                    Reply::SubtitleChunk {
+                        format,
+                        bytes,
+                        total,
+                        version,
+                    } => (format, bytes, total, version),
+                    Reply::Subtitle { format, bytes } => {
+                        let total = bytes.len() as u64;
+                        (format, bytes, total, 0)
+                    }
+                    _ => unreachable!(),
+                };
+                let length = bytes.len() as u64;
+                if length > MAX_READ {
+                    return Err(Error::ReplyTooLarge { bytes: length });
+                }
+                Ok((
+                    ResourceMetadata::Subtitle {
+                        format,
+                        total,
+                        version,
+                        revision,
+                    },
+                    length,
+                    ResourceBody::Bytes(bytes),
+                ))
+            }
+        }
     }
 
     async fn find_artwork(
@@ -484,10 +804,7 @@ impl ClientProtocol {
         let playbacks = &self.services.playbacks;
         let using = playbacks
             .use_handle(handle, session, &endpoint)
-            .map_err(|refusal| match refusal {
-                Refusal::Expired => Error::PlaybackExpired,
-                Refusal::NotYours => Error::Unauthenticated,
-            })?;
+            .map_err(playback_refusal)?;
         if using.recheck {
             let live = self
                 .services
@@ -501,66 +818,6 @@ impl ClientProtocol {
             }
         }
         Ok(using.playback)
-    }
-
-    /// One range read on its own stream: a request frame in; a response
-    /// frame and exactly `sent` bytes of the file out.
-    async fn media_read(
-        &self,
-        connection: &Connection,
-        state: &ConnectionState,
-        mut send: SendStream,
-        mut recv: RecvStream,
-    ) {
-        let opened = match codec::read_frame::<_, MediaRead>(&mut recv).await {
-            Ok(read) => {
-                let opened = self.open_range(connection, state, &read).await;
-                // A client that plays HLS through a local player (AVPlayer)
-                // shows a failed fetch only to that player.
-                if let (Some(n), Err(error)) = (read.segment, &opened) {
-                    tracing::warn!(
-                        id = %self.played(&read.handle),
-                        endpoint = %connection.remote_id().fmt_short(),
-                        segment = n,
-                        %error,
-                        "an HLS segment read failed"
-                    );
-                }
-                opened
-            }
-            Err(e) => Err(Error::Malformed {
-                message: e.to_string(),
-            }),
-        };
-        let sent = async {
-            match opened {
-                Ok((file, reply)) => {
-                    let sent = reply.sent;
-                    write_frame(&mut send, &MediaReadResponse::Ok(reply)).await?;
-                    // Streamed from disk: nothing is held whole in memory.
-                    let copied = tokio::io::copy(&mut file.take(sent), &mut send).await?;
-                    if copied != sent {
-                        return Err(codec::CodecError::Io(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            format!("the file ended after {copied} of {sent} bytes"),
-                        )));
-                    }
-                }
-                Err(error) => {
-                    write_frame(&mut send, &MediaReadResponse::Err(error)).await?;
-                }
-            }
-            Ok::<_, codec::CodecError>(())
-        };
-        match sent.await {
-            Ok(()) => {
-                let _ = send.finish();
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "media read failed");
-                let _ = send.reset(VarInt::from_u32(0));
-            }
-        }
     }
 
     /// What `handle` plays, for the log; the handle itself is never logged.
@@ -611,10 +868,16 @@ impl ClientProtocol {
         connection: &Connection,
         state: &ConnectionState,
         read: &MediaRead,
+        revision: u64,
     ) -> Result<(tokio::fs::File, MediaReadReply), Error> {
         let playback = self
             .use_playback(connection, &read.handle, &read.session)
             .await?;
+        if playback.revision != revision {
+            return Err(Error::RevisionConflict {
+                revision: playback.revision,
+            });
+        }
         // The lock, in memory, on every read. A session this connection
         // has not looked up yet (a playback started before a reconnect) is
         // looked up first, so a new connection does not skip its lock.
@@ -688,10 +951,57 @@ impl ClientProtocol {
         session: SessionId,
         user: SessionUser,
         request: Request,
+        expected_revision: Option<u64>,
     ) -> Result<Reply, Error> {
         let catalog = &self.services.catalog;
         let principal = Principal::LocalUser(user.user);
+        // Hold across preparation and publication, and re-read the handle
+        // inside the handler. QUIC requests may arrive concurrently.
+        let _control = match &request {
+            Request::UpdatePlaybackProgress { handle, .. }
+            | Request::ChangeSubtitle { handle, .. }
+            | Request::SeekPlayback { handle, .. }
+            | Request::StopPlayback { handle } => Some(
+                self.services
+                    .playbacks
+                    .control(handle, &session, &connection.remote_id().to_string())
+                    .await
+                    .map_err(playback_refusal)?,
+            ),
+            _ => None,
+        };
+        if let Request::ChangeSubtitle { handle, .. }
+        | Request::SeekPlayback { handle, .. }
+        | Request::StopPlayback { handle } = &request
+        {
+            let playback = self.use_playback(connection, handle, &session).await?;
+            if expected_revision != Some(playback.revision) {
+                return Err(Error::RevisionConflict {
+                    revision: playback.revision,
+                });
+            }
+        }
         match request {
+            Request::ActivateProfile => {
+                state
+                    .locks
+                    .lock()
+                    .expect("never poisoned")
+                    .activate(&session);
+                Ok(Reply::Done)
+            }
+            Request::PlaybackProgressSequence { handle } => Ok(Reply::PlaybackProgressSequence {
+                sequence: self
+                    .use_playback(connection, &handle, &session)
+                    .await?
+                    .progress_sequence,
+            }),
+            Request::PlaybackRevision { handle } => Ok(Reply::PlaybackRevision {
+                revision: self
+                    .use_playback(connection, &handle, &session)
+                    .await?
+                    .revision,
+            }),
             Request::WhoAmI => {
                 // Asked while locked too: a PIN pad sizes itself by it.
                 let pin = self.store().pin_info(user.user).await.map_err(internal)?;
@@ -738,13 +1048,23 @@ impl ClientProtocol {
                 Ok(Reply::Done)
             }
             Request::UnlockProfile { pin } => {
+                let generation = state.locks.lock().expect("never poisoned").generation;
                 let endpoint = connection.remote_id().to_string();
                 self.services
                     .auth
                     .check_pin(user.user, &endpoint, &pin)
                     .await
                     .map_err(pin_error)?;
-                state.locks.lock().expect("never poisoned").unlock(&session);
+                let mut locks = state.locks.lock().expect("never poisoned");
+                if locks.generation != generation
+                    || locks
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active != &session.0)
+                {
+                    return Err(Error::ProfileLocked);
+                }
+                locks.unlock(&session);
                 Ok(Reply::Done)
             }
             // The PIN, and where it is asked for, need only the session
@@ -855,6 +1175,7 @@ impl ClientProtocol {
                 })
             }
             Request::SetPinRequired { device, required } => {
+                let generation = state.locks.lock().expect("never poisoned").generation;
                 let this = connection.remote_id().to_string();
                 let device = device.unwrap_or_else(|| this.clone());
                 self.store()
@@ -874,7 +1195,14 @@ impl ClientProtocol {
                     // connection stays unlocked; the next one asks.
                     let mut locks = state.locks.lock().expect("never poisoned");
                     locks.learn(&session, true);
-                    locks.unlock(&session);
+                    if locks.generation == generation
+                        && locks
+                            .active
+                            .as_ref()
+                            .is_none_or(|active| active == &session.0)
+                    {
+                        locks.unlock(&session);
+                    }
                 }
                 tracing::info!(user = %user.username, %device, required, "PIN requirement changed");
                 Ok(Reply::Done)
@@ -980,12 +1308,28 @@ impl ClientProtocol {
                 self.fill(principal, items.iter_mut()).await?;
                 Ok(Reply::Items { items, total })
             }
-            Request::UpdatePlaybackProgress { id, position_ms } => {
+            Request::UpdatePlaybackProgress {
+                handle,
+                sequence,
+                position_ms,
+            } => {
+                let playback = self.use_playback(connection, &handle, &session).await?;
+                let _progress = self
+                    .services
+                    .playbacks
+                    .progress_control(&session, &playback.item)
+                    .await;
+                self.services.playbacks.check_progress(&handle, sequence)?;
                 self.services
                     .watch
-                    .progress(principal, &id, Duration::from_millis(position_ms))
+                    .progress(
+                        principal,
+                        &playback.item,
+                        Duration::from_millis(position_ms),
+                    )
                     .await
                     .map_err(watch_error)?;
+                self.services.playbacks.record_progress(&handle, sequence);
                 Ok(Reply::Done)
             }
             Request::MarkWatched { id } => {
@@ -1152,6 +1496,11 @@ impl ClientProtocol {
                 // Its previews next, if it has none yet: the player asks
                 // for them as soon as it shows a seek bar.
                 self.services.previews.played(&id);
+                let _progress = self
+                    .services
+                    .playbacks
+                    .progress_control(&session, &id)
+                    .await;
                 let handle = self.services.playbacks.start(
                     handle,
                     Opened {
@@ -1254,12 +1603,13 @@ impl ClientProtocol {
                     });
                 };
                 let epoch = conversion
-                    .restart(Duration::from_millis(position_ms), 1)
+                    .seek(Duration::from_millis(position_ms))
                     .map_err(|e| match e {
                         JobError::Busy => Error::Busy,
                         JobError::Prepare(reason) => Error::PlaybackFailed { reason },
                     })?;
                 tracing::debug!(epoch, position_ms, "conversion restarted at a seek");
+                self.services.playbacks.revised(&handle);
                 Ok(Reply::PlaybackSeeked { epoch })
             }
             Request::GetManifest { handle, kind } => {
@@ -1982,8 +2332,15 @@ fn internal(e: impl std::fmt::Display) -> Error {
     Error::Internal
 }
 
+fn playback_refusal(refusal: Refusal) -> Error {
+    match refusal {
+        Refusal::Expired => Error::PlaybackExpired,
+        Refusal::NotYours => Error::Unauthenticated,
+    }
+}
+
 /// How long a read past what an encode has written waits for more.
-const READ_WAIT: Duration = Duration::from_secs(10);
+const READ_WAIT: Duration = spoolframe_protocol::policy::wait::READ;
 
 /// A range of a converted playback's progressive output (P2-04): the bytes
 /// written so far, waiting a while for more when the read is past them.
@@ -2315,6 +2672,14 @@ pub(crate) fn auth_methods() -> Vec<AuthMethod> {
 mod tests {
     use super::*;
     use crate::plex_accounts::AccountLink;
+
+    #[test]
+    fn the_shared_probe_allowance_matches_the_media_probers_default() {
+        assert_eq!(
+            spoolframe_protocol::policy::wait::PROBE,
+            spoolframe_media::Prober::DEFAULT_TIMEOUT
+        );
+    }
 
     fn run() -> PlexSyncRun {
         PlexSyncRun {

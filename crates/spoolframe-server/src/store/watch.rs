@@ -152,6 +152,22 @@ impl Store {
         media_id: &str,
         show_id: Option<&str>,
     ) -> Result<(), StoreError> {
+        // Throttled progress reports usually have nothing to clear. A
+        // DELETE, even of no rows, would still acquire SQLite's writer.
+        // Read outside a transaction; a concurrent hide is seen on the
+        // next progress report, without an in-memory invalidation cache.
+        let hidden: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM continue_hidden \
+             WHERE principal = ?1 AND media_id IN (?2, ?3))",
+        )
+        .bind(principal.to_string())
+        .bind(media_id)
+        .bind(show_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if !hidden {
+            return Ok(());
+        }
         let mut tx = self.pool.begin().await?;
         clear_hidden(&mut tx, &principal.to_string(), media_id, show_id).await?;
         tx.commit().await?;
@@ -426,6 +442,34 @@ mod tests {
 
     const ALICE: Principal = Principal::LocalUser(LocalUserId::from_uuid(uuid::Uuid::from_u128(1)));
     const BOB: Principal = Principal::LocalUser(LocalUserId::from_uuid(uuid::Uuid::from_u128(2)));
+
+    #[tokio::test]
+    async fn clearing_nothing_does_not_wait_for_sqlites_writer() {
+        let store = store("clear-hidden-read-only").await;
+        let mut writer = store.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.clear_hidden(ALICE, "plex:episode:1", Some("plex:show:7")),
+        )
+        .await
+        .expect("a no-op clear tried to acquire the writer")
+        .unwrap();
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+        // A later hide must still be cleared on the next progress report.
+        store
+            .hide_continue(ALICE, "plex:show:7", &[])
+            .await
+            .unwrap();
+        store
+            .clear_hidden(ALICE, "plex:episode:1", Some("plex:show:7"))
+            .await
+            .unwrap();
+        assert!(store.hidden(ALICE).await.unwrap().is_empty());
+    }
 
     fn at<'a>(media_id: &'a str, position_ms: i64, ids: &'a [String]) -> WatchUpdate<'a> {
         WatchUpdate {

@@ -1,0 +1,23 @@
+# The server graph permits its existing MPL dependencies and named AGPL crates.
+[graph]
+all-features = true
+exclude-dev = true
+
+[licenses]
+confidence-threshold = 0.95
+allow = [
+  "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC",
+  "Unicode-3.0", "Zlib", "CC0-1.0", "Unlicense", "BSL-1.0", "CDLA-Permissive-2.0", "MPL-2.0",
+]
+
+# Only our server-side crates may introduce AGPL into the server graph.
+# The public crates are checked separately with deny-sdk.toml (no exceptions).
+exceptions = [
+  { crate = "spoolframe-policy", allow = ["GPL-3.0-or-later"] },
+  { crate = "spoolframe-server", allow = ["AGPL-3.0-or-later"] },
+  { crate = "spoolframe-web", allow = ["AGPL-3.0-or-later"] },
+  { crate = "spoolframe-media", allow = ["AGPL-3.0-or-later"] },
+  { crate = "spoolframe-catalog", allow = ["AGPL-3.0-or-later"] },
+  { crate = "spoolframe-plex", allow = ["AGPL-3.0-or-later"] },
+  { crate = "spoolframe-admin-api", allow = ["AGPL-3.0-or-later"] },
+]

@@ -1,6 +1,6 @@
 //! The license boundary from ARCHITECTURE §56: the permissive crates
 //! (types, protocol, client SDK) are what proprietary clients link, so none
-//! of them may reach an AGPL crate through a normal or build dependency.
+//! of them may reach a GPL or AGPL crate through a normal or build dependency.
 //!
 //! Reads the real workspace with `cargo metadata --no-deps`, so a new crate
 //! or a new dependency edge is checked without editing this file.
@@ -24,24 +24,24 @@ fn violations(members: &BTreeMap<String, Member>) -> Vec<String> {
     for (name, member) in members {
         match member.license.as_deref() {
             Some(PERMISSIVE) => {
-                if let Some(path) = path_to_agpl(members, name) {
+                if let Some(path) = path_to_copyleft(members, name) {
                     found.push(format!(
-                        "{name} is {PERMISSIVE} but reaches an AGPL crate: {}",
+                        "{name} is {PERMISSIVE} but reaches a GPL or AGPL crate: {}",
                         path.join(" -> ")
                     ));
                 }
             }
-            Some(AGPL) => {}
+            Some(AGPL) | Some("GPL-3.0-or-later") => {}
             other => found.push(format!(
-                "{name} has license {other:?}; expected {PERMISSIVE:?} or {AGPL:?}"
+                "{name} has license {other:?}; expected {PERMISSIVE:?}, {AGPL:?} or GPL-3.0-or-later"
             )),
         }
     }
     found
 }
 
-/// The dependency path from `start` to the first AGPL member, if there is one.
-fn path_to_agpl(members: &BTreeMap<String, Member>, start: &str) -> Option<Vec<String>> {
+/// The dependency path from `start` to the first copyleft member, if there is one.
+fn path_to_copyleft(members: &BTreeMap<String, Member>, start: &str) -> Option<Vec<String>> {
     let mut stack = vec![vec![start.to_owned()]];
     let mut seen = BTreeSet::new();
     while let Some(path) = stack.pop() {
@@ -52,7 +52,10 @@ fn path_to_agpl(members: &BTreeMap<String, Member>, start: &str) -> Option<Vec<S
         for dep in &members[last].deps {
             let mut next = path.clone();
             next.push(dep.clone());
-            if members[dep].license.as_deref() == Some(AGPL) {
+            if matches!(
+                members[dep].license.as_deref(),
+                Some(AGPL) | Some("GPL-3.0-or-later")
+            ) {
                 return Some(next);
             }
             stack.push(next);
@@ -93,7 +96,7 @@ fn workspace_members() -> BTreeMap<String, Member> {
 }
 
 #[test]
-fn the_workspace_keeps_permissive_crates_free_of_agpl() {
+fn the_workspace_keeps_permissive_crates_free_of_copyleft() {
     let members = workspace_members();
     assert!(
         members.contains_key("spoolframe-types") && members.contains_key("spoolframe-server"),
@@ -136,4 +139,29 @@ fn a_crate_with_an_unexpected_license_is_caught() {
         },
     )]);
     assert_eq!(violations(&members).len(), 1);
+}
+
+#[test]
+fn the_sdk_cannot_reach_gpl_policy_either() {
+    let members = BTreeMap::from([
+        (
+            "sdk".into(),
+            Member {
+                license: Some(PERMISSIVE.into()),
+                deps: BTreeSet::from(["policy".into()]),
+            },
+        ),
+        (
+            "policy".into(),
+            Member {
+                license: Some("GPL-3.0-or-later".into()),
+                deps: BTreeSet::new(),
+            },
+        ),
+    ]);
+    assert!(
+        violations(&members)
+            .iter()
+            .any(|v| v.contains("sdk -> policy"))
+    );
 }

@@ -1,8 +1,8 @@
-//! Artwork over its own stream (`streams::bi::ARTWORK`, P1-05).
+//! Artwork over a resource stream ([`crate::streams::bi::RESOURCE`]).
 //!
 //! The client opens a bi stream, writes the kind byte and one
-//! [`ArtworkRequest`] frame. The server answers with one
-//! [`ArtworkResponse`] frame and, if it is `ok`, exactly `length` raw
+//! [`crate::resource::ResourceRequest`] containing [`ArtworkRequest`].
+//! The server answers with [`crate::resource::ResourceResponse`] and exactly `length` raw
 //! bytes of the image. Each image is its own stream, so a slow one never
 //! holds up RPCs or media.
 

@@ -159,17 +159,7 @@ impl Conversion {
             }
         });
         // An HLS start begins at the segment the position falls in.
-        let (start, first_segment) = match (&segments, start) {
-            (Some(segments), Some(at)) => {
-                let n = segments
-                    .starts_ms
-                    .partition_point(|&s| s <= at.as_millis() as u64)
-                    .max(1) as u32;
-                (segment_seek(segments, n, *video), n)
-            }
-            (Some(_), None) => (None, 1),
-            (None, start) => (start, 0),
-        };
+        let (start, first_segment) = playback_seek(segments.as_ref(), start, *video);
         let job = spawn(
             &jobs,
             &dir,
@@ -291,6 +281,13 @@ impl Conversion {
         self.current.lock().expect("never poisoned").clone()
     }
 
+    /// Seek using the same timeline and keyframe alignment as a new
+    /// playback. HLS segment numbers always refer to the full film.
+    pub fn seek(&self, position: Duration) -> Result<u32, JobError> {
+        let (start, number) = playback_seek(self.segments.as_ref(), Some(position), self.video);
+        self.restart(start.unwrap_or(Duration::ZERO), number)
+    }
+
     /// Start the next epoch at `start` and stop the job (progressive; HLS
     /// restarts at a segment, [`Conversion::job_for_segment`]). Returns the
     /// new epoch.
@@ -325,6 +322,24 @@ impl Drop for Conversion {
         {
             tracing::warn!(dir = %self.dir.display(), error = %e, "cannot remove a conversion's files");
         }
+    }
+}
+
+fn playback_seek(
+    segments: Option<&Segments>,
+    start: Option<Duration>,
+    video: Option<ConvertedVideo>,
+) -> (Option<Duration>, u32) {
+    match (segments, start) {
+        (Some(segments), Some(at)) => {
+            let n = segments
+                .starts_ms
+                .partition_point(|&s| u128::from(s) <= at.as_millis())
+                .max(1) as u32;
+            (segment_seek(segments, n, video), n)
+        }
+        (Some(_), None) => (None, 1),
+        (None, start) => (start, 0),
     }
 }
 

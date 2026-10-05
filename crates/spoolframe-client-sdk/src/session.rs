@@ -311,6 +311,18 @@ pub struct Session {
     pub(crate) user: UserSummary,
 }
 
+/// A profile explicitly selected by the application. All session operations
+/// remain available; choosing another profile relocks this one's PIN.
+#[derive(Debug, Clone)]
+pub struct ActiveProfile(pub(crate) Session);
+
+impl std::ops::Deref for ActiveProfile {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.0
+    }
+}
+
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
@@ -355,6 +367,12 @@ impl Session {
     /// One request in this session. A session the server no longer knows
     /// is forgotten here, and the caller gets [`SdkError::SignInRequired`].
     async fn call(&self, request: Request) -> Result<Reply, SdkError> {
+        if matches!(
+            request,
+            Request::ReadSubtitle { .. } | Request::ReadSubtitleSegment { .. }
+        ) {
+            return self.subtitle_resource(request).await;
+        }
         match self
             .client
             .call(self.server, Some(&self.token), request)
@@ -362,6 +380,82 @@ impl Session {
         {
             Response::Ok(reply) => Ok(reply),
             Response::Err(e) => Err(self.failed(e).await),
+        }
+    }
+
+    async fn subtitle_resource(&self, request: Request) -> Result<Reply, SdkError> {
+        use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
+        let handle = match &request {
+            Request::ReadSubtitle { handle, .. } | Request::ReadSubtitleSegment { handle, .. } => {
+                handle
+            }
+            _ => unreachable!(),
+        };
+        let revision = self
+            .client
+            .playback_revision(self.server, &self.token, handle)
+            .await?;
+        let chunk = matches!(request, Request::ReadSubtitle { .. });
+        let request = match request {
+            Request::ReadSubtitle {
+                handle,
+                offset,
+                version,
+            } => ResourceRequest::Subtitle {
+                session: self.token.clone(),
+                handle,
+                revision,
+                offset,
+                version,
+            },
+            Request::ReadSubtitleSegment { handle, n } => ResourceRequest::SubtitleSegment {
+                session: self.token.clone(),
+                handle,
+                revision,
+                segment: n,
+            },
+            _ => unreachable!(),
+        };
+        let timeouts = self.client.inner.timeouts;
+        let maximum = if chunk {
+            spoolframe_protocol::SUBTITLE_CHUNK
+        } else {
+            spoolframe_protocol::MAX_READ
+        };
+        let (reply, bytes) = self
+            .client
+            .on_connection(self.server, true, |conn| {
+                let request = &request;
+                async move {
+                    conn.resource(request, maximum, timeouts.of_read(), timeouts.request)
+                        .await
+                }
+            })
+            .await?;
+        match reply {
+            ResourceResponse::Ready {
+                metadata:
+                    ResourceMetadata::Subtitle {
+                        format,
+                        total,
+                        version,
+                        revision: actual,
+                    },
+                ..
+            } if revision == actual => Ok(if chunk {
+                Reply::SubtitleChunk {
+                    format,
+                    bytes,
+                    total,
+                    version,
+                }
+            } else {
+                Reply::Subtitle { format, bytes }
+            }),
+            ResourceResponse::Error { error } => Err(self.failed(error).await),
+            _ => Err(SdkError::Protocol(
+                "subtitle returned another resource kind or revision".into(),
+            )),
         }
     }
 
@@ -861,9 +955,13 @@ impl Session {
         request: &MediaRead,
     ) -> Result<(MediaReadResponse, Vec<u8>), SdkError> {
         let timeouts = self.client.inner.timeouts;
+        let revision = self
+            .client
+            .playback_revision(self.server, &self.token, &request.handle)
+            .await?;
         self.client
             .on_connection(self.server, true, |conn| async move {
-                conn.read(request, timeouts.of_read(), timeouts.request)
+                conn.read(request, revision, timeouts.of_read(), timeouts.request)
                     .await
             })
             .await
@@ -978,6 +1076,7 @@ impl Session {
     }
 
     /// An image, at `size`.
+    /// Images larger than 64 MiB are refused before allocating their body.
     pub async fn artwork(&self, id: &ArtworkId, size: ArtworkSize) -> Result<Vec<u8>, SdkError> {
         let request = ArtworkRequest {
             session: self.token.clone(),
@@ -998,11 +1097,22 @@ impl Session {
         }
     }
 
-    /// Where playback of `id` has got to. Send it now and then while
+    /// Where playback of `handle` has got to. Send it now and then while
     /// playing, and on pause and stop; the server decides what to keep.
-    pub async fn update_progress(&self, id: &MediaId, position: Duration) -> Result<(), SdkError> {
+    pub async fn update_progress(
+        &self,
+        handle: &PlaybackHandle,
+        position: Duration,
+    ) -> Result<(), SdkError> {
+        // Keep the sequence cache entry alive until this report finishes,
+        // so eviction cannot reuse a sequence while its request is in flight.
+        let (sequence, _lease) = self
+            .client
+            .progress_sequence(self.server, &self.token, handle)
+            .await?;
         let request = Request::UpdatePlaybackProgress {
-            id: id.clone(),
+            handle: handle.clone(),
+            sequence,
             position_ms: millis(position),
         };
         self.done(request).await

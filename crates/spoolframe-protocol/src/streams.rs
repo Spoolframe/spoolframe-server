@@ -3,14 +3,10 @@
 
 /// The first byte of every bidirectional stream the client opens.
 pub mod bi {
-    /// One request frame from the client, one response frame back.
+    /// One request frame, then a bounded multipart RPC response.
     pub const RPC: u8 = 1;
-    /// One image: an `ArtworkRequest` frame, then an `ArtworkResponse`
-    /// frame and the image's bytes (P1-05).
-    pub const ARTWORK: u8 = 2;
-    /// One range read: a `MediaRead` frame, then a `MediaReadResponse`
-    /// frame and the bytes (P1-08).
-    pub const MEDIA: u8 = 3;
+    /// A `ResourceRequest`, `ResourceResponse`, and bounded raw body.
+    pub const RESOURCE: u8 = 2;
 }
 
 /// The first byte of every unidirectional stream the server opens.

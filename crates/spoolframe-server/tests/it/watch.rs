@@ -15,18 +15,39 @@ async fn alice_and_bob(test: &str) -> (TestServer, TestClient, SessionId, Sessio
     server.add_user("alice", "correct horse", None).await;
     server.add_user("bob", "battery staple", None).await;
     let tv = server.client().await;
-    tv.hello().await;
+    let mut capabilities = support::mkv_capabilities();
+    capabilities
+        .video
+        .insert(spoolframe_types::VideoCodec::H264);
+    tv.hello_with(None, Some(capabilities)).await;
     let alice = tv.login("alice", "correct horse").await;
     let bob = tv.login("bob", "battery staple").await;
     (server, tv, alice, bob)
 }
 
-async fn progress(tv: &TestClient, who: &SessionId, id: &MediaId, secs: u64) {
+async fn progress(server: &TestServer, tv: &TestClient, who: &SessionId, id: &MediaId, secs: u64) {
+    server.write_media(1000);
+    server.write_episode(id.key());
+    let started = tv
+        .call(
+            Some(who),
+            Request::StartPlayback {
+                id: id.clone(),
+                selection: Some(Default::default()),
+                start_ms: None,
+                bitmap: Default::default(),
+            },
+        )
+        .await;
+    let Response::Ok(Reply::PlaybackStarted { handle, .. }) = started else {
+        panic!("progress needs a playback: {started:?}")
+    };
     let response = tv
         .call(
             Some(who),
             Request::UpdatePlaybackProgress {
-                id: id.clone(),
+                handle,
+                sequence: 1,
                 position_ms: secs * 1000,
             },
         )
@@ -70,7 +91,7 @@ fn ids(items: &[Item]) -> Vec<String> {
 async fn each_user_has_their_own_progress() {
     let (server, tv, alice, bob) = alice_and_bob("two-users").await;
     let id = movie().id().clone();
-    progress(&tv, &alice, &id, 600).await;
+    progress(&server, &tv, &alice, &id, 600).await;
     assert_eq!(
         state_of(&tv, &alice, &id).await.position,
         Some(Duration::from_secs(600))
@@ -85,7 +106,7 @@ async fn progress_past_the_threshold_marks_watched() {
     let (server, tv, alice, _) = alice_and_bob("threshold").await;
     let id = movie().id().clone();
     // The fake movie is 7020 s long: 95% is 6669 s.
-    progress(&tv, &alice, &id, 6669).await;
+    progress(&server, &tv, &alice, &id, 6669).await;
     let state = state_of(&tv, &alice, &id).await;
     assert!(state.watched);
     assert_eq!(state.position, None);
@@ -97,7 +118,7 @@ async fn progress_past_the_threshold_marks_watched() {
 async fn under_a_minute_is_not_in_progress() {
     let (server, tv, alice, _) = alice_and_bob("not-started").await;
     let id = movie().id().clone();
-    progress(&tv, &alice, &id, 30).await;
+    progress(&server, &tv, &alice, &id, 30).await;
     assert_eq!(state_of(&tv, &alice, &id).await.position, None);
     assert!(home(&tv, &alice).await.continue_watching.is_empty());
     tv.close().await;
@@ -108,16 +129,16 @@ async fn under_a_minute_is_not_in_progress() {
 async fn fast_updates_are_coalesced() {
     let (server, tv, alice, _) = alice_and_bob("throttle").await;
     let id = movie().id().clone();
-    progress(&tv, &alice, &id, 600).await;
+    progress(&server, &tv, &alice, &id, 600).await;
     // Within the throttle: not written.
-    progress(&tv, &alice, &id, 610).await;
-    progress(&tv, &alice, &id, 620).await;
+    progress(&server, &tv, &alice, &id, 610).await;
+    progress(&server, &tv, &alice, &id, 620).await;
     assert_eq!(
         state_of(&tv, &alice, &id).await.position,
         Some(Duration::from_secs(600))
     );
     // Crossing into watched is always written.
-    progress(&tv, &alice, &id, 6900).await;
+    progress(&server, &tv, &alice, &id, 6900).await;
     assert!(state_of(&tv, &alice, &id).await.watched);
     tv.close().await;
     server.stop().await;
@@ -129,9 +150,9 @@ async fn fast_updates_are_coalesced() {
 async fn fast_updates_after_the_crossing_into_watched_are_coalesced() {
     let (server, tv, alice, _) = alice_and_bob("throttle-watched").await;
     let id = movie().id().clone();
-    progress(&tv, &alice, &id, 6900).await;
-    progress(&tv, &alice, &id, 6910).await;
-    progress(&tv, &alice, &id, 6920).await;
+    progress(&server, &tv, &alice, &id, 6900).await;
+    progress(&server, &tv, &alice, &id, 6910).await;
+    progress(&server, &tv, &alice, &id, 6920).await;
     let rows = server
         .store
         .all_watch(principal(&server, "alice").await)
@@ -150,11 +171,11 @@ async fn fast_updates_after_the_crossing_into_watched_are_coalesced() {
 async fn an_item_is_watched_at_the_start_of_credits_that_run_to_its_end() {
     let (server, tv, alice, bob) = alice_and_bob("credits").await;
     let id = episode("15", "14", 2, 1).id().clone();
-    progress(&tv, &alice, &id, 2399).await;
+    progress(&server, &tv, &alice, &id, 2399).await;
     let state = state_of(&tv, &alice, &id).await;
     assert!(!state.watched);
     assert_eq!(state.position, Some(Duration::from_secs(2399)));
-    progress(&tv, &bob, &id, 2400).await;
+    progress(&server, &tv, &bob, &id, 2400).await;
     assert!(state_of(&tv, &bob, &id).await.watched);
     tv.close().await;
     server.stop().await;
@@ -166,29 +187,29 @@ async fn an_item_is_watched_at_the_start_of_credits_that_run_to_its_end() {
 async fn the_crossing_at_the_credits_is_written_within_the_throttle() {
     let (server, tv, alice, _) = alice_and_bob("credits-throttle").await;
     let id = episode("15", "14", 2, 1).id().clone();
-    progress(&tv, &alice, &id, 2380).await;
+    progress(&server, &tv, &alice, &id, 2380).await;
     // Before the credits: no crossing, so not written.
-    progress(&tv, &alice, &id, 2390).await;
+    progress(&server, &tv, &alice, &id, 2390).await;
     let state = state_of(&tv, &alice, &id).await;
     assert!(!state.watched);
     assert_eq!(state.position, Some(Duration::from_secs(2380)));
-    progress(&tv, &alice, &id, 2400).await;
+    progress(&server, &tv, &alice, &id, 2400).await;
     assert!(state_of(&tv, &alice, &id).await.watched);
     tv.close().await;
     server.stop().await;
 }
 
 /// An item with no such credits is watched at 95% and not before: episode
-/// 12 is as long as episode 15, and at 2507 s it has 133 s left.
+/// 12 is probed as 1309.472 seconds: 95% falls between 1243 and 1244 seconds.
 #[tokio::test]
 async fn an_item_without_credits_that_run_to_its_end_is_watched_at_95_percent() {
     let (server, tv, alice, bob) = alice_and_bob("no-credits").await;
     let id = episode("12", "11", 1, 1).id().clone();
-    progress(&tv, &alice, &id, 2507).await;
+    progress(&server, &tv, &alice, &id, 1243).await;
     let state = state_of(&tv, &alice, &id).await;
     assert!(!state.watched);
-    assert_eq!(state.position, Some(Duration::from_secs(2507)));
-    progress(&tv, &bob, &id, 2508).await;
+    assert_eq!(state.position, Some(Duration::from_secs(1243)));
+    progress(&server, &tv, &bob, &id, 1244).await;
     assert!(state_of(&tv, &bob, &id).await.watched);
     tv.close().await;
     server.stop().await;
@@ -199,10 +220,10 @@ async fn continue_watching_is_newest_first() {
     let (server, tv, alice, _) = alice_and_bob("continue").await;
     let movie_id = movie().id().clone();
     let episode_id = episode("13", "11", 1, 2).id().clone();
-    progress(&tv, &alice, &movie_id, 600).await;
+    progress(&server, &tv, &alice, &movie_id, 600).await;
     // updated_at has one-second resolution.
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    progress(&tv, &alice, &episode_id, 300).await;
+    progress(&server, &tv, &alice, &episode_id, 300).await;
     let home = home(&tv, &alice).await;
     assert_eq!(
         ids(&home.continue_watching),
@@ -330,7 +351,7 @@ async fn a_second_copy_of_a_film_does_not_take_the_first_copy_s_state() {
     let (server, tv, alice, _) = alice_and_bob("two-copies").await;
     let first = movie().id().clone();
     let second = second_copy().id().clone();
-    progress(&tv, &alice, &first, 600).await;
+    progress(&server, &tv, &alice, &first, 600).await;
     assert_eq!(
         state_of(&tv, &alice, &second).await,
         PlaybackState::default()
@@ -351,7 +372,7 @@ async fn a_second_copy_of_a_film_does_not_take_the_first_copy_s_state() {
 async fn a_second_copy_of_a_film_does_not_take_the_first_copy_s_hide() {
     let (server, tv, alice, _) = alice_and_bob("two-copies-hide").await;
     let first = movie().id().clone();
-    progress(&tv, &alice, &first, 600).await;
+    progress(&server, &tv, &alice, &first, 600).await;
     hide(&tv, &alice, &first).await;
     state_of(&tv, &alice, second_copy().id()).await;
     let hidden = server
@@ -475,7 +496,7 @@ async fn looks_at_a_second_copy_ask_about_the_first_copy_once() {
     let (server, tv, alice, _) = alice_and_bob("two-copies-asked-once").await;
     let first = movie().id().clone();
     let second = second_copy().id().clone();
-    progress(&tv, &alice, &first, 600).await;
+    progress(&server, &tv, &alice, &first, 600).await;
     server.catalog.take_calls(&first);
     state_of(&tv, &alice, &second).await;
     state_of(&tv, &alice, &second).await;
@@ -488,7 +509,7 @@ async fn looks_at_a_second_copy_ask_about_the_first_copy_once() {
 async fn pages_and_searches_carry_the_user_s_state() {
     let (server, tv, alice, bob) = alice_and_bob("filled").await;
     let id = movie().id().clone();
-    progress(&tv, &alice, &id, 600).await;
+    progress(&server, &tv, &alice, &id, 600).await;
     let library = support::library().id;
     let Response::Ok(Reply::Items { items, .. }) = tv
         .call(
@@ -561,8 +582,8 @@ async fn hide(tv: &TestClient, who: &SessionId, id: &MediaId) {
 async fn a_hidden_movie_leaves_only_that_user_s_home_and_keeps_its_state() {
     let (server, tv, alice, bob) = alice_and_bob("hide-movie").await;
     let id = movie().id().clone();
-    progress(&tv, &alice, &id, 600).await;
-    progress(&tv, &bob, &id, 600).await;
+    progress(&server, &tv, &alice, &id, 600).await;
+    progress(&server, &tv, &bob, &id, 600).await;
     hide(&tv, &alice, &id).await;
     assert!(home(&tv, &alice).await.continue_watching.is_empty());
     assert_eq!(
@@ -582,10 +603,10 @@ async fn a_hidden_movie_leaves_only_that_user_s_home_and_keeps_its_state() {
 async fn playing_a_hidden_movie_brings_it_back() {
     let (server, tv, alice, _) = alice_and_bob("hide-play").await;
     let id = movie().id().clone();
-    progress(&tv, &alice, &id, 600).await;
+    progress(&server, &tv, &alice, &id, 600).await;
     hide(&tv, &alice, &id).await;
     // Within the write throttle of the last update: not written, but played.
-    progress(&tv, &alice, &id, 610).await;
+    progress(&server, &tv, &alice, &id, 610).await;
     assert_eq!(
         ids(&home(&tv, &alice).await.continue_watching),
         [id.to_string()]
@@ -600,7 +621,7 @@ async fn a_hidden_episode_hides_its_show_until_an_episode_is_played() {
     let watched = episode("12", "11", 1, 1).id().clone();
     let started = episode("13", "11", 1, 2).id().clone();
     mark_watched(&tv, &alice, &watched).await;
-    progress(&tv, &alice, &started, 300).await;
+    progress(&server, &tv, &alice, &started, 300).await;
     let before = home(&tv, &alice).await;
     assert_eq!(ids(&before.continue_watching), [started.to_string()]);
     assert!(!before.next_up.is_empty());
@@ -624,7 +645,7 @@ async fn a_hidden_episode_hides_its_show_until_an_episode_is_played() {
 async fn unhide_restores_at_once() {
     let (server, tv, alice, _) = alice_and_bob("unhide").await;
     let id = movie().id().clone();
-    progress(&tv, &alice, &id, 600).await;
+    progress(&server, &tv, &alice, &id, 600).await;
     hide(&tv, &alice, &id).await;
     let response = tv
         .call(
@@ -645,12 +666,16 @@ async fn unhide_restores_at_once() {
 async fn a_hide_survives_a_restart() {
     let (server, tv, alice, _) = alice_and_bob("hide-restart").await;
     let id = movie().id().clone();
-    progress(&tv, &alice, &id, 600).await;
+    progress(&server, &tv, &alice, &id, 600).await;
     hide(&tv, &alice, &id).await;
     tv.close().await;
     let server = server.restart().await;
     let tv = server.client().await;
-    tv.hello().await;
+    let mut capabilities = support::mkv_capabilities();
+    capabilities
+        .video
+        .insert(spoolframe_types::VideoCodec::H264);
+    tv.hello_with(None, Some(capabilities)).await;
     let alice = tv.login("alice", "correct horse").await;
     assert!(home(&tv, &alice).await.continue_watching.is_empty());
     tv.close().await;

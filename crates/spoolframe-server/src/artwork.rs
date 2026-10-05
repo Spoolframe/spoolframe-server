@@ -114,7 +114,7 @@ pub struct ArtworkCache {
     index: Mutex<Index>,
     /// One fetch or resize per key at a time; others wait and then find it
     /// cached.
-    inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    inflight: crate::keyed_locks::KeyedLocks,
 }
 
 impl std::fmt::Debug for ArtworkCache {
@@ -204,7 +204,7 @@ impl ArtworkCache {
             limit,
             catalog,
             index: Mutex::new(index),
-            inflight: Mutex::default(),
+            inflight: Default::default(),
         })
     }
 
@@ -226,16 +226,12 @@ impl ArtworkCache {
         if let Some(hit) = self.read(&key).await? {
             return Ok(hit);
         }
-        let gate = self.gate(&key);
-        let _held = gate.lock().await;
+        let _held = self.inflight.lock(&key).await;
         // Whoever held the gate before us may have filled it.
         if let Some(hit) = self.read(&key).await? {
-            self.release(&key);
             return Ok(hit);
         }
-        let made = self.make(id, size).await;
-        self.release(&key);
-        let image = made?;
+        let image = self.make(id, size).await?;
         self.store(&key, &image).await
     }
 
@@ -295,23 +291,6 @@ impl ArtworkCache {
             content_type: image.content_type.clone(),
             etag: key.to_owned(),
         })
-    }
-
-    fn gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.inflight
-            .lock()
-            .expect("never held across a panic")
-            .entry(key.to_owned())
-            .or_default()
-            .clone()
-    }
-
-    fn release(&self, key: &str) {
-        let mut inflight = self.inflight.lock().expect("never held across a panic");
-        // Only the last holder removes it; waiters still have a clone.
-        if inflight.get(key).is_some_and(|g| Arc::strong_count(g) <= 2) {
-            inflight.remove(key);
-        }
     }
 }
 

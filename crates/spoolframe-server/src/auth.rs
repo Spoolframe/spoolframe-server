@@ -119,10 +119,7 @@ pub fn valid_pin(pin: &str) -> bool {
 }
 
 /// How many digits `pin` has, if it is a PIN a user may set.
-pub fn pin_digits(pin: &str) -> Option<u8> {
-    let digits = u8::try_from(pin.len()).ok()?;
-    ((4..=8).contains(&digits) && pin.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
-}
+pub use spoolframe_types::pin::pin_digits;
 
 /// Hash a new PIN as passwords are (Argon2id, PHC string).
 pub async fn hash_pin(pin: &str) -> Result<String, PasswordError> {

@@ -1,0 +1,228 @@
+//! Independent SDK test transport. No server or platform-client dependencies.
+use crate::{
+    Chunk, ManagedPlayback, Playback, PlaybackBackend, PlaybackChange, PlaybackOptions, SdkError,
+};
+use async_trait::async_trait;
+use spoolframe_protocol::{BitmapSubtitles, PlaybackHandle, PlaybackPlan, Selection};
+use spoolframe_types::{Container, Delivery, MediaId, MediaKind, Namespace};
+use std::{
+    collections::HashMap,
+    future::Future,
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
+
+pub fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    })
+}
+pub fn ready<T>(future: impl Future<Output = T>) -> T {
+    runtime().block_on(future)
+}
+pub fn thread_spawn() -> crate::reader::Spawn {
+    Arc::new(|future| {
+        runtime().spawn(future);
+    })
+}
+pub fn media_file(name: &str, len: usize) -> (spoolframe_test_dir::TestDir, PathBuf, Vec<u8>) {
+    let dir = spoolframe_test_dir::TestDir::new_blocking(name);
+    let path = dir.join("media");
+    let bytes: Vec<_> = (0..len).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &bytes).unwrap();
+    (dir, path, bytes)
+}
+pub fn direct_plan() -> PlaybackPlan {
+    PlaybackPlan::Direct {
+        container: Container::Matroska,
+        video: None,
+        audio: None,
+        subtitle: None,
+    }
+}
+pub struct TestProfile;
+pub struct FakeClient {
+    path: PathBuf,
+    limit: u64,
+    grow: Option<u64>,
+}
+impl FakeClient {
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path: path.unwrap(),
+            limit: u64::MAX,
+            grow: None,
+        }
+    }
+    pub fn with_read_limit(mut self, limit: u64) -> Self {
+        self.limit = limit;
+        self
+    }
+    pub fn converting(mut self, grow: u64) -> Self {
+        self.grow = Some(grow);
+        self
+    }
+    pub fn profile(_name: &str) -> TestProfile {
+        TestProfile
+    }
+    pub fn session(&self, _: &TestProfile) -> Result<Arc<TestBackend>, SdkError> {
+        Ok(Arc::new(TestBackend {
+            bytes: std::fs::read(&self.path).unwrap(),
+            limit: self.limit,
+            grow: self.grow,
+            state: Mutex::new(TestState::default()),
+        }))
+    }
+}
+#[derive(Default)]
+struct TestState {
+    next: u64,
+    handles: HashMap<String, (u32, u64)>,
+}
+pub struct TestBackend {
+    bytes: Vec<u8>,
+    limit: u64,
+    grow: Option<u64>,
+    state: Mutex<TestState>,
+}
+impl TestBackend {
+    fn playback(&self, handle: PlaybackHandle, epoch: u32) -> Playback {
+        Playback {
+            handle,
+            epoch,
+            size: if self.grow.is_some() {
+                0
+            } else {
+                self.bytes.len() as u64
+            },
+            chosen: None,
+            markers: vec![],
+            plan: if self.grow.is_some() {
+                PlaybackPlan::Converted {
+                    delivery: Delivery::Progressive,
+                    container: Container::Matroska,
+                    video: None,
+                    audio: None,
+                    subtitle: None,
+                    reasons: vec![],
+                }
+            } else {
+                direct_plan()
+            },
+        }
+    }
+    pub async fn start_playback(
+        &self,
+        item: &MediaId,
+        selection: Option<Selection>,
+        start: Option<Duration>,
+    ) -> Result<Playback, SdkError> {
+        self.start(
+            item,
+            selection,
+            PlaybackOptions {
+                start,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+    pub async fn seek_playback(
+        &self,
+        handle: &PlaybackHandle,
+        position: Duration,
+    ) -> Result<u32, SdkError> {
+        self.seek(handle, position).await
+    }
+    pub fn adopt(self: Arc<Self>, handle: PlaybackHandle, epoch: u32) -> ManagedPlayback {
+        let _enter = runtime().enter();
+        let p = self.playback(handle, epoch);
+        ManagedPlayback::adopt(
+            self,
+            MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
+            None,
+            PlaybackOptions::default(),
+            p,
+        )
+    }
+}
+#[async_trait]
+impl PlaybackBackend for TestBackend {
+    async fn start(
+        &self,
+        _: &MediaId,
+        _: Option<Selection>,
+        _: PlaybackOptions,
+    ) -> Result<Playback, SdkError> {
+        let mut s = self.state.lock().unwrap();
+        s.next += 1;
+        let handle = s.next.to_string();
+        s.handles.insert(handle.clone(), (0, 0));
+        Ok(self.playback(PlaybackHandle(handle), 0))
+    }
+    async fn read(&self, h: &PlaybackHandle, o: u64, n: u64) -> Result<Vec<u8>, SdkError> {
+        if !self.state.lock().unwrap().handles.contains_key(&h.0) {
+            return Err(SdkError::PlaybackExpired);
+        }
+        let from = o.min(self.bytes.len() as u64) as usize;
+        let to = o
+            .saturating_add(n.min(self.limit))
+            .min(self.bytes.len() as u64) as usize;
+        Ok(self.bytes[from..to].to_vec())
+    }
+    async fn read_chunk(
+        &self,
+        h: &PlaybackHandle,
+        e: u32,
+        o: u64,
+        n: u64,
+    ) -> Result<Chunk, SdkError> {
+        let mut s = self.state.lock().unwrap();
+        let (epoch, written) = s.handles.get_mut(&h.0).ok_or(SdkError::PlaybackExpired)?;
+        if *epoch != e {
+            return Err(SdkError::PlaybackRestarted { epoch: *epoch });
+        }
+        *written = written
+            .saturating_add(self.grow.unwrap_or(u64::MAX))
+            .min(self.bytes.len() as u64);
+        let end = o.saturating_add(n).min(*written);
+        let from = o.min(end);
+        Ok(Chunk {
+            bytes: self.bytes[from as usize..end as usize].to_vec(),
+            size: *written,
+            complete: *written == self.bytes.len() as u64,
+            epoch: *epoch,
+        })
+    }
+    async fn seek(&self, h: &PlaybackHandle, _: Duration) -> Result<u32, SdkError> {
+        let mut s = self.state.lock().unwrap();
+        let (epoch, written) = s.handles.get_mut(&h.0).ok_or(SdkError::PlaybackExpired)?;
+        *epoch += 1;
+        *written = 0;
+        Ok(*epoch)
+    }
+    async fn subtitle(
+        &self,
+        _: &PlaybackHandle,
+        _: Option<u32>,
+        _: BitmapSubtitles,
+        _: Duration,
+    ) -> Result<PlaybackChange, SdkError> {
+        Err(SdkError::InvalidInput(
+            "test transport has no subtitles".into(),
+        ))
+    }
+    async fn progress(&self, _: &PlaybackHandle, _: Duration) -> Result<(), SdkError> {
+        Ok(())
+    }
+    async fn stop(&self, h: &PlaybackHandle) -> Result<(), SdkError> {
+        self.state.lock().unwrap().handles.remove(&h.0);
+        Ok(())
+    }
+}

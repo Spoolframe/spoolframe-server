@@ -9,60 +9,13 @@ use std::time::{Duration, Instant};
 use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::Prober;
 use spoolframe_protocol::HomeScreen;
-use spoolframe_types::{Item, Marker, MarkerKind, MediaId, MediaKind, PlaybackState};
+use spoolframe_types::{Item, MediaId, MediaKind};
 
 use crate::principal::Principal;
 use crate::store::watch::WatchUpdate;
 use crate::store::{Store, StoreError, now};
-
-/// The rules, with defaults; `watch { … }` in the config overrides them.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WatchRules {
-    /// Under this, an item is not in progress.
-    pub started_after: Duration,
-    /// Watched at this share of the duration, for an item with no credits
-    /// that run to its end.
-    pub watched_fraction: f64,
-    /// At most one progress write per principal and item this often.
-    pub throttle: Duration,
-    /// Shows with activity this recent get a next-up episode.
-    pub next_up_window: Duration,
-    /// How long a next-up row is reused before it is walked again.
-    pub next_up_cache: Duration,
-}
-
-impl Default for WatchRules {
-    fn default() -> Self {
-        Self {
-            started_after: Duration::from_secs(60),
-            watched_fraction: 0.95,
-            throttle: Duration::from_secs(10),
-            next_up_window: Duration::from_secs(30 * 24 * 3600),
-            next_up_cache: Duration::from_secs(60),
-        }
-    }
-}
-
-impl WatchRules {
-    /// Whether `position` into an item of `duration` counts as watched.
-    /// `credits` is where the credits that run to its end start, when the
-    /// catalog knows (P2-10): then that is the point, exactly, and the
-    /// share of the duration does not apply.
-    pub fn is_watched(
-        &self,
-        position: Duration,
-        duration: Option<Duration>,
-        credits: Option<Duration>,
-    ) -> bool {
-        if let Some(credits) = credits {
-            return position >= credits;
-        }
-        let Some(duration) = duration.filter(|d| !d.is_zero()) else {
-            return false;
-        };
-        position.as_secs_f64() >= duration.as_secs_f64() * self.watched_fraction
-    }
-}
+pub use spoolframe_policy::watch::WatchRules;
+use spoolframe_policy::watch::credits_to_end;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
@@ -114,16 +67,6 @@ impl std::fmt::Debug for Watch {
             .field("rules", &self.rules())
             .finish_non_exhaustive()
     }
-}
-
-/// Where the credits that run to the end of the item start, if `markers`
-/// has such credits.
-fn credits_to_end(markers: &[Marker]) -> Option<Duration> {
-    markers
-        .iter()
-        .filter(|m| m.kind == MarkerKind::Credits && m.to_end)
-        .map(|m| Duration::from_millis(m.start_ms))
-        .min()
 }
 
 /// Whether `e` is a Plex server that cannot be reached or does not answer
@@ -489,12 +432,8 @@ impl Watch {
             };
             let position = row
                 .position_ms
-                .map(|p| Duration::from_millis(p.max(0) as u64))
-                .filter(|p| *p >= self.rules().started_after && !row.watched);
-            let state = PlaybackState {
-                position,
-                watched: row.watched,
-            };
+                .map(|p| Duration::from_millis(p.max(0) as u64));
+            let state = self.rules().playback_state(position, row.watched);
             match item {
                 Item::Movie(m) => m.playback = state,
                 Item::Episode(e) => e.playback = state,
@@ -655,6 +594,9 @@ impl Watch {
         Ok(episodes.into_iter().nth(latest + 1))
     }
 }
+
+#[cfg(test)]
+use spoolframe_types::{Marker, MarkerKind};
 
 #[cfg(test)]
 mod tests {

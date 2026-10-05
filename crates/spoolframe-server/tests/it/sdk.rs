@@ -394,8 +394,13 @@ async fn artwork_comes_at_the_asked_size() {
 async fn progress_shows_on_home_and_in_items() {
     let (server, client, _) = ready("progress").await;
     let alice = alice(&server, &client).await;
+    server.write_media(1000);
+    let playback = alice
+        .start_playback(movie().id(), Some(Default::default()))
+        .await
+        .unwrap();
     alice
-        .update_progress(movie().id(), Duration::from_secs(600))
+        .update_progress(&playback.handle, Duration::from_secs(600))
         .await
         .unwrap();
     let home = alice.home().await.unwrap();
@@ -1150,5 +1155,115 @@ async fn the_app_manages_its_user_s_passkeys() {
     );
     assert_eq!(alice.passkeys().await.unwrap().len(), 1);
     phone.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn unchanged_sdk_calls_reassemble_large_replies_and_serialize_controls() {
+    let (server, client, _) = ready("sdk-wire-revision").await;
+    server.write_media(1000);
+    let alice = alice(&server, &client).await;
+    let large = alice
+        .search(support::search(support::A_TITLE_OVER_A_FRAME))
+        .await
+        .unwrap();
+    assert!(
+        spoolframe_protocol::codec::encode(&large).unwrap().len()
+            > spoolframe_protocol::codec::MAX_FRAME as usize
+    );
+    let playback = alice
+        .start_playback(movie().id(), Some(Selection::default()))
+        .await
+        .unwrap();
+    let other = alice.clone();
+    let (one, two) = tokio::join!(
+        alice.change_subtitle(&playback.handle, None, Default::default(), Duration::ZERO),
+        other.change_subtitle(&playback.handle, None, Default::default(), Duration::ZERO),
+    );
+    one.unwrap();
+    two.unwrap();
+    assert_eq!(alice.read(&playback.handle, 0, 10).await.unwrap().len(), 10);
+    alice.stop_playback(&playback.handle).await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn selecting_a_profile_is_explicit_and_background_reads_do_not_switch_it() {
+    let (server, client, _) = ready("sdk-explicit-profile").await;
+    let alice = alice(&server, &client).await;
+    let bob = client
+        .sign_in(&id(&server), "bob", "battery staple")
+        .await
+        .unwrap();
+    let active = client.activate_profile(&alice).await.unwrap();
+    active.set_pin("4321", None).await.unwrap();
+    active.set_pin_required(None, true).await.unwrap();
+    bob.libraries().await.unwrap();
+    assert!(!active.whoami().await.unwrap().locked);
+    active.home().await.unwrap();
+    client.activate_profile(&bob).await.unwrap();
+    assert!(matches!(active.home().await, Err(SdkError::ProfileLocked)));
+    let active = client.activate_profile(&alice).await.unwrap();
+    active.unlock("4321").await.unwrap();
+    active.home().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn progress_sequences_resume_when_the_sdk_reopens_with_a_saved_handle() {
+    let (server, client, storage) = ready("sdk-progress-resume").await;
+    server.write_media(1000);
+    let alice = alice(&server, &client).await;
+    let playback = alice
+        .start_playback(movie().id(), Some(Default::default()))
+        .await
+        .unwrap();
+    alice
+        .update_progress(&playback.handle, Duration::from_secs(30))
+        .await
+        .unwrap();
+    client.close().await;
+    let client = client_on(&server, &storage).await;
+    let alice = client.profiles(&id(&server)).await.unwrap().remove(0);
+    alice
+        .update_progress(&playback.handle, Duration::from_secs(600))
+        .await
+        .unwrap();
+    alice.stop_playback(&playback.handle).await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn managed_playback_recovers_then_reports_and_stops_the_replacement() {
+    let (server, client, _) = ready("sdk-managed-playback").await;
+    let file = server.write_media(1000);
+    let alice = alice(&server, &client).await;
+    let playback = alice
+        .open_playback(
+            movie().id(),
+            Some(Selection::default()),
+            PlaybackOptions::default(),
+        )
+        .await
+        .unwrap();
+    let old = playback.snapshot().handle;
+    // Force the same missing-handle response as idle expiry, without waiting.
+    alice.stop_playback(&old).await.unwrap();
+    assert_eq!(playback.read(0, 1000).await.unwrap(), file);
+    let new = playback.snapshot().handle;
+    assert_ne!(old, new);
+    playback.report_position(Duration::from_secs(60)).unwrap();
+    playback.finish(Duration::from_secs(600)).await.unwrap();
+    let home = alice.home().await.unwrap();
+    assert_eq!(home.continue_watching.len(), 1);
+    let Item::Movie(item) = &home.continue_watching[0] else {
+        panic!("expected movie")
+    };
+    assert_eq!(item.playback.position, Some(Duration::from_secs(600)));
+    assert_eq!(alice.read(&new, 0, 1).await, Err(SdkError::PlaybackExpired));
+    client.close().await;
     server.stop().await;
 }

@@ -186,13 +186,18 @@ async fn switching_to_another_profile_and_back_asks_again() {
     let (server, tv, alice) = locked("pin-switch", ServerOptions::default()).await;
     server.add_user("bob", "battery staple", None).await;
     let bob = tv.login("bob", "battery staple").await;
+    ok(&tv, &alice, Request::ActivateProfile).await;
     ok(&tv, &alice, Request::UnlockProfile { pin: PIN.into() }).await;
     ok(&tv, &alice, Request::Libraries).await;
     // "Who's watching" asks every profile who it is: that is no switch.
     who(&tv, &bob).await;
     ok(&tv, &alice, Request::Libraries).await;
-    // Bob watches; back to alice, her PIN again.
+    // Background requests on Bob do not switch the foreground profile.
     ok(&tv, &bob, Request::Libraries).await;
+    ok(&tv, &alice, Request::Libraries).await;
+    // Only explicit selection relocks Alice.
+    ok(&tv, &bob, Request::ActivateProfile).await;
+    ok(&tv, &alice, Request::ActivateProfile).await;
     assert_eq!(
         err(&tv, &alice, Request::Libraries).await,
         Error::ProfileLocked
@@ -759,6 +764,33 @@ async fn a_user_without_a_password_proves_it_with_the_pin() {
     ok(&tv, &session, set_pin("98765", Some(by_pin(PIN)))).await;
     ok(&tv, &session, clear_pin(by_pin("98765"))).await;
     assert_eq!(pin_state(&tv, &session).await, None);
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn replaying_an_unlock_does_not_unlock_a_new_connection() {
+    use spoolframe_protocol::{RequestEnvelope, rpc::RpcRequest};
+    let (server, tv, session) = locked("pin-replay", ServerOptions::default()).await;
+    let request = RpcRequest {
+        envelope: RequestEnvelope {
+            session: Some(session.clone()),
+            request: Request::UnlockProfile { pin: PIN.into() },
+        },
+        operation: Some(tv.operation()),
+        expected_revision: None,
+    };
+    assert_eq!(
+        tv.wire(&request).await.reply.response,
+        Response::Ok(Reply::Done)
+    );
+    let other = tv.reconnect(&server).await;
+    assert_eq!(
+        other.wire(&request).await.reply.response,
+        Response::Err(Error::ProfileLocked)
+    );
+    assert!(who(&other, &session).await);
+    other.close().await;
     tv.close().await;
     server.stop().await;
 }

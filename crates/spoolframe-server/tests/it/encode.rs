@@ -1164,6 +1164,66 @@ async fn hls_restarted_far_ahead_stores_the_film_s_own_time() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn an_explicit_hls_seek_keeps_segment_numbers_and_film_time() {
+    for encode in [false, true] {
+        let mut caps = hls_capabilities();
+        if encode {
+            caps.max_video = Some(VideoLimits {
+                height: Some(180),
+                ..VideoLimits::default()
+            });
+        }
+        let (server, client, session) = hls_ready("hls-explicit-seek", caps).await;
+        let handle = started(&client, &session, None).await;
+        let playlist = manifest(&client, &session, &handle, ManifestKind::Media).await;
+        let starts = segment_starts(&media_segments(&playlist));
+        // Inside segment 2, not at its boundary. Starting numbering at 1
+        // would serve the following segment's content under this number.
+        let position_ms = if encode { 9_000 } else { 3_000 };
+        assert_eq!(
+            client
+                .call(
+                    Some(&session),
+                    Request::SeekPlayback {
+                        handle: handle.clone(),
+                        position_ms,
+                    }
+                )
+                .await,
+            Response::Ok(Reply::PlaybackSeeked { epoch: 1 }),
+        );
+        for n in [2, 3] {
+            assert_stores_film_time(
+                &client,
+                &session,
+                &handle,
+                n,
+                (starts[n as usize - 1], starts[n as usize]),
+            )
+            .await;
+        }
+        assert_eq!(
+            manifest(&client, &session, &handle, ManifestKind::Media).await,
+            playlist
+        );
+        // Reading these segments must not repair a bad seek by restarting.
+        let (read, _) = client
+            .media(MediaRead {
+                session: session.clone(),
+                handle: handle.clone(),
+                offset: 0,
+                length: 1,
+                epoch: 0,
+                segment: Some(3),
+            })
+            .await;
+        assert!(matches!(read, MediaReadResponse::Ok(reply) if reply.epoch == 1));
+        client.close().await;
+        server.stop().await;
+    }
+}
+
 /// AVPlayer plays HEVC in fMP4 only under the sample entry `hvc1`, and
 /// the playlist says `hvc1`. ffmpeg writes `hev1` unless told: an iPhone
 /// was given a 4K film as `hev1`, and showed nothing.
@@ -1633,6 +1693,36 @@ async fn a_subtitle_change_needs_no_second_slot() {
     ));
     tv.close().await;
     desktop.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn simultaneous_subtitle_changes_get_distinct_epochs_in_one_slot() {
+    let (server, client, session) = ready(
+        "subtitle-concurrent",
+        ServerOptions {
+            max_jobs: 1,
+            ..ServerOptions::default()
+        },
+        12,
+    )
+    .await;
+    let handle = started(&client, &session, None).await;
+    let (a, b) = tokio::join!(
+        change(&client, &session, &handle, None, 1_000),
+        change(&client, &session, &handle, None, 2_000),
+    );
+    let mut epochs = [a.1, b.1];
+    epochs.sort();
+    assert_eq!(epochs, [1, 2]);
+    let (stale, _) = client.read_at(&session, &handle, 1, 0, 1).await;
+    assert_eq!(
+        stale,
+        MediaReadResponse::Err(Error::PlaybackRestarted { epoch: 2 })
+    );
+    let (bytes, _) = read_all(&client, &session, &handle, 2).await;
+    assert!(!bytes.is_empty());
+    client.close().await;
     server.stop().await;
 }
 

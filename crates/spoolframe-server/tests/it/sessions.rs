@@ -184,6 +184,8 @@ async fn a_session_survives_a_server_restart() {
     let tv = support::TestClient {
         endpoint: tv.endpoint,
         conn,
+        instance: Default::default(),
+        controls: Default::default(),
     };
     tv.hello().await;
     assert_eq!(name_of(who(&tv, &alice).await), "alice");

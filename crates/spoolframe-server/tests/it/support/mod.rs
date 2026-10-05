@@ -1171,7 +1171,12 @@ impl TestServer {
             .connect(self.server.addr(), CLIENT_ALPN)
             .await
             .unwrap();
-        TestClient { endpoint, conn }
+        TestClient {
+            endpoint,
+            conn,
+            instance: Arc::default(),
+            controls: Arc::default(),
+        }
     }
 
     pub async fn stop(self) {
@@ -1202,6 +1207,8 @@ impl TestServer {
 pub struct TestClient {
     pub endpoint: Endpoint,
     pub conn: Connection,
+    pub instance: Arc<std::sync::Mutex<Option<spoolframe_protocol::rpc::ServerInstance>>>,
+    pub controls: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl TestClient {
@@ -1225,6 +1232,8 @@ impl TestClient {
         let client = TestClient {
             endpoint: self.endpoint.clone(),
             conn,
+            instance: Arc::default(),
+            controls: Arc::default(),
         };
         assert!(matches!(
             client.hello_with(None, capabilities).await,
@@ -1233,21 +1242,177 @@ impl TestClient {
         client
     }
 
-    /// Send any serializable envelope as one RPC.
-    pub async fn send<T: Serialize>(&self, envelope: &T) -> Response {
+    pub fn operation(&self) -> spoolframe_protocol::rpc::Operation {
+        let instance = self.instance.lock().unwrap().clone();
+        spoolframe_protocol::rpc::Operation {
+            id: uuid::Uuid::now_v7().to_string(),
+            instance: instance.map(|i| i.id).unwrap_or_default(),
+            expires_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 60_000,
+        }
+    }
+
+    pub async fn wire<T: Serialize>(&self, request: &T) -> spoolframe_protocol::rpc::RpcResponse {
         let (mut send, mut recv) = self.conn.open_bi().await.unwrap();
         send.write_u8(bi::RPC).await.unwrap();
-        write_frame(&mut send, envelope).await.unwrap();
+        write_frame(&mut send, request).await.unwrap();
         send.finish().unwrap();
-        read_frame(&mut recv).await.unwrap()
+        let response: spoolframe_protocol::rpc::RpcResponse =
+            spoolframe_protocol::codec::read_reply(&mut recv)
+                .await
+                .unwrap();
+        *self.instance.lock().unwrap() = Some(response.server.clone());
+        response
+    }
+
+    /// Wrap arbitrary envelopes too, to test malformed and unknown requests.
+    pub async fn send<T: Serialize>(&self, envelope: &T) -> Response {
+        #[derive(Serialize)]
+        struct Wire<'a, T> {
+            envelope: &'a T,
+            operation: spoolframe_protocol::rpc::Operation,
+            expected_revision: Option<u64>,
+        }
+        self.wire(&Wire {
+            envelope,
+            operation: self.operation(),
+            expected_revision: None,
+        })
+        .await
+        .reply
+        .response
+    }
+
+    async fn revision(
+        &self,
+        session: &SessionId,
+        handle: &PlaybackHandle,
+    ) -> Result<u64, spoolframe_protocol::Error> {
+        match self
+            .send(&RequestEnvelope {
+                session: Some(session.clone()),
+                request: Request::PlaybackRevision {
+                    handle: handle.clone(),
+                },
+            })
+            .await
+        {
+            Response::Ok(Reply::PlaybackRevision { revision }) => Ok(revision),
+            Response::Err(error) => Err(error),
+            other => panic!("unexpected revision: {other:?}"),
+        }
     }
 
     pub async fn call(&self, session: Option<&SessionId>, request: Request) -> Response {
-        self.send(&RequestEnvelope {
-            session: session.cloned(),
-            request,
+        use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
+        let control = match &request {
+            Request::ChangeSubtitle { handle, .. }
+            | Request::SeekPlayback { handle, .. }
+            | Request::StopPlayback { handle } => Some(handle),
+            _ => None,
+        };
+        let _control = if control.is_some() {
+            Some(self.controls.lock().await)
+        } else {
+            None
+        };
+        let expected_revision = match (session, control) {
+            (Some(session), Some(handle)) => match self.revision(session, handle).await {
+                Ok(revision) => Some(revision),
+                Err(error) => return Response::Err(error),
+            },
+            _ => None,
+        };
+        let subtitle = match (&request, session) {
+            (
+                Request::ReadSubtitle {
+                    handle,
+                    offset,
+                    version,
+                },
+                Some(session),
+            ) => {
+                let revision = match self.revision(session, handle).await {
+                    Ok(v) => v,
+                    Err(e) => return Response::Err(e),
+                };
+                Some(ResourceRequest::Subtitle {
+                    session: session.clone(),
+                    handle: handle.clone(),
+                    revision,
+                    offset: *offset,
+                    version: *version,
+                })
+            }
+            (Request::ReadSubtitleSegment { handle, n: segment }, Some(session)) => {
+                let revision = match self.revision(session, handle).await {
+                    Ok(v) => v,
+                    Err(e) => return Response::Err(e),
+                };
+                Some(ResourceRequest::SubtitleSegment {
+                    session: session.clone(),
+                    handle: handle.clone(),
+                    revision,
+                    segment: *segment,
+                })
+            }
+            _ => None,
+        };
+        if let Some(subtitle) = subtitle {
+            let (response, data) = self.resource(&subtitle).await;
+            return match response {
+                ResourceResponse::Error { error } => Response::Err(error),
+                ResourceResponse::Ready {
+                    metadata:
+                        ResourceMetadata::Subtitle {
+                            format,
+                            total,
+                            version,
+                            ..
+                        },
+                    ..
+                } => Response::Ok(match request {
+                    Request::ReadSubtitle { .. } => Reply::SubtitleChunk {
+                        format,
+                        total,
+                        version,
+                        bytes: data,
+                    },
+                    _ => Reply::Subtitle {
+                        format,
+                        bytes: data,
+                    },
+                }),
+                other => panic!("unexpected subtitle: {other:?}"),
+            };
+        }
+        self.wire(&spoolframe_protocol::rpc::RpcRequest {
+            envelope: RequestEnvelope {
+                session: session.cloned(),
+                request,
+            },
+            operation: Some(self.operation()),
+            expected_revision,
         })
         .await
+        .reply
+        .response
+    }
+
+    pub async fn resource(
+        &self,
+        request: &spoolframe_protocol::resource::ResourceRequest,
+    ) -> (spoolframe_protocol::resource::ResourceResponse, Vec<u8>) {
+        let (mut send, mut recv) = self.conn.open_bi().await.unwrap();
+        send.write_u8(bi::RESOURCE).await.unwrap();
+        write_frame(&mut send, request).await.unwrap();
+        send.finish().unwrap();
+        let response = read_frame(&mut recv).await.unwrap();
+        let bytes = recv.read_to_end(64 << 20).await.unwrap();
+        (response, bytes)
     }
 
     /// `Hello`, as a device named `device_name`.
@@ -1313,17 +1478,29 @@ impl TestClient {
         id: ArtworkId,
         size: ArtworkSize,
     ) -> (ArtworkResponse, Vec<u8>) {
-        let (mut send, mut recv) = self.conn.open_bi().await.unwrap();
-        send.write_u8(bi::ARTWORK).await.unwrap();
-        let request = ArtworkRequest {
-            session: session.clone(),
-            id,
-            size,
+        use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
+        let (response, bytes) = self
+            .resource(&ResourceRequest::Artwork {
+                request: ArtworkRequest {
+                    session: session.clone(),
+                    id,
+                    size,
+                },
+                max_bytes: 64 << 20,
+            })
+            .await;
+        let response = match response {
+            ResourceResponse::Ready {
+                length,
+                metadata: ResourceMetadata::Artwork { content_type, etag },
+            } => ArtworkResponse::Ok(spoolframe_protocol::ArtworkReply {
+                length,
+                content_type,
+                etag,
+            }),
+            ResourceResponse::Error { error } => ArtworkResponse::Err(error),
+            other => panic!("unexpected artwork: {other:?}"),
         };
-        write_frame(&mut send, &request).await.unwrap();
-        send.finish().unwrap();
-        let response: ArtworkResponse = read_frame(&mut recv).await.unwrap();
-        let bytes = recv.read_to_end(64 << 20).await.unwrap();
         (response, bytes)
     }
 
@@ -1349,12 +1526,36 @@ impl TestClient {
 
     /// One MEDIA stream: `read` out, the response frame and the bytes back.
     pub async fn media(&self, read: MediaRead) -> (MediaReadResponse, Vec<u8>) {
-        let (mut send, mut recv) = self.conn.open_bi().await.unwrap();
-        send.write_u8(bi::MEDIA).await.unwrap();
-        write_frame(&mut send, &read).await.unwrap();
-        send.finish().unwrap();
-        let response: MediaReadResponse = read_frame(&mut recv).await.unwrap();
-        let bytes = recv.read_to_end(64 << 20).await.unwrap();
+        use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
+        let revision = match self.revision(&read.session, &read.handle).await {
+            Ok(revision) => revision,
+            Err(error) => return (MediaReadResponse::Err(error), Vec::new()),
+        };
+        let (response, bytes) = self
+            .resource(&ResourceRequest::Media {
+                request: read,
+                revision,
+            })
+            .await;
+        let response = match response {
+            ResourceResponse::Ready {
+                length,
+                metadata:
+                    ResourceMetadata::Media {
+                        size,
+                        complete,
+                        epoch,
+                        ..
+                    },
+            } => MediaReadResponse::Ok(spoolframe_protocol::MediaReadReply {
+                sent: length,
+                size,
+                complete,
+                epoch,
+            }),
+            ResourceResponse::Error { error } => MediaReadResponse::Err(error),
+            other => panic!("unexpected media: {other:?}"),
+        };
         (response, bytes)
     }
 

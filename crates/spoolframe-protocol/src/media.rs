@@ -3,9 +3,10 @@
 //!
 //! `StartPlayback` (an RPC) plans the item and returns a
 //! [`PlaybackHandle`]. The client then reads the file in ranges, each on its
-//! own `streams::bi::MEDIA` stream: one [`MediaRead`] frame out, one
-//! [`MediaReadResponse`] frame back and, if it is `ok`, exactly `sent` raw
-//! bytes. Several reads may be in flight at once. End of file is
+//! own [`crate::streams::bi::RESOURCE`] stream, wrapped with the playback
+//! revision in [`crate::resource::ResourceRequest`]. These media structs
+//! describe the request and SDK result; the resource header announces the
+//! raw body length. Several reads may be in flight at once. End of file is
 //! `offset + sent == size`; a read at or past the end has `sent = 0`.
 
 use std::fmt;

@@ -261,7 +261,8 @@ fn every_request_round_trips() {
             id: MediaId::new(Namespace::Plex, MediaKind::Episode, "12").unwrap(),
         },
         Request::UpdatePlaybackProgress {
-            id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
+            handle: spoolframe_protocol::PlaybackHandle("handle".into()),
+            sequence: 1,
             position_ms: 61_000,
         },
         Request::MarkWatched {
