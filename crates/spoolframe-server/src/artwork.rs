@@ -19,6 +19,8 @@ use spoolframe_catalog::{Catalog, CatalogError, Image};
 use spoolframe_protocol::ArtworkSize;
 use spoolframe_types::ArtworkId;
 
+use crate::metrics::Counter;
+
 /// JPEG quality for resized images without transparency.
 const JPEG_QUALITY: u8 = 85;
 
@@ -115,6 +117,17 @@ pub struct ArtworkCache {
     /// One fetch or resize per key at a time; others wait and then find it
     /// cached.
     inflight: crate::keyed_locks::KeyedLocks,
+    /// Images asked for, and of those found in the cache (P3-14).
+    requests: Counter,
+    hits: Counter,
+}
+
+/// Images asked for since the server started, and how many of them the
+/// cache had (P3-14).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArtworkCounts {
+    pub requests: u64,
+    pub hits: u64,
 }
 
 impl std::fmt::Debug for ArtworkCache {
@@ -205,7 +218,17 @@ impl ArtworkCache {
             catalog,
             index: Mutex::new(index),
             inflight: Default::default(),
+            requests: Counter::default(),
+            hits: Counter::default(),
         })
+    }
+
+    /// What was asked for, and found (P3-14).
+    pub fn counts(&self) -> ArtworkCounts {
+        ArtworkCounts {
+            requests: self.requests.get(),
+            hits: self.hits.get(),
+        }
     }
 
     /// Bytes in the cache now.
@@ -217,8 +240,23 @@ impl ArtworkCache {
         self.index.lock().expect("never held across a panic")
     }
 
-    /// The image for `id` at `size`.
+    /// The image for `id` at `size`. Counted once, as asked for: the
+    /// original a size is made from is not another request.
     pub async fn get(&self, id: &ArtworkId, size: ArtworkSize) -> Result<Artwork, ArtworkError> {
+        self.requests.inc();
+        let (image, hit) = self.fetch(id, size).await?;
+        if hit {
+            self.hits.inc();
+        }
+        Ok(image)
+    }
+
+    /// The image, and whether the cache had it.
+    async fn fetch(
+        &self,
+        id: &ArtworkId,
+        size: ArtworkSize,
+    ) -> Result<(Artwork, bool), ArtworkError> {
         if size == ArtworkSize::Unknown {
             return Err(ArtworkError::BadSize(size));
         }
@@ -226,22 +264,24 @@ impl ArtworkCache {
         self.get_authorized(id, size).await
     }
 
+    /// The image, the caller allowed to see it, and whether the cache had
+    /// it.
     async fn get_authorized(
         &self,
         id: &ArtworkId,
         size: ArtworkSize,
-    ) -> Result<Artwork, ArtworkError> {
+    ) -> Result<(Artwork, bool), ArtworkError> {
         let key = cache_key(id, size);
         if let Some(hit) = self.read(&key).await? {
-            return Ok(hit);
+            return Ok((hit, true));
         }
         let _held = self.inflight.lock(&key).await;
         // Whoever held the gate before us may have filled it.
         if let Some(hit) = self.read(&key).await? {
-            return Ok(hit);
+            return Ok((hit, true));
         }
         let image = self.make(id, size).await?;
-        self.store(&key, &image).await
+        Ok((self.store(&key, &image).await?, false))
     }
 
     async fn make(&self, id: &ArtworkId, size: ArtworkSize) -> Result<Image, ArtworkError> {
@@ -250,7 +290,7 @@ impl ArtworkCache {
         };
         // Every size is made from the cached original, so the catalog is
         // asked once per artwork, not once per size.
-        let original = Box::pin(self.get_authorized(id, ArtworkSize::Original)).await?;
+        let (original, _) = Box::pin(self.get_authorized(id, ArtworkSize::Original)).await?;
         tokio::task::spawn_blocking(move || resize(original, width))
             .await
             .map_err(|e| ArtworkError::Image(e.to_string()))?
@@ -463,6 +503,13 @@ mod tests {
         let second = cache.get(&id(1), ArtworkSize::Original).await.unwrap();
         assert_eq!(first, second);
         assert_eq!(fetches(&catalog), 1);
+        assert_eq!(
+            cache.counts(),
+            ArtworkCounts {
+                requests: 2,
+                hits: 1
+            }
+        );
     }
 
     #[tokio::test]

@@ -274,6 +274,10 @@ pub struct WatchSync {
     access: Mutex<HashMap<LocalUserId, HashMap<String, String>>>,
     /// Each linked user's scheduled runs.
     tasks: Mutex<HashMap<LocalUserId, tokio::task::AbortHandle>>,
+    /// Runs since the server started that synced, and that could not
+    /// (P3-14). A dry run is not one.
+    runs_ok: crate::metrics::Counter,
+    runs_failed: crate::metrics::Counter,
 }
 
 impl std::fmt::Debug for WatchSync {
@@ -317,7 +321,15 @@ impl WatchSync {
             machines: Mutex::default(),
             access: Mutex::default(),
             tasks: Mutex::default(),
+            runs_ok: Default::default(),
+            runs_failed: Default::default(),
         }
+    }
+
+    /// Runs that synced, and runs that could not, since the server started
+    /// (P3-14).
+    pub fn run_counts(&self) -> (u64, u64) {
+        (self.runs_ok.get(), self.runs_failed.get())
     }
 
     pub fn interval(&self) -> Duration {
@@ -347,6 +359,19 @@ impl WatchSync {
 
     /// One run of `user`'s: plan, and apply unless `dry_run`.
     pub async fn run(&self, user: LocalUserId, dry_run: bool) -> Result<Report, SyncError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!("plex sync run", user = %format!("local:{user}"), dry_run);
+        let ran = self.run_once(user, dry_run).instrument(span).await;
+        if !dry_run {
+            match &ran {
+                Ok(_) => self.runs_ok.inc(),
+                Err(_) => self.runs_failed.inc(),
+            }
+        }
+        ran
+    }
+
+    async fn run_once(&self, user: LocalUserId, dry_run: bool) -> Result<Report, SyncError> {
         let runs = self.runs(user);
         let _running = runs.running.lock().await;
         let link = self.accounts.link(user)?.ok_or(SyncError::NotLinked)?;
@@ -846,6 +871,35 @@ mod tests {
     use super::*;
 
     const STARTED: Duration = Duration::from_secs(60);
+
+    /// The metrics count runs (P3-14): one that cannot sync is a failure,
+    /// and a dry run is no run.
+    #[tokio::test]
+    async fn runs_are_counted_and_dry_runs_are_not() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-sync-runs").await;
+        let store = crate::store::Store::open(dir.as_ref()).await.unwrap();
+        let alice = store
+            .add_user("alice", None, "phc", spoolframe_types::Role::Consumer)
+            .await
+            .unwrap();
+        let accounts = Arc::new(PlexAccounts::new(
+            crate::config::secrets::Secrets::new(dir.as_ref()),
+            store,
+            crate::plex_accounts::PlexSite {
+                api: "http://127.0.0.1:9".parse().unwrap(),
+                app: "http://127.0.0.1:9".parse().unwrap(),
+            },
+            None,
+        ));
+        let sync = WatchSync::new(Arc::default(), accounts, STARTED, STARTED);
+        assert!(matches!(
+            sync.run(alice, true).await,
+            Err(SyncError::NotLinked)
+        ));
+        assert_eq!(sync.run_counts(), (0, 0));
+        assert!(sync.run(alice, false).await.is_err());
+        assert_eq!(sync.run_counts(), (0, 1));
+    }
 
     fn id(kind: MediaKind, key: &str) -> MediaId {
         MediaId::new(Namespace::Plex, kind, key).unwrap()

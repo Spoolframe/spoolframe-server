@@ -243,6 +243,22 @@ impl Store {
         }))
     }
 
+    /// How many live sessions each enabled user has, by binding (P3-14):
+    /// `(user, app, web)`, where an app session is bound to a device's
+    /// endpoint and a web one is the admin API's (the CLI's or a browser's).
+    pub async fn live_session_counts(&self) -> Result<Vec<(LocalUserId, u64, u64)>, StoreError> {
+        let rows: Vec<(LocalUserId, i64, i64)> = sqlx::query_as(
+            "SELECT s.user_id,                     sum(s.kind = 'endpoint'), sum(s.kind = 'api')              FROM sessions s JOIN users u ON u.id = s.user_id              WHERE s.revoked_at IS NULL AND s.expires_at > ?1 AND u.disabled_at IS NULL              GROUP BY s.user_id ORDER BY s.user_id",
+        )
+        .bind(now())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user, app, web)| (user, app.max(0) as u64, web.max(0) as u64))
+            .collect())
+    }
+
     /// `user`'s live sessions, on every device, most recently used first.
     pub async fn list_sessions(&self, user: LocalUserId) -> Result<Vec<SessionRecord>, StoreError> {
         Ok(sqlx::query_as(
@@ -391,6 +407,29 @@ mod tests {
             device_name: Some(format!("device {id}")),
             platform: Platform::Tvos,
         }
+    }
+
+    /// What the metrics count (P3-14): live sessions only, apps apart from
+    /// the admin API.
+    #[tokio::test]
+    async fn live_sessions_are_counted_per_user_by_binding() {
+        let (store, alice) = store_with_alice("counted").await;
+        for (hash, binding, expires) in [
+            ("tv", endpoint("tv"), now() + 60),
+            ("phone", endpoint("phone"), now() + 60),
+            ("web", SessionBinding::Api, now() + 60),
+            ("old", endpoint("old"), now() - 1),
+            ("gone", SessionBinding::Api, now() + 60),
+        ] {
+            store
+                .create_session(hash, alice, &binding, expires)
+                .await
+                .unwrap();
+        }
+        store.revoke_session("gone").await.unwrap();
+        assert_eq!(store.live_session_counts().await.unwrap(), [(alice, 2, 1)]);
+        store.disable_user("alice").await.unwrap();
+        assert_eq!(store.live_session_counts().await.unwrap(), []);
     }
 
     async fn last_used(store: &Store, hash: &str) -> (i64, i64) {

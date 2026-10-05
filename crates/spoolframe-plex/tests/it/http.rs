@@ -905,3 +905,26 @@ async fn artwork_in_an_excluded_library_never_fetches_image_bytes() {
     let allowed = catalog(&server).serving(Some(["2".to_owned()].into()));
     allowed.authorize_artwork(&image).await.unwrap();
 }
+
+/// Every request is counted for the metrics (P3-14), from the catalog and
+/// every view made of it; a 404 is an answer, not an error.
+#[tokio::test]
+async fn requests_and_their_failures_are_counted_across_views() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/sections", "sections").await;
+    Mock::given(path("/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let catalog = catalog(&server);
+    catalog.libraries().await.unwrap();
+    catalog.unrestricted().identity().await.unwrap_err();
+    let missing = catalog.item(&id(MediaKind::Movie, "404")).await;
+    assert!(
+        matches!(missing, Err(CatalogError::NotFound(_))),
+        "{missing:?}"
+    );
+    let counts = catalog.request_counts();
+    assert_eq!((counts.requests, counts.errors), (3, 1));
+    assert_eq!(counts.buckets.last().unwrap().1, 3);
+}

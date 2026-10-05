@@ -184,12 +184,26 @@ impl ClientProtocol {
         }
         let request = read_frame_bytes(&mut recv).await;
         let response = match &request {
-            Ok(bytes) => self.answer(&connection, &state, bytes).await,
+            Ok(bytes) => {
+                // One span per request, named by its type: never its
+                // session or its arguments (P3-14).
+                use tracing::Instrument as _;
+                let span = tracing::info_span!(
+                    "client request",
+                    request = codec::rpc_request_type(bytes).unwrap_or_default()
+                );
+                self.answer(&connection, &state, bytes)
+                    .instrument(span)
+                    .await
+            }
             Err(e) => Response::Err(Error::Malformed {
                 message: e.to_string(),
             })
             .into(),
         };
+        if let Response::Err(error) = &response.response {
+            self.count_error(error);
+        }
         let response = RpcResponse {
             server: self.instance(),
             reply: response,
@@ -583,6 +597,7 @@ impl ClientProtocol {
         let sent = async {
             match result {
                 Ok((metadata, length, body)) => {
+                    let media = matches!(metadata, ResourceMetadata::Media { .. });
                     write_frame(&mut send, &ResourceResponse::Ready { length, metadata }).await?;
                     match body {
                         ResourceBody::Bytes(bytes) => send
@@ -591,6 +606,10 @@ impl ClientProtocol {
                             .map_err(std::io::Error::other)?,
                         ResourceBody::File(file) => {
                             let copied = tokio::io::copy(&mut file.take(length), &mut send).await?;
+                            if media {
+                                self.services.metrics.media_reads.inc();
+                                self.services.metrics.media_read_bytes.add(copied);
+                            }
                             if copied != length {
                                 return Err(codec::CodecError::Io(std::io::Error::new(
                                     std::io::ErrorKind::UnexpectedEof,
@@ -600,7 +619,10 @@ impl ClientProtocol {
                         }
                     }
                 }
-                Err(error) => write_frame(&mut send, &ResourceResponse::Error { error }).await?,
+                Err(error) => {
+                    self.count_error(&error);
+                    write_frame(&mut send, &ResourceResponse::Error { error }).await?
+                }
             }
             Ok::<_, codec::CodecError>(())
         }
@@ -864,6 +886,16 @@ impl ClientProtocol {
             }
         }
         Ok(using.playback)
+    }
+
+    /// A playback's end as clients see it, counted (P3-14).
+    fn count_error(&self, error: &Error) {
+        let metrics = &self.services.metrics;
+        match error {
+            Error::PlaybackExpired => metrics.playback_expired.inc(),
+            Error::PlaybackFailed { .. } => metrics.playback_failed.inc(),
+            _ => {}
+        }
     }
 
     /// What `handle` plays, for the log; the handle itself is never logged.
@@ -1687,6 +1719,7 @@ impl ClientProtocol {
                     Some(Sidecar::Made { state, format }) => (read_text(state).await?, format),
                 };
                 let (bytes, total, version) = read_subtitle(&path, offset, version).await?;
+                self.services.metrics.subtitle_reads.inc();
                 Ok(Reply::SubtitleChunk {
                     format,
                     bytes,
@@ -1710,6 +1743,9 @@ impl ClientProtocol {
                         %error,
                         "an HLS subtitle segment read failed"
                     );
+                }
+                if read.is_ok() {
+                    self.services.metrics.subtitle_reads.inc();
                 }
                 read
             }

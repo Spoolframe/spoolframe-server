@@ -16,7 +16,7 @@ use super::admin::sleep;
 use super::libraries::RemoteNote;
 use super::{Alert, Field, Route, icons, now, rpc};
 use crate::libraries;
-use crate::logic::{ApiError, Landing, host_port, thousands};
+use crate::logic::{ApiError, Landing, thousands};
 use crate::setup::{self, Hardware, PathRow, STEPS, Sample, Step};
 
 /// Where a form is: a wizard step (Back and Continue), or a Settings tab
@@ -42,13 +42,13 @@ pub(super) async fn load_setup() -> Result<SetupState, ApiError> {
     client.setup_state().await.map_err(rpc::error)
 }
 
-fn entry<'s>(settings: &'s Settings, key: &str) -> Option<&'s SettingEntry> {
+pub(super) fn entry<'s>(settings: &'s Settings, key: &str) -> Option<&'s SettingEntry> {
     settings.entries.iter().find(|e| e.key == key)
 }
 
 /// A setting's value as a field shows it: a string as it is, a number as
 /// its digits, nothing as nothing.
-fn text(settings: &Settings, key: &str) -> String {
+pub(super) fn text(settings: &Settings, key: &str) -> String {
     match entry(settings, key).and_then(|e| e.value.as_ref()) {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Null) | None => String::new(),
@@ -56,14 +56,14 @@ fn text(settings: &Settings, key: &str) -> String {
     }
 }
 
-fn flag(settings: &Settings, key: &str) -> bool {
+pub(super) fn flag(settings: &Settings, key: &str) -> bool {
     entry(settings, key)
         .and_then(|e| e.value.as_ref())
         .and_then(Value::as_bool)
         .unwrap_or(false)
 }
 
-fn locked(settings: &Settings, key: &str) -> bool {
+pub(super) fn locked(settings: &Settings, key: &str) -> bool {
     entry(settings, key).is_some_and(|e| e.locked)
 }
 
@@ -88,7 +88,10 @@ fn number(label: &str, text: &str) -> Result<Option<Value>, String> {
 /// `None` takes its runtime value out. What is unchanged, and what the
 /// locked config file sets, is left alone, so the runtime settings hold
 /// only what was changed here.
-async fn save(settings: &Settings, changes: Vec<(&str, Option<Value>)>) -> Result<(), ApiError> {
+pub(super) async fn save(
+    settings: &Settings,
+    changes: Vec<(&str, Option<Value>)>,
+) -> Result<(), ApiError> {
     let client = rpc::client().await?;
     for (key, value) in changes {
         let current = entry(settings, key);
@@ -174,7 +177,7 @@ pub fn WizardLayout(children: Element) -> Element {
 /// The row under a form: Back and Continue in the wizard, Discard and Save
 /// in Settings.
 #[component]
-fn Footer(
+pub(super) fn Footer(
     mode: Mode,
     step: &'static str,
     busy: bool,
@@ -220,7 +223,11 @@ fn Footer(
 /// the file's value (with a way back to it), or that it applies after a
 /// restart, and once changed, a way to restart where the server can.
 #[component]
-fn Note(settings: Settings, setting: &'static str, on_changed: EventHandler<()>) -> Element {
+pub(super) fn Note(
+    settings: Settings,
+    setting: &'static str,
+    on_changed: EventHandler<()>,
+) -> Element {
     let key = setting;
     let Some(e) = entry(&settings, key).cloned() else {
         return rsx! {};
@@ -311,7 +318,7 @@ fn shown(value: &Value) -> String {
 }
 
 /// A form's loaded settings, or why they did not load.
-fn loading(state: &Option<Result<Settings, ApiError>>) -> Option<Element> {
+pub(super) fn loading(state: &Option<Result<Settings, ApiError>>) -> Option<Element> {
     match state {
         None => Some(rsx! { p { class: "m-0 text-sm text-ctp-subtext0", "Loading…" } }),
         Some(Err(e)) => Some(rsx! { Alert { text: e.explain() } }),
@@ -484,6 +491,27 @@ fn PlexFields(
         let client = rpc::client().await?;
         client.plex_discover().await.map_err(rpc::error)
     });
+    // The servers of the Plex account signed in with (or the admin's
+    // linked one), asked again after each sign-in. None until either:
+    // the server says so, and nothing more is shown.
+    let mut signed_in = use_signal(|| 0u32);
+    let from_account = use_resource(move || async move {
+        let _ = signed_in();
+        let client = rpc::client().await?;
+        client.plex_account_servers().await.map_err(rpc::error)
+    });
+    // Found and listed, each server once (P3-10).
+    let choices = use_memo(move || {
+        let found = match &*found.read() {
+            Some(Ok(list)) => list.clone(),
+            _ => Vec::new(),
+        };
+        let listed = match &*from_account.read() {
+            Some(Ok(list)) => list.clone(),
+            _ => Vec::new(),
+        };
+        libraries::plex_choices(&found, &listed)
+    });
     // The address chosen: one found, or typed ("" until something is).
     let mut chosen = use_signal(|| saved_url.clone());
     let mut typing = use_signal(|| false);
@@ -530,23 +558,25 @@ fn PlexFields(
         });
     };
     use_hook(reprobe);
-    // Nothing chosen yet: the first server found, once discovery answers;
-    // never a remote one, whose files are here only if mounted.
+    // Nothing chosen yet: the first server found or listed, as they
+    // come; never a remote one, whose files are here only if mounted.
     use_effect(move || {
-        if let Some(Ok(list)) = &*found.read()
-            && chosen.peek().is_empty()
+        let choices = choices();
+        if chosen.peek().is_empty()
             && !*typing.peek()
-            && let Some(first) = list.iter().find(|f| !libraries::remote(&f.url, None))
+            && let Some(first) = libraries::first_choice(&choices)
         {
-            chosen.set(first.url.clone());
+            chosen.set(first);
             reprobe();
         }
     });
-    // A saved address discovery did not find is a typed one.
+    // A saved address neither discovery nor the account lists is a typed
+    // one, once both have answered.
     use_effect(move || {
-        if let Some(Ok(list)) = &*found.read() {
+        let choices = choices();
+        if found.read().is_some() && from_account.read().is_some() {
             let saved = chosen.peek().clone();
-            if !saved.is_empty() && !list.iter().any(|f| f.url == saved) {
+            if !saved.is_empty() && !choices.iter().any(|c| c.url == saved) {
                 typing.set(true);
             }
         }
@@ -597,6 +627,7 @@ fn PlexFields(
                     Ok(PlexPinState::Waiting) => {}
                     Ok(PlexPinState::Linked { account: who }) => {
                         account.set(Account::Linked(who));
+                        signed_in += 1;
                         reprobe();
                         return;
                     }
@@ -646,13 +677,34 @@ fn PlexFields(
     let on_save = move |_| {
         let s = s.clone();
         let url = if typing() { typed_url() } else { chosen() };
+        // One of the account's: the token plex.tv gives the account for
+        // it, which a server shared with it needs, is kept first.
+        let listed = !typing()
+            && choices
+                .peek()
+                .iter()
+                .any(|c| c.url == url && c.account.is_some());
         busy.set(true);
         spawn(async move {
             let changes = vec![
                 ("plex.url", typed(&url)),
                 ("subtitles.ocr", Some(json!(ocr()))),
             ];
-            let saved = match save(&s, changes).await {
+            let token = async {
+                if listed {
+                    let client = rpc::client().await?;
+                    client
+                        .plex_account_token_use(url.clone())
+                        .await
+                        .map_err(rpc::error)?;
+                }
+                Ok::<(), ApiError>(())
+            };
+            let saved = match token.await {
+                Ok(()) => save(&s, changes).await,
+                Err(e) => Err(e),
+            };
+            let saved = match saved {
                 Ok(()) => choose_libraries(shared.peek().clone()).await,
                 Err(e) => Err(e),
             };
@@ -679,6 +731,7 @@ fn PlexFields(
     let blocked = (mode == Mode::Wizard && !reachable)
         .then(|| "Plex has to answer before going on".to_owned());
     let found_list = found.read().clone();
+    let choice_list = choices();
     rsx! {
         if mode == Mode::Wizard {
             div { class: "flex flex-col gap-1.5",
@@ -708,33 +761,32 @@ fn PlexFields(
                         }
                     },
                     Some(Err(e)) => rsx! { span { class: "text-sm text-ctp-subtext0", "{e.explain()}" } },
-                    Some(Ok(list)) => rsx! {
-                        for server in list {
-                            button {
-                                key: "{server.url}",
-                                class: if !typing() && chosen() == server.url { "choice choice-here" } else { "choice" },
-                                onclick: {
-                                    let url = server.url.clone();
-                                    move |_| {
-                                        typing.set(false);
-                                        chosen.set(url.clone());
-                                        reprobe();
-                                    }
-                                },
-                                span { class: "radio" }
-                                span { class: "choice-what",
-                                    b { "{server.name}" }
-                                    {found_line(&server.url, server.version.as_deref())}
-                                    if libraries::remote(&server.url, None) {
-                                        RemoteNote {}
-                                    }
-                                }
-                                if !typing() && chosen() == server.url {
-                                    ProbeState { probed: probed() }
-                                }
+                    Some(Ok(_)) => rsx! {},
+                }
+                for server in choice_list {
+                    button {
+                        key: "{server.url}",
+                        class: if !typing() && chosen() == server.url { "choice choice-here" } else { "choice" },
+                        onclick: {
+                            let url = server.url.clone();
+                            move |_| {
+                                typing.set(false);
+                                chosen.set(url.clone());
+                                reprobe();
+                            }
+                        },
+                        span { class: "radio" }
+                        span { class: "choice-what",
+                            b { "{server.name}" }
+                            {libraries::choice_line(&server)}
+                            if server.remote() {
+                                RemoteNote {}
                             }
                         }
-                    },
+                        if !typing() && chosen() == server.url {
+                            ProbeState { probed: probed() }
+                        }
+                    }
                 }
                 button {
                     class: if typing() { "choice choice-here" } else { "choice" },
@@ -935,15 +987,6 @@ async fn choose_libraries(chosen: Vec<String>) -> Result<(), ApiError> {
         client.library_remove(id).await.map_err(rpc::error)?;
     }
     Ok(())
-}
-
-/// "Found on this network · 192.168.1.10:32400 · Plex Media Server 1.41".
-fn found_line(url: &str, version: Option<&str>) -> String {
-    let mut line = format!("Found on this network · {}", host_port(url));
-    if let Some(v) = version {
-        line.push_str(&format!(" · Plex Media Server {}", short_version(v)));
-    }
-    line
 }
 
 /// "Reachable · Plex Media Server 1.41 · “Cabin”".

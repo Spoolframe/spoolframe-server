@@ -89,6 +89,14 @@ network {
   relay = "disabled";
   # Announce the server on the LAN over mDNS, so clients find it.
   mdns = true;
+  # The UDP port the setup wizard's search for Plex servers on the LAN
+  # (Plex's GDM) is sent from. Each Plex server answers to it, and a host
+  # firewall drops those answers unless the port is open: it cannot match
+  # them to a search sent to a multicast group. Not one of Plex's own
+  # ports (32410-32414). 0 is any free port, whose answers a firewall
+  # drops. A port another program holds is given up for any free one,
+  # with a warning in the log.
+  plex_discovery_port = 32415;
 }
 
 # The admin API (JSON-RPC over WebSocket) and the web UI.
@@ -205,4 +213,30 @@ previews {
   # What is played, or asked for, is made at once, encodes or not. The
   # physical cores the server may use if left out.
   # workers = 8;
+}
+
+# The last log lines kept in memory for the web UI's Logs page, at the
+# level the server logs at: what the journal has, nothing more.
+logs {
+  buffer_lines = 5000;
+}
+
+# OpenTelemetry export: the server's spans, log records and metrics over
+# OTLP, to a collector (an OpenTelemetry Collector, Grafana Alloy). Off
+# without an endpoint. A live setting. What is exported never carries a
+# token or a secret, and names users only as local:<uuid>.
+telemetry {
+  otlp {
+    # "http://alloy.lan:4317" for gRPC; "http://alloy.lan:4318" for HTTP,
+    # to which /v1/traces, /v1/metrics and /v1/logs are added.
+    # endpoint = "http://alloy.lan:4317";
+    # "grpc" or "http" (protobuf).
+    protocol = "grpc";
+    # Sent with every export, name=value pairs, comma-separated; never
+    # logged.
+    # headers = "x-scope-orgid=home";
+    traces = true;
+    metrics = true;
+    logs = true;
+  }
 }

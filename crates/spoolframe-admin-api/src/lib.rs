@@ -704,6 +704,9 @@ pub struct DiscoveredPlex {
     /// `http://<address>:<port>`.
     pub url: String,
     pub version: Option<String>,
+    /// Plex's id for it, as [`PlexAccountServer::machine_id`]: the same
+    /// server found and listed by the account is one choice.
+    pub machine_id: Option<String>,
 }
 
 /// A plex.tv PIN to approve (Sign in with Plex).
@@ -1209,6 +1212,252 @@ pub struct ArtworkInfo {
     pub error: Option<String>,
 }
 
+/// One sample of what the server is doing (P3-14), for the Activity
+/// page's numbers and small graphs. Rates are per second over the time
+/// since the sample before.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityPoint {
+    /// When, in Unix milliseconds.
+    pub at: i64,
+    /// Clients connected over Iroh.
+    pub connections_app: u64,
+    /// Admin API sockets: the web UI's and the CLI's.
+    pub connections_web: u64,
+    /// Open playbacks of the file as it is.
+    pub playbacks_direct: u64,
+    /// Open playbacks whose streams are copied into another container.
+    pub playbacks_remux: u64,
+    /// Open playbacks that are encoded.
+    pub playbacks_transcode: u64,
+    /// Encodes whose ffmpeg runs, paused or not.
+    pub conversions_running: u64,
+    /// Of those, the ones held back for their reader.
+    pub conversions_paused: u64,
+    /// Seconds of media encoded per second, by every encode.
+    pub output_rate: f64,
+    pub media_reads_per_sec: f64,
+    pub media_bytes_per_sec: f64,
+    pub artwork_requests_per_sec: f64,
+    /// Of the artwork asked for in the interval, the share the cache had;
+    /// `None` when none was asked for.
+    #[serde(default)]
+    pub artwork_hit_rate: Option<f64>,
+    pub subtitle_reads_per_sec: f64,
+    pub plex_requests_per_sec: f64,
+    pub plex_errors_per_sec: f64,
+    /// Frame previews waiting or being made.
+    pub previews_queued: u64,
+    /// Bitmap subtitle tracks waiting or being read as text.
+    pub ocr_queued: u64,
+    /// The server's resident memory; `None` where it cannot be read.
+    #[serde(default)]
+    pub memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub open_files: Option<u64>,
+}
+
+/// Counts since the server started (P3-14).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityTotals {
+    pub uptime_secs: u64,
+    pub playbacks_started: u64,
+    pub playbacks_ended: u64,
+    /// `PlaybackExpired` sent to clients.
+    pub playbacks_expired: u64,
+    /// `PlaybackFailed` sent to clients.
+    pub playbacks_failed: u64,
+    /// Conversions refused because `transcode.max_jobs` were running.
+    pub conversions_refused: u64,
+    /// Encodes ended for making no progress.
+    pub conversions_stalled: u64,
+    pub media_reads: u64,
+    pub media_read_bytes: u64,
+    pub artwork_requests: u64,
+    pub artwork_hits: u64,
+    pub subtitle_reads: u64,
+    pub sync_runs_ok: u64,
+    pub sync_runs_failed: u64,
+    pub previews_done: u64,
+    pub previews_failed: u64,
+    pub ocr_done: u64,
+    pub ocr_failed: u64,
+}
+
+/// One Plex server's requests (P3-14), counted since its settings last
+/// changed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexServerActivity {
+    /// Its id in the config: `plex` for the first.
+    pub id: String,
+    pub name: String,
+    pub requests: u64,
+    pub errors: u64,
+    /// The mean time a request took; `None` before any.
+    #[serde(default)]
+    pub mean_latency_ms: Option<f64>,
+}
+
+/// One user's live sessions (P3-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserSessionCount {
+    /// `local:<uuid>`.
+    pub user_id: String,
+    pub username: String,
+    /// Bound to a device's endpoint.
+    pub app: u64,
+    /// The admin API's: the web UI's and the CLI's.
+    pub web: u64,
+}
+
+/// What the Activity page shows (P3-14): now, the last hour sampled every
+/// `sampleSecs`, oldest first, and the counts behind them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Activity {
+    pub sample_secs: u32,
+    pub now: ActivityPoint,
+    pub history: Vec<ActivityPoint>,
+    pub totals: ActivityTotals,
+    pub plex: Vec<PlexServerActivity>,
+    /// Read from the database every `sampleSecs`.
+    pub sessions: Vec<UserSessionCount>,
+}
+
+/// How severe a log line is (P3-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+/// One line of the server's log, as stderr has it (P3-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogLine {
+    /// Numbered from 1 since the server started, never again: what a
+    /// page follows new lines by.
+    pub seq: u64,
+    /// When, in Unix milliseconds.
+    pub at: i64,
+    pub level: LogLevel,
+    /// Where in the server it comes from: `spoolframe_server::client`.
+    pub target: String,
+    /// Its spans, its message and its fields.
+    pub text: String,
+}
+
+/// Which log lines `logs` gives.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogQuery {
+    /// Only lines after this one: the `next` of the page before. Left
+    /// out, the last lines.
+    #[serde(default)]
+    pub after: Option<u64>,
+    /// Only lines at least this severe: `warn` gives warnings and errors.
+    #[serde(default)]
+    pub level: Option<LogLevel>,
+    /// Only lines whose text or target contains this, in any case.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// At most this many lines; 500 if left out.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Some of the server's last log lines (P3-14), oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogPage {
+    pub lines: Vec<LogLine>,
+    /// What to ask `after` next, to follow new lines.
+    pub next: u64,
+    /// Lines after the cursor were dropped before they were asked for:
+    /// more came than the buffer holds.
+    pub missed: bool,
+    /// How many lines the server keeps (`logs.buffer_lines`).
+    pub capacity: u32,
+}
+
+/// One resource attribute every OTLP export carries (P3-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceAttribute {
+    pub key: String,
+    pub value: String,
+}
+
+/// The OTLP export as it is going (P3-14). Header values are never here:
+/// they are write-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtlpStatus {
+    pub endpoint: String,
+    /// `grpc` or `http`.
+    pub protocol: String,
+    pub traces: bool,
+    pub metrics: bool,
+    pub logs: bool,
+    /// The names of the headers sent, never their values.
+    pub header_names: Vec<String>,
+    /// When an export last went through, Unix ms.
+    #[serde(default)]
+    pub last_export_at: Option<i64>,
+    /// Spans and log records dropped since `droppingSince`: since exports
+    /// last stopped going through.
+    pub dropped: u64,
+    #[serde(default)]
+    pub dropping_since: Option<i64>,
+    /// The last failure (the collector unreachable, what it answered, or
+    /// no answer in time), and when, Unix ms.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_error_at: Option<i64>,
+    /// How often metrics are exported; records go at least this often.
+    pub metrics_every_secs: u32,
+}
+
+/// An address refused `GET /metrics` in the last hour (P3-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefusedScrape {
+    pub address: String,
+    pub count: u64,
+    /// Unix ms.
+    pub last_at: i64,
+}
+
+/// `GET /metrics` as it is (P3-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsEndpointStatus {
+    pub enabled: bool,
+    /// The path on the admin listener: `/metrics`.
+    pub path: String,
+    pub refused: Vec<RefusedScrape>,
+}
+
+/// The Settings › Telemetry tab's state (P3-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryStatus {
+    /// `None` while no endpoint is set.
+    #[serde(default)]
+    pub otlp: Option<OtlpStatus>,
+    /// What an export carries, shown whether it is on or not.
+    pub resource: Vec<ResourceAttribute>,
+    pub metrics: MetricsEndpointStatus,
+}
+
 /// The caller's own account, for every role.
 #[cfg_attr(
     all(feature = "client", feature = "server"),
@@ -1611,10 +1860,22 @@ pub trait AdminApi {
     async fn user_plex_unlink(&self, username: String) -> jsonrpsee::core::RpcResult<()>;
 
     /// The Plex servers the caller's linked Plex account reaches (P3-11's
-    /// "From your Plex account"): `NOT_CONFIGURED` without a link, and
-    /// `UNAVAILABLE` when plex.tv cannot be reached.
+    /// "From your Plex account"), or without a link the account the setup
+    /// wizard last signed in with (Sign in with Plex, `plexPinCheck`):
+    /// `NOT_CONFIGURED` without either, and `UNAVAILABLE` when plex.tv
+    /// cannot be reached.
     #[method(name = "plexAccountServers", with_extensions)]
     async fn plex_account_servers(&self) -> jsonrpsee::core::RpcResult<Vec<PlexAccountServer>>;
+
+    /// Keep, as `plex.token`, the token the caller's Plex account (as for
+    /// `plexAccountServers`) uses on the server at `url`, one of its
+    /// servers: what the setup wizard does when one of them is chosen.
+    /// plex.tv hands out a token per server; the account's own is not
+    /// one a server shared with it takes. `NOT_CONFIGURED` without an
+    /// account, `INVALID_INPUT` when it does not reach `url`, and
+    /// `UNAVAILABLE` when plex.tv cannot be reached.
+    #[method(name = "plexAccountTokenUse", with_extensions)]
+    async fn plex_account_token_use(&self, url: String) -> jsonrpsee::core::RpcResult<()>;
 
     /// Every setting: its value, where it comes from, and whether it
     /// applies now or after a restart (P3-10).
@@ -1815,4 +2076,24 @@ pub trait AdminApi {
     /// does; it runs on, and `catalogLibrary` says when it is done.
     #[method(name = "catalogCheckPaths", with_extensions)]
     async fn catalog_check_paths(&self, id: String) -> jsonrpsee::core::RpcResult<PathsChecked>;
+
+    /// What the server is doing now, and over the last hour (P3-14): the
+    /// Activity page. Kept in memory and sampled every `sampleSecs`, so a
+    /// page that asks every few seconds sees a new point as it is made.
+    #[method(name = "activity", with_extensions)]
+    async fn activity(&self) -> jsonrpsee::core::RpcResult<Activity>;
+
+    /// The server's last log lines, as its journal has them (P3-14): the
+    /// Logs page. Kept in memory, `logs.buffer_lines` of them, at the
+    /// level the server logs at. A page follows new lines by asking again
+    /// `after` the `next` it was given; the admin API has no
+    /// subscriptions.
+    #[method(name = "logs", with_extensions)]
+    async fn logs(&self, query: LogQuery) -> jsonrpsee::core::RpcResult<LogPage>;
+
+    /// How the OTLP export and `GET /metrics` are doing (P3-14): the
+    /// Settings › Telemetry tab's status. The settings themselves are in
+    /// `settings`; header values are never returned anywhere.
+    #[method(name = "telemetryStatus", with_extensions)]
+    async fn telemetry_status(&self) -> jsonrpsee::core::RpcResult<TelemetryStatus>;
 }

@@ -3,7 +3,8 @@
 //! covers it.
 
 use spoolframe_admin_api::{
-    LibrariesOverview, LibraryEntry, LibraryKind, LibraryPathCheck, LibraryStatus, PathMappingEntry,
+    DiscoveredPlex, LibrariesOverview, LibraryEntry, LibraryKind, LibraryPathCheck, LibraryStatus,
+    PathMappingEntry, PlexAccountServer,
 };
 
 use std::net::IpAddr;
@@ -249,6 +250,100 @@ pub fn remote(url: &str, lan: Option<bool>) -> bool {
     host.parse::<IpAddr>().is_ok_and(|ip| !on_lan(ip))
 }
 
+/// A Plex server the wizard's Plex step offers (P3-10): found on this
+/// network, listed by the Plex account signed in with, or both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlexChoice {
+    pub name: String,
+    /// Where it is read from: the address discovery found it at, else the
+    /// one plex.tv says (a LAN one where it knows one).
+    pub url: String,
+    pub version: Option<String>,
+    /// Found on this network by Plex's discovery.
+    pub found: bool,
+    /// Listed by the Plex account, with whether plex.tv says `url` is on
+    /// the LAN; `None` when the account does not list it.
+    pub account: Option<bool>,
+}
+
+impl PlexChoice {
+    /// Its files are here only if someone mounted them: never chosen for
+    /// the admin.
+    pub fn remote(&self) -> bool {
+        let lan = if self.found { None } else { self.account };
+        remote(&self.url, lan)
+    }
+}
+
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+/// The servers `found` on the LAN, then the account's others, each once:
+/// one both found and listed is the same server when Plex's id for it
+/// (or its address) is the same, and is read at the address it was found
+/// at. One only Plex's relay reaches is left out: Spoolframe never reads
+/// through it.
+pub fn plex_choices(found: &[DiscoveredPlex], account: &[PlexAccountServer]) -> Vec<PlexChoice> {
+    let same = |f: &DiscoveredPlex, a: &PlexAccountServer| {
+        f.machine_id.as_deref() == Some(a.machine_id.as_str())
+            || a.url.as_deref().is_some_and(|u| same_url(u, &f.url))
+    };
+    let mut choices: Vec<PlexChoice> = found
+        .iter()
+        .map(|f| PlexChoice {
+            name: f.name.clone(),
+            url: f.url.clone(),
+            version: f.version.clone(),
+            found: true,
+            account: account.iter().find(|a| same(f, a)).map(|a| a.local),
+        })
+        .collect();
+    for a in account {
+        if found.iter().any(|f| same(f, a)) {
+            continue;
+        }
+        let Some(url) = &a.url else {
+            continue;
+        };
+        choices.push(PlexChoice {
+            name: a.name.clone(),
+            url: url.clone(),
+            version: None,
+            found: false,
+            account: Some(a.local),
+        });
+    }
+    choices
+}
+
+/// What a choice says under its name: "Found on this network ·
+/// 192.168.1.10:32400 · Plex Media Server 1.41", or "From your Plex
+/// account · <address>", without an address too long to say for a remote
+/// one (the remote note says the rest).
+pub fn choice_line(choice: &PlexChoice) -> String {
+    let host_port = crate::logic::host_port(&choice.url);
+    if !choice.found {
+        return if choice.remote() {
+            "From your Plex account".to_owned()
+        } else {
+            format!("From your Plex account · {host_port}")
+        };
+    }
+    let mut line = format!("Found on this network · {host_port}");
+    if let Some(v) = &choice.version {
+        let minor = v.split('.').take(2).collect::<Vec<_>>().join(".");
+        line.push_str(&format!(" · Plex Media Server {minor}"));
+    }
+    line
+}
+
+/// What the Plex step chooses while the admin has not: the first server
+/// that is not remote.
+pub fn first_choice(choices: &[PlexChoice]) -> Option<String> {
+    choices.iter().find(|c| !c.remote()).map(|c| c.url.clone())
+}
+
 /// A private, loopback or link-local address.
 fn on_lan(ip: IpAddr) -> bool {
     match ip {
@@ -459,6 +554,90 @@ mod tests {
         assert_eq!(local_path(&saved, "Movies", "/data/movies"), "/old");
         assert_eq!(local_path(&saved, "Kids", "/data/kids"), "/mnt/nas/kids");
         assert_eq!(local_path(&[], "Kids", "/data/kids"), "/data/kids");
+    }
+
+    fn found(name: &str, url: &str, machine: Option<&str>) -> DiscoveredPlex {
+        DiscoveredPlex {
+            name: name.into(),
+            url: url.into(),
+            version: Some("1.41.0".into()),
+            machine_id: machine.map(str::to_owned),
+        }
+    }
+
+    fn listed(name: &str, url: Option<&str>, local: bool) -> PlexAccountServer {
+        PlexAccountServer {
+            name: name.into(),
+            machine_id: format!("{}-machine", name.to_lowercase()),
+            url: url.map(str::to_owned),
+            local,
+            owned: true,
+            added: None,
+        }
+    }
+
+    #[test]
+    fn the_wizard_lists_a_server_found_and_in_the_account_once_by_its_lan_address() {
+        let choices = plex_choices(
+            &[
+                found("Tower", "http://192.168.1.10:32400", Some("tower-machine")),
+                found("nas", "http://192.168.1.30:32400", None),
+            ],
+            &[
+                listed(
+                    "Tower",
+                    Some("https://192-168-1-10.abc.plex.direct:32400"),
+                    true,
+                ),
+                listed(
+                    "fulcrum-ng",
+                    Some("https://192-168-1-40.abc.plex.direct:32400"),
+                    true,
+                ),
+                listed(
+                    "Cabin",
+                    Some("https://1-2-3-4.def.plex.direct:32400"),
+                    false,
+                ),
+                listed("Far", None, false),
+            ],
+        );
+        let names: Vec<_> = choices.iter().map(|c| c.name.as_str()).collect();
+        // Found first, then the account's others; one only Plex's relay
+        // reaches is not offered.
+        assert_eq!(names, ["Tower", "nas", "fulcrum-ng", "Cabin"]);
+        assert_eq!(choices[0].url, "http://192.168.1.10:32400");
+        assert!(choices[0].found && choices[0].account.is_some());
+        assert!(choices[1].account.is_none());
+        assert!(!choices[2].found && !choices[2].remote());
+        assert!(choices[3].remote(), "plex.tv says Cabin is not on the LAN");
+        assert_eq!(
+            choice_line(&choices[0]),
+            "Found on this network · 192.168.1.10:32400 · Plex Media Server 1.41"
+        );
+        assert_eq!(
+            choice_line(&choices[2]),
+            "From your Plex account · 192-168-1-40.abc.plex.direct:32400"
+        );
+        // Its plex.direct name is too long to say; the remote note says
+        // the rest.
+        assert_eq!(choice_line(&choices[3]), "From your Plex account");
+        // Nothing chosen yet: the first that is not remote.
+        assert_eq!(first_choice(&choices[3..]), None);
+        assert_eq!(
+            first_choice(&choices[2..]).as_deref(),
+            Some(choices[2].url.as_str())
+        );
+    }
+
+    #[test]
+    fn a_server_found_without_an_id_is_still_matched_to_the_account_by_its_address() {
+        let choices = plex_choices(
+            &[found("Tower", "http://192.168.1.10:32400/", None)],
+            &[listed("Tower", Some("http://192.168.1.10:32400"), true)],
+        );
+        assert_eq!(choices.len(), 1);
+        assert!(choices[0].account.is_some());
     }
 
     #[test]

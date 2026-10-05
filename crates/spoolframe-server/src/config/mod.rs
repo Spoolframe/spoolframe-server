@@ -128,6 +128,12 @@ pub struct ServerConfig {
     /// Ways to sign in besides the password and passkeys: SSO (P3-04).
     #[ucl(default)]
     pub auth: AuthConfig,
+    /// The log lines kept in memory for the web UI (P3-14).
+    #[ucl(default)]
+    pub logs: LogsConfig,
+    /// OpenTelemetry export (P3-14): off without an endpoint.
+    #[ucl(default)]
+    pub telemetry: TelemetryConfig,
     /// The setup wizard's progress (P3-10): the server's own, kept in the
     /// runtime layer, not a setting.
     #[ucl(default)]
@@ -292,6 +298,137 @@ impl AuthConfig {
             });
         }
         Ok(())
+    }
+}
+
+/// `logs { buffer_lines = 5000; }` (P3-14), optional.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct LogsConfig {
+    /// The last log lines kept for the Logs page; 5000 if left out.
+    #[ucl(default)]
+    pub buffer_lines: Option<u64>,
+}
+
+impl LogsConfig {
+    /// The most lines a ring may be set to: about 20 MiB of lines.
+    pub const MAX_LINES: u64 = 100_000;
+
+    pub fn buffer_lines(&self) -> Result<usize, ConfigError> {
+        match self.buffer_lines {
+            None => Ok(crate::logs::DEFAULT_LINES),
+            Some(n) if (1..=Self::MAX_LINES).contains(&n) => Ok(n as usize),
+            Some(n) => Err(ConfigError::Invalid {
+                key: "logs.buffer_lines",
+                message: format!("{n} is not between 1 and {}", Self::MAX_LINES),
+            }),
+        }
+    }
+}
+
+/// `telemetry { otlp { … } }` (P3-14).
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct TelemetryConfig {
+    #[ucl(default)]
+    pub otlp: OtlpConfig,
+}
+
+/// `otlp { endpoint = "http://alloy:4317"; protocol = "grpc";
+/// headers = "x-scope-orgid=home"; traces = true; metrics = true;
+/// logs = true; }`, all optional: without an endpoint nothing is exported.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct OtlpConfig {
+    /// The collector: `http://host:4317` for gRPC, `http://host:4318` for
+    /// HTTP (the paths `/v1/traces`, `/v1/metrics`, `/v1/logs` are added).
+    #[ucl(default)]
+    pub endpoint: Option<String>,
+    /// `grpc` (the default) or `http` (protobuf).
+    #[ucl(default)]
+    pub protocol: Option<String>,
+    /// Sent with every export, as `name=value` pairs, comma-separated (the
+    /// format of OTEL_EXPORTER_OTLP_HEADERS). Never logged.
+    #[ucl(default)]
+    pub headers: Option<String>,
+    /// Each signal, on unless set to false.
+    #[ucl(default)]
+    pub traces: Option<bool>,
+    #[ucl(default)]
+    pub metrics: Option<bool>,
+    #[ucl(default)]
+    pub logs: Option<bool>,
+}
+
+impl OtlpConfig {
+    /// What to export to, checked; `None` without an endpoint.
+    pub fn settings(&self) -> Result<Option<crate::telemetry::OtlpSettings>, ConfigError> {
+        use crate::telemetry::{OtlpSettings, Protocol};
+        let Some(endpoint) = self
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        else {
+            return Ok(None);
+        };
+        let invalid = |key: &'static str, message: String| ConfigError::Invalid { key, message };
+        let url = Url::parse(endpoint)
+            .map_err(|e| invalid("telemetry.otlp.endpoint", format!("{endpoint:?}: {e}")))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+            return Err(invalid(
+                "telemetry.otlp.endpoint",
+                format!("{endpoint:?} is not an http(s) URL"),
+            ));
+        }
+        let protocol = match self.protocol.as_deref().unwrap_or("grpc") {
+            "grpc" => Protocol::Grpc,
+            "http" => Protocol::Http,
+            other => {
+                return Err(invalid(
+                    "telemetry.otlp.protocol",
+                    format!("{other:?}: expected grpc or http"),
+                ));
+            }
+        };
+        let mut headers = Vec::new();
+        for pair in self.headers.as_deref().unwrap_or_default().split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            // The value is never in a message: it may be a key.
+            let Some((name, value)) = pair.split_once('=') else {
+                return Err(invalid(
+                    "telemetry.otlp.headers",
+                    "each header is name=value".into(),
+                ));
+            };
+            let name = name.trim();
+            let token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+            if name.is_empty() || !name.chars().all(token) {
+                return Err(invalid(
+                    "telemetry.otlp.headers",
+                    format!("{name:?} is not a header name"),
+                ));
+            }
+            let value = value.trim();
+            if value.chars().any(|c| c.is_control()) {
+                return Err(invalid(
+                    "telemetry.otlp.headers",
+                    format!("the value of {name:?} has a control character"),
+                ));
+            }
+            headers.push((name.to_owned(), value.to_owned()));
+        }
+        Ok(Some(OtlpSettings {
+            endpoint: endpoint.to_owned(),
+            protocol,
+            headers,
+            traces: self.traces.unwrap_or(true),
+            metrics: self.metrics.unwrap_or(true),
+            logs: self.logs.unwrap_or(true),
+        }))
     }
 }
 
@@ -707,9 +844,21 @@ pub struct NetworkConfig {
     /// it without being told its address. On unless set to `false`.
     #[ucl(default)]
     pub mdns: Option<bool>,
+    /// The UDP port Plex's LAN discovery (GDM) searches from, which each
+    /// PMS answers to. A host firewall drops those answers unless it is
+    /// open: it cannot match them to a search sent to a multicast group.
+    /// [`spoolframe_plex::gdm::PORT`] if left out; 0 is any free port.
+    #[ucl(default)]
+    pub plex_discovery_port: Option<u16>,
 }
 
 impl NetworkConfig {
+    /// `plex_discovery_port`, its default filled in.
+    pub fn plex_discovery_port(&self) -> u16 {
+        self.plex_discovery_port
+            .unwrap_or(spoolframe_plex::gdm::PORT)
+    }
+
     /// How to build the endpoint.
     pub fn endpoint_options(&self) -> Result<EndpointOptions, ConfigError> {
         let invalid = |message: String| ConfigError::Invalid {
@@ -1181,6 +1330,8 @@ impl ServerConfig {
         parsed.transcode.limits(Path::new("/"))?;
         parsed.subtitles.ocr_settings(Path::new("/"))?;
         parsed.previews.settings()?;
+        parsed.logs.buffer_lines()?;
+        parsed.telemetry.otlp.settings()?;
         Ok(parsed)
     }
 
@@ -1453,6 +1604,80 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_exported_without_an_otlp_endpoint() {
+        assert_eq!(plex("").unwrap().telemetry.otlp.settings().unwrap(), None);
+        let on = plex(
+            r#"telemetry { otlp { endpoint = "http://alloy:4318"; protocol = "http";
+               headers = "x-scope-orgid=home, authorization=Bearer k"; logs = false; } }"#,
+        )
+        .unwrap()
+        .telemetry
+        .otlp
+        .settings()
+        .unwrap()
+        .unwrap();
+        assert_eq!(on.protocol, crate::telemetry::Protocol::Http);
+        assert_eq!(
+            on.headers,
+            [
+                ("x-scope-orgid".to_owned(), "home".to_owned()),
+                ("authorization".to_owned(), "Bearer k".to_owned())
+            ]
+        );
+        assert!(on.traces && on.metrics && !on.logs);
+        let grpc = plex(r#"telemetry { otlp { endpoint = "http://alloy:4317"; } }"#)
+            .unwrap()
+            .telemetry
+            .otlp
+            .settings()
+            .unwrap()
+            .unwrap();
+        assert_eq!(grpc.protocol, crate::telemetry::Protocol::Grpc);
+    }
+
+    #[test]
+    fn an_otlp_setting_that_cannot_work_is_refused_without_its_secret() {
+        for (text, key) in [
+            (r#"endpoint = "alloy:4317";"#, "telemetry.otlp.endpoint"),
+            (
+                r#"endpoint = "http://a:4317"; protocol = "udp";"#,
+                "telemetry.otlp.protocol",
+            ),
+            (
+                r#"endpoint = "http://a:4317"; headers = "s3cr3t";"#,
+                "telemetry.otlp.headers",
+            ),
+            (
+                r#"endpoint = "http://a:4317"; headers = "bad name=s3cr3t";"#,
+                "telemetry.otlp.headers",
+            ),
+        ] {
+            let err = plex(&format!("telemetry {{ otlp {{ {text} }} }}")).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Invalid { key: k, .. } if k == key),
+                "{text}: {err:?}"
+            );
+            assert!(!err.to_string().contains("s3cr3t"), "{err}");
+        }
+    }
+
+    #[test]
+    fn five_thousand_log_lines_are_kept_unless_set() {
+        assert_eq!(plex("").unwrap().logs.buffer_lines().unwrap(), 5000);
+        let set = plex("logs { buffer_lines = 200; }").unwrap();
+        assert_eq!(set.logs.buffer_lines().unwrap(), 200);
+        for bad in ["0", "100001"] {
+            assert!(matches!(
+                plex(&format!("logs {{ buffer_lines = {bad}; }}")),
+                Err(ConfigError::Invalid {
+                    key: "logs.buffer_lines",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn job_limits_default_under_the_state_dir() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         let limits = config.transcode.limits(Path::new("/var/lib/sf")).unwrap();
@@ -1696,6 +1921,25 @@ mod tests {
         let config =
             plex(r#"plex { url = "http://nas:32400"; } network { port = 7420; }"#).unwrap();
         assert_eq!(config.network.endpoint_options().unwrap().port, Some(7420));
+    }
+
+    #[test]
+    fn plex_discovery_searches_from_32415_unless_told_another_port() {
+        let bare = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(bare.network.plex_discovery_port(), 32415);
+        let set =
+            plex(r#"plex { url = "http://nas:32400"; } network { plex_discovery_port = 40000; }"#)
+                .unwrap();
+        assert_eq!(set.network.plex_discovery_port(), 40000);
+        // 0 is any free port, as before it was fixed.
+        let any =
+            plex(r#"plex { url = "http://nas:32400"; } network { plex_discovery_port = 0; }"#)
+                .unwrap();
+        assert_eq!(any.network.plex_discovery_port(), 0);
+        assert!(
+            plex(r#"plex { url = "http://nas:32400"; } network { plex_discovery_port = 70000; }"#)
+                .is_err()
+        );
     }
 
     #[test]

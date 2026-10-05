@@ -51,6 +51,12 @@ sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+tonic = { workspace = true }
 tokio = { workspace = true }
 uclicious = { workspace = true }
 webauthn-rs = { workspace = true }
@@ -60,6 +66,10 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# The stand-in OTLP collector (P3-14).
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true, features = ["transport", "router", "codegen"] }
 # A stand-in PMS for the admin API's Plex status.
 wiremock = { workspace = true }
 spoolframe-test-dir = { workspace = true }

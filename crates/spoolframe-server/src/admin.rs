@@ -16,6 +16,10 @@ use jsonrpsee::server::ServerHandle;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
 use spoolframe_admin_api::{
+    Activity, LogPage, LogQuery, MetricsEndpointStatus, OtlpStatus, PlexServerActivity,
+    RefusedScrape, ResourceAttribute, TelemetryStatus, UserSessionCount,
+};
+use spoolframe_admin_api::{
     AdminApiServer, Credentials, DeviceEntry, DeviceSignIn, DiscoveredPlex, LibrariesOverview,
     LibraryPathCheck, LoggedIn, MeApiServer, NewUser, PasskeyChallenge, PasskeyEntry, PasskeyHost,
     PasskeySetupBegin, PasskeySetupFinish, PasswordChange, PathFailures, PathMappingEntry,
@@ -299,6 +303,10 @@ pub struct Admin {
     /// What `GET /metrics` answers (P3-14); `None` in tests without, where
     /// it is not found.
     pub metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// The last log lines (P3-14); `None` in tests without.
+    pub logs: Option<Arc<crate::logs::LogRing>>,
+    /// The OTLP export (P3-14), for its status; `None` in tests without.
+    pub telemetry: Option<Arc<crate::telemetry::Telemetry>>,
 }
 
 /// What the setup wizard reaches beyond the server (P3-10): plex.tv for
@@ -412,6 +420,10 @@ pub async fn serve(
     origins: Origins,
     proxies: TrustedProxies,
 ) -> std::io::Result<(SocketAddr, ServerHandle)> {
+    // Live sessions are counted from the store the API signs in with.
+    if let Some(metrics) = &admin.metrics {
+        metrics.observe_store(admin.auth.store().clone());
+    }
     let api = AdminApi {
         auth: admin.auth,
         setup_code: admin.setup_code,
@@ -427,8 +439,11 @@ pub async fn serve(
         watch: admin.watch,
         artwork: admin.artwork,
         metrics: admin.metrics,
+        logs: admin.logs,
+        telemetry: admin.telemetry,
         checks: Arc::default(),
         pins: Arc::default(),
+        signed_in: Arc::default(),
         public_url: origins.public_url().map(str::to_owned),
     };
     let mut methods = AdminApiServer::into_rpc(api.clone());
@@ -454,10 +469,17 @@ pub(crate) struct AdminApi {
     watch: Option<Arc<crate::watch::Watch>>,
     artwork: Option<Arc<crate::artwork::ArtworkCache>>,
     metrics: Option<Arc<crate::metrics::Metrics>>,
+    logs: Option<Arc<crate::logs::LogRing>>,
+    telemetry: Option<Arc<crate::telemetry::Telemetry>>,
     /// Each library's last path check (P3-16).
     checks: Arc<PathChecks>,
     /// The plex.tv PINs this server began, so a check is only of those.
     pins: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    /// The account token the wizard's last Sign in with Plex got: whose
+    /// servers the wizard offers before anyone has linked an account. In
+    /// memory only; `plex.token` keeps it too, until the token of the
+    /// server chosen replaces it.
+    signed_in: Arc<std::sync::Mutex<Option<String>>>,
     /// Where browsers reach the web UI (`admin.public_url`), if anywhere.
     public_url: Option<String>,
 }
@@ -569,6 +591,10 @@ impl AdminApi {
     /// The server's metrics, if it keeps any.
     pub(crate) fn metrics(&self) -> Option<&crate::metrics::Metrics> {
         self.metrics.as_deref()
+    }
+
+    pub(crate) fn metrics_arc(&self) -> Option<Arc<crate::metrics::Metrics>> {
+        self.metrics.clone()
     }
 
     /// How the session cookie is sent now.
@@ -2213,13 +2239,12 @@ impl AdminApiServer for AdminApi {
 
     async fn plex_account_servers(&self, ext: &Extensions) -> RpcResult<Vec<PlexAccountServer>> {
         let user = self.admin(ext).await?;
-        let Some(token) = self.account_token(user.user)? else {
+        let Some(resources) = self.offered_servers(user.user).await? else {
             return Err(error(
                 error_code::NOT_CONFIGURED,
-                "link your Plex account in My profile to list its servers",
+                "link your Plex account in My profile, or sign in with Plex, to list its servers",
             ));
         };
-        let resources = self.accounts()?.servers(&token).await?;
         let configured: Vec<(String, String)> = self
             .plex
             .composite()
@@ -2234,6 +2259,30 @@ impl AdminApiServer for AdminApi {
             &resources,
             &configured,
         ))
+    }
+
+    async fn plex_account_token_use(&self, ext: &Extensions, url: String) -> RpcResult<()> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        let user = self.admin(ext).await?;
+        let Some(resources) = self.offered_servers(user.user).await? else {
+            return Err(error(
+                error_code::NOT_CONFIGURED,
+                "sign in with Plex first: no Plex account lists this server",
+            ));
+        };
+        let Some(token) = crate::plex_accounts::token_for_url(&resources, url.trim()) else {
+            return Err(error(
+                error_code::INVALID_INPUT,
+                format!("the Plex account does not reach {}", url.trim()),
+            ));
+        };
+        settings.set(PLEX_TOKEN, &serde_json::Value::String(token), &by)?;
+        tracing::info!(
+            by,
+            url = url.trim(),
+            "the Plex account's token for the server chosen is kept as plex.token"
+        );
+        Ok(())
     }
 
     async fn settings(&self, ext: &Extensions) -> RpcResult<Settings> {
@@ -2282,20 +2331,27 @@ impl AdminApiServer for AdminApi {
 
     async fn plex_discover(&self, ext: &Extensions) -> RpcResult<Vec<DiscoveredPlex>> {
         self.admin(ext).await?;
-        let found = spoolframe_plex::gdm::discover(&self.wizard.gdm, spoolframe_plex::gdm::WAIT)
-            .await
-            .map_err(|e| {
-                error(
-                    error_code::UNAVAILABLE,
-                    format!("cannot search the LAN: {e}"),
-                )
-            })?;
+        // The setting now (it is live), else the default.
+        let port = self
+            .settings
+            .as_ref()
+            .map_or(spoolframe_plex::gdm::PORT, |s| s.plex_discovery_port());
+        let found =
+            spoolframe_plex::gdm::discover(&self.wizard.gdm, port, spoolframe_plex::gdm::WAIT)
+                .await
+                .map_err(|e| {
+                    error(
+                        error_code::UNAVAILABLE,
+                        format!("cannot search the LAN: {e}"),
+                    )
+                })?;
         Ok(found
             .into_iter()
             .map(|f| DiscoveredPlex {
                 name: f.name,
                 url: f.url,
                 version: f.version,
+                machine_id: f.machine_id,
             })
             .collect())
     }
@@ -2394,6 +2450,7 @@ impl AdminApiServer for AdminApi {
             .expect("never held across a panic")
             .remove(&id);
         settings.set(PLEX_TOKEN, &serde_json::Value::String(token.clone()), &by)?;
+        *self.signed_in.lock().expect("never held across a panic") = Some(token.clone());
         // Only for the page to say who; the token is kept either way.
         let account = plex_tv.account(&token).await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "cannot ask plex.tv whose token it is");
@@ -2587,6 +2644,118 @@ impl AdminApiServer for AdminApi {
         self.admin(ext).await?;
         self.catalog_check_paths_of(id).await
     }
+
+    async fn activity(&self, ext: &Extensions) -> RpcResult<Activity> {
+        self.admin(ext).await?;
+        let Some(metrics) = &self.metrics else {
+            return Err(error(
+                error_code::NOT_CONFIGURED,
+                "this server keeps no metrics",
+            ));
+        };
+        let (history, now) = metrics.activity();
+        let names: std::collections::HashMap<_, _> = self
+            .auth
+            .store()
+            .list_users()
+            .await?
+            .into_iter()
+            .map(|u| (u.id, u.username))
+            .collect();
+        Ok(Activity {
+            sample_secs: crate::metrics::history::SAMPLE_EVERY.as_secs() as u32,
+            now: metrics.now_point(&now),
+            history,
+            totals: now.totals,
+            plex: metrics
+                .plex_servers()
+                .into_iter()
+                .map(|(id, name, counts)| PlexServerActivity {
+                    id,
+                    name,
+                    requests: counts.requests,
+                    errors: counts.errors,
+                    mean_latency_ms: (counts.requests > 0)
+                        .then(|| counts.sum_seconds * 1000.0 / counts.requests as f64),
+                })
+                .collect(),
+            sessions: metrics
+                .sessions()
+                .into_iter()
+                .map(|s| UserSessionCount {
+                    user_id: format!("local:{}", s.user),
+                    username: names.get(&s.user).cloned().unwrap_or_default(),
+                    app: s.app,
+                    web: s.web,
+                })
+                .collect(),
+        })
+    }
+
+    async fn telemetry_status(&self, ext: &Extensions) -> RpcResult<TelemetryStatus> {
+        self.admin(ext).await?;
+        let now = crate::metrics::history::unix_ms();
+        let metrics = MetricsEndpointStatus {
+            enabled: self.metrics.as_ref().is_some_and(|m| m.access().enabled()),
+            path: "/metrics".into(),
+            refused: self
+                .metrics
+                .as_ref()
+                .map(|m| m.access().refused_last_hour(now))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| RefusedScrape {
+                    address: r.address.to_string(),
+                    count: r.count,
+                    last_at: r.last_at,
+                })
+                .collect(),
+        };
+        let Some(telemetry) = &self.telemetry else {
+            return Ok(TelemetryStatus {
+                otlp: None,
+                resource: Vec::new(),
+                metrics,
+            });
+        };
+        let otlp = telemetry.status().map(|(settings, status)| OtlpStatus {
+            endpoint: settings.endpoint,
+            protocol: match settings.protocol {
+                crate::telemetry::Protocol::Grpc => "grpc".into(),
+                crate::telemetry::Protocol::Http => "http".into(),
+            },
+            traces: settings.traces,
+            metrics: settings.metrics,
+            logs: settings.logs,
+            header_names: settings.headers.into_iter().map(|(k, _)| k).collect(),
+            last_export_at: status.last_export_at,
+            dropped: status.dropped,
+            dropping_since: status.dropping_since,
+            last_error: status.last_error,
+            last_error_at: status.last_error_at,
+            metrics_every_secs: telemetry.metrics_every().as_secs() as u32,
+        });
+        Ok(TelemetryStatus {
+            otlp,
+            resource: telemetry
+                .resource_attributes()
+                .into_iter()
+                .map(|(key, value)| ResourceAttribute { key, value })
+                .collect(),
+            metrics,
+        })
+    }
+
+    async fn logs(&self, ext: &Extensions, query: LogQuery) -> RpcResult<LogPage> {
+        self.admin(ext).await?;
+        match &self.logs {
+            Some(ring) => Ok(ring.page(&query)),
+            None => Err(error(
+                error_code::NOT_CONFIGURED,
+                "this server keeps no log lines",
+            )),
+        }
+    }
 }
 
 /// How many files of each library the wizard's path check, and the
@@ -2603,19 +2772,69 @@ impl AdminApi {
     /// server. `None` without a link, or when plex.tv cannot be asked.
     async fn linked_token_for(&self, ext: &Extensions, url: &str) -> RpcResult<Option<String>> {
         let (_, user) = self.caller(ext).await?;
-        let Some(accounts) = &self.accounts else {
-            return Ok(None);
+        let linked = match &self.accounts {
+            Some(accounts) => accounts.account(user.user).map_err(internal)?,
+            None => None,
         };
-        let Some(link) = accounts.account(user.user).map_err(internal)? else {
-            return Ok(None);
+        let token = match linked {
+            Some(link) => link.token,
+            None => match self.wizard_sign_in() {
+                Some(token) => token,
+                None => return Ok(None),
+            },
         };
-        match accounts.servers(&link.token).await {
+        match self.servers_of(&token).await {
             Ok(resources) => Ok(crate::plex_accounts::token_for_url(&resources, url.trim())),
             Err(e) => {
-                tracing::warn!(error = %e, "cannot list the linked Plex account's servers");
+                tracing::warn!(error = %e.message(), "cannot list the Plex account's servers");
                 Ok(None)
             }
         }
+    }
+
+    /// The account token the wizard's last Sign in with Plex got.
+    fn wizard_sign_in(&self) -> Option<String> {
+        self.signed_in
+            .lock()
+            .expect("never held across a panic")
+            .clone()
+    }
+
+    /// The Plex servers `token`'s account reaches, asked of plex.tv.
+    async fn servers_of(
+        &self,
+        token: &str,
+    ) -> RpcResult<Vec<spoolframe_plex::account::PlexResource>> {
+        if let Some(accounts) = &self.accounts {
+            return Ok(accounts.servers(token).await?);
+        }
+        let Some(settings) = &self.settings else {
+            return Err(error(
+                error_code::NOT_CONFIGURED,
+                "this server does not reach plex.tv",
+            ));
+        };
+        self.plex_tv(settings)?
+            .servers(token)
+            .await
+            .map_err(|e| error(error_code::UNAVAILABLE, e.to_string()))
+    }
+
+    /// The servers of the Plex account `user` is offered: their own linked
+    /// one, else the one the wizard last signed in with (P3-10), before
+    /// anyone has linked one. `None` without either.
+    async fn offered_servers(
+        &self,
+        user: crate::store::users::LocalUserId,
+    ) -> RpcResult<Option<Vec<spoolframe_plex::account::PlexResource>>> {
+        let token = match self.account_token(user)? {
+            Some(token) => token,
+            None => match self.wizard_sign_in() {
+                Some(token) => token,
+                None => return Ok(None),
+            },
+        };
+        Ok(Some(self.servers_of(&token).await?))
     }
 
     /// Where suggested path mappings are looked for.
@@ -2743,8 +2962,11 @@ mod tests {
             watch: None,
             artwork: None,
             metrics: None,
+            logs: None,
+            telemetry: None,
             checks: Arc::default(),
             pins: Arc::default(),
+            signed_in: Arc::default(),
             public_url: origins.public_url().map(str::to_owned),
         }
     }

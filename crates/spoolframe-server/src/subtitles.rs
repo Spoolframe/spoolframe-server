@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 use spoolframe_media::ocr::{self, Ocr};
 use spoolframe_media::{SubtitleKind, SubtitleSource, SubtitleStream, codecs, dvb, pgs, vobsub};
 use spoolframe_types::SubtitleFormat;
+
+use crate::metrics::Counter;
 use tokio::sync::{Semaphore, watch};
 
 /// `subtitles { … }`, with the defaults filled in.
@@ -64,6 +66,19 @@ pub struct Subtitles {
     cache_dir: PathBuf,
     making: Mutex<HashMap<String, watch::Receiver<TextState>>>,
     one_track: Arc<Semaphore>,
+    /// Bitmap tracks waiting to be read or being read (P3-14).
+    ocr_pending: std::sync::atomic::AtomicU64,
+    ocr_done: Counter,
+    ocr_failed: Counter,
+}
+
+/// Text recognition's work now, and since the server started (P3-14).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OcrCounts {
+    /// Tracks waiting their turn or being read: one is read at a time.
+    pub queued: u64,
+    pub done: u64,
+    pub failed: u64,
 }
 
 impl std::fmt::Debug for Subtitles {
@@ -102,7 +117,20 @@ impl Subtitles {
             cache_dir: settings.cache_dir.clone(),
             making: Mutex::new(HashMap::new()),
             one_track: Arc::new(Semaphore::new(1)),
+            ocr_pending: Default::default(),
+            ocr_done: Counter::default(),
+            ocr_failed: Counter::default(),
         })
+    }
+
+    /// Text recognition's work (P3-14).
+    pub fn ocr_counts(&self) -> OcrCounts {
+        use std::sync::atomic::Ordering;
+        OcrCounts {
+            queued: self.ocr_pending.load(Ordering::Relaxed),
+            done: self.ocr_done.get(),
+            failed: self.ocr_failed.get(),
+        }
     }
 
     /// What the planner may read as text.
@@ -154,6 +182,11 @@ impl Subtitles {
             work: self.cache_dir.join("work").join(&key),
             text,
         };
+        let ocr = matches!(job.how, How::Ocr { .. });
+        if ocr {
+            self.ocr_pending
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         tokio::spawn(async move {
             let state = match job.run(&tx).await {
                 Ok(path) => TextState::Ready(path),
@@ -162,6 +195,16 @@ impl Subtitles {
                     TextState::Failed(reason)
                 }
             };
+            if ocr {
+                let subtitles = &job.subtitles;
+                match &state {
+                    TextState::Ready(_) => subtitles.ocr_done.inc(),
+                    _ => subtitles.ocr_failed.inc(),
+                }
+                subtitles
+                    .ocr_pending
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let _ = tokio::fs::remove_dir_all(&job.work).await;
             let _ = tx.send(state);
             job.subtitles

@@ -24,6 +24,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Extension, Router};
 use jsonrpsee::Extensions;
+use jsonrpsee::server::middleware::rpc::{Batch, Notification, RpcServiceBuilder, RpcServiceT};
 use jsonrpsee::server::{Methods, ServerHandle, StopHandle, stop_channel};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
@@ -334,9 +335,19 @@ fn router(
     origins: Origins,
     proxies: TrustedProxies,
 ) -> Router {
+    let metrics = api.metrics_arc();
     let rpc = tower::service_fn(move |req: Request| {
+        // Each socket counted open while its RPC service lives (P3-14):
+        // jsonrpsee makes one per connection and drops it as the
+        // connection ends.
+        let metrics = metrics.clone();
+        let counted = RpcServiceBuilder::new().layer_fn(move |inner| Counted {
+            inner,
+            _open: metrics.as_ref().map(|m| Arc::new(m.web_connection())),
+        });
         // Built per connection: building is what gives each its own id.
         let mut service = jsonrpsee::server::ServerBuilder::default()
+            .set_rpc_middleware(counted)
             .to_service_builder()
             .build(methods.clone(), stop.clone());
         async move {
@@ -365,7 +376,7 @@ fn router(
         .route("/auth/me", get(me))
         .route("/auth/site", get(site))
         .route("/catalog/artwork", get(catalog_artwork))
-        .route("/metrics", get(metrics))
+        .route("/metrics", get(metrics_page))
         .with_state(api)
         // The socket: `/jsonrpc` for the web UI, and any other path's
         // upgrade too, which is where the CLI has always connected. Except
@@ -383,6 +394,41 @@ fn router(
         }))
         .layer(middleware::from_fn_with_state(proxies, credentials))
         .layer(middleware::from_fn_with_state(origins, check_origin))
+}
+
+/// An admin API connection's RPC service, holding its place in the count
+/// of open sockets until jsonrpsee drops it.
+#[derive(Clone)]
+struct Counted<S> {
+    inner: S,
+    _open: Option<Arc<crate::metrics::WebConnection>>,
+}
+
+impl<S> RpcServiceT for Counted<S>
+where
+    S: RpcServiceT + Send + Sync,
+{
+    type MethodResponse = S::MethodResponse;
+    type NotificationResponse = S::NotificationResponse;
+    type BatchResponse = S::BatchResponse;
+
+    fn call<'a>(
+        &self,
+        request: jsonrpsee::types::Request<'a>,
+    ) -> impl Future<Output = Self::MethodResponse> + Send + 'a {
+        self.inner.call(request)
+    }
+
+    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = Self::BatchResponse> + Send + 'a {
+        self.inner.batch(batch)
+    }
+
+    fn notification<'a>(
+        &self,
+        n: Notification<'a>,
+    ) -> impl Future<Output = Self::NotificationResponse> + Send + 'a {
+        self.inner.notification(n)
+    }
 }
 
 fn is_upgrade(headers: &HeaderMap) -> bool {
@@ -890,7 +936,7 @@ async fn catalog_artwork(State(api): State<AdminApi>, req: Request) -> Response<
 /// off, so the listener does not even say it could; refused from anywhere
 /// else. The caller is who a trusted proxy says it carries: a proxy on
 /// this machine does not make the Internet loopback.
-async fn metrics(State(api): State<AdminApi>, req: Request) -> Response<Body> {
+async fn metrics_page(State(api): State<AdminApi>, req: Request) -> Response<Body> {
     let Some(metrics) = api.metrics().filter(|m| m.access().enabled()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -900,6 +946,11 @@ async fn metrics(State(api): State<AdminApi>, req: Request) -> Response<Body> {
             ?caller,
             "metrics refused to an address not in admin.metrics_from"
         );
+        if let Some(ip) = caller {
+            metrics
+                .access()
+                .refused(ip, crate::metrics::history::unix_ms());
+        }
         return (StatusCode::FORBIDDEN, "not from this address").into_response();
     }
     (

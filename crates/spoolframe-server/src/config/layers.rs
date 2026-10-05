@@ -550,6 +550,12 @@ impl Layers {
                     (false, _) => "not set".into(),
                 };
                 (value.to_owned(), origin)
+            } else if setting.write_only {
+                let value = match tree::get(&merged, setting.key) {
+                    Some(_) => "(set)",
+                    None => "(not set)",
+                };
+                (value.to_owned(), describe(&origin))
             } else {
                 let value = tree::get(&merged, setting.key)
                     .map_or_else(|| "(not set)".to_owned(), Value::to_ucl);
@@ -667,6 +673,10 @@ mod tests {
             bare.network.endpoint_options().unwrap()
         );
         assert_eq!(
+            documented.network.plex_discovery_port(),
+            bare.network.plex_discovery_port()
+        );
+        assert_eq!(
             documented.admin.listen().unwrap(),
             bare.admin.listen().unwrap()
         );
@@ -695,6 +705,14 @@ mod tests {
             bare.previews.settings().unwrap()
         );
         assert_eq!(documented.admin.metrics(), bare.admin.metrics());
+        assert_eq!(
+            documented.logs.buffer_lines().unwrap(),
+            bare.logs.buffer_lines().unwrap()
+        );
+        assert_eq!(
+            documented.telemetry.otlp.settings().unwrap(),
+            bare.telemetry.otlp.settings().unwrap()
+        );
         assert_eq!(
             documented.admin.metrics_from().unwrap(),
             bare.admin.metrics_from().unwrap()

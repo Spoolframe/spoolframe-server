@@ -34,6 +34,7 @@ mod sessions;
 mod settings;
 mod sso;
 mod subtitles;
+mod telemetry;
 mod throughput;
 mod tracks;
 mod watch;

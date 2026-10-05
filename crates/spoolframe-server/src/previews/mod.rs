@@ -38,6 +38,8 @@ use spoolframe_catalog::{Catalog, CatalogError, PreviewFrame};
 use spoolframe_media::codecs;
 use spoolframe_media::{Prober, VideoRange};
 use spoolframe_types::{ArtworkId, MediaId, MediaKind, Namespace};
+
+use crate::metrics::Counter;
 use tokio::sync::{Notify, watch};
 
 use self::cache::Cache;
@@ -200,6 +202,21 @@ pub struct Previews {
     /// The server is stopping: the file being made is given up between
     /// two tiles, and nothing more is made.
     stopped: AtomicBool,
+    /// Sets made since the server started (P3-14).
+    made: Counter,
+    /// Sets that could not be made since the server started.
+    failures: Counter,
+}
+
+/// The previews' work now (P3-14).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreviewCounts {
+    /// Waiting to be made.
+    pub queued: u64,
+    /// Being made now.
+    pub making: u64,
+    pub done: u64,
+    pub failed: u64,
 }
 
 impl std::fmt::Debug for Previews {
@@ -251,6 +268,8 @@ impl Previews {
             wake: Arc::default(),
             failed: Mutex::default(),
             stopped: AtomicBool::new(false),
+            made: Counter::default(),
+            failures: Counter::default(),
         });
         tokio::spawn(urgent_loop(
             Arc::downgrade(&previews),
@@ -302,6 +321,17 @@ impl Previews {
         queue.queued.clear();
         drop(queue);
         self.wake.notify_waiters();
+    }
+
+    /// The work now, and what was done (P3-14).
+    pub fn counts(&self) -> PreviewCounts {
+        let queue = self.lock_queue();
+        PreviewCounts {
+            queued: (queue.urgent.len() + queue.ahead.len()) as u64,
+            making: queue.making.len() as u64,
+            done: self.made.get(),
+            failed: self.failures.get(),
+        }
     }
 
     /// Bytes in the cache now.
@@ -470,6 +500,7 @@ impl Previews {
         let started = std::time::Instant::now();
         match self.make_set(id, &path, &key, settings.interval).await {
             Ok(meta) => {
+                self.made.inc();
                 tracing::info!(
                     %id,
                     tiles = meta.count,
@@ -481,6 +512,7 @@ impl Previews {
             }
             Err(_) if self.stopped.load(Ordering::SeqCst) => Ok(()),
             Err(reason) => {
+                self.failures.inc();
                 self.failed
                     .lock()
                     .expect("never poisoned")

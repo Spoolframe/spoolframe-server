@@ -1,6 +1,7 @@
 //! The app: routes and pages, laid out as the "Spoolframe UI" design's
 //! web boards draw them.
 
+mod activity;
 mod admin;
 mod catalog;
 mod catalog_item;
@@ -8,21 +9,25 @@ mod device;
 mod http;
 mod icons;
 mod libraries;
+mod logs;
 mod plex;
 mod profile;
 mod rpc;
 mod settings;
+mod telemetry;
 mod webauthn;
 mod wizard;
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{MeApiClient, PasswordChange, Role, UserInfo};
 
+use activity::ActivityPage;
 use admin::{AdminHome, Server, UserSessions, Users};
 use catalog::CatalogLibrary;
 use catalog_item::CatalogItem;
 use device::DeviceApproval;
 use libraries::{AddLibrary, Libraries};
+use logs::LogsPage;
 use plex::PlexSignedIn;
 use profile::Profile;
 use settings::{Settings, SettingsHome};
@@ -74,6 +79,11 @@ enum Route {
             UserSessions { username: String },
             #[route("/server")]
             Server {},
+            // Server's sub-pages (P3-14): what it does now, and its log.
+            #[route("/activity")]
+            ActivityPage {},
+            #[route("/logs")]
+            LogsPage {},
             #[route("/libraries")]
             Libraries {},
             // `back`: where Cancel and the back link go (the wizard's Plex
@@ -277,6 +287,11 @@ fn Wordmark(#[props(default)] class: String) -> Element {
 /// Now, in Unix seconds, by the browser's clock.
 fn now() -> i64 {
     (js_sys::Date::now() / 1000.0) as i64
+}
+
+/// Now, in Unix milliseconds, by the browser's clock.
+fn now_ms() -> i64 {
+    js_sys::Date::now() as i64
 }
 
 /// Whether the page is in a secure context: HTTPS, or `localhost`. Only
@@ -1102,6 +1117,8 @@ fn SignedIn(user: UserInfo) -> Element {
     let title = match route {
         Route::Profile {} => "My profile",
         Route::Server {} => "Server",
+        Route::ActivityPage {} => "Activity",
+        Route::LogsPage {} => "Logs",
         Route::Libraries {} | Route::AddLibrary { .. } => "Libraries",
         Route::CatalogLibrary { .. } | Route::CatalogItem { .. } => "Libraries",
         Route::Settings { .. } | Route::SettingsHome {} => "Settings",
@@ -1156,8 +1173,7 @@ fn SignedIn(user: UserInfo) -> Element {
                 nav { class: "flex flex-col gap-0.5",
                     {link(Route::Users {}, "Users and devices", false)}
                     {link(Route::Server {}, "Server", false)}
-                    {libraries_link(&route)}
-                    {settings_link(&route)}
+                    {server_links(&route)}
                     {link(Route::Profile {}, "My profile", true)}
                 }
                 div { class: "mt-auto flex items-center gap-2.5 rounded-[10px] bg-ctp-base p-2",
@@ -1196,8 +1212,7 @@ fn SignedIn(user: UserInfo) -> Element {
                 nav { class: "drawer md:hidden", aria_label: "Admin", onclick: move |_| menu.set(false),
                     {link(Route::Users {}, "Users and devices", false)}
                     {link(Route::Server {}, "Server", false)}
-                    {libraries_link(&route)}
-                    {settings_link(&route)}
+                    {server_links(&route)}
                     {link(Route::Profile {}, "My profile", true)}
                 }
             }
@@ -1218,32 +1233,48 @@ fn SignedIn(user: UserInfo) -> Element {
     }
 }
 
-/// Server › Libraries in the sidebar (P3-11): under Server, one step in.
-fn libraries_link(route: &Route) -> Element {
-    let here = matches!(
-        route,
-        Route::Libraries {}
-            | Route::AddLibrary { .. }
-            | Route::CatalogLibrary { .. }
-            | Route::CatalogItem { .. }
-    );
+/// Server's sub-pages in the sidebar, one step in: Activity and Logs
+/// (P3-14), Libraries (P3-11) and Settings. The boards also draw Playback here; it
+/// is P3-15's, and joins the list when that page exists.
+fn server_links(route: &Route) -> Element {
+    let pages = [
+        (
+            Route::ActivityPage {},
+            "Activity",
+            matches!(route, Route::ActivityPage {}),
+        ),
+        (
+            Route::LogsPage {},
+            "Logs",
+            matches!(route, Route::LogsPage {}),
+        ),
+        (
+            Route::Libraries {},
+            "Libraries",
+            matches!(
+                route,
+                Route::Libraries {}
+                    | Route::AddLibrary { .. }
+                    | Route::CatalogLibrary { .. }
+                    | Route::CatalogItem { .. }
+            ),
+        ),
+        (
+            Route::Settings {
+                tab: "server".into(),
+            },
+            "Settings",
+            matches!(route, Route::Settings { .. } | Route::SettingsHome {}),
+        ),
+    ];
     rsx! {
-        Link {
-            class: if here { "nav-link nav-link-here nav-sub" } else { "nav-link nav-sub" },
-            to: Route::Libraries {},
-            "Libraries"
-        }
-    }
-}
-
-/// Server › Settings in the sidebar: under Server, one step in.
-fn settings_link(route: &Route) -> Element {
-    let here = matches!(route, Route::Settings { .. } | Route::SettingsHome {});
-    rsx! {
-        Link {
-            class: if here { "nav-link nav-link-here nav-sub" } else { "nav-link nav-sub" },
-            to: Route::Settings { tab: "server".into() },
-            "Settings"
+        for (to, label, here) in pages {
+            Link {
+                key: "{label}",
+                class: if here { "nav-link nav-link-here nav-sub" } else { "nav-link nav-sub" },
+                to,
+                "{label}"
+            }
         }
     }
 }

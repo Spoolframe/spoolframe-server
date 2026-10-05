@@ -6,6 +6,7 @@ use dioxus::prelude::*;
 
 use super::Route;
 use super::admin::{Said, Toast, say};
+use super::telemetry::TelemetryForm;
 use super::wizard::{
     AccessForm, Mode, PathsForm, PlaybackForm, PlexForm, SecurityForm, ServerForm,
 };
@@ -18,6 +19,7 @@ const TABS: &[(&str, &str)] = &[
     ("playback", "Playback"),
     ("access", "Access"),
     ("security", "Security"),
+    ("telemetry", "Telemetry"),
 ];
 
 #[component]
@@ -53,6 +55,15 @@ pub fn Settings(tab: String) -> Element {
                     }
                 }
             }
+            // Telemetry is two cards, Prometheus and OpenTelemetry, as its
+            // board draws it.
+            if tab == "telemetry" {
+                div { class: "flex max-w-[800px] flex-col gap-4",
+                    for n in [saved()] {
+                        TelemetryForm { key: "{n}", on_done }
+                    }
+                }
+            } else {
             section { class: "card max-w-[800px]",
                 div { class: "card-body form gap-[18px]",
                     for n in [saved()] {
@@ -67,6 +78,7 @@ pub fn Settings(tab: String) -> Element {
                         }
                     }
                 }
+            }
             }
         }
         Toast { said: toast }

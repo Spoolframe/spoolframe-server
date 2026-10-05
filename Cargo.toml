@@ -133,6 +133,24 @@ libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Opt-in OpenTelemetry export over OTLP (P3-14), versions that go
+# together: opentelemetry 0.31 with tracing-opentelemetry 0.32. No default
+# features: the SDK's internal-logs would log through the very subscriber
+# that exports, and its thread-based batch processors would block the
+# runtime's threads at shutdown; the server queues and batches itself.
+# The metrics reader runs on tokio. gRPC (tonic) and HTTP/protobuf (on the
+# reqwest the server already has), both with TLS for an https endpoint.
+opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics", "logs", "rt-tokio", "experimental_metrics_periodicreader_with_async_runtime"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "http-proto", "reqwest-client", "trace", "metrics", "logs", "tls-ring", "tls-webpki-roots"] }
+tracing-opentelemetry = { version = "0.32", default-features = false }
+opentelemetry-appender-tracing = { version = "0.31", default-features = false }
+# The headers sent to a gRPC collector, and the test collector's server.
+tonic = { version = "0.14", default-features = false }
+# The test collector decodes what arrives.
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"] }
+prost = "0.14"
+
 # The client wire encoding (spoolframe-protocol): self-describing, so peers
 # skip fields and variants they do not know. See the P1-10 commit.
 ciborium = "0.2"

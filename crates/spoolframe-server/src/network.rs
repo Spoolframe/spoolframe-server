@@ -150,6 +150,9 @@ pub struct Services {
     /// on a server that links no Plex accounts.
     pub plex_accounts: Option<Arc<crate::plex_accounts::PlexAccounts>>,
     pub plex_sync: Option<Arc<crate::plex_sync::WatchSync>>,
+    /// What the client protocol counts, and where its parts are read
+    /// from for the metrics (P3-14).
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl std::fmt::Debug for Services {
@@ -245,6 +248,7 @@ impl Server {
             web_url: services.public_url.clone(),
         };
         let connections = Connections::default();
+        services.metrics.observe_services(&services, &connections);
         // Unknown ALPNs never get this far: the TLS handshake refuses them.
         let router = Router::builder(endpoint)
             .accept(

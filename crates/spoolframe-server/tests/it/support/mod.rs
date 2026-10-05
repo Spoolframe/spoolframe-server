@@ -684,6 +684,8 @@ pub struct TestServer {
     /// Users' Plex links (P3-12). Its plex.tv is an address nothing
     /// answers at: tests save links directly and never reach Plex.
     pub plex_accounts: Arc<spoolframe_server::plex_accounts::PlexAccounts>,
+    /// Its metrics (P3-14), read from its parts.
+    pub metrics: Arc<spoolframe_server::metrics::Metrics>,
 }
 
 impl TestServer {
@@ -779,6 +781,8 @@ impl TestServer {
             },
             None,
         ));
+        let metrics = Arc::new(spoolframe_server::metrics::Metrics::default());
+        metrics.observe_store(store.clone());
         let services = Services {
             auth: auth.clone(),
             public_url: options.public_url.clone(),
@@ -799,6 +803,7 @@ impl TestServer {
             app_passkeys: Arc::new(spoolframe_server::app_passkeys::AppPasskeys::with_lifetime(
                 options.passkey_lifetime,
             )),
+            metrics: metrics.clone(),
         };
         let endpoint = EndpointOptions {
             port: options.port,
@@ -819,6 +824,7 @@ impl TestServer {
             catalog: fake,
             dir,
             media,
+            metrics,
         }
     }
 

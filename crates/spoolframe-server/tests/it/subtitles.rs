@@ -170,8 +170,20 @@ async fn the_first_chunk_of_a_subtitle_still_being_read_is_not_ready() {
         matches!(response, Response::Err(Error::SubtitleNotReady { .. })),
         "{response:?}"
     );
+    // Waiting, or being read, counts in the queue (P3-14).
+    assert_eq!(ocr(&server, "spoolframe_ocr_queued", &[]), 1.0);
     client.close().await;
     server.stop().await;
+}
+
+/// A number from the server's metrics (P3-14).
+fn ocr(server: &TestServer, name: &str, labels: &[(&str, &str)]) -> f64 {
+    let families = server.metrics.families();
+    families
+        .iter()
+        .find(|f| f.name == name)
+        .and_then(|f| f.value(labels))
+        .unwrap_or_else(|| panic!("no {name}{labels:?}"))
 }
 
 #[tokio::test]
@@ -183,6 +195,14 @@ async fn a_pgs_track_is_read_as_text_and_the_file_still_plays_directly() {
     };
     assert_eq!(subtitle, read_as_srt());
     assert_eq!(text(&client, &session, &handle).await, SRT);
+    assert_eq!(
+        (
+            ocr(&server, "spoolframe_ocr_queued", &[]),
+            ocr(&server, "spoolframe_ocr_total", &[("outcome", "done")]),
+            ocr(&server, "spoolframe_subtitle_reads_total", &[]) > 0.0,
+        ),
+        (0.0, 1.0, true)
+    );
     client.close().await;
     server.stop().await;
 }

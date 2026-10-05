@@ -45,6 +45,10 @@ pub struct Live {
     pub oidc: Option<Arc<crate::oidc::Oidc>>,
     /// `admin.metrics` and `admin.metrics_from` (P3-14).
     pub metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// `logs.buffer_lines` (P3-14).
+    pub logs: Option<Arc<crate::logs::LogRing>>,
+    /// `telemetry.otlp.*` (P3-14).
+    pub telemetry: Option<Arc<crate::telemetry::Telemetry>>,
 }
 
 /// Why a change was not made.
@@ -214,6 +218,24 @@ impl RuntimeSettings {
         }
         let value = tree::get(merged, setting.key);
         let origin = layers.origin(setting.key);
+        if setting.write_only {
+            // Write-only (the OTLP headers): whether it is set, never what.
+            return SettingEntry {
+                key: setting.key.to_owned(),
+                value: None,
+                secret: true,
+                set: value.is_some(),
+                layer: origin.layer.map(|layer| match layer {
+                    Layer::Default => SettingLayer::Default,
+                    Layer::File => SettingLayer::File,
+                    Layer::Runtime => SettingLayer::Runtime,
+                }),
+                locked: origin.locked,
+                overrides: None,
+                apply,
+                restart_pending: false,
+            };
+        }
         SettingEntry {
             key: setting.key.to_owned(),
             value: value.map(Value::to_json),
@@ -260,7 +282,12 @@ impl RuntimeSettings {
                 message,
             })
         })?;
-        let shown = value.to_ucl();
+        // The OTLP headers may carry a collector's key: never logged.
+        let shown = if settings::setting(key).is_some_and(|s| s.write_only) {
+            "(not shown)".to_owned()
+        } else {
+            value.to_ucl()
+        };
         self.change(key, by, |layers| layers.with_set(key, value))?;
         tracing::info!(by, key, value = shown, "setting changed");
         Ok(self.entry_for(key).expect("a known setting"))
@@ -385,6 +412,12 @@ impl RuntimeSettings {
         if let (Some(metrics), Ok(from)) = (&live.metrics, config.admin.metrics_from()) {
             metrics.access().set(config.admin.metrics(), from);
         }
+        if let (Some(logs), Ok(lines)) = (&live.logs, config.logs.buffer_lines()) {
+            logs.set_capacity(lines);
+        }
+        if let (Some(telemetry), Ok(otlp)) = (&live.telemetry, config.telemetry.otlp.settings()) {
+            telemetry.apply(otlp);
+        }
         if let (Some(watch), Ok(rules)) = (&live.watch, config.watch.rules()) {
             let mut now = watch.rules();
             now.started_after = rules.started_after;
@@ -421,6 +454,17 @@ impl RuntimeSettings {
             Some(plex) => layers.plex_token(plex, &self.secrets).ok().flatten(),
             None => self.secrets.get(PLEX_TOKEN_SECRET).ok().flatten(),
         }
+    }
+
+    /// The UDP port Plex's discovery searches from now
+    /// (`network.plex_discovery_port`): read at each search, so a change
+    /// applies to the next one.
+    pub fn plex_discovery_port(&self) -> u16 {
+        self.layers()
+            .config()
+            .map_or(spoolframe_plex::gdm::PORT, |c| {
+                c.network.plex_discovery_port()
+            })
     }
 
     /// This installation's id at plex.tv, which a PIN is bound to: made
@@ -637,6 +681,57 @@ mod tests {
         assert!(!metrics.access().allows("127.0.0.1".parse().unwrap()));
         settings.unset("admin.metrics", "root").unwrap();
         assert!(!metrics.access().enabled());
+    }
+
+    #[tokio::test]
+    async fn otlp_headers_are_never_logged_shown_or_returned() {
+        let (settings, _dir) = settings(None).await;
+        let (logged, _guard) = {
+            let ring = Arc::new(crate::logs::LogRing::default());
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let subscriber =
+                tracing_subscriber::registry().with(crate::logs::RingLayer(ring.clone()));
+            (ring, tracing::subscriber::set_default(subscriber))
+        };
+        settings
+            .set(
+                "telemetry.otlp.headers",
+                &serde_json::json!("authorization=Bearer s3cr3t"),
+                "root",
+            )
+            .unwrap();
+        let page = logged.page(&Default::default());
+        assert!(
+            page.lines
+                .iter()
+                .any(|l| l.text.contains("telemetry.otlp.headers")),
+            "{page:?}"
+        );
+        assert!(
+            page.lines.iter().all(|l| !l.text.contains("s3cr3t")),
+            "{page:?}"
+        );
+        // Nor returned, nor shown: only that it is set.
+        let entry = settings.entry_for("telemetry.otlp.headers").unwrap();
+        assert!(entry.set && entry.secret && entry.value.is_none());
+        let all = serde_json::to_string(&settings.settings()).unwrap();
+        assert!(!all.contains("s3cr3t"), "{all}");
+        let shown = settings.layers().show(settings.secrets());
+        assert!(shown.contains("telemetry.otlp.headers = (set);"), "{shown}");
+        assert!(!shown.contains("s3cr3t"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn the_log_buffer_follows_its_size_at_once() {
+        let (mut settings, _dir) = settings(None).await;
+        let logs = Arc::new(crate::logs::LogRing::default());
+        settings.live.logs = Some(logs.clone());
+        settings
+            .set("logs.buffer_lines", &serde_json::json!(50), "root")
+            .unwrap();
+        assert_eq!(logs.capacity(), 50);
+        settings.unset("logs.buffer_lines", "root").unwrap();
+        assert_eq!(logs.capacity(), 5000);
     }
 
     #[tokio::test]

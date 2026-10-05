@@ -135,6 +135,11 @@ impl fmt::Debug for PlexResource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlexConnection {
     pub uri: String,
+    /// The address and port `uri` stands for, as plex.tv says them: a
+    /// plex.direct name's LAN address, which is how the server is found
+    /// on the LAN.
+    pub address: Option<String>,
+    pub port: Option<u16>,
     /// On the server's own network.
     pub local: bool,
     /// Through Plex's relay: slow, and never what Spoolframe reads from.
@@ -159,6 +164,10 @@ struct ResourceReply {
 #[derive(Deserialize)]
 struct ConnectionReply {
     uri: String,
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
     #[serde(default)]
     local: bool,
     #[serde(default)]
@@ -327,6 +336,8 @@ impl PlexTv {
                     .into_iter()
                     .map(|c| PlexConnection {
                         uri: c.uri,
+                        address: c.address,
+                        port: c.port,
                         local: c.local,
                         relay: c.relay,
                     })

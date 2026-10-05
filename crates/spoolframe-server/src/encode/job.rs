@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 
 use super::JobLimits;
 use super::args::PLAYLIST;
+use crate::metrics::Counter;
 
 /// How often a job looks at its output.
 const POLL: Duration = Duration::from_millis(200);
@@ -118,6 +119,33 @@ pub struct Jobs {
     /// How many jobs that encode a stream run now: frame previews made
     /// ahead wait while any does (P3-13).
     encoding: Encoding,
+    /// Every job started and not yet dropped, to count (P3-14).
+    live: std::sync::Mutex<Vec<std::sync::Weak<EncodeJob>>>,
+    counters: Arc<JobCounters>,
+}
+
+/// What the jobs did since the server started (P3-14).
+#[derive(Debug, Default)]
+struct JobCounters {
+    /// Starts refused for want of a free place: there is no queue.
+    refused: Counter,
+    /// ffmpeg runs ended for making no progress.
+    stalled: Counter,
+    /// Media time encoded, in ms, by every job.
+    output_ms: Counter,
+}
+
+/// The jobs now (P3-14).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct JobCounts {
+    /// Jobs whose ffmpeg runs (paused or not).
+    pub running: u64,
+    /// Of those, the ones held back for their reader.
+    pub paused: u64,
+    pub refused: u64,
+    pub stalled: u64,
+    /// Seconds of media encoded since the server started.
+    pub output_seconds: f64,
 }
 
 /// How many encodes (a stream decoded and encoded again, not only copied
@@ -181,6 +209,8 @@ impl Jobs {
             })),
             scratch_check: Arc::default(),
             encoding: Encoding::default(),
+            live: std::sync::Mutex::default(),
+            counters: Arc::default(),
             limits: std::sync::RwLock::new(limits),
             dir,
             ffmpeg,
@@ -218,6 +248,27 @@ impl Jobs {
         self.encoding.clone()
     }
 
+    /// The jobs now, and what they did (P3-14).
+    pub fn counts(&self) -> JobCounts {
+        let jobs: Vec<Arc<EncodeJob>> = {
+            let mut live = self.live.lock().expect("never held across a panic");
+            live.retain(|job| job.strong_count() > 0);
+            live.iter().filter_map(std::sync::Weak::upgrade).collect()
+        };
+        // Dropped outside the lock: the last hold of a job removes its files.
+        let running: Vec<_> = jobs
+            .iter()
+            .filter(|job| job.progress.borrow().done.is_none() && !job.task.is_finished())
+            .collect();
+        JobCounts {
+            running: running.len() as u64,
+            paused: running.iter().filter(|job| job.paused()).count() as u64,
+            refused: self.counters.refused.get(),
+            stalled: self.counters.stalled.get(),
+            output_seconds: self.counters.output_ms.get() as f64 / 1000.0,
+        }
+    }
+
     /// Run ffmpeg with `args` into `dir` (created), which the job owns and
     /// removes when dropped. It runs in `slot`, the place of the job it
     /// replaces, or takes a free one. One that `encodes` counts in
@@ -239,8 +290,14 @@ impl Jobs {
     ) -> Result<Arc<EncodeJob>, JobError> {
         let slot = match slot {
             Some(slot) => slot,
-            None => Slot {
-                _place: Arc::new(Place::take(&self.places).ok_or(JobError::Busy)?),
+            None => match Place::take(&self.places) {
+                Some(place) => Slot {
+                    _place: Arc::new(place),
+                },
+                None => {
+                    self.counters.refused.inc();
+                    return Err(JobError::Busy);
+                }
             },
         };
         let slot = Arc::new(std::sync::Mutex::new(Some(slot)));
@@ -276,13 +333,14 @@ impl Jobs {
             shared: shared.clone(),
             slot: slot.clone(),
             progress: progress_tx,
+            counters: self.counters.clone(),
             _encoding: encodes.then(|| self.encoding.begin()),
         };
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
         let task = tokio::spawn(supervisor.run(child, stdout, stderr));
         tracing::debug!(pid, dir = %dir.display(), epoch, "encode started");
-        Ok(Arc::new(EncodeJob {
+        let job = Arc::new(EncodeJob {
             epoch,
             first_segment,
             pid,
@@ -291,7 +349,11 @@ impl Jobs {
             shared,
             task,
             slot,
-        }))
+        });
+        let mut live = self.live.lock().expect("never held across a panic");
+        live.retain(|job| job.strong_count() > 0);
+        live.push(Arc::downgrade(&job));
+        Ok(job)
     }
 }
 
@@ -436,6 +498,7 @@ struct Supervisor {
     /// The job's slot, let go of when a stalled ffmpeg is ended.
     slot: Arc<std::sync::Mutex<Option<Slot>>>,
     progress: watch::Sender<Progress>,
+    counters: Arc<JobCounters>,
     /// Counted as encoding for as long as the supervisor runs: until
     /// ffmpeg exits, is ended as stalled, or the job is stopped (which
     /// aborts the supervisor).
@@ -462,6 +525,9 @@ impl Supervisor {
         // With `-copyts` a run started at a seek reports the film's own
         // time, from where it started.
         let base_ms = self.start_ms;
+        // The furthest media time counted as output (P3-14): from where the
+        // run started, never twice.
+        let mut counted_ms = base_ms;
         let mut tick = tokio::time::interval(POLL);
         let mut out_open = true;
         let mut err_open = true;
@@ -475,6 +541,10 @@ impl Supervisor {
                             && let Ok(us) = us.trim().parse::<u64>()
                         {
                             encoded_ms = us / 1000;
+                            if encoded_ms > counted_ms {
+                                self.counters.output_ms.add(encoded_ms - counted_ms);
+                                counted_ms = encoded_ms;
+                            }
                         }
                     }
                     _ => out_open = false,
@@ -515,6 +585,7 @@ impl Supervisor {
                             "an encode stalled"
                         );
                         self.slot.lock().expect("never poisoned").take();
+                        self.counters.stalled.inc();
                         self.finish(Err(format!(
                             "the conversion stalled: ffmpeg made no progress for {:?}",
                             self.stalled_after
@@ -888,6 +959,36 @@ mod tests {
         let progress = job.progress().borrow().clone();
         assert_eq!(progress.bytes, 10);
         assert_eq!(progress.encoded_ms, 4000);
+        let counts = jobs.counts();
+        assert_eq!(counts.output_seconds, 4.0);
+        assert_eq!(counts.running, 0);
+    }
+
+    /// A run started at a seek reports the film's own time: only what it
+    /// encoded from there is output (P3-14).
+    #[tokio::test]
+    async fn output_is_counted_from_where_the_run_started() {
+        let (jobs, _dir) = jobs(
+            "output-from-seek",
+            "echo out_time_us=61000000; echo out_time_us=63500000",
+            2,
+            Duration::from_secs(60),
+        )
+        .await;
+        let job = jobs
+            .start(
+                jobs.dir().join("h/0"),
+                Vec::new(),
+                Written::Hls,
+                false,
+                0,
+                0,
+                60_000,
+                None,
+            )
+            .unwrap();
+        done(&job).await.unwrap();
+        assert_eq!(jobs.counts().output_seconds, 3.5);
     }
 
     #[tokio::test]
@@ -919,6 +1020,8 @@ mod tests {
             ),
             Err(JobError::Busy)
         ));
+        let counts = jobs.counts();
+        assert_eq!((counts.running, counts.refused), (1, 1));
         first.stop();
         jobs.start(
             scratch.join("b/0"),
@@ -1046,6 +1149,8 @@ mod tests {
         .await
         .expect("not paused");
         assert!(job.paused());
+        let counts = jobs.counts();
+        assert_eq!((counts.running, counts.paused), (1, 1));
         // The reader is at 95 of 100 bytes: 57 s of 60, 3 s behind.
         job.read_to(95);
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1213,6 +1318,8 @@ mod tests {
             "the conversion stalled: ffmpeg made no progress for 500ms"
         );
         assert!(!alive(pid), "ffmpeg {pid} still runs");
+        let counts = jobs.counts();
+        assert_eq!((counts.running, counts.stalled), (0, 1));
         // The job is still held, as by a playback not yet stopped: its
         // slot, the only one, is free.
         jobs.start(

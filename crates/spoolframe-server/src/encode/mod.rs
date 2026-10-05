@@ -198,6 +198,12 @@ impl Conversion {
         }))
     }
 
+    /// Whether it decodes and encodes a stream again, rather than only
+    /// copying them into another container (P3-14's plans).
+    pub fn encodes(&self) -> bool {
+        encodes(self.video, self.audio)
+    }
+
     /// For HLS, the segments.
     pub fn segments(&self) -> Option<&Segments> {
         self.segments.as_ref()

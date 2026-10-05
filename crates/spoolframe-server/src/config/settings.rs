@@ -18,6 +18,9 @@ pub struct Setting {
     /// Kept in a file of its own under the state directory, never in a
     /// layer, and never shown: only whether it is set.
     pub secret: bool,
+    /// Kept in the layers, but its value never logged, shown or returned:
+    /// only whether it is set. It may carry a key (P3-14's OTLP headers).
+    pub write_only: bool,
 }
 
 const fn live(key: &'static str) -> Setting {
@@ -25,6 +28,7 @@ const fn live(key: &'static str) -> Setting {
         key,
         apply: Apply::Live,
         secret: false,
+        write_only: false,
     }
 }
 
@@ -33,6 +37,7 @@ const fn restart(key: &'static str) -> Setting {
         key,
         apply: Apply::Restart,
         secret: false,
+        write_only: false,
     }
 }
 
@@ -48,6 +53,7 @@ pub const SETTINGS: &[Setting] = &[
         key: PLEX_TOKEN,
         apply: Apply::Live,
         secret: true,
+        write_only: true,
     },
     live("plex.name"),
     live("plex.token_file"),
@@ -59,6 +65,7 @@ pub const SETTINGS: &[Setting] = &[
     restart("network.port"),
     restart("network.relay"),
     restart("network.mdns"),
+    live("network.plex_discovery_port"),
     restart("admin.listen"),
     restart("admin.public_url"),
     restart("admin.trusted_proxies"),
@@ -85,6 +92,18 @@ pub const SETTINGS: &[Setting] = &[
     live("previews.interval_secs"),
     live("previews.cache_mb"),
     live("previews.workers"),
+    live("logs.buffer_lines"),
+    live("telemetry.otlp.endpoint"),
+    live("telemetry.otlp.protocol"),
+    Setting {
+        key: "telemetry.otlp.headers",
+        apply: Apply::Live,
+        secret: false,
+        write_only: true,
+    },
+    live("telemetry.otlp.traces"),
+    live("telemetry.otlp.metrics"),
+    live("telemetry.otlp.logs"),
 ];
 
 /// The setting called `key`, if there is one.

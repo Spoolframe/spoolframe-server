@@ -1441,3 +1441,155 @@
   series: `spoolframe_process_uptime_seconds`,
   `spoolframe_process_resident_memory_bytes` and
   `spoolframe_process_open_files` (the last two on Linux).
+- Metrics (P3-14), the server's parts, read when scraped:
+  `spoolframe_connections_open{kind="app"|"web"}` (Iroh connections,
+  admin API sockets); `spoolframe_sessions{user="local:<uuid>",kind}`
+  (live sessions, read from the database every 10 s);
+  `spoolframe_playbacks_active{plan="direct"|"remux"|"transcode"}`,
+  `spoolframe_playbacks_started_total`, `spoolframe_playbacks_ended_total`,
+  `spoolframe_playback_errors_total{error="expired"|"failed"}`;
+  `spoolframe_conversions_running`, `spoolframe_conversions_paused`,
+  `spoolframe_conversions_refused_total` (over `transcode.max_jobs`: jobs
+  have no queue), `spoolframe_conversions_stalled_total`,
+  `spoolframe_conversion_output_seconds_total`;
+  `spoolframe_media_reads_total`, `spoolframe_media_read_bytes_total`,
+  `spoolframe_artwork_requests_total`, `spoolframe_artwork_cache_hits_total`,
+  `spoolframe_subtitle_reads_total`; per Plex server (its id)
+  `spoolframe_plex_requests_total`, `spoolframe_plex_errors_total` (a 404
+  is not one) and the histogram `spoolframe_plex_request_duration_seconds`;
+  `spoolframe_plex_sync_runs_total{outcome="ok"|"failed"}`;
+  `spoolframe_previews_queued{state="waiting"|"making"}`,
+  `spoolframe_previews_total{outcome="done"|"failed"}`,
+  `spoolframe_ocr_queued`, `spoolframe_ocr_total{outcome}`.
+- `spoolframe-plex`: `PlexCatalog::request_counts()`, every request to
+  one PMS counted and timed, across the views made of its catalog.
+- Tracing spans `client request` (the request's type), `plex request`
+  (the path) and `plex sync run` (the user as `local:<uuid>`): log lines
+  inside them name them.
+- Admin API `admin.activity` (P3-14), admins only (`FORBIDDEN`
+  otherwise), for the web UI's Server › Activity page: `now` and the
+  last hour's `history` of `ActivityPoint`s (connections, playbacks by
+  plan, encodes running and paused, output seconds per second, MEDIA
+  reads and bytes per second, artwork requests per second and hit rate,
+  subtitle reads, Plex requests and errors per second, previews and OCR
+  queued, memory, open files), sampled every 10 s and kept in memory
+  only; `totals` since start; each Plex server's requests, errors and
+  mean latency; and each user's live sessions. A page polls it.
+- The last log lines in memory (P3-14), for the web UI's Server › Logs
+  page: `logs.buffer_lines` (default 5000, 1 to 100000, live) lines at
+  the level the server logs at, as stderr has them (spans, message,
+  fields). Admin API `admin.logs(query)`, admins only: the last lines,
+  or with `after` the ones since a page's cursor (`next`), at least as
+  severe as `level` and containing `text` in any case; `missed` says
+  lines were dropped before they were asked for. A page follows new
+  lines by polling with the cursor.
+- OpenTelemetry export (P3-14), opt-in: `telemetry { otlp { endpoint;
+  protocol = "grpc" | "http"; headers; traces; metrics; logs; } }`, off
+  without an endpoint, a live setting. The server's spans (a client
+  request, a Plex request, a sync run), its log records at the level it
+  logs at, and every metric of `GET /metrics` (counters without `_total`,
+  the Plex latency histogram as its `_sum` and `_count`) go to the
+  collector, each with the resource `service.name = spoolframe-server`,
+  `service.version`, `spoolframe.server.name` and
+  `spoolframe.server.endpoint_id`. `headers` (`name=value`,
+  comma-separated) is write-only: never logged, shown or returned, only
+  whether it is set. Spans and log records are queued (2048 each) and
+  exported in batches by tasks of their own; a full queue drops and counts
+  (`spoolframe_telemetry_dropped_total{signal}`), a failed export is
+  counted (`spoolframe_telemetry_export_failures_total{signal}`) and
+  logged at WARN at most once a minute. What is queued is exported when
+  the server stops. Built on opentelemetry 0.31, opentelemetry-otlp 0.31,
+  tracing-opentelemetry 0.32 and opentelemetry-appender-tracing 0.31.
+- Admin API `admin.telemetryStatus`, admins only, for Settings ›
+  Telemetry: the export's endpoint, signals and header names, when an
+  export last went through, what was dropped since when, the last error;
+  the resource attributes; whether `GET /metrics` is on, and the
+  addresses refused it in the last hour with their counts.
+- Web UI: Server › Activity (`/admin/activity`, P3-14). A card each for
+  playbacks (direct, remux, transcode; started, ended, expired, failed),
+  conversions (paused by the throttle, output speed, refused at the job
+  limit, stalls ended), media reads (bytes, range, subtitle and artwork
+  reads, artwork cache hits), connections (apps, web, sessions per
+  user), Plex (requests a minute; each server's requests, errors and
+  mean latency; watch sync runs), background work (previews and OCR
+  queued, done, failed), the process (memory, open files, uptime,
+  version) and the telemetry export (on or off). Each has its number now
+  and a graph of the last hour, drawn against the hour, so after a
+  restart it starts part-way. The page asks `admin.activity` every 5 s,
+  says "Live · updated N s ago", and Pause stops it asking. On a phone,
+  two small cards a row with the number and the graph only. The sidebar
+  has Activity under Server, before Libraries and Settings.
+- Web UI: Server › Logs (`/admin/logs`, P3-14): the server's last log
+  lines from `admin.logs`, oldest first, in mono with WARN and ERROR
+  tinted, each with its local time, level, target (its last part; the
+  whole on hover) and text. DEBUG+, INFO+ (the default), WARN+ and ERROR
+  pick the least severe level shown, and the text filter (applied as
+  typing stops) any text or target; the server filters both. The page
+  follows new lines by asking every 2 s after the cursor it was given,
+  keeping the newest in sight; Pause holds new lines back and says how
+  many ("Paused · 4 new lines"), and Follow shows them. Lines dropped
+  before they were asked for are said. Download saves the lines shown as
+  a text file made in the browser, times in UTC. The page keeps as many
+  lines as the server does (`logs.buffer_lines`). The sidebar has Logs
+  under Server, after Activity.
+- Web UI: Settings › Telemetry (P3-14), two cards. Prometheus: "Serve
+  /metrics" (`admin.metrics`) with its address on the admin listener,
+  and Allowed from (`admin.metrics_from`) as chips: loopback is always
+  there and cannot be removed, "Add an address" takes an address or a
+  CIDR range and refuses anything else, and an address refused in the
+  last hour is named with its count and "Allow <address>". OpenTelemetry:
+  "Export with OTLP" (off is no `telemetry.otlp.endpoint`), the
+  endpoint, gRPC or HTTP, the headers by name only with their values
+  masked (Replace the headers, typing every value again, or Remove
+  them; a value is never shown or read back), Traces, Metrics and Logs,
+  and the resource attributes every export carries. Under it, how the
+  export is going, asked every 5 s: "Exporting · last batch N s ago · N
+  dropped"; the collector unreachable or failing ("N dropped since
+  HH:MM. Trying again every N s." and Try now, which asks again); or
+  refused, named with the collector's answer and the headers to check.
+  Discard and Save, as the other tabs; it all applies when saved. The
+  Activity page links there, and its Telemetry card says how the export
+  is going.
+- Plex discovery is answered through a host firewall (P3-10). The
+  wizard's search for Plex servers (GDM) went out from a random port, and
+  each Plex server's unicast answer to it was dropped by the host's
+  firewall, which cannot match an answer to a search sent to a multicast
+  group or the broadcast address: no server was ever found on a host
+  with a firewall. The search is now sent from a fixed UDP port,
+  `network.plex_discovery_port` (default 32415: past Plex's own
+  32410-32414, which a Plex server on the same host holds), which the
+  firewall can open. The setting is live: the next search uses it. A
+  port another program holds is given up for any free one, with a
+  warning that answers to it may be dropped; 0 is any free port.
+  Searches take turns, since two on one port would each get only some
+  of the answers.
+- NixOS module: `services.spoolframe.plexDiscovery.enable` (default
+  true) and `.port` (default 32415) (P3-10). Enabled, the provided file
+  sets `network.plex_discovery_port` to the port and, when the host's
+  firewall is on, `networking.firewall.allowedUDPPorts` gets it, so
+  the wizard's search for Plex servers is answered through the
+  firewall. A host that runs the server without the module opens the
+  port itself: `networking.firewall.allowedUDPPorts = [ 32415 ];`.
+- Sign in with Plex in the setup wizard offers the account's servers
+  (P3-10, P3-11). The wizard's Plex step listed only what discovery
+  found and a typed address, so after signing in a user's own servers
+  (or ones shared with them) were not offered. Now, once the PIN is
+  approved, the step asks plex.tv for the account's servers and lists
+  them as "From your Plex account", after the ones found on this
+  network: each server once, one both found and listed being matched by
+  Plex's machine identifier (GDM's `Resource-Identifier`, now
+  `DiscoveredPlex.machineId`) or its address, and read at the address
+  discovery found. A server reached only through Plex's relay is left
+  out; a remote one carries "Remote · its files must be mounted here"
+  and is never chosen for the admin. `admin.plexAccountServers` falls
+  back to the account the wizard signed in with when the caller has
+  linked none (kept in memory, so a restart asks for a new sign-in).
+  `admin.plexProbe` and `plexServerAdd` use that account's token for a
+  server too, and the new `admin.plexAccountTokenUse(url)` keeps, as
+  `plex.token`, the token plex.tv gives the account for the server at
+  `url`, which a server shared with the account needs: the wizard
+  calls it when one of the account's servers is chosen. A server is
+  matched to its plex.tv entry by a connection's URL or by the address
+  and port plex.tv says a plex.direct name stands for. Wire change:
+  `DiscoveredPlex.machineId` is always sent (null when a server's
+  answer has none).

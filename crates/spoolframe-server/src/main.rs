@@ -18,6 +18,7 @@ use spoolframe_server::config::secrets::Secrets;
 use spoolframe_server::config::{ServerConfig, WatchSyncConfig};
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
+use spoolframe_server::logs::{LogRing, RingLayer};
 use spoolframe_server::metrics::Metrics;
 use spoolframe_server::network::{Server, ServerName, Services};
 use spoolframe_server::oidc::Oidc;
@@ -28,10 +29,13 @@ use spoolframe_server::previews::{self, PreviewSources, Previews};
 use spoolframe_server::runtime::{self, Live, RuntimeSettings};
 use spoolframe_server::store::Store;
 use spoolframe_server::subtitles::Subtitles;
+use spoolframe_server::telemetry::{OtelLayer, Swap, Telemetry};
 use spoolframe_server::transcode::{self, Transcoding};
 use spoolframe_server::watch::Watch;
 use spoolframe_types::MediaId;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 mod admin_cli;
 
@@ -191,9 +195,22 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| EnvFilter::new(level));
     // Logs go to stderr: stdout is the output of `id`, `media probe` and
     // `plex check-paths`, and must stay parseable.
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+    // And into memory for the web UI's Logs page (P3-14): the same lines,
+    // under the same filter.
+    let ring = Arc::new(LogRing::default());
+    // And, once telemetry.otlp names a collector, to it (P3-14): a slot
+    // filled and emptied as the setting changes.
+    let (otlp, slot) = tracing_subscriber::reload::Layer::new(None::<OtelLayer>);
+    let swap: Swap = Box::new(move |layer| {
+        if let Err(e) = slot.reload(layer) {
+            tracing::warn!(error = %e, "cannot change the OTLP export's layer");
+        }
+    });
+    tracing_subscriber::registry()
+        .with(otlp)
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(RingLayer(ring.clone()))
         .init();
 
     if let Some(Command::Config {
@@ -220,7 +237,7 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        None => run(&config, &layers, state_dir).await,
+        None => run(&config, &layers, state_dir, ring, swap).await,
         Some(Command::Config {
             command: ConfigCommand::Defaults,
         }) => unreachable!("printed before the layers are read"),
@@ -302,13 +319,21 @@ async fn probe(catalog: &dyn Catalog, id: &MediaId, ffprobe: PathBuf) -> Result<
 }
 
 /// Run the server until SIGINT or SIGTERM.
-async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result<()> {
+async fn run(
+    config: &ServerConfig,
+    layers: &Layers,
+    state_dir: &Path,
+    logs: Arc<LogRing>,
+    swap: Swap,
+) -> Result<()> {
+    logs.set_capacity(config.logs.buffer_lines()?);
     // Before anything is logged: whatever waits for "listening" (a service
     // manager, the CLI tests) may send SIGTERM the moment it sees it, and a
     // signal with no handler yet kills the process instead of stopping it.
     let shutdown = shutdown_signal()?;
     // The key first: if it cannot be loaded nothing else should start.
     let key = identity::load_or_create(state_dir)?;
+    let endpoint_id = key.public().to_string();
     // What a person compares with a client's screen before pinning (P1-21).
     tracing::info!(
         server = config.server_name(),
@@ -458,9 +483,18 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
     let supervised = std::env::var_os("SPOOLFRAME_SUPERVISED").is_some_and(|v| !v.is_empty());
     // GET /metrics (P3-14): its settings are live.
     let metrics = Arc::new(Metrics::default());
+    let telemetry = Arc::new(Telemetry::new(
+        swap,
+        metrics.clone(),
+        name.clone(),
+        endpoint_id.clone(),
+    ));
+    telemetry.apply(config.telemetry.otlp.settings()?);
     metrics
         .access()
         .set(config.admin.metrics(), config.admin.metrics_from()?);
+    metrics.observe_catalog(live.clone());
+    metrics.spawn_sampler();
     let settings = Arc::new(RuntimeSettings::new(
         layers.clone(),
         state_dir,
@@ -473,6 +507,8 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             previews: Some(previews.clone()),
             oidc: Some(oidc.clone()),
             metrics: Some(metrics.clone()),
+            logs: Some(logs.clone()),
+            telemetry: Some(telemetry.clone()),
         },
         supervised,
     ));
@@ -496,6 +532,8 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             watch: Some(watch.clone()),
             artwork: Some(artwork.clone()),
             metrics: Some(metrics.clone()),
+            logs: Some(logs),
+            telemetry: Some(telemetry.clone()),
         },
         admin_origins,
         admin_proxies,
@@ -531,6 +569,7 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             jobs,
             subtitles,
             previews,
+            metrics,
         },
     )
     .await?;
@@ -547,6 +586,8 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
     server.shutdown().await;
     let _ = admin.stop();
     admin.stopped().await;
+    // What is queued for the collector goes before the process does.
+    telemetry.shutdown().await;
     if restart {
         // Not a success: systemd's Restart=on-failure starts it again.
         std::process::exit(RESTART_EXIT);

@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use spoolframe_admin_api::{PlexAccountServer, PlexLink};
-use spoolframe_plex::account::{AccountError, Pin, PinState, PlexResource, PlexTv};
+use spoolframe_plex::account::{AccountError, Pin, PinState, PlexConnection, PlexResource, PlexTv};
 use url::Url;
 
 use crate::config::ServerConfig;
@@ -331,6 +331,22 @@ fn same_url(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
+/// `url` is `connection`: its address, or the address and port plex.tv
+/// says its plex.direct name stands for (where discovery finds it).
+fn reaches(connection: &PlexConnection, url: &str) -> bool {
+    if same_url(&connection.uri, url) {
+        return true;
+    }
+    let (Some(address), Some(port)) = (&connection.address, connection.port) else {
+        return false;
+    };
+    Url::parse(url.trim()).is_ok_and(|u| {
+        u.host_str()
+            .is_some_and(|h| h.trim_start_matches('[').trim_end_matches(']') == address)
+            && u.port_or_known_default() == Some(port)
+    })
+}
+
 /// The account's servers as the add-a-library flow lists them, each marked
 /// with the id it is added under among `configured` (id, URL), if it is.
 pub fn account_servers(
@@ -364,14 +380,12 @@ pub fn account_servers(
 pub fn token_for_url(resources: &[PlexResource], url: &str) -> Option<String> {
     resources
         .iter()
-        .find(|r| r.connections.iter().any(|c| same_url(&c.uri, url)))
+        .find(|r| r.connections.iter().any(|c| reaches(c, url)))
         .and_then(|r| r.access_token.clone())
 }
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_plex::account::PlexConnection;
-
     use super::*;
 
     fn resource(name: &str, connections: &[(&str, bool, bool)]) -> PlexResource {
@@ -384,6 +398,8 @@ mod tests {
                 .iter()
                 .map(|&(uri, local, relay)| PlexConnection {
                     uri: uri.into(),
+                    address: None,
+                    port: None,
                     local,
                     relay,
                 })
@@ -422,6 +438,23 @@ mod tests {
             Some("tok-cabin")
         );
         assert_eq!(token_for_url(&resources, "http://nas:32400"), None);
+    }
+
+    #[test]
+    fn a_server_found_on_the_lan_gets_the_token_of_the_plex_direct_name_for_its_address() {
+        let mut tower = resource(
+            "Tower",
+            &[("https://10-0-0-2.abc.plex.direct:32400", true, false)],
+        );
+        tower.connections[0].address = Some("10.0.0.2".into());
+        tower.connections[0].port = Some(32400);
+        let resources = [tower];
+        assert_eq!(
+            token_for_url(&resources, "http://10.0.0.2:32400").as_deref(),
+            Some("tok-tower")
+        );
+        assert_eq!(token_for_url(&resources, "http://10.0.0.2:32401"), None);
+        assert_eq!(token_for_url(&resources, "http://10.0.0.3:32400"), None);
     }
 
     #[test]

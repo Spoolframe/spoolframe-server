@@ -62,6 +62,7 @@
     network {
       port = ${toString cfg.port};
       mdns = ${lib.boolToString cfg.mdns};
+      ${lib.optionalString cfg.plexDiscovery.enable "plex_discovery_port = ${toString cfg.plexDiscovery.port};"}
     }
     admin {
       ${lib.optionalString (cfg.admin.listen != null) "listen = ${quote cfg.admin.listen};"}
@@ -186,6 +187,33 @@ in {
       type = lib.types.bool;
       default = true;
       description = "Announce the server on the LAN, so clients list it.";
+    };
+
+    plexDiscovery = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Let the setup wizard find Plex servers on the LAN through this
+          host's firewall. Plex's discovery (GDM) is a search sent to a
+          multicast group and the broadcast address; each Plex server
+          answers to the port it came from, and the firewall drops that
+          answer, since it cannot match it to a multicast search. This sends
+          the search from {option}`plexDiscovery.port` and opens that UDP
+          port when the firewall is on. Off, neither: the server's own
+          setting applies, and with a firewall on, discovery finds nothing
+          (a server's address can still be typed).
+        '';
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 32415;
+        description = ''
+          The UDP port the search is sent from and answered on. Not one of
+          Plex's own (32410-32414), which a Plex server on this host holds.
+        '';
+      };
     };
 
     openFirewall = lib.mkOption {
@@ -360,9 +388,12 @@ in {
     environment.etc."spoolframe/server.ucl".source = configFile;
     environment.systemPackages = [cli];
 
-    networking.firewall = lib.mkIf cfg.openFirewall {
-      allowedUDPPorts = [cfg.port] ++ lib.optional cfg.mdns 5353;
-    };
+    networking.firewall.allowedUDPPorts = lib.mkMerge [
+      (lib.mkIf cfg.openFirewall ([cfg.port] ++ lib.optional cfg.mdns 5353))
+      # Answers to the wizard's search for Plex servers: unicast replies
+      # to a multicast send, which the firewall cannot track.
+      (lib.mkIf (cfg.plexDiscovery.enable && config.networking.firewall.enable) [cfg.plexDiscovery.port])
+    ];
 
     users.users.spoolframe = {
       isSystemUser = true;

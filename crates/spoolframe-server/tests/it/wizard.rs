@@ -310,3 +310,153 @@ async fn the_paths_step_checks_unsaved_mappings_and_suggests_one() {
         .unwrap_err();
     assert_eq!(code(relative), error_code::INVALID_INPUT);
 }
+
+/// A stand-in PMS answering GDM on loopback, saying from which port each
+/// search came.
+async fn gdm_stand_in() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<u16>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let at = socket.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 256];
+        loop {
+            let (_, from) = socket.recv_from(&mut buf).await.unwrap();
+            let _ = tx.send(from.port());
+            let reply = "HTTP/1.0 200 OK\r\nContent-Type: plex/media-server\r\n\
+                Resource-Identifier: abc123\r\nName: Tower\r\nPort: 32400\r\n\r\n";
+            socket.send_to(reply.as_bytes(), from).await.unwrap();
+        }
+    });
+    (at, rx)
+}
+
+#[tokio::test]
+async fn discovery_searches_from_the_port_the_setting_names_as_soon_as_it_changes() {
+    let (gdm, mut from) = gdm_stand_in().await;
+    let wizard = Wizard {
+        gdm: vec![gdm],
+        ..Wizard::default()
+    };
+    let (addr, _dir) = served_with("gdm-port", "", wizard).await;
+    let root = root(addr).await;
+    let port = {
+        let free = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        free.local_addr().unwrap().port()
+    };
+    let entry = root
+        .setting_set("network.plex_discovery_port".into(), json!(port))
+        .await
+        .unwrap();
+    assert_eq!(entry.apply, spoolframe_admin_api::SettingApply::Live);
+    let found = root.plex_discover().await.unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].name, "Tower");
+    // Plex's id for it, for the wizard to tell it from the same server
+    // listed by the account.
+    assert_eq!(found[0].machine_id.as_deref(), Some("abc123"));
+    assert_eq!(from.recv().await, Some(port));
+}
+
+/// A PMS that answers only with `token`, as `name`.
+async fn pms_wanting(name: &str, token: &str) -> MockServer {
+    let pms = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(header("X-Plex-Token", token))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "MediaContainer": { "friendlyName": name, "version": "1.41.0" }
+        })))
+        .mount(&pms)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections"))
+        .and(header("X-Plex-Token", token))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "MediaContainer": { "Directory": [] }
+        })))
+        .mount(&pms)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(401))
+        .with_priority(10)
+        .mount(&pms)
+        .await;
+    pms
+}
+
+#[tokio::test]
+async fn after_signing_in_with_plex_the_wizard_offers_the_account_s_servers_with_their_tokens() {
+    let tv = plex_tv().await;
+    // Tower is the account's own, on the LAN; plex.tv names it by its
+    // plex.direct address, and says which address that stands for.
+    let tower = pms_wanting("Tower", "tok-tower").await;
+    let port = tower.address().port();
+    Mock::given(method("GET"))
+        .and(path("/api/v2/resources"))
+        .and(header("X-Plex-Token", "tok-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "name": "Tower", "provides": "server", "clientIdentifier": "tower-machine",
+              "owned": true, "accessToken": "tok-tower",
+              "connections": [
+                { "uri": format!("https://127-0-0-1.abc.plex.direct:{port}"),
+                  "address": "127.0.0.1", "port": port, "local": true, "relay": false },
+              ] },
+            { "name": "Cabin", "provides": "server", "clientIdentifier": "cabin-machine",
+              "owned": false, "accessToken": "tok-cabin",
+              "connections": [
+                { "uri": "https://1-2-3-4.cabin.plex.direct:32400",
+                  "address": "1.2.3.4", "port": 32400, "local": false, "relay": false },
+              ] },
+        ])))
+        .mount(&tv)
+        .await;
+    let wizard = Wizard {
+        plex_tv: tv.uri().parse().unwrap(),
+        plex_app: "https://app.example".parse().unwrap(),
+        ..Wizard::default()
+    };
+    let (addr, dir) = served_with("plex-pin-servers", "", wizard).await;
+    let root = root(addr).await;
+    // Nobody has signed in with Plex, and nobody has linked an account.
+    assert_eq!(
+        code(root.plex_account_servers().await.unwrap_err()),
+        error_code::NOT_CONFIGURED
+    );
+
+    let pin = root.plex_pin_begin().await.unwrap();
+    root.plex_pin_check(pin.id).await.unwrap();
+    assert!(matches!(
+        root.plex_pin_check(pin.id).await.unwrap(),
+        PlexPinState::Linked { .. }
+    ));
+    let servers = root.plex_account_servers().await.unwrap();
+    let shown = serde_json::to_string(&servers).unwrap();
+    assert!(
+        !shown.contains("tok-tower") && !shown.contains("tok-cabin"),
+        "{shown}"
+    );
+    assert_eq!(servers.len(), 2, "{servers:?}");
+    assert_eq!(servers[0].machine_id, "tower-machine");
+    assert!(servers[0].local && servers[0].owned);
+    assert_eq!(servers[1].name, "Cabin");
+    assert!(!servers[1].local, "a remote one is marked");
+
+    // At the address discovery finds it by, Tower answers with its own
+    // token from plex.tv, not the account's that plex.token holds now.
+    let lan = format!("http://127.0.0.1:{port}");
+    let probed = root.plex_probe(lan.clone(), None).await.unwrap();
+    assert!(probed.reachable, "{probed:?}");
+    // Chosen: that token is the one kept.
+    root.plex_account_token_use(lan).await.unwrap();
+    let secret = std::fs::read_to_string(dir.as_ref().join("secrets/plex-token")).unwrap();
+    assert_eq!(secret, "tok-tower");
+    // The account does not reach this one.
+    assert_eq!(
+        code(
+            root.plex_account_token_use("http://10.9.9.9:32400".into())
+                .await
+                .unwrap_err()
+        ),
+        error_code::INVALID_INPUT
+    );
+}

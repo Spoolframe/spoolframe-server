@@ -47,6 +47,8 @@ pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
         watch: None,
         artwork: None,
         metrics: None,
+        logs: None,
+        telemetry: None,
     }
 }
 

@@ -38,6 +38,12 @@ web-sys = { workspace = true, features = [
     "CredentialsContainer",
     "CredentialCreationOptions",
     "CredentialRequestOptions",
+    # Server › Logs' Download: the lines shown, as a file (P3-14).
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "Document",
+    "HtmlAnchorElement",
 ] }
 
 # dx looks for it even for a web-only bundle.

@@ -306,6 +306,24 @@ async fn a_file_without_pictures_fails_once_and_is_not_made_again() {
         assert!(std::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let counts = setup.previews.counts();
+    assert_eq!((counts.done, counts.failed), (0, 1));
+}
+
+/// What is made, and what waits, is counted (P3-14).
+#[tokio::test]
+async fn a_set_made_is_counted_done() {
+    let setup = setup("counted", settings()).await;
+    let id = setup.film("film", 20, 0);
+    assert_eq!(setup.previews.counts(), PreviewCounts::default());
+    setup.ready(&id).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while setup.previews.counts().done == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let counts = setup.previews.counts();
+    assert_eq!((counts.done, counts.failed, counts.queued), (1, 0, 0));
 }
 
 #[tokio::test]

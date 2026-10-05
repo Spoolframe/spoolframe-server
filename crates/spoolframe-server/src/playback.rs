@@ -18,6 +18,7 @@ use spoolframe_types::{MediaId, SubtitleFormat};
 use tokio::sync::watch;
 
 use crate::encode::Conversion;
+use crate::metrics::Counter;
 use crate::subtitles::TextState;
 
 /// How long a handle lives without reads.
@@ -69,6 +70,17 @@ pub struct Playback {
     last_checked: Instant,
 }
 
+impl Playback {
+    /// How it is served.
+    pub fn plan(&self) -> Plan {
+        match &self.conversion {
+            None => Plan::Direct,
+            Some(c) if c.encodes() => Plan::Transcode,
+            Some(_) => Plan::Remux,
+        }
+    }
+}
+
 /// A playback to open.
 #[derive(Debug)]
 pub struct Opened {
@@ -116,6 +128,52 @@ pub struct Playbacks {
     handles: Mutex<HashMap<String, Playback>>,
     controls: crate::keyed_locks::KeyedLocks,
     progress_controls: crate::keyed_locks::KeyedLocks,
+    /// Opened since the server started (P3-14).
+    started: Counter,
+    /// Ended since the server started, however they ended.
+    ended: Counter,
+}
+
+/// How a playback is served (P3-14): the file as it is, a conversion that
+/// only copies its streams into another container, or one that encodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Plan {
+    Direct,
+    Remux,
+    Transcode,
+}
+
+impl Plan {
+    pub const ALL: [Plan; 3] = [Plan::Direct, Plan::Remux, Plan::Transcode];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Plan::Direct => "direct",
+            Plan::Remux => "remux",
+            Plan::Transcode => "transcode",
+        }
+    }
+}
+
+/// The playbacks open now, by plan, and how many opened and ended since
+/// the server started.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaybackCounts {
+    pub direct: u64,
+    pub remux: u64,
+    pub transcode: u64,
+    pub started: u64,
+    pub ended: u64,
+}
+
+impl PlaybackCounts {
+    pub fn active(&self, plan: Plan) -> u64 {
+        match plan {
+            Plan::Direct => self.direct,
+            Plan::Remux => self.remux,
+            Plan::Transcode => self.transcode,
+        }
+    }
 }
 
 impl Default for Playbacks {
@@ -133,7 +191,27 @@ impl Playbacks {
             handles: Mutex::default(),
             controls: Default::default(),
             progress_controls: Default::default(),
+            started: Counter::default(),
+            ended: Counter::default(),
         }
+    }
+
+    /// What is open now, and what opened and ended (P3-14). A playback
+    /// idle past the limit counts as open until the next sweep ends it.
+    pub fn counts(&self) -> PlaybackCounts {
+        let mut counts = PlaybackCounts {
+            started: self.started.get(),
+            ended: self.ended.get(),
+            ..PlaybackCounts::default()
+        };
+        for playback in self.lock().values() {
+            match playback.plan() {
+                Plan::Direct => counts.direct += 1,
+                Plan::Remux => counts.remux += 1,
+                Plan::Transcode => counts.transcode += 1,
+            }
+        }
+        counts
     }
 
     /// Playbacks end `grace` after their device's last connection closes
@@ -184,7 +262,10 @@ impl Playbacks {
         let now = Instant::now();
         let mut handles = self.lock();
         // Forget idle handles here rather than on a timer.
+        let before = handles.len();
         handles.retain(|_, p| now.duration_since(p.last_used) < self.idle);
+        self.ended.add((before - handles.len()) as u64);
+        self.started.inc();
         for previous in handles.values_mut() {
             if previous.session == opened.session && previous.item == opened.item {
                 previous.progress_superseded = true;
@@ -242,6 +323,7 @@ impl Playbacks {
         }
         if now.duration_since(playback.last_used) >= self.idle {
             handles.remove(&handle.0);
+            self.ended.inc();
             return Err(Refusal::Expired);
         }
         playback.last_used = now;
@@ -311,6 +393,9 @@ impl Playbacks {
     pub fn end(&self, handle: &PlaybackHandle) {
         // Dropped outside the lock: ending a conversion removes files.
         let ended = self.lock().remove(&handle.0);
+        if ended.is_some() {
+            self.ended.inc();
+        }
         drop(ended);
     }
 
@@ -338,6 +423,7 @@ impl Playbacks {
         });
         // Dropped outside the lock: ending a conversion removes files.
         let count = ended.len();
+        self.ended.add(count as u64);
         drop(ended);
         count
     }
@@ -354,6 +440,7 @@ impl Playbacks {
             }
             alive
         });
+        self.ended.add(ended.len() as u64);
         drop(ended);
     }
 
@@ -400,6 +487,29 @@ mod tests {
         assert_eq!(
             p.use_handle(&h, &SessionId("s".into()), "x").unwrap_err(),
             Refusal::NotYours
+        );
+    }
+
+    /// Each playback ends once in the counts, however it ends (P3-14).
+    #[test]
+    fn playbacks_are_counted_open_and_ended_once_each() {
+        let p = Playbacks::new(Duration::from_millis(20), RECHECK);
+        let stopped = start(&p);
+        let idle = start(&p);
+        let _device = start_on(&p, "tv");
+        let counts = p.counts();
+        assert_eq!((counts.direct, counts.started, counts.ended), (3, 3, 0));
+        p.end(&stopped);
+        p.end(&stopped);
+        assert_eq!(p.end_device("tv"), 1);
+        std::thread::sleep(Duration::from_millis(40));
+        // Found idle when used, then forgotten.
+        assert!(p.use_handle(&idle, &SessionId("s".into()), "e").is_err());
+        p.sweep();
+        let counts = p.counts();
+        assert_eq!(
+            (counts.active(Plan::Direct), counts.started, counts.ended),
+            (0, 3, 3)
         );
     }
 

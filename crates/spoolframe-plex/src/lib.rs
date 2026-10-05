@@ -15,6 +15,7 @@ pub mod gdm;
 pub mod inspect;
 pub mod paths;
 mod search;
+pub mod stats;
 mod watch;
 mod wire;
 
@@ -37,6 +38,7 @@ use url::Url;
 
 pub use crate::check::{Failures, LibraryPaths, Scope};
 pub use crate::paths::{PathMap, PathMapping};
+pub use crate::stats::{RequestCounts, RequestStats};
 pub use crate::watch::PlexWatch;
 
 use crate::convert::ConvertError;
@@ -62,6 +64,9 @@ pub struct PlexCatalog {
     /// one. An item in another is [`CatalogError::NotServed`], and left
     /// out of listings, search and recently added.
     sections: Option<Arc<HashSet<String>>>,
+    /// Every request to this PMS, from this catalog and the views of it
+    /// made from it (P3-14).
+    stats: Arc<RequestStats>,
 }
 
 /// An item fetched by ID: as Plex sent it, converted, and the library it
@@ -140,6 +145,7 @@ impl PlexCatalog {
             http,
             paths: PathMap::default(),
             sections: None,
+            stats: Arc::default(),
         })
     }
 
@@ -158,6 +164,7 @@ impl PlexCatalog {
             http: self.http.clone(),
             paths,
             sections: self.sections.clone(),
+            stats: self.stats.clone(),
         }
     }
 
@@ -218,6 +225,11 @@ impl PlexCatalog {
         &self.base
     }
 
+    /// What this PMS's requests did so far (P3-14).
+    pub fn request_counts(&self) -> RequestCounts {
+        self.stats.counts()
+    }
+
     /// What the PMS calls itself; asking is also how to tell it is up.
     pub async fn server_name(&self) -> Result<Option<String>, CatalogError> {
         Ok(self.identity().await?.0)
@@ -237,8 +249,23 @@ impl PlexCatalog {
     }
 
     /// One GET, with the token; the body and its content type. Status codes
-    /// become errors here.
+    /// become errors here. Each is counted and timed (P3-14), in a span of
+    /// its own that names the path, never the token.
     async fn get_bytes(
+        &self,
+        call: &Call<'_>,
+        accept: &str,
+    ) -> Result<(Vec<u8>, Option<String>), CatalogError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!("plex request", path = %call.path);
+        let started = std::time::Instant::now();
+        let result = self.send(call, accept).instrument(span).await;
+        let failed = matches!(&result, Err(e) if !matches!(e, CatalogError::NotFound(_)));
+        self.stats.record(started.elapsed(), failed);
+        result
+    }
+
+    async fn send(
         &self,
         call: &Call<'_>,
         accept: &str,
