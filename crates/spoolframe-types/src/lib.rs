@@ -24,7 +24,7 @@ pub use codec::{
     VideoLimits,
 };
 pub use id::{ArtworkId, IdError, LibraryId, MediaId, MediaKind, Namespace, PersonId};
-pub use media::{AudioRole, AudioTrack, MediaTracks, SubtitleRole, SubtitleTrack};
+pub use media::{AudioRole, AudioTrack, MediaTracks, SubtitleRole, SubtitleTrack, VideoTrack};
 pub use model::{
     Album, Artist, Artwork, ArtworkKind, Episode, Item, Library, LibraryKind, Marker, MarkerKind,
     Movie, PlaybackState, Season, Show, Track,

@@ -174,6 +174,20 @@ async fn episodes_are_asked_for_by_their_own_titles() {
 }
 
 #[tokio::test]
+async fn a_show_found_says_how_many_seasons_and_which_genres_it_has() {
+    let server = pms(&["letterkenny"]).await;
+    let found = catalog(&server)
+        .find(&query("letterkenny", &[SearchKind::Shows]))
+        .await
+        .unwrap();
+    let [Item::Show(show)] = &group(&found, SearchKind::Shows).items[..] else {
+        panic!("not one show")
+    };
+    assert_eq!(show.season_count, Some(6));
+    assert_eq!(show.genres, ["Comedy", "Sport"]);
+}
+
+#[tokio::test]
 async fn a_group_holds_at_most_the_limit_and_says_how_many_there_are() {
     let server = pms(&["pilot"]).await;
     let mut asked = query("pilot", &[SearchKind::Episodes]);

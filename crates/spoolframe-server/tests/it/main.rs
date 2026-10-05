@@ -7,7 +7,9 @@ mod support;
 
 mod admin;
 mod admin_web;
+mod app_passkeys;
 mod artwork;
+mod catalog;
 mod cli;
 mod device_sign_in;
 mod encode;

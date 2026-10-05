@@ -132,8 +132,8 @@ mod tests {
     use crate::store::users::LocalUserId;
     use crate::tracks::SubtitleChoice;
 
-    const ALICE: Principal = Principal::LocalUser(LocalUserId(1));
-    const BOB: Principal = Principal::LocalUser(LocalUserId(2));
+    const ALICE: Principal = Principal::LocalUser(LocalUserId::from_uuid(uuid::Uuid::from_u128(1)));
+    const BOB: Principal = Principal::LocalUser(LocalUserId::from_uuid(uuid::Uuid::from_u128(2)));
 
     #[tokio::test]
     async fn preferences_are_per_principal_with_defaults() {

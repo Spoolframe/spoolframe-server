@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use spoolframe_client_sdk::types::{ClientCapabilities, Item, PlaybackState, VideoCodec};
 use spoolframe_client_sdk::{
-    ArtworkSize, BitmapSubtitles, Client, ConnectionState, Device, MAX_READ, ManifestKind,
-    MemoryStorage, PlaybackHandle, PlaybackOptions, PlaybackPlan, SdkError, Selection, Session,
-    Storage,
+    ArtworkSize, BitmapSubtitles, Client, ConnectionPath, ConnectionState, Device, MAX_READ,
+    ManifestKind, MemoryStorage, PinProof, PlaybackHandle, PlaybackOptions, PlaybackPlan,
+    ProfileSignIn, SdkError, Selection, Session, Storage, TopResult,
 };
 use support::{
     ServerOptions, TestServer, episode, fresh_dir, library, markers, mkv_capabilities, movie,
@@ -95,9 +95,35 @@ async fn sign_in_and_browse() {
     assert_eq!(detail.children.len(), 3);
     assert_eq!(
         alice.search(support::search("ali")).await.unwrap().top,
-        Some(movie())
+        Some(TopResult::Item(movie()))
     );
     client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_session_says_its_connection_is_direct_on_the_lan() {
+    let (server, client, _) = ready("path").await;
+    let alice = alice(&server, &client).await;
+    let ConnectionPath::Lan { addr } = alice.connection_path() else {
+        panic!("{:?}", alice.connection_path())
+    };
+    assert!(
+        server.server.addr().ip_addrs().any(|a| *a == addr),
+        "{addr} is not one of the server's"
+    );
+    // The same, asked of the client before a profile is chosen.
+    assert_eq!(
+        client.connection_path(&id(&server)).unwrap(),
+        alice.connection_path()
+    );
+    assert!(client.connection_path("not an endpoint").is_err());
+    client.close().await;
+    assert_eq!(alice.connection_path(), ConnectionPath::Unknown);
+    assert_eq!(
+        client.connection_path(&id(&server)).unwrap(),
+        ConnectionPath::Unknown
+    );
     server.stop().await;
 }
 
@@ -149,10 +175,26 @@ async fn sessions_outlive_the_app() {
     server.stop().await;
 }
 
+/// Who's watching as this device keeps it: each name and how they sign
+/// in.
+async fn saved(client: &Client, server: &TestServer) -> Vec<(String, ProfileSignIn)> {
+    client
+        .saved_profiles(&id(server))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.username, p.sign_in))
+        .collect()
+}
+
 #[tokio::test]
-async fn an_ended_session_is_forgotten_and_needs_a_sign_in() {
+async fn an_ended_session_keeps_its_profile_which_needs_a_sign_in() {
     let (server, client, storage) = ready("ended").await;
     let alice = alice(&server, &client).await;
+    assert_eq!(
+        saved(&client, &server).await,
+        [("alice".to_owned(), ProfileSignIn::Automatic)]
+    );
     server.store.disable_user("alice").await.unwrap();
 
     assert_eq!(
@@ -160,14 +202,38 @@ async fn an_ended_session_is_forgotten_and_needs_a_sign_in() {
         SdkError::SignInRequired
     );
     assert!(client.profiles(&id(&server)).await.unwrap().is_empty());
+    assert_eq!(
+        saved(&client, &server).await,
+        [("alice".to_owned(), ProfileSignIn::Password)]
+    );
+    // The token is gone from storage; only the names are kept.
     let key = format!("sessions/{}", id(&server));
-    assert_eq!(storage.secret(&key).await.unwrap(), None);
+    let kept: serde_json::Value =
+        serde_json::from_slice(&storage.secret(&key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(kept[0]["token"], serde_json::Value::Null, "{kept}");
+    assert_eq!(kept[0]["display_name"], "Alice", "{kept}");
     client.close().await;
     server.stop().await;
 }
 
 #[tokio::test]
-async fn a_stale_profile_is_dropped_from_who_is_watching() {
+async fn signing_in_again_makes_an_ended_profile_automatic() {
+    let (server, client, _) = ready("ended-again").await;
+    alice(&server, &client).await;
+    server.store.disable_user("alice").await.unwrap();
+    assert!(client.profiles(&id(&server)).await.unwrap().is_empty());
+    server.store.enable_user("alice").await.unwrap();
+    alice(&server, &client).await;
+    assert_eq!(
+        saved(&client, &server).await,
+        [("alice".to_owned(), ProfileSignIn::Automatic)]
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_stale_profile_is_kept_for_a_password_and_out_of_the_sessions() {
     let (server, client, _) = ready("stale-profile").await;
     alice(&server, &client).await;
     client
@@ -178,8 +244,37 @@ async fn a_stale_profile_is_dropped_from_who_is_watching() {
     let profiles = client.profiles(&id(&server)).await.unwrap();
     let names: Vec<_> = profiles.iter().map(|p| p.user().username.clone()).collect();
     assert_eq!(names, ["alice"]);
+    assert_eq!(
+        saved(&client, &server).await,
+        [
+            ("alice".to_owned(), ProfileSignIn::Automatic),
+            ("bob".to_owned(), ProfileSignIn::Password),
+        ]
+    );
+    client.forget_profile(&id(&server), "bob").await.unwrap();
+    assert_eq!(
+        saved(&client, &server).await,
+        [("alice".to_owned(), ProfileSignIn::Automatic)]
+    );
     client.close().await;
     server.stop().await;
+}
+
+#[tokio::test]
+async fn saved_profiles_are_read_without_the_server() {
+    let (server, client, storage) = ready("saved-offline").await;
+    let key = id(&server);
+    alice(&server, &client).await;
+    client.close().await;
+    server.stop().await;
+    let again = Client::open(storage.clone(), device(mkv_capabilities()))
+        .await
+        .unwrap();
+    let profiles = again.saved_profiles(&key).await.unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].display_name, "Alice");
+    assert_eq!(profiles[0].sign_in, ProfileSignIn::Automatic);
+    again.close().await;
 }
 
 #[tokio::test]
@@ -188,6 +283,8 @@ async fn sign_out_ends_the_session_here_and_there() {
     let alice = alice(&server, &client).await;
     alice.sign_out().await.unwrap();
     assert!(client.profiles(&id(&server)).await.unwrap().is_empty());
+    // Signing out is leaving: the profile goes too.
+    assert!(saved(&client, &server).await.is_empty());
     assert_eq!(alice.whoami().await.unwrap_err(), SdkError::SignInRequired);
     client.close().await;
     server.stop().await;
@@ -646,13 +743,29 @@ async fn a_pin_required_here_locks_the_profile_when_the_app_opens_again() {
         alice.user().pin,
         Some(spoolframe_client_sdk::PinState { digits: Some(4) })
     );
-    // Change PIN and Remove PIN take the current one.
+    // Change PIN and Remove PIN take the current PIN, or the password.
+    let pin = |pin: &str| PinProof::Pin { pin: pin.into() };
+    let password = |password: &str| PinProof::Password {
+        password: password.into(),
+    };
     assert_eq!(
-        alice.set_pin("98765", Some("0000")).await,
+        alice.set_pin("98765", Some(pin("0000"))).await,
         Err(SdkError::InvalidCredentials)
     );
-    alice.set_pin("98765", Some("4321")).await.unwrap();
-    alice.clear_pin("98765").await.unwrap();
+    assert_eq!(
+        alice
+            .set_pin("98765", Some(password("wrong password")))
+            .await,
+        Err(SdkError::InvalidCredentials)
+    );
+    alice.set_pin("98765", Some(pin("4321"))).await.unwrap();
+    alice
+        .set_pin("2468", Some(password("correct horse")))
+        .await
+        .unwrap();
+    alice.clear_pin(pin("2468")).await.unwrap();
+    alice.set_pin("4321", None).await.unwrap();
+    alice.clear_pin(password("correct horse")).await.unwrap();
     assert_eq!(alice.whoami().await.unwrap().pin, None);
     client.close().await;
     server.stop().await;
@@ -927,5 +1040,115 @@ async fn a_saved_server_is_dated_when_pinned_verified_and_connected() {
     assert_eq!(unverified.verified_at, None);
     assert_eq!(secs(unverified.pinned_at), 1);
     client.close().await;
+    server.stop().await;
+}
+
+/// An app passkey (P3-19) made on the phone through the SDK signs the TV
+/// in, and the TV keeps the session as a password sign-in's.
+#[tokio::test]
+async fn an_app_passkey_made_on_the_phone_signs_the_tv_in() {
+    let (server, phone, _) = ready("app-passkey").await;
+    let alice = alice(&server, &phone).await;
+    let creation = alice.begin_passkey_registration().await.unwrap();
+    assert_eq!(creation.user_name, "alice on Home Media");
+    let mut app = crate::app_passkeys::App::new();
+    alice
+        .finish_passkey_registration(app.create(&creation, "Alice's iPhone"))
+        .await
+        .unwrap();
+
+    let tv_storage = Arc::new(MemoryStorage::default());
+    let tv = client_on(&server, &tv_storage).await;
+    let request = tv.begin_passkey_sign_in(&id(&server), None).await.unwrap();
+    let signed = app.get(&request);
+    let session = tv
+        .finish_passkey_sign_in(&id(&server), signed.clone())
+        .await
+        .unwrap();
+    assert_eq!(session.user().username, "alice");
+    let profiles = tv.profiles(&id(&server)).await.unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].user().username, "alice");
+    // Once.
+    assert_eq!(
+        tv.finish_passkey_sign_in(&id(&server), signed)
+            .await
+            .unwrap_err(),
+        SdkError::InvalidCredentials
+    );
+    tv.close().await;
+    phone.close().await;
+    server.stop().await;
+}
+
+/// The app lists, renames and removes its user's passkeys through the SDK
+/// (P3-19), the web UI's with its own, under the web UI's rules.
+#[tokio::test]
+async fn the_app_manages_its_user_s_passkeys() {
+    use crate::app_passkeys::{App, app_one, sql, web_one, web_passkey};
+
+    let (server, phone, _) = ready("app-passkey-manage").await;
+    let alice = alice(&server, &phone).await;
+    let creation = alice.begin_passkey_registration().await.unwrap();
+    let mut app = App::new();
+    alice
+        .finish_passkey_registration(app.create(&creation, "Alice's iPhone"))
+        .await
+        .unwrap();
+    web_passkey(&server, "alice", "d2ViLTE", "YubiKey").await;
+
+    let listed = alice.passkeys().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    let flags = |p: &spoolframe_client_sdk::PasskeyInfo| (p.name.clone(), p.app, p.usable_here);
+    assert_eq!(
+        flags(app_one(&listed)),
+        ("Alice's iPhone".to_owned(), true, true)
+    );
+    assert_eq!(
+        flags(web_one(&listed)),
+        ("YubiKey".to_owned(), false, false)
+    );
+    let (made, web) = (app_one(&listed).id.clone(), web_one(&listed).id.clone());
+
+    alice.rename_passkey(&made, "Kitchen iPad").await.unwrap();
+    let listed = alice.passkeys().await.unwrap();
+    assert_eq!(app_one(&listed).name, "Kitchen iPad");
+    assert!(matches!(
+        alice.rename_passkey(&made, "").await,
+        Err(SdkError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        alice.remove_passkey("bm9wZQ").await,
+        Err(SdkError::NotFound(_))
+    ));
+
+    alice.remove_passkey(&web).await.unwrap();
+    assert_eq!(alice.passkeys().await.unwrap().len(), 1);
+    // With no password, the one left is her way in.
+    sql(
+        &server,
+        "DELETE FROM password_credentials WHERE user_id = \
+         (SELECT id FROM users WHERE username = ?1)",
+        "alice",
+    )
+    .await;
+    assert_eq!(
+        alice.remove_passkey(&made).await,
+        Err(SdkError::LastSignInMethod)
+    );
+    // Signed in an hour ago, she signs in again first.
+    sql(
+        &server,
+        "UPDATE sessions SET authenticated_at = authenticated_at - 3600 WHERE user_id = \
+         (SELECT id FROM users WHERE username = ?1)",
+        "alice",
+    )
+    .await;
+    assert_eq!(
+        alice.remove_passkey(&made).await,
+        Err(SdkError::RecentSignInRequired)
+    );
+    assert_eq!(alice.passkeys().await.unwrap().len(), 1);
+    phone.close().await;
     server.stop().await;
 }

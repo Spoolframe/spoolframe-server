@@ -4,7 +4,7 @@ use crate::support;
 
 use std::time::Duration;
 
-use spoolframe_protocol::{HomeScreen, Reply, Request, Response, SessionId};
+use spoolframe_protocol::{HomeScreen, Reply, Request, Response, SessionId, TopResult};
 use spoolframe_server::principal::Principal;
 use spoolframe_server::store::watch::WatchUpdate;
 use spoolframe_types::{Item, MediaId, PlaybackState};
@@ -517,7 +517,7 @@ async fn pages_and_searches_carry_the_user_s_state() {
             else {
                 panic!("no search");
             };
-            let Some(Item::Movie(m)) = results.top else {
+            let Some(TopResult::Item(Item::Movie(m))) = results.top else {
                 panic!("not a movie")
             };
             m.playback

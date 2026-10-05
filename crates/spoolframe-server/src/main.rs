@@ -434,8 +434,12 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
     let passkeys = Arc::new(Passkeys::new(&admin_origins));
     match (passkeys.rp_id(), passkeys.unavailable()) {
         (Some(rp_id), _) => tracing::info!(rp_id, "passkeys are bound to this host"),
-        (None, why) => tracing::warn!(why, "no passkeys"),
+        (None, why) => tracing::warn!(why, "no passkeys in the web UI"),
     }
+    tracing::info!(
+        rp_id = spoolframe_protocol::APP_RP_ID,
+        "the apps' passkeys are bound to the shared relying party"
+    );
     passkeys.log_orphans(auth.store()).await?;
     // Single sign-on (P3-04): its providers are a live setting.
     let oidc = Arc::new(Oidc::new(
@@ -482,6 +486,8 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             settings: Some(settings.clone()),
             wizard,
             oidc,
+            watch: Some(watch.clone()),
+            artwork: Some(artwork.clone()),
         },
         admin_origins,
         admin_proxies,
@@ -511,6 +517,7 @@ async fn run(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result
             prober,
             artwork,
             playbacks: Arc::default(),
+            app_passkeys: Arc::default(),
             watch,
             transcoding,
             jobs,

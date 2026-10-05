@@ -127,8 +127,8 @@ pub struct PlexAccounts {
     changed: tokio::sync::broadcast::Sender<LocalUserId>,
 }
 
-fn secret_name(user: LocalUserId) -> String {
-    format!("plex-account-{}", user.0)
+pub(crate) fn secret_name(user: impl std::fmt::Display) -> String {
+    format!("plex-account-{}", user)
 }
 
 impl PlexAccounts {
@@ -167,7 +167,7 @@ impl PlexAccounts {
             Err(e) => {
                 // Never the text: it holds the token.
                 tracing::warn!(
-                    user = user.0,
+                    user = %user,
                     error = ?e.classify(),
                     "an unreadable Plex link; treated as none"
                 );
@@ -251,7 +251,7 @@ impl PlexAccounts {
         };
         self.save(user, &link)?;
         tracing::info!(
-            user = user.0,
+            user = %user,
             account = link.username.as_deref().or(link.email.as_deref()),
             "Plex account linked"
         );
@@ -282,7 +282,7 @@ impl PlexAccounts {
         }
         if removed {
             tracing::info!(
-                user = user.0,
+                user = %user,
                 by,
                 "Plex account unlinked; its token is deleted"
             );

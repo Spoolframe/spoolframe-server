@@ -27,9 +27,12 @@ pub struct SearchResults {
     /// The single best match: an exact title, else a title that starts
     /// with the query (case and a leading "the", "a" or "an" aside), else
     /// the first result; on a tie a show before a movie, then artist,
-    /// album, track and episode, so a show beats its own episodes. Not
+    /// album, track and episode, so a show beats its own episodes. A
+    /// person is the top match only when their name matches better than
+    /// every title (an exact "keanu reeves" over titles that start with
+    /// it), or when only people are found: on a tie the item wins. Not
     /// repeated in its group. `None` for a `kind` search.
-    pub top: Option<Item>,
+    pub top: Option<TopResult>,
     /// The groups that have something to show, in the order they are
     /// shown: shows, movies, people, artists, albums, tracks, episodes. A
     /// `kind` search has that one group, even when it is empty.
@@ -43,6 +46,16 @@ pub struct SearchResults {
     pub without_year: Vec<Item>,
 }
 
+/// The top match: an item, or a person. On the wire, `{"item": {...}}`
+/// or `{"person": {...}}`. A person's items are listed with
+/// `Request::PersonItems`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopResult {
+    Item(Item),
+    Person(Person),
+}
+
 /// One kind's results.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchGroup {
@@ -54,6 +67,12 @@ pub struct SearchGroup {
     /// There are more than are here: a `kind` search for this group
     /// finds them.
     pub more: bool,
+    /// How many a `kind` search for this group finds, for "See all 23":
+    /// the top match and the episodes under their show (`hidden`)
+    /// included. For items it is the catalog's exact count. People are
+    /// counted only when every one of them is here (`more` is false):
+    /// Plex lists them only up to the limit.
+    pub total: Option<u32>,
     /// Episodes left out because their show is in the shows group (only
     /// in `All`, where episodes are quiet), for "3 from Severance are
     /// under the show". A group may be here with only this.

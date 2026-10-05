@@ -96,10 +96,123 @@ impl From<StoreError> for CeremonyError {
 }
 
 /// The host passkeys are bound to.
-struct RelyingParty {
-    webauthn: Webauthn,
-    rp_id: String,
-    origin: String,
+pub(crate) struct RelyingParty {
+    pub(crate) webauthn: Webauthn,
+    pub(crate) rp_id: String,
+    pub(crate) origin: String,
+}
+
+impl RelyingParty {
+    /// The relying party `rp_id`, at `origin` only.
+    pub(crate) fn at(rp_id: &str, origin: &str) -> Result<Self, String> {
+        let url = Url::parse(origin).map_err(|e| format!("{origin:?} is not a URL: {e}"))?;
+        let webauthn = WebauthnBuilder::new(rp_id, &url)
+            .map(|builder| builder.rp_name(RP_NAME))
+            .and_then(WebauthnBuilder::build)
+            .map_err(|e| format!("passkeys cannot be bound to {origin}: {e}"))?;
+        Ok(Self {
+            webauthn,
+            rp_id: rp_id.to_owned(),
+            origin: origin.to_owned(),
+        })
+    }
+
+    /// Verify what an authenticator made for the registration `state`:
+    /// the passkey's credential id (base64url, as stored) and the
+    /// credential as JSON.
+    pub(crate) fn made(
+        &self,
+        made: &RegisterPublicKeyCredential,
+        state: &PasskeyRegistration,
+    ) -> Result<(String, String), CeremonyError> {
+        let passkey = self
+            .webauthn
+            .finish_passkey_registration(made, state)
+            .map_err(|e| CeremonyError::Refused(e.to_string()))?;
+        let json = serde_json::to_string(&passkey)
+            .map_err(|e| CeremonyError::Internal(format!("a credential as JSON: {e}")))?;
+        Ok((URL_SAFE_NO_PAD.encode(passkey.cred_id()), json))
+    }
+
+    /// The user `signed` signs in, if it is a passkey of theirs made for
+    /// this relying party and signed for the ceremony `begun` gives:
+    /// `begun` is handed the passkey's credential id (base64url) and
+    /// takes the ceremony's state, or says why there is none. A failure
+    /// counts in `auth`'s limit on failed logins, under the passkey's user
+    /// and `source`, and the log has its reason.
+    pub(crate) async fn sign_in(
+        &self,
+        auth: &Auth,
+        signed: &PublicKeyCredential,
+        source: Option<&str>,
+        begun: impl FnOnce(&str) -> Result<DiscoverableAuthentication, &'static str>,
+    ) -> Result<UserRecord, SignInError> {
+        let store = auth.store();
+        let id = URL_SAFE_NO_PAD.encode(signed.get_credential_id());
+        let record = store.passkey(&id).await?;
+        // Counted as a failure before it is checked, as a password is. A
+        // passkey nobody has is counted too, all under one name: there is
+        // no one for those to lock out.
+        let what = match &record {
+            Some(record) => format!("passkey:{}", record.user),
+            None => "passkey:unknown".to_owned(),
+        };
+        let began = auth
+            .attempt_begin(&what, source)
+            .map_err(|retry_after| SignInError::RateLimited { retry_after })?;
+        // Taken whatever comes next: a ceremony is tried once.
+        let state = begun(&id);
+        let refused = |why: &str| {
+            tracing::warn!(
+                passkey = record.as_ref().map(|r| r.name.as_str()),
+                user = record.as_ref().map(|r| tracing::field::display(r.user)),
+                rp_id = %self.rp_id,
+                reason = why,
+                "passkey sign-in refused"
+            );
+            SignInError::Refused
+        };
+        let Some(record) = &record else {
+            return Err(refused("not a passkey of this server"));
+        };
+        let state = state.map_err(refused)?;
+        if record.rp_id != self.rp_id {
+            return Err(refused("the passkey was made for another host"));
+        }
+        // The user handle its authenticator stored with it is its user's.
+        let handle = self
+            .webauthn
+            .identify_discoverable_authentication(signed)
+            .map(|(handle, _)| handle.to_string())
+            .map_err(|e| refused(&e.to_string()))?;
+        if store.passkey_handle_user(&handle).await? != Some(record.user) {
+            return Err(refused("the user handle is not the passkey's user's"));
+        }
+        let mut passkey = credential(record).map_err(|e| SignInError::Internal(e.to_string()))?;
+        let verified = self
+            .webauthn
+            .finish_discoverable_authentication(signed, state, &[DiscoverableKey::from(&passkey)])
+            .map_err(|e| match e {
+                WebauthnError::CredentialPossibleCompromise => refused(
+                    "the signature counter went backwards: there may be a copy of this passkey",
+                ),
+                other => refused(&other.to_string()),
+            })?;
+        let Some(user) = store
+            .user_by_id(record.user)
+            .await
+            .map_err(|e| SignInError::Internal(e.to_string()))?
+            .filter(|user| user.disabled_at.is_none())
+        else {
+            return Err(refused("the user is disabled"));
+        };
+        passkey.update_credential(&verified);
+        let json = serde_json::to_string(&passkey)
+            .map_err(|e| SignInError::Internal(format!("a credential as JSON: {e}")))?;
+        store.passkey_used(&record.credential_id, &json).await?;
+        auth.attempt_succeeded(&what, source, began);
+        Ok(user)
+    }
 }
 
 /// The server's passkeys: its relying party, if it can be one, and the
@@ -240,13 +353,7 @@ impl Passkeys {
             .filter(|(_, expires_at)| *expires_at > Instant::now())
             .map(|(state, _)| state)
             .ok_or(CeremonyError::NoCeremony)?;
-        let passkey = party
-            .webauthn
-            .finish_passkey_registration(made, &state)
-            .map_err(|e| CeremonyError::Refused(e.to_string()))?;
-        let json = serde_json::to_string(&passkey)
-            .map_err(|e| CeremonyError::Internal(format!("a credential as JSON: {e}")))?;
-        let id = URL_SAFE_NO_PAD.encode(passkey.cred_id());
+        let (id, json) = party.made(made, &state)?;
         let record = store
             .add_passkey(user.id, &id, name, &json, &party.rp_id)
             .await?;
@@ -300,16 +407,11 @@ impl Passkeys {
             .filter(|(_, expires_at)| *expires_at > Instant::now())
             .map(|(setup, _)| setup)
             .ok_or(CeremonyError::NoCeremony)?;
-        let passkey = party
-            .webauthn
-            .finish_passkey_registration(made, &setup.state)
-            .map_err(|e| CeremonyError::Refused(e.to_string()))?;
-        let credential = serde_json::to_string(&passkey)
-            .map_err(|e| CeremonyError::Internal(format!("a credential as JSON: {e}")))?;
+        let (credential_id, credential) = party.made(made, &setup.state)?;
         Ok(SetupPasskey {
             username: setup.username,
             handle: setup.handle.to_string(),
-            credential_id: URL_SAFE_NO_PAD.encode(passkey.cred_id()),
+            credential_id,
             credential,
             rp_id: party.rp_id.clone(),
         })
@@ -359,78 +461,17 @@ impl Passkeys {
             .party
             .as_ref()
             .map_err(|why| SignInError::Unavailable(why.clone()))?;
-        let store = auth.store();
-        let id = URL_SAFE_NO_PAD.encode(signed.get_credential_id());
-        let record = store.passkey(&id).await?;
-        // Counted as a failure before it is checked, as a password is. A
-        // passkey nobody has is counted too, all under one name: there is
-        // no one for those to lock out.
-        let what = match &record {
-            Some(record) => format!("passkey:{}", record.user.0),
-            None => "passkey:unknown".to_owned(),
-        };
-        let began = auth
-            .attempt_begin(&what, source)
-            .map_err(|retry_after| SignInError::RateLimited { retry_after })?;
-        // Taken whatever comes next: a ceremony is tried once.
-        let state = self
-            .sign_ins
-            .lock()
-            .expect("never held across a panic")
-            .remove(ceremony)
-            .filter(|(_, expires_at)| *expires_at > Instant::now())
-            .map(|(state, _)| state);
-        let refused = |why: &str| {
-            tracing::warn!(
-                passkey = record.as_ref().map(|r| r.name.as_str()),
-                user = record.as_ref().map(|r| r.user.0),
-                reason = why,
-                "passkey sign-in refused"
-            );
-            SignInError::Refused
-        };
-        let Some(record) = &record else {
-            return Err(refused("not a passkey of this server"));
-        };
-        let Some(state) = state else {
-            return Err(refused("the sign-in was not begun, or is over"));
-        };
-        if record.rp_id != party.rp_id {
-            return Err(refused("the passkey was made for another host"));
-        }
-        // The user handle its authenticator stored with it is its user's.
-        let handle = party
-            .webauthn
-            .identify_discoverable_authentication(signed)
-            .map(|(handle, _)| handle.to_string())
-            .map_err(|e| refused(&e.to_string()))?;
-        if store.passkey_handle_user(&handle).await? != Some(record.user) {
-            return Err(refused("the user handle is not the passkey's user's"));
-        }
-        let mut passkey = credential(record).map_err(|e| SignInError::Internal(e.to_string()))?;
-        let verified = party
-            .webauthn
-            .finish_discoverable_authentication(signed, state, &[DiscoverableKey::from(&passkey)])
-            .map_err(|e| match e {
-                WebauthnError::CredentialPossibleCompromise => refused(
-                    "the signature counter went backwards: there may be a copy of this passkey",
-                ),
-                other => refused(&other.to_string()),
-            })?;
-        let Some(user) = store
-            .user_by_id(record.user)
+        party
+            .sign_in(auth, signed, source, |_| {
+                self.sign_ins
+                    .lock()
+                    .expect("never held across a panic")
+                    .remove(ceremony)
+                    .filter(|(_, expires_at)| *expires_at > Instant::now())
+                    .map(|(state, _)| state)
+                    .ok_or("the sign-in was not begun, or is over")
+            })
             .await
-            .map_err(|e| SignInError::Internal(e.to_string()))?
-            .filter(|user| user.disabled_at.is_none())
-        else {
-            return Err(refused("the user is disabled"));
-        };
-        passkey.update_credential(&verified);
-        let json = serde_json::to_string(&passkey)
-            .map_err(|e| SignInError::Internal(format!("a credential as JSON: {e}")))?;
-        store.passkey_used(&record.credential_id, &json).await?;
-        auth.attempt_succeeded(&what, source, began);
-        Ok(user)
     }
 
     /// Say in the log which stored passkeys this server's host no longer
@@ -486,7 +527,7 @@ fn relying_party(origins: &Origins) -> Result<RelyingParty, String> {
 /// signing in needs no username), wherever that authenticator is.
 /// webauthn-rs asks for one it need not store, which a security key then
 /// does not, and which no sign-in without a username would find.
-fn stored_on_the_authenticator(options: &mut CreationChallengeResponse) {
+pub(crate) fn stored_on_the_authenticator(options: &mut CreationChallengeResponse) {
     options.public_key.authenticator_selection = Some(AuthenticatorSelectionCriteria {
         authenticator_attachment: None,
         resident_key: Some(ResidentKeyRequirement::Required),
@@ -497,7 +538,7 @@ fn stored_on_the_authenticator(options: &mut CreationChallengeResponse) {
 }
 
 /// A stored passkey as webauthn-rs verifies against it.
-fn credential(record: &PasskeyRecord) -> Result<Passkey, CeremonyError> {
+pub(crate) fn credential(record: &PasskeyRecord) -> Result<Passkey, CeremonyError> {
     serde_json::from_str(&record.credential)
         .map_err(|e| CeremonyError::Internal(format!("a stored credential: {e}")))
 }

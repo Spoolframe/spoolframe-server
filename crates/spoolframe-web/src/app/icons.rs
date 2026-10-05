@@ -559,3 +559,52 @@ pub fn LinkChain(#[props(default = 15)] size: u32) -> Element {
         }
     }
 }
+
+/// Seen, not changed: the catalog's "Read-only" (P3-16).
+#[component]
+pub fn Eye(#[props(default = 16)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" }
+            circle { cx: "12", cy: "12", r: "3" }
+        }
+    }
+}
+
+#[component]
+pub fn Search(#[props(default = 16)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "m21 21-4.34-4.34" }
+            circle { cx: "11", cy: "11", r: "8" }
+        }
+    }
+}
+
+/// The catalog's Columns menu.
+#[component]
+pub fn Sliders(#[props(default = 14)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M10 5H3" }
+            path { d: "M12 19H3" }
+            path { d: "M14 3v4" }
+            path { d: "M16 17v4" }
+            path { d: "M21 12h-9" }
+            path { d: "M21 19h-5" }
+            path { d: "M21 5h-7" }
+            path { d: "M8 10v4" }
+            path { d: "M8 12H3" }
+        }
+    }
+}
+
+/// Playback debug (P3-15), on an item's Debug tab.
+#[component]
+pub fn Activity(#[props(default = 14)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2" }
+        }
+    }
+}

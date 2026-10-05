@@ -5,7 +5,15 @@
 //! Plex adding fields never breaks parsing and Plex-only data never leaks
 //! into the media model.
 
-use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer};
+
+/// A field read only for an admin's look at an item (P3-16): one Plex
+/// sends in another shape is left out rather than failing the item.
+fn lenient<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Option<T>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).ok())
+}
 
 /// Every PMS JSON response is `{"MediaContainer": {...}}`.
 #[derive(Debug, Deserialize)]
@@ -116,6 +124,9 @@ pub struct Metadata {
     pub title: String,
     pub year: Option<u16>,
     pub summary: Option<String>,
+    /// The age rating: `R`, `TV-MA`. Plex sends it on movies, shows and
+    /// episodes, in listings too.
+    pub content_rating: Option<String>,
     /// Milliseconds.
     pub duration: Option<u64>,
     /// Season, episode or track number.
@@ -150,6 +161,22 @@ pub struct Metadata {
     /// When it came into the library (Unix s): recently added from several
     /// Plex servers is merged by it (P3-11).
     pub added_at: Option<i64>,
+    /// When Plex last changed it (Unix s), for an admin (P3-16).
+    #[serde(default, deserialize_with = "lenient")]
+    pub updated_at: Option<i64>,
+    /// A show's or season's episodes, an album's tracks.
+    #[serde(default, deserialize_with = "lenient")]
+    pub leaf_count: Option<u32>,
+    /// A show's seasons, specials counted; also on clients' shows.
+    #[serde(default, deserialize_with = "lenient")]
+    pub child_count: Option<u32>,
+    /// A show's genres. Listings and search give the first two; the
+    /// show's own item gives all.
+    #[serde(rename = "Genre", default)]
+    pub genres: Vec<Tag>,
+    /// A show's or an artist's folders; only on single-item responses.
+    #[serde(rename = "Location", default)]
+    pub locations: Vec<Location>,
     /// The library it is in. Listings that mix libraries (recently added,
     /// search) have it on every item.
     #[serde(rename = "librarySectionID", default)]
@@ -180,16 +207,44 @@ pub struct Marker {
     pub is_final: bool,
 }
 
+/// A tag on an item (a genre); only its name is read.
+#[derive(Debug, Deserialize)]
+pub struct Tag {
+    pub tag: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct GuidRef {
     pub id: String,
 }
 
-/// One version of an item's media.
+/// One version of an item's media. Everything but its parts is only for
+/// an admin's look at it (P3-16).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Media {
     #[serde(rename = "Part", default)]
     pub parts: Vec<Part>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub id: Option<u64>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub container: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub video_codec: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub video_resolution: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub video_profile: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub audio_codec: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub audio_channels: Option<u32>,
+    /// kbit/s.
+    #[serde(default, deserialize_with = "lenient")]
+    pub bitrate: Option<u64>,
+    /// Milliseconds.
+    #[serde(default, deserialize_with = "lenient")]
+    pub duration: Option<u64>,
 }
 
 /// One file of a version.
@@ -197,7 +252,35 @@ pub struct Media {
 pub struct Part {
     pub id: Option<u64>,
     pub file: Option<String>,
+    /// Bytes; for an admin (P3-16).
+    #[serde(default, deserialize_with = "lenient")]
+    pub size: Option<u64>,
+    /// Milliseconds; for an admin (P3-16).
+    #[serde(default, deserialize_with = "lenient")]
+    pub duration: Option<u64>,
     /// The preview indexes Plex made of it: `sd` when it has its "video
     /// preview thumbnails" (P3-13).
     pub indexes: Option<String>,
+    /// Its streams; only on items asked for by key, never in listings.
+    #[serde(rename = "Stream", default)]
+    pub streams: Vec<Stream>,
+}
+
+/// One stream of a part. Only a track's audio format is read from it, and
+/// a field in another shape is left out rather than failing the item.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Stream {
+    /// 1 video, 2 audio, 3 subtitles, 4 lyrics.
+    #[serde(default, deserialize_with = "lenient")]
+    pub stream_type: Option<u32>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub bit_depth: Option<u32>,
+    /// Hz.
+    #[serde(default, deserialize_with = "lenient")]
+    pub sampling_rate: Option<u32>,
+}
+
+impl Stream {
+    pub const AUDIO: u32 = 2;
 }

@@ -13,8 +13,8 @@ use spoolframe_admin_api::{
 use super::admin::{Said, Toast, say, sleep};
 use super::{Alert, Field, Route, icons, rpc};
 use crate::libraries::{
-    PathCell, add_label, added_text, down, down_text, items_line, local_path, path_cell,
-    sample_line, section_line, source_line, with_path,
+    FILES_HERE, PathCell, REMOTE_NOTE, add_label, added_text, down, down_text, items_line,
+    local_path, path_cell, refusals, remote, sample_line, section_line, source_line, with_path,
 };
 use crate::logic::{ApiError, host_port};
 use crate::plex_sync::{
@@ -335,7 +335,19 @@ fn LibraryRow(
             }
             span { class: "lib-icon", KindIcon { kind: library.kind } }
             span { class: "lib-what",
-                b { "{library.name}" }
+                // Its items (P3-16).
+                Link {
+                    class: "lib-name",
+                    to: Route::CatalogLibrary {
+                        library: library.id.clone(),
+                        page: String::new(),
+                        per: String::new(),
+                        filter: String::new(),
+                        kind: String::new(),
+                        q: String::new(),
+                    },
+                    "{library.name}"
+                }
                 span { class: "lib-source",
                     span { class: "plex-dot" }
                     "{source_line(&library)}"
@@ -887,6 +899,9 @@ pub fn AddLibrary(back: String) -> Element {
         .into_iter()
         .filter(|r| r.checked && r.library.is_none())
         .collect();
+    // A chosen library none of whose files is here holds the add up: it
+    // would play nothing.
+    let refused = refusals(chosen.iter().map(|r| r.check.as_ref()));
     let add = {
         let back_route = back_route.clone();
         let chosen = chosen.clone();
@@ -1115,6 +1130,9 @@ pub fn AddLibrary(back: String) -> Element {
                                         span { class: "choice-what",
                                             b { "{f.name}" }
                                             "Found on this network · {host_port(&f.url)}"
+                                            if remote(&f.url, None) {
+                                                RemoteNote {}
+                                            }
                                         }
                                         if pick() == Pick::Found(f.url.clone()) {
                                             ProbeBadge { probed: probed() }
@@ -1139,10 +1157,12 @@ pub fn AddLibrary(back: String) -> Element {
                                     span { class: "radio" }
                                     span { class: "choice-what",
                                         b { "{a.name}" }
-                                        if a.local {
-                                            "From your Plex account · {host_port(&url)}"
+                                        if remote(&url, Some(a.local)) {
+                                            // Its plex.direct name is too long to say.
+                                            "From your Plex account"
+                                            RemoteNote {}
                                         } else {
-                                            "From your Plex account · plex.direct, remote"
+                                            "From your Plex account · {host_port(&url)}"
                                         }
                                     }
                                     if pick() == Pick::Account(url.clone()) {
@@ -1159,7 +1179,12 @@ pub fn AddLibrary(back: String) -> Element {
                                 take_new(typed(), token());
                             },
                             span { class: "radio" }
-                            span { class: "choice-what", b { "Type an address" } }
+                            span { class: "choice-what",
+                                b { "Type an address" }
+                                if pick() == Pick::Typed && remote(&typed(), None) {
+                                    RemoteNote {}
+                                }
+                            }
                             if pick() == Pick::Typed {
                                 ProbeBadge { probed: probed() }
                             }
@@ -1178,6 +1203,7 @@ pub fn AddLibrary(back: String) -> Element {
                                 }
                             }
                         }
+                        span { class: "text-xs text-ctp-subtext0", "{FILES_HERE}" }
                         if let Some(Ok(p)) = probed().filter(|_| is_new) {
                             if !p.reachable && !needs_token {
                                 div { class: "alert alert-error", role: "alert",
@@ -1318,6 +1344,9 @@ pub fn AddLibrary(back: String) -> Element {
                                 span { class: "add-wide" }
                             }
                         }
+                        for text in refused.clone() {
+                            Alert { key: "{text}", text }
+                        }
                         if let Some(text) = error() {
                             Alert { text }
                         }
@@ -1326,7 +1355,7 @@ pub fn AddLibrary(back: String) -> Element {
                             button {
                                 class: "btn-dialog btn-dialog-primary",
                                 r#type: "button",
-                                disabled: busy() || chosen.is_empty(),
+                                disabled: busy() || chosen.is_empty() || !refused.is_empty(),
                                 onclick: add,
                                 "{add_label(chosen.len())}"
                             }
@@ -1338,6 +1367,14 @@ pub fn AddLibrary(back: String) -> Element {
             }
         }
         Toast { said: toast }
+    }
+}
+
+/// On a Plex server away from this machine's network.
+#[component]
+pub(super) fn RemoteNote() -> Element {
+    rsx! {
+        span { class: "state state-warn", "{REMOTE_NOTE}" }
     }
 }
 

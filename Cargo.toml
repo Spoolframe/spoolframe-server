@@ -70,6 +70,9 @@ sha2 = "0.10"
 webauthn-rs = { version = "0.5.5", features = ["conditional-ui"] }
 # For the option types webauthn-rs does not re-export.
 webauthn-rs-proto = "0.5.5"
+# User ids (P3-20): UUIDv7, time-ordered so they still sort by creation.
+# Already in the build through webauthn-rs.
+uuid = { version = "1.27", default-features = false, features = ["std", "v7"] }
 # Credential ids, as base64url text.
 base64 = "0.22"
 # SSO (P3-04): the OpenID Connect client, which checks ID tokens itself

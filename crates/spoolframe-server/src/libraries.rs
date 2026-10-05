@@ -7,7 +7,7 @@
 //! refused where the locked file sets it, and the catalog follows at once.
 //! A token is kept as a secret, never in a layer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use spoolframe_admin_api::{
@@ -391,6 +391,28 @@ impl RuntimeSettings {
                 "{} on {} is a library already",
                 found.title, source.name
             )));
+        }
+        // Spoolframe plays the files itself (P1-04): a section none of
+        // whose sample files is here, under the saved mappings, would play
+        // nothing, so it is not added. The add flow says the same before
+        // asking; this is for every other caller.
+        let sample = source
+            .catalog
+            .unrestricted()
+            .serving(Some(HashSet::from([section.to_owned()])))
+            .check_paths(None, Scope::Sample(PATH_SAMPLE))
+            .await
+            .map_err(|e| {
+                LibraryError::Unavailable(format!(
+                    "cannot check {}'s files on {}: {e}",
+                    found.title, source.name
+                ))
+            })?;
+        if let Some(why) = sample
+            .into_iter()
+            .find_map(|report| path_check(report, &[]).refusal())
+        {
+            return Err(LibraryError::Invalid(why));
         }
         let name = name
             .map(str::trim)

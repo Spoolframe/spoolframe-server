@@ -3,7 +3,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
-use spoolframe_admin_api::{Platform, Role, UserInfo, error_code};
+use spoolframe_admin_api::{PasskeyEntry, Platform, Role, UserInfo, error_code};
 
 /// Where a browser opening the web UI belongs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +164,17 @@ pub fn setup_without_passkeys(
     Some(format!(
         "{why}, so the admin gets a password. Add a passkey later in My profile."
     ))
+}
+
+/// What a passkey is called in a list: its name, or, for one made in a
+/// Spoolframe app (P3-19), "Spoolframe app · <name>", its name being the
+/// device's.
+pub fn passkey_title(passkey: &PasskeyEntry) -> String {
+    if passkey.app {
+        format!("Spoolframe app · {}", passkey.name)
+    } else {
+        passkey.name.clone()
+    }
 }
 
 /// Whether a page at host `page` can make and use passkeys bound to
@@ -428,6 +439,32 @@ mod tests {
     use super::*;
     use serde_json::json;
     use spoolframe_admin_api::{PathFailures, PathReport};
+
+    fn passkey(name: &str, rp_id: &str, app: bool) -> PasskeyEntry {
+        PasskeyEntry {
+            id: "id".into(),
+            name: name.into(),
+            created_at: 0,
+            last_used_at: None,
+            rp_id: rp_id.into(),
+            usable: true,
+            app,
+        }
+    }
+
+    /// An app passkey (P3-19) is named for the device it was made on; the
+    /// row says it is the app's.
+    #[test]
+    fn an_app_passkey_is_shown_as_the_app_s() {
+        assert_eq!(
+            passkey_title(&passkey("Alice's iPhone", "spoolframe.app", true)),
+            "Spoolframe app · Alice's iPhone"
+        );
+        assert_eq!(
+            passkey_title(&passkey("MacBook", "media.example.org", false)),
+            "MacBook"
+        );
+    }
 
     #[test]
     fn a_session_or_device_is_named_by_the_kind_of_client_it_runs() {

@@ -25,6 +25,9 @@ use spoolframe_admin_api::{
     error_code,
 };
 use spoolframe_admin_api::{
+    ArtworkInfo, CatalogItem, CatalogLibrary, CatalogPage, CatalogQuery, CatalogRow, PathsChecked,
+};
+use spoolframe_admin_api::{
     AudioPick, SsoLink, SubtitlePick, TrackOverrideEntry, TrackPreferences,
 };
 use spoolframe_plex::PlexCatalog;
@@ -56,6 +59,11 @@ use crate::store::users::{UserError, UserRecord, normalize_username};
 use crate::tracks::SubtitleChoice;
 use crate::transcode::Transcoding;
 use spoolframe_plex::account::{PinState, PlexTv};
+
+#[path = "admin_catalog.rs"]
+mod catalog;
+
+pub use catalog::PathChecks;
 
 /// The address the caller is at: its connection's, or behind a trusted
 /// proxy the one the proxy forwards for, `None` if the proxy named none
@@ -282,6 +290,12 @@ pub struct Admin {
     pub wizard: Wizard,
     /// Single sign-on (P3-04): the providers, and the flows in progress.
     pub oidc: Arc<Oidc>,
+    /// Each user's watch state, for an item as a client of the caller's
+    /// gets it (P3-16); `None` in tests without.
+    pub watch: Option<Arc<crate::watch::Watch>>,
+    /// Artwork, resized, for the catalog pages' thumbnails (P3-16);
+    /// `None` in tests without, which get the catalog's own images.
+    pub artwork: Option<Arc<crate::artwork::ArtworkCache>>,
 }
 
 /// What the setup wizard reaches beyond the server (P3-10): plex.tv for
@@ -407,6 +421,9 @@ pub async fn serve(
         settings: admin.settings,
         wizard: admin.wizard,
         oidc: admin.oidc,
+        watch: admin.watch,
+        artwork: admin.artwork,
+        checks: Arc::default(),
         pins: Arc::default(),
         public_url: origins.public_url().map(str::to_owned),
     };
@@ -430,6 +447,10 @@ pub(crate) struct AdminApi {
     settings: Option<Arc<RuntimeSettings>>,
     wizard: Wizard,
     oidc: Arc<Oidc>,
+    watch: Option<Arc<crate::watch::Watch>>,
+    artwork: Option<Arc<crate::artwork::ArtworkCache>>,
+    /// Each library's last path check (P3-16).
+    checks: Arc<PathChecks>,
     /// The plex.tv PINs this server began, so a check is only of those.
     pins: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
     /// Where browsers reach the web UI (`admin.public_url`), if anywhere.
@@ -664,8 +685,10 @@ impl AdminApi {
 
     /// A stored passkey as the API shows it.
     fn passkey_entry(&self, p: PasskeyRecord) -> PasskeyEntry {
+        let app = p.rp_id == spoolframe_protocol::APP_RP_ID;
         PasskeyEntry {
-            usable: self.passkeys.rp_id() == Some(p.rp_id.as_str()),
+            usable: app || self.passkeys.rp_id() == Some(p.rp_id.as_str()),
+            app,
             id: p.credential_id,
             name: p.name,
             created_at: p.created_at,
@@ -840,7 +863,7 @@ fn sign_in_code_keys(
     user: ApiSessionUser,
 ) -> RpcResult<(String, Option<String>)> {
     Ok((
-        format!("devcode:{}", user.user.0),
+        format!("devcode:{}", user.user),
         source(ext)?.map(|address| format!("devcode@{address}")),
     ))
 }
@@ -1083,12 +1106,12 @@ impl AdminApi {
                     .await
                 {
                     Ok(_) => {
-                        tracing::info!(user = user.0, provider, "sign-in provider account linked");
+                        tracing::info!(user = %user, provider, "sign-in provider account linked");
                         Ok(back("/profile", "linked", Some(provider)))
                     }
                     Err(IdentityError::LinkedToAnother) => {
                         tracing::warn!(
-                            user = user.0,
+                            user = %user,
                             provider,
                             "refused to link an account another user has linked"
                         );
@@ -1110,7 +1133,7 @@ impl AdminApi {
                     .map_err(internal)?;
                 if owner != Some(user) {
                     tracing::warn!(
-                        user = user.0,
+                        user = %user,
                         provider,
                         "a sign-in provider account not linked to this user was offered as a confirmation"
                     );
@@ -1348,7 +1371,7 @@ impl MeApiServer for AdminApi {
             .clear_pin(user.user)
             .await
             .map_err(internal)?;
-        tracing::info!(user = user.user.0, "PIN removed by its user");
+        tracing::info!(user = %user.user, "PIN removed by its user");
         Ok(())
     }
 
@@ -1428,7 +1451,7 @@ impl MeApiServer for AdminApi {
             Ok(token) => {
                 sign_ins.fulfil(&claim.request, Some(token));
                 tracing::info!(
-                    user = user.user.0,
+                    user = %user.user,
                     device = %claim.endpoint,
                     "device sign-in approved from the web"
                 );
@@ -1444,7 +1467,7 @@ impl MeApiServer for AdminApi {
     async fn device_sign_in_deny(&self, ext: &Extensions, code: String) -> RpcResult<()> {
         let (user, code) = self.sign_in_code(ext, &code).await?;
         if self.auth.sign_ins().deny(&code) {
-            tracing::info!(user = user.user.0, "device sign-in denied from the web");
+            tracing::info!(user = %user.user, "device sign-in denied from the web");
             Ok(())
         } else {
             Err(self.wrong_sign_in_code(ext, user)?)
@@ -1471,7 +1494,7 @@ impl MeApiServer for AdminApi {
             .await?;
         if signer.id != user.user {
             tracing::warn!(
-                user = user.user.0,
+                user = %user.user,
                 passkey_of = %signer.username,
                 "a passkey of another user's was offered as a confirmation"
             );
@@ -1547,7 +1570,7 @@ impl MeApiServer for AdminApi {
     async fn passkey_remove(&self, ext: &Extensions, id: String) -> RpcResult<()> {
         let (_, user) = self.recently_signed_in(ext).await?;
         self.auth.store().remove_passkey(user.user, &id).await?;
-        tracing::info!(user = user.user.0, "passkey removed by its user");
+        tracing::info!(user = %user.user, "passkey removed by its user");
         Ok(())
     }
 
@@ -1562,7 +1585,7 @@ impl MeApiServer for AdminApi {
             .store()
             .unlink_identity(user.user, &issuer)
             .await?;
-        tracing::info!(user = user.user.0, provider = ?self.oidc.provider_of(&issuer), "sign-in provider account unlinked by its user");
+        tracing::info!(user = %user.user, provider = ?self.oidc.provider_of(&issuer), "sign-in provider account unlinked by its user");
         Ok(())
     }
 
@@ -1609,7 +1632,7 @@ impl MeApiServer for AdminApi {
             .await
             .map_err(internal)?;
         tracing::info!(
-            user = user.user.0,
+            user = %user.user,
             revoked,
             "signed out everywhere else by its user"
         );
@@ -2053,6 +2076,7 @@ impl AdminApiServer for AdminApi {
         library: Option<String>,
     ) -> RpcResult<Vec<PathReport>> {
         self.admin(ext).await?;
+        let composite = self.plex.composite();
         let reports = self
             .plex()?
             .check_paths(library.as_deref(), Scope::All)
@@ -2067,6 +2091,22 @@ impl AdminApiServer for AdminApi {
             count: f.count,
             examples: f.examples,
         };
+        // Each library's catalog pages list this check (P3-16).
+        if let Some(composite) = &composite {
+            for r in &reports {
+                let Ok(local) =
+                    spoolframe_types::LibraryId::new(spoolframe_types::Namespace::Plex, &r.section)
+                else {
+                    continue;
+                };
+                let library = crate::catalog::ids::library(FIRST_PLEX_SERVER, local);
+                let check = spoolframe_catalog::LibraryCheck {
+                    ok: r.ok,
+                    missing: r.missing.clone(),
+                };
+                self.checks.record(composite, &library.to_string(), check);
+            }
+        }
         Ok(reports
             .into_iter()
             .map(|r| PathReport {
@@ -2501,6 +2541,41 @@ impl AdminApiServer for AdminApi {
         let (settings, by) = self.settings_as_admin(ext).await?;
         Ok(settings.plex_server_remove(&id, &by)?)
     }
+
+    async fn catalog_library(&self, ext: &Extensions, id: String) -> RpcResult<CatalogLibrary> {
+        self.admin(ext).await?;
+        self.catalog_library_of(id).await
+    }
+
+    async fn catalog_rows(&self, ext: &Extensions, query: CatalogQuery) -> RpcResult<CatalogPage> {
+        self.admin(ext).await?;
+        self.catalog_rows_of(query).await
+    }
+
+    async fn catalog_children(
+        &self,
+        ext: &Extensions,
+        library: String,
+        id: String,
+    ) -> RpcResult<Vec<CatalogRow>> {
+        self.admin(ext).await?;
+        self.catalog_children_of(library, id).await
+    }
+
+    async fn catalog_item(&self, ext: &Extensions, id: String) -> RpcResult<CatalogItem> {
+        let user = self.admin(ext).await?;
+        self.catalog_item_of(user.user, id).await
+    }
+
+    async fn catalog_artwork(&self, ext: &Extensions, id: String) -> RpcResult<Vec<ArtworkInfo>> {
+        self.admin(ext).await?;
+        self.catalog_artwork_of(id).await
+    }
+
+    async fn catalog_check_paths(&self, ext: &Extensions, id: String) -> RpcResult<PathsChecked> {
+        self.admin(ext).await?;
+        self.catalog_check_paths_of(id).await
+    }
 }
 
 /// How many files of each library the wizard's path check, and the
@@ -2654,6 +2729,9 @@ mod tests {
             settings: None,
             wizard: Wizard::default(),
             oidc: Arc::default(),
+            watch: None,
+            artwork: None,
+            checks: Arc::default(),
             pins: Arc::default(),
             public_url: origins.public_url().map(str::to_owned),
         }

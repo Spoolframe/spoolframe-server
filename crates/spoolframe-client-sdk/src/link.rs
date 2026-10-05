@@ -5,7 +5,13 @@
 //! or the server says it is shutting down, it dials the pinned key again
 //! with backoff. Sessions live on the server and are bound to this
 //! device's key, not to a connection, so they keep working afterwards.
+//!
+//! A connection can also die without closing: the app was suspended and
+//! the server's side of it is gone, but QUIC here has not noticed yet. A
+//! request that gets no answer, and then no `Pong`, drops it
+//! ([`Link::drop_dead`]): it is closed, and the supervisor dials again.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -40,6 +46,48 @@ pub enum ConnectionState {
     Reconnecting {
         attempt: u32,
     },
+}
+
+/// The way packets go to a server now, for a player's diagnostics.
+///
+/// Iroh says whether its selected path is a relay or an IP address, not
+/// how an IP path came about, so a hole punched through NAT and an open
+/// port look the same. What the address is does tell the local network
+/// apart: `Lan` is a private, link-local or loopback address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionPath {
+    /// Straight to the server on the local network.
+    Lan { addr: SocketAddr },
+    /// Straight to a public address, across the internet: through an open
+    /// port or a hole punched in NAT.
+    Direct { addr: SocketAddr },
+    /// Through a relay server. Relays are off in this build, so it is not
+    /// seen yet.
+    Relay,
+    /// Not connected now, or no path selected yet.
+    Unknown,
+}
+
+impl ConnectionPath {
+    /// The path to `addr`, an IP path's remote address.
+    pub(crate) fn of_ip(addr: SocketAddr) -> Self {
+        if is_local(addr.ip()) {
+            Self::Lan { addr }
+        } else {
+            Self::Direct { addr }
+        }
+    }
+}
+
+/// An address that is only reachable on this network.
+fn is_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_local(IpAddr::V4(v4)),
+            None => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+        },
+    }
 }
 
 /// Changes of one server's [`ConnectionState`].
@@ -85,8 +133,14 @@ impl Link {
         StateWatch(self.state.subscribe())
     }
 
-    /// The connection, if it is open.
-    fn open(&self) -> Option<Arc<ServerConnection>> {
+    /// The path of the connection now; `Unknown` without one.
+    pub fn path(&self) -> ConnectionPath {
+        self.open()
+            .map_or(ConnectionPath::Unknown, |conn| conn.path())
+    }
+
+    /// The connection, if it is open. Never dials.
+    pub fn open(&self) -> Option<Arc<ServerConnection>> {
         self.current
             .lock()
             .expect("never poisoned")
@@ -152,19 +206,46 @@ impl Link {
             .is_some_and(|t| !t.is_finished())
     }
 
-    /// Wait up to [`CALL_WAIT`] for the supervisor to reconnect.
+    /// Wait up to [`CALL_WAIT`] for the supervisor to reconnect. The
+    /// state may still say `Connected` of a connection just closed, until
+    /// the supervisor has seen it go: what counts is an open connection.
     async fn reconnected(&self) -> Result<Arc<ServerConnection>, SdkError> {
+        let deadline = tokio::time::Instant::now() + CALL_WAIT;
         let mut state = self.state.subscribe();
-        let wait = state.wait_for(|s| *s == ConnectionState::Connected);
-        match tokio::time::timeout(CALL_WAIT, wait).await {
-            Ok(Ok(_)) => self
-                .open()
-                .ok_or_else(|| SdkError::Unreachable(format!("{}: lost again", self.id))),
-            _ => Err(SdkError::Unreachable(format!(
-                "{}: not back within {CALL_WAIT:?}",
-                self.id
-            ))),
+        loop {
+            if let Some(conn) = self.open() {
+                return Ok(conn);
+            }
+            match tokio::time::timeout_at(deadline, state.changed()).await {
+                Ok(Ok(())) => {}
+                _ => {
+                    return Err(SdkError::Unreachable(format!(
+                        "{}: not back within {CALL_WAIT:?}",
+                        self.id
+                    )));
+                }
+            }
         }
+    }
+
+    /// `conn` has stopped answering: close it, so that no call uses it
+    /// again and the supervisor dials anew. Nothing changes if it was
+    /// already replaced.
+    pub fn drop_dead(&self, conn: &Arc<ServerConnection>) {
+        tracing::info!(server = %self.id, "the connection stopped answering; dropping it");
+        let supervised = self.supervised();
+        {
+            let mut current = self.current.lock().expect("never poisoned");
+            if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn)) {
+                *current = None;
+                self.state.send_replace(if supervised {
+                    ConnectionState::Reconnecting { attempt: 1 }
+                } else {
+                    ConnectionState::Disconnected
+                });
+            }
+        }
+        conn.conn.close(0u32.into(), b"no answer");
     }
 
     /// Stop: no more reconnects, and the connection closed.
@@ -237,5 +318,46 @@ async fn shutting_down(conn: &Connection) {
     };
     if events.await.is_none() {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(addr: &str) -> ConnectionPath {
+        ConnectionPath::of_ip(addr.parse().unwrap())
+    }
+
+    #[test]
+    fn private_link_local_and_loopback_addresses_are_the_lan() {
+        for addr in [
+            "192.168.86.176:4433",
+            "10.0.0.2:4433",
+            "172.20.1.1:4433",
+            "169.254.3.4:4433",
+            "127.0.0.1:4433",
+            "[fd12:3456::1]:4433",
+            "[fe80::1]:4433",
+            "[::1]:4433",
+            "[::ffff:192.168.1.10]:4433",
+        ] {
+            assert!(matches!(path(addr), ConnectionPath::Lan { .. }), "{addr}");
+        }
+    }
+
+    #[test]
+    fn a_public_address_is_direct() {
+        for addr in [
+            "203.0.113.7:4433",
+            "100.64.1.2:4433",
+            "[2001:db8::1]:4433",
+            "[::ffff:8.8.8.8]:4433",
+        ] {
+            assert!(
+                matches!(path(addr), ConnectionPath::Direct { .. }),
+                "{addr}"
+            );
+        }
     }
 }

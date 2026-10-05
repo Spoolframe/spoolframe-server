@@ -19,30 +19,32 @@ use spoolframe_protocol::device_sign_in::{
 };
 use spoolframe_protocol::streams::{bi, reset, uni};
 use spoolframe_protocol::{
-    ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize, ChosenTracks, ConvertedSubtitle,
-    MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan,
-    SUBTITLE_CHUNK, Selection, SubtitleAction,
+    APP_RP_ID, AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, FinishPasskeySignIn,
+    Hello, LoginPassword, PasskeyInfo, PinProof, PinState, PlexLink, PlexSyncSummary, Reply,
+    Request, RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_protocol::{
-    AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, LoginPassword, PinState,
-    PlexLink, PlexSyncSummary, Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId,
-    SessionInfo, UserSummary,
+    ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize, ChosenTracks, ConvertedSubtitle,
+    MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle, PlaybackPlan,
+    SUBTITLE_CHUNK, Selection, SubtitleAction, TopResult,
 };
 use spoolframe_types::{ArtworkId, Item, MediaId, MediaKind, Namespace, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
 
 use crate::artwork::{Artwork, ArtworkError};
-use crate::auth::{self, LoginError, SessionToken, UnlockError};
+use crate::auth::{self, LoginError, RECENT_SIGN_IN, SessionToken, UnlockError};
 use crate::device_sign_in::{self, ClaimError, Outcome, Waiting};
 use crate::encode::job::{EncodeJob, JobError, Progress};
 use crate::encode::{Conversion, ConversionSource, hls};
 use crate::network::{ConnectionAuth, Connections, ServerName, Services};
+use crate::passkeys::{CeremonyError, SignInError};
 use crate::planner;
 use crate::playback::{Changed, Opened, Playback, Playbacks, Refusal, Sidecar};
 use crate::plex_accounts::Link;
 use crate::previews::{self, PreviewState};
 use crate::principal::Principal;
+use crate::store::passkeys::{PasskeyError, PasskeyRecord};
 use crate::store::pins::PinError;
 use crate::store::sessions::{SessionBinding, SessionUser};
 use crate::subtitles::{TextSource, TextState};
@@ -286,6 +288,20 @@ impl ClientProtocol {
                     Outcome::Denied => Err(Error::DeviceSignInDenied),
                     Outcome::Expired => Err(Error::DeviceSignInExpired),
                 }
+            }
+            Request::BeginPasskeySignIn { username } => {
+                let endpoint = connection.remote_id().to_string();
+                self.services
+                    .app_passkeys
+                    .begin_sign_in(self.store(), &endpoint, username.as_deref())
+                    .await
+                    .map(Reply::PasskeyRequest)
+                    .map_err(sign_in_error)
+            }
+            Request::FinishPasskeySignIn(signed) => {
+                let hello = state.hello.get().expect("checked above");
+                self.finish_passkey_sign_in(connection, &signed, hello)
+                    .await
             }
             // Everything else needs a session that is live on this
             // endpoint. Each request names its own, so one connection can
@@ -680,13 +696,46 @@ impl ClientProtocol {
                 // Asked while locked too: a PIN pad sizes itself by it.
                 let pin = self.store().pin_info(user.user).await.map_err(internal)?;
                 Ok(Reply::WhoAmI(UserSummary {
-                    user_id: format!("local:{}", user.user.0),
+                    user_id: format!("local:{}", user.user),
                     username: user.username,
                     display_name: user.display_name,
                     role: user.role,
                     locked: state.locks.lock().expect("never poisoned").locked(&session),
                     pin: pin.map(|p| PinState { digits: p.digits }),
                 }))
+            }
+            Request::BeginPasskeyRegistration => {
+                // P3-03's rule, as for a passkey added in the web UI: a
+                // session left signed in on a device does not add one.
+                recently_signed_in(&user)?;
+                let account = self.account(&user).await?;
+                self.services
+                    .app_passkeys
+                    .begin_registration(
+                        self.store(),
+                        &SessionToken(session.0.clone()).hash(),
+                        &connection.remote_id().to_string(),
+                        &account,
+                        &self.name.get(),
+                    )
+                    .await
+                    .map(Reply::PasskeyCreation)
+                    .map_err(ceremony_error)
+            }
+            Request::FinishPasskeyRegistration(made) => {
+                let account = self.account(&user).await?;
+                self.services
+                    .app_passkeys
+                    .finish_registration(
+                        self.store(),
+                        &SessionToken(session.0.clone()).hash(),
+                        &connection.remote_id().to_string(),
+                        &account,
+                        &made,
+                    )
+                    .await
+                    .map_err(ceremony_error)?;
+                Ok(Reply::Done)
             }
             Request::UnlockProfile { pin } => {
                 let endpoint = connection.remote_id().to_string();
@@ -701,25 +750,16 @@ impl ClientProtocol {
             // The PIN, and where it is asked for, need only the session
             // (a real sign-in made it, a locked one never gets here, and a
             // PIN is never a way to sign in), and changing or removing the
-            // PIN the current one too: an unlocked session left on a TV
-            // must not let whoever holds the remote take the PIN over.
-            Request::SetPin { pin, current } => {
+            // PIN a proof too: an unlocked session left on a TV must not
+            // let whoever holds the remote take the PIN over.
+            Request::SetPin { pin, proof } => {
                 let Some(digits) = auth::pin_digits(&pin) else {
                     return Err(Error::InvalidInput {
                         message: "a PIN is 4 to 8 digits".into(),
                     });
                 };
-                // Checked as at the lock screen, and counted with it, but
-                // never unlocking: the lock stays as it is.
-                match current {
-                    Some(current) => {
-                        let endpoint = connection.remote_id().to_string();
-                        self.services
-                            .auth
-                            .check_pin(user.user, &endpoint, &current)
-                            .await
-                            .map_err(pin_error)?;
-                    }
+                match proof {
+                    Some(proof) => self.check_pin_proof(connection, &user, proof).await?,
                     None => {
                         if self
                             .store()
@@ -729,7 +769,8 @@ impl ClientProtocol {
                             .is_some()
                         {
                             return Err(Error::InvalidInput {
-                                message: "enter the current PIN to change it".into(),
+                                message: "enter the current PIN or the password to change it"
+                                    .into(),
                             });
                         }
                     }
@@ -742,15 +783,43 @@ impl ClientProtocol {
                 tracing::info!(user = %user.username, "PIN set");
                 Ok(Reply::Done)
             }
-            Request::ClearPin { current } => {
-                let endpoint = connection.remote_id().to_string();
-                self.services
-                    .auth
-                    .check_pin(user.user, &endpoint, &current)
-                    .await
-                    .map_err(pin_error)?;
+            Request::ClearPin { proof } => {
+                self.check_pin_proof(connection, &user, proof).await?;
                 self.store().clear_pin(user.user).await.map_err(internal)?;
                 tracing::info!(user = %user.username, "PIN cleared");
+                Ok(Reply::Done)
+            }
+            // The web UI's me.passkeys, me.passkeyRename and
+            // me.passkeyRemove (P3-05), with the same store calls and so
+            // the same rules: only the user's own, the name's length, and
+            // the last way to sign in kept.
+            Request::ListPasskeys => {
+                let passkeys = self
+                    .store()
+                    .list_passkeys(user.user)
+                    .await
+                    .map_err(internal)?
+                    .into_iter()
+                    .map(passkey_info)
+                    .collect();
+                Ok(Reply::Passkeys { passkeys })
+            }
+            Request::RenamePasskey { id, name } => {
+                self.store()
+                    .rename_passkey(user.user, &id, &name)
+                    .await
+                    .map_err(|e| passkey_error(e, &id))?;
+                Ok(Reply::Done)
+            }
+            Request::RemovePasskey { id } => {
+                // As the web UI asks: a device left signed in does not
+                // take a way to sign in away.
+                recently_signed_in(&user)?;
+                self.store()
+                    .remove_passkey(user.user, &id)
+                    .await
+                    .map_err(|e| passkey_error(e, &id))?;
+                tracing::info!(user = %user.user, "passkey removed by its user, in an app");
                 Ok(Reply::Done)
             }
             Request::ListDevices => {
@@ -883,9 +952,12 @@ impl ClientProtocol {
                     crate::search::search(catalog.as_ref(), &search, crate::search::this_year())
                         .await
                         .map_err(catalog_error)?;
-                let items = results
-                    .top
-                    .iter_mut()
+                let top = match &mut results.top {
+                    Some(TopResult::Item(item)) => Some(item),
+                    _ => None,
+                };
+                let items = top
+                    .into_iter()
                     .chain(results.groups.iter_mut().flat_map(|g| g.items.iter_mut()))
                     .chain(results.without_year.iter_mut());
                 self.fill(principal, items).await?;
@@ -1299,6 +1371,8 @@ impl ClientProtocol {
             | Request::Ping
             | Request::BeginDeviceSignIn
             | Request::AwaitDeviceSignIn { .. }
+            | Request::BeginPasskeySignIn { .. }
+            | Request::FinishPasskeySignIn(_)
             | Request::Unknown => {
                 unreachable!("pre-auth and unknown requests are answered before the session check")
             }
@@ -1337,15 +1411,109 @@ impl ClientProtocol {
                     session: SessionId(done.token.0),
                 })
             }
-            Err(LoginError::InvalidCredentials) => Err(Error::InvalidCredentials),
-            Err(LoginError::RateLimited { retry_after }) => Err(Error::RateLimited {
-                retry_after_ms: u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX),
-            }),
-            Err(LoginError::Internal(e)) => {
-                tracing::error!(error = %e, "login failed");
-                Err(Error::Internal)
+            Err(e) => Err(login_error(e)),
+        }
+    }
+
+    /// A sign-in with an app passkey (P3-19) from this connection's
+    /// endpoint: a session bound to it, as [`Self::login_password`] opens.
+    async fn finish_passkey_sign_in(
+        &self,
+        connection: &Connection,
+        signed: &FinishPasskeySignIn,
+        hello: &Hello,
+    ) -> Result<Reply, Error> {
+        let endpoint_id = connection.remote_id().to_string();
+        let user = self
+            .services
+            .app_passkeys
+            .finish_sign_in(&self.services.auth, &endpoint_id, signed)
+            .await
+            .map_err(sign_in_error)?;
+        let binding = SessionBinding::Endpoint {
+            endpoint_id: endpoint_id.clone(),
+            device_name: hello.device_name.clone(),
+            platform: hello.platform,
+        };
+        let token = self
+            .services
+            .auth
+            .open_session(user.id, &binding)
+            .await
+            .map_err(internal)?;
+        tracing::info!(endpoint = %endpoint_id, user = %user.id, "logged in with an app passkey");
+        Ok(Reply::LoggedIn {
+            session: SessionId(token.0),
+        })
+    }
+
+    /// The account of `user`, a session's.
+    async fn account(&self, user: &SessionUser) -> Result<crate::store::users::UserRecord, Error> {
+        self.store()
+            .user_by_id(user.user)
+            .await
+            .map_err(internal)?
+            .ok_or(Error::Unauthenticated)
+    }
+
+    /// `proof` that `user` may change or remove their PIN. The PIN is
+    /// checked as at the lock screen and counted with it, but unlocks
+    /// nothing (the lock stays as it is); the password as at sign-in.
+    async fn check_pin_proof(
+        &self,
+        connection: &Connection,
+        user: &SessionUser,
+        proof: PinProof,
+    ) -> Result<(), Error> {
+        match proof {
+            PinProof::Pin { pin } => {
+                let endpoint = connection.remote_id().to_string();
+                self.services
+                    .auth
+                    .check_pin(user.user, &endpoint, &pin)
+                    .await
+                    .map_err(pin_error)
+            }
+            PinProof::Password { password } => {
+                self.confirm_password(connection, user, &password).await
             }
         }
+    }
+
+    /// `password` is `user`'s account password, checked and limited as a
+    /// sign-in from this connection's endpoint is: a wrong one is a failed
+    /// login for their username from here, and nothing else (no session
+    /// is revoked, no PIN counted). A user with no password (passkeys or
+    /// SSO only) gets `NoPassword` before anything is counted: their
+    /// session already says who they are, so that tells no one anything.
+    async fn confirm_password(
+        &self,
+        connection: &Connection,
+        user: &SessionUser,
+        password: &str,
+    ) -> Result<(), Error> {
+        let account = self
+            .store()
+            .user_by_id(user.user)
+            .await
+            .map_err(internal)?
+            .ok_or(Error::Unauthenticated)?;
+        if !account.has_password {
+            return Err(Error::NoPassword);
+        }
+        let endpoint = connection.remote_id().to_string();
+        let checked = self
+            .services
+            .auth
+            .check_password(&account.username, password, Some(&endpoint))
+            .await
+            .map_err(login_error)?;
+        // The username is the session user's own; a rename between the two
+        // lookups is not a way to pass with another user's password.
+        if checked.id != user.user {
+            return Err(Error::InvalidCredentials);
+        }
+        Ok(())
     }
 
     /// `typed` as a device sign-in code, if `user` on this endpoint may
@@ -1713,6 +1881,89 @@ fn plex_link(
     })
 }
 
+/// A password that did not pass, for the client: the same answers at
+/// sign-in and wherever else it is asked for.
+fn login_error(e: LoginError) -> Error {
+    match e {
+        LoginError::InvalidCredentials => Error::InvalidCredentials,
+        LoginError::RateLimited { retry_after } => Error::RateLimited {
+            retry_after_ms: u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX),
+        },
+        LoginError::Internal(e) => {
+            tracing::error!(error = %e, "login failed");
+            Error::Internal
+        }
+    }
+}
+
+/// P3-03's rule for what adds or takes away a way to sign in: `user`'s
+/// session proved who they are within [`RECENT_SIGN_IN`].
+fn recently_signed_in(user: &SessionUser) -> Result<(), Error> {
+    let age = crate::store::now() - user.authenticated_at;
+    if age > RECENT_SIGN_IN.as_secs() as i64 {
+        return Err(Error::RecentSignInRequired);
+    }
+    Ok(())
+}
+
+/// A stored passkey as the apps see it. Only an app passkey signs in in
+/// an app; a web UI's is listed so its user sees every way they sign in.
+fn passkey_info(p: PasskeyRecord) -> PasskeyInfo {
+    let app = p.rp_id == APP_RP_ID;
+    PasskeyInfo {
+        id: p.credential_id,
+        name: p.name,
+        created_at: p.created_at,
+        last_used_at: p.last_used_at,
+        rp_id: p.rp_id,
+        app,
+        usable_here: app,
+    }
+}
+
+/// A passkey not renamed or removed, for the client.
+fn passkey_error(e: PasskeyError, id: &str) -> Error {
+    match e {
+        PasskeyError::NoSuchPasskey => Error::NotFound {
+            what: format!("passkey {id}"),
+        },
+        PasskeyError::InvalidName | PasskeyError::Exists => Error::InvalidInput {
+            message: e.to_string(),
+        },
+        PasskeyError::LastSignInMethod => Error::LastSignInMethod,
+        PasskeyError::Store(e) => internal(e),
+    }
+}
+
+/// An app passkey that signed no one in, for the client: as a wrong
+/// password is answered. The log has the reason.
+fn sign_in_error(e: SignInError) -> Error {
+    match e {
+        SignInError::Refused => Error::InvalidCredentials,
+        SignInError::RateLimited { retry_after } => Error::RateLimited {
+            retry_after_ms: u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX),
+        },
+        SignInError::Unavailable(e) | SignInError::Internal(e) => internal(e),
+    }
+}
+
+/// An app passkey that was not kept, for the client.
+fn ceremony_error(e: CeremonyError) -> Error {
+    match e {
+        CeremonyError::NoCeremony | CeremonyError::Refused(_) => {
+            tracing::warn!(reason = %e, "app passkey refused");
+            Error::InvalidCredentials
+        }
+        CeremonyError::Passkey(e @ (PasskeyError::InvalidName | PasskeyError::Exists)) => {
+            Error::InvalidInput {
+                message: e.to_string(),
+            }
+        }
+        CeremonyError::Passkey(e) => internal(e),
+        CeremonyError::Unavailable(e) | CeremonyError::Internal(e) => internal(e),
+    }
+}
+
 /// A PIN that did not pass, for the client: the same answers wherever it
 /// was entered.
 fn pin_error(e: UnlockError) -> Error {
@@ -2051,7 +2302,7 @@ fn watch_error(e: WatchError) -> Error {
 /// this connection's endpoint: apart from passwords and PINs.
 fn sign_in_code_keys(connection: &Connection, user: &SessionUser) -> (String, String) {
     (
-        format!("devcode:{}", user.user.0),
+        format!("devcode:{}", user.user),
         format!("devcode@{}", connection.remote_id()),
     )
 }

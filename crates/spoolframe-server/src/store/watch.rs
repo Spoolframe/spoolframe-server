@@ -424,8 +424,8 @@ mod tests {
     use super::*;
     use crate::store::users::LocalUserId;
 
-    const ALICE: Principal = Principal::LocalUser(LocalUserId(1));
-    const BOB: Principal = Principal::LocalUser(LocalUserId(2));
+    const ALICE: Principal = Principal::LocalUser(LocalUserId::from_uuid(uuid::Uuid::from_u128(1)));
+    const BOB: Principal = Principal::LocalUser(LocalUserId::from_uuid(uuid::Uuid::from_u128(2)));
 
     fn at<'a>(media_id: &'a str, position_ms: i64, ids: &'a [String]) -> WatchUpdate<'a> {
         WatchUpdate {

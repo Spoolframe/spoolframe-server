@@ -1,13 +1,15 @@
-//! What a client learns about a media file before it plays it: its length
-//! and the tracks it can choose between (ARCHITECTURE §6).
+//! What a client learns about a media file before it plays it: its length,
+//! what it is (container and picture, to show), and the tracks it can
+//! choose between (ARCHITECTURE §6).
 //!
-//! Codec details stay on the server, where the playback planner uses them;
-//! a client chooses an audio language, not a codec.
+//! Audio and subtitle codecs stay on the server, where the playback
+//! planner uses them; a client chooses an audio language, not a codec.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::codec::{Container, HdrFormat, VideoCodec};
 use crate::duration_ms;
 
 /// The tracks of one media file. A track is identified by its position in
@@ -16,8 +18,30 @@ use crate::duration_ms;
 pub struct MediaTracks {
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,
+    /// The file's container, from the server's own probe of it. `None`
+    /// only where nothing was probed.
+    pub container: Option<Container>,
+    /// The main picture; `None` for audio only (music).
+    pub video: Option<VideoTrack>,
     pub audio: Vec<AudioTrack>,
     pub subtitles: Vec<SubtitleTrack>,
+}
+
+/// A file's picture as it is stored, for "4K · HEVC · Dolby Vision ·
+/// 10-bit": what the file is, not how it will play.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoTrack {
+    pub codec: VideoCodec,
+    /// Pixels. A 2.40:1 4K film is 3840 by 1600: go by the width for
+    /// its class.
+    pub width: u32,
+    pub height: u32,
+    /// Bits per sample: 8, 10 or 12.
+    pub bit_depth: u32,
+    /// The HDR format; `None` is SDR. Dolby Vision over an HDR10 base is
+    /// Dolby Vision. HDR10+ is HDR10 here: its metadata is in the frames,
+    /// which the probe does not read.
+    pub hdr: Option<HdrFormat>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +115,14 @@ mod tests {
     fn tracks_round_trip_with_the_duration_in_milliseconds() {
         let tracks = MediaTracks {
             duration: Some(Duration::from_millis(6_106_791)),
+            container: Some(Container::Matroska),
+            video: Some(VideoTrack {
+                codec: VideoCodec::Hevc,
+                width: 3840,
+                height: 1600,
+                bit_depth: 10,
+                hdr: Some(HdrFormat::DolbyVision),
+            }),
             audio: vec![AudioTrack {
                 language: Some("eng".into()),
                 title: None,

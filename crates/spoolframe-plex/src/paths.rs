@@ -74,6 +74,25 @@ impl PathMap {
     }
 }
 
+impl PathMap {
+    /// Map `plex` from the library titled `library`, and look for the
+    /// file there: what the path check (P1-04) and an admin's look at an
+    /// item (P3-16) both report.
+    pub fn check(&self, library: Option<&str>, plex: &Path) -> spoolframe_catalog::FileCheck {
+        let mapped = self.map(library, plex);
+        spoolframe_catalog::FileCheck {
+            reported: plex.to_owned(),
+            mapping: mapped.mapping.map(|m| spoolframe_catalog::MappingUsed {
+                library: m.library.clone(),
+                from: m.from.clone(),
+                to: m.to.clone(),
+            }),
+            problem: unreadable(&mapped.local),
+            local: mapped.local,
+        }
+    }
+}
+
 /// The rule with the longest `from` that is a component prefix of `plex`,
 /// and the remainder of `plex` after it.
 fn longest_match<'m>(

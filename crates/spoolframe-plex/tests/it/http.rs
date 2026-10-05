@@ -119,6 +119,111 @@ async fn a_show_comes_with_its_seasons() {
     assert_eq!(got.children.len(), 2);
 }
 
+/// The Cure's "Catch" single: three 24-bit, 96 kHz FLAC tracks.
+async fn serve_catch(server: &MockServer) {
+    serve(server, "/library/metadata/224629", "metadata-album-catch").await;
+    serve(
+        server,
+        "/library/metadata/224629/children",
+        "children-album-catch",
+    )
+    .await;
+}
+
+fn tracks(children: &[Item]) -> Vec<&spoolframe_types::Track> {
+    children
+        .iter()
+        .map(|c| match c {
+            Item::Track(t) => t,
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_album_s_tracks_come_with_their_format_and_the_album_s_count() {
+    let server = MockServer::start().await;
+    serve_catch(&server).await;
+    // Plex gives streams only on items asked for by key, so the tracks
+    // are asked for together, once.
+    Mock::given(method("GET"))
+        .and(path("/library/metadata/224630,224631,224632"))
+        .respond_with(json("metadata-tracks-catch"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let got = catalog(&server)
+        .item(&id(MediaKind::Album, "224629"))
+        .await
+        .unwrap();
+    let Item::Album(album) = &got.item else {
+        panic!("not an album")
+    };
+    assert_eq!(album.track_count, Some(3));
+    let tracks = tracks(&got.children);
+    let shown: Vec<_> = tracks
+        .iter()
+        .map(|t| {
+            (
+                t.track,
+                t.album_track_count,
+                t.codec,
+                t.bit_depth,
+                t.sample_rate,
+            )
+        })
+        .collect();
+    let flac = Some(spoolframe_types::AudioCodec::Flac);
+    assert_eq!(
+        shown,
+        [
+            (Some(1), Some(3), flac, Some(24), Some(96_000)),
+            (Some(2), Some(3), flac, Some(24), Some(96_000)),
+            (Some(3), Some(3), flac, Some(24), Some(96_000)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_album_s_tracks_load_without_their_format_when_plex_cannot_give_it() {
+    let server = MockServer::start().await;
+    serve_catch(&server).await;
+    Mock::given(path("/library/metadata/224630,224631,224632"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let got = catalog(&server)
+        .item(&id(MediaKind::Album, "224629"))
+        .await
+        .unwrap();
+    let tracks = tracks(&got.children);
+    assert_eq!(tracks.len(), 3);
+    for t in tracks {
+        assert_eq!(
+            (t.album_track_count, t.bit_depth, t.sample_rate),
+            (Some(3), None, None)
+        );
+        assert_eq!(t.codec, Some(spoolframe_types::AudioCodec::Flac));
+    }
+}
+
+#[tokio::test]
+async fn a_track_alone_has_its_format() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/metadata/223610", "metadata-track").await;
+    let got = catalog(&server)
+        .item(&id(MediaKind::Track, "223610"))
+        .await
+        .unwrap();
+    let Item::Track(track) = got.item else {
+        panic!("not a track")
+    };
+    assert_eq!(
+        (track.bit_depth, track.sample_rate),
+        (Some(16), Some(44_100))
+    );
+}
+
 #[tokio::test]
 async fn a_movie_has_no_children_and_none_are_fetched() {
     let server = MockServer::start().await;

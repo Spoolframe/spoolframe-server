@@ -667,6 +667,24 @@ fn pair(id: &str, name: &str) -> (String, String) {
     (id.to_owned(), name.to_owned())
 }
 
+/// `/data` mapped to a folder under `dir` holding `films`' files: a
+/// library is added only when its files are on this machine.
+fn files_here(
+    dir: &std::path::Path,
+    films: &[&str],
+) -> Vec<spoolframe_admin_api::PathMappingEntry> {
+    let media = dir.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    for title in films {
+        std::fs::write(media.join(format!("{title}.mkv")), b"film").unwrap();
+    }
+    vec![spoolframe_admin_api::PathMappingEntry {
+        library: None,
+        from: "/data".into(),
+        to: media.display().to_string(),
+    }]
+}
+
 #[tokio::test]
 async fn an_admin_chooses_renames_orders_and_removes_libraries() {
     let tower = pms("Tower", TOWER_SECTIONS, TOWER_FILMS).await;
@@ -712,6 +730,9 @@ async fn an_admin_chooses_renames_orders_and_removes_libraries() {
     assert!(saved.contains("Docs"), "{saved}");
 
     // Kids comes back under Plex's name, last; once is enough.
+    root.plex_server_set_paths("plex".into(), files_here(dir.as_ref(), &["Bambi"]))
+        .await
+        .unwrap();
     let id = root
         .library_add("plex".into(), "2".into(), None)
         .await
@@ -811,6 +832,9 @@ async fn a_second_plex_server_is_added_with_the_first_one_s_token_and_removed_wi
     let twice = root.plex_server_add(cabin.uri(), None).await;
     assert_eq!(code(twice.unwrap_err()), error_code::INVALID_INPUT);
 
+    root.plex_server_set_paths("cabin".into(), files_here(dir.as_ref(), &["Arrival"]))
+        .await
+        .unwrap();
     let id = root
         .library_add("cabin".into(), "1".into(), Some("Cabin movies".into()))
         .await
@@ -912,6 +936,48 @@ async fn a_library_about_to_be_added_has_its_paths_checked_first() {
         .await
         .unwrap();
     assert_eq!(served[0].library, "Movies");
+}
+
+/// Spoolframe plays the files itself: a library none of whose sample
+/// files is on this machine is refused, saying which folder to mount,
+/// and added once its files are found here.
+#[tokio::test]
+async fn a_library_whose_files_are_not_on_this_machine_is_not_added() {
+    let tower = pms("Tower", TOWER_SECTIONS, TOWER_FILMS).await;
+    let file = format!(
+        r#"plex {{ url = "{}"; }}
+        libraries [ {{ name = "Films"; kind = "movies"; plex {{ server = "plex"; section = "1"; }} }} ]"#,
+        tower.uri()
+    );
+    let (_addr, root, dir) = admin_served("not-on-this-machine", &file).await;
+
+    // Documentaries (4) is Baraka, at /data/Baraka.mkv: not here.
+    let refused = root
+        .library_add("plex".into(), "4".into(), None)
+        .await
+        .unwrap_err();
+    let jsonrpsee::core::ClientError::Call(e) = refused else {
+        panic!("not a call error: {refused}");
+    };
+    assert_eq!(
+        (e.code(), e.message()),
+        (
+            error_code::INVALID_INPUT,
+            "Documentaries can't be added: its sample file is not on this machine. \
+             Mount its folder here, or map it to where it is."
+        )
+    );
+    assert_eq!(root.libraries().await.unwrap().libraries.len(), 1);
+
+    // Mapped to where it is here: added.
+    root.plex_server_set_paths("plex".into(), files_here(dir.as_ref(), &["Baraka"]))
+        .await
+        .unwrap();
+    let id = root
+        .library_add("plex".into(), "4".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(id, "plex:4");
 }
 
 /// Plex's own preview index of a part (P3-13), on the Plex server the

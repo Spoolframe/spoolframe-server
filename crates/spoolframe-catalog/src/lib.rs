@@ -6,8 +6,13 @@
 //! can implement it and the server can hold either, without the server and
 //! a catalog depending on each other.
 
+pub mod inspect;
 mod search;
 
+pub use inspect::{
+    Browse, FileCheck, Inspect, Inspected, LibraryCheck, MappingUsed, MissingFile, Row, RowFilter,
+    RowPage, Version, VersionPart,
+};
 pub use search::{Found, FoundGroup, SearchQuery, interleave};
 
 use std::error::Error;

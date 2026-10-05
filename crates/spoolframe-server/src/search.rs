@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use spoolframe_catalog::{Catalog, CatalogError, Found, FoundGroup, SearchQuery};
-use spoolframe_protocol::{SearchCounts, SearchGroup, SearchRequest, SearchResults};
-use spoolframe_types::{Item, MediaId, SearchKind, SearchScope};
+use spoolframe_protocol::{SearchCounts, SearchGroup, SearchRequest, SearchResults, TopResult};
+use spoolframe_types::{Item, MediaId, Person, SearchKind, SearchScope};
 
 /// How many episodes `All` shows: episodes are quiet there, and come last.
 pub const QUIET_EPISODES: usize = 3;
@@ -164,7 +164,15 @@ fn group(
 
     let top = match see_all {
         true => None,
-        false => best(found.iter().flat_map(|g| &g.items), &text).cloned(),
+        false => top(&found, &text),
+    };
+    let top_item = match &top {
+        Some(TopResult::Item(item)) => Some(item.id()),
+        _ => None,
+    };
+    let top_person = match &top {
+        Some(TopResult::Person(person)) => Some(&person.id),
+        _ => None,
     };
     let shows: HashSet<MediaId> = found
         .iter()
@@ -180,11 +188,10 @@ fn group(
         total,
     } in found
     {
-        let before = items.len();
-        if let Some(top) = &top {
-            items.retain(|i| i.id() != top.id());
-        }
-        let removed = before - items.len();
+        let before = items.len() + people.len();
+        items.retain(|i| Some(i.id()) != top_item);
+        people.retain(|p| Some(&p.id) != top_person);
+        let removed = before - items.len() - people.len();
         let mut hidden = 0;
         if quiet && kind == SearchKind::Episodes {
             let before = items.len();
@@ -206,11 +213,17 @@ fn group(
         if shown == 0 && hidden == 0 && !see_all {
             continue;
         }
+        let more = available > shown;
+        let total = match kind {
+            SearchKind::People if more => None,
+            _ => Some(total),
+        };
         groups.push(SearchGroup {
             kind,
             items,
             people,
-            more: available > shown,
+            more,
+            total,
             hidden: u32::try_from(hidden).unwrap_or(u32::MAX),
         });
     }
@@ -263,6 +276,29 @@ fn without_year(text: &str, year: u16, found: &Found, any_year: Found) -> Vec<It
         .collect()
 }
 
+/// The top match of `found`: the best item, unless a person's name
+/// matches better than its title does (or no item is found). On a tie the
+/// item wins: a person is shown in the top spot only when the query is
+/// more surely them, as an exact "keanu reeves" over titles that only
+/// start with it.
+fn top(found: &[FoundGroup], text: &str) -> Option<TopResult> {
+    let item = best(found.iter().flat_map(|g| &g.items), text);
+    let person = found
+        .iter()
+        .flat_map(|g| &g.people)
+        .enumerate()
+        .min_by_key(|&(at, person)| (name_tier(person, text), at))
+        .map(|(_, person)| person);
+    match (item, person) {
+        (Some(item), Some(person)) if name_tier(person, text) < tier(item, text) => {
+            Some(TopResult::Person(person.clone()))
+        }
+        (Some(item), _) => Some(TopResult::Item(item.clone())),
+        (None, Some(person)) => Some(TopResult::Person(person.clone())),
+        (None, None) => None,
+    }
+}
+
 /// The best match among `items`: by [`tier`], then the order they come
 /// in. They come in the groups' order, so on a tie a show beats a movie,
 /// and its own episodes, which are last.
@@ -273,10 +309,20 @@ fn best<'a>(items: impl Iterator<Item = &'a Item>, text: &str) -> Option<&'a Ite
         .map(|(_, item)| item)
 }
 
+/// [`tier`] of a person's name.
+fn name_tier(person: &Person, text: &str) -> u8 {
+    tier_of(&person.name, text)
+}
+
+/// [`tier_of`] the item's title.
+fn tier(item: &Item, text: &str) -> u8 {
+    tier_of(title(item), text)
+}
+
 /// 0 for a title that is the query, 1 for one that starts with it, 2 for
 /// the rest. `text` is [`normalized`].
-fn tier(item: &Item, text: &str) -> u8 {
-    let title = normalized(title(item));
+fn tier_of(title: &str, text: &str) -> u8 {
+    let title = normalized(title);
     if title == text {
         0
     } else if title.starts_with(text) {
@@ -326,7 +372,9 @@ fn year_of(item: &Item) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spoolframe_types::{Artist, Episode, Movie, PlaybackState, Show};
+    use spoolframe_types::{
+        Artist, Episode, Movie, Namespace, Person, PersonId, PersonRole, PlaybackState, Show,
+    };
 
     fn id(kind: &str, key: &str) -> MediaId {
         format!("plex:{kind}:{key}").parse().unwrap()
@@ -338,6 +386,7 @@ mod tests {
             title: title.into(),
             year: Some(year),
             summary: None,
+            content_rating: None,
             duration: None,
             artwork: Vec::new(),
             playback: PlaybackState::default(),
@@ -350,6 +399,9 @@ mod tests {
             title: title.into(),
             year: None,
             summary: None,
+            content_rating: None,
+            season_count: None,
+            genres: Vec::new(),
             artwork: Vec::new(),
         })
     }
@@ -364,6 +416,7 @@ mod tests {
             episode: 1,
             title: title.into(),
             summary: None,
+            content_rating: None,
             duration: None,
             artwork: Vec::new(),
             playback: PlaybackState::default(),
@@ -436,7 +489,7 @@ mod tests {
                 ],
             )],
         );
-        assert_eq!(results.top.unwrap().id().to_string(), "plex:movie:3");
+        assert_eq!(top_item(&results), "plex:movie:3");
     }
 
     #[test]
@@ -460,7 +513,7 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(results.top.unwrap().id().to_string(), "plex:artist:1");
+        assert_eq!(top_item(&results), "plex:artist:1");
     }
 
     #[test]
@@ -476,7 +529,7 @@ mod tests {
                 ],
             )],
         );
-        assert_eq!(results.top.unwrap().id().to_string(), "plex:movie:2");
+        assert_eq!(top_item(&results), "plex:movie:2");
     }
 
     #[test]
@@ -489,7 +542,7 @@ mod tests {
                 vec![movie("1", "Stargate", 1994), movie("2", "Watergate", 2018)],
             )],
         );
-        assert_eq!(results.top.unwrap().id().to_string(), "plex:movie:1");
+        assert_eq!(top_item(&results), "plex:movie:1");
     }
 
     #[test]
@@ -505,7 +558,7 @@ mod tests {
                 found(SearchKind::Shows, vec![show("5", "The Sopranos")]),
             ],
         );
-        assert_eq!(results.top.unwrap().id().to_string(), "plex:show:5");
+        assert_eq!(top_item(&results), "plex:show:5");
     }
 
     #[test]
@@ -580,7 +633,10 @@ mod tests {
             vec![found(SearchKind::Episodes, six)],
         );
         // One is the top match; the others are all here.
-        assert!(matches!(results.top, Some(Item::Episode(_))));
+        assert!(matches!(
+            results.top,
+            Some(TopResult::Item(Item::Episode(_)))
+        ));
         let episodes = of(&results, SearchKind::Episodes).unwrap();
         assert_eq!(episodes.items.len(), 5);
         assert_eq!(episodes.hidden, 0);
@@ -597,6 +653,182 @@ mod tests {
         let movies = of(&results, SearchKind::Movies).unwrap();
         assert_eq!(movies.items.len(), 2);
         assert!(movies.more);
+    }
+
+    #[test]
+    fn a_group_says_how_many_see_all_finds() {
+        let mut movies = found(
+            SearchKind::Movies,
+            vec![
+                movie("1", "Alien", 1979),
+                movie("2", "Aliens", 1986),
+                movie("3", "Alien 3", 1992),
+            ],
+        );
+        movies.total = 23;
+        let results = grouped(&request(SearchScope::All, None, 2), "alien", vec![movies]);
+        // The top match is out of its group but still one of the 23 a
+        // search for movies alone finds.
+        assert_eq!(top_item(&results), "plex:movie:1");
+        let movies = of(&results, SearchKind::Movies).unwrap();
+        assert_eq!(keys(&movies.items), ["plex:movie:2", "plex:movie:3"]);
+        assert_eq!(movies.total, Some(23));
+    }
+
+    #[test]
+    fn episodes_under_their_show_count_in_their_group_s_total() {
+        let results = grouped(
+            &request(SearchScope::All, None, 10),
+            "letterkenny",
+            vec![
+                found(SearchKind::Shows, vec![show("5", "Letterkenny")]),
+                found(
+                    SearchKind::Episodes,
+                    vec![
+                        episode("6", "Letterkenny Talent Show", "5"),
+                        episode("7", "The Letterkenny Leave", "5"),
+                        episode("8", "Letterkenny Problems", "99"),
+                    ],
+                ),
+            ],
+        );
+        assert_eq!(of(&results, SearchKind::Episodes).unwrap().total, Some(3));
+    }
+
+    fn person(key: &str, name: &str) -> Person {
+        Person {
+            id: PersonId::new(Namespace::Plex, key).unwrap(),
+            name: name.into(),
+            role: PersonRole::Actor,
+            count: Some(1),
+        }
+    }
+
+    fn people(names: &[&str]) -> FoundGroup {
+        let people: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(n, name)| person(&format!("actor-{n}"), name))
+            .collect();
+        FoundGroup {
+            total: people.len() as u32,
+            people,
+            ..FoundGroup::empty(SearchKind::People)
+        }
+    }
+
+    fn top_person(results: &SearchResults) -> &str {
+        match &results.top {
+            Some(TopResult::Person(p)) => &p.name,
+            other => panic!("not a person: {other:?}"),
+        }
+    }
+
+    fn top_item(results: &SearchResults) -> String {
+        match &results.top {
+            Some(TopResult::Item(i)) => i.id().to_string(),
+            other => panic!("not an item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_exact_name_beats_titles_that_only_start_with_it() {
+        let results = grouped(
+            &request(SearchScope::All, None, 10),
+            "keanu reeves",
+            vec![
+                found(
+                    SearchKind::Movies,
+                    vec![movie("1", "Keanu Reeves: Unscripted", 2020)],
+                ),
+                people(&["Keanu Reeves"]),
+            ],
+        );
+        assert_eq!(top_person(&results), "Keanu Reeves");
+        // Not repeated in its group, which is left out with nobody else.
+        assert_eq!(of(&results, SearchKind::People), None);
+        assert_eq!(
+            keys(&of(&results, SearchKind::Movies).unwrap().items),
+            ["plex:movie:1"]
+        );
+    }
+
+    #[test]
+    fn a_title_as_good_as_a_name_wins() {
+        let results = grouped(
+            &request(SearchScope::All, None, 10),
+            "madonna",
+            vec![
+                people(&["Madonna"]),
+                found(
+                    SearchKind::Artists,
+                    vec![Item::Artist(Artist {
+                        id: id("artist", "1"),
+                        name: "Madonna".into(),
+                        summary: None,
+                        artwork: Vec::new(),
+                    })],
+                ),
+            ],
+        );
+        assert_eq!(top_item(&results), "plex:artist:1");
+        let tom = grouped(
+            &request(SearchScope::All, None, 10),
+            "tom",
+            vec![
+                found(SearchKind::Shows, vec![show("5", "Tom & Jerry")]),
+                people(&["Tom Hanks"]),
+            ],
+        );
+        assert_eq!(top_item(&tom), "plex:show:5");
+    }
+
+    #[test]
+    fn with_only_people_found_the_first_is_the_top_and_still_counted() {
+        let results = grouped(
+            &request(SearchScope::All, None, 10),
+            "keanu",
+            vec![people(&["Keanu Reeves", "Keanu Karim", "Keanu Lam"])],
+        );
+        assert_eq!(top_person(&results), "Keanu Reeves");
+        let group = of(&results, SearchKind::People).unwrap();
+        let names: Vec<_> = group.people.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Keanu Karim", "Keanu Lam"]);
+        assert!(!group.more);
+        assert_eq!(group.total, Some(3));
+    }
+
+    #[test]
+    fn a_kind_search_for_people_has_no_top() {
+        let results = grouped(
+            &request(SearchScope::All, Some(SearchKind::People), 10),
+            "keanu",
+            vec![people(&["Keanu Reeves"])],
+        );
+        assert_eq!(results.top, None);
+        assert_eq!(of(&results, SearchKind::People).unwrap().people.len(), 1);
+    }
+
+    #[test]
+    fn people_are_counted_only_when_all_of_them_are_here() {
+        // An exact title, so that neither person is the top match.
+        let zzz = || found(SearchKind::Movies, vec![movie("1", "Zzz", 2000)]);
+        let few = grouped(
+            &request(SearchScope::All, None, 3),
+            "zzz",
+            vec![zzz(), people(&["Keanu Reeves", "Keanu Akana"])],
+        );
+        assert_eq!(of(&few, SearchKind::People).unwrap().total, Some(2));
+        // Plex lists people only up to the limit, so more than fit is
+        // not a count.
+        let many = grouped(
+            &request(SearchScope::All, None, 1),
+            "zzz",
+            vec![zzz(), people(&["Keanu Reeves", "Keanu Akana"])],
+        );
+        let group = of(&many, SearchKind::People).unwrap();
+        assert!(group.more);
+        assert_eq!(group.total, None);
     }
 
     #[test]

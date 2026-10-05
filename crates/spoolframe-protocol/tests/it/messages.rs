@@ -12,13 +12,16 @@ use spoolframe_protocol::{
     SubtitleAction, TrackReason,
 };
 use spoolframe_protocol::{
-    AuthMethod, Error, Event, Hello, LoginPassword, PROTOCOL_VERSION, Reply, Request,
+    AuthMethod, Error, Event, Hello, LoginPassword, PROTOCOL_VERSION, PinProof, Reply, Request,
     RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
+};
+use spoolframe_protocol::{
+    FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
 };
 use spoolframe_protocol::{
     PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleDelivery,
 };
-use spoolframe_protocol::{SearchCounts, SearchGroup, SearchRequest, SearchResults};
+use spoolframe_protocol::{SearchCounts, SearchGroup, SearchRequest, SearchResults, TopResult};
 use spoolframe_types::Delivery;
 use spoolframe_types::{
     AudioCodec, ClientCapabilities, Container, SubtitleFormat, TrackPreferences, VideoCodec,
@@ -39,6 +42,7 @@ fn movie() -> Item {
         title: "Alien".into(),
         year: Some(1979),
         summary: None,
+        content_rating: None,
         duration: Some(Duration::from_secs(7020)),
         artwork: Vec::new(),
         playback: PlaybackState::default(),
@@ -64,7 +68,7 @@ fn markers() -> Vec<Marker> {
 
 fn search_results() -> SearchResults {
     SearchResults {
-        top: Some(movie()),
+        top: Some(TopResult::Item(movie())),
         groups: vec![
             SearchGroup {
                 kind: SearchKind::People,
@@ -76,6 +80,7 @@ fn search_results() -> SearchResults {
                     count: Some(9),
                 }],
                 more: true,
+                total: None,
                 hidden: 0,
             },
             SearchGroup {
@@ -83,6 +88,7 @@ fn search_results() -> SearchResults {
                 items: Vec::new(),
                 people: Vec::new(),
                 more: false,
+                total: Some(3),
                 hidden: 3,
             },
         ],
@@ -134,6 +140,19 @@ fn every_request_round_trips() {
         Request::LookupDeviceSignIn {
             code: "BCDFGHJK".into(),
         },
+        Request::BeginPasskeySignIn { username: None },
+        Request::BeginPasskeySignIn {
+            username: Some("alice".into()),
+        },
+        Request::FinishPasskeySignIn(signed()),
+        Request::BeginPasskeyRegistration,
+        Request::FinishPasskeyRegistration(made()),
+        Request::ListPasskeys,
+        Request::RenamePasskey {
+            id: "AQID".into(),
+            name: "Alice's iPad".into(),
+        },
+        Request::RemovePasskey { id: "AQID".into() },
         Request::ApproveDeviceSignIn {
             code: "BCDFGHJK".into(),
         },
@@ -187,10 +206,16 @@ fn every_request_round_trips() {
         },
         Request::SetPin {
             pin: "4321".into(),
-            current: Some("1234".into()),
+            proof: None,
+        },
+        Request::SetPin {
+            pin: "4321".into(),
+            proof: Some(PinProof::Pin { pin: "1234".into() }),
         },
         Request::ClearPin {
-            current: "4321".into(),
+            proof: PinProof::Password {
+                password: "correct horse".into(),
+            },
         },
         Request::UnlockProfile { pin: "4321".into() },
         Request::ListDevices,
@@ -292,6 +317,40 @@ fn every_reply_round_trips() {
         Reply::AuthMethods {
             methods: vec![AuthMethod::Password, AuthMethod::DeviceApproval],
         },
+        Reply::PasskeyCreation(creation()),
+        Reply::Passkeys {
+            passkeys: vec![
+                PasskeyInfo {
+                    id: "AQID".into(),
+                    name: "Alice's iPhone".into(),
+                    created_at: 1,
+                    last_used_at: Some(2),
+                    rp_id: "spoolframe.app".into(),
+                    app: true,
+                    usable_here: true,
+                },
+                PasskeyInfo {
+                    id: "BAUG".into(),
+                    name: "YubiKey".into(),
+                    created_at: 3,
+                    last_used_at: None,
+                    rp_id: "media.example.org".into(),
+                    app: false,
+                    usable_here: false,
+                },
+            ],
+        },
+        Reply::Passkeys {
+            passkeys: Vec::new(),
+        },
+        Reply::PasskeyRequest(PasskeyRequest {
+            challenge: vec![7; 32],
+            allow_credential_ids: vec![vec![1; 16], vec![2; 16]],
+        }),
+        Reply::PasskeyRequest(PasskeyRequest {
+            challenge: vec![7; 32],
+            allow_credential_ids: Vec::new(),
+        }),
         Reply::Previews(spoolframe_protocol::Previews {
             interval_ms: 10_000,
             tile_width: 320,
@@ -345,7 +404,7 @@ fn every_reply_round_trips() {
         Reply::Search(search_results()),
         Reply::Tracks(MediaTracks::default()),
         Reply::WhoAmI(UserSummary {
-            user_id: "local:1".into(),
+            user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
             username: "alice".into(),
             display_name: "Alice".into(),
             role: spoolframe_types::Role::Consumer,
@@ -483,6 +542,9 @@ fn every_error_round_trips() {
             message: "Plex is down".into(),
         },
         Error::NotSetUp,
+        Error::NoPassword,
+        Error::RecentSignInRequired,
+        Error::LastSignInMethod,
         Error::PreviewsNotReady { done_percent: 7 },
         Error::NoPreviews,
         Error::Internal,
@@ -675,6 +737,59 @@ fn subtitle_bytes_are_a_cbor_byte_string() {
     }
 }
 
+fn creation() -> PasskeyCreation {
+    PasskeyCreation {
+        challenge: vec![7; 32],
+        user_id: vec![9; 16],
+        user_name: "alice on Home Media".into(),
+        display_name: "Alice on Home Media".into(),
+        exclude_credential_ids: vec![vec![1; 16]],
+    }
+}
+
+fn made() -> FinishPasskeyRegistration {
+    FinishPasskeyRegistration {
+        credential_id: vec![1; 16],
+        attestation_object: vec![0xA3; 64],
+        client_data_json: b"{}".to_vec(),
+        name: "Alice's iPhone".into(),
+    }
+}
+
+fn signed() -> FinishPasskeySignIn {
+    FinishPasskeySignIn {
+        credential_id: vec![1; 16],
+        authenticator_data: vec![0x49; 37],
+        client_data_json: b"{}".to_vec(),
+        signature: vec![0x30; 70],
+        user_handle: vec![9; 16],
+    }
+}
+
+/// Passkey bytes go as CBOR byte strings, lists of them too: an app's
+/// platform API gives raw bytes, and arrays of integers would double them.
+#[test]
+fn passkey_bytes_are_cbor_byte_strings() {
+    let ids = vec![vec![0xAB; 100]; 3];
+    let request = Reply::PasskeyRequest(PasskeyRequest {
+        challenge: vec![0xAB; 100],
+        allow_credential_ids: ids.clone(),
+    });
+    assert!(codec::encode(&request).unwrap().len() < 470);
+    let creation = Reply::PasskeyCreation(PasskeyCreation {
+        exclude_credential_ids: ids,
+        ..creation()
+    });
+    assert!(codec::encode(&creation).unwrap().len() < 600);
+    let signed = Request::FinishPasskeySignIn(FinishPasskeySignIn {
+        authenticator_data: vec![0xAB; 100],
+        client_data_json: vec![0xAB; 100],
+        signature: vec![0xAB; 100],
+        ..signed()
+    });
+    assert!(codec::encode(&signed).unwrap().len() < 500);
+}
+
 #[test]
 fn events_round_trip() {
     round_trip(Event::ShuttingDown);
@@ -789,6 +904,24 @@ fn a_search_is_flat_on_the_wire() {
     assert_eq!(reply["groups"][0]["people"][0]["id"], "plex:actor-134469");
     assert_eq!(reply["groups"][1]["hidden"], 3);
     assert_eq!(reply["counts"]["shows"], serde_json::Value::Null);
+    assert_eq!(reply["top"]["item"]["kind"], "movie");
+    assert_eq!(reply["groups"][1]["total"], 3);
+    assert_eq!(reply["groups"][0]["total"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_person_at_the_top_is_tagged_person_on_the_wire() {
+    let keanu = Person {
+        id: PersonId::new(Namespace::Plex, "actor-134469").unwrap(),
+        name: "Keanu Reeves".into(),
+        role: PersonRole::Actor,
+        count: Some(9),
+    };
+    let top = TopResult::Person(keanu);
+    let json = serde_json::to_value(&top).unwrap();
+    assert_eq!(json["person"]["name"], "Keanu Reeves");
+    assert_eq!(json["person"]["id"], "plex:actor-134469");
+    round_trip(top);
 }
 
 #[test]
@@ -806,6 +939,13 @@ fn only_hello_auth_methods_logins_and_ping_are_pre_auth() {
     assert!(Request::Hello(hello()).is_pre_auth());
     assert!(Request::Ping.is_pre_auth());
     assert!(Request::BeginDeviceSignIn.is_pre_auth());
+    // A passkey signs in (P3-19); only a session makes one.
+    assert!(Request::BeginPasskeySignIn { username: None }.is_pre_auth());
+    assert!(Request::FinishPasskeySignIn(signed()).is_pre_auth());
+    assert!(!Request::BeginPasskeyRegistration.is_pre_auth());
+    assert!(!Request::FinishPasskeyRegistration(made()).is_pre_auth());
+    assert!(!Request::ListPasskeys.is_pre_auth());
+    assert!(!Request::RemovePasskey { id: "AQID".into() }.is_pre_auth());
     assert!(
         Request::AwaitDeviceSignIn {
             request: "r".into()
@@ -832,6 +972,17 @@ fn credentials_stay_out_of_debug_output() {
     };
     assert!(!format!("{login:?}").contains("hunter2"));
     assert!(!format!("{:?}", SessionId("tok3n".into())).contains("tok3n"));
+    let clear = Request::ClearPin {
+        proof: PinProof::Password {
+            password: "hunter2".into(),
+        },
+    };
+    assert!(!format!("{clear:?}").contains("hunter2"));
+    let change = Request::SetPin {
+        pin: "2468".into(),
+        proof: Some(PinProof::Pin { pin: "1357".into() }),
+    };
+    assert!(!format!("{change:?}").contains("1357"));
 }
 
 #[tokio::test]

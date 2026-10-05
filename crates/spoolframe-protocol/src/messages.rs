@@ -16,6 +16,9 @@ use spoolframe_types::{
 };
 
 use crate::media::PlaybackHandle;
+use crate::passkeys::{
+    FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
+};
 use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Selection};
 use crate::plex::PlexLink;
 use crate::previews::Previews;
@@ -75,6 +78,18 @@ pub enum Request {
     AwaitDeviceSignIn {
         request: String,
     },
+    /// Begin signing in with an app passkey (P3-19, [`crate::passkeys`]):
+    /// `PasskeyRequest`, with the passkeys of `username` listed, or none
+    /// listed (any the platform finds) without one. The challenge is
+    /// this device's, for 5 minutes; beginning again replaces it.
+    BeginPasskeySignIn {
+        username: Option<String>,
+    },
+    /// Finish it with what the passkey signed: `LoggedIn`, a session for
+    /// this device, as `LoginPassword` gives (its PIN is asked as usual).
+    /// Anything that does not sign in is `InvalidCredentials`, counted as
+    /// a failed sign-in (then `RateLimited`).
+    FinishPasskeySignIn(FinishPasskeySignIn),
 
     // Need a session.
     Libraries,
@@ -139,23 +154,21 @@ pub enum Request {
         handle: PlaybackHandle,
         position_ms: u64,
     },
-    /// Set the session user's PIN (P2-08): 4 to 8 digits. `Done`.
+    /// Set or change the session user's PIN (P2-08): 4 to 8 digits. `Done`.
     ///
-    /// A user who has one changes it only with it: `current` is checked as
-    /// `UnlockProfile` checks a PIN, and a wrong one counts towards the
-    /// same limit (`InvalidCredentials`, then `RateLimited`, and after 10
-    /// wrong in a row `Unauthenticated`: the session on this device is
-    /// revoked). Without `current` it is `InvalidInput`. A user with no PIN
-    /// sends none; one sent is not looked at. Checking it unlocks nothing.
+    /// A user with no PIN sets their first with no `proof`. A user who has
+    /// one changes it only with a [`PinProof`]: the current PIN, or the
+    /// account password when the PIN is forgotten. Without one it is
+    /// `InvalidInput`. A locked session gets `ProfileLocked`.
     SetPin {
         pin: String,
-        current: Option<String>,
+        proof: Option<PinProof>,
     },
     /// Remove the session user's PIN, and its requirement on every device,
-    /// with the `current` PIN, checked and limited as for `SetPin`. `Done`;
-    /// also for a user with no PIN.
+    /// with a [`PinProof`], checked as for `SetPin`. `Done`; also for a
+    /// user with no PIN (any PIN passes then).
     ClearPin {
-        current: String,
+        proof: PinProof,
     },
     /// Unlock this session on this connection with the user's PIN (P2-08).
     /// Wrong PINs are rate-limited; after 10 in a row the session on this
@@ -166,6 +179,32 @@ pub enum Request {
     },
     /// The devices the session user has signed in from. `Devices`.
     ListDevices,
+    /// Begin making an app passkey for the session user (P3-19):
+    /// `PasskeyCreation`. Needs a session signed in within the last 10
+    /// minutes, or `RecentSignInRequired`: sign in again first.
+    BeginPasskeyRegistration,
+    /// Keep the passkey made for it, in the session that began it: `Done`.
+    /// One that does not verify is `InvalidCredentials`; a name that is
+    /// not 1 to 64 characters `InvalidInput` (the challenge is not used
+    /// up then).
+    FinishPasskeyRegistration(FinishPasskeyRegistration),
+    /// The session user's passkeys, the web UI's and the apps', oldest
+    /// first: `Passkeys`.
+    ListPasskeys,
+    /// Rename one of them (`id` from `Passkeys`): `Done`. A name that is
+    /// not 1 to 64 characters (trimmed) is `InvalidInput`; an `id` that is
+    /// not one of the session user's passkeys `NotFound`.
+    RenamePasskey {
+        id: String,
+        name: String,
+    },
+    /// Remove one of them: `Done`. Needs a session signed in within the
+    /// last 10 minutes, or `RecentSignInRequired`; the user's last way to
+    /// sign in is `LastSignInMethod`; an `id` that is not one of their
+    /// passkeys `NotFound`.
+    RemovePasskey {
+        id: String,
+    },
     /// The session user's Plex account link (P3-12): `PlexLink`. Read
     /// only; a client links or unlinks by opening `<web_url>/profile`.
     GetPlexLink,
@@ -304,6 +343,8 @@ impl Request {
                 | Request::Ping
                 | Request::BeginDeviceSignIn
                 | Request::AwaitDeviceSignIn { .. }
+                | Request::BeginPasskeySignIn { .. }
+                | Request::FinishPasskeySignIn(_)
         )
     }
 }
@@ -342,6 +383,36 @@ impl fmt::Debug for LoginPassword {
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .finish()
+    }
+}
+
+/// What proves a PIN change or removal is the user's (P2-08): the PIN
+/// they have, or, when it is forgotten, their account password.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PinProof {
+    /// The current PIN, checked as `UnlockProfile` checks it: a wrong one
+    /// counts towards the same limit (`InvalidCredentials`, then
+    /// `RateLimited`) and the same count of wrong PINs in a row; the 10th
+    /// revokes the session on this device (`Unauthenticated`). Checking it
+    /// unlocks nothing. A user with no PIN passes any.
+    Pin { pin: String },
+    /// The account password, checked as `LoginPassword` checks it: a wrong
+    /// one is a failed sign-in for this username from this device
+    /// (`InvalidCredentials`, then `RateLimited`, one limit with
+    /// `LoginPassword`). It never revokes the session and never touches
+    /// the PIN's limit. A user with no password (passkeys or SSO only) gets
+    /// `NoPassword`: the PIN proof, or the web UI, is theirs.
+    Password { password: String },
+}
+
+impl fmt::Debug for PinProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            PinProof::Pin { .. } => "Pin",
+            PinProof::Password { .. } => "Password",
+        };
+        write!(f, "PinProof::{kind}(<redacted>)")
     }
 }
 
@@ -507,6 +578,16 @@ pub enum Reply {
     TrackPreferences(TrackPreferences),
     /// An item's frame previews (`GetPreviews`, P3-13).
     Previews(Previews),
+    /// What the platform makes an app passkey with
+    /// (`BeginPasskeyRegistration`, P3-19).
+    PasskeyCreation(PasskeyCreation),
+    /// What the platform signs in with an app passkey with
+    /// (`BeginPasskeySignIn`, P3-19).
+    PasskeyRequest(PasskeyRequest),
+    /// The session user's passkeys (`ListPasskeys`).
+    Passkeys {
+        passkeys: Vec<PasskeyInfo>,
+    },
 }
 
 /// Which HLS playlist (P2-05).
@@ -537,7 +618,10 @@ pub struct HomeScreen {
 /// A session's user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserSummary {
-    /// Opaque; stable for the user on this server.
+    /// Opaque; stable for the user on this server. Since P3-20 a
+    /// server's ids are UUIDs (`local:<uuid>` today), and one that served
+    /// `local:<number>` before changes it once: a client that kept an id
+    /// reads it again from `WhoAmI`.
     pub user_id: String,
     pub username: String,
     /// What to show; the username when the user has no display name.
@@ -694,6 +778,22 @@ pub enum Error {
     /// to 8 digits, say); the message says why.
     #[error("{message}")]
     InvalidInput { message: String },
+    /// The request carried the user's account password, and they have none:
+    /// they sign in with a passkey or SSO only (a `PinProof::Password`).
+    /// Not a wrong password, and nothing was counted. Use another proof, or
+    /// send them to the server's web UI (`ServerInfo::web_url`, when the
+    /// server has one).
+    #[error("this account has no password; use the PIN or the web UI")]
+    NoPassword,
+    /// The session was signed in too long ago for this (an app passkey,
+    /// P3-19): sign in again, then ask again. Nothing was changed.
+    #[error("sign in again first")]
+    RecentSignInRequired,
+    /// Removing this would leave the user no way to sign in: it is their
+    /// only passkey, and they have no password or linked sign-in provider
+    /// (`RemovePasskey`). Nothing was changed.
+    #[error("that is the last way to sign in to this account")]
+    LastSignInMethod,
     /// The device sign-in was refused on the approving device (P3-07).
     #[error("the sign-in was denied")]
     DeviceSignInDenied,

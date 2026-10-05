@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::codec::AudioCodec;
 use crate::duration_ms;
 use crate::id::{ArtworkId, LibraryId, MediaId};
 
@@ -60,6 +61,9 @@ pub struct Movie {
     pub title: String,
     pub year: Option<u16>,
     pub summary: Option<String>,
+    /// The age rating as the catalog has it ("R", "TV-MA"), shown as
+    /// is; `None` when it has none.
+    pub content_rating: Option<String>,
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,
     pub artwork: Vec<Artwork>,
@@ -72,6 +76,16 @@ pub struct Show {
     pub title: String,
     pub year: Option<u16>,
     pub summary: Option<String>,
+    /// The age rating as the catalog has it ("R", "TV-MA"), shown as
+    /// is; `None` when it has none.
+    pub content_rating: Option<String>,
+    /// How many seasons it has, specials counted as one, as the catalog
+    /// counts them; `None` when it does not say.
+    pub season_count: Option<u32>,
+    /// Its genres, by the catalog's names and in its order. A listing
+    /// may hold only the first few: Plex gives two in listings and
+    /// search, and all of them on the show itself.
+    pub genres: Vec<String>,
     pub artwork: Vec<Artwork>,
 }
 
@@ -101,6 +115,9 @@ pub struct Episode {
     pub episode: u32,
     pub title: String,
     pub summary: Option<String>,
+    /// The episode's own age rating, as on a movie; a client that has
+    /// none here may show the show's.
+    pub content_rating: Option<String>,
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,
     pub artwork: Vec<Artwork>,
@@ -124,6 +141,10 @@ pub struct Album {
     pub artist_name: Option<String>,
     pub title: String,
     pub year: Option<u16>,
+    /// How many tracks it has, on every disc. `None` where the catalog
+    /// does not say: Plex counts them on the album itself, not in
+    /// listings or search.
+    pub track_count: Option<u32>,
     pub artwork: Vec<Artwork>,
 }
 
@@ -136,6 +157,19 @@ pub struct Track {
     /// Position on its disc, when the tags say.
     pub track: Option<u32>,
     pub disc: Option<u32>,
+    /// How many tracks its album has (as `Album::track_count`), for
+    /// "track 3 of 9". Set on an album's own tracks, the children of
+    /// its item; `None` elsewhere.
+    pub album_track_count: Option<u32>,
+    /// The audio codec, `None` when the catalog does not say.
+    pub codec: Option<AudioCodec>,
+    /// Bits per sample (16, 24); `None` when not known, and for lossy
+    /// codecs, which have none. Known for an album's own tracks and a
+    /// track's own item, not in other listings or search.
+    pub bit_depth: Option<u32>,
+    /// Samples per second, in Hz (44_100, 96_000); known where
+    /// `bit_depth` is.
+    pub sample_rate: Option<u32>,
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,
     pub playback: PlaybackState,
@@ -240,6 +274,39 @@ mod tests {
     }
 
     #[test]
+    fn a_track_s_format_is_plain_numbers_on_the_wire() {
+        let track = Track {
+            id: media(MediaKind::Track, "224630"),
+            album_id: media(MediaKind::Album, "224629"),
+            artist_id: media(MediaKind::Artist, "224303"),
+            title: "Catch".into(),
+            track: Some(1),
+            disc: Some(1),
+            album_track_count: Some(3),
+            codec: Some(AudioCodec::Flac),
+            bit_depth: Some(24),
+            sample_rate: Some(96_000),
+            duration: None,
+            playback: PlaybackState::default(),
+        };
+        let json = serde_json::to_value(&track).unwrap();
+        assert_eq!(
+            (
+                &json["codec"],
+                &json["bit_depth"],
+                &json["sample_rate"],
+                &json["album_track_count"]
+            ),
+            (
+                &serde_json::json!("flac"),
+                &serde_json::json!(24),
+                &serde_json::json!(96_000),
+                &serde_json::json!(3)
+            )
+        );
+    }
+
+    #[test]
     fn library_kinds_are_snake_case_on_the_wire() {
         assert_eq!(
             serde_json::to_string(&LibraryKind::Movies).unwrap(),
@@ -283,6 +350,9 @@ mod tests {
             title: "The Expanse".into(),
             year: None,
             summary: None,
+            content_rating: None,
+            season_count: None,
+            genres: Vec::new(),
             artwork: Vec::new(),
         });
         let json = serde_json::to_value(&item).unwrap();
@@ -303,6 +373,7 @@ mod tests {
             title: "Alien".into(),
             year: Some(1979),
             summary: Some("In space no one can hear you scream.".into()),
+            content_rating: Some("R".into()),
             duration: Some(Duration::from_secs(7020)),
             artwork: poster(),
             playback: halfway(),
@@ -312,6 +383,9 @@ mod tests {
             title: "The Expanse".into(),
             year: Some(2015),
             summary: None,
+            content_rating: Some("TV-14".into()),
+            season_count: Some(6),
+            genres: vec!["Science Fiction".into(), "Drama".into()],
             artwork: poster(),
         });
         round_trip(Season {
@@ -331,6 +405,7 @@ mod tests {
             episode: 1,
             title: "Dulcinea".into(),
             summary: None,
+            content_rating: Some("TV-14".into()),
             duration: Some(Duration::from_secs(2640)),
             artwork: poster(),
             playback: PlaybackState::default(),
@@ -347,6 +422,7 @@ mod tests {
             artist_name: Some("Boards of Canada".into()),
             title: "Music Has the Right to Children".into(),
             year: Some(1998),
+            track_count: Some(18),
             artwork: poster(),
         });
         round_trip(Track {
@@ -356,6 +432,10 @@ mod tests {
             title: "Roygbiv".into(),
             track: Some(10),
             disc: Some(1),
+            album_track_count: Some(18),
+            codec: Some(AudioCodec::Flac),
+            bit_depth: Some(16),
+            sample_rate: Some(44_100),
             duration: Some(Duration::from_secs(151)),
             playback: PlaybackState {
                 position: None,

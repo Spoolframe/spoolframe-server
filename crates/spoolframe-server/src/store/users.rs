@@ -1,13 +1,75 @@
 //! Local users and their password credentials (ARCHITECTURE §21).
 
+use std::fmt;
+use std::str::FromStr;
+
 use spoolframe_types::Role;
 use sqlx::Row;
+use sqlx::encode::IsNull;
+use sqlx::error::BoxDynError;
+use sqlx::sqlite::{Sqlite, SqliteArgumentsBuffer, SqliteTypeInfo, SqliteValueRef};
+use uuid::Uuid;
 
 use super::{Store, StoreError, now};
 
-/// A local user's database id. Every login method ends here (§24B).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LocalUserId(pub i64);
+/// A local user's id. Every login method ends here (§24B).
+///
+/// A UUIDv7 (P3-20): unique beyond this server, saying nothing about how
+/// many users it has, and still sorting by creation. Shown and stored
+/// lowercase and hyphenated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LocalUserId(Uuid);
+
+impl LocalUserId {
+    /// A new user's id.
+    pub fn generate() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    /// An id as it is. For tests and for parsing; a new user gets
+    /// [`LocalUserId::generate`].
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+
+    pub fn uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for LocalUserId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0.hyphenated(), f)
+    }
+}
+
+impl FromStr for LocalUserId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::try_parse(s).map(Self)
+    }
+}
+
+/// Stored as its text, as principals carry it (`local:<uuid>`), so the
+/// database reads the same in `sqlite3` as in a log.
+impl sqlx::Type<Sqlite> for LocalUserId {
+    fn type_info() -> SqliteTypeInfo {
+        <String as sqlx::Type<Sqlite>>::type_info()
+    }
+}
+
+impl sqlx::Encode<'_, Sqlite> for LocalUserId {
+    fn encode_by_ref(&self, buf: &mut SqliteArgumentsBuffer) -> Result<IsNull, BoxDynError> {
+        <String as sqlx::Encode<Sqlite>>::encode(self.to_string(), buf)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, Sqlite> for LocalUserId {
+    fn decode(value: SqliteValueRef<'r>) -> Result<Self, BoxDynError> {
+        Ok(<&str as sqlx::Decode<Sqlite>>::decode(value)?.parse()?)
+    }
+}
 
 /// A user as the admin sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,25 +181,27 @@ impl Store {
         let name = normalize_username(username)?;
         let display_name = display_name.map(str::trim).filter(|d| !d.is_empty());
         let now = now();
+        let id = LocalUserId::generate();
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
-            "INSERT INTO users (username, display_name, role, created_at) \
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO users (id, username, display_name, role, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
+        .bind(id)
         .bind(&name)
         .bind(display_name)
         .bind(stored(role))
         .bind(now)
         .execute(&mut *tx)
         .await;
-        let id = match inserted {
-            Ok(done) => done.last_insert_rowid(),
+        match inserted {
+            Ok(_) => {}
             Err(e) if is_unique_violation(&e) => return Err(UserError::Exists(name)),
             Err(e) => return Err(e.into()),
-        };
+        }
         add_password(&mut tx, id, phc, now).await?;
         tx.commit().await?;
-        Ok(LocalUserId(id))
+        Ok(id)
     }
 
     /// Add the first user, as an admin, only if there are no users yet.
@@ -150,7 +214,7 @@ impl Store {
         let now = now();
         let mut tx = self.pool.begin().await?;
         let id = add_first_user(&mut tx, username, now).await?;
-        add_password(&mut tx, id.0, phc, now).await?;
+        add_password(&mut tx, id, phc, now).await?;
         tx.commit().await?;
         Ok(id)
     }
@@ -164,7 +228,7 @@ impl Store {
             "INSERT INTO password_credentials (user_id, phc, updated_at) VALUES (?1, ?2, ?3) \
              ON CONFLICT (user_id) DO UPDATE SET phc = excluded.phc, updated_at = excluded.updated_at",
         )
-        .bind(id.0)
+        .bind(id)
         .bind(phc)
         .bind(now())
         .execute(&mut *tx)
@@ -183,7 +247,7 @@ impl Store {
             keep_an_admin(&mut tx, id, &name).await?;
         }
         sqlx::query("UPDATE users SET role = ?2 WHERE id = ?1")
-            .bind(id.0)
+            .bind(id)
             .bind(stored(role))
             .execute(&mut *tx)
             .await?;
@@ -200,12 +264,12 @@ impl Store {
     ) -> Result<(), UserError> {
         let name = display_name(name)?;
         let changed = sqlx::query("UPDATE users SET display_name = ?2 WHERE id = ?1")
-            .bind(user.0)
+            .bind(user)
             .bind(name)
             .execute(&self.pool)
             .await?;
         if changed.rows_affected() == 0 {
-            return Err(UserError::NoSuchUser(format!("#{}", user.0)));
+            return Err(UserError::NoSuchUser(format!("#{user}")));
         }
         Ok(())
     }
@@ -224,14 +288,14 @@ impl Store {
         let id = user_id(&mut tx, &name).await?;
         keep_an_admin(&mut tx, id, &name).await?;
         sqlx::query("UPDATE users SET disabled_at = ?2 WHERE id = ?1 AND disabled_at IS NULL")
-            .bind(id.0)
+            .bind(id)
             .bind(now)
             .execute(&mut *tx)
             .await?;
         let revoked = sqlx::query(
             "UPDATE sessions SET revoked_at = ?2 WHERE user_id = ?1 AND revoked_at IS NULL",
         )
-        .bind(id.0)
+        .bind(id)
         .bind(now)
         .execute(&mut *tx)
         .await?
@@ -247,7 +311,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let id = user_id(&mut tx, &name).await?;
         sqlx::query("UPDATE users SET disabled_at = NULL WHERE id = ?1")
-            .bind(id.0)
+            .bind(id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -285,7 +349,7 @@ impl Store {
         rows.into_iter()
             .map(|row| {
                 Ok(UserRecord {
-                    id: LocalUserId(row.try_get("id")?),
+                    id: row.try_get("id")?,
                     username: row.try_get("username")?,
                     display_name: row.try_get("display_name")?,
                     role: role(row.try_get("role")?),
@@ -320,7 +384,7 @@ impl Store {
         .await?;
         row.map(|row| {
             Ok(PasswordLogin {
-                id: LocalUserId(row.try_get("id")?),
+                id: row.try_get("id")?,
                 role: role(row.try_get("role")?),
                 disabled: row.try_get("disabled")?,
                 phc: row.try_get("phc")?,
@@ -352,10 +416,12 @@ pub(super) async fn add_first_user(
     now: i64,
 ) -> Result<LocalUserId, UserError> {
     let name = normalize_username(username)?;
+    let id = LocalUserId::generate();
     let inserted = sqlx::query(
-        "INSERT INTO users (username, role, created_at) \
-         SELECT ?1, 'admin', ?2 WHERE NOT EXISTS (SELECT 1 FROM users)",
+        "INSERT INTO users (id, username, role, created_at) \
+         SELECT ?1, ?2, 'admin', ?3 WHERE NOT EXISTS (SELECT 1 FROM users)",
     )
+    .bind(id)
     .bind(&name)
     .bind(now)
     .execute(tx)
@@ -363,12 +429,12 @@ pub(super) async fn add_first_user(
     if inserted.rows_affected() == 0 {
         return Err(UserError::AlreadySetUp);
     }
-    Ok(LocalUserId(inserted.last_insert_rowid()))
+    Ok(id)
 }
 
 async fn add_password(
     tx: &mut sqlx::SqliteConnection,
-    user: i64,
+    user: LocalUserId,
     phc: &str,
     now: i64,
 ) -> Result<(), UserError> {
@@ -394,7 +460,7 @@ async fn keep_an_admin(
            EXISTS (SELECT 1 FROM users WHERE id = ?1 AND role = 'admin' AND disabled_at IS NULL), \
            (SELECT count(*) FROM users WHERE id != ?1 AND role = 'admin' AND disabled_at IS NULL)",
     )
-    .bind(id.0)
+    .bind(id)
     .fetch_one(tx)
     .await?;
     if is_enabled_admin && others == 0 {
@@ -404,12 +470,11 @@ async fn keep_an_admin(
 }
 
 async fn user_id(tx: &mut sqlx::SqliteConnection, name: &str) -> Result<LocalUserId, UserError> {
-    let id: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE username = ?1")
+    let id: Option<LocalUserId> = sqlx::query_scalar("SELECT id FROM users WHERE username = ?1")
         .bind(name)
         .fetch_optional(tx)
         .await?;
-    id.map(LocalUserId)
-        .ok_or_else(|| UserError::NoSuchUser(name.to_owned()))
+    id.ok_or_else(|| UserError::NoSuchUser(name.to_owned()))
 }
 
 #[cfg(test)]
@@ -617,7 +682,7 @@ mod tests {
             "INSERT INTO sessions (token_hash, user_id, kind, created_at, expires_at) \
              VALUES ('h', ?1, 'api', 0, 99999999999)",
         )
-        .bind(id.0)
+        .bind(id)
         .execute(&store.pool)
         .await
         .unwrap();
@@ -657,7 +722,7 @@ mod tests {
             "INSERT INTO sessions (token_hash, user_id, kind, created_at, expires_at) \
              VALUES ('h', ?1, 'endpoint', 0, 1)",
         )
-        .bind(id.0)
+        .bind(id)
         .execute(&store.pool)
         .await;
         assert!(endpoint_without_id.is_err());

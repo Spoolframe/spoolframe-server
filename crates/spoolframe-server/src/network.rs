@@ -141,6 +141,8 @@ pub struct Services {
     pub subtitles: Arc<Subtitles>,
     /// Frame previews for scrubbing (P3-13).
     pub previews: Arc<crate::previews::Previews>,
+    /// The apps' passkeys (P3-19).
+    pub app_passkeys: Arc<crate::app_passkeys::AppPasskeys>,
     /// The web UI's origin (`admin.public_url`), where a browser approves
     /// a device's sign-in (P3-05); `None` without one.
     pub public_url: Option<String>,

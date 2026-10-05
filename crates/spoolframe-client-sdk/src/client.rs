@@ -5,23 +5,33 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use iroh::endpoint::presets;
+use iroh::endpoint::{QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use std::time::Duration;
 
 use spoolframe_protocol::{
-    LoginPassword, Reply, Request, Response, SessionId, device_sign_in, fingerprint, lan,
+    FinishPasskeySignIn, LoginPassword, PasskeyRequest, Reply, Request, Response, SessionId,
+    device_sign_in, fingerprint, lan,
 };
 use spoolframe_types::{ClientCapabilities, Platform};
 
-use crate::connection::ServerConnection;
+use crate::connection::{ServerConnection, Timeouts, retry_safe};
 use crate::discovery::Discovery;
 use crate::error::SdkError;
-use crate::link::{Link, StateWatch};
+use crate::link::{ConnectionPath, Link, StateWatch};
 use crate::servers::{self, SavedServer, ServerEntry};
-use crate::session::{self, Session, StoredSession};
+use crate::session::{self, SavedProfile, Session, StoredSession};
 use crate::storage::{Storage, StorageError, keys};
+
+/// How often the endpoint sends a QUIC keep-alive on an idle connection
+/// (iroh's own default, made explicit: the idle timeout below needs it).
+const KEEP_ALIVE: Duration = Duration::from_secs(5);
+/// How long a connection may hear nothing from the server before QUIC
+/// closes it: three keep-alives unanswered. iroh's default is 30 s; its
+/// per-path limit is already 15 s, and a connection is no better than its
+/// paths. The lower of this and the server's own limit applies.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What the app says about this device and itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +93,7 @@ pub(crate) struct Inner {
     pub(crate) endpoint: Endpoint,
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) device: Device,
+    pub(crate) timeouts: Timeouts,
     discovery: Discovery,
     /// Addresses the app gave for servers (P6's invite tickets will too).
     manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
@@ -104,8 +115,19 @@ impl std::fmt::Debug for Client {
 impl Client {
     /// Open this device: its key from `storage` (made on first start), and
     /// an endpoint with relays off that listens for servers on the LAN and
-    /// never announces itself.
+    /// never announces itself. Requests wait for answers as
+    /// [`Timeouts::default`] says.
     pub async fn open(storage: Arc<dyn Storage>, device: Device) -> Result<Self, SdkError> {
+        Self::open_with(storage, device, Timeouts::default()).await
+    }
+
+    /// [`Client::open`], with requests waiting for answers as `timeouts`
+    /// says.
+    pub async fn open_with(
+        storage: Arc<dyn Storage>,
+        device: Device,
+        timeouts: Timeouts,
+    ) -> Result<Self, SdkError> {
         let key = load_or_create_key(storage.as_ref()).await?;
         // Minimal: no pkarr or DNS lookup, so a LAN client never tries the
         // Internet. mDNS only listens: a laptop or a TV must not announce
@@ -117,9 +139,18 @@ impl Client {
             .service_name(lan::MDNS_SERVICE)
             .build(key.public())
             .map_err(|e| cannot_bind(e.to_string()))?;
+        let transport = QuicTransportConfig::builder()
+            .keep_alive_interval(KEEP_ALIVE)
+            .max_idle_timeout(Some(
+                IDLE_TIMEOUT
+                    .try_into()
+                    .expect("15 s is a valid idle timeout"),
+            ))
+            .build();
         let endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(key)
             .relay_mode(RelayMode::Disabled)
+            .transport_config(transport)
             .bind()
             .await
             .map_err(|e| cannot_bind(e.to_string()))?;
@@ -134,6 +165,7 @@ impl Client {
                 endpoint,
                 storage,
                 device,
+                timeouts,
                 discovery,
                 manual: Mutex::default(),
                 links: Mutex::default(),
@@ -460,19 +492,71 @@ impl Client {
     ) -> Result<Session, SdkError> {
         let server = parse_id(endpoint_id)?;
         self.require_pinned(server).await?;
-        let conn = self.connection(server).await?;
         let login = Request::LoginPassword(LoginPassword {
             username: username.to_owned(),
             password: password.to_owned(),
         });
-        let token = match conn.call(None, login).await? {
+        let token = match self.call(server, None, login).await? {
             Response::Ok(Reply::LoggedIn { session }) => session,
             Response::Ok(other) => {
                 return Err(SdkError::Protocol(format!("login answered {other:?}")));
             }
             Response::Err(e) => return Err(SdkError::from_server(e)),
         };
-        self.keep_session(server, &conn, token).await
+        self.keep_session(server, token).await
+    }
+
+    /// Begin signing in on server `endpoint_id` with a passkey made in the
+    /// app (P3-19): what the platform's passkey API signs, for the relying
+    /// party [`crate::APP_RP_ID`]. With `username`, that user's passkeys
+    /// are listed; without, none are, and the platform offers whichever it
+    /// has for this relying party (a keychain may hold several servers':
+    /// their names say `<username> on <server name>`). The challenge is
+    /// this device's, for 5 minutes; beginning again replaces it.
+    pub async fn begin_passkey_sign_in(
+        &self,
+        endpoint_id: &str,
+        username: Option<&str>,
+    ) -> Result<PasskeyRequest, SdkError> {
+        let server = parse_id(endpoint_id)?;
+        self.require_pinned(server).await?;
+        let begin = Request::BeginPasskeySignIn {
+            username: username.map(str::to_owned),
+        };
+        match self.call(server, None, begin).await? {
+            Response::Ok(Reply::PasskeyRequest(request)) => Ok(request),
+            Response::Ok(other) => Err(SdkError::Protocol(format!(
+                "BeginPasskeySignIn answered {other:?}"
+            ))),
+            Response::Err(e) => Err(SdkError::from_server(e)),
+        }
+    }
+
+    /// Finish it with what the passkey signed, and keep the session, as
+    /// [`Client::sign_in`] does. A passkey that does not sign in (another
+    /// server's, a removed one, an expired or spent challenge) is
+    /// [`SdkError::InvalidCredentials`], counted as a failed sign-in (then
+    /// [`SdkError::RateLimited`]).
+    pub async fn finish_passkey_sign_in(
+        &self,
+        endpoint_id: &str,
+        signed: FinishPasskeySignIn,
+    ) -> Result<Session, SdkError> {
+        let server = parse_id(endpoint_id)?;
+        self.require_pinned(server).await?;
+        let token = match self
+            .call(server, None, Request::FinishPasskeySignIn(signed))
+            .await?
+        {
+            Response::Ok(Reply::LoggedIn { session }) => session,
+            Response::Ok(other) => {
+                return Err(SdkError::Protocol(format!(
+                    "FinishPasskeySignIn answered {other:?}"
+                )));
+            }
+            Response::Err(e) => return Err(SdkError::from_server(e)),
+        };
+        self.keep_session(server, token).await
     }
 
     /// Ask server `endpoint_id` to sign this device in by someone approving
@@ -482,8 +566,7 @@ impl Client {
     pub async fn begin_device_sign_in(&self, endpoint_id: &str) -> Result<DeviceSignIn, SdkError> {
         let server = parse_id(endpoint_id)?;
         self.require_pinned(server).await?;
-        let conn = self.connection(server).await?;
-        match conn.call(None, Request::BeginDeviceSignIn).await? {
+        match self.call(server, None, Request::BeginDeviceSignIn).await? {
             Response::Ok(Reply::DeviceSignInStarted {
                 request,
                 code,
@@ -508,18 +591,24 @@ impl Client {
     /// Wait until `sign_in` is approved, and keep the session it brings:
     /// [`SdkError::SignInDenied`] if it was refused, [`SdkError::SignInExpired`]
     /// once it is over (begin another). Drop the future to stop waiting.
+    ///
+    /// [`SdkError::TimedOut`] or [`SdkError::Unreachable`] when the
+    /// connection failed while waiting: call this again with the same
+    /// `sign_in`, which lives on the server until it expires. It is not
+    /// asked again by itself, since an approval the server sent on a
+    /// connection that then died is spent; asking again says
+    /// [`SdkError::SignInExpired`].
     pub async fn await_device_sign_in(&self, sign_in: &DeviceSignIn) -> Result<Session, SdkError> {
         let server = parse_id(&sign_in.server)?;
         loop {
-            // Asked again on each round: the connection may have been
-            // replaced since, and the request lives on the server.
-            let conn = self.connection(server).await?;
+            // Each round goes on the connection there is then: it may
+            // have been replaced since, and the request lives on the server.
             let request = Request::AwaitDeviceSignIn {
                 request: sign_in.request.clone(),
             };
-            match conn.call(None, request).await? {
+            match self.call(server, None, request).await? {
                 Response::Ok(Reply::LoggedIn { session }) => {
-                    return self.keep_session(server, &conn, session).await;
+                    return self.keep_session(server, session).await;
                 }
                 Response::Ok(Reply::DeviceSignInPending) => {}
                 Response::Ok(other) => {
@@ -536,10 +625,9 @@ impl Client {
     async fn keep_session(
         &self,
         server: EndpointId,
-        conn: &ServerConnection,
         token: SessionId,
     ) -> Result<Session, SdkError> {
-        let user = match conn.call(Some(&token), Request::WhoAmI).await? {
+        let user = match self.call(server, Some(&token), Request::WhoAmI).await? {
             Response::Ok(Reply::WhoAmI(user)) => user,
             Response::Ok(other) => {
                 return Err(SdkError::Protocol(format!("WhoAmI answered {other:?}")));
@@ -553,7 +641,7 @@ impl Client {
         // the server keeps it until it expires or is revoked.
         stored.retain(|s| s.username != user.username);
         stored.push(StoredSession {
-            token: token.0.clone(),
+            token: Some(token.0.clone()),
             username: user.username.clone(),
             display_name: user.display_name.clone(),
         });
@@ -567,17 +655,20 @@ impl Client {
     }
 
     /// "Who's watching": the users signed in on server `endpoint_id` from
-    /// this device, as the server names them now. Sessions the server no
-    /// longer knows are forgotten; their users have to sign in again.
+    /// this device, as the server names them now. A session the server no
+    /// longer knows is ended here: its user stays in
+    /// [`Client::saved_profiles`], to sign in again.
     pub async fn profiles(&self, endpoint_id: &str) -> Result<Vec<Session>, SdkError> {
         let server = parse_id(endpoint_id)?;
         self.require_pinned(server).await?;
         let stored = session::load(self.inner.storage.as_ref(), &server).await?;
-        let conn = self.connection(server).await?;
         let mut profiles = Vec::new();
         for s in stored {
-            let token = SessionId(s.token);
-            match conn.call(Some(&token), Request::WhoAmI).await? {
+            let Some(token) = s.token else {
+                continue;
+            };
+            let token = SessionId(token);
+            match self.call(server, Some(&token), Request::WhoAmI).await? {
                 Response::Ok(Reply::WhoAmI(user)) => profiles.push(Session {
                     client: self.clone(),
                     server,
@@ -585,8 +676,11 @@ impl Client {
                     user,
                 }),
                 Response::Err(spoolframe_protocol::Error::Unauthenticated) => {
-                    tracing::info!(user = s.username, "a session has ended; forgetting it");
-                    self.drop_session(server, &token).await?;
+                    tracing::info!(
+                        user = s.username,
+                        "a session has ended; keeping the profile"
+                    );
+                    self.end_session(server, &token).await?;
                 }
                 Response::Ok(other) => {
                     return Err(SdkError::Protocol(format!("WhoAmI answered {other:?}")));
@@ -597,16 +691,64 @@ impl Client {
         Ok(profiles)
     }
 
-    /// Forget the session `token` on `server`.
+    /// Everyone signed in on server `endpoint_id` from this device, and
+    /// whether choosing them signs in by itself or asks for a password: for
+    /// "Who's watching" before, or without, a connection. In the order
+    /// they first signed in. Nothing here asks the server; use
+    /// [`Client::profiles`] for the sessions that still work.
+    pub async fn saved_profiles(&self, endpoint_id: &str) -> Result<Vec<SavedProfile>, SdkError> {
+        let server = parse_id(endpoint_id)?;
+        let stored = session::load(self.inner.storage.as_ref(), &server).await?;
+        Ok(stored.iter().map(SavedProfile::from).collect())
+    }
+
+    /// Take `username` off this device's "Who's watching" for server
+    /// `endpoint_id`. A session kept for them is only forgotten here, not
+    /// ended on the server: [`Session::sign_out`] does both.
+    pub async fn forget_profile(&self, endpoint_id: &str, username: &str) -> Result<(), SdkError> {
+        let server = parse_id(endpoint_id)?;
+        self.update_sessions(server, |stored| stored.retain(|s| s.username != username))
+            .await
+    }
+
+    /// Forget the session `token` on `server`, profile and all.
     pub(crate) async fn drop_session(
         &self,
         server: EndpointId,
         token: &SessionId,
     ) -> Result<(), SdkError> {
+        self.update_sessions(server, |stored| {
+            stored.retain(|s| s.token.as_deref() != Some(token.0.as_str()))
+        })
+        .await
+    }
+
+    /// The server ended the session `token` on `server`: forget the token,
+    /// and keep its user, who now signs in with a password.
+    pub(crate) async fn end_session(
+        &self,
+        server: EndpointId,
+        token: &SessionId,
+    ) -> Result<(), SdkError> {
+        self.update_sessions(server, |stored| {
+            for s in stored {
+                if s.token.as_deref() == Some(token.0.as_str()) {
+                    s.token = None;
+                }
+            }
+        })
+        .await
+    }
+
+    async fn update_sessions(
+        &self,
+        server: EndpointId,
+        change: impl FnOnce(&mut Vec<StoredSession>),
+    ) -> Result<(), SdkError> {
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
         let mut stored = session::load(storage, &server).await?;
-        stored.retain(|s| s.token != token.0);
+        change(&mut stored);
         session::save(storage, &server, &stored).await?;
         Ok(())
     }
@@ -626,17 +768,121 @@ impl Client {
             .clone()
     }
 
+    /// How this device reaches server `endpoint_id` now, without dialling:
+    /// for a "Who's watching" screen, before any profile is chosen.
+    /// [`ConnectionPath::Unknown`] when there is no connection to it.
+    pub fn connection_path(&self, endpoint_id: &str) -> Result<ConnectionPath, SdkError> {
+        Ok(self.path_of(parse_id(endpoint_id)?))
+    }
+
+    /// The path of the connection to `id` now, without dialling.
+    pub(crate) fn path_of(&self, id: EndpointId) -> ConnectionPath {
+        self.link(id).path()
+    }
+
     /// What `id` said in the latest connection's Hello.
     pub(crate) fn server_info(&self, id: EndpointId) -> Option<spoolframe_protocol::ServerInfo> {
         self.link(id).info()
     }
 
-    /// The open connection to `id`: the one there is, or a new one.
-    pub(crate) async fn connection(
+    /// One request to `server` in `session`, within its time limit
+    /// ([`Timeouts`]); see [`Client::on_connection`] for a connection
+    /// that fails under it.
+    pub(crate) async fn call(
         &self,
-        id: EndpointId,
-    ) -> Result<Arc<ServerConnection>, SdkError> {
-        self.link(id).connection(self).await
+        server: EndpointId,
+        session: Option<&SessionId>,
+        request: Request,
+    ) -> Result<Response, SdkError> {
+        let limit = self.inner.timeouts.of(&request);
+        let retry = retry_safe(&request);
+        self.on_connection(server, retry, |conn| {
+            let request = request.clone();
+            async move { conn.call(session, request, limit).await }
+        })
+        .await
+    }
+
+    /// Run `exchange` on `server`'s connection. When the connection fails
+    /// under it (no answer in time, a broken stream), it is asked for a
+    /// `Ping`; unanswered, it is dropped, and the next call dials. Then an
+    /// exchange that may be repeated (`retry`) runs once more, on a new
+    /// connection. A connection that answers the `Ping` is kept: the
+    /// server is alive and slow, and asking it again would not help.
+    pub(crate) async fn on_connection<T, F, Fut>(
+        &self,
+        server: EndpointId,
+        retry: bool,
+        exchange: F,
+    ) -> Result<T, SdkError>
+    where
+        F: Fn(Arc<ServerConnection>) -> Fut,
+        Fut: Future<Output = Result<T, SdkError>>,
+    {
+        let link = self.link(server);
+        let conn = link.connection(self).await?;
+        let error = match exchange(conn.clone()).await {
+            Err(e) if e.is_transport() => e,
+            done => return done,
+        };
+        let dead = self.drop_if_dead(&link, &conn).await;
+        if !(dead && retry) {
+            return Err(error);
+        }
+        tracing::debug!(%server, %error, "asking again on a new connection");
+        let conn = link.connection(self).await?;
+        let again = exchange(conn.clone()).await;
+        if again.as_ref().is_err_and(SdkError::is_transport) {
+            self.drop_if_dead(&link, &conn).await;
+        }
+        again
+    }
+
+    /// Drop `conn` if it does not answer a `Ping`; whether it was dropped.
+    async fn drop_if_dead(&self, link: &Link, conn: &Arc<ServerConnection>) -> bool {
+        if conn.answers(self.inner.timeouts.ping).await {
+            return false;
+        }
+        link.drop_dead(conn);
+        true
+    }
+
+    /// Check the connections after the app was away: call it when the app
+    /// comes back to the foreground (iOS and tvOS: on
+    /// `sceneWillEnterForeground` or `applicationWillEnterForeground`), and
+    /// after the device wakes from sleep or changes network (Linux: logind's
+    /// `PrepareForSleep(false)`, a NetworkManager change).
+    ///
+    /// While the app was suspended, the server may have dropped its side
+    /// of a connection that still looks open here. Each open connection is
+    /// asked for a `Ping`; one that does not answer within
+    /// [`Timeouts::ping`] is dropped and dialled again in the background,
+    /// so the next request goes on a working one instead of waiting out
+    /// its time limit. Servers with no connection are not dialled. Returns
+    /// within about [`Timeouts::ping`]; it is cheap, and safe to call at
+    /// any time.
+    pub async fn resume(&self) {
+        let links: Vec<Arc<Link>> = self
+            .inner
+            .links
+            .lock()
+            .expect("never poisoned")
+            .values()
+            .cloned()
+            .collect();
+        let ping = self.inner.timeouts.ping;
+        let mut checks = tokio::task::JoinSet::new();
+        for link in links {
+            let Some(conn) = link.open() else {
+                continue;
+            };
+            checks.spawn(async move {
+                if !conn.answers(ping).await {
+                    link.drop_dead(&conn);
+                }
+            });
+        }
+        while checks.join_next().await.is_some() {}
     }
 
     /// Dial `id`. Once it answers as itself, a saved server's name and
@@ -667,7 +913,13 @@ impl Client {
             }
         }
         let addr = EndpointAddr::from_parts(id, addrs.iter().copied().map(TransportAddr::Ip));
-        let conn = ServerConnection::dial(&self.inner.endpoint, addr, &self.inner.device).await?;
+        let conn = ServerConnection::dial(
+            &self.inner.endpoint,
+            addr,
+            &self.inner.device,
+            &self.inner.timeouts,
+        )
+        .await?;
         // Where the server answered. Not what was heard before dialling:
         // when the endpoint resolves a server through mDNS while dialling,
         // that record is not passed on to the discovery subscription, so

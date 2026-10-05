@@ -38,6 +38,30 @@ async fn a_session_works_only_from_the_endpoint_that_logged_in() {
     server.stop().await;
 }
 
+/// P3-20: `local:` and a lowercase, hyphenated UUIDv7, not a number.
+#[tokio::test]
+async fn who_am_i_names_the_user_by_a_uuidv7() {
+    let server = TestServer::start("uuid-user-id").await;
+    server.add_user("alice", "correct horse", None).await;
+    let tv = server.client().await;
+    tv.hello().await;
+    let session = tv.login("alice", "correct horse").await;
+    let Response::Ok(Reply::WhoAmI(UserSummary { user_id, .. })) = who(&tv, &session).await else {
+        panic!("not WhoAmI");
+    };
+    let uuid = user_id.strip_prefix("local:").expect(&user_id);
+    let groups: Vec<_> = uuid.split('-').map(str::len).collect();
+    assert_eq!(groups, [8, 4, 4, 4, 12], "{user_id}");
+    assert!(
+        uuid.chars()
+            .all(|c| c == '-' || c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "{user_id}"
+    );
+    assert_eq!(&uuid[14..15], "7", "version 7: {user_id}");
+    tv.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn two_users_share_one_connection() {
     let server = TestServer::start("two-users").await;

@@ -59,7 +59,7 @@ impl Store {
     pub async fn pin_phc(&self, user: LocalUserId) -> Result<Option<String>, StoreError> {
         Ok(
             sqlx::query_scalar("SELECT phc FROM pin_credentials WHERE user_id = ?1")
-                .bind(user.0)
+                .bind(user)
                 .fetch_optional(&self.pool)
                 .await?,
         )
@@ -69,7 +69,7 @@ impl Store {
     pub async fn pin_info(&self, user: LocalUserId) -> Result<Option<PinInfo>, StoreError> {
         let digits: Option<Option<i64>> =
             sqlx::query_scalar("SELECT digits FROM pin_credentials WHERE user_id = ?1")
-                .bind(user.0)
+                .bind(user)
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(digits.map(|digits| PinInfo {
@@ -91,7 +91,7 @@ impl Store {
              ON CONFLICT (user_id) DO UPDATE SET phc = excluded.phc, \
              updated_at = excluded.updated_at, digits = excluded.digits",
         )
-        .bind(user.0)
+        .bind(user)
         .bind(phc)
         .bind(now())
         .bind(i64::from(digits))
@@ -105,11 +105,11 @@ impl Store {
     pub async fn clear_pin(&self, user: LocalUserId) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM pin_required WHERE user_id = ?1")
-            .bind(user.0)
+            .bind(user)
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM pin_credentials WHERE user_id = ?1")
-            .bind(user.0)
+            .bind(user)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -128,7 +128,7 @@ impl Store {
         let theirs: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM sessions WHERE user_id = ?1 AND endpoint_id = ?2 LIMIT 1",
         )
-        .bind(user.0)
+        .bind(user)
         .bind(endpoint_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -138,7 +138,7 @@ impl Store {
         if required {
             let has_pin: Option<i64> =
                 sqlx::query_scalar("SELECT 1 FROM pin_credentials WHERE user_id = ?1")
-                    .bind(user.0)
+                    .bind(user)
                     .fetch_optional(&mut *tx)
                     .await?;
             if has_pin.is_none() {
@@ -148,14 +148,14 @@ impl Store {
                 "INSERT INTO pin_required (user_id, endpoint_id, set_at) VALUES (?1, ?2, ?3) \
                  ON CONFLICT DO NOTHING",
             )
-            .bind(user.0)
+            .bind(user)
             .bind(endpoint_id)
             .bind(now())
             .execute(&mut *tx)
             .await?;
         } else {
             sqlx::query("DELETE FROM pin_required WHERE user_id = ?1 AND endpoint_id = ?2")
-                .bind(user.0)
+                .bind(user)
                 .bind(endpoint_id)
                 .execute(&mut *tx)
                 .await?;
@@ -174,7 +174,7 @@ impl Store {
              WHERE d.endpoint_id IN (SELECT endpoint_id FROM sessions WHERE user_id = ?1) \
              ORDER BY d.last_seen_at DESC",
         )
-        .bind(user.0)
+        .bind(user)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -190,7 +190,7 @@ impl Store {
             "UPDATE sessions SET revoked_at = ?3 \
              WHERE user_id = ?1 AND endpoint_id = ?2 AND revoked_at IS NULL",
         )
-        .bind(user.0)
+        .bind(user)
         .bind(endpoint_id)
         .bind(now())
         .execute(&self.pool)

@@ -43,6 +43,9 @@ pub struct SessionUser {
     pub role: Role,
     /// The user's PIN is asked for on this session's device (P2-08).
     pub pin_required: bool,
+    /// When they last proved who they are in this session (Unix seconds):
+    /// at sign-in.
+    pub authenticated_at: i64,
 }
 
 /// One of a user's live sessions, as the user may see it: never the token.
@@ -117,7 +120,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6)",
         )
         .bind(token_hash)
-        .bind(user.0)
+        .bind(user)
         .bind(kind)
         .bind(endpoint)
         .bind(now)
@@ -134,7 +137,7 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<ApiSessionUser>, StoreError> {
-        let row: Option<(i64, String, i64)> = sqlx::query_as(
+        let row: Option<(LocalUserId, String, i64)> = sqlx::query_as(
             "SELECT u.id, u.role, s.authenticated_at \
              FROM sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.token_hash = ?1 AND s.kind = 'api' AND s.revoked_at IS NULL \
@@ -145,7 +148,7 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(id, stored, authenticated_at)| ApiSessionUser {
-            user: LocalUserId(id),
+            user: id,
             role: role(stored),
             authenticated_at,
         }))
@@ -185,11 +188,13 @@ impl Store {
         lifetime_secs: i64,
     ) -> Result<Option<SessionUser>, StoreError> {
         let now = now();
-        let row: Option<(i64, String, Option<String>, String, i64, bool)> = sqlx::query_as(
+        type Row = (LocalUserId, String, Option<String>, String, i64, bool, i64);
+        let row: Option<Row> = sqlx::query_as(
             "SELECT u.id, u.username, u.display_name, u.role, s.last_used_at, \
                     EXISTS (SELECT 1 FROM pin_credentials p WHERE p.user_id = u.id) \
                     AND EXISTS (SELECT 1 FROM pin_required r \
-                                WHERE r.user_id = u.id AND r.endpoint_id = s.endpoint_id) \
+                                WHERE r.user_id = u.id AND r.endpoint_id = s.endpoint_id), \
+                    s.authenticated_at \
              FROM sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.token_hash = ?1 AND s.kind = 'endpoint' AND s.endpoint_id = ?2 \
                AND s.revoked_at IS NULL AND s.expires_at > ?3 AND u.disabled_at IS NULL",
@@ -199,7 +204,16 @@ impl Store {
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((id, username, display_name, stored, last_used_at, pin_required)) = row else {
+        let Some((
+            id,
+            username,
+            display_name,
+            stored,
+            last_used_at,
+            pin_required,
+            authenticated_at,
+        )) = row
+        else {
             return Ok(None);
         };
         if now - last_used_at >= RENEW_EVERY_SECS {
@@ -220,11 +234,12 @@ impl Store {
             tx.commit().await?;
         }
         Ok(Some(SessionUser {
-            user: LocalUserId(id),
+            user: id,
             display_name: display_name.unwrap_or_else(|| username.clone()),
             username,
             role: role(stored),
             pin_required,
+            authenticated_at,
         }))
     }
 
@@ -237,7 +252,7 @@ impl Store {
              WHERE s.user_id = ?1 AND s.revoked_at IS NULL AND s.expires_at > ?2 \
              ORDER BY s.last_used_at DESC",
         )
-        .bind(user.0)
+        .bind(user)
         .bind(now())
         .fetch_all(&self.pool)
         .await?)
@@ -272,7 +287,7 @@ impl Store {
             "UPDATE sessions SET revoked_at = ?3 \
              WHERE user_id = ?1 AND token_hash != ?2 AND revoked_at IS NULL",
         )
-        .bind(user.0)
+        .bind(user)
         .bind(keep)
         .bind(now())
         .execute(&self.pool)

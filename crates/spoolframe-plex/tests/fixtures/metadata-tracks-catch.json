@@ -1,0 +1,195 @@
+{
+  "MediaContainer": {
+    "size": 3,
+    "librarySectionID": 12,
+    "librarySectionTitle": "Music",
+    "Metadata": [
+      {
+        "ratingKey": "224630",
+        "key": "/library/metadata/224630",
+        "parentRatingKey": "224629",
+        "grandparentRatingKey": "224303",
+        "guid": "plex://track/5d07cdb3403c640290f4c655",
+        "type": "track",
+        "title": "Catch",
+        "librarySectionID": 12,
+        "summary": "",
+        "index": 1,
+        "parentIndex": 1,
+        "duration": 162539,
+        "addedAt": 1758736312,
+        "Media": [
+          {
+            "id": 530534,
+            "duration": 162539,
+            "bitrate": 2773,
+            "audioChannels": 2,
+            "audioCodec": "flac",
+            "container": "flac",
+            "Part": [
+              {
+                "id": 791812,
+                "duration": 162539,
+                "file": "/slow/media/Music/The Cure/Catch (1987)/The Cure - Catch - 01 - Catch.flac",
+                "size": 56350667,
+                "container": "flac",
+                "Stream": [
+                  {
+                    "id": 2019183,
+                    "streamType": 2,
+                    "codec": "flac",
+                    "index": 0,
+                    "channels": 2,
+                    "bitrate": 2773,
+                    "audioChannelLayout": "stereo",
+                    "bitDepth": 24,
+                    "samplingRate": 96000,
+                    "displayTitle": "FLAC (Stereo)"
+                  },
+                  {
+                    "id": 2019234,
+                    "streamType": 4,
+                    "codec": "lrc",
+                    "format": "lrc",
+                    "displayTitle": "LRC"
+                  },
+                  {
+                    "id": 2019235,
+                    "streamType": 4,
+                    "codec": "txt",
+                    "format": "txt",
+                    "displayTitle": "TXT"
+                  },
+                  {
+                    "id": 2019236,
+                    "streamType": 4,
+                    "codec": "txt",
+                    "format": "txt",
+                    "displayTitle": "TXT"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "ratingKey": "224631",
+        "key": "/library/metadata/224631",
+        "parentRatingKey": "224629",
+        "grandparentRatingKey": "224303",
+        "guid": "plex://track/5d07ce63403c640290054d90",
+        "type": "track",
+        "title": "Breathe",
+        "librarySectionID": 12,
+        "summary": "",
+        "index": 2,
+        "parentIndex": 1,
+        "duration": 287834,
+        "addedAt": 1758736312,
+        "Media": [
+          {
+            "id": 530535,
+            "duration": 287834,
+            "bitrate": 2815,
+            "audioChannels": 2,
+            "audioCodec": "flac",
+            "container": "flac",
+            "Part": [
+              {
+                "id": 791813,
+                "duration": 287834,
+                "file": "/slow/media/Music/The Cure/Catch (1987)/The Cure - Catch - 02 - Breathe.flac",
+                "size": 101304499,
+                "container": "flac",
+                "Stream": [
+                  {
+                    "id": 2019184,
+                    "streamType": 2,
+                    "codec": "flac",
+                    "index": 0,
+                    "channels": 2,
+                    "bitrate": 2815,
+                    "audioChannelLayout": "stereo",
+                    "bitDepth": 24,
+                    "samplingRate": 96000,
+                    "displayTitle": "FLAC (Stereo)"
+                  },
+                  {
+                    "id": 2019238,
+                    "streamType": 4,
+                    "codec": "txt",
+                    "format": "txt",
+                    "displayTitle": "TXT"
+                  },
+                  {
+                    "id": 2019237,
+                    "streamType": 4,
+                    "codec": "txt",
+                    "format": "txt",
+                    "displayTitle": "TXT"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "ratingKey": "224632",
+        "key": "/library/metadata/224632",
+        "parentRatingKey": "224629",
+        "grandparentRatingKey": "224303",
+        "guid": "plex://track/5d07ce64403c6402900554b9",
+        "type": "track",
+        "title": "A Chain of Flowers",
+        "librarySectionID": 12,
+        "summary": "",
+        "index": 3,
+        "parentIndex": 1,
+        "duration": 294800,
+        "addedAt": 1758736312,
+        "Media": [
+          {
+            "id": 530536,
+            "duration": 294800,
+            "bitrate": 2787,
+            "audioChannels": 2,
+            "audioCodec": "flac",
+            "container": "flac",
+            "Part": [
+              {
+                "id": 791814,
+                "duration": 294800,
+                "file": "/slow/media/Music/The Cure/Catch (1987)/The Cure - Catch - 03 - A Chain of Flowers.flac",
+                "size": 102722889,
+                "container": "flac",
+                "Stream": [
+                  {
+                    "id": 2019185,
+                    "streamType": 2,
+                    "codec": "flac",
+                    "index": 0,
+                    "channels": 2,
+                    "bitrate": 2787,
+                    "audioChannelLayout": "stereo",
+                    "bitDepth": 24,
+                    "samplingRate": 96000,
+                    "displayTitle": "FLAC (Stereo)"
+                  },
+                  {
+                    "id": 2019239,
+                    "streamType": 4,
+                    "codec": "txt",
+                    "format": "txt",
+                    "displayTitle": "TXT"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

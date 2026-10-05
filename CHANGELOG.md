@@ -1160,3 +1160,255 @@
   each server; a file from before keeps every server, with the dates
   `None` until they happen again. `trust_new_identity` dates the new key
   as pinned and verified now.
+- Changing or removing a PIN over the client protocol takes the current
+  PIN or the account password (P2-08), so a forgotten PIN is replaced or
+  removed without the web UI: `SetPin { pin, proof: Option<PinProof> }`
+  and `ClearPin { proof: PinProof }`, with `PinProof::Pin { pin }` or
+  `PinProof::Password { password }` (tagged `type`: `pin`, `password`;
+  its `Debug` redacts both). The first PIN needs no proof; changing one
+  without a proof is `InvalidInput`. A PIN proof is checked as before, as
+  `UnlockProfile` checks a PIN (same limit, same count of wrong PINs in a
+  row; 10 wrong revoke the session on that device). A password proof is
+  checked as `LoginPassword` checks it: a wrong one is a failed sign-in
+  for that username from that device (`InvalidCredentials`, then
+  `RateLimited`, one limit with `LoginPassword`), never counts as a wrong
+  PIN and never revokes the session. A user with no password (passkeys or
+  SSO only) who sends one gets the new `Error::NoPassword` (SDK:
+  `SdkError::NoPassword`), with nothing counted; the PIN proof works for
+  them. A locked session still gets `ProfileLocked`. SDK:
+  `Session::set_pin(pin, Option<PinProof>)`, `Session::clear_pin(PinProof)`,
+  and `PinProof` is re-exported. The web UI's `me.pinSet` and
+  `me.pinClear` are unchanged.
+- Users have UUIDv7 ids (P3-20), in place of SQLite row numbers: unique
+  beyond one server, saying nothing about how many users a server has,
+  and still sorting by creation. `WhoAmI`'s `user_id` is
+  `local:<uuid>` (lowercase, hyphenated), still opaque. Wire change: a
+  client that kept a `user_id` reads it again from `WhoAmI`; sessions
+  keep working, tokens are not keyed on it. Passkey user handles stay
+  the random UUIDs they were. The admin API and CLI show no ids and take
+  usernames, as before.
+- Migration 0012 moves an existing database to the new ids in one
+  transaction: each user gets a UUIDv7 made from their creation time,
+  in creation order; `password_credentials`, `sessions`,
+  `pin_credentials`, `pin_required`, `passkey_users`, `passkeys` and
+  `external_identities` move to it; `watch_state`, `continue_hidden`
+  (and their `_ids`), `track_preferences` and `track_overrides` move
+  from `local:<n>` to `local:<uuid>`, and a `local:<n>` of no user is
+  dropped. A row of a user that does not exist fails the migration and
+  leaves the database as it was. Before it runs, the server copies the
+  database to `state_dir/spoolframe.db.pre-0012` (`.1`, `.2`, ... when
+  one is there already) and logs the path; to undo it, stop the server
+  and put that copy in place of `spoolframe.db`. After it,
+  `secrets/plex-account-<n>` is renamed to `plex-account-<uuid>`, from
+  the old-to-new table `legacy_user_ids` the migration keeps, at every
+  start until done. An older server refuses the migrated database
+  (migration 0012 unknown to it).
+- Passkeys in the apps (P3-19), through one relying party every server
+  shares: RP ID `spoolframe.app`, origin `https://spoolframe.app`
+  (`spoolframe_protocol::{APP_RP_ID, APP_ORIGIN}`). It needs nothing
+  configured and does not depend on `admin.public_url`, so a LAN-only
+  server has app passkeys though its web UI has none; the server never
+  contacts `spoolframe.app`. New in `spoolframe/client/1` (wire change):
+  pre-auth `BeginPasskeySignIn { username: Option<String> }` ->
+  `PasskeyRequest { challenge, allow_credential_ids }` (empty: any
+  passkey the platform finds; with a username, that user's app passkeys)
+  and `FinishPasskeySignIn { credential_id, authenticator_data,
+  client_data_json, signature, user_handle }` -> `LoggedIn { session }`,
+  a session bound to the device as `LoginPassword`'s, with its PIN asked
+  as usual; in a session, `BeginPasskeyRegistration` ->
+  `PasskeyCreation { challenge, user_id, user_name, display_name,
+  exclude_credential_ids }` and `FinishPasskeyRegistration {
+  credential_id, attestation_object, client_data_json, name }` -> `Done`.
+  All bytes are CBOR byte strings. Registration needs a session signed in
+  within 10 minutes, or the new `Error::RecentSignInRequired`. A
+  challenge lives 5 minutes, is used once, and is the device's that asked
+  for it (a registration's is its session's). Anything that does not
+  verify is `InvalidCredentials`, counted by the failed-login limit as a
+  web passkey is (then `RateLimited`); a name that is not 1 to 64
+  characters is `InvalidInput`. The account's name in the platform's
+  passkey list is `<username> on <server name>`; the user handle is the
+  random one each user already has per server (P3-05).
+- App passkeys are kept with the web UI's, under the relying-party ID
+  `spoolframe.app`: listed in `me.passkeys` and `userPasskeys` with the
+  new `PasskeyEntry::app` (and `usable`), removable as a web passkey is,
+  and counted by the last-sign-in-method rule. The log no longer calls
+  them passkeys of another host at start.
+- SDK: app passkeys (P3-19). `Client::begin_passkey_sign_in(server,
+  username: Option<&str>) -> PasskeyRequest` and
+  `Client::finish_passkey_sign_in(server, FinishPasskeySignIn) -> Session`
+  (kept as `Client::sign_in` keeps one); `Session::begin_passkey_registration()
+  -> PasskeyCreation` and `Session::finish_passkey_registration(
+  FinishPasskeyRegistration)`. Raw WebAuthn bytes as `Vec<u8>`, for the
+  app to map to and from its platform API; `APP_RP_ID`, `APP_ORIGIN` and
+  the four types are re-exported. New `SdkError::RecentSignInRequired`.
+- Web UI: My profile and an admin's user page show an app passkey
+  (P3-19) as "Spoolframe app · <device>", in the same row as a web
+  passkey (`spoolframe.app · added ...`), removable there as one is.
+- Passkey management in the apps (P3-19), as the web UI's `me.passkeys`,
+  `me.passkeyRename` and `me.passkeyRemove` and through the same store
+  calls. New in `spoolframe/client/1` (wire change), in a session:
+  `ListPasskeys` -> `Passkeys { passkeys: Vec<PasskeyInfo> }`, the user's
+  web and app passkeys oldest first, each `{ id, name, created_at,
+  last_used_at, rp_id, app, usable_here }` (`id` the credential id in
+  base64url, as the web UI's; `usable_here` only for an app passkey);
+  `RenamePasskey { id, name }` -> `Done` (1 to 64 characters trimmed, or
+  `InvalidInput`); `RemovePasskey { id }` -> `Done`, needing a sign-in
+  within 10 minutes (`RecentSignInRequired`) and refusing the user's last
+  way to sign in with the new `Error::LastSignInMethod`. Another user's or
+  an unknown `id` is `NotFound`; a locked profile gets `ProfileLocked`.
+  SDK: `Session::passkeys() -> Vec<PasskeyInfo>`,
+  `Session::rename_passkey(id, name)`, `Session::remove_passkey(id)`,
+  `PasskeyInfo` re-exported, new `SdkError::LastSignInMethod`.
+- `spoolframe-catalog`: the `Inspect` trait (P3-16), an admin's look at
+  a catalog beside `Catalog`: a library's rows a page at a time
+  (`browse`: kinds one after another, a title search, the Unmatched and
+  No artwork filters), `count` per kind, `child_rows`, `inspect` (the
+  item as clients get it, its library, show and season, Plex GUID,
+  versions and parts with the mapping used and whether the file is
+  found, its children as rows), `check_library` (every file, as
+  `check-paths` checks it, each missing one with its item) and
+  `backend_link`.
+- `spoolframe-plex`: `PlexCatalog` implements it. Rows come from Plex's
+  section listings and P3-09's section search with `includeGuids=1`;
+  only the rows of the page have their files looked for. Unmatched is a
+  `local://` or "none" agent GUID, the same thing Plex's own filter
+  shows. "Open in Plex" is the Plex web app's page for the item on the
+  server's machine identifier
+  (`https://app.plex.tv/desktop/#!/server/<id>/details?key=...`). The
+  path check now keeps every failing file with its item
+  (`LibraryPaths::missing`, `section`); its counts and output are as
+  they were.
+- Admin API, catalog browsing (P3-16), admins only (`FORBIDDEN`
+  otherwise), read through the catalog of every Plex server (P3-11):
+  `admin.catalogLibrary(id)` (counts per kind, unmatched and
+  no-artwork counts, Plex's name for the section, and the library's
+  path check, started if it has none), `admin.catalogRows(CatalogQuery
+  { library, kind, text, filter: Missing | Unmatched | NoArtwork,
+  offset, limit <= 200 })`, `admin.catalogChildren(library, id)`,
+  `admin.catalogItem(id)` (the client protocol's `Item` reply as JSON,
+  with the caller's own playback state; external IDs; versions and
+  parts with the mapping used and whether each file is found, looked
+  for when asked; children; "Open in Plex"), `admin.catalogArtwork(id)`
+  (each image's size as Plex has it) and `admin.catalogCheckPaths(id)`.
+  A Plex server that is down is `UNAVAILABLE`: the server keeps no copy
+  of the catalog to show instead.
+- Each library's last path check is kept while the server runs, until
+  its Plex servers, libraries or mappings change. Opening a library
+  starts one if there is none, and Server › Media paths' check
+  (`plexCheckPaths`) fills it in for the libraries it covers. "Missing
+  files" lists that check's own failures, one row per movie, episode or
+  track, so it is exactly what `check-paths` reports; a show's, season's
+  or album's missing count comes from it. Only the rows of a page look
+  for their files as they are listed.
+- `GET /catalog/artwork?id=<ArtworkId>&size=thumb|small|medium|large`
+  on the admin listener: artwork for the catalog pages, resized through
+  the artwork cache, to an admin's session only.
+- Web UI: catalog browsing (P3-16). In Server › Libraries a library's
+  name opens its items (`/admin/libraries/<library>`): movies, shows or
+  albums in a paged table (50, 100 or 200 a page; the page, filter,
+  kind and search are in the address). Shows open in place into seasons
+  and seasons into episodes, and albums into tracks. Each row has its
+  poster, title, year, kind, match (the agents' ids, or Unmatched), its
+  mapped path and whether its file is found; a show, season or album
+  shows how many of its files are missing. The Columns menu adds
+  MediaId, Plex path, Added and Updated. Those columns are kept per
+  admin in this browser (`localStorage`). Missing files, Unmatched and
+  No artwork filters, a Kind select and P3-09's title search; Missing
+  files lists the path check's own list, by episode, with MediaId and
+  Plex path shown. The header names the source, the counts and when the
+  paths were checked.
+- An item (`/admin/libraries/<library>/<MediaId>`) has a header with
+  its artwork, MediaId (copy), Matched, files and markers, and "Open in
+  Plex". Its tabs are Overview (the item as clients get it, its
+  external IDs linked out, the Plex GUID, and Show JSON of the exact
+  client reply), Files & paths (each version and part with size, Plex
+  path, the mapping used, the mapped path and Found or Not found,
+  checked as the page opens), Artwork (each image's id, size and
+  source, or None), Markers (a timeline with each range), Children,
+  and Debug. Debug is shown greyed out: playback debug (P3-15) is not
+  built yet. A consumer who opens a catalog link sees "Only admins can
+  see the catalog". On a phone, the rows are cards with back and next,
+  and the tabs scroll sideways.
+- A Plex server's files must be on this machine (P3-11). Spoolframe
+  plays the files itself, so Add a library and the wizard's Plex step
+  say so under the server choices. A server away from this network (an
+  account server plex.tv has no LAN address for, a public IP, or a
+  plex.direct name for one) is marked "Remote · its files must be
+  mounted here", and the wizard never picks one for you. A library none
+  of whose 5 sample files is found here shows "Not on this machine" and
+  holds the add up, with a reason that names its folders. `libraryAdd`
+  refuses such a library too (`INVALID_INPUT`), in the same words.
+- Movies, shows and episodes carry their age rating, `content_rating`
+  ("R", "TV-MA"), as the catalog has it; `None` when unrated. From
+  Plex's `contentRating`, in listings and single items alike.
+- Shows carry `season_count` (specials count as a season) and `genres`,
+  in lists, search and on the show itself, from Plex's `childCount` and
+  `Genre` tags. Plex lists only the first two genres in listings and
+  search; the show's own item has all of them.
+- Music format and position: a track carries `codec` (the shared
+  `AudioCodec`), `bit_depth` (bits per sample) and `sample_rate` (Hz) as
+  numbers, and `album_track_count` for "track 3 of 9"; an album carries
+  `track_count`. The codec is in every listing; bit depth and sample
+  rate come with an album's own tracks and a track's own item, which
+  ask Plex for the tracks' streams (one request per album, and the
+  tracks still load without them if it fails). `album_track_count` is
+  set on an album's own tracks; `track_count` on an album's own item,
+  where Plex counts them (`leafCount`).
+- `MediaTracks` (the `Tracks` reply) says what the file is: `container`
+  (the shared `Container`) and `video`, a `VideoTrack` with `codec`
+  (`VideoCodec`), `width` and `height` in pixels, `bit_depth` and `hdr`
+  (`HdrFormat`; `None` is SDR). From the server's own probe of the file,
+  which `Tracks` already runs and caches. HDR10+ shows as HDR10: its
+  metadata is per frame, and the probe reads streams, not frames.
+- Search: each `SearchGroup` has `total`, how many a "See all" search
+  for that group finds (its top match and the episodes under their show
+  included): the catalog's exact count for items; for people only when
+  all of them are shown, since Plex lists people only up to the limit.
+- Search: the top match can be a person. `SearchResults.top` is now a
+  `TopResult`, `Item(Item)` or `Person(Person)` (`{"item": …}` or
+  `{"person": …}` on the wire). A person is the top match only when
+  their name matches better than every title (an exact name over titles
+  that start with it), or when only people are found; on a tie the item
+  wins. Like an item, the top person is not repeated in their group.
+  Their items are listed with `PersonItems`, as before.
+- SDK: `Client::saved_profiles(server)` lists everyone signed in on a
+  server from this device, each a `SavedProfile` (`username`,
+  `display_name`, `sign_in`), read from the device's store without the
+  server. `ProfileSignIn::Automatic` has a kept session;
+  `ProfileSignIn::Password` is someone whose session the server ended,
+  who signs in again. A session the server ends is no longer forgotten
+  outright: its token goes and its user stays, as `Password`.
+  `Client::forget_profile(server, username)` takes one off; signing out
+  still removes the profile too. `Client::profiles` is unchanged: the
+  sessions that still work.
+- SDK: `Session::connection_path()` says how the device reaches the
+  server now, for a player's diagnostics: `ConnectionPath::Lan { addr }`
+  (straight to a private, link-local or loopback address),
+  `Direct { addr }` (straight to a public address; iroh does not say
+  whether a hole was punched), `Relay`, or `Unknown` without a
+  connection. It never dials.
+- SDK: `Client::connection_path(endpoint_id)` says how the device
+  reaches a server now, without dialling and before any profile is
+  chosen ("Who's watching"); `Session::connection_path()` is the same
+  for its server. Unknown when there is no connection.
+- SDK: a connection that dies without closing no longer hangs requests
+  (P1-15). An app suspended by iOS came back to a connection the server
+  had dropped, and a request on it waited forever. Now every request has
+  a time limit (`Timeouts`, default 15 s; `Client::open_with` sets it),
+  plus the server's own wait for requests built to wait:
+  `AwaitDeviceSignIn` +25 s, subtitle and converted-media reads +10 s,
+  requests that may probe the file +30 s, starting a playback or
+  changing its subtitle +2 min. A media read or image fails only on a
+  pause of 15 s, not on a slow link. Past the limit a request is the new
+  `SdkError::TimedOut`; the connection is then asked for a `Ping`
+  (3 s), and dropped if that goes unanswered too, so the next request
+  dials. A request that only reads (lists, item, search, `WhoAmI`,
+  `LookupDeviceSignIn`, media reads, images…) is asked once more on the
+  new connection; one that changes something (approve or deny, PINs,
+  playback start, marking watched…) never is, since it may have been
+  done. A connection that answers the `Ping` is kept: the server is
+  slow, not gone. A Hello not answered in time is `Unreachable`.
+  `Client::resume()` pings every open connection and drops those that
+  do not answer, without dialling servers that have none: apps call it
+  on returning to the foreground or waking from sleep. The endpoint's
+  QUIC idle timeout is 15 s (keep-alive every 5 s), down from 30 s.

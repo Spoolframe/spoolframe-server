@@ -8,7 +8,6 @@ use super::{Store, StoreError, now};
 /// One linked identity.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct IdentityRecord {
-    #[sqlx(try_from = "i64")]
     pub user: LocalUserId,
     pub issuer: String,
     pub subject: String,
@@ -53,7 +52,7 @@ impl Store {
         display: Option<&str>,
     ) -> Result<IdentityRecord, IdentityError> {
         let mut tx = self.pool.begin().await?;
-        let owner: Option<i64> = sqlx::query_scalar(
+        let owner: Option<LocalUserId> = sqlx::query_scalar(
             "SELECT user_id FROM external_identities WHERE issuer = ?1 AND subject = ?2",
         )
         .bind(issuer)
@@ -61,7 +60,7 @@ impl Store {
         .fetch_optional(&mut *tx)
         .await?;
         match owner {
-            Some(id) if id == user.0 => return Err(IdentityError::ProviderLinked),
+            Some(id) if id == user => return Err(IdentityError::ProviderLinked),
             Some(_) => return Err(IdentityError::LinkedToAnother),
             None => {}
         }
@@ -70,7 +69,7 @@ impl Store {
             "INSERT INTO external_identities (user_id, issuer, subject, display, linked_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )
-        .bind(user.0)
+        .bind(user)
         .bind(issuer)
         .bind(subject)
         .bind(display)
@@ -103,7 +102,7 @@ impl Store {
         issuer: &str,
         subject: &str,
     ) -> Result<Option<LocalUserId>, StoreError> {
-        let id: Option<i64> = sqlx::query_scalar(
+        let id: Option<LocalUserId> = sqlx::query_scalar(
             "UPDATE external_identities SET last_used_at = ?3 \
              WHERE issuer = ?1 AND subject = ?2 RETURNING user_id",
         )
@@ -112,7 +111,7 @@ impl Store {
         .bind(now())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(id.map(LocalUserId))
+        Ok(id)
     }
 
     /// The user `subject` at `issuer` is linked to, without counting it as
@@ -122,14 +121,14 @@ impl Store {
         issuer: &str,
         subject: &str,
     ) -> Result<Option<LocalUserId>, StoreError> {
-        let id: Option<i64> = sqlx::query_scalar(
+        let id: Option<LocalUserId> = sqlx::query_scalar(
             "SELECT user_id FROM external_identities WHERE issuer = ?1 AND subject = ?2",
         )
         .bind(issuer)
         .bind(subject)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(id.map(LocalUserId))
+        Ok(id)
     }
 
     /// `user`'s linked identities, oldest first.
@@ -141,7 +140,7 @@ impl Store {
             "SELECT user_id AS user, issuer, subject, display, linked_at, last_used_at \
              FROM external_identities WHERE user_id = ?1 ORDER BY linked_at, issuer",
         )
-        .bind(user.0)
+        .bind(user)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -161,7 +160,7 @@ impl Store {
                + (SELECT count(*) FROM passkeys WHERE user_id = ?1) \
                + (SELECT count(*) FROM password_credentials WHERE user_id = ?1)",
         )
-        .bind(user.0)
+        .bind(user)
         .bind(issuer)
         .fetch_one(&mut *tx)
         .await?;
@@ -172,7 +171,7 @@ impl Store {
             return Err(IdentityError::LastSignInMethod);
         }
         sqlx::query("DELETE FROM external_identities WHERE user_id = ?1 AND issuer = ?2")
-            .bind(user.0)
+            .bind(user)
             .bind(issuer)
             .execute(&mut *tx)
             .await?;
@@ -205,7 +204,7 @@ mod tests {
 
     async fn without_password(store: &TestStore, user: LocalUserId) {
         sqlx::query("DELETE FROM password_credentials WHERE user_id = ?1")
-            .bind(user.0)
+            .bind(user)
             .execute(&store.pool)
             .await
             .unwrap();

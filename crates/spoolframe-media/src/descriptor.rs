@@ -6,9 +6,10 @@ use std::time::Duration;
 use easy_ffprobe::{FfProbe, Ratio, StreamKinds};
 use serde::Serialize;
 use spoolframe_types::{
-    AudioRole, AudioTrack, HdrFormat, MediaTracks, SubtitleRole, SubtitleTrack,
+    AudioRole, AudioTrack, HdrFormat, MediaTracks, SubtitleRole, SubtitleTrack, VideoTrack,
 };
 
+use crate::codecs;
 use crate::roles::{self, Flags};
 
 /// Everything the server knows about one media file.
@@ -227,6 +228,14 @@ impl MediaDescriptor {
     pub fn tracks(&self) -> MediaTracks {
         MediaTracks {
             duration: self.duration,
+            container: Some(codecs::container(&self.container)),
+            video: self.video.as_ref().map(|v| VideoTrack {
+                codec: codecs::video_codec(&v.codec),
+                width: v.width,
+                height: v.height,
+                bit_depth: v.bit_depth,
+                hdr: v.hdr,
+            }),
             audio: self
                 .audio
                 .iter()
@@ -314,6 +323,7 @@ fn language(tag: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spoolframe_types::{Container, VideoCodec};
 
     fn probe(name: &str) -> FfProbe {
         let path = format!("{}/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"));
@@ -473,6 +483,42 @@ mod tests {
         assert_eq!(sdh[0].language.as_deref(), Some("eng"));
         let forced = d.subtitles.iter().filter(|s| s.forced).count();
         assert_eq!(forced, 9);
+    }
+
+    #[test]
+    fn the_client_sees_the_file_s_container_and_picture() {
+        let dv = describe("mkv-forced-subs").tracks();
+        assert_eq!(dv.container, Some(Container::Matroska));
+        assert_eq!(
+            dv.video,
+            Some(VideoTrack {
+                codec: VideoCodec::Hevc,
+                width: 3840,
+                height: 1920,
+                bit_depth: 10,
+                hdr: Some(HdrFormat::DolbyVision),
+            })
+        );
+        let hdr10 = describe("mkv-cover-art").tracks().video.unwrap();
+        assert_eq!((hdr10.height, hdr10.hdr), (2160, Some(HdrFormat::Hdr10)));
+        let sdr = describe("mp4-h264-aac").tracks();
+        assert_eq!(sdr.container, Some(Container::Mp4));
+        assert_eq!(
+            sdr.video,
+            Some(VideoTrack {
+                codec: VideoCodec::H264,
+                width: 1920,
+                height: 1036,
+                bit_depth: 8,
+                hdr: None,
+            })
+        );
+    }
+
+    #[test]
+    fn music_has_a_container_and_no_picture() {
+        let flac = describe("flac-track").tracks();
+        assert_eq!((flac.container, flac.video), (Some(Container::Flac), None));
     }
 
     #[test]

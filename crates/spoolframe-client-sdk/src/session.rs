@@ -8,9 +8,10 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::{
     ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo,
-    DeviceSignInRequest, HomeScreen, ManifestKind, MediaRead, MediaReadResponse, PlaybackHandle,
-    PlaybackPlan, PlexLink, Previews, Reply, Request, Response, SearchRequest, SearchResults,
-    Selection, SessionId, SessionInfo, UserSummary,
+    DeviceSignInRequest, FinishPasskeyRegistration, HomeScreen, ManifestKind, MediaRead,
+    MediaReadResponse, PasskeyCreation, PasskeyInfo, PinProof, PlaybackHandle, PlaybackPlan,
+    PlexLink, Previews, Reply, Request, Response, SearchRequest, SearchResults, Selection,
+    SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId, SubtitleFormat,
@@ -19,15 +20,55 @@ use spoolframe_types::{
 
 use crate::client::Client;
 use crate::error::SdkError;
+use crate::link::ConnectionPath;
 use crate::storage::{Storage, StorageError, keys};
 
 /// A session as it is stored: the token is the secret, the names are what
-/// "Who's watching" shows before the server is asked.
+/// "Who's watching" shows before the server is asked. A session the
+/// server ended keeps its names without a token, so its user is still
+/// shown, to sign in again.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct StoredSession {
-    pub token: String,
+    pub token: Option<String>,
     pub username: String,
     pub display_name: String,
+}
+
+/// Someone who signed in on a server from this device, as "Who's
+/// watching" shows them: from what the device keeps, without asking the
+/// server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedProfile {
+    pub username: String,
+    /// As of their last sign-in or [`crate::Client::profiles`].
+    pub display_name: String,
+    pub sign_in: ProfileSignIn,
+}
+
+/// How choosing a saved profile signs them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProfileSignIn {
+    /// A session is kept: choosing them signs in without asking. The
+    /// server may still have ended it since; [`crate::Client::profiles`]
+    /// asks it, and a session it ended turns into `Password`.
+    Automatic,
+    /// Their session ended (it expired, was revoked, or the server no
+    /// longer knows it): they sign in again, with their password or a
+    /// passkey.
+    Password,
+}
+
+impl From<&StoredSession> for SavedProfile {
+    fn from(stored: &StoredSession) -> Self {
+        Self {
+            username: stored.username.clone(),
+            display_name: stored.display_name.clone(),
+            sign_in: match stored.token {
+                Some(_) => ProfileSignIn::Automatic,
+                None => ProfileSignIn::Password,
+            },
+        }
+    }
 }
 
 pub(crate) async fn load(
@@ -299,6 +340,13 @@ impl Session {
         self.client.server_info(self.server)?.web_url
     }
 
+    /// How this device reaches the server now, for a player's
+    /// diagnostics. Asks nothing and never dials: without a connection it
+    /// is [`ConnectionPath::Unknown`].
+    pub fn connection_path(&self) -> ConnectionPath {
+        self.client.path_of(self.server)
+    }
+
     /// Who this session is, as of sign-in or the last [`Session::whoami`].
     pub fn user(&self) -> &UserSummary {
         &self.user
@@ -307,8 +355,11 @@ impl Session {
     /// One request in this session. A session the server no longer knows
     /// is forgotten here, and the caller gets [`SdkError::SignInRequired`].
     async fn call(&self, request: Request) -> Result<Reply, SdkError> {
-        let conn = self.client.connection(self.server).await?;
-        match conn.call(Some(&self.token), request).await? {
+        match self
+            .client
+            .call(self.server, Some(&self.token), request)
+            .await?
+        {
             Response::Ok(reply) => Ok(reply),
             Response::Err(e) => Err(self.failed(e).await),
         }
@@ -317,7 +368,7 @@ impl Session {
     async fn failed(&self, error: spoolframe_protocol::Error) -> SdkError {
         let error = SdkError::from_server(error);
         if error == SdkError::SignInRequired
-            && let Err(e) = self.client.drop_session(self.server, &self.token).await
+            && let Err(e) = self.client.end_session(self.server, &self.token).await
         {
             return e;
         }
@@ -332,7 +383,8 @@ impl Session {
         }
     }
 
-    /// End this session on the server and forget it here.
+    /// End this session on the server and forget it here, profile and
+    /// all: signing out is leaving "Who's watching".
     pub async fn sign_out(&self) -> Result<(), SdkError> {
         match self.call(Request::Logout).await {
             Ok(Reply::LoggedOut) | Err(SdkError::SignInRequired) => {}
@@ -542,27 +594,34 @@ impl Session {
         .await
     }
 
-    /// Set or change this user's PIN: 4 to 8 digits. A user who has one
-    /// ([`UserSummary::pin`]) changes it only with it, `current`; it is
-    /// checked as [`Session::unlock`] checks a PIN and counts towards the
-    /// same limit, with the same errors, but unlocks nothing. Without it,
-    /// a user who has a PIN gets [`SdkError::InvalidInput`]. A user with
-    /// none passes `None`.
-    pub async fn set_pin(&self, pin: &str, current: Option<&str>) -> Result<(), SdkError> {
+    /// Set or change this user's PIN: 4 to 8 digits. A user with none
+    /// ([`UserSummary::pin`]) sets their first with no `proof`. A user who
+    /// has one changes it only with a [`PinProof`]; without one it is
+    /// [`SdkError::InvalidInput`].
+    ///
+    /// [`PinProof::Pin`] is checked as [`Session::unlock`] checks a PIN and
+    /// counts towards the same limit, with the same errors (10 wrong in a
+    /// row sign this device out), but unlocks nothing.
+    /// [`PinProof::Password`] is for a forgotten PIN: checked as
+    /// [`Client::sign_in`](crate::Client::sign_in) checks it, a wrong one
+    /// is a failed sign-in as this user from this device
+    /// ([`SdkError::InvalidCredentials`], then [`SdkError::RateLimited`]),
+    /// and it never signs the session out. A user with no password
+    /// (passkeys or SSO only) gets [`SdkError::NoPassword`]: offer the PIN
+    /// proof, or [`Session::web_url`]. A locked profile gets
+    /// [`SdkError::ProfileLocked`].
+    pub async fn set_pin(&self, pin: &str, proof: Option<PinProof>) -> Result<(), SdkError> {
         self.done(Request::SetPin {
             pin: pin.to_owned(),
-            current: current.map(str::to_owned),
+            proof,
         })
         .await
     }
 
-    /// Remove this user's PIN, and where it is asked for, with the
-    /// `current` PIN, checked as for [`Session::set_pin`].
-    pub async fn clear_pin(&self, current: &str) -> Result<(), SdkError> {
-        self.done(Request::ClearPin {
-            current: current.to_owned(),
-        })
-        .await
+    /// Remove this user's PIN, and where it is asked for, with a
+    /// [`PinProof`], checked as for [`Session::set_pin`].
+    pub async fn clear_pin(&self, proof: PinProof) -> Result<(), SdkError> {
+        self.done(Request::ClearPin { proof }).await
     }
 
     /// The devices this user has signed in from, with where the PIN is
@@ -596,6 +655,64 @@ impl Session {
             required,
         })
         .await
+    }
+
+    /// Begin making a passkey for this user in the app (P3-19): what the
+    /// platform's passkey API makes one with, for the relying party
+    /// [`crate::APP_RP_ID`], with user verification. Only soon after
+    /// signing in: a session older than 10 minutes gets
+    /// [`SdkError::RecentSignInRequired`] (sign in again, then ask).
+    pub async fn begin_passkey_registration(&self) -> Result<PasskeyCreation, SdkError> {
+        match self.call(Request::BeginPasskeyRegistration).await? {
+            Reply::PasskeyCreation(creation) => Ok(creation),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Keep the passkey the platform made for it, named for this device
+    /// (`made.name`, 1 to 64 characters, or [`SdkError::InvalidInput`]).
+    /// The user's profile shows it as "Spoolframe app · <name>". One that
+    /// does not verify, or a registration that is over, is
+    /// [`SdkError::InvalidCredentials`]: begin again.
+    pub async fn finish_passkey_registration(
+        &self,
+        made: FinishPasskeyRegistration,
+    ) -> Result<(), SdkError> {
+        self.done(Request::FinishPasskeyRegistration(made)).await
+    }
+
+    /// This user's passkeys, oldest first: the app's and the web UI's, as
+    /// My profile in the web UI lists them, so the user sees every way
+    /// they sign in. Only those with [`PasskeyInfo::usable_here`] (made in
+    /// an app, [`PasskeyInfo::app`]) sign in in the app.
+    pub async fn passkeys(&self) -> Result<Vec<PasskeyInfo>, SdkError> {
+        match self.call(Request::ListPasskeys).await? {
+            Reply::Passkeys { passkeys } => Ok(passkeys),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Rename one of this user's passkeys (`id` from
+    /// [`Session::passkeys`]). A name that is not 1 to 64 characters once
+    /// trimmed is [`SdkError::InvalidInput`]; an `id` that is not one of
+    /// this user's passkeys [`SdkError::NotFound`].
+    pub async fn rename_passkey(&self, id: &str, name: &str) -> Result<(), SdkError> {
+        self.done(Request::RenamePasskey {
+            id: id.to_owned(),
+            name: name.to_owned(),
+        })
+        .await
+    }
+
+    /// Remove one of this user's passkeys (`id` from
+    /// [`Session::passkeys`]); a web UI's too. Only soon after signing in,
+    /// as for adding one ([`SdkError::RecentSignInRequired`]: sign in
+    /// again, then ask). Their last way to sign in, with no password or
+    /// linked sign-in provider left, is [`SdkError::LastSignInMethod`]; an
+    /// `id` that is not one of their passkeys [`SdkError::NotFound`].
+    pub async fn remove_passkey(&self, id: &str) -> Result<(), SdkError> {
+        self.done(Request::RemovePasskey { id: id.to_owned() })
+            .await
     }
 
     /// The device showing sign-in code `code` (P3-07; typed any way, or
@@ -726,8 +843,7 @@ impl Session {
             epoch,
             segment,
         };
-        let conn = self.client.connection(self.server).await?;
-        match conn.read(&request).await? {
+        match self.read_media(&request).await? {
             (MediaReadResponse::Ok(reply), bytes) => Ok(Chunk {
                 bytes,
                 size: reply.size,
@@ -736,6 +852,21 @@ impl Session {
             }),
             (MediaReadResponse::Err(e), _) => Err(self.failed(e).await),
         }
+    }
+
+    /// One media read, asked again on a new connection if the first one
+    /// died under it: a read changes nothing.
+    async fn read_media(
+        &self,
+        request: &MediaRead,
+    ) -> Result<(MediaReadResponse, Vec<u8>), SdkError> {
+        let timeouts = self.client.inner.timeouts;
+        self.client
+            .on_connection(self.server, true, |conn| async move {
+                conn.read(request, timeouts.of_read(), timeouts.request)
+                    .await
+            })
+            .await
     }
 
     /// How this user wants tracks chosen, on every device.
@@ -794,8 +925,7 @@ impl Session {
             epoch: 0,
             segment: None,
         };
-        let conn = self.client.connection(self.server).await?;
-        match conn.read(&request).await? {
+        match self.read_media(&request).await? {
             (MediaReadResponse::Ok(_), bytes) => Ok(bytes),
             (MediaReadResponse::Err(e), _) => Err(self.failed(e).await),
         }
@@ -854,8 +984,15 @@ impl Session {
             id: id.clone(),
             size,
         };
-        let conn = self.client.connection(self.server).await?;
-        match conn.artwork(&request).await? {
+        let request = &request;
+        let timeouts = self.client.inner.timeouts;
+        let artwork = self
+            .client
+            .on_connection(self.server, true, |conn| async move {
+                conn.artwork(request, timeouts.request, timeouts.request)
+                    .await
+            });
+        match artwork.await? {
             (ArtworkResponse::Ok(_), bytes) => Ok(bytes),
             (ArtworkResponse::Err(e), _) => Err(self.failed(e).await),
         }
@@ -911,6 +1048,28 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+
+    #[tokio::test]
+    async fn sessions_kept_before_profiles_were_are_automatic() {
+        let storage = crate::storage::MemoryStorage::default();
+        let server = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        // As SDKs before saved profiles wrote it: every entry a token.
+        let old = br#"[{"token": "abc", "username": "alice", "display_name": "Alice"}]"#;
+        storage
+            .set_secret(&keys::sessions(&server.to_string()), Some(old.to_vec()))
+            .await
+            .unwrap();
+        let stored = load(&storage, &server).await.unwrap();
+        let profiles: Vec<SavedProfile> = stored.iter().map(SavedProfile::from).collect();
+        assert_eq!(
+            profiles,
+            [SavedProfile {
+                username: "alice".into(),
+                display_name: "Alice".into(),
+                sign_in: ProfileSignIn::Automatic,
+            }]
+        );
+    }
 
     /// Six bytes of SubRip, version 1, of which `have` have arrived.
     fn chunks(have: &[u8]) -> Chunks {

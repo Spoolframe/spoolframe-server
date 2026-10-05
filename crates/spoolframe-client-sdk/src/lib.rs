@@ -8,6 +8,11 @@
 //! values, no generics, so a UniFFI layer can wrap it (P5). What the SDK
 //! needs from the platform comes in from the app: the [`Device`] and its
 //! [`Storage`].
+//!
+//! Every request has a time limit ([`Timeouts`]); one not answered in time
+//! is [`SdkError::TimedOut`]. An app calls [`Client::resume`] when it comes
+//! back to the foreground or the device wakes, so connections that died
+//! while it was away are dropped before a request waits on one.
 
 mod client;
 mod connection;
@@ -19,19 +24,26 @@ mod session;
 pub mod storage;
 
 pub use client::{Client, Device, DeviceSignIn, ServersWatch};
+pub use connection::Timeouts;
 pub use error::SdkError;
-pub use link::{ConnectionState, StateWatch};
+pub use link::{ConnectionPath, ConnectionState, StateWatch};
 pub use servers::ServerEntry;
 pub use session::{
-    Chunk, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange, PlaybackOptions, Session,
-    Subtitle,
+    Chunk, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange, PlaybackOptions, ProfileSignIn,
+    SavedProfile, Session, Subtitle,
 };
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{
     ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen,
-    MAX_READ, ManifestKind, PinState, PlaybackHandle, PlaybackPlan, PlexLink, PlexSyncSummary,
-    PreviewTile, Previews, SearchCounts, SearchGroup, SearchRequest, SearchResults, Selection,
-    SessionInfo, TrackReason, UserSummary,
+    MAX_READ, ManifestKind, PinProof, PinState, PlaybackHandle, PlaybackPlan, PlexLink,
+    PlexSyncSummary, PreviewTile, Previews, SearchCounts, SearchGroup, SearchRequest,
+    SearchResults, Selection, SessionInfo, TopResult, TrackReason, UserSummary,
+};
+// Passkeys in the app (P3-19): the relying party and the raw WebAuthn
+// bytes the platform's passkey API takes and gives.
+pub use spoolframe_protocol::{
+    APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation,
+    PasskeyInfo, PasskeyRequest,
 };
 // Fingerprints for the "Server identity changed" alert (P1-13, P1-21).
 pub use spoolframe_protocol::fingerprint;

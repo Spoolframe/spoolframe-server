@@ -2,6 +2,8 @@
 //! `crate::passkeys`'; this is storage, and the rule that a user keeps a
 //! way to sign in.
 
+use spoolframe_protocol::APP_RP_ID;
+
 use super::users::{LocalUserId, UserError, add_first_user};
 use super::{Store, StoreError, now};
 
@@ -10,7 +12,6 @@ use super::{Store, StoreError, now};
 pub struct PasskeyRecord {
     /// base64url.
     pub credential_id: String,
-    #[sqlx(try_from = "i64")]
     pub user: LocalUserId,
     pub name: String,
     /// webauthn-rs' credential, as JSON.
@@ -19,12 +20,6 @@ pub struct PasskeyRecord {
     pub rp_id: String,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
-}
-
-impl From<i64> for LocalUserId {
-    fn from(id: i64) -> Self {
-        LocalUserId(id)
-    }
 }
 
 /// A passkey with whose it is, for the log.
@@ -96,12 +91,12 @@ impl Store {
         sqlx::query(
             "INSERT INTO passkey_users (user_id, handle) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
         )
-        .bind(user.0)
+        .bind(user)
         .bind(fresh)
         .execute(&mut *tx)
         .await?;
         let handle = sqlx::query_scalar("SELECT handle FROM passkey_users WHERE user_id = ?1")
-            .bind(user.0)
+            .bind(user)
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -113,12 +108,12 @@ impl Store {
         &self,
         handle: &str,
     ) -> Result<Option<LocalUserId>, StoreError> {
-        let id: Option<i64> =
+        Ok(
             sqlx::query_scalar("SELECT user_id FROM passkey_users WHERE handle = ?1")
                 .bind(handle)
                 .fetch_optional(&self.pool)
-                .await?;
-        Ok(id.map(LocalUserId))
+                .await?,
+        )
     }
 
     /// Keep a new passkey of `user`'s, made under `rp_id`.
@@ -137,7 +132,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(credential_id)
-        .bind(user.0)
+        .bind(user)
         .bind(name)
         .bind(credential)
         .bind(rp_id)
@@ -166,7 +161,7 @@ impl Store {
                     last_used_at \
              FROM passkeys WHERE user_id = ?1 ORDER BY created_at, credential_id",
         )
-        .bind(user.0)
+        .bind(user)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -195,7 +190,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let id = add_first_user(&mut tx, username, now).await?;
         sqlx::query("INSERT INTO passkey_users (user_id, handle) VALUES (?1, ?2)")
-            .bind(id.0)
+            .bind(id)
             .bind(passkey.handle)
             .execute(&mut *tx)
             .await?;
@@ -204,7 +199,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(passkey.credential_id)
-        .bind(id.0)
+        .bind(id)
         .bind(passkey.name)
         .bind(passkey.credential)
         .bind(passkey.rp_id)
@@ -225,7 +220,7 @@ impl Store {
         let name = passkey_name(name)?;
         let renamed =
             sqlx::query("UPDATE passkeys SET name = ?3 WHERE user_id = ?1 AND credential_id = ?2")
-                .bind(user.0)
+                .bind(user)
                 .bind(credential_id)
                 .bind(name)
                 .execute(&self.pool)
@@ -252,7 +247,7 @@ impl Store {
                EXISTS (SELECT 1 FROM password_credentials WHERE user_id = ?1) \
                OR EXISTS (SELECT 1 FROM external_identities WHERE user_id = ?1)",
         )
-        .bind(user.0)
+        .bind(user)
         .bind(credential_id)
         .fetch_one(&mut *tx)
         .await?;
@@ -263,7 +258,7 @@ impl Store {
             return Err(PasskeyError::LastSignInMethod);
         }
         sqlx::query("DELETE FROM passkeys WHERE user_id = ?1 AND credential_id = ?2")
-            .bind(user.0)
+            .bind(user)
             .bind(credential_id)
             .execute(&mut *tx)
             .await?;
@@ -289,16 +284,36 @@ impl Store {
         Ok(())
     }
 
-    /// The passkeys made under another relying-party ID than `rp_id`: no
-    /// browser offers them here.
+    /// The passkeys made under another relying-party ID than `rp_id`, and
+    /// not the apps' ([`APP_RP_ID`], P3-19): no browser offers them here.
     pub async fn passkeys_of_other_hosts(
         &self,
         rp_id: &str,
     ) -> Result<Vec<OwnedPasskey>, StoreError> {
         Ok(sqlx::query_as(
             "SELECT u.username, p.name, p.rp_id FROM passkeys p JOIN users u ON u.id = p.user_id \
-             WHERE p.rp_id != ?1 ORDER BY u.username, p.created_at",
+             WHERE p.rp_id NOT IN (?1, ?2) ORDER BY u.username, p.created_at",
         )
+        .bind(rp_id)
+        .bind(APP_RP_ID)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The credential ids (base64url) of `username`'s passkeys made under
+    /// `rp_id`, oldest first; none for a user who does not exist or is
+    /// disabled.
+    pub async fn passkey_ids_of(
+        &self,
+        username: &str,
+        rp_id: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT p.credential_id FROM passkeys p JOIN users u ON u.id = p.user_id \
+             WHERE u.username = ?1 AND p.rp_id = ?2 AND u.disabled_at IS NULL \
+             ORDER BY p.created_at, p.credential_id",
+        )
+        .bind(username)
         .bind(rp_id)
         .fetch_all(&self.pool)
         .await?)
@@ -410,7 +425,7 @@ mod tests {
         add(&store, alice, "cred-1").await;
         add(&store, alice, "cred-2").await;
         sqlx::query("DELETE FROM password_credentials WHERE user_id = ?1")
-            .bind(alice.0)
+            .bind(alice)
             .execute(&store.pool)
             .await
             .unwrap();
@@ -483,6 +498,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_user_s_passkeys_of_one_relying_party_are_listed_by_username() {
+        let (store, alice) = store_with_alice("passkey-ids-of").await;
+        add(&store, alice, "web-1").await;
+        store
+            .add_passkey(alice, "app-1", "iPhone", "{}", APP_RP_ID)
+            .await
+            .unwrap();
+        store
+            .add_passkey(alice, "app-2", "iPad", "{}", APP_RP_ID)
+            .await
+            .unwrap();
+        let ids = |name: &'static str| {
+            let store = &store;
+            async move { store.passkey_ids_of(name, APP_RP_ID).await.unwrap() }
+        };
+        assert_eq!(ids("alice").await, ["app-1", "app-2"]);
+        assert_eq!(ids("nobody").await, Vec::<String>::new());
+        store.disable_user("alice").await.unwrap();
+        assert_eq!(ids("alice").await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
     async fn a_use_keeps_the_credential_and_the_time() {
         let (store, alice) = store_with_alice("passkey-used").await;
         add(&store, alice, "cred-1").await;
@@ -501,6 +538,11 @@ mod tests {
         add(&store, alice, "cred-1").await;
         store
             .add_passkey(alice, "cred-2", "Tunnel", "{}", "localhost")
+            .await
+            .unwrap();
+        // An app's (P3-19) works on every server, whatever its host.
+        store
+            .add_passkey(alice, "cred-3", "iPhone", "{}", APP_RP_ID)
             .await
             .unwrap();
         assert_eq!(

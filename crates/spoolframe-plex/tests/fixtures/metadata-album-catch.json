@@ -1,0 +1,26 @@
+{
+  "MediaContainer": {
+    "size": 1,
+    "librarySectionID": 12,
+    "librarySectionTitle": "Music",
+    "Metadata": [
+      {
+        "ratingKey": "224629",
+        "key": "/library/metadata/224629/children",
+        "parentRatingKey": "224303",
+        "guid": "plex://album/5d07c436403c6402909d9cca",
+        "type": "album",
+        "title": "Catch",
+        "librarySectionID": 12,
+        "index": 1,
+        "year": 1987,
+        "thumb": "/library/metadata/224629/thumb/1783793750",
+        "art": "/library/metadata/224303/art/1790945459",
+        "leafCount": 3,
+        "addedAt": 1758736312,
+        "parentTitle": "The Cure",
+        "parentThumb": "/library/metadata/224303/thumb/1790945459"
+      }
+    ]
+  }
+}

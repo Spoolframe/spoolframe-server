@@ -7,7 +7,8 @@ use spoolframe_protocol::{
     ChosenTracks, Reply, Request, Response, Selection, SessionId, TrackReason,
 };
 use spoolframe_types::{
-    MediaId, MediaKind, Namespace, SdhPreference, SubtitleMode, SubtitleRole, TrackPreferences,
+    Container, MediaId, MediaKind, Namespace, SdhPreference, SubtitleMode, SubtitleRole,
+    TrackPreferences, VideoCodec, VideoTrack,
 };
 
 use crate::support::{TestClient, TestServer, mkv_capabilities};
@@ -79,6 +80,30 @@ async fn sdh(client: &TestClient, session: &SessionId) -> u32 {
         .iter()
         .position(|s| s.role == SubtitleRole::Sdh)
         .unwrap() as u32
+}
+
+#[tokio::test]
+async fn the_tracks_say_what_the_file_and_its_picture_are() {
+    let (server, client, session) = ready("tracks-file").await;
+    let Response::Ok(Reply::Tracks(tracks)) = client
+        .call(Some(&session), Request::Tracks { id: episode("12") })
+        .await
+    else {
+        panic!("no tracks");
+    };
+    assert_eq!(tracks.container, Some(Container::Matroska));
+    assert_eq!(
+        tracks.video,
+        Some(VideoTrack {
+            codec: VideoCodec::H264,
+            width: 1920,
+            height: 1080,
+            bit_depth: 8,
+            hdr: None,
+        })
+    );
+    client.close().await;
+    server.stop().await;
 }
 
 #[tokio::test]

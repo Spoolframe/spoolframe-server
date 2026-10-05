@@ -330,6 +330,7 @@ fn router(
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/auth/site", get(site))
+        .route("/catalog/artwork", get(catalog_artwork))
         .with_state(api)
         // The socket: `/jsonrpc` for the web UI, and any other path's
         // upgrade too, which is where the CLI has always connected. Except
@@ -793,6 +794,58 @@ async fn logout(State(api): State<AdminApi>, req: Request) -> Response<Body> {
 async fn me(State(api): State<AdminApi>, req: Request) -> Response<Body> {
     match MeApiServer::who_am_i(&api, &as_caller(&req)).await {
         Ok(user) => axum::Json(user).into_response(),
+        Err(e) => failure(e),
+    }
+}
+
+/// Which artwork a catalog page shows (`id`), and at what size (`size`,
+/// a thumb if left out) (P3-16).
+fn artwork_query(query: Option<&str>) -> Option<(String, spoolframe_protocol::ArtworkSize)> {
+    let mut id = None;
+    let mut size = spoolframe_protocol::ArtworkSize::Thumb;
+    for (key, value) in url::form_urlencoded::parse(query?.as_bytes()) {
+        match &*key {
+            "id" => id = Some(value.into_owned()),
+            "size" => {
+                size = serde_json::from_value(serde_json::Value::String(value.into_owned()))
+                    .ok()
+                    .filter(|s| *s != spoolframe_protocol::ArtworkSize::Unknown)?;
+            }
+            _ => {}
+        }
+    }
+    Some((id?, size))
+}
+
+/// Artwork for the catalog pages (P3-16), to admins only: an `<img>`
+/// cannot speak JSON-RPC, and carries the session cookie as any request
+/// to this origin does. Artwork ids change with the image, so a browser
+/// may keep it.
+async fn catalog_artwork(State(api): State<AdminApi>, req: Request) -> Response<Body> {
+    let Some((id, size)) = artwork_query(req.uri().query()) else {
+        return (StatusCode::BAD_REQUEST, "id, and a size clients use").into_response();
+    };
+    match api.catalog_image(&as_caller(&req), &id, size).await {
+        Ok(image) => {
+            let mut response = (
+                [
+                    (header::CONTENT_TYPE, image.content_type),
+                    (
+                        header::CACHE_CONTROL,
+                        "private, max-age=86400, immutable".to_owned(),
+                    ),
+                ],
+                image.bytes,
+            )
+                .into_response();
+            if let Some(etag) = image
+                .etag
+                .and_then(|e| HeaderValue::from_str(&format!("\"{e}\"")).ok())
+            {
+                response.headers_mut().insert(header::ETAG, etag);
+            }
+            response
+        }
         Err(e) => failure(e),
     }
 }

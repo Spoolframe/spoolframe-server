@@ -6,6 +6,8 @@ use spoolframe_admin_api::{
     LibrariesOverview, LibraryEntry, LibraryKind, LibraryPathCheck, LibraryStatus, PathMappingEntry,
 };
 
+use std::net::IpAddr;
+
 use crate::logic::thousands;
 use crate::setup::{Sample, mapped, sample};
 
@@ -214,10 +216,65 @@ pub fn with_path(
     out
 }
 
+/// Under the Plex server choices, in the add flow and the wizard: why a
+/// server anywhere will not do.
+pub const FILES_HERE: &str = "Spoolframe plays the files itself, so a Plex server's media must be mounted on this machine. A server whose files aren't here can't be added.";
+
+/// On a remote server's choice.
+pub const REMOTE_NOTE: &str = "Remote · its files must be mounted here";
+
+/// Whether the Plex server at `url` is away from this machine's network,
+/// so its files are here only if someone mounted them. `lan` is what
+/// plex.tv says of an account's server; `None` for one found or typed,
+/// told by its address: a public IP, or a plex.direct name that is not a
+/// LAN address's. A plain host name is taken as local: nothing says
+/// otherwise.
+pub fn remote(url: &str, lan: Option<bool>) -> bool {
+    if let Some(lan) = lan {
+        return !lan;
+    }
+    let host_port = crate::logic::host_port(url);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => host_port.split(':').next().unwrap_or(host_port),
+    };
+    if let Some(name) = host.strip_suffix(".plex.direct") {
+        // "192-168-1-10.<hash>": the address it stands for, dashed.
+        let first = name.split('.').next().unwrap_or_default();
+        return first
+            .replace('-', ".")
+            .parse::<IpAddr>()
+            .map_or(true, |ip| !on_lan(ip));
+    }
+    host.parse::<IpAddr>().is_ok_and(|ip| !on_lan(ip))
+}
+
+/// A private, loopback or link-local address.
+fn on_lan(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+    }
+}
+
+/// Why the add flow's chosen libraries cannot be added, from their
+/// checks (`None` while one is still being checked): one sentence per
+/// library none of whose files is here.
+pub fn refusals<'a>(checks: impl IntoIterator<Item = Option<&'a LibraryPathCheck>>) -> Vec<String> {
+    checks
+        .into_iter()
+        .flatten()
+        .filter_map(LibraryPathCheck::refusal)
+        .collect()
+}
+
 /// A library's sample as the add flow's last column says it.
 pub fn sample_line(check: &LibraryPathCheck) -> (bool, String) {
     match sample(check) {
         Sample::Ok { of } => (true, format!("OK · {of} of {of}")),
+        Sample::Missing { missing, of } if missing == of => {
+            (false, format!("Not on this machine · 0 of {of}"))
+        }
         Sample::Missing { missing, of } => (false, format!("{missing} of {of} missing")),
         Sample::Empty => (true, "No files yet".to_owned()),
     }
@@ -402,6 +459,64 @@ mod tests {
         assert_eq!(local_path(&saved, "Movies", "/data/movies"), "/old");
         assert_eq!(local_path(&saved, "Kids", "/data/kids"), "/mnt/nas/kids");
         assert_eq!(local_path(&[], "Kids", "/data/kids"), "/data/kids");
+    }
+
+    #[test]
+    fn plex_tv_s_word_on_an_account_server_decides_whether_it_is_remote() {
+        assert!(remote("https://1-2-3-4.abc.plex.direct:32400", Some(false)));
+        assert!(!remote("http://8.8.8.8:32400", Some(true)));
+    }
+
+    #[test]
+    fn a_found_or_typed_server_is_remote_by_its_address() {
+        assert!(remote("http://8.8.8.8:32400", None));
+        assert!(remote("https://8-8-8-8.abc123.plex.direct:32400/", None));
+        assert!(remote("https://abc123.plex.direct:32400", None));
+        assert!(remote("http://[2001:db8::1]:32400", None));
+        assert!(!remote("http://192.168.1.10:32400", None));
+        assert!(!remote(
+            "https://192-168-1-10.abc123.plex.direct:32400",
+            None
+        ));
+        assert!(!remote("http://10.0.0.5:32400", None));
+        assert!(!remote("http://127.0.0.1:32400", None));
+        assert!(!remote("http://[fd00::5]:32400", None));
+        assert!(!remote("http://tower.lan:32400", None));
+        assert!(!remote("tower:32400", None));
+    }
+
+    fn sampled(checked: u64, ok: u64) -> LibraryPathCheck {
+        LibraryPathCheck {
+            library: "Movies".into(),
+            roots: vec!["/data/movies".into()],
+            checked,
+            ok,
+            failures: Vec::new(),
+            suggestion: None,
+        }
+    }
+
+    #[test]
+    fn a_library_with_no_sample_file_here_is_said_to_be_not_here() {
+        assert_eq!(
+            sample_line(&sampled(5, 0)),
+            (false, "Not on this machine · 0 of 5".to_owned())
+        );
+        assert_eq!(
+            sample_line(&sampled(5, 3)),
+            (false, "2 of 5 missing".to_owned())
+        );
+    }
+
+    #[test]
+    fn only_the_checked_libraries_not_on_this_machine_hold_the_add_up() {
+        let here = sampled(5, 5);
+        let gone = sampled(5, 0);
+        assert_eq!(refusals([Some(&here), None]), Vec::<String>::new());
+        assert_eq!(
+            refusals([Some(&here), Some(&gone)]),
+            [gone.refusal().unwrap()]
+        );
     }
 
     #[test]

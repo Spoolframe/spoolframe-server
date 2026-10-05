@@ -23,11 +23,27 @@
         "Media": [
           {
             "id": 529616,
+            "audioChannels": 2,
+            "audioCodec": "flac",
             "container": "flac",
             "Part": [
               {
                 "id": 790894,
-                "file": "/data/Music/The Cranberries/In the End (2019)/The Cranberries - In the End - 01 - All Over Now.flac"
+                "file": "/data/Music/The Cranberries/In the End (2019)/The Cranberries - In the End - 01 - All Over Now.flac",
+                "Stream": [
+                  {
+                    "id": 2017898,
+                    "streamType": 2,
+                    "codec": "flac",
+                    "index": 0,
+                    "channels": 2,
+                    "bitrate": 1048,
+                    "audioChannelLayout": "stereo",
+                    "bitDepth": 16,
+                    "samplingRate": 44100,
+                    "displayTitle": "FLAC (Stereo)"
+                  }
+                ]
               }
             ]
           }

@@ -7,9 +7,11 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use spoolframe_plex::PlexCatalog;
-use spoolframe_protocol::{Reply, Request, Response, SearchRequest, SearchResults, SessionId};
+use spoolframe_protocol::{
+    Reply, Request, Response, SearchRequest, SearchResults, SessionId, TopResult,
+};
 use spoolframe_server::catalog::{Composite, LiveCatalog};
-use spoolframe_types::{Item, SearchKind, SearchScope};
+use spoolframe_types::{Item, Person, SearchKind, SearchScope};
 use wiremock::matchers::{method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -136,9 +138,11 @@ fn title(item: &Item) -> &str {
 
 /// Every item in the results: the top match, then each group's.
 fn every_item(results: &SearchResults) -> Vec<&Item> {
-    results
-        .top
-        .iter()
+    let top = match &results.top {
+        Some(TopResult::Item(item)) => Some(item),
+        _ => None,
+    };
+    top.into_iter()
         .chain(results.groups.iter().flat_map(|g| &g.items))
         .collect()
 }
@@ -210,7 +214,9 @@ async fn a_show_is_the_top_match_and_its_episodes_are_left_out_of_all() {
     let results = searcher
         .search(request("letterkenny", SearchScope::All))
         .await;
-    assert!(matches!(&results.top, Some(Item::Show(s)) if s.title == "Letterkenny"));
+    assert!(
+        matches!(&results.top, Some(TopResult::Item(Item::Show(s))) if s.title == "Letterkenny")
+    );
     let episodes = group(&results, SearchKind::Episodes).unwrap();
     assert!(episodes.items.is_empty(), "{:?}", episodes.items);
     assert_eq!(episodes.hidden, 3);
@@ -229,7 +235,9 @@ async fn a_show_beats_its_own_episode_of_the_same_name() {
     let results = searcher
         .search(request("the sopranos", SearchScope::All))
         .await;
-    assert!(matches!(&results.top, Some(Item::Show(s)) if s.title == "The Sopranos"));
+    assert!(
+        matches!(&results.top, Some(TopResult::Item(Item::Show(s))) if s.title == "The Sopranos")
+    );
     assert_eq!(group(&results, SearchKind::Episodes).unwrap().hidden, 1);
     searcher.stop().await;
 }
@@ -278,14 +286,26 @@ async fn more_says_a_group_has_more_and_see_all_returns_them() {
     searcher.stop().await;
 }
 
+/// The person at the top of `results`.
+fn top_person(results: &SearchResults) -> &Person {
+    match &results.top {
+        Some(TopResult::Person(person)) => person,
+        other => panic!("not a person: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn people_are_found_by_name() {
     let pms = pms(&["keanu"]).await;
     let searcher = Searcher::start("search-people", &pms).await;
     let results = searcher.search(request("keanu", SearchScope::All)).await;
+    // No title has "keanu" in it, so the first person is the top match,
+    // and the others are in their group.
+    let keanu = top_person(&results);
+    assert_eq!(keanu.name, "Keanu Reeves");
+    assert_eq!(keanu.count, Some(9));
     let people = &group(&results, SearchKind::People).unwrap().people;
-    assert_eq!(people[0].name, "Keanu Reeves");
-    assert_eq!(people[0].count, Some(9));
+    assert_eq!(people[0].name, "Keanu Karim");
     searcher.stop().await;
 }
 
@@ -303,9 +323,7 @@ async fn choosing_a_person_lists_their_items_a_page_at_a_time() {
         .await;
     let searcher = Searcher::start("search-person", &pms).await;
     let results = searcher.search(request("keanu", SearchScope::All)).await;
-    let keanu = group(&results, SearchKind::People).unwrap().people[0]
-        .id
-        .clone();
+    let keanu = top_person(&results).id.clone();
     let page = |offset| {
         let person = keanu.clone();
         let searcher = &searcher;

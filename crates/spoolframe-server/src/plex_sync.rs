@@ -468,7 +468,7 @@ impl WatchSync {
             }
             Err(e) => {
                 tracing::warn!(
-                    user = user.0,
+                    user = %user,
                     error = %e,
                     "cannot list the linked Plex account's servers; trying its own token"
                 );
@@ -632,7 +632,7 @@ impl WatchSync {
                     .apply(principal, &server.id, &on.plex, &action, &by_id)
                     .await
             {
-                tracing::warn!(user = user.0, item = line, error = %e, "Plex watch sync");
+                tracing::warn!(user = %user, item = line, error = %e, "Plex watch sync");
                 report.failed.push(format!("{line} ({e})"));
                 continue;
             }
@@ -714,7 +714,7 @@ impl WatchSync {
                 match sync.accounts.link(user) {
                     Ok(Some(_)) => sync.follow(user, changes.resubscribe()),
                     Ok(None) => sync.unfollow(user),
-                    Err(e) => tracing::warn!(user = user.0, error = %e, "cannot read a Plex link"),
+                    Err(e) => tracing::warn!(user = %user, error = %e, "cannot read a Plex link"),
                 }
             }
         });
@@ -763,7 +763,7 @@ impl WatchSync {
     async fn run_logged(&self, user: LocalUserId) {
         match self.run(user, false).await {
             Ok(r) => tracing::info!(
-                user = user.0,
+                user = %user,
                 pulled = r.pulled.len(),
                 pushed = r.pushed.len(),
                 skipped = r.skipped,
@@ -772,7 +772,7 @@ impl WatchSync {
                 "Plex watch sync"
             ),
             Err(e) => {
-                tracing::warn!(user = user.0, error = %e, "Plex watch sync; trying again later");
+                tracing::warn!(user = %user, error = %e, "Plex watch sync; trying again later");
                 *self
                     .runs(user)
                     .last
@@ -1100,8 +1100,12 @@ mod tests {
         assert!(both(&[row(&track, true, None, 10)], &[], STARTED).is_empty());
     }
 
-    const ME: Principal = Principal::LocalUser(crate::store::users::LocalUserId(1));
-    const SOMEONE_ELSE: Principal = Principal::LocalUser(crate::store::users::LocalUserId(2));
+    const ME: Principal = Principal::LocalUser(crate::store::users::LocalUserId::from_uuid(
+        uuid::Uuid::from_u128(1),
+    ));
+    const SOMEONE_ELSE: Principal = Principal::LocalUser(
+        crate::store::users::LocalUserId::from_uuid(uuid::Uuid::from_u128(2)),
+    );
 
     /// Run [`schedule`] every 2 minutes; the seconds at which it ran.
     fn scheduled() -> (

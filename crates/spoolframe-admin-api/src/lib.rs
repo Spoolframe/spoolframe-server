@@ -17,8 +17,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 pub use spoolframe_types::{
-    AudioRole, LibraryKind, Platform, Role, SdhPreference, SubtitleMode, SubtitleRole,
-    TrackPreferences,
+    Album, Artist, Artwork, ArtworkKind, AudioRole, Episode, Item, LibraryKind, Marker, MarkerKind,
+    Movie, Platform, PlaybackState, Role, SdhPreference, Season, Show, SubtitleMode, SubtitleRole,
+    Track, TrackPreferences,
 };
 
 /// JSON-RPC error codes the admin API returns, beside the standard ones.
@@ -335,8 +336,13 @@ pub struct PasskeyEntry {
     /// The host it was made for.
     pub rp_id: String,
     /// Whether that is the host the server is at now: one made for another
-    /// host (before `admin.public_url` changed) signs no one in.
+    /// host (before `admin.public_url` changed) signs no one in. An app
+    /// passkey is always usable, in the apps.
     pub usable: bool,
+    /// Made in a Spoolframe app (P3-19), for the relying party every server
+    /// shares (`spoolframe.app`), and of use in the apps only: shown as
+    /// "Spoolframe app · <name>", where its name is the device's.
+    pub app: bool,
 }
 
 /// A user's account at a sign-in provider, linked to them (P3-04). Linking
@@ -884,6 +890,74 @@ pub struct LibraryPathCheck {
     pub suggestion: Option<PathMappingEntry>,
 }
 
+impl LibraryPathCheck {
+    /// Why the library cannot be added, when none of its sample files is
+    /// on this machine: Spoolframe plays the files itself (P1-04), so a
+    /// library whose folders are not mounted here would play nothing.
+    /// `None` when any is found, or when there were none to look at.
+    ///
+    /// One sentence for the add flow and `libraryAdd` alike, so both say
+    /// the same thing.
+    pub fn refusal(&self) -> Option<String> {
+        if self.checked == 0 || self.ok > 0 {
+            return None;
+        }
+        let none = match self.checked {
+            1 => "its sample file is not on this machine".to_owned(),
+            n => format!("none of its {n} sample files are on this machine"),
+        };
+        let mount = match self.roots.as_slice() {
+            [] => "Mount its folder here, or map it to where it is".to_owned(),
+            [one] => format!("Mount {one} here, or map it to where it is"),
+            [rest @ .., last] => format!(
+                "Mount {} and {last} here, or map them to where they are",
+                rest.join(", ")
+            ),
+        };
+        Some(format!("{} can't be added: {none}. {mount}.", self.library))
+    }
+}
+
+#[cfg(test)]
+mod path_check_tests {
+    use super::*;
+
+    fn check(roots: &[&str], checked: u64, ok: u64) -> LibraryPathCheck {
+        LibraryPathCheck {
+            library: "Movies".into(),
+            roots: roots.iter().map(|r| (*r).to_owned()).collect(),
+            checked,
+            ok,
+            failures: Vec::new(),
+            suggestion: None,
+        }
+    }
+
+    #[test]
+    fn a_library_none_of_whose_sample_is_here_is_refused_naming_its_folder() {
+        assert_eq!(
+            check(&["/data/movies"], 5, 0).refusal().as_deref(),
+            Some(
+                "Movies can't be added: none of its 5 sample files are on this machine. \
+                 Mount /data/movies here, or map it to where it is."
+            )
+        );
+        assert_eq!(
+            check(&["/data/a", "/data/b"], 1, 0).refusal().as_deref(),
+            Some(
+                "Movies can't be added: its sample file is not on this machine. \
+                 Mount /data/a and /data/b here, or map them to where they are."
+            )
+        );
+    }
+
+    #[test]
+    fn a_library_with_any_sample_file_here_or_none_to_look_at_is_not_refused() {
+        assert_eq!(check(&["/data/movies"], 5, 1).refusal(), None);
+        assert_eq!(check(&["/data/movies"], 0, 0).refusal(), None);
+    }
+}
+
 /// What one user's Plex watch sync run did, or would do (PX-04, P3-12):
 /// one line per item.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -897,6 +971,242 @@ pub struct PlexSyncReport {
     pub skipped: u32,
     /// What was skipped whole, as `PlexSyncRun.notes`.
     pub notes: Vec<String>,
+}
+
+/// What kind of item a catalog row is (P3-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CatalogKind {
+    Movie,
+    Show,
+    Season,
+    Episode,
+    Artist,
+    Album,
+    Track,
+}
+
+/// How many items of one kind a library has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KindCount {
+    pub kind: CatalogKind,
+    pub count: u32,
+}
+
+/// A quick filter of a library's rows (P3-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CatalogFilter {
+    /// The files the library's last path check found missing: the same
+    /// list `plexCheckPaths` and `plex check-paths` report, one row per
+    /// movie, episode or track.
+    Missing,
+    /// Items Plex has not matched to an agent.
+    Unmatched,
+    /// Items with no artwork: clients show a placeholder.
+    NoArtwork,
+}
+
+/// Where a library's check of every media file is (P3-16). The server
+/// keeps the last one of each library until its Plex servers, libraries
+/// or path mappings change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum PathsChecked {
+    /// Not since the server started, or since the mappings changed.
+    NotChecked,
+    /// Running, since `since` (Unix seconds).
+    #[serde(rename_all = "camelCase")]
+    Checking { since: i64 },
+    /// Done at `at` (Unix seconds): `ok` files found, `missing` not.
+    #[serde(rename_all = "camelCase")]
+    Checked { at: i64, ok: u64, missing: u64 },
+    /// It could not run: the Plex server did not answer.
+    #[serde(rename_all = "camelCase")]
+    Failed { at: i64, error: String },
+}
+
+/// One library as an admin browses it (P3-16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogLibrary {
+    /// What clients know it by: `plex:2`.
+    pub id: String,
+    /// Spoolframe's name for it.
+    pub name: String,
+    pub kind: LibraryKind,
+    /// Its Plex server's id and name, and Plex's name for the section,
+    /// when the server answers.
+    pub server: String,
+    pub server_name: String,
+    pub plex_title: Option<String>,
+    /// How many items of each kind it has, top level first.
+    pub counts: Vec<KindCount>,
+    /// Its top-level items Plex has not matched, and with no artwork.
+    pub unmatched: u32,
+    pub no_artwork: u32,
+    pub paths: PathsChecked,
+}
+
+/// What `catalogRows` lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogQuery {
+    pub library: String,
+    /// Only items of this kind; the library's top level (movies, shows,
+    /// albums) if left out, and with `text`, every kind a title search
+    /// finds there.
+    pub kind: Option<CatalogKind>,
+    /// Only items whose titles match, as P3-09's search matches them.
+    pub text: Option<String>,
+    pub filter: Option<CatalogFilter>,
+    pub offset: u32,
+    /// At most 200.
+    pub limit: u32,
+}
+
+/// One page of a library's rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogPage {
+    pub rows: Vec<CatalogRow>,
+    /// How many rows the whole listing has.
+    pub total: u32,
+    /// The library's path check, which `Missing` lists and container rows
+    /// count their missing files from.
+    pub paths: PathsChecked,
+}
+
+/// An item as the catalog lists it to an admin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogRow {
+    /// As clients get it.
+    pub item: Item,
+    /// Plex matched it to an agent.
+    pub matched: bool,
+    /// Plex's GUID, `plex://show/…`, or `local://…` when unmatched.
+    pub guid: Option<String>,
+    /// Other agents' ids: `imdb://tt…`, `tmdb://…`, `tvdb://…`.
+    pub agents: Vec<String>,
+    /// Unix seconds.
+    pub added_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    /// A show's seasons, an album's tracks.
+    pub children: Option<u32>,
+    /// A show's or season's episodes.
+    pub leaves: Option<u32>,
+    /// A movie's, episode's or track's files, looked for when listed;
+    /// under `Missing`, as the path check found them.
+    pub files: Vec<FileState>,
+    /// A show's, season's, artist's or album's files the last path check
+    /// found missing; `None` until there is one.
+    pub missing: Option<u64>,
+}
+
+/// One media file: where Plex has it, where it is here, whether it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileState {
+    pub plex_path: String,
+    /// The path looked at here.
+    pub mapped_path: String,
+    /// The `plex.path_mapping` rule used; `None` when none covers the
+    /// Plex path, which is then looked at as it is.
+    pub mapping: Option<PathMappingEntry>,
+    pub found: bool,
+    /// Why it cannot be read, when it cannot.
+    pub problem: Option<String>,
+}
+
+/// One item as an admin inspects it (P3-16).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogItem {
+    /// The library it is in, by id and name, when it is one served.
+    pub library: Option<CatalogCrumb>,
+    /// Its show and season, or artist and album, outermost first.
+    pub ancestors: Vec<CatalogCrumb>,
+    /// The Plex server it comes from.
+    pub server: String,
+    pub server_name: String,
+    /// Exactly what `spoolframe/client/1` answers `Item` with, as JSON:
+    /// `{"type": "item", "item": …, "children": […], "markers": […]}`,
+    /// with the caller's own playback state.
+    pub reply: serde_json::Value,
+    pub matched: bool,
+    pub guid: Option<String>,
+    /// Its stable ids (P1-14): Plex's GUID and the agents', as watch
+    /// state is linked by them.
+    pub external_ids: Vec<String>,
+    pub added_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    /// A show's or an artist's folders, as Plex has them.
+    pub folders: Vec<String>,
+    /// Each version of its media, the one played first; each file looked
+    /// for now.
+    pub versions: Vec<MediaVersion>,
+    /// Its children, as rows.
+    pub children: Vec<CatalogRow>,
+    /// The Plex web app's page for it, when the server says its id.
+    pub open_in_plex: Option<String>,
+    /// The library's path check, which `children` count from.
+    pub paths: PathsChecked,
+}
+
+/// An item named in a trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogCrumb {
+    pub id: String,
+    pub title: String,
+}
+
+/// One version of an item's media, as Plex describes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaVersion {
+    /// Plex's media id.
+    pub id: Option<u64>,
+    pub container: Option<String>,
+    pub video_codec: Option<String>,
+    /// `1080`, `4k`, `sd`, as Plex says it.
+    pub video_resolution: Option<String>,
+    pub video_profile: Option<String>,
+    pub audio_codec: Option<String>,
+    pub audio_channels: Option<u32>,
+    /// kbit/s.
+    pub bitrate: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub parts: Vec<MediaPart>,
+}
+
+/// One file of a version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaPart {
+    /// Plex's part id.
+    pub id: Option<u64>,
+    /// Bytes.
+    pub size: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub file: FileState,
+}
+
+/// One piece of an item's artwork, as the server has it (P3-16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtworkInfo {
+    /// The `ArtworkId` clients fetch it by.
+    pub id: String,
+    pub kind: ArtworkKind,
+    /// Its size as the catalog has it, in pixels, when it could be read.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub bytes: Option<u64>,
+    /// Why it could not be fetched, when it could not.
+    pub error: Option<String>,
 }
 
 /// The caller's own account, for every role.
@@ -1393,8 +1703,9 @@ pub trait AdminApi {
     /// Add section `section` of Plex server `server` as a library, last,
     /// called `name` (Plex's name if left out); its id. The server must
     /// answer, to say what the section holds. `INVALID_INPUT` for a
-    /// section that is a library already, or that Spoolframe cannot
-    /// serve.
+    /// section that is a library already, that Spoolframe cannot serve,
+    /// or none of whose sample files is on this machine under the saved
+    /// mappings ([`LibraryPathCheck::refusal`]'s words).
     #[method(name = "libraryAdd", with_extensions)]
     async fn library_add(
         &self,
@@ -1469,4 +1780,39 @@ pub trait AdminApi {
     /// its address and token can be changed.
     #[method(name = "plexServerRemove", with_extensions)]
     async fn plex_server_remove(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+    /// Library `id` as an admin browses it (P3-16): its counts, and its
+    /// path check, which starts if the library has none yet.
+    /// `UNAVAILABLE` when its Plex server does not answer: the server
+    /// keeps no copy of the catalog to show instead.
+    #[method(name = "catalogLibrary", with_extensions)]
+    async fn catalog_library(&self, id: String) -> jsonrpsee::core::RpcResult<CatalogLibrary>;
+
+    /// One page of a library's rows. Only the rows on the page have their
+    /// files looked for; `Missing` is the path check's list, and is empty
+    /// until a check is done.
+    #[method(name = "catalogRows", with_extensions)]
+    async fn catalog_rows(&self, query: CatalogQuery) -> jsonrpsee::core::RpcResult<CatalogPage>;
+
+    /// The rows of an item's children in library `library`: a show's
+    /// seasons, a season's episodes, an album's tracks.
+    #[method(name = "catalogChildren", with_extensions)]
+    async fn catalog_children(
+        &self,
+        library: String,
+        id: String,
+    ) -> jsonrpsee::core::RpcResult<Vec<CatalogRow>>;
+
+    /// One item: what clients get, its match, its files looked for now,
+    /// its children.
+    #[method(name = "catalogItem", with_extensions)]
+    async fn catalog_item(&self, id: String) -> jsonrpsee::core::RpcResult<CatalogItem>;
+
+    /// An item's artwork, each with its size as the catalog has it.
+    #[method(name = "catalogArtwork", with_extensions)]
+    async fn catalog_artwork(&self, id: String) -> jsonrpsee::core::RpcResult<Vec<ArtworkInfo>>;
+
+    /// Check every media file of library `id` again, as `plexCheckPaths`
+    /// does; it runs on, and `catalogLibrary` says when it is done.
+    #[method(name = "catalogCheckPaths", with_extensions)]
+    async fn catalog_check_paths(&self, id: String) -> jsonrpsee::core::RpcResult<PathsChecked>;
 }

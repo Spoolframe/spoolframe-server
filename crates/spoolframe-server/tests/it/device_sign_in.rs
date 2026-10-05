@@ -291,7 +291,7 @@ async fn a_locked_phone_cannot_approve() {
             Some(&session),
             Request::SetPin {
                 pin: "4321".into(),
-                current: None,
+                proof: None,
             },
         )
         .await;

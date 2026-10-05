@@ -6199,6 +6199,7 @@ dependencies = [
  "tracing-subscriber",
  "uclicious",
  "url",
+ "uuid",
  "webauthn-authenticator-rs",
  "webauthn-rs",
  "webauthn-rs-proto",

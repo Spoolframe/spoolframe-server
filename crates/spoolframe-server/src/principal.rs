@@ -15,10 +15,11 @@ pub enum Principal {
 }
 
 impl fmt::Display for Principal {
-    /// The key it is stored under: `local:3`.
+    /// The key it is stored under, and `WhoAmI`'s `user_id`:
+    /// `local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c` (P3-20).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Principal::LocalUser(id) => write!(f, "local:{}", id.0),
+            Principal::LocalUser(id) => write!(f, "local:{id}"),
         }
     }
 }

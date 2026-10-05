@@ -30,6 +30,8 @@ wasm-bindgen-futures = "0.4"
 web-sys = { workspace = true, features = [
     "Navigator",
     "Clipboard",
+    # The catalog's columns, kept per browser (P3-16).
+    "Storage",
     # Taking the SSO callback's outcome out of the address (P3-04).
     "History",
     # The browser's passkey prompts.

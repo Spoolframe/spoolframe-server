@@ -15,7 +15,7 @@ use spoolframe_admin_api::{
 };
 
 use super::{Alert, Field, Notice, ShownName, http, icons, now, rpc, webauthn};
-use crate::logic::{ApiError, ago, avatar_class, client_kind, date, page_serves};
+use crate::logic::{ApiError, ago, avatar_class, client_kind, date, page_serves, passkey_title};
 use crate::preferences::{
     self, SDH, SUBTITLE_MODES, audio_choices, avoids_extras, index_of, override_line,
     subtitle_choices,
@@ -568,7 +568,7 @@ fn PasskeyRow(
             span { class: "row-what",
                 span { class: "break-words",
                     icons::Fingerprint {}
-                    b { "{passkey.name}" }
+                    b { {passkey_title(&passkey)} }
                 }
                 span { class: "row-sub", "{passkey.rp_id} · added {date(passkey.created_at)}{used}" }
                 if !passkey.usable {

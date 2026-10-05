@@ -903,7 +903,7 @@ fn UserPasskeys(username: String, name: String) -> Element {
                         for p in list {
                             div { key: "{p.id}", class: "row",
                                 span { class: "row-what",
-                                    span { icons::Fingerprint {} b { "{p.name}" } }
+                                    span { icons::Fingerprint {} b { {crate::logic::passkey_title(&p)} } }
                                     span { class: "row-sub",
                                         {match p.last_used_at {
                                             Some(at) => format!("{} · used {}", p.rp_id, ago(now(), at)),

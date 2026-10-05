@@ -13,6 +13,7 @@ use spoolframe_admin_api::{
 };
 
 use super::admin::sleep;
+use super::libraries::RemoteNote;
 use super::{Alert, Field, Route, icons, now, rpc};
 use crate::libraries;
 use crate::logic::{ApiError, Landing, host_port, thousands};
@@ -529,12 +530,13 @@ fn PlexFields(
         });
     };
     use_hook(reprobe);
-    // Nothing chosen yet: the first server found, once discovery answers.
+    // Nothing chosen yet: the first server found, once discovery answers;
+    // never a remote one, whose files are here only if mounted.
     use_effect(move || {
         if let Some(Ok(list)) = &*found.read()
             && chosen.peek().is_empty()
             && !*typing.peek()
-            && let Some(first) = list.first()
+            && let Some(first) = list.iter().find(|f| !libraries::remote(&f.url, None))
         {
             chosen.set(first.url.clone());
             reprobe();
@@ -723,6 +725,9 @@ fn PlexFields(
                                 span { class: "choice-what",
                                     b { "{server.name}" }
                                     {found_line(&server.url, server.version.as_deref())}
+                                    if libraries::remote(&server.url, None) {
+                                        RemoteNote {}
+                                    }
                                 }
                                 if !typing() && chosen() == server.url {
                                     ProbeState { probed: probed() }
@@ -741,6 +746,9 @@ fn PlexFields(
                     span { class: "choice-what",
                         b { "Type an address" }
                         "For a server discovery didn't find, or one on another network"
+                        if typing() && libraries::remote(&typed_url(), None) {
+                            RemoteNote {}
+                        }
                     }
                 }
                 if typing() {
@@ -776,6 +784,7 @@ fn PlexFields(
                         _ => rsx! {},
                     }
                 }
+                span { class: "text-xs text-ctp-subtext0", "{libraries::FILES_HERE}" }
             }
         }
         div { class: "flex flex-col gap-2",

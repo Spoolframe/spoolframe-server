@@ -14,6 +14,7 @@
         "guid": "plex://show/5d9c083d7b5c2e001e6578f9",
         "type": "show",
         "title": "12 Monkeys",
+        "contentRating": "TV-14",
         "summary": "Follows the journey of a time traveler from the post-apocalyptic future who a...",
         "index": 1,
         "viewCount": 51,
@@ -21,6 +22,16 @@
         "thumb": "/library/metadata/208618/thumb/1789149282",
         "art": "/library/metadata/208618/art/1789149282",
         "duration": 2580000,
+        "childCount": 4,
+        "leafCount": 46,
+        "Genre": [
+          {
+            "tag": "Thriller"
+          },
+          {
+            "tag": "Science Fiction"
+          }
+        ],
         "addedAt": 1720224129
       },
       {
@@ -29,6 +40,7 @@
         "guid": "plex://show/5d9c08713c3f87001f3505b6",
         "type": "show",
         "title": "24",
+        "contentRating": "TV-14",
         "summary": "In this concept drama, each season takes place within one 24 hour period. Day...",
         "index": 1,
         "viewCount": 70,
@@ -36,6 +48,16 @@
         "thumb": "/library/metadata/227433/thumb/1790784120",
         "art": "/library/metadata/227433/art/1790784120",
         "duration": 2700000,
+        "childCount": 9,
+        "leafCount": 204,
+        "Genre": [
+          {
+            "tag": "Drama"
+          },
+          {
+            "tag": "Crime"
+          }
+        ],
         "addedAt": 1772309809
       }
     ]

@@ -15,6 +15,7 @@ pub mod fingerprint;
 pub mod lan;
 pub mod media;
 pub mod messages;
+pub mod passkeys;
 pub mod playback;
 pub mod plex;
 pub mod previews;
@@ -25,8 +26,12 @@ pub use artwork::{ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
 pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle};
 pub use messages::{
     AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, HomeScreen, LoginPassword,
-    ManifestKind, PROTOCOL_VERSION, PinState, Reply, Request, RequestEnvelope, Response,
+    ManifestKind, PROTOCOL_VERSION, PinProof, PinState, Reply, Request, RequestEnvelope, Response,
     SUBTITLE_CHUNK, ServerInfo, SessionId, SessionInfo, UserSummary,
+};
+pub use passkeys::{
+    APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation,
+    PasskeyInfo, PasskeyRequest,
 };
 pub use playback::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
@@ -35,7 +40,7 @@ pub use playback::{
 };
 pub use plex::{PlexLink, PlexSyncSummary};
 pub use previews::{PreviewTile, Previews};
-pub use search::{SearchCounts, SearchGroup, SearchRequest, SearchResults};
+pub use search::{SearchCounts, SearchGroup, SearchRequest, SearchResults, TopResult};
 
 /// The ALPN of the client protocol, version 1. A breaking change to the
 /// protocol is a new ALPN, so old and new clients can be served side by

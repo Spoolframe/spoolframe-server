@@ -2,6 +2,8 @@
 //! web boards draw them.
 
 mod admin;
+mod catalog;
+mod catalog_item;
 mod device;
 mod http;
 mod icons;
@@ -17,6 +19,8 @@ use dioxus::prelude::*;
 use spoolframe_admin_api::{MeApiClient, PasswordChange, Role, UserInfo};
 
 use admin::{AdminHome, Server, UserSessions, Users};
+use catalog::CatalogLibrary;
+use catalog_item::CatalogItem;
 use device::DeviceApproval;
 use libraries::{AddLibrary, Libraries};
 use plex::PlexSignedIn;
@@ -76,6 +80,12 @@ enum Route {
             // step, or Settings › Plex); Libraries when empty.
             #[route("/libraries/add?:back")]
             AddLibrary { back: String },
+            // A library's items (P3-16): where the table is is in the
+            // address, so a reload or a link opens the same rows.
+            #[route("/libraries/:library?:page&:per&:filter&:kind&:q")]
+            CatalogLibrary { library: String, page: String, per: String, filter: String, kind: String, q: String },
+            #[route("/libraries/:library/:id?:tab")]
+            CatalogItem { library: String, id: String, tab: String },
             #[route("/settings")]
             SettingsHome {},
             #[route("/settings/:tab")]
@@ -1093,6 +1103,7 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::Profile {} => "My profile",
         Route::Server {} => "Server",
         Route::Libraries {} | Route::AddLibrary { .. } => "Libraries",
+        Route::CatalogLibrary { .. } | Route::CatalogItem { .. } => "Libraries",
         Route::Settings { .. } | Route::SettingsHome {} => "Settings",
         _ => "Users",
     };
@@ -1209,7 +1220,13 @@ fn SignedIn(user: UserInfo) -> Element {
 
 /// Server › Libraries in the sidebar (P3-11): under Server, one step in.
 fn libraries_link(route: &Route) -> Element {
-    let here = matches!(route, Route::Libraries {} | Route::AddLibrary { .. });
+    let here = matches!(
+        route,
+        Route::Libraries {}
+            | Route::AddLibrary { .. }
+            | Route::CatalogLibrary { .. }
+            | Route::CatalogItem { .. }
+    );
     rsx! {
         Link {
             class: if here { "nav-link nav-link-here nav-sub" } else { "nav-link nav-sub" },

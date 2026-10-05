@@ -12,12 +12,13 @@ mod bif;
 pub mod check;
 mod convert;
 pub mod gdm;
+pub mod inspect;
 pub mod paths;
 mod search;
 mod watch;
 mod wire;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -346,6 +347,43 @@ impl PlexCatalog {
         })
     }
 
+    /// `tracks`, an album's listing, with each track's streams: Plex gives
+    /// a track's bit depth and sample rate only on the track asked for by
+    /// key, and one request asks for them all. Without them the tracks
+    /// are still whole, so a failure only loses those two numbers.
+    async fn with_streams(&self, album: &MediaId, tracks: &mut [Metadata]) {
+        // Plex's keys are numbers; anything else is left out of the path.
+        let keys: Vec<&str> = tracks
+            .iter()
+            .map(|m| m.rating_key.as_str())
+            .filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let call = Call::get(format!("/library/metadata/{}", keys.join(","))).about(album);
+        let full = match self.fetch(&call).await {
+            Ok(container) => container.metadata,
+            Err(e) => {
+                tracing::warn!(
+                    %album,
+                    error = %e,
+                    "an album's tracks are listed without their bit depth and sample rate"
+                );
+                return;
+            }
+        };
+        let mut full: HashMap<String, Metadata> = full
+            .into_iter()
+            .map(|m| (m.rating_key.clone(), m))
+            .collect();
+        for track in tracks {
+            if let Some(found) = full.remove(&track.rating_key) {
+                track.media = found.media;
+            }
+        }
+    }
+
     /// Every item in a listing, or the first one that does not convert.
     fn items_of(&self, call: &Call<'_>, metadata: &[Metadata]) -> Result<Vec<Item>, CatalogError> {
         metadata
@@ -556,27 +594,26 @@ impl Catalog for PlexCatalog {
     }
 
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
-        let Fetched {
-            item,
-            call,
-            metadata,
-            ..
-        } = self.metadata(id, has_markers(id.kind())).await?;
-        let children = if has_children(id.kind()) {
-            let children = Call::get(format!("{}/children", call.path)).about(id);
-            // Only `Metadata` entries are children; a show's "All episodes"
-            // shortcut comes as a `Directory` and is not one.
-            let container = self.fetch(&children).await?;
-            self.items_of(&children, &container.metadata)?
-        } else {
-            Vec::new()
+        let fetched = self.metadata(id, has_markers(id.kind())).await?;
+        if !has_children(id.kind()) {
+            return self.with_children(&fetched, None, &[]);
+        }
+        let (call, mut children, _) = self.children_of(id, &fetched.call.path, false).await?;
+        if id.kind() != MediaKind::Album {
+            return self.with_children(&fetched, Some(&call), &children);
+        }
+        self.with_streams(id, &mut children).await;
+        let mut got = self.with_children(&fetched, Some(&call), &children)?;
+        let count = match &got.item {
+            Item::Album(album) => album.track_count,
+            _ => None,
         };
-        Ok(ItemWithChildren {
-            item,
-            children,
-            external_ids: convert::external_ids(&metadata),
-            markers: convert::markers(&metadata),
-        })
+        for child in &mut got.children {
+            if let Item::Track(track) = child {
+                track.album_track_count = count;
+            }
+        }
+        Ok(got)
     }
 
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {

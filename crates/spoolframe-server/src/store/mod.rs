@@ -9,6 +9,7 @@ pub mod passkeys;
 pub mod pins;
 pub mod sessions;
 pub mod tracks;
+pub mod user_ids;
 pub mod users;
 pub mod watch;
 
@@ -31,6 +32,17 @@ pub enum StoreError {
         path: PathBuf,
         source: sqlx::migrate::MigrateError,
     },
+    /// The copy made before migration 0012 (P3-20) could not be written;
+    /// the migration has not run.
+    #[error("cannot back the database up to {path}: {source}")]
+    Backup { path: PathBuf, source: sqlx::Error },
+    /// A secret named by a user's old id could not take the new one; the
+    /// next start tries again.
+    #[error("cannot rename the secret {from} to its user's new id: {source}")]
+    RenameSecret {
+        from: PathBuf,
+        source: std::io::Error,
+    },
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -43,7 +55,9 @@ pub struct Store {
 
 impl Store {
     /// Open (creating if needed) the database in `state_dir` and apply the
-    /// migrations it has not seen.
+    /// migrations it has not seen. Before migration 0012 (UUID user ids,
+    /// P3-20) the database is copied to `spoolframe.db.pre-0012`; after
+    /// it, the secrets named by user id take the new ids.
     pub async fn open(state_dir: &Path) -> Result<Self, StoreError> {
         let path = state_dir.join(DB_FILE);
         let options = SqliteConnectOptions::from_str("sqlite:")
@@ -64,10 +78,12 @@ impl Store {
                 path: path.clone(),
                 source,
             })?;
+        user_ids::back_up_if_pending(&pool, state_dir).await?;
         sqlx::migrate!("./migrations")
             .run(&pool)
             .await
             .map_err(|source| StoreError::Migrate { path, source })?;
+        user_ids::rename_secrets(&pool, state_dir).await?;
         Ok(Self { pool })
     }
 }

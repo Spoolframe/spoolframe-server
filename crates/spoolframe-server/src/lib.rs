@@ -6,6 +6,7 @@
 
 pub mod admin;
 mod admin_http;
+pub mod app_passkeys;
 pub mod artwork;
 pub mod auth;
 pub mod catalog;

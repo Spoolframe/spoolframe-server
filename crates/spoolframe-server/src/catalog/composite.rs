@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use spoolframe_catalog::{
-    Catalog, CatalogError, Found, FoundGroup, Image, ItemPage, ItemWithChildren, Page,
-    PreviewFrames, SearchQuery,
+    Browse, Catalog, CatalogError, Found, FoundGroup, Image, Inspect, Inspected, ItemPage,
+    ItemWithChildren, LibraryCheck, MissingFile, Page, PreviewFrames, Row, RowPage, SearchQuery,
 };
 use spoolframe_plex::{Dated, PlexCatalog};
-use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId, PersonId};
+use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId, MediaKind, PersonId};
 
 use spoolframe_admin_api::SyncDirection;
 
@@ -385,6 +385,128 @@ impl Catalog for Composite {
     }
 }
 
+/// `row` from `server`, every ID in it naming that server.
+fn row(server: &str, row: Row) -> Row {
+    Row {
+        item: ids::item(server, row.item),
+        ..row
+    }
+}
+
+fn rows(server: &str, rows: Vec<Row>) -> Vec<Row> {
+    rows.into_iter().map(|r| row(server, r)).collect()
+}
+
+impl Composite {
+    /// The library a Plex server's section is here: its configured one,
+    /// or while none are chosen, the first server's under Plex's name.
+    pub fn served_library(&self, server: &str, section: &str) -> Option<&Served> {
+        self.libraries
+            .as_deref()?
+            .iter()
+            .find(|l| l.server == server && l.section == section)
+    }
+}
+
+/// An admin's look into each library, at the Plex server its ID names
+/// (P3-16).
+#[async_trait]
+impl Inspect for Composite {
+    async fn browse(&self, library: &LibraryId, query: &Browse) -> Result<RowPage, CatalogError> {
+        let (server, local) = ids::library_local(library);
+        let page = self
+            .source(server, library)?
+            .catalog
+            .browse(&local, query)
+            .await
+            .map_err(|e| named(e, &local, library))?;
+        Ok(RowPage {
+            rows: rows(server, page.rows),
+            total: page.total,
+        })
+    }
+
+    async fn count(&self, library: &LibraryId, kind: MediaKind) -> Result<u32, CatalogError> {
+        let (server, local) = ids::library_local(library);
+        self.source(server, library)?
+            .catalog
+            .count(&local, kind)
+            .await
+            .map_err(|e| named(e, &local, library))
+    }
+
+    async fn child_rows(&self, id: &MediaId) -> Result<Vec<Row>, CatalogError> {
+        let (server, local) = ids::media_local(id);
+        let found = self
+            .source(server, id)?
+            .catalog
+            .child_rows(&local)
+            .await
+            .map_err(|e| named(e, &local, id))?;
+        Ok(rows(server, found))
+    }
+
+    async fn inspect(&self, id: &MediaId) -> Result<Inspected, CatalogError> {
+        let (server, local) = ids::media_local(id);
+        let seen = self
+            .source(server, id)?
+            .catalog
+            .inspect(&local)
+            .await
+            .map_err(|e| named(e, &local, id))?;
+        Ok(Inspected {
+            found: ItemWithChildren {
+                item: ids::item(server, seen.found.item),
+                children: seen
+                    .found
+                    .children
+                    .into_iter()
+                    .map(|c| ids::item(server, c))
+                    .collect(),
+                ..seen.found
+            },
+            library: seen.library.map(|l| ids::library(server, l)),
+            ancestors: seen
+                .ancestors
+                .into_iter()
+                .map(|(id, title)| (ids::media(server, id), title))
+                .collect(),
+            children: rows(server, seen.children),
+            ..seen
+        })
+    }
+
+    async fn check_library(&self, library: &LibraryId) -> Result<LibraryCheck, CatalogError> {
+        let (server, local) = ids::library_local(library);
+        let check = self
+            .source(server, library)?
+            .catalog
+            .check_library(&local)
+            .await
+            .map_err(|e| named(e, &local, library))?;
+        Ok(LibraryCheck {
+            ok: check.ok,
+            missing: check
+                .missing
+                .into_iter()
+                .map(|m| MissingFile {
+                    row: row(server, m.row),
+                    file: m.file,
+                })
+                .collect(),
+        })
+    }
+
+    async fn backend_link(&self, id: &MediaId) -> Result<Option<String>, CatalogError> {
+        let (server, local) = ids::media_local(id);
+        self.source(server, id)?
+            .catalog
+            .backend_link(&local)
+            .await
+            .map_err(|e| named(e, &local, id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +518,7 @@ mod tests {
             title: key.into(),
             year: None,
             summary: None,
+            content_rating: None,
             duration: None,
             artwork: Vec::new(),
             playback: PlaybackState::default(),

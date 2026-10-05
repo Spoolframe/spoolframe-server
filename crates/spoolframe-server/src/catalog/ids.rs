@@ -221,6 +221,7 @@ mod tests {
             episode: 1,
             title: "Pilot".into(),
             summary: None,
+            content_rating: None,
             duration: None,
             artwork: vec![Artwork {
                 id: "plex:/library/metadata/3/thumb/9".parse().unwrap(),

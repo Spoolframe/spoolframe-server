@@ -125,9 +125,30 @@ pub(crate) async fn link(client: &WsClient) -> PlexLink {
     }
 }
 
-/// The user's own secret, as a file under the state directory.
-pub(crate) fn secret(dir: &std::path::Path, user_id: i64) -> Option<String> {
-    std::fs::read_to_string(dir.join(format!("secrets/plex-account-{user_id}"))).ok()
+/// The one user's Plex link secret under the state directory, if any:
+/// `secrets/plex-account-<user id>`, the id a UUID (P3-20).
+pub(crate) fn secret(dir: &std::path::Path) -> Option<String> {
+    let Ok(entries) = std::fs::read_dir(dir.join("secrets")) else {
+        return None;
+    };
+    let mut found: Vec<_> = entries
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("plex-account-")
+        })
+        .collect();
+    assert!(found.len() <= 1, "one user links here: {found:?}");
+    let path = found.pop()?;
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    let id = name.strip_prefix("plex-account-").unwrap();
+    assert!(
+        id.len() == 36 && id.split('-').count() == 5,
+        "named by a UUID: {name}"
+    );
+    Some(std::fs::read_to_string(path).unwrap())
 }
 
 /// `forwardUrl` in Plex's sign-in page `auth_url`, if it has one.
@@ -200,8 +221,8 @@ async fn a_user_links_their_plex_account_and_unlinks_it_and_the_token_is_never_h
     assert_eq!(linked.username.as_deref(), Some("alice"));
     assert_eq!(linked.email.as_deref(), Some("alice@example.com"));
     assert!(!linked.by_config);
-    // alice is user 2: the token is her secret, and nowhere else.
-    let kept = secret(dir.as_ref(), 2).expect("kept");
+    // The token is her secret, and nowhere else.
+    let kept = secret(dir.as_ref()).expect("kept");
     assert!(kept.contains("tok-alice-account"));
     assert!(!dir.as_ref().join("runtime.ucl").exists());
 
@@ -224,7 +245,7 @@ async fn a_user_links_their_plex_account_and_unlinks_it_and_the_token_is_never_h
     assert!(!mine.contains("tok-alice-account"), "{mine}");
 
     alice.plex_unlink().await.unwrap();
-    assert_eq!(secret(dir.as_ref(), 2), None);
+    assert_eq!(secret(dir.as_ref()), None);
     assert_eq!(alice.plex_link().await.unwrap().link, None);
 }
 
@@ -248,7 +269,7 @@ async fn an_admin_unlinks_a_user_but_cannot_link_one() {
     let (root, alice) = root_and_alice(addr).await;
     link(&alice).await;
     root.user_plex_unlink("alice".into()).await.unwrap();
-    assert_eq!(secret(dir.as_ref(), 2), None);
+    assert_eq!(secret(dir.as_ref()), None);
     assert_eq!(alice.plex_link().await.unwrap().link, None);
     // Unlinking is the admin's; nothing here links someone else.
     assert_eq!(
@@ -275,7 +296,7 @@ async fn plex_tv_out_of_reach_is_unavailable_and_links_nothing() {
         code(alice.plex_link_begin().await.unwrap_err()),
         error_code::UNAVAILABLE
     );
-    assert_eq!(secret(dir.as_ref(), 2), None);
+    assert_eq!(secret(dir.as_ref()), None);
 }
 
 /// PX-04's `watch_sync { user = … }` is the owner's link: shown as made

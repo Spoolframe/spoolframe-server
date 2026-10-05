@@ -14,6 +14,14 @@ pub enum SdkError {
     /// The server cannot be reached right now.
     #[error("{0} cannot be reached")]
     Unreachable(String),
+    /// The server did not answer in time ([`crate::Timeouts`]). Whether a
+    /// request that changes something was done is not known: show the
+    /// state again before offering to repeat it. A request that only
+    /// reads has been tried again, once, on a new connection where the
+    /// old one had died. Either way the next call works if the server is
+    /// back: a dead connection has been dropped, and the next call dials.
+    #[error("no answer in time: {0}")]
+    TimedOut(String),
     /// Not saved, not heard on the LAN and no address given.
     #[error("no server {0} is known")]
     UnknownServer(String),
@@ -65,6 +73,13 @@ pub enum SdkError {
     /// digits); the message says why.
     #[error("{0}")]
     InvalidInput(String),
+    /// The call carried the user's account password and they have none:
+    /// they sign in with a passkey or SSO only
+    /// ([`crate::PinProof::Password`]). Nothing was counted as a failed
+    /// sign-in. Offer another proof, or send them to the server's web UI
+    /// ([`crate::Session::web_url`], when the server has one).
+    #[error("this account has no password; use the PIN or the web UI")]
+    NoPassword,
     /// The subtitle is still being read as text (P2-07): ask again in a
     /// few seconds.
     #[error("the subtitle is still being read ({done_percent}% done)")]
@@ -87,6 +102,16 @@ pub enum SdkError {
     /// would be; signing in works.
     #[error("this server is not set up yet")]
     NotSetUp,
+    /// The session signed in too long ago to add or remove a passkey
+    /// (P3-19): sign in again ([`crate::Client::sign_in`], or a passkey),
+    /// then ask again.
+    #[error("sign in again first")]
+    RecentSignInRequired,
+    /// The passkey is the user's last way to sign in, and is kept
+    /// ([`crate::Session::remove_passkey`]): add another passkey, or a
+    /// password in the web UI, first.
+    #[error("that is the last way to sign in to this account")]
+    LastSignInMethod,
     /// The device sign-in was refused on the approving device (P3-07).
     #[error("the sign-in was denied")]
     SignInDenied,
@@ -102,6 +127,12 @@ pub enum SdkError {
 }
 
 impl SdkError {
+    /// The connection failed under a request: it was not answered in
+    /// time, or its stream broke. The connection may be dead.
+    pub(crate) fn is_transport(&self) -> bool {
+        matches!(self, SdkError::TimedOut(_) | SdkError::Unreachable(_))
+    }
+
     /// The error for a server's answer. `Unauthenticated` is
     /// [`SdkError::SignInRequired`]; the caller forgets the session.
     pub(crate) fn from_server(error: ServerError) -> Self {
@@ -119,6 +150,7 @@ impl SdkError {
             ServerError::PlaybackRestarted { epoch } => SdkError::PlaybackRestarted { epoch },
             ServerError::ProfileLocked => SdkError::ProfileLocked,
             ServerError::InvalidInput { message } => SdkError::InvalidInput(message),
+            ServerError::NoPassword => SdkError::NoPassword,
             ServerError::SubtitleNotReady { done_percent } => {
                 SdkError::SubtitleNotReady { done_percent }
             }
@@ -130,7 +162,30 @@ impl SdkError {
             ServerError::DeviceSignInDenied => SdkError::SignInDenied,
             ServerError::DeviceSignInExpired => SdkError::SignInExpired,
             ServerError::NotSetUp => SdkError::NotSetUp,
+            ServerError::RecentSignInRequired => SdkError::RecentSignInRequired,
+            ServerError::LastSignInMethod => SdkError::LastSignInMethod,
             other => SdkError::Server(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_signed_in_too_long_ago_is_told_apart() {
+        assert_eq!(
+            SdkError::from_server(ServerError::RecentSignInRequired),
+            SdkError::RecentSignInRequired
+        );
+    }
+
+    #[test]
+    fn the_last_way_to_sign_in_is_told_apart() {
+        assert_eq!(
+            SdkError::from_server(ServerError::LastSignInMethod),
+            SdkError::LastSignInMethod
+        );
     }
 }

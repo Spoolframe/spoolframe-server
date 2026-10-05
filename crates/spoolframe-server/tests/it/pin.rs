@@ -6,9 +6,13 @@ use crate::support;
 use std::time::Duration;
 
 use spoolframe_protocol::{
-    ArtworkResponse, ArtworkSize, Error, MediaReadResponse, PinState, Reply, Request, Response,
-    Selection, SessionId,
+    ArtworkResponse, ArtworkSize, Error, LoginPassword, MediaReadResponse, PinProof, PinState,
+    Reply, Request, Response, Selection, SessionId,
 };
+use spoolframe_server::auth::SessionToken;
+use spoolframe_server::store::passkeys::FirstPasskey;
+use spoolframe_server::store::sessions::SessionBinding;
+use spoolframe_types::Platform;
 use support::{ServerOptions, TestClient, TestServer, fresh_dir, mkv_capabilities, movie, poster};
 
 const PASSWORD: &str = "correct horse";
@@ -49,7 +53,7 @@ async fn locked(test: &str, options: ServerOptions) -> (TestServer, TestClient, 
         &session,
         Request::SetPin {
             pin: PIN.into(),
-            current: None,
+            proof: None,
         },
     )
     .await;
@@ -128,7 +132,7 @@ async fn a_locked_session_gets_nothing_on_any_stream() {
         &session,
         Request::SetPin {
             pin: PIN.into(),
-            current: None,
+            proof: None,
         },
     )
     .await;
@@ -197,9 +201,8 @@ async fn switching_to_another_profile_and_back_asks_again() {
     server.stop().await;
 }
 
-/// A PIN only locks and unlocks a session a real sign-in made, so an
-/// unlocked session changes it and its switch with nothing more; a locked
-/// one cannot touch either (P2-08).
+/// A locked session cannot touch the PIN or its switch, not even with
+/// the PIN: it unlocks first (P2-08).
 #[tokio::test]
 async fn only_an_unlocked_session_changes_the_pin_or_its_switch() {
     let (server, tv, session) = locked("pin-off", ServerOptions::default()).await;
@@ -213,7 +216,7 @@ async fn only_an_unlocked_session_changes_the_pin_or_its_switch() {
             &tv,
             &session,
             Request::ClearPin {
-                current: PIN.into()
+                proof: PinProof::Pin { pin: PIN.into() }
             }
         )
         .await,
@@ -225,7 +228,7 @@ async fn only_an_unlocked_session_changes_the_pin_or_its_switch() {
             &session,
             Request::SetPin {
                 pin: "0000".into(),
-                current: Some(PIN.into())
+                proof: Some(PinProof::Pin { pin: PIN.into() })
             }
         )
         .await,
@@ -251,7 +254,7 @@ async fn a_pin_is_four_to_eight_digits() {
             &session,
             Request::SetPin {
                 pin: bad.into(),
-                current: None,
+                proof: None,
             },
         )
         .await;
@@ -327,7 +330,7 @@ async fn devices_are_listed_and_set_from_elsewhere() {
         &on_desktop,
         Request::SetPin {
             pin: PIN.into(),
-            current: None,
+            proof: None,
         },
     )
     .await;
@@ -382,7 +385,7 @@ async fn who_am_i_says_whether_there_is_a_pin_and_how_many_digits() {
         &session,
         Request::SetPin {
             pin: "123456".into(),
-            current: None,
+            proof: None,
         },
     )
     .await;
@@ -394,7 +397,9 @@ async fn who_am_i_says_whether_there_is_a_pin_and_how_many_digits() {
         &tv,
         &session,
         Request::ClearPin {
-            current: "123456".into(),
+            proof: PinProof::Pin {
+                pin: "123456".into(),
+            },
         },
     )
     .await;
@@ -417,76 +422,125 @@ async fn a_locked_profile_says_how_long_its_pin_is() {
     server.stop().await;
 }
 
-fn set_pin(pin: &str, current: Option<&str>) -> Request {
+fn set_pin(pin: &str, proof: Option<PinProof>) -> Request {
     Request::SetPin {
         pin: pin.into(),
-        current: current.map(Into::into),
+        proof,
     }
 }
 
-fn clear_pin(current: &str) -> Request {
-    Request::ClearPin {
-        current: current.into(),
+fn clear_pin(proof: PinProof) -> Request {
+    Request::ClearPin { proof }
+}
+
+fn by_pin(pin: &str) -> PinProof {
+    PinProof::Pin { pin: pin.into() }
+}
+
+fn by_password(password: &str) -> PinProof {
+    PinProof::Password {
+        password: password.into(),
     }
 }
 
-/// A PIN is changed or removed only with the current one (a Change PIN or
-/// Remove PIN dialog asks for it); a wrong one changes nothing.
-#[tokio::test]
-async fn a_pin_is_changed_or_removed_only_with_the_current_one() {
-    let server =
-        TestServer::start_with(fresh_dir("pin-current").await, ServerOptions::default()).await;
+async fn pin_server(test: &str, options: ServerOptions) -> (TestServer, TestClient, SessionId) {
+    let server = TestServer::start_with(fresh_dir(test).await, options).await;
     server.add_user("alice", PASSWORD, None).await;
     let (tv, session) = alice_on(&server).await;
+    (server, tv, session)
+}
+
+/// The first PIN needs no proof. After that, changing or removing it takes
+/// the current PIN or the account password (a Change PIN or Remove PIN
+/// dialog asks for one); none is `InvalidInput`, a wrong one changes
+/// nothing.
+#[tokio::test]
+async fn a_pin_is_changed_or_removed_only_with_the_current_pin_or_the_password() {
+    let (server, tv, session) = pin_server("pin-proof", ServerOptions::default()).await;
     ok(&tv, &session, set_pin(PIN, None)).await;
 
     let refused = err(&tv, &session, set_pin("98765", None)).await;
     assert!(matches!(refused, Error::InvalidInput { .. }), "{refused:?}");
-    assert_eq!(
-        err(&tv, &session, set_pin("98765", Some("0000"))).await,
-        Error::InvalidCredentials
-    );
-    assert_eq!(
-        err(&tv, &session, clear_pin("0000")).await,
-        Error::InvalidCredentials
-    );
+    for wrong in [
+        set_pin("98765", Some(by_pin("0000"))),
+        set_pin("98765", Some(by_password("wrong password"))),
+        // Neither stands in for the other.
+        set_pin("98765", Some(by_pin(PASSWORD))),
+        set_pin("98765", Some(by_password(PIN))),
+        clear_pin(by_pin("0000")),
+        clear_pin(by_password("wrong password")),
+    ] {
+        assert_eq!(err(&tv, &session, wrong).await, Error::InvalidCredentials);
+    }
     // Nothing changed: the PIN is the first one still.
     assert_eq!(
         pin_state(&tv, &session).await,
         Some(PinState { digits: Some(4) })
     );
 
-    ok(&tv, &session, set_pin("98765", Some(PIN))).await;
+    ok(&tv, &session, set_pin("98765", Some(by_pin(PIN)))).await;
     assert_eq!(
         pin_state(&tv, &session).await,
         Some(PinState { digits: Some(5) })
     );
+    ok(
+        &tv,
+        &session,
+        set_pin("123456", Some(by_password(PASSWORD))),
+    )
+    .await;
     assert_eq!(
-        err(&tv, &session, clear_pin(PIN)).await,
-        Error::InvalidCredentials
+        pin_state(&tv, &session).await,
+        Some(PinState { digits: Some(6) })
     );
-    ok(&tv, &session, clear_pin("98765")).await;
+    ok(&tv, &session, clear_pin(by_pin("123456"))).await;
     assert_eq!(pin_state(&tv, &session).await, None);
-    // Without a PIN there is nothing to check.
     ok(&tv, &session, set_pin(PIN, None)).await;
+    ok(&tv, &session, clear_pin(by_password(PASSWORD))).await;
+    assert_eq!(pin_state(&tv, &session).await, None);
     tv.close().await;
     server.stop().await;
 }
 
-/// Checking the current PIN does not unlock a locked profile: a locked
-/// session cannot change the PIN at all, and an unlocked one that checks
-/// it gets no further than it was.
+/// Forgot the PIN: the password alone replaces it, and then removes it.
+/// The old PIN no longer unlocks; the new one does.
 #[tokio::test]
-async fn checking_the_current_pin_unlocks_nothing() {
-    let (server, tv, session) = locked("pin-current-locked", ServerOptions::default()).await;
+async fn the_password_replaces_a_forgotten_pin() {
+    let (server, tv, session) = pin_server("pin-forgot", ServerOptions::default()).await;
+    ok(&tv, &session, set_pin(PIN, None)).await;
+    ok(&tv, &session, set_pin("2468", Some(by_password(PASSWORD)))).await;
     assert_eq!(
-        err(&tv, &session, set_pin("98765", Some(PIN))).await,
-        Error::ProfileLocked
+        err(&tv, &session, Request::UnlockProfile { pin: PIN.into() }).await,
+        Error::InvalidCredentials
     );
+    ok(&tv, &session, Request::UnlockProfile { pin: "2468".into() }).await;
+    ok(&tv, &session, clear_pin(by_password(PASSWORD))).await;
+    assert_eq!(pin_state(&tv, &session).await, None);
+    tv.close().await;
+    server.stop().await;
+}
+
+/// A locked session gets `ProfileLocked` whatever the proof, and checking
+/// it unlocks nothing: the session stays locked.
+#[tokio::test]
+async fn no_proof_gets_round_the_lock() {
+    let (server, tv, session) = locked("pin-proof-locked", ServerOptions::default()).await;
+    for request in [
+        set_pin("98765", Some(by_pin(PIN))),
+        set_pin("98765", Some(by_password(PASSWORD))),
+        clear_pin(by_pin(PIN)),
+        clear_pin(by_password(PASSWORD)),
+    ] {
+        assert_eq!(err(&tv, &session, request).await, Error::ProfileLocked);
+    }
     assert!(who(&tv, &session).await);
     assert_eq!(
         err(&tv, &session, Request::Libraries).await,
         Error::ProfileLocked
+    );
+    assert_eq!(
+        pin_state(&tv, &session).await,
+        Some(PinState { digits: Some(4) })
     );
     tv.close().await;
     server.stop().await;
@@ -495,30 +549,24 @@ async fn checking_the_current_pin_unlocks_nothing() {
 /// Wrong current PINs count towards the same limit as wrong PINs at the
 /// lock screen: guessing through Change PIN, Remove PIN and the lock in
 /// turn is stopped after as many tries as through the lock alone, and
-/// stopped even for the right PIN.
+/// stopped even for the right PIN. The password limit is untouched.
 #[tokio::test]
 async fn wrong_current_pins_share_the_unlock_limit() {
-    let server = TestServer::start_with(
-        fresh_dir("pin-current-limit").await,
-        ServerOptions::default(),
-    )
-    .await;
-    server.add_user("alice", PASSWORD, None).await;
-    let (tv, session) = alice_on(&server).await;
+    let (server, tv, session) = pin_server("pin-proof-limit", ServerOptions::default()).await;
     ok(&tv, &session, set_pin(PIN, None)).await;
     let guesses = [
-        set_pin("98765", Some("0000")),
-        clear_pin("0001"),
+        set_pin("98765", Some(by_pin("0000"))),
+        clear_pin(by_pin("0001")),
         Request::UnlockProfile { pin: "0002".into() },
-        set_pin("98765", Some("0003")),
-        clear_pin("0004"),
+        set_pin("98765", Some(by_pin("0003"))),
+        clear_pin(by_pin("0004")),
     ];
     for guess in guesses {
         assert_eq!(err(&tv, &session, guess).await, Error::InvalidCredentials);
     }
     for right in [
-        clear_pin(PIN),
-        set_pin("98765", Some(PIN)),
+        clear_pin(by_pin(PIN)),
+        set_pin("98765", Some(by_pin(PIN))),
         Request::UnlockProfile { pin: PIN.into() },
     ] {
         let refused = err(&tv, &session, right).await;
@@ -528,6 +576,8 @@ async fn wrong_current_pins_share_the_unlock_limit() {
         pin_state(&tv, &session).await,
         Some(PinState { digits: Some(4) })
     );
+    // Not one password was counted: alice signs in from here.
+    tv.login("alice", PASSWORD).await;
     tv.close().await;
     server.stop().await;
 }
@@ -538,13 +588,11 @@ async fn ten_wrong_current_pins_revoke_that_device_s_session() {
         failure_window: Duration::from_millis(200),
         ..ServerOptions::default()
     };
-    let server = TestServer::start_with(fresh_dir("pin-current-revoke").await, options).await;
-    server.add_user("alice", PASSWORD, None).await;
-    let (tv, session) = alice_on(&server).await;
+    let (server, tv, session) = pin_server("pin-proof-revoke", options).await;
     ok(&tv, &session, set_pin(PIN, None)).await;
     let mut wrong = 0;
     let last = loop {
-        match tv.call(Some(&session), clear_pin("0000")).await {
+        match tv.call(Some(&session), clear_pin(by_pin("0000"))).await {
             Response::Err(Error::RateLimited { .. }) => {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
@@ -556,9 +604,161 @@ async fn ten_wrong_current_pins_revoke_that_device_s_session() {
     assert_eq!(wrong, 9);
     assert_eq!(last, Error::Unauthenticated);
     assert_eq!(
-        err(&tv, &session, clear_pin(PIN)).await,
+        err(&tv, &session, clear_pin(by_password(PASSWORD))).await,
         Error::Unauthenticated
     );
+    tv.close().await;
+    server.stop().await;
+}
+
+/// Wrong passwords through Change PIN and Remove PIN are failed sign-ins:
+/// with wrong `LoginPassword`s from the same device they reach the one
+/// limit, after which even the right password is refused, there and at
+/// sign-in, and any sign-in from that device. The PIN's own limit is
+/// untouched.
+#[tokio::test]
+async fn wrong_passwords_share_the_sign_in_limit_not_the_pin_s() {
+    let (server, tv, session) = pin_server("pin-password-limit", ServerOptions::default()).await;
+    server.add_user("bob", "battery staple", None).await;
+    ok(&tv, &session, set_pin(PIN, None)).await;
+    let wrong_login = Request::LoginPassword(LoginPassword {
+        username: "alice".into(),
+        password: "wrong password".into(),
+    });
+    assert_eq!(
+        tv.call(None, wrong_login.clone()).await,
+        Response::Err(Error::InvalidCredentials)
+    );
+    for guess in [
+        set_pin("98765", Some(by_password("wrong 1"))),
+        clear_pin(by_password("wrong 2")),
+        set_pin("98765", Some(by_password("wrong 3"))),
+    ] {
+        assert_eq!(err(&tv, &session, guess).await, Error::InvalidCredentials);
+    }
+    assert_eq!(
+        tv.call(None, wrong_login).await,
+        Response::Err(Error::InvalidCredentials)
+    );
+    for right in [
+        set_pin("98765", Some(by_password(PASSWORD))),
+        clear_pin(by_password(PASSWORD)),
+    ] {
+        let refused = err(&tv, &session, right).await;
+        assert!(matches!(refused, Error::RateLimited { .. }), "{refused:?}");
+    }
+    for (username, password) in [("alice", PASSWORD), ("bob", "battery staple")] {
+        let login = Request::LoginPassword(LoginPassword {
+            username: username.into(),
+            password: password.into(),
+        });
+        let refused = tv.call(None, login).await;
+        assert!(
+            matches!(refused, Response::Err(Error::RateLimited { .. })),
+            "{username}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        pin_state(&tv, &session).await,
+        Some(PinState { digits: Some(4) })
+    );
+    // Not one PIN was counted: the PIN proof still works, first try.
+    ok(&tv, &session, set_pin("98765", Some(by_pin(PIN)))).await;
+    tv.close().await;
+    server.stop().await;
+}
+
+/// However many wrong passwords, the session stays: a failed sign-in
+/// signs no one out (unlike ten wrong PINs).
+#[tokio::test]
+async fn wrong_passwords_never_revoke_the_session() {
+    let options = ServerOptions {
+        failure_window: Duration::from_millis(200),
+        ..ServerOptions::default()
+    };
+    let (server, tv, session) = pin_server("pin-password-revoke", options).await;
+    ok(&tv, &session, set_pin(PIN, None)).await;
+    let mut wrong = 0;
+    while wrong < 12 {
+        match tv
+            .call(Some(&session), clear_pin(by_password("wrong password")))
+            .await
+        {
+            Response::Err(Error::RateLimited { .. }) => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Response::Err(Error::InvalidCredentials) => wrong += 1,
+            other => panic!("not a wrong password: {other:?}"),
+        }
+    }
+    ok(&tv, &session, Request::Libraries).await;
+    assert_eq!(
+        pin_state(&tv, &session).await,
+        Some(PinState { digits: Some(4) })
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+/// A user who signs in with a passkey (or SSO) only has no password to
+/// give: a password proof is answered `NoPassword`, distinctly, and
+/// nothing is counted or changed. The PIN proof works for them as for
+/// anyone.
+#[tokio::test]
+async fn a_user_without_a_password_proves_it_with_the_pin() {
+    let server =
+        TestServer::start_with(fresh_dir("pin-no-password").await, ServerOptions::default()).await;
+    let alice = server
+        .store
+        .add_first_admin_with_passkey(
+            "alice",
+            FirstPasskey {
+                handle: "handle",
+                credential_id: "credential",
+                name: "Key",
+                credential: "{}",
+                rp_id: "localhost",
+            },
+        )
+        .await
+        .unwrap();
+    let tv = server.client().await;
+    tv.hello_with(None, Some(mkv_capabilities())).await;
+    // As a passkey sign-in or a device approval would open it.
+    let token = SessionToken("alice-on-the-tv".into());
+    server
+        .store
+        .create_session(
+            &token.hash(),
+            alice,
+            &SessionBinding::Endpoint {
+                endpoint_id: tv.endpoint.id().to_string(),
+                device_name: None,
+                platform: Platform::Linux,
+            },
+            i64::MAX / 2,
+        )
+        .await
+        .unwrap();
+    let session = SessionId(token.0);
+    ok(&tv, &session, set_pin(PIN, None)).await;
+    for _ in 0..6 {
+        assert_eq!(
+            err(&tv, &session, set_pin("98765", Some(by_password("")))).await,
+            Error::NoPassword
+        );
+        assert_eq!(
+            err(&tv, &session, clear_pin(by_password(""))).await,
+            Error::NoPassword
+        );
+    }
+    assert_eq!(
+        pin_state(&tv, &session).await,
+        Some(PinState { digits: Some(4) })
+    );
+    ok(&tv, &session, set_pin("98765", Some(by_pin(PIN)))).await;
+    ok(&tv, &session, clear_pin(by_pin("98765"))).await;
+    assert_eq!(pin_state(&tv, &session).await, None);
     tv.close().await;
     server.stop().await;
 }

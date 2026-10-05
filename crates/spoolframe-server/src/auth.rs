@@ -178,7 +178,7 @@ fn decoy_hash() -> String {
 /// password logins, so wrong PINs and wrong passwords do not use up each
 /// other's tries.
 fn pin_keys(user: LocalUserId, source: &str) -> (String, String) {
-    (format!("pin:{}", user.0), format!("pin@{source}"))
+    (format!("pin:{}", user), format!("pin@{source}"))
 }
 
 /// How often every key is looked at for failures out of the window. In
@@ -444,18 +444,32 @@ impl Auth {
         user: LocalUserId,
         claim: &Claim,
     ) -> Result<SessionToken, StoreError> {
-        let token = SessionToken::generate();
         let binding = SessionBinding::Endpoint {
             endpoint_id: claim.endpoint.clone(),
             device_name: claim.device_name.clone(),
             platform: claim.platform,
         };
+        self.open_session(user, &binding).await
+    }
+
+    /// Open a session bound as `binding` for `user`, who just proved who
+    /// they are some other way than a password (an approval, a passkey).
+    pub async fn open_session(
+        &self,
+        user: LocalUserId,
+        binding: &SessionBinding,
+    ) -> Result<SessionToken, StoreError> {
+        let lifetime = match binding {
+            SessionBinding::Endpoint { .. } => ENDPOINT_SESSION,
+            SessionBinding::Api => API_SESSION,
+        };
+        let token = SessionToken::generate();
         self.store
             .create_session(
                 &token.hash(),
                 user,
-                &binding,
-                now() + ENDPOINT_SESSION.as_secs() as i64,
+                binding,
+                now() + lifetime.as_secs() as i64,
             )
             .await?;
         Ok(token)
@@ -499,7 +513,7 @@ impl Auth {
             self.wrong_pins.lock().expect("never poisoned").remove(&key);
             let revoked = self.store.revoke_device_sessions(user, endpoint).await?;
             tracing::warn!(
-                user = user.0,
+                user = %user,
                 endpoint,
                 revoked,
                 "too many wrong PINs; sessions revoked"

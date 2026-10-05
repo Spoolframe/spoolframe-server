@@ -4,11 +4,11 @@
 
 use std::path::{Path, PathBuf};
 
-use spoolframe_catalog::CatalogError;
-use spoolframe_types::LibraryKind;
+use spoolframe_catalog::{CatalogError, FileCheck, LibraryCheck, MissingFile, Row};
+use spoolframe_types::{LibraryId, LibraryKind};
 
-use crate::wire::{Directory, SectionKey};
-use crate::{Call, PlexCatalog, convert, paths};
+use crate::wire::{Directory, Metadata, SectionKey};
+use crate::{Call, PlexCatalog, convert};
 
 /// How many failing paths a report keeps per kind of failure.
 const EXAMPLES: usize = 3;
@@ -50,6 +50,13 @@ pub struct LibraryPaths {
     /// Unreadable files that a mapping did match: probably the mapping is
     /// wrong, or the mount is missing.
     pub unreadable: Failures,
+    /// The library's section key (P3-16).
+    pub section: String,
+    /// Every unreadable file, with its item, in Plex's order: what an
+    /// admin's "Missing files" filter lists (P3-16). As many as
+    /// `no_mapping.count + unreadable.count`, but for an item Plex sends
+    /// in a shape that does not convert, which is counted and logged only.
+    pub missing: Vec<MissingFile>,
 }
 
 impl LibraryPaths {
@@ -116,6 +123,7 @@ impl PlexCatalog {
     ) -> Result<LibraryPaths, CatalogError> {
         let mut report = LibraryPaths {
             library: dir.title.clone(),
+            section: dir.key.clone(),
             roots: dir
                 .locations
                 .iter()
@@ -132,16 +140,15 @@ impl PlexCatalog {
             let size = PAGE.min(limit - offset);
             let mut call = Call::get(format!("/library/sections/{}/all", dir.key))
                 .about(format!("Plex library {:?}", dir.title));
-            call.query = vec![("type", leaf_type(kind))];
+            // With the agents' ids, for the rows of the files that fail.
+            call.query = vec![("type", leaf_type(kind)), ("includeGuids", "1")];
             call.headers = vec![
                 ("X-Plex-Container-Start", offset.to_string()),
                 ("X-Plex-Container-Size", size.to_string()),
             ];
             let page = self.fetch(&call).await?;
             for m in &page.metadata {
-                for file in convert::media_files(m) {
-                    self.check_file(&mut report, Path::new(file));
-                }
+                self.check_item(&mut report, m);
             }
             let got = u32::try_from(page.metadata.len()).unwrap_or(u32::MAX);
             offset = offset.saturating_add(got);
@@ -153,19 +160,88 @@ impl PlexCatalog {
         Ok(report)
     }
 
-    fn check_file(&self, report: &mut LibraryPaths, file: &Path) {
-        let mapped = self.paths.map(Some(&report.library), file);
-        let Some(reason) = paths::unreadable(&mapped.local) else {
-            report.ok += 1;
+    /// Check each file of item `m`; one that fails is counted, and kept
+    /// with the item's row.
+    fn check_item(&self, report: &mut LibraryPaths, m: &Metadata) {
+        let checks: Vec<FileCheck> = convert::media_files(m)
+            .into_iter()
+            .map(|file| self.paths.check(Some(&report.library), Path::new(file)))
+            .collect();
+        let mut failing = Vec::new();
+        for checked in &checks {
+            let Some(reason) = &checked.problem else {
+                report.ok += 1;
+                continue;
+            };
+            if report.failed.len() < EXAMPLES {
+                report.failed.push(checked.reported.clone());
+            }
+            let example = || {
+                format!(
+                    "{} -> {}: {reason}",
+                    checked.reported.display(),
+                    checked.local.display()
+                )
+            };
+            match checked.mapping {
+                None => report.no_mapping.add(example),
+                Some(_) => report.unreadable.add(example),
+            }
+            failing.push(checked.clone());
+        }
+        if failing.is_empty() {
             return;
+        }
+        let item = match convert::item(m) {
+            Ok(item) => item,
+            Err(e) => {
+                tracing::warn!(
+                    library = report.library,
+                    rating_key = %m.rating_key,
+                    error = e.message,
+                    "a missing file's item does not convert; counted, not listed"
+                );
+                return;
+            }
         };
-        if report.failed.len() < EXAMPLES {
-            report.failed.push(file.to_owned());
+        let row = Row {
+            item,
+            guid: m.guid.clone(),
+            agents: m.guids.iter().map(|g| g.id.clone()).collect(),
+            added_at: m.added_at,
+            updated_at: m.updated_at,
+            children: m.child_count,
+            leaves: m.leaf_count,
+            files: checks,
+        };
+        for file in failing {
+            report.missing.push(MissingFile {
+                row: row.clone(),
+                file,
+            });
         }
-        let example = || format!("{} -> {}: {reason}", file.display(), mapped.local.display());
-        match mapped.mapping {
-            None => report.no_mapping.add(example),
-            Some(_) => report.unreadable.add(example),
+    }
+
+    /// Every media file of library `id`, served, checked (P3-16): the
+    /// check `check-paths` makes of it.
+    pub async fn check_library(&self, id: &LibraryId) -> Result<LibraryCheck, CatalogError> {
+        let key = crate::plex_key(id.namespace(), id.key(), id)?;
+        if !self.serves(Some(&SectionKey(key.to_owned()))) {
+            return Err(CatalogError::NotServed(id.to_string()));
         }
+        let call = Call::get("/library/sections");
+        let sections = self.fetch(&call).await?.directories;
+        let dir = sections
+            .iter()
+            .find(|d| d.key == key)
+            .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+        let lib = convert::library(dir)
+            .map_err(|e| self.converted(&call, e))?
+            .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+        let report = self.check_section(dir, lib.kind, Scope::All).await?;
+        Ok(LibraryCheck {
+            ok: report.ok,
+            missing: report.missing,
+        })
     }
 }

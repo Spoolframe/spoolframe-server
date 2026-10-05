@@ -10,6 +10,7 @@
         "guid": "plex://show/5d9c083d7b5c2e001e6578f9",
         "type": "show",
         "title": "12 Monkeys",
+        "contentRating": "TV-14",
         "librarySectionID": 1,
         "summary": "Follows the journey of a time traveler from the post-apocalyptic future who a...",
         "index": 1,
@@ -18,6 +19,50 @@
         "thumb": "/library/metadata/208618/thumb/1789149282",
         "art": "/library/metadata/208618/art/1789149282",
         "duration": 2580000,
+        "childCount": 4,
+        "leafCount": 46,
+        "Genre": [
+          {
+            "id": 83,
+            "filter": "genre=83",
+            "tag": "Thriller"
+          },
+          {
+            "id": 101414,
+            "filter": "genre=101414",
+            "tag": "Science Fiction"
+          },
+          {
+            "id": 81,
+            "filter": "genre=81",
+            "tag": "Mystery"
+          },
+          {
+            "id": 311,
+            "filter": "genre=311",
+            "tag": "Adventure"
+          },
+          {
+            "id": 27,
+            "filter": "genre=27",
+            "tag": "Drama"
+          },
+          {
+            "id": 118476,
+            "filter": "genre=118476",
+            "tag": "Sci-Fi & Fantasy"
+          },
+          {
+            "id": 138,
+            "filter": "genre=138",
+            "tag": "Action"
+          },
+          {
+            "id": 96707,
+            "filter": "genre=96707",
+            "tag": "Suspense"
+          }
+        ],
         "addedAt": 1720224129,
         "Guid": [
           {

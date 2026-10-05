@@ -159,6 +159,7 @@ pub fn movie() -> Item {
         title: "Alien".into(),
         year: Some(1979),
         summary: None,
+        content_rating: None,
         duration: Some(Duration::from_secs(7020)),
         artwork: Vec::new(),
         playback: PlaybackState::default(),
@@ -173,6 +174,7 @@ pub fn second_copy() -> Item {
         title: "Alien (4K)".into(),
         year: Some(1979),
         summary: None,
+        content_rating: None,
         duration: Some(Duration::from_secs(7020)),
         artwork: Vec::new(),
         playback: PlaybackState::default(),
@@ -191,6 +193,9 @@ pub fn show() -> Item {
         title: "The Expanse".into(),
         year: Some(2015),
         summary: None,
+        content_rating: None,
+        season_count: None,
+        genres: Vec::new(),
         artwork: Vec::new(),
     })
 }
@@ -217,6 +222,7 @@ pub fn episode(key: &str, season_key: &str, season: u32, episode: u32) -> Item {
         episode,
         title: format!("S{season}E{episode}"),
         summary: None,
+        content_rating: None,
         duration: Some(Duration::from_secs(2640)),
         artwork: Vec::new(),
         playback: PlaybackState::default(),
@@ -302,6 +308,7 @@ impl Catalog for FakeCatalog {
                     item: Item::Movie(Movie {
                         id: id.clone(),
                         title: "Aliens".into(),
+                        content_rating: None,
                         ..movie
                     }),
                     children: Vec::new(),
@@ -366,6 +373,7 @@ impl Catalog for FakeCatalog {
             };
             vec![Item::Movie(Movie {
                 title: "a".repeat(MAX_FRAME as usize),
+                content_rating: None,
                 ..movie
             })]
         } else if "alien".contains(&text) && !text.is_empty() {
@@ -573,6 +581,8 @@ pub struct ServerOptions {
     pub previews: PreviewSettings,
     /// The ffmpeg previews are made with: real, or a stand-in script.
     pub previews_ffmpeg: PathBuf,
+    /// How long an app passkey's challenge lives (P3-19).
+    pub passkey_lifetime: Duration,
 }
 
 impl Default for ServerOptions {
@@ -602,6 +612,7 @@ impl Default for ServerOptions {
                 workers: 1,
             },
             previews_ffmpeg: PathBuf::from("ffmpeg"),
+            passkey_lifetime: spoolframe_server::passkeys::CEREMONY_LIFETIME,
         }
     }
 }
@@ -778,6 +789,9 @@ impl TestServer {
             jobs: Arc::new(jobs),
             subtitles: Arc::new(subtitles),
             previews,
+            app_passkeys: Arc::new(spoolframe_server::app_passkeys::AppPasskeys::with_lifetime(
+                options.passkey_lifetime,
+            )),
         };
         let endpoint = EndpointOptions {
             port: options.port,

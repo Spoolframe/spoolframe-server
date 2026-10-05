@@ -10,7 +10,6 @@ use spoolframe_admin_api::{
 };
 use spoolframe_server::principal::Principal;
 use spoolframe_server::store::Store;
-use spoolframe_server::store::users::LocalUserId;
 use spoolframe_server::store::watch::WatchUpdate;
 use wiremock::matchers::{header, method, path, path_regex, query_param};
 use wiremock::{Match, Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -193,12 +192,22 @@ async fn mount_resources(tv: &MockServer, tower: &MockServer, accounts: &[(&str,
     }
 }
 
-/// Mark `key` watched for user `id` in Spoolframe, as of `at`.
-async fn seen_here(store: &Store, id: i64, key: &str, at: i64) {
+/// `username`'s principal.
+async fn principal(store: &Store, username: &str) -> Principal {
+    let user = store
+        .password_login(username)
+        .await
+        .unwrap()
+        .expect(username);
+    Principal::LocalUser(user.id)
+}
+
+/// Mark `key` watched for `username` in Spoolframe, as of `at`.
+async fn seen_here(store: &Store, username: &str, key: &str, at: i64) {
     let media_id = format!("plex:movie:{key}");
     store
         .save_watch_at(
-            Principal::LocalUser(LocalUserId(id)),
+            principal(store, username).await,
             WatchUpdate {
                 media_id: &media_id,
                 show_id: None,
@@ -214,10 +223,10 @@ async fn seen_here(store: &Store, id: i64, key: &str, at: i64) {
         .unwrap();
 }
 
-/// User `id`'s state of `key` in Spoolframe: watched, and as of when.
-async fn state_here(store: &Store, id: i64, key: &str) -> Option<(bool, Option<i64>, i64)> {
+/// `username`'s state of `key` in Spoolframe: watched, and as of when.
+async fn state_here(store: &Store, username: &str, key: &str) -> Option<(bool, Option<i64>, i64)> {
     store
-        .all_watch(Principal::LocalUser(LocalUserId(id)))
+        .all_watch(principal(store, username).await)
         .await
         .unwrap()
         .into_iter()
@@ -279,9 +288,9 @@ async fn two_linked_users_each_sync_their_own_plex_account_and_an_unlinked_one_i
     let bob = signed_in(addr, "bob", "bob's horse").await;
     link(&alice).await;
     link(&bob).await;
-    // bob (3) and carol (4) watched films here that Plex has not seen.
-    seen_here(&store, 3, "12", 2_000).await;
-    seen_here(&store, 4, "13", 2_000).await;
+    // bob and carol watched films here that Plex has not seen.
+    seen_here(&store, "bob", "12", 2_000).await;
+    seen_here(&store, "carol", "13", 2_000).await;
 
     let reports = root.plex_watch_sync(None, false).await.unwrap();
     assert_eq!(reports.len(), 2, "{reports:?}");
@@ -294,8 +303,11 @@ async fn two_linked_users_each_sync_their_own_plex_account_and_an_unlinked_one_i
     // film went nowhere.
     assert_eq!(writes(&pms).await, [scrobble("12", Some("bob-on-tower"))]);
     // alice's state is Plex's, as of Plex's time; bob's is his own.
-    assert_eq!(state_here(&store, 2, "11").await, Some((true, None, 1_000)));
-    assert_eq!(state_here(&store, 3, "11").await, None);
+    assert_eq!(
+        state_here(&store, "alice", "11").await,
+        Some((true, None, 1_000))
+    );
+    assert_eq!(state_here(&store, "bob", "11").await, None);
 
     // The newer side won, and nothing comes back: no ping-pong.
     let again = root
@@ -352,7 +364,7 @@ async fn from_plex_never_writes_to_plex_to_plex_never_writes_here_and_off_does_n
     let (root, alice) = root_and_alice(addr).await;
     link(&alice).await;
     for key in ["12", "22", "32"] {
-        seen_here(&store, 2, key, 2_000).await;
+        seen_here(&store, "alice", key, 2_000).await;
     }
 
     let run = root
@@ -365,9 +377,9 @@ async fn from_plex_never_writes_to_plex_to_plex_never_writes_here_and_off_does_n
     // Kids, to Plex: 22 sent, 21 not taken.
     assert_eq!(run.pushed, ["plex:movie:22: watched"]);
     assert_eq!(writes(&pms).await, [scrobble("22", Some("alice-on-tower"))]);
-    assert_eq!(state_here(&store, 2, "21").await, None);
+    assert_eq!(state_here(&store, "alice", "21").await, None);
     // Docs, off: neither.
-    assert_eq!(state_here(&store, 2, "31").await, None);
+    assert_eq!(state_here(&store, "alice", "31").await, None);
     assert_eq!(run.skipped, 2);
 
     // Movies both ways: PX-04's rules, so 12 goes to Plex now.
@@ -416,9 +428,9 @@ async fn the_owner_s_px_04_setup_keeps_syncing_as_before() {
     // The server started again, as after setting up: root is the owner.
     let (addr, store) = serve_syncing(dir.as_ref(), &file, reaching(&tv), false).await;
     let root = signed_in(addr, "root", "correct horse").await;
-    seen_here(&store, 1, "12", 2_000).await;
+    seen_here(&store, "root", "12", 2_000).await;
     // Gone from Plex: nothing to send it to.
-    seen_here(&store, 1, "91", 2_000).await;
+    seen_here(&store, "root", "91", 2_000).await;
 
     let reports = root.plex_watch_sync(None, false).await.unwrap();
     assert_eq!(reports.len(), 1, "{reports:?}");
@@ -434,7 +446,7 @@ async fn the_owner_s_px_04_setup_keeps_syncing_as_before() {
     assert_eq!(run.pushed, ["plex:movie:12: watched"]);
     assert_eq!(writes(&pms).await, [scrobble("12", None)]);
     assert_eq!(
-        state_here(&store, 1, "31").await,
+        state_here(&store, "root", "31").await,
         Some((false, Some(600_000), 1_500))
     );
     assert!(tv.received_requests().await.unwrap().is_empty());
@@ -508,7 +520,10 @@ async fn a_new_link_is_synced_at_once_and_an_unlinked_user_no_more() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert_eq!(synced.expect("synced after linking").pulled, 1);
-    assert_eq!(state_here(&store, 2, "11").await, Some((true, None, 1_000)));
+    assert_eq!(
+        state_here(&store, "alice", "11").await,
+        Some((true, None, 1_000))
+    );
     alice.plex_unlink().await.unwrap();
     let mut user = alice.plex_link().await.unwrap();
     for _ in 0..100 {

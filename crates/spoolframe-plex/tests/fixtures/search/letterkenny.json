@@ -24,8 +24,19 @@
               "ratingKey": "209050",
               "type": "show",
               "title": "Letterkenny",
+              "contentRating": "TV-MA",
               "year": 2016,
-              "index": 1
+              "index": 1,
+              "childCount": 6,
+              "leafCount": 36,
+              "Genre": [
+                {
+                  "tag": "Comedy"
+                },
+                {
+                  "tag": "Sport"
+                }
+              ]
             }
           ]
         }

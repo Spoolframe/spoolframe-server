@@ -6,8 +6,9 @@
 use std::time::Duration;
 
 use spoolframe_types::{
-    Album, Artist, Artwork, ArtworkId, ArtworkKind, Episode, Item, Library, LibraryId, LibraryKind,
-    Marker, MarkerKind, MediaId, MediaKind, Movie, Namespace, PlaybackState, Season, Show, Track,
+    Album, Artist, Artwork, ArtworkId, ArtworkKind, AudioCodec, Episode, Item, Library, LibraryId,
+    LibraryKind, Marker, MarkerKind, MediaId, MediaKind, Movie, Namespace, PlaybackState, Season,
+    Show, Track,
 };
 
 use serde::Deserialize;
@@ -73,6 +74,19 @@ pub fn media_kind(plex: &str) -> Option<MediaKind> {
     })
 }
 
+/// Plex's `type` for a media kind: [`media_kind`] the other way.
+pub fn plex_name(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Movie => "movie",
+        MediaKind::Show => "show",
+        MediaKind::Season => "season",
+        MediaKind::Episode => "episode",
+        MediaKind::Artist => "artist",
+        MediaKind::Album => "album",
+        MediaKind::Track => "track",
+    }
+}
+
 /// The `MediaId` of an item with this `ratingKey` and kind.
 pub fn media_id(kind: MediaKind, rating_key: &str) -> Result<MediaId, ConvertError> {
     MediaId::new(Namespace::Plex, kind, rating_key).map_err(|e| ConvertError {
@@ -93,6 +107,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             title: m.title.clone(),
             year: m.year,
             summary: summary(m),
+            content_rating: content_rating(m),
             duration: duration(m),
             artwork: artwork(m, ArtworkKind::Poster)?,
             playback: PlaybackState::default(),
@@ -102,6 +117,9 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             title: m.title.clone(),
             year: m.year,
             summary: summary(m),
+            content_rating: content_rating(m),
+            season_count: m.child_count,
+            genres: m.genres.iter().map(|g| g.tag.clone()).collect(),
             artwork: artwork(m, ArtworkKind::Poster)?,
         }),
         MediaKind::Season => Item::Season(Season {
@@ -121,6 +139,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             episode: required(m, m.index, "index")?,
             title: m.title.clone(),
             summary: summary(m),
+            content_rating: content_rating(m),
             duration: duration(m),
             // An episode's thumb is a still from it, not a poster; its
             // poster is its season's, else its show's.
@@ -143,6 +162,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             artist_name: m.parent_title.clone(),
             title: m.title.clone(),
             year: m.year,
+            track_count: m.leaf_count,
             artwork: artwork(m, ArtworkKind::Poster)?,
         }),
         MediaKind::Track => Item::Track(Track {
@@ -152,6 +172,14 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             title: m.title.clone(),
             track: m.index,
             disc: m.parent_index,
+            album_track_count: None,
+            codec: m
+                .media
+                .first()
+                .and_then(|media| media.audio_codec.as_deref())
+                .map(audio_codec),
+            bit_depth: audio_stream(m).and_then(|s| s.bit_depth),
+            sample_rate: audio_stream(m).and_then(|s| s.sampling_rate),
             duration: duration(m),
             playback: PlaybackState::default(),
         }),
@@ -232,8 +260,47 @@ pub fn media_files(m: &Metadata) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+/// Plex's name for an audio codec (`audioCodec`, a stream's `codec`) as
+/// the shared vocabulary has it; one it does not know is `Unknown`.
+pub fn audio_codec(plex: &str) -> AudioCodec {
+    match plex {
+        "aac" => AudioCodec::Aac,
+        "ac3" => AudioCodec::Ac3,
+        "eac3" => AudioCodec::Eac3,
+        "dca" | "dts" => AudioCodec::Dts,
+        "truehd" => AudioCodec::TrueHd,
+        "flac" => AudioCodec::Flac,
+        "alac" => AudioCodec::Alac,
+        "opus" => AudioCodec::Opus,
+        "vorbis" => AudioCodec::Vorbis,
+        "mp3" => AudioCodec::Mp3,
+        pcm if pcm.starts_with("pcm") => AudioCodec::Pcm,
+        _ => AudioCodec::Unknown,
+    }
+}
+
+/// The first audio stream of the first part of the first version: what a
+/// track plays. Plex lists lyrics as streams too.
+fn audio_stream(m: &Metadata) -> Option<&wire::Stream> {
+    m.media
+        .first()?
+        .parts
+        .first()?
+        .streams
+        .iter()
+        .find(|s| s.stream_type == Some(wire::Stream::AUDIO))
+}
+
 fn summary(m: &Metadata) -> Option<String> {
     m.summary.clone().filter(|s| !s.trim().is_empty())
+}
+
+fn content_rating(m: &Metadata) -> Option<String> {
+    m.content_rating
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_owned)
 }
 
 fn duration(m: &Metadata) -> Option<Duration> {
@@ -396,6 +463,60 @@ mod tests {
     }
 
     #[test]
+    fn a_show_says_how_many_seasons_and_which_genres_it_has() {
+        let Item::Show(show) = only_item("metadata-show") else {
+            panic!("not a show")
+        };
+        assert_eq!(show.season_count, Some(4));
+        assert_eq!(
+            show.genres,
+            [
+                "Thriller",
+                "Science Fiction",
+                "Mystery",
+                "Adventure",
+                "Drama",
+                "Sci-Fi & Fantasy",
+                "Action",
+                "Suspense"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_show_in_a_listing_has_the_genres_plex_lists_there() {
+        let shows: Vec<_> = fixture("section-all-show")
+            .metadata
+            .iter()
+            .map(|m| match item(m).unwrap() {
+                Item::Show(s) => (s.season_count, s.genres),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shows,
+            [
+                (
+                    Some(4),
+                    vec!["Thriller".to_owned(), "Science Fiction".into()]
+                ),
+                (Some(9), vec!["Drama".to_owned(), "Crime".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_show_without_counts_or_genres_has_none() {
+        let mut m = fixture("metadata-show").metadata.remove(0);
+        m.child_count = None;
+        m.genres.clear();
+        let Item::Show(show) = item(&m).unwrap() else {
+            panic!("not a show")
+        };
+        assert_eq!((show.season_count, show.genres), (None, Vec::new()));
+    }
+
+    #[test]
     fn a_season_knows_its_show_and_number() {
         let Item::Season(season) = only_item("metadata-season") else {
             panic!("not a season")
@@ -491,6 +612,115 @@ mod tests {
         assert_eq!(track.artist_id, id(MediaKind::Artist, "222392"));
         assert_eq!((track.track, track.disc), (Some(1), Some(1)));
         assert_eq!(track.duration, Some(Duration::from_millis(257_386)));
+    }
+
+    #[test]
+    fn movies_shows_and_episodes_carry_their_content_rating() {
+        let Item::Movie(movie) = only_item("metadata-movie") else {
+            panic!("not a movie")
+        };
+        assert_eq!(movie.content_rating.as_deref(), Some("PG-13"));
+        let Item::Show(show) = only_item("metadata-show") else {
+            panic!("not a show")
+        };
+        assert_eq!(show.content_rating.as_deref(), Some("TV-14"));
+        let Item::Episode(ep) = only_item("metadata-episode") else {
+            panic!("not an episode")
+        };
+        assert_eq!(ep.content_rating.as_deref(), Some("TV-14"));
+    }
+
+    #[test]
+    fn listings_carry_the_content_rating_too() {
+        for name in ["section-all-show", "children-season"] {
+            for m in &fixture(name).metadata {
+                let rating = match item(m).unwrap() {
+                    Item::Show(s) => s.content_rating,
+                    Item::Episode(e) => e.content_rating,
+                    other => panic!("{other:?}"),
+                };
+                assert_eq!(rating.as_deref(), Some("TV-14"), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrated_item_has_no_content_rating() {
+        let mut m = fixture("metadata-movie").metadata.remove(0);
+        for unrated in [None, Some(String::new()), Some("  ".to_owned())] {
+            m.content_rating = unrated;
+            let Item::Movie(movie) = item(&m).unwrap() else {
+                panic!("not a movie")
+            };
+            assert_eq!(movie.content_rating, None);
+        }
+    }
+
+    #[test]
+    fn a_track_says_its_codec_bit_depth_and_sample_rate() {
+        let Item::Track(track) = only_item("metadata-track") else {
+            panic!("not a track")
+        };
+        assert_eq!(
+            (track.codec, track.bit_depth, track.sample_rate),
+            (Some(AudioCodec::Flac), Some(16), Some(44_100))
+        );
+    }
+
+    #[test]
+    fn a_hi_res_track_s_format_is_read_past_its_lyrics() {
+        let c = fixture("metadata-tracks-catch");
+        let Item::Track(track) = item(&c.metadata[0]).unwrap() else {
+            panic!("not a track")
+        };
+        assert_eq!(
+            (track.codec, track.bit_depth, track.sample_rate),
+            (Some(AudioCodec::Flac), Some(24), Some(96_000))
+        );
+    }
+
+    #[test]
+    fn a_track_in_a_listing_has_its_codec_but_no_bit_depth_or_sample_rate() {
+        for m in &fixture("children-album-catch").metadata {
+            let Item::Track(track) = item(m).unwrap() else {
+                panic!("not a track")
+            };
+            assert_eq!(
+                (track.codec, track.bit_depth, track.sample_rate),
+                (Some(AudioCodec::Flac), None, None)
+            );
+            // Only the album's own listing knows how many it has.
+            assert_eq!(track.album_track_count, None);
+        }
+    }
+
+    #[test]
+    fn plex_s_audio_codec_names_become_the_shared_ones() {
+        for (plex, codec) in [
+            ("flac", AudioCodec::Flac),
+            ("mp3", AudioCodec::Mp3),
+            ("aac", AudioCodec::Aac),
+            ("alac", AudioCodec::Alac),
+            ("dca", AudioCodec::Dts),
+            ("truehd", AudioCodec::TrueHd),
+            ("pcm", AudioCodec::Pcm),
+            ("wmapro", AudioCodec::Unknown),
+        ] {
+            assert_eq!(audio_codec(plex), codec, "{plex}");
+        }
+    }
+
+    #[test]
+    fn an_album_says_how_many_tracks_it_has() {
+        let Item::Album(album) = only_item("metadata-album-catch") else {
+            panic!("not an album")
+        };
+        assert_eq!(album.track_count, Some(3));
+        // Plex leaves the count out of some answers.
+        let Item::Album(album) = only_item("metadata-album") else {
+            panic!("not an album")
+        };
+        assert_eq!(album.track_count, None);
     }
 
     #[test]
