@@ -119,6 +119,16 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
             "settingUnset(auth.*)",
             outcome(root.setting_unset("auth.oidc".into()).await),
         ),
+        // PX-11 finding 34: the programs the server runs, and whether
+        // they are confined.
+        (
+            "settingSet(media.*)",
+            outcome(root.setting_set("media.sandbox".into(), json!("off")).await),
+        ),
+        (
+            "settingUnset(media.*)",
+            outcome(root.setting_unset("media.ffmpeg".into()).await),
+        ),
         (
             "ssoSetClientSecret",
             outcome(

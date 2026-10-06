@@ -16,6 +16,9 @@
   nvenc = uses "nvenc";
   gpu = vaapi || nvenc;
 
+  # Each media tool in a bubblewrap sandbox of its own (PX-11 finding 34).
+  sandboxed = cfg.media.sandbox != "off";
+
   # A loopback listen address: the proxy in front of it is on this host.
   loopback = listen: listen != null && (lib.hasPrefix "127." listen || lib.hasPrefix "[::1]:" listen);
 
@@ -80,6 +83,7 @@
     }
     media {
       tesseract = ${quote "${tesseract}/bin/tesseract"};
+      sandbox = ${quote cfg.media.sandbox};
     }
     subtitles {
       ocr = ${lib.boolToString (cfg.subtitles.ocrLanguages != [])};
@@ -271,10 +275,12 @@ in {
         description = ''
           Where browsers reach the web UI through a TLS reverse proxy: the
           only origin then allowed to sign in and use it. Left unset, a
-          browser must be on the listener's own host (directly, or through
-          an SSH tunnel). Its host is also what passkeys are bound to
-          (`localhost` when unset): they need HTTPS, and changing the host
-          orphans the ones already made, which the log names at start.
+          browser must reach the listener by its address or as `localhost`
+          (directly, or through an SSH tunnel), never by a name. Its host
+          is also what passkeys are bound to (`localhost` when unset, at the
+          listener's own port, so a tunnel keeps the port): they need HTTPS,
+          and changing the host orphans the ones already made, which the
+          log names at start.
         '';
       };
 
@@ -388,6 +394,26 @@ in {
         as text, for clients that cannot draw them or that ask for text. A
         track is read only with its own language's data; tracks in other
         languages are burned in instead. Empty turns reading off.
+      '';
+    };
+
+    media.sandbox = lib.mkOption {
+      type = lib.types.enum ["required" "auto" "off"];
+      default = "required";
+      description = ''
+        How ffmpeg, ffprobe and tesseract run (PX-11 finding 34). They
+        parse files anyone who can write to a library folder made, so by
+        default each runs in a bubblewrap sandbox of its own, inside the
+        service's: no network, no state directory (database, key,
+        secrets), the one media file read-only and its own scratch
+        directory the only place it writes, no new processes, and a
+        seccomp filter. `required` refuses to start without it; `auto`
+        runs them unconfined, with an error in the log, where bubblewrap
+        cannot work; `off` never confines them. Their environment is
+        cleared and their memory, CPU time and file sizes are limited
+        either way. Confining them needs user, mount, PID, network, IPC
+        and UTS namespaces, and the mount calls, which the unit allows
+        the service for it; `off` keeps those refused.
       '';
     };
 
@@ -542,8 +568,21 @@ in {
         # Other processes are not its business; its own children's /proc
         # entries stay (encode jobs are watched through them).
         ProtectProc = "invisible";
-        ProcSubset = "pid";
-        RestrictNamespaces = true;
+        # Only the processes' entries, but bubblewrap reads
+        # /proc/sys/kernel/overflowuid to map its user, so a sandboxed
+        # service sees the rest of /proc too (read-only, through
+        # ProtectKernelTunables).
+        ProcSubset =
+          if sandboxed
+          then "all"
+          else "pid";
+        # bubblewrap makes these for each media tool's sandbox: the
+        # service's own processes can then make them too, but only with
+        # the rights of a user namespace of its own, never the host's.
+        RestrictNamespaces =
+          if sandboxed
+          then ["user" "mnt" "pid" "net" "ipc" "uts"]
+          else true;
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
         RemoveIPC = true;
@@ -557,7 +596,12 @@ in {
         # change resource settings, but for the two previews use to run
         # ffmpeg at the lowest CPU and I/O priority. A refused call fails
         # with EPERM rather than killing the server.
-        SystemCallFilter = ["@system-service" "~@privileged @resources" "setpriority ioprio_set"];
+        # And for bubblewrap (media.sandbox): the mount calls and capset,
+        # which it sets up each sandbox and drops its rights with, in the
+        # namespaces it makes.
+        SystemCallFilter =
+          ["@system-service" "~@privileged @resources" "setpriority ioprio_set"]
+          ++ lib.optional sandboxed "capset @mount";
         SystemCallErrorNumber = "EPERM";
         # MemoryDenyWriteExecute is left out: GPU drivers JIT shaders, and
         # the VM test has no GPU to show it safe with them.

@@ -713,6 +713,11 @@ mod tests {
         assert_eq!(documented.media.ffprobe(), bare.media.ffprobe());
         assert_eq!(documented.media.tesseract(), bare.media.tesseract());
         assert_eq!(
+            documented.media.sandbox().unwrap(),
+            bare.media.sandbox().unwrap()
+        );
+        assert_eq!(documented.media.bwrap(), bare.media.bwrap());
+        assert_eq!(
             documented.transcode.settings().unwrap(),
             bare.transcode.settings().unwrap()
         );

@@ -70,6 +70,25 @@ pub fn check_line(word: &str) -> String {
     format!("Check that the code and the fingerprint match the {word} screen.")
 }
 
+/// Where the device asked from (PX-09 finding 27), and whether that is
+/// to be warned of: a public address is not a network the approver
+/// shares, which is how a code someone else sent them as a link looks.
+/// `None` when the server could not tell.
+pub fn origin(address: Option<&str>, from_internet: bool, word: &str) -> Option<(String, bool)> {
+    let address = address?;
+    Some(if from_internet {
+        (
+            format!(
+                "The {word} asked from {address}, on the internet, not on your network. \
+                 Approve only a {word} you can see: a code sent to you is someone else's."
+            ),
+            true,
+        )
+    } else {
+        (format!("The {word} asked from {address}."), false)
+    })
+}
+
 /// Who is approving, and what the device gets.
 pub fn signed_in_as_tail(word: &str) -> String {
     format!(". The {word} gets its own session, which you can sign out from My profile.")
@@ -100,6 +119,22 @@ mod tests {
             message: "refused".into(),
             data,
         }
+    }
+
+    /// PX-09 finding 27.
+    #[test]
+    fn a_device_on_the_internet_is_warned_of_and_one_nearby_is_named() {
+        let (far, warn) = origin(Some("203.0.113.9"), true, "TV").unwrap();
+        assert!(warn);
+        assert!(
+            far.contains("203.0.113.9") && far.contains("internet"),
+            "{far}"
+        );
+        assert_eq!(
+            origin(Some("192.168.86.20"), false, "TV"),
+            Some(("The TV asked from 192.168.86.20.".to_owned(), false))
+        );
+        assert_eq!(origin(None, true, "TV"), None);
     }
 
     #[test]

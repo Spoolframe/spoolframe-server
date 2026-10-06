@@ -7,4 +7,5 @@ mod dvb;
 mod ocr;
 mod prober;
 mod samples;
+mod sandbox;
 mod vobsub;

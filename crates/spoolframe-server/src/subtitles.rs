@@ -18,11 +18,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use spoolframe_media::ocr::{self, Ocr};
+use spoolframe_media::sandbox::Tool;
 use spoolframe_media::{SubtitleKind, SubtitleSource, SubtitleStream, codecs, dvb, pgs, vobsub};
 use spoolframe_types::SubtitleFormat;
 
 use crate::metrics::Counter;
 use tokio::sync::{Semaphore, watch};
+
+/// Text conversions (ffmpeg reading a track out of a file) at once
+/// (PX-09 finding 15).
+const MAX_CONVERSIONS: usize = 4;
+
+/// Tracks being made or waiting their turn, of every kind, at once
+/// (PX-09 finding 15).
+const MAX_MAKING: usize = 64;
 
 /// `subtitles { … }`, with the defaults filled in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,12 +79,14 @@ pub struct TextSource<'a> {
 
 pub struct Subtitles {
     ocr: Ocr,
-    ffmpeg: PathBuf,
-    ffprobe: PathBuf,
+    ffmpeg: Tool,
+    ffprobe: Tool,
     threads: usize,
     cache_dir: PathBuf,
     making: Mutex<HashMap<String, watch::Receiver<TextState>>>,
     one_track: Arc<Semaphore>,
+    /// [`MAX_CONVERSIONS`] places for text conversions.
+    conversions: Arc<Semaphore>,
     /// Bitmap tracks waiting to be read or being read (P3-14).
     ocr_pending: std::sync::atomic::AtomicU64,
     ocr_done: Counter,
@@ -106,8 +117,8 @@ impl Subtitles {
     /// is removed.
     pub fn new(
         ocr: Ocr,
-        ffmpeg: PathBuf,
-        ffprobe: PathBuf,
+        ffmpeg: Tool,
+        ffprobe: Tool,
         settings: &OcrSettings,
     ) -> std::io::Result<Self> {
         crate::files::private_dir(&settings.cache_dir)?;
@@ -127,6 +138,7 @@ impl Subtitles {
             cache_dir: settings.cache_dir.clone(),
             making: Mutex::new(HashMap::new()),
             one_track: Arc::new(Semaphore::new(1)),
+            conversions: Arc::new(Semaphore::new(MAX_CONVERSIONS)),
             ocr_pending: Default::default(),
             ocr_done: Counter::default(),
             ocr_failed: Counter::default(),
@@ -214,6 +226,16 @@ impl Subtitles {
         if let Some(state) = making.get(&key) {
             return state.clone();
         }
+        // Each waits as a task (PX-09 finding 15): a consumer asking for
+        // every track of a library is told to try later past this many.
+        if making.len() >= MAX_MAKING {
+            drop(making);
+            tracing::warn!(
+                tracks = MAX_MAKING,
+                "too many subtitles being made; one more refused for now"
+            );
+            return failed("the server is making too many subtitles; try again later".into());
+        }
         let (tx, rx) = watch::channel(TextState::Waiting);
         making.insert(key.clone(), rx.clone());
         drop(making);
@@ -292,6 +314,13 @@ impl Job {
         match &self.how {
             How::Ocr { language } => self.read(state, language, &partial).await?,
             How::Convert => {
+                let _turn = self
+                    .subtitles
+                    .conversions
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("never closed");
                 let _ = state.send(TextState::Reading { done_percent: 0 });
                 // A sidecar is its own input, its one stream the track.
                 let (input, index) = match &self.track {
@@ -472,5 +501,133 @@ fn extension(format: SubtitleFormat) -> &'static str {
     match format {
         SubtitleFormat::WebVtt => "vtt",
         _ => "srt",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use spoolframe_media::sandbox::Tool;
+    use spoolframe_types::SubtitleRole;
+
+    use super::*;
+
+    /// A stand-in ffmpeg, in `bin`, that marks itself running in `dir`
+    /// for `secs`, then writes its output (its last argument).
+    fn slow_ffmpeg(bin: &Path, dir: &Path, secs: &str) -> PathBuf {
+        let script = bin.join("ffmpeg");
+        crate::test_support::write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nfor out; do :; done\nmark='{}'/running.$$\n: > \"$mark\"\nsleep {secs}\n\
+                 printf 'WEBVTT\\n\\n' > \"$out\"\nrm \"$mark\"\n",
+                dir.display()
+            ),
+        );
+        script
+    }
+
+    /// Subtitles converted by `slow_ffmpeg(secs)`, a film, and where the
+    /// stand-in marks itself running.
+    async fn converting(
+        test: &str,
+        secs: &str,
+    ) -> (
+        spoolframe_test_dir::TestDir,
+        Arc<Subtitles>,
+        PathBuf,
+        PathBuf,
+    ) {
+        let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-subtitles-{test}")).await;
+        let dir = tmp.as_ref().to_path_buf();
+        let (bin, marks) = (dir.join("bin"), dir.join("marks"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&marks).unwrap();
+        let subtitles = Arc::new(
+            Subtitles::new(
+                Ocr::disabled(),
+                Tool::unconfined(slow_ffmpeg(&bin, &marks, secs)),
+                Tool::unconfined("ffprobe"),
+                &OcrSettings {
+                    enabled: false,
+                    threads: 1,
+                    cache_dir: dir.join("cache"),
+                },
+            )
+            .unwrap(),
+        );
+        let film = dir.join("Film.mkv");
+        std::fs::write(&film, b"a film").unwrap();
+        (tmp, subtitles, film, marks)
+    }
+
+    /// The text of the `n`th subtitle file beside `film`, asked for.
+    async fn ask(subtitles: &Arc<Subtitles>, film: &Path, n: usize) -> watch::Receiver<TextState> {
+        let srt = film.with_file_name(format!("Film.{n}.srt"));
+        std::fs::write(&srt, format!("{n}")).unwrap();
+        let stream = sidecar(srt);
+        subtitles
+            .text(TextSource {
+                path: film,
+                stream: &stream,
+                to: SubtitleFormat::WebVtt,
+            })
+            .await
+    }
+
+    fn sidecar(path: PathBuf) -> SubtitleStream {
+        SubtitleStream {
+            source: SubtitleSource::External { path },
+            codec: "subrip".into(),
+            kind: SubtitleKind::Text,
+            language: None,
+            title: None,
+            forced: false,
+            default: false,
+            role: SubtitleRole::Full,
+        }
+    }
+
+    /// PX-09 finding 15 (B-8): a consumer asking for many text tracks at
+    /// once started an ffmpeg for each. At most [`MAX_CONVERSIONS`] run
+    /// at a time; the rest wait their turn, and all are made.
+    #[tokio::test]
+    async fn text_conversions_run_a_few_at_a_time() {
+        let (_tmp, subtitles, film, marks) = converting("converting", "0.5").await;
+        let mut states = Vec::new();
+        for n in 0..8 {
+            states.push(ask(&subtitles, &film, n).await);
+        }
+        let mut most = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !states.iter().all(|s| s.borrow().finished()) {
+            most = most.max(std::fs::read_dir(&marks).unwrap().count());
+            assert!(std::time::Instant::now() < deadline, "not all made");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(most <= MAX_CONVERSIONS, "{most} ran at once");
+        assert!(
+            states
+                .iter()
+                .all(|s| matches!(*s.borrow(), TextState::Ready(_)))
+        );
+    }
+
+    /// Nor do they queue without end: past [`MAX_MAKING`] tracks being
+    /// made or waiting, one more is refused for now, not queued.
+    #[tokio::test]
+    async fn past_a_limit_more_subtitles_are_refused_for_now() {
+        let (_tmp, subtitles, film, _marks) = converting("too-many", "30").await;
+        for n in 0..MAX_MAKING {
+            let state = ask(&subtitles, &film, n).await;
+            assert!(!state.borrow().finished(), "{n}: {:?}", *state.borrow());
+        }
+        let refused = ask(&subtitles, &film, MAX_MAKING).await;
+        assert!(
+            matches!(&*refused.borrow(), TextState::Failed(reason) if reason.contains("try again")),
+            "{:?}",
+            *refused.borrow()
+        );
     }
 }

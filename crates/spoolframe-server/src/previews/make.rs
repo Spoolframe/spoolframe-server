@@ -16,6 +16,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use spoolframe_media::encoders::Hardware;
+use spoolframe_media::sandbox::{Jail, Limits, Tool};
 
 use super::sheets::TILE_WIDTH;
 use crate::encode::args::TONE_MAP;
@@ -134,9 +135,9 @@ pub trait MakeTile: Send + Sync {
     ) -> Result<Option<Vec<u8>>, String>;
 }
 
-/// Tiles made by ffmpeg at this path.
+/// Tiles made by this ffmpeg.
 #[derive(Debug, Clone)]
-pub struct Ffmpeg(pub PathBuf);
+pub struct Ffmpeg(pub Tool);
 
 #[async_trait::async_trait]
 impl MakeTile for Ffmpeg {
@@ -217,14 +218,22 @@ where
 
 /// One tile: its JPEG, or `None` when ffmpeg found no frame there.
 async fn tile(
-    ffmpeg: &Path,
+    ffmpeg: &Tool,
     source: &Source,
     hardware: bool,
     at: Duration,
     out: &Path,
 ) -> Result<Option<Vec<u8>>, String> {
     let _ = tokio::fs::remove_file(out).await;
-    let mut command = tokio::process::Command::new(ffmpeg);
+    let mut jail = Jail::new(Limits::TILE)
+        .input(&source.input)
+        .gpu(hardware && source.hardware.is_some());
+    if let Some(dir) = out.parent() {
+        jail = jail.writes(dir);
+    }
+    let mut command = ffmpeg
+        .command(&jail)
+        .map_err(|e| format!("cannot run {}: {e}", ffmpeg.program().display()))?;
     command
         .args(tile_args(source, hardware, at, out))
         .stdin(Stdio::null())
@@ -234,7 +243,7 @@ async fn tile(
     low_priority(&mut command);
     let child = command
         .spawn()
-        .map_err(|e| format!("cannot run {}: {e}", ffmpeg.display()))?;
+        .map_err(|e| format!("cannot run {}: {e}", ffmpeg.program().display()))?;
     let output = tokio::time::timeout(TILE_TIMEOUT, child.wait_with_output())
         .await
         .map_err(|_| format!("ffmpeg took over {TILE_TIMEOUT:?} for the tile at {at:?}"))?

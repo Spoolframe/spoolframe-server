@@ -279,6 +279,31 @@ async fn spans_metrics_and_logs_reach_an_http_collector_with_the_resource() {
     assert!(telemetry.status().is_none());
 }
 
+/// PX-09 finding 20: the setup code takes over a server with no users
+/// yet, so it is never sent to the collector, where whoever reads the
+/// logs would see it. It stays in the server's own log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_setup_code_is_never_exported() {
+    let (addr, received) = http_collector().await;
+    let (telemetry, subscriber) = telemetry(Arc::new(Metrics::default()), timings());
+    telemetry.apply(Some(settings(format!("http://{addr}"), Protocol::Http)));
+    let code = spoolframe_server::admin::SetupCode::generate();
+    tracing::subscriber::with_default(subscriber, || {
+        spoolframe_server::admin::log_setup_code(&["http://127.0.0.1:7421/".into()], &code);
+        activity();
+    });
+    telemetry.flush().await;
+    until("the warning after it arrives", || {
+        !received.logs.lock().unwrap().is_empty()
+    })
+    .await;
+    let logs = format!("{:?}", received.logs.lock().unwrap());
+    assert!(logs.contains("Plex server unavailable"), "{logs}");
+    assert!(!logs.contains(&code.to_string()), "{logs}");
+    assert!(!logs.contains("setup code"), "{logs}");
+    telemetry.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spans_reach_a_grpc_collector() {
     let (addr, received) = grpc_collector().await;

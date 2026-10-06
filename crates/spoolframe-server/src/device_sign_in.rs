@@ -16,6 +16,7 @@
 //! begins again.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,33 @@ pub struct Waiting {
     pub requested_at: i64,
     /// The device asked to be trusted (P4-01); the approver decides.
     pub remember: bool,
+    /// The address its request came from, if the server could tell: what
+    /// the approver is shown (PX-09 finding 27).
+    pub address: Option<IpAddr>,
+}
+
+/// Whether `ip` is a public address: not loopback, a private or
+/// link-local network's, CGNAT's or a VPN's (`100.64.0.0/10`), or an IPv6
+/// unique-local one. A device signing in from one is not on a network
+/// the approver shares, which is what device-code phishing looks like:
+/// the code is someone else's, sent to the approver as a link.
+pub fn from_internet(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let shared = v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64;
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || shared)
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local())
+        }
+    }
 }
 
 /// A code taken for approval: the session goes to `endpoint`, then
@@ -398,6 +426,7 @@ mod tests {
 
     fn tv(endpoint: &str) -> Waiting {
         Waiting {
+            address: None,
             endpoint: endpoint.into(),
             device_name: Some("Living room TV".into()),
             client_name: "spoolframe-tvos".into(),
@@ -412,6 +441,7 @@ mod tests {
         let sign_ins = DeviceSignIns::default();
         let asked = sign_ins
             .begin(Waiting {
+                address: None,
                 remember: true,
                 ..tv("tv")
             })
@@ -621,5 +651,28 @@ mod tests {
             Outcome::Expired
         );
         assert_eq!(sign_ins.lookup(&started.code), None);
+    }
+
+    /// PX-09 finding 27: what the approval page warns of.
+    #[test]
+    fn only_a_public_address_is_from_the_internet() {
+        let at = |text: &str| from_internet(text.parse().unwrap());
+        for near in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "172.16.4.2",
+            "192.168.86.20",
+            "169.254.1.1",
+            "100.101.102.103",
+            "::1",
+            "fe80::1",
+            "fd7a:115c:a1e0::1",
+            "::ffff:192.168.1.2",
+        ] {
+            assert!(!at(near), "{near}");
+        }
+        for far in ["203.0.113.9", "8.8.8.8", "2001:db8::1", "2a00:1450::1"] {
+            assert!(at(far), "{far}");
+        }
     }
 }

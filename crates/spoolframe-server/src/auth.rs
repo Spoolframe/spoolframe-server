@@ -244,7 +244,15 @@ struct Failures {
     by_key: HashMap<String, VecDeque<Instant>>,
     /// When every key was last looked at.
     swept: Option<Instant>,
+    /// Per username, the last [`KNOWN_SOURCES`] sources a right attempt
+    /// came from (PX-09 finding 24): a username's own failures do not
+    /// refuse them. Only a right attempt adds one, so the map is as large
+    /// as the accounts.
+    known: HashMap<String, VecDeque<String>>,
 }
+
+/// How many sources a username is remembered at.
+const KNOWN_SOURCES: usize = 16;
 
 impl Default for RateLimiter {
     fn default() -> Self {
@@ -342,6 +350,20 @@ impl RateLimiter {
         }
     }
 
+    /// Whether `username`'s own failures refuse an attempt from `source`:
+    /// not from where it signed in before (PX-09 finding 24). Five wrong
+    /// passwords from anywhere locked a name out for everyone, its owner
+    /// too; now only for the places it never signed in from. A source
+    /// that guesses is still refused by its own key.
+    fn known(failures: &Failures, user: &str, source: Option<&str>) -> bool {
+        source.is_some_and(|source| {
+            failures
+                .known
+                .get(user)
+                .is_some_and(|known| known.iter().any(|s| s == source))
+        })
+    }
+
     fn limited(
         &self,
         failures: &mut Failures,
@@ -350,8 +372,12 @@ impl RateLimiter {
         now: Instant,
     ) -> Option<Duration> {
         self.sweep(failures, now);
+        let user = Self::user_key(username);
         let mut wait = None;
         for key in Self::keys(username, source) {
+            if key == user && Self::known(failures, &user, source) {
+                continue;
+            }
             self.prune(failures, &key, now);
             if let Some(times) = failures.by_key.get(&key)
                 && times.len() >= MAX_FAILURES
@@ -437,7 +463,16 @@ impl RateLimiter {
     /// the same place.
     pub fn record_success(&self, username: &str, source: Option<&str>, began: Instant) {
         let mut failures = self.failures.lock().expect("never held across a panic");
-        failures.by_key.remove(&Self::user_key(username));
+        let user = Self::user_key(username);
+        failures.by_key.remove(&user);
+        if let Some(source) = source {
+            let known = failures.known.entry(user).or_default();
+            known.retain(|s| s != source);
+            if known.len() == KNOWN_SOURCES {
+                known.pop_front();
+            }
+            known.push_back(source.to_owned());
+        }
         let Some(source) = source.map(Self::source_key) else {
             return;
         };

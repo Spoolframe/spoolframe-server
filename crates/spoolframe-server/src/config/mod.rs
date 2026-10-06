@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use spoolframe_admin_api::SyncDirection;
 use spoolframe_media::encoders::{Hardware, HardwarePolicy, TranscodeSettings};
+use spoolframe_media::sandbox::Mode as SandboxMode;
 use spoolframe_plex::{PathMap, PathMapping};
 use spoolframe_types::LibraryKind;
 
@@ -502,9 +503,9 @@ impl WatchConfig {
     }
 }
 
-/// `media { ffmpeg = "ffmpeg"; ffprobe = "ffprobe"; tesseract = "tesseract"; }`,
-/// all optional: by default whatever is on `PATH`, which the nix package
-/// wraps.
+/// `media { ffmpeg = "ffmpeg"; ffprobe = "ffprobe"; tesseract = "tesseract";
+/// sandbox = "auto"; bwrap = "bwrap"; }`, all optional: by default whatever
+/// is on `PATH`, which the nix package wraps.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct MediaConfig {
@@ -514,9 +515,32 @@ pub struct MediaConfig {
     pub ffprobe: Option<PathBuf>,
     #[ucl(default)]
     pub tesseract: Option<PathBuf>,
+    /// Whether the tools run confined by bubblewrap: `required`, `auto`
+    /// or `off` (PX-11 finding 34); `auto` if left out.
+    #[ucl(default)]
+    pub sandbox: Option<String>,
+    /// bubblewrap; `bwrap` on `PATH` if left out.
+    #[ucl(default)]
+    pub bwrap: Option<PathBuf>,
 }
 
 impl MediaConfig {
+    pub fn sandbox(&self) -> Result<SandboxMode, ConfigError> {
+        self.sandbox
+            .as_deref()
+            .unwrap_or("auto")
+            .trim()
+            .parse()
+            .map_err(|message| ConfigError::Invalid {
+                key: "media.sandbox",
+                message,
+            })
+    }
+
+    pub fn bwrap(&self) -> PathBuf {
+        self.bwrap.clone().unwrap_or_else(|| "bwrap".into())
+    }
+
     pub fn ffmpeg(&self) -> PathBuf {
         self.ffmpeg.clone().unwrap_or_else(|| "ffmpeg".into())
     }
@@ -895,6 +919,10 @@ pub struct NetworkConfig {
     /// stream is reset (PX-10).
     #[ucl(default)]
     pub first_frame_timeout_secs: Option<u64>,
+    /// Seconds a media or artwork stream may wait for its reader to take
+    /// any of it before it is reset; 120 if left out.
+    #[ucl(default)]
+    pub stalled_read_secs: Option<u64>,
     /// Which of its addresses a signed-in device is told (PX-12).
     #[ucl(default)]
     pub announce: AnnounceConfig,
@@ -1001,6 +1029,9 @@ impl NetworkConfig {
             first_frame: self
                 .first_frame_timeout_secs
                 .map_or(Admission::DEFAULT_FIRST_FRAME, Duration::from_secs),
+            stalled_read: self
+                .stalled_read_secs
+                .map_or(Admission::DEFAULT_STALLED_READ, Duration::from_secs),
         };
         if admission.max_strangers == 0 {
             return Err(ConfigError::Invalid {
@@ -1011,6 +1042,12 @@ impl NetworkConfig {
         if admission.first_frame.is_zero() {
             return Err(ConfigError::Invalid {
                 key: "network.first_frame_timeout_secs",
+                message: "must be at least 1".into(),
+            });
+        }
+        if admission.stalled_read.is_zero() {
+            return Err(ConfigError::Invalid {
+                key: "network.stalled_read_secs",
                 message: "must be at least 1".into(),
             });
         }
@@ -1640,6 +1677,19 @@ mod tests {
             TranscodeSettings::default()
         );
         assert_eq!(config.media.ffmpeg(), PathBuf::from("ffmpeg"));
+    }
+
+    #[test]
+    fn the_media_tools_are_confined_when_they_can_be_by_default() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(config.media.sandbox().unwrap(), SandboxMode::Auto);
+        assert_eq!(config.media.bwrap(), PathBuf::from("bwrap"));
+        let config =
+            plex(r#"plex { url = "http://nas:32400"; } media { sandbox = "required"; }"#).unwrap();
+        assert_eq!(config.media.sandbox().unwrap(), SandboxMode::Required);
+        let config =
+            plex(r#"plex { url = "http://nas:32400"; } media { sandbox = "on"; }"#).unwrap();
+        assert!(config.media.sandbox().is_err());
     }
 
     #[test]

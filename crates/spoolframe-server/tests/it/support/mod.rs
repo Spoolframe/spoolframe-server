@@ -23,6 +23,7 @@ use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
 use spoolframe_media::encoders::{FfmpegCommand, TranscodeSettings};
 use spoolframe_media::ocr::Ocr;
+use spoolframe_media::sandbox::{Mode, Sandbox, Tool};
 use spoolframe_protocol::codec::{read_frame, write_frame};
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{ArtworkRequest, ArtworkResponse, ArtworkSize};
@@ -67,10 +68,39 @@ pub async fn sdk_client(
 /// No test runs a real ffmpeg.
 pub fn transcoding() -> Arc<Transcoding> {
     Arc::new(Transcoding::new(
-        Box::new(FfmpegCommand::new("/nonexistent/ffmpeg")),
+        Box::new(FfmpegCommand::new(Tool::unconfined("/nonexistent/ffmpeg"))),
         TranscodeSettings::default(),
         std::env::temp_dir(),
     ))
+}
+
+/// The media tools' sandbox for a server on `dir`, as the server's own
+/// (PX-11 finding 34), but for what it hides: the tests' films are in the
+/// state directory, so the database, the key and the secrets beside them
+/// are hidden rather than the whole of it.
+pub fn media_sandbox(dir: &Path) -> Sandbox {
+    Sandbox::new(
+        Mode::Required,
+        Path::new("bwrap"),
+        vec![
+            dir.join("spoolframe.db"),
+            dir.join("endpoint.key"),
+            dir.join("secrets"),
+        ],
+        Vec::new(),
+    )
+    .expect("the dev shell has bubblewrap")
+}
+
+/// A real tool (a bare name, looked up in `PATH`) confined in `sandbox`; a
+/// stand-in script (a path) as it is: it lives in the state directory,
+/// and is a shell script whose tools a confined shell cannot start.
+pub fn tool(program: &Path, sandbox: &Sandbox) -> Tool {
+    if program.components().count() == 1 {
+        Tool::new(program, sandbox.clone())
+    } else {
+        Tool::unconfined(program)
+    }
 }
 
 /// A search of everything for `query`, up to 10 per group.
@@ -363,6 +393,8 @@ impl TestServer {
         } else {
             fake_ffprobe(&dir, options.ffprobe_fixture)
         };
+        let sandbox = media_sandbox(&dir);
+        let ffprobe = tool(&ffprobe, &sandbox);
         let prober = Arc::new(Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT));
         let jobs = Jobs::new(
             JobLimits {
@@ -372,17 +404,17 @@ impl TestServer {
                 read_ahead: options.read_ahead,
                 stalled_after: options.stalled_after,
             },
-            options.ffmpeg.clone(),
+            tool(&options.ffmpeg, &sandbox),
         )
         .unwrap();
         let ocr = if options.ocr {
-            Ocr::detect(&options.tesseract).await
+            Ocr::detect(&tool(&options.tesseract, &sandbox)).await
         } else {
             Ocr::disabled()
         };
         let subtitles = Subtitles::new(
             ocr,
-            PathBuf::from("ffmpeg"),
+            tool(Path::new("ffmpeg"), &sandbox),
             ffprobe,
             &OcrSettings {
                 enabled: true,
@@ -404,7 +436,7 @@ impl TestServer {
                 catalog: catalog.clone(),
                 prober: prober.clone(),
                 transcoding: transcoding(),
-                ffmpeg: options.previews_ffmpeg.clone(),
+                ffmpeg: tool(&options.previews_ffmpeg, &sandbox),
                 encoding: jobs.encoding(),
             },
         )

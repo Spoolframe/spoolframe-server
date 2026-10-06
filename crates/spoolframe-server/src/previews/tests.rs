@@ -10,6 +10,7 @@ use spoolframe_catalog::{
     Found, Image, ItemPage, ItemWithChildren, Page, PreviewFrames, SearchQuery,
 };
 use spoolframe_media::encoders::{FfmpegCommand, TranscodeSettings};
+use spoolframe_media::sandbox::Tool;
 use spoolframe_types::{Item, Library, LibraryId, PersonId};
 
 use super::*;
@@ -106,13 +107,16 @@ async fn setup_making(
     let encoding = Encoding::default();
     let sources = PreviewSources {
         catalog: files.clone(),
-        prober: Arc::new(Prober::new("ffprobe", Prober::DEFAULT_TIMEOUT)),
+        prober: Arc::new(Prober::new(
+            Tool::unconfined("ffprobe"),
+            Prober::DEFAULT_TIMEOUT,
+        )),
         transcoding: Arc::new(Transcoding::new(
-            Box::new(FfmpegCommand::new("ffmpeg")),
+            Box::new(FfmpegCommand::new(Tool::unconfined("ffmpeg"))),
             TranscodeSettings::default(),
             tmp.as_ref().join("encoder-test"),
         )),
-        ffmpeg: ffmpeg.into(),
+        ffmpeg: Tool::unconfined(ffmpeg),
         encoding: encoding.clone(),
     };
     let dir = tmp.as_ref().join("previews");
@@ -510,6 +514,22 @@ fn the_newest_go_ahead_of_what_was_queued_ahead_and_behind_what_is_played() {
     assert_eq!(keys(&urgent), ["9"]);
     let ahead: Vec<_> = std::iter::from_fn(|| queue.pop_ahead()).collect();
     assert_eq!(keys(&ahead), ["3", "4", "1", "2"]);
+}
+
+/// PX-09 finding 15 (B-8): every `GetPreviews` for another item queued
+/// it as played, without end. The played queue keeps the newest
+/// [`MAX_URGENT`]: one asked for longer ago is dropped, and made again
+/// only if asked for again.
+#[test]
+fn the_played_queue_keeps_only_the_newest() {
+    let mut queue = Queue::default();
+    let asked: Vec<_> = (0..100).map(|n| film(&n.to_string())).collect();
+    for id in &asked {
+        queue.push(id, true);
+    }
+    let urgent: Vec<_> = std::iter::from_fn(|| queue.pop_urgent()).collect();
+    assert_eq!(urgent, asked[asked.len() - MAX_URGENT..]);
+    assert!(!queue.queued.contains(&asked[0]));
 }
 
 #[test]

@@ -924,3 +924,93 @@ async fn one_address_cannot_begin_every_passkey_sign_in() {
     );
     assert_eq!(begin_from("203.0.113.2").await, reqwest::StatusCode::OK);
 }
+
+/// PX-09 finding 28 (A-12): without a public URL the relying party is
+/// `localhost`, and any port was taken as its origin, so a page on
+/// another localhost port (a dev server, some other app) could have the
+/// user's passkey sign, and relay the assertion to this server from
+/// behind. Only the listener's own port is the web UI's now.
+#[tokio::test]
+async fn a_passkey_signed_on_another_localhost_port_signs_no_one_in() {
+    use spoolframe_server::admin::{self, Admin, Origins, SetupCode, TrustedProxies};
+    use spoolframe_server::auth::Auth;
+    use spoolframe_server::passkeys::Passkeys;
+    use spoolframe_server::store::Store;
+
+    let dir = crate::admin::state_dir("passkey-localhost-port").await;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let auth = Auth::new(Store::open(dir.as_ref()).await.unwrap());
+    let (addr, handle) = admin::serve(
+        format!("127.0.0.1:{port}").parse().unwrap(),
+        Admin {
+            passkeys: std::sync::Arc::new(Passkeys::at(
+                &Origins::SameHost,
+                &crate::admin::server_id(),
+                Some(port),
+            )),
+            ..crate::admin::admin(auth, Some(SetupCode::new(CODE)))
+        },
+        Origins::SameHost,
+        TrustedProxies::default(),
+    )
+    .await
+    .unwrap();
+    std::mem::forget(handle);
+    let root = anonymous(addr)
+        .await
+        .setup(setup(CODE, "root", PASSWORD))
+        .await
+        .unwrap();
+    let root = with_token(addr, &root.token).await;
+    let page = format!("http://localhost:{port}");
+    let mut laptop = Authenticator::new();
+    let options = root.passkey_add_begin().await.unwrap();
+    let made = laptop.create(&page, &options);
+    root.passkey_add_finish("Laptop".into(), made)
+        .await
+        .unwrap();
+
+    // The web UI's own page signs in; the browser sends its own origin.
+    let browser = |path: &str, body: Value| {
+        reqwest::Client::new()
+            .post(format!("{page}{path}"))
+            .header("origin", &page)
+            .json(&body)
+            .send()
+    };
+    let begun: Value = browser("/auth/passkey/begin", json!({}))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let signed = laptop.get(&page, &begun["options"]);
+    let ok = browser(
+        "/auth/passkey/finish",
+        json!({ "ceremony": begun["ceremony"], "credential": signed }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok.status(), reqwest::StatusCode::OK);
+
+    // Another app's page at localhost:3000 has it sign, and its backend
+    // sends this server what was signed, with whatever headers it likes.
+    let begun: Value = browser("/auth/passkey/begin", json!({}))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let relayed = laptop.get("http://localhost:3000", &begun["options"]);
+    let refused = browser(
+        "/auth/passkey/finish",
+        json!({ "ceremony": begun["ceremony"], "credential": relayed }),
+    )
+    .await
+    .unwrap();
+    assert_refused(refused).await;
+}

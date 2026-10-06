@@ -83,6 +83,9 @@ impl Link {
 pub enum LinkError {
     #[error("not a PIN you began")]
     NotYourPin,
+    /// [`MAX_LINK_BEGINS`] begun within the window.
+    #[error("too many Plex sign-ins begun; wait a few minutes")]
+    TooMany { retry_after: std::time::Duration },
     /// Unlinking what the config file links.
     #[error(
         "the server's config file links this account (plex.watch_sync.user); only that file \
@@ -120,12 +123,23 @@ pub struct PlexAccounts {
     site: PlexSite,
     /// `plex.watch_sync.user`, as the server started (a restart setting).
     owner: Option<LocalUserId>,
-    /// The PINs begun, and whose each is.
-    pins: Mutex<HashMap<u64, LocalUserId>>,
+    /// The PINs begun, whose each is, and when.
+    pins: Mutex<HashMap<u64, (LocalUserId, std::time::Instant)>>,
+    /// When each user began their last links, for [`MAX_LINK_BEGINS`].
+    begun: Mutex<HashMap<LocalUserId, std::collections::VecDeque<std::time::Instant>>>,
     /// The user whose link was made or removed, for the sync to start or
     /// stop their runs.
     changed: tokio::sync::broadcast::Sender<LocalUserId>,
 }
+
+/// The Plex links a user may begin in [`LINK_BEGIN_WINDOW`] (PX-09
+/// finding 15): each asks plex.tv for a PIN, which the server keeps. A
+/// person links once; a few is a page reloaded, or a PIN let expire.
+pub const MAX_LINK_BEGINS: usize = 5;
+
+/// How long a begun link counts against [`MAX_LINK_BEGINS`]: plex.tv's
+/// PINs last 15 minutes.
+const LINK_BEGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 pub(crate) fn secret_name(user: impl std::fmt::Display) -> String {
     format!("plex-account-{}", user)
@@ -139,6 +153,7 @@ impl PlexAccounts {
             site,
             owner,
             pins: Mutex::default(),
+            begun: Mutex::default(),
             changed: tokio::sync::broadcast::Sender::new(16),
         }
     }
@@ -208,12 +223,40 @@ impl PlexAccounts {
 
     /// Begin linking `user`'s Plex account: a PIN for them to approve,
     /// and Plex's sign-in page for it, which goes on to `forward` when done.
+    /// At most [`MAX_LINK_BEGINS`] a user in [`LINK_BEGIN_WINDOW`], so
+    /// neither plex.tv nor the PINs kept here are asked for without end
+    /// (PX-09 finding 15); the user keeps only that many PINs.
     pub async fn begin(&self, user: LocalUserId, forward: Option<&str>) -> Result<Pin, LinkError> {
-        let pin = self.plex_tv()?.begin(forward).await?;
-        self.pins
-            .lock()
-            .expect("never held across a panic")
-            .insert(pin.id, user);
+        let plex_tv = self.plex_tv()?;
+        {
+            let now = std::time::Instant::now();
+            let mut begun = self.begun.lock().expect("never held across a panic");
+            begun.retain(|_, times| {
+                times.retain(|at| now.duration_since(*at) < LINK_BEGIN_WINDOW);
+                !times.is_empty()
+            });
+            let times = begun.entry(user).or_default();
+            if times.len() >= MAX_LINK_BEGINS {
+                let oldest = times.front().copied().unwrap_or(now);
+                return Err(LinkError::TooMany {
+                    retry_after: LINK_BEGIN_WINDOW.saturating_sub(now.duration_since(oldest)),
+                });
+            }
+            times.push_back(now);
+        }
+        let pin = plex_tv.begin(forward).await?;
+        let mut pins = self.pins.lock().expect("never held across a panic");
+        let mine: Vec<(u64, std::time::Instant)> = pins
+            .iter()
+            .filter(|(_, (owner, _))| *owner == user)
+            .map(|(id, (_, at))| (*id, *at))
+            .collect();
+        if mine.len() >= MAX_LINK_BEGINS
+            && let Some((oldest, _)) = mine.iter().min_by_key(|(_, at)| *at)
+        {
+            pins.remove(oldest);
+        }
+        pins.insert(pin.id, (user, std::time::Instant::now()));
         Ok(pin)
     }
 
@@ -224,7 +267,7 @@ impl PlexAccounts {
             .lock()
             .expect("never held across a panic")
             .get(&id)
-            == Some(&user);
+            .is_some_and(|(owner, _)| *owner == user);
         if !mine {
             return Err(LinkError::NotYourPin);
         }

@@ -12,6 +12,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use spoolframe_media::sandbox::{Jail, Limits, Tool};
+
 use super::JobLimits;
 use super::args::PLAYLIST;
 use crate::metrics::Counter;
@@ -51,17 +53,58 @@ pub struct Progress {
     /// own playlist lists.
     pub last_segment: Option<u32>,
     /// `None` while running; then how it ended.
-    pub done: Option<Result<(), String>>,
+    pub done: Option<Result<(), Failure>>,
 }
+
+/// Why a job ended unfinished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// The server's words, or ffmpeg's last line.
+    pub reason: String,
+    /// The reason is ffmpeg's own (PX-09 finding 23).
+    pub from_ffmpeg: bool,
+}
+
+impl Failure {
+    fn server(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            from_ffmpeg: false,
+        }
+    }
+
+    /// What the client is told: the server's words as they are, never
+    /// ffmpeg's.
+    pub fn for_client(&self) -> &str {
+        if self.from_ffmpeg {
+            FFMPEG_FAILED
+        } else {
+            &self.reason
+        }
+    }
+}
+
+/// What a client is told of an encode ffmpeg failed (PX-09 finding 23):
+/// ffmpeg's own words name the server's paths, so they are only in the
+/// log and on the admin's playback page.
+pub const FFMPEG_FAILED: &str = "the conversion failed on the server";
 
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
     /// Over `max_jobs`.
     #[error("the server is converting as many files as it may")]
     Busy,
+    /// Why, in words a client may see.
     #[error("cannot prepare the encode: {0}")]
     Prepare(String),
+    /// ffmpeg could not be run: the reason names it, and where it is, so
+    /// it is for the log only (PX-09 finding 23).
+    #[error("cannot run ffmpeg: {0}")]
+    Spawn(String),
 }
+
+/// What a client is told of an encode that could not be run.
+pub const SPAWN_FAILED: &str = "the conversion could not be started on the server";
 
 /// One of the `max_jobs` places. A job that replaces another (a seek, a
 /// subtitle change) shares the place of the one it replaces, so nobody
@@ -114,7 +157,7 @@ pub struct Jobs {
     limits: std::sync::RwLock<JobLimits>,
     /// [`JOBS_DIR`] in the scratch directory.
     dir: PathBuf,
-    ffmpeg: PathBuf,
+    ffmpeg: Tool,
     places: Arc<std::sync::Mutex<Places>>,
     /// Held by the job that looks at a full scratch directory and makes
     /// room in it, so the next job to look sees what the first one freed.
@@ -195,7 +238,7 @@ impl Jobs {
     /// the scratch directory is emptied: whatever is there is a previous
     /// run's. Nothing else in the scratch directory is touched: it may be
     /// a directory other things are kept in.
-    pub fn new(limits: JobLimits, ffmpeg: PathBuf) -> std::io::Result<Self> {
+    pub fn new(limits: JobLimits, ffmpeg: Tool) -> std::io::Result<Self> {
         let dir = limits.scratch_dir.join(JOBS_DIR);
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {
@@ -285,7 +328,7 @@ impl Jobs {
     pub fn start(
         &self,
         dir: PathBuf,
-        args: Vec<String>,
+        run: impl Into<Run>,
         written: Written,
         encodes: bool,
         epoch: u32,
@@ -307,16 +350,38 @@ impl Jobs {
         };
         let slot = Arc::new(std::sync::Mutex::new(Some(slot)));
         std::fs::create_dir_all(&dir).map_err(|e| JobError::Prepare(e.to_string()))?;
-        let mut child = tokio::process::Command::new(&self.ffmpeg)
+        let Run {
+            args,
+            inputs,
+            reads,
+            gpu,
+        } = run.into();
+        let limits = self.limits();
+        let cannot_run = |e: std::io::Error| {
+            JobError::Spawn(format!("{}: {e}", self.ffmpeg.program().display()))
+        };
+        // No file of the job's is larger than all it may write.
+        let mut jail = Jail::new(Limits::encode(limits.scratch_limit_bytes)).gpu(gpu);
+        for dir in reads {
+            jail = jail.reads(dir);
+        }
+        jail = jail.writes(&dir);
+        for input in inputs {
+            jail = jail.input(input);
+        }
+        let mut child = self
+            .ffmpeg
+            .command(&jail)
+            .map_err(cannot_run)?
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| JobError::Prepare(format!("cannot run {}: {e}", self.ffmpeg.display())))?;
+            .map_err(cannot_run)?;
+        // The run's process group: ffmpeg, or bubblewrap with ffmpeg in it.
         let pid = child.id().unwrap_or(0);
-        let limits = self.limits();
         let (progress_tx, progress) = watch::channel(Progress::default());
         let progress_tx = Arc::new(progress_tx);
         let shared = Arc::new(Shared {
@@ -347,7 +412,7 @@ impl Jobs {
         let stderr = child.stderr.take().expect("piped");
         let task = tokio::spawn(supervisor.run(child, stdout, stderr));
         tracing::debug!(pid, dir = %dir.display(), epoch, "encode started");
-        let mut command = vec![self.ffmpeg.display().to_string()];
+        let mut command = vec![self.ffmpeg.program().display().to_string()];
         command.extend(args);
         let job = Arc::new(EncodeJob {
             epoch,
@@ -369,6 +434,30 @@ impl Jobs {
         live.retain(|job| job.strong_count() > 0);
         live.push(Arc::downgrade(&job));
         Ok(job)
+    }
+}
+
+/// One ffmpeg run: its arguments, and what it reads besides the directory
+/// it writes.
+#[derive(Debug, Clone, Default)]
+pub struct Run {
+    pub args: Vec<String>,
+    /// Files someone else may have put there: the film, a subtitle file
+    /// beside it.
+    pub inputs: Vec<PathBuf>,
+    /// Directories of the server's own it reads: the conversion's, with its
+    /// links to the inputs.
+    pub reads: Vec<PathBuf>,
+    /// It decodes or encodes on the GPU.
+    pub gpu: bool,
+}
+
+impl From<Vec<String>> for Run {
+    fn from(args: Vec<String>) -> Self {
+        Self {
+            args,
+            ..Self::default()
+        }
     }
 }
 
@@ -567,15 +656,17 @@ impl Drop for EncodeJob {
     }
 }
 
+/// `sig` to the run's process group, which `pid` leads: ffmpeg, or
+/// bubblewrap and the ffmpeg it runs.
 fn signal(pid: u32, sig: libc::c_int) {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return;
     };
     if pid > 0 {
-        // SAFETY: kill(2) on our own child's pid; an error (it has exited)
-        // is harmless.
+        // SAFETY: kill(2) on our own child's process group; an error (it
+        // has exited) is harmless.
         unsafe {
-            libc::kill(pid, sig);
+            libc::kill(-pid, sig);
         }
     }
 }
@@ -631,19 +722,7 @@ impl Supervisor {
         let status = loop {
             tokio::select! {
                 line = out.next_line(), if out_open => match line {
-                    Ok(Some(line)) => {
-                        // `-progress` writes key=value lines; out_time_us is
-                        // the encoded media time (out_time_ms is µs too).
-                        if let Some(us) = line.strip_prefix("out_time_us=")
-                            && let Ok(us) = us.trim().parse::<u64>()
-                        {
-                            encoded_ms = us / 1000;
-                            if encoded_ms > counted_ms {
-                                self.counters.output_ms.add(encoded_ms - counted_ms);
-                                counted_ms = encoded_ms;
-                            }
-                        }
-                    }
+                    Ok(Some(line)) => self.progress_line(&line, &mut encoded_ms, &mut counted_ms),
                     _ => out_open = false,
                 },
                 line = err.next_line(), if err_open => match line {
@@ -678,10 +757,10 @@ impl Supervisor {
                         );
                         self.slot.lock().expect("never poisoned").take();
                         self.counters.stalled.inc();
-                        self.finish(Err(format!(
+                        self.finish(Err(Failure::server(format!(
                             "the conversion stalled: ffmpeg made no progress for {:?}",
                             self.stalled_after
-                        )));
+                        ))));
                         return;
                     }
                     // Only a job that wrote since it last looked can be the
@@ -700,7 +779,9 @@ impl Supervisor {
                             if let Err(e) = std::fs::remove_dir_all(&self.dir) {
                                 tracing::warn!(dir = %self.dir.display(), error = %e, "cannot remove an encode's files");
                             }
-                            self.finish(Err("the server's scratch space for conversions is full".into()));
+                            self.finish(Err(Failure::server(
+                                "the server's scratch space for conversions is full",
+                            )));
                             return;
                         }
                         seen = self.measure().0;
@@ -708,7 +789,11 @@ impl Supervisor {
                 }
             }
         };
-        // Drain what is left of stderr for the report.
+        // What is left of its progress (a run that ends at once may have
+        // written all of it unread), and of stderr for the report.
+        while out_open && let Ok(Some(line)) = out.next_line().await {
+            self.progress_line(&line, &mut encoded_ms, &mut counted_ms);
+        }
         while let Ok(Some(line)) = err.next_line().await {
             self.shared.stderr_line(line);
         }
@@ -729,13 +814,31 @@ impl Supervisor {
                     .cloned()
                     .unwrap_or_else(|| format!("ffmpeg exited with {status}"));
                 tracing::warn!(pid = self.pid, %status, stderr = ?tail, "an encode failed");
-                self.finish(Err(reason));
+                self.finish(Err(Failure {
+                    reason,
+                    from_ffmpeg: true,
+                }));
             }
-            Err(e) => self.finish(Err(format!("cannot wait for ffmpeg: {e}"))),
+            Err(e) => self.finish(Err(Failure::server(format!("cannot wait for ffmpeg: {e}")))),
         }
     }
 
-    fn finish(&self, done: Result<(), String>) {
+    /// A line of ffmpeg's `-progress`: key=value; out_time_us is the
+    /// encoded media time (out_time_ms is µs too), counted as output past
+    /// `counted_ms` (P3-14).
+    fn progress_line(&self, line: &str, encoded_ms: &mut u64, counted_ms: &mut u64) {
+        if let Some(us) = line.strip_prefix("out_time_us=")
+            && let Ok(us) = us.trim().parse::<u64>()
+        {
+            *encoded_ms = us / 1000;
+            if *encoded_ms > *counted_ms {
+                self.counters.output_ms.add(*encoded_ms - *counted_ms);
+                *counted_ms = *encoded_ms;
+            }
+        }
+    }
+
+    fn finish(&self, done: Result<(), Failure>) {
         self.shared.paused.store(false, Ordering::Relaxed);
         self.progress.send_modify(|p| p.done = Some(done));
     }
@@ -921,7 +1024,7 @@ mod tests {
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
         };
-        let jobs = Jobs::new(limits.clone(), "ffmpeg".into()).unwrap();
+        let jobs = Jobs::new(limits.clone(), Tool::unconfined("ffmpeg")).unwrap();
         jobs.set_limits(JobLimits {
             max_jobs: 1,
             scratch_dir: tmp.as_ref().join("elsewhere"),
@@ -1003,7 +1106,7 @@ mod tests {
             read_ahead,
             stalled_after,
         };
-        (Jobs::new(limits, bin).unwrap(), tmp)
+        (Jobs::new(limits, Tool::unconfined(bin)).unwrap(), tmp)
     }
 
     async fn done(job: &EncodeJob) -> Result<(), String> {
@@ -1013,7 +1116,7 @@ mod tests {
             .await
             .unwrap()
             .clone();
-        ended.done.unwrap()
+        ended.done.unwrap().map_err(|f| f.reason)
     }
 
     fn alive(pid: u32) -> bool {
@@ -1270,7 +1373,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut expected = vec![jobs.ffmpeg.display().to_string()];
+        let mut expected = vec![jobs.ffmpeg.program().display().to_string()];
         expected.extend(args);
         assert_eq!(job.command(), expected);
     }
@@ -1656,7 +1759,7 @@ mod tests {
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
         };
-        (Jobs::new(limits, bin).unwrap(), tmp)
+        (Jobs::new(limits, Tool::unconfined(bin)).unwrap(), tmp)
     }
 
     const FULL: &str = "the server's scratch space for conversions is full";
@@ -1826,7 +1929,7 @@ mod tests {
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
         };
-        let jobs = Jobs::new(limits, "ffmpeg".into()).unwrap();
+        let jobs = Jobs::new(limits, Tool::unconfined("ffmpeg")).unwrap();
         assert!(!jobs.dir().join("oldhandle").exists());
         assert!(jobs.dir().is_dir());
     }
@@ -1850,7 +1953,7 @@ mod tests {
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
         };
-        Jobs::new(limits, "ffmpeg".into()).unwrap();
+        Jobs::new(limits, Tool::unconfined("ffmpeg")).unwrap();
         assert_eq!(std::fs::read(&key).unwrap(), b"secret");
         assert_eq!(std::fs::read(&text).unwrap(), b"WEBVTT");
     }

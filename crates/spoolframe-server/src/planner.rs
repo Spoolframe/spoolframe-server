@@ -763,6 +763,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use spoolframe_media::encoders::{AudioEncoder, Hardware, VideoEncoder};
+    use spoolframe_media::sandbox::Tool;
     use spoolframe_types::{AudioRole, HdrFormat, SubtitleRole, VideoLimits};
 
     use super::*;
@@ -1324,7 +1325,7 @@ mod tests {
 
     /// tesseract with English data.
     fn english() -> Ocr {
-        Ocr::new(PathBuf::from("tesseract"), ["eng".to_owned()])
+        Ocr::new(Tool::unconfined("tesseract"), ["eng".to_owned()])
     }
 
     fn with_mode(

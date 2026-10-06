@@ -921,16 +921,23 @@ const QUIET: [&str; 9] = [
     "reqwest",
 ];
 
+/// The target of log lines for this host's own log only, never exported:
+/// the setup code (PX-09 finding 20), which takes over a server with no
+/// users, so whoever reads the collector's logs must not see it.
+pub const LOCAL_ONLY: &str = "spoolframe::local_only";
+
 fn loud(meta: &Metadata<'_>) -> bool {
     let target = meta.target();
-    !QUIET.iter().any(|quiet| {
-        target
-            .strip_prefix(quiet)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
-    })
+    target != LOCAL_ONLY
+        && !QUIET.iter().any(|quiet| {
+            target
+                .strip_prefix(quiet)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+        })
 }
 
-/// A layer that never sees the export's own libraries.
+/// A layer that never sees the export's own libraries, nor
+/// [`LOCAL_ONLY`] lines.
 struct Quiet<L>(L);
 
 impl<S, L> Layer<S> for Quiet<L>

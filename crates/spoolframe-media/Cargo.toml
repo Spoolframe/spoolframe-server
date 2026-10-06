@@ -10,6 +10,10 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 async-trait = { workspace = true }
 easy-ffprobe = { workspace = true }
+# Limits and file descriptors for the tools it runs, between fork and exec.
+libc = { workspace = true }
+# The tools' seccomp filter, as BPF for bubblewrap (sandbox.rs).
+seccompiler = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spoolframe-types = { workspace = true }
@@ -18,8 +22,6 @@ tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-# mkfifo, for a sidecar name that is a FIFO (PX-09 B-1).
-libc = { workspace = true }
 spoolframe-test-dir = { workspace = true }
 # Its own PGS fixtures, for the OCR tests.
 spoolframe-media = { workspace = true, features = ["fixtures"] }

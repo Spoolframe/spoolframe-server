@@ -530,6 +530,7 @@ impl ClientProtocol {
                     platform: hello.platform,
                     requested_at: crate::store::now(),
                     remember,
+                    address: remote_ip(connection),
                 });
                 match started {
                     Some(started) => Ok(Reply::DeviceSignInStarted {
@@ -716,18 +717,19 @@ impl ClientProtocol {
                 message: e.to_string(),
             }),
         };
+        let stall = self.connections.admission().stalled_read;
         let sent = async {
             match result {
                 Ok((metadata, length, body)) => {
                     let media = matches!(metadata, ResourceMetadata::Media { .. });
                     write_frame(&mut send, &ResourceResponse::Ready { length, metadata }).await?;
                     match body {
-                        ResourceBody::Bytes(bytes) => send
-                            .write_all(&bytes)
-                            .await
-                            .map_err(std::io::Error::other)?,
+                        ResourceBody::Bytes(bytes) => {
+                            send_unless_stalled(&mut send, &bytes, stall).await?;
+                        }
                         ResourceBody::File(file) => {
-                            let copied = tokio::io::copy(&mut file.take(length), &mut send).await?;
+                            let copied =
+                                copy_unless_stalled(file.take(length), &mut send, stall).await?;
                             if media {
                                 self.services.metrics.media_reads.inc();
                                 self.services.metrics.media_read_bytes.add(copied);
@@ -2001,10 +2003,7 @@ impl ClientProtocol {
                 };
                 let epoch = conversion
                     .seek(Duration::from_millis(position_ms))
-                    .map_err(|e| match e {
-                        JobError::Busy => Error::Busy,
-                        JobError::Prepare(reason) => Error::PlaybackFailed { reason },
-                    })?;
+                    .map_err(conversion_error)?;
                 tracing::debug!(epoch, position_ms, "conversion restarted at a seek");
                 self.services.playbacks.revised(&handle);
                 Ok(Reply::PlaybackSeeked { epoch })
@@ -2572,12 +2571,11 @@ impl ClientProtocol {
                     },
                     start,
                 )
-                .map_err(|e| match e {
-                    JobError::Busy => Error::Busy,
-                    JobError::Prepare(reason) => {
-                        tracing::warn!(%id, reason, "cannot start a conversion");
-                        Error::PlaybackFailed { reason }
+                .map_err(|e| {
+                    if !matches!(e, JobError::Busy) {
+                        tracing::warn!(%id, error = %e, "cannot start a conversion");
                     }
+                    conversion_error(e)
                 })?;
                 (text, (0, None), Some(conversion))
             }
@@ -2761,6 +2759,65 @@ impl ProtocolHandler for ClientProtocol {
     }
 }
 
+/// The address `connection` reaches the server from now, if it is an IP
+/// path (relays are off, so it is).
+fn remote_ip(connection: &Connection) -> Option<std::net::IpAddr> {
+    connection
+        .paths()
+        .iter()
+        .find(|path| path.is_selected())
+        .and_then(|path| match path.remote_addr() {
+            iroh::TransportAddr::Ip(addr) => Some(addr.ip()),
+            _ => None,
+        })
+}
+
+/// The size of each part of a resource sent: what one write waits on.
+const RESOURCE_PART: usize = 64 << 10;
+
+/// `bytes` written to `send`, unless the reader takes none of a part for
+/// `stall` (PX-09 finding 14): then an error, and the stream is reset.
+async fn send_unless_stalled(
+    send: &mut SendStream,
+    bytes: &[u8],
+    stall: Duration,
+) -> std::io::Result<()> {
+    for part in bytes.chunks(RESOURCE_PART) {
+        tokio::time::timeout(stall, send.write_all(part))
+            .await
+            .map_err(|_| stalled(stall))?
+            .map_err(std::io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// `from` copied to `send`, as [`send_unless_stalled`]: a read whose
+/// reader takes nothing held its file open, and what waited to be sent,
+/// for as long as the connection lived. The bytes copied.
+async fn copy_unless_stalled(
+    mut from: impl tokio::io::AsyncRead + Unpin,
+    send: &mut SendStream,
+    stall: Duration,
+) -> std::io::Result<u64> {
+    let mut part = vec![0u8; RESOURCE_PART];
+    let mut copied = 0u64;
+    loop {
+        let n = from.read(&mut part).await?;
+        if n == 0 {
+            return Ok(copied);
+        }
+        send_unless_stalled(send, &part[..n], stall).await?;
+        copied += n as u64;
+    }
+}
+
+fn stalled(stall: Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("the reader took nothing for {stall:?}"),
+    )
+}
+
 /// Wait, for at most [`SIGN_OUT_DRAIN`], for the peer to acknowledge all
 /// of a finished stream: until then the stream counts as being answered,
 /// so a signed-out device's connection is not closed under its reply.
@@ -2942,7 +2999,7 @@ async fn converted_range(
     let now = wait_for(&job, keep_alive, |p| p.bytes > offset || p.done.is_some()).await;
     if let Some(Err(reason)) = &now.done {
         return Err(Error::PlaybackFailed {
-            reason: reason.clone(),
+            reason: reason.for_client().to_owned(),
         });
     }
     let size = now.bytes;
@@ -3025,10 +3082,7 @@ async fn segment_range(
     let job = if n == 0 {
         conversion.job()
     } else {
-        conversion.job_for_segment(n).map_err(|e| match e {
-            JobError::Busy => Error::Busy,
-            JobError::Prepare(reason) => Error::PlaybackFailed { reason },
-        })?
+        conversion.job_for_segment(n).map_err(conversion_error)?
     };
     // A segment is final once ffmpeg has finished it or the encode has
     // ended; the init segment once the first media segment is finished.
@@ -3048,7 +3102,7 @@ async fn segment_range(
     .await;
     if let Some(Err(reason)) = &now.done {
         return Err(Error::PlaybackFailed {
-            reason: reason.clone(),
+            reason: reason.for_client().to_owned(),
         });
     }
     // Not a segment removed meanwhile to make room: asked for again, the
@@ -3081,7 +3135,7 @@ async fn segment_range(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if let Some(Err(reason)) = &job.progress().borrow().done {
                     return Err(Error::PlaybackFailed {
-                        reason: reason.clone(),
+                        reason: reason.for_client().to_owned(),
                     });
                 }
                 None
@@ -3178,6 +3232,22 @@ fn subtitle_version(metadata: &std::fs::Metadata) -> u64 {
     let mut first = [0; 8];
     first.copy_from_slice(&hash.finalize().as_bytes()[..8]);
     u64::from_le_bytes(first)
+}
+
+/// A conversion that could not start or restart, as the client is told:
+/// a failure to run ffmpeg names where it is, so only the log has it
+/// (PX-09 finding 23).
+fn conversion_error(e: JobError) -> Error {
+    match e {
+        JobError::Busy => Error::Busy,
+        JobError::Prepare(reason) => Error::PlaybackFailed { reason },
+        JobError::Spawn(reason) => {
+            tracing::warn!(reason, "cannot run ffmpeg");
+            Error::PlaybackFailed {
+                reason: crate::encode::job::SPAWN_FAILED.into(),
+            }
+        }
+    }
 }
 
 /// The text a reading made: waits for it a while, then tells the client to

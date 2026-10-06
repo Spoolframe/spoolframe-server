@@ -325,6 +325,62 @@ async fn login_from(addr: SocketAddr, from: &str, username: &str, password: &str
         .status()
 }
 
+/// PX-09 finding 24 (A-7): five wrong passwords for a name, from anywhere,
+/// locked that name out for 15 minutes, its owner too. They still lock
+/// it for every new place, but not for one it signed in from before.
+#[tokio::test]
+async fn a_name_guessed_at_elsewhere_still_signs_in_where_it_did_before() {
+    let (addr, _dir) = server_behind_a_proxy("web-lockout-known").await;
+    set_up(addr).await;
+    assert_eq!(
+        login_from(addr, "203.0.113.9", "root", PASSWORD).await,
+        StatusCode::OK
+    );
+    for n in 1..=5 {
+        let status = login_from(addr, &format!("198.51.100.{n}"), "root", "wrong").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    // The name is still guarded from a place it never signed in from,
+    assert_eq!(
+        login_from(addr, "198.51.100.77", "root", PASSWORD).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // but not from its own.
+    assert_eq!(
+        login_from(addr, "203.0.113.9", "root", PASSWORD).await,
+        StatusCode::OK
+    );
+}
+
+/// A setup as the proxy passes it on from the caller at `from`.
+async fn set_up_from(addr: SocketAddr, from: &str, code: &str) -> StatusCode {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/auth/setup"))
+        .header("x-forwarded-for", from)
+        .json(&json!({ "code": code, "username": "root", "password": PASSWORD }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Nor do five wrong setup codes from one caller keep the owner from
+/// setting the server up: the code is 59 random bits, so it is guessed at
+/// per caller, not under one name for all.
+#[tokio::test]
+async fn wrong_setup_codes_from_one_caller_do_not_lock_setup_for_another() {
+    let (addr, _dir) = server_behind_a_proxy("web-setup-guess").await;
+    for _ in 0..5 {
+        let status = set_up_from(addr, "198.51.100.1", "WRNG-WRNG-WRNG").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    assert_eq!(
+        set_up_from(addr, "198.51.100.1", CODE).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(set_up_from(addr, "203.0.113.9", CODE).await, StatusCode::OK);
+}
+
 /// Behind a trusted proxy every connection comes from the proxy's address.
 /// The failure limit counts the caller the proxy names: one caller's
 /// failures do not lock out the others behind it.

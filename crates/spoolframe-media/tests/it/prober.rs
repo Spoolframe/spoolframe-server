@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use spoolframe_media::sandbox::Tool;
 use spoolframe_media::{ProbeError, Prober, SubtitleSource};
 
 fn fixture(name: &str) -> String {
@@ -86,7 +87,7 @@ fn media(dir: &Path) -> PathBuf {
 }
 
 fn prober(ffprobe: PathBuf) -> Prober {
-    Prober::new(ffprobe, Duration::from_secs(10))
+    Prober::new(Tool::unconfined(ffprobe), Duration::from_secs(10))
 }
 
 #[tokio::test]
@@ -162,7 +163,10 @@ async fn a_new_subtitle_file_is_noticed() {
 async fn a_hung_ffprobe_is_stopped_and_named_by_path() {
     let (_tmp, dir) = scratch("timeout").await;
     let movie = media(&dir);
-    let prober = Prober::new(fake_ffprobe(&dir, "sleep 30"), Duration::from_millis(200));
+    let prober = Prober::new(
+        Tool::unconfined(fake_ffprobe(&dir, "sleep 30")),
+        Duration::from_millis(200),
+    );
     let err = prober.describe(&movie).await.unwrap_err();
     assert!(matches!(err, ProbeError::TimedOut { .. }), "{err}");
     assert!(err.to_string().contains(movie.to_str().unwrap()), "{err}");

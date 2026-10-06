@@ -279,24 +279,29 @@ impl PlexCatalog {
     }
 
     async fn fetch(&self, call: &Call<'_>) -> Result<MediaContainer, CatalogError> {
-        let body = self.get_bytes(call, "application/json").await?.0;
+        let body = self
+            .get_bytes(call, "application/json", MAX_JSON_BYTES)
+            .await?
+            .0;
         serde_json::from_slice::<Envelope>(&body)
             .map(|e| e.container)
             .map_err(|e| self.backend(call, None, format!("unreadable response: {e}")))
     }
 
-    /// One GET, with the token; the body and its content type. Status codes
-    /// become errors here. Each is counted and timed (P3-14), in a span of
-    /// its own that names the path, never the token.
+    /// One GET, with the token; the body (at most `limit` bytes) and its
+    /// content type. Status codes become errors here. Each is counted and
+    /// timed (P3-14), in a span of its own that names the path, never the
+    /// token.
     async fn get_bytes(
         &self,
         call: &Call<'_>,
         accept: &str,
+        limit: usize,
     ) -> Result<(Vec<u8>, Option<String>), CatalogError> {
         use tracing::Instrument as _;
         let span = tracing::info_span!("plex request", path = %call.path);
         let started = std::time::Instant::now();
-        let result = self.send(call, accept).instrument(span).await;
+        let result = self.send(call, accept, limit).instrument(span).await;
         let failed = matches!(&result, Err(e) if !matches!(e, CatalogError::NotFound(_)));
         self.stats.record(started.elapsed(), failed);
         result
@@ -306,6 +311,7 @@ impl PlexCatalog {
         &self,
         call: &Call<'_>,
         accept: &str,
+        limit: usize,
     ) -> Result<(Vec<u8>, Option<String>), CatalogError> {
         let mut req = self
             .http
@@ -348,15 +354,33 @@ impl PlexCatalog {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|source| CatalogError::Unreachable {
-                url: self.base.clone(),
-                call: call.describe(),
-                source: Box::new(source),
-            })?;
-        Ok((body.to_vec(), content_type))
+        // Read up to `limit`, not whole and then measured (PX-09 finding
+        // 26): what a PMS sends within the request's time is otherwise
+        // all held.
+        let mut resp = resp;
+        let mut body = Vec::new();
+        loop {
+            let chunk = resp
+                .chunk()
+                .await
+                .map_err(|source| CatalogError::Unreachable {
+                    url: self.base.clone(),
+                    call: call.describe(),
+                    source: Box::new(source),
+                })?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if body.len() + chunk.len() > limit {
+                return Err(self.backend(
+                    call,
+                    None,
+                    format!("an answer of more than {limit} bytes is over the limit"),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok((body, content_type))
     }
 
     fn backend(&self, call: &Call<'_>, item: Option<String>, message: String) -> CatalogError {
@@ -598,6 +622,10 @@ impl PlexCatalog {
 /// The largest image passed on; posters and backgrounds are far smaller.
 const MAX_IMAGE_BYTES: usize = 32 << 20;
 
+/// The most of a JSON answer read: a page of a library, or a show with its
+/// seasons, is well under a megabyte.
+pub(crate) const MAX_JSON_BYTES: usize = 64 << 20;
+
 /// The most of a preview index read: a film's is about 3.6 MB an hour at
 /// a frame every 2 s.
 const MAX_INDEX_BYTES: usize = 256 << 20;
@@ -738,19 +766,12 @@ impl Catalog for PlexCatalog {
             return Ok(None);
         };
         let call = Call::get(format!("/library/parts/{part}/indexes/sd")).about(id);
-        let bytes = match self.get_bytes(&call, "*/*").await {
+        let bytes = match self.get_bytes(&call, "*/*", MAX_INDEX_BYTES).await {
             Ok((bytes, _)) => bytes,
             // Listed, but gone (being made again): as if there were none.
             Err(CatalogError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        if bytes.len() > MAX_INDEX_BYTES {
-            return Err(self.backend(
-                &call,
-                None,
-                format!("a preview index of {} bytes is over the limit", bytes.len()),
-            ));
-        }
         let frames = bif::frames(&bytes)
             .map_err(|e| self.backend(&call, None, format!("unreadable preview index: {e}")))?;
         Ok((!frames.is_empty()).then_some(PreviewFrames { frames }))
@@ -784,14 +805,7 @@ impl Catalog for PlexCatalog {
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
         self.authorize_artwork(id).await?;
         let call = Call::get(id.key()).about(id);
-        let (bytes, content_type) = self.get_bytes(&call, "image/*").await?;
-        if bytes.len() > MAX_IMAGE_BYTES {
-            return Err(self.backend(
-                &call,
-                None,
-                format!("image of {} bytes is over the limit", bytes.len()),
-            ));
-        }
+        let (bytes, content_type) = self.get_bytes(&call, "image/*", MAX_IMAGE_BYTES).await?;
         match content_type {
             Some(content_type) if content_type.starts_with("image/") => Ok(Image {
                 bytes,

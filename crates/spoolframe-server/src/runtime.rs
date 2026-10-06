@@ -590,7 +590,7 @@ mod tests {
             store,
             Arc::new(LiveCatalog::default()),
             Arc::new(spoolframe_media::Prober::new(
-                std::path::PathBuf::from("ffprobe"),
+                spoolframe_media::sandbox::Tool::unconfined("ffprobe"),
                 spoolframe_media::Prober::DEFAULT_TIMEOUT,
             )),
             rules,
@@ -618,15 +618,17 @@ mod tests {
             PreviewSources {
                 catalog: Arc::new(LiveCatalog::default()),
                 prober: Arc::new(spoolframe_media::Prober::new(
-                    "ffprobe",
+                    spoolframe_media::sandbox::Tool::unconfined("ffprobe"),
                     spoolframe_media::Prober::DEFAULT_TIMEOUT,
                 )),
                 transcoding: Arc::new(crate::transcode::Transcoding::new(
-                    Box::new(spoolframe_media::encoders::FfmpegCommand::new("ffmpeg")),
+                    Box::new(spoolframe_media::encoders::FfmpegCommand::new(
+                        spoolframe_media::sandbox::Tool::unconfined("ffmpeg"),
+                    )),
                     Default::default(),
                     dir.as_ref().join("encoder-test"),
                 )),
-                ffmpeg: "ffmpeg".into(),
+                ffmpeg: spoolframe_media::sandbox::Tool::unconfined("ffmpeg"),
                 encoding: Default::default(),
             },
         )

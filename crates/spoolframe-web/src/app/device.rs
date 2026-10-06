@@ -8,7 +8,7 @@ use spoolframe_admin_api::{DeviceSignIn, MeApiClient, UserInfo};
 
 use super::admin::sleep;
 use super::profile::{ConfirmItsYou, asks_to_confirm};
-use super::{Alert, Centered, Route, SignInForm, http, icons, now_ms, rpc};
+use super::{Alert, Centered, Notice, Route, SignInForm, http, icons, now_ms, rpc};
 use crate::approve::{self, Refused};
 use crate::logic::{ApiError, display_code};
 use crate::trust;
@@ -333,6 +333,11 @@ fn Consent(user: UserInfo, code: String, server: String, on_switch: EventHandler
                         div { class: "approve-server",
                             span { "{server} · {page_host()}" }
                             b { class: "approve-fingerprint", "{found.server_fingerprint}" }
+                        }
+                        match approve::origin(found.address.as_deref(), found.from_internet, word) {
+                            Some((line, true)) => rsx! { Notice { "{line}" } },
+                            Some((line, false)) => rsx! { p { class: "approve-who", "{line}" } },
+                            None => rsx! {},
                         }
                         p { class: "approve-who",
                             "You're signed in as " b { "{who}" } {approve::signed_in_as_tail(word)}

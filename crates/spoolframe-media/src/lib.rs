@@ -15,6 +15,7 @@ pub mod ocr;
 pub mod pgs;
 mod probe;
 pub mod roles;
+pub mod sandbox;
 pub mod vobsub;
 
 pub use probe::{ProbeError, Prober};

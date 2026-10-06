@@ -1,8 +1,6 @@
 //! VobSub tracks as ffmpeg's encoder writes them, read back cue by cue:
 //! embedded in Matroska, and as a `.idx` and `.sub` pair.
 
-use std::path::Path;
-
 use spoolframe_media::bitmap::Cue;
 use spoolframe_media::{ocr, vobsub};
 
@@ -42,7 +40,7 @@ fn assert_read_back(cues: &[Cue]) {
 async fn an_embedded_track_reads_back_at_its_times_with_its_text() {
     let tmp = scratch("embedded").await;
     let movie = samples::movie(tmp.as_ref(), "movie.mkv", "dvdsub", &CUES);
-    let track = ocr::read_track(Path::new("ffprobe"), &movie, 1, true)
+    let track = ocr::read_track(&crate::sandbox::confined("ffprobe"), &movie, 1, true)
         .await
         .unwrap();
     assert!(
@@ -56,7 +54,7 @@ async fn an_embedded_track_reads_back_at_its_times_with_its_text() {
 async fn a_pair_beside_the_film_reads_back_at_its_times_with_its_text() {
     let tmp = scratch("pair").await;
     let idx = samples::vobsub_pair(tmp.as_ref(), &CUES);
-    let track = ocr::read_track(Path::new("ffprobe"), &idx, 0, false)
+    let track = ocr::read_track(&crate::sandbox::confined("ffprobe"), &idx, 0, false)
         .await
         .unwrap();
     assert_read_back(&vobsub::cues(&track.extradata, &track.packets).unwrap());

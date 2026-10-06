@@ -164,6 +164,31 @@ async fn a_player_gets_previews_and_finds_the_frame_for_a_time_on_its_sheet() {
     server.stop().await;
 }
 
+/// PX-09 finding 25 (B-9): a sheet's id is all it took to fetch it, for
+/// as long as the cache kept it. Now a sheet is served only while its
+/// film still is: here the catalog no longer finds it, as when its
+/// library stops being served, and the sheet a client was told of is
+/// not found.
+#[tokio::test]
+async fn a_sheet_is_not_served_once_its_film_is_not() {
+    let (server, client, session) = ready("sheet-unserved", making()).await;
+    tiny_film(&server, 60, "libx264");
+    let previews = made(&client, &session).await;
+    let sheet = previews.sheets[0].clone();
+    let (served, _) = client
+        .artwork(&session, sheet.clone(), ArtworkSize::Original)
+        .await;
+    assert!(matches!(served, ArtworkResponse::Ok(_)), "{served:?}");
+    std::fs::rename(&server.media, server.media.with_extension("gone")).unwrap();
+    let (refused, _) = client.artwork(&session, sheet, ArtworkSize::Original).await;
+    assert!(
+        matches!(refused, ArtworkResponse::Err(Error::NotFound { .. })),
+        "{refused:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn a_server_that_makes_none_says_so() {
     let (server, client, session) = ready(

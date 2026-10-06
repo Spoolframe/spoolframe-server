@@ -11,6 +11,7 @@ use easy_ffprobe::FfProbe;
 use crate::descriptor::{MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream};
 use crate::external;
 use crate::roles;
+use crate::sandbox::{Jail, Limits, Tool};
 use spoolframe_types::SubtitleRole;
 
 /// Why a file could not be described. A probe never answers a failure
@@ -57,7 +58,7 @@ struct Stamp {
 /// its file changes.
 #[derive(Debug)]
 pub struct Prober {
-    ffprobe: PathBuf,
+    ffprobe: Tool,
     timeout: Duration,
     cache: Mutex<HashMap<PathBuf, (Stamp, Arc<MediaDescriptor>)>>,
     keyframes: Mutex<HashMap<PathBuf, (Stamp, Keyframes)>>,
@@ -75,10 +76,10 @@ impl Prober {
     /// media may be on a network mount that has to spin up.
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// A prober running `ffprobe` (a path, or a name looked up in `PATH`).
-    pub fn new(ffprobe: impl Into<PathBuf>, timeout: Duration) -> Self {
+    /// A prober running `ffprobe`.
+    pub fn new(ffprobe: Tool, timeout: Duration) -> Self {
         Self {
-            ffprobe: ffprobe.into(),
+            ffprobe,
             timeout,
             cache: Mutex::new(HashMap::new()),
             keyframes: Mutex::new(HashMap::new()),
@@ -172,7 +173,7 @@ impl Prober {
         {
             return Ok(times.clone());
         }
-        let mut cmd = tokio::process::Command::new(&self.ffprobe);
+        let mut cmd = self.command(path)?;
         cmd.args(["-v", "error", "-select_streams", "v:0"])
             .args([
                 "-show_entries",
@@ -193,7 +194,7 @@ impl Prober {
             }
             Ok(Err(source)) => {
                 return Err(ProbeError::Spawn {
-                    ffprobe: self.ffprobe.clone(),
+                    ffprobe: self.ffprobe.program().to_owned(),
                     source,
                 });
             }
@@ -214,8 +215,26 @@ impl Prober {
         Ok(times)
     }
 
+    /// ffprobe confined to `path`: a VobSub `.idx` with its `.sub`, which
+    /// ffmpeg opens by the `.idx`'s name.
+    fn command(&self, path: &Path) -> Result<crate::sandbox::Command, ProbeError> {
+        let mut jail = Jail::new(Limits::PROBE).input(path);
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("idx"))
+        {
+            jail = jail.input(path.with_extension("sub"));
+        }
+        self.ffprobe
+            .command(&jail)
+            .map_err(|source| ProbeError::Spawn {
+                ffprobe: self.ffprobe.program().to_owned(),
+                source,
+            })
+    }
+
     async fn run(&self, path: &Path) -> Result<FfProbe, ProbeError> {
-        let mut cmd = tokio::process::Command::new(&self.ffprobe);
+        let mut cmd = self.command(path)?;
         cmd.args([
             "-v",
             "error",
@@ -239,7 +258,7 @@ impl Prober {
             }
             Ok(Err(source)) => {
                 return Err(ProbeError::Spawn {
-                    ffprobe: self.ffprobe.clone(),
+                    ffprobe: self.ffprobe.program().to_owned(),
                     source,
                 });
             }

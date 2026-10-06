@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use spoolframe_media::sandbox::Tool;
 use spoolframe_media::{ocr, pgs::fixture};
 use spoolframe_protocol::codec;
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
@@ -262,7 +263,7 @@ async fn track(dir: &Path, sup: &Path, codec: &str) -> spoolframe_media::bitmap:
         .arg(sup)
         .args(["-map", "0", "-map", "1", "-c:v", "libx264", "-c:s", codec])
         .arg(&movie));
-    ocr::read_track(Path::new("ffprobe"), &movie, 1, true)
+    ocr::read_track(&Tool::unconfined("ffprobe"), &movie, 1, true)
         .await
         .unwrap()
 }

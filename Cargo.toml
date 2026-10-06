@@ -131,6 +131,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Pausing and resuming encodes (SIGSTOP/SIGCONT, P2-03).
 libc = "0.2"
+seccompiler = "0.5"
 
 # Logging
 tracing = "0.1"

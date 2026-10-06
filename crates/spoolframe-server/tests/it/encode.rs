@@ -588,14 +588,18 @@ async fn an_hls_restart_that_cannot_start_leaves_the_playback_playing() {
     server.stop().await;
 }
 
+/// PX-09 finding 23: ffmpeg's last words name the server's paths (its
+/// scratch directory, the playback's handle, the nix store). They go to
+/// the log and the admin's playback page (`playback_debug`), not to the
+/// client, which is told the conversion failed.
 #[tokio::test]
-async fn a_failed_encode_fails_its_reads_with_ffmpeg_s_reason() {
+async fn a_failed_encode_fails_its_reads_without_ffmpeg_s_words() {
     let dir = fresh_dir("encode-failed").await;
     std::fs::create_dir_all(&dir).unwrap();
     let stub = dir.join("failing-ffmpeg");
     crate::support::write_script(
         &stub,
-        "#!/bin/sh\necho 'input: Invalid data found when processing input' >&2\nexit 1\n",
+        "#!/bin/sh\necho '/var/cache/spoolframe/transcode/spoolframe-jobs/3f2a/input: Invalid data found when processing input' >&2\nexit 1\n",
     );
     let server = TestServer::start_with(
         dir,
@@ -618,9 +622,43 @@ async fn a_failed_encode_fails_its_reads_with_ffmpeg_s_reason() {
     assert_eq!(
         response,
         MediaReadResponse::Err(Error::PlaybackFailed {
-            reason: "input: Invalid data found when processing input".into()
+            reason: spoolframe_server::encode::job::FFMPEG_FAILED.into()
         })
     );
+    client.close().await;
+    server.stop().await;
+}
+
+/// Nor does a conversion that cannot start say where the server keeps
+/// ffmpeg.
+#[tokio::test]
+async fn a_conversion_that_cannot_start_does_not_name_the_server_s_paths() {
+    let dir = fresh_dir("encode-no-ffmpeg").await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let missing = dir.join("no-such-ffmpeg");
+    let server = TestServer::start_with(
+        dir,
+        ServerOptions {
+            real_media: true,
+            ffmpeg: missing,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_media(4, "libx264", "ac3");
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client
+        .hello_with(None, Some(progressive_capabilities()))
+        .await;
+    let session = client.login("alice", "correct horse").await;
+    match start(&client, &session, None).await {
+        Response::Err(Error::PlaybackFailed { reason }) => {
+            assert!(!reason.contains('/'), "{reason}");
+            assert!(!reason.contains("no-such-ffmpeg"), "{reason}");
+        }
+        other => panic!("started without ffmpeg: {other:?}"),
+    }
     client.close().await;
     server.stop().await;
 }

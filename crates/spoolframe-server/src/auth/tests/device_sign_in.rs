@@ -47,6 +47,7 @@ impl Approvals {
         self.auth
             .sign_ins()
             .begin(Waiting {
+                address: None,
                 endpoint: "tv".into(),
                 device_name: Some("Living room TV".into()),
                 client_name: "test".into(),

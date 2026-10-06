@@ -402,6 +402,13 @@ pub struct DeviceSignIn {
     /// yes. Always known: a code is pending only once a device reached the
     /// server's endpoint.
     pub server_fingerprint: String,
+    /// Where the device's request came from, as the server saw it: its IP
+    /// address (PX-09 finding 27). `None` if the server could not tell.
+    pub address: Option<String>,
+    /// That address is a public one, not a home, office or VPN network's:
+    /// a device far from the approver, which is what a sign-in link sent
+    /// to someone else (device-code phishing) looks like.
+    pub from_internet: bool,
 }
 
 /// What the server is and can do, for an admin.

@@ -65,11 +65,17 @@ pub struct Admission {
     /// How long a stream's kind byte and first frame may take to arrive
     /// before the stream is reset.
     pub first_frame: Duration,
+    /// How long a resource stream (media, artwork) may wait for its
+    /// reader to take any more before it is reset (PX-09 finding 14).
+    pub stalled_read: Duration,
 }
 
 impl Admission {
     pub const DEFAULT_MAX_STRANGERS: usize = 64;
     pub const DEFAULT_FIRST_FRAME: Duration = Duration::from_secs(10);
+    /// Long enough for a player paused with a read under way: it takes
+    /// what is sent as it plays on.
+    pub const DEFAULT_STALLED_READ: Duration = Duration::from_secs(120);
 }
 
 impl Default for Admission {
@@ -77,6 +83,7 @@ impl Default for Admission {
         Self {
             max_strangers: Self::DEFAULT_MAX_STRANGERS,
             first_frame: Self::DEFAULT_FIRST_FRAME,
+            stalled_read: Self::DEFAULT_STALLED_READ,
         }
     }
 }

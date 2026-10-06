@@ -296,8 +296,14 @@ impl Passkeys {
     /// The relying party for browsers coming from `origins`, on the server
     /// whose id is `server_id`.
     pub fn new(origins: &Origins, server_id: &ServerId) -> Self {
+        Self::at(origins, server_id, None)
+    }
+
+    /// As [`Passkeys::new`], for the admin listener on `port`: without a
+    /// public URL, a browser's page is `http://localhost:<port>`.
+    pub fn at(origins: &Origins, server_id: &ServerId, port: Option<u16>) -> Self {
         Self {
-            party: relying_party(origins),
+            party: relying_party(origins, port),
             app_rp_id: server_id.rp_id(),
             registrations: Mutex::default(),
             sign_ins: Mutex::default(),
@@ -552,13 +558,19 @@ impl Passkeys {
     }
 }
 
-/// The relying party for `origins`, or why the server cannot be one.
-fn relying_party(origins: &Origins) -> Result<RelyingParty, String> {
-    let (origin, any_port) = match origins {
+/// The relying party for `origins`, with the admin listener on `port`,
+/// or why the server cannot be one.
+fn relying_party(origins: &Origins, port: Option<u16>) -> Result<RelyingParty, String> {
+    let (origin, any_port) = match (origins, port) {
         // On the listener's own host a browser has a secure context only
-        // as `localhost`, at whatever port it or a tunnel has.
-        Origins::SameHost => (format!("http://{LOCALHOST}"), true),
-        Origins::Exactly(origin) => (origin.clone(), false),
+        // as `localhost`, and its page is at the listener's port (PX-09
+        // finding 28): taking any port let a page on another localhost
+        // port (a dev server, another app) have a passkey sign for this
+        // relying party and relay it here. A tunnel keeps the port.
+        (Origins::SameHost, Some(port)) => (format!("http://{LOCALHOST}:{port}"), false),
+        // Its port not known (tests that bind port 0): any.
+        (Origins::SameHost, None) => (format!("http://{LOCALHOST}"), true),
+        (Origins::Exactly(origin), _) => (origin.clone(), false),
     };
     let url = Url::parse(&origin).map_err(|e| format!("{origin:?} is not a URL: {e}"))?;
     let Some(rp_id) = url.domain() else {

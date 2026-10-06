@@ -99,12 +99,12 @@ async fn a_pgs_track_reads_back_as_its_text_at_its_times() {
         ],
     );
     let sup = dir.join("extracted.sup");
-    ocr::extract_sup(Path::new("ffmpeg"), &movie, 1, &sup)
+    ocr::extract_sup(&crate::sandbox::confined("ffmpeg"), &movie, 1, &sup)
         .await
         .unwrap();
     let cues = pgs::cues(&std::fs::read(&sup).unwrap()).unwrap();
 
-    let ocr = Ocr::detect(Path::new("tesseract")).await;
+    let ocr = Ocr::detect(&crate::sandbox::confined("tesseract")).await;
     let language = ocr
         .language_for(Some("eng"))
         .expect("the dev shell has English data");
@@ -139,7 +139,7 @@ const SHOWN: [samples::Shown; 2] = [
 
 /// The text tesseract reads in `cues`, with their times.
 async fn read(cues: &[spoolframe_media::bitmap::Cue], dir: &Path) -> Vec<(u64, u64, String)> {
-    let ocr = Ocr::detect(Path::new("tesseract")).await;
+    let ocr = Ocr::detect(&crate::sandbox::confined("tesseract")).await;
     let texts = ocr
         .recognise(cues, "eng", &dir.join("work"), 2, &|_| {})
         .await
@@ -164,9 +164,14 @@ async fn vobsub_tracks_read_back_as_their_text_at_their_times() {
     let movie = samples::movie(dir, "movie.mkv", "dvdsub", &SHOWN);
     let idx = samples::vobsub_pair(dir, &SHOWN);
     for (input, index, from_start) in [(&movie, 1, true), (&idx, 0, false)] {
-        let track = ocr::read_track(Path::new("ffprobe"), input, index, from_start)
-            .await
-            .unwrap();
+        let track = ocr::read_track(
+            &crate::sandbox::confined("ffprobe"),
+            input,
+            index,
+            from_start,
+        )
+        .await
+        .unwrap();
         let cues = vobsub::cues(&track.extradata, &track.packets).unwrap();
         assert_eq!(read(&cues, dir).await, expected(), "{}", input.display());
     }
@@ -178,7 +183,7 @@ async fn dvb_tracks_read_back_as_their_text_at_their_times() {
     let dir = tmp.as_ref();
     for name in ["movie.mkv", "movie.ts"] {
         let movie = samples::movie(dir, name, "dvbsub", &SHOWN);
-        let track = ocr::read_track(Path::new("ffprobe"), &movie, 1, true)
+        let track = ocr::read_track(&crate::sandbox::confined("ffprobe"), &movie, 1, true)
             .await
             .unwrap();
         let cues = dvb::cues(&track.packets);
@@ -204,7 +209,7 @@ async fn more_cues_than_one_run_takes_come_back_in_order() {
         })
         .collect();
     let cues = pgs::cues(&fixture::sup(&fixtures, 65_000)).unwrap();
-    let ocr = Ocr::detect(Path::new("tesseract")).await;
+    let ocr = Ocr::detect(&crate::sandbox::confined("tesseract")).await;
     let texts = ocr
         .recognise(&cues, "eng", &dir.join("work"), 2, &|_| {})
         .await
@@ -215,7 +220,7 @@ async fn more_cues_than_one_run_takes_come_back_in_order() {
 
 #[tokio::test]
 async fn without_tesseract_ocr_is_off() {
-    let ocr = Ocr::detect(Path::new("/nonexistent/tesseract")).await;
+    let ocr = Ocr::detect(&crate::sandbox::confined("/nonexistent/tesseract")).await;
     assert!(ocr.languages().is_empty());
     assert_eq!(ocr.language_for(None), None);
 }
@@ -225,7 +230,7 @@ async fn a_language_without_data_fails_with_tesseract_s_reason() {
     let tmp = scratch("no-data").await;
     let dir = tmp.as_ref();
     let cues = pgs::cues(&fixture::sup(&[shown(0, 1_000, "hi")], 65_000)).unwrap();
-    let ocr = Ocr::detect(Path::new("tesseract")).await;
+    let ocr = Ocr::detect(&crate::sandbox::confined("tesseract")).await;
     let err = ocr
         .recognise(&cues, "xyz", &dir.join("work"), 1, &|_| {})
         .await
@@ -287,7 +292,7 @@ async fn subrip_ass_and_mov_text_become_webvtt_with_the_same_times() {
     for (input, index) in [(&srt, 0), (&ass, 0), (&mp4, 1)] {
         let out = dir.join("out.vtt");
         ocr::convert_text(
-            Path::new("ffmpeg"),
+            &crate::sandbox::confined("ffmpeg"),
             input,
             index,
             SubtitleFormat::WebVtt,

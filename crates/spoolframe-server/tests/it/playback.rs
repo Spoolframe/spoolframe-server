@@ -796,3 +796,58 @@ async fn progress_rejects_old_sequences_superseded_and_stopped_handles() {
     client.close().await;
     server.stop().await;
 }
+
+/// PX-09 finding 14 (C-4): a read whose reader took nothing kept its
+/// file open, and what was waiting to be sent, for as long as its
+/// connection lived, so a client could pin as many as it could open
+/// streams. One whose reader takes nothing for `network.stalled_read_secs`
+/// is reset.
+#[tokio::test]
+async fn a_read_nobody_takes_is_reset() {
+    use spoolframe_protocol::codec::{read_frame, write_frame};
+    use spoolframe_protocol::resource::{ResourceRequest, ResourceResponse};
+    use spoolframe_protocol::{MediaRead, streams::bi};
+    use tokio::io::AsyncWriteExt as _;
+
+    let server = TestServer::start_with(
+        support::fresh_dir("read-unread").await,
+        support::ServerOptions {
+            admission: spoolframe_server::admission::Admission {
+                stalled_read: Duration::from_secs(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client.hello_with(None, Some(mkv_capabilities())).await;
+    let session = client.login("alice", "correct horse").await;
+    server.write_media(16 << 20);
+    let (handle, size) = started(&client, &session).await;
+    let revision = client.revision(&session, &handle).await.unwrap();
+    let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+    send.write_u8(bi::RESOURCE).await.unwrap();
+    let request = ResourceRequest::Media {
+        request: MediaRead {
+            session: session.clone(),
+            handle,
+            offset: 0,
+            length: size,
+            epoch: 0,
+            segment: None,
+        },
+        revision,
+    };
+    write_frame(&mut send, &request).await.unwrap();
+    send.finish().unwrap();
+    let ready: ResourceResponse = read_frame(&mut recv).await.unwrap();
+    assert!(matches!(ready, ResourceResponse::Ready { .. }), "{ready:?}");
+    // Read nothing for a while, then all of it.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let rest = recv.read_to_end(32 << 20).await;
+    assert!(rest.is_err(), "read whole: {} bytes", rest.unwrap().len());
+    client.close().await;
+    server.stop().await;
+}

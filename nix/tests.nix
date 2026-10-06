@@ -5,7 +5,8 @@
 # listens on its UDP port, finds only software encoders without a GPU,
 # reads subtitles with the tesseract languages it was given, and keeps its
 # key over a restart, all under the unit's sandbox, which
-# `systemd-analyze security` scores. `fresh`, the module with nothing but
+# `systemd-analyze security` scores; ffmpeg and tesseract run in a
+# bubblewrap sandbox of their own inside it. `fresh`, the module with nothing but
 # `enable`: not set up, its web UI answering on loopback only, insecure
 # cookies locked off, its state where the module says and its own user's
 # alone, and the firewall opening none of its ports (PX-11).
@@ -90,6 +91,9 @@ pkgs.testers.runNixOSTest {
     # PX-11 findings 32 and 33: loopback, and no insecure cookies.
     assert 'admin.listen = "127.0.0.1:7421";  # config file, locked' in shown, shown
     assert "admin.insecure_cookies = false;  # config file, locked" in shown, shown
+    # PX-11 finding 34: the media tools confined, or no server.
+    assert 'media.sandbox = "required";  # config file, locked' in shown, shown
+    fresh.wait_until_succeeds("journalctl -u spoolframe.service | grep -q 'media tools run confined'")
     # Its state where the module says, the service's own.
     fresh.succeed("test -s /var/lib/spoolframe/endpoint.key")
     fresh.succeed("test -s /var/lib/spoolframe/spoolframe.db")
@@ -101,7 +105,10 @@ pkgs.testers.runNixOSTest {
     for path in ["cache", "cache/artwork", "cache/previews"]:
         mode = fresh.succeed(f"stat -c %a /var/lib/spoolframe/{path}").strip()
         assert mode == "700", f"{path}: {mode}"
-    endpoint = fresh.succeed("spoolframe id").strip()
+    # `spoolframe id` prints the endpoint id and the server id, a line each.
+    ids = re.search(r"endpoint id: (\S+)", fresh.succeed("spoolframe id"))
+    assert ids is not None
+    endpoint = ids.group(1)
     assert re.search(f"endpoint_id={endpoint}", fresh.succeed("journalctl -u spoolframe.service")), endpoint
     # Without openFirewall nothing of ours is opened, Plex's answers
     # included (PX-11 finding 36).
@@ -128,6 +135,13 @@ pkgs.testers.runNixOSTest {
     server.succeed(f"printf 'alice-pw\n' | {admin} spoolframe user add alice --password-stdin")
     users = server.succeed(f"{admin} spoolframe user list")
     assert "alice" in users, users
+
+    # PX-11 finding 34: bubblewrap works inside the unit, so the encoder
+    # test and tesseract below ran confined; had it not, the service
+    # would not have started.
+    assert "media tools run confined" in journal(), journal()
+    assert "MEDIA TOOLS RUN UNCONFINED" not in journal()
+    print(server.succeed("systemctl show spoolframe.service -p RestrictNamespaces"))
 
     # No GPU in the VM: detection finds software encoders only.
     server.wait_until_succeeds("journalctl -u spoolframe.service | grep -q 'transcoding'")
@@ -168,20 +182,21 @@ pkgs.testers.runNixOSTest {
     # Its proxy is named: no warning about one that is not (PX-11 38).
     assert "trusted_proxies is empty" not in journal()
 
-    # PX-11 finding 34: the unit's sandbox, as systemd scores it (1.6 when
-    # this was written; at most 2.0, out of 10, passes). ffmpeg
-    # (the encoder test at start) and tesseract (its languages) ran
-    # under it above.
+    # PX-11 finding 34: the unit's sandbox, as systemd scores it (1.6
+    # when this was written; 2.5 once the media tools' bubblewrap needed
+    # six namespaces, the mount calls, capset and all of /proc; at most
+    # 2.5, out of 10, passes). ffmpeg (the encoder test at start) and
+    # tesseract (its languages) ran under it above, each confined.
     props = server.succeed(
         "systemctl show spoolframe.service -p UMask -p TasksMax -p MemoryMax -p MemoryHigh "
         "-p ProtectHome -p ProtectProc -p ProcSubset -p SystemCallArchitectures"
     )
     for want in ["UMask=0077", "TasksMax=4096", "MemoryMax=8589934592", "MemoryHigh=6442450944",
-                 "ProtectHome=yes", "ProtectProc=invisible", "ProcSubset=pid",
+                 "ProtectHome=yes", "ProtectProc=invisible", "ProcSubset=all",
                  "SystemCallArchitectures=native"]:
         assert want in props, f"{want}: {props}"
     exposure = server.succeed("systemd-analyze security spoolframe.service --no-pager | tail -n 1")
     print(exposure)
-    server.succeed("systemd-analyze security --threshold=20 spoolframe.service --no-pager")
+    server.succeed("systemd-analyze security --threshold=25 spoolframe.service --no-pager")
   '';
 }

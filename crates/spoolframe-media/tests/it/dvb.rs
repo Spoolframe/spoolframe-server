@@ -1,8 +1,6 @@
 //! DVB subtitle tracks as ffmpeg's encoder writes them, read back cue by
 //! cue: in Matroska, and in MPEG-TS, whose clock does not start at 0.
 
-use std::path::Path;
-
 use spoolframe_media::{dvb, ocr};
 
 use crate::samples::{self, Shown};
@@ -19,7 +17,7 @@ async fn scratch(test: &str) -> spoolframe_test_dir::TestDir {
 async fn assert_reads_back(name: &str) {
     let tmp = scratch(name).await;
     let movie = samples::movie(tmp.as_ref(), name, "dvbsub", &CUES);
-    let track = ocr::read_track(Path::new("ffprobe"), &movie, 1, true)
+    let track = ocr::read_track(&crate::sandbox::confined("ffprobe"), &movie, 1, true)
         .await
         .unwrap();
     let cues = dvb::cues(&track.packets);

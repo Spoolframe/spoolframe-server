@@ -19,7 +19,7 @@ use spoolframe_types::{Delivery, SubtitleFormat};
 
 use self::args::{EncodeSpec, Output, ffmpeg_args};
 use self::hls::Segments;
-use self::job::{EncodeJob, JobError, Jobs, Slot, Written};
+use self::job::{EncodeJob, JobError, Jobs, Run, Slot, Written};
 pub use self::job::{Encoding, EncodingGuard};
 
 /// What the server allows encodes (`transcode { … }`).
@@ -463,9 +463,28 @@ fn spawn(
         0
     };
     let start_ms = start.map_or(0, |s| s.as_millis() as u64);
+    // ffmpeg reads the job's links (PX-11 finding 34): the conversion's
+    // directory, and the files they lead to, bound in confined.
+    let vobsub_pictures = sidecar.map(|s| s.with_extension("sub"));
+    let inputs = [Some(input), sidecar, vobsub_pictures.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|link| std::fs::read_link(link).ok())
+        .collect();
+    let gpu = match video {
+        Some(ConvertedVideo::Encode { codec, .. }) => encoders
+            .video_encoder(codec)
+            .is_some_and(|e| e.hardware.is_some()),
+        _ => false,
+    };
     jobs.start(
         job_dir,
-        args,
+        Run {
+            args,
+            inputs,
+            reads: vec![dir.to_path_buf()],
+            gpu,
+        },
         written,
         encodes(video, audio),
         epoch,

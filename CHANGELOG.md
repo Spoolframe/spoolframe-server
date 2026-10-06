@@ -2433,3 +2433,102 @@
   before a field existed still load: the server fills in the defaults
   when it reads a row. Device-local files (the SDK's saved servers and
   sessions) keep their defaults.
+- ffmpeg, ffprobe and tesseract run in a sandbox of their own (PX-11
+  finding 34). The new `media.sandbox` setting is `required`, `auto` (the
+  server's default) or `off`; `media.bwrap` names bubblewrap (`bwrap` on
+  `PATH` by default).
+  - Confined, each run is in a bubblewrap sandbox: new user, mount, PID,
+    network, IPC and UTS namespaces, so no network at all; a read-only
+    root with only the system's programs and libraries in it; no state
+    directory, `/proc`, `/tmp` or `/home`. Each input file (the film, a
+    subtitle file beside it) is opened by the server and bound in by its
+    file descriptor, symlinks followed, and refused if it leads into the
+    state directory or systemd's credentials. The job's own directory is
+    the one writable path. A seccomp filter refuses new processes (only
+    threads), sockets other than Unix ones, and `ptrace`, mounts,
+    namespaces, keyrings, `bpf`, `io_uring` and the like. A run that may
+    use the GPU also gets its device nodes, `/sys` and
+    `/run/opengl-driver`.
+  - `required` stops the server at start when bubblewrap cannot confine a
+    program; `auto` then runs the tools unconfined and logs an error
+    saying so; `off` never confines them, with a warning.
+  - Confined or not, a run's environment is cleared to a short list
+    (`PATH`, the GPU drivers' and tesseract's variables), with `HOME` and
+    `TMPDIR` in its own directory. It gets limits it cannot raise:
+    memory (`RLIMIT_DATA`, which grows with the core count: an encode
+    2 GiB and 512 MiB a core), CPU time, the largest file it may write,
+    and no core dumps. It runs in a process group of its own, and an
+    encode is paused, resumed and stopped as a group.
+  - `media.*` settings now need a recent sign-in, as `admin.*` and
+    `auth.*` do.
+  - The nix package puts bubblewrap on the server's `PATH`. The NixOS
+    module has a new `media.sandbox` option, `required` by default; with
+    it on, the unit allows the user, mount, PID, network, IPC and UTS
+    namespaces and the `@mount` and `capset` calls, and sees all of
+    `/proc` (`ProcSubset=all`), which bubblewrap needs. The dev shell has
+    bubblewrap, and the tests' real ffmpeg, ffprobe and tesseract run
+    confined.
+  - An encode that ended at once could lose its last progress lines, and
+    so its output time; they are read after it ends now.
+- A client no longer sees ffmpeg's own words when a conversion fails
+  (PX-09 finding 23): they named the server's scratch directory, the
+  playback's handle and where ffmpeg is installed. Its reads get
+  `PlaybackFailed` with "the conversion failed on the server", and one
+  that cannot run ffmpeg at all "the conversion could not be started on
+  the server". The server's own reasons (stalled, scratch space full,
+  ended by an admin) are sent as before. ffmpeg's last lines stay in the
+  log and on the admin's playback page.
+- The setup code is no longer sent to the OTLP collector (PX-09 finding
+  20): whoever read the logs there could set up a server that has no
+  users yet. It is still logged at warn to stderr, the journal and the
+  Logs page, under the target `spoolframe::local_only`, which the export
+  never takes.
+- Without `admin.public_url`, the web UI and the admin API take a browser
+  only at the listener's address or `localhost` (PX-09 finding 22). A page
+  at a name made to resolve to the listener (DNS rebinding) sent that name
+  as both `Host` and `Origin`, which passed. Reaching the web UI by a name
+  now needs `admin.public_url`; the refusal's log line says so.
+- Wrong passwords from elsewhere no longer lock a user out where they
+  signed in before (PX-09 finding 24). Five failures for a name still
+  refuse it for 15 minutes from any new place, and a guessing source is
+  still refused for every name; but the last 16 places (endpoints,
+  addresses) a right password, passkey or PIN came from are not refused
+  for the name's own failures. The setup code is now limited per caller:
+  five wrong codes from one place no longer keep the owner from setting
+  the server up.
+- A preview sheet is served only while its film is (PX-09 finding 25).
+  Its id was enough to fetch it for as long as the cache kept it, after
+  the film's library stopped being served too. The server now checks the
+  catalog still has the item the previews were last asked for, and that
+  its file is the one they were made of. After a restart a client asks
+  for the previews again before their sheets, as players do.
+- A PMS's answer is read only up to its limit (PX-09 finding 26): 64 MiB
+  for JSON, which had none, 256 MiB for a preview index and 32 MiB for an
+  image, refused as soon as it passes it. Before, the whole answer was read
+  first, so a malicious PMS could make the server hold whatever it sent
+  in 15 seconds. A preview sheet's first tile must be at most 320 pixels
+  wide and twice as tall as wide: its height is the film's shape, which a
+  crafted file sets, and a sheet is ten by ten of it.
+- What one consumer can start is bounded (PX-09 finding 15, with the
+  timeouts of PX-10): at most 4 text subtitle conversions run at once,
+  and at most 64 subtitle tracks are being made or waiting (past that,
+  one more is "try again later", not queued); the queue of previews asked
+  for keeps the newest 16; a user can begin 5 Plex sign-ins in 15
+  minutes (`plexLinkBegin` then answers `RATE_LIMITED` without asking
+  plex.tv), and keeps at most 5 PINs.
+- A media or artwork stream whose reader takes nothing for
+  `network.stalled_read_secs` (new, 120 by default) is reset (PX-09
+  finding 14). It held its file open, and what waited to be sent, for as
+  long as the connection lived, so one client could pin as many as it
+  could open streams.
+- Without `admin.public_url`, web passkeys take only the listener's own
+  port as their origin, `http://localhost:<port>` (PX-09 finding 28). Any
+  localhost port was taken, so a page on another one (a dev server,
+  another app) could have the user's passkey sign and relay the sign-in
+  here. An SSH tunnel must keep the listener's port.
+- The web UI's device approval says where the device asked from (PX-09
+  finding 27): "The TV asked from 192.168.86.20." For a public address
+  it warns instead: the device is on the internet, not on the
+  approver's network, so approve only one you can see; a code someone
+  sent you is theirs. `deviceSignInLookup` has the new `address` and
+  `fromInternet`.

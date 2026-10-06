@@ -153,10 +153,28 @@ impl Origins {
                 let origin_host = origin
                     .strip_prefix("http://")
                     .or_else(|| origin.strip_prefix("https://"));
-                host.is_some() && origin_host == host
+                host.is_some_and(own_host) && origin_host == host
             }
         }
     }
+}
+
+/// Whether `host` (`Host`, with or without its port) can only be this
+/// listener: an address, or `localhost`. A name is anyone's DNS: a page
+/// at `rebind.example`, made to resolve to the listener, sends that name
+/// as its `Origin` and its `Host` alike (PX-09 finding 22). Reached by
+/// name, the web UI needs `admin.public_url`.
+fn own_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        // `[::1]:7421`: an IPv6 address is bracketed.
+        Some(rest) => {
+            return rest
+                .split_once(']')
+                .is_some_and(|(ip, _)| ip.parse::<std::net::Ipv6Addr>().is_ok());
+        }
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::Ipv4Addr>().is_ok()
 }
 
 /// The reverse proxies in front of the admin listener
@@ -504,7 +522,12 @@ async fn check_origin(
 ) -> Response<Body> {
     let acts = req.method() == axum::http::Method::POST || is_upgrade(req.headers());
     if acts && !origins.allow(req.headers()) {
-        tracing::warn!(origin = ?req.headers().get(header::ORIGIN), "admin request from another origin refused");
+        tracing::warn!(
+            origin = ?req.headers().get(header::ORIGIN),
+            host = ?req.headers().get(header::HOST),
+            "admin request from another origin refused (without admin.public_url, only the \
+             listener's address or localhost is its own)"
+        );
         return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
     }
     // Allowed just now: the web UI's own origin, for the methods.
@@ -1101,6 +1124,29 @@ mod tests {
         assert!(!origins.allow(&port));
         // Not a browser.
         assert!(origins.allow(&headers(&[(header::HOST, "localhost:7421")])));
+    }
+
+    /// PX-09 finding 22 (A-9, C-10): a page at a name the attacker's DNS
+    /// points at the listener has that name for its origin and its `Host`
+    /// alike. Without a public URL only an address or `localhost` is the
+    /// listener's own: a name is anyone's.
+    #[test]
+    fn same_host_takes_an_address_or_localhost_but_not_a_name() {
+        let origins = Origins::SameHost;
+        let at = |host: &str| {
+            origins.allow(&headers(&[
+                (header::HOST, host),
+                (header::ORIGIN, &format!("http://{host}")),
+            ]))
+        };
+        assert!(!at("rebind.example:7421"));
+        assert!(!at("rebind.example"));
+        assert!(!at("127.0.0.1.rebind.example:7421"));
+        assert!(at("127.0.0.1:7421"));
+        assert!(at("10.10.0.6:7431"));
+        assert!(at("[::1]:7421"));
+        assert!(at("localhost:7421"));
+        assert!(at("localhost"));
     }
 
     #[test]

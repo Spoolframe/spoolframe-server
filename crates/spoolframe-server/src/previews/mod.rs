@@ -108,6 +108,9 @@ struct Making {
     paused: bool,
 }
 
+/// Items queued as played or asked for at once (PX-09 finding 15).
+const MAX_URGENT: usize = 16;
+
 #[derive(Debug, Default)]
 struct Queue {
     /// Played or asked for: one at a time, encodes or not.
@@ -131,15 +134,27 @@ impl Queue {
             if urgent && let Some(at) = self.ahead.iter().position(|q| q == id) {
                 // Asked for while waiting to be made ahead: now.
                 self.ahead.remove(at);
-                self.urgent.push_back(id.clone());
+                self.push_urgent(id);
             }
             return;
         }
         self.queued.insert(id.clone());
         if urgent {
-            self.urgent.push_back(id.clone());
+            self.push_urgent(id);
         } else {
             self.ahead.push_back(id.clone());
+        }
+    }
+
+    /// `id` played or asked for, after the others. Past [`MAX_URGENT`] the
+    /// one asked for longest ago is dropped: every `GetPreviews` of
+    /// another item queued it, without end (PX-09 finding 15).
+    fn push_urgent(&mut self, id: &MediaId) {
+        self.urgent.push_back(id.clone());
+        while self.urgent.len() > MAX_URGENT {
+            if let Some(dropped) = self.urgent.pop_front() {
+                self.queued.remove(&dropped);
+            }
         }
     }
 
@@ -194,7 +209,7 @@ pub struct PreviewSources {
     pub prober: Arc<Prober>,
     /// The hardware decoders P2-02 found.
     pub transcoding: Arc<Transcoding>,
-    pub ffmpeg: PathBuf,
+    pub ffmpeg: spoolframe_media::sandbox::Tool,
     /// The encodes running, which previews made ahead wait for.
     pub encoding: Encoding,
 }
@@ -213,6 +228,11 @@ pub struct Previews {
     /// Sets that could not be made, by key, and why: not tried again
     /// until the file changes or the server restarts.
     failed: Mutex<HashMap<String, String>>,
+    /// The item each set was last shown for, by key (PX-09 finding 25): a
+    /// sheet is served only while that item is still in the catalog and
+    /// its file still makes the key. Empty at start: a client asks for
+    /// the previews again before it fetches their sheets.
+    shown: Mutex<HashMap<String, MediaId>>,
     /// The server is stopping: the file being made is given up between
     /// two tiles, and nothing more is made.
     stopped: AtomicBool,
@@ -281,6 +301,7 @@ impl Previews {
             queue: Mutex::default(),
             wake: Arc::default(),
             failed: Mutex::default(),
+            shown: Mutex::default(),
             stopped: AtomicBool::new(false),
             made: Counter::default(),
             failures: Counter::default(),
@@ -399,6 +420,10 @@ impl Previews {
             return Ok(PreviewState::None);
         };
         if let Some(meta) = self.cache.get(&key) {
+            self.shown
+                .lock()
+                .expect("never poisoned")
+                .insert(key.clone(), id.clone());
             return Ok(PreviewState::Ready { key, meta });
         }
         if settings.when == When::Never
@@ -449,8 +474,28 @@ impl Previews {
         })
     }
 
-    /// Sheet `n` of the set under `key`.
+    /// Sheet `n` of the set under `key`, if its item is still served
+    /// (PX-09 finding 25): the catalog still has the item a client was
+    /// last told of the set for, and its file still makes `key`. Without
+    /// that, a sheet's id was enough to fetch it for as long as the cache
+    /// kept it, after its library stopped being served too.
     pub async fn sheet(&self, key: &str, n: u32) -> Option<Vec<u8>> {
+        let shown = self
+            .shown
+            .lock()
+            .expect("never poisoned")
+            .get(key)
+            .cloned()?;
+        let still = match self.sources.catalog.media_path(&shown).await {
+            Ok(path) => self::key(&path, self.settings().interval)
+                .await
+                .is_ok_and(|now| now == key),
+            Err(_) => false,
+        };
+        if !still {
+            self.shown.lock().expect("never poisoned").remove(key);
+            return None;
+        }
         self.cache.sheet(key, n).await
     }
 

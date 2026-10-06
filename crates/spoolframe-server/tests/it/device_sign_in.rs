@@ -280,6 +280,20 @@ async fn a_tv_approved_in_a_browser_gets_a_session_as_the_web_user() {
         device.server_fingerprint,
         spoolframe_protocol::fingerprint::TEST_VECTORS[0].1
     );
+    // And where the TV asked from (PX-09 finding 27): one of this host's
+    // own addresses, whichever path the TV took, said public or not as
+    // that address is (this host may have a global IPv6 one).
+    let from: std::net::IpAddr = device.address.as_deref().unwrap().parse().unwrap();
+    assert!(
+        spoolframe_server::announce::interfaces()
+            .iter()
+            .any(|i| i.addrs.contains(&from)),
+        "{from}"
+    );
+    assert_eq!(
+        device.from_internet,
+        spoolframe_server::device_sign_in::from_internet(from)
+    );
 
     let waiting = tv_awaits(&tv, &request);
     alice.device_sign_in_approve(typed, false).await.unwrap();

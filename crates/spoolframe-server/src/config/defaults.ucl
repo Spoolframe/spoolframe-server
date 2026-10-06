@@ -104,6 +104,9 @@ network {
   # How long a request may take to arrive once a client opens a stream
   # for it. A stream that sends nothing in time is reset.
   first_frame_timeout_secs = 10;
+  # How long a media or artwork stream may wait for its reader to take
+  # any more of it. One left unread is reset: it holds a file open.
+  stalled_read_secs = 120;
   # The addresses a signed-in device is told to dial the server at. The
   # server has an address on each network interface, and container and
   # VM bridges are on that list too: no device reaches those. Told are
@@ -137,8 +140,9 @@ admin {
   # for a host whose proxy runs on the same machine.
   listen = "0.0.0.0:7421";
   # Where browsers reach the web UI through a TLS reverse proxy. Its host
-  # is what passkeys are bound to. Left out, a browser must be on the
-  # listener's own host.
+  # is what passkeys are bound to. Left out, a browser must reach the
+  # listener by its address or as localhost: a name could be anyone's
+  # (DNS rebinding).
   # public_url = "https://media.example.org";
   # The reverse proxies in front of the listener, as addresses and CIDR
   # ranges, comma-separated. Left out, no X-Forwarded-For is read.
@@ -201,6 +205,14 @@ media {
   ffmpeg = "ffmpeg";
   ffprobe = "ffprobe";
   tesseract = "tesseract";
+  # They read files anyone who can write to a library made. "required"
+  # runs each in a bubblewrap sandbox (no network, no state directory,
+  # only its own files) or refuses to start; "auto" does when bubblewrap
+  # works here, and otherwise runs them unconfined with an error in the
+  # log; "off" never confines them. Their environment is cleared and their
+  # memory, CPU time and file sizes are limited either way.
+  sandbox = "auto";
+  bwrap = "bwrap";
 }
 
 # Converting for clients that cannot play a file as it is.

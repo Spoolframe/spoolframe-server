@@ -152,7 +152,8 @@ impl PlexCatalog {
         };
         let mut call = Call::get(path).about(id);
         call.query = vec![("identifier", IDENTIFIER), ("key", key)];
-        self.get_bytes(&call, "application/json").await?;
+        self.get_bytes(&call, "application/json", crate::MAX_JSON_BYTES)
+            .await?;
         Ok(())
     }
 
@@ -167,7 +168,8 @@ impl PlexCatalog {
             ("time", &time),
             ("state", "stopped"),
         ];
-        self.get_bytes(&call, "application/json").await?;
+        self.get_bytes(&call, "application/json", crate::MAX_JSON_BYTES)
+            .await?;
         Ok(())
     }
 }

@@ -236,6 +236,52 @@ async fn a_same_host_proxy_without_trusted_proxies_is_warned_of_at_start() {
     assert!(running.stop().success());
 }
 
+/// `config` with `media { … }` added.
+fn with_media(config: &Path, media: &str) {
+    let mut text = std::fs::read_to_string(config).unwrap();
+    text.push_str(&format!("media {{ {media} }}\n"));
+    std::fs::write(config, text).unwrap();
+}
+
+/// PX-11 finding 34: with bubblewrap on PATH (the dev shell's), the media
+/// tools run confined without being asked.
+#[tokio::test]
+async fn the_media_tools_run_confined_by_default() {
+    let (_tmp, config) = config_with_state("sandbox-auto", &closed_port_url()).await;
+    let (running, log) = Running::start(&config);
+    assert!(log.contains("media tools run confined"), "{log}");
+    assert!(running.stop().success());
+}
+
+/// "required" refuses to start rather than run them unconfined.
+#[tokio::test]
+async fn a_required_sandbox_without_bubblewrap_does_not_start() {
+    let (_tmp, config) = config_with_state("sandbox-required", &closed_port_url()).await;
+    with_media(
+        &config,
+        r#"sandbox = "required"; bwrap = "/nonexistent/bwrap";"#,
+    );
+    let output = server_with(&config).output().expect("the binary runs");
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(r#"media.sandbox is "required", but /nonexistent/bwrap cannot confine"#),
+        "{stderr}"
+    );
+}
+
+/// "auto" starts unconfined where bubblewrap does not work, and says so
+/// at the error level.
+#[tokio::test]
+async fn an_auto_sandbox_without_bubblewrap_starts_and_says_the_tools_are_unconfined() {
+    let (_tmp, config) = config_with_state("sandbox-fallback", &closed_port_url()).await;
+    with_media(&config, r#"bwrap = "/nonexistent/bwrap";"#);
+    let (running, log) = Running::start(&config);
+    assert!(log.contains("MEDIA TOOLS RUN UNCONFINED"), "{log}");
+    assert!(log.contains("ERROR"), "{log}");
+    assert!(running.stop().success());
+}
+
 /// The setup code a fresh server printed in its log.
 fn setup_code(log: &str) -> String {
     let marker = "the setup code is ";

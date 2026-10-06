@@ -21,6 +21,7 @@ use tokio::sync::Semaphore;
 use spoolframe_types::SubtitleFormat;
 
 use crate::bitmap::{self, Packet, Track};
+use crate::sandbox::{Command, Jail, Limits, Tool};
 
 /// Cues per tesseract process: enough that loading the model is a small
 /// part of each run, few enough that the work spreads over every thread
@@ -79,7 +80,7 @@ pub enum OcrError {
 /// tesseract, and the languages it has data for.
 #[derive(Debug, Clone)]
 pub struct Ocr {
-    tesseract: PathBuf,
+    tesseract: Tool,
     languages: BTreeSet<String>,
 }
 
@@ -87,14 +88,14 @@ impl Ocr {
     /// No OCR: the planner never offers it.
     pub fn disabled() -> Self {
         Self {
-            tesseract: PathBuf::new(),
+            tesseract: Tool::unconfined(PathBuf::new()),
             languages: BTreeSet::new(),
         }
     }
 
     /// `tesseract` with data for `languages`, as [`Ocr::detect`] would find
     /// them.
-    pub fn new(tesseract: PathBuf, languages: impl IntoIterator<Item = String>) -> Self {
+    pub fn new(tesseract: Tool, languages: impl IntoIterator<Item = String>) -> Self {
         Self {
             tesseract,
             languages: languages.into_iter().collect(),
@@ -103,15 +104,22 @@ impl Ocr {
 
     /// Asks `tesseract` which languages it has. If it cannot be run, OCR
     /// is off, and the log says why.
-    pub async fn detect(tesseract: &Path) -> Self {
-        let mut command = tokio::process::Command::new(tesseract);
-        command.arg("--list-langs");
-        let output = run(command, "tesseract", MAX_TEXT, Duration::from_secs(30)).await;
+    pub async fn detect(tesseract: &Tool) -> Self {
+        let output = match tesseract.command(&Jail::new(Limits::OCR)) {
+            Ok(mut command) => {
+                command.arg("--list-langs");
+                run(command, "tesseract", MAX_TEXT, Duration::from_secs(30)).await
+            }
+            Err(source) => Err(OcrError::Spawn {
+                program: "tesseract".into(),
+                source,
+            }),
+        };
         let languages = match output {
             Ok(out) if out.status.success() => list_langs(&String::from_utf8_lossy(&out.stdout)),
             Ok(out) => {
                 tracing::warn!(
-                    tesseract = %tesseract.display(),
+                    tesseract = %tesseract.program().display(),
                     stderr = %String::from_utf8_lossy(&out.stderr).trim(),
                     "tesseract cannot list its languages; subtitle OCR is off"
                 );
@@ -119,7 +127,7 @@ impl Ocr {
             }
             Err(e) => {
                 tracing::warn!(
-                    tesseract = %tesseract.display(),
+                    tesseract = %tesseract.program().display(),
                     error = %e,
                     "cannot run tesseract; subtitle OCR is off"
                 );
@@ -201,14 +209,19 @@ impl Ocr {
     }
 }
 
-/// One tesseract run over a list of pictures: one page of text each.
+/// One tesseract run over a list of pictures (in the list's directory):
+/// one page of text each.
 async fn read_pages(
-    tesseract: &Path,
+    tesseract: &Tool,
     list: &Path,
     language: &str,
     expected: usize,
 ) -> Result<Vec<String>, OcrError> {
-    let mut command = tokio::process::Command::new(tesseract);
+    let mut jail = Jail::new(Limits::OCR);
+    if let Some(dir) = list.parent() {
+        jail = jail.reads(dir);
+    }
+    let mut command = spawnable(tesseract, &jail)?;
     command
         .arg(list)
         .arg("stdout")
@@ -238,12 +251,12 @@ async fn read_pages(
 /// Copies subtitle stream `index` (ffprobe's stream index) of `input` into
 /// a raw `.sup` file, without decoding it.
 pub async fn extract_sup(
-    ffmpeg: &Path,
+    ffmpeg: &Tool,
     input: &Path,
     index: u32,
     out: &Path,
 ) -> Result<(), OcrError> {
-    let mut command = tokio::process::Command::new(ffmpeg);
+    let mut command = spawnable(ffmpeg, &writing(Jail::new(Limits::PASS).input(input), out))?;
     command
         .args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
         .arg(input)
@@ -269,12 +282,19 @@ pub async fn extract_sup(
 /// player shows them: an MPEG-TS recording's clock starts anywhere. A
 /// subtitle file of its own already counts from the film's start.
 pub async fn read_track(
-    ffprobe: &Path,
+    ffprobe: &Tool,
     input: &Path,
     index: u32,
     from_file_start: bool,
 ) -> Result<Track, OcrError> {
-    let mut command = tokio::process::Command::new(ffprobe);
+    let mut jail = Jail::new(Limits::PROBE).input(input);
+    if input
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("idx"))
+    {
+        jail = jail.input(input.with_extension("sub"));
+    }
+    let mut command = spawnable(ffprobe, &jail)?;
     command
         .args(["-v", "error", "-select_streams", &index.to_string()])
         .args(["-show_data", "-show_entries"])
@@ -379,7 +399,7 @@ fn hexdump(text: &str) -> Vec<u8> {
 /// client takes: ASS, `mov_text` or SubRip to WebVTT, say. ASS styling is
 /// lost.
 pub async fn convert_text(
-    ffmpeg: &Path,
+    ffmpeg: &Tool,
     input: &Path,
     index: u32,
     to: SubtitleFormat,
@@ -389,7 +409,7 @@ pub async fn convert_text(
         SubtitleFormat::WebVtt => ("webvtt", "webvtt"),
         _ => ("srt", "srt"),
     };
-    let mut command = tokio::process::Command::new(ffmpeg);
+    let mut command = spawnable(ffmpeg, &writing(Jail::new(Limits::PASS).input(input), out))?;
     command
         .args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
         .arg(input)
@@ -555,6 +575,22 @@ fn tesseract_code(tag: &str) -> &str {
     }
 }
 
+/// `tool`'s command in `jail`, or why it cannot run.
+fn spawnable(tool: &Tool, jail: &Jail) -> Result<Command, OcrError> {
+    tool.command(jail).map_err(|source| OcrError::Spawn {
+        program: tool.program().display().to_string(),
+        source,
+    })
+}
+
+/// `jail`, writing to `out`'s directory.
+fn writing(jail: Jail, out: &Path) -> Jail {
+    match out.parent() {
+        Some(dir) => jail.writes(dir),
+        None => jail,
+    }
+}
+
 /// What a run wrote, and how it ended.
 struct Ran {
     status: std::process::ExitStatus,
@@ -568,7 +604,7 @@ struct Ran {
 /// [`MAX_STDERR`] bytes of stderr are kept; the rest is read and dropped,
 /// so a chatty program does not stall on a full pipe.
 async fn run(
-    mut command: tokio::process::Command,
+    mut command: Command,
     program: &str,
     max_stdout: usize,
     timeout: Duration,
@@ -641,8 +677,10 @@ fn last_line(stderr: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    fn sh(script: &str) -> tokio::process::Command {
-        let mut command = tokio::process::Command::new("sh");
+    fn sh(script: &str) -> Command {
+        let mut command = Tool::unconfined("sh")
+            .command(&Jail::new(Limits::OCR))
+            .unwrap();
         command.args(["-c", script]);
         command
     }
@@ -696,7 +734,7 @@ mod tests {
 
     fn ocr(languages: &[&str]) -> Ocr {
         Ocr {
-            tesseract: PathBuf::from("tesseract"),
+            tesseract: Tool::unconfined("tesseract"),
             languages: languages.iter().map(|l| (*l).to_owned()).collect(),
         }
     }

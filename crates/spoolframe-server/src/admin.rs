@@ -130,6 +130,17 @@ impl std::fmt::Debug for SetupCode {
     }
 }
 
+/// Says the server has no users yet, where to set it up, and the setup
+/// code, in this host's log: never in the OTLP export (PX-09 finding 20).
+pub fn log_setup_code(urls: &[String], code: &SetupCode) {
+    tracing::warn!(
+        target: crate::telemetry::LOCAL_ONLY,
+        "no users yet: open the web UI to set up this server, at {} (or register the first \
+         admin with `spoolframe-server setup`); the setup code is {code}",
+        urls.join(", ")
+    );
+}
+
 impl std::fmt::Display for SetupCode {
     /// Grouped by four for reading aloud and typing: `K7QD-M2XP-9RTB`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -647,17 +658,21 @@ impl AdminApi {
     }
 
     /// Whether `given` is the setup code, while setup can be done at all;
-    /// guesses are limited as failed logins are, under one name.
+    /// guesses are limited as failed logins are, per caller (PX-09 finding
+    /// 24): under one name for all, five wrong codes from anyone kept the
+    /// owner from setting the server up. The code is 59 random bits, so
+    /// guesses from many places at five each get nowhere.
     fn setup_code(&self, ext: &Extensions, given: &str) -> RpcResult<()> {
         let Some(code) = &self.setup_code else {
             return Err(UserError::AlreadySetUp.into());
         };
         let source = source(ext)?;
-        if let Some(retry_after) = self.auth.attempt_limited("setup", source.as_deref()) {
+        let what = format!("setup@{}", source.as_deref().unwrap_or_default());
+        if let Some(retry_after) = self.auth.attempt_limited(&what, source.as_deref()) {
             return Err(LoginError::RateLimited { retry_after }.into());
         }
         if !code.matches(given) {
-            self.auth.attempt_failed("setup", source.as_deref());
+            self.auth.attempt_failed(&what, source.as_deref());
             return Err(error(
                 error_code::INVALID_SETUP_CODE,
                 "that is not the setup code in the server's log",
@@ -836,6 +851,10 @@ impl From<LinkError> for ErrorObjectOwned {
     fn from(e: LinkError) -> Self {
         match &e {
             LinkError::NotYourPin => error(error_code::INVALID_INPUT, e.to_string()),
+            LinkError::TooMany { retry_after } => LoginError::RateLimited {
+                retry_after: *retry_after,
+            }
+            .into(),
             LinkError::ByConfig => error(error_code::NOT_CONFIGURED, e.to_string()),
             LinkError::PlexTv(_) => error(error_code::UNAVAILABLE, e.to_string()),
             LinkError::Io(_) | LinkError::Users(_) => internal(e),
@@ -983,10 +1002,11 @@ fn recent(user: &ApiSessionUser) -> RpcResult<()> {
 }
 
 /// Whether a setting is one whose change could take the server over: the
-/// admin listener, its cookies, proxies and public URL (`admin.*`), and
-/// sign-in providers (`auth.*`).
+/// admin listener, its cookies, proxies and public URL (`admin.*`),
+/// sign-in providers (`auth.*`), and the programs the server runs and
+/// whether they are confined (`media.*`, PX-11 finding 34).
 fn sensitive_setting(key: &str) -> bool {
-    key.starts_with("admin.") || key.starts_with("auth.")
+    key.starts_with("admin.") || key.starts_with("auth.") || key.starts_with("media.")
 }
 
 impl AdminApi {
@@ -1624,6 +1644,10 @@ impl MeApiServer for AdminApi {
             requested_at: waiting.requested_at,
             remember: waiting.remember,
             server_fingerprint,
+            address: waiting.address.map(|ip| ip.to_canonical().to_string()),
+            from_internet: waiting
+                .address
+                .is_some_and(crate::device_sign_in::from_internet),
         })
     }
 
@@ -3318,7 +3342,7 @@ mod tests {
     fn api(auth: Auth) -> AdminApi {
         let transcoding = Transcoding::new(
             Box::new(spoolframe_media::encoders::FfmpegCommand::new(
-                "/nonexistent/ffmpeg",
+                spoolframe_media::sandbox::Tool::unconfined("/nonexistent/ffmpeg"),
             )),
             Default::default(),
             std::env::temp_dir(),
@@ -3385,6 +3409,7 @@ mod tests {
             .auth
             .sign_ins()
             .begin(crate::device_sign_in::Waiting {
+                address: None,
                 endpoint: "new-device".into(),
                 device_name: None,
                 client_name: "test".into(),

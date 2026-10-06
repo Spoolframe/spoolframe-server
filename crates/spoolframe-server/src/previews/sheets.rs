@@ -43,6 +43,13 @@ pub fn pack(tiles: &[Vec<u8>]) -> Result<Packed, String> {
     if tile_width == 0 || tile_height == 0 {
         return Err("tile 0 is empty".into());
     }
+    // Every sheet is ten by ten of these (PX-09 finding 26): the height is
+    // the film's own shape, which a crafted file sets.
+    if tile_width > TILE_WIDTH || tile_height > 2 * tile_width {
+        return Err(format!(
+            "tile 0 is {tile_width}×{tile_height}: no film is that shape"
+        ));
+    }
     let mut sheets = Vec::new();
     for (n, chunk) in tiles.chunks(PER_SHEET as usize).enumerate() {
         let mut sheet = RgbImage::new(tile_width * COLUMNS, tile_height * ROWS);
@@ -128,6 +135,18 @@ pub(crate) mod tests {
         let packed = pack(&[tile(32, 18, 0), tile(64, 48, 255)]).unwrap();
         assert_eq!((packed.tile_width, packed.tile_height), (32, 18));
         assert!(grey_at(&packed.sheets[0], 1, 32, 18) > 230);
+    }
+
+    /// PX-09 finding 26 (B-7): a sheet is ten tiles by ten of the first
+    /// tile's size, and the first tile's height is the film's own shape:
+    /// a crafted aspect ratio made a sheet of gigabytes. A tile is at most
+    /// [`TILE_WIDTH`] wide and twice as tall as it is wide.
+    #[test]
+    fn a_first_tile_of_no_film_s_shape_is_refused() {
+        assert!(pack(&[tile(32, 4000, 0)]).is_err());
+        assert!(pack(&[tile(4000, 18, 0)]).is_err());
+        // A portrait film, half as wide as it is tall, is still one.
+        assert!(pack(&[tile(32, 64, 0)]).is_ok());
     }
 
     #[test]

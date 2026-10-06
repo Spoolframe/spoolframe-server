@@ -65,7 +65,9 @@ fn s(v: impl ToString) -> String {
 fn filter_path(path: &Path) -> Result<String, String> {
     let raw = path.display().to_string();
     if raw.contains(['\'', ':', '\\', ',', ';', '[', ']']) {
-        return Err(format!("{raw}: not a plain path for a filter"));
+        // Not the path itself: the reason reaches the client (PX-09
+        // finding 23).
+        return Err("a subtitle file's path is not one ffmpeg's filters can take".into());
     }
     Ok(format!("'{raw}'"))
 }

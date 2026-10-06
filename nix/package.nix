@@ -11,6 +11,8 @@
   makeWrapper,
   ffmpeg-headless,
   tesseract,
+  # Confines ffmpeg, ffprobe and tesseract (media.sandbox, PX-11 34).
+  bubblewrap,
   # The web UI (P3-01).
   dioxus-cli,
   wasm-bindgen-cli,
@@ -76,9 +78,9 @@ in
       '';
 
       # The server runs ffprobe on every file it serves (P1-06), ffmpeg to
-      # encode (P2-02) and tesseract to read bitmap subtitles (P2-07); put
-      # them on the binary's PATH rather than relying on the host having
-      # them. nixpkgs' ffmpeg-headless already has VA-API
+      # encode (P2-02) and tesseract to read bitmap subtitles (P2-07), each
+      # in a bubblewrap sandbox (PX-11 finding 34); put them on the
+      # binary's PATH rather than relying on the host having them. nixpkgs' ffmpeg-headless already has VA-API
       # and NVENC (the CUDA driver is loaded at run time), so no override:
       # QSV is the one it lacks, and Intel GPUs encode through VA-API.
       nativeBuildInputs =
@@ -93,7 +95,7 @@ in
         ];
       postInstall = ''
         wrapProgram $out/bin/spoolframe-server \
-          --prefix PATH : ${lib.makeBinPath [ffmpeg-headless ocr]}
+          --prefix PATH : ${lib.makeBinPath [ffmpeg-headless ocr bubblewrap]}
       '';
       # Tests run in devenv/CI; the license-boundary test shells out to
       # `cargo metadata`, which the package build has no reason to do.

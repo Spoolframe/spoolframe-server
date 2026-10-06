@@ -411,3 +411,32 @@ async fn the_linked_account_lists_its_servers_and_a_server_is_added_with_its_tok
         "root-on-cabin"
     );
 }
+
+/// PX-09 finding 15 (B-8): every `plexLinkBegin` asked plex.tv for a PIN
+/// and kept it, without end, so one consumer could have the server flood
+/// plex.tv. A user begins at most a few links in 15 minutes; past them
+/// plex.tv is not asked.
+#[tokio::test]
+async fn a_user_begins_only_a_few_links_at_a_time() {
+    let tv = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/pins"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 9, "code": "q3n8vbx2kd5w7rjh0tyc4mzpf", "expiresIn": 900, "authToken": null
+        })))
+        .mount(&tv)
+        .await;
+    let (addr, _dir) = served_with("plex-link-begins", "", reaching(&tv)).await;
+    let (root, alice) = root_and_alice(addr).await;
+    for _ in 0..spoolframe_server::plex_accounts::MAX_LINK_BEGINS {
+        alice.plex_link_begin().await.unwrap();
+    }
+    let err = alice.plex_link_begin().await.unwrap_err();
+    assert_eq!(code(err), error_code::RATE_LIMITED);
+    assert_eq!(
+        tv.received_requests().await.unwrap().len(),
+        spoolframe_server::plex_accounts::MAX_LINK_BEGINS
+    );
+    // Another user's are their own.
+    root.plex_link_begin().await.unwrap();
+}

@@ -18,6 +18,8 @@ use async_trait::async_trait;
 use serde::Serialize;
 use spoolframe_types::{AudioCodec, VideoCodec};
 
+use crate::sandbox::{Jail, Limits, Tool};
+
 /// A family of hardware video encoders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,7 +63,8 @@ pub enum HardwarePolicy {
 }
 
 impl HardwarePolicy {
-    fn families(&self) -> Vec<Hardware> {
+    /// The families to try, in order: every one for `Auto`.
+    pub fn families(&self) -> Vec<Hardware> {
         match self {
             HardwarePolicy::Auto => Hardware::ALL.to_vec(),
             HardwarePolicy::Ordered(order) => order.clone(),
@@ -200,8 +203,9 @@ const AUDIO: [(AudioCodec, &str); 4] = [
 pub trait Ffmpeg: Send + Sync {
     /// The output of `ffmpeg -encoders`.
     async fn encoders(&self) -> Result<String, String>;
-    /// Whether ffmpeg with `args` exits successfully.
-    async fn succeeds(&self, args: &[String]) -> bool;
+    /// Whether ffmpeg with `args` exits successfully. What it reads and
+    /// writes is in `scratch`.
+    async fn succeeds(&self, args: &[String], scratch: &Path) -> bool;
 }
 
 /// The names in `ffmpeg -encoders` output.
@@ -289,6 +293,8 @@ fn decode_args(hardware: Hardware, sample: &Path, settings: &TranscodeSettings) 
 /// Find what works. `scratch` is a directory for the test samples the
 /// hardware decoders are tried on.
 pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: &Path) -> Encoders {
+    // Every run is confined to it, so it is there before the first.
+    let scratch_made = std::fs::create_dir_all(scratch).is_ok();
     let list = match ffmpeg.encoders().await {
         Ok(list) => list,
         Err(e) => {
@@ -314,7 +320,7 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
                 continue;
             }
             if ffmpeg
-                .succeeds(&encode_args(&name, hardware, settings))
+                .succeeds(&encode_args(&name, hardware, settings), scratch)
                 .await
             {
                 video.push(VideoEncoder {
@@ -336,17 +342,19 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
         .collect();
 
     let mut hardware_decoders = Vec::new();
-    if !families.is_empty() && std::fs::create_dir_all(scratch).is_ok() {
+    if !families.is_empty() && scratch_made {
         for (codec, _, software) in VIDEO {
             let sample = scratch.join(format!("sample-{}.mkv", codec.as_str()));
             let made = listed.contains(&software)
-                && ffmpeg.succeeds(&sample_args(software, &sample)).await;
+                && ffmpeg
+                    .succeeds(&sample_args(software, &sample), scratch)
+                    .await;
             if !made {
                 continue;
             }
             for hardware in &families {
                 if ffmpeg
-                    .succeeds(&decode_args(*hardware, &sample, settings))
+                    .succeeds(&decode_args(*hardware, &sample, settings), scratch)
                     .await
                 {
                     hardware_decoders.push(HardwareDecoder {
@@ -397,42 +405,61 @@ fn sample_args(encoder: &str, out: &Path) -> Vec<String> {
 /// The real ffmpeg.
 #[derive(Debug, Clone)]
 pub struct FfmpegCommand {
-    pub path: PathBuf,
+    pub tool: Tool,
     /// Per run. A wedged driver must not hold up start-up for long.
     pub timeout: Duration,
 }
 
 impl FfmpegCommand {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    pub fn new(tool: Tool) -> Self {
         Self {
-            path: path.into(),
+            tool,
             timeout: Duration::from_secs(15),
         }
+    }
+}
+
+/// What a test encode or decode may use: an encode's memory (less, and an
+/// encoder that works would be left out), the GPU, and its scratch
+/// directory.
+fn test_jail(scratch: Option<&Path>) -> Jail {
+    let jail = Jail::new(Limits::encode(64 << 20)).gpu(true);
+    match scratch {
+        Some(dir) => jail.writes(dir),
+        None => jail,
     }
 }
 
 #[async_trait]
 impl Ffmpeg for FfmpegCommand {
     async fn encoders(&self) -> Result<String, String> {
+        let path = self.tool.program().display();
+        let mut command = self
+            .tool
+            .command(&test_jail(None))
+            .map_err(|e| format!("cannot run {path}: {e}"))?;
         let output = tokio::time::timeout(
             self.timeout,
-            tokio::process::Command::new(&self.path)
+            command
                 .args(["-hide_banner", "-encoders"])
                 .stdin(Stdio::null())
                 .kill_on_drop(true)
                 .output(),
         )
         .await
-        .map_err(|_| format!("{} -encoders timed out", self.path.display()))?
-        .map_err(|e| format!("cannot run {}: {e}", self.path.display()))?;
+        .map_err(|_| format!("{path} -encoders timed out"))?
+        .map_err(|e| format!("cannot run {path}: {e}"))?;
         if !output.status.success() {
-            return Err(format!("{} -encoders failed", self.path.display()));
+            return Err(format!("{path} -encoders failed"));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    async fn succeeds(&self, args: &[String]) -> bool {
-        let run = tokio::process::Command::new(&self.path)
+    async fn succeeds(&self, args: &[String], scratch: &Path) -> bool {
+        let Ok(mut command) = self.tool.command(&test_jail(Some(scratch))) else {
+            return false;
+        };
+        let run = command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -478,7 +505,7 @@ mod tests {
             .unwrap())
         }
 
-        async fn succeeds(&self, args: &[String]) -> bool {
+        async fn succeeds(&self, args: &[String], _scratch: &Path) -> bool {
             self.runs.lock().unwrap().push(args.to_vec());
             // A sample encode writes a file; a decode names its hwaccel.
             let name = args

@@ -958,3 +958,51 @@ async fn a_redirect_to_another_server_does_not_carry_the_token() {
         .collect();
     assert!(carried.is_empty(), "the token reached {carried:?}");
 }
+
+/// A PMS on loopback that answers any request with a JSON body of `total`
+/// bytes, sent as fast as it is read; it counts what it got to send.
+async fn endless_pms(total: usize) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let sent = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = sent.clone();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n";
+        if socket.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+        let chunk = vec![b' '; 1 << 20];
+        let framed = [
+            format!("{:x}\r\n", chunk.len()).into_bytes(),
+            chunk,
+            b"\r\n".to_vec(),
+        ]
+        .concat();
+        while counted.load(Ordering::Relaxed) < total {
+            if socket.write_all(&framed).await.is_err() {
+                return;
+            }
+            counted.fetch_add(1 << 20, Ordering::Relaxed);
+        }
+        let _ = socket.write_all(b"0\r\n\r\n").await;
+    });
+    (url, sent)
+}
+
+/// PX-09 finding 26 (B-7): a PMS's answer was read whole before anything
+/// looked at its size, so a malicious one could make the server hold as
+/// much as it sent within the request's 15 s. Reading stops at the limit.
+#[tokio::test]
+async fn an_answer_past_the_limit_is_not_read_to_its_end() {
+    let (url, sent) = endless_pms(512 << 20).await;
+    let catalog = PlexCatalog::new(url.parse().unwrap(), None).unwrap();
+    let err = catalog.server_name().await.unwrap_err();
+    assert!(err.to_string().contains("over the limit"), "{err}");
+    let sent = sent.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(sent < 256 << 20, "the PMS got to send {} MiB", sent >> 20);
+}

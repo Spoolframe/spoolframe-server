@@ -6,8 +6,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::Prober;
-use spoolframe_media::encoders::FfmpegCommand;
+use spoolframe_media::encoders::{FfmpegCommand, Hardware};
 use spoolframe_media::ocr::Ocr;
+use spoolframe_media::sandbox::{self, Sandbox, Tool};
 use spoolframe_plex::{Failures, LibraryPaths, Scope};
 use spoolframe_server::admin::{self, Admin, CookiePolicy, SetupCode, StatusSource};
 use spoolframe_server::app_passkeys::AppPasskeys;
@@ -310,7 +311,7 @@ async fn main() -> Result<()> {
             probe(
                 &plex(&config, &layers, state_dir)?,
                 &id,
-                config.media.ffprobe(),
+                Tool::new(config.media.ffprobe(), media_sandbox(&config, state_dir)?),
             )
             .await
         }
@@ -326,7 +327,28 @@ fn plex(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result<Comp
     }
 }
 
-async fn probe(catalog: &dyn Catalog, id: &MediaId, ffprobe: PathBuf) -> Result<()> {
+/// How ffmpeg, ffprobe and tesseract run (PX-11 finding 34): confined as
+/// `media.sandbox` says, kept out of the state directory and systemd's
+/// credentials, with the GPU's device nodes when hardware may be used.
+fn media_sandbox(config: &ServerConfig, state_dir: &Path) -> Result<Sandbox> {
+    let transcode = config.transcode.settings()?;
+    let families = transcode.hardware.families();
+    let vaapi = families
+        .iter()
+        .any(|f| matches!(f, Hardware::Vaapi | Hardware::Qsv))
+        .then_some(transcode.vaapi_device.as_path());
+    let nvidia = families.contains(&Hardware::Nvenc);
+    let mut hidden = vec![state_dir.to_path_buf()];
+    hidden.extend(std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from));
+    Ok(Sandbox::new(
+        config.media.sandbox()?,
+        &config.media.bwrap(),
+        hidden,
+        sandbox::gpu_devices(vaapi, nvidia),
+    )?)
+}
+
+async fn probe(catalog: &dyn Catalog, id: &MediaId, ffprobe: Tool) -> Result<()> {
     let path = catalog.media_path(id).await?;
     let prober = Prober::new(ffprobe, Prober::DEFAULT_TIMEOUT);
     let descriptor = prober.describe(&path).await?;
@@ -372,36 +394,31 @@ async fn run(
     // left: each cache closes its own as well.
     spoolframe_server::files::private_dir(&state_dir.join("cache"))
         .with_context(|| format!("cannot prepare the caches in {}", state_dir.display()))?;
-    let prober = Arc::new(Prober::new(config.media.ffprobe(), Prober::DEFAULT_TIMEOUT));
+    let sandbox = media_sandbox(config, state_dir)?;
+    let ffmpeg = Tool::new(config.media.ffmpeg(), sandbox.clone());
+    let ffprobe = Tool::new(config.media.ffprobe(), sandbox.clone());
+    let prober = Arc::new(Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT));
     let transcoding = Arc::new(Transcoding::new(
-        Box::new(FfmpegCommand::new(config.media.ffmpeg())),
+        Box::new(FfmpegCommand::new(ffmpeg.clone())),
         config.transcode.settings()?,
         state_dir.join("cache").join("encoder-test"),
     ));
     transcode::spawn_detection(transcoding.clone());
     let limits = config.transcode.limits(state_dir)?;
-    let jobs = Arc::new(
-        Jobs::new(limits.clone(), config.media.ffmpeg()).with_context(|| {
-            format!(
-                "cannot prepare the scratch directory {}",
-                limits.scratch_dir.display()
-            )
-        })?,
-    );
+    let jobs = Arc::new(Jobs::new(limits.clone(), ffmpeg.clone()).with_context(|| {
+        format!(
+            "cannot prepare the scratch directory {}",
+            limits.scratch_dir.display()
+        )
+    })?);
     let ocr_settings = config.subtitles.ocr_settings(state_dir)?;
     let ocr = if ocr_settings.enabled {
-        Ocr::detect(&config.media.tesseract()).await
+        Ocr::detect(&Tool::new(config.media.tesseract(), sandbox.clone())).await
     } else {
         Ocr::disabled()
     };
     let subtitles = Arc::new(
-        Subtitles::new(
-            ocr,
-            config.media.ffmpeg(),
-            config.media.ffprobe(),
-            &ocr_settings,
-        )
-        .with_context(|| {
+        Subtitles::new(ocr, ffmpeg.clone(), ffprobe, &ocr_settings).with_context(|| {
             format!(
                 "cannot prepare the subtitle cache {}",
                 ocr_settings.cache_dir.display()
@@ -416,7 +433,7 @@ async fn run(
             catalog: catalog.clone(),
             prober: prober.clone(),
             transcoding: transcoding.clone(),
-            ffmpeg: config.media.ffmpeg(),
+            ffmpeg,
             encoding: jobs.encoding(),
         },
     )
@@ -488,7 +505,13 @@ async fn run(
              lets in; set admin.trusted_proxies to the proxy's address"
         );
     }
-    let passkeys = Arc::new(Passkeys::new(&admin_origins, &server_id));
+    // Without a public URL, a browser's page is the listener's own port
+    // (PX-09 finding 28).
+    let passkeys = Arc::new(Passkeys::at(
+        &admin_origins,
+        &server_id,
+        Some(admin_listen.port()).filter(|port| *port != 0),
+    ));
     match (passkeys.rp_id(), passkeys.unavailable()) {
         (Some(rp_id), _) => tracing::info!(rp_id, "passkeys are bound to this host"),
         (None, why) => tracing::warn!(why, "no passkeys in the web UI"),
@@ -588,11 +611,7 @@ async fn run(
     status.set_web_urls(urls.clone());
     tracing::info!(addr = %admin_addr, web = urls.join(" "), "admin API listening");
     if let Some(code) = setup_code {
-        tracing::warn!(
-            "no users yet: open the web UI to set up this server, at {} (or register the first \
-             admin with `spoolframe-server setup`); the setup code is {code}",
-            urls.join(", ")
-        );
+        admin::log_setup_code(&urls, &code);
     }
     let server = Server::start(
         key,

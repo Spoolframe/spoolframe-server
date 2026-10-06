@@ -436,7 +436,7 @@ impl Playback {
                 paused: job.paused(),
                 running: progress.done.is_none() && !c.ended(),
                 ended: c.ended(),
-                failed: progress.done.and_then(Result::err),
+                failed: progress.done.and_then(Result::err).map(|f| f.reason),
                 command: crate::redact::command_line(&job.command(), &[handle]),
                 stderr: job
                     .stderr()

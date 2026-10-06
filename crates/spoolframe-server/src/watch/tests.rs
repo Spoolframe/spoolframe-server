@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
+use spoolframe_media::sandbox::Tool;
 use spoolframe_protocol::HomeScreen;
 use spoolframe_types::{Item, Marker, MarkerKind, MediaId, MediaKind, Namespace, PlaybackState};
 
@@ -121,7 +122,10 @@ async fn harness(test: &str) -> Harness {
     let media = dir.join("media").join("movie.mkv");
     let catalog = Arc::new(FakeCatalog::new(media.clone()));
     let ffprobe = fake_ffprobe(dir.as_ref(), "mkv-forced-subs.json");
-    let prober = Arc::new(Prober::new(ffprobe, Prober::DEFAULT_TIMEOUT));
+    let prober = Arc::new(Prober::new(
+        Tool::unconfined(ffprobe),
+        Prober::DEFAULT_TIMEOUT,
+    ));
     let watch = Watch::new(
         store.clone(),
         catalog.clone(),
