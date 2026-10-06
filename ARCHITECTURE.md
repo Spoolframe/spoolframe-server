@@ -727,6 +727,23 @@ For stronger verification, support a short pairing/fingerprint confirmation.
 
 Remote invitations should carry the expected server `EndpointId`, avoiding blind TOFU.
 
+The pin is a pair (PX-14): the server's `EndpointId` and its server id,
+which `Hello` names (`ServerInfo.server_id`). The server id is made once,
+kept in the state directory beside the key, and outlives a new key. The
+SDK pins both at the first connect, and a pin saved before it kept ids
+takes the id at its next connect. Then:
+
+| What answers | What the SDK does |
+|---|---|
+| Same key, same id, any name | Connects. A new name is saved; it never asks. |
+| Same id, another key | `IdentityChanged`: the key was replaced. The user checks the new fingerprint, and `trust_new_identity` pins the new key with the same id, so the server's app passkeys keep working. |
+| Same key, another id | `ServerIdChanged`: refused every time, and nothing is kept. A server never changes its id. It cannot be accepted in place. |
+| Another key and another id | Another server, whatever its name. No pin applies; the user may add it. |
+
+A name says nothing about a pin with an id. Only a pin with no id yet is
+still matched by name, as before: another key heard under its name is an
+`IdentityChanged`.
+
 ---
 
 # 20. Iroh Connections May Be Anonymous at the Spoolframe Layer
@@ -872,19 +889,32 @@ P3-05). The UI recommends a password or SSO next to a passkey, because a
 user, or a sole admin, who loses their only passkey has no other way in
 short of shell access to the server.
 
-The apps use one relying party for their passkeys, shared by every
-server: `spoolframe.app` (P3-19). A platform's passkey API works only for
-a domain the app is associated with when it is built, and a self-hosted
-server's domain is not known then. That domain only serves the
-association file; the ceremonies run app to server over
-`spoolframe/client/1`, and the server never contacts it, so a LAN-only
-server has app passkeys too. Each server keeps its own app passkeys (with
-the web UI's, marked by that relying-party ID), its own random user
-handle per user, and its own challenges, bound to the device that asked
-and to the server: the server sends a nonce, and the challenge is a hash
-of the server's endpoint id and the nonce, which the app's SDK makes with
-the id it pinned (PX-10). A passkey or an assertion of one server is of no
-use at another, even one relayed by a server the app trusts. An app
+The apps make their passkeys for a relying party per server under
+`spoolframe.app` (P3-19, PX-14): `<server id>.spoolframe.app`, at the
+origin `https://<server id>.spoolframe.app`. A platform's passkey API
+works only for a domain the app is associated with when it is built, and
+a self-hosted server's domain is not known then. One association file at
+`spoolframe.app` covers every subdomain (Apple: one
+`webcredentials:*.spoolframe.app` entitlement). The ceremonies run app
+to server over `spoolframe/client/1`, and the server never contacts
+`spoolframe.app`, so a LAN-only server has app passkeys too.
+
+The server id, not the key, names the relying party: a passkey syncs with
+its relying party and must outlive a key that is replaced. Every server
+shared `spoolframe.app` itself before PX-14, and a security key with
+passkeys for two servers then offered both to a sign-in that listed
+none. Passkeys made for it are kept and listed as old, to add again, and
+sign no one in.
+
+Each server keeps its own app passkeys (with the web UI's, marked by
+that relying-party ID), its own random user handle per user, and its own
+challenges, bound to the device that asked and to the server: the server
+sends a nonce, and the challenge is a hash of the server's endpoint id
+and the nonce, which the app's SDK makes with the id it pinned (PX-10).
+The relying party alone does not bind the server, because a server may
+name another's server id; the challenge does. A passkey or an assertion
+of one server is of no use at another, even one relayed by a server the
+app trusts that claims the other's id. An app
 lists, renames and removes its user's passkeys, the web UI's with its
 own, through the same store calls and rules as My profile.
 

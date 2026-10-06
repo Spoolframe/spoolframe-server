@@ -6,7 +6,7 @@
 //! "SDH" subtitle as the only English one.
 
 use spoolframe_protocol::{
-    ChosenTracks, Reply, Request, Response, Selection, SessionId, TrackReason,
+    ChosenTracks, Reply, Request, Response, Selection, SessionId, TrackPreferencesInfo, TrackReason,
 };
 use spoolframe_types::{
     MediaId, MediaKind, Namespace, SdhPreference, SubtitleMode, SubtitleRole, TrackPreferences,
@@ -98,7 +98,10 @@ async fn preferences_set_on_one_device_choose_on_another() {
     let (tv, on_tv) = signed_in(&server, "alice", "correct horse").await;
     assert_eq!(
         tv.call(Some(&on_tv), Request::GetTrackPreferences).await,
-        Response::Ok(Reply::TrackPreferences(always_english()))
+        Response::Ok(Reply::TrackPreferences(TrackPreferencesInfo {
+            preferences: always_english(),
+            ocr_offered: false,
+        }))
     );
     let chosen = chosen(&tv, &on_tv, &episode("12")).await;
     assert_eq!(chosen.selection.subtitle, Some(sdh(&tv, &on_tv).await));

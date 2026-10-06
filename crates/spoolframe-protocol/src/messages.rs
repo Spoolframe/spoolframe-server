@@ -27,7 +27,7 @@ use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -567,6 +567,18 @@ impl fmt::Debug for PinProof {
     }
 }
 
+/// The session user's track preferences (`GetTrackPreferences`), and
+/// whether this server reads picture subtitles as text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackPreferencesInfo {
+    pub preferences: TrackPreferences,
+    /// The server reads picture subtitles as text: `subtitles.ocr` is on
+    /// and tesseract has at least one language. When false,
+    /// `preferences.subtitles.bitmap` has no effect, and apps show that
+    /// choice disabled.
+    pub ocr_offered: bool,
+}
+
 /// How a user can log in to this server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -752,7 +764,7 @@ pub enum Reply {
     /// `FinishConfirmPasskey`): this session counts as signed in now.
     Confirmed,
     Home(HomeScreen),
-    TrackPreferences(TrackPreferences),
+    TrackPreferences(TrackPreferencesInfo),
     /// An item's frame previews (`GetPreviews`, P3-13).
     Previews(Previews),
     /// What the platform makes an app passkey with, but the challenge:
@@ -906,6 +918,10 @@ pub struct ServerInfo {
     pub name: String,
     /// Hex, as `spoolframe-server id` prints it.
     pub endpoint_id: String,
+    /// The server's id ([`crate::ServerId`]): made once, kept when its key
+    /// is replaced. A client pins it beside `endpoint_id`, the first time
+    /// it sees it.
+    pub server_id: String,
     pub protocol_version: u32,
     pub server_version: String,
     pub auth_methods: Vec<AuthMethod>,

@@ -4,6 +4,7 @@
 use std::fmt::Debug;
 use std::time::Duration;
 
+use crate::TrackPreferencesInfo;
 use crate::codec::{self, CodecError, MAX_FRAME};
 use crate::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
@@ -340,6 +341,7 @@ fn every_reply_round_trips() {
         Reply::ServerInfo(ServerInfo {
             name: "Home Media".into(),
             endpoint_id: "e9c1".into(),
+            server_id: "mzxw6ytbojtg633c".into(),
             protocol_version: PROTOCOL_VERSION,
             server_version: "0.1.0".into(),
             auth_methods: vec![AuthMethod::Password],
@@ -524,7 +526,10 @@ fn every_reply_round_trips() {
             }),
             markers: markers(),
         },
-        Reply::TrackPreferences(TrackPreferences::default()),
+        Reply::TrackPreferences(TrackPreferencesInfo {
+            preferences: TrackPreferences::default(),
+            ocr_offered: true,
+        }),
         Reply::Subtitle {
             format: SubtitleFormat::Srt,
             bytes: b"1\n00:00:01,000 --> 00:00:02,000\nHi\n".to_vec(),
@@ -905,6 +910,28 @@ fn a_sign_in_that_leaves_the_user_handle_out_does_not_decode() {
     })
     .unwrap();
     assert!(codec::decode::<FinishPasskeySignIn>(&bytes).is_err());
+}
+
+/// A revision-4 server's `ServerInfo` has no `server_id`; it does not
+/// decode, so no client takes another relying party for a missing one.
+#[test]
+fn server_info_without_a_server_id_does_not_decode() {
+    let mut value = ciborium::Value::serialized(&ServerInfo {
+        name: "Home Media".into(),
+        endpoint_id: "e9c1".into(),
+        server_id: "mzxw6ytbojtg633c".into(),
+        protocol_version: 4,
+        server_version: "0.1.0".into(),
+        auth_methods: vec![AuthMethod::Password],
+        web_url: None,
+    })
+    .unwrap();
+    let ciborium::Value::Map(fields) = &mut value else {
+        panic!("{value:?}");
+    };
+    fields.retain(|(key, _)| key.as_text() != Some("server_id"));
+    let bytes = codec::encode(&value).unwrap();
+    assert!(codec::decode::<ServerInfo>(&bytes).is_err());
 }
 
 /// An older client's empty handle is `Some` of nothing, for the server

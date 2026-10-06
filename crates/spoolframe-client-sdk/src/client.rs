@@ -11,8 +11,8 @@ use iroh_mdns_address_lookup::MdnsAddressLookup;
 use std::time::Duration;
 
 use spoolframe_protocol::{
-    FinishPasskeySignIn, LoginPassword, PasskeyRequest, Reply, Request, Response, SessionId,
-    TrustedProfile, device_sign_in, fingerprint, lan,
+    FinishPasskeySignIn, LoginPassword, PasskeyRequest, Reply, Request, Response, ServerId,
+    SessionId, TrustedProfile, device_sign_in, fingerprint, lan,
 };
 use spoolframe_types::{ClientCapabilities, Platform};
 
@@ -197,8 +197,11 @@ impl Client {
     pub async fn servers(&self) -> Result<Vec<ServerEntry>, SdkError> {
         let saved = servers::load(self.inner.storage.as_ref()).await?;
         let mut heard = self.inner.discovery.heard();
+        // Only a pin with no server id yet is matched by name: one with an
+        // id is matched by that (PX-14), and a name may change freely.
         let away: Vec<String> = saved
             .iter()
+            .filter(|s| s.server_id.is_none())
             .filter(|s| parse_id(&s.endpoint_id).map_or(true, |id| !heard.contains_key(&id)))
             .map(|s| s.name.clone())
             .collect();
@@ -217,6 +220,7 @@ impl Client {
                     pinned_at: servers::time(s.pinned_at),
                     verified_at: servers::time(s.verified_at),
                     last_connected_at: servers::time(s.last_connected_at),
+                    server_id: s.server_id,
                     endpoint_id: s.endpoint_id,
                     name: s.name,
                     pinned: true,
@@ -240,6 +244,7 @@ impl Client {
                 pinned_at: None,
                 verified_at: None,
                 last_connected_at: None,
+                server_id: None,
             })
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -275,12 +280,22 @@ impl Client {
     /// saved by this: the app shows the fingerprint, then calls
     /// [`Client::pin`] (P1-21). Until then only `Hello` is sent to it.
     ///
+    /// The pin is the pair of the key and the server id (PX-14): a saved
+    /// server connects only when both answer as pinned, and the name it
+    /// answers with is saved, whatever it is.
+    ///
     /// [`SdkError::IdentityChanged`] when a saved server seems to answer
-    /// with another key (P1-13): `endpoint_id` is heard under a saved
-    /// server's name while that server's own key is not, or a saved server
-    /// cannot be reached and another key is heard under its name. Nothing
-    /// is connected or saved; [`Client::trust_new_identity`] replaces the
-    /// pin if the user says so.
+    /// with another key (P1-13): `endpoint_id` answers with a saved
+    /// server's server id. For a server saved before the SDK kept ids,
+    /// also when `endpoint_id` is heard under its name while its own key
+    /// is not, or when it cannot be reached and another key is heard
+    /// under its name. Nothing is saved; [`Client::trust_new_identity`]
+    /// replaces the pin if the user says so.
+    ///
+    /// [`SdkError::ServerIdChanged`] when a saved server answers under its
+    /// key with another server id: refused, and nothing is saved. A key
+    /// and a server id that are both new are another server: nothing
+    /// pinned applies to it.
     pub async fn connect(&self, endpoint_id: &str) -> Result<ServerEntry, SdkError> {
         let id = parse_id(endpoint_id)?;
         let saved = servers::load(self.inner.storage.as_ref()).await?;
@@ -307,6 +322,14 @@ impl Client {
                 return Err(e);
             }
         };
+        if pinned.is_none()
+            && let Some(old) = same_server(&saved, id, &conn.info.server_id)
+        {
+            return Err(SdkError::IdentityChanged {
+                saved: old.endpoint_id.clone(),
+                now: endpoint_id.to_owned(),
+            });
+        }
         // Read again: dialling it has just dated the connect.
         let pinned = servers::load(self.inner.storage.as_ref())
             .await?
@@ -338,6 +361,7 @@ impl Client {
                     pinned_at: servers::time(server.pinned_at),
                     verified_at: servers::time(server.verified_at),
                     last_connected_at: servers::time(server.last_connected_at),
+                    server_id: server.server_id.clone(),
                 };
                 servers::save(storage, &saved).await?;
                 self.inner.discovery.changed();
@@ -360,10 +384,18 @@ impl Client {
         let server = SavedServer::pinned_now(
             conn.info.name.clone(),
             endpoint_id.to_owned(),
+            conn.info.server_id.clone(),
             conn.reached(),
             verified,
         );
         let mut saved = servers::load(storage).await?;
+        // Nor this way, by a new key that says it is a saved server.
+        if let Some(old) = same_server(&saved, id, &conn.info.server_id) {
+            return Err(SdkError::IdentityChanged {
+                saved: old.endpoint_id.clone(),
+                now: endpoint_id.to_owned(),
+            });
+        }
         saved.retain(|s| s.endpoint_id != endpoint_id);
         tracing::info!(
             id = endpoint_id,
@@ -381,6 +413,11 @@ impl Client {
     /// its place (P1-13), after the user checked `new_id`'s fingerprint.
     /// The old key's sessions are forgotten: they belonged to the server
     /// that key was, so everyone signs in again.
+    ///
+    /// The new pin is `new_id` with the server id it answers with. When
+    /// the server only replaced its key, that is the id pinned before
+    /// (PX-14), so its app passkeys, made for that id, still sign in: the
+    /// SDK makes their challenges with the new key from now on.
     pub async fn trust_new_identity(
         &self,
         saved_id: &str,
@@ -404,6 +441,7 @@ impl Client {
         let server = SavedServer::pinned_now(
             conn.info.name.clone(),
             new_id.to_owned(),
+            conn.info.server_id.clone(),
             conn.reached(),
             true,
         );
@@ -423,12 +461,14 @@ impl Client {
         Ok(self.entry(new, &conn, Some(&server)))
     }
 
-    /// A saved server that `id` answers in place of: `id` is heard under its
-    /// name, and its own key is not heard.
+    /// A saved server with no server id pinned yet that `id` answers in
+    /// place of: `id` is heard under its name, and its own key is not
+    /// heard. One with an id is matched by it ([`same_server`]).
     fn replaced_by<'a>(&self, saved: &'a [SavedServer], id: EndpointId) -> Option<&'a SavedServer> {
         let heard = self.inner.discovery.get(&id)?;
         saved.iter().find(|s| {
-            s.name == heard.name
+            s.server_id.is_none()
+                && s.name == heard.name
                 && s.endpoint_id != id.to_string()
                 && parse_id(&s.endpoint_id)
                     .map_or(true, |own| self.inner.discovery.get(&own).is_none())
@@ -436,8 +476,12 @@ impl Client {
     }
 
     /// Another key heard under saved server `server`'s name while its own is
-    /// not heard.
+    /// not heard, if `server` has no server id pinned yet: a name says
+    /// nothing about one that has (PX-14).
     fn replacement(&self, server: &SavedServer) -> Option<EndpointId> {
+        if server.server_id.is_some() {
+            return None;
+        }
         let heard = self.inner.discovery.heard();
         if parse_id(&server.endpoint_id).is_ok_and(|own| heard.contains_key(&own)) {
             return None;
@@ -470,6 +514,7 @@ impl Client {
             pinned_at: saved.and_then(|s| servers::time(s.pinned_at)),
             verified_at: saved.and_then(|s| servers::time(s.verified_at)),
             last_connected_at: saved.and_then(|s| servers::time(s.last_connected_at)),
+            server_id: Some(conn.info.server_id.clone()),
         }
     }
 
@@ -486,6 +531,20 @@ impl Client {
         link.and_then(|l| l.open())
             .map(|conn| conn.remote_addrs())
             .unwrap_or_default()
+    }
+
+    /// The server id pinned with saved server `id`'s key (PX-14), which
+    /// names its app passkeys' relying party. Every connection to a saved
+    /// server pins it, or refuses one that differs, so after a call to it
+    /// there is one.
+    pub(crate) async fn pinned_server_id(&self, id: EndpointId) -> Result<ServerId, SdkError> {
+        let saved = servers::load(self.inner.storage.as_ref()).await?;
+        let server_id = saved
+            .into_iter()
+            .find(|s| s.endpoint_id == id.to_string())
+            .and_then(|s| s.server_id)
+            .ok_or_else(|| SdkError::NotPinned(id.to_string()))?;
+        ServerId::parse(&server_id).map_err(|e| SdkError::Protocol(e.to_string()))
     }
 
     /// Requests other than `Hello` go only to a pinned server (P1-21).
@@ -603,16 +662,20 @@ impl Client {
 
     /// Begin signing in on server `endpoint_id` with a passkey made in the
     /// app (P3-19): what the platform's passkey API signs, for the relying
-    /// party [`crate::APP_RP_ID`]. No passkeys are listed: the platform
-    /// offers whichever it has for this relying party (a keychain may hold
-    /// several servers': their names say `<username> on <server name>`).
-    /// With `username`, only that user's finish it. The challenge is this
-    /// device's, for 5 minutes; beginning again replaces it.
+    /// party in [`PasskeyRequest::rp_id`], from [`PasskeyRequest::origin`]
+    /// where the platform takes one. That is the server's own,
+    /// `<server id>.spoolframe.app`, from the server id pinned with its key
+    /// (PX-14): pass it to the platform as it is, never a fixed one. No
+    /// passkeys are listed: the platform offers whichever it has for this
+    /// relying party, which are only this server's. With `username`, only
+    /// that user's finish it. The challenge is this device's, for 5
+    /// minutes; beginning again replaces it.
     ///
     /// The server sends a nonce; the challenge is
     /// [`spoolframe_protocol::app_passkey_challenge`] of `endpoint_id`, the
-    /// pinned server dialled, and that nonce (PX-10). A server that hands
-    /// on another server's nonce gets a signature the other refuses.
+    /// pinned server dialled, and that nonce (PX-10). A server that claims
+    /// another's server id and hands on its nonce gets a signature the
+    /// other refuses.
     pub async fn begin_passkey_sign_in(
         &self,
         endpoint_id: &str,
@@ -625,7 +688,8 @@ impl Client {
         };
         match self.call(server, None, begin).await? {
             Response::Ok(Reply::PasskeySignInBegun(begun)) => {
-                Ok(begun.for_server(server.as_bytes()))
+                let server_id = self.pinned_server_id(server).await?;
+                Ok(begun.for_server(server.as_bytes(), &server_id))
             }
             Response::Ok(other) => Err(SdkError::Protocol(format!(
                 "BeginPasskeySignIn answered {other:?}"
@@ -1384,7 +1448,13 @@ impl Client {
         // seen it would never age out.
         let reached = conn.reached.clone();
         let saving = reached.borrow().clone();
-        self.refresh(id, &conn.info.name, saving.clone()).await?;
+        if let Err(e) = self
+            .refresh(id, &conn.info.name, &conn.info.server_id, saving.clone())
+            .await
+        {
+            conn.conn.close(0u32.into(), b"not the server pinned");
+            return Err(e);
+        }
         tokio::spawn(save_reached(
             Arc::downgrade(&self.inner),
             id,
@@ -1406,10 +1476,16 @@ impl Client {
     /// A saved server's name, as it answered now, that it answered now,
     /// and that it was reached at `addrs`, which join those known. The key
     /// is the match, so a pin is never moved to another key.
+    ///
+    /// `server_id` is the server id it answered with: one pinned before
+    /// must be it, or nothing is kept and the answer is
+    /// [`SdkError::ServerIdChanged`]. A pin from before the SDK kept ids
+    /// takes it now, as a first connect does.
     async fn refresh(
         &self,
         id: EndpointId,
         name: &str,
+        server_id: &str,
         addrs: Vec<SocketAddr>,
     ) -> Result<(), SdkError> {
         let storage = self.inner.storage.as_ref();
@@ -1418,6 +1494,23 @@ impl Client {
         let Some(server) = saved.iter_mut().find(|s| s.endpoint_id == id.to_string()) else {
             return Ok(());
         };
+        match &server.server_id {
+            Some(pinned) if pinned != server_id => {
+                tracing::warn!(
+                    server = %id,
+                    pinned,
+                    now = server_id,
+                    "a saved server answered with another server id; refused"
+                );
+                return Err(SdkError::ServerIdChanged {
+                    endpoint_id: id.to_string(),
+                    saved: pinned.clone(),
+                    now: server_id.to_owned(),
+                });
+            }
+            Some(_) => {}
+            None => server.server_id = Some(server_id.to_owned()),
+        }
         server.name = name.to_owned();
         let now = servers::now();
         server.saw(addrs, now);
@@ -1500,6 +1593,19 @@ impl Client {
         }
         self.inner.endpoint.close().await;
     }
+}
+
+/// The saved server, under another key than `id`, whose pinned server id is
+/// `server_id`: the server `id` says it is, with its key replaced (PX-14).
+fn same_server<'a>(
+    saved: &'a [SavedServer],
+    id: EndpointId,
+    server_id: &str,
+) -> Option<&'a SavedServer> {
+    let id = id.to_string();
+    saved
+        .iter()
+        .find(|s| s.endpoint_id != id && s.server_id.as_deref() == Some(server_id))
 }
 
 /// Save each address a connection to server `id` reaches from now on

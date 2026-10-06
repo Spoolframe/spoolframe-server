@@ -2,8 +2,6 @@
 //! `crate::passkeys`'; this is storage, and the rule that a user keeps a
 //! way to sign in.
 
-use spoolframe_protocol::APP_RP_ID;
-
 use super::users::{LocalUserId, UserError, add_first_user};
 use super::{Store, StoreError};
 
@@ -284,18 +282,21 @@ impl Store {
         Ok(())
     }
 
-    /// The passkeys made under another relying-party ID than `rp_id`, and
-    /// not the apps' ([`APP_RP_ID`], P3-19): no browser offers them here.
+    /// The passkeys made under neither `rp_id`, the web UI's relying
+    /// party, nor `app_rp_id`, the apps' (P3-19, PX-14): no browser or app
+    /// offers them here. App passkeys made for the relying party every
+    /// server once shared are among them.
     pub async fn passkeys_of_other_hosts(
         &self,
         rp_id: &str,
+        app_rp_id: &str,
     ) -> Result<Vec<OwnedPasskey>, StoreError> {
         Ok(sqlx::query_as(
             "SELECT u.username, p.name, p.rp_id FROM passkeys p JOIN users u ON u.id = p.user_id \
              WHERE p.rp_id NOT IN (?1, ?2) ORDER BY u.username, p.created_at",
         )
         .bind(rp_id)
-        .bind(APP_RP_ID)
+        .bind(app_rp_id)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -326,6 +327,9 @@ mod tests {
 
     use super::super::tests::{TestStore, test_store};
     use super::*;
+
+    /// A server's app relying party (PX-14).
+    const APP_RP: &str = "mzxw6ytbojtg633c.spoolframe.app";
 
     async fn store_with_alice(test: &str) -> (TestStore, LocalUserId) {
         let store = test_store(test).await;
@@ -502,16 +506,16 @@ mod tests {
         let (store, alice) = store_with_alice("passkey-ids-of").await;
         add(&store, alice, "web-1").await;
         store
-            .add_passkey(alice, "app-1", "iPhone", "{}", APP_RP_ID)
+            .add_passkey(alice, "app-1", "iPhone", "{}", APP_RP)
             .await
             .unwrap();
         store
-            .add_passkey(alice, "app-2", "iPad", "{}", APP_RP_ID)
+            .add_passkey(alice, "app-2", "iPad", "{}", APP_RP)
             .await
             .unwrap();
         let ids = |name: &'static str| {
             let store = &store;
-            async move { store.passkey_ids_of(name, APP_RP_ID).await.unwrap() }
+            async move { store.passkey_ids_of(name, APP_RP).await.unwrap() }
         };
         assert_eq!(ids("alice").await, ["app-1", "app-2"]);
         assert_eq!(ids("nobody").await, Vec::<String>::new());
@@ -540,21 +544,36 @@ mod tests {
             .add_passkey(alice, "cred-2", "Tunnel", "{}", "localhost")
             .await
             .unwrap();
-        // An app's (P3-19) works on every server, whatever its host.
+        // An app's (P3-19) works whatever the web UI's host is; one made
+        // for the relying party every server once shared (PX-14) does not.
         store
-            .add_passkey(alice, "cred-3", "iPhone", "{}", APP_RP_ID)
+            .add_passkey(alice, "cred-3", "iPhone", "{}", APP_RP)
             .await
             .unwrap();
+        store
+            .add_passkey(alice, "cred-4", "iPad", "{}", "spoolframe.app")
+            .await
+            .unwrap();
+        // Made in the same second, they are in no set order.
+        let mut others = store
+            .passkeys_of_other_hosts("media.example.org", APP_RP)
+            .await
+            .unwrap();
+        others.sort_by(|a, b| a.rp_id.cmp(&b.rp_id));
         assert_eq!(
-            store
-                .passkeys_of_other_hosts("media.example.org")
-                .await
-                .unwrap(),
-            [OwnedPasskey {
-                username: "alice".into(),
-                name: "Tunnel".into(),
-                rp_id: "localhost".into(),
-            }]
+            others,
+            [
+                OwnedPasskey {
+                    username: "alice".into(),
+                    name: "Tunnel".into(),
+                    rp_id: "localhost".into(),
+                },
+                OwnedPasskey {
+                    username: "alice".into(),
+                    name: "iPad".into(),
+                    rp_id: "spoolframe.app".into(),
+                },
+            ]
         );
     }
 }

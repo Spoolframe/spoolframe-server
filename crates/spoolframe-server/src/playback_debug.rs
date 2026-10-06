@@ -12,12 +12,11 @@ use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::encoders::Encoders;
 use spoolframe_media::{MediaDescriptor, Prober, SubtitleKind, SubtitleSource, codecs};
 use spoolframe_protocol::{
-    AudioAction, BitmapSubtitles, ConvertedVideo, PlaybackPlan, Selection, SubtitleAction,
-    SubtitleDelivery,
+    AudioAction, ConvertedVideo, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
 };
 use spoolframe_types::{
-    AudioCodec, AudioRole, ClientCapabilities, Container, Delivery, MediaId, SubtitleFormat,
-    SubtitleRole, VideoCodec,
+    AudioCodec, AudioRole, BitmapPreference, ClientCapabilities, Container, Delivery, MediaId,
+    SubtitleFormat, SubtitleRole, VideoCodec,
 };
 
 use crate::connected::Connected;
@@ -732,10 +731,11 @@ impl PlaybackDebug {
             audio: request.audio,
             subtitle: request.subtitle,
         };
+        // `Auto` is planned as for a viewer who never chose.
         let bitmap = match request.pictures {
-            api::PictureSubtitles::Auto => BitmapSubtitles::Auto,
-            api::PictureSubtitles::Text => BitmapSubtitles::Text,
-            api::PictureSubtitles::BurnIn => BitmapSubtitles::BurnIn,
+            api::PictureSubtitles::Auto => planner::Bitmap::Preferred(BitmapPreference::default()),
+            api::PictureSubtitles::Text => planner::Bitmap::Text,
+            api::PictureSubtitles::BurnIn => planner::Bitmap::BurnIn,
         };
         let encoders = self.transcoding.encoders();
         // As the client protocol plans it: without capabilities, nothing.

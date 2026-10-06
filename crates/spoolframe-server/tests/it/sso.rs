@@ -82,7 +82,7 @@ async fn server_behind(
     let (addr, handle) = admin::serve(
         "127.0.0.1:0".parse().unwrap(),
         Admin {
-            passkeys: Arc::new(Passkeys::new(&origins)),
+            passkeys: Arc::new(Passkeys::new(&origins, &crate::admin::server_id())),
             oidc: Arc::new(oidc),
             ..admin(Auth::new(store.clone()), Some(SetupCode::new(CODE)))
         },

@@ -11,15 +11,15 @@ use dioxus::prelude::*;
 use serde_json::Value;
 use spoolframe_admin_api::{
     DeviceEntry, MeApiClient, PasskeyEntry, PasskeyHost, PasswordChange, Role, SessionEntry,
-    SsoLink, TrackOverrideEntry, TrackPreferences, UserInfo, error_code,
+    SsoLink, TrackOverrideEntry, TrackPreferences, TrackPreferencesInfo, UserInfo, error_code,
 };
 
 use super::admin::{Said, Toast, say};
 use super::{Alert, Field, Notice, ShownName, http, icons, now, rpc, webauthn};
 use crate::logic::{ApiError, ago, avatar_class, client_kind, date, page_serves, passkey_title};
 use crate::preferences::{
-    self, SDH, SUBTITLE_MODES, audio_choices, avoids_extras, index_of, override_line,
-    subtitle_choices,
+    self, PICTURE_SUBTITLES, SDH, SUBTITLE_MODES, audio_choices, avoids_extras, index_of,
+    override_line, picture_row, subtitle_choices,
 };
 use crate::sso::Tone;
 use crate::trust::{self, Change, Icon, Question, Row, Switch, Whose};
@@ -577,10 +577,8 @@ fn PasskeyRow(
                     b { {passkey_title(&passkey)} }
                 }
                 span { class: "row-sub", "{passkey.rp_id} · added {date(passkey.created_at)}{used}" }
-                if !passkey.usable {
-                    span { class: "row-sub text-ctp-yellow",
-                        "Made for {passkey.rp_id}: it does not work at this server's address now."
-                    }
+                if let Some(note) = crate::logic::unusable_note(&passkey, "this server's") {
+                    span { class: "row-sub text-ctp-yellow", "{note}" }
                 }
             }
             span { class: "row-do",
@@ -1462,7 +1460,7 @@ fn session_line(session: &SessionEntry) -> String {
     format!("{kind} · {when}")
 }
 
-async fn track_preferences() -> Result<TrackPreferences, ApiError> {
+async fn track_preferences() -> Result<TrackPreferencesInfo, ApiError> {
     let client = rpc::client().await?;
     client.track_preferences().await.map_err(rpc::error)
 }
@@ -1525,8 +1523,8 @@ fn Playback() -> Element {
                 match current {
                     None => rsx! { p { class: "m-0 text-sm text-ctp-subtext0", "Loading…" } },
                     Some(Err(e)) => rsx! { Alert { text: e.explain() } },
-                    Some(Ok(p)) => rsx! {
-                        PreferenceRows { preferences: p, busy: busy(), on_change: move |p| save.call(p) }
+                    Some(Ok(info)) => rsx! {
+                        PreferenceRows { preferences: info.preferences, ocr_offered: info.ocr_offered, busy: busy(), on_change: move |p| save.call(p) }
                     },
                 }
                 match said() {
@@ -1574,6 +1572,7 @@ fn Playback() -> Element {
 #[component]
 fn PreferenceRows(
     preferences: TrackPreferences,
+    ocr_offered: bool,
     busy: bool,
     on_change: EventHandler<TrackPreferences>,
 ) -> Element {
@@ -1581,6 +1580,7 @@ fn PreferenceRows(
     let subtitles = preferences::key(&preferences.subtitles.languages);
     let mode = index_of(SUBTITLE_MODES, &preferences.subtitles.mode);
     let sdh = index_of(SDH, &preferences.subtitles.sdh);
+    let pictures = picture_row(preferences.subtitles.bitmap, ocr_offered);
     let avoid = avoids_extras(&preferences.audio.avoid);
     let p = preferences.clone();
     let set_audio = move |e: FormEvent| {
@@ -1626,6 +1626,19 @@ fn PreferenceRows(
         let mut p = p.clone();
         if let Some((sdh, _)) = e.value().parse().ok().and_then(|i: usize| SDH.get(i)) {
             p.subtitles.sdh = *sdh;
+        }
+        on_change.call(p);
+    };
+    let p = preferences.clone();
+    let set_pictures = move |e: FormEvent| {
+        let mut p = p.clone();
+        if let Some((bitmap, _)) = e
+            .value()
+            .parse()
+            .ok()
+            .and_then(|i: usize| PICTURE_SUBTITLES.get(i))
+        {
+            p.subtitles.bitmap = *bitmap;
         }
         on_change.call(p);
     };
@@ -1685,6 +1698,21 @@ fn PreferenceRows(
                 select { class: "pref-select", aria_label: "Subtitles for the deaf", disabled: busy, onchange: set_sdh,
                     for (i, (_, label)) in SDH.iter().enumerate() {
                         option { value: "{i}", selected: i == sdh, "{label}" }
+                    }
+                }
+            }
+        }
+        div { class: "row",
+            span { class: "row-what",
+                b { "Picture subtitles" }
+                span { class: "row-sub",
+                    {pictures.off.unwrap_or("PGS, VobSub and DVB: as text, any device shows them styled and sized")}
+                }
+            }
+            span { class: "row-do",
+                select { class: "pref-select", aria_label: "Picture subtitles", disabled: busy || pictures.off.is_some(), onchange: set_pictures,
+                    for (i, (_, label)) in PICTURE_SUBTITLES.iter().enumerate() {
+                        option { value: "{i}", selected: i == pictures.shown, "{label}" }
                     }
                 }
             }

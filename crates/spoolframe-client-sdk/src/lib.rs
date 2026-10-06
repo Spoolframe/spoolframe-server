@@ -37,13 +37,16 @@ pub use spoolframe_protocol::{
     ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen,
     MAX_READ, ManifestKind, PinProof, PinState, PlaybackHandle, PlaybackPlan, PlexLink,
     PlexSyncSummary, PreviewTile, Previews, SearchCounts, SearchGroup, SearchRequest,
-    SearchResults, Selection, SessionInfo, TopResult, TrackReason, TrustedProfile, UserSummary,
+    SearchResults, Selection, SessionInfo, TopResult, TrackPreferencesInfo, TrackReason,
+    TrustedProfile, UserSummary,
 };
-// Passkeys in the app (P3-19): the relying party and the raw WebAuthn
-// bytes the platform's passkey API takes and gives.
+// Passkeys in the app (P3-19): the raw WebAuthn bytes the platform's
+// passkey API takes and gives. The relying party is each server's own
+// (PX-14), in the request; `LEGACY_APP_RP_ID` marks passkeys made for the
+// one all servers once shared, which sign in nowhere now.
 pub use spoolframe_protocol::{
-    APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation,
-    PasskeyInfo, PasskeyRequest,
+    FinishPasskeyRegistration, FinishPasskeySignIn, LEGACY_APP_RP_ID, PasskeyCreation, PasskeyInfo,
+    PasskeyRequest, ServerId,
 };
 // Fingerprints for the "Server identity changed" alert (P1-13, P1-21).
 pub use spoolframe_protocol::fingerprint;

@@ -276,15 +276,16 @@ async fn another_server_with_the_same_name_beside_it_is_a_different_server() {
     impostor.stop().await;
 }
 
-/// The saved server is gone and another key answers under its name
-/// (P1-13): reinstalled, or a different server. Nothing connects or saves
-/// on its own; the user's Cancel keeps the pin, Trust replaces it.
+/// The saved server is gone and another key answers with its server id
+/// (P1-13, PX-14): the server's key was replaced. Nothing connects or saves
+/// on its own; the user's Cancel keeps the pin, Trust replaces it and
+/// keeps the server id.
 #[tokio::test]
-async fn a_new_key_under_a_saved_name_is_an_identity_change() {
-    if !private_lan("a_new_key_under_a_saved_name_is_an_identity_change") {
+async fn a_new_key_with_a_saved_server_id_is_an_identity_change() {
+    if !private_lan("a_new_key_with_a_saved_server_id_is_an_identity_change") {
         return;
     }
-    let first = TestServer::start_with(fresh_dir("reinstall-1").await, on_lan("Home Media")).await;
+    let first = TestServer::start_with(fresh_dir("rekey-1").await, on_lan("Home Media")).await;
     first.add_user("alice", "correct horse", None).await;
     let storage = Arc::new(MemoryStorage::default());
     let client = open(&storage).await;
@@ -296,41 +297,86 @@ async fn a_new_key_under_a_saved_name_is_an_identity_change() {
         .await
         .unwrap();
 
+    let server_id = first.server_id.clone();
     first.stop().await;
-    let second = TestServer::start_with(fresh_dir("reinstall-2").await, on_lan("Home Media")).await;
+    let dir = fresh_dir("rekey-2").await;
+    std::fs::create_dir_all(&*dir).unwrap();
+    std::fs::write(
+        dir.join(spoolframe_server::identity::SERVER_ID_FILE),
+        server_id.as_str(),
+    )
+    .unwrap();
+    let second = TestServer::start_with(dir, on_lan("Home Media")).await;
     let new = second.server.id().to_string();
     let changed = SdkError::IdentityChanged {
         saved: old.clone(),
         now: new.clone(),
     };
-    // Once the old record is gone and the new one heard, picking it says
-    // so, rather than connecting.
+    // Once it is heard, picking it says so, rather than connecting.
     until("the new key is an identity change", || async {
         (client.connect(&new).await == Err(changed.clone())).then_some(())
     })
     .await;
-    // One entry, the saved one; and the saved one says the same.
-    let listed = client.servers().await.unwrap();
-    assert_eq!(listed.len(), 1, "{listed:?}");
-    assert_eq!(listed[0].endpoint_id, old);
-    assert_eq!(client.connect(&old).await, Err(changed.clone()));
     // A pin is not taken over by pinning.
     assert_eq!(client.pin(&new, true).await, Err(changed.clone()));
     // Cancel: nothing changed.
-    assert_eq!(client.servers().await.unwrap()[0].endpoint_id, old);
+    let pinned: Vec<_> = client
+        .servers()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.pinned)
+        .map(|e| e.endpoint_id)
+        .collect();
+    assert_eq!(pinned, std::slice::from_ref(&old));
 
-    // Trust: the new key is the pin, verified, and the old sessions are
-    // gone with the old key.
+    // Trust: the new key is the pin, verified, with the same server id,
+    // and the old sessions are gone with the old key.
     let trusted = client.trust_new_identity(&old, &new).await.unwrap();
     assert!(trusted.pinned && trusted.verified, "{trusted:?}");
-    let listed = client.servers().await.unwrap();
-    assert_eq!(listed.len(), 1, "{listed:?}");
-    assert_eq!(listed[0].endpoint_id, new);
+    // The old key may still be heard a while: it is listed, not pinned.
+    let pinned: Vec<_> = client
+        .servers()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.pinned)
+        .map(|e| (e.endpoint_id, e.server_id))
+        .collect();
+    assert_eq!(pinned, [(new.clone(), Some(server_id.to_string()))]);
     assert!(client.profiles(&new).await.unwrap().is_empty());
     assert!(matches!(
         client.profiles(&old).await,
         Err(SdkError::NotPinned(_))
     ));
+    client.close().await;
+    second.stop().await;
+}
+
+/// The saved server is gone and another key, with another server id,
+/// answers under its name: another server (PX-14). A name says nothing:
+/// it is listed apart, connects as a server not pinned, and the saved one
+/// stays as it was.
+#[tokio::test]
+async fn a_new_key_and_server_id_under_a_saved_name_is_another_server() {
+    if !private_lan("a_new_key_and_server_id_under_a_saved_name_is_another_server") {
+        return;
+    }
+    let first = TestServer::start_with(fresh_dir("reinstall-1").await, on_lan("Home Media")).await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = open(&storage).await;
+    let old = entry(&client, &first, |e| e.on_network).await.endpoint_id;
+    client.connect(&old).await.unwrap();
+    client.pin(&old, true).await.unwrap();
+
+    first.stop().await;
+    let second = TestServer::start_with(fresh_dir("reinstall-2").await, on_lan("Home Media")).await;
+    let other = entry(&client, &second, |e| e.on_network).await;
+    assert!(!other.pinned, "{other:?}");
+    assert!(!client.connect(&other.endpoint_id).await.unwrap().pinned);
+    let listed = client.servers().await.unwrap();
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert!(listed.iter().any(|e| e.pinned && e.endpoint_id == old));
     client.close().await;
     second.stop().await;
 }

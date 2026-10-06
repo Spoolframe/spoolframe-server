@@ -630,15 +630,23 @@ async fn a_server_that_stays_away_is_unreachable_within_the_bound() {
 #[tokio::test]
 async fn track_preferences_round_trip_and_choose() {
     use spoolframe_client_sdk::TrackReason;
-    use spoolframe_client_sdk::types::{MediaId, MediaKind, Namespace, SubtitleMode};
+    use spoolframe_client_sdk::types::{
+        BitmapPreference, MediaId, MediaKind, Namespace, SubtitleMode,
+    };
 
     let (server, client, _) = ready("track-preferences").await;
     server.write_episode("12");
     let alice = alice(&server, &client).await;
-    let mut preferences = alice.track_preferences().await.unwrap();
+    let read = alice.track_preferences().await.unwrap();
+    assert!(!read.ocr_offered, "this server has no text recognition");
+    let mut preferences = read.preferences;
     preferences.subtitles.mode = SubtitleMode::Off;
+    preferences.subtitles.bitmap = BitmapPreference::Pictures;
     alice.set_track_preferences(&preferences).await.unwrap();
-    assert_eq!(alice.track_preferences().await.unwrap(), preferences);
+    assert_eq!(
+        alice.track_preferences().await.unwrap().preferences,
+        preferences
+    );
 
     let episode = MediaId::new(Namespace::Plex, MediaKind::Episode, "12").unwrap();
     let plan = alice.playback_plan(&episode, None).await.unwrap();
@@ -1055,7 +1063,7 @@ async fn a_tv_is_signed_in_from_a_browser_by_its_web_qr_code() {
     server
         .add_user("alice", "correct horse", Some("Alice"))
         .await;
-    let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
+    let web = crate::admin::serve_beside(&server, WEB).await;
     let tv = client_on(&server, &Arc::new(MemoryStorage::default())).await;
 
     let sign_in = tv.begin_device_sign_in(&id(&server), false).await.unwrap();
@@ -1195,7 +1203,14 @@ async fn an_app_passkey_made_on_the_phone_signs_the_tv_in() {
     let (server, phone, _) = ready("app-passkey").await;
     let alice = alice(&server, &phone).await;
     let creation = alice.begin_passkey_registration().await.unwrap();
-    assert_eq!(creation.user_name, "alice on Home Media");
+    assert_eq!(creation.user_name, "alice @ Home Media");
+    assert_eq!(creation.display_name, "Alice");
+    // The SDK hands the app the relying party and origin of the server
+    // id it pinned (PX-14).
+    assert_eq!(
+        (creation.rp_id.clone(), creation.origin.clone()),
+        (server.server_id.rp_id(), server.server_id.origin())
+    );
     let mut app = crate::app_passkeys::App::new();
     alice
         .finish_passkey_registration(app.create(&creation, "Alice's iPhone"))
@@ -1205,6 +1220,10 @@ async fn an_app_passkey_made_on_the_phone_signs_the_tv_in() {
     let tv_storage = Arc::new(MemoryStorage::default());
     let tv = client_on(&server, &tv_storage).await;
     let request = tv.begin_passkey_sign_in(&id(&server), None).await.unwrap();
+    assert_eq!(
+        (request.rp_id.clone(), request.origin.clone()),
+        (server.server_id.rp_id(), server.server_id.origin())
+    );
     let signed = app.get(&request);
     let session = tv
         .finish_passkey_sign_in(&id(&server), signed.clone(), false)

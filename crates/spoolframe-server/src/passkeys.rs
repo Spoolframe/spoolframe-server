@@ -32,6 +32,8 @@ use webauthn_rs_proto::{
     AuthenticatorSelectionCriteria, ResidentKeyRequirement, UserVerificationPolicy,
 };
 
+use spoolframe_protocol::ServerId;
+
 use crate::admin_http::Origins;
 use crate::auth::{Auth, SessionToken};
 use crate::store::passkeys::{PasskeyError, PasskeyRecord, passkey_name};
@@ -248,6 +250,9 @@ type SignInBegun = (DiscoverableAuthentication, Instant, Option<String>);
 /// ceremonies begun.
 pub struct Passkeys {
     party: Result<RelyingParty, String>,
+    /// The apps' relying party for this server (PX-14): its passkeys are
+    /// listed here too, as usable in the apps.
+    app_rp_id: String,
     /// Registrations begun, by the session (its token's hash) that began
     /// them: one at a time each.
     registrations: Mutex<HashMap<String, (PasskeyRegistration, Instant)>>,
@@ -288,10 +293,12 @@ impl std::fmt::Debug for Passkeys {
 }
 
 impl Passkeys {
-    /// The relying party for browsers coming from `origins`.
-    pub fn new(origins: &Origins) -> Self {
+    /// The relying party for browsers coming from `origins`, on the server
+    /// whose id is `server_id`.
+    pub fn new(origins: &Origins, server_id: &ServerId) -> Self {
         Self {
             party: relying_party(origins),
+            app_rp_id: server_id.rp_id(),
             registrations: Mutex::default(),
             sign_ins: Mutex::default(),
             setups: Mutex::default(),
@@ -314,6 +321,11 @@ impl Passkeys {
     /// The relying-party ID, if the server can be one.
     pub fn rp_id(&self) -> Option<&str> {
         self.party.as_ref().ok().map(|party| party.rp_id.as_str())
+    }
+
+    /// The apps' relying party for this server (PX-14).
+    pub fn app_rp_id(&self) -> &str {
+        &self.app_rp_id
     }
 
     /// Why the server has no passkeys, if it has none.
@@ -519,11 +531,15 @@ impl Passkeys {
 
     /// Say in the log which stored passkeys this server's host no longer
     /// serves: made under another relying-party ID (before
-    /// `admin.public_url` changed), no browser offers them here.
+    /// `admin.public_url` changed, or, for an app's, before each server
+    /// had its own, PX-14), no browser or app offers them here.
     pub async fn log_orphans(&self, store: &Store) -> Result<(), StoreError> {
-        // With no relying party at all, every passkey is one.
+        // With no relying party at all, every web passkey is one.
         let rp_id = self.rp_id().unwrap_or_default();
-        for passkey in store.passkeys_of_other_hosts(rp_id).await? {
+        for passkey in store
+            .passkeys_of_other_hosts(rp_id, &self.app_rp_id)
+            .await?
+        {
             tracing::warn!(
                 username = %passkey.username,
                 passkey = %passkey.name,
@@ -592,7 +608,7 @@ mod tests {
     use super::*;
 
     fn party(origins: Origins) -> Passkeys {
-        Passkeys::new(&origins)
+        Passkeys::new(&origins, &ServerId::from_bytes([0; 10]))
     }
 
     #[test]

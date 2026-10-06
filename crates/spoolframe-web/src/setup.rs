@@ -427,9 +427,55 @@ pub fn missing_summary(missing: &[String]) -> Option<String> {
     }
 }
 
+/// What the Playback step says under "Offer picture subtitles as text":
+/// with the switch `on`, the languages `found` on the server are what OCR
+/// covers. The switch takes effect on a restart, so off wins over the
+/// languages the running server found.
+pub fn ocr_note(on: bool, found: bool) -> &'static str {
+    match (on, found) {
+        (false, _) => {
+            "Off: every user sees picture subtitles as pictures, drawn by their app or burned in."
+        }
+        (true, false) => {
+            "Tesseract has no languages on this server. Until it has, picture subtitles show as pictures."
+        }
+        (true, true) => {
+            "Found on this server. Picture subtitles in other languages show as pictures. \
+             Add Tesseract language data to the server for more."
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocr_with_languages_names_what_the_languages_cover() {
+        assert_eq!(
+            ocr_note(true, true),
+            "Found on this server. Picture subtitles in other languages show as pictures. \
+             Add Tesseract language data to the server for more."
+        );
+    }
+
+    #[test]
+    fn ocr_on_without_languages_says_pictures_are_shown_until_there_are_some() {
+        assert_eq!(
+            ocr_note(true, false),
+            "Tesseract has no languages on this server. Until it has, picture subtitles show as pictures."
+        );
+    }
+
+    #[test]
+    fn ocr_off_says_every_user_gets_pictures_whatever_languages_were_found() {
+        for found in [true, false] {
+            assert_eq!(
+                ocr_note(false, found),
+                "Off: every user sees picture subtitles as pictures, drawn by their app or burned in."
+            );
+        }
+    }
 
     #[test]
     fn automatic_names_the_hardware_it_picks() {

@@ -11,7 +11,8 @@ use spoolframe_protocol::{
     DeviceInfo, DeviceSignInRequest, FinishPasskeyRegistration, FinishPasskeySignIn, HomeScreen,
     ManifestKind, MediaRead, MediaReadResponse, PasskeyCreation, PasskeyInfo, PasskeyRequest,
     PinProof, PlaybackHandle, PlaybackPlan, PlexLink, Previews, Reply, Request, Response,
-    SearchRequest, SearchResults, Selection, SessionId, SessionInfo, UserSummary,
+    SearchRequest, SearchResults, Selection, SessionId, SessionInfo, TrackPreferencesInfo,
+    UserSummary,
 };
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId, SubtitleFormat,
@@ -823,8 +824,11 @@ impl Session {
     }
 
     /// Begin making a passkey for this user in the app (P3-19): what the
-    /// platform's passkey API makes one with, for the relying party
-    /// [`crate::APP_RP_ID`], with user verification. Only soon after
+    /// platform's passkey API makes one with, for the relying party in
+    /// [`PasskeyCreation::rp_id`] (this server's, from the server id
+    /// pinned with its key, PX-14), from [`PasskeyCreation::origin`], with
+    /// user verification. The account's name in it is
+    /// `<username> @ <server name>`. Only soon after
     /// signing in: a session older than 10 minutes gets
     /// [`SdkError::RecentSignInRequired`] (confirm it is them with
     /// [`Session::confirm_password`] or [`Session::begin_confirm_passkey`],
@@ -832,7 +836,10 @@ impl Session {
     /// for [`crate::Client::begin_passkey_sign_in`].
     pub async fn begin_passkey_registration(&self) -> Result<PasskeyCreation, SdkError> {
         match self.call(Request::BeginPasskeyRegistration).await? {
-            Reply::PasskeyRegistrationBegun(begun) => Ok(begun.for_server(self.server.as_bytes())),
+            Reply::PasskeyRegistrationBegun(begun) => {
+                let server_id = self.client.pinned_server_id(self.server).await?;
+                Ok(begun.for_server(self.server.as_bytes(), &server_id))
+            }
             other => Err(unexpected(other)),
         }
     }
@@ -904,14 +911,18 @@ impl Session {
 
     /// Begin confirming it is this user with one of their app passkeys,
     /// as for [`Session::confirm_password`]: what the platform's passkey
-    /// API signs, for [`crate::APP_RP_ID`], listing only this user's app
-    /// passkeys. The challenge is this session's on this device, for 5
+    /// API signs, for [`PasskeyRequest::rp_id`] as for
+    /// [`crate::Client::begin_passkey_sign_in`], listing only this user's
+    /// app passkeys. The challenge is this session's on this device, for 5
     /// minutes; beginning again replaces it. A user with no app passkey
     /// gets [`SdkError::NotFound`]. The challenge is made for this
     /// session's server, as for [`crate::Client::begin_passkey_sign_in`].
     pub async fn begin_confirm_passkey(&self) -> Result<PasskeyRequest, SdkError> {
         match self.call(Request::BeginConfirmPasskey).await? {
-            Reply::PasskeySignInBegun(begun) => Ok(begun.for_server(self.server.as_bytes())),
+            Reply::PasskeySignInBegun(begun) => {
+                let server_id = self.client.pinned_server_id(self.server).await?;
+                Ok(begun.for_server(self.server.as_bytes(), &server_id))
+            }
             other => Err(unexpected(other)),
         }
     }
@@ -1098,10 +1109,13 @@ impl Session {
             .await
     }
 
-    /// How this user wants tracks chosen, on every device.
-    pub async fn track_preferences(&self) -> Result<TrackPreferences, SdkError> {
+    /// How this user wants tracks chosen, on every device, and whether
+    /// this server reads picture subtitles as text. When it does not, the
+    /// picture subtitle choice (`subtitles.bitmap`) has no effect: show it
+    /// disabled.
+    pub async fn track_preferences(&self) -> Result<TrackPreferencesInfo, SdkError> {
         match self.call(Request::GetTrackPreferences).await? {
-            Reply::TrackPreferences(preferences) => Ok(preferences),
+            Reply::TrackPreferences(info) => Ok(info),
             other => Err(unexpected(other)),
         }
     }

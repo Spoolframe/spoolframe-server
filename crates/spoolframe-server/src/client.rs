@@ -25,14 +25,15 @@ use spoolframe_protocol::rpc::{
 };
 use spoolframe_protocol::streams::{bi, reset, uni};
 use spoolframe_protocol::{
-    APP_RP_ID, AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, FinishPasskeySignIn,
-    Hello, LoginPassword, PasskeyInfo, PinProof, PinState, PlexLink, PlexSyncSummary, Reply,
-    Request, Response, ServerInfo, SessionId, SessionInfo, TrustedProfile, UserSummary,
+    ArtworkRequest, ArtworkSize, BitmapSubtitles, ChosenTracks, ConvertedSubtitle, MAX_READ,
+    MediaRead, MediaReadReply, PlaybackHandle, PlaybackPlan, SUBTITLE_CHUNK, Selection,
+    SubtitleAction, TopResult,
 };
 use spoolframe_protocol::{
-    ArtworkRequest, ArtworkSize, ChosenTracks, ConvertedSubtitle, MAX_READ, MediaRead,
-    MediaReadReply, PlaybackHandle, PlaybackPlan, SUBTITLE_CHUNK, Selection, SubtitleAction,
-    TopResult,
+    AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, FinishPasskeySignIn, Hello,
+    LoginPassword, PasskeyInfo, PinProof, PinState, PlexLink, PlexSyncSummary, Reply, Request,
+    Response, ServerInfo, SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile,
+    UserSummary, is_app_rp_id,
 };
 use spoolframe_types::{ArtworkId, MediaId, Namespace, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -1346,7 +1347,7 @@ impl ClientProtocol {
                     .await
                     .map_err(internal)?
                     .into_iter()
-                    .map(passkey_info)
+                    .map(|p| passkey_info(p, self.services.app_passkeys.rp_id()))
                     .collect();
                 Ok(Reply::Passkeys { passkeys })
             }
@@ -1732,12 +1733,14 @@ impl ClientProtocol {
                     PreviewState::None => Err(Error::NoPreviews),
                 }
             }
-            Request::GetTrackPreferences => Ok(Reply::TrackPreferences(
-                self.store()
+            Request::GetTrackPreferences => Ok(Reply::TrackPreferences(TrackPreferencesInfo {
+                preferences: self
+                    .store()
                     .track_preferences(principal)
                     .await
                     .map_err(internal)?,
-            )),
+                ocr_offered: !self.services.subtitles.ocr().languages().is_empty(),
+            })),
             Request::SetTrackPreferences { preferences } => {
                 self.store()
                     .set_track_preferences(principal, &preferences)
@@ -1781,6 +1784,7 @@ impl ClientProtocol {
                 let (selection, chosen) = self
                     .selection(principal, &id, &descriptor, selection)
                     .await?;
+                let bitmap = self.bitmap(principal, bitmap).await?;
                 Ok(Reply::PlaybackPlan {
                     plan: planner::plan(
                         &descriptor,
@@ -1804,6 +1808,7 @@ impl ClientProtocol {
                 let (selection, chosen) = self
                     .selection(principal, &id, &descriptor, selection)
                     .await?;
+                let bitmap = self.bitmap(principal, bitmap).await?;
                 let plan = planner::plan(
                     &descriptor,
                     caps,
@@ -1910,6 +1915,7 @@ impl ClientProtocol {
                     audio: playback.selection.audio,
                     subtitle,
                 };
+                let bitmap = self.bitmap(principal, bitmap).await?;
                 let plan = planner::plan(
                     &descriptor,
                     caps,
@@ -2599,6 +2605,24 @@ impl ClientProtocol {
         Ok((chosen.selection, Some(chosen)))
     }
 
+    /// How a picked bitmap subtitle is shown: as the client asked, or, for
+    /// `Auto`, as the principal's preferences say.
+    async fn bitmap(
+        &self,
+        principal: Principal,
+        requested: BitmapSubtitles,
+    ) -> Result<planner::Bitmap, Error> {
+        if let Some(asked) = planner::Bitmap::asked(requested) {
+            return Ok(asked);
+        }
+        let preferences = self
+            .store()
+            .track_preferences(principal)
+            .await
+            .map_err(internal)?;
+        Ok(planner::Bitmap::Preferred(preferences.subtitles.bitmap))
+    }
+
     /// What a track override for `id` applies to: its show for an episode,
     /// so a pick carries to the rest of the series; else `id` itself.
     async fn override_scope(&self, id: &MediaId) -> Result<String, Error> {
@@ -2767,18 +2791,19 @@ fn recently_signed_in(user: &SessionUser) -> Result<(), Error> {
     Ok(())
 }
 
-/// A stored passkey as the apps see it. Only an app passkey signs in in
-/// an app; a web UI's is listed so its user sees every way they sign in.
-fn passkey_info(p: PasskeyRecord) -> PasskeyInfo {
-    let app = p.rp_id == APP_RP_ID;
+/// A stored passkey as the apps see it. Only an app passkey made for this
+/// server's relying party, `app_rp_id`, signs in in an app (PX-14): one
+/// made for the relying party every server once shared is an app's that
+/// does not. A web UI's is listed so its user sees every way they sign in.
+fn passkey_info(p: PasskeyRecord, app_rp_id: &str) -> PasskeyInfo {
     PasskeyInfo {
+        app: is_app_rp_id(&p.rp_id),
+        usable_here: p.rp_id == app_rp_id,
         id: p.credential_id,
         name: p.name,
         created_at: p.created_at,
         last_used_at: p.last_used_at,
         rp_id: p.rp_id,
-        app,
-        usable_here: app,
     }
 }
 

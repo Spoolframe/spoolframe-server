@@ -2292,3 +2292,74 @@
   no failed sign-in. The client SDK's `finish_passkey_sign_in`
   and `finish_confirm_passkey` send an app's empty handle as `None`.
   `PROTOCOL_VERSION` stays 4: see "The user handle" in PROTOCOL.md.
+- Each user chooses how picture subtitles (PGS, VobSub, DVB) are shown:
+  read as text (OCR), the default, or shown as pictures. The choice is
+  `subtitles.bitmap` in the track preferences (`"text"` or
+  `"pictures"`), kept per user, so it follows the user to every device.
+  When an app asks for `bitmap: auto`, the server reads the track as text
+  if it can, else the app draws the pictures, else they are burned in. A
+  user who wants pictures has the app draw them, or has them burned in.
+  An app's explicit `text` or `burn_in` still wins. With the server's
+  `subtitles.ocr` off, pictures are shown whatever the preference. Before
+  this, `auto` let an app that draws PGS draw it, and read the track as
+  text only for apps that cannot. The admin debug plan's `auto` plans as
+  for a user who never chose.
+- The track preferences say whether the server offers picture subtitles
+  as text. `GetTrackPreferences` and the admin API's
+  `me.trackPreferences` now answer the preferences with `ocr_offered`
+  (`ocrOffered`), true when `subtitles.ocr` is on and tesseract has a
+  language. Apps show the picture subtitle choice disabled when it is
+  false. The SDK's `track_preferences` returns `TrackPreferencesInfo`.
+  The reply's encoding changed: update the server and SDK together.
+- The web UI's OCR switch moved from the Plex form (the wizard's Plex
+  step and Settings › Plex) to the Playback settings and the wizard's
+  Playback step, beside the OCR languages. It reads "Offer picture
+  subtitles as text (OCR)": "Picture subtitles (PGS, VobSub, DVB) can be
+  read into text, so any device can show them styled and sized. Each user
+  picks what they see." The note under it says what users get when OCR
+  is off or tesseract has no language. My profile › Playback has a new
+  row, "Picture subtitles": Read as text (OCR) or Show as pictures. When
+  the server does not offer OCR, the row is disabled, shows pictures, and
+  says why.
+- Each server has a server id: 80 random bits, written as 16 lowercase
+  base32 characters, a DNS label. The server makes it at its first start
+  and keeps it in `server.id` in its state directory (mode `0600`),
+  beside its key. A new key keeps it. `spoolframe-server id` prints it
+  under the endpoint id, each line labelled, and the server logs it with
+  its fingerprint. A `server.id` that is not one stops the server.
+- `PROTOCOL_VERSION` is 5 (PX-14): update the server and SDK together.
+  `ServerInfo` has a new required field, `server_id`. Revision 5 also
+  covers PX-13's change to the `GetTrackPreferences` reply (now a
+  `TrackPreferencesInfo` with `ocr_offered`), which shipped without a
+  bump. A mismatched
+  build is now refused at `Hello`, not on one request later.
+- Admins see the server id (PX-14). The admin API's `serverStatus` has
+  a required `serverId`. `spoolframe-server status` prints it and the
+  passkey domain, `<server id>.spoolframe.app`. The web UI's Server page
+  has a "Passkey domain" row, under the fingerprint, with a copy button:
+  the domain a password manager lists the app passkeys under.
+- The SDK's pin is the server's key and its server id (PX-14). Both are
+  pinned at the first connect; a server saved before takes its id at the
+  next connect. A new name is saved without asking. A new key with the
+  pinned id is `IdentityChanged`, and `trust_new_identity` keeps the id.
+  The pinned key with a new id is the new `SdkError::ServerIdChanged`,
+  refused every time. A new key and a new id are another server: a name
+  no longer marks a server with an id pinned as replaced.
+  `ServerEntry` has `server_id`.
+- App passkeys have a relying party per server (PX-14):
+  `<server id>.spoolframe.app`, at `https://<server id>.spoolframe.app`,
+  for registration, sign-in and confirmation. A security key with
+  passkeys for two servers, or two accounts, offered all of them to a
+  sign-in that listed none, and a server refused the one the client
+  took; now it offers only that server's. The server refuses another
+  relying party's hash and any other origin, `https://spoolframe.app`
+  too. The challenge stays bound to the pinned key (PX-10), as a server
+  can name another's id.
+- `PasskeyCreation` and `PasskeyRequest` carry `rp_id` and `origin`,
+  which the SDK makes from the pinned server id; `APP_RP_ID` and
+  `APP_ORIGIN` are gone. A passkey's account name is
+  `<username> @ <server name>`; its display name is the user's own.
+- App passkeys made for `spoolframe.app` are kept. They sign in nowhere,
+  are listed as app passkeys that are not usable, and My profile says to
+  remove them and add them again in the app. The server logs them at
+  start. `LEGACY_APP_RP_ID` and `is_app_rp_id` name them.

@@ -76,9 +76,10 @@ async fn register(device: &TestClient, session: &SessionId, app: &mut App, name:
         .call(Some(session), Request::BeginPasskeyRegistration)
         .await
     {
-        Response::Ok(Reply::PasskeyRegistrationBegun(begun)) => {
-            begun.for_server(device.conn.remote_id().as_bytes())
-        }
+        Response::Ok(Reply::PasskeyRegistrationBegun(begun)) => begun.for_server(
+            device.conn.remote_id().as_bytes(),
+            &device.server_id().await,
+        ),
         other => panic!("not begun: {other:?}"),
     };
     assert_eq!(
@@ -97,9 +98,10 @@ async fn begin_confirm(device: &TestClient, session: &SessionId) -> PasskeyReque
         .call(Some(session), Request::BeginConfirmPasskey)
         .await
     {
-        Response::Ok(Reply::PasskeySignInBegun(begun)) => {
-            begun.for_server(device.conn.remote_id().as_bytes())
-        }
+        Response::Ok(Reply::PasskeySignInBegun(begun)) => begun.for_server(
+            device.conn.remote_id().as_bytes(),
+            &device.server_id().await,
+        ),
         other => panic!("not begun: {other:?}"),
     }
 }
@@ -342,7 +344,7 @@ async fn a_confirmation_signed_for_another_server_confirms_nothing() {
         Response::Ok(Reply::PasskeySignInBegun(begun)) => begun,
         other => panic!("not begun: {other:?}"),
     };
-    let signed = app.get(&begun.for_server(&[0x55; 32]));
+    let signed = app.get(&begun.for_server(&[0x55; 32], &server.server_id));
     assert_eq!(finish_confirm(&phone, &session, signed).await, REFUSED);
     assert_eq!(phone.call(Some(&session), approve(&code)).await, NOT_RECENT);
     tv.close().await;
@@ -363,7 +365,7 @@ async fn a_confirmation_takes_only_its_own_session_s_challenge() {
         .await
     {
         Response::Ok(Reply::PasskeySignInBegun(begun)) => {
-            begun.for_server(phone.conn.remote_id().as_bytes())
+            begun.for_server(phone.conn.remote_id().as_bytes(), &phone.server_id().await)
         }
         other => panic!("not begun: {other:?}"),
     };
@@ -393,7 +395,7 @@ async fn confirming_needs_a_session() {
         .await
     {
         Response::Ok(Reply::PasskeySignInBegun(begun)) => {
-            begun.for_server(phone.conn.remote_id().as_bytes())
+            begun.for_server(phone.conn.remote_id().as_bytes(), &phone.server_id().await)
         }
         other => panic!("not begun: {other:?}"),
     };

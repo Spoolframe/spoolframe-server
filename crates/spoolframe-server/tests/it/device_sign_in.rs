@@ -243,7 +243,7 @@ async fn server_with_web(test: &str, options: ServerOptions) -> (TestServer, Soc
         },
     )
     .await;
-    let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
+    let web = crate::admin::serve_beside(&server, WEB).await;
     (server, web)
 }
 

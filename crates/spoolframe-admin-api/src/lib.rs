@@ -17,9 +17,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 pub use spoolframe_types::{
-    Album, Artist, Artwork, ArtworkKind, AudioRole, Episode, Item, LibraryKind, Marker, MarkerKind,
-    Movie, Platform, PlaybackState, Role, SdhPreference, Season, Show, SubtitleMode, SubtitleRole,
-    Track, TrackPreferences,
+    APP_RP_DOMAIN, Album, Artist, Artwork, ArtworkKind, AudioRole, BitmapPreference, Episode, Item,
+    LibraryKind, Marker, MarkerKind, Movie, Platform, PlaybackState, Role, SdhPreference, Season,
+    Show, SubtitleMode, SubtitleRole, Track, TrackPreferences,
 };
 
 /// JSON-RPC error codes the admin API returns, beside the standard ones.
@@ -349,13 +349,15 @@ pub struct PasskeyEntry {
     pub last_used_at: Option<i64>,
     /// The host it was made for.
     pub rp_id: String,
-    /// Whether that is the host the server is at now: one made for another
-    /// host (before `admin.public_url` changed) signs no one in. An app
-    /// passkey is always usable, in the apps.
+    /// Whether it signs in: a web UI's made for the host the server is at
+    /// now (one made before `admin.public_url` changed signs no one in), or
+    /// an app's made for this server's relying party,
+    /// `<server id>.spoolframe.app` (PX-14). An app's made for the one
+    /// every server once shared, `spoolframe.app`, does not: it is to be
+    /// added again in the app.
     pub usable: bool,
-    /// Made in a Spoolframe app (P3-19), for the relying party every server
-    /// shares (`spoolframe.app`), and of use in the apps only: shown as
-    /// "Spoolframe app · <name>", where its name is the device's.
+    /// Made in a Spoolframe app (P3-19), and of use in the apps only: shown
+    /// as "Spoolframe app · <name>", where its name is the device's.
     pub app: bool,
 }
 
@@ -419,6 +421,11 @@ pub struct ServerStatus {
     /// That key's fingerprint (P1-21), for checking a client's pin.
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// The server id (PX-14): made once, kept when the key is replaced.
+    /// The apps' passkeys for this server are made for
+    /// `<server id>.`[`APP_RP_DOMAIN`], which the Server page shows as
+    /// the passkey domain. Known from the start, unlike the key.
+    pub server_id: String,
     pub transcoding: TranscodingStatus,
     /// Whether the server announces itself on the LAN (mDNS).
     #[serde(default)]
@@ -779,6 +786,18 @@ pub enum PlexPinState {
     },
     /// plex.tv has forgotten it: begin another.
     Expired,
+}
+
+/// The caller's track preferences (`me.trackPreferences`), and whether
+/// this server reads picture subtitles as text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackPreferencesInfo {
+    pub preferences: TrackPreferences,
+    /// `subtitles.ocr` is on and tesseract has at least one language.
+    /// When false, `preferences.subtitles.bitmap` has no effect: every
+    /// picture subtitle is shown as pictures.
+    pub ocr_offered: bool,
 }
 
 /// What a user picked for one series or movie (P1-20), which its next
@@ -1975,9 +1994,9 @@ pub trait MeApi {
     ) -> jsonrpsee::core::RpcResult<UserInfo>;
 
     /// How the caller wants tracks chosen (P1-20), as their devices read
-    /// them.
+    /// them, and whether this server reads picture subtitles as text.
     #[method(name = "trackPreferences", with_extensions)]
-    async fn track_preferences(&self) -> jsonrpsee::core::RpcResult<TrackPreferences>;
+    async fn track_preferences(&self) -> jsonrpsee::core::RpcResult<TrackPreferencesInfo>;
 
     /// Replace them, for every device of the caller's: the next playback
     /// anywhere uses them.

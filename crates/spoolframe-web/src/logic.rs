@@ -177,6 +177,27 @@ pub fn passkey_title(passkey: &PasskeyEntry) -> String {
     }
 }
 
+/// Why a passkey that does not sign in does not, for its row: `server` is
+/// "this server's" in My profile, "the server's" for an admin. An app
+/// passkey made for the relying party every server once shared (PX-14) is
+/// old, and is added again in the app; a web UI's was made for another
+/// address. `None` for one that signs in.
+pub fn unusable_note(passkey: &PasskeyEntry, server: &str) -> Option<String> {
+    if passkey.usable {
+        None
+    } else if passkey.app {
+        Some(
+            "An old app passkey: it signs in nowhere now. Remove it, and add it again in the app."
+                .to_owned(),
+        )
+    } else {
+        Some(format!(
+            "Made for {}: it does not work at {server} address now.",
+            passkey.rp_id
+        ))
+    }
+}
+
 /// Whether a page at host `page` can make and use passkeys bound to
 /// `rp_id`: the browser takes its own host, or a parent domain of it.
 pub fn page_serves(page: &str, rp_id: &str) -> bool {
@@ -485,6 +506,13 @@ pub fn server_version(version: &str, revision: Option<&str>) -> String {
     }
 }
 
+/// The Server page's "Passkey domain" (PX-14): the relying party the apps
+/// make this server's passkeys for, `<server id>.spoolframe.app`, as a
+/// password manager lists them.
+pub fn passkey_domain(server_id: &str) -> String {
+    format!("{server_id}.{}", spoolframe_admin_api::APP_RP_DOMAIN)
+}
+
 /// Plex's version to its minor, as the boards show it: `1.41.0.8992-…`
 /// is 1.41.
 pub fn plex_version(v: &str) -> String {
@@ -772,6 +800,14 @@ mod tests {
     }
 
     #[test]
+    fn the_passkey_domain_is_the_server_id_under_spoolframe_app() {
+        assert_eq!(
+            passkey_domain("mzxw6ytbojtg633c"),
+            "mzxw6ytbojtg633c.spoolframe.app"
+        );
+    }
+
+    #[test]
     fn the_plex_line_says_its_version_to_the_minor() {
         assert_eq!(plex_version("1.41.0.8992-f1a2b3c4d"), "1.41");
         assert_eq!(
@@ -796,6 +832,30 @@ mod tests {
             usable: true,
             app,
         }
+    }
+
+    #[test]
+    fn an_old_app_passkey_is_to_be_added_again_and_a_web_one_names_its_host() {
+        let usable = passkey("Alice's iPhone", "mzxw6ytbojtg633c.spoolframe.app", true);
+        assert_eq!(unusable_note(&usable, "this server's"), None);
+        let old = PasskeyEntry {
+            usable: false,
+            ..passkey("Alice's iPhone", "spoolframe.app", true)
+        };
+        assert_eq!(
+            unusable_note(&old, "this server's").as_deref(),
+            Some(
+                "An old app passkey: it signs in nowhere now. Remove it, and add it again in the app."
+            )
+        );
+        let moved = PasskeyEntry {
+            usable: false,
+            ..passkey("MacBook", "old.example.org", false)
+        };
+        assert_eq!(
+            unusable_note(&moved, "the server's").as_deref(),
+            Some("Made for old.example.org: it does not work at the server's address now.")
+        );
     }
 
     /// An app passkey (P3-19) is named for the device it was made on; the

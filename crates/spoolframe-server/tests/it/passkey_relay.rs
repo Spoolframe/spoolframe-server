@@ -1,12 +1,16 @@
-//! PX-09 finding 2 (A-3, C-1): every server shares the app relying party
-//! `spoolframe.app`, so a passkey ceremony could be relayed. A malicious
-//! server M begins a sign-in on the real server S, hands S's request to
-//! a victim's app as its own, and finishes on S with what the app
-//! signed: S would sign M in as the victim.
+//! PX-09 finding 2 (A-3, C-1): a passkey ceremony could be relayed. A
+//! malicious server M begins a sign-in on the real server S, hands S's
+//! request to a victim's app as its own, and finishes on S with what the
+//! app signed: S would sign M in as the victim.
+//!
+//! Each server has its own relying party since PX-14, named by the server
+//! id the server gives in `ServerInfo`, and M gives S's: the app then
+//! signs for S's relying party, with S's passkey. Only the challenge,
+//! made from the key the app pinned and dialled, which is M's, stops it.
 //!
 //! M here is a stand-in, not a Spoolframe server: an endpoint that says
-//! Hello as itself, relays `BeginPasskeySignIn` to S from its own endpoint
-//! and keeps the `FinishPasskeySignIn` it is sent.
+//! Hello as itself with S's server id, relays `BeginPasskeySignIn` to S
+//! from its own endpoint and keeps the `FinishPasskeySignIn` it is sent.
 
 use std::sync::{Arc, Mutex};
 
@@ -57,6 +61,7 @@ impl Relay {
         let kept = Arc::default();
         let task = tokio::spawn(accept(
             endpoint.clone(),
+            target.server_id.to_string(),
             upstream.clone(),
             Arc::clone(&kept),
         ));
@@ -80,6 +85,7 @@ impl Relay {
 
 async fn accept(
     endpoint: Endpoint,
+    server_id: String,
     upstream: Arc<TestClient>,
     kept: Arc<Mutex<Option<FinishPasskeySignIn>>>,
 ) {
@@ -90,6 +96,7 @@ async fn accept(
         tokio::spawn(serve(
             conn,
             endpoint.id(),
+            server_id.clone(),
             upstream.clone(),
             Arc::clone(&kept),
         ));
@@ -99,16 +106,25 @@ async fn accept(
 async fn serve(
     conn: Connection,
     id: EndpointId,
+    server_id: String,
     upstream: Arc<TestClient>,
     kept: Arc<Mutex<Option<FinishPasskeySignIn>>>,
 ) {
     while let Ok((send, recv)) = conn.accept_bi().await {
-        tokio::spawn(stream(id, upstream.clone(), Arc::clone(&kept), send, recv));
+        tokio::spawn(stream(
+            id,
+            server_id.clone(),
+            upstream.clone(),
+            Arc::clone(&kept),
+            send,
+            recv,
+        ));
     }
 }
 
 async fn stream(
     id: EndpointId,
+    server_id: String,
     upstream: Arc<TestClient>,
     kept: Arc<Mutex<Option<FinishPasskeySignIn>>>,
     mut send: SendStream,
@@ -125,6 +141,8 @@ async fn stream(
         Request::Hello(_) => Response::Ok(Reply::ServerInfo(ServerInfo {
             name: "Home Media".into(),
             endpoint_id: id.to_string(),
+            // S's, not one of its own.
+            server_id,
             protocol_version: PROTOCOL_VERSION,
             server_version: "0".into(),
             auth_methods: vec![AuthMethod::Password],
@@ -206,6 +224,8 @@ async fn a_passkey_sign_in_relayed_from_another_server_signs_no_one_in() {
         .begin_passkey_sign_in(&relay.id(), Some("alice"))
         .await
         .unwrap();
+    // S's relying party, from the id M claimed: the app finds S's passkey.
+    assert_eq!(request.rp_id, target.server_id.rp_id());
     let signed = app.get(&request);
     assert_eq!(
         victim

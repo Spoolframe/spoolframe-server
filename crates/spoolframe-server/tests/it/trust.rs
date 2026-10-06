@@ -794,7 +794,7 @@ mod web {
     #[tokio::test]
     async fn a_user_trusts_a_device_they_used_from_the_web_after_a_recent_sign_in() {
         let server = server("trust-web-me").await;
-        let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
+        let web = crate::admin::serve_beside(&server, WEB).await;
         let tv = device(&server, "Living room TV").await;
         sign_in(&tv, "alice", PASSWORD, false).await;
         let tv_id = tv.endpoint.id().to_string();
@@ -878,7 +878,7 @@ mod web {
     async fn an_admin_trusts_another_user_s_device_and_a_reset_password_ends_it() {
         let server = server("trust-web-admin").await;
         make_admin(&server, "bob").await;
-        let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
+        let web = crate::admin::serve_beside(&server, WEB).await;
         let tv = device(&server, "Living room TV").await;
         sign_in(&tv, "alice", PASSWORD, false).await;
         let tv_id = tv.endpoint.id().to_string();
@@ -925,7 +925,7 @@ mod web {
     async fn an_admin_stops_trusting_another_user_s_device_and_signs_them_out_there() {
         let server = server("trust-web-admin-off").await;
         make_admin(&server, "bob").await;
-        let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
+        let web = crate::admin::serve_beside(&server, WEB).await;
         let tv = device(&server, "Living room TV").await;
         remembered(&tv).await;
         let tv_id = tv.endpoint.id().to_string();
@@ -962,7 +962,7 @@ mod web {
     async fn disabling_a_user_from_the_web_ends_their_trust() {
         let server = server("trust-web-disable").await;
         make_admin(&server, "bob").await;
-        let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
+        let web = crate::admin::serve_beside(&server, WEB).await;
         let tv = device(&server, "Living room TV").await;
         remembered(&tv).await;
         let root = on_the_web(web, "bob", "battery staple").await;
@@ -984,7 +984,7 @@ mod web {
     #[tokio::test]
     async fn a_web_approval_decides_whether_the_tv_is_remembered() {
         let server = server("trust-web-approve").await;
-        let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
+        let web = crate::admin::serve_beside(&server, WEB).await;
         let alice = on_the_web(web, "alice", PASSWORD).await;
         for (asked, approved, expected) in [
             (true, false, false),

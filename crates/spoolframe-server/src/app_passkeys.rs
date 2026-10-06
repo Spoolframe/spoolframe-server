@@ -1,17 +1,28 @@
-//! Passkeys in the apps (P3-19): a second relying party, [`APP_RP_ID`],
-//! that every server shares and that needs nothing configured.
+//! Passkeys in the apps (P3-19): a second relying party, this server's
+//! own under `spoolframe.app` (PX-14), `<server id>.spoolframe.app`, that
+//! needs nothing configured.
 //!
 //! A platform's passkey API (Apple's first) works only for a domain the
 //! app is associated with when it is built, and a self-hosted server's own
 //! domain is not known then. So the apps make and use their passkeys for
-//! `spoolframe.app`, at the origin [`APP_ORIGIN`] the platform writes into
-//! `clientDataJSON`. The ceremonies run over `spoolframe/client/1`; the
-//! server never contacts `spoolframe.app`. It does not depend on
-//! `admin.public_url`, so a LAN-only server, whose web UI has no passkeys,
-//! has them in the apps.
+//! a subdomain of `spoolframe.app`, named by the server id
+//! ([`ServerId::rp_id`]), at the origin ([`ServerId::origin`]) the
+//! platform writes into `clientDataJSON`. One association file at
+//! `spoolframe.app` covers every subdomain. The ceremonies run over
+//! `spoolframe/client/1`; the server never contacts `spoolframe.app`. It
+//! does not depend on `admin.public_url`, so a LAN-only server, whose web
+//! UI has no passkeys, has them in the apps.
+//!
+//! Every server once shared `spoolframe.app` itself. A security key with
+//! passkeys for two servers then answered a sign-in that listed none with
+//! both, and the server whose passkey the platform did not take refused
+//! it. Passkeys stored for the shared relying party
+//! ([`spoolframe_protocol::LEGACY_APP_RP_ID`]) are kept, listed as app
+//! passkeys that do not sign in here, so their users see to add them
+//! again; they sign no one in, as one made for another host never does.
 //!
 //! App passkeys are kept with the web UI's ([`crate::passkeys`]), under
-//! the relying-party ID `spoolframe.app`, which is what marks them: the
+//! this server's app relying-party ID, which is what marks them: the
 //! same list in My profile, the same removal and last-method rule, the
 //! same user handle (random, one per user and server) and the same limit
 //! on failed sign-ins.
@@ -25,11 +36,13 @@
 //! The device is sent a nonce, not the challenge: the challenge is
 //! [`app_passkey_challenge`] of this server's endpoint id and the nonce,
 //! and the app's SDK makes it with the id it dialled (PX-09, finding 2).
-//! `clientDataJSON` names no server, as the origin is every server's; so
-//! without that, a server that begins a ceremony here and hands the
-//! request to an app as its own would have the app sign for here. With
-//! it, the app signs for the server it talks to, and this one refuses
-//! that. A passkey made at one server is unknown at another.
+//! The relying party does not do that: it comes from the server id a
+//! server names, and a server may name this one's. So without the
+//! challenge, a server that claims this server's id, begins a ceremony
+//! here and hands the request to an app as its own would have the app
+//! sign for here. With it, the app signs for the server it talks to, and
+//! this one refuses that. A passkey made at one server is unknown at
+//! another.
 //!
 //! Anyone can begin a sign-in, so it lists no passkeys, even for a
 //! username: those would tell anyone a user's credential ids. Passkeys are
@@ -45,8 +58,8 @@ use password_hash::rand_core::{OsRng, RngCore};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use spoolframe_protocol::{
-    APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, NONCE_LEN,
-    PasskeyRegistrationBegun, PasskeySignInBegun, app_passkey_challenge,
+    FinishPasskeyRegistration, FinishPasskeySignIn, NONCE_LEN, PasskeyRegistrationBegun,
+    PasskeySignInBegun, ServerId, app_passkey_challenge,
 };
 use webauthn_rs::prelude::{
     DiscoverableAuthentication, PasskeyRegistration, PublicKeyCredential,
@@ -64,6 +77,9 @@ use crate::store::users::{LocalUserId, UserRecord, normalize_username};
 
 /// The apps' relying party, and the ceremonies begun with it.
 pub struct AppPasskeys {
+    /// The server's id, which `ServerInfo` names it by.
+    server_id: ServerId,
+    /// `<server id>.spoolframe.app`, at its origin only.
     party: RelyingParty,
     /// How long a begun ceremony can be finished.
     lifetime: Duration,
@@ -105,28 +121,40 @@ impl std::fmt::Debug for AppPasskeys {
     }
 }
 
-impl Default for AppPasskeys {
-    fn default() -> Self {
-        Self::with_lifetime(CEREMONY_LIFETIME)
-    }
-}
-
 impl AppPasskeys {
-    /// As the default, with ceremonies that last `lifetime` (tests shorten
-    /// it).
-    pub fn with_lifetime(lifetime: Duration) -> Self {
+    /// The app passkeys of the server whose id is `server_id`.
+    pub fn new(server_id: ServerId) -> Self {
+        Self::with_lifetime(server_id, CEREMONY_LIFETIME)
+    }
+
+    /// As [`AppPasskeys::new`], with ceremonies that last `lifetime`
+    /// (tests shorten it).
+    pub fn with_lifetime(server_id: ServerId, lifetime: Duration) -> Self {
         Self {
             party: RelyingParty {
                 user_handle_optional: true,
-                ..RelyingParty::at(APP_RP_ID, APP_ORIGIN)
-                    .expect("spoolframe.app at https://spoolframe.app is a relying party")
+                ..RelyingParty::at(&server_id.rp_id(), &server_id.origin()).expect(
+                    "a server id is a DNS label, so its subdomain of spoolframe.app is a \
+                     relying party",
+                )
             },
+            server_id,
             lifetime,
             registrations: Mutex::default(),
             sign_ins: Mutex::default(),
             confirms: Mutex::default(),
             clock: crate::clock::Clock::default(),
         }
+    }
+
+    /// The server's id.
+    pub fn server_id(&self) -> &ServerId {
+        &self.server_id
+    }
+
+    /// The relying party of this server's app passkeys.
+    pub fn rp_id(&self) -> &str {
+        &self.party.rp_id
     }
 
     /// Ceremonies expire by `clock` (tests move it instead of sleeping).
@@ -158,19 +186,19 @@ impl AppPasskeys {
             .list_passkeys(user.id)
             .await?
             .iter()
-            .filter(|p| p.rp_id == APP_RP_ID)
+            .filter(|p| p.rp_id == self.party.rp_id)
             .map(|p| credential(p).map(|c| c.cred_id().clone()))
             .collect::<Result<Vec<_>, _>>()?;
         let exclude_credential_ids = existing.iter().map(|id| id.to_vec()).collect();
-        // One keychain may hold app passkeys of several servers, all for
-        // spoolframe.app: the server's name tells them apart.
+        // The relying party is an opaque id: a password manager shows the
+        // account's name, and the server's name in it says which server it
+        // is. The display name is the user's own.
         let display_name = user.display_name.as_deref().unwrap_or(&user.username);
-        let user_name = format!("{} on {server_name}", user.username);
-        let display_name = format!("{display_name} on {server_name}");
+        let user_name = format!("{} @ {server_name}", user.username);
         let (options, state) = self
             .party
             .webauthn
-            .start_passkey_registration(handle, &user_name, &display_name, Some(existing))
+            .start_passkey_registration(handle, &user_name, display_name, Some(existing))
             .map_err(|e| CeremonyError::Internal(e.to_string()))?;
         let nonce = nonce();
         let state = with_challenge(state, "rs", &app_passkey_challenge(server, &nonce))
@@ -190,7 +218,7 @@ impl AppPasskeys {
             nonce,
             user_id: options.public_key.user.id.to_vec(),
             user_name,
-            display_name,
+            display_name: display_name.to_owned(),
             exclude_credential_ids,
         })
     }
@@ -217,7 +245,7 @@ impl AppPasskeys {
             .ok_or(CeremonyError::NoCeremony)?;
         let (id, json) = self.party.made(&registered(made), &state)?;
         let record = store
-            .add_passkey(user.id, &id, name, &json, APP_RP_ID)
+            .add_passkey(user.id, &id, name, &json, &self.party.rp_id)
             .await?;
         tracing::info!(username = %user.username, passkey = %record.name, "app passkey added");
         Ok(record)
@@ -236,7 +264,7 @@ impl AppPasskeys {
         username: Option<&str>,
     ) -> Result<PasskeySignInBegun, SignInError> {
         let allowed = match username.map(normalize_username) {
-            Some(Ok(username)) => store.passkey_ids_of(&username, APP_RP_ID).await?,
+            Some(Ok(username)) => store.passkey_ids_of(&username, &self.party.rp_id).await?,
             Some(Err(_)) | None => Vec::new(),
         };
         let (_, state) = self
@@ -310,7 +338,7 @@ impl AppPasskeys {
             .list_passkeys(user)
             .await?
             .into_iter()
-            .filter(|p| p.rp_id == APP_RP_ID)
+            .filter(|p| p.rp_id == self.party.rp_id)
             .map(|p| p.credential_id)
             .collect();
         if allowed.is_empty() {

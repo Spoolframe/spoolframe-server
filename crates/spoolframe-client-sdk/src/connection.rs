@@ -167,6 +167,12 @@ impl ServerConnection {
                 actual: info.endpoint_id,
             });
         }
+        // It names the relying party of the server's app passkeys (PX-14):
+        // one that is not an id is never pinned or used.
+        if let Err(e) = spoolframe_protocol::ServerId::parse(&info.server_id) {
+            conn.close(0u32.into(), b"not a server id");
+            return Err(SdkError::Protocol(e.to_string()));
+        }
         Ok(Self {
             conn,
             info,

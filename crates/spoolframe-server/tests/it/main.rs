@@ -36,6 +36,7 @@ mod recent_admin;
 mod sdk;
 mod search;
 mod server_addresses;
+mod server_pin;
 mod sessions;
 mod settings;
 mod sso;

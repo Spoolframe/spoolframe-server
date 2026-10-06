@@ -289,6 +289,8 @@ fn test_module() -> String {
 /// A running server on loopback, with its database at hand.
 pub struct TestServer {
     pub server: Server,
+    /// Its server id, kept in its state directory.
+    pub server_id: spoolframe_protocol::ServerId,
     /// What its store, logins, sign-in codes, playbacks and app passkeys
     /// time expiry by: a test moves it on instead of sleeping (PX-09).
     pub clock: Clock,
@@ -326,6 +328,7 @@ impl TestServer {
     /// A server on `dir` (its key and database), run as `options` say.
     pub async fn start_with(dir: StateDir, options: ServerOptions) -> Self {
         let key = identity::load_or_create(&dir).unwrap();
+        let server_id = identity::load_or_create_server_id(&dir).unwrap();
         let clock = Clock::default();
         let store = Store::open(&dir).await.unwrap().with_clock(clock.clone());
         let media = dir.join("media").join("movie.mkv");
@@ -425,6 +428,7 @@ impl TestServer {
             previews,
             app_passkeys: Arc::new(
                 spoolframe_server::app_passkeys::AppPasskeys::with_lifetime(
+                    server_id.clone(),
                     options.passkey_lifetime,
                 )
                 .with_clock(clock.clone()),
@@ -454,6 +458,7 @@ impl TestServer {
             .unwrap();
         Self {
             server,
+            server_id,
             clock,
             name,
             store,
@@ -1078,6 +1083,15 @@ impl TestClient {
     ) -> Response {
         self.hello_from(spoolframe_types::Platform::Linux, device_name, capabilities)
             .await
+    }
+
+    /// The server id the server names in `ServerInfo` (PX-14): what an app
+    /// makes its passkeys' relying party of, once pinned.
+    pub async fn server_id(&self) -> spoolframe_protocol::ServerId {
+        match self.hello_as(None).await {
+            Response::Ok(Reply::ServerInfo(info)) => info.server_id.parse().unwrap(),
+            other => panic!("no ServerInfo: {other:?}"),
+        }
     }
 
     /// `Hello` from an app on `platform`.

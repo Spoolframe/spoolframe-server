@@ -23,6 +23,7 @@ pub mod previews;
 pub mod resource;
 pub mod rpc;
 pub mod search;
+pub mod server_id;
 pub mod streams;
 
 pub use artwork::{ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
@@ -31,12 +32,12 @@ pub use messages::{
     AuthMethod, ConfirmPassword, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, HomeScreen,
     LoginPassword, MAX_HELLO_TEXT, ManifestKind, PROTOCOL_VERSION, PinProof, PinState, Reply,
     Request, RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo, SessionId, SessionInfo,
-    TrustedProfile, UserSummary,
+    TrackPreferencesInfo, TrustedProfile, UserSummary,
 };
 pub use passkeys::{
-    APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, NONCE_LEN,
-    PasskeyCreation, PasskeyInfo, PasskeyRegistrationBegun, PasskeyRequest, PasskeySignInBegun,
-    app_passkey_challenge,
+    FinishPasskeyRegistration, FinishPasskeySignIn, LEGACY_APP_RP_ID, NONCE_LEN, PasskeyCreation,
+    PasskeyInfo, PasskeyRegistrationBegun, PasskeyRequest, PasskeySignInBegun,
+    app_passkey_challenge, is_app_rp_id,
 };
 pub use playback::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
@@ -46,6 +47,7 @@ pub use playback::{
 pub use plex::{PlexLink, PlexSyncSummary};
 pub use previews::{PreviewTile, Previews};
 pub use search::{SearchCounts, SearchGroup, SearchRequest, SearchResults, TopResult};
+pub use server_id::{APP_RP_DOMAIN, InvalidServerId, SERVER_ID_LEN, ServerId};
 
 /// Development ALPN. Breaking revisions currently retain `/1` and require
 /// a coordinated server/SDK update; [`PROTOCOL_VERSION`] identifies the revision.

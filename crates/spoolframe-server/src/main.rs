@@ -10,6 +10,7 @@ use spoolframe_media::encoders::FfmpegCommand;
 use spoolframe_media::ocr::Ocr;
 use spoolframe_plex::{Failures, LibraryPaths, Scope};
 use spoolframe_server::admin::{self, Admin, CookiePolicy, SetupCode, StatusSource};
+use spoolframe_server::app_passkeys::AppPasskeys;
 use spoolframe_server::artwork::ArtworkCache;
 use spoolframe_server::auth::Auth;
 use spoolframe_server::catalog::{Composite, LiveCatalog, PlexSource};
@@ -88,8 +89,9 @@ enum Command {
         #[command(subcommand)]
         command: MediaCommand,
     },
-    /// Print the server's EndpointId, the identity clients pin. Creates the
-    /// server key if this is the first start.
+    /// Print the server's EndpointId, the identity clients pin, and its
+    /// server id, which names its app passkeys' relying party. Creates
+    /// either if this is the first start.
     Id,
     /// Print the server key's fingerprint, to compare with what a client
     /// shows before it pins this server. Works with the server stopped;
@@ -283,7 +285,10 @@ async fn main() -> Result<()> {
         Some(Command::User { command }) => admin_cli::user(config.admin.listen()?, command).await,
         Some(Command::Status) => admin_cli::status(config.admin.listen()?).await,
         Some(Command::Id) => {
-            println!("{}", identity::load_or_create(state_dir)?.public());
+            let key = identity::load_or_create(state_dir)?;
+            let server_id = identity::load_or_create_server_id(state_dir)?;
+            println!("endpoint id: {}", key.public());
+            println!("server id:   {server_id}");
             Ok(())
         }
         Some(Command::Fingerprint) => {
@@ -344,11 +349,13 @@ async fn run(
     let shutdown = shutdown_signal()?;
     // The key first: if it cannot be loaded nothing else should start.
     let key = identity::load_or_create(state_dir)?;
+    let server_id = identity::load_or_create_server_id(state_dir)?;
     let endpoint_id = key.public().to_string();
     // What a person compares with a client's screen before pinning (P1-21).
     tracing::info!(
         server = config.server_name(),
         fingerprint = identity::fingerprint(&key),
+        %server_id,
         "server identity"
     );
     let plex = runtime::plex_catalog(config, layers, &Secrets::new(state_dir))?.map(Arc::new);
@@ -416,7 +423,7 @@ async fn run(
     .with_context(|| format!("cannot open the previews cache {}", previews_dir.display()))?;
     let name = ServerName::new(config.server_name());
     let status = Arc::new(
-        StatusSource::new(name.clone(), transcoding.clone())
+        StatusSource::new(name.clone(), server_id.clone(), transcoding.clone())
             .with_mdns(config.network.endpoint_options()?.mdns)
             .with_ocr_languages(subtitles.ocr().languages().iter().cloned().collect()),
     );
@@ -481,14 +488,14 @@ async fn run(
              lets in; set admin.trusted_proxies to the proxy's address"
         );
     }
-    let passkeys = Arc::new(Passkeys::new(&admin_origins));
+    let passkeys = Arc::new(Passkeys::new(&admin_origins, &server_id));
     match (passkeys.rp_id(), passkeys.unavailable()) {
         (Some(rp_id), _) => tracing::info!(rp_id, "passkeys are bound to this host"),
         (None, why) => tracing::warn!(why, "no passkeys in the web UI"),
     }
     tracing::info!(
-        rp_id = spoolframe_protocol::APP_RP_ID,
-        "the apps' passkeys are bound to the shared relying party"
+        rp_id = server_id.rp_id(),
+        "the apps' passkeys are bound to this server's relying party"
     );
     passkeys.log_orphans(auth.store()).await?;
     // Single sign-on (P3-04): its providers are a live setting.
@@ -601,7 +608,7 @@ async fn run(
             artwork,
             playbacks: playbacks.clone(),
             connected: connected.clone(),
-            app_passkeys: Arc::default(),
+            app_passkeys: Arc::new(AppPasskeys::new(server_id)),
             watch,
             transcoding,
             jobs,

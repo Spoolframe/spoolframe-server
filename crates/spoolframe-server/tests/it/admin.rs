@@ -22,6 +22,7 @@ pub(crate) const CODE: &str = "K7QD-M2XP-9RTB";
 fn status() -> std::sync::Arc<admin::StatusSource> {
     let status = admin::StatusSource::new(
         spoolframe_server::network::ServerName::new("Den"),
+        server_id(),
         crate::support::transcoding(),
     );
     status.set_endpoint_id(VECTOR.0.to_owned());
@@ -29,6 +30,13 @@ fn status() -> std::sync::Arc<admin::StatusSource> {
 }
 
 const VECTOR: (&str, &str) = spoolframe_protocol::fingerprint::TEST_VECTORS[0];
+
+/// The server id of an admin API with no endpoint beside it.
+pub(crate) const SERVER_ID: &str = "mzxw6ytbojtg633c";
+
+pub(crate) fn server_id() -> spoolframe_protocol::ServerId {
+    SERVER_ID.parse().unwrap()
+}
 
 /// The admin API over `auth`, without Plex.
 pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
@@ -42,7 +50,7 @@ pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
         cookies: Default::default(),
         settings: None,
         wizard: Default::default(),
-        passkeys: std::sync::Arc::new(Passkeys::new(&Origins::default())),
+        passkeys: std::sync::Arc::new(Passkeys::new(&Origins::default(), &server_id())),
         oidc: Default::default(),
         watch: None,
         artwork: None,
@@ -97,7 +105,7 @@ pub(crate) async fn server_at_behind(
     let (addr, handle) = admin::serve(
         "127.0.0.1:0".parse().unwrap(),
         Admin {
-            passkeys: std::sync::Arc::new(Passkeys::new(&origins)),
+            passkeys: std::sync::Arc::new(Passkeys::new(&origins, &server_id())),
             ..admin(auth, Some(SetupCode::new(CODE)))
         },
         origins,
@@ -109,15 +117,18 @@ pub(crate) async fn server_at_behind(
     (addr, dir)
 }
 
-/// The admin API beside a client endpoint: over the `auth` they share,
-/// with browsers reaching it at `public_url`.
-pub(crate) async fn serve_beside(auth: Auth, public_url: &str) -> SocketAddr {
+/// The admin API beside `server`'s client endpoint: over the `auth` they
+/// share, with browsers reaching it at `public_url`, and the server's id.
+pub(crate) async fn serve_beside(
+    server: &crate::support::TestServer,
+    public_url: &str,
+) -> SocketAddr {
     let origins = Origins::Exactly(public_url.to_owned());
     let (addr, handle) = admin::serve(
         "127.0.0.1:0".parse().unwrap(),
         Admin {
-            passkeys: std::sync::Arc::new(Passkeys::new(&origins)),
-            ..admin(auth, None)
+            passkeys: std::sync::Arc::new(Passkeys::new(&origins, &server.server_id)),
+            ..admin(server.auth.clone(), None)
         },
         origins,
         TrustedProxies::default(),
@@ -257,6 +268,7 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
     assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(status.endpoint_id.as_deref(), Some(VECTOR.0));
     assert_eq!(status.fingerprint.as_deref(), Some(VECTOR.1));
+    assert_eq!(status.server_id, SERVER_ID);
     // Nothing detected in tests: the software baseline.
     assert_eq!(status.transcoding.video_encoders, ["libx264"]);
     assert_eq!(status.transcoding.audio_encoders, ["aac"]);

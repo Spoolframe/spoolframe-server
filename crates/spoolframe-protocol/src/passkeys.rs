@@ -1,26 +1,33 @@
-//! Passkeys in the apps (P3-19), through one relying party every server
-//! shares: [`APP_RP_ID`].
+//! Passkeys in the apps (P3-19), each server through a relying party of
+//! its own under `spoolframe.app` (PX-14): [`ServerId::rp_id`].
 //!
 //! A platform's passkey API works only for a domain the app is associated
 //! with when it is built; a self-hosted server's own domain is not known
-//! then. So the apps make and use their passkeys for `spoolframe.app`,
-//! whose only part in this is the association file it serves to the
-//! operating system. Sign-in runs between the app and the server over
-//! this protocol; the server never contacts `spoolframe.app`.
+//! then. So the apps make and use their passkeys for
+//! `<server id>.spoolframe.app`, which one association file at
+//! `spoolframe.app` covers, with a wildcard. Sign-in runs between the app
+//! and the server over this protocol; the server never contacts
+//! `spoolframe.app`.
+//!
+//! Every server once shared `spoolframe.app` itself ([`LEGACY_APP_RP_ID`]).
+//! A security key with passkeys for two servers then offered both to a
+//! sign-in that listed none, the platform took one, and the other server
+//! refused it. With a relying party per server, a key offers only that
+//! server's. Passkeys made for the shared one sign in nowhere now.
 //!
 //! Every server keeps its own passkeys, so a passkey made on one is
 //! refused by another. Each user has a random user handle per server, so
 //! one server's says nothing about the same person on another.
 //!
-//! The platform writes only the origin and the challenge into
-//! `clientDataJSON`, and the origin is the same for every server. So the
-//! challenge names the server (PX-09, finding 2): a server sends a random
+//! The relying party comes from the server id the server names in
+//! `ServerInfo`, and a server may name another's. So the challenge still
+//! names the server by its key (PX-09, finding 2): a server sends a random
 //! nonce, never a challenge, and the challenge is [`app_passkey_challenge`]
 //! of the server's endpoint id and that nonce. The server computes it with
 //! its own id; the client with the id it pinned and dialled, never one the
-//! server names. A server that hands on another's nonce, to relay a
-//! sign-in, has the app sign a challenge for itself, which the other
-//! refuses.
+//! server names. A server that claims another's server id and hands on
+//! its nonce, to relay a sign-in, has the app sign a challenge for itself,
+//! which the other refuses.
 //!
 //! The bytes are WebAuthn's own, as the platform API gives and takes them;
 //! the app maps them to and from it and changes nothing.
@@ -30,13 +37,22 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// The relying-party ID of app passkeys: what the app asks its platform's
-/// passkey API for, on every server.
-pub const APP_RP_ID: &str = "spoolframe.app";
+use crate::server_id::{APP_RP_DOMAIN, ServerId};
 
-/// The origin the platform writes into `clientDataJSON` for
-/// [`APP_RP_ID`]; the server accepts no other for app passkeys.
-pub const APP_ORIGIN: &str = "https://spoolframe.app";
+/// The relying party every server's app passkeys were made for before
+/// each server had its own (PX-14). A passkey stored with it signs in
+/// nowhere now: its user adds it again.
+pub const LEGACY_APP_RP_ID: &str = APP_RP_DOMAIN;
+
+/// Whether a passkey made for `rp_id` was made in an app: for a server's
+/// relying party ([`ServerId::rp_id`]), or the one all shared before.
+pub fn is_app_rp_id(rp_id: &str) -> bool {
+    rp_id == LEGACY_APP_RP_ID
+        || rp_id
+            .strip_suffix(APP_RP_DOMAIN)
+            .and_then(|id| id.strip_suffix('.'))
+            .is_some_and(|id| ServerId::parse(id).is_ok())
+}
 
 /// Bytes of a nonce a server sends.
 pub const NONCE_LEN: usize = 32;
@@ -80,9 +96,12 @@ pub struct PasskeyRegistrationBegun {
 
 impl PasskeyRegistrationBegun {
     /// What the platform makes the passkey with, for the server whose
-    /// endpoint id is `server`: the one the client dialled.
-    pub fn for_server(self, server: &[u8; 32]) -> PasskeyCreation {
+    /// endpoint id is `server`, the one the client dialled, and whose
+    /// server id is `server_id`, the one it pinned with it.
+    pub fn for_server(self, server: &[u8; 32], server_id: &ServerId) -> PasskeyCreation {
         PasskeyCreation {
+            rp_id: server_id.rp_id(),
+            origin: server_id.origin(),
             challenge: app_passkey_challenge(server, &self.nonce),
             user_id: self.user_id,
             user_name: self.user_name,
@@ -109,20 +128,29 @@ pub struct PasskeySignInBegun {
 
 impl PasskeySignInBegun {
     /// What the platform signs, for the server whose endpoint id is
-    /// `server`: the one the client dialled.
-    pub fn for_server(self, server: &[u8; 32]) -> PasskeyRequest {
+    /// `server`, the one the client dialled, and whose server id is
+    /// `server_id`, the one it pinned with it.
+    pub fn for_server(self, server: &[u8; 32], server_id: &ServerId) -> PasskeyRequest {
         PasskeyRequest {
+            rp_id: server_id.rp_id(),
+            origin: server_id.origin(),
             challenge: app_passkey_challenge(server, &self.nonce),
             allow_credential_ids: self.allow_credential_ids,
         }
     }
 }
 
-/// What making a passkey needs: the platform's options. The relying party
-/// is [`APP_RP_ID`]; user verification is required. Not on the wire: the
-/// client makes it from a [`PasskeyRegistrationBegun`].
+/// What making a passkey needs: the platform's options. User verification
+/// is required. Not on the wire: the client makes it from a
+/// [`PasskeyRegistrationBegun`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PasskeyCreation {
+    /// The relying party to make it for: the server's,
+    /// `<server id>.spoolframe.app`. Never `spoolframe.app` itself.
+    pub rp_id: String,
+    /// The origin a platform that takes one writes into `clientDataJSON`:
+    /// `https://<server id>.spoolframe.app`. The server accepts no other.
+    pub origin: String,
     /// To sign: [`app_passkey_challenge`] of the server and its nonce.
     #[serde(with = "serde_bytes")]
     pub challenge: Vec<u8>,
@@ -130,10 +158,10 @@ pub struct PasskeyCreation {
     #[serde(with = "serde_bytes")]
     pub user_id: Vec<u8>,
     /// The account's name in the platform's passkey list,
-    /// `<username> on <server name>`: one keychain may hold passkeys of
-    /// several servers, all for [`APP_RP_ID`].
+    /// `<username> @ <server name>`: the relying party is an opaque id, so
+    /// the server's name says which server it is.
     pub user_name: String,
-    /// `<display name> on <server name>`.
+    /// The user's display name, or their username without one.
     pub display_name: String,
     /// The user's app passkeys on this server: an authenticator holding
     /// one of these is not to make another.
@@ -162,11 +190,15 @@ pub struct FinishPasskeyRegistration {
 /// the wire: the client makes it from a [`PasskeySignInBegun`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PasskeyRequest {
+    /// The relying party to sign for, as [`PasskeyCreation::rp_id`].
+    pub rp_id: String,
+    /// The origin, as [`PasskeyCreation::origin`].
+    pub origin: String,
     /// To sign: [`app_passkey_challenge`] of the server and its nonce.
     #[serde(with = "serde_bytes")]
     pub challenge: Vec<u8>,
     /// The passkeys that may answer; empty: any the platform finds for
-    /// [`APP_RP_ID`] (a discoverable sign-in).
+    /// `rp_id` (a discoverable sign-in), so only this server's.
     #[serde(with = "byte_strings")]
     pub allow_credential_ids: Vec<Vec<u8>>,
 }
@@ -208,13 +240,16 @@ pub struct PasskeyInfo {
     pub created_at: i64,
     /// `None` if it has never signed them in.
     pub last_used_at: Option<i64>,
-    /// The relying party it was made for: [`APP_RP_ID`], or the host of
-    /// the server's web UI.
+    /// The relying party it was made for: the server's app relying party
+    /// ([`ServerId::rp_id`]), [`LEGACY_APP_RP_ID`], or the host of the
+    /// server's web UI.
     pub rp_id: String,
-    /// Made in a Spoolframe app, for [`APP_RP_ID`].
+    /// Made in a Spoolframe app ([`is_app_rp_id`]).
     pub app: bool,
-    /// An app can sign in with it: only an app passkey. A web UI's is
-    /// listed so the user sees it, and can rename or remove it.
+    /// An app can sign in with it: only an app passkey made for this
+    /// server's relying party. One made for [`LEGACY_APP_RP_ID`] is an
+    /// app passkey that cannot: list it as old, to add again. A web UI's
+    /// is listed so the user sees it, and can rename or remove it.
     pub usable_here: bool,
 }
 
@@ -224,6 +259,7 @@ pub struct PasskeyInfo {
 impl fmt::Debug for PasskeyCreation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PasskeyCreation")
+            .field("rp_id", &self.rp_id)
             .field("user_name", &self.user_name)
             .field("display_name", &self.display_name)
             .field("exclude", &self.exclude_credential_ids.len())
@@ -260,6 +296,7 @@ impl fmt::Debug for FinishPasskeyRegistration {
 impl fmt::Debug for PasskeyRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PasskeyRequest")
+            .field("rp_id", &self.rp_id)
             .field("allow", &self.allow_credential_ids.len())
             .finish_non_exhaustive()
     }
@@ -339,18 +376,60 @@ mod tests {
         );
     }
 
+    fn server_id() -> ServerId {
+        ServerId::parse("mzxw6ytbojtg633c").unwrap()
+    }
+
     #[test]
-    fn a_request_for_a_server_signs_its_challenge_and_keeps_the_list() {
+    fn a_request_for_a_server_signs_its_challenge_for_its_relying_party() {
         let begun = PasskeySignInBegun {
             nonce: NONCE.to_vec(),
             allow_credential_ids: vec![vec![4]],
         };
         assert_eq!(
-            begun.for_server(&[1; 32]),
+            begun.for_server(&[1; 32], &server_id()),
             PasskeyRequest {
+                rp_id: "mzxw6ytbojtg633c.spoolframe.app".into(),
+                origin: "https://mzxw6ytbojtg633c.spoolframe.app".into(),
                 challenge: app_passkey_challenge(&[1; 32], &NONCE),
                 allow_credential_ids: vec![vec![4]],
             }
         );
+    }
+
+    #[test]
+    fn a_creation_for_a_server_is_for_its_relying_party() {
+        let begun = PasskeyRegistrationBegun {
+            nonce: NONCE.to_vec(),
+            user_id: vec![9],
+            user_name: "alice @ Nimble".into(),
+            display_name: "Alice".into(),
+            exclude_credential_ids: Vec::new(),
+        };
+        let creation = begun.for_server(&[1; 32], &server_id());
+        assert_eq!(
+            (creation.rp_id.as_str(), creation.origin.as_str()),
+            (
+                "mzxw6ytbojtg633c.spoolframe.app",
+                "https://mzxw6ytbojtg633c.spoolframe.app"
+            )
+        );
+        assert_eq!(creation.challenge, app_passkey_challenge(&[1; 32], &NONCE));
+    }
+
+    #[test]
+    fn app_passkeys_are_known_by_their_relying_party() {
+        for app in ["spoolframe.app", "mzxw6ytbojtg633c.spoolframe.app"] {
+            assert!(is_app_rp_id(app), "{app}");
+        }
+        for not in [
+            "media.example.org",
+            "localhost",
+            "evil.spoolframe.app",
+            "mzxw6ytbojtg633c.spoolframe.app.example.org",
+            "mzxw6ytbojtg633cspoolframe.app",
+        ] {
+            assert!(!is_app_rp_id(not), "{not}");
+        }
     }
 }

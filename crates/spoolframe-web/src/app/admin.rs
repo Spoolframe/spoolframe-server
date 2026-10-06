@@ -1355,8 +1355,8 @@ fn UserPasskeys(username: String, name: String) -> Element {
                                             None => format!("{} · never used", p.rp_id),
                                         }}
                                     }
-                                    if !p.usable {
-                                        span { class: "row-sub text-ctp-yellow", "Made for {p.rp_id}: it does not work at the server's address now." }
+                                    if let Some(note) = crate::logic::unusable_note(&p, "the server's") {
+                                        span { class: "row-sub text-ctp-yellow", "{note}" }
                                     }
                                 }
                                 span { class: "row-do",
@@ -1460,6 +1460,20 @@ fn ThisServer() -> Element {
                                     div { class: "mt-1 text-xs text-ctp-subtext0 max-md:hidden", "Clients show this when they first connect." }
                                 },
                                 None => rsx! { span { class: "text-ctp-subtext0", "starting…" } },
+                            }
+                        }
+                        // The apps' passkeys for this server (PX-14): what a
+                        // password manager lists them under.
+                        Pair { label: "Passkey domain", class: "pair-stack",
+                            {
+                                let domain = crate::logic::passkey_domain(&s.server_id);
+                                rsx! {
+                                    div { class: "flex items-start gap-2.5",
+                                        span { class: "mono-value min-w-0", "{domain}" }
+                                        CopyButton { text: domain }
+                                    }
+                                    div { class: "mt-1 text-xs text-ctp-subtext0 max-md:hidden", "Passkeys made in the apps are saved for this domain." }
+                                }
                             }
                         }
                         // On a phone the key itself is too long to read:

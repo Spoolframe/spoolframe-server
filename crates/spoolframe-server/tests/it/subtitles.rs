@@ -7,10 +7,13 @@ use crate::support;
 use std::time::{Duration, Instant};
 
 use spoolframe_protocol::{
-    BitmapSubtitles, Error, PlannedSubtitle, PlaybackHandle, PlaybackPlan, Reply, Request,
-    Response, Selection, SessionId, SubtitleDelivery,
+    BitmapSubtitles, ConvertedSubtitle, Error, PlannedSubtitle, PlaybackHandle, PlaybackPlan,
+    Reply, Request, Response, Selection, SessionId, SubtitleAction, SubtitleDelivery,
 };
-use spoolframe_types::{AudioCodec, ClientCapabilities, Container, SubtitleFormat, VideoCodec};
+use spoolframe_types::{
+    AudioCodec, BitmapPreference, ClientCapabilities, Container, Delivery, SubtitleFormat,
+    TrackPreferences, VideoCodec,
+};
 use support::{ServerOptions, TestClient, TestServer, fresh_dir, movie};
 
 /// The text the PGS track shows, as tesseract reads it back.
@@ -120,6 +123,158 @@ fn read_as_srt() -> Option<PlannedSubtitle> {
         format: SubtitleFormat::Srt,
         delivery: SubtitleDelivery::External,
     })
+}
+
+/// The PGS track left in the file, for the client to draw.
+fn drawn_by_the_client() -> Option<PlannedSubtitle> {
+    Some(PlannedSubtitle {
+        index: 0,
+        format: SubtitleFormat::Pgs,
+        delivery: SubtitleDelivery::Embedded,
+    })
+}
+
+/// The plan for the PGS track with `bitmap`, without starting anything.
+async fn subtitle_planned(
+    client: &TestClient,
+    session: &SessionId,
+    bitmap: BitmapSubtitles,
+) -> Option<PlannedSubtitle> {
+    let request = Request::PlaybackPlan {
+        id: movie().id().clone(),
+        selection: with_pgs(),
+        bitmap,
+    };
+    match client.call(Some(session), request).await {
+        Response::Ok(Reply::PlaybackPlan {
+            plan: PlaybackPlan::Direct { subtitle, .. },
+            ..
+        }) => subtitle,
+        other => panic!("not a direct plan: {other:?}"),
+    }
+}
+
+/// The session user's picture subtitles shown as `bitmap`.
+async fn prefer(client: &TestClient, session: &SessionId, bitmap: BitmapPreference) {
+    let mut preferences = TrackPreferences::default();
+    preferences.subtitles.bitmap = bitmap;
+    let response = client
+        .call(Some(session), Request::SetTrackPreferences { preferences })
+        .await;
+    assert_eq!(response, Response::Ok(Reply::Done));
+}
+
+/// Whether the session user's track preferences say the server reads
+/// picture subtitles as text.
+async fn ocr_offered(client: &TestClient, session: &SessionId) -> bool {
+    match client
+        .call(Some(session), Request::GetTrackPreferences)
+        .await
+    {
+        Response::Ok(Reply::TrackPreferences(info)) => info.ocr_offered,
+        other => panic!("no preferences: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn track_preferences_say_whether_the_server_reads_picture_subtitles() {
+    let (server, client, session) = ready("ocr-offered", true, false).await;
+    assert!(ocr_offered(&client, &session).await);
+    client.close().await;
+    server.stop().await;
+    let (server, client, session) = ready("ocr-not-offered", false, false).await;
+    assert!(!ocr_offered(&client, &session).await);
+    client.close().await;
+    server.stop().await;
+}
+
+/// A user who never chose has picture subtitles read as text, even on a
+/// device that could draw them.
+#[tokio::test]
+async fn auto_reads_pgs_as_text_by_default_even_for_a_client_that_draws_it() {
+    let (server, client, session) = ready("ocr-pref-default", true, true).await;
+    assert_eq!(
+        subtitle_planned(&client, &session, BitmapSubtitles::Auto).await,
+        read_as_srt()
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_user_who_wants_pictures_has_the_client_draw_them() {
+    let (server, client, session) = ready("ocr-pref-pictures", true, true).await;
+    prefer(&client, &session, BitmapPreference::Pictures).await;
+    assert_eq!(
+        subtitle_planned(&client, &session, BitmapSubtitles::Auto).await,
+        drawn_by_the_client()
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// Pictures on a device that cannot draw them are burned in, though the
+/// server could read them.
+#[tokio::test]
+async fn a_user_who_wants_pictures_on_a_client_that_cannot_draw_them_has_them_burned_in() {
+    let (server, client, _) = ready("ocr-pref-burn-in", true, false).await;
+    client.close().await;
+    let client = server.client().await;
+    let converts = ClientCapabilities {
+        delivery: vec![Delivery::Range, Delivery::Progressive],
+        ..capabilities(false)
+    };
+    client.hello_with(None, Some(converts)).await;
+    let session = client.login("alice", "correct horse").await;
+    prefer(&client, &session, BitmapPreference::Pictures).await;
+    let request = Request::PlaybackPlan {
+        id: movie().id().clone(),
+        selection: with_pgs(),
+        bitmap: BitmapSubtitles::Auto,
+    };
+    let response = client.call(Some(&session), request).await;
+    let Response::Ok(Reply::PlaybackPlan {
+        plan: PlaybackPlan::Converted { subtitle, .. },
+        ..
+    }) = response
+    else {
+        panic!("not converted: {response:?}");
+    };
+    assert_eq!(
+        subtitle,
+        Some(ConvertedSubtitle {
+            index: 0,
+            action: SubtitleAction::BurnIn {
+                format: SubtitleFormat::Pgs
+            },
+        })
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn with_the_servers_ocr_off_pictures_are_shown_whatever_the_preference() {
+    let (server, client, session) = ready("ocr-pref-off", false, true).await;
+    prefer(&client, &session, BitmapPreference::Text).await;
+    assert_eq!(
+        subtitle_planned(&client, &session, BitmapSubtitles::Auto).await,
+        drawn_by_the_client()
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_mode_the_app_asks_for_wins_over_the_preference() {
+    let (server, client, session) = ready("ocr-pref-asked", true, true).await;
+    prefer(&client, &session, BitmapPreference::Pictures).await;
+    assert_eq!(
+        subtitle_planned(&client, &session, BitmapSubtitles::Text).await,
+        read_as_srt()
+    );
+    client.close().await;
+    server.stop().await;
 }
 
 /// The first chunk of a subtitle that is still being read answers as the

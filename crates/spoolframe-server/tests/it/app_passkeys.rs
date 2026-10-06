@@ -1,8 +1,8 @@
 //! Passkeys in the apps (P3-19), over `spoolframe/client/1`, with
 //! webauthn-rs' software authenticator in the place of the app's platform
-//! passkey API: relying party `spoolframe.app`, origin
-//! `https://spoolframe.app`. Every server here has no `public_url`, so its
-//! web UI could only offer passkeys at `localhost`.
+//! passkey API: relying party `<server id>.spoolframe.app`, origin
+//! `https://<server id>.spoolframe.app` (PX-14). Every server here has no
+//! `public_url`, so its web UI could only offer passkeys at `localhost`.
 
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::json;
 use spoolframe_admin_api::{AdminApiClient, MeApiClient, error_code};
 use spoolframe_protocol::{
-    APP_ORIGIN, APP_RP_ID, Error, FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation,
+    Error, FinishPasskeyRegistration, FinishPasskeySignIn, LEGACY_APP_RP_ID, PasskeyCreation,
     PasskeyInfo, PasskeyRequest, Reply, Request, Response, SessionId,
 };
 use spoolframe_server::auth::hash_password;
@@ -30,28 +30,37 @@ const PASSWORD: &str = "correct horse";
 const WEB: &str = "http://localhost:8080";
 
 /// The app on one device, with the platform's passkey store: it signs as
-/// a real authenticator does, and keeps each passkey's credential id and
-/// user handle, as the platform does (the soft token keeps no user
-/// handle, and finds a passkey only when it is named).
+/// a real authenticator does, and keeps each passkey's credential id, user
+/// handle and relying party, as the platform does (the soft token keeps
+/// no user handle, and finds a passkey only when it is named). One `App`
+/// may hold passkeys of several servers, as one security key does.
 pub(crate) struct App {
     token: SoftToken,
-    stored: Vec<(Vec<u8>, Vec<u8>)>,
+    stored: Vec<Stored>,
 }
 
-/// How the app's platform makes or signs: for which relying party, from
-/// which origin, verifying its user or not. [`Platform::APPLE`] is what
-/// the platform does; the rest is mischief.
+/// A passkey the platform keeps.
+#[derive(Clone)]
+struct Stored {
+    credential_id: Vec<u8>,
+    user_handle: Vec<u8>,
+    rp_id: String,
+}
+
+/// How the app's platform makes or signs: for the relying party and
+/// origin it is given, or for others, verifying its user or not.
+/// [`Platform::APPLE`] is what the platform does; the rest is mischief.
 #[derive(Clone, Copy)]
 struct Platform {
-    rp_id: &'static str,
-    origin: &'static str,
+    rp_id: Option<&'static str>,
+    origin: Option<&'static str>,
     verify_user: bool,
 }
 
 impl Platform {
     const APPLE: Self = Self {
-        rp_id: APP_RP_ID,
-        origin: APP_ORIGIN,
+        rp_id: None,
+        origin: None,
         verify_user: true,
     };
 
@@ -99,8 +108,10 @@ impl App {
         creation: &PasskeyCreation,
         name: &str,
     ) -> FinishPasskeyRegistration {
+        let rp_id = platform.rp_id.unwrap_or(&creation.rp_id);
+        let origin = platform.origin.unwrap_or(&creation.origin);
         let options = serde_json::from_value(json!({
-            "rp": { "id": platform.rp_id, "name": "Spoolframe" },
+            "rp": { "id": rp_id, "name": "Spoolframe" },
             "user": {
                 "id": b64(&creation.user_id),
                 "name": creation.user_name,
@@ -121,11 +132,14 @@ impl App {
         .unwrap();
         let made = self
             .token
-            .perform_register(Url::parse(platform.origin).unwrap(), options, 60_000)
+            .perform_register(Url::parse(origin).unwrap(), options, 60_000)
             .unwrap();
         let credential_id = made.raw_id.to_vec();
-        self.stored
-            .push((credential_id.clone(), creation.user_id.clone()));
+        self.stored.push(Stored {
+            credential_id: credential_id.clone(),
+            user_handle: creation.user_id.clone(),
+            rp_id: rp_id.to_owned(),
+        });
         FinishPasskeyRegistration {
             credential_id,
             attestation_object: made.response.attestation_object.to_vec(),
@@ -134,31 +148,40 @@ impl App {
         }
     }
 
-    /// Sign `request` with the passkey it keeps (the first that `request`
-    /// allows).
+    /// Sign `request` with the passkey it keeps (the first for the
+    /// request's relying party that `request` allows, as an authenticator
+    /// finds one).
     pub(crate) fn get(&mut self, request: &PasskeyRequest) -> FinishPasskeySignIn {
         self.get_as(Platform::APPLE, request)
     }
 
     fn get_as(&mut self, platform: Platform, request: &PasskeyRequest) -> FinishPasskeySignIn {
-        let (credential_id, user_handle) = self
+        let Stored {
+            credential_id,
+            user_handle,
+            ..
+        } = self
             .stored
             .iter()
-            .find(|(id, _)| {
-                request.allow_credential_ids.is_empty() || request.allow_credential_ids.contains(id)
+            .find(|p| {
+                p.rp_id == request.rp_id
+                    && (request.allow_credential_ids.is_empty()
+                        || request.allow_credential_ids.contains(&p.credential_id))
             })
             .cloned()
             .expect("a passkey for this request");
+        let rp_id = platform.rp_id.unwrap_or(&request.rp_id);
+        let origin = platform.origin.unwrap_or(&request.origin);
         let options = serde_json::from_value(json!({
             "challenge": b64(&request.challenge),
-            "rpId": platform.rp_id,
+            "rpId": rp_id,
             "allowCredentials": [{ "type": "public-key", "id": b64(&credential_id) }],
             "userVerification": platform.user_verification(),
         }))
         .unwrap();
         let signed = self
             .token
-            .perform_auth(Url::parse(platform.origin).unwrap(), options, 60_000)
+            .perform_auth(Url::parse(origin).unwrap(), options, 60_000)
             .unwrap();
         FinishPasskeySignIn {
             credential_id: signed.raw_id.to_vec(),
@@ -200,9 +223,10 @@ async fn begin_registration(device: &TestClient, session: &SessionId) -> Passkey
         .call(Some(session), Request::BeginPasskeyRegistration)
         .await
     {
-        Response::Ok(Reply::PasskeyRegistrationBegun(begun)) => {
-            begun.for_server(device.conn.remote_id().as_bytes())
-        }
+        Response::Ok(Reply::PasskeyRegistrationBegun(begun)) => begun.for_server(
+            device.conn.remote_id().as_bytes(),
+            &device.server_id().await,
+        ),
         other => panic!("not begun: {other:?}"),
     }
 }
@@ -232,9 +256,10 @@ async fn begin_sign_in(device: &TestClient, username: Option<&str>) -> PasskeyRe
         username: username.map(str::to_owned),
     };
     match device.call(None, request).await {
-        Response::Ok(Reply::PasskeySignInBegun(begun)) => {
-            begun.for_server(device.conn.remote_id().as_bytes())
-        }
+        Response::Ok(Reply::PasskeySignInBegun(begun)) => begun.for_server(
+            device.conn.remote_id().as_bytes(),
+            &device.server_id().await,
+        ),
         other => panic!("not begun: {other:?}"),
     }
 }
@@ -287,10 +312,19 @@ async fn a_passkey_made_in_the_app_signs_in_on_a_server_without_a_public_url() {
     let server = server("app-passkey-life").await;
     let (phone, session) = alice_on(&server, "Alice's iPhone").await;
     let creation = begin_registration(&phone, &session).await;
-    // The keychain holds the passkeys of every server, all for
-    // spoolframe.app: the server's name says which this one is.
-    assert_eq!(creation.user_name, "alice on Home Media");
-    assert_eq!(creation.display_name, "Alice on Home Media");
+    // For this server's relying party (PX-14), named by its server id.
+    assert_eq!(
+        (creation.rp_id.clone(), creation.origin.clone()),
+        (server.server_id.rp_id(), server.server_id.origin())
+    );
+    assert_eq!(
+        creation.rp_id,
+        format!("{}.spoolframe.app", server.server_id)
+    );
+    // The relying party is an opaque id: the server's name says which
+    // server the passkey is for. The display name is the user's own.
+    assert_eq!(creation.user_name, "alice @ Home Media");
+    assert_eq!(creation.display_name, "Alice");
     assert_eq!(creation.user_id.len(), 16, "a UUID");
     assert_eq!(creation.exclude_credential_ids, Vec::<Vec<u8>>::new());
     let mut app = App::new();
@@ -302,8 +336,8 @@ async fn a_passkey_made_in_the_app_signs_in_on_a_server_without_a_public_url() {
     );
     let kept = server.store.passkey(&b64(&id)).await.unwrap().unwrap();
     assert_eq!(
-        (kept.name.as_str(), kept.rp_id.as_str()),
-        ("Alice's iPhone", APP_RP_ID)
+        (kept.name.as_str(), kept.rp_id),
+        ("Alice's iPhone", server.server_id.rp_id())
     );
     // The same authenticator is not asked for a second one.
     assert_eq!(
@@ -317,6 +351,10 @@ async fn a_passkey_made_in_the_app_signs_in_on_a_server_without_a_public_url() {
     let tv = device(&server, "Living room TV").await;
     let request = begin_sign_in(&tv, None).await;
     assert_eq!(request.allow_credential_ids, Vec::<Vec<u8>>::new());
+    assert_eq!(
+        (request.rp_id.clone(), request.origin.clone()),
+        (server.server_id.rp_id(), server.server_id.origin())
+    );
     let tv_session = session_of(finish_sign_in(&tv, app.get(&request)).await);
     assert_eq!(username(&tv, &tv_session).await, "alice");
     // Bound to the TV, as a password sign-in's is.
@@ -410,7 +448,10 @@ async fn a_challenge_made_for_another_server_is_refused() {
         other => panic!("not begun: {other:?}"),
     };
     let mut app = App::new();
-    let made = app.create(&begun.for_server(&ANOTHER_SERVER), "Alice's iPhone");
+    let made = app.create(
+        &begun.for_server(&ANOTHER_SERVER, &server.server_id),
+        "Alice's iPhone",
+    );
     assert_eq!(finish_registration(&phone, &session, made).await, REFUSED);
     assert!(logs::has(&["app passkey refused", "challenge"]));
 
@@ -423,11 +464,14 @@ async fn a_challenge_made_for_another_server_is_refused() {
         Response::Ok(Reply::PasskeySignInBegun(begun)) => begun,
         other => panic!("not begun: {other:?}"),
     };
-    let signed = app.get(&begun.for_server(&ANOTHER_SERVER));
+    let signed = app.get(&begun.for_server(&ANOTHER_SERVER, &server.server_id));
     assert_eq!(finish_sign_in(&tv, signed).await, REFUSED);
     server.stop().await;
 }
 
+/// A platform finds no passkey of one server's for another's relying
+/// party; one signed all the same, for the cabin's challenge, is not the
+/// cabin's.
 #[tokio::test]
 async fn a_passkey_made_on_another_server_is_refused() {
     logs::keep();
@@ -435,10 +479,103 @@ async fn a_passkey_made_on_another_server_is_refused() {
     let cabin = server("app-passkey-cabin").await;
     let (_phone, _session, mut app) = alice_with_a_passkey(&home).await;
     let tv = device(&cabin, "Cabin TV").await;
-    assert_eq!(sign_in(&tv, &mut app).await, REFUSED);
+    let request = PasskeyRequest {
+        rp_id: home.server_id.rp_id(),
+        origin: home.server_id.origin(),
+        ..begin_sign_in(&tv, None).await
+    };
+    assert_eq!(finish_sign_in(&tv, app.get(&request)).await, REFUSED);
     assert!(logs::has(&["not a passkey of this server"]));
     home.stop().await;
     cabin.stop().await;
+}
+
+/// One key with passkeys for two servers (PX-14): each server is its own
+/// relying party, so a sign-in that lists no passkeys gets that server's
+/// from the key, never the other's. With one relying party for all, the
+/// key offered both, the platform took the first, and the other server
+/// refused it.
+#[tokio::test]
+async fn a_key_with_passkeys_for_two_servers_signs_in_to_each_with_no_list() {
+    let home = server("app-passkey-two-home").await;
+    let cabin = server("app-passkey-two-cabin").await;
+    assert_ne!(home.server_id, cabin.server_id);
+    let mut key = App::new();
+    for server in [&home, &cabin] {
+        let (phone, session) = alice_on(server, "Alice's key").await;
+        register(&phone, &session, &mut key, "Alice's key").await;
+    }
+    for server in [&home, &cabin] {
+        let tv = device(server, "Living room TV").await;
+        let request = begin_sign_in(&tv, None).await;
+        assert_eq!(request.allow_credential_ids, Vec::<Vec<u8>>::new());
+        let session = session_of(finish_sign_in(&tv, key.get(&request)).await);
+        assert_eq!(username(&tv, &session).await, "alice");
+    }
+    home.stop().await;
+    cabin.stop().await;
+}
+
+/// An app passkey made for the relying party every server once shared
+/// (PX-14) is kept, so My profile and the app list it as an app passkey
+/// that does not sign in here, to add again. It signs no one in, and its
+/// user removes it as any other.
+#[tokio::test]
+async fn a_passkey_made_for_the_shared_relying_party_is_kept_and_signs_in_nowhere() {
+    logs::keep();
+    let server = server("app-passkey-shared-rp").await;
+    let (phone, session, mut app) = alice_with_a_passkey(&server).await;
+    // As a passkey made before PX-14 is stored.
+    sql(&server, "UPDATE passkeys SET rp_id = ?1", LEGACY_APP_RP_ID).await;
+    let listed = passkeys(&phone, &session).await;
+    let old = app_one(&listed);
+    assert_eq!(old.rp_id, LEGACY_APP_RP_ID);
+    assert!(old.app && !old.usable_here, "{old:?}");
+    // My profile says the same.
+    let web = serve_beside(&server, WEB).await;
+    let alice = with_token(
+        web,
+        &anonymous(web)
+            .await
+            .login(creds("alice", PASSWORD))
+            .await
+            .unwrap()
+            .token,
+    )
+    .await;
+    let [entry] = &alice.passkeys().await.unwrap()[..] else {
+        panic!("not one passkey");
+    };
+    assert!(entry.app && !entry.usable, "{entry:?}");
+
+    let tv = device(&server, "Living room TV").await;
+    let request = begin_sign_in(&tv, None).await;
+    // The platform finds it under this server's relying party only if it
+    // was made there; signed all the same, it is refused.
+    let mut signed = app.get_as(Platform::APPLE, &request);
+    signed.user_handle = None;
+    assert_eq!(finish_sign_in(&tv, signed).await, REFUSED);
+    assert!(logs::has(&["the passkey was made for another host"]));
+    // Its user confirms with no app passkey of this server's.
+    assert_eq!(
+        phone
+            .call(Some(&session), Request::BeginConfirmPasskey)
+            .await,
+        Response::Err(Error::NotFound {
+            what: "app passkey".into()
+        })
+    );
+    assert_eq!(
+        phone
+            .call(
+                Some(&session),
+                Request::RemovePasskey { id: old.id.clone() }
+            )
+            .await,
+        Response::Ok(Reply::Done)
+    );
+    assert_eq!(passkeys(&phone, &session).await, []);
+    server.stop().await;
 }
 
 /// The same username on two servers is two accounts, and the handles say
@@ -503,7 +640,7 @@ async fn a_user_handle_that_is_not_the_passkey_s_user_s_is_refused() {
     let tv = device(&server, "Living room TV").await;
     let request = begin_sign_in(&tv, None).await;
     let mut signed = alices.get(&request);
-    signed.user_handle = Some(bobs.stored[0].1.clone());
+    signed.user_handle = Some(bobs.stored[0].user_handle.clone());
     assert_eq!(finish_sign_in(&tv, signed).await, REFUSED);
     assert!(logs::has(&["the user handle is not the passkey's user's"]));
     server.stop().await;
@@ -531,16 +668,35 @@ async fn an_empty_user_handle_is_invalid_input() {
 }
 
 const WEB_RP: Platform = Platform {
-    rp_id: "localhost",
-    origin: WEB,
+    rp_id: Some("localhost"),
+    origin: Some(WEB),
     verify_user: true,
 };
 const WRONG_ORIGIN: Platform = Platform {
-    origin: "https://evil.example",
+    origin: Some("https://evil.example"),
     ..Platform::APPLE
 };
 const WRONG_RP_ID: Platform = Platform {
-    rp_id: "localhost",
+    rp_id: Some("localhost"),
+    ..Platform::APPLE
+};
+/// The origin every server shared before PX-14, for this server's relying
+/// party: WebAuthn wants the origin at or under the relying party, and the
+/// server takes only its own.
+const SHARED_ORIGIN: Platform = Platform {
+    origin: Some("https://spoolframe.app"),
+    ..Platform::APPLE
+};
+/// The relying party and origin every server shared before PX-14.
+const SHARED_RP: Platform = Platform {
+    rp_id: Some(LEGACY_APP_RP_ID),
+    origin: Some("https://spoolframe.app"),
+    ..Platform::APPLE
+};
+/// Another server's relying party, from this server's origin: only the
+/// relying party's hash in the authenticator data tells.
+const ANOTHER_SERVERS_RP: Platform = Platform {
+    rp_id: Some("aaaaaaaaaaaaaaaa.spoolframe.app"),
     ..Platform::APPLE
 };
 const NO_USER_VERIFICATION: Platform = Platform {
@@ -558,6 +714,9 @@ async fn a_passkey_made_for_another_relying_party_or_origin_or_unverified_is_not
         (WRONG_ORIGIN, "origin does not match"),
         (WRONG_RP_ID, "relying party id hash does not match"),
         (NO_USER_VERIFICATION, "user verified bit is not set"),
+        (SHARED_ORIGIN, "origin does not match"),
+        (SHARED_RP, "origin does not match"),
+        (ANOTHER_SERVERS_RP, "relying party id hash does not match"),
     ] {
         let creation = begin_registration(&phone, &session).await;
         let made = App::new().create_as(platform, &creation, "Alice's iPhone");
@@ -587,6 +746,29 @@ async fn an_assertion_for_another_relying_party_or_origin_or_unverified_signs_no
         assert!(logs::has(&["Alice's iPhone", why]), "{why}");
     }
     // As the platform signs, it signs in.
+    session_of(sign_in(&tv, &mut app).await);
+    server.stop().await;
+}
+
+/// The relying party and origin every server shared before PX-14, or
+/// another server's relying party, sign no one in here. (Apart from the
+/// test above: five failures use up a user's tries.)
+#[tokio::test]
+async fn an_assertion_for_the_shared_or_another_server_s_relying_party_signs_no_one_in() {
+    logs::keep();
+    let server = server("app-passkey-signed-shared").await;
+    let (_phone, _session, mut app) = alice_with_a_passkey(&server).await;
+    let tv = device(&server, "Living room TV").await;
+    for (platform, why) in [
+        (SHARED_ORIGIN, "origin does not match"),
+        (SHARED_RP, "origin does not match"),
+        (ANOTHER_SERVERS_RP, "relying party id hash does not match"),
+    ] {
+        let request = begin_sign_in(&tv, None).await;
+        let signed = app.get_as(platform, &request);
+        assert_eq!(finish_sign_in(&tv, signed).await, REFUSED);
+        assert!(logs::has(&["Alice's iPhone", why]), "{why}");
+    }
     session_of(sign_in(&tv, &mut app).await);
     server.stop().await;
 }
@@ -794,7 +976,7 @@ async fn app_passkeys_are_listed_and_removed_in_the_web_ui() {
         .await
         .unwrap();
     let (_phone, _session, mut app) = alice_with_a_passkey(&server).await;
-    let web = serve_beside(server.auth.clone(), WEB).await;
+    let web = serve_beside(&server, WEB).await;
     let alice = with_token(
         web,
         &anonymous(web)
@@ -818,7 +1000,7 @@ async fn app_passkeys_are_listed_and_removed_in_the_web_ui() {
     let listed = alice.passkeys().await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].name, "Alice's iPhone");
-    assert_eq!(listed[0].rp_id, APP_RP_ID);
+    assert_eq!(listed[0].rp_id, server.server_id.rp_id());
     assert!(listed[0].app);
     // Not "made for another host": it works, in the apps.
     assert!(listed[0].usable);
@@ -944,9 +1126,9 @@ async fn the_app_lists_its_user_s_passkeys_the_web_ui_s_too() {
     assert_eq!(listed.len(), 2, "{listed:?}");
     let (made, web) = (app_one(&listed), web_one(&listed));
     // Named as the web UI names it: base64url of the platform's id.
-    assert_eq!(made.id, b64(&app.stored[0].0));
+    assert_eq!(made.id, b64(&app.stored[0].credential_id));
     assert_eq!(made.name, "Alice's iPhone");
-    assert_eq!(made.rp_id, APP_RP_ID);
+    assert_eq!(made.rp_id, server.server_id.rp_id());
     assert!(made.app);
     assert!(made.usable_here);
     assert_eq!(made.last_used_at, None);

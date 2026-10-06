@@ -602,7 +602,6 @@ fn PlexFields(
     let mut account = use_signal(|| Account::Idle);
     let pasted = use_signal(String::new);
     let mut paste_error = use_signal(|| None::<String>);
-    let mut ocr = use_signal(|| flag(&settings, "subtitles.ocr"));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     // The library sections checked (P3-11), as of the server last probed.
@@ -711,10 +710,7 @@ fn PlexFields(
                 .any(|c| c.url == url && c.account.is_some());
         busy.set(true);
         spawn(async move {
-            let changes = vec![
-                ("plex.url", typed(&url)),
-                ("subtitles.ocr", Some(json!(ocr()))),
-            ];
+            let changes = vec![("plex.url", typed(&url))];
             let token = async {
                 if listed {
                     let client = rpc::client().await?;
@@ -960,24 +956,6 @@ fn PlexFields(
                     }
                 }
             }
-        }
-        div { class: "flex flex-col gap-2",
-            h2 { "Subtitles" }
-            div { class: "flex items-start gap-3",
-                button {
-                    class: "switch mt-0.5",
-                    role: "switch",
-                    aria_checked: "{ocr()}",
-                    aria_label: "Read picture subtitles as text",
-                    disabled: locked(&settings, "subtitles.ocr"),
-                    onclick: move |_| ocr.toggle(),
-                }
-                span { class: "choice-what",
-                    b { "Read picture subtitles as text (OCR)" }
-                    "Blu-ray and DVD subtitles become text, so every app can show and style them. Languages are on the Playback step."
-                }
-            }
-            Note { settings: settings.clone(), setting: "subtitles.ocr", on_changed: move |_| on_reload.call(()) }
         }
         div { class: "flex flex-wrap items-center gap-3",
             Link {
@@ -1438,8 +1416,8 @@ fn SampleState(check: Option<LibraryPathCheck>, checking: bool) -> Element {
     }
 }
 
-/// Step 5: the encoders found, which to use, the limits, and the OCR
-/// languages.
+/// Step 5: the encoders found, which to use, the limits, and whether
+/// picture subtitles are offered as text, with the OCR languages.
 #[component]
 pub fn PlaybackForm(mode: Mode, on_done: EventHandler<()>) -> Element {
     let mut generation = use_signal(|| 0u32);
@@ -1495,6 +1473,7 @@ fn PlaybackFields(
     });
     let ahead = use_signal(|| text(&settings, "transcode.read_ahead_secs"));
     let workers = use_signal(|| text(&settings, "previews.workers"));
+    let mut ocr = use_signal(|| flag(&settings, "subtitles.ocr"));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let s = settings.clone();
@@ -1520,6 +1499,7 @@ fn PlaybackFields(
                     "previews.workers",
                     number("Previews made at once", &workers())?,
                 ),
+                ("subtitles.ocr", Some(json!(ocr()))),
             ])
         })();
         let changes = match changes {
@@ -1661,19 +1641,30 @@ fn PlaybackFields(
             }
         }
         div { class: "flex flex-col gap-2",
-            h2 { "Subtitle text recognition (OCR) languages" }
-            if languages.is_empty() {
-                span { class: "text-sm text-ctp-subtext0", "None: OCR is off, or tesseract has no languages here. Picture subtitles are burned in." }
-            } else {
+            h2 { "Subtitles" }
+            div { class: "flex items-start gap-3",
+                button {
+                    class: "switch mt-0.5",
+                    role: "switch",
+                    aria_checked: "{ocr()}",
+                    aria_label: "Offer picture subtitles as text",
+                    disabled: locked(&settings, "subtitles.ocr"),
+                    onclick: move |_| ocr.toggle(),
+                }
+                span { class: "choice-what",
+                    b { "Offer picture subtitles as text (OCR)" }
+                    "Picture subtitles (PGS, VobSub, DVB) can be read into text, so any device can show them styled and sized. Each user picks what they see."
+                }
+            }
+            Note { settings: settings.clone(), setting: "subtitles.ocr", on_changed: move |_| on_reload.call(()) }
+            if ocr() && !languages.is_empty() {
                 div { class: "chips",
-                    for code in languages {
+                    for code in languages.clone() {
                         span { key: "{code}", title: "{code}", {setup::language_name(&code)} }
                     }
                 }
-                span { class: "text-xs text-ctp-subtext0",
-                    "Found on this server. Picture subtitles in other languages can only be burned in. Add Tesseract language data to the server for more."
-                }
             }
+            span { class: "text-xs text-ctp-subtext0", {setup::ocr_note(ocr(), !languages.is_empty())} }
         }
         if let Some(text) = error() {
             Alert { text }

@@ -6,6 +6,11 @@
 //! fingerprint (P1-21). A pin is replaced only by an explicit
 //! `trust_new_identity`, never by a connect (P1-13).
 //!
+//! The pin is the key with the server id the server answered with
+//! (PX-14). A connect needs both. A new name is saved; a new key with the
+//! same id is an identity change, as above; the same key with a new id
+//! is refused, as a server never changes its id.
+//!
 //! The addresses are every one the server was reached at (PX-12), each
 //! with when it was last seen, not only the last connection's: a phone
 //! that reached the server over its public IPv6 last time must still know
@@ -64,6 +69,11 @@ pub(crate) struct KnownAddr {
 pub(crate) struct SavedServer {
     pub name: String,
     pub endpoint_id: String,
+    /// The server id pinned with the key (PX-14): the pin is the pair. Taken
+    /// at the first connect; `None` in a file written before the SDK kept
+    /// it, until the next connect pins it.
+    #[serde(default)]
+    pub server_id: Option<String>,
     /// Where it was reached, newest first. Changed only by
     /// [`SavedServer::saw`].
     #[serde(default)]
@@ -95,6 +105,7 @@ impl SavedServer {
     pub fn pinned_now(
         name: String,
         endpoint_id: String,
+        server_id: String,
         addrs: Vec<SocketAddr>,
         verified: bool,
     ) -> Self {
@@ -102,6 +113,7 @@ impl SavedServer {
         let mut server = Self {
             name,
             endpoint_id,
+            server_id: Some(server_id),
             known_addrs: Vec::new(),
             legacy_addrs: Vec::new(),
             verified,
@@ -239,6 +251,11 @@ pub struct ServerEntry {
     /// The key's fingerprint (P1-21): what the user compares with the
     /// server's `spoolframe-server fingerprint`.
     pub fingerprint: String,
+    /// The server id (PX-14): pinned with the key, or the one it answered
+    /// with. `None` for a server only heard on the LAN, or saved before the
+    /// SDK kept it and not connected to since. Its app passkeys are for
+    /// `<server id>.spoolframe.app`.
+    pub server_id: Option<String>,
     /// Saved, with this key pinned.
     pub pinned: bool,
     /// Pinned after the user confirmed the fingerprint; a pinned server
@@ -287,6 +304,7 @@ mod tests {
     use crate::storage::MemoryStorage;
 
     const ID: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
+    const SERVER_ID: &str = "mzxw6ytbojtg633c";
 
     /// A servers file as SDKs before these dates wrote it, one entry from
     /// before P1-21 too.
@@ -312,6 +330,7 @@ mod tests {
                 SavedServer {
                     name: "Nimble".into(),
                     endpoint_id: ID.into(),
+                    server_id: None,
                     known_addrs: vec![KnownAddr {
                         addr: "192.168.1.10:4433".parse().unwrap(),
                         last_seen: seen,
@@ -326,6 +345,7 @@ mod tests {
                 SavedServer {
                     name: "Cabin".into(),
                     endpoint_id: "cd34".into(),
+                    server_id: None,
                     known_addrs: Vec::new(),
                     legacy_addrs: Vec::new(),
                     verified: false,
@@ -338,9 +358,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_server_id_is_kept_with_the_key() {
+        let storage = MemoryStorage::default();
+        let server = server();
+        assert_eq!(server.server_id.as_deref(), Some(SERVER_ID));
+        save(&storage, std::slice::from_ref(&server)).await.unwrap();
+        assert_eq!(load(&storage).await.unwrap(), [server]);
+    }
+
+    #[tokio::test]
     async fn the_dates_are_kept_with_the_servers() {
         let storage = MemoryStorage::default();
-        let mut server = SavedServer::pinned_now("Nimble".into(), ID.into(), Vec::new(), false);
+        let mut server = SavedServer::pinned_now(
+            "Nimble".into(),
+            ID.into(),
+            SERVER_ID.into(),
+            Vec::new(),
+            false,
+        );
         server.last_connected_at = Some(1_790_000_500);
         save(&storage, &[server.clone()]).await.unwrap();
         assert_eq!(load(&storage).await.unwrap(), [server]);
@@ -353,7 +388,13 @@ mod tests {
     }
 
     fn server() -> SavedServer {
-        SavedServer::pinned_now("Nimble".into(), ID.into(), Vec::new(), false)
+        SavedServer::pinned_now(
+            "Nimble".into(),
+            ID.into(),
+            SERVER_ID.into(),
+            Vec::new(),
+            false,
+        )
     }
 
     #[test]
@@ -596,20 +637,38 @@ mod tests {
     #[test]
     fn pinning_dates_the_pin_the_connect_and_a_verification_only_if_there_was_one() {
         let before = now();
-        let unverified = SavedServer::pinned_now("Nimble".into(), ID.into(), Vec::new(), false);
+        let unverified = SavedServer::pinned_now(
+            "Nimble".into(),
+            ID.into(),
+            SERVER_ID.into(),
+            Vec::new(),
+            false,
+        );
         let after = now();
         let pinned = unverified.pinned_at.unwrap();
         assert!((before..=after).contains(&pinned));
         assert_eq!(unverified.last_connected_at, Some(pinned));
         assert_eq!(unverified.verified_at, None);
 
-        let verified = SavedServer::pinned_now("Nimble".into(), ID.into(), Vec::new(), true);
+        let verified = SavedServer::pinned_now(
+            "Nimble".into(),
+            ID.into(),
+            SERVER_ID.into(),
+            Vec::new(),
+            true,
+        );
         assert_eq!(verified.verified_at, verified.pinned_at);
     }
 
     #[test]
     fn verifying_later_dates_it_and_taking_it_back_clears_it() {
-        let mut server = SavedServer::pinned_now("Nimble".into(), ID.into(), Vec::new(), false);
+        let mut server = SavedServer::pinned_now(
+            "Nimble".into(),
+            ID.into(),
+            SERVER_ID.into(),
+            Vec::new(),
+            false,
+        );
         server.pinned_at = Some(1);
         server.set_verified(true);
         assert!(server.verified_at.is_some_and(|at| at > 1));

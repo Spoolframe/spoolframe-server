@@ -42,6 +42,10 @@ pub struct SubtitlePreferences {
     /// ISO 639 codes in order of preference. Empty: the audio's language.
     pub languages: Vec<String>,
     pub sdh: SdhPreference,
+    /// How picture subtitles (PGS, VobSub, DVB) are shown when the app
+    /// leaves it to the server. It has no effect on a server that does not
+    /// read them as text.
+    pub bitmap: BitmapPreference,
 }
 
 /// When subtitles are shown.
@@ -76,6 +80,22 @@ pub enum SdhPreference {
     Accept,
 }
 
+/// How a viewer wants picture subtitles shown: read as text by the
+/// server, so any device shows them styled and sized, or as the pictures
+/// they are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BitmapPreference {
+    /// Drawn by the device if it can, else burned into the video.
+    Pictures,
+    /// Read as text when the server can read the track; else as
+    /// `Pictures`. Also any value this build does not know. (Last, as
+    /// serde wants of `other`.)
+    #[default]
+    #[serde(other)]
+    Text,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +117,26 @@ mod tests {
             serde_json::from_value(serde_json::json!({"audio": {"languages": ["eng"]}})).unwrap();
         assert_eq!(p.audio.languages, ["eng"]);
         assert_eq!(p.audio.avoid, AudioPreferences::default().avoid);
+    }
+
+    #[test]
+    fn picture_subtitles_are_read_as_text_unless_the_viewer_wants_pictures() {
+        assert_eq!(
+            TrackPreferences::default().subtitles.bitmap,
+            BitmapPreference::Text
+        );
+        let p: TrackPreferences =
+            serde_json::from_value(serde_json::json!({"subtitles": {"bitmap": "pictures"}}))
+                .unwrap();
+        assert_eq!(p.subtitles.bitmap, BitmapPreference::Pictures);
+    }
+
+    #[test]
+    fn a_picture_subtitle_preference_this_build_does_not_know_reads_as_text() {
+        let p: TrackPreferences =
+            serde_json::from_value(serde_json::json!({"subtitles": {"bitmap": "hologram"}}))
+                .unwrap();
+        assert_eq!(p.subtitles.bitmap, BitmapPreference::Text);
     }
 
     #[test]

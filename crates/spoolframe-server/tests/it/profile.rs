@@ -6,9 +6,12 @@ use std::net::SocketAddr;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::core::params::ObjectParams;
 use jsonrpsee::ws_client::WsClient;
-use spoolframe_admin_api::{MeApiClient, SubtitlePick, error_code};
+use spoolframe_admin_api::{
+    MeApiClient, SubtitlePick, TrackPreferencesInfo as AdminTrackPreferences, error_code,
+};
 use spoolframe_protocol::{
-    ChosenTracks, Error, Reply, Request, Response, Selection, SessionId, TrackReason, UserSummary,
+    ChosenTracks, Error, Reply, Request, Response, Selection, SessionId, TrackPreferencesInfo,
+    TrackReason, UserSummary,
 };
 use spoolframe_types::{
     MediaId, MediaKind, Namespace, SdhPreference, SubtitleMode, SubtitleRole, TrackPreferences,
@@ -25,7 +28,7 @@ async fn server(test: &str) -> (TestServer, SocketAddr) {
     let server = TestServer::start(test).await;
     server.add_user("alice", PASSWORD, None).await;
     server.add_user("bob", PASSWORD, None).await;
-    let web = serve_beside(server.auth.clone(), WEB).await;
+    let web = serve_beside(&server, WEB).await;
     (server, web)
 }
 
@@ -180,7 +183,10 @@ async fn preferences_set_on_the_web_choose_the_app_s_next_playback() {
     let alice = on_the_web(web, "alice").await;
     assert_eq!(
         alice.track_preferences().await.unwrap(),
-        TrackPreferences::default()
+        AdminTrackPreferences {
+            preferences: TrackPreferences::default(),
+            ocr_offered: false,
+        }
     );
     // Forced only by default, and the episode has no forced subtitle.
     assert_eq!(
@@ -194,7 +200,10 @@ async fn preferences_set_on_the_web_choose_the_app_s_next_playback() {
         .unwrap();
     assert_eq!(
         pc.call(Some(&on_pc), Request::GetTrackPreferences).await,
-        Response::Ok(Reply::TrackPreferences(english_with_subtitles()))
+        Response::Ok(Reply::TrackPreferences(TrackPreferencesInfo {
+            preferences: english_with_subtitles(),
+            ocr_offered: false,
+        }))
     );
     let next = chosen(&pc, &on_pc, &episode("12")).await;
     assert_eq!(next.subtitle, TrackReason::Preferences);
@@ -322,7 +331,7 @@ async fn no_me_method_reaches_another_user_s_account() {
         .await
         .unwrap();
     assert_eq!(
-        bob.track_preferences().await.unwrap(),
+        bob.track_preferences().await.unwrap().preferences,
         TrackPreferences::default()
     );
     alice.revoke_other_sessions().await.unwrap();

@@ -46,10 +46,26 @@ pub enum SdkError {
     #[error("server {0} is not saved yet; pin it first")]
     NotPinned(String),
     /// Saved server `saved` seems to answer with another key, `now` (P1-13):
-    /// it was reinstalled, or this is a different server. Show both
-    /// fingerprints; [`crate::Client::trust_new_identity`] if the user says so.
+    /// its key was replaced, or this is a different server. Since PX-14 it
+    /// is said when `now` answers with `saved`'s pinned server id; for a
+    /// server saved before the SDK kept ids, when `now` is heard under its
+    /// name. Show both fingerprints; [`crate::Client::trust_new_identity`]
+    /// if the user says so, which keeps the server id.
     #[error("server {saved} answered with another key, {now}")]
     IdentityChanged { saved: String, now: String },
+    /// Saved server `endpoint_id` answered under its pinned key with
+    /// another server id, `now`, than the one pinned, `saved` (PX-14). A
+    /// server never changes its id, and its app passkeys are bound to it,
+    /// so this is refused, every time, and nothing is kept: unlike
+    /// [`SdkError::IdentityChanged`] it cannot be accepted in place. Tell
+    /// the user the server is not the one saved; [`crate::Client::forget`]
+    /// it and add it again if they say it is theirs.
+    #[error("server {endpoint_id} answered with server id {now}, not its own, {saved}")]
+    ServerIdChanged {
+        endpoint_id: String,
+        saved: String,
+        now: String,
+    },
     /// The endpoint answered as another server than the one dialled.
     #[error("expected server {expected}, but {actual} answered")]
     WrongServer { expected: String, actual: String },

@@ -43,6 +43,7 @@ async fn hello_is_answered_with_server_info() {
     };
     assert_eq!(info.name, "Home Media");
     assert_eq!(info.endpoint_id, server.server.id().to_string());
+    assert_eq!(info.server_id, server.server_id.as_str());
     assert_eq!(info.protocol_version, PROTOCOL_VERSION);
     assert_eq!(
         info.auth_methods,

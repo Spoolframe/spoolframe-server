@@ -63,6 +63,7 @@ mod tests {
                 mode,
                 languages: vec!["eng".into()],
                 sdh,
+                ..SubtitlePreferences::default()
             },
         }
     }

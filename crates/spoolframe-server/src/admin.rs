@@ -32,7 +32,7 @@ use spoolframe_admin_api::{
     ArtworkInfo, CatalogItem, CatalogLibrary, CatalogPage, CatalogQuery, CatalogRow, PathsChecked,
 };
 use spoolframe_admin_api::{
-    AudioPick, SsoLink, SubtitlePick, TrackOverrideEntry, TrackPreferences,
+    AudioPick, SsoLink, SubtitlePick, TrackOverrideEntry, TrackPreferences, TrackPreferencesInfo,
 };
 use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
@@ -181,6 +181,8 @@ impl SetupCode {
 pub struct StatusSource {
     /// A live setting (P3-10): read at each call.
     pub name: ServerName,
+    /// Known from the start: it is read before anything listens (PX-14).
+    pub server_id: spoolframe_protocol::ServerId,
     pub transcoding: Arc<Transcoding>,
     /// Whether the endpoint announces itself on the LAN.
     pub mdns: bool,
@@ -209,9 +211,14 @@ fn preview_workers_default() -> spoolframe_admin_api::DefaultWorkers {
 }
 
 impl StatusSource {
-    pub fn new(name: ServerName, transcoding: Arc<Transcoding>) -> Self {
+    pub fn new(
+        name: ServerName,
+        server_id: spoolframe_protocol::ServerId,
+        transcoding: Arc<Transcoding>,
+    ) -> Self {
         Self {
             name,
+            server_id,
             transcoding,
             mdns: false,
             endpoint_id: OnceLock::new(),
@@ -266,6 +273,7 @@ impl StatusSource {
             revision: revision(BUILD_REVISION),
             endpoint_id: self.endpoint_id.get().cloned(),
             fingerprint: self.fingerprint(),
+            server_id: self.server_id.to_string(),
             transcoding: TranscodingStatus {
                 video_encoders: encoders.video.iter().map(|e| e.name.clone()).collect(),
                 audio_encoders: encoders.audio.iter().map(|e| e.name.clone()).collect(),
@@ -748,10 +756,12 @@ impl AdminApi {
 
     /// A stored passkey as the API shows it.
     fn passkey_entry(&self, p: PasskeyRecord) -> PasskeyEntry {
-        let app = p.rp_id == spoolframe_protocol::APP_RP_ID;
+        // An app's made for the relying party every server once shared is
+        // an app's that signs in nowhere now (PX-14).
         PasskeyEntry {
-            usable: app || self.passkeys.rp_id() == Some(p.rp_id.as_str()),
-            app,
+            usable: p.rp_id == self.passkeys.app_rp_id()
+                || self.passkeys.rp_id() == Some(p.rp_id.as_str()),
+            app: spoolframe_protocol::is_app_rp_id(&p.rp_id),
             id: p.credential_id,
             name: p.name,
             created_at: p.created_at,
@@ -1828,13 +1838,18 @@ impl MeApiServer for AdminApi {
         Ok(self.info(self.account(user).await?))
     }
 
-    async fn track_preferences(&self, ext: &Extensions) -> RpcResult<TrackPreferences> {
+    async fn track_preferences(&self, ext: &Extensions) -> RpcResult<TrackPreferencesInfo> {
         let (_, user) = self.caller(ext).await?;
-        self.auth
+        let preferences = self
+            .auth
             .store()
             .track_preferences(Principal::LocalUser(user.user))
             .await
-            .map_err(internal)
+            .map_err(internal)?;
+        Ok(TrackPreferencesInfo {
+            preferences,
+            ocr_offered: !self.status.ocr_languages.is_empty(),
+        })
     }
 
     async fn set_track_preferences(
@@ -3284,12 +3299,16 @@ mod tests {
             setup_code: None,
             status: Arc::new(StatusSource::new(
                 ServerName::new("Den"),
+                spoolframe_protocol::ServerId::from_bytes([0; 10]),
                 Arc::new(transcoding),
             )),
             plex_sync: None,
             accounts: None,
             plex: Arc::default(),
-            passkeys: Arc::new(Passkeys::new(&origins)),
+            passkeys: Arc::new(Passkeys::new(
+                &origins,
+                &spoolframe_protocol::ServerId::from_bytes([0; 10]),
+            )),
             cookies: CookiePolicy::default(),
             settings: None,
             wizard: Wizard::default(),
@@ -3305,6 +3324,24 @@ mod tests {
             signed_in: Arc::default(),
             public_url: origins.public_url().map(str::to_owned),
         }
+    }
+
+    #[tokio::test]
+    async fn track_preferences_say_whether_picture_subtitles_are_read_as_text() {
+        let (mut api, ext, _, _dir) = api_with_alice("track-preferences-ocr").await;
+        assert!(!api.track_preferences(&ext).await.unwrap().ocr_offered);
+        let transcoding = api.status.transcoding.clone();
+        api.status = Arc::new(
+            StatusSource::new(
+                ServerName::new("Den"),
+                spoolframe_protocol::ServerId::from_bytes([0; 10]),
+                transcoding,
+            )
+            .with_ocr_languages(vec!["eng".into()]),
+        );
+        let read = api.track_preferences(&ext).await.unwrap();
+        assert!(read.ocr_offered);
+        assert_eq!(read.preferences, TrackPreferences::default());
     }
 
     #[tokio::test]

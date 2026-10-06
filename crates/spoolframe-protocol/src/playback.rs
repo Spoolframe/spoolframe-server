@@ -23,8 +23,11 @@ pub struct Selection {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BitmapSubtitles {
-    /// As the client shows it if it can; else read as text if the server
-    /// can; else burned in.
+    /// As the viewer's preference says (`TrackPreferences`'
+    /// `subtitles.bitmap`): read as text if the server can, else drawn by
+    /// the client if it can, else burned in; or, for pictures, drawn by
+    /// the client if it can, else burned in. Apps send this unless the
+    /// user overrides it for one playback. The plan says which was used.
     #[default]
     Auto,
     /// Read as text and sent as a text subtitle, even to a client that

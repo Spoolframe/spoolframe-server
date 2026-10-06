@@ -31,9 +31,16 @@ pub use model::{
 };
 pub use platform::Platform;
 pub use preferences::{
-    AudioPreferences, SdhPreference, SubtitleMode, SubtitlePreferences, TrackPreferences,
+    AudioPreferences, BitmapPreference, SdhPreference, SubtitleMode, SubtitlePreferences,
+    TrackPreferences,
 };
 pub use role::Role;
 pub use search::{Person, PersonRole, SearchKind, SearchScope};
 
 pub mod pin;
+
+/// The domain every server's app passkeys are made under: a server's
+/// relying party is `<server id>.spoolframe.app` (PX-14). Kept here, the
+/// crate every client and the admin API share, so all of them name the
+/// same one.
+pub const APP_RP_DOMAIN: &str = "spoolframe.app";

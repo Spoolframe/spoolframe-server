@@ -333,6 +333,7 @@ impl Server {
         let info = ServerInfo {
             name: name.get(),
             endpoint_id: endpoint.id().to_string(),
+            server_id: services.app_passkeys.server_id().to_string(),
             protocol_version: PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             auth_methods: client::auth_methods(),

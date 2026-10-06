@@ -405,7 +405,7 @@ async fn the_fingerprint_is_the_key_s_and_the_server_logs_it() {
     let (_tmp, config) = config_with_state("fingerprint", &closed_port_url()).await;
     // With the server stopped.
     let fingerprint = printed(&config, "fingerprint");
-    let id = printed(&config, "id");
+    let (id, _) = ids(&config);
     assert_eq!(
         spoolframe_protocol::fingerprint::of_hex(&id).as_deref(),
         Some(fingerprint.as_str())
@@ -419,18 +419,49 @@ async fn the_fingerprint_is_the_key_s_and_the_server_logs_it() {
     assert!(running.stop().success());
 }
 
+/// What `spoolframe-server id` prints: the endpoint id, then the server
+/// id, each on its own line after its label.
+fn ids(config: &Path) -> (String, String) {
+    let printed = printed(config, "id");
+    let label = |line: Option<&str>, label: &str| {
+        line.and_then(|l| l.strip_prefix(label))
+            .map(|id| id.trim().to_owned())
+            .unwrap_or_else(|| panic!("no {label:?} line in {printed:?}"))
+    };
+    let mut lines = printed.lines();
+    let endpoint_id = label(lines.next(), "endpoint id:");
+    let server_id = label(lines.next(), "server id:");
+    assert_eq!(lines.next(), None, "{printed}");
+    (endpoint_id, server_id)
+}
+
 #[tokio::test]
 async fn id_prints_the_same_endpoint_id_every_time() {
     let (_tmp, config) = config_with_state("id", &closed_port_url()).await;
-    let id = || {
-        let output = server_with(&config).arg("id").output().unwrap();
-        assert!(output.status.success(), "{output:?}");
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    };
-    let first = id();
+    let (first, _) = ids(&config);
     assert_eq!(first.len(), 64, "{first}");
     assert!(first.bytes().all(|b| b.is_ascii_hexdigit()), "{first}");
-    assert_eq!(id(), first);
+    assert_eq!(ids(&config).0, first);
+}
+
+/// The server id is made at the first start, beside the key, and the
+/// server logs it.
+#[tokio::test]
+async fn id_prints_the_same_server_id_every_time_and_the_server_logs_it() {
+    let (_tmp, config) = config_with_state("server-id", &closed_port_url()).await;
+    let (_, first) = ids(&config);
+    assert!(
+        spoolframe_protocol::ServerId::parse(&first).is_ok(),
+        "{first}"
+    );
+    assert_eq!(ids(&config).1, first);
+    let (running, log) = Running::start(&config);
+    assert!(
+        log.lines()
+            .any(|l| l.contains("server identity") && l.contains(&first)),
+        "{log}"
+    );
+    assert!(running.stop().success());
 }
 
 #[test]
@@ -656,6 +687,20 @@ async fn config_set_and_unset_change_the_running_server_through_its_admin_api() 
     );
     let status = set(&["status"], "");
     assert!(status.contains("name: Den"), "{status}");
+    // The server id and the passkey domain it names (PX-14).
+    let (_, server_id) = ids(&config);
+    assert!(
+        status
+            .lines()
+            .any(|l| l == format!("server id: {server_id}")),
+        "{status}"
+    );
+    assert!(
+        status
+            .lines()
+            .any(|l| l == format!("passkey domain: {server_id}.spoolframe.app")),
+        "{status}"
+    );
     // Restart: saved, and said so.
     let port = set(&["config", "set", "network.port", "7440"], "");
     assert_eq!(port, "network.port = 7440\napplies after a restart\n");

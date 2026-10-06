@@ -7,8 +7,8 @@
 //! changes what was set.
 
 use spoolframe_admin_api::{
-    AudioPick, AudioRole, SdhPreference, SubtitleMode, SubtitlePick, SubtitleRole,
-    TrackOverrideEntry,
+    AudioPick, AudioRole, BitmapPreference, SdhPreference, SubtitleMode, SubtitlePick,
+    SubtitleRole, TrackOverrideEntry,
 };
 
 /// What stands for the item's original language in an audio list.
@@ -134,6 +134,41 @@ pub const SDH: &[(SdhPreference, &str)] = &[
     (SdhPreference::Avoid, "Never"),
 ];
 
+/// How picture subtitles (PGS, VobSub, DVB) show, as the card names each
+/// choice.
+pub const PICTURE_SUBTITLES: &[(BitmapPreference, &str)] = &[
+    (BitmapPreference::Text, "Read as text (OCR)"),
+    (BitmapPreference::Pictures, "Show as pictures"),
+];
+
+/// The picture subtitle row as the card draws it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PictureRow {
+    /// The choice shown, in [`PICTURE_SUBTITLES`].
+    pub shown: usize,
+    /// Why the choice is disabled, when the server does not read picture
+    /// subtitles as text.
+    pub off: Option<&'static str>,
+}
+
+/// The row for `preference` on a server that reads picture subtitles as
+/// text if `ocr_offered`. Without it every user gets pictures, so that is
+/// what the row shows; the saved choice is kept for when it is offered.
+pub fn picture_row(preference: BitmapPreference, ocr_offered: bool) -> PictureRow {
+    if !ocr_offered {
+        return PictureRow {
+            shown: index_of(PICTURE_SUBTITLES, &BitmapPreference::Pictures),
+            off: Some(
+                "This server doesn't read picture subtitles as text, so they show as pictures.",
+            ),
+        };
+    }
+    PictureRow {
+        shown: index_of(PICTURE_SUBTITLES, &preference),
+        off: None,
+    }
+}
+
 /// A choice's value in a select: its place in the list.
 pub fn index_of<T: PartialEq>(list: &[(T, &str)], value: &T) -> usize {
     list.iter().position(|(v, _)| v == value).unwrap_or(0)
@@ -205,6 +240,30 @@ mod tests {
 
     fn list(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|c| (*c).to_owned()).collect()
+    }
+
+    #[test]
+    fn picture_subtitles_are_read_as_text_by_default() {
+        let row = picture_row(BitmapPreference::default(), true);
+        assert_eq!(PICTURE_SUBTITLES[row.shown].1, "Read as text (OCR)");
+        assert_eq!(row.off, None);
+    }
+
+    #[test]
+    fn a_user_who_chose_pictures_sees_pictures() {
+        let row = picture_row(BitmapPreference::Pictures, true);
+        assert_eq!(PICTURE_SUBTITLES[row.shown].1, "Show as pictures");
+        assert_eq!(row.off, None);
+    }
+
+    #[test]
+    fn without_the_servers_ocr_the_choice_is_off_and_shows_pictures() {
+        let row = picture_row(BitmapPreference::Text, false);
+        assert_eq!(PICTURE_SUBTITLES[row.shown].1, "Show as pictures");
+        assert_eq!(
+            row.off,
+            Some("This server doesn't read picture subtitles as text, so they show as pictures.")
+        );
     }
 
     #[test]

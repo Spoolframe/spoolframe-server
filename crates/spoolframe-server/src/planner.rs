@@ -14,8 +14,10 @@
 //! can play directly (P2-07). A bitmap one (PGS; VobSub and DVB since
 //! P3-08): the client draws it, the server reads it as text (sent as an
 //! external text subtitle, so the file still plays directly), or it is
-//! burned in; the client's [`BitmapSubtitles`] mode picks, and `Auto` takes
-//! the first that works. A text one the client cannot show is converted to
+//! burned in. The client's [`BitmapSubtitles`] mode picks; for `Auto` the
+//! viewer's [`BitmapPreference`] does: text when the server can read the
+//! track, else the client draws it, else it is burned in; or, for
+//! pictures, the client draws it, else it is burned in. A text one the client cannot show is converted to
 //! SubRip or WebVTT and sent beside the file the same way.
 
 use spoolframe_media::encoders::Encoders;
@@ -28,8 +30,33 @@ use spoolframe_protocol::{
     PlannedSubtitle, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
 };
 use spoolframe_types::{
-    AudioCodec, ClientCapabilities, Container, Delivery, SubtitleFormat, VideoCodec,
+    AudioCodec, BitmapPreference, ClientCapabilities, Container, Delivery, SubtitleFormat,
+    VideoCodec,
 };
+
+/// How a picked bitmap subtitle is shown: as the client asked, or, when it
+/// left it to the server (`BitmapSubtitles::Auto`), as the viewer prefers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bitmap {
+    /// Read as text, or the plan is unsupported.
+    Text,
+    /// Burned into the video.
+    BurnIn,
+    /// The viewer's preference, falling back to pictures.
+    Preferred(BitmapPreference),
+}
+
+impl Bitmap {
+    /// What the client asked for, or `None` when it left it to the
+    /// viewer's preference.
+    pub fn asked(requested: BitmapSubtitles) -> Option<Self> {
+        match requested {
+            BitmapSubtitles::Text => Some(Bitmap::Text),
+            BitmapSubtitles::BurnIn => Some(Bitmap::BurnIn),
+            BitmapSubtitles::Auto | BitmapSubtitles::Unknown => None,
+        }
+    }
+}
 
 /// Plan `descriptor` for a client with `capabilities` (`None`: it sent
 /// none) and `selection`, showing a bitmap subtitle as `bitmap` says,
@@ -39,7 +66,7 @@ pub fn plan(
     descriptor: &MediaDescriptor,
     capabilities: Option<&ClientCapabilities>,
     selection: Selection,
-    bitmap: BitmapSubtitles,
+    bitmap: Bitmap,
     encoders: &Encoders,
     ocr: &Ocr,
 ) -> PlaybackPlan {
@@ -140,7 +167,7 @@ fn subtitle_shown(
     stream: &SubtitleStream,
     picked: u32,
     caps: &ClientCapabilities,
-    mode: BitmapSubtitles,
+    mode: Bitmap,
     ocr: &Ocr,
 ) -> Result<Option<Shown>, String> {
     if stream.kind == SubtitleKind::Text {
@@ -149,8 +176,13 @@ fn subtitle_shown(
     let format = codecs::subtitle_format(&stream.codec);
     let native = format != SubtitleFormat::Unknown && caps.subtitles.contains(&format);
     let text = as_text(stream, format, caps, ocr);
+    let pictures = if native {
+        Shown::Native
+    } else {
+        Shown::BurnIn { asked: false }
+    };
     Ok(Some(match mode {
-        BitmapSubtitles::Text => match text {
+        Bitmap::Text => match text {
             Ok(to) => Shown::Text { to },
             Err(why) => {
                 return Err(format!(
@@ -159,12 +191,12 @@ fn subtitle_shown(
                 ));
             }
         },
-        BitmapSubtitles::BurnIn => Shown::BurnIn { asked: true },
-        BitmapSubtitles::Auto | BitmapSubtitles::Unknown => match text {
-            _ if native => Shown::Native,
+        Bitmap::BurnIn => Shown::BurnIn { asked: true },
+        Bitmap::Preferred(BitmapPreference::Text) => match text {
             Ok(to) => Shown::Text { to },
-            Err(_) => Shown::BurnIn { asked: false },
+            Err(_) => pictures,
         },
+        Bitmap::Preferred(BitmapPreference::Pictures) => pictures,
     }))
 }
 
@@ -740,7 +772,8 @@ mod tests {
         plan_with(d, caps, s, &Encoders::software_baseline())
     }
 
-    /// `Auto` bitmap subtitles, and no text recognition.
+    /// The default preference for bitmap subtitles, and no text
+    /// recognition.
     fn plan_with(
         d: &MediaDescriptor,
         caps: Option<&ClientCapabilities>,
@@ -751,7 +784,7 @@ mod tests {
             d,
             caps,
             s,
-            BitmapSubtitles::Auto,
+            Bitmap::Preferred(BitmapPreference::Text),
             encoders,
             &Ocr::disabled(),
         )
@@ -1298,7 +1331,7 @@ mod tests {
         d: &MediaDescriptor,
         caps: &ClientCapabilities,
         s: Selection,
-        mode: BitmapSubtitles,
+        mode: Bitmap,
         ocr: &Ocr,
     ) -> PlaybackPlan {
         super::plan(d, Some(caps), s, mode, &dev_encoders(), ocr)
@@ -1320,52 +1353,110 @@ mod tests {
     }
 
     #[test]
-    fn auto_reads_a_pgs_the_client_cannot_draw_and_the_file_plays_directly() {
+    fn text_preferred_reads_a_pgs_the_client_cannot_draw_and_the_file_plays_directly() {
         // AAC audio fits; the PGS track goes out beside it as SubRip.
         let plan = with_mode(
             &dts_aac_pgs(),
             &caps(),
             picked(1, Some(0)),
-            BitmapSubtitles::Auto,
+            Bitmap::Preferred(BitmapPreference::Text),
+            &english(),
+        );
+        assert_eq!(direct_subtitle(plan), sent_as_srt());
+    }
+
+    /// A client that takes SubRip and draws PGS.
+    fn caps_that_draw_pgs() -> ClientCapabilities {
+        ClientCapabilities {
+            subtitles: [SubtitleFormat::Srt, SubtitleFormat::Pgs].into(),
+            ..caps()
+        }
+    }
+
+    fn drawn_by_the_client() -> Option<PlannedSubtitle> {
+        Some(PlannedSubtitle {
+            index: 0,
+            format: SubtitleFormat::Pgs,
+            delivery: SubtitleDelivery::Embedded,
+        })
+    }
+
+    #[test]
+    fn the_default_preference_reads_a_pgs_even_for_a_client_that_draws_it() {
+        let plan = with_mode(
+            &dts_aac_pgs(),
+            &caps_that_draw_pgs(),
+            picked(1, Some(0)),
+            Bitmap::Preferred(BitmapPreference::default()),
             &english(),
         );
         assert_eq!(direct_subtitle(plan), sent_as_srt());
     }
 
     #[test]
-    fn auto_lets_a_client_that_draws_pgs_draw_it() {
-        let caps = ClientCapabilities {
-            subtitles: [SubtitleFormat::Srt, SubtitleFormat::Pgs].into(),
-            ..caps()
-        };
+    fn preferring_pictures_lets_a_client_that_draws_pgs_draw_it() {
         let plan = with_mode(
             &dts_aac_pgs(),
-            &caps,
+            &caps_that_draw_pgs(),
             picked(1, Some(0)),
-            BitmapSubtitles::Auto,
+            Bitmap::Preferred(BitmapPreference::Pictures),
             &english(),
         );
+        assert_eq!(direct_subtitle(plan), drawn_by_the_client());
+    }
+
+    #[test]
+    fn preferring_pictures_burns_them_in_for_a_client_that_cannot_draw_them() {
+        let (_, _, video, _, subtitle, reasons) = converted(with_mode(
+            &dts_aac_pgs(),
+            &caps_that_can_burn_in(),
+            picked(1, Some(0)),
+            Bitmap::Preferred(BitmapPreference::Pictures),
+            &english(),
+        ));
+        assert!(matches!(video, ConvertedVideo::Encode { .. }), "{video:?}");
         assert_eq!(
-            direct_subtitle(plan),
-            Some(PlannedSubtitle {
+            subtitle,
+            Some(ConvertedSubtitle {
                 index: 0,
-                format: SubtitleFormat::Pgs,
-                delivery: SubtitleDelivery::Embedded,
+                action: SubtitleAction::BurnIn {
+                    format: SubtitleFormat::Pgs
+                },
             })
+        );
+        assert!(
+            reasons.contains(&"subtitle 0: pgs cannot be shown; burned into the video".to_owned()),
+            "{reasons:?}"
         );
     }
 
     #[test]
-    fn text_reads_it_even_for_a_client_that_draws_pgs() {
-        let caps = ClientCapabilities {
-            subtitles: [SubtitleFormat::Srt, SubtitleFormat::Pgs].into(),
-            ..caps()
-        };
+    fn text_preferred_without_recognition_is_drawn_by_a_client_that_can() {
         let plan = with_mode(
             &dts_aac_pgs(),
-            &caps,
+            &caps_that_draw_pgs(),
             picked(1, Some(0)),
-            BitmapSubtitles::Text,
+            Bitmap::Preferred(BitmapPreference::Text),
+            &Ocr::disabled(),
+        );
+        assert_eq!(direct_subtitle(plan), drawn_by_the_client());
+    }
+
+    #[test]
+    fn a_mode_the_client_asks_for_is_what_the_request_resolves_to() {
+        assert_eq!(Bitmap::asked(BitmapSubtitles::Text), Some(Bitmap::Text));
+        assert_eq!(Bitmap::asked(BitmapSubtitles::BurnIn), Some(Bitmap::BurnIn));
+        assert_eq!(Bitmap::asked(BitmapSubtitles::Auto), None);
+        assert_eq!(Bitmap::asked(BitmapSubtitles::Unknown), None);
+    }
+
+    #[test]
+    fn text_reads_it_even_for_a_client_that_draws_pgs() {
+        let plan = with_mode(
+            &dts_aac_pgs(),
+            &caps_that_draw_pgs(),
+            picked(1, Some(0)),
+            Bitmap::Text,
             &english(),
         );
         assert_eq!(direct_subtitle(plan), sent_as_srt());
@@ -1376,13 +1467,7 @@ mod tests {
         let mut french = dts_aac_pgs();
         french.subtitles[0].language = Some("fre".into());
         let text = |d: &MediaDescriptor, ocr: &Ocr| {
-            reasons(with_mode(
-                d,
-                &caps(),
-                picked(1, Some(0)),
-                BitmapSubtitles::Text,
-                ocr,
-            ))
+            reasons(with_mode(d, &caps(), picked(1, Some(0)), Bitmap::Text, ocr))
         };
         assert_eq!(
             text(&french, &english()),
@@ -1396,14 +1481,14 @@ mod tests {
                 "subtitle 0: pgs cannot be read as text: the server has no text recognition (tesseract)"
             ]
         );
-        // Auto with the same file burns it in where it can, or names the
-        // format as before.
+        // Preferred as text, the same file is burned in where it can be,
+        // or the format is named as before.
         assert_eq!(
             reasons(with_mode(
                 &french,
                 &caps(),
                 picked(1, Some(0)),
-                BitmapSubtitles::Auto,
+                Bitmap::Preferred(BitmapPreference::Text),
                 &english(),
             )),
             ["subtitle 0: pgs not supported"]
@@ -1421,7 +1506,7 @@ mod tests {
             &dts_aac_pgs(),
             &caps,
             picked(1, Some(0)),
-            BitmapSubtitles::BurnIn,
+            Bitmap::BurnIn,
             &english(),
         ));
         assert!(matches!(video, ConvertedVideo::Encode { .. }), "{video:?}");
@@ -1448,7 +1533,7 @@ mod tests {
             &dts_aac_pgs(),
             &caps,
             picked(0, Some(0)),
-            BitmapSubtitles::Auto,
+            Bitmap::Preferred(BitmapPreference::Text),
             &english(),
         ));
         assert_eq!(
@@ -1494,7 +1579,7 @@ mod tests {
                 &with_bitmap(codec, "eng"),
                 &caps(),
                 picked(1, Some(0)),
-                BitmapSubtitles::Text,
+                Bitmap::Text,
                 &english(),
             );
             assert_eq!(direct_subtitle(plan), sent_as_srt(), "{codec}");
@@ -1502,13 +1587,13 @@ mod tests {
     }
 
     #[test]
-    fn auto_reads_vobsub_and_dvb_rather_than_burn_them_in() {
+    fn text_preferred_reads_vobsub_and_dvb_rather_than_burn_them_in() {
         for codec in ["dvd_subtitle", "dvb_subtitle"] {
             let plan = with_mode(
                 &with_bitmap(codec, "eng"),
                 &caps_that_can_burn_in(),
                 picked(1, Some(0)),
-                BitmapSubtitles::Auto,
+                Bitmap::Preferred(BitmapPreference::Text),
                 &english(),
             );
             assert_eq!(direct_subtitle(plan), sent_as_srt(), "{codec}");
@@ -1530,7 +1615,7 @@ mod tests {
                 &with_bitmap(codec, "eng"),
                 &caps,
                 picked(1, Some(0)),
-                BitmapSubtitles::Auto,
+                Bitmap::Preferred(BitmapPreference::Text),
                 &english(),
             ));
             assert!(matches!(video, ConvertedVideo::Copy { .. }), "{video:?}");
@@ -1556,7 +1641,7 @@ mod tests {
                 &french,
                 &caps_that_can_burn_in(),
                 picked(1, Some(0)),
-                BitmapSubtitles::Auto,
+                Bitmap::Preferred(BitmapPreference::Text),
                 &english(),
             ));
             assert!(matches!(video, ConvertedVideo::Encode { .. }), "{video:?}");
@@ -1581,7 +1666,7 @@ mod tests {
                     &french,
                     &caps_that_can_burn_in(),
                     picked(1, Some(0)),
-                    BitmapSubtitles::Text,
+                    Bitmap::Text,
                     &english(),
                 )),
                 [format!(
@@ -1598,7 +1683,7 @@ mod tests {
             &dts_aac_pgs(),
             &caps(),
             picked(1, Some(1)),
-            BitmapSubtitles::BurnIn,
+            Bitmap::BurnIn,
             &english(),
         );
         assert_eq!(
@@ -1620,7 +1705,7 @@ mod tests {
             &file,
             &caps(),
             picked(1, Some(1)),
-            BitmapSubtitles::Auto,
+            Bitmap::Preferred(BitmapPreference::Text),
             &Ocr::disabled(),
         );
         assert_eq!(

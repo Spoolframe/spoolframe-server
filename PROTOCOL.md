@@ -1,7 +1,25 @@
-# Development wire revision 4
+# Development wire revision 5
 
-Revision 4 (P4-01, trusted devices) keeps the `spoolframe/client/1` ALPN
-and sets `PROTOCOL_VERSION` to 4. Update the server and SDK together.
+Revision 5 (PX-14, the server id; PX-13, picture subtitles) keeps the
+`spoolframe/client/1` ALPN and sets `PROTOCOL_VERSION` to 5. Update the
+server and SDK together. A mismatched build is refused at `Hello`, not
+later on one request:
+
+- A revision-4 client gets `Unsupported` from a revision-5 server's
+  `Hello`.
+- `ServerInfo` has a new required field, `server_id` (PX-14), so a
+  revision-5 client cannot decode a revision-4 server's `Hello` reply.
+- `GetTrackPreferences` answers `Reply::TrackPreferences` with a
+  `TrackPreferencesInfo { preferences, ocr_offered }`, not the bare
+  `TrackPreferences` (PX-13). PX-13 made this change without a bump, so
+  a mismatched build failed only that request; revision 5 covers it.
+  PX-13's new `subtitles.bitmap` preference and the new meaning of
+  `bitmap: "auto"` change no encoding.
+
+What changed for the server id is in "The server id" below; what
+changed for picture subtitles is in "Picture subtitles".
+
+Revision 4 (P4-01, trusted devices) set `PROTOCOL_VERSION` to 4.
 Revision 3 and older binaries cannot use this wire format. What changed
 is in "Trusted devices" below.
 
@@ -10,6 +28,52 @@ binaries cannot use that wire format either. Clients must explicitly select fore
 playback handle; see the migration examples below. Clients
 that depend directly on the protocol/types crates must update those
 packages together with the SDK.
+
+## The server id
+
+`ServerInfo` (the reply to `Hello`) has `server_id: String`. The key is
+always there. It is the server's id: 80 random bits, written as
+lowercase RFC 4648 base32 with no padding, so 16 characters of `a`-`z`
+and `2`-`7`. It is a DNS label. `spoolframe_protocol::ServerId::parse`
+checks one.
+
+The server makes it at its first start and keeps it in its state
+directory, in `server.id` (mode `0600`), beside `endpoint.key`. It is
+not the endpoint id. A new key keeps the server id, and a new server id
+does not change the key. `spoolframe-server id` prints both:
+
+```text
+endpoint id: 5f0c…
+server id:   mzxw6ytbojtg633c
+```
+
+A `server.id` that is not a server id stops the server. It is never
+made again while the file is there.
+
+### SDK: the pin is the key and the server id
+
+The SDK checks that `server_id` is a server id, or the connect is a
+`Protocol` error. It pins the server id with the key, at the first
+connect. A server saved by an older SDK takes the id at its next
+connect. `ServerEntry` has a new field, `server_id: Option<String>`.
+
+- Same key and same id: the connect succeeds. The name is saved, as
+  before, whatever it is.
+- Same id, another key: `SdkError::IdentityChanged { saved, now }`, from
+  `connect` and from `pin`. `Client::trust_new_identity(saved, now)`
+  pins the new key with the same id. The server's app passkeys keep
+  working, because they belong to the id, and the SDK makes their
+  challenges with the new key from then on.
+- Same key, another id: `SdkError::ServerIdChanged { endpoint_id, saved,
+  now }`, from every request to that server. Nothing is saved, and the
+  pin does not change. A server never changes its id, so this is not
+  accepted in place. `Client::forget` it and add it again if the user
+  says it is theirs.
+- Another key and another id: another server. No pin applies, whatever
+  its name.
+
+A pin with no id yet is still matched by name: another key heard on the
+LAN under its name is an `IdentityChanged`. A pin with an id is not.
 
 ## RPC framing
 
@@ -154,8 +218,9 @@ failures in 15 minutes the reply is `RateLimited`, also for the right
 password and for a login. A user with no password gets `NoPassword`, and
 nothing is counted.
 
-`BeginConfirmPasskey` lists only the session user's app passkeys
-(relying party `spoolframe.app`). It sends a nonce, and the app signs the
+`BeginConfirmPasskey` lists only the session user's app passkeys made
+for this server's relying party (see "App passkeys: a relying party per
+server"). It sends a nonce, and the app signs the
 challenge made from it (see "App passkey challenges"). The challenge
 belongs to this session on this endpoint, for 5 minutes, and is used once. A sign-in challenge or the
 challenge of another session does not finish it. A passkey of another user
@@ -164,14 +229,59 @@ the passkey's user from this endpoint. A user with no app passkey gets
 `NotFound`. When the user's passkey sign-ins are rate-limited, `Begin`
 gets `RateLimited` before a challenge is made.
 
+## App passkeys: a relying party per server
+
+Each server has its own app relying party (PX-14):
+
+| | Value |
+|---|---|
+| RP ID | `<server id>.spoolframe.app` (`ServerId::rp_id`) |
+| Origin | `https://<server id>.spoolframe.app` (`ServerId::origin`) |
+
+Before PX-14 every server shared the RP ID `spoolframe.app`, at the origin
+`https://spoolframe.app`. A security key with passkeys for two servers,
+or for two accounts, then answered a sign-in that listed no passkeys with
+all of them. The platform took the first, and another server refused it.
+With an RP per server, the key offers only that server's passkeys.
+
+The server takes only its own RP ID hash and its own origin, for
+registration, sign-in and confirmation. `https://spoolframe.app` is not
+its origin: WebAuthn wants the origin's host at or under the RP ID, and
+`spoolframe.app` is above `<server id>.spoolframe.app`.
+
+`PasskeyCreation` and `PasskeyRequest`, which the SDK gives the app, have
+two new fields, `rp_id` and `origin`. The SDK makes them from the server
+id that it pinned with the key, not from a fixed value. The app gives
+`rp_id` to the platform's passkey API, and `origin` where the platform
+takes one (webauthn-authenticator-rs on Linux). `APP_RP_ID` and
+`APP_ORIGIN` are gone. `PasskeyRegistrationBegun.user_name` is now
+`<username> @ <server name>`, because the RP ID says nothing a person can
+read. `display_name` is the user's display name, or the username.
+
+### Passkeys made for `spoolframe.app`
+
+The server keeps them. They sign no one in: a sign-in or confirmation
+with one is `InvalidCredentials`, and the log says the passkey "was made
+for another host". `ListPasskeys` lists each one with `app: true` and
+`usable_here: false`. The web UI's `passkeys` lists it with `app: true`
+and `usable: false`, and says it is an old app passkey to add again. The
+user removes it as any other passkey. The server logs each one at
+start, as it logs web passkeys of another host. They still count as a
+way to sign in for the last-method rule, as web passkeys of another host
+do. `LEGACY_APP_RP_ID` names their RP ID, and `is_app_rp_id` tells an app
+passkey's RP ID from a web one.
+
+The web UI's own relying party, the host of `admin.public_url`, does not
+change.
+
 ## App passkey challenges
 
-Every server shares the app relying party `spoolframe.app`, and the
-platform writes only the origin `https://spoolframe.app` and the challenge
-into `clientDataJSON`. So the challenge names the server: otherwise a
-server could begin a ceremony on another server, give that challenge to
-an app as its own, and finish there with what the app signed (PX-09,
-finding 2).
+The RP ID comes from the server id that a server names in `ServerInfo`,
+and a server can name another server's id. The platform writes only the
+origin and the challenge into `clientDataJSON`. So the challenge names
+the server by its key: otherwise a server could claim another server's
+id, begin a ceremony there, give that challenge to an app as its own,
+and finish there with what the app signed (PX-09, finding 2).
 
 `BeginPasskeySignIn` and `BeginConfirmPasskey` reply `PasskeySignInBegun`
 (`nonce`, `allow_credential_ids`). `BeginPasskeyRegistration` replies
@@ -372,6 +482,55 @@ server's addresses, marked as told, with the time it was told. The same
 when a connection reaches it, and a reached one stays reached. Under the
 cap, the newest reached addresses are kept first, and told ones fill the
 room that is left. Every saved address is dialled, told or reached.
+
+## Picture subtitles
+
+Each user chooses how picture subtitles (PGS, VobSub, DVB) are shown,
+in `TrackPreferences`: `subtitles.bitmap` is `"text"` (read as text by
+the server, the default) or `"pictures"`. The choice is per user, so it
+is the same on every device. An unknown value reads as `"text"`.
+
+The server applies it when a `PlaybackPlan`, `StartPlayback` or
+`ChangeSubtitle` request has `bitmap: "auto"`:
+
+| Preference | The server reads the track | Else |
+|---|---|---|
+| `text` | sent as SubRip or WebVTT (`Ocr`) | drawn by the client if it can, else burned in |
+| `pictures` | not used | drawn by the client if it can, else burned in |
+
+The server cannot read a track when `subtitles.ocr` is off, when
+tesseract has no data for the track's language, or when the client takes
+neither SubRip nor WebVTT. With `subtitles.ocr` off the preference has no
+effect. A request with `bitmap: "text"` or `"burn_in"` still gets what it
+asks for, whatever the preference.
+
+The plan says which was used. A direct plan has the picked subtitle with
+its format and delivery: `pgs` `embedded` is drawn by the client, and
+`srt` or `web_vtt` `external` is read as text. A converted plan has a
+`SubtitleAction` of `ocr`, `burn_in` or `copy`.
+
+Before this, `auto` meant drawn by the client if it can, then read as
+text, then burned in. The meaning of `auto` changed, not its encoding. An
+older app that saves `TrackPreferences` without `subtitles.bitmap` sets it
+back to `"text"`.
+
+### Whether the server offers it
+
+`GetTrackPreferences` answers `TrackPreferences { preferences,
+ocr_offered }` (`TrackPreferencesInfo`), not the bare preferences.
+`ocr_offered` is true when `subtitles.ocr` is on and tesseract has at
+least one language. When it is false, apps show the picture subtitle
+choice disabled, because pictures are shown whatever it says. The admin
+API's `me.trackPreferences` answers the same, as `{ preferences,
+ocrOffered }`. `SetTrackPreferences` and `me.setTrackPreferences` still
+take the bare preferences.
+
+This changes the reply's encoding. It shipped in revision 4 without a
+bump, so only `GetTrackPreferences` failed between mismatched builds.
+Revision 5 (PX-14) covers it: a mismatched build is now refused at
+`Hello`. Update the server and SDK together. The SDK's `Session::track_preferences` returns
+`TrackPreferencesInfo`; read `.preferences` where the bare preferences
+were used.
 
 ## SDK migration in 0.3.0
 

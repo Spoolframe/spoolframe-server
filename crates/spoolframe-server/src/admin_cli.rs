@@ -406,6 +406,12 @@ pub async fn status(listen: SocketAddr) -> Result<()> {
         "fingerprint: {}",
         status.fingerprint.as_deref().unwrap_or("starting")
     );
+    println!("server id: {}", status.server_id);
+    println!(
+        "passkey domain: {}.{}",
+        status.server_id,
+        spoolframe_admin_api::APP_RP_DOMAIN
+    );
     println!(
         "video encoders: {}",
         list(&status.transcoding.video_encoders)

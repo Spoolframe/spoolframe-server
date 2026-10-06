@@ -288,6 +288,11 @@ fn answer(
     envelope: spoolframe_protocol::RequestEnvelope,
 ) -> Response {
     let web_url = state.web_url.lock().unwrap().clone();
+    // Made from its key: two stubs are two servers (PX-14).
+    let server_id = spoolframe_protocol::ServerId::from_bytes(
+        id.as_bytes()[..10].try_into().expect("a key is 32 bytes"),
+    )
+    .to_string();
     let reply = match envelope.request {
         Request::ServerAddresses if envelope.session.is_none() => {
             return Response::Err(Error::Unauthenticated);
@@ -298,6 +303,7 @@ fn answer(
         Request::Hello(_) => Reply::ServerInfo(ServerInfo {
             name: "Stub".into(),
             endpoint_id: id.to_string(),
+            server_id,
             protocol_version: PROTOCOL_VERSION,
             server_version: "0".into(),
             auth_methods: vec![AuthMethod::Password],
