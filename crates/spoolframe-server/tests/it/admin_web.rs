@@ -297,6 +297,22 @@ async fn without_a_cookie_there_is_no_one() {
     );
 }
 
+/// The web UI asks with `?or=null`: no one is `null`, not a 401 the
+/// browser logs as a failed request. A stale cookie is no one too.
+#[tokio::test]
+async fn asked_with_or_null_no_one_is_null() {
+    let (addr, _dir) = server("web-anonymous-null").await;
+    for cookie in [None, Some("spoolframe_session=not-a-session")] {
+        let mut request = reqwest::Client::new().get(format!("http://{addr}/auth/me?or=null"));
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{cookie:?}");
+        assert_eq!(response.json::<Value>().await.unwrap(), Value::Null);
+    }
+}
+
 /// A login as the proxy passes it on from the caller at `from`.
 async fn login_from(addr: SocketAddr, from: &str, username: &str, password: &str) -> StatusCode {
     reqwest::Client::new()

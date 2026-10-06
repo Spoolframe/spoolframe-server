@@ -318,6 +318,8 @@ pub struct Playbacks {
     /// told so, not that it expired (P3-15). Kept as long as an idle
     /// handle would have lived.
     stopped: Mutex<HashMap<String, Instant>>,
+    /// What idling out and rechecks are timed by (PX-09).
+    clock: crate::clock::Clock,
 }
 
 /// How a playback ended (P3-15).
@@ -532,7 +534,15 @@ impl Playbacks {
             ended: Counter::default(),
             gone: Mutex::default(),
             stopped: Mutex::default(),
+            clock: crate::clock::Clock::default(),
         }
+    }
+
+    /// Time idling and rechecks by `clock` (tests move it instead of
+    /// sleeping).
+    pub fn with_clock(mut self, clock: crate::clock::Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// What is open now, and what opened and ended (P3-14). A playback
@@ -572,7 +582,8 @@ impl Playbacks {
     /// it, or it is unknown or idled out.
     fn gone(&self, handle: &str) -> Refusal {
         let mut stopped = self.stopped.lock().expect("never held across a panic");
-        stopped.retain(|_, at| at.elapsed() < self.idle);
+        let now = self.clock.now();
+        stopped.retain(|_, at| now.saturating_duration_since(*at) < self.idle);
         if stopped.contains_key(handle) {
             Refusal::Stopped
         } else {
@@ -613,7 +624,7 @@ impl Playbacks {
     /// Open `opened` as `handle`; the session was checked by the caller
     /// just now.
     pub fn start(&self, handle: PlaybackHandle, opened: Opened) -> PlaybackHandle {
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut handles = self.lock();
         // Forget idle handles here rather than on a timer.
         let idle: Vec<String> = handles
@@ -684,7 +695,7 @@ impl Playbacks {
         session: &SessionId,
         endpoint: &str,
     ) -> Result<Use, Refusal> {
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut handles = self.lock();
         let Some(playback) = handles.get_mut(&handle.0) else {
             drop(handles);
@@ -720,7 +731,7 @@ impl Playbacks {
     /// encode does, so the playback does not idle out under it.
     pub fn touch(&self, handle: &PlaybackHandle) {
         if let Some(p) = self.lock().get_mut(&handle.0) {
-            p.last_used = Instant::now();
+            p.last_used = self.clock.now();
         }
     }
 
@@ -863,7 +874,7 @@ impl Playbacks {
     /// End every playback idle past the limit. Run now and then, so a
     /// conversion does not outlive its handle by long.
     pub fn sweep(&self) {
-        let now = Instant::now();
+        let now = self.clock.now();
         self.end_where(
             |p| now.duration_since(p.last_used) >= self.idle,
             EndReason::Idle,
@@ -969,7 +980,7 @@ impl Playbacks {
         self.stopped
             .lock()
             .expect("never held across a panic")
-            .insert(handle, Instant::now());
+            .insert(handle, self.clock.now());
         drop(handles);
         self.ended_all(ended, EndReason::StoppedByAdmin);
         true
@@ -994,6 +1005,7 @@ impl Playbacks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Clock;
 
     fn start(p: &Playbacks) -> PlaybackHandle {
         start_on(p, "e")
@@ -1053,7 +1065,8 @@ mod tests {
     /// Each playback ends once in the counts, however it ends (P3-14).
     #[test]
     fn playbacks_are_counted_open_and_ended_once_each() {
-        let p = Playbacks::new(Duration::from_millis(20), RECHECK);
+        let clock = Clock::default();
+        let p = Playbacks::default().with_clock(clock.clone());
         let stopped = start(&p);
         let idle = start(&p);
         let _device = start_on(&p, "tv");
@@ -1062,7 +1075,7 @@ mod tests {
         p.end(&stopped, EndReason::Finished);
         p.end(&stopped, EndReason::Finished);
         assert_eq!(p.end_device("tv"), 1);
-        std::thread::sleep(Duration::from_millis(40));
+        clock.advance(IDLE);
         // Found idle when used, then forgotten.
         assert!(p.use_handle(&idle, &SessionId("s".into()), "e").is_err());
         p.sweep();
@@ -1085,22 +1098,27 @@ mod tests {
 
     #[test]
     fn an_idle_handle_expires() {
-        let p = Playbacks::new(Duration::from_millis(20), RECHECK);
+        let clock = Clock::default();
+        let p = Playbacks::default().with_clock(clock.clone());
         let h = start(&p);
-        std::thread::sleep(Duration::from_millis(40));
-        assert_eq!(
-            p.use_handle(&h, &SessionId("s".into()), "e").unwrap_err(),
-            Refusal::Expired
-        );
+        let s = SessionId("s".into());
+        clock.advance(IDLE - Duration::from_secs(1));
+        assert!(p.use_handle(&h, &s, "e").is_ok());
+        // Used a moment ago: idle from then.
+        clock.advance(IDLE);
+        assert_eq!(p.use_handle(&h, &s, "e").unwrap_err(), Refusal::Expired);
     }
 
     #[test]
     fn use_asks_for_a_recheck_once_per_interval() {
-        let p = Playbacks::new(IDLE, Duration::from_millis(20));
+        let clock = Clock::default();
+        let p = Playbacks::default().with_clock(clock.clone());
         let h = start(&p);
         let s = SessionId("s".into());
         assert!(!p.use_handle(&h, &s, "e").unwrap().recheck);
-        std::thread::sleep(Duration::from_millis(40));
+        clock.advance(RECHECK - Duration::from_secs(1));
+        assert!(!p.use_handle(&h, &s, "e").unwrap().recheck);
+        clock.advance(Duration::from_secs(1));
         assert!(p.use_handle(&h, &s, "e").unwrap().recheck);
         assert!(!p.use_handle(&h, &s, "e").unwrap().recheck);
     }
@@ -1165,13 +1183,14 @@ mod tests {
     /// The last hour's list says how each one ended.
     #[test]
     fn an_ended_playback_is_listed_with_how_it_ended_newest_first() {
-        let p = Playbacks::new(Duration::from_millis(20), RECHECK);
+        let clock = Clock::default();
+        let p = Playbacks::default().with_clock(clock.clone());
         let finished = start_on(&p, "a");
         start_on(&p, "b");
         p.end(&finished, EndReason::Finished);
         assert_eq!(p.end_device("b"), 1);
         start_on(&p, "c");
-        std::thread::sleep(Duration::from_millis(40));
+        clock.advance(IDLE);
         p.sweep();
         let why: Vec<EndReason> = p.ended().into_iter().map(|e| e.why).collect();
         assert_eq!(

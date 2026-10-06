@@ -1,7 +1,9 @@
 //! Scoped, grouped search (P3-09) through the client protocol, from a
 //! Plex server replaying replies recorded from a real PMS (1.43.3; the
 //! recordings are `spoolframe-plex`'s `tests/fixtures/search`). Sections:
-//! Movies (2), TV Shows (1), Music (12).
+//! Movies (2), TV Shows (1), Music (12). What a search finds is tested on
+//! `search::search` itself, in `search::recorded`; these check that a
+//! request reaches it, and a person's items are paged.
 
 use std::sync::Arc;
 
@@ -11,7 +13,7 @@ use spoolframe_protocol::{
     Reply, Request, Response, SearchRequest, SearchResults, SessionId, TopResult,
 };
 use spoolframe_server::catalog::{Composite, LiveCatalog};
-use spoolframe_types::{ArtworkKind, Item, Person, SearchKind, SearchScope};
+use spoolframe_types::{Item, Person, SearchKind, SearchScope};
 use wiremock::matchers::{method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -159,10 +161,6 @@ fn kind_of(item: &Item) -> SearchKind {
     }
 }
 
-fn group(results: &SearchResults, kind: SearchKind) -> Option<&spoolframe_protocol::SearchGroup> {
-    results.groups.iter().find(|g| g.kind == kind)
-}
-
 #[tokio::test]
 async fn each_scope_returns_only_its_kinds() {
     let pms = pms(&["dune", "letterkenny", "cure"]).await;
@@ -190,154 +188,12 @@ async fn each_scope_returns_only_its_kinds() {
     searcher.stop().await;
 }
 
-/// A track that is the top match says whose it is (PX-07), so a client
-/// shows more than its title on a blank tile. `low-tide` is hand-written
-/// in the shape the PMS sends, not recorded.
-#[tokio::test]
-async fn a_track_at_the_top_says_whose_it_is_and_has_its_cover() {
-    let pms = pms(&["low-tide"]).await;
-    let searcher = Searcher::start("search-track-whose", &pms).await;
-    let results = searcher
-        .search(request("low tide", SearchScope::Music))
-        .await;
-    let Some(TopResult::Item(Item::Track(track))) = &results.top else {
-        panic!("{:?}", results.top)
-    };
-    assert_eq!(
-        (
-            track.title.as_str(),
-            track.artist_name.as_deref(),
-            track.album_title.as_deref()
-        ),
-        ("Low Tide", Some("Mara Quell"), Some("Harbour Lights"))
-    );
-    let poster: Vec<_> = track
-        .artwork
-        .iter()
-        .filter(|a| a.kind == ArtworkKind::Poster)
-        .map(|a| a.id.to_string())
-        .collect();
-    assert_eq!(poster, ["plex:/library/metadata/900100/thumb/1700000100"]);
-    searcher.stop().await;
-}
-
-#[tokio::test]
-async fn a_library_returns_only_its_items() {
-    let pms = pms(&["dune"]).await;
-    let searcher = Searcher::start("search-library", &pms).await;
-    let everywhere = searcher.search(request("dune", SearchScope::All)).await;
-    assert!(group(&everywhere, SearchKind::Movies).is_some());
-    let in_shows = searcher
-        .search(SearchRequest {
-            library: Some("plex:1".parse().unwrap()),
-            ..request("dune", SearchScope::All)
-        })
-        .await;
-    let titles: Vec<_> = every_item(&in_shows).into_iter().map(title).collect();
-    assert_eq!(titles, ["Dune: Prophecy"]);
-    searcher.stop().await;
-}
-
-#[tokio::test]
-async fn a_show_is_the_top_match_and_its_episodes_are_left_out_of_all() {
-    let pms = pms(&["letterkenny"]).await;
-    let searcher = Searcher::start("search-quiet", &pms).await;
-    let results = searcher
-        .search(request("letterkenny", SearchScope::All))
-        .await;
-    assert!(
-        matches!(&results.top, Some(TopResult::Item(Item::Show(s))) if s.title == "Letterkenny")
-    );
-    let episodes = group(&results, SearchKind::Episodes).unwrap();
-    assert!(episodes.items.is_empty(), "{:?}", episodes.items);
-    assert_eq!(episodes.hidden, 3);
-    // In their own scope they are all there.
-    let results = searcher
-        .search(request("letterkenny", SearchScope::Episodes))
-        .await;
-    assert_eq!(every_item(&results).len(), 3);
-    searcher.stop().await;
-}
-
-#[tokio::test]
-async fn a_show_beats_its_own_episode_of_the_same_name() {
-    let pms = pms(&["the-sopranos"]).await;
-    let searcher = Searcher::start("search-same-name", &pms).await;
-    let results = searcher
-        .search(request("the sopranos", SearchScope::All))
-        .await;
-    assert!(
-        matches!(&results.top, Some(TopResult::Item(Item::Show(s))) if s.title == "The Sopranos")
-    );
-    assert_eq!(group(&results, SearchKind::Episodes).unwrap().hidden, 1);
-    searcher.stop().await;
-}
-
-#[tokio::test]
-async fn a_year_at_the_end_finds_that_year_s_film_and_offers_the_others() {
-    let pms = pms(&["dune-2021", "dune"]).await;
-    let searcher = Searcher::start("search-year", &pms).await;
-    let results = searcher
-        .search(request("dune 2021", SearchScope::All))
-        .await;
-    assert_eq!(results.year, Some(2021));
-    let titles: Vec<_> = every_item(&results).into_iter().map(title).collect();
-    assert_eq!(titles, ["Dune: Part One"]);
-    let also: Vec<_> = results.without_year.iter().map(title).collect();
-    assert_eq!(also, ["Dune: Prophecy", "Dune: Part Two"]);
-    searcher.stop().await;
-}
-
-#[tokio::test]
-async fn more_says_a_group_has_more_and_see_all_returns_them() {
-    let pms = pms(&["pilot"]).await;
-    let searcher = Searcher::start("search-more", &pms).await;
-    let results = searcher
-        .search(SearchRequest {
-            limit: 5,
-            ..request("pilot", SearchScope::Episodes)
-        })
-        .await;
-    let episodes = group(&results, SearchKind::Episodes).unwrap();
-    assert_eq!(episodes.items.len(), 5);
-    assert!(episodes.more);
-    assert_eq!(results.counts.episodes, Some(14));
-
-    let all = searcher
-        .search(SearchRequest {
-            limit: 50,
-            kind: Some(SearchKind::Episodes),
-            ..request("pilot", SearchScope::Episodes)
-        })
-        .await;
-    assert_eq!(all.top, None);
-    assert_eq!(all.groups.len(), 1);
-    assert_eq!(all.groups[0].items.len(), 14);
-    assert!(!all.groups[0].more);
-    searcher.stop().await;
-}
-
 /// The person at the top of `results`.
 fn top_person(results: &SearchResults) -> &Person {
     match &results.top {
         Some(TopResult::Person(person)) => person,
         other => panic!("not a person: {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn people_are_found_by_name() {
-    let pms = pms(&["keanu"]).await;
-    let searcher = Searcher::start("search-people", &pms).await;
-    let results = searcher.search(request("keanu", SearchScope::All)).await;
-    // No title has "keanu" in it, so the first person is the top match,
-    // and the others are in their group.
-    let keanu = top_person(&results);
-    assert_eq!(keanu.name, "Keanu Reeves");
-    assert_eq!(keanu.count, Some(9));
-    let people = &group(&results, SearchKind::People).unwrap().people;
-    assert_eq!(people[0].name, "Keanu Karim");
-    searcher.stop().await;
 }
 
 #[tokio::test]
@@ -377,37 +233,5 @@ async fn choosing_a_person_lists_their_items_a_page_at_a_time() {
     let titles: Vec<_> = first.iter().chain(&rest).map(title).collect();
     assert!(titles.contains(&"John Wick: Chapter 4"), "{titles:?}");
     assert!(titles.contains(&"Severance"), "{titles:?}");
-    searcher.stop().await;
-}
-
-#[tokio::test]
-async fn every_scope_is_counted() {
-    let pms = pms(&["dune"]).await;
-    let searcher = Searcher::start("search-counts", &pms).await;
-    let counts = searcher
-        .search(request("dune", SearchScope::All))
-        .await
-        .counts;
-    assert_eq!(counts.movies, Some(2));
-    assert_eq!(counts.shows, Some(1));
-    assert_eq!(counts.episodes, Some(0));
-    assert_eq!(counts.music, Some(0));
-    // And two actors.
-    assert_eq!(counts.all, Some(5));
-    searcher.stop().await;
-}
-
-#[tokio::test]
-async fn nothing_in_this_scope_counts_the_others() {
-    let pms = pms(&["letterkenny"]).await;
-    let searcher = Searcher::start("search-empty", &pms).await;
-    let results = searcher
-        .search(request("letterkenny", SearchScope::Movies))
-        .await;
-    assert_eq!(results.top, None);
-    assert!(results.groups.is_empty());
-    assert_eq!(results.counts.movies, Some(0));
-    assert_eq!(results.counts.shows, Some(1));
-    assert_eq!(results.counts.episodes, Some(3));
     searcher.stop().await;
 }

@@ -77,6 +77,8 @@ pub struct AppPasskeys {
     /// that began them, with its endpoint: one at a time each. Only a
     /// session begins one, so they are as many as the sessions at most.
     confirms: Mutex<HashMap<String, (Confirm, Instant)>>,
+    /// What ceremonies expire by (PX-09).
+    clock: crate::clock::Clock,
 }
 
 struct Confirm {
@@ -114,13 +116,23 @@ impl AppPasskeys {
     /// it).
     pub fn with_lifetime(lifetime: Duration) -> Self {
         Self {
-            party: RelyingParty::at(APP_RP_ID, APP_ORIGIN)
-                .expect("spoolframe.app at https://spoolframe.app is a relying party"),
+            party: RelyingParty {
+                user_handle_optional: true,
+                ..RelyingParty::at(APP_RP_ID, APP_ORIGIN)
+                    .expect("spoolframe.app at https://spoolframe.app is a relying party")
+            },
             lifetime,
             registrations: Mutex::default(),
             sign_ins: Mutex::default(),
             confirms: Mutex::default(),
+            clock: crate::clock::Clock::default(),
         }
+    }
+
+    /// Ceremonies expire by `clock` (tests move it instead of sleeping).
+    pub fn with_clock(mut self, clock: crate::clock::Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Begin making an app passkey for `user` on `endpoint`, in the session
@@ -167,7 +179,7 @@ impl AppPasskeys {
             .registrations
             .lock()
             .expect("never held across a panic");
-        let now = Instant::now();
+        let now = self.clock.now();
         registrations.retain(|_, (_, expires_at)| *expires_at > now);
         let registration = Registration {
             endpoint: endpoint.to_owned(),
@@ -200,7 +212,7 @@ impl AppPasskeys {
             .lock()
             .expect("never held across a panic")
             .remove(session)
-            .filter(|(r, expires_at)| *expires_at > Instant::now() && r.endpoint == endpoint)
+            .filter(|(r, expires_at)| *expires_at > self.clock.now() && r.endpoint == endpoint)
             .map(|(r, _)| r.state)
             .ok_or(CeremonyError::NoCeremony)?;
         let (id, json) = self.party.made(&registered(made), &state)?;
@@ -236,7 +248,7 @@ impl AppPasskeys {
         let state = with_challenge(state, "ast", &app_passkey_challenge(server, &nonce))
             .map_err(SignInError::Internal)?;
         let mut sign_ins = self.sign_ins.lock().expect("never held across a panic");
-        let now = Instant::now();
+        let now = self.clock.now();
         sign_ins.retain(|_, (_, expires_at)| *expires_at > now);
         // Anyone can make an endpoint: they are counted, as the web's are.
         if !sign_ins.contains_key(endpoint) && sign_ins.len() >= MAX_SIGN_INS {
@@ -270,7 +282,7 @@ impl AppPasskeys {
                     .lock()
                     .expect("never held across a panic")
                     .remove(endpoint)
-                    .filter(|(_, expires_at)| *expires_at > Instant::now())
+                    .filter(|(_, expires_at)| *expires_at > self.clock.now())
                     .ok_or("the sign-in was not begun on this device, or is over")?;
                 if !sign_in.allowed.is_empty() && !sign_in.allowed.iter().any(|a| a == id) {
                     return Err("the passkey is not one the sign-in asked for");
@@ -318,7 +330,7 @@ impl AppPasskeys {
         let state = with_challenge(state, "ast", &app_passkey_challenge(server, &nonce))
             .map_err(SignInError::Internal)?;
         let mut confirms = self.confirms.lock().expect("never held across a panic");
-        let now = Instant::now();
+        let now = self.clock.now();
         confirms.retain(|_, (_, expires_at)| *expires_at > now);
         let confirm = Confirm {
             endpoint: endpoint.to_owned(),
@@ -351,7 +363,7 @@ impl AppPasskeys {
                     .expect("never held across a panic")
                     .remove(session)
                     .filter(|(c, expires_at)| {
-                        *expires_at > Instant::now() && c.endpoint == endpoint
+                        *expires_at > self.clock.now() && c.endpoint == endpoint
                     })
                     .ok_or("the confirmation was not begun in this session, or is over")?;
                 if !confirm.sign_in.allowed.iter().any(|a| a == id) {
@@ -416,7 +428,7 @@ fn asserted(signed: &FinishPasskeySignIn) -> PublicKeyCredential {
             authenticator_data: signed.authenticator_data.clone().into(),
             client_data_json: signed.client_data_json.clone().into(),
             signature: signed.signature.clone().into(),
-            user_handle: Some(signed.user_handle.clone().into()),
+            user_handle: signed.user_handle.clone().map(Into::into),
         },
         extensions: Default::default(),
         type_: "public-key".to_owned(),

@@ -1,5 +1,7 @@
 //! Track preferences and the server's choice of tracks (P1-20) over a real
-//! Iroh connection. Episodes 12 and 13 are probed as Brooklyn Nine-Nine
+//! Iroh connection: that preferences reach the plan, and that a sent
+//! selection is used as it is. The choosing itself is tested in
+//! `tracks::tests`. Episodes 12 and 13 are probed as Brooklyn Nine-Nine
 //! S07E01: English audio description before the main English 5.1, and an
 //! "SDH" subtitle as the only English one.
 
@@ -7,8 +9,7 @@ use spoolframe_protocol::{
     ChosenTracks, Reply, Request, Response, Selection, SessionId, TrackReason,
 };
 use spoolframe_types::{
-    Container, MediaId, MediaKind, Namespace, SdhPreference, SubtitleMode, SubtitleRole,
-    TrackPreferences, VideoCodec, VideoTrack,
+    MediaId, MediaKind, Namespace, SdhPreference, SubtitleMode, SubtitleRole, TrackPreferences,
 };
 
 use crate::support::{TestClient, TestServer, mkv_capabilities};
@@ -83,43 +84,6 @@ async fn sdh(client: &TestClient, session: &SessionId) -> u32 {
 }
 
 #[tokio::test]
-async fn the_tracks_say_what_the_file_and_its_picture_are() {
-    let (server, client, session) = ready("tracks-file").await;
-    let Response::Ok(Reply::Tracks(tracks)) = client
-        .call(Some(&session), Request::Tracks { id: episode("12") })
-        .await
-    else {
-        panic!("no tracks");
-    };
-    assert_eq!(tracks.container, Some(Container::Matroska));
-    assert_eq!(
-        tracks.video,
-        Some(VideoTrack {
-            codec: VideoCodec::H264,
-            width: 1920,
-            height: 1080,
-            bit_depth: 8,
-            hdr: None,
-        })
-    );
-    client.close().await;
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn a_new_user_gets_the_main_audio_and_no_description() {
-    let (server, client, alice) = ready("tracks-defaults").await;
-    let chosen = chosen(&client, &alice, &episode("12")).await;
-    assert_eq!(chosen.selection.audio, Some(2));
-    assert_eq!(chosen.audio, TrackReason::FileDefault);
-    // Forced only, and B99 has no English forced subtitle.
-    assert_eq!(chosen.selection.subtitle, None);
-    assert_eq!(chosen.subtitle, TrackReason::NoneMatched);
-    client.close().await;
-    server.stop().await;
-}
-
-#[tokio::test]
 async fn preferences_set_on_one_device_choose_on_another() {
     let (server, laptop, on_laptop) = ready("tracks-two-devices").await;
     done(
@@ -141,68 +105,6 @@ async fn preferences_set_on_one_device_choose_on_another() {
     assert_eq!(chosen.subtitle, TrackReason::Preferences);
     laptop.close().await;
     tv.close().await;
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn preferences_are_each_user_s_own() {
-    let (server, client, alice) = ready("tracks-per-user").await;
-    server.add_user("bob", "battery staple", None).await;
-    let bob = client.login("bob", "battery staple").await;
-    done(
-        &client,
-        &alice,
-        Request::SetTrackPreferences {
-            preferences: always_english(),
-        },
-    )
-    .await;
-    assert_eq!(
-        client.call(Some(&bob), Request::GetTrackPreferences).await,
-        Response::Ok(Reply::TrackPreferences(TrackPreferences::default()))
-    );
-    client.close().await;
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn a_pick_on_one_episode_carries_to_the_next_until_cleared() {
-    let (server, client, alice) = ready("tracks-override").await;
-    done(
-        &client,
-        &alice,
-        Request::SetTrackPreferences {
-            preferences: always_english(),
-        },
-    )
-    .await;
-    // On episode 12 the viewer turns subtitles off.
-    done(
-        &client,
-        &alice,
-        Request::SetTrackOverride {
-            id: episode("12"),
-            selection: Selection {
-                audio: Some(2),
-                subtitle: None,
-            },
-        },
-    )
-    .await;
-    let next = chosen(&client, &alice, &episode("13")).await;
-    assert_eq!(next.selection.subtitle, None);
-    assert_eq!(next.subtitle, TrackReason::Override);
-    assert_eq!(next.audio, TrackReason::Override);
-
-    done(
-        &client,
-        &alice,
-        Request::ClearTrackOverride { id: episode("13") },
-    )
-    .await;
-    let after = chosen(&client, &alice, &episode("13")).await;
-    assert_eq!(after.subtitle, TrackReason::Preferences);
-    client.close().await;
     server.stop().await;
 }
 

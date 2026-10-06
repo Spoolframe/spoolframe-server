@@ -165,7 +165,7 @@ impl App {
             authenticator_data: signed.response.authenticator_data.to_vec(),
             client_data_json: signed.response.client_data_json.to_vec(),
             signature: signed.response.signature.to_vec(),
-            user_handle,
+            user_handle: Some(user_handle),
         }
     }
 }
@@ -463,6 +463,73 @@ async fn the_user_handle_differs_between_servers() {
     cabin.stop().await;
 }
 
+/// A platform that returns no user handle (the Linux client's, signing
+/// with a phone over caBLE) sends none: the passkey's credential id says
+/// whose it is, and its signature proves it.
+#[tokio::test]
+async fn a_passkey_signed_with_no_user_handle_signs_its_user_in() {
+    let server = server("app-passkey-no-handle").await;
+    let (_phone, _session, mut alices) = alice_with_a_passkey(&server).await;
+    server.add_user("bob", PASSWORD, None).await;
+    let bobs_phone = device(&server, "Bob's phone").await;
+    let bob = bobs_phone.login("bob", PASSWORD).await;
+    let mut bobs = App::new();
+    register(&bobs_phone, &bob, &mut bobs, "Bob's phone").await;
+
+    let tv = device(&server, "Living room TV").await;
+    for (app, who) in [(&mut alices, "alice"), (&mut bobs, "bob")] {
+        let request = begin_sign_in(&tv, None).await;
+        let mut signed = app.get(&request);
+        signed.user_handle = None;
+        let session = session_of(finish_sign_in(&tv, signed).await);
+        assert_eq!(username(&tv, &session).await, who);
+    }
+    server.stop().await;
+}
+
+/// A user handle that is sent is still checked: another user's is
+/// refused, though the passkey and its signature are alice's.
+#[tokio::test]
+async fn a_user_handle_that_is_not_the_passkey_s_user_s_is_refused() {
+    logs::keep();
+    let server = server("app-passkey-wrong-handle").await;
+    let (_phone, _session, mut alices) = alice_with_a_passkey(&server).await;
+    server.add_user("bob", PASSWORD, None).await;
+    let bobs_phone = device(&server, "Bob's phone").await;
+    let bob = bobs_phone.login("bob", PASSWORD).await;
+    let mut bobs = App::new();
+    register(&bobs_phone, &bob, &mut bobs, "Bob's phone").await;
+
+    let tv = device(&server, "Living room TV").await;
+    let request = begin_sign_in(&tv, None).await;
+    let mut signed = alices.get(&request);
+    signed.user_handle = Some(bobs.stored[0].1.clone());
+    assert_eq!(finish_sign_in(&tv, signed).await, REFUSED);
+    assert!(logs::has(&["the user handle is not the passkey's user's"]));
+    server.stop().await;
+}
+
+/// No handle is `None`, not empty bytes: an empty handle is malformed,
+/// refused before the passkey is looked at. It uses up nothing, so the
+/// same signature then sent with no handle signs alice in.
+#[tokio::test]
+async fn an_empty_user_handle_is_invalid_input() {
+    let server = server("app-passkey-empty-handle").await;
+    let (_phone, _session, mut app) = alice_with_a_passkey(&server).await;
+    let tv = device(&server, "Living room TV").await;
+    let request = begin_sign_in(&tv, None).await;
+    let mut signed = app.get(&request);
+    signed.user_handle = Some(Vec::new());
+    assert!(matches!(
+        finish_sign_in(&tv, signed.clone()).await,
+        Response::Err(Error::InvalidInput { .. })
+    ));
+    signed.user_handle = None;
+    let session = session_of(finish_sign_in(&tv, signed).await);
+    assert_eq!(username(&tv, &session).await, "alice");
+    server.stop().await;
+}
+
 const WEB_RP: Platform = Platform {
     rp_id: "localhost",
     origin: WEB,
@@ -582,7 +649,7 @@ async fn a_challenge_expires() {
     let late = App::new().create(&begin_registration(&phone, &session).await, "Late");
     let tv = device(&server, "Living room TV").await;
     let request = begin_sign_in(&tv, None).await;
-    tokio::time::sleep(lifetime + Duration::from_millis(500)).await;
+    server.clock.advance(lifetime);
     assert_eq!(finish_registration(&phone, &session, late).await, REFUSED);
     register(&phone, &session, &mut app, "Alice's iPhone").await;
     // Signed for the sign-in begun before the passkey was kept: it has the

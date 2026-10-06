@@ -889,16 +889,20 @@ fn PlexFields(
                     AccountPanel { account: account(), token_set, on_sign_in: sign_in, on_cancel: move |_| account.set(Account::Idle) }
                 } else {
                     div { class: "panel",
-                        label { class: "field",
-                            "Plex token"
-                            input {
-                                r#type: "password",
-                                autocomplete: "off",
-                                value: "{pasted}",
-                                oninput: {
-                                    let mut pasted = pasted;
-                                    move |e: FormEvent| pasted.set(e.value())
-                                },
+                        // In a form of its own, as browsers expect of a
+                        // password field; Enter does nothing.
+                        form { class: "contents", onsubmit: move |e: FormEvent| e.prevent_default(),
+                            label { class: "field",
+                                "Plex token"
+                                input {
+                                    r#type: "password",
+                                    autocomplete: "off",
+                                    value: "{pasted}",
+                                    oninput: {
+                                        let mut pasted = pasted;
+                                        move |e: FormEvent| pasted.set(e.value())
+                                    },
+                                }
                             }
                         }
                         span { "From Plex Web: any item › Get Info › View XML; the token is in the address." }
@@ -1367,7 +1371,18 @@ fn PathsFields(
                             },
                         }
                     }
-                    button { class: "btn", onclick: move |_| { extra.with_mut(|x| { x.remove(i); }); recheck(); }, icons::X {} }
+                    button {
+                        class: "btn",
+                        aria_label: "Remove this mapping",
+                        title: "Remove this mapping",
+                        onclick: move |_| {
+                            extra.with_mut(|x| {
+                                x.remove(i);
+                            });
+                            recheck();
+                        },
+                        icons::X {}
+                    }
                 }
             }
         }
@@ -1980,20 +1995,21 @@ pub fn DoneCard() -> Element {
         })
         .unwrap_or_default();
     let missing = match &*checked.read() {
-        Some(Ok(checks)) => setup::missing_files(checks),
-        _ => Vec::new(),
+        Some(Ok(checks)) => setup::missing_summary(&setup::missing_files(checks)),
+        _ => None,
     };
+    let encoders = status
+        .read()
+        .as_ref()
+        .and_then(|s| s.as_ref().ok())
+        .map(|s| s.transcoding.video_encoders.clone());
     let playback_line = s
         .as_ref()
         .map(|s| {
-            let hardware = match Hardware::from_setting(&text(s, "transcode.hardware")) {
-                Hardware::Auto => "Automatic".to_owned(),
-                Hardware::Software => "Software only".to_owned(),
-                Hardware::Ordered(list) => format!("In this order: {list}"),
-            };
-            format!(
-                "{hardware} · {} at once",
-                crate::logic::count(text(s, "transcode.max_jobs").parse().unwrap_or(2), "encode")
+            setup::playback_summary(
+                &Hardware::from_setting(&text(s, "transcode.hardware")),
+                encoders.as_deref(),
+                text(s, "transcode.max_jobs").parse().unwrap_or(2),
             )
         })
         .unwrap_or_default();
@@ -2006,10 +2022,10 @@ pub fn DoneCard() -> Element {
         .unwrap_or_default();
     let row = |label: &'static str, value: String, step: &'static str| {
         rsx! {
-            div { key: "{label}",
-                span { class: "w-28 shrink-0 text-ctp-subtext0", "{label}" }
-                span { class: "min-w-0 flex-grow", "{value}" }
-                Link { class: "text-sm", to: Route::Wizard { step: step.to_owned() }, "Change" }
+            div { key: "{label}", class: "done-line",
+                span { class: "done-label", "{label}" }
+                span { class: "done-value", "{value}" }
+                Link { class: "done-change", to: Route::Wizard { step: step.to_owned() }, "Change" }
             }
         }
     };
@@ -2020,27 +2036,33 @@ pub fn DoneCard() -> Element {
             p { class: "lede", "Apps on your network can sign in now." }
         }
         div { class: "lines",
-            div { key: "Admin",
-                span { class: "w-28 shrink-0 text-ctp-subtext0", "Admin" }
-                span { class: "min-w-0 flex-grow", {admin.unwrap_or_default()} }
-                Link { class: "text-sm", to: Route::Profile {}, "Change" }
+            div { key: "Admin", class: "done-line",
+                span { class: "done-label", "Admin" }
+                span { class: "done-value", {admin.unwrap_or_default()} }
+                Link { class: "done-change", to: Route::Profile {}, "Change" }
             }
-            {row("Server", format!("{name} · {fingerprint}"), "server")}
-            {row("Plex", plex_line, "plex")}
-            div { key: "Paths",
-                span { class: "w-28 shrink-0 text-ctp-subtext0", "Paths" }
-                span { class: "min-w-0 flex-grow", "{paths_line}" }
-                if !missing.is_empty() {
-                    span { class: "state state-warn flex flex-col items-end gap-0.5 text-[13px]",
-                        for text in missing {
-                            span { key: "{text}", class: "flex items-center gap-1.5",
-                                span { class: "flex", icons::Warning { size: 15 } }
-                                "{text}"
-                            }
-                        }
+            div { key: "Server", class: "done-line",
+                span { class: "done-label", "Server" }
+                span { class: "done-value",
+                    "{name}"
+                    if !fingerprint.is_empty() {
+                        " · "
+                        span { class: "mono-value whitespace-nowrap", "{fingerprint}" }
                     }
                 }
-                Link { class: "text-sm", to: Route::Wizard { step: "paths".to_owned() }, "Change" }
+                Link { class: "done-change", to: Route::Wizard { step: "server".to_owned() }, "Change" }
+            }
+            {row("Plex", plex_line, "plex")}
+            div { key: "Paths", class: "done-line",
+                span { class: "done-label", "Paths" }
+                span { class: "done-value", "{paths_line}" }
+                if let Some(text) = missing {
+                    span { class: "done-warn state state-warn",
+                        span { class: "flex", icons::Warning { size: 15 } }
+                        "{text}"
+                    }
+                }
+                Link { class: "done-change", to: Route::Wizard { step: "paths".to_owned() }, "Change" }
             }
             {row("Playback", playback_line, "playback")}
             {row("Access", access_line, "access")}

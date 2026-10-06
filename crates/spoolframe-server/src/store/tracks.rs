@@ -3,7 +3,7 @@
 
 use spoolframe_types::TrackPreferences;
 
-use super::{Store, StoreError, now};
+use super::{Store, StoreError};
 use crate::principal::Principal;
 use crate::tracks::TrackOverride;
 
@@ -45,7 +45,7 @@ impl Store {
         )
         .bind(principal.to_string())
         .bind(json)
-        .bind(now())
+        .bind(self.now())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -84,7 +84,7 @@ impl Store {
         .bind(principal.to_string())
         .bind(scope)
         .bind(json)
-        .bind(now())
+        .bind(self.now())
         .execute(&self.pool)
         .await?;
         Ok(())

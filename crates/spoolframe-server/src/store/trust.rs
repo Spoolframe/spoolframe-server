@@ -7,7 +7,7 @@
 
 use super::sessions::SessionBinding;
 use super::users::LocalUserId;
-use super::{Store, StoreError, now};
+use super::{Store, StoreError};
 
 /// A user this device may resume, as `TrustedProfiles` shows them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +57,7 @@ impl Store {
     /// first leaves no trust behind. An existing row keeps its auto-login.
     /// Whether the device is trusted after it.
     pub async fn remember_session_device(&self, token_hash: &str) -> Result<bool, StoreError> {
-        let now = now();
+        let now = self.now();
         let made = sqlx::query(
             "INSERT INTO trusted_endpoints (user_id, endpoint_id, created_at, last_used_at) \
              SELECT s.user_id, s.endpoint_id, ?2, ?2 \
@@ -120,7 +120,7 @@ impl Store {
         if auto_login && !trusted {
             return Err(TrustError::AutoLoginUntrusted);
         }
-        let now = now();
+        let now = self.now();
         let mut tx = self.pool.begin().await?;
         let theirs: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM sessions WHERE user_id = ?1 AND endpoint_id = ?2 LIMIT 1",
@@ -193,7 +193,7 @@ impl Store {
         endpoint_id: &str,
         idle_secs: i64,
     ) -> Result<Vec<TrustedProfile>, StoreError> {
-        let now = now();
+        let now = self.now();
         sqlx::query("DELETE FROM trusted_endpoints WHERE endpoint_id = ?1 AND last_used_at <= ?2")
             .bind(endpoint_id)
             .bind(now - idle_secs)
@@ -245,7 +245,7 @@ impl Store {
         let SessionBinding::Endpoint { endpoint_id, .. } = binding else {
             return Ok(Resumed::Refused);
         };
-        let now = now();
+        let now = self.now();
         let mut tx = self.pool.begin().await?;
         let renewed = sqlx::query(
             "UPDATE trusted_endpoints SET last_used_at = ?3 \
@@ -302,6 +302,7 @@ mod tests {
 
     use super::super::tests::{TestStore, test_store};
     use super::*;
+    use crate::store::now;
 
     const IDLE: i64 = 180 * 24 * 3600;
 

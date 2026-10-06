@@ -2170,3 +2170,125 @@
   used only to verify OIDC ID token signatures) and RUSTSEC-2024-0436
   (`paste`, an unmaintained build-time proc-macro). `cargo deny --locked
   check advisories` now passes on both, so a new advisory fails it.
+- The web UI's approval page (`/auth/device`) follows the WebApproveStates
+  board in every state (P4-03):
+  - Signed in, it asks `Sign in "<device>"?` with Deny and Approve. It
+    shows the code big, and the server's name, host and key fingerprint
+    in a box, to be matched against the device's screen.
+    `deviceSignInLookup` now answers with a required
+    `serverFingerprint` for this.
+  - "This device will be remembered" says whose profile the device can
+    open, and that unticking signs it in just this once.
+  - Opened without a code, it takes the code in a big centred field, with
+    "8 letters. Dashes and lowercase are fine."
+  - A wrong code says "That code doesn't work" and keeps the code in a red
+    field, with Try again. Too many wrong codes counts the wait down
+    ("Try again in 11:20") with the field and button disabled.
+  - Signed out, it shows the code around the sign-in form and says that
+    signing in comes straight back to it.
+  - Approved and denied end on a big check or circled x, with no button
+    to the web UI.
+- The web UI's trust dialogs and toasts use the WebTrustStates board's
+  words (P4-03). "Open your profile automatically on <device>?" with Turn
+  on, "Ask for your PIN on <device>?" with Turn PIN on, and the shorter
+  "Stop trusting" text. On an admin's user page, the dialogs name the user
+  by display name ("Stop trusting Alice's Living room Apple TV?") and say
+  the user is not told by email. The toasts read "… · PIN off there" and
+  "Stopped trusting <device> · signed out there". "Confirm it's you" says
+  it is about "changing how your devices sign in". Each dialog has the
+  board's icon: play, lock, or a yellow shield.
+- My profile's Devices and sessions card follows WebProfile and
+  WebProfilePhone (P3-03):
+  - The column headers are small caps.
+  - A browser's row is named for the browser where it is this one
+    ("Firefox on Linux", from its User-Agent), and "Web browser"
+    otherwise. Its line reads "Web browser · 3 days ago".
+  - The card ends with the board's footnote about trust, auto-login and
+    confirming it's you. The extra "Sign out everywhere else" button is
+    gone, as the board has none. Each row still signs its own sessions
+    out.
+  - At phone width, "This device" or Sign out sits at a row's top right,
+    the switches are labelled under them, and a browser's row says "A
+    browser can't be trusted or open by itself."
+  - The "Trusted" pill beside a device's name is gone: the switch says
+    it.
+- An admin's user page lays out the user's devices as WebUserSessions
+  and WebAdminPhone do (P4-03). It has the board's description, and a
+  Clear PIN button on each row (the PIN is one per user, so it clears it
+  everywhere, as its dialog says). The "Trusted" pill is gone. At phone
+  width each device is a card with its switches labelled under them,
+  and the bar's title is the user's display name. A session is named as
+  My profile names it: "Web browser" and "Command line" instead of
+  "Browser" and "web / CLI".
+- The Server page follows WebServer and WebAdminPhone (P3-02):
+  - LAN discovery is a switch that sets `network.mdns`. That setting
+    applies at the next start, so the page says "Applies after a
+    restart". Once it is changed, the page offers Restart now where the
+    server runs under a supervisor. A value the config file sets cannot
+    be changed here.
+  - An IPv6 address wraps only between its groups, and its last group
+    stays on the line with the port.
+  - "Told to devices" lists its addresses as Addresses does, with a line
+    saying what they are.
+  - At phone width the card shows only the name, the version, the full
+    fingerprint under its label, and a Copy key button.
+- The users list follows WebUsers (P3-02):
+  - Admins come first.
+  - An admin's avatar is teal. Anyone else's tone follows the letter the
+    avatar shows, so Alice is mauve and Steve is peach, as on the
+    boards, on every page.
+  - Under the table, "<user>'s devices" shows a tile for each device
+    the picked user signed in on. Each tile has the key's start, the
+    kind, when it was last seen, that user's sessions on it with
+    Revoke, and "also: …" for other users on the same device. The admin's
+    own devices show first. Clicking a row, or its device count, picks
+    another user.
+- The admin sidebar and phone drawer have the boards' Overview and Plex
+  items (P3-02, P3-12). Overview (`/admin`) is now an admin's start page.
+  It shows four tiles (playing now, users, uptime, and whether Plex
+  answers), what plays now, the server's name, fingerprint and version
+  with Copy server key, and each library with its state. It reads again
+  every 15 seconds. Plex opens Settings › Plex, where the Plex Media
+  Server and the admin's Plex account are. That tab now marks Plex in
+  the sidebar, not Settings.
+- Server › Libraries follows WebLibraries (P3-11). Library names are
+  white, turning teal only when pointed at. The column headers are 12px
+  subtext with no row styles mixed in. The watch sync choice is 96px
+  wide, and rows are as tall as the board's. The note about the first
+  change saving the full list of libraries now says plainly what
+  happens.
+- The setup wizard's Done card follows WebWizardDone (P3-10). The
+  fingerprint is in monospace. The Playback line names the encoder
+  Automatic picks ("Automatic (VA-API) · 2 encodes at once"). Missing
+  files are one warning beside Paths: the library, or how many
+  libraries. At phone width the labels narrow and the warning goes
+  under the value, so no line breaks inside a word.
+- Smaller web UI fixes from the browser review (P3-18):
+  - The reset-password dialog says, as WebUsersStates does, "Alice will
+    be signed out on every device, and needs the new password to sign in
+    again", naming the user by display name.
+  - My profile's Plex account card has a teal outline icon, as every
+    other card does.
+  - The wizard's button that removes a path mapping has an accessible
+    name.
+  - Password fields are in forms: setup's password, Plex token fields,
+    and OpenTelemetry header values.
+  - `GET /auth/me?or=null` answers `null` when no one is signed in. The
+    web UI asks that way, so a signed-out page no longer logs a failed
+    401 request in the browser's console. Without the query it is 401,
+    as before.
+- An app passkey signs in, or confirms (P3-19, P3-07), with an empty
+  `user_handle`. The Linux client gets no user handle from a phone over
+  caBLE, so it sends an empty one, and the server refused every such
+  sign-in. Now an empty handle is absent: the passkey's credential id
+  says whose it is, and the signature, challenge, counter and failed-login
+  limit are checked as before. A confirmation still takes only the
+  session's user's passkey. A handle that is sent must still be the
+  passkey's user's. The web UI's passkeys still need one.
+- `FinishPasskeySignIn.user_handle` is now `Option<Vec<u8>>` (P3-19).
+  No handle is CBOR null, and the key is still required; a handle is a
+  CBOR byte string, as before. The server took an empty handle as no
+  handle; now it is `InvalidInput`, which uses no challenge and counts as
+  no failed sign-in. The client SDK's `finish_passkey_sign_in`
+  and `finish_confirm_passkey` send an app's empty handle as `None`.
+  `PROTOCOL_VERSION` stays 4: see "The user handle" in PROTOCOL.md.

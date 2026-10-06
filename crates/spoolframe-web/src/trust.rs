@@ -9,22 +9,26 @@ pub fn remembers(asked: bool, ticked: bool) -> bool {
     asked && ticked
 }
 
-/// The line under "Remember this device" on the approval page, as the box
-/// stands; `None` for a device that did not ask, which shows no box.
-pub fn remember_line(asked: bool, ticked: bool) -> Option<&'static str> {
+/// What the approval page's box says (WebApproveStates 1 and 6), as it
+/// stands: `who` is the approver, whose profile the device opens, and
+/// `word` what the page calls the device ("TV"). `None` for a device that
+/// did not ask to be remembered, which shows no box.
+pub fn remember_line(asked: bool, ticked: bool, who: &str, word: &str) -> Option<String> {
     match (asked, ticked) {
         (false, _) => None,
-        (true, true) => {
-            Some("This device will be remembered. It can open your profile without a password.")
-        }
-        (true, false) => Some("It signs in just this once."),
+        (true, true) => Some(format!(
+            "It asked to be. It can open {who}'s profile without a password until it signs out. Untick to sign it in just this once."
+        )),
+        (true, false) => Some(format!(
+            "Unticked: the {word} signs in this once and needs a sign-in again after it signs out."
+        )),
     }
 }
 
 use spoolframe_admin_api::{DeviceEntry, SessionEntry};
 
 /// Whose device a page changes: the signed-in user's own (My profile), or
-/// a user's an admin manages, by username.
+/// a user's an admin manages, by the name the admin pages show them by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Whose {
     Mine,
@@ -59,6 +63,19 @@ pub struct Question {
     pub action: &'static str,
     /// It takes something away: the button is the dangerous kind.
     pub danger: bool,
+    /// The dialog's icon (WebTrustStates).
+    pub icon: Icon,
+}
+
+/// A trust dialog's icon, as the board draws each one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Icon {
+    /// Auto-login: the app opening by itself, a play mark.
+    Start,
+    /// The PIN: a lock.
+    Pin,
+    /// Trust taken away: a shield with a mark.
+    Untrust,
 }
 
 /// The change pressing `switch` on `device`'s row makes.
@@ -95,90 +112,120 @@ pub fn trust_request(change: Change) -> Option<(bool, bool)> {
     }
 }
 
+/// `user`'s `device`, as an admin's page names someone else's device:
+/// "Alice's Living room Apple TV", but "Alice's laptop" left as it is.
+pub fn their_device(user: &str, device: &str) -> String {
+    if device.starts_with(&format!("{user}'s ")) || device.starts_with(&format!("{user}’s ")) {
+        device.to_owned()
+    } else {
+        format!("{user}'s {device}")
+    }
+}
+
 /// What is asked before `change` on `device`, called `name`; `None` when
-/// it is made at once.
+/// it is made at once. The WebTrustStates board's words: for another
+/// user, `whose` carries the name the admin pages show them by.
 pub fn question(
     change: Change,
     device: &DeviceEntry,
     name: &str,
     whose: &Whose,
 ) -> Option<Question> {
-    let (profile, who, needs) = match whose {
-        Whose::Mine => ("your profile".to_owned(), "You are".to_owned(), "need"),
-        Whose::Theirs(user) => (format!("{user}'s profile"), format!("{user} is"), "needs"),
+    let (profile, pin) = match whose {
+        Whose::Mine => ("your profile".to_owned(), "your PIN".to_owned()),
+        Whose::Theirs(user) => (format!("{user}'s profile"), format!("{user}'s PIN")),
     };
     match change {
         Change::StopTrusting => Some(Question {
-            title: format!("Stop trusting {name}?"),
-            text: format!(
-                "{name} can no longer open {profile} without a password. {who} signed out there now, and {needs} a full sign-in to come back."
-            ),
+            title: match whose {
+                Whose::Mine => format!("Stop trusting {name}?"),
+                Whose::Theirs(user) => format!("Stop trusting {}?", their_device(user, name)),
+            },
+            text: match whose {
+                Whose::Mine => {
+                    "It's signed out of your profile now, and needs your password next time."
+                        .to_owned()
+                }
+                Whose::Theirs(user) => format!(
+                    "{user} is signed out there now and needs a password next time. {user} isn't told by email; the device just asks to sign in."
+                ),
+            },
             action: "Stop trusting",
             danger: true,
+            icon: Icon::Untrust,
         }),
         Change::AutoLoginOn => {
-            let pin = if device.pin_required {
-                " The PIN is no longer asked for there."
+            let others = if device.pin_required {
+                format!(
+                    "{} is turned off on that device, and any other profile set to open there stops.",
+                    capitalized(&pin)
+                )
             } else {
-                ""
+                "Any other profile set to open there stops.".to_owned()
             };
             Some(Question {
-                title: format!("Turn on auto-login on {name}?"),
+                title: format!("Open {profile} automatically on {name}?"),
                 text: format!(
-                    "{name} opens {profile} by itself when it starts.{pin} It no longer opens anyone else's profile at start."
+                    "When the app starts there, it opens {profile} without asking. {others}"
                 ),
-                action: "Turn on auto-login",
+                action: "Turn on",
                 danger: false,
+                icon: Icon::Start,
             })
         }
         Change::AskForPin if device.auto_login => Some(Question {
-            title: format!("Ask for the PIN on {name}?"),
+            title: format!("Ask for {pin} on {name}?"),
             text: format!(
-                "Auto-login turns off there: {name} no longer opens {profile} by itself at start."
+                "Auto-login turns off there: the app shows Who's watching and asks for {pin}."
             ),
-            action: "Ask for the PIN",
+            action: "Turn PIN on",
             danger: false,
+            icon: Icon::Pin,
         }),
         Change::Trust | Change::AutoLoginOff | Change::AskForPin | Change::StopAskingForPin => None,
     }
 }
 
-/// What the page says once `change` is made.
+/// `text` with its first letter upper case.
+fn capitalized(text: &str) -> String {
+    let mut letters = text.chars();
+    match letters.next() {
+        Some(first) => first.to_uppercase().chain(letters).collect(),
+        None => String::new(),
+    }
+}
+
+/// What the page says once `change` is made: the board's toasts.
 pub fn done(change: Change, name: &str, whose: &Whose) -> String {
-    let (profile, who, whose_pin) = match whose {
-        Whose::Mine => (
-            "your profile".to_owned(),
-            "you are".to_owned(),
-            "the PIN".to_owned(),
-        ),
-        Whose::Theirs(user) => (
-            format!("{user}'s profile"),
-            format!("{user} is"),
-            format!("{user}'s PIN"),
-        ),
+    let (profile, pin) = match whose {
+        Whose::Mine => ("your profile".to_owned(), "your PIN".to_owned()),
+        Whose::Theirs(user) => (format!("{user}'s profile"), format!("{user}'s PIN")),
     };
     match change {
         Change::Trust => match whose {
             Whose::Mine => format!("{name} is trusted"),
             Whose::Theirs(user) => format!("{name} is trusted for {user}"),
         },
-        Change::StopTrusting => format!("{name} is no longer trusted · {who} signed out there"),
-        Change::AutoLoginOn => format!("{name} opens {profile} at start"),
+        Change::StopTrusting => match whose {
+            Whose::Mine => format!("Stopped trusting {name} · signed out there"),
+            Whose::Theirs(user) => format!(
+                "Stopped trusting {} · signed out there",
+                their_device(user, name)
+            ),
+        },
+        Change::AutoLoginOn => format!("{name} opens {profile} at start · PIN off there"),
         Change::AutoLoginOff => format!("{name} no longer opens {profile} at start"),
-        Change::AskForPin => format!("{name} asks for {whose_pin}"),
-        Change::StopAskingForPin => format!("{name} no longer asks for {whose_pin}"),
+        Change::AskForPin => format!("{name} asks for {pin}"),
+        Change::StopAskingForPin => format!("{name} no longer asks for {pin}"),
     }
 }
 
-/// What "Confirm it's you" says the change is: "Confirm it's you before
-/// {about}."
-pub fn about(change: Change) -> &'static str {
-    match change {
-        Change::Trust => "trusting a device",
-        Change::StopTrusting => "no longer trusting a device",
-        Change::AutoLoginOn | Change::AutoLoginOff => "changing auto-login",
-        Change::AskForPin => "asking for the PIN",
-        Change::StopAskingForPin => "no longer asking for the PIN",
+/// What "Confirm it's you" says a trust change is (WebTrustStates 1):
+/// "Confirm it's you before {about}."
+pub fn about(whose: &Whose) -> String {
+    match whose {
+        Whose::Mine => "changing how your devices sign in".to_owned(),
+        Whose::Theirs(user) => format!("changing how {user}'s devices sign in"),
     }
 }
 
@@ -294,7 +341,7 @@ mod tests {
     }
 
     fn alice() -> Whose {
-        Whose::Theirs("alice".into())
+        Whose::Theirs("Alice".into())
     }
 
     #[test]
@@ -391,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn stopping_trust_on_your_own_device_says_it_signs_you_out_there() {
+    fn stopping_trust_on_your_own_device_says_it_needs_your_password_next_time() {
         let asked = question(
             Change::StopTrusting,
             &trusted_tv(),
@@ -401,12 +448,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             asked.text,
-            "Living room TV can no longer open your profile without a password. You are signed out there now, and need a full sign-in to come back."
+            "It's signed out of your profile now, and needs your password next time."
         );
     }
 
     #[test]
-    fn stopping_trust_for_another_user_says_they_are_signed_out_there() {
+    fn stopping_trust_for_another_user_says_they_are_not_told_by_email() {
         let asked = question(
             Change::StopTrusting,
             &trusted_tv(),
@@ -416,8 +463,25 @@ mod tests {
         .unwrap();
         assert_eq!(
             asked.text,
-            "Living room TV can no longer open alice's profile without a password. alice is signed out there now, and needs a full sign-in to come back."
+            "Alice is signed out there now and needs a password next time. Alice isn't told by email; the device just asks to sign in."
         );
+    }
+
+    #[test]
+    fn stopping_trust_for_another_user_names_whose_device_it_is() {
+        let asked = question(
+            Change::StopTrusting,
+            &trusted_tv(),
+            "Living room TV",
+            &alice(),
+        )
+        .unwrap();
+        assert_eq!(asked.title, "Stop trusting Alice's Living room TV?");
+    }
+
+    #[test]
+    fn a_device_already_named_for_its_user_is_not_named_twice() {
+        assert_eq!(their_device("Alice", "Alice's laptop"), "Alice's laptop");
     }
 
     #[test]
@@ -436,6 +500,24 @@ mod tests {
     }
 
     #[test]
+    fn auto_login_asks_to_open_the_profile_automatically() {
+        let asked = question(
+            Change::AutoLoginOn,
+            &trusted_tv(),
+            "Alice's laptop",
+            &Whose::Mine,
+        )
+        .unwrap();
+        assert_eq!(
+            (asked.title.as_str(), asked.action),
+            (
+                "Open your profile automatically on Alice's laptop?",
+                "Turn on"
+            )
+        );
+    }
+
+    #[test]
     fn auto_login_on_a_device_that_asks_for_the_pin_says_the_pin_goes() {
         let asks = DeviceEntry {
             pin_required: true,
@@ -444,7 +526,7 @@ mod tests {
         let asked = question(Change::AutoLoginOn, &asks, "Living room TV", &Whose::Mine).unwrap();
         assert_eq!(
             asked.text,
-            "Living room TV opens your profile by itself when it starts. The PIN is no longer asked for there. It no longer opens anyone else's profile at start."
+            "When the app starts there, it opens your profile without asking. Your PIN is turned off on that device, and any other profile set to open there stops."
         );
     }
 
@@ -459,7 +541,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             asked.text,
-            "Living room TV opens alice's profile by itself when it starts. It no longer opens anyone else's profile at start."
+            "When the app starts there, it opens Alice's profile without asking. Any other profile set to open there stops."
         );
     }
 
@@ -482,10 +564,14 @@ mod tests {
             auto_login: true,
             ..trusted_tv()
         };
-        let asked = question(Change::AskForPin, &auto, "Living room TV", &Whose::Mine).unwrap();
+        let asked = question(Change::AskForPin, &auto, "Alice's laptop", &Whose::Mine).unwrap();
         assert_eq!(
-            asked.text,
-            "Auto-login turns off there: Living room TV no longer opens your profile by itself at start."
+            (asked.title.as_str(), asked.text.as_str(), asked.action),
+            (
+                "Ask for your PIN on Alice's laptop?",
+                "Auto-login turns off there: the app shows Who's watching and asks for your PIN.",
+                "Turn PIN on"
+            )
         );
     }
 
@@ -503,13 +589,21 @@ mod tests {
     }
 
     #[test]
-    fn stopping_trust_says_who_was_signed_out() {
+    fn stopping_trust_says_it_was_signed_out_there() {
         assert_eq!(
             [Whose::Mine, alice()].map(|w| done(Change::StopTrusting, "Living room TV", &w)),
             [
-                "Living room TV is no longer trusted · you are signed out there".to_owned(),
-                "Living room TV is no longer trusted · alice is signed out there".to_owned(),
+                "Stopped trusting Living room TV · signed out there".to_owned(),
+                "Stopped trusting Alice's Living room TV · signed out there".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn auto_login_on_says_the_pin_is_off_there() {
+        assert_eq!(
+            done(Change::AutoLoginOn, "Alice's laptop", &Whose::Mine),
+            "Alice's laptop opens your profile at start · PIN off there"
         );
     }
 
@@ -517,13 +611,19 @@ mod tests {
     fn trusting_says_for_whom() {
         assert_eq!(
             done(Change::Trust, "Living room TV", &alice()),
-            "Living room TV is trusted for alice"
+            "Living room TV is trusted for Alice"
         );
     }
 
     #[test]
-    fn confirming_it_is_you_names_the_trust_change() {
-        assert_eq!(about(Change::StopTrusting), "no longer trusting a device");
+    fn confirming_it_is_you_says_whose_devices_change() {
+        assert_eq!(
+            [Whose::Mine, alice()].map(|w| about(&w)),
+            [
+                "changing how your devices sign in".to_owned(),
+                "changing how Alice's devices sign in".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -608,23 +708,27 @@ mod tests {
     }
 
     #[test]
-    fn the_ticked_box_says_the_device_will_be_remembered() {
+    fn the_ticked_box_says_whose_profile_the_device_opens() {
         assert_eq!(
-            remember_line(true, true),
-            Some("This device will be remembered. It can open your profile without a password.")
+            remember_line(true, true, "Andrey", "TV").as_deref(),
+            Some(
+                "It asked to be. It can open Andrey's profile without a password until it signs out. Untick to sign it in just this once."
+            )
         );
     }
 
     #[test]
-    fn the_unticked_box_says_it_signs_in_just_this_once() {
+    fn the_unticked_box_says_the_device_signs_in_just_this_once() {
         assert_eq!(
-            remember_line(true, false),
-            Some("It signs in just this once.")
+            remember_line(true, false, "Andrey", "TV").as_deref(),
+            Some(
+                "Unticked: the TV signs in this once and needs a sign-in again after it signs out."
+            )
         );
     }
 
     #[test]
     fn a_device_that_did_not_ask_shows_no_box() {
-        assert_eq!(remember_line(false, true), None);
+        assert_eq!(remember_line(false, true, "Andrey", "TV"), None);
     }
 }

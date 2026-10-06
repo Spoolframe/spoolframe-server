@@ -714,6 +714,19 @@ async fn an_assertion_naming_another_user_is_refused() {
     ]));
 }
 
+/// The web UI's passkeys still need their handle: a browser always sends
+/// one for a discoverable passkey, unlike the apps' relying party (P3-19).
+#[tokio::test]
+async fn an_assertion_without_a_user_handle_is_refused() {
+    let (addr, _root, alice, _dir) = server("passkey-no-handle").await;
+    let mut phone = Authenticator::new();
+    add_passkey(&alice, &mut phone, "iPhone").await;
+    let (ceremony, options) = begin(addr).await;
+    let mut signed = phone.get(ORIGIN, &options);
+    signed["response"]["userHandle"] = Value::Null;
+    assert_refused(finish(addr, &ceremony, signed).await).await;
+}
+
 /// P1-11's limit counts a passkey that fails as it counts a wrong
 /// password, under where it comes from: the address the proxy names.
 #[tokio::test]

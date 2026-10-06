@@ -11,17 +11,11 @@ use spoolframe_admin_api::{
 use super::profile::{ConfirmItsYou, TrustDialog, asks_to_confirm};
 use super::{Alert, Field, Route, icons, initial, now, role_name, rpc};
 use crate::logic::{
-    AddUserError, ApiError, Landing, PathState, UserStatus, add_user_error, ago, avatar_class,
-    client_kind, count, last_admin, path_state, plex_line, server_version, sign_in_methods,
-    thousands, user_change_error, user_status,
+    AddUserError, ApiError, PathState, UserStatus, add_user_error, ago, avatar_class, client_kind,
+    count, key_start, last_admin, path_state, plex_line, server_version, shared_devices,
+    sign_in_methods, thousands, user_change_error, user_status, users_in_order,
 };
 use crate::trust::{self, Change, Question, Switch, Whose};
-
-#[component]
-pub fn AdminHome() -> Element {
-    navigator().replace(Route::from(Landing::Admin));
-    rsx! {}
-}
 
 async fn users() -> Result<Vec<UserInfo>, ApiError> {
     let client = rpc::client().await?;
@@ -114,11 +108,17 @@ fn shown_name(user: &UserInfo) -> String {
 
 #[component]
 pub fn Users() -> Element {
+    let me = use_context::<UserInfo>();
     let mut list = use_resource(users);
     let toast = use_signal(|| None::<Said>);
     let mut adding = use_signal(|| false);
-    let mut resetting = use_signal(|| None::<String>);
-    let current = list.read().clone();
+    // Whose password is being reset: their username, and the name the
+    // dialog calls them by.
+    let mut resetting = use_signal(|| None::<(String, String)>);
+    // Whose devices the panel under the table shows: the admin's own
+    // until another row is picked (WebUsers).
+    let mut selected = use_signal(|| me.username.clone());
+    let current = list.read().clone().map(|r| r.map(users_in_order));
     rsx! {
         div { class: "flex flex-col gap-6",
             div { class: "page-head hidden md:flex",
@@ -137,7 +137,9 @@ pub fn Users() -> Element {
                 Some(Ok(users)) => rsx! {
                     UserTable {
                         users: users.clone(),
-                        on_reset: move |name: String| resetting.set(Some(name)),
+                        selected: selected(),
+                        on_select: move |name: String| selected.set(name),
+                        on_reset: move |who: (String, String)| resetting.set(Some(who)),
                     }
                     div { class: "flex flex-col gap-3.5 md:hidden",
                         for user in users.iter().cloned() {
@@ -146,6 +148,15 @@ pub fn Users() -> Element {
                     }
                     if users.len() == 1 {
                         OnlyYou { on_add: move |_| adding.set(true) }
+                    }
+                    if let Some(user) = users.iter().find(|u| u.username == selected()).cloned() {
+                        DevicesPanel {
+                            key: "{user.username}",
+                            user,
+                            users: users.clone(),
+                            toast,
+                            on_changed: move |_| list.restart(),
+                        }
                     }
                 },
             }
@@ -161,9 +172,10 @@ pub fn Users() -> Element {
                 },
             }
         }
-        if let Some(username) = resetting() {
+        if let Some((username, name)) = resetting() {
             ResetPassword {
                 username,
+                name,
                 on_done: move |said: Option<(bool, String)>| {
                     resetting.set(None);
                     if let Some((ok, text)) = said {
@@ -178,9 +190,15 @@ pub fn Users() -> Element {
 
 /// The users as the WebUsers board's table: who, role, how they sign in,
 /// their devices and live sessions, and whether they can. Their name opens
-/// their page, where everything but a password reset is done.
+/// their page, where everything but a password reset is done; the row, or
+/// its device count, shows their devices under the table.
 #[component]
-fn UserTable(users: Vec<UserInfo>, on_reset: EventHandler<String>) -> Element {
+fn UserTable(
+    users: Vec<UserInfo>,
+    selected: String,
+    on_select: EventHandler<String>,
+    on_reset: EventHandler<(String, String)>,
+) -> Element {
     rsx! {
         section { class: "table-card hidden md:block",
             table { class: "table",
@@ -197,10 +215,21 @@ fn UserTable(users: Vec<UserInfo>, on_reset: EventHandler<String>) -> Element {
                 }
                 tbody {
                     for user in users {
-                        tr { key: "{user.username}", class: if user.disabled { "off" } else { "" },
+                        tr {
+                            key: "{user.username}",
+                            class: match (user.disabled, user.username == selected) {
+                                (true, true) => "off opens here",
+                                (true, false) => "off opens",
+                                (false, true) => "opens here",
+                                (false, false) => "opens",
+                            },
+                            onclick: {
+                                let name = user.username.clone();
+                                move |_| on_select.call(name.clone())
+                            },
                             td {
                                 Link { class: "who", to: Route::UserSessions { username: user.username.clone() },
-                                    span { class: "{avatar_class(&user.username, user.disabled)} avatar-md", "{initial(&shown_name(&user))}" }
+                                    span { class: "{avatar_class(&user)} avatar-md", "{initial(&shown_name(&user))}" }
                                     span { class: "who-name",
                                         b { "{shown_name(&user)}" }
                                         if user.display_name.is_some() {
@@ -211,15 +240,32 @@ fn UserTable(users: Vec<UserInfo>, on_reset: EventHandler<String>) -> Element {
                             }
                             td { RolePill { role: user.role } }
                             td { "{sign_in_methods(&user)}" }
-                            td { "{user.device_count}" }
+                            td {
+                                button {
+                                    class: "count-button",
+                                    aria_pressed: "{user.username == selected}",
+                                    aria_label: "Show {shown_name(&user)}'s devices",
+                                    onclick: {
+                                        let name = user.username.clone();
+                                        move |e: MouseEvent| {
+                                            e.stop_propagation();
+                                            on_select.call(name.clone());
+                                        }
+                                    },
+                                    "{user.device_count}"
+                                }
+                            }
                             td { "{user.session_count}" }
                             td { Status { user: user.clone() } }
                             td { class: "end",
                                 button {
                                     class: "btn h-8 px-3 font-normal",
                                     onclick: {
-                                        let name = user.username.clone();
-                                        move |_| on_reset.call(name.clone())
+                                        let who = (user.username.clone(), shown_name(&user));
+                                        move |e: MouseEvent| {
+                                            e.stop_propagation();
+                                            on_reset.call(who.clone());
+                                        }
                                     },
                                     "Reset password"
                                 }
@@ -227,6 +273,120 @@ fn UserTable(users: Vec<UserInfo>, on_reset: EventHandler<String>) -> Element {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Everyone's devices, by the names the page shows them, for "also: …".
+async fn everyones_devices(
+    users: Vec<UserInfo>,
+) -> Result<Vec<(String, Vec<DeviceEntry>)>, ApiError> {
+    let client = rpc::client().await?;
+    let mut all = Vec::with_capacity(users.len());
+    for user in users {
+        let devices = client
+            .user_devices(user.username.clone())
+            .await
+            .map_err(rpc::error)?;
+        all.push((shown_name(&user), devices));
+    }
+    Ok(all)
+}
+
+/// "Andrey's devices" (WebUsers): a card per device the user signed in
+/// on, its key's start and kind, when it was last seen, the user's
+/// sessions on it with Revoke, and who else signed in on it.
+#[component]
+fn DevicesPanel(
+    user: UserInfo,
+    users: Vec<UserInfo>,
+    toast: Signal<Option<Said>>,
+    on_changed: EventHandler<()>,
+) -> Element {
+    let name = shown_name(&user);
+    let username = user.username.clone();
+    let devices = use_resource(use_reactive((&users,), |(users,)| everyones_devices(users)));
+    let who = username.clone();
+    let mut sessions = use_resource(move || {
+        let who = who.clone();
+        async move {
+            let client = rpc::client().await?;
+            client.user_sessions(who).await.map_err(rpc::error)
+        }
+    });
+    let revoke = {
+        let username = username.clone();
+        use_callback(move |(id, device): (String, String)| {
+            let username = username.clone();
+            spawn(async move {
+                let ended = async {
+                    let client = rpc::client().await?;
+                    client
+                        .user_revoke_session(username, id)
+                        .await
+                        .map_err(rpc::error)
+                };
+                match ended.await {
+                    Ok(()) => say(toast, true, format!("Signed out of {device}")),
+                    Err(e) => say(toast, false, e.explain()),
+                }
+                sessions.restart();
+                on_changed.call(());
+            });
+        })
+    };
+    let found = match (&*devices.read(), &*sessions.read()) {
+        (Some(Ok(all)), Some(Ok(live))) => Some(Ok((shared_devices(&name, all), live.clone()))),
+        (Some(Err(e)), _) | (_, Some(Err(e))) => Some(Err(e.clone())),
+        _ => None,
+    };
+    rsx! {
+        section { class: "card devices-panel hidden md:flex",
+            div { class: "card-head",
+                h2 { "{name}'s devices" }
+                span { class: "ml-auto text-[13px] text-ctp-subtext0", "A session only works from the device key it was created on." }
+            }
+            match found {
+                None => rsx! { div { class: "card-body", p { class: "m-0 text-sm text-ctp-subtext0", "Loading…" } } },
+                Some(Err(e)) => rsx! { div { class: "card-body", Alert { text: e.explain() } } },
+                Some(Ok((shared, _))) if shared.is_empty() => rsx! {
+                    div { class: "card-body",
+                        p { class: "m-0 text-sm text-ctp-subtext0", "No devices yet. A device shows here once {name} signs in on it." }
+                    }
+                },
+                Some(Ok((shared, live))) => rsx! {
+                    div { class: "devices-grid",
+                        for d in shared {
+                            div { key: "{d.device.endpoint_id}", class: "device-tile",
+                                div { class: "flex items-baseline justify-between gap-2",
+                                    b { class: "min-w-0 break-words", "{device_name(&d.device)}" }
+                                    span { class: "shrink-0 text-xs text-ctp-subtext0", "{ago(now(), d.device.last_seen_at)}" }
+                                }
+                                span { class: "device-tile-key",
+                                    "{key_start(&d.device.endpoint_id)} · {client_kind(Some(&d.device.endpoint_id), d.device.platform)}"
+                                }
+                                for s in live.iter().filter(|s| s.endpoint_id.as_deref() == Some(d.device.endpoint_id.as_str())).cloned() {
+                                    div { key: "{s.id}", class: "device-tile-session",
+                                        span { "{name} · since {crate::logic::date(s.created_at)}" }
+                                        button {
+                                            class: "btn btn-danger h-7 px-2.5 text-xs",
+                                            onclick: {
+                                                let id = s.id.clone();
+                                                let device = device_name(&d.device);
+                                                move |_| revoke.call((id.clone(), device.clone()))
+                                            },
+                                            "Revoke"
+                                        }
+                                    }
+                                }
+                                if !d.also.is_empty() {
+                                    div { class: "device-tile-also", "also: {d.also.join(\", \")}" }
+                                }
+                            }
+                        }
+                    }
+                },
             }
         }
     }
@@ -247,7 +407,7 @@ fn UserCard(user: UserInfo) -> Element {
         Link {
             class: if user.disabled { "user-card off" } else { "user-card" },
             to: Route::UserSessions { username: user.username.clone() },
-            span { class: "{avatar_class(&user.username, user.disabled)} avatar-card", "{initial(&shown_name(&user))}" }
+            span { class: "{avatar_class(&user)} avatar-card", "{initial(&shown_name(&user))}" }
             span {
                 b { "{shown_name(&user)}" }
                 span {
@@ -296,18 +456,23 @@ fn OnlyYou(on_add: EventHandler<()>) -> Element {
     }
 }
 
-/// "Set a new password for <username>" (WebUsersStates, 3). `on_done`
-/// gets what to say, or `None` when cancelled.
+/// "Set a new password for <username>" (WebUsersStates, 3), saying what
+/// it does to `name`, the name the pages show. `on_done` gets what to
+/// say, or `None` when cancelled.
 #[component]
-fn ResetPassword(username: String, on_done: EventHandler<Option<(bool, String)>>) -> Element {
+fn ResetPassword(
+    username: String,
+    name: String,
+    on_done: EventHandler<Option<(bool, String)>>,
+) -> Element {
     let password = use_signal(String::new);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let confirming = use_signal(|| None::<String>);
-    let name = username.clone();
+    let owner = username.clone();
     let attempt = use_callback(move |()| {
         busy.set(true);
-        let username = name.clone();
+        let username = owner.clone();
         spawn(async move {
             let set = async {
                 let client = rpc::client().await?;
@@ -339,7 +504,7 @@ fn ResetPassword(username: String, on_done: EventHandler<Option<(bool, String)>>
                     h1 { "Set a new password for {username}" }
                 }
                 Field { label: "New password", value: password, kind: "password", autocomplete: "new-password" }
-                span { class: "hint", "{username} is signed out on every device and browser, and signs in again with this one." }
+                span { class: "hint", "{name} will be signed out on every device, and needs the new password to sign in again." }
                 if let Some(text) = error() {
                     Alert { text }
                 }
@@ -477,7 +642,15 @@ pub fn UserSessions(username: String) -> Element {
 
 #[component]
 fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element {
+    // The phone bar names the user, not the list they came from.
+    let super::BarTitle(mut bar_title) = use_context::<super::BarTitle>();
+    let titled = shown_name(&user);
+    use_effect(use_reactive((&titled,), move |(titled,)| {
+        bar_title.set(Some(titled));
+    }));
     let toast = use_signal(|| None::<Said>);
+    // Bumped by each change to a device, which may end its sessions.
+    let devices_changed = use_signal(|| 0u32);
     let mut asking = use_signal(|| None::<Ask>);
     let mut resetting = use_signal(|| false);
     let username = user.username.clone();
@@ -511,7 +684,7 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
     rsx! {
         div { class: "page-head",
             span { class: "who gap-3.5",
-                span { class: "{avatar_class(&user.username, user.disabled)} avatar-lg", "{initial(&name)}" }
+                span { class: "{avatar_class(&user)} avatar-lg", "{initial(&name)}" }
                 span { class: "flex flex-col",
                     h1 { class: "page-title page-title-admin", "{name}" }
                     span { class: "text-sm font-medium text-ctp-subtext0",
@@ -547,19 +720,22 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
                 }
             }
         }
-        UserSessionList { username: username.clone(), name: name.clone(), disabled: user.disabled, toast }
+        UserSessionList { username: username.clone(), name: name.clone(), disabled: user.disabled, toast, devices_changed }
         super::plex::UserPlex { username: username.clone(), name: name.clone(), toast }
         UserSso { username: username.clone(), name: name.clone(), toast }
         UserDevices {
             username: username.clone(),
+            name: name.clone(),
             has_pin: user.has_pin,
             toast,
+            devices_changed,
             on_clear: move |_| asking.set(Some(Ask::ClearPin)),
         }
         UserPasskeys { username: username.clone(), name: name.clone() }
         if resetting() {
             ResetPassword {
                 username: username.clone(),
+                name: name.clone(),
                 on_done: move |said: Option<(bool, String)>| {
                     resetting.set(false);
                     if let Some((ok, text)) = said {
@@ -705,21 +881,39 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
     }
 }
 
-/// What a session's device is called: its name, its key's start, or for
-/// an admin API session what signed it in (P3-18), "web / CLI" for one
-/// from before the server kept it.
+/// What a session's device is called: its name, its key's start, or, for
+/// an admin API session, what signed it in (P3-18), by the same words My
+/// profile uses (logic::session_name).
 fn session_device(
     endpoint_id: &Option<String>,
     name: &Option<String>,
     platform: Option<spoolframe_admin_api::Platform>,
 ) -> String {
-    use spoolframe_admin_api::Platform;
-    match (endpoint_id, name, platform) {
-        (Some(_), Some(name), _) => name.clone(),
-        (Some(id), None, _) => format!("Device {}", &id[..id.len().min(10)]),
-        (None, _, Some(Platform::Web)) => "Browser".to_owned(),
-        (None, _, Some(Platform::Cli)) => "Command line".to_owned(),
-        (None, _, _) => "web / CLI".to_owned(),
+    match (endpoint_id, name) {
+        (Some(id), None) => format!("Device {}", &id[..id.len().min(10)]),
+        _ => crate::logic::session_name(
+            endpoint_id.as_deref(),
+            name.as_deref(),
+            platform,
+            false,
+            None,
+        ),
+    }
+}
+
+/// A session's name on a user's page: this browser's own by its own
+/// name, as My profile calls it.
+fn session_title(s: &spoolframe_admin_api::SessionEntry) -> String {
+    if s.current {
+        crate::logic::session_name(
+            s.endpoint_id.as_deref(),
+            s.device_name.as_deref(),
+            s.platform,
+            true,
+            super::profile::user_agent().as_deref(),
+        )
+    } else {
+        session_device(&s.endpoint_id, &s.device_name, s.platform)
     }
 }
 
@@ -729,12 +923,14 @@ fn UserSessionList(
     name: String,
     disabled: bool,
     toast: Signal<Option<Said>>,
+    devices_changed: Signal<u32>,
 ) -> Element {
     let mut sessions = use_resource(use_reactive(
         (&username, &disabled),
-        |(username, disabled)| async move {
-            // Read again when the account is disabled: that ends every session.
-            let _ = disabled;
+        move |(username, disabled)| async move {
+            // Read again when the account is disabled, or a device's trust
+            // changes: no longer trusting a device ends its sessions.
+            let _ = (disabled, devices_changed());
             let client = rpc::client().await?;
             client.user_sessions(username).await.map_err(rpc::error)
         },
@@ -768,12 +964,12 @@ fn UserSessionList(
                             for s in list {
                                 tr { key: "{s.id}",
                                     td {
-                                        b { "{session_device(&s.endpoint_id, &s.device_name, s.platform)}" }
+                                        b { "{session_title(&s)}" }
                                         if s.current {
                                             span { class: "pill ml-2", "This browser" }
                                         }
                                     }
-                                    td { class: "quiet max-md:hidden", "{client_kind(s.endpoint_id.as_deref(), s.platform)}" }
+                                    td { class: "quiet max-md:hidden", "{crate::logic::session_kind(s.endpoint_id.as_deref(), s.platform)}" }
                                     td { class: "quiet", "{ago(now(), s.last_used_at)}" }
                                     td { class: "end",
                                         button {
@@ -781,7 +977,7 @@ fn UserSessionList(
                                             onclick: {
                                                 let username = username.clone();
                                                 let id = s.id.clone();
-                                                let device = session_device(&s.endpoint_id, &s.device_name, s.platform);
+                                                let device = session_title(&s);
                                                 move |_| {
                                                     let username = username.clone();
                                                     let id = id.clone();
@@ -830,8 +1026,10 @@ struct DeviceChange {
 #[component]
 fn UserDevices(
     username: String,
+    name: String,
     has_pin: bool,
     toast: Signal<Option<Said>>,
+    devices_changed: Signal<u32>,
     on_clear: EventHandler<()>,
 ) -> Element {
     let mut devices = use_resource(use_reactive(
@@ -844,15 +1042,18 @@ fn UserDevices(
             client.user_devices(username).await.map_err(rpc::error)
         },
     ));
-    let whose = Whose::Theirs(username.clone());
+    // The dialogs and toasts call them by the name the page shows.
+    let whose = Whose::Theirs(name.clone());
+    let told = whose.clone();
     // The change whose question is open.
     let mut pending = use_signal(|| None::<DeviceChange>);
     // A change may need "Confirm it's you" first, then is made again.
     let confirming = use_signal(|| None::<String>);
     let mut again = use_signal(|| None::<DeviceChange>);
-    let name = username.clone();
+    let owner = username.clone();
     let make = use_callback(move |change: DeviceChange| {
-        let username = name.clone();
+        let username = owner.clone();
+        let told = told.clone();
         spawn(async move {
             let made = async {
                 let client = rpc::client().await?;
@@ -880,17 +1081,15 @@ fn UserDevices(
                 .map_err(rpc::error)
             };
             match made.await {
-                Ok(()) => say(
-                    toast,
-                    true,
-                    trust::done(change.change, &change.name, &Whose::Theirs(username)),
-                ),
-                Err(e) if asks_to_confirm(&e, confirming, trust::about(change.change)) => {
+                Ok(()) => say(toast, true, trust::done(change.change, &change.name, &told)),
+                Err(e) if asks_to_confirm(&e, confirming, &trust::about(&told)) => {
                     again.set(Some(change));
                 }
                 Err(e) => say(toast, false, e.explain()),
             }
             devices.restart();
+            let mut devices_changed = devices_changed;
+            devices_changed += 1;
         });
     });
     let press = use_callback(
@@ -932,15 +1131,10 @@ fn UserDevices(
                 on_no: move |_| pending.set(None),
             }
         }
-        div { class: "flex flex-wrap items-end justify-between gap-3",
-            div { class: "section-head",
-                h2 { "Devices" }
-                span { "On each device: whether it asks for the PIN, may open this profile without a password, and opens it at start." }
-            }
-            if has_pin {
-                button { class: "btn", onclick: move |_| on_clear.call(()), "Clear PIN" }
-            } else {
-                span { class: "text-[13px] text-ctp-subtext0", "No PIN set" }
+        div { class: "section-head",
+            h2 { "Devices" }
+            span {
+                "PIN, Trusted and Auto-login per device. Trusted reopens {name}'s profile there without a password; auto-login opens it at start and turns its PIN off. Turning trust off also ends {name}'s sessions on that device. Changes ask you to confirm it's you if you signed in over 10 minutes ago."
             }
         }
         match current {
@@ -948,58 +1142,132 @@ fn UserDevices(
             Some(Err(error)) => rsx! {
                 LoadError { what: "Couldn't load the devices", error, on_retry: move |_| devices.restart() }
             },
+            Some(Ok(list)) if list.is_empty() => rsx! {
+                section { class: "card",
+                    div { class: "card-body",
+                        p { class: "m-0 text-sm text-ctp-subtext0", "No devices yet. A device shows here once {name} signs in on it." }
+                    }
+                }
+            },
             Some(Ok(list)) => rsx! {
-                section { class: "table-card",
+                // Wide, the board's table; on a phone, a card per device
+                // (WebAdminPhone 5).
+                section { class: "table-card max-md:hidden",
                     table { class: "table",
                         thead {
                             tr {
                                 th { "Device" }
-                                th { class: "max-md:hidden", "Kind" }
+                                th { "Kind" }
                                 th { "PIN" }
                                 th { "Trusted" }
                                 th { "Auto-login" }
+                                th {}
                             }
                         }
                         tbody {
-                            if list.is_empty() {
-                                tr { td { class: "quiet", colspan: "5", "No devices yet. A device shows here once {username} signs in on it." } }
-                            }
-                            for d in list {
+                            for d in list.iter().cloned() {
                                 tr { key: "{d.endpoint_id}",
-                                    td {
-                                        b { "{session_device(&Some(d.endpoint_id.clone()), &d.name, d.platform)}" }
-                                        if d.trusted {
-                                            span { class: "pill pill-trusted ml-2", "Trusted" }
-                                        }
-                                    }
-                                    td { class: "quiet max-md:hidden", "{client_kind(Some(&d.endpoint_id), d.platform)}" }
-                                    for (switch, what, on) in [
-                                        (Switch::Pin, "PIN", d.pin_required),
-                                        (Switch::Trusted, "Trusted", d.trusted),
-                                        (Switch::AutoLogin, "Auto-login", d.auto_login),
-                                    ] {
-                                        td { key: "{what}",
-                                            button {
-                                                class: "switch",
-                                                role: "switch",
-                                                aria_checked: "{on}",
-                                                aria_label: "{what} on this device",
-                                                disabled: !trust::can_press(switch, &d, has_pin),
-                                                title: device_switch_title(switch, &d, has_pin),
-                                                onclick: {
-                                                    let device = d.clone();
-                                                    let name = session_device(&Some(d.endpoint_id.clone()), &d.name, d.platform);
-                                                    move |_| press.call((switch, device.clone(), name.clone()))
-                                                },
-                                            }
-                                        }
+                                    td { b { "{device_name(&d)}" } }
+                                    td { class: "quiet", "{client_kind(Some(&d.endpoint_id), d.platform)}" }
+                                    DeviceSwitches { device: d.clone(), has_pin, cells: true, on_press: press }
+                                    td { class: "end",
+                                        ClearPinButton { has_pin, name: name.clone(), on_clear }
                                     }
                                 }
                             }
                         }
                     }
                 }
+                div { class: "flex flex-col gap-2.5 md:hidden",
+                    for d in list {
+                        div { key: "{d.endpoint_id}", class: "device-card",
+                            span { class: "row-what",
+                                b { "{device_name(&d)}" }
+                                span { class: "row-sub", "{client_kind(Some(&d.endpoint_id), d.platform)}" }
+                            }
+                            span { class: "device-switches",
+                                DeviceSwitches { device: d.clone(), has_pin, cells: false, on_press: press }
+                            }
+                        }
+                    }
+                    if has_pin {
+                        div { ClearPinButton { has_pin, name: name.clone(), on_clear } }
+                    }
+                }
             },
+        }
+    }
+}
+
+/// What the user's device is called on their page: its name, or its key's
+/// start.
+fn device_name(device: &DeviceEntry) -> String {
+    session_device(
+        &Some(device.endpoint_id.clone()),
+        &device.name,
+        device.platform,
+    )
+}
+
+/// "Clear PIN" (WebUserSessions): the PIN is one per user, so each row's
+/// button clears it for every device, as its dialog says.
+#[component]
+fn ClearPinButton(has_pin: bool, name: String, on_clear: EventHandler<()>) -> Element {
+    rsx! {
+        button {
+            class: "btn",
+            disabled: !has_pin,
+            title: if has_pin { "Clears {name}'s PIN on every device." } else { "{name} has no PIN." },
+            onclick: move |_| on_clear.call(()),
+            "Clear PIN"
+        }
+    }
+}
+
+/// A device's three switches: table cells wide, labelled columns in a
+/// card on a phone.
+#[component]
+fn DeviceSwitches(
+    device: DeviceEntry,
+    has_pin: bool,
+    cells: bool,
+    on_press: Callback<(Switch, DeviceEntry, String)>,
+) -> Element {
+    let name = device_name(&device);
+    rsx! {
+        for (switch, what, on) in [
+            (Switch::Pin, "PIN", device.pin_required),
+            (Switch::Trusted, "Trusted", device.trusted),
+            (Switch::AutoLogin, "Auto-login", device.auto_login),
+        ] {
+            {
+                let toggle = rsx! {
+                    button {
+                        class: "switch",
+                        r#type: "button",
+                        role: "switch",
+                        aria_checked: "{on}",
+                        aria_label: "{what} on {name}",
+                        disabled: !trust::can_press(switch, &device, has_pin),
+                        title: device_switch_title(switch, &device, has_pin),
+                        onclick: {
+                            let device = device.clone();
+                            let name = name.clone();
+                            move |_| on_press.call((switch, device.clone(), name.clone()))
+                        },
+                    }
+                };
+                if cells {
+                    rsx! { td { key: "{what}", {toggle} } }
+                } else {
+                    rsx! {
+                        span { key: "{what}", class: "device-switch",
+                            {toggle}
+                            span { class: "device-switch-label", aria_hidden: "true", "{what}" }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1132,13 +1400,35 @@ pub fn Server() -> Element {
     }
 }
 
-/// A label and its value, in a card.
+/// A label and its value, in a card. `class`: `pair-stack` puts the label
+/// over the value on a phone; `max-md:hidden` leaves the row out there
+/// (WebAdminPhone 3 shows Name, Version and the fingerprint only).
 #[component]
-fn Pair(label: String, children: Element) -> Element {
+fn Pair(label: String, #[props(default)] class: String, children: Element) -> Element {
     rsx! {
-        div { class: "pair",
+        div { class: "pair {class}",
             span { class: "pair-label", "{label}" }
             span { class: "min-w-0", {children} }
+        }
+    }
+}
+
+/// Addresses one per line, an IPv6 one wrapping only between its groups.
+#[component]
+fn Addresses(addresses: Vec<String>) -> Element {
+    rsx! {
+        div { class: "flex flex-col gap-1",
+            for address in addresses {
+                span { key: "{address}", class: "mono-value address",
+                    {
+                        let (wraps, kept) = crate::logic::address_parts(&address);
+                        rsx! {
+                            span { "{wraps}" }
+                            span { class: "whitespace-nowrap", "{kept}" }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1163,62 +1453,131 @@ fn ThisServer() -> Element {
                     Some(Ok(s)) => rsx! {
                         Pair { label: "Name", b { "{s.name}" } }
                         Pair { label: "Version", span { class: "mono-value", {server_version(&s.version, s.revision.as_deref())} } }
-                        Pair { label: "Fingerprint",
+                        Pair { label: "Fingerprint", class: "pair-stack",
                             match s.fingerprint {
                                 Some(fingerprint) => rsx! {
                                     div { class: "fingerprint", "{fingerprint}" }
-                                    div { class: "mt-1 text-xs text-ctp-subtext0", "Clients show this when they first connect." }
+                                    div { class: "mt-1 text-xs text-ctp-subtext0 max-md:hidden", "Clients show this when they first connect." }
                                 },
                                 None => rsx! { span { class: "text-ctp-subtext0", "starting…" } },
                             }
                         }
-                        Pair { label: "Key",
+                        // On a phone the key itself is too long to read:
+                        // the board offers it to copy only.
+                        if let Some(key) = s.endpoint_id.clone() {
+                            div { class: "md:hidden",
+                                CopyButton { text: key, label: "Copy key", wide: true }
+                            }
+                        }
+                        Pair { label: "Key", class: "max-md:hidden",
                             match s.endpoint_id {
                                 Some(key) => rsx! {
-                                    div { class: "flex flex-col items-start gap-2.5 md:flex-row",
-                                        span { class: "mono-value", "{key}" }
+                                    div { class: "flex items-start gap-2.5",
+                                        span { class: "mono-value min-w-0", "{key}" }
                                         CopyButton { text: key }
                                     }
                                 },
                                 None => rsx! { span { class: "text-ctp-subtext0", "starting…" } },
                             }
                         }
-                        // Read only: the config sets it, and the API does not change it.
-                        Pair { label: "LAN discovery",
-                            if s.mdns {
-                                span { class: "state state-ok text-sm", "On" }
-                                span { class: "text-[13px] text-ctp-subtext0", " · clients on this network find the server by themselves" }
-                            } else {
-                                span { class: "state text-sm text-ctp-subtext1", "Off" }
-                                span { class: "text-[13px] text-ctp-subtext0", " · clients need its address or key" }
-                            }
+                        Pair { label: "LAN discovery", class: "max-md:hidden",
+                            LanDiscovery { running: s.mdns }
                         }
-                        Pair { label: "Addresses",
+                        Pair { label: "Addresses", class: "max-md:hidden",
                             if s.addresses.is_empty() {
                                 span { class: "text-ctp-subtext0", "starting…" }
                             } else {
-                                div { class: "flex flex-col gap-1",
-                                    for address in s.addresses {
-                                        span { key: "{address}", class: "mono-value", "{address}" }
-                                    }
-                                }
+                                Addresses { addresses: s.addresses }
                             }
                         }
                         // The ones a signed-in device is told to dial (PX-12):
                         // `network.announce` leaves out container bridges.
-                        Pair { label: "Told to devices",
+                        Pair { label: "Told to devices", class: "max-md:hidden",
                             if s.told_addresses.is_empty() {
                                 span { class: "text-ctp-subtext0", "none" }
                             } else {
-                                div { class: "flex flex-col gap-1",
-                                    for address in s.told_addresses {
-                                        span { key: "{address}", class: "mono-value", "{address}" }
-                                    }
-                                }
+                                Addresses { addresses: s.told_addresses }
+                                div { class: "mt-1 text-xs text-ctp-subtext0", "What a signed-in device is told to dial." }
                             }
                         }
                     },
                 }
+            }
+        }
+    }
+}
+
+/// LAN discovery (`network.mdns`) as a switch (WebServer). The setting
+/// applies at the next start: the server announces itself, or stops, only
+/// then, so a change says so and offers the restart where the server can.
+/// `running`: what the server does now.
+#[component]
+fn LanDiscovery(running: bool) -> Element {
+    let mut settings = use_resource(super::wizard::load_settings);
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let current = settings.read().clone();
+    let Some(Ok(loaded)) = current else {
+        // Until the settings load (or if they cannot), what runs now.
+        return rsx! { LanLine { on: running } };
+    };
+    let entry = super::wizard::entry(&loaded, "network.mdns").cloned();
+    let wanted = entry
+        .as_ref()
+        .and_then(|e| e.value.as_ref())
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(running);
+    let locked = entry.as_ref().is_some_and(|e| e.locked);
+    let flip = move |_| {
+        busy.set(true);
+        spawn(async move {
+            let set = async {
+                let client = rpc::client().await?;
+                client
+                    .setting_set("network.mdns".into(), serde_json::Value::Bool(!wanted))
+                    .await
+                    .map_err(rpc::error)
+            };
+            match set.await {
+                Ok(_) => error.set(None),
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+            settings.restart();
+        });
+    };
+    rsx! {
+        div { class: "flex flex-col gap-2",
+            div { class: "flex items-start gap-3",
+                button {
+                    class: "switch shrink-0",
+                    r#type: "button",
+                    role: "switch",
+                    aria_checked: "{wanted}",
+                    aria_label: "LAN discovery",
+                    disabled: busy() || locked,
+                    title: if locked { "Set by the server's config file." } else { "" },
+                    onclick: flip,
+                }
+                LanLine { on: wanted }
+            }
+            super::wizard::Note { settings: loaded.clone(), setting: "network.mdns", on_changed: move |_| settings.restart() }
+            if let Some(text) = error() {
+                Alert { text }
+            }
+        }
+    }
+}
+
+/// What LAN discovery being `on` means for clients.
+#[component]
+fn LanLine(on: bool) -> Element {
+    rsx! {
+        span { class: "text-[13px] leading-snug text-ctp-subtext1",
+            if on {
+                "Clients on this network find the server by themselves"
+            } else {
+                "Clients need its address or key"
             }
         }
     }
@@ -1278,12 +1637,18 @@ fn Plex() -> Element {
     }
 }
 
+/// Copies `text`. `label`: what it says before it is pressed; `wide`:
+/// the card's width, as the phone board's "Copy key".
 #[component]
-pub(super) fn CopyButton(text: String) -> Element {
+pub(super) fn CopyButton(
+    text: String,
+    #[props(default = "Copy".to_owned())] label: String,
+    #[props(default)] wide: bool,
+) -> Element {
     let mut copied = use_signal(|| false);
     rsx! {
         button {
-            class: "btn shrink-0",
+            class: if wide { "btn w-full justify-center" } else { "btn shrink-0" },
             onclick: move |_| {
                 if let Some(window) = web_sys::window() {
                     let _ = window.navigator().clipboard().write_text(&text);
@@ -1291,7 +1656,7 @@ pub(super) fn CopyButton(text: String) -> Element {
                 }
             },
             icons::Link {}
-            if copied() { "Copied" } else { "Copy" }
+            if copied() { "Copied" } else { "{label}" }
         }
     }
 }

@@ -640,6 +640,10 @@ impl Client {
     /// [`SdkError::InvalidCredentials`], counted as a failed sign-in (then
     /// [`SdkError::RateLimited`]).
     /// `remember` is as for [`Client::sign_in`].
+    ///
+    /// `signed.user_handle` is `None` when the platform gave no user
+    /// handle; an empty one is sent as `None` too, which the server takes
+    /// (it refuses empty bytes).
     pub async fn finish_passkey_sign_in(
         &self,
         endpoint_id: &str,
@@ -648,6 +652,7 @@ impl Client {
     ) -> Result<Session, SdkError> {
         let server = parse_id(endpoint_id)?;
         self.require_pinned(server).await?;
+        let signed = without_empty_user_handle(signed);
         let (token, remembered) = match self
             .call(
                 server,
@@ -1651,6 +1656,16 @@ fn is_web_page(url: &str) -> bool {
         None => host_port.split(':').next().unwrap_or_default(),
     };
     !host.is_empty()
+}
+
+/// `signed` with an empty user handle as `None`: what an app gives when
+/// its platform gave no handle is no handle on the wire, whichever way
+/// the app says it.
+pub(crate) fn without_empty_user_handle(mut signed: FinishPasskeySignIn) -> FinishPasskeySignIn {
+    if signed.user_handle.as_ref().is_some_and(Vec::is_empty) {
+        signed.user_handle = None;
+    }
+    signed
 }
 
 #[cfg(test)]

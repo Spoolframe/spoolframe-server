@@ -52,12 +52,13 @@ async fn my_link() -> Result<PlexUser, ApiError> {
     client.plex_link().await.map_err(rpc::error)
 }
 
-/// The card's head: Plex's mark and its name.
+/// The card's head: a teal link outline, as every card's icon is
+/// (WebProfile), and its name. Plex's orange stays on the linked line.
 #[component]
 fn PlexHead() -> Element {
     rsx! {
         div { class: "card-head",
-            span { class: "plex-badge", icons::Play {} }
+            icons::LinkChain { size: 18 }
             h2 { "Plex account" }
         }
     }

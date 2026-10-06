@@ -273,6 +273,61 @@ async fn another_user_s_passkey_confirms_nothing() {
     server.stop().await;
 }
 
+/// A platform that returns no user handle sends none: alice's passkey
+/// still confirms her, and bob's still confirms nothing.
+#[tokio::test]
+async fn a_passkey_signed_with_no_user_handle_confirms_only_its_user() {
+    let server = server("confirm-passkey-no-handle").await;
+    server.add_user("bob", PASSWORD, None).await;
+    let (bob_phone, bob) = signed_in(&server, "bob", "Bob's phone").await;
+    let mut bob_app = App::new();
+    register(&bob_phone, &bob, &mut bob_app, "Bob's phone").await;
+    let (tv, code) = tv_code(&server).await;
+    let (phone, session, mut app) = alice_old_with_a_passkey(&server).await;
+
+    let mut request = begin_confirm(&phone, &session).await;
+    request.allow_credential_ids.clear();
+    let mut signed = bob_app.get(&request);
+    signed.user_handle = None;
+    assert_eq!(finish_confirm(&phone, &session, signed).await, REFUSED);
+    assert_eq!(phone.call(Some(&session), approve(&code)).await, NOT_RECENT);
+
+    let request = begin_confirm(&phone, &session).await;
+    let mut signed = app.get(&request);
+    signed.user_handle = None;
+    assert_eq!(finish_confirm(&phone, &session, signed).await, CONFIRMED);
+    assert_eq!(
+        phone.call(Some(&session), approve(&code)).await,
+        Response::Ok(Reply::Done)
+    );
+    tv.close().await;
+    phone.close().await;
+    bob_phone.close().await;
+    server.stop().await;
+}
+
+/// An empty user handle confirms nothing: it is malformed, `InvalidInput`,
+/// and uses up nothing, so the same signature with no handle confirms.
+#[tokio::test]
+async fn an_empty_user_handle_confirms_nothing() {
+    let server = server("confirm-passkey-empty-handle").await;
+    let (tv, code) = tv_code(&server).await;
+    let (phone, session, mut app) = alice_old_with_a_passkey(&server).await;
+    let request = begin_confirm(&phone, &session).await;
+    let mut signed = app.get(&request);
+    signed.user_handle = Some(Vec::new());
+    assert!(matches!(
+        finish_confirm(&phone, &session, signed.clone()).await,
+        Response::Err(Error::InvalidInput { .. })
+    ));
+    assert_eq!(phone.call(Some(&session), approve(&code)).await, NOT_RECENT);
+    signed.user_handle = None;
+    assert_eq!(finish_confirm(&phone, &session, signed).await, CONFIRMED);
+    tv.close().await;
+    phone.close().await;
+    server.stop().await;
+}
+
 /// A confirmation signed for another server, with this one's nonce,
 /// confirms nothing (PX-09, finding 2): the challenge names the server.
 #[tokio::test]

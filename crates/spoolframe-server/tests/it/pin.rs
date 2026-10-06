@@ -1,5 +1,7 @@
 //! Profile PINs (P2-08): required per device, enforced by the server on
-//! every stream of a locked session.
+//! every stream of a locked session. What runs of wrong PINs and
+//! passwords do to sessions is tested on `Auth` in `auth::tests::pins`;
+//! these check which request counts against which limit.
 
 use crate::support;
 
@@ -302,7 +304,7 @@ async fn ten_wrong_pins_revoke_that_device_s_session_only() {
             .await
         {
             Response::Err(Error::RateLimited { .. }) => {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                server.clock.advance(Duration::from_millis(200));
             }
             Response::Err(Error::InvalidCredentials) => wrong += 1,
             Response::Err(e) => break e,
@@ -590,38 +592,6 @@ async fn wrong_current_pins_share_the_unlock_limit() {
     server.stop().await;
 }
 
-#[tokio::test]
-async fn ten_wrong_current_pins_revoke_that_device_s_session() {
-    let options = ServerOptions {
-        failure_window: Duration::from_millis(200),
-        ..ServerOptions::default()
-    };
-    let (server, tv, session) = pin_server("pin-proof-revoke", options).await;
-    ok(&tv, &session, set_pin(PIN, None)).await;
-    let mut wrong = 0;
-    let last = loop {
-        match tv.call(Some(&session), clear_pin(by_pin("0000"))).await {
-            Response::Err(Error::RateLimited { .. }) => {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Response::Err(Error::InvalidCredentials) => wrong += 1,
-            Response::Err(e) => break e,
-            Response::Ok(reply) => panic!("cleared with a wrong PIN: {reply:?}"),
-        }
-    };
-    assert_eq!(wrong, 9);
-    assert_eq!(last, Error::Unauthenticated);
-    // Its last session gone, the TV's connection is closed (PX-10).
-    tv.conn.closed().await;
-    let tv = tv.reconnect(&server).await;
-    assert_eq!(
-        err(&tv, &session, clear_pin(by_password(PASSWORD))).await,
-        Error::Unauthenticated
-    );
-    tv.close().await;
-    server.stop().await;
-}
-
 /// Wrong passwords through Change PIN and Remove PIN are failed sign-ins:
 /// with wrong `LoginPassword`s from the same device they reach the one
 /// limit, after which even the right password is refused, there and at
@@ -677,38 +647,6 @@ async fn wrong_passwords_share_the_sign_in_limit_not_the_pin_s() {
     );
     // Not one PIN was counted: the PIN proof still works, first try.
     ok(&tv, &session, set_pin("98765", Some(by_pin(PIN)))).await;
-    tv.close().await;
-    server.stop().await;
-}
-
-/// However many wrong passwords, the session stays: a failed sign-in
-/// signs no one out (unlike ten wrong PINs).
-#[tokio::test]
-async fn wrong_passwords_never_revoke_the_session() {
-    let options = ServerOptions {
-        failure_window: Duration::from_millis(200),
-        ..ServerOptions::default()
-    };
-    let (server, tv, session) = pin_server("pin-password-revoke", options).await;
-    ok(&tv, &session, set_pin(PIN, None)).await;
-    let mut wrong = 0;
-    while wrong < 12 {
-        match tv
-            .call(Some(&session), clear_pin(by_password("wrong password")))
-            .await
-        {
-            Response::Err(Error::RateLimited { .. }) => {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Response::Err(Error::InvalidCredentials) => wrong += 1,
-            other => panic!("not a wrong password: {other:?}"),
-        }
-    }
-    ok(&tv, &session, Request::Libraries).await;
-    assert_eq!(
-        pin_state(&tv, &session).await,
-        Some(PinState { digits: Some(4) })
-    );
     tv.close().await;
     server.stop().await;
 }

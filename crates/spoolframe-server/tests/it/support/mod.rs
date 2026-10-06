@@ -7,22 +7,23 @@
 
 pub mod idp;
 
-use std::collections::HashMap;
+pub use spoolframe_server::test_support::{
+    A_TITLE_OVER_A_FRAME, FakeCatalog, episode, fake_ffprobe, library, markers, movie, poster,
+    show, write_script,
+};
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, RelayMode};
 use serde::Serialize;
-use spoolframe_catalog::{
-    Catalog, CatalogError, Found, FoundGroup, Image, ItemPage, ItemWithChildren, Page, SearchQuery,
-};
+use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
 use spoolframe_media::encoders::{FfmpegCommand, TranscodeSettings};
 use spoolframe_media::ocr::Ocr;
-use spoolframe_protocol::codec::{MAX_FRAME, read_frame, write_frame};
+use spoolframe_protocol::codec::{read_frame, write_frame};
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{ArtworkRequest, ArtworkResponse, ArtworkSize};
 use spoolframe_protocol::{
@@ -32,6 +33,7 @@ use spoolframe_protocol::{
 use spoolframe_protocol::{MediaRead, MediaReadResponse, PlaybackHandle};
 use spoolframe_server::artwork::ArtworkCache;
 use spoolframe_server::auth::{Auth, hash_password};
+use spoolframe_server::clock::Clock;
 use spoolframe_server::encode::JobLimits;
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
@@ -42,11 +44,7 @@ use spoolframe_server::store::Store;
 use spoolframe_server::subtitles::{OcrSettings, Subtitles};
 use spoolframe_server::transcode::Transcoding;
 use spoolframe_server::watch::{Watch, WatchRules};
-use spoolframe_types::{
-    ArtworkId, ClientCapabilities, Episode, Item, Library, LibraryId, LibraryKind, Marker,
-    MarkerKind, MediaId, MediaKind, Movie, Namespace, PersonId, PlaybackState, SearchKind,
-    SearchScope, Season, Show,
-};
+use spoolframe_types::{ArtworkId, ClientCapabilities, SearchScope};
 use tokio::io::AsyncWriteExt;
 
 /// Transcoding that has not detected anything: the software baseline.
@@ -59,17 +57,6 @@ pub fn transcoding() -> Arc<Transcoding> {
     ))
 }
 
-/// The fake catalog's one image.
-pub const POSTER: &str = "/library/metadata/1/thumb/1";
-
-pub fn poster() -> ArtworkId {
-    ArtworkId::new(Namespace::Plex, POSTER).unwrap()
-}
-
-/// A search for this finds a movie whose title alone is over a frame: a
-/// reply that cannot be sent.
-pub const A_TITLE_OVER_A_FRAME: &str = "a title over a frame";
-
 /// A search of everything for `query`, up to 10 per group.
 pub fn search(query: &str) -> spoolframe_protocol::SearchRequest {
     spoolframe_protocol::SearchRequest {
@@ -81,395 +68,13 @@ pub fn search(query: &str) -> spoolframe_protocol::SearchRequest {
     }
 }
 
-/// One library holding one movie, `plex:movie:1`.
-#[derive(Debug)]
-pub struct FakeCatalog {
-    /// The movie's file, once a test writes it.
-    media: PathBuf,
-    /// What the catalog answers for keys items had before it was rebuilt.
-    old_keys: Mutex<HashMap<MediaId, OldKey>>,
-    /// Each `item` and `external_ids` call: the method and the id.
-    calls: Mutex<Vec<(&'static str, MediaId)>>,
-}
-
-/// What a key holds after the catalog gave its item a new one. A key the
-/// fake knows nothing of is not found.
-#[derive(Debug, Clone)]
-pub enum OldKey {
-    /// Another item of the same kind, with these external ids.
-    AnotherItem(Vec<String>),
-    /// An item of another kind: `PlexCatalog` cannot read it as `item`,
-    /// and has no `external_ids` for it.
-    AnotherKind,
-    /// The key is another catalog's.
-    Foreign,
-    /// The catalog cannot be asked.
-    Unreachable,
-}
-
-impl FakeCatalog {
-    pub fn set_old_key(&self, id: &MediaId, holds: OldKey) {
-        self.old_keys.lock().unwrap().insert(id.clone(), holds);
-    }
-
-    pub fn forget_old_key(&self, id: &MediaId) {
-        self.old_keys.lock().unwrap().remove(id);
-    }
-
-    /// The `item` and `external_ids` calls since the last time, by method.
-    pub fn take_calls(&self, id: &MediaId) -> Vec<&'static str> {
-        let mut calls = self.calls.lock().unwrap();
-        let about = calls.iter().filter(|(_, i)| i == id).map(|(m, _)| *m);
-        let about = about.collect();
-        calls.clear();
-        about
-    }
-
-    fn called(&self, method: &'static str, id: &MediaId) {
-        self.calls.lock().unwrap().push((method, id.clone()));
-    }
-
-    fn old_key(&self, id: &MediaId) -> Option<OldKey> {
-        self.old_keys.lock().unwrap().get(id).cloned()
-    }
-
-    fn unreachable() -> CatalogError {
-        CatalogError::Unreachable {
-            url: "http://fake".into(),
-            call: "GET /library/metadata".into(),
-            source: "connection refused".into(),
-        }
-    }
-}
-
-/// The external ids of an item of the fake's tree.
-fn external_ids(item: &Item) -> Vec<String> {
-    let first = movie();
-    let of = if item.id() == second_copy().id() {
-        &first
-    } else {
-        item
-    };
-    vec![format!("test://{}", of.id().key())]
-}
-
-pub fn movie() -> Item {
-    Item::Movie(Movie {
-        id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
-        title: "Alien".into(),
-        year: Some(1979),
-        summary: None,
-        content_rating: None,
-        duration: Some(Duration::from_secs(7020)),
-        artwork: Vec::new(),
-        playback: PlaybackState::default(),
-    })
-}
-
-/// The same film in a second library, `plex:movie:2`: its own key, and
-/// the first copy's external ids.
-pub fn second_copy() -> Item {
-    Item::Movie(Movie {
-        id: MediaId::new(Namespace::Plex, MediaKind::Movie, "2").unwrap(),
-        title: "Alien (4K)".into(),
-        year: Some(1979),
-        summary: None,
-        content_rating: None,
-        duration: Some(Duration::from_secs(7020)),
-        artwork: Vec::new(),
-        playback: PlaybackState::default(),
-    })
-}
-
-fn media(kind: MediaKind, key: &str) -> MediaId {
-    MediaId::new(Namespace::Plex, kind, key).unwrap()
-}
-
-/// A show, `plex:show:10`: specials (season 0, episode 21), season 1
-/// (episodes 12 and 13) and season 2 (episode 15).
-pub fn show() -> Item {
-    Item::Show(Show {
-        id: media(MediaKind::Show, "10"),
-        title: "The Expanse".into(),
-        year: Some(2015),
-        summary: None,
-        content_rating: None,
-        season_count: None,
-        genres: Vec::new(),
-        artwork: Vec::new(),
-    })
-}
-
-fn season(key: &str, number: u32) -> Item {
-    Item::Season(Season {
-        id: media(MediaKind::Season, key),
-        show_id: media(MediaKind::Show, "10"),
-        show_title: Some("The Expanse".into()),
-        season: number,
-        title: format!("Season {number}"),
-        artwork: Vec::new(),
-    })
-}
-
-/// Episode `key`: number `episode` of season `season` (`season_key`).
-pub fn episode(key: &str, season_key: &str, season: u32, episode: u32) -> Item {
-    Item::Episode(Episode {
-        id: media(MediaKind::Episode, key),
-        show_id: media(MediaKind::Show, "10"),
-        show_title: Some("The Expanse".into()),
-        season_id: media(MediaKind::Season, season_key),
-        season,
-        episode,
-        title: format!("S{season}E{episode}"),
-        summary: None,
-        content_rating: None,
-        duration: Some(Duration::from_secs(2640)),
-        artwork: Vec::new(),
-        playback: PlaybackState::default(),
-    })
-}
-
-/// The markers of episode 15, the only item that has any: an intro, and
-/// credits that run to the end, starting after the point P1-14's rule
-/// calls the episode watched at (39:00 of its 44:00).
-pub fn markers() -> Vec<Marker> {
-    vec![
-        Marker {
-            kind: MarkerKind::Intro,
-            start_ms: 30_000,
-            end_ms: 90_000,
-            to_end: false,
-        },
-        Marker {
-            kind: MarkerKind::Credits,
-            start_ms: 2_400_000,
-            end_ms: 2_640_001,
-            to_end: true,
-        },
-    ]
-}
-
-/// Every item the fake catalog has, with its children.
-fn tree() -> Vec<(Item, Vec<Item>)> {
-    vec![
-        (movie(), Vec::new()),
-        (second_copy(), Vec::new()),
-        (
-            show(),
-            vec![season("20", 0), season("11", 1), season("14", 2)],
-        ),
-        (season("20", 0), vec![episode("21", "20", 0, 1)]),
-        (
-            season("11", 1),
-            vec![episode("12", "11", 1, 1), episode("13", "11", 1, 2)],
-        ),
-        (season("14", 2), vec![episode("15", "14", 2, 1)]),
-        (episode("21", "20", 0, 1), Vec::new()),
-        (episode("12", "11", 1, 1), Vec::new()),
-        (episode("13", "11", 1, 2), Vec::new()),
-        (episode("15", "14", 2, 1), Vec::new()),
-    ]
-}
-
-pub fn library() -> Library {
-    Library {
-        id: LibraryId::new(Namespace::Plex, "1").unwrap(),
-        title: "Movies".into(),
-        kind: LibraryKind::Movies,
-    }
-}
-
-#[async_trait]
-impl Catalog for FakeCatalog {
-    async fn libraries(&self) -> Result<Vec<Library>, CatalogError> {
-        Ok(vec![library()])
-    }
-
-    async fn items(&self, library: &LibraryId, page: Page) -> Result<ItemPage, CatalogError> {
-        if library.key() != "1" {
-            return Err(CatalogError::NotFound(library.to_string()));
-        }
-        let items = if page.offset == 0 && page.limit > 0 {
-            vec![movie()]
-        } else {
-            Vec::new()
-        };
-        Ok(ItemPage { items, total: 1 })
-    }
-
-    async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
-        self.called("item", id);
-        match self.old_key(id) {
-            Some(OldKey::AnotherItem(external_ids)) => {
-                let Item::Movie(movie) = movie() else {
-                    unreachable!()
-                };
-                return Ok(ItemWithChildren {
-                    item: Item::Movie(Movie {
-                        id: id.clone(),
-                        title: "Aliens".into(),
-                        content_rating: None,
-                        ..movie
-                    }),
-                    children: Vec::new(),
-                    external_ids,
-                    markers: Vec::new(),
-                });
-            }
-            Some(OldKey::AnotherKind) => {
-                return Err(CatalogError::Backend {
-                    url: "http://fake".into(),
-                    call: "GET /library/metadata".into(),
-                    item: Some(id.to_string()),
-                    message: format!("the PMS returned another kind, not {id}"),
-                });
-            }
-            Some(OldKey::Foreign) => return Err(CatalogError::ForeignId(id.to_string())),
-            Some(OldKey::Unreachable) => return Err(Self::unreachable()),
-            None => {}
-        }
-        tree()
-            .into_iter()
-            .find(|(item, _)| item.id() == id)
-            .map(|(item, children)| {
-                let markers = if id.key() == "15" {
-                    markers()
-                } else {
-                    Vec::new()
-                };
-                ItemWithChildren {
-                    external_ids: external_ids(&item),
-                    item,
-                    children,
-                    markers,
-                }
-            })
-            .ok_or_else(|| CatalogError::NotFound(id.to_string()))
-    }
-
-    async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
-        self.called("external_ids", id);
-        match self.old_key(id) {
-            Some(OldKey::AnotherItem(external_ids)) => return Ok(external_ids),
-            Some(OldKey::AnotherKind) => return Err(CatalogError::NotFound(id.to_string())),
-            Some(OldKey::Foreign) => return Err(CatalogError::ForeignId(id.to_string())),
-            Some(OldKey::Unreachable) => return Err(Self::unreachable()),
-            None => {}
-        }
-        tree()
-            .iter()
-            .find(|(item, _)| item.id() == id)
-            .map(|(item, _)| external_ids(item))
-            .ok_or_else(|| CatalogError::NotFound(id.to_string()))
-    }
-
-    /// The movie, for a part of "alien" or for [`A_TITLE_OVER_A_FRAME`];
-    /// nothing else.
-    async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
-        let text = query.text.to_lowercase();
-        let found = if text == A_TITLE_OVER_A_FRAME {
-            let Item::Movie(movie) = movie() else {
-                unreachable!()
-            };
-            vec![Item::Movie(Movie {
-                title: "a".repeat(MAX_FRAME as usize),
-                content_rating: None,
-                ..movie
-            })]
-        } else if "alien".contains(&text) && !text.is_empty() {
-            vec![movie()]
-        } else {
-            Vec::new()
-        };
-        let groups = query
-            .kinds
-            .iter()
-            .map(|&kind| match kind {
-                SearchKind::Movies => FoundGroup {
-                    total: found.len() as u32,
-                    items: found.clone(),
-                    ..FoundGroup::empty(kind)
-                },
-                _ => FoundGroup::empty(kind),
-            })
-            .collect();
-        Ok(Found { groups })
-    }
-
-    /// The fake knows no people.
-    async fn person_items(&self, id: &PersonId) -> Result<Vec<Item>, CatalogError> {
-        Err(CatalogError::NotFound(id.to_string()))
-    }
-
-    async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
-        let path = if id == movie().id() {
-            self.media.clone()
-        } else {
-            episode_media(&self.media, id)
-        };
-        if path.exists() {
-            Ok(path)
-        } else {
-            Err(CatalogError::NotFound(id.to_string()))
-        }
-    }
-
-    async fn recently_added(&self, _limit: u32) -> Result<Vec<Item>, CatalogError> {
-        Ok(vec![movie()])
-    }
-
-    /// A 400×200 PNG at the movie's poster path; nothing else.
-    async fn authorize_artwork(
-        &self,
-        _id: &spoolframe_types::ArtworkId,
-    ) -> Result<(), CatalogError> {
-        Ok(())
-    }
-
-    async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
-        if id.key() != POSTER {
-            return Err(CatalogError::NotFound(id.to_string()));
-        }
-        let img = image::RgbImage::from_pixel(400, 200, image::Rgb([10, 120, 200]));
-        let mut out = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut out, image::ImageFormat::Png)
-            .unwrap();
-        Ok(Image {
-            bytes: out.into_inner(),
-            content_type: "image/png".into(),
-        })
-    }
-}
-
-/// Short playback timings, so tests can see a handle expire or a session
-/// re-checked without waiting minutes.
-pub const PLAYBACK_IDLE: Duration = Duration::from_secs(2);
+/// The playback timings of a test server. Idling out is the server's
+/// own five minutes: a test that needs a playback idle moves
+/// [`TestServer::clock`] on, so a slow machine never idles one out
+/// mid-test. Rechecks stay short, for the requests a test makes in real
+/// time.
+pub const PLAYBACK_IDLE: Duration = spoolframe_server::playback::IDLE;
 pub const PLAYBACK_RECHECK: Duration = Duration::from_millis(300);
-
-/// A stand-in ffprobe answering with recorded output: the forced-subtitle
-/// MKV (matroska, hevc, eac3, subrip) for media, the SRT for `.srt` files.
-/// Where an episode's file goes, next to the movie's. The stand-in ffprobe
-/// describes it as Brooklyn Nine-Nine S07E01 (P1-20's fixture).
-fn episode_media(movie: &Path, id: &MediaId) -> PathBuf {
-    movie.with_file_name(format!("episode-{}.b99.mkv", id.key()))
-}
-
-fn fake_ffprobe(dir: &Path, fixture: &str) -> PathBuf {
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../spoolframe-media/tests/fixtures");
-    let script = dir.join("bin").join("ffprobe");
-    std::fs::create_dir_all(script.parent().unwrap()).unwrap();
-    write_script(
-        &script,
-        &format!(
-            "#!/bin/sh\nfor path; do :; done\ncase \"$path\" in *.srt) cat '{}' ;; *.b99.mkv) cat '{}' ;; *) cat '{}' ;; esac\n",
-            fixtures.join("external-srt.json").display(),
-            fixtures.join("b99-s07e01.json").display(),
-            fixtures.join(fixture).display(),
-        ),
-    );
-    script
-}
 
 /// A Linux-client-like device that takes a progressive stream: H.264 and
 /// AAC in Matroska, so an AC-3 file needs its audio converted.
@@ -684,6 +289,9 @@ fn test_module() -> String {
 /// A running server on loopback, with its database at hand.
 pub struct TestServer {
     pub server: Server,
+    /// What its store, logins, sign-in codes, playbacks and app passkeys
+    /// time expiry by: a test moves it on instead of sleeping (PX-09).
+    pub clock: Clock,
     /// What it is called: a live setting (P3-10).
     pub name: ServerName,
     pub store: Store,
@@ -718,13 +326,10 @@ impl TestServer {
     /// A server on `dir` (its key and database), run as `options` say.
     pub async fn start_with(dir: StateDir, options: ServerOptions) -> Self {
         let key = identity::load_or_create(&dir).unwrap();
-        let store = Store::open(&dir).await.unwrap();
+        let clock = Clock::default();
+        let store = Store::open(&dir).await.unwrap().with_clock(clock.clone());
         let media = dir.join("media").join("movie.mkv");
-        let fake = Arc::new(FakeCatalog {
-            media: media.clone(),
-            old_keys: Mutex::default(),
-            calls: Mutex::default(),
-        });
+        let fake = Arc::new(FakeCatalog::new(media.clone()));
         let catalog: Arc<dyn Catalog> = match &options.catalog {
             Some(live) => live.clone(),
             None if options.not_set_up => {
@@ -811,15 +416,19 @@ impl TestServer {
             artwork: Arc::new(artwork),
             playbacks: Arc::new(
                 Playbacks::new(PLAYBACK_IDLE, PLAYBACK_RECHECK)
-                    .with_disconnect_grace(options.disconnect_grace),
+                    .with_disconnect_grace(options.disconnect_grace)
+                    .with_clock(clock.clone()),
             ),
             transcoding: transcoding(),
             jobs: Arc::new(jobs),
             subtitles: Arc::new(subtitles),
             previews,
-            app_passkeys: Arc::new(spoolframe_server::app_passkeys::AppPasskeys::with_lifetime(
-                options.passkey_lifetime,
-            )),
+            app_passkeys: Arc::new(
+                spoolframe_server::app_passkeys::AppPasskeys::with_lifetime(
+                    options.passkey_lifetime,
+                )
+                .with_clock(clock.clone()),
+            ),
             metrics: metrics.clone(),
             connected: Arc::default(),
         };
@@ -845,6 +454,7 @@ impl TestServer {
             .unwrap();
         Self {
             server,
+            clock,
             name,
             store,
             auth,
@@ -877,10 +487,7 @@ impl TestServer {
 
     /// Write episode `key`'s file; ffprobe describes it as B99 S07E01.
     pub fn write_episode(&self, key: &str) {
-        let id = MediaId::new(Namespace::Plex, MediaKind::Episode, key).unwrap();
-        let path = episode_media(&self.media, &id);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, b"stand-in").unwrap();
+        spoolframe_server::test_support::write_episode(&self.media, key);
     }
 
     /// Make the movie's file with real ffmpeg: `secs` of a 640×360 test
@@ -1619,23 +1226,6 @@ impl TestClient {
         self.conn.close(0u32.into(), b"done");
         self.endpoint.close().await;
     }
-}
-
-/// Writes an executable script. The text goes to a plain file first and
-/// `install` makes the script from it, so this process never holds the
-/// script open for writing: a child another test forks at that moment
-/// would inherit the handle, and running the script would then fail with
-/// "Text file busy" (ETXTBSY).
-pub fn write_script(path: &Path, text: &str) {
-    let source = path.with_extension("txt");
-    std::fs::write(&source, text).unwrap();
-    let status = std::process::Command::new("install")
-        .args(["-m", "755"])
-        .arg(&source)
-        .arg(path)
-        .status()
-        .unwrap();
-    assert!(status.success(), "install {} failed", path.display());
 }
 
 /// The warnings the servers in this test binary log, kept so a test can

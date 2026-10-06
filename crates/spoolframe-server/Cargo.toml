@@ -15,6 +15,10 @@ path = "src/main.rs"
 # Carry the web UI (P3-01): the `dx bundle` output at SPOOLFRAME_WEB_DIST,
 # as `nix build` makes it.
 embed-web = ["dep:rust-embed"]
+# The stand-ins in `test_support` (a fake catalog, a stand-in ffprobe), for
+# the integration tests: only the crate's own dev-dependency below turns it
+# on.
+test-support = []
 
 [dependencies]
 snmalloc-rs.workspace = true
@@ -66,6 +70,8 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Itself, with the stand-ins the integration tests share with the unit tests.
+spoolframe-server = { path = ".", features = ["test-support"] }
 # The stand-in OTLP collector (P3-14).
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }

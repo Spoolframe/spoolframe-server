@@ -13,6 +13,7 @@ pub mod artwork;
 pub mod auth;
 pub mod catalog;
 mod client;
+pub mod clock;
 pub mod config;
 pub mod connected;
 pub mod device_sign_in;
@@ -40,6 +41,8 @@ pub mod search;
 pub mod store;
 pub mod subtitles;
 pub mod telemetry;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod tracks;
 pub mod transcode;
 pub mod watch;

@@ -3,7 +3,7 @@
 //! a user keeps a way to sign in.
 
 use super::users::LocalUserId;
-use super::{Store, StoreError, now};
+use super::{Store, StoreError};
 
 /// One linked identity.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -64,7 +64,7 @@ impl Store {
             Some(_) => return Err(IdentityError::LinkedToAnother),
             None => {}
         }
-        let linked_at = now();
+        let linked_at = self.now();
         let inserted = sqlx::query(
             "INSERT INTO external_identities (user_id, issuer, subject, display, linked_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -108,7 +108,7 @@ impl Store {
         )
         .bind(issuer)
         .bind(subject)
-        .bind(now())
+        .bind(self.now())
         .fetch_optional(&self.pool)
         .await?;
         Ok(id)

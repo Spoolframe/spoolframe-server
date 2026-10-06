@@ -919,11 +919,14 @@ impl Session {
     /// Finish it with what the passkey signed. Another user's passkey, a
     /// challenge that is over or not this session's, or anything else that
     /// does not verify is [`SdkError::InvalidCredentials`], counted as a
-    /// failed passkey sign-in (then [`SdkError::RateLimited`]).
+    /// failed passkey sign-in (then [`SdkError::RateLimited`]). An empty
+    /// `user_handle` is sent as `None`, as
+    /// [`crate::Client::finish_passkey_sign_in`] sends it.
     pub async fn finish_confirm_passkey(
         &self,
         signed: FinishPasskeySignIn,
     ) -> Result<(), SdkError> {
+        let signed = crate::client::without_empty_user_handle(signed);
         self.confirmed(Request::FinishConfirmPasskey(signed)).await
     }
 

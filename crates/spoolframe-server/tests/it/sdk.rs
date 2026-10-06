@@ -1237,6 +1237,43 @@ async fn an_app_passkey_made_on_the_phone_signs_the_tv_in() {
     server.stop().await;
 }
 
+/// An app that still says "no user handle" with empty bytes signs in and
+/// confirms through the SDK: the SDK sends it as no handle, which the
+/// server takes, where it refuses empty bytes.
+#[tokio::test]
+async fn the_sdk_sends_an_empty_user_handle_as_none() {
+    let (server, phone, _) = ready("sdk-empty-handle").await;
+    let alice = alice(&server, &phone).await;
+    let creation = alice.begin_passkey_registration().await.unwrap();
+    let mut app = crate::app_passkeys::App::new();
+    alice
+        .finish_passkey_registration(app.create(&creation, "Alice's iPhone"))
+        .await
+        .unwrap();
+    let unhandled = |mut signed: spoolframe_client_sdk::FinishPasskeySignIn| {
+        signed.user_handle = Some(Vec::new());
+        signed
+    };
+
+    let tv_storage = Arc::new(MemoryStorage::default());
+    let tv = client_on(&server, &tv_storage).await;
+    let request = tv.begin_passkey_sign_in(&id(&server), None).await.unwrap();
+    let session = tv
+        .finish_passkey_sign_in(&id(&server), unhandled(app.get(&request)), false)
+        .await
+        .unwrap();
+    assert_eq!(session.user().username, "alice");
+
+    let request = alice.begin_confirm_passkey().await.unwrap();
+    alice
+        .finish_confirm_passkey(unhandled(app.get(&request)))
+        .await
+        .unwrap();
+    tv.close().await;
+    phone.close().await;
+    server.stop().await;
+}
+
 /// The app lists, renames and removes its user's passkeys through the SDK
 /// (P3-19), the web UI's with its own, under the web UI's rules.
 #[tokio::test]

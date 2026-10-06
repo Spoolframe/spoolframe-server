@@ -165,7 +165,7 @@ async fn an_idle_handle_expires_and_a_new_start_reads_on() {
     let (server, client, session) = ready("expiry").await;
     let file = server.write_media(1000);
     let (handle, _) = started(&client, &session).await;
-    tokio::time::sleep(PLAYBACK_IDLE + Duration::from_millis(200)).await;
+    server.clock.advance(PLAYBACK_IDLE);
     let (response, _) = client.read(&session, &handle, 500, 100).await;
     assert_eq!(err(response), Error::PlaybackExpired);
 
@@ -187,7 +187,7 @@ async fn revoking_the_session_stops_reads_within_the_recheck_interval() {
     // The device's connection is closed (PX-10); it comes back.
     client.conn.closed().await;
     let client = client.reconnect(&server).await;
-    tokio::time::sleep(PLAYBACK_RECHECK + Duration::from_millis(100)).await;
+    server.clock.advance(PLAYBACK_RECHECK);
     let (response, _) = client.read(&session, &handle, 0, 10).await;
     assert_eq!(err(response), Error::Unauthenticated);
     client.close().await;

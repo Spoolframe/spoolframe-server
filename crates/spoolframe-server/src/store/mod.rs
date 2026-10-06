@@ -61,6 +61,8 @@ pub struct Store {
     /// Bumped after anything that may end sessions (PX-10), so the
     /// connections of a device that is no longer signed in are closed.
     sessions_ended: std::sync::Arc<tokio::sync::watch::Sender<u64>>,
+    /// What "now" is for the times it writes and compares (PX-09).
+    clock: crate::clock::Clock,
 }
 
 impl Store {
@@ -119,7 +121,25 @@ impl Store {
         Ok(Self {
             pool,
             sessions_ended: std::sync::Arc::new(tokio::sync::watch::Sender::new(0)),
+            clock: crate::clock::Clock::default(),
         })
+    }
+
+    /// Judge times by `clock` (tests move it instead of sleeping).
+    pub fn with_clock(mut self, clock: crate::clock::Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The clock its times are by.
+    pub fn clock(&self) -> &crate::clock::Clock {
+        &self.clock
+    }
+
+    /// Seconds since the Unix epoch by its clock: how the database
+    /// stores times.
+    pub(crate) fn now(&self) -> i64 {
+        self.clock.unix_secs()
     }
 
     /// Changes each time sessions may have ended: revoked, or their user

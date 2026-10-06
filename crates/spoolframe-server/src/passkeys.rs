@@ -113,6 +113,12 @@ pub(crate) struct RelyingParty {
     pub(crate) webauthn: Webauthn,
     pub(crate) rp_id: String,
     pub(crate) origin: String,
+    /// Whether an assertion may come without a user handle, its passkey's
+    /// user then the one its credential id is stored as. A browser always
+    /// sends the handle of a discoverable passkey, and WebAuthn wants it
+    /// checked; the apps' webauthn-authenticator-rs, on the Linux client,
+    /// gets none from a phone over caBLE, and sends `None`.
+    pub(crate) user_handle_optional: bool,
 }
 
 impl RelyingParty {
@@ -127,6 +133,7 @@ impl RelyingParty {
             webauthn,
             rp_id: rp_id.to_owned(),
             origin: origin.to_owned(),
+            user_handle_optional: false,
         })
     }
 
@@ -193,13 +200,18 @@ impl RelyingParty {
             return Err(refused("the passkey was made for another host"));
         }
         // The user handle its authenticator stored with it is its user's.
-        let handle = self
-            .webauthn
-            .identify_discoverable_authentication(signed)
-            .map(|(handle, _)| handle.to_string())
-            .map_err(|e| refused(&e.to_string()))?;
-        if store.passkey_handle_user(&handle).await? != Some(record.user) {
-            return Err(refused("the user handle is not the passkey's user's"));
+        // Without one, where that is allowed, the credential id alone says
+        // whose it is: ids are unique, and the signature is checked
+        // against the key stored with it.
+        if signed.response.user_handle.is_some() || !self.user_handle_optional {
+            let handle = self
+                .webauthn
+                .identify_discoverable_authentication(signed)
+                .map(|(handle, _)| handle.to_string())
+                .map_err(|e| refused(&e.to_string()))?;
+            if store.passkey_handle_user(&handle).await? != Some(record.user) {
+                return Err(refused("the user handle is not the passkey's user's"));
+            }
         }
         let mut passkey = credential(record).map_err(|e| SignInError::Internal(e.to_string()))?;
         let verified = self
@@ -551,6 +563,7 @@ fn relying_party(origins: &Origins) -> Result<RelyingParty, String> {
         webauthn,
         rp_id: rp_id.to_owned(),
         origin,
+        user_handle_optional: false,
     })
 }
 

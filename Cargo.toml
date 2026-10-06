@@ -173,7 +173,7 @@ anyhow = "1"
 # registry — the crates.io `uclicious` is a stale 0.1.x. Not a path dep: the
 # subflake is copied to the store without its siblings, so `../uclicious`
 # would not exist in the nix build.
-uclicious = { version = "0.9.1", registry = "coldsteel" }
+uclicious = { version = "0.10.1", registry = "coldsteel" }
 
 # Reads the workspace graph for the license-boundary test.
 cargo_metadata = "0.23"

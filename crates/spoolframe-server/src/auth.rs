@@ -15,11 +15,12 @@ use password_hash::rand_core::{OsRng, RngCore};
 
 use spoolframe_types::Role;
 
+use crate::clock::Clock;
 use crate::device_sign_in::{Claim, DeviceSignIns, Handover};
 use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionUser};
 use crate::store::trust::{Resumed, TrustedProfile};
 use crate::store::users::{LocalUserId, PasswordLogin, normalize_username};
-use crate::store::{Store, StoreError, now};
+use crate::store::{Store, StoreError};
 
 /// How long a client (Iroh endpoint) session lasts after its last use.
 /// Use renews it, so a TV in use never signs out.
@@ -552,6 +553,9 @@ pub struct Auth {
     strangers: Arc<TokenBucket>,
     /// How long a trusted device may go unused (P4-01).
     trust_idle: Duration,
+    /// What failures, attempts and sign-in codes are timed by: its
+    /// store's, so sessions and limits agree on what now is (PX-09).
+    clock: Clock,
 }
 
 impl Auth {
@@ -560,14 +564,18 @@ impl Auth {
     }
 
     /// As [`Auth::new`], with failures counting for `window`.
+    ///
+    /// Its clock is `store`'s ([`Store::with_clock`]).
     pub fn with_failure_window(store: Store, window: Duration) -> Self {
+        let clock = store.clock().clone();
         Self {
             store,
             limiter: Arc::new(RateLimiter::with_window(window)),
             wrong_pins: Arc::default(),
-            sign_ins: Arc::default(),
+            sign_ins: Arc::new(DeviceSignIns::default().with_clock(clock.clone())),
             strangers: Arc::new(TokenBucket::new(STRANGER_ATTEMPTS)),
             trust_idle: TRUST_IDLE,
+            clock,
         }
     }
 
@@ -612,7 +620,7 @@ impl Auth {
                 &token.hash(),
                 user,
                 binding,
-                now() + ENDPOINT_SESSION.as_secs() as i64,
+                self.store.now() + ENDPOINT_SESSION.as_secs() as i64,
                 self.trust_idle_secs(),
             )
             .await?;
@@ -632,12 +640,13 @@ impl Auth {
     /// One sign-in attempt by a device that is not signed in: `Err(wait)`
     /// while they have all used up their share.
     pub fn stranger_attempt(&self) -> Result<(), Duration> {
-        self.strangers.take(Instant::now())
+        self.strangers.take(self.clock.now())
     }
 
     /// Device sign-in codes live `lifetime` (tests shorten it).
     pub fn with_sign_in_lifetime(mut self, lifetime: Duration) -> Self {
-        self.sign_ins = Arc::new(DeviceSignIns::with_lifetime(lifetime));
+        self.sign_ins =
+            Arc::new(DeviceSignIns::with_lifetime(lifetime).with_clock(self.clock.clone()));
         self
     }
 
@@ -730,7 +739,7 @@ impl Auth {
                 &token.hash(),
                 user,
                 binding,
-                now() + lifetime.as_secs() as i64,
+                self.store.now() + lifetime.as_secs() as i64,
             )
             .await?;
         Ok(token)
@@ -754,7 +763,7 @@ impl Auth {
         // Counted as wrong before it is checked: PINs sent at once would
         // otherwise all be checked against a limit none had yet reached.
         let (what, from) = pin_keys(user, endpoint);
-        let began = Instant::now();
+        let began = self.clock.now();
         if let Err(retry_after) = self.limiter.begin(&what, Some(&from), began) {
             return Err(UnlockError::RateLimited { retry_after });
         }
@@ -791,17 +800,17 @@ impl Auth {
     /// The failure limit, for an attempt that is not a password login
     /// (a setup code): `Some(wait)` if `what` from `source` is limited.
     pub fn attempt_limited(&self, what: &str, source: Option<&str>) -> Option<Duration> {
-        self.limiter.check(what, source, Instant::now())
+        self.limiter.check(what, source, self.clock.now())
     }
 
     /// How long `username`'s password logins stay refused for its own
     /// failed ones, if they are (P3-18).
     pub fn login_limited(&self, username: &str) -> Option<Duration> {
-        self.limiter.user_limited(username, Instant::now())
+        self.limiter.user_limited(username, self.clock.now())
     }
 
     pub fn attempt_failed(&self, what: &str, source: Option<&str>) {
-        self.limiter.record_failure(what, source, Instant::now());
+        self.limiter.record_failure(what, source, self.clock.now());
     }
 
     /// Count an attempt that is not a password login (a passkey's
@@ -809,7 +818,7 @@ impl Auth {
     /// `Err(wait)` if `what` from `source` is limited. It stays counted as
     /// a failure unless [`Auth::attempt_succeeded`] takes it back.
     pub fn attempt_begin(&self, what: &str, source: Option<&str>) -> Result<Instant, Duration> {
-        let began = Instant::now();
+        let began = self.clock.now();
         self.limiter.begin(what, source, began).map(|()| began)
     }
 
@@ -844,7 +853,7 @@ impl Auth {
                 &token.hash(),
                 account.id,
                 &binding,
-                now() + lifetime.as_secs() as i64,
+                self.store.now() + lifetime.as_secs() as i64,
             )
             .await?;
         let remembered = self
@@ -904,7 +913,7 @@ impl Auth {
         // Counted as a failure before it is checked: logins sent at once
         // would otherwise all be checked against a limit none had yet
         // reached.
-        let began = Instant::now();
+        let began = self.clock.now();
         if let Err(retry_after) = self.limiter.begin(username, source, began) {
             return Err(LoginError::RateLimited { retry_after });
         }
@@ -927,7 +936,7 @@ impl Auth {
                 &token.hash(),
                 user,
                 &SessionBinding::Api,
-                now() + API_SESSION.as_secs() as i64,
+                self.store.now() + API_SESSION.as_secs() as i64,
             )
             .await?;
         Ok(token)
@@ -967,6 +976,9 @@ impl Auth {
 mod tests {
     use super::*;
     use crate::store::tests::state_dir;
+
+    mod device_sign_in;
+    mod pins;
 
     /// Auth over a store in a state directory of its own, which goes
     /// with it.

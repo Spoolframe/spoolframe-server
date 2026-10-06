@@ -163,6 +163,10 @@ fn every_request_round_trips() {
             signed: signed(),
             remember: false,
         },
+        Request::FinishPasskeySignIn {
+            signed: unhandled(),
+            remember: false,
+        },
         Request::BeginPasskeyRegistration,
         Request::FinishPasskeyRegistration(made()),
         Request::ListPasskeys,
@@ -176,6 +180,7 @@ fn every_request_round_trips() {
         }),
         Request::BeginConfirmPasskey,
         Request::FinishConfirmPasskey(signed()),
+        Request::FinishConfirmPasskey(unhandled()),
         Request::ApproveDeviceSignIn {
             code: "BCDFGHJK".into(),
             remember: true,
@@ -804,8 +809,116 @@ fn signed() -> FinishPasskeySignIn {
         authenticator_data: vec![0x49; 37],
         client_data_json: b"{}".to_vec(),
         signature: vec![0x30; 70],
-        user_handle: vec![9; 16],
+        user_handle: Some(vec![9; 16]),
     }
+}
+
+/// [`signed`] by an authenticator that gave no user handle.
+fn unhandled() -> FinishPasskeySignIn {
+    FinishPasskeySignIn {
+        user_handle: None,
+        ..signed()
+    }
+}
+
+/// The `user_handle` of `signed`, as its CBOR map has it.
+fn cbor_user_handle(signed: &FinishPasskeySignIn) -> Option<ciborium::Value> {
+    let bytes = codec::encode(signed).unwrap();
+    let value: ciborium::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+    value
+        .into_map()
+        .unwrap()
+        .into_iter()
+        .find(|(key, _)| key.as_text() == Some("user_handle"))
+        .map(|(_, value)| value)
+}
+
+/// `FinishPasskeySignIn` as revision 4 sent it before `user_handle` was
+/// an `Option`: always bytes, empty for none.
+#[derive(Serialize)]
+struct BytesHandleSignIn {
+    #[serde(with = "serde_bytes")]
+    credential_id: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    authenticator_data: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    client_data_json: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    signature: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    user_handle: Vec<u8>,
+}
+
+impl BytesHandleSignIn {
+    fn of(signed: FinishPasskeySignIn, user_handle: Vec<u8>) -> Self {
+        Self {
+            credential_id: signed.credential_id,
+            authenticator_data: signed.authenticator_data,
+            client_data_json: signed.client_data_json,
+            signature: signed.signature,
+            user_handle,
+        }
+    }
+}
+
+/// A handle goes as a CBOR byte string, as it did when it was not an
+/// `Option`.
+#[test]
+fn a_user_handle_is_a_cbor_byte_string() {
+    assert_eq!(
+        cbor_user_handle(&signed()),
+        Some(ciborium::Value::Bytes(vec![9; 16]))
+    );
+    assert_eq!(
+        codec::encode(&signed()).unwrap(),
+        codec::encode(&BytesHandleSignIn::of(signed(), vec![9; 16])).unwrap()
+    );
+}
+
+/// No handle is sent as an explicit null, never left out.
+#[test]
+fn no_user_handle_is_an_explicit_null() {
+    assert_eq!(cbor_user_handle(&unhandled()), Some(ciborium::Value::Null));
+}
+
+/// A message without the field is not one with no handle: the field is
+/// required, as every other field of it.
+#[test]
+fn a_sign_in_that_leaves_the_user_handle_out_does_not_decode() {
+    #[derive(Serialize)]
+    struct NoHandleField {
+        #[serde(with = "serde_bytes")]
+        credential_id: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        authenticator_data: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        client_data_json: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
+    }
+    let signed = signed();
+    let bytes = codec::encode(&NoHandleField {
+        credential_id: signed.credential_id,
+        authenticator_data: signed.authenticator_data,
+        client_data_json: signed.client_data_json,
+        signature: signed.signature,
+    })
+    .unwrap();
+    assert!(codec::decode::<FinishPasskeySignIn>(&bytes).is_err());
+}
+
+/// An older client's empty handle is `Some` of nothing, for the server
+/// to refuse, not `None`: an older client's bytes still decode.
+#[test]
+fn an_older_client_s_empty_user_handle_decodes_as_some_empty() {
+    let bytes = codec::encode(&BytesHandleSignIn::of(signed(), Vec::new())).unwrap();
+    assert_eq!(
+        codec::decode::<FinishPasskeySignIn>(&bytes).unwrap(),
+        FinishPasskeySignIn {
+            user_handle: Some(Vec::new()),
+            ..signed()
+        }
+    );
 }
 
 /// Passkey bytes go as CBOR byte strings, lists of them too: an app's

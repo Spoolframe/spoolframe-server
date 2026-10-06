@@ -188,9 +188,12 @@ async fn an_idle_playback_s_encode_ends_with_it() {
         !ffmpeg_for(&handle).is_empty()
     })
     .await;
+    // Idle past the limit, as the server's own sweep finds it.
+    server.clock.advance(PLAYBACK_IDLE);
+    server.debug.playbacks.sweep();
     until(
         "the idle playback's ffmpeg is gone",
-        PLAYBACK_IDLE * 4,
+        Duration::from_secs(10),
         || ffmpeg_for(&handle).is_empty(),
     )
     .await;

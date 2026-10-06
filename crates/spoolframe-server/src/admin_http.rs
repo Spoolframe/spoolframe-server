@@ -929,12 +929,26 @@ async fn logout(State(api): State<AdminApi>, req: Request) -> Response<Body> {
 }
 
 /// Who the cookie signs in, read now (role included): the web UI asks
-/// before opening the socket, whose refusal a browser cannot read.
+/// before opening the socket, whose refusal a browser cannot read. No one
+/// is 401, unless the caller asks with `?or=null` (the web UI does): then
+/// `null`, as being signed out is an answer the page expects, and a 401
+/// is logged in the browser's console as a failed request.
 async fn me(State(api): State<AdminApi>, req: Request) -> Response<Body> {
+    let or_null = asks_for_null(req.uri().query());
     match MeApiServer::who_am_i(&api, &as_caller(&req)).await {
         Ok(user) => axum::Json(user).into_response(),
+        Err(e) if or_null && e.code() == error_code::UNAUTHENTICATED => {
+            axum::Json(serde_json::Value::Null).into_response()
+        }
         Err(e) => failure(e),
     }
+}
+
+/// Whether a `/auth/me` query asks for `null` instead of 401: `or=null`.
+fn asks_for_null(query: Option<&str>) -> bool {
+    query.is_some_and(|q| {
+        url::form_urlencoded::parse(q.as_bytes()).any(|(key, value)| key == "or" && value == "null")
+    })
 }
 
 /// Which artwork a catalog page shows (`id`), and at what size (`size`,
@@ -1047,6 +1061,14 @@ async fn metrics_page(State(api): State<AdminApi>, req: Request) -> Response<Bod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn who_is_signed_in_answers_null_for_no_one_only_when_asked() {
+        assert_eq!(
+            [None, Some("or=null"), Some("x=1&or=null"), Some("or=401")].map(asks_for_null),
+            [false, true, true, false]
+        );
+    }
 
     fn headers(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();

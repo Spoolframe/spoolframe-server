@@ -170,9 +170,9 @@ pub fn Libraries() -> Element {
                                 span {}
                                 span {}
                                 span { "Library" }
-                                span { class: "lib-items", "Items" }
-                                span { class: "lib-paths", "Paths" }
-                                span { class: "lib-sync", "Watch sync" }
+                                span { "Items" }
+                                span { "Paths" }
+                                span { "Watch sync" }
                                 span {}
                             }
                             for (i, library) in o.libraries.iter().cloned().enumerate() {
@@ -259,7 +259,7 @@ pub fn Libraries() -> Element {
                         }
                         if !o.chosen {
                             span { class: "hint",
-                                "Every library of the first Plex server is served, under Plex's names. The first change here chooses them all, then makes itself."
+                                "For now, every library of the first Plex server is served, under Plex's names. Your first change here keeps them all as your list of libraries, then makes the change."
                             }
                         }
                         div { class: "sync-grid",
@@ -1372,16 +1372,20 @@ pub fn AddLibrary(back: String) -> Element {
                                     if needs_token {
                                         span { "This Plex server needs a token the server does not have for it." }
                                     }
-                                    label { class: "field",
-                                        "Plex token"
-                                        input {
-                                            r#type: "password",
-                                            autocomplete: "off",
-                                            value: "{pasted}",
-                                            oninput: {
-                                                let mut pasted = pasted;
-                                                move |e: FormEvent| pasted.set(e.value())
-                                            },
+                                    // In a form of its own, as browsers expect
+                                    // of a password field; Enter does nothing.
+                                    form { class: "contents", onsubmit: move |e: FormEvent| e.prevent_default(),
+                                        label { class: "field",
+                                            "Plex token"
+                                            input {
+                                                r#type: "password",
+                                                autocomplete: "off",
+                                                value: "{pasted}",
+                                                oninput: {
+                                                    let mut pasted = pasted;
+                                                    move |e: FormEvent| pasted.set(e.value())
+                                                },
+                                            }
                                         }
                                     }
                                     span { "From Plex Web: any item › Get Info › View XML; the token is in the address." }

@@ -256,13 +256,18 @@ pub async fn logout() -> Result<(), ApiError> {
 /// Who the cookie signs in; `Ok(None)` when no one. Asked before the socket
 /// is opened: a refused WebSocket tells a browser nothing it can read.
 pub async fn me() -> Result<Option<UserInfo>, ApiError> {
-    let response = Request::get("/auth/me").send().await.map_err(unreachable)?;
+    // `or=null`: no one signed in is `null`, not a 401 the browser would
+    // log as a failed request on every signed-out page.
+    let response = Request::get("/auth/me?or=null")
+        .send()
+        .await
+        .map_err(unreachable)?;
     match response.status() {
         200 => response
             .json()
             .await
-            .map(Some)
             .map_err(|e| ApiError::transport(e.to_string())),
+        // A server from before `or=null`.
         401 => Ok(None),
         _ => Err(error_of(response).await),
     }

@@ -396,6 +396,11 @@ pub struct DeviceSignIn {
     /// device will be remembered", ticked, and the approver may untick it
     /// (`deviceSignInApprove`'s `remember`).
     pub remember: bool,
+    /// This server's key fingerprint, as the device shows it beside the
+    /// code: the approval page shows it too, to be matched before saying
+    /// yes. Always known: a code is pending only once a device reached the
+    /// server's endpoint.
+    pub server_fingerprint: String,
 }
 
 /// What the server is and can do, for an admin.

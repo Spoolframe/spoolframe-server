@@ -444,14 +444,18 @@ fn TelemetryFields(
                                         value: "{row.name}",
                                         oninput: move |e| headers.with_mut(|h| if let Headers::Replace(rows) = h { rows[i].name = e.value() }),
                                     }
-                                    input {
-                                        class: "tele-input",
-                                        r#type: "password",
-                                        autocomplete: "off",
-                                        aria_label: "Header value",
-                                        placeholder: "Value",
-                                        value: "{row.value}",
-                                        oninput: move |e| headers.with_mut(|h| if let Headers::Replace(rows) = h { rows[i].value = e.value() }),
+                                    // In a form of its own, as browsers expect of
+                                    // a password field; `contents` keeps the row.
+                                    form { class: "contents", onsubmit: move |e: FormEvent| e.prevent_default(),
+                                        input {
+                                            class: "tele-input",
+                                            r#type: "password",
+                                            autocomplete: "off",
+                                            aria_label: "Header value",
+                                            placeholder: "Value",
+                                            value: "{row.value}",
+                                            oninput: move |e| headers.with_mut(|h| if let Headers::Replace(rows) = h { rows[i].value = e.value() }),
+                                        }
                                     }
                                     button {
                                         class: "text-ctp-subtext0",

@@ -387,9 +387,100 @@ pub fn display_name(typed: &str) -> Result<Option<String>, String> {
     Ok(Some(name.to_owned()))
 }
 
+/// The Done card's Playback line (WebWizardDone): how encoders are
+/// chosen, naming the one Automatic picks ("Automatic (VA-API)"), and how
+/// many encodes run at once. `video_encoders`: what the server found,
+/// `None` until it answers.
+pub fn playback_summary(
+    hardware: &Hardware,
+    video_encoders: Option<&[String]>,
+    max_jobs: u64,
+) -> String {
+    let how = match hardware {
+        // Automatic takes the first family that works: the hardware ones
+        // come first, software last.
+        Hardware::Auto => match video_encoders.map(families) {
+            Some(found) => match found.first() {
+                Some(f) if f.name != "Software" => format!("Automatic ({})", f.name),
+                _ => "Automatic (software)".to_owned(),
+            },
+            None => "Automatic".to_owned(),
+        },
+        Hardware::Software => "Software only".to_owned(),
+        Hardware::Ordered(list) => format!("In this order: {list}"),
+    };
+    let jobs = if max_jobs == 1 {
+        "1 encode".to_owned()
+    } else {
+        format!("{max_jobs} encodes")
+    };
+    format!("{how} · {jobs} at once")
+}
+
+/// The Done card's one warning beside Paths: the library with missing
+/// files, or how many have some. `None` when every file was found.
+pub fn missing_summary(missing: &[String]) -> Option<String> {
+    match missing {
+        [] => None,
+        [one] => Some(one.clone()),
+        many => Some(format!("{} libraries have missing files", many.len())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_names_the_hardware_it_picks() {
+        let found = ["h264_vaapi".to_owned(), "libx264".to_owned()];
+        assert_eq!(
+            playback_summary(&Hardware::Auto, Some(&found), 2),
+            "Automatic (VA-API) · 2 encodes at once"
+        );
+    }
+
+    #[test]
+    fn automatic_without_hardware_says_software() {
+        let found = ["libx264".to_owned()];
+        assert_eq!(
+            playback_summary(&Hardware::Auto, Some(&found), 1),
+            "Automatic (software) · 1 encode at once"
+        );
+    }
+
+    #[test]
+    fn automatic_before_the_server_answers_names_nothing() {
+        assert_eq!(
+            playback_summary(&Hardware::Auto, None, 2),
+            "Automatic · 2 encodes at once"
+        );
+    }
+
+    #[test]
+    fn one_library_missing_files_is_named() {
+        assert_eq!(
+            missing_summary(&["Music: 2 of 5 missing".to_owned()]).as_deref(),
+            Some("Music: 2 of 5 missing")
+        );
+    }
+
+    #[test]
+    fn several_libraries_missing_files_are_one_warning() {
+        assert_eq!(
+            missing_summary(&[
+                "Music: 2 of 5 missing".to_owned(),
+                "Kids: 1 of 9 missing".to_owned()
+            ])
+            .as_deref(),
+            Some("2 libraries have missing files")
+        );
+    }
+
+    #[test]
+    fn nothing_missing_warns_of_nothing() {
+        assert_eq!(missing_summary(&[]), None);
+    }
 
     fn rule(library: Option<&str>, from: &str, to: &str) -> PathMappingEntry {
         PathMappingEntry {

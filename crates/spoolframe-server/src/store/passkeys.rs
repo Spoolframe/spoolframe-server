@@ -5,7 +5,7 @@
 use spoolframe_protocol::APP_RP_ID;
 
 use super::users::{LocalUserId, UserError, add_first_user};
-use super::{Store, StoreError, now};
+use super::{Store, StoreError};
 
 /// One passkey.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -126,7 +126,7 @@ impl Store {
         rp_id: &str,
     ) -> Result<PasskeyRecord, PasskeyError> {
         let name = passkey_name(name)?;
-        let created_at = now();
+        let created_at = self.now();
         let inserted = sqlx::query(
             "INSERT INTO passkeys (credential_id, user_id, name, credential, rp_id, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -186,7 +186,7 @@ impl Store {
         username: &str,
         passkey: FirstPasskey<'_>,
     ) -> Result<LocalUserId, UserError> {
-        let now = now();
+        let now = self.now();
         let mut tx = self.pool.begin().await?;
         let id = add_first_user(&mut tx, username, now).await?;
         sqlx::query("INSERT INTO passkey_users (user_id, handle) VALUES (?1, ?2)")
@@ -278,7 +278,7 @@ impl Store {
         )
         .bind(credential_id)
         .bind(credential)
-        .bind(now())
+        .bind(self.now())
         .execute(&self.pool)
         .await?;
         Ok(())

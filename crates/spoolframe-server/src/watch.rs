@@ -13,7 +13,7 @@ use spoolframe_types::{Item, MediaId, MediaKind};
 
 use crate::principal::Principal;
 use crate::store::watch::WatchUpdate;
-use crate::store::{Store, StoreError, now};
+use crate::store::{Store, StoreError};
 pub use spoolframe_policy::watch::WatchRules;
 use spoolframe_policy::watch::credits_to_end;
 
@@ -109,6 +109,17 @@ impl Watch {
         }
     }
 
+    /// Now, by its store's clock: what the throttle and the caches are
+    /// timed by (PX-09).
+    fn now(&self) -> Instant {
+        self.store.clock().now()
+    }
+
+    /// How long ago `at` was, by the same clock.
+    fn since(&self, at: Instant) -> Duration {
+        self.now().saturating_duration_since(at)
+    }
+
     /// The rules now.
     pub fn rules(&self) -> WatchRules {
         *self.rules.read().expect("never held across a panic")
@@ -143,7 +154,7 @@ impl Watch {
             .expect("never held across a panic")
             .get(&key)
             .copied()
-            .filter(|written| written.at.elapsed() < self.rules().throttle);
+            .filter(|written| self.since(written.at) < self.rules().throttle);
         if let Some(written) = recent {
             // Within the throttle only a crossing into watched is written,
             // judged on what the last write knew (the row's duration and
@@ -179,7 +190,7 @@ impl Watch {
             .insert(
                 key,
                 Written {
-                    at: Instant::now(),
+                    at: self.now(),
                     credits,
                 },
             );
@@ -380,7 +391,7 @@ impl Watch {
             return false;
         };
         let pair = (key.to_owned(), media_id.to_owned());
-        let fresh = |at: &Instant| at.elapsed() < SAME_ITEM_CACHE;
+        let fresh = |at: &Instant| self.since(*at) < SAME_ITEM_CACHE;
         if self
             .copies
             .lock()
@@ -394,7 +405,7 @@ impl Watch {
             Ok(there) if there.iter().any(|id| external_ids.contains(id)) => {
                 let mut copies = self.copies.lock().expect("never held across a panic");
                 copies.retain(|_, at| fresh(at));
-                copies.insert(pair, Instant::now());
+                copies.insert(pair, self.now());
                 false
             }
             Ok(_) | Err(CatalogError::NotFound(_) | CatalogError::ForeignId(_)) => true,
@@ -506,11 +517,11 @@ impl Watch {
             .lock()
             .expect("never held across a panic")
             .get(&principal)
-            && at.elapsed() < self.rules().next_up_cache
+            && self.since(*at) < self.rules().next_up_cache
         {
             return Ok(items.clone());
         }
-        let since = now() - self.rules().next_up_window.as_secs() as i64;
+        let since = self.store.now() - self.rules().next_up_window.as_secs() as i64;
         let mut next = Vec::new();
         for show in self
             .store
@@ -532,7 +543,7 @@ impl Watch {
         self.next_up
             .lock()
             .expect("never held across a panic")
-            .insert(principal, (Instant::now(), next.clone()));
+            .insert(principal, (self.now(), next.clone()));
         Ok(next)
     }
 
@@ -596,85 +607,4 @@ impl Watch {
 }
 
 #[cfg(test)]
-use spoolframe_types::{Marker, MarkerKind};
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn without_credits_an_item_is_watched_at_ninety_five_percent() {
-        let rules = WatchRules::default();
-        // 95% of 2 h is 114 min.
-        let movie = Some(Duration::from_secs(7200));
-        assert!(!rules.is_watched(Duration::from_secs(6839), movie, None));
-        assert!(rules.is_watched(Duration::from_secs(6840), movie, None));
-    }
-
-    #[test]
-    fn time_left_does_not_make_an_item_watched() {
-        let rules = WatchRules::default();
-        // 44 min, with 4 minutes left: 91%.
-        let episode = Some(Duration::from_secs(2640));
-        assert!(!rules.is_watched(Duration::from_secs(2400), episode, None));
-        // A 4-minute clip always has less than 5 minutes left.
-        let clip = Some(Duration::from_secs(240));
-        assert!(!rules.is_watched(Duration::from_secs(10), clip, None));
-        assert!(!rules.is_watched(Duration::from_secs(227), clip, None));
-        assert!(rules.is_watched(Duration::from_secs(228), clip, None));
-    }
-
-    #[test]
-    fn without_a_duration_nothing_is_watched_by_progress() {
-        assert!(!WatchRules::default().is_watched(Duration::from_secs(99_999), None, None));
-    }
-
-    #[test]
-    fn with_credits_that_run_to_the_end_watched_is_at_their_start_exactly() {
-        let rules = WatchRules::default();
-        let episode = Some(Duration::from_secs(2640));
-        // Short credits, from 98%: 95% (41:48) is not the point.
-        let credits = Some(Duration::from_secs(2590));
-        assert!(!rules.is_watched(Duration::from_secs(2589), episode, credits));
-        assert!(rules.is_watched(Duration::from_secs(2590), episode, credits));
-        // Long credits: before 95%.
-        let long = Some(Duration::from_secs(1800));
-        assert!(rules.is_watched(Duration::from_secs(1800), episode, long));
-    }
-
-    #[test]
-    fn credits_that_run_to_the_end_need_no_duration() {
-        let rules = WatchRules::default();
-        let credits = Some(Duration::from_secs(2400));
-        assert!(rules.is_watched(Duration::from_secs(2400), None, credits));
-        assert!(!rules.is_watched(Duration::from_secs(2399), None, credits));
-    }
-
-    fn marker(kind: MarkerKind, start_ms: u64, to_end: bool) -> Marker {
-        Marker {
-            kind,
-            start_ms,
-            end_ms: start_ms + 60_000,
-            to_end,
-        }
-    }
-
-    #[test]
-    fn only_credits_that_run_to_the_end_give_the_watched_point() {
-        // An intro, and credits with a scene after them, do not.
-        assert_eq!(
-            credits_to_end(&[
-                marker(MarkerKind::Intro, 30_000, false),
-                marker(MarkerKind::Credits, 2_000_000, false),
-            ]),
-            None
-        );
-        assert_eq!(
-            credits_to_end(&[
-                marker(MarkerKind::Credits, 2_000_000, false),
-                marker(MarkerKind::Credits, 2_400_000, true),
-            ]),
-            Some(Duration::from_secs(2400))
-        );
-    }
-}
+mod tests;

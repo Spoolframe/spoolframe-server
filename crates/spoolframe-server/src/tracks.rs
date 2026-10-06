@@ -1,6 +1,22 @@
 //! Shared track policy; the server supplies persistence and probed tracks.
 pub use spoolframe_policy::tracks::*;
 
+use spoolframe_catalog::{Catalog, CatalogError};
+use spoolframe_types::{Item, MediaId, MediaKind};
+
+/// What a track override for `id` applies to: its show for an episode,
+/// so a pick carries to the rest of the series; else `id` itself.
+pub async fn override_scope(catalog: &dyn Catalog, id: &MediaId) -> Result<String, CatalogError> {
+    if id.kind() != MediaKind::Episode {
+        return Ok(id.to_string());
+    }
+    let found = catalog.item(id).await?;
+    Ok(match found.item {
+        Item::Episode(e) => e.show_id.to_string(),
+        _ => id.to_string(),
+    })
+}
+
 #[cfg(test)]
 use spoolframe_protocol::{Selection, TrackReason};
 #[cfg(test)]
@@ -16,6 +32,16 @@ mod tests {
     use spoolframe_types::{AudioPreferences, SubtitlePreferences};
 
     use super::*;
+    use std::path::PathBuf;
+
+    use spoolframe_types::{Container, VideoCodec, VideoTrack};
+
+    use crate::principal::Principal;
+    use crate::store::tests::test_store;
+    use crate::store::users::LocalUserId;
+    use crate::test_support::{FakeCatalog, episode};
+
+    const ALICE: Principal = Principal::LocalUser(LocalUserId::from_uuid(uuid::Uuid::from_u128(1)));
 
     /// Brooklyn Nine-Nine S07E01's tracks, from the recorded probe.
     fn b99() -> MediaTracks {
@@ -246,5 +272,90 @@ mod tests {
         assert_eq!(pick(SdhPreference::Prefer), Some(1));
         assert_eq!(pick(SdhPreference::Accept), Some(0));
         assert_eq!(pick(SdhPreference::Avoid), Some(0));
+    }
+
+    /// The B99 file's container and picture, as a client's track list
+    /// says them.
+    #[test]
+    fn the_tracks_say_what_the_file_and_its_picture_are() {
+        let tracks = b99();
+        assert_eq!(tracks.container, Some(Container::Matroska));
+        assert_eq!(
+            tracks.video,
+            Some(VideoTrack {
+                codec: VideoCodec::H264,
+                width: 1920,
+                height: 1080,
+                bit_depth: 8,
+                hdr: None,
+            })
+        );
+    }
+
+    /// A user who never set preferences has the defaults: the main audio,
+    /// not the description, and no subtitle (forced only, and B99 has no
+    /// English forced one).
+    #[tokio::test]
+    async fn a_new_user_gets_the_main_audio_and_no_description() {
+        let store = test_store("tracks-defaults").await;
+        let preferences = store.track_preferences(ALICE).await.unwrap();
+        let chosen = choose(&b99(), &preferences, None);
+        assert_eq!(chosen.selection.audio, Some(2));
+        assert_eq!(chosen.audio, TrackReason::FileDefault);
+        assert_eq!(chosen.selection.subtitle, None);
+        assert_eq!(chosen.subtitle, TrackReason::NoneMatched);
+    }
+
+    /// A pick on episode 12 is kept for its show, so episode 13 (the same
+    /// tracks) is chosen by it, until it is cleared from either episode.
+    #[tokio::test]
+    async fn a_pick_on_one_episode_carries_to_the_next_until_cleared() {
+        let store = test_store("tracks-override").await;
+        let catalog = FakeCatalog::new(PathBuf::from("/nonexistent/movie.mkv"));
+        let (e12, e13) = (episode("12", "11", 1, 1), episode("13", "11", 1, 2));
+        let (e12, e13) = (e12.id(), e13.id());
+        let always = english(SubtitleMode::Always, SdhPreference::Accept);
+        store.set_track_preferences(ALICE, &always).await.unwrap();
+        // On episode 12 the viewer turns subtitles off.
+        let picked = Selection {
+            audio: Some(2),
+            subtitle: None,
+        };
+        let scope = override_scope(&catalog, e12).await.unwrap();
+        let remembered = TrackOverride::from_selection(&b99(), picked);
+        store
+            .set_track_override(ALICE, &scope, &remembered)
+            .await
+            .unwrap();
+
+        let chosen_for = async |id| {
+            let scope = override_scope(&catalog, id).await.unwrap();
+            let preferences = store.track_preferences(ALICE).await.unwrap();
+            let remembered = store.track_override(ALICE, &scope).await.unwrap();
+            choose(&b99(), &preferences, remembered.as_ref())
+        };
+        let next = chosen_for(e13).await;
+        assert_eq!(next.selection.subtitle, None);
+        assert_eq!(next.subtitle, TrackReason::Override);
+        assert_eq!(next.audio, TrackReason::Override);
+
+        let scope = override_scope(&catalog, e13).await.unwrap();
+        store.clear_track_override(ALICE, &scope).await.unwrap();
+        assert_eq!(chosen_for(e13).await.subtitle, TrackReason::Preferences);
+    }
+
+    #[tokio::test]
+    async fn an_override_of_anything_but_an_episode_is_its_own() {
+        let catalog = FakeCatalog::new(PathBuf::from("/nonexistent/movie.mkv"));
+        let movie = crate::test_support::movie();
+        assert_eq!(
+            override_scope(&catalog, movie.id()).await.unwrap(),
+            movie.id().to_string()
+        );
+        let e15 = episode("15", "14", 2, 1);
+        assert_eq!(
+            override_scope(&catalog, e15.id()).await.unwrap(),
+            "plex:show:10"
+        );
     }
 }

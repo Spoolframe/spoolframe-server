@@ -22,7 +22,7 @@ use crate::preferences::{
     subtitle_choices,
 };
 use crate::sso::Tone;
-use crate::trust::{self, Change, Question, Row, Switch, Whose};
+use crate::trust::{self, Change, Icon, Question, Row, Switch, Whose};
 
 #[component]
 pub fn Profile() -> Element {
@@ -60,7 +60,7 @@ pub fn Profile() -> Element {
         };
     }
     // A consumer's one page (WebProfile, WebProfilePhone): one column.
-    let avatar = avatar_class(&user.username, false);
+    let avatar = avatar_class(&user);
     let initial = shown()
         .chars()
         .next()
@@ -1127,7 +1127,6 @@ fn DevicesAndSessions(has_pin: Signal<bool>) -> Element {
         device_rows()
     });
     let toast = use_signal(|| None::<Said>);
-    let mut asking = use_signal(|| false);
     // The change whose question is open.
     let mut pending = use_signal(|| None::<Pending>);
     // "Confirm it's you", and the change it then makes again.
@@ -1160,7 +1159,7 @@ fn DevicesAndSessions(has_pin: Signal<bool>) -> Element {
                     true,
                     trust::done(change.change, &change.name, &Whose::Mine),
                 ),
-                Err(e) if asks_to_confirm(&e, confirming, trust::about(change.change)) => {
+                Err(e) if asks_to_confirm(&e, confirming, &trust::about(&Whose::Mine)) => {
                     again.set(Some(change));
                 }
                 Err(e) => say(toast, false, e.explain()),
@@ -1203,30 +1202,7 @@ fn DevicesAndSessions(has_pin: Signal<bool>) -> Element {
             list.restart();
         });
     };
-    let everywhere_else = move |_| {
-        asking.set(false);
-        spawn(async move {
-            let done = async {
-                let client = rpc::client().await?;
-                client.revoke_other_sessions().await.map_err(rpc::error)
-            };
-            match done.await {
-                Ok(n) => say(
-                    toast,
-                    true,
-                    match n {
-                        0 => "Nothing else was signed in.".into(),
-                        1 => "Signed out of 1 other session.".into(),
-                        n => format!("Signed out of {n} other sessions."),
-                    },
-                ),
-                Err(e) => say(toast, false, e.explain()),
-            }
-            list.restart();
-        });
-    };
     let current = list.read().clone();
-    let others = matches!(&current, Some(Ok(rows)) if rows.iter().any(|r| r.sessions.iter().any(|s| !s.current)));
     rsx! {
         section { class: "card",
             div { class: "card-head",
@@ -1243,7 +1219,7 @@ fn DevicesAndSessions(has_pin: Signal<bool>) -> Element {
                     Some(Ok(rows)) => rsx! {
                         div { class: "device-list",
                           div { class: "device-rows",
-                            div { class: "device-row device-head", "aria-hidden": "true",
+                            div { class: "device-head", "aria-hidden": "true",
                                 span { "Device" }
                                 span { class: "device-switches",
                                     span { "PIN" }
@@ -1265,24 +1241,10 @@ fn DevicesAndSessions(has_pin: Signal<bool>) -> Element {
                         }
                     },
                 }
-                if asking() {
-                    div { class: "flex flex-col gap-2",
-                        p { class: "m-0 text-[13px] text-ctp-subtext1",
-                            "Every other browser and device is signed out, and has to sign in again. This one stays signed in."
-                        }
-                        div { class: "flex justify-end gap-2",
-                            button { class: "btn", onclick: move |_| asking.set(false), "Keep them" }
-                            button { class: "btn btn-danger", onclick: everywhere_else, icons::LogOut {} "Sign out everywhere else" }
-                        }
-                    }
-                } else {
-                    button {
-                        class: "btn btn-danger btn-wide",
-                        disabled: !others,
-                        onclick: move |_| asking.set(true),
-                        icons::LogOut {}
-                        "Sign out everywhere else"
-                    }
+                // WebProfile's footnote: what trust and auto-login mean,
+                // and when a change asks to confirm it's you.
+                p { class: "device-footnote",
+                    "A trusted device reopens your profile without a password, until you sign out there or it goes unused for 180 days. Auto-login opens your profile when the app starts, and turns its PIN off there. Changes here ask you to confirm it's you if you signed in over 10 minutes ago."
                 }
             }
         }
@@ -1322,8 +1284,16 @@ fn row_key(row: &Row) -> String {
     }
 }
 
+/// This browser's `User-Agent`, which names its own session's row.
+pub(super) fn user_agent() -> Option<String> {
+    web_sys::window().and_then(|w| w.navigator().user_agent().ok())
+}
+
 /// One row of "Devices and sessions": a device with its three switches,
-/// or a browser's session with "—" for each.
+/// or a browser's session, which has none. Wide, the switches sit under
+/// the card's columns and a browser shows "—" in each; narrow (a phone),
+/// each row is a card with "This device" or Sign out at its top right,
+/// the switches labelled under them, and a browser says why it has none.
 #[component]
 fn DeviceRow(
     row: Row,
@@ -1339,12 +1309,16 @@ fn DeviceRow(
                 .or_else(|| row.sessions.iter().find_map(|s| s.device_name.clone()))
                 .unwrap_or_else(|| "A device with no name".into());
             let kind = client_kind(Some(&device.endpoint_id), device.platform);
-            let when = match row.sessions.iter().map(|s| s.last_used_at).max() {
-                Some(used) => format!("{kind} · {}", ago(now(), used)),
-                None => format!(
-                    "{kind} · not signed in · last seen {}",
-                    ago(now(), device.last_seen_at)
-                ),
+            let when = if row.current() {
+                format!("{kind} · active now")
+            } else {
+                match row.sessions.iter().map(|s| s.last_used_at).max() {
+                    Some(used) => format!("{kind} · {}", ago(now(), used)),
+                    None => format!(
+                        "{kind} · not signed in · last seen {}",
+                        ago(now(), device.last_seen_at)
+                    ),
+                }
             };
             (name, when)
         }
@@ -1357,25 +1331,19 @@ fn DeviceRow(
     let trusted = row.device.as_ref().is_some_and(|d| d.trusted);
     rsx! {
         div { class: "device-row",
-            span { class: "row-what",
-                span { class: "flex flex-wrap items-center gap-2",
-                    b { class: "break-words", "{name}" }
-                    if trusted {
-                        span { class: "pill pill-trusted", "Trusted" }
-                    }
-                }
+            span { class: "row-what device-what",
+                b { class: "break-words", "{name}" }
                 span { class: "row-sub", "{line}" }
             }
-            span { class: "device-switches",
-                match &row.device {
-                    Some(device) => rsx! {
+            match &row.device {
+                Some(device) => rsx! {
+                    span { class: "device-switches",
                         for (switch, what, on) in [
                             (Switch::Pin, "PIN", device.pin_required),
                             (Switch::Trusted, "Trusted", device.trusted),
                             (Switch::AutoLogin, "Auto-login", device.auto_login),
                         ] {
-                            label { class: "device-switch", key: "{what}",
-                                span { class: "device-switch-label", "{what}" }
+                            span { class: "device-switch", key: "{what}",
                                 button {
                                     class: "switch",
                                     r#type: "button",
@@ -1390,18 +1358,19 @@ fn DeviceRow(
                                         move |_| on_press.call((switch, device.clone(), name.clone()))
                                     },
                                 }
+                                span { class: "device-switch-label", aria_hidden: "true", "{what}" }
                             }
                         }
-                    },
-                    None => rsx! {
+                    }
+                },
+                None => rsx! {
+                    span { class: "device-switches device-none", aria_hidden: "true",
                         for what in ["PIN", "Trusted", "Auto-login"] {
-                            span { class: "device-switch", key: "{what}",
-                                span { class: "device-switch-label", "{what}" }
-                                span { class: "text-ctp-overlay1", title: "A browser is not a device that can be trusted.", "—" }
-                            }
+                            span { class: "device-switch", key: "{what}", "—" }
                         }
-                    },
-                }
+                    }
+                    span { class: "device-note", "A browser can't be trusted or open by itself." }
+                },
             }
             span { class: "device-do",
                 if current {
@@ -1446,11 +1415,13 @@ pub(super) fn TrustDialog(
     rsx! {
         div { class: "scrim",
             section { class: "dialog w-[440px]", role: "dialog",
-                div { class: if question.danger { "dialog-head dialog-head-danger" } else { "dialog-head" },
-                    if question.danger {
-                        icons::ShieldOff { size: 22 }
-                    } else {
-                        icons::ShieldCheck { size: 22 }
+                // Taking trust away is a yellow shield on the board, not red:
+                // nothing is lost that a sign-in cannot bring back.
+                div { class: if question.danger { "dialog-head dialog-head-warn" } else { "dialog-head" },
+                    match question.icon {
+                        Icon::Start => rsx! { icons::Play { size: 22 } },
+                        Icon::Pin => rsx! { icons::Lock { size: 22 } },
+                        Icon::Untrust => rsx! { icons::ShieldAlert { size: 22 } },
                     }
                     h1 { "{question.title}" }
                 }
@@ -1468,18 +1439,21 @@ pub(super) fn TrustDialog(
     }
 }
 
-/// A session as the card names it: its device, or a browser or the CLI.
+/// A session as every page names it (logic::session_name): its device,
+/// this browser by its own name, or a browser or the CLI.
 fn session_name(session: &SessionEntry) -> String {
-    match (&session.device_name, &session.endpoint_id) {
-        (Some(name), _) => name.clone(),
-        (None, Some(_)) => "A device with no name".into(),
-        (None, None) => "A browser or the CLI".into(),
-    }
+    crate::logic::session_name(
+        session.endpoint_id.as_deref(),
+        session.device_name.as_deref(),
+        session.platform,
+        session.current,
+        user_agent().as_deref(),
+    )
 }
 
-/// "Linux app · 2 hours ago".
+/// "Web browser · 3 days ago".
 fn session_line(session: &SessionEntry) -> String {
-    let kind = client_kind(session.endpoint_id.as_deref(), session.platform);
+    let kind = crate::logic::session_kind(session.endpoint_id.as_deref(), session.platform);
     let when = if session.current {
         "active now".into()
     } else {

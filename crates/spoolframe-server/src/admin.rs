@@ -251,6 +251,13 @@ impl StatusSource {
         let _ = self.told.set(told);
     }
 
+    /// The endpoint key's fingerprint (P1-21), once the endpoint is up.
+    fn fingerprint(&self) -> Option<String> {
+        self.endpoint_id
+            .get()
+            .and_then(|id| spoolframe_protocol::fingerprint::of_hex(id))
+    }
+
     fn status(&self) -> ServerStatus {
         let encoders = self.transcoding.encoders();
         ServerStatus {
@@ -258,10 +265,7 @@ impl StatusSource {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             revision: revision(BUILD_REVISION),
             endpoint_id: self.endpoint_id.get().cloned(),
-            fingerprint: self
-                .endpoint_id
-                .get()
-                .and_then(|id| spoolframe_protocol::fingerprint::of_hex(id)),
+            fingerprint: self.fingerprint(),
             transcoding: TranscodingStatus {
                 video_encoders: encoders.video.iter().map(|e| e.name.clone()).collect(),
                 audio_encoders: encoders.audio.iter().map(|e| e.name.clone()).collect(),
@@ -1579,16 +1583,25 @@ impl MeApiServer for AdminApi {
         code: String,
     ) -> RpcResult<DeviceSignIn> {
         let (user, code) = self.sign_in_code(ext, &code).await?;
-        match self.auth.sign_ins().lookup(&code) {
-            Some(waiting) => Ok(DeviceSignIn {
-                device_name: waiting.device_name,
-                client_name: waiting.client_name,
-                platform: waiting.platform,
-                requested_at: waiting.requested_at,
-                remember: waiting.remember,
-            }),
-            None => Err(self.wrong_sign_in_code(ext, user)?),
-        }
+        let Some(waiting) = self.auth.sign_ins().lookup(&code) else {
+            return Err(self.wrong_sign_in_code(ext, user)?);
+        };
+        // A code is pending only once a device reached the endpoint, so
+        // the endpoint's key is known; never an empty fingerprint to match.
+        let server_fingerprint = self.status.fingerprint().ok_or_else(|| {
+            error(
+                error_code::UNAVAILABLE,
+                "the server's endpoint is not up yet",
+            )
+        })?;
+        Ok(DeviceSignIn {
+            device_name: waiting.device_name,
+            client_name: waiting.client_name,
+            platform: waiting.platform,
+            requested_at: waiting.requested_at,
+            remember: waiting.remember,
+            server_fingerprint,
+        })
     }
 
     async fn device_sign_in_approve(

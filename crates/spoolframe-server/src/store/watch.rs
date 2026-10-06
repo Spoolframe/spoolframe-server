@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use sqlx::{QueryBuilder, Sqlite};
 
-use super::{Store, StoreError, now};
+use super::{Store, StoreError};
 use crate::principal::Principal;
 
 /// One item's state for one principal.
@@ -41,7 +41,7 @@ impl Store {
         principal: Principal,
         update: WatchUpdate<'_>,
     ) -> Result<(), StoreError> {
-        self.save_watch_at(principal, update, now()).await
+        self.save_watch_at(principal, update, self.now()).await
     }
 
     /// [`Store::save_watch`], as of `updated_at` (Unix seconds) rather than
@@ -113,7 +113,7 @@ impl Store {
         )
         .bind(&principal)
         .bind(media_id)
-        .bind(now())
+        .bind(self.now())
         .execute(&mut *tx)
         .await?;
         for id in external_ids {

@@ -34,7 +34,7 @@ use spoolframe_protocol::{
     MediaReadReply, PlaybackHandle, PlaybackPlan, SUBTITLE_CHUNK, Selection, SubtitleAction,
     TopResult,
 };
-use spoolframe_types::{ArtworkId, Item, MediaId, MediaKind, Namespace, SubtitleFormat};
+use spoolframe_types::{ArtworkId, MediaId, Namespace, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
 
@@ -593,7 +593,7 @@ impl ClientProtocol {
             }
             Request::FinishPasskeySignIn { signed, remember } => {
                 let hello = state.hello.get().expect("checked above");
-                match self.stranger_attempt(state) {
+                match self.stranger_attempt(state).and(user_handle_given(&signed)) {
                     Ok(()) => {
                         self.finish_passkey_sign_in(connection, &signed, hello, remember)
                             .await
@@ -1404,6 +1404,7 @@ impl ClientProtocol {
                 })
             }
             Request::FinishConfirmPasskey(signed) => {
+                user_handle_given(&signed)?;
                 let signer = self
                     .services
                     .app_passkeys
@@ -2601,19 +2602,9 @@ impl ClientProtocol {
     /// What a track override for `id` applies to: its show for an episode,
     /// so a pick carries to the rest of the series; else `id` itself.
     async fn override_scope(&self, id: &MediaId) -> Result<String, Error> {
-        if id.kind() != MediaKind::Episode {
-            return Ok(id.to_string());
-        }
-        let found = self
-            .services
-            .catalog
-            .item(id)
+        tracks::override_scope(self.services.catalog.as_ref(), id)
             .await
-            .map_err(catalog_error)?;
-        Ok(match found.item {
-            Item::Episode(e) => e.show_id.to_string(),
-            _ => id.to_string(),
-        })
+            .map_err(catalog_error)
     }
 
     /// Open the server→client events stream for `connection`.
@@ -2815,6 +2806,19 @@ fn sign_in_error(e: SignInError) -> Error {
         },
         SignInError::Unavailable(e) | SignInError::Internal(e) => internal(e),
     }
+}
+
+/// `InvalidInput` for a user handle of no bytes: no handle is `None`
+/// (P3-19), and the SDK sends it so. Refused before the ceremony, so it
+/// uses up no challenge and counts as no failed sign-in: it is a client's
+/// bug, not a guess.
+fn user_handle_given(signed: &FinishPasskeySignIn) -> Result<(), Error> {
+    if signed.user_handle.as_ref().is_some_and(Vec::is_empty) {
+        return Err(Error::InvalidInput {
+            message: "a passkey with no user handle sends none, not empty bytes".into(),
+        });
+    }
+    Ok(())
 }
 
 /// An app passkey that was not kept, for the client.

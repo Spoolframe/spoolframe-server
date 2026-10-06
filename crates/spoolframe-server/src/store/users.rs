@@ -10,7 +10,7 @@ use sqlx::error::BoxDynError;
 use sqlx::sqlite::{Sqlite, SqliteArgumentsBuffer, SqliteTypeInfo, SqliteValueRef};
 use uuid::Uuid;
 
-use super::{Store, StoreError, now};
+use super::{Store, StoreError};
 
 /// A local user's id. Every login method ends here (§24B).
 ///
@@ -180,7 +180,7 @@ impl Store {
     ) -> Result<LocalUserId, UserError> {
         let name = normalize_username(username)?;
         let display_name = display_name.map(str::trim).filter(|d| !d.is_empty());
-        let now = now();
+        let now = self.now();
         let id = LocalUserId::generate();
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
@@ -211,7 +211,7 @@ impl Store {
         username: &str,
         phc: &str,
     ) -> Result<LocalUserId, UserError> {
-        let now = now();
+        let now = self.now();
         let mut tx = self.pool.begin().await?;
         let id = add_first_user(&mut tx, username, now).await?;
         add_password(&mut tx, id, phc, now).await?;
@@ -230,7 +230,7 @@ impl Store {
         keep: Option<&str>,
     ) -> Result<u64, UserError> {
         let name = normalize_username(username)?;
-        let now = now();
+        let now = self.now();
         let mut tx = self.pool.begin().await?;
         let id = user_id(&mut tx, &name).await?;
         sqlx::query(
@@ -307,7 +307,7 @@ impl Store {
     /// sessions were revoked. The last enabled admin stays enabled.
     pub async fn disable_user(&self, username: &str) -> Result<u64, UserError> {
         let name = normalize_username(username)?;
-        let now = now();
+        let now = self.now();
         let mut tx = self.pool.begin().await?;
         let id = user_id(&mut tx, &name).await?;
         keep_an_admin(&mut tx, id, &name).await?;
@@ -370,7 +370,7 @@ impl Store {
              FROM users u LEFT JOIN password_credentials p ON p.user_id = u.id \
              ORDER BY u.username",
         )
-        .bind(now())
+        .bind(self.now())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()

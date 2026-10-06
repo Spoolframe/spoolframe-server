@@ -4,7 +4,7 @@
 use spoolframe_types::Platform;
 
 use super::users::LocalUserId;
-use super::{Store, StoreError, now};
+use super::{Store, StoreError};
 
 /// One of a user's devices: an endpoint they have signed in from.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -97,7 +97,7 @@ impl Store {
         )
         .bind(user)
         .bind(phc)
-        .bind(now())
+        .bind(self.now())
         .bind(i64::from(digits))
         .execute(&self.pool)
         .await?;
@@ -154,7 +154,7 @@ impl Store {
             )
             .bind(user)
             .bind(endpoint_id)
-            .bind(now())
+            .bind(self.now())
             .execute(&mut *tx)
             .await?;
             // A profile that opens by itself asks for no PIN (P4-01).
@@ -209,7 +209,7 @@ impl Store {
         )
         .bind(user)
         .bind(endpoint_id)
-        .bind(now())
+        .bind(self.now())
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -231,6 +231,7 @@ mod tests {
     use super::super::sessions::SessionBinding;
     use super::super::tests::test_store;
     use super::*;
+    use crate::store::now;
 
     async fn alice_on(store: &Store, endpoints: &[&str]) -> LocalUserId {
         let alice = store

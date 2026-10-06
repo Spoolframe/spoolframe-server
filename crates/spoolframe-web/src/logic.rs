@@ -11,7 +11,7 @@ pub enum Landing {
     /// A server with no users: register the first admin.
     Setup,
     Login,
-    /// An admin's pages, from the Server page (P3-02): what the server is
+    /// An admin's pages, from the Overview (P3-02): what the server is
     /// doing is what an admin opens the web UI for.
     Admin,
     /// Everyone else's: their own account.
@@ -25,7 +25,7 @@ impl Landing {
         match self {
             Landing::Setup => "/setup",
             Landing::Login => "/login",
-            Landing::Admin => "/admin/server",
+            Landing::Admin => "/admin",
             Landing::Profile => "/profile",
         }
     }
@@ -318,25 +318,86 @@ pub fn count(n: u64, unit: &str) -> String {
     }
 }
 
-/// The avatar's class: a colour of the user's own, the same on every page
-/// and every load, and grey while they are disabled.
-pub fn avatar_class(username: &str, disabled: bool) -> &'static str {
-    const TONES: [&str; 6] = [
-        "avatar avatar-teal",
-        "avatar avatar-mauve",
+/// The avatar's class (WebUsers, WebAdminPhone): an admin is teal; anyone
+/// else takes a tone by the letter the avatar shows, so the same letter is
+/// the same colour on every page and every load ("A" mauve, "S" peach, as
+/// the boards draw Alice and Steve). Grey while disabled.
+pub fn avatar_class(user: &UserInfo) -> &'static str {
+    // Teal is the admin's alone.
+    const TONES: [&str; 5] = [
         "avatar avatar-peach",
         "avatar avatar-blue",
+        "avatar avatar-mauve",
         "avatar avatar-pink",
         "avatar avatar-green",
     ];
-    if disabled {
+    if user.disabled {
         return "avatar avatar-off";
     }
-    // FNV-1a: stable across builds, unlike std's hasher.
-    let hash = username.bytes().fold(0x811c_9dc5_u32, |h, b| {
-        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
-    });
-    TONES[hash as usize % TONES.len()]
+    if user.role == Role::Admin {
+        return "avatar avatar-teal";
+    }
+    let shown = user.display_name.as_deref().unwrap_or(&user.username);
+    let letter = shown
+        .chars()
+        .next()
+        .map_or(0, |c| c.to_lowercase().next().map_or(0, u32::from));
+    TONES[letter as usize % TONES.len()]
+}
+
+/// The users as the list shows them (WebUsers): admins first, then
+/// everyone else, each in the server's order.
+pub fn users_in_order(mut users: Vec<UserInfo>) -> Vec<UserInfo> {
+    users.sort_by_key(|u| u.role != Role::Admin);
+    users
+}
+
+/// One of a user's devices as the users page's panel shows it, with who
+/// else has signed in on it (WebUsers' "also: Alice, Steve").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedDevice {
+    pub device: spoolframe_admin_api::DeviceEntry,
+    /// The other users on the same device key, by the names the page shows.
+    pub also: Vec<String>,
+}
+
+/// `whose` devices, most recently seen first, each with the other users
+/// in `everyone` (name, devices) who signed in on the same key.
+pub fn shared_devices(
+    whose: &str,
+    everyone: &[(String, Vec<spoolframe_admin_api::DeviceEntry>)],
+) -> Vec<SharedDevice> {
+    let Some((_, own)) = everyone.iter().find(|(name, _)| name == whose) else {
+        return Vec::new();
+    };
+    let mut shared: Vec<SharedDevice> = own
+        .iter()
+        .map(|device| SharedDevice {
+            also: everyone
+                .iter()
+                .filter(|(name, devices)| {
+                    name != whose && devices.iter().any(|d| d.endpoint_id == device.endpoint_id)
+                })
+                .map(|(name, _)| name.clone())
+                .collect(),
+            device: device.clone(),
+        })
+        .collect();
+    shared.sort_by_key(|s| std::cmp::Reverse(s.device.last_seen_at));
+    shared
+}
+
+/// A device key as the panel shows its start: "dc97 3189 4e65 8276", in
+/// groups so it can be read out and compared.
+pub fn key_start(endpoint_id: &str) -> String {
+    endpoint_id
+        .chars()
+        .take(16)
+        .collect::<Vec<_>>()
+        .chunks(4)
+        .map(|c| c.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// One library's media paths, as the Server page's row says it.
@@ -489,10 +550,220 @@ pub fn client_kind(endpoint_id: Option<&str>, platform: Option<Platform>) -> &'s
     }
 }
 
+/// A browser's name from its `User-Agent`, as My profile names a browser
+/// session (WebProfile's "Firefox on Linux"): the browser, then the
+/// system it runs on when the string says. `None` for one it does not
+/// know.
+pub fn browser_name(user_agent: &str) -> Option<String> {
+    let has = |part: &str| user_agent.contains(part);
+    // Most browsers say "Safari" and "Chrome" too: the specific first.
+    let browser = if has("Edg/") || has("EdgA/") || has("EdgiOS/") {
+        "Edge"
+    } else if has("OPR/") || has("Opera") {
+        "Opera"
+    } else if has("Firefox/") || has("FxiOS/") {
+        "Firefox"
+    } else if has("Chrome/") || has("CriOS/") || has("Chromium/") {
+        "Chrome"
+    } else if has("Safari/") {
+        "Safari"
+    } else {
+        return None;
+    };
+    let system = if has("iPhone") {
+        Some("iPhone")
+    } else if has("iPad") {
+        Some("iPad")
+    } else if has("Android") {
+        Some("Android")
+    } else if has("CrOS") {
+        Some("ChromeOS")
+    } else if has("Windows") {
+        Some("Windows")
+    } else if has("Macintosh") || has("Mac OS X") {
+        Some("macOS")
+    } else if has("Linux") || has("X11") {
+        Some("Linux")
+    } else {
+        None
+    };
+    Some(match system {
+        Some(system) => format!("{browser} on {system}"),
+        None => browser.to_owned(),
+    })
+}
+
+/// What kind of client a session is, as the pages' second line says it:
+/// a browser is a "Web browser", the CLI a "Command line", and a device's
+/// session its app.
+pub fn session_kind(endpoint_id: Option<&str>, platform: Option<Platform>) -> &'static str {
+    match (endpoint_id, platform) {
+        (None, Some(Platform::Web)) => "Web browser",
+        (None, Some(Platform::Cli)) => "Command line",
+        (None, None) => "Web browser or command line",
+        _ => client_kind(endpoint_id, platform),
+    }
+}
+
+/// What every page calls a session (My profile, an admin's user page and
+/// the users list alike): its device's name; for this browser's own, the
+/// browser as `user_agent` names it; for another browser, "Web browser".
+pub fn session_name(
+    endpoint_id: Option<&str>,
+    device_name: Option<&str>,
+    platform: Option<Platform>,
+    current: bool,
+    user_agent: Option<&str>,
+) -> String {
+    match (endpoint_id, device_name) {
+        (Some(_), Some(name)) => name.to_owned(),
+        (Some(_), None) => "A device with no name".to_owned(),
+        (None, _) if current && platform == Some(Platform::Web) => user_agent
+            .and_then(browser_name)
+            .unwrap_or_else(|| "Web browser".to_owned()),
+        (None, _) => session_kind(None, platform).to_owned(),
+    }
+}
+
+/// An address as the Server page breaks it over lines: the part that may
+/// wrap, and the part that may not. An IPv6 address wraps only between its
+/// groups, and never inside its last group and port, so the port never
+/// stands alone on a line; anything else does not wrap at all.
+pub fn address_parts(address: &str) -> (&str, &str) {
+    let Some(close) = address.rfind("]:") else {
+        return ("", address);
+    };
+    match address[..close].rfind(':') {
+        Some(colon) => address.split_at(colon + 1),
+        None => ("", address),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_ipv4_address_does_not_wrap() {
+        assert_eq!(
+            address_parts("192.168.1.20:7890"),
+            ("", "192.168.1.20:7890")
+        );
+    }
+
+    #[test]
+    fn an_ipv6_address_keeps_its_last_group_with_the_port() {
+        assert_eq!(
+            address_parts("[2603:8000:c33e:6ac6:a53:7cfe:42df:c5cf]:17530"),
+            ("[2603:8000:c33e:6ac6:a53:7cfe:42df:", "c5cf]:17530")
+        );
+    }
+
+    #[test]
+    fn a_short_ipv6_address_keeps_its_last_group_with_the_port() {
+        assert_eq!(address_parts("[fd00::20]:7890"), ("[fd00::", "20]:7890"));
+    }
+
+    const FIREFOX_LINUX: &str =
+        "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0";
+    const CHROME_MAC: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
+    const SAFARI_IPHONE: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
+    const EDGE_WINDOWS: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0";
+    const CHROME_ANDROID: &str = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36";
+
+    #[test]
+    fn firefox_on_linux_is_named_as_the_board_names_it() {
+        assert_eq!(
+            browser_name(FIREFOX_LINUX).as_deref(),
+            Some("Firefox on Linux")
+        );
+    }
+
+    #[test]
+    fn chrome_is_told_from_the_safari_it_also_claims() {
+        assert_eq!(browser_name(CHROME_MAC).as_deref(), Some("Chrome on macOS"));
+    }
+
+    #[test]
+    fn safari_on_an_iphone_is_not_called_macos() {
+        assert_eq!(
+            browser_name(SAFARI_IPHONE).as_deref(),
+            Some("Safari on iPhone")
+        );
+    }
+
+    #[test]
+    fn edge_is_told_from_the_chrome_it_also_claims() {
+        assert_eq!(
+            browser_name(EDGE_WINDOWS).as_deref(),
+            Some("Edge on Windows")
+        );
+    }
+
+    #[test]
+    fn android_is_told_from_the_linux_it_also_claims() {
+        assert_eq!(
+            browser_name(CHROME_ANDROID).as_deref(),
+            Some("Chrome on Android")
+        );
+    }
+
+    #[test]
+    fn an_unknown_browser_has_no_name() {
+        assert_eq!(browser_name("curl/8.9.1"), None);
+    }
+
+    #[test]
+    fn this_browser_s_session_is_named_from_its_user_agent() {
+        assert_eq!(
+            session_name(None, None, Some(Platform::Web), true, Some(FIREFOX_LINUX)),
+            "Firefox on Linux"
+        );
+    }
+
+    #[test]
+    fn another_browser_s_session_is_a_web_browser() {
+        assert_eq!(
+            session_name(None, None, Some(Platform::Web), false, Some(FIREFOX_LINUX)),
+            "Web browser"
+        );
+    }
+
+    #[test]
+    fn this_browser_without_a_known_user_agent_is_a_web_browser() {
+        assert_eq!(
+            session_name(None, None, Some(Platform::Web), true, Some("curl/8.9.1")),
+            "Web browser"
+        );
+    }
+
+    #[test]
+    fn a_cli_session_is_the_command_line() {
+        assert_eq!(
+            session_name(None, None, Some(Platform::Cli), false, None),
+            "Command line"
+        );
+    }
+
+    #[test]
+    fn a_device_session_is_its_device_s_name() {
+        assert_eq!(
+            session_name(
+                Some("aa11"),
+                Some("Living room TV"),
+                Some(Platform::Tvos),
+                true,
+                Some(FIREFOX_LINUX)
+            ),
+            "Living room TV"
+        );
+    }
+
+    #[test]
+    fn a_browser_session_s_kind_is_web_browser() {
+        assert_eq!(session_kind(None, Some(Platform::Web)), "Web browser");
+    }
 
     #[test]
     fn the_server_s_version_names_its_revision_when_the_build_had_one() {
@@ -562,8 +833,8 @@ mod tests {
     }
 
     #[test]
-    fn an_admin_starts_on_the_server_page_and_everyone_else_on_their_profile() {
-        assert_eq!(landing(false, Some(Role::Admin)).path(), "/admin/server");
+    fn an_admin_starts_on_the_overview_and_everyone_else_on_their_profile() {
+        assert_eq!(landing(false, Some(Role::Admin)).path(), "/admin");
         assert_eq!(landing(false, Some(Role::Consumer)).path(), "/profile");
     }
 
@@ -852,15 +1123,130 @@ mod tests {
         assert_eq!(count(4, "session"), "4 sessions");
     }
 
+    fn named(name: &str, shown: &str, role: Role) -> UserInfo {
+        UserInfo {
+            display_name: Some(shown.into()),
+            ..user(name, role, false)
+        }
+    }
+
     #[test]
-    fn a_user_keeps_their_avatar_colour_and_a_disabled_one_is_grey() {
-        assert_eq!(avatar_class("alice", false), avatar_class("alice", false));
-        // Not one colour for everyone.
-        let names = ["alice", "andrey", "bob", "sam", "steve", "root"];
-        let tones: std::collections::HashSet<_> =
-            names.iter().map(|n| avatar_class(n, false)).collect();
-        assert!(tones.len() > 2, "{tones:?}");
-        assert_eq!(avatar_class("alice", true), "avatar avatar-off");
+    fn an_admin_s_avatar_is_teal() {
+        assert_eq!(
+            avatar_class(&named("andrey", "Andrey", Role::Admin)),
+            "avatar avatar-teal"
+        );
+    }
+
+    #[test]
+    fn alice_is_mauve_and_steve_peach_as_the_board_draws_them() {
+        assert_eq!(
+            [
+                avatar_class(&named("alice", "Alice", Role::Consumer)),
+                avatar_class(&named("steve", "Steve", Role::Consumer)),
+            ],
+            ["avatar avatar-mauve", "avatar avatar-peach"]
+        );
+    }
+
+    #[test]
+    fn a_consumer_is_never_the_admin_s_teal() {
+        let teal = ('a'..='z')
+            .map(|c| user(&c.to_string(), Role::Consumer, false))
+            .filter(|u| avatar_class(u) == "avatar avatar-teal")
+            .count();
+        assert_eq!(teal, 0);
+    }
+
+    #[test]
+    fn the_avatar_tone_follows_the_letter_it_shows() {
+        assert_eq!(
+            avatar_class(&named("x1", "Sam", Role::Consumer)),
+            avatar_class(&named("x2", "steve", Role::Consumer))
+        );
+    }
+
+    #[test]
+    fn a_disabled_user_s_avatar_is_grey() {
+        assert_eq!(
+            avatar_class(&user("andrey", Role::Admin, true)),
+            "avatar avatar-off"
+        );
+    }
+
+    #[test]
+    fn the_admins_come_first_in_the_server_s_order() {
+        let order: Vec<String> = users_in_order(vec![
+            user("alice", Role::Consumer, false),
+            user("andrey", Role::Admin, false),
+            user("steve", Role::Consumer, false),
+            user("root", Role::Admin, false),
+        ])
+        .into_iter()
+        .map(|u| u.username)
+        .collect();
+        assert_eq!(order, ["andrey", "root", "alice", "steve"]);
+    }
+
+    fn device(id: &str, seen: i64) -> spoolframe_admin_api::DeviceEntry {
+        spoolframe_admin_api::DeviceEntry {
+            endpoint_id: id.into(),
+            name: None,
+            platform: None,
+            last_seen_at: seen,
+            pin_required: false,
+            trusted: false,
+            auto_login: false,
+        }
+    }
+
+    #[test]
+    fn a_device_others_signed_in_on_names_them() {
+        let everyone = vec![
+            (
+                "Andrey".to_owned(),
+                vec![device("pc", 10), device("laptop", 5)],
+            ),
+            ("Alice".to_owned(), vec![device("pc", 8)]),
+            ("Steve".to_owned(), vec![device("pc", 3)]),
+        ];
+        let found = shared_devices("Andrey", &everyone);
+        assert_eq!(
+            found
+                .iter()
+                .map(|s| (s.device.endpoint_id.as_str(), s.also.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("pc", vec!["Alice".to_owned(), "Steve".to_owned()]),
+                ("laptop", vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_devices_most_recently_seen_come_first() {
+        let everyone = vec![(
+            "Andrey".to_owned(),
+            vec![device("old", 1), device("new", 9)],
+        )];
+        let found: Vec<_> = shared_devices("Andrey", &everyone)
+            .into_iter()
+            .map(|s| s.device.endpoint_id)
+            .collect();
+        assert_eq!(found, ["new", "old"]);
+    }
+
+    #[test]
+    fn a_user_not_listed_has_no_devices() {
+        assert_eq!(shared_devices("Nobody", &[]), vec![]);
+    }
+
+    #[test]
+    fn a_key_s_start_is_read_in_groups_of_four() {
+        assert_eq!(
+            key_start("dc9731894e65827601a7af6f146bd96a"),
+            "dc97 3189 4e65 8276"
+        );
     }
 
     fn report(ok: u64, no_mapping: &[&str], unreadable: (u64, &[&str])) -> PathReport {

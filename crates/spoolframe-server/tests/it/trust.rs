@@ -148,6 +148,15 @@ async fn age_sign_ins(server: &TestServer) {
     .await;
 }
 
+/// Wait for the server to close `client`'s connection as signed out, as it
+/// does once the device's last session ends (PX-10). A connection made
+/// before that lands is closed with it, so a test reconnects only after.
+async fn signed_out(client: &TestClient) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), client.conn.closed())
+        .await
+        .expect("the server closes a signed-out device's connection");
+}
+
 fn set_trust(device: Option<String>, trusted: bool, auto_login: bool) -> Request {
     Request::SetDeviceTrust {
         device,
@@ -256,6 +265,7 @@ async fn signing_out_forgets_the_device() {
     let tv = device(&server, "Living room TV").await;
     let session = remembered(&tv).await;
     assert_eq!(ok(&tv, &session, Request::Logout).await, Reply::LoggedOut);
+    signed_out(&tv).await;
     let tv = tv.reconnect(&server).await;
     tv.hello().await;
     assert!(trusted(&tv).await.is_empty());
@@ -290,6 +300,7 @@ async fn a_revoked_session_does_not_come_back_as_a_resume() {
         .unwrap()
         .token_hash;
     server.store.revoke_session(&hash).await.unwrap();
+    signed_out(&tv).await;
     let tv = tv.reconnect(&server).await;
     tv.hello().await;
     assert_eq!(
@@ -321,6 +332,7 @@ async fn a_password_change_or_disabling_the_user_ends_their_trust() {
         .await
         .unwrap();
     for client in [&tv, &laptop] {
+        signed_out(client).await;
         let client = client.reconnect(&server).await;
         client.hello().await;
         assert!(trusted(&client).await.is_empty());
@@ -338,6 +350,7 @@ async fn a_password_change_or_disabling_the_user_ends_their_trust() {
         other => panic!("{other:?}"),
     }
     server.store.disable_user("alice").await.unwrap();
+    signed_out(&tv).await;
     let tv = tv.reconnect(&server).await;
     tv.hello().await;
     assert_eq!(
@@ -534,6 +547,7 @@ async fn a_client_trusts_only_itself_and_only_after_a_recent_sign_in() {
     assert_eq!(trusted_names(&tv).await, ["alice"]);
     ok(&tv, &on_tv, set_trust(Some(laptop_id), false, false)).await;
     // Its connection closes with its last session; it comes back a stranger.
+    signed_out(&laptop).await;
     let laptop = laptop.reconnect(&server).await;
     laptop.hello().await;
     assert!(trusted(&laptop).await.is_empty());
@@ -564,6 +578,7 @@ async fn stopping_trust_here_needs_no_recent_sign_in_and_ends_the_session() {
     let session = remembered(&tv).await;
     age_sign_ins(&server).await;
     ok(&tv, &session, set_trust(None, false, false)).await;
+    signed_out(&tv).await;
     let tv = tv.reconnect(&server).await;
     tv.hello().await;
     assert!(trusted(&tv).await.is_empty());

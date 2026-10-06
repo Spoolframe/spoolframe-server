@@ -182,9 +182,14 @@ pub struct FinishPasskeySignIn {
     pub client_data_json: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
-    /// The user handle the authenticator keeps with the passkey.
-    #[serde(with = "serde_bytes")]
-    pub user_handle: Vec<u8>,
+    /// The user handle the authenticator keeps with the passkey, or
+    /// `None` when the platform gave none (webauthn-authenticator-rs, for
+    /// a phone over caBLE). Never `Some` of no bytes: the server refuses
+    /// that as `InvalidInput`. The client SDK sends an empty handle as
+    /// `None`. On the wire a CBOR byte string, or null for `None`; the key
+    /// is always there.
+    #[serde(with = "optional_bytes")]
+    pub user_handle: Option<Vec<u8>>,
 }
 
 /// One of the session user's passkeys (`ListPasskeys`), the web UI's as
@@ -263,6 +268,7 @@ impl fmt::Debug for PasskeyRequest {
 impl fmt::Debug for FinishPasskeySignIn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FinishPasskeySignIn")
+            .field("user_handle", &self.user_handle.as_ref().map(Vec::len))
             .finish_non_exhaustive()
     }
 }
@@ -282,6 +288,29 @@ mod byte_strings {
     ) -> Result<Vec<Vec<u8>>, D::Error> {
         let list = Vec::<ByteBuf>::deserialize(deserializer)?;
         Ok(list.into_iter().map(ByteBuf::into_vec).collect())
+    }
+}
+
+/// An optional byte string: CBOR bytes, or null. Its field is required:
+/// `with` makes serde ask for it, as it does not for a plain `Option`.
+mod optional_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use serde_bytes::{ByteBuf, Bytes};
+
+    pub fn serialize<S: Serializer>(
+        bytes: &Option<Vec<u8>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(bytes) => serializer.serialize_some(Bytes::new(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        Ok(Option::<ByteBuf>::deserialize(deserializer)?.map(ByteBuf::into_vec))
     }
 }
 

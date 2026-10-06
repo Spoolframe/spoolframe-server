@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::clock::Clock;
+
 use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::device_sign_in::{ALPHABET, CODE_LEN};
 use spoolframe_types::Platform;
@@ -169,6 +171,8 @@ impl Inner {
 pub struct DeviceSignIns {
     inner: Mutex<Inner>,
     lifetime: Duration,
+    /// What codes expire by (PX-09).
+    clock: Clock,
 }
 
 impl Default for DeviceSignIns {
@@ -183,12 +187,24 @@ impl DeviceSignIns {
         Self {
             inner: Mutex::default(),
             lifetime,
+            clock: Clock::default(),
         }
+    }
+
+    /// Codes expire by `clock` (tests move it instead of sleeping).
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// How long a code lives.
+    pub fn lifetime(&self) -> Duration {
+        self.lifetime
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         let mut inner = self.inner.lock().expect("never held across a panic");
-        inner.sweep(Instant::now());
+        inner.sweep(self.clock.now());
         inner
     }
 
@@ -220,7 +236,7 @@ impl DeviceSignIns {
             Pending {
                 waiting,
                 code: code.clone(),
-                expires_at: Instant::now() + self.lifetime,
+                expires_at: self.clock.now() + self.lifetime,
                 state: watch::Sender::new(State::Waiting),
             },
         );
@@ -278,7 +294,7 @@ impl DeviceSignIns {
                         Some(handover) => State::Approved(handover),
                         None => State::Failed,
                     },
-                    Instant::now(),
+                    self.clock.now(),
                 );
                 true
             }
@@ -296,14 +312,17 @@ impl DeviceSignIns {
             .by_request
             .get_mut(&request)
             .expect("swept with its code");
-        pending.decide(State::Denied, Instant::now());
+        pending.decide(State::Denied, self.clock.now());
         true
     }
 
     /// Wait up to `max` for `request`, begun by `endpoint`, to be decided.
     /// A decided request is gone once told: its session is handed out once.
+    ///
+    /// `max` is a real wait, on the runtime's timer; the code's expiry is
+    /// by the clock, so the wait ends at whichever of the two comes first.
     pub async fn wait(&self, request: &str, endpoint: &str, max: Duration) -> Outcome {
-        let until = Instant::now() + max;
+        let until = tokio::time::Instant::now() + max;
         let mut state = {
             let inner = self.lock();
             match inner.by_request.get(request) {
@@ -316,8 +335,9 @@ impl DeviceSignIns {
             let Some(expires_at) = self.lock().by_request.get(request).map(|p| p.expires_at) else {
                 return Outcome::Expired;
             };
+            let left = expires_at.saturating_duration_since(self.clock.now());
             let decided = tokio::time::timeout_at(
-                until.min(expires_at).into(),
+                until.min(tokio::time::Instant::now() + left),
                 state.wait_for(|s| s.outcome().is_some()),
             )
             .await;
@@ -328,7 +348,7 @@ impl DeviceSignIns {
                 // under the lock, against an approver deciding it now.
                 Ok(Ok(_)) | Err(_) => match self.take(request) {
                     Some(outcome) => return outcome,
-                    None if Instant::now() >= until => return Outcome::Pending,
+                    None if tokio::time::Instant::now() >= until => return Outcome::Pending,
                     None => continue,
                 },
             }
@@ -530,11 +550,14 @@ mod tests {
     /// waits then, still gets the session the approver was told it got.
     #[tokio::test]
     async fn an_approval_just_before_expiry_is_handed_over() {
-        let sign_ins = DeviceSignIns::with_lifetime(Duration::from_millis(100));
+        let clock = Clock::default();
+        // Shorter than the handover, which then keeps it.
+        let lifetime = HANDOVER / 2;
+        let sign_ins = DeviceSignIns::with_lifetime(lifetime).with_clock(clock.clone());
         let started = sign_ins.begin(tv("tv")).unwrap();
         let claim = sign_ins.claim(&started.code, Some("phone")).unwrap();
         assert!(sign_ins.fulfil(&claim.request, Some(handover("t"))));
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        clock.advance(lifetime * 3 / 2);
         assert_eq!(
             sign_ins.wait(&started.request, "tv", AWAIT).await,
             Outcome::Approved(handover("t"))
@@ -545,9 +568,11 @@ mod tests {
     /// device has been told it expired, so the approver must hear so too.
     #[tokio::test]
     async fn an_approval_after_expiry_is_not_handed_over() {
-        let sign_ins = DeviceSignIns::with_lifetime(Duration::from_millis(100));
+        let clock = Clock::default();
+        let sign_ins = DeviceSignIns::default().with_clock(clock.clone());
         let started = sign_ins.begin(tv("tv")).unwrap();
         let claim = sign_ins.claim(&started.code, Some("phone")).unwrap();
+        clock.advance(LIFETIME);
         assert_eq!(
             sign_ins.wait(&started.request, "tv", AWAIT).await,
             Outcome::Expired
@@ -581,7 +606,8 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_is_pending_until_decided_and_expired_after() {
-        let sign_ins = DeviceSignIns::with_lifetime(Duration::from_millis(300));
+        let clock = Clock::default();
+        let sign_ins = DeviceSignIns::default().with_clock(clock.clone());
         let started = sign_ins.begin(tv("tv")).unwrap();
         assert_eq!(
             sign_ins
@@ -589,6 +615,7 @@ mod tests {
                 .await,
             Outcome::Pending
         );
+        clock.advance(LIFETIME);
         assert_eq!(
             sign_ins.wait(&started.request, "tv", AWAIT).await,
             Outcome::Expired

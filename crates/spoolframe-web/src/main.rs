@@ -9,6 +9,8 @@
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod activity;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod approve;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod catalog;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod libraries;
@@ -16,6 +18,8 @@ mod libraries;
 mod logic;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod logs;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod overview;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod playback;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]

@@ -193,6 +193,25 @@ signature for another server's challenge is `InvalidCredentials`.
 anyone can send it. App passkeys are discoverable, so the platform finds
 them. With `username`, only that user's passkeys finish the sign-in.
 
+### The user handle
+
+`FinishPasskeySignIn` (and `FinishConfirmPasskey`, which carries the same
+fields) has `user_handle: Option<bytes>`. The key is always there:
+
+| Value | Meaning |
+|---|---|
+| CBOR byte string, 1 or more bytes | The handle the authenticator keeps with the passkey. It must be the passkey's user's, or the reply is `InvalidCredentials`. |
+| CBOR null | The platform gave no handle (webauthn-authenticator-rs, for a phone over caBLE). The passkey's credential id says whose it is. |
+| Empty byte string | `InvalidInput`. It uses no challenge and does not count as a failed sign-in. |
+| Key not there | The message does not decode. |
+
+The SDK sends an app's empty handle as null. This is still revision 4,
+and `PROTOCOL_VERSION` stays 4. The bytes of a handle are encoded as
+before. An older client's empty handle decodes as an empty byte string,
+so it gets `InvalidInput`. An older server cannot decode null. Both
+servers refused an empty handle before this change, so no sign-in that
+worked stops working.
+
 A PIN is not accepted as proof. A PIN guards switching profiles on a
 shared device, and it is weaker than a sign-in. A locked session gets
 `ProfileLocked` for all three requests, as for other sensitive requests:

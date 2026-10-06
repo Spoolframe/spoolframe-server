@@ -11,6 +11,7 @@ mod http;
 mod icons;
 mod libraries;
 mod logs;
+mod overview;
 mod playback;
 mod plex;
 mod profile;
@@ -24,12 +25,13 @@ use dioxus::prelude::*;
 use spoolframe_admin_api::{MeApiClient, PasswordChange, Role, UserInfo};
 
 use activity::ActivityPage;
-use admin::{AdminHome, Server, UserSessions, Users};
+use admin::{Server, UserSessions, Users};
 use catalog::CatalogLibrary;
 use catalog_item::CatalogItem;
 use device::DeviceApproval;
 use libraries::{AddLibrary, Libraries};
 use logs::LogsPage;
+use overview::AdminHome;
 use playback::{PlaybackDetail, PlaybackPage};
 use plex::PlexSignedIn;
 use profile::Profile;
@@ -421,9 +423,16 @@ async fn passkey_sign_in(
 /// `said`: why the page was opened, shown at its top (the provider's
 /// account is not linked, …). `return_to`: the page a provider's sign-in
 /// comes back to (path and query), where it is not the start page.
+/// `lede`, `code`, `submit_label` and `footer`: the approval page's own
+/// words (WebApproveStates 2): what signing in is for, the code it comes
+/// back to, and its button.
 #[component]
 fn SignInForm(
     title: String,
+    #[props(default)] lede: Option<String>,
+    #[props(default)] code: Option<String>,
+    #[props(default)] submit_label: Option<String>,
+    #[props(default)] footer: Option<String>,
     #[props(default)] public_url: Option<String>,
     #[props(default)] insecure_cookies: bool,
     #[props(default)] sso: Vec<String>,
@@ -490,9 +499,28 @@ fn SignInForm(
     };
     rsx! {
         form { class: "glass-card", onsubmit: submit,
-            div { class: "flex flex-col items-center gap-2.5",
-                icons::Mark {}
-                h1 { class: "m-0 text-center text-[26px] font-bold", "{title}" }
+            if code.is_some() {
+                div { class: "approve-head",
+                    icons::Mark { size: 48 }
+                    h1 { "{title}" }
+                    if let Some(lede) = &lede {
+                        p { "{lede}" }
+                    }
+                }
+            } else {
+                div { class: "flex flex-col items-center gap-2.5",
+                    icons::Mark {}
+                    h1 { class: "m-0 text-center text-[26px] font-bold", "{title}" }
+                    if let Some(lede) = &lede {
+                        p { class: "m-0 text-center text-sm text-ctp-subtext0", "{lede}" }
+                    }
+                }
+            }
+            if let Some(code) = &code {
+                div { class: "approve-shown",
+                    span { "Code on the screen" }
+                    b { class: "approve-code-shown", "{code}" }
+                }
             }
             if !secure {
                 div { class: "alert alert-error", role: "alert",
@@ -514,9 +542,13 @@ fn SignInForm(
             }
             Field { label: "Username", value: username, autocomplete: "username", placeholder: "Username", tall: true, disabled: !secure }
             Field { label: "Password", value: password, kind: "password", autocomplete: "current-password", placeholder: "Password", tall: true, disabled: !secure }
-            button { class: "btn-primary", r#type: "submit", disabled: busy() || !secure, "Sign in" }
+            button { class: "btn-primary", r#type: "submit", disabled: busy() || !secure,
+                {submit_label.clone().unwrap_or_else(|| "Sign in".to_owned())}
+            }
             if passkeys && webauthn::supported() {
-                div { class: "or-divider", "or" }
+                if code.is_none() {
+                    div { class: "or-divider", "or" }
+                }
                 button {
                     class: "btn-secondary",
                     r#type: "button",
@@ -542,10 +574,14 @@ fn SignInForm(
                     "Continue with {provider}"
                 }
             }
-            p { class: "m-0 text-center text-xs text-ctp-subtext0",
-                "Accounts are created by your server's admin."
-                if !sso.is_empty() {
-                    " A sign-in provider only works once it is linked in My profile."
+            if let Some(footer) = &footer {
+                p { class: "m-0 text-center text-xs text-ctp-subtext0", "{footer}" }
+            } else {
+                p { class: "m-0 text-center text-xs text-ctp-subtext0",
+                    "Accounts are created by your server's admin."
+                    if !sso.is_empty() {
+                        " A sign-in provider only works once it is linked in My profile."
+                    }
                 }
             }
         }
@@ -983,12 +1019,14 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
                     }
                 }
                 if typing() {
-                    div { class: "method-form",
+                    // A form, so the browser treats the two as a new
+                    // password; Save is pressed, not submitted.
+                    form { class: "method-form", onsubmit: move |e: FormEvent| e.prevent_default(),
                         Field { label: "Password", value: password, kind: "password", autocomplete: "new-password" }
                         Field { label: "Confirm password", value: again, kind: "password", autocomplete: "new-password" }
                         div { class: "flex gap-2",
-                            button { class: "btn btn-teal h-[34px]", disabled: busy(), onclick: save_password, "Save password" }
-                            button { class: "btn h-[34px]", onclick: move |_| typing.set(false), "Cancel" }
+                            button { class: "btn btn-teal h-[34px]", r#type: "button", disabled: busy(), onclick: save_password, "Save password" }
+                            button { class: "btn h-[34px]", r#type: "button", onclick: move |_| typing.set(false), "Cancel" }
                         }
                     }
                 }
@@ -1182,6 +1220,11 @@ fn role_name(role: Role) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShownName(pub Signal<String>);
 
+/// What the phone bar calls a page that names its own subject, such as a
+/// user's page (WebAdminPhone 5: "Alice"); `None` for the route's title.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BarTitle(pub Signal<Option<String>>);
+
 /// The frame itself. An admin's is the design's sidebar, or its bar on a
 /// phone, with the pages behind the bar's menu button (the WebAdminPhone
 /// board): the mark, the pages, and who is signed in. A consumer's is a
@@ -1197,9 +1240,11 @@ fn SignedIn(user: UserInfo) -> Element {
             .unwrap_or_else(|| user.username.clone())
     });
     use_context_provider(|| ShownName(shown));
+    let bar_title = use_signal(|| None::<String>);
+    use_context_provider(|| BarTitle(bar_title));
     let name = shown();
     let admin = user.role == Role::Admin;
-    let avatar = avatar_class(&user.username, false);
+    let avatar = avatar_class(&user);
     let mut menu = use_signal(|| false);
     let sign_out = move |_| {
         spawn(async move {
@@ -1226,6 +1271,7 @@ fn SignedIn(user: UserInfo) -> Element {
         }
     };
     let title = match route {
+        Route::AdminHome {} => "Overview",
         Route::Profile {} => "My profile",
         Route::Server {} => "Server",
         Route::ActivityPage {} => "Activity",
@@ -1233,8 +1279,13 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::PlaybackPage {} | Route::PlaybackDetail { .. } => "Playback",
         Route::Libraries {} | Route::AddLibrary { .. } => "Libraries",
         Route::CatalogLibrary { .. } | Route::CatalogItem { .. } => "Libraries",
+        Route::Settings { ref tab } if tab == "plex" => "Plex",
         Route::Settings { .. } | Route::SettingsHome {} => "Settings",
         _ => "Users",
+    };
+    let title = match (&route, bar_title()) {
+        (Route::UserSessions { .. }, Some(named)) => named,
+        _ => title.to_owned(),
     };
     let site = use_resource(site);
     let insecure = admin && site.read().as_ref().is_some_and(|s| s.insecure_cookies);
@@ -1274,7 +1325,7 @@ fn SignedIn(user: UserInfo) -> Element {
         // lines, and stretched lines would leave a gap under the bar.
         div { class: "flex min-h-screen flex-wrap content-start bg-ctp-base text-ctp-text",
             aside { class: "sidebar hidden md:flex",
-                // The mark goes to the admin's start, the Server page.
+                // The mark goes to the admin's start, the Overview.
                 Link { class: "home-link flex items-center gap-2.5 px-2", to: Route::from(Landing::Admin),
                     icons::Mark { size: 28 }
                     div { class: "flex flex-col",
@@ -1283,9 +1334,11 @@ fn SignedIn(user: UserInfo) -> Element {
                     }
                 }
                 nav { class: "flex flex-col gap-0.5",
+                    {link(Route::AdminHome {}, "Overview", false)}
                     {link(Route::Users {}, "Users and devices", false)}
                     {link(Route::Server {}, "Server", false)}
                     {server_links(&route)}
+                    {link(plex_page(), "Plex", false)}
                     {link(Route::Profile {}, "My profile", true)}
                 }
                 div { class: "mt-auto flex items-center gap-2.5 rounded-[10px] bg-ctp-base p-2",
@@ -1308,7 +1361,7 @@ fn SignedIn(user: UserInfo) -> Element {
                         onclick: move |_| menu.toggle(),
                         icons::Menu {}
                     }
-                    Link { class: "home-link flex", to: Route::from(Landing::Admin), aria_label: "Server",
+                    Link { class: "home-link flex", to: Route::from(Landing::Admin), aria_label: "Overview",
                         icons::Mark { size: 24 }
                     }
                     b { class: "font-display text-[17px]", "{title}" }
@@ -1322,9 +1375,11 @@ fn SignedIn(user: UserInfo) -> Element {
                 div { class: "drawer-scrim md:hidden", aria_hidden: "true", onclick: move |_| menu.set(false) }
                 // A link's click comes up here once it has navigated.
                 nav { class: "drawer md:hidden", aria_label: "Admin", onclick: move |_| menu.set(false),
+                    {link(Route::AdminHome {}, "Overview", false)}
                     {link(Route::Users {}, "Users and devices", false)}
                     {link(Route::Server {}, "Server", false)}
                     {server_links(&route)}
+                    {link(plex_page(), "Plex", false)}
                     {link(Route::Profile {}, "My profile", true)}
                 }
             }
@@ -1343,6 +1398,12 @@ fn SignedIn(user: UserInfo) -> Element {
             }
         }
     }
+}
+
+/// The sidebar's Plex (WebUsers, WebAdminPhone 2): Settings' Plex tab,
+/// where the Plex Media Server and the admin's Plex account are.
+fn plex_page() -> Route {
+    Route::Settings { tab: "plex".into() }
 }
 
 /// Server's sub-pages in the sidebar, one step in: Activity (P3-14),
@@ -1380,7 +1441,9 @@ fn server_links(route: &Route) -> Element {
                 tab: "server".into(),
             },
             "Settings",
-            matches!(route, Route::Settings { .. } | Route::SettingsHome {}),
+            // Settings' Plex tab is the sidebar's Plex, not Settings.
+            matches!(route, Route::Settings { tab } if tab != "plex")
+                || matches!(route, Route::SettingsHome {}),
         ),
     ];
     rsx! {

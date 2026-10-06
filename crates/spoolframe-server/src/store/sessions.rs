@@ -5,7 +5,7 @@
 use spoolframe_types::{Platform, Role};
 
 use super::users::{LocalUserId, role};
-use super::{Store, StoreError, now};
+use super::{Store, StoreError};
 
 /// What a session is bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +85,7 @@ impl Store {
         binding: &SessionBinding,
         expires_at: i64,
     ) -> Result<(), StoreError> {
-        let now = now();
+        let now = self.now();
         let mut tx = self.pool.begin().await?;
         Self::insert_session(&mut tx, token_hash, user, binding, expires_at, now, now).await?;
         tx.commit().await?;
@@ -165,7 +165,7 @@ impl Store {
                AND s.expires_at > ?2 AND u.disabled_at IS NULL",
         )
         .bind(token_hash)
-        .bind(now())
+        .bind(self.now())
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(id, stored, authenticated_at)| ApiSessionUser {
@@ -179,7 +179,7 @@ impl Store {
     pub async fn confirm_session(&self, token_hash: &str) -> Result<(), StoreError> {
         sqlx::query("UPDATE sessions SET authenticated_at = ?2 WHERE token_hash = ?1")
             .bind(token_hash)
-            .bind(now())
+            .bind(self.now())
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -208,7 +208,7 @@ impl Store {
         endpoint_id: &str,
         lifetime_secs: i64,
     ) -> Result<Option<SessionUser>, StoreError> {
-        let now = now();
+        let now = self.now();
         type Row = (LocalUserId, String, Option<String>, String, i64, bool, i64);
         let row: Option<Row> = sqlx::query_as(
             "SELECT u.id, u.username, u.display_name, u.role, s.last_used_at, \
@@ -281,7 +281,7 @@ impl Store {
         let rows: Vec<(LocalUserId, i64, i64)> = sqlx::query_as(
             "SELECT s.user_id,                     sum(s.kind = 'endpoint'), sum(s.kind = 'api')              FROM sessions s JOIN users u ON u.id = s.user_id              WHERE s.revoked_at IS NULL AND s.expires_at > ?1 AND u.disabled_at IS NULL              GROUP BY s.user_id ORDER BY s.user_id",
         )
-        .bind(now())
+        .bind(self.now())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -312,7 +312,7 @@ impl Store {
              ORDER BY s.last_used_at DESC",
         )
         .bind(user)
-        .bind(now())
+        .bind(self.now())
         .fetch_all(&self.pool)
         .await?)
     }
@@ -351,7 +351,7 @@ impl Store {
         )
         .bind(user)
         .bind(keep)
-        .bind(now())
+        .bind(self.now())
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -387,7 +387,7 @@ impl Store {
             "UPDATE sessions SET revoked_at = ?2 WHERE token_hash = ?1 AND revoked_at IS NULL",
         )
         .bind(token_hash)
-        .bind(now())
+        .bind(self.now())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -404,7 +404,7 @@ impl Store {
             "UPDATE sessions SET revoked_at = ?2 WHERE token_hash = ?1 AND revoked_at IS NULL",
         )
         .bind(token_hash)
-        .bind(now())
+        .bind(self.now())
         .execute(&self.pool)
         .await?;
         self.note_sessions_ended();
@@ -421,7 +421,7 @@ impl Store {
                  AND s.expires_at > ?2 AND u.disabled_at IS NULL)",
         )
         .bind(endpoint_id)
-        .bind(now())
+        .bind(self.now())
         .fetch_one(&self.pool)
         .await?;
         Ok(live)
@@ -432,6 +432,7 @@ impl Store {
 mod tests {
     use super::super::tests::{TestStore, test_store};
     use super::*;
+    use crate::store::now;
 
     async fn store_with_alice(test: &str) -> (TestStore, LocalUserId) {
         let store = test_store(test).await;

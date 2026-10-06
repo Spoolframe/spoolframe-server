@@ -370,6 +370,9 @@ fn year_of(item: &Item) -> Option<u16> {
 }
 
 #[cfg(test)]
+mod recorded;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use spoolframe_types::{
