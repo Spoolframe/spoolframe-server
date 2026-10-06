@@ -380,6 +380,7 @@ fn every_reply_round_trips() {
         Reply::DeviceSignInRequest(spoolframe_protocol::DeviceSignInRequest {
             device_name: Some("Living room TV".into()),
             client_name: "spoolframe-tvos".into(),
+            platform: spoolframe_types::Platform::Tvos,
             requested_at: 1_790_000_000,
         }),
         Reply::LoggedIn {
@@ -690,6 +691,7 @@ fn media_reads_round_trip() {
     ));
     for error in [
         Error::PlaybackExpired,
+        Error::PlaybackStopped,
         Error::Busy,
         Error::PlaybackFailed {
             reason: "Invalid data found when processing input".into(),

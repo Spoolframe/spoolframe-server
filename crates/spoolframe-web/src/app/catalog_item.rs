@@ -166,24 +166,15 @@ fn Page(
             }
             nav { class: "cat-tabs", role: "tablist",
                 for (key, label) in tabs(kind) {
-                    if key == "debug" {
-                        span {
-                            key: "{key}",
-                            class: "cat-tab cat-tab-off",
-                            role: "tab",
-                            aria_disabled: "true",
-                            title: "Playback debug (P3-15) isn't built yet",
-                            "{label}"
+                    Link {
+                        key: "{key}",
+                        class: if key == tab { "cat-tab cat-tab-here" } else { "cat-tab" },
+                        role: "tab",
+                        aria_selected: "{key == tab}",
+                        to: Route::CatalogItem { library: library.clone(), id: id.clone(), tab: if key == "overview" { String::new() } else { key.to_owned() } },
+                        "{label}"
+                        if key == "debug" {
                             icons::Activity { size: 14 }
-                        }
-                    } else {
-                        Link {
-                            key: "{key}",
-                            class: if key == tab { "cat-tab cat-tab-here" } else { "cat-tab" },
-                            role: "tab",
-                            aria_selected: "{key == tab}",
-                            to: Route::CatalogItem { library: library.clone(), id: id.clone(), tab: if key == "overview" { String::new() } else { key.to_owned() } },
-                            "{label}"
                         }
                     }
                 }
@@ -193,13 +184,7 @@ fn Page(
                 "artwork" => rsx! { ArtworkTab { id: id.clone(), server: seen.server_name.clone() } },
                 "markers" => rsx! { Markers { markers: markers.clone(), duration: duration_ms(&item), server: seen.server_name.clone() } },
                 "children" => rsx! { Children { library: library.clone(), seen: seen.clone(), client_children: client_children.clone() } },
-                "debug" => rsx! {
-                    section { class: "card", div { class: "card-body",
-                        p { class: "m-0 text-sm text-ctp-subtext0",
-                            "Playback debug (P3-15) isn't built yet: the probe result, “Plan for…”, and the subtitle and preview state will be here once it is."
-                        }
-                    } }
-                },
+                "debug" => rsx! { super::catalog_debug::DebugTab { id: id.clone() } },
                 _ => rsx! { Overview { seen: seen.clone(), item: item.clone(), library: library.clone() } },
             }
         }

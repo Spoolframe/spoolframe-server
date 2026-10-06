@@ -534,7 +534,8 @@ fn failure(e: ErrorObjectOwned) -> Response<Body> {
 /// Signed in: the cookie, and who. From a page the browser will not keep
 /// the cookie for, the sign-in looks to its user as if nothing happened,
 /// and only this log can say why.
-fn signed_in(api: &AdminApi, headers: &HeaderMap, done: LoggedIn) -> Response<Body> {
+async fn signed_in(api: &AdminApi, headers: &HeaderMap, done: LoggedIn) -> Response<Body> {
+    api.mark_web_session(&done.token).await;
     let cookies = api.cookies();
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
         && !cookies.insecure()
@@ -592,7 +593,7 @@ async fn login(
         Err(e) => return failure(e),
     };
     match MeApiServer::login(&api, &from(peer), credentials).await {
-        Ok(done) => signed_in(&api, &headers, done),
+        Ok(done) => signed_in(&api, &headers, done).await,
         Err(e) => failure(e),
     }
 }
@@ -631,7 +632,7 @@ async fn passkey_finish(
         Err(e) => return failure(e),
     };
     match MeApiServer::passkey_login_finish(&api, &from(peer), ceremony, credential).await {
-        Ok(done) => signed_in(&api, &headers, done),
+        Ok(done) => signed_in(&api, &headers, done).await,
         Err(e) => failure(e),
     }
 }
@@ -647,7 +648,7 @@ async fn setup(
         Err(e) => return failure(e),
     };
     match AdminApiServer::setup(&api, &from(peer), request).await {
-        Ok(done) => signed_in(&api, &headers, done),
+        Ok(done) => signed_in(&api, &headers, done).await,
         Err(e) => failure(e),
     }
 }
@@ -708,7 +709,7 @@ async fn setup_passkey_finish(
         Err(e) => return failure(e),
     };
     match AdminApiServer::setup_passkey_finish(&api, &from(peer), request).await {
-        Ok(done) => signed_in(&api, &headers, done),
+        Ok(done) => signed_in(&api, &headers, done).await,
         Err(e) => failure(e),
     }
 }
@@ -827,6 +828,7 @@ async fn sso_callback(State(api): State<AdminApi>, req: Request) -> Response<Bod
     let headers = response.headers_mut();
     headers.append(header::SET_COOKIE, api.cookies().oidc_clear());
     if let Some(token) = session {
+        api.mark_web_session(&token).await;
         headers.append(header::SET_COOKIE, api.cookies().set(&token));
     }
     // The page's address has the code in it; it is not sent on.

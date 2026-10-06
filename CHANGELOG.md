@@ -1593,3 +1593,169 @@
   and port plex.tv says a plex.direct name stands for. Wire change:
   `DiscoveredPlex.machineId` is always sent (null when a server's
   answer has none).
+- Protocol: `Error::PlaybackStopped` (P3-15), "the playback was stopped
+  on the server": an admin stopped it. A client tells the viewer it
+  ended and does not start it again, as it would after
+  `PlaybackExpired`. Every later read, progress report, seek or
+  subtitle change on its handle gets it, for as long as an idle handle
+  would have lived. The SDK's `SdkError::PlaybackStopped`;
+  `ManagedPlayback` does not recover from it. A client built before it
+  sees `Unknown`.
+- Playbacks are kept for playback debug (P3-15): each has a random id
+  of its own (never its handle), who plays it on which device, what it
+  plays, its plan, when it started, the position its client last
+  reported, and its reads over the last 10 minutes (one point a second
+  at most: where in the film, and how far its conversion had got). A
+  playback that ends is kept for an hour (200 at most) with how it
+  ended: its client stopped it, an admin did, it idled out, its device
+  started another conversion or was gone too long, its session ended,
+  or its conversion failed. An encode keeps its command line and
+  ffmpeg's last 50 stderr lines; End conversion stops ffmpeg and frees
+  its slot while what it wrote stays readable, and nothing starts it
+  again. The command line shown hides the playback handle in its paths
+  and any token-like value. All in memory.
+- Admin API, playback debug (P3-15), admins only (`FORBIDDEN`
+  otherwise); nothing in it changes a playback but Stop and End
+  conversion. `admin.playbacks`: every open playback, newest first, and
+  those that ended in the last hour with how: user, device, item, plan
+  (`direct`, `remux`, `transcode`, `unsupported`) and the plan's own
+  reasons, the "playback started" log line's summary, epoch, revision,
+  the position the client last reported, where the last read was in the
+  film, the furthest byte or segment read, when it was, and the
+  conversion's progress, whether the throttle holds it back, whether it
+  runs, ended or failed. `admin.playback(id)`: that, the plan laid out by
+  stream (what each is in the file, copied, encoded with which encoder,
+  read as text, converted, burned in, and the reasons naming it, word for
+  word), the ffmpeg command line (paths shown; the playback handle and
+  any token hidden), ffmpeg's last stderr lines, and the reads of the
+  last 10 minutes; it answers for an ended playback too.
+  `admin.playbackStop(id)` and `admin.playbackEndConversion(id)`
+  (`NO_SUCH_PLAYBACK`, `NO_CONVERSION` for direct play).
+  `admin.catalogDebug(id)`: the item's file as ffprobe sees it (path,
+  container, duration, bitrate, size, each stream with its index, codec,
+  details, language, title, role, default and forced), the devices "Plan
+  for" offers, each subtitle track's text as the cache has it (made,
+  being made, not made, or why it cannot be), and the frame previews'
+  state; looking queues nothing. `admin.catalogPlanFor(id, request)`:
+  the plan `PlaybackPlan` would give a device for those tracks and
+  picture-subtitle mode, laid out as above, with the plan itself as the
+  client gets it. A device is one connected now (`device:<endpoint>`,
+  with what its Hello said it plays) or a stored profile: `linux`
+  (the Linux app with GStreamer's usual plugins), `apple-tv` (AVPlayer:
+  H.264 and HEVC, AAC, AC-3, E-AC-3, MP4 and TS, WebVTT, HLS), `iphone`
+  (as Apple TV, stereo), `mac` (as Apple TV) and `cli` (no player).
+- Web UI: Server › Playback (`/admin/playback`, P3-15), in the sidebar
+  under Server after Activity. Each playback: what plays, who and on
+  which device; its plan's pill (Direct, Remux, Transcode, Cannot play)
+  and the plan's own reasons; Range, HLS or Progressive and the epoch;
+  the position the client reported and where the reads have got to; the
+  conversion's share done with a bar, "Paused by the throttle" when it
+  is; and how long since the last read. "Nothing is playing" when
+  nothing is, and "Ended in the last hour" with how each ended. Asked
+  every 2 s. On a phone, a card each. One playback's page
+  (`/admin/playback/<id>`): position, converted to, the throttle and the
+  last read with the furthest byte or segment; the plan a row per
+  stream (in the file, out, and the reasons naming it) with the log
+  line's summary under it; the reads of the last 10 minutes drawn as
+  read position against converted-to; the ffmpeg command line with Copy
+  ("Paths are shown; tokens never are"), a failure's reason, and the
+  last stderr lines. End conversion and Stop playback each ask first;
+  an ended playback's page says when and how it ended.
+- Web UI: an item's Debug tab (P3-15), now open on films, episodes and
+  tracks. Probe: the file's path, container, length, size and bitrate,
+  and a row per stream (its index in the file, kind, track number,
+  codec, details, language, role), with "Look again". "Plan for…":
+  Device (each one connected now, then the stored profiles Linux app,
+  Apple TV, iPhone, Mac and CLI, with what each stands for), Audio,
+  Subtitles and Picture subtitles (Auto, Text, Burn in); the plan comes
+  back as the Playback page lays it out, the plan `PlaybackPlan` would
+  give, and nothing plays. Subtitles and previews: each picture track's
+  text (and a text track's, once something of it is made), whether it
+  is made, being read, failed or cannot be; and the frame previews'
+  state.
+- Device sign-in (P3-18, P3-07): one code has one outcome. A pending
+  sign-in moves Waiting → Claimed → Approved/Failed, or Waiting →
+  Denied, each step under one lock and only from the step before, so
+  two approvals, an approval and a denial, or an approval and the code
+  running out cannot both pass. An approval that the code outruns while
+  its session is made revokes that session and tells the approver the
+  code is gone (`NotFound` / `NO_SUCH_SIGN_IN_CODE`, not counted as a
+  wrong code), as the device was told it expired; a sign-in decided a
+  moment before its code ran out is still handed to the device for 25 s.
+- Device sign-in (P3-18, P3-07): the approver sees what kind of device
+  asks. `DeviceSignInRequest` (the `LookupDeviceSignIn` reply) and the
+  admin API's `DeviceSignIn` (`me.deviceSignInLookup`) gain a required
+  `platform`, from the waiting device's `Hello`; the web UI's
+  `/auth/device` page shows it under the device's name ("Apple TV app",
+  `Platform::label`). Wire change: approver apps (phone, Linux) should
+  show it beside the device name.
+- Web UI (P3-18, P3-01): every passkey prompt opens from the click
+  itself, before anything is awaited, as Safari requires. Setup fetches
+  the passkey request for the username once typing pauses; sign-in and
+  "Confirm it's you" fetch theirs when the card opens; "Add a passkey"
+  already had its own. A click before the request is in hand fetches it
+  first, as before, and a refused prompt fetches a new one for the next
+  click. Checked in WebKit 26.4 (Playwright) with a stand-in
+  authenticator that refuses a prompt opened outside the click: a
+  passkey-only setup and a passkey sign-in, over HTTPS.
+- NixOS VM test (P3-18, P3-04, P3-10): `checks.<system>.nixos-module`
+  now boots two machines. `server` sets P3-10's admin options (listener
+  on loopback, `publicUrl`, `trustedProxies`) and a P3-04 sign-in
+  provider with its secret as a credential, and checks `/auth/site` and
+  `spoolframe config show` show them, and that `openFirewall` opens UDP
+  7420, 5353 and 32415. `fresh` has only `enable`: not set up, the
+  service active, `/auth/site` answering, `config show` working, its
+  key and database in `/var/lib/spoolframe` (the service's, mode 700),
+  UDP 32415 open and nothing else of ours, and the web UI not reachable
+  from another machine. Run, with KVM: it passes, and found no module
+  bug; the server package (OpenSSL, P3-05) builds.
+- Web UI: Server › Libraries' drag handle works (P3-18): a library
+  dragged by it to another row takes that row's place, with a line
+  showing where it lands, and the order is saved through `libraryMove`
+  as the up and down arrows save it. Only the handle starts a drag, so
+  the row's link and watch sync menu work as before; the arrows stay
+  for the keyboard.
+- The first Plex server can be removed (P3-18), once it is the only one:
+  `admin.plexServerRemove("plex")` takes out its libraries and every
+  `plex.*` setting of the runtime layer, forgets its token, and leaves the
+  server not set up until a Plex server is added again. Its watch state is
+  kept under its items' ids (`plex:movie:12`), as a removed library's is,
+  and the same server added back finds it. While another server remains it
+  is refused (`INVALID_INPUT`), naming them: the next server could take its
+  place only by its items taking those ids, which would show the old
+  server's state on other films and change every id clients hold. A first
+  server the config file names is removed there. The add-library flow's
+  Cancel now takes out a first server it added.
+- A Plex server that is down keeps its libraries' Plex titles (P3-18):
+  the server keeps each section's title as every server last gave it, in
+  `state_dir/plex-section-titles.json` (not a setting), and
+  `LibraryEntry.plexTitle` is that title while its server is down, so
+  Server › Libraries says "Plex · Cabin · Movies" rather than "section 1",
+  after a restart too. A server removed is forgotten; a missing or
+  unreadable file is filled again by the next answers.
+- Search inside a library finds people (P3-18): the actors and directors
+  Plex's hubs found in that library's section, each with their count
+  there. The hubs already say where each person was found, so it costs
+  no call per person; inside a library the hubs are asked for four times
+  the limit (at most 100), so people found elsewhere first leave room.
+  The request and reply are unchanged; `PersonItems` still lists all of a
+  person's items.
+- Admin pages (P3-18): a user whose password sign-ins are refused for
+  too many wrong ones under their username shows "Rate limited" on the
+  Users list and their page, with the wait in its tooltip;
+  `UserInfo.rateLimitedSecs` (and `whoAmI`'s) is the wait, from the P1-11
+  limiter. A source that is limited is not shown on anyone. The CLI's
+  `user list` says "rate limited for N min".
+- An admin API session says what signed it in (P3-18): `SessionEntry
+  .platform` is `web` for the web UI's cookie sessions (setup, password,
+  passkey, SSO) and `cli` for the rest, kept in the session's new
+  `client` column (migration 0013); `null` for one from before. The web
+  UI shows "Web" or "Command-line client" in place of "Web or CLI", and
+  the CLI's `user sessions` likewise. `Platform` gains `web`, which no
+  client sends; an older peer reads it as `unknown`.
+- Web UI: setup's first-admin step has a display name (P3-18), beside the
+  username as the WebSetup board draws it, on the passkey and the
+  password-only setup alike. It is optional, checked as `setDisplayName`
+  checks it (at most 64 characters, one line) before the account is
+  made, and given through `setDisplayName` when the step is finished, so
+  the Users list and My profile show it. The setup API is unchanged.

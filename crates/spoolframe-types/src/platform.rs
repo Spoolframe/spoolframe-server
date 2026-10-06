@@ -15,8 +15,12 @@ pub enum Platform {
     Ios,
     /// The Mac app.
     Macos,
-    /// A command-line or scripted client of the SDK (its examples, tools).
+    /// A command-line or scripted client of the SDK (its examples, tools),
+    /// or, for an admin API session, the server's own CLI.
     Cli,
+    /// The web UI, in a browser (P3-18): never in a client's `Hello`, only
+    /// on the admin API's sessions the web UI signed in.
+    Web,
     /// A platform this build does not know, from a newer peer.
     #[serde(other)]
     Unknown,
@@ -31,6 +35,7 @@ impl Platform {
             Platform::Ios => "ios",
             Platform::Macos => "macos",
             Platform::Cli => "cli",
+            Platform::Web => "web",
             Platform::Unknown => "unknown",
         }
     }
@@ -44,6 +49,7 @@ impl Platform {
             "ios" => Platform::Ios,
             "macos" => Platform::Macos,
             "cli" => Platform::Cli,
+            "web" => Platform::Web,
             _ => Platform::Unknown,
         }
     }
@@ -56,6 +62,7 @@ impl Platform {
             Platform::Ios => "iPhone or iPad app",
             Platform::Macos => "Mac app",
             Platform::Cli => "Command-line client",
+            Platform::Web => "Web",
             Platform::Unknown => "App",
         }
     }
@@ -65,12 +72,13 @@ impl Platform {
 mod tests {
     use super::*;
 
-    const ALL: [Platform; 6] = [
+    const ALL: [Platform; 7] = [
         Platform::Linux,
         Platform::Tvos,
         Platform::Ios,
         Platform::Macos,
         Platform::Cli,
+        Platform::Web,
         Platform::Unknown,
     ];
 

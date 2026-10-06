@@ -422,13 +422,38 @@ fn minutes(n: u64) -> String {
     }
 }
 
+/// A user's status on the Users list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserStatus {
+    Disabled,
+    /// Their password sign-ins are refused for a while (P3-18): why, and
+    /// for how long.
+    Limited(String),
+    Active,
+}
+
+pub fn user_status(user: &UserInfo) -> UserStatus {
+    match (user.disabled, user.rate_limited_secs) {
+        (true, _) => UserStatus::Disabled,
+        (false, Some(secs)) => UserStatus::Limited(format!(
+            "Too many wrong passwords. Password sign-ins as {} are refused for {}.",
+            user.username,
+            minutes(secs.div_ceil(60))
+        )),
+        (false, None) => UserStatus::Active,
+    }
+}
+
 /// What kind of client a session or device is, for its "Kind" and its
 /// "Linux app · 2 hours ago": the platform its app said, "App" for one
-/// that has not said since the server began keeping it, and "Web or CLI"
-/// for a session with no device (the admin API's).
+/// that has not said since the server began keeping it, and "Web" or
+/// "Command-line client" for a session with no device (the admin API's).
 pub fn client_kind(endpoint_id: Option<&str>, platform: Option<Platform>) -> &'static str {
     match (endpoint_id, platform) {
-        (None, _) => "Web or CLI",
+        // The admin API's: the web UI or the CLI, by what signed it in
+        // (P3-18), unless it is from before the server kept which.
+        (None, Some(platform)) => platform.label(),
+        (None, None) => "Web or CLI",
         (Some(_), Some(platform)) => platform.label(),
         (Some(_), None) => "App",
     }
@@ -690,7 +715,38 @@ mod tests {
             has_pin: false,
             device_count: 0,
             session_count: 0,
+            rate_limited_secs: None,
         }
+    }
+
+    #[test]
+    fn a_user_whose_sign_ins_are_limited_says_so_with_the_wait() {
+        let mut steve = user("steve", Role::Consumer, false);
+        assert_eq!(user_status(&steve), UserStatus::Active);
+        steve.rate_limited_secs = Some(11 * 60 + 5);
+        assert_eq!(
+            user_status(&steve),
+            UserStatus::Limited(
+                "Too many wrong passwords. Password sign-ins as steve are refused for 12 minutes."
+                    .into()
+            )
+        );
+        steve.rate_limited_secs = Some(20);
+        assert!(
+            matches!(user_status(&steve), UserStatus::Limited(why) if why.ends_with("for a minute."))
+        );
+        // Disabled says more than limited.
+        steve.disabled = true;
+        assert_eq!(user_status(&steve), UserStatus::Disabled);
+    }
+
+    #[test]
+    fn a_session_without_a_device_is_the_web_ui_s_or_the_cli_s() {
+        assert_eq!(client_kind(None, Some(Platform::Web)), "Web");
+        assert_eq!(
+            client_kind(None, Some(Platform::Cli)),
+            "Command-line client"
+        );
     }
 
     #[test]

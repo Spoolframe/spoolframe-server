@@ -83,6 +83,20 @@ pub enum PreviewState {
     None,
 }
 
+/// Where an item's previews are, looked at without queuing them (P3-15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewPeek {
+    Ready(SetMeta),
+    /// Being made, or waiting in the queue (0).
+    Making {
+        done_percent: u8,
+    },
+    /// Not made, nor queued: made when it is first played.
+    NotMade,
+    /// It will have none, and why.
+    None(&'static str),
+}
+
 /// A file being made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Making {
@@ -402,6 +416,37 @@ impl Previews {
         drop(queue);
         self.wake.notify_waiters();
         Ok(PreviewState::Making { done_percent })
+    }
+
+    /// Where `id`'s previews are, as playback debug shows it (P3-15):
+    /// unlike [`Previews::state`], looking queues nothing.
+    pub async fn peek(&self, id: &MediaId) -> Result<PreviewPeek, CatalogError> {
+        if !has_pictures(id) {
+            return Ok(PreviewPeek::None("only films and episodes have previews"));
+        }
+        let path = self.sources.catalog.media_path(id).await?;
+        let settings = self.settings();
+        let Ok(key) = key(&path, settings.interval).await else {
+            return Ok(PreviewPeek::None("the file could not be read"));
+        };
+        if let Some(meta) = self.cache.get(&key) {
+            return Ok(PreviewPeek::Ready(meta));
+        }
+        if settings.when == When::Never {
+            return Ok(PreviewPeek::None("previews are off (previews.when)"));
+        }
+        if self
+            .failed
+            .lock()
+            .expect("never poisoned")
+            .contains_key(&key)
+        {
+            return Ok(PreviewPeek::None("they could not be made of this file"));
+        }
+        Ok(match self.lock_queue().progress(id) {
+            Some(done_percent) => PreviewPeek::Making { done_percent },
+            None => PreviewPeek::NotMade,
+        })
     }
 
     /// Sheet `n` of the set under `key`.

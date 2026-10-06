@@ -51,6 +51,16 @@ impl TextState {
     }
 }
 
+/// Where a track's text is, looked at without making it (P3-15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextPeek {
+    NotMade,
+    Making(TextState),
+    Ready,
+    /// The server cannot make it, and why.
+    Unavailable(String),
+}
+
 /// A track to make text of: stream `stream` of the file at `path`, as `to`.
 pub struct TextSource<'a> {
     pub path: &'a Path,
@@ -136,6 +146,42 @@ impl Subtitles {
     /// What the planner may read as text.
     pub fn ocr(&self) -> &Ocr {
         &self.ocr
+    }
+
+    /// Where the text of `source` is, as playback debug shows it (P3-15):
+    /// unlike [`Subtitles::text`], looking starts nothing.
+    pub async fn peek(&self, source: TextSource<'_>) -> TextPeek {
+        let how = match source.stream.kind {
+            SubtitleKind::Bitmap => {
+                if self.ocr.languages().is_empty() {
+                    return TextPeek::Unavailable(
+                        "the server has no text recognition (tesseract)".into(),
+                    );
+                }
+                let Some(language) = self.ocr.language_for(source.stream.language.as_deref())
+                else {
+                    return TextPeek::Unavailable(format!(
+                        "the server has no text recognition data for {}",
+                        source.stream.language.as_deref().unwrap_or("English")
+                    ));
+                };
+                How::Ocr { language }
+            }
+            SubtitleKind::Text => How::Convert,
+        };
+        let Ok(key) = key(&source, &how).await else {
+            return TextPeek::Unavailable("the media file could not be read".into());
+        };
+        let text = self
+            .cache_dir
+            .join(format!("{key}.{}", extension(source.to)));
+        if tokio::fs::try_exists(&text).await.unwrap_or(false) {
+            return TextPeek::Ready;
+        }
+        match self.making.lock().expect("never poisoned").get(&key) {
+            Some(state) => TextPeek::Making(state.borrow().clone()),
+            None => TextPeek::NotMade,
+        }
     }
 
     /// The text of `source`: ready at once from the cache, or being made.

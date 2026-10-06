@@ -705,7 +705,7 @@ impl AdminApi {
     }
 }
 
-fn media_id(id: &str) -> RpcResult<MediaId> {
+pub(super) fn media_id(id: &str) -> RpcResult<MediaId> {
     id.parse()
         .map_err(|_| error(error_code::INVALID_INPUT, format!("no item {id}")))
 }

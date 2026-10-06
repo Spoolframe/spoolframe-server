@@ -868,6 +868,99 @@ async fn a_second_plex_server_is_added_with_the_first_one_s_token_and_removed_wi
     assert!(!secret.exists());
 }
 
+/// Whether alice has watched `id`, as a client is told.
+async fn watched(served: &Served, id: &str) -> bool {
+    match served.item(id).await.unwrap() {
+        Item::Movie(m) => m.playback.watched,
+        other => panic!("not a movie: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_first_plex_server_is_removed_only_when_alone_and_its_watch_state_is_kept() {
+    let tower = pms("Tower", TOWER_SECTIONS, TOWER_FILMS).await;
+    let cabin = pms(
+        "Cabin",
+        &[(1, "movie", "Movies")],
+        &[film("11", 1, "Arrival", 200)],
+    )
+    .await;
+    // Set up as the wizard does: nothing in the file, the server added at
+    // run time.
+    let served = Served::start("remove-first", "").await;
+    let settings = &served.settings;
+    let first = settings
+        .plex_server_add(&tower.uri(), None, "root")
+        .await
+        .unwrap();
+    assert_eq!(first, "plex");
+    let watch = Request::MarkWatched {
+        id: media("plex:movie:11"),
+    };
+    assert_eq!(served.call(watch).await, Response::Ok(Reply::Done));
+    assert!(watched(&served, "plex:movie:11").await);
+
+    // Another server's items would answer to the first one's ids if it
+    // became the first: refused while there is one, with the reason.
+    settings
+        .plex_server_add(&cabin.uri(), None, "root")
+        .await
+        .unwrap();
+    let refused = settings.plex_server_remove("plex", "root").unwrap_err();
+    assert!(refused.to_string().contains("Cabin"), "{refused}");
+    assert!(watched(&served, "plex:movie:11").await);
+
+    // Alone, it goes, and the server is not set up again.
+    settings.plex_server_remove("cabin", "root").unwrap();
+    settings.plex_server_remove("plex", "root").unwrap();
+    assert!(matches!(
+        served.call(Request::Libraries).await,
+        Response::Err(Error::NotSetUp)
+    ));
+    let runtime = std::fs::read_to_string(served.server.dir.join("runtime.ucl")).unwrap();
+    assert!(!runtime.contains("plex"), "{runtime}");
+    // Its watch state is kept, under the ids its items had.
+    let alice = served
+        .server
+        .store
+        .password_login("alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let kept = served
+        .server
+        .store
+        .all_watch(Principal::LocalUser(alice.id))
+        .await
+        .unwrap();
+    assert_eq!(
+        kept.iter()
+            .map(|r| (r.media_id.as_str(), r.watched))
+            .collect::<Vec<_>>(),
+        [("plex:movie:11", true)]
+    );
+
+    // Added back, it is where it was.
+    settings
+        .plex_server_add(&tower.uri(), None, "root")
+        .await
+        .unwrap();
+    assert!(watched(&served, "plex:movie:11").await);
+}
+
+#[tokio::test]
+async fn the_first_plex_server_a_config_file_names_is_not_removed_at_run_time() {
+    let tower = pms("Tower", TOWER_SECTIONS, TOWER_FILMS).await;
+    let file = format!(r#"plex {{ url = "{}"; }}"#, tower.uri());
+    let served = Served::start("remove-first-file", &file).await;
+    let refused = served
+        .settings
+        .plex_server_remove("plex", "root")
+        .unwrap_err();
+    assert!(refused.to_string().contains("config file"), "{refused}");
+    assert_eq!(served.libraries().await.len(), 4);
+}
+
 #[tokio::test]
 async fn a_plex_server_that_is_down_is_an_answer_in_the_overview() {
     let tower = pms("Tower", TOWER_SECTIONS, TOWER_FILMS).await;
@@ -888,6 +981,49 @@ async fn a_plex_server_that_is_down_is_an_answer_in_the_overview() {
     assert_eq!((films.items, films.error.as_ref()), (Some(1), None));
     assert_eq!(cabin_movies.name, "Cabin movies");
     assert!(cabin_movies.error.is_some() && cabin_movies.items.is_none());
+}
+
+#[tokio::test]
+async fn a_down_server_s_libraries_keep_the_plex_titles_it_last_gave_after_a_restart() {
+    let tower = pms("Tower", TOWER_SECTIONS, TOWER_FILMS).await;
+    let cabin = pms("Cabin", &[(1, "movie", "Cabin films")], &[]).await;
+    let file = two_servers(&cabin.uri(), FILMS_AND_CABIN)
+        .replace("{tower}", &tower.uri())
+        .replace("{dir}", "/nonexistent");
+    let (_addr, root, dir) = admin_served("titles-kept", &file).await;
+    let titles = |o: &spoolframe_admin_api::LibrariesOverview| {
+        o.libraries
+            .iter()
+            .map(|l| l.plex_title.clone())
+            .collect::<Vec<_>>()
+    };
+    let up = root.libraries().await.unwrap();
+    assert_eq!(
+        titles(&up),
+        [Some("Movies".to_owned()), Some("Cabin films".to_owned())]
+    );
+
+    // Cabin stops answering, and the server starts again.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(&cabin)
+        .await;
+    let addr = crate::settings::serve_in(dir.as_ref(), &file, Default::default()).await;
+    let anonymous = crate::admin::anonymous(addr).await;
+    let login = spoolframe_admin_api::MeApiClient::login(
+        &anonymous,
+        crate::admin::creds("root", "correct horse"),
+    )
+    .await
+    .unwrap();
+    let root = crate::admin::with_token(addr, &login.token).await;
+    let down = root.libraries().await.unwrap();
+    assert!(!down.servers[1].status.reachable);
+    assert_eq!(
+        titles(&down),
+        [Some("Movies".to_owned()), Some("Cabin films".to_owned())]
+    );
 }
 
 #[tokio::test]

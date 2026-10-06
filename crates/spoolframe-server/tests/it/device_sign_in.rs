@@ -12,6 +12,9 @@ use spoolframe_admin_api::{MeApiClient, error_code};
 use spoolframe_protocol::{
     AuthMethod, DeviceSignInRequest, Error, Reply, Request, Response, SessionId,
 };
+use spoolframe_server::auth::Approval;
+use spoolframe_server::store::users::LocalUserId;
+use spoolframe_types::Platform;
 use support::{ServerOptions, TestClient, TestServer, fresh_dir};
 
 const PASSWORD: &str = "correct horse";
@@ -25,7 +28,8 @@ async fn server(test: &str, options: ServerOptions) -> TestServer {
 /// A TV that said Hello and began a sign-in: its request and code.
 async fn tv_begins(server: &TestServer) -> (TestClient, String, String) {
     let tv = server.client().await;
-    tv.hello_as(Some("Living room TV")).await;
+    tv.hello_from(Platform::Tvos, Some("Living room TV"), None)
+        .await;
     match tv.call(None, Request::BeginDeviceSignIn).await {
         Response::Ok(Reply::DeviceSignInStarted {
             request,
@@ -90,10 +94,13 @@ async fn an_approved_tv_gets_a_session_of_its_own() {
         Response::Ok(Reply::DeviceSignInRequest(DeviceSignInRequest {
             device_name,
             client_name,
+            platform,
             ..
         })) => {
             assert_eq!(device_name.as_deref(), Some("Living room TV"));
             assert_eq!(client_name, "test");
+            // As its Hello said: the phone shows "Apple TV app".
+            assert_eq!(platform, Platform::Tvos);
         }
         other => panic!("{other:?}"),
     }
@@ -402,6 +409,7 @@ async fn a_tv_approved_in_a_browser_gets_a_session_as_the_web_user() {
     let device = alice.device_sign_in_lookup(typed.clone()).await.unwrap();
     assert_eq!(device.device_name.as_deref(), Some("Living room TV"));
     assert_eq!(device.client_name, "test");
+    assert_eq!(device.platform, Platform::Tvos);
     assert!(device.requested_at > 0);
 
     let waiting = tv_awaits(&tv, &request);
@@ -592,5 +600,169 @@ async fn an_old_session_cannot_approve_a_fresh_session() {
     );
     tv.close().await;
     phone.close().await;
+    server.stop().await;
+}
+
+/// Bob, added straight to the store so a test knows his id, and a phone
+/// signed in as him.
+async fn bob_phone(server: &TestServer) -> (LocalUserId, TestClient, SessionId) {
+    let phc = spoolframe_server::auth::hash_password(PASSWORD)
+        .await
+        .unwrap();
+    let bob = server
+        .store
+        .add_user("bob", None, &phc, spoolframe_types::Role::Consumer)
+        .await
+        .unwrap();
+    let phone = server.client().await;
+    phone.hello_as(Some("Bob's iPhone")).await;
+    let session = phone.login("bob", PASSWORD).await;
+    (bob, phone, session)
+}
+
+/// Bob's live sessions on the TV that began `request`.
+async fn sessions_on_tv(server: &TestServer, bob: LocalUserId) -> usize {
+    server
+        .store
+        .list_sessions(bob)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|s| s.device_name.as_deref() == Some("Living room TV"))
+        .count()
+}
+
+/// Many approvals of one code at once, as a double tap or two phones
+/// send them: one signs the TV in, and one session is made.
+#[tokio::test]
+async fn approvals_of_one_code_at_once_sign_in_once() {
+    let server = server("dsi-race-approve", ServerOptions::default()).await;
+    let (tv, request, code) = tv_begins(&server).await;
+    let (bob, phone, session) = bob_phone(&server).await;
+    let approvals: Vec<_> = (0..8)
+        .map(|_| {
+            let (phone, session, code) = (phone.clone(), session.clone(), code.clone());
+            tokio::spawn(async move { phone.call(Some(&session), approve(&code)).await })
+        })
+        .collect();
+    let mut done = 0;
+    for approval in approvals {
+        match tokio::time::timeout(Duration::from_secs(10), approval)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Response::Ok(Reply::Done) => done += 1,
+            // The losers are told the code is gone, or, once they have
+            // counted as wrong codes, to wait.
+            Response::Err(Error::NotFound { .. } | Error::RateLimited { .. }) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(done, 1);
+    assert!(matches!(
+        tv.call(None, Request::AwaitDeviceSignIn { request }).await,
+        Response::Ok(Reply::LoggedIn { .. })
+    ));
+    assert_eq!(sessions_on_tv(&server, bob).await, 1);
+    tv.close().await;
+    phone.close().await;
+    server.stop().await;
+}
+
+/// An approval and a denial of one code at once: the TV is told the one
+/// that won, and the other is refused.
+#[tokio::test]
+async fn an_approval_and_a_denial_at_once_have_one_outcome() {
+    let server = server("dsi-race-deny", ServerOptions::default()).await;
+    let (bob, phone, session) = bob_phone(&server).await;
+    let mut approved_tvs = 0;
+    // Fewer rounds than wrong codes allowed: each round's loser counts as
+    // one.
+    for _ in 0..4 {
+        let (tv, request, code) = tv_begins(&server).await;
+        let approval = {
+            let (phone, session, code) = (phone.clone(), session.clone(), code.clone());
+            tokio::spawn(async move { phone.call(Some(&session), approve(&code)).await })
+        };
+        let denial = phone
+            .call(Some(&session), Request::DenyDeviceSignIn { code })
+            .await;
+        let approval = tokio::time::timeout(Duration::from_secs(10), approval)
+            .await
+            .unwrap()
+            .unwrap();
+        let told = tv.call(None, Request::AwaitDeviceSignIn { request }).await;
+        match (approval, denial) {
+            (Response::Ok(Reply::Done), Response::Err(Error::NotFound { .. })) => {
+                assert!(
+                    matches!(told, Response::Ok(Reply::LoggedIn { .. })),
+                    "{told:?}"
+                );
+                approved_tvs += 1;
+            }
+            (Response::Err(Error::NotFound { .. }), Response::Ok(Reply::Done)) => {
+                assert_eq!(told, Response::Err(Error::DeviceSignInDenied));
+            }
+            other => panic!("not one outcome: {other:?}"),
+        }
+        tv.close().await;
+    }
+    assert_eq!(sessions_on_tv(&server, bob).await, approved_tvs);
+    phone.close().await;
+    server.stop().await;
+}
+
+/// A code claimed by an approver, then run out before its session was
+/// made: the TV was told it expired, so the approver is told so too, and
+/// no session is left that nobody holds.
+#[tokio::test]
+async fn an_approval_outrun_by_the_code_leaves_no_session() {
+    let options = ServerOptions {
+        sign_in_lifetime: Duration::from_millis(300),
+        ..ServerOptions::default()
+    };
+    let server = server("dsi-race-expire", options).await;
+    let (tv, request, code) = tv_begins(&server).await;
+    let claim = server.auth.sign_ins().claim(&code, None).unwrap();
+    let (bob, phone, _) = bob_phone(&server).await;
+    assert_eq!(
+        tv.call(None, Request::AwaitDeviceSignIn { request }).await,
+        Response::Err(Error::DeviceSignInExpired)
+    );
+    assert_eq!(
+        server.auth.approve_device(bob, &claim).await.unwrap(),
+        Approval::Expired
+    );
+    assert_eq!(sessions_on_tv(&server, bob).await, 0);
+    tv.close().await;
+    phone.close().await;
+    server.stop().await;
+}
+
+/// The same from a browser: a double click on Approve signs in once.
+#[tokio::test]
+async fn approvals_of_one_code_at_once_in_a_browser_sign_in_once() {
+    let (server, web) = server_with_web("dsi-web-race", ServerOptions::default()).await;
+    let (tv, request, code) = tv_begins(&server).await;
+    let alice = alice_on_the_web(web).await;
+    let approvals =
+        futures_util::future::join_all((0..4).map(|_| alice.device_sign_in_approve(code.clone())));
+    let approvals = tokio::time::timeout(Duration::from_secs(10), approvals)
+        .await
+        .unwrap();
+    assert_eq!(approvals.iter().filter(|a| a.is_ok()).count(), 1);
+    for refused in approvals.into_iter().filter_map(Result::err) {
+        assert_eq!(
+            crate::admin::code(refused),
+            error_code::NO_SUCH_SIGN_IN_CODE
+        );
+    }
+    assert!(matches!(
+        tv.call(None, Request::AwaitDeviceSignIn { request }).await,
+        Response::Ok(Reply::LoggedIn { .. })
+    ));
+    assert_eq!(alice.devices().await.unwrap().len(), 1);
+    tv.close().await;
     server.stop().await;
 }

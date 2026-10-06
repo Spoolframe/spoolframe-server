@@ -37,7 +37,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
 
 use crate::artwork::{Artwork, ArtworkError};
-use crate::auth::{self, LoginError, RECENT_SIGN_IN, SessionToken, UnlockError};
+use crate::auth::{self, Approval, LoginError, RECENT_SIGN_IN, SessionToken, UnlockError};
 use crate::device_sign_in::{self, ClaimError, Outcome, Waiting};
 use crate::encode::job::{EncodeJob, JobError, Progress};
 use crate::encode::{Conversion, ConversionSource, hls};
@@ -425,6 +425,13 @@ impl ClientProtocol {
                     // A device signed in before platforms were kept gets
                     // one now; a failure costs only the label.
                     let endpoint = connection.remote_id().to_string();
+                    if let Some(hello) = state.hello.get() {
+                        self.services.connected.hello(
+                            connection.stable_id(),
+                            endpoint.clone(),
+                            hello,
+                        );
+                    }
                     if let Err(e) = self.store().note_device_platform(&endpoint, platform).await {
                         tracing::warn!(error = %e, %endpoint, "cannot keep the device's platform");
                     }
@@ -691,6 +698,13 @@ impl ClientProtocol {
                         revision: current.revision,
                     });
                 }
+                // On its chart in playback debug (P3-15).
+                self.services.playbacks.read(
+                    &request.handle,
+                    request.offset,
+                    reply.sent,
+                    request.segment,
+                );
                 Ok((
                     ResourceMetadata::Media {
                         size: reply.size,
@@ -881,7 +895,7 @@ impl ClientProtocol {
                 .await
                 .map_err(internal)?;
             if live.is_none() {
-                playbacks.end(handle);
+                playbacks.end(handle, crate::playback::EndReason::SignedOut);
                 return Err(Error::Unauthenticated);
             }
         }
@@ -1410,7 +1424,9 @@ impl ClientProtocol {
                     )
                     .await
                     .map_err(watch_error)?;
-                self.services.playbacks.record_progress(&handle, sequence);
+                self.services
+                    .playbacks
+                    .record_progress(&handle, sequence, position_ms);
                 Ok(Reply::Done)
             }
             Request::MarkWatched { id } => {
@@ -1555,7 +1571,21 @@ impl ClientProtocol {
                 );
                 // The item's markers go with the playback (P2-10), so a
                 // player needs no second request for them.
-                let markers = catalog.item(&id).await.map_err(catalog_error)?.markers;
+                let found = catalog.item(&id).await.map_err(catalog_error)?;
+                let markers = found.markers;
+                let mut shown = crate::playback::Shown::of(&found.item);
+                if shown.duration_ms.is_none() {
+                    shown.duration_ms = descriptor.duration.map(|d| d.as_millis() as u64);
+                }
+                let hello = state.hello.get().expect("served after Hello");
+                let viewer = crate::playback::Viewer {
+                    user_id: format!("local:{}", user.user),
+                    username: user.username.clone(),
+                    display_name: user.display_name.clone(),
+                    device_name: hello.device_name.clone(),
+                    client_name: hello.client_name.clone(),
+                    platform: hello.platform,
+                };
                 let handle = Playbacks::new_handle();
                 // This device's earlier encodes are abandoned: free their
                 // slots before this one takes one.
@@ -1585,6 +1615,9 @@ impl ClientProtocol {
                 let handle = self.services.playbacks.start(
                     handle,
                     Opened {
+                        viewer,
+                        shown,
+                        planned: plan.clone(),
                         session,
                         endpoint,
                         item: id.clone(),
@@ -1655,6 +1688,7 @@ impl ClientProtocol {
                 let replaced = self.services.playbacks.change(
                     &handle,
                     Changed {
+                        planned: plan.clone(),
                         selection,
                         size,
                         subtitle,
@@ -1668,7 +1702,9 @@ impl ClientProtocol {
             Request::StopPlayback { handle } => {
                 // Only the session and endpoint that started it may end it.
                 self.use_playback(connection, &handle, &session).await?;
-                self.services.playbacks.end(&handle);
+                self.services
+                    .playbacks
+                    .end(&handle, crate::playback::EndReason::Finished);
                 Ok(Reply::Done)
             }
             // Converted playback only; served from P2-04 and P2-05.
@@ -1755,6 +1791,7 @@ impl ClientProtocol {
                     Some(waiting) => Ok(Reply::DeviceSignInRequest(DeviceSignInRequest {
                         device_name: waiting.device_name,
                         client_name: waiting.client_name,
+                        platform: waiting.platform,
                         requested_at: waiting.requested_at,
                     })),
                     None => Err(self.wrong_sign_in_code(connection, &user)),
@@ -1764,8 +1801,7 @@ impl ClientProtocol {
                 recently_signed_in(&user)?;
                 let code = self.sign_in_code(connection, &user, &code)?;
                 let approver = connection.remote_id().to_string();
-                let sign_ins = self.services.auth.sign_ins();
-                let claim = match sign_ins.claim(&code, Some(&approver)) {
+                let claim = match self.services.auth.sign_ins().claim(&code, Some(&approver)) {
                     Ok(claim) => claim,
                     Err(ClaimError::Unknown) => {
                         return Err(self.wrong_sign_in_code(connection, &user));
@@ -1777,8 +1813,7 @@ impl ClientProtocol {
                     }
                 };
                 match self.services.auth.approve_device(user.user, &claim).await {
-                    Ok(token) => {
-                        sign_ins.fulfil(&claim.request, Some(token));
+                    Ok(Approval::SignedIn) => {
                         tracing::info!(
                             user = %user.username,
                             device = %claim.endpoint,
@@ -1786,10 +1821,12 @@ impl ClientProtocol {
                         );
                         Ok(Reply::Done)
                     }
-                    Err(e) => {
-                        sign_ins.fulfil(&claim.request, None);
-                        Err(internal(e))
-                    }
+                    // The right code, run out while it was approved: not
+                    // a guess, so not counted as one.
+                    Ok(Approval::Expired) => Err(Error::NotFound {
+                        what: "sign-in code".into(),
+                    }),
+                    Err(e) => Err(internal(e)),
                 }
             }
             Request::DenyDeviceSignIn { code } => {
@@ -2262,6 +2299,7 @@ impl ProtocolHandler for ClientProtocol {
 
         self.events.lock().await.remove(&id);
         self.connections.remove(id);
+        self.services.connected.closed(id);
         tracing::info!(?auth, %reason, "client disconnected");
         self.end_playbacks_unless_back(connection.remote_id());
         Ok(())
@@ -2421,6 +2459,7 @@ fn internal(e: impl std::fmt::Display) -> Error {
 fn playback_refusal(refusal: Refusal) -> Error {
     match refusal {
         Refusal::Expired => Error::PlaybackExpired,
+        Refusal::Stopped => Error::PlaybackStopped,
         Refusal::NotYours => Error::Unauthenticated,
     }
 }

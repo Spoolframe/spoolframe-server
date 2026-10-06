@@ -24,16 +24,63 @@ pub fn supported() -> bool {
 }
 
 /// Make a passkey: the browser's prompt for the server's `options`
-/// (`{"publicKey": …}` from `me.passkeyAddBegin`), and what it made, for
-/// `me.passkeyAddFinish`.
-pub async fn create(options: &Value) -> Result<Value, String> {
-    prompt(options, true).await.map_err(|e| explain(&e, true))
+/// (`{"publicKey": …}` from `me.passkeyAddBegin`), opened now; its
+/// answer is what `me.passkeyAddFinish` takes.
+///
+/// Called from a click handler itself, before anything is awaited, so it
+/// opens inside the click: Safari refuses a passkey prompt opened after a
+/// network request. So the options are fetched ahead, and the click only
+/// opens the prompt.
+pub fn open_create(options: &Value) -> Result<Prompt, String> {
+    Prompt::open(options, true).map_err(|e| explain(&e, true))
 }
 
 /// Sign with a passkey: the browser's prompt for the server's `options`
-/// (from `/auth/passkey/begin`), and what the passkey signed.
-pub async fn get(options: &Value) -> Result<Value, String> {
-    prompt(options, false).await.map_err(|e| explain(&e, false))
+/// (from `/auth/passkey/begin`), opened now, as [`open_create`]; its
+/// answer is what the passkey signed.
+pub fn open_get(options: &Value) -> Result<Prompt, String> {
+    Prompt::open(options, false).map_err(|e| explain(&e, false))
+}
+
+/// A passkey prompt the browser has open: [`Prompt::answer`] waits for
+/// the person.
+pub struct Prompt {
+    pending: JsFuture,
+    adding: bool,
+}
+
+impl Prompt {
+    fn open(options: &Value, adding: bool) -> Result<Self, JsValue> {
+        let key = js_sys::JSON::parse(&options["publicKey"].to_string())?;
+        bytes_at(&key, "challenge")?;
+        if adding {
+            bytes_at(&get_in(&key, "user")?, "id")?;
+            ids_at(&key, "excludeCredentials")?;
+        } else {
+            ids_at(&key, "allowCredentials")?;
+        }
+        let request = Object::new();
+        Reflect::set(&request, &"publicKey".into(), &key)?;
+        let credentials = web_sys::window()
+            .ok_or_else(|| JsValue::from_str("no window"))?
+            .navigator()
+            .credentials();
+        let promise = if adding {
+            credentials.create_with_options(request.unchecked_ref())?
+        } else {
+            credentials.get_with_options(request.unchecked_ref())?
+        };
+        Ok(Self {
+            pending: JsFuture::from(promise),
+            adding,
+        })
+    }
+
+    /// What the passkey made or signed, for the server.
+    pub async fn answer(self) -> Result<Value, String> {
+        let adding = self.adding;
+        read(self.pending.await, adding).map_err(|e| explain(&e, adding))
+    }
 }
 
 fn get_in(target: &JsValue, key: &str) -> Result<JsValue, JsValue> {
@@ -72,27 +119,9 @@ fn text_of(source: &JsValue, key: &str) -> Result<Option<String>, JsValue> {
     Ok(Some(base64url(&Uint8Array::new(&buffer).to_vec())))
 }
 
-async fn prompt(options: &Value, adding: bool) -> Result<Value, JsValue> {
-    let key = js_sys::JSON::parse(&options["publicKey"].to_string())?;
-    bytes_at(&key, "challenge")?;
-    if adding {
-        bytes_at(&get_in(&key, "user")?, "id")?;
-        ids_at(&key, "excludeCredentials")?;
-    } else {
-        ids_at(&key, "allowCredentials")?;
-    }
-    let request = Object::new();
-    Reflect::set(&request, &"publicKey".into(), &key)?;
-    let credentials = web_sys::window()
-        .ok_or_else(|| JsValue::from_str("no window"))?
-        .navigator()
-        .credentials();
-    let promise = if adding {
-        credentials.create_with_options(request.unchecked_ref())?
-    } else {
-        credentials.get_with_options(request.unchecked_ref())?
-    };
-    let credential = JsFuture::from(promise).await?;
+/// The credential the browser answered with, as the server reads it.
+fn read(answered: Result<JsValue, JsValue>, adding: bool) -> Result<Value, JsValue> {
+    let credential = answered?;
     if credential.is_null() || credential.is_undefined() {
         return Err(JsValue::from_str("the browser gave no credential"));
     }

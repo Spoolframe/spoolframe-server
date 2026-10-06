@@ -13,8 +13,9 @@ use spoolframe_admin_api::{
 use super::admin::{Said, Toast, say, sleep};
 use super::{Alert, Field, Route, icons, rpc};
 use crate::libraries::{
-    FILES_HERE, PathCell, REMOTE_NOTE, add_label, added_text, down, down_text, items_line,
-    local_path, path_cell, refusals, remote, sample_line, section_line, source_line, with_path,
+    DropLine, FILES_HERE, PathCell, REMOTE_NOTE, add_label, added_text, down, down_text, drop_line,
+    dropped_at, items_line, local_path, path_cell, refusals, remote, sample_line, section_line,
+    source_line, with_path,
 };
 use crate::logic::{ApiError, host_port};
 use crate::plex_sync::{
@@ -57,6 +58,9 @@ pub fn Libraries() -> Element {
     let mut removing = use_signal(|| None::<LibraryEntry>);
     let mut mapping = use_signal(|| None::<LibraryEntry>);
     let mut menu = use_signal(|| None::<String>);
+    // The row being dragged to a new place, and the row it is over.
+    let mut dragged = use_signal(|| None::<usize>);
+    let mut over = use_signal(|| None::<usize>);
     use_hook(move || {
         if let Some((ok, text)) = ARRIVING.with(|a| a.borrow_mut().take()) {
             say(toast, ok, text);
@@ -128,7 +132,10 @@ pub fn Libraries() -> Element {
                 Some(Err(error)) => rsx! {
                     Alert { text: format!("Couldn't load the libraries: {}", error.explain()) }
                 },
-                Some(Ok(o)) => rsx! {
+                Some(Ok(o)) => {
+                    // By row, for a drop: the dragged row's library.
+                    let order: Vec<String> = o.libraries.iter().map(|l| l.id.clone()).collect();
+                    rsx! {
                     if o.locked {
                         div { class: "alert alert-info", role: "note",
                             icons::Lock { size: 16 }
@@ -174,6 +181,36 @@ pub fn Libraries() -> Element {
                                     first: i == 0,
                                     last: i + 1 == o.libraries.len(),
                                     locked: o.locked,
+                                    dragging: dragged().is_some(),
+                                    dragged: dragged() == Some(i),
+                                    line: match (dragged(), over()) {
+                                        (Some(from), Some(at)) if at == i => drop_line(from, i),
+                                        _ => None,
+                                    },
+                                    on_drag_start: move |_| {
+                                        menu.set(None);
+                                        dragged.set(Some(i));
+                                    },
+                                    on_drag_over: move |_| {
+                                        if over() != Some(i) {
+                                            over.set(Some(i));
+                                        }
+                                    },
+                                    on_drop: {
+                                        let order = order.clone();
+                                        move |_| {
+                                            if let Some(from) = dragged.take()
+                                                && let (Some(position), Some(id)) = (dropped_at(from, i), order.get(from))
+                                            {
+                                                moved(id.clone(), position);
+                                            }
+                                            over.set(None);
+                                        }
+                                    },
+                                    on_drag_end: move |_| {
+                                        dragged.set(None);
+                                        over.set(None);
+                                    },
                                     menu_open: menu() == Some(library.id.clone()),
                                     on_menu: {
                                         let id = library.id.clone();
@@ -244,7 +281,8 @@ pub fn Libraries() -> Element {
                             }
                         }
                     }
-                },
+                    }
+                }
             }
         }
         if let Some(library) = renaming() {
@@ -305,7 +343,16 @@ fn LibraryRow(
     first: bool,
     last: bool,
     locked: bool,
+    /// A row, any of them, is being dragged; this one, and the line a
+    /// drop on this one would land on.
+    dragging: bool,
+    dragged: bool,
+    line: Option<DropLine>,
     menu_open: bool,
+    on_drag_start: EventHandler<()>,
+    on_drag_over: EventHandler<()>,
+    on_drop: EventHandler<()>,
+    on_drag_end: EventHandler<()>,
     on_menu: EventHandler<()>,
     on_up: EventHandler<()>,
     on_down: EventHandler<()>,
@@ -316,9 +363,62 @@ fn LibraryRow(
 ) -> Element {
     let cell = path_cell(&library, reachable);
     let off = matches!(cell, PathCell::Unavailable(_));
+    // Draggable only from the grip: a row that always were would take
+    // the drag from its link and its select. The arrows stay for the
+    // keyboard.
+    let mut armed = use_signal(|| false);
+    let class = [
+        Some("lib-row"),
+        off.then_some("off"),
+        dragged.then_some("dragged"),
+        match line {
+            Some(DropLine::Above) => Some("drop-above"),
+            Some(DropLine::Below) => Some("drop-below"),
+            None => None,
+        },
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    let name = library.name.clone();
     rsx! {
-        div { class: if off { "lib-row off" } else { "lib-row" },
-            span { class: "lib-grip", aria_hidden: "true", icons::Grip {} }
+        div {
+            class: "{class}",
+            draggable: if armed() && !locked { "true" } else { "false" },
+            ondragstart: move |e: DragEvent| {
+                let data = e.data_transfer();
+                // Firefox starts no drag without data.
+                let _ = data.set_data("text/plain", &name);
+                data.set_effect_allowed("move");
+                on_drag_start.call(());
+            },
+            ondragover: move |e: DragEvent| {
+                if dragging {
+                    // Without this, nothing may be dropped here.
+                    e.prevent_default();
+                    e.data_transfer().set_drop_effect("move");
+                    on_drag_over.call(());
+                }
+            },
+            ondrop: move |e: DragEvent| {
+                if dragging {
+                    e.prevent_default();
+                    on_drop.call(());
+                }
+            },
+            ondragend: move |_| {
+                armed.set(false);
+                on_drag_end.call(());
+            },
+            span {
+                class: if locked { "lib-grip" } else { "lib-grip lib-grip-on" },
+                aria_hidden: "true",
+                title: if !locked { "Drag to reorder" },
+                onpointerdown: move |_| armed.set(true),
+                onpointerup: move |_| armed.set(false),
+                icons::Grip {}
+            }
             span { class: "lib-move",
                 button {
                     aria_label: "Move {library.name} up",

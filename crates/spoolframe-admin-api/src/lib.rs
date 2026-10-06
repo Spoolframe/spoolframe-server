@@ -75,6 +75,10 @@ pub mod error_code {
     /// The provider account is linked to another user, or the user has
     /// one linked at that provider already (P3-04).
     pub const LINK_REFUSED: i32 = -32022;
+    /// Not a playback open now or ended in the last hour (P3-15).
+    pub const NO_SUCH_PLAYBACK: i32 = -32023;
+    /// End conversion on a playback that plays the file directly (P3-15).
+    pub const NO_CONVERSION: i32 = -32024;
 }
 
 /// A username and password.
@@ -207,6 +211,10 @@ pub struct UserInfo {
     pub device_count: u64,
     /// Their live sessions, as `admin.userSessions` lists them.
     pub session_count: u64,
+    /// Seconds until password sign-ins as them are checked again, after
+    /// too many wrong ones under their username (P1-11, P3-18); `None`
+    /// when they are checked now.
+    pub rate_limited_secs: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,9 +277,10 @@ pub struct SessionEntry {
     /// a web or CLI session.
     #[serde(default)]
     pub endpoint_id: Option<String>,
-    /// What kind of client the device runs, for a client session; `None`
-    /// for a web or CLI session, or a device not seen since before the
-    /// server kept it.
+    /// What kind of client the device runs, for a client session: for an
+    /// admin API session `Web` or `Cli`, by what signed it in (P3-18).
+    /// `None` for a device not seen since before the server kept it, or
+    /// an admin API session from before it kept which.
     pub platform: Option<Platform>,
 }
 
@@ -374,6 +383,8 @@ pub struct DeviceSignIn {
     pub device_name: Option<String>,
     /// The app on it, e.g. `spoolframe-linux`.
     pub client_name: String,
+    /// What kind of client it runs, as it said when it connected.
+    pub platform: Platform,
     /// Unix seconds.
     pub requested_at: i64,
 }
@@ -514,8 +525,9 @@ pub struct LibraryEntry {
     /// Its Plex server's id, and what Spoolframe calls that server.
     pub server: String,
     pub server_name: String,
-    /// Its section's key in Plex, and Plex's name for it when the server
-    /// answers.
+    /// Its section's key in Plex, and Plex's name for it: as the server
+    /// answers, or, while it is down, as it last answered (P3-18); `None`
+    /// for a server that has never answered here.
     pub section: String,
     pub plex_title: Option<String>,
     /// Its top-level items, when the server answers.
@@ -1458,6 +1470,405 @@ pub struct TelemetryStatus {
     pub metrics: MetricsEndpointStatus,
 }
 
+/// How a playback is served (P3-15): the file as it is, its streams
+/// copied into another container, encoded, or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanKind {
+    Direct,
+    Remux,
+    Transcode,
+    Unsupported,
+}
+
+/// A plan in the words of the server's "playback started" log line
+/// (P3-15): `direct`, `converted`, `unsupported`; `range`, `hls`,
+/// `progressive`; `copy:hevc`, `encode:h264:1080p:tonemap`,
+/// `copy:eac3`, `ocr:pgs>srt`, `none`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanLine {
+    pub kind: String,
+    pub delivery: String,
+    pub video: String,
+    pub audio: String,
+    pub subtitle: String,
+}
+
+/// Which part of a file a plan row is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StreamKind {
+    Container,
+    Video,
+    Audio,
+    Subtitle,
+}
+
+/// What a plan does with one part of the file (P3-15). Codec and format
+/// names are the protocol's (`hevc`, `eac3`, `web_vtt`, `matroska`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+pub enum StreamOut {
+    /// Played as it is in the file.
+    Direct,
+    /// Copied into the new container as it is.
+    #[serde(rename_all = "camelCase")]
+    Copy { codec: String },
+    /// Decoded and encoded again.
+    #[serde(rename_all = "camelCase")]
+    Encode {
+        codec: String,
+        /// Video: the height encoded to.
+        height: Option<u32>,
+        /// Audio: the channels encoded to.
+        channels: Option<u32>,
+        /// Bits per second: the cap for video, the rate for audio.
+        bitrate: Option<u64>,
+        /// HDR mapped to SDR.
+        tone_map: bool,
+        /// The encoder that runs it (`h264_vaapi`, `libx264`), when the
+        /// server has one.
+        encoder: Option<String>,
+    },
+    /// Pictures read as text (OCR), sent beside the stream.
+    #[serde(rename_all = "camelCase")]
+    ReadAsText { from: String, to: String },
+    /// Text converted to another format.
+    #[serde(rename_all = "camelCase")]
+    Convert { from: String, to: String },
+    /// Drawn into the video, which is then encoded.
+    #[serde(rename_all = "camelCase")]
+    BurnIn { format: String },
+    /// A subtitle file the client fetches beside the stream as it is.
+    #[serde(rename_all = "camelCase")]
+    Beside { format: String },
+    /// Into another container.
+    #[serde(rename_all = "camelCase")]
+    Remux { to: String },
+    /// The plan cannot play it.
+    Unplayable,
+}
+
+/// One row of a plan (P3-15): a stream (or the container), what it is in
+/// the file, what the plan does with it, and the planner's reasons that
+/// name it, word for word.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanStream {
+    pub stream: StreamKind,
+    /// The track's number as the plan's reasons and the client's
+    /// selection count it (0 for the first audio track); `None` for the
+    /// video and the container.
+    pub index: Option<u32>,
+    /// What it is in the file: `hevc main 10 2160p hdr10`, `dts 7.1 eng`.
+    pub source: String,
+    pub out: StreamOut,
+    pub reasons: Vec<String>,
+}
+
+/// A plan as playback debug shows it (P3-15): what `PlaybackPlan`
+/// returns, laid out by stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanView {
+    pub kind: PlanKind,
+    pub line: PlanLine,
+    pub streams: Vec<PlanStream>,
+    /// The plan's reasons that name no stream.
+    pub reasons: Vec<String>,
+    /// Exactly the `PlaybackPlan` the client protocol gives, as JSON.
+    pub plan: serde_json::Value,
+}
+
+/// How far a playback has read in its encode now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "unit", rename_all = "camelCase")]
+pub enum ReadMark {
+    /// Bytes into the file or the progressive stream.
+    #[serde(rename_all = "camelCase")]
+    Byte { offset: u64 },
+    /// An HLS segment.
+    #[serde(rename_all = "camelCase")]
+    Segment { n: u32 },
+}
+
+/// A playback's conversion now (P3-15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversionState {
+    /// How far into the film the encode has got, ms.
+    pub converted_ms: u64,
+    pub bytes: u64,
+    /// HLS: the last segment finished.
+    pub last_segment: Option<u32>,
+    /// Held back by the throttle for its reader.
+    pub paused: bool,
+    /// ffmpeg runs, paused or not.
+    pub running: bool,
+    /// An admin ended it.
+    pub ended: bool,
+    /// ffmpeg's failure, when it failed.
+    pub failed: Option<String>,
+    /// It encodes a stream, rather than only copying them.
+    pub encodes: bool,
+}
+
+/// One playback as Server › Playback lists it (P3-15).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackRow {
+    /// What the admin API names it by; never its handle.
+    pub id: String,
+    /// `local:<uuid>`.
+    pub user_id: String,
+    pub username: String,
+    pub display_name: String,
+    /// The device's own name, else its app's.
+    pub device: String,
+    pub platform: Platform,
+    /// Its `MediaId`.
+    pub item: String,
+    /// `Alien`; `Severance · S2 E4`.
+    pub title: String,
+    /// An episode's title; a track's artist.
+    pub subtitle: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub plan: PlanKind,
+    pub line: PlanLine,
+    /// Why it is converted or cannot play, as the plan says.
+    pub reasons: Vec<String>,
+    /// The encode's epoch; 0 for direct play.
+    pub epoch: u32,
+    /// Bumped by each subtitle change and seek.
+    pub revision: u64,
+    /// Unix ms.
+    pub started_at: i64,
+    /// Where the client last said it was, ms.
+    pub position_ms: Option<u64>,
+    /// Where in the film the last read was, ms.
+    pub read_to_ms: Option<u64>,
+    pub furthest: Option<ReadMark>,
+    /// Unix ms.
+    pub last_read_at: Option<i64>,
+    pub conversion: Option<ConversionState>,
+}
+
+/// How a playback ended (P3-15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum EndedWhy {
+    /// Its client stopped it.
+    Finished,
+    /// An admin stopped it.
+    Stopped,
+    /// No reads for 5 minutes.
+    Idle,
+    /// Its device started another conversion.
+    Replaced,
+    /// Its device was gone too long.
+    DeviceGone,
+    /// Its session ended or its user was disabled.
+    SignedOut,
+    /// Its conversion failed.
+    #[serde(rename_all = "camelCase")]
+    Failed { reason: String },
+}
+
+/// A playback that ended in the last hour, as it was at the end.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndedPlayback {
+    /// Unix ms.
+    pub at: i64,
+    pub why: EndedWhy,
+    pub playback: PlaybackRow,
+}
+
+/// Server › Playback (P3-15): what plays now, newest first, and what
+/// ended in the last hour, newest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackList {
+    /// The server's clock, Unix ms: what "N s ago" counts from.
+    pub now: i64,
+    pub open: Vec<PlaybackRow>,
+    pub ended: Vec<EndedPlayback>,
+}
+
+/// One point of a playback's reads (P3-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadPoint {
+    /// Unix ms.
+    pub at: i64,
+    /// Where in the film the read was, ms.
+    pub read_ms: Option<u64>,
+    /// How far the conversion had got, ms; none for direct play.
+    pub converted_ms: Option<u64>,
+}
+
+/// One playback's page (P3-15).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackDetail {
+    pub now: i64,
+    pub playback: PlaybackRow,
+    /// Set once it has ended: when and how.
+    pub ended: Option<EndedPlayback>,
+    pub plan: PlanView,
+    /// The ffmpeg command line its conversion runs: paths shown, tokens
+    /// (the playback handle, a Plex token) never.
+    pub command: Option<String>,
+    /// ffmpeg's last stderr lines, oldest first, tokens hidden.
+    pub stderr: Vec<String>,
+    /// The last `readsWindowSecs` of reads, one point a second at most.
+    pub reads: Vec<ReadPoint>,
+    pub reads_window_secs: u32,
+}
+
+/// Picture subtitles in "Plan for…": as the client's setting says them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PictureSubtitles {
+    /// Drawn by the device if it can, else read as text, else burned in.
+    Auto,
+    /// Always read as text.
+    Text,
+    /// Always burned in.
+    BurnIn,
+}
+
+/// What "Plan for…" plans (P3-15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanFor {
+    /// A [`DeviceChoice::id`].
+    pub device: String,
+    /// The audio track (0 for the first); none: the file's default.
+    pub audio: Option<u32>,
+    pub subtitle: Option<u32>,
+    pub pictures: PictureSubtitles,
+}
+
+/// A device "Plan for…" can plan for (P3-15): one connected now, with
+/// what its `Hello` said it plays, or a stored profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceChoice {
+    /// `device:<endpoint id>` or `profile:<name>`.
+    pub id: String,
+    pub name: String,
+    pub connected: bool,
+    /// What the choice stands for, in a line.
+    pub note: String,
+}
+
+/// One stream of a file as ffprobe sees it (P3-15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeStream {
+    /// The stream's index in the file; none for a file beside it.
+    pub index: Option<u32>,
+    pub kind: StreamKind,
+    /// Its number among its kind, as plans and selections count it.
+    pub track: u32,
+    /// ffprobe's codec name.
+    pub codec: String,
+    /// `main 10 · 2160p · 23.976 fps · hdr10`, `5.1 · eng`.
+    pub details: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    /// Its role (P1-20): `main`, `commentary`, `forced`, `sdh`, ….
+    pub role: Option<String>,
+    pub default: bool,
+    pub forced: bool,
+    /// The file beside the media file it is in.
+    pub file: Option<String>,
+}
+
+/// A media file as the server's ffprobe describes it (P1-06).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Probe {
+    pub path: String,
+    /// ffprobe's container name.
+    pub container: String,
+    pub duration_ms: Option<u64>,
+    pub bit_rate: Option<u64>,
+    pub size: Option<u64>,
+    pub streams: Vec<ProbeStream>,
+}
+
+/// Where a cached piece of work is (P3-15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum CacheState {
+    /// Nothing made, nothing being made.
+    NotMade,
+    /// Behind another track.
+    Waiting,
+    #[serde(rename_all = "camelCase")]
+    Making {
+        done_percent: u8,
+    },
+    Ready,
+    #[serde(rename_all = "camelCase")]
+    Failed {
+        reason: String,
+    },
+    /// The server cannot make it.
+    #[serde(rename_all = "camelCase")]
+    Unavailable {
+        reason: String,
+    },
+}
+
+/// A subtitle track's text, as the server makes it (P2-07, P3-08).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleCache {
+    pub track: u32,
+    /// `pgs eng forced`.
+    pub label: String,
+    /// Read from pictures (OCR), not converted from text.
+    pub ocr: bool,
+    /// The format made: `srt`, `web_vtt`; none while nothing is.
+    pub to: Option<String>,
+    pub state: CacheState,
+}
+
+/// An item's frame previews (P3-13), as the cache has them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum PreviewCache {
+    #[serde(rename_all = "camelCase")]
+    Ready {
+        count: u32,
+        interval_ms: u64,
+        sheets: u32,
+    },
+    #[serde(rename_all = "camelCase")]
+    Making { done_percent: u8 },
+    /// Not made, nor queued: made when it is first played.
+    NotMade,
+    /// It will have none.
+    #[serde(rename_all = "camelCase")]
+    None { reason: String },
+}
+
+/// An item's Debug tab (P3-15).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemDebug {
+    /// `None` when it could not be probed: `probeError` says why.
+    pub probe: Option<Probe>,
+    pub probe_error: Option<String>,
+    pub devices: Vec<DeviceChoice>,
+    pub subtitles: Vec<SubtitleCache>,
+    pub previews: PreviewCache,
+}
+
 /// The caller's own account, for every role.
 #[cfg_attr(
     all(feature = "client", feature = "server"),
@@ -2096,4 +2507,44 @@ pub trait AdminApi {
     /// `settings`; header values are never returned anywhere.
     #[method(name = "telemetryStatus", with_extensions)]
     async fn telemetry_status(&self) -> jsonrpsee::core::RpcResult<TelemetryStatus>;
+
+    /// Every playback open now, and those that ended in the last hour
+    /// (P3-15): Server › Playback. Nothing here changes a playback.
+    #[method(name = "playbacks", with_extensions)]
+    async fn playbacks(&self) -> jsonrpsee::core::RpcResult<PlaybackList>;
+
+    /// One playback, open or ended in the last hour (P3-15): its plan in
+    /// full, its conversion's command line and last stderr lines, its
+    /// reads over the last 10 minutes. `NO_SUCH_PLAYBACK` for an id it
+    /// does not know.
+    #[method(name = "playback", with_extensions)]
+    async fn playback(&self, id: String) -> jsonrpsee::core::RpcResult<PlaybackDetail>;
+
+    /// Stop playback `id` (P3-15): it ends now, its conversion with it,
+    /// and its client is told it was stopped, so it does not start it
+    /// again. Its progress is kept. `NO_SUCH_PLAYBACK` unless it is open.
+    #[method(name = "playbackStop", with_extensions)]
+    async fn playback_stop(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// End playback `id`'s conversion (P3-15): ffmpeg stops and its slot
+    /// is free; the playback goes on with what was written, then ends.
+    /// `NO_CONVERSION` for direct play.
+    #[method(name = "playbackEndConversion", with_extensions)]
+    async fn playback_end_conversion(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// An item's Debug tab (P3-15): its file as ffprobe sees it, the
+    /// devices "Plan for…" offers, and its subtitle text and previews as
+    /// the caches have them. Looking starts nothing.
+    #[method(name = "catalogDebug", with_extensions)]
+    async fn catalog_debug(&self, id: String) -> jsonrpsee::core::RpcResult<ItemDebug>;
+
+    /// The plan the server would make for item `id` on `request`'s
+    /// device, exactly as `PlaybackPlan` would answer it (P3-15).
+    /// Nothing plays.
+    #[method(name = "catalogPlanFor", with_extensions)]
+    async fn catalog_plan_for(
+        &self,
+        id: String,
+        request: PlanFor,
+    ) -> jsonrpsee::core::RpcResult<PlanView>;
 }

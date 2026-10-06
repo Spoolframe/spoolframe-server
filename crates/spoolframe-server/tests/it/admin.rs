@@ -49,6 +49,7 @@ pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
         metrics: None,
         logs: None,
         telemetry: None,
+        playback: None,
     }
 }
 
@@ -776,8 +777,9 @@ async fn the_user_list_counts_each_user_s_devices_and_live_sessions() {
     // A revoked session is not live; the device it was on is still hers.
     let sessions = root.user_sessions("alice".into()).await.unwrap();
     let browser = sessions.iter().find(|s| s.endpoint_id.is_none()).unwrap();
-    // The web UI says "Apple TV app" for the TV's, "Web or CLI" for hers.
-    assert_eq!(browser.platform, None);
+    // The web UI says "Apple TV app" for the TV's; hers was signed in
+    // over the admin API's socket, as the CLI signs in (P3-18).
+    assert_eq!(browser.platform, Some(spoolframe_admin_api::Platform::Cli));
     assert!(
         sessions
             .iter()

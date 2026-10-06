@@ -66,7 +66,12 @@ pub struct Conversion {
     /// For HLS: where the segments are cut (P2-05).
     segments: Option<Segments>,
     current: Mutex<Arc<EncodeJob>>,
+    /// Ended by an admin (P3-15): no encode starts again for it.
+    ended: std::sync::atomic::AtomicBool,
 }
+
+/// Why a read past what an ended conversion wrote fails (P3-15).
+pub const ENDED: &str = "the conversion was ended on the server";
 
 /// How far past what is written a segment may be asked for before the
 /// encode restarts there rather than the reader waiting.
@@ -195,7 +200,23 @@ impl Conversion {
             vaapi_device: source.vaapi_device.to_path_buf(),
             segments,
             current: Mutex::new(job),
+            ended: Default::default(),
         }))
+    }
+
+    /// End the conversion where it is (P3-15's End conversion): ffmpeg
+    /// stops and lets go of its slot, what it wrote stays readable, and no
+    /// read or seek starts it again. The playback goes on until it runs out
+    /// of what was written.
+    pub fn end(&self) {
+        let current = self.current.lock().expect("never poisoned");
+        self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        current.end();
+    }
+
+    /// Whether [`Conversion::end`] ended it.
+    pub fn ended(&self) -> bool {
+        self.ended.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether it decodes and encodes a stream again, rather than only
@@ -257,6 +278,14 @@ impl Conversion {
         let mut current = self.current.lock().expect("never poisoned");
         let written = current.progress().borrow().last_segment;
         let head = written.unwrap_or(current.first_segment.saturating_sub(1));
+        if self.ended() {
+            // Only what it wrote: nothing more is coming.
+            return if n >= current.first_kept() && written.is_some_and(|w| n <= w) {
+                Ok(current.clone())
+            } else {
+                Err(JobError::Prepare(ENDED.into()))
+            };
+        }
         if n >= current.first_kept() && n <= head + SEGMENTS_AHEAD {
             return Ok(current.clone());
         }
@@ -299,6 +328,9 @@ impl Conversion {
     /// new epoch.
     pub fn restart(&self, start: Duration, start_number: u32) -> Result<u32, JobError> {
         let mut current = self.current.lock().expect("never poisoned");
+        if self.ended() {
+            return Err(JobError::Prepare(ENDED.into()));
+        }
         let epoch = current.epoch + 1;
         let job = spawn(
             &self.jobs,

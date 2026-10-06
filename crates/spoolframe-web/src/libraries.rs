@@ -147,6 +147,33 @@ pub fn added_text(n: usize, server: &str) -> String {
     }
 }
 
+/// Where a library dragged from row `from` and held over row `over` would
+/// go, as the line drawn between rows shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropLine {
+    Above,
+    Below,
+}
+
+/// The line to draw on row `over` while row `from` is dragged over it:
+/// none on the row itself, since dropping it there moves nothing.
+pub fn drop_line(from: usize, over: usize) -> Option<DropLine> {
+    match over.cmp(&from) {
+        std::cmp::Ordering::Less => Some(DropLine::Above),
+        std::cmp::Ordering::Greater => Some(DropLine::Below),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+/// The position `libraryMove` is given when row `from` is dropped on row
+/// `onto`: it takes that row's place, which is the line [`drop_line`]
+/// drew. `None` when it moves nothing.
+pub fn dropped_at(from: usize, onto: usize) -> Option<u32> {
+    // Taken out first, the rows below `from` move up one: `onto`'s index
+    // is then the place after it (dragged down) or its own (dragged up).
+    drop_line(from, onto).and_then(|_| u32::try_from(onto).ok())
+}
+
 /// What the wizard's library checkboxes change: the sections to add, and
 /// the libraries (by id) to remove. `chosen` are the checked sections'
 /// keys; a section is a library already when the server says so.
@@ -703,5 +730,44 @@ mod tests {
         assert_eq!(add_label(2), "Add 2 libraries");
         assert_eq!(add_label(1), "Add 1 library");
         assert_eq!(added_text(2, "Cabin"), "2 libraries added from Cabin");
+    }
+
+    /// `libraryMove` takes the library out, then puts it at the position:
+    /// what the server does with the list, to check a drop against.
+    fn moved(list: &[&'static str], from: usize, position: u32) -> Vec<&'static str> {
+        let mut list = list.to_vec();
+        let library = list.remove(from);
+        list.insert((position as usize).min(list.len()), library);
+        list
+    }
+
+    #[test]
+    fn a_library_dropped_on_a_row_below_goes_after_it() {
+        let list = ["A", "B", "C", "D"];
+        assert_eq!(drop_line(0, 2), Some(DropLine::Below));
+        let position = dropped_at(0, 2).unwrap();
+        assert_eq!(moved(&list, 0, position), ["B", "C", "A", "D"]);
+        assert_eq!(
+            moved(&list, 0, dropped_at(0, 3).unwrap()),
+            ["B", "C", "D", "A"]
+        );
+    }
+
+    #[test]
+    fn a_library_dropped_on_a_row_above_goes_before_it() {
+        let list = ["A", "B", "C", "D"];
+        assert_eq!(drop_line(3, 1), Some(DropLine::Above));
+        let position = dropped_at(3, 1).unwrap();
+        assert_eq!(moved(&list, 3, position), ["A", "D", "B", "C"]);
+        assert_eq!(
+            moved(&list, 3, dropped_at(3, 0).unwrap()),
+            ["D", "A", "B", "C"]
+        );
+    }
+
+    #[test]
+    fn a_library_dropped_on_itself_does_not_move() {
+        assert_eq!(drop_line(2, 2), None);
+        assert_eq!(dropped_at(2, 2), None);
     }
 }

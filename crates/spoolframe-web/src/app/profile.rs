@@ -625,6 +625,9 @@ fn ConfirmDialog(
     let password = use_signal(String::new);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
+    // The passkey request, fetched as the dialog opens, so "Use a passkey"
+    // opens the prompt from the click itself, as Safari requires.
+    let mut request = use_resource(super::passkey_request);
     // The sign-in providers the user has linked, which can confirm too
     // (P3-04): through the provider and back to My profile, which then
     // says to go on.
@@ -673,10 +676,10 @@ fn ConfirmDialog(
     };
     let with_passkey = move |_| {
         busy.set(true);
+        let opened = super::open_passkey_prompt(request.read().clone().flatten());
         spawn(async move {
             let confirmed = async {
-                let challenge = http::passkey_begin().await.map_err(|e| e.explain())?;
-                let signed = webauthn::get(&challenge.options).await?;
+                let (challenge, signed) = super::passkey_signature(opened).await?;
                 let client = rpc::client().await.map_err(|e| e.explain())?;
                 client
                     .confirm_passkey(challenge.ceremony, signed)
@@ -685,7 +688,11 @@ fn ConfirmDialog(
             };
             match confirmed.await {
                 Ok(()) => on_confirmed.call(()),
-                Err(text) => error.set(Some(text)),
+                Err(text) => {
+                    error.set(Some(text));
+                    // A request is good once: the next try needs another.
+                    request.restart();
+                }
             }
             busy.set(false);
         });
@@ -766,9 +773,15 @@ fn AddPasskeyDialog(
             return;
         }
         busy.set(true);
-        let options = options.clone();
+        // Opened here, in the click, before anything is awaited: Safari
+        // opens a passkey prompt only from the click itself.
+        let opened = webauthn::open_create(&options);
         spawn(async move {
-            match webauthn::create(&options).await {
+            let made = match opened {
+                Ok(prompt) => prompt.answer().await,
+                Err(text) => Err(text),
+            };
+            match made {
                 // Cancelled, or the browser refused: the request still
                 // stands, so the button can be pressed again.
                 Err(text) => error.set(Some(text)),

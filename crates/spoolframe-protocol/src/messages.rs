@@ -690,6 +690,10 @@ pub struct DeviceSignInRequest {
     pub device_name: Option<String>,
     /// Its app, e.g. `spoolframe-tvos`.
     pub client_name: String,
+    /// What kind of client it runs, as its `Hello` said: shown beside its
+    /// name ([`Platform::label`], "Apple TV app"), so the approver knows
+    /// which device asks.
+    pub platform: Platform,
     /// Unix seconds.
     pub requested_at: i64,
 }
@@ -770,6 +774,11 @@ pub enum Error {
     /// `StartPlayback` again and go on from where playback was.
     #[error("the playback has expired; start it again")]
     PlaybackExpired,
+    /// An admin stopped the playback on the server (P3-15). It is over:
+    /// tell the viewer it ended, and do not start it again on your own
+    /// as after `PlaybackExpired`. Its progress is kept.
+    #[error("the playback was stopped on the server")]
+    PlaybackStopped,
     /// The server is converting as many files as it may at once.
     #[error("the server is busy converting; try again later")]
     Busy,

@@ -502,6 +502,7 @@ mod tests {
         events: Mutex<Vec<String>>,
         starts: std::sync::atomic::AtomicUsize,
         expired: std::sync::atomic::AtomicBool,
+        stopped: std::sync::atomic::AtomicBool,
         hold_start: std::sync::atomic::AtomicBool,
         hold_seek: std::sync::atomic::AtomicBool,
         entered: Notify,
@@ -542,7 +543,9 @@ mod tests {
             Ok(playback(n))
         }
         async fn read(&self, h: &PlaybackHandle, _: u64, _: u64) -> Result<Vec<u8>, SdkError> {
-            if h.0 == "1" && self.expired.load(SeqCst) {
+            if self.stopped.load(SeqCst) {
+                Err(SdkError::PlaybackStopped)
+            } else if h.0 == "1" && self.expired.load(SeqCst) {
                 Err(SdkError::PlaybackExpired)
             } else {
                 Ok(vec![42])
@@ -639,6 +642,17 @@ mod tests {
         );
         p.finish(Duration::from_secs(90)).await.unwrap();
         assert_eq!(*b.events.lock().unwrap(), vec!["progress:2:90", "stop:2"]);
+    }
+    /// An admin's Stop (P3-15) is the end: the playback is not started
+    /// again behind the viewer's back, as an expired one is.
+    #[tokio::test]
+    async fn a_playback_stopped_on_the_server_is_not_started_again() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        b.stopped.store(true, SeqCst);
+        assert_eq!(p.read(0, 1).await, Err(SdkError::PlaybackStopped));
+        assert_eq!(b.starts.load(SeqCst), 1);
+        assert_eq!(p.snapshot().handle.0, "1");
     }
     #[tokio::test]
     async fn final_position_supersedes_pending_and_precedes_stop() {

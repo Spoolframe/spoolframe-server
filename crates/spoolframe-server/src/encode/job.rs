@@ -26,6 +26,9 @@ const POLL: Duration = Duration::from_millis(200);
 pub const STALLED_AFTER: Duration = Duration::from_secs(120);
 /// How many of ffmpeg's last stderr lines a failure reports.
 const STDERR_LINES: usize = 20;
+/// How many of ffmpeg's last stderr lines a job keeps, for playback debug
+/// (P3-15) to show while it runs and after it ends.
+pub const STDERR_KEPT: usize = 50;
 
 /// What a job writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,18 +316,20 @@ impl Jobs {
         let pid = child.id().unwrap_or(0);
         let limits = self.limits();
         let (progress_tx, progress) = watch::channel(Progress::default());
+        let progress_tx = Arc::new(progress_tx);
         let shared = Arc::new(Shared {
             furthest_bytes: AtomicU64::new(0),
             reader_ms: AtomicU64::new(0),
             reader_segment: AtomicU32::new(0),
             first_kept: AtomicU32::new(first_segment),
             paused: AtomicBool::new(false),
+            stderr: std::sync::Mutex::default(),
         });
         let supervisor = Supervisor {
             pid,
             start_ms,
             dir: dir.clone(),
-            written,
+            written: written.clone(),
             scratch: self.dir.clone(),
             scratch_limit: limits.scratch_limit_bytes,
             scratch_check: self.scratch_check.clone(),
@@ -332,7 +337,7 @@ impl Jobs {
             stalled_after: limits.stalled_after,
             shared: shared.clone(),
             slot: slot.clone(),
-            progress: progress_tx,
+            progress: progress_tx.clone(),
             counters: self.counters.clone(),
             _encoding: encodes.then(|| self.encoding.begin()),
         };
@@ -340,12 +345,20 @@ impl Jobs {
         let stderr = child.stderr.take().expect("piped");
         let task = tokio::spawn(supervisor.run(child, stdout, stderr));
         tracing::debug!(pid, dir = %dir.display(), epoch, "encode started");
+        let mut command = vec![self.ffmpeg.display().to_string()];
+        command.extend(args);
         let job = Arc::new(EncodeJob {
             epoch,
             first_segment,
             pid,
             dir,
+            written,
+            start_ms,
+            command,
             progress,
+            // Only the supervisor holds it otherwise: once it is gone, a
+            // reader waiting for more hears so at once.
+            sender: Arc::downgrade(&progress_tx),
             shared,
             task,
             slot,
@@ -371,6 +384,27 @@ struct Shared {
     /// never written by this run, or removed to make room.
     first_kept: AtomicU32,
     paused: AtomicBool,
+    /// ffmpeg's last [`STDERR_KEPT`] lines of stderr.
+    stderr: std::sync::Mutex<VecDeque<String>>,
+}
+
+impl Shared {
+    fn stderr_line(&self, line: String) {
+        let mut kept = self.stderr.lock().expect("never poisoned");
+        if kept.len() == STDERR_KEPT {
+            kept.pop_front();
+        }
+        kept.push_back(line);
+    }
+
+    /// The last [`STDERR_LINES`], for a failure's report.
+    fn stderr_tail(&self) -> Vec<String> {
+        let kept = self.stderr.lock().expect("never poisoned");
+        kept.iter()
+            .skip(kept.len().saturating_sub(STDERR_LINES))
+            .cloned()
+            .collect()
+    }
 }
 
 /// A running (or finished) ffmpeg.
@@ -381,7 +415,15 @@ pub struct EncodeJob {
     pub first_segment: u32,
     pid: u32,
     dir: PathBuf,
+    written: Written,
+    /// Where the run started in the film, ms.
+    start_ms: u64,
+    /// The program and its arguments, as run.
+    command: Vec<String>,
     progress: watch::Receiver<Progress>,
+    /// The supervisor's, while it runs: what [`EncodeJob::end`] says the
+    /// job ended with.
+    sender: std::sync::Weak<watch::Sender<Progress>>,
     shared: Arc<Shared>,
     task: JoinHandle<()>,
     /// Held while ffmpeg may run; released by [`EncodeJob::stop`], or by
@@ -401,6 +443,60 @@ impl EncodeJob {
             signal(self.pid, libc::SIGKILL);
         }
         self.slot.lock().expect("never poisoned").take();
+    }
+
+    /// End the encode where it is (P3-15's End conversion): ffmpeg is
+    /// killed and its slot let go of, and what it wrote is all there is,
+    /// so a reader gets that and then the end, rather than waiting for
+    /// more. Its files stay until the job is dropped. One that has ended
+    /// already keeps how it ended.
+    pub fn end(&self) {
+        // Held across the abort, so the channel is still open to say it.
+        let sender = self.sender.upgrade();
+        self.stop();
+        if let Some(sender) = sender {
+            let (bytes, last_segment) = measure(&self.written, &self.dir);
+            sender.send_if_modified(|p| {
+                if p.done.is_some() {
+                    return false;
+                }
+                p.bytes = p.bytes.max(bytes);
+                p.last_segment = p.last_segment.max(last_segment);
+                p.done = Some(Ok(()));
+                true
+            });
+        }
+        self.shared.paused.store(false, Ordering::Relaxed);
+    }
+
+    /// Where its reader is in the film, ms, as the throttle reckons it.
+    pub fn reader_ms(&self) -> u64 {
+        let p = self.progress.borrow();
+        reader_ms(
+            &self.written,
+            &self.shared,
+            self.start_ms,
+            p.encoded_ms,
+            p.bytes,
+            p.last_segment,
+        )
+    }
+
+    /// The program and its arguments, as run (paths and all).
+    pub fn command(&self) -> Vec<String> {
+        self.command.clone()
+    }
+
+    /// ffmpeg's last lines of stderr, oldest first, at most
+    /// [`STDERR_KEPT`].
+    pub fn stderr(&self) -> Vec<String> {
+        self.shared
+            .stderr
+            .lock()
+            .expect("never poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// The job's slot, for the job that replaces it; none once stopped.
@@ -497,7 +593,7 @@ struct Supervisor {
     shared: Arc<Shared>,
     /// The job's slot, let go of when a stalled ffmpeg is ended.
     slot: Arc<std::sync::Mutex<Option<Slot>>>,
-    progress: watch::Sender<Progress>,
+    progress: Arc<watch::Sender<Progress>>,
     counters: Arc<JobCounters>,
     /// Counted as encoding for as long as the supervisor runs: until
     /// ffmpeg exits, is ended as stalled, or the job is stopped (which
@@ -514,7 +610,6 @@ impl Supervisor {
     ) {
         let mut out = BufReader::new(stdout).lines();
         let mut err = BufReader::new(stderr).lines();
-        let mut tail: VecDeque<String> = VecDeque::new();
         let mut encoded_ms = 0u64;
         // What the job had written when it last looked.
         let mut seen = 0u64;
@@ -550,12 +645,7 @@ impl Supervisor {
                     _ => out_open = false,
                 },
                 line = err.next_line(), if err_open => match line {
-                    Ok(Some(line)) => {
-                        if tail.len() == STDERR_LINES {
-                            tail.pop_front();
-                        }
-                        tail.push_back(line);
-                    }
+                    Ok(Some(line)) => self.shared.stderr_line(line),
                     _ => err_open = false,
                 },
                 status = child.wait() => break status,
@@ -581,7 +671,7 @@ impl Supervisor {
                             after = ?self.stalled_after,
                             bytes,
                             encoded_ms,
-                            stderr = ?tail,
+                            stderr = ?self.shared.stderr_tail(),
                             "an encode stalled"
                         );
                         self.slot.lock().expect("never poisoned").take();
@@ -618,10 +708,7 @@ impl Supervisor {
         };
         // Drain what is left of stderr for the report.
         while let Ok(Some(line)) = err.next_line().await {
-            if tail.len() == STDERR_LINES {
-                tail.pop_front();
-            }
-            tail.push_back(line);
+            self.shared.stderr_line(line);
         }
         let (bytes, last_segment) = self.measure();
         self.progress.send_modify(|p| {
@@ -632,6 +719,7 @@ impl Supervisor {
         match status {
             Ok(status) if status.success() => self.finish(Ok(())),
             Ok(status) => {
+                let tail = self.shared.stderr_tail();
                 let reason = tail
                     .iter()
                     .rev()
@@ -685,27 +773,7 @@ impl Supervisor {
 
     /// Bytes written, and for HLS the highest segment on disk.
     fn measure(&self) -> (u64, Option<u32>) {
-        match &self.written {
-            Written::Progressive { file } => (std::fs::metadata(file).map_or(0, |m| m.len()), None),
-            Written::Hls => {
-                let bytes = std::fs::read_dir(&self.dir).map_or(0, |entries| {
-                    entries
-                        .flatten()
-                        .map(|e| e.metadata().map_or(0, |m| m.len()))
-                        .sum()
-                });
-                // Not the segment files: in fMP4 mode ffmpeg writes a
-                // segment's file only as it closes it, so a file that
-                // exists may still be half written, and the one being
-                // encoded does not exist yet. ffmpeg's playlist is replaced
-                // (written aside, then renamed) right after each segment is
-                // closed.
-                let last = std::fs::read_to_string(self.dir.join(PLAYLIST))
-                    .ok()
-                    .and_then(|text| last_listed(&text));
-                (bytes, last)
-            }
-        }
+        measure(&self.written, &self.dir)
     }
 
     /// Pause ffmpeg once it is `read_ahead` past its reader; resume it at
@@ -713,32 +781,14 @@ impl Supervisor {
     /// encode goes on only when its reader moves on, and a reader that
     /// waits for the encode cannot.
     fn throttle(&self, encoded_ms: u64, base_ms: u64, bytes: u64, last_segment: Option<u32>) {
-        let reader_ms = match self.written {
-            Written::Progressive { .. } => {
-                let read = self.shared.furthest_bytes.load(Ordering::Relaxed);
-                if read >= bytes {
-                    // It has all that is written, which is nothing until
-                    // ffmpeg has its first cluster whole: it is where the
-                    // encode is.
-                    encoded_ms
-                } else {
-                    // A byte offset as a share of what this run encoded:
-                    // close enough for a stream of roughly even bitrate.
-                    let run = encoded_ms.saturating_sub(base_ms);
-                    base_ms + (u128::from(run) * u128::from(read) / u128::from(bytes)) as u64
-                }
-            }
-            Written::Hls => {
-                let asked = self.shared.reader_segment.load(Ordering::Relaxed);
-                if asked > 0 && last_segment.is_none_or(|last| last < asked) {
-                    // It waits for a segment ffmpeg has not finished,
-                    // whatever time ffmpeg reports.
-                    encoded_ms
-                } else {
-                    self.shared.reader_ms.load(Ordering::Relaxed).max(base_ms)
-                }
-            }
-        };
+        let reader_ms = reader_ms(
+            &self.written,
+            &self.shared,
+            base_ms,
+            encoded_ms,
+            bytes,
+            last_segment,
+        );
         let ahead = Duration::from_millis(encoded_ms.saturating_sub(reader_ms));
         let paused = self.shared.paused.load(Ordering::Relaxed);
         if !paused && ahead > self.read_ahead {
@@ -749,6 +799,67 @@ impl Supervisor {
             signal(self.pid, libc::SIGCONT);
             self.shared.paused.store(false, Ordering::Relaxed);
             tracing::debug!(pid = self.pid, ?ahead, "encode resumed");
+        }
+    }
+}
+
+/// Where a job's reader is in the film, ms: what the throttle holds the
+/// encode back against, and what playback debug (P3-15) shows as read.
+fn reader_ms(
+    written: &Written,
+    shared: &Shared,
+    base_ms: u64,
+    encoded_ms: u64,
+    bytes: u64,
+    last_segment: Option<u32>,
+) -> u64 {
+    match written {
+        Written::Progressive { .. } => {
+            let read = shared.furthest_bytes.load(Ordering::Relaxed);
+            if read >= bytes {
+                // It has all that is written, which is nothing until ffmpeg
+                // has its first cluster whole: it is where the encode is.
+                encoded_ms
+            } else {
+                // A byte offset as a share of what this run encoded: close
+                // enough for a stream of roughly even bitrate.
+                let run = encoded_ms.saturating_sub(base_ms);
+                base_ms + (u128::from(run) * u128::from(read) / u128::from(bytes)) as u64
+            }
+        }
+        Written::Hls => {
+            let asked = shared.reader_segment.load(Ordering::Relaxed);
+            if asked > 0 && last_segment.is_none_or(|last| last < asked) {
+                // It waits for a segment ffmpeg has not finished, whatever
+                // time ffmpeg reports.
+                encoded_ms
+            } else {
+                shared.reader_ms.load(Ordering::Relaxed).max(base_ms)
+            }
+        }
+    }
+}
+
+/// Bytes `written` in `dir`, and for HLS the highest segment finished.
+fn measure(written: &Written, dir: &Path) -> (u64, Option<u32>) {
+    match written {
+        Written::Progressive { file } => (std::fs::metadata(file).map_or(0, |m| m.len()), None),
+        Written::Hls => {
+            let bytes = std::fs::read_dir(dir).map_or(0, |entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.metadata().map_or(0, |m| m.len()))
+                    .sum()
+            });
+            // Not the segment files: in fMP4 mode ffmpeg writes a segment's
+            // file only as it closes it, so a file that exists may still be
+            // half written, and the one being encoded does not exist yet.
+            // ffmpeg's playlist is replaced (written aside, then renamed)
+            // right after each segment is closed.
+            let last = std::fs::read_to_string(dir.join(PLAYLIST))
+                .ok()
+                .and_then(|text| last_listed(&text));
+            (bytes, last)
         }
     }
 }
@@ -1098,6 +1209,119 @@ mod tests {
         .await
         .expect("an encode still counts")
         .unwrap();
+    }
+
+    /// Waits up to 5 s for `ready`, checking every 20 ms.
+    async fn eventually(ready: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("never happened");
+    }
+
+    /// Playback debug (P3-15) shows what ffmpeg said last while it still
+    /// runs, not only once it has failed; only the last lines are kept.
+    #[tokio::test]
+    async fn ffmpeg_s_last_stderr_lines_are_kept_while_it_runs() {
+        let (jobs, _dir) = jobs(
+            "stderr-ring",
+            "i=0; while [ $i -lt 100 ]; do echo \"line $i\" >&2; i=$((i+1)); done; exec sleep 30",
+            2,
+            Duration::from_secs(60),
+        )
+        .await;
+        let job = jobs
+            .start(
+                jobs.dir().join("h/0"),
+                Vec::new(),
+                Written::Hls,
+                false,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        eventually(|| job.stderr().last().is_some_and(|l| l == "line 99")).await;
+        let kept = job.stderr();
+        assert_eq!(kept.len(), STDERR_KEPT);
+        assert_eq!(kept[0], format!("line {}", 100 - STDERR_KEPT));
+    }
+
+    /// What the job runs, as it ran it: the program and its arguments.
+    #[tokio::test]
+    async fn a_job_knows_its_command_line() {
+        let (jobs, _dir) = jobs("command", "exec sleep 30", 2, Duration::from_secs(60)).await;
+        let args = vec!["-i".to_owned(), "/media/a b.mkv".to_owned()];
+        let job = jobs
+            .start(
+                jobs.dir().join("h/0"),
+                args.clone(),
+                Written::Hls,
+                false,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        let mut expected = vec![jobs.ffmpeg.display().to_string()];
+        expected.extend(args);
+        assert_eq!(job.command(), expected);
+    }
+
+    /// End conversion (P3-15): ffmpeg stops, the place is free at once, and
+    /// what it wrote stays readable as all there is, rather than a reader
+    /// waiting for more that never comes.
+    #[tokio::test]
+    async fn an_ended_encode_stops_and_what_it_wrote_is_the_whole() {
+        let (jobs, _dir) = jobs(
+            "end",
+            "printf 'abcdefghij' > \"$1\"; echo out_time_us=4000000; exec sleep 30",
+            1,
+            Duration::from_secs(60),
+        )
+        .await;
+        let dir = jobs.dir().join("h/0");
+        let file = dir.join("out.mkv");
+        let job = jobs
+            .start(
+                dir.clone(),
+                vec![file.display().to_string()],
+                Written::Progressive { file: file.clone() },
+                true,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        let mut progress = job.progress();
+        progress.wait_for(|p| p.bytes == 10).await.unwrap();
+        let pid = job.pid();
+        job.end();
+        let now = job.progress().borrow().clone();
+        assert_eq!(now.done, Some(Ok(())));
+        assert_eq!(now.bytes, 10);
+        eventually(|| !alive(pid)).await;
+        // Its files stay for the reader until the job is dropped.
+        assert!(file.exists());
+        // Its place is free: another job starts at the limit of one.
+        let other = jobs.start(
+            jobs.dir().join("i/0"),
+            Vec::new(),
+            Written::Hls,
+            false,
+            0,
+            0,
+            0,
+            None,
+        );
+        assert!(other.is_ok(), "the ended job still holds its place");
+        eventually(|| jobs.encoding().running() == 0).await;
     }
 
     #[tokio::test]

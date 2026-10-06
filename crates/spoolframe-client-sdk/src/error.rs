@@ -67,6 +67,10 @@ pub enum SdkError {
     /// Start the playback again and go on from where it was.
     #[error("the playback has expired")]
     PlaybackExpired,
+    /// The server's admin stopped the playback (P3-15): it is over, and
+    /// [`crate::ManagedPlayback`] does not start it again. Say it ended.
+    #[error("the playback was stopped on the server")]
+    PlaybackStopped,
     #[error("{0} not found")]
     NotFound(String),
     /// The server is converting as many files as it may (P2-03); try
@@ -166,6 +170,7 @@ impl SdkError {
             },
             ServerError::CannotPlay { reasons } => SdkError::CannotPlay { reasons },
             ServerError::PlaybackExpired => SdkError::PlaybackExpired,
+            ServerError::PlaybackStopped => SdkError::PlaybackStopped,
             ServerError::NotFound { what } => SdkError::NotFound(what),
             ServerError::Busy => SdkError::Busy,
             ServerError::PlaybackFailed { reason } => SdkError::PlaybackFailed(reason),
@@ -200,6 +205,14 @@ mod tests {
         assert_eq!(
             SdkError::from_server(ServerError::RecentSignInRequired),
             SdkError::RecentSignInRequired
+        );
+    }
+
+    #[test]
+    fn a_playback_stopped_on_the_server_is_told_apart_from_an_expired_one() {
+        assert_eq!(
+            SdkError::from_server(ServerError::PlaybackStopped),
+            SdkError::PlaybackStopped
         );
     }
 

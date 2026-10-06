@@ -182,6 +182,11 @@ impl RuntimeSettings {
         &self.secrets
     }
 
+    /// Where the server keeps its state.
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
     /// Every setting, as `admin.settings` answers.
     pub fn settings(&self) -> Settings {
         let layers = self.layers();
@@ -371,16 +376,7 @@ impl RuntimeSettings {
         by: &str,
         keys: Vec<(&str, Option<Value>)>,
     ) -> Result<(), ChangeError> {
-        self.change(what, by, |layers| {
-            let mut changed = layers.clone();
-            for (key, value) in keys {
-                changed = match value {
-                    Some(value) => changed.with_set(key, value)?,
-                    None => changed.with_unset(key)?,
-                };
-            }
-            Ok(changed)
-        })?;
+        self.change(what, by, |layers| layers.with_changes(keys))?;
         tracing::info!(by, what, "settings changed");
         Ok(())
     }

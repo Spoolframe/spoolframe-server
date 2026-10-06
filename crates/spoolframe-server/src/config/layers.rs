@@ -381,6 +381,30 @@ impl Layers {
         Ok(changed)
     }
 
+    /// The layers with each of `keys` set (or, with `None`, unset) in the
+    /// runtime layer, checked once all are: one admin action that changes
+    /// several keys may pass through a state that would not load, such as
+    /// the first Plex server's address gone before its name (P3-18).
+    pub fn with_changes(&self, keys: Vec<(&str, Option<Value>)>) -> Result<Self, SettingError> {
+        let mut changed = self.clone();
+        for (key, value) in keys {
+            self.changeable(key)?;
+            match value {
+                Some(value) => tree::set(&mut changed.runtime, key, value),
+                None => {
+                    tree::remove(&mut changed.runtime, key);
+                }
+            }
+        }
+        changed.check()?;
+        Ok(changed)
+    }
+
+    /// Whether the provided file sets `key`, locked or not.
+    pub fn file_sets(&self, key: &str) -> bool {
+        self.file().is_some_and(|f| tree::get(f, key).is_some())
+    }
+
     /// Whether the runtime layer may hold `key`: a setting that is no
     /// secret and that a locked file does not set.
     fn changeable(&self, key: &str) -> Result<(), SettingError> {

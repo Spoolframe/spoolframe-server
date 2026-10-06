@@ -455,7 +455,7 @@ fn episode_media(movie: &Path, id: &MediaId) -> PathBuf {
     movie.with_file_name(format!("episode-{}.b99.mkv", id.key()))
 }
 
-fn fake_ffprobe(dir: &Path) -> PathBuf {
+fn fake_ffprobe(dir: &Path, fixture: &str) -> PathBuf {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../spoolframe-media/tests/fixtures");
     let script = dir.join("bin").join("ffprobe");
     std::fs::create_dir_all(script.parent().unwrap()).unwrap();
@@ -465,7 +465,7 @@ fn fake_ffprobe(dir: &Path) -> PathBuf {
             "#!/bin/sh\nfor path; do :; done\ncase \"$path\" in *.srt) cat '{}' ;; *.b99.mkv) cat '{}' ;; *) cat '{}' ;; esac\n",
             fixtures.join("external-srt.json").display(),
             fixtures.join("b99-s07e01.json").display(),
-            fixtures.join("mkv-forced-subs.json").display(),
+            fixtures.join(fixture).display(),
         ),
     );
     script
@@ -590,6 +590,9 @@ pub struct ServerOptions {
     pub previews_ffmpeg: PathBuf,
     /// How long an app passkey's challenge lives (P3-19).
     pub passkey_lifetime: Duration,
+    /// What the stand-in ffprobe says the movie is: a file in
+    /// spoolframe-media's fixtures.
+    pub ffprobe_fixture: &'static str,
 }
 
 impl Default for ServerOptions {
@@ -620,6 +623,7 @@ impl Default for ServerOptions {
             },
             previews_ffmpeg: PathBuf::from("ffmpeg"),
             passkey_lifetime: spoolframe_server::passkeys::CEREMONY_LIFETIME,
+            ffprobe_fixture: "mkv-forced-subs.json",
         }
     }
 }
@@ -686,6 +690,8 @@ pub struct TestServer {
     pub plex_accounts: Arc<spoolframe_server::plex_accounts::PlexAccounts>,
     /// Its metrics (P3-14), read from its parts.
     pub metrics: Arc<spoolframe_server::metrics::Metrics>,
+    /// Playback debug (P3-15) over its parts, for an admin API beside it.
+    pub debug: Arc<spoolframe_server::playback_debug::PlaybackDebug>,
 }
 
 impl TestServer {
@@ -721,7 +727,7 @@ impl TestServer {
         let ffprobe = if options.real_media {
             PathBuf::from("ffprobe")
         } else {
-            fake_ffprobe(&dir)
+            fake_ffprobe(&dir, options.ffprobe_fixture)
         };
         let prober = Arc::new(Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT));
         let jobs = Jobs::new(
@@ -804,7 +810,17 @@ impl TestServer {
                 options.passkey_lifetime,
             )),
             metrics: metrics.clone(),
+            connected: Arc::default(),
         };
+        let debug = Arc::new(spoolframe_server::playback_debug::PlaybackDebug {
+            playbacks: services.playbacks.clone(),
+            connected: services.connected.clone(),
+            catalog: services.catalog.clone(),
+            prober: services.prober.clone(),
+            transcoding: services.transcoding.clone(),
+            subtitles: services.subtitles.clone(),
+            previews: services.previews.clone(),
+        });
         let endpoint = EndpointOptions {
             port: options.port,
             relay: Relay::Disabled,
@@ -825,6 +841,7 @@ impl TestServer {
             dir,
             media,
             metrics,
+            debug,
         }
     }
 

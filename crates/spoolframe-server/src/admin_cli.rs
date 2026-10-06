@@ -437,12 +437,15 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
         }
         UserCommand::List => {
             for user in api.user_list().await.map_err(api_error)? {
-                let mut flags = vec![user.role.as_str()];
+                let mut flags = vec![user.role.as_str().to_owned()];
                 if user.disabled {
-                    flags.push("disabled");
+                    flags.push("disabled".into());
+                }
+                if let Some(secs) = user.rate_limited_secs {
+                    flags.push(format!("rate limited for {} min", secs.div_ceil(60)));
                 }
                 if !user.has_password {
-                    flags.push("no password");
+                    flags.push("no password".into());
                 }
                 let mut line = user.username;
                 if let Some(name) = user.display_name {
@@ -497,7 +500,10 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
                 let what = match (&s.endpoint_id, &s.device_name) {
                     (Some(_), Some(name)) => name.clone(),
                     (Some(id), None) => format!("device {}", &id[..id.len().min(10)]),
-                    (None, _) => "web or CLI".to_owned(),
+                    (None, _) => match s.platform {
+                        Some(platform) => platform.label().to_lowercase(),
+                        None => "web or CLI".to_owned(),
+                    },
                 };
                 println!(
                     "{}  {what}  since {}  last used {}",

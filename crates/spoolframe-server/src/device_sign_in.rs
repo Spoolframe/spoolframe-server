@@ -85,13 +85,38 @@ pub enum Outcome {
     Expired,
 }
 
+/// Where a pending sign-in is. Every step is taken under the one lock and
+/// only from the state before it, so one code has one outcome: two
+/// approvals, an approval and a denial, or an approval and the code running
+/// out cannot both pass.
 #[derive(Debug, Clone)]
 enum State {
+    /// Its code can be claimed or denied.
     Waiting,
+    /// Claimed by an approver making its session; only
+    /// [`DeviceSignIns::fulfil`] moves it on.
+    Claimed,
     Approved(SessionToken),
     Denied,
     Failed,
 }
+
+impl State {
+    /// What the waiting device is told, once it is decided.
+    fn outcome(&self) -> Option<Outcome> {
+        match self {
+            State::Waiting | State::Claimed => None,
+            State::Approved(token) => Some(Outcome::Approved(token.clone())),
+            State::Denied => Some(Outcome::Denied),
+            State::Failed => Some(Outcome::Expired),
+        }
+    }
+}
+
+/// How long a decided sign-in waits for its device to come and be told,
+/// past the code's own end: decided a moment before it, the device may be
+/// between two waits.
+const HANDOVER: Duration = AWAIT;
 
 #[derive(Debug)]
 struct Pending {
@@ -101,10 +126,17 @@ struct Pending {
     state: watch::Sender<State>,
 }
 
+impl Pending {
+    fn decide(&mut self, state: State, now: Instant) {
+        self.expires_at = self.expires_at.max(now + HANDOVER);
+        self.state.send_replace(state);
+    }
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     by_request: HashMap<String, Pending>,
-    /// Codes that can still be claimed, to their request.
+    /// Codes that can still be claimed, to their request: those `Waiting`.
     by_code: HashMap<String, String>,
 }
 
@@ -191,16 +223,20 @@ impl DeviceSignIns {
     /// session, which is no endpoint and so never the one waiting.
     pub fn claim(&self, code: &str, approver: Option<&str>) -> Result<Claim, ClaimError> {
         let mut inner = self.lock();
-        let request = inner.by_code.get(code).ok_or(ClaimError::Unknown)?;
-        let waiting = &inner.by_request[request].waiting;
-        if approver == Some(waiting.endpoint.as_str()) {
+        let request = inner.by_code.get(code).ok_or(ClaimError::Unknown)?.clone();
+        let pending = inner
+            .by_request
+            .get_mut(&request)
+            .expect("swept with its code");
+        if approver == Some(pending.waiting.endpoint.as_str()) {
             return Err(ClaimError::SameDevice);
         }
+        pending.state.send_replace(State::Claimed);
         let claim = Claim {
-            request: request.clone(),
-            endpoint: waiting.endpoint.clone(),
-            device_name: waiting.device_name.clone(),
-            platform: waiting.platform,
+            request,
+            endpoint: pending.waiting.endpoint.clone(),
+            device_name: pending.waiting.device_name.clone(),
+            platform: pending.waiting.platform,
         };
         inner.by_code.remove(code);
         Ok(claim)
@@ -208,13 +244,24 @@ impl DeviceSignIns {
 
     /// Hand the claimed sign-in its session, or `None` to fail it (the
     /// session could not be made): the device stops waiting either way.
-    pub fn fulfil(&self, request: &str, token: Option<SessionToken>) {
-        let inner = self.lock();
-        if let Some(pending) = inner.by_request.get(request) {
-            pending.state.send_replace(match token {
-                Some(token) => State::Approved(token),
-                None => State::Failed,
-            });
+    /// `false` if the device will never be told: the code ran out, and the
+    /// device was told so, before the session was made. The caller then
+    /// revokes the session, which nobody holds.
+    #[must_use]
+    pub fn fulfil(&self, request: &str, token: Option<SessionToken>) -> bool {
+        let mut inner = self.lock();
+        match inner.by_request.get_mut(request) {
+            Some(pending) if matches!(*pending.state.borrow(), State::Claimed) => {
+                pending.decide(
+                    match token {
+                        Some(token) => State::Approved(token),
+                        None => State::Failed,
+                    },
+                    Instant::now(),
+                );
+                true
+            }
+            _ => false,
         }
     }
 
@@ -224,48 +271,60 @@ impl DeviceSignIns {
         let Some(request) = inner.by_code.remove(code) else {
             return false;
         };
-        inner.by_request[&request].state.send_replace(State::Denied);
+        let pending = inner
+            .by_request
+            .get_mut(&request)
+            .expect("swept with its code");
+        pending.decide(State::Denied, Instant::now());
         true
     }
 
     /// Wait up to `max` for `request`, begun by `endpoint`, to be decided.
     /// A decided request is gone once told: its session is handed out once.
     pub async fn wait(&self, request: &str, endpoint: &str, max: Duration) -> Outcome {
-        let (mut state, expires_at) = {
+        let until = Instant::now() + max;
+        let mut state = {
             let inner = self.lock();
             match inner.by_request.get(request) {
-                Some(p) if p.waiting.endpoint == endpoint => (p.state.subscribe(), p.expires_at),
+                Some(p) if p.waiting.endpoint == endpoint => p.state.subscribe(),
                 // Not this device's: as if it were not there at all.
                 _ => return Outcome::Expired,
             }
         };
-        let deadline = (Instant::now() + max).min(expires_at);
-        let decided = tokio::time::timeout_at(
-            deadline.into(),
-            state.wait_for(|s| !matches!(s, State::Waiting)),
-        )
-        .await;
-        match decided {
-            Ok(Ok(_)) => self.take(request),
-            // Dropped by a sweep: it expired.
-            Ok(Err(_)) => Outcome::Expired,
-            Err(_) if deadline >= expires_at => Outcome::Expired,
-            Err(_) => Outcome::Pending,
+        loop {
+            let Some(expires_at) = self.lock().by_request.get(request).map(|p| p.expires_at) else {
+                return Outcome::Expired;
+            };
+            let decided = tokio::time::timeout_at(
+                until.min(expires_at).into(),
+                state.wait_for(|s| s.outcome().is_some()),
+            )
+            .await;
+            match decided {
+                // Dropped by a sweep: it expired.
+                Ok(Err(_)) => return Outcome::Expired,
+                // Decided, or out of time: which of the two is settled
+                // under the lock, against an approver deciding it now.
+                Ok(Ok(_)) | Err(_) => match self.take(request) {
+                    Some(outcome) => return outcome,
+                    None if Instant::now() >= until => return Outcome::Pending,
+                    None => continue,
+                },
+            }
         }
     }
 
-    fn take(&self, request: &str) -> Outcome {
+    /// The outcome of `request`, removing it, if it is decided; `Expired`
+    /// if it ran out undecided. `None` while it is still undecided.
+    fn take(&self, request: &str) -> Option<Outcome> {
         let mut inner = self.lock();
-        let Some(pending) = inner.by_request.remove(request) else {
-            return Outcome::Expired;
+        let Some(pending) = inner.by_request.get(request) else {
+            return Some(Outcome::Expired);
         };
+        let outcome = pending.state.borrow().outcome()?;
+        let pending = inner.by_request.remove(request).expect("just seen");
         inner.by_code.remove(&pending.code);
-        match pending.state.borrow().clone() {
-            State::Approved(token) => Outcome::Approved(token),
-            State::Denied => Outcome::Denied,
-            State::Failed => Outcome::Expired,
-            State::Waiting => unreachable!("taken once decided"),
-        }
+        Some(outcome)
     }
 }
 
@@ -325,7 +384,7 @@ mod tests {
         );
         assert!(!sign_ins.deny(&started.code));
         assert_eq!(sign_ins.lookup(&started.code), None);
-        sign_ins.fulfil(&claim.request, Some(SessionToken("t".into())));
+        assert!(sign_ins.fulfil(&claim.request, Some(SessionToken("t".into()))));
         assert_eq!(
             sign_ins.wait(&started.request, "tv", AWAIT).await,
             Outcome::Approved(SessionToken("t".into()))
@@ -366,6 +425,105 @@ mod tests {
         }
         assert!(sign_ins.begin(tv("tv")).is_none());
         assert!(sign_ins.begin(tv("other tv")).is_some());
+    }
+
+    /// Approvers on many threads at once: one claim, whatever the order.
+    #[test]
+    fn one_code_is_claimed_once_by_concurrent_approvers() {
+        let sign_ins = std::sync::Arc::new(DeviceSignIns::default());
+        let started = sign_ins.begin(tv("tv")).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let claims: Vec<_> = (0..16)
+            .map(|i| {
+                let (sign_ins, barrier, code) =
+                    (sign_ins.clone(), barrier.clone(), started.code.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    sign_ins.claim(&code, Some(&format!("phone {i}"))).is_ok()
+                })
+            })
+            .collect();
+        let won = claims
+            .into_iter()
+            .map(|c| c.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(won, 1);
+    }
+
+    /// An approval and a denial at once: one of them decides.
+    #[test]
+    fn a_code_is_approved_or_denied_never_both() {
+        for _ in 0..200 {
+            let sign_ins = std::sync::Arc::new(DeviceSignIns::default());
+            let started = sign_ins.begin(tv("tv")).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let approve = {
+                let (sign_ins, barrier, code) =
+                    (sign_ins.clone(), barrier.clone(), started.code.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    sign_ins.claim(&code, Some("phone")).is_ok()
+                })
+            };
+            barrier.wait();
+            let denied = sign_ins.deny(&started.code);
+            let approved = approve.join().unwrap();
+            assert!(approved != denied, "approved {approved}, denied {denied}");
+        }
+    }
+
+    /// Approved a moment before the code ran out: the device, between two
+    /// waits then, still gets the session the approver was told it got.
+    #[tokio::test]
+    async fn an_approval_just_before_expiry_is_handed_over() {
+        let sign_ins = DeviceSignIns::with_lifetime(Duration::from_millis(100));
+        let started = sign_ins.begin(tv("tv")).unwrap();
+        let claim = sign_ins.claim(&started.code, Some("phone")).unwrap();
+        assert!(sign_ins.fulfil(&claim.request, Some(SessionToken("t".into()))));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            sign_ins.wait(&started.request, "tv", AWAIT).await,
+            Outcome::Approved(SessionToken("t".into()))
+        );
+    }
+
+    /// Claimed, but the code ran out before the session was made: the
+    /// device has been told it expired, so the approver must hear so too.
+    #[tokio::test]
+    async fn an_approval_after_expiry_is_not_handed_over() {
+        let sign_ins = DeviceSignIns::with_lifetime(Duration::from_millis(100));
+        let started = sign_ins.begin(tv("tv")).unwrap();
+        let claim = sign_ins.claim(&started.code, Some("phone")).unwrap();
+        assert_eq!(
+            sign_ins.wait(&started.request, "tv", AWAIT).await,
+            Outcome::Expired
+        );
+        assert!(!sign_ins.fulfil(&claim.request, Some(SessionToken("t".into()))));
+    }
+
+    /// A session is handed over once, also to two waits at once.
+    #[tokio::test]
+    async fn two_waits_get_one_session() {
+        let sign_ins = std::sync::Arc::new(DeviceSignIns::default());
+        let started = sign_ins.begin(tv("tv")).unwrap();
+        let waits: Vec<_> = (0..2)
+            .map(|_| {
+                let (sign_ins, request) = (sign_ins.clone(), started.request.clone());
+                tokio::spawn(async move { sign_ins.wait(&request, "tv", AWAIT).await })
+            })
+            .collect();
+        let claim = sign_ins.claim(&started.code, None).unwrap();
+        assert!(sign_ins.fulfil(&claim.request, Some(SessionToken("t".into()))));
+        let mut outcomes = Vec::new();
+        for wait in waits {
+            outcomes.push(wait.await.unwrap());
+        }
+        let approved = outcomes
+            .iter()
+            .filter(|o| matches!(o, Outcome::Approved(_)))
+            .count();
+        assert_eq!(approved, 1, "{outcomes:?}");
     }
 
     #[tokio::test]

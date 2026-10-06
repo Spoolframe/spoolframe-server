@@ -8,8 +8,9 @@ use spoolframe_admin_api::{AdminApiClient, NewUser, PathReport, Role, SsoLink, U
 
 use super::{Alert, Field, Route, icons, initial, now, role_name, rpc};
 use crate::logic::{
-    AddUserError, ApiError, Landing, PathState, add_user_error, ago, avatar_class, client_kind,
-    count, host_port, last_admin, path_state, sign_in_methods, thousands, user_change_error,
+    AddUserError, ApiError, Landing, PathState, UserStatus, add_user_error, ago, avatar_class,
+    client_kind, count, host_port, last_admin, path_state, sign_in_methods, thousands,
+    user_change_error, user_status,
 };
 
 #[component]
@@ -208,7 +209,7 @@ fn UserTable(users: Vec<UserInfo>, on_reset: EventHandler<String>) -> Element {
                             td { "{sign_in_methods(&user)}" }
                             td { "{user.device_count}" }
                             td { "{user.session_count}" }
-                            td { Status { disabled: user.disabled } }
+                            td { Status { user: user.clone() } }
                             td { class: "end",
                                 button {
                                     class: "btn h-8 px-3 font-normal",
@@ -264,11 +265,14 @@ fn RolePill(role: Role) -> Element {
 }
 
 #[component]
-fn Status(disabled: bool) -> Element {
-    if disabled {
-        rsx! { span { class: "pill", "Disabled" } }
-    } else {
-        rsx! { span { class: "state state-ok", "Active" } }
+fn Status(user: UserInfo) -> Element {
+    match user_status(&user) {
+        UserStatus::Disabled => rsx! { span { class: "pill", "Disabled" } },
+        // WebUsers: Steve's row.
+        UserStatus::Limited(why) => {
+            rsx! { span { class: "state state-warn", title: "{why}", "Rate limited" } }
+        }
+        UserStatus::Active => rsx! { span { class: "state state-ok", "Active" } },
     }
 }
 
@@ -496,7 +500,11 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
                     h1 { class: "page-title page-title-admin", "{name}" }
                     span { class: "text-sm font-medium text-ctp-subtext0",
                         "{user.username} · {role_name(user.role)} · "
-                        if user.disabled { "Disabled" } else { "Active" }
+                        match user_status(&user) {
+                            UserStatus::Disabled => rsx! { "Disabled" },
+                            UserStatus::Limited(why) => rsx! { span { class: "text-ctp-yellow", title: "{why}", "Rate limited" } },
+                            UserStatus::Active => rsx! { "Active" },
+                        }
                     }
                 }
             }
@@ -670,13 +678,21 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
     }
 }
 
-/// What a session's device is called: its name, its key's start, or
-/// "web / CLI" for an admin API session.
-fn session_device(endpoint_id: &Option<String>, name: &Option<String>) -> String {
-    match (endpoint_id, name) {
-        (Some(_), Some(name)) => name.clone(),
-        (Some(id), None) => format!("Device {}", &id[..id.len().min(10)]),
-        (None, _) => "web / CLI".to_owned(),
+/// What a session's device is called: its name, its key's start, or for
+/// an admin API session what signed it in (P3-18), "web / CLI" for one
+/// from before the server kept it.
+fn session_device(
+    endpoint_id: &Option<String>,
+    name: &Option<String>,
+    platform: Option<spoolframe_admin_api::Platform>,
+) -> String {
+    use spoolframe_admin_api::Platform;
+    match (endpoint_id, name, platform) {
+        (Some(_), Some(name), _) => name.clone(),
+        (Some(id), None, _) => format!("Device {}", &id[..id.len().min(10)]),
+        (None, _, Some(Platform::Web)) => "Browser".to_owned(),
+        (None, _, Some(Platform::Cli)) => "Command line".to_owned(),
+        (None, _, _) => "web / CLI".to_owned(),
     }
 }
 
@@ -725,7 +741,7 @@ fn UserSessionList(
                             for s in list {
                                 tr { key: "{s.id}",
                                     td {
-                                        b { "{session_device(&s.endpoint_id, &s.device_name)}" }
+                                        b { "{session_device(&s.endpoint_id, &s.device_name, s.platform)}" }
                                         if s.current {
                                             span { class: "pill ml-2", "This browser" }
                                         }
@@ -738,7 +754,7 @@ fn UserSessionList(
                                             onclick: {
                                                 let username = username.clone();
                                                 let id = s.id.clone();
-                                                let device = session_device(&s.endpoint_id, &s.device_name);
+                                                let device = session_device(&s.endpoint_id, &s.device_name, s.platform);
                                                 move |_| {
                                                     let username = username.clone();
                                                     let id = id.clone();
@@ -823,7 +839,7 @@ fn UserDevices(
                             }
                             for d in list {
                                 tr { key: "{d.endpoint_id}",
-                                    td { b { "{session_device(&Some(d.endpoint_id.clone()), &d.name)}" } }
+                                    td { b { "{session_device(&Some(d.endpoint_id.clone()), &d.name, d.platform)}" } }
                                     td { class: "quiet max-md:hidden", "{client_kind(Some(&d.endpoint_id), d.platform)}" }
                                     td {
                                         span { class: "flex items-center gap-2",

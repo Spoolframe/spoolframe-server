@@ -23,6 +23,7 @@ mod passkey_setup;
 mod passkeys;
 mod pin;
 mod playback;
+mod playback_debug;
 mod plex_link;
 mod plex_sync;
 mod previews;

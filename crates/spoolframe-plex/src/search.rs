@@ -49,6 +49,11 @@ fn person_id(role: PersonRole, tag: u64) -> PersonId {
     PersonId::new(Namespace::Plex, format!("{}-{tag}", role_name(role))).expect("a key")
 }
 
+/// How many more people a search inside a library asks Plex's hubs for
+/// than it shows, and the most it asks for.
+const INSIDE_A_LIBRARY: u32 = 4;
+const MAX_HUB: u32 = 100;
+
 fn usize_of(n: u32) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
 }
@@ -126,11 +131,10 @@ impl PlexCatalog {
         query: &SearchQuery,
     ) -> Result<FoundGroup, CatalogError> {
         let Some((holds, number, name)) = plex_type(kind) else {
-            // Plex cannot narrow people to a section.
-            return match query.library {
-                Some(_) => Ok(FoundGroup::empty(kind)),
-                None => self.find_people(query).await,
-            };
+            // Plex cannot narrow people to a section, but it says which
+            // section it found each in: inside a library, those (P3-18).
+            let inside = query.library.as_ref().and_then(|_| sections.first());
+            return self.find_people(query, inside.map(|l| l.id.key())).await;
         };
         let asked = sections
             .iter()
@@ -187,13 +191,25 @@ impl PlexCatalog {
     }
 
     /// The actors and directors whose names match, each once: Plex lists
-    /// a person once per section, with their count there.
-    async fn find_people(&self, query: &SearchQuery) -> Result<FoundGroup, CatalogError> {
+    /// a person once per section, with their count there. With `section`,
+    /// only the ones it found in that section, with their count in it.
+    async fn find_people(
+        &self,
+        query: &SearchQuery,
+        section: Option<&str>,
+    ) -> Result<FoundGroup, CatalogError> {
         if query.limit == 0 {
             // Counting people would cost a call for a number no scope has.
             return Ok(FoundGroup::empty(SearchKind::People));
         }
-        let limit = query.limit.to_string();
+        // Plex caps each hub at `limit` over every section: inside one,
+        // ask for more, so that people found elsewhere first leave some
+        // for it. Still one call.
+        let asked = match section {
+            Some(_) => query.limit.saturating_mul(INSIDE_A_LIBRARY).min(MAX_HUB),
+            None => query.limit,
+        };
+        let limit = asked.to_string();
         let mut call = Call::get("/hubs/search").about(format!("search {:?}", query.text));
         call.query = vec![("query", &query.text), ("limit", &limit)];
         let container = self.fetch(&call).await?;
@@ -205,7 +221,11 @@ impl PlexCatalog {
                 _ => continue,
             };
             for tag in &hub.tags {
-                if !self.serves(tag.library_section_id.as_ref()) {
+                let found_in = tag.library_section_id.as_ref();
+                if !self.serves(found_in) {
+                    continue;
+                }
+                if section.is_some_and(|s| found_in.is_none_or(|f| f.0 != s)) {
                     continue;
                 }
                 let id = person_id(role, tag.id);

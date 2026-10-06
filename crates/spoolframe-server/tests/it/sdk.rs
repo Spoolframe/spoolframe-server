@@ -101,14 +101,18 @@ async fn sign_in_and_browse() {
     server.stop().await;
 }
 
-/// `session`'s connection path once it is on the LAN, or whatever it is
+/// `session`'s connection path once a direct path is selected, or whatever it is
 /// after `within`: right after a sign-in iroh may not have selected a
 /// path yet.
 async fn settled_path(session: &Session, within: Duration) -> ConnectionPath {
     let deadline = tokio::time::Instant::now() + within;
     loop {
         let path = session.connection_path();
-        if matches!(path, ConnectionPath::Lan { .. }) || tokio::time::Instant::now() >= deadline {
+        if matches!(
+            path,
+            ConnectionPath::Lan { .. } | ConnectionPath::Direct { .. }
+        ) || tokio::time::Instant::now() >= deadline
+        {
             return path;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -124,7 +128,7 @@ fn on_the_lan(addr: &std::net::SocketAddr) -> bool {
 }
 
 #[tokio::test]
-async fn a_session_says_its_connection_is_direct_on_the_lan() {
+async fn a_session_tells_its_direct_path_as_lan_or_not() {
     let server = TestServer::start("path").await;
     server
         .add_user("alice", "correct horse", Some("Alice"))
@@ -149,9 +153,24 @@ async fn a_session_says_its_connection_is_direct_on_the_lan() {
     pin(&client, &server).await;
     let alice = alice(&server, &client).await;
 
+    // iroh learns the server's other addresses during the handshake and
+    // may still move to a public one, so which path it settles on is not
+    // ours to fix: what is checked is that the path is told as what it is,
+    // a LAN address as Lan and any other as Direct.
     let path = settled_path(&alice, Duration::from_secs(5)).await;
-    let ConnectionPath::Lan { addr } = path else {
-        panic!("not on the LAN within 5 s: {path:?}")
+    let addr = match path {
+        ConnectionPath::Lan { addr } => {
+            assert!(on_the_lan(&addr), "{addr} is told as LAN but is not");
+            addr
+        }
+        ConnectionPath::Direct { addr } => {
+            assert!(
+                !on_the_lan(&addr),
+                "{addr} is on the LAN but told as Direct"
+            );
+            addr
+        }
+        other => panic!("no direct path within 5 s: {other:?}"),
     };
     assert!(
         server.server.addr().ip_addrs().any(|a| *a == addr),

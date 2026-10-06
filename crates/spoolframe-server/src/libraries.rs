@@ -7,8 +7,9 @@
 //! refused where the locked file sets it, and the catalog follows at once.
 //! A token is kept as a secret, never in a layer.
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use spoolframe_admin_api::{
     LibrariesOverview, LibraryEntry, LibraryPathCheck, LibraryStatus, PathMappingEntry,
@@ -263,6 +264,67 @@ pub fn path_check(report: LibraryPaths, bases: &[PathBuf]) -> LibraryPathCheck {
         library: report.library,
         suggestion,
     }
+}
+
+/// Where Plex's name for each section of each server is kept, as the
+/// server last gave it (P3-18): what a down server's libraries are shown
+/// with, rather than "section 3". Not a setting, so no layer or lock has
+/// it.
+const SECTION_TITLES: &str = "plex-section-titles.json";
+
+/// By server id, then section key.
+type SectionTitles = BTreeMap<String, BTreeMap<String, String>>;
+
+/// One writer at a time: overviews asked at once would otherwise rename
+/// over each other's half-written file.
+static TITLES_WRITE: Mutex<()> = Mutex::new(());
+
+/// The titles kept in `path`. A file that is missing or does not read is
+/// none: the next answer from each server fills them in again.
+fn read_titles(path: &Path) -> SectionTitles {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!(path = %path.display(), error = %e, "the kept Plex section titles do not read; starting again");
+            SectionTitles::new()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SectionTitles::new(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cannot read the kept Plex section titles");
+            SectionTitles::new()
+        }
+    }
+}
+
+fn write_titles(path: &Path, titles: &SectionTitles) -> std::io::Result<()> {
+    let _one = TITLES_WRITE.lock().expect("never held across a panic");
+    let partial = path.with_extension("json.partial");
+    std::fs::write(&partial, serde_json::to_vec(titles)?)?;
+    std::fs::rename(&partial, path)
+}
+
+/// `kept` brought up to what the servers answered: each one that answered
+/// has its sections' titles as it gave them now, one that did not keeps
+/// the ones it gave last, and a server no longer configured is forgotten.
+/// Whether anything changed.
+fn remember_titles<'a>(
+    kept: &mut SectionTitles,
+    answered: impl IntoIterator<Item = (&'a str, &'a PlexStatus)>,
+) -> bool {
+    let before = kept.clone();
+    let mut configured = HashSet::new();
+    for (server, status) in answered {
+        configured.insert(server.to_owned());
+        if status.reachable {
+            let now = status
+                .libraries
+                .iter()
+                .map(|s| (s.section.clone(), s.title.clone()))
+                .collect();
+            kept.insert(server.to_owned(), now);
+        }
+    }
+    kept.retain(|server, _| configured.contains(server));
+    *kept != before
 }
 
 /// The libraries now: as chosen, or (not chosen yet) every library of the
@@ -677,15 +739,13 @@ impl RuntimeSettings {
         Ok(())
     }
 
-    /// Remove Plex server `id`, its libraries and its token.
+    /// Remove Plex server `id`, its libraries and its token. Their watch
+    /// state is kept, under their items' ids.
     pub fn plex_server_remove(&self, id: &str, by: &str) -> Result<(), LibraryError> {
-        let (_, config) = self.config_now()?;
+        let (layers, config) = self.config_now()?;
         let (mut servers, at) = Self::locate(&config, id)?;
         let Some(at) = at else {
-            return Err(LibraryError::Invalid(
-                "the first Plex server cannot be removed; change its address or token instead"
-                    .into(),
-            ));
+            return self.first_server_remove(&layers, &config, by);
         };
         let removed = servers.remove(at);
         // Its libraries first: each change is checked, and a library of a
@@ -709,6 +769,72 @@ impl RuntimeSettings {
             server = id,
             name = removed.display_name(),
             "Plex server removed with its libraries; their watch state is kept"
+        );
+        Ok(())
+    }
+
+    /// Remove the first Plex server (P3-18), which only it being the last
+    /// one allows. Its items' ids have no server in them (`plex:movie:12`),
+    /// and its watch state is stored under those ids. Another server could
+    /// take its place only by its items taking those ids, so the old
+    /// server's state would show on whatever the new one's item 12 is, and
+    /// every id of the new one that clients hold would change. So while
+    /// another remains, removing it is refused with the reason. Alone, it
+    /// goes with every Plex setting, and the server is not set up again;
+    /// its watch state stays where it was, as a removed library's does, and
+    /// the same server added back finds it there.
+    fn first_server_remove(
+        &self,
+        layers: &Layers,
+        config: &ServerConfig,
+        by: &str,
+    ) -> Result<(), LibraryError> {
+        let plex = config.plex.as_ref().ok_or(LibraryError::NotSetUp)?;
+        let first = plex.all_servers().remove(0).display_name();
+        if !plex.servers.is_empty() {
+            let others: Vec<String> = plex
+                .servers
+                .iter()
+                .map(PlexServerConfig::display_name)
+                .collect();
+            return Err(LibraryError::Invalid(format!(
+                "{first} is the first Plex server, and its items' ids are the ones without a \
+                 server in them, which its watch state is kept under. It can be removed once \
+                 it is the only one: remove {} first, or change its address or token instead",
+                others.join(", ")
+            )));
+        }
+        if layers.file_sets("plex.url") {
+            return Err(LibraryError::Invalid(format!(
+                "{first} is set in the config file{}; remove it there",
+                layers
+                    .file_path()
+                    .map(|p| format!(" {}", p.display()))
+                    .unwrap_or_default()
+            )));
+        }
+        let keys = [
+            "libraries",
+            "plex.servers",
+            "plex.watch_sync.user",
+            "plex.watch_sync.interval_secs",
+            "plex.path_mapping",
+            "plex.token_file",
+            "plex.name",
+            "plex.url",
+        ]
+        .into_iter()
+        .map(|key| (key, None))
+        .collect();
+        self.change_keys("plex", by, keys)?;
+        if let Err(e) = self.secrets().remove(&plex_token_secret(FIRST_PLEX_SERVER)) {
+            tracing::warn!(error = %e, "cannot forget the removed first server's token");
+        }
+        tracing::info!(
+            by,
+            name = first,
+            "the first Plex server removed with its libraries; their watch state is kept, \
+             and the server is not set up until one is added"
         );
         Ok(())
     }
@@ -756,6 +882,18 @@ impl RuntimeSettings {
             .into_iter()
             .map(|r| r.expect("every server answered"))
             .collect();
+        let titles_at = self.state_dir().join(SECTION_TITLES);
+        let mut titles = read_titles(&titles_at);
+        let answered = composite
+            .servers()
+            .iter()
+            .zip(&reports)
+            .map(|(source, (status, _))| (source.id.as_str(), status));
+        if remember_titles(&mut titles, answered)
+            && let Err(e) = write_titles(&titles_at, &titles)
+        {
+            tracing::warn!(path = %titles_at.display(), error = %e, "cannot keep the Plex section titles");
+        }
         let served = served_now(&config, &reports[0].0);
         let configured: HashMap<String, PlexServerConfig> = plex
             .all_servers()
@@ -818,6 +956,13 @@ impl RuntimeSettings {
                     (None, Some(_)) => None,
                 };
                 let title = section.map(|s| s.title.clone());
+                // A server that is down: the name it gave last.
+                let kept_title = || {
+                    titles
+                        .get(&l.plex.server)
+                        .and_then(|t| t.get(&l.plex.section))
+                        .cloned()
+                };
                 LibraryEntry {
                     id: library_id(&l.plex),
                     name: l.name.clone(),
@@ -836,7 +981,7 @@ impl RuntimeSettings {
                             .cloned()
                             .map(|p| path_check(p, bases))
                     }),
-                    plex_title: title,
+                    plex_title: title.or_else(kept_title),
                     error,
                     sync: plex.sync(&l.plex),
                 }
@@ -910,6 +1055,70 @@ mod tests {
         };
         assert_eq!(library_id(&source("plex")), "plex:2");
         assert_eq!(library_id(&source("cabin")), "plex:cabin:2");
+    }
+
+    fn status(reachable: bool, sections: &[(&str, &str)]) -> PlexStatus {
+        PlexStatus {
+            reachable,
+            error: (!reachable).then(|| "down".to_owned()),
+            server_name: None,
+            version: None,
+            url: None,
+            libraries: sections
+                .iter()
+                .map(|(key, title)| LibraryStatus {
+                    section: (*key).into(),
+                    title: (*title).into(),
+                    kind: spoolframe_types::LibraryKind::Movies,
+                    items: 1,
+                    library: None,
+                })
+                .collect(),
+            unsupported: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_server_that_is_down_keeps_the_titles_it_gave_last() {
+        let mut kept = SectionTitles::new();
+        let tower = status(true, &[("1", "Movies")]);
+        let cabin = status(true, &[("1", "Cabin films")]);
+        assert!(remember_titles(
+            &mut kept,
+            [("plex", &tower), ("cabin", &cabin)]
+        ));
+        let down = status(false, &[]);
+        assert!(!remember_titles(
+            &mut kept,
+            [("plex", &tower), ("cabin", &down)]
+        ));
+        assert_eq!(kept["cabin"]["1"], "Cabin films");
+        // Renamed in Plex: the new title, once it answers.
+        let renamed = status(true, &[("1", "Films")]);
+        assert!(remember_titles(
+            &mut kept,
+            [("plex", &renamed), ("cabin", &down)]
+        ));
+        assert_eq!(kept["plex"]["1"], "Films");
+        // Removed: forgotten.
+        assert!(remember_titles(&mut kept, [("plex", &renamed)]));
+        assert!(!kept.contains_key("cabin"));
+    }
+
+    #[tokio::test]
+    async fn kept_titles_that_do_not_read_are_none() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-section-titles").await;
+        let path = dir.as_ref().join(SECTION_TITLES);
+        assert!(read_titles(&path).is_empty());
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(read_titles(&path).is_empty());
+        let mut titles = SectionTitles::new();
+        titles.insert(
+            "plex".into(),
+            BTreeMap::from([("1".into(), "Movies".into())]),
+        );
+        write_titles(&path, &titles).unwrap();
+        assert_eq!(read_titles(&path), titles);
     }
 
     #[test]

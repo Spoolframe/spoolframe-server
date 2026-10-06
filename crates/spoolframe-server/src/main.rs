@@ -16,6 +16,7 @@ use spoolframe_server::catalog::{Composite, LiveCatalog, PlexSource};
 use spoolframe_server::config::layers::{DEFAULTS, Layers, Locations};
 use spoolframe_server::config::secrets::Secrets;
 use spoolframe_server::config::{ServerConfig, WatchSyncConfig};
+use spoolframe_server::connected::Connected;
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
 use spoolframe_server::logs::{LogRing, RingLayer};
@@ -23,6 +24,8 @@ use spoolframe_server::metrics::Metrics;
 use spoolframe_server::network::{Server, ServerName, Services};
 use spoolframe_server::oidc::Oidc;
 use spoolframe_server::passkeys::Passkeys;
+use spoolframe_server::playback::Playbacks;
+use spoolframe_server::playback_debug::PlaybackDebug;
 use spoolframe_server::plex_accounts::{PlexAccounts, configured_owner};
 use spoolframe_server::plex_sync::WatchSync;
 use spoolframe_server::previews::{self, PreviewSources, Previews};
@@ -512,6 +515,10 @@ async fn run(
         },
         supervised,
     ));
+    // Shared by the client protocol, which opens and plays them, and the
+    // admin API's playback debug (P3-15), which looks at them.
+    let playbacks: Arc<Playbacks> = Arc::default();
+    let connected: Arc<Connected> = Arc::default();
     // Only a server with no users offers setup, and only to someone who
     // can read this log.
     let setup_code = (auth.store().user_count().await? == 0).then(SetupCode::generate);
@@ -534,6 +541,15 @@ async fn run(
             metrics: Some(metrics.clone()),
             logs: Some(logs),
             telemetry: Some(telemetry.clone()),
+            playback: Some(Arc::new(PlaybackDebug {
+                playbacks: playbacks.clone(),
+                connected: connected.clone(),
+                catalog: catalog.clone(),
+                prober: prober.clone(),
+                transcoding: transcoding.clone(),
+                subtitles: subtitles.clone(),
+                previews: previews.clone(),
+            })),
         },
         admin_origins,
         admin_proxies,
@@ -562,7 +578,8 @@ async fn run(
             catalog,
             prober,
             artwork,
-            playbacks: Arc::default(),
+            playbacks: playbacks.clone(),
+            connected: connected.clone(),
             app_passkeys: Arc::default(),
             watch,
             transcoding,

@@ -328,15 +328,43 @@ async fn people_come_from_the_actor_hub_once_each() {
     );
 }
 
-#[tokio::test]
-async fn people_are_not_looked_for_inside_a_library() {
+/// The people a search for "keanu" finds in `library`, with their counts.
+async fn people_in(library: &str) -> Vec<(String, Option<u32>)> {
     let server = pms(&["keanu"]).await;
     let mut asked = query("keanu", &[SearchKind::People]);
-    asked.library = Some("plex:2".parse().unwrap());
+    asked.library = Some(library.parse().unwrap());
     let found = catalog(&server).find(&asked).await.unwrap();
-    assert!(group(&found, SearchKind::People).people.is_empty());
-    let requests = server.received_requests().await.unwrap();
-    assert!(requests.iter().all(|r| r.url.path() != "/hubs/search"));
+    let hubs = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/hubs/search")
+        .count();
+    // The hub's own answer says where each person was found: no call
+    // per person.
+    assert_eq!(hubs, 1);
+    group(&found, SearchKind::People)
+        .people
+        .iter()
+        .map(|p| (p.name.clone(), p.count))
+        .collect()
+}
+
+#[tokio::test]
+async fn inside_a_library_people_are_the_ones_plex_found_in_it() {
+    // Keanu Reeves is in 7 of Movies and 2 of TV Shows; the others in one.
+    assert_eq!(
+        people_in("plex:1").await,
+        [
+            ("Keanush Tafreshi".to_owned(), Some(1)),
+            ("Keanu Reeves".to_owned(), Some(2)),
+        ]
+    );
+    let movies = people_in("plex:2").await;
+    assert_eq!(movies[0], ("Keanu Reeves".to_owned(), Some(7)));
+    assert!(!movies.iter().any(|(name, _)| name == "Keanush Tafreshi"));
+    assert!(people_in("plex:12").await.is_empty());
 }
 
 async fn person_pms() -> MockServer {

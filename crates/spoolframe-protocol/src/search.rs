@@ -17,7 +17,9 @@ pub struct SearchRequest {
     /// top match. It overrides `scope`, since people, artists, albums and
     /// tracks have no scope of their own.
     pub kind: Option<SearchKind>,
-    /// Only this library's items. People are not found inside a library.
+    /// Only this library's items, and the people found in it, each with
+    /// their count there. A person's items (`PersonItems`) are still all
+    /// of theirs.
     pub library: Option<LibraryId>,
 }
 

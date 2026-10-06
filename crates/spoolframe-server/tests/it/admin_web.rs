@@ -382,3 +382,79 @@ async fn a_sign_in_at_localhost_or_over_https_is_not_warned_about() {
     assert_eq!(status, StatusCode::OK);
     assert!(!logs::has(&["plain-http-test.example.org", DROPPED]));
 }
+
+#[tokio::test]
+async fn a_session_says_whether_the_web_ui_or_the_cli_made_it() {
+    let (addr, _dir) = server("web-or-cli").await;
+    let root = set_up(addr).await;
+    let api = socket(addr, &root, &page(addr)).await.unwrap();
+    let cli = anonymous(addr)
+        .await
+        .login(crate::admin::creds("root", PASSWORD))
+        .await
+        .unwrap();
+    let browser = post(
+        addr,
+        "/auth/login",
+        Some(&page(addr)),
+        None,
+        json!({ "username": "root", "password": PASSWORD }),
+    )
+    .await;
+    cookie(&browser);
+    let mut platforms: Vec<_> = api
+        .user_sessions("root".into())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.endpoint_id, s.platform))
+        .collect();
+    platforms.sort_by_key(|(_, p)| p.map(|p| p.as_str()));
+    // Setup's and the login's from the web UI, the CLI's login.
+    assert_eq!(
+        platforms,
+        [
+            (None, Some(spoolframe_admin_api::Platform::Cli)),
+            (None, Some(spoolframe_admin_api::Platform::Web)),
+            (None, Some(spoolframe_admin_api::Platform::Web)),
+        ]
+    );
+    assert!(!cli.token.is_empty());
+}
+
+#[tokio::test]
+async fn a_user_whose_password_logins_are_limited_is_listed_so_with_the_wait() {
+    let (addr, _dir) = server("web-limited").await;
+    let root = set_up(addr).await;
+    let api = socket(addr, &root, &page(addr)).await.unwrap();
+    for name in ["bob", "carol"] {
+        api.user_add(NewUser {
+            username: name.into(),
+            display_name: None,
+            password: PASSWORD.into(),
+            role: Role::Consumer,
+        })
+        .await
+        .unwrap();
+    }
+    let guesser = anonymous(addr).await;
+    for _ in 0..spoolframe_server::auth::MAX_FAILURES {
+        let wrong = guesser
+            .login(crate::admin::creds("bob", "not the password"))
+            .await;
+        assert!(wrong.is_err());
+    }
+    let users = api.user_list().await.unwrap();
+    let limited = |name: &str| {
+        users
+            .iter()
+            .find(|u| u.username == name)
+            .unwrap()
+            .rate_limited_secs
+    };
+    let wait = limited("bob").expect("bob is limited");
+    let window = spoolframe_server::auth::FAILURE_WINDOW.as_secs();
+    assert!(wait > window - 60 && wait <= window, "{wait}");
+    assert_eq!(limited("carol"), None);
+    assert_eq!(limited("root"), None);
+}

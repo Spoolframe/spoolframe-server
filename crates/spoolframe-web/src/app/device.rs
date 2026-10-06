@@ -181,6 +181,10 @@ fn Consent(user: UserInfo, code: String, server: String, on_switch: EventHandler
                                 icons::Mark { size: 52 }
                                 span { class: "text-ctp-teal", icons::Monitor {} }
                                 h1 { class: "m-0 break-words text-2xl font-bold", "Sign in to Spoolframe on “{name}”?" }
+                                // Which kind of device asks, as it said: a
+                                // code from a TV typed on a phone should
+                                // say "Apple TV app".
+                                p { class: "m-0 text-[15px] font-semibold text-ctp-teal", "{device.platform.label()}" }
                                 p { class: "m-0 text-[15px] text-ctp-subtext1",
                                     "You are signed in as " b { "{who}" } " ({user.username}) on {server}."
                                 }

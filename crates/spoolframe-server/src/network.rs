@@ -153,6 +153,8 @@ pub struct Services {
     /// What the client protocol counts, and where its parts are read
     /// from for the metrics (P3-14).
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// The devices connected now and what they play (P3-15).
+    pub connected: Arc<crate::connected::Connected>,
 }
 
 impl std::fmt::Debug for Services {

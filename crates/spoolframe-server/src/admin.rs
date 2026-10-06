@@ -39,8 +39,8 @@ use spoolframe_plex::check::Scope;
 
 pub use crate::admin_http::{AddressRanges, CookiePolicy, Origins, TrustedProxies};
 use crate::auth::{
-    Auth, LoginError, PasswordError, RECENT_SIGN_IN, SessionToken, hash_password, hash_pin,
-    pin_digits,
+    Approval, Auth, LoginError, PasswordError, RECENT_SIGN_IN, SessionToken, hash_password,
+    hash_pin, pin_digits,
 };
 use crate::catalog::LiveCatalog;
 use crate::config::layers::SettingError;
@@ -307,6 +307,9 @@ pub struct Admin {
     pub logs: Option<Arc<crate::logs::LogRing>>,
     /// The OTLP export (P3-14), for its status; `None` in tests without.
     pub telemetry: Option<Arc<crate::telemetry::Telemetry>>,
+    /// What plays, for playback debug (P3-15); `None` in tests without,
+    /// where its methods are `NOT_CONFIGURED`.
+    pub playback: Option<Arc<crate::playback_debug::PlaybackDebug>>,
 }
 
 /// What the setup wizard reaches beyond the server (P3-10): plex.tv for
@@ -441,6 +444,7 @@ pub async fn serve(
         metrics: admin.metrics,
         logs: admin.logs,
         telemetry: admin.telemetry,
+        playback: admin.playback,
         checks: Arc::default(),
         pins: Arc::default(),
         signed_in: Arc::default(),
@@ -471,6 +475,7 @@ pub(crate) struct AdminApi {
     metrics: Option<Arc<crate::metrics::Metrics>>,
     logs: Option<Arc<crate::logs::LogRing>>,
     telemetry: Option<Arc<crate::telemetry::Telemetry>>,
+    playback: Option<Arc<crate::playback_debug::PlaybackDebug>>,
     /// Each library's last path check (P3-16).
     checks: Arc<PathChecks>,
     /// The plex.tv PINs this server began, so a check is only of those.
@@ -588,6 +593,16 @@ impl AdminApi {
         })
     }
 
+    /// Note that the session `token` is the web UI's: what set it as a
+    /// browser's cookie (P3-18). Only a label for the session list, so a
+    /// failure is logged and the sign-in goes on.
+    pub(crate) async fn mark_web_session(&self, token: &str) {
+        let hash = crate::auth::SessionToken(token.to_owned()).hash();
+        if let Err(e) = self.auth.store().mark_web_session(&hash).await {
+            tracing::warn!(error = %e, "cannot mark a session as the web UI's");
+        }
+    }
+
     /// The server's metrics, if it keeps any.
     pub(crate) fn metrics(&self) -> Option<&crate::metrics::Metrics> {
         self.metrics.as_deref()
@@ -595,6 +610,16 @@ impl AdminApi {
 
     pub(crate) fn metrics_arc(&self) -> Option<Arc<crate::metrics::Metrics>> {
         self.metrics.clone()
+    }
+
+    /// Playback debug's parts (P3-15), if this server has them.
+    fn playback_debug(&self) -> RpcResult<&crate::playback_debug::PlaybackDebug> {
+        self.playback.as_deref().ok_or_else(|| {
+            error(
+                error_code::NOT_CONFIGURED,
+                "this admin API has no playback to look at",
+            )
+        })
     }
 
     /// How the session cookie is sent now.
@@ -749,13 +774,19 @@ impl AdminApi {
             .collect())
     }
 
+    /// `u` as the API shows it, with whether their logins are limited now.
+    fn info(&self, u: UserRecord) -> UserInfo {
+        let limited = self.auth.login_limited(&u.username);
+        info(u, limited)
+    }
+
     async fn user_info(&self, username: &str) -> RpcResult<UserInfo> {
         let name = normalize_username(username)?;
         let users = self.auth.store().list_users().await?;
         users
             .into_iter()
             .find(|u| u.username == name)
-            .map(info)
+            .map(|u| self.info(u))
             .ok_or_else(|| UserError::NoSuchUser(name).into())
     }
 }
@@ -1232,8 +1263,10 @@ impl AdminApi {
 /// How long titles are waited for in a list of track overrides.
 const TITLE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
-fn info(u: UserRecord) -> UserInfo {
+fn info(u: UserRecord, limited: Option<std::time::Duration>) -> UserInfo {
     UserInfo {
+        // Rounded up: a wait of 0.4 s is still a wait.
+        rate_limited_secs: limited.map(|d| d.as_secs() + u64::from(d.subsec_nanos() > 0)),
         username: u.username,
         display_name: u.display_name,
         role: u.role,
@@ -1346,7 +1379,7 @@ impl MeApiServer for AdminApi {
         let (_, user) = self.caller(ext).await?;
         let record = self.auth.store().user_by_id(user.user).await?;
         record
-            .map(info)
+            .map(|u| self.info(u))
             .ok_or_else(|| error(error_code::UNAUTHENTICATED, "session is not valid"))
     }
 
@@ -1466,6 +1499,7 @@ impl MeApiServer for AdminApi {
             Some(waiting) => Ok(DeviceSignIn {
                 device_name: waiting.device_name,
                 client_name: waiting.client_name,
+                platform: waiting.platform,
                 requested_at: waiting.requested_at,
             }),
             None => Err(self.wrong_sign_in_code(ext, user)?),
@@ -1475,18 +1509,16 @@ impl MeApiServer for AdminApi {
     async fn device_sign_in_approve(&self, ext: &Extensions, code: String) -> RpcResult<()> {
         self.recently_signed_in(ext).await?;
         let (user, code) = self.sign_in_code(ext, &code).await?;
-        let sign_ins = self.auth.sign_ins();
         // No endpoint approves here: a web session is never the device
         // that waits.
-        let claim = match sign_ins.claim(&code, None) {
+        let claim = match self.auth.sign_ins().claim(&code, None) {
             Ok(claim) => claim,
             Err(ClaimError::Unknown | ClaimError::SameDevice) => {
                 return Err(self.wrong_sign_in_code(ext, user)?);
             }
         };
         match self.auth.approve_device(user.user, &claim).await {
-            Ok(token) => {
-                sign_ins.fulfil(&claim.request, Some(token));
+            Ok(Approval::SignedIn) => {
                 tracing::info!(
                     user = %user.user,
                     device = %claim.endpoint,
@@ -1494,10 +1526,13 @@ impl MeApiServer for AdminApi {
                 );
                 Ok(())
             }
-            Err(e) => {
-                sign_ins.fulfil(&claim.request, None);
-                Err(internal(e))
-            }
+            // The right code, run out while it was approved: not a guess,
+            // so not counted as one.
+            Ok(Approval::Expired) => Err(error(
+                error_code::NO_SUCH_SIGN_IN_CODE,
+                "that sign-in code ran out while it was approved",
+            )),
+            Err(e) => Err(internal(e)),
         }
     }
 
@@ -1686,7 +1721,7 @@ impl MeApiServer for AdminApi {
             .store()
             .set_display_name(user.user, display_name.as_deref())
             .await?;
-        Ok(info(self.account(user).await?))
+        Ok(self.info(self.account(user).await?))
     }
 
     async fn track_preferences(&self, ext: &Extensions) -> RpcResult<TrackPreferences> {
@@ -1864,7 +1899,7 @@ impl AdminApiServer for AdminApi {
             .list_users()
             .await?
             .into_iter()
-            .map(info)
+            .map(|u| self.info(u))
             .collect())
     }
 
@@ -2756,6 +2791,85 @@ impl AdminApiServer for AdminApi {
             )),
         }
     }
+
+    async fn playbacks(&self, ext: &Extensions) -> RpcResult<spoolframe_admin_api::PlaybackList> {
+        self.admin(ext).await?;
+        Ok(self.playback_debug()?.list())
+    }
+
+    async fn playback(
+        &self,
+        ext: &Extensions,
+        id: String,
+    ) -> RpcResult<spoolframe_admin_api::PlaybackDetail> {
+        self.admin(ext).await?;
+        self.playback_debug()?
+            .detail(&id)
+            .await
+            .ok_or_else(|| no_such_playback(&id))
+    }
+
+    async fn playback_stop(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        self.admin(ext).await?;
+        if self.playback_debug()?.stop(&id) {
+            Ok(())
+        } else {
+            Err(no_such_playback(&id))
+        }
+    }
+
+    async fn playback_end_conversion(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        self.admin(ext).await?;
+        self.playback_debug()?
+            .end_conversion(&id)
+            .map_err(|e| match e {
+                crate::playback::EndConversionError::NotFound => no_such_playback(&id),
+                crate::playback::EndConversionError::NoConversion => error(
+                    error_code::NO_CONVERSION,
+                    "this playback plays the file as it is: there is no conversion to end",
+                ),
+            })
+    }
+
+    async fn catalog_debug(
+        &self,
+        ext: &Extensions,
+        id: String,
+    ) -> RpcResult<spoolframe_admin_api::ItemDebug> {
+        self.admin(ext).await?;
+        let id = catalog::media_id(&id)?;
+        self.playback_debug()?.item(&id).await.map_err(debug_error)
+    }
+
+    async fn catalog_plan_for(
+        &self,
+        ext: &Extensions,
+        id: String,
+        request: spoolframe_admin_api::PlanFor,
+    ) -> RpcResult<spoolframe_admin_api::PlanView> {
+        self.admin(ext).await?;
+        let id = catalog::media_id(&id)?;
+        self.playback_debug()?
+            .plan_for(&id, &request)
+            .await
+            .map_err(debug_error)
+    }
+}
+
+fn no_such_playback(id: &str) -> ErrorObjectOwned {
+    error(
+        error_code::NO_SUCH_PLAYBACK,
+        format!("no playback {id} is open or ended in the last hour"),
+    )
+}
+
+fn debug_error(e: crate::playback_debug::DebugError) -> ErrorObjectOwned {
+    use crate::playback_debug::DebugError;
+    match e {
+        DebugError::Catalog(e) => catalog::catalog_error(e),
+        DebugError::Unreadable(why) => error(error_code::UNAVAILABLE, why),
+        DebugError::NoSuchDevice(why) => error(error_code::NO_SUCH_DEVICE, why),
+    }
 }
 
 /// How many files of each library the wizard's path check, and the
@@ -2964,6 +3078,7 @@ mod tests {
             metrics: None,
             logs: None,
             telemetry: None,
+            playback: None,
             checks: Arc::default(),
             pins: Arc::default(),
             signed_in: Arc::default(),

@@ -272,6 +272,7 @@ fn answer(id: EndpointId, request: Request) -> Response {
         Request::LookupDeviceSignIn { .. } => Reply::DeviceSignInRequest(DeviceSignInRequest {
             device_name: Some("Living room TV".into()),
             client_name: "spoolframe-tvos".into(),
+            platform: spoolframe_types::Platform::Tvos,
             requested_at: 0,
         }),
         Request::ApproveDeviceSignIn { .. } => Reply::Done,

@@ -332,6 +332,26 @@ pub fn sample(check: &LibraryPathCheck) -> Sample {
     }
 }
 
+/// The longest display name the server takes (`setDisplayName`).
+const MAX_DISPLAY_NAME: usize = 64;
+
+/// The first admin's display name as typed in step 1 (P3-18), checked as
+/// the server checks it before the account is made, so a name it would
+/// refuse cannot leave an account made without one. `None` when blank:
+/// the username is shown.
+pub fn display_name(typed: &str) -> Result<Option<String>, String> {
+    let name = typed.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if name.chars().count() > MAX_DISPLAY_NAME || name.chars().any(char::is_control) {
+        return Err(format!(
+            "A display name is at most {MAX_DISPLAY_NAME} characters, on one line."
+        ));
+    }
+    Ok(Some(name.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,5 +517,14 @@ mod tests {
             Sample::Missing { missing: 2, of: 5 }
         );
         assert_eq!(sample(&check("M", "/m", 0, 0)), Sample::Empty);
+    }
+
+    #[test]
+    fn the_first_admin_s_display_name_is_checked_as_the_server_does() {
+        assert_eq!(display_name("  Andrey "), Ok(Some("Andrey".into())));
+        assert_eq!(display_name("   "), Ok(None));
+        assert_eq!(display_name(&"é".repeat(64)), Ok(Some("é".repeat(64))));
+        assert!(display_name(&"a".repeat(65)).is_err());
+        assert!(display_name("two\nlines").is_err());
     }
 }

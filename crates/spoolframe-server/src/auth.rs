@@ -254,6 +254,20 @@ impl RateLimiter {
         self.limited(&mut failures, username, source, now)
     }
 
+    /// How long `username` stays limited by its own failures, if it is:
+    /// what the admin pages show (P3-18). A limited source, or a full
+    /// limiter, refuses the user's logins too, but is not theirs to show.
+    pub fn user_limited(&self, username: &str, now: Instant) -> Option<Duration> {
+        let mut failures = self.failures.lock().expect("never held across a panic");
+        let key = Self::user_key(username);
+        self.prune(&mut failures, &key, now);
+        failures
+            .by_key
+            .get(&key)
+            .filter(|times| times.len() >= MAX_FAILURES)
+            .map(|times| self.window - now.duration_since(times[0]))
+    }
+
     fn expired(&self, at: Instant, now: Instant) -> bool {
         now.duration_since(at) >= self.window
     }
@@ -397,6 +411,16 @@ impl From<StoreError> for UnlockError {
     }
 }
 
+/// How an approved device sign-in ended (P3-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    /// The device has its session.
+    SignedIn,
+    /// The code ran out first; the device was told so, and no session
+    /// was left behind.
+    Expired,
+}
+
 /// Logins and sessions.
 #[derive(Debug, Clone)]
 pub struct Auth {
@@ -434,21 +458,40 @@ impl Auth {
     }
 
     /// Open a session on the device `claim` names, as `user`, who approved
-    /// it from a session of their own (P3-07): that session is the proof.
-    /// The caller must require recent authentication before claiming the code:
-    /// the approved session receives a fresh authentication timestamp.
-    /// The device gets the token through [`DeviceSignIns::fulfil`].
+    /// it from a session of their own (P3-07): that session is the proof,
+    /// and hand it to the device. The caller must require recent
+    /// authentication before claiming the code: the approved session
+    /// receives a fresh authentication timestamp.
+    ///
+    /// The code may run out while the session is made, and the device be
+    /// told so: then the session, which nobody holds, is revoked, and the
+    /// approver is told it expired too. The device and the approver never
+    /// hear two different outcomes.
     pub async fn approve_device(
         &self,
         user: LocalUserId,
         claim: &Claim,
-    ) -> Result<SessionToken, StoreError> {
+    ) -> Result<Approval, StoreError> {
         let binding = SessionBinding::Endpoint {
             endpoint_id: claim.endpoint.clone(),
             device_name: claim.device_name.clone(),
             platform: claim.platform,
         };
-        self.open_session(user, &binding).await
+        let token = match self.open_session(user, &binding).await {
+            Ok(token) => token,
+            Err(e) => {
+                // Failed or already gone, the device stops waiting.
+                let _ = self.sign_ins.fulfil(&claim.request, None);
+                return Err(e);
+            }
+        };
+        let hash = token.hash();
+        if self.sign_ins.fulfil(&claim.request, Some(token)) {
+            Ok(Approval::SignedIn)
+        } else {
+            self.store.revoke_session(&hash).await?;
+            Ok(Approval::Expired)
+        }
     }
 
     /// Open a session bound as `binding` for `user`, who just proved who
@@ -530,6 +573,12 @@ impl Auth {
     /// (a setup code): `Some(wait)` if `what` from `source` is limited.
     pub fn attempt_limited(&self, what: &str, source: Option<&str>) -> Option<Duration> {
         self.limiter.check(what, source, Instant::now())
+    }
+
+    /// How long `username`'s password logins stay refused for its own
+    /// failed ones, if they are (P3-18).
+    pub fn login_limited(&self, username: &str) -> Option<Duration> {
+        self.limiter.user_limited(username, Instant::now())
     }
 
     pub fn attempt_failed(&self, what: &str, source: Option<&str>) {
@@ -856,6 +905,30 @@ mod tests {
         assert!(limiter.check("bob", Some("a"), t0).is_some());
         // Others are not.
         assert!(limiter.check("bob", Some("b"), t0).is_none());
+    }
+
+    #[test]
+    fn a_user_is_shown_limited_only_by_their_own_username_s_failures() {
+        let limiter = RateLimiter::default();
+        let t0 = Instant::now();
+        for _ in 0..MAX_FAILURES {
+            limiter.record_failure("Alice", Some("a"), t0);
+        }
+        let later = t0 + Duration::from_secs(60);
+        assert_eq!(
+            limiter.user_limited("alice", later),
+            Some(FAILURE_WINDOW - Duration::from_secs(60))
+        );
+        // Bob shares only the source: he is refused from there, but it is
+        // not his account that is limited.
+        assert!(limiter.check("bob", Some("a"), later).is_some());
+        assert_eq!(limiter.user_limited("bob", later), None);
+        // One short of the limit is not limited.
+        for _ in 1..MAX_FAILURES {
+            limiter.record_failure("carol", None, t0);
+        }
+        assert_eq!(limiter.user_limited("carol", later), None);
+        assert_eq!(limiter.user_limited("alice", t0 + FAILURE_WINDOW), None);
     }
 
     #[test]

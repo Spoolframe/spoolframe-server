@@ -56,15 +56,17 @@ pub struct SessionRecord {
     /// `None` for an admin API session.
     pub device_name: Option<String>,
     pub endpoint_id: Option<String>,
-    /// The device's [`Platform`] by name; see [`SessionRecord::platform`].
+    /// The device's [`Platform`] by name, or for an API session what
+    /// signed it in; see [`SessionRecord::platform`].
     platform: Option<String>,
     pub created_at: i64,
     pub last_used_at: i64,
 }
 
 impl SessionRecord {
-    /// What kind of client the session's device runs; `None` for an API
-    /// session, or a device not seen since the server began keeping it.
+    /// What kind of client the session's device runs, or for an API
+    /// session [`Platform::Web`] or [`Platform::Cli`]; `None` for a device
+    /// or an API session from before the server began keeping it.
     pub fn platform(&self) -> Option<Platform> {
         self.platform.as_deref().map(Platform::from_name)
     }
@@ -113,11 +115,13 @@ impl Store {
             }
             SessionBinding::Api => ("api", None),
         };
+        // The web UI says it made one afterwards (`mark_web_session`).
+        let client = matches!(binding, SessionBinding::Api).then_some(Platform::Cli.as_str());
         sqlx::query(
             "INSERT INTO sessions \
                (token_hash, user_id, kind, endpoint_id, created_at, last_used_at, \
-                authenticated_at, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6)",
+                authenticated_at, expires_at, client) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6, ?7)",
         )
         .bind(token_hash)
         .bind(user)
@@ -125,6 +129,7 @@ impl Store {
         .bind(endpoint)
         .bind(now)
         .bind(expires_at)
+        .bind(client)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -259,10 +264,22 @@ impl Store {
             .collect())
     }
 
+    /// Mark the admin API session `token_hash` as the web UI's (P3-18):
+    /// what set it as a browser's cookie.
+    pub async fn mark_web_session(&self, token_hash: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE sessions SET client = ?2 WHERE token_hash = ?1 AND kind = 'api'")
+            .bind(token_hash)
+            .bind(Platform::Web.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// `user`'s live sessions, on every device, most recently used first.
     pub async fn list_sessions(&self, user: LocalUserId) -> Result<Vec<SessionRecord>, StoreError> {
         Ok(sqlx::query_as(
-            "SELECT s.token_hash, d.display_name AS device_name, s.endpoint_id, d.platform, \
+            "SELECT s.token_hash, d.display_name AS device_name, s.endpoint_id, \
+                    CASE s.kind WHEN 'api' THEN s.client ELSE d.platform END AS platform, \
                     s.created_at, s.last_used_at \
              FROM sessions s LEFT JOIN devices d ON d.endpoint_id = s.endpoint_id \
              WHERE s.user_id = ?1 AND s.revoked_at IS NULL AND s.expires_at > ?2 \

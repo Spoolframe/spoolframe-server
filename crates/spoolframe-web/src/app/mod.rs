@@ -4,12 +4,14 @@
 mod activity;
 mod admin;
 mod catalog;
+mod catalog_debug;
 mod catalog_item;
 mod device;
 mod http;
 mod icons;
 mod libraries;
 mod logs;
+mod playback;
 mod plex;
 mod profile;
 mod rpc;
@@ -28,6 +30,7 @@ use catalog_item::CatalogItem;
 use device::DeviceApproval;
 use libraries::{AddLibrary, Libraries};
 use logs::LogsPage;
+use playback::{PlaybackDetail, PlaybackPage};
 use plex::PlexSignedIn;
 use profile::Profile;
 use settings::{Settings, SettingsHome};
@@ -84,6 +87,11 @@ enum Route {
             ActivityPage {},
             #[route("/logs")]
             LogsPage {},
+            // What plays now, and one playback (P3-15).
+            #[route("/playback")]
+            PlaybackPage {},
+            #[route("/playback/:id")]
+            PlaybackDetail { id: String },
             #[route("/libraries")]
             Libraries {},
             // `back`: where Cancel and the back link go (the wizard's Plex
@@ -351,7 +359,7 @@ fn Login() -> Element {
 const REQUEST_FRESH_SECS: i64 = 4 * 60;
 
 /// A passkey sign-in request fetched before it is needed, and when.
-async fn passkey_request() -> Option<(spoolframe_admin_api::PasskeyChallenge, i64)> {
+pub(super) async fn passkey_request() -> Option<(spoolframe_admin_api::PasskeyChallenge, i64)> {
     if !webauthn::supported() {
         return None;
     }
@@ -359,17 +367,42 @@ async fn passkey_request() -> Option<(spoolframe_admin_api::PasskeyChallenge, i6
     http::passkey_begin().await.ok().map(|c| (c, now()))
 }
 
-/// Sign in with a passkey: the browser's prompt, with no username. With
-/// `ahead`, a request fetched earlier, the prompt opens straight from the
-/// click, which some browsers insist on.
-async fn passkey_sign_in(
+/// A passkey prompt opened from a click, before anything is awaited, if
+/// `ahead` holds a request still fresh: Safari opens a prompt only from
+/// the click itself, not after a network request. `None` if there is no
+/// such request; the click then fetches one ([`passkey_sign_in`]).
+pub(super) fn open_passkey_prompt(
     ahead: Option<(spoolframe_admin_api::PasskeyChallenge, i64)>,
-) -> Result<http::SignedIn, String> {
-    let challenge = match ahead {
-        Some((challenge, at)) if now() - at < REQUEST_FRESH_SECS => challenge,
-        _ => http::passkey_begin().await.map_err(|e| e.explain())?,
+) -> Option<Result<(spoolframe_admin_api::PasskeyChallenge, webauthn::Prompt), String>> {
+    let (challenge, at) = ahead?;
+    if now() - at >= REQUEST_FRESH_SECS {
+        return None;
+    }
+    Some(webauthn::open_get(&challenge.options).map(|prompt| (challenge, prompt)))
+}
+
+/// What a passkey signed, and the request it answers: `opened` by
+/// [`open_passkey_prompt`], or a request fetched now and its prompt.
+pub(super) async fn passkey_signature(
+    opened: Option<Result<(spoolframe_admin_api::PasskeyChallenge, webauthn::Prompt), String>>,
+) -> Result<(spoolframe_admin_api::PasskeyChallenge, serde_json::Value), String> {
+    let (challenge, prompt) = match opened {
+        Some(opened) => opened?,
+        None => {
+            let challenge = http::passkey_begin().await.map_err(|e| e.explain())?;
+            let prompt = webauthn::open_get(&challenge.options)?;
+            (challenge, prompt)
+        }
     };
-    let signed = webauthn::get(&challenge.options).await?;
+    Ok((challenge, prompt.answer().await?))
+}
+
+/// Sign in with a passkey: the browser's prompt, with no username, as
+/// [`passkey_signature`] gets it.
+async fn passkey_sign_in(
+    opened: Option<Result<(spoolframe_admin_api::PasskeyChallenge, webauthn::Prompt), String>>,
+) -> Result<http::SignedIn, String> {
+    let (challenge, signed) = passkey_signature(opened).await?;
     http::passkey_finish(&challenge.ceremony, &signed)
         .await
         .map_err(|e| e.explain())
@@ -421,9 +454,9 @@ fn SignInForm(
     };
     let with_passkey = move |_| {
         busy.set(true);
-        let ahead = request.read().clone().flatten();
+        let opened = open_passkey_prompt(request.read().clone().flatten());
         spawn(async move {
-            match passkey_sign_in(ahead).await {
+            match passkey_sign_in(opened).await {
                 Ok(user) => {
                     rpc::forget();
                     on_done.call(user);
@@ -521,6 +554,10 @@ fn SignInForm(
 
 /// What a passkey made at setup is called until its user renames it.
 const SETUP_PASSKEY_NAME: &str = "Passkey";
+
+/// How long typing the username pauses before its passkey request is
+/// fetched: one request per name typed, not per letter.
+const SETUP_REQUEST_PAUSE_MS: i32 = 400;
 
 /// The wizard's first page and step 1 (P3-01, P3-10): the setup code,
 /// with insecure cookies offered where the page is plain HTTP; then the
@@ -650,11 +687,20 @@ fn CodeCard(name: String, on_ok: EventHandler<String>) -> Element {
     }
 }
 
-/// The first admin exists: step 1 is done, and the wizard goes on. Over
-/// plain HTTP without insecure cookies the browser dropped the session,
-/// and the next page sends it to sign in, which says why.
-async fn admin_made() -> Route {
+/// The first admin exists: their display name is given (P3-18), step 1 is
+/// done, and the wizard goes on. Over plain HTTP without insecure cookies
+/// the browser dropped the session, and the next page sends it to sign
+/// in, which says why.
+async fn admin_made(display_name: Option<String>) -> Route {
     if let Ok(client) = rpc::client().await {
+        // Checked before the account was made; a failure now is the
+        // connection's, and My profile can set it.
+        if let Some(name) = display_name
+            && let Err(e) =
+                spoolframe_admin_api::MeApiClient::set_display_name(&*client, Some(name)).await
+        {
+            tracing::warn!(error = %e, "the first admin's display name was not set");
+        }
         let _ =
             spoolframe_admin_api::AdminApiClient::setup_step_done(&*client, "admin".into()).await;
     }
@@ -678,11 +724,25 @@ fn SetupHeading(name: String) -> Element {
     }
 }
 
+/// The first admin's display name and username, side by side where they
+/// fit (WebSetup). The display name can still change once the account is
+/// made: it is given when the step is finished.
+#[component]
+fn NameFields(display: Signal<String>, username: Signal<String>, disabled: bool) -> Element {
+    rsx! {
+        div { class: "grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-3",
+            Field { label: "Display name", value: display, autocomplete: "nickname", placeholder: "Optional" }
+            Field { label: "Username", value: username, autocomplete: "username", disabled }
+        }
+    }
+}
+
 /// Setup with a password only, where no passkey can be made: `why`.
 #[component]
 fn PasswordSetup(name: String, why: String, setup_code: String) -> Element {
     let nav = navigator();
     let code = use_signal(|| setup_code.clone());
+    let display = use_signal(String::new);
     let username = use_signal(String::new);
     let password = use_signal(String::new);
     let again = use_signal(String::new);
@@ -690,6 +750,13 @@ fn PasswordSetup(name: String, why: String, setup_code: String) -> Element {
     let mut busy = use_signal(|| false);
     let submit = move |e: FormEvent| {
         e.prevent_default();
+        let shown = match crate::setup::display_name(&display()) {
+            Ok(shown) => shown,
+            Err(why) => {
+                error.set(Some(why));
+                return;
+            }
+        };
         if password() != again() {
             error.set(Some("The passwords are not the same.".into()));
             return;
@@ -699,7 +766,7 @@ fn PasswordSetup(name: String, why: String, setup_code: String) -> Element {
             match http::setup(&code(), &username(), &password()).await {
                 Ok(_) => {
                     rpc::forget();
-                    nav.replace(admin_made().await);
+                    nav.replace(admin_made(shown).await);
                 }
                 Err(e) => error.set(Some(e.explain())),
             }
@@ -710,7 +777,7 @@ fn PasswordSetup(name: String, why: String, setup_code: String) -> Element {
         form { class: "glass-card glass-card-wide", onsubmit: submit,
             SetupHeading { name }
             p { class: "m-0 text-xs text-ctp-yellow", "{why}" }
-            Field { label: "Username", value: username, autocomplete: "username" }
+            NameFields { display, username, disabled: false }
             Field { label: "Password", value: password, kind: "password", autocomplete: "new-password" }
             Field { label: "Password again", value: again, kind: "password", autocomplete: "new-password" }
             if let Some(text) = error() {
@@ -739,6 +806,7 @@ async fn first_password(password: String) -> Result<(), ApiError> {
 fn MethodsSetup(name: String, setup_code: String) -> Element {
     let nav = navigator();
     let code = use_signal(|| setup_code.clone());
+    let display = use_signal(String::new);
     let username = use_signal(String::new);
     let password = use_signal(String::new);
     let again = use_signal(String::new);
@@ -752,15 +820,47 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let password_added = has_password() || waiting().is_some();
+    // The passkey request for the username as typed, fetched once typing
+    // pauses, so "Create a passkey" opens the prompt from the click itself:
+    // Safari refuses a passkey prompt opened after a network request.
+    let mut ahead = use_resource(move || async move {
+        let typed = username();
+        if typed.trim().is_empty() || !webauthn::supported() {
+            return None;
+        }
+        admin::sleep(SETUP_REQUEST_PAUSE_MS).await;
+        http::setup_passkey_begin(&code(), &typed)
+            .await
+            .ok()
+            .map(|challenge| (typed, challenge, now()))
+    });
     let create_passkey = move |_| {
         error.set(None);
         busy.set(true);
+        // Opened here, before anything is awaited, when the request for
+        // this username is in hand; fetched first (as browsers other than
+        // Safari allow) only when it is not yet.
+        let opened = ahead
+            .read()
+            .clone()
+            .flatten()
+            .filter(|(typed, _, at)| *typed == username() && now() - at < REQUEST_FRESH_SECS)
+            .map(|(_, challenge, _)| {
+                webauthn::open_create(&challenge.options).map(|prompt| (challenge, prompt))
+            });
         spawn(async move {
             let created = async {
-                let challenge = http::setup_passkey_begin(&code(), &username())
-                    .await
-                    .map_err(|e| e.explain())?;
-                let credential = webauthn::create(&challenge.options).await?;
+                let (challenge, prompt) = match opened {
+                    Some(opened) => opened?,
+                    None => {
+                        let challenge = http::setup_passkey_begin(&code(), &username())
+                            .await
+                            .map_err(|e| e.explain())?;
+                        let prompt = webauthn::open_create(&challenge.options)?;
+                        (challenge, prompt)
+                    }
+                };
+                let credential = prompt.answer().await?;
                 http::setup_passkey_finish(
                     &code(),
                     &challenge.ceremony,
@@ -787,7 +887,11 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
                         }
                     }
                 }
-                Err(text) => error.set(Some(text)),
+                Err(text) => {
+                    error.set(Some(text));
+                    // A request is tried once: the next click needs another.
+                    ahead.restart();
+                }
             }
             busy.set(false);
         });
@@ -816,9 +920,16 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
         });
     };
     let finish = move |_| {
+        let shown = match crate::setup::display_name(&display()) {
+            Ok(shown) => shown,
+            Err(why) => {
+                error.set(Some(why));
+                return;
+            }
+        };
         if made() {
             spawn(async move {
-                nav.replace(admin_made().await);
+                nav.replace(admin_made(shown).await);
             });
             return;
         }
@@ -830,7 +941,7 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
             match http::setup(&code(), &username(), &typed).await {
                 Ok(_) => {
                     rpc::forget();
-                    nav.replace(admin_made().await);
+                    nav.replace(admin_made(shown).await);
                 }
                 Err(e) => error.set(Some(e.explain())),
             }
@@ -841,7 +952,7 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
     rsx! {
         section { class: "glass-card glass-card-setup",
             SetupHeading { name }
-            Field { label: "Username", value: username, autocomplete: "username", disabled: made() }
+            NameFields { display, username, disabled: made() }
             div { class: "flex flex-col gap-0.5",
                 h2 { class: "m-0 text-base font-bold", "Ways to sign in" }
                 span { class: "text-[13px] text-ctp-subtext0", "One is enough to finish. Two is safer." }
@@ -1119,6 +1230,7 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::Server {} => "Server",
         Route::ActivityPage {} => "Activity",
         Route::LogsPage {} => "Logs",
+        Route::PlaybackPage {} | Route::PlaybackDetail { .. } => "Playback",
         Route::Libraries {} | Route::AddLibrary { .. } => "Libraries",
         Route::CatalogLibrary { .. } | Route::CatalogItem { .. } => "Libraries",
         Route::Settings { .. } | Route::SettingsHome {} => "Settings",
@@ -1233,15 +1345,19 @@ fn SignedIn(user: UserInfo) -> Element {
     }
 }
 
-/// Server's sub-pages in the sidebar, one step in: Activity and Logs
-/// (P3-14), Libraries (P3-11) and Settings. The boards also draw Playback here; it
-/// is P3-15's, and joins the list when that page exists.
+/// Server's sub-pages in the sidebar, one step in: Activity (P3-14),
+/// Playback (P3-15), Logs (P3-14), Libraries (P3-11) and Settings.
 fn server_links(route: &Route) -> Element {
     let pages = [
         (
             Route::ActivityPage {},
             "Activity",
             matches!(route, Route::ActivityPage {}),
+        ),
+        (
+            Route::PlaybackPage {},
+            "Playback",
+            matches!(route, Route::PlaybackPage {} | Route::PlaybackDetail { .. }),
         ),
         (
             Route::LogsPage {},
