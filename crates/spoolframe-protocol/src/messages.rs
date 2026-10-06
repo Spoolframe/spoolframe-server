@@ -190,7 +190,8 @@ pub enum Request {
     ListDevices,
     /// Begin making an app passkey for the session user (P3-19):
     /// `PasskeyCreation`. Needs a session signed in within the last 10
-    /// minutes, or `RecentSignInRequired`: sign in again first.
+    /// minutes, or `RecentSignInRequired`: confirm it is the user
+    /// (`ConfirmPassword`, `BeginConfirmPasskey`) first.
     BeginPasskeyRegistration,
     /// Keep the passkey made for it, in the session that began it: `Done`.
     /// One that does not verify is `InvalidCredentials`; a name that is
@@ -214,6 +215,35 @@ pub enum Request {
     RemovePasskey {
         id: String,
     },
+    /// Confirm it is the session user, with their account password, so
+    /// that a session signed in long ago may make a change that needs a
+    /// recent sign-in (`ApproveDeviceSignIn`, `BeginPasskeyRegistration`,
+    /// `RemovePasskey`, `SetPinRequired` with `required: false`):
+    /// `Confirmed`, and this session counts as signed in now, for 10
+    /// minutes. Only this session; the user's others are as they were.
+    ///
+    /// Checked as `LoginPassword` checks it: a wrong one is a failed
+    /// sign-in for the user's username from this device
+    /// (`InvalidCredentials`, then `RateLimited`, one limit with
+    /// `LoginPassword` and the web UI's confirmation). A user with no
+    /// password gets `NoPassword`, with nothing counted: confirm with an
+    /// app passkey. A locked session gets `ProfileLocked`. The PIN is
+    /// never a confirmation: it guards switching profiles on a shared
+    /// device, and is weaker than a sign-in.
+    ConfirmPassword(ConfirmPassword),
+    /// Begin confirming it is the session user with one of their app
+    /// passkeys (P3-19): `PasskeyRequest`, listing their app passkeys
+    /// only. The challenge is this session's on this device, for 5
+    /// minutes; beginning again replaces it. A user with no app passkey
+    /// gets `NotFound`; one whose passkey sign-ins are limited
+    /// `RateLimited`. A locked session gets `ProfileLocked`.
+    BeginConfirmPasskey,
+    /// Finish it with what the passkey signed: `Confirmed`, as for
+    /// `ConfirmPassword`. A passkey that is not the session user's, a
+    /// challenge that is not this session's, or anything else that does
+    /// not verify is `InvalidCredentials`, counted as a failed passkey
+    /// sign-in (then `RateLimited`).
+    FinishConfirmPasskey(FinishPasskeySignIn),
     /// The session user's Plex account link (P3-12): `PlexLink`. Read
     /// only; a client links or unlinks by opening `<web_url>/profile`.
     GetPlexLink,
@@ -393,6 +423,21 @@ impl fmt::Debug for LoginPassword {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoginPassword")
             .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The account password, to confirm it is the session user
+/// (`ConfirmPassword`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmPassword {
+    pub password: String,
+}
+
+impl fmt::Debug for ConfirmPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfirmPassword")
             .field("password", &"<redacted>")
             .finish()
     }
@@ -592,6 +637,9 @@ pub enum Reply {
     },
     /// The request was carried out; there is nothing to return.
     Done,
+    /// The session user confirmed it is them (`ConfirmPassword`,
+    /// `FinishConfirmPasskey`): this session counts as signed in now.
+    Confirmed,
     Home(HomeScreen),
     TrackPreferences(TrackPreferences),
     /// An item's frame previews (`GetPreviews`, P3-13).
@@ -823,7 +871,9 @@ pub enum Error {
     #[error("this account has no password; use the PIN or the web UI")]
     NoPassword,
     /// The session was signed in too long ago for this (an app passkey,
-    /// P3-19): sign in again, then ask again. Nothing was changed.
+    /// P3-19; approving a device, P3-07): confirm it is the user
+    /// (`ConfirmPassword`, or `BeginConfirmPasskey`), or sign in again,
+    /// then ask again. Nothing was changed.
     #[error("sign in again first")]
     RecentSignInRequired,
     /// Removing this would leave the user no way to sign in: it is their

@@ -1234,6 +1234,64 @@ impl ClientProtocol {
                 tracing::info!(user = %user.user, "passkey removed by its user, in an app");
                 Ok(Reply::Done)
             }
+            // P3-07: the web UI's me.confirmPassword and me.confirmPasskey,
+            // for an app, counted under the same keys. The PIN is no proof
+            // here: it guards switching profiles on a shared device, and
+            // is weaker than a sign-in. A locked session never gets here.
+            Request::ConfirmPassword(confirm) => {
+                self.confirm_password(connection, &user, &confirm.password)
+                    .await?;
+                self.confirmed(&session, &user, "password").await
+            }
+            Request::BeginConfirmPasskey => {
+                let endpoint = connection.remote_id().to_string();
+                // Refused before a challenge is made that could only fail.
+                if let Some(retry_after) = self
+                    .services
+                    .auth
+                    .attempt_limited(&crate::passkeys::limit_key(user.user), Some(&endpoint))
+                {
+                    return Err(sign_in_error(SignInError::RateLimited { retry_after }));
+                }
+                let begun = self
+                    .services
+                    .app_passkeys
+                    .begin_confirm(
+                        self.store(),
+                        &SessionToken(session.0.clone()).hash(),
+                        &endpoint,
+                        user.user,
+                    )
+                    .await
+                    .map_err(sign_in_error)?;
+                begun.map(Reply::PasskeyRequest).ok_or(Error::NotFound {
+                    what: "app passkey".into(),
+                })
+            }
+            Request::FinishConfirmPasskey(signed) => {
+                let signer = self
+                    .services
+                    .app_passkeys
+                    .finish_confirm(
+                        &self.services.auth,
+                        &SessionToken(session.0.clone()).hash(),
+                        &connection.remote_id().to_string(),
+                        &signed,
+                    )
+                    .await
+                    .map_err(sign_in_error)?;
+                // The challenge listed only the user's own; this is the
+                // web UI's check too, in case that ever changes.
+                if signer.id != user.user {
+                    tracing::warn!(
+                        user = %user.user,
+                        passkey_of = %signer.id,
+                        "a passkey of another user's was offered as a confirmation"
+                    );
+                    return Err(Error::InvalidCredentials);
+                }
+                self.confirmed(&session, &user, "app passkey").await
+            }
             Request::ListDevices => {
                 let this = connection.remote_id().to_string();
                 let devices = self
@@ -1918,6 +1976,22 @@ impl ClientProtocol {
         Ok(Reply::LoggedIn {
             session: SessionId(token.0),
         })
+    }
+
+    /// `session`'s user proved who they are again, `how`: it counts as
+    /// signed in now ([`RECENT_SIGN_IN`]). Only this session.
+    async fn confirmed(
+        &self,
+        session: &SessionId,
+        user: &SessionUser,
+        how: &str,
+    ) -> Result<Reply, Error> {
+        self.store()
+            .confirm_session(&SessionToken(session.0.clone()).hash())
+            .await
+            .map_err(internal)?;
+        tracing::info!(user = %user.username, how, "confirmed it is them, in an app");
+        Ok(Reply::Confirmed)
     }
 
     /// The account of `user`, a session's.

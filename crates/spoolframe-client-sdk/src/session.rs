@@ -7,11 +7,11 @@ use std::time::Duration;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::{
-    ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo,
-    DeviceSignInRequest, FinishPasskeyRegistration, HomeScreen, ManifestKind, MediaRead,
-    MediaReadResponse, PasskeyCreation, PasskeyInfo, PinProof, PlaybackHandle, PlaybackPlan,
-    PlexLink, Previews, Reply, Request, Response, SearchRequest, SearchResults, Selection,
-    SessionId, SessionInfo, UserSummary,
+    ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChosenTracks, ConfirmPassword,
+    DeviceInfo, DeviceSignInRequest, FinishPasskeyRegistration, FinishPasskeySignIn, HomeScreen,
+    ManifestKind, MediaRead, MediaReadResponse, PasskeyCreation, PasskeyInfo, PasskeyRequest,
+    PinProof, PlaybackHandle, PlaybackPlan, PlexLink, Previews, Reply, Request, Response,
+    SearchRequest, SearchResults, Selection, SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId, SubtitleFormat,
@@ -777,7 +777,9 @@ impl Session {
     /// platform's passkey API makes one with, for the relying party
     /// [`crate::APP_RP_ID`], with user verification. Only soon after
     /// signing in: a session older than 10 minutes gets
-    /// [`SdkError::RecentSignInRequired`] (sign in again, then ask).
+    /// [`SdkError::RecentSignInRequired`] (confirm it is them with
+    /// [`Session::confirm_password`] or [`Session::begin_confirm_passkey`],
+    /// then ask).
     pub async fn begin_passkey_registration(&self) -> Result<PasskeyCreation, SdkError> {
         match self.call(Request::BeginPasskeyRegistration).await? {
             Reply::PasskeyCreation(creation) => Ok(creation),
@@ -831,6 +833,49 @@ impl Session {
             .await
     }
 
+    /// Confirm it is this user with their account password (P3-07), when
+    /// a change answers [`SdkError::RecentSignInRequired`]: approving a
+    /// device, adding or removing a passkey, no longer asking for the PIN.
+    /// This session then counts as signed in now, for 10 minutes; ask
+    /// again. Only this session: the user's others are as they were.
+    ///
+    /// Checked as [`Client::sign_in`](crate::Client::sign_in) checks it: a
+    /// wrong one is a failed sign-in as this user from this device
+    /// ([`SdkError::InvalidCredentials`], then [`SdkError::RateLimited`]).
+    /// A user with no password gets [`SdkError::NoPassword`]: offer
+    /// [`Session::begin_confirm_passkey`]. A locked profile gets
+    /// [`SdkError::ProfileLocked`]. The PIN does not confirm it is them.
+    pub async fn confirm_password(&self, password: &str) -> Result<(), SdkError> {
+        let request = Request::ConfirmPassword(ConfirmPassword {
+            password: password.to_owned(),
+        });
+        self.confirmed(request).await
+    }
+
+    /// Begin confirming it is this user with one of their app passkeys,
+    /// as for [`Session::confirm_password`]: what the platform's passkey
+    /// API signs, for [`crate::APP_RP_ID`], listing only this user's app
+    /// passkeys. The challenge is this session's on this device, for 5
+    /// minutes; beginning again replaces it. A user with no app passkey
+    /// gets [`SdkError::NotFound`].
+    pub async fn begin_confirm_passkey(&self) -> Result<PasskeyRequest, SdkError> {
+        match self.call(Request::BeginConfirmPasskey).await? {
+            Reply::PasskeyRequest(request) => Ok(request),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Finish it with what the passkey signed. Another user's passkey, a
+    /// challenge that is over or not this session's, or anything else that
+    /// does not verify is [`SdkError::InvalidCredentials`], counted as a
+    /// failed passkey sign-in (then [`SdkError::RateLimited`]).
+    pub async fn finish_confirm_passkey(
+        &self,
+        signed: FinishPasskeySignIn,
+    ) -> Result<(), SdkError> {
+        self.confirmed(Request::FinishConfirmPasskey(signed)).await
+    }
+
     /// The device showing sign-in code `code` (P3-07; typed any way, or
     /// from a scanned [`crate::device_sign_in::parse_link`]), to ask "Sign
     /// in on 'Living room TV'?". A code that is not pending is
@@ -846,7 +891,11 @@ impl Session {
     }
 
     /// Sign the device showing `code` in as this user. It cannot be this
-    /// device ([`SdkError::InvalidInput`]).
+    /// device ([`SdkError::InvalidInput`]). Only soon after signing in: a
+    /// session older than 10 minutes gets
+    /// [`SdkError::RecentSignInRequired`] (confirm it is them with
+    /// [`Session::confirm_password`] or [`Session::begin_confirm_passkey`],
+    /// then ask).
     pub async fn approve_device_sign_in(&self, code: &str) -> Result<(), SdkError> {
         self.done(Request::ApproveDeviceSignIn {
             code: code.to_owned(),
@@ -1161,6 +1210,13 @@ impl Session {
     pub async fn unhide_from_continue(&self, id: &MediaId) -> Result<(), SdkError> {
         self.done(Request::UnhideFromContinueWatching { id: id.clone() })
             .await
+    }
+
+    async fn confirmed(&self, request: Request) -> Result<(), SdkError> {
+        match self.call(request).await? {
+            Reply::Confirmed => Ok(()),
+            other => Err(unexpected(other)),
+        }
     }
 
     async fn done(&self, request: Request) -> Result<(), SdkError> {

@@ -91,6 +91,11 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::FinishPasskeyRegistration(_)
         | Request::RenamePasskey { .. }
         | Request::RemovePasskey { .. }
+        // Confirming: a wrong password or passkey counts, a challenge is
+        // replaced or used up.
+        | Request::ConfirmPassword(_)
+        | Request::BeginConfirmPasskey
+        | Request::FinishConfirmPasskey(_)
         // Looking up a wrong code consumes a failure-limit attempt too.
         | Request::LookupDeviceSignIn { .. }
         | Request::ApproveDeviceSignIn { .. }

@@ -415,6 +415,36 @@ pub fn host_port(url: &str) -> &str {
     rest.split(['/', '?']).next().unwrap_or(rest)
 }
 
+/// Spoolframe's build as the Server page shows it (P3-18): `0.5.0 ·
+/// 9f3c2a1`, or the version alone when the build named no revision.
+pub fn server_version(version: &str, revision: Option<&str>) -> String {
+    match revision {
+        Some(rev) => format!("{version} · {rev}"),
+        None => version.to_owned(),
+    }
+}
+
+/// Plex's version to its minor, as the boards show it: `1.41.0.8992-…`
+/// is 1.41.
+pub fn plex_version(v: &str) -> String {
+    v.split('.').take(2).collect::<Vec<_>>().join(".")
+}
+
+/// The Plex card's line: "Plex Media Server 1.41 · <host:port> · N
+/// libraries", without what is not known.
+pub fn plex_line(version: Option<&str>, url: Option<&str>, libraries: usize) -> String {
+    let mut parts = vec![match version {
+        Some(v) => format!("Plex Media Server {}", plex_version(v)),
+        None => "Plex Media Server".to_owned(),
+    }];
+    parts.extend(url.map(|u| host_port(u).to_owned()));
+    parts.push(match libraries {
+        1 => "1 library".to_owned(),
+        n => format!("{n} libraries"),
+    });
+    parts.join(" · ")
+}
+
 fn minutes(n: u64) -> String {
     match n {
         0 | 1 => "a minute".into(),
@@ -463,6 +493,26 @@ pub fn client_kind(endpoint_id: Option<&str>, platform: Option<Platform>) -> &'s
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_server_s_version_names_its_revision_when_the_build_had_one() {
+        assert_eq!(server_version("0.5.0", Some("9f3c2a1")), "0.5.0 · 9f3c2a1");
+        assert_eq!(server_version("0.5.0", None), "0.5.0");
+    }
+
+    #[test]
+    fn the_plex_line_says_its_version_to_the_minor() {
+        assert_eq!(plex_version("1.41.0.8992-f1a2b3c4d"), "1.41");
+        assert_eq!(
+            plex_line(
+                Some("1.41.3.9314-a0bfb8370"),
+                Some("http://192.168.1.10:32400/"),
+                4
+            ),
+            "Plex Media Server 1.41 · 192.168.1.10:32400 · 4 libraries"
+        );
+        assert_eq!(plex_line(None, None, 1), "Plex Media Server · 1 library");
+    }
     use spoolframe_admin_api::{PathFailures, PathReport};
 
     fn passkey(name: &str, rp_id: &str, app: bool) -> PasskeyEntry {

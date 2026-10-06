@@ -1277,6 +1277,65 @@ async fn the_app_manages_its_user_s_passkeys() {
     server.stop().await;
 }
 
+/// An app signed in long ago confirms it is its user (P3-07), with the
+/// password or an app passkey, and may then approve a TV; a wrong
+/// password confirms nothing.
+#[tokio::test]
+async fn an_old_session_confirms_it_is_its_user_before_approving_a_tv() {
+    let (server, phone, _) = ready("sdk-confirm").await;
+    let alice = alice(&server, &phone).await;
+    let creation = alice.begin_passkey_registration().await.unwrap();
+    let mut app = crate::app_passkeys::App::new();
+    alice
+        .finish_passkey_registration(app.create(&creation, "Alice's iPhone"))
+        .await
+        .unwrap();
+    let tv_storage = Arc::new(MemoryStorage::default());
+    let tv = client_on(&server, &tv_storage).await;
+    let aged = || {
+        crate::app_passkeys::sql(
+            &server,
+            "UPDATE sessions SET authenticated_at = authenticated_at - 3600 WHERE user_id = \
+             (SELECT id FROM users WHERE username = ?1)",
+            "alice",
+        )
+    };
+
+    aged().await;
+    let sign_in = tv.begin_device_sign_in(&id(&server)).await.unwrap();
+    assert_eq!(
+        alice.approve_device_sign_in(&sign_in.code).await,
+        Err(SdkError::RecentSignInRequired)
+    );
+    assert_eq!(
+        alice.confirm_password("battery staple").await,
+        Err(SdkError::InvalidCredentials)
+    );
+    alice.confirm_password("correct horse").await.unwrap();
+    alice.approve_device_sign_in(&sign_in.code).await.unwrap();
+
+    aged().await;
+    let sign_in = tv.begin_device_sign_in(&id(&server)).await.unwrap();
+    assert_eq!(
+        alice.approve_device_sign_in(&sign_in.code).await,
+        Err(SdkError::RecentSignInRequired)
+    );
+    let request = alice.begin_confirm_passkey().await.unwrap();
+    alice
+        .finish_confirm_passkey(app.get(&request))
+        .await
+        .unwrap();
+    alice.approve_device_sign_in(&sign_in.code).await.unwrap();
+    // A challenge is used once.
+    assert_eq!(
+        alice.finish_confirm_passkey(app.get(&request)).await,
+        Err(SdkError::InvalidCredentials)
+    );
+    tv.close().await;
+    phone.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn unchanged_sdk_calls_reassemble_large_replies_and_serialize_controls() {
     let (server, client, _) = ready("sdk-wire-revision").await;

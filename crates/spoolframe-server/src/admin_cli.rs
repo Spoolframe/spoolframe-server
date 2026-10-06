@@ -358,7 +358,10 @@ pub async fn status(listen: SocketAddr) -> Result<()> {
         }
     };
     println!("name: {}", status.name);
-    println!("version: {}", status.version);
+    match &status.revision {
+        Some(revision) => println!("version: {} ({revision})", status.version),
+        None => println!("version: {}", status.version),
+    }
     println!(
         "endpoint: {}",
         status.endpoint_id.as_deref().unwrap_or("starting")

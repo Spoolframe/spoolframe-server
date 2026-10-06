@@ -4,13 +4,15 @@
 //! too.
 
 use dioxus::prelude::*;
-use spoolframe_admin_api::{AdminApiClient, NewUser, PathReport, Role, SsoLink, UserInfo};
+use spoolframe_admin_api::{
+    AdminApiClient, NewUser, PathCheckRun, PathReport, Role, SsoLink, UserInfo,
+};
 
 use super::{Alert, Field, Route, icons, initial, now, role_name, rpc};
 use crate::logic::{
     AddUserError, ApiError, Landing, PathState, UserStatus, add_user_error, ago, avatar_class,
-    client_kind, count, host_port, last_admin, path_state, sign_in_methods, thousands,
-    user_change_error, user_status,
+    client_kind, count, last_admin, path_state, plex_line, server_version, sign_in_methods,
+    thousands, user_change_error, user_status,
 };
 
 #[component]
@@ -1017,7 +1019,7 @@ fn ThisServer() -> Element {
                     Some(Err(e)) => rsx! { Alert { text: e.explain() } },
                     Some(Ok(s)) => rsx! {
                         Pair { label: "Name", b { "{s.name}" } }
-                        Pair { label: "Version", span { class: "mono-value", "{s.version}" } }
+                        Pair { label: "Version", span { class: "mono-value", {server_version(&s.version, s.revision.as_deref())} } }
                         Pair { label: "Fingerprint",
                             match s.fingerprint {
                                 Some(fingerprint) => rsx! {
@@ -1108,7 +1110,7 @@ fn Plex() -> Element {
                             span { class: "row-what",
                                 b { {p.server_name.clone().unwrap_or_else(|| "Plex Media Server".into())} }
                                 span { class: "row-sub",
-                                    {plex_line(p.url.as_deref(), p.libraries.len())}
+                                    {plex_line(p.version.as_deref(), p.url.as_deref(), p.libraries.len())}
                                 }
                             }
                             span { class: "row-do", span { class: "state state-ok", "Reachable" } }
@@ -1118,17 +1120,6 @@ fn Plex() -> Element {
             }
         }
     }
-}
-
-/// "Plex Media Server · <host:port> · N libraries".
-fn plex_line(url: Option<&str>, libraries: usize) -> String {
-    let mut parts = vec!["Plex Media Server".to_owned()];
-    parts.extend(url.map(|u| host_port(u).to_owned()));
-    parts.push(match libraries {
-        1 => "1 library".to_owned(),
-        n => format!("{n} libraries"),
-    });
-    parts.join(" · ")
 }
 
 #[component]
@@ -1151,11 +1142,32 @@ pub(super) fn CopyButton(text: String) -> Element {
 
 /// Whether every file Plex lists can be read here (WebServer, and
 /// WebServerStates 2 and 3). The check reports nothing until it is done,
-/// so "checking" is a spinner, not a count.
+/// so "checking" is a spinner, not a count. The server keeps the last one,
+/// shown with how long ago it ran (P3-18).
 #[component]
 fn PathCheck() -> Element {
-    let mut result = use_signal(|| None::<Result<Vec<PathReport>, ApiError>>);
+    let mut result = use_signal(|| None::<Result<PathCheckRun, ApiError>>);
     let mut busy = use_signal(|| false);
+    // "checked N minutes ago" moves on while the page is open.
+    let mut clock = use_signal(now);
+    use_hook(move || {
+        spawn(async move {
+            let last = async {
+                let client = rpc::client().await?;
+                client.plex_last_path_check().await.map_err(rpc::error)
+            };
+            // None before the first check; an error is shown by the run.
+            if let Ok(Some(run)) = last.await
+                && result.peek().is_none()
+            {
+                result.set(Some(Ok(run)));
+            }
+            loop {
+                sleep(30_000).await;
+                clock.set(now());
+            }
+        });
+    });
     let run = move |_| {
         busy.set(true);
         spawn(async move {
@@ -1187,9 +1199,15 @@ fn PathCheck() -> Element {
                 match result() {
                     None => rsx! {},
                     Some(Err(e)) => rsx! { Alert { text: e.explain() } },
-                    Some(Ok(reports)) => rsx! {
-                        for r in reports {
-                            PathRow { key: "{r.library}", report: r }
+                    Some(Ok(run)) => rsx! {
+                        for (i, r) in run.reports.into_iter().enumerate() {
+                            // Said once, on the first row, as the board does:
+                            // every row is of the same check.
+                            PathRow {
+                                key: "{r.library}",
+                                report: r,
+                                checked: (i == 0).then(|| format!("checked {}", ago(clock(), run.at))),
+                            }
                         }
                     },
                 }
@@ -1206,23 +1224,24 @@ fn PathCheck() -> Element {
 }
 
 #[component]
-fn PathRow(report: PathReport) -> Element {
+fn PathRow(report: PathReport, checked: Option<String>) -> Element {
+    let when = checked.map(|c| format!(" · {c}")).unwrap_or_default();
     rsx! {
         div { class: "row",
             span { class: "row-what",
                 b { "{report.library}" }
                 match path_state(&report) {
                     PathState::Ok { files } => rsx! {
-                        span { class: "row-sub", "{thousands(files)} files" }
+                        span { class: "row-sub", "{thousands(files)} files{when}" }
                     },
                     PathState::Missing { local_path, .. } => rsx! {
-                        span { class: "row-sub", "e.g. " span { class: "mono-value", "{local_path}" } }
+                        span { class: "row-sub", "e.g. " span { class: "mono-value", "{local_path}" } "{when}" }
                     },
                     PathState::NoMapping { plex_path } => rsx! {
                         span { class: "row-sub",
                             "Plex path "
                             span { class: "mono-value", "{plex_path}" }
-                            " has no mapping."
+                            " has no mapping.{when}"
                         }
                     },
                 }

@@ -47,6 +47,8 @@
         # mismatch (scribe's FD-451 found the floating one moving under it).
         spoolframe = pkgs.callPackage ./nix/package.nix {
           inherit lib craneLib;
+          # A dirty tree says so; a tree without git has no revision.
+          rev = inputs.self.shortRev or inputs.self.dirtyShortRev or null;
           dioxus-cli = inputs.ports.packages.${system}.dioxus-cli_0_7_10;
           wasm-bindgen-cli = inputs.ports.packages.${system}.wasm-bindgen-cli_0_2_126;
         };

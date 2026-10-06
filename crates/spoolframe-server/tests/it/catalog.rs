@@ -377,7 +377,8 @@ async fn filtering_to_missing_files_lists_exactly_what_the_path_check_reports() 
         .root
         .plex_check_paths(Some("TV Shows".into()))
         .await
-        .unwrap();
+        .unwrap()
+        .reports;
     let report = &reports[0];
     assert_eq!(ok, report.ok);
     assert_eq!(missing, report.no_mapping.count + report.unreadable.count);

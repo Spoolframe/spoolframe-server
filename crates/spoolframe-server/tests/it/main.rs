@@ -11,6 +11,7 @@ mod app_passkeys;
 mod artwork;
 mod catalog;
 mod cli;
+mod confirm;
 mod device_sign_in;
 mod encode;
 mod endpoint;

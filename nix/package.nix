@@ -21,6 +21,9 @@
   google-fonts,
   # rustc links wasm32 with `lld`, which nixpkgs' rustc does not carry.
   lld,
+  # The source revision the admin pages show beside the version (P3-18):
+  # the flake's short revision, or null where there is none.
+  rev ? null,
 }: let
   # English by default; the NixOS module points the server at a tesseract
   # with the languages the host asks for.
@@ -50,6 +53,9 @@ in
   craneLib.buildPackage (commonArgs
     // {
       inherit cargoArtifacts;
+      # Read by the server at compile time (`option_env!`). Only here, not
+      # in commonArgs, so a new revision does not rebuild the dependencies.
+      SPOOLFRAME_GIT_REV = lib.optionalString (rev != null) rev;
 
       # The web UI first, then the server carrying it: Tailwind, `dx bundle`
       # (from the workspace root, where dx resolves members), then the server

@@ -1759,3 +1759,55 @@
   checks it (at most 64 characters, one line) before the account is
   made, and given through `setDisplayName` when the step is finished, so
   the Users list and My profile show it. The setup API is unchanged.
+- An app confirms it is its user (P3-07): a session signed in more than
+  10 minutes ago, which gets `RecentSignInRequired` for approving a
+  device, adding or removing a passkey, or no longer asking for the PIN,
+  sends `ConfirmPassword { password }` or `BeginConfirmPasskey` then
+  `FinishConfirmPasskey(FinishPasskeySignIn)`, both answered `Confirmed`,
+  and asks again; it no longer has to sign out and in. Only that session
+  is refreshed, with the store call the web UI's `me.confirmPassword` and
+  `me.confirmPasskey` use, and failures count under the same keys as a
+  login (`InvalidCredentials`, then `RateLimited`). The passkey challenge
+  lists only the user's app passkeys and is the session's on its device;
+  a user without one gets `NotFound`, without a password `NoPassword`. A
+  PIN is not a confirmation, and a locked profile gets `ProfileLocked`.
+  The SDK has `Session::confirm_password`, `begin_confirm_passkey` and
+  `finish_confirm_passkey`.
+- Web UI: the setup wizard's summary warns about missing files (P3-18,
+  P3-10), as the WebWizardDone board draws it: the Paths line names each
+  library some of whose sample files this server cannot read ("Music: 2
+  of 5 missing"), beside the Change link that opens the Paths step. The
+  summary runs the Paths step's sample check again on the saved
+  mappings, so a mapping changed since then is what it shows. No API
+  change.
+- Sign in with Plex works for every Plex server (P3-18, P3-11): Add a
+  library offers "Sign in with Plex" when no Plex account lists servers
+  (none linked in My profile, none signed in with since the server
+  started), then lists that account's servers; the one chosen is probed
+  and added with the token plex.tv has for it, as the wizard does for the
+  first, and the other servers keep theirs. Admin API:
+  `plexPinCheck(id, keepToken)` gains `keepToken` (required): the Plex
+  step passes `true` and the token is kept as `plex.token` as before;
+  with `false` the account is only remembered, for `plexAccountServers`,
+  `plexProbe` and `plexServerAdd`. A wire change for callers of
+  `plexPinCheck`.
+- Admin pages show the Plex and Spoolframe versions (P3-18, P3-02), where
+  the WebServer board places them: This server's Version is "0.5.0 ·
+  9f3c2a1" and the Plex card says "Plex Media Server 1.41 · <host:port> ·
+  N libraries", from `PlexStatus.version` (to its minor, as the wizard's
+  Plex step says it). Admin API: `ServerStatus.revision` (required,
+  `null` when unknown) is the source revision the binary was built from,
+  read at compile time from `SPOOLFRAME_GIT_REV`; the nix package sets it
+  to the flake's short revision (`-dirty` for a dirty tree), and a plain
+  `cargo build` or a flake without git leaves it `null`, so only the
+  version shows. The CLI's `status` prints `version: 0.5.0 (9f3c2a1)`.
+- Server › Media paths says when the files were last checked (P3-18,
+  P3-02): "1,204 files · checked 2 minutes ago" on the first row, as the
+  WebServer board has it, moving on while the page is open. The server
+  keeps the last check of every library with when it finished, so the
+  page shows it again when opened, until the server restarts or its Plex
+  servers, libraries or path mappings change. Admin API: `plexCheckPaths`
+  answers a `PathCheckRun { at, reports }` (Unix seconds) in place of
+  the bare list, a wire change; `plexLastPathCheck` gives the kept one,
+  or `null`. A check of one library is answered the same way but not
+  kept.

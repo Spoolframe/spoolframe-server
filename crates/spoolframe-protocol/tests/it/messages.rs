@@ -12,8 +12,8 @@ use spoolframe_protocol::{
     SubtitleAction, TrackReason,
 };
 use spoolframe_protocol::{
-    AuthMethod, Error, Event, Hello, LoginPassword, PROTOCOL_VERSION, PinProof, Reply, Request,
-    RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
+    AuthMethod, ConfirmPassword, Error, Event, Hello, LoginPassword, PROTOCOL_VERSION, PinProof,
+    Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
 };
 use spoolframe_protocol::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
@@ -153,6 +153,11 @@ fn every_request_round_trips() {
             name: "Alice's iPad".into(),
         },
         Request::RemovePasskey { id: "AQID".into() },
+        Request::ConfirmPassword(ConfirmPassword {
+            password: "hunter2".into(),
+        }),
+        Request::BeginConfirmPasskey,
+        Request::FinishConfirmPasskey(signed()),
         Request::ApproveDeviceSignIn {
             code: "BCDFGHJK".into(),
         },
@@ -443,6 +448,7 @@ fn every_reply_round_trips() {
         },
         Reply::LoggedOut,
         Reply::Done,
+        Reply::Confirmed,
         Reply::PlaybackSeeked { epoch: 1 },
         Reply::PlaybackChanged {
             plan: PlaybackPlan::Unsupported {
@@ -949,6 +955,16 @@ fn only_hello_auth_methods_logins_and_ping_are_pre_auth() {
     assert!(!Request::FinishPasskeyRegistration(made()).is_pre_auth());
     assert!(!Request::ListPasskeys.is_pre_auth());
     assert!(!Request::RemovePasskey { id: "AQID".into() }.is_pre_auth());
+    // Confirming is the session user's: there is no one to confirm without
+    // one.
+    assert!(
+        !Request::ConfirmPassword(ConfirmPassword {
+            password: "hunter2".into()
+        })
+        .is_pre_auth()
+    );
+    assert!(!Request::BeginConfirmPasskey.is_pre_auth());
+    assert!(!Request::FinishConfirmPasskey(signed()).is_pre_auth());
     assert!(
         Request::AwaitDeviceSignIn {
             request: "r".into()
@@ -986,6 +1002,61 @@ fn credentials_stay_out_of_debug_output() {
         proof: Some(PinProof::Pin { pin: "1357".into() }),
     };
     assert!(!format!("{change:?}").contains("1357"));
+    let confirm = Request::ConfirmPassword(ConfirmPassword {
+        password: "hunter2".into(),
+    });
+    assert!(!format!("{confirm:?}").contains("hunter2"));
+}
+
+/// What the Apple and Linux apps encode by hand must not drift: the tags
+/// and the password's field name.
+#[test]
+fn confirm_requests_have_their_wire_names() {
+    let encoded = |request: Request| {
+        codec::encode(&RequestEnvelope {
+            session: None,
+            request,
+        })
+        .unwrap()
+    };
+    let password = encoded(Request::ConfirmPassword(ConfirmPassword {
+        password: "hunter2".into(),
+    }));
+    assert_eq!(
+        codec::request_type(&password).as_deref(),
+        Some("confirm_password")
+    );
+    let value: ciborium::Value = ciborium::from_reader(password.as_slice()).unwrap();
+    let request = value
+        .as_map()
+        .and_then(|m| m.iter().find(|(k, _)| k.as_text() == Some("request")))
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let field = request
+        .as_map()
+        .and_then(|m| m.iter().find(|(k, _)| k.as_text() == Some("password")))
+        .and_then(|(_, v)| v.as_text().map(str::to_owned));
+    assert_eq!(field.as_deref(), Some("hunter2"));
+    assert_eq!(
+        codec::request_type(&encoded(Request::BeginConfirmPasskey)).as_deref(),
+        Some("begin_confirm_passkey")
+    );
+    assert_eq!(
+        codec::request_type(&encoded(Request::FinishConfirmPasskey(signed()))).as_deref(),
+        Some("finish_confirm_passkey")
+    );
+}
+
+/// Confirming may count a failure or use up a challenge: a transport retry
+/// must not send it again on its own.
+#[test]
+fn confirm_requests_are_not_retried() {
+    use spoolframe_protocol::policy::retry_safe;
+    assert!(!retry_safe(&Request::ConfirmPassword(ConfirmPassword {
+        password: "hunter2".into(),
+    })));
+    assert!(!retry_safe(&Request::BeginConfirmPasskey));
+    assert!(!retry_safe(&Request::FinishConfirmPasskey(signed())));
 }
 
 #[tokio::test]

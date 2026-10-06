@@ -332,6 +332,20 @@ pub fn sample(check: &LibraryPathCheck) -> Sample {
     }
 }
 
+/// The setup summary's warnings (P3-18): "Music: 2 of 5 missing" for each
+/// library whose sample has files this server cannot read.
+pub fn missing_files(checks: &[LibraryPathCheck]) -> Vec<String> {
+    checks
+        .iter()
+        .filter_map(|c| match sample(c) {
+            Sample::Missing { missing, of } => {
+                Some(format!("{}: {missing} of {of} missing", c.library))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The longest display name the server takes (`setDisplayName`).
 const MAX_DISPLAY_NAME: usize = 64;
 
@@ -517,6 +531,21 @@ mod tests {
             Sample::Missing { missing: 2, of: 5 }
         );
         assert_eq!(sample(&check("M", "/m", 0, 0)), Sample::Empty);
+    }
+
+    #[test]
+    fn the_summary_names_each_library_with_files_the_server_cannot_read() {
+        let checks = [
+            check("Movies", "/m", 5, 5),
+            check("Music", "/music", 3, 5),
+            check("Empty", "/e", 0, 0),
+            check("Kids", "/k", 0, 5),
+        ];
+        assert_eq!(
+            missing_files(&checks),
+            ["Music: 2 of 5 missing", "Kids: 5 of 5 missing"]
+        );
+        assert!(missing_files(&checks[..1]).is_empty());
     }
 
     #[test]

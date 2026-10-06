@@ -11,6 +11,7 @@ use spoolframe_admin_api::{
 };
 
 use super::admin::{Said, Toast, say, sleep};
+use super::wizard::{Account, AccountPanel, sign_in_with_plex};
 use super::{Alert, Field, Route, icons, rpc};
 use crate::libraries::{
     DropLine, FILES_HERE, PathCell, REMOTE_NOTE, add_label, added_text, down, down_text, drop_line,
@@ -834,12 +835,21 @@ pub fn AddLibrary(back: String) -> Element {
         let client = rpc::client().await?;
         client.plex_discover().await.map_err(rpc::error)
     });
-    // The servers the admin's linked Plex account reaches; none without a
-    // link (P3-12).
-    let from_account = use_resource(|| async {
+    // The servers the admin's linked Plex account reaches (P3-12), or the
+    // account signed in with here or in the wizard (P3-18); none without
+    // either. Asked again after each sign-in.
+    let mut signed_in = use_signal(|| 0u32);
+    let from_account = use_resource(move || async move {
+        let _ = signed_in();
         let client = rpc::client().await?;
         client.plex_account_servers().await.map_err(rpc::error)
     });
+    // Signing in with Plex here, for its servers' own tokens: the first
+    // server's token stays as it is.
+    let account = use_signal(|| Account::Idle);
+    let sign_in = move |_| {
+        sign_in_with_plex(account, false, move || signed_in += 1);
+    };
     let linked = use_resource(|| async {
         let client = rpc::client().await?;
         client.plex_link().await.map_err(rpc::error)
@@ -1111,7 +1121,7 @@ pub fn AddLibrary(back: String) -> Element {
             .collect(),
         _ => Vec::new(),
     };
-    let account_name = match &*linked.read() {
+    let linked_name = match &*linked.read() {
         Some(Ok(me)) => me
             .link
             .as_ref()
@@ -1119,6 +1129,23 @@ pub fn AddLibrary(back: String) -> Element {
             .and_then(|l| l.email.clone().or_else(|| l.username.clone())),
         _ => None,
     };
+    let signed_in_as = match account() {
+        Account::Linked(who) => who,
+        _ => None,
+    };
+    // Whose account a server from it is added with.
+    let account_name = linked_name
+        .clone()
+        .map(|who| format!("Uses your linked Plex account, {who}"))
+        .or_else(|| {
+            signed_in_as
+                .clone()
+                .map(|who| format!("Uses the Plex account signed in as {who}"))
+        });
+    // No account lists servers yet: offer to sign in with Plex (P3-18).
+    let no_account = matches!(&*from_account.read(), Some(Err(_)));
+    let signing_in = !matches!(account(), Account::Idle | Account::Linked(_));
+    let nothing_from_account = account_servers.is_empty() && from_account.read().is_some();
     let is_new = matches!(pick(), Pick::Found(_) | Pick::Account(_) | Pick::Typed);
     let server_done = server().is_some();
     let needs_token = probed()
@@ -1271,6 +1298,28 @@ pub fn AddLibrary(back: String) -> Element {
                                 }
                             }
                         }
+                        if signing_in {
+                            AccountPanel {
+                                account: account(),
+                                token_set: false,
+                                on_sign_in: move |_| sign_in(()),
+                                on_cancel: move |_| {
+                                    let mut account = account;
+                                    account.set(Account::Idle);
+                                },
+                            }
+                        } else if let Some(who) = signed_in_as.clone().filter(|_| nothing_from_account) {
+                            span { class: "text-[13px] text-ctp-subtext0",
+                                "The Plex account signed in as {who} has no other servers to add."
+                            }
+                        } else if no_account && signed_in_as.is_none() {
+                            div { class: "account-line",
+                                span { class: "flex-grow text-[13px] text-ctp-subtext0",
+                                    "Sign in with Plex to list your account's servers. Each is added with its own token; the other servers keep theirs."
+                                }
+                                button { class: "btn", r#type: "button", onclick: move |_| sign_in(()), "Sign in with Plex" }
+                            }
+                        }
                         button {
                             r#type: "button",
                             class: if pick() == Pick::Typed { "choice choice-here" } else { "choice" },
@@ -1352,10 +1401,10 @@ pub fn AddLibrary(back: String) -> Element {
                                         "Check token"
                                     }
                                 }
-                            } else if let (Pick::Account(_), Some(who)) = (pick(), account_name.clone()) {
+                            } else if let (Pick::Account(_), Some(line)) = (pick(), account_name.clone()) {
                                 div { class: "account-line",
                                     span { class: "text-ctp-green", icons::CircleCheck {} }
-                                    span { class: "flex-grow", "Uses your linked Plex account, " b { "{who}" } }
+                                    span { class: "flex-grow", "{line}" }
                                     button { class: "link-button", r#type: "button", onclick: move |_| pasting.set(true), "Paste a token" }
                                 }
                             } else if let Some(first) = first_token.clone() {

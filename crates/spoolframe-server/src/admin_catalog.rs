@@ -21,7 +21,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use spoolframe_admin_api::{
     ArtworkInfo, CatalogCrumb, CatalogFilter, CatalogItem, CatalogKind, CatalogLibrary,
     CatalogPage, CatalogQuery, CatalogRow, FileState, KindCount, MediaPart, MediaVersion,
-    PathMappingEntry, PathsChecked, error_code,
+    PathCheckRun, PathMappingEntry, PathsChecked, error_code,
 };
 use spoolframe_catalog::{
     Browse, Catalog, CatalogError, FileCheck, Inspect, LibraryCheck, Page, Row, RowFilter,
@@ -55,9 +55,27 @@ struct Entry {
 #[derive(Debug, Default)]
 pub struct PathChecks {
     entries: Mutex<HashMap<String, Entry>>,
+    /// Server › Media paths' last check of every library (P3-18), and the
+    /// catalog it ran on.
+    last_run: Mutex<Option<(Weak<Composite>, PathCheckRun)>>,
 }
 
 impl PathChecks {
+    /// Keep `run`, a check of every library on `on`, as the last one.
+    pub fn keep_run(&self, on: &Arc<Composite>, run: PathCheckRun) {
+        *self.last_run.lock().expect("never held across a panic") = Some((Arc::downgrade(on), run));
+    }
+
+    /// The last check of every library, while `on` is the catalog it ran
+    /// on: one of a catalog since replaced says what the old mappings
+    /// found.
+    pub fn last_run(&self, on: &Arc<Composite>) -> Option<PathCheckRun> {
+        let last = self.last_run.lock().expect("never held across a panic");
+        let (ran_on, run) = last.as_ref()?;
+        let same = ran_on.upgrade().is_some_and(|c| Arc::ptr_eq(&c, on));
+        same.then(|| run.clone())
+    }
+
     fn current(&self, on: &Arc<Composite>, library: &str) -> Option<State> {
         let entries = self.entries.lock().expect("never held across a panic");
         let entry = entries.get(library)?;

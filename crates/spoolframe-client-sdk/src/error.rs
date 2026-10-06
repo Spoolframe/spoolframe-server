@@ -122,8 +122,10 @@ pub enum SdkError {
     /// would be; signing in works.
     #[error("this server is not set up yet")]
     NotSetUp,
-    /// The session signed in too long ago to add or remove a passkey
-    /// (P3-19): sign in again ([`crate::Client::sign_in`], or a passkey),
+    /// The session signed in too long ago for this: approving a device
+    /// (P3-07), adding or removing a passkey (P3-19), no longer asking for
+    /// the PIN. Confirm it is the user ([`crate::Session::confirm_password`]
+    /// or [`crate::Session::begin_confirm_passkey`]), or sign in again,
     /// then ask again.
     #[error("sign in again first")]
     RecentSignInRequired,

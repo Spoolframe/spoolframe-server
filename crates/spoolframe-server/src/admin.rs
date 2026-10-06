@@ -22,11 +22,11 @@ use spoolframe_admin_api::{
 use spoolframe_admin_api::{
     AdminApiServer, Credentials, DeviceEntry, DeviceSignIn, DiscoveredPlex, LibrariesOverview,
     LibraryPathCheck, LoggedIn, MeApiServer, NewUser, PasskeyChallenge, PasskeyEntry, PasskeyHost,
-    PasskeySetupBegin, PasskeySetupFinish, PasswordChange, PathFailures, PathMappingEntry,
-    PathReport, PlexAccountServer, PlexLinkState, PlexPin, PlexPinState, PlexServerEntry,
-    PlexStatus, PlexSyncOverview, PlexSyncReport, PlexUser, Role, ServerStatus, SessionEntry,
-    SettingEntry, Settings, SetupRequest, SetupState, SyncDirection, TranscodingStatus, UserInfo,
-    error_code,
+    PasskeySetupBegin, PasskeySetupFinish, PasswordChange, PathCheckRun, PathFailures,
+    PathMappingEntry, PathReport, PlexAccountServer, PlexLinkState, PlexPin, PlexPinState,
+    PlexServerEntry, PlexStatus, PlexSyncOverview, PlexSyncReport, PlexUser, Role, ServerStatus,
+    SessionEntry, SettingEntry, Settings, SetupRequest, SetupState, SyncDirection,
+    TranscodingStatus, UserInfo, error_code,
 };
 use spoolframe_admin_api::{
     ArtworkInfo, CatalogItem, CatalogLibrary, CatalogPage, CatalogQuery, CatalogRow, PathsChecked,
@@ -247,6 +247,7 @@ impl StatusSource {
         ServerStatus {
             name: self.name.get(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            revision: revision(BUILD_REVISION),
             endpoint_id: self.endpoint_id.get().cloned(),
             fingerprint: self
                 .endpoint_id
@@ -2146,7 +2147,7 @@ impl AdminApiServer for AdminApi {
         &self,
         ext: &Extensions,
         library: Option<String>,
-    ) -> RpcResult<Vec<PathReport>> {
+    ) -> RpcResult<PathCheckRun> {
         self.admin(ext).await?;
         let composite = self.plex.composite();
         let reports = self
@@ -2179,15 +2180,33 @@ impl AdminApiServer for AdminApi {
                 self.checks.record(composite, &library.to_string(), check);
             }
         }
-        Ok(reports
-            .into_iter()
-            .map(|r| PathReport {
-                library: r.library,
-                ok: r.ok,
-                no_mapping: failures(r.no_mapping),
-                unreadable: failures(r.unreadable),
-            })
-            .collect())
+        let run = PathCheckRun {
+            at: crate::store::now(),
+            reports: reports
+                .into_iter()
+                .map(|r| PathReport {
+                    library: r.library,
+                    ok: r.ok,
+                    no_mapping: failures(r.no_mapping),
+                    unreadable: failures(r.unreadable),
+                })
+                .collect(),
+        };
+        // Only a check of every library stands for the page's.
+        if library.is_none()
+            && let Some(composite) = &composite
+        {
+            self.checks.keep_run(composite, run.clone());
+        }
+        Ok(run)
+    }
+
+    async fn plex_last_path_check(&self, ext: &Extensions) -> RpcResult<Option<PathCheckRun>> {
+        self.admin(ext).await?;
+        Ok(self
+            .plex
+            .composite()
+            .and_then(|composite| self.checks.last_run(&composite)))
     }
 
     async fn server_status(&self, ext: &Extensions) -> RpcResult<ServerStatus> {
@@ -2451,7 +2470,12 @@ impl AdminApiServer for AdminApi {
         })
     }
 
-    async fn plex_pin_check(&self, ext: &Extensions, id: u64) -> RpcResult<PlexPinState> {
+    async fn plex_pin_check(
+        &self,
+        ext: &Extensions,
+        id: u64,
+        keep_token: bool,
+    ) -> RpcResult<PlexPinState> {
         let (settings, by) = self.settings_as_admin(ext).await?;
         if !self
             .pins
@@ -2484,18 +2508,30 @@ impl AdminApiServer for AdminApi {
             .lock()
             .expect("never held across a panic")
             .remove(&id);
-        settings.set(PLEX_TOKEN, &serde_json::Value::String(token.clone()), &by)?;
+        // Signing in to add another server leaves the first one's token
+        // alone: each server added takes its own from the account.
+        if keep_token {
+            settings.set(PLEX_TOKEN, &serde_json::Value::String(token.clone()), &by)?;
+        }
         *self.signed_in.lock().expect("never held across a panic") = Some(token.clone());
         // Only for the page to say who; the token is kept either way.
         let account = plex_tv.account(&token).await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "cannot ask plex.tv whose token it is");
             None
         });
-        tracing::info!(
-            by,
-            account,
-            "signed in with Plex: the token is kept as plex.token"
-        );
+        if keep_token {
+            tracing::info!(
+                by,
+                account,
+                "signed in with Plex: the token is kept as plex.token"
+            );
+        } else {
+            tracing::info!(
+                by,
+                account,
+                "signed in with Plex: its servers can be added with their own tokens"
+            );
+        }
         Ok(PlexPinState::Linked { account })
     }
 
@@ -2872,6 +2908,17 @@ fn debug_error(e: crate::playback_debug::DebugError) -> ErrorObjectOwned {
     }
 }
 
+/// The source revision this binary was built from, when the build named
+/// one (P3-18): the nix package sets `SPOOLFRAME_GIT_REV` to the flake's
+/// short revision; a plain `cargo build` leaves it out.
+const BUILD_REVISION: Option<&str> = option_env!("SPOOLFRAME_GIT_REV");
+
+fn revision(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_owned)
+}
+
 /// How many files of each library the wizard's path check, and the
 /// libraries overview, read: as many as the check at startup.
 pub const PATH_SAMPLE: u32 = 5;
@@ -3004,6 +3051,18 @@ impl AdminApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_build_s_revision_is_what_the_build_named_or_none() {
+        assert_eq!(revision(Some("9f3c2a1")).as_deref(), Some("9f3c2a1"));
+        assert_eq!(
+            revision(Some(" 9f3c2a1-dirty\n")).as_deref(),
+            Some("9f3c2a1-dirty")
+        );
+        // nix sets the variable empty when the tree has no revision.
+        assert_eq!(revision(Some("")), None);
+        assert_eq!(revision(None), None);
+    }
 
     #[test]
     fn a_code_reads_in_groups_and_matches_however_it_is_typed() {

@@ -110,7 +110,7 @@ async fn a_wizard_stopped_after_the_plex_step_resumes_there_after_a_restart() {
     assert_eq!(state.done, ["admin", "server", "plex"]);
     assert!(!state.finished);
     assert_eq!(
-        root.plex_check_paths(None).await.unwrap()[0].library,
+        root.plex_check_paths(None).await.unwrap().reports[0].library,
         "Movies"
     );
     let done = root.setup_finish().await.unwrap();
@@ -209,11 +209,11 @@ async fn signing_in_with_plex_keeps_the_token_and_never_hands_it_out() {
     );
     assert_eq!(pin.expires_in, Some(900));
     assert_eq!(
-        root.plex_pin_check(pin.id).await.unwrap(),
+        root.plex_pin_check(pin.id, true).await.unwrap(),
         PlexPinState::Waiting
     );
     assert_eq!(
-        root.plex_pin_check(pin.id).await.unwrap(),
+        root.plex_pin_check(pin.id, true).await.unwrap(),
         PlexPinState::Linked {
             account: Some("andrey".into())
         }
@@ -229,7 +229,7 @@ async fn signing_in_with_plex_keeps_the_token_and_never_hands_it_out() {
     assert!(!settings.contains("tok-123"), "{settings}");
     // Only PINs this server began.
     assert_eq!(
-        code(root.plex_pin_check(78).await.unwrap_err()),
+        code(root.plex_pin_check(78, true).await.unwrap_err()),
         error_code::INVALID_INPUT
     );
 }
@@ -424,9 +424,9 @@ async fn after_signing_in_with_plex_the_wizard_offers_the_account_s_servers_with
     );
 
     let pin = root.plex_pin_begin().await.unwrap();
-    root.plex_pin_check(pin.id).await.unwrap();
+    root.plex_pin_check(pin.id, true).await.unwrap();
     assert!(matches!(
-        root.plex_pin_check(pin.id).await.unwrap(),
+        root.plex_pin_check(pin.id, true).await.unwrap(),
         PlexPinState::Linked { .. }
     ));
     let servers = root.plex_account_servers().await.unwrap();
@@ -459,4 +459,75 @@ async fn after_signing_in_with_plex_the_wizard_offers_the_account_s_servers_with
         ),
         error_code::INVALID_INPUT
     );
+}
+
+#[tokio::test]
+async fn signing_in_with_plex_to_add_another_server_takes_its_own_token_and_keeps_the_first_s() {
+    let tv = plex_tv().await;
+    let tower = pms_wanting("Tower", "tok-first").await;
+    // Cabin is a server shared with the account: only its own token from
+    // plex.tv opens it, not the account's and not Tower's.
+    let cabin = pms_wanting("Cabin", "tok-cabin").await;
+    let port = cabin.address().port();
+    Mock::given(method("GET"))
+        .and(path("/api/v2/resources"))
+        .and(header("X-Plex-Token", "tok-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "name": "Cabin", "provides": "server", "clientIdentifier": "cabin-machine",
+              "owned": false, "accessToken": "tok-cabin",
+              "connections": [
+                { "uri": format!("https://127-0-0-1.cabin.plex.direct:{port}"),
+                  "address": "127.0.0.1", "port": port, "local": true, "relay": false },
+              ] },
+        ])))
+        .mount(&tv)
+        .await;
+    let wizard = Wizard {
+        plex_tv: tv.uri().parse().unwrap(),
+        plex_app: "https://app.example".parse().unwrap(),
+        ..Wizard::default()
+    };
+    let (addr, dir) = served_with(
+        "plex-pin-another",
+        &format!(r#"plex {{ url = "{}"; }}"#, tower.uri()),
+        wizard,
+    )
+    .await;
+    let root = root(addr).await;
+    root.setting_set("plex.token".into(), json!("tok-first"))
+        .await
+        .unwrap();
+
+    let pin = root.plex_pin_begin().await.unwrap();
+    root.plex_pin_check(pin.id, false).await.unwrap();
+    assert_eq!(
+        root.plex_pin_check(pin.id, false).await.unwrap(),
+        PlexPinState::Linked {
+            account: Some("andrey".into())
+        }
+    );
+    // The first server keeps its token.
+    let first = std::fs::read_to_string(dir.as_ref().join("secrets/plex-token")).unwrap();
+    assert_eq!(first, "tok-first");
+    assert!(root.plex_status().await.unwrap().reachable);
+
+    // The account's servers are offered, and the one chosen is probed and
+    // added with the token plex.tv has for it.
+    let servers = root.plex_account_servers().await.unwrap();
+    assert_eq!(servers.len(), 1, "{servers:?}");
+    assert_eq!(servers[0].name, "Cabin");
+    let lan = format!("http://127.0.0.1:{port}");
+    let probed = root.plex_probe(lan.clone(), None).await.unwrap();
+    assert!(probed.reachable, "{probed:?}");
+    let added = root.plex_server_add(lan, None).await.unwrap();
+    assert_eq!(added.name, "Cabin");
+    assert!(added.status.reachable, "{:?}", added.status);
+    let kept = std::fs::read_to_string(
+        dir.as_ref()
+            .join(format!("secrets/plex-token-{}", added.id)),
+    )
+    .unwrap();
+    assert_eq!(kept, "tok-cabin");
+    let first = std::fs::read_to_string(dir.as_ref().join("secrets/plex-token")).unwrap();
+    assert_eq!(first, "tok-first");
 }

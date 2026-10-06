@@ -394,7 +394,11 @@ pub struct DeviceSignIn {
 #[serde(rename_all = "camelCase")]
 pub struct ServerStatus {
     pub name: String,
+    /// Spoolframe's own version, the crate's.
     pub version: String,
+    /// The source revision it was built from (P3-18), when the build
+    /// named one: the nix package does, a plain `cargo build` does not.
+    pub revision: Option<String>,
     /// The key clients pin; `None` while the endpoint is starting.
     #[serde(default)]
     pub endpoint_id: Option<String>,
@@ -618,6 +622,16 @@ pub struct PathReport {
     pub no_mapping: PathFailures,
     /// Unreadable though a mapping matched: wrong mapping or missing mount.
     pub unreadable: PathFailures,
+}
+
+/// A check of every library's media paths (`plexCheckPaths`), and when
+/// it finished (P3-18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathCheckRun {
+    /// Unix seconds.
+    pub at: i64,
+    pub reports: Vec<PathReport>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2238,12 +2252,20 @@ pub trait AdminApi {
 
     /// Check every media path of every library, or of the one titled
     /// `library`, as `plex check-paths` does. Reads the whole library: it
-    /// takes a while.
+    /// takes a while. A check of every library is kept, for
+    /// `plexLastPathCheck`.
     #[method(name = "plexCheckPaths", with_extensions)]
     async fn plex_check_paths(
         &self,
         library: Option<String>,
-    ) -> jsonrpsee::core::RpcResult<Vec<PathReport>>;
+    ) -> jsonrpsee::core::RpcResult<PathCheckRun>;
+
+    /// The last `plexCheckPaths` of every library (P3-18), for Server ›
+    /// Media paths to show with when it ran. The server keeps it until it
+    /// restarts, or its Plex servers, libraries or path mappings change;
+    /// `None` before.
+    #[method(name = "plexLastPathCheck", with_extensions)]
+    async fn plex_last_path_check(&self) -> jsonrpsee::core::RpcResult<Option<PathCheckRun>>;
 
     /// The server's name, key, version and encoders.
     #[method(name = "serverStatus", with_extensions)]
@@ -2348,10 +2370,19 @@ pub trait AdminApi {
     #[method(name = "plexPinBegin", with_extensions)]
     async fn plex_pin_begin(&self) -> jsonrpsee::core::RpcResult<PlexPin>;
 
-    /// Whether PIN `id` (from `plexPinBegin`) is approved; once it is, the
-    /// server keeps the account's token as `plex.token`.
+    /// Whether PIN `id` (from `plexPinBegin`) is approved. Once it is, the
+    /// server remembers the account, for `plexAccountServers`,
+    /// `plexProbe` and `plexServerAdd` to take each of its servers' own
+    /// token from (P3-18); with `keepToken`, as the setup wizard's Plex
+    /// step asks, it also keeps the account's token as `plex.token`, the
+    /// first server's. Adding another Plex server leaves that token as it
+    /// is.
     #[method(name = "plexPinCheck", with_extensions)]
-    async fn plex_pin_check(&self, id: u64) -> jsonrpsee::core::RpcResult<PlexPinState>;
+    async fn plex_pin_check(
+        &self,
+        id: u64,
+        keep_token: bool,
+    ) -> jsonrpsee::core::RpcResult<PlexPinState>;
 
     /// A few media files of each library, checked with `mappings` instead
     /// of the saved ones, with a suggested mapping where they fail. Of

@@ -176,7 +176,7 @@ async fn a_path_mapping_set_at_run_time_is_used_at_once() {
     std::fs::create_dir_all(&media).unwrap();
     std::fs::write(media.join("a.mkv"), b"movie").unwrap();
 
-    let before = root.plex_check_paths(None).await.unwrap();
+    let before = root.plex_check_paths(None).await.unwrap().reports;
     assert_eq!((before[0].ok, before[0].no_mapping.count), (0, 1));
 
     let entry = root
@@ -189,10 +189,47 @@ async fn a_path_mapping_set_at_run_time_is_used_at_once() {
     assert_eq!(entry.apply, SettingApply::Live);
     assert!(!entry.restart_pending);
     assert_eq!(entry.layer, Some(SettingLayer::Runtime));
-    let after = root.plex_check_paths(None).await.unwrap();
+    let after = root.plex_check_paths(None).await.unwrap().reports;
     assert_eq!((after[0].ok, after[0].no_mapping.count), (1, 0));
     let saved = std::fs::read_to_string(dir.as_ref().join("runtime.ucl")).unwrap();
     assert!(saved.contains("/data/movies"), "{saved}");
+}
+
+#[tokio::test]
+async fn the_last_check_of_every_file_is_kept_with_its_time_until_the_mappings_change() {
+    let pms = pms().await;
+    let (_addr, root, dir) = served(
+        "last-path-check",
+        &format!(r#"plex {{ url = "{}"; }}"#, pms.uri()),
+    )
+    .await;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    assert_eq!(root.plex_last_path_check().await.unwrap(), None);
+
+    let started = now();
+    let run = root.plex_check_paths(None).await.unwrap();
+    assert!(
+        (started..=now()).contains(&run.at),
+        "{} not in {started}..",
+        run.at
+    );
+    assert_eq!(run.reports[0].library, "Movies");
+    assert_eq!(root.plex_last_path_check().await.unwrap(), Some(run));
+
+    // A mapping changed: the check said what the old one found.
+    let media = dir.as_ref().join("media");
+    root.setting_set(
+        "plex.path_mapping".into(),
+        json!([{ "from": "/data/movies", "to": media }]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(root.plex_last_path_check().await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -278,7 +315,7 @@ async fn plex_set_up_at_run_time_answers_at_once() {
     root.setting_set("plex.url".into(), json!(pms.uri()))
         .await
         .unwrap();
-    let reports = root.plex_check_paths(None).await.unwrap();
+    let reports = root.plex_check_paths(None).await.unwrap().reports;
     assert_eq!(reports[0].library, "Movies");
 }
 

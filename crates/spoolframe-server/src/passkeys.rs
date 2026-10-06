@@ -35,7 +35,7 @@ use webauthn_rs_proto::{
 use crate::admin_http::Origins;
 use crate::auth::{Auth, SessionToken};
 use crate::store::passkeys::{PasskeyError, PasskeyRecord, passkey_name};
-use crate::store::users::UserRecord;
+use crate::store::users::{LocalUserId, UserRecord};
 use crate::store::{Store, StoreError};
 
 /// How long a begun ceremony can be finished: the time WebAuthn gives the
@@ -93,6 +93,13 @@ impl From<StoreError> for CeremonyError {
     fn from(e: StoreError) -> Self {
         CeremonyError::Passkey(e.into())
     }
+}
+
+/// What the limit on failed logins counts a passkey of `user`'s under,
+/// besides its source: apart from their password's, so neither uses up
+/// the other's tries.
+pub(crate) fn limit_key(user: LocalUserId) -> String {
+    format!("passkey:{user}")
 }
 
 /// The host passkeys are bound to.
@@ -154,7 +161,7 @@ impl RelyingParty {
         // passkey nobody has is counted too, all under one name: there is
         // no one for those to lock out.
         let what = match &record {
-            Some(record) => format!("passkey:{}", record.user),
+            Some(record) => limit_key(record.user),
             None => "passkey:unknown".to_owned(),
         };
         let began = auth

@@ -17,9 +17,10 @@
 //! on failed sign-ins.
 //!
 //! A challenge is the device's that asked for it, for [`CEREMONY_LIFETIME`]
-//! and once: a registration's is kept under the session that began it, a
-//! sign-in's under the device's endpoint, so another device can finish
-//! neither. Each server issues its own, so an assertion made for one is
+//! and once: a registration's and a confirmation's (P3-07) are kept under
+//! the session that began them, with its endpoint, a sign-in's under the
+//! device's endpoint, so another device can finish none, and a sign-in's
+//! challenge confirms nothing. Each server issues its own, so an assertion made for one is
 //! of no use at another, and a passkey made at one is unknown elsewhere.
 
 use std::collections::HashMap;
@@ -44,7 +45,7 @@ use crate::passkeys::{
 };
 use crate::store::Store;
 use crate::store::passkeys::{PasskeyRecord, passkey_name};
-use crate::store::users::{UserRecord, normalize_username};
+use crate::store::users::{LocalUserId, UserRecord, normalize_username};
 
 /// The apps' relying party, and the ceremonies begun with it.
 pub struct AppPasskeys {
@@ -57,6 +58,15 @@ pub struct AppPasskeys {
     /// Sign-ins begun, by the endpoint that began them: one at a time
     /// each.
     sign_ins: Mutex<HashMap<String, (SignIn, Instant)>>,
+    /// Confirmations begun (P3-07), by the session (its token's hash)
+    /// that began them, with its endpoint: one at a time each. Only a
+    /// session begins one, so they are as many as the sessions at most.
+    confirms: Mutex<HashMap<String, (Confirm, Instant)>>,
+}
+
+struct Confirm {
+    endpoint: String,
+    sign_in: SignIn,
 }
 
 struct Registration {
@@ -94,6 +104,7 @@ impl AppPasskeys {
             lifetime,
             registrations: Mutex::default(),
             sign_ins: Mutex::default(),
+            confirms: Mutex::default(),
         }
     }
 
@@ -246,6 +257,83 @@ impl AppPasskeys {
                     return Err("the passkey is not one the sign-in asked for");
                 }
                 Ok(sign_in.state)
+            })
+            .await
+    }
+
+    /// Begin confirming it is `user` (P3-07), in the session whose token
+    /// hashes to `session`, on `endpoint`: a challenge for their app
+    /// passkeys, and only theirs. A confirmation the session began before
+    /// is dropped. `None` if they have no app passkey: an empty list would
+    /// let the platform offer any.
+    pub async fn begin_confirm(
+        &self,
+        store: &Store,
+        session: &str,
+        endpoint: &str,
+        user: LocalUserId,
+    ) -> Result<Option<PasskeyRequest>, SignInError> {
+        let allowed: Vec<String> = store
+            .list_passkeys(user)
+            .await?
+            .into_iter()
+            .filter(|p| p.rp_id == APP_RP_ID)
+            .map(|p| p.credential_id)
+            .collect();
+        if allowed.is_empty() {
+            return Ok(None);
+        }
+        let allow_credential_ids = allowed
+            .iter()
+            .map(|id| URL_SAFE_NO_PAD.decode(id))
+            .collect::<Result<_, _>>()
+            .map_err(|e| SignInError::Internal(format!("a stored credential id: {e}")))?;
+        let (options, state) = self
+            .party
+            .webauthn
+            .start_discoverable_authentication()
+            .map_err(|e| SignInError::Internal(e.to_string()))?;
+        let mut confirms = self.confirms.lock().expect("never held across a panic");
+        let now = Instant::now();
+        confirms.retain(|_, (_, expires_at)| *expires_at > now);
+        let confirm = Confirm {
+            endpoint: endpoint.to_owned(),
+            sign_in: SignIn { state, allowed },
+        };
+        confirms.insert(session.to_owned(), (confirm, now + self.lifetime));
+        Ok(Some(PasskeyRequest {
+            challenge: options.public_key.challenge.to_vec(),
+            allow_credential_ids,
+        }))
+    }
+
+    /// Finish the confirmation `session` began on `endpoint` with what the
+    /// passkey signed: the user it is, which the caller compares with the
+    /// session's. Only a passkey the challenge listed passes, so another
+    /// user's never does. A failure counts in `auth`'s limit on failed
+    /// logins, as a passkey sign-in's does.
+    pub async fn finish_confirm(
+        &self,
+        auth: &Auth,
+        session: &str,
+        endpoint: &str,
+        signed: &FinishPasskeySignIn,
+    ) -> Result<UserRecord, SignInError> {
+        self.party
+            .sign_in(auth, &asserted(signed), Some(endpoint), |id| {
+                let (confirm, _) = self
+                    .confirms
+                    .lock()
+                    .expect("never held across a panic")
+                    .remove(session)
+                    .filter(|(c, expires_at)| {
+                        *expires_at > Instant::now() && c.endpoint == endpoint
+                    })
+                    .ok_or("the confirmation was not begun in this session, or is over")?;
+                if !confirm.sign_in.allowed.iter().any(|a| a == id) {
+                    return Err("the passkey is not one the confirmation asked for");
+                }
+                Ok(confirm.sign_in.state)
             })
             .await
     }

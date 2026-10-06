@@ -90,6 +90,49 @@ Media and subtitle segments are capped at 16 MiB; subtitle file chunks at
 The server bounds file copies by the announced length, even if a file grows
 while it is sent.
 
+## Confirming it is you
+
+Some requests need a session that proved its user within the last 10
+minutes: `ApproveDeviceSignIn`, `BeginPasskeyRegistration`,
+`RemovePasskey`, and `SetPinRequired` with `required: false`. An older
+session gets `RecentSignInRequired`. The app then asks its user to
+confirm, and sends the request again. It does not sign out.
+
+| Request | Reply |
+|---|---|
+| `{"type": "confirm_password", "password": "…"}` | `Confirmed` |
+| `{"type": "begin_confirm_passkey"}` | `PasskeyRequest` |
+| `{"type": "finish_confirm_passkey", …FinishPasskeySignIn fields}` | `Confirmed` |
+
+Each request needs a session. Each is a mutation, so it carries an
+operation ID, and the SDK never retries it on a new connection. A
+`Confirmed` reply makes this session count as signed in now. The user's
+other sessions do not change. This is the same store change as the web
+UI's `me.confirmPassword` and `me.confirmPasskey`.
+
+The password is checked as `LoginPassword` checks it. A wrong password is
+a failed sign-in for the user's username from this endpoint. These are
+the keys that a login and the web UI's confirmation count. After five
+failures in 15 minutes the reply is `RateLimited`, also for the right
+password and for a login. A user with no password gets `NoPassword`, and
+nothing is counted.
+
+`BeginConfirmPasskey` lists only the session user's app passkeys
+(relying party `spoolframe.app`). The challenge belongs to this session on
+this endpoint, for 5 minutes, and is used once. A sign-in challenge or the
+challenge of another session does not finish it. A passkey of another user
+is `InvalidCredentials`. A failure counts as a failed passkey sign-in of
+the passkey's user from this endpoint. A user with no app passkey gets
+`NotFound`. When the user's passkey sign-ins are rate-limited, `Begin`
+gets `RateLimited` before a challenge is made.
+
+A PIN is not accepted as proof. A PIN guards switching profiles on a
+shared device, and it is weaker than a sign-in. A locked session gets
+`ProfileLocked` for all three requests, as for other sensitive requests:
+unlock with the PIN first, then confirm. A confirmation does not unlock a
+profile. The lock belongs to the connection, and the confirmation belongs
+to the session.
+
 ## SDK migration in 0.3.0
 
 `Client::activate_profile` explicitly selects a foreground profile and returns

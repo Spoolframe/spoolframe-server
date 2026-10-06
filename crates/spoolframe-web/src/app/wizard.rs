@@ -422,7 +422,7 @@ fn ServerFields(
 
 /// How the Plex account step is going.
 #[derive(Debug, Clone, PartialEq)]
-enum Account {
+pub(super) enum Account {
     /// Nothing done here yet; `set` says whether the server has a token.
     Idle,
     /// Plex's sign-in is open, plex.tv not answered yet. `opened`: whether
@@ -439,6 +439,78 @@ enum Account {
     Linked(Option<String>),
     Expired,
     Failed(String),
+}
+
+/// Sign in with Plex (plex.tv's PIN flow), from a click: Plex's page
+/// opens in a new window, and `account` follows plex.tv until the PIN is
+/// approved, expires or fails; `on_linked` runs once it is approved. With
+/// `keep_token` the server keeps the account's token as the first
+/// server's (the Plex step); without, only to add servers with (P3-18).
+pub(super) fn sign_in_with_plex(
+    mut account: Signal<Account>,
+    keep_token: bool,
+    on_linked: impl FnOnce() + 'static,
+) {
+    // Opened now, from the click: a tab opened after an answer from the
+    // server is one a browser may block.
+    let tab =
+        web_sys::window().and_then(|w| w.open_with_url_and_target("", "_blank").ok().flatten());
+    account.set(Account::Asking);
+    spawn(async move {
+        let begun = async {
+            let client = rpc::client().await?;
+            client.plex_pin_begin().await.map_err(rpc::error)
+        };
+        let pin = match begun.await {
+            Ok(pin) => pin,
+            Err(e) => {
+                if let Some(tab) = &tab {
+                    let _ = tab.close();
+                }
+                account.set(Account::Failed(e.explain()));
+                return;
+            }
+        };
+        let opened = tab
+            .as_ref()
+            .is_some_and(|t| t.location().set_href(&pin.auth_url).is_ok());
+        let id = pin.id;
+        account.set(Account::Waiting {
+            id,
+            auth_url: pin.auth_url,
+            expires_at: pin.expires_in.map(|s| now() + s as i64),
+            opened,
+        });
+        loop {
+            sleep(2000).await;
+            if !matches!(&*account.peek(), Account::Waiting { id: waiting, .. } if *waiting == id) {
+                return;
+            }
+            let checked = async {
+                let client = rpc::client().await?;
+                client
+                    .plex_pin_check(id, keep_token)
+                    .await
+                    .map_err(rpc::error)
+            };
+            match checked.await {
+                Ok(PlexPinState::Waiting) => {}
+                Ok(PlexPinState::Linked { account: who }) => {
+                    account.set(Account::Linked(who));
+                    on_linked();
+                    return;
+                }
+                Ok(PlexPinState::Expired) => {
+                    account.set(Account::Expired);
+                    return;
+                }
+                Err(e) => {
+                    account.set(Account::Failed(e.explain()));
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// Step 3: which Plex Media Server, and its token, by signing in with Plex
@@ -583,64 +655,9 @@ fn PlexFields(
     });
 
     let sign_in = move |_| {
-        // Opened now, from the click: a tab opened after an answer from
-        // the server is one a browser may block.
-        let tab =
-            web_sys::window().and_then(|w| w.open_with_url_and_target("", "_blank").ok().flatten());
-        account.set(Account::Asking);
-        spawn(async move {
-            let begun = async {
-                let client = rpc::client().await?;
-                client.plex_pin_begin().await.map_err(rpc::error)
-            };
-            let pin = match begun.await {
-                Ok(pin) => pin,
-                Err(e) => {
-                    if let Some(tab) = &tab {
-                        let _ = tab.close();
-                    }
-                    account.set(Account::Failed(e.explain()));
-                    return;
-                }
-            };
-            let opened = tab
-                .as_ref()
-                .is_some_and(|t| t.location().set_href(&pin.auth_url).is_ok());
-            let id = pin.id;
-            account.set(Account::Waiting {
-                id,
-                auth_url: pin.auth_url,
-                expires_at: pin.expires_in.map(|s| now() + s as i64),
-                opened,
-            });
-            loop {
-                sleep(2000).await;
-                if !matches!(&*account.peek(), Account::Waiting { id: waiting, .. } if *waiting == id)
-                {
-                    return;
-                }
-                let checked = async {
-                    let client = rpc::client().await?;
-                    client.plex_pin_check(id).await.map_err(rpc::error)
-                };
-                match checked.await {
-                    Ok(PlexPinState::Waiting) => {}
-                    Ok(PlexPinState::Linked { account: who }) => {
-                        account.set(Account::Linked(who));
-                        signed_in += 1;
-                        reprobe();
-                        return;
-                    }
-                    Ok(PlexPinState::Expired) => {
-                        account.set(Account::Expired);
-                        return;
-                    }
-                    Err(e) => {
-                        account.set(Account::Failed(e.explain()));
-                        return;
-                    }
-                }
-            }
+        sign_in_with_plex(account, true, move || {
+            signed_in += 1;
+            reprobe();
         });
     };
     let check_token = move |_| {
@@ -993,17 +1010,15 @@ async fn choose_libraries(chosen: Vec<String>) -> Result<(), ApiError> {
 fn reachable_line(p: &PlexStatus) -> String {
     let mut line = "Reachable".to_owned();
     if let Some(v) = &p.version {
-        line.push_str(&format!(" · Plex Media Server {}", short_version(v)));
+        line.push_str(&format!(
+            " · Plex Media Server {}",
+            crate::logic::plex_version(v)
+        ));
     }
     if let Some(name) = &p.server_name {
         line.push_str(&format!(" · “{name}”"));
     }
     line
-}
-
-/// Plex's version to its minor: `1.41.0.8992-…` is 1.41.
-fn short_version(v: &str) -> String {
-    v.split('.').take(2).collect::<Vec<_>>().join(".")
 }
 
 fn kind_name(kind: LibraryKind) -> &'static str {
@@ -1040,7 +1055,7 @@ fn ProbeState(probed: Option<Result<PlexStatus, ApiError>>) -> Element {
 
 /// The account half of the Plex step, signing in with Plex.
 #[component]
-fn AccountPanel(
+pub(super) fn AccountPanel(
     account: Account,
     token_set: bool,
     on_sign_in: EventHandler<()>,
@@ -1877,6 +1892,12 @@ pub fn DoneCard() -> Element {
         let client = rpc::client().await?;
         client.plex_status().await.map_err(rpc::error)
     });
+    // The Paths step's check again, on the saved mappings: a library with
+    // files this server cannot read is named here (P3-18).
+    let checked = use_resource(|| async {
+        let settings = load_settings().await?;
+        check_paths(saved_mappings(&settings)).await
+    });
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let finish = move |_| {
@@ -1933,6 +1954,10 @@ pub fn DoneCard() -> Element {
             n => crate::logic::count(n as u64, "mapping"),
         })
         .unwrap_or_default();
+    let missing = match &*checked.read() {
+        Some(Ok(checks)) => setup::missing_files(checks),
+        _ => Vec::new(),
+    };
     let playback_line = s
         .as_ref()
         .map(|s| {
@@ -1977,7 +2002,21 @@ pub fn DoneCard() -> Element {
             }
             {row("Server", format!("{name} · {fingerprint}"), "server")}
             {row("Plex", plex_line, "plex")}
-            {row("Paths", paths_line, "paths")}
+            div { key: "Paths",
+                span { class: "w-28 shrink-0 text-ctp-subtext0", "Paths" }
+                span { class: "min-w-0 flex-grow", "{paths_line}" }
+                if !missing.is_empty() {
+                    span { class: "state state-warn flex flex-col items-end gap-0.5 text-[13px]",
+                        for text in missing {
+                            span { key: "{text}", class: "flex items-center gap-1.5",
+                                span { class: "flex", icons::Warning { size: 15 } }
+                                "{text}"
+                            }
+                        }
+                    }
+                }
+                Link { class: "text-sm", to: Route::Wizard { step: "paths".to_owned() }, "Change" }
+            }
             {row("Playback", playback_line, "playback")}
             {row("Access", access_line, "access")}
         }
