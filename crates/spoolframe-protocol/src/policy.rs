@@ -81,6 +81,7 @@ pub fn retry_safe(request: &Request) -> bool {
         // A resume makes a session; trust changes end sessions.
         | Request::ResumeProfile { .. }
         | Request::SetDeviceTrust { .. }
+        | Request::ForgetDevice { .. }
         | Request::Logout
         // Playback: each starts, stops or restarts an encode.
         | Request::StartPlayback { .. }

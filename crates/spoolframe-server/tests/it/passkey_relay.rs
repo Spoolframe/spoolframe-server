@@ -184,7 +184,7 @@ fn device() -> spoolframe_client_sdk::Device {
 
 /// A client that knows where `id` is, at `addrs`, and has pinned it.
 async fn pinned(id: &str, addrs: Vec<std::net::SocketAddr>) -> Client {
-    let client = Client::open(Arc::new(MemoryStorage::default()), device())
+    let client = crate::support::sdk_client(Arc::new(MemoryStorage::default()), device())
         .await
         .unwrap();
     client.add_address(id, addrs).unwrap();

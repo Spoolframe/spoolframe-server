@@ -53,7 +53,6 @@ pub struct AudioTrack {
     /// The file marks it as the one to play by default.
     pub default: bool,
     /// What the track is for, whatever its title says (P1-20).
-    #[serde(default)]
     pub role: AudioRole,
 }
 
@@ -86,7 +85,6 @@ pub struct SubtitleTrack {
     /// From a separate file next to the media, not inside it.
     pub external: bool,
     /// What the track is for, whatever its title says (P1-20).
-    #[serde(default)]
     pub role: SubtitleRole,
 }
 
@@ -110,6 +108,27 @@ pub enum SubtitleRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_track_s_role_left_out_is_refused() {
+        let audio = AudioTrack {
+            language: None,
+            title: None,
+            channels: None,
+            default: false,
+            role: AudioRole::Commentary,
+        };
+        crate::test_support::assert_each_required(&audio, &["role"]);
+        let subtitle = SubtitleTrack {
+            language: None,
+            title: None,
+            forced: false,
+            default: false,
+            external: false,
+            role: SubtitleRole::Sdh,
+        };
+        crate::test_support::assert_each_required(&subtitle, &["role"]);
+    }
 
     #[test]
     fn tracks_round_trip_with_the_duration_in_milliseconds() {
@@ -145,14 +164,9 @@ mod tests {
     }
 
     #[test]
-    fn roles_from_an_older_or_newer_peer_still_decode() {
-        // Older: no role at all.
-        let old: AudioTrack = serde_json::from_value(serde_json::json!({
-            "language": "eng", "title": null, "channels": 2, "default": false
-        }))
-        .unwrap();
-        assert_eq!(old.role, AudioRole::Main);
-        // Newer: a role this build does not know.
+    fn a_role_from_a_newer_peer_still_decodes() {
+        // A role this build does not know. (A track with no role at all is
+        // refused: `a_track_s_role_left_out_is_refused`.)
         let audio: AudioRole = serde_json::from_value(serde_json::json!("karaoke")).unwrap();
         assert_eq!(audio, AudioRole::Other);
         let subtitle: SubtitleRole = serde_json::from_value(serde_json::json!("lyrics")).unwrap();

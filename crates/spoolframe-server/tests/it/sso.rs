@@ -180,7 +180,7 @@ impl Browser {
     /// Begin a flow: the provider's address and the flow's cookie, or the
     /// server's refusal.
     async fn begin(&self, purpose: &str) -> Result<(String, String), (StatusCode, Value)> {
-        self.begin_with(json!({ "provider": PROVIDER, "purpose": purpose }))
+        self.begin_with(json!({ "provider": PROVIDER, "purpose": purpose, "return_to": null }))
             .await
     }
 
@@ -583,7 +583,7 @@ async fn without_providers_there_is_no_sso() {
     assert_eq!(site["sso"], json!([]));
     let refused = reqwest::Client::new()
         .post(format!("http://{addr}/auth/oidc/begin"))
-        .json(&json!({ "provider": PROVIDER, "purpose": "signIn" }))
+        .json(&json!({ "provider": PROVIDER, "purpose": "signIn", "return_to": null }))
         .send()
         .await
         .unwrap();
@@ -805,6 +805,27 @@ async fn a_place_to_return_to_off_the_server_is_refused() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// The web UI always says where to return to, `null` for the start page
+/// (PX-15): a begin that leaves the key out is refused, not read as none.
+#[tokio::test]
+async fn a_begin_that_leaves_return_to_out_is_refused() {
+    let idp = StandIn::start().await;
+    let server = server("sso-return-missing", &idp.issuer).await;
+    let browser = Browser::new(server.addr);
+    let (status, body) = browser
+        .begin_with(json!({ "provider": PROVIDER, "purpose": "signIn" }))
+        .await
+        .unwrap_err();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], error_code::INVALID_INPUT);
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("missing field `return_to`")),
+        "{body}"
+    );
+}
+
 /// PX-09 finding 16 (A-6): anyone may begin a sign-in, so one address may
 /// hold only a few flows, and the table stays open to everyone else.
 #[tokio::test]
@@ -823,7 +844,7 @@ async fn one_address_cannot_begin_every_sso_flow() {
             .post(format!("http://{addr}/auth/oidc/begin"))
             .header("origin", WEB)
             .header("x-forwarded-for", caller)
-            .json(&json!({ "provider": PROVIDER, "purpose": "signIn" }))
+            .json(&json!({ "provider": PROVIDER, "purpose": "signIn", "return_to": null }))
             .send()
             .await
             .unwrap()

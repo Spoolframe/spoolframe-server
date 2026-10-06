@@ -2,7 +2,7 @@
 //! started and watched, how often progress is written, and what Home
 //! shows. Storage is `crate::store::watch`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -173,8 +173,7 @@ impl Watch {
             if !crossing {
                 // Not written, but played: it is back in Continue watching
                 // (P1-22).
-                let show = row.and_then(|r| r.show_id.as_deref());
-                self.store.clear_hidden(principal, &key.1, show).await?;
+                self.store.clear_hidden(principal, &key.1).await?;
                 return Ok(());
             }
         }
@@ -197,40 +196,30 @@ impl Watch {
         Ok(())
     }
 
-    /// Remove `id` from `principal`'s Continue watching (P1-22): a movie
-    /// itself, an episode its show (from Next up too). Its watch state does
-    /// not change; the next one written clears this.
+    /// Remove the card `id`, a movie or an episode, from `principal`'s
+    /// Continue watching or Next up (P1-22). Only that card: the show's
+    /// other episodes stay. Its watch state does not change; the next one
+    /// written for it clears this.
     pub async fn hide(&self, principal: Principal, id: &MediaId) -> Result<(), WatchError> {
-        let (target, external_ids) = self.hide_target(id).await?;
+        if !tracked(id) {
+            return Err(WatchError::NotTracked(id.clone()));
+        }
+        let found = self.catalog.item(id).await?;
         self.store
-            .hide_continue(principal, &target.to_string(), &external_ids)
+            .hide_continue(principal, &id.to_string(), &found.external_ids)
             .await?;
         Ok(())
     }
 
     /// Undo [`Watch::hide`].
     pub async fn unhide(&self, principal: Principal, id: &MediaId) -> Result<(), WatchError> {
-        let (target, _) = self.hide_target(id).await?;
-        self.store
-            .unhide_continue(principal, &target.to_string())
-            .await?;
-        Ok(())
-    }
-
-    /// What hiding `id` hides, with its external ids: the movie, or the
-    /// episode's show.
-    async fn hide_target(&self, id: &MediaId) -> Result<(MediaId, Vec<String>), WatchError> {
         if !tracked(id) {
             return Err(WatchError::NotTracked(id.clone()));
         }
-        let found = self.catalog.item(id).await?;
-        match &found.item {
-            Item::Episode(e) => {
-                let show = self.catalog.item(&e.show_id).await?;
-                Ok((e.show_id.clone(), show.external_ids))
-            }
-            _ => Ok((id.clone(), found.external_ids)),
-        }
+        self.store
+            .unhide_continue(principal, &id.to_string())
+            .await?;
+        Ok(())
     }
 
     /// Mark `id` watched or not. Either way its progress starts over.
@@ -369,7 +358,7 @@ impl Watch {
         {
             self.store.move_watch(principal, &old, &media_id).await?;
         }
-        // A show's hide follows it too (P1-22).
+        // A hide follows it too (P1-22).
         if let Some(old) = self
             .store
             .hidden_under_another_key(principal, &media_id, external_ids)
@@ -456,7 +445,7 @@ impl Watch {
 
     /// `principal`'s home screen.
     pub async fn home(&self, principal: Principal) -> Result<HomeScreen, WatchError> {
-        // Removed from Continue watching (P1-22): movies, and shows.
+        // Cards removed (P1-22): movies and episodes, each by its own id.
         let hidden = self.store.hidden(principal).await?;
         let mut continue_watching = Vec::new();
         let min = ms(self.rules().started_after);
@@ -466,9 +455,7 @@ impl Watch {
             if continue_watching.len() == ROW {
                 break;
             }
-            if hidden.contains(&row.media_id)
-                || row.show_id.as_ref().is_some_and(|s| hidden.contains(s))
-            {
+            if hidden.contains(&row.media_id) {
                 continue;
             }
             let Ok(id) = row.media_id.parse::<MediaId>() else {
@@ -487,8 +474,33 @@ impl Watch {
             }
         }
         let mut next_up = self.next_up(principal).await?;
+        // One row per show: while an episode of a show is in progress, the
+        // show is in Continue watching and has nothing in Next up. Every
+        // episode in progress counts, not only the ones the row has room
+        // for, but not one removed: its card is not there to hold the
+        // show. Judged here, after the cache, so an episode just started,
+        // or a card just removed, shows at once.
+        let shows: Vec<String> = next_up
+            .iter()
+            .filter_map(|item| match item {
+                Item::Episode(e) => Some(e.show_id.to_string()),
+                _ => None,
+            })
+            .collect();
+        let started: HashSet<String> = self
+            .store
+            .in_progress_in_shows(principal, min, &shows)
+            .await?
+            .into_iter()
+            .filter(|row| !hidden.contains(&row.media_id))
+            .filter_map(|row| row.show_id)
+            .collect();
+        // A removed Next up episode stays out until it is watched, which
+        // moves Next up past it.
         next_up.retain(|item| match item {
-            Item::Episode(e) => !hidden.contains(&e.show_id.to_string()),
+            Item::Episode(e) => {
+                !hidden.contains(&e.id.to_string()) && !started.contains(&e.show_id.to_string())
+            }
             _ => true,
         });
         let recently_added = self.catalog.recently_added(ROW as u32).await?;
@@ -602,7 +614,19 @@ impl Watch {
         else {
             return Ok(None);
         };
-        Ok(episodes.into_iter().nth(latest + 1))
+        let Some(next) = episodes.into_iter().nth(latest + 1) else {
+            return Ok(None);
+        };
+        // Started already: it is in Continue watching, never in both rows.
+        let id = next.id().to_string();
+        let min = ms(self.rules().started_after);
+        let started = self
+            .store
+            .watch_states(principal, std::slice::from_ref(&id))
+            .await?
+            .get(&id)
+            .is_some_and(|row| !row.watched && row.position_ms.is_some_and(|p| p >= min));
+        Ok((!started).then_some(next))
     }
 }
 

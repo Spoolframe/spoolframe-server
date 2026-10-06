@@ -5,6 +5,11 @@
 //! There, every record is from this test: no other Spoolframe server on the
 //! real LAN is heard, and the host firewall, which usually drops inbound
 //! mDNS (UDP 5353), is not in the way.
+//!
+//! The assertions still name the servers they look for by key, never by
+//! how many are listed: a test says what it knows about its own servers,
+//! whatever else may be heard. The other integration tests do not listen
+//! on the LAN at all ([`support::sdk_client`]).
 
 use crate::support;
 
@@ -18,7 +23,7 @@ use iroh::endpoint::presets;
 use iroh::endpoint_info::UserData;
 use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
-use spoolframe_client_sdk::{Client, Device, MemoryStorage, SdkError, ServerEntry};
+use spoolframe_client_sdk::{Client, ClientOptions, Device, MemoryStorage, SdkError, ServerEntry};
 use spoolframe_protocol::lan;
 use spoolframe_types::ClientCapabilities;
 use support::{ServerOptions, TestServer, fresh_dir};
@@ -98,6 +103,18 @@ fn device() -> Device {
 
 async fn open(storage: &Arc<MemoryStorage>) -> Client {
     Client::open(storage.clone(), device()).await.unwrap()
+}
+
+/// The keys `client` lists, of those in `ours`.
+async fn listed_of(client: &Client, ours: &[&str]) -> Vec<String> {
+    client
+        .servers()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.endpoint_id)
+        .filter(|id| ours.contains(&id.as_str()))
+        .collect()
 }
 
 /// The client's entry for `server`, once it has one that `ready` accepts.
@@ -265,10 +282,15 @@ async fn another_server_with_the_same_name_beside_it_is_a_different_server() {
     assert_eq!(other.name, "Home Media");
     assert!(!other.pinned);
     assert_ne!(other.fingerprint, pinned.fingerprint);
+    let mut listed = listed_of(&client, &[&pinned.endpoint_id, &other.endpoint_id]).await;
+    listed.sort();
+    let mut both = [pinned.endpoint_id.clone(), other.endpoint_id.clone()];
+    both.sort();
+    assert_eq!(listed, both);
     let servers = client.servers().await.unwrap();
-    assert_eq!(servers.len(), 2);
-    let still = servers.iter().find(|e| e.pinned).unwrap();
-    assert_eq!(still.endpoint_id, pinned.endpoint_id);
+    let still: Vec<_> = servers.iter().filter(|e| e.pinned).collect();
+    assert_eq!(still.len(), 1, "{servers:?}");
+    assert_eq!(still[0].endpoint_id, pinned.endpoint_id);
     // Both are on the air: the second is another server, not a new key.
     assert!(!client.connect(&other.endpoint_id).await.unwrap().pinned);
     client.close().await;
@@ -375,7 +397,11 @@ async fn a_new_key_and_server_id_under_a_saved_name_is_another_server() {
     assert!(!other.pinned, "{other:?}");
     assert!(!client.connect(&other.endpoint_id).await.unwrap().pinned);
     let listed = client.servers().await.unwrap();
-    assert_eq!(listed.len(), 2, "{listed:?}");
+    let ours: Vec<_> = listed
+        .iter()
+        .filter(|e| e.endpoint_id == old || e.endpoint_id == other.endpoint_id)
+        .collect();
+    assert_eq!(ours.len(), 2, "{listed:?}");
     assert!(listed.iter().any(|e| e.pinned && e.endpoint_id == old));
     client.close().await;
     second.stop().await;
@@ -399,14 +425,13 @@ async fn endpoints_that_are_not_spoolframe_servers_are_not_listed() {
     // ...and a real server, heard after them, is the only one listed.
     let server = TestServer::start_with(fresh_dir("decoys").await, on_lan("Den")).await;
     entry(&client, &server, |e| e.on_network).await;
-    let listed: Vec<_> = client
-        .servers()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|e| e.endpoint_id)
-        .collect();
-    assert_eq!(listed, [server.server.id().to_string()]);
+    let decoys = [
+        other_app.id().to_string(),
+        no_advert.id().to_string(),
+        other_protocol.id().to_string(),
+    ];
+    let decoys: Vec<&str> = decoys.iter().map(String::as_str).collect();
+    assert_eq!(listed_of(&client, &decoys).await, Vec::<String>::new());
     for decoy in [other_app, no_advert, other_protocol] {
         decoy.close().await;
     }
@@ -442,9 +467,15 @@ async fn a_pinned_server_on_a_new_address_is_found_again_by_its_key() {
     assert_eq!(found.endpoint_id, id.to_string());
     // The pin now holds where the server answered, ahead of the next record.
     let listed = client.servers().await.unwrap();
-    assert_eq!(listed.len(), 1);
-    assert!(listed[0].pinned);
-    assert!(new_addrs.contains(&listed[0].addrs[0]), "{listed:?}");
+    let [ours] = &listed
+        .iter()
+        .filter(|e| e.endpoint_id == id.to_string())
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("not one entry for {id}: {listed:?}");
+    };
+    assert!(ours.pinned);
+    assert!(new_addrs.contains(&ours.addrs[0]), "{listed:?}");
     client.close().await;
     server.stop().await;
 }
@@ -477,7 +508,8 @@ async fn the_server_list_tells_when_a_server_is_heard() {
         return;
     }
     let client = open(&Arc::new(MemoryStorage::default())).await;
-    // An app lists at once: nothing heard yet.
+    // An app lists at once: nothing pinned, and nothing heard yet in this
+    // private namespace.
     let mut changes = client.watch_servers();
     assert!(client.servers().await.unwrap().is_empty());
 
@@ -502,5 +534,40 @@ async fn the_server_list_tells_when_a_server_is_heard() {
     .expect("no change listed the server");
     assert_eq!(listed.name, "Den");
     client.close().await;
+    server.stop().await;
+}
+
+/// A client opened with LAN discovery off (PX-10) never lists or dials a
+/// server it only could have heard: the switch the other tests use to keep
+/// a developer's own server out of their results.
+#[tokio::test]
+async fn a_client_with_discovery_off_hears_no_server() {
+    if !private_lan("a_client_with_discovery_off_hears_no_server") {
+        return;
+    }
+    let server = TestServer::start_with(fresh_dir("deaf").await, on_lan("Den")).await;
+    let deaf = Client::open_with_options(
+        Arc::new(MemoryStorage::default()),
+        device(),
+        ClientOptions {
+            lan_discovery: false,
+            ..ClientOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    // A listening client hears the server: it is on the air...
+    let listening = open(&Arc::new(MemoryStorage::default())).await;
+    let heard = entry(&listening, &server, |e| e.on_network).await;
+    // ...and given as long again, the deaf one lists nothing and cannot
+    // dial a key it was given no address for.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(deaf.servers().await.unwrap().is_empty());
+    assert!(matches!(
+        deaf.connect(&heard.endpoint_id).await,
+        Err(SdkError::UnknownServer(_))
+    ));
+    deaf.close().await;
+    listening.close().await;
     server.stop().await;
 }

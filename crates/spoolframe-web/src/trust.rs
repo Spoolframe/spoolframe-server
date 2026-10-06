@@ -76,6 +76,8 @@ pub enum Icon {
     Pin,
     /// Trust taken away: a shield with a mark.
     Untrust,
+    /// The device deleted: a trash can, in red.
+    Delete,
 }
 
 /// The change pressing `switch` on `device`'s row makes.
@@ -240,6 +242,120 @@ pub fn signed_out(name: &str, trusted: bool) -> String {
     }
 }
 
+/// What is asked before deleting `name` (canvas v75): what it means, and
+/// Delete in red. For another user, `whose` carries the name the admin
+/// pages show them by.
+pub fn forget_question(name: &str, whose: &Whose) -> Question {
+    Question {
+        title: match whose {
+            Whose::Mine => format!("Delete {name}?"),
+            Whose::Theirs(user) => format!("Delete {}?", their_device(user, name)),
+        },
+        text: "It is signed out and forgotten. If it signs in again it shows up as new.".to_owned(),
+        action: "Delete",
+        danger: true,
+        icon: Icon::Delete,
+    }
+}
+
+/// What the page says once `name` is deleted.
+pub fn forgotten(name: &str) -> String {
+    format!("Deleted {name}")
+}
+
+/// What "Confirm it's you" says deleting a device is: "Confirm it's you
+/// before {about}."
+pub fn forget_about(whose: &Whose) -> String {
+    match whose {
+        Whose::Mine => "deleting a device".to_owned(),
+        Whose::Theirs(user) => format!("deleting {user}'s device"),
+    }
+}
+
+/// How long a trusted device may go unused before its trust lapses: the
+/// server's `auth.trust_idle_days` default. The admin API does not expose
+/// the setting, and My profile is any user's, so the pages say the
+/// default.
+pub const TRUST_IDLE_DAYS: u32 = 180;
+
+/// Why a browser's row has no switches: under the legend, and on the
+/// row itself on a phone.
+pub const BROWSER_NOTE: &str = "A browser can't be trusted or open by itself.";
+
+/// One line of the legend under the device switches: the column's name
+/// in bold, then what it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegendLine {
+    pub switch: Switch,
+    pub term: &'static str,
+    pub text: String,
+}
+
+/// The element id of `switch`'s legend line, which its column head, its
+/// phone label and each of its switches name as their description.
+pub fn legend_id(switch: Switch) -> &'static str {
+    match switch {
+        Switch::Pin => "device-legend-pin",
+        Switch::Trusted => "device-legend-trusted",
+        Switch::AutoLogin => "device-legend-auto-login",
+    }
+}
+
+/// What each switch does, in the columns' order, for My profile
+/// (`Whose::Mine`) or an admin's user page, which says "this user's". With
+/// no PIN, the PIN line also says why its switch cannot be turned on;
+/// auto-login's says it needs Trusted, why its switch is off until then.
+pub fn legend(whose: &Whose, has_pin: bool) -> [LegendLine; 3] {
+    let days = TRUST_IDLE_DAYS;
+    let (pin, trusted, auto_login) = match whose {
+        Whose::Mine => (
+            format!(
+                "Asks for your PIN before opening your profile here, even when the device is trusted.{}",
+                if has_pin {
+                    ""
+                } else {
+                    " You have no PIN yet: set one under Profile PIN to turn this on."
+                }
+            ),
+            format!(
+                "Remembered on this device: picking your profile on Who's watching opens it without your password. Ends when you sign out there, change your password, or don't use it for {days} days."
+            ),
+            "Opens your profile as soon as the app starts, instead of showing Who's watching. Needs Trusted; one profile per device.".to_owned(),
+        ),
+        Whose::Theirs(_) => (
+            format!(
+                "Asks for their PIN before opening this user's profile here, even when the device is trusted.{}",
+                if has_pin {
+                    ""
+                } else {
+                    " This user has no PIN, so no device can ask for one."
+                }
+            ),
+            format!(
+                "Remembered on this device: picking this user's profile on Who's watching opens it without their password. Ends when they sign out there, change their password, or don't use it for {days} days."
+            ),
+            "Opens this user's profile as soon as the app starts, instead of showing Who's watching. Needs Trusted; one profile per device.".to_owned(),
+        ),
+    };
+    [
+        LegendLine {
+            switch: Switch::Pin,
+            term: "PIN",
+            text: pin,
+        },
+        LegendLine {
+            switch: Switch::Trusted,
+            term: "Trusted",
+            text: trusted,
+        },
+        LegendLine {
+            switch: Switch::AutoLogin,
+            term: "Auto-login",
+            text: auto_login,
+        },
+    ]
+}
+
 /// One row of My profile's "Devices and sessions": a device the user has
 /// signed in on, with its live sessions, or a browser's or the CLI's
 /// session, which has no device and so no PIN or trust.
@@ -253,6 +369,13 @@ impl Row {
     /// This browser's own session is on it.
     pub fn current(&self) -> bool {
         self.sessions.iter().any(|s| s.current)
+    }
+
+    /// It has Delete beside Sign out (canvas v75): an app's device, signed
+    /// in or not. A browser's or the CLI's session has no device to
+    /// delete, and this browser's row is this device.
+    pub fn can_forget(&self) -> bool {
+        self.device.is_some() && !self.current()
     }
 }
 
@@ -727,8 +850,152 @@ mod tests {
         );
     }
 
+    fn legend_text(whose: &Whose, has_pin: bool) -> Vec<String> {
+        legend(whose, has_pin).into_iter().map(|l| l.text).collect()
+    }
+
+    #[test]
+    fn the_legend_names_the_columns_in_their_order() {
+        assert_eq!(
+            legend(&Whose::Mine, true).map(|l| (l.switch, l.term)),
+            [
+                (Switch::Pin, "PIN"),
+                (Switch::Trusted, "Trusted"),
+                (Switch::AutoLogin, "Auto-login"),
+            ]
+        );
+    }
+
+    #[test]
+    fn my_legend_says_what_each_switch_does_to_your_profile() {
+        assert_eq!(
+            legend_text(&Whose::Mine, true),
+            [
+                "Asks for your PIN before opening your profile here, even when the device is trusted.",
+                "Remembered on this device: picking your profile on Who's watching opens it without your password. Ends when you sign out there, change your password, or don't use it for 180 days.",
+                "Opens your profile as soon as the app starts, instead of showing Who's watching. Needs Trusted; one profile per device.",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_admin_s_legend_says_this_user_s_profile() {
+        assert_eq!(
+            legend_text(&alice(), true),
+            [
+                "Asks for their PIN before opening this user's profile here, even when the device is trusted.",
+                "Remembered on this device: picking this user's profile on Who's watching opens it without their password. Ends when they sign out there, change their password, or don't use it for 180 days.",
+                "Opens this user's profile as soon as the app starts, instead of showing Who's watching. Needs Trusted; one profile per device.",
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_pin_my_legend_says_to_set_one() {
+        assert_eq!(
+            legend_text(&Whose::Mine, false)[0],
+            "Asks for your PIN before opening your profile here, even when the device is trusted. You have no PIN yet: set one under Profile PIN to turn this on."
+        );
+    }
+
+    #[test]
+    fn without_a_pin_an_admin_s_legend_says_no_device_can_ask_for_one() {
+        assert_eq!(
+            legend_text(&alice(), false)[0],
+            "Asks for their PIN before opening this user's profile here, even when the device is trusted. This user has no PIN, so no device can ask for one."
+        );
+    }
+
+    #[test]
+    fn each_column_s_legend_line_has_its_own_id() {
+        let ids = [Switch::Pin, Switch::Trusted, Switch::AutoLogin].map(legend_id);
+        assert!(
+            ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2],
+            "{ids:?}"
+        );
+    }
+
     #[test]
     fn a_device_that_did_not_ask_shows_no_box() {
         assert_eq!(remember_line(false, true, "Andrey", "TV"), None);
+    }
+
+    #[test]
+    fn deleting_my_device_asks_by_its_name() {
+        assert_eq!(
+            forget_question("Living room TV", &Whose::Mine).title,
+            "Delete Living room TV?"
+        );
+    }
+
+    #[test]
+    fn deleting_a_user_s_device_asks_by_their_name() {
+        assert_eq!(
+            forget_question("Living room TV", &alice()).title,
+            "Delete Alice's Living room TV?"
+        );
+    }
+
+    #[test]
+    fn deleting_a_device_says_what_it_means() {
+        assert_eq!(
+            forget_question("Living room TV", &alice()).text,
+            "It is signed out and forgotten. If it signs in again it shows up as new."
+        );
+    }
+
+    #[test]
+    fn deleting_is_the_red_delete_button() {
+        let asked = forget_question("Living room TV", &Whose::Mine);
+        assert_eq!(
+            (asked.action, asked.danger, asked.icon),
+            ("Delete", true, Icon::Delete)
+        );
+    }
+
+    #[test]
+    fn a_deleted_device_is_said_by_its_name() {
+        assert_eq!(forgotten("Living room TV"), "Deleted Living room TV");
+    }
+
+    #[test]
+    fn confirming_it_s_me_names_the_deletion() {
+        assert_eq!(forget_about(&Whose::Mine), "deleting a device");
+    }
+
+    #[test]
+    fn confirming_it_s_an_admin_names_whose_device() {
+        assert_eq!(forget_about(&alice()), "deleting Alice's device");
+    }
+
+    #[test]
+    fn an_app_s_device_can_be_deleted_signed_in_or_not() {
+        let signed_out = Row {
+            device: Some(tv()),
+            sessions: Vec::new(),
+        };
+        let signed_in = Row {
+            device: Some(tv()),
+            sessions: vec![session("s1", Some("aa11"), 5, false)],
+        };
+        assert!(signed_out.can_forget() && signed_in.can_forget());
+    }
+
+    #[test]
+    fn a_browser_s_session_has_no_device_to_delete() {
+        let browser = Row {
+            device: None,
+            sessions: vec![session("s1", None, 5, false)],
+        };
+        assert!(!browser.can_forget());
+    }
+
+    #[test]
+    fn this_device_is_not_deleted() {
+        let this = Row {
+            device: Some(tv()),
+            sessions: vec![session("s1", Some("aa11"), 5, true)],
+        };
+        assert!(!this.can_forget());
     }
 }

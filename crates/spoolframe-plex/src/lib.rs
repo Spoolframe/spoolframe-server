@@ -44,6 +44,39 @@ pub use crate::watch::PlexWatch;
 use crate::convert::ConvertError;
 use crate::wire::{Envelope, MediaContainer, Metadata, SectionKey};
 
+/// The parsers of what a PMS sends, for the fuzz targets (`fuzz/`,
+/// PX-10): they are private otherwise. Not an API; only the `fuzzing`
+/// feature builds it.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    use crate::{bif, convert, wire};
+
+    /// A PMS JSON response, decoded and converted as the catalog does:
+    /// its sections and items, with their ids, markers and files.
+    pub fn json(body: &[u8]) {
+        let Ok(envelope) = serde_json::from_slice::<wire::Envelope>(body) else {
+            return;
+        };
+        let container = envelope.container;
+        for directory in &container.directories {
+            let _ = convert::library(directory);
+        }
+        for metadata in &container.metadata {
+            let _ = convert::is_modelled(&metadata.kind);
+            let _ = convert::item(metadata);
+            let _ = convert::external_ids(metadata);
+            let _ = convert::markers(metadata);
+            let _ = convert::media_files(metadata);
+        }
+    }
+
+    /// A preview index (BIF), as the catalog reads it.
+    pub fn bif(bytes: &[u8]) -> Result<usize, String> {
+        bif::frames(bytes).map(|frames| frames.len())
+    }
+}
+
 /// How long one PMS call may take. Browsing waits on it, so a stuck PMS
 /// should fail fast rather than hang the client.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);

@@ -796,7 +796,9 @@ async fn site(State(api): State<AdminApi>) -> Response<Body> {
 struct SsoBegin {
     provider: String,
     purpose: String,
-    #[serde(default)]
+    /// `null` for none; the key is required (PX-15), as the web UI always
+    /// sends it.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     return_to: Option<String>,
 }
 

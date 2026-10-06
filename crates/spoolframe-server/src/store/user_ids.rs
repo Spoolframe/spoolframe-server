@@ -201,9 +201,9 @@ mod tests {
             VALUES ('local:2', 'plex:movie:1', 'imdb://tt1'),
                    ('local:9', 'plex:movie:1', 'imdb://tt1');
         INSERT INTO continue_hidden (principal, media_id, hidden_at)
-            VALUES ('local:3', 'plex:show:4', 10);
+            VALUES ('local:3', 'plex:episode:5', 10);
         INSERT INTO continue_hidden_ids (principal, media_id, external_id)
-            VALUES ('local:3', 'plex:show:4', 'tvdb://4');
+            VALUES ('local:3', 'plex:episode:5', 'tvdb://5');
         INSERT INTO track_preferences (principal, preferences, updated_at)
             VALUES ('local:1', '{}', 11);
         INSERT INTO track_overrides (principal, scope, override, updated_at)
@@ -340,7 +340,7 @@ mod tests {
                 .hidden(Principal::LocalUser(bob))
                 .await
                 .unwrap()
-                .contains("plex:show:4")
+                .contains("plex:episode:5")
         );
         assert_eq!(
             count(

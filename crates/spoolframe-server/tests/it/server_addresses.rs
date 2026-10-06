@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use spoolframe_client_sdk::{Client, MemoryStorage};
+use spoolframe_client_sdk::MemoryStorage;
 use spoolframe_protocol::{Error, Reply, Request, Response, SessionId};
 use spoolframe_server::announce::Announce;
 use support::{ServerOptions, TestClient, TestServer, fresh_dir, mkv_capabilities};
@@ -158,7 +158,7 @@ async fn the_sdk_saves_every_address_it_is_told_after_a_sign_in() {
         platform: spoolframe_client_sdk::types::Platform::Ios,
         capabilities: mkv_capabilities(),
     };
-    let client = Client::open(storage, device).await.unwrap();
+    let client = crate::support::sdk_client(storage, device).await.unwrap();
     let id = server.server.id().to_string();
     client.add_address(&id, vec![first]).unwrap();
     client.connect(&id).await.unwrap();

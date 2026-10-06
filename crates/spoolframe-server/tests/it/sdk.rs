@@ -40,7 +40,7 @@ async fn client_with(
     storage: &Arc<MemoryStorage>,
     capabilities: ClientCapabilities,
 ) -> Client {
-    let client = Client::open(storage.clone(), device(capabilities))
+    let client = crate::support::sdk_client(storage.clone(), device(capabilities))
         .await
         .unwrap();
     let addrs = server.server.addr().ip_addrs().copied().collect();
@@ -147,7 +147,7 @@ async fn a_session_tells_its_direct_path_as_lan_or_not() {
         .collect();
     assert!(!lan.is_empty(), "the server has no LAN address");
     let storage = Arc::new(MemoryStorage::default());
-    let client = Client::open(storage, device(mkv_capabilities()))
+    let client = crate::support::sdk_client(storage, device(mkv_capabilities()))
         .await
         .unwrap();
     client.add_address(&id(&server), lan).unwrap();
@@ -281,7 +281,7 @@ async fn an_ended_profile_remembers_it_signed_in_with_a_password() {
     );
     client.close().await;
 
-    let again = Client::open(storage.clone(), device(mkv_capabilities()))
+    let again = crate::support::sdk_client(storage.clone(), device(mkv_capabilities()))
         .await
         .unwrap();
     assert_eq!(
@@ -400,7 +400,7 @@ async fn saved_profiles_are_read_without_the_server() {
     alice(&server, &client).await;
     client.close().await;
     server.stop().await;
-    let again = Client::open(storage.clone(), device(mkv_capabilities()))
+    let again = crate::support::sdk_client(storage.clone(), device(mkv_capabilities()))
         .await
         .unwrap();
     let profiles = again.saved_profiles(&key).await.unwrap();
@@ -496,7 +496,7 @@ async fn a_device_that_cannot_play_is_told_why() {
     server.write_media(1000);
     server.add_user("alice", "correct horse", None).await;
     let storage = Arc::new(MemoryStorage::default());
-    let client = Client::open(storage, device(ClientCapabilities::default()))
+    let client = crate::support::sdk_client(storage, device(ClientCapabilities::default()))
         .await
         .unwrap();
     let addrs = server.server.addr().ip_addrs().copied().collect();
@@ -560,7 +560,7 @@ async fn progress_shows_on_home_and_in_items() {
 #[tokio::test]
 async fn an_unknown_server_is_refused_without_dialling() {
     let storage = Arc::new(MemoryStorage::default());
-    let client = Client::open(storage, device(ClientCapabilities::default()))
+    let client = crate::support::sdk_client(storage, device(ClientCapabilities::default()))
         .await
         .unwrap();
     let stranger = iroh::SecretKey::generate().public().to_string();
@@ -589,12 +589,17 @@ async fn after_a_server_restart_the_same_sessions_work() {
     });
 
     let server = server.restart().await;
-    // Made while the client may still be reconnecting: it waits.
-    assert_eq!(alice.libraries().await.unwrap(), [library()]);
-    let seen = tokio::time::timeout(Duration::from_secs(10), seen)
+    // Its new address, as a LAN record or a new lease would bring it. A
+    // dial already under way to the old port can only time out (10 s),
+    // and the next one finds the new address: so wait for the reconnect
+    // rather than make a call that waits at most as long.
+    let addrs = server.server.addr().ip_addrs().copied().collect();
+    client.add_address(&id(&server), addrs).unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(30), seen)
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(alice.libraries().await.unwrap(), [library()]);
     assert!(
         matches!(seen[0], ConnectionState::Reconnecting { attempt: 1 }),
         "{seen:?}"
@@ -676,7 +681,9 @@ async fn converting(
     server.generate_media(12, "libx264", "ac3");
     server.add_user("alice", "correct horse", None).await;
     let storage = Arc::new(MemoryStorage::default());
-    let client = Client::open(storage, device(capabilities)).await.unwrap();
+    let client = crate::support::sdk_client(storage, device(capabilities))
+        .await
+        .unwrap();
     let addrs = server.server.addr().ip_addrs().copied().collect();
     client.add_address(&id(&server), addrs).unwrap();
     pin(&client, &server).await;
@@ -1174,7 +1181,7 @@ async fn a_saved_server_is_dated_when_pinned_verified_and_connected() {
         .unwrap();
 
     // The app opens again and connects: only the connect is dated anew.
-    let client = Client::open(storage.clone(), device(mkv_capabilities()))
+    let client = crate::support::sdk_client(storage.clone(), device(mkv_capabilities()))
         .await
         .unwrap();
     let addrs = server.server.addr().ip_addrs().copied().collect();
@@ -1635,7 +1642,7 @@ async fn a_call_after_the_device_is_signed_out_asks_for_a_sign_in() {
 #[tokio::test]
 async fn a_new_device_past_the_stranger_cap_is_told_the_server_is_full() {
     let (server, tv, _alice, _stranger) = full_of_strangers("sdk-server-full").await;
-    let newcomer = Client::open(
+    let newcomer = crate::support::sdk_client(
         Arc::new(MemoryStorage::default()),
         device(mkv_capabilities()),
     )
@@ -1756,6 +1763,39 @@ async fn a_session_sets_its_own_device_s_trust_and_auto_login() {
             .is_empty()
     );
     client.close().await;
+    server.stop().await;
+}
+
+/// P4-03: a phone deletes the TV, not itself; the TV leaves its devices
+/// and its session there needs a sign-in again.
+#[tokio::test]
+async fn a_session_deletes_another_of_its_user_s_devices() {
+    let (server, phone, _) = ready("sdk-forget-device").await;
+    let on_phone = alice(&server, &phone).await;
+    let tv = client_on(&server, &Arc::new(MemoryStorage::default())).await;
+    let on_tv = alice(&server, &tv).await;
+    assert!(matches!(
+        on_phone.forget_device(&phone.id()).await,
+        Err(SdkError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        on_phone.forget_device(&"ab".repeat(32)).await,
+        Err(SdkError::NotFound(_))
+    ));
+
+    on_phone.forget_device(&tv.id()).await.unwrap();
+
+    let devices = on_phone.devices().await.unwrap();
+    assert!(
+        devices.iter().all(|d| d.endpoint_id != tv.id()),
+        "{devices:?}"
+    );
+    assert_eq!(
+        on_tv.libraries().await.unwrap_err(),
+        SdkError::SignInRequired
+    );
+    tv.close().await;
+    phone.close().await;
     server.stop().await;
 }
 

@@ -23,7 +23,7 @@ mod servers;
 mod session;
 pub mod storage;
 
-pub use client::{Client, Device, DeviceSignIn, ServersWatch};
+pub use client::{Client, ClientOptions, Device, DeviceSignIn, ServersWatch};
 pub use connection::Timeouts;
 pub use error::SdkError;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};

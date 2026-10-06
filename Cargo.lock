@@ -6381,6 +6381,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spoolframe-admin-api",
+ "spoolframe-types",
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",

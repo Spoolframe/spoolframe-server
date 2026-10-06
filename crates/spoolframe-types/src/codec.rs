@@ -119,21 +119,22 @@ vocabulary!(
     }
 );
 
-/// The most video a client can show. Each limit left out is no limit.
+/// The most video a client can show. Each limit that is `None` is no
+/// limit.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoLimits {
     /// Lines, e.g. 1080.
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required::option")]
     pub height: Option<u32>,
     /// Frames per second.
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required::option")]
     pub frame_rate: Option<u32>,
     /// Bits per sample, e.g. 8 for a client without 10-bit decoding.
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required::option")]
     pub bit_depth: Option<u32>,
     /// The HDR formats it shows as HDR; anything else is tone-mapped to
-    /// SDR. Left out: all of them.
-    #[serde(default)]
+    /// SDR. `None`: all of them.
+    #[serde(deserialize_with = "crate::required::option")]
     pub hdr: Option<BTreeSet<HdrFormat>>,
 }
 
@@ -142,28 +143,23 @@ pub struct VideoLimits {
 /// what it actually has (the Linux client from the GStreamer registry),
 /// not from a fixed list.
 ///
-/// Every field is optional on the wire, so a client that predates one
-/// still parses, and gets what it got before.
+/// Every field is required on the wire (PX-15): an empty set or `null`
+/// says "none", and a client that leaves a field out is refused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientCapabilities {
-    #[serde(default)]
     pub video: BTreeSet<VideoCodec>,
-    #[serde(default)]
     pub audio: BTreeSet<AudioCodec>,
-    #[serde(default)]
     pub containers: BTreeSet<Container>,
-    #[serde(default)]
     pub subtitles: BTreeSet<SubtitleFormat>,
     /// How it takes media in, preferred first. Empty means range reads
     /// only, which is what a Phase 1 client does.
-    #[serde(default)]
     pub delivery: Vec<Delivery>,
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required::option")]
     pub max_video: Option<VideoLimits>,
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required::option")]
     pub max_audio_channels: Option<u32>,
-    /// Bits per second, from the client's settings. Left out: no limit.
-    #[serde(default)]
+    /// Bits per second, from the client's settings. `None`: no limit.
+    #[serde(deserialize_with = "crate::required::option")]
     pub max_bitrate: Option<u64>,
 }
 
@@ -200,12 +196,39 @@ mod tests {
     }
 
     #[test]
-    fn a_phase_1_client_takes_range_reads_with_no_limits() {
-        let caps: ClientCapabilities =
-            serde_json::from_value(serde_json::json!({"video": ["h264"]})).unwrap();
+    fn a_client_without_deliveries_takes_range_reads() {
+        let caps = ClientCapabilities {
+            video: [VideoCodec::H264].into(),
+            ..ClientCapabilities::default()
+        };
         assert_eq!(caps.deliveries(), [Delivery::Range]);
-        assert_eq!(caps.max_video, None);
-        assert_eq!(caps.max_bitrate, None);
+    }
+
+    /// Capabilities were optional field by field, so a client that left
+    /// one out was planned for as if it had none (PX-15).
+    #[test]
+    fn capabilities_missing_a_field_are_refused() {
+        let caps = ClientCapabilities {
+            max_video: Some(VideoLimits::default()),
+            ..ClientCapabilities::default()
+        };
+        crate::test_support::assert_each_required(
+            &caps,
+            &[
+                "video",
+                "audio",
+                "containers",
+                "subtitles",
+                "delivery",
+                "max_video",
+                "max_audio_channels",
+                "max_bitrate",
+            ],
+        );
+        crate::test_support::assert_each_required(
+            &VideoLimits::default(),
+            &["height", "frame_rate", "bit_depth", "hdr"],
+        );
     }
 
     #[test]
@@ -217,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_round_trip_and_default_to_empty() {
+    fn capabilities_round_trip() {
         let caps = ClientCapabilities {
             video: [VideoCodec::H264, VideoCodec::Hevc].into(),
             audio: [AudioCodec::Aac].into(),
@@ -229,10 +252,6 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ClientCapabilities>(&json).unwrap(),
             caps
-        );
-        assert_eq!(
-            serde_json::from_str::<ClientCapabilities>("{}").unwrap(),
-            ClientCapabilities::default()
         );
     }
 }

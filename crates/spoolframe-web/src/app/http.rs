@@ -66,8 +66,7 @@ pub struct Site {
     /// plain HTTP, and every admin page says so.
     pub insecure_cookies: bool,
     /// The sign-in providers' names (P3-04), in the config's order: one
-    /// "Continue with" button each. None: no SSO anywhere.
-    #[serde(default)]
+    /// "Continue with" button each. Empty: no SSO anywhere.
     pub sso: Vec<String>,
 }
 
@@ -95,10 +94,7 @@ pub async fn sso_begin(
     purpose: &str,
     return_to: Option<&str>,
 ) -> Result<String, ApiError> {
-    let mut body = json!({ "provider": provider, "purpose": purpose });
-    if let Some(page) = return_to {
-        body["return_to"] = json!(page);
-    }
+    let body = json!({ "provider": provider, "purpose": purpose, "return_to": return_to });
     let response = post("/auth/oidc/begin", body).await?;
     if !response.ok() {
         return Err(error_of(response).await);
@@ -279,7 +275,7 @@ pub async fn me() -> Result<Option<UserInfo>, ApiError> {
 pub struct SetupState {
     pub open: bool,
     /// Why the server cannot make the admin a passkey, if it cannot.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub passkeys_unavailable: Option<String>,
 }
 

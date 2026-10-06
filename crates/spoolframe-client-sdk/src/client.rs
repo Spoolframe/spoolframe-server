@@ -91,6 +91,29 @@ impl std::fmt::Debug for DeviceSignIn {
     }
 }
 
+/// How [`Client::open_with_options`] opens this device. The default is
+/// what [`Client::open`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientOptions {
+    /// How long requests wait for answers.
+    pub timeouts: Timeouts,
+    /// Listen for servers on the LAN (mDNS). On by default. Off, nothing
+    /// is heard: [`Client::servers`] lists the saved servers only, and a
+    /// server is dialled only at the addresses saved for it or given with
+    /// [`Client::add_address`]. For tests, and for any app that must not
+    /// depend on what else is on the network.
+    pub lan_discovery: bool,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            timeouts: Timeouts::default(),
+            lan_discovery: true,
+        }
+    }
+}
+
 /// This device. Cheap to clone: every clone is the same device.
 #[derive(Clone)]
 pub struct Client {
@@ -127,7 +150,8 @@ impl Client {
     /// Open this device: its key from `storage` (made on first start), and
     /// an endpoint with relays off that listens for servers on the LAN and
     /// never announces itself. Requests wait for answers as
-    /// [`Timeouts::default`] says.
+    /// [`Timeouts::default`] says. [`Client::open_with_options`] can turn
+    /// the listening off.
     pub async fn open(storage: Arc<dyn Storage>, device: Device) -> Result<Self, SdkError> {
         Self::open_with(storage, device, Timeouts::default()).await
     }
@@ -139,17 +163,40 @@ impl Client {
         device: Device,
         timeouts: Timeouts,
     ) -> Result<Self, SdkError> {
+        let options = ClientOptions {
+            timeouts,
+            ..ClientOptions::default()
+        };
+        Self::open_with_options(storage, device, options).await
+    }
+
+    /// [`Client::open`], as `options` say: its timeouts, and whether it
+    /// listens for servers on the LAN.
+    pub async fn open_with_options(
+        storage: Arc<dyn Storage>,
+        device: Device,
+        options: ClientOptions,
+    ) -> Result<Self, SdkError> {
+        let ClientOptions {
+            timeouts,
+            lan_discovery,
+        } = options;
         let key = load_or_create_key(storage.as_ref()).await?;
         // Minimal: no pkarr or DNS lookup, so a LAN client never tries the
         // Internet. mDNS only listens: a laptop or a TV must not announce
         // itself to the network (P1-13).
         let cannot_bind =
             |e: String| SdkError::Unreachable(format!("cannot bind the endpoint: {e}"));
-        let mdns = MdnsAddressLookup::builder()
-            .advertise(false)
-            .service_name(lan::MDNS_SERVICE)
-            .build(key.public())
-            .map_err(|e| cannot_bind(e.to_string()))?;
+        let mdns = if lan_discovery {
+            let mdns = MdnsAddressLookup::builder()
+                .advertise(false)
+                .service_name(lan::MDNS_SERVICE)
+                .build(key.public())
+                .map_err(|e| cannot_bind(e.to_string()))?;
+            Some(mdns)
+        } else {
+            None
+        };
         let transport = QuicTransportConfig::builder()
             .keep_alive_interval(KEEP_ALIVE)
             .max_idle_timeout(Some(
@@ -165,12 +212,18 @@ impl Client {
             .bind()
             .await
             .map_err(|e| cannot_bind(e.to_string()))?;
-        // The same lookup finds the addresses of servers being dialled.
-        endpoint
-            .address_lookup()
-            .map_err(|e| cannot_bind(e.to_string()))?
-            .add(mdns.clone());
-        let discovery = Discovery::start(&mdns).await;
+        let discovery = match mdns {
+            Some(mdns) => {
+                // The same lookup finds the addresses of servers being
+                // dialled.
+                endpoint
+                    .address_lookup()
+                    .map_err(|e| cannot_bind(e.to_string()))?
+                    .add(mdns.clone());
+                Discovery::start(&mdns).await
+            }
+            None => Discovery::off(),
+        };
         Ok(Self {
             inner: Arc::new(Inner {
                 endpoint,

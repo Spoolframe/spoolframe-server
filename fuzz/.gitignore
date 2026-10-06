@@ -1,0 +1,5 @@
+# What a campaign makes; only the minimized seeds in seeds/ are kept.
+target/
+corpus/
+artifacts/
+coverage/

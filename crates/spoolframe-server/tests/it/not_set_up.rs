@@ -6,7 +6,7 @@ use crate::support;
 
 use std::sync::Arc;
 
-use spoolframe_client_sdk::{Client, Device, MemoryStorage, SdkError};
+use spoolframe_client_sdk::{Device, MemoryStorage, SdkError};
 use support::{ServerOptions, TestServer, fresh_dir, library, mkv_capabilities, movie};
 
 #[tokio::test]
@@ -20,7 +20,7 @@ async fn clients_sign_in_and_are_told_the_server_is_not_set_up() {
     )
     .await;
     server.add_user("alice", "correct horse", None).await;
-    let client = Client::open(
+    let client = crate::support::sdk_client(
         Arc::new(MemoryStorage::default()),
         Device {
             name: "living room".into(),

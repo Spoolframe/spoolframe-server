@@ -24,6 +24,10 @@ tokio = { workspace = true, features = ["net", "sync"] }
 # GDM answers' interface (IP_PKTINFO) and the host's networks (PX-11).
 libc = { workspace = true }
 
+[features]
+# `fuzzing`: the PMS response parsers, for the fuzz targets in fuzz/.
+fuzzing = []
+
 [dev-dependencies]
 spoolframe-test-dir = { workspace = true }
 wiremock = { workspace = true }

@@ -23,6 +23,8 @@ dioxus-logger = { workspace = true }
 gloo-net = { workspace = true }
 js-sys = "0.3"
 jsonrpsee = { workspace = true, features = ["wasm-client"] }
+# `required::option`, for the `/auth` answers' required `Option` fields.
+spoolframe-types = { workspace = true }
 tracing = { workspace = true }
 wasm-bindgen = { workspace = true }
 # Awaits the passkey prompt's promise (P3-05).

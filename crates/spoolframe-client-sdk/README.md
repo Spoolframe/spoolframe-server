@@ -28,3 +28,10 @@ UI thread or a Tokio worker that must drive their asynchronous fetches.
 Use `ProfileScope::token` when dispatching UI work and `ProfileToken::accept` on
 completion. Invalidate the scope when changing profile or ending a session so
 stale successes and errors cannot change the replacement session's UI.
+
+`Client::open` listens for servers on the LAN over mDNS, and `Client::servers`
+lists what it hears beside the saved servers. `Client::open_with_options` with
+`ClientOptions { lan_discovery: false, .. }` turns the listening off: only saved
+servers are listed, and a server is dialled only at its saved addresses or at
+the ones given with `add_address`. Tests use it so that a real server on the
+developer's network cannot change their results.

@@ -898,6 +898,22 @@
   .btn-danger {
     color: var(--ctp-red);
   }
+  .btn-delete {
+    height: 30px;
+    padding: 0 4px;
+    background: transparent;
+    color: var(--ctp-red);
+    border: 0;
+    font: 600 13px var(--font-sans);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn-delete:hover {
+    text-decoration: underline;
+  }
   .btn-grey {
     background: var(--ctp-surface1);
     border: 0;
@@ -1630,12 +1646,31 @@
     line-height: 1.5;
     color: var(--ctp-subtext0);
   }
-  @container (min-width: 520px) {
+  .device-legend {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--ctp-subtext0);
+  }
+  .device-legend dt {
+    display: inline;
+    margin-right: 6px;
+    font-weight: 700;
+    color: var(--ctp-text);
+  }
+  .device-legend dd {
+    display: inline;
+    margin: 0;
+  }
+  @container (min-width: 600px) {
     .device-rows {
       gap: 0;
     }
     .device-row, .device-head {
-      grid-template-columns: minmax(0, 1fr) auto 96px;
+      grid-template-columns: minmax(0, 1fr) auto 172px;
       grid-template-areas: "what switches do";
       align-items: center;
       gap: 12px;
@@ -1682,6 +1717,12 @@
     border-radius: 12px;
     background: var(--ctp-mantle);
     font-size: 14px;
+  }
+  .device-card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
   }
   .switch {
     width: 42px;

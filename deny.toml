@@ -20,6 +20,10 @@ exceptions = [
   { crate = "spoolframe-catalog", allow = ["AGPL-3.0-or-later"] },
   { crate = "spoolframe-plex", allow = ["AGPL-3.0-or-later"] },
   { crate = "spoolframe-admin-api", allow = ["AGPL-3.0-or-later"] },
+  # The fuzz targets (fuzz/, PX-10): never built into anything shipped.
+  # libFuzzer, which libfuzzer-sys builds in, is LLVM's, under NCSA.
+  { crate = "spoolframe-fuzz", allow = ["AGPL-3.0-or-later"] },
+  { crate = "libfuzzer-sys", allow = ["NCSA"] },
 ]
 
 # Accepted advisories (PX-09 C-15, written down in PX-11 finding 39), so

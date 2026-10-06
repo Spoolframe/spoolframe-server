@@ -222,6 +222,51 @@ impl Store {
         self.note_sessions_ended();
         Ok(revoked)
     }
+
+    /// Delete `endpoint_id` from `user`'s devices (P4-03): their sessions
+    /// on it, live or revoked, since [`Store::user_devices`] lists every
+    /// endpoint with one, and the trust and PIN requirement it had for
+    /// them. If it signs in again it is a new device. Other users' rows
+    /// on it stay, and so does its connection while one of theirs is
+    /// live. Returns how many sessions were deleted.
+    pub async fn delete_device(
+        &self,
+        user: LocalUserId,
+        endpoint_id: &str,
+    ) -> Result<u64, PinError> {
+        let mut tx = self.pool.begin().await?;
+        let theirs: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sessions WHERE user_id = ?1 AND endpoint_id = ?2 LIMIT 1",
+        )
+        .bind(user)
+        .bind(endpoint_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if theirs.is_none() {
+            return Err(PinError::NoSuchDevice);
+        }
+        for delete in [
+            "DELETE FROM trusted_endpoints WHERE user_id = ?1 AND endpoint_id = ?2",
+            "DELETE FROM pin_required WHERE user_id = ?1 AND endpoint_id = ?2",
+        ] {
+            sqlx::query(delete)
+                .bind(user)
+                .bind(endpoint_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let deleted = sqlx::query("DELETE FROM sessions WHERE user_id = ?1 AND endpoint_id = ?2")
+            .bind(user)
+            .bind(endpoint_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        // The device's connection closes if no user's session is left on
+        // it (PX-10); another user's keeps it open.
+        self.note_sessions_ended();
+        Ok(deleted)
+    }
 }
 
 #[cfg(test)]
@@ -333,5 +378,124 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(live, 1);
+    }
+
+    async fn count(store: &Store, query: &'static str) -> i64 {
+        sqlx::query_scalar(query)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Deleting a device (P4-03) takes everything of the user's on it,
+    /// revoked sessions too, and nothing of another user's there.
+    #[tokio::test]
+    async fn deleting_a_device_deletes_only_its_user_s_rows_there() {
+        let store = test_store("pin-forget").await;
+        let alice = alice_on(&store, &["tv", "desktop"]).await;
+        let bob = store
+            .add_user("bob", None, "phc", Role::Consumer)
+            .await
+            .unwrap();
+        store
+            .create_session(
+                "bob-tv",
+                bob,
+                &SessionBinding::Endpoint {
+                    endpoint_id: "tv".into(),
+                    device_name: Some("device 0".into()),
+                    platform: Platform::Linux,
+                },
+                now() + 3600,
+            )
+            .await
+            .unwrap();
+        // A second, revoked session of alice's there: still listed.
+        store
+            .create_session(
+                "token-old",
+                alice,
+                &SessionBinding::Endpoint {
+                    endpoint_id: "tv".into(),
+                    device_name: None,
+                    platform: Platform::Linux,
+                },
+                now() + 3600,
+            )
+            .await
+            .unwrap();
+        store.revoke_device_sessions(alice, "tv").await.unwrap();
+        store
+            .create_session(
+                "token-new",
+                alice,
+                &SessionBinding::Endpoint {
+                    endpoint_id: "tv".into(),
+                    device_name: None,
+                    platform: Platform::Linux,
+                },
+                now() + 3600,
+            )
+            .await
+            .unwrap();
+        for user in [alice, bob] {
+            store.set_pin(user, "pin-phc", 4).await.unwrap();
+            store.set_pin_required(user, "tv", true).await.unwrap();
+            store
+                .set_device_trust(user, "tv", true, false)
+                .await
+                .unwrap();
+        }
+        let mut ended = store.sessions_ended();
+        ended.borrow_and_update();
+
+        assert_eq!(store.delete_device(alice, "tv").await.unwrap(), 3);
+
+        let hers: Vec<_> = store
+            .user_devices(alice)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.endpoint_id)
+            .collect();
+        assert_eq!(hers, ["desktop"]);
+        assert!(ended.has_changed().unwrap(), "the connections are checked");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM sessions WHERE endpoint_id = 'tv'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM trusted_endpoints WHERE endpoint_id = 'tv'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM pin_required WHERE endpoint_id = 'tv'"
+            )
+            .await,
+            1
+        );
+        let his = store.user_devices(bob).await.unwrap();
+        assert!(
+            his.len() == 1 && his[0].trusted && his[0].pin_required,
+            "{his:?}"
+        );
+        assert!(store.endpoint_signed_in("tv").await.unwrap());
+        // Gone, it is no longer hers to delete; nor is one she never used.
+        for endpoint in ["tv", "elsewhere"] {
+            assert!(matches!(
+                store.delete_device(alice, endpoint).await,
+                Err(PinError::NoSuchDevice)
+            ));
+        }
     }
 }

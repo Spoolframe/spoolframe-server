@@ -15,6 +15,40 @@ fn parse<T: serde::de::DeserializeOwned>(what: &str, json: &str) -> Option<T> {
         .ok()
 }
 
+/// A stored `TrackPreferences` row, which may be from a build before some
+/// of its fields existed (PX-13's `subtitles.bitmap`, for one).
+///
+/// The wire type has no serde defaults (PX-15), so the row is laid over
+/// the defaults first: each key the row has wins, each it lacks takes
+/// `TrackPreferences::default()`'s. This keeps the defaults in one place,
+/// the `Default` impls, rather than in a migration's JSON literal or in a
+/// second set of structs that must follow every new field. Rows are
+/// written whole by `set_track_preferences`, so a read rewrites nothing.
+fn parse_preferences(json: &str) -> Option<TrackPreferences> {
+    let stored: serde_json::Value = parse("track preferences", json)?;
+    let mut full =
+        serde_json::to_value(TrackPreferences::default()).expect("preferences always serialize");
+    overlay(&mut full, stored);
+    parse("track preferences", &full.to_string())
+}
+
+/// `top` over `base`: objects merge key by key, anything else replaces.
+fn overlay(base: &mut serde_json::Value, top: serde_json::Value) {
+    match (base, top) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(top)) => {
+            for (key, value) in top {
+                match base.get_mut(&key) {
+                    Some(slot) => overlay(slot, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, top) => *base = top,
+    }
+}
+
 impl Store {
     /// The principal's preferences; the defaults if they set none.
     pub async fn track_preferences(
@@ -26,9 +60,7 @@ impl Store {
                 .bind(principal.to_string())
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(json
-            .and_then(|j| parse("track preferences", &j))
-            .unwrap_or_default())
+        Ok(json.and_then(|j| parse_preferences(&j)).unwrap_or_default())
     }
 
     pub async fn set_track_preferences(
@@ -144,6 +176,63 @@ mod tests {
         assert_eq!(store.track_preferences(ALICE).await.unwrap(), always);
         assert_eq!(
             store.track_preferences(BOB).await.unwrap(),
+            TrackPreferences::default()
+        );
+    }
+
+    /// Put `json` in `principal`'s row as an older build wrote it.
+    async fn plant_preferences(store: &Store, principal: Principal, json: &str) {
+        sqlx::query(
+            "INSERT INTO track_preferences (principal, preferences, updated_at) \
+             VALUES (?1, ?2, 0)",
+        )
+        .bind(principal.to_string())
+        .bind(json)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_row_from_before_picture_subtitles_reads_with_the_new_default() {
+        let store = test_store("track-preferences-pre-px13").await;
+        // PX-13 added `subtitles.bitmap`; a row written before it has none.
+        plant_preferences(
+            &store,
+            ALICE,
+            r#"{"audio":{"languages":["jpn"],"avoid":[]},
+                "subtitles":{"mode":"always","languages":["eng"],"sdh":"avoid"}}"#,
+        )
+        .await;
+        let mut expected = TrackPreferences::default();
+        expected.audio.languages = vec!["jpn".into()];
+        expected.audio.avoid = vec![];
+        expected.subtitles.mode = SubtitleMode::Always;
+        expected.subtitles.languages = vec!["eng".into()];
+        expected.subtitles.sdh = spoolframe_types::SdhPreference::Avoid;
+        assert_eq!(store.track_preferences(ALICE).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_partial_row_keeps_what_it_has_and_takes_the_rest_from_the_defaults() {
+        let store = test_store("track-preferences-partial").await;
+        plant_preferences(&store, ALICE, r#"{"audio":{"languages":["eng"]}}"#).await;
+        plant_preferences(&store, BOB, "{}").await;
+        let mut expected = TrackPreferences::default();
+        expected.audio.languages = vec!["eng".into()];
+        assert_eq!(store.track_preferences(ALICE).await.unwrap(), expected);
+        assert_eq!(
+            store.track_preferences(BOB).await.unwrap(),
+            TrackPreferences::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_that_is_not_preferences_reads_as_the_defaults() {
+        let store = test_store("track-preferences-garbage").await;
+        plant_preferences(&store, ALICE, r#"{"audio":"loud"}"#).await;
+        assert_eq!(
+            store.track_preferences(ALICE).await.unwrap(),
             TrackPreferences::default()
         );
     }

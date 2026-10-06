@@ -51,7 +51,7 @@ impl fmt::Debug for SessionId {
 pub struct RequestEnvelope {
     /// `None` for the pre-auth requests. Several sessions may be used on
     /// one connection.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub session: Option<SessionId>,
     pub request: Request,
 }
@@ -164,24 +164,22 @@ pub enum Request {
     /// preferences (P1-20) and says which in the reply.
     PlaybackPlan {
         id: MediaId,
-        #[serde(default)]
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
         selection: Option<Selection>,
         /// How a picked bitmap subtitle is shown (P2-07).
-        #[serde(default)]
         bitmap: BitmapSubtitles,
     },
     /// Plan `id` and, if it plays directly, open a playback session to
     /// read it through. Without a selection, as for `PlaybackPlan`.
     StartPlayback {
         id: MediaId,
-        #[serde(default)]
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
         selection: Option<Selection>,
         /// Where to start, for a converted playback (P2-03): the encode
         /// begins there. Direct play reads from wherever the client likes.
-        #[serde(default)]
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
         start_ms: Option<u64>,
         /// How a picked bitmap subtitle is shown (P2-07).
-        #[serde(default)]
         bitmap: BitmapSubtitles,
     },
     /// End a playback now, and any encode for it.
@@ -291,7 +289,7 @@ pub enum Request {
     /// `UnlockProfile`). Stopping the requirement needs recent authentication.
     /// `Done`.
     SetPinRequired {
-        #[serde(default)]
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
         device: Option<String>,
         required: bool,
     },
@@ -331,6 +329,18 @@ pub enum Request {
         trusted: bool,
         auto_login: bool,
     },
+    /// Delete one of the session user's other devices (P4-03): `device`
+    /// is an endpoint id from `Devices`. `Done`. The user's sessions
+    /// there are deleted, and with them its trust and PIN requirement; it
+    /// leaves `Devices`, and if it signs in again it is listed as new.
+    /// Other users' sessions on that device are kept.
+    ///
+    /// - Always needs a recent sign-in (`RecentSignInRequired`).
+    /// - This device is `InvalidInput`: sign out with `Logout`.
+    /// - A device that is not the user's is `NotFound`.
+    ForgetDevice {
+        device: String,
+    },
     /// Refuse it: the device stops waiting. `Done`.
     DenyDeviceSignIn {
         code: String,
@@ -344,7 +354,6 @@ pub enum Request {
     ChangeSubtitle {
         handle: PlaybackHandle,
         subtitle: Option<u32>,
-        #[serde(default)]
         bitmap: BitmapSubtitles,
         position_ms: u64,
     },
@@ -400,10 +409,11 @@ pub enum Request {
     MarkUnwatched {
         id: MediaId,
     },
-    /// Remove `id` from the session user's Continue watching (P1-22),
-    /// leaving its progress and watched state: a movie itself, an episode
-    /// its show (from Next up too). Playing or marking it again brings it
-    /// back. `Done`.
+    /// Remove the card `id`, a movie or an episode, from the session
+    /// user's Continue watching or Next up (P1-22), leaving its progress
+    /// and watched state. Only that card: never the episode's whole show.
+    /// `id` is the card's own, not its show's. Playing or marking it again
+    /// brings it back. `Done`.
     HideFromContinueWatching {
         id: MediaId,
     },
@@ -461,9 +471,8 @@ impl Request {
 /// longer one to this many, and keeps and shows only that.
 pub const MAX_HELLO_TEXT: usize = 128;
 
-/// The client introduces itself. Capabilities (P1-07) will be added as an
-/// optional field, which older servers ignore. Each string is cut to
-/// [`MAX_HELLO_TEXT`] characters.
+/// The client introduces itself. Every field is required (PX-15). Each
+/// string is cut to [`MAX_HELLO_TEXT`] characters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol_version: u32,
@@ -475,12 +484,12 @@ pub struct Hello {
     /// one app may share across platforms.
     pub platform: Platform,
     /// What the device calls itself (a hostname, "Living room TV"); shown
-    /// in session lists. Optional.
-    #[serde(default)]
+    /// in session lists. `None` when it has no name to give.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub device_name: Option<String>,
-    /// What this device can play (P1-07). Without it every playback plan
-    /// is `Unsupported`.
-    #[serde(default)]
+    /// What this device can play (P1-07). `None`: every playback plan is
+    /// `Unsupported`.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub capabilities: Option<ClientCapabilities>,
 }
 
@@ -670,8 +679,7 @@ pub enum Reply {
         item: Item,
         children: Vec<Item>,
         /// The item's intro and credits (P2-10), in order of start; empty
-        /// for an item that has none, and from a server that sends none.
-        #[serde(default)]
+        /// for an item that has none.
         markers: Vec<Marker>,
     },
     Search(SearchResults),
@@ -692,7 +700,7 @@ pub enum Reply {
     PlaybackPlan {
         plan: PlaybackPlan,
         /// The tracks the server chose, when the request had no selection.
-        #[serde(default)]
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
         chosen: Option<ChosenTracks>,
     },
     PlaybackStarted {
@@ -702,15 +710,13 @@ pub enum Reply {
         /// The size of the file the handle reads.
         size: u64,
         /// The tracks the server chose, when the request had no selection.
-        #[serde(default)]
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
         chosen: Option<ChosenTracks>,
         /// The encode reads name; 0 for direct play.
-        #[serde(default)]
         epoch: u32,
         /// The item's intro and credits, as in `Item`, so a player needs
         /// no second request for them. Their times are the item's own,
         /// wherever the playback starts.
-        #[serde(default)]
         markers: Vec<Marker>,
     },
     /// A seek restarted the encode: reads name this epoch from offset 0.
@@ -820,7 +826,6 @@ pub struct UserSummary {
     pub role: Role,
     /// The session needs the user's PIN on this connection before anything
     /// but `WhoAmI` and `UnlockProfile` (P2-08).
-    #[serde(default)]
     pub locked: bool,
     /// The user's PIN, if they have one (P2-08): for "Set · 4 digits", and
     /// for how many boxes a PIN pad shows. Never the PIN itself.
@@ -858,7 +863,7 @@ pub struct DeviceInfo {
     /// Hex `EndpointId`: what `SetPinRequired { device }` takes.
     pub endpoint_id: String,
     /// What the device calls itself.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub name: Option<String>,
     /// What kind of client it runs, as its `Hello` said; `None` for a
     /// device not seen since before the server kept it.
@@ -879,7 +884,7 @@ pub struct DeviceInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSignInRequest {
     /// What the device calls itself (from its `Hello`).
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub device_name: Option<String>,
     /// Its app, e.g. `spoolframe-tvos`.
     pub client_name: String,

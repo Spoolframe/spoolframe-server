@@ -31,7 +31,8 @@ pub(crate) struct Discovery {
     /// Bumped whenever what `Client::servers` returns may have changed:
     /// a server heard, changed or gone here, or a pin saved or forgotten.
     changes: watch::Sender<u64>,
-    task: JoinHandle<()>,
+    /// `None` when the client does not listen on the LAN.
+    task: Option<JoinHandle<()>>,
 }
 
 impl Discovery {
@@ -73,7 +74,17 @@ impl Discovery {
         Self {
             heard,
             changes,
-            task,
+            task: Some(task),
+        }
+    }
+
+    /// Nothing is ever heard: the client does not listen on the LAN.
+    /// Pins and forgets still notify watchers.
+    pub fn off() -> Self {
+        Self {
+            heard: HeardMap::default(),
+            changes: watch::Sender::new(0u64),
+            task: None,
         }
     }
 
@@ -104,6 +115,8 @@ impl Discovery {
 
 impl Drop for Discovery {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }

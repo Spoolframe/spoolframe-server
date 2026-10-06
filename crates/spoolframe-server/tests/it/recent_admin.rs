@@ -75,6 +75,10 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
             ),
         ),
         (
+            "userForgetDevice",
+            outcome(root.user_forget_device(bob(), "ab".repeat(32)).await),
+        ),
+        (
             "userSetPinRequired(false)",
             outcome(
                 root.user_set_pin_required(bob(), "ab".repeat(32), false)

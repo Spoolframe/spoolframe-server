@@ -49,6 +49,8 @@ pub fn landing(setup_open: bool, signed_in: Option<Role>) -> Landing {
 pub struct ApiError {
     pub code: i32,
     pub message: String,
+    /// Kept optional (PX-15 left it): JSON-RPC 2.0 lets an error leave
+    /// `data` out, and jsonrpsee does when there is none.
     #[serde(default)]
     pub data: Option<Value>,
 }

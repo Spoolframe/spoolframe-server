@@ -7,6 +7,9 @@
 //! server.
 //!
 //! The servers here are off the LAN: a client is given their addresses.
+//! The client does not listen on the LAN either ([`crate::support::sdk_client`]),
+//! so `Client::servers` lists what the test saved and nothing a server on
+//! the developer's network announces.
 
 use std::sync::Arc;
 
@@ -31,7 +34,9 @@ fn id(server: &TestServer) -> String {
 
 /// A client on `storage` that knows where each of `servers` is.
 async fn client_of(storage: &Arc<MemoryStorage>, servers: &[&TestServer]) -> Client {
-    let client = Client::open(storage.clone(), device()).await.unwrap();
+    let client = crate::support::sdk_client(storage.clone(), device())
+        .await
+        .unwrap();
     for server in servers {
         let addrs = server.server.addr().ip_addrs().copied().collect();
         client.add_address(&id(server), addrs).unwrap();
@@ -151,20 +156,14 @@ async fn a_new_server_id_under_the_same_key_is_refused() {
     pin(&client, &server).await;
     client.close().await;
 
-    let port = server
-        .server
-        .addr()
-        .ip_addrs()
-        .find(|a| a.is_ipv4())
-        .expect("an IPv4 address")
-        .port();
     let dir = server.dir.clone();
     server.stop().await;
     std::fs::write(dir.join(SERVER_ID_FILE), "aaaaaaaaaaaaaaaa").unwrap();
+    // Any free port: the new client is given the address below. The old
+    // port may be taken by now, by any endpoint started meanwhile.
     let server = TestServer::start_with(
         dir,
         ServerOptions {
-            port: Some(port),
             name: "Somewhere else".into(),
             ..ServerOptions::default()
         },

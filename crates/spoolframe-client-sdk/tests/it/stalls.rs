@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use spoolframe_client_sdk::types::{ClientCapabilities, Platform};
 use spoolframe_client_sdk::{
-    Client, ConnectionState, Device, MemoryStorage, SdkError, Session, Timeouts,
+    Client, ClientOptions, ConnectionState, Device, MemoryStorage, SdkError, Session, Timeouts,
 };
 
 use crate::stub::Stub;
@@ -41,7 +41,12 @@ fn device() -> Device {
 }
 
 async fn client() -> Client {
-    Client::open_with(Arc::new(MemoryStorage::default()), device(), TIMEOUTS)
+    // Off the LAN: the stub is given by address.
+    let options = ClientOptions {
+        timeouts: TIMEOUTS,
+        lan_discovery: false,
+    };
+    Client::open_with_options(Arc::new(MemoryStorage::default()), device(), options)
         .await
         .unwrap()
 }

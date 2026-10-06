@@ -8,14 +8,14 @@ use spoolframe_admin_api::{
     AdminApiClient, DeviceEntry, NewUser, PathCheckRun, PathReport, Role, SsoLink, UserInfo,
 };
 
-use super::profile::{ConfirmItsYou, TrustDialog, asks_to_confirm};
+use super::profile::{ConfirmItsYou, DevicesLegend, TrustDialog, asks_to_confirm};
 use super::{Alert, Field, Route, icons, initial, now, role_name, rpc};
 use crate::logic::{
     AddUserError, ApiError, PathState, UserStatus, add_user_error, ago, avatar_class, client_kind,
     count, key_start, last_admin, path_state, plex_line, server_version, shared_devices,
     sign_in_methods, thousands, user_change_error, user_status, users_in_order,
 };
-use crate::trust::{self, Change, Question, Switch, Whose};
+use crate::trust::{self, Change, LegendLine, Question, Switch, Whose};
 
 async fn users() -> Result<Vec<UserInfo>, ApiError> {
     let client = rpc::client().await?;
@@ -1044,6 +1044,7 @@ fn UserDevices(
     ));
     // The dialogs and toasts call them by the name the page shows.
     let whose = Whose::Theirs(name.clone());
+    let legend_whose = whose.clone();
     let told = whose.clone();
     // The change whose question is open.
     let mut pending = use_signal(|| None::<DeviceChange>);
@@ -1108,8 +1109,58 @@ fn UserDevices(
             }
         },
     );
+    // The device whose "Delete …?" is open, by endpoint id and name; the
+    // one deleted again once "Confirm it's you" is done.
+    let mut deleting = use_signal(|| None::<(String, String)>);
+    let confirming_delete = use_signal(|| None::<String>);
+    let mut delete_again = use_signal(|| None::<(String, String)>);
+    let deleter = username.clone();
+    let delete_whose = Whose::Theirs(name.clone());
+    let delete = use_callback(move |(endpoint_id, device): (String, String)| {
+        let username = deleter.clone();
+        let whose = delete_whose.clone();
+        spawn(async move {
+            let deleted = async {
+                let client = rpc::client().await?;
+                client
+                    .user_forget_device(username, endpoint_id.clone())
+                    .await
+                    .map_err(rpc::error)
+            };
+            match deleted.await {
+                Ok(()) => say(toast, true, trust::forgotten(&device)),
+                Err(e) if asks_to_confirm(&e, confirming_delete, &trust::forget_about(&whose)) => {
+                    delete_again.set(Some((endpoint_id, device)));
+                }
+                Err(e) => say(toast, false, e.explain()),
+            }
+            devices.restart();
+            let mut devices_changed = devices_changed;
+            devices_changed += 1;
+        });
+    });
+    let asked_whose = Whose::Theirs(name.clone());
     let current = devices.read().clone();
     rsx! {
+        if let Some((endpoint_id, device)) = deleting() {
+            TrustDialog {
+                question: trust::forget_question(&device, &asked_whose),
+                on_yes: move |_| {
+                    deleting.set(None);
+                    delete.call((endpoint_id.clone(), device.clone()));
+                },
+                on_no: move |_| deleting.set(None),
+            }
+        }
+        ConfirmItsYou {
+            asking: confirming_delete,
+            on_confirmed: move |_| {
+                let asked = delete_again.write().take();
+                if let Some(asked) = asked {
+                    delete.call(asked);
+                }
+            },
+        }
         ConfirmItsYou {
             asking: confirming,
             on_confirmed: move |_| {
@@ -1134,7 +1185,7 @@ fn UserDevices(
         div { class: "section-head",
             h2 { "Devices" }
             span {
-                "PIN, Trusted and Auto-login per device. Trusted reopens {name}'s profile there without a password; auto-login opens it at start and turns its PIN off. Turning trust off also ends {name}'s sessions on that device. Changes ask you to confirm it's you if you signed in over 10 minutes ago."
+                "Turning trust off also ends {name}'s sessions on that device. Changes ask you to confirm it's you if you signed in over 10 minutes ago."
             }
         }
         match current {
@@ -1158,9 +1209,14 @@ fn UserDevices(
                             tr {
                                 th { "Device" }
                                 th { "Kind" }
-                                th { "PIN" }
-                                th { "Trusted" }
-                                th { "Auto-login" }
+                                for line in trust::legend(&legend_whose, has_pin) {
+                                    th {
+                                        key: "{line.term}",
+                                        title: "{line.text}",
+                                        aria_describedby: trust::legend_id(line.switch),
+                                        "{line.term}"
+                                    }
+                                }
                                 th {}
                             }
                         }
@@ -1171,7 +1227,14 @@ fn UserDevices(
                                     td { class: "quiet", "{client_kind(Some(&d.endpoint_id), d.platform)}" }
                                     DeviceSwitches { device: d.clone(), has_pin, cells: true, on_press: press }
                                     td { class: "end",
-                                        ClearPinButton { has_pin, name: name.clone(), on_clear }
+                                        span { class: "inline-flex items-center gap-2",
+                                            ClearPinButton { has_pin, name: name.clone(), on_clear }
+                                            DeleteButton {
+                                                device: device_name(&d),
+                                                on_delete: move |asked| deleting.set(Some(asked)),
+                                                endpoint_id: d.endpoint_id.clone(),
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1181,9 +1244,16 @@ fn UserDevices(
                 div { class: "flex flex-col gap-2.5 md:hidden",
                     for d in list {
                         div { key: "{d.endpoint_id}", class: "device-card",
-                            span { class: "row-what",
-                                b { "{device_name(&d)}" }
-                                span { class: "row-sub", "{client_kind(Some(&d.endpoint_id), d.platform)}" }
+                            div { class: "device-card-head",
+                                span { class: "row-what",
+                                    b { "{device_name(&d)}" }
+                                    span { class: "row-sub", "{client_kind(Some(&d.endpoint_id), d.platform)}" }
+                                }
+                                DeleteButton {
+                                    device: device_name(&d),
+                                    on_delete: move |asked| deleting.set(Some(asked)),
+                                    endpoint_id: d.endpoint_id.clone(),
+                                }
                             }
                             span { class: "device-switches",
                                 DeviceSwitches { device: d.clone(), has_pin, cells: false, on_press: press }
@@ -1194,6 +1264,8 @@ fn UserDevices(
                         div { ClearPinButton { has_pin, name: name.clone(), on_clear } }
                     }
                 }
+                // Under the table or the cards, what each column does.
+                DevicesLegend { whose: legend_whose.clone(), has_pin, browsers: false }
             },
         }
     }
@@ -1224,6 +1296,25 @@ fn ClearPinButton(has_pin: bool, name: String, on_clear: EventHandler<()>) -> El
     }
 }
 
+/// "Delete" (canvas v75): red words and a trash can, no border, quieter
+/// than the buttons beside it. Asks first, by `device`'s name.
+#[component]
+fn DeleteButton(
+    endpoint_id: String,
+    device: String,
+    on_delete: EventHandler<(String, String)>,
+) -> Element {
+    rsx! {
+        button {
+            class: "btn-delete",
+            aria_label: "Delete {device}",
+            onclick: move |_| on_delete.call((endpoint_id.clone(), device.clone())),
+            icons::Trash { size: 14 }
+            "Delete"
+        }
+    }
+}
+
 /// A device's three switches: table cells wide, labelled columns in a
 /// card on a phone.
 #[component]
@@ -1234,12 +1325,15 @@ fn DeviceSwitches(
     on_press: Callback<(Switch, DeviceEntry, String)>,
 ) -> Element {
     let name = device_name(&device);
+    // Only the copy's wording is read here: an admin's legend says "this
+    // user's", whoever they are.
+    let legend = trust::legend(&Whose::Theirs(String::new()), has_pin);
     rsx! {
-        for (switch, what, on) in [
-            (Switch::Pin, "PIN", device.pin_required),
-            (Switch::Trusted, "Trusted", device.trusted),
-            (Switch::AutoLogin, "Auto-login", device.auto_login),
-        ] {
+        for (LegendLine { switch, term: what, text }, on) in legend.into_iter().zip([
+            device.pin_required,
+            device.trusted,
+            device.auto_login,
+        ]) {
             {
                 let toggle = rsx! {
                     button {
@@ -1248,6 +1342,7 @@ fn DeviceSwitches(
                         role: "switch",
                         aria_checked: "{on}",
                         aria_label: "{what} on {name}",
+                        aria_describedby: trust::legend_id(switch),
                         disabled: !trust::can_press(switch, &device, has_pin),
                         title: device_switch_title(switch, &device, has_pin),
                         onclick: {
@@ -1263,7 +1358,13 @@ fn DeviceSwitches(
                     rsx! {
                         span { key: "{what}", class: "device-switch",
                             {toggle}
-                            span { class: "device-switch-label", aria_hidden: "true", "{what}" }
+                            span {
+                                class: "device-switch-label",
+                                aria_hidden: "true",
+                                title: "{text}",
+                                aria_describedby: trust::legend_id(switch),
+                                "{what}"
+                            }
                         }
                     }
                 }

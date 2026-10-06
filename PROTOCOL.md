@@ -17,7 +17,9 @@ later on one request:
   `bitmap: "auto"` change no encoding.
 
 What changed for the server id is in "The server id" below; what
-changed for picture subtitles is in "Picture subtitles".
+changed for picture subtitles is in "Picture subtitles". PX-15 made every
+field of every message required, in revision 5: see "Every field is
+required".
 
 Revision 4 (P4-01, trusted devices) set `PROTOCOL_VERSION` to 4.
 Revision 3 and older binaries cannot use this wire format. What changed
@@ -28,6 +30,30 @@ binaries cannot use that wire format either. Clients must explicitly select fore
 playback handle; see the migration examples below. Clients
 that depend directly on the protocol/types crates must update those
 packages together with the SDK.
+
+## Every field is required
+
+Since PX-15, a message must carry every field its type has. A field
+with no value is sent as `null` (CBOR `null`), never left out. A message
+that leaves out a field is refused: `Malformed` from the server, a
+decode error in the SDK. Before, about 20 fields had defaults, so a peer
+that left them out was read as if it sent `null`, `0`, `false` or `[]`.
+Among them were `Hello.device_name` and `capabilities`, each field of
+`ClientCapabilities` and `VideoLimits`, `RequestEnvelope.session`,
+`Selection`, `MediaRead.epoch` and `segment`, `MediaReadReply.complete`
+and `epoch`, the `markers` and `chosen` of replies, and
+`TrackPreferences` and its sections.
+
+`PROTOCOL_VERSION` stays 5. The server, the SDK and the Linux app send
+every field already, so their bytes do not change. Only a peer that
+builds messages by hand, and leaves a field out, must change. Unknown
+fields are still ignored, and unknown enum values still decode as
+`Unknown` (or the value the type names), so a newer peer can still add
+both.
+
+The admin API (JSON-RPC) is the same: every field is required, `null`
+for none, except an error object's `data`, which JSON-RPC 2.0 lets an
+error leave out.
 
 ## The server id
 
@@ -194,8 +220,9 @@ while it is sent.
 
 Some requests need a session that proved its user within the last 10
 minutes: `ApproveDeviceSignIn`, `BeginPasskeyRegistration`,
-`RemovePasskey`, `SetPinRequired` with `required: false`, and
-`SetDeviceTrust` except to stop trusting this device. An older
+`RemovePasskey`, `SetPinRequired` with `required: false`,
+`SetDeviceTrust` except to stop trusting this device, and
+`ForgetDevice`. An older
 session gets `RecentSignInRequired`. The app then asks its user to
 confirm, and sends the request again. It does not sign out.
 
@@ -428,6 +455,33 @@ Trust never lasts longer than what it would bypass:
 
 Expiry of a session does not end trust. That is the purpose of trust.
 
+### Deleting a device
+
+`ForgetDevice` (P4-03) is an added request. `PROTOCOL_VERSION` stays 5.
+
+| Request | Reply |
+|---|---|
+| `{"type": "forget_device", "device": "<endpoint id>"}` | `Done` |
+
+`device` is an endpoint id from `Devices`, and it is required. The
+server deletes the user's sessions on that device, live or revoked, and
+the device's trust and PIN requirement for the user. The device leaves
+`Devices`. If it signs in again, it is a new device. These rules apply:
+
+- It needs a session, and a locked profile gets `ProfileLocked`.
+- It is a mutation, so it carries an operation ID and is not retried.
+- It always needs a recent sign-in (`RecentSignInRequired`).
+- This device gets `InvalidInput`. To leave this device, send `Logout`.
+- A device that is not the user's gets `NotFound`.
+- Other users' sessions, trust and PIN requirement on that device stay.
+  The server closes the device's connection with `SIGNED_OUT` only when
+  no user's session is left on it.
+
+The web UI sends `me.forgetDevice(endpointId)`, and an admin sends
+`admin.userForgetDevice(username, endpointId)`. Both always need a
+recent sign-in (`RECENT_SIGN_IN_REQUIRED`). A device the user never
+signed in on gets `NO_SUCH_DEVICE`.
+
 `DeviceInfo` (`ListDevices`) has two new fields, `trusted` and
 `auto_login`.
 
@@ -446,6 +500,9 @@ Expiry of a session does not end trust. That is the purpose of trust.
   this device's trust off, the SDK also forgets this session. The profile
   stays in `saved_profiles`.
 - `Session::approve_device_sign_in(code, remember)`.
+- `Session::forget_device(device)` deletes another of the user's devices
+  (P4-03). For this device it returns `SdkError::InvalidInput`: use
+  `Session::sign_out`.
 
 ## Server addresses
 
@@ -531,6 +588,31 @@ Revision 5 (PX-14) covers it: a mismatched build is now refused at
 `Hello`. Update the server and SDK together. The SDK's `Session::track_preferences` returns
 `TrackPreferencesInfo`; read `.preferences` where the bare preferences
 were used.
+
+## Home rows and "Remove"
+
+`Home` shows a show in one row only. While an episode of a show is in
+progress, that episode is in Continue watching and the show has nothing
+in Next up. When the user finishes the episode, the next episode goes to
+Next up.
+
+`HideFromContinueWatching { id }` removes one card: the movie or the
+episode named by `id`. It removes the card from Continue watching or from
+Next up, wherever it is. It does not remove the episode's show. Send the
+card's own `id`, never its show's. `UnhideFromContinueWatching { id }`
+puts that card back.
+
+- The show's other episodes stay on Home.
+- A removed Next up episode stays out until the user watches it. Then
+  the episode after it goes to Next up.
+- A removed episode in progress does not keep its show out of Next up.
+- Playing or marking the removed item brings it back. Playing another
+  episode of the show does not.
+
+Before, removing an episode hid its whole show from both rows. The
+encoding did not change, so `PROTOCOL_VERSION` stays the same. The
+server drops the hides it stored per show (migration 0015), so those
+shows come back once.
 
 ## SDK migration in 0.3.0
 

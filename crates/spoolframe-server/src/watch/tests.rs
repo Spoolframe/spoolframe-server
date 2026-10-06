@@ -595,28 +595,151 @@ async fn playing_a_hidden_movie_brings_it_back() {
     );
 }
 
+/// Removing an episode removes that card only: playing another episode of
+/// the show does not bring it back, as playing it does.
 #[tokio::test]
-async fn a_hidden_episode_hides_its_show_until_an_episode_is_played() {
-    let h = harness("hide-show").await;
+async fn a_removed_episode_stays_removed_when_another_episode_is_played() {
+    let h = harness("hide-episode").await;
     let watched = episode("12", "11", 1, 1).id().clone();
     let started = episode("13", "11", 1, 2).id().clone();
     h.mark(h.alice, &watched, true).await;
     h.progress(h.alice, &started, 300).await;
-    let before = h.home(h.alice).await;
-    assert_eq!(ids(&before.continue_watching), [started.to_string()]);
-    assert!(!before.next_up.is_empty());
-
     h.hide(h.alice, &started).await;
     let hidden = h.home(h.alice).await;
     assert!(hidden.continue_watching.is_empty());
-    assert!(hidden.next_up.is_empty());
     // Recently added is not Continue watching.
     assert!(!hidden.recently_added.is_empty());
 
-    // Another episode of the show, marked: the show is back.
     h.mark(h.alice, &watched, true).await;
-    let back = h.home(h.alice).await;
-    assert_eq!(ids(&back.continue_watching), [started.to_string()]);
+    assert!(h.home(h.alice).await.continue_watching.is_empty());
+}
+
+/// Lanterns S1E8 and Banshee S3E9, on the user's server: the episode after
+/// the one watched is started, and was in both rows.
+#[tokio::test]
+async fn an_episode_in_progress_is_in_continue_watching_and_not_in_next_up() {
+    let h = harness("one-row-started").await;
+    h.mark(h.alice, episode("12", "11", 1, 1).id(), true).await;
+    let started = episode("13", "11", 1, 2).id().clone();
+    h.progress(h.alice, &started, 300).await;
+    let home = h.home(h.alice).await;
+    assert_eq!(ids(&home.continue_watching), [started.to_string()]);
+    assert!(home.next_up.is_empty(), "{:?}", ids(&home.next_up));
+}
+
+/// Vigil, on the user's server: S2E3 in progress, and Next up showed S1E2,
+/// the episode after an older one watched.
+#[tokio::test]
+async fn a_show_with_a_later_episode_in_progress_has_nothing_in_next_up() {
+    let h = harness("one-row-later").await;
+    h.mark(h.alice, episode("12", "11", 1, 1).id(), true).await;
+    h.progress(h.alice, episode("15", "14", 2, 1).id(), 300)
+        .await;
+    assert!(h.home(h.alice).await.next_up.is_empty());
+}
+
+#[tokio::test]
+async fn finishing_the_episode_in_progress_puts_the_next_one_in_next_up() {
+    let h = harness("one-row-finished").await;
+    h.mark(h.alice, episode("12", "11", 1, 1).id(), true).await;
+    let started = episode("13", "11", 1, 2).id().clone();
+    h.progress(h.alice, &started, 300).await;
+    assert!(h.home(h.alice).await.next_up.is_empty());
+    // Probed as 1309.472 s: watched at 95%.
+    h.progress(h.alice, &started, 1300).await;
+    let home = h.home(h.alice).await;
+    assert!(home.continue_watching.is_empty());
+    assert_eq!(ids(&home.next_up), ["plex:episode:15"]);
+}
+
+/// More items in progress than Continue watching shows: a show whose
+/// episode in progress is past the row is still kept out of Next up.
+#[tokio::test]
+async fn a_show_in_progress_past_the_row_is_kept_out_of_next_up() {
+    let h = harness("one-row-past-the-row").await;
+    h.mark(h.alice, episode("12", "11", 1, 1).id(), true).await;
+    h.progress(h.alice, episode("15", "14", 2, 1).id(), 300)
+        .await;
+    // updated_at has one-second resolution.
+    h.clock.advance(Duration::from_secs(1));
+    for n in 0..ROW {
+        let media_id = format!("plex:movie:{}", 100 + n);
+        h.store
+            .save_watch(
+                h.alice,
+                WatchUpdate {
+                    media_id: &media_id,
+                    show_id: None,
+                    external_ids: &[],
+                    position_ms: Some(600_000),
+                    duration_ms: Some(7_000_000),
+                    watched: false,
+                    unhide: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert!(h.home(h.alice).await.next_up.is_empty());
+}
+
+/// "Remove" on a Next up card removes that episode, not the show; once it
+/// is watched, the one after it is next up.
+#[tokio::test]
+async fn removing_a_next_up_episode_removes_only_that_episode() {
+    let h = harness("hide-next-up").await;
+    h.mark(h.alice, episode("12", "11", 1, 1).id(), true).await;
+    let next = episode("13", "11", 1, 2).id().clone();
+    assert_eq!(ids(&h.home(h.alice).await.next_up), [next.to_string()]);
+    h.hide(h.alice, &next).await;
+    assert!(h.home(h.alice).await.next_up.is_empty());
+    assert_eq!(
+        h.store.hidden(h.alice).await.unwrap(),
+        [next.to_string()].into()
+    );
+
+    h.mark(h.alice, &next, true).await;
+    assert_eq!(ids(&h.home(h.alice).await.next_up), ["plex:episode:15"]);
+}
+
+/// "Remove" on a Continue watching episode removes that card: another
+/// episode of the show in progress stays, and playing the removed one
+/// brings it back.
+#[tokio::test]
+async fn removing_an_episode_in_progress_leaves_the_show_s_others() {
+    let h = harness("hide-in-progress").await;
+    let first = episode("13", "11", 1, 2).id().clone();
+    let second = episode("15", "14", 2, 1).id().clone();
+    h.progress(h.alice, &first, 300).await;
+    // updated_at has one-second resolution.
+    h.clock.advance(Duration::from_secs(1));
+    h.progress(h.alice, &second, 300).await;
+    h.hide(h.alice, &first).await;
+    assert_eq!(
+        ids(&h.home(h.alice).await.continue_watching),
+        [second.to_string()]
+    );
+
+    // Within the write throttle: not written, but played.
+    h.progress(h.alice, &first, 310).await;
+    assert_eq!(
+        ids(&h.home(h.alice).await.continue_watching),
+        [second.to_string(), first.to_string()]
+    );
+}
+
+/// Only a card that shows keeps its show out of Next up.
+#[tokio::test]
+async fn a_removed_episode_in_progress_does_not_keep_its_show_out_of_next_up() {
+    let h = harness("hide-in-progress-next-up").await;
+    let started = episode("15", "14", 2, 1).id().clone();
+    h.progress(h.alice, &started, 300).await;
+    h.hide(h.alice, &started).await;
+    h.clock.advance(Duration::from_secs(1));
+    h.mark(h.alice, episode("12", "11", 1, 1).id(), true).await;
+    let home = h.home(h.alice).await;
+    assert!(home.continue_watching.is_empty());
+    assert_eq!(ids(&home.next_up), ["plex:episode:13"]);
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use spoolframe_client_sdk::types::{ClientCapabilities, Platform};
-use spoolframe_client_sdk::{Client, Device, MemoryStorage, Timeouts};
+use spoolframe_client_sdk::{Client, ClientOptions, Device, MemoryStorage, Timeouts};
 
 use crate::stub::Stub;
 
@@ -26,12 +26,15 @@ fn device() -> Device {
 async fn given(sent: &str) -> (Option<String>, Option<String>) {
     let stub = Stub::start().await;
     stub.web_url(sent);
-    let client = Client::open_with(
+    let client = Client::open_with_options(
         Arc::new(MemoryStorage::default()),
         device(),
-        Timeouts {
-            request: Duration::from_secs(5),
-            ping: Duration::from_secs(1),
+        ClientOptions {
+            timeouts: Timeouts {
+                request: Duration::from_secs(5),
+                ping: Duration::from_secs(1),
+            },
+            lan_discovery: false,
         },
     )
     .await

@@ -22,7 +22,7 @@ use crate::preferences::{
     override_line, picture_row, subtitle_choices,
 };
 use crate::sso::Tone;
-use crate::trust::{self, Change, Icon, Question, Row, Switch, Whose};
+use crate::trust::{self, Change, Icon, LegendLine, Question, Row, Switch, Whose};
 
 #[component]
 pub fn Profile() -> Element {
@@ -1200,7 +1200,38 @@ fn DevicesAndSessions(has_pin: Signal<bool>) -> Element {
             list.restart();
         });
     };
+    // The device whose "Delete …?" is open, by endpoint id and name; the
+    // one deleted again once "Confirm it's you" is done.
+    let mut deleting = use_signal(|| None::<(String, String)>);
+    let confirming_delete = use_signal(|| None::<String>);
+    let mut delete_again = use_signal(|| None::<(String, String)>);
+    let delete = use_callback(move |(endpoint_id, name): (String, String)| {
+        spawn(async move {
+            let deleted = async {
+                let client = rpc::client().await?;
+                client
+                    .forget_device(endpoint_id.clone())
+                    .await
+                    .map_err(rpc::error)
+            };
+            match deleted.await {
+                Ok(()) => say(toast, true, trust::forgotten(&name)),
+                Err(e)
+                    if asks_to_confirm(
+                        &e,
+                        confirming_delete,
+                        &trust::forget_about(&Whose::Mine),
+                    ) =>
+                {
+                    delete_again.set(Some((endpoint_id, name)));
+                }
+                Err(e) => say(toast, false, e.explain()),
+            }
+            list.restart();
+        });
+    });
     let current = list.read().clone();
+    let legend = trust::legend(&Whose::Mine, has_pin());
     rsx! {
         section { class: "card",
             div { class: "card-head",
@@ -1220,9 +1251,14 @@ fn DevicesAndSessions(has_pin: Signal<bool>) -> Element {
                             div { class: "device-head", "aria-hidden": "true",
                                 span { "Device" }
                                 span { class: "device-switches",
-                                    span { "PIN" }
-                                    span { "Trusted" }
-                                    span { "Auto-login" }
+                                    for line in legend.iter().cloned() {
+                                        span {
+                                            key: "{line.term}",
+                                            title: "{line.text}",
+                                            aria_describedby: trust::legend_id(line.switch),
+                                            "{line.term}"
+                                        }
+                                    }
                                 }
                                 span {}
                             }
@@ -1233,16 +1269,19 @@ fn DevicesAndSessions(has_pin: Signal<bool>) -> Element {
                                     has_pin: has_pin(),
                                     on_press: press,
                                     on_sign_out: sign_out,
+                                    on_delete: move |asked| deleting.set(Some(asked)),
                                 }
                             }
                         }
                         }
                     },
                 }
-                // WebProfile's footnote: what trust and auto-login mean,
-                // and when a change asks to confirm it's you.
+                // Where WebProfile has its footnote: what each column does,
+                // why a browser has none, and when a change asks to
+                // confirm it's you.
+                DevicesLegend { whose: Whose::Mine, has_pin: has_pin(), browsers: true }
                 p { class: "device-footnote",
-                    "A trusted device reopens your profile without a password, until you sign out there or it goes unused for 180 days. Auto-login opens your profile when the app starts, and turns its PIN off there. Changes here ask you to confirm it's you if you signed in over 10 minutes ago."
+                    "Changes here ask you to confirm it's you if you signed in over 10 minutes ago."
                 }
             }
         }
@@ -1263,6 +1302,25 @@ fn DevicesAndSessions(has_pin: Signal<bool>) -> Element {
                 let change = again.write().take();
                 if let Some(change) = change {
                     make.call(change);
+                }
+            },
+        }
+        if let Some((endpoint_id, name)) = deleting() {
+            TrustDialog {
+                question: trust::forget_question(&name, &Whose::Mine),
+                on_yes: move |_| {
+                    deleting.set(None);
+                    delete.call((endpoint_id.clone(), name.clone()));
+                },
+                on_no: move |_| deleting.set(None),
+            }
+        }
+        ConfirmItsYou {
+            asking: confirming_delete,
+            on_confirmed: move |_| {
+                let asked = delete_again.write().take();
+                if let Some(asked) = asked {
+                    delete.call(asked);
                 }
             },
         }
@@ -1298,6 +1356,7 @@ fn DeviceRow(
     has_pin: bool,
     on_press: Callback<(Switch, DeviceEntry, String)>,
     on_sign_out: EventHandler<(Vec<SessionEntry>, String, bool)>,
+    on_delete: EventHandler<(String, String)>,
 ) -> Element {
     let (name, line) = match &row.device {
         Some(device) => {
@@ -1327,6 +1386,7 @@ fn DeviceRow(
     };
     let current = row.current();
     let trusted = row.device.as_ref().is_some_and(|d| d.trusted);
+    let legend = trust::legend(&Whose::Mine, has_pin);
     rsx! {
         div { class: "device-row",
             span { class: "row-what device-what",
@@ -1336,11 +1396,11 @@ fn DeviceRow(
             match &row.device {
                 Some(device) => rsx! {
                     span { class: "device-switches",
-                        for (switch, what, on) in [
-                            (Switch::Pin, "PIN", device.pin_required),
-                            (Switch::Trusted, "Trusted", device.trusted),
-                            (Switch::AutoLogin, "Auto-login", device.auto_login),
-                        ] {
+                        for (LegendLine { switch, term: what, text }, on) in legend.into_iter().zip([
+                            device.pin_required,
+                            device.trusted,
+                            device.auto_login,
+                        ]) {
                             span { class: "device-switch", key: "{what}",
                                 button {
                                     class: "switch",
@@ -1348,6 +1408,7 @@ fn DeviceRow(
                                     role: "switch",
                                     aria_checked: "{on}",
                                     aria_label: "{what} on {name}",
+                                    aria_describedby: trust::legend_id(switch),
                                     disabled: !trust::can_press(switch, device, has_pin),
                                     title: switch_title(switch, device, has_pin),
                                     onclick: {
@@ -1356,7 +1417,13 @@ fn DeviceRow(
                                         move |_| on_press.call((switch, device.clone(), name.clone()))
                                     },
                                 }
-                                span { class: "device-switch-label", aria_hidden: "true", "{what}" }
+                                span {
+                                    class: "device-switch-label",
+                                    aria_hidden: "true",
+                                    title: "{text}",
+                                    aria_describedby: trust::legend_id(switch),
+                                    "{what}"
+                                }
                             }
                         }
                     }
@@ -1367,7 +1434,7 @@ fn DeviceRow(
                             span { class: "device-switch", key: "{what}", "—" }
                         }
                     }
-                    span { class: "device-note", "A browser can't be trusted or open by itself." }
+                    span { class: "device-note", "{trust::BROWSER_NOTE}" }
                 },
             }
             span { class: "device-do",
@@ -1384,6 +1451,43 @@ fn DeviceRow(
                         },
                         "Sign out"
                     }
+                }
+                if let Some(device) = row.device.as_ref().filter(|_| row.can_forget()) {
+                    button {
+                        class: "btn-delete",
+                        aria_label: "Delete {name}",
+                        onclick: {
+                            let asked = (device.endpoint_id.clone(), name.clone());
+                            move |_| on_delete.call(asked.clone())
+                        },
+                        icons::Trash { size: 14 }
+                        "Delete"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The legend under a page's device switches (P4-03), where WebProfile
+/// has its footnote: each column's name in bold and what it does. Each
+/// column head, phone label and switch names its line as their
+/// description. With `browsers`, a last line says why a browser's row has
+/// no switches, which a wide row shows only as dashes.
+#[component]
+pub(super) fn DevicesLegend(whose: Whose, has_pin: bool, browsers: bool) -> Element {
+    rsx! {
+        dl { class: "device-legend",
+            for line in trust::legend(&whose, has_pin) {
+                div { key: "{line.term}",
+                    dt { "{line.term}" }
+                    dd { id: trust::legend_id(line.switch), "{line.text}" }
+                }
+            }
+            if browsers {
+                div {
+                    dt { "—" }
+                    dd { "{trust::BROWSER_NOTE}" }
                 }
             }
         }
@@ -1415,11 +1519,18 @@ pub(super) fn TrustDialog(
             section { class: "dialog w-[440px]", role: "dialog",
                 // Taking trust away is a yellow shield on the board, not red:
                 // nothing is lost that a sign-in cannot bring back.
-                div { class: if question.danger { "dialog-head dialog-head-warn" } else { "dialog-head" },
+                // Deleting is red: the device is forgotten, not just signed out.
+                div {
+                    class: match (question.icon, question.danger) {
+                        (Icon::Delete, _) => "dialog-head dialog-head-danger",
+                        (_, true) => "dialog-head dialog-head-warn",
+                        (_, false) => "dialog-head",
+                    },
                     match question.icon {
                         Icon::Start => rsx! { icons::Play { size: 22 } },
                         Icon::Pin => rsx! { icons::Lock { size: 22 } },
                         Icon::Untrust => rsx! { icons::ShieldAlert { size: 22 } },
+                        Icon::Delete => rsx! { icons::Trash { size: 22 } },
                     }
                     h1 { "{question.title}" }
                 }

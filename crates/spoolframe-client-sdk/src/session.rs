@@ -809,6 +809,25 @@ impl Session {
         Ok(())
     }
 
+    /// Delete another of this user's devices (an endpoint id from
+    /// [`Session::devices`]; P4-03): their sessions there end and are
+    /// forgotten, with its trust and PIN requirement, and it leaves
+    /// [`Session::devices`]. If it signs in again it is listed as new.
+    /// Other profiles on that device are kept.
+    ///
+    /// - Always needs a recent sign-in ([`SdkError::RecentSignInRequired`]:
+    ///   confirm it is them with [`Session::confirm_password`] or
+    ///   [`Session::begin_confirm_passkey`], then call again).
+    /// - This device is [`SdkError::InvalidInput`]: use
+    ///   [`Session::sign_out`].
+    /// - A device that is not this user's is [`SdkError::NotFound`].
+    pub async fn forget_device(&self, device: &str) -> Result<(), SdkError> {
+        self.done(Request::ForgetDevice {
+            device: device.to_owned(),
+        })
+        .await
+    }
+
     /// Ask for this user's PIN on `device` (an endpoint id from
     /// [`Session::devices`]; this device for `None`), or stop asking.
     pub async fn set_pin_required(
@@ -1271,10 +1290,11 @@ impl Session {
         self.done(Request::MarkUnwatched { id: id.clone() }).await
     }
 
-    /// "Remove from Continue watching" (P1-22): `id` leaves this user's
-    /// Continue watching, an episode's show leaves Next up too, and its
-    /// progress and watched state stay. Playing or marking it brings it
-    /// back.
+    /// "Remove from Continue watching" or "Next up" (P1-22): the card
+    /// `id`, a movie or an episode, leaves this user's Home, and its
+    /// progress and watched state stay. Only that card: the show's other
+    /// episodes stay. Pass the card's own id, not its show's. Playing or
+    /// marking it brings it back.
     pub async fn hide_from_continue(&self, id: &MediaId) -> Result<(), SdkError> {
         self.done(Request::HideFromContinueWatching { id: id.clone() })
             .await

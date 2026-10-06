@@ -10,10 +10,10 @@ use spoolframe_types::{AudioCodec, Container, Delivery, SubtitleFormat, VideoCod
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selection {
     /// `None`: the file's default audio track.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub audio: Option<u32>,
     /// `None`: no subtitles.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub subtitle: Option<u32>,
 }
 

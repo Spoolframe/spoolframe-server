@@ -1,0 +1,74 @@
+# Fuzzing
+
+The fuzz targets (PX-10) feed random and mutated input to the code that reads
+what Spoolframe does not control: frames and CBOR from a peer, subtitle tracks
+in a user's files, ffprobe's description of a file, and what a Plex Media Server
+sends.
+
+They use [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) and libFuzzer,
+with AddressSanitizer and debug assertions on. cargo-fuzz needs a nightly
+compiler. The rest of Spoolframe builds on stable, so the targets are a
+workspace of their own in `fuzz/`, and `fuzz/toolchain.nix` supplies the
+nightly compiler, cargo-fuzz and a C++ compiler for libFuzzer. You do not need
+the dev shell to fuzz.
+
+## Targets
+
+| target | reads | code |
+|---|---|---|
+| `protocol_frame` | a stream: a frame (length, then CBOR), a multipart RPC reply | `spoolframe-protocol` `codec.rs` |
+| `protocol_cbor` | a CBOR payload as `RpcRequest`, `RpcResponse`, `ResourceRequest`, `ResourceResponse`; a decoded request must encode and decode back to itself | `codec.rs`, `rpc.rs`, `resource.rs` |
+| `pgs` | a PGS (`.sup`) stream | `spoolframe-media` `pgs.rs` |
+| `dvb` | a DVB subtitle track's packets | `spoolframe-media` `dvb.rs` |
+| `vobsub` | a VobSub track: its `.idx` header and packets | `spoolframe-media` `vobsub.rs` |
+| `bif` | a PMS preview index (BIF) | `spoolframe-plex` `bif.rs` |
+| `plex_json` | a PMS JSON response, decoded and converted to items | `spoolframe-plex` `wire.rs`, `convert.rs` |
+| `ffprobe_json` | ffprobe's JSON for a file, made into a `MediaDescriptor` | `spoolframe-media` `descriptor.rs` |
+
+The `dvb` and `vobsub` inputs are packets framed as `u16 LE length, u32 LE pts
+in ms, data`. A VobSub input starts with a `u16 LE` length and that much `.idx`
+header. `fuzz/src/lib.rs` has the framing. `spoolframe-plex` builds its private
+parsers into the targets only with its `fuzzing` feature.
+
+## Running
+
+```sh
+scripts/fuzz.sh                 # every target, 60 s each
+scripts/fuzz.sh 3600 pgs dvb    # an hour each, on two targets
+FUZZ_FLAGS="-jobs=8 -workers=8" scripts/fuzz.sh 3600 protocol_cbor
+```
+
+Each target starts from its seeds in `fuzz/seeds/TARGET/` and, for `bif`,
+`plex_json` and `ffprobe_json`, from its crate's test fixtures. It grows its
+corpus in `fuzz/corpus/TARGET/`. A crash goes to `fuzz/artifacts/TARGET/`, and
+the script exits 1 after it runs the other targets. The corpus and the
+artifacts are not tracked.
+
+To reproduce a crash, and to make an input smaller:
+
+```sh
+nix shell --impure -f fuzz/toolchain.nix -c bash -c \
+  'cd fuzz && cargo fuzz run TARGET artifacts/TARGET/crash-…'
+nix shell --impure -f fuzz/toolchain.nix -c bash -c \
+  'cd fuzz && cargo fuzz tmin TARGET artifacts/TARGET/crash-…'
+```
+
+Fix a crash with a regression test in the crate that owns the code, red first,
+with the smallest input that shows it. Do not add crash inputs to `fuzz/seeds/`.
+
+## Seeds
+
+`fuzz/seeds/` holds small inputs only. `cargo run --example seeds`, run in
+`fuzz/` in the dev shell (it needs ffmpeg), writes them again: protocol
+messages, a two-cue PGS stream (whole, and split into fragments), and the same
+cues encoded by ffmpeg's `dvbsub` and `dvdsub` encoders and read back as the
+server reads a track.
+
+## Pins
+
+`fuzz/toolchain.nix` pins nixpkgs and rust-overlay to the revisions that
+`devenv.lock` had when it was written, so a campaign gets the same nightly
+each time. Move the pins with `devenv.lock` when the nightly must change.
+`fuzz/Cargo.lock` is tracked, and `scripts/check-licenses.sh` checks the fuzz
+workspace against `deny.toml`. libFuzzer is under NCSA, which is allowed for
+`libfuzzer-sys` only.

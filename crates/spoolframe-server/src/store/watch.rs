@@ -28,9 +28,9 @@ pub struct WatchUpdate<'a> {
     pub position_ms: Option<i64>,
     pub duration_ms: Option<i64>,
     pub watched: bool,
-    /// Clear a "removed from Continue watching" for the item or its show
-    /// (P1-22): the user played or marked it. Not for state taken from
-    /// elsewhere (PX-04): hides are this server's own.
+    /// Clear a "removed from Continue watching" for the item (P1-22): the
+    /// user played or marked it. Not for state taken from elsewhere
+    /// (PX-04): hides are this server's own.
     pub unhide: bool,
 }
 
@@ -90,15 +90,16 @@ impl Store {
             .await?;
         }
         if update.unhide {
-            clear_hidden(&mut tx, &principal, update.media_id, update.show_id).await?;
+            clear_hidden(&mut tx, &principal, update.media_id).await?;
         }
         tx.commit().await?;
         Ok(())
     }
 
-    /// Remove `media_id` (a movie, or an episode's show) from `principal`'s
-    /// Continue watching and Next up, until its watch state changes
-    /// (P1-22). `external_ids` let the hide follow the item to a new key.
+    /// Remove `media_id` (a movie or an episode: the card, never a show)
+    /// from `principal`'s Continue watching and Next up, until its watch
+    /// state changes (P1-22). `external_ids` let the hide follow the item
+    /// to a new key.
     pub async fn hide_continue(
         &self,
         principal: Principal,
@@ -139,18 +140,17 @@ impl Store {
         media_id: &str,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        clear_hidden(&mut tx, &principal.to_string(), media_id, None).await?;
+        clear_hidden(&mut tx, &principal.to_string(), media_id).await?;
         tx.commit().await?;
         Ok(())
     }
 
-    /// Clear the hide of `media_id` or its show without a state written:
-    /// progress within the write throttle still counts as playing it.
+    /// Clear the hide of `media_id` without a state written: progress
+    /// within the write throttle still counts as playing it.
     pub async fn clear_hidden(
         &self,
         principal: Principal,
         media_id: &str,
-        show_id: Option<&str>,
     ) -> Result<(), StoreError> {
         // Throttled progress reports usually have nothing to clear. A
         // DELETE, even of no rows, would still acquire SQLite's writer.
@@ -158,23 +158,23 @@ impl Store {
         // next progress report, without an in-memory invalidation cache.
         let hidden: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM continue_hidden \
-             WHERE principal = ?1 AND media_id IN (?2, ?3))",
+             WHERE principal = ?1 AND media_id = ?2)",
         )
         .bind(principal.to_string())
         .bind(media_id)
-        .bind(show_id)
         .fetch_one(&self.pool)
         .await?;
         if !hidden {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
-        clear_hidden(&mut tx, &principal.to_string(), media_id, show_id).await?;
+        clear_hidden(&mut tx, &principal.to_string(), media_id).await?;
         tx.commit().await?;
         Ok(())
     }
 
-    /// What `principal` removed from Continue watching.
+    /// What `principal` removed from Continue watching or Next up: the
+    /// MediaIds of those cards.
     pub async fn hidden(&self, principal: Principal) -> Result<HashSet<String>, StoreError> {
         let ids: Vec<String> =
             sqlx::query_scalar("SELECT media_id FROM continue_hidden WHERE principal = ?1")
@@ -366,6 +366,35 @@ impl Store {
         .await?)
     }
 
+    /// The episodes of `show_ids` started (position at least
+    /// `min_position_ms`) and not watched, whatever their number: what
+    /// keeps a show out of Next up, past Continue watching's length too.
+    pub async fn in_progress_in_shows(
+        &self,
+        principal: Principal,
+        min_position_ms: i64,
+        show_ids: &[String],
+    ) -> Result<Vec<WatchRow>, StoreError> {
+        if show_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT media_id, show_id, position_ms, duration_ms, watched, updated_at \
+             FROM watch_state WHERE watched = 0 AND principal = ",
+        );
+        query
+            .push_bind(principal.to_string())
+            .push(" AND position_ms >= ")
+            .push_bind(min_position_ms)
+            .push(" AND show_id IN (");
+        let mut ids = query.separated(", ");
+        for id in show_ids {
+            ids.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.pool).await?)
+    }
+
     /// Every user's started and unwatched items, the most recently played
     /// first, each once: what frame previews are made for first (P3-13).
     pub async fn in_progress_anyone(&self, limit: u32) -> Result<Vec<String>, StoreError> {
@@ -423,12 +452,10 @@ async fn clear_hidden(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     principal: &str,
     media_id: &str,
-    show_id: Option<&str>,
 ) -> Result<(), StoreError> {
-    sqlx::query("DELETE FROM continue_hidden WHERE principal = ?1 AND media_id IN (?2, ?3)")
+    sqlx::query("DELETE FROM continue_hidden WHERE principal = ?1 AND media_id = ?2")
         .bind(principal)
         .bind(media_id)
-        .bind(show_id)
         .execute(&mut **tx)
         .await?;
     Ok(())
@@ -453,7 +480,7 @@ mod tests {
             .unwrap();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            store.clear_hidden(ALICE, "plex:episode:1", Some("plex:show:7")),
+            store.clear_hidden(ALICE, "plex:episode:1"),
         )
         .await
         .expect("a no-op clear tried to acquire the writer")
@@ -461,13 +488,10 @@ mod tests {
         sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
         // A later hide must still be cleared on the next progress report.
         store
-            .hide_continue(ALICE, "plex:show:7", &[])
+            .hide_continue(ALICE, "plex:episode:1", &[])
             .await
             .unwrap();
-        store
-            .clear_hidden(ALICE, "plex:episode:1", Some("plex:show:7"))
-            .await
-            .unwrap();
+        store.clear_hidden(ALICE, "plex:episode:1").await.unwrap();
         assert!(store.hidden(ALICE).await.unwrap().is_empty());
     }
 
@@ -484,30 +508,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hide_is_per_principal_and_cleared_by_a_write_for_it_or_its_show() {
+    async fn a_hide_is_per_principal_and_cleared_by_a_write_for_that_item_only() {
         let store = store("hidden").await;
-        store
-            .hide_continue(ALICE, "plex:movie:1", &[])
-            .await
-            .unwrap();
-        store
-            .hide_continue(ALICE, "plex:show:7", &[])
-            .await
-            .unwrap();
-        assert_eq!(store.hidden(ALICE).await.unwrap().len(), 2);
+        for id in ["plex:movie:1", "plex:episode:70", "plex:episode:71"] {
+            store.hide_continue(ALICE, id, &[]).await.unwrap();
+        }
+        assert_eq!(store.hidden(ALICE).await.unwrap().len(), 3);
         assert!(store.hidden(BOB).await.unwrap().is_empty());
 
         store
             .save_watch(ALICE, at("plex:movie:1", 120_000, &[]))
             .await
             .unwrap();
-        // An episode of the show clears the show.
+        // Another episode of the same show leaves 71 hidden.
         let episode = WatchUpdate {
             show_id: Some("plex:show:7"),
             ..at("plex:episode:70", 120_000, &[])
         };
         store.save_watch(ALICE, episode).await.unwrap();
-        assert!(store.hidden(ALICE).await.unwrap().is_empty());
+        assert_eq!(
+            store.hidden(ALICE).await.unwrap(),
+            ["plex:episode:71".to_owned()].into()
+        );
     }
 
     #[tokio::test]
@@ -550,6 +572,63 @@ mod tests {
 
     async fn store(test: &str) -> TestStore {
         test_store(test).await
+    }
+
+    /// Before migration 0015 a removed episode hid its show, stored under
+    /// the show's id. Those hides are dropped, so the show comes back; a
+    /// movie's and an episode's own stay.
+    #[tokio::test]
+    async fn the_migration_drops_the_hides_of_shows() {
+        let dir = super::super::tests::state_dir("hidden-per-card").await;
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.as_ref().join(super::super::DB_FILE))
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = sqlx::pool::PoolOptions::<Sqlite>::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let mut before = sqlx::migrate!("./migrations");
+        before.migrations = before
+            .iter()
+            .filter(|m| m.version < 15)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        before.run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO continue_hidden (principal, media_id, hidden_at) \
+               VALUES ('local:a', 'plex:show:7', 1), ('local:a', 'plex:movie:1', 2), \
+                      ('local:b', 'plex:episode:70', 3); \
+             INSERT INTO continue_hidden_ids (principal, media_id, external_id) \
+               VALUES ('local:a', 'plex:show:7', 'tvdb://7'), \
+                      ('local:a', 'plex:movie:1', 'imdb://tt1');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let store = Store::open(dir.as_ref()).await.unwrap();
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT principal, media_id FROM continue_hidden ORDER BY media_id")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        let ids: Vec<String> = sqlx::query_scalar("SELECT external_id FROM continue_hidden_ids")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        store.pool.close().await;
+        assert_eq!(
+            rows,
+            [
+                ("local:b".to_owned(), "plex:episode:70".to_owned()),
+                ("local:a".to_owned(), "plex:movie:1".to_owned()),
+            ]
+        );
+        assert_eq!(ids, ["imdb://tt1"]);
     }
 
     #[tokio::test]

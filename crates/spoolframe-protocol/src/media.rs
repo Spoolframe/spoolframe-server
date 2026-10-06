@@ -42,16 +42,14 @@ pub struct MediaRead {
     pub length: u64,
     /// The encode this read is for (P2-04): byte offsets mean nothing
     /// across a restart. 0 for direct play and a playback's first encode.
-    #[serde(default)]
     pub epoch: u32,
     /// An HLS segment to read in, 0 being the init segment (P2-05); `None`
     /// reads the file itself (direct play) or the progressive output.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub segment: Option<u32>,
 }
 
-/// What follows on the stream. New fields (P2 adds some) arrive with
-/// defaults, so older clients keep working.
+/// What follows on the stream. Every field is required (PX-15).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaReadReply {
     /// How many bytes follow this frame.
@@ -61,17 +59,10 @@ pub struct MediaReadReply {
     pub size: u64,
     /// `size` is final: always for direct play, once the encode has ended
     /// for a converted playback. The end is `complete` and `offset + sent
-    /// == size`. A reply from a server before P2-04 means direct play,
-    /// hence the default.
-    #[serde(default = "complete")]
+    /// == size`.
     pub complete: bool,
     /// The encode the bytes are from.
-    #[serde(default)]
     pub epoch: u32,
-}
-
-fn complete() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

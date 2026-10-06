@@ -16,8 +16,11 @@ pub mod media;
 pub mod model;
 pub mod platform;
 pub mod preferences;
+pub mod required;
 pub mod role;
 pub mod search;
+#[cfg(test)]
+mod test_support;
 
 pub use codec::{
     AudioCodec, ClientCapabilities, Container, Delivery, HdrFormat, SubtitleFormat, VideoCodec,

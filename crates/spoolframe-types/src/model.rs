@@ -94,7 +94,7 @@ pub struct Season {
     pub id: MediaId,
     pub show_id: MediaId,
     /// The show's title, so a season shown alone needs no second request.
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required::option")]
     pub show_title: Option<String>,
     /// The season number; 0 is specials.
     pub season: u32,
@@ -108,7 +108,7 @@ pub struct Episode {
     pub show_id: MediaId,
     /// The show's title, so an episode shown alone (Continue watching)
     /// needs no second request.
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required::option")]
     pub show_title: Option<String>,
     pub season_id: MediaId,
     pub season: u32,
@@ -137,7 +137,7 @@ pub struct Album {
     pub id: MediaId,
     pub artist_id: MediaId,
     /// The artist's name, for the same reason.
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required::option")]
     pub artist_name: Option<String>,
     pub title: String,
     pub year: Option<u16>,
@@ -370,6 +370,48 @@ mod tests {
         assert_eq!(json["kind"], "show");
         assert_eq!(json["id"], "plex:show:20");
         round_trip(item);
+    }
+
+    /// The parent's name on a season, an episode and an album was once
+    /// `serde(default)`; every field is now required (PX-15).
+    #[test]
+    fn a_parent_s_name_left_out_is_refused() {
+        let season = Season {
+            id: media(MediaKind::Season, "21"),
+            show_id: media(MediaKind::Show, "20"),
+            show_title: None,
+            season: 1,
+            title: "Season 1".into(),
+            artwork: Vec::new(),
+        };
+        crate::test_support::assert_each_required(&season, &["show_title"]);
+        let episode = Episode {
+            id: media(MediaKind::Episode, "22"),
+            show_id: media(MediaKind::Show, "20"),
+            show_title: None,
+            season_id: media(MediaKind::Season, "21"),
+            season: 1,
+            episode: 1,
+            title: "Dulcinea".into(),
+            summary: None,
+            content_rating: None,
+            duration: None,
+            artwork: Vec::new(),
+            playback: PlaybackState::default(),
+        };
+        crate::test_support::assert_each_required(&episode, &["show_title"]);
+        let album = Album {
+            id: media(MediaKind::Album, "30"),
+            artist_id: media(MediaKind::Artist, "31"),
+            artist_name: None,
+            title: "Moon Safari".into(),
+            year: None,
+            track_count: None,
+            artwork: Vec::new(),
+        };
+        crate::test_support::assert_each_required(&album, &["artist_name"]);
+        // `null` is how none is sent.
+        round_trip(album);
     }
 
     #[test]

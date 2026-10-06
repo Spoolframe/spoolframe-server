@@ -1554,6 +1554,35 @@ impl ClientProtocol {
                 );
                 Ok(Reply::Done)
             }
+            Request::ForgetDevice { device } => {
+                // This device leaves by signing out; deleting it here would
+                // end this session with no `LoggedOut` to say so.
+                if device == connection.remote_id().to_string() {
+                    return Err(Error::InvalidInput {
+                        message: "sign out to leave this device".into(),
+                    });
+                }
+                // It ends sessions elsewhere and takes away trust: a
+                // session left signed in does not (P4-03).
+                recently_signed_in(&user)?;
+                let deleted = self
+                    .store()
+                    .delete_device(user.user, &device)
+                    .await
+                    .map_err(|e| match e {
+                        PinError::NoSuchDevice => Error::NotFound {
+                            what: format!("device {device}"),
+                        },
+                        e @ (PinError::NoPin | PinError::Store(_)) => internal(e),
+                    })?;
+                tracing::info!(
+                    user = %user.username,
+                    %device,
+                    deleted,
+                    "device deleted in an app"
+                );
+                Ok(Reply::Done)
+            }
             Request::ListSessions => {
                 let current = SessionToken(session.0).hash();
                 let sessions = self

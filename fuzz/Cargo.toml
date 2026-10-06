@@ -1,0 +1,92 @@
+[package]
+name = "spoolframe-fuzz"
+description = "Fuzz targets for what Spoolframe reads from peers, files and a PMS (PX-10)."
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+
+# Not a member of the Spoolframe workspace: cargo-fuzz builds it with a
+# nightly compiler and sanitizer flags, and the workspace's gates stay on
+# stable. See ../FUZZING.md.
+[workspace]
+members = ["."]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The vendored copy the workspace patches in (see ../Cargo.toml).
+easy-ffprobe = { path = "../vendor/easy-ffprobe", default-features = false, features = ["format", "streams"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+spoolframe-protocol = { path = "../crates/spoolframe-protocol" }
+spoolframe-media = { path = "../crates/spoolframe-media" }
+spoolframe-plex = { path = "../crates/spoolframe-plex", features = ["fuzzing"] }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "protocol_frame"
+path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_cbor"
+path = "fuzz_targets/protocol_cbor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgs"
+path = "fuzz_targets/pgs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dvb"
+path = "fuzz_targets/dvb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vobsub"
+path = "fuzz_targets/vobsub.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bif"
+path = "fuzz_targets/bif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plex_json"
+path = "fuzz_targets/plex_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ffprobe_json"
+path = "fuzz_targets/ffprobe_json.rs"
+test = false
+doc = false
+bench = false
+
+# For examples/seeds.rs only: the PGS writer, and a runtime to read the
+# DVB and VobSub tracks ffmpeg makes from it.
+[dev-dependencies]
+spoolframe-media = { path = "../crates/spoolframe-media", features = ["fixtures"] }
+spoolframe-types = { path = "../crates/spoolframe-types" }
+tokio = { version = "1", features = ["rt", "macros"] }

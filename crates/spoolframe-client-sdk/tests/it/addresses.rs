@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use iroh::SecretKey;
 use spoolframe_client_sdk::types::{ClientCapabilities, Platform};
-use spoolframe_client_sdk::{Client, Device, MemoryStorage};
+use spoolframe_client_sdk::{Client, ClientOptions, Device, MemoryStorage};
 
 use crate::stub::Stub;
 
@@ -34,9 +34,16 @@ fn device() -> Device {
 }
 
 /// This device, as the app opens it again: what it knows of servers is
-/// only what `storage` kept.
+/// only what `storage` kept. It does not listen on the LAN, so nothing a
+/// real server there announces is mixed into what was saved.
 async fn open(storage: &Arc<MemoryStorage>) -> Client {
-    Client::open(storage.clone(), device()).await.unwrap()
+    let options = ClientOptions {
+        lan_discovery: false,
+        ..ClientOptions::default()
+    };
+    Client::open_with_options(storage.clone(), device(), options)
+        .await
+        .unwrap()
 }
 
 /// The addresses saved for server `id`, read by a client that has not

@@ -184,7 +184,7 @@ impl fmt::Debug for LoggedIn {
 pub struct UserInfo {
     pub username: String,
     /// What clients show; `None` means the username.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub display_name: Option<String>,
     pub role: Role,
     /// Unix seconds.
@@ -196,7 +196,7 @@ pub struct UserInfo {
     pub password_changed_at: Option<i64>,
     /// When any of their sessions was last used, Unix seconds; `None` if
     /// they have never signed in.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub last_seen_at: Option<i64>,
     /// They have a passkey (P3-05): with `has_password`, how they can sign
     /// in.
@@ -221,11 +221,10 @@ pub struct UserInfo {
 #[serde(rename_all = "camelCase")]
 pub struct NewUser {
     pub username: String,
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub display_name: Option<String>,
     pub password: String,
     /// `Consumer` if left out.
-    #[serde(default)]
     pub role: Role,
 }
 
@@ -266,7 +265,7 @@ pub struct SessionEntry {
     pub id: String,
     /// The device's name; `None` for an admin API session or an unnamed
     /// device.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub device_name: Option<String>,
     /// Unix seconds.
     pub created_at: i64,
@@ -275,7 +274,7 @@ pub struct SessionEntry {
     pub current: bool,
     /// The device's key (hex `EndpointId`) for a client session; `None` for
     /// a web or CLI session.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub endpoint_id: Option<String>,
     /// What kind of client the device runs, for a client session: for an
     /// admin API session `Web` or `Cli`, by what signed it in (P3-18).
@@ -290,7 +289,7 @@ pub struct SessionEntry {
 pub struct DeviceEntry {
     /// Hex `EndpointId`.
     pub endpoint_id: String,
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub name: Option<String>,
     /// What kind of client it runs; `None` for a device not seen since
     /// before the server kept it.
@@ -416,10 +415,10 @@ pub struct ServerStatus {
     /// named one: the nix package does, a plain `cargo build` does not.
     pub revision: Option<String>,
     /// The key clients pin; `None` while the endpoint is starting.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub endpoint_id: Option<String>,
     /// That key's fingerprint (P1-21), for checking a client's pin.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub fingerprint: Option<String>,
     /// The server id (PX-14): made once, kept when the key is replaced.
     /// The apps' passkeys for this server are made for
@@ -428,10 +427,8 @@ pub struct ServerStatus {
     pub server_id: String,
     pub transcoding: TranscodingStatus,
     /// Whether the server announces itself on the LAN (mDNS).
-    #[serde(default)]
     pub mdns: bool,
     /// Where clients reach it: the endpoint's bound addresses.
-    #[serde(default)]
     pub addresses: Vec<String>,
     /// The addresses a signed-in device is told to dial (PX-12): the
     /// endpoint's, as `network.announce` filters them, read now. Empty
@@ -484,21 +481,19 @@ impl CoreCount {
 pub struct PlexStatus {
     pub reachable: bool,
     /// Why not, when it is not.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub error: Option<String>,
     /// What the PMS calls itself.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub server_name: Option<String>,
     /// The PMS's version.
     pub version: Option<String>,
     /// Where the server reaches it: `plex.url`, without the token.
     pub url: Option<String>,
     /// Every library section Spoolframe can serve, served or not.
-    #[serde(default)]
     pub libraries: Vec<LibraryStatus>,
     /// The titles of its sections Spoolframe does not serve (photos,
     /// other videos), with what they hold: `Photos · photo`.
-    #[serde(default)]
     pub unsupported: Vec<UnsupportedSection>,
 }
 
@@ -1304,7 +1299,7 @@ pub struct ActivityPoint {
     pub artwork_requests_per_sec: f64,
     /// Of the artwork asked for in the interval, the share the cache had;
     /// `None` when none was asked for.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub artwork_hit_rate: Option<f64>,
     pub subtitle_reads_per_sec: f64,
     pub plex_requests_per_sec: f64,
@@ -1314,9 +1309,9 @@ pub struct ActivityPoint {
     /// Bitmap subtitle tracks waiting or being read as text.
     pub ocr_queued: u64,
     /// The server's resident memory; `None` where it cannot be read.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub memory_bytes: Option<u64>,
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub open_files: Option<u64>,
 }
 
@@ -1359,7 +1354,7 @@ pub struct PlexServerActivity {
     pub requests: u64,
     pub errors: u64,
     /// The mean time a request took; `None` before any.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub mean_latency_ms: Option<f64>,
 }
 
@@ -1421,18 +1416,18 @@ pub struct LogLine {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogQuery {
-    /// Only lines after this one: the `next` of the page before. Left
-    /// out, the last lines.
-    #[serde(default)]
+    /// Only lines after this one: the `next` of the page before. `None`:
+    /// the last lines.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub after: Option<u64>,
     /// Only lines at least this severe: `warn` gives warnings and errors.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub level: Option<LogLevel>,
     /// Only lines whose text or target contains this, in any case.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub text: Option<String>,
-    /// At most this many lines; 500 if left out.
-    #[serde(default)]
+    /// At most this many lines; 500 if `None`.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub limit: Option<u32>,
 }
 
@@ -1472,18 +1467,18 @@ pub struct OtlpStatus {
     /// The names of the headers sent, never their values.
     pub header_names: Vec<String>,
     /// When an export last went through, Unix ms.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub last_export_at: Option<i64>,
     /// Spans and log records dropped since `droppingSince`: since exports
     /// last stopped going through.
     pub dropped: u64,
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub dropping_since: Option<i64>,
     /// The last failure (the collector unreachable, what it answered, or
     /// no answer in time), and when, Unix ms.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub last_error: Option<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub last_error_at: Option<i64>,
     /// How often metrics are exported; records go at least this often.
     pub metrics_every_secs: u32,
@@ -1514,7 +1509,7 @@ pub struct MetricsEndpointStatus {
 #[serde(rename_all = "camelCase")]
 pub struct TelemetryStatus {
     /// `None` while no endpoint is set.
-    #[serde(default)]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub otlp: Option<OtlpStatus>,
     /// What an export carries, shown whether it is on or not.
     pub resource: Vec<ResourceAttribute>,
@@ -2081,6 +2076,15 @@ pub trait MeApi {
         auto_login: bool,
     ) -> jsonrpsee::core::RpcResult<()>;
 
+    /// Delete one of the caller's devices (an `endpointId` from
+    /// `devices`; P4-03): their sessions there are deleted, and with them
+    /// its trust and PIN requirement. It leaves `devices`, and if it signs
+    /// in again it is listed as new. Other users' sessions on that device
+    /// are kept. Always needs a recent sign-in (`RECENT_SIGN_IN_REQUIRED`).
+    /// A device they never signed in on is `NO_SUCH_DEVICE`.
+    #[method(name = "forgetDevice", with_extensions)]
+    async fn forget_device(&self, endpoint_id: String) -> jsonrpsee::core::RpcResult<()>;
+
     /// Refuse it: the device is told so.
     #[method(name = "deviceSignInDeny", with_extensions)]
     async fn device_sign_in_deny(&self, code: String) -> jsonrpsee::core::RpcResult<()>;
@@ -2269,6 +2273,16 @@ pub trait AdminApi {
         endpoint_id: String,
         trusted: bool,
         auto_login: bool,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// `me.forgetDevice` for one of a user's devices (P4-03). Needs a
+    /// recent sign-in (`RECENT_SIGN_IN_REQUIRED`); a device the user never
+    /// signed in on is `NO_SUCH_DEVICE`.
+    #[method(name = "userForgetDevice", with_extensions)]
+    async fn user_forget_device(
+        &self,
+        username: String,
+        endpoint_id: String,
     ) -> jsonrpsee::core::RpcResult<()>;
 
     /// A user's live sessions on every device, most recently used first.
@@ -2676,4 +2690,181 @@ pub trait AdminApi {
         id: String,
         request: PlanFor,
     ) -> jsonrpsee::core::RpcResult<PlanView>;
+}
+
+/// What was `serde(default)` before PX-15 is required: a server and a web
+/// UI that disagree about a shape fail on the call, not quietly.
+#[cfg(test)]
+mod required_field_tests {
+    use serde::de::DeserializeOwned;
+
+    use super::*;
+
+    /// `value` as JSON, then each of `fields` left out in turn: every one
+    /// must be refused as missing, not filled in.
+    fn assert_each_required<T: Serialize + DeserializeOwned>(value: &T, fields: &[&str]) {
+        let json = serde_json::to_value(value).unwrap();
+        for field in fields {
+            let mut without = json.clone();
+            assert!(
+                without.as_object_mut().unwrap().remove(*field).is_some(),
+                "{field} is not a key"
+            );
+            let Err(error) = serde_json::from_value::<T>(without) else {
+                panic!("{field} was filled in");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("missing field `{field}`")),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn users_sessions_and_devices() {
+        assert_each_required(
+            &UserInfo {
+                username: "alice".into(),
+                display_name: None,
+                role: Role::Consumer,
+                created_at: 0,
+                disabled: false,
+                has_password: true,
+                password_changed_at: None,
+                last_seen_at: None,
+                has_passkey: false,
+                has_sso: false,
+                has_pin: false,
+                device_count: 0,
+                session_count: 0,
+                rate_limited_secs: None,
+            },
+            &["displayName", "lastSeenAt"],
+        );
+        assert_each_required(
+            &NewUser {
+                username: "alice".into(),
+                display_name: None,
+                password: "correct horse".into(),
+                role: Role::Consumer,
+            },
+            &["displayName", "role"],
+        );
+        assert_each_required(
+            &SessionEntry {
+                id: "1".into(),
+                device_name: None,
+                created_at: 0,
+                last_used_at: 0,
+                current: false,
+                endpoint_id: None,
+                platform: None,
+            },
+            &["deviceName", "endpointId"],
+        );
+        assert_each_required(
+            &DeviceEntry {
+                endpoint_id: "ab".into(),
+                name: None,
+                platform: None,
+                last_seen_at: 0,
+                pin_required: false,
+                trusted: false,
+                auto_login: false,
+            },
+            &["name"],
+        );
+    }
+
+    #[test]
+    fn server_and_plex_status() {
+        assert_each_required(
+            &ServerStatus {
+                name: "Spoolframe".into(),
+                version: "0.5.0".into(),
+                revision: None,
+                endpoint_id: None,
+                fingerprint: None,
+                server_id: "abc".into(),
+                transcoding: TranscodingStatus {
+                    video_encoders: Vec::new(),
+                    audio_encoders: Vec::new(),
+                    hardware_decoders: Vec::new(),
+                },
+                mdns: false,
+                addresses: Vec::new(),
+                told_addresses: Vec::new(),
+                ocr_languages: Vec::new(),
+                web_urls: Vec::new(),
+                preview_workers_default: DefaultWorkers {
+                    count: 1,
+                    counted: CoreCount::LogicalCpus,
+                },
+            },
+            &["endpointId", "fingerprint", "mdns", "addresses"],
+        );
+        assert_each_required(
+            &PlexStatus {
+                reachable: false,
+                error: None,
+                server_name: None,
+                version: None,
+                url: None,
+                libraries: Vec::new(),
+                unsupported: Vec::new(),
+            },
+            &["error", "serverName", "libraries", "unsupported"],
+        );
+    }
+
+    #[test]
+    fn activity_logs_and_telemetry() {
+        assert_each_required(
+            &ActivityPoint::default(),
+            &["artworkHitRate", "memoryBytes", "openFiles"],
+        );
+        assert_each_required(
+            &PlexServerActivity {
+                id: "plex".into(),
+                name: "Plex".into(),
+                requests: 0,
+                errors: 0,
+                mean_latency_ms: None,
+            },
+            &["meanLatencyMs"],
+        );
+        assert_each_required(&LogQuery::default(), &["after", "level", "text", "limit"]);
+        let otlp = OtlpStatus {
+            endpoint: "http://collector:4318".into(),
+            protocol: "http".into(),
+            traces: true,
+            metrics: true,
+            logs: true,
+            header_names: Vec::new(),
+            last_export_at: None,
+            dropped: 0,
+            dropping_since: None,
+            last_error: None,
+            last_error_at: None,
+            metrics_every_secs: 60,
+        };
+        assert_each_required(
+            &otlp,
+            &["lastExportAt", "droppingSince", "lastError", "lastErrorAt"],
+        );
+        assert_each_required(
+            &TelemetryStatus {
+                otlp: None,
+                resource: Vec::new(),
+                metrics: MetricsEndpointStatus {
+                    enabled: false,
+                    path: "/metrics".into(),
+                    refused: Vec::new(),
+                },
+            },
+            &["otlp"],
+        );
+    }
 }

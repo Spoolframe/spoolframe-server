@@ -2220,6 +2220,48 @@
   and the bar's title is the user's display name. A session is named as
   My profile names it: "Web browser" and "Command line" instead of
   "Browser" and "web / CLI".
+- The device switches explain themselves (P4-03). On My profile's
+  Devices and sessions and on an admin's user Devices, a legend under the
+  table or cards says what PIN, Trusted and Auto-login do, each name in
+  bold. It is where the footnote was. The admin's legend says "this
+  user's profile". The 180 days a trusted device may go unused is the
+  server's default: the admin API does not expose
+  `auth.trust_idle_days`. Each column head, phone label and switch has
+  its legend line as its description (`aria-describedby`) and as its
+  `title`. Each switch that cannot be pressed has a visible reason. With
+  no PIN, the PIN line says how to get one (My profile) or that no device
+  can ask for one (admin). Auto-login's line says it needs
+  Trusted. On My profile, a last line says a browser can't be
+  trusted or open by itself, which a wide row shows only as dashes.
+- A user's device can be deleted (P4-03). Signing a device out kept it
+  in the user's devices, since a revoked session still lists it. Deleting
+  it deletes the user's sessions there, live or revoked, with its trust
+  and PIN requirement for them, in one transaction. It leaves the list,
+  and if it signs in again it is new. Other users' sessions, trust and
+  PIN requirement on that device are kept. The device's connection
+  closes with `SIGNED_OUT` once no user's session is left on it.
+  - Admin API: `me.forgetDevice(endpointId)` and
+    `admin.userForgetDevice(username, endpointId)`. Both always need a
+    recent sign-in (`RECENT_SIGN_IN_REQUIRED`); a device the user never
+    used is `NO_SUCH_DEVICE`.
+  - Client protocol: the new `ForgetDevice { device }`, answered `Done`.
+    It needs a session and a recent sign-in (`RecentSignInRequired`), is
+    a mutation, and a locked profile cannot send it. This device is
+    `InvalidInput` (sign out with `Logout`); a device that is not the
+    user's is `NotFound`. An added request: `PROTOCOL_VERSION` stays 5.
+  - SDK: `Session::forget_device(device)`.
+- Delete on the web (P4-03, canvas v75). My profile's Devices and
+  sessions has Delete beside Sign out on each app's device, signed in or
+  not; a browser's row and this device have none. An admin's user
+  Devices has it beside Clear PIN on each device, and at phone width in
+  each device card's header. Delete is red words with a trash can and no
+  border, quieter than Sign out. It asks "Delete <device>?" ("Delete
+  Alice's <device>?" on an admin's page): "It is signed out and
+  forgotten. If it signs in again it shows up as new." with Cancel and a
+  red Delete. Then a toast says "Deleted <device>" and the list is read
+  again. A session past its recent sign-in asks "Confirm it's you"
+  first, then deletes. My profile's rows switch to the wide layout at
+  600px instead of 520px, so that Sign out and Delete fit side by side.
 - The Server page follows WebServer and WebAdminPhone (P3-02):
   - LAN discovery is a switch that sets `network.mdns`. That setting
     applies at the next start, so the page says "Applies after a
@@ -2363,3 +2405,31 @@
   are listed as app passkeys that are not usable, and My profile says to
   remove them and add them again in the app. The server logs them at
   start. `LEGACY_APP_RP_ID` and `is_app_rp_id` name them.
+- Home has one row per show (P1-14). While an episode of a show is in
+  progress, the show is in Continue watching and has nothing in Next up;
+  finishing that episode puts the one after it in Next up. Every episode
+  in progress counts, also one past the length of Continue watching.
+  Before, the next episode could be in both rows (it was the one in
+  progress), and a show with a later episode in progress was in Next up
+  at the episode after an older one watched.
+- "Remove" removes only its card (P1-22). `HideFromContinueWatching`
+  with an episode hides that episode, from Continue watching or Next up,
+  not its show. The show's other episodes stay. A removed Next up episode
+  stays out until it is watched, and then the one after it is next up. A
+  removed episode in progress does not keep its show out of Next up.
+  Playing or marking a removed item brings it back, as for a movie; a
+  write for another episode of the show no longer does. The wire is
+  unchanged: apps already send the card's own id. Migration 0015 drops
+  the hides made per show before, so those shows come back to Home once.
+- Every field of the client protocol, the admin API and the models they
+  carry is required (PX-15). Before, about 70 fields had serde defaults,
+  among them `SessionEntry.device_name`, the `ServerStatus` fields and
+  all of `TrackPreferences`, so a peer that left a field out was read as
+  if it sent none. Now it is refused, with the missing field named. A
+  field with no value is sent as `null`. `PROTOCOL_VERSION` stays 5:
+  the server, the SDK and the Linux app already send every field, so
+  their bytes do not change. The web UI now sends `return_to: null` to
+  `/auth/oidc/begin` when there is none. Stored track preferences from
+  before a field existed still load: the server fills in the defaults
+  when it reads a row. Device-local files (the SDK's saved servers and
+  sessions) keep their defaults.

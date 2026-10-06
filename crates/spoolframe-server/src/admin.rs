@@ -1573,6 +1573,19 @@ impl MeApiServer for AdminApi {
         Ok(())
     }
 
+    async fn forget_device(&self, ext: &Extensions, endpoint_id: String) -> RpcResult<()> {
+        // An API session is on no device, so any of the caller's may go;
+        // it ends sessions there and takes away trust (P4-03).
+        let (_, user) = self.recently_signed_in(ext).await?;
+        let deleted = self
+            .auth
+            .store()
+            .delete_device(user.user, &endpoint_id)
+            .await?;
+        tracing::info!(user = %user.user, endpoint_id, deleted, "device deleted by its user");
+        Ok(())
+    }
+
     async fn confirm_password(&self, ext: &Extensions, password: String) -> RpcResult<()> {
         let (token, user) = self.caller(ext).await?;
         let me = self.account(user).await?;
@@ -2164,6 +2177,23 @@ impl AdminApiServer for AdminApi {
             revoked,
             "device trust changed by an admin"
         );
+        Ok(())
+    }
+
+    async fn user_forget_device(
+        &self,
+        ext: &Extensions,
+        username: String,
+        endpoint_id: String,
+    ) -> RpcResult<()> {
+        self.recent_admin(ext).await?;
+        let user = self.record(&username).await?;
+        let deleted = self
+            .auth
+            .store()
+            .delete_device(user.id, &endpoint_id)
+            .await?;
+        tracing::info!(%username, endpoint_id, deleted, "device deleted by an admin");
         Ok(())
     }
 

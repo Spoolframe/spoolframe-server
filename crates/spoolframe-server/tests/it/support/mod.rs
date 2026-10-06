@@ -47,6 +47,22 @@ use spoolframe_server::watch::{Watch, WatchRules};
 use spoolframe_types::{ArtworkId, ClientCapabilities, SearchScope};
 use tokio::io::AsyncWriteExt;
 
+/// An SDK client that does not listen on the LAN (PX-10). A developer's
+/// own server announces itself there, and a client that hears it lists it
+/// in `Client::servers`, so a test's result would depend on the network.
+/// The test servers are dialled at the addresses a test gives. Only the
+/// LAN tests, in their private network namespace, listen.
+pub async fn sdk_client(
+    storage: Arc<dyn spoolframe_client_sdk::Storage>,
+    device: spoolframe_client_sdk::Device,
+) -> Result<spoolframe_client_sdk::Client, spoolframe_client_sdk::SdkError> {
+    let options = spoolframe_client_sdk::ClientOptions {
+        lan_discovery: false,
+        ..spoolframe_client_sdk::ClientOptions::default()
+    };
+    spoolframe_client_sdk::Client::open_with_options(storage, device, options).await
+}
+
 /// Transcoding that has not detected anything: the software baseline.
 /// No test runs a real ffmpeg.
 pub fn transcoding() -> Arc<Transcoding> {
@@ -838,23 +854,16 @@ impl TestServer {
         self.server.shutdown().await;
     }
 
-    /// Stop and start again on the same directory (key, database) and
-    /// UDP port, as a restarted server is.
+    /// Stop and start again on the same directory (key, database), as a
+    /// restarted server is: the same key, on any free UDP port. The old
+    /// port is not asked for again: under the load of the workspace tests
+    /// another endpoint may have taken it, and the bind fails. A client
+    /// dials the restarted server at its new `server.addr()`; an SDK client
+    /// is given it with `Client::add_address`.
     pub async fn restart(self) -> Self {
-        let port = self
-            .server
-            .addr()
-            .ip_addrs()
-            .find(|a| a.is_ipv4())
-            .expect("an IPv4 address")
-            .port();
         let dir = self.dir.clone();
         self.stop().await;
-        let options = ServerOptions {
-            port: Some(port),
-            ..ServerOptions::default()
-        };
-        Self::start_with(dir, options).await
+        Self::start_with(dir, ServerOptions::default()).await
     }
 }
 
@@ -941,7 +950,7 @@ impl TestClient {
         .response
     }
 
-    async fn revision(
+    pub async fn revision(
         &self,
         session: &SessionId,
         handle: &PlaybackHandle,

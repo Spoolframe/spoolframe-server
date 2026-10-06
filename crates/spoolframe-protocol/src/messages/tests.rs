@@ -150,6 +150,9 @@ fn every_request_round_trips() {
             trusted: false,
             auto_login: false,
         },
+        Request::ForgetDevice {
+            device: "ab".repeat(32),
+        },
         Request::AwaitDeviceSignIn {
             request: "r".into(),
         },
@@ -755,19 +758,18 @@ fn media_reads_round_trip() {
     }
 }
 
-/// A reply from a server before P2-04 has neither `complete` nor `epoch`:
-/// it was direct play, so the whole file.
+/// A reply from a server before P2-04 has neither `complete` nor `epoch`.
+/// It was once read as direct play; since PX-15 it is refused.
 #[test]
-fn an_older_server_s_read_reply_is_complete_at_epoch_0() {
+fn an_older_server_s_read_reply_does_not_decode() {
     #[derive(Serialize)]
     struct OldReply {
         sent: u64,
         size: u64,
     }
     let bytes = codec::encode(&OldReply { sent: 10, size: 20 }).unwrap();
-    let reply: crate::MediaReadReply = codec::decode(&bytes).unwrap();
-    assert!(reply.complete);
-    assert_eq!(reply.epoch, 0);
+    let error = codec::decode::<crate::MediaReadReply>(&bytes).unwrap_err();
+    assert!(error.to_string().contains("missing field"), "{error}");
 }
 
 #[test]
@@ -1015,6 +1017,8 @@ mod newer {
         pub client_version: String,
         /// A platform this build has never heard of.
         pub platform: String,
+        pub device_name: Option<String>,
+        pub capabilities: Option<spoolframe_types::ClientCapabilities>,
         /// A field this build has never heard of.
         pub screen_inches: u32,
     }
@@ -1054,6 +1058,8 @@ fn a_field_added_by_a_newer_client_is_ignored() {
         client_name: "next".into(),
         client_version: "9".into(),
         platform: "vision_os".into(),
+        device_name: None,
+        capabilities: None,
         screen_inches: 65,
     })
     .unwrap();
@@ -1290,10 +1296,11 @@ async fn an_oversized_frame_is_refused_before_it_is_read() {
     assert!(matches!(err, CodecError::TooLarge { .. }), "{err}");
 }
 
-/// A client from before P1-20 sends a selection as a plain struct; it
-/// still decodes, as an explicit one.
+/// A client from before P2-03 and P2-07 sends `StartPlayback` with no
+/// `start_ms` or `bitmap`. It was once read with their defaults; since
+/// PX-15 it is refused.
 #[test]
-fn an_older_client_s_selection_is_still_explicit() {
+fn an_older_client_s_start_playback_does_not_decode() {
     #[derive(Serialize)]
     struct OldStart {
         #[serde(rename = "type")]
@@ -1303,9 +1310,11 @@ fn an_older_client_s_selection_is_still_explicit() {
     }
     #[derive(Serialize)]
     struct Envelope {
+        session: Option<SessionId>,
         request: OldStart,
     }
     let bytes = codec::encode(&Envelope {
+        session: None,
         request: OldStart {
             kind: "start_playback",
             id: "plex:movie:1",
@@ -1313,16 +1322,8 @@ fn an_older_client_s_selection_is_still_explicit() {
         },
     })
     .unwrap();
-    let decoded: RequestEnvelope = codec::decode(&bytes).unwrap();
-    assert!(matches!(
-        decoded.request,
-        Request::StartPlayback {
-            selection: Some(_),
-            // Before P2-07: the mode a client never names is `Auto`.
-            bitmap: BitmapSubtitles::Auto,
-            ..
-        }
-    ));
+    let error = codec::decode::<RequestEnvelope>(&bytes).unwrap_err();
+    assert!(error.to_string().contains("missing field"), "{error}");
 }
 
 #[test]
@@ -1332,7 +1333,8 @@ fn a_bitmap_mode_from_a_newer_client_is_unknown() {
 }
 
 /// The item and started-playback replies as they were before P2-10, with
-/// no `markers`: what an older server sends and an older client reads.
+/// no `markers` (nor `chosen`): what an older server sent and an older
+/// client reads.
 mod before_markers {
     use crate::{PlaybackHandle, PlaybackPlan};
     use serde::{Deserialize, Serialize};
@@ -1365,36 +1367,26 @@ fn playback_started(markers: Vec<Marker>) -> Reply {
     }
 }
 
+/// An older server's replies were once read with no markers; since
+/// PX-15 they are refused.
 #[test]
-fn an_older_server_s_item_has_no_markers() {
-    let bytes = codec::encode(&before_markers::Reply::Item {
+fn an_older_server_s_replies_without_markers_do_not_decode() {
+    let item = codec::encode(&before_markers::Reply::Item {
         item: movie(),
         children: Vec::new(),
     })
     .unwrap();
-    assert_eq!(
-        codec::decode::<Reply>(&bytes).unwrap(),
-        Reply::Item {
-            item: movie(),
-            children: Vec::new(),
-            markers: Vec::new(),
-        }
-    );
-}
-
-#[test]
-fn an_older_server_s_started_playback_has_no_markers() {
-    let bytes = codec::encode(&before_markers::Reply::PlaybackStarted {
+    let started = codec::encode(&before_markers::Reply::PlaybackStarted {
         handle: crate::PlaybackHandle("h".into()),
         plan: PlaybackPlan::Unsupported { reasons: vec![] },
         size: 12_345,
         epoch: 0,
     })
     .unwrap();
-    assert_eq!(
-        codec::decode::<Reply>(&bytes).unwrap(),
-        playback_started(Vec::new())
-    );
+    for bytes in [item, started] {
+        let error = codec::decode::<Reply>(&bytes).unwrap_err();
+        assert!(error.to_string().contains("missing field"), "{error}");
+    }
 }
 
 #[test]
@@ -1498,6 +1490,26 @@ fn trust_requests_are_retried_only_when_they_read() {
     }));
 }
 
+/// Deleting a device (P4-03) is the session user's, ends sessions, and so
+/// is never sent twice on its own; the apps encode it by hand. Its device
+/// is always named: there is no "this device" form, which is `Logout`.
+#[test]
+fn forgetting_a_device_needs_a_session_is_not_retried_and_names_the_device() {
+    use crate::policy::retry_safe;
+    let forget = Request::ForgetDevice {
+        device: "ab".into(),
+    };
+    assert!(!forget.is_pre_auth());
+    assert!(!retry_safe(&forget));
+    assert_eq!(
+        serde_json::to_value(&forget).unwrap(),
+        serde_json::json!({"type": "forget_device", "device": "ab"})
+    );
+    let unnamed: Result<Request, _> =
+        serde_json::from_value(serde_json::json!({"type": "forget_device"}));
+    assert!(unnamed.is_err(), "{unnamed:?}");
+}
+
 /// What the apps encode by hand (P4-01): the tags and field names.
 #[test]
 fn trust_requests_have_their_wire_names() {
@@ -1580,4 +1592,171 @@ fn a_server_address_that_is_not_one_does_not_decode() {
         "type": "server_addresses", "addrs": ["nimble.local:4433"]
     }));
     assert!(bad.is_err(), "{bad:?}");
+}
+
+/// `value` in CBOR, then each of `fields` left out of its map in turn:
+/// every one must be refused as missing, not filled in (PX-15).
+fn assert_each_required<T: Serialize + DeserializeOwned + Debug>(value: &T, fields: &[&str]) {
+    let full: ciborium::Value =
+        ciborium::from_reader(codec::encode(value).unwrap().as_slice()).unwrap();
+    for field in fields {
+        let ciborium::Value::Map(mut entries) = full.clone() else {
+            panic!("{value:?} is not a map");
+        };
+        let before = entries.len();
+        entries.retain(|(key, _)| key.as_text() != Some(field));
+        assert_eq!(
+            entries.len(),
+            before - 1,
+            "{field} is not a key of {value:?}"
+        );
+        let error = codec::decode::<T>(&codec::encode(&ciborium::Value::Map(entries)).unwrap())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("missing field `{field}`")),
+            "{field}: {error}"
+        );
+    }
+}
+
+fn movie_id() -> MediaId {
+    MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap()
+}
+
+/// What was `serde(default)` before PX-15 is required: the requests.
+#[test]
+fn a_request_missing_a_field_is_refused() {
+    assert_each_required(
+        &RequestEnvelope {
+            session: None,
+            request: Request::Ping,
+        },
+        &["session"],
+    );
+    assert_each_required(&hello(), &["device_name", "capabilities"]);
+    assert_each_required(
+        &Request::PlaybackPlan {
+            id: movie_id(),
+            selection: None,
+            bitmap: BitmapSubtitles::Auto,
+        },
+        &["selection", "bitmap"],
+    );
+    assert_each_required(
+        &Request::StartPlayback {
+            id: movie_id(),
+            selection: None,
+            start_ms: None,
+            bitmap: BitmapSubtitles::Auto,
+        },
+        &["selection", "start_ms", "bitmap"],
+    );
+    assert_each_required(
+        &Request::SetPinRequired {
+            device: None,
+            required: true,
+        },
+        &["device"],
+    );
+    assert_each_required(
+        &Request::ChangeSubtitle {
+            handle: crate::PlaybackHandle("h".into()),
+            subtitle: None,
+            bitmap: BitmapSubtitles::Auto,
+            position_ms: 0,
+        },
+        &["bitmap"],
+    );
+    assert_each_required(
+        &Selection {
+            audio: None,
+            subtitle: None,
+        },
+        &["audio", "subtitle"],
+    );
+}
+
+/// And the replies.
+#[test]
+fn a_reply_missing_a_field_is_refused() {
+    assert_each_required(
+        &Reply::Item {
+            item: movie(),
+            children: Vec::new(),
+            markers: Vec::new(),
+        },
+        &["markers"],
+    );
+    assert_each_required(
+        &Reply::PlaybackPlan {
+            plan: PlaybackPlan::Unsupported { reasons: vec![] },
+            chosen: None,
+        },
+        &["chosen"],
+    );
+    assert_each_required(
+        &playback_started(Vec::new()),
+        &["chosen", "epoch", "markers"],
+    );
+    assert_each_required(
+        &UserSummary {
+            user_id: "local:1".into(),
+            username: "alice".into(),
+            display_name: "Alice".into(),
+            role: spoolframe_types::Role::Consumer,
+            locked: false,
+            pin: None,
+        },
+        &["locked"],
+    );
+    assert_each_required(
+        &crate::DeviceInfo {
+            endpoint_id: "ab".into(),
+            name: None,
+            platform: None,
+            last_seen_at: 0,
+            pin_required: false,
+            trusted: false,
+            auto_login: false,
+            this_device: false,
+        },
+        &["name"],
+    );
+    assert_each_required(
+        &crate::DeviceSignInRequest {
+            device_name: None,
+            client_name: "spoolframe-tvos".into(),
+            platform: spoolframe_types::Platform::Tvos,
+            requested_at: 0,
+            remember: false,
+        },
+        &["device_name"],
+    );
+}
+
+/// And the media reads.
+#[test]
+fn a_media_read_or_its_reply_missing_a_field_is_refused() {
+    assert_each_required(
+        &crate::MediaRead {
+            session: SessionId("s".into()),
+            handle: crate::PlaybackHandle("h".into()),
+            offset: 0,
+            length: 1,
+            epoch: 0,
+            segment: None,
+        },
+        &["epoch", "segment"],
+    );
+    assert_each_required(
+        &crate::MediaReadReply {
+            sent: 1,
+            size: 1,
+            complete: true,
+            epoch: 0,
+        },
+        &["complete", "epoch"],
+    );
 }

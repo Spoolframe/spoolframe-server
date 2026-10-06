@@ -9,15 +9,16 @@ use crate::media::AudioRole;
 /// language of the file's default audio track.
 pub const ORIGINAL_LANGUAGE: &str = "original";
 
+/// Every field is required on the wire (PX-15): a peer that leaves one out
+/// is refused, not filled in. The server keeps these as JSON and reads its
+/// older rows with the defaults filled in itself (`store::tracks`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct TrackPreferences {
     pub audio: AudioPreferences,
     pub subtitles: SubtitlePreferences,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct AudioPreferences {
     /// ISO 639 codes in order of preference, or [`ORIGINAL_LANGUAGE`].
     /// Empty: the file's default track.
@@ -36,7 +37,6 @@ impl Default for AudioPreferences {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct SubtitlePreferences {
     pub mode: SubtitleMode,
     /// ISO 639 codes in order of preference. Empty: the audio's language.
@@ -111,12 +111,11 @@ mod tests {
         assert_eq!(p.subtitles.mode, SubtitleMode::ForcedOnly);
     }
 
-    #[test]
-    fn a_partial_audio_section_keeps_the_default_avoid_list() {
-        let p: TrackPreferences =
-            serde_json::from_value(serde_json::json!({"audio": {"languages": ["eng"]}})).unwrap();
-        assert_eq!(p.audio.languages, ["eng"]);
-        assert_eq!(p.audio.avoid, AudioPreferences::default().avoid);
+    /// The defaults as JSON, with `edit` applied.
+    fn full(edit: impl FnOnce(&mut serde_json::Value)) -> serde_json::Value {
+        let mut json = serde_json::to_value(TrackPreferences::default()).unwrap();
+        edit(&mut json);
+        json
     }
 
     #[test]
@@ -126,24 +125,50 @@ mod tests {
             BitmapPreference::Text
         );
         let p: TrackPreferences =
-            serde_json::from_value(serde_json::json!({"subtitles": {"bitmap": "pictures"}}))
-                .unwrap();
+            serde_json::from_value(full(|j| j["subtitles"]["bitmap"] = "pictures".into())).unwrap();
         assert_eq!(p.subtitles.bitmap, BitmapPreference::Pictures);
     }
 
     #[test]
     fn a_picture_subtitle_preference_this_build_does_not_know_reads_as_text() {
         let p: TrackPreferences =
-            serde_json::from_value(serde_json::json!({"subtitles": {"bitmap": "hologram"}}))
-                .unwrap();
+            serde_json::from_value(full(|j| j["subtitles"]["bitmap"] = "hologram".into())).unwrap();
         assert_eq!(p.subtitles.bitmap, BitmapPreference::Text);
     }
 
     #[test]
-    fn missing_fields_take_the_defaults() {
-        let p: TrackPreferences =
-            serde_json::from_value(serde_json::json!({"subtitles": {"mode": "always"}})).unwrap();
-        assert_eq!(p.subtitles.mode, SubtitleMode::Always);
-        assert_eq!(p.audio, AudioPreferences::default());
+    fn every_field_round_trips() {
+        let p: TrackPreferences = serde_json::from_value(full(|_| {})).unwrap();
+        assert_eq!(p, TrackPreferences::default());
+    }
+
+    /// Each field in turn, by its JSON path, left out of the defaults.
+    #[test]
+    fn preferences_missing_any_field_are_refused() {
+        for (section, field) in [
+            (None, "audio"),
+            (None, "subtitles"),
+            (Some("audio"), "languages"),
+            (Some("audio"), "avoid"),
+            (Some("subtitles"), "mode"),
+            (Some("subtitles"), "languages"),
+            (Some("subtitles"), "sdh"),
+            (Some("subtitles"), "bitmap"),
+        ] {
+            let json = full(|j| {
+                let object = match section {
+                    Some(section) => &mut j[section],
+                    None => j,
+                };
+                object.as_object_mut().unwrap().remove(field);
+            });
+            let error = serde_json::from_value::<TrackPreferences>(json).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("missing field `{field}`")),
+                "{section:?}.{field}: {error}"
+            );
+        }
     }
 }

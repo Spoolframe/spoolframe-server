@@ -417,6 +417,15 @@ fn cropped(object: &Object, crop: Option<(usize, usize, usize, usize)>) -> Objec
     };
     let w = w.min(object.width.saturating_sub(x));
     let h = h.min(object.height.saturating_sub(y));
+    // A crop that starts outside the object shows none of it; its first
+    // row would start past the end of the pixels.
+    if w == 0 || h == 0 {
+        return Object {
+            width: 0,
+            height: 0,
+            indices: Vec::new(),
+        };
+    }
     let mut indices = Vec::with_capacity(w * h);
     for row in y..y + h {
         indices.extend_from_slice(&object.indices[row * object.width + x..][..w]);
@@ -627,5 +636,25 @@ mod tests {
         let mut sup = fixture::sup(&[shown(0, 1_000, 0, 10, 10)], 65_000);
         sup.truncate(sup.len() - 1);
         assert!(matches!(cues(&sup), Err(PgsError::Truncated(_))));
+    }
+
+    /// Found by the `pgs` fuzz target (PX-10): a composition's crop that
+    /// starts right of or below its object panicked on a slice out of
+    /// range. A crop outside the object shows nothing.
+    #[test]
+    fn a_crop_outside_its_object_shows_nothing() {
+        let object = Object {
+            width: 4,
+            height: 2,
+            indices: vec![1; 8],
+        };
+        for crop in [(4, 0, 2, 2), (9, 0, 2, 2), (0, 2, 2, 2), (0, 7, 2, 2)] {
+            let shown = cropped(&object, Some(crop));
+            assert_eq!(shown.width * shown.height, 0, "{crop:?}");
+            assert!(shown.indices.is_empty(), "{crop:?}");
+        }
+        // Inside, as before.
+        let shown = cropped(&object, Some((3, 1, 5, 5)));
+        assert_eq!((shown.width, shown.height, shown.indices), (1, 1, vec![1]));
     }
 }
