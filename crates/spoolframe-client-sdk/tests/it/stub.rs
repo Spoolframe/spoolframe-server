@@ -35,6 +35,8 @@ struct State {
     body: Mutex<(u64, Vec<u8>)>,
     /// What `ServerAddresses` answers a session with (PX-12).
     told: Mutex<Vec<SocketAddr>>,
+    /// What `ServerInfo` and `DeviceSignInStarted` give as the web UI.
+    web_url: Mutex<Option<String>>,
 }
 
 pub struct Stub {
@@ -129,6 +131,11 @@ impl Stub {
     /// is bound there or not; a stranger's is `Unauthenticated`.
     pub fn tell(&self, addrs: &[SocketAddr]) {
         *self.state.told.lock().unwrap() = addrs.to_vec();
+    }
+
+    /// Say `url` is the server's web UI from now on.
+    pub fn web_url(&self, url: &str) {
+        *self.state.web_url.lock().unwrap() = Some(url.to_owned());
     }
 
     pub fn body(&self, announced: u64, bytes: &[u8]) {
@@ -280,6 +287,7 @@ fn answer(
     state: &State,
     envelope: spoolframe_protocol::RequestEnvelope,
 ) -> Response {
+    let web_url = state.web_url.lock().unwrap().clone();
     let reply = match envelope.request {
         Request::ServerAddresses if envelope.session.is_none() => {
             return Response::Err(Error::Unauthenticated);
@@ -293,8 +301,14 @@ fn answer(
             protocol_version: PROTOCOL_VERSION,
             server_version: "0".into(),
             auth_methods: vec![AuthMethod::Password],
-            web_url: None,
+            web_url,
         }),
+        Request::BeginDeviceSignIn { .. } => Reply::DeviceSignInStarted {
+            request: "stub-request".into(),
+            code: "BCDFGHJK".into(),
+            expires_in_ms: 60_000,
+            web_url,
+        },
         Request::Ping => Reply::Pong,
         Request::PlaybackRevision { .. } => Reply::PlaybackRevision { revision: 0 },
         Request::LoginPassword(_) => Reply::LoggedIn {

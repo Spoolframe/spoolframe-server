@@ -56,7 +56,7 @@ impl CookiePolicy {
         Self(Arc::new(AtomicBool::new(insecure)))
     }
 
-    /// Whether the cookie goes without `Secure` and `HttpOnly`.
+    /// Whether the cookie goes without `Secure`.
     pub fn insecure(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
@@ -65,11 +65,12 @@ impl CookiePolicy {
         self.0.store(insecure, Ordering::Relaxed);
     }
 
-    /// `Set-Cookie` for a new session. `Secure` and `HttpOnly` unless
-    /// insecure cookies are on: browsers treat `http://localhost` as
-    /// secure, so a `Secure` cookie works on loopback, over an SSH tunnel
-    /// to it, and behind a TLS proxy alike, but on no plain-HTTP LAN
-    /// address. Insecure, it does there too, and page scripts can read it.
+    /// `Set-Cookie` for a new session. `HttpOnly` always, and `Secure`
+    /// unless insecure cookies are on: browsers treat `http://localhost`
+    /// as secure, so a `Secure` cookie works on loopback, over an SSH
+    /// tunnel to it, and behind a TLS proxy alike, but on no plain-HTTP
+    /// LAN address. Insecure, it does there too; page scripts still cannot
+    /// read it (PX-11, PX-09 finding 21).
     fn set(&self, token: &str) -> HeaderValue {
         let value = format!(
             "{COOKIE}={token}; Path=/; {}SameSite=Strict; Max-Age={}",
@@ -108,7 +109,7 @@ impl CookiePolicy {
 
     fn flags(&self) -> &'static str {
         if self.insecure() {
-            ""
+            "HttpOnly; "
         } else {
             "HttpOnly; Secure; "
         }
@@ -401,6 +402,54 @@ fn router(
         }))
         .layer(middleware::from_fn_with_state(proxies, credentials))
         .layer(middleware::from_fn_with_state(origins, check_origin))
+        // Outermost: refusals get the headers too.
+        .layer(middleware::from_fn(security_headers))
+}
+
+/// The web UI's content policy (PX-11 finding 37), fitted to the Dioxus
+/// bundle: its own scripts, and `wasm-unsafe-eval` to compile its wasm
+/// (no `unsafe-eval`: the app never evaluates script). Styles allow
+/// `unsafe-inline`, as the app sets `style` attributes and puts its font
+/// faces in a `<style>` element. Images from the listener (artwork) and
+/// data or blob URLs; the socket is `'self'`. Never framed.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+    script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; \
+    img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; \
+    object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// A page `dx serve` made, in a debug build that takes its pages from it:
+/// its hot reload is not fitted to [`CONTENT_SECURITY_POLICY`], which is
+/// left off it. A release build never has one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DevPage;
+
+/// Every answer (PX-11 finding 37): not to be sniffed as another type,
+/// nor framed, with the web UI's content policy. Sign-in answers and
+/// JSON-RPC replies are not to be stored: they name sessions and users.
+async fn security_headers(req: Request, next: Next) -> Response<Body> {
+    let path = req.uri().path().to_owned();
+    let mut response = next.run(req).await;
+    let dev_page = response.extensions().get::<DevPage>().is_some();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    if !dev_page {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+        );
+    }
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|t| t.to_str().ok())
+        .is_some_and(|t| t.starts_with("application/json"));
+    if path.starts_with("/auth/") || path == "/jsonrpc" || json {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 /// An admin API connection's RPC service, holding its place in the count
@@ -916,6 +965,20 @@ async fn catalog_artwork(State(api): State<AdminApi>, req: Request) -> Response<
         return (StatusCode::BAD_REQUEST, "id, and a size clients use").into_response();
     };
     match api.catalog_image(&as_caller(&req), &id, size).await {
+        Ok(image) if !is_raster(&image.content_type) => {
+            // An SVG runs script when opened by itself (PX-11, PX-09
+            // finding 13); nothing but the three is served to a browser.
+            tracing::warn!(
+                id,
+                content_type = image.content_type,
+                "artwork that is not JPEG, PNG or WebP is not served"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                "the artwork is not a JPEG, PNG or WebP image",
+            )
+                .into_response()
+        }
         Ok(image) => {
             let mut response = (
                 [
@@ -938,6 +1001,18 @@ async fn catalog_artwork(State(api): State<AdminApi>, req: Request) -> Response<
         }
         Err(e) => failure(e),
     }
+}
+
+/// Whether `content_type` is one of the raster types artwork is served
+/// as: JPEG, PNG or WebP, whatever its case or parameters.
+fn is_raster(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(essence.as_str(), "image/jpeg" | "image/png" | "image/webp")
 }
 
 /// `GET /metrics` (P3-14): Prometheus text, for a scraper at one of
@@ -1156,17 +1231,20 @@ mod tests {
         for cookie in [insecure.oidc("ab"), insecure.oidc_clear()] {
             let cookie = cookie.to_str().unwrap();
             assert!(!cookie.contains("Secure"), "{cookie}");
+            assert!(cookie.contains("HttpOnly"), "{cookie}");
             assert!(cookie.contains("SameSite=Lax"), "{cookie}");
         }
     }
 
+    /// Insecure cookies drop only `Secure`, which plain HTTP needs gone:
+    /// page scripts still cannot read them (PX-11, PX-09 finding 21).
     #[test]
-    fn an_insecure_cookie_is_neither_secure_nor_http_only_and_still_strict() {
+    fn an_insecure_cookie_is_not_secure_but_still_http_only_and_strict() {
         let cookies = CookiePolicy::new(true);
         for cookie in [cookies.set("abc"), cookies.clear()] {
             let cookie = cookie.to_str().unwrap();
             assert!(!cookie.contains("Secure"), "{cookie}");
-            assert!(!cookie.contains("HttpOnly"), "{cookie}");
+            assert!(cookie.contains("HttpOnly"), "{cookie}");
             assert!(cookie.contains("SameSite=Strict"), "{cookie}");
         }
         // Live: the next sign-in reads it again.

@@ -21,6 +21,8 @@ url = { workspace = true }
 thiserror = { workspace = true }
 # GDM, Plex's LAN discovery (P3-10), over UDP.
 tokio = { workspace = true, features = ["net", "sync"] }
+# GDM answers' interface (IP_PKTINFO) and the host's networks (PX-11).
+libc = { workspace = true }
 
 [dev-dependencies]
 spoolframe-test-dir = { workspace = true }

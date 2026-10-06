@@ -621,3 +621,68 @@ async fn a_library_whose_plex_is_down_is_unavailable() {
     let err = root.catalog_library("plex:2".into()).await.unwrap_err();
     assert_eq!(code(err), error_code::UNAVAILABLE);
 }
+
+/// `/catalog/artwork` as the root admin's page asks for it.
+async fn page_artwork(s: &Setup, id: &str) -> reqwest::Response {
+    let root = anonymous(s.addr)
+        .await
+        .login(creds("root", "correct horse"))
+        .await
+        .unwrap();
+    reqwest::Client::new()
+        .get(format!("http://{}/catalog/artwork?id={id}", s.addr))
+        .bearer_auth(&root.token)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// An SVG (or any other type a browser might run) from Plex never reaches
+/// the admin's browser (PX-11, PX-09 finding 13): only JPEG, PNG and WebP
+/// are served.
+#[tokio::test]
+async fn artwork_that_is_not_jpeg_png_or_webp_is_not_served() {
+    let s = setup("svg-artwork").await;
+    let svg = r#"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>"#;
+    for (path, body, content_type) in [
+        (
+            "/library/metadata/1/thumb/1",
+            svg.as_bytes().to_vec(),
+            "image/svg+xml",
+        ),
+        (
+            "/library/metadata/2/thumb/1",
+            b"GIF89a".to_vec(),
+            "image/gif",
+        ),
+        ("/library/metadata/3/thumb/1", png(), "image/png"),
+    ] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(path))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, content_type))
+            .with_priority(1)
+            .mount(&s.pms)
+            .await;
+    }
+    for id in [
+        "plex:/library/metadata/1/thumb/1",
+        "plex:/library/metadata/2/thumb/1",
+    ] {
+        let refused = page_artwork(&s, id).await;
+        assert_eq!(refused.status(), reqwest::StatusCode::BAD_GATEWAY, "{id}");
+        let body = refused.text().await.unwrap();
+        assert!(!body.contains("<svg"), "{id}: {body}");
+    }
+    let served = page_artwork(&s, "plex:/library/metadata/3/thumb/1").await;
+    assert_eq!(served.status(), reqwest::StatusCode::OK);
+    assert_eq!(served.headers()["content-type"], "image/png");
+}
+
+/// A 1×1 PNG.
+fn png() -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(1, 1)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
+}

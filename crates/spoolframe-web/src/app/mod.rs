@@ -668,7 +668,7 @@ fn CodeCard(name: String, on_ok: EventHandler<String>) -> Element {
                         }
                         span { class: "choice-what",
                             b { "Allow insecure cookies" }
-                            "The session cookie crosses your network unencrypted, and scripts on the page can read it. Anyone on the network who can see the traffic could take over the session. Passkeys still need HTTPS or localhost, so setup here is password-only. You can turn this off later in Server › Settings."
+                            "The session cookie crosses your network unencrypted. Anyone on the network who can see the traffic could take over the session. Passkeys still need HTTPS or localhost, so setup here is password-only. You can turn this off later in Server › Settings."
                         }
                     }
                 }
@@ -1334,7 +1334,7 @@ fn SignedIn(user: UserInfo) -> Element {
                         icons::Warning {}
                         span {
                             b { "Insecure cookies are on. " }
-                            "Sessions can be read by anyone watching the network, and by scripts on the page."
+                            "Sessions can be read by anyone watching the network."
                         }
                         Link { to: Route::Settings { tab: "security".into() }, "Turn off" }
                     }

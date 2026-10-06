@@ -90,8 +90,14 @@ impl Running {
 
     /// [`Running::start`], with `env` set for the server.
     fn start_with(config: &Path, env: &[(&str, &str)]) -> (Self, String) {
-        let mut child = server_with(config)
-            .envs(env.iter().copied())
+        let mut command = server_with(config);
+        command.envs(env.iter().copied());
+        Self::start_command(command)
+    }
+
+    /// [`Running::start`] of `command`, a [`server_with`].
+    fn start_command(mut command: Command) -> (Self, String) {
+        let mut child = command
             .stderr(Stdio::piped())
             .spawn()
             .expect("the binary runs");
@@ -162,6 +168,71 @@ async fn an_unreachable_plex_is_reported_and_the_server_keeps_running() {
     assert!(log.contains(&url), "{log}");
     assert!(log.contains("admin API listening"), "{log}");
     // SIGTERM is a clean stop, not a failure.
+    assert!(running.stop().success());
+}
+
+/// `path`'s permission bits.
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// Started under the usual umask, the server keeps what it writes to its
+/// own user (PX-11 finding 35): its umask is 077, its caches 0700 (one an
+/// older server left open too), and its database 0600.
+#[tokio::test]
+async fn the_server_keeps_its_state_and_caches_to_its_own_user() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    let (_tmp, config) = config_with_state("private-state", &closed_port_url()).await;
+    let state = config.with_file_name("state");
+    let old = state.join("cache").join("artwork");
+    std::fs::create_dir_all(&old).unwrap();
+    for dir in [&state.join("cache"), &old] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut command = server_with(&config);
+    // SAFETY: only umask(2), async-signal-safe, between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o022);
+            Ok(())
+        });
+    }
+    let (running, _log) = Running::start_command(command);
+    let status = std::fs::read_to_string(format!("/proc/{}/status", running.0.id())).unwrap();
+    assert!(status.contains("Umask:\t0077"), "{status}");
+    for dir in [
+        "cache",
+        "cache/artwork",
+        "cache/previews",
+        "cache/subtitles",
+        "cache/transcode",
+    ] {
+        assert_eq!(mode(&state.join(dir)), 0o700, "{dir}");
+    }
+    for file in ["spoolframe.db", "spoolframe.db-wal"] {
+        assert_eq!(mode(&state.join(file)), 0o600, "{file}");
+    }
+    assert!(running.stop().success());
+}
+
+/// A loopback listener with a public URL is a proxy on this host; without
+/// `trusted_proxies` every caller looks like loopback (PX-11 finding 38).
+#[tokio::test]
+async fn a_same_host_proxy_without_trusted_proxies_is_warned_of_at_start() {
+    let (_tmp, config) = config_with_state("unnamed-proxy", &closed_port_url()).await;
+    let text = std::fs::read_to_string(&config).unwrap().replace(
+        "admin {",
+        r#"admin { public_url = "https://media.example.org";"#,
+    );
+    std::fs::write(&config, text).unwrap();
+    let (running, log) = Running::start(&config);
+    assert!(log.contains("admin.trusted_proxies is empty"), "{log}");
     assert!(running.stop().success());
 }
 

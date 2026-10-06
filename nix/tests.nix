@@ -4,9 +4,11 @@
 # prints a setup code, takes its first admin and users through the CLI,
 # listens on its UDP port, finds only software encoders without a GPU,
 # reads subtitles with the tesseract languages it was given, and keeps its
-# key over a restart. `fresh`, the module with nothing but `enable`: not
-# set up, its web UI answering, its state where the module says, and the
-# firewall opening only the Plex discovery port.
+# key over a restart, all under the unit's sandbox, which
+# `systemd-analyze security` scores. `fresh`, the module with nothing but
+# `enable`: not set up, its web UI answering on loopback only, insecure
+# cookies locked off, its state where the module says and its own user's
+# alone, and the firewall opening none of its ports (PX-11).
 {
   pkgs,
   spoolframePackage,
@@ -85,16 +87,26 @@ pkgs.testers.runNixOSTest {
     assert "(locked)" in shown, shown
     assert "plex.url = (not set);" in shown, shown
     assert "network.plex_discovery_port = 32415;  # config file, locked" in shown, shown
+    # PX-11 findings 32 and 33: loopback, and no insecure cookies.
+    assert 'admin.listen = "127.0.0.1:7421";  # config file, locked' in shown, shown
+    assert "admin.insecure_cookies = false;  # config file, locked" in shown, shown
     # Its state where the module says, the service's own.
     fresh.succeed("test -s /var/lib/spoolframe/endpoint.key")
     fresh.succeed("test -s /var/lib/spoolframe/spoolframe.db")
     assert fresh.succeed("stat -c '%U %a' /var/lib/spoolframe").strip() == "spoolframe 700"
+    # PX-11 finding 35: the database and the caches are its user's alone.
+    for path in ["spoolframe.db", "spoolframe.db-wal"]:
+        mode = fresh.succeed(f"stat -c %a /var/lib/spoolframe/{path}").strip()
+        assert mode == "600", f"{path}: {mode}"
+    for path in ["cache", "cache/artwork", "cache/previews"]:
+        mode = fresh.succeed(f"stat -c %a /var/lib/spoolframe/{path}").strip()
+        assert mode == "700", f"{path}: {mode}"
     endpoint = fresh.succeed("spoolframe id").strip()
     assert re.search(f"endpoint_id={endpoint}", fresh.succeed("journalctl -u spoolframe.service")), endpoint
-    # The firewall lets Plex's answers in, and nothing else of ours.
+    # Without openFirewall nothing of ours is opened, Plex's answers
+    # included (PX-11 finding 36).
     opened = firewall_udp(fresh)
-    assert 32415 in opened, opened
-    assert 7420 not in opened and 5353 not in opened, opened
+    assert not {7420, 5353, 32415} & opened, opened
     # The web UI is not opened to the network.
     server.wait_for_unit("multi-user.target")
     server.fail("curl -sf --max-time 5 http://fresh:7421/auth/site")
@@ -153,5 +165,23 @@ pkgs.testers.runNixOSTest {
     # openFirewall: the client port and mDNS, as well as Plex's answers.
     opened = firewall_udp(server)
     assert {7420, 5353, 32415} <= opened, opened
+    # Its proxy is named: no warning about one that is not (PX-11 38).
+    assert "trusted_proxies is empty" not in journal()
+
+    # PX-11 finding 34: the unit's sandbox, as systemd scores it (1.6 when
+    # this was written; at most 2.0, out of 10, passes). ffmpeg
+    # (the encoder test at start) and tesseract (its languages) ran
+    # under it above.
+    props = server.succeed(
+        "systemctl show spoolframe.service -p UMask -p TasksMax -p MemoryMax -p MemoryHigh "
+        "-p ProtectHome -p ProtectProc -p ProcSubset -p SystemCallArchitectures"
+    )
+    for want in ["UMask=0077", "TasksMax=4096", "MemoryMax=8589934592", "MemoryHigh=6442450944",
+                 "ProtectHome=yes", "ProtectProc=invisible", "ProcSubset=pid",
+                 "SystemCallArchitectures=native"]:
+        assert want in props, f"{want}: {props}"
+    exposure = server.succeed("systemd-analyze security spoolframe.service --no-pager | tail -n 1")
+    print(exposure)
+    server.succeed("systemd-analyze security --threshold=20 spoolframe.service --no-pager")
   '';
 }

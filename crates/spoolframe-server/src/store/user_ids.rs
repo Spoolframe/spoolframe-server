@@ -46,16 +46,23 @@ pub(super) async fn back_up_if_pending(
         }
     }
     let path = free_backup_path(state_dir);
+    // Made empty first, the server's user's only (PX-11 finding 35):
+    // VACUUM INTO fills an empty file, and keeps its mode.
+    crate::files::private_file(&path).map_err(|source| StoreError::Private {
+        path: path.clone(),
+        source,
+    })?;
     // A consistent copy of what is committed, the WAL included, made
     // while the pool is open.
-    sqlx::query("VACUUM INTO ?1")
+    if let Err(source) = sqlx::query("VACUUM INTO ?1")
         .bind(path.to_string_lossy().into_owned())
         .execute(pool)
         .await
-        .map_err(|source| StoreError::Backup {
-            path: path.clone(),
-            source,
-        })?;
+    {
+        // Not left to look like a backup.
+        let _ = std::fs::remove_file(&path);
+        return Err(StoreError::Backup { path, source });
+    }
     tracing::info!(
         backup = %path.display(),
         "database backed up before giving users UUIDs (migration 0012); \
@@ -487,6 +494,18 @@ mod tests {
         let again = Store::open(dir.as_ref()).await.unwrap();
         assert_eq!(ids_by_name(&again).await, ids_before);
         assert!(!dir.as_ref().join(format!("{BACKUP_FILE}.1")).exists());
+    }
+
+    /// The copy holds what the database does (PX-11 finding 35).
+    #[tokio::test]
+    async fn the_backup_is_readable_by_the_server_s_user_only() {
+        let dir = household("backup-mode").await;
+        let store = Store::open(dir.as_ref()).await.unwrap();
+        assert_eq!(
+            crate::store::tests::mode(&dir.as_ref().join(BACKUP_FILE)),
+            0o600
+        );
+        store.pool.close().await;
     }
 
     #[tokio::test]

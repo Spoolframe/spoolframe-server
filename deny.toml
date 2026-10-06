@@ -21,3 +21,18 @@ exceptions = [
   { crate = "spoolframe-plex", allow = ["AGPL-3.0-or-later"] },
   { crate = "spoolframe-admin-api", allow = ["AGPL-3.0-or-later"] },
 ]
+
+# Accepted advisories (PX-09 C-15, written down in PX-11 finding 39), so
+# `cargo deny --locked check advisories` passes and a new one stands out.
+[advisories]
+ignore = [
+  # rsa: the Marvin timing attack recovers a private key from many timed
+  # decryptions or signatures. Here rsa comes in only through openidconnect
+  # to verify a provider's RS256 ID token signatures with its public keys;
+  # the server holds no RSA private key and does no RSA private-key
+  # operation. No fixed rsa release exists.
+  { id = "RUSTSEC-2023-0071", reason = "rsa is used only to verify OIDC ID token signatures (public keys); no private-key operations" },
+  # paste: unmaintained, not vulnerable. A proc-macro run at build time
+  # (through iroh's netlink-packet-core); none of it is in the binary.
+  { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the server" },
+]

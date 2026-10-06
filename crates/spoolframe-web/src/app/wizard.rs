@@ -1891,7 +1891,7 @@ pub fn SecurityForm() -> Element {
             }
             span { class: "choice-what",
                 b { "Allow insecure cookies" }
-                "Sends the session cookie without its Secure and HttpOnly flags, so signing in over plain HTTP on your network works. The cookie then crosses your network unencrypted, and scripts on the page can read it. Passkeys still need HTTPS or localhost."
+                "Sends the session cookie without its Secure flag, so signing in over plain HTTP on your network works. The cookie then crosses your network unencrypted. Passkeys still need HTTPS or localhost. Not allowed when the public URL is HTTPS."
             }
         }
         Note { settings: loaded.clone(), setting: "admin.insecure_cookies", on_changed: move |_| generation += 1 }

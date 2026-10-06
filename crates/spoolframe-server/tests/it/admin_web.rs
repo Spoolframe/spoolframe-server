@@ -458,3 +458,76 @@ async fn a_user_whose_password_logins_are_limited_is_listed_so_with_the_wait() {
     assert_eq!(limited("carol"), None);
     assert_eq!(limited("root"), None);
 }
+
+/// A response's header, or "".
+fn header<'a>(response: &'a reqwest::Response, name: &str) -> &'a str {
+    response
+        .headers()
+        .get(name)
+        .map_or("", |v| v.to_str().unwrap())
+}
+
+/// Every answer of the listener says not to sniff it or frame it, and
+/// carries the web UI's content policy (PX-11 finding 37).
+fn assert_hardened(response: &reqwest::Response) {
+    let url = response.url().clone();
+    assert_eq!(
+        header(response, "x-content-type-options"),
+        "nosniff",
+        "{url}"
+    );
+    assert_eq!(header(response, "x-frame-options"), "DENY", "{url}");
+    let csp = header(response, "content-security-policy");
+    for part in [
+        "default-src 'self'",
+        "script-src 'self' 'wasm-unsafe-eval'",
+        "frame-ancestors 'none'",
+        "object-src 'none'",
+        "base-uri 'none'",
+    ] {
+        assert!(csp.contains(part), "{url}: {csp}");
+    }
+    assert!(!csp.contains("'unsafe-eval'"), "{url}: {csp}");
+}
+
+#[tokio::test]
+async fn every_answer_is_hardened_and_auth_answers_are_not_stored() {
+    let (addr, _dir) = server("headers").await;
+    let site = reqwest::get(format!("http://{addr}/auth/site"))
+        .await
+        .unwrap();
+    assert_hardened(&site);
+    assert_eq!(header(&site, "cache-control"), "no-store");
+
+    let cookie = set_up(addr).await;
+    let refused = post(
+        addr,
+        "/auth/login",
+        Some(&page(addr)),
+        None,
+        json!({ "username": "root", "password": "wrong" }),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert_hardened(&refused);
+    assert_eq!(header(&refused, "cache-control"), "no-store");
+    let me = me(addr, &cookie).await;
+    assert_hardened(&me);
+    assert_eq!(header(&me, "cache-control"), "no-store");
+
+    // A JSON-RPC reply over HTTP.
+    let rpc = reqwest::Client::new()
+        .post(format!("http://{addr}/jsonrpc"))
+        .header("cookie", &cookie)
+        .header("origin", page(addr))
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "me.whoAmI", "params": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_hardened(&rpc);
+    assert_eq!(header(&rpc, "cache-control"), "no-store");
+
+    // The pages, whatever this build has of them.
+    let page = reqwest::get(format!("http://{addr}/admin")).await.unwrap();
+    assert_hardened(&page);
+}

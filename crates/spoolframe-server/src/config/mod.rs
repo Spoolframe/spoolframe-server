@@ -769,9 +769,10 @@ pub struct AdminConfig {
     /// a loopback one under none.
     #[ucl(default)]
     pub trusted_proxies: Option<String>,
-    /// Send the session cookie without `Secure` and `HttpOnly`, so signing
-    /// in over plain HTTP on the LAN works: the cookie then crosses the
-    /// network in clear, and page scripts can read it. Off if left out.
+    /// Send the session cookie without `Secure`, so signing in over plain
+    /// HTTP on the LAN works: the cookie then crosses the network in
+    /// clear. It stays `HttpOnly`. Off if left out, and refused while
+    /// `public_url` is `https` (PX-11).
     #[ucl(default)]
     pub insecure_cookies: Option<bool>,
     /// Answer `GET /metrics` with Prometheus text (P3-14). Off if left
@@ -840,6 +841,18 @@ impl AdminConfig {
     }
 
     /// The address to listen on.
+    /// Whether this is a proxy on the same host that the server is not
+    /// told about (PX-11 finding 38): a loopback listener with a public
+    /// URL is one, and with no `trusted_proxies` every caller through it
+    /// looks like loopback. Failed logins then share no source, and
+    /// `/metrics`, when on, answers anyone the proxy lets in (PX-09
+    /// finding 29).
+    pub fn proxy_unnamed(&self) -> Result<bool, ConfigError> {
+        Ok(self.listen()?.ip().is_loopback()
+            && self.public_url.is_some()
+            && self.trusted_proxies()? == crate::admin::TrustedProxies::default())
+    }
+
     pub fn listen(&self) -> Result<SocketAddr, ConfigError> {
         let text = self.listen.as_deref().unwrap_or(Self::DEFAULT_LISTEN);
         text.parse().map_err(|e| ConfigError::Invalid {
@@ -2182,6 +2195,32 @@ mod tests {
             plex(r#"admin { listen = "127.0.0.1:7421"; insecure_cookies = true; }"#).unwrap();
         assert!(config.admin.listen().unwrap().ip().is_loopback());
         assert!(config.admin.insecure_cookies());
+    }
+
+    /// PX-11 finding 38: the shape of a same-host proxy whose callers
+    /// the server cannot tell apart (PX-09 finding 29).
+    #[test]
+    fn a_loopback_listener_behind_a_public_url_without_trusted_proxies_is_warned_of() {
+        let warned = |admin: &str| {
+            plex(&format!("admin {{ {admin} }}"))
+                .unwrap()
+                .admin
+                .proxy_unnamed()
+                .unwrap()
+        };
+        assert!(warned(
+            r#"listen = "127.0.0.1:7421"; public_url = "https://media.example.org";"#
+        ));
+        assert!(warned(
+            r#"listen = "[::1]:7421"; public_url = "https://media.example.org";"#
+        ));
+        assert!(!warned(
+            r#"listen = "127.0.0.1:7421"; public_url = "https://media.example.org"; trusted_proxies = "127.0.0.1";"#
+        ));
+        assert!(!warned(r#"listen = "127.0.0.1:7421";"#));
+        assert!(!warned(
+            r#"listen = "0.0.0.0:7421"; public_url = "https://media.example.org";"#
+        ));
     }
 
     #[test]

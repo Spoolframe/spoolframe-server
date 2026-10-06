@@ -6,3 +6,4 @@
 mod addresses;
 mod stalls;
 mod stub;
+mod web_url;

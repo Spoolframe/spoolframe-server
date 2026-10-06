@@ -144,13 +144,14 @@ impl ServerConnection {
             }
         };
         let instance = answer.server;
-        let info = match answer.reply.response {
+        let mut info = match answer.reply.response {
             Response::Ok(Reply::ServerInfo(info)) => info,
             Response::Ok(other) => {
                 return Err(SdkError::Protocol(format!("Hello answered with {other:?}")));
             }
             Response::Err(e) => return Err(SdkError::from_server(e)),
         };
+        info.web_url = crate::client::web_page(info.web_url.take());
         if info.protocol_version != PROTOCOL_VERSION {
             conn.close(0u32.into(), b"wrong protocol revision");
             return Err(SdkError::Protocol(

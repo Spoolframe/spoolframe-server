@@ -172,7 +172,7 @@ impl ArtworkCache {
     /// `catalog`. Files already in `dir` are kept, the most recently
     /// written counting as most recently used.
     pub fn open(dir: &Path, limit: u64, catalog: Arc<dyn Catalog>) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        crate::files::private_dir(dir)?;
         let mut found = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;

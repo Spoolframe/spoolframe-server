@@ -143,9 +143,10 @@ admin {
   # The reverse proxies in front of the listener, as addresses and CIDR
   # ranges, comma-separated. Left out, no X-Forwarded-For is read.
   # trusted_proxies = "10.0.0.5, 172.17.0.0/16";
-  # Send the session cookie without Secure and HttpOnly, so signing in
-  # over plain HTTP on the LAN works. The cookie then crosses the LAN in
-  # clear and page scripts can read it; passkeys still need HTTPS.
+  # Send the session cookie without Secure, so signing in over plain
+  # HTTP on the LAN works. The cookie then crosses the LAN in clear, but
+  # stays HttpOnly; passkeys still need HTTPS. Refused while public_url
+  # is https.
   insecure_cookies = false;
   # Answer GET /metrics on this listener with Prometheus text. Off, it is
   # not found.

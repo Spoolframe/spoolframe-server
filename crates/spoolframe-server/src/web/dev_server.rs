@@ -87,6 +87,7 @@ impl DevServer {
                 let mut response = Response::new(Body::from(body));
                 *response.status_mut() = status;
                 *response.headers_mut() = headers;
+                response.extensions_mut().insert(crate::admin_http::DevPage);
                 response
             }
             Err(e) => {

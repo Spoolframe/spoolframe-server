@@ -11,8 +11,10 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::fd::{AsRawFd as _, RawFd};
 use std::time::Duration;
 
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
 /// Where a GDM search goes: Plex's multicast group, and the LAN's
@@ -59,6 +61,145 @@ pub async fn discover(
     port: u16,
     wait: Duration,
 ) -> std::io::Result<Vec<Found>> {
+    search(targets, port, wait, host_links).await
+}
+
+/// One of this host's IPv4 networks: the index of the interface it is
+/// on, and an address and mask there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Link {
+    pub index: u32,
+    pub addr: Ipv4Addr,
+    pub mask: Ipv4Addr,
+}
+
+impl Link {
+    fn holds(&self, ip: Ipv4Addr) -> bool {
+        let mask = u32::from(self.mask);
+        u32::from(self.addr) & mask == u32::from(ip) & mask
+    }
+}
+
+/// Whether `from` is on a network of interface `index`'s: a PMS answering
+/// a LAN search is on the link it answers over (PX-11 finding 36). An
+/// answer routed in from anywhere else is not one. A PMS on this host
+/// answers from one of its addresses over loopback, which is kept.
+pub fn on_link(links: &[Link], index: u32, from: IpAddr) -> bool {
+    let IpAddr::V4(from) = from.to_canonical() else {
+        return false;
+    };
+    links
+        .iter()
+        .any(|l| (l.index == index && l.holds(from)) || l.addr == from)
+}
+
+/// This host's IPv4 networks, of the interfaces that are up.
+pub fn host_links() -> Vec<Link> {
+    let mut found = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list it allocates, read only
+    // until the freeifaddrs below. An AF_INET entry's address and mask
+    // are sockaddr_in; its name is a C string.
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return found;
+        }
+        let mut entry = head;
+        while let Some(ifa) = entry.as_ref() {
+            entry = ifa.ifa_next;
+            if ifa.ifa_addr.is_null()
+                || ifa.ifa_netmask.is_null()
+                || ifa.ifa_flags & libc::IFF_UP as u32 == 0
+                || i32::from((*ifa.ifa_addr).sa_family) != libc::AF_INET
+            {
+                continue;
+            }
+            let index = libc::if_nametoindex(ifa.ifa_name);
+            if index == 0 {
+                continue;
+            }
+            let v4 = |sa: *const libc::sockaddr| {
+                let sin = std::ptr::read_unaligned(sa.cast::<libc::sockaddr_in>());
+                Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))
+            };
+            found.push(Link {
+                index,
+                addr: v4(ifa.ifa_addr),
+                mask: v4(ifa.ifa_netmask),
+            });
+        }
+        libc::freeifaddrs(head);
+    }
+    found
+}
+
+/// Have `socket` say which interface each datagram came in on.
+fn ask_for_interfaces(socket: &UdpSocket) -> std::io::Result<()> {
+    let on: libc::c_int = 1;
+    // SAFETY: setsockopt on a socket this owns, with an int it reads.
+    let done = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_PKTINFO,
+            (&raw const on).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if done != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// One datagram into `buf`, without waiting: its length, its sender, and
+/// the index of the interface it came in on (`IP_PKTINFO`).
+fn receive(fd: RawFd, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr, Option<u32>)> {
+    // u64s, for the alignment cmsghdr needs.
+    let mut control = [0u64; 16];
+    // SAFETY: recvmsg writes at most the lengths given into `buf`, `from`
+    // and `control`, which outlive the call; the control messages are read
+    // only within the length it returned, through the CMSG macros.
+    unsafe {
+        let mut from: libc::sockaddr_in = std::mem::zeroed();
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_name = (&raw mut from).cast();
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        msg.msg_iov = &raw mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = std::mem::size_of_val(&control) as _;
+        let len = libc::recvmsg(fd, &raw mut msg, libc::MSG_DONTWAIT);
+        if len < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut index = None;
+        let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::IPPROTO_IP && (*cmsg).cmsg_type == libc::IP_PKTINFO {
+                let info: libc::in_pktinfo = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
+                index = u32::try_from(info.ipi_ifindex).ok();
+            }
+            cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
+        }
+        let ip = Ipv4Addr::from(u32::from_be(from.sin_addr.s_addr));
+        let port = u16::from_be(from.sin_port);
+        Ok((len as usize, SocketAddr::new(IpAddr::V4(ip), port), index))
+    }
+}
+
+/// [`discover`], with the host's networks from `links`: read once a
+/// search, after the answers are in.
+async fn search(
+    targets: &[SocketAddr],
+    port: u16,
+    wait: Duration,
+    links: impl Fn() -> Vec<Link>,
+) -> std::io::Result<Vec<Found>> {
     let _turn = SEARCHING.lock().await;
     let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).await {
         Ok(socket) => socket,
@@ -74,19 +215,38 @@ pub async fn discover(
         Err(e) => return Err(e),
     };
     socket.set_broadcast(true)?;
+    ask_for_interfaces(&socket)?;
     for target in targets {
         // One unreachable target (no broadcast route, say) leaves the rest.
         if let Err(e) = socket.send_to(SEARCH, target).await {
             tracing::debug!(%target, error = %e, "GDM search not sent");
         }
     }
-    let mut found = BTreeMap::new();
+    let mut answers = Vec::new();
     let mut buf = vec![0u8; 4096];
+    let fd = socket.as_raw_fd();
     let deadline = tokio::time::Instant::now() + wait;
-    while let Ok(Ok((len, from))) =
-        tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await
+    while let Ok(Ok((len, from, index))) = tokio::time::timeout_at(
+        deadline,
+        socket.async_io(Interest::READABLE, || receive(fd, &mut buf)),
+    )
+    .await
     {
-        if let Some(server) = parse(&String::from_utf8_lossy(&buf[..len]), from.ip()) {
+        answers.push((
+            String::from_utf8_lossy(&buf[..len]).into_owned(),
+            from,
+            index,
+        ));
+    }
+    let links = links();
+    let mut found = BTreeMap::new();
+    for (reply, from, index) in answers {
+        // Only from the network of the interface it came in on.
+        if !index.is_some_and(|index| on_link(&links, index, from.ip())) {
+            tracing::debug!(%from, ?index, "GDM answer from off its link dropped");
+            continue;
+        }
+        if let Some(server) = parse(&reply, from.ip()) {
             found.insert(server.url.clone(), server);
         }
     }
@@ -220,6 +380,60 @@ mod tests {
         assert_eq!(b.unwrap().len(), 1);
         assert_eq!(from.recv().await, Some(port));
         assert_eq!(from.recv().await, Some(port));
+    }
+
+    #[test]
+    fn a_sender_is_on_link_only_on_the_interface_whose_network_holds_it() {
+        let links = [
+            Link {
+                index: 2,
+                addr: Ipv4Addr::new(192, 168, 1, 5),
+                mask: Ipv4Addr::new(255, 255, 255, 0),
+            },
+            Link {
+                index: 3,
+                addr: Ipv4Addr::new(10, 8, 0, 1),
+                mask: Ipv4Addr::new(255, 255, 0, 0),
+            },
+        ];
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(on_link(&links, 2, ip("192.168.1.10")));
+        assert!(on_link(&links, 3, ip("10.8.200.7")));
+        // On a network of this host's, but not the one it came in on.
+        assert!(!on_link(&links, 2, ip("10.8.200.7")));
+        assert!(!on_link(&links, 3, ip("192.168.1.10")));
+        assert!(!on_link(&links, 2, ip("192.168.2.10")));
+        assert!(!on_link(&links, 4, ip("192.168.1.10")));
+        assert!(!on_link(&links, 2, ip("::1")));
+        // A PMS on this host, from its LAN address over loopback.
+        assert!(on_link(&links, 1, ip("192.168.1.5")));
+    }
+
+    /// PX-11 finding 36: an answer from a sender that is not on the
+    /// network of the interface it came in on is dropped.
+    #[tokio::test]
+    async fn an_answer_from_off_the_link_it_came_in_on_is_dropped() {
+        let (at, _from) = stand_in().await;
+        // Loopback, as if its network were 10.0.0.0/8: 127.0.0.1 is off it.
+        let elsewhere = || {
+            host_links()
+                .into_iter()
+                .map(|l| Link {
+                    addr: Ipv4Addr::new(10, 0, 0, 1),
+                    mask: Ipv4Addr::new(255, 0, 0, 0),
+                    ..l
+                })
+                .collect()
+        };
+        let found = search(&[at], 0, Duration::from_millis(500), elsewhere)
+            .await
+            .unwrap();
+        assert_eq!(found, []);
+        // Its own networks, as they are: found.
+        let found = search(&[at], 0, Duration::from_millis(500), host_links)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
     }
 
     #[tokio::test]

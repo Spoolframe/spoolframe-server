@@ -185,6 +185,14 @@ enum PlexCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // What the server writes is its own (PX-11 finding 35): the database
+    // holds password and session hashes, the caches what users watch. Its
+    // subprocesses (ffmpeg, tesseract) write into its caches, and inherit
+    // this. The module's UMask=0077 says the same; this holds without it.
+    // SAFETY: umask(2) only sets the process's file mode mask.
+    unsafe {
+        libc::umask(0o077);
+    }
     let cli = Cli::parse();
     let level = match cli.verbose {
         0 => "info",
@@ -353,6 +361,10 @@ async fn run(
              set up yet; set it up in the web UI"
         ),
     }
+    // The caches under the state directory, whatever an older server
+    // left: each cache closes its own as well.
+    spoolframe_server::files::private_dir(&state_dir.join("cache"))
+        .with_context(|| format!("cannot prepare the caches in {}", state_dir.display()))?;
     let prober = Arc::new(Prober::new(config.media.ffprobe(), Prober::DEFAULT_TIMEOUT));
     let transcoding = Arc::new(Transcoding::new(
         Box::new(FfmpegCommand::new(config.media.ffmpeg())),
@@ -450,14 +462,23 @@ async fn run(
     let cookies = CookiePolicy::new(config.admin.insecure_cookies());
     if cookies.insecure() {
         tracing::warn!(
-            "admin.insecure_cookies is on: the session cookie is sent without Secure and \
-             HttpOnly, so it crosses the network in clear and page scripts can read it"
+            "admin.insecure_cookies is on: the session cookie is sent without Secure, so it \
+             crosses the network in clear"
         );
     } else if !admin_listen.ip().is_loopback() && public_url.is_none() {
         tracing::warn!(
             listen = %admin_listen,
             "admin.public_url is not set: browsers keep the session cookie only over HTTPS or at \
              localhost, so signing in to the web UI at this address will appear to do nothing"
+        );
+    }
+    if config.admin.proxy_unnamed()? {
+        tracing::warn!(
+            listen = %admin_listen,
+            "admin.public_url is set on a loopback listener, so a proxy on this host is in front, \
+             but admin.trusted_proxies is empty: every caller looks like loopback, so failed \
+             logins are not limited per caller and /metrics, when on, answers whoever the proxy \
+             lets in; set admin.trusted_proxies to the proxy's address"
         );
     }
     let passkeys = Arc::new(Passkeys::new(&admin_origins));

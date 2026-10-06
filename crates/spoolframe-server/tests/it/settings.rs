@@ -404,7 +404,7 @@ async fn insecure_cookies_turned_on_apply_to_the_next_sign_in() {
         .unwrap();
     let cookie = sign_in_cookie(addr).await;
     assert!(
-        !cookie.contains("Secure") && !cookie.contains("HttpOnly"),
+        !cookie.contains("Secure") && cookie.contains("HttpOnly"),
         "{cookie}"
     );
     let site: serde_json::Value = reqwest::get(format!("http://{addr}/auth/site"))
@@ -414,6 +414,41 @@ async fn insecure_cookies_turned_on_apply_to_the_next_sign_in() {
         .await
         .unwrap();
     assert_eq!(site["insecureCookies"], true);
+}
+
+/// Behind an HTTPS proxy, insecure cookies only downgrade the cookie
+/// (PX-11 finding 32): refused, whichever of the two settings comes
+/// second, and nothing is saved.
+#[tokio::test]
+async fn insecure_cookies_are_refused_behind_an_https_public_url() {
+    let (_addr, root, dir) = served(
+        "insecure-cookies-https",
+        r#"admin { public_url = "https://media.example.org"; }"#,
+    )
+    .await;
+    let refused = root
+        .setting_set("admin.insecure_cookies".into(), json!(true))
+        .await
+        .unwrap_err();
+    assert_eq!(code(refused), error_code::INVALID_INPUT);
+    assert!(!dir.as_ref().join("runtime.ucl").exists());
+
+    let (_addr, root, _dir) = served("insecure-cookies-then-https", "").await;
+    root.setting_set("admin.insecure_cookies".into(), json!(true))
+        .await
+        .unwrap();
+    let refused = root
+        .setting_set(
+            "admin.public_url".into(),
+            json!("https://media.example.org"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(refused), error_code::INVALID_INPUT);
+    // Plain HTTP behind the proxy is what insecure cookies are for.
+    root.setting_set("admin.public_url".into(), json!("http://10.0.0.6:7421"))
+        .await
+        .unwrap();
 }
 
 /// A sign-in provider's client secret set in the web UI (P3-04): kept as a

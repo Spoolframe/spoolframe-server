@@ -696,7 +696,7 @@ impl Client {
                 expires_in_ms,
                 web_url,
             }) => Ok(DeviceSignIn {
-                web_url,
+                web_url: web_page(web_url),
                 server: server.to_string(),
                 link: device_sign_in::link(&server.to_string(), &code),
                 display_code: device_sign_in::display(&code),
@@ -1613,6 +1613,44 @@ async fn load_or_create_key(storage: &dyn Storage) -> Result<SecretKey, SdkError
         .await?;
     tracing::info!(id = %key.public(), "made this device's key");
     Ok(key)
+}
+
+/// `url`, if it is a web page an app may open or show as a QR code: an
+/// `http` or `https` URL with a host. A server sends it (`ServerInfo`,
+/// `DeviceSignInStarted`), and a malicious one could send a `file:` or an
+/// app's own scheme instead (PX-11, PX-09 finding 18); that is dropped,
+/// as if the server had no web UI.
+pub(crate) fn web_page(url: Option<String>) -> Option<String> {
+    let url = url?;
+    if !is_web_page(&url) {
+        tracing::warn!(url, "the server's web_url is not an http(s) page; not used");
+        return None;
+    }
+    Some(url)
+}
+
+/// `scheme://host...` with an `http` or `https` scheme (any case) and a
+/// host, and nothing an opener could read another way: no whitespace or
+/// control characters. Parsed by hand, so the SDK (and the apps' lock
+/// files) take no URL parser for it.
+fn is_web_page(url: &str) -> bool {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host_port.strip_prefix('[') {
+        // An IPv6 literal, `[::1]:7421`.
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    !host.is_empty()
 }
 
 #[cfg(test)]

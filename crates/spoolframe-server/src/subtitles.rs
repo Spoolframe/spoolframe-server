@@ -110,7 +110,7 @@ impl Subtitles {
         ffprobe: PathBuf,
         settings: &OcrSettings,
     ) -> std::io::Result<Self> {
-        std::fs::create_dir_all(&settings.cache_dir)?;
+        crate::files::private_dir(&settings.cache_dir)?;
         let work = settings.cache_dir.join("work");
         if work.exists() {
             std::fs::remove_dir_all(&work)?;

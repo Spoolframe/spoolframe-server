@@ -157,6 +157,22 @@ pub fn plex_catalog(
     ))
 }
 
+/// Whether `layers` turn insecure cookies on behind an `https` public URL
+/// (PX-11 finding 32). A change that makes it so is refused, whichever of
+/// the two it sets; a config file that already says so only gets the
+/// warning at start.
+fn insecure_over_https(layers: &Layers) -> bool {
+    layers.config().is_ok_and(|config| {
+        config.admin.insecure_cookies()
+            && config
+                .admin
+                .public_url
+                .as_deref()
+                .and_then(|u| url::Url::parse(u).ok())
+                .is_some_and(|u| u.scheme() == "https")
+    })
+}
+
 impl RuntimeSettings {
     pub fn new(layers: Layers, state_dir: &Path, live: Live, supervised: bool) -> Self {
         Self {
@@ -322,6 +338,16 @@ impl RuntimeSettings {
     ) -> Result<(), ChangeError> {
         let mut layers = self.layers.lock().expect("never held across a panic");
         let changed = change(&layers)?;
+        if insecure_over_https(&changed) && !insecure_over_https(&layers) {
+            return Err(SettingError::Invalid(ConfigError::Invalid {
+                key: "admin.insecure_cookies",
+                message: "insecure cookies cannot be on while admin.public_url is https: \
+                          behind a TLS proxy they would only send the session cookie \
+                          without Secure"
+                    .into(),
+            })
+            .into());
+        }
         changed.write_runtime().map_err(ChangeError::Write)?;
         let (before, after) = (layers.merged(), changed.merged());
         let plex_changed = ["plex", "libraries"]

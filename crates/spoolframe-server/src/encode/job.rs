@@ -204,7 +204,9 @@ impl Jobs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        std::fs::create_dir_all(&dir)?;
+        // The scratch directory may be shared (`/tmp`): only the jobs'
+        // own is closed to others.
+        crate::files::private_dir(&dir)?;
         Ok(Self {
             places: Arc::new(std::sync::Mutex::new(Places {
                 taken: 0,

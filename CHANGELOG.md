@@ -2102,3 +2102,71 @@
   in the state directory as `last-path-check.json` (mode 0600, written
   whole through a temporary file), holding a hash of what it read rather
   than the paths.
+- The NixOS module and the server are hardened (PX-11 findings 32-36,
+  38):
+  - The module locks `admin.insecure_cookies` off. The new
+    `admin.allowInsecureCookies` option leaves the setting to the web UI.
+    The server refuses a change that turns insecure cookies on while
+    `admin.public_url` is `https`, or that sets an `https` public URL while
+    they are on. This applies to `settingSet` and to the setup code's page
+    (`/auth/setup/check`), which answers 400. A config file that already
+    has both still only gets the start-up warning.
+  - The module's `admin.listen` default is now `127.0.0.1:7421`, not every
+    IPv4 interface. Set it to another address only with a TLS proxy in
+    front. `null` still gives the server's own default.
+  - The unit gets `UMask=0077`, `MemoryHigh`/`MemoryMax`/`TasksMax` (the
+    new `resources.*` options, 6G/8G/4096 by default), a system call
+    filter (`@system-service`, without `@privileged` and `@resources`, but
+    with `setpriority` and `ioprio_set`, which the previews use; refused
+    calls fail with EPERM), `SystemCallArchitectures=native`,
+    `ProtectProc=invisible`, `ProcSubset=pid`, `ProtectClock`,
+    `ProtectHostname`, `ProtectKernelLogs`, `RestrictSUIDSGID`,
+    `RemoveIPC`, and `PrivateUsers` when no GPU is used. `ProtectHome` is
+    now `true`; the new `mediaUnderHome` option makes it read-only again.
+    VA-API gets only its render node (`transcode.vaapiDevice`), not every
+    DRM node. `MemoryDenyWriteExecute` is not set: GPU drivers make code
+    at run time. The VM test scores the unit with `systemd-analyze
+    security`.
+  - The server sets its umask to 077 at start. The database is created
+    0600, and an existing database, WAL and WAL index are made 0600 at
+    start. The backup before migration 0012 is 0600. The cache
+    directories are made 0700, ones an older server left open included.
+  - The module opens the Plex discovery port (UDP 32415) only with
+    `openFirewall`, or on the interfaces in the new
+    `plexDiscovery.interfaces` option. Before, it opened it on every
+    interface whenever the firewall was on. The server now takes a GDM
+    answer only from a network of the interface it came in on, or from
+    one of the host's own addresses.
+  - The server warns at start, and the module warns at evaluation, when
+    the admin listener is on loopback, `public_url` is set and
+    `trusted_proxies` is empty: a proxy on the same host that the server
+    is not told about.
+- The admin listener's answers are hardened (PX-11 findings 21, 37 and
+  13):
+  - Insecure cookies (`admin.insecure_cookies`) drop only `Secure` now.
+    The session and sign-in provider cookies stay `HttpOnly`, so page
+    scripts cannot read them over plain HTTP either. The web UI's texts
+    about insecure cookies say so.
+  - Every answer carries `X-Content-Type-Options: nosniff`,
+    `X-Frame-Options: DENY` and a content security policy fitted to the
+    web UI: `default-src 'self'; script-src 'self' 'wasm-unsafe-eval';
+    style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:;
+    font-src 'self'; connect-src 'self'; object-src 'none';
+    base-uri 'none'; form-action 'self'; frame-ancestors 'none'`. The
+    wasm needs `wasm-unsafe-eval`. The app sets `style` attributes and
+    puts its font faces in a `<style>` element, which needs
+    `unsafe-inline` for styles. Pages that a debug build takes from
+    `dx serve` get no policy, so hot reload keeps working. `/auth/*`,
+    `/jsonrpc` and every JSON answer get `Cache-Control: no-store`.
+  - `/catalog/artwork` serves only JPEG, PNG and WebP. Any other type
+    from Plex, SVG included, gets 502 and a warning in the log.
+- The SDK passes on a server's `web_url` only when it is an `http` or
+  `https` URL with a host (PX-11, PX-09 finding 18). Any other one in
+  `ServerInfo` (`Session::web_url`) or `DeviceSignInStarted`
+  (`DeviceSignIn::web_url`), such as `file:` or an app's own scheme, is
+  dropped with a warning, as if the server had no web UI.
+- `deny.toml` and `deny-sdk.toml` list the two accepted advisories with
+  their reasons (PX-11 finding 39, PX-09 C-15): RUSTSEC-2023-0071 (`rsa`,
+  used only to verify OIDC ID token signatures) and RUSTSEC-2024-0436
+  (`paste`, an unmaintained build-time proc-macro). `cargo deny --locked
+  check advisories` now passes on both, so a new advisory fails it.

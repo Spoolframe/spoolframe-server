@@ -44,6 +44,12 @@ pub enum StoreError {
         from: PathBuf,
         source: std::io::Error,
     },
+    /// The database or its backup could not be made private.
+    #[error("cannot make {path} readable by the server's user only: {source}")]
+    Private {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -64,6 +70,28 @@ impl Store {
     /// it, the secrets named by user id take the new ids.
     pub async fn open(state_dir: &Path) -> Result<Self, StoreError> {
         let path = state_dir.join(DB_FILE);
+        // Password, PIN and session hashes (PX-11 finding 35): the
+        // server's user's only, whatever the umask. SQLite makes the WAL
+        // and its index with the database's mode; ones an older server
+        // left are closed here.
+        crate::files::private_file(&path).map_err(|source| StoreError::Private {
+            path: path.clone(),
+            source,
+        })?;
+        for suffix in ["-wal", "-shm"] {
+            let side = state_dir.join(format!("{DB_FILE}{suffix}"));
+            let private =
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600);
+            match std::fs::set_permissions(&side, private) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(StoreError::Private {
+                        path: side,
+                        source: e,
+                    });
+                }
+                _ => {}
+            }
+        }
         let options = SqliteConnectOptions::from_str("sqlite:")
             .map_err(|source| StoreError::Open {
                 path: path.clone(),
@@ -167,6 +195,50 @@ pub(crate) mod tests {
         Store::open(dir.as_ref()).await.unwrap().pool.close().await;
         // A migration applied twice would fail on CREATE TABLE.
         Store::open(dir.as_ref()).await.unwrap();
+    }
+
+    /// `path`'s permission bits.
+    pub(crate) fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// The database holds password hashes and session hashes (PX-11
+    /// finding 35): only the server's user reads it, or its WAL, whatever
+    /// the umask.
+    #[tokio::test]
+    async fn the_database_and_its_wal_are_readable_by_the_server_s_user_only() {
+        let dir = state_dir("modes").await;
+        let store = Store::open(dir.as_ref()).await.unwrap();
+        for file in [DB_FILE, "spoolframe.db-wal", "spoolframe.db-shm"] {
+            assert_eq!(mode(&dir.as_ref().join(file)), 0o600, "{file}");
+        }
+        store.pool.close().await;
+    }
+
+    /// One made by an older server, readable by everyone, is made private
+    /// at the next start.
+    #[tokio::test]
+    async fn a_database_left_readable_by_others_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = state_dir("modes-old").await;
+        let store = Store::open(dir.as_ref()).await.unwrap();
+        store.pool.close().await;
+        for file in [DB_FILE, "spoolframe.db-wal", "spoolframe.db-shm"] {
+            let path = dir.as_ref().join(file);
+            if path.exists() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        let store = Store::open(dir.as_ref()).await.unwrap();
+        for file in [DB_FILE, "spoolframe.db-wal", "spoolframe.db-shm"] {
+            assert_eq!(mode(&dir.as_ref().join(file)), 0o600, "{file}");
+        }
+        store.pool.close().await;
     }
 
     #[tokio::test]

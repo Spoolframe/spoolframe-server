@@ -84,7 +84,7 @@ impl Cache {
     /// there are kept, the most recently used last; a set left half
     /// written by a stopped server is removed.
     pub fn open(dir: &Path, limit: u64) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        crate::files::private_dir(dir)?;
         let mut found = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let path = entry?.path();

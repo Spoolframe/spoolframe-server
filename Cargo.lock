@@ -6251,6 +6251,7 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "futures-util",
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

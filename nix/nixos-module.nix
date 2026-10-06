@@ -16,6 +16,9 @@
   nvenc = uses "nvenc";
   gpu = vaapi || nvenc;
 
+  # A loopback listen address: the proxy in front of it is on this host.
+  loopback = listen: listen != null && (lib.hasPrefix "127." listen || lib.hasPrefix "[::1]:" listen);
+
   # systemd hands the Plex token to the service as a credential, so the
   # secret file can stay root-only.
   tokenCredential = "/run/credentials/spoolframe.service/plex-token";
@@ -66,6 +69,7 @@
     }
     admin {
       ${lib.optionalString (cfg.admin.listen != null) "listen = ${quote cfg.admin.listen};"}
+      ${lib.optionalString (!cfg.admin.allowInsecureCookies) "insecure_cookies = false;"}
       ${lib.optionalString (cfg.admin.publicUrl != null) "public_url = ${quote cfg.admin.publicUrl};"}
       ${lib.optionalString (cfg.admin.trustedProxies != []) "trusted_proxies = ${quote (lib.concatStringsSep ", " cfg.admin.trustedProxies)};"}
     }
@@ -214,32 +218,49 @@ in {
           Plex's own (32410-32414), which a Plex server on this host holds.
         '';
       };
+
+      interfaces = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [];
+        example = ["eno1"];
+        description = ''
+          The interfaces {option}`plexDiscovery.port` is opened on when
+          {option}`openFirewall` is off. With neither, the port stays
+          closed and discovery finds nothing through the firewall (an
+          address can still be typed). The server takes an answer only
+          from a network of the interface it came in on.
+        '';
+      };
     };
 
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
       description = ''
-        Open {option}`port` and, with {option}`mdns`, UDP 5353, on every
+        Open {option}`port`, with {option}`mdns` UDP 5353, and with
+        {option}`plexDiscovery.enable` the discovery port, on every
         interface. Leave it off and open them per interface when the host
-        has more networks than the LAN.
+        has more networks than the LAN
+        ({option}`plexDiscovery.interfaces` for the discovery port).
       '';
     };
 
     admin = {
       listen = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
-        default = null;
-        example = "127.0.0.1:7421";
+        example = "0.0.0.0:7421";
+        default = "127.0.0.1:7421";
         description = ''
           Where the web UI and the admin API (JSON-RPC over WebSocket, the
-          `spoolframe` CLI's) listen; null is the server's default, every
-          IPv4 interface on TCP 7421. Passwords cross it in clear: put a
-          TLS proxy (nginx, Caddy) in front, with {option}`admin.publicUrl`,
-          and listen on loopback when the proxy is on this host. Over plain
-          HTTP on the LAN (the firewall's TCP port opened by hand) the
-          setup code and the wizard work, but signing in sticks only with
-          the web UI's insecure cookies setting.
+          `spoolframe` CLI's) listen. Loopback by default (PX-11): reach it
+          through a TLS proxy (nginx, Caddy) on this host, with
+          {option}`admin.publicUrl` and {option}`admin.trustedProxies`, or
+          through an SSH tunnel. Passwords cross it in clear, so give it
+          another address only with a proxy in front; null is the server's
+          own default, every IPv4 interface. Over plain HTTP on the LAN
+          (the firewall's TCP port opened by hand) the setup code and the
+          wizard work, but signing in sticks only with insecure cookies
+          ({option}`admin.allowInsecureCookies`).
         '';
       };
 
@@ -254,6 +275,18 @@ in {
           an SSH tunnel). Its host is also what passkeys are bound to
           (`localhost` when unset): they need HTTPS, and changing the host
           orphans the ones already made, which the log names at start.
+        '';
+      };
+
+      allowInsecureCookies = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Leave the server's insecure cookies setting to the web UI. Off,
+          the module locks it off: an admin, or the setup code before the
+          first admin, cannot send the session cookie without `Secure`.
+          On is only for signing in over plain HTTP on the LAN; the server
+          still refuses it with an `https` {option}`admin.publicUrl`.
         '';
       };
 
@@ -358,6 +391,40 @@ in {
       '';
     };
 
+    mediaUnderHome = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether media is under /home. Off, the service sees no /home at
+        all (ProtectHome=true); on, it sees /home read-only.
+      '';
+    };
+
+    resources = {
+      memoryHigh = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = "6G";
+        description = ''
+          systemd's MemoryHigh: past it the service is slowed and its
+          memory reclaimed. Transcodes, previews and OCR are what use it.
+          Null leaves it unset.
+        '';
+      };
+      memoryMax = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = "8G";
+        description = "systemd's MemoryMax: past it the kernel kills in the service. Null leaves it unset.";
+      };
+      tasksMax = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.positive;
+        default = 4096;
+        description = ''
+          systemd's TasksMax: threads and processes, ffmpeg's and
+          tesseract's included. Null leaves it unset.
+        '';
+      };
+    };
+
     mediaGroups = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [];
@@ -385,15 +452,28 @@ in {
       }
     ];
 
+    # PX-11 finding 38 (PX-09 finding 29): behind a proxy on this host
+    # every caller looks like loopback unless the proxy is named.
+    warnings = lib.optional (loopback cfg.admin.listen && cfg.admin.publicUrl != null && cfg.admin.trustedProxies == []) ''
+      services.spoolframe: admin.listen is loopback and admin.publicUrl is set, so a proxy on
+      this host is in front, but admin.trustedProxies is empty: every caller looks like
+      loopback, so failed logins are not limited per caller and /metrics, when on, answers
+      whoever the proxy lets in. Set admin.trustedProxies = ["127.0.0.1"].
+    '';
+
     environment.etc."spoolframe/server.ucl".source = configFile;
     environment.systemPackages = [cli];
 
-    networking.firewall.allowedUDPPorts = lib.mkMerge [
-      (lib.mkIf cfg.openFirewall ([cfg.port] ++ lib.optional cfg.mdns 5353))
-      # Answers to the wizard's search for Plex servers: unicast replies
-      # to a multicast send, which the firewall cannot track.
-      (lib.mkIf (cfg.plexDiscovery.enable && config.networking.firewall.enable) [cfg.plexDiscovery.port])
-    ];
+    # Answers to the wizard's search for Plex servers are unicast replies
+    # to a multicast send, which the firewall cannot track: their port is
+    # opened as the others are, everywhere or per interface (PX-11
+    # finding 36).
+    networking.firewall.allowedUDPPorts = lib.mkIf cfg.openFirewall (
+      [cfg.port] ++ lib.optional cfg.mdns 5353 ++ lib.optional cfg.plexDiscovery.enable cfg.plexDiscovery.port
+    );
+    networking.firewall.interfaces = lib.mkIf (cfg.plexDiscovery.enable && !cfg.openFirewall) (
+      lib.genAttrs cfg.plexDiscovery.interfaces (_: {allowedUDPPorts = [cfg.plexDiscovery.port];})
+    );
 
     users.users.spoolframe = {
       isSystemUser = true;
@@ -434,26 +514,56 @@ in {
 
         # Reads media, writes only its state directory.
         ProtectSystem = "strict";
-        ProtectHome = "read-only";
+        ProtectHome =
+          if cfg.mediaUnderHome
+          then "read-only"
+          else true;
         PrivateTmp = true;
+        # What it writes is its own (PX-11 finding 35); the server sets
+        # the same umask itself.
+        UMask = "0077";
         # No other devices; the GPU's only when hardware encoding may be
-        # used.
+        # used: VA-API's one render node, not every DRM node.
         PrivateDevices = !gpu;
         DevicePolicy = "closed";
         DeviceAllow =
-          lib.optionals vaapi ["char-drm rw"]
+          lib.optionals vaapi ["${cfg.transcode.vaapiDevice} rw"]
           ++ lib.optionals nvenc ["char-nvidia-frontend rw" "char-nvidia-uvm rw" "char-nvidia-caps rw"];
+        # The GPU's device nodes belong to groups the service's user is in
+        # (render), which a user namespace would hide.
+        PrivateUsers = !gpu;
         NoNewPrivileges = true;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
+        ProtectKernelLogs = true;
         ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        # Other processes are not its business; its own children's /proc
+        # entries stay (encode jobs are watched through them).
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
         RestrictNamespaces = true;
         RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        RemoveIPC = true;
         LockPersonality = true;
         # Netlink: the endpoint watches the host's interfaces for address
         # changes.
         RestrictAddressFamilies = ["AF_INET" "AF_INET6" "AF_UNIX" "AF_NETLINK"];
         CapabilityBoundingSet = "";
+        SystemCallArchitectures = "native";
+        # A service's usual calls, less the privileged ones and those that
+        # change resource settings, but for the two previews use to run
+        # ffmpeg at the lowest CPU and I/O priority. A refused call fails
+        # with EPERM rather than killing the server.
+        SystemCallFilter = ["@system-service" "~@privileged @resources" "setpriority ioprio_set"];
+        SystemCallErrorNumber = "EPERM";
+        # MemoryDenyWriteExecute is left out: GPU drivers JIT shaders, and
+        # the VM test has no GPU to show it safe with them.
+        MemoryHigh = lib.mkIf (cfg.resources.memoryHigh != null) cfg.resources.memoryHigh;
+        MemoryMax = lib.mkIf (cfg.resources.memoryMax != null) cfg.resources.memoryMax;
+        TasksMax = lib.mkIf (cfg.resources.tasksMax != null) cfg.resources.tasksMax;
       };
     };
   };

@@ -65,7 +65,7 @@ async fn the_setup_code_page_turns_insecure_cookies_on_for_the_admin_made_next()
     .await;
     let cookie = made.headers()["set-cookie"].to_str().unwrap().to_owned();
     assert!(
-        !cookie.contains("Secure") && !cookie.contains("HttpOnly"),
+        !cookie.contains("Secure") && cookie.contains("HttpOnly"),
         "{cookie}"
     );
     let saved = std::fs::read_to_string(dir.as_ref().join("runtime.ucl")).unwrap();
@@ -79,6 +79,34 @@ async fn the_setup_code_page_turns_insecure_cookies_on_for_the_admin_made_next()
     )
     .await;
     assert_eq!(again.status(), 409);
+}
+
+/// Behind an HTTPS proxy the setup code cannot turn insecure cookies on
+/// (PX-11 finding 32): they would only downgrade the cookie.
+#[tokio::test]
+async fn the_setup_code_page_cannot_turn_insecure_cookies_on_behind_https() {
+    let (addr, dir) = served_with(
+        "setup-check-https",
+        r#"admin { public_url = "https://media.example.org"; }"#,
+        Wizard::default(),
+    )
+    .await;
+    let refused = post(
+        addr,
+        "/auth/setup/check",
+        json!({ "code": CODE, "insecureCookies": true }),
+    )
+    .await;
+    assert_eq!(refused.status(), 400);
+    assert!(!dir.as_ref().join("runtime.ucl").exists());
+    // Without them, the code is still checked as right.
+    let right = post(
+        addr,
+        "/auth/setup/check",
+        json!({ "code": CODE, "insecureCookies": false }),
+    )
+    .await;
+    assert!(right.status().is_success(), "{right:?}");
 }
 
 #[tokio::test]

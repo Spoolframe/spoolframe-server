@@ -17,7 +17,7 @@ pub mod config;
 pub mod connected;
 pub mod device_sign_in;
 pub mod encode;
-mod files;
+pub mod files;
 pub mod identity;
 mod keyed_locks;
 pub mod libraries;
