@@ -316,7 +316,7 @@ impl Store {
         user: LocalUserId,
         keep: &str,
     ) -> Result<u64, StoreError> {
-        Ok(sqlx::query(
+        let revoked = sqlx::query(
             "UPDATE sessions SET revoked_at = ?3 \
              WHERE user_id = ?1 AND token_hash != ?2 AND revoked_at IS NULL",
         )
@@ -325,7 +325,9 @@ impl Store {
         .bind(now())
         .execute(&self.pool)
         .await?
-        .rows_affected())
+        .rows_affected();
+        self.note_sessions_ended();
+        Ok(revoked)
     }
 
     /// Revoke one session. Revoking an unknown or already revoked one is
@@ -338,7 +340,24 @@ impl Store {
         .bind(now())
         .execute(&self.pool)
         .await?;
+        self.note_sessions_ended();
         Ok(())
+    }
+
+    /// Whether `endpoint_id` is a device with a live session (PX-10): one
+    /// not revoked, not expired, and its user not disabled. Such a device
+    /// gets the normal connection limits; any other is a stranger.
+    pub async fn endpoint_signed_in(&self, endpoint_id: &str) -> Result<bool, StoreError> {
+        let (live,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id \
+               WHERE s.kind = 'endpoint' AND s.endpoint_id = ?1 AND s.revoked_at IS NULL \
+                 AND s.expires_at > ?2 AND u.disabled_at IS NULL)",
+        )
+        .bind(endpoint_id)
+        .bind(now())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(live)
     }
 }
 

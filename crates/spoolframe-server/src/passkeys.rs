@@ -46,6 +46,12 @@ pub const CEREMONY_LIFETIME: Duration = Duration::from_secs(5 * 60);
 /// so they are counted: past this, a new one waits for an old one to end.
 pub const MAX_SIGN_INS: usize = 10_000;
 
+/// Sign-ins one source (a remote address) may have begun and not finished
+/// (PX-10): a person signs in once at a time, so one source cannot fill
+/// [`MAX_SIGN_INS`]. A caller with no source (loopback, or a proxy not in
+/// `admin.trusted_proxies`) is not counted apart.
+pub const MAX_SIGN_INS_PER_SOURCE: usize = 16;
+
 /// What the relying party is called in a browser's prompt.
 const RP_NAME: &str = "Spoolframe";
 
@@ -222,6 +228,10 @@ impl RelyingParty {
     }
 }
 
+/// A sign-in begun: its state, when it is over, and the source that
+/// began it, if it has one.
+type SignInBegun = (DiscoverableAuthentication, Instant, Option<String>);
+
 /// The server's passkeys: its relying party, if it can be one, and the
 /// ceremonies begun.
 pub struct Passkeys {
@@ -230,7 +240,7 @@ pub struct Passkeys {
     /// them: one at a time each.
     registrations: Mutex<HashMap<String, (PasskeyRegistration, Instant)>>,
     /// Sign-ins begun, by the ceremony id the browser was given.
-    sign_ins: Mutex<HashMap<String, (DiscoverableAuthentication, Instant)>>,
+    sign_ins: Mutex<HashMap<String, SignInBegun>>,
     /// First admins' registrations begun (P3-01), by the ceremony id the
     /// browser was given: there is no session, or user, to key them by.
     setups: Mutex<HashMap<String, (Setup, Instant)>>,
@@ -428,7 +438,12 @@ impl Passkeys {
     /// browser's `navigator.credentials.get` takes. No credential is
     /// listed, so the browser offers the passkeys it finds for this host,
     /// on the device or on a phone.
-    pub fn begin_sign_in(&self) -> Result<(String, RequestChallengeResponse), SignInError> {
+    ///
+    /// At most [`MAX_SIGN_INS_PER_SOURCE`] are held for one `source`.
+    pub fn begin_sign_in(
+        &self,
+        source: Option<&str>,
+    ) -> Result<(String, RequestChallengeResponse), SignInError> {
         let party = self
             .party
             .as_ref()
@@ -443,14 +458,23 @@ impl Passkeys {
         options.mediation = None;
         let mut sign_ins = self.sign_ins.lock().expect("never held across a panic");
         let now = Instant::now();
-        sign_ins.retain(|_, (_, expires_at)| *expires_at > now);
-        if sign_ins.len() >= MAX_SIGN_INS {
+        sign_ins.retain(|_, (_, expires_at, _)| *expires_at > now);
+        let from_source = source.map_or(0, |source| {
+            sign_ins
+                .values()
+                .filter(|(_, _, from)| from.as_deref() == Some(source))
+                .count()
+        });
+        if sign_ins.len() >= MAX_SIGN_INS || from_source >= MAX_SIGN_INS_PER_SOURCE {
             return Err(SignInError::RateLimited {
                 retry_after: CEREMONY_LIFETIME,
             });
         }
         let ceremony = SessionToken::generate().0;
-        sign_ins.insert(ceremony.clone(), (state, now + CEREMONY_LIFETIME));
+        sign_ins.insert(
+            ceremony.clone(),
+            (state, now + CEREMONY_LIFETIME, source.map(str::to_owned)),
+        );
         Ok((ceremony, options))
     }
 
@@ -474,8 +498,8 @@ impl Passkeys {
                     .lock()
                     .expect("never held across a panic")
                     .remove(ceremony)
-                    .filter(|(_, expires_at)| *expires_at > Instant::now())
-                    .map(|(state, _)| state)
+                    .filter(|(_, expires_at, _)| *expires_at > Instant::now())
+                    .map(|(state, _, _)| state)
                     .ok_or("the sign-in was not begun, or is over")
             })
             .await

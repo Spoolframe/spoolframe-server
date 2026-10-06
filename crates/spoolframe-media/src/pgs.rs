@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::bitmap::{Cue, Image, push};
+use crate::bitmap::{Cue, Image, MAX_SIDE, push};
 
 const PCS: u8 = 0x16;
 const WDS: u8 = 0x17;
@@ -27,6 +27,8 @@ pub enum PgsError {
     Truncated(usize),
     #[error("a {0} segment is too short")]
     Short(&'static str),
+    #[error("a {width} × {height} picture is larger than {MAX_SIDE} × {MAX_SIDE}")]
+    TooLarge { width: usize, height: usize },
 }
 
 /// What one PCS asks to show.
@@ -120,6 +122,9 @@ pub fn cues(stream: &[u8]) -> Result<Vec<Cue>, PgsError> {
                     }
                     let width = usize::from(u16::from_be_bytes([data[3], data[4]]));
                     let height = usize::from(u16::from_be_bytes([data[5], data[6]]));
+                    if width > MAX_SIDE || height > MAX_SIDE {
+                        return Err(PgsError::TooLarge { width, height });
+                    }
                     data = &data[7..];
                     partial.insert(id, (width, height, Vec::new()));
                 }
@@ -151,7 +156,7 @@ pub fn cues(stream: &[u8]) -> Result<Vec<Cue>, PgsError> {
                     .get(&composition.palette)
                     .copied()
                     .unwrap_or([0; 256]);
-                shown = render(&composition, &objects, &palette)
+                shown = render(&composition, &objects, &palette)?
                     .map(|image| (composition.pts_ms, image));
             }
             WDS => {}
@@ -239,12 +244,13 @@ fn decode_rle(data: &[u8], width: usize, height: usize) -> Vec<u8> {
 
 /// The composition's objects drawn where they sit, cut to the box around
 /// them, as dark text on white with a margin (tesseract reads text that
-/// touches the edge badly). `None` if nothing shows.
+/// touches the edge badly). `None` if nothing shows; an error if the box
+/// is larger than [`MAX_SIDE`] a side.
 fn render(
     composition: &Composition,
     objects: &HashMap<u16, Object>,
     palette: &Palette,
-) -> Option<Image> {
+) -> Result<Option<Image>, PgsError> {
     const MARGIN: usize = 16;
     let placed: Vec<(&Placed, Object)> = composition
         .objects
@@ -252,10 +258,18 @@ fn render(
         .filter_map(|p| Some((p, cropped(objects.get(&p.object)?, p.crop))))
         .filter(|(_, o)| o.width > 0 && o.height > 0)
         .collect();
-    let left = placed.iter().map(|(p, _)| p.x).min()?;
-    let top = placed.iter().map(|(p, _)| p.y).min()?;
-    let right = placed.iter().map(|(p, o)| p.x + o.width).max()?;
-    let bottom = placed.iter().map(|(p, o)| p.y + o.height).max()?;
+    let (Some(left), Some(top), Some(right), Some(bottom)) = (
+        placed.iter().map(|(p, _)| p.x).min(),
+        placed.iter().map(|(p, _)| p.y).min(),
+        placed.iter().map(|(p, o)| p.x + o.width).max(),
+        placed.iter().map(|(p, o)| p.y + o.height).max(),
+    ) else {
+        return Ok(None);
+    };
+    let (width, height) = (right - left, bottom - top);
+    if width > MAX_SIDE || height > MAX_SIDE {
+        return Err(PgsError::TooLarge { width, height });
+    }
     let mut image = Image::blank(right - left + 2 * MARGIN, bottom - top + 2 * MARGIN, 255);
     let mut ink = false;
     for (p, object) in &placed {
@@ -271,7 +285,7 @@ fn render(
             }
         }
     }
-    ink.then_some(image)
+    Ok(ink.then_some(image))
 }
 
 /// Writes `.sup` streams, for tests: ffmpeg decodes PGS but cannot encode
@@ -444,6 +458,59 @@ mod tests {
     /// margin.
     fn ink(image: &Image) -> Vec<bool> {
         image.pixels.iter().map(|&p| p < 128).collect()
+    }
+
+    /// A stream showing one `width` × `height` object, all text, once at
+    /// each of `xs` on the top line (PX-09 B-3).
+    fn placed(width: u16, height: u16, xs: &[u16]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pcs = fixture::composition(0, 0x80);
+        pcs[10] = xs.len() as u8;
+        for x in xs {
+            pcs.extend([0, 0, 0, 0]);
+            pcs.extend(x.to_be_bytes());
+            pcs.extend(0u16.to_be_bytes());
+        }
+        fixture::segment(&mut out, 0, PCS, &pcs);
+        fixture::segment(&mut out, 0, PDS, &[0, 0, 1, 235, 128, 128, 255]);
+        // One line of text when small; past that the lines are padded.
+        let line = vec![1; usize::from(width).min(64)];
+        let rle = fixture::rle(&line, line.len());
+        let mut data = Vec::new();
+        data.extend(&((rle.len() + 4) as u32).to_be_bytes()[1..]);
+        data.extend(width.to_be_bytes());
+        data.extend(height.to_be_bytes());
+        data.extend(rle);
+        let mut ods = vec![0, 0, 0, 0xc0];
+        ods.extend(data);
+        fixture::segment(&mut out, 0, ODS, &ods);
+        fixture::segment(&mut out, 0, END, &[]);
+        // Cleared, so the cue has an end.
+        fixture::segment(&mut out, 1_000, PCS, &fixture::composition(1, 0));
+        fixture::segment(&mut out, 1_000, END, &[]);
+        out
+    }
+
+    /// PX-09 B-3: an ODS header says 65535 × 65535, which would be 4 GiB of
+    /// pixels; the stream is refused instead.
+    #[test]
+    fn an_object_of_65535_squared_is_an_error() {
+        assert!(cues(&placed(0xffff, 0xffff, &[0])).is_err());
+    }
+
+    /// Just past the cap, as small as that allows.
+    #[test]
+    fn an_object_wider_than_4096_is_an_error() {
+        assert!(cues(&placed(4096, 1, &[0])).is_ok());
+        assert!(cues(&placed(4097, 1, &[0])).is_err());
+    }
+
+    /// Small objects placed far apart would make one picture as wide as
+    /// the gap between them.
+    #[test]
+    fn objects_placed_further_apart_than_4096_are_an_error() {
+        assert_eq!(cues(&placed(8, 1, &[0, 3_000])).unwrap().len(), 1);
+        assert!(cues(&placed(8, 1, &[0, 60_000])).is_err());
     }
 
     #[test]

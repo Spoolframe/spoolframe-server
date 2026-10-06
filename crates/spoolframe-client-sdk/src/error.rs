@@ -54,7 +54,13 @@ pub enum SdkError {
     #[error("expected server {expected}, but {actual} answered")]
     WrongServer { expected: String, actual: String },
     /// The session is gone (revoked, expired, user disabled) and was
-    /// forgotten; the user has to sign in again.
+    /// forgotten; the user has to sign in again. Their profile stays in
+    /// [`crate::Client::saved_profiles`]. It comes from the server's
+    /// answer, or from the server closing the connection with
+    /// [`spoolframe_protocol::close::SIGNED_OUT`]: then a call cut off by
+    /// the close gets it, and every later call in a session of that
+    /// server, without dialling ([`crate::Client::signed_out`]). Do not
+    /// retry it; show "Who's watching" or the sign-in.
     #[error("sign in again")]
     SignInRequired,
     #[error("the username or password is wrong")]
@@ -77,6 +83,14 @@ pub enum SdkError {
     /// again later, or pick tracks that play without converting.
     #[error("the server is busy converting other files")]
     Busy,
+    /// The server holds as many devices with no session as it takes, and
+    /// closed this connection ([`spoolframe_protocol::close::BUSY`],
+    /// PX-10). Nothing is wrong with the network or the server: say it is
+    /// busy, and let the user try again in a while; the SDK does not dial
+    /// again by itself. A device that is signed in is always let in, so
+    /// this comes before a sign-in, or once every session here has ended.
+    #[error("the server is busy; try again later")]
+    ServerFull,
     /// The conversion failed, with ffmpeg's reason.
     #[error("the conversion failed: {0}")]
     PlaybackFailed(String),

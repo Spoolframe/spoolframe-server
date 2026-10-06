@@ -280,7 +280,7 @@ mod tests {
             store.unlink_identity(alice, ISSUER).await,
             Err(IdentityError::LastSignInMethod)
         ));
-        store.set_password("alice", "phc").await.unwrap();
+        store.set_password("alice", "phc", None).await.unwrap();
         store.unlink_identity(alice, ISSUER).await.unwrap();
         assert_eq!(store.user_identities(alice).await.unwrap(), []);
         // Bob has no link to remove.

@@ -120,6 +120,9 @@ async fn a_disabled_user_s_session_stops_working() {
     tv.hello().await;
     let alice = tv.login("alice", "correct horse").await;
     server.store.disable_user("alice").await.unwrap();
+    // Its last session gone, the TV's connection is closed (PX-10).
+    tv.conn.closed().await;
+    let tv = tv.reconnect(&server).await;
     assert_eq!(
         who(&tv, &alice).await,
         Response::Err(Error::Unauthenticated)

@@ -928,3 +928,33 @@ async fn requests_and_their_failures_are_counted_across_views() {
     assert_eq!((counts.requests, counts.errors), (3, 1));
     assert_eq!(counts.buckets.last().unwrap().1, 3);
 }
+
+/// PX-09 finding 5 (B-2): a PMS that answers with a redirect to another
+/// host does not get the token sent there; the redirect is not followed.
+#[tokio::test]
+async fn a_redirect_to_another_server_does_not_carry_the_token() {
+    let elsewhere = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": { "friendlyName": "Elsewhere" }
+        })))
+        .mount(&elsewhere)
+        .await;
+    let pms = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", format!("{}/", elsewhere.uri())),
+        )
+        .mount(&pms)
+        .await;
+
+    let catalog = PlexCatalog::new(pms.uri().parse().unwrap(), Some("s3cr3t".into())).unwrap();
+    let _ = catalog.identity().await;
+
+    let reached = elsewhere.received_requests().await.unwrap();
+    let carried: Vec<_> = reached
+        .iter()
+        .filter(|r| r.headers.contains_key("x-plex-token"))
+        .collect();
+    assert!(carried.is_empty(), "the token reached {carried:?}");
+}

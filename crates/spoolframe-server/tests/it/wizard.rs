@@ -218,9 +218,25 @@ async fn signing_in_with_plex_keeps_the_token_and_never_hands_it_out() {
             account: Some("andrey".into())
         }
     );
-    // Kept as the secret, and used.
+    // Kept as the secret, and used for the account's own server, as
+    // plex.tv lists it: never for a URL the account does not reach
+    // (PX-09 B-2).
     let secret = std::fs::read_to_string(dir.as_ref().join("secrets/plex-token")).unwrap();
     assert_eq!(secret, "tok-123");
+    let port = pms.address().port();
+    Mock::given(method("GET"))
+        .and(path("/api/v2/resources"))
+        .and(header("X-Plex-Token", "tok-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "name": "Tower", "provides": "server", "clientIdentifier": "tower-machine",
+              "owned": true, "accessToken": "tok-123",
+              "connections": [
+                { "uri": format!("http://127.0.0.1:{port}"),
+                  "address": "127.0.0.1", "port": port, "local": true, "relay": false },
+              ] },
+        ])))
+        .mount(&tv)
+        .await;
     let probed = root.plex_probe(pms.uri(), None).await.unwrap();
     assert!(probed.reachable, "{probed:?}");
     assert_eq!(probed.server_name.as_deref(), Some("Tower"));
@@ -530,4 +546,69 @@ async fn signing_in_with_plex_to_add_another_server_takes_its_own_token_and_keep
     assert_eq!(kept, "tok-cabin");
     let first = std::fs::read_to_string(dir.as_ref().join("secrets/plex-token")).unwrap();
     assert_eq!(first, "tok-first");
+}
+
+/// A stand-in PMS that answers anyone, token or not, and keeps what it
+/// was sent: a server found on the LAN, which may be anyone's.
+async fn stranger() -> MockServer {
+    let pms = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "MediaContainer": { "friendlyName": "Stranger", "version": "1.41.0" }
+        })))
+        .mount(&pms)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "MediaContainer": { "Directory": [] }
+        })))
+        .mount(&pms)
+        .await;
+    pms
+}
+
+/// The tokens `pms` was sent, in order.
+async fn tokens_sent(pms: &MockServer) -> Vec<String> {
+    pms.received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.headers.get("x-plex-token"))
+        .map(|v| v.to_str().unwrap().to_owned())
+        .collect()
+}
+
+/// PX-09 finding 5 (B-2): probing or adding a server no one gave a token
+/// for sends none, not the first server's; the first server is still
+/// probed with its own.
+#[tokio::test]
+async fn a_server_without_a_token_of_its_own_is_never_sent_another_s() {
+    let tower = pms_wanting("Tower", "tok-first").await;
+    let (addr, dir) = served_with(
+        "plex-no-token-fallback",
+        &format!(r#"plex {{ url = "{}"; }}"#, tower.uri()),
+        Wizard::default(),
+    )
+    .await;
+    let root = root(addr).await;
+    root.setting_set("plex.token".into(), json!("tok-first"))
+        .await
+        .unwrap();
+    let stranger = stranger().await;
+
+    root.plex_probe(stranger.uri(), None).await.unwrap();
+    assert_eq!(tokens_sent(&stranger).await, Vec::<String>::new());
+    let added = root.plex_server_add(stranger.uri(), None).await.unwrap();
+    assert_eq!(tokens_sent(&stranger).await, Vec::<String>::new());
+    assert!(
+        !dir.as_ref()
+            .join(format!("secrets/plex-token-{}", added.id))
+            .exists()
+    );
+
+    // The first server, by its own URL, with its own token.
+    let first = root.plex_probe(tower.uri(), None).await.unwrap();
+    assert!(first.reachable, "{first:?}");
 }

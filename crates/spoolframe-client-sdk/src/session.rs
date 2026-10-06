@@ -446,7 +446,7 @@ impl Session {
         };
         let (reply, bytes) = self
             .client
-            .on_connection(self.server, true, |conn| {
+            .on_connection(self.server, Some(&self.token), true, |conn| {
                 let request = &request;
                 async move {
                     conn.resource(request, maximum, timeouts.of_read(), timeouts.request)
@@ -779,10 +779,11 @@ impl Session {
     /// signing in: a session older than 10 minutes gets
     /// [`SdkError::RecentSignInRequired`] (confirm it is them with
     /// [`Session::confirm_password`] or [`Session::begin_confirm_passkey`],
-    /// then ask).
+    /// then ask). The challenge is made for this session's server, as
+    /// for [`crate::Client::begin_passkey_sign_in`].
     pub async fn begin_passkey_registration(&self) -> Result<PasskeyCreation, SdkError> {
         match self.call(Request::BeginPasskeyRegistration).await? {
-            Reply::PasskeyCreation(creation) => Ok(creation),
+            Reply::PasskeyRegistrationBegun(begun) => Ok(begun.for_server(self.server.as_bytes())),
             other => Err(unexpected(other)),
         }
     }
@@ -857,10 +858,11 @@ impl Session {
     /// API signs, for [`crate::APP_RP_ID`], listing only this user's app
     /// passkeys. The challenge is this session's on this device, for 5
     /// minutes; beginning again replaces it. A user with no app passkey
-    /// gets [`SdkError::NotFound`].
+    /// gets [`SdkError::NotFound`]. The challenge is made for this
+    /// session's server, as for [`crate::Client::begin_passkey_sign_in`].
     pub async fn begin_confirm_passkey(&self) -> Result<PasskeyRequest, SdkError> {
         match self.call(Request::BeginConfirmPasskey).await? {
-            Reply::PasskeyRequest(request) => Ok(request),
+            Reply::PasskeySignInBegun(begun) => Ok(begun.for_server(self.server.as_bytes())),
             other => Err(unexpected(other)),
         }
     }
@@ -1031,7 +1033,7 @@ impl Session {
             .playback_revision(self.server, &self.token, &request.handle)
             .await?;
         self.client
-            .on_connection(self.server, true, |conn| async move {
+            .on_connection(self.server, Some(&self.token), true, |conn| async move {
                 conn.read(request, revision, timeouts.of_read(), timeouts.request)
                     .await
             })
@@ -1156,12 +1158,12 @@ impl Session {
         };
         let request = &request;
         let timeouts = self.client.inner.timeouts;
-        let artwork = self
-            .client
-            .on_connection(self.server, true, |conn| async move {
-                conn.artwork(request, timeouts.request, timeouts.request)
-                    .await
-            });
+        let artwork =
+            self.client
+                .on_connection(self.server, Some(&self.token), true, |conn| async move {
+                    conn.artwork(request, timeouts.request, timeouts.request)
+                        .await
+                });
         match artwork.await? {
             (ArtworkResponse::Ok(_), bytes) => Ok(bytes),
             (ArtworkResponse::Err(e), _) => Err(self.failed(e).await),

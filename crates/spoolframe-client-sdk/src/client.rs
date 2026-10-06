@@ -19,7 +19,7 @@ use spoolframe_types::{ClientCapabilities, Platform};
 use crate::connection::{ServerConnection, Timeouts};
 use crate::discovery::Discovery;
 use crate::error::SdkError;
-use crate::link::{ConnectionPath, Link, StateWatch};
+use crate::link::{ConnectionPath, Link, SignOutWatch, StateWatch};
 use crate::servers::{self, SavedServer, ServerEntry};
 use crate::session::{self, SavedProfile, Session, SignInMethod, StoredSession};
 use crate::storage::{Storage, StorageError, keys};
@@ -520,11 +520,16 @@ impl Client {
 
     /// Begin signing in on server `endpoint_id` with a passkey made in the
     /// app (P3-19): what the platform's passkey API signs, for the relying
-    /// party [`crate::APP_RP_ID`]. With `username`, that user's passkeys
-    /// are listed; without, none are, and the platform offers whichever it
-    /// has for this relying party (a keychain may hold several servers':
-    /// their names say `<username> on <server name>`). The challenge is
-    /// this device's, for 5 minutes; beginning again replaces it.
+    /// party [`crate::APP_RP_ID`]. No passkeys are listed: the platform
+    /// offers whichever it has for this relying party (a keychain may hold
+    /// several servers': their names say `<username> on <server name>`).
+    /// With `username`, only that user's finish it. The challenge is this
+    /// device's, for 5 minutes; beginning again replaces it.
+    ///
+    /// The server sends a nonce; the challenge is
+    /// [`spoolframe_protocol::app_passkey_challenge`] of `endpoint_id`, the
+    /// pinned server dialled, and that nonce (PX-10). A server that hands
+    /// on another server's nonce gets a signature the other refuses.
     pub async fn begin_passkey_sign_in(
         &self,
         endpoint_id: &str,
@@ -536,7 +541,9 @@ impl Client {
             username: username.map(str::to_owned),
         };
         match self.call(server, None, begin).await? {
-            Response::Ok(Reply::PasskeyRequest(request)) => Ok(request),
+            Response::Ok(Reply::PasskeySignInBegun(begun)) => {
+                Ok(begun.for_server(server.as_bytes()))
+            }
             Response::Ok(other) => Err(SdkError::Protocol(format!(
                 "BeginPasskeySignIn answered {other:?}"
             ))),
@@ -786,6 +793,21 @@ impl Client {
         .await
     }
 
+    /// The server signed this device out (`close::SIGNED_OUT`): no session
+    /// is left for it there. End every session kept for `server`, as
+    /// [`Client::end_session`] does; the tokens that were kept.
+    pub(crate) async fn end_every_session(
+        &self,
+        server: EndpointId,
+    ) -> Result<Vec<String>, SdkError> {
+        let mut ended = Vec::new();
+        self.update_sessions(server, |stored| {
+            ended.extend(stored.iter_mut().filter_map(|s| s.token.take()));
+        })
+        .await?;
+        Ok(ended)
+    }
+
     async fn update_sessions(
         &self,
         server: EndpointId,
@@ -802,6 +824,21 @@ impl Client {
     /// Where server `endpoint_id`'s connection stands, and its changes.
     pub fn state(&self, endpoint_id: &str) -> Result<StateWatch, SdkError> {
         Ok(self.link(parse_id(endpoint_id)?).watch())
+    }
+
+    /// Each time server `endpoint_id` signs this device out: it closed the
+    /// connection because the device's last session there ended (signed
+    /// out, revoked, its user disabled; [`spoolframe_protocol::close::SIGNED_OUT`]).
+    /// The server sends that only once no session is left for this
+    /// device, so by the time the watch fires every session kept for the
+    /// server has been ended here, and their users stay on "Who's
+    /// watching", to sign in again ([`Client::saved_profiles`]). A call in
+    /// one of them is [`SdkError::SignInRequired`] without asking the
+    /// server. The SDK does not dial again by itself: a device with no
+    /// session has nothing to keep a connection for, and the server holds
+    /// few of them. The next call dials.
+    pub fn signed_out(&self, endpoint_id: &str) -> Result<SignOutWatch, SdkError> {
+        Ok(self.link(parse_id(endpoint_id)?).sign_outs())
     }
 
     fn link(&self, id: EndpointId) -> Arc<Link> {
@@ -859,7 +896,9 @@ impl Client {
         {
             **guard = Some(self.fetch_revision(server, session, handle).await?);
         }
-        let conn = self.link(server).connection(self).await?;
+        let link = self.link(server);
+        self.not_signed_out(&link, session)?;
+        let conn = link.connection(self).await?;
         let operation = (!retry_safe(&request)).then(|| Operation {
             id: uuid::Uuid::now_v7().to_string(),
             instance: conn.instance.id.clone(),
@@ -880,7 +919,7 @@ impl Client {
         // The exact invocation, including its server incarnation and expiry,
         // is reused on a reconnect. A restarted server refuses it.
         let reply = self
-            .on_connection(server, true, |conn| {
+            .on_connection(server, session, true, |conn| {
                 let wire = &wire;
                 async move { conn.call(wire, limit).await }
             })
@@ -986,7 +1025,7 @@ impl Client {
             expected_revision: None,
         };
         let reply = self
-            .on_connection(server, true, |conn| {
+            .on_connection(server, Some(session), true, |conn| {
                 let wire = &wire;
                 async move { conn.call(wire, self.inner.timeouts.request).await }
             })
@@ -1027,9 +1066,16 @@ impl Client {
     /// exchange that may be repeated (`retry`) runs once more, on a new
     /// connection. A connection that answers the `Ping` is kept: the
     /// server is alive and slow, and asking it again would not help.
+    ///
+    /// A connection the server closed because it signed the device out
+    /// fails an exchange in `session` with [`SdkError::SignInRequired`],
+    /// and the session is ended here. With no session, it is a lost
+    /// connection like any other. A session a sign-out ended is not sent
+    /// at all.
     pub(crate) async fn on_connection<T, F, Fut>(
         &self,
         server: EndpointId,
+        session: Option<&SessionId>,
         retry: bool,
         exchange: F,
     ) -> Result<T, SdkError>
@@ -1038,8 +1084,11 @@ impl Client {
         Fut: Future<Output = Result<T, SdkError>>,
     {
         let link = self.link(server);
+        self.not_signed_out(&link, session)?;
         let conn = link.connection(self).await?;
-        let error = match exchange(conn.clone()).await {
+        self.not_signed_out(&link, session)?;
+        let done = exchange(conn.clone()).await;
+        let error = match self.after_sign_out(&link, session, done).await {
             Err(e) if e.is_transport() => e,
             done => return done,
         };
@@ -1049,11 +1098,46 @@ impl Client {
         }
         tracing::debug!(%server, %error, "asking again on a new connection");
         let conn = link.connection(self).await?;
+        self.not_signed_out(&link, session)?;
         let again = exchange(conn.clone()).await;
+        let again = self.after_sign_out(&link, session, again).await;
         if again.as_ref().is_err_and(SdkError::is_transport) {
             self.drop_if_dead(&link, &conn).await;
         }
         again
+    }
+
+    /// [`SdkError::SignInRequired`] if the server signed this device out
+    /// of `session`.
+    fn not_signed_out(&self, link: &Link, session: Option<&SessionId>) -> Result<(), SdkError> {
+        match session {
+            Some(session) if link.has_ended(session) => Err(SdkError::SignInRequired),
+            _ => Ok(()),
+        }
+    }
+
+    /// `done`, an exchange's outcome, once a sign-out that cut it off is
+    /// handled. An exchange fails with [`SdkError::SignInRequired`] only
+    /// when the server closed its connection with `close::SIGNED_OUT`: a
+    /// server's `Unauthenticated` is in its answer.
+    async fn after_sign_out<T>(
+        &self,
+        link: &Link,
+        session: Option<&SessionId>,
+        done: Result<T, SdkError>,
+    ) -> Result<T, SdkError> {
+        match (done, session) {
+            (Err(SdkError::SignInRequired), Some(session)) => {
+                link.end([session.0.clone()]);
+                self.end_session(link.id(), session).await?;
+                Err(SdkError::SignInRequired)
+            }
+            (Err(SdkError::SignInRequired), None) => Err(SdkError::Unreachable(format!(
+                "{}: the connection closed as the device was signed out",
+                link.id()
+            ))),
+            (done, _) => done,
+        }
     }
 
     /// Drop `conn` if it does not answer a `Ping`; whether it was dropped.

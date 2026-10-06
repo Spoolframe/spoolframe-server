@@ -12,6 +12,12 @@ use spoolframe_types::{
 use crate::codecs;
 use crate::roles::{self, Flags};
 
+/// The longest a file may say it is for what is sized by its length:
+/// frame previews and an HLS grid (PX-09 B-4). The length is ffprobe's,
+/// from the file, so a crafted one can say anything; no film is two days
+/// long.
+pub const MAX_DURATION: Duration = Duration::from_secs(48 * 3600);
+
 /// Everything the server knows about one media file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MediaDescriptor {

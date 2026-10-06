@@ -885,3 +885,29 @@ async fn a_passkey_confirms_its_own_user_and_no_one_else() {
         error_code::PASSKEY_REFUSED
     );
 }
+
+/// PX-09 finding 16 (A-6): anyone may begin a sign-in, so one address may
+/// hold only a few, and the table stays open to everyone else.
+#[tokio::test]
+async fn one_address_cannot_begin_every_passkey_sign_in() {
+    let (addr, _dir) =
+        server_at_behind("passkey-begin-source", ORIGIN, "127.0.0.1".parse().unwrap()).await;
+    let begin_from = |caller: &'static str| async move {
+        reqwest::Client::new()
+            .post(format!("http://{addr}/auth/passkey/begin"))
+            .header("origin", ORIGIN)
+            .header("x-forwarded-for", caller)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    for _ in 0..spoolframe_server::passkeys::MAX_SIGN_INS_PER_SOURCE {
+        assert_eq!(begin_from("203.0.113.1").await, reqwest::StatusCode::OK);
+    }
+    assert_eq!(
+        begin_from("203.0.113.1").await,
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(begin_from("203.0.113.2").await, reqwest::StatusCode::OK);
+}

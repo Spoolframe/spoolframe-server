@@ -223,6 +223,7 @@ fn ChangePassword(first: bool, on_done: EventHandler<bool>) -> Element {
             }
             Field { label: "New password", value: new, kind: "password", autocomplete: "new-password" }
             Field { label: "New password again", value: again, kind: "password", autocomplete: "new-password" }
+            span { class: "hint", "Every other browser and device is signed out. This one stays signed in." }
             if let Some(text) = error() {
                 Alert { text }
             }
@@ -616,7 +617,7 @@ fn PasskeyRow(
 /// passkey `with_password` false, for a user who has none. `about`: what
 /// the change is, "changing your sign-in methods".
 #[component]
-fn ConfirmDialog(
+pub(super) fn ConfirmDialog(
     with_password: bool,
     about: String,
     on_confirmed: EventHandler<()>,
@@ -747,6 +748,57 @@ fn ConfirmDialog(
             }
         }
     }
+}
+
+/// "Confirm it's you" for a change an admin makes on another page (PX-10,
+/// PX-09 finding 3), opened while `asking` holds what the change is ("resetting
+/// a password"). Once confirmed it closes and `on_confirmed` tries the
+/// change again; cancelled, it closes and nothing is tried. The password
+/// is offered if the signed-in user has one now.
+#[component]
+pub(super) fn ConfirmItsYou(
+    asking: Signal<Option<String>>,
+    on_confirmed: EventHandler<()>,
+) -> Element {
+    let mut asking = asking;
+    let me = use_resource(|| async {
+        let client = rpc::client().await?;
+        client.who_am_i().await.map_err(rpc::error)
+    });
+    let Some(about) = asking() else {
+        return rsx! {};
+    };
+    let with_password = match &*me.read() {
+        None => return rsx! {},
+        Some(Ok(user)) => user.has_password,
+        // Offered anyway: the server says if it is wrong.
+        Some(Err(_)) => true,
+    };
+    rsx! {
+        ConfirmDialog {
+            with_password,
+            about,
+            on_confirmed: move |_| {
+                asking.set(None);
+                on_confirmed.call(());
+            },
+            on_cancel: move |_| asking.set(None),
+        }
+    }
+}
+
+/// Whether `e` asks for a recent sign-in: if so, `asking` is set to
+/// `about`, which opens [`ConfirmItsYou`].
+pub(super) fn asks_to_confirm(
+    e: &ApiError,
+    mut asking: Signal<Option<String>>,
+    about: &str,
+) -> bool {
+    let asks = e.code == error_code::RECENT_SIGN_IN_REQUIRED;
+    if asks {
+        asking.set(Some(about.to_owned()));
+    }
+    asks
 }
 
 /// The design's "Web · Add a passkey": name it, see the host it binds

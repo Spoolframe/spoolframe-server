@@ -97,6 +97,13 @@ network {
   # drops. A port another program holds is given up for any free one,
   # with a warning in the log.
   plex_discovery_port = 32415;
+  # The most connections held at once from devices that are not signed
+  # in: new devices signing in, and anyone else who finds the port. One
+  # more is refused until one goes. A signed-in device is always let in.
+  max_stranger_connections = 64;
+  # How long a request may take to arrive once a client opens a stream
+  # for it. A stream that sends nothing in time is reset.
+  first_frame_timeout_secs = 10;
 }
 
 # The admin API (JSON-RPC over WebSocket) and the web UI.

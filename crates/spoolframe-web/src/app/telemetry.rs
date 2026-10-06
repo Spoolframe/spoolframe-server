@@ -11,6 +11,7 @@ use spoolframe_admin_api::{AdminApiClient, Settings, TelemetryStatus};
 use wasm_bindgen::JsValue;
 
 use super::admin::sleep;
+use super::profile::{ConfirmItsYou, asks_to_confirm};
 use super::wizard::{Footer, Mode, Note, entry, load_settings, loading, locked, save, text};
 use super::{Alert, icons, now_ms, page_address, rpc};
 use crate::logic::ApiError;
@@ -135,7 +136,10 @@ fn TelemetryFields(
 
     let headers_were_set = entry(s, "telemetry.otlp.headers").is_some_and(|e| e.set);
     let saved = settings.clone();
-    let on_save = move |_| {
+    // The metrics settings are `admin.*`: from an old session, "Confirm
+    // it's you" first, then the save again.
+    let confirming = use_signal(|| None::<String>);
+    let on_save = use_callback(move |()| {
         let s = saved.clone();
         let endpoint_typed = endpoint().trim().to_owned();
         if otlp_on() && endpoint_typed.is_empty() {
@@ -223,11 +227,12 @@ fn TelemetryFields(
             };
             match done.await {
                 Ok(()) => on_done.call(()),
+                Err(e) if asks_to_confirm(&e, confirming, "changing who reads metrics") => {}
                 Err(e) => error.set(Some(e.explain())),
             }
             busy.set(false);
         });
-    };
+    });
 
     let (status, status_error) = match status {
         Some(Ok(t)) => (Some(t), None),
@@ -565,6 +570,7 @@ fn TelemetryFields(
             Alert { text }
         }
         Footer { mode: Mode::Settings, step: "telemetry", busy: busy(), on_save, on_discard: move |_| on_reload.call(()) }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
     }
 }
 

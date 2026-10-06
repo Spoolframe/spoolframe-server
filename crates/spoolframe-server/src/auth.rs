@@ -126,9 +126,33 @@ pub async fn hash_pin(pin: &str) -> Result<String, PasswordError> {
     hash_secret(pin).await
 }
 
+/// How many Argon2 hashes or verifications may run at once: one a core.
+/// Each takes about 19 MiB and a core for tens of milliseconds, and the
+/// blocking pool would otherwise run up to 512 (PX-10, finding 10).
+pub fn argon2_permits() -> usize {
+    std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
+}
+
+/// Run `work`, an Argon2 hash or verification, off the async threads,
+/// once one of [`argon2_permits`] is free.
+async fn argon2<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    static PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(argon2_permits())));
+    let permit = PERMITS.clone().acquire_owned().await.expect("never closed");
+    // Held by the work itself: a caller that goes away does not free it
+    // while the work still runs.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+}
+
 async fn hash_secret(secret: &str) -> Result<String, PasswordError> {
     let password = secret.to_owned();
-    tokio::task::spawn_blocking(move || {
+    argon2(move || {
         let salt = SaltString::generate(&mut OsRng);
         Argon2::default()
             .hash_password(password.as_bytes(), &salt)
@@ -143,7 +167,7 @@ async fn hash_secret(secret: &str) -> Result<String, PasswordError> {
 /// runs off the async threads.
 async fn verify_password(password: &str, phc: String) -> bool {
     let password = password.to_owned();
-    tokio::task::spawn_blocking(move || {
+    argon2(move || {
         PasswordHash::new(&phc)
             .map(|hash| {
                 Argon2::default()
@@ -192,10 +216,13 @@ const MAX_KEYS: usize = 100_000;
 ///
 /// What an attempt costs does not grow with the attempts of others: the
 /// keys it names are judged exactly, all the others are swept once per
-/// [`SWEEP_INTERVAL`], and at most [`MAX_KEYS`] are held. While it is
-/// full, an attempt under a key it does not hold is refused as limited:
-/// there is no room to count it, and an attempt that cannot be counted
-/// must not be let through.
+/// [`SWEEP_INTERVAL`], and at most [`MAX_KEYS`] are held. When a new key
+/// finds it full, the keys whose failures are all out of the window go,
+/// then those whose last failure is oldest (PX-10, finding 9): names and
+/// sources are free, so refusing new keys instead would let anyone lock
+/// everyone out. Evicting a key forgets its failures; filling the limiter
+/// to evict one takes [`MAX_KEYS`] new keys, each one an attempt, which
+/// the stranger sign-in bucket ([`STRANGER_ATTEMPTS`]) spreads over hours.
 #[derive(Debug)]
 pub struct RateLimiter {
     failures: Mutex<Failures>,
@@ -247,16 +274,15 @@ impl RateLimiter {
             .flatten()
     }
 
-    /// `Some(wait)` if either key has used up its failures, or the limiter
-    /// is full and does not hold one of them.
+    /// `Some(wait)` if either key has used up its failures.
     pub fn check(&self, username: &str, source: Option<&str>, now: Instant) -> Option<Duration> {
         let mut failures = self.failures.lock().expect("never held across a panic");
         self.limited(&mut failures, username, source, now)
     }
 
     /// How long `username` stays limited by its own failures, if it is:
-    /// what the admin pages show (P3-18). A limited source, or a full
-    /// limiter, refuses the user's logins too, but is not theirs to show.
+    /// what the admin pages show (P3-18). A limited source refuses the
+    /// user's logins too, but is not theirs to show.
     pub fn user_limited(&self, username: &str, now: Instant) -> Option<Duration> {
         let mut failures = self.failures.lock().expect("never held across a panic");
         let key = Self::user_key(username);
@@ -316,35 +342,61 @@ impl RateLimiter {
     ) -> Option<Duration> {
         self.sweep(failures, now);
         let mut wait = None;
-        let mut new = 0;
         for key in Self::keys(username, source) {
             self.prune(failures, &key, now);
-            match failures.by_key.get(&key) {
-                Some(times) if times.len() >= MAX_FAILURES => {
-                    wait = wait.max(Some(self.window - now.duration_since(times[0])));
-                }
-                Some(_) => {}
-                None => new += 1,
+            if let Some(times) = failures.by_key.get(&key)
+                && times.len() >= MAX_FAILURES
+            {
+                wait = wait.max(Some(self.window - now.duration_since(times[0])));
             }
-        }
-        if wait.is_none() && failures.by_key.len() + new > self.max_keys {
-            // Room comes with a sweep.
-            return Some(SWEEP_INTERVAL);
         }
         wait
     }
 
-    /// Count a failure. While the limiter is full, not under a key it does
-    /// not hold: [`RateLimiter::check`] refuses such an attempt before it
-    /// is made.
+    /// Make room for the keys of an attempt by `username` from `source`
+    /// that are not held yet: drop every key out of the window, then the
+    /// keys whose last failure is oldest. The attempt's own keys stay.
+    fn make_room(
+        &self,
+        failures: &mut Failures,
+        username: &str,
+        source: Option<&str>,
+        now: Instant,
+    ) {
+        let keys: Vec<String> = Self::keys(username, source).collect();
+        let new = keys
+            .iter()
+            .filter(|key| !failures.by_key.contains_key(*key))
+            .count();
+        if failures.by_key.len() + new <= self.max_keys {
+            return;
+        }
+        failures.swept = None;
+        self.sweep(failures, now);
+        while failures.by_key.len() + new > self.max_keys {
+            // Only when full: a scan of at most MAX_KEYS, at the rate
+            // attempts can be made.
+            let oldest = failures
+                .by_key
+                .iter()
+                .filter(|(key, _)| !keys.contains(key))
+                .min_by_key(|(_, times)| times.back().copied())
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => failures.by_key.remove(&key),
+                None => break,
+            };
+        }
+    }
+
+    /// Count a failure.
     pub fn record_failure(&self, username: &str, source: Option<&str>, now: Instant) {
         let mut failures = self.failures.lock().expect("never held across a panic");
         self.sweep(&mut failures, now);
+        self.make_room(&mut failures, username, source, now);
         for key in Self::keys(username, source) {
             self.prune(&mut failures, &key, now);
-            if failures.by_key.contains_key(&key) || failures.by_key.len() < self.max_keys {
-                failures.by_key.entry(key).or_default().push_back(now);
-            }
+            failures.by_key.entry(key).or_default().push_back(now);
         }
     }
 
@@ -363,6 +415,7 @@ impl RateLimiter {
         if let Some(wait) = self.limited(&mut failures, username, source, now) {
             return Err(wait);
         }
+        self.make_room(&mut failures, username, source, now);
         for key in Self::keys(username, source) {
             failures.by_key.entry(key).or_default().push_back(now);
         }
@@ -387,6 +440,63 @@ impl RateLimiter {
                 failures.by_key.remove(&source);
             }
         }
+    }
+}
+
+/// How many sign-in attempts devices that are not signed in may make, all
+/// of them together (PX-10, finding 9): a burst of 20, then one every
+/// 200 ms (5 a second). A household's new devices sign in a few times a
+/// day; a flood from free endpoint ids is held to the rate one Argon2
+/// verification a core can keep up with, and needs hours, not minutes, to
+/// fill [`RateLimiter`]. A signed-in device's attempts are not counted.
+pub const STRANGER_ATTEMPTS: Bucket = Bucket {
+    capacity: 20,
+    refill_every: Duration::from_millis(200),
+};
+
+/// A token bucket's size and rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bucket {
+    pub capacity: u32,
+    /// One token comes back each time this passes.
+    pub refill_every: Duration,
+}
+
+/// A token bucket: [`Bucket::capacity`] at first, one more each
+/// [`Bucket::refill_every`].
+#[derive(Debug)]
+pub struct TokenBucket {
+    bucket: Bucket,
+    state: Mutex<(u32, Instant)>,
+}
+
+impl TokenBucket {
+    pub fn new(bucket: Bucket) -> Self {
+        Self {
+            bucket,
+            state: Mutex::new((bucket.capacity, Instant::now())),
+        }
+    }
+
+    /// Take a token at `now`, or `Err(wait)` until the next one.
+    pub fn take(&self, now: Instant) -> Result<(), Duration> {
+        let mut state = self.state.lock().expect("never held across a panic");
+        let (tokens, since) = &mut *state;
+        let every = self.bucket.refill_every.max(Duration::from_nanos(1));
+        let elapsed = now.saturating_duration_since(*since);
+        let earned = (elapsed.as_nanos() / every.as_nanos()).min(u128::from(u32::MAX)) as u32;
+        if earned > 0 {
+            *tokens = tokens.saturating_add(earned).min(self.bucket.capacity);
+            *since += every * earned;
+            if *tokens == self.bucket.capacity {
+                *since = now;
+            }
+        }
+        if *tokens == 0 {
+            return Err(every.saturating_sub(now.saturating_duration_since(*since)));
+        }
+        *tokens -= 1;
+        Ok(())
     }
 }
 
@@ -430,6 +540,8 @@ pub struct Auth {
     wrong_pins: Arc<Mutex<HashMap<(LocalUserId, String), u32>>>,
     /// Devices waiting to be approved on another (P3-07).
     sign_ins: Arc<DeviceSignIns>,
+    /// Sign-in attempts from devices that are not signed in (PX-10).
+    strangers: Arc<TokenBucket>,
 }
 
 impl Auth {
@@ -444,7 +556,21 @@ impl Auth {
             limiter: Arc::new(RateLimiter::with_window(window)),
             wrong_pins: Arc::default(),
             sign_ins: Arc::default(),
+            strangers: Arc::new(TokenBucket::new(STRANGER_ATTEMPTS)),
         }
+    }
+
+    /// Sign-in attempts from devices that are not signed in come from
+    /// `bucket` ([`STRANGER_ATTEMPTS`] by default; tests shrink it).
+    pub fn with_stranger_attempts(mut self, bucket: Bucket) -> Self {
+        self.strangers = Arc::new(TokenBucket::new(bucket));
+        self
+    }
+
+    /// One sign-in attempt by a device that is not signed in: `Err(wait)`
+    /// while they have all used up their share.
+    pub fn stranger_attempt(&self) -> Result<(), Duration> {
+        self.strangers.take(Instant::now())
     }
 
     /// Device sign-in codes live `lifetime` (tests shorten it).
@@ -989,22 +1115,113 @@ mod tests {
     }
 
     #[test]
-    fn a_full_limiter_refuses_what_it_cannot_count_and_judges_what_it_holds() {
+    fn a_full_limiter_makes_room_from_its_oldest_keys() {
+        let limiter = limiter_of(4);
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        for _ in 0..MAX_FAILURES {
+            limiter.record_failure("alice", Some("a"), t0);
+        }
+        limiter.record_failure("bob", Some("b"), t1);
+        // Carol and her source are counted, in place of alice's keys.
+        assert_eq!(limiter.check("carol", Some("c"), t1), None);
+        limiter.begin("carol", Some("c"), t1).unwrap();
+        assert_eq!(limiter.held(), 4);
+        assert!(limiter.check("alice", Some("x"), t1).is_none());
+        // What it still holds is judged as ever.
+        for _ in 1..MAX_FAILURES {
+            limiter.record_failure("bob", Some("b"), t1);
+        }
+        assert!(limiter.check("bob", Some("y"), t1).is_some());
+    }
+
+    #[test]
+    fn a_full_limiter_drops_expired_keys_before_live_ones() {
         let limiter = limiter_of(4);
         let t0 = Instant::now();
         limiter.record_failure("alice", Some("a"), t0);
-        limiter.record_failure("bob", Some("b"), t0);
-        // No room for carol's name or her source.
-        assert_eq!(limiter.check("carol", Some("c"), t0), Some(SWEEP_INTERVAL));
-        assert!(limiter.begin("carol", Some("a"), t0).is_err());
-        limiter.record_failure("carol", Some("c"), t0);
-        assert_eq!(limiter.held(), 4);
-        // The names and sources it holds are judged as ever.
-        assert!(limiter.check("alice", Some("b"), t0).is_none());
-        limiter.begin("alice", Some("a"), t0).unwrap();
-        // With the old failures gone there is room again.
-        let later = t0 + FAILURE_WINDOW;
-        assert!(limiter.check("carol", Some("c"), later).is_none());
+        let later = t0 + FAILURE_WINDOW - Duration::from_secs(1);
+        for _ in 0..MAX_FAILURES {
+            limiter.record_failure("bob", Some("b"), later);
+        }
+        let now = t0 + FAILURE_WINDOW;
+        limiter.record_failure("carol", Some("c"), now);
+        assert!(limiter.check("bob", Some("z"), now).is_some());
+    }
+
+    #[test]
+    fn the_stranger_bucket_gives_its_burst_then_one_per_interval() {
+        let bucket = TokenBucket::new(Bucket {
+            capacity: 2,
+            refill_every: Duration::from_secs(1),
+        });
+        let t0 = Instant::now();
+        assert!(bucket.take(t0).is_ok());
+        assert!(bucket.take(t0).is_ok());
+        assert!(
+            matches!(bucket.take(t0), Err(wait) if wait <= Duration::from_secs(1) && !wait.is_zero())
+        );
+        let t1 = t0 + Duration::from_millis(1500);
+        assert!(bucket.take(t1).is_ok());
+        assert!(bucket.take(t1).is_err());
+        // Idle, it fills back to its burst and no more.
+        let t2 = t1 + Duration::from_secs(60);
+        assert!(bucket.take(t2).is_ok());
+        assert!(bucket.take(t2).is_ok());
+        assert!(bucket.take(t2).is_err());
+    }
+
+    /// PX-09 finding 9 (A-4): endpoint ids are free, so anyone could fill
+    /// the limiter, and a full one refused every new name and source.
+    #[tokio::test]
+    async fn a_full_limiter_still_lets_a_fresh_valid_login_in() {
+        let test = auth_with_alice("full-limiter").await;
+        let auth = Auth {
+            limiter: Arc::new(limiter_of(20)),
+            ..test.auth.clone()
+        };
+        // Names and sources are free: far more of them than it holds.
+        for endpoint in 0..10 {
+            let source = format!("endpoint-{endpoint}");
+            for i in 0..MAX_FAILURES {
+                let name = format!("user-{endpoint}-{i}");
+                let _ = auth
+                    .login_password(&name, "guess", SessionBinding::Api, Some(&source))
+                    .await;
+            }
+        }
+        let fresh = auth
+            .login_password(
+                "alice",
+                "correct horse",
+                SessionBinding::Api,
+                Some("endpoint-fresh"),
+            )
+            .await;
+        assert!(fresh.is_ok(), "{fresh:?}");
+    }
+
+    /// PX-09 finding 10 (A-5): logins sent at once each ran Argon2 at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn argon2_runs_at_most_once_a_core_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let runs: Vec<_> = (0..3 * argon2_permits())
+            .map(|_| {
+                let (active, peak) = (active.clone(), peak.clone());
+                tokio::spawn(argon2(move || {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }))
+            })
+            .collect();
+        for run in runs {
+            run.await.unwrap().unwrap();
+        }
+        assert!(peak.load(Ordering::SeqCst) <= argon2_permits());
     }
 
     #[test]

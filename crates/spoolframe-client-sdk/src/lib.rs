@@ -26,7 +26,7 @@ pub mod storage;
 pub use client::{Client, Device, DeviceSignIn, ServersWatch};
 pub use connection::Timeouts;
 pub use error::SdkError;
-pub use link::{ConnectionPath, ConnectionState, StateWatch};
+pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
 pub use servers::ServerEntry;
 pub use session::{
     ActiveProfile, Chunk, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange, PlaybackOptions,

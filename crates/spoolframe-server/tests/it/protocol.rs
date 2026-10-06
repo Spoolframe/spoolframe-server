@@ -280,3 +280,34 @@ async fn unauthenticated_mutations_cannot_exhaust_replay_capacity() {
     );
     close(server, client).await;
 }
+
+/// PX-09 finding 17 (C-6): an anonymous device's Hello strings are kept
+/// and shown to approvers, so each is cut to a bound.
+#[tokio::test]
+async fn hello_strings_are_cut_to_their_bound() {
+    let (server, client) = connect("hello-strings").await;
+    let long = "é".repeat(10_000);
+    let hello = spoolframe_protocol::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client_name: long.clone(),
+        client_version: long.clone(),
+        platform: spoolframe_types::Platform::Linux,
+        device_name: Some(long.clone()),
+        capabilities: None,
+    };
+    assert!(matches!(
+        client.call(None, Request::Hello(hello)).await,
+        Response::Ok(Reply::ServerInfo(_))
+    ));
+    let devices = server.debug.connected.devices();
+    let device = &devices[0];
+    let cut = "é".repeat(spoolframe_protocol::MAX_HELLO_TEXT);
+    // Compared as booleans: a failure must not print 10,000 characters.
+    assert!(device.client_name == cut, "client_name");
+    assert!(device.client_version == cut, "client_version");
+    assert!(
+        device.device_name.as_deref() == Some(cut.as_str()),
+        "device_name"
+    );
+    close(server, client).await;
+}

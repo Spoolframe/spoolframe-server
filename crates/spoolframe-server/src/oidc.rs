@@ -50,6 +50,10 @@ pub const FLOW_LIFETIME: Duration = Duration::from_secs(10 * 60);
 /// in), so this bounds what strangers can make the server keep.
 pub const MAX_FLOWS: usize = 10_000;
 
+/// Flows one source (a remote address) may have begun and not finished
+/// (PX-10), as [`crate::passkeys::MAX_SIGN_INS_PER_SOURCE`].
+pub const MAX_FLOWS_PER_SOURCE: usize = 16;
+
 /// How long a provider's discovery document and keys are used before they
 /// are fetched again: sign-ins begun at once (or a stranger's flood of
 /// them) ask the provider once.
@@ -254,6 +258,8 @@ struct Flow {
     /// endpoints and keys.
     metadata: Metadata,
     began: Instant,
+    /// The remote address that began it, if it has one.
+    source: Option<String>,
 }
 
 /// The server's SSO: its providers, and the flows in progress.
@@ -522,7 +528,14 @@ impl Oidc {
 
     /// Begin a flow with `provider` for `purpose`: where to send the
     /// browser, and what its cookie must carry back.
-    pub async fn begin(&self, provider: &str, purpose: Purpose) -> Result<Begun, OidcError> {
+    ///
+    /// At most [`MAX_FLOWS_PER_SOURCE`] are held for one `source`.
+    pub async fn begin(
+        &self,
+        provider: &str,
+        purpose: Purpose,
+        source: Option<&str>,
+    ) -> Result<Begun, OidcError> {
         let provider = self.provider(provider)?;
         let metadata = self.discover(&provider).await?;
         let (client, _) = self.client(&provider, metadata.clone())?;
@@ -540,7 +553,13 @@ impl Oidc {
         let mut flows = self.flows.lock().expect("never poisoned");
         let now = Instant::now();
         flows.retain(|_, f| now.duration_since(f.began) < self.lifetime);
-        if flows.len() >= MAX_FLOWS {
+        let from_source = source.map_or(0, |source| {
+            flows
+                .values()
+                .filter(|f| f.source.as_deref() == Some(source))
+                .count()
+        });
+        if flows.len() >= MAX_FLOWS || from_source >= MAX_FLOWS_PER_SOURCE {
             return Err(OidcError::Busy);
         }
         flows.insert(
@@ -553,6 +572,7 @@ impl Oidc {
                 nonce,
                 metadata,
                 began: now,
+                source: source.map(str::to_owned),
             },
         );
         Ok(Begun {

@@ -184,6 +184,9 @@ async fn revoking_the_session_stops_reads_within_the_recheck_interval() {
     let (handle, _) = started(&client, &session).await;
     ok(client.read(&session, &handle, 0, 10).await.0);
     server.store.disable_user("alice").await.unwrap();
+    // The device's connection is closed (PX-10); it comes back.
+    client.conn.closed().await;
+    let client = client.reconnect(&server).await;
     tokio::time::sleep(PLAYBACK_RECHECK + Duration::from_millis(100)).await;
     let (response, _) = client.read(&session, &handle, 0, 10).await;
     assert_eq!(err(response), Error::Unauthenticated);
@@ -507,6 +510,55 @@ async fn a_subtitle_changed_for_another_between_chunks_is_refused() {
     );
     let (bytes, _, _) = subtitle_chunk(&client, &session, &handle, 0).await;
     assert_eq!(bytes, b"bbbbbbbb");
+    client.close().await;
+    server.stop().await;
+}
+
+/// Swap `path` for a symlink to `target`, as a consumer who can write to
+/// the library folder could once a playback has started (PX-09 B-1).
+fn swap_for_symlink(path: &std::path::Path, target: &std::path::Path) {
+    std::fs::remove_file(path).unwrap();
+    std::os::unix::fs::symlink(target, path).unwrap();
+}
+
+/// The sidecar becomes a symlink into the state directory after
+/// `StartPlayback`: the server key is not read through it.
+#[tokio::test]
+async fn a_sidecar_swapped_for_a_symlink_after_start_is_not_read() {
+    let (server, client, session) = ready("subtitle-symlink-swap").await;
+    server.write_media(1000);
+    server.write_sidecar();
+    let handle = started_with_sidecar(&client, &session).await;
+    swap_for_symlink(
+        &server.media.with_extension("en.srt"),
+        &server.dir.join("endpoint.key"),
+    );
+
+    let response = read_subtitle(&client, &session, &handle, 0, None).await;
+    assert!(
+        matches!(response, Response::Err(Error::Unavailable { .. })),
+        "{response:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// The media file becomes a symlink to the database after
+/// `StartPlayback`: a range read does not answer from it.
+#[tokio::test]
+async fn a_media_file_swapped_for_a_symlink_after_start_is_not_read() {
+    let (server, client, session) = ready("media-symlink-swap").await;
+    server.write_media(1000);
+    let (handle, _) = started(&client, &session).await;
+    ok(client.read(&session, &handle, 0, 10).await.0);
+    swap_for_symlink(&server.media, &server.dir.join("spoolframe.db"));
+
+    let (response, bytes) = client.read(&session, &handle, 0, 100).await;
+    assert!(bytes.is_empty(), "read {} bytes", bytes.len());
+    assert!(
+        matches!(err(response), Error::Unavailable { .. }),
+        "the read was not refused"
+    );
     client.close().await;
     server.stop().await;
 }

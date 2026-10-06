@@ -132,6 +132,10 @@ impl PlexCatalog {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
+            // Not followed (PX-09 B-2): reqwest keeps custom headers across
+            // hosts, so a redirect would hand X-Plex-Token to wherever a
+            // PMS, or whoever answers as one, points.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CatalogError::Backend {
                 url: base.clone(),
@@ -543,7 +547,7 @@ impl PlexCatalog {
         file: &Path,
     ) -> Result<PathBuf, CatalogError> {
         let mapped = self.paths.map(library, file);
-        match paths::unreadable(&mapped.local) {
+        match mapped.problem() {
             None => Ok(mapped.local),
             Some(reason) => Err(CatalogError::MediaFileUnavailable(Box::new(
                 UnavailableFile {

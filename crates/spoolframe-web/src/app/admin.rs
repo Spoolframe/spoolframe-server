@@ -8,6 +8,7 @@ use spoolframe_admin_api::{
     AdminApiClient, NewUser, PathCheckRun, PathReport, Role, SsoLink, UserInfo,
 };
 
+use super::profile::{ConfirmItsYou, asks_to_confirm};
 use super::{Alert, Field, Route, icons, initial, now, role_name, rpc};
 use crate::logic::{
     AddUserError, ApiError, Landing, PathState, UserStatus, add_user_error, ago, avatar_class,
@@ -301,9 +302,9 @@ fn ResetPassword(username: String, on_done: EventHandler<Option<(bool, String)>>
     let password = use_signal(String::new);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
+    let confirming = use_signal(|| None::<String>);
     let name = username.clone();
-    let submit = move |e: FormEvent| {
-        e.prevent_default();
+    let attempt = use_callback(move |()| {
         busy.set(true);
         let username = name.clone();
         spawn(async move {
@@ -319,10 +320,15 @@ fn ResetPassword(username: String, on_done: EventHandler<Option<(bool, String)>>
             };
             match set.await {
                 Ok(()) => on_done.call(Some((true, format!("New password set for {username}")))),
+                Err(e) if asks_to_confirm(&e, confirming, "setting a password") => {}
                 Err(e) => error.set(Some(user_change_error(&e, &username))),
             }
             busy.set(false);
         });
+    });
+    let submit = move |e: FormEvent| {
+        e.prevent_default();
+        attempt.call(());
     };
     rsx! {
         div { class: "scrim",
@@ -332,7 +338,7 @@ fn ResetPassword(username: String, on_done: EventHandler<Option<(bool, String)>>
                     h1 { "Set a new password for {username}" }
                 }
                 Field { label: "New password", value: password, kind: "password", autocomplete: "new-password" }
-                span { class: "hint", "Devices that are signed in stay signed in." }
+                span { class: "hint", "{username} is signed out on every device and browser, and signs in again with this one." }
                 if let Some(text) = error() {
                     Alert { text }
                 }
@@ -342,6 +348,7 @@ fn ResetPassword(username: String, on_done: EventHandler<Option<(bool, String)>>
                 }
             }
         }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| attempt.call(()) }
     }
 }
 
@@ -356,8 +363,8 @@ fn AddUser(on_done: EventHandler<Option<String>>) -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut bad_username = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
-    let submit = move |e: FormEvent| {
-        e.prevent_default();
+    let confirming = use_signal(|| None::<String>);
+    let attempt = use_callback(move |()| {
         busy.set(true);
         spawn(async move {
             let display = display();
@@ -374,6 +381,7 @@ fn AddUser(on_done: EventHandler<Option<String>>) -> Element {
             };
             match added.await {
                 Ok(user) => on_done.call(Some(shown_name(&user))),
+                Err(e) if asks_to_confirm(&e, confirming, "adding an admin") => {}
                 Err(e) => match add_user_error(&e, &typed) {
                     AddUserError::Username(text) => {
                         bad_username.set(Some(text));
@@ -387,6 +395,10 @@ fn AddUser(on_done: EventHandler<Option<String>>) -> Element {
             }
             busy.set(false);
         });
+    });
+    let submit = move |e: FormEvent| {
+        e.prevent_default();
+        attempt.call(());
     };
     let who = match (display().trim(), username().trim()) {
         ("", "") => "They".to_owned(),
@@ -419,6 +431,7 @@ fn AddUser(on_done: EventHandler<Option<String>>) -> Element {
                 }
             }
         }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| attempt.call(()) }
     }
 }
 
@@ -603,8 +616,13 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
             "Clear PIN",
         ),
     };
+    let confirming = use_signal(|| None::<String>);
+    let about = match ask {
+        Ask::Role(_) => "making an admin",
+        _ => "clearing a PIN",
+    };
     let name = username.clone();
-    let go = move |_| {
+    let go = use_callback(move |()| {
         busy.set(true);
         let username = name.clone();
         spawn(async move {
@@ -647,12 +665,17 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
             }
             .await;
             busy.set(false);
+            if let Err(e) = &done
+                && asks_to_confirm(e, confirming, about)
+            {
+                return;
+            }
             on_done.call(Some(match done {
                 Ok(text) => (true, text),
                 Err(e) => (false, user_change_error(&e, &username)),
             }));
         });
-    };
+    });
     let danger = ask == Ask::Disable;
     rsx! {
         div { class: "scrim",
@@ -671,12 +694,13 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
                     button {
                         class: if danger { "btn-dialog btn-dialog-outline text-ctp-red" } else { "btn-dialog btn-dialog-primary" },
                         disabled: busy(),
-                        onclick: go,
+                        onclick: move |_| go.call(()),
                         "{action}"
                     }
                 }
             }
         }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| go.call(()) }
     }
 }
 
@@ -807,8 +831,42 @@ fn UserDevices(
             client.user_devices(username).await.map_err(rpc::error)
         },
     ));
+    // No longer asking for the PIN may need "Confirm it's you" first,
+    // then is tried again on the device it was for.
+    let confirming = use_signal(|| None::<String>);
+    let mut again = use_signal(|| None::<String>);
+    let name = username.clone();
+    let set_required = use_callback(move |(id, required): (String, bool)| {
+        let username = name.clone();
+        spawn(async move {
+            let set = async {
+                let client = rpc::client().await?;
+                client
+                    .user_set_pin_required(username, id.clone(), required)
+                    .await
+                    .map_err(rpc::error)
+            };
+            match set.await {
+                Ok(()) => {}
+                Err(e) if asks_to_confirm(&e, confirming, "no longer asking for the PIN") => {
+                    again.set(Some(id));
+                }
+                Err(e) => say(toast, false, e.explain()),
+            }
+            devices.restart();
+        });
+    });
     let current = devices.read().clone();
     rsx! {
+        ConfirmItsYou {
+            asking: confirming,
+            on_confirmed: move |_| {
+                let id = again.write().take();
+                if let Some(id) = id {
+                    set_required.call((id, false));
+                }
+            },
+        }
         div { class: "flex flex-wrap items-end justify-between gap-3",
             div { class: "section-head",
                 h2 { "Devices and profile PIN" }
@@ -853,26 +911,9 @@ fn UserDevices(
                                                 disabled: !has_pin,
                                                 title: if has_pin { "" } else { "There is no PIN to ask for." },
                                                 onclick: {
-                                                    let username = username.clone();
                                                     let id = d.endpoint_id.clone();
                                                     let required = !d.pin_required;
-                                                    move |_| {
-                                                        let username = username.clone();
-                                                        let id = id.clone();
-                                                        spawn(async move {
-                                                            let set = async {
-                                                                let client = rpc::client().await?;
-                                                                client
-                                                                    .user_set_pin_required(username, id, required)
-                                                                    .await
-                                                                    .map_err(rpc::error)
-                                                            };
-                                                            if let Err(e) = set.await {
-                                                                say(toast, false, e.explain());
-                                                            }
-                                                            devices.restart();
-                                                        });
-                                                    }
+                                                    move |_| set_required.call((id.clone(), required))
                                                 },
                                             }
                                             span { class: "text-[13px] text-ctp-subtext0",
@@ -899,8 +940,41 @@ fn UserPasskeys(username: String, name: String) -> Element {
         client.user_passkeys(username).await.map_err(rpc::error)
     }));
     let mut notice = use_signal(|| None::<String>);
+    // Removing one may need "Confirm it's you" first, then is tried again.
+    let confirming = use_signal(|| None::<String>);
+    let mut again = use_signal(|| None::<(String, String)>);
+    let owner = username.clone();
+    let remove = use_callback(move |(id, name): (String, String)| {
+        let username = owner.clone();
+        spawn(async move {
+            let removed = async {
+                let client = rpc::client().await?;
+                client
+                    .user_remove_passkey(username, id.clone())
+                    .await
+                    .map_err(rpc::error)
+            };
+            match removed.await {
+                Ok(()) => notice.set(Some(format!("Passkey {name} removed."))),
+                Err(e) if asks_to_confirm(&e, confirming, "removing a passkey") => {
+                    again.set(Some((id, name)));
+                }
+                Err(e) => notice.set(Some(e.explain())),
+            }
+            passkeys.restart();
+        });
+    });
     let current = passkeys.read().clone();
     rsx! {
+        ConfirmItsYou {
+            asking: confirming,
+            on_confirmed: move |_| {
+                let pending = again.write().take();
+                if let Some(pending) = pending {
+                    remove.call(pending);
+                }
+            },
+        }
         section { class: "card",
             div { class: "card-head",
                 icons::Key { size: 18 }
@@ -936,25 +1010,9 @@ fn UserPasskeys(username: String, name: String) -> Element {
                             button {
                                 class: "btn btn-danger",
                                 onclick: {
-                                    let username = username.clone();
                                     let id = p.id.clone();
                                     let name = p.name.clone();
-                                    move |_| {
-                                        let username = username.clone();
-                                        let id = id.clone();
-                                        let name = name.clone();
-                                        spawn(async move {
-                                            let removed = async {
-                                                let client = rpc::client().await?;
-                                                client.user_remove_passkey(username, id).await.map_err(rpc::error)
-                                            };
-                                            match removed.await {
-                                                Ok(()) => notice.set(Some(format!("Passkey {name} removed."))),
-                                                Err(e) => notice.set(Some(e.explain())),
-                                            }
-                                            passkeys.restart();
-                                        });
-                                    }
+                                    move |_| remove.call((id.clone(), name.clone()))
                                 },
                                 icons::Trash {}
                                 "Remove"
@@ -1272,21 +1330,12 @@ fn UserSso(username: String, name: String, toast: Signal<Option<Said>>) -> Eleme
     });
     let site = use_resource(super::http::site);
     let mut unlinking = use_signal(|| None::<SsoLink>);
-    let providers = site
-        .read()
-        .as_ref()
-        .and_then(|s| s.as_ref().ok())
-        .map(|s| s.sso.clone())
-        .unwrap_or_default();
-    let current = links.read().clone();
-    let any = matches!(&current, Some(Ok(l)) if !l.is_empty());
-    if providers.is_empty() && !any {
-        return rsx! {};
-    }
+    // Unlinking may need "Confirm it's you" first, then is tried again.
+    let confirming = use_signal(|| None::<String>);
     let unlink = {
         let username = username.clone();
         let name = name.clone();
-        move |link: SsoLink| {
+        use_callback(move |link: SsoLink| {
             let username = username.clone();
             let name = name.clone();
             spawn(async move {
@@ -1300,14 +1349,36 @@ fn UserSso(username: String, name: String, toast: Signal<Option<Said>>) -> Eleme
                 let provider = link.provider.clone().unwrap_or(link.issuer.clone());
                 match done.await {
                     Ok(()) => say(toast, true, format!("{name}'s {provider} account unlinked")),
+                    // Kept as being unlinked, to try again once confirmed.
+                    Err(e) if asks_to_confirm(&e, confirming, "unlinking an account") => return,
                     Err(e) => say(toast, false, e.explain()),
                 }
                 unlinking.set(None);
                 links.restart();
             });
-        }
+        })
     };
+    let providers = site
+        .read()
+        .as_ref()
+        .and_then(|s| s.as_ref().ok())
+        .map(|s| s.sso.clone())
+        .unwrap_or_default();
+    let current = links.read().clone();
+    let any = matches!(&current, Some(Ok(l)) if !l.is_empty());
+    if providers.is_empty() && !any {
+        return rsx! {};
+    }
     rsx! {
+        ConfirmItsYou {
+            asking: confirming,
+            on_confirmed: move |_| {
+                let pending = unlinking();
+                if let Some(link) = pending {
+                    unlink.call(link);
+                }
+            },
+        }
         div { class: "section-head",
             h2 { "Sign-in providers" }
             span { "Accounts {name} signs in with. Only {name} can link one, in My profile." }
@@ -1343,8 +1414,7 @@ fn UserSso(username: String, name: String, toast: Signal<Option<Said>>) -> Eleme
                                             class: "btn btn-danger",
                                             onclick: {
                                                 let link = link.clone();
-                                                let unlink = unlink.clone();
-                                                move |_| unlink(link.clone())
+                                                move |_| unlink.call(link.clone())
                                             },
                                             "Unlink"
                                         }

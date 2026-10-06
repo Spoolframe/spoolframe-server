@@ -43,6 +43,16 @@ async fn server(test: &str, issuer: &str) -> Server {
 
 /// As [`server`], asking for `scopes`.
 async fn server_asking(test: &str, issuer: &str, scopes: Option<Vec<String>>) -> Server {
+    server_behind(test, issuer, scopes, TrustedProxies::default()).await
+}
+
+/// As [`server_asking`], with `proxies` believed about whom they carry.
+async fn server_behind(
+    test: &str,
+    issuer: &str,
+    scopes: Option<Vec<String>>,
+    proxies: TrustedProxies,
+) -> Server {
     let dir = state_dir(test).await;
     let store = Store::open(dir.as_ref()).await.unwrap();
     let phc = hash_password(PASSWORD).await.unwrap();
@@ -77,7 +87,7 @@ async fn server_asking(test: &str, issuer: &str, scopes: Option<Vec<String>>) ->
             ..admin(Auth::new(store.clone()), Some(SetupCode::new(CODE)))
         },
         origins,
-        TrustedProxies::default(),
+        proxies,
     )
     .await
     .unwrap();
@@ -793,4 +803,35 @@ async fn a_place_to_return_to_off_the_server_is_refused() {
         .await
         .unwrap_err();
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// PX-09 finding 16 (A-6): anyone may begin a sign-in, so one address may
+/// hold only a few flows, and the table stays open to everyone else.
+#[tokio::test]
+async fn one_address_cannot_begin_every_sso_flow() {
+    let idp = StandIn::start().await;
+    let server = server_behind(
+        "sso-begin-source",
+        &idp.issuer,
+        None,
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await;
+    let addr = server.addr;
+    let begin_from = |caller: &'static str| async move {
+        reqwest::Client::new()
+            .post(format!("http://{addr}/auth/oidc/begin"))
+            .header("origin", WEB)
+            .header("x-forwarded-for", caller)
+            .json(&json!({ "provider": PROVIDER, "purpose": "signIn" }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    for _ in 0..spoolframe_server::oidc::MAX_FLOWS_PER_SOURCE {
+        assert_eq!(begin_from("203.0.113.1").await, StatusCode::OK);
+    }
+    assert_ne!(begin_from("203.0.113.1").await, StatusCode::OK);
+    assert_eq!(begin_from("203.0.113.2").await, StatusCode::OK);
 }

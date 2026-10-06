@@ -68,7 +68,10 @@ sha2 = "0.10"
 
 # Passkeys (P3-05). `conditional-ui` is the feature the username-less
 # (discoverable) sign-in sits behind. It links OpenSSL.
-webauthn-rs = { version = "0.5.5", features = ["conditional-ui"] }
+# `danger-allow-state-serialisation` lets an app passkey ceremony's state
+# take the challenge made from the server's id and nonce (PX-10): webauthn-rs
+# only makes random ones. The states still never leave the server.
+webauthn-rs = { version = "0.5.5", features = ["conditional-ui", "danger-allow-state-serialisation"] }
 # For the option types webauthn-rs does not re-export.
 webauthn-rs-proto = "0.5.5"
 # User ids (P3-20): UUIDv7, time-ordered so they still sort by creation.

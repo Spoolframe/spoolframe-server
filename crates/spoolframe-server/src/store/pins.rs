@@ -186,7 +186,7 @@ impl Store {
         user: LocalUserId,
         endpoint_id: &str,
     ) -> Result<u64, StoreError> {
-        Ok(sqlx::query(
+        let revoked = sqlx::query(
             "UPDATE sessions SET revoked_at = ?3 \
              WHERE user_id = ?1 AND endpoint_id = ?2 AND revoked_at IS NULL",
         )
@@ -195,7 +195,9 @@ impl Store {
         .bind(now())
         .execute(&self.pool)
         .await?
-        .rows_affected())
+        .rows_affected();
+        self.note_sessions_ended();
+        Ok(revoked)
     }
 }
 

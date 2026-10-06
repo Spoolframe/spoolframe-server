@@ -4,24 +4,23 @@
 use std::fmt::Debug;
 use std::time::Duration;
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use spoolframe_protocol::codec::{self, CodecError, MAX_FRAME};
-use spoolframe_protocol::{
+use crate::codec::{self, CodecError, MAX_FRAME};
+use crate::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
     SubtitleAction, TrackReason,
 };
-use spoolframe_protocol::{
+use crate::{
     AuthMethod, ConfirmPassword, Error, Event, Hello, LoginPassword, PROTOCOL_VERSION, PinProof,
     Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
 };
-use spoolframe_protocol::{
-    FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
+use crate::{
+    FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyInfo, PasskeyRegistrationBegun,
+    PasskeySignInBegun,
 };
-use spoolframe_protocol::{
-    PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleDelivery,
-};
-use spoolframe_protocol::{SearchCounts, SearchGroup, SearchRequest, SearchResults, TopResult};
+use crate::{PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleDelivery};
+use crate::{SearchCounts, SearchGroup, SearchRequest, SearchResults, TopResult};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use spoolframe_types::Delivery;
 use spoolframe_types::{
     AudioCodec, ClientCapabilities, Container, SubtitleFormat, TrackPreferences, VideoCodec,
@@ -207,7 +206,7 @@ fn every_request_round_trips() {
             bitmap: BitmapSubtitles::Auto,
         },
         Request::StopPlayback {
-            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            handle: crate::PlaybackHandle("h".into()),
         },
         Request::SetPin {
             pin: "4321".into(),
@@ -230,26 +229,26 @@ fn every_request_round_trips() {
             required: false,
         },
         Request::ChangeSubtitle {
-            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            handle: crate::PlaybackHandle("h".into()),
             subtitle: Some(2),
             bitmap: BitmapSubtitles::BurnIn,
             position_ms: 61_000,
         },
         Request::ReadSubtitleSegment {
-            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            handle: crate::PlaybackHandle("h".into()),
             n: 7,
         },
         Request::GetManifest {
-            handle: spoolframe_protocol::PlaybackHandle("h".into()),
-            kind: spoolframe_protocol::ManifestKind::Subtitles,
+            handle: crate::PlaybackHandle("h".into()),
+            kind: crate::ManifestKind::Subtitles,
         },
         Request::SeekPlayback {
-            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            handle: crate::PlaybackHandle("h".into()),
             position_ms: 600_000,
         },
         Request::GetManifest {
-            handle: spoolframe_protocol::PlaybackHandle("h".into()),
-            kind: spoolframe_protocol::ManifestKind::Media,
+            handle: crate::PlaybackHandle("h".into()),
+            kind: crate::ManifestKind::Media,
         },
         Request::GetTrackPreferences,
         Request::SetTrackPreferences {
@@ -266,7 +265,7 @@ fn every_request_round_trips() {
             id: MediaId::new(Namespace::Plex, MediaKind::Episode, "12").unwrap(),
         },
         Request::UpdatePlaybackProgress {
-            handle: spoolframe_protocol::PlaybackHandle("handle".into()),
+            handle: crate::PlaybackHandle("handle".into()),
             sequence: 1,
             position_ms: 61_000,
         },
@@ -284,13 +283,13 @@ fn every_request_round_trips() {
         },
         Request::Home,
         Request::ReadSubtitle {
-            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            handle: crate::PlaybackHandle("h".into()),
             offset: 0,
             version: None,
         },
         Request::ReadSubtitle {
-            handle: spoolframe_protocol::PlaybackHandle("h".into()),
-            offset: spoolframe_protocol::SUBTITLE_CHUNK,
+            handle: crate::PlaybackHandle("h".into()),
+            offset: crate::SUBTITLE_CHUNK,
             version: Some(0x1234_5678_9abc_def0),
         },
         Request::PlaybackPlan {
@@ -323,7 +322,7 @@ fn every_reply_round_trips() {
         Reply::AuthMethods {
             methods: vec![AuthMethod::Password, AuthMethod::DeviceApproval],
         },
-        Reply::PasskeyCreation(creation()),
+        Reply::PasskeyRegistrationBegun(creation()),
         Reply::Passkeys {
             passkeys: vec![
                 PasskeyInfo {
@@ -349,15 +348,15 @@ fn every_reply_round_trips() {
         Reply::Passkeys {
             passkeys: Vec::new(),
         },
-        Reply::PasskeyRequest(PasskeyRequest {
-            challenge: vec![7; 32],
+        Reply::PasskeySignInBegun(PasskeySignInBegun {
+            nonce: vec![7; 32],
             allow_credential_ids: vec![vec![1; 16], vec![2; 16]],
         }),
-        Reply::PasskeyRequest(PasskeyRequest {
-            challenge: vec![7; 32],
+        Reply::PasskeySignInBegun(PasskeySignInBegun {
+            nonce: vec![7; 32],
             allow_credential_ids: Vec::new(),
         }),
-        Reply::Previews(spoolframe_protocol::Previews {
+        Reply::Previews(crate::Previews {
             interval_ms: 10_000,
             tile_width: 320,
             tile_height: 134,
@@ -382,7 +381,7 @@ fn every_reply_round_trips() {
             web_url: None,
         },
         Reply::DeviceSignInPending,
-        Reply::DeviceSignInRequest(spoolframe_protocol::DeviceSignInRequest {
+        Reply::DeviceSignInRequest(crate::DeviceSignInRequest {
             device_name: Some("Living room TV".into()),
             client_name: "spoolframe-tvos".into(),
             platform: spoolframe_types::Platform::Tvos,
@@ -416,10 +415,10 @@ fn every_reply_round_trips() {
             display_name: "Alice".into(),
             role: spoolframe_types::Role::Consumer,
             locked: true,
-            pin: Some(spoolframe_protocol::PinState { digits: Some(6) }),
+            pin: Some(crate::PinState { digits: Some(6) }),
         }),
         Reply::Devices {
-            devices: vec![spoolframe_protocol::DeviceInfo {
+            devices: vec![crate::DeviceInfo {
                 endpoint_id: "ab".repeat(32),
                 name: Some("Living room TV".into()),
                 platform: Some(spoolframe_types::Platform::Tvos),
@@ -430,12 +429,12 @@ fn every_reply_round_trips() {
         },
         Reply::PlexLink { link: None },
         Reply::PlexLink {
-            link: Some(spoolframe_protocol::PlexLink {
+            link: Some(crate::PlexLink {
                 username: Some("alice".into()),
                 email: Some("alice@example.com".into()),
                 by_config: false,
                 linked_at: Some(1_790_000_000),
-                last_sync: Some(spoolframe_protocol::PlexSyncSummary {
+                last_sync: Some(crate::PlexSyncSummary {
                     at: 1_790_000_100,
                     libraries: 2,
                     pulled: 3,
@@ -460,13 +459,13 @@ fn every_reply_round_trips() {
         Reply::Manifest {
             text: "#EXTM3U\n".into(),
         },
-        Reply::Home(spoolframe_protocol::HomeScreen {
+        Reply::Home(crate::HomeScreen {
             continue_watching: vec![movie()],
             next_up: Vec::new(),
             recently_added: vec![movie()],
         }),
         Reply::PlaybackStarted {
-            handle: spoolframe_protocol::PlaybackHandle("h".into()),
+            handle: crate::PlaybackHandle("h".into()),
             plan: PlaybackPlan::Unsupported { reasons: vec![] },
             size: 12_345,
             epoch: 0,
@@ -645,22 +644,18 @@ fn plan_parts_from_a_newer_peer_decode_as_unknown() {
 
 #[test]
 fn artwork_messages_round_trip() {
-    round_trip(spoolframe_protocol::ArtworkRequest {
+    round_trip(crate::ArtworkRequest {
         session: SessionId("s".into()),
         id: spoolframe_types::ArtworkId::new(Namespace::Plex, "/library/metadata/1/thumb/2")
             .unwrap(),
-        size: spoolframe_protocol::ArtworkSize::Medium,
+        size: crate::ArtworkSize::Medium,
     });
-    round_trip(spoolframe_protocol::ArtworkResponse::Ok(
-        spoolframe_protocol::ArtworkReply {
-            content_type: "image/jpeg".into(),
-            length: 1234,
-            etag: "abc".into(),
-        },
-    ));
-    round_trip(spoolframe_protocol::ArtworkResponse::Err(
-        Error::Unauthenticated,
-    ));
+    round_trip(crate::ArtworkResponse::Ok(crate::ArtworkReply {
+        content_type: "image/jpeg".into(),
+        length: 1234,
+        etag: "abc".into(),
+    }));
+    round_trip(crate::ArtworkResponse::Err(Error::Unauthenticated));
 }
 
 #[test]
@@ -672,29 +667,27 @@ fn an_artwork_size_from_a_newer_client_is_unknown() {
     }
     let bytes = codec::encode(&Newer::Huge).unwrap();
     assert_eq!(
-        codec::decode::<spoolframe_protocol::ArtworkSize>(&bytes).unwrap(),
-        spoolframe_protocol::ArtworkSize::Unknown
+        codec::decode::<crate::ArtworkSize>(&bytes).unwrap(),
+        crate::ArtworkSize::Unknown
     );
 }
 
 #[test]
 fn media_reads_round_trip() {
-    round_trip(spoolframe_protocol::MediaRead {
+    round_trip(crate::MediaRead {
         session: SessionId("s".into()),
-        handle: spoolframe_protocol::PlaybackHandle("h".into()),
+        handle: crate::PlaybackHandle("h".into()),
         offset: 1 << 30,
-        length: spoolframe_protocol::MAX_READ,
+        length: crate::MAX_READ,
         epoch: 2,
         segment: Some(14),
     });
-    round_trip(spoolframe_protocol::MediaReadResponse::Ok(
-        spoolframe_protocol::MediaReadReply {
-            sent: 4096,
-            size: 1 << 33,
-            complete: false,
-            epoch: 2,
-        },
-    ));
+    round_trip(crate::MediaReadResponse::Ok(crate::MediaReadReply {
+        sent: 4096,
+        size: 1 << 33,
+        complete: false,
+        epoch: 2,
+    }));
     for error in [
         Error::PlaybackExpired,
         Error::PlaybackStopped,
@@ -708,7 +701,7 @@ fn media_reads_round_trip() {
         Error::ProfileLocked,
         Error::NotSetUp,
     ] {
-        round_trip(spoolframe_protocol::MediaReadResponse::Err(error));
+        round_trip(crate::MediaReadResponse::Err(error));
     }
 }
 
@@ -722,7 +715,7 @@ fn an_older_server_s_read_reply_is_complete_at_epoch_0() {
         size: u64,
     }
     let bytes = codec::encode(&OldReply { sent: 10, size: 20 }).unwrap();
-    let reply: spoolframe_protocol::MediaReadReply = codec::decode(&bytes).unwrap();
+    let reply: crate::MediaReadReply = codec::decode(&bytes).unwrap();
     assert!(reply.complete);
     assert_eq!(reply.epoch, 0);
 }
@@ -746,9 +739,9 @@ fn subtitle_bytes_are_a_cbor_byte_string() {
     }
 }
 
-fn creation() -> PasskeyCreation {
-    PasskeyCreation {
-        challenge: vec![7; 32],
+fn creation() -> PasskeyRegistrationBegun {
+    PasskeyRegistrationBegun {
+        nonce: vec![7; 32],
         user_id: vec![9; 16],
         user_name: "alice on Home Media".into(),
         display_name: "Alice on Home Media".into(),
@@ -780,12 +773,12 @@ fn signed() -> FinishPasskeySignIn {
 #[test]
 fn passkey_bytes_are_cbor_byte_strings() {
     let ids = vec![vec![0xAB; 100]; 3];
-    let request = Reply::PasskeyRequest(PasskeyRequest {
-        challenge: vec![0xAB; 100],
+    let request = Reply::PasskeySignInBegun(PasskeySignInBegun {
+        nonce: vec![0xAB; 100],
         allow_credential_ids: ids.clone(),
     });
     assert!(codec::encode(&request).unwrap().len() < 470);
-    let creation = Reply::PasskeyCreation(PasskeyCreation {
+    let creation = Reply::PasskeyRegistrationBegun(PasskeyRegistrationBegun {
         exclude_credential_ids: ids,
         ..creation()
     });
@@ -1051,7 +1044,7 @@ fn confirm_requests_have_their_wire_names() {
 /// must not send it again on its own.
 #[test]
 fn confirm_requests_are_not_retried() {
-    use spoolframe_protocol::policy::retry_safe;
+    use crate::policy::retry_safe;
     assert!(!retry_safe(&Request::ConfirmPassword(ConfirmPassword {
         password: "hunter2".into(),
     })));
@@ -1133,8 +1126,8 @@ fn a_bitmap_mode_from_a_newer_client_is_unknown() {
 /// The item and started-playback replies as they were before P2-10, with
 /// no `markers`: what an older server sends and an older client reads.
 mod before_markers {
+    use crate::{PlaybackHandle, PlaybackPlan};
     use serde::{Deserialize, Serialize};
-    use spoolframe_protocol::{PlaybackHandle, PlaybackPlan};
     use spoolframe_types::Item;
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -1155,7 +1148,7 @@ mod before_markers {
 
 fn playback_started(markers: Vec<Marker>) -> Reply {
     Reply::PlaybackStarted {
-        handle: spoolframe_protocol::PlaybackHandle("h".into()),
+        handle: crate::PlaybackHandle("h".into()),
         plan: PlaybackPlan::Unsupported { reasons: vec![] },
         size: 12_345,
         chosen: None,
@@ -1184,7 +1177,7 @@ fn an_older_server_s_item_has_no_markers() {
 #[test]
 fn an_older_server_s_started_playback_has_no_markers() {
     let bytes = codec::encode(&before_markers::Reply::PlaybackStarted {
-        handle: spoolframe_protocol::PlaybackHandle("h".into()),
+        handle: crate::PlaybackHandle("h".into()),
         plan: PlaybackPlan::Unsupported { reasons: vec![] },
         size: 12_345,
         epoch: 0,
@@ -1226,7 +1219,7 @@ fn an_older_client_reads_a_started_playback_that_has_markers() {
 fn a_whole_subtitle_chunk_fits_a_frame() {
     let reply = Response::Ok(Reply::SubtitleChunk {
         format: SubtitleFormat::WebVtt,
-        bytes: vec![0xAB; spoolframe_protocol::SUBTITLE_CHUNK as usize],
+        bytes: vec![0xAB; crate::SUBTITLE_CHUNK as usize],
         total: u64::MAX,
         version: u64::MAX,
     });

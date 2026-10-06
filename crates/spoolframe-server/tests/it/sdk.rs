@@ -13,6 +13,7 @@ use spoolframe_client_sdk::{
     ManifestKind, MemoryStorage, PinProof, PlaybackHandle, PlaybackOptions, PlaybackPlan,
     ProfileSignIn, SdkError, Selection, Session, SignInMethod, Storage, TopResult,
 };
+use spoolframe_server::admission::Admission;
 use support::{
     ServerOptions, TestServer, episode, fresh_dir, library, markers, mkv_capabilities, movie,
     poster, show,
@@ -1443,5 +1444,117 @@ async fn managed_playback_recovers_then_reports_and_stops_the_replacement() {
     assert_eq!(item.playback.position, Some(Duration::from_secs(600)));
     assert_eq!(alice.read(&new, 0, 1).await, Err(SdkError::PlaybackExpired));
     client.close().await;
+    server.stop().await;
+}
+
+/// A server that holds at most one device with no session (PX-10), with
+/// alice, and a TV signed in as her. The TV is let in past the cap: it is
+/// signed in. A stranger takes the one place left.
+async fn full_of_strangers(test: &str) -> (TestServer, Client, Session, support::TestClient) {
+    let server = TestServer::start_with(
+        fresh_dir(test).await,
+        ServerOptions {
+            admission: Admission {
+                max_strangers: 1,
+                ..Admission::default()
+            },
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server
+        .add_user("alice", "correct horse", Some("Alice"))
+        .await;
+    let storage = Arc::new(MemoryStorage::default());
+    let tv = client_on(&server, &storage).await;
+    let alice = alice(&server, &tv).await;
+    let stranger = server.client().await;
+    stranger.hello().await;
+    (server, tv, alice, stranger)
+}
+
+/// The server closes the connection of a device whose last session ended
+/// (PX-10). The SDK tells the app at once, with no request in flight, and
+/// forgets the device's sessions before it does.
+#[tokio::test]
+async fn a_device_signed_out_on_the_server_is_told_with_no_request_in_flight() {
+    let (server, tv, _alice, _stranger) = full_of_strangers("sdk-signed-out-watch").await;
+    let mut signed_out = tv.signed_out(&id(&server)).unwrap();
+    server.store.disable_user("alice").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), signed_out.next())
+        .await
+        .expect("no sign-out within 5 s")
+        .expect("the client is open");
+    assert_eq!(
+        saved(&tv, &server).await,
+        [("alice".to_owned(), ProfileSignIn::Password)]
+    );
+    // It does not dial again as a device with no session.
+    assert_eq!(
+        tv.state(&id(&server)).unwrap().current(),
+        ConnectionState::Disconnected
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+/// A call in a session the server signed out is told to sign in, at once:
+/// not left waiting for a reconnect as if the network had failed. Here
+/// that reconnect would never come: as a device with no session, the TV
+/// is past the cap.
+#[tokio::test]
+async fn a_call_after_the_device_is_signed_out_asks_for_a_sign_in() {
+    let (server, tv, alice, _stranger) = full_of_strangers("sdk-signed-out-call").await;
+    let mut state = tv.state(&id(&server)).unwrap();
+    server.store.disable_user("alice").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state.current() == ConnectionState::Connected {
+            state.changed().await.expect("the client is open");
+        }
+    })
+    .await
+    .expect("the connection was not closed");
+    let started = std::time::Instant::now();
+    assert_eq!(
+        alice.libraries().await.unwrap_err(),
+        SdkError::SignInRequired
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    // Signing in again is refused while the server has no room: the TV
+    // is a device with no session now.
+    assert_eq!(
+        tv.sign_in(&id(&server), "alice", "correct horse")
+            .await
+            .unwrap_err(),
+        SdkError::ServerFull
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
+/// Past the cap on devices with no session, a new one is refused with a
+/// reason the app can show: the server is full, try again later. Not that
+/// it cannot be reached.
+#[tokio::test]
+async fn a_new_device_past_the_stranger_cap_is_told_the_server_is_full() {
+    let (server, tv, _alice, _stranger) = full_of_strangers("sdk-server-full").await;
+    let newcomer = Client::open(
+        Arc::new(MemoryStorage::default()),
+        device(mkv_capabilities()),
+    )
+    .await
+    .unwrap();
+    let addrs = server.server.addr().ip_addrs().copied().collect();
+    newcomer.add_address(&id(&server), addrs).unwrap();
+    assert_eq!(
+        newcomer.connect(&id(&server)).await.unwrap_err(),
+        SdkError::ServerFull
+    );
+    newcomer.close().await;
+    tv.close().await;
     server.stop().await;
 }

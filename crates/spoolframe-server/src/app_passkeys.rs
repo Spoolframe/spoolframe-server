@@ -20,8 +20,20 @@
 //! and once: a registration's and a confirmation's (P3-07) are kept under
 //! the session that began them, with its endpoint, a sign-in's under the
 //! device's endpoint, so another device can finish none, and a sign-in's
-//! challenge confirms nothing. Each server issues its own, so an assertion made for one is
-//! of no use at another, and a passkey made at one is unknown elsewhere.
+//! challenge confirms nothing.
+//!
+//! The device is sent a nonce, not the challenge: the challenge is
+//! [`app_passkey_challenge`] of this server's endpoint id and the nonce,
+//! and the app's SDK makes it with the id it dialled (PX-09, finding 2).
+//! `clientDataJSON` names no server, as the origin is every server's; so
+//! without that, a server that begins a ceremony here and hands the
+//! request to an app as its own would have the app sign for here. With
+//! it, the app signs for the server it talks to, and this one refuses
+//! that. A passkey made at one server is unknown at another.
+//!
+//! Anyone can begin a sign-in, so it lists no passkeys, even for a
+//! username: those would tell anyone a user's credential ids. Passkeys are
+//! made discoverable, so the platform finds them.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,9 +41,12 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use password_hash::rand_core::{OsRng, RngCore};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use spoolframe_protocol::{
-    APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation,
-    PasskeyRequest,
+    APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, NONCE_LEN,
+    PasskeyRegistrationBegun, PasskeySignInBegun, app_passkey_challenge,
 };
 use webauthn_rs::prelude::{
     DiscoverableAuthentication, PasskeyRegistration, PublicKeyCredential,
@@ -110,17 +125,18 @@ impl AppPasskeys {
 
     /// Begin making an app passkey for `user` on `endpoint`, in the session
     /// whose token hashes to `session`, on the server called
-    /// `server_name`. A registration the session began before is dropped.
-    /// Whether the session signed in recently enough is the caller's to
-    /// check.
+    /// `server_name`, whose endpoint id is `server`. A registration the
+    /// session began before is dropped. Whether the session signed in
+    /// recently enough is the caller's to check.
     pub async fn begin_registration(
         &self,
         store: &Store,
+        server: &[u8; 32],
         session: &str,
         endpoint: &str,
         user: &UserRecord,
         server_name: &str,
-    ) -> Result<PasskeyCreation, CeremonyError> {
+    ) -> Result<PasskeyRegistrationBegun, CeremonyError> {
         let handle = store
             .passkey_user_handle(user.id, &Uuid::new_v4().to_string())
             .await?;
@@ -144,6 +160,9 @@ impl AppPasskeys {
             .webauthn
             .start_passkey_registration(handle, &user_name, &display_name, Some(existing))
             .map_err(|e| CeremonyError::Internal(e.to_string()))?;
+        let nonce = nonce();
+        let state = with_challenge(state, "rs", &app_passkey_challenge(server, &nonce))
+            .map_err(CeremonyError::Internal)?;
         let mut registrations = self
             .registrations
             .lock()
@@ -155,8 +174,8 @@ impl AppPasskeys {
             state,
         };
         registrations.insert(session.to_owned(), (registration, now + self.lifetime));
-        Ok(PasskeyCreation {
-            challenge: options.public_key.challenge.to_vec(),
+        Ok(PasskeyRegistrationBegun {
+            nonce,
             user_id: options.public_key.user.id.to_vec(),
             user_name,
             display_name,
@@ -192,30 +211,30 @@ impl AppPasskeys {
         Ok(record)
     }
 
-    /// Begin a sign-in on `endpoint`: for `username`'s app passkeys, or,
-    /// without one, for any the platform finds. A sign-in the endpoint
-    /// began before is dropped. A username that is nobody's, or whose
-    /// user has no app passkey, lists none.
+    /// Begin a sign-in on `endpoint`, with this server's endpoint id
+    /// `server`: only `username`'s app passkeys finish it, or, without
+    /// one, any. It lists none, whoever `username` is: anyone can ask. A
+    /// sign-in the endpoint began before is dropped. A username that is
+    /// nobody's, or whose user has no app passkey, is as none.
     pub async fn begin_sign_in(
         &self,
         store: &Store,
+        server: &[u8; 32],
         endpoint: &str,
         username: Option<&str>,
-    ) -> Result<PasskeyRequest, SignInError> {
+    ) -> Result<PasskeySignInBegun, SignInError> {
         let allowed = match username.map(normalize_username) {
             Some(Ok(username)) => store.passkey_ids_of(&username, APP_RP_ID).await?,
             Some(Err(_)) | None => Vec::new(),
         };
-        let allow_credential_ids = allowed
-            .iter()
-            .map(|id| URL_SAFE_NO_PAD.decode(id))
-            .collect::<Result<_, _>>()
-            .map_err(|e| SignInError::Internal(format!("a stored credential id: {e}")))?;
-        let (options, state) = self
+        let (_, state) = self
             .party
             .webauthn
             .start_discoverable_authentication()
             .map_err(|e| SignInError::Internal(e.to_string()))?;
+        let nonce = nonce();
+        let state = with_challenge(state, "ast", &app_passkey_challenge(server, &nonce))
+            .map_err(SignInError::Internal)?;
         let mut sign_ins = self.sign_ins.lock().expect("never held across a panic");
         let now = Instant::now();
         sign_ins.retain(|_, (_, expires_at)| *expires_at > now);
@@ -229,9 +248,9 @@ impl AppPasskeys {
             endpoint.to_owned(),
             (SignIn { state, allowed }, now + self.lifetime),
         );
-        Ok(PasskeyRequest {
-            challenge: options.public_key.challenge.to_vec(),
-            allow_credential_ids,
+        Ok(PasskeySignInBegun {
+            nonce,
+            allow_credential_ids: Vec::new(),
         })
     }
 
@@ -262,17 +281,19 @@ impl AppPasskeys {
     }
 
     /// Begin confirming it is `user` (P3-07), in the session whose token
-    /// hashes to `session`, on `endpoint`: a challenge for their app
-    /// passkeys, and only theirs. A confirmation the session began before
-    /// is dropped. `None` if they have no app passkey: an empty list would
+    /// hashes to `session`, on `endpoint`, with this server's endpoint id
+    /// `server`: a nonce for their app passkeys, listed, and only theirs:
+    /// the session is theirs. A confirmation the session began before is
+    /// dropped. `None` if they have no app passkey: an empty list would
     /// let the platform offer any.
     pub async fn begin_confirm(
         &self,
         store: &Store,
+        server: &[u8; 32],
         session: &str,
         endpoint: &str,
         user: LocalUserId,
-    ) -> Result<Option<PasskeyRequest>, SignInError> {
+    ) -> Result<Option<PasskeySignInBegun>, SignInError> {
         let allowed: Vec<String> = store
             .list_passkeys(user)
             .await?
@@ -288,11 +309,14 @@ impl AppPasskeys {
             .map(|id| URL_SAFE_NO_PAD.decode(id))
             .collect::<Result<_, _>>()
             .map_err(|e| SignInError::Internal(format!("a stored credential id: {e}")))?;
-        let (options, state) = self
+        let (_, state) = self
             .party
             .webauthn
             .start_discoverable_authentication()
             .map_err(|e| SignInError::Internal(e.to_string()))?;
+        let nonce = nonce();
+        let state = with_challenge(state, "ast", &app_passkey_challenge(server, &nonce))
+            .map_err(SignInError::Internal)?;
         let mut confirms = self.confirms.lock().expect("never held across a panic");
         let now = Instant::now();
         confirms.retain(|_, (_, expires_at)| *expires_at > now);
@@ -301,8 +325,8 @@ impl AppPasskeys {
             sign_in: SignIn { state, allowed },
         };
         confirms.insert(session.to_owned(), (confirm, now + self.lifetime));
-        Ok(Some(PasskeyRequest {
-            challenge: options.public_key.challenge.to_vec(),
+        Ok(Some(PasskeySignInBegun {
+            nonce,
             allow_credential_ids,
         }))
     }
@@ -337,6 +361,35 @@ impl AppPasskeys {
             })
             .await
     }
+}
+
+/// A fresh nonce for a ceremony.
+fn nonce() -> Vec<u8> {
+    let mut nonce = vec![0; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
+/// A ceremony's `state` from webauthn-rs, with `challenge` in the place of
+/// the random one it made: webauthn-rs takes no challenge of the caller's.
+/// Its state is JSON with the challenge, base64url, at
+/// `<inner>.challenge`; one that is not is an error, never a state with
+/// the old challenge.
+fn with_challenge<T: Serialize + DeserializeOwned>(
+    state: T,
+    inner: &str,
+    challenge: &[u8],
+) -> Result<T, String> {
+    let mut json =
+        serde_json::to_value(state).map_err(|e| format!("a ceremony's state as JSON: {e}"))?;
+    let Some(slot @ serde_json::Value::String(_)) = json
+        .get_mut(inner)
+        .and_then(|state| state.get_mut("challenge"))
+    else {
+        return Err(format!("a ceremony's state has no {inner}.challenge"));
+    };
+    *slot = serde_json::Value::String(URL_SAFE_NO_PAD.encode(challenge));
+    serde_json::from_value(json).map_err(|e| format!("a ceremony's state from JSON: {e}"))
 }
 
 /// What the app sent as webauthn-rs takes it: the browser's JSON, without

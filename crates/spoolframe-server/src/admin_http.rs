@@ -346,7 +346,14 @@ fn router(
             _open: metrics.as_ref().map(|m| Arc::new(m.web_connection())),
         });
         // Built per connection: building is what gives each its own id.
+        // No client sends batches; one would carry any number of calls,
+        // password checks among them, in one message (PX-10, finding 10).
         let mut service = jsonrpsee::server::ServerBuilder::default()
+            .set_config(
+                jsonrpsee::server::ServerConfig::builder()
+                    .set_batch_request_config(jsonrpsee::server::BatchRequestConfig::Disabled)
+                    .build(),
+            )
             .set_rpc_middleware(counted)
             .to_service_builder()
             .build(methods.clone(), stop.clone());

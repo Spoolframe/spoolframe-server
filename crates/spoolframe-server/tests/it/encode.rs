@@ -207,13 +207,15 @@ async fn one_conversion_too_many_is_busy() {
         ..ServerOptions::default()
     };
     let (server, tv, session) = ready("encode-busy", options, 120).await;
-    started(&tv, &session, None).await;
-    // Another device, while the TV's encode holds the only slot.
+    // Another device, signed in first: a sign-in waits its turn for
+    // Argon2 (PX-10), and the TV's playback idles out after PLAYBACK_IDLE.
     let desktop = server.client().await;
     desktop
         .hello_with(None, Some(progressive_capabilities()))
         .await;
     let other = desktop.login("alice", "correct horse").await;
+    started(&tv, &session, None).await;
+    // While the TV's encode holds the only slot.
     assert!(matches!(
         start(&desktop, &other, None).await,
         Response::Err(Error::Busy)
@@ -1678,15 +1680,17 @@ async fn a_subtitle_change_needs_no_second_slot() {
     };
     let (server, tv, session) = ready("subtitle-change-slot", options, 12).await;
     server.add_pgs(&[("Hello there", 1_000, 3_500)]);
-    let handle = started(&tv, &session, None).await;
-    let (_, epoch) = change(&tv, &session, &handle, Some(0), 4_000).await;
-    assert_eq!(epoch, 1);
-    // Still one slot, and the TV's playback holds it.
+    // Signed in first: a sign-in waits its turn for Argon2 (PX-10), and
+    // the TV's playback idles out after PLAYBACK_IDLE.
     let desktop = server.client().await;
     desktop
         .hello_with(None, Some(progressive_capabilities()))
         .await;
     let other = desktop.login("alice", "correct horse").await;
+    let handle = started(&tv, &session, None).await;
+    let (_, epoch) = change(&tv, &session, &handle, Some(0), 4_000).await;
+    assert_eq!(epoch, 1);
+    // Still one slot, and the TV's playback holds it.
     assert!(matches!(
         start(&desktop, &other, None).await,
         Response::Err(Error::Busy)

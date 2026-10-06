@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, RecvStream};
+use iroh::endpoint::{ConnectError, ConnectingError, Connection, ConnectionError, RecvStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -18,7 +18,7 @@ use spoolframe_protocol::codec::{CodecError, read_frame, write_frame};
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{
     ArtworkRequest, ArtworkResponse, CLIENT_ALPN, Hello, MAX_READ, MediaRead, MediaReadResponse,
-    PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId,
+    PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId, close,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -98,7 +98,7 @@ impl ServerConnection {
         let conn = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, CLIENT_ALPN))
             .await
             .map_err(|_| unreachable(format!("no answer within {DIAL_TIMEOUT:?}")))?
-            .map_err(|e| unreachable(e.to_string()))?;
+            .map_err(|e| refused(&e).unwrap_or_else(|| unreachable(e.to_string())))?;
         let hello = Request::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: device.client_name.clone(),
@@ -282,15 +282,55 @@ impl ServerConnection {
     }
 }
 
-fn lost(conn: &Connection, e: impl std::fmt::Display) -> SdkError {
-    SdkError::Unreachable(format!("{}: {e}", conn.remote_id()))
+/// What the server meant by closing a connection with `error`, when it
+/// gave one of its reasons ([`spoolframe_protocol::close`]): the device was
+/// signed out, or the server is full. `None` for any other end of a
+/// connection: it was lost.
+pub(crate) fn closed_by_server(error: &ConnectionError) -> Option<SdkError> {
+    let ConnectionError::ApplicationClosed(close) = error else {
+        return None;
+    };
+    match u32::try_from(close.error_code.into_inner()).ok()? {
+        close::SIGNED_OUT => Some(SdkError::SignInRequired),
+        close::BUSY => Some(SdkError::ServerFull),
+        _ => None,
+    }
 }
 
+/// [`closed_by_server`], for a dial the server closed before it was set up.
+fn refused(error: &ConnectError) -> Option<SdkError> {
+    match error {
+        ConnectError::Connection { source, .. }
+        | ConnectError::Connecting {
+            source: ConnectingError::ConnectionError { source, .. },
+            ..
+        } => closed_by_server(source),
+        _ => None,
+    }
+}
+
+/// A request on `conn` failed with `e`. When the server closed the
+/// connection for a reason it gave, that reason is the error: a call cut
+/// off by a sign-out is [`SdkError::SignInRequired`], not a network
+/// failure.
+fn lost(conn: &Connection, e: impl std::fmt::Display) -> SdkError {
+    conn.close_reason()
+        .as_ref()
+        .and_then(closed_by_server)
+        .unwrap_or_else(|| SdkError::Unreachable(format!("{}: {e}", conn.remote_id())))
+}
+
+/// As [`lost`], for a request that got no answer in time.
 fn timed_out(conn: &Connection, what: impl std::fmt::Display, limit: Duration) -> SdkError {
-    SdkError::TimedOut(format!(
-        "{}: {what}, no answer within {limit:?}",
-        conn.remote_id()
-    ))
+    conn.close_reason()
+        .as_ref()
+        .and_then(closed_by_server)
+        .unwrap_or_else(|| {
+            SdkError::TimedOut(format!(
+                "{}: {what}, no answer within {limit:?}",
+                conn.remote_id()
+            ))
+        })
 }
 
 /// One RPC stream: the request frame out, the response frame back within

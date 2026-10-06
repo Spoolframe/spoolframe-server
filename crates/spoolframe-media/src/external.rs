@@ -59,6 +59,11 @@ fn parse(stem: &str, file_name: &str) -> Option<NameTags> {
 
 /// The subtitle files beside `media`, in name order. A directory that
 /// cannot be listed yields none: the media itself is still playable.
+///
+/// Only regular files are subtitles (PX-09 B-1): a FIFO would block the
+/// read, and a symlink could name any file the server can read. A symlink
+/// to a regular file in the same directory is kept, under its target's
+/// path, so that reading it never follows a link.
 pub fn find(media: &Path) -> Vec<ExternalFile> {
     let (Some(dir), Some(stem)) = (media.parent(), media.file_stem().and_then(|s| s.to_str()))
     else {
@@ -73,13 +78,30 @@ pub fn find(media: &Path) -> Vec<ExternalFile> {
             let name = entry.file_name();
             let tags = parse(stem, name.to_str()?)?;
             Some(ExternalFile {
-                path: entry.path(),
+                path: regular_file_in(dir, &entry)?,
                 name: tags,
             })
         })
         .collect();
     found.sort_by(|a, b| a.path.cmp(&b.path));
     found
+}
+
+/// `entry`'s path if it is a regular file, or a symlink to a regular file
+/// in `dir` itself; that file's path then.
+fn regular_file_in(dir: &Path, entry: &std::fs::DirEntry) -> Option<PathBuf> {
+    // Of the entry itself: a symlink is not followed here.
+    let kind = entry.file_type().ok()?;
+    if kind.is_file() {
+        return Some(entry.path());
+    }
+    if !kind.is_symlink() {
+        return None;
+    }
+    let target = entry.path().canonicalize().ok()?;
+    let inside = target.parent() == Some(dir.canonicalize().ok()?.as_path());
+    let regular = std::fs::symlink_metadata(&target).ok()?.is_file();
+    (inside && regular).then_some(target)
 }
 
 #[cfg(test)]
@@ -189,5 +211,54 @@ mod tests {
             .collect();
         assert_eq!(names, ["Movie.de.forced.srt", "Movie.srt"]);
         assert!(found[0].name.forced);
+    }
+
+    /// PX-09 B-1: a sidecar name that is a symlink out of the media's
+    /// directory is not a subtitle, whatever it points at.
+    #[tokio::test]
+    async fn find_skips_a_symlink_out_of_the_media_directory() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-external-outside").await;
+        let library = tmp.as_ref().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(tmp.as_ref().join("secret.key"), b"key").unwrap();
+        std::fs::write(library.join("Movie.mkv"), b"").unwrap();
+        std::os::unix::fs::symlink(tmp.as_ref().join("secret.key"), library.join("Movie.srt"))
+            .unwrap();
+        assert_eq!(find(&library.join("Movie.mkv")), Vec::new());
+    }
+
+    /// A FIFO or a directory with a sidecar's name is not a subtitle:
+    /// opening a FIFO would wait for a writer.
+    #[tokio::test]
+    async fn find_skips_what_is_not_a_regular_file() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-external-special").await;
+        let dir = tmp.as_ref();
+        std::fs::write(dir.join("Movie.mkv"), b"").unwrap();
+        std::fs::create_dir(dir.join("Movie.en.srt")).unwrap();
+        let fifo =
+            std::ffi::CString::new(dir.join("Movie.srt").into_os_string().into_encoded_bytes())
+                .unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(find(&dir.join("Movie.mkv")), Vec::new());
+    }
+
+    /// A symlink to another file in the same directory is kept, as the
+    /// file it names, so that a read need not follow a link.
+    #[tokio::test]
+    async fn find_keeps_a_symlink_within_the_media_directory_as_its_target() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-external-inside").await;
+        let dir = tmp.as_ref();
+        std::fs::write(dir.join("Movie.mkv"), b"").unwrap();
+        std::fs::write(dir.join("subs.txt"), b"1\n").unwrap();
+        std::os::unix::fs::symlink("subs.txt", dir.join("Movie.en.srt")).unwrap();
+        let found = find(&dir.join("Movie.mkv"));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name.language.as_deref(), Some("en"));
+        assert_eq!(
+            found[0].path,
+            dir.canonicalize().unwrap().join("subs.txt"),
+            "the path names the file, not the link"
+        );
     }
 }

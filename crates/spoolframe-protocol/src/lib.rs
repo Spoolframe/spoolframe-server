@@ -29,12 +29,14 @@ pub use artwork::{ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
 pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle};
 pub use messages::{
     AuthMethod, ConfirmPassword, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, HomeScreen,
-    LoginPassword, ManifestKind, PROTOCOL_VERSION, PinProof, PinState, Reply, Request,
-    RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo, SessionId, SessionInfo, UserSummary,
+    LoginPassword, MAX_HELLO_TEXT, ManifestKind, PROTOCOL_VERSION, PinProof, PinState, Reply,
+    Request, RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo, SessionId, SessionInfo,
+    UserSummary,
 };
 pub use passkeys::{
-    APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation,
-    PasskeyInfo, PasskeyRequest,
+    APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, NONCE_LEN,
+    PasskeyCreation, PasskeyInfo, PasskeyRegistrationBegun, PasskeyRequest, PasskeySignInBegun,
+    app_passkey_challenge,
 };
 pub use playback::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
@@ -59,4 +61,12 @@ pub const FEDERATION_ALPN: &[u8] = b"spoolframe/federation/1";
 pub mod close {
     /// The ALPN is known but this peer does not serve it.
     pub const UNSUPPORTED_PROTOCOL: u32 = 1;
+    /// The server holds as many connections from devices with no session
+    /// as it takes (PX-10). A device that is signed in is always let in;
+    /// one that is not tries again later.
+    pub const BUSY: u32 = 2;
+    /// The device's last live session on this server ended (signed out,
+    /// revoked, or its user disabled). It may connect again, as a device
+    /// that is not signed in.
+    pub const SIGNED_OUT: u32 = 3;
 }

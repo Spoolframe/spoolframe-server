@@ -311,6 +311,9 @@ async fn ten_wrong_pins_revoke_that_device_s_session_only() {
     };
     assert_eq!(wrong, 9);
     assert_eq!(last, Error::Unauthenticated);
+    // Its last session gone, the TV's connection is closed (PX-10).
+    tv.conn.closed().await;
+    let tv = tv.reconnect(&server).await;
     // A full sign-in is needed there; even the right PIN does nothing.
     assert_eq!(
         err(&tv, &session, Request::UnlockProfile { pin: PIN.into() }).await,
@@ -608,6 +611,9 @@ async fn ten_wrong_current_pins_revoke_that_device_s_session() {
     };
     assert_eq!(wrong, 9);
     assert_eq!(last, Error::Unauthenticated);
+    // Its last session gone, the TV's connection is closed (PX-10).
+    tv.conn.closed().await;
+    let tv = tv.reconnect(&server).await;
     assert_eq!(
         err(&tv, &session, clear_pin(by_password(PASSWORD))).await,
         Error::Unauthenticated

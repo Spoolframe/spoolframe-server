@@ -448,6 +448,31 @@ async fn failed_logins_as_one_user_do_not_lock_the_others_out() {
     assert_eq!(root.role, Role::Admin);
 }
 
+/// PX-09 finding 10 (C-5): one message could carry any number of calls,
+/// each a password check. No client sends batches, so none is taken.
+#[tokio::test]
+async fn a_batch_of_logins_is_refused() {
+    use jsonrpsee::core::client::ClientT;
+    use jsonrpsee::core::params::BatchRequestBuilder;
+
+    let (addr, _admin, _dir) = admin_client("login-batch").await;
+    let client = anonymous(addr).await;
+    let mut batch = BatchRequestBuilder::new();
+    for _ in 0..1000 {
+        // A name no user can have: refused before any hashing, so the red
+        // run of this test costs nothing.
+        batch
+            .insert("me.login", jsonrpsee::rpc_params![creds("", "guess")])
+            .unwrap();
+    }
+    let answered = client.batch_request::<serde_json::Value>(batch).await;
+    assert!(
+        answered.is_err(),
+        "a batch of {} calls was answered",
+        answered.map(|r| r.len()).unwrap_or_default()
+    );
+}
+
 #[tokio::test]
 async fn a_server_started_with_users_offers_no_setup() {
     let dir = state_dir("no-setup").await;

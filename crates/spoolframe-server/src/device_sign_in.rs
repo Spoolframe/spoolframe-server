@@ -36,6 +36,11 @@ pub const AWAIT: Duration = spoolframe_protocol::policy::wait::SIGN_IN;
 /// Sign-ins one device may have pending at once.
 pub const MAX_PENDING_PER_DEVICE: usize = 3;
 
+/// Sign-ins pending at once on the server (PX-10, finding 16). Anyone can
+/// begin one from a new endpoint id; a household has a few devices
+/// signing in at a time.
+pub const MAX_PENDING: usize = 256;
+
 /// A sign-in that was begun.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Started {
@@ -176,9 +181,12 @@ impl DeviceSignIns {
     }
 
     /// Begin a sign-in for `waiting.endpoint`; `None` if it already has
-    /// [`MAX_PENDING_PER_DEVICE`] pending.
+    /// [`MAX_PENDING_PER_DEVICE`] pending, or the server [`MAX_PENDING`].
     pub fn begin(&self, waiting: Waiting) -> Option<Started> {
         let mut inner = self.lock();
+        if inner.by_request.len() >= MAX_PENDING {
+            return None;
+        }
         let pending = inner
             .by_request
             .values()
@@ -425,6 +433,15 @@ mod tests {
         }
         assert!(sign_ins.begin(tv("tv")).is_none());
         assert!(sign_ins.begin(tv("other tv")).is_some());
+    }
+
+    #[test]
+    fn the_server_holds_few_pending_sign_ins_in_all() {
+        let sign_ins = DeviceSignIns::default();
+        for i in 0..MAX_PENDING {
+            assert!(sign_ins.begin(tv(&format!("tv-{i}"))).is_some());
+        }
+        assert!(sign_ins.begin(tv("one more tv")).is_none());
     }
 
     /// Approvers on many threads at once: one claim, whatever the order.

@@ -5,6 +5,12 @@
 
 use std::collections::HashMap;
 
+/// The widest or tallest subtitle picture read (PX-09 B-3): a 4K screen
+/// is 3840 × 2160, and VobSub's 12-bit coordinates stop at 4096 too. Sizes
+/// come from the file, so without a cap a header of 65535 × 65535 would
+/// ask for 4 GiB of pixels.
+pub const MAX_SIDE: usize = 4096;
+
 /// A grey picture: 0 is black, 255 white.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {

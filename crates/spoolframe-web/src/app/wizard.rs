@@ -14,6 +14,7 @@ use spoolframe_admin_api::{
 
 use super::admin::sleep;
 use super::libraries::RemoteNote;
+use super::profile::{ConfirmItsYou, asks_to_confirm};
 use super::{Alert, Field, Route, icons, now, rpc};
 use crate::libraries;
 use crate::logic::{ApiError, Landing, thousands};
@@ -229,12 +230,11 @@ pub(super) fn Note(
     on_changed: EventHandler<()>,
 ) -> Element {
     let key = setting;
-    let Some(e) = entry(&settings, key).cloned() else {
-        return rsx! {};
-    };
-    let file = settings.config_file.clone().unwrap_or_default();
     let mut restarting = use_signal(|| None::<String>);
-    let use_file = move |_| {
+    // An `admin.*` or `auth.*` setting, from an old session: "Confirm
+    // it's you" first, then the same change again.
+    let confirming = use_signal(|| None::<String>);
+    let use_file = use_callback(move |()| {
         spawn(async move {
             let unset = async {
                 let client = rpc::client().await?;
@@ -243,11 +243,18 @@ pub(super) fn Note(
                     .await
                     .map_err(rpc::error)
             };
-            if unset.await.is_ok() {
-                on_changed.call(());
+            match unset.await {
+                Ok(_) => on_changed.call(()),
+                Err(e) => {
+                    asks_to_confirm(&e, confirming, "changing this setting");
+                }
             }
         });
+    });
+    let Some(e) = entry(&settings, key).cloned() else {
+        return rsx! {};
     };
+    let file = settings.config_file.clone().unwrap_or_default();
     let restart = move |_| {
         restarting.set(Some("Restarting…".into()));
         spawn(async move {
@@ -287,7 +294,7 @@ pub(super) fn Note(
                 "Overrides {shown(overridden)} from "
                 span { class: "mono-value text-xs", "{file}" }
                 " · "
-                button { onclick: use_file, "Use the file's value" }
+                button { onclick: move |_| use_file.call(()), "Use the file's value" }
             }
         }
         if e.apply == SettingApply::Restart && !e.locked {
@@ -306,6 +313,7 @@ pub(super) fn Note(
                 }
             }
         }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| use_file.call(()) }
     }
 }
 
@@ -1721,7 +1729,9 @@ fn AccessFields(
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let s = settings.clone();
-    let on_save = move |_| {
+    // `admin.*`: from an old session, "Confirm it's you" first.
+    let confirming = use_signal(|| None::<String>);
+    let on_save = use_callback(move |()| {
         let s = s.clone();
         busy.set(true);
         spawn(async move {
@@ -1731,11 +1741,13 @@ fn AccessFields(
             ];
             match save(&s, changes).await {
                 Ok(()) => on_done.call(()),
+                Err(e)
+                    if asks_to_confirm(&e, confirming, "changing how people reach the web UI") => {}
                 Err(e) => error.set(Some(e.explain())),
             }
             busy.set(false);
         });
-    };
+    });
     let url = public_url();
     let https = url.trim().starts_with("https://");
     let host = crate::logic::host_port(url.trim())
@@ -1807,6 +1819,7 @@ fn AccessFields(
             Alert { text }
         }
         Footer { mode, step: "access", busy: busy(), on_save, on_discard: move |_| on_reload.call(()) }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
     }
 }
 
@@ -1818,16 +1831,11 @@ pub fn SecurityForm() -> Element {
         let _ = generation();
         load_settings().await
     });
-    let current = settings.read().clone();
-    if let Some(wait) = loading(&current) {
-        return wait;
-    }
-    let Some(Ok(loaded)) = current else {
-        return rsx! {};
-    };
-    let on = flag(&loaded, "admin.insecure_cookies");
     let mut error = use_signal(|| None::<String>);
-    let toggle = move |_| {
+    // `admin.*`: from an old session, "Confirm it's you" first, then the
+    // same change again. `on` is whether the cookies are insecure now.
+    let confirming = use_signal(|| None::<String>);
+    let toggle = use_callback(move |on: bool| {
         spawn(async move {
             let changed = async {
                 let client = rpc::client().await?;
@@ -1850,11 +1858,22 @@ pub fn SecurityForm() -> Element {
                         let _ = window.location().reload();
                     }
                 }
+                Err(e)
+                    if asks_to_confirm(&e, confirming, "changing how sign-in cookies are sent") => {
+                }
                 Err(e) => error.set(Some(e.explain())),
             }
             generation += 1;
         });
+    });
+    let current = settings.read().clone();
+    if let Some(wait) = loading(&current) {
+        return wait;
+    }
+    let Some(Ok(loaded)) = current else {
+        return rsx! {};
     };
+    let on = flag(&loaded, "admin.insecure_cookies");
     rsx! {
         div { class: "flex items-start gap-3",
             button {
@@ -1863,7 +1882,7 @@ pub fn SecurityForm() -> Element {
                 aria_checked: "{on}",
                 aria_label: "Allow insecure cookies",
                 disabled: locked(&loaded, "admin.insecure_cookies"),
-                onclick: toggle,
+                onclick: move |_| toggle.call(on),
             }
             span { class: "choice-what",
                 b { "Allow insecure cookies" }
@@ -1874,6 +1893,7 @@ pub fn SecurityForm() -> Element {
         if let Some(text) = error() {
             Alert { text }
         }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| toggle.call(on) }
     }
 }
 

@@ -169,6 +169,14 @@ where
     G: Fn() -> F,
     F: Future<Output = bool>,
 {
+    // ffprobe's length, from the file (PX-09 B-4): it sizes the tiles.
+    if source.duration > spoolframe_media::MAX_DURATION {
+        return Err(format!(
+            "the file says it is {} hours long; previews are made only of files up to {} hours",
+            source.duration.as_secs() / 3600,
+            spoolframe_media::MAX_DURATION.as_secs() / 3600
+        ));
+    }
     let times = times(source.duration, interval);
     let mut hardware = source.hardware.is_some();
     let mut tiles: Vec<Vec<u8>> = Vec::with_capacity(times.len());
@@ -280,6 +288,46 @@ mod tests {
         assert_eq!(times(Duration::from_millis(5_100_000), s(10)).len(), 510);
         // Even a film shorter than the interval has its first picture.
         assert_eq!(times(s(3), s(10)), [s(0)]);
+    }
+
+    /// A maker that counts the tiles asked of it.
+    #[derive(Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl MakeTile for Counting {
+        async fn tile(
+            &self,
+            _: &Source,
+            _: bool,
+            _: Duration,
+            _: &Path,
+        ) -> Result<Option<Vec<u8>>, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(vec![0xff]))
+        }
+    }
+
+    /// PX-09 B-4: the length is ffprobe's, from the file; a file that says
+    /// it is 49 hours long gets no previews, and no tile is asked for.
+    #[tokio::test]
+    async fn a_file_said_to_be_longer_than_48_hours_gets_no_previews() {
+        let maker = Counting::default();
+        let source = Source {
+            duration: Duration::from_secs(49 * 3600),
+            ..source(false, None)
+        };
+        let made = tiles(
+            &maker,
+            &source,
+            Duration::from_secs(10),
+            Path::new("/nonexistent"),
+            || async { true },
+            &|_, _| {},
+        )
+        .await;
+        assert!(made.is_err(), "made {} tiles", made.map_or(0, |t| t.len()));
+        assert_eq!(maker.0.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]

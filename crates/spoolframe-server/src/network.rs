@@ -19,6 +19,7 @@ use spoolframe_protocol::{CLIENT_ALPN, FEDERATION_ALPN, PROTOCOL_VERSION, Server
 use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
 
+use crate::admission::{self, Admission, Peer};
 use crate::artwork::ArtworkCache;
 use crate::auth::Auth;
 use crate::client::{self, ClientProtocol};
@@ -72,6 +73,8 @@ pub struct EndpointOptions {
     pub relay: Relay,
     /// Announce the server on the LAN over mDNS (P1-13).
     pub mdns: bool,
+    /// Who may hold connections (PX-10).
+    pub admission: Admission,
 }
 
 /// What the server knows about who is on the other end of a connection.
@@ -86,24 +89,58 @@ pub enum ConnectionAuth {
     Anonymous { endpoint: EndpointId },
 }
 
-/// The open client connections and their auth state.
+/// The open client connections and their auth state, with who may open
+/// more (PX-10).
 #[derive(Debug, Clone, Default)]
-pub struct Connections(Arc<Mutex<HashMap<usize, ConnectionAuth>>>);
+pub struct Connections {
+    peers: Arc<Mutex<HashMap<usize, Arc<Peer>>>>,
+    admission: Admission,
+}
 
 impl Connections {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<usize, ConnectionAuth>> {
-        self.0
+    pub(crate) fn new(admission: Admission) -> Self {
+        Self {
+            peers: Arc::default(),
+            admission,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<usize, Arc<Peer>>> {
+        self.peers
             .lock()
             .expect("the connections lock is never held across a panic")
     }
 
-    /// Every open client connection.
-    pub fn snapshot(&self) -> Vec<ConnectionAuth> {
-        self.lock().values().cloned().collect()
+    pub(crate) fn admission(&self) -> Admission {
+        self.admission
     }
 
-    pub(crate) fn insert(&self, id: usize, auth: ConnectionAuth) {
-        self.lock().insert(id, auth);
+    /// Every open client connection.
+    pub fn snapshot(&self) -> Vec<ConnectionAuth> {
+        self.lock()
+            .values()
+            .map(|peer| ConnectionAuth::Anonymous {
+                endpoint: peer.endpoint,
+            })
+            .collect()
+    }
+
+    /// Hold `connection`, if there is room: a signed-in device (`known`)
+    /// always, with the normal limits; a stranger only while fewer than
+    /// [`Admission::max_strangers`] are held.
+    pub(crate) fn admit(&self, connection: &Connection, known: bool) -> Option<Arc<Peer>> {
+        let mut peers = self.lock();
+        if !known
+            && peers.values().filter(|peer| !peer.known()).count() >= self.admission.max_strangers
+        {
+            return None;
+        }
+        let peer = Arc::new(Peer::new(connection));
+        if known {
+            peer.raise();
+        }
+        peers.insert(connection.stable_id(), peer.clone());
+        Some(peer)
     }
 
     pub(crate) fn remove(&self, id: usize) {
@@ -112,9 +149,54 @@ impl Connections {
 
     /// Whether `endpoint` has a connection open.
     pub(crate) fn has_endpoint(&self, endpoint: &EndpointId) -> bool {
-        self.lock()
+        self.lock().values().any(|peer| &peer.endpoint == endpoint)
+    }
+
+    /// `endpoint` signed in: each of its connections gets the normal
+    /// limits.
+    pub(crate) fn signed_in(&self, endpoint: &EndpointId) {
+        for peer in self.lock().values().filter(|p| &p.endpoint == endpoint) {
+            peer.raise();
+        }
+    }
+
+    /// The endpoints of the connections that have the normal limits.
+    fn known_endpoints(&self) -> Vec<EndpointId> {
+        let mut endpoints: Vec<_> = self
+            .lock()
             .values()
-            .any(|auth| matches!(auth, ConnectionAuth::Anonymous { endpoint: e } if e == endpoint))
+            .filter(|peer| peer.known())
+            .map(|peer| peer.endpoint)
+            .collect();
+        endpoints.sort();
+        endpoints.dedup();
+        endpoints
+    }
+
+    /// `endpoint` has no live session left: close its connections.
+    fn sign_out(&self, endpoint: &EndpointId) {
+        for peer in self.lock().values().filter(|p| &p.endpoint == endpoint) {
+            peer.sign_out();
+        }
+    }
+
+    /// Close the connections of every device that is no longer signed in:
+    /// each time sessions end, and every [`admission::RECHECK`].
+    async fn close_signed_out(self, store: crate::store::Store) {
+        let mut ended = store.sessions_ended();
+        loop {
+            tokio::select! {
+                changed = ended.changed() => if changed.is_err() { return },
+                () = tokio::time::sleep(admission::RECHECK) => {}
+            }
+            for endpoint in self.known_endpoints() {
+                match store.endpoint_signed_in(&endpoint.to_string()).await {
+                    Ok(true) => {}
+                    Ok(false) => self.sign_out(&endpoint),
+                    Err(e) => tracing::warn!(error = %e, "cannot check a device's sessions"),
+                }
+            }
+        }
     }
 }
 
@@ -168,6 +250,8 @@ impl std::fmt::Debug for Services {
 pub struct Server {
     router: Router,
     connections: Connections,
+    /// Closes signed-out devices' connections; ends with the server.
+    sign_outs: tokio::task::JoinHandle<()>,
 }
 
 impl Server {
@@ -193,6 +277,7 @@ impl Server {
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(key)
             .relay_mode(relay)
+            .transport_config(admission::transport_config())
             .alpns(vec![CLIENT_ALPN.to_vec(), FEDERATION_ALPN.to_vec()]);
         if options.mdns {
             let advert: UserData = lan::advert(&name.get())
@@ -249,19 +334,26 @@ impl Server {
             auth_methods: client::auth_methods(),
             web_url: services.public_url.clone(),
         };
-        let connections = Connections::default();
+        let connections = Connections::new(options.admission);
         services.metrics.observe_services(&services, &connections);
+        let sign_outs = tokio::spawn(
+            connections
+                .clone()
+                .close_signed_out(services.auth.store().clone()),
+        );
         // Unknown ALPNs never get this far: the TLS handshake refuses them.
+        let id = endpoint.id();
         let router = Router::builder(endpoint)
             .accept(
                 CLIENT_ALPN,
-                ClientProtocol::new(connections.clone(), info, name.clone(), services),
+                ClientProtocol::new(id, connections.clone(), info, name.clone(), services),
             )
             .accept(FEDERATION_ALPN, Unsupported("spoolframe/federation/1"))
             .spawn();
         Ok(Self {
             router,
             connections,
+            sign_outs,
         })
     }
 
@@ -281,9 +373,16 @@ impl Server {
 
     /// Close every connection and the endpoint.
     pub async fn shutdown(self) {
+        self.sign_outs.abort();
         if let Err(e) = self.router.shutdown().await {
             tracing::warn!(error = %e, "endpoint shutdown");
         }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.sign_outs.abort();
     }
 }
 

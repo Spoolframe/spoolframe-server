@@ -219,9 +219,18 @@ impl Store {
         Ok(id)
     }
 
-    /// Replace a user's password hash.
-    pub async fn set_password(&self, username: &str, phc: &str) -> Result<(), UserError> {
+    /// Replace a user's password hash, and revoke every live session of
+    /// theirs but `keep` (a token hash, the session that made the change):
+    /// whoever knew the old password, on the web or on a device, signs in
+    /// again (PX-09 finding 4). How many were revoked.
+    pub async fn set_password(
+        &self,
+        username: &str,
+        phc: &str,
+        keep: Option<&str>,
+    ) -> Result<u64, UserError> {
         let name = normalize_username(username)?;
+        let now = now();
         let mut tx = self.pool.begin().await?;
         let id = user_id(&mut tx, &name).await?;
         sqlx::query(
@@ -230,11 +239,23 @@ impl Store {
         )
         .bind(id)
         .bind(phc)
-        .bind(now())
+        .bind(now)
         .execute(&mut *tx)
         .await?;
+        let revoked = sqlx::query(
+            "UPDATE sessions SET revoked_at = ?2 \
+             WHERE user_id = ?1 AND revoked_at IS NULL AND token_hash IS NOT ?3",
+        )
+        .bind(id)
+        .bind(now)
+        .bind(keep)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         tx.commit().await?;
-        Ok(())
+        // The other devices' connections are closed (PX-10).
+        self.note_sessions_ended();
+        Ok(revoked)
     }
 
     /// Make `username` an admin or a consumer (P2-09). The last enabled
@@ -301,6 +322,7 @@ impl Store {
         .await?
         .rows_affected();
         tx.commit().await?;
+        self.note_sessions_ended();
         Ok(revoked)
     }
 
@@ -656,7 +678,7 @@ mod tests {
             .add_user("alice", None, "old", Role::Consumer)
             .await
             .unwrap();
-        store.set_password("alice", "new").await.unwrap();
+        store.set_password("alice", "new", None).await.unwrap();
         let login = store.password_login("alice").await.unwrap().unwrap();
         assert_eq!(login.phc.as_deref(), Some("new"));
     }
@@ -666,7 +688,7 @@ mod tests {
         let store = store("unknown").await;
         assert_eq!(store.password_login("nobody").await.unwrap(), None);
         assert!(matches!(
-            store.set_password("nobody", "x").await,
+            store.set_password("nobody", "x", None).await,
             Err(UserError::NoSuchUser(_))
         ));
     }

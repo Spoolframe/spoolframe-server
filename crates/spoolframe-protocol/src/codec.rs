@@ -169,8 +169,17 @@ pub async fn read_frame_bytes<R>(reader: &mut R) -> Result<Vec<u8>, CodecError>
 where
     R: AsyncRead + Unpin,
 {
+    read_frame_bytes_within(reader, MAX_FRAME).await
+}
+
+/// As [`read_frame_bytes`], refusing a frame longer than `max` (at most
+/// [`MAX_FRAME`]) before anything is allocated for it.
+pub async fn read_frame_bytes_within<R>(reader: &mut R, max: u32) -> Result<Vec<u8>, CodecError>
+where
+    R: AsyncRead + Unpin,
+{
     let len = reader.read_u32().await?;
-    if len > MAX_FRAME {
+    if len > max.min(MAX_FRAME) {
         return Err(CodecError::TooLarge { len: len.into() });
     }
     let mut bytes = vec![0; len as usize];
@@ -184,4 +193,13 @@ where
     T: DeserializeOwned,
 {
     decode(&read_frame_bytes(reader).await?)
+}
+
+/// As [`read_frame`], refusing a frame longer than `max`.
+pub async fn read_frame_within<R, T>(reader: &mut R, max: u32) -> Result<T, CodecError>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
+    decode(&read_frame_bytes_within(reader, max).await?)
 }

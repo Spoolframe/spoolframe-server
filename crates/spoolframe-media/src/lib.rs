@@ -20,6 +20,6 @@ pub mod vobsub;
 pub use probe::{ProbeError, Prober};
 
 pub use descriptor::{
-    AudioStream, MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, VideoRange,
-    VideoStream,
+    AudioStream, MAX_DURATION, MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream,
+    VideoRange, VideoStream,
 };

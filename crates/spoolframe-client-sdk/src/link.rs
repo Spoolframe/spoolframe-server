@@ -10,7 +10,13 @@
 //! the server's side of it is gone, but QUIC here has not noticed yet. A
 //! request that gets no answer, and then no `Pong`, drops it
 //! ([`Link::drop_dead`]): it is closed, and the supervisor dials again.
+//!
+//! The server may also close a connection for a reason it gives
+//! ([`spoolframe_protocol::close`]). Signed out, the device has no session
+//! there: they are ended here, and nothing dials again until a call needs
+//! it. Refused as the server is full, the supervisor stops too.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -19,12 +25,12 @@ use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use spoolframe_protocol::codec::read_frame;
 use spoolframe_protocol::streams::uni;
-use spoolframe_protocol::{Event, ServerInfo};
+use spoolframe_protocol::{Event, ServerInfo, SessionId};
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
 use crate::client::{Client, Inner};
-use crate::connection::ServerConnection;
+use crate::connection::{ServerConnection, closed_by_server};
 use crate::error::SdkError;
 
 /// The first wait after a connection is lost.
@@ -106,9 +112,30 @@ impl StateWatch {
     }
 }
 
+/// Each time a server signs this device out: it closed the connection
+/// because the device's last session there ended ([`crate::Client::signed_out`]).
+#[derive(Debug, Clone)]
+pub struct SignOutWatch(watch::Receiver<u64>);
+
+impl SignOutWatch {
+    /// Returns at the next sign-out; `None` once the client is gone. A
+    /// sign-out since the last call returns at once, so none goes unseen
+    /// between two calls; several are told as one.
+    pub async fn next(&mut self) -> Option<()> {
+        self.0.changed().await.ok()?;
+        self.0.borrow_and_update();
+        Some(())
+    }
+}
+
 pub(crate) struct Link {
     id: EndpointId,
     state: watch::Sender<ConnectionState>,
+    /// How many times the server has signed this device out.
+    sign_outs: watch::Sender<u64>,
+    /// The sessions a sign-out ended: a call in one is
+    /// [`SdkError::SignInRequired`] without a dial.
+    ended: Mutex<HashSet<String>>,
     current: Mutex<Option<Arc<ServerConnection>>>,
     /// What the latest connection's Hello said, kept while it reconnects.
     info: Mutex<Option<ServerInfo>>,
@@ -122,6 +149,8 @@ impl Link {
         Arc::new(Self {
             id,
             state: watch::Sender::new(ConnectionState::Disconnected),
+            sign_outs: watch::Sender::new(0),
+            ended: Mutex::default(),
             current: Mutex::default(),
             info: Mutex::default(),
             dialing: tokio::sync::Mutex::default(),
@@ -129,8 +158,29 @@ impl Link {
         })
     }
 
+    pub fn id(&self) -> EndpointId {
+        self.id
+    }
+
     pub fn watch(&self) -> StateWatch {
         StateWatch(self.state.subscribe())
+    }
+
+    pub fn sign_outs(&self) -> SignOutWatch {
+        SignOutWatch(self.sign_outs.subscribe())
+    }
+
+    /// Whether the server signed this device out of `session`.
+    pub fn has_ended(&self, session: &SessionId) -> bool {
+        self.ended
+            .lock()
+            .expect("never poisoned")
+            .contains(&session.0)
+    }
+
+    /// The server signed this device out of `sessions`.
+    pub fn end(&self, sessions: impl IntoIterator<Item = String>) {
+        self.ended.lock().expect("never poisoned").extend(sessions);
     }
 
     /// The path of the connection now; `Unknown` without one.
@@ -171,8 +221,10 @@ impl Link {
         if let Some(conn) = self.open() {
             return Ok(conn);
         }
-        if self.supervised() {
-            return self.reconnected().await;
+        if self.supervised()
+            && let Some(conn) = self.reconnected().await?
+        {
+            return Ok(conn);
         }
         let _dialing = self.dialing.lock().await;
         if let Some(conn) = self.open() {
@@ -209,12 +261,17 @@ impl Link {
     /// Wait up to [`CALL_WAIT`] for the supervisor to reconnect. The
     /// state may still say `Connected` of a connection just closed, until
     /// the supervisor has seen it go: what counts is an open connection.
-    async fn reconnected(&self) -> Result<Arc<ServerConnection>, SdkError> {
+    /// `None` when the supervisor stopped instead (the device was signed
+    /// out, or the server is full): the caller dials.
+    async fn reconnected(&self) -> Result<Option<Arc<ServerConnection>>, SdkError> {
         let deadline = tokio::time::Instant::now() + CALL_WAIT;
         let mut state = self.state.subscribe();
         loop {
             if let Some(conn) = self.open() {
-                return Ok(conn);
+                return Ok(Some(conn));
+            }
+            if *state.borrow_and_update() == ConnectionState::Disconnected {
+                return Ok(None);
             }
             match tokio::time::timeout_at(deadline, state.changed()).await {
                 Ok(Ok(())) => {}
@@ -265,6 +322,11 @@ impl Link {
 async fn supervise(link: Arc<Link>, client: Weak<Inner>, mut conn: Arc<ServerConnection>) {
     loop {
         until_lost(&conn.conn).await;
+        let reason = conn.conn.close_reason();
+        if reason.as_ref().and_then(closed_by_server) == Some(SdkError::SignInRequired) {
+            signed_out(&link, &client).await;
+            return;
+        }
         tracing::info!(server = %link.id, "connection lost; reconnecting");
         let mut delay = FIRST_RETRY;
         let mut attempt = 1;
@@ -279,6 +341,13 @@ async fn supervise(link: Arc<Link>, client: Weak<Inner>, mut conn: Arc<ServerCon
                     link.set(None, ConnectionState::Disconnected);
                     return;
                 }
+                // Let in again only once signed in: dialling on would only
+                // be refused again, and the next call says why.
+                Err(SdkError::ServerFull) => {
+                    tracing::info!(server = %link.id, "the server is full; not reconnecting");
+                    link.set(None, ConnectionState::Disconnected);
+                    return;
+                }
                 Err(e) => {
                     tracing::debug!(server = %link.id, attempt, error = %e, "reconnect failed")
                 }
@@ -290,6 +359,22 @@ async fn supervise(link: Arc<Link>, client: Weak<Inner>, mut conn: Arc<ServerCon
         tracing::info!(server = %link.id, attempt, "reconnected");
         link.set(Some(conn.clone()), ConnectionState::Connected);
     }
+}
+
+/// The server closed the connection because this device's last session
+/// there ended. It sends that only once no session is left for the
+/// device, so every session kept for the server is ended here, before the
+/// app is told ([`crate::Client::signed_out`]).
+async fn signed_out(link: &Link, client: &Weak<Inner>) {
+    tracing::info!(server = %link.id, "signed out by the server; its sessions here are ended");
+    if let Some(inner) = client.upgrade() {
+        match (Client { inner }).end_every_session(link.id).await {
+            Ok(tokens) => link.end(tokens),
+            Err(e) => tracing::warn!(server = %link.id, error = %e, "cannot end the sessions kept"),
+        }
+    }
+    link.set(None, ConnectionState::Disconnected);
+    link.sign_outs.send_modify(|n| *n += 1);
 }
 
 /// Returns when `conn` closes or the server says it is shutting down: then

@@ -26,6 +26,31 @@ catalog cursors or bound the backend's work to produce the collection.
 Each reply identifies the server process and reports its clock. Both peers
 require the current revision in the Hello exchange.
 
+## Connection limits
+
+A connection from an endpoint with no live session is a *stranger*. Its
+limits come from the handshake: no unidirectional streams (the server
+never accepts one; events go server → client), 4 concurrent
+bidirectional streams, 512 KiB of unread data across them, and request
+frames of at most 64 KiB. A connection from a device with a live session
+gets 100 streams and 16 MiB, at accept or as soon as a sign-in on it
+succeeds; frames may then be 1 MiB.
+
+Every stream must deliver its kind byte and first frame within 10 s
+(`network.first_frame_timeout_secs`), or it is reset with
+`reset::FIRST_FRAME_TIMEOUT` (2); the connection stays.
+
+The server holds at most 64 stranger connections
+(`network.max_stranger_connections`). One more is closed with
+`close::BUSY` (2) and may try again later; a signed-in device is always
+let in. When a device's last live session ends, the server delivers the
+replies it is sending (for at most 2 s) and closes its connections with
+`close::SIGNED_OUT` (3). The SDK ends every session it keeps for the
+server, answers a call in one with `SignInRequired`, and dials again
+only when a call needs it, as a stranger. It reports `close::BUSY` as
+`ServerFull`. Connections
+idle for 15 s are dropped; iroh sends a keep-alive every 5 s.
+
 ## Mutation replay
 
 Mutations require an operation ID, server process ID, and expiry expressed
@@ -41,9 +66,16 @@ or cancelling the response stream does not cancel an admitted mutation.
 Reusing an ID with another request returns `OperationConflict`.
 
 An operation can live for at most 15 minutes. The cache has a 4096-entry
-and 64 MiB serialized-outcome budget, reserving 1 MiB per pending operation.
-It refuses new operations when full; it does not evict unexpired IDs to
-make room. Individual mutation outcomes are capped at 1 MiB. Expired IDs
+and 64 MiB serialized-outcome budget. A pending operation reserves what its
+kind of reply can take: 1 MiB for `StartPlayback`, `ChangeSubtitle` and
+`SeekPlayback`, 64 KiB for passkey ceremony options, 16 KiB for the rest;
+a finished one counts its outcome's size. One endpoint, and one user, may
+hold at most an eighth of the entries and bytes. The anonymous sign-in
+requests have their own pool of 512 entries and 8 MiB with the same
+shares, and their outcomes are replayed for 30 s after they are known, or
+until the operation expires if that is sooner.
+It refuses new operations with `RateLimited` when full; it does not evict
+unexpired IDs to make room. Individual mutation outcomes are capped at 1 MiB. Expired IDs
 return `OperationExpired`; IDs from an earlier server process return
 `ServerRestarted`. Neither error re-executes the operation. This is a
 bounded replay guarantee, not a durable transaction log. After a crash,
@@ -101,7 +133,7 @@ confirm, and sends the request again. It does not sign out.
 | Request | Reply |
 |---|---|
 | `{"type": "confirm_password", "password": "…"}` | `Confirmed` |
-| `{"type": "begin_confirm_passkey"}` | `PasskeyRequest` |
+| `{"type": "begin_confirm_passkey"}` | `PasskeySignInBegun` |
 | `{"type": "finish_confirm_passkey", …FinishPasskeySignIn fields}` | `Confirmed` |
 
 Each request needs a session. Each is a mutation, so it carries an
@@ -118,13 +150,43 @@ password and for a login. A user with no password gets `NoPassword`, and
 nothing is counted.
 
 `BeginConfirmPasskey` lists only the session user's app passkeys
-(relying party `spoolframe.app`). The challenge belongs to this session on
-this endpoint, for 5 minutes, and is used once. A sign-in challenge or the
+(relying party `spoolframe.app`). It sends a nonce, and the app signs the
+challenge made from it (see "App passkey challenges"). The challenge
+belongs to this session on this endpoint, for 5 minutes, and is used once. A sign-in challenge or the
 challenge of another session does not finish it. A passkey of another user
 is `InvalidCredentials`. A failure counts as a failed passkey sign-in of
 the passkey's user from this endpoint. A user with no app passkey gets
 `NotFound`. When the user's passkey sign-ins are rate-limited, `Begin`
 gets `RateLimited` before a challenge is made.
+
+## App passkey challenges
+
+Every server shares the app relying party `spoolframe.app`, and the
+platform writes only the origin `https://spoolframe.app` and the challenge
+into `clientDataJSON`. So the challenge names the server: otherwise a
+server could begin a ceremony on another server, give that challenge to
+an app as its own, and finish there with what the app signed (PX-09,
+finding 2).
+
+`BeginPasskeySignIn` and `BeginConfirmPasskey` reply `PasskeySignInBegun`
+(`nonce`, `allow_credential_ids`). `BeginPasskeyRegistration` replies
+`PasskeyRegistrationBegun` (`nonce`, `user_id`, `user_name`,
+`display_name`, `exclude_credential_ids`). Each `nonce` is 32 random bytes.
+There is no `challenge` field. The challenge is:
+
+```text
+SHA-256("spoolframe/app-passkey-challenge/1" || server endpoint id (32 bytes) || nonce)
+```
+
+`spoolframe_protocol::app_passkey_challenge` computes it. The server uses
+its own endpoint id. The client uses the endpoint id that it pinned and
+dialled, never an id that the server sends. The SDK gives the app a
+`PasskeyRequest` or a `PasskeyCreation` with this challenge in it. A
+signature for another server's challenge is `InvalidCredentials`.
+
+`BeginPasskeySignIn` lists no credential ids, with or without `username`:
+anyone can send it. App passkeys are discoverable, so the platform finds
+them. With `username`, only that user's passkeys finish the sign-in.
 
 A PIN is not accepted as proof. A PIN guards switching profiles on a
 shared device, and it is weaker than a sign-in. A locked session gets

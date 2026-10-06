@@ -17,7 +17,8 @@ use spoolframe_types::{
 
 use crate::media::PlaybackHandle;
 use crate::passkeys::{
-    FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
+    FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyInfo, PasskeyRegistrationBegun,
+    PasskeySignInBegun,
 };
 use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Selection};
 use crate::plex::PlexLink;
@@ -83,9 +84,11 @@ pub enum Request {
         request: String,
     },
     /// Begin signing in with an app passkey (P3-19, [`crate::passkeys`]):
-    /// `PasskeyRequest`, with the passkeys of `username` listed, or none
-    /// listed (any the platform finds) without one. The challenge is
-    /// this device's, for 5 minutes; beginning again replaces it.
+    /// `PasskeySignInBegun`, a nonce, listing no passkeys (any the
+    /// platform finds): anyone can ask. With `username`, only that user's
+    /// passkeys finish it. The nonce is this device's, for 5 minutes;
+    /// beginning again replaces it. The challenge to sign is
+    /// [`crate::app_passkey_challenge`] of this server's id and the nonce.
     BeginPasskeySignIn {
         username: Option<String>,
     },
@@ -189,7 +192,8 @@ pub enum Request {
     /// The devices the session user has signed in from. `Devices`.
     ListDevices,
     /// Begin making an app passkey for the session user (P3-19):
-    /// `PasskeyCreation`. Needs a session signed in within the last 10
+    /// `PasskeyRegistrationBegun`, a nonce, as for `BeginPasskeySignIn`.
+    /// Needs a session signed in within the last 10
     /// minutes, or `RecentSignInRequired`: confirm it is the user
     /// (`ConfirmPassword`, `BeginConfirmPasskey`) first.
     BeginPasskeyRegistration,
@@ -232,8 +236,9 @@ pub enum Request {
     /// device, and is weaker than a sign-in.
     ConfirmPassword(ConfirmPassword),
     /// Begin confirming it is the session user with one of their app
-    /// passkeys (P3-19): `PasskeyRequest`, listing their app passkeys
-    /// only. The challenge is this session's on this device, for 5
+    /// passkeys (P3-19): `PasskeySignInBegun`, a nonce as for
+    /// `BeginPasskeySignIn`, listing their app passkeys only. The nonce is
+    /// this session's on this device, for 5
     /// minutes; beginning again replaces it. A user with no app passkey
     /// gets `NotFound`; one whose passkey sign-ins are limited
     /// `RateLimited`. A locked session gets `ProfileLocked`.
@@ -391,8 +396,14 @@ impl Request {
     }
 }
 
+/// The most characters the server keeps of each of `Hello`'s strings
+/// (PX-10): `client_name`, `client_version` and `device_name`. It cuts a
+/// longer one to this many, and keeps and shows only that.
+pub const MAX_HELLO_TEXT: usize = 128;
+
 /// The client introduces itself. Capabilities (P1-07) will be added as an
-/// optional field, which older servers ignore.
+/// optional field, which older servers ignore. Each string is cut to
+/// [`MAX_HELLO_TEXT`] characters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol_version: u32,
@@ -411,6 +422,24 @@ pub struct Hello {
     /// is `Unsupported`.
     #[serde(default)]
     pub capabilities: Option<ClientCapabilities>,
+}
+
+impl Hello {
+    /// This `Hello` with each string cut to [`MAX_HELLO_TEXT`] characters:
+    /// what a server keeps of it.
+    pub fn within_bounds(mut self) -> Self {
+        fn cut(text: &mut String) {
+            if let Some((at, _)) = text.char_indices().nth(MAX_HELLO_TEXT) {
+                text.truncate(at);
+            }
+        }
+        cut(&mut self.client_name);
+        cut(&mut self.client_version);
+        if let Some(name) = &mut self.device_name {
+            cut(name);
+        }
+        self
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -644,12 +673,13 @@ pub enum Reply {
     TrackPreferences(TrackPreferences),
     /// An item's frame previews (`GetPreviews`, P3-13).
     Previews(Previews),
-    /// What the platform makes an app passkey with
-    /// (`BeginPasskeyRegistration`, P3-19).
-    PasskeyCreation(PasskeyCreation),
-    /// What the platform signs in with an app passkey with
-    /// (`BeginPasskeySignIn`, P3-19).
-    PasskeyRequest(PasskeyRequest),
+    /// What the platform makes an app passkey with, but the challenge:
+    /// the nonce it is made from (`BeginPasskeyRegistration`, P3-19).
+    PasskeyRegistrationBegun(PasskeyRegistrationBegun),
+    /// What the platform signs in with an app passkey with, but the
+    /// challenge: the nonce it is made from (`BeginPasskeySignIn`,
+    /// `BeginConfirmPasskey`, P3-19).
+    PasskeySignInBegun(PasskeySignInBegun),
     /// The session user's passkeys (`ListPasskeys`).
     Passkeys {
         passkeys: Vec<PasskeyInfo>,
@@ -921,3 +951,6 @@ pub enum Event {
     #[serde(other)]
     Unknown,
 }
+
+#[cfg(test)]
+mod tests;

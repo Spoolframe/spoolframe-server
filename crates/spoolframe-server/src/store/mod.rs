@@ -51,6 +51,9 @@ pub enum StoreError {
 #[derive(Debug, Clone)]
 pub struct Store {
     pool: SqlitePool,
+    /// Bumped after anything that may end sessions (PX-10), so the
+    /// connections of a device that is no longer signed in are closed.
+    sessions_ended: std::sync::Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 impl Store {
@@ -84,7 +87,23 @@ impl Store {
             .await
             .map_err(|source| StoreError::Migrate { path, source })?;
         user_ids::rename_secrets(&pool, state_dir).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            sessions_ended: std::sync::Arc::new(tokio::sync::watch::Sender::new(0)),
+        })
+    }
+
+    /// Changes each time sessions may have ended: revoked, or their user
+    /// disabled. What changed is not said; the connections of every
+    /// signed-in device are checked again.
+    pub fn sessions_ended(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.sessions_ended.subscribe()
+    }
+
+    /// Say that sessions may have ended. A change that ends sessions
+    /// outside this store's own methods calls it too.
+    pub fn note_sessions_ended(&self) {
+        self.sessions_ended.send_modify(|n| *n = n.wrapping_add(1));
     }
 }
 

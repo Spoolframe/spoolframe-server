@@ -872,12 +872,6 @@ pub fn AddLibrary(back: String) -> Element {
     let mut busy = use_signal(|| false);
 
     let current = known.read().clone();
-    let first_token = current
-        .as_ref()
-        .and_then(|c| c.as_ref().ok())
-        .and_then(|o| o.servers.first())
-        .filter(|s| s.token_set)
-        .map(|s| s.name.clone());
 
     // Check the checked rows' paths: all of them, or (after a keystroke)
     // the one changed, a moment after typing stops.
@@ -1368,10 +1362,11 @@ pub fn AddLibrary(back: String) -> Element {
                     if is_new {
                         div { class: "flex flex-col gap-2.5",
                             h2 { class: "add-h2", "Account" }
+                            // Another server's token is never used for this
+                            // one (PX-10): the account's, or one pasted.
                             if pasting()
                                 || needs_token
-                                || (first_token.is_none()
-                                    && !(matches!(pick(), Pick::Account(_)) && account_name.is_some()))
+                                || !(matches!(pick(), Pick::Account(_)) && account_name.is_some())
                             {
                                 div { class: "panel",
                                     if needs_token {
@@ -1405,12 +1400,6 @@ pub fn AddLibrary(back: String) -> Element {
                                 div { class: "account-line",
                                     span { class: "text-ctp-green", icons::CircleCheck {} }
                                     span { class: "flex-grow", "{line}" }
-                                    button { class: "link-button", r#type: "button", onclick: move |_| pasting.set(true), "Paste a token" }
-                                }
-                            } else if let Some(first) = first_token.clone() {
-                                div { class: "account-line",
-                                    span { class: "text-ctp-green", icons::CircleCheck {} }
-                                    span { class: "flex-grow", "Uses the Plex token the server has for " b { "{first}" } }
                                     button { class: "link-button", r#type: "button", onclick: move |_| pasting.set(true), "Paste a token" }
                                 }
                             }

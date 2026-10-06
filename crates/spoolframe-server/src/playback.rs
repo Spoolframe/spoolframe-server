@@ -187,6 +187,26 @@ pub enum Sidecar {
     },
 }
 
+/// The file a direct playback reads, as it was when the playback started:
+/// a read opens the path again, and is refused if the path names another
+/// file by then (PX-09 B-1), such as a symlink swapped in by someone who
+/// can write to the library folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    pub fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+}
+
 /// One playback.
 #[derive(Debug, Clone)]
 pub struct Playback {
@@ -212,6 +232,8 @@ pub struct Playback {
     pub selection: Selection,
     pub path: PathBuf,
     pub size: u64,
+    /// For direct play, the file `path` named at the start.
+    pub file: Option<FileId>,
     pub subtitle: Option<Sidecar>,
     /// For a converted playback, its encode (P2-03). Ending the handle
     /// drops it, which stops ffmpeg and removes its files.
@@ -243,6 +265,7 @@ pub struct Opened {
     pub selection: Selection,
     pub path: PathBuf,
     pub size: u64,
+    pub file: Option<FileId>,
     pub subtitle: Option<Sidecar>,
     pub conversion: Option<Arc<Conversion>>,
 }
@@ -253,6 +276,7 @@ pub struct Changed {
     pub planned: PlaybackPlan,
     pub selection: Selection,
     pub size: u64,
+    pub file: Option<FileId>,
     pub subtitle: Option<Sidecar>,
     pub conversion: Option<Arc<Conversion>>,
 }
@@ -625,6 +649,7 @@ impl Playbacks {
                 selection: opened.selection,
                 path: opened.path,
                 size: opened.size,
+                file: opened.file,
                 subtitle: opened.subtitle,
                 conversion: opened.conversion,
                 last_used: now,
@@ -646,6 +671,7 @@ impl Playbacks {
         playback.planned = changed.planned;
         playback.selection = changed.selection;
         playback.size = changed.size;
+        playback.file = changed.file;
         playback.subtitle = changed.subtitle;
         std::mem::replace(&mut playback.conversion, changed.conversion)
     }
@@ -1001,6 +1027,7 @@ mod tests {
                 selection: Selection::default(),
                 path: "/media/a.mkv".into(),
                 size: 10,
+                file: None,
                 subtitle: None,
                 conversion: None,
             },

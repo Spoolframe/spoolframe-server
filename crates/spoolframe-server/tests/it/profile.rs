@@ -96,6 +96,9 @@ async fn revoking_a_device_signs_it_out() {
     assert!(!device.current);
 
     alice.revoke_session(device.id.clone()).await.unwrap();
+    // Its connection is closed (PX-10); back, its session is refused.
+    pc.conn.closed().await;
+    let pc = pc.reconnect(&server).await;
     assert_eq!(
         who(&pc, &on_pc).await,
         Response::Err(Error::Unauthenticated)
@@ -118,6 +121,9 @@ async fn signing_out_everywhere_else_leaves_only_this_web_session() {
     let left = phone.sessions().await.unwrap();
     assert_eq!(left.len(), 1, "{left:?}");
     assert!(left[0].current);
+    // Its connection is closed (PX-10); back, its session is refused.
+    pc.conn.closed().await;
+    let pc = pc.reconnect(&server).await;
     assert_eq!(
         who(&pc, &on_pc).await,
         Response::Err(Error::Unauthenticated)
@@ -323,5 +329,126 @@ async fn no_me_method_reaches_another_user_s_account() {
     assert_eq!(shown_as(who(&bobs_pc, &on_bobs_pc).await), "bob");
     bob.who_am_i().await.unwrap();
     bobs_pc.close().await;
+    server.stop().await;
+}
+
+/// Whether `web`'s session still works: `whoAmI`, or the error's code.
+async fn web_works(web: &WsClient) -> Result<(), i32> {
+    web.who_am_i().await.map(|_| ()).map_err(code)
+}
+
+/// Whether `pc`'s connection was closed as signed out (PX-10) within 5 s;
+/// then the device back on a new connection.
+async fn signed_out(server: &TestServer, pc: TestClient) -> TestClient {
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), pc.conn.closed())
+        .await
+        .expect("the device's connection was not closed");
+    assert!(
+        matches!(
+            &closed,
+            iroh::endpoint::ConnectionError::ApplicationClosed(close)
+                if close.error_code
+                    == iroh::endpoint::VarInt::from_u32(spoolframe_protocol::close::SIGNED_OUT)
+        ),
+        "{closed:?}"
+    );
+    pc.reconnect(server).await
+}
+
+/// PX-09 finding 4 (A-2): a new password signs out every other session of
+/// its user, on the web and on devices; the one that changed it stays.
+#[tokio::test]
+async fn a_password_change_signs_out_every_other_session() {
+    let (server, web) = server("password-revokes").await;
+    let (pc, session) = on_a_device(&server, "alice").await;
+    let elsewhere = on_the_web(web, "alice").await;
+    let here = on_the_web(web, "alice").await;
+    let (bob_pc, bob_session) = on_a_device(&server, "bob").await;
+
+    here.set_password(spoolframe_admin_api::PasswordChange {
+        current_password: PASSWORD.into(),
+        new_password: "battery staple".into(),
+    })
+    .await
+    .unwrap();
+
+    // Its connection is closed at once (PX-10).
+    let pc = signed_out(&server, pc).await;
+    assert_eq!(
+        who(&pc, &session).await,
+        Response::Err(Error::Unauthenticated)
+    );
+    assert_eq!(
+        web_works(&elsewhere).await,
+        Err(error_code::UNAUTHENTICATED)
+    );
+    assert_eq!(web_works(&here).await, Ok(()));
+    // Nobody else's.
+    assert_eq!(shown_as(who(&bob_pc, &bob_session).await), "bob");
+    pc.close().await;
+    bob_pc.close().await;
+    server.stop().await;
+}
+
+/// An admin `root` beside alice and bob, signed in to the web UI.
+async fn as_root(server: &TestServer, web: SocketAddr) -> WsClient {
+    server.add_user("root", PASSWORD, None).await;
+    server
+        .store
+        .set_role("root", spoolframe_types::Role::Admin)
+        .await
+        .unwrap();
+    on_the_web(web, "root").await
+}
+
+/// An admin's reset signs the user out everywhere: whoever knew the old
+/// password is out.
+#[tokio::test]
+async fn an_admin_reset_signs_the_user_out_everywhere() {
+    use spoolframe_admin_api::AdminApiClient;
+    let (server, web) = server("reset-revokes").await;
+    let root = as_root(&server, web).await;
+    let (pc, session) = on_a_device(&server, "alice").await;
+    let alice = on_the_web(web, "alice").await;
+
+    root.user_set_password(creds("alice", "battery staple"))
+        .await
+        .unwrap();
+
+    // Its connection is closed at once (PX-10).
+    let pc = signed_out(&server, pc).await;
+    assert_eq!(
+        who(&pc, &session).await,
+        Response::Err(Error::Unauthenticated)
+    );
+    assert_eq!(web_works(&alice).await, Err(error_code::UNAUTHENTICATED));
+    assert_eq!(web_works(&root).await, Ok(()));
+    pc.close().await;
+    server.stop().await;
+}
+
+/// An admin resetting their own password keeps the session they did it
+/// from, as a change of their own does.
+#[tokio::test]
+async fn an_admin_resetting_their_own_password_keeps_that_session() {
+    use spoolframe_admin_api::AdminApiClient;
+    let (server, web) = server("reset-self-revokes").await;
+    let root = as_root(&server, web).await;
+    let other = on_the_web(web, "root").await;
+    let (pc, session) = on_a_device(&server, "root").await;
+
+    root.user_set_password(creds("root", "battery staple"))
+        .await
+        .unwrap();
+
+    assert_eq!(web_works(&root).await, Ok(()));
+    assert_eq!(web_works(&other).await, Err(error_code::UNAUTHENTICATED));
+    // Its connection is closed at once (PX-10).
+    let pc = signed_out(&server, pc).await;
+    assert_eq!(
+        who(&pc, &session).await,
+        Response::Err(Error::Unauthenticated)
+    );
+    pc.close().await;
     server.stop().await;
 }

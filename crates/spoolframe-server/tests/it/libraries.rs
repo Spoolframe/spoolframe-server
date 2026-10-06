@@ -817,7 +817,7 @@ async fn each_library_s_watch_sync_is_shown_and_chosen() {
 }
 
 #[tokio::test]
-async fn a_second_plex_server_is_added_with_the_first_one_s_token_and_removed_with_its_libraries() {
+async fn a_second_plex_server_is_added_with_its_own_token_and_removed_with_its_libraries() {
     let tower = pms_with("Tower", TOWER_SECTIONS, TOWER_FILMS, Some("t0k")).await;
     let cabin = pms_with(
         "Cabin",
@@ -834,14 +834,18 @@ async fn a_second_plex_server_is_added_with_the_first_one_s_token_and_removed_wi
 
     let wrong = root.plex_server_add(cabin.uri(), Some("nope".into())).await;
     assert_eq!(code(wrong.unwrap_err()), error_code::UNAVAILABLE);
-    // The same Plex account's token works on its other servers.
-    let added = root.plex_server_add(cabin.uri(), None).await.unwrap();
+    // Its own token, given: the first server's is never sent to another
+    // URL by itself (PX-09 B-2).
+    let added = root
+        .plex_server_add(cabin.uri(), Some("t0k".into()))
+        .await
+        .unwrap();
     assert_eq!((added.id.as_str(), added.name.as_str()), ("cabin", "Cabin"));
     assert!(added.status.reachable && added.token_set);
     assert_eq!(added.status.unsupported[0].title, "Photos");
     let secret = dir.as_ref().join("secrets").join("plex-token-cabin");
     assert_eq!(std::fs::read_to_string(&secret).unwrap().trim(), "t0k");
-    let twice = root.plex_server_add(cabin.uri(), None).await;
+    let twice = root.plex_server_add(cabin.uri(), Some("t0k".into())).await;
     assert_eq!(code(twice.unwrap_err()), error_code::INVALID_INPUT);
 
     root.plex_server_set_paths("cabin".into(), files_here(dir.as_ref(), &["Arrival"]))

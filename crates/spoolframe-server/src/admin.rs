@@ -690,14 +690,19 @@ impl AdminApi {
     /// session left open, or its stolen cookie, cannot make one.
     async fn recently_signed_in(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
         let (token, user) = self.caller(ext).await?;
-        let age = crate::store::now() - user.authenticated_at;
-        if age > RECENT_SIGN_IN.as_secs() as i64 {
-            return Err(error(
-                error_code::RECENT_SIGN_IN_REQUIRED,
-                "confirm it is you: enter your password, or sign in again",
-            ));
-        }
+        recent(&user)?;
         Ok((token, user))
+    }
+
+    /// The caller, if an admin who signed in within [`RECENT_SIGN_IN`]
+    /// (PX-09 finding 3): what an admin change needs that could take over
+    /// an account or the server, so an admin session left open, or its
+    /// stolen cookie, cannot make one. The role is checked first, so a
+    /// consumer is told `FORBIDDEN`, not asked to confirm.
+    async fn recent_admin(&self, ext: &Extensions) -> RpcResult<ApiSessionUser> {
+        let user = self.admin(ext).await?;
+        recent(&user)?;
+        Ok(user)
     }
 
     /// The caller and `typed` as a device sign-in code (P3-07), if they
@@ -946,6 +951,26 @@ fn device(d: DeviceRecord) -> DeviceEntry {
     }
 }
 
+/// `RECENT_SIGN_IN_REQUIRED` unless `user` proved who they are in this
+/// session within [`RECENT_SIGN_IN`].
+fn recent(user: &ApiSessionUser) -> RpcResult<()> {
+    let age = crate::store::now() - user.authenticated_at;
+    if age > RECENT_SIGN_IN.as_secs() as i64 {
+        return Err(error(
+            error_code::RECENT_SIGN_IN_REQUIRED,
+            "confirm it is you: enter your password, or sign in again",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a setting is one whose change could take the server over: the
+/// admin listener, its cookies, proxies and public URL (`admin.*`), and
+/// sign-in providers (`auth.*`).
+fn sensitive_setting(key: &str) -> bool {
+    key.starts_with("admin.") || key.starts_with("auth.")
+}
+
 impl AdminApi {
     /// The runtime settings, and the admin changing them, by name for the
     /// log.
@@ -958,6 +983,20 @@ impl AdminApi {
             ));
         };
         Ok((settings, self.account(user).await?.username))
+    }
+
+    /// As [`AdminApi::settings_as_admin`], for a change that needs a recent
+    /// sign-in when `sensitive`.
+    async fn settings_as_recent_admin(
+        &self,
+        ext: &Extensions,
+        sensitive: bool,
+    ) -> RpcResult<(&RuntimeSettings, String)> {
+        let (settings, by) = self.settings_as_admin(ext).await?;
+        if sensitive {
+            self.recent_admin(ext).await?;
+        }
+        Ok((settings, by))
     }
 
     fn plex(&self) -> RpcResult<Arc<PlexCatalog>> {
@@ -1087,7 +1126,11 @@ impl AdminApi {
                 ));
             }
         };
-        Ok(self.oidc.begin(provider, purpose).await?)
+        let source = source(ext)?;
+        Ok(self
+            .oidc
+            .begin(provider, purpose, source.as_deref())
+            .await?)
     }
 
     /// The provider's callback: `code` (or `declined`, its `error`) for
@@ -1329,8 +1372,9 @@ impl MeApiServer for AdminApi {
         })
     }
 
-    async fn passkey_login_begin(&self, _ext: &Extensions) -> RpcResult<PasskeyChallenge> {
-        let (ceremony, options) = self.passkeys.begin_sign_in()?;
+    async fn passkey_login_begin(&self, ext: &Extensions) -> RpcResult<PasskeyChallenge> {
+        let source = source(ext)?;
+        let (ceremony, options) = self.passkeys.begin_sign_in(source.as_deref())?;
         Ok(PasskeyChallenge {
             ceremony,
             options: serde_json::to_value(options).map_err(internal)?,
@@ -1385,7 +1429,7 @@ impl MeApiServer for AdminApi {
     }
 
     async fn set_password(&self, ext: &Extensions, change: PasswordChange) -> RpcResult<()> {
-        let (_, user) = self.caller(ext).await?;
+        let (token, user) = self.caller(ext).await?;
         let me = self.account(user).await?;
         if me.has_password {
             let source = source(ext)?;
@@ -1398,8 +1442,14 @@ impl MeApiServer for AdminApi {
             self.recently_signed_in(ext).await?;
         }
         let phc = hash_password(&change.new_password).await?;
-        self.auth.store().set_password(&me.username, &phc).await?;
-        tracing::info!(username = %me.username, "password changed by its user");
+        // Every other session of theirs ends, on the web and on devices.
+        let keep = SessionToken(token).hash();
+        let revoked = self
+            .auth
+            .store()
+            .set_password(&me.username, &phc, Some(&keep))
+            .await?;
+        tracing::info!(username = %me.username, revoked, "password changed by its user");
         Ok(())
     }
 
@@ -1905,7 +1955,10 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn user_add(&self, ext: &Extensions, user: NewUser) -> RpcResult<UserInfo> {
-        self.admin(ext).await?;
+        match user.role {
+            Role::Admin => self.recent_admin(ext).await?,
+            _ => self.admin(ext).await?,
+        };
         if user.role == Role::Unknown {
             return Err(error(error_code::INVALID_INPUT, "use admin or consumer"));
         }
@@ -1924,12 +1977,18 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn user_set_password(&self, ext: &Extensions, credentials: Credentials) -> RpcResult<()> {
-        self.admin(ext).await?;
+        self.recent_admin(ext).await?;
+        let (token, _) = self.caller(ext).await?;
         let phc = hash_password(&credentials.password).await?;
-        self.auth
+        // Every session of theirs ends; the admin's own is kept, which is
+        // one of theirs only when they reset their own password.
+        let keep = SessionToken(token).hash();
+        let revoked = self
+            .auth
             .store()
-            .set_password(&credentials.username, &phc)
+            .set_password(&credentials.username, &phc, Some(&keep))
             .await?;
+        tracing::info!(username = %credentials.username, revoked, "password set by an admin");
         Ok(())
     }
 
@@ -1939,7 +1998,10 @@ impl AdminApiServer for AdminApi {
         username: String,
         role: Role,
     ) -> RpcResult<UserInfo> {
-        self.admin(ext).await?;
+        match role {
+            Role::Admin => self.recent_admin(ext).await?,
+            _ => self.admin(ext).await?,
+        };
         if role == Role::Unknown {
             return Err(error(error_code::INVALID_INPUT, "use admin or consumer"));
         }
@@ -1961,7 +2023,7 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn user_clear_pin(&self, ext: &Extensions, username: String) -> RpcResult<()> {
-        self.admin(ext).await?;
+        self.recent_admin(ext).await?;
         let user = self.record(&username).await?;
         self.auth
             .store()
@@ -1995,7 +2057,13 @@ impl AdminApiServer for AdminApi {
         endpoint_id: String,
         required: bool,
     ) -> RpcResult<()> {
-        self.admin(ext).await?;
+        // Asking for the PIN guards the device more; no longer asking
+        // does not, as for `me.setPinRequired`.
+        if required {
+            self.admin(ext).await?;
+        } else {
+            self.recent_admin(ext).await?;
+        }
         let user = self.record(&username).await?;
         self.auth
             .store()
@@ -2071,7 +2139,7 @@ impl AdminApiServer for AdminApi {
         username: String,
         id: String,
     ) -> RpcResult<()> {
-        self.admin(ext).await?;
+        self.recent_admin(ext).await?;
         let user = self.record(&username).await?;
         self.auth.store().remove_passkey(user.id, &id).await?;
         tracing::info!(%username, "passkey removed by an admin");
@@ -2090,7 +2158,7 @@ impl AdminApiServer for AdminApi {
         username: String,
         issuer: String,
     ) -> RpcResult<()> {
-        self.admin(ext).await?;
+        self.recent_admin(ext).await?;
         let user = self.record(&username).await?;
         self.auth.store().unlink_identity(user.id, &issuer).await?;
         tracing::info!(%username, provider = ?self.oidc.provider_of(&issuer), "sign-in provider account unlinked by an admin");
@@ -2103,7 +2171,7 @@ impl AdminApiServer for AdminApi {
         provider: String,
         secret: Option<String>,
     ) -> RpcResult<()> {
-        let (settings, by) = self.settings_as_admin(ext).await?;
+        let (settings, by) = self.settings_as_recent_admin(ext, true).await?;
         let config = settings.layers().config().map_err(internal)?;
         let Some(p) = config.auth.oidc.iter().find(|p| p.name.trim() == provider) else {
             return Err(OidcError::NoSuchProvider(provider).into());
@@ -2350,12 +2418,16 @@ impl AdminApiServer for AdminApi {
         key: String,
         value: serde_json::Value,
     ) -> RpcResult<SettingEntry> {
-        let (settings, by) = self.settings_as_admin(ext).await?;
+        let (settings, by) = self
+            .settings_as_recent_admin(ext, sensitive_setting(&key))
+            .await?;
         Ok(settings.set(&key, &value, &by)?)
     }
 
     async fn setting_unset(&self, ext: &Extensions, key: String) -> RpcResult<SettingEntry> {
-        let (settings, by) = self.settings_as_admin(ext).await?;
+        let (settings, by) = self
+            .settings_as_recent_admin(ext, sensitive_setting(&key))
+            .await?;
         Ok(settings.unset(&key, &by)?)
     }
 
@@ -2429,14 +2501,15 @@ impl AdminApiServer for AdminApi {
             .url()
             .map_err(|e| error(error_code::INVALID_INPUT, e.to_string()))?;
         // As `plexServerAdd` will add it: a pasted token, else the one the
-        // caller's linked Plex account has for it (P3-12), else the first
-        // server's.
+        // caller's linked Plex account has for it (P3-12); a server already
+        // added, with its own. Never another server's (PX-09 B-2): the URL
+        // may be anyone's that answered discovery.
         let token = match token.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()) {
             Some(token) => Some(token),
-            None => self
-                .linked_token_for(ext, url.as_str())
-                .await?
-                .or_else(|| settings.plex_token()),
+            None => match self.linked_token_for(ext, url.as_str()).await? {
+                Some(token) => Some(token),
+                None => settings.server_token_at(url.as_str()),
+            },
         };
         let catalog = PlexCatalog::new(url, token).map_err(internal)?;
         let mut status = libraries::plex_status(&catalog).await;
@@ -2662,7 +2735,7 @@ impl AdminApiServer for AdminApi {
         id: String,
         token: String,
     ) -> RpcResult<()> {
-        let (settings, by) = self.settings_as_admin(ext).await?;
+        let (settings, by) = self.settings_as_recent_admin(ext, true).await?;
         Ok(settings.plex_server_set_token(&id, &token, &by)?)
     }
 

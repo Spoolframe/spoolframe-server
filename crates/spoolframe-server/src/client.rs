@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use spoolframe_catalog::{CatalogError, Page};
 use spoolframe_media::{MediaDescriptor, SubtitleSource, SubtitleStream, codecs};
-use spoolframe_protocol::codec::{self, read_frame_bytes, write_frame};
+use spoolframe_protocol::close;
+use spoolframe_protocol::codec::{self, write_frame};
 use spoolframe_protocol::device_sign_in::{
     normalize as device_sign_in_code, web_link as device_sign_in_web_link,
 };
@@ -36,6 +38,7 @@ use spoolframe_types::{ArtworkId, Item, MediaId, MediaKind, Namespace, SubtitleF
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
 
+use crate::admission::{Peer, SIGN_OUT_DRAIN};
 use crate::artwork::{Artwork, ArtworkError};
 use crate::auth::{self, Approval, LoginError, RECENT_SIGN_IN, SessionToken, UnlockError};
 use crate::device_sign_in::{self, ClaimError, Outcome, Waiting};
@@ -44,7 +47,7 @@ use crate::encode::{Conversion, ConversionSource, hls};
 use crate::network::{ConnectionAuth, Connections, ServerName, Services};
 use crate::passkeys::{CeremonyError, SignInError};
 use crate::planner;
-use crate::playback::{Changed, Opened, Playback, Playbacks, Refusal, Sidecar};
+use crate::playback::{Changed, FileId, Opened, Playback, Playbacks, Refusal, Sidecar};
 use crate::plex_accounts::Link;
 use crate::previews::{self, PreviewState};
 use crate::principal::Principal;
@@ -64,6 +67,9 @@ const SHUTDOWN_NOTICE: Duration = Duration::from_millis(500);
 /// The client protocol handler shared by every connection.
 #[derive(Debug, Clone)]
 pub(crate) struct ClientProtocol {
+    /// This server's endpoint id, which app passkey challenges are made
+    /// with (PX-10).
+    id: EndpointId,
     connections: Connections,
     services: Services,
     info: Arc<ServerInfo>,
@@ -77,8 +83,10 @@ pub(crate) struct ClientProtocol {
 }
 
 /// What one connection has said so far.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ConnectionState {
+    /// Its limits, and its streams being answered (PX-10).
+    peer: Arc<Peer>,
     hello: OnceLock<Hello>,
     /// Profile locks (P2-08).
     locks: std::sync::Mutex<Locks>,
@@ -140,12 +148,14 @@ impl Locks {
 
 impl ClientProtocol {
     pub(crate) fn new(
+        id: EndpointId,
         connections: Connections,
         info: ServerInfo,
         name: ServerName,
         services: Services,
     ) -> Self {
         Self {
+            id,
             connections,
             services,
             info: Arc::new(info),
@@ -166,14 +176,35 @@ impl ClientProtocol {
         mut send: SendStream,
         mut recv: RecvStream,
     ) {
-        let Ok(kind) = recv.read_u8().await else {
-            return;
+        let _answering = state.peer.answering();
+        // A stream holds one of the peer's few stream credits, and its
+        // frame's memory, until its first frame is in (PX-10).
+        let first = tokio::time::timeout(self.connections.admission().first_frame, async {
+            let kind = recv.read_u8().await?;
+            let frame = if kind == bi::RPC || kind == bi::RESOURCE {
+                Some(codec::read_frame_bytes_within(&mut recv, state.peer.max_frame()).await)
+            } else {
+                None
+            };
+            Ok::<_, std::io::Error>((kind, frame))
+        })
+        .await;
+        let (kind, frame) = match first {
+            Ok(Ok(first)) => first,
+            // The stream ended before its kind byte.
+            Ok(Err(_)) => return,
+            Err(_) => {
+                tracing::debug!(
+                    endpoint = %connection.remote_id().fmt_short(),
+                    "a stream's first frame did not arrive in time"
+                );
+                let code = VarInt::from_u32(reset::FIRST_FRAME_TIMEOUT);
+                let _ = send.reset(code);
+                let _ = recv.stop(code);
+                return;
+            }
         };
-        if kind == bi::RESOURCE {
-            self.resource(&connection, &state, send, recv).await;
-            return;
-        }
-        if kind != bi::RPC {
+        let Some(request) = frame else {
             // A kind from a newer client. The stream is refused; the
             // connection carries on.
             tracing::debug!(kind, "refusing a stream of unknown kind");
@@ -181,8 +212,11 @@ impl ClientProtocol {
             let _ = send.reset(code);
             let _ = recv.stop(code);
             return;
+        };
+        if kind == bi::RESOURCE {
+            self.resource(&connection, &state, send, request).await;
+            return;
         }
-        let request = read_frame_bytes(&mut recv).await;
         let response = match &request {
             Ok(bytes) => {
                 // One span per request, named by its type: never its
@@ -229,6 +263,7 @@ impl ClientProtocol {
             return;
         }
         let _ = send.finish();
+        delivered(&send).await;
     }
 
     fn instance(&self) -> ServerInstance {
@@ -328,8 +363,9 @@ impl ClientProtocol {
         let invocation = if let Some(cached) = cached {
             Ok(cached)
         } else {
+            let mut user = None;
             if !anonymous {
-                let (session, _) = match self
+                let (session, signed_in) = match self
                     .authenticate(connection, state, wire.envelope.session.clone())
                     .await
                 {
@@ -345,12 +381,17 @@ impl ClientProtocol {
                 {
                     return Response::Err(error).into();
                 }
+                user = Some(signed_in.user.to_string());
             }
             operations.begin(
-                &endpoint,
+                crate::operations::Owner {
+                    endpoint: &endpoint,
+                    user: user.as_deref(),
+                },
                 &self.instance,
                 &operation,
                 fingerprint,
+                crate::operations::reservation(&wire.envelope.request),
                 crate::operations::now_ms(),
             )
         };
@@ -362,7 +403,14 @@ impl ClientProtocol {
         if let Some(send) = invocation.execute {
             let operations = operations.clone();
             tokio::spawn(async move {
-                operations.finish(&endpoint, &operation.id, send, execute.await);
+                let reply = execute.await;
+                operations.finish(
+                    &endpoint,
+                    &operation.id,
+                    send,
+                    reply,
+                    crate::operations::now_ms(),
+                );
             });
         }
         let mut outcome = invocation.outcome;
@@ -414,6 +462,9 @@ impl ClientProtocol {
         let envelope = wire.envelope;
         let reply = match envelope.request {
             Request::Hello(hello) => {
+                // Kept, and shown to approvers: each string is bounded
+                // (PX-10, finding 17).
+                let hello = hello.within_bounds();
                 if hello.protocol_version != spoolframe_protocol::PROTOCOL_VERSION {
                     return Response::Err(Error::Unsupported {
                         request: "protocol revision; update the SDK".into(),
@@ -457,7 +508,10 @@ impl ClientProtocol {
             Request::Ping => Ok(Reply::Pong),
             Request::LoginPassword(login) => {
                 let hello = state.hello.get().expect("checked above");
-                self.login_password(connection, login, hello).await
+                match self.stranger_attempt(state) {
+                    Ok(()) => self.login_password(connection, login, hello).await,
+                    Err(e) => Err(e),
+                }
             }
             Request::BeginDeviceSignIn => {
                 let hello = state.hello.get().expect("checked above");
@@ -495,6 +549,7 @@ impl ClientProtocol {
                 match outcome {
                     Outcome::Approved(token) => {
                         tracing::info!(%endpoint, "device signed in by approval");
+                        self.connections.signed_in(&connection.remote_id());
                         Ok(Reply::LoggedIn {
                             session: SessionId(token.0),
                         })
@@ -506,17 +561,32 @@ impl ClientProtocol {
             }
             Request::BeginPasskeySignIn { username } => {
                 let endpoint = connection.remote_id().to_string();
+                // Held per endpoint, and endpoints are free: strangers'
+                // beginnings share their sign-in budget (PX-10).
+                if let Err(e) = self.stranger_attempt(state) {
+                    return Response::Err(e);
+                }
                 self.services
                     .app_passkeys
-                    .begin_sign_in(self.store(), &endpoint, username.as_deref())
+                    .begin_sign_in(
+                        self.store(),
+                        self.id.as_bytes(),
+                        &endpoint,
+                        username.as_deref(),
+                    )
                     .await
-                    .map(Reply::PasskeyRequest)
+                    .map(Reply::PasskeySignInBegun)
                     .map_err(sign_in_error)
             }
             Request::FinishPasskeySignIn(signed) => {
                 let hello = state.hello.get().expect("checked above");
-                self.finish_passkey_sign_in(connection, &signed, hello)
-                    .await
+                match self.stranger_attempt(state) {
+                    Ok(()) => {
+                        self.finish_passkey_sign_in(connection, &signed, hello)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
             }
             // Everything else needs a session that is live on this
             // endpoint. Each request names its own, so one connection can
@@ -593,9 +663,10 @@ impl ClientProtocol {
         connection: &Connection,
         state: &ConnectionState,
         mut send: SendStream,
-        mut recv: RecvStream,
+        frame: Result<Vec<u8>, codec::CodecError>,
     ) {
-        let result = match codec::read_frame::<_, ResourceRequest>(&mut recv).await {
+        let request = frame.and_then(|bytes| codec::decode::<ResourceRequest>(&bytes));
+        let result = match request {
             Ok(request) => self.open_resource(connection, state, request).await,
             Err(e) => Err(Error::Malformed {
                 message: e.to_string(),
@@ -637,6 +708,7 @@ impl ClientProtocol {
         match sent {
             Ok(()) => {
                 let _ = send.finish();
+                delivered(&send).await;
             }
             Err(e) => {
                 tracing::debug!(error = %e, "resource read failed");
@@ -1002,9 +1074,18 @@ impl ClientProtocol {
                 message: "the media file could not be read".into(),
             }
         };
-        let mut file = tokio::fs::File::open(&playback.path)
+        let mut file = crate::files::open_nonblocking(&playback.path)
             .await
             .map_err(unreadable)?;
+        // The file the playback started with, or none (PX-09 B-1): the
+        // path may name another by now.
+        let now = FileId::of(&file.metadata().await.map_err(unreadable)?);
+        if playback.file != Some(now) {
+            tracing::warn!(path = %playback.path.display(), "a media file was replaced during its playback");
+            return Err(Error::Unavailable {
+                message: "the media file changed during playback".into(),
+            });
+        }
         if sent > 0 {
             file.seek(std::io::SeekFrom::Start(read.offset))
                 .await
@@ -1115,13 +1196,14 @@ impl ClientProtocol {
                     .app_passkeys
                     .begin_registration(
                         self.store(),
+                        self.id.as_bytes(),
                         &SessionToken(session.0.clone()).hash(),
                         &connection.remote_id().to_string(),
                         &account,
                         &self.name.get(),
                     )
                     .await
-                    .map(Reply::PasskeyCreation)
+                    .map(Reply::PasskeyRegistrationBegun)
                     .map_err(ceremony_error)
             }
             Request::FinishPasskeyRegistration(made) => {
@@ -1258,13 +1340,14 @@ impl ClientProtocol {
                     .app_passkeys
                     .begin_confirm(
                         self.store(),
+                        self.id.as_bytes(),
                         &SessionToken(session.0.clone()).hash(),
                         &endpoint,
                         user.user,
                     )
                     .await
                     .map_err(sign_in_error)?;
-                begun.map(Reply::PasskeyRequest).ok_or(Error::NotFound {
+                begun.map(Reply::PasskeySignInBegun).ok_or(Error::NotFound {
                     what: "app passkey".into(),
                 })
             }
@@ -1652,7 +1735,7 @@ impl ClientProtocol {
                 if ended > 0 {
                     tracing::info!(%endpoint, ended, "a device's earlier conversions ended");
                 }
-                let (subtitle, size, conversion) = self
+                let (subtitle, (size, file), conversion) = self
                     .prepare(
                         &handle,
                         &id,
@@ -1682,6 +1765,7 @@ impl ClientProtocol {
                         selection,
                         path,
                         size,
+                        file,
                         subtitle,
                         conversion,
                     },
@@ -1732,7 +1816,7 @@ impl ClientProtocol {
                     &self.services.transcoding.encoders(),
                     self.services.subtitles.ocr(),
                 );
-                let (subtitle, size, conversion) = self
+                let (subtitle, (size, file), conversion) = self
                     .prepare(
                         &handle,
                         &playback.item,
@@ -1749,6 +1833,7 @@ impl ClientProtocol {
                         planned: plan.clone(),
                         selection,
                         size,
+                        file,
                         subtitle,
                         conversion,
                     },
@@ -1910,6 +1995,21 @@ impl ClientProtocol {
         }
     }
 
+    /// A sign-in attempt on `state`'s connection, if it may make one now:
+    /// a device that is not signed in draws on the bucket all such devices
+    /// share (PX-10); a signed-in one (adding a user) does not.
+    fn stranger_attempt(&self, state: &ConnectionState) -> Result<(), Error> {
+        if state.peer.known() {
+            return Ok(());
+        }
+        self.services
+            .auth
+            .stranger_attempt()
+            .map_err(|wait| Error::RateLimited {
+                retry_after_ms: wait.as_millis().max(1) as u64,
+            })
+    }
+
     /// A password login from this connection's endpoint. The session is
     /// bound to that endpoint (P1-12 checks it on every request), and the
     /// endpoint is the source the failure limit counts.
@@ -1938,6 +2038,7 @@ impl ClientProtocol {
         {
             Ok(done) => {
                 tracing::info!(endpoint = %endpoint_id, user = ?done.user, "logged in");
+                self.connections.signed_in(&connection.remote_id());
                 Ok(Reply::LoggedIn {
                     session: SessionId(done.token.0),
                 })
@@ -1973,6 +2074,7 @@ impl ClientProtocol {
             .await
             .map_err(internal)?;
         tracing::info!(endpoint = %endpoint_id, user = %user.id, "logged in with an app passkey");
+        self.connections.signed_in(&connection.remote_id());
         Ok(Reply::LoggedIn {
             session: SessionId(token.0),
         })
@@ -2093,7 +2195,7 @@ impl ClientProtocol {
     /// A device's last connection closed: end its playbacks, and their
     /// encodes, unless it is back within the grace. A killed app's encode
     /// would otherwise hold a slot until it idles out.
-    fn end_playbacks_unless_back(&self, endpoint: iroh::EndpointId) {
+    fn end_playbacks_unless_back(&self, endpoint: EndpointId) {
         let connections = self.connections.clone();
         let playbacks = self.services.playbacks.clone();
         tokio::spawn(async move {
@@ -2130,8 +2232,10 @@ impl ClientProtocol {
 
     /// What `plan` needs to play as `handle`: the subtitle the client
     /// fetches beside it, the size of what it reads (0 while a conversion
-    /// writes it), and the conversion, started at `start`. `replaces` is
-    /// the playback as it was, when this is a subtitle change.
+    /// writes it) with the file read for direct play, and the conversion,
+    /// started at `start`. `replaces` is the playback as it was, when this
+    /// is a subtitle change: direct play goes on reading the file it began
+    /// with, or none.
     async fn prepare(
         &self,
         handle: &PlaybackHandle,
@@ -2140,7 +2244,14 @@ impl ClientProtocol {
         plan: &PlaybackPlan,
         start: Option<Duration>,
         replaces: Option<&Playback>,
-    ) -> Result<(Option<Sidecar>, u64, Option<Arc<Conversion>>), Error> {
+    ) -> Result<
+        (
+            Option<Sidecar>,
+            (u64, Option<FileId>),
+            Option<Arc<Conversion>>,
+        ),
+        Error,
+    > {
         Ok(match plan {
             PlaybackPlan::Direct { subtitle, .. } => {
                 let subtitle = match subtitle {
@@ -2161,16 +2272,23 @@ impl ClientProtocol {
                     }
                     None => None,
                 };
-                let size = tokio::fs::metadata(path)
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(%id, error = %e, "cannot stat a media file");
-                        Error::Unavailable {
-                            message: "the media file could not be read".into(),
-                        }
-                    })?
-                    .len();
-                (subtitle, size, None)
+                let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+                    tracing::warn!(%id, error = %e, "cannot stat a media file");
+                    Error::Unavailable {
+                        message: "the media file could not be read".into(),
+                    }
+                })?;
+                let file = FileId::of(&metadata);
+                if replaces
+                    .and_then(|p| p.file)
+                    .is_some_and(|began| began != file)
+                {
+                    tracing::warn!(%id, "a media file was replaced during its playback");
+                    return Err(Error::Unavailable {
+                        message: "the media file changed during playback".into(),
+                    });
+                }
+                (subtitle, (metadata.len(), Some(file)), None)
             }
             PlaybackPlan::Converted {
                 delivery,
@@ -2257,7 +2375,7 @@ impl ClientProtocol {
                         Error::PlaybackFailed { reason }
                     }
                 })?;
-                (text, 0, Some(conversion))
+                (text, (0, None), Some(conversion))
             }
             PlaybackPlan::Unsupported { reasons } => {
                 return Err(Error::CannotPlay {
@@ -2355,9 +2473,38 @@ impl ProtocolHandler for ClientProtocol {
         let auth = ConnectionAuth::Anonymous {
             endpoint: connection.remote_id(),
         };
-        tracing::info!(?auth, "client connected");
-        self.connections.insert(id, auth.clone());
-        let state = Arc::new(ConnectionState::default());
+        // A device with a live session gets the normal limits; any other
+        // is a stranger, held only while there is room for one (PX-10).
+        let known = match self
+            .store()
+            .endpoint_signed_in(&connection.remote_id().to_string())
+            .await
+        {
+            Ok(known) => known,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot look the device's sessions up");
+                false
+            }
+        };
+        let Some(peer) = self.connections.admit(&connection, known) else {
+            tracing::info!(
+                ?auth,
+                "refusing a connection: too many devices that are not signed in"
+            );
+            connection.close(
+                VarInt::from_u32(close::BUSY),
+                b"too many devices that are not signed in; try again later",
+            );
+            // Stay until the close is delivered, or the peer never sees why.
+            let _ = tokio::time::timeout(SHUTDOWN_NOTICE, connection.closed()).await;
+            return Ok(());
+        };
+        tracing::info!(?auth, known, "client connected");
+        let state = Arc::new(ConnectionState {
+            peer,
+            hello: OnceLock::new(),
+            locks: std::sync::Mutex::default(),
+        });
 
         let reason = loop {
             match connection.accept_bi().await {
@@ -2400,6 +2547,13 @@ impl ProtocolHandler for ClientProtocol {
             }
         }
     }
+}
+
+/// Wait, for at most [`SIGN_OUT_DRAIN`], for the peer to acknowledge all
+/// of a finished stream: until then the stream counts as being answered,
+/// so a signed-out device's connection is not closed under its reply.
+async fn delivered(send: &SendStream) {
+    let _ = tokio::time::timeout(SIGN_OUT_DRAIN, send.stopped()).await;
 }
 
 /// The most items one page or search returns, whatever the client asks.
@@ -2757,7 +2911,7 @@ async fn read_subtitle(
             message: "the subtitle file could not be read".into(),
         }
     };
-    let mut file = tokio::fs::File::open(path).await.map_err(unreadable)?;
+    let mut file = crate::files::open_regular(path).await.map_err(unreadable)?;
     // Of the open file, not of the path: the version is of the file the
     // bytes below come from, whatever the path names by then. It is taken
     // before the bytes, so a write during the read gives the next chunk's

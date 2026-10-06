@@ -8,11 +8,19 @@
 //! operating system. Sign-in runs between the app and the server over
 //! this protocol; the server never contacts `spoolframe.app`.
 //!
-//! Every server keeps its own passkeys and issues its own challenges, so a
-//! passkey made on one is refused by another, and an assertion made for
-//! one cannot be replayed to another. Each user has a random user handle
-//! per server, so one server's says nothing about the same person on
-//! another.
+//! Every server keeps its own passkeys, so a passkey made on one is
+//! refused by another. Each user has a random user handle per server, so
+//! one server's says nothing about the same person on another.
+//!
+//! The platform writes only the origin and the challenge into
+//! `clientDataJSON`, and the origin is the same for every server. So the
+//! challenge names the server (PX-09, finding 2): a server sends a random
+//! nonce, never a challenge, and the challenge is [`app_passkey_challenge`]
+//! of the server's endpoint id and that nonce. The server computes it with
+//! its own id; the client with the id it pinned and dialled, never one the
+//! server names. A server that hands on another's nonce, to relay a
+//! sign-in, has the app sign a challenge for itself, which the other
+//! refuses.
 //!
 //! The bytes are WebAuthn's own, as the platform API gives and takes them;
 //! the app maps them to and from it and changes nothing.
@@ -20,6 +28,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// The relying-party ID of app passkeys: what the app asks its platform's
 /// passkey API for, on every server.
@@ -29,11 +38,92 @@ pub const APP_RP_ID: &str = "spoolframe.app";
 /// [`APP_RP_ID`]; the server accepts no other for app passkeys.
 pub const APP_ORIGIN: &str = "https://spoolframe.app";
 
-/// What making a passkey needs (`BeginPasskeyRegistration`). The relying
-/// party is [`APP_RP_ID`]; user verification is required.
+/// Bytes of a nonce a server sends.
+pub const NONCE_LEN: usize = 32;
+
+/// What [`app_passkey_challenge`] hashes first, so its digest is of use
+/// for nothing else.
+const CHALLENGE_TAG: &[u8] = b"spoolframe/app-passkey-challenge/1";
+
+/// The WebAuthn challenge for an app passkey ceremony with the server
+/// whose endpoint id is `server`, from the `nonce` it sent: SHA-256 of
+/// [`CHALLENGE_TAG`], the 32 bytes of the id, then the nonce. The tag and
+/// the id are of fixed length, so nothing else hashes the same.
+pub fn app_passkey_challenge(server: &[u8; 32], nonce: &[u8]) -> Vec<u8> {
+    Sha256::new()
+        .chain_update(CHALLENGE_TAG)
+        .chain_update(server)
+        .chain_update(nonce)
+        .finalize()
+        .to_vec()
+}
+
+/// A server's answer to `BeginPasskeyRegistration`, on the wire: a nonce,
+/// not a challenge. [`PasskeyRegistrationBegun::for_server`] makes the
+/// [`PasskeyCreation`] the platform is given.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasskeyRegistrationBegun {
+    /// Of use once, for 5 minutes, from this device.
+    #[serde(with = "serde_bytes")]
+    pub nonce: Vec<u8>,
+    /// The user handle: random, this server's for this user.
+    #[serde(with = "serde_bytes")]
+    pub user_id: Vec<u8>,
+    /// As [`PasskeyCreation::user_name`].
+    pub user_name: String,
+    /// As [`PasskeyCreation::display_name`].
+    pub display_name: String,
+    /// As [`PasskeyCreation::exclude_credential_ids`].
+    #[serde(with = "byte_strings")]
+    pub exclude_credential_ids: Vec<Vec<u8>>,
+}
+
+impl PasskeyRegistrationBegun {
+    /// What the platform makes the passkey with, for the server whose
+    /// endpoint id is `server`: the one the client dialled.
+    pub fn for_server(self, server: &[u8; 32]) -> PasskeyCreation {
+        PasskeyCreation {
+            challenge: app_passkey_challenge(server, &self.nonce),
+            user_id: self.user_id,
+            user_name: self.user_name,
+            display_name: self.display_name,
+            exclude_credential_ids: self.exclude_credential_ids,
+        }
+    }
+}
+
+/// A server's answer to `BeginPasskeySignIn` and `BeginConfirmPasskey`,
+/// on the wire: a nonce, not a challenge.
+/// [`PasskeySignInBegun::for_server`] makes the [`PasskeyRequest`] the
+/// platform is given.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasskeySignInBegun {
+    /// Of use once, for 5 minutes, from this device.
+    #[serde(with = "serde_bytes")]
+    pub nonce: Vec<u8>,
+    /// As [`PasskeyRequest::allow_credential_ids`]. Always empty for
+    /// `BeginPasskeySignIn`: anyone can begin one.
+    #[serde(with = "byte_strings")]
+    pub allow_credential_ids: Vec<Vec<u8>>,
+}
+
+impl PasskeySignInBegun {
+    /// What the platform signs, for the server whose endpoint id is
+    /// `server`: the one the client dialled.
+    pub fn for_server(self, server: &[u8; 32]) -> PasskeyRequest {
+        PasskeyRequest {
+            challenge: app_passkey_challenge(server, &self.nonce),
+            allow_credential_ids: self.allow_credential_ids,
+        }
+    }
+}
+
+/// What making a passkey needs: the platform's options. The relying party
+/// is [`APP_RP_ID`]; user verification is required. Not on the wire: the
+/// client makes it from a [`PasskeyRegistrationBegun`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PasskeyCreation {
-    /// To sign; of use once, for 5 minutes, from this device.
+    /// To sign: [`app_passkey_challenge`] of the server and its nonce.
     #[serde(with = "serde_bytes")]
     pub challenge: Vec<u8>,
     /// The user handle: random, this server's for this user.
@@ -68,14 +158,15 @@ pub struct FinishPasskeyRegistration {
     pub name: String,
 }
 
-/// What signing in with a passkey needs (`BeginPasskeySignIn`).
+/// What signing in with a passkey needs: the platform's options. Not on
+/// the wire: the client makes it from a [`PasskeySignInBegun`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PasskeyRequest {
-    /// To sign; of use once, for 5 minutes, from this device.
+    /// To sign: [`app_passkey_challenge`] of the server and its nonce.
     #[serde(with = "serde_bytes")]
     pub challenge: Vec<u8>,
-    /// The passkeys that may answer; empty: any of this server's the
-    /// platform finds (a discoverable sign-in, with no username).
+    /// The passkeys that may answer; empty: any the platform finds for
+    /// [`APP_RP_ID`] (a discoverable sign-in).
     #[serde(with = "byte_strings")]
     pub allow_credential_ids: Vec<Vec<u8>>,
 }
@@ -135,6 +226,24 @@ impl fmt::Debug for PasskeyCreation {
     }
 }
 
+impl fmt::Debug for PasskeyRegistrationBegun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasskeyRegistrationBegun")
+            .field("user_name", &self.user_name)
+            .field("display_name", &self.display_name)
+            .field("exclude", &self.exclude_credential_ids.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for PasskeySignInBegun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasskeySignInBegun")
+            .field("allow", &self.allow_credential_ids.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for FinishPasskeyRegistration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FinishPasskeyRegistration")
@@ -173,5 +282,46 @@ mod byte_strings {
     ) -> Result<Vec<Vec<u8>>, D::Error> {
         let list = Vec::<ByteBuf>::deserialize(deserializer)?;
         Ok(list.into_iter().map(ByteBuf::into_vec).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NONCE: [u8; NONCE_LEN] = [7; NONCE_LEN];
+
+    #[test]
+    fn the_challenge_differs_for_another_server_with_the_same_nonce() {
+        assert_ne!(
+            app_passkey_challenge(&[1; 32], &NONCE),
+            app_passkey_challenge(&[2; 32], &NONCE)
+        );
+    }
+
+    #[test]
+    fn the_challenge_is_the_tagged_sha256_of_the_server_and_nonce() {
+        let mut bytes = b"spoolframe/app-passkey-challenge/1".to_vec();
+        bytes.extend([1; 32]);
+        bytes.extend(NONCE);
+        assert_eq!(
+            app_passkey_challenge(&[1; 32], &NONCE),
+            Sha256::digest(&bytes).to_vec()
+        );
+    }
+
+    #[test]
+    fn a_request_for_a_server_signs_its_challenge_and_keeps_the_list() {
+        let begun = PasskeySignInBegun {
+            nonce: NONCE.to_vec(),
+            allow_credential_ids: vec![vec![4]],
+        };
+        assert_eq!(
+            begun.for_server(&[1; 32]),
+            PasskeyRequest {
+                challenge: app_passkey_challenge(&[1; 32], &NONCE),
+                allow_credential_ids: vec![vec![4]],
+            }
+        );
     }
 }

@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 
 use spoolframe_types::SubtitleFormat;
@@ -24,6 +26,28 @@ use crate::bitmap::{self, Packet, Track};
 /// part of each run, few enough that the work spreads over every thread
 /// and progress moves.
 const CHUNK: usize = 40;
+
+/// The longest one tesseract run over a [`CHUNK`] of cues may take
+/// (PX-09 B-3): seconds is usual.
+pub const OCR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// The longest an ffmpeg or ffprobe pass over a whole film may take:
+/// copying a track out, reading its packets, converting a text track. A
+/// large file on slow storage takes minutes.
+pub const PASS_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// The most ffprobe's JSON of a track's packets is read to: its hex dump is
+/// about 4.5 bytes a byte, and a film's bitmap track is tens of MB.
+pub const MAX_TRACK_JSON: usize = 512 << 20;
+
+/// The most of a PGS track (`.sup`) read: a film's is tens of MB.
+pub const MAX_SUP_BYTES: usize = 256 << 20;
+
+/// The most of tesseract's text read, for one run.
+const MAX_TEXT: usize = 16 << 20;
+
+/// What a program writes to stderr that is kept, for its last line.
+const MAX_STDERR: usize = 64 << 10;
 
 /// A cue as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +68,10 @@ pub enum OcrError {
     Failed { program: String, reason: String },
     #[error("tesseract read {got} pictures of {expected}")]
     PageCount { expected: usize, got: usize },
+    #[error("{program} took longer than {} s", after.as_secs())]
+    TimedOut { program: String, after: Duration },
+    #[error("{program} wrote more than {limit} bytes")]
+    TooMuch { program: String, limit: usize },
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
@@ -76,12 +104,9 @@ impl Ocr {
     /// Asks `tesseract` which languages it has. If it cannot be run, OCR
     /// is off, and the log says why.
     pub async fn detect(tesseract: &Path) -> Self {
-        let output = tokio::process::Command::new(tesseract)
-            .arg("--list-langs")
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output()
-            .await;
+        let mut command = tokio::process::Command::new(tesseract);
+        command.arg("--list-langs");
+        let output = run(command, "tesseract", MAX_TEXT, Duration::from_secs(30)).await;
         let languages = match output {
             Ok(out) if out.status.success() => list_langs(&String::from_utf8_lossy(&out.stdout)),
             Ok(out) => {
@@ -183,21 +208,15 @@ async fn read_pages(
     language: &str,
     expected: usize,
 ) -> Result<Vec<String>, OcrError> {
-    let output = tokio::process::Command::new(tesseract)
+    let mut command = tokio::process::Command::new(tesseract);
+    command
         .arg(list)
         .arg("stdout")
         .args(["-l", language, "--psm", "6"])
         // One thread each: the parallelism is the processes, and
         // tesseract's own threads only fight them for cores.
-        .env("OMP_THREAD_LIMIT", "1")
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|source| OcrError::Spawn {
-            program: tesseract.display().to_string(),
-            source,
-        })?;
+        .env("OMP_THREAD_LIMIT", "1");
+    let output = run(command, "tesseract", MAX_TEXT, OCR_TIMEOUT).await?;
     if !output.status.success() {
         return Err(OcrError::Failed {
             program: "tesseract".into(),
@@ -224,19 +243,13 @@ pub async fn extract_sup(
     index: u32,
     out: &Path,
 ) -> Result<(), OcrError> {
-    let output = tokio::process::Command::new(ffmpeg)
+    let mut command = tokio::process::Command::new(ffmpeg);
+    command
         .args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
         .arg(input)
         .args(["-map", &format!("0:{index}"), "-c", "copy", "-f", "sup"])
-        .arg(out)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|source| OcrError::Spawn {
-            program: ffmpeg.display().to_string(),
-            source,
-        })?;
+        .arg(out);
+    let output = run(command, "ffmpeg", MAX_STDERR, PASS_TIMEOUT).await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -261,20 +274,14 @@ pub async fn read_track(
     index: u32,
     from_file_start: bool,
 ) -> Result<Track, OcrError> {
-    let output = tokio::process::Command::new(ffprobe)
+    let mut command = tokio::process::Command::new(ffprobe);
+    command
         .args(["-v", "error", "-select_streams", &index.to_string()])
         .args(["-show_data", "-show_entries"])
         .arg("packet=pts,duration,data:stream=time_base,extradata:format=start_time")
         .args(["-of", "json"])
-        .arg(input)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|source| OcrError::Spawn {
-            program: ffprobe.display().to_string(),
-            source,
-        })?;
+        .arg(input);
+    let output = run(command, "ffprobe", MAX_TRACK_JSON, PASS_TIMEOUT).await?;
     if !output.status.success() {
         return Err(OcrError::Failed {
             program: "ffprobe".into(),
@@ -382,19 +389,13 @@ pub async fn convert_text(
         SubtitleFormat::WebVtt => ("webvtt", "webvtt"),
         _ => ("srt", "srt"),
     };
-    let output = tokio::process::Command::new(ffmpeg)
+    let mut command = tokio::process::Command::new(ffmpeg);
+    command
         .args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
         .arg(input)
         .args(["-map", &format!("0:{index}"), "-c:s", codec, "-f", format])
-        .arg(out)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|source| OcrError::Spawn {
-            program: ffmpeg.display().to_string(),
-            source,
-        })?;
+        .arg(out);
+    let output = run(command, "ffmpeg", MAX_STDERR, PASS_TIMEOUT).await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -554,6 +555,78 @@ fn tesseract_code(tag: &str) -> &str {
     }
 }
 
+/// What a run wrote, and how it ended.
+struct Ran {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// `command` run to its end, as `program` in errors (PX-09 B-3): killed
+/// if it runs past `timeout`, or writes more than `max_stdout` bytes to
+/// stdout, which is what a crafted file can make it do. Only the first
+/// [`MAX_STDERR`] bytes of stderr are kept; the rest is read and dropped,
+/// so a chatty program does not stall on a full pipe.
+async fn run(
+    mut command: tokio::process::Command,
+    program: &str,
+    max_stdout: usize,
+    timeout: Duration,
+) -> Result<Ran, OcrError> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|source| OcrError::Spawn {
+            program: program.to_owned(),
+            source,
+        })?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
+    let errors = tokio::spawn(async move {
+        let mut kept = Vec::new();
+        let _ = (&mut stderr)
+            .take(MAX_STDERR as u64)
+            .read_to_end(&mut kept)
+            .await;
+        let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+        kept
+    });
+    let ran = async {
+        let mut out = Vec::new();
+        (&mut stdout)
+            .take(max_stdout as u64 + 1)
+            .read_to_end(&mut out)
+            .await?;
+        if out.len() > max_stdout {
+            let _ = child.kill().await;
+            return Err(OcrError::TooMuch {
+                program: program.to_owned(),
+                limit: max_stdout,
+            });
+        }
+        let status = child.wait().await?;
+        Ok((status, out))
+    };
+    // Past the time, the future and the child in it are dropped, which
+    // kills it.
+    let (status, stdout) =
+        tokio::time::timeout(timeout, ran)
+            .await
+            .map_err(|_| OcrError::TimedOut {
+                program: program.to_owned(),
+                after: timeout,
+            })??;
+    let stderr = errors.await.unwrap_or_default();
+    Ok(Ran {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn last_line(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
@@ -567,6 +640,59 @@ fn last_line(stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sh(script: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    /// PX-09 B-3: a program that never ends is killed at its time.
+    #[tokio::test]
+    async fn a_program_past_its_time_is_killed() {
+        let started = std::time::Instant::now();
+        let ran = run(sh("sleep 30"), "sleep", 1024, Duration::from_millis(200)).await;
+        assert!(
+            matches!(ran, Err(OcrError::TimedOut { .. })),
+            "{:?}",
+            ran.err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// One that writes more than its cap is stopped there, not buffered.
+    #[tokio::test]
+    async fn a_program_writing_past_its_cap_is_stopped() {
+        let ran = run(
+            sh("head -c 1000000 /dev/zero"),
+            "head",
+            1000,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(
+            matches!(ran, Err(OcrError::TooMuch { limit: 1000, .. })),
+            "{:?}",
+            ran.err()
+        );
+    }
+
+    /// Much on stderr is read and dropped, so the program does not stall
+    /// on a full pipe, and its stdout comes back whole.
+    #[tokio::test]
+    async fn a_chatty_program_runs_to_its_end() {
+        let ran = run(
+            sh("head -c 1000000 /dev/zero >&2; echo done"),
+            "sh",
+            1000,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(ran.status.success());
+        assert_eq!(ran.stdout, b"done\n");
+        assert_eq!(ran.stderr.len(), MAX_STDERR);
+    }
 
     fn ocr(languages: &[&str]) -> Ocr {
         Ocr {

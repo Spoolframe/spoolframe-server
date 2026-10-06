@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::bitmap::{self, Colour, Cue, Packet, push};
+use crate::bitmap::{self, Colour, Cue, MAX_SIDE, Packet, push};
 
 const PAGE: u8 = 0x10;
 const REGION: u8 = 0x11;
@@ -171,6 +171,11 @@ fn region_composition(body: &[u8], regions: &mut HashMap<u8, Region>) -> Option<
     let fill = head[1] & 0x08 != 0;
     let width = usize::from(u16::from_be_bytes([head[2], head[3]]));
     let height = usize::from(u16::from_be_bytes([head[4], head[5]]));
+    // Allocated as told (PX-09 B-3): past the cap the segment is refused,
+    // and counted with those that do not parse.
+    if width > MAX_SIDE || height > MAX_SIDE {
+        return None;
+    }
     let depth = match (head[6] >> 2) & 7 {
         1 => 2,
         2 => 4,
@@ -512,6 +517,14 @@ fn render(
     let right = placed.iter().map(|&(r, x, _)| x + r.width).max()?;
     let bottom = placed.iter().map(|&(r, _, y)| y + r.height).max()?;
     let (width, height) = (right - left, bottom - top);
+    if width > MAX_SIDE || height > MAX_SIDE {
+        tracing::warn!(
+            width,
+            height,
+            "a DVB subtitle page too large to read was left out"
+        );
+        return None;
+    }
     let defaults = default_clut();
     let mut pixels = vec![Colour::default(); width * height];
     for (region, x, y) in placed {
@@ -683,6 +696,38 @@ mod tests {
 
     fn times(cues: &[Cue]) -> Vec<(u64, u64)> {
         cues.iter().map(|c| (c.start_ms, c.end_ms)).collect()
+    }
+
+    /// PX-09 B-3: a region's size is the region's pixels, allocated as
+    /// told; past 4096 a side the region is refused, and nothing shows.
+    #[test]
+    fn a_region_wider_than_4096_is_refused() {
+        let mut wide = shown(5);
+        // The region's width, after the page (14 bytes) and its header.
+        assert_eq!(&wide[22..24], &[0, 8]);
+        wide[22..24].copy_from_slice(&4096u16.to_be_bytes());
+        assert_eq!(cues(&[packet(1_000, wide.clone())]).len(), 1);
+        wide[22..24].copy_from_slice(&4097u16.to_be_bytes());
+        assert_eq!(cues(&[packet(1_000, wide)]), Vec::new());
+    }
+
+    /// Regions placed far apart would make one picture as wide as the gap.
+    #[test]
+    fn regions_placed_further_apart_than_4096_show_nothing() {
+        let far = |x: u16| {
+            let mut data = Vec::new();
+            let mut body = vec![5, 2 << 2];
+            body.extend([0, 0xff, 0, 0, 0, 0]);
+            body.extend([0, 0xff]);
+            body.extend(x.to_be_bytes());
+            body.extend([0, 0]);
+            segment(&mut data, PAGE, &body);
+            display_set(&mut data);
+            segment(&mut data, END, &[]);
+            data
+        };
+        assert_eq!(cues(&[packet(1_000, far(3_000))]).len(), 1);
+        assert_eq!(cues(&[packet(1_000, far(60_000))]), Vec::new());
     }
 
     #[test]

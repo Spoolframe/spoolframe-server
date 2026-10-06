@@ -70,7 +70,9 @@ async fn register(device: &TestClient, session: &SessionId, app: &mut App, name:
         .call(Some(session), Request::BeginPasskeyRegistration)
         .await
     {
-        Response::Ok(Reply::PasskeyCreation(creation)) => creation,
+        Response::Ok(Reply::PasskeyRegistrationBegun(begun)) => {
+            begun.for_server(device.conn.remote_id().as_bytes())
+        }
         other => panic!("not begun: {other:?}"),
     };
     assert_eq!(
@@ -89,7 +91,9 @@ async fn begin_confirm(device: &TestClient, session: &SessionId) -> PasskeyReque
         .call(Some(session), Request::BeginConfirmPasskey)
         .await
     {
-        Response::Ok(Reply::PasskeyRequest(request)) => request,
+        Response::Ok(Reply::PasskeySignInBegun(begun)) => {
+            begun.for_server(device.conn.remote_id().as_bytes())
+        }
         other => panic!("not begun: {other:?}"),
     }
 }
@@ -262,6 +266,28 @@ async fn another_user_s_passkey_confirms_nothing() {
     server.stop().await;
 }
 
+/// A confirmation signed for another server, with this one's nonce,
+/// confirms nothing (PX-09, finding 2): the challenge names the server.
+#[tokio::test]
+async fn a_confirmation_signed_for_another_server_confirms_nothing() {
+    let server = server("confirm-passkey-other-server").await;
+    let (tv, code) = tv_code(&server).await;
+    let (phone, session, mut app) = alice_old_with_a_passkey(&server).await;
+    let begun = match phone
+        .call(Some(&session), Request::BeginConfirmPasskey)
+        .await
+    {
+        Response::Ok(Reply::PasskeySignInBegun(begun)) => begun,
+        other => panic!("not begun: {other:?}"),
+    };
+    let signed = app.get(&begun.for_server(&[0x55; 32]));
+    assert_eq!(finish_confirm(&phone, &session, signed).await, REFUSED);
+    assert_eq!(phone.call(Some(&session), approve(&code)).await, NOT_RECENT);
+    tv.close().await;
+    phone.close().await;
+    server.stop().await;
+}
+
 /// A confirmation's challenge is its session's: a sign-in's, or another
 /// session's, does not finish it.
 #[tokio::test]
@@ -274,7 +300,9 @@ async fn a_confirmation_takes_only_its_own_session_s_challenge() {
         .call(None, Request::BeginPasskeySignIn { username: None })
         .await
     {
-        Response::Ok(Reply::PasskeyRequest(request)) => request,
+        Response::Ok(Reply::PasskeySignInBegun(begun)) => {
+            begun.for_server(phone.conn.remote_id().as_bytes())
+        }
         other => panic!("not begun: {other:?}"),
     };
     assert_eq!(
@@ -302,7 +330,9 @@ async fn confirming_needs_a_session() {
         .call(None, Request::BeginPasskeySignIn { username: None })
         .await
     {
-        Response::Ok(Reply::PasskeyRequest(request)) => request,
+        Response::Ok(Reply::PasskeySignInBegun(begun)) => {
+            begun.for_server(phone.conn.remote_id().as_bytes())
+        }
         other => panic!("not begun: {other:?}"),
     };
     for request in [

@@ -359,6 +359,20 @@ fn mark(status: &mut PlexStatus, server: &str, served: &[LibraryConfig]) {
 }
 
 impl RuntimeSettings {
+    /// The token of the server configured at `url`, if one is: what a
+    /// probe of that server uses when given none. Another server's is
+    /// never handed out for a URL.
+    pub fn server_token_at(&self, url: &str) -> Option<String> {
+        let layers = self.layers();
+        let config = layers.config().ok()?;
+        let server = config
+            .plex?
+            .all_servers()
+            .into_iter()
+            .find(|s| same_url(&s.url, url.trim()))?;
+        layers.server_token(&server, self.secrets()).ok().flatten()
+    }
+
     fn config_now(&self) -> Result<(Layers, ServerConfig), LibraryError> {
         let layers = self.layers();
         let config = layers.config()?;
@@ -563,8 +577,10 @@ impl RuntimeSettings {
         Ok(())
     }
 
-    /// Add the Plex server at `url`, with `token` or else the first
-    /// server's; its id.
+    /// Add the Plex server at `url`, with `token` or none; its id. Never
+    /// with another server's token (PX-09 B-2): the URL may be anyone's.
+    /// The first server added keeps a token set before it (the wizard's
+    /// `plex.token`), which is that server's own.
     pub async fn plex_server_add(
         &self,
         url: &str,
@@ -574,10 +590,10 @@ impl RuntimeSettings {
         let parsed = config::plex_url(url.trim(), "url")
             .map_err(|e| LibraryError::Invalid(e.to_string()))?;
         let url = parsed.as_str().trim_end_matches('/').to_owned();
-        let token = match token.map(str::trim).filter(|t| !t.is_empty()) {
-            Some(token) => Some(token.to_owned()),
-            None => self.plex_token(),
-        };
+        let token = token
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned);
         let probe = PlexCatalog::new(parsed.clone(), token.clone())
             .map_err(|e| LibraryError::Unavailable(e.to_string()))?;
         let (name, _) = probe

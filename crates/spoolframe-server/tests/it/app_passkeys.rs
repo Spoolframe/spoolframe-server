@@ -200,7 +200,9 @@ async fn begin_registration(device: &TestClient, session: &SessionId) -> Passkey
         .call(Some(session), Request::BeginPasskeyRegistration)
         .await
     {
-        Response::Ok(Reply::PasskeyCreation(creation)) => creation,
+        Response::Ok(Reply::PasskeyRegistrationBegun(begun)) => {
+            begun.for_server(device.conn.remote_id().as_bytes())
+        }
         other => panic!("not begun: {other:?}"),
     }
 }
@@ -230,7 +232,9 @@ async fn begin_sign_in(device: &TestClient, username: Option<&str>) -> PasskeyRe
         username: username.map(str::to_owned),
     };
     match device.call(None, request).await {
-        Response::Ok(Reply::PasskeyRequest(request)) => request,
+        Response::Ok(Reply::PasskeySignInBegun(begun)) => {
+            begun.for_server(device.conn.remote_id().as_bytes())
+        }
         other => panic!("not begun: {other:?}"),
     }
 }
@@ -325,19 +329,28 @@ async fn a_passkey_made_in_the_app_signs_in_on_a_server_without_a_public_url() {
             .is_some()
     );
 
-    // With a username: hers are listed; nobody's are none.
-    assert_eq!(
-        begin_sign_in(&tv, Some("Alice")).await.allow_credential_ids,
-        [id]
-    );
+    // With a username, too.
     let request = begin_sign_in(&tv, Some("alice")).await;
     session_of(finish_sign_in(&tv, app.get(&request)).await);
-    assert_eq!(
-        begin_sign_in(&tv, Some("nobody"))
-            .await
-            .allow_credential_ids,
-        Vec::<Vec<u8>>::new()
-    );
+    server.stop().await;
+}
+
+/// Anyone can begin a sign-in, so one for a username lists none of their
+/// passkeys (PX-09 C-14): the platform finds them, as without one.
+#[tokio::test]
+async fn a_sign_in_for_a_username_lists_none_of_their_passkeys() {
+    let server = server("app-passkey-no-list").await;
+    let (_phone, _session, _app) = alice_with_a_passkey(&server).await;
+    let tv = device(&server, "Living room TV").await;
+    for username in ["Alice", "alice", "nobody"] {
+        assert_eq!(
+            begin_sign_in(&tv, Some(username))
+                .await
+                .allow_credential_ids,
+            Vec::<Vec<u8>>::new(),
+            "{username}"
+        );
+    }
     server.stop().await;
 }
 
@@ -368,6 +381,44 @@ async fn a_sign_in_for_a_user_takes_only_their_passkeys() {
     let request = begin_sign_in(&tv, Some("alice")).await;
     let session = session_of(finish_sign_in(&tv, alices.get(&request)).await);
     assert_eq!(username(&tv, &session).await, "alice");
+    server.stop().await;
+}
+
+/// Another server's endpoint id, for challenges an app signed while it
+/// talked to that server (PX-09, finding 2).
+const ANOTHER_SERVER: [u8; 32] = [0x55; 32];
+
+/// A server sends a nonce, and the challenge is made from it and the
+/// server the app talks to: one made for another server, with this one's
+/// nonce, finishes nothing here.
+#[tokio::test]
+async fn a_challenge_made_for_another_server_is_refused() {
+    logs::keep();
+    let server = server("app-passkey-other-server").await;
+    let (phone, session) = alice_on(&server, "Alice's iPhone").await;
+    let begun = match phone
+        .call(Some(&session), Request::BeginPasskeyRegistration)
+        .await
+    {
+        Response::Ok(Reply::PasskeyRegistrationBegun(begun)) => begun,
+        other => panic!("not begun: {other:?}"),
+    };
+    let mut app = App::new();
+    let made = app.create(&begun.for_server(&ANOTHER_SERVER), "Alice's iPhone");
+    assert_eq!(finish_registration(&phone, &session, made).await, REFUSED);
+    assert!(logs::has(&["app passkey refused", "challenge"]));
+
+    let (_phone, _session, mut app) = alice_with_a_passkey(&server).await;
+    let tv = device(&server, "Living room TV").await;
+    let begun = match tv
+        .call(None, Request::BeginPasskeySignIn { username: None })
+        .await
+    {
+        Response::Ok(Reply::PasskeySignInBegun(begun)) => begun,
+        other => panic!("not begun: {other:?}"),
+    };
+    let signed = app.get(&begun.for_server(&ANOTHER_SERVER));
+    assert_eq!(finish_sign_in(&tv, signed).await, REFUSED);
     server.stop().await;
 }
 
@@ -731,12 +782,17 @@ async fn app_passkeys_are_listed_and_removed_in_the_web_ui() {
     assert_eq!(sign_in(&tv, &mut app).await, REFUSED);
     session_of(sign_in(&tv, &mut tablet).await);
 
-    // With a password again, an admin removes it too.
-    server.store.set_password("alice", &phc).await.unwrap();
+    // With a password again, an admin removes it too. Setting it signs
+    // alice out (PX-09 finding 4), so the admin's list is read.
+    server
+        .store
+        .set_password("alice", &phc, None)
+        .await
+        .unwrap();
     root.user_remove_passkey("alice".into(), ipads[0].id.clone())
         .await
         .unwrap();
-    assert_eq!(alice.passkeys().await.unwrap(), []);
+    assert_eq!(root.user_passkeys("alice".into()).await.unwrap(), []);
     server.stop().await;
 }
 

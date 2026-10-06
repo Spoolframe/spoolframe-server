@@ -22,6 +22,7 @@ use spoolframe_media::encoders::{Hardware, HardwarePolicy, TranscodeSettings};
 use spoolframe_plex::{PathMap, PathMapping};
 use spoolframe_types::LibraryKind;
 
+use crate::admission::Admission;
 use crate::encode::JobLimits;
 use crate::network::{EndpointOptions, Relay};
 use crate::previews::{PreviewSettings, When};
@@ -850,6 +851,15 @@ pub struct NetworkConfig {
     /// [`spoolframe_plex::gdm::PORT`] if left out; 0 is any free port.
     #[ucl(default)]
     pub plex_discovery_port: Option<u16>,
+    /// The most connections held at once from devices with no live
+    /// session (PX-10); one more is refused until one goes. A signed-in
+    /// device is always let in.
+    #[ucl(default)]
+    pub max_stranger_connections: Option<u32>,
+    /// How long a stream's first request may take to arrive before the
+    /// stream is reset (PX-10).
+    #[ucl(default)]
+    pub first_frame_timeout_secs: Option<u64>,
 }
 
 impl NetworkConfig {
@@ -878,10 +888,31 @@ impl NetworkConfig {
                 self.relay.as_deref().unwrap_or_default()
             )));
         }
+        let admission = Admission {
+            max_strangers: self
+                .max_stranger_connections
+                .map_or(Admission::DEFAULT_MAX_STRANGERS, |n| n as usize),
+            first_frame: self
+                .first_frame_timeout_secs
+                .map_or(Admission::DEFAULT_FIRST_FRAME, Duration::from_secs),
+        };
+        if admission.max_strangers == 0 {
+            return Err(ConfigError::Invalid {
+                key: "network.max_stranger_connections",
+                message: "must be at least 1, or no device could sign in".into(),
+            });
+        }
+        if admission.first_frame.is_zero() {
+            return Err(ConfigError::Invalid {
+                key: "network.first_frame_timeout_secs",
+                message: "must be at least 1".into(),
+            });
+        }
         Ok(EndpointOptions {
             port: self.port,
             relay,
             mdns: self.mdns.unwrap_or(true),
+            admission,
         })
     }
 }

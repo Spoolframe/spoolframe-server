@@ -18,6 +18,8 @@ tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# mkfifo, for a sidecar name that is a FIFO (PX-09 B-1).
+libc = { workspace = true }
 spoolframe-test-dir = { workspace = true }
 # Its own PGS fixtures, for the OCR tests.
 spoolframe-media = { workspace = true, features = ["fixtures"] }

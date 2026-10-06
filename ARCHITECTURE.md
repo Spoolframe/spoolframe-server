@@ -276,6 +276,12 @@ plex {
 
 Spoolframe must always probe and serve the local filesystem path it can access.
 
+Plex names the files Spoolframe reads, so its paths are confined: a path
+with a `..` component is never served, and once any rule exists, neither is
+a path that no rule maps. A library whose files are at the same path on
+both hosts then needs a rule from that path to itself. With no rules at
+all, Plex's paths are used as they are.
+
 ---
 
 # 8. Client Capability Negotiation
@@ -874,8 +880,11 @@ association file; the ceremonies run app to server over
 `spoolframe/client/1`, and the server never contacts it, so a LAN-only
 server has app passkeys too. Each server keeps its own app passkeys (with
 the web UI's, marked by that relying-party ID), its own random user
-handle per user, and its own challenges, bound to the device that asked:
-a passkey or an assertion of one server is of no use at another. An app
+handle per user, and its own challenges, bound to the device that asked
+and to the server: the server sends a nonce, and the challenge is a hash
+of the server's endpoint id and the nonce, which the app's SDK makes with
+the id it pinned (PX-10). A passkey or an assertion of one server is of no
+use at another, even one relayed by a server the app trusts. An app
 lists, renames and removes its user's passkeys, the web UI's with its
 own, through the same store calls and rules as My profile.
 

@@ -151,18 +151,19 @@ impl Conversion {
             }
             _ => None,
         };
-        let segments = (*delivery == Delivery::Hls).then(|| {
-            let total = source
-                .descriptor
-                .duration
-                .map_or(0, |d| d.as_millis() as u64);
-            match (video, &source.keyframes) {
-                (Some(ConvertedVideo::Copy { .. }), Some(keyframes)) => {
-                    Segments::at_keyframes(keyframes, total)
-                }
-                _ => Segments::grid(total),
+        let segments = match delivery {
+            Delivery::Hls => {
+                let total =
+                    hls::hls_total_ms(source.descriptor.duration).map_err(JobError::Prepare)?;
+                Some(match (video, &source.keyframes) {
+                    (Some(ConvertedVideo::Copy { .. }), Some(keyframes)) => {
+                        Segments::at_keyframes(keyframes, total)
+                    }
+                    _ => Segments::grid(total),
+                })
             }
-        });
+            _ => None,
+        };
         // An HLS start begins at the segment the position falls in.
         let (start, first_segment) = playback_seek(segments.as_ref(), start, *video);
         let job = spawn(

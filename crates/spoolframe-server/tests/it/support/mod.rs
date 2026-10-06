@@ -593,6 +593,10 @@ pub struct ServerOptions {
     /// What the stand-in ffprobe says the movie is: a file in
     /// spoolframe-media's fixtures.
     pub ffprobe_fixture: &'static str,
+    /// Who may hold connections (PX-10); tests of the limits shrink them.
+    pub admission: spoolframe_server::admission::Admission,
+    /// The sign-in attempts devices that are not signed in share (PX-10).
+    pub stranger_attempts: spoolframe_server::auth::Bucket,
 }
 
 impl Default for ServerOptions {
@@ -624,6 +628,8 @@ impl Default for ServerOptions {
             previews_ffmpeg: PathBuf::from("ffmpeg"),
             passkey_lifetime: spoolframe_server::passkeys::CEREMONY_LIFETIME,
             ffprobe_fixture: "mkv-forced-subs.json",
+            admission: spoolframe_server::admission::Admission::default(),
+            stranger_attempts: spoolframe_server::auth::STRANGER_ATTEMPTS,
         }
     }
 }
@@ -777,7 +783,8 @@ impl TestServer {
         .unwrap();
         spoolframe_server::previews::ahead::spawn(&previews, catalog.clone(), store.clone());
         let auth = Auth::with_failure_window(store.clone(), options.failure_window)
-            .with_sign_in_lifetime(options.sign_in_lifetime);
+            .with_sign_in_lifetime(options.sign_in_lifetime)
+            .with_stranger_attempts(options.stranger_attempts);
         let plex_accounts = Arc::new(spoolframe_server::plex_accounts::PlexAccounts::new(
             spoolframe_server::config::secrets::Secrets::new(dir.as_ref()),
             store.clone(),
@@ -825,6 +832,7 @@ impl TestServer {
             port: options.port,
             relay: Relay::Disabled,
             mdns: options.mdns,
+            admission: options.admission,
         };
         let name = ServerName::new(options.name.clone());
         let server = Server::start(key, &endpoint, &name, services)

@@ -5,6 +5,11 @@
 //! is by whole path components, so `/data/movies` never matches
 //! `/data/movies2`, and Plex's stray double slashes (`/media//TV`) do not
 //! matter.
+//!
+//! A Plex server names the files Spoolframe reads, so its paths are
+//! confined (PX-09 B-5): none with `..`, and once any rule exists, none
+//! that no rule maps. With no rules at all, Plex's paths are used as they
+//! are, as on a host that mounts the media where Plex does.
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -38,6 +43,20 @@ pub struct Mapped<'m> {
     pub local: PathBuf,
     /// `None` when no rule matched and the Plex path is used as it is.
     pub mapping: Option<&'m PathMapping>,
+    /// Why `local` is not served whether or not it can be read: a path
+    /// that climbs with `..`, or that no rule maps when there are rules.
+    pub refused: Option<&'static str>,
+}
+
+impl Mapped<'_> {
+    /// Why the file cannot be served, or `None` if it is a readable file
+    /// the rules allow.
+    pub fn problem(&self) -> Option<String> {
+        match self.refused {
+            Some(reason) => Some(reason.to_owned()),
+            None => unreadable(&self.local),
+        }
+    }
 }
 
 /// Every configured mapping.
@@ -53,7 +72,8 @@ impl PathMap {
 
     /// Map `plex` from the library titled `library`. A rule scoped to that
     /// library wins over a global one; within each group the longest
-    /// matching `from` wins. No match leaves the path as it is.
+    /// matching `from` wins. No match leaves the path as it is, refused
+    /// when there are rules.
     pub fn map(&self, library: Option<&str>, plex: &Path) -> Mapped<'_> {
         let scoped = self
             .mappings
@@ -61,14 +81,22 @@ impl PathMap {
             .filter(|m| m.library.is_some() && m.library.as_deref() == library);
         let global = self.mappings.iter().filter(|m| m.library.is_none());
         let best = longest_match(scoped, plex).or_else(|| longest_match(global, plex));
+        // Before mapping, so that no rule's `to` is climbed out of: a
+        // parent component is never in a path Plex has for a file.
+        let climbs = plex.components().any(|c| c == Component::ParentDir);
+        let refused = climbs.then_some("the Plex path has a `..` component");
         match best {
             Some((mapping, rest)) => Mapped {
                 local: mapping.to.join(rest),
                 mapping: Some(mapping),
+                refused,
             },
             None => Mapped {
                 local: normalized(plex),
                 mapping: None,
+                refused: refused.or_else(|| {
+                    (!self.mappings.is_empty()).then_some("no path mapping matches it")
+                }),
             },
         }
     }
@@ -87,7 +115,7 @@ impl PathMap {
                 from: m.from.clone(),
                 to: m.to.clone(),
             }),
-            problem: unreadable(&mapped.local),
+            problem: mapped.problem(),
             local: mapped.local,
         }
     }
@@ -301,6 +329,77 @@ mod tests {
         let mapped = map.map(None, Path::new("/data/movies/Alien (1979)/Alien.mkv"));
         assert_eq!(unreadable(&mapped.local), None);
         assert_eq!(suggest(Path::new("/data/movies/Missing.mkv"), &bases), None);
+    }
+
+    /// A file that can be read, under a fresh directory, for the checks
+    /// below: a refused path must be refused although it can be read.
+    async fn readable(test: &str) -> (spoolframe_test_dir::TestDir, PathBuf) {
+        let dir = spoolframe_test_dir::TestDir::new(test).await;
+        let library = dir.as_ref().join("library/movies");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(dir.as_ref().join("spoolframe.db"), b"secret").unwrap();
+        (dir, library)
+    }
+
+    /// PX-09 B-5: a Plex path that climbs out of its rule's `to` is not
+    /// served, though the file it names is readable.
+    #[tokio::test]
+    async fn a_parent_component_after_mapping_is_refused() {
+        let (_dir, library) = readable("spoolframe-paths-dotdot").await;
+        let map = PathMap::new(vec![PathMapping {
+            library: None,
+            from: "/data/movies".into(),
+            to: library,
+        }]);
+        let checked = map.check(None, Path::new("/data/movies/../../spoolframe.db"));
+        assert!(checked.problem.is_some(), "{checked:?}");
+    }
+
+    /// With no rules the Plex path is used as it is, but never with `..`.
+    #[tokio::test]
+    async fn a_parent_component_without_mappings_is_refused() {
+        let (dir, library) = readable("spoolframe-paths-dotdot-unmapped").await;
+        let plex = library.join("../../spoolframe.db");
+        assert_eq!(unreadable(&plex), None, "the file is readable");
+        let checked = PathMap::default().check(None, &plex);
+        assert!(checked.problem.is_some(), "{checked:?}");
+        drop(dir);
+    }
+
+    /// Once there are rules, a path that none of them maps is not used as
+    /// it is: a Plex server cannot name a file outside its libraries.
+    #[tokio::test]
+    async fn a_path_no_rule_matches_is_refused_when_rules_exist() {
+        let (dir, library) = readable("spoolframe-paths-unmatched").await;
+        let map = PathMap::new(vec![PathMapping {
+            library: None,
+            from: "/data/movies".into(),
+            to: library,
+        }]);
+        let checked = map.check(None, &dir.as_ref().join("spoolframe.db"));
+        assert!(checked.problem.is_some(), "{checked:?}");
+        assert_eq!(checked.mapping, None);
+    }
+
+    /// A rule for another library is no rule for this one.
+    #[tokio::test]
+    async fn a_path_only_another_librarys_rule_matches_is_refused() {
+        let (dir, library) = readable("spoolframe-paths-other-library").await;
+        let map = PathMap::new(vec![PathMapping {
+            library: Some("Music".into()),
+            from: "/".into(),
+            to: library,
+        }]);
+        let checked = map.check(Some("Movies"), &dir.as_ref().join("spoolframe.db"));
+        assert!(checked.problem.is_some(), "{checked:?}");
+    }
+
+    /// No rules at all: the readable Plex path is served as before.
+    #[tokio::test]
+    async fn without_rules_a_readable_plex_path_is_served() {
+        let (dir, _) = readable("spoolframe-paths-no-rules").await;
+        let checked = PathMap::default().check(None, &dir.as_ref().join("spoolframe.db"));
+        assert_eq!(checked.problem, None);
     }
 
     #[test]

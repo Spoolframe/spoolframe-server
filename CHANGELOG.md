@@ -1811,3 +1811,148 @@
   the bare list, a wire change; `plexLastPathCheck` gives the kept one,
   or `null`. A check of one library is answered the same way but not
   kept.
+- A media file or a subtitle file beside it that is swapped for a symlink
+  during its playback is not read through the link (PX-10, PX-09
+  finding 1). Direct play reads only the file it started with (its device
+  and inode), so a read after the swap is `Unavailable`; a subtitle file
+  is opened without following a symlink and must be a regular file, and
+  may still be replaced by another file as P2-11 allows. Subtitle files
+  found beside a film are regular files, or symlinks to one in the same
+  directory; a FIFO or a link out of the directory is skipped.
+- Plex paths are confined (PX-10, PX-09 finding 12): a path Plex reports
+  with a `..` component is never served or probed, and once
+  `plex.path_mapping` (or a library's mappings) has any rule, a path that
+  no rule maps is refused too; the path check counts it under "no
+  matching mapping". A library at the same path on both hosts needs a rule
+  from that path to itself. With no rules at all, Plex's paths are used as
+  they are, as before.
+- An admin's changes that could take over an account or the server need a
+  recent sign-in, as the user's own do (PX-10, PX-09 finding 3): setting
+  a password, removing a passkey, clearing a PIN or no longer asking for
+  it, unlinking a sign-in provider account, adding an admin or making
+  one, setting or unsetting an `admin.*` or `auth.*` setting, a sign-in
+  provider's client secret, and a Plex server's token. From a session
+  signed in more than 10 minutes ago they are `RECENT_SIGN_IN_REQUIRED`;
+  the web UI then shows "Confirm it's you" and tries the change again.
+  Admin API: those methods may now answer `RECENT_SIGN_IN_REQUIRED`.
+- A new password signs out whoever knew the old one (PX-10, PX-09
+  finding 4): `me.setPassword` revokes every other session of the user's,
+  in browsers and on devices, and keeps the one it came from;
+  `admin.userSetPassword` revokes every session of that user's, except
+  the admin's own when they set their own. Devices are asked to sign in
+  again (`Unauthenticated`). The web UI's password forms say so. Admin
+  API: no new fields; the revocation is a change of behaviour.
+- The Plex token reaches only the server it is for (PX-10, PX-09
+  finding 5). Spoolframe follows no redirect from a Plex server, so
+  `X-Plex-Token` is never sent on to another host. `plexProbe` and
+  `plexServerAdd` no longer fall back to the first server's token for
+  another URL, such as one a LAN discovery answer named: they use a
+  pasted token, else the one plex.tv lists for that server under the
+  linked Plex account (or the wizard's Sign in with Plex), and a probe of
+  a server already added uses its own. Add a library no longer offers the
+  first server's token for a new server; it asks for the account or a
+  pasted token. Admin API: a change of behaviour for callers that relied
+  on the fallback.
+- Bitmap subtitles read for OCR are bounded (PX-10, PX-09 finding 8): a
+  PGS object or picture larger than 4096 × 4096 stops the track's
+  reading with an error, and a DVB region or page past that size is left
+  out, instead of allocating what the file's header says (up to 4 GiB).
+  ffprobe's packets of a track are read to 512 MiB, a `.sup` to 256 MiB
+  and tesseract's text to 16 MiB. Each tesseract run may take 5 minutes
+  and each ffmpeg or ffprobe pass over a film (copying a track out,
+  reading its packets, converting a text track) 15, then it is killed and
+  the subtitle fails to read.
+- A file that says it is longer than 48 hours gets no frame previews and
+  no HLS (PX-10, PX-09 finding 11): its length is ffprobe's, from the
+  file, and it sized the previews' tiles and the HLS grid and playlist.
+  Previews of it fail with that reason, and an HLS playback of it is
+  `PlaybackFailed` saying so. Direct play and a progressive conversion
+  are unchanged.
+- Connections from devices that are not signed in get small limits
+  (PX-10, PX-09 findings 7 and C-3). A device with no live session (a
+  *stranger*) may open 4 bidirectional streams at once and send at most
+  512 KiB unread, with request frames of at most 64 KiB; a device with a
+  live session gets 100 streams and 16 MiB, on the connection it signs
+  in on (`LoginPassword`, `FinishPasskeySignIn`, an approved
+  `AwaitDeviceSignIn`) and on every later one. No client may open a
+  unidirectional stream. A stream whose kind byte and first frame do not
+  arrive within `network.first_frame_timeout_secs` (10) is reset with
+  `reset::FIRST_FRAME_TIMEOUT`. At most `network.max_stranger_connections`
+  (64) stranger connections are held; one more is closed with
+  `close::BUSY`, and a signed-in device is always let in. When a device's
+  last live session ends (sign-out, revoke, "sign out everywhere else",
+  too many wrong PINs, its user disabled, or expiry, checked every
+  minute), its connections are closed with `close::SIGNED_OUT` once its
+  replies are delivered (at most 2 s), and it reconnects as a stranger.
+  Connections that send nothing for 15 s are dropped (iroh keeps alive
+  every 5 s). Protocol: `close::BUSY`, `close::SIGNED_OUT`,
+  `reset::FIRST_FRAME_TIMEOUT` and `codec::read_frame_bytes_within` are
+  new.
+- One user or device can no longer fill the mutation replay pools (PX-10,
+  PX-09 findings 6 and C-2). A pending mutation reserves what its kind of
+  reply can take (1 MiB for `StartPlayback`, `ChangeSubtitle` and
+  `SeekPlayback`, 64 KiB for passkey ceremony options, 16 KiB for the
+  rest) in place of 1 MiB for every one, and a finished one its
+  outcome's size. Each endpoint and each user may hold an eighth of a
+  pool's entries and bytes: 512 and 8 MiB of the signed-in pool, 64 and
+  1 MiB of the anonymous one. Anonymous outcomes are replayed for 30 s
+  once known, not for the operation's whole expiry. Over its share, a
+  mutation gets `RateLimited` (retry after 1 s).
+- A full sign-in limiter no longer refuses everyone (PX-10, PX-09 findings
+  9 and A-4). When a new username or source finds its 100,000 keys held,
+  the keys out of the window go first, then those whose last failure is
+  oldest. Sign-in attempts (`LoginPassword`, `FinishPasskeySignIn`) from
+  devices that are not signed in now share one budget: a burst of 20,
+  then 5 a second. Past it they get `RateLimited`. A signed-in device
+  adding a user does not draw on it.
+- Password hashing and checking run at most once a core at a time
+  (PX-10, PX-09 findings 10 and A-5): logins, PIN checks and password
+  changes wait for a free core instead of each starting Argon2 (about
+  19 MiB) on the blocking pool. The admin API's JSON-RPC refuses batch
+  requests (C-5): one message could carry any number of calls. No
+  Spoolframe client sends them; a caller that did gets an error for the
+  batch.
+- Anonymous callers can no longer fill the sign-in tables (PX-10, PX-09
+  findings 16, 17, A-6 and C-6). `Hello`'s `client_name`,
+  `client_version` and `device_name` are cut to 128 characters
+  (`MAX_HELLO_TEXT`), not refused: what the server keeps, lists as
+  connected and shows to an approver is the cut text. At most 256
+  device sign-ins are pending on the server (`MAX_PENDING`; a device
+  still has at most 3), past which `BeginDeviceSignIn` is `RateLimited`.
+  One remote address may hold at most 16 web passkey sign-ins
+  (`/auth/passkey/begin`, 429 past it) and 16 SSO flows
+  (`/auth/oidc/begin`); a caller with no source address (loopback, or an
+  untrusted proxy) is not counted apart. A stranger's
+  `BeginPasskeySignIn` draws on the stranger sign-in budget, as its
+  `FinishPasskeySignIn` does.
+- A password change or an admin's reset closes the user's other devices'
+  connections at once with `close::SIGNED_OUT` (PX-10, findings 4 and
+  7), as a sign-out or a revoke does, where they waited for the
+  minute's recheck.
+- An app passkey sign-in can no longer be relayed from one server to
+  another (PX-10, PX-09 finding 2). Every server shares the relying party
+  `spoolframe.app`, so a malicious server could hand an app the challenge
+  of another server and sign in there with what the app signed. Now a
+  server sends a nonce, and the challenge is SHA-256 of a tag, the
+  server's endpoint id and the nonce: the server uses its own id, the SDK
+  the id it pinned (`spoolframe_protocol::app_passkey_challenge`). This
+  applies to sign-in, confirmation and registration. Wire change:
+  `Reply::PasskeyRequest` and `Reply::PasskeyCreation` are now
+  `PasskeySignInBegun` and `PasskeyRegistrationBegun`, with `nonce` in
+  place of `challenge`. The SDK still gives apps a `PasskeyRequest` and a
+  `PasskeyCreation` with the challenge in them, so apps change nothing.
+  `BeginPasskeySignIn` with a `username` no longer lists that user's
+  credential ids to anyone who asks; only that user's passkeys finish it.
+- The SDK reads the server's close codes (PX-10). A connection closed
+  with `close::SIGNED_OUT` ends every session the SDK keeps for that
+  server, and a call in one of them is `SdkError::SignInRequired`: a call
+  it cut off, and each call after it, at once and with no dial. Before,
+  it was `Unreachable` or `TimedOut`, and only the retry learned the
+  session was gone. The SDK no longer reconnects as a stranger after a
+  sign-out; the state goes to `Disconnected` and the next call dials.
+  `Client::signed_out` returns a `SignOutWatch` that fires on each such
+  close, after the sessions are ended, so an app can show "Who's
+  watching" with no request in flight. A connection refused with
+  `close::BUSY` is the new `SdkError::ServerFull` (try again later), not
+  `Unreachable`; a reconnect refused so stops. Session-less calls cut
+  off by a sign-out are retried on a new connection as before.

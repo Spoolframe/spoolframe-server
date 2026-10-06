@@ -296,7 +296,12 @@ impl Job {
                 // A sidecar is its own input, its one stream the track.
                 let (input, index) = match &self.track {
                     SubtitleSource::Embedded { index } => (&self.input, *index),
-                    SubtitleSource::External { path } => (path, 0),
+                    SubtitleSource::External { path } => {
+                        crate::files::is_regular(path)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        (path, 0)
+                    }
                 };
                 ocr::convert_text(&self.subtitles.ffmpeg, input, index, self.to, &partial)
                     .await
@@ -372,7 +377,12 @@ impl Job {
             // own already does.
             let (input, index, from_start) = match &self.track {
                 SubtitleSource::Embedded { index } => (&self.input, *index, true),
-                SubtitleSource::External { path } => (path, 0, false),
+                SubtitleSource::External { path } => {
+                    crate::files::is_regular(path)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    (path, 0, false)
+                }
             };
             let track = ocr::read_track(&self.subtitles.ffprobe, input, index, from_start)
                 .await
@@ -394,7 +404,24 @@ impl Job {
             }
             SubtitleSource::External { path } => path.clone(),
         };
-        let bytes = tokio::fs::read(&sup).await.map_err(|e| e.to_string())?;
+        // Not through a symlink (PX-09 B-1): a file beside the film is
+        // anyone's who can write to the library folder.
+        let file = crate::files::open_regular(&sup)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Read to a cap (PX-09 B-3): the file is whatever is beside the
+        // film, or what ffmpeg copied out of it.
+        let limit = spoolframe_media::ocr::MAX_SUP_BYTES;
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(
+            &mut tokio::io::AsyncReadExt::take(file, limit as u64 + 1),
+            &mut bytes,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if bytes.len() > limit {
+            return Err(format!("the PGS track is larger than {limit} bytes"));
+        }
         pgs::cues(&bytes).map_err(|e| e.to_string())
     }
 }

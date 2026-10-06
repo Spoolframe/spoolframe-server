@@ -6,6 +6,7 @@
 
 pub mod admin;
 mod admin_http;
+pub mod admission;
 pub mod app_passkeys;
 pub mod artwork;
 pub mod auth;
@@ -15,6 +16,7 @@ pub mod config;
 pub mod connected;
 pub mod device_sign_in;
 pub mod encode;
+mod files;
 pub mod identity;
 mod keyed_locks;
 pub mod libraries;

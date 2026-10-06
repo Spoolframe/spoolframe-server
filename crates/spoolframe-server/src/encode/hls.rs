@@ -20,7 +20,7 @@
 
 use std::fmt::Write as _;
 
-use spoolframe_media::{MediaDescriptor, SubtitleStream, VideoRange};
+use spoolframe_media::{MAX_DURATION, MediaDescriptor, SubtitleStream, VideoRange};
 use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo};
 use spoolframe_types::{AudioCodec, VideoCodec, language};
 
@@ -35,6 +35,21 @@ const TAIL_MS: u64 = 500;
 pub struct Segments {
     pub starts_ms: Vec<u64>,
     pub total_ms: u64,
+}
+
+/// The length an HLS grid is cut over, in ms, from ffprobe's length of
+/// the file: refused past [`MAX_DURATION`], which would make a grid (and
+/// a playlist) as long as the file says.
+pub fn hls_total_ms(duration: Option<std::time::Duration>) -> Result<u64, String> {
+    match duration {
+        Some(d) if d > MAX_DURATION => Err(format!(
+            "the file says it is {} hours long; HLS is made only of files up to {} hours",
+            d.as_secs() / 3600,
+            MAX_DURATION.as_secs() / 3600
+        )),
+        Some(d) => Ok(d.as_millis() as u64),
+        None => Ok(0),
+    }
 }
 
 impl Segments {
@@ -355,6 +370,18 @@ fn audio_codec_string(codec: AudioCodec) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PX-09 B-4: the grid's size comes from ffprobe's length of the file;
+    /// one said to be longer than 48 hours is refused, with why.
+    #[test]
+    fn a_file_said_to_be_longer_than_48_hours_has_no_hls() {
+        let hours = |h: u64| Some(std::time::Duration::from_secs(h * 3600));
+        assert_eq!(hls_total_ms(hours(48)), Ok(48 * 3600 * 1000));
+        let refused = hls_total_ms(hours(49)).unwrap_err();
+        assert!(refused.contains("48 hours"), "{refused}");
+        assert!(hls_total_ms(Some(std::time::Duration::MAX)).is_err());
+        assert_eq!(hls_total_ms(None), Ok(0));
+    }
 
     #[test]
     fn a_grid_covers_the_file_with_a_short_last_segment() {

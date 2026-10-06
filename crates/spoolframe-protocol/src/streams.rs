@@ -19,4 +19,7 @@ pub mod uni {
 pub mod reset {
     /// The first byte named a stream kind this peer does not serve.
     pub const UNKNOWN_STREAM_KIND: u32 = 1;
+    /// The stream's kind byte and first frame did not arrive in time
+    /// (PX-10).
+    pub const FIRST_FRAME_TIMEOUT: u32 = 2;
 }

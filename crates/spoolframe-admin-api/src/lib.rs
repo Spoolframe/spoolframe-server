@@ -1927,7 +1927,9 @@ pub trait MeApi {
 
     /// Change the caller's password, given the current one. A caller with
     /// no password (passkeys only) sets their first one instead, which
-    /// needs a recent sign-in (`RECENT_SIGN_IN_REQUIRED`).
+    /// needs a recent sign-in (`RECENT_SIGN_IN_REQUIRED`). Every other
+    /// session of the caller's, on the web and on devices, is revoked
+    /// (PX-10); this one stays.
     #[method(name = "setPassword", with_extensions)]
     async fn set_password(&self, change: PasswordChange) -> jsonrpsee::core::RpcResult<()>;
 
@@ -2145,16 +2147,23 @@ pub trait AdminApi {
     #[method(name = "userList", with_extensions)]
     async fn user_list(&self) -> jsonrpsee::core::RpcResult<Vec<UserInfo>>;
 
+    /// Adding an admin needs a recent sign-in (PX-10), as
+    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "userAdd", with_extensions)]
     async fn user_add(&self, user: NewUser) -> jsonrpsee::core::RpcResult<UserInfo>;
 
     /// Set anyone's password, without the current one; for a user with
-    /// passkeys only, that adds one.
+    /// passkeys only, that adds one. Needs a recent sign-in (PX-10), as
+    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise. Every
+    /// session of the user's is revoked (PX-10), but the caller's own
+    /// when they set their own.
     #[method(name = "userSetPassword", with_extensions)]
     async fn user_set_password(&self, credentials: Credentials) -> jsonrpsee::core::RpcResult<()>;
 
     /// Change a user's role. The last enabled admin cannot be demoted
     /// (`LAST_ADMIN`). Takes effect on their next call, on every session.
+    /// Making an admin needs a recent sign-in (PX-10), as
+    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "userSetRole", with_extensions)]
     async fn user_set_role(
         &self,
@@ -2172,6 +2181,8 @@ pub trait AdminApi {
 
     /// Remove a user's PIN, and its requirement everywhere (P2-08). An
     /// admin can clear a PIN, never set one: the user sets a new one.
+    /// Needs a recent sign-in (PX-10), as
+    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "userClearPin", with_extensions)]
     async fn user_clear_pin(&self, username: String) -> jsonrpsee::core::RpcResult<()>;
 
@@ -2180,6 +2191,8 @@ pub trait AdminApi {
     async fn user_devices(&self, username: String) -> jsonrpsee::core::RpcResult<Vec<DeviceEntry>>;
 
     /// Ask for a user's PIN on one of their devices, or stop asking.
+    /// Stopping needs a recent sign-in (PX-10), as
+    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "userSetPinRequired", with_extensions)]
     async fn user_set_pin_required(
         &self,
@@ -2212,6 +2225,8 @@ pub trait AdminApi {
     ) -> jsonrpsee::core::RpcResult<Vec<PasskeyEntry>>;
 
     /// Remove one of a user's passkeys, by its id from `userPasskeys`.
+    /// Needs a recent sign-in (PX-10), as
+    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "userRemovePasskey", with_extensions)]
     async fn user_remove_passkey(
         &self,
@@ -2226,7 +2241,9 @@ pub trait AdminApi {
     async fn user_sso_links(&self, username: String) -> jsonrpsee::core::RpcResult<Vec<SsoLink>>;
 
     /// Unlink a user's account at the provider with `issuer`, as
-    /// `me.ssoUnlink` does; their last way to sign in stays.
+    /// `me.ssoUnlink` does; their last way to sign in stays. Needs a
+    /// recent sign-in (PX-10), as
+    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "userSsoUnlink", with_extensions)]
     async fn user_sso_unlink(
         &self,
@@ -2237,7 +2254,9 @@ pub trait AdminApi {
     /// Keep `secret` as the client secret of the sign-in provider called
     /// `provider` (P3-04), or forget it (`None`): a secret, in the state
     /// directory, never shown. A provider whose config names a
-    /// `client_secret_file` reads that instead (`SETTING_LOCKED`).
+    /// `client_secret_file` reads that instead (`SETTING_LOCKED`). Needs
+    /// a recent sign-in (PX-10), as
+    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "ssoSetClientSecret", with_extensions)]
     async fn sso_set_client_secret(
         &self,
@@ -2320,7 +2339,9 @@ pub trait AdminApi {
     /// with the message the file would get. `SETTING_LOCKED` for what the
     /// locked config file sets. A live setting applies at once; a restart
     /// one is saved, and `restartPending`. `plex.token` is kept as a
-    /// secret, never in the runtime settings.
+    /// secret, never in the runtime settings. An `admin.*` or `auth.*` key
+    /// needs a recent sign-in (PX-10), as
+    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "settingSet", with_extensions)]
     async fn setting_set(
         &self,
@@ -2329,7 +2350,9 @@ pub trait AdminApi {
     ) -> jsonrpsee::core::RpcResult<SettingEntry>;
 
     /// Take `key` out of the runtime settings: the config file's value or
-    /// the default applies again.
+    /// the default applies again. An `admin.*` or `auth.*` key needs a
+    /// recent sign-in (PX-10), as
+    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "settingUnset", with_extensions)]
     async fn setting_unset(&self, key: String) -> jsonrpsee::core::RpcResult<SettingEntry>;
 
@@ -2357,7 +2380,11 @@ pub trait AdminApi {
     async fn plex_discover(&self) -> jsonrpsee::core::RpcResult<Vec<DiscoveredPlex>>;
 
     /// The PMS at `url` as `plexStatus` would show it, without saving
-    /// anything: with `token`, or else the one the server has.
+    /// anything: with `token`, or else the one the caller's linked Plex
+    /// account (or the wizard's sign-in) has for that server, as plex.tv
+    /// lists it, or else, for a server already added at `url`, its own.
+    /// Never another server's token (PX-10): a URL found on the LAN may
+    /// be anyone's.
     #[method(name = "plexProbe", with_extensions)]
     async fn plex_probe(
         &self,
@@ -2442,8 +2469,7 @@ pub trait AdminApi {
 
     /// Add the Plex server at `url`, with `token`, or else the one the
     /// caller's linked Plex account has for that server (P3-12), or else
-    /// the token the first server has, which works for every server of its
-    /// account.
+    /// none: never the first server's (PX-10).
     /// It must answer; it is named by what it calls itself. Without a
     /// first server, it becomes the first. No library is added.
     #[method(name = "plexServerAdd", with_extensions)]
@@ -2462,7 +2488,9 @@ pub trait AdminApi {
         name: Option<String>,
     ) -> jsonrpsee::core::RpcResult<()>;
 
-    /// Keep `token` as Plex server `id`'s, as a secret.
+    /// Keep `token` as Plex server `id`'s, as a secret. Needs a recent
+    /// sign-in (PX-10), as
+    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "plexServerSetToken", with_extensions)]
     async fn plex_server_set_token(
         &self,
