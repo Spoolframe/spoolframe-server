@@ -20,6 +20,7 @@ use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
 
 use crate::admission::{self, Admission, Peer};
+use crate::announce::{Announce, Told};
 use crate::artwork::ArtworkCache;
 use crate::auth::Auth;
 use crate::client::{self, ClientProtocol};
@@ -75,6 +76,8 @@ pub struct EndpointOptions {
     pub mdns: bool,
     /// Who may hold connections (PX-10).
     pub admission: Admission,
+    /// Which of its addresses a signed-in device is told (PX-12).
+    pub announce: Announce,
 }
 
 /// What the server knows about who is on the other end of a connection.
@@ -249,6 +252,7 @@ impl std::fmt::Debug for Services {
 #[derive(Debug)]
 pub struct Server {
     router: Router,
+    told: Told,
     connections: Connections,
     /// Closes signed-out devices' connections; ends with the server.
     sign_outs: tokio::task::JoinHandle<()>,
@@ -342,16 +346,22 @@ impl Server {
                 .close_signed_out(services.auth.store().clone()),
         );
         // Unknown ALPNs never get this far: the TLS handshake refuses them.
-        let id = endpoint.id();
+        let told = Told::new(endpoint.clone(), options.announce.clone());
+        let client = ClientProtocol::new(
+            endpoint.clone(),
+            told.clone(),
+            connections.clone(),
+            info,
+            name.clone(),
+            services,
+        );
         let router = Router::builder(endpoint)
-            .accept(
-                CLIENT_ALPN,
-                ClientProtocol::new(id, connections.clone(), info, name.clone(), services),
-            )
+            .accept(CLIENT_ALPN, client)
             .accept(FEDERATION_ALPN, Unsupported("spoolframe/federation/1"))
             .spawn();
         Ok(Self {
             router,
+            told,
             connections,
             sign_outs,
         })
@@ -365,6 +375,12 @@ impl Server {
     /// Where the endpoint can be dialled right now.
     pub fn addr(&self) -> EndpointAddr {
         self.router.endpoint().addr()
+    }
+
+    /// What a signed-in device is told about where to dial (PX-12):
+    /// read at each call, as for each device.
+    pub fn told(&self) -> Told {
+        self.told.clone()
     }
 
     pub fn connections(&self) -> &Connections {

@@ -5,16 +5,17 @@
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{
-    AdminApiClient, NewUser, PathCheckRun, PathReport, Role, SsoLink, UserInfo,
+    AdminApiClient, DeviceEntry, NewUser, PathCheckRun, PathReport, Role, SsoLink, UserInfo,
 };
 
-use super::profile::{ConfirmItsYou, asks_to_confirm};
+use super::profile::{ConfirmItsYou, TrustDialog, asks_to_confirm};
 use super::{Alert, Field, Route, icons, initial, now, role_name, rpc};
 use crate::logic::{
     AddUserError, ApiError, Landing, PathState, UserStatus, add_user_error, ago, avatar_class,
     client_kind, count, last_admin, path_state, plex_line, server_version, sign_in_methods,
     thousands, user_change_error, user_status,
 };
+use crate::trust::{self, Change, Question, Switch, Whose};
 
 #[component]
 pub fn AdminHome() -> Element {
@@ -811,9 +812,21 @@ fn UserSessionList(
     }
 }
 
-/// The user's devices, and on which of them their PIN is asked for. The
-/// PIN is one per user: clearing it is one action for the section, not a
-/// row's.
+/// A change to one of the user's devices, held while the page asks about
+/// it or the admin confirms it is them.
+#[derive(Debug, Clone, PartialEq)]
+struct DeviceChange {
+    change: Change,
+    endpoint_id: String,
+    name: String,
+    question: Option<Question>,
+}
+
+/// The user's devices (WebUserSessions, WebAdminPhone's "One user's
+/// devices"; P4-03): on each, whether their PIN is asked for, whether it
+/// is trusted to open their profile without a password, and whether it
+/// opens it at start. The PIN is one per user: clearing it is one action
+/// for the section, not a row's.
 #[component]
 fn UserDevices(
     username: String,
@@ -831,46 +844,98 @@ fn UserDevices(
             client.user_devices(username).await.map_err(rpc::error)
         },
     ));
-    // No longer asking for the PIN may need "Confirm it's you" first,
-    // then is tried again on the device it was for.
+    let whose = Whose::Theirs(username.clone());
+    // The change whose question is open.
+    let mut pending = use_signal(|| None::<DeviceChange>);
+    // A change may need "Confirm it's you" first, then is made again.
     let confirming = use_signal(|| None::<String>);
-    let mut again = use_signal(|| None::<String>);
+    let mut again = use_signal(|| None::<DeviceChange>);
     let name = username.clone();
-    let set_required = use_callback(move |(id, required): (String, bool)| {
+    let make = use_callback(move |change: DeviceChange| {
         let username = name.clone();
         spawn(async move {
-            let set = async {
+            let made = async {
                 let client = rpc::client().await?;
-                client
-                    .user_set_pin_required(username, id.clone(), required)
-                    .await
-                    .map_err(rpc::error)
+                match trust::trust_request(change.change) {
+                    Some((trusted, auto_login)) => {
+                        client
+                            .user_set_device_trust(
+                                username.clone(),
+                                change.endpoint_id.clone(),
+                                trusted,
+                                auto_login,
+                            )
+                            .await
+                    }
+                    None => {
+                        client
+                            .user_set_pin_required(
+                                username.clone(),
+                                change.endpoint_id.clone(),
+                                change.change == Change::AskForPin,
+                            )
+                            .await
+                    }
+                }
+                .map_err(rpc::error)
             };
-            match set.await {
-                Ok(()) => {}
-                Err(e) if asks_to_confirm(&e, confirming, "no longer asking for the PIN") => {
-                    again.set(Some(id));
+            match made.await {
+                Ok(()) => say(
+                    toast,
+                    true,
+                    trust::done(change.change, &change.name, &Whose::Theirs(username)),
+                ),
+                Err(e) if asks_to_confirm(&e, confirming, trust::about(change.change)) => {
+                    again.set(Some(change));
                 }
                 Err(e) => say(toast, false, e.explain()),
             }
             devices.restart();
         });
     });
+    let press = use_callback(
+        move |(switch, device, name): (Switch, DeviceEntry, String)| {
+            let change = trust::change(switch, &device);
+            let asked = DeviceChange {
+                change,
+                question: trust::question(change, &device, &name, &whose),
+                endpoint_id: device.endpoint_id,
+                name,
+            };
+            if asked.question.is_some() {
+                pending.set(Some(asked));
+            } else {
+                make.call(asked);
+            }
+        },
+    );
     let current = devices.read().clone();
     rsx! {
         ConfirmItsYou {
             asking: confirming,
             on_confirmed: move |_| {
-                let id = again.write().take();
-                if let Some(id) = id {
-                    set_required.call((id, false));
+                let change = again.write().take();
+                if let Some(change) = change {
+                    make.call(change);
                 }
             },
         }
+        if let Some(DeviceChange { question: Some(question), .. }) = pending() {
+            TrustDialog {
+                question,
+                on_yes: move |_| {
+                    let change = pending.write().take();
+                    if let Some(change) = change {
+                        make.call(change);
+                    }
+                },
+                on_no: move |_| pending.set(None),
+            }
+        }
         div { class: "flex flex-wrap items-end justify-between gap-3",
             div { class: "section-head",
-                h2 { "Devices and profile PIN" }
-                span { "Whether this profile asks for its PIN on each device." }
+                h2 { "Devices" }
+                span { "On each device: whether it asks for the PIN, may open this profile without a password, and opens it at start." }
             }
             if has_pin {
                 button { class: "btn", onclick: move |_| on_clear.call(()), "Clear PIN" }
@@ -890,34 +955,42 @@ fn UserDevices(
                             tr {
                                 th { "Device" }
                                 th { class: "max-md:hidden", "Kind" }
-                                th { "PIN on this device" }
+                                th { "PIN" }
+                                th { "Trusted" }
+                                th { "Auto-login" }
                             }
                         }
                         tbody {
                             if list.is_empty() {
-                                tr { td { class: "quiet", colspan: "3", "No devices yet. A device shows here once {username} signs in on it." } }
+                                tr { td { class: "quiet", colspan: "5", "No devices yet. A device shows here once {username} signs in on it." } }
                             }
                             for d in list {
                                 tr { key: "{d.endpoint_id}",
-                                    td { b { "{session_device(&Some(d.endpoint_id.clone()), &d.name, d.platform)}" } }
-                                    td { class: "quiet max-md:hidden", "{client_kind(Some(&d.endpoint_id), d.platform)}" }
                                     td {
-                                        span { class: "flex items-center gap-2",
+                                        b { "{session_device(&Some(d.endpoint_id.clone()), &d.name, d.platform)}" }
+                                        if d.trusted {
+                                            span { class: "pill pill-trusted ml-2", "Trusted" }
+                                        }
+                                    }
+                                    td { class: "quiet max-md:hidden", "{client_kind(Some(&d.endpoint_id), d.platform)}" }
+                                    for (switch, what, on) in [
+                                        (Switch::Pin, "PIN", d.pin_required),
+                                        (Switch::Trusted, "Trusted", d.trusted),
+                                        (Switch::AutoLogin, "Auto-login", d.auto_login),
+                                    ] {
+                                        td { key: "{what}",
                                             button {
                                                 class: "switch",
                                                 role: "switch",
-                                                aria_checked: "{d.pin_required}",
-                                                aria_label: "Ask for the PIN on this device",
-                                                disabled: !has_pin,
-                                                title: if has_pin { "" } else { "There is no PIN to ask for." },
+                                                aria_checked: "{on}",
+                                                aria_label: "{what} on this device",
+                                                disabled: !trust::can_press(switch, &d, has_pin),
+                                                title: device_switch_title(switch, &d, has_pin),
                                                 onclick: {
-                                                    let id = d.endpoint_id.clone();
-                                                    let required = !d.pin_required;
-                                                    move |_| set_required.call((id.clone(), required))
+                                                    let device = d.clone();
+                                                    let name = session_device(&Some(d.endpoint_id.clone()), &d.name, d.platform);
+                                                    move |_| press.call((switch, device.clone(), name.clone()))
                                                 },
-                                            }
-                                            span { class: "text-[13px] text-ctp-subtext0",
-                                                if d.pin_required { "Required" } else { "Not required" }
                                             }
                                         }
                                     }
@@ -928,6 +1001,18 @@ fn UserDevices(
                 }
             },
         }
+    }
+}
+
+/// Why a switch cannot be pressed, as its tooltip.
+fn device_switch_title(switch: Switch, device: &DeviceEntry, has_pin: bool) -> &'static str {
+    if trust::can_press(switch, device, has_pin) {
+        return "";
+    }
+    match switch {
+        Switch::Pin => "There is no PIN to ask for.",
+        Switch::AutoLogin => "Trust the device first.",
+        Switch::Trusted => "",
     }
 }
 
@@ -1114,6 +1199,19 @@ fn ThisServer() -> Element {
                             } else {
                                 div { class: "flex flex-col gap-1",
                                     for address in s.addresses {
+                                        span { key: "{address}", class: "mono-value", "{address}" }
+                                    }
+                                }
+                            }
+                        }
+                        // The ones a signed-in device is told to dial (PX-12):
+                        // `network.announce` leaves out container bridges.
+                        Pair { label: "Told to devices",
+                            if s.told_addresses.is_empty() {
+                                span { class: "text-ctp-subtext0", "none" }
+                            } else {
+                                div { class: "flex flex-col gap-1",
+                                    for address in s.told_addresses {
                                         span { key: "{address}", class: "mono-value", "{address}" }
                                     }
                                 }

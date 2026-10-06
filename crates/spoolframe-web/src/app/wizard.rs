@@ -1224,12 +1224,17 @@ fn PathsFields(
         use_hook(move || {
             spawn(async move {
                 let result = check_paths(saved.clone()).await;
+                // The saved mappings no folder shows stay, as extra rows:
+                // Continue saves only what the page has (P3-18). All of
+                // them when the check failed and no folder is known.
+                let found = result.as_deref().unwrap_or_default();
+                extra.set(setup::unattached(found, &saved));
                 if let Ok(found) = &result {
                     rows.set(setup::rows(found, &saved));
                     // With the suggestions in, check again: the statuses
                     // are those of what the page shows.
                     if rows.peek().iter().any(|r| r.suggested) {
-                        let shown = setup::mappings(&rows.peek(), &[]);
+                        let shown = setup::mappings(&rows.peek(), &extra.peek());
                         checks.set(Some(check_paths(shown).await));
                         checking.set(false);
                         return;
@@ -1338,7 +1343,7 @@ fn PathsFields(
             }
             for (i, m) in extra().into_iter().enumerate() {
                 div { key: "extra{i}", class: "path-row",
-                    span { class: "text-ctp-subtext0", "Every library" }
+                    span { class: "text-ctp-subtext0", {m.library.clone().unwrap_or_else(|| "Every library".to_owned())} }
                     span { class: "path-local",
                         input {
                             value: "{m.from}",

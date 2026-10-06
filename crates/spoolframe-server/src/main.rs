@@ -593,7 +593,15 @@ async fn run(
     status.set_endpoint_id(server.id().to_string());
     let addrs: Vec<_> = server.addr().ip_addrs().map(ToString::to_string).collect();
     status.set_addresses(addrs.clone());
-    tracing::info!(endpoint_id = %server.id(), ?addrs, "listening");
+    let told = server.told();
+    status.set_told(told.clone());
+    let told: Vec<_> = tokio::task::spawn_blocking(move || told.addrs())
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    tracing::info!(endpoint_id = %server.id(), ?addrs, ?told, "listening");
 
     let restart = tokio::select! {
         _ = shutdown => false,

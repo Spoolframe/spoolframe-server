@@ -5,11 +5,12 @@
 //! to it), and it is worse than a lost path: nothing in QUIC times it out.
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
-use iroh::{Endpoint, EndpointId, RelayMode};
+use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
 use spoolframe_protocol::codec::{decode, read_frame_bytes, request_type, write_frame};
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{
@@ -32,6 +33,8 @@ struct State {
     invocations: Mutex<Vec<(String, spoolframe_protocol::rpc::RpcRequest)>>,
     /// The length advertised by binary replies and the bytes actually sent.
     body: Mutex<(u64, Vec<u8>)>,
+    /// What `ServerAddresses` answers a session with (PX-12).
+    told: Mutex<Vec<SocketAddr>>,
 }
 
 pub struct Stub {
@@ -48,6 +51,24 @@ impl Stub {
             .bind()
             .await
             .unwrap();
+        Self::serving(endpoint)
+    }
+
+    /// A stub with key `key`, bound only on `addrs` (at most one of each
+    /// address family), so that it answers there and nowhere else.
+    pub async fn start_on(key: SecretKey, addrs: &[SocketAddr]) -> Self {
+        let mut builder = Endpoint::builder(presets::Minimal)
+            .secret_key(key)
+            .relay_mode(RelayMode::Disabled)
+            .alpns(vec![CLIENT_ALPN.to_vec()])
+            .clear_ip_transports();
+        for addr in addrs {
+            builder = builder.bind_addr(*addr).unwrap();
+        }
+        Self::serving(builder.bind().await.unwrap())
+    }
+
+    fn serving(endpoint: Endpoint) -> Self {
         let state = Arc::new(State::default());
         let task = tokio::spawn(accept(endpoint.clone(), state.clone()));
         Self {
@@ -63,6 +84,11 @@ impl Stub {
 
     pub fn addrs(&self) -> Vec<std::net::SocketAddr> {
         self.endpoint.addr().ip_addrs().copied().collect()
+    }
+
+    /// The sockets it is bound on, ports and all.
+    pub fn bound(&self) -> Vec<SocketAddr> {
+        self.endpoint.bound_sockets()
     }
 
     /// The connections open now stop answering for good; new ones answer.
@@ -97,6 +123,12 @@ impl Stub {
     /// How many requests of type `kind` arrived, answered or not.
     pub fn count(&self, kind: &str) -> usize {
         self.requests_of(kind).len()
+    }
+
+    /// Answer a session's `ServerAddresses` with `addrs`, whether the stub
+    /// is bound there or not; a stranger's is `Unauthenticated`.
+    pub fn tell(&self, addrs: &[SocketAddr]) {
+        *self.state.told.lock().unwrap() = addrs.to_vec();
     }
 
     pub fn body(&self, announced: u64, bytes: &[u8]) {
@@ -231,7 +263,7 @@ async fn stream(
             id: id.to_string(),
             time_ms: 1_000_000,
         },
-        reply: answer(id, wire.envelope.request).into(),
+        reply: answer(id, &state, wire.envelope).into(),
     };
     if spoolframe_protocol::codec::write_reply(&mut send, &response)
         .await
@@ -243,8 +275,18 @@ async fn stream(
     let _ = send.stopped().await;
 }
 
-fn answer(id: EndpointId, request: Request) -> Response {
-    let reply = match request {
+fn answer(
+    id: EndpointId,
+    state: &State,
+    envelope: spoolframe_protocol::RequestEnvelope,
+) -> Response {
+    let reply = match envelope.request {
+        Request::ServerAddresses if envelope.session.is_none() => {
+            return Response::Err(Error::Unauthenticated);
+        }
+        Request::ServerAddresses => Reply::ServerAddresses {
+            addrs: state.told.lock().unwrap().clone(),
+        },
         Request::Hello(_) => Reply::ServerInfo(ServerInfo {
             name: "Stub".into(),
             endpoint_id: id.to_string(),

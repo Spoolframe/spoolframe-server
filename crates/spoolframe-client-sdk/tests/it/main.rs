@@ -3,5 +3,6 @@
 //! linking the crate and all its dependencies again. A new test goes in as
 //! a module here, never as a new file under `tests/`.
 
+mod addresses;
 mod stalls;
 mod stub;

@@ -1184,3 +1184,60 @@ async fn a_film_s_previews_come_from_its_own_plex_server_s_index() {
     assert_eq!((previews.tile_width, previews.tile_height), (320, 132));
     assert_eq!(previews.count, 1);
 }
+
+/// Server › Media paths' last check (P3-18) stands while what it read is
+/// the same: a reorder of the libraries keeps it, and so does a restart;
+/// a changed mapping drops it.
+#[tokio::test]
+async fn the_last_path_check_outlives_a_reorder_and_a_restart_but_not_a_new_mapping() {
+    let tower = pms("Tower", TOWER_SECTIONS, TOWER_FILMS).await;
+    let file = format!(
+        r#"plex {{ url = "{}"; path_mapping = [ {{ from = "/data"; to = "/mnt"; }} ]; }}
+        libraries [
+          {{ name = "Films"; kind = "movies"; plex {{ server = "plex"; section = "1"; }} }},
+          {{ name = "Docs"; kind = "movies"; plex {{ server = "plex"; section = "4"; }} }},
+        ]"#,
+        tower.uri()
+    );
+    let (_addr, root, dir) = admin_served("last-check-kept", &file).await;
+    let run = root.plex_check_paths(None).await.unwrap();
+    assert_eq!(
+        root.plex_last_path_check().await.unwrap(),
+        Some(run.clone())
+    );
+
+    root.library_move("plex:4".into(), 0).await.unwrap();
+    assert_eq!(
+        root.plex_last_path_check().await.unwrap(),
+        Some(run.clone()),
+        "a reorder dropped it"
+    );
+
+    let again = crate::settings::serve_in(dir.as_ref(), &file, Default::default()).await;
+    let anonymous = crate::admin::anonymous(again).await;
+    let login = spoolframe_admin_api::MeApiClient::login(
+        &anonymous,
+        crate::admin::creds("root", "correct horse"),
+    )
+    .await
+    .unwrap();
+    let restarted = crate::admin::with_token(again, &login.token).await;
+    assert_eq!(
+        restarted.plex_last_path_check().await.unwrap(),
+        Some(run),
+        "a restart dropped it"
+    );
+    let kept = dir.as_ref().join("last-path-check.json");
+    let mode =
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&kept).unwrap().permissions());
+    assert_eq!(mode & 0o777, 0o600);
+
+    restarted
+        .setting_set(
+            "plex.path_mapping".into(),
+            json!([{ "from": "/data", "to": "/elsewhere" }]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restarted.plex_last_path_check().await.unwrap(), None);
+}

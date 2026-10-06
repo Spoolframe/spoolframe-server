@@ -57,6 +57,7 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::PersonItems { .. }
         | Request::Tracks { .. }
         | Request::WhoAmI
+        | Request::ServerAddresses
         | Request::ListSessions
         | Request::PlaybackPlan { .. }
         | Request::PlaybackRevision { .. }

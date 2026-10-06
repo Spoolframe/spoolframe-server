@@ -318,6 +318,42 @@ Expiry of a session does not end trust. That is the purpose of trust.
   stays in `saved_profiles`.
 - `Session::approve_device_sign_in(code, remember)`.
 
+## Server addresses
+
+A signed-in device can ask where the server can be dialled directly
+(PX-12). This needs no new revision: a server that does not know the
+request answers `Unsupported`, and the SDK then does without.
+
+| Request | Reply |
+|---|---|
+| `{"type": "server_addresses"}` | `ServerAddresses { addrs }` |
+
+`addrs` is every address on the server endpoint's interfaces, with its
+port: LAN, public and VPN addresses. Loopback, link-local and unspecified
+addresses are left out. Each one is text, `192.168.1.10:4433` or
+`[2001:db8::1]:4433`, in CBOR as in JSON. Only a session is told: without
+one, or with one that is not live on this endpoint, the reply is
+`Unauthenticated`. A locked profile is told too, as for `WhoAmI`. The
+addresses are never in `Hello`, because a stranger must not learn the
+server's internal and VPN addresses. It is a read, and the SDK may retry
+it.
+
+Iroh announces these addresses inside each connection too, but a client
+sees only the paths that opened. A phone that never reached the server's
+VPN address cannot learn it from iroh.
+
+### SDK
+
+The SDK asks after each sign-in or resume, and on each new connection
+(first dial, app restart, reconnect) when it keeps a session for the
+server. It asks on that one connection, and a failure costs only the
+addresses. Nothing in the API changes. Each told address joins the saved
+server's addresses, marked as told, with the time it was told. The same
+30-day age-out and 32-address cap apply. A told address becomes reached
+when a connection reaches it, and a reached one stays reached. Under the
+cap, the newest reached addresses are kept first, and told ones fill the
+room that is left. Every saved address is dialled, told or reached.
+
 ## SDK migration in 0.3.0
 
 `Client::activate_profile` explicitly selects a foreground profile and returns

@@ -420,6 +420,7 @@ pub async fn status(listen: SocketAddr) -> Result<()> {
     );
     println!("mDNS: {}", if status.mdns { "on" } else { "off" });
     println!("addresses: {}", list(&status.addresses));
+    println!("told to devices: {}", list(&status.told_addresses));
     let Some(plex) = plex else {
         println!("Plex: not set up");
         return Ok(());

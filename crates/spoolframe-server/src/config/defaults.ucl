@@ -104,6 +104,29 @@ network {
   # How long a request may take to arrive once a client opens a stream
   # for it. A stream that sends nothing in time is reset.
   first_frame_timeout_secs = 10;
+  # The addresses a signed-in device is told to dial the server at. The
+  # server has an address on each network interface, and container and
+  # VM bridges are on that list too: no device reaches those. Told are
+  # the addresses on `interfaces` (each interface when empty), less those
+  # on `ignore_interfaces`, less those in `ignore`, plus `add`. An `add`
+  # address is told even when an ignore matches it. Interface names take
+  # `*` and `?`. A change applies at the next start; the interfaces are
+  # read each time a device asks. `spoolframe-server status` shows the
+  # list told now.
+  announce {
+    # Addresses the server does not see itself, for example the public
+    # address of a NAT that forwards the port: "203.0.113.7" (with the
+    # server's port) or "203.0.113.7:7420".
+    add = [];
+    # Addresses and CIDR ranges never told: "172.17.0.0/16", "10.0.0.9".
+    ignore = [];
+    # Interfaces never told: Docker's, its networks', their veth pairs'
+    # and libvirt's bridges.
+    ignore_interfaces = ["docker*", "br-*", "veth*", "virbr*"];
+    # When set, only these interfaces' addresses are told:
+    # ["enp*", "wg0"].
+    interfaces = [];
+  }
 }
 
 # The admin API (JSON-RPC over WebSocket) and the web UI.

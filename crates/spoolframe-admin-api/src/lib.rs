@@ -421,6 +421,10 @@ pub struct ServerStatus {
     /// Where clients reach it: the endpoint's bound addresses.
     #[serde(default)]
     pub addresses: Vec<String>,
+    /// The addresses a signed-in device is told to dial (PX-12): the
+    /// endpoint's, as `network.announce` filters them, read now. Empty
+    /// while the endpoint is starting.
+    pub told_addresses: Vec<String>,
     /// The tesseract languages bitmap subtitles are read as text in
     /// (P2-07), as tesseract names them (`eng`); none when OCR is off.
     pub ocr_languages: Vec<String>,

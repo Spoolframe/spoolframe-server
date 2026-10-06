@@ -597,6 +597,9 @@ pub struct ServerOptions {
     pub admission: spoolframe_server::admission::Admission,
     /// The sign-in attempts devices that are not signed in share (PX-10).
     pub stranger_attempts: spoolframe_server::auth::Bucket,
+    /// Which addresses a signed-in device is told (PX-12): all of them,
+    /// unless a test is about the filter.
+    pub announce: spoolframe_server::announce::Announce,
 }
 
 impl Default for ServerOptions {
@@ -630,6 +633,7 @@ impl Default for ServerOptions {
             ffprobe_fixture: "mkv-forced-subs.json",
             admission: spoolframe_server::admission::Admission::default(),
             stranger_attempts: spoolframe_server::auth::STRANGER_ATTEMPTS,
+            announce: spoolframe_server::announce::Announce::default(),
         }
     }
 }
@@ -833,6 +837,7 @@ impl TestServer {
             relay: Relay::Disabled,
             mdns: options.mdns,
             admission: options.admission,
+            announce: options.announce.clone(),
         };
         let name = ServerName::new(options.name.clone());
         let server = Server::start(key, &endpoint, &name, services)

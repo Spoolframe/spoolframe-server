@@ -35,6 +35,7 @@ mod protocol;
 mod recent_admin;
 mod sdk;
 mod search;
+mod server_addresses;
 mod sessions;
 mod settings;
 mod sso;

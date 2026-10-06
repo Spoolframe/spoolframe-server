@@ -186,6 +186,8 @@ pub struct StatusSource {
     pub mdns: bool,
     endpoint_id: OnceLock<String>,
     addresses: OnceLock<Vec<String>>,
+    /// What a signed-in device is told (PX-12), once the endpoint is up.
+    told: OnceLock<crate::announce::Told>,
     /// The languages subtitles are read as text in.
     pub ocr_languages: Vec<String>,
     web_urls: OnceLock<Vec<String>>,
@@ -214,6 +216,7 @@ impl StatusSource {
             mdns: false,
             endpoint_id: OnceLock::new(),
             addresses: OnceLock::new(),
+            told: OnceLock::new(),
             ocr_languages: Vec::new(),
             web_urls: OnceLock::new(),
         }
@@ -243,6 +246,11 @@ impl StatusSource {
         let _ = self.addresses.set(addresses);
     }
 
+    /// What a signed-in device is told, once the endpoint is up.
+    pub fn set_told(&self, told: crate::announce::Told) {
+        let _ = self.told.set(told);
+    }
+
     fn status(&self) -> ServerStatus {
         let encoders = self.transcoding.encoders();
         ServerStatus {
@@ -265,6 +273,9 @@ impl StatusSource {
             },
             mdns: self.mdns,
             addresses: self.addresses.get().cloned().unwrap_or_default(),
+            told_addresses: self.told.get().map_or_else(Vec::new, |told| {
+                told.addrs().iter().map(ToString::to_string).collect()
+            }),
             ocr_languages: self.ocr_languages.clone(),
             web_urls: self.web_urls.get().cloned().unwrap_or_default(),
             preview_workers_default: preview_workers_default(),
@@ -385,36 +396,10 @@ fn urls(listen: SocketAddr, host: &[IpAddr]) -> Vec<String> {
 
 /// This host's interface addresses, of the interfaces that are up.
 fn host_addresses() -> Vec<IpAddr> {
-    let mut found = Vec::new();
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills `head` with a list it allocates, which is
-    // read only until the freeifaddrs below; each entry's address is read
-    // as the struct its family names.
-    unsafe {
-        if libc::getifaddrs(&mut head) != 0 {
-            return found;
-        }
-        let mut entry = head;
-        while let Some(ifa) = entry.as_ref() {
-            entry = ifa.ifa_next;
-            if ifa.ifa_addr.is_null() || ifa.ifa_flags & libc::IFF_UP as u32 == 0 {
-                continue;
-            }
-            match i32::from((*ifa.ifa_addr).sa_family) {
-                libc::AF_INET => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    found.push(IpAddr::from(sa.sin_addr.s_addr.to_ne_bytes()));
-                }
-                libc::AF_INET6 => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
-                    found.push(IpAddr::from(sa.sin6_addr.s6_addr));
-                }
-                _ => {}
-            }
-        }
-        libc::freeifaddrs(head);
-    }
-    found
+    crate::announce::interfaces()
+        .into_iter()
+        .flat_map(|i| i.addrs)
+        .collect()
 }
 
 /// Start the admin API on `listen`. Browsers are let in from `origins`;
@@ -429,6 +414,12 @@ pub async fn serve(
     if let Some(metrics) = &admin.metrics {
         metrics.observe_store(admin.auth.store().clone());
     }
+    let checks = Arc::new(
+        admin
+            .settings
+            .as_ref()
+            .map_or_else(PathChecks::default, |s| PathChecks::kept_in(s.state_dir())),
+    );
     let api = AdminApi {
         auth: admin.auth,
         setup_code: admin.setup_code,
@@ -447,7 +438,7 @@ pub async fn serve(
         logs: admin.logs,
         telemetry: admin.telemetry,
         playback: admin.playback,
-        checks: Arc::default(),
+        checks,
         pins: Arc::default(),
         signed_in: Arc::default(),
         public_url: origins.public_url().map(str::to_owned),
@@ -2293,8 +2284,8 @@ impl AdminApiServer for AdminApi {
     ) -> RpcResult<PathCheckRun> {
         self.admin(ext).await?;
         let composite = self.plex.composite();
-        let reports = self
-            .plex()?
+        let plex = self.plex()?;
+        let reports = plex
             .check_paths(library.as_deref(), Scope::All)
             .await
             .map_err(|e| match e {
@@ -2336,20 +2327,30 @@ impl AdminApiServer for AdminApi {
                 .collect(),
         };
         // Only a check of every library stands for the page's.
-        if library.is_none()
-            && let Some(composite) = &composite
-        {
-            self.checks.keep_run(composite, run.clone());
+        if library.is_none() {
+            match plex.paths_basis().await {
+                Ok(basis) => self.checks.keep_run(&basis, run.clone()),
+                Err(e) => tracing::warn!(error = %e, "cannot keep the path check"),
+            }
         }
         Ok(run)
     }
 
+    /// Server › Media paths' last check, while the mappings and the
+    /// served libraries' folders are what it read. Plex is asked for the
+    /// folders; without an answer, nothing says the check still stands.
     async fn plex_last_path_check(&self, ext: &Extensions) -> RpcResult<Option<PathCheckRun>> {
         self.admin(ext).await?;
-        Ok(self
-            .plex
-            .composite()
-            .and_then(|composite| self.checks.last_run(&composite)))
+        let Some(plex) = self.plex.plex() else {
+            return Ok(None);
+        };
+        Ok(match plex.paths_basis().await {
+            Ok(basis) => self.checks.last_run(&basis),
+            Err(e) => {
+                tracing::debug!(error = %e, "cannot tell whether the last path check stands");
+                None
+            }
+        })
     }
 
     async fn server_status(&self, ext: &Extensions) -> RpcResult<ServerStatus> {

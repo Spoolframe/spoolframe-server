@@ -14,6 +14,7 @@ use spoolframe_admin_api::{
     SsoLink, TrackOverrideEntry, TrackPreferences, UserInfo, error_code,
 };
 
+use super::admin::{Said, Toast, say};
 use super::{Alert, Field, Notice, ShownName, http, icons, now, rpc, webauthn};
 use crate::logic::{ApiError, ago, avatar_class, client_kind, date, page_serves, passkey_title};
 use crate::preferences::{
@@ -21,6 +22,7 @@ use crate::preferences::{
     subtitle_choices,
 };
 use crate::sso::Tone;
+use crate::trust::{self, Change, Question, Row, Switch, Whose};
 
 #[component]
 pub fn Profile() -> Element {
@@ -28,6 +30,9 @@ pub fn Profile() -> Element {
     let ShownName(shown) = use_context::<ShownName>();
     // Read at sign-in, and kept here: adding a first password changes it.
     let has_password = use_signal(|| user.has_password);
+    // Kept here: the PIN card sets and removes it, and the devices card
+    // asks for it only once there is one.
+    let has_pin = use_signal(|| user.has_pin);
     // What a sign-in provider's callback sent the browser here to say.
     let said = use_hook(|| {
         http::sso_outcome("/profile")
@@ -42,12 +47,12 @@ pub fn Profile() -> Element {
                 div { class: "profile-grid",
                     div { class: "profile-col",
                         div { style: "order:1", Account { user: user.clone(), has_password } }
-                        div { style: "order:3", PinCard { has_password, has_pin: user.has_pin } }
+                        div { style: "order:3", PinCard { has_password, has_pin } }
                         div { style: "order:5", Playback {} }
                     }
                     div { class: "profile-col",
                         div { style: "order:2", Passkeys { has_password, said: said.clone() } }
-                        div { style: "order:4", Sessions {} }
+                        div { style: "order:4", DevicesAndSessions { has_pin } }
                         div { style: "order:6", super::plex::PlexAccountCard {} }
                     }
                 }
@@ -73,8 +78,8 @@ pub fn Profile() -> Element {
             Account { user: user.clone(), has_password }
             Passkeys { has_password, said }
             super::plex::PlexAccountCard {}
-            Sessions {}
-            PinCard { has_password, has_pin: user.has_pin }
+            DevicesAndSessions { has_pin }
+            PinCard { has_password, has_pin }
             Playback {}
         }
     }
@@ -902,8 +907,6 @@ fn AddPasskeyDialog(
 enum PinChange {
     Set(String),
     Remove,
-    /// No longer asked for on this device (its endpoint id).
-    NotRequired(String),
 }
 
 async fn devices() -> Result<Vec<DeviceEntry>, ApiError> {
@@ -911,12 +914,11 @@ async fn devices() -> Result<Vec<DeviceEntry>, ApiError> {
     client.devices().await.map_err(rpc::error)
 }
 
-/// The design's "Profile PIN" card (P2-08): set, change or remove it,
-/// and for each of the user's devices whether it is asked for there.
+/// The design's "Profile PIN" card (P2-08): set, change or remove it.
+/// Where it is asked for is each device's, in "Devices and sessions".
 #[component]
-fn PinCard(has_password: Signal<bool>, has_pin: bool) -> Element {
-    let mut has_pin = use_signal(|| has_pin);
-    let mut list = use_resource(devices);
+fn PinCard(has_password: Signal<bool>, has_pin: Signal<bool>) -> Element {
+    let mut has_pin = has_pin;
     let mut editing = use_signal(|| false);
     let mut removing = use_signal(|| false);
     let mut notice = use_signal(|| None::<String>);
@@ -945,14 +947,7 @@ fn PinCard(has_password: Signal<bool>, has_pin: bool) -> Element {
                         notice.set(Some("PIN removed. No device asks for it now.".into()));
                         has_pin.set(false);
                     }
-                    PinChange::NotRequired(device) => {
-                        client
-                            .set_pin_required(device.clone(), false)
-                            .await
-                            .map_err(rpc::error)?;
-                    }
                 }
-                list.restart();
                 Ok::<(), ApiError>(())
             };
             match tried.await {
@@ -970,25 +965,6 @@ fn PinCard(has_password: Signal<bool>, has_pin: bool) -> Element {
             }
         });
     });
-    let require = move |device: String| {
-        spawn(async move {
-            let set = async {
-                let client = rpc::client().await?;
-                client
-                    .set_pin_required(device, true)
-                    .await
-                    .map_err(rpc::error)
-            };
-            match set.await {
-                Ok(()) => {
-                    error.set(None);
-                    list.restart();
-                }
-                Err(e) => error.set(Some(e.explain())),
-            }
-        });
-    };
-    let current = list.read().clone();
     rsx! {
         section { class: "card",
             div { class: "card-head",
@@ -1042,47 +1018,12 @@ fn PinCard(has_password: Signal<bool>, has_pin: bool) -> Element {
                 if let Some(text) = error() {
                     Alert { text }
                 }
-                div { class: "row-label", "Required on this device" }
-                match current {
-                    None => rsx! { p { class: "m-0 text-sm text-ctp-subtext0", "Loading…" } },
-                    Some(Err(e)) => rsx! { Alert { text: e.explain() } },
-                    Some(Ok(devices)) if devices.is_empty() => rsx! {
-                        p { class: "m-0 text-sm text-ctp-subtext0", "No devices yet. Sign in with a Spoolframe app, and it is listed here." }
-                    },
-                    Some(Ok(devices)) => rsx! {
-                        for device in devices {
-                            div { class: "row", key: "{device.endpoint_id}",
-                                span { class: "row-what",
-                                    span { class: "break-words", icons::Laptop {} "{device_name(&device.name)}" }
-                                    span { class: "row-sub", "Last used {ago(now(), device.last_seen_at)}" }
-                                }
-                                span { class: "row-do",
-                                    button {
-                                        class: "switch",
-                                        r#type: "button",
-                                        role: "switch",
-                                        aria_checked: "{device.pin_required}",
-                                        aria_label: "Ask for the PIN on {device_name(&device.name)}",
-                                        disabled: !has_pin() && !device.pin_required,
-                                        onclick: {
-                                            let id = device.endpoint_id.clone();
-                                            let on = device.pin_required;
-                                            move |_| {
-                                                if on {
-                                                    attempt.call(PinChange::NotRequired(id.clone()));
-                                                } else {
-                                                    require(id.clone());
-                                                }
-                                            }
-                                        },
-                                    }
-                                }
-                            }
-                        }
-                        if !has_pin() {
-                            p { class: "m-0 text-xs text-ctp-subtext0", "Set a PIN to ask for it on a device." }
-                        }
-                    },
+                p { class: "m-0 text-xs text-ctp-subtext0",
+                    if has_pin() {
+                        "Choose where it is asked for in Devices and sessions."
+                    } else {
+                        "Set a PIN to ask for it on a device."
+                    }
                 }
             }
         }
@@ -1115,12 +1056,6 @@ fn link_line(link: &SsoLink) -> String {
         Some(who) => format!("{who} · {since}"),
         None => since,
     }
-}
-
-/// What a device is called, or what stands for it when it gave no name.
-fn device_name(name: &Option<String>) -> String {
-    name.clone()
-        .unwrap_or_else(|| "A device with no name".into())
 }
 
 /// A new PIN, typed twice: 4 to 8 digits.
@@ -1163,32 +1098,109 @@ async fn sessions() -> Result<Vec<SessionEntry>, ApiError> {
     client.sessions().await.map_err(rpc::error)
 }
 
-/// The design's "Devices and sessions" card: every live session of the
-/// user's, the apps' and the browsers', each signed out by itself, or all
-/// but this one at once.
+/// The card's rows: the user's devices and their live sessions, and the
+/// sessions of browsers and the CLI.
+async fn device_rows() -> Result<Vec<Row>, ApiError> {
+    Ok(trust::rows(devices().await?, sessions().await?))
+}
+
+/// A change to a device, held while the page asks about it.
+#[derive(Debug, Clone, PartialEq)]
+struct Pending {
+    change: Change,
+    endpoint_id: String,
+    name: String,
+    question: Option<Question>,
+}
+
+/// The design's "Devices and sessions" card (WebProfile, WebProfilePhone;
+/// P4-03): each device the user has signed in on, with whether it asks
+/// for the PIN, is trusted to open the profile without a password, and
+/// opens it at start, and each live session, signed out by itself or all
+/// but this one at once. A browser's row has no PIN or trust: "—".
 #[component]
-fn Sessions() -> Element {
-    let mut list = use_resource(sessions);
-    let mut error = use_signal(|| None::<String>);
-    let mut notice = use_signal(|| None::<String>);
+fn DevicesAndSessions(has_pin: Signal<bool>) -> Element {
+    let mut list = use_resource(move || {
+        // Read again when the PIN comes or goes: removing it asks for it
+        // nowhere.
+        let _ = has_pin();
+        device_rows()
+    });
+    let toast = use_signal(|| None::<Said>);
     let mut asking = use_signal(|| false);
-    let sign_out = move |session: SessionEntry| {
+    // The change whose question is open.
+    let mut pending = use_signal(|| None::<Pending>);
+    // "Confirm it's you", and the change it then makes again.
+    let confirming = use_signal(|| None::<String>);
+    let mut again = use_signal(|| None::<Pending>);
+    let make = use_callback(move |change: Pending| {
+        spawn(async move {
+            let made = async {
+                let client = rpc::client().await?;
+                match trust::trust_request(change.change) {
+                    Some((trusted, auto_login)) => {
+                        client
+                            .set_device_trust(change.endpoint_id.clone(), trusted, auto_login)
+                            .await
+                    }
+                    None => {
+                        client
+                            .set_pin_required(
+                                change.endpoint_id.clone(),
+                                change.change == Change::AskForPin,
+                            )
+                            .await
+                    }
+                }
+                .map_err(rpc::error)
+            };
+            match made.await {
+                Ok(()) => say(
+                    toast,
+                    true,
+                    trust::done(change.change, &change.name, &Whose::Mine),
+                ),
+                Err(e) if asks_to_confirm(&e, confirming, trust::about(change.change)) => {
+                    again.set(Some(change));
+                }
+                Err(e) => say(toast, false, e.explain()),
+            }
+            list.restart();
+        });
+    });
+    let press = use_callback(
+        move |(switch, device, name): (Switch, DeviceEntry, String)| {
+            let change = trust::change(switch, &device);
+            let asked = Pending {
+                change,
+                question: trust::question(change, &device, &name, &Whose::Mine),
+                endpoint_id: device.endpoint_id,
+                name,
+            };
+            if asked.question.is_some() {
+                pending.set(Some(asked));
+            } else {
+                make.call(asked);
+            }
+        },
+    );
+    let sign_out = move |(sessions, name, trusted): (Vec<SessionEntry>, String, bool)| {
         spawn(async move {
             let done = async {
                 let client = rpc::client().await?;
-                client
-                    .revoke_session(session.id.clone())
-                    .await
-                    .map_err(rpc::error)
+                for session in sessions {
+                    client
+                        .revoke_session(session.id)
+                        .await
+                        .map_err(rpc::error)?;
+                }
+                Ok::<(), ApiError>(())
             };
             match done.await {
-                Ok(()) => {
-                    error.set(None);
-                    notice.set(Some(format!("{} is signed out.", session_name(&session))));
-                    list.restart();
-                }
-                Err(e) => error.set(Some(e.explain())),
+                Ok(()) => say(toast, true, trust::signed_out(&name, trusted)),
+                Err(e) => say(toast, false, e.explain()),
             }
+            list.restart();
         });
     };
     let everywhere_else = move |_| {
@@ -1199,21 +1211,22 @@ fn Sessions() -> Element {
                 client.revoke_other_sessions().await.map_err(rpc::error)
             };
             match done.await {
-                Ok(n) => {
-                    error.set(None);
-                    notice.set(Some(match n {
+                Ok(n) => say(
+                    toast,
+                    true,
+                    match n {
                         0 => "Nothing else was signed in.".into(),
                         1 => "Signed out of 1 other session.".into(),
                         n => format!("Signed out of {n} other sessions."),
-                    }));
-                    list.restart();
-                }
-                Err(e) => error.set(Some(e.explain())),
+                    },
+                ),
+                Err(e) => say(toast, false, e.explain()),
             }
+            list.restart();
         });
     };
     let current = list.read().clone();
-    let others = matches!(&current, Some(Ok(s)) if s.iter().any(|s| !s.current));
+    let others = matches!(&current, Some(Ok(rows)) if rows.iter().any(|r| r.sessions.iter().any(|s| !s.current)));
     rsx! {
         section { class: "card",
             div { class: "card-head",
@@ -1224,36 +1237,33 @@ fn Sessions() -> Element {
                 match current {
                     None => rsx! { p { class: "m-0 text-sm text-ctp-subtext0", "Loading…" } },
                     Some(Err(e)) => rsx! { Alert { text: e.explain() } },
-                    Some(Ok(sessions)) => rsx! {
-                        for session in sessions {
-                            div { class: "row", key: "{session.id}",
-                                span { class: "row-what",
-                                    b { class: "break-words", "{session_name(&session)}" }
-                                    span { class: "row-sub", "{session_line(&session)}" }
+                    Some(Ok(rows)) if rows.is_empty() => rsx! {
+                        p { class: "m-0 text-sm text-ctp-subtext0", "No devices yet. Sign in with a Spoolframe app, and it is listed here." }
+                    },
+                    Some(Ok(rows)) => rsx! {
+                        div { class: "device-list",
+                          div { class: "device-rows",
+                            div { class: "device-row device-head", "aria-hidden": "true",
+                                span { "Device" }
+                                span { class: "device-switches",
+                                    span { "PIN" }
+                                    span { "Trusted" }
+                                    span { "Auto-login" }
                                 }
-                                span { class: "row-do",
-                                    if session.current {
-                                        span { class: "text-xs text-ctp-green", "This device" }
-                                    } else {
-                                        button {
-                                            class: "btn btn-danger",
-                                            onclick: {
-                                                let session = session.clone();
-                                                move |_| sign_out(session.clone())
-                                            },
-                                            "Sign out"
-                                        }
-                                    }
+                                span {}
+                            }
+                            for row in rows {
+                                DeviceRow {
+                                    key: "{row_key(&row)}",
+                                    row,
+                                    has_pin: has_pin(),
+                                    on_press: press,
+                                    on_sign_out: sign_out,
                                 }
                             }
                         }
+                        }
                     },
-                }
-                if let Some(text) = notice() {
-                    p { class: "m-0 text-xs text-ctp-green", role: "status", "{text}" }
-                }
-                if let Some(text) = error() {
-                    Alert { text }
                 }
                 if asking() {
                     div { class: "flex flex-col gap-2",
@@ -1272,6 +1282,185 @@ fn Sessions() -> Element {
                         onclick: move |_| asking.set(true),
                         icons::LogOut {}
                         "Sign out everywhere else"
+                    }
+                }
+            }
+        }
+        if let Some(Pending { question: Some(question), .. }) = pending() {
+            TrustDialog {
+                question,
+                on_yes: move |_| {
+                    if let Some(change) = pending.write().take() {
+                        make.call(change);
+                    }
+                },
+                on_no: move |_| pending.set(None),
+            }
+        }
+        ConfirmItsYou {
+            asking: confirming,
+            on_confirmed: move |_| {
+                let change = again.write().take();
+                if let Some(change) = change {
+                    make.call(change);
+                }
+            },
+        }
+        Toast { said: toast }
+    }
+}
+
+/// What keeps a row the same row across reloads.
+fn row_key(row: &Row) -> String {
+    match &row.device {
+        Some(device) => device.endpoint_id.clone(),
+        None => row
+            .sessions
+            .first()
+            .map(|s| s.id.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// One row of "Devices and sessions": a device with its three switches,
+/// or a browser's session with "—" for each.
+#[component]
+fn DeviceRow(
+    row: Row,
+    has_pin: bool,
+    on_press: Callback<(Switch, DeviceEntry, String)>,
+    on_sign_out: EventHandler<(Vec<SessionEntry>, String, bool)>,
+) -> Element {
+    let (name, line) = match &row.device {
+        Some(device) => {
+            let name = device
+                .name
+                .clone()
+                .or_else(|| row.sessions.iter().find_map(|s| s.device_name.clone()))
+                .unwrap_or_else(|| "A device with no name".into());
+            let kind = client_kind(Some(&device.endpoint_id), device.platform);
+            let when = match row.sessions.iter().map(|s| s.last_used_at).max() {
+                Some(used) => format!("{kind} · {}", ago(now(), used)),
+                None => format!(
+                    "{kind} · not signed in · last seen {}",
+                    ago(now(), device.last_seen_at)
+                ),
+            };
+            (name, when)
+        }
+        None => match row.sessions.first() {
+            Some(session) => (session_name(session), session_line(session)),
+            None => (String::new(), String::new()),
+        },
+    };
+    let current = row.current();
+    let trusted = row.device.as_ref().is_some_and(|d| d.trusted);
+    rsx! {
+        div { class: "device-row",
+            span { class: "row-what",
+                span { class: "flex flex-wrap items-center gap-2",
+                    b { class: "break-words", "{name}" }
+                    if trusted {
+                        span { class: "pill pill-trusted", "Trusted" }
+                    }
+                }
+                span { class: "row-sub", "{line}" }
+            }
+            span { class: "device-switches",
+                match &row.device {
+                    Some(device) => rsx! {
+                        for (switch, what, on) in [
+                            (Switch::Pin, "PIN", device.pin_required),
+                            (Switch::Trusted, "Trusted", device.trusted),
+                            (Switch::AutoLogin, "Auto-login", device.auto_login),
+                        ] {
+                            label { class: "device-switch", key: "{what}",
+                                span { class: "device-switch-label", "{what}" }
+                                button {
+                                    class: "switch",
+                                    r#type: "button",
+                                    role: "switch",
+                                    aria_checked: "{on}",
+                                    aria_label: "{what} on {name}",
+                                    disabled: !trust::can_press(switch, device, has_pin),
+                                    title: switch_title(switch, device, has_pin),
+                                    onclick: {
+                                        let device = device.clone();
+                                        let name = name.clone();
+                                        move |_| on_press.call((switch, device.clone(), name.clone()))
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    None => rsx! {
+                        for what in ["PIN", "Trusted", "Auto-login"] {
+                            span { class: "device-switch", key: "{what}",
+                                span { class: "device-switch-label", "{what}" }
+                                span { class: "text-ctp-overlay1", title: "A browser is not a device that can be trusted.", "—" }
+                            }
+                        }
+                    },
+                }
+            }
+            span { class: "device-do",
+                if current {
+                    span { class: "text-xs text-ctp-green", "This device" }
+                } else if !row.sessions.is_empty() {
+                    button {
+                        class: "btn btn-danger",
+                        title: if trusted { "Signing it out also stops trusting it." } else { "" },
+                        onclick: {
+                            let sessions = row.sessions.clone();
+                            let name = name.clone();
+                            move |_| on_sign_out.call((sessions.clone(), name.clone(), trusted))
+                        },
+                        "Sign out"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Why a switch cannot be pressed, as its tooltip.
+fn switch_title(switch: Switch, device: &DeviceEntry, has_pin: bool) -> &'static str {
+    if trust::can_press(switch, device, has_pin) {
+        return "";
+    }
+    match switch {
+        Switch::Pin => "Set a PIN first.",
+        Switch::AutoLogin => "Trust the device first.",
+        Switch::Trusted => "",
+    }
+}
+
+/// The question before a change to a device's trust, auto-login or PIN
+/// (WebTrustStates).
+#[component]
+pub(super) fn TrustDialog(
+    question: Question,
+    on_yes: EventHandler<()>,
+    on_no: EventHandler<()>,
+) -> Element {
+    rsx! {
+        div { class: "scrim",
+            section { class: "dialog w-[440px]", role: "dialog",
+                div { class: if question.danger { "dialog-head dialog-head-danger" } else { "dialog-head" },
+                    if question.danger {
+                        icons::ShieldOff { size: 22 }
+                    } else {
+                        icons::ShieldCheck { size: 22 }
+                    }
+                    h1 { "{question.title}" }
+                }
+                p { "{question.text}" }
+                div { class: "dialog-actions",
+                    button { class: "btn-dialog btn-dialog-grey", onclick: move |_| on_no.call(()), "Cancel" }
+                    button {
+                        class: if question.danger { "btn-dialog btn-dialog-outline text-ctp-red" } else { "btn-dialog btn-dialog-primary" },
+                        onclick: move |_| on_yes.call(()),
+                        "{question.action}"
                     }
                 }
             }

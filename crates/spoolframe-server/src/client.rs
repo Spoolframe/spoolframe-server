@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
+use iroh::{Endpoint, EndpointId};
 use spoolframe_catalog::{CatalogError, Page};
 use spoolframe_media::{MediaDescriptor, SubtitleSource, SubtitleStream, codecs};
 use spoolframe_protocol::close;
@@ -39,6 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
 
 use crate::admission::{Peer, SIGN_OUT_DRAIN};
+use crate::announce::Told;
 use crate::artwork::{Artwork, ArtworkError};
 use crate::auth::{self, Approval, LoginError, RECENT_SIGN_IN, SessionToken, UnlockError};
 use crate::device_sign_in::{self, ClaimError, Outcome, Waiting};
@@ -71,6 +72,8 @@ pub(crate) struct ClientProtocol {
     /// This server's endpoint id, which app passkey challenges are made
     /// with (PX-10).
     id: EndpointId,
+    /// The addresses a signed-in device is told (PX-12).
+    told: Told,
     connections: Connections,
     services: Services,
     info: Arc<ServerInfo>,
@@ -149,14 +152,16 @@ impl Locks {
 
 impl ClientProtocol {
     pub(crate) fn new(
-        id: EndpointId,
+        endpoint: Endpoint,
+        told: Told,
         connections: Connections,
         info: ServerInfo,
         name: ServerName,
         services: Services,
     ) -> Self {
         Self {
-            id,
+            id: endpoint.id(),
+            told,
             connections,
             services,
             info: Arc::new(info),
@@ -631,7 +636,10 @@ impl ClientProtocol {
                     // Locked, only these two (P2-08).
                     let exempt = matches!(
                         request,
-                        Request::ActivateProfile | Request::WhoAmI | Request::UnlockProfile { .. }
+                        Request::ActivateProfile
+                            | Request::WhoAmI
+                            | Request::ServerAddresses
+                            | Request::UnlockProfile { .. }
                     );
                     let allowed = if exempt {
                         Ok(())
@@ -1221,6 +1229,15 @@ impl ClientProtocol {
                     locked: state.locks.lock().expect("never poisoned").locked(&session),
                     pin: pin.map(|p| PinState { digits: p.digits }),
                 }))
+            }
+            Request::ServerAddresses => {
+                // The interfaces are read from the system: off the async
+                // threads.
+                let told = self.told.clone();
+                let addrs = tokio::task::spawn_blocking(move || told.addrs())
+                    .await
+                    .map_err(internal)?;
+                Ok(Reply::ServerAddresses { addrs })
             }
             Request::BeginPasskeyRegistration => {
                 // P3-03's rule, as for a passkey added in the web UI: a

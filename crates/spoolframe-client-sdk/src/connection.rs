@@ -10,7 +10,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use iroh::endpoint::{ConnectError, ConnectingError, Connection, ConnectionError, RecvStream};
+use futures_util::StreamExt;
+use iroh::endpoint::{
+    ConnectError, ConnectingError, Connection, ConnectionError, PathEvent, PathEventStream,
+    RecvStream, WeakConnectionHandle,
+};
 use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -21,6 +25,7 @@ use spoolframe_protocol::{
     PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId, close,
 };
 use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
 
 use spoolframe_protocol::policy::{server_wait, wait};
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
@@ -82,6 +87,10 @@ pub(crate) struct ServerConnection {
     pub info: ServerInfo,
     pub instance: ServerInstance,
     pub greeted_at: std::time::Instant,
+    /// Every address this connection has reached the server at, in the
+    /// order first reached: each path iroh opened, while it lasted or
+    /// not. Updated for as long as the connection is open.
+    pub reached: watch::Receiver<Vec<SocketAddr>>,
 }
 
 impl ServerConnection {
@@ -99,6 +108,21 @@ impl ServerConnection {
             .await
             .map_err(|_| unreachable(format!("no answer within {DIAL_TIMEOUT:?}")))?
             .map_err(|e| refused(&e).unwrap_or_else(|| unreachable(e.to_string())))?;
+        // Followed from here, before anything is sent. Once the server
+        // has the connection, it announces each of its addresses; iroh
+        // opens a path to every one it can reach, keeps the best, and
+        // closes the rest within a millisecond. `Connection::paths` then
+        // shows one path, so only the events tell where else the server
+        // was reached. They are a small broadcast that drops what is not
+        // read in time: the task reads them from now, and cannot miss the
+        // first, which come a round trip after the handshake at least.
+        let reached = watch::Sender::new(ip_addrs(&conn));
+        let receiver = reached.subscribe();
+        tokio::spawn(follow_paths(
+            conn.weak_handle(),
+            conn.path_events(),
+            reached,
+        ));
         let hello = Request::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: device.client_name.clone(),
@@ -147,6 +171,7 @@ impl ServerConnection {
             info,
             instance,
             greeted_at: std::time::Instant::now(),
+            reached: receiver,
         })
     }
 
@@ -163,6 +188,12 @@ impl ServerConnection {
         }
     }
 
+    /// Every address this connection has reached the server at
+    /// ([`ServerConnection::reached`]) now.
+    pub fn reached(&self) -> Vec<SocketAddr> {
+        self.reached.borrow().clone()
+    }
+
     /// The server's addresses on this connection's open paths, the one in
     /// use first.
     pub fn remote_addrs(&self) -> Vec<SocketAddr> {
@@ -176,6 +207,64 @@ impl ServerConnection {
                 _ => None,
             })
             .collect()
+    }
+}
+
+/// The server's addresses on `conn`'s open IP paths.
+fn ip_addrs(conn: &Connection) -> Vec<SocketAddr> {
+    conn.paths()
+        .iter()
+        .filter_map(|p| match p.remote_addr() {
+            TransportAddr::Ip(addr) => Some(*addr),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Add each IP address a path of `conn` opens to, is selected at, or
+/// closes from to `reached`, until the connection closes or no one reads
+/// `reached`. Events dropped while lagging are made up from the paths open
+/// then.
+async fn follow_paths(
+    conn: WeakConnectionHandle,
+    mut events: PathEventStream,
+    reached: watch::Sender<Vec<SocketAddr>>,
+) {
+    let closed = conn.closed();
+    tokio::pin!(closed);
+    loop {
+        let found = tokio::select! {
+            event = events.next() => match event {
+                None => return,
+                Some(
+                    PathEvent::Opened { remote_addr, .. }
+                    | PathEvent::Selected { remote_addr, .. }
+                    | PathEvent::Closed { remote_addr, .. },
+                ) => match remote_addr {
+                    TransportAddr::Ip(addr) => vec![addr],
+                    _ => continue,
+                },
+                Some(PathEvent::Lagged { missed, .. }) => {
+                    tracing::debug!(missed, "path events dropped; reading the open paths");
+                    match conn.upgrade() {
+                        Some(conn) => ip_addrs(&conn),
+                        None => return,
+                    }
+                }
+                Some(_) => continue,
+            },
+            _ = &mut closed => return,
+            () = reached.closed() => return,
+        };
+        reached.send_if_modified(|list| {
+            let before = list.len();
+            for addr in found {
+                if !list.contains(&addr) {
+                    list.push(addr);
+                }
+            }
+            list.len() != before
+        });
     }
 }
 
@@ -335,6 +424,26 @@ fn timed_out(conn: &Connection, what: impl std::fmt::Display, limit: Duration) -
 
 /// One RPC stream: the request frame out, the response frame back within
 /// `limit`.
+/// Where the server says it can be dialled directly (PX-12), asked on
+/// `conn` in `session`: only a session is told.
+pub(crate) async fn server_addresses(
+    conn: &Connection,
+    session: &SessionId,
+    limit: Duration,
+) -> Result<Vec<SocketAddr>, SdkError> {
+    match rpc(conn, Some(session), Request::ServerAddresses, limit)
+        .await?
+        .reply
+        .response
+    {
+        Response::Ok(Reply::ServerAddresses { addrs }) => Ok(addrs),
+        Response::Ok(other) => Err(SdkError::Protocol(format!(
+            "ServerAddresses answered {other:?}"
+        ))),
+        Response::Err(e) => Err(SdkError::from_server(e)),
+    }
+}
+
 async fn rpc(
     conn: &Connection,
     session: Option<&SessionId>,

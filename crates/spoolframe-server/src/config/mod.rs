@@ -882,6 +882,77 @@ pub struct NetworkConfig {
     /// stream is reset (PX-10).
     #[ucl(default)]
     pub first_frame_timeout_secs: Option<u64>,
+    /// Which of its addresses a signed-in device is told (PX-12).
+    #[ucl(default)]
+    pub announce: AnnounceConfig,
+}
+
+/// `announce { add = ["203.0.113.7"]; ignore = ["172.17.0.0/16"];
+/// ignore_interfaces = ["docker*"]; interfaces = ["enp*"]; }`, all
+/// optional: which of the endpoint's addresses a signed-in device is told
+/// (PX-12). The endpoint has an address on every interface, container
+/// bridges included, and no device reaches those. Interface names may
+/// have `*` and `?` in them.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct AnnounceConfig {
+    /// Addresses to tell besides the endpoint's own, as `ip` or
+    /// `ip:port` (`[ipv6]:port`): one the host does not see, as a NAT's
+    /// public address. Without a port, the endpoint's. Told even when an
+    /// ignore below matches it.
+    #[ucl(default)]
+    pub add: Option<Vec<String>>,
+    /// Addresses and CIDR ranges never told.
+    #[ucl(default)]
+    pub ignore: Option<Vec<String>>,
+    /// Interfaces whose addresses are never told;
+    /// [`Self::DEFAULT_IGNORE_INTERFACES`] if left out.
+    #[ucl(default)]
+    pub ignore_interfaces: Option<Vec<String>>,
+    /// If set, only these interfaces' addresses are told.
+    #[ucl(default)]
+    pub interfaces: Option<Vec<String>>,
+}
+
+impl AnnounceConfig {
+    /// Docker's, its networks', their veth pairs' and libvirt's bridges:
+    /// on the host only, never reached from another device.
+    pub const DEFAULT_IGNORE_INTERFACES: &'static [&'static str] =
+        &["docker*", "br-*", "veth*", "virbr*"];
+
+    /// The settings, checked.
+    pub fn announce(&self) -> Result<crate::announce::Announce, ConfigError> {
+        fn each<T: std::str::FromStr<Err = String>>(
+            key: &'static str,
+            list: Option<&[String]>,
+        ) -> Result<Vec<T>, ConfigError> {
+            list.unwrap_or_default()
+                .iter()
+                .map(|entry| {
+                    entry
+                        .parse()
+                        .map_err(|message| ConfigError::Invalid { key, message })
+                })
+                .collect()
+        }
+        let default_ignored: Vec<String> = Self::DEFAULT_IGNORE_INTERFACES
+            .iter()
+            .map(|g| (*g).to_owned())
+            .collect();
+        Ok(crate::announce::Announce {
+            add: each("network.announce.add", self.add.as_deref())?,
+            ignore: each("network.announce.ignore", self.ignore.as_deref())?,
+            ignore_interfaces: each(
+                "network.announce.ignore_interfaces",
+                Some(
+                    self.ignore_interfaces
+                        .as_deref()
+                        .unwrap_or(&default_ignored),
+                ),
+            )?,
+            interfaces: each("network.announce.interfaces", self.interfaces.as_deref())?,
+        })
+    }
 }
 
 impl NetworkConfig {
@@ -935,6 +1006,7 @@ impl NetworkConfig {
             relay,
             mdns: self.mdns.unwrap_or(true),
             admission,
+            announce: self.announce.announce()?,
         })
     }
 }
@@ -1994,6 +2066,85 @@ mod tests {
             plex(r#"plex { url = "http://nas:32400"; } network { plex_discovery_port = 70000; }"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn docker_and_libvirt_bridges_are_not_told_by_default() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        let announce = config.network.endpoint_options().unwrap().announce;
+        let names: Vec<_> = [
+            "docker0",
+            "br-0123abcd",
+            "veth12ab",
+            "virbr0",
+            "enp5s0",
+            "wg0",
+        ]
+        .into_iter()
+        .filter(|name| announce.ignore_interfaces.iter().any(|g| g.matches(name)))
+        .collect();
+        assert_eq!(names, ["docker0", "br-0123abcd", "veth12ab", "virbr0"]);
+        assert!(announce.add.is_empty());
+        assert!(announce.ignore.is_empty());
+        assert!(announce.interfaces.is_empty());
+    }
+
+    #[test]
+    fn what_is_told_is_read_from_network_announce() {
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; }
+            network { announce {
+                add = ["203.0.113.7", "203.0.113.8:443"];
+                ignore = ["172.17.0.0/16", "10.0.0.9"];
+                ignore_interfaces = [];
+                interfaces = ["enp*", "wg0"];
+            } }"#,
+        )
+        .unwrap();
+        let announce = config.network.endpoint_options().unwrap().announce;
+        assert_eq!(
+            announce.add,
+            [
+                "203.0.113.7".parse().unwrap(),
+                "203.0.113.8:443".parse().unwrap()
+            ]
+        );
+        assert_eq!(
+            announce.ignore,
+            [
+                "172.17.0.0/16".parse().unwrap(),
+                "10.0.0.9".parse().unwrap()
+            ]
+        );
+        assert!(announce.ignore_interfaces.is_empty());
+        assert_eq!(
+            announce.interfaces,
+            ["enp*".parse().unwrap(), "wg0".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_bad_announce_setting_names_its_key() {
+        for (setting, key) in [
+            (r#"add = ["nas.local"]"#, "network.announce.add"),
+            (r#"add = ["203.0.113.7:0"]"#, "network.announce.add"),
+            (r#"ignore = ["172.17.0.0/33"]"#, "network.announce.ignore"),
+            (r#"ignore = ["docker0"]"#, "network.announce.ignore"),
+            (
+                r#"ignore_interfaces = ["docker*", ""]"#,
+                "network.announce.ignore_interfaces",
+            ),
+            (r#"interfaces = [" "]"#, "network.announce.interfaces"),
+        ] {
+            let err = plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} network {{ announce {{ {setting}; }} }}"#
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::Invalid { key: k, .. } if *k == key),
+                "{setting}: {err:?}"
+            );
+        }
     }
 
     #[test]

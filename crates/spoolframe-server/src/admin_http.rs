@@ -166,13 +166,13 @@ pub struct TrustedProxies(Vec<Network>);
 
 /// An address range: `addr/prefix`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Network {
+pub struct Network {
     addr: IpAddr,
     prefix: u32,
 }
 
 impl Network {
-    fn contains(&self, ip: IpAddr) -> bool {
+    pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip.to_canonical()) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {
                 let mask = u32::MAX.checked_shl(32 - self.prefix).unwrap_or(0);

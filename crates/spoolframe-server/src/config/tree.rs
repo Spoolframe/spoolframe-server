@@ -125,7 +125,10 @@ impl Value {
         }
     }
 
-    /// A JSON value as UCL's; `null` has none.
+    /// A JSON value as UCL's; `null` has none. A `null` member of an
+    /// object is left out: it is how serde writes a `None` field (the
+    /// admin API's `PathMappingEntry.library`), and the typed parse reads
+    /// a missing key as `None`.
     pub fn from_json(json: &serde_json::Value) -> Result<Self, String> {
         use serde_json::Value as J;
         Ok(match json {
@@ -144,6 +147,7 @@ impl Value {
             ),
             J::Object(map) => Value::Object(
                 map.iter()
+                    .filter(|(_, v)| !v.is_null())
                     .map(|(k, v)| Ok((k.clone(), Value::from_json(v)?)))
                     .collect::<Result<_, String>>()?,
             ),
@@ -331,5 +335,17 @@ mod tests {
         let value = Value::from_json(&json).unwrap();
         assert_eq!(value.to_json(), json);
         assert!(Value::from_json(&serde_json::Value::Null).is_err());
+    }
+
+    /// serde writes a `None` field as `null`: in an object it is a key
+    /// left out, as the typed parse reads a missing one.
+    #[test]
+    fn a_null_member_of_an_object_is_left_out() {
+        let json = serde_json::json!([{ "library": null, "from": "/a", "to": "/b" }]);
+        assert_eq!(
+            Value::from_json(&json).unwrap().to_json(),
+            serde_json::json!([{ "from": "/a", "to": "/b" }])
+        );
+        assert!(Value::from_json(&serde_json::json!([null])).is_err());
     }
 }

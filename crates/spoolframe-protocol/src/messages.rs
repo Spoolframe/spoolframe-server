@@ -148,6 +148,11 @@ pub enum Request {
     },
     /// Who this request's session belongs to.
     WhoAmI,
+    /// Where this server can be dialled directly (PX-12): `ServerAddresses`.
+    /// Only for a session, never in `Hello`: its LAN and VPN addresses are
+    /// not for strangers. Asked while locked too, as for `WhoAmI`: they say
+    /// nothing about the user.
+    ServerAddresses,
     /// End this request's session (and only it). On a trusted device it
     /// forgets the device for this user too (P4-01): the next time is a
     /// full sign-in.
@@ -660,6 +665,14 @@ pub enum Reply {
     Search(SearchResults),
     Tracks(MediaTracks),
     WhoAmI(UserSummary),
+    /// Every address the server's endpoint has on its interfaces, with its
+    /// port (`ServerAddresses`): LAN, public and VPN ones, not loopback or
+    /// link-local. Each is text, as `192.168.1.10:4433` or
+    /// `[2001:db8::1]:4433`.
+    ServerAddresses {
+        #[serde(with = "socket_addrs_as_text")]
+        addrs: Vec<std::net::SocketAddr>,
+    },
     LoggedOut,
     Sessions {
         sessions: Vec<SessionInfo>,
@@ -1043,6 +1056,32 @@ pub enum Event {
     /// An event type this build does not know; ignore it.
     #[serde(other)]
     Unknown,
+}
+
+/// Socket addresses on the wire as text (`192.168.1.10:4433`,
+/// `[2001:db8::1]:4433`). CBOR is not a human-readable format to serde, so
+/// a bare `SocketAddr` would go as serde's enum of byte tuples, which a
+/// peer outside Rust would have to copy; text is also what JSON shows.
+mod socket_addrs_as_text {
+    use std::net::SocketAddr;
+
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(addrs: &[SocketAddr], s: S) -> Result<S::Ok, S::Error> {
+        let text: Vec<String> = addrs.iter().map(ToString::to_string).collect();
+        text.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<SocketAddr>, D::Error> {
+        Vec::<String>::deserialize(d)?
+            .iter()
+            .map(|text| {
+                text.parse()
+                    .map_err(|_| D::Error::custom(format!("not a socket address: {text:?}")))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

@@ -8,12 +8,19 @@
 //! starts one if there is none, Server › Media paths' check fills it in
 //! for the libraries it covers, and "Missing files" lists it. Rows on a
 //! page look for their own files as they are listed; a show's or album's
-//! count of missing files comes from the check. A check belongs to the
-//! catalog it ran on: when Plex servers, libraries or mappings change, the
-//! catalog is replaced and its checks no longer count.
+//! count of missing files comes from the check. A library's check belongs
+//! to the catalog it ran on: when Plex servers, libraries or mappings
+//! change, the catalog is replaced and its checks no longer count.
+//!
+//! Server › Media paths' last check of every library (P3-18) is kept by
+//! what it read instead: the mappings and the served libraries' folders
+//! ([`spoolframe_plex::PlexCatalog::paths_basis`]). A reorder of the libraries replaces
+//! the catalog but reads the same, so the check stands; it is kept in the
+//! state directory, so it stands after a restart too.
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 use jsonrpsee::core::RpcResult;
@@ -51,29 +58,82 @@ struct Entry {
     state: State,
 }
 
+/// Where the last check of every library is kept, in the state
+/// directory.
+const LAST_RUN_FILE: &str = "last-path-check.json";
+
+/// A check of every library, and what it read: a hash of its
+/// [`spoolframe_plex::PlexCatalog::paths_basis`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct KeptRun {
+    basis: String,
+    run: PathCheckRun,
+}
+
 /// Each library's last path check, by library id.
 #[derive(Debug, Default)]
 pub struct PathChecks {
     entries: Mutex<HashMap<String, Entry>>,
-    /// Server › Media paths' last check of every library (P3-18), and the
-    /// catalog it ran on.
-    last_run: Mutex<Option<(Weak<Composite>, PathCheckRun)>>,
+    /// Server › Media paths' last check of every library (P3-18).
+    last_run: Mutex<Option<KeptRun>>,
+    /// Where it is kept; in memory only without one.
+    file: Option<PathBuf>,
+}
+
+/// `basis` as kept: a hash, so the file holds no paths of its own.
+fn basis_hash(basis: &str) -> String {
+    blake3::hash(basis.as_bytes()).to_hex().to_string()
 }
 
 impl PathChecks {
-    /// Keep `run`, a check of every library on `on`, as the last one.
-    pub fn keep_run(&self, on: &Arc<Composite>, run: PathCheckRun) {
-        *self.last_run.lock().expect("never held across a panic") = Some((Arc::downgrade(on), run));
+    /// The checks, with the last check of every library kept in
+    /// `state_dir` and read from there now. A file that cannot be read is
+    /// logged and left for the next check to replace.
+    pub fn kept_in(state_dir: &Path) -> Self {
+        let file = state_dir.join(LAST_RUN_FILE);
+        let last = match std::fs::read(&file) {
+            Ok(bytes) => match serde_json::from_slice::<KeptRun>(&bytes) {
+                Ok(kept) => Some(kept),
+                Err(e) => {
+                    tracing::warn!(path = %file.display(), error = %e, "cannot read the last path check");
+                    None
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                tracing::warn!(path = %file.display(), error = %e, "cannot read the last path check");
+                None
+            }
+        };
+        Self {
+            entries: Mutex::default(),
+            last_run: Mutex::new(last),
+            file: Some(file),
+        }
     }
 
-    /// The last check of every library, while `on` is the catalog it ran
-    /// on: one of a catalog since replaced says what the old mappings
-    /// found.
-    pub fn last_run(&self, on: &Arc<Composite>) -> Option<PathCheckRun> {
+    /// Keep `run`, a check of every library that read `basis`, as the
+    /// last one: in memory, and in the state directory if there is one.
+    pub fn keep_run(&self, basis: &str, run: PathCheckRun) {
+        let kept = KeptRun {
+            basis: basis_hash(basis),
+            run,
+        };
+        if let Some(file) = &self.file
+            && let Err(e) = write_private(file, &kept)
+        {
+            tracing::warn!(path = %file.display(), error = %e, "cannot keep the last path check");
+        }
+        *self.last_run.lock().expect("never held across a panic") = Some(kept);
+    }
+
+    /// The last check of every library, while what it read is the same
+    /// as `basis`: one that read other mappings or folders says what they
+    /// found, not what these would.
+    pub fn last_run(&self, basis: &str) -> Option<PathCheckRun> {
         let last = self.last_run.lock().expect("never held across a panic");
-        let (ran_on, run) = last.as_ref()?;
-        let same = ran_on.upgrade().is_some_and(|c| Arc::ptr_eq(&c, on));
-        same.then(|| run.clone())
+        let kept = last.as_ref()?;
+        (kept.basis == basis_hash(basis)).then(|| kept.run.clone())
     }
 
     fn current(&self, on: &Arc<Composite>, library: &str) -> Option<State> {
@@ -180,6 +240,24 @@ impl PathChecks {
         }
         self.state(on, &key).0
     }
+}
+
+/// Write `kept` to `file` whole or not at all: a file beside it first,
+/// readable by the server's user only, then renamed over it.
+fn write_private(file: &Path, kept: &KeptRun) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = file.parent().unwrap_or(Path::new("."));
+    let partial = dir.join(format!(".{LAST_RUN_FILE}.new"));
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&partial)?;
+    out.write_all(&serde_json::to_vec(kept)?)?;
+    out.sync_all()?;
+    std::fs::rename(&partial, file)
 }
 
 fn kind_of(kind: CatalogKind) -> MediaKind {

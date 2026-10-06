@@ -115,6 +115,30 @@ impl PlexCatalog {
         Ok(reports)
     }
 
+    /// What a check of every served library reads besides the files
+    /// (P3-18): the path mappings, and each served section's key, title
+    /// and folders as Plex has them now, by key. The same text while those
+    /// are the same: the order libraries are listed in, and their
+    /// Spoolframe names, are not in it.
+    pub async fn paths_basis(&self) -> Result<String, CatalogError> {
+        use std::fmt::Write as _;
+        let mut basis = String::new();
+        for m in self.paths.mappings() {
+            let _ = writeln!(basis, "map {:?} {:?} {:?}", m.library, m.from, m.to);
+        }
+        let mut sections: Vec<_> = self
+            .sections()
+            .await?
+            .into_iter()
+            .filter(|s| s.kind.is_some() && self.serves(Some(&SectionKey(s.key.clone()))))
+            .collect();
+        sections.sort_by(|a, b| a.key.cmp(&b.key));
+        for s in sections {
+            let _ = writeln!(basis, "section {:?} {:?} {:?}", s.key, s.title, s.roots);
+        }
+        Ok(basis)
+    }
+
     async fn check_section(
         &self,
         dir: &Directory,

@@ -1,10 +1,27 @@
 //! Saved servers and their pins (P1-13, §19).
 //!
 //! A saved server is pinned to its `EndpointId`: that is its identity, and
-//! the client only ever connects to that key. Its addresses are hints that
-//! are refreshed on every connect. A server is saved only when the app pins
-//! it, after the user has seen its fingerprint (P1-21). A pin is replaced
-//! only by an explicit `trust_new_identity`, never by a connect (P1-13).
+//! the client only ever connects to that key. Its addresses are hints. A
+//! server is saved only when the app pins it, after the user has seen its
+//! fingerprint (P1-21). A pin is replaced only by an explicit
+//! `trust_new_identity`, never by a connect (P1-13).
+//!
+//! The addresses are every one the server was reached at (PX-12), each
+//! with when it was last seen, not only the last connection's: a phone
+//! that reached the server over its public IPv6 last time must still know
+//! the address it once reached it at over a VPN. A sighting adds to them;
+//! one not seen for [`MAX_ADDR_AGE`] goes at the next sighting, and only
+//! the newest [`MAX_KNOWN_ADDRS`] are kept.
+//!
+//! A signed-in device is also told the server's own addresses (PX-12):
+//! those on every interface it has, which this device may never have
+//! reached (a VPN address while the phone is off the VPN). They are kept
+//! the same way, marked [`AddrSource::Told`]. An address is told until the
+//! device reaches it; once reached it stays reached. Under the cap a told
+//! address never pushes out a reached one: every reached address is kept
+//! first, newest first, and told ones fill what room is left, newest
+//! first. So a server that tells many addresses (a host full of container
+//! bridges) cannot make a device forget where it has really reached it.
 
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,13 +30,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::{Storage, StorageError, keys};
 
+/// How long an address is kept without being seen again, in seconds.
+pub(crate) const MAX_ADDR_AGE: u64 = 30 * 24 * 60 * 60;
+/// How many addresses a server keeps: the newest.
+pub(crate) const MAX_KNOWN_ADDRS: usize = 32;
+
+/// How this device knows an address of a server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AddrSource {
+    /// A connection reached the server there.
+    #[default]
+    Reached,
+    /// The server said it has the address (`ServerAddresses`), and no
+    /// connection has reached it there yet.
+    Told,
+}
+
+/// An address a server was reached at or told, and when it last was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct KnownAddr {
+    pub addr: SocketAddr,
+    /// Unix seconds.
+    pub last_seen: u64,
+    /// Absent from a file written before PX-12 part 2, when every address
+    /// kept was one reached.
+    #[serde(default)]
+    pub source: AddrSource,
+}
+
 /// A server as it is stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SavedServer {
     pub name: String,
     pub endpoint_id: String,
+    /// Where it was reached, newest first. Changed only by
+    /// [`SavedServer::saw`].
     #[serde(default)]
-    pub last_known_addrs: Vec<SocketAddr>,
+    pub known_addrs: Vec<KnownAddr>,
+    /// What SDKs before PX-12 kept: the last connection's addresses. Read
+    /// into `known_addrs` on load, and never written.
+    #[serde(default, rename = "last_known_addrs", skip_serializing)]
+    legacy_addrs: Vec<SocketAddr>,
     /// The user confirmed its fingerprint. Pins from before P1-21 were
     /// never checked: false.
     #[serde(default)]
@@ -39,23 +91,26 @@ pub(crate) struct SavedServer {
 }
 
 impl SavedServer {
-    /// A key pinned now, from a connection to it just made.
+    /// A key pinned now, from a connection to it just made at `addrs`.
     pub fn pinned_now(
         name: String,
         endpoint_id: String,
-        last_known_addrs: Vec<SocketAddr>,
+        addrs: Vec<SocketAddr>,
         verified: bool,
     ) -> Self {
         let now = now();
-        Self {
+        let mut server = Self {
             name,
             endpoint_id,
-            last_known_addrs,
+            known_addrs: Vec::new(),
+            legacy_addrs: Vec::new(),
             verified,
             pinned_at: Some(now),
             verified_at: verified.then_some(now),
             last_connected_at: Some(now),
-        }
+        };
+        server.saw(addrs, now);
+        server
     }
 
     /// The user confirmed its fingerprint now, or took it back.
@@ -63,6 +118,101 @@ impl SavedServer {
         self.verified = verified;
         self.verified_at = verified.then(now);
     }
+
+    /// The server was reached at `addrs` at `now` (Unix seconds). They
+    /// join the addresses known, dated `now`; then any not seen for
+    /// [`MAX_ADDR_AGE`] go, and only the newest [`MAX_KNOWN_ADDRS`] stay.
+    /// Whether that changed which addresses are known, not only their
+    /// dates.
+    pub fn saw(&mut self, addrs: impl IntoIterator<Item = SocketAddr>, now: u64) -> bool {
+        self.sighted(addrs, now, AddrSource::Reached)
+    }
+
+    /// The server told this device at `now` that it has `addrs`. Kept as
+    /// [`SavedServer::saw`] keeps addresses reached, but a reached address
+    /// stays reached, and under the cap reached addresses go last.
+    pub fn told(&mut self, addrs: impl IntoIterator<Item = SocketAddr>, now: u64) -> bool {
+        self.sighted(addrs, now, AddrSource::Told)
+    }
+
+    fn sighted(
+        &mut self,
+        addrs: impl IntoIterator<Item = SocketAddr>,
+        now: u64,
+        source: AddrSource,
+    ) -> bool {
+        let before = self.addrs();
+        let mut known: Vec<KnownAddr> = Vec::new();
+        for addr in addrs.into_iter().map(canonical) {
+            if known.iter().any(|k| k.addr == addr) {
+                continue;
+            }
+            let was_reached = self
+                .known_addrs
+                .iter()
+                .any(|k| k.addr == addr && k.source == AddrSource::Reached);
+            known.push(KnownAddr {
+                addr,
+                last_seen: now,
+                source: if was_reached {
+                    AddrSource::Reached
+                } else {
+                    source
+                },
+            });
+        }
+        let older: Vec<KnownAddr> = std::mem::take(&mut self.known_addrs)
+            .into_iter()
+            .filter(|old| !known.iter().any(|k| k.addr == old.addr))
+            .collect();
+        known.extend(older);
+        // Stable: those seen together keep the order they were seen in.
+        known.sort_by_key(|k| std::cmp::Reverse(k.last_seen));
+        known.retain(|k| now.saturating_sub(k.last_seen) <= MAX_ADDR_AGE);
+        keep_reached_first(&mut known);
+        self.known_addrs = known;
+        let after = self.addrs();
+        after.len() != before.len() || after.iter().any(|a| !before.contains(a))
+    }
+
+    /// The addresses known, newest first.
+    pub fn addrs(&self) -> Vec<SocketAddr> {
+        self.known_addrs.iter().map(|k| k.addr).collect()
+    }
+
+    /// A server from a file written before PX-12: the last connection's
+    /// addresses become known from `now`. Not from when it last
+    /// connected, which may be over [`MAX_ADDR_AGE`] ago: they would be
+    /// dropped at the first sighting of any other address.
+    fn migrate(&mut self, now: u64) {
+        let legacy = std::mem::take(&mut self.legacy_addrs);
+        if !legacy.is_empty() {
+            self.saw(legacy, now);
+        }
+    }
+}
+
+/// Cut `known`, newest first, to [`MAX_KNOWN_ADDRS`]: the newest reached
+/// addresses, as many as fit, then the newest told ones in the room left.
+/// The order is kept.
+fn keep_reached_first(known: &mut Vec<KnownAddr>) {
+    let reached = known
+        .iter()
+        .filter(|k| k.source == AddrSource::Reached)
+        .count()
+        .min(MAX_KNOWN_ADDRS);
+    let mut room = [reached, MAX_KNOWN_ADDRS - reached];
+    known.retain(|k| {
+        let left = &mut room[usize::from(k.source == AddrSource::Told)];
+        let keep = *left > 0;
+        *left = left.saturating_sub(1);
+        keep
+    });
+}
+
+/// `addr`, an IPv4 address written as IPv6 (`::ffff:a.b.c.d`) as IPv4.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
 /// Now, in Unix seconds.
@@ -83,8 +233,8 @@ pub struct ServerEntry {
     /// The server's identity, hex.
     pub endpoint_id: String,
     pub name: String,
-    /// Where it was heard or last connected to: hints for dialing, never
-    /// its identity.
+    /// Where it was heard, reached, or said it is once signed in (PX-12):
+    /// hints for dialing, never its identity.
     pub addrs: Vec<SocketAddr>,
     /// The key's fingerprint (P1-21): what the user compares with the
     /// server's `spoolframe-server fingerprint`.
@@ -111,8 +261,15 @@ pub struct ServerEntry {
 pub(crate) async fn load(storage: &dyn Storage) -> Result<Vec<SavedServer>, StorageError> {
     match storage.data(keys::SERVERS).await? {
         None => Ok(Vec::new()),
-        Some(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|e| StorageError(format!("the saved servers cannot be read: {e}"))),
+        Some(bytes) => {
+            let mut servers: Vec<SavedServer> = serde_json::from_slice(&bytes)
+                .map_err(|e| StorageError(format!("the saved servers cannot be read: {e}")))?;
+            let now = now();
+            for server in &mut servers {
+                server.migrate(now);
+            }
+            Ok(servers)
+        }
     }
 }
 
@@ -147,13 +304,20 @@ mod tests {
             .await
             .unwrap();
         let servers = load(&storage).await.unwrap();
+        // When the address counts as seen is the next test's.
+        let seen = servers[0].known_addrs.first().map_or(0, |k| k.last_seen);
         assert_eq!(
             servers,
             [
                 SavedServer {
                     name: "Nimble".into(),
                     endpoint_id: ID.into(),
-                    last_known_addrs: vec!["192.168.1.10:4433".parse().unwrap()],
+                    known_addrs: vec![KnownAddr {
+                        addr: "192.168.1.10:4433".parse().unwrap(),
+                        last_seen: seen,
+                        source: AddrSource::Reached,
+                    }],
+                    legacy_addrs: Vec::new(),
                     verified: true,
                     pinned_at: None,
                     verified_at: None,
@@ -162,7 +326,8 @@ mod tests {
                 SavedServer {
                     name: "Cabin".into(),
                     endpoint_id: "cd34".into(),
-                    last_known_addrs: Vec::new(),
+                    known_addrs: Vec::new(),
+                    legacy_addrs: Vec::new(),
                     verified: false,
                     pinned_at: None,
                     verified_at: None,
@@ -177,6 +342,253 @@ mod tests {
         let storage = MemoryStorage::default();
         let mut server = SavedServer::pinned_now("Nimble".into(), ID.into(), Vec::new(), false);
         server.last_connected_at = Some(1_790_000_500);
+        save(&storage, &[server.clone()]).await.unwrap();
+        assert_eq!(load(&storage).await.unwrap(), [server]);
+    }
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn server() -> SavedServer {
+        SavedServer::pinned_now("Nimble".into(), ID.into(), Vec::new(), false)
+    }
+
+    #[test]
+    fn a_sighting_adds_to_the_addresses_and_never_replaces_them() {
+        let mut server = server();
+        server.saw(
+            [addr("192.168.1.10:4433"), addr("[2001:db8::1]:4433")],
+            1_000,
+        );
+        server.saw([addr("10.10.0.6:4433")], 2_000);
+        assert_eq!(
+            server.addrs(),
+            [
+                addr("10.10.0.6:4433"),
+                addr("192.168.1.10:4433"),
+                addr("[2001:db8::1]:4433"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_address_seen_again_is_dated_again_and_listed_once() {
+        let mut server = server();
+        server.saw([addr("192.168.1.10:4433"), addr("10.10.0.6:4433")], 1_000);
+        server.saw([addr("192.168.1.10:4433")], 2_000);
+        assert_eq!(
+            server.known_addrs,
+            [
+                KnownAddr {
+                    addr: addr("192.168.1.10:4433"),
+                    last_seen: 2_000,
+                    source: AddrSource::Reached,
+                },
+                KnownAddr {
+                    addr: addr("10.10.0.6:4433"),
+                    last_seen: 1_000,
+                    source: AddrSource::Reached,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_ipv4_address_in_ipv6_form_is_the_same_address() {
+        let mut server = server();
+        server.saw([addr("192.168.1.10:4433")], 1_000);
+        server.saw([addr("[::ffff:192.168.1.10]:4433")], 2_000);
+        assert_eq!(server.addrs(), [addr("192.168.1.10:4433")]);
+    }
+
+    #[test]
+    fn a_sighting_says_whether_an_address_was_new() {
+        let mut server = server();
+        assert!(server.saw([addr("192.168.1.10:4433")], 1_000));
+        assert!(!server.saw([addr("192.168.1.10:4433")], 2_000));
+        assert!(server.saw([addr("10.10.0.6:4433")], 3_000));
+    }
+
+    #[test]
+    fn an_address_not_seen_for_30_days_is_dropped_at_the_next_sighting() {
+        let mut server = server();
+        server.saw([addr("10.10.0.6:4433")], 1_000);
+        server.saw([addr("192.168.1.10:4433")], 1_000 + 30 * DAY);
+        assert_eq!(
+            server.addrs(),
+            [addr("192.168.1.10:4433"), addr("10.10.0.6:4433")],
+            "30 days is still kept"
+        );
+        server.saw([addr("192.168.1.10:4433")], 1_000 + 30 * DAY + 1);
+        assert_eq!(server.addrs(), [addr("192.168.1.10:4433")]);
+    }
+
+    #[test]
+    fn the_newest_32_addresses_are_kept() {
+        let mut server = server();
+        for port in 0..40u16 {
+            server.saw(
+                [SocketAddr::from(([10, 0, 0, 1], 1000 + port))],
+                1_000 + u64::from(port),
+            );
+        }
+        let kept = server.addrs();
+        assert_eq!(kept.len(), MAX_KNOWN_ADDRS);
+        assert_eq!(kept.first(), Some(&SocketAddr::from(([10, 0, 0, 1], 1039))));
+        assert_eq!(kept.last(), Some(&SocketAddr::from(([10, 0, 0, 1], 1008))));
+    }
+
+    #[test]
+    fn a_clock_set_back_does_not_drop_what_was_seen_later() {
+        let mut server = server();
+        server.saw([addr("10.10.0.6:4433")], 1_000 + 40 * DAY);
+        server.saw([addr("192.168.1.10:4433")], 1_000);
+        assert_eq!(
+            server.addrs(),
+            [addr("10.10.0.6:4433"), addr("192.168.1.10:4433")]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_addresses_and_their_dates_are_kept_with_the_servers() {
+        let storage = MemoryStorage::default();
+        let mut server = server();
+        server.saw(
+            [addr("192.168.1.10:4433"), addr("10.10.0.6:4433")],
+            1_790_000_000,
+        );
+        save(&storage, &[server.clone()]).await.unwrap();
+        assert_eq!(load(&storage).await.unwrap(), [server]);
+    }
+
+    #[tokio::test]
+    async fn the_last_connections_addresses_from_an_old_file_are_known_from_now() {
+        let storage = MemoryStorage::default();
+        storage
+            .set_data(keys::SERVERS, Some(OLD_FILE.as_bytes().to_vec()))
+            .await
+            .unwrap();
+        let before = now();
+        let servers = load(&storage).await.unwrap();
+        let after = now();
+        let [seen] = servers[0].known_addrs[..] else {
+            panic!("{:?}", servers[0].known_addrs);
+        };
+        assert_eq!(seen.addr, addr("192.168.1.10:4433"));
+        assert!((before..=after).contains(&seen.last_seen));
+
+        // Saved again, the file has them in the new form only.
+        save(&storage, &servers).await.unwrap();
+        let file = String::from_utf8(storage.data(keys::SERVERS).await.unwrap().unwrap()).unwrap();
+        assert!(!file.contains("last_known_addrs"), "{file}");
+        assert_eq!(load(&storage).await.unwrap(), servers);
+    }
+
+    fn sources(server: &SavedServer) -> Vec<(SocketAddr, AddrSource)> {
+        server
+            .known_addrs
+            .iter()
+            .map(|k| (k.addr, k.source))
+            .collect()
+    }
+
+    #[test]
+    fn a_told_address_is_kept_as_told_until_it_is_reached() {
+        let mut server = server();
+        server.saw([addr("192.168.1.10:4433")], 1_000);
+        assert!(server.told([addr("192.168.1.10:4433"), addr("10.10.0.2:4433")], 2_000));
+        assert_eq!(
+            sources(&server),
+            [
+                (addr("192.168.1.10:4433"), AddrSource::Reached),
+                (addr("10.10.0.2:4433"), AddrSource::Told),
+            ],
+            "told again, a reached address stays reached"
+        );
+        server.saw([addr("10.10.0.2:4433")], 3_000);
+        assert_eq!(
+            sources(&server),
+            [
+                (addr("10.10.0.2:4433"), AddrSource::Reached),
+                (addr("192.168.1.10:4433"), AddrSource::Reached),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_told_address_not_told_for_30_days_is_dropped() {
+        let mut server = server();
+        server.told([addr("10.10.0.2:4433")], 1_000);
+        server.saw([addr("192.168.1.10:4433")], 1_000 + 30 * DAY + 1);
+        assert_eq!(server.addrs(), [addr("192.168.1.10:4433")]);
+    }
+
+    #[test]
+    fn told_addresses_never_push_out_reached_ones() {
+        let mut server = server();
+        let reached: Vec<SocketAddr> = (0..20u16)
+            .map(|p| SocketAddr::from(([192, 168, 1, 10], 1000 + p)))
+            .collect();
+        server.saw(reached.clone(), 1_000);
+        // Newer, and more than the cap on their own.
+        let told: Vec<SocketAddr> = (0..40u16)
+            .map(|p| SocketAddr::from(([172, 17, 0, 1], 2000 + p)))
+            .collect();
+        server.told(told.clone(), 2_000);
+        let kept = server.addrs();
+        assert_eq!(kept.len(), MAX_KNOWN_ADDRS);
+        assert!(reached.iter().all(|a| kept.contains(a)), "{kept:?}");
+        assert_eq!(
+            kept.iter().filter(|a| told.contains(a)).count(),
+            MAX_KNOWN_ADDRS - reached.len()
+        );
+        // Newest first all the same: the told ones were seen last.
+        assert_eq!(kept.first(), Some(&told[0]));
+    }
+
+    #[test]
+    fn reached_addresses_push_out_told_ones_and_each_other_by_age() {
+        let mut server = server();
+        server.told([addr("10.10.0.2:4433")], 1_000);
+        for port in 0..40u16 {
+            server.saw(
+                [SocketAddr::from(([192, 168, 1, 10], 1000 + port))],
+                2_000 + u64::from(port),
+            );
+        }
+        let kept = server.addrs();
+        assert_eq!(kept.len(), MAX_KNOWN_ADDRS);
+        assert!(!kept.contains(&addr("10.10.0.2:4433")));
+        assert_eq!(kept.first(), Some(&addr("192.168.1.10:1039")));
+    }
+
+    #[tokio::test]
+    async fn an_address_saved_before_sources_were_kept_was_reached() {
+        let storage = MemoryStorage::default();
+        let file = format!(
+            r#"[{{"name": "Nimble", "endpoint_id": "{ID}",
+                 "known_addrs": [{{"addr": "192.168.1.10:4433", "last_seen": 1000}}]}}]"#
+        );
+        storage
+            .set_data(keys::SERVERS, Some(file.into_bytes()))
+            .await
+            .unwrap();
+        let servers = load(&storage).await.unwrap();
+        assert_eq!(
+            sources(&servers[0]),
+            [(addr("192.168.1.10:4433"), AddrSource::Reached)]
+        );
+    }
+
+    #[tokio::test]
+    async fn told_addresses_are_kept_as_told() {
+        let storage = MemoryStorage::default();
+        let mut server = server();
+        server.saw([addr("192.168.1.10:4433")], 1_790_000_000);
+        server.told([addr("10.10.0.2:4433")], 1_790_000_000);
         save(&storage, &[server.clone()]).await.unwrap();
         assert_eq!(load(&storage).await.unwrap(), [server]);
     }

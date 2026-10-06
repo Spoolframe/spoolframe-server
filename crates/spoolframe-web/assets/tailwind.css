@@ -339,6 +339,9 @@
   .flex-\[1_1_600px\] {
     flex: 1 1 600px;
   }
+  .shrink {
+    flex-shrink: 1;
+  }
   .shrink-0 {
     flex-shrink: 0;
   }
@@ -1460,6 +1463,13 @@
     color: var(--ctp-subtext1);
     white-space: nowrap;
   }
+  .pill-trusted {
+    background: var(--ctp-green);
+    @supports (color: color-mix(in lab, red, red)) {
+      background: color-mix(in srgb, var(--ctp-green) 18%, transparent);
+    }
+    color: var(--ctp-green);
+  }
   .pill-admin {
     background: var(--ctp-teal);
     @supports (color: color-mix(in lab, red, red)) {
@@ -1480,6 +1490,82 @@
   }
   .state-bad {
     color: var(--ctp-red);
+  }
+  .device-list {
+    container-type: inline-size;
+  }
+  .device-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .device-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid var(--ctp-surface0);
+    border-radius: 10px;
+    font-size: 14px;
+  }
+  .device-head {
+    display: none;
+  }
+  .device-switches {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .device-switch {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+  .device-switch-label {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--ctp-subtext0);
+  }
+  .device-do {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  @container (min-width: 520px) {
+    .device-rows {
+      gap: 0;
+    }
+    .device-row {
+      grid-template-columns: minmax(0, 1fr) auto 96px;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 0;
+      border: 0;
+      border-top: 1px solid var(--ctp-surface0);
+      border-radius: 0;
+    }
+    .device-head {
+      display: grid;
+      border-top: 0;
+      padding-top: 0;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--ctp-subtext0);
+    }
+    .device-switches {
+      grid-template-columns: repeat(3, 72px);
+      justify-items: center;
+    }
+    .device-switch {
+      align-items: center;
+    }
+    .device-row .device-switch-label {
+      display: none;
+    }
+    .device-do {
+      justify-content: flex-end;
+    }
   }
   .switch {
     width: 42px;
@@ -2533,6 +2619,21 @@
   .box:disabled {
     cursor: default;
     opacity: 0.6;
+  }
+  .remember-box {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--ctp-surface1);
+    background: var(--ctp-mantle);
+    font-size: 14px;
+    text-align: left;
+  }
+  .remember-box .box {
+    margin-top: 1px;
+    flex-shrink: 0;
   }
   .lines > .library-line {
     justify-content: flex-start;

@@ -2001,3 +2001,104 @@
   Stopping trust ends the user's sessions on that device. `user devices`
   shows "trusted" and "opens at start". `user trust <name> --device
   <name|prefix> [--off | --auto-login]` sets trust.
+- Trusted devices on the web (P4-03):
+  - The web approval page (`/auth/device`) shows "Remember this device",
+    ticked, when the device asked to be remembered. Approved as is, the
+    device is trusted; unticked, it signs in just this once. A device
+    that did not ask shows no box and is never trusted. Approving after
+    the recent sign-in has lapsed asks "Confirm it's you", then approves.
+  - My profile's "Devices and sessions" lists each device the user has
+    signed in on, with or without a live session, beside the browsers'
+    and the CLI's sessions. Each device has three switches: PIN, Trusted
+    (with a Trusted pill) and Auto-login. A browser's row shows "—" for
+    each. The Profile PIN card keeps only setting, changing and removing
+    the PIN.
+  - An admin's user page shows the same three switches per device, made
+    through `admin.userSetDeviceTrust` and `admin.userSetPinRequired`.
+  - On both pages, "Stop trusting" asks first. It says that the user is
+    signed out on that device at once and needs a full sign-in there.
+    Turning auto-login on says first that the PIN is no longer asked for
+    there and that the device no longer opens anyone else at start.
+    Asking for the PIN where auto-login is on says first that auto-login
+    turns off. Each change that needs a recent sign-in asks "Confirm it's
+    you", then is made. A toast says what was done.
+  - Signing out a trusted device from My profile says that it is no
+    longer trusted, since P4-01 ends trust on any revocation of the
+    device's session.
+- Saved servers remember every direct address (PX-12). The SDK kept only
+  the addresses of the last connection's paths, and each connect replaced
+  them: a phone that last reached the server over its public IPv6 forgot
+  the address it had reached it at over a VPN. Now each saved server keeps
+  a set of addresses, each with when it was last seen. A connect adds
+  every address it reached and never removes any. The server announces its
+  addresses inside the connection, and iroh opens a path to each one it
+  can reach, then closes all but the best within a millisecond. The SDK
+  follows those path events for as long as the connection is open, so an
+  address reached only for that moment is saved too. An address the server
+  announces that this device cannot reach then (a VPN address while the
+  device is off the VPN) is not saved: iroh does not show it. An address
+  not seen for 30 days is dropped at the next sighting, and only the
+  newest 32 are kept. Every one is dialled, with the addresses given by
+  the app and heard on the LAN, and iroh takes whichever answers. A
+  servers file from an older SDK keeps its addresses, as seen at the first
+  load. `ServerEntry.addrs` lists them all, the address in use first. No
+  wire or API change.
+- `Client::profiles` lists the sessions left when the server signs the
+  device out while it runs (PX-10). It read the kept sessions, then asked
+  the server after each one; a `close::SIGNED_OUT` that landed between the
+  two made that ask `SdkError::SignInRequired`, and the whole list failed
+  with it. Now that session is left out and its profile needs a password,
+  as for one the server answers `Unauthenticated`. No API change.
+- A signed-in device is told the server's addresses (PX-12). Iroh shows a
+  client only the paths that opened, so a phone that never reached the
+  server's VPN address could not learn it, though iroh announces it inside
+  the connection. The new `Request::ServerAddresses` answers
+  `Reply::ServerAddresses { addrs }`: every address on the server
+  endpoint's interfaces, with its port, but loopback, link-local and
+  unspecified ones. The addresses go as text on the wire. Only a live
+  session is told (`Unauthenticated` otherwise), never `Hello`; a locked
+  profile is told too. No new revision: a server without it answers
+  `Unsupported`. The SDK asks after each sign-in or resume, and on each
+  new connection when it keeps a session there, and saves what it is told
+  with the server's addresses, marked as told. The same 30-day age-out and
+  32-address cap apply, but a told address never pushes out a reached one:
+  the newest reached addresses are kept first, and told ones fill the room
+  left. A told address that a connection reaches becomes reached. A
+  servers file from before keeps its addresses as reached. No API change.
+- `network.announce` chooses which addresses a signed-in device is told
+  (PX-12). The server told every address on every interface, and on a
+  host with Docker that includes its bridges (172.17.0.1, 172.18.0.1),
+  which no device reaches. Told now are the addresses on
+  `announce.interfaces` (each interface when empty), less those on
+  `announce.ignore_interfaces`, less those in `announce.ignore`
+  (addresses and CIDR ranges), plus `announce.add` (`ip` with the
+  server's port, or `ip:port`), which is told even when an ignore matches
+  it. Interface names take `*` and `?`. `ignore_interfaces` is
+  `["docker*", "br-*", "veth*", "virbr*"]` by default, the others empty.
+  A bad address, range or empty name is a config error naming the key.
+  Restart settings; the interfaces are read each time a device asks.
+  `spoolframe-server status`, the web UI's server page and the start-up
+  log show the addresses told now (`ServerStatus.told_addresses`, a new
+  required field).
+- A path mapping for every library saves (P3-18). The wizard's Paths
+  step failed on Continue with "value: null is not a value" for a
+  mapping added by hand: the admin API's `PathMappingEntry.library` is
+  `None` there, which serde writes as `"library": null`. A setting's
+  value now leaves out a `null` member of an object, as a missing key; a
+  `null` setting, or one in a list, is still refused.
+- The wizard's Paths step keeps saved mappings that no library folder
+  is under (P3-18). Its rows show only the folders of the libraries
+  served, and Continue saved only the rows and the mappings added there,
+  so a mapping for a library not served yet, or for a prefix no folder is
+  under, was erased. Those now load as extra rows, under their library
+  or "Every library"; with the check failed, every saved mapping does.
+- Server › Media paths keeps its last check through a library reorder
+  and a restart (P3-18). The check was kept against the catalog object
+  it ran on, and any library change (even a reorder) or a restart
+  replaced that, so the page lost it. It is now kept while what it read
+  is the same: the path mappings, and each served Plex section's key,
+  title and folders (`PlexCatalog::paths_basis`, asked of Plex when the
+  page loads). A changed mapping or folder still drops it. It is saved
+  in the state directory as `last-path-check.json` (mode 0600, written
+  whole through a temporary file), holding a hash of what it read rather
+  than the paths.

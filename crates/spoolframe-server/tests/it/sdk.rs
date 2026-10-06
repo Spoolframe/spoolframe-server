@@ -321,6 +321,34 @@ async fn an_ended_session_keeps_its_profile_which_needs_a_sign_in() {
     server.stop().await;
 }
 
+/// "Who's watching" read the sessions kept just before the server signed
+/// the device out (PX-10), and asks after one only once the sign-out has
+/// ended it: that profile needs a password, as any ended one does, and the
+/// list is not an error. Putting the token back after the sign-out makes
+/// that interleaving certain.
+#[tokio::test]
+async fn profiles_read_across_a_sign_out_list_it_as_ended() {
+    let (server, client, storage) = ready("profiles-across-sign-out").await;
+    alice(&server, &client).await;
+    let key = format!("sessions/{}", id(&server));
+    let before = storage.secret(&key).await.unwrap();
+    let mut signed_out = client.signed_out(&id(&server)).unwrap();
+    server.store.disable_user("alice").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), signed_out.next())
+        .await
+        .expect("no sign-out within 5 s")
+        .expect("the client is open");
+    storage.set_secret(&key, before).await.unwrap();
+
+    assert!(client.profiles(&id(&server)).await.unwrap().is_empty());
+    assert_eq!(
+        saved(&client, &server).await,
+        [("alice".to_owned(), ProfileSignIn::Password)]
+    );
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn signing_in_again_makes_an_ended_profile_automatic() {
     let (server, client, _) = ready("ended-again").await;

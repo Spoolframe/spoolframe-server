@@ -70,6 +70,11 @@ impl PathMap {
         Self { mappings }
     }
 
+    /// The rules, in their order.
+    pub fn mappings(&self) -> &[PathMapping] {
+        &self.mappings
+    }
+
     /// Map `plex` from the library titled `library`. A rule scoped to that
     /// library wins over a global one; within each group the longest
     /// matching `from` wins. No match leaves the path as it is, refused

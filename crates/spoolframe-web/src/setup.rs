@@ -310,6 +310,27 @@ pub fn mappings(rows: &[PathRow], extra: &[PathMappingEntry]) -> Vec<PathMapping
         .collect()
 }
 
+/// Of the saved `mappings`, those no folder of `checks` is under: the
+/// rows do not show them, so the Paths step keeps them as extra rows, or
+/// Continue would save the rows' mappings without them.
+pub fn unattached(
+    checks: &[LibraryPathCheck],
+    mappings: &[PathMappingEntry],
+) -> Vec<PathMappingEntry> {
+    mappings
+        .iter()
+        .filter(|m| {
+            !checks.iter().any(|check| {
+                check
+                    .roots
+                    .iter()
+                    .any(|root| mapped(std::slice::from_ref(*m), &check.library, root).is_some())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// A library's sample, as its row says it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sample {
@@ -514,6 +535,46 @@ mod tests {
                 rule(Some("Kids"), "/mnt/kids", "/srv/kids"),
             ]
         );
+    }
+
+    /// Saved mappings that no library folder shows are kept on Continue
+    /// (P3-18): a rule for a library not served yet, or for a prefix no
+    /// folder is under.
+    #[test]
+    fn saved_mappings_no_folder_shows_are_kept_as_extra_ones() {
+        let checks = [
+            check("Movies", "/data/movies", 5, 5),
+            check("Kids", "/mnt/kids", 5, 5),
+        ];
+        let saved = [
+            rule(Some("Kids"), "/mnt/kids", "/srv/kids"),
+            rule(None, "/data", "/mnt/nas"),
+            rule(None, "/music", "/srv/music"),
+            rule(Some("Documentaries"), "/data/docs", "/srv/docs"),
+            rule(Some("Movies"), "/elsewhere", "/srv/elsewhere"),
+        ];
+        let extra = unattached(&checks, &saved);
+        assert_eq!(
+            extra,
+            [
+                rule(None, "/music", "/srv/music"),
+                rule(Some("Documentaries"), "/data/docs", "/srv/docs"),
+                rule(Some("Movies"), "/elsewhere", "/srv/elsewhere"),
+            ]
+        );
+        // Continue saves the rows' mappings and those.
+        assert_eq!(
+            mappings(&rows(&checks, &saved), &extra),
+            [
+                rule(Some("Movies"), "/data/movies", "/mnt/nas/movies"),
+                rule(Some("Kids"), "/mnt/kids", "/srv/kids"),
+                rule(None, "/music", "/srv/music"),
+                rule(Some("Documentaries"), "/data/docs", "/srv/docs"),
+                rule(Some("Movies"), "/elsewhere", "/srv/elsewhere"),
+            ]
+        );
+        // With no folders known (the check failed), every one is kept.
+        assert_eq!(unattached(&[], &saved), saved);
     }
 
     #[test]

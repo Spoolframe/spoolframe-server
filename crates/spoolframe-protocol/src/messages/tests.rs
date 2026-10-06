@@ -211,6 +211,7 @@ fn every_request_round_trips() {
         },
         Request::Tracks { id },
         Request::WhoAmI,
+        Request::ServerAddresses,
         Request::Logout,
         Request::ListSessions,
         Request::StartPlayback {
@@ -440,6 +441,12 @@ fn every_reply_round_trips() {
         },
         Reply::Search(search_results()),
         Reply::Tracks(MediaTracks::default()),
+        Reply::ServerAddresses {
+            addrs: vec![
+                "192.168.1.10:4433".parse().unwrap(),
+                "[2001:db8::1]:4433".parse().unwrap(),
+            ],
+        },
         Reply::WhoAmI(UserSummary {
             user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
             username: "alice".into(),
@@ -1392,4 +1399,45 @@ fn a_sign_in_must_say_whether_to_remember() {
     let without: Result<Request, _> =
         serde_json::from_value(serde_json::json!({"type": "begin_device_sign_in"}));
     assert!(without.is_err(), "{without:?}");
+}
+
+/// The server's addresses (PX-12) need a session, may be asked again, and
+/// go as text: what an app sees in JSON is what is in the CBOR.
+#[test]
+fn server_addresses_need_a_session_and_go_as_text() {
+    use crate::policy::retry_safe;
+    assert!(!Request::ServerAddresses.is_pre_auth());
+    assert!(retry_safe(&Request::ServerAddresses));
+    assert_eq!(
+        serde_json::to_value(Request::ServerAddresses).unwrap(),
+        serde_json::json!({"type": "server_addresses"})
+    );
+    let reply = Reply::ServerAddresses {
+        addrs: vec![
+            "10.10.0.2:4433".parse().unwrap(),
+            "[2001:db8::1]:4433".parse().unwrap(),
+        ],
+    };
+    assert_eq!(
+        serde_json::to_value(&reply).unwrap(),
+        serde_json::json!({
+            "type": "server_addresses", "addrs": ["10.10.0.2:4433", "[2001:db8::1]:4433"]
+        })
+    );
+    let cbor: ciborium::Value = ciborium::from_reader(&codec::encode(&reply).unwrap()[..]).unwrap();
+    let text = ciborium::Value::Text("10.10.0.2:4433".into());
+    let addrs = cbor
+        .as_map()
+        .and_then(|m| m.iter().find(|(k, _)| k.as_text() == Some("addrs")))
+        .and_then(|(_, v)| v.as_array())
+        .unwrap_or_else(|| panic!("{cbor:?}"));
+    assert_eq!(addrs.first(), Some(&text), "{cbor:?}");
+}
+
+#[test]
+fn a_server_address_that_is_not_one_does_not_decode() {
+    let bad: Result<Reply, _> = serde_json::from_value(serde_json::json!({
+        "type": "server_addresses", "addrs": ["nimble.local:4433"]
+    }));
+    assert!(bad.is_err(), "{bad:?}");
 }

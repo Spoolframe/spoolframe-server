@@ -842,6 +842,9 @@ mod web {
             .set_device_trust(tv_id.clone(), false, false)
             .await
             .unwrap();
+        // Its session ended, the server closes the connection as signed
+        // out; a new one made before that lands is closed with it.
+        tv.conn.closed().await;
         let tv = tv.reconnect(&server).await;
         tv.hello().await;
         assert!(trusted(&tv).await.is_empty());
@@ -879,6 +882,9 @@ mod web {
         })
         .await
         .unwrap();
+        // Its session ended, the server closes the connection as signed
+        // out; a new one made before that lands is closed with it.
+        tv.conn.closed().await;
         let tv = tv.reconnect(&server).await;
         tv.hello().await;
         assert!(trusted(&tv).await.is_empty());
@@ -897,6 +903,46 @@ mod web {
         server.stop().await;
     }
 
+    /// The admin's user page (P4-03): stopping trust on another user's
+    /// device ends that user's session there, and the device no longer
+    /// offers the profile.
+    #[tokio::test]
+    async fn an_admin_stops_trusting_another_user_s_device_and_signs_them_out_there() {
+        let server = server("trust-web-admin-off").await;
+        make_admin(&server, "bob").await;
+        let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
+        let tv = device(&server, "Living room TV").await;
+        remembered(&tv).await;
+        let tv_id = tv.endpoint.id().to_string();
+        let root = on_the_web(web, "bob", "battery staple").await;
+        assert!(
+            root.user_sessions("alice".into())
+                .await
+                .unwrap()
+                .iter()
+                .any(|s| s.endpoint_id.as_deref() == Some(tv_id.as_str()))
+        );
+
+        root.user_set_device_trust("alice".into(), tv_id.clone(), false, false)
+            .await
+            .unwrap();
+        assert!(!root.user_devices("alice".into()).await.unwrap()[0].trusted);
+        assert!(
+            root.user_sessions("alice".into())
+                .await
+                .unwrap()
+                .iter()
+                .all(|s| s.endpoint_id.as_deref() != Some(tv_id.as_str()))
+        );
+        // Its session ended, the server closes the connection as signed
+        // out; a new one made before that lands is closed with it.
+        tv.conn.closed().await;
+        let tv = tv.reconnect(&server).await;
+        tv.hello().await;
+        assert!(trusted(&tv).await.is_empty());
+        server.stop().await;
+    }
+
     #[tokio::test]
     async fn disabling_a_user_from_the_web_ends_their_trust() {
         let server = server("trust-web-disable").await;
@@ -907,36 +953,50 @@ mod web {
         let root = on_the_web(web, "bob", "battery staple").await;
         root.user_disable("alice".into()).await.unwrap();
         root.user_enable("alice".into()).await.unwrap();
+        // Its session ended, the server closes the connection as signed
+        // out; a new one made before that lands is closed with it.
+        tv.conn.closed().await;
         let tv = tv.reconnect(&server).await;
         tv.hello().await;
         assert!(trusted(&tv).await.is_empty());
         server.stop().await;
     }
 
-    /// The web approval page (P4-03): approved as is, a TV that asked is
-    /// remembered; unticked, it signs in just this once.
+    /// The web approval page (P4-03), through the admin API as the page
+    /// calls it: approved as is, a TV that asked is remembered; unticked,
+    /// it signs in just this once. The page shows no box to a TV that did
+    /// not ask, and a `remember` sent anyway trusts nothing.
     #[tokio::test]
     async fn a_web_approval_decides_whether_the_tv_is_remembered() {
         let server = server("trust-web-approve").await;
         let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
         let alice = on_the_web(web, "alice", PASSWORD).await;
-        for approved in [false, true] {
-            let (tv, waiting, code) = tv_asks(&server, true).await;
-            assert!(
+        for (asked, approved, expected) in [
+            (true, false, false),
+            (true, true, true),
+            (false, true, false),
+        ] {
+            let (tv, waiting, code) = tv_asks(&server, asked).await;
+            assert_eq!(
                 alice
                     .device_sign_in_lookup(code.clone())
                     .await
                     .unwrap()
-                    .remember
+                    .remember,
+                asked
             );
             alice.device_sign_in_approve(code, approved).await.unwrap();
             match waiting.await.unwrap() {
                 Response::Ok(Reply::LoggedIn { remembered, .. }) => {
-                    assert_eq!(remembered, approved);
+                    assert_eq!(remembered, expected, "asked {asked}, approved {approved}");
                 }
                 other => panic!("{other:?}"),
             }
-            assert_eq!(trusted_names(&tv).await.len(), usize::from(approved));
+            assert_eq!(
+                trusted_names(&tv).await.len(),
+                usize::from(expected),
+                "asked {asked}, approved {approved}"
+            );
             tv.close().await;
         }
         server.stop().await;

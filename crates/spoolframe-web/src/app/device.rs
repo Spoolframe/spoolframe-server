@@ -6,8 +6,10 @@
 use dioxus::prelude::*;
 use spoolframe_admin_api::{DeviceSignIn, MeApiClient, UserInfo};
 
+use super::profile::{ConfirmItsYou, asks_to_confirm};
 use super::{Alert, Centered, Field, Route, SignInForm, http, icons, rpc};
 use crate::logic::{ApiError, display_code};
+use crate::trust;
 
 /// Where the page is.
 const PATH: &str = "/auth/device";
@@ -115,23 +117,30 @@ fn Consent(user: UserInfo, code: String, server: String, on_switch: EventHandler
     let mut outcome = use_signal(|| None::<Outcome>);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
+    // "Remember this device", ticked as the page opens (WebApproveStates):
+    // shown only when the device asked, and the approver's answer decides
+    // (P4-01).
+    let mut ticked = use_signal(|| true);
+    // Approving needs a recent sign-in: "Confirm it's you", then again.
+    let confirming = use_signal(|| None::<String>);
     let who = user.display_name.clone().unwrap_or(user.username.clone());
     let decide = use_callback(move |decision: Outcome| {
         let code = code.clone();
+        let asked = matches!(&*device.peek(), Some(Ok(d)) if d.remember);
+        let remember = trust::remembers(asked, ticked());
         busy.set(true);
         spawn(async move {
             let decided = async {
                 let client = rpc::client().await?;
                 match decision {
-                    // Never remembered until this page shows the device's
-                    // request and lets the approver untick it (P4-03).
-                    Outcome::Approved => client.device_sign_in_approve(code, false).await,
+                    Outcome::Approved => client.device_sign_in_approve(code, remember).await,
                     Outcome::Denied => client.device_sign_in_deny(code).await,
                 }
                 .map_err(rpc::error)
             };
             match decided.await {
                 Ok(()) => outcome.set(Some(decision)),
+                Err(e) if asks_to_confirm(&e, confirming, "signing in a device") => {}
                 Err(e) => error.set(Some(e.explain())),
             }
             busy.set(false);
@@ -148,6 +157,7 @@ fn Consent(user: UserInfo, code: String, server: String, on_switch: EventHandler
     };
     let current = device.read().clone();
     rsx! {
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| decide.call(Outcome::Approved) }
         div { class: "glass-card glass-card-wide",
             match current {
                 None => rsx! { p { class: "m-0 text-center text-ctp-subtext0", "Loading…" } },
@@ -167,6 +177,9 @@ fn Consent(user: UserInfo, code: String, server: String, on_switch: EventHandler
                                 icons::Mark { size: 52 }
                                 h1 { class: "m-0 text-2xl font-bold text-ctp-green", "Signed in" }
                                 p { class: "m-0 text-[15px] text-ctp-subtext1", "{name} is now signed in as " b { "{who}" } ". You can close this page." }
+                                if trust::remembers(device.remember, ticked()) {
+                                    p { class: "m-0 text-[13px] text-ctp-subtext0", "It is remembered. You can stop trusting it from My profile." }
+                                }
                             }
                             Link { class: "btn-secondary", to: Route::Start {}, "Open the web UI" }
                         },
@@ -195,6 +208,24 @@ fn Consent(user: UserInfo, code: String, server: String, on_switch: EventHandler
                                 }
                                 p { class: "mono m-0 text-[13px] text-ctp-subtext0",
                                     "{device.client_name} · code {shown}"
+                                }
+                            }
+                            if let Some(line) = trust::remember_line(device.remember, ticked()) {
+                                div { class: "remember-box",
+                                    button {
+                                        class: if ticked() { "box box-on" } else { "box" },
+                                        r#type: "button",
+                                        role: "checkbox",
+                                        aria_checked: "{ticked()}",
+                                        aria_labelledby: "remember-label",
+                                        disabled: busy(),
+                                        onclick: move |_| ticked.toggle(),
+                                        if ticked() { icons::Check {} }
+                                    }
+                                    span { class: "flex flex-col gap-0.5",
+                                        b { id: "remember-label", "Remember this device" }
+                                        span { class: "text-[13px] text-ctp-subtext0", "{line}" }
+                                    }
                                 }
                             }
                             if let Some(text) = error() {

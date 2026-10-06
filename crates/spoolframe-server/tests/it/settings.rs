@@ -195,6 +195,34 @@ async fn a_path_mapping_set_at_run_time_is_used_at_once() {
     assert!(saved.contains("/data/movies"), "{saved}");
 }
 
+/// The web UI's "Every library" row (P3-18): a mapping with no library
+/// goes as the admin API's type serializes it, `"library": null`.
+#[tokio::test]
+async fn a_mapping_for_every_library_is_saved_as_the_web_ui_sends_it() {
+    let pms = pms().await;
+    let (_addr, root, dir) = served(
+        "every-library-mapping",
+        &format!(r#"plex {{ url = "{}"; }}"#, pms.uri()),
+    )
+    .await;
+    let media = dir.as_ref().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    std::fs::write(media.join("a.mkv"), b"movie").unwrap();
+    let mapping = spoolframe_admin_api::PathMappingEntry {
+        library: None,
+        from: "/data/movies".into(),
+        to: media.display().to_string(),
+    };
+    root.setting_set(
+        "plex.path_mapping".into(),
+        serde_json::to_value(vec![mapping]).unwrap(),
+    )
+    .await
+    .unwrap();
+    let after = root.plex_check_paths(None).await.unwrap().reports;
+    assert_eq!((after[0].ok, after[0].no_mapping.count), (1, 0));
+}
+
 #[tokio::test]
 async fn the_last_check_of_every_file_is_kept_with_its_time_until_the_mappings_change() {
     let pms = pms().await;
