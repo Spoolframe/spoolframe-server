@@ -51,6 +51,22 @@ pub enum UserCommand {
     /// The devices a user has signed in from, and where their PIN is asked
     /// for.
     Devices { username: String },
+    /// Trust one of a user's devices, so it opens their profile without a
+    /// password (`--off`: stop, which also ends their sessions there).
+    /// Admins only.
+    Trust {
+        username: String,
+        /// The device's name, as `user devices` lists it, or the start of
+        /// its endpoint id.
+        #[arg(long)]
+        device: String,
+        #[arg(long)]
+        off: bool,
+        /// Also open their profile there at start (turns the PIN off there,
+        /// and auto-login off for the device's other users).
+        #[arg(long, conflicts_with = "off")]
+        auto_login: bool,
+    },
     /// A user's live sessions, on every device and the web.
     Sessions { username: String },
     /// End one of a user's sessions, by the id `user sessions` shows.
@@ -259,6 +275,26 @@ async fn pin_set(listen: SocketAddr, username: &str, from_stdin: bool) -> Result
     result?;
     println!("PIN set for {username}");
     Ok(())
+}
+
+/// One line of `user devices`: name, endpoint id's start, last use (as
+/// `when` says it), then what applies.
+fn device_line(d: &spoolframe_admin_api::DeviceEntry, when: &str) -> String {
+    let mut line = format!(
+        "{}  {}  last used {when}",
+        d.name.as_deref().unwrap_or("(unnamed)"),
+        &d.endpoint_id[..d.endpoint_id.len().min(10)],
+    );
+    if d.trusted {
+        line.push_str("  trusted");
+    }
+    if d.auto_login {
+        line.push_str("  opens at start");
+    }
+    if d.pin_required {
+        line.push_str("  PIN required");
+    }
+    line
 }
 
 /// The endpoint of `username`'s device named `device` (or whose endpoint
@@ -489,14 +525,25 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
         },
         UserCommand::Devices { username } => {
             for d in api.user_devices(username).await.map_err(api_error)? {
-                println!(
-                    "{}  {}  last used {}{}",
-                    d.name.as_deref().unwrap_or("(unnamed)"),
-                    &d.endpoint_id[..d.endpoint_id.len().min(10)],
-                    when(d.last_seen_at),
-                    if d.pin_required { "  PIN required" } else { "" }
-                );
+                println!("{}", device_line(&d, &when(d.last_seen_at)));
             }
+        }
+        UserCommand::Trust {
+            username,
+            device,
+            off,
+            auto_login,
+        } => {
+            let endpoint = find_device(api, &username, &device).await?;
+            api.user_set_device_trust(username.clone(), endpoint, !off, auto_login)
+                .await
+                .map_err(api_error)?;
+            let state = match (off, auto_login) {
+                (true, _) => "no longer trusted; their sessions there ended",
+                (false, true) => "trusted, and opens their profile at start",
+                (false, false) => "trusted",
+            };
+            println!("{device} is {state} for {username}");
         }
         UserCommand::Sessions { username } => {
             for s in api.user_sessions(username).await.map_err(api_error)? {
@@ -610,6 +657,34 @@ mod tests {
             "2000-02-29 13:07 UTC"
         );
         assert_eq!(when(1_790_000_000), "2026-09-21 14:13 UTC");
+    }
+
+    #[test]
+    fn the_devices_list_says_what_applies_on_each() {
+        let tv = spoolframe_admin_api::DeviceEntry {
+            endpoint_id: "ab".repeat(32),
+            name: Some("TV".into()),
+            platform: None,
+            last_seen_at: 0,
+            pin_required: false,
+            trusted: true,
+            auto_login: true,
+        };
+        assert_eq!(
+            device_line(&tv, "now"),
+            "TV  ababababab  last used now  trusted  opens at start"
+        );
+        let plain = spoolframe_admin_api::DeviceEntry {
+            name: None,
+            pin_required: true,
+            trusted: false,
+            auto_login: false,
+            ..tv
+        };
+        assert_eq!(
+            device_line(&plain, "now"),
+            "(unnamed)  ababababab  last used now  PIN required"
+        );
     }
 
     #[test]

@@ -68,6 +68,13 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
         ),
         ("userClearPin", outcome(root.user_clear_pin(bob()).await)),
         (
+            "userSetDeviceTrust",
+            outcome(
+                root.user_set_device_trust(bob(), "ab".repeat(32), true, false)
+                    .await,
+            ),
+        ),
+        (
             "userSetPinRequired(false)",
             outcome(
                 root.user_set_pin_required(bob(), "ab".repeat(32), false)

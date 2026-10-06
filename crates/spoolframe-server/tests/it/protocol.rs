@@ -31,6 +31,7 @@ fn login(username: &str, password: &str) -> Request {
     Request::LoginPassword(LoginPassword {
         username: username.into(),
         password: password.into(),
+        remember: false,
     })
 }
 

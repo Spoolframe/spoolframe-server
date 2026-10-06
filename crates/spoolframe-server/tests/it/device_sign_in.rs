@@ -30,7 +30,10 @@ async fn tv_begins(server: &TestServer) -> (TestClient, String, String) {
     let tv = server.client().await;
     tv.hello_from(Platform::Tvos, Some("Living room TV"), None)
         .await;
-    match tv.call(None, Request::BeginDeviceSignIn).await {
+    match tv
+        .call(None, Request::BeginDeviceSignIn { remember: false })
+        .await
+    {
         Response::Ok(Reply::DeviceSignInStarted {
             request,
             code,
@@ -66,7 +69,10 @@ fn tv_awaits(tv: &TestClient, request: &str) -> tokio::task::JoinHandle<Response
 }
 
 fn approve(code: &str) -> Request {
-    Request::ApproveDeviceSignIn { code: code.into() }
+    Request::ApproveDeviceSignIn {
+        code: code.into(),
+        remember: false,
+    }
 }
 
 #[tokio::test]
@@ -111,7 +117,7 @@ async fn an_approved_tv_gets_a_session_of_its_own() {
         Response::Ok(Reply::Done)
     );
     let session = match waiting.await.unwrap() {
-        Response::Ok(Reply::LoggedIn { session }) => session,
+        Response::Ok(Reply::LoggedIn { session, .. }) => session,
         other => panic!("not signed in: {other:?}"),
     };
     // Alice's, on the TV.
@@ -355,12 +361,14 @@ async fn a_device_has_few_codes_pending() {
     tv.hello().await;
     for _ in 0..spoolframe_server::device_sign_in::MAX_PENDING_PER_DEVICE {
         assert!(matches!(
-            tv.call(None, Request::BeginDeviceSignIn).await,
+            tv.call(None, Request::BeginDeviceSignIn { remember: false })
+                .await,
             Response::Ok(Reply::DeviceSignInStarted { .. })
         ));
     }
     assert!(matches!(
-        tv.call(None, Request::BeginDeviceSignIn).await,
+        tv.call(None, Request::BeginDeviceSignIn { remember: false })
+            .await,
         Response::Err(Error::RateLimited { .. })
     ));
     tv.close().await;
@@ -413,9 +421,9 @@ async fn a_tv_approved_in_a_browser_gets_a_session_as_the_web_user() {
     assert!(device.requested_at > 0);
 
     let waiting = tv_awaits(&tv, &request);
-    alice.device_sign_in_approve(typed).await.unwrap();
+    alice.device_sign_in_approve(typed, false).await.unwrap();
     let session = match waiting.await.unwrap() {
-        Response::Ok(Reply::LoggedIn { session }) => session,
+        Response::Ok(Reply::LoggedIn { session, .. }) => session,
         other => panic!("not signed in: {other:?}"),
     };
     // Alice's, on the TV, and one of her devices from now on.
@@ -431,7 +439,7 @@ async fn a_tv_approved_in_a_browser_gets_a_session_as_the_web_user() {
     assert_eq!(
         crate::admin::code(
             alice
-                .device_sign_in_approve(code.clone())
+                .device_sign_in_approve(code.clone(), false)
                 .await
                 .unwrap_err()
         ),
@@ -461,9 +469,9 @@ async fn a_web_session_made_with_a_passkey_approves_a_tv() {
     let token = session.split_once('=').unwrap().1;
     let alice = crate::admin::with_token(web, token).await;
     let waiting = tv_awaits(&tv, &request);
-    alice.device_sign_in_approve(code).await.unwrap();
+    alice.device_sign_in_approve(code, false).await.unwrap();
     let session = match waiting.await.unwrap() {
-        Response::Ok(Reply::LoggedIn { session }) => session,
+        Response::Ok(Reply::LoggedIn { session, .. }) => session,
         other => panic!("not signed in: {other:?}"),
     };
     match tv.call(Some(&session), Request::WhoAmI).await {
@@ -499,7 +507,7 @@ async fn nobody_approves_in_a_browser_without_signing_in() {
     let nobody = crate::admin::anonymous(web).await;
     for refused in [
         nobody.device_sign_in_lookup(code.clone()).await.map(|_| ()),
-        nobody.device_sign_in_approve(code.clone()).await,
+        nobody.device_sign_in_approve(code.clone(), false).await,
         nobody.device_sign_in_deny(code.clone()).await,
     ] {
         assert_eq!(
@@ -543,7 +551,7 @@ async fn wrong_codes_from_a_browser_are_limited() {
     // The sixth is not looked at, though the code is right.
     for limited in [
         alice.device_sign_in_lookup(code.clone()).await.map(|_| ()),
-        alice.device_sign_in_approve(code.clone()).await,
+        alice.device_sign_in_approve(code.clone(), false).await,
         alice.device_sign_in_deny(code.clone()).await,
     ] {
         assert_eq!(
@@ -568,7 +576,7 @@ async fn an_expired_code_is_not_approved_in_a_browser() {
     let alice = alice_on_the_web(web).await;
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
-        crate::admin::code(alice.device_sign_in_approve(code).await.unwrap_err()),
+        crate::admin::code(alice.device_sign_in_approve(code, false).await.unwrap_err()),
         error_code::NO_SUCH_SIGN_IN_CODE
     );
     tv.close().await;
@@ -731,7 +739,11 @@ async fn an_approval_outrun_by_the_code_leaves_no_session() {
         Response::Err(Error::DeviceSignInExpired)
     );
     assert_eq!(
-        server.auth.approve_device(bob, &claim).await.unwrap(),
+        server
+            .auth
+            .approve_device(bob, &claim, false)
+            .await
+            .unwrap(),
         Approval::Expired
     );
     assert_eq!(sessions_on_tv(&server, bob).await, 0);
@@ -746,8 +758,9 @@ async fn approvals_of_one_code_at_once_in_a_browser_sign_in_once() {
     let (server, web) = server_with_web("dsi-web-race", ServerOptions::default()).await;
     let (tv, request, code) = tv_begins(&server).await;
     let alice = alice_on_the_web(web).await;
-    let approvals =
-        futures_util::future::join_all((0..4).map(|_| alice.device_sign_in_approve(code.clone())));
+    let approvals = futures_util::future::join_all(
+        (0..4).map(|_| alice.device_sign_in_approve(code.clone(), false)),
+    );
     let approvals = tokio::time::timeout(Duration::from_secs(10), approvals)
         .await
         .unwrap();

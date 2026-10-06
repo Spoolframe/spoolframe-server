@@ -59,6 +59,7 @@ use crate::store::identities::{IdentityError, IdentityRecord};
 use crate::store::passkeys::{FirstPasskey, PasskeyError, PasskeyRecord, passkey_name};
 use crate::store::pins::{DeviceRecord, PinError};
 use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionRecord};
+use crate::store::trust::TrustError;
 use crate::store::users::{UserError, UserRecord, normalize_username};
 use crate::tracks::SubtitleChoice;
 use crate::transcode::Transcoding;
@@ -918,6 +919,16 @@ fn failed(page: &str, e: &OidcError) -> SsoOutcome {
     }
 }
 
+impl From<TrustError> for ErrorObjectOwned {
+    fn from(e: TrustError) -> Self {
+        match e {
+            TrustError::NoSuchDevice => error(error_code::NO_SUCH_DEVICE, e.to_string()),
+            TrustError::AutoLoginUntrusted => error(error_code::INVALID_INPUT, e.to_string()),
+            TrustError::Store(_) => internal(e),
+        }
+    }
+}
+
 impl From<PinError> for ErrorObjectOwned {
     fn from(e: PinError) -> Self {
         match &e {
@@ -948,6 +959,8 @@ fn device(d: DeviceRecord) -> DeviceEntry {
         name: d.name,
         last_seen_at: d.last_seen_at,
         pin_required: d.pin_required,
+        trusted: d.trusted,
+        auto_login: d.auto_login,
     }
 }
 
@@ -1357,6 +1370,9 @@ impl MeApiServer for AdminApi {
                 &credentials.password,
                 SessionBinding::Api,
                 source.as_deref(),
+                // A browser is no Iroh endpoint: the web's own sign-in
+                // never makes trust (P4-01).
+                false,
             )
             .await?;
         let username = normalize_username(&credentials.username)?;
@@ -1526,6 +1542,32 @@ impl MeApiServer for AdminApi {
             .await?)
     }
 
+    async fn set_device_trust(
+        &self,
+        ext: &Extensions,
+        endpoint_id: String,
+        trusted: bool,
+        auto_login: bool,
+    ) -> RpcResult<()> {
+        // Either way (P4-01, P4-03): trust is a way in, and taking it away
+        // ends the device's sessions.
+        let (_, user) = self.recently_signed_in(ext).await?;
+        let revoked = self
+            .auth
+            .store()
+            .set_device_trust(user.user, &endpoint_id, trusted, auto_login)
+            .await?;
+        tracing::info!(
+            user = %user.user,
+            endpoint_id,
+            trusted,
+            auto_login,
+            revoked,
+            "device trust changed by its user"
+        );
+        Ok(())
+    }
+
     async fn confirm_password(&self, ext: &Extensions, password: String) -> RpcResult<()> {
         let (token, user) = self.caller(ext).await?;
         let me = self.account(user).await?;
@@ -1552,12 +1594,18 @@ impl MeApiServer for AdminApi {
                 client_name: waiting.client_name,
                 platform: waiting.platform,
                 requested_at: waiting.requested_at,
+                remember: waiting.remember,
             }),
             None => Err(self.wrong_sign_in_code(ext, user)?),
         }
     }
 
-    async fn device_sign_in_approve(&self, ext: &Extensions, code: String) -> RpcResult<()> {
+    async fn device_sign_in_approve(
+        &self,
+        ext: &Extensions,
+        code: String,
+        remember: bool,
+    ) -> RpcResult<()> {
         self.recently_signed_in(ext).await?;
         let (user, code) = self.sign_in_code(ext, &code).await?;
         // No endpoint approves here: a web session is never the device
@@ -1568,11 +1616,12 @@ impl MeApiServer for AdminApi {
                 return Err(self.wrong_sign_in_code(ext, user)?);
             }
         };
-        match self.auth.approve_device(user.user, &claim).await {
+        match self.auth.approve_device(user.user, &claim, remember).await {
             Ok(Approval::SignedIn) => {
                 tracing::info!(
                     user = %user.user,
                     device = %claim.endpoint,
+                    remembered = claim.remember && remember,
                     "device sign-in approved from the web"
                 );
                 Ok(())
@@ -2070,6 +2119,32 @@ impl AdminApiServer for AdminApi {
             .set_pin_required(user.id, &endpoint_id, required)
             .await?;
         tracing::info!(%username, endpoint_id, required, "PIN requirement changed by an admin");
+        Ok(())
+    }
+
+    async fn user_set_device_trust(
+        &self,
+        ext: &Extensions,
+        username: String,
+        endpoint_id: String,
+        trusted: bool,
+        auto_login: bool,
+    ) -> RpcResult<()> {
+        self.recent_admin(ext).await?;
+        let user = self.record(&username).await?;
+        let revoked = self
+            .auth
+            .store()
+            .set_device_trust(user.id, &endpoint_id, trusted, auto_login)
+            .await?;
+        tracing::info!(
+            %username,
+            endpoint_id,
+            trusted,
+            auto_login,
+            revoked,
+            "device trust changed by an admin"
+        );
         Ok(())
     }
 
@@ -3171,7 +3246,7 @@ mod tests {
             .unwrap();
         let auth = Auth::new(store);
         let login = auth
-            .login_password("alice", "correct horse", SessionBinding::Api, None)
+            .login_password("alice", "correct horse", SessionBinding::Api, None, false)
             .await
             .unwrap();
         let mut ext = Extensions::new();
@@ -3234,16 +3309,17 @@ mod tests {
                 client_name: "test".into(),
                 platform: spoolframe_types::Platform::Linux,
                 requested_at: crate::store::now(),
+                remember: false,
             })
             .unwrap();
         let error = api
-            .device_sign_in_approve(&ext, started.code.clone())
+            .device_sign_in_approve(&ext, started.code.clone(), false)
             .await
             .unwrap_err();
         assert_eq!(error.code(), error_code::RECENT_SIGN_IN_REQUIRED);
         assert!(api.auth.sign_ins().lookup(&started.code).is_some());
         api.auth.store().confirm_session(&hash).await.unwrap();
-        api.device_sign_in_approve(&ext, started.code)
+        api.device_sign_in_approve(&ext, started.code, false)
             .await
             .unwrap();
     }
@@ -3289,7 +3365,7 @@ mod tests {
             .await;
         api.set_password(&ext, first()).await.unwrap();
         api.auth
-            .login_password("root", "correct horse", SessionBinding::Api, None)
+            .login_password("root", "correct horse", SessionBinding::Api, None, false)
             .await
             .unwrap();
     }
@@ -3406,7 +3482,7 @@ mod tests {
             .unwrap();
         let old = api
             .auth
-            .login_password("alice", "correct horse", SessionBinding::Api, None)
+            .login_password("alice", "correct horse", SessionBinding::Api, None, false)
             .await;
         assert!(matches!(old, Err(LoginError::InvalidCredentials)));
     }

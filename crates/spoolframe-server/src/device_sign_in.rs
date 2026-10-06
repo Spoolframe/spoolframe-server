@@ -58,6 +58,8 @@ pub struct Waiting {
     pub platform: Platform,
     /// Unix seconds.
     pub requested_at: i64,
+    /// The device asked to be trusted (P4-01); the approver decides.
+    pub remember: bool,
 }
 
 /// A code taken for approval: the session goes to `endpoint`, then
@@ -68,6 +70,16 @@ pub struct Claim {
     pub endpoint: String,
     pub device_name: Option<String>,
     pub platform: Platform,
+    /// The device asked to be trusted (P4-01).
+    pub remember: bool,
+}
+
+/// What an approved device is handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handover {
+    pub token: SessionToken,
+    /// The device is trusted for the approver after it (P4-01).
+    pub remembered: bool,
 }
 
 /// Why a code could not be claimed.
@@ -82,7 +94,7 @@ pub enum ClaimError {
 /// What the waiting device learns.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Approved(SessionToken),
+    Approved(Handover),
     /// Not yet; ask again.
     Pending,
     Denied,
@@ -101,7 +113,7 @@ enum State {
     /// Claimed by an approver making its session; only
     /// [`DeviceSignIns::fulfil`] moves it on.
     Claimed,
-    Approved(SessionToken),
+    Approved(Handover),
     Denied,
     Failed,
 }
@@ -111,7 +123,7 @@ impl State {
     fn outcome(&self) -> Option<Outcome> {
         match self {
             State::Waiting | State::Claimed => None,
-            State::Approved(token) => Some(Outcome::Approved(token.clone())),
+            State::Approved(handover) => Some(Outcome::Approved(handover.clone())),
             State::Denied => Some(Outcome::Denied),
             State::Failed => Some(Outcome::Expired),
         }
@@ -245,6 +257,7 @@ impl DeviceSignIns {
             endpoint: pending.waiting.endpoint.clone(),
             device_name: pending.waiting.device_name.clone(),
             platform: pending.waiting.platform,
+            remember: pending.waiting.remember,
         };
         inner.by_code.remove(code);
         Ok(claim)
@@ -256,13 +269,13 @@ impl DeviceSignIns {
     /// device was told so, before the session was made. The caller then
     /// revokes the session, which nobody holds.
     #[must_use]
-    pub fn fulfil(&self, request: &str, token: Option<SessionToken>) -> bool {
+    pub fn fulfil(&self, request: &str, handover: Option<Handover>) -> bool {
         let mut inner = self.lock();
         match inner.by_request.get_mut(request) {
             Some(pending) if matches!(*pending.state.borrow(), State::Claimed) => {
                 pending.decide(
-                    match token {
-                        Some(token) => State::Approved(token),
+                    match handover {
+                        Some(handover) => State::Approved(handover),
                         None => State::Failed,
                     },
                     Instant::now(),
@@ -356,6 +369,13 @@ fn new_code() -> String {
 mod tests {
     use super::*;
 
+    fn handover(token: &str) -> Handover {
+        Handover {
+            token: SessionToken(token.into()),
+            remembered: false,
+        }
+    }
+
     fn tv(endpoint: &str) -> Waiting {
         Waiting {
             endpoint: endpoint.into(),
@@ -363,7 +383,23 @@ mod tests {
             client_name: "spoolframe-tvos".into(),
             platform: Platform::Tvos,
             requested_at: 0,
+            remember: false,
         }
+    }
+
+    #[test]
+    fn the_approver_learns_whether_the_device_asked_to_be_remembered() {
+        let sign_ins = DeviceSignIns::default();
+        let asked = sign_ins
+            .begin(Waiting {
+                remember: true,
+                ..tv("tv")
+            })
+            .unwrap();
+        let did_not = sign_ins.begin(tv("laptop")).unwrap();
+        assert!(sign_ins.lookup(&asked.code).unwrap().remember);
+        assert!(sign_ins.claim(&asked.code, None).unwrap().remember);
+        assert!(!sign_ins.claim(&did_not.code, None).unwrap().remember);
     }
 
     #[test]
@@ -392,10 +428,10 @@ mod tests {
         );
         assert!(!sign_ins.deny(&started.code));
         assert_eq!(sign_ins.lookup(&started.code), None);
-        assert!(sign_ins.fulfil(&claim.request, Some(SessionToken("t".into()))));
+        assert!(sign_ins.fulfil(&claim.request, Some(handover("t"))));
         assert_eq!(
             sign_ins.wait(&started.request, "tv", AWAIT).await,
-            Outcome::Approved(SessionToken("t".into()))
+            Outcome::Approved(handover("t"))
         );
         assert_eq!(
             sign_ins.wait(&started.request, "tv", AWAIT).await,
@@ -497,11 +533,11 @@ mod tests {
         let sign_ins = DeviceSignIns::with_lifetime(Duration::from_millis(100));
         let started = sign_ins.begin(tv("tv")).unwrap();
         let claim = sign_ins.claim(&started.code, Some("phone")).unwrap();
-        assert!(sign_ins.fulfil(&claim.request, Some(SessionToken("t".into()))));
+        assert!(sign_ins.fulfil(&claim.request, Some(handover("t"))));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             sign_ins.wait(&started.request, "tv", AWAIT).await,
-            Outcome::Approved(SessionToken("t".into()))
+            Outcome::Approved(handover("t"))
         );
     }
 
@@ -516,7 +552,7 @@ mod tests {
             sign_ins.wait(&started.request, "tv", AWAIT).await,
             Outcome::Expired
         );
-        assert!(!sign_ins.fulfil(&claim.request, Some(SessionToken("t".into()))));
+        assert!(!sign_ins.fulfil(&claim.request, Some(handover("t"))));
     }
 
     /// A session is handed over once, also to two waits at once.
@@ -531,7 +567,7 @@ mod tests {
             })
             .collect();
         let claim = sign_ins.claim(&started.code, None).unwrap();
-        assert!(sign_ins.fulfil(&claim.request, Some(SessionToken("t".into()))));
+        assert!(sign_ins.fulfil(&claim.request, Some(handover("t"))));
         let mut outcomes = Vec::new();
         for wait in waits {
             outcomes.push(wait.await.unwrap());

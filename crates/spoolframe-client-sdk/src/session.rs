@@ -331,6 +331,10 @@ pub struct Session {
     pub(crate) server: EndpointId,
     pub(crate) token: SessionId,
     pub(crate) user: UserSummary,
+    /// Whether the server trusted this device for the user when the
+    /// session was made (P4-01); `None` for a session found again rather
+    /// than made ([`crate::Client::profiles`]).
+    pub(crate) remembered: Option<bool>,
 }
 
 /// A profile explicitly selected by the application. All session operations
@@ -384,6 +388,16 @@ impl Session {
     /// Who this session is, as of sign-in or the last [`Session::whoami`].
     pub fn user(&self) -> &UserSummary {
         &self.user
+    }
+
+    /// Whether this device was trusted for the user once the sign-in that
+    /// made this session was done (P4-01): for "Approved and remembered" or
+    /// "Approved, not remembered" after a device sign-in, where the
+    /// approver decides. `None` for a session found again by
+    /// [`crate::Client::profiles`]; ask [`crate::Client::trusted_profiles`]
+    /// or [`Session::devices`] then.
+    pub fn remembered(&self) -> Option<bool> {
+        self.remembered
     }
 
     /// One request in this session. A session the server no longer knows
@@ -759,6 +773,41 @@ impl Session {
         }
     }
 
+    /// Trust `device` (an endpoint id from [`Session::devices`]; this
+    /// device for `None`) for this user, or stop (P4-01), and say whether
+    /// it opens their profile at start (`auto_login`, which needs trust).
+    ///
+    /// - Trust and auto-login can be turned on for this device only
+    ///   ([`SdkError::InvalidInput`] for another: that is the web UI's),
+    ///   and only soon after signing in
+    ///   ([`SdkError::RecentSignInRequired`]: confirm it is them with
+    ///   [`Session::confirm_password`] or [`Session::begin_confirm_passkey`]).
+    /// - Auto-login turns it off for this device's other profiles, and the
+    ///   PIN off for this profile here; [`Session::set_pin_required`] on
+    ///   turns auto-login off. Say so before either.
+    /// - Turning trust off ends the user's sessions on that device. On
+    ///   this device that is this session: it is forgotten here, and the
+    ///   profile stays in [`crate::Client::saved_profiles`] to sign in
+    ///   again. For another device it needs a recent sign-in.
+    pub async fn set_device_trust(
+        &self,
+        device: Option<&str>,
+        trusted: bool,
+        auto_login: bool,
+    ) -> Result<(), SdkError> {
+        let own = device.is_none_or(|d| d == self.client.id());
+        self.done(Request::SetDeviceTrust {
+            device: device.map(str::to_owned),
+            trusted,
+            auto_login,
+        })
+        .await?;
+        if own && !trusted {
+            self.client.end_session(self.server, &self.token).await?;
+        }
+        Ok(())
+    }
+
     /// Ask for this user's PIN on `device` (an endpoint id from
     /// [`Session::devices`]; this device for `None`), or stop asking.
     pub async fn set_pin_required(
@@ -898,9 +947,15 @@ impl Session {
     /// [`SdkError::RecentSignInRequired`] (confirm it is them with
     /// [`Session::confirm_password`] or [`Session::begin_confirm_passkey`],
     /// then ask).
-    pub async fn approve_device_sign_in(&self, code: &str) -> Result<(), SdkError> {
+    ///
+    /// `remember` is the approver's answer to the device's request to be
+    /// remembered ([`DeviceSignInRequest::remember`], P4-01): shown as
+    /// "This device will be remembered", ticked, and untickable. The device
+    /// is trusted only if it asked and this is true.
+    pub async fn approve_device_sign_in(&self, code: &str, remember: bool) -> Result<(), SdkError> {
         self.done(Request::ApproveDeviceSignIn {
             code: code.to_owned(),
+            remember,
         })
         .await
     }

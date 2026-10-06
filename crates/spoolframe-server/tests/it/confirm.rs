@@ -48,14 +48,20 @@ async fn tv_code(server: &TestServer) -> (TestClient, String) {
     let tv = server.client().await;
     tv.hello_from(Platform::Tvos, Some("Living room TV"), None)
         .await;
-    match tv.call(None, Request::BeginDeviceSignIn).await {
+    match tv
+        .call(None, Request::BeginDeviceSignIn { remember: false })
+        .await
+    {
         Response::Ok(Reply::DeviceSignInStarted { code, .. }) => (tv, code),
         other => panic!("not started: {other:?}"),
     }
 }
 
 fn approve(code: &str) -> Request {
-    Request::ApproveDeviceSignIn { code: code.into() }
+    Request::ApproveDeviceSignIn {
+        code: code.into(),
+        remember: false,
+    }
 }
 
 fn confirm_password(password: &str) -> Request {
@@ -208,6 +214,7 @@ async fn a_wrong_password_confirms_nothing_and_is_limited() {
                 Request::LoginPassword(spoolframe_protocol::LoginPassword {
                     username: "alice".into(),
                     password: PASSWORD.into(),
+                    remember: false,
                 })
             )
             .await,

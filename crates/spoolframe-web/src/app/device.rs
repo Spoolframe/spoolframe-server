@@ -123,7 +123,9 @@ fn Consent(user: UserInfo, code: String, server: String, on_switch: EventHandler
             let decided = async {
                 let client = rpc::client().await?;
                 match decision {
-                    Outcome::Approved => client.device_sign_in_approve(code).await,
+                    // Never remembered until this page shows the device's
+                    // request and lets the approver untick it (P4-03).
+                    Outcome::Approved => client.device_sign_in_approve(code, false).await,
                     Outcome::Denied => client.device_sign_in_deny(code).await,
                 }
                 .map_err(rpc::error)

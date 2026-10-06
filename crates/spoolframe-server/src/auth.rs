@@ -15,8 +15,9 @@ use password_hash::rand_core::{OsRng, RngCore};
 
 use spoolframe_types::Role;
 
-use crate::device_sign_in::{Claim, DeviceSignIns};
+use crate::device_sign_in::{Claim, DeviceSignIns, Handover};
 use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionUser};
+use crate::store::trust::{Resumed, TrustedProfile};
 use crate::store::users::{LocalUserId, PasswordLogin, normalize_username};
 use crate::store::{Store, StoreError, now};
 
@@ -67,7 +68,14 @@ pub struct Login {
     pub user: LocalUserId,
     pub role: Role,
     pub token: SessionToken,
+    /// Its device is trusted for the user after it (P4-01); always false
+    /// for an API session, which has no device.
+    pub remembered: bool,
 }
+
+/// How long a trusted device may go unused before its trust lapses, by
+/// default (`auth.trust_idle_days`, P4-01).
+pub const TRUST_IDLE: Duration = Duration::from_secs(180 * 24 * 3600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoginError {
@@ -542,6 +550,8 @@ pub struct Auth {
     sign_ins: Arc<DeviceSignIns>,
     /// Sign-in attempts from devices that are not signed in (PX-10).
     strangers: Arc<TokenBucket>,
+    /// How long a trusted device may go unused (P4-01).
+    trust_idle: Duration,
 }
 
 impl Auth {
@@ -557,7 +567,59 @@ impl Auth {
             wrong_pins: Arc::default(),
             sign_ins: Arc::default(),
             strangers: Arc::new(TokenBucket::new(STRANGER_ATTEMPTS)),
+            trust_idle: TRUST_IDLE,
         }
+    }
+
+    /// Trust unused for `idle` lapses ([`TRUST_IDLE`] by default).
+    pub fn with_trust_idle(mut self, idle: Duration) -> Self {
+        self.trust_idle = idle;
+        self
+    }
+
+    fn trust_idle_secs(&self) -> i64 {
+        i64::try_from(self.trust_idle.as_secs()).unwrap_or(i64::MAX)
+    }
+
+    /// Trust the device of `token`'s live endpoint session for its user
+    /// (P4-01); whether it is trusted after it.
+    pub async fn remember(&self, token: &SessionToken) -> Result<bool, StoreError> {
+        self.store.remember_session_device(&token.hash()).await
+    }
+
+    /// The users `endpoint` may resume (P4-01), lapsed trust left out and
+    /// removed.
+    pub async fn trusted_profiles(
+        &self,
+        endpoint: &str,
+    ) -> Result<Vec<TrustedProfile>, StoreError> {
+        self.store
+            .trusted_profiles(endpoint, self.trust_idle_secs())
+            .await
+    }
+
+    /// A new session for `user` on the device `binding` names, if it is
+    /// trusted for them (P4-01): `None` otherwise, whatever the reason.
+    pub async fn resume(
+        &self,
+        user: LocalUserId,
+        binding: &SessionBinding,
+    ) -> Result<Option<SessionToken>, StoreError> {
+        let token = SessionToken::generate();
+        let resumed = self
+            .store
+            .resume_session(
+                &token.hash(),
+                user,
+                binding,
+                now() + ENDPOINT_SESSION.as_secs() as i64,
+                self.trust_idle_secs(),
+            )
+            .await?;
+        Ok(match resumed {
+            Resumed::Session => Some(token),
+            Resumed::Refused => None,
+        })
     }
 
     /// Sign-in attempts from devices that are not signed in come from
@@ -589,14 +651,19 @@ impl Auth {
     /// authentication before claiming the code: the approved session
     /// receives a fresh authentication timestamp.
     ///
+    /// The device is trusted for `user` (P4-01) only if it asked to be
+    /// and the approver's `remember` agrees: the approver decides, and
+    /// cannot trust a device that did not ask.
+    ///
     /// The code may run out while the session is made, and the device be
-    /// told so: then the session, which nobody holds, is revoked, and the
-    /// approver is told it expired too. The device and the approver never
-    /// hear two different outcomes.
+    /// told so: then the session, which nobody holds, is revoked, any trust
+    /// made for it removed, and the approver is told it expired too. The
+    /// device and the approver never hear two different outcomes.
     pub async fn approve_device(
         &self,
         user: LocalUserId,
         claim: &Claim,
+        remember: bool,
     ) -> Result<Approval, StoreError> {
         let binding = SessionBinding::Endpoint {
             endpoint_id: claim.endpoint.clone(),
@@ -612,10 +679,36 @@ impl Auth {
             }
         };
         let hash = token.hash();
-        if self.sign_ins.fulfil(&claim.request, Some(token)) {
+        let made = async {
+            let was = self.store.device_trusted(user, &claim.endpoint).await?;
+            let remembered = if claim.remember && remember {
+                self.store.remember_session_device(&hash).await?
+            } else {
+                was
+            };
+            Ok::<_, StoreError>((was, remembered))
+        }
+        .await;
+        let (was, remembered) = match made {
+            Ok(made) => made,
+            Err(e) => {
+                let _ = self.sign_ins.fulfil(&claim.request, None);
+                self.store.discard_unheld_session(&hash).await?;
+                return Err(e);
+            }
+        };
+        if self
+            .sign_ins
+            .fulfil(&claim.request, Some(Handover { token, remembered }))
+        {
             Ok(Approval::SignedIn)
         } else {
-            self.store.revoke_session(&hash).await?;
+            // Nobody holds it: trust the device had before stays, and
+            // trust made for this sign-in goes.
+            self.store.discard_unheld_session(&hash).await?;
+            if remembered && !was {
+                self.store.forget_device(user, &claim.endpoint).await?;
+            }
             Ok(Approval::Expired)
         }
     }
@@ -728,12 +821,16 @@ impl Auth {
     /// `source` (an EndpointId, a remote address) is what the failure
     /// limit counts besides the username; `None` if it says nothing about
     /// who is trying.
+    ///
+    /// With `remember`, an endpoint session's device is trusted for the
+    /// user (P4-01); an API session's never is.
     pub async fn login_password(
         &self,
         username: &str,
         password: &str,
         binding: SessionBinding,
         source: Option<&str>,
+        remember: bool,
     ) -> Result<Login, LoginError> {
         let account = self.check_password(username, password, source).await?;
         let lifetime = match binding {
@@ -750,11 +847,35 @@ impl Auth {
                 now() + lifetime.as_secs() as i64,
             )
             .await?;
+        let remembered = self
+            .remembered(&token, &binding, account.id, remember)
+            .await?;
         Ok(Login {
             user: account.id,
             role: account.role,
             token,
+            remembered,
         })
+    }
+
+    /// After a sign-in that opened `token`, bound as `binding`, for `user`:
+    /// trust its device if the user asked (`remember`), and say whether
+    /// the device is trusted for them now (P4-01).
+    pub async fn remembered(
+        &self,
+        token: &SessionToken,
+        binding: &SessionBinding,
+        user: LocalUserId,
+        remember: bool,
+    ) -> Result<bool, StoreError> {
+        let SessionBinding::Endpoint { endpoint_id, .. } = binding else {
+            return Ok(false);
+        };
+        if remember {
+            self.remember(token).await
+        } else {
+            self.store.device_trusted(user, endpoint_id).await
+        }
     }
 
     /// `username`'s account if `password` is theirs and they may log in,
@@ -878,8 +999,14 @@ mod tests {
     }
 
     async fn login(auth: &Auth, user: &str, password: &str) -> Result<Login, LoginError> {
-        auth.login_password(user, password, SessionBinding::Api, Some("192.0.2.1"))
-            .await
+        auth.login_password(
+            user,
+            password,
+            SessionBinding::Api,
+            Some("192.0.2.1"),
+            false,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1186,7 +1313,7 @@ mod tests {
             for i in 0..MAX_FAILURES {
                 let name = format!("user-{endpoint}-{i}");
                 let _ = auth
-                    .login_password(&name, "guess", SessionBinding::Api, Some(&source))
+                    .login_password(&name, "guess", SessionBinding::Api, Some(&source), false)
                     .await;
             }
         }
@@ -1196,6 +1323,7 @@ mod tests {
                 "correct horse",
                 SessionBinding::Api,
                 Some("endpoint-fresh"),
+                false,
             )
             .await;
         assert!(fresh.is_ok(), "{fresh:?}");

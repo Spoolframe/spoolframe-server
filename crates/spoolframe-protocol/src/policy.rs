@@ -68,14 +68,18 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::ReadSubtitleSegment { .. }
         | Request::GetPreviews { .. }
         | Request::Home
+        | Request::TrustedProfiles
         | Request::GetTrackPreferences => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)
-        | Request::BeginDeviceSignIn
+        | Request::BeginDeviceSignIn { .. }
         | Request::AwaitDeviceSignIn { .. }
         | Request::BeginPasskeySignIn { .. }
-        | Request::FinishPasskeySignIn(_)
+        | Request::FinishPasskeySignIn { .. }
+        // A resume makes a session; trust changes end sessions.
+        | Request::ResumeProfile { .. }
+        | Request::SetDeviceTrust { .. }
         | Request::Logout
         // Playback: each starts, stops or restarts an encode.
         | Request::StartPlayback { .. }

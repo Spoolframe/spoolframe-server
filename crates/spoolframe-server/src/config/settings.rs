@@ -73,6 +73,7 @@ pub const SETTINGS: &[Setting] = &[
     live("admin.metrics"),
     live("admin.metrics_from"),
     live("auth.oidc"),
+    restart("auth.trust_idle_days"),
     restart("artwork.cache_mb"),
     live("watch.started_after_secs"),
     live("watch.watched_percent"),

@@ -741,6 +741,10 @@ mod tests {
             documented.admin.metrics_from().unwrap(),
             bare.admin.metrics_from().unwrap()
         );
+        assert_eq!(
+            documented.auth.trust_idle().unwrap(),
+            bare.auth.trust_idle().unwrap()
+        );
     }
 
     #[test]

@@ -77,7 +77,7 @@ fn id(server: &TestServer) -> String {
 
 async fn alice(server: &TestServer, client: &Client) -> Session {
     client
-        .sign_in(&id(server), "alice", "correct horse")
+        .sign_in(&id(server), "alice", "correct horse", false)
         .await
         .unwrap()
 }
@@ -197,7 +197,7 @@ async fn wrong_password_is_invalid_credentials() {
     let (server, client, _) = ready("wrong-password").await;
     assert_eq!(
         client
-            .sign_in(&id(&server), "alice", "nope")
+            .sign_in(&id(&server), "alice", "nope", false)
             .await
             .unwrap_err(),
         SdkError::InvalidCredentials
@@ -211,7 +211,7 @@ async fn two_users_share_one_connection_and_answer_as_themselves() {
     let (server, client, _) = ready("two-users").await;
     let alice = alice(&server, &client).await;
     let bob = client
-        .sign_in(&id(&server), "bob", "battery staple")
+        .sign_in(&id(&server), "bob", "battery staple", false)
         .await
         .unwrap();
     assert_eq!(alice.whoami().await.unwrap().username, "alice");
@@ -342,7 +342,7 @@ async fn a_stale_profile_is_kept_for_a_password_and_out_of_the_sessions() {
     let (server, client, _) = ready("stale-profile").await;
     alice(&server, &client).await;
     client
-        .sign_in(&id(&server), "bob", "battery staple")
+        .sign_in(&id(&server), "bob", "battery staple", false)
         .await
         .unwrap();
     server.store.disable_user("bob").await.unwrap();
@@ -645,7 +645,7 @@ async fn converting(
     client.add_address(&id(&server), addrs).unwrap();
     pin(&client, &server).await;
     let alice = client
-        .sign_in(&id(&server), "alice", "correct horse")
+        .sign_in(&id(&server), "alice", "correct horse", false)
         .await
         .unwrap();
     (server, client, alice)
@@ -888,7 +888,7 @@ async fn a_tv_is_signed_in_from_a_phone_by_its_qr_code() {
     let tv_storage = Arc::new(MemoryStorage::default());
     let tv = client_on(&server, &tv_storage).await;
 
-    let sign_in = tv.begin_device_sign_in(&id(&server)).await.unwrap();
+    let sign_in = tv.begin_device_sign_in(&id(&server), false).await.unwrap();
     assert_eq!(
         sign_in.display_code,
         format!("{}-{}", &sign_in.code[..4], &sign_in.code[4..])
@@ -905,7 +905,10 @@ async fn a_tv_is_signed_in_from_a_phone_by_its_qr_code() {
     assert_eq!(scanned.server, id(&server));
     let device = alice.lookup_device_sign_in(&scanned.code).await.unwrap();
     assert_eq!(device.device_name.as_deref(), Some("living room"));
-    alice.approve_device_sign_in(&scanned.code).await.unwrap();
+    alice
+        .approve_device_sign_in(&scanned.code, false)
+        .await
+        .unwrap();
 
     let on_tv = waiting.await.unwrap().unwrap();
     assert_eq!(on_tv.user().username, "alice");
@@ -919,7 +922,7 @@ async fn a_tv_is_signed_in_from_a_phone_by_its_qr_code() {
     );
 
     // A second one, refused.
-    let sign_in = tv.begin_device_sign_in(&id(&server)).await.unwrap();
+    let sign_in = tv.begin_device_sign_in(&id(&server), false).await.unwrap();
     alice.deny_device_sign_in(&sign_in.code).await.unwrap();
     assert_eq!(
         tv.await_device_sign_in(&sign_in).await.unwrap_err(),
@@ -1027,7 +1030,7 @@ async fn a_tv_is_signed_in_from_a_browser_by_its_web_qr_code() {
     let web = crate::admin::serve_beside(server.auth.clone(), WEB).await;
     let tv = client_on(&server, &Arc::new(MemoryStorage::default())).await;
 
-    let sign_in = tv.begin_device_sign_in(&id(&server)).await.unwrap();
+    let sign_in = tv.begin_device_sign_in(&id(&server), false).await.unwrap();
     let page = sign_in.web_url.clone().expect("a page to approve on");
     assert_eq!(page, format!("{WEB}/auth/device?code={}", sign_in.code));
     let waiting = {
@@ -1046,7 +1049,7 @@ async fn a_tv_is_signed_in_from_a_browser_by_its_web_qr_code() {
     let alice = crate::admin::with_token(web, &login.token).await;
     let device = alice.device_sign_in_lookup(code.clone()).await.unwrap();
     assert_eq!(device.device_name.as_deref(), Some("living room"));
-    alice.device_sign_in_approve(code).await.unwrap();
+    alice.device_sign_in_approve(code, false).await.unwrap();
 
     let on_tv = waiting.await.unwrap().unwrap();
     assert_eq!(on_tv.user().username, "alice");
@@ -1090,7 +1093,7 @@ async fn a_session_reads_its_user_s_plex_link() {
 
     // Only hers: bob's session says he is not linked.
     let bob = client
-        .sign_in(&id(&server), "bob", "battery staple")
+        .sign_in(&id(&server), "bob", "battery staple", false)
         .await
         .unwrap();
     assert_eq!(bob.plex_link().await.unwrap(), None);
@@ -1176,7 +1179,7 @@ async fn an_app_passkey_made_on_the_phone_signs_the_tv_in() {
     let request = tv.begin_passkey_sign_in(&id(&server), None).await.unwrap();
     let signed = app.get(&request);
     let session = tv
-        .finish_passkey_sign_in(&id(&server), signed.clone())
+        .finish_passkey_sign_in(&id(&server), signed.clone(), false)
         .await
         .unwrap();
     assert_eq!(session.user().username, "alice");
@@ -1185,7 +1188,7 @@ async fn an_app_passkey_made_on_the_phone_signs_the_tv_in() {
     assert_eq!(profiles[0].user().username, "alice");
     // Once.
     assert_eq!(
-        tv.finish_passkey_sign_in(&id(&server), signed)
+        tv.finish_passkey_sign_in(&id(&server), signed, false)
             .await
             .unwrap_err(),
         SdkError::InvalidCredentials
@@ -1303,9 +1306,9 @@ async fn an_old_session_confirms_it_is_its_user_before_approving_a_tv() {
     };
 
     aged().await;
-    let sign_in = tv.begin_device_sign_in(&id(&server)).await.unwrap();
+    let sign_in = tv.begin_device_sign_in(&id(&server), false).await.unwrap();
     assert_eq!(
-        alice.approve_device_sign_in(&sign_in.code).await,
+        alice.approve_device_sign_in(&sign_in.code, false).await,
         Err(SdkError::RecentSignInRequired)
     );
     assert_eq!(
@@ -1313,12 +1316,15 @@ async fn an_old_session_confirms_it_is_its_user_before_approving_a_tv() {
         Err(SdkError::InvalidCredentials)
     );
     alice.confirm_password("correct horse").await.unwrap();
-    alice.approve_device_sign_in(&sign_in.code).await.unwrap();
+    alice
+        .approve_device_sign_in(&sign_in.code, false)
+        .await
+        .unwrap();
 
     aged().await;
-    let sign_in = tv.begin_device_sign_in(&id(&server)).await.unwrap();
+    let sign_in = tv.begin_device_sign_in(&id(&server), false).await.unwrap();
     assert_eq!(
-        alice.approve_device_sign_in(&sign_in.code).await,
+        alice.approve_device_sign_in(&sign_in.code, false).await,
         Err(SdkError::RecentSignInRequired)
     );
     let request = alice.begin_confirm_passkey().await.unwrap();
@@ -1326,7 +1332,10 @@ async fn an_old_session_confirms_it_is_its_user_before_approving_a_tv() {
         .finish_confirm_passkey(app.get(&request))
         .await
         .unwrap();
-    alice.approve_device_sign_in(&sign_in.code).await.unwrap();
+    alice
+        .approve_device_sign_in(&sign_in.code, false)
+        .await
+        .unwrap();
     // A challenge is used once.
     assert_eq!(
         alice.finish_confirm_passkey(app.get(&request)).await,
@@ -1372,7 +1381,7 @@ async fn selecting_a_profile_is_explicit_and_background_reads_do_not_switch_it()
     let (server, client, _) = ready("sdk-explicit-profile").await;
     let alice = alice(&server, &client).await;
     let bob = client
-        .sign_in(&id(&server), "bob", "battery staple")
+        .sign_in(&id(&server), "bob", "battery staple", false)
         .await
         .unwrap();
     let active = client.activate_profile(&alice).await.unwrap();
@@ -1527,7 +1536,7 @@ async fn a_call_after_the_device_is_signed_out_asks_for_a_sign_in() {
     // Signing in again is refused while the server has no room: the TV
     // is a device with no session now.
     assert_eq!(
-        tv.sign_in(&id(&server), "alice", "correct horse")
+        tv.sign_in(&id(&server), "alice", "correct horse", false)
             .await
             .unwrap_err(),
         SdkError::ServerFull
@@ -1556,5 +1565,144 @@ async fn a_new_device_past_the_stranger_cap_is_told_the_server_is_full() {
     );
     newcomer.close().await;
     tv.close().await;
+    server.stop().await;
+}
+
+/// Every session on the server as if it expired: what a long absence does.
+async fn expire_sessions(server: &TestServer) {
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(server.dir.join("spoolframe.db")),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE sessions SET expires_at = expires_at - 100000000")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+/// P4-01 through the SDK: remembered at sign-in, listed, resumed after the
+/// session ended, and forgotten by signing out.
+#[tokio::test]
+async fn a_remembered_profile_resumes_without_a_password_until_signed_out() {
+    let (server, client, _) = ready("sdk-trust").await;
+    let alice = client
+        .sign_in(&id(&server), "alice", "correct horse", true)
+        .await
+        .unwrap();
+    assert_eq!(alice.remembered(), Some(true));
+    let bob = client
+        .sign_in(&id(&server), "bob", "battery staple", false)
+        .await
+        .unwrap();
+    assert_eq!(bob.remembered(), Some(false));
+    let profiles = client.trusted_profiles(&id(&server)).await.unwrap();
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|p| p.username.as_str())
+            .collect::<Vec<_>>(),
+        ["alice"]
+    );
+    assert_eq!(profiles[0].user_id, alice.user().user_id);
+
+    expire_sessions(&server).await;
+    // Found ended, the profile stays for "Who's watching".
+    assert!(client.profiles(&id(&server)).await.unwrap().is_empty());
+    let resumed = client
+        .resume_profile(&id(&server), &profiles[0].user_id)
+        .await
+        .unwrap();
+    assert_eq!(resumed.user().username, "alice");
+    resumed.libraries().await.unwrap();
+    // A resume is no sign-in: how she last signed in is still the password.
+    assert_eq!(
+        methods(&client, &server).await,
+        [
+            ("alice".to_owned(), Some(SignInMethod::Password)),
+            ("bob".to_owned(), Some(SignInMethod::Password)),
+        ]
+    );
+    assert_eq!(
+        client
+            .resume_profile(&id(&server), &bob.user().user_id)
+            .await
+            .unwrap_err(),
+        SdkError::SignInRequired
+    );
+
+    resumed.sign_out().await.unwrap();
+    assert!(
+        client
+            .trusted_profiles(&id(&server))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        client
+            .resume_profile(&id(&server), &profiles[0].user_id)
+            .await
+            .unwrap_err(),
+        SdkError::SignInRequired
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_session_sets_its_own_device_s_trust_and_auto_login() {
+    let (server, client, _) = ready("sdk-set-trust").await;
+    let alice = alice(&server, &client).await;
+    alice.set_device_trust(None, true, true).await.unwrap();
+    let devices = alice.devices().await.unwrap();
+    assert!(devices[0].trusted && devices[0].auto_login, "{devices:?}");
+    let profile = &client.trusted_profiles(&id(&server)).await.unwrap()[0];
+    assert!(profile.auto_login);
+    // Stopping ends the session here; the profile stays to sign in again.
+    alice.set_device_trust(None, false, false).await.unwrap();
+    let saved = client.saved_profiles(&id(&server)).await.unwrap();
+    assert_eq!(saved[0].sign_in, ProfileSignIn::Password);
+    assert!(
+        client
+            .trusted_profiles(&id(&server))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_tv_s_request_to_be_remembered_is_the_approver_s_to_grant() {
+    let (server, phone, _) = ready("sdk-trust-approval").await;
+    let alice = alice(&server, &phone).await;
+    let tv = client_on(&server, &Arc::new(MemoryStorage::default())).await;
+    for approve in [false, true] {
+        let sign_in = tv.begin_device_sign_in(&id(&server), true).await.unwrap();
+        assert!(sign_in.remember);
+        let waiting = {
+            let tv = tv.clone();
+            let sign_in = sign_in.clone();
+            tokio::spawn(async move { tv.await_device_sign_in(&sign_in).await })
+        };
+        assert!(
+            alice
+                .lookup_device_sign_in(&sign_in.code)
+                .await
+                .unwrap()
+                .remember
+        );
+        alice
+            .approve_device_sign_in(&sign_in.code, approve)
+            .await
+            .unwrap();
+        let on_tv = waiting.await.unwrap().unwrap();
+        assert_eq!(on_tv.remembered(), Some(approve));
+    }
+    tv.close().await;
+    phone.close().await;
     server.stop().await;
 }

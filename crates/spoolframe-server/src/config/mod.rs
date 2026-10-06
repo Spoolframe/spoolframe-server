@@ -149,7 +149,16 @@ pub struct ServerConfig {
 pub struct AuthConfig {
     #[ucl(default)]
     pub oidc: Vec<OidcConfig>,
+    /// Days a trusted device (P4-01) may go unused before its trust lapses
+    /// and it signs in again in full; 180 if left out.
+    #[ucl(default)]
+    pub trust_idle_days: Option<u64>,
 }
+
+/// How long a trusted device may go unused by default (P4-01).
+pub const DEFAULT_TRUST_IDLE_DAYS: u64 = 180;
+/// The longest `auth.trust_idle_days` may be: ten years.
+pub const MAX_TRUST_IDLE_DAYS: u64 = 3650;
 
 /// One OpenID Connect provider (P3-04): Pocket ID, Authentik, Kanidm,
 /// Keycloak, Google, …. Spoolframe is its confidential client, with PKCE,
@@ -243,6 +252,19 @@ pub fn oidc_secret_name(name: &str) -> String {
 }
 
 impl AuthConfig {
+    /// How long a trusted device may go unused before its trust lapses:
+    /// 1 to [`MAX_TRUST_IDLE_DAYS`] days.
+    pub fn trust_idle(&self) -> Result<Duration, ConfigError> {
+        let days = self.trust_idle_days.unwrap_or(DEFAULT_TRUST_IDLE_DAYS);
+        if !(1..=MAX_TRUST_IDLE_DAYS).contains(&days) {
+            return Err(ConfigError::Invalid {
+                key: "auth.trust_idle_days",
+                message: format!("{days} is not between 1 and {MAX_TRUST_IDLE_DAYS}"),
+            });
+        }
+        Ok(Duration::from_secs(days * 24 * 3600))
+    }
+
     /// Every provider checked: a name, an issuer, a client id, none twice;
     /// and somewhere for the provider to send the browser back to.
     fn check(&self, admin: &AdminConfig) -> Result<(), ConfigError> {
@@ -1355,6 +1377,7 @@ impl ServerConfig {
         parsed.admin.trusted_proxies()?;
         parsed.admin.metrics_from()?;
         parsed.auth.check(&parsed.admin)?;
+        parsed.auth.trust_idle()?;
         parsed.watch.rules()?;
         parsed.transcode.settings()?;
         // Any directory: only the values are checked here.
@@ -2209,6 +2232,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn trusted_devices_lapse_after_180_days_unless_set() {
+        let default = ServerConfig::parse(r#"schema = "spoolframe.server.v1";"#).unwrap();
+        assert_eq!(
+            default.auth.trust_idle().unwrap(),
+            Duration::from_secs(180 * 24 * 3600)
+        );
+        let set = ServerConfig::parse(
+            r#"schema = "spoolframe.server.v1"; auth { trust_idle_days = 30; }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            set.auth.trust_idle().unwrap(),
+            Duration::from_secs(30 * 24 * 3600)
+        );
+        for bad in [0, MAX_TRUST_IDLE_DAYS + 1] {
+            let refused = ServerConfig::parse(&format!(
+                r#"schema = "spoolframe.server.v1"; auth {{ trust_idle_days = {bad}; }}"#
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(
+                    refused,
+                    ConfigError::Invalid {
+                        key: "auth.trust_idle_days",
+                        ..
+                    }
+                ),
+                "{bad}: {refused:?}"
+            );
+        }
     }
 
     #[test]

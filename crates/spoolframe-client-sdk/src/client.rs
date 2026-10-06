@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use spoolframe_protocol::{
     FinishPasskeySignIn, LoginPassword, PasskeyRequest, Reply, Request, Response, SessionId,
-    device_sign_in, fingerprint, lan,
+    TrustedProfile, device_sign_in, fingerprint, lan,
 };
 use spoolframe_types::{ClientCapabilities, Platform};
 
@@ -74,6 +74,9 @@ pub struct DeviceSignIn {
     pub web_url: Option<String>,
     /// How long it can be approved, from when it began.
     pub expires_in: Duration,
+    /// It asked to be remembered (P4-01): the approver decides, and the
+    /// session it brings says what they chose ([`Session::remembered`]).
+    pub remember: bool,
     /// Only this device can collect the session with it.
     request: String,
 }
@@ -494,28 +497,88 @@ impl Client {
     }
 
     /// Sign `username` in on server `endpoint_id` with a password (§22),
-    /// and keep the session.
+    /// and keep the session. With `remember` ("Remember this device",
+    /// never ticked by default), the server trusts this device for them
+    /// (P4-01): once the session ends, [`Client::resume_profile`] opens
+    /// it again without a password, until they sign out here.
     pub async fn sign_in(
         &self,
         endpoint_id: &str,
         username: &str,
         password: &str,
+        remember: bool,
     ) -> Result<Session, SdkError> {
         let server = parse_id(endpoint_id)?;
         self.require_pinned(server).await?;
         let login = Request::LoginPassword(LoginPassword {
             username: username.to_owned(),
             password: password.to_owned(),
+            remember,
         });
-        let token = match self.call(server, None, login).await? {
-            Response::Ok(Reply::LoggedIn { session }) => session,
+        let (token, remembered) = match self.call(server, None, login).await? {
+            Response::Ok(Reply::LoggedIn {
+                session,
+                remembered,
+            }) => (session, remembered),
             Response::Ok(other) => {
                 return Err(SdkError::Protocol(format!("login answered {other:?}")));
             }
             Response::Err(e) => return Err(SdkError::from_server(e)),
         };
-        self.keep_session(server, token, SignInMethod::Password)
+        self.keep_session(server, token, Some(SignInMethod::Password), remembered)
             .await
+    }
+
+    /// The users this device is trusted for on server `endpoint_id`
+    /// (P4-01), by username: for "Who's watching" once their sessions have
+    /// ended. One with `auto_login` is the profile to open at start.
+    /// Trust that lapsed or was removed is not listed.
+    pub async fn trusted_profiles(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Vec<TrustedProfile>, SdkError> {
+        let server = parse_id(endpoint_id)?;
+        self.require_pinned(server).await?;
+        match self.call(server, None, Request::TrustedProfiles).await? {
+            Response::Ok(Reply::TrustedProfiles { profiles }) => Ok(profiles),
+            Response::Ok(other) => Err(SdkError::Protocol(format!(
+                "TrustedProfiles answered {other:?}"
+            ))),
+            Response::Err(e) => Err(SdkError::from_server(e)),
+        }
+    }
+
+    /// Open a session for `user_id` (a [`TrustedProfile::user_id`]) on
+    /// server `endpoint_id` without a password, on a device trusted for
+    /// them (P4-01), and keep it as a sign-in does. Its profile may start
+    /// locked, as after any sign-in, when the device asks for their PIN.
+    /// [`SdkError::SignInRequired`], whatever the reason, when the device
+    /// is no longer trusted for them (removed, lapsed, or the user
+    /// disabled): they sign in again in full.
+    pub async fn resume_profile(
+        &self,
+        endpoint_id: &str,
+        user_id: &str,
+    ) -> Result<Session, SdkError> {
+        let server = parse_id(endpoint_id)?;
+        self.require_pinned(server).await?;
+        let resume = Request::ResumeProfile {
+            user_id: user_id.to_owned(),
+        };
+        let (token, remembered) = match self.call(server, None, resume).await? {
+            Response::Ok(Reply::LoggedIn {
+                session,
+                remembered,
+            }) => (session, remembered),
+            Response::Ok(other) => {
+                return Err(SdkError::Protocol(format!(
+                    "ResumeProfile answered {other:?}"
+                )));
+            }
+            Response::Err(e) => return Err(SdkError::from_server(e)),
+        };
+        // Not a sign-in: how they last signed in stays what it was.
+        self.keep_session(server, token, None, remembered).await
     }
 
     /// Begin signing in on server `endpoint_id` with a passkey made in the
@@ -556,18 +619,27 @@ impl Client {
     /// server's, a removed one, an expired or spent challenge) is
     /// [`SdkError::InvalidCredentials`], counted as a failed sign-in (then
     /// [`SdkError::RateLimited`]).
+    /// `remember` is as for [`Client::sign_in`].
     pub async fn finish_passkey_sign_in(
         &self,
         endpoint_id: &str,
         signed: FinishPasskeySignIn,
+        remember: bool,
     ) -> Result<Session, SdkError> {
         let server = parse_id(endpoint_id)?;
         self.require_pinned(server).await?;
-        let token = match self
-            .call(server, None, Request::FinishPasskeySignIn(signed))
+        let (token, remembered) = match self
+            .call(
+                server,
+                None,
+                Request::FinishPasskeySignIn { signed, remember },
+            )
             .await?
         {
-            Response::Ok(Reply::LoggedIn { session }) => session,
+            Response::Ok(Reply::LoggedIn {
+                session,
+                remembered,
+            }) => (session, remembered),
             Response::Ok(other) => {
                 return Err(SdkError::Protocol(format!(
                     "FinishPasskeySignIn answered {other:?}"
@@ -575,7 +647,7 @@ impl Client {
             }
             Response::Err(e) => return Err(SdkError::from_server(e)),
         };
-        self.keep_session(server, token, SignInMethod::Passkey)
+        self.keep_session(server, token, Some(SignInMethod::Passkey), remembered)
             .await
     }
 
@@ -583,10 +655,21 @@ impl Client {
     /// it on another device they are signed in on (P3-07): show the code
     /// and a QR code of the link, then [`Client::await_device_sign_in`].
     /// For a device without a keyboard (a TV).
-    pub async fn begin_device_sign_in(&self, endpoint_id: &str) -> Result<DeviceSignIn, SdkError> {
+    ///
+    /// `remember` asks for this device to be trusted (P4-01), as
+    /// [`Client::sign_in`]'s does; the approver sees the request and
+    /// decides.
+    pub async fn begin_device_sign_in(
+        &self,
+        endpoint_id: &str,
+        remember: bool,
+    ) -> Result<DeviceSignIn, SdkError> {
         let server = parse_id(endpoint_id)?;
         self.require_pinned(server).await?;
-        match self.call(server, None, Request::BeginDeviceSignIn).await? {
+        match self
+            .call(server, None, Request::BeginDeviceSignIn { remember })
+            .await?
+        {
             Response::Ok(Reply::DeviceSignInStarted {
                 request,
                 code,
@@ -600,6 +683,7 @@ impl Client {
                 code,
                 request,
                 expires_in: Duration::from_millis(expires_in_ms),
+                remember,
             }),
             Response::Ok(other) => Err(SdkError::Protocol(format!(
                 "BeginDeviceSignIn answered {other:?}"
@@ -627,9 +711,12 @@ impl Client {
                 request: sign_in.request.clone(),
             };
             match self.call(server, None, request).await? {
-                Response::Ok(Reply::LoggedIn { session }) => {
+                Response::Ok(Reply::LoggedIn {
+                    session,
+                    remembered,
+                }) => {
                     return self
-                        .keep_session(server, session, SignInMethod::Device)
+                        .keep_session(server, session, Some(SignInMethod::Device), remembered)
                         .await;
                 }
                 Response::Ok(Reply::DeviceSignInPending) => {}
@@ -643,13 +730,15 @@ impl Client {
         }
     }
 
-    /// Keep `token`, a new session on `server` made by `method`, under the
+    /// Keep `token`, a new session on `server` made by `method` (`None`: a
+    /// resume, which keeps the user's last method and place), under the
     /// user it is.
     async fn keep_session(
         &self,
         server: EndpointId,
         token: SessionId,
-        method: SignInMethod,
+        method: Option<SignInMethod>,
+        remembered: bool,
     ) -> Result<Session, SdkError> {
         let user = match self.call(server, Some(&token), Request::WhoAmI).await? {
             Response::Ok(Reply::WhoAmI(user)) => user,
@@ -661,21 +750,37 @@ impl Client {
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
         let mut stored = session::load(storage, &server).await?;
-        // Signing in again as the same user replaces the old session here;
-        // the server keeps it until it expires or is revoked.
-        stored.retain(|s| s.username != user.username);
-        stored.push(StoredSession {
+        let kept = StoredSession {
             token: Some(token.0.clone()),
             username: user.username.clone(),
             display_name: user.display_name.clone(),
-            method: Some(method),
-        });
+            method,
+        };
+        match (
+            method,
+            stored.iter_mut().find(|s| s.username == user.username),
+        ) {
+            // A resume: the same profile, in its place.
+            (None, Some(old)) => {
+                *old = StoredSession {
+                    method: old.method,
+                    ..kept
+                };
+            }
+            // Signing in again as the same user replaces the old session
+            // here; the server keeps it until it expires or is revoked.
+            _ => {
+                stored.retain(|s| s.username != user.username);
+                stored.push(kept);
+            }
+        }
         session::save(storage, &server, &stored).await?;
         Ok(Session {
             client: self.clone(),
             server,
             token,
             user,
+            remembered: Some(remembered),
         })
     }
 
@@ -699,6 +804,7 @@ impl Client {
                     server,
                     token,
                     user,
+                    remembered: None,
                 }),
                 Response::Err(spoolframe_protocol::Error::Unauthenticated) => {
                     tracing::info!(

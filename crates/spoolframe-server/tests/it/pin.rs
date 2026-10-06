@@ -635,6 +635,7 @@ async fn wrong_passwords_share_the_sign_in_limit_not_the_pin_s() {
     let wrong_login = Request::LoginPassword(LoginPassword {
         username: "alice".into(),
         password: "wrong password".into(),
+        remember: false,
     });
     assert_eq!(
         tv.call(None, wrong_login.clone()).await,
@@ -662,6 +663,7 @@ async fn wrong_passwords_share_the_sign_in_limit_not_the_pin_s() {
         let login = Request::LoginPassword(LoginPassword {
             username: username.into(),
             password: password.into(),
+            remember: false,
         });
         let refused = tv.call(None, login).await;
         assert!(

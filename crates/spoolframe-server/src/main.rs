@@ -417,7 +417,7 @@ async fn run(
     let store = Store::open(state_dir).await?;
     // Previews made ahead (P3-13) start with what is being watched.
     previews::ahead::spawn(&previews, catalog.clone(), store.clone());
-    let auth = Auth::new(store);
+    let auth = Auth::new(store).with_trust_idle(config.auth.trust_idle()?);
     let watch = Arc::new(Watch::new(
         auth.store().clone(),
         catalog.clone(),

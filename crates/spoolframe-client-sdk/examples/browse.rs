@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     let pinned = client.connect(&server.endpoint_id).await?;
     println!("pinned: {}", pinned.pinned);
     let session = client
-        .sign_in(&server.endpoint_id, &user, &password)
+        .sign_in(&server.endpoint_id, &user, &password, false)
         .await?;
     println!("signed in as {}", session.user().display_name);
 

@@ -257,6 +257,7 @@ fn answer(id: EndpointId, request: Request) -> Response {
         Request::PlaybackRevision { .. } => Reply::PlaybackRevision { revision: 0 },
         Request::LoginPassword(_) => Reply::LoggedIn {
             session: SessionId("stub-session".into()),
+            remembered: false,
         },
         Request::WhoAmI => Reply::WhoAmI(UserSummary {
             user_id: "local:1".into(),
@@ -274,6 +275,7 @@ fn answer(id: EndpointId, request: Request) -> Response {
             client_name: "spoolframe-tvos".into(),
             platform: spoolframe_types::Platform::Tvos,
             requested_at: 0,
+            remember: false,
         }),
         Request::ApproveDeviceSignIn { .. } => Reply::Done,
         _ => {

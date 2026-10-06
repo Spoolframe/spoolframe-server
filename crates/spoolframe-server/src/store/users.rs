@@ -252,6 +252,9 @@ impl Store {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        // And none of their devices resumes them (P4-01): trust was made
+        // under the old password, by whoever knew it.
+        forget_trust(&mut tx, id).await?;
         tx.commit().await?;
         // The other devices' connections are closed (PX-10).
         self.note_sessions_ended();
@@ -321,6 +324,8 @@ impl Store {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        // Enabling them again does not bring it back (P4-01).
+        forget_trust(&mut tx, id).await?;
         tx.commit().await?;
         self.note_sessions_ended();
         Ok(revoked)
@@ -414,6 +419,18 @@ impl Store {
         })
         .transpose()
     }
+}
+
+/// Remove every device's trust for `user` (P4-01).
+async fn forget_trust(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    user: LocalUserId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM trusted_endpoints WHERE user_id = ?1")
+        .bind(user)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// A role as the database stores it. `Unknown` is never stored: the

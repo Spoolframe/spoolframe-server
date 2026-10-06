@@ -424,6 +424,7 @@ mod tests {
             spoolframe_protocol::LoginPassword {
                 username: "alice".into(),
                 password: "correct horse".into(),
+                remember: false,
             },
         ));
         assert!(

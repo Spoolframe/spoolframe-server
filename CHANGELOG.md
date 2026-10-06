@@ -1956,3 +1956,48 @@
   `close::BUSY` is the new `SdkError::ServerFull` (try again later), not
   `Unreachable`; a reconnect refused so stops. Session-less calls cut
   off by a sign-out are retried on a new connection as before.
+- Trusted devices (P4-01): a device a user chose to remember opens their
+  profile again without a password once their session has ended. The
+  device's Iroh key is the proof, so it works with the Internet down.
+  Wire revision 4 (`PROTOCOL_VERSION` 4):
+  - `LoginPassword`, `FinishPasskeySignIn` and `BeginDeviceSignIn` take
+    a required `remember`. It is never true unless the user ticked
+    "Remember this device".
+  - `ApproveDeviceSignIn` takes the approver's `remember`. A device is
+    trusted only if it asked and the approver agreed.
+    `DeviceSignInRequest.remember` says that the device asked.
+  - `LoggedIn` says whether the device is `remembered`.
+  - The new pre-auth `TrustedProfiles` lists this device's own trusted
+    users, and `ResumeProfile` opens a session for one of them. Every
+    refusal is `Unauthenticated`. A device that requires the PIN gets a
+    locked session. A resumed session is not a recent sign-in: its user
+    confirms before a sensitive change.
+  - The new `SetDeviceTrust` turns trust and auto-login on for this
+    device, after a recent sign-in. It turns trust off for any of the
+    user's devices, and that ends the user's sessions there.
+  - `DeviceInfo` has `trusted` and `auto_login`.
+
+  At most one user per device has auto-login. Auto-login turns the PIN
+  off there, and the PIN turns auto-login off. These end trust: signing
+  out, a session ended by its user or an admin, "sign out everywhere
+  else", ten wrong PINs, any password change or reset, and disabling the
+  user. Trust unused for `auth.trust_idle_days` (default 180) lapses.
+  Migration 0014 adds `trusted_endpoints`. SDK: `remember` on `sign_in`,
+  `finish_passkey_sign_in`, `begin_device_sign_in` and
+  `approve_device_sign_in`. New calls: `Client::trusted_profiles`,
+  `Client::resume_profile`, `Session::set_device_trust` and
+  `Session::remembered`.
+- Trusted devices in the admin API and the CLI (P4-01, for the web UI's
+  P4-03). `DeviceEntry` (`me.devices`, `admin.userDevices`) has
+  `trusted` and `autoLogin`. `DeviceSignIn` (`me.deviceSignInLookup`)
+  has `remember`: the device asked to be remembered.
+  `me.deviceSignInApprove` takes the approver's `remember`. The web UI
+  sends `false` until P4-03 shows the box. `me.setDeviceTrust(endpointId,
+  trusted, autoLogin)` works for any device the caller has signed in on.
+  `admin.userSetDeviceTrust(username, endpointId, trusted, autoLogin)`
+  works for any user's device. Both need a recent sign-in in either
+  direction (`RECENT_SIGN_IN_REQUIRED`). A device the user never used is
+  `NO_SUCH_DEVICE`, and auto-login without trust is `INVALID_INPUT`.
+  Stopping trust ends the user's sessions on that device. `user devices`
+  shows "trusted" and "opens at start". `user trust <name> --device
+  <name|prefix> [--off | --auto-login]` sets trust.

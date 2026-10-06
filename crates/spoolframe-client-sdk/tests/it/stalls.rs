@@ -57,7 +57,10 @@ async fn pin(client: &Client, stub: &Stub) {
 async fn signed_in(stub: &Stub) -> (Client, Session) {
     let client = client().await;
     pin(&client, stub).await;
-    let alice = client.sign_in(&stub.id(), "alice", "pw").await.unwrap();
+    let alice = client
+        .sign_in(&stub.id(), "alice", "pw", false)
+        .await
+        .unwrap();
     (client, alice)
 }
 
@@ -78,7 +81,7 @@ async fn a_request_to_a_frozen_server_times_out_and_the_next_one_dials_anew() {
         stub.freeze();
 
         let started = Instant::now();
-        let approve = alice.approve_device_sign_in(CODE).await;
+        let approve = alice.approve_device_sign_in(CODE, false).await;
         assert!(
             matches!(approve, Err(SdkError::Unreachable(_))),
             "{approve:?}"
@@ -185,7 +188,7 @@ async fn an_approval_on_a_dead_connection_is_retried() {
         let (client, alice) = signed_in(&stub).await;
         stub.kill_open_connections();
 
-        let approve = alice.approve_device_sign_in(CODE).await;
+        let approve = alice.approve_device_sign_in(CODE, false).await;
         assert!(approve.is_ok(), "{approve:?}");
         // The dead connection was dropped: the next request works.
         alice.whoami().await.unwrap();

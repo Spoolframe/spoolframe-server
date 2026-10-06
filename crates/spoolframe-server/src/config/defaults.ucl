@@ -144,17 +144,22 @@ admin {
 # <issuer>/.well-known/openid-configuration, whose issuer must be exactly
 # the one configured. Left out, no SSO anywhere.
 #
-# auth {
-#   oidc [
-#     { name = "Pocket ID"; issuer = "https://id.example.org";
-#       client_id = "…";
-#       # A file holding the client secret. Left out, the secret set in
-#       # the web UI, kept as secrets/oidc-<name> in the state directory.
-#       client_secret_file = "/run/secrets/spoolframe-oidc";
-#       # What is asked for; openid is always.
-#       scopes = ["openid", "profile", "email"]; },
-#   ]
-# }
+auth {
+  # oidc [
+  #   { name = "Pocket ID"; issuer = "https://id.example.org";
+  #     client_id = "…";
+  #     # A file holding the client secret. Left out, the secret set in
+  #     # the web UI, kept as secrets/oidc-<name> in the state directory.
+  #     client_secret_file = "/run/secrets/spoolframe-oidc";
+  #     # What is asked for; openid is always.
+  #     scopes = ["openid", "profile", "email"]; },
+  # ]
+
+  # Trusted devices (P4-01): a device a user chose to remember opens
+  # their profile without a password. Unused for this many days (1 to
+  # 3650), it forgets them, and they sign in again in full.
+  trust_idle_days = 180;
+}
 
 # The artwork cache under the state directory, in MiB.
 artwork {

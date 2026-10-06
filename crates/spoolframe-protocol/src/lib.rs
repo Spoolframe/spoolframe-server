@@ -31,7 +31,7 @@ pub use messages::{
     AuthMethod, ConfirmPassword, DeviceInfo, DeviceSignInRequest, Error, Event, Hello, HomeScreen,
     LoginPassword, MAX_HELLO_TEXT, ManifestKind, PROTOCOL_VERSION, PinProof, PinState, Reply,
     Request, RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo, SessionId, SessionInfo,
-    UserSummary,
+    TrustedProfile, UserSummary,
 };
 pub use passkeys::{
     APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, NONCE_LEN,

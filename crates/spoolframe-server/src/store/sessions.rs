@@ -87,6 +87,22 @@ impl Store {
     ) -> Result<(), StoreError> {
         let now = now();
         let mut tx = self.pool.begin().await?;
+        Self::insert_session(&mut tx, token_hash, user, binding, expires_at, now, now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`Store::create_session`] inside `tx`, at `now`, its user last
+    /// proving who they are at `authenticated_at`.
+    pub(super) async fn insert_session(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        token_hash: &str,
+        user: LocalUserId,
+        binding: &SessionBinding,
+        expires_at: i64,
+        now: i64,
+        authenticated_at: i64,
+    ) -> Result<(), StoreError> {
         let (kind, endpoint) = match binding {
             SessionBinding::Endpoint {
                 endpoint_id,
@@ -109,7 +125,7 @@ impl Store {
                 .bind(device_name)
                 .bind(now)
                 .bind(platform.as_str())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
                 ("endpoint", Some(endpoint_id.as_str()))
             }
@@ -121,7 +137,7 @@ impl Store {
             "INSERT INTO sessions \
                (token_hash, user_id, kind, endpoint_id, created_at, last_used_at, \
                 authenticated_at, expires_at, client) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?8, ?6, ?7)",
         )
         .bind(token_hash)
         .bind(user)
@@ -130,9 +146,9 @@ impl Store {
         .bind(now)
         .bind(expires_at)
         .bind(client)
-        .execute(&mut *tx)
+        .bind(authenticated_at)
+        .execute(&mut **tx)
         .await?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -236,6 +252,16 @@ impl Store {
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
+            // A device in use is not idle: its trust does not lapse (P4-01).
+            sqlx::query(
+                "UPDATE trusted_endpoints SET last_used_at = ?3 \
+                 WHERE user_id = ?1 AND endpoint_id = ?2",
+            )
+            .bind(id)
+            .bind(endpoint_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
         }
         Ok(Some(SessionUser {
@@ -310,12 +336,15 @@ impl Store {
     }
 
     /// Revoke every live session of `user`'s but `keep` (a token hash):
-    /// "sign out everywhere else" (P3-03). How many were revoked.
+    /// "sign out everywhere else" (P3-03). Every other device's trust for
+    /// them goes too (P4-01), or those devices would resume at once. How
+    /// many were revoked.
     pub async fn revoke_other_sessions(
         &self,
         user: LocalUserId,
         keep: &str,
     ) -> Result<u64, StoreError> {
+        let mut tx = self.pool.begin().await?;
         let revoked = sqlx::query(
             "UPDATE sessions SET revoked_at = ?3 \
              WHERE user_id = ?1 AND token_hash != ?2 AND revoked_at IS NULL",
@@ -323,16 +352,54 @@ impl Store {
         .bind(user)
         .bind(keep)
         .bind(now())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        sqlx::query(
+            "DELETE FROM trusted_endpoints WHERE user_id = ?1 AND endpoint_id IS NOT \
+               (SELECT endpoint_id FROM sessions WHERE token_hash = ?2)",
+        )
+        .bind(user)
+        .bind(keep)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         self.note_sessions_ended();
         Ok(revoked)
     }
 
-    /// Revoke one session. Revoking an unknown or already revoked one is
-    /// not an error.
+    /// Revoke one session: signed out, or ended by its user or an admin.
+    /// Its device's trust for its user goes with it (P4-01): signing out
+    /// forgets the device, and a session someone ended must not come back
+    /// as a resume. Revoking an unknown or already revoked one is not an
+    /// error.
     pub async fn revoke_session(&self, token_hash: &str) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM trusted_endpoints WHERE (user_id, endpoint_id) IN \
+               (SELECT user_id, endpoint_id FROM sessions \
+                WHERE token_hash = ?1 AND kind = 'endpoint')",
+        )
+        .bind(token_hash)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE sessions SET revoked_at = ?2 WHERE token_hash = ?1 AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.note_sessions_ended();
+        Ok(())
+    }
+
+    /// Revoke a session nobody holds: one made for a device sign-in whose
+    /// code ran out before the device was handed it. Unlike
+    /// [`Store::revoke_session`], the device's trust stays: the device
+    /// never had this session, and its user did not sign out there.
+    pub async fn discard_unheld_session(&self, token_hash: &str) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE sessions SET revoked_at = ?2 WHERE token_hash = ?1 AND revoked_at IS NULL",
         )

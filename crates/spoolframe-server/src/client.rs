@@ -27,7 +27,7 @@ use spoolframe_protocol::streams::{bi, reset, uni};
 use spoolframe_protocol::{
     APP_RP_ID, AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, FinishPasskeySignIn,
     Hello, LoginPassword, PasskeyInfo, PinProof, PinState, PlexLink, PlexSyncSummary, Reply,
-    Request, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
+    Request, Response, ServerInfo, SessionId, SessionInfo, TrustedProfile, UserSummary,
 };
 use spoolframe_protocol::{
     ArtworkRequest, ArtworkSize, ChosenTracks, ConvertedSubtitle, MAX_READ, MediaRead,
@@ -54,6 +54,7 @@ use crate::principal::Principal;
 use crate::store::passkeys::{PasskeyError, PasskeyRecord};
 use crate::store::pins::PinError;
 use crate::store::sessions::{SessionBinding, SessionUser};
+use crate::store::trust::TrustError;
 use crate::subtitles::{TextSource, TextState};
 use crate::tracks::{self, TrackOverride};
 use crate::watch::WatchError;
@@ -343,10 +344,11 @@ impl ClientProtocol {
         let anonymous = matches!(
             wire.envelope.request,
             Request::LoginPassword(_)
-                | Request::BeginDeviceSignIn
+                | Request::BeginDeviceSignIn { .. }
                 | Request::AwaitDeviceSignIn { .. }
                 | Request::BeginPasskeySignIn { .. }
-                | Request::FinishPasskeySignIn(_)
+                | Request::FinishPasskeySignIn { .. }
+                | Request::ResumeProfile { .. }
         );
         let operations = if anonymous {
             &self.anonymous_operations
@@ -513,7 +515,7 @@ impl ClientProtocol {
                     Err(e) => Err(e),
                 }
             }
-            Request::BeginDeviceSignIn => {
+            Request::BeginDeviceSignIn { remember } => {
                 let hello = state.hello.get().expect("checked above");
                 let started = self.services.auth.sign_ins().begin(Waiting {
                     endpoint: connection.remote_id().to_string(),
@@ -521,6 +523,7 @@ impl ClientProtocol {
                     client_name: hello.client_name.clone(),
                     platform: hello.platform,
                     requested_at: crate::store::now(),
+                    remember,
                 });
                 match started {
                     Some(started) => Ok(Reply::DeviceSignInStarted {
@@ -547,11 +550,16 @@ impl ClientProtocol {
                     .wait(&request, &endpoint, device_sign_in::AWAIT)
                     .await;
                 match outcome {
-                    Outcome::Approved(token) => {
-                        tracing::info!(%endpoint, "device signed in by approval");
+                    Outcome::Approved(handover) => {
+                        tracing::info!(
+                            %endpoint,
+                            remembered = handover.remembered,
+                            "device signed in by approval"
+                        );
                         self.connections.signed_in(&connection.remote_id());
                         Ok(Reply::LoggedIn {
-                            session: SessionId(token.0),
+                            session: SessionId(handover.token.0),
+                            remembered: handover.remembered,
                         })
                     }
                     Outcome::Pending => Ok(Reply::DeviceSignInPending),
@@ -578,15 +586,42 @@ impl ClientProtocol {
                     .map(Reply::PasskeySignInBegun)
                     .map_err(sign_in_error)
             }
-            Request::FinishPasskeySignIn(signed) => {
+            Request::FinishPasskeySignIn { signed, remember } => {
                 let hello = state.hello.get().expect("checked above");
                 match self.stranger_attempt(state) {
                     Ok(()) => {
-                        self.finish_passkey_sign_in(connection, &signed, hello)
+                        self.finish_passkey_sign_in(connection, &signed, hello, remember)
                             .await
                     }
                     Err(e) => Err(e),
                 }
+            }
+            // P4-01. Neither draws on the strangers' sign-in budget: the
+            // device's key is the proof, and nothing is guessed here.
+            Request::TrustedProfiles => {
+                let endpoint = connection.remote_id().to_string();
+                let profiles = self
+                    .services
+                    .auth
+                    .trusted_profiles(&endpoint)
+                    .await
+                    .map_err(internal);
+                profiles.map(|profiles| Reply::TrustedProfiles {
+                    profiles: profiles
+                        .into_iter()
+                        .map(|p| TrustedProfile {
+                            user_id: format!("local:{}", p.user),
+                            username: p.username,
+                            display_name: p.display_name,
+                            pin_required: p.pin_required,
+                            auto_login: p.auto_login,
+                        })
+                        .collect(),
+                })
+            }
+            Request::ResumeProfile { user_id } => {
+                let hello = state.hello.get().expect("checked above");
+                self.resume_profile(connection, &user_id, hello).await
             }
             // Everything else needs a session that is live on this
             // endpoint. Each request names its own, so one connection can
@@ -1390,6 +1425,8 @@ impl ClientProtocol {
                         name: d.name,
                         last_seen_at: d.last_seen_at,
                         pin_required: d.pin_required,
+                        trusted: d.trusted,
+                        auto_login: d.auto_login,
                     })
                     .collect();
                 Ok(Reply::Devices { devices })
@@ -1443,6 +1480,8 @@ impl ClientProtocol {
                 tracing::info!(user = %user.username, %device, required, "PIN requirement changed");
                 Ok(Reply::Done)
             }
+            // Forgets the device for the user too (P4-01): signing out is
+            // leaving it.
             Request::Logout => {
                 self.services
                     .auth
@@ -1450,6 +1489,51 @@ impl ClientProtocol {
                     .await
                     .map_err(internal)?;
                 Ok(Reply::LoggedOut)
+            }
+            Request::SetDeviceTrust {
+                device,
+                trusted,
+                auto_login,
+            } => {
+                let this = connection.remote_id().to_string();
+                let device = device.unwrap_or_else(|| this.clone());
+                let own = device == this;
+                // A client trusts only itself: another device is trusted
+                // from the web UI (P4-01).
+                if trusted && !own {
+                    return Err(Error::InvalidInput {
+                        message: "trust another device from the web UI".into(),
+                    });
+                }
+                // Trust, and auto-login (which turns the PIN off), are as
+                // strong as a sign-in: a session left signed in does not
+                // grant them, nor end another device's sessions. Stopping
+                // trust on this very device only takes away.
+                if trusted || !own {
+                    recently_signed_in(&user)?;
+                }
+                let revoked = self
+                    .store()
+                    .set_device_trust(user.user, &device, trusted, auto_login)
+                    .await
+                    .map_err(|e| match e {
+                        TrustError::NoSuchDevice => Error::NotFound {
+                            what: format!("device {device}"),
+                        },
+                        TrustError::AutoLoginUntrusted => Error::InvalidInput {
+                            message: "auto-login needs the device to be trusted".into(),
+                        },
+                        TrustError::Store(e) => internal(e),
+                    })?;
+                tracing::info!(
+                    user = %user.username,
+                    %device,
+                    trusted,
+                    auto_login,
+                    revoked,
+                    "device trust changed in an app"
+                );
+                Ok(Reply::Done)
             }
             Request::ListSessions => {
                 let current = SessionToken(session.0).hash();
@@ -1936,11 +2020,12 @@ impl ClientProtocol {
                         client_name: waiting.client_name,
                         platform: waiting.platform,
                         requested_at: waiting.requested_at,
+                        remember: waiting.remember,
                     })),
                     None => Err(self.wrong_sign_in_code(connection, &user)),
                 }
             }
-            Request::ApproveDeviceSignIn { code } => {
+            Request::ApproveDeviceSignIn { code, remember } => {
                 recently_signed_in(&user)?;
                 let code = self.sign_in_code(connection, &user, &code)?;
                 let approver = connection.remote_id().to_string();
@@ -1955,11 +2040,17 @@ impl ClientProtocol {
                         });
                     }
                 };
-                match self.services.auth.approve_device(user.user, &claim).await {
+                match self
+                    .services
+                    .auth
+                    .approve_device(user.user, &claim, remember)
+                    .await
+                {
                     Ok(Approval::SignedIn) => {
                         tracing::info!(
                             user = %user.username,
                             device = %claim.endpoint,
+                            remembered = claim.remember && remember,
                             "device sign-in approved"
                         );
                         Ok(Reply::Done)
@@ -1985,10 +2076,12 @@ impl ClientProtocol {
             | Request::AuthMethods
             | Request::LoginPassword(_)
             | Request::Ping
-            | Request::BeginDeviceSignIn
+            | Request::BeginDeviceSignIn { .. }
             | Request::AwaitDeviceSignIn { .. }
             | Request::BeginPasskeySignIn { .. }
-            | Request::FinishPasskeySignIn(_)
+            | Request::FinishPasskeySignIn { .. }
+            | Request::TrustedProfiles
+            | Request::ResumeProfile { .. }
             | Request::Unknown => {
                 unreachable!("pre-auth and unknown requests are answered before the session check")
             }
@@ -2033,14 +2126,21 @@ impl ClientProtocol {
                 &login.password,
                 binding,
                 Some(&endpoint_id),
+                login.remember,
             )
             .await
         {
             Ok(done) => {
-                tracing::info!(endpoint = %endpoint_id, user = ?done.user, "logged in");
+                tracing::info!(
+                    endpoint = %endpoint_id,
+                    user = ?done.user,
+                    remembered = done.remembered,
+                    "logged in"
+                );
                 self.connections.signed_in(&connection.remote_id());
                 Ok(Reply::LoggedIn {
                     session: SessionId(done.token.0),
+                    remembered: done.remembered,
                 })
             }
             Err(e) => Err(login_error(e)),
@@ -2054,6 +2154,7 @@ impl ClientProtocol {
         connection: &Connection,
         signed: &FinishPasskeySignIn,
         hello: &Hello,
+        remember: bool,
     ) -> Result<Reply, Error> {
         let endpoint_id = connection.remote_id().to_string();
         let user = self
@@ -2073,11 +2174,61 @@ impl ClientProtocol {
             .open_session(user.id, &binding)
             .await
             .map_err(internal)?;
-        tracing::info!(endpoint = %endpoint_id, user = %user.id, "logged in with an app passkey");
+        let remembered = self
+            .services
+            .auth
+            .remembered(&token, &binding, user.id, remember)
+            .await
+            .map_err(internal)?;
+        tracing::info!(
+            endpoint = %endpoint_id,
+            user = %user.id,
+            remembered,
+            "logged in with an app passkey"
+        );
         self.connections.signed_in(&connection.remote_id());
         Ok(Reply::LoggedIn {
             session: SessionId(token.0),
+            remembered,
         })
+    }
+
+    /// A trusted device's resume of `user_id` (P4-01): a session bound to
+    /// this connection's endpoint, as a sign-in opens, or
+    /// `Unauthenticated` for every reason it is not trusted for them.
+    async fn resume_profile(
+        &self,
+        connection: &Connection,
+        user_id: &str,
+        hello: &Hello,
+    ) -> Result<Reply, Error> {
+        let endpoint_id = connection.remote_id().to_string();
+        let Some(user) = user_id
+            .strip_prefix("local:")
+            .and_then(|id| id.parse::<crate::store::users::LocalUserId>().ok())
+        else {
+            return Err(Error::Unauthenticated);
+        };
+        let binding = SessionBinding::Endpoint {
+            endpoint_id: endpoint_id.clone(),
+            device_name: hello.device_name.clone(),
+            platform: hello.platform,
+        };
+        match self.services.auth.resume(user, &binding).await {
+            Ok(Some(token)) => {
+                tracing::info!(endpoint = %endpoint_id, user = %user, "resumed on a trusted device");
+                self.connections.signed_in(&connection.remote_id());
+                Ok(Reply::LoggedIn {
+                    session: SessionId(token.0),
+                    remembered: true,
+                })
+            }
+            Ok(None) => {
+                tracing::info!(endpoint = %endpoint_id, user = %user, "a resume was refused");
+                Err(Error::Unauthenticated)
+            }
+            Err(e) => Err(internal(e)),
+        }
     }
 
     /// `session`'s user proved who they are again, `how`: it counts as

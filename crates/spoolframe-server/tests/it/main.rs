@@ -42,5 +42,6 @@ mod subtitles;
 mod telemetry;
 mod throughput;
 mod tracks;
+mod trust;
 mod watch;
 mod wizard;

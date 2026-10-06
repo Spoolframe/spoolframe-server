@@ -27,7 +27,7 @@ use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -75,7 +75,13 @@ pub enum Request {
     /// one they are signed in on (P3-07). Show the code (and its
     /// [`crate::device_sign_in::link`] as a QR code), then
     /// `AwaitDeviceSignIn`. `DeviceSignInStarted`.
-    BeginDeviceSignIn,
+    ///
+    /// `remember` asks for this device to be trusted (P4-01); the
+    /// approver sees the request and decides. Never true unless the user
+    /// ticked "Remember this device".
+    BeginDeviceSignIn {
+        remember: bool,
+    },
     /// Wait, up to about 25 s, for `request` to be approved: `LoggedIn`
     /// with a session for this device, `DeviceSignInPending` (ask again),
     /// or `DeviceSignInDenied` / `DeviceSignInExpired`. Only the device
@@ -93,10 +99,30 @@ pub enum Request {
         username: Option<String>,
     },
     /// Finish it with what the passkey signed: `LoggedIn`, a session for
-    /// this device, as `LoginPassword` gives (its PIN is asked as usual).
+    /// this device, as `LoginPassword` gives (its PIN is asked as usual),
+    /// and with `remember` this device trusted, as `LoginPassword` does.
     /// Anything that does not sign in is `InvalidCredentials`, counted as
     /// a failed sign-in (then `RateLimited`).
-    FinishPasskeySignIn(FinishPasskeySignIn),
+    FinishPasskeySignIn {
+        signed: FinishPasskeySignIn,
+        remember: bool,
+    },
+    /// The users this device is trusted for (P4-01): `TrustedProfiles`,
+    /// for "Who's watching" once their sessions have ended. Only this
+    /// device's own; nothing about other devices. Trust that lapsed is
+    /// left out.
+    TrustedProfiles,
+    /// Start a session on this device for `user_id` (as `TrustedProfiles`
+    /// gives it), without a password: `LoggedIn`, a normal session bound
+    /// to this device, `remembered: true`. A device that asks for the
+    /// user's PIN gets it locked, as after any sign-in. `Unauthenticated`,
+    /// the same for every reason, when this device is not trusted for
+    /// them, the trust lapsed or was removed, or the user is disabled.
+    /// The server never resumes a profile by itself: auto-login is the
+    /// client resuming the profile marked `auto_login` at start.
+    ResumeProfile {
+        user_id: String,
+    },
 
     // Need a session.
     Libraries,
@@ -122,7 +148,9 @@ pub enum Request {
     },
     /// Who this request's session belongs to.
     WhoAmI,
-    /// End this request's session (and only it).
+    /// End this request's session (and only it). On a trusted device it
+    /// forgets the device for this user too (P4-01): the next time is a
+    /// full sign-in.
     Logout,
     /// The session user's live sessions on every device.
     ListSessions,
@@ -270,8 +298,33 @@ pub enum Request {
     },
     /// Sign the device showing `code` in as the session user. `Done`.
     /// Requires recent authentication; an old session cannot mint a fresh one.
+    ///
+    /// `remember`: the approver's answer to the device's request to be
+    /// trusted (`DeviceSignInRequest::remember`, P4-01). The device is
+    /// trusted only if it asked and this is true; this cannot trust a
+    /// device that did not ask.
     ApproveDeviceSignIn {
         code: String,
+        remember: bool,
+    },
+    /// Trust `device` (an endpoint id from `Devices`; this device if left
+    /// out) for the session user, or stop (P4-01). `Done`.
+    ///
+    /// - Turning trust on, or auto-login on, works for this device only
+    ///   (`InvalidInput` for another: trust another device from the web
+    ///   UI), and needs a recent sign-in (`RecentSignInRequired`).
+    /// - Auto-login needs trust (`InvalidInput` without). It turns
+    ///   auto-login off for the device's other users, and the PIN
+    ///   requirement off for this user there.
+    /// - Turning trust off works for any of the user's devices, and ends
+    ///   the user's sessions there, this one too if it is this device.
+    ///   For another device it needs a recent sign-in; for this one it
+    ///   needs only the session.
+    /// - A device that is not the user's is `NotFound`.
+    SetDeviceTrust {
+        device: Option<String>,
+        trusted: bool,
+        auto_login: bool,
     },
     /// Refuse it: the device stops waiting. `Done`.
     DenyDeviceSignIn {
@@ -388,10 +441,12 @@ impl Request {
                 | Request::AuthMethods
                 | Request::LoginPassword(_)
                 | Request::Ping
-                | Request::BeginDeviceSignIn
+                | Request::BeginDeviceSignIn { .. }
                 | Request::AwaitDeviceSignIn { .. }
                 | Request::BeginPasskeySignIn { .. }
-                | Request::FinishPasskeySignIn(_)
+                | Request::FinishPasskeySignIn { .. }
+                | Request::TrustedProfiles
+                | Request::ResumeProfile { .. }
         )
     }
 }
@@ -446,6 +501,10 @@ impl Hello {
 pub struct LoginPassword {
     pub username: String,
     pub password: String,
+    /// Trust this device for the user (P4-01): it may resume them later
+    /// without a password (`ResumeProfile`). Never true unless the user
+    /// ticked "Remember this device".
+    pub remember: bool,
 }
 
 impl fmt::Debug for LoginPassword {
@@ -453,6 +512,7 @@ impl fmt::Debug for LoginPassword {
         f.debug_struct("LoginPassword")
             .field("username", &self.username)
             .field("password", &"<redacted>")
+            .field("remember", &self.remember)
             .finish()
     }
 }
@@ -556,6 +616,15 @@ pub enum Reply {
     },
     LoggedIn {
         session: SessionId,
+        /// This device is trusted for the session's user after it
+        /// (P4-01): the sign-in asked to be remembered and it was (by the
+        /// approver too, for a device sign-in), or the device already was.
+        remembered: bool,
+    },
+    /// The users this device is trusted for (`TrustedProfiles`), by
+    /// username.
+    TrustedProfiles {
+        profiles: Vec<TrustedProfile>,
     },
     Pong,
     /// A device sign-in is pending (P3-07). Show `code` (see
@@ -741,6 +810,23 @@ pub struct PinState {
     pub digits: Option<u8>,
 }
 
+/// A user a device is trusted for (P4-01), as that device sees them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedProfile {
+    /// What `ResumeProfile` takes: `UserSummary::user_id`.
+    pub user_id: String,
+    /// To match the profile with one the device keeps by username.
+    pub username: String,
+    /// What to show; the username when the user has no display name.
+    pub display_name: String,
+    /// The user's PIN is asked for on this device: a resumed session
+    /// starts locked.
+    pub pin_required: bool,
+    /// Open this profile at start, past "Who's watching". At most one per
+    /// device.
+    pub auto_login: bool,
+}
+
 /// One of a user's devices (P2-08).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -756,6 +842,10 @@ pub struct DeviceInfo {
     pub last_seen_at: i64,
     /// The user's PIN is asked for on it.
     pub pin_required: bool,
+    /// It may resume the user without a password (P4-01).
+    pub trusted: bool,
+    /// It opens the user's profile at start (P4-01).
+    pub auto_login: bool,
     /// The device this request came from.
     pub this_device: bool,
 }
@@ -774,6 +864,9 @@ pub struct DeviceSignInRequest {
     pub platform: Platform,
     /// Unix seconds.
     pub requested_at: i64,
+    /// The device asked to be remembered (P4-01): the approval says "This
+    /// device will be remembered", ticked, and the approver may untick it.
+    pub remember: bool,
 }
 
 /// One live session, without its token.

@@ -38,7 +38,10 @@ async fn clients_sign_in_and_are_told_the_server_is_not_set_up() {
         .unwrap();
     client.connect(&id).await.unwrap();
     client.pin(&id, true).await.unwrap();
-    let alice = client.sign_in(&id, "alice", "correct horse").await.unwrap();
+    let alice = client
+        .sign_in(&id, "alice", "correct horse", false)
+        .await
+        .unwrap();
     assert_eq!(alice.whoami().await.unwrap().username, "alice");
 
     assert_eq!(alice.libraries().await.unwrap_err(), SdkError::NotSetUp);

@@ -19,6 +19,10 @@ pub struct DeviceRecord {
     pub last_seen_at: i64,
     /// The user's PIN is asked for on it.
     pub pin_required: bool,
+    /// It may resume the user without a full sign-in (P4-01).
+    pub trusted: bool,
+    /// It opens the user's profile by itself at start (P4-01).
+    pub auto_login: bool,
 }
 
 /// What may be said about a user's PIN: never its hash.
@@ -153,6 +157,15 @@ impl Store {
             .bind(now())
             .execute(&mut *tx)
             .await?;
+            // A profile that opens by itself asks for no PIN (P4-01).
+            sqlx::query(
+                "UPDATE trusted_endpoints SET auto_login = 0 \
+                 WHERE user_id = ?1 AND endpoint_id = ?2",
+            )
+            .bind(user)
+            .bind(endpoint_id)
+            .execute(&mut *tx)
+            .await?;
         } else {
             sqlx::query("DELETE FROM pin_required WHERE user_id = ?1 AND endpoint_id = ?2")
                 .bind(user)
@@ -169,8 +182,10 @@ impl Store {
         Ok(sqlx::query_as(
             "SELECT d.endpoint_id, d.display_name AS name, d.platform, d.last_seen_at, \
                     EXISTS (SELECT 1 FROM pin_required r \
-                            WHERE r.user_id = ?1 AND r.endpoint_id = d.endpoint_id) AS pin_required \
+                            WHERE r.user_id = ?1 AND r.endpoint_id = d.endpoint_id) AS pin_required, \
+                    t.user_id IS NOT NULL AS trusted, coalesce(t.auto_login, 0) AS auto_login \
              FROM devices d \
+             LEFT JOIN trusted_endpoints t ON t.user_id = ?1 AND t.endpoint_id = d.endpoint_id \
              WHERE d.endpoint_id IN (SELECT endpoint_id FROM sessions WHERE user_id = ?1) \
              ORDER BY d.last_seen_at DESC",
         )
@@ -180,12 +195,14 @@ impl Store {
     }
 
     /// Revoke `user`'s sessions on `endpoint_id` (too many wrong PINs
-    /// there). Returns how many.
+    /// there), and the device's trust for them (P4-01): otherwise it would
+    /// resume, and the count of wrong PINs start again. Returns how many.
     pub async fn revoke_device_sessions(
         &self,
         user: LocalUserId,
         endpoint_id: &str,
     ) -> Result<u64, StoreError> {
+        let mut tx = self.pool.begin().await?;
         let revoked = sqlx::query(
             "UPDATE sessions SET revoked_at = ?3 \
              WHERE user_id = ?1 AND endpoint_id = ?2 AND revoked_at IS NULL",
@@ -193,9 +210,15 @@ impl Store {
         .bind(user)
         .bind(endpoint_id)
         .bind(now())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        sqlx::query("DELETE FROM trusted_endpoints WHERE user_id = ?1 AND endpoint_id = ?2")
+            .bind(user)
+            .bind(endpoint_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         self.note_sessions_ended();
         Ok(revoked)
     }

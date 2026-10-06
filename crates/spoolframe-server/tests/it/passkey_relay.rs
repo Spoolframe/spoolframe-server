@@ -133,7 +133,7 @@ async fn stream(
         Request::Ping => Response::Ok(Reply::Pong),
         // S's own answer, as M's.
         begin @ Request::BeginPasskeySignIn { .. } => upstream.call(None, begin).await,
-        Request::FinishPasskeySignIn(signed) => {
+        Request::FinishPasskeySignIn { signed, .. } => {
             *kept.lock().unwrap() = Some(signed);
             Response::Err(Error::InvalidCredentials)
         }
@@ -188,7 +188,10 @@ async fn a_passkey_sign_in_relayed_from_another_server_signs_no_one_in() {
 
     // Her passkey on S, made through the SDK as the app makes one.
     let phone = pinned(&s, target.server.addr().ip_addrs().copied().collect()).await;
-    let alice = phone.sign_in(&s, "alice", "correct horse").await.unwrap();
+    let alice = phone
+        .sign_in(&s, "alice", "correct horse", false)
+        .await
+        .unwrap();
     let creation = alice.begin_passkey_registration().await.unwrap();
     let mut app = App::new();
     alice
@@ -206,7 +209,7 @@ async fn a_passkey_sign_in_relayed_from_another_server_signs_no_one_in() {
     let signed = app.get(&request);
     assert_eq!(
         victim
-            .finish_passkey_sign_in(&relay.id(), signed)
+            .finish_passkey_sign_in(&relay.id(), signed, false)
             .await
             .unwrap_err(),
         SdkError::InvalidCredentials
@@ -217,7 +220,13 @@ async fn a_passkey_sign_in_relayed_from_another_server_signs_no_one_in() {
     assert_eq!(
         relay
             .upstream
-            .call(None, Request::FinishPasskeySignIn(relayed))
+            .call(
+                None,
+                Request::FinishPasskeySignIn {
+                    signed: relayed,
+                    remember: false,
+                }
+            )
             .await,
         Response::Err(Error::InvalidCredentials)
     );

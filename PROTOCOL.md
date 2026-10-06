@@ -1,8 +1,12 @@
-# Development wire revision 3
+# Development wire revision 4
 
-Release 0.3.0 keeps the `spoolframe/client/1` ALPN and sets
-`PROTOCOL_VERSION` to 3. Update the server and SDK together. Revision-1 and revision-2
-binaries cannot use this wire format. Clients must explicitly select foreground profiles and report progress by
+Revision 4 (P4-01, trusted devices) keeps the `spoolframe/client/1` ALPN
+and sets `PROTOCOL_VERSION` to 4. Update the server and SDK together.
+Revision 3 and older binaries cannot use this wire format. What changed
+is in "Trusted devices" below.
+
+Release 0.3.0 set `PROTOCOL_VERSION` to 3. Revision-1 and revision-2
+binaries cannot use that wire format either. Clients must explicitly select foreground profiles and report progress by
 playback handle; see the migration examples below. Clients
 that depend directly on the protocol/types crates must update those
 packages together with the SDK.
@@ -126,7 +130,8 @@ while it is sent.
 
 Some requests need a session that proved its user within the last 10
 minutes: `ApproveDeviceSignIn`, `BeginPasskeyRegistration`,
-`RemovePasskey`, and `SetPinRequired` with `required: false`. An older
+`RemovePasskey`, `SetPinRequired` with `required: false`, and
+`SetDeviceTrust` except to stop trusting this device. An older
 session gets `RecentSignInRequired`. The app then asks its user to
 confirm, and sends the request again. It does not sign out.
 
@@ -194,6 +199,124 @@ shared device, and it is weaker than a sign-in. A locked session gets
 unlock with the PIN first, then confirm. A confirmation does not unlock a
 profile. The lock belongs to the connection, and the confirmation belongs
 to the session.
+
+## Trusted devices
+
+A user can make a device trusted (P4-01). A trusted device starts a new
+session for that user without a full sign-in. It is a row in the
+server's `trusted_endpoints` table, for one user and one Iroh endpoint.
+The device's key is the proof. A PIN unlock never makes trust or renews
+it.
+
+### Making trust
+
+| Request | Change in revision 4 |
+|---|---|
+| `LoginPassword` | New `remember: bool` field. |
+| `FinishPasskeySignIn` | Now `{signed: FinishPasskeySignIn, remember: bool}`. |
+| `BeginDeviceSignIn` | Now `{remember: bool}`: the device asks to be trusted. |
+| `LookupDeviceSignIn` | `DeviceSignInRequest` has a new `remember: bool`: the device asked. |
+| `ApproveDeviceSignIn` | New `remember: bool`: the approver's answer. |
+| `SetDeviceTrust` | New: `{device: Option<String>, trusted, auto_login}`. |
+
+Each `remember` and `trusted` field is required. Clients send `false`
+unless the user ticked "Remember this device". Nothing ticks it by
+default.
+
+After a device sign-in, the device is trusted only if it asked and the
+approver's `remember` is `true`. An approver cannot trust a device that
+did not ask.
+
+`Reply::LoggedIn` has a new `remembered: bool`. It is `true` when the
+device is trusted for the session's user after the sign-in. The device
+learns from it whether the approver kept "Remember". The web UI's own
+sign-in never makes trust, because a browser is not an Iroh endpoint.
+
+`SetDeviceTrust` needs a session. `device` is an endpoint id from
+`Devices`. Leave it out for this device. These rules apply:
+
+- To turn trust or auto-login on, the device must be this device. For
+  another device, the reply is `InvalidInput`. Only the web UI trusts
+  another device.
+- Turning trust or auto-login on needs a recent sign-in.
+- Auto-login needs trust, or the reply is `InvalidInput`.
+- To turn trust off, the device can be any of the user's devices. This
+  ends the user's sessions on that device, including the caller's session
+  if it is this device. For another device, it needs a recent sign-in.
+- A device that is not the user's gets `NotFound`.
+
+### Resuming
+
+These two requests are pre-auth, beside `Hello` and `LoginPassword`:
+
+| Request | Reply |
+|---|---|
+| `{"type": "trusted_profiles"}` | `TrustedProfiles { profiles }` |
+| `{"type": "resume_profile", "user_id": "local:…"}` | `LoggedIn { session, remembered: true }` |
+
+`TrustedProfiles` lists only the connecting endpoint's rows. Each one is
+`{user_id, username, display_name, pin_required, auto_login}`. It is a
+read, and the SDK may retry it.
+
+`ResumeProfile` is a mutation, so it carries an operation ID. It opens a
+normal session, bound to this endpoint as a sign-in's is. The reply is
+`Unauthenticated`, the same for every reason: the device is not trusted
+for the user, the trust lapsed or was removed, or the user is disabled.
+If the device requires the user's PIN, the new session starts locked.
+A resumed session is not a recent sign-in, because nobody proved who
+they are. Until the user confirms (`ConfirmPassword`,
+`BeginConfirmPasskey`), each request in "Confirming it is you" gets
+`RecentSignInRequired`.
+
+The server never opens a session by itself. For auto-login, the client
+calls `TrustedProfiles` at start and resumes the profile that has
+`auto_login`.
+
+### Auto-login and the PIN
+
+At most one user per device has `auto_login`. Turning it on for one user
+turns it off for the others on that device. It also turns off the PIN
+requirement for that user on that device. Turning the PIN requirement on
+(`SetPinRequired`) turns auto-login off.
+
+### What ends trust
+
+Trust never lasts longer than what it would bypass:
+
+- `Logout` on the device removes the device's trust for that user.
+- When the user or an admin ends a session (`me.revokeSession`,
+  `admin.userRevokeSession`), that device's trust goes too.
+- `me.revokeOtherSessions` removes the trust of every other device.
+- Ten wrong PINs in a row revoke the device's sessions and its trust.
+- Each of these removes all of the user's trust: a password change, an
+  admin's password reset, and disabling the user. Enabling the user
+  again does not bring trust back.
+- Turning trust off ends the user's sessions on that device.
+- Trust lapses after `auth.trust_idle_days` without use (default 180).
+  A resume uses the trust, and so does any use of the user's session on
+  that device. These writes happen at most once a minute, as for
+  sessions. Lapsed trust is refused and removed.
+
+Expiry of a session does not end trust. That is the purpose of trust.
+
+`DeviceInfo` (`ListDevices`) has two new fields, `trusted` and
+`auto_login`.
+
+### SDK
+
+- `Client::sign_in(server, username, password, remember)`.
+- `Client::finish_passkey_sign_in(server, signed, remember)`.
+- `Client::begin_device_sign_in(server, remember)`. The returned
+  `DeviceSignIn` has `remember`.
+- `Client::trusted_profiles(server)` returns `Vec<TrustedProfile>`.
+- `Client::resume_profile(server, user_id)` returns a `Session`. If the
+  device is no longer trusted, it returns `SdkError::SignInRequired`.
+- `Session::remembered()` returns `Option<bool>`. It is `Some` for a
+  session that a sign-in or a resume made in this process.
+- `Session::set_device_trust(device, trusted, auto_login)`. When it turns
+  this device's trust off, the SDK also forgets this session. The profile
+  stays in `saved_profiles`.
+- `Session::approve_device_sign_in(code, remember)`.
 
 ## SDK migration in 0.3.0
 

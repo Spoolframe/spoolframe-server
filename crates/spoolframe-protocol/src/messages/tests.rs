@@ -130,9 +130,25 @@ fn every_request_round_trips() {
         Request::LoginPassword(LoginPassword {
             username: "alice".into(),
             password: "hunter2".into(),
+            remember: true,
         }),
         Request::Ping,
-        Request::BeginDeviceSignIn,
+        Request::BeginDeviceSignIn { remember: true },
+        Request::BeginDeviceSignIn { remember: false },
+        Request::TrustedProfiles,
+        Request::ResumeProfile {
+            user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
+        },
+        Request::SetDeviceTrust {
+            device: None,
+            trusted: true,
+            auto_login: true,
+        },
+        Request::SetDeviceTrust {
+            device: Some("ab".repeat(32)),
+            trusted: false,
+            auto_login: false,
+        },
         Request::AwaitDeviceSignIn {
             request: "r".into(),
         },
@@ -143,7 +159,10 @@ fn every_request_round_trips() {
         Request::BeginPasskeySignIn {
             username: Some("alice".into()),
         },
-        Request::FinishPasskeySignIn(signed()),
+        Request::FinishPasskeySignIn {
+            signed: signed(),
+            remember: false,
+        },
         Request::BeginPasskeyRegistration,
         Request::FinishPasskeyRegistration(made()),
         Request::ListPasskeys,
@@ -159,6 +178,7 @@ fn every_request_round_trips() {
         Request::FinishConfirmPasskey(signed()),
         Request::ApproveDeviceSignIn {
             code: "BCDFGHJK".into(),
+            remember: true,
         },
         Request::DenyDeviceSignIn {
             code: "BCDFGHJK".into(),
@@ -386,9 +406,20 @@ fn every_reply_round_trips() {
             client_name: "spoolframe-tvos".into(),
             platform: spoolframe_types::Platform::Tvos,
             requested_at: 1_790_000_000,
+            remember: true,
         }),
         Reply::LoggedIn {
             session: SessionId("s".into()),
+            remembered: false,
+        },
+        Reply::TrustedProfiles {
+            profiles: vec![crate::TrustedProfile {
+                user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
+                username: "alice".into(),
+                display_name: "Alice".into(),
+                pin_required: true,
+                auto_login: false,
+            }],
         },
         Reply::Pong,
         Reply::Libraries {
@@ -424,6 +455,8 @@ fn every_reply_round_trips() {
                 platform: Some(spoolframe_types::Platform::Tvos),
                 last_seen_at: 1_790_000_000,
                 pin_required: true,
+                trusted: true,
+                auto_login: false,
                 this_device: false,
             }],
         },
@@ -783,12 +816,15 @@ fn passkey_bytes_are_cbor_byte_strings() {
         ..creation()
     });
     assert!(codec::encode(&creation).unwrap().len() < 600);
-    let signed = Request::FinishPasskeySignIn(FinishPasskeySignIn {
-        authenticator_data: vec![0xAB; 100],
-        client_data_json: vec![0xAB; 100],
-        signature: vec![0xAB; 100],
-        ..signed()
-    });
+    let signed = Request::FinishPasskeySignIn {
+        signed: FinishPasskeySignIn {
+            authenticator_data: vec![0xAB; 100],
+            client_data_json: vec![0xAB; 100],
+            signature: vec![0xAB; 100],
+            ..signed()
+        },
+        remember: true,
+    };
     assert!(codec::encode(&signed).unwrap().len() < 500);
 }
 
@@ -940,10 +976,16 @@ fn request_types_are_snake_case() {
 fn only_hello_auth_methods_logins_and_ping_are_pre_auth() {
     assert!(Request::Hello(hello()).is_pre_auth());
     assert!(Request::Ping.is_pre_auth());
-    assert!(Request::BeginDeviceSignIn.is_pre_auth());
+    assert!(Request::BeginDeviceSignIn { remember: true }.is_pre_auth());
     // A passkey signs in (P3-19); only a session makes one.
     assert!(Request::BeginPasskeySignIn { username: None }.is_pre_auth());
-    assert!(Request::FinishPasskeySignIn(signed()).is_pre_auth());
+    assert!(
+        Request::FinishPasskeySignIn {
+            signed: signed(),
+            remember: false
+        }
+        .is_pre_auth()
+    );
     assert!(!Request::BeginPasskeyRegistration.is_pre_auth());
     assert!(!Request::FinishPasskeyRegistration(made()).is_pre_auth());
     assert!(!Request::ListPasskeys.is_pre_auth());
@@ -967,7 +1009,25 @@ fn only_hello_auth_methods_logins_and_ping_are_pre_auth() {
     // Approving signs someone in: only a session may.
     assert!(
         !Request::ApproveDeviceSignIn {
-            code: "BCDFGHJK".into()
+            code: "BCDFGHJK".into(),
+            remember: true,
+        }
+        .is_pre_auth()
+    );
+    // A trusted device whose sessions ended has none to send (P4-01).
+    assert!(Request::TrustedProfiles.is_pre_auth());
+    assert!(
+        Request::ResumeProfile {
+            user_id: "local:x".into()
+        }
+        .is_pre_auth()
+    );
+    // Trusting is the session user's.
+    assert!(
+        !Request::SetDeviceTrust {
+            device: None,
+            trusted: true,
+            auto_login: false,
         }
         .is_pre_auth()
     );
@@ -981,6 +1041,7 @@ fn credentials_stay_out_of_debug_output() {
     let login = LoginPassword {
         username: "alice".into(),
         password: "hunter2".into(),
+        remember: true,
     };
     assert!(!format!("{login:?}").contains("hunter2"));
     assert!(!format!("{:?}", SessionId("tok3n".into())).contains("tok3n"));
@@ -1272,4 +1333,63 @@ fn a_marker_kind_from_a_newer_server_is_unknown() {
         markers.iter().map(|m| m.kind).collect::<Vec<_>>(),
         [MarkerKind::Unknown, MarkerKind::Intro]
     );
+}
+
+/// A resume makes a session and a trust change can end them: neither may be
+/// sent again on its own; listing the trusted profiles may (P4-01).
+#[test]
+fn trust_requests_are_retried_only_when_they_read() {
+    use crate::policy::retry_safe;
+    assert!(retry_safe(&Request::TrustedProfiles));
+    assert!(!retry_safe(&Request::ResumeProfile {
+        user_id: "local:x".into()
+    }));
+    assert!(!retry_safe(&Request::SetDeviceTrust {
+        device: None,
+        trusted: false,
+        auto_login: false,
+    }));
+}
+
+/// What the apps encode by hand (P4-01): the tags and field names.
+#[test]
+fn trust_requests_have_their_wire_names() {
+    let value = |request: Request| -> serde_json::Value { serde_json::to_value(request).unwrap() };
+    assert_eq!(
+        value(Request::TrustedProfiles),
+        serde_json::json!({"type": "trusted_profiles"})
+    );
+    assert_eq!(
+        value(Request::ResumeProfile {
+            user_id: "local:u".into()
+        }),
+        serde_json::json!({"type": "resume_profile", "user_id": "local:u"})
+    );
+    assert_eq!(
+        value(Request::SetDeviceTrust {
+            device: None,
+            trusted: true,
+            auto_login: false
+        }),
+        serde_json::json!({
+            "type": "set_device_trust", "device": null, "trusted": true, "auto_login": false
+        })
+    );
+    assert_eq!(
+        value(Request::BeginDeviceSignIn { remember: true }),
+        serde_json::json!({"type": "begin_device_sign_in", "remember": true})
+    );
+}
+
+/// "Remember" is never assumed (P4-01): a sign-in without it is refused,
+/// not read as a sign-in that remembers or forgets.
+#[test]
+fn a_sign_in_must_say_whether_to_remember() {
+    let without: Result<Request, _> = serde_json::from_value(serde_json::json!({
+        "type": "login_password", "username": "alice", "password": "hunter2"
+    }));
+    assert!(without.is_err(), "{without:?}");
+    let without: Result<Request, _> =
+        serde_json::from_value(serde_json::json!({"type": "begin_device_sign_in"}));
+    assert!(without.is_err(), "{without:?}");
 }

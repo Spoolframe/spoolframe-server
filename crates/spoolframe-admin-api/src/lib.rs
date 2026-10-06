@@ -299,6 +299,11 @@ pub struct DeviceEntry {
     pub last_seen_at: i64,
     /// The user's PIN is asked for on it.
     pub pin_required: bool,
+    /// It may open the user's profile without a password (P4-01).
+    pub trusted: bool,
+    /// It opens the user's profile by itself at start (P4-01). Only with
+    /// `trusted`; at most one user per device.
+    pub auto_login: bool,
 }
 
 /// Where passkeys work (P3-05): WebAuthn ties each one to a host, the
@@ -387,6 +392,10 @@ pub struct DeviceSignIn {
     pub platform: Platform,
     /// Unix seconds.
     pub requested_at: i64,
+    /// The device asked to be remembered (P4-01): the approval says "This
+    /// device will be remembered", ticked, and the approver may untick it
+    /// (`deviceSignInApprove`'s `remember`).
+    pub remember: bool,
 }
 
 /// What the server is and can do, for an admin.
@@ -2019,8 +2028,30 @@ pub trait MeApi {
 
     /// Sign that device in as the caller: it gets a session of its own. A
     /// code is good once. Requires a recent sign-in or confirmation.
+    /// `remember` is the approver's answer to the device's request to be
+    /// remembered (P4-01): it is trusted only if it asked and this is
+    /// true.
     #[method(name = "deviceSignInApprove", with_extensions)]
-    async fn device_sign_in_approve(&self, code: String) -> jsonrpsee::core::RpcResult<()>;
+    async fn device_sign_in_approve(
+        &self,
+        code: String,
+        remember: bool,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Trust one of the caller's devices (an `endpointId` from `devices`),
+    /// or stop, and say whether it opens their profile at start (P4-01).
+    /// Needs a recent sign-in either way (`RECENT_SIGN_IN_REQUIRED`).
+    /// `autoLogin` needs `trusted` (`INVALID_INPUT`); it turns auto-login
+    /// off for the device's other users, and the PIN requirement off for
+    /// the caller there. Stopping trust ends the caller's sessions on that
+    /// device. A device they never signed in on is `NO_SUCH_DEVICE`.
+    #[method(name = "setDeviceTrust", with_extensions)]
+    async fn set_device_trust(
+        &self,
+        endpoint_id: String,
+        trusted: bool,
+        auto_login: bool,
+    ) -> jsonrpsee::core::RpcResult<()>;
 
     /// Refuse it: the device is told so.
     #[method(name = "deviceSignInDeny", with_extensions)]
@@ -2199,6 +2230,17 @@ pub trait AdminApi {
         username: String,
         endpoint_id: String,
         required: bool,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// `me.setDeviceTrust` for one of a user's devices (P4-01). Needs a
+    /// recent sign-in (`RECENT_SIGN_IN_REQUIRED`).
+    #[method(name = "userSetDeviceTrust", with_extensions)]
+    async fn user_set_device_trust(
+        &self,
+        username: String,
+        endpoint_id: String,
+        trusted: bool,
+        auto_login: bool,
     ) -> jsonrpsee::core::RpcResult<()>;
 
     /// A user's live sessions on every device, most recently used first.

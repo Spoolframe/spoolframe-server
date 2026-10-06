@@ -9,6 +9,7 @@ pub mod passkeys;
 pub mod pins;
 pub mod sessions;
 pub mod tracks;
+pub mod trust;
 pub mod user_ids;
 pub mod users;
 pub mod watch;

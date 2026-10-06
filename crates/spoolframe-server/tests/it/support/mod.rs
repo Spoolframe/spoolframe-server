@@ -1501,9 +1501,10 @@ impl TestClient {
         let request = Request::LoginPassword(LoginPassword {
             username: username.into(),
             password: password.into(),
+            remember: false,
         });
         match self.call(None, request).await {
-            Response::Ok(Reply::LoggedIn { session }) => session,
+            Response::Ok(Reply::LoggedIn { session, .. }) => session,
             other => panic!("login as {username} failed: {other:?}"),
         }
     }

@@ -292,7 +292,7 @@ async fn a_new_key_under_a_saved_name_is_an_identity_change() {
     client.connect(&old).await.unwrap();
     client.pin(&old, true).await.unwrap();
     client
-        .sign_in(&old, "alice", "correct horse")
+        .sign_in(&old, "alice", "correct horse", false)
         .await
         .unwrap();
 

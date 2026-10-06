@@ -241,7 +241,13 @@ async fn begin_sign_in(device: &TestClient, username: Option<&str>) -> PasskeyRe
 
 async fn finish_sign_in(device: &TestClient, signed: FinishPasskeySignIn) -> Response {
     device
-        .call(None, Request::FinishPasskeySignIn(signed))
+        .call(
+            None,
+            Request::FinishPasskeySignIn {
+                signed,
+                remember: false,
+            },
+        )
         .await
 }
 
@@ -253,7 +259,7 @@ async fn sign_in(device: &TestClient, app: &mut App) -> Response {
 
 fn session_of(response: Response) -> SessionId {
     match response {
-        Response::Ok(Reply::LoggedIn { session }) => session,
+        Response::Ok(Reply::LoggedIn { session, .. }) => session,
         other => panic!("not signed in: {other:?}"),
     }
 }
