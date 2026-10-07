@@ -867,17 +867,25 @@ impl RuntimeSettings {
             .map(|r| r.expect("every server answered"))
             .collect();
         let titles_at = self.state_dir().join(SECTION_TITLES);
-        let mut titles = read_titles(&titles_at);
-        let answered = composite
+        let answered: Vec<(String, PlexStatus)> = composite
             .servers()
             .iter()
             .zip(&reports)
-            .map(|(source, (status, _))| (source.id.as_str(), status));
-        if remember_titles(&mut titles, answered)
-            && let Err(e) = write_titles(&titles_at, &titles)
-        {
-            tracing::warn!(path = %titles_at.display(), error = %e, "cannot keep the Plex section titles");
-        }
+            .map(|(source, (status, _))| (source.id.clone(), status.clone()))
+            .collect();
+        // File reads and writes, off the async threads (B-13).
+        let titles = tokio::task::spawn_blocking(move || {
+            let mut titles = read_titles(&titles_at);
+            let answered = answered.iter().map(|(id, status)| (id.as_str(), status));
+            if remember_titles(&mut titles, answered)
+                && let Err(e) = write_titles(&titles_at, &titles)
+            {
+                tracing::warn!(path = %titles_at.display(), error = %e, "cannot keep the Plex section titles");
+            }
+            titles
+        })
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
         let served = served_now(&config, &reports[0].0);
         let configured: HashMap<String, PlexServerConfig> = plex
             .all_servers()

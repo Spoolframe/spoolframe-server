@@ -1161,6 +1161,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spoolframe-catalog",
+ "spoolframe-media",
  "spoolframe-types",
  "thiserror",
  "tokio",
@@ -1173,6 +1174,7 @@ name = "spoolframe-protocol"
 version = "0.5.0"
 dependencies = [
  "ciborium",
+ "ciborium-ll",
  "serde",
  "serde_bytes",
  "sha2",

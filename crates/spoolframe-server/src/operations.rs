@@ -297,9 +297,32 @@ impl Operations {
         })
     }
 
+    /// Whether the bytes `entries` hold fit this pool, and the bytes
+    /// `endpoint` and `user` hold fit their shares of it.
+    fn within(
+        &self,
+        entries: &HashMap<(String, String), Entry>,
+        endpoint: &str,
+        user: Option<&str>,
+    ) -> bool {
+        let share = self.max_bytes / OWNER_SHARE;
+        let bytes = |of: &dyn Fn(&str, &Entry) -> bool| -> usize {
+            entries
+                .iter()
+                .filter(|((peer, _), entry)| of(peer, entry))
+                .map(|(_, entry)| entry.bytes)
+                .sum()
+        };
+        bytes(&|_, _| true) <= self.max_bytes
+            && bytes(&|peer, _| peer == endpoint) <= share
+            && user
+                .is_none_or(|user| bytes(&|_, entry| entry.user.as_deref() == Some(user)) <= share)
+    }
+
     /// The outcome of `endpoint`'s operation `id` is `reply`, at `now`. It
     /// is kept at its own size, which may be more than was reserved for
-    /// it, up to a frame.
+    /// it, up to a frame, while the pool and its owners' shares still have
+    /// room for that; otherwise it is not kept.
     pub fn finish(
         &self,
         endpoint: &str,
@@ -329,9 +352,19 @@ impl Operations {
             }
             kept => {
                 if let Some(entry) = entries.get_mut(&key) {
-                    entry.bytes = bytes;
+                    let reserved = std::mem::replace(&mut entry.bytes, bytes);
                     if let Some(kept) = kept {
                         entry.expires = entry.expires.min(now.saturating_add(kept));
+                    }
+                    let user = entry.user.clone();
+                    // Admission counted what it reserved; an outcome kept
+                    // larger than that past the pool's bytes would hold
+                    // them to expiry (finding 55). Only replies whose size
+                    // the requester chooses outgrow their reservation (a
+                    // passkey ceremony's credential ids), and running one
+                    // of those again on a retry is harmless.
+                    if bytes > reserved && !self.within(&entries, endpoint, user.as_deref()) {
+                        entries.remove(&key);
                     }
                 }
             }
@@ -425,6 +458,90 @@ mod tests {
         Request::AwaitDeviceSignIn {
             request: "r".into(),
         }
+    }
+
+    fn begin_confirm_passkey() -> usize {
+        reservation(&Request::BeginConfirmPasskey)
+    }
+
+    /// `BeginConfirmPasskey`'s outcome for a user with `passkeys` passkeys
+    /// whose credential ids are 1 KiB each: nothing caps how many a user
+    /// has, so it can be far more than the 64 KiB its kind reserves.
+    fn ceremony(passkeys: usize) -> RpcReply {
+        Response::Ok(Reply::PasskeySignInBegun(
+            spoolframe_protocol::passkeys::PasskeySignInBegun {
+                nonce: vec![0; 32],
+                allow_credential_ids: vec![vec![7; 1024]; passkeys],
+            },
+        ))
+        .into()
+    }
+
+    /// The bytes `cache`'s entries hold.
+    fn held_bytes(cache: &Operations) -> usize {
+        cache.entries.lock().values().map(|entry| entry.bytes).sum()
+    }
+
+    /// `users` users' `BeginConfirmPasskey`s, each from an endpoint of its
+    /// own, all admitted while none has finished, then each finished with
+    /// `reply`.
+    fn confirm_at_once(cache: &Operations, users: usize, reply: &RpcReply) {
+        let mut op = operation();
+        let begun: Vec<_> = (0..users)
+            .map(|i| {
+                let user = format!("user-{i}");
+                op.id = format!("{user}-confirm");
+                let invocation = cache
+                    .begin(
+                        of(&user, &user),
+                        "process-1",
+                        &op,
+                        [1; 32],
+                        begin_confirm_passkey(),
+                        1,
+                    )
+                    .unwrap();
+                (user, op.id.clone(), invocation)
+            })
+            .collect();
+        for (user, id, invocation) in begun {
+            cache.finish(&user, &id, invocation.execute.unwrap(), reply.clone(), 1);
+        }
+    }
+
+    /// Third review G-6 (finding 55): an outcome is admitted at what its
+    /// kind reserves and kept at its own size, up to a frame, so outcomes
+    /// larger than they reserved held more than the pool's bytes.
+    #[test]
+    fn outcomes_larger_than_reserved_never_hold_more_than_the_pool() {
+        let cache = Operations::default();
+        confirm_at_once(&cache, 100, &ceremony(900));
+        let held = held_bytes(&cache);
+        assert!(held <= MAX_BYTES, "{held} bytes held of {MAX_BYTES}");
+    }
+
+    /// One that did not fit is not kept: a retry runs it again, which for
+    /// a passkey ceremony makes a new nonce.
+    #[test]
+    fn an_outcome_that_does_not_fit_the_pool_runs_again_on_retry() {
+        let cache = Operations::default();
+        confirm_at_once(&cache, 100, &ceremony(900));
+        let mut op = operation();
+        op.id = "user-99-confirm".into();
+        let retry = cache
+            .begin(
+                of("user-99", "user-99"),
+                "process-1",
+                &op,
+                [1; 32],
+                begin_confirm_passkey(),
+                2,
+            )
+            .unwrap();
+        assert!(
+            retry.execute.is_some(),
+            "the retry was answered from a kept outcome"
+        );
     }
 
     /// Independent review M-1 (finding 48): eight strangers, each keeping

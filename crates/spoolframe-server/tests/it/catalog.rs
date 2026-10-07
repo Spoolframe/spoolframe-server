@@ -532,6 +532,18 @@ async fn an_item_page_shows_what_a_client_would_get() {
     );
 }
 
+/// B-11: `plex:episode:plex:121` was served as `plex:episode:121`, so
+/// watch state written through it went under a second key for the same
+/// episode. The first server's ids have no prefix; that spelling is no
+/// item's.
+#[tokio::test]
+async fn an_id_spelled_with_the_first_server_s_name_is_not_found() {
+    let s = setup("alias").await;
+    let alias = s.root.catalog_item("plex:episode:plex:121".into()).await;
+    // Not found is INVALID_INPUT here: "no … in the catalog".
+    assert_eq!(code(alias.unwrap_err()), error_code::INVALID_INPUT);
+}
+
 #[tokio::test]
 async fn a_consumer_gets_forbidden() {
     let s = setup("consumer").await;

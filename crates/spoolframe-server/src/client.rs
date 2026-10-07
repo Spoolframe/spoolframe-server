@@ -228,16 +228,20 @@ impl ClientProtocol {
             self.resource(&connection, &state, send, request).await;
             return;
         }
+        // Named once, from its `type` alone, and the name is used
+        // wherever the request is named (finding 50). The client chose
+        // it: at most 64 characters, on one line (C-12).
+        let name = match &request {
+            Ok(bytes) => refusals::bounded(&codec::rpc_request_type(bytes).unwrap_or_default()),
+            Err(_) => String::new(),
+        };
         let response = match &request {
             Ok(bytes) => {
                 // One span per request, named by its type: never its
                 // session or its arguments (P3-14).
                 use tracing::Instrument as _;
-                let span = tracing::info_span!(
-                    "client request",
-                    request = codec::rpc_request_type(bytes).unwrap_or_default()
-                );
-                self.answer(&connection, &state, bytes)
+                let span = tracing::info_span!("client request", request = name.as_str());
+                self.answer(&connection, &state, bytes, &name)
                     .instrument(span)
                     .await
             }
@@ -249,7 +253,8 @@ impl ClientProtocol {
         if let Response::Err(error) = &response.response {
             self.count_error(error);
             if let Ok(bytes) = &request {
-                self.refused(&connection, Frame::Rpc(bytes), error).await;
+                self.refused(&connection, Frame::Rpc(bytes, &name), error)
+                    .await;
             }
         }
         let response = RpcResponse {
@@ -260,10 +265,11 @@ impl ClientProtocol {
             // Nothing of it was written. The client gets the reason, not a
             // stream that ends with no response.
             Err(codec::CodecError::TooLarge { len }) => {
-                let request = request
-                    .ok()
-                    .and_then(|bytes| codec::rpc_request_type(&bytes));
-                tracing::warn!(request, len, "a reply is over the frame limit");
+                tracing::warn!(
+                    request = name.as_str(),
+                    len,
+                    "a reply is over the frame limit"
+                );
                 let refusal = RpcResponse {
                     server: self.instance(),
                     reply: Response::Err(Error::ReplyTooLarge { bytes: len }).into(),
@@ -292,6 +298,7 @@ impl ClientProtocol {
         connection: &Connection,
         state: &Arc<ConnectionState>,
         bytes: &[u8],
+        name: &str,
     ) -> RpcReply {
         let wire: RpcRequest = match codec::decode(bytes) {
             Ok(wire) => wire,
@@ -307,10 +314,11 @@ impl ClientProtocol {
             let connection = connection.clone();
             let state = state.clone();
             let bytes = bytes.to_vec();
+            let name = name.to_owned();
             let request = wire.envelope.request.clone();
             let expected = wire.expected_revision;
             async move {
-                let response = this.answer_once(&connection, &state, &bytes).await;
+                let response = this.answer_once(&connection, &state, &bytes, &name).await;
                 let playback = match (&response, request) {
                     (Response::Ok(Reply::PlaybackStarted { handle, .. }), _) => {
                         Some(PlaybackRevision {
@@ -448,6 +456,7 @@ impl ClientProtocol {
         connection: &Connection,
         state: &ConnectionState,
         bytes: &[u8],
+        name: &str,
     ) -> Response {
         let wire: RpcRequest = match codec::decode(bytes) {
             Ok(envelope) => envelope,
@@ -500,7 +509,7 @@ impl ClientProtocol {
                 })
             }
             Request::Unknown => Err(Error::Unsupported {
-                request: codec::rpc_request_type(bytes).unwrap_or_default(),
+                request: name.to_owned(),
             }),
             Request::AuthMethods => Ok(Reply::AuthMethods {
                 methods: self.info.auth_methods.clone(),
@@ -2180,9 +2189,10 @@ impl ClientProtocol {
 
     /// A sign-in attempt on `state`'s connection, if it may make one now:
     /// a device that is not signed in draws on the bucket all such devices
-    /// share (PX-10); a signed-in one (adding a user) does not.
+    /// share (PX-10); a signed-in one (adding a user) does not. One signed
+    /// out is a stranger again while its connection drains (G-14).
     fn stranger_attempt(&self, state: &ConnectionState) -> Result<(), Error> {
-        if state.peer.known() {
+        if state.peer.signed_in() {
             return Ok(());
         }
         self.services
@@ -2781,8 +2791,12 @@ impl ProtocolHandler for ClientProtocol {
     /// closes the connections.
     async fn shutdown(&self) {
         self.services.previews.stop();
-        for stream in self.addresses.streams.drain() {
-            let notice = async {
+        let notices = self
+            .addresses
+            .streams
+            .drain()
+            .into_iter()
+            .map(|stream| async move {
                 let mut stream = stream.lock().await;
                 write_frame(&mut *stream, &Event::ShuttingDown).await?;
                 stream.finish().map_err(std::io::Error::other)?;
@@ -2790,13 +2804,32 @@ impl ProtocolHandler for ClientProtocol {
                 // connection first could drop the frame.
                 let _ = stream.stopped().await;
                 Ok::<_, codec::CodecError>(())
-            };
-            match tokio::time::timeout(SHUTDOWN_NOTICE, notice).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::debug!(error = %e, "cannot send ShuttingDown"),
-                Err(_) => tracing::debug!("a client did not take ShuttingDown in time"),
+            });
+        deliver(notices).await;
+    }
+}
+
+/// Deliver every client's `ShuttingDown` notice, all at once, within
+/// [`SHUTDOWN_NOTICE`] together: one at a time, each client that did not
+/// take its notice held the shutdown up for another 500 ms (C-13).
+async fn deliver<F>(notices: impl IntoIterator<Item = F>)
+where
+    F: Future<Output = Result<(), codec::CodecError>> + Send + 'static,
+{
+    let mut pending: tokio::task::JoinSet<_> = notices.into_iter().collect();
+    let all = async {
+        while let Some(delivered) = pending.join_next().await {
+            if let Ok(Err(e)) = delivered {
+                tracing::debug!(error = %e, "cannot send ShuttingDown");
             }
         }
+    };
+    if tokio::time::timeout(SHUTDOWN_NOTICE, all).await.is_err() {
+        // Dropping the set gives up on the rest.
+        tracing::debug!(
+            clients = pending.len(),
+            "clients did not take ShuttingDown in time"
+        );
     }
 }
 
@@ -2896,7 +2929,8 @@ fn plex_link(
 /// A refused request's frame, as it came in on its stream.
 #[derive(Clone, Copy)]
 enum Frame<'a> {
-    Rpc(&'a [u8]),
+    /// An RPC request's frame, and the type it was named by, bounded.
+    Rpc(&'a [u8], &'a str),
     Resource(&'a [u8]),
 }
 
@@ -2918,13 +2952,13 @@ struct Asked {
 impl Asked {
     fn of(frame: Frame<'_>) -> Self {
         match frame {
-            Frame::Rpc(bytes) => Self::rpc(bytes),
+            Frame::Rpc(bytes, name) => Self::rpc(bytes, name),
             Frame::Resource(bytes) => Self::resource(bytes),
         }
     }
 
-    fn rpc(bytes: &[u8]) -> Self {
-        let request = refusals::bounded(&codec::rpc_request_type(bytes).unwrap_or_default());
+    fn rpc(bytes: &[u8], name: &str) -> Self {
+        let request = name.to_owned();
         let Ok(wire) = codec::decode::<RpcRequest>(bytes) else {
             return Self {
                 request,
@@ -3459,6 +3493,20 @@ pub(crate) fn auth_methods() -> Vec<AuthMethod> {
 mod tests {
     use super::*;
     use crate::plex_accounts::AccountLink;
+
+    /// C-13: shutdown notices went to clients one at a time, each given
+    /// `SHUTDOWN_NOTICE`, so N clients that did not take theirs held the
+    /// shutdown up N times as long.
+    #[tokio::test(start_paused = true)]
+    async fn clients_that_do_not_take_their_notice_hold_shutdown_up_once_together() {
+        let started = tokio::time::Instant::now();
+        deliver((0..8).map(|_| std::future::pending::<Result<(), codec::CodecError>>())).await;
+        let took = started.elapsed();
+        assert!(
+            took <= SHUTDOWN_NOTICE,
+            "8 clients held shutdown up {took:?}"
+        );
+    }
 
     #[test]
     fn the_shared_probe_allowance_matches_the_media_probers_default() {

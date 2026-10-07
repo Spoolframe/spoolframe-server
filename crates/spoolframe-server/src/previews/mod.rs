@@ -601,10 +601,16 @@ impl Previews {
         // The catalog's own first: Plex has made them for most files, and
         // reading them decodes nothing and reads nothing of the file.
         let tiles = match self.sources.catalog.preview_frames(id).await {
-            Ok(Some(frames)) => {
-                tracing::debug!(%id, frames = frames.frames.len(), "previews from the catalog's index");
-                pick(&frames.frames, interval)
-            }
+            Ok(Some(frames)) => match pick(&frames.frames, interval) {
+                Ok(tiles) => {
+                    tracing::debug!(%id, frames = frames.frames.len(), "previews from the catalog's index");
+                    tiles
+                }
+                Err(e) => {
+                    tracing::info!(%id, error = %e, "the catalog's previews are refused; making them");
+                    self.decode(id, path, key, interval).await?
+                }
+            },
             Ok(None) => self.decode(id, path, key, interval).await?,
             Err(e) => {
                 tracing::info!(%id, error = %e, "cannot read the catalog's previews; making them");
@@ -797,17 +803,29 @@ const KEY_LEN: usize = 32;
 /// A tile every `interval` from a catalog's frames (in order of time):
 /// for each, the last frame at or before its time, as a tile made from
 /// the file shows the keyframe at or before it. Up to the last frame.
-fn pick(frames: &[PreviewFrame], interval: Duration) -> Vec<Vec<u8>> {
+///
+/// The last frame's time sizes the tiles, a JPEG copy each, and comes
+/// from the catalog (a PMS's index), so an index past the longest film
+/// the decode path makes tiles of is refused (finding 52): no more tiles
+/// than [`make::tiles`] would make.
+fn pick(frames: &[PreviewFrame], interval: Duration) -> Result<Vec<Vec<u8>>, String> {
     let Some(last) = frames.last() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    if u128::from(last.at_ms) > spoolframe_media::MAX_DURATION.as_millis() {
+        return Err(format!(
+            "the index has a frame at {} hours; previews are made only of files up to {} hours",
+            last.at_ms / 3_600_000,
+            spoolframe_media::MAX_DURATION.as_secs() / 3600
+        ));
+    }
     let interval = interval.as_millis().max(1) as u64;
-    (0..=last.at_ms / interval)
+    Ok((0..=last.at_ms / interval)
         .map(|i| {
             let before = frames.partition_point(|f| f.at_ms <= i * interval);
             frames[before.saturating_sub(1)].jpeg.clone()
         })
-        .collect()
+        .collect())
 }
 
 /// Only films and episodes have pictures to preview.

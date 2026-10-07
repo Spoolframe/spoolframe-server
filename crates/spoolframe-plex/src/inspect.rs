@@ -364,6 +364,7 @@ impl Inspect for PlexCatalog {
         let section = fetched
             .section
             .as_deref()
+            .and_then(|s| convert::local_key(s).ok())
             .and_then(|s| LibraryId::new(Namespace::Plex, s).ok());
         Ok(Inspected {
             ancestors: ancestors(&fetched.item, m),

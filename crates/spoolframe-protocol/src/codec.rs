@@ -120,29 +120,167 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
     ciborium::from_reader(bytes).map_err(|e| CodecError::Decode(e.to_string()))
 }
 
+/// The most characters of a request's `type` that [`request_type`] and
+/// [`rpc_request_type`] read: a client chooses it, up to a whole frame of
+/// it, and every type the protocol has is far shorter (C-12).
+pub const MAX_REQUEST_TYPE: usize = 64;
+
 /// The `type` of a request payload, even one this build cannot decode, so
 /// the server can name it in [`crate::Error::Unsupported`].
 pub fn request_type(envelope: &[u8]) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Envelope {
-        request: Tagged,
-    }
-    #[derive(serde::Deserialize)]
-    struct Tagged {
-        #[serde(rename = "type")]
-        kind: String,
-    }
-    decode::<Envelope>(envelope).ok().map(|e| e.request.kind)
+    scan::text_at(envelope, &["request", "type"])
 }
 
 /// Extract a request tag from the mandatory RPC wrapper, including unknown tags.
+///
+/// The server names every request with this before it is authenticated, so
+/// it reads the frame only as far as the tag and keeps nothing of what it
+/// steps over (finding 50): decoding the frame whole cost about 50 times
+/// its size in heap.
 pub fn rpc_request_type(bytes: &[u8]) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Wire {
-        envelope: ciborium::Value,
+    scan::text_at(bytes, &["envelope", "request", "type"])
+}
+
+/// Reading one text value out of CBOR without decoding what is around it.
+mod scan {
+    use ciborium_ll::{Decoder, Header};
+
+    type Reader<'a> = Decoder<&'a [u8]>;
+
+    /// How deep arrays and maps that are stepped over may nest: ciborium's
+    /// own limit, so whatever the typed decode reads can be named.
+    const DEPTH: usize = 256;
+
+    /// The bytes read at a time from a text or byte string.
+    const CHUNK: usize = 64;
+
+    /// The text under `path`, a key in each of the nested maps in turn: at
+    /// most [`super::MAX_REQUEST_TYPE`] characters of it.
+    pub(super) fn text_at(bytes: &[u8], path: &[&str]) -> Option<String> {
+        let mut reader = Decoder::from(bytes);
+        for key in path {
+            enter(&mut reader, key)?;
+        }
+        match header(&mut reader)? {
+            Header::Text(len) => text(&mut reader, len, super::MAX_REQUEST_TYPE),
+            _ => None,
+        }
     }
-    let wire: Wire = decode(bytes).ok()?;
-    request_type(&encode(&wire.envelope).ok()?)
+
+    /// The next header that is not a tag: a tag only annotates the item
+    /// after it.
+    fn header(reader: &mut Reader<'_>) -> Option<Header> {
+        loop {
+            match reader.pull().ok()? {
+                Header::Tag(_) => continue,
+                header => return Some(header),
+            }
+        }
+    }
+
+    /// Read into the map that comes next, up to the value of `key` in it.
+    fn enter(reader: &mut Reader<'_>, key: &str) -> Option<()> {
+        let Header::Map(len) = header(reader)? else {
+            return None;
+        };
+        let mut left = len;
+        loop {
+            match &mut left {
+                Some(0) => return None,
+                Some(n) => *n -= 1,
+                None => {}
+            }
+            let found = match header(reader)? {
+                Header::Break if len.is_none() => return None,
+                // One character past the key is enough to tell it apart.
+                Header::Text(n) => text(reader, n, key.chars().count() + 1)?.as_str() == key,
+                other => {
+                    skip(reader, other, DEPTH)?;
+                    false
+                }
+            };
+            if found {
+                return Some(());
+            }
+            let value = header(reader)?;
+            skip(reader, value, DEPTH)?;
+        }
+    }
+
+    /// The first `max` characters of the text whose header was `len`; the
+    /// rest of it is read and dropped.
+    fn text(reader: &mut Reader<'_>, len: Option<usize>, max: usize) -> Option<String> {
+        let mut kept = String::new();
+        let mut count = 0;
+        let mut chunk = [0; CHUNK];
+        let mut segments = reader.text(len);
+        while let Some(mut segment) = segments.pull().ok()? {
+            while let Some(part) = segment.pull(&mut chunk).ok()? {
+                for c in part.chars().take(max - count) {
+                    kept.push(c);
+                    count += 1;
+                }
+            }
+        }
+        Some(kept)
+    }
+
+    /// Step over the item whose header was `header`, keeping none of it.
+    fn skip(reader: &mut Reader<'_>, header: Header, depth: usize) -> Option<()> {
+        let depth = depth.checked_sub(1)?;
+        match header {
+            Header::Text(len) => drop_text(reader, len),
+            Header::Bytes(len) => drop_bytes(reader, len),
+            Header::Array(len) => items(reader, len, depth),
+            Header::Map(Some(len)) => items(reader, Some(len.checked_mul(2)?), depth),
+            Header::Map(None) => items(reader, None, depth),
+            Header::Break => None,
+            // A number or a simple value is all header.
+            _ => Some(()),
+        }
+    }
+
+    /// Step over `len` items, or up to a break when `len` is `None`.
+    fn items(reader: &mut Reader<'_>, len: Option<usize>, depth: usize) -> Option<()> {
+        match len {
+            // Each item is at least a byte, so a claimed length past the
+            // frame ends at the frame's end.
+            Some(len) => {
+                for _ in 0..len {
+                    let item = header(reader)?;
+                    skip(reader, item, depth)?;
+                }
+            }
+            None => loop {
+                match header(reader)? {
+                    Header::Break => break,
+                    item => skip(reader, item, depth)?,
+                }
+            },
+        }
+        Some(())
+    }
+
+    // Kept out of `skip`, so a deep nest does not carry a buffer per level.
+    #[inline(never)]
+    fn drop_text(reader: &mut Reader<'_>, len: Option<usize>) -> Option<()> {
+        let mut chunk = [0; CHUNK];
+        let mut segments = reader.text(len);
+        while let Some(mut segment) = segments.pull().ok()? {
+            while segment.pull(&mut chunk).ok()?.is_some() {}
+        }
+        Some(())
+    }
+
+    #[inline(never)]
+    fn drop_bytes(reader: &mut Reader<'_>, len: Option<usize>) -> Option<()> {
+        let mut chunk = [0; CHUNK];
+        let mut segments = reader.bytes(len);
+        while let Some(mut segment) = segments.pull().ok()? {
+            while segment.pull(&mut chunk).ok()?.is_some() {}
+        }
+        Some(())
+    }
 }
 
 /// Write `value` as one frame. One over [`MAX_FRAME`] is refused before

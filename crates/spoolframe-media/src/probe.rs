@@ -3,7 +3,6 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -11,6 +10,7 @@ use easy_ffprobe::FfProbe;
 
 use crate::descriptor::{MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream};
 use crate::external;
+use crate::ocr::{self, OcrError};
 use crate::roles;
 use crate::sandbox::{Jail, Limits, Tool};
 use spoolframe_types::SubtitleRole;
@@ -44,6 +44,10 @@ pub enum ProbeError {
     },
     #[error("{path} has no audio or video stream")]
     NoMedia { path: PathBuf },
+    /// Finding 51 (G-2): what ffprobe prints is read into the server, so
+    /// it is capped; a crafted file can make it print gigabytes.
+    #[error("ffprobe printed more than {limit} bytes for {path}")]
+    TooMuch { path: PathBuf, limit: usize },
 }
 
 /// What a cached descriptor was made from. The directory's mtime is in it
@@ -71,6 +75,16 @@ type Keyframes = Arc<Vec<u64>>;
 /// How long listing a file's keyframes may take: it reads the whole file,
 /// which on a network mount is minutes for a large remux.
 const KEYFRAME_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The most of ffprobe's JSON description read. A film's is tens of KB;
+/// one with hundreds of streams is a few MB.
+const MAX_DESCRIPTION: usize = 64 << 20;
+
+/// The most of ffprobe's keyframe listing read: a line of about 16 bytes
+/// (`1234.567000,K__`) per video packet. A 100-minute 24 fps film's is
+/// 2.3 MB (143,764 lines, measured); a 4-hour 60 fps one's about 14 MB.
+/// 64 MiB is about 4 million packets: 48 hours at 24 fps.
+const MAX_KEYFRAME_LISTING: usize = 64 << 20;
 
 impl Prober {
     /// How long one ffprobe run may take by default. Generous because the
@@ -175,32 +189,11 @@ impl Prober {
                 "csv=p=0",
                 "-i",
             ])
-            .arg(path)
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-        let output = match tokio::time::timeout(KEYFRAME_TIMEOUT, cmd.output()).await {
-            Err(_) => {
-                return Err(ProbeError::TimedOut {
-                    path: path.to_owned(),
-                    after: KEYFRAME_TIMEOUT,
-                });
-            }
-            Ok(Err(source)) => {
-                return Err(ProbeError::Spawn {
-                    ffprobe: self.ffprobe.program().to_owned(),
-                    source,
-                });
-            }
-            Ok(Ok(output)) => output,
-        };
-        if !output.status.success() {
-            return Err(ProbeError::Failed {
-                path: path.to_owned(),
-                status: output.status.to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
-        let times = Arc::new(keyframe_times(&String::from_utf8_lossy(&output.stdout)));
+            .arg(path);
+        let output = self
+            .output(cmd, path, MAX_KEYFRAME_LISTING, KEYFRAME_TIMEOUT)
+            .await?;
+        let times = Arc::new(keyframe_times(&String::from_utf8_lossy(&output)));
         self.keyframes
             .lock()
             .insert(path.to_owned(), (stamp, times.clone()));
@@ -237,36 +230,55 @@ impl Prober {
             // `-i` so a path is never read as an option.
             "-i",
         ])
-        .arg(path)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-
-        let output = match tokio::time::timeout(self.timeout, cmd.output()).await {
-            Err(_) => {
-                return Err(ProbeError::TimedOut {
-                    path: path.to_owned(),
-                    after: self.timeout,
-                });
-            }
-            Ok(Err(source)) => {
-                return Err(ProbeError::Spawn {
-                    ffprobe: self.ffprobe.program().to_owned(),
-                    source,
-                });
-            }
-            Ok(Ok(output)) => output,
-        };
-        if !output.status.success() {
-            return Err(ProbeError::Failed {
-                path: path.to_owned(),
-                status: output.status.to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
-        serde_json::from_slice(&output.stdout).map_err(|source| ProbeError::Unreadable {
+        .arg(path);
+        let output = self
+            .output(cmd, path, MAX_DESCRIPTION, self.timeout)
+            .await?;
+        serde_json::from_slice(&output).map_err(|source| ProbeError::Unreadable {
             path: path.to_owned(),
             source,
         })
+    }
+
+    /// `cmd` run to its end: its stdout, up to `max` bytes, if it
+    /// succeeded. Killed past `max` or `timeout`. Only the first 64 KiB
+    /// of stderr are kept.
+    async fn output(
+        &self,
+        cmd: crate::sandbox::Command,
+        path: &Path,
+        max: usize,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, ProbeError> {
+        let ran = ocr::run(cmd, "ffprobe", ocr::Feed::Nothing, max, timeout)
+            .await
+            .map_err(|e| match e {
+                OcrError::TimedOut { after, .. } => ProbeError::TimedOut {
+                    path: path.to_owned(),
+                    after,
+                },
+                OcrError::TooMuch { limit, .. } => ProbeError::TooMuch {
+                    path: path.to_owned(),
+                    limit,
+                },
+                OcrError::Spawn { source, .. } | OcrError::Io(source) => ProbeError::Spawn {
+                    ffprobe: self.ffprobe.program().to_owned(),
+                    source,
+                },
+                // `run` gives no other.
+                other => ProbeError::Spawn {
+                    ffprobe: self.ffprobe.program().to_owned(),
+                    source: std::io::Error::other(other.to_string()),
+                },
+            })?;
+        if !ran.status.success() {
+            return Err(ProbeError::Failed {
+                path: path.to_owned(),
+                status: ran.status.to_string(),
+                stderr: String::from_utf8_lossy(&ran.stderr).trim().to_owned(),
+            });
+        }
+        Ok(ran.stdout)
     }
 }
 

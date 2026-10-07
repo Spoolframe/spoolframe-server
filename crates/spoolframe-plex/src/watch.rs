@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use spoolframe_catalog::{Catalog, CatalogError};
-use spoolframe_types::{LibraryKind, MediaId, MediaKind, Namespace};
+use spoolframe_types::{LibraryKind, MediaId, MediaKind};
 
 use crate::convert;
 use crate::wire::Metadata;
@@ -114,11 +114,11 @@ impl PlexCatalog {
         m: &Metadata,
     ) -> Result<PlexWatch, CatalogError> {
         let id = |kind, key: &str| {
-            MediaId::new(Namespace::Plex, kind, key).map_err(|e| CatalogError::Backend {
+            convert::media_id(kind, key).map_err(|e| CatalogError::Backend {
                 url: self.base.clone(),
                 call: "list watch state".into(),
                 item: Some(format!("ratingKey {key}")),
-                message: e.to_string(),
+                message: e.message,
             })
         };
         Ok(PlexWatch {

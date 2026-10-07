@@ -18,10 +18,15 @@ use spoolframe_types::{
 use crate::config::FIRST_PLEX_SERVER;
 
 /// The server a key names, and the key Plex knows.
+///
+/// The first server's keys carry no prefix, so `plex:12` is not its key
+/// `12` under a second spelling (B-11): served as one, it would be a
+/// second key for that item's watch state. It stays whole, and the first
+/// server, whose keys are digits, has nothing under it.
 pub fn split(key: &str) -> (&str, &str) {
     match key.split_once(':') {
-        Some((server, local)) => (server, local),
-        None => (FIRST_PLEX_SERVER, key),
+        Some((server, local)) if server != FIRST_PLEX_SERVER => (server, local),
+        _ => (FIRST_PLEX_SERVER, key),
     }
 }
 
@@ -183,6 +188,15 @@ mod tests {
         assert_eq!(library_local(&library), ("plex", library.clone()));
         let art: ArtworkId = "plex:/library/metadata/1/thumb/2".parse().unwrap();
         assert_eq!(artwork_local(&art), ("plex", art.clone()));
+    }
+
+    /// B-11: the first server's ids carry no prefix, so `plex:movie:plex:12`
+    /// is not its item 12 under a second spelling. Served as one, it was
+    /// a second key for that item's watch state.
+    #[test]
+    fn the_first_server_s_name_is_not_a_prefix() {
+        let alias: MediaId = "plex:movie:plex:12".parse().unwrap();
+        assert_eq!(media_local(&alias), ("plex", alias.clone()));
     }
 
     #[test]

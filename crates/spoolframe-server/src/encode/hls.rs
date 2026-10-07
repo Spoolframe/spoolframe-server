@@ -257,18 +257,19 @@ pub fn multivariant_playlist(
     if let Some(track) = subtitle {
         let name = track
             .title
-            .clone()
-            .or_else(|| track.language.clone())
-            .unwrap_or_else(|| "Subtitles".into())
-            .replace('"', "'");
+            .as_deref()
+            .or(track.language.as_deref())
+            .map(quoted_string)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "Subtitles".into());
         let _ = write!(
             text,
             "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",DEFAULT=YES,\
              AUTOSELECT=YES,FORCED={},URI=\"subtitles.m3u8\"",
             if track.forced { "YES" } else { "NO" }
         );
-        if let Some(language) = &track.language {
-            let _ = write!(text, ",LANGUAGE=\"{}\"", language::bcp47(language));
+        if let Some(language) = track.language.as_deref().and_then(language_tag) {
+            let _ = write!(text, ",LANGUAGE=\"{language}\"");
         }
         text.push('\n');
     }
@@ -296,6 +297,34 @@ pub fn multivariant_playlist(
     }
     text.push_str("\nmedia.m3u8\n");
     text
+}
+
+/// `text` from the file (a track's title or language), as the inside of
+/// an HLS quoted-string: no `"`, CR or LF (RFC 8216 4.2), and no other
+/// control character either. A line break in it would end the tag, and
+/// the next line would be read as a tag or a URI the player fetches
+/// (finding 53).
+fn quoted_string(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '"' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// `code` (from the file) as HLS's `LANGUAGE`, a BCP 47 tag: letters,
+/// digits and `-` only. Anything else is not a tag, and is left out
+/// (finding 53).
+fn language_tag(code: &str) -> Option<String> {
+    let tag = language::bcp47(code);
+    let valid = !tag.is_empty()
+        && tag.len() <= 35
+        && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    valid.then_some(tag)
 }
 
 /// The cues of WebVTT `vtt` that show during `start_ms..end_ms`, as one
@@ -758,5 +787,75 @@ mod tests {
             }
             other => panic!("not a multivariant playlist: {other:?}"),
         }
+    }
+
+    /// The multivariant playlist of a subtitle rendition of `language`
+    /// and `title`, and nothing else.
+    fn with_subtitle(language: Option<&str>, title: Option<&str>) -> String {
+        let descriptor = MediaDescriptor {
+            container: "matroska,webm".into(),
+            duration: None,
+            bit_rate: None,
+            video: None,
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        };
+        let track = SubtitleStream {
+            source: spoolframe_media::SubtitleSource::Embedded { index: 3 },
+            codec: "subrip".into(),
+            kind: spoolframe_media::SubtitleKind::Text,
+            language: language.map(Into::into),
+            title: title.map(Into::into),
+            forced: false,
+            default: false,
+            role: spoolframe_types::SubtitleRole::Full,
+        };
+        multivariant_playlist(&descriptor, None, None, Some(&track))
+    }
+
+    /// The lines of `playlist` that are neither tags nor blank: the URIs a
+    /// player fetches.
+    fn uris(playlist: &str) -> Vec<&str> {
+        playlist
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    }
+
+    const INJECTED: &str = "Forced\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhttp://attacker/x";
+
+    /// Finding 53 (G-4): a track title from the file is written into the
+    /// playlist; a line break in it must not start a line of its own.
+    #[test]
+    fn a_line_break_in_a_subtitle_title_adds_no_line() {
+        let text = with_subtitle(Some("eng"), Some(INJECTED));
+        assert_eq!(uris(&text), ["media.m3u8"], "{text}");
+    }
+
+    #[test]
+    fn a_line_break_in_a_subtitle_language_adds_no_line() {
+        let text = with_subtitle(Some(INJECTED), Some("English"));
+        assert_eq!(uris(&text), ["media.m3u8"], "{text}");
+    }
+
+    /// The language's name is the NAME when there is no title.
+    #[test]
+    fn a_line_break_in_an_untitled_subtitle_s_language_adds_no_line() {
+        let text = with_subtitle(Some(INJECTED), None);
+        assert_eq!(uris(&text), ["media.m3u8"], "{text}");
+    }
+
+    /// LANGUAGE is a BCP 47 tag: letters, digits and `-`. Anything else
+    /// is not one, and the attribute is left out.
+    #[test]
+    fn a_language_that_is_not_a_tag_is_left_out() {
+        let text = with_subtitle(Some("en\"x"), Some("English"));
+        assert!(!text.contains("LANGUAGE="), "{text}");
+    }
+
+    #[test]
+    fn a_tag_with_a_region_is_kept() {
+        let text = with_subtitle(Some("pt-BR"), None);
+        assert!(text.contains(",LANGUAGE=\"pt-br\""), "{text}");
     }
 }

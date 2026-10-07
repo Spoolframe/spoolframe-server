@@ -216,6 +216,40 @@ async fn an_unknown_request_is_unsupported_and_the_connection_stays_up() {
     close(server, client).await;
 }
 
+/// A request is named, in its span, its refusal log line and an
+/// `Unsupported` reply, by one name; a client's type is at most 64
+/// characters of it, on one line (C-12).
+#[tokio::test]
+async fn a_long_unknown_type_is_named_in_64_characters_on_one_line() {
+    #[derive(Serialize)]
+    struct Tagged {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    #[derive(Serialize)]
+    struct Envelope {
+        session: Option<String>,
+        request: Tagged,
+    }
+
+    let (server, client) = connect("long-unknown-type").await;
+    client.hello().await;
+    let response = client
+        .send(&Envelope {
+            session: None,
+            request: Tagged {
+                kind: "line\n".repeat(800),
+            },
+        })
+        .await;
+    let Response::Err(Error::Unsupported { request }) = response else {
+        panic!("{response:?}");
+    };
+    // Ten escaped lines of six characters, and four of the next.
+    assert_eq!(request, format!("{}line", r"line\n".repeat(10)));
+    close(server, client).await;
+}
+
 #[tokio::test]
 async fn a_stream_of_unknown_kind_is_refused_and_the_connection_stays_up() {
     let (server, client) = connect("unknown-stream").await;

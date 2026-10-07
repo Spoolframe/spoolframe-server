@@ -123,47 +123,60 @@ impl Conversion {
             epoch => jobs.dir().join(format!("{}~{epoch}", source.handle)),
         };
         std::fs::create_dir_all(&dir).map_err(prepare)?;
-        // Plain names for ffmpeg's filters (see `args::filter_path`).
-        let input = dir.join("input");
-        std::os::unix::fs::symlink(source.path, &input).map_err(prepare)?;
-        let sidecar = match subtitle.and_then(|s| source.descriptor.subtitles.get(s.index as usize))
-        {
-            Some(spoolframe_media::SubtitleStream {
-                source: spoolframe_media::SubtitleSource::External { path },
-                codec,
-                ..
-            }) if codecs::subtitle_format(codec) == SubtitleFormat::VobSub => {
-                // VobSub is two files: the `.idx`, and the `.sub` with the
-                // pictures, which ffmpeg finds by the `.idx`'s name. Both
-                // are linked, under names that match.
-                let link = dir.join("sidecar.idx");
-                std::os::unix::fs::symlink(path, &link).map_err(prepare)?;
-                std::os::unix::fs::symlink(path.with_extension("sub"), dir.join("sidecar.sub"))
-                    .map_err(prepare)?;
-                Some(link)
+        // What fails from here leaves no directory behind (B-13), as a
+        // failed spawn already did not.
+        let prepared = (|| -> Result<_, JobError> {
+            // Plain names for ffmpeg's filters (see `args::filter_path`).
+            let input = dir.join("input");
+            std::os::unix::fs::symlink(source.path, &input).map_err(prepare)?;
+            let sidecar = match subtitle
+                .and_then(|s| source.descriptor.subtitles.get(s.index as usize))
+            {
+                Some(spoolframe_media::SubtitleStream {
+                    source: spoolframe_media::SubtitleSource::External { path },
+                    codec,
+                    ..
+                }) if codecs::subtitle_format(codec) == SubtitleFormat::VobSub => {
+                    // VobSub is two files: the `.idx`, and the `.sub` with the
+                    // pictures, which ffmpeg finds by the `.idx`'s name. Both
+                    // are linked, under names that match.
+                    let link = dir.join("sidecar.idx");
+                    std::os::unix::fs::symlink(path, &link).map_err(prepare)?;
+                    std::os::unix::fs::symlink(path.with_extension("sub"), dir.join("sidecar.sub"))
+                        .map_err(prepare)?;
+                    Some(link)
+                }
+                Some(spoolframe_media::SubtitleStream {
+                    source: spoolframe_media::SubtitleSource::External { path },
+                    ..
+                }) => {
+                    let link = dir.join("sidecar");
+                    std::os::unix::fs::symlink(path, &link).map_err(prepare)?;
+                    Some(link)
+                }
+                _ => None,
+            };
+            let segments = match delivery {
+                Delivery::Hls => {
+                    let total =
+                        hls::hls_total_ms(source.descriptor.duration).map_err(JobError::Prepare)?;
+                    Some(match (video, &source.keyframes) {
+                        (Some(ConvertedVideo::Copy { .. }), Some(keyframes)) => {
+                            Segments::at_keyframes(keyframes, total)
+                        }
+                        _ => Segments::grid(total),
+                    })
+                }
+                _ => None,
+            };
+            Ok((input, sidecar, segments))
+        })();
+        let (input, sidecar, segments) = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
             }
-            Some(spoolframe_media::SubtitleStream {
-                source: spoolframe_media::SubtitleSource::External { path },
-                ..
-            }) => {
-                let link = dir.join("sidecar");
-                std::os::unix::fs::symlink(path, &link).map_err(prepare)?;
-                Some(link)
-            }
-            _ => None,
-        };
-        let segments = match delivery {
-            Delivery::Hls => {
-                let total =
-                    hls::hls_total_ms(source.descriptor.duration).map_err(JobError::Prepare)?;
-                Some(match (video, &source.keyframes) {
-                    (Some(ConvertedVideo::Copy { .. }), Some(keyframes)) => {
-                        Segments::at_keyframes(keyframes, total)
-                    }
-                    _ => Segments::grid(total),
-                })
-            }
-            _ => None,
         };
         // An HLS start begins at the segment the position falls in.
         let (start, first_segment) = playback_seek(segments.as_ref(), start, *video);
@@ -512,6 +525,63 @@ fn encodes(video: Option<ConvertedVideo>, audio: Option<ConvertedAudio>) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-13: a conversion that fails before its encode starts (a link
+    /// that cannot be made, an HLS grid refused for the file's length)
+    /// left its job directory behind until the next start.
+    #[tokio::test]
+    async fn a_conversion_that_cannot_be_prepared_leaves_no_directory() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-conversion-prepare").await;
+        let jobs = Arc::new(
+            Jobs::new(
+                JobLimits {
+                    max_jobs: 1,
+                    scratch_dir: tmp.as_ref().join("scratch"),
+                    scratch_limit_bytes: 1 << 30,
+                    read_ahead: Duration::from_secs(60),
+                    stalled_after: Duration::from_secs(60),
+                },
+                spoolframe_media::sandbox::Tool::unconfined("ffmpeg"),
+            )
+            .unwrap(),
+        );
+        let film = tmp.as_ref().join("film.mkv");
+        std::fs::write(&film, b"x").unwrap();
+        let descriptor = Arc::new(MediaDescriptor {
+            container: "matroska,webm".into(),
+            // Past the longest HLS is made of.
+            duration: Some(spoolframe_media::MAX_DURATION + Duration::from_secs(3600)),
+            bit_rate: None,
+            video: None,
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        });
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: spoolframe_types::Container::Mp4,
+            video: None,
+            audio: None,
+            subtitle: None,
+            reasons: Vec::new(),
+        };
+        let started = Conversion::start(
+            jobs.clone(),
+            ConversionSource {
+                handle: "h1",
+                path: &film,
+                descriptor,
+                plan: &plan,
+                encoders: Arc::new(Encoders::software_baseline()),
+                vaapi_device: Path::new("/dev/dri/renderD128"),
+                keyframes: None,
+                first_epoch: 0,
+                slot: None,
+            },
+            None,
+        );
+        assert!(started.is_err());
+        assert!(!jobs.dir().join("h1").exists(), "the job directory is left");
+    }
 
     #[test]
     fn only_a_stream_encoded_again_is_encoding() {

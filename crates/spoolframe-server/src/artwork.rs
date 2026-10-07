@@ -13,9 +13,9 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use image::ImageFormat;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
+use image::{ImageFormat, ImageReader, Limits};
 use spoolframe_catalog::{Catalog, CatalogError, Image};
 use spoolframe_protocol::ArtworkSize;
 use spoolframe_types::ArtworkId;
@@ -344,17 +344,63 @@ impl ArtworkCache {
     }
 }
 
+/// The widest and tallest artwork decoded (finding 54): the Linux client's
+/// limit (C-14). A poster or backdrop is at most 4K wide.
+const MAX_SIDE: u32 = 8192;
+
+/// The most one artwork decode may allocate: an 8192 × 8192 RGBA image.
+/// The image crate's own default is 512 MiB.
+const MAX_ALLOC: u64 = 256 << 20;
+
+/// `bytes`, which come from the catalog (a PMS), as a reader: only JPEG,
+/// PNG or WebP, and held to [`MAX_SIDE`] and [`MAX_ALLOC`]. A header past
+/// them is refused before anything is decoded.
+fn reader(bytes: &[u8]) -> Result<ImageReader<Cursor<&[u8]>>, ArtworkError> {
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| ArtworkError::Image(e.to_string()))?;
+    match reader.format() {
+        Some(ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP) => {}
+        other => {
+            return Err(ArtworkError::Image(format!(
+                "{other:?} is not JPEG, PNG or WebP"
+            )));
+        }
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_SIDE);
+    limits.max_image_height = Some(MAX_SIDE);
+    limits.max_alloc = Some(MAX_ALLOC);
+    reader.limits(limits);
+    Ok(reader)
+}
+
+/// `e` from the image crate; a limit's names the limits.
+fn image_error(e: image::ImageError) -> ArtworkError {
+    match e {
+        image::ImageError::Limits(e) => ArtworkError::Image(format!(
+            "past {MAX_SIDE} × {MAX_SIDE} pixels or {} MiB: {e}",
+            MAX_ALLOC >> 20
+        )),
+        e => ArtworkError::Image(e.to_string()),
+    }
+}
+
 /// `original` scaled down to `width` (never up). Transparent images stay
 /// PNG; everything else becomes a JPEG.
 pub(crate) fn resize(original: Artwork, width: u32) -> Result<Image, ArtworkError> {
-    let decoded =
-        image::load_from_memory(&original.bytes).map_err(|e| ArtworkError::Image(e.to_string()))?;
-    if decoded.width() <= width {
+    // The size from the header first: a picture no wider is served as it
+    // is, and is not decoded at all.
+    let (wide, _) = reader(&original.bytes)?
+        .into_dimensions()
+        .map_err(image_error)?;
+    if wide <= width {
         return Ok(Image {
             bytes: original.bytes,
             content_type: original.content_type,
         });
     }
+    let decoded = reader(&original.bytes)?.decode().map_err(image_error)?;
     let scaled = decoded.resize(width, u32::MAX, FilterType::Lanczos3);
     let mut out = Cursor::new(Vec::new());
     let content_type = if scaled.color().has_alpha() {
@@ -601,5 +647,73 @@ mod tests {
             Err(ArtworkError::BadSize(_))
         ));
         assert_eq!(fetches(&catalog), 0);
+    }
+
+    fn artwork(bytes: Vec<u8>) -> Artwork {
+        Artwork {
+            bytes,
+            content_type: "image/png".into(),
+            etag: "e".into(),
+        }
+    }
+
+    /// CRC-32 (ISO-HDLC), as PNG chunks carry.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// A PNG of only its signature, header and an empty IDAT, saying it is
+    /// `width` × `height` RGBA: 45 bytes.
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut chunk = b"IHDR".to_vec();
+        chunk.extend(width.to_be_bytes());
+        chunk.extend(height.to_be_bytes());
+        // 8 bits, RGBA, deflate, adaptive filtering, no interlace.
+        chunk.extend([8, 6, 0, 0, 0]);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(13u32.to_be_bytes());
+        png.extend(&chunk);
+        png.extend(crc32(&chunk).to_be_bytes());
+        // An empty IDAT: the decoder reads up to the first before it says
+        // the size.
+        png.extend(0u32.to_be_bytes());
+        png.extend(b"IDAT");
+        png.extend(crc32(b"IDAT").to_be_bytes());
+        png
+    }
+
+    /// Finding 54 (G-5): the PMS's bytes were decoded whole before their
+    /// size was looked at. A bomb's header says how big it is; past
+    /// 8192 × 8192 it is refused from that, before anything is decoded.
+    #[test]
+    fn a_bomb_is_refused_by_its_header() {
+        let err = resize(artwork(png_header(100_000, 100_000)), 320).unwrap_err();
+        assert!(err.to_string().contains("8192"), "{err}");
+    }
+
+    /// The limit is on the picture, not on what it would cost: a picture
+    /// wider than any poster is refused even when it is small.
+    #[test]
+    fn a_picture_wider_than_the_limit_is_refused() {
+        let err = resize(artwork(png(9000, 1)), 320).unwrap_err();
+        assert!(err.to_string().contains("8192"), "{err}");
+    }
+
+    #[test]
+    fn a_picture_within_the_limit_is_resized() {
+        let image = resize(artwork(png(800, 400)), 320).unwrap();
+        let resized = image::load_from_memory(&image.bytes).unwrap();
+        assert_eq!((resized.width(), resized.height()), (320, 160));
     }
 }

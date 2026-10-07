@@ -480,10 +480,23 @@ fn a_tile_from_an_index_is_its_last_frame_at_or_before_the_tile_s_time() {
         jpeg: vec![n],
     };
     let frames = [frame(0, 0), frame(2000, 1), frame(4000, 2), frame(7000, 3)];
-    let tiles = pick(&frames, Duration::from_secs(3));
+    let tiles = pick(&frames, Duration::from_secs(3)).unwrap();
     // 0 s, 3 s, 6 s: frames 0, 1 (at 2 s) and 2 (at 4 s).
     assert_eq!(tiles, [vec![0], vec![1], vec![2]]);
-    assert!(pick(&[], Duration::from_secs(3)).is_empty());
+    assert!(pick(&[], Duration::from_secs(3)).unwrap().is_empty());
+}
+
+/// Finding 52 (G-3): the last frame's time sizes the tiles, a JPEG copy
+/// each. Past the longest film the decode path makes tiles of, the
+/// catalog's index is refused, not made into tiles.
+#[test]
+fn an_index_past_the_longest_film_makes_no_tiles() {
+    let last = spoolframe_media::MAX_DURATION.as_millis() as u64 + 1000;
+    let frames = [PreviewFrame {
+        at_ms: last,
+        jpeg: vec![0],
+    }];
+    assert!(pick(&frames, Duration::from_secs(10)).is_err());
 }
 
 #[test]

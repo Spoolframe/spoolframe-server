@@ -53,8 +53,19 @@ pub fn frames(bif: &[u8]) -> Result<Vec<PreviewFrame>, String> {
         let jpeg = bif
             .get(start..end)
             .ok_or_else(|| format!("frame {i} is outside the file ({start}..{end})"))?;
+        // The times size the preview tiles made from the index (finding
+        // 52): one past the longest film the server previews is refused.
+        let at_ms = u64::from(at)
+            .checked_mul(multiplier)
+            .filter(|&ms| u128::from(ms) <= spoolframe_media::MAX_DURATION.as_millis())
+            .ok_or_else(|| {
+                format!(
+                    "frame {i} is at {at} × {multiplier} ms, past {} hours",
+                    spoolframe_media::MAX_DURATION.as_secs() / 3600
+                )
+            })?;
         frames.push(PreviewFrame {
-            at_ms: u64::from(at) * multiplier,
+            at_ms,
             jpeg: jpeg.to_vec(),
         });
     }
@@ -107,5 +118,39 @@ mod tests {
         let mut many = bif.clone();
         many[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(frames(&many).is_err());
+    }
+
+    /// A one-frame BIF of 81 bytes: the frame at `at` × `multiplier` ms.
+    fn one_frame(at: u32, multiplier: u32) -> Vec<u8> {
+        let mut bif = MAGIC.to_vec();
+        bif.extend(0u32.to_le_bytes()); // version
+        bif.extend(1u32.to_le_bytes()); // frames
+        bif.extend(multiplier.to_le_bytes());
+        bif.resize(HEADER, 0);
+        bif.extend(at.to_le_bytes());
+        bif.extend(80u32.to_le_bytes());
+        bif.extend(END.to_le_bytes());
+        bif.extend(81u32.to_le_bytes());
+        bif.push(0xFF);
+        bif
+    }
+
+    /// Finding 52 (G-3): a frame time sizes the preview tiles made from
+    /// the index, so one far past any film's length is refused.
+    #[test]
+    fn a_frame_past_the_longest_film_is_refused() {
+        assert!(frames(&one_frame(u32::MAX - 1, u32::MAX)).is_err());
+    }
+
+    #[test]
+    fn a_frame_a_second_past_the_longest_film_is_refused() {
+        let past = spoolframe_media::MAX_DURATION.as_secs() as u32 + 1;
+        assert!(frames(&one_frame(past, 0)).is_err());
+    }
+
+    #[test]
+    fn a_frame_at_the_longest_film_s_end_is_kept() {
+        let end = spoolframe_media::MAX_DURATION.as_secs() as u32;
+        assert_eq!(frames(&one_frame(end, 0)).unwrap()[0].jpeg, [0xFF]);
     }
 }

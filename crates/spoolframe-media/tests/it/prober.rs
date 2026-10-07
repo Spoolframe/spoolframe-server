@@ -304,3 +304,30 @@ async fn a_missing_media_file_is_named() {
     assert!(matches!(err, ProbeError::Stat { .. }), "{err}");
     assert!(err.to_string().contains("Gone.mkv"), "{err}");
 }
+
+/// Finding 51 (G-2): ffprobe's stdout was read whole into the server. A
+/// crafted file can make it print gigabytes. Past the cap the run is
+/// stopped and refused. 70 MB is past the 64 MiB cap.
+#[tokio::test]
+async fn a_description_past_the_output_cap_is_refused() {
+    let (_tmp, dir) = scratch("describe-too-much").await;
+    let movie = media(&dir);
+    let err = prober(fake_ffprobe(&dir, "head -c 70000000 /dev/zero"))
+        .describe(&movie)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("more than"), "{err}");
+}
+
+/// Finding 51 (G-2): one line per packet, so a file of tiny packets makes
+/// the keyframe listing as long as it likes.
+#[tokio::test]
+async fn a_keyframe_listing_past_the_output_cap_is_refused() {
+    let (_tmp, dir) = scratch("keyframes-too-much").await;
+    let movie = media(&dir);
+    let err = prober(fake_ffprobe(&dir, "yes 0.000000,K__ | head -c 70000000"))
+        .keyframes(&movie)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("more than"), "{err}");
+}

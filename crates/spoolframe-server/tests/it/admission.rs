@@ -308,6 +308,70 @@ async fn strangers_share_one_sign_in_budget_and_a_signed_in_device_does_not() {
     server.stop().await;
 }
 
+/// Third review G-14: a device that signed out is a stranger again while
+/// its streams drain before the close, and its sign-in attempts draw on
+/// the strangers' budget; they drew on nothing for up to 2 s.
+#[tokio::test]
+async fn a_signed_out_device_s_sign_ins_draw_on_the_strangers_budget_while_it_drains() {
+    // The device's own sign-in takes the only token, for an hour.
+    const REFILL: Duration = Duration::from_secs(3600);
+    let server = TestServer::start_with(
+        support::fresh_dir("signed-out-stranger-attempts").await,
+        ServerOptions {
+            stranger_attempts: Bucket {
+                capacity: 1,
+                refill_every: REFILL,
+            },
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.add_user("alice", "correct horse", None).await;
+    let device = server.client().await;
+    device.hello().await;
+    let session = device.login("alice", "correct horse").await;
+    // A stream waiting for its first frame holds the drain open.
+    let (mut held, _recv) = device.conn.open_bi().await.unwrap();
+    held.write_all(&[bi::RPC]).await.unwrap();
+    assert_eq!(
+        device.call(Some(&session), Request::Logout).await,
+        Response::Ok(Reply::LoggedOut)
+    );
+    // The sign-out lands soon after the reply, from a task of the
+    // server's: until the connection closes, each wrong guess is refused
+    // by the failure limit (15 minutes) or, once the device is a stranger,
+    // by the strangers' budget (an hour).
+    let mut by_budget = false;
+    for guess in 0.. {
+        if device.conn.close_reason().is_some() {
+            break;
+        }
+        // A call on a closed connection panics: that ends the drain too.
+        let attempt = tokio::spawn({
+            let device = device.clone();
+            async move {
+                device
+                    .call(None, login(&format!("guess-{guess}"), "wrong"))
+                    .await
+            }
+        });
+        let Ok(Ok(response)) = tokio::time::timeout(AT_ONCE, attempt).await else {
+            break;
+        };
+        if let Response::Err(Error::RateLimited { retry_after_ms }) = response
+            && retry_after_ms > 1_800_000
+        {
+            by_budget = true;
+            break;
+        }
+    }
+    assert!(
+        by_budget,
+        "no sign-in of the signed-out device drew on the strangers' budget"
+    );
+    server.stop().await;
+}
+
 /// PX-09 finding 16 (A-6): an app passkey sign-in is held per endpoint,
 /// and endpoint ids are free, so strangers' beginnings draw on their
 /// shared sign-in budget too: the 10,000 table cannot be filled in its

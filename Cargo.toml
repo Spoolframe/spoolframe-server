@@ -166,6 +166,9 @@ prost = "0.14"
 # The client wire encoding (spoolframe-protocol): self-describing, so peers
 # skip fields and variants they do not know. See the P1-10 commit.
 ciborium = "0.2"
+# Its low-level decoder: a request's type is read from a frame without
+# decoding the rest of it (finding 50).
+ciborium-ll = "0.2"
 # Byte strings as CBOR byte strings, not arrays of integers.
 serde_bytes = "0.11"
 

@@ -285,9 +285,22 @@ pub fn log(refusal: &Refusal) {
 }
 
 /// At most 64 characters of what a caller chose (a request type, a
-/// username), so a line stays a line.
+/// username), so a line stays a line: a control character in it is
+/// written escaped (`\n`, `\u{1b}`), or a newline in a username would
+/// write a line of its own into the text log (finding 59).
 pub fn bounded(text: &str) -> String {
-    text.chars().take(64).collect()
+    let mut escaped = String::new();
+    for c in text.chars() {
+        if c.is_control() {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+        if escaped.chars().count() >= 64 {
+            break;
+        }
+    }
+    escaped.chars().take(64).collect()
 }
 
 #[cfg(test)]
@@ -298,6 +311,19 @@ mod tests {
         (0..n)
             .filter(|_| refusals.admit(source, Kind::Forbidden))
             .count()
+    }
+
+    #[test]
+    fn a_username_with_a_newline_stays_on_one_line() {
+        let username = "alice\n2026-10-07T12:00:00Z WARN request refused user=admin\r\n";
+        let logged = bounded(&username.repeat(2));
+        assert!(
+            !logged.chars().any(char::is_control),
+            "{logged:?} carries a control character"
+        );
+        assert!(logged.starts_with(r"alice\n2026"), "{logged:?}");
+        // Escaped, it is still at most 64 characters.
+        assert_eq!(logged.chars().count(), 64);
     }
 
     #[test]

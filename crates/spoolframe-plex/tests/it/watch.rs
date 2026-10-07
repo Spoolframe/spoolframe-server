@@ -192,3 +192,35 @@ async fn a_key_plex_cannot_have_is_refused_before_any_call() {
     );
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+/// Finding 60 (G-11): a key with a `:` names another server in
+/// Spoolframe's ids (`plex:movie:cabin:12`), so a first PMS that hands one
+/// out would write watch state under another server's item. It is
+/// refused.
+#[tokio::test]
+async fn a_rating_key_that_names_another_server_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(path("/library/sections"))
+        .respond_with(json("sections"))
+        .mount(&server)
+        .await;
+    let listing = |metadata: serde_json::Value| {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": { "size": 1, "totalSize": 1, "Metadata": metadata }
+        }))
+    };
+    Mock::given(path("/library/sections/2/all"))
+        .respond_with(listing(serde_json::json!([{
+            "ratingKey": "cabin:12", "type": "movie", "title": "Elsewhere",
+            "viewCount": 1
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(path("/library/sections/1/all"))
+        .respond_with(listing(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    let catalog = PlexCatalog::new(server.uri().parse().unwrap(), None).unwrap();
+    let states = catalog.watch_states(None).await;
+    assert!(states.is_err(), "{states:?}");
+}

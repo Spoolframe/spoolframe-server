@@ -44,10 +44,12 @@ pub fn library(dir: &Directory) -> Result<Option<Library>, ConvertError> {
             return Ok(None);
         }
     };
-    let id = LibraryId::new(Namespace::Plex, dir.key.as_str()).map_err(|e| ConvertError {
-        item: None,
-        message: format!("library {:?}: {e}", dir.title),
-    })?;
+    let id = local_key(&dir.key)
+        .and_then(|key| LibraryId::new(Namespace::Plex, key).map_err(|e| e.to_string()))
+        .map_err(|e| ConvertError {
+            item: None,
+            message: format!("library {:?}: {e}", dir.title),
+        })?;
     Ok(Some(Library {
         id,
         title: dir.title.clone(),
@@ -87,12 +89,26 @@ pub fn plex_name(kind: MediaKind) -> &'static str {
     }
 }
 
+/// `key` from the PMS (a `ratingKey` or a section's key), if it can be an
+/// id's key. Spoolframe's ids read a key with a `:` as naming another
+/// Plex server (`plex:movie:cabin:12`), and a Plex key never has one; a
+/// PMS that hands one out would have its items and watch state taken for
+/// another server's (finding 60).
+pub(crate) fn local_key(key: &str) -> Result<&str, String> {
+    if key.contains(':') {
+        return Err(format!("key {key:?} has a ':', which names another server"));
+    }
+    Ok(key)
+}
+
 /// The `MediaId` of an item with this `ratingKey` and kind.
 pub fn media_id(kind: MediaKind, rating_key: &str) -> Result<MediaId, ConvertError> {
-    MediaId::new(Namespace::Plex, kind, rating_key).map_err(|e| ConvertError {
-        item: Some(rating_key.to_owned()),
-        message: e.to_string(),
-    })
+    local_key(rating_key)
+        .and_then(|key| MediaId::new(Namespace::Plex, kind, key).map_err(|e| e.to_string()))
+        .map_err(|message| ConvertError {
+            item: Some(rating_key.to_owned()),
+            message,
+        })
 }
 
 /// One item. A `type` Spoolframe does not model is an error: asking for an
@@ -450,6 +466,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Finding 60 (G-11): a key with a `:` names another server in
+    /// Spoolframe's ids, so one from the PMS would be taken for another
+    /// server's item.
+    #[test]
+    fn a_rating_key_with_a_colon_is_refused() {
+        let mut m = fixture("metadata-movie").metadata.remove(0);
+        m.rating_key = "cabin:12".into();
+        assert!(item(&m).is_err());
+    }
+
+    #[test]
+    fn a_parent_s_rating_key_with_a_colon_is_refused() {
+        let mut m = fixture("metadata-episode").metadata.remove(0);
+        m.grandparent_rating_key = Some("cabin:12".into());
+        assert!(item(&m).is_err());
+    }
+
+    #[test]
+    fn a_section_key_with_a_colon_is_refused() {
+        let dir = Directory {
+            key: "cabin:2".into(),
+            kind: Some("movie".into()),
+            title: "Movies".into(),
+            locations: Vec::new(),
+        };
+        assert!(library(&dir).is_err());
     }
 
     #[test]
