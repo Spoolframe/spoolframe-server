@@ -2777,3 +2777,15 @@
 - Setup-code and device sign-in code guesses are counted before they are
   checked (A-13), as passwords already were: guesses sent at once can no
   longer pass the limit of 5. A right code is not counted.
+- A proxy on the same host that the server is not told about is refused,
+  not only warned of (findings 29 and 38, the second review's M-4): with
+  `admin.listen` on loopback, `admin.public_url` set and
+  `admin.trusted_proxies` empty, the config does not load. The server
+  does not start, with an error naming `admin.trusted_proxies`, and a
+  `settingSet` or `settingUnset` that would make that shape is refused
+  as `INVALID_INPUT`. The new `admin.not_proxied = true` (a restart
+  setting; NixOS `admin.notProxied`) says nothing proxies to the
+  listener, and lets the shape load: its loopback callers are taken as
+  local and share one failed-login limit, as before. The NixOS module's
+  warning is now an assertion with the same opt-out, checked by the new
+  flake check `nixos-module-assertions`.

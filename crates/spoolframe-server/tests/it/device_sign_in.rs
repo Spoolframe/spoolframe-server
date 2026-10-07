@@ -333,6 +333,10 @@ async fn a_tv_approved_in_a_browser_gets_a_session_as_the_web_user() {
         device.from_internet,
         spoolframe_server::device_sign_in::from_internet(from)
     );
+    assert_eq!(
+        device.public_ipv6,
+        spoolframe_server::device_sign_in::public_ipv6(from)
+    );
 
     let waiting = tv_awaits(&tv, &request);
     alice.device_sign_in_approve(typed, false).await.unwrap();

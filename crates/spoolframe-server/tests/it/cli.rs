@@ -151,6 +151,18 @@ impl Running {
         assert!(killed.success());
         self.0.wait().unwrap()
     }
+
+    /// [`Running::stop`], which must be clean (SIGTERM is not a failure).
+    /// Says how it ended, and the log, when it is not.
+    fn stop_cleanly(self) {
+        let log = self.1.clone();
+        let status = self.stop();
+        if !status.success() {
+            // Time for the reader thread to take the last lines.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            panic!("stopped with {status}:\n{}", log.lock());
+        }
+    }
 }
 
 impl Drop for Running {
@@ -168,7 +180,7 @@ async fn an_unreachable_plex_is_reported_and_the_server_keeps_running() {
     assert!(log.contains(&url), "{log}");
     assert!(log.contains("admin API listening"), "{log}");
     // SIGTERM is a clean stop, not a failure.
-    assert!(running.stop().success());
+    running.stop_cleanly();
 }
 
 /// `path`'s permission bits.
@@ -218,22 +230,72 @@ async fn the_server_keeps_its_state_and_caches_to_its_own_user() {
     for file in ["spoolframe.db", "spoolframe.db-wal"] {
         assert_eq!(mode(&state.join(file)), 0o600, "{file}");
     }
-    assert!(running.stop().success());
+    running.stop_cleanly();
+}
+
+/// `config`'s `admin { … }` with `settings` added.
+fn with_admin(config: &Path, settings: &str) {
+    let text = std::fs::read_to_string(config)
+        .unwrap()
+        .replace("admin {", &format!("admin {{ {settings}"));
+    std::fs::write(config, text).unwrap();
 }
 
 /// A loopback listener with a public URL is a proxy on this host; without
-/// `trusted_proxies` every caller looks like loopback (PX-11 finding 38).
+/// `trusted_proxies` every caller looks like loopback, so the server does
+/// not start (PX-11 finding 38, the second review's M-4).
 #[tokio::test]
-async fn a_same_host_proxy_without_trusted_proxies_is_warned_of_at_start() {
+async fn a_same_host_proxy_without_trusted_proxies_does_not_start() {
     let (_tmp, config) = config_with_state("unnamed-proxy", &closed_port_url()).await;
-    let text = std::fs::read_to_string(&config).unwrap().replace(
-        "admin {",
-        r#"admin { public_url = "https://media.example.org";"#,
+    with_admin(&config, r#"public_url = "https://media.example.org";"#);
+    let mut child = server_with(&config)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    // A server that starts never exits by itself: give it a while, then
+    // fail rather than wait for ever.
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            let _ = child.kill();
+            panic!("the server started with an unnamed proxy in front");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("admin.trusted_proxies"), "{stderr}");
+    assert!(stderr.contains("admin.not_proxied"), "{stderr}");
+}
+
+/// The same shape starts once the proxy is named.
+#[tokio::test]
+async fn a_same_host_proxy_named_in_trusted_proxies_starts() {
+    let (_tmp, config) = config_with_state("named-proxy", &closed_port_url()).await;
+    with_admin(
+        &config,
+        r#"public_url = "https://media.example.org"; trusted_proxies = "127.0.0.1";"#,
     );
-    std::fs::write(&config, text).unwrap();
     let (running, log) = Running::start(&config);
-    assert!(log.contains("admin.trusted_proxies is empty"), "{log}");
-    assert!(running.stop().success());
+    assert!(log.contains("admin API listening"), "{log}");
+    running.stop_cleanly();
+}
+
+/// And once the config says nothing proxies to the listener: a tunnel's
+/// or this host's callers are local.
+#[tokio::test]
+async fn a_loopback_listener_said_not_to_be_proxied_starts() {
+    let (_tmp, config) = config_with_state("not-proxied", &closed_port_url()).await;
+    with_admin(
+        &config,
+        r#"public_url = "https://media.example.org"; not_proxied = true;"#,
+    );
+    let (running, log) = Running::start(&config);
+    assert!(log.contains("admin API listening"), "{log}");
+    assert!(log.contains("admin.not_proxied"), "{log}");
+    running.stop_cleanly();
 }
 
 /// `config` with `media { … }` added.
@@ -259,7 +321,7 @@ async fn the_media_tools_run_confined_by_default() {
     assert!(log.contains("could not read"), "{log}");
     // And the subtitle decoder, this binary run again (finding 45).
     assert!(log.contains("a confined subtitle decoder"), "{log}");
-    assert!(running.stop().success());
+    running.stop_cleanly();
 }
 
 /// "required" refuses to start when the start check cannot show the
@@ -289,7 +351,7 @@ async fn an_auto_sandbox_that_cannot_be_shown_to_confine_starts_and_says_so() {
     let (running, log) = Running::start(&config);
     assert!(log.contains("MEDIA TOOLS MAY NOT BE CONFINED"), "{log}");
     assert!(log.contains("ERROR"), "{log}");
-    assert!(running.stop().success());
+    running.stop_cleanly();
 }
 
 /// The setup code a fresh server printed in its log.
@@ -472,7 +534,7 @@ async fn the_fingerprint_is_the_key_s_and_the_server_logs_it() {
             .any(|l| l.contains("server identity") && l.contains(&fingerprint)),
         "{log}"
     );
-    assert!(running.stop().success());
+    running.stop_cleanly();
 }
 
 /// What `spoolframe-server id` prints: the endpoint id, then the server
@@ -517,7 +579,7 @@ async fn id_prints_the_same_server_id_every_time_and_the_server_logs_it() {
             .any(|l| l.contains("server identity") && l.contains(&first)),
         "{log}"
     );
-    assert!(running.stop().success());
+    running.stop_cleanly();
 }
 
 #[test]
@@ -704,7 +766,7 @@ async fn without_plex_the_server_starts_not_set_up_and_says_where_to_set_it_up()
         .await
         .unwrap();
     assert_eq!(open["open"], true, "{open}");
-    assert!(running.stop().success());
+    running.stop_cleanly();
 }
 
 #[tokio::test]
@@ -810,7 +872,7 @@ async fn config_set_and_unset_change_the_running_server_through_its_admin_api() 
         set(&["config", "unset", "name"], ""),
         "name = \"Spoolframe\"\n"
     );
-    assert!(running.stop().success());
+    running.stop_cleanly();
 }
 
 #[tokio::test]
@@ -856,7 +918,7 @@ async fn config_set_is_refused_for_what_a_locked_file_sets() {
         stderr.contains("name is set by the server's config file") && stderr.contains("locked"),
         "{stderr}"
     );
-    assert!(running.stop().success());
+    running.stop_cleanly();
 }
 
 /// What `spoolframe-server <args>` prints.
@@ -976,7 +1038,7 @@ async fn plex_sync_watch_reports_each_linked_user() {
     );
     assert!(out.status.success(), "{out:?}");
     // The owner is found as the server starts.
-    assert!(running.stop().success());
+    running.stop_cleanly();
     let (running, _) = Running::start(&config);
     let admin = [
         ("SPOOLFRAME_ADMIN_USER", "root"),

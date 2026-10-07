@@ -78,6 +78,26 @@ pub fn from_internet(ip: IpAddr) -> bool {
     network(ip) == AddressNetwork::Internet
 }
 
+/// Whether `ip` is a global unicast IPv6 address: not unique-local
+/// (`fc00::/7`), link-local (`fe80::/10`), an IPv4 one written as IPv6
+/// (`::ffff:0:0/96`), loopback, unspecified or multicast. A device can be
+/// on the server's own network ([`network`] says `Local`) and still have
+/// one, which the approval page says, as "on your network (public IPv6)".
+/// The apps decide this for themselves from [`DeviceAddress`].
+pub fn public_ipv6(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(_) => false,
+        IpAddr::V6(v6) => {
+            v6.to_ipv4_mapped().is_none()
+                && !v6.is_unique_local()
+                && !v6.is_unicast_link_local()
+                && !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+        }
+    }
+}
+
 /// What kind of network `ip` is on, for an approver (PX-09 finding 27):
 /// the web approval page's `from_internet` and the apps' [`DeviceAddress`]
 /// both come from here. It reads the server's interfaces now: sign-ins are
@@ -889,6 +909,29 @@ mod tests {
         for (addr, len) in own_networks() {
             assert!(len <= if addr.is_ipv4() { 32 } else { 128 }, "{addr}/{len}");
             assert_ne!(network(addr), AddressNetwork::Internet, "{addr}/{len}");
+        }
+    }
+
+    /// A global unicast IPv6 address is public even on the server's own
+    /// network: the approval page says so beside "on your network".
+    #[test]
+    fn only_a_global_unicast_ipv6_address_is_public_ipv6() {
+        let at = |text: &str| public_ipv6(text.parse().unwrap());
+        for public in ["2603:8000:c33e:6ac6::abcd", "2001:db8::1", "2a00:1450::1"] {
+            assert!(at(public), "{public}");
+        }
+        for not in [
+            "fd7a:115c:a1e0::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:203.0.113.9",
+            "::1",
+            "::",
+            "ff02::1",
+            "203.0.113.9",
+            "192.168.86.20",
+        ] {
+            assert!(!at(not), "{not}");
         }
     }
 

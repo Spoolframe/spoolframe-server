@@ -186,9 +186,38 @@ impl Stub {
             .collect()
     }
 
+    /// Stop, and return once the addresses it was bound on are free, so a
+    /// stub started next on the same address binds there.
+    ///
+    /// iroh closes its UDP sockets only when the last handle on the
+    /// endpoint is gone, and `close` does not wait for that: the accept
+    /// task holds a clone until tokio drops it, each events stream in
+    /// `state` holds its connection and with it the socket, and the
+    /// tasks still serving streams drop theirs only when next polled.
     pub async fn stop(self) {
+        let bound = self.endpoint.bound_sockets();
         self.task.abort();
+        let _ = self.task.await;
         self.endpoint.close().await;
+        self.state.events.lock().clear();
+        drop(self.endpoint);
+        drop(self.state);
+        until_free(&bound).await;
+    }
+}
+
+/// Wait until nothing holds a UDP socket on any of `addrs`.
+async fn until_free(addrs: &[SocketAddr]) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    for addr in addrs {
+        while let Err(err) = std::net::UdpSocket::bind(addr) {
+            assert!(
+                err.kind() == std::io::ErrorKind::AddrInUse
+                    && tokio::time::Instant::now() < deadline,
+                "{addr} was never freed: {err}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }
 

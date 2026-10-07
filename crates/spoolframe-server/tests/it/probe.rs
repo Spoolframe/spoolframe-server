@@ -120,7 +120,35 @@ async fn every_check_passes_against_the_server() {
     // Shown with --nocapture: the evidence, not only the verdicts.
     eprintln!("{summary}");
     assert_eq!(report.aborted, None, "{summary}");
-    assert_eq!(report.count(Status::Pass), report.checks.len(), "{summary}");
+    // All but the anonymous-pool check, which needs more strangers than
+    // [`CAP`] and has a test of its own below.
+    assert_eq!(status(&report, "anonymous-pool"), Status::Skip, "{summary}");
+    assert_eq!(
+        report.count(Status::Pass),
+        report.checks.len() - 1,
+        "{summary}"
+    );
+    server.stop().await;
+}
+
+/// Finding 48 (the second review's M-1): strangers spamming refused
+/// resumes leave room for another stranger's login. Its own server, at the
+/// default stranger cap: the spammers are more strangers than [`CAP`].
+/// Short, so the run stays quick; the live run spams for 45 s.
+#[tokio::test]
+async fn strangers_spamming_resumes_leave_room_for_a_login() {
+    let (server, _web) = server_with("probe-pool", Admission::default(), Role::Consumer).await;
+    let config = Config {
+        check_pool: true,
+        pool_seconds: 3,
+        pool_drain: Duration::from_secs(10),
+        ..Config::new(server.server.addr())
+    };
+    let report = spoolframe_probe::run(&config)
+        .await
+        .expect("the probe runs");
+    let summary = spoolframe_probe::summary(&report);
+    assert_eq!(status(&report, "anonymous-pool"), Status::Pass, "{summary}");
     server.stop().await;
 }
 

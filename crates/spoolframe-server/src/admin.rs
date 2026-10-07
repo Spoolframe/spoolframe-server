@@ -1749,6 +1749,9 @@ impl MeApiServer for AdminApi {
             from_internet: waiting
                 .address
                 .is_some_and(crate::device_sign_in::from_internet),
+            public_ipv6: waiting
+                .address
+                .is_some_and(crate::device_sign_in::public_ipv6),
         })
     }
 

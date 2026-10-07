@@ -786,6 +786,13 @@ pub struct AdminConfig {
     /// a loopback one under none.
     #[ucl(default)]
     pub trusted_proxies: Option<String>,
+    /// Nothing proxies to this listener: a loopback caller is on this
+    /// host, or comes through an SSH tunnel. Only read for a loopback
+    /// listener with a public URL, which otherwise means a proxy on this
+    /// host, and is refused without `trusted_proxies` (PX-11 finding 38).
+    /// Off if left out.
+    #[ucl(default)]
+    pub not_proxied: Option<bool>,
     /// Send the session cookie without `Secure`, so signing in over plain
     /// HTTP on the LAN works: the cookie then crosses the network in
     /// clear. It stays `HttpOnly`. Off if left out, and refused while
@@ -845,6 +852,10 @@ impl AdminConfig {
         self.metrics.unwrap_or(false)
     }
 
+    pub fn not_proxied(&self) -> bool {
+        self.not_proxied.unwrap_or(false)
+    }
+
     /// Who may read `GET /metrics`.
     pub fn metrics_from(&self) -> Result<crate::admin::AddressRanges, ConfigError> {
         let list = self
@@ -857,19 +868,40 @@ impl AdminConfig {
         })
     }
 
-    /// The address to listen on.
-    /// Whether this is a proxy on the same host that the server is not
-    /// told about (PX-11 finding 38): a loopback listener with a public
-    /// URL is one, and with no `trusted_proxies` every caller through it
-    /// looks like loopback. Failed logins then share no source, and
-    /// `/metrics`, when on, answers anyone the proxy lets in (PX-09
-    /// finding 29).
+    /// Whether this is the shape of a proxy on the same host that the
+    /// server is not told about (PX-11 finding 38): a loopback listener
+    /// with a public URL and no `trusted_proxies`. Every caller through
+    /// such a proxy looks like loopback: failed logins then share no
+    /// source, and `/metrics`, when on, answers anyone the proxy lets in
+    /// (PX-09 finding 29).
     pub fn proxy_unnamed(&self) -> Result<bool, ConfigError> {
         Ok(self.listen()?.ip().is_loopback()
             && self.public_url.is_some()
             && self.trusted_proxies()? == crate::admin::TrustedProxies::default())
     }
 
+    /// Refuses [`Self::proxy_unnamed`]'s shape unless `not_proxied` says
+    /// nothing proxies to the listener (the second review's M-4). Checked
+    /// at every parse, so a change at run time that would make it is
+    /// refused too, and the server is never left unable to start.
+    fn check_proxy(&self) -> Result<(), ConfigError> {
+        if self.proxy_unnamed()? && !self.not_proxied() {
+            return Err(ConfigError::Invalid {
+                key: "admin.trusted_proxies",
+                message: "is empty, but admin.listen is loopback and admin.public_url is set, \
+                          so a proxy on this host is in front, and every caller through it \
+                          would look like loopback: failed logins would not be limited per \
+                          caller, and /metrics, when on, would answer whoever the proxy lets \
+                          in. Set admin.trusted_proxies to the proxy's address (\"127.0.0.1\" \
+                          for one on this host); or, if nothing proxies to this listener, \
+                          set admin.not_proxied = true"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The address to listen on.
     pub fn listen(&self) -> Result<SocketAddr, ConfigError> {
         let text = self.listen.as_deref().unwrap_or(Self::DEFAULT_LISTEN);
         text.parse().map_err(|e| ConfigError::Invalid {
@@ -1479,6 +1511,7 @@ impl ServerConfig {
         parsed.admin.listen()?;
         parsed.admin.origins()?;
         parsed.admin.trusted_proxies()?;
+        parsed.admin.check_proxy()?;
         parsed.admin.metrics_from()?;
         parsed.auth.check(&parsed.admin)?;
         parsed.auth.trust_idle()?;
@@ -2265,30 +2298,45 @@ mod tests {
         assert!(config.admin.insecure_cookies());
     }
 
-    /// PX-11 finding 38: the shape of a same-host proxy whose callers
-    /// the server cannot tell apart (PX-09 finding 29).
+    /// PX-11 finding 38, the second review's M-4: a same-host proxy whose
+    /// callers the server cannot tell apart (PX-09 finding 29) does not
+    /// load, and the refusal names the setting that fixes it.
     #[test]
-    fn a_loopback_listener_behind_a_public_url_without_trusted_proxies_is_warned_of() {
-        let warned = |admin: &str| {
-            plex(&format!("admin {{ {admin} }}"))
-                .unwrap()
-                .admin
-                .proxy_unnamed()
-                .unwrap()
-        };
-        assert!(warned(
-            r#"listen = "127.0.0.1:7421"; public_url = "https://media.example.org";"#
-        ));
-        assert!(warned(
-            r#"listen = "[::1]:7421"; public_url = "https://media.example.org";"#
-        ));
-        assert!(!warned(
-            r#"listen = "127.0.0.1:7421"; public_url = "https://media.example.org"; trusted_proxies = "127.0.0.1";"#
-        ));
-        assert!(!warned(r#"listen = "127.0.0.1:7421";"#));
-        assert!(!warned(
-            r#"listen = "0.0.0.0:7421"; public_url = "https://media.example.org";"#
-        ));
+    fn a_loopback_listener_behind_a_public_url_without_trusted_proxies_is_refused() {
+        for admin in [
+            r#"listen = "127.0.0.1:7421"; public_url = "https://media.example.org";"#,
+            r#"listen = "[::1]:7421"; public_url = "https://media.example.org";"#,
+        ] {
+            let err = plex(&format!("admin {{ {admin} }}")).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::Invalid {
+                        key: "admin.trusted_proxies",
+                        message,
+                    } if message.contains("admin.not_proxied")
+                ),
+                "{admin}: {err:?}"
+            );
+        }
+    }
+
+    /// The same shape loads once the proxy is named, or once the config
+    /// says nothing proxies to the listener; and a listener that is not
+    /// loopback, or has no public URL, is not that shape.
+    #[test]
+    fn a_loopback_listener_behind_a_public_url_loads_with_its_proxy_named_or_none_said() {
+        for admin in [
+            r#"listen = "127.0.0.1:7421"; public_url = "https://media.example.org"; trusted_proxies = "127.0.0.1";"#,
+            r#"listen = "127.0.0.1:7421"; public_url = "http://localhost:7421"; not_proxied = true;"#,
+            r#"listen = "127.0.0.1:7421";"#,
+            r#"listen = "0.0.0.0:7421"; public_url = "https://media.example.org";"#,
+            // The dev server's shape.
+            r#"listen = "0.0.0.0:7431"; public_url = "http://localhost:7431"; insecure_cookies = true;"#,
+        ] {
+            let config = plex(&format!("admin {{ {admin} }}"));
+            assert!(config.is_ok(), "{admin}: {config:?}");
+        }
     }
 
     #[test]

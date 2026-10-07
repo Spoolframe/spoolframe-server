@@ -21,7 +21,7 @@ use spoolframe_protocol::{Error, LoginPassword, MediaRead, Reply, Request, Respo
 use spoolframe_server::auth::SessionToken;
 
 use crate::admin::{CODE, anonymous, code, creds, setup, state_dir, with_token};
-use crate::support::{LogCapture, Logged, TestClient, TestServer, mkv_capabilities, movie};
+use crate::support::{LogCapture, Logged, TestClient, TestServer, alone, mkv_capabilities, movie};
 
 const ROOT_PASSWORD: &str = "correct horse";
 const ALICE_PASSWORD: &str = "battery staple";
@@ -82,6 +82,9 @@ async fn root_and_alice(
 
 #[tokio::test]
 async fn a_consumer_calling_an_admin_method_is_logged_once() {
+    if !alone("refusals::a_consumer_calling_an_admin_method_is_logged_once") {
+        return;
+    }
     let (addr, _root, alice, _dir) = root_and_alice("refused-forbidden", Clock::default()).await;
     let alice = with_token(addr, &alice).await;
     let (capture, _guard) = LogCapture::start();
@@ -104,6 +107,9 @@ async fn a_consumer_calling_an_admin_method_is_logged_once() {
 
 #[tokio::test]
 async fn an_old_session_making_a_sensitive_change_is_logged_once() {
+    if !alone("refusals::an_old_session_making_a_sensitive_change_is_logged_once") {
+        return;
+    }
     let (_, root, _, dir) = root_and_alice("refused-recent", Clock::default()).await;
     crate::recent_admin::age(dir.as_ref(), "root").await;
     let (capture, _guard) = LogCapture::start();
@@ -129,6 +135,9 @@ async fn an_old_session_making_a_sensitive_change_is_logged_once() {
 /// sends, so it is only INFO.
 #[tokio::test]
 async fn a_made_up_token_is_a_warning_and_no_token_only_info() {
+    if !alone("refusals::a_made_up_token_is_a_warning_and_no_token_only_info") {
+        return;
+    }
     let (addr, _root, _, _dir) = root_and_alice("refused-token", Clock::default()).await;
     let (capture, _guard) = LogCapture::start();
     let err = with_token(addr, "made-up")
@@ -163,6 +172,9 @@ async fn a_made_up_token_is_a_warning_and_no_token_only_info() {
 
 #[tokio::test]
 async fn a_failed_login_names_the_user_and_why_but_never_the_password() {
+    if !alone("refusals::a_failed_login_names_the_user_and_why_but_never_the_password") {
+        return;
+    }
     let (addr, _root, _, _dir) = root_and_alice("refused-login", Clock::default()).await;
     let (capture, _guard) = LogCapture::start();
     let err = anonymous(addr)
@@ -200,6 +212,9 @@ async fn a_failed_login_names_the_user_and_why_but_never_the_password() {
 
 #[tokio::test]
 async fn a_rate_limited_login_is_logged() {
+    if !alone("refusals::a_rate_limited_login_is_logged") {
+        return;
+    }
     let (addr, _root, _, _dir) = root_and_alice("refused-limited", Clock::default()).await;
     let client = anonymous(addr).await;
     for _ in 0..spoolframe_server::auth::MAX_FAILURES {
@@ -224,6 +239,9 @@ async fn a_rate_limited_login_is_logged() {
 
 #[tokio::test]
 async fn a_wrong_setup_code_is_logged_but_not_the_code() {
+    if !alone("refusals::a_wrong_setup_code_is_logged_but_not_the_code") {
+        return;
+    }
     let (addr, _dir) = crate::admin::server("refused-setup-code").await;
     let (capture, _guard) = LogCapture::start();
     let err = anonymous(addr)
@@ -248,6 +266,9 @@ async fn a_wrong_setup_code_is_logged_but_not_the_code() {
 /// The browser's sign-in is not JSON-RPC: `/auth/login` logs its own.
 #[tokio::test]
 async fn a_failed_web_sign_in_is_logged() {
+    if !alone("refusals::a_failed_web_sign_in_is_logged") {
+        return;
+    }
     let (addr, _root, _, _dir) = root_and_alice("refused-web-login", Clock::default()).await;
     let (capture, _guard) = LogCapture::start();
     let response = reqwest::Client::new()
@@ -278,6 +299,9 @@ async fn a_failed_web_sign_in_is_logged() {
 /// lines; a minute on, one line says how many were left out.
 #[tokio::test]
 async fn a_flood_of_refusals_is_cut_to_a_few_lines_and_a_count() {
+    if !alone("refusals::a_flood_of_refusals_is_cut_to_a_few_lines_and_a_count") {
+        return;
+    }
     const BURST: usize = 1000;
     let clock = Clock::default();
     let (addr, _root, alice, _dir) = root_and_alice("refused-flood", clock.clone()).await;
@@ -337,6 +361,9 @@ fn short(client: &TestClient) -> String {
 /// use it, names whose it is.
 #[tokio::test]
 async fn a_session_used_from_another_device_is_logged_with_its_owner() {
+    if !alone("refusals::a_session_used_from_another_device_is_logged_with_its_owner") {
+        return;
+    }
     let (server, tv, session) = quic_alice("refused-quic-g3").await;
     let thief = server.client().await;
     thief.hello().await;
@@ -367,6 +394,9 @@ async fn a_session_used_from_another_device_is_logged_with_its_owner() {
 /// No session at all is what a signed-out app sends: INFO, not WARN.
 #[tokio::test]
 async fn a_request_without_a_session_is_only_info() {
+    if !alone("refusals::a_request_without_a_session_is_only_info") {
+        return;
+    }
     let (server, tv, _) = quic_alice("refused-quic-anonymous").await;
     let (capture, _guard) = LogCapture::start();
     assert_eq!(
@@ -383,6 +413,9 @@ async fn a_request_without_a_session_is_only_info() {
 /// G4: a profile locked on its device until its PIN.
 #[tokio::test]
 async fn a_locked_profile_s_request_is_logged() {
+    if !alone("refusals::a_locked_profile_s_request_is_logged") {
+        return;
+    }
     let (server, tv, session) = quic_alice("refused-quic-g4").await;
     for request in [
         Request::SetPin {
@@ -444,6 +477,9 @@ async fn a_locked_profile_s_request_is_logged() {
 /// RS: a change that needs a recent sign-in, from an old session.
 #[tokio::test]
 async fn an_old_session_s_sensitive_request_is_logged() {
+    if !alone("refusals::an_old_session_s_sensitive_request_is_logged") {
+        return;
+    }
     let (server, tv, session) = quic_alice("refused-quic-rs").await;
     crate::app_passkeys::sql(
         &server,
@@ -480,6 +516,9 @@ async fn an_old_session_s_sensitive_request_is_logged() {
 /// over RPC and over a media read.
 #[tokio::test]
 async fn another_session_s_playback_is_logged() {
+    if !alone("refusals::another_session_s_playback_is_logged") {
+        return;
+    }
     let (server, tv, alice) = quic_alice("refused-quic-pb").await;
     let Response::Ok(Reply::PlaybackStarted { handle, .. }) = tv
         .call(
@@ -553,6 +592,9 @@ async fn another_session_s_playback_is_logged() {
 
 #[tokio::test]
 async fn a_failed_app_sign_in_names_the_user_and_why_but_never_the_password() {
+    if !alone("refusals::a_failed_app_sign_in_names_the_user_and_why_but_never_the_password") {
+        return;
+    }
     let (server, tv, _) = quic_alice("refused-quic-login").await;
     let (capture, _guard) = LogCapture::start();
     for (username, reason) in [("mallory", "unknown user"), ("alice", "wrong password")] {
@@ -587,6 +629,9 @@ async fn a_failed_app_sign_in_names_the_user_and_why_but_never_the_password() {
 
 #[tokio::test]
 async fn a_rate_limited_app_sign_in_is_logged() {
+    if !alone("refusals::a_rate_limited_app_sign_in_is_logged") {
+        return;
+    }
     let (server, tv, _) = quic_alice("refused-quic-limited").await;
     let login = || {
         Request::LoginPassword(LoginPassword {

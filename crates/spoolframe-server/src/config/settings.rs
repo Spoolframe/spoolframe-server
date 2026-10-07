@@ -73,6 +73,7 @@ pub const SETTINGS: &[Setting] = &[
     restart("admin.listen"),
     restart("admin.public_url"),
     restart("admin.trusted_proxies"),
+    restart("admin.not_proxied"),
     live("admin.insecure_cookies"),
     live("admin.metrics"),
     live("admin.metrics_from"),

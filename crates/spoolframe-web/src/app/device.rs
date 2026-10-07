@@ -334,7 +334,12 @@ fn Consent(user: UserInfo, code: String, server: String, on_switch: EventHandler
                             span { "{server} · {page_host()}" }
                             b { class: "approve-fingerprint", "{found.server_fingerprint}" }
                         }
-                        match approve::origin(found.address.as_deref(), found.from_internet, word) {
+                        match approve::origin(
+                            found.address.as_deref(),
+                            found.from_internet,
+                            found.public_ipv6,
+                            word,
+                        ) {
                             Some((line, true)) => rsx! { Notice { "{line}" } },
                             Some((line, false)) => rsx! { p { class: "approve-who", "{line}" } },
                             None => rsx! {},

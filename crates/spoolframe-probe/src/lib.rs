@@ -18,6 +18,11 @@
 //!   time, and only when asked ([`Config::check_cap`]); the sign-in check
 //!   only when asked ([`Config::check_limits`]), and only for a username
 //!   it makes up.
+//! - the anonymous-pool check holds the pool's attention for
+//!   [`Config::pool_seconds`] with [`Config::pool_spammers`] strangers,
+//!   and only when asked ([`Config::check_pool`]). It is last: it holds
+//!   strangers' slots for a while (before finding 48's fix it also blocked
+//!   every anonymous sign-in).
 //!
 //! Given a consumer account ([`Config::account`]), it also signs in as
 //! that account, once over QUIC and once on the web listener, and checks
@@ -59,6 +64,14 @@ pub struct Config {
     pub cap_pace: Duration,
     /// Run the sign-in limits check (failed logins for a made-up user).
     pub check_limits: bool,
+    /// Run the anonymous-pool check (strangers holding the pool).
+    pub check_pool: bool,
+    /// Strangers the anonymous-pool check holds shares with.
+    pub pool_spammers: usize,
+    /// How long the anonymous-pool check spams for.
+    pub pool_seconds: u64,
+    /// How long the anonymous-pool check waits for the pool to drain.
+    pub pool_drain: Duration,
     /// Sign in as this account for the signed-in checks.
     pub account: Option<Account>,
 }
@@ -130,6 +143,10 @@ impl Config {
             check_cap: false,
             cap_pace: Duration::from_millis(100),
             check_limits: false,
+            check_pool: false,
+            pool_spammers: 8,
+            pool_seconds: 45,
+            pool_drain: Duration::from_secs(40),
             account: None,
         }
     }

@@ -60,6 +60,10 @@
             spoolframePackage = spoolframe;
             spoolframeModule = ./nix/nixos-module.nix;
           };
+          nixos-module-assertions = import ./nix/assertions.nix {
+            inherit pkgs;
+            spoolframeModule = ./nix/nixos-module.nix;
+          };
         };
         formatter = pkgs.alejandra;
       };

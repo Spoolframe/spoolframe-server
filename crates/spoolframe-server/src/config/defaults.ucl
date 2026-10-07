@@ -150,6 +150,11 @@ admin {
   # The reverse proxies in front of the listener, as addresses and CIDR
   # ranges, comma-separated. Left out, no X-Forwarded-For is read.
   # trusted_proxies = "10.0.0.5, 172.17.0.0/16";
+  # A loopback listen with a public_url means a proxy on this host, and
+  # the server refuses to start without trusted_proxies: every caller
+  # would look like loopback. Set this only when nothing proxies to the
+  # listener (an SSH tunnel, a browser on this host).
+  not_proxied = false;
   # Send the session cookie without Secure, so signing in over plain
   # HTTP on the LAN works. The cookie then crosses the LAN in clear, but
   # stays HttpOnly; passkeys still need HTTPS. Refused while public_url

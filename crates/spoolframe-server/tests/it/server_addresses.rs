@@ -183,6 +183,21 @@ async fn a_device_signed_out_is_pushed_nothing_on_its_next_connection() {
     pushed(next_event(&mut events(&again).await, Duration::from_secs(5)).await);
 
     server.store.disable_user("alice").await.unwrap();
+    // The server closes the device's connections once its last session
+    // ends (PX-10), and one made before that lands is closed with them:
+    // reconnect only after.
+    let closed = tokio::time::timeout(Duration::from_secs(10), again.conn.closed())
+        .await
+        .expect("the server closes a signed-out device's connection");
+    assert!(
+        matches!(
+            &closed,
+            iroh::endpoint::ConnectionError::ApplicationClosed(close)
+                if close.error_code
+                    == iroh::endpoint::VarInt::from_u32(spoolframe_protocol::close::SIGNED_OUT)
+        ),
+        "{closed:?}"
+    );
     let after = device.reconnect(&server).await;
     assert_eq!(
         next_event(&mut events(&after).await, Duration::from_secs(1)).await,

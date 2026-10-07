@@ -73,8 +73,15 @@ pub fn check_line(word: &str) -> String {
 /// Where the device asked from (PX-09 finding 27), and whether that is
 /// to be warned of: a public address is not a network the approver
 /// shares, which is how a code someone else sent them as a link looks.
-/// `None` when the server could not tell.
-pub fn origin(address: Option<&str>, from_internet: bool, word: &str) -> Option<(String, bool)> {
+/// A nearby device with a global IPv6 address (`public_ipv6`, in the
+/// server's own prefix) is named as on your network, with its address
+/// said to be public. `None` when the server could not tell.
+pub fn origin(
+    address: Option<&str>,
+    from_internet: bool,
+    public_ipv6: bool,
+    word: &str,
+) -> Option<(String, bool)> {
     let address = address?;
     Some(if from_internet {
         (
@@ -83,6 +90,11 @@ pub fn origin(address: Option<&str>, from_internet: bool, word: &str) -> Option<
                  Approve only a {word} you can see: a code sent to you is someone else's."
             ),
             true,
+        )
+    } else if public_ipv6 {
+        (
+            format!("The {word} asked from {address}, on your network (public IPv6)."),
+            false,
         )
     } else {
         (format!("The {word} asked from {address}."), false)
@@ -124,17 +136,40 @@ mod tests {
     /// PX-09 finding 27.
     #[test]
     fn a_device_on_the_internet_is_warned_of_and_one_nearby_is_named() {
-        let (far, warn) = origin(Some("203.0.113.9"), true, "TV").unwrap();
+        let (far, warn) = origin(Some("203.0.113.9"), true, false, "TV").unwrap();
         assert!(warn);
         assert!(
             far.contains("203.0.113.9") && far.contains("internet"),
             "{far}"
         );
         assert_eq!(
-            origin(Some("192.168.86.20"), false, "TV"),
+            origin(Some("192.168.86.20"), false, false, "TV"),
             Some(("The TV asked from 192.168.86.20.".to_owned(), false))
         );
-        assert_eq!(origin(None, true, "TV"), None);
+        assert_eq!(origin(None, true, false, "TV"), None);
+    }
+
+    /// A device in the server's own IPv6 prefix is on the approver's
+    /// network, but its address is a public one: the page says both.
+    #[test]
+    fn a_nearby_device_with_a_public_ipv6_address_is_said_to_be_on_your_network() {
+        assert_eq!(
+            origin(Some("2603:8000:c33e:6ac6::abcd"), false, true, "TV"),
+            Some((
+                "The TV asked from 2603:8000:c33e:6ac6::abcd, on your network (public IPv6)."
+                    .to_owned(),
+                false
+            ))
+        );
+    }
+
+    /// The internet warning wins: a public IPv6 address outside the
+    /// server's prefix is warned of as any other far one.
+    #[test]
+    fn a_far_device_with_a_public_ipv6_address_is_warned_of() {
+        let (far, warn) = origin(Some("2a00:1450::1"), true, true, "TV").unwrap();
+        assert!(warn);
+        assert!(far.contains("on the internet"), "{far}");
     }
 
     #[test]

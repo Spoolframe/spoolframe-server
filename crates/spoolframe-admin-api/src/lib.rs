@@ -409,6 +409,10 @@ pub struct DeviceSignIn {
     /// a device far from the approver, which is what a sign-in link sent
     /// to someone else (device-code phishing) looks like.
     pub from_internet: bool,
+    /// That address is a global unicast IPv6 one. With `from_internet`
+    /// false the device is still on the server's own network (in its
+    /// IPv6 prefix), and the page says "on your network (public IPv6)".
+    pub public_ipv6: bool,
 }
 
 /// What the server is and can do, for an admin.
@@ -1923,6 +1927,8 @@ pub struct ItemDebug {
 }
 
 /// The caller's own account, for every role.
+/// Only with `client` or `server`: the macro makes one or both.
+#[cfg(any(feature = "client", feature = "server"))]
 #[cfg_attr(
     all(feature = "client", feature = "server"),
     jsonrpsee::proc_macros::rpc(client, server, namespace = "me")
@@ -2176,6 +2182,8 @@ pub trait MeApi {
 }
 
 /// Other users and the server: admins only.
+/// Only with `client` or `server`: the macro makes one or both.
+#[cfg(any(feature = "client", feature = "server"))]
 #[cfg_attr(
     all(feature = "client", feature = "server"),
     jsonrpsee::proc_macros::rpc(client, server, namespace = "admin")

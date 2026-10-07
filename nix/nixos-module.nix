@@ -75,6 +75,7 @@
       ${lib.optionalString (!cfg.admin.allowInsecureCookies) "insecure_cookies = false;"}
       ${lib.optionalString (cfg.admin.publicUrl != null) "public_url = ${quote cfg.admin.publicUrl};"}
       ${lib.optionalString (cfg.admin.trustedProxies != []) "trusted_proxies = ${quote (lib.concatStringsSep ", " cfg.admin.trustedProxies)};"}
+      ${lib.optionalString cfg.admin.notProxied "not_proxied = true;"}
     }
     transcode {
       hardware = ${quote hardware};
@@ -308,7 +309,24 @@ in {
           trusted proxy; `Forwarded` is not read), and under no address
           if it names none. Left empty, no header is read: every
           connection counts under its own address, and a loopback one
-          under none.
+          under none. With {option}`admin.listen` on loopback and
+          {option}`admin.publicUrl` set, a proxy on this host is in front,
+          so this must name it (`["127.0.0.1"]`), or
+          {option}`admin.notProxied` must say there is none: the module
+          does not evaluate otherwise, and the server does not start.
+        '';
+      };
+
+      notProxied = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Nothing proxies to {option}`admin.listen`: its loopback callers
+          are on this host, or come through an SSH tunnel, and share one
+          limit on failed logins. Only needed for a loopback listener with
+          {option}`admin.publicUrl` set, which otherwise means a proxy on
+          this host that {option}`admin.trustedProxies` must name (PX-11
+          finding 38).
         '';
       };
     };
@@ -477,16 +495,19 @@ in {
         assertion = cfg.auth.oidc == [] || cfg.admin.publicUrl != null;
         message = "services.spoolframe.auth.oidc needs services.spoolframe.admin.publicUrl: the provider sends the browser back to <publicUrl>/auth/oidc/callback.";
       }
+      # PX-11 finding 38 (PX-09 finding 29): behind a proxy on this host
+      # every caller looks like loopback unless the proxy is named. The
+      # server refuses to start in this shape too.
+      {
+        assertion = !(loopback cfg.admin.listen && cfg.admin.publicUrl != null && cfg.admin.trustedProxies == [] && !cfg.admin.notProxied);
+        message = ''
+          services.spoolframe.admin.trustedProxies is empty, but admin.listen is loopback and
+          admin.publicUrl is set, so a proxy on this host is in front, and every caller through it
+          would look like loopback: failed logins would not be limited per caller, and /metrics,
+          when on, would answer whoever the proxy lets in. Set admin.trustedProxies = ["127.0.0.1"];
+          or, if nothing proxies to the listener, admin.notProxied = true.'';
+      }
     ];
-
-    # PX-11 finding 38 (PX-09 finding 29): behind a proxy on this host
-    # every caller looks like loopback unless the proxy is named.
-    warnings = lib.optional (loopback cfg.admin.listen && cfg.admin.publicUrl != null && cfg.admin.trustedProxies == []) ''
-      services.spoolframe: admin.listen is loopback and admin.publicUrl is set, so a proxy on
-      this host is in front, but admin.trustedProxies is empty: every caller looks like
-      loopback, so failed logins are not limited per caller and /metrics, when on, answers
-      whoever the proxy lets in. Set admin.trustedProxies = ["127.0.0.1"].
-    '';
 
     environment.etc."spoolframe/server.ucl".source = configFile;
     environment.systemPackages = [cli];

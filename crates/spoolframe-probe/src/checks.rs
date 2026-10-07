@@ -143,10 +143,11 @@ pub enum Check {
     SignedInStreams,
     SessionReread,
     StrangerCap,
+    AnonymousPool,
 }
 
 impl Check {
-    pub const ALL: [Check; 14] = [
+    pub const ALL: [Check; 15] = [
         Check::HelloVersion,
         Check::Unauthenticated,
         Check::UniStream,
@@ -160,11 +161,14 @@ impl Check {
         Check::Visibility,
         Check::RecentSignIn,
         Check::SignedInStreams,
-        // Last of them: it signs the QUIC session out.
         Check::SessionReread,
-        // Last: it fills the server's stranger slots, and nothing after it
-        // should meet a full server.
+        // It fills the server's stranger slots; the anonymous-pool check
+        // after it meets a server with them free again.
         Check::StrangerCap,
+        // Last: it holds strangers' shares of the anonymous operation pool
+        // for a while (before finding 48's fix that blocked every anonymous
+        // sign-in).
+        Check::AnonymousPool,
     ];
 
     pub fn id(self) -> &'static str {
@@ -183,6 +187,7 @@ impl Check {
             Check::SignedInStreams => "signed-in-streams",
             Check::SessionReread => "session-reread",
             Check::StrangerCap => "stranger-cap",
+            Check::AnonymousPool => "anonymous-pool",
         }
     }
 
@@ -212,6 +217,9 @@ impl Check {
                 "the session works till Logout, which closes SIGNED_OUT and ends it"
             }
             Check::StrangerCap => "the stranger connection past the cap is closed BUSY",
+            Check::AnonymousPool => {
+                "strangers holding the anonymous pool cannot refuse another stranger's login"
+            }
         }
     }
 
@@ -235,6 +243,10 @@ impl Check {
             Check::StrangerCap if config.check_cap => stranger_cap(probe, config).await,
             Check::StrangerCap => Ok(Outcome::skip(
                 "not asked for: pass --check-cap (opens cap+1 connections)",
+            )),
+            Check::AnonymousPool if config.check_pool => anonymous_pool(probe, config).await,
+            Check::AnonymousPool => Ok(Outcome::skip(
+                "not asked for: pass --check-pool (strangers holding the anonymous pool)",
             )),
             Check::ConsumerAdminRefused => {
                 account::consumer_admin_refused(probe, config, state).await
@@ -543,5 +555,140 @@ async fn stranger_cap(probe: &Probe, config: &Config) -> Result<Outcome, Problem
     let (conn, _) = probe.connect_hello().await?;
     f.still_usable(probe, &conn, "closing the connections")
         .await?;
+    Ok(f.done())
+}
+
+/// Check 6: strangers together cannot fill the anonymous operation pool
+/// (PX-09 finding 6's residual, finding 48, the second review's M-1): while
+/// `pool_spammers` strangers each try to hold their share of it with refused
+/// `ResumeProfile` attempts (before finding 48's fix each refused outcome was
+/// kept 30 s; now none is) a further stranger's wrong login
+/// still reaches auth (`InvalidCredentials`), not the pool's `RateLimited`.
+/// After they stop, the pool drains and a login reaches auth again.
+///
+/// Each spammer is a fresh endpoint key of its own: the run's budget counts
+/// its connection, and the spammer's own budget bounds its streams.
+async fn anonymous_pool(probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
+    let mut f = Findings::default();
+    let id = probe.id().to_string();
+    let hex = &id[..8];
+    // A wrong login for a username no account has, unique per attempt, so
+    // the failure limit never counts one name twice: `InvalidCredentials`
+    // means the login reached auth; `RateLimited` with `retry_after_ms` of
+    // 1000 means the pool refused it before that.
+    let login = |n: u64| {
+        Request::LoginPassword(LoginPassword {
+            username: format!("spoolframe-probe-pool-{n}-{hex}"),
+            password: "not-the-password".into(),
+            remember: false,
+        })
+    };
+    let resume = Request::ResumeProfile {
+        user_id: format!("local:spoolframe-probe-pool-{hex}"),
+    };
+
+    // Baseline: a wrong login reaches auth before anyone spams.
+    {
+        let (conn, _) = probe.connect_hello().await?;
+        let response = probe.request(&conn, None, login(0)).await?;
+        f.expect(
+            response == Response::Err(Error::InvalidCredentials),
+            format!("baseline login: {}", describe(&response)),
+        );
+    }
+
+    // The spammers: fresh endpoint keys, each sending a resume the server
+    // refuses `Unauthenticated` at about 3 a second, for `pool_seconds`.
+    let spammers = config.pool_spammers;
+    let seconds = config.pool_seconds;
+    f.note(format!(
+        "{spammers} strangers sending ResumeProfile for a user id no account has, \
+         for {seconds} s (before finding 48's fix each refused outcome held a pool entry 30 s)"
+    ));
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut handles = Vec::new();
+    for i in 0..spammers {
+        probe.spend()?; // the run's budget counts the spammer's connection
+        let target = config.target.clone();
+        let resume = resume.clone();
+        let budget = seconds as u32 * 4 + 4;
+        handles.push(tokio::spawn(async move {
+            let spammer = Probe::new(target, budget, Duration::from_secs(10))
+                .await
+                .map_err(|e| e.to_string())?;
+            let (conn, _) = spammer
+                .connect_hello()
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            let mut sent = 0u64;
+            while Instant::now() < deadline {
+                match spammer.request(&conn, None, resume.clone()).await {
+                    // Refused: the attempt still left its outcome in the pool.
+                    Ok(Response::Err(Error::Unauthenticated)) => sent += 1,
+                    // The spammer's share, or the pool, is full: expected once
+                    // it holds its share; the entries expire and free room.
+                    Ok(Response::Err(Error::RateLimited {
+                        retry_after_ms: 1000,
+                    })) => sent += 1,
+                    Ok(other) => {
+                        return Ok(format!("spammer {i}: unexpected {}", describe(&other)));
+                    }
+                    Err(e) => return Ok(format!("spammer {i}: stopped: {e:?}")),
+                }
+                sleep(Duration::from_millis(330)).await;
+            }
+            Ok::<String, String>(format!("spammer {i}: {sent} refused resumes sent"))
+        }));
+    }
+
+    // While they spam, past the time their shares take to fill: a fresh
+    // stranger's wrong login must still reach auth.
+    sleep(Duration::from_secs(seconds * 2 / 3)).await;
+    for n in 1..=3u64 {
+        let (conn, _) = probe.connect_hello().await?;
+        let response = probe.request(&conn, None, login(n)).await?;
+        f.expect(
+            response == Response::Err(Error::InvalidCredentials),
+            format!("login {n} while the pool is held: {}", describe(&response)),
+        );
+        sleep(Duration::from_secs(5)).await;
+    }
+
+    // Stop the spammers; the pool drains as their entries expire.
+    for h in handles {
+        match h.await {
+            Ok(Ok(line)) => f.note(line),
+            Ok(Err(why)) => f.note(format!("a spammer stopped early: {why}")),
+            Err(e) => return Err(Problem::Failed(format!("a spammer task failed: {e}"))),
+        }
+    }
+
+    // Recovery: a login reaches auth again once the pool has drained.
+    let drain = Instant::now() + config.pool_drain;
+    let mut n = 10u64;
+    loop {
+        let (conn, _) = probe.connect_hello().await?;
+        let response = probe.request(&conn, None, login(n)).await?;
+        n += 1;
+        if response == Response::Err(Error::InvalidCredentials) {
+            f.expect(
+                true,
+                format!("login after the spammers stopped: {}", describe(&response)),
+            );
+            break;
+        }
+        f.note(format!(
+            "login while the pool drains: {}",
+            describe(&response)
+        ));
+        if Instant::now() >= drain {
+            f.expect(
+                false,
+                "a login never reached auth again after the spammers stopped".to_owned(),
+            );
+            break;
+        }
+        sleep(Duration::from_secs(5)).await;
+    }
     Ok(f.done())
 }

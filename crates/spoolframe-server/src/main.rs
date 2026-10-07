@@ -724,13 +724,13 @@ async fn run(
              localhost, so signing in to the web UI at this address will appear to do nothing"
         );
     }
+    // Without admin.not_proxied the config would not have loaded (PX-11
+    // finding 38).
     if config.admin.proxy_unnamed()? {
-        tracing::warn!(
+        tracing::info!(
             listen = %admin_listen,
-            "admin.public_url is set on a loopback listener, so a proxy on this host is in front, \
-             but admin.trusted_proxies is empty: every caller looks like loopback, so failed \
-             logins are not limited per caller and /metrics, when on, answers whoever the proxy \
-             lets in; set admin.trusted_proxies to the proxy's address"
+            "admin.not_proxied: nothing proxies to this loopback listener, so its callers are \
+             taken as local and share one failure limit"
         );
     }
     // Without a public URL, a browser's page is the listener's own port

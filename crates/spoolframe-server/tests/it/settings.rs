@@ -451,6 +451,38 @@ async fn insecure_cookies_are_refused_behind_an_https_public_url() {
         .unwrap();
 }
 
+/// A change that would put an unnamed proxy in front of a loopback
+/// listener is refused, so the server is never left unable to start
+/// (PX-11 finding 38, the second review's M-4); naming the proxy first
+/// lets it through.
+#[tokio::test]
+async fn a_public_url_on_a_loopback_listener_needs_its_proxy_named() {
+    let (_addr, root, dir) = served(
+        "unnamed-proxy-change",
+        r#"admin { listen = "127.0.0.1:7421"; }"#,
+    )
+    .await;
+    let refused = root
+        .setting_set(
+            "admin.public_url".into(),
+            json!("https://media.example.org"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(refused), error_code::INVALID_INPUT);
+    assert!(!dir.as_ref().join("runtime.ucl").exists());
+
+    root.setting_set("admin.trusted_proxies".into(), json!("127.0.0.1"))
+        .await
+        .unwrap();
+    root.setting_set(
+        "admin.public_url".into(),
+        json!("https://media.example.org"),
+    )
+    .await
+    .unwrap();
+}
+
 /// A sign-in provider's client secret set in the web UI (P3-04): kept as a
 /// secret file, readable by the server's user only, and never shown; a
 /// provider whose config names a file reads that file instead.

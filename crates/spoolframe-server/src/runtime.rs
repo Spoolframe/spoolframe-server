@@ -705,8 +705,45 @@ mod tests {
         assert!(!metrics.access().enabled());
     }
 
+    /// Marks the copy of a test that [`alone`] runs.
+    const ALONE: &str = "SPOOLFRAME_TEST_ALONE";
+
+    /// Run `test`, a test of this module, again in a process where no
+    /// other test runs, and assert it passed there. `true` in that copy,
+    /// which runs the body; `false` here.
+    ///
+    /// For a test that reads the log through a subscriber of its own:
+    /// tracing decides once per call site, for every thread, whether a
+    /// line there is wanted at all. While that subscriber is the only
+    /// one, a call site another test's thread reaches first is asked of
+    /// that thread's subscriber, which is none, and stays off for this
+    /// thread too.
+    fn alone(test: &str) -> bool {
+        if std::env::var_os(ALONE).is_some() {
+            return true;
+        }
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let test = format!("{module}::{test}");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(ALONE, "1")
+            .output()
+            .unwrap();
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{test} alone:\n{log}");
+        assert!(log.contains("1 passed"), "{test} did not run:\n{log}");
+        false
+    }
+
     #[tokio::test]
     async fn otlp_headers_are_never_logged_shown_or_returned() {
+        if !alone("otlp_headers_are_never_logged_shown_or_returned") {
+            return;
+        }
         let (settings, _dir) = settings(None).await;
         let (logged, _guard) = {
             let ring = Arc::new(crate::logs::LogRing::default());

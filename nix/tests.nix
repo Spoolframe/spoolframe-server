@@ -197,8 +197,8 @@ pkgs.testers.runNixOSTest {
     # openFirewall: the client port and mDNS, as well as Plex's answers.
     opened = firewall_udp(server)
     assert {7420, 5353, 32415} <= opened, opened
-    # Its proxy is named: no warning about one that is not (PX-11 38).
-    assert "trusted_proxies is empty" not in journal()
+    # Its proxy is named (PX-11 38): with it unnamed the module would not
+    # evaluate (nix/assertions.nix) and the server would not start.
 
     # PX-11 finding 34: the unit's sandbox, as systemd scores it (1.6
     # when this was written, and again once the media tools confined

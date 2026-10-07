@@ -29,6 +29,10 @@ struct Args {
     /// Also check the sign-in limits: failed logins for a made-up username.
     #[arg(long)]
     check_limits: bool,
+    /// Also check the anonymous operation pool: strangers holding it cannot
+    /// refuse another stranger's login (holds it for a while).
+    #[arg(long)]
+    check_pool: bool,
     /// Also run the signed-in checks as this consumer account.
     #[arg(long, requires = "password_file")]
     username: Option<String>,
@@ -76,6 +80,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         budget: args.budget,
         check_cap: args.check_cap,
         check_limits: args.check_limits,
+        check_pool: args.check_pool,
         account,
         ..Config::new(target)
     };

@@ -1196,9 +1196,28 @@ async fn hls_of_an_encoded_video_started_far_in_stores_the_film_s_own_time() {
 
 /// A far seek starts a new run in a new epoch, with an `init.mp4` of its
 /// own: that one stores the film's time too.
+///
+/// A segment restarts the encode only if it is far past what the running
+/// one has written, and at full speed the first run can write the whole
+/// film before segment 14 is asked for. So the first run (epoch 0) reads
+/// only the film's first 8 s: it ends at segment 4, and segment 14 is
+/// always far past it. The run that restarts there reads the whole film.
 #[tokio::test]
 async fn hls_restarted_far_ahead_stores_the_film_s_own_time() {
-    let (server, client, session) = hls_ready("hls-times-restart", hls_capabilities()).await;
+    let dir = fresh_dir("hls-times-restart").await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let ffmpeg = dir.join("short-first-ffmpeg");
+    crate::support::write_script(
+        &ffmpeg,
+        "#!/bin/sh\nfor out; do :; done\n\
+         case \"$out\" in */0/*) exec ffmpeg -t 8 \"$@\" ;; esac\n\
+         exec ffmpeg \"$@\"\n",
+    );
+    let options = ServerOptions {
+        ffmpeg,
+        ..ServerOptions::default()
+    };
+    let (server, client, session) = hls_ready_with(dir, hls_capabilities(), options).await;
     let handle = started(&client, &session, None).await;
     assert_stores_film_time(&client, &session, &handle, 1, (0.0, 2.0)).await;
     assert_stores_film_time(&client, &session, &handle, 14, (26.0, 28.0)).await;
@@ -1327,6 +1346,9 @@ async fn hls_of_a_copied_hevc_video_is_hvc1_as_the_playlist_says() {
 /// playback and the segment.
 #[tokio::test]
 async fn a_failed_hls_segment_read_is_logged() {
+    if !crate::support::alone("encode::a_failed_hls_segment_read_is_logged") {
+        return;
+    }
     let (server, client, session) = hls_ready("hls-read-warn", hls_capabilities()).await;
     let handle = started(&client, &session, None).await;
     let (warnings, _guard) = crate::support::Warnings::capture();

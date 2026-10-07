@@ -143,14 +143,56 @@ pub fn progressive_capabilities() -> ClientCapabilities {
 
 /// An Apple-like device that takes HLS: H.264 and AAC in MP4, so an AC-3
 /// file has its audio converted and its video copied.
+/// Marks the copy of a test that [`alone`] runs.
+const ALONE: &str = "SPOOLFRAME_TEST_ALONE";
+
+/// Run `test` (as `--exact` names it: `refusals::a_test`) again in a
+/// process where no other test runs, and assert it passed there. `true`
+/// in that copy, which runs the body; `false` here.
+///
+/// A test that reads the server's log ([`Warnings`], [`LogCapture`])
+/// needs it. tracing decides once per call site, for every thread,
+/// whether a line there is wanted at all. While the test's subscriber is
+/// the only one, a call site another test's server reaches first is asked
+/// of that thread's subscriber, which is none, and stays off for the test
+/// too: its line is never logged.
+pub fn alone(test: &str) -> bool {
+    if std::env::var_os(ALONE).is_some() {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(ALONE, "1")
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{test} alone:\n{log}");
+    assert!(log.contains("1 passed"), "{test} did not run:\n{log}");
+    false
+}
+
+/// A capture of the log is sound only in a test run [`alone`].
+fn assert_alone() {
+    assert!(
+        std::env::var_os(ALONE).is_some(),
+        "a test that reads the log runs alone: see `support::alone`"
+    );
+}
+
 /// The server's log at WARN and above, as text, for as long as the guard
 /// is held. Captured on this thread only: a `#[tokio::test]` runtime runs
-/// the server's tasks on the test's own thread.
+/// the server's tasks on the test's own thread. Only in a test run
+/// [`alone`].
 #[derive(Clone, Default)]
 pub struct Warnings(Arc<Mutex<Vec<u8>>>);
 
 impl Warnings {
     pub fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        assert_alone();
         let warnings = Self::default();
         let writer = warnings.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -194,7 +236,7 @@ impl Logged {
 
 /// Everything the server logs at every level, events and spans, field by
 /// field, for as long as the guard is held. Captured on this thread only,
-/// as [`Warnings`] is.
+/// as [`Warnings`] is. Only in a test run [`alone`].
 #[derive(Clone, Default)]
 pub struct LogCapture(Arc<Mutex<Vec<Logged>>>);
 
@@ -204,6 +246,7 @@ pub const REFUSED: &str = "spoolframe::refused";
 impl LogCapture {
     pub fn start() -> (Self, tracing::subscriber::DefaultGuard) {
         use tracing_subscriber::layer::SubscriberExt as _;
+        assert_alone();
         let capture = Self::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         (capture, tracing::subscriber::set_default(subscriber))
