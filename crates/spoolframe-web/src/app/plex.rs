@@ -347,7 +347,7 @@ fn UnlinkDialog(
 
 async fn overview() -> Result<PlexSyncOverview, ApiError> {
     let client = rpc::client().await?;
-    client.plex_sync().await.map_err(rpc::error)
+    client.plex_sync_overview().await.map_err(rpc::error)
 }
 
 /// Sync `username` now, or with `None` everyone linked; what to say.

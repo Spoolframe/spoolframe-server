@@ -20,7 +20,8 @@ use tokio::sync::Semaphore;
 
 use spoolframe_types::SubtitleFormat;
 
-use crate::bitmap::{self, Packet, Track};
+use crate::bitmap::{Packet, Track};
+use crate::decode::CueTime;
 use crate::sandbox::{Command, Jail, Limits, Tool};
 
 /// Cues per tesseract process: enough that loading the model is a small
@@ -108,7 +109,14 @@ impl Ocr {
         let output = match tesseract.command(&Jail::new(Limits::OCR)) {
             Ok(mut command) => {
                 command.arg("--list-langs");
-                run(command, "tesseract", MAX_TEXT, Duration::from_secs(30)).await
+                run(
+                    command,
+                    "tesseract",
+                    Feed::Nothing,
+                    MAX_TEXT,
+                    Duration::from_secs(30),
+                )
+                .await
             }
             Err(source) => Err(OcrError::Spawn {
                 program: "tesseract".into(),
@@ -160,44 +168,48 @@ impl Ocr {
         self.languages.contains(&wanted).then_some(wanted)
     }
 
-    /// The text of each cue, in order, read with `threads` tesseract
-    /// processes side by side. The pictures go in `work`, which the caller
-    /// owns and removes. `progress` is told how many cues are done.
+    /// The text of each of `count` cue pictures, in order: `{i}.pgm` in
+    /// `pictures` ([`crate::decode::picture`]), as the subtitle decoder
+    /// wrote them. They are read with `threads` tesseract processes side
+    /// by side, which may read `pictures` and `work`. The lists of
+    /// pictures go in `work`, which the caller owns and removes, and which
+    /// the decoder may not write. `progress` is told how many cues are
+    /// done.
     pub async fn recognise(
         &self,
-        cues: &[bitmap::Cue],
-        language: &str,
+        pictures: &Path,
+        count: usize,
         work: &Path,
+        language: &str,
         threads: usize,
         progress: &(dyn Fn(usize) + Sync),
     ) -> Result<Vec<String>, OcrError> {
         tokio::fs::create_dir_all(work).await?;
-        for (i, cue) in cues.iter().enumerate() {
-            tokio::fs::write(work.join(format!("{i}.pgm")), cue.image.to_pgm()).await?;
-        }
         let permits = Arc::new(Semaphore::new(threads.max(1)));
         let done = Arc::new(AtomicUsize::new(0));
         let mut runs = tokio::task::JoinSet::new();
-        for (n, first) in (0..cues.len()).step_by(CHUNK).enumerate() {
-            let pictures: Vec<PathBuf> = (first..(first + CHUNK).min(cues.len()))
-                .map(|i| work.join(format!("{i}.pgm")))
+        for (n, first) in (0..count).step_by(CHUNK).enumerate() {
+            let listed: Vec<PathBuf> = (first..(first + CHUNK).min(count))
+                .map(|i| crate::decode::picture(pictures, i))
                 .collect();
             let list = work.join(format!("chunk{n}.txt"));
             let mut text = String::new();
-            for p in &pictures {
+            for p in &listed {
                 let _ = writeln!(text, "{}", p.display());
             }
             tokio::fs::write(&list, text).await?;
             let (tesseract, language) = (self.tesseract.clone(), language.to_owned());
             let (permits, done) = (permits.clone(), done.clone());
+            let pictures = pictures.to_owned();
             runs.spawn(async move {
                 let _permit = permits.acquire_owned().await.expect("never closed");
-                let pages = read_pages(&tesseract, &list, &language, pictures.len()).await?;
+                let pages =
+                    read_pages(&tesseract, &list, &pictures, &language, listed.len()).await?;
                 done.fetch_add(pages.len(), Ordering::Relaxed);
                 Ok::<_, OcrError>((first, pages))
             });
         }
-        let mut texts = vec![String::new(); cues.len()];
+        let mut texts = vec![String::new(); count];
         while let Some(run) = runs.join_next().await {
             let (first, pages) = run.expect("an OCR run never panics")?;
             for (i, page) in pages.into_iter().enumerate() {
@@ -209,15 +221,16 @@ impl Ocr {
     }
 }
 
-/// One tesseract run over a list of pictures (in the list's directory):
-/// one page of text each.
+/// One tesseract run over a list of pictures (in `pictures`): one page
+/// of text each.
 async fn read_pages(
     tesseract: &Tool,
     list: &Path,
+    pictures: &Path,
     language: &str,
     expected: usize,
 ) -> Result<Vec<String>, OcrError> {
-    let mut jail = Jail::new(Limits::OCR);
+    let mut jail = Jail::new(Limits::OCR).reads(pictures);
     if let Some(dir) = list.parent() {
         jail = jail.reads(dir);
     }
@@ -229,7 +242,7 @@ async fn read_pages(
         // One thread each: the parallelism is the processes, and
         // tesseract's own threads only fight them for cores.
         .env("OMP_THREAD_LIMIT", "1");
-    let output = run(command, "tesseract", MAX_TEXT, OCR_TIMEOUT).await?;
+    let output = run(command, "tesseract", Feed::Nothing, MAX_TEXT, OCR_TIMEOUT).await?;
     if !output.status.success() {
         return Err(OcrError::Failed {
             program: "tesseract".into(),
@@ -262,7 +275,7 @@ pub async fn extract_sup(
         .arg(input)
         .args(["-map", &format!("0:{index}"), "-c", "copy", "-f", "sup"])
         .arg(out);
-    let output = run(command, "ffmpeg", MAX_STDERR, PASS_TIMEOUT).await?;
+    let output = run(command, "ffmpeg", Feed::Nothing, MAX_STDERR, PASS_TIMEOUT).await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -287,6 +300,20 @@ pub async fn read_track(
     index: u32,
     from_file_start: bool,
 ) -> Result<Track, OcrError> {
+    let json = read_track_json(ffprobe, input, index).await?;
+    track(&json, from_file_start).map_err(|reason| OcrError::Failed {
+        program: "ffprobe".into(),
+        reason,
+    })
+}
+
+/// ffprobe's JSON of [`read_track`], not parsed: what the subtitle
+/// decoder reads ([`crate::decode`]).
+pub async fn read_track_json(
+    ffprobe: &Tool,
+    input: &Path,
+    index: u32,
+) -> Result<Vec<u8>, OcrError> {
     let mut jail = Jail::new(Limits::PROBE).input(input);
     if input
         .extension()
@@ -301,17 +328,21 @@ pub async fn read_track(
         .arg("packet=pts,duration,data:stream=time_base,extradata:format=start_time")
         .args(["-of", "json"])
         .arg(input);
-    let output = run(command, "ffprobe", MAX_TRACK_JSON, PASS_TIMEOUT).await?;
+    let output = run(
+        command,
+        "ffprobe",
+        Feed::Nothing,
+        MAX_TRACK_JSON,
+        PASS_TIMEOUT,
+    )
+    .await?;
     if !output.status.success() {
         return Err(OcrError::Failed {
             program: "ffprobe".into(),
             reason: last_line(&output.stderr),
         });
     }
-    track(&output.stdout, from_file_start).map_err(|reason| OcrError::Failed {
-        program: "ffprobe".into(),
-        reason,
-    })
+    Ok(output.stdout)
 }
 
 /// ffprobe's JSON for one stream's packets, with `-show_data`.
@@ -342,7 +373,7 @@ struct ProbedFormat {
     start_time: Option<String>,
 }
 
-fn track(json: &[u8], from_file_start: bool) -> Result<Track, String> {
+pub(crate) fn track(json: &[u8], from_file_start: bool) -> Result<Track, String> {
     let probed: Probed = serde_json::from_slice(json).map_err(|e| e.to_string())?;
     let stream = probed.streams.first().ok_or("no such stream")?;
     let (num, den) = stream
@@ -415,7 +446,7 @@ pub async fn convert_text(
         .arg(input)
         .args(["-map", &format!("0:{index}"), "-c:s", codec, "-f", format])
         .arg(out);
-    let output = run(command, "ffmpeg", MAX_STDERR, PASS_TIMEOUT).await?;
+    let output = run(command, "ffmpeg", Feed::Nothing, MAX_STDERR, PASS_TIMEOUT).await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -427,7 +458,7 @@ pub async fn convert_text(
 }
 
 /// The cues with their text; cues tesseract found no text in are left out.
-pub fn text_cues(cues: &[bitmap::Cue], texts: Vec<String>) -> Vec<TextCue> {
+pub fn text_cues(cues: &[CueTime], texts: Vec<String>) -> Vec<TextCue> {
     cues.iter()
         .zip(texts)
         .filter(|(_, text)| !text.is_empty())
@@ -591,26 +622,41 @@ fn writing(jail: Jail, out: &Path) -> Jail {
     }
 }
 
+/// What a run reads on its standard input.
+pub(crate) enum Feed {
+    Nothing,
+    /// A file the server opened.
+    File(std::fs::File),
+    /// Bytes written to a pipe while the run reads them.
+    Bytes(Vec<u8>),
+}
+
 /// What a run wrote, and how it ended.
-struct Ran {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct Ran {
+    pub(crate) status: std::process::ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 /// `command` run to its end, as `program` in errors (PX-09 B-3): killed
 /// if it runs past `timeout`, or writes more than `max_stdout` bytes to
 /// stdout, which is what a crafted file can make it do. Only the first
 /// [`MAX_STDERR`] bytes of stderr are kept; the rest is read and dropped,
-/// so a chatty program does not stall on a full pipe.
-async fn run(
+/// so a chatty program does not stall on a full pipe. It reads `feed`.
+pub(crate) async fn run(
     mut command: Command,
     program: &str,
+    feed: Feed,
     max_stdout: usize,
     timeout: Duration,
 ) -> Result<Ran, OcrError> {
+    let (stdin, bytes) = match feed {
+        Feed::Nothing => (Stdio::null(), None),
+        Feed::File(file) => (Stdio::from(file), None),
+        Feed::Bytes(bytes) => (Stdio::piped(), Some(bytes)),
+    };
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -621,6 +667,13 @@ async fn run(
         })?;
     let mut stdout = child.stdout.take().expect("piped");
     let mut stderr = child.stderr.take().expect("piped");
+    // Written beside the reads, so neither side waits on a full pipe. A
+    // run that stops reading (it failed, or was killed) ends the write.
+    if let (Some(bytes), Some(mut pipe)) = (bytes, child.stdin.take()) {
+        tokio::spawn(async move {
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut pipe, &bytes).await;
+        });
+    }
     let errors = tokio::spawn(async move {
         let mut kept = Vec::new();
         let _ = (&mut stderr)
@@ -663,7 +716,7 @@ async fn run(
     })
 }
 
-fn last_line(stderr: &[u8]) -> String {
+pub(crate) fn last_line(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
         .rev()
@@ -689,7 +742,14 @@ mod tests {
     #[tokio::test]
     async fn a_program_past_its_time_is_killed() {
         let started = std::time::Instant::now();
-        let ran = run(sh("sleep 30"), "sleep", 1024, Duration::from_millis(200)).await;
+        let ran = run(
+            sh("sleep 30"),
+            "sleep",
+            Feed::Nothing,
+            1024,
+            Duration::from_millis(200),
+        )
+        .await;
         assert!(
             matches!(ran, Err(OcrError::TimedOut { .. })),
             "{:?}",
@@ -704,6 +764,7 @@ mod tests {
         let ran = run(
             sh("head -c 1000000 /dev/zero"),
             "head",
+            Feed::Nothing,
             1000,
             Duration::from_secs(30),
         )
@@ -722,6 +783,7 @@ mod tests {
         let ran = run(
             sh("head -c 1000000 /dev/zero >&2; echo done"),
             "sh",
+            Feed::Nothing,
             1000,
             Duration::from_secs(30),
         )
@@ -730,6 +792,22 @@ mod tests {
         assert!(ran.status.success());
         assert_eq!(ran.stdout, b"done\n");
         assert_eq!(ran.stderr.len(), MAX_STDERR);
+    }
+
+    /// Bytes fed to a run arrive whole, written while it reads: more
+    /// than a pipe holds.
+    #[tokio::test]
+    async fn a_program_reads_the_bytes_it_is_fed() {
+        let ran = run(
+            sh("wc -c"),
+            "wc",
+            Feed::Bytes(vec![b'x'; 1_000_000]),
+            1000,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "1000000");
     }
 
     fn ocr(languages: &[&str]) -> Ocr {
@@ -853,15 +931,9 @@ mod tests {
     fn blank_lines_go_and_empty_cues_are_dropped() {
         assert_eq!(tidy("  Hello \n\n there\n\n"), "Hello\nthere");
         assert_eq!(tidy("| said, | know.\n"), "I said, I know.");
-        let image = bitmap::Image {
-            width: 1,
-            height: 1,
-            pixels: vec![255],
-        };
-        let cue = |start_ms| bitmap::Cue {
+        let cue = |start_ms| CueTime {
             start_ms,
             end_ms: start_ms + 1,
-            image: image.clone(),
         };
         let kept = text_cues(&[cue(0), cue(10)], vec![String::new(), "hi".into()]);
         assert_eq!(kept.len(), 1);

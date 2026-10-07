@@ -33,8 +33,9 @@ use spoolframe_admin_api::{
     SetupRequest, error_code,
 };
 
-use crate::admin::{AdminApi, Bearer, PageOrigin, Peer, SsoOutcome};
+use crate::admin::{AdminApi, Attempt, Bearer, PageOrigin, Peer, SsoOutcome};
 use crate::auth::API_SESSION;
+use crate::refusals::Channel;
 
 /// The browser's session cookie: an admin API session token, as the CLI's
 /// Bearer token is.
@@ -355,15 +356,22 @@ fn router(
     proxies: TrustedProxies,
 ) -> Router {
     let metrics = api.metrics_arc();
+    let refusals = api.clone();
     let rpc = tower::service_fn(move |req: Request| {
         // Each socket counted open while its RPC service lives (P3-14):
         // jsonrpsee makes one per connection and drops it as the
         // connection ends.
         let metrics = metrics.clone();
-        let counted = RpcServiceBuilder::new().layer_fn(move |inner| Counted {
-            inner,
-            _open: metrics.as_ref().map(|m| Arc::new(m.web_connection())),
-        });
+        let refusals = refusals.clone();
+        let counted = RpcServiceBuilder::new()
+            .layer_fn(move |inner| Counted {
+                inner,
+                _open: metrics.as_ref().map(|m| Arc::new(m.web_connection())),
+            })
+            .layer_fn(move |inner| Refusing {
+                inner,
+                api: refusals.clone(),
+            });
         // Built per connection: building is what gives each its own id.
         // No client sends batches; one would carry any number of calls,
         // password checks among them, in one message (PX-10, finding 10).
@@ -505,6 +513,62 @@ where
     }
 }
 
+/// An admin API connection's RPC service, logging each call it refuses
+/// (finding 46): the method, and what the call's extensions say of the
+/// caller.
+#[derive(Clone)]
+struct Refusing<S> {
+    inner: S,
+    api: AdminApi,
+}
+
+impl<S> RpcServiceT for Refusing<S>
+where
+    S: RpcServiceT<MethodResponse = jsonrpsee::MethodResponse> + Send + Sync,
+{
+    type MethodResponse = S::MethodResponse;
+    type NotificationResponse = S::NotificationResponse;
+    type BatchResponse = S::BatchResponse;
+
+    fn call<'a>(
+        &self,
+        mut request: jsonrpsee::types::Request<'a>,
+    ) -> impl Future<Output = Self::MethodResponse> + Send + 'a {
+        let attempt = Attempt::default();
+        request.extensions_mut().insert(attempt.clone());
+        // Only what the log reads, not the whole set, kept past the call.
+        let mut caller = Extensions::new();
+        caller.insert(attempt);
+        if let Some(peer) = request.extensions().get::<Peer>() {
+            caller.insert(*peer);
+        }
+        if let Some(bearer) = request.extensions().get::<Bearer>() {
+            caller.insert(bearer.clone());
+        }
+        let method = request.method_name().to_owned();
+        let api = self.api.clone();
+        let answered = self.inner.call(request);
+        async move {
+            let response = answered.await;
+            if let Some(code) = response.as_error_code() {
+                api.refused(Channel::AdminApi, &method, &caller, code).await;
+            }
+            response
+        }
+    }
+
+    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = Self::BatchResponse> + Send + 'a {
+        self.inner.batch(batch)
+    }
+
+    fn notification<'a>(
+        &self,
+        n: Notification<'a>,
+    ) -> impl Future<Output = Self::NotificationResponse> + Send + 'a {
+        self.inner.notification(n)
+    }
+}
+
 fn is_upgrade(headers: &HeaderMap) -> bool {
     headers
         .get(header::UPGRADE)
@@ -590,6 +654,18 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|(_, value)| value.to_owned())
 }
 
+/// A refused call on the listener's HTTP side, logged as the socket's are
+/// (finding 46), then answered as [`failure`] does.
+async fn refused(
+    api: &AdminApi,
+    path: &str,
+    ext: &Extensions,
+    e: ErrorObjectOwned,
+) -> Response<Body> {
+    api.refused(Channel::Web, path, ext, e.code()).await;
+    failure(e)
+}
+
 /// A JSON-RPC error as an HTTP answer, with the same code and message, so
 /// the web UI reads both alike.
 fn failure(e: ErrorObjectOwned) -> Response<Body> {
@@ -671,9 +747,10 @@ async fn login(
         Ok(c) => c,
         Err(e) => return failure(e),
     };
-    match MeApiServer::login(&api, &from(peer), credentials).await {
+    let ext = from(peer);
+    match MeApiServer::login(&api, &ext, credentials).await {
         Ok(done) => signed_in(&api, &headers, done).await,
-        Err(e) => failure(e),
+        Err(e) => refused(&api, "/auth/login", &ext, e).await,
     }
 }
 
@@ -710,9 +787,10 @@ async fn passkey_finish(
         Ok(assertion) => assertion,
         Err(e) => return failure(e),
     };
-    match MeApiServer::passkey_login_finish(&api, &from(peer), ceremony, credential).await {
+    let ext = from(peer);
+    match MeApiServer::passkey_login_finish(&api, &ext, ceremony, credential).await {
         Ok(done) => signed_in(&api, &headers, done).await,
-        Err(e) => failure(e),
+        Err(e) => refused(&api, "/auth/passkey/finish", &ext, e).await,
     }
 }
 
@@ -726,9 +804,10 @@ async fn setup(
         Ok(r) => r,
         Err(e) => return failure(e),
     };
-    match AdminApiServer::setup(&api, &from(peer), request).await {
+    let ext = from(peer);
+    match AdminApiServer::setup(&api, &ext, request).await {
         Ok(done) => signed_in(&api, &headers, done).await,
-        Err(e) => failure(e),
+        Err(e) => refused(&api, "/auth/setup", &ext, e).await,
     }
 }
 
@@ -750,12 +829,13 @@ async fn setup_check(
         Ok(c) => c,
         Err(e) => return failure(e),
     };
+    let ext = from(peer);
     match api
-        .setup_check(&from(peer), &check.code, check.insecure_cookies)
+        .setup_check(&ext, &check.code, check.insecure_cookies)
         .await
     {
         Ok(()) => axum::Json(json!({ "ok": true })).into_response(),
-        Err(e) => failure(e),
+        Err(e) => refused(&api, "/auth/setup/check", &ext, e).await,
     }
 }
 
@@ -787,9 +867,10 @@ async fn setup_passkey_finish(
         Ok(r) => r,
         Err(e) => return failure(e),
     };
-    match AdminApiServer::setup_passkey_finish(&api, &from(peer), request).await {
+    let ext = from(peer);
+    match AdminApiServer::setup_passkey_finish(&api, &ext, request).await {
         Ok(done) => signed_in(&api, &headers, done).await,
-        Err(e) => failure(e),
+        Err(e) => refused(&api, "/auth/setup/passkey/finish", &ext, e).await,
     }
 }
 
@@ -925,6 +1006,7 @@ async fn sso_callback(State(api): State<AdminApi>, req: Request) -> Response<Bod
 fn from(peer: Peer) -> Extensions {
     let mut ext = Extensions::new();
     ext.insert(peer);
+    ext.insert(Attempt::default());
     ext
 }
 
@@ -933,6 +1015,9 @@ fn as_caller(req: &Request) -> Extensions {
     let mut ext = Extensions::new();
     if let Some(bearer) = req.extensions().get::<Bearer>() {
         ext.insert(bearer.clone());
+    }
+    if let Some(peer) = req.extensions().get::<Peer>() {
+        ext.insert(*peer);
     }
     ext
 }
@@ -960,12 +1045,13 @@ async fn logout(State(api): State<AdminApi>, req: Request) -> Response<Body> {
 /// is logged in the browser's console as a failed request.
 async fn me(State(api): State<AdminApi>, req: Request) -> Response<Body> {
     let or_null = asks_for_null(req.uri().query());
-    match MeApiServer::who_am_i(&api, &as_caller(&req)).await {
+    let ext = as_caller(&req);
+    match MeApiServer::who_am_i(&api, &ext).await {
         Ok(user) => axum::Json(user).into_response(),
         Err(e) if or_null && e.code() == error_code::UNAUTHENTICATED => {
             axum::Json(serde_json::Value::Null).into_response()
         }
-        Err(e) => failure(e),
+        Err(e) => refused(&api, "/auth/me", &ext, e).await,
     }
 }
 
@@ -1003,7 +1089,8 @@ async fn catalog_artwork(State(api): State<AdminApi>, req: Request) -> Response<
     let Some((id, size)) = artwork_query(req.uri().query()) else {
         return (StatusCode::BAD_REQUEST, "id, and a size clients use").into_response();
     };
-    match api.catalog_image(&as_caller(&req), &id, size).await {
+    let ext = as_caller(&req);
+    match api.catalog_image(&ext, &id, size).await {
         Ok(image) if !is_raster(&image.content_type) => {
             // An SVG runs script when opened by itself (PX-11, PX-09
             // finding 13); nothing but the three is served to a browser.
@@ -1038,7 +1125,7 @@ async fn catalog_artwork(State(api): State<AdminApi>, req: Request) -> Response<
             }
             response
         }
-        Err(e) => failure(e),
+        Err(e) => refused(&api, "/catalog/artwork", &ext, e).await,
     }
 }
 

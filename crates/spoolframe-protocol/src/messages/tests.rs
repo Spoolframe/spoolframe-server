@@ -418,6 +418,18 @@ fn every_reply_round_trips() {
             platform: spoolframe_types::Platform::Tvos,
             requested_at: 1_790_000_000,
             remember: true,
+            requested_from: Some(crate::DeviceAddress {
+                address: "192.168.86.20".into(),
+                network: crate::AddressNetwork::Local,
+            }),
+        }),
+        Reply::DeviceSignInRequest(crate::DeviceSignInRequest {
+            device_name: None,
+            client_name: "spoolframe-tvos".into(),
+            platform: spoolframe_types::Platform::Tvos,
+            requested_at: 1_790_000_000,
+            remember: false,
+            requested_from: None,
         }),
         Reply::LoggedIn {
             session: SessionId("s".into()),
@@ -1731,8 +1743,16 @@ fn a_reply_missing_a_field_is_refused() {
             platform: spoolframe_types::Platform::Tvos,
             requested_at: 0,
             remember: false,
+            requested_from: None,
         },
-        &["device_name"],
+        &["device_name", "requested_from"],
+    );
+    assert_each_required(
+        &crate::DeviceAddress {
+            address: "127.0.0.1".into(),
+            network: crate::AddressNetwork::Loopback,
+        },
+        &["address", "network"],
     );
 }
 
@@ -1758,5 +1778,49 @@ fn a_media_read_or_its_reply_missing_a_field_is_refused() {
             epoch: 0,
         },
         &["complete", "epoch"],
+    );
+}
+
+/// Where a device asked to sign in from (PX-09 finding 27): each network
+/// by its wire name, and one a newer server names is `Unknown`.
+#[test]
+fn a_device_address_s_network_has_its_wire_name() {
+    use crate::{AddressNetwork, DeviceAddress};
+    for (network, name) in [
+        (AddressNetwork::Loopback, "loopback"),
+        (AddressNetwork::Local, "local"),
+        (AddressNetwork::Internet, "internet"),
+    ] {
+        let address = DeviceAddress {
+            address: "203.0.113.9".into(),
+            network,
+        };
+        round_trip(address.clone());
+        let value: ciborium::Value =
+            ciborium::from_reader(codec::encode(&address).unwrap().as_slice()).unwrap();
+        let ciborium::Value::Map(entries) = value else {
+            panic!("not a map");
+        };
+        assert!(
+            entries
+                .iter()
+                .any(|(key, value)| key.as_text() == Some("network")
+                    && value.as_text() == Some(name)),
+            "{network:?}"
+        );
+    }
+    #[derive(Serialize)]
+    struct Newer {
+        address: &'static str,
+        network: &'static str,
+    }
+    let bytes = codec::encode(&Newer {
+        address: "203.0.113.9",
+        network: "satellite",
+    })
+    .unwrap();
+    assert_eq!(
+        codec::decode::<DeviceAddress>(&bytes).unwrap().network,
+        AddressNetwork::Unknown
     );
 }

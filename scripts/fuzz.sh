@@ -12,6 +12,11 @@
 # crash is kept in fuzz/artifacts/TARGET/; the script goes on with the
 # other targets and exits 1 if any target crashed.
 #
+# A target crashed if cargo fuzz failed or if its fuzz/artifacts/TARGET/
+# has files it did not have before the run. The exit status alone is not
+# enough: with -ignore_crashes=1 (fork mode) libFuzzer exits 0 after
+# crashes, and an overnight run reported "no crashes" over 64 of them.
+#
 # Extra libFuzzer flags go in FUZZ_FLAGS, e.g. FUZZ_FLAGS="-jobs=4 -workers=4".
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -29,8 +34,16 @@ fixtures() {
   esac
 }
 
+# The files in a target's artifact directory, one per line, sorted.
+artifacts() {
+  local dir=fuzz/artifacts/$1
+  [[ -d $dir ]] || return 0
+  find "$dir" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort
+}
+
 failed=()
 for target in "${targets[@]}"; do
+  before=$(artifacts "$target")
   corpus=fuzz/corpus/$target
   mkdir -p "$corpus"
   seeds=()
@@ -43,7 +56,20 @@ for target in "${targets[@]}"; do
     "$target" "$PWD/$corpus" "${seeds[@]}" -- \
     -max_total_time="$seconds" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 \
     ${FUZZ_FLAGS:-}; then
-    failed+=("$target")
+    status=failed
+  else
+    status=ok
+  fi
+  new=$(LC_ALL=C comm -13 <(printf '%s\n' "$before") <(artifacts "$target") | sed '/^$/d')
+  count=$(grep -c . <<<"$new" || true)
+  if ((count)); then
+    echo "== $target: $count new in fuzz/artifacts/$target/:" >&2
+    while read -r name; do echo "  $name"; done <<<"$new" >&2
+  fi
+  if ((count)); then
+    failed+=("$target ($count new)")
+  elif [[ $status == failed ]]; then
+    failed+=("$target (cargo fuzz failed)")
   fi
 done
 

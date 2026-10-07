@@ -7,7 +7,7 @@
 use parking_lot::Mutex;
 use std::fmt;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, VarInt, presets};
@@ -93,6 +93,23 @@ pub struct Probe {
     /// The server process the replies came from: operations name it.
     instance: Mutex<Option<ServerInstance>>,
     operations: AtomicU64,
+    /// Signing out what the run signed in: past the budget too.
+    cleaning: AtomicBool,
+}
+
+/// A fresh endpoint key, dialling only the addresses it is given.
+pub async fn bind() -> anyhow::Result<Endpoint> {
+    let transport = QuicTransportConfig::builder()
+        .keep_alive_interval(KEEP_ALIVE)
+        .max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?))
+        .build();
+    // No relays and no address lookup: only the addresses given are
+    // dialled, and nothing is announced.
+    Ok(Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .transport_config(transport)
+        .bind()
+        .await?)
 }
 
 impl Probe {
@@ -101,19 +118,8 @@ impl Probe {
         limit: u32,
         reply_timeout: Duration,
     ) -> anyhow::Result<Self> {
-        let transport = QuicTransportConfig::builder()
-            .keep_alive_interval(KEEP_ALIVE)
-            .max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?))
-            .build();
-        // No relays and no address lookup: only the addresses given are
-        // dialled, and nothing is announced.
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Disabled)
-            .transport_config(transport)
-            .bind()
-            .await?;
         Ok(Self {
-            endpoint,
+            endpoint: bind().await?,
             target,
             limit,
             spent: AtomicU32::new(0),
@@ -121,6 +127,7 @@ impl Probe {
             failures: AtomicU32::new(0),
             instance: Mutex::default(),
             operations: AtomicU64::new(0),
+            cleaning: AtomicBool::new(false),
         })
     }
 
@@ -133,8 +140,20 @@ impl Probe {
         self.spent.load(Ordering::Acquire)
     }
 
-    /// Count one connection or stream against the budget, or stop.
+    /// From now on the run only signs out what it signed in: that is not
+    /// refused for want of budget, though it is still counted.
+    pub fn cleaning_up(&self) {
+        self.cleaning.store(true, Ordering::Release);
+        self.answered();
+    }
+
+    /// Count one connection, stream or web request against the budget, or
+    /// stop.
     pub fn spend(&self) -> Result<(), Problem> {
+        if self.cleaning.load(Ordering::Acquire) {
+            self.spent.fetch_add(1, Ordering::AcqRel);
+            return Ok(());
+        }
         let limit = self.limit;
         self.spent
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spent| {
@@ -161,10 +180,15 @@ impl Probe {
     }
 
     pub async fn connect(&self) -> Result<Conn, Problem> {
+        self.connect_from(&self.endpoint).await
+    }
+
+    /// A connection from `endpoint`, another key than the run's own.
+    pub async fn connect_from(&self, endpoint: &Endpoint) -> Result<Conn, Problem> {
         self.spend()?;
         match timeout(
             self.reply_timeout,
-            self.endpoint.connect(self.target.clone(), CLIENT_ALPN),
+            endpoint.connect(self.target.clone(), CLIENT_ALPN),
         )
         .await
         {
@@ -179,8 +203,26 @@ impl Probe {
 
     /// A connection that said a good `Hello`, and what the server said.
     pub async fn connect_hello(&self) -> Result<(Conn, ServerInfo), Problem> {
-        let conn = self.connect().await?;
-        match self.request(&conn, None, hello(None)).await? {
+        self.connect_hello_with(&self.endpoint, None).await
+    }
+
+    /// As [`Probe::connect_hello`], from `endpoint`.
+    pub async fn connect_hello_from(
+        &self,
+        endpoint: &Endpoint,
+    ) -> Result<(Conn, ServerInfo), Problem> {
+        self.connect_hello_with(endpoint, None).await
+    }
+
+    /// As [`Probe::connect_hello_from`], naming the device: what an
+    /// account's devices list shows for it.
+    pub async fn connect_hello_with(
+        &self,
+        endpoint: &Endpoint,
+        device_name: Option<String>,
+    ) -> Result<(Conn, ServerInfo), Problem> {
+        let conn = self.connect_from(endpoint).await?;
+        match self.request(&conn, None, hello(device_name)).await? {
             Response::Ok(Reply::ServerInfo(info)) => Ok((conn, info)),
             other => Err(Problem::Failed(format!(
                 "a good Hello was answered {}",

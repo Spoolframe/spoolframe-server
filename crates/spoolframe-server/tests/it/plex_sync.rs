@@ -320,7 +320,7 @@ async fn two_linked_users_each_sync_their_own_plex_account_and_an_unlinked_one_i
     );
     assert_eq!(again[0].skipped, 1);
 
-    let overview = root.plex_sync().await.unwrap();
+    let overview = root.plex_sync_overview().await.unwrap();
     let user = |name: &str| overview.users.iter().find(|u| u.username == name).unwrap();
     let last = |name: &str| user(name).last_run.clone().unwrap();
     assert_eq!((last("alice").pulled, last("alice").libraries), (0, 1));
@@ -450,7 +450,7 @@ async fn the_owner_s_px_04_setup_keeps_syncing_as_before() {
         Some((false, Some(600_000), 1_500))
     );
     assert!(tv.received_requests().await.unwrap().is_empty());
-    let overview = root.plex_sync().await.unwrap();
+    let overview = root.plex_sync_overview().await.unwrap();
     let owner = overview
         .users
         .iter()
@@ -490,7 +490,7 @@ async fn a_server_out_of_reach_is_a_note_and_the_others_sync() {
         .remove(0);
     assert_eq!(run.pulled, ["Film 11: watched"]);
     assert_eq!(run.notes, ["Cabin movies skipped: Cabin can't be reached"]);
-    let overview = root.plex_sync().await.unwrap();
+    let overview = root.plex_sync_overview().await.unwrap();
     let alice = overview.users.iter().find(|u| u.username == "alice");
     assert_eq!(alice.unwrap().last_run.as_ref().unwrap().notes, run.notes);
 }

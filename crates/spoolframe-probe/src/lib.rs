@@ -18,8 +18,17 @@
 //!   time, and only when asked ([`Config::check_cap`]); the sign-in check
 //!   only when asked ([`Config::check_limits`]), and only for a username
 //!   it makes up.
+//!
+//! Given a consumer account ([`Config::account`]), it also signs in as
+//! that account, once over QUIC and once on the web listener, and checks
+//! what a signed-in consumer may and may not do (`account`): only reads,
+//! and refusals that would be harmless were they not refused. Every
+//! session it makes is signed out at the end, and the report says what
+//! the account still lists.
 
+mod account;
 mod checks;
+pub mod web;
 pub mod wire;
 
 use std::time::{Duration, Instant};
@@ -27,6 +36,7 @@ use std::time::{Duration, Instant};
 use iroh::EndpointAddr;
 use serde::Serialize;
 
+use account::AccountState;
 pub use checks::Check;
 use wire::{Probe, Problem};
 
@@ -49,6 +59,37 @@ pub struct Config {
     pub cap_pace: Duration,
     /// Run the sign-in limits check (failed logins for a made-up user).
     pub check_limits: bool,
+    /// Sign in as this account for the signed-in checks.
+    pub account: Option<Account>,
+}
+
+/// A consumer account the run signs in as. The password is never shown:
+/// not in `Debug`, the report or any line of evidence.
+#[derive(Clone)]
+pub struct Account {
+    pub username: String,
+    pub password: String,
+    /// The server's web listener, for the admin API checks and the list of
+    /// what the account still has signed in after the run.
+    pub web: Option<Web>,
+}
+
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Account")
+            .field("username", &self.username)
+            .field("password", &"<hidden>")
+            .field("web", &self.web)
+            .finish()
+    }
+}
+
+/// Where the web listener is, and the `Origin` its own pages send: the
+/// server's `public_url`, or the listener's address without one.
+#[derive(Debug, Clone)]
+pub struct Web {
+    pub url: String,
+    pub origin: String,
 }
 
 /// What a server is expected to give a device with no session.
@@ -89,6 +130,7 @@ impl Config {
             check_cap: false,
             cap_pace: Duration::from_millis(100),
             check_limits: false,
+            account: None,
         }
     }
 }
@@ -141,6 +183,9 @@ pub struct Report {
     /// Why the run stopped early, if it did.
     pub aborted: Option<String>,
     pub checks: Vec<CheckResult>,
+    /// What the run did as the account, its signing out, and what the
+    /// account still listed before the web session ended.
+    pub account: Vec<String>,
 }
 
 impl Report {
@@ -164,7 +209,9 @@ pub async fn run(config: &Config) -> anyhow::Result<Report> {
         spent: 0,
         aborted: None,
         checks: Vec::new(),
+        account: Vec::new(),
     };
+    let state = AccountState::new();
     // A server that does not answer a good Hello is not probed further.
     match checks::preflight(&probe).await {
         Ok(info) => {
@@ -183,7 +230,7 @@ pub async fn run(config: &Config) -> anyhow::Result<Report> {
         let began = Instant::now();
         let (status, evidence) = match &report.aborted {
             Some(why) => (Status::Skip, vec![format!("not run: {why}")]),
-            None => match check.run(&probe, config).await {
+            None => match check.run(&probe, config, &state).await {
                 Ok(outcome) => (outcome.status, outcome.evidence),
                 Err(Problem::Failed(why)) => (Status::Fail, vec![why]),
                 Err(Problem::Stop(stop)) => {
@@ -200,6 +247,8 @@ pub async fn run(config: &Config) -> anyhow::Result<Report> {
             elapsed_ms: began.elapsed().as_millis() as u64,
         });
     }
+    // Whatever happened above: nothing the run signed in stays signed in.
+    report.account = state.finish(&probe, config).await;
     report.spent = probe.spent();
     probe.close().await;
     Ok(report)
@@ -232,6 +281,12 @@ pub fn summary(report: &Report) -> String {
             check.status, check.id, check.title, check.elapsed_ms
         );
         for line in &check.evidence {
+            let _ = writeln!(out, "      - {line}");
+        }
+    }
+    if !report.account.is_empty() {
+        out.push_str("\naccount:\n");
+        for line in &report.account {
             let _ = writeln!(out, "      - {line}");
         }
     }

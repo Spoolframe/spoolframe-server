@@ -23,12 +23,19 @@ the dev shell to fuzz.
 | `vobsub` | a VobSub track: its `.idx` header and packets | `spoolframe-media` `vobsub.rs` |
 | `bif` | a PMS preview index (BIF) | `spoolframe-plex` `bif.rs` |
 | `plex_json` | a PMS JSON response, decoded and converted to items | `spoolframe-plex` `wire.rs`, `convert.rs` |
-| `ffprobe_json` | ffprobe's JSON for a file, made into a `MediaDescriptor` | `spoolframe-media` `descriptor.rs` |
+| `ffprobe_json` | ffprobe's JSON for a file, made into a `MediaDescriptor` | the vendored `easy-ffprobe` model, `spoolframe-media` `descriptor.rs` |
 
 The `dvb` and `vobsub` inputs are packets framed as `u16 LE length, u32 LE pts
 in ms, data`. A VobSub input starts with a `u16 LE` length and that much `.idx`
 header. `fuzz/src/lib.rs` has the framing. `spoolframe-plex` builds its private
 parsers into the targets only with its `fuzzing` feature.
+
+`pgs`, `dvb` and `vobsub` call each format's `cues`, which decodes within
+`bitmap::Budget::DEFAULT` (finding 45): an input that decodes past it is an
+`OverBudget` error, not a crash. The budget allows 1 Gi pixels of pictures, so
+such an input can still use about 1 GiB before it is refused; libFuzzer's
+default `-rss_limit_mb=2048` leaves room for that. The server runs this code in
+a child (`decode.rs`), but the targets call it directly.
 
 ## Running
 
@@ -43,6 +50,15 @@ Each target starts from its seeds in `fuzz/seeds/TARGET/` and, for `bif`,
 corpus in `fuzz/corpus/TARGET/`. A crash goes to `fuzz/artifacts/TARGET/`, and
 the script exits 1 after it runs the other targets. The corpus and the
 artifacts are not tracked.
+
+The script finds crashes by the files in `fuzz/artifacts/TARGET/`, not only by
+the exit status of `cargo fuzz`. It lists the directory before each target and
+after it. A file that was not there before is a crash, an OOM or a timeout. The
+script names the new files and counts the target as crashed. Old files do not
+count, so you can keep them while you fix them. This is necessary because, with
+`-ignore_crashes=1` (normal with `-fork`), libFuzzer exits 0 after crashes. An
+overnight run printed "no crashes" over 64 crashes in `ffprobe_json` before the
+script counted files.
 
 To reproduce a crash, and to make an input smaller:
 

@@ -1,6 +1,6 @@
 [package]
 name = "spoolframe-probe"
-description = "Checks that a Spoolframe server keeps its documented limits for devices with no session, over live QUIC."
+description = "Checks that a Spoolframe server keeps its documented limits for devices with no session, and for a signed-in consumer, over live QUIC and its web listener."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -23,4 +23,5 @@ serde_json = { workspace = true }
 spoolframe-protocol = { workspace = true }
 spoolframe-types = { workspace = true }
 parking_lot = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true }

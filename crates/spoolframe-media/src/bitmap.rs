@@ -11,6 +11,123 @@ use std::collections::HashMap;
 /// ask for 4 GiB of pixels.
 pub const MAX_SIDE: usize = 4096;
 
+/// How much a track may decode to (finding 45). [`MAX_SIDE`] bounds one
+/// picture, not a track: run-length coding lets a few bytes describe a
+/// 4096 × 4096 picture, and a track can show one again and again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    /// Cues kept.
+    pub cues: usize,
+    /// Pixels of every kept cue's picture, added up.
+    pub pixels: u64,
+    /// Pixels a decoder holds at once between cues: PGS objects, DVB
+    /// regions.
+    pub held: u64,
+}
+
+impl Budget {
+    /// A film's track with room to spare. A feature film's PGS track is 1
+    /// to 3 thousand cues, each a picture of a line or two of text with a
+    /// 16-pixel margin: about 100 thousand pixels, and 1,952 × 180 at most
+    /// for two lines as wide as a 1080p screen. 20,000 cues is one every
+    /// 0.36 s of a two-hour film. 1 Gi pixels is 3,000 of the widest
+    /// pictures, and 3 to 5 times a usual film's 0.2 to 0.4 G. The
+    /// decoder holds the pictures in memory, then writes them as PGM files
+    /// (a byte a pixel) for tesseract, so this bounds both. Held is 32
+    /// times a 1080p screen; a PGS decoder of the spec has a 4 MiB object
+    /// buffer.
+    pub const DEFAULT: Self = Self {
+        cues: 20_000,
+        pixels: 1 << 30,
+        held: 64 << 20,
+    };
+
+    /// Whether holding `held` pixels, `adding` more, stays within it;
+    /// counted before they are allocated.
+    pub(crate) fn hold(&self, held: u64, adding: u64) -> Result<u64, OverBudget> {
+        let total = held.saturating_add(adding);
+        if total > self.held {
+            return Err(OverBudget::Held(self.held));
+        }
+        Ok(total)
+    }
+}
+
+/// The cues a decoder keeps, within its [`Budget`].
+pub(crate) struct Kept<'a> {
+    budget: &'a Budget,
+    pixels: u64,
+    cues: Vec<Cue>,
+}
+
+impl<'a> Kept<'a> {
+    pub(crate) fn new(budget: &'a Budget) -> Self {
+        Self {
+            budget,
+            pixels: 0,
+            cues: Vec::new(),
+        }
+    }
+
+    /// Whether a `width` × `height` picture may still be kept: asked
+    /// before it is made.
+    pub(crate) fn afford(&self, width: usize, height: usize) -> Result<(), OverBudget> {
+        let size = (width as u64).saturating_mul(height as u64);
+        if self.pixels.saturating_add(size) > self.budget.pixels {
+            return Err(OverBudget::Pixels(self.budget.pixels));
+        }
+        Ok(())
+    }
+
+    /// Adds a cue, or lengthens the last one when this is the same picture
+    /// straight after it (a palette change, as in a fade, or a page sent
+    /// again). Only a cue kept counts against the budget.
+    pub(crate) fn push(
+        &mut self,
+        start_ms: u64,
+        end_ms: u64,
+        image: Image,
+    ) -> Result<(), OverBudget> {
+        if end_ms <= start_ms {
+            return Ok(());
+        }
+        if let Some(last) = self.cues.last_mut()
+            && last.end_ms == start_ms
+            && same_text(&last.image, &image)
+        {
+            last.end_ms = end_ms;
+            return Ok(());
+        }
+        if self.cues.len() >= self.budget.cues {
+            return Err(OverBudget::Cues(self.budget.cues));
+        }
+        self.afford(image.width, image.height)?;
+        self.pixels += image.pixels.len() as u64;
+        self.cues.push(Cue {
+            start_ms,
+            end_ms,
+            image,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn into_cues(self) -> Vec<Cue> {
+        self.cues
+    }
+}
+
+/// A track that decodes to more than its [`Budget`]. Decoding stops there:
+/// a track cut short would read as a whole one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OverBudget {
+    #[error("the track has more than {0} cues")]
+    Cues(usize),
+    #[error("the track's pictures come to more than {0} pixels")]
+    Pixels(u64),
+    #[error("the track holds more than {0} pixels of pictures at once")]
+    Held(u64),
+}
+
 /// A grey picture: 0 is black, 255 white.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {
@@ -74,35 +191,45 @@ pub(crate) fn luma(r: u8, g: u8, b: u8) -> u8 {
 /// A picture of `width` × `height` pixels, each a colour, as dark text on
 /// white: the text without its outline, cut to the box around it with a
 /// margin (tesseract reads text that touches the edge badly). `None` if no
-/// text shows.
+/// text shows; an error if `kept` has no room for the picture.
 ///
 /// It is not scaled up. Over a real DVD's VobSub (720×480), two and three
 /// times the size read worse, not better: tesseract scales lines itself,
 /// and blocky letters made bigger are only bigger blocks.
-pub(crate) fn text_picture(width: usize, height: usize, pixels: &[Colour]) -> Option<Image> {
+pub(crate) fn text_picture(
+    width: usize,
+    height: usize,
+    pixels: &[Colour],
+    kept: &Kept,
+) -> Result<Option<Image>, OverBudget> {
     const MARGIN: usize = 16;
     let ink = ink(width, pixels);
     let text = |at: usize| ink[at] > 0;
     let rows: Vec<usize> = (0..height)
         .filter(|&y| (0..width).any(|x| text(y * width + x)))
         .collect();
-    let (&top, &bottom) = (rows.first()?, rows.last()?);
-    let left = (0..width).find(|&x| rows.iter().any(|&y| text(y * width + x)))?;
-    let right = (0..width)
+    let (Some(&top), Some(&bottom)) = (rows.first(), rows.last()) else {
+        return Ok(None);
+    };
+    let Some(left) = (0..width).find(|&x| rows.iter().any(|&y| text(y * width + x))) else {
+        return Ok(None);
+    };
+    let Some(right) = (0..width)
         .rev()
-        .find(|&x| rows.iter().any(|&y| text(y * width + x)))?;
-    let mut image = Image::blank(
-        right - left + 1 + 2 * MARGIN,
-        bottom - top + 1 + 2 * MARGIN,
-        255,
-    );
+        .find(|&x| rows.iter().any(|&y| text(y * width + x)))
+    else {
+        return Ok(None);
+    };
+    let (w, h) = (right - left + 1 + 2 * MARGIN, bottom - top + 1 + 2 * MARGIN);
+    kept.afford(w, h)?;
+    let mut image = Image::blank(w, h, 255);
     for y in top..=bottom {
         for x in left..=right {
             let at = (y - top + MARGIN) * image.width + (x - left + MARGIN);
             image.pixels[at] = 255 - ink[y * width + x];
         }
     }
-    Some(image)
+    Ok(Some(image))
 }
 
 /// How much each pixel is text, from 0 (not) to 255. A subtitle is text in
@@ -163,27 +290,6 @@ fn ink(width: usize, pixels: &[Colour]) -> Vec<u8> {
         .collect()
 }
 
-/// Adds a cue, or lengthens the last one when this is the same picture
-/// straight after it (a palette change, as in a fade, or a page sent
-/// again).
-pub(crate) fn push(out: &mut Vec<Cue>, start_ms: u64, end_ms: u64, image: Image) {
-    if end_ms <= start_ms {
-        return;
-    }
-    if let Some(last) = out.last_mut()
-        && last.end_ms == start_ms
-        && same_text(&last.image, &image)
-    {
-        last.end_ms = end_ms;
-        return;
-    }
-    out.push(Cue {
-        start_ms,
-        end_ms,
-        image,
-    });
-}
-
 /// The same shapes, whatever their brightness: a fade changes the
 /// palette, not which pixels are text.
 fn same_text(a: &Image, b: &Image) -> bool {
@@ -200,6 +306,10 @@ mod tests {
     use super::*;
 
     const CLEAR: Colour = Colour { luma: 0, alpha: 0 };
+
+    fn text_picture(width: usize, height: usize, pixels: &[Colour]) -> Option<Image> {
+        super::text_picture(width, height, pixels, &Kept::new(&Budget::DEFAULT)).unwrap()
+    }
 
     fn opaque(luma: u8) -> Colour {
         Colour { luma, alpha: 255 }

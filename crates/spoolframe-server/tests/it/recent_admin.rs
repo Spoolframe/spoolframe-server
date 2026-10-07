@@ -19,7 +19,7 @@ const FILE: &str = r#"
 "#;
 
 /// Make every session of `username` signed in an hour ago.
-async fn age(dir: &std::path::Path, username: &str) {
+pub(crate) async fn age(dir: &std::path::Path, username: &str) {
     let pool = sqlx::SqlitePool::connect_with(
         sqlx::sqlite::SqliteConnectOptions::new().filename(dir.join("spoolframe.db")),
     )
@@ -143,6 +143,64 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
                     .await,
             ),
         ),
+        // Finding 44: every other way to the first server's token.
+        (
+            "settingSet(plex.token)",
+            outcome(root.setting_set("plex.token".into(), json!("token")).await),
+        ),
+        (
+            "settingUnset(plex.token)",
+            outcome(root.setting_unset("plex.token".into()).await),
+        ),
+        (
+            "plexAccountTokenUse",
+            outcome(
+                root.plex_account_token_use("http://10.9.9.9:32400".into())
+                    .await,
+            ),
+        ),
+        (
+            "plexPinCheck(keepToken)",
+            outcome(root.plex_pin_check(78, true).await),
+        ),
+        // Finding 47: where a kept token is sent. The first server's
+        // address, and every other server's (one key with their names
+        // and paths).
+        (
+            "settingSet(plex.url)",
+            outcome(
+                root.setting_set("plex.url".into(), json!("http://10.9.9.9:32400"))
+                    .await,
+            ),
+        ),
+        (
+            "settingUnset(plex.url)",
+            outcome(root.setting_unset("plex.url".into()).await),
+        ),
+        (
+            "settingSet(plex.servers)",
+            outcome(
+                root.setting_set(
+                    "plex.servers".into(),
+                    json!([{ "id": "nas", "url": "http://10.9.9.9:32400" }]),
+                )
+                .await,
+            ),
+        ),
+        (
+            "settingUnset(plex.servers)",
+            outcome(root.setting_unset("plex.servers".into()).await),
+        ),
+        // The first server added keeps a token set before it (the
+        // wizard's), so adding it says where that token goes. Nothing
+        // answers at port 1: a confirmed session is refused at once.
+        (
+            "plexServerAdd(first)",
+            outcome(
+                root.plex_server_add("http://127.0.0.1:1".into(), None)
+                    .await,
+            ),
+        ),
     ]
 }
 
@@ -156,6 +214,11 @@ async fn an_old_admin_session_cannot_make_sensitive_changes() {
 
     for (call, outcome) in sensitive(&root).await {
         assert_eq!(outcome, Some(error_code::RECENT_SIGN_IN_REQUIRED), "{call}");
+    }
+    let settings = root.settings().await.unwrap();
+    for key in ["plex.token", "plex.url", "plex.servers"] {
+        let entry = settings.entries.iter().find(|e| e.key == key);
+        assert!(entry.is_some_and(|e| !e.set), "{entry:?}");
     }
     let users = root.user_list().await.unwrap();
     assert!(users.iter().all(|u| u.username != "carol"), "{users:?}");
@@ -187,6 +250,39 @@ async fn an_old_admin_session_still_makes_the_other_changes() {
         asked.err().map(code),
         Some(error_code::RECENT_SIGN_IN_REQUIRED)
     );
+    // Signing in with Plex only to add servers keeps no token.
+    let signed_in = root.plex_pin_check(78, false).await;
+    assert_ne!(
+        signed_in.err().map(code),
+        Some(error_code::RECENT_SIGN_IN_REQUIRED)
+    );
+    // A name sends nothing anywhere, and paths and removal send no token
+    // to a new place (finding 47). No Plex is set up here, so each fails
+    // on its own checks, not on the sign-in's age.
+    for (call, outcome) in [
+        (
+            "settingSet(plex.name)",
+            root.setting_set("plex.name".into(), json!("Den"))
+                .await
+                .err(),
+        ),
+        (
+            "plexServerSetPaths",
+            root.plex_server_set_paths("nas".into(), Vec::new())
+                .await
+                .err(),
+        ),
+        (
+            "plexServerRemove",
+            root.plex_server_remove("nas".into()).await.err(),
+        ),
+    ] {
+        assert_ne!(
+            outcome.map(code),
+            Some(error_code::RECENT_SIGN_IN_REQUIRED),
+            "{call}"
+        );
+    }
 }
 
 /// Confirmed again, as the web UI's "Confirm it's you" does, the same

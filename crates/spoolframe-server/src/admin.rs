@@ -54,6 +54,7 @@ use crate::passkeys::{CeremonyError, Passkeys, SignInError};
 use crate::plex_accounts::{Link, LinkError, Linking, PlexAccounts};
 use crate::plex_sync::{SyncError, WatchSync};
 use crate::principal::Principal;
+use crate::refusals::{Channel, Kind, Refusal};
 use crate::runtime::{ChangeError, RuntimeSettings};
 use crate::store::identities::{IdentityError, IdentityRecord};
 use crate::store::passkeys::{FirstPasskey, PasskeyError, PasskeyRecord, passkey_name};
@@ -100,6 +101,25 @@ fn source(ext: &Extensions) -> RpcResult<Option<String>> {
 /// browser's cookie (`crate::admin_http`), if there was one.
 #[derive(Debug, Clone)]
 pub(crate) struct Bearer(pub(crate) String);
+
+/// The username a sign-in gave, for the refused-request log (finding 46):
+/// the method sets it, and the listener reads it once the call is
+/// answered. The password beside it is never kept.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Attempt(Arc<parking_lot::Mutex<Option<String>>>);
+
+impl Attempt {
+    /// Note `username` as the one the caller's sign-in gave.
+    fn note(ext: &Extensions, username: &str) {
+        if let Some(Attempt(given)) = ext.get::<Attempt>() {
+            *given.lock() = Some(crate::refusals::bounded(username));
+        }
+    }
+
+    fn given(&self) -> Option<String> {
+        self.0.lock().clone()
+    }
+}
 
 /// The web UI's origin as the caller's browser has it open (the socket
 /// upgrade's `Origin`, which [`crate::admin_http`] has already checked):
@@ -681,6 +701,78 @@ impl AdminApi {
         Ok(())
     }
 
+    /// Log that `request` was refused with `code` (finding 46), if that
+    /// code is a refusal and the log is not full for the caller's address
+    /// ([`crate::refusals`]). Who it was is looked up only then.
+    pub(crate) async fn refused(
+        &self,
+        channel: Channel,
+        request: &str,
+        ext: &Extensions,
+        code: i32,
+    ) {
+        let bearer = ext.get::<Bearer>();
+        let kind = match code {
+            error_code::UNAUTHENTICATED if bearer.is_none() => Kind::NoSession,
+            error_code::UNAUTHENTICATED => Kind::Unauthenticated,
+            error_code::FORBIDDEN => Kind::Forbidden,
+            error_code::RECENT_SIGN_IN_REQUIRED => Kind::RecentSignInRequired,
+            error_code::RATE_LIMITED => Kind::RateLimited,
+            error_code::INVALID_CREDENTIALS
+            | error_code::INVALID_SETUP_CODE
+            | error_code::PASSKEY_REFUSED
+            | error_code::NO_SUCH_SIGN_IN_CODE => Kind::SignInFailed,
+            _ => return,
+        };
+        // The address itself, loopback included: unlike the failure
+        // limit's source, the log is not shared out by it.
+        let source = ext
+            .get::<Peer>()
+            .and_then(|Peer(ip)| *ip)
+            .map_or_else(|| "-".to_owned(), |ip| ip.to_canonical().to_string());
+        let refusals = self.auth.refusals();
+        if !refusals.admit(&source, kind) {
+            return;
+        }
+        let owner = match bearer {
+            Some(Bearer(token)) => self.auth.session_owner(token).await.ok().flatten(),
+            None => None,
+        };
+        let given = ext.get::<Attempt>().and_then(Attempt::given);
+        let reason = match kind {
+            Kind::NoSession => "no session",
+            Kind::Unauthenticated => match &owner {
+                None => "no such session",
+                Some(owner) if !owner.live => "session ended",
+                Some(owner) if owner.endpoint_id.is_some() => {
+                    "an app's session, not the admin API's"
+                }
+                Some(_) => "session is not valid",
+            },
+            Kind::Forbidden => "admins only",
+            Kind::RecentSignInRequired => "sign-in too old for this change",
+            Kind::RateLimited => "rate-limited",
+            Kind::SignInFailed => match code {
+                error_code::INVALID_CREDENTIALS => match &given {
+                    Some(username) => self.auth.why_password_refused(username).await,
+                    None => "wrong password",
+                },
+                error_code::INVALID_SETUP_CODE => "wrong setup code",
+                error_code::PASSKEY_REFUSED => "passkey refused",
+                _ => "wrong device sign-in code",
+            },
+            Kind::ProfileLocked => "profile locked",
+        };
+        crate::refusals::log(&Refusal {
+            kind,
+            channel,
+            request: request.to_owned(),
+            source,
+            user: given.or(owner.map(|owner| owner.username)),
+            reason: reason.to_owned(),
+        });
+    }
+
     /// The caller's live session, checked on every call so a revoked
     /// session or a disabled user stops at once.
     async fn caller(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
@@ -1003,10 +1095,18 @@ fn recent(user: &ApiSessionUser) -> RpcResult<()> {
 
 /// Whether a setting is one whose change could take the server over: the
 /// admin listener, its cookies, proxies and public URL (`admin.*`),
-/// sign-in providers (`auth.*`), and the programs the server runs and
-/// whether they are confined (`media.*`, PX-11 finding 34).
+/// sign-in providers (`auth.*`), the programs the server runs and
+/// whether they are confined (`media.*`, PX-11 finding 34), the first
+/// Plex server's token (`plex.token`, finding 44), as
+/// `plexServerSetToken` is for every server's, and where the kept tokens
+/// are sent (finding 47): the first server's address (`plex.url`) and the
+/// others' (`plex.servers`, one key with their names and path mappings,
+/// so all of it). A name alone (`plex.name`) sends nothing anywhere.
 fn sensitive_setting(key: &str) -> bool {
-    key.starts_with("admin.") || key.starts_with("auth.") || key.starts_with("media.")
+    key.starts_with("admin.")
+        || key.starts_with("auth.")
+        || key.starts_with("media.")
+        || [PLEX_TOKEN, "plex.url", "plex.servers"].contains(&key)
 }
 
 impl AdminApi {
@@ -1387,6 +1487,7 @@ fn session_id(token_hash: &str) -> String {
 #[async_trait]
 impl MeApiServer for AdminApi {
     async fn login(&self, ext: &Extensions, credentials: Credentials) -> RpcResult<LoggedIn> {
+        Attempt::note(ext, &credentials.username);
         let source = source(ext)?;
         let login = self
             .auth
@@ -2491,7 +2592,7 @@ impl AdminApiServer for AdminApi {
         Ok(reports)
     }
 
-    async fn plex_sync(&self, ext: &Extensions) -> RpcResult<PlexSyncOverview> {
+    async fn plex_sync_overview(&self, ext: &Extensions) -> RpcResult<PlexSyncOverview> {
         self.admin(ext).await?;
         let users = self.accounts()?.users().await?;
         let interval = self
@@ -2542,7 +2643,8 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn plex_account_token_use(&self, ext: &Extensions, url: String) -> RpcResult<()> {
-        let (settings, by) = self.settings_as_admin(ext).await?;
+        // It replaces `plex.token` (finding 44).
+        let (settings, by) = self.settings_as_recent_admin(ext, true).await?;
         let user = self.admin(ext).await?;
         let Some(resources) = self.offered_servers(user.user).await? else {
             return Err(error(
@@ -2704,7 +2806,10 @@ impl AdminApiServer for AdminApi {
         id: u64,
         keep_token: bool,
     ) -> RpcResult<PlexPinState> {
-        let (settings, by) = self.settings_as_admin(ext).await?;
+        // Keeping the token replaces `plex.token` (finding 44); checked
+        // before the PIN is, so an approved one waits for "Confirm it's
+        // you" and is not used up.
+        let (settings, by) = self.settings_as_recent_admin(ext, keep_token).await?;
         if !self.pins.lock().contains(&id) {
             return Err(error(
                 error_code::INVALID_INPUT,
@@ -2752,7 +2857,7 @@ impl AdminApiServer for AdminApi {
         Ok(PlexPinState::Linked { account })
     }
 
-    async fn plex_path_check(
+    async fn plex_path_try(
         &self,
         ext: &Extensions,
         mappings: Vec<PathMappingEntry>,
@@ -2846,7 +2951,12 @@ impl AdminApiServer for AdminApi {
         url: String,
         token: Option<String>,
     ) -> RpcResult<PlexServerEntry> {
-        let (settings, by) = self.settings_as_admin(ext).await?;
+        // The first server takes the token kept before it, so its address
+        // is where that token goes (finding 47), as `plex.url` is. A later
+        // one has its own token, given or the linked account's for it.
+        let (settings, _) = self.settings_as_admin(ext).await?;
+        let first = !settings.plex_configured()?;
+        let (settings, by) = self.settings_as_recent_admin(ext, first).await?;
         let token = match token.filter(|t| !t.trim().is_empty()) {
             Some(token) => Some(token),
             None => self.linked_token_for(ext, &url).await?,
@@ -2860,17 +2970,6 @@ impl AdminApiServer for AdminApi {
             .into_iter()
             .find(|s| s.id == id)
             .ok_or_else(|| internal("the server added is not configured"))
-    }
-
-    async fn plex_server_update(
-        &self,
-        ext: &Extensions,
-        id: String,
-        url: Option<String>,
-        name: Option<String>,
-    ) -> RpcResult<()> {
-        let (settings, by) = self.settings_as_admin(ext).await?;
-        Ok(settings.plex_server_update(&id, url.as_deref(), name.as_deref(), &by)?)
     }
 
     async fn plex_server_set_token(

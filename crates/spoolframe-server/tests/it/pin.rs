@@ -389,7 +389,7 @@ async fn who_am_i_says_whether_there_is_a_pin_and_how_many_digits() {
         TestServer::start_with(fresh_dir("pin-state").await, ServerOptions::default()).await;
     server.add_user("alice", PASSWORD, None).await;
     let (tv, session) = alice_on(&server).await;
-    assert_eq!(pin_state(&tv, &session).await, None);
+    assert!(pin_state(&tv, &session).await.is_none());
     ok(
         &tv,
         &session,
@@ -413,7 +413,7 @@ async fn who_am_i_says_whether_there_is_a_pin_and_how_many_digits() {
         },
     )
     .await;
-    assert_eq!(pin_state(&tv, &session).await, None);
+    assert!(pin_state(&tv, &session).await.is_none());
     tv.close().await;
     server.stop().await;
 }
@@ -504,10 +504,10 @@ async fn a_pin_is_changed_or_removed_only_with_the_current_pin_or_the_password()
         Some(PinState { digits: Some(6) })
     );
     ok(&tv, &session, clear_pin(by_pin("123456"))).await;
-    assert_eq!(pin_state(&tv, &session).await, None);
+    assert!(pin_state(&tv, &session).await.is_none());
     ok(&tv, &session, set_pin(PIN, None)).await;
     ok(&tv, &session, clear_pin(by_password(PASSWORD))).await;
-    assert_eq!(pin_state(&tv, &session).await, None);
+    assert!(pin_state(&tv, &session).await.is_none());
     tv.close().await;
     server.stop().await;
 }
@@ -525,7 +525,7 @@ async fn the_password_replaces_a_forgotten_pin() {
     );
     ok(&tv, &session, Request::UnlockProfile { pin: "2468".into() }).await;
     ok(&tv, &session, clear_pin(by_password(PASSWORD))).await;
-    assert_eq!(pin_state(&tv, &session).await, None);
+    assert!(pin_state(&tv, &session).await.is_none());
     tv.close().await;
     server.stop().await;
 }
@@ -709,7 +709,7 @@ async fn a_user_without_a_password_proves_it_with_the_pin() {
     );
     ok(&tv, &session, set_pin("98765", Some(by_pin(PIN)))).await;
     ok(&tv, &session, clear_pin(by_pin("98765"))).await;
-    assert_eq!(pin_state(&tv, &session).await, None);
+    assert!(pin_state(&tv, &session).await.is_none());
     tv.close().await;
     server.stop().await;
 }
@@ -778,6 +778,38 @@ async fn an_old_unlocked_session_cannot_disable_pin_protection() {
         },
     )
     .await;
+    tv.close().await;
+    server.stop().await;
+}
+
+/// A first PIN is set only from a recent sign-in, as the web UI's `pinSet`
+/// asks (A-14): an unlocked session left on a TV must not let whoever
+/// holds the remote put a PIN on the account. Its owner then would need
+/// that PIN, or the password, to change it.
+#[tokio::test]
+async fn an_old_session_cannot_set_a_first_pin() {
+    let (server, tv, session) = pin_server("pin-first-recent", ServerOptions::default()).await;
+    let hash = SessionToken(session.0.clone()).hash();
+    crate::app_passkeys::sql(
+        &server,
+        "UPDATE sessions SET authenticated_at = authenticated_at - 3600 WHERE token_hash = ?1",
+        &hash,
+    )
+    .await;
+    assert_eq!(
+        err(&tv, &session, set_pin(PIN, None)).await,
+        Error::RecentSignInRequired
+    );
+    assert!(pin_state(&tv, &session).await.is_none());
+    tv.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_fresh_session_sets_a_first_pin() {
+    let (server, tv, session) = pin_server("pin-first-fresh", ServerOptions::default()).await;
+    ok(&tv, &session, set_pin(PIN, None)).await;
+    assert!(pin_state(&tv, &session).await.is_some());
     tv.close().await;
     server.stop().await;
 }

@@ -12,7 +12,8 @@ use std::time::Duration;
 use jsonrpsee::ws_client::WsClient;
 use spoolframe_admin_api::{MeApiClient, error_code};
 use spoolframe_protocol::{
-    AuthMethod, DeviceSignInRequest, Error, Reply, Request, Response, SessionId,
+    AddressNetwork, AuthMethod, DeviceAddress, DeviceSignInRequest, Error, Reply, Request,
+    Response, SessionId,
 };
 use spoolframe_types::Platform;
 use support::{ServerOptions, TestClient, TestServer, fresh_dir};
@@ -511,5 +512,42 @@ async fn approvals_of_one_code_at_once_in_a_browser_sign_in_once() {
     ));
     assert_eq!(alice.devices().await.unwrap().len(), 1);
     tv.close().await;
+    server.stop().await;
+}
+
+/// The approving app is told where the TV asked from (PX-09 finding 27),
+/// judged as the web approval page judges it: a TV whose only way to the
+/// server is loopback is named at `127.0.0.1`, on the loopback network.
+#[tokio::test]
+async fn the_approver_is_told_where_the_tv_asked_from() {
+    let server = server("dsi-address", ServerOptions::default()).await;
+    let tv = server.loopback_client().await;
+    tv.hello_from(Platform::Tvos, Some("Living room TV"), None)
+        .await;
+    let code = match tv
+        .call(None, Request::BeginDeviceSignIn { remember: false })
+        .await
+    {
+        Response::Ok(Reply::DeviceSignInStarted { code, .. }) => code,
+        other => panic!("not started: {other:?}"),
+    };
+    let (phone, phone_session) = phone(&server).await;
+    match phone
+        .call(Some(&phone_session), Request::LookupDeviceSignIn { code })
+        .await
+    {
+        Response::Ok(Reply::DeviceSignInRequest(DeviceSignInRequest {
+            requested_from, ..
+        })) => assert_eq!(
+            requested_from,
+            Some(DeviceAddress {
+                address: "127.0.0.1".into(),
+                network: AddressNetwork::Loopback,
+            })
+        ),
+        other => panic!("{other:?}"),
+    }
+    tv.close().await;
+    phone.close().await;
     server.stop().await;
 }

@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::bitmap::{self, Colour, Cue, MAX_SIDE, Packet, push};
+use crate::bitmap::{self, Budget, Colour, Cue, Kept, MAX_SIDE, OverBudget, Packet};
 
 const PAGE: u8 = 0x10;
 const REGION: u8 = 0x11;
@@ -58,12 +58,19 @@ struct Page {
     regions: Vec<(u8, usize, usize)>,
 }
 
-/// The cues of a track's packets, in order. Segments that do not parse
-/// end their packet's reading, and what was read of it still counts.
-pub fn cues(packets: &[Packet]) -> Vec<Cue> {
-    let mut regions: HashMap<u8, Region> = HashMap::new();
+/// The cues of a track's packets, in order, within [`Budget::DEFAULT`].
+/// Segments that do not parse end their packet's reading, and what was
+/// read of it still counts.
+pub fn cues(packets: &[Packet]) -> Result<Vec<Cue>, OverBudget> {
+    cues_within(packets, &Budget::DEFAULT)
+}
+
+/// The cues of a track's packets, in order. A track that decodes to more
+/// than `budget` is an error.
+pub fn cues_within(packets: &[Packet], budget: &Budget) -> Result<Vec<Cue>, OverBudget> {
+    let mut regions = Regions::default();
     let mut cluts: HashMap<u8, Clut> = HashMap::new();
-    let mut out = Vec::new();
+    let mut out = Kept::new(budget);
     // What shows: since when, until its time-out (if it has one), and the
     // picture.
     let mut shown: Option<(u64, Option<u64>, bitmap::Image)> = None;
@@ -85,26 +92,30 @@ pub fn cues(packets: &[Packet]) -> Vec<Cue> {
             };
             data = &rest[len..];
             let parsed = match *kind {
-                PAGE => page_composition(body).map(|(p, epoch)| {
-                    // The page before ends here, if its time-out has not
-                    // ended it already.
-                    if let Some((start, time_out, image)) = shown.take() {
-                        let end = time_out.map_or(packet.pts_ms, |t| t.min(packet.pts_ms));
-                        push(&mut out, start, end, image);
+                PAGE => match page_composition(body) {
+                    Some((p, epoch)) => {
+                        // The page before ends here, if its time-out has
+                        // not ended it already.
+                        if let Some((start, time_out, image)) = shown.take() {
+                            let end = time_out.map_or(packet.pts_ms, |t| t.min(packet.pts_ms));
+                            out.push(start, end, image)?;
+                        }
+                        if epoch {
+                            regions = Regions::default();
+                            cluts.clear();
+                        }
+                        page = Some(p);
+                        composed = true;
+                        Some(())
                     }
-                    if epoch {
-                        regions.clear();
-                        cluts.clear();
-                    }
-                    page = Some(p);
-                    composed = true;
-                }),
-                REGION => region_composition(body, &mut regions),
+                    None => None,
+                },
+                REGION => region_composition(body, &mut regions, budget)?,
                 CLUT => clut_definition(body, &mut cluts),
-                OBJECT => object_data(body, &mut regions),
+                OBJECT => object_data(body, &mut regions.by_id),
                 END => {
                     if composed {
-                        shown = render(page.as_ref(), &regions, &cluts, packet.pts_ms);
+                        shown = render(page.as_ref(), &regions.by_id, &cluts, packet.pts_ms, &out)?;
                         composed = false;
                     }
                     Some(())
@@ -119,13 +130,13 @@ pub fn cues(packets: &[Packet]) -> Vec<Cue> {
         }
         // A display set whose end segment is missing ends with its packet.
         if composed {
-            shown = render(page.as_ref(), &regions, &cluts, packet.pts_ms);
+            shown = render(page.as_ref(), &regions.by_id, &cluts, packet.pts_ms, &out)?;
         }
     }
     // The last page ends at its time-out; one without is dropped, as the
     // last PGS cue is.
     if let Some((start, Some(time_out), image)) = shown {
-        push(&mut out, start, time_out, image);
+        out.push(start, time_out, image)?;
     }
     if broken > 0 {
         tracing::warn!(
@@ -133,7 +144,14 @@ pub fn cues(packets: &[Packet]) -> Vec<Cue> {
             "DVB subtitle segments that could not be read were left out"
         );
     }
-    out
+    Ok(out.into_cues())
+}
+
+/// The regions sent this epoch, and their pixels added up.
+#[derive(Default)]
+struct Regions {
+    by_id: HashMap<u8, Region>,
+    held: u64,
 }
 
 /// The page, and whether it starts a new epoch.
@@ -165,8 +183,16 @@ fn page_composition(body: &[u8]) -> Option<(Page, bool)> {
     ))
 }
 
-fn region_composition(body: &[u8], regions: &mut HashMap<u8, Region>) -> Option<()> {
-    let head = body.get(..10)?;
+/// A region's size, colours and objects. `None` if it does not parse; an
+/// error if holding it would pass `budget`.
+fn region_composition(
+    body: &[u8],
+    regions: &mut Regions,
+    budget: &Budget,
+) -> Result<Option<()>, OverBudget> {
+    let Some(head) = body.get(..10) else {
+        return Ok(None);
+    };
     let id = head[0];
     let fill = head[1] & 0x08 != 0;
     let width = usize::from(u16::from_be_bytes([head[2], head[3]]));
@@ -174,7 +200,7 @@ fn region_composition(body: &[u8], regions: &mut HashMap<u8, Region>) -> Option<
     // Allocated as told (PX-09 B-3): past the cap the segment is refused,
     // and counted with those that do not parse.
     if width > MAX_SIDE || height > MAX_SIDE {
-        return None;
+        return Ok(None);
     }
     let depth = match (head[6] >> 2) & 7 {
         1 => 2,
@@ -198,7 +224,13 @@ fn region_composition(body: &[u8], regions: &mut HashMap<u8, Region>) -> Option<
         // Character objects carry a foreground and background code.
         at += if kind == 1 || kind == 2 { 8 } else { 6 };
     }
-    let region = regions.entry(id).or_insert_with(|| Region {
+    // Counted before it is allocated; a region it resizes is let go.
+    let before = regions.by_id.get(&id).map(|r| r.pixels.len());
+    if before != Some(width * height) {
+        let held = regions.held - before.unwrap_or(0) as u64;
+        regions.held = budget.hold(held, (width * height) as u64)?;
+    }
+    let region = regions.by_id.entry(id).or_insert_with(|| Region {
         width,
         height,
         depth,
@@ -214,7 +246,7 @@ fn region_composition(body: &[u8], regions: &mut HashMap<u8, Region>) -> Option<
     if fill {
         region.pixels.fill(background);
     }
-    Some(())
+    Ok(Some(()))
 }
 
 fn clut_definition(body: &[u8], cluts: &mut HashMap<u8, Clut>) -> Option<()> {
@@ -499,23 +531,30 @@ fn eight_bit(bits: &mut Bits, runs: &mut Vec<(usize, u8)>) {
 
 /// The page's regions drawn where they sit, shown from `pts_ms` until its
 /// time-out at the latest (a time-out of 0: until the next page). `None`
-/// if nothing shows.
+/// if nothing shows; an error if `kept` has no room for its picture.
 fn render(
     page: Option<&Page>,
     regions: &HashMap<u8, Region>,
     cluts: &HashMap<u8, Clut>,
     pts_ms: u64,
-) -> Option<(u64, Option<u64>, bitmap::Image)> {
-    let page = page?;
+    kept: &Kept,
+) -> Result<Option<(u64, Option<u64>, bitmap::Image)>, OverBudget> {
+    let Some(page) = page else {
+        return Ok(None);
+    };
     let placed: Vec<(&Region, usize, usize)> = page
         .regions
         .iter()
         .filter_map(|&(id, x, y)| Some((regions.get(&id)?, x, y)))
         .collect();
-    let left = placed.iter().map(|&(_, x, _)| x).min()?;
-    let top = placed.iter().map(|&(_, _, y)| y).min()?;
-    let right = placed.iter().map(|&(r, x, _)| x + r.width).max()?;
-    let bottom = placed.iter().map(|&(r, _, y)| y + r.height).max()?;
+    let (Some(left), Some(top), Some(right), Some(bottom)) = (
+        placed.iter().map(|&(_, x, _)| x).min(),
+        placed.iter().map(|&(_, _, y)| y).min(),
+        placed.iter().map(|&(r, x, _)| x + r.width).max(),
+        placed.iter().map(|&(r, _, y)| y + r.height).max(),
+    ) else {
+        return Ok(None);
+    };
     let (width, height) = (right - left, bottom - top);
     if width > MAX_SIDE || height > MAX_SIDE {
         tracing::warn!(
@@ -523,7 +562,7 @@ fn render(
             height,
             "a DVB subtitle page too large to read was left out"
         );
-        return None;
+        return Ok(None);
     }
     let defaults = default_clut();
     let mut pixels = vec![Colour::default(); width * height];
@@ -536,14 +575,21 @@ fn render(
             }
         }
     }
-    let image = bitmap::text_picture(width, height, &pixels)?;
+    let Some(image) = bitmap::text_picture(width, height, &pixels, kept)? else {
+        return Ok(None);
+    };
     let time_out = (page.time_out_ms > 0).then_some(pts_ms + page.time_out_ms);
-    Some((pts_ms, time_out, image))
+    Ok(Some((pts_ms, time_out, image)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cues within the default budget, which these never reach.
+    fn cues(packets: &[Packet]) -> Vec<Cue> {
+        super::cues(packets).unwrap()
+    }
 
     /// Bits, high first, for writing code strings.
     #[derive(Default)]
@@ -692,6 +738,84 @@ mod tests {
         display_set(&mut data);
         segment(&mut data, END, &[]);
         data
+    }
+
+    /// Finding 45 in DVB: a page of one `side` × `side` region filled
+    /// with an opaque colour, so all of it is text: 36 bytes a cue.
+    fn filled(pts_ms: u64, side: u16) -> Packet {
+        let mut data = Vec::new();
+        // A mode change, region 0 at (0, 0), a time-out of 1 s.
+        segment(&mut data, PAGE, &[1, 2 << 2, 0, 0xff, 0, 0, 0, 0]);
+        // Region 0, filled with 2-bit code 1 (white), CLUT 0, no objects.
+        let mut region = vec![0, 0x08];
+        region.extend(side.to_be_bytes());
+        region.extend(side.to_be_bytes());
+        region.extend([1 << 2, 0, 0, 1 << 2]);
+        segment(&mut data, REGION, &region);
+        segment(&mut data, END, &[]);
+        packet(pts_ms, data)
+    }
+
+    #[test]
+    fn a_track_past_its_budget_of_pixels_is_refused() {
+        let packets: Vec<Packet> = (0..8).map(|n| filled(n * 2_000, 1024)).collect();
+        assert!(packets.iter().all(|p| p.data.len() == 36));
+        let picture = 1056 * 1056;
+        let budget = Budget {
+            cues: 1_000,
+            pixels: 3 * picture,
+            held: 64 << 20,
+        };
+        match cues_within(&packets, &budget) {
+            Err(e) => assert_eq!(e, OverBudget::Pixels(budget.pixels)),
+            Ok(cues) => panic!(
+                "{} bytes decoded to {} cues of {} pixels",
+                packets.len() * 36,
+                cues.len(),
+                cues.iter().map(|c| c.image.pixels.len()).sum::<usize>()
+            ),
+        }
+    }
+
+    #[test]
+    fn a_track_past_its_budget_of_cues_is_refused() {
+        let packets: Vec<Packet> = (0..5).map(|n| filled(n * 2_000, 8)).collect();
+        let budget = Budget {
+            cues: 4,
+            ..Budget::DEFAULT
+        };
+        assert_eq!(
+            cues_within(&packets, &budget).map(|c| c.len()),
+            Err(OverBudget::Cues(4))
+        );
+        assert_eq!(
+            cues_within(&packets, &Budget::DEFAULT).map(|c| c.len()),
+            Ok(5)
+        );
+    }
+
+    /// Regions stay until the next epoch: many full-size ones under
+    /// different ids are refused as they come, before each is allocated.
+    #[test]
+    fn regions_held_past_the_budget_are_refused() {
+        let mut data = Vec::new();
+        segment(&mut data, PAGE, &[1, 2 << 2]);
+        for id in 0..=255u8 {
+            let mut region = vec![id, 0];
+            region.extend(4096u16.to_be_bytes());
+            region.extend(4096u16.to_be_bytes());
+            region.extend([1 << 2, 0, 0, 0]);
+            segment(&mut data, REGION, &region);
+        }
+        let held = 3 * 4096 * 4096;
+        let budget = Budget {
+            held,
+            ..Budget::DEFAULT
+        };
+        assert_eq!(
+            cues_within(&[packet(0, data)], &budget).map(|c| c.len()),
+            Err(OverBudget::Held(held))
+        );
     }
 
     fn times(cues: &[Cue]) -> Vec<(u64, u64)> {

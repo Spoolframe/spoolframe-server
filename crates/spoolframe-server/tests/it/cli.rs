@@ -257,6 +257,8 @@ async fn the_media_tools_run_confined_by_default() {
     );
     assert!(log.contains("a confined ffprobe"), "{log}");
     assert!(log.contains("could not read"), "{log}");
+    // And the subtitle decoder, this binary run again (finding 45).
+    assert!(log.contains("a confined subtitle decoder"), "{log}");
     assert!(running.stop().success());
 }
 

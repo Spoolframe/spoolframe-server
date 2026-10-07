@@ -12,15 +12,20 @@
 //! One bitmap track is read at a time, with `threads` tesseract processes:
 //! a second track waits, rather than both taking twice as long. A text
 //! conversion is only ffmpeg reading the file, and waits for nothing.
+//!
+//! A bitmap track's pictures are decoded by the server's own binary run
+//! again, confined as the tools are (finding 45, [`decode`]): never in
+//! this process, which holds only the cues' times.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use spoolframe_media::decode::{self, CueTime};
 use spoolframe_media::ocr::{self, Ocr};
 use spoolframe_media::sandbox::Tool;
-use spoolframe_media::{SubtitleKind, SubtitleSource, SubtitleStream, codecs, dvb, pgs, vobsub};
+use spoolframe_media::{SubtitleKind, SubtitleSource, SubtitleStream, codecs};
 use spoolframe_types::SubtitleFormat;
 
 use crate::metrics::Counter;
@@ -82,6 +87,8 @@ pub struct Subtitles {
     ocr: Ocr,
     ffmpeg: Tool,
     ffprobe: Tool,
+    /// The server's own binary, as the subtitle decoder.
+    decoder: Tool,
     threads: usize,
     cache_dir: PathBuf,
     making: Mutex<HashMap<String, watch::Receiver<TextState>>>,
@@ -113,13 +120,15 @@ impl std::fmt::Debug for Subtitles {
 }
 
 impl Subtitles {
-    /// Reading with `ocr` (or not at all, if `settings` turn it off), and
-    /// tracks with ffmpeg and ffprobe. Work a stopped server left half done
-    /// is removed.
+    /// Reading with `ocr` (or not at all, if `settings` turn it off),
+    /// tracks with ffmpeg and ffprobe, and their pictures decoded by
+    /// `decoder` (the server's own binary). Work a stopped server left
+    /// half done is removed.
     pub fn new(
         ocr: Ocr,
         ffmpeg: Tool,
         ffprobe: Tool,
+        decoder: Tool,
         settings: &OcrSettings,
     ) -> std::io::Result<Self> {
         crate::files::private_dir(&settings.cache_dir)?;
@@ -135,6 +144,7 @@ impl Subtitles {
             },
             ffmpeg,
             ffprobe,
+            decoder,
             threads: settings.threads,
             cache_dir: settings.cache_dir.clone(),
             making: Mutex::new(HashMap::new()),
@@ -358,15 +368,22 @@ impl Job {
             .expect("never closed");
         let _ = state.send(TextState::Reading { done_percent: 0 });
         let started = std::time::Instant::now();
-        let cues = self.cues().await?;
-        let total = cues.len().max(1);
+        // The decoder writes here and nowhere else; the lists tesseract
+        // reads go beside it, where the decoder cannot.
+        let pictures = self.work.join("pictures");
+        tokio::fs::create_dir_all(&pictures)
+            .await
+            .map_err(|e| e.to_string())?;
+        let times = self.decode(&pictures).await?;
+        let total = times.len().max(1);
         let texts = self
             .subtitles
             .ocr
             .recognise(
-                &cues,
+                &pictures,
+                times.len(),
+                &self.work.join("lists"),
                 language,
-                &self.work.join("pictures"),
                 self.subtitles.threads,
                 &|done| {
                     let _ = state.send(TextState::Reading {
@@ -376,7 +393,7 @@ impl Job {
             )
             .await
             .map_err(|e| e.to_string())?;
-        let cues = ocr::text_cues(&cues, texts);
+        let cues = ocr::text_cues(&times, texts);
         let text = match self.to {
             SubtitleFormat::WebVtt => ocr::webvtt(&cues),
             _ => ocr::srt(&cues),
@@ -394,10 +411,14 @@ impl Job {
         Ok(())
     }
 
-    /// The track's cues. PGS is copied out as a `.sup` (a file beside the
-    /// film already is one); VobSub and DVB are read as packets, a `.idx`
-    /// beside the film with its `.sub` as its first stream.
-    async fn cues(&self) -> Result<Vec<spoolframe_media::bitmap::Cue>, String> {
+    /// The track's cues, decoded by the subtitle decoder into `pictures`:
+    /// their times. PGS is copied out as a `.sup` (a file beside the film
+    /// already is one), and the decoder reads the file the server opened;
+    /// VobSub and DVB are read as packets by ffprobe, a `.idx` beside the
+    /// film with its `.sub` as its first stream, and the decoder reads
+    /// ffprobe's JSON.
+    async fn decode(&self, pictures: &Path) -> Result<Vec<CueTime>, String> {
+        let decoder = &self.subtitles.decoder;
         if let SubtitleFormat::VobSub | SubtitleFormat::DvbSub = self.format {
             // An embedded track counts from the file's start; a file of its
             // own already does.
@@ -410,15 +431,22 @@ impl Job {
                     (path, 0, false)
                 }
             };
-            let track = ocr::read_track(&self.subtitles.ffprobe, input, index, from_start)
+            let json = ocr::read_track_json(&self.subtitles.ffprobe, input, index)
                 .await
                 .map_err(|e| e.to_string())?;
-            return match self.format {
-                SubtitleFormat::VobSub => {
-                    vobsub::cues(&track.extradata, &track.packets).map_err(|e| e.to_string())
-                }
-                _ => Ok(dvb::cues(&track.packets)),
+            let format = match self.format {
+                SubtitleFormat::VobSub => decode::Format::VobSub,
+                _ => decode::Format::Dvb,
             };
+            return decode::run(
+                decoder,
+                format,
+                from_start,
+                decode::Input::Bytes(json),
+                pictures,
+            )
+            .await
+            .map_err(|e| e.to_string());
         }
         let sup = match &self.track {
             SubtitleSource::Embedded { index } => {
@@ -431,24 +459,23 @@ impl Job {
             SubtitleSource::External { path } => path.clone(),
         };
         // Not through a symlink (PX-09 B-1): a file beside the film is
-        // anyone's who can write to the library folder.
+        // anyone's who can write to the library folder. The decoder reads
+        // the file opened here, never a path; it reads up to
+        // `ocr::MAX_SUP_BYTES` (PX-09 B-3).
         let file = crate::files::open_regular(&sup)
             .await
-            .map_err(|e| e.to_string())?;
-        // Read to a cap (PX-09 B-3): the file is whatever is beside the
-        // film, or what ffmpeg copied out of it.
-        let limit = spoolframe_media::ocr::MAX_SUP_BYTES;
-        let mut bytes = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(
-            &mut tokio::io::AsyncReadExt::take(file, limit as u64 + 1),
-            &mut bytes,
+            .map_err(|e| e.to_string())?
+            .into_std()
+            .await;
+        decode::run(
+            decoder,
+            decode::Format::Pgs,
+            false,
+            decode::Input::File(file),
+            pictures,
         )
         .await
-        .map_err(|e| e.to_string())?;
-        if bytes.len() > limit {
-            return Err(format!("the PGS track is larger than {limit} bytes"));
-        }
-        pgs::cues(&bytes).map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -546,6 +573,7 @@ mod tests {
                 Ocr::disabled(),
                 Tool::unconfined(slow_ffmpeg(&bin, &marks, secs)),
                 Tool::unconfined("ffprobe"),
+                Tool::unconfined("/nonexistent/spoolframe-server"),
                 &OcrSettings {
                     enabled: false,
                     threads: 1,
@@ -557,6 +585,101 @@ mod tests {
         let film = dir.join("Film.mkv");
         std::fs::write(&film, b"a film").unwrap();
         (tmp, subtitles, film, marks)
+    }
+
+    /// The text of a PGS file beside `film`, read with OCR in English by
+    /// `subtitles`, once it is made or has failed.
+    async fn read_pgs(subtitles: &Arc<Subtitles>, film: &Path) -> TextState {
+        let sup = film.with_file_name("Film.en.sup");
+        std::fs::write(&sup, b"PG").unwrap();
+        let stream = SubtitleStream {
+            source: SubtitleSource::External { path: sup },
+            codec: "hdmv_pgs_subtitle".into(),
+            kind: SubtitleKind::Bitmap,
+            language: Some("eng".into()),
+            title: None,
+            forced: false,
+            default: false,
+            role: SubtitleRole::Full,
+        };
+        let mut state = subtitles
+            .text(TextSource {
+                path: film,
+                stream: &stream,
+                to: SubtitleFormat::Srt,
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(20), state.wait_for(TextState::finished))
+            .await
+            .expect("made or failed in time")
+            .unwrap()
+            .clone()
+    }
+
+    /// Subtitles whose decoder is a stand-in script, `script`, in `dir`;
+    /// tesseract is never reached.
+    fn decoding_with(dir: &Path, script: &str) -> Arc<Subtitles> {
+        let decoder = dir.join("decoder");
+        crate::test_support::write_script(&decoder, script);
+        Arc::new(
+            Subtitles::new(
+                Ocr::new(Tool::unconfined("/nonexistent/tesseract"), ["eng".into()]),
+                Tool::unconfined("/nonexistent/ffmpeg"),
+                Tool::unconfined("/nonexistent/ffprobe"),
+                Tool::unconfined(decoder),
+                &OcrSettings {
+                    enabled: true,
+                    threads: 1,
+                    cache_dir: dir.join("cache"),
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Finding 45: a decoder that panics (a parser bug a crafted file
+    /// found) ends its child, and the track fails with its message; the
+    /// server goes on, and the next request is answered.
+    #[tokio::test]
+    async fn a_decoder_that_panics_fails_the_track_not_the_server() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-subtitles-panic").await;
+        let dir = tmp.as_ref();
+        let subtitles = decoding_with(
+            dir,
+            "#!/bin/sh
+echo \"thread 'main' panicked at crates/x.rs:1:1:\" >&2
+             echo 'index out of bounds' >&2
+exit 101
+",
+        );
+        let film = dir.join("Film.mkv");
+        std::fs::write(&film, b"a film").unwrap();
+        match read_pgs(&subtitles, &film).await {
+            TextState::Failed(reason) => {
+                assert!(reason.contains("index out of bounds"), "{reason}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(subtitles.ocr_counts().failed, 1);
+    }
+
+    /// One killed (past its memory limit, say) fails the same way.
+    #[tokio::test]
+    async fn a_decoder_that_is_killed_fails_the_track() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-subtitles-killed").await;
+        let dir = tmp.as_ref();
+        let subtitles = decoding_with(
+            dir,
+            "#!/bin/sh
+kill -KILL $$
+",
+        );
+        let film = dir.join("Film.mkv");
+        std::fs::write(&film, b"a film").unwrap();
+        match read_pgs(&subtitles, &film).await {
+            TextState::Failed(reason) => assert!(reason.contains("signal 9"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The text of the `n`th subtitle file beside `film`, asked for.

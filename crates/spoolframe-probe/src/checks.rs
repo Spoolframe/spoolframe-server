@@ -15,12 +15,13 @@ use spoolframe_types::{MediaId, MediaKind, Namespace};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, timeout};
 
+use crate::account::{self, AccountState};
 use crate::wire::{Conn, Probe, Problem, describe, hello, hello_for};
 use crate::{Config, Status};
 
 /// How long an open the server gives no credit for is given. Credit comes
 /// in the handshake, so an open either returns at once or never.
-const NO_CREDIT: Duration = Duration::from_secs(1);
+pub(crate) const NO_CREDIT: Duration = Duration::from_secs(1);
 
 /// How long the probe's own closed connections are given to leave the
 /// server's count before the stranger-cap check counts.
@@ -33,7 +34,7 @@ pub(crate) struct Outcome {
 }
 
 impl Outcome {
-    fn skip(why: &str) -> Self {
+    pub(crate) fn skip(why: &str) -> Self {
         Self {
             status: Status::Skip,
             evidence: vec![why.to_owned()],
@@ -44,13 +45,13 @@ impl Outcome {
 /// Lines of evidence, each one as expected or not: the check passes when
 /// all are.
 #[derive(Default)]
-struct Findings {
+pub(crate) struct Findings {
     lines: Vec<String>,
     failed: bool,
 }
 
 impl Findings {
-    fn expect(&mut self, ok: bool, line: String) {
+    pub(crate) fn expect(&mut self, ok: bool, line: String) {
         self.failed |= !ok;
         self.lines.push(if ok {
             line
@@ -59,20 +60,22 @@ impl Findings {
         });
     }
 
-    fn note(&mut self, line: String) {
+    pub(crate) fn note(&mut self, line: String) {
         self.lines.push(line);
     }
 
-    /// `request` on `conn` is answered with an error `matches` accepts.
-    async fn expect_error(
+    /// `request` on `conn`, with `session`, is answered with an error
+    /// `matches` accepts.
+    pub(crate) async fn expect_error(
         &mut self,
         probe: &Probe,
         conn: &Connection,
         what: &str,
+        session: Option<&str>,
         request: Request,
         matches: impl Fn(&Error) -> bool,
     ) -> Result<(), Problem> {
-        let response = probe.request(conn, None, request).await?;
+        let response = probe.request(conn, session, request).await?;
         let ok = matches!(&response, Response::Err(e) if matches(e));
         self.expect(ok, format!("{what}: {}", describe(&response)));
         Ok(())
@@ -99,7 +102,7 @@ impl Findings {
         }
     }
 
-    fn done(self) -> Outcome {
+    pub(crate) fn done(self) -> Outcome {
         Outcome {
             status: if self.failed {
                 Status::Fail
@@ -133,11 +136,17 @@ pub enum Check {
     FrameSize,
     FirstFrame,
     SignInLimits,
+    ConsumerAdminRefused,
+    SessionBound,
+    Visibility,
+    RecentSignIn,
+    SignedInStreams,
+    SessionReread,
     StrangerCap,
 }
 
 impl Check {
-    pub const ALL: [Check; 8] = [
+    pub const ALL: [Check; 14] = [
         Check::HelloVersion,
         Check::Unauthenticated,
         Check::UniStream,
@@ -145,6 +154,14 @@ impl Check {
         Check::FrameSize,
         Check::FirstFrame,
         Check::SignInLimits,
+        // As the account (`--username`), one QUIC sign-in for all of them.
+        Check::ConsumerAdminRefused,
+        Check::SessionBound,
+        Check::Visibility,
+        Check::RecentSignIn,
+        Check::SignedInStreams,
+        // Last of them: it signs the QUIC session out.
+        Check::SessionReread,
         // Last: it fills the server's stranger slots, and nothing after it
         // should meet a full server.
         Check::StrangerCap,
@@ -159,6 +176,12 @@ impl Check {
             Check::FrameSize => "frame-size",
             Check::FirstFrame => "first-frame",
             Check::SignInLimits => "sign-in-limits",
+            Check::ConsumerAdminRefused => "consumer-admin-refused",
+            Check::SessionBound => "session-bound",
+            Check::Visibility => "visibility",
+            Check::RecentSignIn => "recent-sign-in",
+            Check::SignedInStreams => "signed-in-streams",
+            Check::SessionReread => "session-reread",
             Check::StrangerCap => "stranger-cap",
         }
     }
@@ -176,11 +199,28 @@ impl Check {
             }
             Check::FirstFrame => "a stream that sends nothing after its kind byte is reset",
             Check::SignInLimits => "wrong passwords for a made-up user reach RateLimited",
+            Check::ConsumerAdminRefused => "a consumer is refused the admin reads, FORBIDDEN",
+            Check::SessionBound => "the session from another endpoint key is Unauthenticated",
+            Check::Visibility => {
+                "what Libraries lists, and an unlisted library or item is NotFound"
+            }
+            Check::RecentSignIn => "a fresh session passes the recent sign-in check",
+            Check::SignedInStreams => {
+                "a signed-in connection gets more streams than a stranger's limit"
+            }
+            Check::SessionReread => {
+                "the session works till Logout, which closes SIGNED_OUT and ends it"
+            }
             Check::StrangerCap => "the stranger connection past the cap is closed BUSY",
         }
     }
 
-    pub(crate) async fn run(self, probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
+    pub(crate) async fn run(
+        self,
+        probe: &Probe,
+        config: &Config,
+        state: &AccountState,
+    ) -> Result<Outcome, Problem> {
         match self {
             Check::HelloVersion => hello_version(probe).await,
             Check::Unauthenticated => unauthenticated(probe).await,
@@ -196,6 +236,14 @@ impl Check {
             Check::StrangerCap => Ok(Outcome::skip(
                 "not asked for: pass --check-cap (opens cap+1 connections)",
             )),
+            Check::ConsumerAdminRefused => {
+                account::consumer_admin_refused(probe, config, state).await
+            }
+            Check::SessionBound => account::session_bound(probe, config, state).await,
+            Check::Visibility => account::visibility(probe, config, state).await,
+            Check::RecentSignIn => account::recent_sign_in(probe, config, state).await,
+            Check::SignedInStreams => account::signed_in_streams(probe, config, state).await,
+            Check::SessionReread => account::session_reread(probe, config, state).await,
         }
     }
 }
@@ -210,6 +258,7 @@ async fn hello_version(probe: &Probe) -> Result<Outcome, Problem> {
         probe,
         &conn,
         &format!("Hello with protocol_version {wrong} (the server's is {PROTOCOL_VERSION})"),
+        None,
         hello_for(wrong, None),
         |e| matches!(e, Error::Unsupported { .. }),
     )
@@ -218,6 +267,7 @@ async fn hello_version(probe: &Probe) -> Result<Outcome, Problem> {
         probe,
         &conn,
         "Ping after the refused Hello",
+        None,
         Request::Ping,
         |e| *e == Error::HandshakeRequired,
     )
@@ -252,9 +302,14 @@ async fn unauthenticated(probe: &Probe) -> Result<Outcome, Problem> {
         ("ServerAddresses", Request::ServerAddresses),
     ];
     for (what, request) in sample {
-        f.expect_error(probe, &conn, &format!("{what}, no session"), request, |e| {
-            *e == Error::Unauthenticated
-        })
+        f.expect_error(
+            probe,
+            &conn,
+            &format!("{what}, no session"),
+            None,
+            request,
+            |e| *e == Error::Unauthenticated,
+        )
         .await?;
     }
     f.still_usable(probe, &conn, "the refused requests").await?;

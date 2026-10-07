@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::bitmap::{Cue, Image, MAX_SIDE, push};
+use crate::bitmap::{Budget, Cue, Image, Kept, MAX_SIDE, OverBudget};
 
 const PCS: u8 = 0x16;
 const WDS: u8 = 0x17;
@@ -29,6 +29,8 @@ pub enum PgsError {
     Short(&'static str),
     #[error("a {width} × {height} picture is larger than {MAX_SIDE} × {MAX_SIDE}")]
     TooLarge { width: usize, height: usize },
+    #[error(transparent)]
+    Budget(#[from] OverBudget),
 }
 
 /// What one PCS asks to show.
@@ -56,15 +58,23 @@ struct Object {
 /// A palette entry as grey on black: how bright the pixel shows.
 type Palette = [u8; 256];
 
-/// The cues of a `.sup` stream, in order.
+/// The cues of a `.sup` stream, in order, within [`Budget::DEFAULT`].
 pub fn cues(stream: &[u8]) -> Result<Vec<Cue>, PgsError> {
+    cues_within(stream, &Budget::DEFAULT)
+}
+
+/// The cues of a `.sup` stream, in order. A stream that decodes to more
+/// than `budget` is an error.
+pub fn cues_within(stream: &[u8], budget: &Budget) -> Result<Vec<Cue>, PgsError> {
     let mut palettes: HashMap<u8, Palette> = HashMap::new();
     let mut objects: HashMap<u16, Object> = HashMap::new();
+    // The pixels of `objects`, added up.
+    let mut held = 0;
     // An object arrives in fragments: its size, then RLE data.
     let mut partial: HashMap<u16, (usize, usize, Vec<u8>)> = HashMap::new();
     let mut shown: Option<(u64, Image)> = None;
     let mut pending: Option<Composition> = None;
-    let mut out: Vec<Cue> = Vec::new();
+    let mut out = Kept::new(budget);
 
     let mut at = 0;
     while at < stream.len() {
@@ -91,6 +101,7 @@ pub fn cues(stream: &[u8]) -> Result<Vec<Cue>, PgsError> {
                     palettes.clear();
                     objects.clear();
                     partial.clear();
+                    held = 0;
                 }
                 pending = Some(composition);
             }
@@ -134,6 +145,10 @@ pub fn cues(stream: &[u8]) -> Result<Vec<Cue>, PgsError> {
                 if sequence & 0x40 != 0
                     && let Some((width, height, rle)) = partial.remove(&id)
                 {
+                    // Counted before it is decoded; one it replaces is
+                    // let go.
+                    let replaced = objects.get(&id).map_or(0, |o| o.indices.len() as u64);
+                    held = budget.hold(held - replaced, (width * height) as u64)?;
                     objects.insert(
                         id,
                         Object {
@@ -150,13 +165,13 @@ pub fn cues(stream: &[u8]) -> Result<Vec<Cue>, PgsError> {
                 };
                 // Whatever was shown ends here.
                 if let Some((start_ms, image)) = shown.take() {
-                    push(&mut out, start_ms, composition.pts_ms, image);
+                    out.push(start_ms, composition.pts_ms, image)?;
                 }
                 let palette = palettes
                     .get(&composition.palette)
                     .copied()
                     .unwrap_or([0; 256]);
-                shown = render(&composition, &objects, &palette)?
+                shown = render(&composition, &objects, &palette, &out)?
                     .map(|image| (composition.pts_ms, image));
             }
             WDS => {}
@@ -165,7 +180,7 @@ pub fn cues(stream: &[u8]) -> Result<Vec<Cue>, PgsError> {
     }
     // A stream that ends while a cue shows: it is dropped, with no end
     // time to give it.
-    Ok(out)
+    Ok(out.into_cues())
 }
 
 fn composition(body: &[u8], pts_ms: u64) -> Result<Composition, PgsError> {
@@ -203,8 +218,13 @@ fn composition(body: &[u8], pts_ms: u64) -> Result<Composition, PgsError> {
 /// PGS run-length coding, line by line. A non-zero byte is one pixel of
 /// that colour; a zero byte starts a run, whose next byte says how long and
 /// of which colour, or ends the line.
+///
+/// It never holds more than `width` × `height` pixels (finding 45): runs
+/// on a line that does not end would otherwise grow without bound, a
+/// 16,383-pixel run per 3 bytes. What is past the size is cut anyway.
 fn decode_rle(data: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let mut pixels = Vec::with_capacity(width * height);
+    let size = width * height;
+    let mut pixels = Vec::with_capacity(size);
     let mut line = 0;
     let mut i = 0;
     let byte = |i: usize| data.get(i).copied().unwrap_or(0);
@@ -212,7 +232,9 @@ fn decode_rle(data: &[u8], width: usize, height: usize) -> Vec<u8> {
         let b = byte(i);
         i += 1;
         if b != 0 {
-            pixels.push(b);
+            if pixels.len() < size {
+                pixels.push(b);
+            }
             continue;
         }
         let flags = byte(i);
@@ -236,33 +258,39 @@ fn decode_rle(data: &[u8], width: usize, height: usize) -> Vec<u8> {
         } else {
             0
         };
-        pixels.extend(std::iter::repeat_n(colour, run));
+        pixels.extend(std::iter::repeat_n(colour, run.min(size - pixels.len())));
     }
-    pixels.resize(width * height, 0);
+    pixels.resize(size, 0);
     pixels
 }
 
 /// The composition's objects drawn where they sit, cut to the box around
 /// them, as dark text on white with a margin (tesseract reads text that
 /// touches the edge badly). `None` if nothing shows; an error if the box
-/// is larger than [`MAX_SIDE`] a side.
+/// is larger than [`MAX_SIDE`] a side, or if `kept` has no room for it.
 fn render(
     composition: &Composition,
     objects: &HashMap<u16, Object>,
     palette: &Palette,
+    kept: &Kept,
 ) -> Result<Option<Image>, PgsError> {
     const MARGIN: usize = 16;
-    let placed: Vec<(&Placed, Object)> = composition
+    // Each object as it shows: drawn from where it is held, never copied,
+    // as a composition may place one object 255 times.
+    let placed: Vec<(&Placed, &Object, Visible)> = composition
         .objects
         .iter()
-        .filter_map(|p| Some((p, cropped(objects.get(&p.object)?, p.crop))))
-        .filter(|(_, o)| o.width > 0 && o.height > 0)
+        .filter_map(|p| {
+            let object = objects.get(&p.object)?;
+            Some((p, object, visible(object, p.crop)))
+        })
+        .filter(|(_, _, v)| v.width > 0 && v.height > 0)
         .collect();
     let (Some(left), Some(top), Some(right), Some(bottom)) = (
-        placed.iter().map(|(p, _)| p.x).min(),
-        placed.iter().map(|(p, _)| p.y).min(),
-        placed.iter().map(|(p, o)| p.x + o.width).max(),
-        placed.iter().map(|(p, o)| p.y + o.height).max(),
+        placed.iter().map(|(p, ..)| p.x).min(),
+        placed.iter().map(|(p, ..)| p.y).min(),
+        placed.iter().map(|(p, _, v)| p.x + v.width).max(),
+        placed.iter().map(|(p, _, v)| p.y + v.height).max(),
     ) else {
         return Ok(None);
     };
@@ -270,12 +298,15 @@ fn render(
     if width > MAX_SIDE || height > MAX_SIDE {
         return Err(PgsError::TooLarge { width, height });
     }
-    let mut image = Image::blank(right - left + 2 * MARGIN, bottom - top + 2 * MARGIN, 255);
+    let (width, height) = (width + 2 * MARGIN, height + 2 * MARGIN);
+    kept.afford(width, height)?;
+    let mut image = Image::blank(width, height, 255);
     let mut ink = false;
-    for (p, object) in &placed {
-        for row in 0..object.height {
-            for col in 0..object.width {
-                let light = palette[usize::from(object.indices[row * object.width + col])];
+    for (p, object, v) in &placed {
+        for row in 0..v.height {
+            for col in 0..v.width {
+                let index = object.indices[(v.y + row) * object.width + v.x + col];
+                let light = palette[usize::from(index)];
                 if light == 0 {
                     continue;
                 }
@@ -358,6 +389,37 @@ pub mod fixture {
         out
     }
 
+    /// A decompression bomb (finding 45): one `side` × `side` object
+    /// whose run-length data is one pixel (the rest of each line is
+    /// padding), then shown `times` times, a second apart. Each cue after
+    /// the first is 82 bytes of stream; at a side of 4096, a 4128 × 4128
+    /// picture (the object and its margin), about 17 million pixels.
+    pub fn bomb(times: u16, side: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        for n in 0..times {
+            let ms = u64::from(n) * 2_000;
+            // The first starts an epoch, and sends the palette and object.
+            let number = n.wrapping_mul(2);
+            let mut pcs = composition(number, if n == 0 { 0x80 } else { 0 });
+            pcs[10] = 1;
+            pcs.extend([0, 0, 0, 0, 0, 0, 0, 0]);
+            segment(&mut out, ms, PCS, &pcs);
+            if n == 0 {
+                segment(&mut out, ms, PDS, &[0, 0, 1, 235, 128, 128, 255]);
+                let mut ods = vec![0, 0, 0, 0xc0];
+                ods.extend(&5u32.to_be_bytes()[1..]);
+                ods.extend(side.to_be_bytes());
+                ods.extend(side.to_be_bytes());
+                ods.push(1);
+                segment(&mut out, ms, ODS, &ods);
+            }
+            segment(&mut out, ms, END, &[]);
+            segment(&mut out, ms + 1_000, PCS, &composition(number + 1, 0));
+            segment(&mut out, ms + 1_000, END, &[]);
+        }
+        out
+    }
+
     pub(super) fn composition(number: u16, state: u8) -> Vec<u8> {
         let mut pcs = Vec::new();
         pcs.extend(1920u16.to_be_bytes());
@@ -411,29 +473,41 @@ pub mod fixture {
     }
 }
 
-fn cropped(object: &Object, crop: Option<(usize, usize, usize, usize)>) -> Object {
+/// The part of an object a composition shows: all of it, or its crop.
+#[derive(Debug, PartialEq, Eq)]
+struct Visible {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+fn visible(object: &Object, crop: Option<(usize, usize, usize, usize)>) -> Visible {
     let Some((x, y, w, h)) = crop else {
-        return object.clone();
+        return Visible {
+            x: 0,
+            y: 0,
+            width: object.width,
+            height: object.height,
+        };
     };
     let w = w.min(object.width.saturating_sub(x));
     let h = h.min(object.height.saturating_sub(y));
     // A crop that starts outside the object shows none of it; its first
     // row would start past the end of the pixels.
     if w == 0 || h == 0 {
-        return Object {
+        return Visible {
+            x: 0,
+            y: 0,
             width: 0,
             height: 0,
-            indices: Vec::new(),
         };
     }
-    let mut indices = Vec::with_capacity(w * h);
-    for row in y..y + h {
-        indices.extend_from_slice(&object.indices[row * object.width + x..][..w]);
-    }
-    Object {
+    Visible {
+        x,
+        y,
         width: w,
         height: h,
-        indices,
     }
 }
 
@@ -520,6 +594,89 @@ mod tests {
     fn objects_placed_further_apart_than_4096_are_an_error() {
         assert_eq!(cues(&placed(8, 1, &[0, 3_000])).unwrap().len(), 1);
         assert!(cues(&placed(8, 1, &[0, 60_000])).is_err());
+    }
+
+    /// A bomb cue's picture: the 4096 × 4096 object and its margin.
+    const BOMB_PICTURE: u64 = 4128 * 4128;
+
+    /// Finding 45: under a kilobyte of stream is eight full 4096 × 4096
+    /// pictures. Past its budget the track is refused, not decoded on.
+    #[test]
+    fn a_track_past_its_budget_of_pixels_is_refused() {
+        let bomb = fixture::bomb(8, 4096);
+        assert!(bomb.len() < 1024, "{} bytes", bomb.len());
+        let budget = Budget {
+            cues: 1_000,
+            pixels: 3 * BOMB_PICTURE,
+            held: 64 << 20,
+        };
+        match cues_within(&bomb, &budget) {
+            Err(e) => assert_eq!(e, PgsError::Budget(OverBudget::Pixels(budget.pixels))),
+            Ok(cues) => panic!(
+                "{} bytes decoded to {} cues of {} pixels",
+                bomb.len(),
+                cues.len(),
+                cues.iter().map(|c| c.image.pixels.len()).sum::<usize>()
+            ),
+        }
+    }
+
+    /// Small pictures, but more of them than the budget keeps.
+    #[test]
+    fn a_track_past_its_budget_of_cues_is_refused() {
+        let cues: Vec<Shown> = (0..5)
+            .map(|n| shown(n * 2_000, n * 2_000 + 1_000, 900, 30, 10))
+            .collect();
+        let sup = fixture::sup(&cues, 65_000);
+        let budget = Budget {
+            cues: 4,
+            ..Budget::DEFAULT
+        };
+        assert_eq!(
+            cues_within(&sup, &budget).map(|c| c.len()),
+            Err(PgsError::Budget(OverBudget::Cues(4)))
+        );
+        assert_eq!(cues_within(&sup, &Budget::DEFAULT).map(|c| c.len()), Ok(5));
+    }
+
+    /// Objects stay until the next epoch: many full-size ones under
+    /// different ids, sent before any is shown, are refused as they come,
+    /// before each is decoded.
+    #[test]
+    fn objects_held_past_the_budget_are_refused() {
+        let mut sup = Vec::new();
+        let mut pcs = fixture::composition(0, 0x80);
+        pcs[10] = 1;
+        pcs.extend([0, 0, 0, 0, 0, 0, 0, 0]);
+        fixture::segment(&mut sup, 0, PCS, &pcs);
+        for id in 0..64u16 {
+            let mut ods = id.to_be_bytes().to_vec();
+            ods.extend([0, 0xc0]);
+            ods.extend(&5u32.to_be_bytes()[1..]);
+            ods.extend(4096u16.to_be_bytes());
+            ods.extend(4096u16.to_be_bytes());
+            ods.push(1);
+            fixture::segment(&mut sup, 0, ODS, &ods);
+        }
+        fixture::segment(&mut sup, 0, END, &[]);
+        let held = 3 * 4096 * 4096;
+        let budget = Budget {
+            held,
+            ..Budget::DEFAULT
+        };
+        assert_eq!(
+            cues_within(&sup, &budget).map(|c| c.len()),
+            Err(PgsError::Budget(OverBudget::Held(held)))
+        );
+    }
+
+    /// Runs on a line that never ends are not kept past the object's size:
+    /// here 1,000 runs of 16,383 pixels, 4 bytes each, on a 1 × 1 object.
+    #[test]
+    fn runs_past_the_object_s_size_are_not_held() {
+        let pixels = decode_rle(&[0, 0xff, 0xff, 1].repeat(1_000), 1, 1);
+        assert_eq!(pixels, [1]);
+        assert_eq!(pixels.capacity(), 1);
     }
 
     #[test]
@@ -649,12 +806,18 @@ mod tests {
             indices: vec![1; 8],
         };
         for crop in [(4, 0, 2, 2), (9, 0, 2, 2), (0, 2, 2, 2), (0, 7, 2, 2)] {
-            let shown = cropped(&object, Some(crop));
+            let shown = visible(&object, Some(crop));
             assert_eq!(shown.width * shown.height, 0, "{crop:?}");
-            assert!(shown.indices.is_empty(), "{crop:?}");
         }
         // Inside, as before.
-        let shown = cropped(&object, Some((3, 1, 5, 5)));
-        assert_eq!((shown.width, shown.height, shown.indices), (1, 1, vec![1]));
+        assert_eq!(
+            visible(&object, Some((3, 1, 5, 5))),
+            Visible {
+                x: 3,
+                y: 1,
+                width: 1,
+                height: 1
+            }
+        );
     }
 }

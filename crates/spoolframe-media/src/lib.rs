@@ -7,6 +7,7 @@
 
 pub mod bitmap;
 pub mod codecs;
+pub mod decode;
 mod descriptor;
 pub mod dvb;
 pub mod encoders;

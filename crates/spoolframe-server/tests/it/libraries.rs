@@ -1074,7 +1074,7 @@ async fn a_library_about_to_be_added_has_its_paths_checked_first() {
     };
     // Documentaries (4) is not a library yet.
     let checked = root
-        .plex_path_check(vec![mapping.clone()], None, Some(vec!["4".into()]))
+        .plex_path_try(vec![mapping.clone()], None, Some(vec!["4".into()]))
         .await
         .unwrap();
     let found: Vec<_> = checked
@@ -1083,10 +1083,7 @@ async fn a_library_about_to_be_added_has_its_paths_checked_first() {
         .collect();
     assert_eq!(found, [("Documentaries", 1, 1)]);
     // Without sections: the libraries served.
-    let served = root
-        .plex_path_check(vec![mapping], None, None)
-        .await
-        .unwrap();
+    let served = root.plex_path_try(vec![mapping], None, None).await.unwrap();
     assert_eq!(served[0].library, "Movies");
 }
 

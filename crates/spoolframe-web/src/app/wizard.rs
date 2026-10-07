@@ -231,8 +231,9 @@ pub(super) fn Note(
 ) -> Element {
     let key = setting;
     let mut restarting = use_signal(|| None::<String>);
-    // An `admin.*` or `auth.*` setting, from an old session: "Confirm
-    // it's you" first, then the same change again.
+    // A sensitive setting (`admin.*`, `auth.*`, `media.*`, `plex.token`),
+    // from an old session: "Confirm it's you" first, then the same change
+    // again.
     let confirming = use_signal(|| None::<String>);
     let use_file = use_callback(move |()| {
         spawn(async move {
@@ -454,9 +455,13 @@ pub(super) enum Account {
 /// approved, expires or fails; `on_linked` runs once it is approved. With
 /// `keep_token` the server keeps the account's token as the first
 /// server's (the Plex step); without, only to add servers with (P3-18).
+/// Keeping it needs a recent sign-in (finding 44): from an old session,
+/// `confirming` opens "Confirm it's you" and the PIN waits, still
+/// approved, for [`follow_plex_pin`] to take up again.
 pub(super) fn sign_in_with_plex(
     mut account: Signal<Account>,
     keep_token: bool,
+    confirming: Option<Signal<Option<String>>>,
     on_linked: impl FnOnce() + 'static,
 ) {
     // Opened now, from the click: a tab opened after an answer from the
@@ -482,13 +487,28 @@ pub(super) fn sign_in_with_plex(
         let opened = tab
             .as_ref()
             .is_some_and(|t| t.location().set_href(&pin.auth_url).is_ok());
-        let id = pin.id;
         account.set(Account::Waiting {
-            id,
+            id: pin.id,
             auth_url: pin.auth_url,
             expires_at: pin.expires_in.map(|s| now() + s as i64),
             opened,
         });
+        follow_plex_pin(account, keep_token, confirming, on_linked);
+    });
+}
+
+/// Follow the PIN `account` is waiting on, as [`sign_in_with_plex`] does,
+/// until it is approved, expires or fails; nothing if it waits on none.
+pub(super) fn follow_plex_pin(
+    mut account: Signal<Account>,
+    keep_token: bool,
+    confirming: Option<Signal<Option<String>>>,
+    on_linked: impl FnOnce() + 'static,
+) {
+    let Account::Waiting { id, .. } = *account.peek() else {
+        return;
+    };
+    spawn(async move {
         loop {
             sleep(2000).await;
             if !matches!(&*account.peek(), Account::Waiting { id: waiting, .. } if *waiting == id) {
@@ -510,6 +530,14 @@ pub(super) fn sign_in_with_plex(
                 }
                 Ok(PlexPinState::Expired) => {
                     account.set(Account::Expired);
+                    return;
+                }
+                // Still waiting, until "Confirm it's you" takes it up.
+                Err(e)
+                    if confirming.is_some_and(|c| {
+                        asks_to_confirm(&e, c, "keeping your Plex account's token")
+                    }) =>
+                {
                     return;
                 }
                 Err(e) => {
@@ -661,13 +689,19 @@ fn PlexFields(
         }
     });
 
-    let sign_in = move |_| {
-        sign_in_with_plex(account, true, move || {
-            signed_in += 1;
-            reprobe();
-        });
+    // Each way to `plex.token` needs a recent sign-in (finding 44): from
+    // an old session, "Confirm it's you", then the same again.
+    let confirming = use_signal(|| None::<String>);
+    let mut again = use_signal(|| None::<Again>);
+    let on_linked = move || {
+        signed_in += 1;
+        reprobe();
     };
-    let check_token = move |_| {
+    let sign_in = move |_| {
+        again.set(Some(Again::SignIn));
+        sign_in_with_plex(account, true, Some(confirming), on_linked);
+    };
+    let check_token = use_callback(move |()| {
         let url = if typing() { typed_url() } else { chosen() };
         let token = pasted().trim().to_owned();
         if token.is_empty() {
@@ -689,6 +723,9 @@ fn PlexFields(
                             account.set(Account::Linked(None));
                             probed.set(Some(Ok(status)));
                         }
+                        Err(e) if asks_to_confirm(&e, confirming, "keeping a Plex token") => {
+                            again.set(Some(Again::Paste));
+                        }
                         Err(e) => paste_error.set(Some(e.explain())),
                     }
                 }
@@ -696,9 +733,9 @@ fn PlexFields(
                 Err(e) => paste_error.set(Some(e.explain())),
             }
         });
-    };
+    });
     let s = settings.clone();
-    let on_save = move |_| {
+    let on_save = use_callback(move |()| {
         let s = s.clone();
         let url = if typing() { typed_url() } else { chosen() };
         // One of the account's: the token plex.tv gives the account for
@@ -731,10 +768,20 @@ fn PlexFields(
             };
             match saved {
                 Ok(()) => on_done.call(()),
+                // `plex.url` too says where the kept token goes (finding 47).
+                Err(e) if asks_to_confirm(&e, confirming, "saving the Plex server") => {
+                    again.set(Some(Again::Save));
+                }
                 Err(e) => error.set(Some(e.explain())),
             }
             busy.set(false);
         });
+    });
+    let on_confirmed = move |()| match again.take() {
+        Some(Again::SignIn) => follow_plex_pin(account, true, Some(confirming), on_linked),
+        Some(Again::Paste) => check_token.call(()),
+        Some(Again::Save) => on_save.call(()),
+        None => {}
     };
 
     let reachable = probed()
@@ -908,7 +955,7 @@ fn PlexFields(
                         if matches!(account(), Account::Linked(None)) {
                             span { class: "state state-ok flex items-center gap-1.5", icons::CircleCheck {} "Token kept" }
                         }
-                        button { class: "btn btn-teal h-9", disabled: pasted().trim().is_empty(), onclick: check_token, "Check token" }
+                        button { class: "btn btn-teal h-9", disabled: pasted().trim().is_empty(), onclick: move |_| check_token.call(()), "Check token" }
                     }
                 }
             }
@@ -970,7 +1017,19 @@ fn PlexFields(
             Alert { text }
         }
         Footer { mode, step: "plex", busy: busy(), on_save, on_discard: move |_| on_reload.call(()), blocked }
+        ConfirmItsYou { asking: confirming, on_confirmed }
     }
+}
+
+/// What the Plex step makes again once "Confirm it's you" is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Again {
+    /// Take up the PIN signed in with, whose token is to be kept.
+    SignIn,
+    /// Keep the token pasted.
+    Paste,
+    /// Save, keeping the chosen server's token from the account.
+    Save,
 }
 
 /// Make the first Plex server's libraries the sections `chosen`: those
@@ -1180,7 +1239,7 @@ fn saved_mappings(settings: &Settings) -> Vec<PathMappingEntry> {
 async fn check_paths(mappings: Vec<PathMappingEntry>) -> Result<Vec<LibraryPathCheck>, ApiError> {
     let client = rpc::client().await?;
     client
-        .plex_path_check(mappings, None, None)
+        .plex_path_try(mappings, None, None)
         .await
         .map_err(rpc::error)
 }

@@ -227,7 +227,7 @@ async fn a_user_links_their_plex_account_and_unlinks_it_and_the_token_is_never_h
     assert!(!dir.as_ref().join("runtime.ucl").exists());
 
     // The admin sees who is linked to which account.
-    let overview = root.plex_sync().await.unwrap();
+    let overview = root.plex_sync_overview().await.unwrap();
     let shown = serde_json::to_string(&overview).unwrap();
     assert!(!shown.contains("tok-alice-account"), "{shown}");
     let by_name = |name: &str| {
@@ -259,7 +259,7 @@ async fn a_pin_is_checked_only_by_whoever_began_it() {
         code(root.plex_link_check(pin.id).await.unwrap_err()),
         error_code::INVALID_INPUT
     );
-    assert_eq!(root.plex_sync().await.unwrap().users[0].link, None);
+    assert_eq!(root.plex_sync_overview().await.unwrap().users[0].link, None);
 }
 
 #[tokio::test]
@@ -309,7 +309,7 @@ async fn the_config_s_watch_sync_user_is_linked_as_the_owner() {
     // The owner is found as the server starts, as `watch_sync` always was.
     let again = serve_in(dir.as_ref(), file, Wizard::default()).await;
     let root = signed_in(again, "root", "correct horse").await;
-    let owner = root.plex_sync().await.unwrap();
+    let owner = root.plex_sync_overview().await.unwrap();
     let root_link = owner
         .users
         .iter()

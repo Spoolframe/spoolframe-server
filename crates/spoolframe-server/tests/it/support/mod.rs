@@ -103,6 +103,12 @@ pub fn tool(program: &Path, sandbox: &Sandbox) -> Tool {
     }
 }
 
+/// The server's own binary as its subtitle decoder (finding 45), confined
+/// in `sandbox` as the server confines it.
+pub fn decoder(sandbox: &Sandbox) -> Tool {
+    Tool::new(env!("CARGO_BIN_EXE_spoolframe-server"), sandbox.clone())
+}
+
 /// A search of everything for `query`, up to 10 per group.
 pub fn search(query: &str) -> spoolframe_protocol::SearchRequest {
     spoolframe_protocol::SearchRequest {
@@ -168,6 +174,107 @@ impl std::io::Write for Warnings {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// One event the server logged, with its fields as text (`message` among
+/// them), or one span it opened.
+#[derive(Debug, Clone)]
+pub struct Logged {
+    pub level: tracing::Level,
+    pub target: String,
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+impl Logged {
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+}
+
+/// Everything the server logs at every level, events and spans, field by
+/// field, for as long as the guard is held. Captured on this thread only,
+/// as [`Warnings`] is.
+#[derive(Clone, Default)]
+pub struct LogCapture(Arc<Mutex<Vec<Logged>>>);
+
+/// The target of the refused-request log (finding 46).
+pub const REFUSED: &str = "spoolframe::refused";
+
+impl LogCapture {
+    pub fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let capture = Self::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        (capture, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// Every line of the refused-request log so far.
+    pub fn refused(&self) -> Vec<Logged> {
+        self.0
+            .lock()
+            .iter()
+            .filter(|line| line.target == REFUSED)
+            .cloned()
+            .collect()
+    }
+
+    /// What was captured, as text: what a secret must never be in. That
+    /// is every line at DEBUG and above (`-v`), and the server's own at
+    /// every level. Libraries' TRACE (`-vv`) is left out: jsonrpsee's
+    /// prints whole requests, headers and parameters included.
+    pub fn text(&self) -> String {
+        let logged = self.0.lock();
+        let lines: Vec<&Logged> = logged
+            .iter()
+            .filter(|line| {
+                line.level <= tracing::Level::DEBUG || line.target.starts_with("spoolframe")
+            })
+            .collect();
+        format!("{lines:?}")
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().clear();
+    }
+}
+
+struct Fields<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let mut fields = std::collections::BTreeMap::new();
+        event.record(&mut Fields(&mut fields));
+        self.0.lock().push(Logged {
+            level: *event.metadata().level(),
+            target: event.metadata().target().to_owned(),
+            fields,
+        });
+    }
+
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _: &tracing::span::Id,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = std::collections::BTreeMap::new();
+        attrs.record(&mut Fields(&mut fields));
+        self.0.lock().push(Logged {
+            level: *attrs.metadata().level(),
+            target: attrs.metadata().target().to_owned(),
+            fields,
+        });
     }
 }
 
@@ -416,6 +523,7 @@ impl TestServer {
             ocr,
             tool(Path::new("ffmpeg"), &sandbox),
             ffprobe,
+            decoder(&sandbox),
             &OcrSettings {
                 enabled: true,
                 threads: 2,
@@ -893,6 +1001,35 @@ impl TestServer {
             .connect(self.server.addr(), CLIENT_ALPN)
             .await
             .unwrap();
+        TestClient {
+            endpoint,
+            conn,
+            instance: Arc::default(),
+            controls: Arc::default(),
+        }
+    }
+
+    /// A client whose only way to the server is loopback: its one socket is
+    /// bound to `127.0.0.1` and it dials the server's IPv4 port there, so
+    /// the server sees it at `127.0.0.1` whatever other paths this host has.
+    pub async fn loopback_client(&self) -> TestClient {
+        let server = self.server.addr();
+        let port = server
+            .ip_addrs()
+            .find(|addr| addr.is_ipv4())
+            .expect("the server has an IPv4 address")
+            .port();
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let loopback = iroh::EndpointAddr::new(server.id)
+            .with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        let conn = endpoint.connect(loopback, CLIENT_ALPN).await.unwrap();
         TestClient {
             endpoint,
             conn,

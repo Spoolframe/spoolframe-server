@@ -208,6 +208,58 @@ async fn garbage_output_is_an_error_not_an_empty_descriptor() {
     assert!(matches!(err, ProbeError::Unreadable { .. }), "{err}");
 }
 
+/// The MP4 fixture with the format's `field` (a time in seconds) set to
+/// `seconds`.
+fn mp4_with_format_time(dir: &Path, field: &str, seconds: &str) -> PathBuf {
+    let json = std::fs::read_to_string(fixture("mp4-h264-aac")).unwrap();
+    // The streams have the same start_time and duration; the format's are
+    // the ones at its indent, before its size.
+    let (old, new) = match field {
+        "start_time" => (
+            "\n        \"start_time\": \"0.000000\",\n        \"duration\"".to_owned(),
+            format!("\n        \"start_time\": \"{seconds}\",\n        \"duration\""),
+        ),
+        "duration" => (
+            "\"duration\": \"6638.677167\",\n        \"size\"".to_owned(),
+            format!("\"duration\": \"{seconds}\",\n        \"size\""),
+        ),
+        _ => unreachable!("not a format time: {field}"),
+    };
+    assert!(json.contains(&old), "the fixture's {field} moved");
+    let out = bin(dir).join("probe.json");
+    std::fs::write(&out, json.replacen(&old, &new, 1)).unwrap();
+    fake_ffprobe(dir, &format!("cat '{}'", out.display()))
+}
+
+// PX-10's ffprobe_json fuzzing: a time past `Duration`'s range made the
+// parse panic (`Duration::from_secs_f64`) instead of failing.
+#[tokio::test]
+async fn a_duration_too_long_for_a_duration_is_an_error_not_a_panic() {
+    let (_tmp, dir) = scratch("huge-duration").await;
+    let movie = media(&dir);
+    let ffprobe = mp4_with_format_time(&dir, "duration", "88888888888888888000");
+    let err = prober(ffprobe).describe(&movie).await.unwrap_err();
+    assert!(matches!(err, ProbeError::Unreadable { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn a_start_time_too_late_for_a_duration_is_an_error_not_a_panic() {
+    let (_tmp, dir) = scratch("huge-start").await;
+    let movie = media(&dir);
+    let ffprobe = mp4_with_format_time(&dir, "start_time", "88888888888888888888");
+    let err = prober(ffprobe).describe(&movie).await.unwrap_err();
+    assert!(matches!(err, ProbeError::Unreadable { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn an_infinite_duration_is_an_error_not_a_panic() {
+    let (_tmp, dir) = scratch("infinite-duration").await;
+    let movie = media(&dir);
+    let ffprobe = mp4_with_format_time(&dir, "duration", "inf");
+    let err = prober(ffprobe).describe(&movie).await.unwrap_err();
+    assert!(matches!(err, ProbeError::Unreadable { .. }), "{err}");
+}
+
 #[tokio::test]
 async fn a_file_with_no_audio_or_video_is_an_error() {
     let (_tmp, dir) = scratch("no-media").await;

@@ -12,12 +12,14 @@
 //!
 //! [`Track`]: crate::bitmap::Track
 
-use crate::bitmap::{self, Colour, Cue, Packet, push};
+use crate::bitmap::{self, Budget, Colour, Cue, Kept, OverBudget, Packet};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum VobSubError {
     #[error("the VobSub header has no palette")]
     NoPalette,
+    #[error(transparent)]
+    Budget(#[from] OverBudget),
 }
 
 /// One subtitle unit's control sequences, as read.
@@ -37,10 +39,21 @@ struct Unit {
     fields: [usize; 2],
 }
 
-/// The cues of a track with `header` and `packets`, in order.
+/// The cues of a track with `header` and `packets`, in order, within
+/// [`Budget::DEFAULT`].
 pub fn cues(header: &[u8], packets: &[Packet]) -> Result<Vec<Cue>, VobSubError> {
+    cues_within(header, packets, &Budget::DEFAULT)
+}
+
+/// The cues of a track with `header` and `packets`, in order. A track
+/// that decodes to more than `budget` is an error.
+pub fn cues_within(
+    header: &[u8],
+    packets: &[Packet],
+    budget: &Budget,
+) -> Result<Vec<Cue>, VobSubError> {
     let lumas = palette(header)?;
-    let mut out = Vec::new();
+    let mut out = Kept::new(budget);
     let mut unreadable = 0;
     for (i, packet) in packets.iter().enumerate() {
         let Some(unit) = unit(&packet.data) else {
@@ -72,8 +85,8 @@ pub fn cues(header: &[u8], packets: &[Packet]) -> Result<Vec<Cue>, VobSubError> 
             .into_iter()
             .map(|i| palette[usize::from(i)])
             .collect();
-        if let Some(image) = bitmap::text_picture(unit.width, unit.height, &pixels) {
-            push(&mut out, packet.pts_ms + start, end_ms, image);
+        if let Some(image) = bitmap::text_picture(unit.width, unit.height, &pixels, &out)? {
+            out.push(packet.pts_ms + start, end_ms, image)?;
         }
     }
     if unreadable > 0 {
@@ -82,7 +95,7 @@ pub fn cues(header: &[u8], packets: &[Packet]) -> Result<Vec<Cue>, VobSubError> 
             "VobSub units that could not be read were left out"
         );
     }
-    Ok(out)
+    Ok(out.into_cues())
 }
 
 /// The palette's colours as luma: `palette: rrggbb, rrggbb, …` in the
@@ -235,6 +248,7 @@ impl Nibbles<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitmap::{Budget, OverBudget};
 
     /// The header ffmpeg writes: its default palette, where entry 7 is
     /// white and 0 black.
@@ -423,6 +437,30 @@ mod tests {
         let cues = cues(HEADER, &[packet(0, cut), packet(5_000, whole)]).unwrap();
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].start_ms, 5_000);
+    }
+
+    /// Finding 45 in VobSub: a unit whose every line is one code, "the
+    /// rest of the line in white", is two bytes a line of text.
+    #[test]
+    fn a_track_past_its_budget_of_pixels_is_refused() {
+        let field = line(&[(0, 1)]).repeat(256);
+        let units: Vec<Packet> = (0..8)
+            .map(|n| packet(n * 2_000, unit_of(512, 512, &field, &field, 0, Some(45))))
+            .collect();
+        let picture = 544 * 544;
+        let budget = Budget {
+            pixels: 3 * picture,
+            ..Budget::DEFAULT
+        };
+        match cues_within(HEADER, &units, &budget) {
+            Err(e) => assert_eq!(e, VobSubError::Budget(OverBudget::Pixels(budget.pixels))),
+            Ok(cues) => panic!(
+                "{} bytes decoded to {} cues of {} pixels",
+                units.iter().map(|u| u.data.len()).sum::<usize>(),
+                cues.len(),
+                cues.iter().map(|c| c.image.pixels.len()).sum::<usize>()
+            ),
+        }
     }
 
     #[test]

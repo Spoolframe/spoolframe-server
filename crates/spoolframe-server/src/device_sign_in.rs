@@ -24,6 +24,7 @@ use crate::clock::Clock;
 
 use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::device_sign_in::{ALPHABET, CODE_LEN};
+use spoolframe_protocol::{AddressNetwork, DeviceAddress};
 use spoolframe_types::Platform;
 use tokio::sync::watch;
 
@@ -74,21 +75,43 @@ pub struct Waiting {
 /// the approver shares, which is what device-code phishing looks like:
 /// the code is someone else's, sent to the approver as a link.
 pub fn from_internet(ip: IpAddr) -> bool {
+    network(ip) == AddressNetwork::Internet
+}
+
+/// What kind of network `ip` is on, for an approver (PX-09 finding 27):
+/// the web approval page's `from_internet` and the apps' [`DeviceAddress`]
+/// both come from here. The unspecified address, which no device sends
+/// from, is not called public.
+pub fn network(ip: IpAddr) -> AddressNetwork {
     match ip.to_canonical() {
         IpAddr::V4(v4) => {
             let shared = v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64;
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || shared)
+            if v4.is_loopback() {
+                AddressNetwork::Loopback
+            } else if v4.is_private() || v4.is_link_local() || v4.is_unspecified() || shared {
+                AddressNetwork::Local
+            } else {
+                AddressNetwork::Internet
+            }
         }
         IpAddr::V6(v6) => {
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local())
+            if v6.is_loopback() {
+                AddressNetwork::Loopback
+            } else if v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local() {
+                AddressNetwork::Local
+            } else {
+                AddressNetwork::Internet
+            }
         }
+    }
+}
+
+/// `ip` as an approving app is shown it: an IPv4 address never in its
+/// IPv6-mapped form, as the web page shows it.
+pub fn device_address(ip: IpAddr) -> DeviceAddress {
+    DeviceAddress {
+        address: ip.to_canonical().to_string(),
+        network: network(ip),
     }
 }
 
@@ -651,6 +674,38 @@ mod tests {
             Outcome::Expired
         );
         assert_eq!(sign_ins.lookup(&started.code), None);
+    }
+
+    /// PX-09 finding 27: what an approving app is told. Loopback is told
+    /// apart from a home network; the rest is as the web page judges it.
+    #[test]
+    fn an_address_s_network_is_loopback_local_or_internet() {
+        let at = |text: &str| network(text.parse().unwrap());
+        for this_host in ["127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1"] {
+            assert_eq!(at(this_host), AddressNetwork::Loopback, "{this_host}");
+        }
+        for near in [
+            "10.0.0.5",
+            "172.16.4.2",
+            "192.168.86.20",
+            "169.254.1.1",
+            "100.101.102.103",
+            "fe80::1",
+            "fd7a:115c:a1e0::1",
+            "::ffff:192.168.1.2",
+        ] {
+            assert_eq!(at(near), AddressNetwork::Local, "{near}");
+        }
+        for far in ["203.0.113.9", "8.8.8.8", "2001:db8::1", "2a00:1450::1"] {
+            assert_eq!(at(far), AddressNetwork::Internet, "{far}");
+        }
+        assert_eq!(
+            device_address("::ffff:192.168.1.2".parse().unwrap()),
+            DeviceAddress {
+                address: "192.168.1.2".into(),
+                network: AddressNetwork::Local,
+            }
+        );
     }
 
     /// PX-09 finding 27: what the approval page warns of.

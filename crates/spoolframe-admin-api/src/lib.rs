@@ -2393,9 +2393,10 @@ pub trait AdminApi {
     ) -> jsonrpsee::core::RpcResult<Vec<PlexSyncReport>>;
 
     /// Every user, their Plex link and their last sync run (P3-12): who
-    /// is linked to which Plex account, and how their sync is going.
-    #[method(name = "plexSync", with_extensions)]
-    async fn plex_sync(&self) -> jsonrpsee::core::RpcResult<PlexSyncOverview>;
+    /// is linked to which Plex account, and how their sync is going. It
+    /// syncs nothing: `plexWatchSync` does.
+    #[method(name = "plexSyncOverview", with_extensions)]
+    async fn plex_sync_overview(&self) -> jsonrpsee::core::RpcResult<PlexSyncOverview>;
 
     /// Unlink `username`'s Plex account, as `me.plexUnlink` does. An admin
     /// can unlink, not link.
@@ -2414,9 +2415,10 @@ pub trait AdminApi {
     /// `plexAccountServers`) uses on the server at `url`, one of its
     /// servers: what the setup wizard does when one of them is chosen.
     /// plex.tv hands out a token per server; the account's own is not
-    /// one a server shared with it takes. `NOT_CONFIGURED` without an
-    /// account, `INVALID_INPUT` when it does not reach `url`, and
-    /// `UNAVAILABLE` when plex.tv cannot be reached.
+    /// one a server shared with it takes. Needs a recent sign-in
+    /// (finding 44): `RECENT_SIGN_IN_REQUIRED` otherwise. `NOT_CONFIGURED`
+    /// without an account, `INVALID_INPUT` when it does not reach `url`,
+    /// and `UNAVAILABLE` when plex.tv cannot be reached.
     #[method(name = "plexAccountTokenUse", with_extensions)]
     async fn plex_account_token_use(&self, url: String) -> jsonrpsee::core::RpcResult<()>;
 
@@ -2430,8 +2432,8 @@ pub trait AdminApi {
     /// with the message the file would get. `SETTING_LOCKED` for what the
     /// locked config file sets. A live setting applies at once; a restart
     /// one is saved, and `restartPending`. `plex.token` is kept as a
-    /// secret, never in the runtime settings. An `admin.*` or `auth.*` key
-    /// needs a recent sign-in (PX-10), as
+    /// secret, never in the runtime settings. An `admin.*`, `auth.*` or
+    /// `media.*` key, or `plex.token`, needs a recent sign-in (PX-10), as
     /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "settingSet", with_extensions)]
     async fn setting_set(
@@ -2441,8 +2443,8 @@ pub trait AdminApi {
     ) -> jsonrpsee::core::RpcResult<SettingEntry>;
 
     /// Take `key` out of the runtime settings: the config file's value or
-    /// the default applies again. An `admin.*` or `auth.*` key needs a
-    /// recent sign-in (PX-10), as
+    /// the default applies again. An `admin.*`, `auth.*` or `media.*`
+    /// key, or `plex.token`, needs a recent sign-in (PX-10), as
     /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "settingUnset", with_extensions)]
     async fn setting_unset(&self, key: String) -> jsonrpsee::core::RpcResult<SettingEntry>;
@@ -2494,7 +2496,9 @@ pub trait AdminApi {
     /// token from (P3-18); with `keepToken`, as the setup wizard's Plex
     /// step asks, it also keeps the account's token as `plex.token`, the
     /// first server's. Adding another Plex server leaves that token as it
-    /// is.
+    /// is. With `keepToken`, it needs a recent sign-in (finding 44):
+    /// `RECENT_SIGN_IN_REQUIRED`, before the PIN is looked at, so an
+    /// approved one can be checked again once confirmed.
     #[method(name = "plexPinCheck", with_extensions)]
     async fn plex_pin_check(
         &self,
@@ -2506,9 +2510,11 @@ pub trait AdminApi {
     /// of the saved ones, with a suggested mapping where they fail. Of
     /// Plex server `server` (the first if left out), and of its sections
     /// `sections` (its served ones if left out): a library about to be
-    /// added is checked before it is (P3-11).
-    #[method(name = "plexPathCheck", with_extensions)]
-    async fn plex_path_check(
+    /// added is checked before it is (P3-11). Mappings are tried, not
+    /// saved, and nothing is kept: `plexCheckPaths` checks every file
+    /// under the saved ones.
+    #[method(name = "plexPathTry", with_extensions)]
+    async fn plex_path_try(
         &self,
         mappings: Vec<PathMappingEntry>,
         server: Option<String>,
@@ -2569,15 +2575,6 @@ pub trait AdminApi {
         url: String,
         token: Option<String>,
     ) -> jsonrpsee::core::RpcResult<PlexServerEntry>;
-
-    /// Change where Plex server `id` is reached, or what it is called.
-    #[method(name = "plexServerUpdate", with_extensions)]
-    async fn plex_server_update(
-        &self,
-        id: String,
-        url: Option<String>,
-        name: Option<String>,
-    ) -> jsonrpsee::core::RpcResult<()>;
 
     /// Keep `token` as Plex server `id`'s, as a secret. Needs a recent
     /// sign-in (PX-10), as

@@ -14,6 +14,11 @@ output with `serde_json::from_slice::<FfProbe>`.
   leaves it out for the streams of standalone subtitle files (`.srt`,
   `.vtt`, VobSub `.idx`), so upstream fails to parse those at all.
   `Stream::start_time` treats a missing value as 0.
+- The format's `start_time` and `duration` are read with
+  `Duration::try_from_secs_f64`. Upstream's `from_secs_f64` panics on a
+  value past `u64::MAX` seconds or on `inf`, so such JSON panicked in the
+  parse instead of failing it (PX-10, found by the `ffprobe_json` fuzz
+  target).
 - The `async` feature and `ffprobe_async*` are removed. They ignored
   `Config::ffprobe_bin` (always ran `ffprobe` from `PATH`) and had no
   timeout; Spoolframe runs the process itself.

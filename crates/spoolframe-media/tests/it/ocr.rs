@@ -8,7 +8,7 @@ use std::process::Command;
 
 use spoolframe_media::ocr::{self, Ocr};
 use spoolframe_media::pgs::{self, fixture};
-use spoolframe_media::{dvb, vobsub};
+use spoolframe_media::{decode, dvb, vobsub};
 use spoolframe_types::SubtitleFormat;
 
 use crate::samples;
@@ -87,6 +87,16 @@ fn movie(dir: &Path, cues: &[fixture::Cue]) -> PathBuf {
     movie
 }
 
+/// The cues' pictures as the subtitle decoder writes them, in a fresh
+/// `pictures` in `dir`, and their times.
+fn written(cues: &[spoolframe_media::bitmap::Cue], dir: &Path) -> (PathBuf, Vec<decode::CueTime>) {
+    let pictures = dir.join("pictures");
+    let _ = std::fs::remove_dir_all(&pictures);
+    std::fs::create_dir_all(&pictures).unwrap();
+    let times = decode::write_pictures(cues, &pictures).unwrap();
+    (pictures, times)
+}
+
 #[tokio::test]
 async fn a_pgs_track_reads_back_as_its_text_at_its_times() {
     let tmp = scratch("reads-back").await;
@@ -109,13 +119,19 @@ async fn a_pgs_track_reads_back_as_its_text_at_its_times() {
         .language_for(Some("eng"))
         .expect("the dev shell has English data");
     let done = parking_lot::Mutex::new(Vec::new());
+    let (pictures, times) = written(&cues, dir);
     let texts = ocr
-        .recognise(&cues, &language, &dir.join("work"), 2, &|n| {
-            done.lock().push(n)
-        })
+        .recognise(
+            &pictures,
+            times.len(),
+            &dir.join("work"),
+            &language,
+            2,
+            &|n| done.lock().push(n),
+        )
         .await
         .unwrap();
-    let read = ocr::text_cues(&cues, texts);
+    let read = ocr::text_cues(&times, texts);
     let got: Vec<_> = read
         .iter()
         .map(|c| (c.start_ms, c.end_ms, c.text.as_str()))
@@ -140,11 +156,12 @@ const SHOWN: [samples::Shown; 2] = [
 /// The text tesseract reads in `cues`, with their times.
 async fn read(cues: &[spoolframe_media::bitmap::Cue], dir: &Path) -> Vec<(u64, u64, String)> {
     let ocr = Ocr::detect(&crate::sandbox::confined("tesseract")).await;
+    let (pictures, times) = written(cues, dir);
     let texts = ocr
-        .recognise(cues, "eng", &dir.join("work"), 2, &|_| {})
+        .recognise(&pictures, times.len(), &dir.join("work"), "eng", 2, &|_| {})
         .await
         .unwrap();
-    ocr::text_cues(cues, texts)
+    ocr::text_cues(&times, texts)
         .into_iter()
         .map(|c| (c.start_ms, c.end_ms, c.text))
         .collect()
@@ -186,7 +203,7 @@ async fn dvb_tracks_read_back_as_their_text_at_their_times() {
         let track = ocr::read_track(&crate::sandbox::confined("ffprobe"), &movie, 1, true)
             .await
             .unwrap();
-        let cues = dvb::cues(&track.packets);
+        let cues = dvb::cues(&track.packets).unwrap();
         assert_eq!(read(&cues, dir).await, expected(), "{name}");
     }
 }
@@ -210,8 +227,9 @@ async fn more_cues_than_one_run_takes_come_back_in_order() {
         .collect();
     let cues = pgs::cues(&fixture::sup(&fixtures, 65_000)).unwrap();
     let ocr = Ocr::detect(&crate::sandbox::confined("tesseract")).await;
+    let (pictures, times) = written(&cues, dir);
     let texts = ocr
-        .recognise(&cues, "eng", &dir.join("work"), 2, &|_| {})
+        .recognise(&pictures, times.len(), &dir.join("work"), "eng", 2, &|_| {})
         .await
         .unwrap();
     let expected: Vec<_> = (0..90).map(|i| words[i % 4]).collect();
@@ -231,8 +249,9 @@ async fn a_language_without_data_fails_with_tesseract_s_reason() {
     let dir = tmp.as_ref();
     let cues = pgs::cues(&fixture::sup(&[shown(0, 1_000, "hi")], 65_000)).unwrap();
     let ocr = Ocr::detect(&crate::sandbox::confined("tesseract")).await;
+    let (pictures, times) = written(&cues, dir);
     let err = ocr
-        .recognise(&cues, "xyz", &dir.join("work"), 1, &|_| {})
+        .recognise(&pictures, times.len(), &dir.join("work"), "xyz", 1, &|_| {})
         .await
         .unwrap_err();
     assert!(matches!(err, ocr::OcrError::Failed { .. }), "{err}");

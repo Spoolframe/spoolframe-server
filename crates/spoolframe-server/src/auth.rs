@@ -18,7 +18,8 @@ use spoolframe_types::Role;
 
 use crate::clock::Clock;
 use crate::device_sign_in::{Claim, DeviceSignIns, Handover};
-use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionUser};
+use crate::refusals::Refusals;
+use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionOwner, SessionUser};
 use crate::store::trust::{Resumed, TrustedProfile};
 use crate::store::users::{LocalUserId, PasswordLogin, normalize_username};
 use crate::store::{Store, StoreError};
@@ -592,6 +593,8 @@ pub struct Auth {
     /// What failures, attempts and sign-in codes are timed by: its
     /// store's, so sessions and limits agree on what now is (PX-09).
     clock: Clock,
+    /// Which refused requests are logged (finding 46).
+    refusals: Arc<Refusals>,
 }
 
 impl Auth {
@@ -611,6 +614,7 @@ impl Auth {
             sign_ins: Arc::new(DeviceSignIns::default().with_clock(clock.clone())),
             strangers: Arc::new(TokenBucket::new(STRANGER_ATTEMPTS)),
             trust_idle: TRUST_IDLE,
+            refusals: Arc::new(Refusals::new(clock.clone())),
             clock,
         }
     }
@@ -831,6 +835,30 @@ impl Auth {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Which refused requests are logged, shared by every listener.
+    pub fn refusals(&self) -> &Refusals {
+        &self.refusals
+    }
+
+    /// Whose session `token` is, live or not (finding 46).
+    pub async fn session_owner(&self, token: &str) -> Result<Option<SessionOwner>, StoreError> {
+        self.store
+            .session_owner(&SessionToken(token.to_owned()).hash())
+            .await
+    }
+
+    /// Why a password sign-in as `username` was refused, for the log: the
+    /// caller is only ever told "invalid credentials" (finding 46).
+    pub async fn why_password_refused(&self, username: &str) -> &'static str {
+        match self.store.password_login(username).await {
+            Ok(None) => "unknown user",
+            Ok(Some(account)) if account.disabled => "user disabled",
+            Ok(Some(PasswordLogin { phc: None, .. })) => "no password",
+            Ok(Some(_)) => "wrong password",
+            Err(_) => "invalid credentials",
+        }
     }
 
     /// The failure limit, for an attempt that is not a password login

@@ -373,6 +373,13 @@ impl RuntimeSettings {
         layers.server_token(&server, self.secrets()).ok().flatten()
     }
 
+    /// Whether a Plex server is configured: until one is, the first
+    /// added takes the token kept before it (the wizard's `plex.token`).
+    pub fn plex_configured(&self) -> Result<bool, LibraryError> {
+        let (_, config) = self.config_now()?;
+        Ok(config.plex.is_some())
+    }
+
     fn config_now(&self) -> Result<(Layers, ServerConfig), LibraryError> {
         let layers = self.layers();
         let config = layers.config()?;
@@ -674,45 +681,6 @@ impl RuntimeSettings {
             .position(|s| s.id == id)
             .ok_or_else(|| LibraryError::NoSuchServer(id.to_owned()))?;
         Ok((plex.servers.clone(), Some(at)))
-    }
-
-    /// Change where Plex server `id` is reached, or what it is called.
-    pub fn plex_server_update(
-        &self,
-        id: &str,
-        url: Option<&str>,
-        name: Option<&str>,
-        by: &str,
-    ) -> Result<(), LibraryError> {
-        let (_, config) = self.config_now()?;
-        let (mut servers, at) = Self::locate(&config, id)?;
-        let url = url.map(str::trim).filter(|u| !u.is_empty());
-        let name = name.map(str::trim).filter(|n| !n.is_empty());
-        let mut keys = Vec::new();
-        match at {
-            None => {
-                if let Some(url) = url {
-                    keys.push(("plex.url", Some(string(url))));
-                }
-                if let Some(name) = name {
-                    keys.push(("plex.name", Some(string(name))));
-                }
-            }
-            Some(at) => {
-                if let Some(url) = url {
-                    servers[at].url = url.to_owned();
-                }
-                if let Some(name) = name {
-                    servers[at].name = Some(name.to_owned());
-                }
-                keys.push(("plex.servers", Some(servers_value(&servers))));
-            }
-        }
-        if keys.is_empty() {
-            return Ok(());
-        }
-        self.change_keys("plex", by, keys)?;
-        Ok(())
     }
 
     /// Keep `token` as Plex server `id`'s.

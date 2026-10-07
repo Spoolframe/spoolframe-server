@@ -1,8 +1,15 @@
-# Development wire revision 5
+# Development wire revision 6
 
-Revision 5 (PX-14, the server id; PX-13, picture subtitles) keeps the
-`spoolframe/client/1` ALPN and sets `PROTOCOL_VERSION` to 5. Update the
-server and SDK together. A mismatched build is refused at `Hello`, not
+Revision 6 (PX-09 finding 27) keeps the `spoolframe/client/1` ALPN and
+sets `PROTOCOL_VERSION` to 6. Update the server and SDK together: a
+revision-5 client gets `Unsupported` from a revision-6 server's `Hello`.
+`DeviceSignInRequest`, the reply to `LookupDeviceSignIn`, has a new
+required field, `requested_from`, so a revision-6 client cannot decode a
+revision-5 server's. What it holds, and what an approving app shows, is
+in "Where a device asked from" below.
+
+Revision 5 (PX-14, the server id; PX-13, picture subtitles) set
+`PROTOCOL_VERSION` to 5. A mismatched build is refused at `Hello`, not
 later on one request:
 
 - A revision-4 client gets `Unsupported` from a revision-5 server's
@@ -220,9 +227,9 @@ while it is sent.
 
 Some requests need a session that proved its user within the last 10
 minutes: `ApproveDeviceSignIn`, `BeginPasskeyRegistration`,
-`RemovePasskey`, `SetPinRequired` with `required: false`,
-`SetDeviceTrust` except to stop trusting this device, and
-`ForgetDevice`. An older
+`RemovePasskey`, `SetPin` with no `proof` (a user's first PIN),
+`SetPinRequired` with `required: false`, `SetDeviceTrust` except to
+stop trusting this device, and `ForgetDevice`. An older
 session gets `RecentSignInRequired`. The app then asks its user to
 confirm, and sends the request again. It does not sign out.
 
@@ -355,6 +362,30 @@ shared device, and it is weaker than a sign-in. A locked session gets
 unlock with the PIN first, then confirm. A confirmation does not unlock a
 profile. The lock belongs to the connection, and the confirmation belongs
 to the session.
+
+## Where a device asked from
+
+A device-sign-in approval shows the device's own name, which an attacker
+chooses: one can begin a sign-in, send someone the approval link or
+code, and get a session when they approve it (device-code phishing,
+PX-09 finding 27). So the approval also shows where the device's
+`BeginDeviceSignIn` came from, which the attacker cannot choose.
+
+`DeviceSignInRequest.requested_from` is `null` if the server could not
+tell, or a `DeviceAddress`:
+
+| Field | Value |
+|---|---|
+| `address` | The IP address as text, `"192.168.86.20"`; an IPv4 address never in its IPv6-mapped form. |
+| `network` | `"loopback"` (the server's own machine), `"local"` (private IPv4, link-local, CGNAT and VPNs' `100.64.0.0/10`, IPv6 unique-local) or `"internet"` (any other: a public address). An unknown value decodes as `Unknown`. |
+
+The server judges `network` as the web approval page judges
+`fromInternet`. An app's approval screen shows the address, "The TV
+asked from 192.168.86.20.", and for `internet` or `Unknown` warns
+instead: the device is not on this network, so approve only a device
+you can see; a code someone sent you is theirs. The SDK re-exports
+`DeviceAddress` and `AddressNetwork`; `Session::lookup_device_sign_in`
+returns the field with the rest.
 
 ## Trusted devices
 

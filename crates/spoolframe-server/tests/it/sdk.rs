@@ -948,6 +948,19 @@ async fn a_tv_is_signed_in_from_a_phone_by_its_qr_code() {
     assert_eq!(scanned.server, id(&server));
     let device = alice.lookup_device_sign_in(&scanned.code).await.unwrap();
     assert_eq!(device.device_name.as_deref(), Some("living room"));
+    // And where it asked from (PX-09 finding 27): one of this host's own
+    // addresses, whichever path the TV took, judged as the server judges
+    // it (this host may have a global IPv6 one).
+    let from: spoolframe_client_sdk::DeviceAddress = device.requested_from.unwrap();
+    let ip: std::net::IpAddr = from.address.parse().unwrap();
+    assert!(
+        ip.is_loopback()
+            || spoolframe_server::announce::interfaces()
+                .iter()
+                .any(|i| i.addrs.contains(&ip)),
+        "{ip}"
+    );
+    assert_eq!(from.network, spoolframe_server::device_sign_in::network(ip));
     alice
         .approve_device_sign_in(&scanned.code, false)
         .await

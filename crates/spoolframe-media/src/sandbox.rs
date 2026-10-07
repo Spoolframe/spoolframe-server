@@ -361,6 +361,16 @@ impl Limits {
             file_size,
         }
     }
+    /// The server's own subtitle decoder over one bitmap track (finding
+    /// 45), on one thread: the track read whole (up to 512 MiB of
+    /// ffprobe's JSON, then its parse), and the pictures of its cues, up to
+    /// the decode budget's 1 Gi pixels. The largest file is one picture's
+    /// PGM, 4128 × 4128 at most.
+    pub const DECODE: Self = Self {
+        memory: Memory::fixed(4 * GIB),
+        cpu_secs: 10 * 60,
+        file_size: 32 * MIB,
+    };
     /// One tesseract run over a few dozen cue pictures, on one thread.
     pub const OCR: Self = Self {
         memory: Memory::fixed(2 * GIB),

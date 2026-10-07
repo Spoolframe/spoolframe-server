@@ -186,12 +186,14 @@ where
 {
     let s: Option<String> = Option::deserialize(deserializer)?;
     match s {
-        Some(s) => s
-            .parse::<f64>()
-            .map(|v| v.max(0.0))
-            .map(Duration::from_secs_f64)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
+        Some(s) => {
+            let seconds = s.parse::<f64>().map_err(serde::de::Error::custom)?;
+            // `try_`: `from_secs_f64` panics past u64::MAX seconds and on
+            // infinity, and the text is a file's (Spoolframe PX-10).
+            Duration::try_from_secs_f64(seconds.max(0.0))
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
         None => Ok(None),
     }
 }

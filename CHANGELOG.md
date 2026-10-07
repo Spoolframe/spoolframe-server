@@ -2580,6 +2580,29 @@
     exchanges in a row unanswered or `Internal` stop the run. Every
     frame it sends is a real request; malformed frames are the fuzz
     targets' job. It is `MIT OR Apache-2.0`, and links no server crate.
+- `spoolframe-probe --username <name> --password-file <path> [--web
+  <url>] [--web-origin <origin>]` (PX-11 coverage gap 1): signed-in
+  checks as a consumer account. It signs in once over QUIC, from a fresh
+  key of the account's own, and once on the web listener; a refused
+  sign-in is never tried again. The password is read from the file only,
+  and is in no line of the report.
+  - `consumer-admin-refused`: the account is a consumer on both sides,
+    and nine admin reads (`admin_userList`, `admin_settings`,
+    `admin_logs`, …) are `FORBIDDEN`. No admin mutation is sent.
+  - `session-bound`: the session from another endpoint key is
+    `Unauthenticated`, and still works from its own.
+  - `visibility`: what `Libraries` lists; a library and an item on a
+    Plex server no server has are `NotFound`.
+  - `recent-sign-in`: on a fresh session, `RemovePasskey` of a passkey
+    id no account has gets past the recent sign-in check (`NotFound`).
+  - `signed-in-streams`: the signed-in connection opens 8 streams at
+    once, past a stranger's 4.
+  - `session-reread`: `Ping` and `WhoAmI` work; `Logout` closes the
+    connection `SIGNED_OUT`, and the session is `Unauthenticated` after.
+  - The run signs out every session it made, past the budget if need be,
+    and lists what the account still has (`me_sessions`, `me_devices`).
+    Web requests count against the budget, and a 5xx counts towards the
+    stop rule.
 - Music on iOS starts (P2-03): a device keeps "now + next", the playback
   it plays and the one it starts after it. Starting a third ends the
   device's oldest converted playback, and its encode slot. Before, every
@@ -2602,3 +2625,90 @@
   restart (PX-10). The server, the SDK, `spoolframe-media` and
   `spoolframe-probe` use `parking_lot` locks, which do not poison; with
   `std::sync` locks, every later `lock()` after one panic panicked too.
+- A first PIN set in an app needs a recent sign-in, as the web UI's
+  `pinSet` does (PX-09 A-14): `SetPin` with no `proof` from a session
+  that signed in over 10 minutes ago is `RecentSignInRequired`, and the
+  app asks "Confirm it's you". An unlocked session left on a TV could put
+  a PIN on the account, which its owner then had to prove to change.
+  Changing a PIN with a `PinProof` is unchanged: the proof confirms it.
+- `PROTOCOL_VERSION` is 6 (PX-09 finding 27): update the server and SDK
+  together. The apps' device approvals can say where the device asked
+  from, as the web UI's does: `DeviceSignInRequest`, the reply to
+  `LookupDeviceSignIn`, has a new required `requested_from`, `null` or a
+  `DeviceAddress { address, network }`, where `network` is `loopback`,
+  `local` or `internet`, judged as the web page's `fromInternet`. The
+  SDK re-exports `DeviceAddress` and `AddressNetwork`. An app shows "The
+  TV asked from 192.168.86.20.", and for an `internet` (or unknown)
+  address warns instead: approve only a device you can see.
+- Every way to change the first Plex server's token needs a recent
+  sign-in (finding 44), as `plexServerSetToken` already did for every
+  server's: `admin.plexAccountTokenUse`, `plexPinCheck` with `keepToken`,
+  and `settingSet`/`settingUnset` on `plex.token`. From a session that
+  signed in over 10 minutes ago they are `RECENT_SIGN_IN_REQUIRED`, and
+  the web UI's Plex step (the wizard and Settings) asks "Confirm it's
+  you", then goes on: a PIN approved meanwhile is kept, not used up.
+  Signing in with Plex only to add servers (`keepToken = false`) is
+  unchanged.
+- `admin.plexServerUpdate` is gone: nothing called it, not the web UI,
+  the CLI or a test. A Plex server's address and name change with
+  `settingSet` on `plex.url`, `plex.name` or `plex.servers`, as before.
+- Two admin methods are renamed, so a name says which of a similar pair
+  it is (a wire change; the web UI moves with them):
+  `admin.plexPathCheck` is `plexPathTry` (it tries unsaved mappings on a
+  sample, and keeps nothing; `plexCheckPaths` checks every file under the
+  saved ones), and `admin.plexSync` is `plexSyncOverview` (who is linked
+  and how their sync is going; `plexWatchSync` runs one).
+- Picture subtitles (PGS, DVB and VobSub, read as text with OCR) are
+  decoded in a child process, never in the server (finding 45). A few
+  hundred bytes of a crafted track could ask for gigabytes of pictures,
+  and a `.sup` beside a film took the whole server down when anyone
+  played it with text subtitles.
+  - The server runs its own binary again, as the hidden
+    `spoolframe-server decode-subtitle`, confined as ffmpeg is
+    (`media.sandbox`): it reads the track on its standard input, writes
+    its cues' pictures into the job's directory and nothing else, and
+    prints their times. It may use 4 GiB, 10 minutes of CPU and 10
+    minutes in all.
+  - A track decodes within a budget: 20,000 cues, 1 Gi pixels of
+    pictures, and 64 Mi pixels held at once between cues. A film's
+    track is 1 to 3 thousand cues of about 100 thousand pixels each.
+    Past the budget the track is not read, and the reason says why
+    ("the track's pictures come to more than 1073741824 pixels"); it is
+    never cut short.
+  - A decoder that panics, is refused by its budget, or is killed past a
+    limit fails that track only.
+  - At start, with OCR on, the server decodes a one-cue track with it and
+    shows it may not write the state directory; `required` does not
+    start otherwise, and `auto` logs an error ("SUBTITLE DECODER MAY NOT
+    WORK OR NOT BE CONFINED").
+  - `spoolframe-media`: `pgs::cues_within`, `dvb::cues_within` and
+    `vobsub::cues_within` take a `bitmap::Budget`; `cues` keeps
+    `Budget::DEFAULT`, and `dvb::cues` now returns a `Result`.
+    `Ocr::recognise` reads pictures the decoder wrote (`decode::picture`),
+    and `ocr::text_cues` takes their times.
+- Refused requests are logged (finding 46): one line each, at WARN, on
+  the target `spoolframe::refused`, with `kind`, `channel` (`admin_api`,
+  `web` or `quic`), `request` (the method, path or request type),
+  `source` (the caller's address, or the device's short id), `user` when
+  known (the session's user, or the username a sign-in gave) and
+  `reason`. The kinds are `unauthenticated` (a token that is not live,
+  or not this device's: "session bound to another device"; a live
+  session refused another session's playback: "playback is another
+  session's"), `forbidden` (not an admin), `recent_sign_in_required`,
+  `profile_locked`, `sign_in_failed` ("unknown user", "wrong password",
+  "user disabled", "wrong PIN", "passkey refused", "wrong setup code")
+  and `rate_limited`. A request with no session at all is `no_session`,
+  at INFO only: every signed-out caller makes one. No line has a
+  password, PIN, code or token. Per source and kind, 10 lines a minute
+  are written, then one line, "N more refusals suppressed"; at most
+  10,000 sources are counted apart. The lines reach the OTLP export like
+  other warnings.
+- Changing where a Plex token is sent needs a recent sign-in (finding
+  47), as changing the token does (44): `settingSet` and `settingUnset`
+  on `plex.url` and `plex.servers` (one key with every other server's
+  address, name and paths), and `admin.plexServerAdd` while no Plex
+  server is configured, since the first takes the token kept before it.
+  From a session that signed in over 10 minutes ago they are
+  `RECENT_SIGN_IN_REQUIRED`; the web UI's Plex Save and the Libraries
+  page's add ask "Confirm it's you" and go on. `plex.name`,
+  `plexServerSetPaths` and `plexServerRemove` are unchanged.

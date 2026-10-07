@@ -27,7 +27,7 @@ use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -199,10 +199,12 @@ pub enum Request {
     },
     /// Set or change the session user's PIN (P2-08): 4 to 8 digits. `Done`.
     ///
-    /// A user with no PIN sets their first with no `proof`. A user who has
-    /// one changes it only with a [`PinProof`]: the current PIN, or the
-    /// account password when the PIN is forgotten. Without one it is
-    /// `InvalidInput`. A locked session gets `ProfileLocked`.
+    /// A user with no PIN sets their first with no `proof`, from a session
+    /// that signed in within the last 10 minutes; an older one gets
+    /// `RecentSignInRequired`. A user who has one changes it only with a
+    /// [`PinProof`]: the current PIN, or the account password when the PIN
+    /// is forgotten. Without one it is `InvalidInput`. A locked session
+    /// gets `ProfileLocked`.
     SetPin {
         pin: String,
         proof: Option<PinProof>,
@@ -897,6 +899,44 @@ pub struct DeviceSignInRequest {
     /// The device asked to be remembered (P4-01): the approval says "This
     /// device will be remembered", ticked, and the approver may untick it.
     pub remember: bool,
+    /// Where the device's `BeginDeviceSignIn` came from, as the server saw
+    /// it (PX-09 finding 27): the one thing on this screen an attacker who
+    /// sent the approver a code cannot choose. `None` if the server could
+    /// not tell. The approval shows it, "The TV asked from 192.168.86.20.",
+    /// and for [`AddressNetwork::Internet`] warns instead: the device is
+    /// not on the approver's network, so approve only one you can see.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub requested_from: Option<DeviceAddress>,
+}
+
+/// An address a device reached the server from (PX-09 finding 27).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceAddress {
+    /// Its IP address as text: `192.168.86.20`, `fd7a:115c:a1e0::1`. An
+    /// IPv4 address is never in its IPv6-mapped form.
+    pub address: String,
+    /// What kind of network that address is on, as the server judges it.
+    pub network: AddressNetwork,
+}
+
+/// What kind of network an address is on, as the server's web approval
+/// page judges it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressNetwork {
+    /// The server's own machine: `127.0.0.0/8`, `::1`.
+    Loopback,
+    /// A home, office or VPN network: private IPv4 ranges, link-local,
+    /// CGNAT and VPNs' `100.64.0.0/10`, IPv6 unique-local and link-local.
+    Local,
+    /// A public address: a device far from the approver, which is what a
+    /// sign-in code sent to someone else (device-code phishing) looks
+    /// like. The approval warns.
+    Internet,
+    /// A kind this build does not know, from a newer server. Show the
+    /// address and warn as for [`AddressNetwork::Internet`].
+    #[serde(other)]
+    Unknown,
 }
 
 /// One live session, without its token.

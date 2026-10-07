@@ -8,7 +8,9 @@
 # `systemd-analyze security` scores; ffmpeg, ffprobe and tesseract
 # confine themselves inside it with Landlock and seccomp, and a confined
 # ffprobe can neither read the state directory nor connect to the admin
-# listener. `fresh`, the module with nothing but `enable`: not set up, its web UI answering on loopback only, insecure
+# listener; the subtitle decoder, the server's own binary run again,
+# decodes a track inside it, confined, and cannot write the state
+# directory. `fresh`, the module with nothing but `enable`: not set up, its web UI answering on loopback only, insecure
 # cookies locked off, its state where the module says and its own user's
 # alone, and the firewall opening none of its ports (PX-11).
 {
@@ -151,6 +153,13 @@ pkgs.testers.runNixOSTest {
     assert "could not read /var/lib/spoolframe nor connect to 127.0.0.1:" in shown[-1], shown[-1]
     for loud in ["MEDIA TOOLS RUN WITHOUT LANDLOCK", "MEDIA TOOLS RUN UNCONFINED", "MEDIA TOOLS MAY NOT BE CONFINED"]:
         assert loud not in journal(), loud
+    # Finding 45: picture subtitles are decoded by the server's own binary
+    # run again, confined as the tools are. At start, from inside the
+    # unit, it decoded a one-cue track and was refused the state directory.
+    decoder = [line for line in journal().splitlines() if "a confined subtitle decoder" in line]
+    assert decoder, journal()
+    assert "could not write /var/lib/spoolframe" in decoder[-1], decoder[-1]
+    assert "SUBTITLE DECODER MAY NOT WORK" not in journal()
 
     # No GPU in the VM: detection finds software encoders only.
     server.wait_until_succeeds("journalctl -u spoolframe.service | grep -q 'transcoding'")

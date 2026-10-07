@@ -33,6 +33,16 @@ pub struct ApiSessionUser {
     pub authenticated_at: i64,
 }
 
+/// Whose a session is, for the refused-request log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOwner {
+    pub username: String,
+    /// The device's endpoint it is bound to; `None` for an API session.
+    pub endpoint_id: Option<String>,
+    /// Not revoked, not expired, and its user not disabled.
+    pub live: bool,
+}
+
 /// The user behind a live endpoint session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionUser {
@@ -172,6 +182,29 @@ impl Store {
             user: id,
             role: role(stored),
             authenticated_at,
+        }))
+    }
+
+    /// Whose session `token_hash` is, live or not, and where it is bound:
+    /// what the refused-request log names (finding 46). Changes nothing.
+    pub async fn session_owner(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<SessionOwner>, StoreError> {
+        let row: Option<(String, Option<String>, bool)> = sqlx::query_as(
+            "SELECT u.username, s.endpoint_id, \
+                    s.revoked_at IS NULL AND s.expires_at > ?2 AND u.disabled_at IS NULL \
+             FROM sessions s JOIN users u ON u.id = s.user_id \
+             WHERE s.token_hash = ?1",
+        )
+        .bind(token_hash)
+        .bind(self.now())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(username, endpoint_id, live)| SessionOwner {
+            username,
+            endpoint_id,
+            live,
         }))
     }
 

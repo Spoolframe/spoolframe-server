@@ -964,6 +964,13 @@ impl Session {
     /// from a scanned [`crate::device_sign_in::parse_link`]), to ask "Sign
     /// in on 'Living room TV'?". A code that is not pending is
     /// [`SdkError::NotFound`]; too many of those [`SdkError::RateLimited`].
+    ///
+    /// The approval also shows where the device asked from
+    /// ([`DeviceSignInRequest::requested_from`], PX-09 finding 27): "The
+    /// TV asked from 192.168.86.20.", or, for an address on the
+    /// [`crate::AddressNetwork::Internet`] (or one this build does not
+    /// know), a warning that the device is not on this network, so approve
+    /// only one you can see: a code someone sent you is theirs.
     pub async fn lookup_device_sign_in(&self, code: &str) -> Result<DeviceSignInRequest, SdkError> {
         let request = Request::LookupDeviceSignIn {
             code: code.to_owned(),

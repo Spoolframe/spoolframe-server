@@ -34,11 +34,11 @@ pub use session::{
 };
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{
-    ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen,
-    MAX_READ, ManifestKind, PinProof, PinState, PlaybackHandle, PlaybackPlan, PlexLink,
-    PlexSyncSummary, PreviewTile, Previews, SearchCounts, SearchGroup, SearchRequest,
-    SearchResults, Selection, SessionInfo, TopResult, TrackPreferencesInfo, TrackReason,
-    TrustedProfile, UserSummary,
+    AddressNetwork, ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceAddress, DeviceInfo,
+    DeviceSignInRequest, HomeScreen, MAX_READ, ManifestKind, PinProof, PinState, PlaybackHandle,
+    PlaybackPlan, PlexLink, PlexSyncSummary, PreviewTile, Previews, SearchCounts, SearchGroup,
+    SearchRequest, SearchResults, Selection, SessionInfo, TopResult, TrackPreferencesInfo,
+    TrackReason, TrustedProfile, UserSummary,
 };
 // Passkeys in the app (P3-19): the raw WebAuthn bytes the platform's
 // passkey API takes and gives. The relying party is each server's own

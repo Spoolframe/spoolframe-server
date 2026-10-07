@@ -20,7 +20,7 @@ async fn assert_reads_back(name: &str) {
     let track = ocr::read_track(&crate::sandbox::confined("ffprobe"), &movie, 1, true)
         .await
         .unwrap();
-    let cues = dvb::cues(&track.packets);
+    let cues = dvb::cues(&track.packets).unwrap();
     let times: Vec<_> = cues.iter().map(|c| (c.start_ms, c.end_ms)).collect();
     assert_eq!(times, CUES.map(|(_, start, end)| (start, end)));
     for (cue, (text, ..)) in cues.iter().zip(CUES) {

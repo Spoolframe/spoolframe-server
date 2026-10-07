@@ -53,6 +53,7 @@ use crate::playback::{Changed, FileId, Opened, Playback, Playbacks, Refusal, Sid
 use crate::plex_accounts::Link;
 use crate::previews::{self, PreviewState};
 use crate::principal::Principal;
+use crate::refusals::{self, Channel, Kind};
 use crate::store::passkeys::{PasskeyError, PasskeyRecord};
 use crate::store::pins::PinError;
 use crate::store::sessions::{SessionBinding, SessionUser};
@@ -244,6 +245,9 @@ impl ClientProtocol {
         };
         if let Response::Err(error) = &response.response {
             self.count_error(error);
+            if let Ok(bytes) = &request {
+                self.refused(&connection, Frame::Rpc(bytes), error).await;
+            }
         }
         let response = RpcResponse {
             server: self.instance(),
@@ -698,13 +702,18 @@ impl ClientProtocol {
         mut send: SendStream,
         frame: Result<Vec<u8>, codec::CodecError>,
     ) {
-        let request = frame.and_then(|bytes| codec::decode::<ResourceRequest>(&bytes));
+        let request = frame
+            .as_ref()
+            .map_err(ToString::to_string)
+            .and_then(|bytes| codec::decode::<ResourceRequest>(bytes).map_err(|e| e.to_string()));
         let result = match request {
             Ok(request) => self.open_resource(connection, state, request).await,
-            Err(e) => Err(Error::Malformed {
-                message: e.to_string(),
-            }),
+            Err(message) => Err(Error::Malformed { message }),
         };
+        if let (Err(error), Ok(bytes)) = (&result, &frame) {
+            self.refused(connection, Frame::Resource(bytes), error)
+                .await;
+        }
         let stall = self.connections.admission().stalled_read;
         let sent = async {
             match result {
@@ -1000,6 +1009,65 @@ impl ClientProtocol {
         Ok(using.playback)
     }
 
+    /// Log that the request in `frame` was refused with `error`, if that
+    /// is a refusal (finding 46) and the log is not full for this device
+    /// ([`crate::refusals`]). The frame is read again, and whose session
+    /// it named looked up, only then: a flood costs a counter each.
+    async fn refused(&self, connection: &Connection, frame: Frame<'_>, error: &Error) {
+        let kind = match error {
+            Error::Unauthenticated => Kind::Unauthenticated,
+            Error::ProfileLocked => Kind::ProfileLocked,
+            Error::RecentSignInRequired => Kind::RecentSignInRequired,
+            Error::RateLimited { .. } => Kind::RateLimited,
+            Error::InvalidCredentials => Kind::SignInFailed,
+            _ => return,
+        };
+        let source = connection.remote_id().fmt_short().to_string();
+        let auth = &self.services.auth;
+        if !auth.refusals().admit(&source, kind) {
+            return;
+        }
+        let asked = Asked::of(frame);
+        let owner = match &asked.session {
+            Some(session) => auth.session_owner(&session.0).await.ok().flatten(),
+            None => None,
+        };
+        let endpoint = connection.remote_id().to_string();
+        let (kind, reason) = match kind {
+            Kind::Unauthenticated => match (&asked.session, &owner) {
+                (None, _) if asked.resume => (kind, "device not trusted for that user"),
+                (None, _) => (Kind::NoSession, "no session"),
+                (Some(_), None) => (kind, "no such session"),
+                (Some(_), Some(owner)) if !owner.live => (kind, "session ended"),
+                (Some(_), Some(owner)) => match &owner.endpoint_id {
+                    None => (kind, "a web session's token"),
+                    Some(bound) if *bound != endpoint => (kind, "session bound to another device"),
+                    // Live and this device's: what it was refused is a
+                    // playback another session started (PB).
+                    Some(_) => (kind, "playback is another session's"),
+                },
+            },
+            Kind::SignInFailed => match (&asked.username, asked.credential) {
+                (Some(username), _) => (kind, auth.why_password_refused(username).await),
+                (None, Some(credential)) => (kind, credential),
+                (None, None) => (kind, "invalid credentials"),
+            },
+            Kind::ProfileLocked => (kind, "profile locked"),
+            Kind::RecentSignInRequired => (kind, "sign-in too old for this change"),
+            Kind::RateLimited => (kind, "rate-limited"),
+            // Not among the protocol's errors above.
+            Kind::NoSession | Kind::Forbidden => return,
+        };
+        refusals::log(&refusals::Refusal {
+            kind,
+            channel: Channel::Quic,
+            request: asked.request,
+            source,
+            user: asked.username.or(owner.map(|owner| owner.username)),
+            reason: reason.to_owned(),
+        });
+    }
+
     /// A playback's end as clients see it, counted (P3-14).
     fn count_error(&self, error: &Error) {
         let metrics = &self.services.metrics;
@@ -1264,11 +1332,13 @@ impl ClientProtocol {
                 locks.unlock(&session);
                 Ok(Reply::Done)
             }
-            // The PIN, and where it is asked for, need only the session
-            // (a real sign-in made it, a locked one never gets here, and a
-            // PIN is never a way to sign in), and changing or removing the
-            // PIN a proof too: an unlocked session left on a TV must not
-            // let whoever holds the remote take the PIN over.
+            // Changing or removing the PIN needs a proof (the current PIN
+            // or the password), and the first PIN a recent sign-in, as the
+            // web UI's pinSet (A-14): an unlocked session left on a TV must
+            // not let whoever holds the remote take the PIN over, nor put
+            // one on the account its owner then has to prove to change.
+            // Where it is asked for needs only the session (a locked one
+            // never gets here, and a PIN is never a way to sign in).
             Request::SetPin { pin, proof } => {
                 let Some(digits) = auth::pin_digits(&pin) else {
                     return Err(Error::InvalidInput {
@@ -1278,6 +1348,7 @@ impl ClientProtocol {
                 match proof {
                     Some(proof) => self.check_pin_proof(connection, &user, proof).await?,
                     None => {
+                        recently_signed_in(&user)?;
                         if self
                             .store()
                             .pin_info(user.user)
@@ -2052,6 +2123,7 @@ impl ClientProtocol {
                         platform: waiting.platform,
                         requested_at: waiting.requested_at,
                         remember: waiting.remember,
+                        requested_from: waiting.address.map(crate::device_sign_in::device_address),
                     })),
                     None => Err(self.wrong_sign_in_code(connection, &user)),
                 }
@@ -2829,6 +2901,96 @@ fn plex_link(
         }),
         syncing,
     })
+}
+
+/// A refused request's frame, as it came in on its stream.
+#[derive(Clone, Copy)]
+enum Frame<'a> {
+    Rpc(&'a [u8]),
+    Resource(&'a [u8]),
+}
+
+/// What a refused request asked, as far as the refused-request log needs
+/// it (finding 46): never a password, PIN or token.
+#[derive(Default)]
+struct Asked {
+    /// Its type, as the wire names it.
+    request: String,
+    session: Option<SessionId>,
+    /// The username a password sign-in gave.
+    username: Option<String>,
+    /// What a wrong credential in it was.
+    credential: Option<&'static str>,
+    /// A trusted device's resume (P4-01), which has no session yet.
+    resume: bool,
+}
+
+impl Asked {
+    fn of(frame: Frame<'_>) -> Self {
+        match frame {
+            Frame::Rpc(bytes) => Self::rpc(bytes),
+            Frame::Resource(bytes) => Self::resource(bytes),
+        }
+    }
+
+    fn rpc(bytes: &[u8]) -> Self {
+        let request = refusals::bounded(&codec::rpc_request_type(bytes).unwrap_or_default());
+        let Ok(wire) = codec::decode::<RpcRequest>(bytes) else {
+            return Self {
+                request,
+                ..Self::default()
+            };
+        };
+        let mut asked = Self {
+            request,
+            session: wire.envelope.session,
+            ..Self::default()
+        };
+        match &wire.envelope.request {
+            Request::LoginPassword(login) => {
+                asked.username = Some(refusals::bounded(&login.username));
+            }
+            Request::UnlockProfile { .. }
+            | Request::SetPin {
+                proof: Some(PinProof::Pin { .. }),
+                ..
+            }
+            | Request::ClearPin {
+                proof: PinProof::Pin { .. },
+            } => asked.credential = Some("wrong PIN"),
+            Request::ConfirmPassword(_)
+            | Request::SetPin {
+                proof: Some(PinProof::Password { .. }),
+                ..
+            }
+            | Request::ClearPin {
+                proof: PinProof::Password { .. },
+            } => asked.credential = Some("wrong password"),
+            Request::FinishPasskeySignIn { .. }
+            | Request::FinishConfirmPasskey(_)
+            | Request::FinishPasskeyRegistration(_) => asked.credential = Some("passkey refused"),
+            Request::ResumeProfile { .. } => asked.resume = true,
+            _ => {}
+        }
+        asked
+    }
+
+    fn resource(bytes: &[u8]) -> Self {
+        let (request, session) = match codec::decode::<ResourceRequest>(bytes) {
+            Ok(ResourceRequest::Artwork { request, .. }) => ("artwork", Some(request.session)),
+            Ok(ResourceRequest::Media { request, .. }) => ("media", Some(request.session)),
+            Ok(ResourceRequest::Subtitle { session, .. }) => ("subtitle", Some(session)),
+            Ok(ResourceRequest::SubtitleSegment { session, .. }) => {
+                ("subtitle_segment", Some(session))
+            }
+            Err(_) => ("resource", None),
+        };
+        Self {
+            request: request.to_owned(),
+            session,
+            ..Self::default()
+        }
+    }
 }
 
 /// A password that did not pass, for the client: the same answers at

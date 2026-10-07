@@ -11,6 +11,7 @@ use spoolframe_admin_api::{
 };
 
 use super::admin::{Said, Toast, say, sleep};
+use super::profile::{ConfirmItsYou, asks_to_confirm};
 use super::wizard::{Account, AccountPanel, sign_in_with_plex};
 use super::{Alert, Field, Route, icons, rpc};
 use crate::libraries::{
@@ -605,7 +606,7 @@ async fn path_check(
 ) -> Result<Vec<LibraryPathCheck>, ApiError> {
     let client = rpc::client().await?;
     client
-        .plex_path_check(mappings, Some(server), Some(sections))
+        .plex_path_try(mappings, Some(server), Some(sections))
         .await
         .map_err(rpc::error)
 }
@@ -848,7 +849,7 @@ pub fn AddLibrary(back: String) -> Element {
     // server's token stays as it is.
     let account = use_signal(|| Account::Idle);
     let sign_in = move |_| {
-        sign_in_with_plex(account, false, move || signed_in += 1);
+        sign_in_with_plex(account, false, None, move || signed_in += 1);
     };
     let linked = use_resource(|| async {
         let client = rpc::client().await?;
@@ -934,6 +935,11 @@ pub fn AddLibrary(back: String) -> Element {
             check_rows(None);
         };
 
+    // The first server added says where the token kept before it goes
+    // (finding 47): from an old session, "Confirm it's you", then the
+    // same add again.
+    let confirming = use_signal(|| None::<String>);
+    let mut again = use_signal(|| None::<(String, Option<String>)>);
     // A new server: once it answers, it is added (taken back out on
     // Cancel), so its libraries can be checked before they are.
     let mut take_new = move |url: String, token: Option<String>| {
@@ -971,12 +977,18 @@ pub fn AddLibrary(back: String) -> Element {
             }
             let added = async {
                 let client = rpc::client().await?;
-                client.plex_server_add(url, token).await.map_err(rpc::error)
+                client
+                    .plex_server_add(url.clone(), token.clone())
+                    .await
+                    .map_err(rpc::error)
             };
             match added.await {
                 Ok(entry) => {
                     added_here.set(Some(entry.id.clone()));
                     list_server(entry.id, entry.name, entry.path_mapping, entry.status);
+                }
+                Err(e) if asks_to_confirm(&e, confirming, "adding the first Plex server") => {
+                    again.set(Some((url, token)));
                 }
                 Err(e) => error.set(Some(e.explain())),
             }
@@ -1164,6 +1176,14 @@ pub fn AddLibrary(back: String) -> Element {
     ];
     rsx! {
         div { class: "flex flex-col gap-[22px]",
+            ConfirmItsYou {
+                asking: confirming,
+                on_confirmed: move |_| {
+                    if let Some((url, token)) = again.take() {
+                        take_new(url, token);
+                    }
+                },
+            }
             Link { class: "back-link", to: back_route.clone(),
                 icons::ChevronLeft {}
                 if back == "wizard" { "Setup" } else if back == "settings" { "Settings" } else { "Libraries" }

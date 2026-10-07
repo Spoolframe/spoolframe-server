@@ -333,6 +333,7 @@ fn answer(
             platform: spoolframe_types::Platform::Tvos,
             requested_at: 0,
             remember: false,
+            requested_from: None,
         }),
         Request::ApproveDeviceSignIn { .. } => Reply::Done,
         _ => {

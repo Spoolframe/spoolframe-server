@@ -6,6 +6,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::Prober;
+use spoolframe_media::bitmap::Budget;
+use spoolframe_media::decode;
 use spoolframe_media::encoders::{FfmpegCommand, Hardware};
 use spoolframe_media::ocr::Ocr;
 use spoolframe_media::sandbox::{self, Sandbox, Tool};
@@ -45,7 +47,89 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 mod admin_cli;
 
 #[global_allocator]
-static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+static ALLOC: Allocator = Allocator;
+
+/// snmalloc, unless the process has a data limit (`RLIMIT_DATA`), as the
+/// subtitle decoder this binary also is runs with (finding 45): snmalloc
+/// maps more than 256 GiB of address space at its start, which any such
+/// limit refuses ("Failed to initialise snmalloc"), so a limited process
+/// uses the C library's allocator. Decided at the first allocation, from
+/// the limit then, and never changed: every block is freed by the
+/// allocator that made it.
+struct Allocator;
+
+/// Which allocator: not yet decided, snmalloc, or the system's.
+static WHICH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const SNMALLOC: u8 = 1;
+const SYSTEM: u8 = 2;
+
+impl Allocator {
+    fn which() -> u8 {
+        use std::sync::atomic::Ordering;
+        match WHICH.load(Ordering::Relaxed) {
+            0 => {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: getrlimit(2) with a valid pointer; it allocates
+                // nothing.
+                let limited = unsafe { libc::getrlimit(libc::RLIMIT_DATA, &mut limit) } == 0
+                    && limit.rlim_cur != libc::RLIM_INFINITY;
+                // Threads that race here read the same limit.
+                let which = if limited { SYSTEM } else { SNMALLOC };
+                WHICH.store(which, Ordering::Relaxed);
+                which
+            }
+            which => which,
+        }
+    }
+}
+
+// SAFETY: each call goes to one of two allocators, the same one for the
+// whole process (see `Allocator`), so a block is always freed or grown by
+// the allocator that made it.
+unsafe impl std::alloc::GlobalAlloc for Allocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller's contract, passed on.
+        unsafe {
+            match Self::which() {
+                SNMALLOC => snmalloc_rs::SnMalloc.alloc(layout),
+                _ => std::alloc::System.alloc(layout),
+            }
+        }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller's contract, passed on.
+        unsafe {
+            match Self::which() {
+                SNMALLOC => snmalloc_rs::SnMalloc.alloc_zeroed(layout),
+                _ => std::alloc::System.alloc_zeroed(layout),
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: the caller's contract, passed on.
+        unsafe {
+            match Self::which() {
+                SNMALLOC => snmalloc_rs::SnMalloc.dealloc(ptr, layout),
+                _ => std::alloc::System.dealloc(ptr, layout),
+            }
+        }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new: usize) -> *mut u8 {
+        // SAFETY: the caller's contract, passed on.
+        unsafe {
+            match Self::which() {
+                SNMALLOC => snmalloc_rs::SnMalloc.realloc(ptr, layout, new),
+                _ => std::alloc::System.realloc(ptr, layout, new),
+            }
+        }
+    }
+}
 
 use admin_cli::UserCommand;
 
@@ -125,6 +209,23 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Decode one bitmap subtitle track from standard input (finding 45):
+    /// the server runs its own binary with this, confined, rather than
+    /// decode a track in its own process. Prints a line per cue, its start
+    /// and end in milliseconds.
+    #[command(name = "decode-subtitle", hide = true)]
+    DecodeSubtitle {
+        /// `pgs` (a `.sup`), `dvb` or `vobsub` (ffprobe's JSON of the
+        /// track).
+        #[arg(long)]
+        format: decode::Format,
+        /// Where each cue's picture is written, as `{i}.pgm`.
+        #[arg(long)]
+        pictures: PathBuf,
+        /// Cue times count from the start of the file (an embedded track).
+        #[arg(long)]
+        from_file_start: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -186,17 +287,62 @@ enum PlexCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // What the server writes is its own (PX-11 finding 35): the database
     // holds password and session hashes, the caches what users watch. Its
-    // subprocesses (ffmpeg, tesseract) write into its caches, and inherit
-    // this. The module's UMask=0077 says the same; this holds without it.
+    // subprocesses (ffmpeg, tesseract, its own subtitle decoder) write into
+    // its caches, and inherit this. The module's UMask=0077 says the same;
+    // this holds without it.
     // SAFETY: umask(2) only sets the process's file mode mask.
     unsafe {
         libc::umask(0o077);
     }
     let cli = Cli::parse();
+    // Before any runtime, thread or log: the decoder is a child the server
+    // started, confined, which only reads its input and writes pictures.
+    if let Some(Command::DecodeSubtitle {
+        format,
+        pictures,
+        from_file_start,
+    }) = &cli.command
+    {
+        decode_subtitle(*format, pictures, *from_file_start);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("cannot start the async runtime")?
+        .block_on(serve(cli))
+}
+
+/// `decode-subtitle`: the track on standard input decoded within the
+/// default budget, its pictures written, its index printed. A failure is
+/// one line on stderr, which the server reports, and exit status 1.
+fn decode_subtitle(format: decode::Format, pictures: &Path, from_file_start: bool) -> ! {
+    let decoded = decode::decode(
+        format,
+        from_file_start,
+        std::io::stdin().lock(),
+        pictures,
+        &Budget::DEFAULT,
+    );
+    let printed = decoded.and_then(|times| {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        out.write_all(decode::index(&times).as_bytes())
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("cannot write the index: {e}"))
+    });
+    match printed {
+        Ok(()) => std::process::exit(0),
+        Err(reason) => {
+            eprintln!("{reason}");
+            std::process::exit(1)
+        }
+    }
+}
+
+async fn serve(cli: Cli) -> Result<()> {
     let level = match cli.verbose {
         0 => "info",
         1 => "debug",
@@ -255,6 +401,7 @@ async fn main() -> Result<()> {
         Some(Command::Config {
             command: ConfigCommand::Defaults,
         }) => unreachable!("printed before the layers are read"),
+        Some(Command::DecodeSubtitle { .. }) => unreachable!("decoded before the runtime starts"),
         Some(Command::Config {
             command: ConfigCommand::Show,
         }) => {
@@ -380,6 +527,36 @@ async fn check_media_sandbox(
     }
 }
 
+/// Shows the subtitle decoder (this binary, run again) works here, and,
+/// confined, that it may not write the state directory (finding 45), as
+/// [`check_media_sandbox`] shows the tools. `required` does not start
+/// without that shown; otherwise it is logged at the error level.
+async fn check_decoder(
+    config: &ServerConfig,
+    decoder: &Tool,
+    scratch: &Path,
+    state_dir: &Path,
+) -> Result<()> {
+    match decode::check(decoder, scratch, state_dir).await {
+        Ok(shown) => {
+            tracing::info!("{shown}");
+            Ok(())
+        }
+        Err(reason) if config.media.sandbox()? == sandbox::Mode::Required => bail!(
+            "media.sandbox is \"required\", but the subtitle decoder cannot be shown to run \
+             confined: {reason}"
+        ),
+        Err(reason) => {
+            tracing::error!(
+                reason,
+                "SUBTITLE DECODER MAY NOT WORK OR NOT BE CONFINED: picture subtitles may fail to \
+                 read as text"
+            );
+            Ok(())
+        }
+    }
+}
+
 async fn probe(catalog: &dyn Catalog, id: &MediaId, ffprobe: Tool) -> Result<()> {
     let path = catalog.media_path(id).await?;
     let prober = Prober::new(ffprobe, Prober::DEFAULT_TIMEOUT);
@@ -430,6 +607,13 @@ async fn run(
     let ffmpeg = Tool::new(config.media.ffmpeg(), sandbox.clone());
     let ffprobe = Tool::new(config.media.ffprobe(), sandbox.clone());
     check_media_sandbox(config, &ffprobe, state_dir).await?;
+    // Bitmap subtitles are decoded by this binary run again, confined as
+    // the tools are (finding 45). /proc/self/exe now: the program running,
+    // whatever PATH or a later upgrade says.
+    let decoder = Tool::new(
+        std::env::current_exe().context("cannot find the server's own binary")?,
+        sandbox.clone(),
+    );
     let prober = Arc::new(Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT));
     let transcoding = Arc::new(Transcoding::new(
         Box::new(FfmpegCommand::new(ffmpeg.clone())),
@@ -451,13 +635,24 @@ async fn run(
         Ocr::disabled()
     };
     let subtitles = Arc::new(
-        Subtitles::new(ocr, ffmpeg.clone(), ffprobe, &ocr_settings).with_context(|| {
-            format!(
-                "cannot prepare the subtitle cache {}",
-                ocr_settings.cache_dir.display()
-            )
-        })?,
+        Subtitles::new(ocr, ffmpeg.clone(), ffprobe, decoder.clone(), &ocr_settings).with_context(
+            || {
+                format!(
+                    "cannot prepare the subtitle cache {}",
+                    ocr_settings.cache_dir.display()
+                )
+            },
+        )?,
     );
+    if ocr_settings.enabled {
+        check_decoder(
+            config,
+            &decoder,
+            &ocr_settings.cache_dir.join("decoder-check"),
+            state_dir,
+        )
+        .await?;
+    }
     let previews_dir = state_dir.join("cache").join("previews");
     let previews = Previews::start(
         &previews_dir,
