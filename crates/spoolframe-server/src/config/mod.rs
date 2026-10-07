@@ -764,8 +764,8 @@ impl ArtworkConfig {
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct AdminConfig {
     /// Where the admin API and the web UI listen; every IPv4 interface on
-    /// port 7421 if left out (P3-10). Loopback, for a host whose TLS proxy
-    /// runs on the same machine.
+    /// port 7421 if left out (P3-10). Loopback, with `trusted_proxies`
+    /// naming it, for a host whose TLS proxy runs on the same machine.
     #[ucl(default)]
     pub listen: Option<String>,
     /// Where browsers reach the web UI, when it is behind a TLS proxy
@@ -787,10 +787,11 @@ pub struct AdminConfig {
     #[ucl(default)]
     pub trusted_proxies: Option<String>,
     /// Nothing proxies to this listener: a loopback caller is on this
-    /// host, or comes through an SSH tunnel. Only read for a loopback
-    /// listener with a public URL, which otherwise means a proxy on this
-    /// host, and is refused without `trusted_proxies` (PX-11 finding 38).
-    /// Off if left out.
+    /// host, or comes through an SSH tunnel. Only read with a public URL
+    /// and no `trusted_proxies`: a loopback listener then means a proxy
+    /// on this host, and is refused without it (PX-11 finding 38); one on
+    /// every interface may have one, and is warned of at start without it
+    /// (finding 58). Off if left out.
     #[ucl(default)]
     pub not_proxied: Option<bool>,
     /// Send the session cookie without `Secure`, so signing in over plain
@@ -878,6 +879,20 @@ impl AdminConfig {
         Ok(self.listen()?.ip().is_loopback()
             && self.public_url.is_some()
             && self.trusted_proxies()? == crate::admin::TrustedProxies::default())
+    }
+
+    /// Whether a proxy on this host may be in front of a listener on
+    /// every interface without the server told (finding 58, the third
+    /// review's G-9): a public URL, no `trusted_proxies`, and no
+    /// `not_proxied`. Through such a proxy every caller looks like
+    /// loopback, as in [`Self::proxy_unnamed`]'s shape; but browsers may
+    /// as well reach this listener directly, or through an SSH tunnel,
+    /// so it is warned of at start, not refused.
+    pub fn proxy_maybe_unnamed(&self) -> Result<bool, ConfigError> {
+        Ok(self.listen()?.ip().is_unspecified()
+            && self.public_url.is_some()
+            && self.trusted_proxies()? == crate::admin::TrustedProxies::default()
+            && !self.not_proxied())
     }
 
     /// Refuses [`Self::proxy_unnamed`]'s shape unless `not_proxied` says
@@ -2336,6 +2351,57 @@ mod tests {
         ] {
             let config = plex(&format!("admin {{ {admin} }}"));
             assert!(config.is_ok(), "{admin}: {config:?}");
+        }
+    }
+
+    /// Finding 58 (the third review's G-9): a listener on every interface
+    /// with a public URL and no `trusted_proxies` may have a proxy on this
+    /// host in front. It loads, the dev server's shape among them, and is
+    /// to be warned of; naming the proxy, saying there is none, or a
+    /// listener on one address, is not.
+    #[test]
+    fn a_public_url_on_every_interface_without_trusted_proxies_may_be_proxied_unnamed() {
+        for (admin, warned) in [
+            (
+                r#"listen = "0.0.0.0:7421"; public_url = "https://media.example.org";"#,
+                true,
+            ),
+            (
+                r#"listen = "[::]:7421"; public_url = "https://media.example.org";"#,
+                true,
+            ),
+            // The server's default listener.
+            (r#"public_url = "https://media.example.org";"#, true),
+            // The dev server's shape.
+            (
+                r#"listen = "0.0.0.0:7431"; public_url = "http://localhost:7431"; insecure_cookies = true;"#,
+                true,
+            ),
+            (
+                r#"listen = "0.0.0.0:7421"; public_url = "https://media.example.org"; trusted_proxies = "127.0.0.1";"#,
+                false,
+            ),
+            (
+                r#"listen = "0.0.0.0:7421"; public_url = "https://media.example.org"; not_proxied = true;"#,
+                false,
+            ),
+            (r#"listen = "0.0.0.0:7421";"#, false),
+            (
+                r#"listen = "192.168.1.20:7421"; public_url = "https://media.example.org";"#,
+                false,
+            ),
+            (
+                r#"listen = "127.0.0.1:7421"; public_url = "https://media.example.org"; trusted_proxies = "127.0.0.1";"#,
+                false,
+            ),
+        ] {
+            let config = plex(&format!("admin {{ {admin} }}"));
+            let config = config.unwrap_or_else(|e| panic!("{admin}: {e:?}"));
+            assert_eq!(
+                config.admin.proxy_maybe_unnamed().unwrap(),
+                warned,
+                "{admin}"
+            );
         }
     }
 

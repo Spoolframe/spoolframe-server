@@ -2,6 +2,7 @@
   config,
   lib,
   pkgs,
+  utils,
   ...
 }: let
   cfg = config.services.spoolframe;
@@ -19,8 +20,19 @@
   # Each media tool confined by Landlock and seccomp (PX-11 finding 34).
   sandboxed = cfg.media.sandbox != "off";
 
+  # The server parses admin.listen as an IP address and port, and judges
+  # it by the address (G-12): IPv4 dotted, or IPv6 in brackets, never a
+  # name such as localhost or a bracketed IPv4 address, which it refuses.
+  matches = re: listen: listen != null && builtins.match re listen != null;
+  parsed = listen: matches "[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:[0-9]+" listen || matches "[[][0-9a-fA-F.]*:[0-9a-fA-F:.%]*[]]:[0-9]+" listen;
+
   # A loopback listen address: the proxy in front of it is on this host.
-  loopback = listen: listen != null && (lib.hasPrefix "127." listen || lib.hasPrefix "[::1]:" listen);
+  # 127.0.0.0/8, or ::1 however it is spelt (every group but the last 0).
+  loopback = listen: matches "127\\.[0-9.]+:[0-9]+" listen || matches "[[][0:]*:0*1[]]:[0-9]+" listen;
+
+  # A listen address on every interface (null is the server's default,
+  # 0.0.0.0): a proxy on this host may be in front, or may not.
+  everywhere = listen: listen == null || lib.hasPrefix "0.0.0.0:" listen || matches "[[][0:]*:[0:]*[]]:[0-9]+" listen;
 
   # systemd hands the Plex token to the service as a credential, so the
   # secret file can stay root-only.
@@ -257,7 +269,8 @@ in {
         default = "127.0.0.1:7421";
         description = ''
           Where the web UI and the admin API (JSON-RPC over WebSocket, the
-          `spoolframe` CLI's) listen. Loopback by default (PX-11): reach it
+          `spoolframe` CLI's) listen: an IP address and a port, never a
+          name (`localhost`). Loopback by default (PX-11): reach it
           through a TLS proxy (nginx, Caddy) on this host, with
           {option}`admin.publicUrl` and {option}`admin.trustedProxies`, or
           through an SSH tunnel. Passwords cross it in clear, so give it
@@ -313,7 +326,9 @@ in {
           {option}`admin.publicUrl` set, a proxy on this host is in front,
           so this must name it (`["127.0.0.1"]`), or
           {option}`admin.notProxied` must say there is none: the module
-          does not evaluate otherwise, and the server does not start.
+          does not evaluate otherwise, and the server does not start. On
+          every interface with {option}`admin.publicUrl` set, there may be
+          one, and both warn without either.
         '';
       };
 
@@ -323,10 +338,10 @@ in {
         description = ''
           Nothing proxies to {option}`admin.listen`: its loopback callers
           are on this host, or come through an SSH tunnel, and share one
-          limit on failed logins. Only needed for a loopback listener with
-          {option}`admin.publicUrl` set, which otherwise means a proxy on
-          this host that {option}`admin.trustedProxies` must name (PX-11
-          finding 38).
+          limit on failed logins. Only needed with {option}`admin.publicUrl`
+          set: a loopback listener otherwise means a proxy on this host that
+          {option}`admin.trustedProxies` must name (PX-11 finding 38), and
+          one on every interface is warned of (finding 58).
         '';
       };
     };
@@ -492,6 +507,10 @@ in {
         message = "services.spoolframe.stateDir (${cfg.stateDir}) must be under /var/lib/.";
       }
       {
+        assertion = cfg.admin.listen == null || parsed cfg.admin.listen;
+        message = "services.spoolframe.admin.listen (${cfg.admin.listen}) must be an IP address and a port, such as 127.0.0.1:7421 or [::1]:7421: the server does not look up names.";
+      }
+      {
         assertion = cfg.auth.oidc == [] || cfg.admin.publicUrl != null;
         message = "services.spoolframe.auth.oidc needs services.spoolframe.admin.publicUrl: the provider sends the browser back to <publicUrl>/auth/oidc/callback.";
       }
@@ -508,6 +527,16 @@ in {
           or, if nothing proxies to the listener, admin.notProxied = true.'';
       }
     ];
+
+    # Finding 58 (the third review's G-9): on every interface, a proxy on
+    # this host is as likely as browsers coming straight in, so the server
+    # warns at start rather than refuse, and so does the module.
+    warnings = lib.optional (everywhere cfg.admin.listen && cfg.admin.publicUrl != null && cfg.admin.trustedProxies == [] && !cfg.admin.notProxied) ''
+      services.spoolframe.admin.trustedProxies is empty, but admin.publicUrl is set and admin.listen is
+      on every interface: if a proxy on this host is in front, every caller through it looks like
+      loopback, so failed logins are not limited per caller, and /metrics, when on, answers whoever
+      the proxy lets in. Put admin.listen on loopback and set admin.trustedProxies = ["127.0.0.1"];
+      or, if nothing proxies to the listener, set admin.notProxied = true.'';
 
     environment.etc."spoolframe/server.ucl".source = configFile;
     environment.systemPackages = [cli];
@@ -541,7 +570,9 @@ in {
       # A new config is a restart: the server reads it once.
       restartTriggers = [configFile];
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/spoolframe-server --config ${configFile} --state-dir ${cfg.stateDir}";
+        # The state directory quoted (G-13), as the CLI wrapper's is:
+        # systemd splits on whitespace, and expands % and $.
+        ExecStart = "${cfg.package}/bin/spoolframe-server --config ${configFile} --state-dir ${utils.escapeSystemdExecArg cfg.stateDir}";
         User = "spoolframe";
         Group = "spoolframe";
         StateDirectory = lib.removePrefix "/var/lib/" cfg.stateDir;

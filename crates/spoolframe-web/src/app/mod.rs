@@ -333,11 +333,12 @@ fn Login() -> Element {
         .as_ref()
         .map(|s| s.sso.clone())
         .unwrap_or_default();
-    // What a sign-in provider's callback sent the browser here to say.
-    let said = use_hook(|| {
-        http::sso_outcome("/login")
-            .and_then(|(what, provider)| crate::sso::login_message(&what, provider.as_deref()))
-            .map(|(_, text)| text)
+    // What a sign-in provider's callback sent the browser here to say,
+    // naming the provider once the server says it has one by that name
+    // (A-16).
+    let outcome = use_hook(|| http::sso_outcome("/login"));
+    let said = outcome.and_then(|(what, provider)| {
+        crate::sso::login_message(&what, provider.as_deref(), &sso).map(|(_, text)| text)
     });
     rsx! {
         Centered {

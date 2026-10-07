@@ -50,10 +50,11 @@ pub fn DeviceApproval(code: String) -> Element {
         .unwrap_or_default();
     // A provider's sign-in comes back here, to this code, and says here
     // what went wrong.
-    let said = use_hook(|| {
-        http::sso_outcome(PATH)
-            .and_then(|(what, provider)| crate::sso::login_message(&what, provider.as_deref()))
-            .map(|(_, text)| text)
+    // The provider is named once the server says it has one by that name
+    // (A-16).
+    let outcome = use_hook(|| http::sso_outcome(PATH));
+    let said = outcome.and_then(|(what, provider)| {
+        crate::sso::login_message(&what, provider.as_deref(), &sso).map(|(_, text)| text)
     });
     let return_to = format!("{PATH}?code={}", encode(&code));
     let has_code = !code.trim().is_empty();

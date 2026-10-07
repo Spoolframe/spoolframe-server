@@ -1100,12 +1100,18 @@ fn recent(user: &ApiSessionUser) -> RpcResult<()> {
 /// `plexServerSetToken` is for every server's, and where the kept tokens
 /// are sent (finding 47): the first server's address (`plex.url`) and the
 /// others' (`plex.servers`, one key with their names and path mappings,
-/// so all of it). A name alone (`plex.name`) sends nothing anywhere.
+/// so all of it). The file read and sent as the first server's token
+/// (`plex.token_file`, finding 57) is that token as much as `plex.token`
+/// is. A name alone (`plex.name`) sends nothing anywhere. And
+/// the OTLP export (`telemetry.*`, finding 56): its endpoint receives
+/// every span, metric and log record, refusal lines with usernames
+/// among them, and its headers are a secret sent with each export.
 fn sensitive_setting(key: &str) -> bool {
     key.starts_with("admin.")
         || key.starts_with("auth.")
         || key.starts_with("media.")
-        || [PLEX_TOKEN, "plex.url", "plex.servers"].contains(&key)
+        || key.starts_with("telemetry.")
+        || [PLEX_TOKEN, "plex.token_file", "plex.url", "plex.servers"].contains(&key)
 }
 
 impl AdminApi {

@@ -12,13 +12,14 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
+use spoolframe_protocol::resource::{ResourceRequest, ResourceResponse};
 use spoolframe_protocol::rpc::{Operation, RpcRequest, RpcResponse, ServerInstance};
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{
     CLIENT_ALPN, Error, Hello, Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId,
     codec,
 };
-use spoolframe_types::Platform;
+use spoolframe_types::{ClientCapabilities, Platform};
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
@@ -221,8 +222,25 @@ impl Probe {
         endpoint: &Endpoint,
         device_name: Option<String>,
     ) -> Result<(Conn, ServerInfo), Problem> {
+        self.connect_hello_as(endpoint, device_name, None).await
+    }
+
+    /// As [`Probe::connect_hello_with`], saying what the device can play:
+    /// a playback is planned by the capabilities its connection's `Hello`
+    /// gave.
+    pub async fn connect_hello_as(
+        &self,
+        endpoint: &Endpoint,
+        device_name: Option<String>,
+        capabilities: Option<ClientCapabilities>,
+    ) -> Result<(Conn, ServerInfo), Problem> {
         let conn = self.connect_from(endpoint).await?;
-        match self.request(&conn, None, hello(device_name)).await? {
+        let request = hello_full(
+            spoolframe_protocol::PROTOCOL_VERSION,
+            device_name,
+            capabilities,
+        );
+        match self.request(&conn, None, request).await? {
             Response::Ok(Reply::ServerInfo(info)) => Ok((conn, info)),
             other => Err(Problem::Failed(format!(
                 "a good Hello was answered {}",
@@ -253,7 +271,19 @@ impl Probe {
         session: Option<&str>,
         request: Request,
     ) -> Result<Response, Problem> {
-        let bytes = self.encode(session, request)?;
+        self.request_at(conn, session, request, None).await
+    }
+
+    /// As [`Probe::request`], claiming the playback's revision
+    /// `expected_revision`, as a playback control does.
+    pub async fn request_at(
+        &self,
+        conn: &Connection,
+        session: Option<&str>,
+        request: Request,
+        expected_revision: Option<u64>,
+    ) -> Result<Response, Problem> {
+        let bytes = self.encode_at(session, request, expected_revision)?;
         let (mut send, mut recv) = self.open(conn).await?;
         // A server that refuses a frame by its length stops the stream:
         // what is left to write is never read. Only the reply says how it
@@ -267,13 +297,22 @@ impl Probe {
 
     /// `request` as the frame body [`Probe::request`] sends.
     pub fn encode(&self, session: Option<&str>, request: Request) -> Result<Vec<u8>, Problem> {
+        self.encode_at(session, request, None)
+    }
+
+    fn encode_at(
+        &self,
+        session: Option<&str>,
+        request: Request,
+        expected_revision: Option<u64>,
+    ) -> Result<Vec<u8>, Problem> {
         let wire = RpcRequest {
             envelope: RequestEnvelope {
                 session: session.map(|s| SessionId(s.to_owned())),
                 request,
             },
             operation: Some(self.operation()),
-            expected_revision: None,
+            expected_revision,
         };
         let bytes = codec::encode(&wire).map_err(|e| Problem::Failed(e.to_string()))?;
         // Within the protocol's own frame limit, or the length prefix
@@ -312,6 +351,62 @@ impl Probe {
         }
     }
 
+    /// `request` on a resource stream (bi kind 2), as a client sends it:
+    /// its response frame, and the bytes after it, at most `max_bytes`
+    /// of them.
+    pub async fn resource(
+        &self,
+        conn: &Connection,
+        request: &ResourceRequest,
+        max_bytes: usize,
+    ) -> Result<(ResourceResponse, Vec<u8>), Problem> {
+        let (mut send, mut recv) = self.open(conn).await?;
+        let _ = send.write_u8(bi::RESOURCE).await;
+        if let Err(e) = codec::write_frame(&mut send, request).await {
+            return Err(Problem::Failed(format!(
+                "cannot write the resource request: {e}"
+            )));
+        }
+        let _ = send.finish();
+        let response = match timeout(
+            self.reply_timeout,
+            codec::read_frame::<_, ResourceResponse>(&mut recv),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => return Err(self.failed(format!("no resource reply: {e}"))),
+            Err(_) => {
+                return Err(
+                    self.failed(format!("no resource reply within {:?}", self.reply_timeout))
+                );
+            }
+        };
+        if matches!(
+            response,
+            ResourceResponse::Error {
+                error: Error::Internal
+            }
+        ) {
+            if let Problem::Stop(stop) = self.failed("Internal".into()) {
+                return Err(Problem::Stop(stop));
+            }
+        } else {
+            self.answered();
+        }
+        let bytes = match timeout(self.reply_timeout, recv.read_to_end(max_bytes)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => return Err(Problem::Failed(format!("the resource's bytes: {e}"))),
+            Err(_) => {
+                return Err(Problem::Failed(format!(
+                    "the resource's bytes did not end within {:?}",
+                    self.reply_timeout
+                )));
+            }
+        };
+        Ok((response, bytes))
+    }
+
     /// A fresh operation for the server instance the last reply came from,
     /// for its clock: mutations need one, reads ignore it.
     fn operation(&self) -> Operation {
@@ -337,13 +432,21 @@ pub fn hello(device_name: Option<String>) -> Request {
 }
 
 pub fn hello_for(protocol_version: u32, device_name: Option<String>) -> Request {
+    hello_full(protocol_version, device_name, None)
+}
+
+fn hello_full(
+    protocol_version: u32,
+    device_name: Option<String>,
+    capabilities: Option<ClientCapabilities>,
+) -> Request {
     Request::Hello(Hello {
         protocol_version,
         client_name: "spoolframe-probe".into(),
         client_version: env!("CARGO_PKG_VERSION").into(),
         platform: Platform::Cli,
         device_name,
-        capabilities: None,
+        capabilities,
     })
 }
 

@@ -137,10 +137,16 @@ network {
 
 # The admin API (JSON-RPC over WebSocket) and the web UI.
 admin {
-  # Every IPv4 interface. Put something that terminates TLS in front of
-  # it (nginx, Caddy) and set public_url: over plain HTTP a browser drops
-  # the Secure session cookie, and passkeys do not work. "127.0.0.1:7421"
-  # for a host whose proxy runs on the same machine.
+  # Every IPv4 interface: for browsers on the LAN, or a proxy on another
+  # host, named in trusted_proxies. Over plain HTTP a browser drops the
+  # Secure session cookie, and passkeys do not work, so put something
+  # that terminates TLS in front of it (nginx, Caddy) and set public_url.
+  # With the proxy on this host, listen on loopback and name the proxy:
+  #   listen = "127.0.0.1:7421";
+  #   public_url = "https://media.example.org";
+  #   trusted_proxies = "127.0.0.1";
+  # The proxy connects from loopback, so without trusted_proxies every
+  # caller through it would look like loopback.
   listen = "0.0.0.0:7421";
   # Where browsers reach the web UI through a TLS reverse proxy. Its host
   # is what passkeys are bound to. Left out, a browser must reach the
@@ -152,8 +158,10 @@ admin {
   # trusted_proxies = "10.0.0.5, 172.17.0.0/16";
   # A loopback listen with a public_url means a proxy on this host, and
   # the server refuses to start without trusted_proxies: every caller
-  # would look like loopback. Set this only when nothing proxies to the
-  # listener (an SSH tunnel, a browser on this host).
+  # would look like loopback. On every interface with a public_url there
+  # may be one, and the server warns at start without trusted_proxies.
+  # Set this only when nothing proxies to the listener (an SSH tunnel,
+  # browsers that reach it directly).
   not_proxied = false;
   # Send the session cookie without Secure, so signing in over plain
   # HTTP on the LAN works. The cookie then crosses the LAN in clear, but

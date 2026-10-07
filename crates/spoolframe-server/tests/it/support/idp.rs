@@ -49,6 +49,9 @@ pub enum Mischief {
     Expired,
     /// Saying it is from another issuer.
     WrongIssuer,
+    /// Saying the account signed in at the provider an hour ago
+    /// (`auth_time`), as one that did not ask again would.
+    SignedInLongAgo,
 }
 
 /// Who signs in at the stand-in: a subject, and an email to show.
@@ -106,6 +109,10 @@ struct Grant {
     challenge: String,
     redirect_uri: String,
     client_id: String,
+    /// Whether the request asked how long ago the account signed in
+    /// (`max_age`): its ID token then says when (`auth_time`), as OpenID
+    /// Connect Core §3.1.2.1 requires.
+    max_age: bool,
 }
 
 #[derive(Default)]
@@ -120,6 +127,8 @@ struct Inner {
     document: Document,
     /// The `scope` of the last authorization request.
     scope: Option<String>,
+    /// The last authorization request's parameters.
+    last: HashMap<String, String>,
 }
 
 /// A running stand-in provider.
@@ -195,6 +204,12 @@ impl StandIn {
     pub fn last_scope(&self) -> Option<String> {
         self.inner.lock().scope.clone()
     }
+
+    /// The parameter `name` of the last authorization request, if it had
+    /// one.
+    pub fn last_asked(&self, name: &str) -> Option<String> {
+        self.inner.lock().last.get(name).cloned()
+    }
 }
 
 fn random() -> String {
@@ -257,6 +272,7 @@ fn grant(s: &Shared, params: &HashMap<String, String>, account: Account) -> Resp
             challenge: challenge.clone(),
             redirect_uri: redirect_uri.clone(),
             client_id: params.get("client_id").cloned().unwrap_or_default(),
+            max_age: params.contains_key("max_age"),
         },
     );
     let mut to = url::Url::parse(redirect_uri).unwrap();
@@ -272,6 +288,7 @@ async fn authorize(State(s): State<Arc<Shared>>, req: Request) -> Response {
         return (StatusCode::BAD_REQUEST, "response_type=code only").into_response();
     }
     s.inner.lock().scope = params.get("scope").cloned();
+    s.inner.lock().last = params.clone();
     let next = s.inner.lock().next.take();
     if let Some(account) = next {
         return grant(&s, &params, account);
@@ -428,7 +445,12 @@ async fn token(
             .set_preferred_username(grant.account.username.map(EndUserUsername::new)),
         EmptyAdditionalClaims {},
     )
-    .set_nonce(nonce.map(Nonce::new));
+    .set_nonce(nonce.map(Nonce::new))
+    .set_auth_time(if mischief == Some(Mischief::SignedInLongAgo) {
+        Some(now - chrono::Duration::hours(1))
+    } else {
+        grant.max_age.then_some(now)
+    });
     let key = if mischief == Some(Mischief::WrongKey) {
         &s.other
     } else {

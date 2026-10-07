@@ -48,6 +48,17 @@ struct Args {
     /// URL if left out.
     #[arg(long, requires = "web")]
     web_origin: Option<String>,
+    /// Also check playback ownership as the account: start one direct
+    /// playback, try its handle from another device signed in as the same
+    /// account (and as --second-username), then stop it.
+    #[arg(long, requires = "username")]
+    check_playback: bool,
+    /// A second consumer account, for the playback check's cross-user part.
+    #[arg(long, requires_all = ["second_password_file", "check_playback"])]
+    second_username: Option<String>,
+    /// Its password, alone in this file, as for --password-file.
+    #[arg(long, requires = "second_username")]
+    second_password_file: Option<PathBuf>,
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -76,12 +87,22 @@ async fn main() -> anyhow::Result<ExitCode> {
         }),
         _ => None,
     };
+    let second = match (&args.second_username, &args.second_password_file) {
+        (Some(username), Some(file)) => Some(Account {
+            username: username.clone(),
+            password: password(file)?,
+            web: None,
+        }),
+        _ => None,
+    };
     let config = Config {
         budget: args.budget,
         check_cap: args.check_cap,
         check_limits: args.check_limits,
         check_pool: args.check_pool,
         account,
+        check_playback: args.check_playback,
+        second,
         ..Config::new(target)
     };
     let report = run(&config).await?;

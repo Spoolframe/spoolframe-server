@@ -163,7 +163,8 @@ impl Store {
     }
 
     /// The user of a live API session: not revoked, not expired, and the
-    /// user not disabled.
+    /// user not disabled. Changes nothing; [`Store::use_api_session`] is a
+    /// use.
     pub async fn api_session(
         &self,
         token_hash: &str,
@@ -179,6 +180,48 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(id, stored, authenticated_at)| ApiSessionUser {
+            user: id,
+            role: role(stored),
+            authenticated_at,
+        }))
+    }
+
+    /// [`Store::api_session`], as a use: the session is renewed to
+    /// `idle_secs` from now, but never past `max_secs` after it was made,
+    /// written at most once a [`RENEW_EVERY_SECS`] (A-18).
+    pub async fn use_api_session(
+        &self,
+        token_hash: &str,
+        idle_secs: i64,
+        max_secs: i64,
+    ) -> Result<Option<ApiSessionUser>, StoreError> {
+        let now = self.now();
+        let row: Option<(LocalUserId, String, i64, i64)> = sqlx::query_as(
+            "SELECT u.id, u.role, s.authenticated_at, s.last_used_at \
+             FROM sessions s JOIN users u ON u.id = s.user_id \
+             WHERE s.token_hash = ?1 AND s.kind = 'api' AND s.revoked_at IS NULL \
+               AND s.expires_at > ?2 AND u.disabled_at IS NULL",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((id, stored, authenticated_at, last_used_at)) = row else {
+            return Ok(None);
+        };
+        if now - last_used_at >= RENEW_EVERY_SECS {
+            sqlx::query(
+                "UPDATE sessions SET last_used_at = ?2, expires_at = min(?3, created_at + ?4) \
+                 WHERE token_hash = ?1",
+            )
+            .bind(token_hash)
+            .bind(now)
+            .bind(now + idle_secs)
+            .bind(max_secs)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(Some(ApiSessionUser {
             user: id,
             role: role(stored),
             authenticated_at,

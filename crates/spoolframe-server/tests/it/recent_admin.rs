@@ -191,6 +191,45 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
             "settingUnset(plex.servers)",
             outcome(root.setting_unset("plex.servers".into()).await),
         ),
+        // Finding 57: what file is read and sent as the first server's
+        // token.
+        (
+            "settingSet(plex.token_file)",
+            outcome(
+                root.setting_set("plex.token_file".into(), json!("/etc/hostname"))
+                    .await,
+            ),
+        ),
+        (
+            "settingUnset(plex.token_file)",
+            outcome(root.setting_unset("plex.token_file".into()).await),
+        ),
+        // Finding 56: where every span, metric and log record is sent,
+        // and the secret headers sent with them.
+        (
+            "settingSet(telemetry.otlp.endpoint)",
+            outcome(
+                root.setting_set(
+                    "telemetry.otlp.endpoint".into(),
+                    json!("http://10.9.9.9:4317"),
+                )
+                .await,
+            ),
+        ),
+        (
+            "settingUnset(telemetry.otlp.endpoint)",
+            outcome(root.setting_unset("telemetry.otlp.endpoint".into()).await),
+        ),
+        (
+            "settingSet(telemetry.otlp.headers)",
+            outcome(
+                root.setting_set(
+                    "telemetry.otlp.headers".into(),
+                    json!("authorization=Bearer x"),
+                )
+                .await,
+            ),
+        ),
         // The first server added keeps a token set before it (the
         // wizard's), so adding it says where that token goes. Nothing
         // answers at port 1: a confirmed session is refused at once.
@@ -216,7 +255,14 @@ async fn an_old_admin_session_cannot_make_sensitive_changes() {
         assert_eq!(outcome, Some(error_code::RECENT_SIGN_IN_REQUIRED), "{call}");
     }
     let settings = root.settings().await.unwrap();
-    for key in ["plex.token", "plex.url", "plex.servers"] {
+    for key in [
+        "plex.token",
+        "plex.url",
+        "plex.servers",
+        "plex.token_file",
+        "telemetry.otlp.endpoint",
+        "telemetry.otlp.headers",
+    ] {
         let entry = settings.entries.iter().find(|e| e.key == key);
         assert!(entry.is_some_and(|e| !e.set), "{entry:?}");
     }

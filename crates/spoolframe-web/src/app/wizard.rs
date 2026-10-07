@@ -231,8 +231,9 @@ pub(super) fn Note(
 ) -> Element {
     let key = setting;
     let mut restarting = use_signal(|| None::<String>);
-    // A sensitive setting (`admin.*`, `auth.*`, `media.*`, `plex.token`),
-    // from an old session: "Confirm it's you" first, then the same change
+    // A sensitive setting (`admin.*`, `auth.*`, `media.*`, `telemetry.*`,
+    // `plex.token`, `plex.token_file`, `plex.url`, `plex.servers`), from
+    // an old session: "Confirm it's you" first, then the same change
     // again.
     let confirming = use_signal(|| None::<String>);
     let use_file = use_callback(move |()| {

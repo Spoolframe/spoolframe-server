@@ -16,8 +16,9 @@
 //!   run;
 //! - the stranger-cap check opens at most cap+1 connections, one at a
 //!   time, and only when asked ([`Config::check_cap`]); the sign-in check
-//!   only when asked ([`Config::check_limits`]), and only for a username
-//!   it makes up.
+//!   only when asked ([`Config::check_limits`]), only for a username it
+//!   makes up, and from a key of its own, so the source it locks is not
+//!   the run's.
 //! - the anonymous-pool check holds the pool's attention for
 //!   [`Config::pool_seconds`] with [`Config::pool_spammers`] strangers,
 //!   and only when asked ([`Config::check_pool`]). It is last: it holds
@@ -30,9 +31,15 @@
 //! and refusals that would be harmless were they not refused. Every
 //! session it makes is signed out at the end, and the report says what
 //! the account still lists.
+//!
+//! Only when asked ([`Config::check_playback`]), it starts one direct
+//! playback as the account and tries its handle from another device of
+//! the same account, and of [`Config::second`] if given (`playback`).
+//! Nothing it sends there changes more than that playback.
 
 mod account;
 mod checks;
+mod playback;
 pub mod web;
 pub mod wire;
 
@@ -74,6 +81,12 @@ pub struct Config {
     pub pool_drain: Duration,
     /// Sign in as this account for the signed-in checks.
     pub account: Option<Account>,
+    /// Run the playback-ownership check: start one direct playback as
+    /// [`Config::account`], and try its handle from other devices.
+    pub check_playback: bool,
+    /// A second consumer account, for the playback-ownership check's
+    /// cross-user part. Its `web` is not used.
+    pub second: Option<Account>,
 }
 
 /// A consumer account the run signs in as. The password is never shown:
@@ -148,6 +161,8 @@ impl Config {
             pool_seconds: 45,
             pool_drain: Duration::from_secs(40),
             account: None,
+            check_playback: false,
+            second: None,
         }
     }
 }

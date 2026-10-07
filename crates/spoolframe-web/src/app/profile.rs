@@ -33,11 +33,10 @@ pub fn Profile() -> Element {
     // Kept here: the PIN card sets and removes it, and the devices card
     // asks for it only once there is one.
     let has_pin = use_signal(|| user.has_pin);
-    // What a sign-in provider's callback sent the browser here to say.
-    let said = use_hook(|| {
-        http::sso_outcome("/profile")
-            .and_then(|(what, provider)| crate::sso::profile_message(&what, provider.as_deref()))
-    });
+    // What a sign-in provider's callback sent the browser here to say:
+    // put in words by the sign-in methods card, once it knows the
+    // server's providers (A-16).
+    let said = use_hook(|| http::sso_outcome("/profile"));
     if user.role == Role::Admin {
         // In the admin shell (WebAdminProfile): two columns on a wide
         // screen, one on a phone in `order`.
@@ -313,18 +312,34 @@ fn provider_name(link: &SsoLink) -> String {
 /// sign-in providers (P3-04): each configured one linked or not, and any
 /// link whose provider is gone.
 #[component]
-fn Passkeys(has_password: Signal<bool>, said: Option<(Tone, String)>) -> Element {
+fn Passkeys(has_password: Signal<bool>, said: Option<(String, Option<String>)>) -> Element {
     let mut list = use_resource(passkeys);
     let host = use_resource(host);
     let mut links = use_resource(sso_links);
     let site = use_resource(http::site);
-    let (said_good, said_bad) = match said {
-        Some((Tone::Good, text)) => (Some(text), None),
-        Some((Tone::Bad, text)) => (None, Some(text)),
-        None => (None, None),
-    };
-    let mut notice = use_signal(|| said_good);
-    let mut error = use_signal(|| said_bad);
+    let mut notice = use_signal(|| None::<String>);
+    let mut error = use_signal(|| None::<String>);
+    // What the provider's callback said, shown once the server's providers
+    // are known: `?provider=` is anyone's to write, and only a configured
+    // provider is named (A-16).
+    let mut unsaid = use_signal(|| said);
+    use_effect(move || {
+        let Some(loaded) = &*site.read() else {
+            return;
+        };
+        let Some((what, provider)) = unsaid.write().take() else {
+            return;
+        };
+        let configured = loaded
+            .as_ref()
+            .map(|s| s.sso.as_slice())
+            .unwrap_or_default();
+        match crate::sso::profile_message(&what, provider.as_deref(), configured) {
+            Some((Tone::Good, text)) => notice.set(Some(text)),
+            Some((Tone::Bad, text)) => error.set(Some(text)),
+            None => {}
+        }
+    });
     // The registration the server began, while the dialog naming the new
     // passkey is open.
     let mut adding = use_signal(|| None::<Value>);

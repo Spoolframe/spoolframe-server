@@ -21,7 +21,9 @@ use std::time::Duration;
 use iroh::Endpoint;
 use iroh::endpoint::{ConnectionError, VarInt};
 use serde_json::{Value, json};
-use spoolframe_protocol::{Error, LoginPassword, Reply, Request, Response, UserSummary, close};
+use spoolframe_protocol::{
+    Error, LoginPassword, PlaybackHandle, Reply, Request, Response, UserSummary, close,
+};
 use spoolframe_types::{LibraryId, MediaId, MediaKind, Namespace, Role};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -36,7 +38,7 @@ use crate::{Account, Config};
 const SIGN_OUT_WAIT: Duration = Duration::from_secs(5);
 
 /// The device name the probe's sign-in shows in the account's devices.
-const DEVICE_NAME: &str = "spoolframe-probe";
+pub(crate) const DEVICE_NAME: &str = "spoolframe-probe";
 
 /// Admin reads a consumer must be refused, with the params each takes
 /// (`admin.userList` is `admin_userList` on the wire: jsonrpsee joins a
@@ -59,14 +61,22 @@ fn admin_reads() -> [(&'static str, Value); 9] {
     ]
 }
 
-/// The run's QUIC sign-in as the account.
+/// A QUIC sign-in the run made: the account's, or another device's.
 pub(crate) struct Signed {
-    /// The account's own fresh key: not the run's, which the stranger
-    /// checks may have locked out of signing in (`sign-in-limits`).
-    endpoint: Endpoint,
-    conn: Conn,
-    session: String,
-    user: UserSummary,
+    /// A fresh key of its own: not the run's, which the stranger checks
+    /// may have locked out of signing in (`sign-in-limits`).
+    pub(crate) endpoint: Endpoint,
+    pub(crate) conn: Conn,
+    pub(crate) session: String,
+    pub(crate) user: UserSummary,
+}
+
+/// A playback the run started, until it is stopped: [`AccountState::finish`]
+/// stops it if the check that started it could not.
+pub(crate) struct Playing {
+    pub(crate) conn: Arc<Conn>,
+    pub(crate) session: String,
+    pub(crate) handle: PlaybackHandle,
 }
 
 enum Quic {
@@ -105,6 +115,7 @@ macro_rules! ready {
         }
     };
 }
+pub(crate) use ready;
 
 /// The account to sign in as, if the run was given one.
 fn asked(config: &Config) -> Result<&Account, NotSigned> {
@@ -119,8 +130,14 @@ fn asked(config: &Config) -> Result<&Account, NotSigned> {
 pub(crate) struct AccountState {
     quic: Mutex<Quic>,
     web: Mutex<Browser>,
-    /// The key the account signed in from, once it has.
-    key: parking_lot::Mutex<Option<Endpoint>>,
+    /// Every key the run signed in from, the account's first: closed at
+    /// the end, and marked in what the account still lists.
+    keys: parking_lot::Mutex<Vec<Endpoint>>,
+    /// Other devices' sign-ins (`playback-ownership`), by what they are
+    /// called in the report, until they are signed out.
+    others: parking_lot::Mutex<Vec<(String, Arc<Signed>)>>,
+    /// A playback the run started and has not stopped yet.
+    playing: parking_lot::Mutex<Option<Playing>>,
     /// What was done as the account, for the report.
     log: parking_lot::Mutex<Vec<String>>,
 }
@@ -130,33 +147,33 @@ impl AccountState {
         Self {
             quic: Mutex::new(Quic::NotYet),
             web: Mutex::new(Browser::NotYet),
-            key: parking_lot::Mutex::default(),
+            keys: parking_lot::Mutex::default(),
+            others: parking_lot::Mutex::default(),
+            playing: parking_lot::Mutex::default(),
             log: parking_lot::Mutex::default(),
         }
     }
 
-    fn note(&self, line: String) {
+    pub(crate) fn note(&self, line: String) {
         self.log.lock().push(line);
     }
 
-    /// The QUIC session, signing in the first time.
-    async fn signed(&self, probe: &Probe, config: &Config) -> Result<Arc<Signed>, NotSigned> {
-        let account = asked(config)?;
-        let mut quic = self.quic.lock().await;
-        match &*quic {
-            Quic::In(signed) => return Ok(signed.clone()),
-            Quic::Out => return Err(NotSigned::Skip("signed out already".into())),
-            Quic::Refused(why) => {
-                return Err(NotSigned::Skip(format!("the sign-in failed: {why}")));
-            }
-            Quic::NotYet => {}
-        }
+    /// Sign `account` in from a fresh key, as a device named `device`.
+    /// `Ok(Err(why))`: refused, and not to be tried again (a wrong
+    /// password counts towards the name's lockout).
+    async fn sign_in(
+        &self,
+        probe: &Probe,
+        account: &Account,
+        device: &str,
+    ) -> Result<Result<Signed, String>, Problem> {
         let endpoint = bind()
             .await
-            .map_err(|e| Problem::Failed(format!("cannot bind the account's key: {e}")))?;
-        *self.key.lock() = Some(endpoint.clone());
+            .map_err(|e| Problem::Failed(format!("cannot bind a fresh key: {e}")))?;
+        // Closed at the end, whatever happens from here.
+        self.keys.lock().push(endpoint.clone());
         let (conn, _) = probe
-            .connect_hello_with(&endpoint, Some(DEVICE_NAME.into()))
+            .connect_hello_with(&endpoint, Some(device.into()))
             .await?;
         let login = Request::LoginPassword(LoginPassword {
             username: account.username.clone(),
@@ -170,7 +187,8 @@ impl AccountState {
                 remembered,
             }) => {
                 self.note(format!(
-                    "QUIC: signed in as {:?} from a fresh key {} (remembered {remembered})",
+                    "QUIC: signed in as {:?} from a fresh key {} named {device:?} \
+                     (remembered {remembered})",
                     account.username,
                     endpoint.id().fmt_short()
                 ));
@@ -183,9 +201,7 @@ impl AccountState {
                     describe(&other)
                 );
                 self.note(format!("QUIC: {why}"));
-                *quic = Quic::Refused(why.clone());
-                // Not tried again, by this check or any other.
-                return Err(NotSigned::Problem(Problem::Failed(why)));
+                return Ok(Err(why));
             }
         };
         let user = match probe.request(&conn, Some(&session), Request::WhoAmI).await {
@@ -202,22 +218,95 @@ impl AccountState {
                     Err(e) => format!("NOT signed out: {e}"),
                 };
                 self.note(format!("QUIC: {why}; {out}"));
-                *quic = Quic::Refused(why.clone());
-                return Err(NotSigned::Problem(Problem::Failed(why)));
+                return Ok(Err(why));
             }
         };
-        let signed = Arc::new(Signed {
+        Ok(Ok(Signed {
             endpoint,
             conn,
             session,
             user,
-        });
+        }))
+    }
+
+    /// Another device signed in as `account` (`label` in the report),
+    /// kept until [`Self::sign_out_other`] or the end of the run.
+    pub(crate) async fn sign_in_other(
+        &self,
+        probe: &Probe,
+        account: &Account,
+        device: &str,
+        label: &str,
+    ) -> Result<Result<Arc<Signed>, String>, Problem> {
+        Ok(match self.sign_in(probe, account, device).await? {
+            Ok(signed) => {
+                let signed = Arc::new(signed);
+                self.others.lock().push((label.to_owned(), signed.clone()));
+                Ok(signed)
+            }
+            Err(why) => Err(why),
+        })
+    }
+
+    /// Sign out another device's session: the line for the report.
+    pub(crate) async fn sign_out_other(&self, probe: &Probe, signed: &Arc<Signed>) -> String {
+        let label = {
+            let mut others = self.others.lock();
+            let at = others.iter().position(|(_, s)| Arc::ptr_eq(s, signed));
+            at.map(|at| others.remove(at).0)
+        };
+        let Some(label) = label else {
+            return "signed out already".into();
+        };
+        let line = match logout(probe, &signed.endpoint, &signed.conn, &signed.session).await {
+            Ok(done) => format!("QUIC, {label}: {done}"),
+            Err(why) => format!("QUIC, {label}: NOT signed out: {why}"),
+        };
+        self.note(line.clone());
+        line
+    }
+
+    /// Keep `playing` until [`Self::stopped`].
+    pub(crate) fn playing(&self, playing: Playing) {
+        *self.playing.lock() = Some(playing);
+    }
+
+    /// The playback the run started is stopped.
+    pub(crate) fn stopped(&self) {
+        *self.playing.lock() = None;
+    }
+
+    /// The QUIC session, signing in the first time.
+    async fn signed(&self, probe: &Probe, config: &Config) -> Result<Arc<Signed>, NotSigned> {
+        let account = asked(config)?;
+        let mut quic = self.quic.lock().await;
+        match &*quic {
+            Quic::In(signed) => return Ok(signed.clone()),
+            Quic::Out => return Err(NotSigned::Skip("signed out already".into())),
+            Quic::Refused(why) => {
+                return Err(NotSigned::Skip(format!("the sign-in failed: {why}")));
+            }
+            Quic::NotYet => {}
+        }
+        let signed = match self.sign_in(probe, account, DEVICE_NAME).await? {
+            Ok(signed) => signed,
+            Err(why) => {
+                *quic = Quic::Refused(why.clone());
+                // Not tried again, by this check or any other.
+                return Err(NotSigned::Problem(Problem::Failed(why)));
+            }
+        };
+        let signed = Arc::new(signed);
         *quic = Quic::In(signed.clone());
         Ok(signed)
     }
 
     /// As [`Self::signed`], for a check that needs the profile unlocked.
-    async fn unlocked(&self, probe: &Probe, config: &Config) -> Result<Arc<Signed>, NotSigned> {
+    pub(crate) async fn unlocked(
+        &self,
+        probe: &Probe,
+        config: &Config,
+    ) -> Result<Arc<Signed>, NotSigned> {
         let signed = self.signed(probe, config).await?;
         if signed.user.locked {
             return Err(NotSigned::Skip(
@@ -264,6 +353,17 @@ impl AccountState {
     /// still lists. Run after the checks, whatever happened in them.
     pub async fn finish(&self, probe: &Probe, config: &Config) -> Vec<String> {
         probe.cleaning_up();
+        let playing = self.playing.lock().take();
+        if let Some(playing) = playing {
+            let line = crate::playback::stop_left(probe, &playing).await;
+            self.note(format!(
+                "QUIC: the run's playback, left playing by its check: {line}"
+            ));
+        }
+        let others: Vec<Arc<Signed>> = self.others.lock().iter().map(|(_, s)| s.clone()).collect();
+        for other in others {
+            self.sign_out_other(probe, &other).await;
+        }
         let quic = std::mem::replace(&mut *self.quic.lock().await, Quic::Out);
         if let Quic::In(signed) = quic {
             let line = match logout(probe, &signed.endpoint, &signed.conn, &signed.session).await {
@@ -287,30 +387,31 @@ impl AccountState {
                 "the account's sessions and devices were not listed: no web listener given".into(),
             );
         }
-        let key = self.key.lock().take();
-        if let Some(key) = key {
+        let keys = std::mem::take(&mut *self.keys.lock());
+        for key in keys {
             key.close().await;
         }
         std::mem::take(&mut *self.log.lock())
     }
 
     /// What the account lists from its web session, every QUIC session of
-    /// the run's ended by now: the key it signed in from is marked.
+    /// the run's ended by now: the keys the run signed in from are marked.
     async fn left_behind(&self, probe: &Probe, session: &WebSession) {
-        let own = self
-            .key
+        let own: Vec<String> = self
+            .keys
             .lock()
-            .as_ref()
+            .iter()
             .map(|k| k.id().to_string())
-            .unwrap_or_default();
+            .collect();
+        let own = |id: Option<&str>| id.is_some_and(|id| own.iter().any(|k| k == id));
         match session.call(probe, "me_sessions", json!([])).await {
             Ok(Answer::Result(Value::Array(sessions))) => {
                 let probe_sessions = sessions
                     .iter()
-                    .filter(|s| s["endpointId"].as_str() == Some(own.as_str()))
+                    .filter(|s| own(s["endpointId"].as_str()))
                     .count();
                 self.note(format!(
-                    "me.sessions: {} live, {probe_sessions} of them from this run's QUIC key, \
+                    "me.sessions: {} live, {probe_sessions} of them from this run's QUIC keys, \
                      1 of them this web session",
                     sessions.len()
                 ));
@@ -326,7 +427,7 @@ impl AccountState {
                     .map(|d| {
                         let id = d["endpointId"].as_str().unwrap_or("?");
                         let name = d["name"].as_str().unwrap_or("(no name)");
-                        let mark = if id == own { " (this run's)" } else { "" };
+                        let mark = if own(Some(id)) { " (this run's)" } else { "" };
                         format!("{}… {name:?}{mark}", &id[..id.len().min(10)])
                     })
                     .collect();
@@ -345,7 +446,7 @@ impl AccountState {
 
 /// `Logout` for `session` on `conn` or, if that is gone, on a new
 /// connection from the same key.
-async fn logout(
+pub(crate) async fn logout(
     probe: &Probe,
     endpoint: &Endpoint,
     conn: &Conn,
@@ -370,7 +471,7 @@ async fn logout(
     }
 }
 
-fn problem(p: Problem) -> String {
+pub(crate) fn problem(p: Problem) -> String {
     match p {
         Problem::Failed(why) => why,
         Problem::Stop(stop) => stop.to_string(),

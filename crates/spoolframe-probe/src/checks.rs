@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, timeout};
 
 use crate::account::{self, AccountState};
-use crate::wire::{Conn, Probe, Problem, describe, hello, hello_for};
+use crate::wire::{Conn, Probe, Problem, bind, describe, hello, hello_for};
 use crate::{Config, Status};
 
 /// How long an open the server gives no credit for is given. Credit comes
@@ -141,13 +141,14 @@ pub enum Check {
     Visibility,
     RecentSignIn,
     SignedInStreams,
+    PlaybackOwnership,
     SessionReread,
     StrangerCap,
     AnonymousPool,
 }
 
 impl Check {
-    pub const ALL: [Check; 15] = [
+    pub const ALL: [Check; 16] = [
         Check::HelloVersion,
         Check::Unauthenticated,
         Check::UniStream,
@@ -161,6 +162,9 @@ impl Check {
         Check::Visibility,
         Check::RecentSignIn,
         Check::SignedInStreams,
+        // Only when asked (`--check-playback`); device A is the account's
+        // sign-in, so before session-reread signs it out.
+        Check::PlaybackOwnership,
         Check::SessionReread,
         // It fills the server's stranger slots; the anonymous-pool check
         // after it meets a server with them free again.
@@ -185,6 +189,7 @@ impl Check {
             Check::Visibility => "visibility",
             Check::RecentSignIn => "recent-sign-in",
             Check::SignedInStreams => "signed-in-streams",
+            Check::PlaybackOwnership => "playback-ownership",
             Check::SessionReread => "session-reread",
             Check::StrangerCap => "stranger-cap",
             Check::AnonymousPool => "anonymous-pool",
@@ -212,6 +217,9 @@ impl Check {
             Check::RecentSignIn => "a fresh session passes the recent sign-in check",
             Check::SignedInStreams => {
                 "a signed-in connection gets more streams than a stranger's limit"
+            }
+            Check::PlaybackOwnership => {
+                "a playback's handle is refused to another device and another user"
             }
             Check::SessionReread => {
                 "the session works till Logout, which closes SIGNED_OUT and ends it"
@@ -255,6 +263,9 @@ impl Check {
             Check::Visibility => account::visibility(probe, config, state).await,
             Check::RecentSignIn => account::recent_sign_in(probe, config, state).await,
             Check::SignedInStreams => account::signed_in_streams(probe, config, state).await,
+            Check::PlaybackOwnership => {
+                crate::playback::playback_ownership(probe, config, state).await
+            }
             Check::SessionReread => account::session_reread(probe, config, state).await,
         }
     }
@@ -462,12 +473,28 @@ async fn first_frame(probe: &Probe, config: &Config) -> Result<Outcome, Problem>
     Ok(f.done())
 }
 
-/// Check 5: failed logins for a username no server has, made from this
-/// run's own fresh key: `failures` are refused as wrong, the next is
-/// `RateLimited`. Never a real username.
+/// Check 5: failed logins for a username no server has, made from a fresh
+/// key of the check's own: `failures` are refused as wrong, the next is
+/// `RateLimited`. Never a real username. Not the run's key: the failures
+/// lock their source for the failure window, and the anonymous-pool
+/// check's logins from the run's key would then be `RateLimited` too
+/// (the third review's G-16).
 async fn sign_in_limits(probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
+    let key = bind()
+        .await
+        .map_err(|e| Problem::Failed(format!("cannot bind the check's key: {e}")))?;
+    let outcome = sign_in_limits_from(probe, config, &key).await;
+    key.close().await;
+    outcome
+}
+
+async fn sign_in_limits_from(
+    probe: &Probe,
+    config: &Config,
+    key: &iroh::Endpoint,
+) -> Result<Outcome, Problem> {
     let mut f = Findings::default();
-    let (conn, _) = probe.connect_hello().await?;
+    let (conn, _) = probe.connect_hello_from(key).await?;
     let id = probe.id().to_string();
     let username = format!("spoolframe-probe-{}", &id[..16]);
     f.note(format!("username {username:?}, made up for this run"));

@@ -733,6 +733,19 @@ async fn run(
              taken as local and share one failure limit"
         );
     }
+    // Finding 58: on every interface, a proxy on this host is as likely
+    // as browsers coming straight in, so this is said, not refused.
+    if config.admin.proxy_maybe_unnamed()? {
+        tracing::warn!(
+            listen = %admin_listen,
+            "admin.trusted_proxies is empty, but admin.public_url is set: if a proxy on this \
+             host is in front, every caller through it looks like loopback, so failed logins \
+             are not limited per caller, and /metrics, when on, answers whoever the proxy lets \
+             in. Set admin.trusted_proxies to the proxy's address (\"127.0.0.1\" for one on \
+             this host), better with admin.listen on loopback; or, if nothing proxies to this \
+             listener, set admin.not_proxied = true"
+        );
+    }
     // Without a public URL, a browser's page is the listener's own port
     // (PX-09 finding 28).
     let passkeys = Arc::new(Passkeys::at(

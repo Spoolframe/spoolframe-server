@@ -298,6 +298,55 @@ async fn a_loopback_listener_said_not_to_be_proxied_starts() {
     running.stop_cleanly();
 }
 
+/// `config`'s listener moved to every IPv4 interface, on the same port.
+fn on_every_interface(config: &Path) {
+    let text = std::fs::read_to_string(config)
+        .unwrap()
+        .replace(r#"listen = "127.0.0.1:"#, r#"listen = "0.0.0.0:"#);
+    std::fs::write(config, text).unwrap();
+}
+
+/// Finding 58 (the third review's G-9): a listener on every interface
+/// with a public URL may have a proxy on this host in front, whose
+/// callers would all look like loopback. Browsers may as well reach it
+/// directly, as the dev server's do, so it starts, and says what to set.
+#[tokio::test]
+async fn a_public_url_on_every_interface_without_trusted_proxies_is_warned_of() {
+    let (_tmp, config) = config_with_state("wildcard-proxy", &closed_port_url()).await;
+    on_every_interface(&config);
+    // The dev server's shape.
+    with_admin(
+        &config,
+        r#"public_url = "http://localhost:7431"; insecure_cookies = true;"#,
+    );
+    let (running, log) = Running::start(&config);
+    assert!(log.contains("admin API listening"), "{log}");
+    let warning = log
+        .lines()
+        .find(|line| line.contains("WARN") && line.contains("admin.trusted_proxies"));
+    assert!(
+        warning.is_some_and(|line| line.contains("admin.not_proxied")),
+        "{log}"
+    );
+    running.stop_cleanly();
+}
+
+/// The same shape says nothing once the config says nothing proxies to
+/// the listener.
+#[tokio::test]
+async fn a_public_url_on_every_interface_said_not_to_be_proxied_is_not_warned_of() {
+    let (_tmp, config) = config_with_state("wildcard-not-proxied", &closed_port_url()).await;
+    on_every_interface(&config);
+    with_admin(
+        &config,
+        r#"public_url = "https://media.example.org"; not_proxied = true;"#,
+    );
+    let (running, log) = Running::start(&config);
+    assert!(log.contains("admin API listening"), "{log}");
+    assert!(!log.contains("admin.trusted_proxies"), "{log}");
+    running.stop_cleanly();
+}
+
 /// `config` with `media { … }` added.
 fn with_media(config: &Path, media: &str) {
     let mut text = std::fs::read_to_string(config).unwrap();

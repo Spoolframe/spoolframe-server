@@ -27,8 +27,14 @@ use crate::store::{Store, StoreError};
 /// How long a client (Iroh endpoint) session lasts after its last use.
 /// Use renews it, so a TV in use never signs out.
 pub const ENDPOINT_SESSION: Duration = Duration::from_secs(90 * 24 * 3600);
-/// How long an admin API session lasts.
+/// The longest an admin API (web UI) session lasts, from its sign-in,
+/// however much it is used.
 pub const API_SESSION: Duration = Duration::from_secs(12 * 3600);
+/// How long an admin API session lasts unused (A-18): a use renews it,
+/// within [`API_SESSION`], as a client's is renewed. A browser left
+/// signed in, or a cookie taken from it, is good for an hour after the
+/// last use, not for the rest of the 12.
+pub const API_SESSION_IDLE: Duration = Duration::from_secs(3600);
 
 /// Failed attempts allowed per username and per source within
 /// [`FAILURE_WINDOW`] before logins are refused without checking.
@@ -798,7 +804,7 @@ impl Auth {
     ) -> Result<SessionToken, StoreError> {
         let lifetime = match binding {
             SessionBinding::Endpoint { .. } => ENDPOINT_SESSION,
-            SessionBinding::Api => API_SESSION,
+            SessionBinding::Api => API_SESSION_IDLE,
         };
         let token = SessionToken::generate();
         self.store
@@ -953,7 +959,7 @@ impl Auth {
         let account = self.check_password(username, password, source).await?;
         let lifetime = match binding {
             SessionBinding::Endpoint { .. } => ENDPOINT_SESSION,
-            SessionBinding::Api => API_SESSION,
+            SessionBinding::Api => API_SESSION_IDLE,
         };
 
         let token = SessionToken::generate();
@@ -1045,16 +1051,22 @@ impl Auth {
                 &token.hash(),
                 user,
                 &SessionBinding::Api,
-                self.store.now() + API_SESSION.as_secs() as i64,
+                self.store.now() + API_SESSION_IDLE.as_secs() as i64,
             )
             .await?;
         Ok(token)
     }
 
-    /// The user behind an API session token, if it is live.
+    /// The user behind an API session token, if it is live. Renews the
+    /// session for [`API_SESSION_IDLE`], within [`API_SESSION`] of its
+    /// sign-in.
     pub async fn api_session(&self, token: &str) -> Result<Option<ApiSessionUser>, StoreError> {
         self.store
-            .api_session(&SessionToken(token.to_owned()).hash())
+            .use_api_session(
+                &SessionToken(token.to_owned()).hash(),
+                API_SESSION_IDLE.as_secs() as i64,
+                API_SESSION.as_secs() as i64,
+            )
             .await
     }
 
@@ -1086,6 +1098,7 @@ mod tests {
     use super::*;
     use crate::store::tests::state_dir;
 
+    mod api_sessions;
     mod device_sign_in;
     mod pins;
 

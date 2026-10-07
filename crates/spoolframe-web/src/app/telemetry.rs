@@ -136,8 +136,9 @@ fn TelemetryFields(
 
     let headers_were_set = entry(s, "telemetry.otlp.headers").is_some_and(|e| e.set);
     let saved = settings.clone();
-    // The metrics settings are `admin.*`: from an old session, "Confirm
-    // it's you" first, then the save again.
+    // The metrics settings are `admin.*` and the export's `telemetry.*`
+    // (finding 56): from an old session, "Confirm it's you" first, then
+    // the save again.
     let confirming = use_signal(|| None::<String>);
     let on_save = use_callback(move |()| {
         let s = saved.clone();
@@ -227,7 +228,7 @@ fn TelemetryFields(
             };
             match done.await {
                 Ok(()) => on_done.call(()),
-                Err(e) if asks_to_confirm(&e, confirming, "changing who reads metrics") => {}
+                Err(e) if asks_to_confirm(&e, confirming, "changing who reads telemetry") => {}
                 Err(e) => error.set(Some(e.explain())),
             }
             busy.set(false);

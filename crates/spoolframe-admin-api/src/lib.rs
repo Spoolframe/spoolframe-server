@@ -2440,9 +2440,11 @@ pub trait AdminApi {
     /// with the message the file would get. `SETTING_LOCKED` for what the
     /// locked config file sets. A live setting applies at once; a restart
     /// one is saved, and `restartPending`. `plex.token` is kept as a
-    /// secret, never in the runtime settings. An `admin.*`, `auth.*` or
-    /// `media.*` key, or `plex.token`, needs a recent sign-in (PX-10), as
-    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
+    /// secret, never in the runtime settings. An `admin.*`, `auth.*`,
+    /// `media.*` or `telemetry.*` key, or `plex.token`,
+    /// `plex.token_file`, `plex.url` or `plex.servers`, needs a recent
+    /// sign-in (PX-10), as `me.*` changes do: `RECENT_SIGN_IN_REQUIRED`
+    /// otherwise.
     #[method(name = "settingSet", with_extensions)]
     async fn setting_set(
         &self,
@@ -2451,9 +2453,10 @@ pub trait AdminApi {
     ) -> jsonrpsee::core::RpcResult<SettingEntry>;
 
     /// Take `key` out of the runtime settings: the config file's value or
-    /// the default applies again. An `admin.*`, `auth.*` or `media.*`
-    /// key, or `plex.token`, needs a recent sign-in (PX-10), as
-    /// `me.*` changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
+    /// the default applies again. An `admin.*`, `auth.*`, `media.*` or
+    /// `telemetry.*` key, or `plex.token`, `plex.token_file`, `plex.url`
+    /// or `plex.servers`, needs a recent sign-in (PX-10), as `me.*`
+    /// changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "settingUnset", with_extensions)]
     async fn setting_unset(&self, key: String) -> jsonrpsee::core::RpcResult<SettingEntry>;
 

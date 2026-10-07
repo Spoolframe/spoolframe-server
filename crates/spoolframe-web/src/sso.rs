@@ -71,10 +71,22 @@ fn hex(b: u8) -> Option<u8> {
     (b as char).to_digit(16).map(|d| d as u8)
 }
 
+/// `provider` if it is one of `configured`, the providers the server
+/// says it has. `?provider=` is anyone's to write, in a link sent to
+/// someone, so a name the server does not have is never shown (A-16).
+fn configured_name<'a>(provider: Option<&'a str>, configured: &[String]) -> Option<&'a str> {
+    provider.filter(|p| configured.iter().any(|c| c == p))
+}
+
 /// The login page's message for what happened (the WebLoginPhone board's
-/// for an account that is not linked).
-pub fn login_message(what: &str, provider: Option<&str>) -> Option<(Tone, String)> {
-    let name = provider.unwrap_or("The sign-in provider");
+/// for an account that is not linked), naming `provider` only if it is
+/// one of `configured`.
+pub fn login_message(
+    what: &str,
+    provider: Option<&str>,
+    configured: &[String],
+) -> Option<(Tone, String)> {
+    let name = configured_name(provider, configured).unwrap_or("The sign-in provider");
     let text = match what {
         "unlinked" => "This account is not linked to a Spoolframe user. Sign in another way and link it in My profile, or ask your admin.".to_owned(),
         "unavailable" => format!("{name} can't be reached right now. Sign in another way, or try again later."),
@@ -86,9 +98,14 @@ pub fn login_message(what: &str, provider: Option<&str>) -> Option<(Tone, String
     Some((Tone::Bad, text))
 }
 
-/// My profile's message for what happened.
-pub fn profile_message(what: &str, provider: Option<&str>) -> Option<(Tone, String)> {
-    let name = provider.unwrap_or("the sign-in provider");
+/// My profile's message for what happened, naming `provider` only if it
+/// is one of `configured`.
+pub fn profile_message(
+    what: &str,
+    provider: Option<&str>,
+    configured: &[String],
+) -> Option<(Tone, String)> {
+    let name = configured_name(provider, configured).unwrap_or("the sign-in provider");
     let (tone, text) = match what {
         "linked" => (
             Tone::Good,
@@ -166,7 +183,7 @@ mod tests {
 
     #[test]
     fn an_unlinked_account_gets_the_board_s_words() {
-        let (tone, text) = login_message("unlinked", Some("Pocket ID")).unwrap();
+        let (tone, text) = login_message("unlinked", Some("Pocket ID"), &configured()).unwrap();
         assert_eq!(tone, Tone::Bad);
         assert_eq!(
             text,
@@ -177,23 +194,57 @@ mod tests {
     #[test]
     fn messages_name_the_provider_and_say_good_from_bad() {
         assert_eq!(
-            profile_message("linked", Some("Pocket ID")),
+            profile_message("linked", Some("Pocket ID"), &configured()),
             Some((
                 Tone::Good,
                 "Pocket ID is linked. You can sign in with it now.".into()
             ))
         );
         assert_eq!(
-            profile_message("taken", Some("Pocket ID")).unwrap().0,
+            profile_message("taken", Some("Pocket ID"), &configured())
+                .unwrap()
+                .0,
             Tone::Bad
         );
         assert!(
-            login_message("unavailable", Some("Pocket ID"))
+            login_message("unavailable", Some("Pocket ID"), &configured())
                 .unwrap()
                 .1
                 .starts_with("Pocket ID can't be reached")
         );
-        assert_eq!(login_message("linked", None), None);
-        assert_eq!(profile_message("nonsense", None), None);
+        assert_eq!(login_message("linked", None, &configured()), None);
+        assert_eq!(profile_message("nonsense", None, &configured()), None);
+    }
+
+    /// The providers the server says it has.
+    fn configured() -> Vec<String> {
+        vec!["Pocket ID".into()]
+    }
+
+    /// A-16: `?provider=` is anyone's to write, in a link sent to someone;
+    /// a name that is not a configured provider's is never shown.
+    #[test]
+    fn only_a_configured_provider_is_named() {
+        let planted = "Pocket ID is down. Call 555-0100 and give them your password";
+        for what in ["unavailable", "failed"] {
+            let (_, text) = login_message(what, Some(planted), &configured()).unwrap();
+            assert!(!text.contains("555-0100"), "{what}: {text}");
+            assert!(text.starts_with("The sign-in provider"), "{what}: {text}");
+        }
+        for what in [
+            "linked",
+            "taken",
+            "already",
+            "notyours",
+            "unavailable",
+            "failed",
+        ] {
+            let (_, text) = profile_message(what, Some(planted), &configured()).unwrap();
+            assert!(!text.contains("555-0100"), "{what}: {text}");
+            assert!(text.contains("the sign-in provider"), "{what}: {text}");
+        }
+        // Before the server's list is known, no name either.
+        let (_, text) = login_message("failed", Some("Pocket ID"), &[]).unwrap();
+        assert!(text.starts_with("The sign-in provider"), "{text}");
     }
 }

@@ -2789,3 +2789,49 @@
   local and share one failed-login limit, as before. The NixOS module's
   warning is now an assertion with the same opt-out, checked by the new
   flake check `nixos-module-assertions`.
+- Changing the OTLP export needs a recent sign-in (finding 56, third
+  review G-7): `settingSet` and `settingUnset` on every `telemetry.*`
+  key, as on `admin.*`, `auth.*` and `media.*`. The endpoint receives
+  every span, metric and log record, and `telemetry.otlp.headers` is a
+  secret sent with each export. The web UI's Telemetry Save already
+  asked "Confirm it's you" for the metrics settings, and now does for
+  the export too.
+- Changing `plex.token_file` needs a recent sign-in (finding 57, third
+  review G-8), as `plex.token` does: the file it names is read and sent
+  as the first Plex server's token.
+- A listener on every interface with `admin.public_url` set and
+  `admin.trusted_proxies` empty is warned of at start (finding 58, third
+  review G-9): a proxy on this host may be in front, and every caller
+  through it would look like loopback. It is not refused, since browsers
+  may as well reach the listener directly or through an SSH tunnel;
+  `admin.not_proxied = true` says so and silences it. The NixOS module
+  warns the same way. The `admin` recipe in `defaults.ucl` now puts a
+  proxy on the same host in front of a loopback listener with
+  `trusted_proxies = "127.0.0.1"`.
+- Confirming it's you with a sign-in provider asks it to sign the account
+  in again (A-15): the flow sends `prompt=login` and `max_age=0`, and an
+  ID token whose `auth_time` is from before the confirmation began
+  (60 s allowed for clock skew) confirms nothing (`sso=failed`). Signing
+  in and linking ask neither.
+- The web UI names a sign-in provider in what its callback said
+  (`?sso=…&provider=…` on the login, device and My profile pages) only
+  if the server has a provider by that name (A-16); any other name is
+  "the sign-in provider". The query is anyone's to write in a link, so
+  it could put words of their choosing on the login page.
+- A web UI (admin API) session ends after an hour unused (A-18). Each
+  use renews it, written at most once a minute as a client's is, and it
+  still ends 12 hours after its sign-in however much it is used. Until
+  now it lasted the full 12 hours whether used or not.
+- The NixOS module reads `admin.listen` as the server does (third review
+  G-12): every spelling of `::1` (`[0:0:0:0:0:0:0:1]:7421`) is loopback
+  for the unnamed-proxy assertion, and every spelling of `::` is every
+  interface for its warning. A name (`localhost:7421`) or a bracketed
+  IPv4 address (`[127.0.0.1]:7421`), which the server refuses to parse,
+  is now refused by the module too, naming `admin.listen`.
+- The NixOS unit's `ExecStart` quotes the state directory (third review
+  G-13), as the CLI wrapper does: a `stateDir` with a space was split
+  into two arguments.
+- `spoolframe-probe --check-limits --check-pool` in one run no longer
+  fails `anonymous-pool` (third review G-16): the limits check's wrong
+  passwords come from a key of its own, so the source they lock is not
+  the run's key, from which the pool check then logs in.

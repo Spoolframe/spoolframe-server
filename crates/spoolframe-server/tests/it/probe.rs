@@ -5,7 +5,13 @@
 //! code.
 //!
 //! Every run signs in as a consumer, over QUIC and on a web listener
-//! beside the server, for the signed-in checks.
+//! beside the server, for the signed-in checks; and, for the
+//! playback-ownership check, plays the fake catalog's movie and signs in
+//! as a second consumer.
+//!
+//! The playback-ownership check has no weakened server here: PB is not a
+//! setting, and a server that let another session use a handle would
+//! need its code changed (`use_playback`, `Playbacks::control`).
 
 use crate::support;
 
@@ -24,20 +30,26 @@ const CAP: usize = 3;
 const USER: &str = "probe-consumer";
 const PASSWORD: &str = "a probe's password";
 
+/// The second account, for the playback check's cross-user part.
+const USER2: &str = "probe-consumer-2";
+const PASSWORD2: &str = "another probe's password";
+
 /// The `public_url` of the web listener beside the server.
 const WEB: &str = "https://media.example.org";
 
 /// The checks that sign in as [`USER`].
-const SIGNED_IN: [&str; 6] = [
+const SIGNED_IN: [&str; 7] = [
     "consumer-admin-refused",
     "session-bound",
     "visibility",
     "recent-sign-in",
     "signed-in-streams",
+    "playback-ownership",
     "session-reread",
 ];
 
-/// A server with [`USER`] as `role`, and the web listener beside it.
+/// A server with [`USER`] as `role` and [`USER2`] a consumer, the movie's
+/// file written, and the web listener beside it.
 async fn server_with(test: &str, admission: Admission, role: Role) -> (TestServer, Web) {
     let server = TestServer::start_with(
         support::fresh_dir(test).await,
@@ -52,6 +64,17 @@ async fn server_with(test: &str, admission: Admission, role: Role) -> (TestServe
         .add_user(USER, None, &hash_password(PASSWORD).await.unwrap(), role)
         .await
         .unwrap();
+    server
+        .store
+        .add_user(
+            USER2,
+            None,
+            &hash_password(PASSWORD2).await.unwrap(),
+            Role::Consumer,
+        )
+        .await
+        .unwrap();
+    server.write_media(1000);
     let web = crate::admin::serve_beside(&server, WEB).await;
     let web = Web {
         url: format!("http://{web}"),
@@ -77,6 +100,12 @@ async fn probe(server: &TestServer, web: Web, first_frame_wait: Duration) -> Rep
             password: PASSWORD.into(),
             web: Some(web),
         }),
+        check_playback: true,
+        second: Some(Account {
+            username: USER2.into(),
+            password: PASSWORD2.into(),
+            web: None,
+        }),
         ..Config::new(server.server.addr())
     };
     spoolframe_probe::run(&config)
@@ -91,17 +120,22 @@ fn status(report: &Report, id: &str) -> Status {
         .status
 }
 
-/// [`USER`]'s sessions the store still has, of any kind.
-async fn sessions_left(server: &TestServer) -> usize {
+/// `username`'s sessions the store still has, of any kind.
+async fn sessions_of(server: &TestServer, username: &str) -> usize {
     let user = server
         .store
         .list_users()
         .await
         .unwrap()
         .into_iter()
-        .find(|u| u.username == USER)
+        .find(|u| u.username == username)
         .expect("the probe's user");
     server.store.list_sessions(user.id).await.unwrap().len()
+}
+
+/// [`USER`]'s and [`USER2`]'s sessions the store still has.
+async fn sessions_left(server: &TestServer) -> usize {
+    sessions_of(server, USER).await + sessions_of(server, USER2).await
 }
 
 fn quick() -> Admission {
@@ -152,6 +186,29 @@ async fn strangers_spamming_resumes_leave_room_for_a_login() {
     server.stop().await;
 }
 
+/// G-16: the limits check's refused logins, from the run's own key, once
+/// locked that key for the pool check's logins after it, which then failed
+/// as `RateLimited`. In one run, both pass.
+#[tokio::test]
+async fn the_limits_and_pool_checks_pass_in_one_run() {
+    let (server, _web) =
+        server_with("probe-limits-pool", Admission::default(), Role::Consumer).await;
+    let config = Config {
+        check_limits: true,
+        check_pool: true,
+        pool_seconds: 3,
+        pool_drain: Duration::from_secs(10),
+        ..Config::new(server.server.addr())
+    };
+    let report = spoolframe_probe::run(&config)
+        .await
+        .expect("the probe runs");
+    let summary = spoolframe_probe::summary(&report);
+    assert_eq!(status(&report, "sign-in-limits"), Status::Pass, "{summary}");
+    assert_eq!(status(&report, "anonymous-pool"), Status::Pass, "{summary}");
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn the_signed_in_checks_leave_no_session_and_never_show_the_password() {
     let (server, web) = server_with("probe-clean", quick(), Role::Consumer).await;
@@ -164,6 +221,47 @@ async fn the_signed_in_checks_leave_no_session_and_never_show_the_password() {
     let json = serde_json::to_string(&report).unwrap();
     assert!(!summary.contains(PASSWORD), "{summary}");
     assert!(!json.contains(PASSWORD));
+    assert!(!summary.contains(PASSWORD2), "{summary}");
+    assert!(!json.contains(PASSWORD2));
+    server.stop().await;
+}
+
+/// The movie is played on device A; B (the same user, another key) and C
+/// (the second user) are refused every read and control of its handle,
+/// and A stops it: no playback is left open.
+#[tokio::test]
+async fn another_device_and_another_user_are_refused_the_playback() {
+    let (server, web) = server_with("probe-playback", quick(), Role::Consumer).await;
+    let report = probe(&server, web, Duration::from_secs(5)).await;
+    let summary = spoolframe_probe::summary(&report);
+    let check = report.check("playback-ownership").unwrap();
+    assert_eq!(check.status, Status::Pass, "{summary}");
+    let refused = |who: &str| {
+        check
+            .evidence
+            .iter()
+            .filter(|line| line.starts_with(who) && line.contains("Unauthenticated"))
+            .count()
+    };
+    // Five RPC requests, three resource reads and the stop; B also sends
+    // A's own session.
+    assert_eq!(refused("B ("), 9, "{summary}");
+    assert_eq!(refused("B, with A's session"), 1, "{summary}");
+    assert_eq!(refused("C ("), 9, "{summary}");
+    assert!(
+        check
+            .evidence
+            .iter()
+            .any(|l| l.starts_with("A: StopPlayback: Ok(Done)")),
+        "{summary}"
+    );
+    let counts = server.debug.playbacks.counts();
+    assert_eq!(
+        (counts.started, counts.ended, counts.direct),
+        (1, 1, 0),
+        "{summary}"
+    );
+    assert_eq!(sessions_left(&server).await, 0, "{summary}");
     server.stop().await;
 }
 

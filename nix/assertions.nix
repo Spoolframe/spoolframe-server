@@ -3,33 +3,43 @@
 # listener with a public URL and no trusted proxies) is a shape the server
 # refuses to start in (PX-11 finding 38, PX-09 finding 29), so it must not
 # evaluate either; naming the proxy, or saying nothing proxies to the
-# listener, lets it through.
+# listener, lets it through. On every interface with a public URL there
+# may be such a proxy (finding 58): warned of, not refused.
 {
   pkgs,
   spoolframeModule,
 }: let
   inherit (pkgs) lib;
-  # The module's failed assertions with `admin` set, as their messages.
-  failed = admin: let
-    system = import (pkgs.path + "/nixos/lib/eval-config.nix") {
+  # The module evaluated with `settings` set.
+  evaluatedWith = settings:
+    import (pkgs.path + "/nixos/lib/eval-config.nix") {
       inherit (pkgs.stdenv.hostPlatform) system;
       modules = [
         spoolframeModule
         {
           nixpkgs.pkgs = pkgs;
           system.stateVersion = lib.trivial.release;
-          services.spoolframe = {
-            enable = true;
-            # Never built: only the assertions are evaluated.
-            package = pkgs.emptyDirectory;
-            inherit admin;
-          };
+          services.spoolframe =
+            {
+              enable = true;
+              # Never built: only the assertions are evaluated.
+              package = pkgs.emptyDirectory;
+            }
+            // settings;
         }
       ];
     };
-  in
-    map (a: a.message) (lib.filter (a: !a.assertion && lib.hasPrefix "services.spoolframe" a.message) system.config.assertions);
+  # The module evaluated with `admin` set.
+  evaluated = admin: evaluatedWith {inherit admin;};
+  # The service's command line with `stateDir` set.
+  execStart = stateDir: (evaluatedWith {inherit stateDir;}).config.systemd.services.spoolframe.serviceConfig.ExecStart;
+  # The module's failed assertions with `admin` set, as their messages.
+  failed = admin: map (a: a.message) (lib.filter (a: !a.assertion && lib.hasPrefix "services.spoolframe" a.message) (evaluated admin).config.assertions);
+  # Its warnings, the same way.
+  warned = admin: lib.any (w: lib.hasPrefix "services.spoolframe" w && lib.hasInfix "admin.trustedProxies" w && lib.hasInfix "admin.notProxied" w) (evaluated admin).config.warnings;
   refused = admin: lib.any (lib.hasInfix "admin.trustedProxies") (failed admin);
+  # Refused for a listen address the server cannot parse.
+  unparsed = admin: lib.any (lib.hasInfix "admin.listen (") (failed admin);
   accepted = admin: failed admin == [];
   check = what: ok: lib.assertMsg ok "spoolframe module assertions: ${what}";
   publicUrl = "https://media.example.org";
@@ -39,6 +49,27 @@ in
     inherit publicUrl;
     listen = "[::1]:7421";
   });
+  # G-12: the server's loopback check is on the parsed address, so every
+  # spelling of ::1 is loopback, and a name or a bracketed IPv4 address is
+  # no address at all.
+  assert check "an unnamed proxy in front of ::1 spelt out is refused" (refused {
+    inherit publicUrl;
+    listen = "[0:0:0:0:0:0:0:1]:7421";
+  });
+  assert check "a listen address that is a name is refused" (unparsed {
+    listen = "localhost:7421";
+    trustedProxies = ["127.0.0.1"];
+  });
+  assert check "a bracketed IPv4 listen address is refused" (unparsed {
+    listen = "[127.0.0.1]:7421";
+    trustedProxies = ["127.0.0.1"];
+  });
+  assert check "an IPv4 listen address is not refused as unparsed" (!unparsed {
+    listen = "192.168.1.20:7421";
+  });
+  assert check "an IPv6 listen address is not refused as unparsed" (!unparsed {
+    listen = "[fd00::20]:7421";
+  });
   assert check "a named proxy is accepted" (accepted {
     inherit publicUrl;
     trustedProxies = ["127.0.0.1"];
@@ -47,9 +78,45 @@ in
     inherit publicUrl;
     notProxied = true;
   });
-  assert check "a listener on every interface is not that shape" (accepted {
+  # Finding 58: on every interface there may be a proxy on this host, or
+  # browsers may come straight in (the dev server's shape): warned of,
+  # not refused.
+  assert check "a listener on every interface is not refused" (accepted {
     inherit publicUrl;
     listen = "0.0.0.0:7421";
   });
+  assert check "a listener on every interface with a public URL is warned of" (warned {
+    inherit publicUrl;
+    listen = "0.0.0.0:7421";
+  });
+  assert check "the server's own default listener is warned of" (warned {
+    inherit publicUrl;
+    listen = null;
+  });
+  assert check "a listener on every interface over [::] is warned of" (warned {
+    inherit publicUrl;
+    listen = "[::]:7421";
+  });
+  assert check "a listener on every interface over [::] spelt out is warned of" (warned {
+    inherit publicUrl;
+    listen = "[0:0:0:0:0:0:0:0]:7421";
+  });
+  assert check "a listener on every interface with its proxy named is not warned of" (!warned {
+    inherit publicUrl;
+    listen = "0.0.0.0:7421";
+    trustedProxies = ["127.0.0.1"];
+  });
+  assert check "a listener on every interface said not to be proxied is not warned of" (!warned {
+    inherit publicUrl;
+    listen = "0.0.0.0:7421";
+    notProxied = true;
+  });
+  assert check "a listener on every interface without a public URL is not warned of" (!warned {
+    listen = "0.0.0.0:7421";
+  });
   assert check "the defaults are accepted" (accepted {});
+  # G-13: systemd splits ExecStart on whitespace, so the state directory
+  # is one quoted argument.
+  assert check "the state directory is one argument" (lib.hasInfix ''--state-dir "/var/lib/spool frame"'' (execStart "/var/lib/spool frame"));
+  assert check "the defaults are not warned of" (!warned {});
     pkgs.runCommand "spoolframe-module-assertions" {} "touch $out"

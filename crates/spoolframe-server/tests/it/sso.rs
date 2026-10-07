@@ -507,6 +507,61 @@ async fn linking_needs_a_recent_sign_in_and_the_provider_can_confirm_one() {
         .unwrap();
 }
 
+/// A-15: a confirmation asks the provider to sign the account in again
+/// (`prompt=login`, `max_age=0`), as the password does, rather than take
+/// a sign-in it remembers; signing in and linking do not ask.
+#[tokio::test]
+async fn confirming_asks_the_provider_to_sign_in_again() {
+    let idp = StandIn::start().await;
+    let server = server("sso-confirm-asks", &idp.issuer).await;
+    let mut alice = Browser::new(server.addr);
+    alice.password("alice").await;
+    idp.next_sign_in(alice_at_the_provider());
+    alice.sso("link").await;
+    assert_eq!(idp.last_asked("prompt"), None);
+    assert_eq!(idp.last_asked("max_age"), None);
+    let mut later = Browser::new(server.addr);
+    idp.next_sign_in(alice_at_the_provider());
+    assert!(later.sso("signIn").await.signed_in);
+    assert_eq!(idp.last_asked("prompt"), None);
+    assert_eq!(idp.last_asked("max_age"), None);
+
+    server.age(&alice).await;
+    idp.next_sign_in(alice_at_the_provider());
+    let landed = alice.sso("confirm").await;
+    assert_eq!(landed.location, "/profile?sso=confirmed&provider=Pocket+ID");
+    assert_eq!(idp.last_asked("prompt").as_deref(), Some("login"));
+    assert_eq!(idp.last_asked("max_age").as_deref(), Some("0"));
+}
+
+/// A-15: a provider that answers a confirmation with a sign-in from before
+/// it began (its `auth_time`) confirms nothing. Signing in takes it.
+#[tokio::test]
+async fn a_provider_sign_in_from_before_the_confirmation_confirms_nothing() {
+    let idp = StandIn::start().await;
+    let server = server("sso-confirm-stale", &idp.issuer).await;
+    let mut alice = Browser::new(server.addr);
+    alice.password("alice").await;
+    idp.next_sign_in(alice_at_the_provider());
+    alice.sso("link").await;
+    server.age(&alice).await;
+
+    idp.next_sign_in(alice_at_the_provider());
+    idp.misbehave(Mischief::SignedInLongAgo);
+    let landed = alice.sso("confirm").await;
+    assert_eq!(landed.location, "/profile?sso=failed&provider=Pocket+ID");
+    let refused = alice.socket().await.sso_unlink(idp.issuer.clone()).await;
+    assert_eq!(
+        code(refused.unwrap_err()),
+        error_code::RECENT_SIGN_IN_REQUIRED
+    );
+
+    let mut later = Browser::new(server.addr);
+    idp.next_sign_in(alice_at_the_provider());
+    idp.misbehave(Mischief::SignedInLongAgo);
+    assert!(later.sso("signIn").await.signed_in);
+}
+
 #[tokio::test]
 async fn an_admin_sees_and_removes_a_user_s_link_and_cannot_make_one() {
     let idp = StandIn::start().await;

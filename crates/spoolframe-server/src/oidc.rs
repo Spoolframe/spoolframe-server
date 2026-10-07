@@ -7,6 +7,12 @@
 //! discovery document (asymmetric algorithms only, never the client
 //! secret), its issuer, its audience, its expiry and its nonce.
 //!
+//! A confirmation (a recent sign-in proved with the provider) asks the
+//! provider to sign the account in again (`prompt=login`, `max_age=0`),
+//! and refuses an ID token whose `auth_time` is from before it began
+//! (A-15): a sign-in the provider merely remembers proves no one is at
+//! the keyboard now.
+//!
 //! A provider never makes or finds accounts. An identity (issuer and
 //! subject) signs in only the local user who linked it from My profile
 //! while signed in; email is shown, never matched.
@@ -22,8 +28,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use openidconnect::core::{
-    CoreAuthDisplay, CoreAuthenticationFlow, CoreClaimName, CoreClaimType, CoreClient,
-    CoreClientAuthMethod, CoreGrantType, CoreJsonWebKey, CoreJsonWebKeyType,
+    CoreAuthDisplay, CoreAuthPrompt, CoreAuthenticationFlow, CoreClaimName, CoreClaimType,
+    CoreClient, CoreClientAuthMethod, CoreGrantType, CoreJsonWebKey, CoreJsonWebKeyType,
     CoreJweContentEncryptionAlgorithm, CoreJweKeyManagementAlgorithm, CoreJwsSigningAlgorithm,
     CoreResponseMode, CoreResponseType, CoreSubjectIdentifierType,
 };
@@ -53,6 +59,10 @@ pub const MAX_FLOWS: usize = 10_000;
 /// Flows one source (a remote address) may have begun and not finished
 /// (PX-10), as [`crate::passkeys::MAX_SIGN_INS_PER_SOURCE`].
 pub const MAX_FLOWS_PER_SOURCE: usize = 16;
+
+/// How far the provider's clock may be behind this server's, in seconds,
+/// when its `auth_time` is compared with when a confirmation began.
+const CLOCK_SKEW_SECS: i64 = 60;
 
 /// How long a provider's discovery document and keys are used before they
 /// are fetched again: sign-ins begun at once (or a stranger's flood of
@@ -258,6 +268,9 @@ struct Flow {
     /// endpoints and keys.
     metadata: Metadata,
     began: Instant,
+    /// When it began by the wall clock, in Unix seconds, which a
+    /// provider's `auth_time` is compared with.
+    began_at: i64,
     /// The remote address that began it, if it has one.
     source: Option<String>,
 }
@@ -532,15 +545,24 @@ impl Oidc {
         let metadata = self.discover(&provider).await?;
         let (client, _) = self.client(&provider, metadata.clone())?;
         let (challenge, pkce) = PkceCodeChallenge::new_random_sha256();
-        let (url, state, nonce) = client
+        let request = client
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
                 CsrfToken::new_random,
                 Nonce::new_random,
             )
             .add_scopes(provider.scopes.iter().cloned().map(Scope::new))
-            .set_pkce_challenge(challenge)
-            .url();
+            .set_pkce_challenge(challenge);
+        // A confirmation is the password asked again: the provider must
+        // ask too, not answer from a sign-in it remembers (A-15).
+        let request = if matches!(purpose, Purpose::Confirm { .. }) {
+            request
+                .add_prompt(CoreAuthPrompt::Login)
+                .set_max_age(Duration::ZERO)
+        } else {
+            request
+        };
+        let (url, state, nonce) = request.url();
         let browser = random();
         let mut flows = self.flows.lock();
         let now = Instant::now();
@@ -564,6 +586,7 @@ impl Oidc {
                 nonce,
                 metadata,
                 began: now,
+                began_at: crate::store::now(),
                 source: source.map(str::to_owned),
             },
         );
@@ -653,6 +676,20 @@ impl Oidc {
             .id_token()
             .ok_or_else(|| refused("the token response has no ID token".into()))?;
         let verifier = client.id_token_verifier().set_allowed_algs(algs);
+        // A confirmation's sign-in is one made after it began, where the
+        // provider says when (A-15). One that does not say is taken: it
+        // was asked to sign in again, and most do without saying.
+        let verifier = if matches!(flow.purpose, Purpose::Confirm { .. }) {
+            let since = flow.began_at - CLOCK_SKEW_SECS;
+            verifier.set_auth_time_verifier_fn(move |at| match at {
+                Some(at) if at.timestamp() < since => Err(format!(
+                    "it says the account signed in at {at}, before the confirmation began"
+                )),
+                _ => Ok(()),
+            })
+        } else {
+            verifier
+        };
         let claims = id_token
             .claims(&verifier, &flow.nonce)
             .map_err(|e| refused(e.to_string()))?;
