@@ -438,6 +438,40 @@ async fn guessing_the_setup_code_is_rate_limited() {
     assert_eq!(code(err), error_code::RATE_LIMITED);
 }
 
+/// A-13: a guess was counted only once it had failed, so guesses sent at
+/// once were each checked against a count none of them had added to yet,
+/// and more than five were tried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn setup_code_guesses_sent_at_once_are_held_to_the_limit() {
+    let (addr, _dir) = server("setup-guess-at-once").await;
+    let mut clients = Vec::new();
+    for _ in 0..8 {
+        clients.push(std::sync::Arc::new(anonymous(addr).await));
+    }
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(64));
+    let guesses: Vec<_> = (0..64)
+        .map(|i| {
+            let (client, start) = (clients[i % clients.len()].clone(), start.clone());
+            tokio::spawn(async move {
+                start.wait().await;
+                client
+                    .setup(setup("WRNG-WRNG-WRNG", "root", "correct horse"))
+                    .await
+            })
+        })
+        .collect();
+    let mut tried = 0;
+    for guess in guesses {
+        if code(guess.await.unwrap().unwrap_err()) == error_code::INVALID_SETUP_CODE {
+            tried += 1;
+        }
+    }
+    assert!(
+        tried <= spoolframe_server::auth::MAX_FAILURES,
+        "{tried} wrong setup codes were tried"
+    );
+}
+
 #[tokio::test]
 async fn failed_logins_as_one_user_do_not_lock_the_others_out() {
     let (addr, _admin, _dir) = admin_client("login-others").await;

@@ -1,4 +1,15 @@
-# Development wire revision 6
+# Development wire revision 7
+
+Revision 7 (PX-12, pushed addresses) keeps the `spoolframe/client/1` ALPN
+and sets `PROTOCOL_VERSION` to 7. Update the server and SDK together: a
+revision-6 client gets `Unsupported` from a revision-7 server's `Hello`.
+The events stream has a new event, `server_addresses { addrs, relays }`.
+The server pushes it to a connection as soon as the connection is signed
+in, and again when the list changes. Each event replaces the list told
+before. The `server_addresses` request and its `ServerAddresses` reply
+are removed: the event does their work, and a server answers the
+request `Unsupported`. What the event holds, and what the SDK does with
+it, is in "Server addresses" below.
 
 Revision 6 (PX-09 finding 27) keeps the `spoolframe/client/1` ALPN and
 sets `PROTOCOL_VERSION` to 6. Update the server and SDK together: a
@@ -171,10 +182,16 @@ and 64 MiB serialized-outcome budget. A pending operation reserves what its
 kind of reply can take: 1 MiB for `StartPlayback`, `ChangeSubtitle` and
 `SeekPlayback`, 64 KiB for passkey ceremony options, 16 KiB for the rest;
 a finished one counts its outcome's size. One endpoint, and one user, may
-hold at most an eighth of the entries and bytes. The anonymous sign-in
-requests have their own pool of 512 entries and 8 MiB with the same
-shares, and their outcomes are replayed for 30 s after they are known, or
-until the operation expires if that is sooner.
+hold at most an eighth of the entries and bytes, and a user already
+holding some may not take the last eighth of the pool, which is kept for
+users holding none. The anonymous sign-in
+requests have pools of their own, 512 entries and 8 MiB each with the same
+shares: one for `LoginPassword`, `BeginPasskeySignIn` and
+`FinishPasskeySignIn`, and one for `BeginDeviceSignIn`,
+`AwaitDeviceSignIn` and `ResumeProfile`. Their outcomes are replayed for
+30 s after they are known, or until the operation expires if that is
+sooner; an outcome that changed nothing (an error, or
+`DeviceSignInPending`) is not kept, and a retry runs again.
 It refuses new operations with `RateLimited` when full; it does not evict
 unexpired IDs to make room. Individual mutation outcomes are capped at 1 MiB. Expired IDs
 return `OperationExpired`; IDs from an earlier server process return
@@ -377,10 +394,15 @@ tell, or a `DeviceAddress`:
 | Field | Value |
 |---|---|
 | `address` | The IP address as text, `"192.168.86.20"`; an IPv4 address never in its IPv6-mapped form. |
-| `network` | `"loopback"` (the server's own machine), `"local"` (private IPv4, link-local, CGNAT and VPNs' `100.64.0.0/10`, IPv6 unique-local) or `"internet"` (any other: a public address). An unknown value decodes as `Unknown`. |
+| `network` | `"loopback"` (the server's own machine), `"local"` (private IPv4, link-local, CGNAT and VPNs' `100.64.0.0/10`, IPv6 unique-local, or any address in the network of one of the server's own interface addresses, by that interface's prefix length) or `"internet"` (any other: a public address). An unknown value decodes as `Unknown`. |
 
 The server judges `network` as the web approval page judges
-`fromInternet`. An app's approval screen shows the address, "The TV
+`fromInternet`. It reads its interfaces at each lookup. A home with
+IPv6 gives its devices public addresses in the server's own /64, so
+those are `local`; an interface with no netmask counts as a /64 for
+IPv6 and as its one address for IPv4. Only the server's own networks
+count, never a wider ISP block: another /64 of the same /56 is
+`internet`. An app's approval screen shows the address, "The TV
 asked from 192.168.86.20.", and for `internet` or `Unknown` warns
 instead: the device is not on this network, so approve only a device
 you can see; a code someone sent you is theirs. The SDK re-exports
@@ -537,23 +559,50 @@ signed in on gets `NO_SUCH_DEVICE`.
 
 ## Server addresses
 
-A signed-in device can ask where the server can be dialled directly
-(PX-12). This needs no new revision: a server that does not know the
-request answers `Unsupported`, and the SDK then does without.
+The server tells a signed-in device where it can be reached (PX-12), on
+the events stream, without being asked (revision 7):
 
-| Request | Reply |
-|---|---|
-| `{"type": "server_addresses"}` | `ServerAddresses { addrs }` |
+```json
+{"type": "server_addresses",
+ "addrs": ["192.168.1.10:4433", "[2001:db8::1]:4433"],
+ "relays": []}
+```
 
-`addrs` is every address on the server endpoint's interfaces, with its
-port: LAN, public and VPN addresses. Loopback, link-local and unspecified
-addresses are left out. Each one is text, `192.168.1.10:4433` or
-`[2001:db8::1]:4433`, in CBOR as in JSON. Only a session is told: without
-one, or with one that is not live on this endpoint, the reply is
-`Unauthenticated`. A locked profile is told too, as for `WhoAmI`. The
-addresses are never in `Hello`, because a stranger must not learn the
-server's internal and VPN addresses. It is a read, and the SDK may retry
-it.
+`addrs` is the addresses on the server endpoint's interfaces that
+`network.announce` lets it tell, with their port: LAN, public and VPN
+addresses. Loopback, link-local and unspecified addresses are left out.
+Each one is text, `192.168.1.10:4433` or `[2001:db8::1]:4433`, in CBOR as
+in JSON. `relays` is the URL of each iroh relay the server uses
+(`network.relay`); it is empty while relays are off, as they are by
+default. Both fields are required, and an empty list is sent as `[]`.
+
+Each event is the whole list. It replaces what the server told before:
+an address it no longer tells is gone.
+
+The server pushes it to a connection:
+
+- right after a sign-in on it: `LoginPassword`, an approved device
+  sign-in (`AwaitDeviceSignIn`), `FinishPasskeySignIn` or
+  `ResumeProfile`. Every other connection of the same device that said
+  `Hello` gets it too;
+- right after `Hello`, when the device has a live session already (the
+  app opened again with a kept session, or a reconnect);
+- to every signed-in connection, when the addresses it would tell
+  change. The server learns of a change when iroh sees the endpoint's
+  addresses change, as when an interface comes up or goes down.
+
+A connection with no live session is never pushed it. A device signed
+out is pushed nothing more, and its connections are closed with
+`signed_out`, as before. A locked profile is pushed it too: the
+addresses say nothing about the user.
+
+The addresses are never in `Hello`, because a stranger must not learn the
+server's internal and VPN addresses.
+
+Revisions 6 and older had a request for the addresses,
+`{"type": "server_addresses"}`, answered `ServerAddresses { addrs }`.
+Revision 7 removes it. A device asked once on each connection, so it did
+not learn of a change while it stayed connected.
 
 Iroh announces these addresses inside each connection too, but a client
 sees only the paths that opened. A phone that never reached the server's
@@ -561,15 +610,30 @@ VPN address cannot learn it from iroh.
 
 ### SDK
 
-The SDK asks after each sign-in or resume, and on each new connection
-(first dial, app restart, reconnect) when it keeps a session for the
-server. It asks on that one connection, and a failure costs only the
-addresses. Nothing in the API changes. Each told address joins the saved
-server's addresses, marked as told, with the time it was told. The same
-30-day age-out and 32-address cap apply. A told address becomes reached
-when a connection reaches it, and a reached one stays reached. Under the
-cap, the newest reached addresses are kept first, and told ones fill the
-room that is left. Every saved address is dialled, told or reached.
+The SDK applies each `server_addresses` event it reads on a connection's
+events stream to the saved server. It does not ask for the addresses any
+more. Nothing in the API changes.
+
+- The list replaces the told addresses saved before. A told address that
+  is not in the new list is removed at once.
+- A reached address stays, whether the list has it or not. It ages out
+  as before, after 30 days without being reached.
+- A new address is saved as told, with the time it was told. A told
+  address becomes reached when a connection reaches it.
+- The 32-address cap applies as before: the newest reached addresses
+  are kept first, and told ones fill the room that is left.
+- The relays are saved with the server (`relays` in the servers file).
+  A file written before has none. The SDK does not dial through relays,
+  because its endpoint has relays off, so it only keeps them.
+
+An event for a server that is not saved is ignored. Every saved address
+is dialled, told or reached.
+
+`ServerEntry` shows the last event as it came, for an app to show the
+server's advertised addresses apart from every dial hint in `addrs`:
+`advertised_addrs` (in the server's order), `relays` and
+`advertised_at` (when the event came, to the second). They are empty and
+`None` until a server tells this device.
 
 ## Picture subtitles
 

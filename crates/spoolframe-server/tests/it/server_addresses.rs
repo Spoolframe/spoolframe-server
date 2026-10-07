@@ -1,7 +1,8 @@
 //! A signed-in device is told where the server can be dialled directly
 //! (PX-12): every address its endpoint has on its interfaces, LAN, public
 //! and VPN, so that a phone that only ever reached it one way still learns
-//! the others. A stranger is told nothing of them.
+//! the others. The server pushes them on the events stream (revision 7).
+//! A stranger is told nothing of them.
 
 use crate::support;
 
@@ -10,10 +11,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use iroh::endpoint::RecvStream;
 use spoolframe_client_sdk::MemoryStorage;
-use spoolframe_protocol::{Error, Reply, Request, Response, SessionId};
-use spoolframe_server::announce::Announce;
+use spoolframe_protocol::codec::read_frame;
+use spoolframe_protocol::streams::uni;
+use spoolframe_protocol::{Error, Event, Request, Response};
+use spoolframe_server::announce::{Announce, Glob, VIRTUAL_INTERFACES, interfaces};
 use support::{ServerOptions, TestClient, TestServer, fresh_dir, mkv_capabilities};
+use tokio::io::AsyncReadExt;
 
 const PASSWORD: &str = "correct horse";
 
@@ -42,6 +47,25 @@ fn reachable(server: &TestServer) -> BTreeSet<SocketAddr> {
         .collect()
 }
 
+/// Of [`reachable`], what a default `network.announce` tells: none on
+/// this machine's virtual interfaces (its docker0, its bridges).
+fn told_by_default(server: &TestServer) -> BTreeSet<SocketAddr> {
+    let virtual_globs: Vec<Glob> = VIRTUAL_INTERFACES
+        .iter()
+        .map(|g| g.parse().unwrap())
+        .collect();
+    let on_virtual: Vec<std::net::IpAddr> = interfaces()
+        .into_iter()
+        .filter(|i| virtual_globs.iter().any(|g| g.matches(&i.name)))
+        .flat_map(|i| i.addrs)
+        .map(|ip| ip.to_canonical())
+        .collect();
+    reachable(server)
+        .into_iter()
+        .filter(|a| !on_virtual.contains(&a.ip().to_canonical()))
+        .collect()
+}
+
 async fn announcing(test: &str, announce: Announce) -> TestServer {
     let options = ServerOptions {
         announce,
@@ -52,62 +76,125 @@ async fn announcing(test: &str, announce: Announce) -> TestServer {
     server
 }
 
-async fn told(client: &TestClient, session: Option<&SessionId>) -> Result<Vec<SocketAddr>, Error> {
-    match client.call(session, Request::ServerAddresses).await {
-        Response::Ok(Reply::ServerAddresses { addrs }) => Ok(addrs),
-        Response::Ok(other) => panic!("ServerAddresses answered {other:?}"),
-        Response::Err(e) => Err(e),
+/// What `client` is pushed once it says Hello and signs in as alice: the
+/// addresses, in the order told.
+async fn told(client: &TestClient) -> Vec<SocketAddr> {
+    client.hello().await;
+    let mut events = events(client).await;
+    client.login("alice", PASSWORD).await;
+    match next_event(&mut events, Duration::from_secs(5)).await {
+        Some(Event::ServerAddresses { addrs, .. }) => addrs,
+        other => panic!("not the server's addresses: {other:?}"),
     }
 }
 
+/// The events stream the server opened at `client`'s Hello.
+async fn events(client: &TestClient) -> RecvStream {
+    let mut events = tokio::time::timeout(Duration::from_secs(5), client.conn.accept_uni())
+        .await
+        .expect("no events stream within 5 s")
+        .unwrap();
+    assert_eq!(events.read_u8().await.unwrap(), uni::EVENTS);
+    events
+}
+
+/// The next event on `events`, if one comes within `wait`.
+async fn next_event(events: &mut RecvStream, wait: Duration) -> Option<Event> {
+    tokio::time::timeout(wait, read_frame::<_, Event>(events))
+        .await
+        .ok()
+        .map(|event| event.expect("an event that decodes"))
+}
+
+/// The addresses of a `ServerAddresses` event, with its relays.
+fn pushed(event: Option<Event>) -> (BTreeSet<SocketAddr>, Vec<String>) {
+    match event {
+        Some(Event::ServerAddresses { addrs, relays }) => {
+            let set: BTreeSet<SocketAddr> = addrs.iter().copied().collect();
+            assert_eq!(set.len(), addrs.len(), "each once: {addrs:?}");
+            (set, relays)
+        }
+        other => panic!("not the server's addresses: {other:?}"),
+    }
+}
+
+/// Signed in, a connection is pushed the addresses without asking, and
+/// no relay while relays are off.
 #[tokio::test]
-async fn a_signed_in_device_is_told_every_address_but_loopback_and_link_local() {
-    let server = server("addrs-signed-in").await;
-    let expected = reachable(&server);
-    assert!(
-        !expected.is_empty(),
-        "this machine has no address but loopback"
-    );
+async fn a_signed_in_connection_is_pushed_the_addresses_and_no_relays() {
+    let server = server("addrs-pushed").await;
     let client = server.client().await;
     client.hello().await;
-    let session = client.login("alice", PASSWORD).await;
+    let mut events = events(&client).await;
+    client.login("alice", PASSWORD).await;
 
-    let addrs = told(&client, Some(&session)).await.unwrap();
-    assert_eq!(addrs.iter().copied().collect::<BTreeSet<_>>(), expected);
-    assert_eq!(addrs.len(), expected.len(), "each once: {addrs:?}");
+    let event = next_event(&mut events, Duration::from_secs(5)).await;
+    assert_eq!(pushed(event), (told_by_default(&server), Vec::new()));
     server.stop().await;
 }
 
+/// A connection with no session is never pushed them, though another
+/// device signs in meanwhile and is.
 #[tokio::test]
-async fn a_stranger_is_not_told_the_addresses() {
-    let server = server("addrs-stranger").await;
+async fn an_anonymous_connection_is_pushed_nothing() {
+    let server = server("addrs-pushed-anonymous").await;
     let stranger = server.client().await;
     stranger.hello().await;
-    assert_eq!(told(&stranger, None).await, Err(Error::Unauthenticated));
-    let made_up = SessionId("not a session".into());
-    assert_eq!(
-        told(&stranger, Some(&made_up)).await,
-        Err(Error::Unauthenticated)
-    );
+    let mut strangers = events(&stranger).await;
 
-    // Nor is a device signed out since.
     let device = server.client().await;
     device.hello().await;
-    let session = device.login("alice", PASSWORD).await;
-    server.store.disable_user("alice").await.unwrap();
-    let again = server.client().await;
-    again.hello().await;
+    let mut devices = events(&device).await;
+    device.login("alice", PASSWORD).await;
+    pushed(next_event(&mut devices, Duration::from_secs(5)).await);
+
     assert_eq!(
-        told(&again, Some(&session)).await,
-        Err(Error::Unauthenticated)
+        next_event(&mut strangers, Duration::from_secs(1)).await,
+        None
     );
     server.stop().await;
 }
 
-/// The addresses say nothing about the user, and the SDK asks for them
-/// right after a sign-in, before any PIN is entered.
+/// A device that kept its session is pushed them on its next connection,
+/// right after Hello, with no sign-in on it.
 #[tokio::test]
-async fn a_locked_profile_is_told_them_too() {
+async fn a_kept_session_is_pushed_the_addresses_on_reconnect() {
+    let server = server("addrs-pushed-reconnect").await;
+    let device = server.client().await;
+    device.hello().await;
+    device.login("alice", PASSWORD).await;
+
+    let again = device.reconnect(&server).await;
+    let mut events = events(&again).await;
+    let event = next_event(&mut events, Duration::from_secs(5)).await;
+    assert_eq!(pushed(event).0, told_by_default(&server));
+    server.stop().await;
+}
+
+/// A device signed out since is pushed nothing on its next connection,
+/// though it was before.
+#[tokio::test]
+async fn a_device_signed_out_is_pushed_nothing_on_its_next_connection() {
+    let server = server("addrs-signed-out").await;
+    let device = server.client().await;
+    device.hello().await;
+    device.login("alice", PASSWORD).await;
+    let again = device.reconnect(&server).await;
+    pushed(next_event(&mut events(&again).await, Duration::from_secs(5)).await);
+
+    server.store.disable_user("alice").await.unwrap();
+    let after = device.reconnect(&server).await;
+    assert_eq!(
+        next_event(&mut events(&after).await, Duration::from_secs(1)).await,
+        None
+    );
+    server.stop().await;
+}
+
+/// The addresses say nothing about the user: a locked profile is pushed
+/// them too, before any PIN is entered.
+#[tokio::test]
+async fn a_locked_profile_is_pushed_them_too() {
     let server = server("addrs-locked").await;
     let tv = server.client().await;
     tv.hello().await;
@@ -128,19 +215,14 @@ async fn a_locked_profile_is_told_them_too() {
         );
     }
     let restarted = tv.reconnect(&server).await;
+    let mut events = events(&restarted).await;
     assert_eq!(
         restarted.call(Some(&session), Request::Libraries).await,
         Response::Err(Error::ProfileLocked),
         "the profile is not locked"
     );
-    assert_eq!(
-        told(&restarted, Some(&session))
-            .await
-            .unwrap()
-            .into_iter()
-            .collect::<BTreeSet<_>>(),
-        reachable(&server)
-    );
+    let event = next_event(&mut events, Duration::from_secs(5)).await;
+    assert_eq!(pushed(event).0, told_by_default(&server));
     server.stop().await;
 }
 
@@ -148,7 +230,7 @@ async fn a_locked_profile_is_told_them_too() {
 #[tokio::test]
 async fn the_sdk_saves_every_address_it_is_told_after_a_sign_in() {
     let server = server("addrs-sdk").await;
-    let expected = reachable(&server);
+    let expected = told_by_default(&server);
     let first = *expected.iter().next().expect("an address to sign in over");
     let storage = Arc::new(MemoryStorage::default());
     let device = spoolframe_client_sdk::Device {
@@ -201,9 +283,7 @@ async fn the_addresses_told_follow_the_interfaces_they_are_on() {
     };
     let server = announcing("addrs-every-interface", every).await;
     let client = server.client().await;
-    client.hello().await;
-    let session = client.login("alice", PASSWORD).await;
-    let addrs = told(&client, Some(&session)).await.unwrap();
+    let addrs = told(&client).await;
     assert_eq!(
         addrs.into_iter().collect::<BTreeSet<_>>(),
         reachable(&server)
@@ -216,9 +296,7 @@ async fn the_addresses_told_follow_the_interfaces_they_are_on() {
     };
     let server = announcing("addrs-no-interface", none).await;
     let client = server.client().await;
-    client.hello().await;
-    let session = client.login("alice", PASSWORD).await;
-    assert_eq!(told(&client, Some(&session)).await.unwrap(), []);
+    assert_eq!(told(&client).await, []);
     server.stop().await;
 }
 
@@ -243,10 +321,8 @@ async fn added_addresses_are_told_with_the_endpoint_port() {
         .expect("an IPv4 address")
         .port();
     let client = server.client().await;
-    client.hello().await;
-    let session = client.login("alice", PASSWORD).await;
     assert_eq!(
-        told(&client, Some(&session)).await.unwrap(),
+        told(&client).await,
         [
             SocketAddr::from(([203, 0, 113, 7], port)),
             "198.51.100.4:443".parse().unwrap(),

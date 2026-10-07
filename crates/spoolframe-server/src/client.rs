@@ -37,7 +37,7 @@ use spoolframe_protocol::{
 };
 use spoolframe_types::{ArtworkId, MediaId, Namespace, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 
 use crate::admission::{Peer, SIGN_OUT_DRAIN};
 use crate::announce::Told;
@@ -46,6 +46,7 @@ use crate::auth::{self, Approval, LoginError, RECENT_SIGN_IN, SessionToken, Unlo
 use crate::device_sign_in::{self, ClaimError, Outcome, Waiting};
 use crate::encode::job::{EncodeJob, JobError, Progress};
 use crate::encode::{Conversion, ConversionSource, hls};
+use crate::events::{Addresses, EventStreams};
 use crate::network::{ConnectionAuth, Connections, ServerName, Services};
 use crate::passkeys::{CeremonyError, SignInError};
 use crate::planner;
@@ -74,18 +75,16 @@ pub(crate) struct ClientProtocol {
     /// This server's endpoint id, which app passkey challenges are made
     /// with (PX-10).
     id: EndpointId,
-    /// The addresses a signed-in device is told (PX-12).
-    told: Told,
     connections: Connections,
     services: Services,
     info: Arc<ServerInfo>,
     /// What `info` calls the server, as it is now (P3-10).
     name: ServerName,
-    /// The events stream of each connection that said Hello.
-    events: Arc<Mutex<HashMap<usize, SendStream>>>,
+    /// The events stream of each connection that said Hello, and what
+    /// pushes the server's addresses on them (PX-12).
+    addresses: Addresses,
     instance: String,
-    operations: Arc<crate::operations::Operations>,
-    anonymous_operations: Arc<crate::operations::Operations>,
+    operations: crate::operations::Pools,
 }
 
 /// What one connection has said so far.
@@ -161,17 +160,21 @@ impl ClientProtocol {
         name: ServerName,
         services: Services,
     ) -> Self {
+        let addresses = Addresses {
+            streams: EventStreams::default(),
+            connections: connections.clone(),
+            told,
+        };
+        tokio::spawn(addresses.clone().tell_changes());
         Self {
             id: endpoint.id(),
-            told,
             connections,
             services,
             info: Arc::new(info),
             name,
-            events: Arc::default(),
+            addresses,
             instance: uuid::Uuid::now_v7().to_string(),
-            operations: Arc::default(),
-            anonymous_operations: Arc::new(crate::operations::Operations::anonymous()),
+            operations: crate::operations::Pools::default(),
         }
     }
 
@@ -351,20 +354,7 @@ impl ClientProtocol {
             .into();
         };
         let endpoint = connection.remote_id().to_string();
-        let anonymous = matches!(
-            wire.envelope.request,
-            Request::LoginPassword(_)
-                | Request::BeginDeviceSignIn { .. }
-                | Request::AwaitDeviceSignIn { .. }
-                | Request::BeginPasskeySignIn { .. }
-                | Request::FinishPasskeySignIn { .. }
-                | Request::ResumeProfile { .. }
-        );
-        let operations = if anonymous {
-            &self.anonymous_operations
-        } else {
-            &self.operations
-        };
+        let (operations, anonymous) = self.operations.of(&wire.envelope.request);
         let fingerprint = *blake3::hash(bytes).as_bytes();
         let now = crate::operations::now_ms();
         let cached =
@@ -495,6 +485,8 @@ impl ClientProtocol {
                         tracing::warn!(error = %e, %endpoint, "cannot keep the device's platform");
                     }
                     self.open_events(connection).await;
+                    // A device that kept a session is signed in already.
+                    self.addresses.tell(connection.stable_id());
                 }
                 Ok(Reply::ServerInfo(ServerInfo {
                     name: self.name.get(),
@@ -563,7 +555,7 @@ impl ClientProtocol {
                             remembered = handover.remembered,
                             "device signed in by approval"
                         );
-                        self.connections.signed_in(&connection.remote_id());
+                        self.signed_in(connection);
                         Ok(Reply::LoggedIn {
                             session: SessionId(handover.token.0),
                             remembered: handover.remembered,
@@ -638,10 +630,7 @@ impl ClientProtocol {
                     // Locked, only these two (P2-08).
                     let exempt = matches!(
                         request,
-                        Request::ActivateProfile
-                            | Request::WhoAmI
-                            | Request::ServerAddresses
-                            | Request::UnlockProfile { .. }
+                        Request::ActivateProfile | Request::WhoAmI | Request::UnlockProfile { .. }
                     );
                     let allowed = if exempt {
                         Ok(())
@@ -1268,15 +1257,6 @@ impl ClientProtocol {
                     locked: state.locks.lock().locked(&session),
                     pin: pin.map(|p| PinState { digits: p.digits }),
                 }))
-            }
-            Request::ServerAddresses => {
-                // The interfaces are read from the system: off the async
-                // threads.
-                let told = self.told.clone();
-                let addrs = tokio::task::spawn_blocking(move || told.addrs())
-                    .await
-                    .map_err(internal)?;
-                Ok(Reply::ServerAddresses { addrs })
             }
             Request::BeginPasskeyRegistration => {
                 // P3-03's rule, as for a passkey added in the web UI: a
@@ -2115,8 +2095,12 @@ impl ClientProtocol {
                 read
             }
             Request::LookupDeviceSignIn { code } => {
-                let code = self.sign_in_code(connection, &user, &code)?;
-                match self.services.auth.sign_ins().lookup(&code) {
+                let (code, guess) = self.sign_in_code(connection, &user, &code)?;
+                let waiting = self.services.auth.sign_ins().lookup(&code);
+                if waiting.is_some() {
+                    self.services.auth.guessed_right(guess);
+                }
+                match waiting {
                     Some(waiting) => Ok(Reply::DeviceSignInRequest(DeviceSignInRequest {
                         device_name: waiting.device_name,
                         client_name: waiting.client_name,
@@ -2125,18 +2109,20 @@ impl ClientProtocol {
                         remember: waiting.remember,
                         requested_from: waiting.address.map(crate::device_sign_in::device_address),
                     })),
-                    None => Err(self.wrong_sign_in_code(connection, &user)),
+                    None => Err(wrong_sign_in_code()),
                 }
             }
             Request::ApproveDeviceSignIn { code, remember } => {
                 recently_signed_in(&user)?;
-                let code = self.sign_in_code(connection, &user, &code)?;
+                let (code, guess) = self.sign_in_code(connection, &user, &code)?;
                 let approver = connection.remote_id().to_string();
-                let claim = match self.services.auth.sign_ins().claim(&code, Some(&approver)) {
+                let claim = self.services.auth.sign_ins().claim(&code, Some(&approver));
+                if !matches!(claim, Err(ClaimError::Unknown)) {
+                    self.services.auth.guessed_right(guess);
+                }
+                let claim = match claim {
                     Ok(claim) => claim,
-                    Err(ClaimError::Unknown) => {
-                        return Err(self.wrong_sign_in_code(connection, &user));
-                    }
+                    Err(ClaimError::Unknown) => return Err(wrong_sign_in_code()),
                     Err(ClaimError::SameDevice) => {
                         return Err(Error::InvalidInput {
                             message: "approve this device's sign-in on another device".into(),
@@ -2167,12 +2153,13 @@ impl ClientProtocol {
                 }
             }
             Request::DenyDeviceSignIn { code } => {
-                let code = self.sign_in_code(connection, &user, &code)?;
+                let (code, guess) = self.sign_in_code(connection, &user, &code)?;
                 if self.services.auth.sign_ins().deny(&code) {
+                    self.services.auth.guessed_right(guess);
                     tracing::info!(user = %user.username, "device sign-in denied");
                     Ok(Reply::Done)
                 } else {
-                    Err(self.wrong_sign_in_code(connection, &user))
+                    Err(wrong_sign_in_code())
                 }
             }
             Request::Hello(_)
@@ -2240,7 +2227,7 @@ impl ClientProtocol {
                     remembered = done.remembered,
                     "logged in"
                 );
-                self.connections.signed_in(&connection.remote_id());
+                self.signed_in(connection);
                 Ok(Reply::LoggedIn {
                     session: SessionId(done.token.0),
                     remembered: done.remembered,
@@ -2289,7 +2276,7 @@ impl ClientProtocol {
             remembered,
             "logged in with an app passkey"
         );
-        self.connections.signed_in(&connection.remote_id());
+        self.signed_in(connection);
         Ok(Reply::LoggedIn {
             session: SessionId(token.0),
             remembered,
@@ -2320,7 +2307,7 @@ impl ClientProtocol {
         match self.services.auth.resume(user, &binding).await {
             Ok(Some(token)) => {
                 tracing::info!(endpoint = %endpoint_id, user = %user, "resumed on a trusted device");
-                self.connections.signed_in(&connection.remote_id());
+                self.signed_in(connection);
                 Ok(Reply::LoggedIn {
                     session: SessionId(token.0),
                     remembered: true,
@@ -2419,31 +2406,27 @@ impl ClientProtocol {
         Ok(())
     }
 
-    /// `typed` as a device sign-in code, if `user` on this endpoint may
-    /// try one now. A malformed code is a wrong one.
+    /// `typed` as a device sign-in code and the guess it is, if `user` on
+    /// this endpoint may try one now. Codes are short, so guessing them is
+    /// limited as passwords are: the guess is counted as wrong before it
+    /// is checked (A-13), and only [`crate::auth::Auth::guessed_right`]
+    /// takes it back. A malformed code is a wrong one.
     fn sign_in_code(
         &self,
         connection: &Connection,
         user: &SessionUser,
         typed: &str,
-    ) -> Result<String, Error> {
+    ) -> Result<(String, crate::auth::Guess), Error> {
         let (what, from) = sign_in_code_keys(connection, user);
-        if let Some(retry_after) = self.services.auth.attempt_limited(&what, Some(&from)) {
-            return Err(Error::RateLimited {
+        let guess = self
+            .services
+            .auth
+            .guess(what, Some(from))
+            .map_err(|retry_after| Error::RateLimited {
                 retry_after_ms: retry_after.as_millis() as u64,
-            });
-        }
-        device_sign_in_code(typed).ok_or_else(|| self.wrong_sign_in_code(connection, user))
-    }
-
-    /// Count a code that is not pending against `user` and this endpoint:
-    /// codes are short, so guessing them is limited as passwords are.
-    fn wrong_sign_in_code(&self, connection: &Connection, user: &SessionUser) -> Error {
-        let (what, from) = sign_in_code_keys(connection, user);
-        self.services.auth.attempt_failed(&what, Some(&from));
-        Error::NotFound {
-            what: "sign-in code".into(),
-        }
+            })?;
+        let code = device_sign_in_code(typed).ok_or_else(wrong_sign_in_code)?;
+        Ok((code, guess))
     }
 
     /// A device's last connection closed: end its playbacks, and their
@@ -2709,6 +2692,14 @@ impl ClientProtocol {
             .map_err(catalog_error)
     }
 
+    /// `connection`'s device signed in: each of its connections gets the
+    /// normal limits and is told the server's addresses.
+    fn signed_in(&self, connection: &Connection) {
+        for id in self.connections.signed_in(&connection.remote_id()) {
+            self.addresses.tell(id);
+        }
+    }
+
     /// Open the server→client events stream for `connection`.
     async fn open_events(&self, connection: &Connection) {
         let opened = async {
@@ -2718,9 +2709,8 @@ impl ClientProtocol {
         };
         match opened.await {
             Ok(stream) => {
-                self.events
-                    .lock()
-                    .await
+                self.addresses
+                    .streams
                     .insert(connection.stable_id(), stream);
             }
             Err(e) => tracing::debug!(error = %e, "cannot open the events stream"),
@@ -2779,7 +2769,7 @@ impl ProtocolHandler for ClientProtocol {
             }
         };
 
-        self.events.lock().await.remove(&id);
+        self.addresses.streams.remove(id);
         self.connections.remove(id);
         self.services.connected.closed(id);
         tracing::info!(?auth, %reason, "client disconnected");
@@ -2791,10 +2781,10 @@ impl ProtocolHandler for ClientProtocol {
     /// closes the connections.
     async fn shutdown(&self) {
         self.services.previews.stop();
-        let streams: Vec<_> = self.events.lock().await.drain().map(|(_, s)| s).collect();
-        for mut stream in streams {
+        for stream in self.addresses.streams.drain() {
             let notice = async {
-                write_frame(&mut stream, &Event::ShuttingDown).await?;
+                let mut stream = stream.lock().await;
+                write_frame(&mut *stream, &Event::ShuttingDown).await?;
                 stream.finish().map_err(std::io::Error::other)?;
                 // Wait for the client to acknowledge it; closing the
                 // connection first could drop the frame.
@@ -3447,6 +3437,13 @@ fn watch_error(e: WatchError) -> Error {
 /// The auth methods this server offers.
 /// The failure limit's keys for device sign-in codes tried by `user` on
 /// this connection's endpoint: apart from passwords and PINs.
+/// The answer for a code that is not pending.
+fn wrong_sign_in_code() -> Error {
+    Error::NotFound {
+        what: "sign-in code".into(),
+    }
+}
+
 fn sign_in_code_keys(connection: &Connection, user: &SessionUser) -> (String, String) {
     (
         format!("devcode:{}", user.user),

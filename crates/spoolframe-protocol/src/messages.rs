@@ -27,7 +27,7 @@ use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -85,7 +85,8 @@ pub enum Request {
     /// Wait, up to about 25 s, for `request` to be approved: `LoggedIn`
     /// with a session for this device, `DeviceSignInPending` (ask again),
     /// or `DeviceSignInDenied` / `DeviceSignInExpired`. Only the device
-    /// that began the request may ask.
+    /// that began the request may ask, and one wait at a time: a newer
+    /// one ends the one before it with `DeviceSignInPending`.
     AwaitDeviceSignIn {
         request: String,
     },
@@ -148,11 +149,6 @@ pub enum Request {
     },
     /// Who this request's session belongs to.
     WhoAmI,
-    /// Where this server can be dialled directly (PX-12): `ServerAddresses`.
-    /// Only for a session, never in `Hello`: its LAN and VPN addresses are
-    /// not for strangers. Asked while locked too, as for `WhoAmI`: they say
-    /// nothing about the user.
-    ServerAddresses,
     /// End this request's session (and only it). On a trusted device it
     /// forgets the device for this user too (P4-01): the next time is a
     /// full sign-in.
@@ -687,14 +683,6 @@ pub enum Reply {
     Search(SearchResults),
     Tracks(MediaTracks),
     WhoAmI(UserSummary),
-    /// Every address the server's endpoint has on its interfaces, with its
-    /// port (`ServerAddresses`): LAN, public and VPN ones, not loopback or
-    /// link-local. Each is text, as `192.168.1.10:4433` or
-    /// `[2001:db8::1]:4433`.
-    ServerAddresses {
-        #[serde(with = "socket_addrs_as_text")]
-        addrs: Vec<std::net::SocketAddr>,
-    },
     LoggedOut,
     Sessions {
         sessions: Vec<SessionInfo>,
@@ -1114,6 +1102,19 @@ pub enum Error {
 pub enum Event {
     /// The server is stopping; the connection will close.
     ShuttingDown,
+    /// Where this server can be reached (PX-12), pushed to a connection
+    /// as soon as it is signed in, and again whenever the list changes.
+    /// Each one is the whole list: it replaces what was told before.
+    /// Never sent to a connection that is not signed in.
+    ServerAddresses {
+        /// The addresses `network.announce` tells, with their port, as
+        /// text: `192.168.1.10:4433` or `[2001:db8::1]:4433`.
+        #[serde(with = "socket_addrs_as_text")]
+        addrs: Vec<std::net::SocketAddr>,
+        /// The URLs of the iroh relays the server uses (`network.relay`);
+        /// empty while relays are off.
+        relays: Vec<String>,
+    },
     /// An event type this build does not know; ignore it.
     #[serde(other)]
     Unknown,

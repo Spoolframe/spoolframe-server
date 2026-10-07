@@ -70,8 +70,8 @@ pub struct Waiting {
 }
 
 /// Whether `ip` is a public address: not loopback, a private or
-/// link-local network's, CGNAT's or a VPN's (`100.64.0.0/10`), or an IPv6
-/// unique-local one. A device signing in from one is not on a network
+/// link-local network's, CGNAT's or a VPN's (`100.64.0.0/10`), an IPv6
+/// unique-local one, or on one of the server's own networks. A device signing in from one is not on a network
 /// the approver shares, which is what device-code phishing looks like:
 /// the code is someone else's, sent to the approver as a link.
 pub fn from_internet(ip: IpAddr) -> bool {
@@ -80,30 +80,115 @@ pub fn from_internet(ip: IpAddr) -> bool {
 
 /// What kind of network `ip` is on, for an approver (PX-09 finding 27):
 /// the web approval page's `from_internet` and the apps' [`DeviceAddress`]
-/// both come from here. The unspecified address, which no device sends
-/// from, is not called public.
+/// both come from here. It reads the server's interfaces now: sign-ins are
+/// rare, and an address that changed since is judged as it is.
 pub fn network(ip: IpAddr) -> AddressNetwork {
-    match ip.to_canonical() {
+    network_with(ip, &own_networks())
+}
+
+/// [`network`], with the server's own on-link networks given as
+/// `(address, prefix length)`. An address inside one of them is `Local`
+/// whatever its kind: a home with IPv6 gives its devices global addresses
+/// in the server's own /64, and a device there is in the same home. Only
+/// the server's own prefixes count, never a guess at the ISP's /56 or /48,
+/// which other homes share. The unspecified address, which no device sends
+/// from, is not called public.
+pub fn network_with(ip: IpAddr, own: &[(IpAddr, u8)]) -> AddressNetwork {
+    let ip = ip.to_canonical();
+    if ip.is_loopback() {
+        return AddressNetwork::Loopback;
+    }
+    if own
+        .iter()
+        .any(|&(addr, len)| same_network(ip, addr.to_canonical(), len))
+    {
+        return AddressNetwork::Local;
+    }
+    match ip {
         IpAddr::V4(v4) => {
             let shared = v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64;
-            if v4.is_loopback() {
-                AddressNetwork::Loopback
-            } else if v4.is_private() || v4.is_link_local() || v4.is_unspecified() || shared {
+            if v4.is_private() || v4.is_link_local() || v4.is_unspecified() || shared {
                 AddressNetwork::Local
             } else {
                 AddressNetwork::Internet
             }
         }
         IpAddr::V6(v6) => {
-            if v6.is_loopback() {
-                AddressNetwork::Loopback
-            } else if v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local() {
+            if v6.is_unspecified() || v6.is_unique_local() || v6.is_unicast_link_local() {
                 AddressNetwork::Local
             } else {
                 AddressNetwork::Internet
             }
         }
     }
+}
+
+/// Whether `ip` is in `own`'s network of `len` bits. A prefix of 0 is
+/// every address, which no interface's network is, so it matches none.
+fn same_network(ip: IpAddr, own: IpAddr, len: u8) -> bool {
+    match (ip, own) {
+        (IpAddr::V4(ip), IpAddr::V4(own)) if (1..=32).contains(&len) => {
+            let mask = u32::MAX << (32 - u32::from(len));
+            u32::from(ip) & mask == u32::from(own) & mask
+        }
+        (IpAddr::V6(ip), IpAddr::V6(own)) if (1..=128).contains(&len) => {
+            let mask = u128::MAX << (128 - u32::from(len));
+            u128::from(ip) & mask == u128::from(own) & mask
+        }
+        _ => false,
+    }
+}
+
+/// The server's on-link networks now: each address on an interface that
+/// is up, with its netmask's prefix length. With no netmask an IPv6
+/// address is taken as a /64, what SLAAC hands out, and an IPv4 one as
+/// itself alone. Kept apart from [`crate::announce::interfaces`], which
+/// does not read netmasks.
+fn own_networks() -> Vec<(IpAddr, u8)> {
+    let mut found = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list it allocates, which is
+    // read only until the freeifaddrs below; each entry's address and
+    // netmask are read as the struct the address's family names.
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return found;
+        }
+        let mut entry = head;
+        while let Some(ifa) = entry.as_ref() {
+            entry = ifa.ifa_next;
+            if ifa.ifa_addr.is_null() || ifa.ifa_flags & libc::IFF_UP as u32 == 0 {
+                continue;
+            }
+            let mask = ifa.ifa_netmask;
+            let own = match i32::from((*ifa.ifa_addr).sa_family) {
+                libc::AF_INET => {
+                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    let len = if mask.is_null() {
+                        32
+                    } else {
+                        let m = &*(mask as *const libc::sockaddr_in);
+                        u32::from_be(m.sin_addr.s_addr).count_ones() as u8
+                    };
+                    (IpAddr::from(sa.sin_addr.s_addr.to_ne_bytes()), len)
+                }
+                libc::AF_INET6 => {
+                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    let len = if mask.is_null() {
+                        64
+                    } else {
+                        let m = &*(mask as *const libc::sockaddr_in6);
+                        u128::from_be_bytes(m.sin6_addr.s6_addr).count_ones() as u8
+                    };
+                    (IpAddr::from(sa.sin6_addr.s6_addr), len)
+                }
+                _ => continue,
+            };
+            found.push(own);
+        }
+        libc::freeifaddrs(head);
+    }
+    found
 }
 
 /// `ip` as an approving app is shown it: an IPv4 address never in its
@@ -194,6 +279,9 @@ struct Pending {
     code: String,
     expires_at: Instant,
     state: watch::Sender<State>,
+    /// How many waits it has had: the latest is the one waiting
+    /// ([`DeviceSignIns::wait`]).
+    waits: watch::Sender<u64>,
 }
 
 impl Pending {
@@ -289,6 +377,7 @@ impl DeviceSignIns {
                 code: code.clone(),
                 expires_at: self.clock.now() + self.lifetime,
                 state: watch::Sender::new(State::Waiting),
+                waits: watch::Sender::new(0),
             },
         );
         Some(Started {
@@ -372,12 +461,22 @@ impl DeviceSignIns {
     ///
     /// `max` is a real wait, on the runtime's timer; the code's expiry is
     /// by the clock, so the wait ends at whichever of the two comes first.
+    ///
+    /// A request is waited on once at a time: a newer wait ends this one as
+    /// [`Outcome::Pending`]. Each wait holds an operation in the anonymous
+    /// pool for its long poll, so a device can hold no more of it than it
+    /// has requests pending (finding 48).
     pub async fn wait(&self, request: &str, endpoint: &str, max: Duration) -> Outcome {
         let until = tokio::time::Instant::now() + max;
-        let mut state = {
+        let (mut state, mut waits, this) = {
             let inner = self.lock();
             match inner.by_request.get(request) {
-                Some(p) if p.waiting.endpoint == endpoint => p.state.subscribe(),
+                Some(p) if p.waiting.endpoint == endpoint => {
+                    p.waits.send_modify(|n| *n += 1);
+                    let waits = p.waits.subscribe();
+                    let this = *waits.borrow();
+                    (p.state.subscribe(), waits, this)
+                }
                 // Not this device's: as if it were not there at all.
                 _ => return Outcome::Expired,
             }
@@ -387,17 +486,25 @@ impl DeviceSignIns {
                 return Outcome::Expired;
             };
             let left = expires_at.saturating_duration_since(self.clock.now());
-            let decided = tokio::time::timeout_at(
-                until.min(tokio::time::Instant::now() + left),
-                state.wait_for(|s| s.outcome().is_some()),
-            )
-            .await;
+            let decided =
+                tokio::time::timeout_at(until.min(tokio::time::Instant::now() + left), async {
+                    tokio::select! {
+                        // A newer wait is told the outcome instead.
+                        biased;
+                        Ok(_) = waits.wait_for(|n| *n != this) => None,
+                        decided = state.wait_for(|s| s.outcome().is_some()) => {
+                            Some(decided.map(|_| ()))
+                        }
+                    }
+                })
+                .await;
             match decided {
+                Ok(None) => return Outcome::Pending,
                 // Dropped by a sweep: it expired.
-                Ok(Err(_)) => return Outcome::Expired,
+                Ok(Some(Err(_))) => return Outcome::Expired,
                 // Decided, or out of time: which of the two is settled
                 // under the lock, against an approver deciding it now.
-                Ok(Ok(_)) | Err(_) => match self.take(request) {
+                Ok(Some(Ok(()))) | Err(_) => match self.take(request) {
                     Some(outcome) => return outcome,
                     None if tokio::time::Instant::now() >= until => return Outcome::Pending,
                     None => continue,
@@ -657,6 +764,33 @@ mod tests {
         assert_eq!(approved, 1, "{outcomes:?}");
     }
 
+    /// Finding 48: each wait holds an operation in the anonymous pool for
+    /// its whole long poll. One sign-in is waited on once at a time, so a
+    /// device cannot keep more waits than it has sign-ins: a newer wait
+    /// ends the one before it as still pending.
+    #[tokio::test(start_paused = true)]
+    async fn a_newer_wait_ends_the_one_before_it() {
+        let sign_ins = std::sync::Arc::new(DeviceSignIns::default());
+        let started = sign_ins.begin(tv("tv")).unwrap();
+        let first = {
+            let (sign_ins, request) = (sign_ins.clone(), started.request.clone());
+            tokio::spawn(async move { sign_ins.wait(&request, "tv", AWAIT).await })
+        };
+        tokio::task::yield_now().await;
+        let second = {
+            let (sign_ins, request) = (sign_ins.clone(), started.request.clone());
+            tokio::spawn(async move { sign_ins.wait(&request, "tv", AWAIT).await })
+        };
+        let first = tokio::time::timeout(Duration::from_secs(1), first).await;
+        assert!(
+            matches!(first, Ok(Ok(Outcome::Pending))),
+            "the older wait went on: {first:?}"
+        );
+        let claim = sign_ins.claim(&started.code, None).unwrap();
+        assert!(sign_ins.fulfil(&claim.request, Some(handover("t"))));
+        assert!(matches!(second.await.unwrap(), Outcome::Approved(_)));
+    }
+
     #[tokio::test]
     async fn waiting_is_pending_until_decided_and_expired_after() {
         let clock = Clock::default();
@@ -680,7 +814,7 @@ mod tests {
     /// apart from a home network; the rest is as the web page judges it.
     #[test]
     fn an_address_s_network_is_loopback_local_or_internet() {
-        let at = |text: &str| network(text.parse().unwrap());
+        let at = |text: &str| network_with(text.parse().unwrap(), &[]);
         for this_host in ["127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1"] {
             assert_eq!(at(this_host), AddressNetwork::Loopback, "{this_host}");
         }
@@ -706,6 +840,56 @@ mod tests {
                 network: AddressNetwork::Local,
             }
         );
+    }
+
+    /// Finding 27's false positive: a global IPv6 address in the server's
+    /// own /64 is a device in the same home, not on the internet.
+    #[test]
+    fn an_address_in_the_server_s_own_ipv6_prefix_is_local() {
+        let own = [("2603:8000:c33e:6ac6::1".parse().unwrap(), 64)];
+        assert_eq!(
+            network_with("2603:8000:c33e:6ac6::abcd".parse().unwrap(), &own),
+            AddressNetwork::Local
+        );
+    }
+
+    /// Only the server's own prefix counts: the next /64 of the same /56
+    /// is another home's.
+    #[test]
+    fn another_prefix_of_the_same_isp_block_is_internet() {
+        let own = [("2603:8000:c33e:6ac6::1".parse().unwrap(), 64)];
+        assert_eq!(
+            network_with("2603:8000:c33e:6ac7::abcd".parse().unwrap(), &own),
+            AddressNetwork::Internet
+        );
+    }
+
+    /// A public IPv4 network the server is on is on-link too.
+    #[test]
+    fn an_address_on_the_server_s_public_ipv4_network_is_local() {
+        let own = [("203.0.113.7".parse().unwrap(), 24)];
+        assert_eq!(
+            network_with("203.0.113.9".parse().unwrap(), &own),
+            AddressNetwork::Local
+        );
+        assert_eq!(
+            network_with("::ffff:203.0.113.9".parse().unwrap(), &own),
+            AddressNetwork::Local
+        );
+        assert_eq!(
+            network_with("203.0.114.9".parse().unwrap(), &own),
+            AddressNetwork::Internet
+        );
+    }
+
+    /// The server's own addresses, read from its interfaces, are on its
+    /// own networks, so none of them is called public.
+    #[test]
+    fn the_server_s_own_addresses_are_not_internet() {
+        for (addr, len) in own_networks() {
+            assert!(len <= if addr.is_ipv4() { 32 } else { 128 }, "{addr}/{len}");
+            assert_ne!(network(addr), AddressNetwork::Internet, "{addr}/{len}");
+        }
     }
 
     /// PX-09 finding 27: what the approval page warns of.

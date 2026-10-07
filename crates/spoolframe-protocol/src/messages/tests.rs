@@ -220,7 +220,6 @@ fn every_request_round_trips() {
         },
         Request::Tracks { id },
         Request::WhoAmI,
-        Request::ServerAddresses,
         Request::Logout,
         Request::ListSessions,
         Request::StartPlayback {
@@ -463,12 +462,6 @@ fn every_reply_round_trips() {
         },
         Reply::Search(search_results()),
         Reply::Tracks(MediaTracks::default()),
-        Reply::ServerAddresses {
-            addrs: vec![
-                "192.168.1.10:4433".parse().unwrap(),
-                "[2001:db8::1]:4433".parse().unwrap(),
-            ],
-        },
         Reply::WhoAmI(UserSummary {
             user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
             username: "alice".into(),
@@ -992,6 +985,45 @@ fn passkey_bytes_are_cbor_byte_strings() {
 #[test]
 fn events_round_trip() {
     round_trip(Event::ShuttingDown);
+    round_trip(server_addresses_event());
+    round_trip(Event::ServerAddresses {
+        addrs: Vec::new(),
+        relays: Vec::new(),
+    });
+}
+
+fn server_addresses_event() -> Event {
+    Event::ServerAddresses {
+        addrs: vec![
+            "10.10.0.2:4433".parse().unwrap(),
+            "[2001:db8::1]:4433".parse().unwrap(),
+        ],
+        relays: vec!["https://relay.example.net./".into()],
+    }
+}
+
+/// The addresses a signed-in device is pushed (PX-12) go as text, as the
+/// rest of the protocol's addresses do, and the relays as their URLs.
+#[test]
+fn the_server_addresses_event_goes_as_text() {
+    assert_eq!(
+        serde_json::to_value(server_addresses_event()).unwrap(),
+        serde_json::json!({
+            "type": "server_addresses",
+            "addrs": ["10.10.0.2:4433", "[2001:db8::1]:4433"],
+            "relays": ["https://relay.example.net./"],
+        })
+    );
+    let bad: Result<Event, _> = serde_json::from_value(serde_json::json!({
+        "type": "server_addresses", "addrs": ["nimble.local:4433"], "relays": []
+    }));
+    assert!(bad.is_err(), "{bad:?}");
+}
+
+/// Neither list may be left out: an empty one is sent as empty.
+#[test]
+fn the_server_addresses_event_missing_a_field_is_refused() {
+    assert_each_required(&server_addresses_event(), &["addrs", "relays"]);
 }
 
 /// What a newer peer might send.
@@ -1565,45 +1597,14 @@ fn a_sign_in_must_say_whether_to_remember() {
     assert!(without.is_err(), "{without:?}");
 }
 
-/// The server's addresses (PX-12) need a session, may be asked again, and
-/// go as text: what an app sees in JSON is what is in the CBOR.
+/// The server's addresses come only as an event since revision 7: a
+/// request for them is one this build does not know, and the server
+/// answers it `Unsupported`.
 #[test]
-fn server_addresses_need_a_session_and_go_as_text() {
-    use crate::policy::retry_safe;
-    assert!(!Request::ServerAddresses.is_pre_auth());
-    assert!(retry_safe(&Request::ServerAddresses));
-    assert_eq!(
-        serde_json::to_value(Request::ServerAddresses).unwrap(),
-        serde_json::json!({"type": "server_addresses"})
-    );
-    let reply = Reply::ServerAddresses {
-        addrs: vec![
-            "10.10.0.2:4433".parse().unwrap(),
-            "[2001:db8::1]:4433".parse().unwrap(),
-        ],
-    };
-    assert_eq!(
-        serde_json::to_value(&reply).unwrap(),
-        serde_json::json!({
-            "type": "server_addresses", "addrs": ["10.10.0.2:4433", "[2001:db8::1]:4433"]
-        })
-    );
-    let cbor: ciborium::Value = ciborium::from_reader(&codec::encode(&reply).unwrap()[..]).unwrap();
-    let text = ciborium::Value::Text("10.10.0.2:4433".into());
-    let addrs = cbor
-        .as_map()
-        .and_then(|m| m.iter().find(|(k, _)| k.as_text() == Some("addrs")))
-        .and_then(|(_, v)| v.as_array())
-        .unwrap_or_else(|| panic!("{cbor:?}"));
-    assert_eq!(addrs.first(), Some(&text), "{cbor:?}");
-}
-
-#[test]
-fn a_server_address_that_is_not_one_does_not_decode() {
-    let bad: Result<Reply, _> = serde_json::from_value(serde_json::json!({
-        "type": "server_addresses", "addrs": ["nimble.local:4433"]
-    }));
-    assert!(bad.is_err(), "{bad:?}");
+fn the_server_addresses_request_is_gone() {
+    let request: Request =
+        serde_json::from_value(serde_json::json!({"type": "server_addresses"})).unwrap();
+    assert_eq!(request, Request::Unknown);
 }
 
 /// `value` in CBOR, then each of `fields` left out of its map in turn:

@@ -459,6 +459,23 @@ impl RateLimiter {
         Ok(())
     }
 
+    /// The attempt begun at `began` was right, and nothing else changes:
+    /// it is taken back from both keys. For a guess at a code, where a
+    /// right one says nothing about who is guessing (A-13).
+    pub fn take_back(&self, username: &str, source: Option<&str>, began: Instant) {
+        let mut failures = self.failures.lock();
+        for key in Self::keys(username, source) {
+            if let Some(times) = failures.by_key.get_mut(&key) {
+                if let Some(at) = times.iter().position(|t| *t == began) {
+                    times.remove(at);
+                }
+                if times.is_empty() {
+                    failures.by_key.remove(&key);
+                }
+            }
+        }
+    }
+
     /// The attempt begun at `began` was right: it is taken back, and the
     /// username's failures are cleared. The source's other failures stay:
     /// one account's right password must not reset guessing at others from
@@ -565,6 +582,16 @@ impl From<StoreError> for UnlockError {
     fn from(e: StoreError) -> Self {
         UnlockError::Internal(e.to_string())
     }
+}
+
+/// A guess at a code, counted as wrong until [`Auth::guessed_right`]
+/// takes it back.
+#[derive(Debug)]
+#[must_use = "a guess is counted as wrong unless it is taken back"]
+pub struct Guess {
+    what: String,
+    source: Option<String>,
+    began: Instant,
 }
 
 /// How an approved device sign-in ended (P3-07).
@@ -861,8 +888,30 @@ impl Auth {
         }
     }
 
-    /// The failure limit, for an attempt that is not a password login
-    /// (a setup code): `Some(wait)` if `what` from `source` is limited.
+    /// A guess at a short code (a setup or device sign-in code) as `what`
+    /// from `source`, counted as wrong before it is checked, as a password
+    /// is: `Err(wait)` if the limit is reached. It stays counted unless
+    /// [`Auth::guessed_right`] takes it back, so guesses sent at once
+    /// cannot all be checked before the first has failed (A-13).
+    pub fn guess(&self, what: String, source: Option<String>) -> Result<Guess, Duration> {
+        let began = self.clock.now();
+        self.limiter.begin(&what, source.as_deref(), began)?;
+        Ok(Guess {
+            what,
+            source,
+            began,
+        })
+    }
+
+    /// `guess` was right: it is not counted. Nothing else is cleared: a
+    /// right code says nothing about the guesses that came before it.
+    pub fn guessed_right(&self, guess: Guess) {
+        self.limiter
+            .take_back(&guess.what, guess.source.as_deref(), guess.began);
+    }
+
+    /// The failure limit, for an attempt that is not a password login:
+    /// `Some(wait)` if `what` from `source` is limited.
     pub fn attempt_limited(&self, what: &str, source: Option<&str>) -> Option<Duration> {
         self.limiter.check(what, source, self.clock.now())
     }
@@ -871,10 +920,6 @@ impl Auth {
     /// failed ones, if they are (P3-18).
     pub fn login_limited(&self, username: &str) -> Option<Duration> {
         self.limiter.user_limited(username, self.clock.now())
-    }
-
-    pub fn attempt_failed(&self, what: &str, source: Option<&str>) {
-        self.limiter.record_failure(what, source, self.clock.now());
     }
 
     /// Count an attempt that is not a password login (a passkey's
@@ -1453,5 +1498,23 @@ mod tests {
         assert!(limiter.check("bob", Some("a"), t0).is_none());
         limiter.record_failure("bob", Some("a"), t0);
         assert!(limiter.check("carol", Some("a"), t0).is_some());
+    }
+
+    /// A-13: a right code is not counted, and clears nothing: unlike a
+    /// password, it says nothing about the guesses before it.
+    #[test]
+    fn a_right_guess_is_taken_back_and_clears_nothing() {
+        let limiter = RateLimiter::default();
+        let t0 = Instant::now();
+        for _ in 0..MAX_FAILURES - 1 {
+            limiter.begin("devcode:1", Some("a"), t0).unwrap();
+        }
+        let right = t0 + Duration::from_millis(1);
+        limiter.begin("devcode:1", Some("a"), right).unwrap();
+        limiter.take_back("devcode:1", Some("a"), right);
+        // The four wrong ones stay, from this source and from another.
+        limiter.begin("devcode:1", Some("a"), right).unwrap();
+        assert!(limiter.begin("devcode:1", Some("b"), right).is_err());
+        assert!(limiter.check("devcode:2", Some("a"), right).is_some());
     }
 }

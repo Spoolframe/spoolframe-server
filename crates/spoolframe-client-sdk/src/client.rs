@@ -21,7 +21,7 @@ use crate::connection::{ServerConnection, Timeouts};
 use crate::discovery::Discovery;
 use crate::error::SdkError;
 use crate::link::{ConnectionPath, Link, SignOutWatch, StateWatch};
-use crate::servers::{self, AddrSource, SavedServer, ServerEntry};
+use crate::servers::{self, SavedServer, ServerEntry};
 use crate::session::{self, SavedProfile, Session, SignInMethod, StoredSession};
 use crate::storage::{Storage, StorageError, keys};
 use spoolframe_protocol::policy::retry_safe;
@@ -281,6 +281,9 @@ impl Client {
                     verified: s.verified,
                     on_network: on_lan.is_some(),
                     addrs,
+                    advertised_at: servers::time(s.advertised_at),
+                    advertised_addrs: s.advertised_addrs,
+                    relays: s.relays,
                 }
             })
             .collect();
@@ -292,6 +295,9 @@ impl Client {
                 fingerprint: fingerprint::fingerprint(id.as_bytes()),
                 name: h.name,
                 addrs: h.addrs,
+                advertised_addrs: Vec::new(),
+                relays: Vec::new(),
+                advertised_at: None,
                 pinned: false,
                 verified: false,
                 on_network: true,
@@ -412,6 +418,9 @@ impl Client {
                     verified_at: servers::time(server.verified_at),
                     last_connected_at: servers::time(server.last_connected_at),
                     server_id: server.server_id.clone(),
+                    advertised_addrs: server.advertised_addrs.clone(),
+                    relays: server.relays.clone(),
+                    advertised_at: servers::time(server.advertised_at),
                 };
                 servers::save(storage, &saved).await?;
                 self.inner.discovery.changed();
@@ -559,6 +568,11 @@ impl Client {
             verified_at: saved.and_then(|s| servers::time(s.verified_at)),
             last_connected_at: saved.and_then(|s| servers::time(s.last_connected_at)),
             server_id: Some(conn.info.server_id.clone()),
+            advertised_addrs: saved
+                .map(|s| s.advertised_addrs.clone())
+                .unwrap_or_default(),
+            relays: saved.map(|s| s.relays.clone()).unwrap_or_default(),
+            advertised_at: saved.and_then(|s| servers::time(s.advertised_at)),
         }
     }
 
@@ -903,15 +917,6 @@ impl Client {
         }
         session::save(storage, &server, &stored).await?;
         drop(_saving);
-        // Signed in now, the device may be told where else the server is.
-        if let Some(conn) = self.link(server).open() {
-            tokio::spawn(learn_addresses(
-                Arc::downgrade(&self.inner),
-                server,
-                conn.conn.clone(),
-                Some(token.clone()),
-            ));
-        }
         Ok(Session {
             client: self.clone(),
             server,
@@ -1485,15 +1490,6 @@ impl Client {
             reached,
             saving,
         ));
-        // A device signed in there (the app opened again, a reconnect)
-        // asks on each new connection: the server may have gained an
-        // address since.
-        tokio::spawn(learn_addresses(
-            Arc::downgrade(&self.inner),
-            id,
-            conn.conn.clone(),
-            None,
-        ));
         Ok(conn)
     }
 
@@ -1547,33 +1543,31 @@ impl Client {
     /// Saved server `id` was reached at `addrs` just now: they join those
     /// known. Nothing for a server not saved.
     async fn saw(&self, id: EndpointId, addrs: Vec<SocketAddr>) -> Result<(), SdkError> {
-        self.sighted(id, addrs, AddrSource::Reached).await
+        self.sighted(id, |server, now| server.saw(addrs, now)).await
     }
 
-    /// Saved server `id` told this device just now that it has `addrs`
-    /// (PX-12): they join those known as told. Nothing for a server not
-    /// saved.
-    async fn told(&self, id: EndpointId, addrs: Vec<SocketAddr>) -> Result<(), SdkError> {
-        self.sighted(id, addrs, AddrSource::Told).await
-    }
-
-    /// A session kept for server `id` that a sign-out has not ended, to
-    /// ask in.
-    async fn kept_session(&self, id: EndpointId) -> Option<SessionId> {
-        let link = self.link(id);
-        session::load(self.inner.storage.as_ref(), &id)
-            .await
-            .ok()?
-            .into_iter()
-            .filter_map(|s| s.token.map(SessionId))
-            .find(|token| !link.has_ended(token))
-    }
-
-    async fn sighted(
+    /// Saved server `id` told this device just now where it is (PX-12,
+    /// the `ServerAddresses` event): `addrs` replace the addresses it told
+    /// before, and `relays` the relays. Nothing for a server not saved.
+    pub(crate) async fn told(
         &self,
         id: EndpointId,
         addrs: Vec<SocketAddr>,
-        source: AddrSource,
+        relays: Vec<String>,
+    ) -> Result<(), SdkError> {
+        self.sighted(id, |server, now| {
+            server.relays = relays;
+            server.told(addrs, now)
+        })
+        .await
+    }
+
+    /// Change saved server `id` with `change`, given the time now, which
+    /// says whether its addresses changed.
+    async fn sighted(
+        &self,
+        id: EndpointId,
+        change: impl FnOnce(&mut SavedServer, u64) -> bool,
     ) -> Result<(), SdkError> {
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
@@ -1581,11 +1575,7 @@ impl Client {
         let Some(server) = saved.iter_mut().find(|s| s.endpoint_id == id.to_string()) else {
             return Ok(());
         };
-        let now = servers::now();
-        let new = match source {
-            AddrSource::Reached => server.saw(addrs, now),
-            AddrSource::Told => server.told(addrs, now),
-        };
+        let new = change(server, servers::now());
         servers::save(storage, &saved).await?;
         if new {
             self.inner.discovery.changed();
@@ -1658,48 +1648,6 @@ async fn save_reached(
             Ok(()) => saved.extend(new),
             Err(e) => tracing::warn!(server = %id, error = %e, "cannot save where it was reached"),
         }
-    }
-}
-
-/// Ask server `id` on `conn` where it can be dialled directly (PX-12), in
-/// `session`, or in a session kept for it when `None`; the addresses it
-/// tells join those saved, as told. A device with no session does not ask:
-/// a stranger is not told. Asked on that one connection only, never
-/// retried: an older server that does not know the request, a session
-/// that ended, a connection lost, each costs only the addresses, which the
-/// next connection asks for again.
-async fn learn_addresses(
-    client: std::sync::Weak<Inner>,
-    id: EndpointId,
-    conn: iroh::endpoint::Connection,
-    session: Option<SessionId>,
-) {
-    let (session, limit) = {
-        let Some(inner) = client.upgrade() else {
-            return;
-        };
-        let client = Client { inner };
-        let session = match session {
-            Some(session) => session,
-            None => match client.kept_session(id).await {
-                Some(session) => session,
-                None => return,
-            },
-        };
-        (session, client.inner.timeouts.request)
-    };
-    let addrs = match crate::connection::server_addresses(&conn, &session, limit).await {
-        Ok(addrs) => addrs,
-        Err(e) => {
-            tracing::debug!(server = %id, error = %e, "not told the server's addresses");
-            return;
-        }
-    };
-    let Some(inner) = client.upgrade() else {
-        return;
-    };
-    if let Err(e) = (Client { inner }).told(id, addrs).await {
-        tracing::warn!(server = %id, error = %e, "cannot save the addresses the server told");
     }
 }
 

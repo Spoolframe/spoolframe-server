@@ -109,13 +109,16 @@ network {
   stalled_read_secs = 120;
   # The addresses a signed-in device is told to dial the server at. The
   # server has an address on each network interface, and container and
-  # VM bridges are on that list too: no device reaches those. Told are
-  # the addresses on `interfaces` (each interface when empty), less those
-  # on `ignore_interfaces`, less those in `ignore`, plus `add`. An `add`
-  # address is told even when an ignore matches it. Interface names take
-  # `*` and `?`. A change applies at the next start; the interfaces are
-  # read each time a device asks. `spoolframe-server status` shows the
-  # list told now.
+  # VM bridges are on that list too: no device reaches those, and on most
+  # devices 172.17.0.1 is their own docker0. Told are the addresses on
+  # `interfaces` (each interface when empty, but the virtual ones:
+  # "docker*", "br-*", "veth*" and "virbr*"), less those on
+  # `ignore_interfaces`, less those in `ignore`, plus `add`. A virtual
+  # interface is told only when `interfaces` names it ("docker0"). An
+  # `add` address is told even when an ignore matches it. Interface names
+  # take `*` and `?`. A change applies at the next start; the interfaces
+  # are read each time the list is worked out. `spoolframe-server status`
+  # shows the list told now.
   announce {
     # Addresses the server does not see itself, for example the public
     # address of a NAT that forwards the port: "203.0.113.7" (with the
@@ -123,11 +126,11 @@ network {
     add = [];
     # Addresses and CIDR ranges never told: "172.17.0.0/16", "10.0.0.9".
     ignore = [];
-    # Interfaces never told: Docker's, its networks', their veth pairs'
-    # and libvirt's bridges.
-    ignore_interfaces = ["docker*", "br-*", "veth*", "virbr*"];
+    # Interfaces never told, even when `interfaces` names them: ["wg1"].
+    # The virtual ones need not be listed.
+    ignore_interfaces = [];
     # When set, only these interfaces' addresses are told:
-    # ["enp*", "wg0"].
+    # ["enp*", "wg0"]. Naming a virtual one tells it: ["enp*", "docker0"].
     interfaces = [];
   }
 }

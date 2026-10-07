@@ -143,6 +143,12 @@ impl Peer {
         self.known.load(Ordering::Acquire)
     }
 
+    /// Whether the device is signed in and not signed out since: what may
+    /// be pushed the server's addresses (PX-12).
+    pub fn signed_in(&self) -> bool {
+        self.known() && !self.closing.load(Ordering::Acquire)
+    }
+
     /// The longest request frame its streams may carry.
     pub fn max_frame(&self) -> u32 {
         if self.known() {

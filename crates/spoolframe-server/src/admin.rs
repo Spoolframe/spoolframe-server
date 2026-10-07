@@ -39,7 +39,7 @@ use spoolframe_plex::check::Scope;
 
 pub use crate::admin_http::{AddressRanges, CookiePolicy, Origins, TrustedProxies};
 use crate::auth::{
-    Approval, Auth, LoginError, PasswordError, RECENT_SIGN_IN, SessionToken, hash_password,
+    Approval, Auth, Guess, LoginError, PasswordError, RECENT_SIGN_IN, SessionToken, hash_password,
     hash_pin, pin_digits,
 };
 use crate::catalog::LiveCatalog;
@@ -688,16 +688,18 @@ impl AdminApi {
         };
         let source = source(ext)?;
         let what = format!("setup@{}", source.as_deref().unwrap_or_default());
-        if let Some(retry_after) = self.auth.attempt_limited(&what, source.as_deref()) {
-            return Err(LoginError::RateLimited { retry_after }.into());
-        }
+        // Counted before it is checked (A-13), and taken back if right.
+        let guess = self
+            .auth
+            .guess(what, source)
+            .map_err(|retry_after| LoginError::RateLimited { retry_after })?;
         if !code.matches(given) {
-            self.auth.attempt_failed(&what, source.as_deref());
             return Err(error(
                 error_code::INVALID_SETUP_CODE,
                 "that is not the setup code in the server's log",
             ));
         }
+        self.auth.guessed_right(guess);
         Ok(())
     }
 
@@ -816,40 +818,29 @@ impl AdminApi {
         Ok(user)
     }
 
-    /// The caller and `typed` as a device sign-in code (P3-07), if they
-    /// may try one now. Any live web session may: it was made by a full
-    /// sign-in, and the PIN lock (P2-08) is a device's, which a browser is
-    /// not. A malformed code is a wrong one.
+    /// The caller, `typed` as a device sign-in code (P3-07) and the guess
+    /// it is, if they may try one now. Any live web session may: it was
+    /// made by a full sign-in, and the PIN lock (P2-08) is a device's,
+    /// which a browser is not. Codes are short, so guessing them is
+    /// limited as passwords are, against `user` and where they are: the
+    /// guess is counted as wrong before it is checked (A-13), and only
+    /// [`Auth::guessed_right`] takes it back. A malformed code is a wrong
+    /// one.
     async fn sign_in_code(
         &self,
         ext: &Extensions,
         typed: &str,
-    ) -> RpcResult<(ApiSessionUser, String)> {
+    ) -> RpcResult<(ApiSessionUser, String, Guess)> {
         let (_, user) = self.caller(ext).await?;
         let (what, from) = sign_in_code_keys(ext, user)?;
-        if let Some(retry_after) = self.auth.attempt_limited(&what, from.as_deref()) {
-            return Err(LoginError::RateLimited { retry_after }.into());
-        }
+        let guess = self
+            .auth
+            .guess(what, from)
+            .map_err(|retry_after| LoginError::RateLimited { retry_after })?;
         match spoolframe_protocol::device_sign_in::normalize(typed) {
-            Some(code) => Ok((user, code)),
-            None => Err(self.wrong_sign_in_code(ext, user)?),
+            Some(code) => Ok((user, code, guess)),
+            None => Err(wrong_sign_in_code()),
         }
-    }
-
-    /// Count a code that is not pending against `user` and where they
-    /// are: codes are short, so guessing them is limited as passwords are.
-    /// The answer for such a code; `Err` only if the request has no peer.
-    fn wrong_sign_in_code(
-        &self,
-        ext: &Extensions,
-        user: ApiSessionUser,
-    ) -> RpcResult<ErrorObjectOwned> {
-        let (what, from) = sign_in_code_keys(ext, user)?;
-        self.auth.attempt_failed(&what, from.as_deref());
-        Ok(error(
-            error_code::NO_SUCH_SIGN_IN_CODE,
-            "that is not a sign-in code a device is showing now",
-        ))
     }
 
     /// The account `user` is.
@@ -1053,6 +1044,14 @@ impl From<PinError> for ErrorObjectOwned {
             PinError::Store(_) => internal(e),
         }
     }
+}
+
+/// The answer for a code that is not pending.
+fn wrong_sign_in_code() -> ErrorObjectOwned {
+    error(
+        error_code::NO_SUCH_SIGN_IN_CODE,
+        "that is not a sign-in code a device is showing now",
+    )
 }
 
 /// The failure limit's keys for device sign-in codes tried by `user` from
@@ -1726,10 +1725,11 @@ impl MeApiServer for AdminApi {
         ext: &Extensions,
         code: String,
     ) -> RpcResult<DeviceSignIn> {
-        let (user, code) = self.sign_in_code(ext, &code).await?;
+        let (_, code, guess) = self.sign_in_code(ext, &code).await?;
         let Some(waiting) = self.auth.sign_ins().lookup(&code) else {
-            return Err(self.wrong_sign_in_code(ext, user)?);
+            return Err(wrong_sign_in_code());
         };
+        self.auth.guessed_right(guess);
         // A code is pending only once a device reached the endpoint, so
         // the endpoint's key is known; never an empty fingerprint to match.
         let server_fingerprint = self.status.fingerprint().ok_or_else(|| {
@@ -1759,15 +1759,16 @@ impl MeApiServer for AdminApi {
         remember: bool,
     ) -> RpcResult<()> {
         self.recently_signed_in(ext).await?;
-        let (user, code) = self.sign_in_code(ext, &code).await?;
+        let (user, code, guess) = self.sign_in_code(ext, &code).await?;
         // No endpoint approves here: a web session is never the device
         // that waits.
         let claim = match self.auth.sign_ins().claim(&code, None) {
             Ok(claim) => claim,
             Err(ClaimError::Unknown | ClaimError::SameDevice) => {
-                return Err(self.wrong_sign_in_code(ext, user)?);
+                return Err(wrong_sign_in_code());
             }
         };
+        self.auth.guessed_right(guess);
         match self.auth.approve_device(user.user, &claim, remember).await {
             Ok(Approval::SignedIn) => {
                 tracing::info!(
@@ -1789,12 +1790,13 @@ impl MeApiServer for AdminApi {
     }
 
     async fn device_sign_in_deny(&self, ext: &Extensions, code: String) -> RpcResult<()> {
-        let (user, code) = self.sign_in_code(ext, &code).await?;
+        let (user, code, guess) = self.sign_in_code(ext, &code).await?;
         if self.auth.sign_ins().deny(&code) {
+            self.auth.guessed_right(guess);
             tracing::info!(user = %user.user, "device sign-in denied from the web");
             Ok(())
         } else {
-            Err(self.wrong_sign_in_code(ext, user)?)
+            Err(wrong_sign_in_code())
         }
     }
 

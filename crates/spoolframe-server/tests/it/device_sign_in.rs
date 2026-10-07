@@ -230,6 +230,44 @@ async fn guessing_codes_is_rate_limited() {
     server.stop().await;
 }
 
+/// A-13: a wrong code was counted only once it had failed, so guesses
+/// sent at once were each checked against a count none of them had added
+/// to yet, and more than five were tried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn code_guesses_sent_at_once_are_held_to_the_limit() {
+    let server = server("dsi-guess-at-once", ServerOptions::default()).await;
+    let (phone, session) = phone(&server).await;
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(64));
+    let guesses: Vec<_> = (0..64)
+        .map(|_| {
+            let (phone, session, start) = (phone.clone(), session.clone(), start.clone());
+            tokio::spawn(async move {
+                start.wait().await;
+                phone
+                    .call(
+                        Some(&session),
+                        Request::LookupDeviceSignIn {
+                            code: "BBBB-BBBB".into(),
+                        },
+                    )
+                    .await
+            })
+        })
+        .collect();
+    let mut tried = 0;
+    for guess in guesses {
+        if matches!(guess.await.unwrap(), Response::Err(Error::NotFound { .. })) {
+            tried += 1;
+        }
+    }
+    assert!(
+        tried <= spoolframe_server::auth::MAX_FAILURES,
+        "{tried} wrong codes were tried"
+    );
+    phone.close().await;
+    server.stop().await;
+}
+
 /// Where browsers reach the web UI of the servers below.
 const WEB: &str = "https://media.example.org";
 

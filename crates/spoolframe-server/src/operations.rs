@@ -7,8 +7,9 @@
 
 use parking_lot::Mutex;
 use spoolframe_protocol::rpc::{OPERATION_WINDOW_MS, Operation, RpcReply};
-use spoolframe_protocol::{Error, Request, Response};
+use spoolframe_protocol::{Error, Reply, Request, Response};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::watch;
 
 const MAX_OPERATIONS: usize = 4096;
@@ -31,7 +32,21 @@ const OWNER_SHARE: usize = 8;
 /// How long an anonymous outcome is kept once it is known: long enough for
 /// a client's retry after a lost reply, short enough that sign-in attempts
 /// cannot hold the anonymous pool for an operation's whole 15 minutes.
+/// An outcome that changed nothing is not kept at all ([`changed_nothing`]).
 const ANONYMOUS_KEPT_MS: u64 = 30_000;
+
+/// Whether an anonymous request's `reply` left nothing that a retry could
+/// not do again: a refusal or failure, or a device's wait still pending.
+/// A retry after a lost reply is then answered by running it again, which
+/// refuses, fails or waits again; a wrong password is counted again, which
+/// errs on the safe side. Kept, such outcomes let strangers hold the
+/// anonymous pool with requests that cost them nothing (finding 48).
+fn changed_nothing(reply: &RpcReply) -> bool {
+    matches!(
+        reply.response,
+        Response::Err(_) | Response::Ok(Reply::DeviceSignInPending)
+    )
+}
 
 /// What the outcome of `request` may take, reserved while it runs.
 /// Playback replies carry a plan and its tracks, and may be a whole frame.
@@ -44,6 +59,55 @@ pub(crate) fn reservation(request: &Request) -> usize {
         | Request::BeginPasskeyRegistration
         | Request::BeginConfirmPasskey => CEREMONY_REPLY,
         _ => SMALL_REPLY,
+    }
+}
+
+/// The pools a request's operation can be held in. Anonymous requests
+/// are made before any session is checked, so they cannot take signed-in
+/// capacity; and they are held in two pools of their own (finding 48):
+///
+/// - sign-ins a stranger makes only with a token from the bucket all
+///   strangers share (`LoginPassword`, `Begin`/`FinishPasskeySignIn`),
+///   which the bucket's rate keeps from filling theirs;
+/// - requests that draw on no rate limit (`BeginDeviceSignIn`,
+///   `AwaitDeviceSignIn`, `ResumeProfile`), held by what they wait on: a
+///   device's few pending sign-ins, each waited on once at a time
+///   ([`crate::device_sign_in::DeviceSignIns::wait`]), and a trusted
+///   device's resume.
+///
+/// Endpoint ids are free, so an endpoint's share alone does not keep
+/// strangers from filling a pool between them; this keeps a flood of the
+/// one kind from taking the other's room.
+#[derive(Debug, Clone)]
+pub(crate) struct Pools {
+    signed_in: Arc<Operations>,
+    sign_in: Arc<Operations>,
+    device: Arc<Operations>,
+}
+
+impl Default for Pools {
+    fn default() -> Self {
+        Self {
+            signed_in: Arc::default(),
+            sign_in: Arc::new(Operations::anonymous()),
+            device: Arc::new(Operations::anonymous()),
+        }
+    }
+}
+
+impl Pools {
+    /// The pool `request`'s operation is held in, and whether it is an
+    /// anonymous one.
+    pub fn of(&self, request: &Request) -> (&Arc<Operations>, bool) {
+        match request {
+            Request::LoginPassword(_)
+            | Request::BeginPasskeySignIn { .. }
+            | Request::FinishPasskeySignIn { .. } => (&self.sign_in, true),
+            Request::BeginDeviceSignIn { .. }
+            | Request::AwaitDeviceSignIn { .. }
+            | Request::ResumeProfile { .. } => (&self.device, true),
+            _ => (&self.signed_in, false),
+        }
     }
 }
 
@@ -189,24 +253,28 @@ impl Operations {
             self.max_operations / OWNER_SHARE,
             self.max_bytes / OWNER_SHARE,
         );
-        let room = Self::fits(
-            held(&|_, _| true),
-            reserve,
-            self.max_operations,
-            self.max_bytes,
-        ) && Self::fits(
-            held(&|(peer, _), _| peer == owner.endpoint),
-            reserve,
-            share_ops,
-            share_bytes,
-        ) && owner.user.is_none_or(|user| {
-            Self::fits(
-                held(&|_, entry| entry.user.as_deref() == Some(user)),
+        let user_held = owner
+            .user
+            .map(|user| held(&|_, entry| entry.user.as_deref() == Some(user)));
+        // The pool's last share is for users holding nothing (finding 49):
+        // eight users at their shares would fill it, and users are few, so
+        // one more always has room for its first. Endpoints are not
+        // reserved for: they are free, and any number could ask.
+        let (pool_ops, pool_bytes) = match user_held {
+            Some((n, _)) if n > 0 => (
+                self.max_operations - share_ops,
+                self.max_bytes - share_bytes,
+            ),
+            _ => (self.max_operations, self.max_bytes),
+        };
+        let room = Self::fits(held(&|_, _| true), reserve, pool_ops, pool_bytes)
+            && Self::fits(
+                held(&|(peer, _), _| peer == owner.endpoint),
                 reserve,
                 share_ops,
                 share_bytes,
             )
-        });
+            && user_held.is_none_or(|held| Self::fits(held, reserve, share_ops, share_bytes));
         if !room {
             return Err(Error::RateLimited {
                 retry_after_ms: 1000,
@@ -252,11 +320,20 @@ impl Operations {
                 SMALL_REPLY
             }
         };
+        let key = (endpoint.to_owned(), id.to_owned());
         let mut entries = self.entries.lock();
-        if let Some(entry) = entries.get_mut(&(endpoint.to_owned(), id.to_owned())) {
-            entry.bytes = bytes;
-            if let Some(kept) = self.kept_ms {
-                entry.expires = entry.expires.min(now.saturating_add(kept));
+        match self.kept_ms {
+            // Requests waiting on it hold its outcome already.
+            Some(_) if changed_nothing(&reply) => {
+                entries.remove(&key);
+            }
+            kept => {
+                if let Some(entry) = entries.get_mut(&key) {
+                    entry.bytes = bytes;
+                    if let Some(kept) = kept {
+                        entry.expires = entry.expires.min(now.saturating_add(kept));
+                    }
+                }
             }
         }
         send.send_replace(Some(reply));
@@ -282,7 +359,6 @@ pub(crate) fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spoolframe_protocol::Reply;
 
     fn operation() -> Operation {
         Operation {
@@ -326,6 +402,200 @@ mod tests {
             )
             .unwrap(),
         })
+    }
+
+    fn login() -> Request {
+        Request::LoginPassword(spoolframe_protocol::LoginPassword {
+            username: "alice".into(),
+            password: "correct horse".into(),
+            remember: false,
+        })
+    }
+
+    /// A sign-in's outcome: a session, which a retry must not open again.
+    fn logged_in() -> RpcReply {
+        Response::Ok(Reply::LoggedIn {
+            session: spoolframe_protocol::SessionId("session".into()),
+            remembered: false,
+        })
+        .into()
+    }
+
+    fn await_sign_in() -> Request {
+        Request::AwaitDeviceSignIn {
+            request: "r".into(),
+        }
+    }
+
+    /// Independent review M-1 (finding 48): eight strangers, each keeping
+    /// its endpoint's share of the anonymous pool with refused requests,
+    /// held it all, and every other device's sign-in was refused.
+    #[test]
+    fn eight_strangers_refused_requests_leave_room_for_a_ninth_s_login() {
+        let anonymous = Operations::anonymous();
+        let mut op = operation();
+        let share = anonymous.max_operations / OWNER_SHARE;
+        for i in 0..OWNER_SHARE {
+            let endpoint = format!("stranger-{i}");
+            for j in 0..share {
+                op.id = format!("{endpoint}-{j}");
+                let invocation = anonymous
+                    .begin(
+                        at(&endpoint),
+                        "process-1",
+                        &op,
+                        [1; 32],
+                        reservation(&login()),
+                        1,
+                    )
+                    .unwrap();
+                anonymous.finish(
+                    &endpoint,
+                    &op.id,
+                    invocation.execute.unwrap(),
+                    Response::Err(Error::RateLimited {
+                        retry_after_ms: 200,
+                    })
+                    .into(),
+                    1,
+                );
+            }
+        }
+        op.id = "login".into();
+        assert!(
+            anonymous
+                .begin(
+                    at("fresh-device"),
+                    "process-1",
+                    &op,
+                    [1; 32],
+                    reservation(&login()),
+                    2
+                )
+                .is_ok(),
+            "a fresh device's LoginPassword was refused"
+        );
+    }
+
+    /// An answer that a device sign-in is still pending changed nothing:
+    /// asking again waits again, so it is not kept.
+    #[test]
+    fn a_pending_answer_to_a_device_s_wait_is_not_kept() {
+        let anonymous = Operations::anonymous();
+        let mut op = operation();
+        op.expires_at_ms = 1 + OPERATION_WINDOW_MS;
+        let invocation = anonymous
+            .begin(
+                at("tv"),
+                "process-1",
+                &op,
+                [1; 32],
+                reservation(&await_sign_in()),
+                1,
+            )
+            .unwrap();
+        anonymous.finish(
+            "tv",
+            &op.id,
+            invocation.execute.unwrap(),
+            Response::Ok(Reply::DeviceSignInPending).into(),
+            1,
+        );
+        assert!(
+            anonymous
+                .lookup("tv", "process-1", &op, [1; 32], 2)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Requests that draw on no rate limit (a device's sign-in and its
+    /// long polls, a trusted device's resume) are held apart from the
+    /// sign-ins the strangers' bucket meters: waits kept up by a few
+    /// strangers cannot take a login's room.
+    #[test]
+    fn device_sign_ins_waiting_leave_room_for_a_login() {
+        let pools = Pools::default();
+        let (device, _) = pools.of(&await_sign_in());
+        let share = device.max_operations / OWNER_SHARE;
+        let mut op = operation();
+        let mut pending = Vec::new();
+        for i in 0..OWNER_SHARE {
+            let endpoint = format!("stranger-{i}");
+            for j in 0..share {
+                op.id = format!("{endpoint}-{j}");
+                pending.push(
+                    device
+                        .begin(
+                            at(&endpoint),
+                            "process-1",
+                            &op,
+                            [1; 32],
+                            reservation(&await_sign_in()),
+                            1,
+                        )
+                        .unwrap(),
+                );
+            }
+        }
+        let (sign_in, anonymous) = pools.of(&login());
+        assert!(anonymous);
+        op.id = "login".into();
+        assert!(
+            sign_in
+                .begin(
+                    at("fresh-device"),
+                    "process-1",
+                    &op,
+                    [1; 32],
+                    reservation(&login()),
+                    1
+                )
+                .is_ok(),
+            "a fresh device's LoginPassword was refused"
+        );
+    }
+
+    /// Independent review M-3 (finding 49): eight users, each holding a
+    /// user's share, filled the pool, and every other user's mutations
+    /// were refused.
+    #[test]
+    fn eight_users_full_shares_leave_room_for_a_ninth_s_mark_watched() {
+        let cache = Operations::default();
+        let mut op = operation();
+        let mut pending = Vec::new();
+        for i in 0..OWNER_SHARE {
+            let (endpoint, user) = (format!("endpoint-{i}"), format!("user-{i}"));
+            // Until the user's share, or the pool, refuses more.
+            for j in 0.. {
+                op.id = format!("{endpoint}-{j}");
+                match cache.begin(
+                    of(&endpoint, &user),
+                    "process-1",
+                    &op,
+                    [1; 32],
+                    change_subtitle(),
+                    1,
+                ) {
+                    Ok(invocation) => pending.push(invocation),
+                    Err(_) => break,
+                }
+            }
+        }
+        op.id = "watched".into();
+        assert!(
+            cache
+                .begin(
+                    of("endpoint-9", "user-9"),
+                    "process-1",
+                    &op,
+                    [1; 32],
+                    mark_watched(),
+                    1
+                )
+                .is_ok(),
+            "a ninth user's MarkWatched was refused"
+        );
     }
 
     #[test]
@@ -443,13 +713,7 @@ mod tests {
         let invocation = anonymous
             .begin(at("peer"), "process-1", &op, [1; 32], SMALL_REPLY, 1)
             .unwrap();
-        anonymous.finish(
-            "peer",
-            &op.id,
-            invocation.execute.unwrap(),
-            Response::Err(Error::InvalidCredentials).into(),
-            1,
-        );
+        anonymous.finish("peer", &op.id, invocation.execute.unwrap(), logged_in(), 1);
         let replayed = |now| {
             anonymous
                 .lookup("peer", "process-1", &op, [1; 32], now)
@@ -488,19 +752,14 @@ mod tests {
         let anonymous = Operations::anonymous();
         let authenticated = Operations::default();
         let mut op = operation();
-        // Completed failures still count against the anonymous endpoint quota.
+        // Completed sign-ins still count against the anonymous endpoint
+        // quota; refusals do not (finding 48).
         for i in 0..anonymous.max_operations / OWNER_SHARE {
             op.id = i.to_string();
             let invocation = anonymous
                 .begin(at("peer"), "process-1", &op, [1; 32], SMALL_REPLY, 1)
                 .unwrap();
-            anonymous.finish(
-                "peer",
-                &op.id,
-                invocation.execute.unwrap(),
-                Response::Err(Error::Unauthenticated).into(),
-                1,
-            );
+            anonymous.finish("peer", &op.id, invocation.execute.unwrap(), logged_in(), 1);
         }
         op.id = "overflow".into();
         assert!(matches!(
@@ -617,13 +876,16 @@ mod tests {
         let cache = Operations::default();
         let mut op = operation();
         let mut pending = Vec::new();
-        // Eight users on eight devices fill the pool between them.
+        // Seven users on seven devices at their shares, and eight more with
+        // one each in the room kept for users holding nothing, fill the
+        // pool between them.
         let per_owner = MAX_BYTES / OWNER_SHARE / MAX_OUTCOME;
-        let owners: Vec<_> = (0..OWNER_SHARE)
+        let owners: Vec<_> = (0..OWNER_SHARE - 1 + per_owner)
             .map(|i| (format!("endpoint-{i}"), format!("user-{i}")))
             .collect();
-        for (endpoint, user) in &owners {
-            for i in 0..per_owner {
+        for (n, (endpoint, user)) in owners.iter().enumerate() {
+            let each = if n < OWNER_SHARE - 1 { per_owner } else { 1 };
+            for i in 0..each {
                 op.id = format!("{endpoint}-{i}");
                 pending.push(
                     cache

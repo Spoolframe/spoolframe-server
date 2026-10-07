@@ -5,7 +5,7 @@
 //! to it), and it is worse than a lost path: nothing in QUIC times it out.
 
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,13 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
 use spoolframe_protocol::codec::{decode, read_frame_bytes, request_type, write_frame};
-use spoolframe_protocol::streams::bi;
+use spoolframe_protocol::streams::{bi, uni};
 use spoolframe_protocol::{
-    AuthMethod, CLIENT_ALPN, DeviceSignInRequest, Error, PROTOCOL_VERSION, Reply, Request,
+    AuthMethod, CLIENT_ALPN, DeviceSignInRequest, Error, Event, PROTOCOL_VERSION, Reply, Request,
     Response, ServerInfo, SessionId, UserSummary,
 };
 use spoolframe_types::Role;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Default)]
 struct State {
@@ -34,8 +34,16 @@ struct State {
     invocations: Mutex<Vec<(String, spoolframe_protocol::rpc::RpcRequest)>>,
     /// The length advertised by binary replies and the bytes actually sent.
     body: Mutex<(u64, Vec<u8>)>,
-    /// What `ServerAddresses` answers a session with (PX-12).
+    /// The addresses the `ServerAddresses` event pushes (PX-12).
     told: Mutex<Vec<SocketAddr>>,
+    /// The relays the `ServerAddresses` event lists.
+    relays: Mutex<Vec<String>>,
+    /// A device signed in here: from then on each connection is pushed
+    /// the addresses after its Hello, as the server pushes a device that
+    /// kept its session.
+    signed_in: AtomicBool,
+    /// Each connection's events stream (from 0), opened at its Hello.
+    events: Mutex<HashMap<usize, Arc<tokio::sync::Mutex<SendStream>>>>,
     /// What `ServerInfo` and `DeviceSignInStarted` give as the web UI.
     web_url: Mutex<Option<String>>,
 }
@@ -128,10 +136,24 @@ impl Stub {
         self.requests_of(kind).len()
     }
 
-    /// Answer a session's `ServerAddresses` with `addrs`, whether the stub
-    /// is bound there or not; a stranger's is `Unauthenticated`.
+    /// Tell a signed-in device `addrs`, whether the stub is bound there
+    /// or not, from the next push on.
     pub fn tell(&self, addrs: &[SocketAddr]) {
         *self.state.told.lock() = addrs.to_vec();
+    }
+
+    /// List `relays` in the `ServerAddresses` event from the next push on.
+    pub fn tell_relays(&self, relays: &[&str]) {
+        *self.state.relays.lock() = relays.iter().map(|r| (*r).to_owned()).collect();
+    }
+
+    /// Push the addresses to every connection that said Hello, as the
+    /// server does when they change.
+    pub async fn push(&self) {
+        let indices: Vec<usize> = self.state.events.lock().keys().copied().collect();
+        for index in indices {
+            push(&self.state, index).await;
+        }
     }
 
     /// Say `url` is the server's web UI from now on.
@@ -260,6 +282,27 @@ async fn stream(
         conn.closed().await;
         return;
     }
+    // Before the reply, as the server opens the events stream in Hello.
+    match kind.as_str() {
+        "hello" => {
+            if let Ok(mut events) = conn.open_uni().await
+                && events.write_u8(uni::EVENTS).await.is_ok()
+            {
+                state
+                    .events
+                    .lock()
+                    .insert(index, Arc::new(tokio::sync::Mutex::new(events)));
+                if state.signed_in.load(Ordering::SeqCst) {
+                    push(&state, index).await;
+                }
+            }
+        }
+        "login_password" => {
+            state.signed_in.store(true, Ordering::SeqCst);
+            push(&state, index).await;
+        }
+        _ => {}
+    }
     let response = spoolframe_protocol::rpc::RpcResponse {
         server: spoolframe_protocol::rpc::ServerInstance {
             id: id.to_string(),
@@ -277,6 +320,18 @@ async fn stream(
     let _ = send.stopped().await;
 }
 
+/// Push the `ServerAddresses` event on connection `index`'s events stream.
+async fn push(state: &State, index: usize) {
+    let Some(events) = state.events.lock().get(&index).cloned() else {
+        return;
+    };
+    let event = Event::ServerAddresses {
+        addrs: state.told.lock().clone(),
+        relays: state.relays.lock().clone(),
+    };
+    let _ = write_frame(&mut *events.lock().await, &event).await;
+}
+
 fn answer(
     id: EndpointId,
     state: &State,
@@ -289,12 +344,6 @@ fn answer(
     )
     .to_string();
     let reply = match envelope.request {
-        Request::ServerAddresses if envelope.session.is_none() => {
-            return Response::Err(Error::Unauthenticated);
-        }
-        Request::ServerAddresses => Reply::ServerAddresses {
-            addrs: state.told.lock().clone(),
-        },
         Request::Hello(_) => Reply::ServerInfo(ServerInfo {
             name: "Stub".into(),
             endpoint_id: id.to_string(),

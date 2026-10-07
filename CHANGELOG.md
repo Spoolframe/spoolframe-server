@@ -2712,3 +2712,68 @@
   `RECENT_SIGN_IN_REQUIRED`; the web UI's Plex Save and the Libraries
   page's add ask "Confirm it's you" and go on. `plex.name`,
   `plexServerSetPaths` and `plexServerRemove` are unchanged.
+- A device approval no longer warns that a device in the same home is on
+  the internet (finding 27). With IPv6, a home's devices have public
+  addresses in the server's own /64, and every one of them was called
+  `internet`. An address in the network of one of the server's own
+  interface addresses, by that interface's prefix length, is now
+  `local`, for the web page's `fromInternet` and the apps'
+  `DeviceAddress` alike. Only the server's own networks count: another
+  /64 of the same ISP block is still `internet`.
+- `PROTOCOL_VERSION` is 7 (PX-12): update the server and SDK together.
+  The events stream has a new event, `ServerAddresses { addrs, relays }`:
+  the addresses a signed-in device is told, as text, and the URLs of the
+  iroh relays the server uses (empty while `network.relay` is off). Each
+  event is the whole list, and replaces the one told before. Both fields
+  are required.
+- The server pushes `ServerAddresses` on the events stream of each
+  signed-in connection (PX-12): right after a sign-in on it (password,
+  approved device sign-in, app passkey, trusted-device resume), right
+  after `Hello` from a device that has a live session, and to every
+  signed-in connection when the endpoint's addresses change. A
+  connection with no session is pushed nothing. `relays` lists the URLs
+  of the relays `network.relay` names: none while relays are off, which
+  is the only setting accepted until remote access.
+- The SDK applies the pushed `ServerAddresses` (PX-12) and no longer asks
+  for the addresses on each connection. Each list replaces the told
+  addresses saved before, so an address the server stopped telling (a
+  Docker bridge now ignored) goes at once, not after 30 days. Addresses
+  this device reached stay, and age out as before. The relays are saved
+  with the server; a servers file written before has none. The SDK does
+  not dial through them yet: its endpoint has relays off.
+- The `ServerAddresses` request and reply are removed (revision 7): the
+  pushed event does their work, and nothing else asked. A server answers
+  the request `Unsupported`. `spoolframe-probe`'s check of requests sent
+  without a session no longer sends it.
+- `network.announce` leaves out virtual interfaces (`docker*`, `br-*`,
+  `veth*`, `virbr*`) unless `announce.interfaces` names them: a device
+  told 172.17.0.1 would dial its own docker0. Before, the same list was
+  the default of `ignore_interfaces`, and an ignored interface stayed
+  ignored even when `interfaces` named it. Now `ignore_interfaces` is
+  empty by default and is for the user's own list, which still wins over
+  `interfaces`. To tell a bridge, name it: `interfaces = ["enp*",
+  "docker0"]`, or `["*"]` for every interface. A config that set
+  `ignore_interfaces = []` to tell the bridges now needs that instead.
+- `ServerEntry` shows what the server advertises apart from every dial
+  hint (`addrs`, unchanged): `advertised_addrs`, the addresses of the
+  latest `ServerAddresses` event in the server's order; `relays`, the
+  relay URLs it listed; and `advertised_at`, when it came (to the
+  second). They are empty and `None` for a server that never told this
+  device, or one not saved. An address this device only reached is not
+  in `advertised_addrs`. Older servers files load with none.
+- Strangers can no longer fill the anonymous operation pool and refuse
+  every other device's sign-in (finding 48, independent review M-1). An
+  anonymous outcome that changed nothing (an error, or
+  `DeviceSignInPending`) is not kept for replay; a retry runs again.
+  Password and passkey sign-ins, which the strangers' bucket meters, have
+  a pool apart from `BeginDeviceSignIn`, `AwaitDeviceSignIn` and
+  `ResumeProfile`. A device sign-in is waited on by one
+  `AwaitDeviceSignIn` at a time: a newer one ends the older as
+  `DeviceSignInPending`.
+- Eight signed-in users at their shares can no longer fill the
+  operation pool (finding 49, independent review M-3): a user already
+  holding operations may not take the pool's last eighth, which is kept
+  for users holding none.
+- Setup-code and device sign-in code guesses are counted before they are
+  checked (A-13), as passwords already were: guesses sent at once can no
+  longer pass the limit of 5. A right code is not counted.

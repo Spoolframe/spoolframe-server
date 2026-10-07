@@ -281,8 +281,8 @@ async fn hello_version(probe: &Probe) -> Result<Outcome, Problem> {
     Ok(f.done())
 }
 
-/// Check 2: a sample of the requests that need a session (a read, a
-/// mutation and the server's own addresses), sent with none.
+/// Check 2: a sample of the requests that need a session (reads and a
+/// mutation), sent with none.
 async fn unauthenticated(probe: &Probe) -> Result<Outcome, Problem> {
     let mut f = Findings::default();
     let (conn, _) = probe.connect_hello().await?;
@@ -299,7 +299,6 @@ async fn unauthenticated(probe: &Probe) -> Result<Outcome, Problem> {
                 bitmap: BitmapSubtitles::Auto,
             },
         ),
-        ("ServerAddresses", Request::ServerAddresses),
     ];
     for (what, request) in sample {
         f.expect_error(

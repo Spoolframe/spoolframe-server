@@ -317,7 +317,7 @@ impl Link {
 /// that one. Ends when the client is gone or forgets the server.
 async fn supervise(link: Arc<Link>, client: Weak<Inner>, mut conn: Arc<ServerConnection>) {
     loop {
-        until_lost(&conn.conn).await;
+        until_lost(&conn.conn, link.id, &client).await;
         let reason = conn.conn.close_reason();
         if reason.as_ref().and_then(closed_by_server) == Some(SdkError::SignInRequired) {
             signed_out(&link, &client).await;
@@ -374,17 +374,20 @@ async fn signed_out(link: &Link, client: &Weak<Inner>) {
 }
 
 /// Returns when `conn` closes or the server says it is shutting down: then
-/// it is about to close, and dialling can start.
-async fn until_lost(conn: &Connection) {
+/// it is about to close, and dialling can start. Meanwhile the server's
+/// other events on it, from server `id`, are applied.
+async fn until_lost(conn: &Connection, id: EndpointId, client: &Weak<Inner>) {
     tokio::select! {
         _ = conn.closed() => {}
-        () = shutting_down(conn) => {}
+        () = shutting_down(conn, id, client) => {}
     }
 }
 
 /// Returns on the server's `ShuttingDown` event. If the events stream
-/// cannot be read, waits for the connection to close instead.
-async fn shutting_down(conn: &Connection) {
+/// cannot be read, waits for the connection to close instead. Its
+/// addresses (PX-12), pushed once the device is signed in and when they
+/// change, replace those it told before.
+async fn shutting_down(conn: &Connection, id: EndpointId, client: &Weak<Inner>) {
     let events = async {
         let mut recv = conn.accept_uni().await.ok()?;
         if recv.read_u8().await.ok()? != uni::EVENTS {
@@ -393,6 +396,14 @@ async fn shutting_down(conn: &Connection) {
         loop {
             match read_frame::<_, Event>(&mut recv).await.ok()? {
                 Event::ShuttingDown => return Some(()),
+                Event::ServerAddresses { addrs, relays } => {
+                    let Some(inner) = client.upgrade() else {
+                        continue;
+                    };
+                    if let Err(e) = (Client { inner }).told(id, addrs, relays).await {
+                        tracing::warn!(server = %id, error = %e, "cannot save the addresses the server told");
+                    }
+                }
                 Event::Unknown => {}
             }
         }

@@ -21,8 +21,10 @@
 //! A signed-in device is also told the server's own addresses (PX-12):
 //! those on every interface it has, which this device may never have
 //! reached (a VPN address while the phone is off the VPN). They are kept
-//! the same way, marked [`AddrSource::Told`]. An address is told until the
-//! device reaches it; once reached it stays reached. Under the cap a told
+//! the same way, marked [`AddrSource::Told`]. Each list the server tells
+//! replaces the told addresses before it: one it no longer tells goes at
+//! once. An address is told until the device reaches it; once reached it
+//! stays reached, and only ages out. Under the cap a told
 //! address never pushes out a reached one: every reached address is kept
 //! first, newest first, and told ones fill what room is left, newest
 //! first. So a server that tells many addresses (a host full of container
@@ -47,8 +49,8 @@ pub(crate) enum AddrSource {
     /// A connection reached the server there.
     #[default]
     Reached,
-    /// The server said it has the address (`ServerAddresses`), and no
-    /// connection has reached it there yet.
+    /// The server said it has the address (the `ServerAddresses` event),
+    /// and no connection has reached it there yet.
     Told,
 }
 
@@ -98,6 +100,21 @@ pub(crate) struct SavedServer {
     /// When it last answered a connect as itself.
     #[serde(default)]
     pub last_connected_at: Option<u64>,
+    /// The URLs of the relays the server said it uses (revision 7), as its
+    /// last `ServerAddresses` event listed them. Kept for when this device
+    /// dials through relays; it does not yet. Absent from a file written
+    /// before the SDK kept them: none.
+    #[serde(default)]
+    pub relays: Vec<String>,
+    /// The addresses of the server's last `ServerAddresses` event, in its
+    /// order: what it advertises, for an app to show. Unlike
+    /// `known_addrs`, never capped, aged or mixed with addresses reached.
+    /// Absent from a file written before the SDK kept them: none.
+    #[serde(default)]
+    pub advertised_addrs: Vec<SocketAddr>,
+    /// When that event came, in Unix seconds; `None` if none has.
+    #[serde(default)]
+    pub advertised_at: Option<u64>,
 }
 
 impl SavedServer {
@@ -120,6 +137,9 @@ impl SavedServer {
             pinned_at: Some(now),
             verified_at: verified.then_some(now),
             last_connected_at: Some(now),
+            relays: Vec::new(),
+            advertised_addrs: Vec::new(),
+            advertised_at: None,
         };
         server.saw(addrs, now);
         server
@@ -140,11 +160,24 @@ impl SavedServer {
         self.sighted(addrs, now, AddrSource::Reached)
     }
 
-    /// The server told this device at `now` that it has `addrs`. Kept as
+    /// The server told this device at `now` that `addrs` is where it is:
+    /// its whole list, which replaces the addresses it told before. An
+    /// address only told before and not now goes; one reached stays,
+    /// whether it is in the list or not. The new ones are kept as
     /// [`SavedServer::saw`] keeps addresses reached, but a reached address
     /// stays reached, and under the cap reached addresses go last.
+    ///
+    /// The list is also kept as it came, as [`Self::advertised_addrs`],
+    /// dated `now`.
     pub fn told(&mut self, addrs: impl IntoIterator<Item = SocketAddr>, now: u64) -> bool {
-        self.sighted(addrs, now, AddrSource::Told)
+        let addrs: Vec<SocketAddr> = addrs.into_iter().map(canonical).collect();
+        self.advertised_addrs.clone_from(&addrs);
+        self.advertised_at = Some(now);
+        let before = self.known_addrs.len();
+        self.known_addrs
+            .retain(|k| k.source == AddrSource::Reached || addrs.contains(&k.addr));
+        let dropped = self.known_addrs.len() != before;
+        self.sighted(addrs, now, AddrSource::Told) || dropped
     }
 
     fn sighted(
@@ -246,8 +279,20 @@ pub struct ServerEntry {
     pub endpoint_id: String,
     pub name: String,
     /// Where it was heard, reached, or said it is once signed in (PX-12):
-    /// hints for dialing, never its identity.
+    /// every hint for dialing, never its identity.
     pub addrs: Vec<SocketAddr>,
+    /// What the server advertises: the addresses of its latest
+    /// `ServerAddresses` event, in the server's order, pushed while this
+    /// device was signed in (revision 7). Empty if it never told this
+    /// device, and for a server not saved. An address this device only
+    /// reached is not in it.
+    pub advertised_addrs: Vec<SocketAddr>,
+    /// The URLs of the relays that event listed; empty while the server
+    /// has relays off.
+    pub relays: Vec<String>,
+    /// When that event came, to the second, for "as of" text. `None` if
+    /// none has.
+    pub advertised_at: Option<SystemTime>,
     /// The key's fingerprint (P1-21): what the user compares with the
     /// server's `spoolframe-server fingerprint`.
     pub fingerprint: String,
@@ -341,6 +386,9 @@ mod tests {
                     pinned_at: None,
                     verified_at: None,
                     last_connected_at: None,
+                    relays: Vec::new(),
+                    advertised_addrs: Vec::new(),
+                    advertised_at: None,
                 },
                 SavedServer {
                     name: "Cabin".into(),
@@ -352,6 +400,9 @@ mod tests {
                     pinned_at: None,
                     verified_at: None,
                     last_connected_at: None,
+                    relays: Vec::new(),
+                    advertised_addrs: Vec::new(),
+                    advertised_at: None,
                 },
             ]
         );
@@ -632,6 +683,69 @@ mod tests {
         server.told([addr("10.10.0.2:4433")], 1_790_000_000);
         save(&storage, &[server.clone()]).await.unwrap();
         assert_eq!(load(&storage).await.unwrap(), [server]);
+    }
+
+    /// Each push is the server's whole list (revision 7): a told address
+    /// it no longer tells is gone at once, not 30 days later. Where this
+    /// device reached the server stays, told or not.
+    #[test]
+    fn a_new_told_list_replaces_the_told_addresses_and_keeps_the_reached_ones() {
+        let mut server = server();
+        server.saw([addr("192.168.1.10:4433")], 1_000);
+        server.told(
+            [
+                addr("192.168.1.10:4433"),
+                addr("172.17.0.1:4433"),
+                addr("10.10.0.2:4433"),
+            ],
+            2_000,
+        );
+        assert!(server.told([addr("10.10.0.2:4433")], 3_000));
+        assert_eq!(
+            sources(&server),
+            [
+                (addr("10.10.0.2:4433"), AddrSource::Told),
+                (addr("192.168.1.10:4433"), AddrSource::Reached),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_told_list_leaves_only_the_reached_addresses() {
+        let mut server = server();
+        server.saw([addr("192.168.1.10:4433")], 1_000);
+        server.told([addr("172.17.0.1:4433")], 2_000);
+        assert!(server.told([], 3_000));
+        assert_eq!(server.addrs(), [addr("192.168.1.10:4433")]);
+    }
+
+    #[tokio::test]
+    async fn the_relays_told_are_kept_with_the_server() {
+        let storage = MemoryStorage::default();
+        let mut server = server();
+        server.relays = vec!["https://relay.example.net./".into()];
+        save(&storage, std::slice::from_ref(&server)).await.unwrap();
+        assert_eq!(load(&storage).await.unwrap(), [server]);
+    }
+
+    #[tokio::test]
+    async fn a_server_saved_before_relays_were_kept_has_none() {
+        let storage = MemoryStorage::default();
+        let file = format!(
+            r#"[{{"name": "Nimble", "endpoint_id": "{ID}", "server_id": "{SERVER_ID}",
+                 "known_addrs": [{{"addr": "192.168.1.10:4433", "last_seen": 1000, "source": "told"}}],
+                 "verified": true, "pinned_at": 1, "verified_at": 1, "last_connected_at": 1}}]"#
+        );
+        storage
+            .set_data(keys::SERVERS, Some(file.into_bytes()))
+            .await
+            .unwrap();
+        let servers = load(&storage).await.unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].relays, Vec::<String>::new());
+        assert_eq!(servers[0].advertised_addrs, Vec::<SocketAddr>::new());
+        assert_eq!(servers[0].advertised_at, None);
+        assert_eq!(servers[0].addrs(), [addr("192.168.1.10:4433")]);
     }
 
     #[test]

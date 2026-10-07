@@ -939,21 +939,18 @@ pub struct AnnounceConfig {
     /// Addresses and CIDR ranges never told.
     #[ucl(default)]
     pub ignore: Option<Vec<String>>,
-    /// Interfaces whose addresses are never told;
-    /// [`Self::DEFAULT_IGNORE_INTERFACES`] if left out.
+    /// Interfaces whose addresses are never told, even when `interfaces`
+    /// names them. Virtual ones ([`crate::announce::VIRTUAL_INTERFACES`])
+    /// are left out without being listed here.
     #[ucl(default)]
     pub ignore_interfaces: Option<Vec<String>>,
-    /// If set, only these interfaces' addresses are told.
+    /// If set, only these interfaces' addresses are told. A virtual
+    /// interface's are told only when one of these names it.
     #[ucl(default)]
     pub interfaces: Option<Vec<String>>,
 }
 
 impl AnnounceConfig {
-    /// Docker's, its networks', their veth pairs' and libvirt's bridges:
-    /// on the host only, never reached from another device.
-    pub const DEFAULT_IGNORE_INTERFACES: &'static [&'static str] =
-        &["docker*", "br-*", "veth*", "virbr*"];
-
     /// The settings, checked.
     pub fn announce(&self) -> Result<crate::announce::Announce, ConfigError> {
         fn each<T: std::str::FromStr<Err = String>>(
@@ -969,20 +966,12 @@ impl AnnounceConfig {
                 })
                 .collect()
         }
-        let default_ignored: Vec<String> = Self::DEFAULT_IGNORE_INTERFACES
-            .iter()
-            .map(|g| (*g).to_owned())
-            .collect();
         Ok(crate::announce::Announce {
             add: each("network.announce.add", self.add.as_deref())?,
             ignore: each("network.announce.ignore", self.ignore.as_deref())?,
             ignore_interfaces: each(
                 "network.announce.ignore_interfaces",
-                Some(
-                    self.ignore_interfaces
-                        .as_deref()
-                        .unwrap_or(&default_ignored),
-                ),
+                self.ignore_interfaces.as_deref(),
             )?,
             interfaces: each("network.announce.interfaces", self.interfaces.as_deref())?,
         })
@@ -2123,25 +2112,62 @@ mod tests {
         );
     }
 
+    /// A host with a LAN interface, Docker's bridges and a veth pair, a
+    /// libvirt bridge, and what the endpoint has on them.
+    fn docker_host() -> (Vec<std::net::SocketAddr>, Vec<crate::announce::Interface>) {
+        let interface = |name: &str, ip: &str| crate::announce::Interface {
+            name: name.into(),
+            addrs: vec![ip.parse().unwrap()],
+        };
+        let interfaces = vec![
+            interface("enp5s0", "192.168.86.176"),
+            interface("docker0", "172.17.0.1"),
+            interface("br-0123abcd", "172.18.0.1"),
+            interface("veth12ab", "172.19.0.1"),
+            interface("virbr0", "192.168.122.1"),
+        ];
+        let direct = interfaces
+            .iter()
+            .map(|i| std::net::SocketAddr::new(i.addrs[0], 7420))
+            .collect();
+        (direct, interfaces)
+    }
+
     #[test]
     fn docker_and_libvirt_bridges_are_not_told_by_default() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         let announce = config.network.endpoint_options().unwrap().announce;
-        let names: Vec<_> = [
-            "docker0",
-            "br-0123abcd",
-            "veth12ab",
-            "virbr0",
-            "enp5s0",
-            "wg0",
-        ]
-        .into_iter()
-        .filter(|name| announce.ignore_interfaces.iter().any(|g| g.matches(name)))
-        .collect();
-        assert_eq!(names, ["docker0", "br-0123abcd", "veth12ab", "virbr0"]);
+        let (direct, interfaces) = docker_host();
+        assert_eq!(
+            announce.told(&direct, &[], &interfaces),
+            ["192.168.86.176:7420"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()]
+        );
         assert!(announce.add.is_empty());
         assert!(announce.ignore.is_empty());
         assert!(announce.interfaces.is_empty());
+    }
+
+    /// The user can still have a bridge told, by naming it.
+    #[test]
+    fn a_bridge_named_in_interfaces_is_told() {
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; }
+            network { announce { interfaces = ["enp*", "docker0"]; } }"#,
+        )
+        .unwrap();
+        let announce = config.network.endpoint_options().unwrap().announce;
+        let (direct, interfaces) = docker_host();
+        assert_eq!(
+            announce.told(&direct, &[], &interfaces),
+            [
+                "192.168.86.176:7420"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap(),
+                "172.17.0.1:7420".parse().unwrap(),
+            ]
+        );
     }
 
     #[test]

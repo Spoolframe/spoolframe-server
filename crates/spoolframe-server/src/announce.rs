@@ -4,9 +4,14 @@
 //! The endpoint's own addresses are every address on every interface,
 //! Docker's and libvirt's bridges included, and no device reaches those.
 //! So the told list is: the addresses on the allowed interfaces (every
-//! interface when none is named), less those on an ignored interface,
-//! less those in an ignored range, plus the added ones. An added address
-//! is told even when an ignore matches it: it was named on purpose.
+//! interface but the virtual ones when none is named), less those on an
+//! ignored interface, less those in an ignored range, plus the added ones.
+//! An added address is told even when an ignore matches it: it was named
+//! on purpose.
+//!
+//! A virtual interface ([`VIRTUAL_INTERFACES`]) is told only when an
+//! allowed interface pattern names it. Its address is worse than useless
+//! to a device: 172.17.0.1 is, on most devices, their own docker0.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -147,23 +152,26 @@ pub fn interfaces() -> Vec<Interface> {
     found
 }
 
+/// Docker's bridges, its networks', their veth pairs' and libvirt's
+/// bridges: on the host only, never reached from another device. Not told
+/// unless [`Announce::interfaces`] names them.
+pub const VIRTUAL_INTERFACES: &[&str] = &["docker*", "br-*", "veth*", "virbr*"];
+
 /// `network.announce`, checked. The default tells every address the
-/// endpoint has that another device may reach.
+/// endpoint has that another device may reach, but those on virtual
+/// interfaces.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Announce {
     pub add: Vec<Added>,
     pub ignore: Vec<Network>,
+    /// Never told, even when `interfaces` names them.
     pub ignore_interfaces: Vec<Glob>,
-    /// Only addresses on these; any interface's when empty.
+    /// Only addresses on these; when empty, any interface's but the
+    /// virtual ones ([`VIRTUAL_INTERFACES`]).
     pub interfaces: Vec<Glob>,
 }
 
 impl Announce {
-    /// Whether the interfaces are needed to say what is told.
-    fn needs_interfaces(&self) -> bool {
-        !self.interfaces.is_empty() || !self.ignore_interfaces.is_empty()
-    }
-
     /// What to tell, of the endpoint's reachable addresses `direct` (see
     /// [`direct_addrs`]), with `interfaces` as the machine has them. An
     /// added address without a port takes the port of the first of
@@ -185,7 +193,11 @@ impl Announce {
                 .filter(|i| i.addrs.iter().any(|a| a.to_canonical() == ip))
                 .map(|i| i.name.as_str())
                 .collect();
-            let allowed = self.interfaces.is_empty() || any(&self.interfaces, &on);
+            let allowed = if self.interfaces.is_empty() {
+                !on.iter().any(|name| is_virtual(name))
+            } else {
+                any(&self.interfaces, &on)
+            };
             let ignored = any(&self.ignore_interfaces, &on)
                 || self.ignore.iter().any(|range| range.contains(ip));
             if allowed && !ignored && !told.contains(addr) {
@@ -215,6 +227,13 @@ impl Announce {
     }
 }
 
+/// Whether interface `name` is a virtual one ([`VIRTUAL_INTERFACES`]).
+fn is_virtual(name: &str) -> bool {
+    VIRTUAL_INTERFACES
+        .iter()
+        .any(|pattern| Glob(String::from(*pattern)).matches(name))
+}
+
 /// Of `addrs`, the endpoint's own, those another device may reach it at
 /// (PX-12): every one but loopback, link-local and unspecified addresses,
 /// each once, in the order given. LAN, public and VPN addresses all stay:
@@ -240,21 +259,28 @@ pub(crate) fn direct_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<S
 pub struct Told {
     endpoint: Endpoint,
     announce: Arc<Announce>,
+    relays: Arc<Vec<String>>,
 }
 
 impl std::fmt::Debug for Told {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Told")
             .field("announce", &self.announce)
+            .field("relays", &self.relays)
             .finish_non_exhaustive()
     }
 }
 
 impl Told {
-    pub(crate) fn new(endpoint: Endpoint, announce: Announce) -> Self {
+    /// What `endpoint` tells, as `announce` says, with the URLs of the
+    /// relays it uses.
+    pub(crate) fn new(endpoint: Endpoint, announce: Announce, relays: Vec<String>) -> Self {
+        let mut relays = relays;
+        relays.sort();
         Self {
             endpoint,
             announce: Arc::new(announce),
+            relays: Arc::new(relays),
         }
     }
 
@@ -262,13 +288,55 @@ impl Told {
     /// so call it off the async threads.
     pub fn addrs(&self) -> Vec<SocketAddr> {
         let direct = direct_addrs(self.endpoint.addr().ip_addrs().copied());
-        let interfaces = if self.announce.needs_interfaces() {
-            interfaces()
-        } else {
-            Vec::new()
-        };
+        // Always read: a virtual interface is known by its name.
+        let interfaces = interfaces();
         self.announce
             .told(&direct, &self.endpoint.bound_sockets(), &interfaces)
+    }
+
+    /// The URLs of the relays the endpoint uses (`network.relay`), sorted;
+    /// none while relays are off.
+    pub fn relays(&self) -> Vec<String> {
+        self.relays.as_ref().clone()
+    }
+
+    /// What a signed-in connection is pushed now: [`Self::addrs`] and
+    /// [`Self::relays`]. It reads the interfaces, as `addrs` does.
+    pub fn event(&self) -> spoolframe_protocol::Event {
+        spoolframe_protocol::Event::ServerAddresses {
+            addrs: self.addrs(),
+            relays: self.relays(),
+        }
+    }
+
+    /// A message each time the endpoint's own addresses change (iroh
+    /// watches the interfaces), until the endpoint closes.
+    pub(crate) fn changes(&self) -> tokio::sync::mpsc::Receiver<()> {
+        use iroh::Watcher as _;
+        let (changed, changes) = tokio::sync::mpsc::channel(1);
+        let mut watcher = self.endpoint.watch_addr();
+        let closed = self.endpoint.closed();
+        tokio::spawn(async move {
+            tokio::pin!(closed);
+            loop {
+                tokio::select! {
+                    () = &mut closed => return,
+                    updated = watcher.updated() => {
+                        if updated.is_err() {
+                            return;
+                        }
+                        // Full: a change is waiting to be read already,
+                        // and reading it reads this one too.
+                        if let Err(tokio::sync::mpsc::error::TrySendError::Closed(())) =
+                            changed.try_send(())
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        changes
     }
 }
 
@@ -316,12 +384,35 @@ mod tests {
         BOUND.iter().map(|a| addr(a)).collect()
     }
 
+    /// 172.17.0.1 told to a device is worse than useless: on most devices
+    /// it is their own docker0.
     #[test]
-    fn without_settings_every_reachable_address_is_told() {
+    fn without_settings_every_address_but_virtual_interfaces_is_told() {
         let (direct, interfaces) = machine();
         assert_eq!(
             Announce::default().told(&direct, &bound(), &interfaces),
-            direct
+            [
+                addr("192.168.86.176:7420"),
+                addr("10.10.0.2:7420"),
+                addr("[2001:db8::5]:7420"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_virtual_interface_named_in_interfaces_is_told() {
+        let (direct, interfaces) = machine();
+        let announce = Announce {
+            interfaces: globs(&["enp*", "docker0"]),
+            ..Announce::default()
+        };
+        assert_eq!(
+            announce.told(&direct, &bound(), &interfaces),
+            [
+                addr("192.168.86.176:7420"),
+                addr("172.17.0.1:7420"),
+                addr("[2001:db8::5]:7420"),
+            ]
         );
     }
 

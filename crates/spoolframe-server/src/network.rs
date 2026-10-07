@@ -155,11 +155,19 @@ impl Connections {
     }
 
     /// `endpoint` signed in: each of its connections gets the normal
-    /// limits.
-    pub(crate) fn signed_in(&self, endpoint: &EndpointId) {
-        for peer in self.lock().values().filter(|p| &p.endpoint == endpoint) {
+    /// limits. Their ids.
+    pub(crate) fn signed_in(&self, endpoint: &EndpointId) -> Vec<usize> {
+        let mut raised = Vec::new();
+        for (id, peer) in self.lock().iter().filter(|(_, p)| &p.endpoint == endpoint) {
             peer.raise();
+            raised.push(*id);
         }
+        raised
+    }
+
+    /// Whether connection `id` is signed in, and not signed out since.
+    pub(crate) fn is_signed_in(&self, id: usize) -> bool {
+        self.lock().get(&id).is_some_and(|peer| peer.signed_in())
     }
 
     /// The endpoints of the connections that have the normal limits.
@@ -271,6 +279,13 @@ impl Server {
             Relay::Default => RelayMode::Default,
             Relay::Custom(url) => RelayMode::Custom(RelayUrl::from(url.clone()).into()),
         };
+        // What a signed-in device is told of them (PX-12).
+        let relays: Vec<String> = relay
+            .relay_map()
+            .urls::<Vec<RelayUrl>>()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         let bind_failed = |message: String| NetworkError::Bind {
             port: options.port,
             message,
@@ -346,7 +361,7 @@ impl Server {
                 .close_signed_out(services.auth.store().clone()),
         );
         // Unknown ALPNs never get this far: the TLS handshake refuses them.
-        let told = Told::new(endpoint.clone(), options.announce.clone());
+        let told = Told::new(endpoint.clone(), options.announce.clone(), relays);
         let client = ClientProtocol::new(
             endpoint.clone(),
             told.clone(),

@@ -431,26 +431,6 @@ fn timed_out(conn: &Connection, what: impl std::fmt::Display, limit: Duration) -
 
 /// One RPC stream: the request frame out, the response frame back within
 /// `limit`.
-/// Where the server says it can be dialled directly (PX-12), asked on
-/// `conn` in `session`: only a session is told.
-pub(crate) async fn server_addresses(
-    conn: &Connection,
-    session: &SessionId,
-    limit: Duration,
-) -> Result<Vec<SocketAddr>, SdkError> {
-    match rpc(conn, Some(session), Request::ServerAddresses, limit)
-        .await?
-        .reply
-        .response
-    {
-        Response::Ok(Reply::ServerAddresses { addrs }) => Ok(addrs),
-        Response::Ok(other) => Err(SdkError::Protocol(format!(
-            "ServerAddresses answered {other:?}"
-        ))),
-        Response::Err(e) => Err(SdkError::from_server(e)),
-    }
-}
-
 async fn rpc(
     conn: &Connection,
     session: Option<&SessionId>,

@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::SecretKey;
+use spoolframe_client_sdk::storage::keys;
 use spoolframe_client_sdk::types::{ClientCapabilities, Platform};
-use spoolframe_client_sdk::{Client, ClientOptions, Device, MemoryStorage};
+use spoolframe_client_sdk::{Client, ClientOptions, Device, MemoryStorage, Storage};
 
 use crate::stub::Stub;
 
@@ -158,8 +159,8 @@ async fn a_connection_over_one_address_keeps_the_others_to_dial_later() {
 
 /// One server, as a phone sees it: reached at `v4`, and also at `v6`,
 /// where this device has never reached it (its VPN address, say). The
-/// same key answers at each, from two stubs: the one at `v4` tells both
-/// addresses to a session, and iroh never learns `v6` on its own.
+/// same key answers at each, from two stubs: the one at `v4` pushes both
+/// addresses to a signed-in device, and iroh never learns `v6` on its own.
 async fn told_pair(key: &SecretKey) -> (Stub, Stub, SocketAddr, SocketAddr) {
     let at_v4 = Stub::start_on(key.clone(), &["127.0.0.1:0".parse().unwrap()]).await;
     let at_v6 = Stub::start_on(key.clone(), &["[::1]:0".parse().unwrap()]).await;
@@ -171,6 +172,19 @@ async fn told_pair(key: &SecretKey) -> (Stub, Stub, SocketAddr, SocketAddr) {
 
 /// Wait until `client` has saved `addr` for server `id`.
 async fn until_saved(client: &Client, id: &str, addr: SocketAddr) {
+    until_addrs(client, id, &format!("{addr} saved"), |addrs| {
+        addrs.contains(&addr)
+    })
+    .await;
+}
+
+/// Wait until the addresses `client` saved for server `id` are `what`.
+async fn until_addrs(
+    client: &Client,
+    id: &str,
+    what: &str,
+    done: impl Fn(&[SocketAddr]) -> bool,
+) -> Vec<SocketAddr> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let entry = client
@@ -180,12 +194,12 @@ async fn until_saved(client: &Client, id: &str, addr: SocketAddr) {
             .into_iter()
             .find(|s| s.endpoint_id == id)
             .expect("the server is saved");
-        if entry.addrs.contains(&addr) {
-            return;
+        if done(&entry.addrs) {
+            return entry.addrs;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "{addr} was never saved: {:?}",
+            "never {what}: {:?}",
             entry.addrs
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -206,7 +220,7 @@ async fn signed_in_via(storage: &Arc<MemoryStorage>, stub: &Stub, v4: SocketAddr
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_sign_in_saves_the_addresses_the_server_tells_it_and_only_a_session_asks() {
+async fn a_sign_in_saves_the_addresses_the_server_pushes_without_asking() {
     within(async {
         let key = SecretKey::generate();
         let (at_v4, at_v6, v4, v6) = told_pair(&key).await;
@@ -215,12 +229,7 @@ async fn a_sign_in_saves_the_addresses_the_server_tells_it_and_only_a_session_as
         until_saved(&client, &at_v4.id(), v6).await;
         client.close().await;
 
-        let asked = at_v4.invocations("server_addresses");
-        assert!(!asked.is_empty());
-        assert!(
-            asked.iter().all(|r| r.envelope.session.is_some()),
-            "asked without a session: {asked:?}"
-        );
+        assert_eq!(at_v4.count("server_addresses"), 0, "the device asked");
         assert_eq!(at_v6.connections(), 0, "the device reached {v6} itself");
         at_v4.stop().await;
         at_v6.stop().await;
@@ -253,10 +262,11 @@ async fn a_later_connect_over_only_a_told_address_succeeds() {
     .await;
 }
 
-/// An app opened again with a session kept asks on its first connection,
-/// so an address the server has gained since is learnt without a sign-in.
+/// An app opened again with a session kept is pushed the addresses on its
+/// first connection, so one the server has gained since is learnt without
+/// a sign-in.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_kept_session_asks_again_on_the_next_connection() {
+async fn a_kept_session_is_pushed_them_on_the_next_connection() {
     within(async {
         let key = SecretKey::generate();
         let id = key.public().to_string();
@@ -273,6 +283,140 @@ async fn a_kept_session_asks_again_on_the_next_connection() {
         client.close().await;
         at_v4.stop().await;
         at_v6.stop().await;
+    })
+    .await;
+}
+
+/// A second push replaces what the first told: an address the server no
+/// longer tells (a Docker bridge it now ignores) is gone at once, and the
+/// one this device reached stays though the server leaves it out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_push_replaces_the_told_addresses_and_keeps_the_reached_one() {
+    within(async {
+        let key = SecretKey::generate();
+        let id = key.public().to_string();
+        let stub = Stub::start_on(key, &["127.0.0.1:0".parse().unwrap()]).await;
+        let v4 = stub.bound()[0];
+        let bridge: SocketAddr = "172.17.0.1:4433".parse().unwrap();
+        let vpn: SocketAddr = "10.10.0.2:4433".parse().unwrap();
+        stub.tell(&[v4, bridge]);
+        let storage = Arc::new(MemoryStorage::default());
+        let client = signed_in_via(&storage, &stub, v4).await;
+        until_saved(&client, &id, bridge).await;
+
+        stub.tell(&[vpn]);
+        stub.push().await;
+        let saved = until_addrs(&client, &id, "the bridge forgotten", |addrs| {
+            !addrs.contains(&bridge)
+        })
+        .await;
+        assert!(saved.contains(&vpn), "{saved:?}");
+        assert!(saved.contains(&v4), "the address reached went: {saved:?}");
+        client.close().await;
+        stub.stop().await;
+    })
+    .await;
+}
+
+/// The relays a push lists are saved with the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_relays_pushed_are_saved() {
+    within(async {
+        let key = SecretKey::generate();
+        let stub = Stub::start_on(key, &["127.0.0.1:0".parse().unwrap()]).await;
+        let v4 = stub.bound()[0];
+        stub.tell(&[v4]);
+        stub.tell_relays(&["https://relay.example.net./"]);
+        let storage = Arc::new(MemoryStorage::default());
+        let client = signed_in_via(&storage, &stub, v4).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let file = storage.data(keys::SERVERS).await.unwrap().unwrap();
+            let servers: serde_json::Value = serde_json::from_slice(&file).unwrap();
+            if servers[0]["relays"] == serde_json::json!(["https://relay.example.net./"]) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the relays were never saved: {servers}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        client.close().await;
+        stub.stop().await;
+    })
+    .await;
+}
+
+/// An app shows what the server advertises apart from every dial hint:
+/// the latest pushed list, in the server's order, with its relays and
+/// when it came. An address only reached is not in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_entry_shows_exactly_what_the_server_advertised_last() {
+    within(async {
+        let key = SecretKey::generate();
+        let id = key.public().to_string();
+        let stub = Stub::start_on(key, &["127.0.0.1:0".parse().unwrap()]).await;
+        let v4 = stub.bound()[0];
+        let vpn: SocketAddr = "10.10.0.2:4433".parse().unwrap();
+        let lan: SocketAddr = "192.168.86.10:4433".parse().unwrap();
+        stub.tell(&[vpn, lan]);
+        stub.tell_relays(&["https://relay.example.net./"]);
+        let storage = Arc::new(MemoryStorage::default());
+        let before = std::time::SystemTime::now();
+        let client = signed_in_via(&storage, &stub, v4).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let entry = loop {
+            let entry = client
+                .servers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.endpoint_id == id)
+                .expect("the server is saved");
+            if !entry.advertised_addrs.is_empty() {
+                break entry;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "nothing advertised: {entry:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(entry.advertised_addrs, [vpn, lan]);
+        assert_eq!(entry.relays, ["https://relay.example.net./"]);
+        assert!(entry.addrs.contains(&v4), "{:?}", entry.addrs);
+        let at = entry.advertised_at.expect("when it was advertised");
+        // Kept in whole seconds.
+        assert!(
+            at + Duration::from_secs(1) >= before,
+            "{at:?} before {before:?}"
+        );
+
+        // A second push replaces it, in its order.
+        stub.tell(&[lan]);
+        stub.tell_relays(&[]);
+        stub.push().await;
+        let addrs = loop {
+            let entry = client
+                .servers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.endpoint_id == id)
+                .unwrap();
+            if entry.advertised_addrs.len() == 1 {
+                assert_eq!(entry.relays, Vec::<String>::new());
+                break entry.advertised_addrs;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{entry:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(addrs, [lan]);
+        client.close().await;
+        stub.stop().await;
     })
     .await;
 }
