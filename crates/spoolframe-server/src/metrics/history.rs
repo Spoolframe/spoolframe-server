@@ -2,8 +2,8 @@
 //! the metrics every [`SAMPLE_EVERY`], for the Activity page's small
 //! graphs. Nothing is written anywhere; a restart starts it again.
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use spoolframe_admin_api::{ActivityPoint, ActivityTotals};
@@ -176,7 +176,7 @@ impl History {
     pub const CAPACITY: usize = (KEPT.as_secs() / SAMPLE_EVERY.as_secs()) as usize + 1;
 
     pub fn record(&self, reading: Reading) {
-        let mut readings = self.readings.lock().expect("never held across a panic");
+        let mut readings = self.readings.lock();
         if readings.len() == Self::CAPACITY {
             readings.pop_front();
         }
@@ -186,7 +186,7 @@ impl History {
     /// Every point kept, oldest first: one fewer than the readings, the
     /// first reading being only what the second's rates are from.
     pub fn points(&self) -> Vec<ActivityPoint> {
-        let readings = self.readings.lock().expect("never held across a panic");
+        let readings = self.readings.lock();
         readings
             .iter()
             .zip(readings.iter().skip(1))
@@ -197,7 +197,7 @@ impl History {
     /// The point for `now`, its rates since the last reading at least a
     /// second before it.
     pub fn now(&self, now: &Reading) -> ActivityPoint {
-        let readings = self.readings.lock().expect("never held across a panic");
+        let readings = self.readings.lock();
         let before = readings.iter().rev().find(|r| now.at - r.at >= 1000);
         now.point(before)
     }

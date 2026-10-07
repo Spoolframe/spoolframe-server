@@ -5,9 +5,10 @@
 # listens on its UDP port, finds only software encoders without a GPU,
 # reads subtitles with the tesseract languages it was given, and keeps its
 # key over a restart, all under the unit's sandbox, which
-# `systemd-analyze security` scores; ffmpeg and tesseract run in a
-# bubblewrap sandbox of their own inside it. `fresh`, the module with nothing but
-# `enable`: not set up, its web UI answering on loopback only, insecure
+# `systemd-analyze security` scores; ffmpeg, ffprobe and tesseract
+# confine themselves inside it with Landlock and seccomp, and a confined
+# ffprobe can neither read the state directory nor connect to the admin
+# listener. `fresh`, the module with nothing but `enable`: not set up, its web UI answering on loopback only, insecure
 # cookies locked off, its state where the module says and its own user's
 # alone, and the firewall opening none of its ports (PX-11).
 {
@@ -93,7 +94,8 @@ pkgs.testers.runNixOSTest {
     assert "admin.insecure_cookies = false;  # config file, locked" in shown, shown
     # PX-11 finding 34: the media tools confined, or no server.
     assert 'media.sandbox = "required";  # config file, locked' in shown, shown
-    fresh.wait_until_succeeds("journalctl -u spoolframe.service | grep -q 'media tools run confined'")
+    fresh.wait_until_succeeds("journalctl -u spoolframe.service | grep -q 'media tools run confined: Landlock ABI'")
+    fresh.wait_until_succeeds("journalctl -u spoolframe.service | grep -q 'a confined .*ffprobe could not read /var/lib/spoolframe'")
     # Its state where the module says, the service's own.
     fresh.succeed("test -s /var/lib/spoolframe/endpoint.key")
     fresh.succeed("test -s /var/lib/spoolframe/spoolframe.db")
@@ -136,12 +138,19 @@ pkgs.testers.runNixOSTest {
     users = server.succeed(f"{admin} spoolframe user list")
     assert "alice" in users, users
 
-    # PX-11 finding 34: bubblewrap works inside the unit, so the encoder
+    # PX-11 finding 34: Landlock works inside the unit, so the encoder
     # test and tesseract below ran confined; had it not, the service
-    # would not have started.
-    assert "media tools run confined" in journal(), journal()
-    assert "MEDIA TOOLS RUN UNCONFINED" not in journal()
-    print(server.succeed("systemctl show spoolframe.service -p RestrictNamespaces"))
+    # would not have started ("required"). At start, from inside the
+    # unit, a confined ffprobe was refused the state directory (the
+    # database, the key, the secrets) and a TCP connection on loopback.
+    confined = [line for line in journal().splitlines() if "media tools run confined" in line]
+    assert confined, journal()
+    print(confined[-1])
+    shown = [line for line in journal().splitlines() if "a confined" in line and "ffprobe" in line]
+    assert shown, journal()
+    assert "could not read /var/lib/spoolframe nor connect to 127.0.0.1:" in shown[-1], shown[-1]
+    for loud in ["MEDIA TOOLS RUN WITHOUT LANDLOCK", "MEDIA TOOLS RUN UNCONFINED", "MEDIA TOOLS MAY NOT BE CONFINED"]:
+        assert loud not in journal(), loud
 
     # No GPU in the VM: detection finds software encoders only.
     server.wait_until_succeeds("journalctl -u spoolframe.service | grep -q 'transcoding'")
@@ -183,20 +192,24 @@ pkgs.testers.runNixOSTest {
     assert "trusted_proxies is empty" not in journal()
 
     # PX-11 finding 34: the unit's sandbox, as systemd scores it (1.6
-    # when this was written; 2.5 once the media tools' bubblewrap needed
-    # six namespaces, the mount calls, capset and all of /proc; at most
-    # 2.5, out of 10, passes). ffmpeg (the encoder test at start) and
-    # tesseract (its languages) ran under it above, each confined.
+    # when this was written, and again once the media tools confined
+    # themselves with Landlock rather than bubblewrap; at most 1.6, out
+    # of 10, passes). The media
+    # tools confine themselves with Landlock, so the unit allows no
+    # namespace, no mount call and only its processes' /proc: ffmpeg (the
+    # encoder test at start), ffprobe (the check) and tesseract (its
+    # languages) ran under it above, each confined.
     props = server.succeed(
         "systemctl show spoolframe.service -p UMask -p TasksMax -p MemoryMax -p MemoryHigh "
-        "-p ProtectHome -p ProtectProc -p ProcSubset -p SystemCallArchitectures"
+        "-p ProtectHome -p ProtectProc -p ProcSubset -p SystemCallArchitectures "
+        "-p RestrictNamespaces"
     )
     for want in ["UMask=0077", "TasksMax=4096", "MemoryMax=8589934592", "MemoryHigh=6442450944",
-                 "ProtectHome=yes", "ProtectProc=invisible", "ProcSubset=all",
-                 "SystemCallArchitectures=native"]:
+                 "ProtectHome=yes", "ProtectProc=invisible", "ProcSubset=pid",
+                 "SystemCallArchitectures=native", "RestrictNamespaces=yes"]:
         assert want in props, f"{want}: {props}"
     exposure = server.succeed("systemd-analyze security spoolframe.service --no-pager | tail -n 1")
     print(exposure)
-    server.succeed("systemd-analyze security --threshold=25 spoolframe.service --no-pager")
+    server.succeed("systemd-analyze security --threshold=16 spoolframe.service --no-pager")
   '';
 }

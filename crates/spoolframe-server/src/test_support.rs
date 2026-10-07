@@ -4,9 +4,9 @@
 //! feature, which only the crate's own dev-dependency turns on; a release
 //! build never has it.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -68,16 +68,16 @@ impl FakeCatalog {
     }
 
     pub fn set_old_key(&self, id: &MediaId, holds: OldKey) {
-        self.old_keys.lock().unwrap().insert(id.clone(), holds);
+        self.old_keys.lock().insert(id.clone(), holds);
     }
 
     pub fn forget_old_key(&self, id: &MediaId) {
-        self.old_keys.lock().unwrap().remove(id);
+        self.old_keys.lock().remove(id);
     }
 
     /// The `item` and `external_ids` calls since the last time, by method.
     pub fn take_calls(&self, id: &MediaId) -> Vec<&'static str> {
-        let mut calls = self.calls.lock().unwrap();
+        let mut calls = self.calls.lock();
         let about = calls.iter().filter(|(_, i)| i == id).map(|(m, _)| *m);
         let about = about.collect();
         calls.clear();
@@ -85,11 +85,11 @@ impl FakeCatalog {
     }
 
     fn called(&self, method: &'static str, id: &MediaId) {
-        self.calls.lock().unwrap().push((method, id.clone()));
+        self.calls.lock().push((method, id.clone()));
     }
 
     fn old_key(&self, id: &MediaId) -> Option<OldKey> {
-        self.old_keys.lock().unwrap().get(id).cloned()
+        self.old_keys.lock().get(id).cloned()
     }
 
     fn unreachable() -> CatalogError {

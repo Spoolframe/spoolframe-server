@@ -17,8 +17,8 @@
 //! A ceremony's challenge is kept here, in memory, for
 //! [`CEREMONY_LIFETIME`]: a restart drops it, and the browser begins again.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -369,10 +369,7 @@ impl Passkeys {
             .start_passkey_registration(handle, &user.username, display_name, Some(existing))
             .map_err(|e| CeremonyError::Internal(e.to_string()))?;
         stored_on_the_authenticator(&mut options);
-        let mut registrations = self
-            .registrations
-            .lock()
-            .expect("never held across a panic");
+        let mut registrations = self.registrations.lock();
         let now = Instant::now();
         registrations.retain(|_, (_, expires_at)| *expires_at > now);
         registrations.insert(session.to_owned(), (state, now + CEREMONY_LIFETIME));
@@ -395,7 +392,6 @@ impl Passkeys {
         let state = self
             .registrations
             .lock()
-            .expect("never held across a panic")
             .remove(session)
             .filter(|(_, expires_at)| *expires_at > Instant::now())
             .map(|(state, _)| state)
@@ -423,7 +419,7 @@ impl Passkeys {
             .start_passkey_registration(handle, username, username, None)
             .map_err(|e| CeremonyError::Internal(e.to_string()))?;
         stored_on_the_authenticator(&mut options);
-        let mut setups = self.setups.lock().expect("never held across a panic");
+        let mut setups = self.setups.lock();
         let now = Instant::now();
         // Not counted as sign-ins are: only who has the setup code begins
         // one.
@@ -449,7 +445,6 @@ impl Passkeys {
         let setup = self
             .setups
             .lock()
-            .expect("never held across a panic")
             .remove(ceremony)
             .filter(|(_, expires_at)| *expires_at > Instant::now())
             .map(|(setup, _)| setup)
@@ -486,7 +481,7 @@ impl Passkeys {
         // mediation), which shows no prompt. This sign-in is a button: the
         // browser's own prompt, with its "use a phone" QR code.
         options.mediation = None;
-        let mut sign_ins = self.sign_ins.lock().expect("never held across a panic");
+        let mut sign_ins = self.sign_ins.lock();
         let now = Instant::now();
         sign_ins.retain(|_, (_, expires_at, _)| *expires_at > now);
         let from_source = source.map_or(0, |source| {
@@ -526,7 +521,6 @@ impl Passkeys {
             .sign_in(auth, signed, source, |_| {
                 self.sign_ins
                     .lock()
-                    .expect("never held across a panic")
                     .remove(ceremony)
                     .filter(|(_, expires_at, _)| *expires_at > Instant::now())
                     .map(|(state, _, _)| state)

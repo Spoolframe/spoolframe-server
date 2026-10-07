@@ -39,9 +39,6 @@ in {
     # Reads bitmap subtitles as text (P2-07); English is what the tests
     # read.
     (tesseract.override {enableLanguages = ["eng"];})
-    # The media tools' sandbox (PX-11 finding 34), which the tests run
-    # the real ffmpeg, ffprobe and tesseract in.
-    bubblewrap
     # The LAN tests (P1-13) run in a private network namespace: unshare
     # makes it, ip brings up loopback with multicast.
     util-linux

@@ -1,9 +1,10 @@
 //! This device: its identity and its endpoint (ARCHITECTURE §13–17).
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use iroh::endpoint::{QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr};
@@ -319,11 +320,7 @@ impl Client {
     /// still proven on connect.
     pub fn add_address(&self, endpoint_id: &str, addrs: Vec<SocketAddr>) -> Result<(), SdkError> {
         let id = parse_id(endpoint_id)?;
-        self.inner
-            .manual
-            .lock()
-            .expect("never poisoned")
-            .insert(id, addrs);
+        self.inner.manual.lock().insert(id, addrs);
         Ok(())
     }
 
@@ -479,13 +476,7 @@ impl Client {
         let old = parse_id(saved_id)?;
         let new = parse_id(new_id)?;
         let conn = self.link(new).connection(self).await?;
-        if let Some(link) = self
-            .inner
-            .links
-            .lock()
-            .expect("never poisoned")
-            .remove(&old)
-        {
+        if let Some(link) = self.inner.links.lock().remove(&old) {
             link.close();
         }
         let storage = self.inner.storage.as_ref();
@@ -574,13 +565,7 @@ impl Client {
     /// Where the open connection to `id` reaches it, the path in use
     /// first; nothing without one. Never dials.
     fn in_use(&self, id: EndpointId) -> Vec<SocketAddr> {
-        let link = self
-            .inner
-            .links
-            .lock()
-            .expect("never poisoned")
-            .get(&id)
-            .cloned();
+        let link = self.inner.links.lock().get(&id).cloned();
         link.and_then(|l| l.open())
             .map(|conn| conn.remote_addrs())
             .unwrap_or_default()
@@ -613,7 +598,7 @@ impl Client {
     /// Forget server `endpoint_id`: its pin and every session on it.
     pub async fn forget(&self, endpoint_id: &str) -> Result<(), SdkError> {
         let id = parse_id(endpoint_id)?;
-        if let Some(link) = self.inner.links.lock().expect("never poisoned").remove(&id) {
+        if let Some(link) = self.inner.links.lock().remove(&id) {
             link.close();
         }
         let storage = self.inner.storage.as_ref();
@@ -1115,7 +1100,6 @@ impl Client {
         self.inner
             .links
             .lock()
-            .expect("never poisoned")
             .entry(id)
             .or_insert_with(|| Link::new(id))
             .clone()
@@ -1229,7 +1213,7 @@ impl Client {
         cache: &Mutex<HashMap<PlaybackKey, RevisionState>>,
         key: PlaybackKey,
     ) -> RevisionState {
-        let mut revisions = cache.lock().expect("never poisoned");
+        let mut revisions = cache.lock();
         // Evict only idle entries: a waiter must keep sharing its control
         // lock. Evicted handles recover their revision from the server.
         if revisions.len() >= 1024 {
@@ -1434,14 +1418,7 @@ impl Client {
     /// within about [`Timeouts::ping`]; it is cheap, and safe to call at
     /// any time.
     pub async fn resume(&self) {
-        let links: Vec<Arc<Link>> = self
-            .inner
-            .links
-            .lock()
-            .expect("never poisoned")
-            .values()
-            .cloned()
-            .collect();
+        let links: Vec<Arc<Link>> = self.inner.links.lock().values().cloned().collect();
         let ping = self.inner.timeouts.ping;
         let mut checks = tokio::task::JoinSet::new();
         for link in links {
@@ -1463,13 +1440,7 @@ impl Client {
         let saved = servers::load(self.inner.storage.as_ref()).await?;
         let pinned = saved.iter().find(|s| s.endpoint_id == id.to_string());
         let heard = self.inner.discovery.get(&id);
-        let manual = self
-            .inner
-            .manual
-            .lock()
-            .expect("never poisoned")
-            .get(&id)
-            .cloned();
+        let manual = self.inner.manual.lock().get(&id).cloned();
         if pinned.is_none() && heard.is_none() && manual.is_none() {
             return Err(SdkError::UnknownServer(id.to_string()));
         }
@@ -1637,7 +1608,6 @@ impl Client {
             .inner
             .links
             .lock()
-            .expect("never poisoned")
             .drain()
             .map(|(_, link)| link)
             .collect();

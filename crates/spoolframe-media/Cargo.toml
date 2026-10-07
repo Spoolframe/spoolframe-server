@@ -10,14 +10,18 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 async-trait = { workspace = true }
 easy-ffprobe = { workspace = true }
-# Limits and file descriptors for the tools it runs, between fork and exec.
+# What the tools it runs may reach (sandbox.rs): Landlock's file and
+# network rules, made before the fork and applied after it.
+landlock = { workspace = true }
+# Limits and the seccomp filter for the tools it runs, between fork and exec.
 libc = { workspace = true }
-# The tools' seccomp filter, as BPF for bubblewrap (sandbox.rs).
+# The tools' seccomp filter, compiled to BPF.
 seccompiler = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spoolframe-types = { workspace = true }
 thiserror = { workspace = true }
+parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 

@@ -5,9 +5,9 @@
 //! lives in memory; it holds no open file (each read opens the file), so an
 //! idle handle costs a map entry until it expires.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use std::sync::Arc;
@@ -219,6 +219,9 @@ pub struct Playback {
     pub planned: PlaybackPlan,
     /// Unix ms.
     pub started_at: i64,
+    /// Its place among every playback opened since the server started:
+    /// which of a device's is the newest, when two start in one ms.
+    order: u64,
     trace: Arc<Mutex<Trace>>,
     pub revision: u64,
     pub progress_sequence: u64,
@@ -331,7 +334,9 @@ pub enum EndReason {
     StoppedByAdmin,
     /// No reads for [`IDLE`].
     Idle,
-    /// Its device started another conversion.
+    /// Its device started two more after it: it holds only the one
+    /// playing now and the next ("now + next"), or, with no slot
+    /// free, only the new one.
     Replaced,
     /// Its device was gone longer than the grace.
     DeviceGone,
@@ -424,7 +429,7 @@ impl Playback {
     /// Playback debug's view of it now. `handle` is its own, hidden in the
     /// command line shown.
     fn snapshot(&self, handle: &str) -> Snapshot {
-        let trace = self.trace.lock().expect("never held across a panic");
+        let trace = self.trace.lock();
         let conversion = self.conversion.as_ref().map(|c| {
             let job = c.job();
             let progress = job.progress().borrow().clone();
@@ -574,14 +579,14 @@ impl Playbacks {
         self.disconnect_grace
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Playback>> {
-        self.handles.lock().expect("never held across a panic")
+    fn lock(&self) -> parking_lot::MutexGuard<'_, HashMap<String, Playback>> {
+        self.handles.lock()
     }
 
     /// Why `handle`, which is not open, cannot be used: an admin stopped
     /// it, or it is unknown or idled out.
     fn gone(&self, handle: &str) -> Refusal {
-        let mut stopped = self.stopped.lock().expect("never held across a panic");
+        let mut stopped = self.stopped.lock();
         let now = self.clock.now();
         stopped.retain(|_, at| now.saturating_duration_since(*at) < self.idle);
         if stopped.contains_key(handle) {
@@ -637,6 +642,8 @@ impl Playbacks {
             .filter_map(|h| handles.remove_entry(&h))
             .collect();
         self.started.inc();
+        // Under the lock, so no two playbacks share one.
+        let order = self.started.get();
         for previous in handles.values_mut() {
             if previous.session == opened.session && previous.item == opened.item {
                 previous.progress_superseded = true;
@@ -650,6 +657,7 @@ impl Playbacks {
                 shown: opened.shown,
                 planned: opened.planned,
                 started_at: unix_ms(),
+                order,
                 trace: Arc::default(),
                 revision: 0,
                 progress_sequence: 0,
@@ -776,11 +784,7 @@ impl Playbacks {
             read_ms,
             converted_ms,
         };
-        playback
-            .trace
-            .lock()
-            .expect("never held across a panic")
-            .read(point, epoch, mark);
+        playback.trace.lock().read(point, epoch, mark);
     }
 
     pub fn revised(&self, handle: &PlaybackHandle) {
@@ -822,11 +826,7 @@ impl Playbacks {
     pub(crate) fn record_progress(&self, handle: &PlaybackHandle, sequence: u64, position_ms: u64) {
         if let Some(playback) = self.lock().get_mut(&handle.0) {
             playback.progress_sequence = sequence;
-            playback
-                .trace
-                .lock()
-                .expect("never held across a panic")
-                .position = Some((position_ms, unix_ms()));
+            playback.trace.lock().position = Some((position_ms, unix_ms()));
         }
     }
 
@@ -838,12 +838,43 @@ impl Playbacks {
         self.ended_all(ended, why);
     }
 
-    /// End `endpoint`'s converted playbacks: it is starting another, and a
-    /// device plays one thing at a time, so their encodes would only hold
-    /// slots (an app killed mid-film and opened again). Returns how many.
+    /// End all of `endpoint`'s converted playbacks: it is starting
+    /// another, and no slot is free for it, so its own encodes give way
+    /// (one device's two playbacks with `max_jobs = 1`). Returns how many.
     pub fn end_conversions_on(&self, endpoint: &str) -> usize {
         self.end_where(
             |p| p.endpoint == endpoint && p.conversion.is_some(),
+            EndReason::Replaced,
+        )
+    }
+
+    /// Make room on `endpoint` for a playback it is starting: a device
+    /// holds at most two converted playbacks, "now + next": the one
+    /// playing now and the next it prepares (an iOS app opens the next track while
+    /// this one plays, for gapless audio). So all of the device's
+    /// converted playbacks but the newest end: those are abandoned (an app
+    /// killed mid-film and opened again), and their encodes would only
+    /// hold slots. Direct play holds no slot, and is left alone. Returns
+    /// how many ended.
+    pub fn make_room_for_next(&self, endpoint: &str) -> usize {
+        self.make_room_for_next_where(endpoint, |p| p.conversion.is_some())
+    }
+
+    /// [`Playbacks::make_room_for_next`], counting the playbacks `holds`
+    /// picks.
+    fn make_room_for_next_where(&self, endpoint: &str, holds: impl Fn(&Playback) -> bool) -> usize {
+        let newest = self
+            .lock()
+            .values()
+            .filter(|p| p.endpoint == endpoint && holds(p))
+            .map(|p| p.order)
+            .max();
+        let Some(newest) = newest else {
+            return 0;
+        };
+        // The newest stays, as "now" once the one starting is "next".
+        self.end_where(
+            |p| p.endpoint == endpoint && holds(p) && p.order < newest,
             EndReason::Replaced,
         )
     }
@@ -913,8 +944,8 @@ impl Playbacks {
         Self::prune(&mut gone, at);
     }
 
-    fn gone_lock(&self) -> std::sync::MutexGuard<'_, VecDeque<EndedPlayback>> {
-        self.gone.lock().expect("never held across a panic")
+    fn gone_lock(&self) -> parking_lot::MutexGuard<'_, VecDeque<EndedPlayback>> {
+        self.gone.lock()
     }
 
     fn prune(gone: &mut VecDeque<EndedPlayback>, now: i64) {
@@ -977,10 +1008,7 @@ impl Playbacks {
             return false;
         };
         let ended = handles.remove_entry(&handle);
-        self.stopped
-            .lock()
-            .expect("never held across a panic")
-            .insert(handle, self.clock.now());
+        self.stopped.lock().insert(handle, self.clock.now());
         drop(handles);
         self.ended_all(ended, EndReason::StoppedByAdmin);
         true
@@ -1140,7 +1168,58 @@ mod tests {
         let direct = start_on(&p, "tv");
         // Direct play holds no slot: it stays.
         assert_eq!(p.end_conversions_on("tv"), 0);
+        assert_eq!(p.make_room_for_next("tv"), 0);
         assert!(p.use_handle(&direct, &SessionId("s".into()), "tv").is_ok());
+    }
+
+    /// A start as StartPlayback makes it: room first, then the playback.
+    /// Every playback here stands in for a converted one, since a real
+    /// conversion needs ffmpeg; tests/it/encode.rs has those.
+    fn start_next(p: &Playbacks, endpoint: &str) -> PlaybackHandle {
+        p.make_room_for_next_where(endpoint, |_| true);
+        start_on(p, endpoint)
+    }
+
+    /// An app prepares the next track while this one plays (iOS gapless
+    /// audio): starting the next leaves the one playing alone.
+    #[test]
+    fn a_device_s_next_playback_leaves_the_one_playing() {
+        let p = Playbacks::default();
+        let s = SessionId("s".into());
+        let now = start_next(&p, "phone");
+        let next = start_next(&p, "phone");
+        assert!(p.use_handle(&now, &s, "phone").is_ok());
+        assert!(p.use_handle(&next, &s, "phone").is_ok());
+    }
+
+    /// A third start ends the oldest: its encode was abandoned, and its
+    /// slot is for the new one.
+    #[test]
+    fn a_device_s_third_playback_ends_the_oldest_and_keeps_the_next() {
+        let p = Playbacks::default();
+        let s = SessionId("s".into());
+        let oldest = start_next(&p, "phone");
+        let next = start_next(&p, "phone");
+        let third = start_next(&p, "phone");
+        assert_eq!(
+            p.use_handle(&oldest, &s, "phone").unwrap_err(),
+            Refusal::Expired
+        );
+        assert!(p.use_handle(&next, &s, "phone").is_ok());
+        assert!(p.use_handle(&third, &s, "phone").is_ok());
+        let why: Vec<EndReason> = p.ended().into_iter().map(|e| e.why).collect();
+        assert_eq!(why, [EndReason::Replaced]);
+    }
+
+    /// Another device's playbacks are not this device's to make room in.
+    #[test]
+    fn making_room_on_one_device_leaves_another_s() {
+        let p = Playbacks::default();
+        let tv = start_next(&p, "tv");
+        start_next(&p, "phone");
+        start_next(&p, "phone");
+        start_next(&p, "phone");
+        assert!(p.use_handle(&tv, &SessionId("s".into()), "tv").is_ok());
     }
 
     fn id_of(p: &Playbacks, endpoint: &str) -> String {

@@ -14,8 +14,8 @@
 //! as PX-04 did. A link made in My profile takes its place while it
 //! exists.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use spoolframe_admin_api::{PlexAccountServer, PlexLink};
@@ -230,7 +230,7 @@ impl PlexAccounts {
         let plex_tv = self.plex_tv()?;
         {
             let now = std::time::Instant::now();
-            let mut begun = self.begun.lock().expect("never held across a panic");
+            let mut begun = self.begun.lock();
             begun.retain(|_, times| {
                 times.retain(|at| now.duration_since(*at) < LINK_BEGIN_WINDOW);
                 !times.is_empty()
@@ -245,7 +245,7 @@ impl PlexAccounts {
             times.push_back(now);
         }
         let pin = plex_tv.begin(forward).await?;
-        let mut pins = self.pins.lock().expect("never held across a panic");
+        let mut pins = self.pins.lock();
         let mine: Vec<(u64, std::time::Instant)> = pins
             .iter()
             .filter(|(_, (owner, _))| *owner == user)
@@ -265,7 +265,6 @@ impl PlexAccounts {
         let mine = self
             .pins
             .lock()
-            .expect("never held across a panic")
             .get(&id)
             .is_some_and(|(owner, _)| *owner == user);
         if !mine {
@@ -302,10 +301,7 @@ impl PlexAccounts {
     }
 
     fn forget_pin(&self, id: u64) {
-        self.pins
-            .lock()
-            .expect("never held across a panic")
-            .remove(&id);
+        self.pins.lock().remove(&id);
     }
 
     /// Keep `link` as `user`'s.

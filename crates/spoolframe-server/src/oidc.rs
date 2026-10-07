@@ -16,9 +16,9 @@
 //! it by a random value in a cookie of its own, so a callback carried to
 //! another browser (a link sent to someone) does nothing there.
 
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use openidconnect::core::{
@@ -364,7 +364,7 @@ impl Oidc {
                 },
             })
             .collect();
-        *self.providers.write().expect("never poisoned") = providers;
+        *self.providers.write() = providers;
     }
 
     /// The providers' names, in the config's order: none without a
@@ -375,7 +375,6 @@ impl Oidc {
         }
         self.providers
             .read()
-            .expect("never poisoned")
             .iter()
             .map(|p| p.name.clone())
             .collect()
@@ -386,7 +385,6 @@ impl Oidc {
     pub fn provider_of(&self, issuer: &str) -> Option<String> {
         self.providers
             .read()
-            .expect("never poisoned")
             .iter()
             .find(|p| p.issuer == issuer)
             .map(|p| p.name.clone())
@@ -401,7 +399,6 @@ impl Oidc {
         }
         self.providers
             .read()
-            .expect("never poisoned")
             .iter()
             .find(|p| p.name == name)
             .cloned()
@@ -475,11 +472,7 @@ impl Oidc {
     /// The provider's discovery document and keys, fetched within the
     /// last [`DISCOVERY_FRESH`].
     async fn discover(&self, provider: &Provider) -> Result<Metadata, OidcError> {
-        if let Some((at, metadata)) = self
-            .discovered
-            .lock()
-            .expect("never poisoned")
-            .get(&provider.issuer)
+        if let Some((at, metadata)) = self.discovered.lock().get(&provider.issuer)
             && at.elapsed() < DISCOVERY_FRESH
         {
             return Ok(metadata.clone());
@@ -487,7 +480,6 @@ impl Oidc {
         let metadata = self.fetch_discovery(provider).await?;
         self.discovered
             .lock()
-            .expect("never poisoned")
             .insert(provider.issuer.clone(), (Instant::now(), metadata.clone()));
         Ok(metadata)
     }
@@ -550,7 +542,7 @@ impl Oidc {
             .set_pkce_challenge(challenge)
             .url();
         let browser = random();
-        let mut flows = self.flows.lock().expect("never poisoned");
+        let mut flows = self.flows.lock();
         let now = Instant::now();
         flows.retain(|_, f| now.duration_since(f.began) < self.lifetime);
         let from_source = source.map_or(0, |source| {
@@ -585,7 +577,7 @@ impl Oidc {
     /// (its cookie's value) is the one that began it and it is not over.
     /// A callback from another browser leaves the flow for its own.
     fn take(&self, state: &str, browser: Option<&str>) -> Result<Flow, OidcError> {
-        let mut flows = self.flows.lock().expect("never poisoned");
+        let mut flows = self.flows.lock();
         let ours = flows
             .get(state)
             .is_some_and(|f| browser.is_some_and(|b| browser_hash(b) == f.browser));

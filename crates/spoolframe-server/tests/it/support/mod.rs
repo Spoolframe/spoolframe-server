@@ -12,8 +12,9 @@ pub use spoolframe_server::test_support::{
     show, write_script,
 };
 
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, presets};
@@ -81,7 +82,6 @@ pub fn transcoding() -> Arc<Transcoding> {
 pub fn media_sandbox(dir: &Path) -> Sandbox {
     Sandbox::new(
         Mode::Required,
-        Path::new("bwrap"),
         vec![
             dir.join("spoolframe.db"),
             dir.join("endpoint.key"),
@@ -89,7 +89,7 @@ pub fn media_sandbox(dir: &Path) -> Sandbox {
         ],
         Vec::new(),
     )
-    .expect("the dev shell has bubblewrap")
+    .expect("this kernel has Landlock")
 }
 
 /// A real tool (a bare name, looked up in `PATH`) confined in `sandbox`; a
@@ -156,13 +156,13 @@ impl Warnings {
     }
 
     pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        String::from_utf8_lossy(&self.0.lock()).into_owned()
     }
 }
 
 impl std::io::Write for Warnings {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        self.0.lock().extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -636,6 +636,25 @@ impl TestServer {
         std::fs::write(&self.media, file).unwrap();
     }
 
+    /// Make the movie's file as music: `secs` of white noise, which FLAC
+    /// cannot make much smaller, as 24-bit 48 kHz stereo FLAC in Matroska
+    /// with no picture (about 2.3 Mbit/s).
+    pub fn generate_flac_noise(&self, secs: u32) {
+        std::fs::create_dir_all(self.media.parent().unwrap()).unwrap();
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i"])
+            .arg(format!(
+                "anoisesrc=color=white:sample_rate=48000:duration={secs}"
+            ))
+            .args(["-ac", "2", "-c:a", "flac", "-sample_fmt", "s32"])
+            .args(["-bits_per_raw_sample", "24"])
+            .arg(&self.media)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not make the test music");
+    }
+
     fn generate(&self, secs: u32, video: &str, audio: &str, video_offset: &str) {
         std::fs::create_dir_all(self.media.parent().unwrap()).unwrap();
         let status = std::process::Command::new("ffmpeg")
@@ -903,7 +922,7 @@ impl TestServer {
 pub struct TestClient {
     pub endpoint: Endpoint,
     pub conn: Connection,
-    pub instance: Arc<std::sync::Mutex<Option<spoolframe_protocol::rpc::ServerInstance>>>,
+    pub instance: Arc<parking_lot::Mutex<Option<spoolframe_protocol::rpc::ServerInstance>>>,
     pub controls: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -939,7 +958,7 @@ impl TestClient {
     }
 
     pub fn operation(&self) -> spoolframe_protocol::rpc::Operation {
-        let instance = self.instance.lock().unwrap().clone();
+        let instance = self.instance.lock().clone();
         spoolframe_protocol::rpc::Operation {
             id: uuid::Uuid::now_v7().to_string(),
             instance: instance.map(|i| i.id).unwrap_or_default(),
@@ -960,7 +979,7 @@ impl TestClient {
             spoolframe_protocol::codec::read_reply(&mut recv)
                 .await
                 .unwrap();
-        *self.instance.lock().unwrap() = Some(response.server.clone());
+        *self.instance.lock() = Some(response.server.clone());
         response
     }
 
@@ -1287,8 +1306,9 @@ impl TestClient {
 /// check that something was said. All tests share them: look for a line
 /// by what only that test's server would say.
 pub mod logs {
+    use parking_lot::Mutex;
     use std::io::Write;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
 
     static LINES: OnceLock<&'static Mutex<Vec<u8>>> = OnceLock::new();
 
@@ -1296,7 +1316,7 @@ pub mod logs {
 
     impl Write for Kept {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            self.0.lock().extend_from_slice(buf);
             Ok(buf.len())
         }
 
@@ -1320,7 +1340,7 @@ pub mod logs {
 
     /// Whether a kept line has every one of `parts`.
     pub fn has(parts: &[&str]) -> bool {
-        let lines = LINES.get().expect("logs::keep() first").lock().unwrap();
+        let lines = LINES.get().expect("logs::keep() first").lock();
         String::from_utf8_lossy(&lines)
             .lines()
             .any(|line| parts.iter().all(|part| line.contains(part)))

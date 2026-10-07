@@ -1,47 +1,56 @@
 //! ffmpeg, ffprobe and tesseract confined (PX-11 finding 34, PX-09 B-12).
 //!
 //! They parse files anyone who can write to a library folder made, in C.
-//! So each run gets only what it needs:
+//! So each run gets only what it needs, applied to the child between fork
+//! and exec, with no namespace, so the service's own sandbox needs none:
 //!
-//! - **bubblewrap** (`bwrap`), when [`Mode`] lets it confine: new user,
-//!   mount, PID, network, IPC and UTS namespaces. The root is an empty
-//!   read-only tmpfs; the system's programs and libraries (the nix store,
-//!   `/usr`, …) are bound in read-only. Each input file is opened here and
-//!   bound in by that file descriptor, so what the run reads is the file
-//!   that was checked, not one swapped in after. The job's own directory
-//!   is the one writable path. No network, no `/proc`, no state directory,
-//!   no `/tmp`, no `/home`. A seccomp filter refuses new processes
-//!   (threads only), sockets but Unix ones, and the calls a sandbox escape
+//! - **Landlock**, when [`Mode`] lets it confine: the system's programs and
+//!   libraries (the nix store, `/usr`, …) to read and run; each input file
+//!   to read, by the inode the server opened and checked; the directories
+//!   the run was given, to read or write. Nothing else: not the state
+//!   directory, not systemd's credentials, not `/home`, not `/proc`. No TCP
+//!   connect or bind (ABI 4), no signal or abstract Unix socket out of the
+//!   run (ABI 6).
+//! - **seccomp**, unless `off`: no new processes (threads only), no sockets
+//!   but Unix ones and no `connect` at all, and none of the calls an escape
 //!   uses: `ptrace`, `mount`, namespaces, keyrings, `bpf`, `io_uring`, …
 //! - **always**, confined or not: a clean environment (a short allowlist,
 //!   and `HOME` and `TMPDIR` in the job's directory), resource limits
 //!   (memory, CPU time, file size, no core dumps), and a process group of
 //!   its own, so a signal reaches the whole run.
 //!
-//! bubblewrap is a program, not a library, so nothing here forks with a
-//! half-set-up namespace in a multithreaded server: it is the same
-//! sandbox Flatpak runs on, and nixpkgs has it.
+//! Everything is made before the fork: the ruleset (its file descriptor
+//! holds the rules) and the BPF. After the fork the child only calls
+//! setrlimit(2), prctl(2) and landlock_restrict_self(2), and allocates
+//! nothing: the server is multithreaded, and another thread may have held
+//! the allocator's lock when it forked.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::Write as _;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::fs::File;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+use landlock::{
+    ABI, Access as _, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible as _, PathBeneath,
+    Ruleset, RulesetAttr as _, RulesetCreated, RulesetCreatedAttr as _, RulesetStatus, Scope,
+};
 use seccompiler::{
-    SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
-    TargetArch,
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule, TargetArch,
 };
 
 /// `media.sandbox`: whether the tools must be confined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// bubblewrap, or the server does not start.
+    /// Landlock and seccomp, or the server does not start.
     Required,
-    /// bubblewrap if it works here; otherwise unconfined, said loudly.
+    /// Landlock and seccomp if this kernel has Landlock; otherwise seccomp
+    /// alone, said loudly.
     Auto,
     /// Never confined. The environment and the limits still apply.
     Off,
@@ -64,17 +73,26 @@ impl std::str::FromStr for Mode {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
-    #[error("media.sandbox is \"required\", but {bwrap} cannot confine a program here: {reason}")]
-    Unavailable { bwrap: String, reason: String },
+    #[error("media.sandbox is \"required\", but the media tools cannot be confined here: {reason}")]
+    Unavailable { reason: String },
 }
 
-/// How the tools run: confined by bubblewrap, or not. Cheap to clone.
+/// The oldest Landlock ABI that confines a run: 3 (Linux 6.2) is the first
+/// to refuse truncate(2) outside the rules, without which a run could
+/// empty the database through its path.
+pub const MIN_LANDLOCK_ABI: i32 = 3;
+
+/// How the tools run: confined by Landlock and seccomp, by seccomp alone,
+/// or not at all. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct Sandbox(Arc<Inner>);
 
 #[derive(Debug)]
 struct Inner {
-    bwrap: Option<Bwrap>,
+    /// Landlock's ABI on this kernel, when runs are confined by it.
+    landlock: Option<i32>,
+    /// The seccomp filters, unless `off`.
+    seccomp: Option<Arc<Filters>>,
     /// No input is read from in here: the state directory, with the
     /// database, the key and the secrets; systemd's credentials.
     hidden: Vec<PathBuf>,
@@ -82,33 +100,36 @@ struct Inner {
     gpu: Vec<PathBuf>,
 }
 
+/// The seccomp filters, as BPF, in the order they are loaded.
 #[derive(Debug)]
-struct Bwrap {
-    /// bwrap itself, its real path.
-    path: PathBuf,
-    /// The seccomp filters, as BPF, in the order they are loaded.
-    filters: Vec<Vec<u8>>,
-}
+struct Filters(Vec<BpfProgram>);
 
 impl Sandbox {
     /// Nothing confined: for tests with stand-in programs, and
     /// `media.sandbox = "off"`.
     pub fn off() -> Self {
         Self(Arc::new(Inner {
-            bwrap: None,
+            landlock: None,
+            seccomp: None,
             hidden: Vec::new(),
             gpu: Vec::new(),
         }))
     }
 
-    /// Confine with `bwrap` (a path, or a name looked up in `PATH`) as
-    /// `mode` says. bwrap is tried once here, the way every run uses it;
-    /// if that fails, `Required` is an error and `Auto` runs unconfined
-    /// and logs why. No input of a run may be inside `hidden`, and a run
-    /// that uses the GPU gets the device nodes in `gpu`.
-    pub fn new(
+    /// Confine as `mode` says, with this kernel's Landlock. Without it (or
+    /// with too old a one), `Required` is an error and `Auto` runs with
+    /// seccomp alone and logs why. No input of a run may be inside
+    /// `hidden`, and a run that uses the GPU gets the device nodes in
+    /// `gpu`.
+    pub fn new(mode: Mode, hidden: Vec<PathBuf>, gpu: Vec<PathBuf>) -> Result<Self, SandboxError> {
+        Self::with_landlock(mode, landlock_abi(), hidden, gpu)
+    }
+
+    /// [`Sandbox::new`] with the kernel's answer given: Landlock's ABI, or
+    /// why there is none.
+    fn with_landlock(
         mode: Mode,
-        bwrap: &Path,
+        abi: Result<i32, String>,
         hidden: Vec<PathBuf>,
         gpu: Vec<PathBuf>,
     ) -> Result<Self, SandboxError> {
@@ -116,45 +137,112 @@ impl Sandbox {
             .into_iter()
             .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir))
             .collect();
-        let bwrap = match mode {
-            Mode::Off => {
-                tracing::warn!(
-                    "media.sandbox is \"off\": ffmpeg, ffprobe and tesseract run with the server's \
-                     own access to files and the network"
-                );
-                None
-            }
-            Mode::Required | Mode::Auto => match Bwrap::check(bwrap) {
-                Ok(bwrap) => {
-                    tracing::info!(bwrap = %bwrap.path.display(), "media tools run confined");
-                    Some(bwrap)
-                }
-                Err(reason) if mode == Mode::Required => {
-                    return Err(SandboxError::Unavailable {
-                        bwrap: bwrap.display().to_string(),
-                        reason,
-                    });
-                }
-                Err(reason) => {
-                    tracing::error!(
-                        bwrap = %bwrap.display(),
-                        reason,
-                        "MEDIA TOOLS RUN UNCONFINED: bubblewrap cannot confine them here, so \
-                         ffmpeg, ffprobe and tesseract parse untrusted files with the server's own \
-                         access to its state directory and the network. Install bubblewrap, or set \
-                         media.sandbox = \"required\" to refuse to start without it"
-                    );
-                    None
-                }
-            },
+        let mut inner = Inner {
+            landlock: None,
+            seccomp: None,
+            hidden,
+            gpu,
         };
-        Ok(Self(Arc::new(Inner { bwrap, hidden, gpu })))
+        if mode == Mode::Off {
+            tracing::warn!(
+                "media.sandbox is \"off\": ffmpeg, ffprobe and tesseract run with the server's \
+                 own access to files and the network"
+            );
+            return Ok(Self(Arc::new(inner)));
+        }
+        let seccomp = filters();
+        let landlock = abi.and_then(|abi| {
+            if abi < MIN_LANDLOCK_ABI {
+                return Err(format!(
+                    "this kernel's Landlock is ABI {abi}; confining needs ABI \
+                     {MIN_LANDLOCK_ABI} (Linux 6.2) or later"
+                ));
+            }
+            // The calls a run makes before it starts, but the last: a
+            // seccomp filter (systemd's SystemCallFilter) may refuse them.
+            ruleset(abi, &inner, None, &Jail::new(Limits::PROBE))
+                .map_err(|e| format!("cannot make a Landlock ruleset: {e}"))?;
+            Ok(abi)
+        });
+        match (landlock, seccomp) {
+            (Ok(abi), Ok(filters)) => {
+                tracing::info!(
+                    landlock_abi = abi,
+                    "media tools run confined: Landlock ABI {abi} and a seccomp filter"
+                );
+                inner.landlock = Some(abi);
+                inner.seccomp = Some(Arc::new(filters));
+            }
+            (Err(reason), _) | (_, Err(reason)) if mode == Mode::Required => {
+                return Err(SandboxError::Unavailable { reason });
+            }
+            (Err(reason), seccomp) => {
+                tracing::error!(
+                    reason,
+                    "MEDIA TOOLS RUN WITHOUT LANDLOCK: ffmpeg, ffprobe and tesseract parse \
+                     untrusted files with the server's own access to its state directory, \
+                     limited only by a seccomp filter and resource limits. Use Linux 6.2 or \
+                     later with Landlock enabled (lsm=…,landlock), or set media.sandbox = \
+                     \"required\" to refuse to start without it"
+                );
+                match seccomp {
+                    Ok(filters) => inner.seccomp = Some(Arc::new(filters)),
+                    Err(reason) => tracing::error!(reason, "media tools run without seccomp"),
+                }
+            }
+            (Ok(abi), Err(reason)) => {
+                tracing::error!(
+                    reason,
+                    landlock_abi = abi,
+                    "MEDIA TOOLS RUN WITHOUT SECCOMP: there is no seccomp filter for this \
+                     machine, so ffmpeg, ffprobe and tesseract may start processes and open \
+                     sockets; Landlock ABI {abi} still limits their files"
+                );
+                inner.landlock = Some(abi);
+            }
+        }
+        Ok(Self(Arc::new(inner)))
     }
 
-    /// Whether runs are confined.
+    /// Whether runs are confined by Landlock.
     pub fn confines(&self) -> bool {
-        self.0.bwrap.is_some()
+        self.0.landlock.is_some()
     }
+
+    /// The Landlock ABI runs are confined with.
+    pub fn landlock_abi(&self) -> Option<i32> {
+        self.0.landlock
+    }
+}
+
+/// This kernel's Landlock ABI, or why it has none.
+fn landlock_abi() -> Result<i32, String> {
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+    // SAFETY: landlock_create_ruleset(2) with no attributes and the version
+    // flag only reads its arguments.
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if abi >= 0 {
+        return i32::try_from(abi).map_err(|_| format!("Landlock ABI {abi}?"));
+    }
+    let error = std::io::Error::last_os_error();
+    Err(match error.raw_os_error() {
+        Some(libc::ENOSYS) => "this kernel has no Landlock".to_owned(),
+        Some(libc::EOPNOTSUPP) => {
+            "Landlock is not enabled on this kernel (add it to the lsm= boot parameter)".to_owned()
+        }
+        Some(libc::EPERM) => format!(
+            "landlock_create_ruleset(2) is refused, by a seccomp filter such as systemd's \
+             SystemCallFilter: {error}"
+        ),
+        _ => format!("landlock_create_ruleset(2): {error}"),
+    })
 }
 
 /// The GPU device nodes a host may encode or decode on: VA-API's render
@@ -305,10 +393,11 @@ impl Jail {
     }
 
     /// A file the run reads that someone else may have put there: media,
-    /// a subtitle beside it. Opened by the server and bound in by its file
-    /// descriptor, following symlinks; refused unless a regular file
-    /// outside the hidden directories. One that does not exist is left
-    /// out, and the program says so as it would anyway.
+    /// a subtitle beside it. Opened by the server, following symlinks, and
+    /// refused unless a regular file outside the hidden directories; the
+    /// run may read that inode only, so a file swapped in after the check
+    /// is not readable. One that does not exist is left out, and the
+    /// program says so as it would anyway.
     pub fn input(mut self, path: impl Into<PathBuf>) -> Self {
         self.inputs.push(path.into());
         self
@@ -367,56 +456,128 @@ impl Tool {
     /// arguments to. An input that may not be read is an error
     /// (`PermissionDenied`).
     pub fn command(&self, jail: &Jail) -> std::io::Result<Command> {
-        let mut keep: Vec<OwnedFd> = Vec::new();
-        let mut command = match &self.sandbox.0.bwrap {
-            None => std::process::Command::new(&self.program),
-            Some(bwrap) => {
+        let sandbox = &*self.sandbox.0;
+        let (program, ruleset) = match sandbox.landlock {
+            Some(abi) => {
+                // Run by its real path, which the rules name.
                 let program = resolve(&self.program)?;
-                let mut command = std::process::Command::new(&bwrap.path);
-                let args = bwrap.args(&self.sandbox.0, &program, jail, &mut keep)?;
-                command.args(args).arg("--").arg(&program);
-                command
+                let ruleset = ruleset(abi, sandbox, Some(&program), jail)?;
+                (program, Some(ruleset))
+            }
+            None => {
+                if sandbox.seccomp.is_some() {
+                    for input in &jail.inputs {
+                        open_input(input, sandbox, jail)?;
+                    }
+                }
+                (self.program.clone(), None)
             }
         };
+        let mut command = std::process::Command::new(&program);
         command.env_clear();
         for (key, value) in environment(jail) {
             command.env(key, value);
         }
         command.process_group(0);
-        let fds: Vec<RawFd> = keep.iter().map(AsRawFd::as_raw_fd).collect();
         let limits = jail.limits;
         let memory = limits.memory.bytes();
-        // SAFETY: between fork and exec only fcntl(2), getrlimit(2) and
-        // setrlimit(2) run, which are async-signal-safe; nothing allocates
-        // (`fds` was made before the fork) or takes a lock.
+        let seccomp = sandbox.seccomp.clone();
+        let mut ruleset = ruleset;
+        // SAFETY: between fork and exec only getrlimit(2), setrlimit(2),
+        // prctl(2) and landlock_restrict_self(2) run, which are
+        // async-signal-safe, and close(2) of the ruleset. Nothing
+        // allocates: the ruleset and the filters were made before the
+        // fork, the errors are errno values, and `take` moves the ruleset
+        // out of the child's copy of the closure without touching the heap.
         unsafe {
             command.pre_exec(move || {
-                for &fd in &fds {
-                    // bwrap reads these by number: they must survive exec.
-                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
                 lower(libc::RLIMIT_DATA, memory)?;
                 lower(libc::RLIMIT_CPU, limits.cpu_secs)?;
                 lower(libc::RLIMIT_FSIZE, limits.file_size)?;
                 lower(libc::RLIMIT_CORE, 0)?;
+                if let Some(ruleset) = ruleset.take() {
+                    restrict(ruleset)?;
+                }
+                if let Some(filters) = &seccomp {
+                    install(filters)?;
+                }
                 Ok(())
             });
         }
         Ok(Command {
             command: tokio::process::Command::from(command),
-            _keep: keep,
         })
+    }
+
+    /// Shows that this tool, run as ffprobe, is confined: it can neither
+    /// read `secret` (a directory no run is given: the state directory)
+    /// nor connect to a listener on loopback. What it showed, for the log;
+    /// or what got through.
+    pub async fn check_confined(&self, secret: &Path) -> Result<String, String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.set_nonblocking(true).map(|()| l))
+            .map_err(|e| format!("cannot listen on loopback to check with: {e}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|e| format!("cannot listen on loopback to check with: {e}"))?;
+        let read = self.check_run(secret.as_os_str().to_owned()).await?;
+        if !read.contains("Permission denied") {
+            return Err(format!(
+                "{} could read {}: {read}",
+                self.program.display(),
+                secret.display()
+            ));
+        }
+        // One second to give up waiting for data, had it connected.
+        let url = format!("tcp://{address}?timeout=1000000");
+        let connect = self.check_run(url.into()).await?;
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            accepted => {
+                return Err(format!(
+                    "{} connected to {address}: {accepted:?}; it said {connect}",
+                    self.program.display()
+                ));
+            }
+        }
+        Ok(format!(
+            "a confined {} could not read {} nor connect to {address}",
+            self.program.display(),
+            secret.display()
+        ))
+    }
+
+    /// ffprobe on `target`, which must fail: what it said.
+    async fn check_run(&self, target: OsString) -> Result<String, String> {
+        let mut command = self
+            .command(&Jail::new(Limits::PROBE))
+            .map_err(|e| format!("cannot run {}: {e}", self.program.display()))?;
+        command
+            .args(["-v", "error", "-i"])
+            .arg(&target)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .map_err(|_| format!("{} did not end", self.program.display()))?
+            .map_err(|e| format!("cannot run {}: {e}", self.program.display()))?;
+        let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if output.status.success() {
+            return Err(format!(
+                "{} read {}: {said}",
+                self.program.display(),
+                target.to_string_lossy()
+            ));
+        }
+        Ok(said)
     }
 }
 
-/// A command from [`Tool::command`]. It holds the inputs' file
-/// descriptors until it is dropped, so it must outlive its spawn.
+/// A command from [`Tool::command`]. It holds what the child confines
+/// itself with until it is dropped, so it must outlive its spawn.
 #[derive(Debug)]
 pub struct Command {
     command: tokio::process::Command,
-    _keep: Vec<OwnedFd>,
 }
 
 impl std::ops::Deref for Command {
@@ -464,6 +625,66 @@ fn lower(resource: Resource, value: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The child confines itself to `ruleset`. After the fork: see
+/// [`Tool::command`].
+fn restrict(ruleset: RulesetCreated) -> std::io::Result<()> {
+    match ruleset.restrict_self() {
+        Ok(status) if status.ruleset == RulesetStatus::FullyEnforced => Ok(()),
+        // Every right was asked for as a hard requirement, so this does
+        // not happen; if it did, the run would not start half confined.
+        Ok(_) => Err(std::io::Error::from_raw_os_error(libc::ENOTSUP)),
+        Err(e) => {
+            let mut source: Option<&dyn std::error::Error> = Some(&e);
+            while let Some(error) = source {
+                if let Some(code) = error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                {
+                    return Err(std::io::Error::from_raw_os_error(code));
+                }
+                source = error.source();
+            }
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        }
+    }
+}
+
+/// The child loads the seccomp filters. Through prctl(2), not seccomp(2),
+/// which systemd's @system-service does not allow. After the fork: see
+/// [`Tool::command`].
+fn install(filters: &Filters) -> std::io::Result<()> {
+    // SAFETY: prctl(2) with integer arguments, and with a pointer to a
+    // filter that lives as long as `filters` (the closure's).
+    unsafe {
+        if libc::prctl(
+            libc::PR_SET_NO_NEW_PRIVS,
+            1 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        for program in &filters.0 {
+            let fprog = libc::sock_fprog {
+                // At most BPF_MAXINSNS, which `filters` checked.
+                len: program.len() as libc::c_ushort,
+                filter: program.as_ptr().cast::<libc::sock_filter>().cast_mut(),
+            };
+            if libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                &raw const fprog,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// What a run's environment keeps from the server's: where programs and
 /// their data are, and the GPU drivers' settings. Nothing else: the
 /// server's environment may name its credentials, or hold a token.
@@ -501,8 +722,8 @@ fn environment(jail: &Jail) -> Vec<(OsString, OsString)> {
 }
 
 /// `program` as a real path: looked up in `PATH` if it is a bare name,
-/// then with symlinks resolved, since `/run/current-system` and the like
-/// are not in the sandbox.
+/// then with symlinks resolved, so the rule that lets it run names the
+/// file itself.
 fn resolve(program: &Path) -> std::io::Result<PathBuf> {
     let found = if program.components().count() == 1 && !program.is_absolute() {
         std::env::var_os("PATH")
@@ -522,8 +743,8 @@ fn resolve(program: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(found)
 }
 
-/// The system's programs and libraries, read-only in every run. Those
-/// missing on this host are left out.
+/// The system's programs and libraries, to read and run in every run.
+/// Those missing on this host are left out.
 const SYSTEM: &[&str] = &[
     "/nix/store",
     "/usr",
@@ -539,148 +760,145 @@ const SYSTEM: &[&str] = &[
     "/etc/fonts",
 ];
 
+/// The device nodes every run may use: the ones written to, then those
+/// only read.
+const DEVICES_WRITTEN: &[&str] = &["/dev/null", "/dev/full"];
+const DEVICES_READ: &[&str] = &["/dev/zero", "/dev/random", "/dev/urandom"];
+
 /// What the GPU drivers read, with [`Jail::gpu`]: `/sys` for the device's
 /// PCI ids, and NixOS's driver directory.
 const GPU_READS: &[&str] = &["/sys", "/run/opengl-driver"];
 
-impl Bwrap {
-    /// bwrap at `path`, if it confines a program here: it runs itself,
-    /// confined, as a run would.
-    fn check(path: &Path) -> Result<Self, String> {
-        let real = resolve(path).map_err(|e| format!("cannot find it: {e}"))?;
-        let bwrap = Self {
-            path: real.clone(),
-            filters: filters()?,
-        };
-        let mut keep = Vec::new();
-        let args = bwrap
-            .args(
-                &Inner {
-                    bwrap: None,
-                    hidden: Vec::new(),
-                    gpu: Vec::new(),
-                },
-                &real,
-                &Jail::new(Limits::PROBE),
-                &mut keep,
-            )
-            .map_err(|e| e.to_string())?;
-        let fds: Vec<RawFd> = keep.iter().map(AsRawFd::as_raw_fd).collect();
-        let mut command = std::process::Command::new(&real);
-        command
-            .args(args)
-            .arg("--")
-            .arg(&real)
-            .arg("--version")
-            .env_clear()
-            .stdin(std::process::Stdio::null());
-        // SAFETY: as in `Tool::command`: only fcntl(2) after the fork.
-        unsafe {
-            command.pre_exec(move || {
-                for &fd in &fds {
-                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
+/// The Landlock ruleset for `program` in `jail`, ready for the child to
+/// confine itself with. Every right this kernel knows is handled, so
+/// anything not allowed here is refused.
+fn ruleset(
+    abi: i32,
+    sandbox: &Inner,
+    program: Option<&Path>,
+    jail: &Jail,
+) -> std::io::Result<RulesetCreated> {
+    let abi = ABI::from(abi);
+    let all = AccessFs::from_all(abi);
+    let net = AccessNet::from_all(abi);
+    let scope = Scope::from_all(abi);
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(all)
+        .map_err(std::io::Error::other)?;
+    // No TCP connect or bind at all (ABI 4): no port is allowed.
+    if !net.is_empty() {
+        ruleset = ruleset.handle_access(net).map_err(std::io::Error::other)?;
+    }
+    // No signal or abstract Unix socket out of the run (ABI 6).
+    if !scope.is_empty() {
+        ruleset = ruleset.scope(scope).map_err(std::io::Error::other)?;
+    }
+    let mut rules = Rules {
+        abi,
+        all,
+        ruleset: ruleset.create().map_err(std::io::Error::other)?,
+    };
+    let run = AccessFs::from_read(abi);
+    let read = AccessFs::ReadFile | AccessFs::ReadDir;
+    for dir in SYSTEM {
+        rules.allow(Path::new(dir), run, false)?;
+    }
+    if let Some(program) = program
+        && !SYSTEM.iter().any(|dir| program.starts_with(dir))
+    {
+        rules.allow(program, run, true)?;
+    }
+    for device in DEVICES_WRITTEN {
+        let access = AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate;
+        rules.allow(Path::new(device), access, false)?;
+    }
+    for device in DEVICES_READ {
+        rules.allow(Path::new(device), AccessFs::ReadFile.into(), false)?;
+    }
+    if jail.gpu {
+        for device in &sandbox.gpu {
+            let access = AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::IoctlDev;
+            rules.allow(device, access, false)?;
+            // libdrm finds the render node by listing /dev/dri.
+            if let Some(parent) = device.parent()
+                && parent != Path::new("/dev")
+            {
+                rules.allow(parent, AccessFs::ReadDir.into(), false)?;
+            }
         }
-        let output = command
-            .output()
-            .map_err(|e| format!("cannot run it: {e}"))?;
-        drop(keep);
-        if output.status.success() {
-            Ok(bwrap)
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!(
-                "{} ({})",
-                stderr.trim().lines().last().unwrap_or("no message"),
-                output.status
-            ))
+        for dir in GPU_READS {
+            rules.allow(Path::new(dir), run, false)?;
         }
     }
+    for dir in &jail.reads {
+        rules.allow(dir, read, true)?;
+    }
+    for dir in &jail.writes {
+        // Everything but running what it wrote.
+        rules.allow(dir, all & !AccessFs::Execute, true)?;
+    }
+    for input in &jail.inputs {
+        if let Some(file) = open_input(input, sandbox, jail)? {
+            rules.allow_file(file, AccessFs::ReadFile.into())?;
+        }
+    }
+    Ok(rules.ruleset)
+}
 
-    /// bwrap's arguments for `program` in `jail`, up to the `--`. The file
-    /// descriptors they name go in `keep`.
-    fn args(
-        &self,
-        sandbox: &Inner,
-        program: &Path,
-        jail: &Jail,
-        keep: &mut Vec<OwnedFd>,
-    ) -> std::io::Result<Vec<OsString>> {
-        let mut args: Vec<OsString> = [
-            "--unshare-user",
-            "--unshare-ipc",
-            "--unshare-pid",
-            "--unshare-net",
-            "--unshare-uts",
-            "--die-with-parent",
-            // The program is the namespace's first process: a signal to
-            // the run's process group reaches it, and its exit status is
-            // bwrap's.
-            "--as-pid-1",
-        ]
-        .map(OsString::from)
-        .to_vec();
-        let mut bind = |flag: &str, from: &Path, to: &Path| {
-            args.push(flag.into());
-            args.push(from.into());
-            args.push(to.into());
+/// A ruleset being filled.
+struct Rules {
+    abi: ABI,
+    all: BitFlags<AccessFs>,
+    ruleset: RulesetCreated,
+}
+
+impl Rules {
+    /// `access` beneath `path`; a `path` that does not exist is an error
+    /// only when it `must`.
+    fn allow(
+        &mut self,
+        path: &Path,
+        access: BitFlags<AccessFs>,
+        must: bool,
+    ) -> std::io::Result<()> {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(e) if !must && e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("{}: {e}", path.display()),
+                ));
+            }
         };
-        for dir in SYSTEM {
-            bind("--ro-bind-try", Path::new(dir), Path::new(dir));
+        self.allow_file(file, access)
+    }
+
+    /// `access` beneath what `file` is open on: that inode, whatever path
+    /// leads to it later. A file that is not a directory gets only the
+    /// rights a file can have.
+    fn allow_file(&mut self, file: File, access: BitFlags<AccessFs>) -> std::io::Result<()> {
+        let mut access = access & self.all;
+        if !file.metadata()?.is_dir() {
+            access &= AccessFs::from_file(self.abi);
         }
-        if !SYSTEM.iter().any(|dir| program.starts_with(dir)) {
-            bind("--ro-bind", program, program);
+        if access.is_empty() {
+            return Ok(());
         }
-        args.extend(["--dev", "/dev"].map(OsString::from));
-        if jail.gpu {
-            for device in &sandbox.gpu {
-                args.push("--dev-bind-try".into());
-                args.push(device.into());
-                args.push(device.into());
-            }
-            for dir in GPU_READS {
-                args.push("--ro-bind-try".into());
-                args.push(dir.into());
-                args.push(dir.into());
-            }
-        }
-        for dir in &jail.reads {
-            let dir = std::path::absolute(dir)?;
-            args.extend(["--ro-bind".into(), dir.clone().into(), dir.into()]);
-        }
-        for dir in &jail.writes {
-            let dir = std::path::absolute(dir)?;
-            args.extend(["--bind".into(), dir.clone().into(), dir.into()]);
-        }
-        for input in &jail.inputs {
-            let Some(file) = open_input(input, sandbox, jail)? else {
-                continue;
-            };
-            args.push("--ro-bind-fd".into());
-            args.push(file.as_raw_fd().to_string().into());
-            args.push(std::path::absolute(input)?.into());
-            keep.push(file);
-        }
-        for filter in &self.filters {
-            let (reader, mut writer) = std::io::pipe()?;
-            writer.write_all(filter)?;
-            drop(writer);
-            let fd = OwnedFd::from(reader);
-            args.push("--add-seccomp-fd".into());
-            args.push(fd.as_raw_fd().to_string().into());
-            keep.push(fd);
-        }
-        args.extend(["--chdir", "/", "--remount-ro", "/"].map(OsString::from));
-        Ok(args)
+        (&mut self.ruleset)
+            .add_rule(PathBeneath::new(file, access))
+            .map_err(std::io::Error::other)?;
+        Ok(())
     }
 }
 
-/// `path`, opened to be bound into a run; `None` if it does not exist.
-fn open_input(path: &Path, sandbox: &Inner, jail: &Jail) -> std::io::Result<Option<OwnedFd>> {
+/// `path`, opened to be read in a run; `None` if it does not exist.
+fn open_input(path: &Path, sandbox: &Inner, jail: &Jail) -> std::io::Result<Option<File>> {
     let refused = |why: String| {
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -690,7 +908,7 @@ fn open_input(path: &Path, sandbox: &Inner, jail: &Jail) -> std::io::Result<Opti
     // Non-blocking: a FIFO in a library folder must not hang the open.
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
         .open(path)
     {
         Ok(file) => file,
@@ -715,14 +933,16 @@ fn open_input(path: &Path, sandbox: &Inner, jail: &Jail) -> std::io::Result<Opti
             real.display()
         )));
     }
-    Ok(Some(OwnedFd::from(file)))
+    Ok(Some(file))
 }
 
-/// The seccomp filters, as BPF for bwrap's `--add-seccomp-fd`: the calls
-/// refused with `EPERM`, then `clone3` refused with `ENOSYS`, so that the
-/// C library starts threads with `clone`, whose flags the first filter
-/// can see.
-fn filters() -> Result<Vec<Vec<u8>>, String> {
+/// The most instructions a seccomp filter may have (BPF_MAXINSNS).
+const BPF_MAXINSNS: usize = 4096;
+
+/// The seccomp filters: the calls refused with `EPERM`, then `clone3`
+/// refused with `ENOSYS`, so that the C library starts threads with
+/// `clone`, whose flags the first filter can see.
+fn filters() -> Result<Filters, String> {
     let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(|e| e.to_string())?;
     let refused = SeccompFilter::new(
         refused_calls().map_err(|e| e.to_string())?,
@@ -738,25 +958,22 @@ fn filters() -> Result<Vec<Vec<u8>>, String> {
         arch,
     )
     .map_err(|e| e.to_string())?;
-    [refused, clone3]
+    let programs = [refused, clone3]
         .into_iter()
         .map(|filter| {
-            let program: seccompiler::BpfProgram = filter
+            let program: BpfProgram = filter
                 .try_into()
                 .map_err(|e: seccompiler::BackendError| e.to_string())?;
-            Ok(program
-                .iter()
-                .flat_map(|op| {
-                    let mut bytes = Vec::with_capacity(8);
-                    bytes.extend(op.code.to_ne_bytes());
-                    bytes.push(op.jt);
-                    bytes.push(op.jf);
-                    bytes.extend(op.k.to_ne_bytes());
-                    bytes
-                })
-                .collect())
+            if program.is_empty() || program.len() > BPF_MAXINSNS {
+                return Err(format!(
+                    "a seccomp filter of {} instructions",
+                    program.len()
+                ));
+            }
+            Ok(program)
         })
-        .collect()
+        .collect::<Result<_, String>>()?;
+    Ok(Filters(programs))
 }
 
 /// The calls the first filter refuses: each always, or when its rule
@@ -776,7 +993,8 @@ fn refused_calls() -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::Backe
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
-        // Mounts and namespaces: the way out of a bubblewrap sandbox.
+        // Mounts and namespaces: a user namespace would give the run
+        // rights over a view of its own.
         libc::SYS_mount,
         libc::SYS_umount2,
         libc::SYS_pivot_root,
@@ -815,6 +1033,11 @@ fn refused_calls() -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::Backe
         libc::SYS_setdomainname,
         libc::SYS_vhangup,
         libc::SYS_fanotify_init,
+        // Connecting to anything: with no mount namespace the host's Unix
+        // sockets (D-Bus, the journal) are in plain sight, and Landlock
+        // leaves a pathname socket open before ABI 9. These programs make
+        // no connection; a socketpair needs none.
+        libc::SYS_connect,
     ] {
         calls.insert(call, Vec::new());
     }
@@ -838,7 +1061,7 @@ fn refused_calls() -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::Backe
             0,
         )?])?],
     );
-    // No network but Unix sockets; the namespace has none anyway.
+    // No network but Unix sockets.
     calls.insert(
         libc::SYS_socket,
         vec![SeccompRule::new(vec![SeccompCondition::new(
@@ -846,6 +1069,17 @@ fn refused_calls() -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::Backe
             SeccompCmpArgLen::Dword,
             SeccompCmpOp::Ne,
             libc::AF_UNIX as u64,
+        )?])?],
+    );
+    // Nor a datagram sent to a named socket without connecting: send(2)
+    // gives sendto(2) no address.
+    calls.insert(
+        libc::SYS_sendto,
+        vec![SeccompRule::new(vec![SeccompCondition::new(
+            4,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::Ne,
+            0,
         )?])?],
     );
     // Typing into the terminal the server was started from.
@@ -878,8 +1112,8 @@ mod tests {
     #[test]
     fn the_filters_compile_for_this_machine() {
         let filters = filters().unwrap();
-        assert_eq!(filters.len(), 2);
-        assert!(filters.iter().all(|f| !f.is_empty() && f.len() % 8 == 0));
+        assert_eq!(filters.0.len(), 2);
+        assert!(filters.0.iter().all(|f| !f.is_empty()));
     }
 
     #[test]
@@ -888,5 +1122,42 @@ mod tests {
         assert_eq!("auto".parse(), Ok(Mode::Auto));
         assert_eq!("off".parse(), Ok(Mode::Off));
         assert!("on".parse::<Mode>().is_err());
+    }
+
+    fn with(mode: Mode, abi: Result<i32, String>) -> Result<Sandbox, SandboxError> {
+        Sandbox::with_landlock(mode, abi, Vec::new(), Vec::new())
+    }
+
+    #[test]
+    fn required_refuses_a_kernel_without_landlock() {
+        let err = with(Mode::Required, Err("this kernel has no Landlock".into())).unwrap_err();
+        assert!(err.to_string().contains("no Landlock"), "{err}");
+    }
+
+    #[test]
+    fn required_refuses_a_landlock_that_cannot_refuse_truncation() {
+        let err = with(Mode::Required, Ok(2)).unwrap_err();
+        assert!(err.to_string().contains("ABI 2"), "{err}");
+    }
+
+    #[test]
+    fn auto_without_landlock_runs_with_seccomp_alone() {
+        let sandbox = with(Mode::Auto, Err("this kernel has no Landlock".into())).unwrap();
+        assert!(!sandbox.confines());
+        assert!(sandbox.0.seccomp.is_some());
+    }
+
+    #[test]
+    fn off_confines_nothing() {
+        let sandbox = with(Mode::Off, landlock_abi()).unwrap();
+        assert!(!sandbox.confines());
+        assert!(sandbox.0.seccomp.is_none());
+    }
+
+    #[test]
+    fn this_kernel_confines() {
+        let sandbox = with(Mode::Required, landlock_abi()).unwrap();
+        assert!(sandbox.landlock_abi().unwrap() >= MIN_LANDLOCK_ABI);
+        assert!(sandbox.0.seccomp.is_some());
     }
 }

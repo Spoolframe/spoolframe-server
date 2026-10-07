@@ -28,10 +28,11 @@ pub mod make;
 pub mod sheets;
 pub mod workers;
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use spoolframe_catalog::{Catalog, CatalogError, PreviewFrame};
@@ -319,7 +320,7 @@ impl Previews {
     }
 
     pub fn settings(&self) -> PreviewSettings {
-        self.settings.lock().expect("never poisoned").clone()
+        self.settings.lock().clone()
     }
 
     /// Use `settings` from now on. A new interval names new sets; a lower
@@ -327,7 +328,7 @@ impl Previews {
     /// at once, and with fewer the files being made are finished.
     pub fn set_settings(&self, settings: PreviewSettings) {
         self.cache.set_limit(settings.cache_limit_bytes);
-        let mut queue = self.queue.lock().expect("never poisoned");
+        let mut queue = self.queue.lock();
         match settings.when {
             When::Never => {
                 queue.urgent.clear();
@@ -342,7 +343,7 @@ impl Previews {
             When::Ahead => {}
         }
         drop(queue);
-        *self.settings.lock().expect("never poisoned") = settings;
+        *self.settings.lock() = settings;
         self.wake.notify_waiters();
     }
 
@@ -374,8 +375,8 @@ impl Previews {
         self.cache.total()
     }
 
-    fn lock_queue(&self) -> std::sync::MutexGuard<'_, Queue> {
-        self.queue.lock().expect("never poisoned")
+    fn lock_queue(&self) -> parking_lot::MutexGuard<'_, Queue> {
+        self.queue.lock()
     }
 
     fn enqueue(&self, id: &MediaId, urgent: bool) {
@@ -420,19 +421,10 @@ impl Previews {
             return Ok(PreviewState::None);
         };
         if let Some(meta) = self.cache.get(&key) {
-            self.shown
-                .lock()
-                .expect("never poisoned")
-                .insert(key.clone(), id.clone());
+            self.shown.lock().insert(key.clone(), id.clone());
             return Ok(PreviewState::Ready { key, meta });
         }
-        if settings.when == When::Never
-            || self
-                .failed
-                .lock()
-                .expect("never poisoned")
-                .contains_key(&key)
-        {
+        if settings.when == When::Never || self.failed.lock().contains_key(&key) {
             return Ok(PreviewState::None);
         }
         let mut queue = self.lock_queue();
@@ -460,12 +452,7 @@ impl Previews {
         if settings.when == When::Never {
             return Ok(PreviewPeek::None("previews are off (previews.when)"));
         }
-        if self
-            .failed
-            .lock()
-            .expect("never poisoned")
-            .contains_key(&key)
-        {
+        if self.failed.lock().contains_key(&key) {
             return Ok(PreviewPeek::None("they could not be made of this file"));
         }
         Ok(match self.lock_queue().progress(id) {
@@ -480,12 +467,7 @@ impl Previews {
     /// that, a sheet's id was enough to fetch it for as long as the cache
     /// kept it, after its library stopped being served too.
     pub async fn sheet(&self, key: &str, n: u32) -> Option<Vec<u8>> {
-        let shown = self
-            .shown
-            .lock()
-            .expect("never poisoned")
-            .get(key)
-            .cloned()?;
+        let shown = self.shown.lock().get(key).cloned()?;
         let still = match self.sources.catalog.media_path(&shown).await {
             Ok(path) => self::key(&path, self.settings().interval)
                 .await
@@ -493,7 +475,7 @@ impl Previews {
             Err(_) => false,
         };
         if !still {
-            self.shown.lock().expect("never poisoned").remove(key);
+            self.shown.lock().remove(key);
             return None;
         }
         self.cache.sheet(key, n).await
@@ -603,10 +585,7 @@ impl Previews {
             Err(_) if self.stopped.load(Ordering::SeqCst) => Ok(()),
             Err(reason) => {
                 self.failures.inc();
-                self.failed
-                    .lock()
-                    .expect("never poisoned")
-                    .insert(key, reason.clone());
+                self.failed.lock().insert(key, reason.clone());
                 Err(reason)
             }
         }

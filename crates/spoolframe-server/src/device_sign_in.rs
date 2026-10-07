@@ -15,9 +15,9 @@
 //! Pending sign-ins are only in memory: a restart drops them, and the TV
 //! begins again.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::clock::Clock;
@@ -230,8 +230,8 @@ impl DeviceSignIns {
         self.lifetime
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        let mut inner = self.inner.lock().expect("never held across a panic");
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Inner> {
+        let mut inner = self.inner.lock();
         inner.sweep(self.clock.now());
         inner
     }

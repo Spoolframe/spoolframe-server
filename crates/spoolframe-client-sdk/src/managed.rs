@@ -5,9 +5,10 @@
 //! is best effort and cannot run after runtime shutdown.
 use crate::{Chunk, Playback, PlaybackChange, PlaybackOptions, SdkError, Session};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use spoolframe_protocol::{BitmapSubtitles, PlaybackHandle, PlaybackPlan, Selection};
 use spoolframe_types::MediaId;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, broadcast, oneshot, watch};
 
@@ -219,12 +220,7 @@ impl ManagedPlayback {
         Self(inner)
     }
     pub fn snapshot(&self) -> Playback {
-        self.0
-            .state
-            .lock()
-            .expect("playback state")
-            .playback
-            .clone()
+        self.0.state.lock().playback.clone()
     }
     pub fn changes(&self) -> watch::Receiver<Playback> {
         self.0.changed.subscribe()
@@ -234,7 +230,7 @@ impl ManagedPlayback {
         self.0.errors.subscribe()
     }
     pub fn report_position(&self, position: Duration) -> Result<(), SdkError> {
-        let mut state = self.0.state.lock().expect("playback state");
+        let mut state = self.0.state.lock();
         if state.finishing || state.closed {
             return Err(SdkError::PlaybackClosed);
         }
@@ -256,7 +252,7 @@ impl ManagedPlayback {
     }
     async fn flush_locked(&self) -> Result<(), SdkError> {
         let report = {
-            let mut state = self.0.state.lock().expect("playback state");
+            let mut state = self.0.state.lock();
             state
                 .pending
                 .take()
@@ -265,7 +261,7 @@ impl ManagedPlayback {
         if let Some((handle, position)) = report
             && let Err(error) = self.0.backend.progress(&handle, position).await
         {
-            let mut state = self.0.state.lock().expect("playback state");
+            let mut state = self.0.state.lock();
             if !state.closed && state.pending.is_none() {
                 state.pending = Some(position);
             }
@@ -274,7 +270,7 @@ impl ManagedPlayback {
         Ok(())
     }
     fn live(&self) -> Result<Playback, SdkError> {
-        let state = self.0.state.lock().expect("playback state");
+        let state = self.0.state.lock();
         if state.finishing || state.closed {
             Err(SdkError::PlaybackClosed)
         } else {
@@ -326,10 +322,10 @@ impl ManagedPlayback {
         if &before.handle != old {
             return Ok(());
         }
-        let selection = self.0.state.lock().expect("playback state").selection;
+        let selection = self.0.state.lock().selection;
         let options = PlaybackOptions {
             start: at,
-            ..self.0.state.lock().expect("playback state").options
+            ..self.0.state.lock().options
         };
         let mut admission = admitted(
             self.0.backend.clone(),
@@ -345,7 +341,7 @@ impl ManagedPlayback {
             return Err(SdkError::PlaybackChanged);
         }
         let next = admission.playback.take().expect("admitted playback");
-        self.0.state.lock().expect("playback state").playback = next.clone();
+        self.0.state.lock().playback = next.clone();
         self.0.changed.send_replace(next);
         Ok(())
     }
@@ -372,7 +368,7 @@ impl ManagedPlayback {
         }
         match self.0.backend.seek(&before.handle, position).await {
             Ok(epoch) => {
-                let mut state = self.0.state.lock().expect("playback state");
+                let mut state = self.0.state.lock();
                 state.playback.epoch = epoch;
                 let next = state.playback.clone();
                 drop(state);
@@ -412,7 +408,7 @@ impl ManagedPlayback {
             .backend
             .subtitle(&p.handle, selected, bitmap, position)
             .await?;
-        let mut state = self.0.state.lock().expect("playback state");
+        let mut state = self.0.state.lock();
         state.playback.plan = changed.plan;
         state.playback.size = changed.size;
         state.playback.epoch = changed.epoch;
@@ -443,7 +439,7 @@ impl ManagedPlayback {
     async fn close_at_inner(&self, position: Option<Duration>) -> Result<(), SdkError> {
         let _control = self.0.control.lock().await;
         {
-            let mut state = self.0.state.lock().expect("playback state");
+            let mut state = self.0.state.lock();
             if state.closed {
                 return Ok(());
             }
@@ -455,7 +451,7 @@ impl ManagedPlayback {
         let progress = self.flush_locked().await;
         let stop = self.0.backend.stop(&self.snapshot().handle).await;
         if stop.is_ok() {
-            let mut state = self.0.state.lock().expect("playback state");
+            let mut state = self.0.state.lock();
             state.closed = true;
             state.pending = None;
         }
@@ -465,7 +461,7 @@ impl ManagedPlayback {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.notify.notify_one();
-        let state = self.state.get_mut().expect("playback state");
+        let state = self.state.get_mut();
         if state.closed {
             return;
         }
@@ -587,12 +583,11 @@ mod tests {
             }
             self.events
                 .lock()
-                .unwrap()
                 .push(format!("progress:{}:{}", h.0, p.as_secs()));
             Ok(())
         }
         async fn stop(&self, h: &PlaybackHandle) -> Result<(), SdkError> {
-            self.events.lock().unwrap().push(format!("stop:{}", h.0));
+            self.events.lock().push(format!("stop:{}", h.0));
             self.entered.notify_one();
             Ok(())
         }
@@ -620,7 +615,7 @@ mod tests {
         task.abort();
         let _ = task.await;
         b.release.notify_one();
-        until(|| b.events.lock().unwrap().contains(&"stop:1".into())).await;
+        until(|| b.events.lock().contains(&"stop:1".into())).await;
     }
     #[tokio::test]
     async fn concurrent_expiry_replaces_one_handle_for_reads_and_progress() {
@@ -641,7 +636,7 @@ mod tests {
             Err(SdkError::PlaybackRestarted { epoch: 0 })
         );
         p.finish(Duration::from_secs(90)).await.unwrap();
-        assert_eq!(*b.events.lock().unwrap(), vec!["progress:2:90", "stop:2"]);
+        assert_eq!(*b.events.lock(), vec!["progress:2:90", "stop:2"]);
     }
     /// An admin's Stop (P3-15) is the end: the playback is not started
     /// again behind the viewer's back, as an expired one is.
@@ -661,13 +656,13 @@ mod tests {
         p.report_position(Duration::from_secs(10)).unwrap();
         p.report_position(Duration::from_secs(20)).unwrap();
         p.finish(Duration::from_secs(30)).await.unwrap();
-        assert_eq!(*b.events.lock().unwrap(), vec!["progress:1:30", "stop:1"]);
+        assert_eq!(*b.events.lock(), vec!["progress:1:30", "stop:1"]);
         assert_eq!(
             p.report_position(Duration::ZERO),
             Err(SdkError::PlaybackClosed)
         );
         p.close().await.unwrap();
-        assert_eq!(b.events.lock().unwrap().len(), 2);
+        assert_eq!(b.events.lock().len(), 2);
     }
     #[tokio::test]
     async fn cancelling_seek_still_installs_the_new_epoch() {
@@ -693,9 +688,9 @@ mod tests {
         let p = open(b.clone()).await;
         let q = p.clone();
         drop(p);
-        assert!(b.events.lock().unwrap().is_empty());
+        assert!(b.events.lock().is_empty());
         drop(q);
-        until(|| b.events.lock().unwrap().contains(&"stop:1".into())).await;
+        until(|| b.events.lock().contains(&"stop:1".into())).await;
     }
     #[tokio::test]
     async fn pending_progress_does_not_block_recovery_on_seek() {
@@ -705,7 +700,7 @@ mod tests {
         b.expired.store(true, SeqCst);
         let next = p.seek(Duration::from_secs(60)).await.unwrap();
         assert_eq!(next.handle.0, "2");
-        assert_eq!(*b.events.lock().unwrap(), vec!["progress:2:10"]);
+        assert_eq!(*b.events.lock(), vec!["progress:2:10"]);
         p.close().await.unwrap();
     }
 }

@@ -7,9 +7,9 @@
 //! refused where the locked file sets it, and the catalog follows at once.
 //! A token is kept as a secret, never in a layer.
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use spoolframe_admin_api::{
     LibrariesOverview, LibraryEntry, LibraryPathCheck, LibraryStatus, PathMappingEntry,
@@ -296,7 +296,7 @@ fn read_titles(path: &Path) -> SectionTitles {
 }
 
 fn write_titles(path: &Path, titles: &SectionTitles) -> std::io::Result<()> {
-    let _one = TITLES_WRITE.lock().expect("never held across a panic");
+    let _one = TITLES_WRITE.lock();
     let partial = path.with_extension("json.partial");
     std::fs::write(&partial, serde_json::to_vec(titles)?)?;
     std::fs::rename(&partial, path)

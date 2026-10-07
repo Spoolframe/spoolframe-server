@@ -1,7 +1,8 @@
 //! Async exclusion per key, including cancellation-safe removal of idle locks.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -13,7 +14,7 @@ pub(crate) struct KeyedLocks {
 impl KeyedLocks {
     pub async fn lock(&self, key: &str) -> Guard<'_> {
         let lock = {
-            let mut entries = self.entries.lock().expect("never poisoned");
+            let mut entries = self.entries.lock();
             match entries.get(key).and_then(Weak::upgrade) {
                 Some(lock) => lock,
                 None => {
@@ -46,7 +47,7 @@ pub(crate) struct Guard<'a> {
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
         self.held.take();
-        let mut entries = self.owner.entries.lock().expect("never poisoned");
+        let mut entries = self.owner.entries.lock();
         if Arc::strong_count(&self.lock) == 1 {
             entries.remove(&self.key);
         }
@@ -74,10 +75,10 @@ mod tests {
         );
         let other = locks.lock("another image").await;
         drop(other);
-        assert_eq!(locks.entries.lock().unwrap().len(), 1);
+        assert_eq!(locks.entries.lock().len(), 1);
         drop(first);
-        assert!(locks.entries.lock().unwrap().is_empty());
+        assert!(locks.entries.lock().is_empty());
         drop(locks.lock("image").await);
-        assert!(locks.entries.lock().unwrap().is_empty());
+        assert!(locks.entries.lock().is_empty());
     }
 }

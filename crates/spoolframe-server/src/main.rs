@@ -342,10 +342,42 @@ fn media_sandbox(config: &ServerConfig, state_dir: &Path) -> Result<Sandbox> {
     hidden.extend(std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from));
     Ok(Sandbox::new(
         config.media.sandbox()?,
-        &config.media.bwrap(),
         hidden,
         sandbox::gpu_devices(vaapi, nvidia),
     )?)
+}
+
+/// Shows the media tools confined here, in this service's own sandbox
+/// (PX-11 finding 34): a confined ffprobe must be refused the state
+/// directory and loopback. `required` does not start without that shown;
+/// `auto` says so at the error level.
+async fn check_media_sandbox(
+    config: &ServerConfig,
+    ffprobe: &Tool,
+    state_dir: &Path,
+) -> Result<()> {
+    if !ffprobe.sandbox().confines() {
+        return Ok(());
+    }
+    match ffprobe.check_confined(state_dir).await {
+        Ok(shown) => {
+            tracing::info!("{shown}");
+            Ok(())
+        }
+        Err(reason) if config.media.sandbox()? == sandbox::Mode::Required => bail!(
+            "media.sandbox is \"required\", but the media tools cannot be shown to be confined: \
+             {reason}"
+        ),
+        Err(reason) => {
+            tracing::error!(
+                reason,
+                "MEDIA TOOLS MAY NOT BE CONFINED: a confined ffprobe was not refused the state \
+                 directory and loopback, as it should be. Set media.sandbox = \"required\" to \
+                 refuse to start then"
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn probe(catalog: &dyn Catalog, id: &MediaId, ffprobe: Tool) -> Result<()> {
@@ -397,6 +429,7 @@ async fn run(
     let sandbox = media_sandbox(config, state_dir)?;
     let ffmpeg = Tool::new(config.media.ffmpeg(), sandbox.clone());
     let ffprobe = Tool::new(config.media.ffprobe(), sandbox.clone());
+    check_media_sandbox(config, &ffprobe, state_dir).await?;
     let prober = Arc::new(Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT));
     let transcoding = Arc::new(Transcoding::new(
         Box::new(FfmpegCommand::new(ffmpeg.clone())),

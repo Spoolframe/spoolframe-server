@@ -16,8 +16,9 @@
 //! until [`RESUME_AHEAD`] is ready again, so playback resumes smoothly
 //! instead of stuttering block by block.
 
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{ManagedPlayback, SdkError as BackendError};
@@ -375,11 +376,7 @@ impl MediaReader {
                 reported = true;
                 state = shared.lock();
             }
-            state = shared
-                .changed
-                .wait_timeout(state, REPORT_EVERY)
-                .expect("reader state is never poisoned")
-                .0;
+            shared.changed.wait_for(&mut state, REPORT_EVERY);
         }
     }
 
@@ -406,7 +403,7 @@ impl MediaReader {
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().expect("reader state is never poisoned")
+        self.state.lock()
     }
 
     /// The last block of the file.
@@ -749,7 +746,7 @@ mod tests {
         let spawned = Arc::new(Mutex::new(0));
         let count = spawned.clone();
         let spawn: Spawn = Arc::new(move |future| {
-            *count.lock().unwrap() += 1;
+            *count.lock() += 1;
             drop(future);
         });
         (spawn, spawned)
@@ -775,7 +772,7 @@ mod tests {
             Some(Duration::from_secs(60)),
         );
         reader.prefetch(0);
-        assert_eq!(*spawned.lock().unwrap(), MAX_IN_FLIGHT);
+        assert_eq!(*spawned.lock(), MAX_IN_FLIGHT);
         assert_eq!(reader.status().in_flight, MAX_IN_FLIGHT);
     }
 
@@ -830,7 +827,7 @@ mod tests {
         let first = Arc::new(Mutex::new(true));
         let threads = thread_spawn();
         let spawn: Spawn = Arc::new(move |future| {
-            if std::mem::replace(&mut *first.lock().unwrap(), false) {
+            if std::mem::replace(&mut *first.lock(), false) {
                 threads(future);
             } else {
                 drop(future);
@@ -892,7 +889,7 @@ mod tests {
         let spawn: Spawn = {
             let (fetches, threads) = (fetches.clone(), thread_spawn());
             Arc::new(move |future| {
-                *fetches.lock().unwrap() += 1;
+                *fetches.lock() += 1;
                 threads(future);
             })
         };
@@ -915,17 +912,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         reader.read(BLOCK, 100).unwrap();
-        let before = *fetches.lock().unwrap();
+        let before = *fetches.lock();
         let at = 4 * BLOCK + 10;
         assert_eq!(
             reader.read(at, 10).unwrap(),
             bytes[at as usize..at as usize + 10]
         );
-        assert_eq!(
-            *fetches.lock().unwrap(),
-            before,
-            "block 4 was fetched again"
-        );
+        assert_eq!(*fetches.lock(), before, "block 4 was fetched again");
     }
 
     /// A resume's read-ahead must not hold up the header: a read of block
@@ -951,7 +944,7 @@ mod tests {
         // Read-ahead far from the read takes every slot, and never arrives.
         reader.prefetch(50 * BLOCK);
         assert_eq!(reader.status().in_flight, MAX_IN_FLIGHT);
-        let before = *spawned.lock().unwrap();
+        let before = *spawned.lock();
         let reading = {
             let reader = reader.clone();
             std::thread::spawn(move || reader.read(0, 10))
@@ -987,7 +980,7 @@ mod tests {
             Some(Duration::from_secs(60)),
         );
         reader.expect(50 * BLOCK);
-        assert_eq!(*spawned.lock().unwrap(), EXPECT_IN_FLIGHT);
+        assert_eq!(*spawned.lock(), EXPECT_IN_FLIGHT);
     }
 
     #[test]
@@ -1016,7 +1009,7 @@ mod tests {
         let shared = reader.shared.clone();
         drop(reader);
         shared.top_up(&shared.clone(), &mut shared.lock(), 0);
-        assert_eq!(*spawned.lock().unwrap(), 0);
+        assert_eq!(*spawned.lock(), 0);
     }
 
     #[test]

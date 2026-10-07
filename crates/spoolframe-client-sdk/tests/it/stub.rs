@@ -4,10 +4,11 @@
 //! side of a connection quietly died (an app suspended by iOS comes back
 //! to it), and it is worse than a lost path: nothing in QUIC times it out.
 
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
@@ -96,7 +97,7 @@ impl Stub {
     /// The connections open now stop answering for good; new ones answer.
     /// The server is alive, its old connections are not.
     pub fn kill_open_connections(&self) {
-        for conn in self.state.connections.lock().unwrap().iter() {
+        for conn in self.state.connections.lock().iter() {
             conn.store(true, Ordering::SeqCst);
         }
     }
@@ -114,12 +115,12 @@ impl Stub {
     /// Never answer a request of type `kind` (`"libraries"`), as a server
     /// that is slow at it; everything else, `Ping` too, is answered.
     pub fn stall(&self, kind: &str) {
-        self.state.stalled.lock().unwrap().insert(kind.to_owned());
+        self.state.stalled.lock().insert(kind.to_owned());
     }
 
     /// How many connections it has accepted.
     pub fn connections(&self) -> usize {
-        self.state.connections.lock().unwrap().len()
+        self.state.connections.lock().len()
     }
 
     /// How many requests of type `kind` arrived, answered or not.
@@ -130,23 +131,22 @@ impl Stub {
     /// Answer a session's `ServerAddresses` with `addrs`, whether the stub
     /// is bound there or not; a stranger's is `Unauthenticated`.
     pub fn tell(&self, addrs: &[SocketAddr]) {
-        *self.state.told.lock().unwrap() = addrs.to_vec();
+        *self.state.told.lock() = addrs.to_vec();
     }
 
     /// Say `url` is the server's web UI from now on.
     pub fn web_url(&self, url: &str) {
-        *self.state.web_url.lock().unwrap() = Some(url.to_owned());
+        *self.state.web_url.lock() = Some(url.to_owned());
     }
 
     pub fn body(&self, announced: u64, bytes: &[u8]) {
-        *self.state.body.lock().unwrap() = (announced, bytes.to_vec());
+        *self.state.body.lock() = (announced, bytes.to_vec());
     }
 
     pub fn invocations(&self, kind: &str) -> Vec<spoolframe_protocol::rpc::RpcRequest> {
         self.state
             .invocations
             .lock()
-            .unwrap()
             .iter()
             .filter(|(name, _)| name == kind)
             .map(|(_, request)| request.clone())
@@ -158,7 +158,6 @@ impl Stub {
         self.state
             .requests
             .lock()
-            .unwrap()
             .iter()
             .filter(|(_, k)| k == kind)
             .map(|(conn, _)| *conn)
@@ -178,7 +177,7 @@ async fn accept(endpoint: Endpoint, state: Arc<State>) {
         };
         let dead = Arc::new(AtomicBool::new(false));
         let index = {
-            let mut connections = state.connections.lock().unwrap();
+            let mut connections = state.connections.lock();
             connections.push(dead.clone());
             connections.len() - 1
         };
@@ -225,7 +224,7 @@ async fn stream(
     if stream_kind == bi::RESOURCE {
         use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
         let request: ResourceRequest = decode(&bytes).unwrap();
-        let (length, bytes) = state.body.lock().unwrap().clone();
+        let (length, bytes) = state.body.lock().clone();
         let metadata = match request {
             ResourceRequest::Media { revision, .. } => ResourceMetadata::Media {
                 size: length,
@@ -250,15 +249,11 @@ async fn stream(
     let wire: spoolframe_protocol::rpc::RpcRequest = decode(&bytes).unwrap();
     let kind = request_type(&spoolframe_protocol::codec::encode(&wire.envelope).unwrap())
         .unwrap_or_default();
-    state.requests.lock().unwrap().push((index, kind.clone()));
-    state
-        .invocations
-        .lock()
-        .unwrap()
-        .push((kind.clone(), wire.clone()));
+    state.requests.lock().push((index, kind.clone()));
+    state.invocations.lock().push((kind.clone(), wire.clone()));
     let silent = dead.load(Ordering::SeqCst)
         || state.frozen.load(Ordering::SeqCst)
-        || state.stalled.lock().unwrap().contains(&kind);
+        || state.stalled.lock().contains(&kind);
     if silent {
         // The stream stays open and unanswered for as long as the
         // connection lasts.
@@ -287,7 +282,7 @@ fn answer(
     state: &State,
     envelope: spoolframe_protocol::RequestEnvelope,
 ) -> Response {
-    let web_url = state.web_url.lock().unwrap().clone();
+    let web_url = state.web_url.lock().clone();
     // Made from its key: two stubs are two servers (PX-14).
     let server_id = spoolframe_protocol::ServerId::from_bytes(
         id.as_bytes()[..10].try_into().expect("a key is 32 bytes"),
@@ -298,7 +293,7 @@ fn answer(
             return Response::Err(Error::Unauthenticated);
         }
         Request::ServerAddresses => Reply::ServerAddresses {
-            addrs: state.told.lock().unwrap().clone(),
+            addrs: state.told.lock().clone(),
         },
         Request::Hello(_) => Reply::ServerInfo(ServerInfo {
             name: "Stub".into(),

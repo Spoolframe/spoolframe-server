@@ -16,9 +16,10 @@
 //! there: they are ended here, and nothing dials again until a call needs
 //! it. Refused as the server is full, the supervisor stops too.
 
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use iroh::EndpointId;
@@ -172,15 +173,12 @@ impl Link {
 
     /// Whether the server signed this device out of `session`.
     pub fn has_ended(&self, session: &SessionId) -> bool {
-        self.ended
-            .lock()
-            .expect("never poisoned")
-            .contains(&session.0)
+        self.ended.lock().contains(&session.0)
     }
 
     /// The server signed this device out of `sessions`.
     pub fn end(&self, sessions: impl IntoIterator<Item = String>) {
-        self.ended.lock().expect("never poisoned").extend(sessions);
+        self.ended.lock().extend(sessions);
     }
 
     /// The path of the connection now; `Unknown` without one.
@@ -193,7 +191,6 @@ impl Link {
     pub fn open(&self) -> Option<Arc<ServerConnection>> {
         self.current
             .lock()
-            .expect("never poisoned")
             .clone()
             .filter(|c| c.conn.close_reason().is_none())
     }
@@ -201,14 +198,14 @@ impl Link {
     /// What the server said in the latest connection's Hello; `None`
     /// before the first.
     pub fn info(&self) -> Option<ServerInfo> {
-        self.info.lock().expect("never poisoned").clone()
+        self.info.lock().clone()
     }
 
     fn set(&self, conn: Option<Arc<ServerConnection>>, state: ConnectionState) {
         if let Some(conn) = &conn {
-            *self.info.lock().expect("never poisoned") = Some(conn.info.clone());
+            *self.info.lock() = Some(conn.info.clone());
         }
-        *self.current.lock().expect("never poisoned") = conn;
+        *self.current.lock() = conn;
         self.state.send_replace(state);
     }
 
@@ -240,7 +237,7 @@ impl Link {
                     Arc::downgrade(&client.inner),
                     conn.clone(),
                 ));
-                *self.supervisor.lock().expect("never poisoned") = Some(task);
+                *self.supervisor.lock() = Some(task);
                 Ok(conn)
             }
             Err(e) => {
@@ -253,7 +250,6 @@ impl Link {
     fn supervised(&self) -> bool {
         self.supervisor
             .lock()
-            .expect("never poisoned")
             .as_ref()
             .is_some_and(|t| !t.is_finished())
     }
@@ -292,7 +288,7 @@ impl Link {
         tracing::info!(server = %self.id, "the connection stopped answering; dropping it");
         let supervised = self.supervised();
         {
-            let mut current = self.current.lock().expect("never poisoned");
+            let mut current = self.current.lock();
             if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn)) {
                 *current = None;
                 self.state.send_replace(if supervised {
@@ -307,10 +303,10 @@ impl Link {
 
     /// Stop: no more reconnects, and the connection closed.
     pub fn close(&self) {
-        if let Some(task) = self.supervisor.lock().expect("never poisoned").take() {
+        if let Some(task) = self.supervisor.lock().take() {
             task.abort();
         }
-        if let Some(conn) = self.current.lock().expect("never poisoned").take() {
+        if let Some(conn) = self.current.lock().take() {
             conn.conn.close(0u32.into(), b"closed");
         }
         self.state.send_replace(ConnectionState::Disconnected);

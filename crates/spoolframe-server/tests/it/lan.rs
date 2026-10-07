@@ -13,9 +13,10 @@
 
 use crate::support;
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -53,10 +54,7 @@ impl Listener {
             while let Some(event) = events.next().await {
                 if let DiscoveryEvent::Discovered { endpoint_info, .. } = event {
                     let data = endpoint_info.data.user_data().map(|u| u.to_string());
-                    record
-                        .lock()
-                        .unwrap()
-                        .insert(endpoint_info.endpoint_id, data);
+                    record.lock().insert(endpoint_info.endpoint_id, data);
                 }
             }
         });
@@ -64,7 +62,7 @@ impl Listener {
     }
 
     fn get(&self, id: &EndpointId) -> Option<Option<String>> {
-        self.heard.lock().unwrap().get(id).cloned()
+        self.heard.lock().get(id).cloned()
     }
 
     /// The user data `id` published, once it is heard.

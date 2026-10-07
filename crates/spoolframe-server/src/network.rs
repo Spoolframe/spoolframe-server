@@ -5,9 +5,10 @@
 //! Being on the LAN is never a reason to trust it: authority comes from a
 //! session (P1-12), as it will for remote clients.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use iroh::endpoint::{Connection, VarInt, presets};
 use iroh::endpoint_info::UserData;
@@ -108,10 +109,8 @@ impl Connections {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<usize, Arc<Peer>>> {
-        self.peers
-            .lock()
-            .expect("the connections lock is never held across a panic")
+    fn lock(&self) -> parking_lot::MutexGuard<'_, HashMap<usize, Arc<Peer>>> {
+        self.peers.lock()
     }
 
     pub(crate) fn admission(&self) -> Admission {

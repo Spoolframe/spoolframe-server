@@ -7,8 +7,9 @@
 pub mod composite;
 pub mod ids;
 
+use parking_lot::RwLock;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use spoolframe_catalog::{
@@ -37,7 +38,7 @@ impl LiveCatalog {
     /// The Plex servers and libraries now. A call in progress keeps the
     /// ones it began with.
     pub fn composite(&self) -> Option<Arc<Composite>> {
-        self.now.read().expect("never held across a panic").clone()
+        self.now.read().clone()
     }
 
     /// The first Plex server's catalog now: the one PX-04's watch sync and
@@ -48,7 +49,7 @@ impl LiveCatalog {
 
     /// Serve from `now` from now on; `None` is not set up.
     pub fn replace(&self, now: Option<Arc<Composite>>) {
-        *self.now.write().expect("never held across a panic") = now;
+        *self.now.write() = now;
     }
 
     fn current(&self) -> Result<Arc<Composite>, CatalogError> {

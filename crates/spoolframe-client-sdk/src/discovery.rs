@@ -6,9 +6,10 @@
 //! client. Records are untrusted hints: where to dial and which key to
 //! expect. Iroh proves the key on connect.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use futures_util::StreamExt;
 use iroh::EndpointId;
@@ -46,7 +47,7 @@ impl Discovery {
         let notify = changes.clone();
         let task = tokio::spawn(async move {
             while let Some(event) = events.next().await {
-                let mut map = map.lock().expect("never poisoned");
+                let mut map = map.lock();
                 let changed = match event {
                     DiscoveryEvent::Discovered { endpoint_info, .. } => {
                         let Some(advert) = endpoint_info
@@ -98,18 +99,18 @@ impl Discovery {
     }
 
     pub fn heard(&self) -> HashMap<EndpointId, Heard> {
-        self.heard.lock().expect("never poisoned").clone()
+        self.heard.lock().clone()
     }
 
     /// `id` answered at `addrs`: newer than its last record, if it has one.
     pub fn refresh(&self, id: &EndpointId, addrs: &[SocketAddr]) {
-        if let Some(heard) = self.heard.lock().expect("never poisoned").get_mut(id) {
+        if let Some(heard) = self.heard.lock().get_mut(id) {
             heard.addrs = addrs.to_vec();
         }
     }
 
     pub fn get(&self, id: &EndpointId) -> Option<Heard> {
-        self.heard.lock().expect("never poisoned").get(id).cloned()
+        self.heard.lock().get(id).cloned()
     }
 }
 

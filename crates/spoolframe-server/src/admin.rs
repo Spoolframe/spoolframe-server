@@ -495,12 +495,12 @@ pub(crate) struct AdminApi {
     /// Each library's last path check (P3-16).
     checks: Arc<PathChecks>,
     /// The plex.tv PINs this server began, so a check is only of those.
-    pins: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    pins: Arc<parking_lot::Mutex<std::collections::HashSet<u64>>>,
     /// The account token the wizard's last Sign in with Plex got: whose
     /// servers the wizard offers before anyone has linked an account. In
     /// memory only; `plex.token` keeps it too, until the token of the
     /// server chosen replaces it.
-    signed_in: Arc<std::sync::Mutex<Option<String>>>,
+    signed_in: Arc<parking_lot::Mutex<Option<String>>>,
     /// Where browsers reach the web UI (`admin.public_url`), if anywhere.
     public_url: Option<String>,
 }
@@ -2690,10 +2690,7 @@ impl AdminApiServer for AdminApi {
             .begin(plex_forward(ext).as_deref())
             .await
             .map_err(|e| error(error_code::UNAVAILABLE, e.to_string()))?;
-        self.pins
-            .lock()
-            .expect("never held across a panic")
-            .insert(pin.id);
+        self.pins.lock().insert(pin.id);
         Ok(PlexPin {
             id: pin.id,
             auth_url: pin.auth_url,
@@ -2708,12 +2705,7 @@ impl AdminApiServer for AdminApi {
         keep_token: bool,
     ) -> RpcResult<PlexPinState> {
         let (settings, by) = self.settings_as_admin(ext).await?;
-        if !self
-            .pins
-            .lock()
-            .expect("never held across a panic")
-            .contains(&id)
-        {
+        if !self.pins.lock().contains(&id) {
             return Err(error(
                 error_code::INVALID_INPUT,
                 "not a PIN this server began",
@@ -2727,24 +2719,18 @@ impl AdminApiServer for AdminApi {
         let token = match state {
             PinState::Waiting => return Ok(PlexPinState::Waiting),
             PinState::Expired => {
-                self.pins
-                    .lock()
-                    .expect("never held across a panic")
-                    .remove(&id);
+                self.pins.lock().remove(&id);
                 return Ok(PlexPinState::Expired);
             }
             PinState::Linked(token) => token,
         };
-        self.pins
-            .lock()
-            .expect("never held across a panic")
-            .remove(&id);
+        self.pins.lock().remove(&id);
         // Signing in to add another server leaves the first one's token
         // alone: each server added takes its own from the account.
         if keep_token {
             settings.set(PLEX_TOKEN, &serde_json::Value::String(token.clone()), &by)?;
         }
-        *self.signed_in.lock().expect("never held across a panic") = Some(token.clone());
+        *self.signed_in.lock() = Some(token.clone());
         // Only for the page to say who; the token is kept either way.
         let account = plex_tv.account(&token).await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "cannot ask plex.tv whose token it is");
@@ -3186,10 +3172,7 @@ impl AdminApi {
 
     /// The account token the wizard's last Sign in with Plex got.
     fn wizard_sign_in(&self) -> Option<String> {
-        self.signed_in
-            .lock()
-            .expect("never held across a panic")
-            .clone()
+        self.signed_in.lock().clone()
     }
 
     /// The Plex servers `token`'s account reaches, asked of plex.tv.

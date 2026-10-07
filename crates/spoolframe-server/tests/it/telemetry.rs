@@ -2,8 +2,9 @@
 //! HTTP/protobuf, one over gRPC, and one that never answers. Nothing here
 //! reaches a real collector.
 
+use parking_lot::Mutex;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
@@ -50,7 +51,7 @@ async fn http_collector() -> (SocketAddr, Received) {
             "/v1/traces",
             post(|State(r): State<Received>, body: Bytes| async move {
                 let request = ExportTraceServiceRequest::decode(body).unwrap();
-                r.traces.lock().unwrap().push(request);
+                r.traces.lock().push(request);
                 protobuf_ok()
             }),
         )
@@ -58,7 +59,7 @@ async fn http_collector() -> (SocketAddr, Received) {
             "/v1/metrics",
             post(|State(r): State<Received>, body: Bytes| async move {
                 let request = ExportMetricsServiceRequest::decode(body).unwrap();
-                r.metrics.lock().unwrap().push(request);
+                r.metrics.lock().push(request);
                 protobuf_ok()
             }),
         )
@@ -66,7 +67,7 @@ async fn http_collector() -> (SocketAddr, Received) {
             "/v1/logs",
             post(|State(r): State<Received>, body: Bytes| async move {
                 let request = ExportLogsServiceRequest::decode(body).unwrap();
-                r.logs.lock().unwrap().push(request);
+                r.logs.lock().push(request);
                 protobuf_ok()
             }),
         )
@@ -85,7 +86,7 @@ impl TraceService for Traces {
         &self,
         request: tonic::Request<ExportTraceServiceRequest>,
     ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
-        self.0.traces.lock().unwrap().push(request.into_inner());
+        self.0.traces.lock().push(request.into_inner());
         Ok(tonic::Response::new(ExportTraceServiceResponse::default()))
     }
 }
@@ -221,13 +222,13 @@ async fn spans_metrics_and_logs_reach_an_http_collector_with_the_resource() {
     tracing::subscriber::with_default(subscriber, activity);
     telemetry.flush().await;
     until("a span, a log record and metrics arrive", || {
-        !received.traces.lock().unwrap().is_empty()
-            && !received.logs.lock().unwrap().is_empty()
-            && !received.metrics.lock().unwrap().is_empty()
+        !received.traces.lock().is_empty()
+            && !received.logs.lock().is_empty()
+            && !received.metrics.lock().is_empty()
     })
     .await;
 
-    let traces = received.traces.lock().unwrap().clone();
+    let traces = received.traces.lock().clone();
     let spans = &traces[0].resource_spans[0];
     assert_eq!(attributes(spans.resource.as_ref()), expected_resource());
     let names: Vec<_> = spans
@@ -238,7 +239,7 @@ async fn spans_metrics_and_logs_reach_an_http_collector_with_the_resource() {
         .collect();
     assert!(names.contains(&"client request"), "{names:?}");
 
-    let logs = received.logs.lock().unwrap().clone();
+    let logs = received.logs.lock().clone();
     let records = &logs[0].resource_logs[0];
     assert_eq!(attributes(records.resource.as_ref()), expected_resource());
     let bodies: Vec<_> = records
@@ -252,7 +253,7 @@ async fn spans_metrics_and_logs_reach_an_http_collector_with_the_resource() {
         .collect();
     assert!(bodies.contains(&"Plex server unavailable"), "{bodies:?}");
 
-    let exported = received.metrics.lock().unwrap().clone();
+    let exported = received.metrics.lock().clone();
     let resource_metrics = &exported[0].resource_metrics[0];
     assert_eq!(
         attributes(resource_metrics.resource.as_ref()),
@@ -294,10 +295,10 @@ async fn the_setup_code_is_never_exported() {
     });
     telemetry.flush().await;
     until("the warning after it arrives", || {
-        !received.logs.lock().unwrap().is_empty()
+        !received.logs.lock().is_empty()
     })
     .await;
-    let logs = format!("{:?}", received.logs.lock().unwrap());
+    let logs = format!("{:?}", received.logs.lock());
     assert!(logs.contains("Plex server unavailable"), "{logs}");
     assert!(!logs.contains(&code.to_string()), "{logs}");
     assert!(!logs.contains("setup code"), "{logs}");
@@ -315,11 +316,8 @@ async fn spans_reach_a_grpc_collector() {
     }));
     tracing::subscriber::with_default(subscriber, activity);
     telemetry.flush().await;
-    until("a span arrives", || {
-        !received.traces.lock().unwrap().is_empty()
-    })
-    .await;
-    let traces = received.traces.lock().unwrap().clone();
+    until("a span arrives", || !received.traces.lock().is_empty()).await;
+    let traces = received.traces.lock().clone();
     assert_eq!(
         attributes(traces[0].resource_spans[0].resource.as_ref()),
         expected_resource()
@@ -386,6 +384,6 @@ async fn with_no_endpoint_nothing_is_exported_and_turning_it_off_stops_it() {
     telemetry.apply(None);
     tracing::dispatcher::with_default(&dispatch, activity);
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(received.traces.lock().unwrap().is_empty());
-    assert!(received.logs.lock().unwrap().is_empty());
+    assert!(received.traces.lock().is_empty());
+    assert!(received.logs.lock().is_empty());
 }

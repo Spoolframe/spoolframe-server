@@ -5,8 +5,9 @@ pub mod args;
 pub mod hls;
 pub mod job;
 
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use spoolframe_media::encoders::Encoders;
@@ -210,7 +211,7 @@ impl Conversion {
     /// read or seek starts it again. The playback goes on until it runs out
     /// of what was written.
     pub fn end(&self) {
-        let current = self.current.lock().expect("never poisoned");
+        let current = self.current.lock();
         self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
         current.end();
     }
@@ -276,7 +277,7 @@ impl Conversion {
             .segments
             .as_ref()
             .ok_or_else(|| JobError::Prepare("not an HLS playback".into()))?;
-        let mut current = self.current.lock().expect("never poisoned");
+        let mut current = self.current.lock();
         let written = current.progress().borrow().last_segment;
         let head = written.unwrap_or(current.first_segment.saturating_sub(1));
         if self.ended() {
@@ -314,7 +315,7 @@ impl Conversion {
 
     /// The job running now.
     pub fn job(&self) -> Arc<EncodeJob> {
-        self.current.lock().expect("never poisoned").clone()
+        self.current.lock().clone()
     }
 
     /// Seek using the same timeline and keyframe alignment as a new
@@ -328,7 +329,7 @@ impl Conversion {
     /// restarts at a segment, [`Conversion::job_for_segment`]). Returns the
     /// new epoch.
     pub fn restart(&self, start: Duration, start_number: u32) -> Result<u32, JobError> {
-        let mut current = self.current.lock().expect("never poisoned");
+        let mut current = self.current.lock();
         if self.ended() {
             return Err(JobError::Prepare(ENDED.into()));
         }
@@ -355,7 +356,7 @@ impl Conversion {
 
 impl Drop for Conversion {
     fn drop(&mut self) {
-        self.current.lock().expect("never poisoned").stop();
+        self.current.lock().stop();
         if let Err(e) = std::fs::remove_dir_all(&self.dir)
             && e.kind() != std::io::ErrorKind::NotFound
         {

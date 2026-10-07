@@ -1,8 +1,9 @@
 //! The encoders this server can use (P2-02): detected at start and again
 //! on SIGHUP, read by the planner.
 
+use parking_lot::RwLock;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use spoolframe_media::encoders::{self, Encoders, Ffmpeg, TranscodeSettings};
 
@@ -38,10 +39,7 @@ impl Transcoding {
     }
 
     pub fn encoders(&self) -> Arc<Encoders> {
-        self.current
-            .read()
-            .expect("never held across a panic")
-            .clone()
+        self.current.read().clone()
     }
 
     /// Find what works now, and use it from here on.
@@ -56,7 +54,7 @@ impl Transcoding {
                 );
             }
         }
-        *self.current.write().expect("never held across a panic") = Arc::new(found);
+        *self.current.write() = Arc::new(found);
     }
 }
 

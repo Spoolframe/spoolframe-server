@@ -229,7 +229,8 @@ async fn one_conversion_too_many_is_busy() {
 }
 
 /// An app killed mid-film and opened again starts the film again: its
-/// abandoned encode must not hold the slot the new one needs.
+/// abandoned encode must not hold the slot the new one needs. With one
+/// slot the device cannot keep "now + next", and the new start wins.
 #[tokio::test]
 async fn a_device_starting_again_ends_its_earlier_encode() {
     let options = ServerOptions {
@@ -1369,6 +1370,86 @@ async fn a_failed_hls_segment_read_is_logged() {
             "no warning with {wanted} for {id}: {text}"
         );
     }
+    client.close().await;
+    server.stop().await;
+}
+
+/// An iOS app starts the next track 140 ms after this one, for gapless
+/// audio: this one's HLS must play on. The device keeps "now + next", so
+/// only a third start ends the first.
+#[tokio::test]
+async fn a_device_s_next_hls_playback_leaves_the_one_playing() {
+    let (server, client, session) = hls_ready("hls-next", hls_capabilities()).await;
+    let now = started(&client, &session, None).await;
+    segment(&client, &session, &now, 0).await;
+    let next = started(&client, &session, None).await;
+    assert!(!segment(&client, &session, &now, 1).await.is_empty());
+    assert!(!segment(&client, &session, &next, 1).await.is_empty());
+    // The third: the first is abandoned, and its slot is the third's.
+    let third = started(&client, &session, None).await;
+    let (response, _) = client
+        .media(MediaRead {
+            session: session.clone(),
+            handle: now.clone(),
+            offset: 0,
+            length: MAX_READ,
+            epoch: 0,
+            segment: Some(2),
+        })
+        .await;
+    assert!(
+        matches!(response, MediaReadResponse::Err(Error::PlaybackExpired)),
+        "{response:?}"
+    );
+    assert!(!segment(&client, &session, &next, 2).await.is_empty());
+    assert!(!segment(&client, &session, &third, 1).await.is_empty());
+    client.close().await;
+    server.stop().await;
+}
+
+/// AVPlayer refuses a segment over the variant's BANDWIDTH ("Segment
+/// exceeds specified bandwidth for variant", CoreMediaErrorDomain
+/// -12318). FLAC copied into HLS was declared at 640 kbit/s, under a
+/// third of what CD-quality FLAC is.
+#[tokio::test]
+async fn hls_of_copied_flac_declares_at_least_its_real_rate() {
+    let server = TestServer::start_with(
+        fresh_dir("hls-flac-bandwidth").await,
+        ServerOptions {
+            real_media: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_flac_noise(20);
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    let caps = ClientCapabilities {
+        audio: [spoolframe_types::AudioCodec::Flac].into(),
+        ..hls_capabilities()
+    };
+    client.hello_with(None, Some(caps)).await;
+    let session = client.login("alice", "correct horse").await;
+    let handle = started(&client, &session, None).await;
+    let declared = match m3u8_rs::parse_playlist_res(
+        manifest(&client, &session, &handle, ManifestKind::Multivariant)
+            .await
+            .as_bytes(),
+    ) {
+        Ok(m3u8_rs::Playlist::MasterPlaylist(p)) => p.variants[0].bandwidth,
+        other => panic!("not a multivariant playlist: {other:?}"),
+    };
+    let durations =
+        media_segments(&manifest(&client, &session, &handle, ManifestKind::Media).await);
+    let mut peak = 0f64;
+    for (n, secs) in (1..).zip(&durations) {
+        let bits = segment(&client, &session, &handle, n).await.len() as f64 * 8.0;
+        peak = peak.max(bits / f64::from(*secs));
+    }
+    assert!(
+        declared as f64 >= peak,
+        "BANDWIDTH={declared}, and a segment is {peak:.0} bit/s"
+    );
     client.close().await;
     server.stop().await;
 }

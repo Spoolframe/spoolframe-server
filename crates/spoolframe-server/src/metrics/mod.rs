@@ -12,9 +12,10 @@ pub mod history;
 pub mod process;
 mod prometheus;
 
+use parking_lot::RwLock;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 pub use prometheus::{CONTENT_TYPE, render};
@@ -146,7 +147,8 @@ pub struct MetricsAccess {
     enabled: AtomicBool,
     from: RwLock<AddressRanges>,
     /// Scrapes refused in the last hour, by address: when each was.
-    refused: std::sync::Mutex<std::collections::BTreeMap<IpAddr, std::collections::VecDeque<i64>>>,
+    refused:
+        parking_lot::Mutex<std::collections::BTreeMap<IpAddr, std::collections::VecDeque<i64>>>,
 }
 
 /// An address refused `GET /metrics` in the last hour.
@@ -171,7 +173,7 @@ impl Default for MetricsAccess {
 
 impl MetricsAccess {
     pub fn set(&self, enabled: bool, from: AddressRanges) {
-        *self.from.write().expect("never held across a panic") = from;
+        *self.from.write() = from;
         self.enabled.store(enabled, Ordering::Relaxed);
     }
 
@@ -184,7 +186,7 @@ impl MetricsAccess {
 
     /// A scrape from `ip` was refused, at `at` (Unix ms).
     pub fn refused(&self, ip: IpAddr, at: i64) {
-        let mut refused = self.refused.lock().expect("never held across a panic");
+        let mut refused = self.refused.lock();
         refused.entry(ip.to_canonical()).or_default().push_back(at);
         Self::prune(&mut refused, at);
         while refused.len() > Self::REFUSED_ADDRESSES {
@@ -213,7 +215,7 @@ impl MetricsAccess {
 
     /// Who was refused in the hour before `now`, most often first.
     pub fn refused_last_hour(&self, now: i64) -> Vec<Refused> {
-        let mut refused = self.refused.lock().expect("never held across a panic");
+        let mut refused = self.refused.lock();
         Self::prune(&mut refused, now);
         let mut list: Vec<Refused> = refused
             .iter()
@@ -229,10 +231,7 @@ impl MetricsAccess {
 
     /// Whether a scraper at `ip` may read them.
     pub fn allows(&self, ip: IpAddr) -> bool {
-        self.from
-            .read()
-            .expect("never held across a panic")
-            .contains(ip)
+        self.from.read().contains(ip)
     }
 }
 
@@ -330,8 +329,8 @@ impl Metrics {
         &self.access
     }
 
-    fn sources(&self) -> std::sync::RwLockWriteGuard<'_, Sources> {
-        self.sources.write().expect("never held across a panic")
+    fn sources(&self) -> parking_lot::RwLockWriteGuard<'_, Sources> {
+        self.sources.write()
     }
 
     /// Read the client protocol's parts, and its open connections.
@@ -356,7 +355,7 @@ impl Metrics {
 
     /// Count live sessions from `store`, at each [`Metrics::refresh`].
     pub fn observe_store(&self, store: Store) {
-        *self.store.write().expect("never held across a panic") = Some(store);
+        *self.store.write() = Some(store);
     }
 
     /// An admin API socket opened: counted until the guard is dropped.
@@ -367,17 +366,13 @@ impl Metrics {
 
     /// Read what is too slow to read at a scrape: the live sessions.
     pub async fn refresh(&self) {
-        let store = self
-            .store
-            .read()
-            .expect("never held across a panic")
-            .clone();
+        let store = self.store.read().clone();
         let Some(store) = store else {
             return;
         };
         match store.live_session_counts().await {
             Ok(counts) => {
-                *self.sessions.write().expect("never held across a panic") = counts
+                *self.sessions.write() = counts
                     .into_iter()
                     .map(|(user, app, web)| UserSessions { user, app, web })
                     .collect();
@@ -388,10 +383,7 @@ impl Metrics {
 
     /// Live sessions per user, as last read.
     pub fn sessions(&self) -> Vec<UserSessions> {
-        self.sessions
-            .read()
-            .expect("never held across a panic")
-            .clone()
+        self.sessions.read().clone()
     }
 
     /// Refresh, and keep a reading in the history (P3-14): what the
@@ -415,7 +407,7 @@ impl Metrics {
 
     /// Each Plex server: its id, its name, and its requests.
     pub fn plex_servers(&self) -> Vec<(String, String, spoolframe_plex::RequestCounts)> {
-        let sources = self.sources.read().expect("never held across a panic");
+        let sources = self.sources.read();
         let Some(composite) = sources.catalog.as_ref().and_then(|c| c.composite()) else {
             return Vec::new();
         };
@@ -495,7 +487,7 @@ impl Metrics {
     }
 
     fn connections(&self, families: &mut Vec<Family>) {
-        let sources = self.sources.read().expect("never held across a panic");
+        let sources = self.sources.read();
         let app = sources
             .connections
             .as_ref()
@@ -533,7 +525,7 @@ impl Metrics {
     }
 
     fn playbacks(&self, families: &mut Vec<Family>) {
-        let sources = self.sources.read().expect("never held across a panic");
+        let sources = self.sources.read();
         let counts = sources
             .playbacks
             .as_ref()
@@ -575,7 +567,7 @@ impl Metrics {
     }
 
     fn conversions(&self, families: &mut Vec<Family>) {
-        let sources = self.sources.read().expect("never held across a panic");
+        let sources = self.sources.read();
         let counts = sources
             .jobs
             .as_ref()
@@ -614,7 +606,7 @@ impl Metrics {
     }
 
     fn reads(&self, families: &mut Vec<Family>) {
-        let sources = self.sources.read().expect("never held across a panic");
+        let sources = self.sources.read();
         families.push(Family::single(
             "spoolframe_media_reads_total",
             "MEDIA range reads served.",
@@ -653,7 +645,7 @@ impl Metrics {
     }
 
     fn plex(&self, families: &mut Vec<Family>) {
-        let sources = self.sources.read().expect("never held across a panic");
+        let sources = self.sources.read();
         let mut requests = Vec::new();
         let mut errors = Vec::new();
         let mut latency = Vec::new();
@@ -708,7 +700,7 @@ impl Metrics {
     }
 
     fn background(&self, families: &mut Vec<Family>) {
-        let sources = self.sources.read().expect("never held across a panic");
+        let sources = self.sources.read();
         let previews = sources
             .previews
             .as_ref()

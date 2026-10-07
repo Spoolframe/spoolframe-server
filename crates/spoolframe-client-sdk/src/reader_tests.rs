@@ -3,13 +3,14 @@ use crate::{
     Chunk, ManagedPlayback, Playback, PlaybackBackend, PlaybackChange, PlaybackOptions, SdkError,
 };
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use spoolframe_protocol::{BitmapSubtitles, PlaybackHandle, PlaybackPlan, Selection};
 use spoolframe_types::{Container, Delivery, MediaId, MediaKind, Namespace};
 use std::{
     collections::HashMap,
     future::Future,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -160,14 +161,14 @@ impl PlaybackBackend for TestBackend {
         _: Option<Selection>,
         _: PlaybackOptions,
     ) -> Result<Playback, SdkError> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock();
         s.next += 1;
         let handle = s.next.to_string();
         s.handles.insert(handle.clone(), (0, 0));
         Ok(self.playback(PlaybackHandle(handle), 0))
     }
     async fn read(&self, h: &PlaybackHandle, o: u64, n: u64) -> Result<Vec<u8>, SdkError> {
-        if !self.state.lock().unwrap().handles.contains_key(&h.0) {
+        if !self.state.lock().handles.contains_key(&h.0) {
             return Err(SdkError::PlaybackExpired);
         }
         let from = o.min(self.bytes.len() as u64) as usize;
@@ -183,7 +184,7 @@ impl PlaybackBackend for TestBackend {
         o: u64,
         n: u64,
     ) -> Result<Chunk, SdkError> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock();
         let (epoch, written) = s.handles.get_mut(&h.0).ok_or(SdkError::PlaybackExpired)?;
         if *epoch != e {
             return Err(SdkError::PlaybackRestarted { epoch: *epoch });
@@ -201,7 +202,7 @@ impl PlaybackBackend for TestBackend {
         })
     }
     async fn seek(&self, h: &PlaybackHandle, _: Duration) -> Result<u32, SdkError> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock();
         let (epoch, written) = s.handles.get_mut(&h.0).ok_or(SdkError::PlaybackExpired)?;
         *epoch += 1;
         *written = 0;
@@ -222,7 +223,7 @@ impl PlaybackBackend for TestBackend {
         Ok(())
     }
     async fn stop(&self, h: &PlaybackHandle) -> Result<(), SdkError> {
-        self.state.lock().unwrap().handles.remove(&h.0);
+        self.state.lock().handles.remove(&h.0);
         Ok(())
     }
 }

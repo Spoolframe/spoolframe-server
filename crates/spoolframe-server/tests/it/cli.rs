@@ -79,7 +79,7 @@ fn closed_port_url() -> String {
 
 /// A running server, stopped with SIGTERM when dropped, and everything it
 /// has logged.
-struct Running(Child, std::sync::Arc<std::sync::Mutex<String>>);
+struct Running(Child, std::sync::Arc<parking_lot::Mutex<String>>);
 
 impl Running {
     /// Start a server and wait until both its endpoint and admin API are
@@ -113,11 +113,11 @@ impl Running {
             }
         }
         // Keep reading so the server never blocks on a full pipe.
-        let kept = std::sync::Arc::new(std::sync::Mutex::new(log.clone()));
+        let kept = std::sync::Arc::new(parking_lot::Mutex::new(log.clone()));
         let more = kept.clone();
         std::thread::spawn(move || {
             for line in lines.map_while(Result::ok) {
-                let mut kept = more.lock().unwrap();
+                let mut kept = more.lock();
                 kept.push_str(&line);
                 kept.push('\n');
             }
@@ -127,7 +127,7 @@ impl Running {
 
     /// Everything logged so far.
     fn log(&self) -> String {
-        self.1.lock().unwrap().clone()
+        self.1.lock().clone()
     }
 
     /// Everything logged once `needle` is, waiting up to 10 seconds for
@@ -243,41 +243,49 @@ fn with_media(config: &Path, media: &str) {
     std::fs::write(config, text).unwrap();
 }
 
-/// PX-11 finding 34: with bubblewrap on PATH (the dev shell's), the media
-/// tools run confined without being asked.
+/// PX-11 finding 34: on a kernel with Landlock the media tools run
+/// confined without being asked, and the server shows it at start: a
+/// confined ffprobe could neither read its state directory nor connect
+/// to a listener on loopback.
 #[tokio::test]
 async fn the_media_tools_run_confined_by_default() {
     let (_tmp, config) = config_with_state("sandbox-auto", &closed_port_url()).await;
     let (running, log) = Running::start(&config);
-    assert!(log.contains("media tools run confined"), "{log}");
+    assert!(
+        log.contains("media tools run confined: Landlock ABI"),
+        "{log}"
+    );
+    assert!(log.contains("a confined ffprobe"), "{log}");
+    assert!(log.contains("could not read"), "{log}");
     assert!(running.stop().success());
 }
 
-/// "required" refuses to start rather than run them unconfined.
+/// "required" refuses to start when the start check cannot show the
+/// tools confined: here ffprobe cannot run at all.
 #[tokio::test]
-async fn a_required_sandbox_without_bubblewrap_does_not_start() {
+async fn a_required_sandbox_that_cannot_be_shown_to_confine_does_not_start() {
     let (_tmp, config) = config_with_state("sandbox-required", &closed_port_url()).await;
     with_media(
         &config,
-        r#"sandbox = "required"; bwrap = "/nonexistent/bwrap";"#,
+        r#"sandbox = "required"; ffprobe = "/nonexistent/ffprobe";"#,
     );
     let output = server_with(&config).output().expect("the binary runs");
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(r#"media.sandbox is "required", but /nonexistent/bwrap cannot confine"#),
+        stderr.contains(r#"media.sandbox is "required", but"#),
         "{stderr}"
     );
+    assert!(stderr.contains("/nonexistent/ffprobe"), "{stderr}");
 }
 
-/// "auto" starts unconfined where bubblewrap does not work, and says so
-/// at the error level.
+/// "auto" starts all the same, and says so at the error level.
 #[tokio::test]
-async fn an_auto_sandbox_without_bubblewrap_starts_and_says_the_tools_are_unconfined() {
+async fn an_auto_sandbox_that_cannot_be_shown_to_confine_starts_and_says_so() {
     let (_tmp, config) = config_with_state("sandbox-fallback", &closed_port_url()).await;
-    with_media(&config, r#"bwrap = "/nonexistent/bwrap";"#);
+    with_media(&config, r#"ffprobe = "/nonexistent/ffprobe";"#);
     let (running, log) = Running::start(&config);
-    assert!(log.contains("MEDIA TOOLS RUN UNCONFINED"), "{log}");
+    assert!(log.contains("MEDIA TOOLS MAY NOT BE CONFINED"), "{log}");
     assert!(log.contains("ERROR"), "{log}");
     assert!(running.stop().success());
 }

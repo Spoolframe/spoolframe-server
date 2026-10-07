@@ -5,10 +5,10 @@
 //! an entry reserves what its kind of reply can be, not the largest frame,
 //! and each endpoint and each user may hold only a share of the pool.
 
+use parking_lot::Mutex;
 use spoolframe_protocol::rpc::{OPERATION_WINDOW_MS, Operation, RpcReply};
 use spoolframe_protocol::{Error, Request, Response};
 use std::collections::HashMap;
-use std::sync::Mutex;
 use tokio::sync::watch;
 
 const MAX_OPERATIONS: usize = 4096;
@@ -114,7 +114,7 @@ impl Operations {
         now: u64,
     ) -> Result<Option<Invocation>, Error> {
         Self::validate(instance, operation, now)?;
-        let mut entries = self.entries.lock().expect("never poisoned");
+        let mut entries = self.entries.lock();
         entries.retain(|_, entry| entry.expires > now);
         let Some(entry) = entries.get(&(endpoint.to_owned(), operation.id.clone())) else {
             return Ok(None);
@@ -165,7 +165,7 @@ impl Operations {
     ) -> Result<Invocation, Error> {
         Self::validate(instance, operation, now)?;
         let key = (owner.endpoint.to_owned(), operation.id.clone());
-        let mut entries = self.entries.lock().expect("never poisoned");
+        let mut entries = self.entries.lock();
         entries.retain(|_, entry| entry.expires > now);
         if let Some(entry) = entries.get(&key) {
             if entry.fingerprint != fingerprint {
@@ -252,7 +252,7 @@ impl Operations {
                 SMALL_REPLY
             }
         };
-        let mut entries = self.entries.lock().expect("never poisoned");
+        let mut entries = self.entries.lock();
         if let Some(entry) = entries.get_mut(&(endpoint.to_owned(), id.to_owned())) {
             entry.bytes = bytes;
             if let Some(kept) = self.kept_ms {

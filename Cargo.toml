@@ -25,6 +25,10 @@ snmalloc-rs = { version = "0.7.5", default-features = false, features = ["build_
 # A test's own directory under a random name, removed with it, so tests
 # running at once never share one.
 tmpdir = "1"
+# Locks that do not poison (PX-10): a panic while one is held, say from a
+# parser bug a fuzzer found, must not make every later lock panic too.
+# Already in the build through iroh and tokio.
+parking_lot = "0.12.5"
 # Internal crates
 spoolframe-types = { path = "crates/spoolframe-types" }
 spoolframe-policy = { path = "crates/spoolframe-policy" }
@@ -34,6 +38,7 @@ spoolframe-media = { path = "crates/spoolframe-media" }
 spoolframe-protocol = { path = "crates/spoolframe-protocol" }
 spoolframe-admin-api = { path = "crates/spoolframe-admin-api" }
 spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk" }
+spoolframe-probe = { path = "crates/spoolframe-probe" }
 spoolframe-test-dir = { path = "crates/spoolframe-test-dir" }
 
 # Vendored (vendor/easy-ffprobe/VENDORED.md). Only the typed model of
@@ -131,6 +136,9 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Pausing and resuming encodes (SIGSTOP/SIGCONT, P2-03).
 libc = "0.2"
+# The media tools' sandbox (PX-11 finding 34): Landlock rules and a seccomp
+# filter, set in the child between fork and exec.
+landlock = "0.4"
 seccompiler = "0.5"
 
 # Logging

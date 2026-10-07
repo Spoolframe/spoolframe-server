@@ -108,10 +108,10 @@ async fn a_pgs_track_reads_back_as_its_text_at_its_times() {
     let language = ocr
         .language_for(Some("eng"))
         .expect("the dev shell has English data");
-    let done = std::sync::Mutex::new(Vec::new());
+    let done = parking_lot::Mutex::new(Vec::new());
     let texts = ocr
         .recognise(&cues, &language, &dir.join("work"), 2, &|n| {
-            done.lock().unwrap().push(n)
+            done.lock().push(n)
         })
         .await
         .unwrap();
@@ -127,7 +127,7 @@ async fn a_pgs_track_reads_back_as_its_text_at_its_times() {
             (5_000, 7_250, "General Kenobi")
         ]
     );
-    assert_eq!(done.into_inner().unwrap().last(), Some(&2));
+    assert_eq!(done.into_inner().last(), Some(&2));
 }
 
 /// What VobSub and DVB samples show. VobSub's stop is in 1024/90000 s,

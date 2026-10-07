@@ -32,6 +32,7 @@ mod playback_debug;
 mod plex_link;
 mod plex_sync;
 mod previews;
+mod probe;
 mod profile;
 mod protocol;
 mod recent_admin;

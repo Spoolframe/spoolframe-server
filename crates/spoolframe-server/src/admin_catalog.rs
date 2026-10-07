@@ -18,10 +18,11 @@
 //! the catalog but reads the same, so the check stands; it is kept in the
 //! state directory, so it stands after a restart too.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::types::ErrorObjectOwned;
@@ -124,20 +125,20 @@ impl PathChecks {
         {
             tracing::warn!(path = %file.display(), error = %e, "cannot keep the last path check");
         }
-        *self.last_run.lock().expect("never held across a panic") = Some(kept);
+        *self.last_run.lock() = Some(kept);
     }
 
     /// The last check of every library, while what it read is the same
     /// as `basis`: one that read other mappings or folders says what they
     /// found, not what these would.
     pub fn last_run(&self, basis: &str) -> Option<PathCheckRun> {
-        let last = self.last_run.lock().expect("never held across a panic");
+        let last = self.last_run.lock();
         let kept = last.as_ref()?;
         (kept.basis == basis_hash(basis)).then(|| kept.run.clone())
     }
 
     fn current(&self, on: &Arc<Composite>, library: &str) -> Option<State> {
-        let entries = self.entries.lock().expect("never held across a panic");
+        let entries = self.entries.lock();
         let entry = entries.get(library)?;
         let same = entry.on.upgrade().is_some_and(|c| Arc::ptr_eq(&c, on));
         same.then(|| entry.state.clone())
@@ -166,19 +167,16 @@ impl PathChecks {
 
     /// Keep `check` as `library`'s on `on`, made just now.
     pub fn record(&self, on: &Arc<Composite>, library: &str, check: LibraryCheck) {
-        self.entries
-            .lock()
-            .expect("never held across a panic")
-            .insert(
-                library.to_owned(),
-                Entry {
-                    on: Arc::downgrade(on),
-                    state: State::Done {
-                        at: crate::store::now(),
-                        check: Arc::new(check),
-                    },
+        self.entries.lock().insert(
+            library.to_owned(),
+            Entry {
+                on: Arc::downgrade(on),
+                state: State::Done {
+                    at: crate::store::now(),
+                    check: Arc::new(check),
                 },
-            );
+            },
+        );
     }
 
     /// Check `library` on `on`, unless a check of it is running; with
@@ -192,7 +190,7 @@ impl PathChecks {
         let key = library.to_string();
         let now = crate::store::now();
         {
-            let mut entries = self.entries.lock().expect("never held across a panic");
+            let mut entries = self.entries.lock();
             let current = entries
                 .get(&key)
                 .filter(|e| e.on.upgrade().is_some_and(|c| Arc::ptr_eq(&c, on)));
@@ -226,7 +224,7 @@ impl PathChecks {
                                 }
                             }
                         };
-                        let mut entries = checks.entries.lock().expect("never held across a panic");
+                        let mut entries = checks.entries.lock();
                         // Only into the entry it was started for: a newer
                         // catalog's check is not replaced by an older one's.
                         if let Some(entry) = entries.get_mut(&key)

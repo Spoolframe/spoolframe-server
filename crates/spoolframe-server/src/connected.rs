@@ -2,8 +2,8 @@
 //! (P3-15): what playback debug's "Plan for…" offers beside the stored
 //! profiles. In memory; a connection's entry goes when it closes.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use spoolframe_protocol::Hello;
 use spoolframe_types::{ClientCapabilities, Platform};
@@ -26,8 +26,8 @@ pub struct ConnectedDevice {
 pub struct Connected(Mutex<HashMap<usize, ConnectedDevice>>);
 
 impl Connected {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<usize, ConnectedDevice>> {
-        self.0.lock().expect("never held across a panic")
+    fn lock(&self) -> parking_lot::MutexGuard<'_, HashMap<usize, ConnectedDevice>> {
+        self.0.lock()
     }
 
     /// Connection `id` from `endpoint` said `hello`.

@@ -6,9 +6,10 @@
 //! (`after`): the admin API has no subscriptions, and a poll every few
 //! seconds is what the page's other numbers do too.
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use spoolframe_admin_api::{LogLevel, LogLine, LogPage, LogQuery};
 use tracing::field::{Field, Visit};
@@ -73,8 +74,8 @@ impl LogRing {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Ring> {
-        self.inner.lock().expect("never held across a panic")
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Ring> {
+        self.inner.lock()
     }
 
     /// Keep the last `capacity` lines from now on: a smaller ring drops

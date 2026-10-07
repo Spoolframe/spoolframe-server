@@ -12,7 +12,9 @@
 //! Hello as itself with S's server id, relays `BeginPasskeySignIn` to S
 //! from its own endpoint and keeps the `FinishPasskeySignIn` it is sent.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointId, RelayMode};
@@ -152,7 +154,7 @@ async fn stream(
         // S's own answer, as M's.
         begin @ Request::BeginPasskeySignIn { .. } => upstream.call(None, begin).await,
         Request::FinishPasskeySignIn { signed, .. } => {
-            *kept.lock().unwrap() = Some(signed);
+            *kept.lock() = Some(signed);
             Response::Err(Error::InvalidCredentials)
         }
         _ => Response::Err(Error::Unsupported {
@@ -234,7 +236,7 @@ async fn a_passkey_sign_in_relayed_from_another_server_signs_no_one_in() {
             .unwrap_err(),
         SdkError::InvalidCredentials
     );
-    let relayed = relay.kept.lock().unwrap().take().expect("M kept it");
+    let relayed = relay.kept.lock().take().expect("M kept it");
 
     // M finishes on S, from the endpoint that began it.
     assert_eq!(

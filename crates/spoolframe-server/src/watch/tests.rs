@@ -395,6 +395,24 @@ async fn next_up_is_after_the_latest_watched_episode() {
     assert_eq!(ids(&h.home(h.alice).await.next_up), ["plex:episode:15"]);
 }
 
+/// A panic while the next-up cache is locked (PX-10) does not break Home
+/// for everyone after it: the lock does not poison.
+#[tokio::test]
+async fn next_up_works_after_a_panic_while_its_cache_was_locked() {
+    let h = harness("next-up-after-panic").await;
+    h.mark(h.alice, episode("12", "11", 1, 1).id(), true).await;
+    let panicked = std::thread::scope(|s| {
+        s.spawn(|| {
+            let _held = h.watch.next_up.lock();
+            panic!("a bug while the next-up cache is held");
+        })
+        .join()
+        .is_err()
+    });
+    assert!(panicked);
+    assert_eq!(ids(&h.home(h.alice).await.next_up), ["plex:episode:13"]);
+}
+
 /// A rewatch: the whole show was watched once, and the person is back at
 /// the start. Next up follows what they watched last, not the finale.
 #[tokio::test]

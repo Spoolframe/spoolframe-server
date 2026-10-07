@@ -716,7 +716,6 @@ mod tests {
             documented.media.sandbox().unwrap(),
             bare.media.sandbox().unwrap()
         );
-        assert_eq!(documented.media.bwrap(), bare.media.bwrap());
         assert_eq!(
             documented.transcode.settings().unwrap(),
             bare.transcode.settings().unwrap()

@@ -6,8 +6,9 @@
 //! applied: a live setting reaches the running server at once, a restart
 //! one waits for the next start and says so.
 
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use spoolframe_admin_api::{SettingApply, SettingEntry, SettingLayer, Settings};
 use spoolframe_plex::PlexCatalog;
@@ -188,10 +189,7 @@ impl RuntimeSettings {
 
     /// The layers now.
     pub fn layers(&self) -> Layers {
-        self.layers
-            .lock()
-            .expect("never held across a panic")
-            .clone()
+        self.layers.lock().clone()
     }
 
     pub fn secrets(&self) -> &Secrets {
@@ -336,7 +334,7 @@ impl RuntimeSettings {
         by: &str,
         change: impl FnOnce(&Layers) -> Result<Layers, SettingError>,
     ) -> Result<(), ChangeError> {
-        let mut layers = self.layers.lock().expect("never held across a panic");
+        let mut layers = self.layers.lock();
         let changed = change(&layers)?;
         if insecure_over_https(&changed) && !insecure_over_https(&layers) {
             return Err(SettingError::Invalid(ConfigError::Invalid {
@@ -376,7 +374,7 @@ impl RuntimeSettings {
         value: Option<&str>,
         by: &str,
     ) -> Result<(), ChangeError> {
-        let layers = self.layers.lock().expect("never held across a panic");
+        let layers = self.layers.lock();
         layers.server_token_changeable(server)?;
         let secret = plex_token_secret(server);
         match value {
@@ -509,7 +507,7 @@ impl RuntimeSettings {
         finish: bool,
         by: &str,
     ) -> Result<(Vec<String>, bool), ChangeError> {
-        let mut layers = self.layers.lock().expect("never held across a panic");
+        let mut layers = self.layers.lock();
         let (mut done, finished) = layers.setup();
         if let Some(step) = step
             && !done.iter().any(|d| d == step)

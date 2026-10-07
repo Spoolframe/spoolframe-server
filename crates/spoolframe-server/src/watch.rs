@@ -2,8 +2,9 @@
 //! started and watched, how often progress is written, and what Home
 //! shows. Storage is `crate::store::watch`.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use spoolframe_catalog::{Catalog, CatalogError};
@@ -41,7 +42,7 @@ pub struct Watch {
     catalog: Arc<dyn Catalog>,
     prober: Arc<Prober>,
     /// A live setting (P3-10): read at each use.
-    rules: std::sync::RwLock<WatchRules>,
+    rules: parking_lot::RwLock<WatchRules>,
     /// Each (principal, item)'s last progress write.
     written: Mutex<HashMap<(Principal, String), Written>>,
     next_up: Mutex<HashMap<Principal, (Instant, Vec<Item>)>>,
@@ -101,7 +102,7 @@ impl Watch {
             store,
             catalog,
             prober,
-            rules: std::sync::RwLock::new(rules),
+            rules: parking_lot::RwLock::new(rules),
             written: Mutex::default(),
             next_up: Mutex::default(),
             copies: Mutex::default(),
@@ -122,12 +123,12 @@ impl Watch {
 
     /// The rules now.
     pub fn rules(&self) -> WatchRules {
-        *self.rules.read().expect("never held across a panic")
+        *self.rules.read()
     }
 
     /// Judge by `rules` from now on (`watch { … }` changed at run time).
     pub fn set_rules(&self, rules: WatchRules) {
-        *self.rules.write().expect("never held across a panic") = rules;
+        *self.rules.write() = rules;
     }
 
     /// Fires after each state saved through [`Watch`], with its principal.
@@ -151,7 +152,6 @@ impl Watch {
         let recent = self
             .written
             .lock()
-            .expect("never held across a panic")
             .get(&key)
             .copied()
             .filter(|written| self.since(written.at) < self.rules().throttle);
@@ -183,16 +183,13 @@ impl Watch {
         let watched = self.rules().is_watched(position, duration, credits);
         self.save(principal, id, &found, Some(position), duration, watched)
             .await?;
-        self.written
-            .lock()
-            .expect("never held across a panic")
-            .insert(
-                key,
-                Written {
-                    at: self.now(),
-                    credits,
-                },
-            );
+        self.written.lock().insert(
+            key,
+            Written {
+                at: self.now(),
+                credits,
+            },
+        );
         Ok(())
     }
 
@@ -308,10 +305,7 @@ impl Watch {
             )
             .await?;
         // What is next up may have changed.
-        self.next_up
-            .lock()
-            .expect("never held across a panic")
-            .remove(&principal);
+        self.next_up.lock().remove(&principal);
         // Nobody listening is fine: nothing syncs.
         let _ = self.changed.send(principal);
         Ok(())
@@ -381,18 +375,12 @@ impl Watch {
         };
         let pair = (key.to_owned(), media_id.to_owned());
         let fresh = |at: &Instant| self.since(*at) < SAME_ITEM_CACHE;
-        if self
-            .copies
-            .lock()
-            .expect("never held across a panic")
-            .get(&pair)
-            .is_some_and(fresh)
-        {
+        if self.copies.lock().get(&pair).is_some_and(fresh) {
             return false;
         }
         match self.catalog.external_ids(&id).await {
             Ok(there) if there.iter().any(|id| external_ids.contains(id)) => {
-                let mut copies = self.copies.lock().expect("never held across a panic");
+                let mut copies = self.copies.lock();
                 copies.retain(|_, at| fresh(at));
                 copies.insert(pair, self.now());
                 false
@@ -524,11 +512,7 @@ impl Watch {
     /// show through the catalog, so it covers recent shows only, and is
     /// cached briefly.
     async fn next_up(&self, principal: Principal) -> Result<Vec<Item>, WatchError> {
-        if let Some((at, items)) = self
-            .next_up
-            .lock()
-            .expect("never held across a panic")
-            .get(&principal)
+        if let Some((at, items)) = self.next_up.lock().get(&principal)
             && self.since(*at) < self.rules().next_up_cache
         {
             return Ok(items.clone());
@@ -554,7 +538,6 @@ impl Watch {
         }
         self.next_up
             .lock()
-            .expect("never held across a panic")
             .insert(principal, (self.now(), next.clone()));
         Ok(next)
     }

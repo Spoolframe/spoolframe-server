@@ -504,7 +504,7 @@ impl WatchConfig {
 }
 
 /// `media { ffmpeg = "ffmpeg"; ffprobe = "ffprobe"; tesseract = "tesseract";
-/// sandbox = "auto"; bwrap = "bwrap"; }`, all optional: by default whatever
+/// sandbox = "auto"; }`, all optional: by default whatever
 /// is on `PATH`, which the nix package wraps.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
@@ -515,13 +515,10 @@ pub struct MediaConfig {
     pub ffprobe: Option<PathBuf>,
     #[ucl(default)]
     pub tesseract: Option<PathBuf>,
-    /// Whether the tools run confined by bubblewrap: `required`, `auto`
-    /// or `off` (PX-11 finding 34); `auto` if left out.
+    /// Whether the tools run confined by Landlock and seccomp: `required`,
+    /// `auto` or `off` (PX-11 finding 34); `auto` if left out.
     #[ucl(default)]
     pub sandbox: Option<String>,
-    /// bubblewrap; `bwrap` on `PATH` if left out.
-    #[ucl(default)]
-    pub bwrap: Option<PathBuf>,
 }
 
 impl MediaConfig {
@@ -535,10 +532,6 @@ impl MediaConfig {
                 key: "media.sandbox",
                 message,
             })
-    }
-
-    pub fn bwrap(&self) -> PathBuf {
-        self.bwrap.clone().unwrap_or_else(|| "bwrap".into())
     }
 
     pub fn ffmpeg(&self) -> PathBuf {
@@ -1683,7 +1676,6 @@ mod tests {
     fn the_media_tools_are_confined_when_they_can_be_by_default() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         assert_eq!(config.media.sandbox().unwrap(), SandboxMode::Auto);
-        assert_eq!(config.media.bwrap(), PathBuf::from("bwrap"));
         let config =
             plex(r#"plex { url = "http://nas:32400"; } media { sandbox = "required"; }"#).unwrap();
         assert_eq!(config.media.sandbox().unwrap(), SandboxMode::Required);

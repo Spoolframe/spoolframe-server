@@ -48,8 +48,8 @@
 //! username: those would tell anyone a user's credential ids. Passkeys are
 //! made discoverable, so the platform finds them.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -203,10 +203,7 @@ impl AppPasskeys {
         let nonce = nonce();
         let state = with_challenge(state, "rs", &app_passkey_challenge(server, &nonce))
             .map_err(CeremonyError::Internal)?;
-        let mut registrations = self
-            .registrations
-            .lock()
-            .expect("never held across a panic");
+        let mut registrations = self.registrations.lock();
         let now = self.clock.now();
         registrations.retain(|_, (_, expires_at)| *expires_at > now);
         let registration = Registration {
@@ -238,7 +235,6 @@ impl AppPasskeys {
         let state = self
             .registrations
             .lock()
-            .expect("never held across a panic")
             .remove(session)
             .filter(|(r, expires_at)| *expires_at > self.clock.now() && r.endpoint == endpoint)
             .map(|(r, _)| r.state)
@@ -275,7 +271,7 @@ impl AppPasskeys {
         let nonce = nonce();
         let state = with_challenge(state, "ast", &app_passkey_challenge(server, &nonce))
             .map_err(SignInError::Internal)?;
-        let mut sign_ins = self.sign_ins.lock().expect("never held across a panic");
+        let mut sign_ins = self.sign_ins.lock();
         let now = self.clock.now();
         sign_ins.retain(|_, (_, expires_at)| *expires_at > now);
         // Anyone can make an endpoint: they are counted, as the web's are.
@@ -308,7 +304,6 @@ impl AppPasskeys {
                 let (sign_in, _) = self
                     .sign_ins
                     .lock()
-                    .expect("never held across a panic")
                     .remove(endpoint)
                     .filter(|(_, expires_at)| *expires_at > self.clock.now())
                     .ok_or("the sign-in was not begun on this device, or is over")?;
@@ -357,7 +352,7 @@ impl AppPasskeys {
         let nonce = nonce();
         let state = with_challenge(state, "ast", &app_passkey_challenge(server, &nonce))
             .map_err(SignInError::Internal)?;
-        let mut confirms = self.confirms.lock().expect("never held across a panic");
+        let mut confirms = self.confirms.lock();
         let now = self.clock.now();
         confirms.retain(|_, (_, expires_at)| *expires_at > now);
         let confirm = Confirm {
@@ -388,7 +383,6 @@ impl AppPasskeys {
                 let (confirm, _) = self
                     .confirms
                     .lock()
-                    .expect("never held across a panic")
                     .remove(session)
                     .filter(|(c, expires_at)| {
                         *expires_at > self.clock.now() && c.endpoint == endpoint

@@ -2,8 +2,8 @@
 //! whose picture says what time it is: grey level `16 + (s mod 20) × 10`
 //! for the 10-second span `s` it is in.
 
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
 use spoolframe_catalog::{
@@ -20,9 +20,9 @@ use super::*;
 /// that cannot be read.
 #[derive(Debug, Default)]
 struct Files {
-    files: StdMutex<HashMap<String, PathBuf>>,
-    indexed: StdMutex<HashMap<String, PreviewFrames>>,
-    broken: StdMutex<HashSet<String>>,
+    files: Mutex<HashMap<String, PathBuf>>,
+    indexed: Mutex<HashMap<String, PreviewFrames>>,
+    broken: Mutex<HashSet<String>>,
 }
 
 #[async_trait]
@@ -48,7 +48,6 @@ impl Catalog for Files {
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
         self.files
             .lock()
-            .unwrap()
             .get(id.key())
             .cloned()
             .ok_or_else(|| CatalogError::NotFound(id.to_string()))
@@ -67,7 +66,7 @@ impl Catalog for Files {
         unreachable!()
     }
     async fn preview_frames(&self, id: &MediaId) -> Result<Option<PreviewFrames>, CatalogError> {
-        if self.broken.lock().unwrap().contains(id.key()) {
+        if self.broken.lock().contains(id.key()) {
             return Err(CatalogError::Backend {
                 url: "http://pms".into(),
                 call: "GET /library/parts/1/indexes/sd".into(),
@@ -75,7 +74,7 @@ impl Catalog for Files {
                 message: "unreadable preview index: not a BIF".into(),
             });
         }
-        Ok(self.indexed.lock().unwrap().get(id.key()).cloned())
+        Ok(self.indexed.lock().get(id.key()).cloned())
     }
 }
 
@@ -163,7 +162,7 @@ impl Setup {
             .status()
             .unwrap();
         assert!(status.success());
-        self.files.files.lock().unwrap().insert(key.into(), path);
+        self.files.files.lock().insert(key.into(), path);
         film(key)
     }
 
@@ -298,12 +297,7 @@ async fn a_file_without_pictures_fails_once_and_is_not_made_again() {
         .media_path(&film("x"))
         .await
         .unwrap_err();
-    setup
-        .files
-        .files
-        .lock()
-        .unwrap()
-        .insert("sound".into(), path);
+    setup.files.files.lock().insert("sound".into(), path);
     let id = film("sound");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while setup.previews.state(&id).await.unwrap() != PreviewState::None {
@@ -386,7 +380,7 @@ fn ffmpeg_reading(path: &Path) -> usize {
 async fn a_stopping_server_gives_up_the_film_being_made() {
     let setup = setup("stop", settings()).await;
     let id = setup.film("long", 7200, 0);
-    let path = setup.files.files.lock().unwrap()["long"].clone();
+    let path = setup.files.files.lock()["long"].clone();
     setup.previews.played(&id);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -405,7 +399,7 @@ async fn a_stopping_server_gives_up_the_film_being_made() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // Given up, not failed, and nothing is left of its work.
-    assert!(setup.previews.failed.lock().unwrap().is_empty());
+    assert!(setup.previews.failed.lock().is_empty());
     assert_eq!(
         std::fs::read_dir(setup.tmp.as_ref().join("previews").join(WORK))
             .map(|d| d.count())
@@ -429,12 +423,7 @@ async fn sound_that_runs_on_past_the_picture_adds_no_tiles() {
         .status()
         .unwrap();
     assert!(status.success());
-    setup
-        .files
-        .files
-        .lock()
-        .unwrap()
-        .insert("film".into(), path);
+    setup.files.files.lock().insert("film".into(), path);
     let (_, meta) = setup.ready(&film("film")).await;
     assert_eq!(meta.count, 3);
 }
@@ -458,17 +447,11 @@ async fn the_catalog_s_own_index_is_used_and_the_file_is_never_decoded() {
     let setup = setup_with("plex-index", settings(), "/nonexistent/ffmpeg").await;
     let path = setup.tmp.as_ref().join("film.mkv");
     std::fs::write(&path, b"a film").unwrap();
-    setup
-        .files
-        .files
-        .lock()
-        .unwrap()
-        .insert("film".into(), path);
+    setup.files.files.lock().insert("film".into(), path);
     setup
         .files
         .indexed
         .lock()
-        .unwrap()
         .insert("film".into(), plex_frames(60));
     let (key, meta) = setup.ready(&film("film")).await;
     // 0, 10, … 60 s.
@@ -485,7 +468,7 @@ async fn the_catalog_s_own_index_is_used_and_the_file_is_never_decoded() {
 async fn an_index_that_cannot_be_read_is_made_from_the_file() {
     let setup = setup("plex-index-broken", settings()).await;
     let id = setup.film("film", 30, 0);
-    setup.files.broken.lock().unwrap().insert("film".into());
+    setup.files.broken.lock().insert("film".into());
     let (_, meta) = setup.ready(&id).await;
     assert_eq!((meta.count, meta.tile_height), (3, 180));
 }
@@ -577,7 +560,7 @@ async fn previews_made_ahead_stop_when_the_cache_is_full_and_a_play_still_gets_i
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let set = |name: &str| {
-        let path = setup.files.files.lock().unwrap()[name].clone();
+        let path = setup.files.files.lock()[name].clone();
         async move { key(&path, Duration::from_secs(10)).await.unwrap() }
     };
     let (key_a, key_b) = (set("a").await, set("b").await);
@@ -771,7 +754,7 @@ async fn n_workers_make_n_files_ahead_at_once() {
     }
     gated.permits.add_permits(3);
     for id in &films {
-        let path = gated.setup.files.files.lock().unwrap()[id.key()].clone();
+        let path = gated.setup.files.files.lock()[id.key()].clone();
         let key = key(&path, Duration::from_secs(10)).await.unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while gated.setup.previews.cache.get(&key).is_none() {

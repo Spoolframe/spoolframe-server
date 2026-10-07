@@ -12,8 +12,9 @@
 //! reports buffering and waits until [`RESUME_BYTES`] are ready (or the
 //! encode ends), so playback resumes smoothly rather than frame by frame.
 
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::reader::{ByteSource, ReadError, Spawn, Status};
@@ -179,11 +180,7 @@ impl ByteSource for ProgressiveReader {
                 reported = true;
                 state = shared.lock();
             }
-            state = shared
-                .changed
-                .wait_timeout(state, REPORT_EVERY)
-                .expect("reader state is never poisoned")
-                .0;
+            shared.changed.wait_for(&mut state, REPORT_EVERY);
         }
     }
 
@@ -245,7 +242,7 @@ impl State {
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().expect("reader state is never poisoned")
+        self.state.lock()
     }
 
     /// Starts the fetch if there is room ahead and nothing stops it.

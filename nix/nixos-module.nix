@@ -16,7 +16,7 @@
   nvenc = uses "nvenc";
   gpu = vaapi || nvenc;
 
-  # Each media tool in a bubblewrap sandbox of its own (PX-11 finding 34).
+  # Each media tool confined by Landlock and seccomp (PX-11 finding 34).
   sandboxed = cfg.media.sandbox != "off";
 
   # A loopback listen address: the proxy in front of it is on this host.
@@ -403,17 +403,18 @@ in {
       description = ''
         How ffmpeg, ffprobe and tesseract run (PX-11 finding 34). They
         parse files anyone who can write to a library folder made, so by
-        default each runs in a bubblewrap sandbox of its own, inside the
-        service's: no network, no state directory (database, key,
-        secrets), the one media file read-only and its own scratch
-        directory the only place it writes, no new processes, and a
-        seccomp filter. `required` refuses to start without it; `auto`
-        runs them unconfined, with an error in the log, where bubblewrap
-        cannot work; `off` never confines them. Their environment is
+        default each run confines itself, inside the service's sandbox,
+        with Landlock and a seccomp filter: no network, no state directory
+        (database, key, secrets), the one media file read-only and its own
+        scratch directory the only place it writes, no new processes. The
+        server shows it at start: a confined ffprobe must be refused the
+        state directory and loopback. `required` refuses to start
+        otherwise; `auto` runs them with the seccomp filter alone, with an
+        error in the log, on a kernel without Landlock (before Linux 6.2,
+        or not in `lsm=`); `off` never confines them. Their environment is
         cleared and their memory, CPU time and file sizes are limited
-        either way. Confining them needs user, mount, PID, network, IPC
-        and UTS namespaces, and the mount calls, which the unit allows
-        the service for it; `off` keeps those refused.
+        either way. Confining them needs no namespace and nothing the unit
+        otherwise refuses, but the three `landlock_*` calls.
       '';
     };
 
@@ -568,21 +569,8 @@ in {
         # Other processes are not its business; its own children's /proc
         # entries stay (encode jobs are watched through them).
         ProtectProc = "invisible";
-        # Only the processes' entries, but bubblewrap reads
-        # /proc/sys/kernel/overflowuid to map its user, so a sandboxed
-        # service sees the rest of /proc too (read-only, through
-        # ProtectKernelTunables).
-        ProcSubset =
-          if sandboxed
-          then "all"
-          else "pid";
-        # bubblewrap makes these for each media tool's sandbox: the
-        # service's own processes can then make them too, but only with
-        # the rights of a user namespace of its own, never the host's.
-        RestrictNamespaces =
-          if sandboxed
-          then ["user" "mnt" "pid" "net" "ipc" "uts"]
-          else true;
+        ProcSubset = "pid";
+        RestrictNamespaces = true;
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
         RemoveIPC = true;
@@ -596,12 +584,13 @@ in {
         # change resource settings, but for the two previews use to run
         # ffmpeg at the lowest CPU and I/O priority. A refused call fails
         # with EPERM rather than killing the server.
-        # And for bubblewrap (media.sandbox): the mount calls and capset,
-        # which it sets up each sandbox and drops its rights with, in the
-        # namespaces it makes.
+        # And Landlock's three calls (media.sandbox), which no group of
+        # @system-service has: the server makes each media tool's ruleset,
+        # and the tool confines itself with it before it starts. The
+        # tool's seccomp filter is loaded with prctl(2), which is allowed.
         SystemCallFilter =
           ["@system-service" "~@privileged @resources" "setpriority ioprio_set"]
-          ++ lib.optional sandboxed "capset @mount";
+          ++ lib.optional sandboxed "landlock_create_ruleset landlock_add_rule landlock_restrict_self";
         SystemCallErrorNumber = "EPERM";
         # MemoryDenyWriteExecute is left out: GPU drivers JIT shaders, and
         # the VM test has no GPU to show it safe with them.

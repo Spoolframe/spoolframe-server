@@ -19,7 +19,9 @@
 //! never carry them, and the headers set for the collector are never
 //! logged.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use opentelemetry::metrics::MeterProvider as _;
@@ -212,7 +214,7 @@ impl Telemetry {
     /// settings again change nothing. Within the server's runtime: the
     /// export runs on it.
     pub fn apply(&self, settings: Option<OtlpSettings>) {
-        let mut running = self.running.lock().expect("never held across a panic");
+        let mut running = self.running.lock();
         if running.as_ref().map(|r| &r.settings) == settings.as_ref() {
             return;
         }
@@ -248,11 +250,7 @@ impl Telemetry {
 
     /// Export what is queued and stop: for a server that is stopping.
     pub async fn shutdown(&self) {
-        let old = self
-            .running
-            .lock()
-            .expect("never held across a panic")
-            .take();
+        let old = self.running.lock().take();
         (self.swap)(None);
         if let Some(old) = old {
             old.stop(self.timings).await;
@@ -261,13 +259,10 @@ impl Telemetry {
 
     /// What is exported to, and how it is going; `None` while off.
     pub fn status(&self) -> Option<(OtlpSettings, ExportStatus)> {
-        let running = self.running.lock().expect("never held across a panic");
-        running.as_ref().map(|r| {
-            (
-                r.settings.clone(),
-                r.status.lock().expect("never held across a panic").clone(),
-            )
-        })
+        let running = self.running.lock();
+        running
+            .as_ref()
+            .map(|r| (r.settings.clone(), r.status.lock().clone()))
     }
 
     /// How often metrics are exported.
@@ -291,7 +286,7 @@ impl Telemetry {
     /// Export what is queued now, and wait for it (or the timeout).
     pub async fn flush(&self) {
         let (spans, logs) = {
-            let running = self.running.lock().expect("never held across a panic");
+            let running = self.running.lock();
             match running.as_ref() {
                 Some(r) => (r.spans.clone(), r.logs.clone()),
                 None => (None, None),
@@ -557,7 +552,7 @@ impl Watch {
     }
 
     fn ok(&self) {
-        let mut status = self.status.lock().expect("never held across a panic");
+        let mut status = self.status.lock();
         status.last_export_at = Some(now_ms());
         status.dropped = 0;
         status.dropping_since = None;
@@ -566,11 +561,11 @@ impl Watch {
     fn failed(&self, error: &dyn std::fmt::Display) {
         self.metrics.telemetry_failed(self.signal);
         {
-            let mut status = self.status.lock().expect("never held across a panic");
+            let mut status = self.status.lock();
             status.last_error = Some(format!("{}: {error}", self.signal.as_str()));
             status.last_error_at = Some(now_ms());
         }
-        let mut warned = self.warned.lock().expect("never held across a panic");
+        let mut warned = self.warned.lock();
         warned.1 += 1;
         if warned.0.is_none_or(|at| at.elapsed() >= self.every) {
             tracing::warn!(
@@ -687,7 +682,7 @@ impl<T> Bounded<T> {
     fn queue(&self, item: T) {
         if self.tx.try_send(Msg::Item(item)).is_err() {
             self.metrics.telemetry_dropped(self.signal);
-            let mut status = self.status.lock().expect("never held across a panic");
+            let mut status = self.status.lock();
             status.dropped += 1;
             status.dropping_since.get_or_insert_with(now_ms);
         }
@@ -770,7 +765,7 @@ struct Families {
 
 impl Families {
     fn now(&self) -> Arc<Vec<Family>> {
-        let mut read = self.read.lock().expect("never held across a panic");
+        let mut read = self.read.lock();
         match &*read {
             Some((at, families)) if at.elapsed() < Duration::from_secs(1) => families.clone(),
             _ => {

@@ -206,13 +206,13 @@ media {
   ffprobe = "ffprobe";
   tesseract = "tesseract";
   # They read files anyone who can write to a library made. "required"
-  # runs each in a bubblewrap sandbox (no network, no state directory,
-  # only its own files) or refuses to start; "auto" does when bubblewrap
-  # works here, and otherwise runs them unconfined with an error in the
-  # log; "off" never confines them. Their environment is cleared and their
-  # memory, CPU time and file sizes are limited either way.
+  # confines each run with Landlock and a seccomp filter (no network, no
+  # state directory, only its own files), or refuses to start; "auto"
+  # does when this kernel has Landlock (Linux 6.2 or later), and otherwise
+  # runs them with the seccomp filter alone and an error in the log; "off"
+  # never confines them. Their environment is cleared and their memory,
+  # CPU time and file sizes are limited either way.
   sandbox = "auto";
-  bwrap = "bwrap";
 }
 
 # Converting for clients that cannot play a file as it is.

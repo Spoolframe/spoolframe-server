@@ -4,9 +4,10 @@
 //! A login ends at a [`LocalUserId`]; the session does not record how it
 //! was reached (§24B), so other methods (OIDC, P4) plug in beside this one.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use argon2::Argon2;
@@ -274,7 +275,7 @@ impl RateLimiter {
     /// How many keys are held.
     #[cfg(test)]
     fn held(&self) -> usize {
-        self.failures.lock().unwrap().by_key.len()
+        self.failures.lock().by_key.len()
     }
 
     fn user_key(username: &str) -> String {
@@ -293,7 +294,7 @@ impl RateLimiter {
 
     /// `Some(wait)` if either key has used up its failures.
     pub fn check(&self, username: &str, source: Option<&str>, now: Instant) -> Option<Duration> {
-        let mut failures = self.failures.lock().expect("never held across a panic");
+        let mut failures = self.failures.lock();
         self.limited(&mut failures, username, source, now)
     }
 
@@ -301,7 +302,7 @@ impl RateLimiter {
     /// what the admin pages show (P3-18). A limited source refuses the
     /// user's logins too, but is not theirs to show.
     pub fn user_limited(&self, username: &str, now: Instant) -> Option<Duration> {
-        let mut failures = self.failures.lock().expect("never held across a panic");
+        let mut failures = self.failures.lock();
         let key = Self::user_key(username);
         self.prune(&mut failures, &key, now);
         failures
@@ -426,7 +427,7 @@ impl RateLimiter {
 
     /// Count a failure.
     pub fn record_failure(&self, username: &str, source: Option<&str>, now: Instant) {
-        let mut failures = self.failures.lock().expect("never held across a panic");
+        let mut failures = self.failures.lock();
         self.sweep(&mut failures, now);
         self.make_room(&mut failures, username, source, now);
         for key in Self::keys(username, source) {
@@ -446,7 +447,7 @@ impl RateLimiter {
         source: Option<&str>,
         now: Instant,
     ) -> Result<(), Duration> {
-        let mut failures = self.failures.lock().expect("never held across a panic");
+        let mut failures = self.failures.lock();
         if let Some(wait) = self.limited(&mut failures, username, source, now) {
             return Err(wait);
         }
@@ -462,7 +463,7 @@ impl RateLimiter {
     /// one account's right password must not reset guessing at others from
     /// the same place.
     pub fn record_success(&self, username: &str, source: Option<&str>, began: Instant) {
-        let mut failures = self.failures.lock().expect("never held across a panic");
+        let mut failures = self.failures.lock();
         let user = Self::user_key(username);
         failures.by_key.remove(&user);
         if let Some(source) = source {
@@ -524,7 +525,7 @@ impl TokenBucket {
 
     /// Take a token at `now`, or `Err(wait)` until the next one.
     pub fn take(&self, now: Instant) -> Result<(), Duration> {
-        let mut state = self.state.lock().expect("never held across a panic");
+        let mut state = self.state.lock();
         let (tokens, since) = &mut *state;
         let every = self.bucket.refill_every.max(Duration::from_nanos(1));
         let elapsed = now.saturating_duration_since(*since);
@@ -805,17 +806,17 @@ impl Auth {
         let key = (user, endpoint.to_owned());
         if valid_pin(pin) && verify_password(pin, phc).await {
             self.limiter.record_success(&what, Some(&from), began);
-            self.wrong_pins.lock().expect("never poisoned").remove(&key);
+            self.wrong_pins.lock().remove(&key);
             return Ok(());
         }
         let wrong = {
-            let mut counts = self.wrong_pins.lock().expect("never poisoned");
+            let mut counts = self.wrong_pins.lock();
             let count = counts.entry(key.clone()).or_default();
             *count += 1;
             *count
         };
         if wrong >= MAX_WRONG_PINS {
-            self.wrong_pins.lock().expect("never poisoned").remove(&key);
+            self.wrong_pins.lock().remove(&key);
             let revoked = self.store.revoke_device_sessions(user, endpoint).await?;
             tracing::warn!(
                 user = %user,

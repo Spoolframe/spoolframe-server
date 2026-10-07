@@ -7,10 +7,11 @@
 //! Artwork ids change when the image does (Plex paths end in an update
 //! timestamp), so nothing is ever invalidated, only evicted.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use image::ImageFormat;
 use image::codecs::jpeg::JpegEncoder;
@@ -236,8 +237,8 @@ impl ArtworkCache {
         self.lock().total
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Index> {
-        self.index.lock().expect("never held across a panic")
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Index> {
+        self.index.lock()
     }
 
     /// The image for `id` at `size`. Counted once, as asked for: the

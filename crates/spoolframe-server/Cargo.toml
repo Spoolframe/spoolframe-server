@@ -61,6 +61,7 @@ opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
 tonic = { workspace = true }
+parking_lot = { workspace = true }
 tokio = { workspace = true }
 uclicious = { workspace = true }
 webauthn-rs = { workspace = true }
@@ -83,6 +84,8 @@ cargo_metadata = { workspace = true }
 m3u8-rs = { workspace = true }
 futures-util = { workspace = true }
 spoolframe-client-sdk = { workspace = true }
+# Its live checks of the stranger limits, run against a test server (PX-11).
+spoolframe-probe = { workspace = true }
 webauthn-authenticator-rs = { workspace = true }
 # The stand-in OpenID Connect provider's token times (P3-04).
 chrono = { workspace = true }

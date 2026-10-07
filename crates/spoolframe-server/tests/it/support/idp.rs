@@ -8,9 +8,10 @@
 //! someone already signed in there. Without one it shows a page to pick
 //! who signs in, for a person or a browser test.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Request, State};
@@ -172,27 +173,27 @@ impl StandIn {
 
     /// The next authorization signs `account` in, at once.
     pub fn next_sign_in(&self, account: Account) {
-        self.inner.lock().unwrap().next = Some(account);
+        self.inner.lock().next = Some(account);
     }
 
     /// The next ID token is wrong in this way.
     pub fn misbehave(&self, mischief: Mischief) {
-        self.inner.lock().unwrap().mischief = Some(mischief);
+        self.inner.lock().mischief = Some(mischief);
     }
 
     /// How many ID tokens it has issued.
     pub fn issued(&self) -> u32 {
-        self.inner.lock().unwrap().issued
+        self.inner.lock().issued
     }
 
     /// Describe itself as `document` from now on.
     pub fn describe(&self, document: Document) {
-        self.inner.lock().unwrap().document = document;
+        self.inner.lock().document = document;
     }
 
     /// The scopes the last authorization request asked for.
     pub fn last_scope(&self) -> Option<String> {
-        self.inner.lock().unwrap().scope.clone()
+        self.inner.lock().scope.clone()
     }
 }
 
@@ -205,7 +206,7 @@ fn random() -> String {
 
 async fn discovery(State(s): State<Arc<Shared>>) -> Response {
     let i = &s.issuer;
-    let document = s.inner.lock().unwrap().document.clone();
+    let document = s.inner.lock().document.clone();
     axum::Json(json!({
         "issuer": document.issuer.as_deref().unwrap_or(i),
         "authorization_endpoint": format!("{i}/authorize"),
@@ -248,7 +249,7 @@ fn grant(s: &Shared, params: &HashMap<String, String>, account: Account) -> Resp
         return (StatusCode::BAD_REQUEST, "S256 only").into_response();
     }
     let code = random();
-    s.inner.lock().unwrap().codes.insert(
+    s.inner.lock().codes.insert(
         code.clone(),
         Grant {
             account,
@@ -270,18 +271,14 @@ async fn authorize(State(s): State<Arc<Shared>>, req: Request) -> Response {
     if params.get("response_type").map(String::as_str) != Some("code") {
         return (StatusCode::BAD_REQUEST, "response_type=code only").into_response();
     }
-    s.inner.lock().unwrap().scope = params.get("scope").cloned();
-    let next = s.inner.lock().unwrap().next.take();
+    s.inner.lock().scope = params.get("scope").cloned();
+    let next = s.inner.lock().next.take();
     if let Some(account) = next {
         return grant(&s, &params, account);
     }
     // Nobody named: a page to pick who signs in.
     let id = random();
-    s.inner
-        .lock()
-        .unwrap()
-        .pending
-        .insert(id.clone(), params.clone());
+    s.inner.lock().pending.insert(id.clone(), params.clone());
     let button = |sub: &str, email: &str, label: &str| {
         format!(
             r#"<form method="post" action="/approve"><input type="hidden" name="request" value="{id}"><input type="hidden" name="sub" value="{sub}"><input type="hidden" name="email" value="{email}"><button>{label}</button></form>"#
@@ -310,7 +307,7 @@ async fn approve(State(s): State<Arc<Shared>>, body: axum::body::Bytes) -> Respo
     let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
     let Some(params) = form
         .get("request")
-        .and_then(|id| s.inner.lock().unwrap().pending.remove(id))
+        .and_then(|id| s.inner.lock().pending.remove(id))
     else {
         return (StatusCode::BAD_REQUEST, "no such request").into_response();
     };
@@ -357,7 +354,7 @@ async fn token(
     body: axum::body::Bytes,
 ) -> Response {
     let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
-    let accepts = s.inner.lock().unwrap().document.token_auth.clone();
+    let accepts = s.inner.lock().document.token_auth.clone();
     let client = (CLIENT_ID.to_owned(), CLIENT_SECRET.to_owned());
     let by_basic =
         accepts.contains(&"client_secret_basic") && basic(&headers) == Some(client.clone());
@@ -377,7 +374,7 @@ async fn token(
     // A code is good once.
     let Some(grant) = form
         .get("code")
-        .and_then(|c| s.inner.lock().unwrap().codes.remove(c))
+        .and_then(|c| s.inner.lock().codes.remove(c))
     else {
         return oauth_error("invalid_grant");
     };
@@ -393,7 +390,7 @@ async fn token(
         return oauth_error("invalid_grant");
     }
     let mischief = {
-        let mut inner = s.inner.lock().unwrap();
+        let mut inner = s.inner.lock();
         inner.issued += 1;
         inner.mischief.take()
     };

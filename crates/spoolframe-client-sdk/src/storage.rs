@@ -3,8 +3,8 @@
 //! Secret Service and data under the XDG data directory; tvOS uses the
 //! keychain (P5).
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use async_trait::async_trait;
 
@@ -52,11 +52,11 @@ pub struct MemoryStorage {
 }
 
 fn get(map: &Mutex<HashMap<String, Vec<u8>>>, key: &str) -> Option<Vec<u8>> {
-    map.lock().expect("never poisoned").get(key).cloned()
+    map.lock().get(key).cloned()
 }
 
 fn set(map: &Mutex<HashMap<String, Vec<u8>>>, key: &str, value: Option<Vec<u8>>) {
-    let mut map = map.lock().expect("never poisoned");
+    let mut map = map.lock();
     match value {
         Some(value) => map.insert(key.to_owned(), value),
         None => map.remove(key),

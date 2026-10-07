@@ -475,7 +475,7 @@ impl Ffmpeg for FfmpegCommand {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -506,7 +506,7 @@ mod tests {
         }
 
         async fn succeeds(&self, args: &[String], _scratch: &Path) -> bool {
-            self.runs.lock().unwrap().push(args.to_vec());
+            self.runs.lock().push(args.to_vec());
             // A sample encode writes a file; a decode names its hwaccel.
             let name = args
                 .iter()
@@ -582,7 +582,7 @@ mod tests {
             scratch("qsv").await.as_ref(),
         )
         .await;
-        let runs = ffmpeg.runs.lock().unwrap();
+        let runs = ffmpeg.runs.lock();
         assert!(runs.iter().all(|r| !r.iter().any(|a| a.contains("_qsv"))));
     }
 
@@ -609,7 +609,7 @@ mod tests {
         let e = detect(&ffmpeg, &settings, scratch("none").await.as_ref()).await;
         assert_eq!(names(&e), ["libx264"]);
         assert!(e.unusable.is_empty());
-        let runs = ffmpeg.runs.lock().unwrap();
+        let runs = ffmpeg.runs.lock();
         assert!(runs.iter().all(|r| !r.iter().any(|a| a.contains("vaapi"))));
     }
 

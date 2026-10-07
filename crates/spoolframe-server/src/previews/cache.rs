@@ -4,9 +4,9 @@
 //! counts as using it, and its `previews.json`'s modification time keeps
 //! that order across restarts.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -128,8 +128,8 @@ impl Cache {
         Ok(cache)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Index> {
-        self.index.lock().expect("never held across a panic")
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Index> {
+        self.index.lock()
     }
 
     fn remove(&self, keys: Vec<String>) {

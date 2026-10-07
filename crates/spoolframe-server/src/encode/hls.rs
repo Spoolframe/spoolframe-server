@@ -147,6 +147,53 @@ impl Segments {
     }
 }
 
+/// What a variant declares, in bit/s: `BANDWIDTH`, the peak, is what
+/// AVPlayer holds every segment to, and it refuses one over it
+/// (CoreMediaErrorDomain -12318); `AVERAGE-BANDWIDTH` is the mean. The
+/// playlist is written before the encode runs, so no segment's size is
+/// known: the peak is bounded from how each stream is made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Rate {
+    peak: u64,
+    average: u64,
+}
+
+impl Rate {
+    /// A copied stream, or an encode with no cap: its average, and a
+    /// segment up to half again over it, as variable rates run.
+    fn varying(average: u64) -> Self {
+        Self {
+            peak: average.saturating_mul(3) / 2,
+            average,
+        }
+    }
+
+    /// A video encode capped at `cap` (`-maxrate cap -bufsize 2×cap`): a
+    /// segment holds at most its time at the cap plus the full buffer.
+    fn capped(cap: u64) -> Self {
+        Self {
+            peak: cap.saturating_add(cap.saturating_mul(2) / u64::from(SEGMENT_SECS)),
+            average: cap,
+        }
+    }
+
+    /// An audio encode at `bitrate`, which ffmpeg's encoders keep near
+    /// it: a tenth more for what it varies by and the container.
+    fn encoded(bitrate: u64) -> Self {
+        Self {
+            peak: bitrate.saturating_add(bitrate / 10),
+            average: bitrate,
+        }
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            peak: self.peak.saturating_add(other.peak),
+            average: self.average.saturating_add(other.average),
+        }
+    }
+}
+
 /// The multivariant playlist: the one variant, described for the player,
 /// with `subtitle` (the picked track) as its subtitle rendition.
 pub fn multivariant_playlist(
@@ -158,7 +205,7 @@ pub fn multivariant_playlist(
     let mut codecs = Vec::new();
     let mut resolution = None;
     let mut picture = None;
-    let mut video_bits = 0;
+    let mut rate = Rate::default();
     if let (Some(plan), Some(source)) = (video, &descriptor.video) {
         // A copied stream is the source's; an encode's level is not known
         // before it runs.
@@ -183,19 +230,28 @@ pub fn multivariant_playlist(
             _ => source.range(),
         };
         picture = Some((source.frame_rate_millis, range));
-        video_bits = cap.or(descriptor.bit_rate).unwrap_or(8_000_000);
+        rate = rate.plus(match cap {
+            Some(cap) => Rate::capped(cap),
+            // A copy is the source's own; an uncapped encode's rate is
+            // not known before it runs, and the source's is a fair guess.
+            None => Rate::varying(descriptor.bit_rate.unwrap_or(8_000_000)),
+        });
     }
-    let mut audio_bits = 0;
     if let Some(audio) = audio {
-        let (codec, bitrate) = match audio.action {
-            AudioAction::Copy { codec } => (codec, 640_000),
-            AudioAction::Encode { codec, bitrate, .. } => (codec, bitrate),
-            AudioAction::Unknown => (AudioCodec::Unknown, 0),
+        let (codec, audio_rate) = match audio.action {
+            // Alone, the file is the sound (a music track): its rate is
+            // the sound's. Beside a picture it is not known.
+            AudioAction::Copy { codec } => {
+                let alone = descriptor.bit_rate.filter(|_| video.is_none());
+                (codec, Rate::varying(alone.unwrap_or(640_000)))
+            }
+            AudioAction::Encode { codec, bitrate, .. } => (codec, Rate::encoded(bitrate)),
+            AudioAction::Unknown => (AudioCodec::Unknown, Rate::default()),
         };
         if let Some(name) = audio_codec_string(codec) {
             codecs.push(name.to_owned());
         }
-        audio_bits = bitrate;
+        rate = rate.plus(audio_rate);
     }
     let mut text = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
     if let Some(track) = subtitle {
@@ -218,8 +274,8 @@ pub fn multivariant_playlist(
     }
     let _ = write!(
         text,
-        "#EXT-X-STREAM-INF:BANDWIDTH={}",
-        video_bits + audio_bits
+        "#EXT-X-STREAM-INF:BANDWIDTH={},AVERAGE-BANDWIDTH={}",
+        rate.peak, rate.average
     );
     // An empty CODECS is not valid HLS; none is.
     if !codecs.is_empty() {
@@ -501,7 +557,8 @@ mod tests {
         let text = multivariant_playlist(&film("smpte2084"), COPY_HEVC, eac3, None);
         assert_eq!(
             variant(&text),
-            "#EXT-X-STREAM-INF:BANDWIDTH=60640000,CODECS=\"hvc1.2.4.L153.B0,ec-3\",\
+            "#EXT-X-STREAM-INF:BANDWIDTH=90704000,AVERAGE-BANDWIDTH=60640000,\
+             CODECS=\"hvc1.2.4.L153.B0,ec-3\",\
              RESOLUTION=3840x1600,FRAME-RATE=23.976,VIDEO-RANGE=PQ"
         );
         assert!(
@@ -511,6 +568,67 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    /// The variant's `(BANDWIDTH, AVERAGE-BANDWIDTH)`.
+    fn bandwidths(text: &str) -> (u64, Option<u64>) {
+        match m3u8_rs::parse_playlist_res(text.as_bytes()) {
+            Ok(m3u8_rs::Playlist::MasterPlaylist(p)) => {
+                (p.variants[0].bandwidth, p.variants[0].average_bandwidth)
+            }
+            other => panic!("not a multivariant playlist: {other:?}"),
+        }
+    }
+
+    /// A track, CD-quality FLAC at its average rate, with no picture.
+    fn flac_track(bit_rate: u64) -> MediaDescriptor {
+        MediaDescriptor {
+            container: "flac".into(),
+            duration: None,
+            bit_rate: Some(bit_rate),
+            video: None,
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        }
+    }
+
+    const COPY_FLAC: Option<ConvertedAudio> = Some(ConvertedAudio {
+        index: 0,
+        action: AudioAction::Copy {
+            codec: AudioCodec::Flac,
+        },
+    });
+
+    /// AVPlayer refuses a segment over BANDWIDTH (-12318). Copied FLAC
+    /// was declared at 640 kbit/s, whatever its rate.
+    #[test]
+    fn copied_flac_declares_its_own_rate_and_a_peak_above_it() {
+        let text = multivariant_playlist(&flac_track(1_000_000), None, COPY_FLAC, None);
+        let (peak, average) = bandwidths(&text);
+        assert_eq!(average, Some(1_000_000));
+        assert!(peak >= 1_500_000, "{text}");
+    }
+
+    /// A capped encode's segments can run over its cap by what the
+    /// encoder's buffer holds, twice the cap, spread over one segment.
+    #[test]
+    fn a_capped_encode_declares_its_cap_and_its_buffer() {
+        let video = Some(ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height: 1080,
+            max_bitrate: Some(6_000_000),
+            tone_map: false,
+        });
+        let aac = Some(ConvertedAudio {
+            index: 0,
+            action: AudioAction::Encode {
+                codec: AudioCodec::Aac,
+                channels: 2,
+                bitrate: 200_000,
+            },
+        });
+        let text = multivariant_playlist(&film("bt709"), video, aac, None);
+        assert_eq!(bandwidths(&text), (8_000_000 + 220_000, Some(6_200_000)));
     }
 
     #[test]

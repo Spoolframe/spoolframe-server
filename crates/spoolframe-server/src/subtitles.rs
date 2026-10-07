@@ -13,9 +13,10 @@
 //! a second track waits, rather than both taking twice as long. A text
 //! conversion is only ffmpeg reading the file, and waits for nothing.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use spoolframe_media::ocr::{self, Ocr};
 use spoolframe_media::sandbox::Tool;
@@ -190,7 +191,7 @@ impl Subtitles {
         if tokio::fs::try_exists(&text).await.unwrap_or(false) {
             return TextPeek::Ready;
         }
-        match self.making.lock().expect("never poisoned").get(&key) {
+        match self.making.lock().get(&key) {
             Some(state) => TextPeek::Making(state.borrow().clone()),
             None => TextPeek::NotMade,
         }
@@ -222,7 +223,7 @@ impl Subtitles {
         if tokio::fs::try_exists(&text).await.unwrap_or(false) {
             return watch::channel(TextState::Ready(text)).1;
         }
-        let mut making = self.making.lock().expect("never poisoned");
+        let mut making = self.making.lock();
         if let Some(state) = making.get(&key) {
             return state.clone();
         }
@@ -275,11 +276,7 @@ impl Subtitles {
             }
             let _ = tokio::fs::remove_dir_all(&job.work).await;
             let _ = tx.send(state);
-            job.subtitles
-                .making
-                .lock()
-                .expect("never poisoned")
-                .remove(&key);
+            job.subtitles.making.lock().remove(&key);
         });
         rx
     }

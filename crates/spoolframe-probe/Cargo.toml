@@ -1,0 +1,26 @@
+[package]
+name = "spoolframe-probe"
+description = "Checks that a Spoolframe server keeps its documented limits for devices with no session, over live QUIC."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+# Permissive: it links only the protocol, the types and iroh, as a client
+# does. Kept out of the server binary and the server's package.
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "spoolframe-probe"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+iroh = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+spoolframe-protocol = { workspace = true }
+spoolframe-types = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }

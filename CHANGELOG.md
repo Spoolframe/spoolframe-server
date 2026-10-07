@@ -2532,3 +2532,73 @@
   approver's network, so approve only one you can see; a code someone
   sent you is theirs. `deviceSignInLookup` has the new `address` and
   `fromInternet`.
+- ffmpeg, ffprobe and tesseract are confined with Landlock and seccomp,
+  not bubblewrap (PX-11 finding 34). Each run confines itself between
+  fork and exec, with no namespace, so the NixOS unit keeps its full
+  hardening again: `RestrictNamespaces=true`, `ProcSubset=pid`, and no
+  `capset` or `@mount` in `SystemCallFilter`; `systemd-analyze security` scores
+  it 1.6 again (2.5 with bubblewrap), and the VM test's threshold is
+  that 1.6.
+  - A confined run may read and run the system's programs and libraries,
+    read each input file (the inode the server opened and checked) and
+    the directories it was given, and write its own directory, whose
+    files it cannot run. Nothing else: not the state directory,
+    systemd's credentials, `/home` or `/proc`. Landlock also refuses TCP
+    (ABI 4), and signals and abstract Unix sockets out of the run (ABI
+    6). The seccomp filter also refuses `connect(2)` and `sendto(2)` to
+    an address now: without a mount namespace the host's Unix sockets
+    are in sight.
+  - `media.sandbox = "required"` needs Landlock ABI 3 (Linux 6.2) or
+    later; `auto` runs the tools with the seccomp filter and the limits
+    only on a kernel without it, with an error in the log; `off` is as
+    before. The server logs the ABI at start, and shows the tools
+    confined: a confined ffprobe must be refused the state directory and
+    a listener on loopback, or `required` does not start.
+  - `media.bwrap` is gone, and so is bubblewrap from the package's
+    `PATH` and the dev shell. The unit allows the three `landlock_*`
+    calls, which `@system-service` does not have.
+  - Not kept from bubblewrap: a PID, mount, network, IPC and UTS
+    namespace of the run's own. A run sees the unit's processes and
+    every path's name and metadata, but can open, signal or connect to
+    none of them (security/report.md 34).
+- `spoolframe-probe` (PX-11 coverage gap 3): checks over live QUIC that
+  a server keeps the limits it documents for a device with no session.
+  `spoolframe-probe --endpoint <hex> --addr <ip:port> [--budget N]
+  [--check-cap] [--check-limits] [--json]`. Each check is PASS, FAIL or
+  SKIP with its evidence, and each ends with a `Ping`:
+  - a `Hello` from another protocol revision is refused, and not kept;
+  - `Libraries`, `Item`, `StartPlayback` and `ServerAddresses` without a
+    session are `Unauthenticated`;
+  - a stranger gets no unidirectional stream and at most 4 bidirectional
+    ones, a well-formed request over 64 KiB is `Malformed`, and a stream
+    silent after its kind byte is reset after
+    `network.first_frame_timeout_secs`;
+  - with `--check-cap`, the 65th stranger connection is closed `BUSY`;
+  - with `--check-limits`, the 6th wrong password for a username made up
+    for the run is `RateLimited`.
+  - Every connection and stream counts against `--budget` (200), and 3
+    exchanges in a row unanswered or `Internal` stop the run. Every
+    frame it sends is a real request; malformed frames are the fuzz
+    targets' job. It is `MIT OR Apache-2.0`, and links no server crate.
+- Music on iOS starts (P2-03): a device keeps "now + next", the playback
+  it plays and the one it starts after it. Starting a third ends the
+  device's oldest converted playback, and its encode slot. Before, every
+  start ended the device's earlier conversions, so the iOS app's next
+  track, prepared 140 ms after the first for gapless audio, ended the
+  first's HLS remux, and its segment reads failed as `PlaybackExpired`.
+  With no slot free (`transcode.max_jobs = 1`), the device's own earlier
+  conversion still gives way to the new start, as before; another
+  device's slot is never taken.
+- HLS declares each variant's peak rate as `BANDWIDTH` and its mean as
+  `AVERAGE-BANDWIDTH` (P2-05). AVPlayer refuses a segment over
+  `BANDWIDTH` ("Segment exceeds specified bandwidth for variant",
+  CoreMediaErrorDomain -12318), and copied FLAC was declared at
+  640 kbit/s whatever its rate. A copied stream, or an encode with no
+  cap, now declares the source's rate (for music, the file's own) and a
+  peak half again over it; a capped video encode declares its cap, and a
+  peak of the cap plus its two-cap buffer over one 6 s segment; an audio
+  encode declares its bitrate and a tenth more.
+- A panic while a lock is held no longer breaks that feature until a
+  restart (PX-10). The server, the SDK, `spoolframe-media` and
+  `spoolframe-probe` use `parking_lot` locks, which do not poison; with
+  `std::sync` locks, every later `lock()` after one panic panicked too.

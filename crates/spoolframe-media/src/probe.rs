@@ -1,9 +1,10 @@
 //! Running ffprobe, and remembering what it said.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use easy_ffprobe::FfProbe;
@@ -112,16 +113,12 @@ impl Prober {
         let descriptor = Arc::new(descriptor);
         self.cache
             .lock()
-            .expect("the cache lock is never held across a panic")
             .insert(path.to_owned(), (stamp, descriptor.clone()));
         Ok(descriptor)
     }
 
     fn cached(&self, path: &Path, stamp: Stamp) -> Option<Arc<MediaDescriptor>> {
-        let cache = self
-            .cache
-            .lock()
-            .expect("the cache lock is never held across a panic");
+        let cache = self.cache.lock();
         cache
             .get(path)
             .filter(|(cached, _)| *cached == stamp)
@@ -164,11 +161,7 @@ impl Prober {
     /// remembered until the file changes.
     pub async fn keyframes(&self, path: &Path) -> Result<Keyframes, ProbeError> {
         let stamp = stamp(path).await?;
-        if let Some((cached, times)) = self
-            .keyframes
-            .lock()
-            .expect("the cache lock is never held across a panic")
-            .get(path)
+        if let Some((cached, times)) = self.keyframes.lock().get(path)
             && *cached == stamp
         {
             return Ok(times.clone());
@@ -210,7 +203,6 @@ impl Prober {
         let times = Arc::new(keyframe_times(&String::from_utf8_lossy(&output.stdout)));
         self.keyframes
             .lock()
-            .expect("the cache lock is never held across a panic")
             .insert(path.to_owned(), (stamp, times.clone()));
         Ok(times)
     }

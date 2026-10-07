@@ -94,7 +94,7 @@ struct ConnectionState {
     peer: Arc<Peer>,
     hello: OnceLock<Hello>,
     /// Profile locks (P2-08).
-    locks: std::sync::Mutex<Locks>,
+    locks: parking_lot::Mutex<Locks>,
 }
 
 /// Which sessions on one connection need their user's PIN, and which are
@@ -381,11 +381,7 @@ impl ClientProtocol {
                     Err(error) => return Response::Err(error).into(),
                 };
                 if !matches!(wire.envelope.request, Request::UnlockProfile { .. })
-                    && let Err(error) = state
-                        .locks
-                        .lock()
-                        .expect("never poisoned")
-                        .use_session(&session)
+                    && let Err(error) = state.locks.lock().use_session(&session)
                 {
                     return Response::Err(error).into();
                 }
@@ -441,7 +437,7 @@ impl ClientProtocol {
                         Ok(user) => user,
                         Err(error) => return Response::Err(error).into(),
                     };
-                    if state.locks.lock().expect("never poisoned").locked(&session) {
+                    if state.locks.lock().locked(&session) {
                         return Response::Err(Error::ProfileLocked).into();
                     }
                 }
@@ -646,11 +642,7 @@ impl ClientProtocol {
                     let allowed = if exempt {
                         Ok(())
                     } else {
-                        state
-                            .locks
-                            .lock()
-                            .expect("never poisoned")
-                            .use_session(&session)
+                        state.locks.lock().use_session(&session)
                     };
                     match allowed {
                         Ok(()) => {
@@ -691,11 +683,7 @@ impl ClientProtocol {
             .await
         {
             Ok(Some(user)) => {
-                state
-                    .locks
-                    .lock()
-                    .expect("never poisoned")
-                    .learn(&session, user.pin_required);
+                state.locks.lock().learn(&session, user.pin_required);
                 Ok((session, user))
             }
             Ok(None) => Err(Error::Unauthenticated),
@@ -866,11 +854,7 @@ impl ClientProtocol {
                     _ => unreachable!(),
                 };
                 let (session, user) = self.authenticate(connection, state, Some(session)).await?;
-                state
-                    .locks
-                    .lock()
-                    .expect("never poisoned")
-                    .use_session(&session)?;
+                state.locks.lock().use_session(&session)?;
                 // Preparing the selected subtitle and its metadata is atomic
                 // with control changes. Sending its bytes holds no lock.
                 let _control = self
@@ -928,11 +912,7 @@ impl ClientProtocol {
         let (session, _) = self
             .authenticate(connection, state, Some(request.session))
             .await?;
-        state
-            .locks
-            .lock()
-            .expect("never poisoned")
-            .use_session(&session)?;
+        state.locks.lock().use_session(&session)?;
         if request.id.namespace() == Namespace::Preview {
             return self.preview_sheet(&request.id, request.size).await;
         }
@@ -1091,20 +1071,12 @@ impl ClientProtocol {
         // The lock, in memory, on every read. A session this connection
         // has not looked up yet (a playback started before a reconnect) is
         // looked up first, so a new connection does not skip its lock.
-        let known = state
-            .locks
-            .lock()
-            .expect("never poisoned")
-            .knows(&read.session);
+        let known = state.locks.lock().knows(&read.session);
         if !known {
             self.authenticate(connection, state, Some(read.session.clone()))
                 .await?;
         }
-        state
-            .locks
-            .lock()
-            .expect("never poisoned")
-            .use_session(&read.session)?;
+        state.locks.lock().use_session(&read.session)?;
         if let Some(conversion) = &playback.conversion {
             let keep_alive = || self.services.playbacks.touch(&read.handle);
             return converted_range(conversion, read, &keep_alive).await;
@@ -1202,11 +1174,7 @@ impl ClientProtocol {
         }
         match request {
             Request::ActivateProfile => {
-                state
-                    .locks
-                    .lock()
-                    .expect("never poisoned")
-                    .activate(&session);
+                state.locks.lock().activate(&session);
                 Ok(Reply::Done)
             }
             Request::PlaybackProgressSequence { handle } => Ok(Reply::PlaybackProgressSequence {
@@ -1229,7 +1197,7 @@ impl ClientProtocol {
                     username: user.username,
                     display_name: user.display_name,
                     role: user.role,
-                    locked: state.locks.lock().expect("never poisoned").locked(&session),
+                    locked: state.locks.lock().locked(&session),
                     pin: pin.map(|p| PinState { digits: p.digits }),
                 }))
             }
@@ -1277,14 +1245,14 @@ impl ClientProtocol {
                 Ok(Reply::Done)
             }
             Request::UnlockProfile { pin } => {
-                let generation = state.locks.lock().expect("never poisoned").generation;
+                let generation = state.locks.lock().generation;
                 let endpoint = connection.remote_id().to_string();
                 self.services
                     .auth
                     .check_pin(user.user, &endpoint, &pin)
                     .await
                     .map_err(pin_error)?;
-                let mut locks = state.locks.lock().expect("never poisoned");
+                let mut locks = state.locks.lock();
                 if locks.generation != generation
                     || locks
                         .active
@@ -1469,7 +1437,7 @@ impl ClientProtocol {
                 if !required {
                     recently_signed_in(&user)?;
                 }
-                let generation = state.locks.lock().expect("never poisoned").generation;
+                let generation = state.locks.lock().generation;
                 let this = connection.remote_id().to_string();
                 let device = device.unwrap_or_else(|| this.clone());
                 self.store()
@@ -1487,7 +1455,7 @@ impl ClientProtocol {
                 if required && device == this {
                     // Who turns it on here is not locked out mid-use: this
                     // connection stays unlocked; the next one asks.
-                    let mut locks = state.locks.lock().expect("never poisoned");
+                    let mut locks = state.locks.lock();
                     locks.learn(&session, true);
                     if locks.generation == generation
                         && locks
@@ -1866,23 +1834,34 @@ impl ClientProtocol {
                     platform: hello.platform,
                 };
                 let handle = Playbacks::new_handle();
-                // This device's earlier encodes are abandoned: free their
-                // slots before this one takes one.
+                // A device keeps "now + next": the one playing and this
+                // one, which may be the next track it prepares while that
+                // plays (iOS gapless audio). Its older encodes are
+                // abandoned: free their slots before this one takes one.
                 let endpoint = connection.remote_id().to_string();
-                let ended = self.services.playbacks.end_conversions_on(&endpoint);
+                let ended = self.services.playbacks.make_room_for_next(&endpoint);
                 if ended > 0 {
                     tracing::info!(%endpoint, ended, "a device's earlier conversions ended");
                 }
-                let (subtitle, (size, file), conversion) = self
-                    .prepare(
-                        &handle,
-                        &id,
-                        (&path, &descriptor),
-                        &plan,
-                        start_ms.map(Duration::from_millis),
-                        None,
-                    )
-                    .await?;
+                let start = start_ms.map(Duration::from_millis);
+                let prepared = match self
+                    .prepare(&handle, &id, (&path, &descriptor), &plan, start, None)
+                    .await
+                {
+                    // No slot free, and the device holds one: what it
+                    // starts now comes before what it started earlier, as
+                    // it did before "now + next" (one slot, a film started
+                    // again). Another device's slot is never taken.
+                    Err(Error::Busy)
+                        if self.services.playbacks.end_conversions_on(&endpoint) > 0 =>
+                    {
+                        tracing::info!(%endpoint, "a device's conversion ended for its new one");
+                        self.prepare(&handle, &id, (&path, &descriptor), &plan, start, None)
+                            .await
+                    }
+                    prepared => prepared,
+                };
+                let (subtitle, (size, file), conversion) = prepared?;
                 // Its previews next, if it has none yet: the player asks
                 // for them as soon as it shows a seek bar.
                 self.services.previews.played(&id);
@@ -2713,7 +2692,7 @@ impl ProtocolHandler for ClientProtocol {
         let state = Arc::new(ConnectionState {
             peer,
             hello: OnceLock::new(),
-            locks: std::sync::Mutex::default(),
+            locks: parking_lot::Mutex::default(),
         });
 
         let reason = loop {

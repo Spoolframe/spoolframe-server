@@ -126,11 +126,11 @@ struct Places {
 
 /// A taken place, given back when dropped.
 #[derive(Debug)]
-struct Place(Arc<std::sync::Mutex<Places>>);
+struct Place(Arc<parking_lot::Mutex<Places>>);
 
 impl Place {
-    fn take(places: &Arc<std::sync::Mutex<Places>>) -> Option<Self> {
-        let mut now = places.lock().expect("never held across a panic");
+    fn take(places: &Arc<parking_lot::Mutex<Places>>) -> Option<Self> {
+        let mut now = places.lock();
         if now.taken >= now.max {
             return None;
         }
@@ -141,7 +141,7 @@ impl Place {
 
 impl Drop for Place {
     fn drop(&mut self) {
-        self.0.lock().expect("never held across a panic").taken -= 1;
+        self.0.lock().taken -= 1;
     }
 }
 
@@ -154,11 +154,11 @@ pub const JOBS_DIR: &str = "spoolframe-jobs";
 pub struct Jobs {
     /// Live (P3-10) but for the scratch directory: a job reads them when
     /// it starts.
-    limits: std::sync::RwLock<JobLimits>,
+    limits: parking_lot::RwLock<JobLimits>,
     /// [`JOBS_DIR`] in the scratch directory.
     dir: PathBuf,
     ffmpeg: Tool,
-    places: Arc<std::sync::Mutex<Places>>,
+    places: Arc<parking_lot::Mutex<Places>>,
     /// Held by the job that looks at a full scratch directory and makes
     /// room in it, so the next job to look sees what the first one freed.
     scratch_check: Arc<tokio::sync::Mutex<()>>,
@@ -166,7 +166,7 @@ pub struct Jobs {
     /// ahead wait while any does (P3-13).
     encoding: Encoding,
     /// Every job started and not yet dropped, to count (P3-14).
-    live: std::sync::Mutex<Vec<std::sync::Weak<EncodeJob>>>,
+    live: parking_lot::Mutex<Vec<std::sync::Weak<EncodeJob>>>,
     counters: Arc<JobCounters>,
 }
 
@@ -251,15 +251,15 @@ impl Jobs {
         // own is closed to others.
         crate::files::private_dir(&dir)?;
         Ok(Self {
-            places: Arc::new(std::sync::Mutex::new(Places {
+            places: Arc::new(parking_lot::Mutex::new(Places {
                 taken: 0,
                 max: limits.max_jobs,
             })),
             scratch_check: Arc::default(),
             encoding: Encoding::default(),
-            live: std::sync::Mutex::default(),
+            live: parking_lot::Mutex::default(),
             counters: Arc::default(),
-            limits: std::sync::RwLock::new(limits),
+            limits: parking_lot::RwLock::new(limits),
             dir,
             ffmpeg,
         })
@@ -267,10 +267,7 @@ impl Jobs {
 
     /// The limits now.
     pub fn limits(&self) -> JobLimits {
-        self.limits
-            .read()
-            .expect("never held across a panic")
-            .clone()
+        self.limits.read().clone()
     }
 
     /// Run new jobs under `limits` from now on. Jobs running go on as they
@@ -278,8 +275,8 @@ impl Jobs {
     /// enough jobs end. The scratch directory stays the one the jobs
     /// started in: it changes only with a restart.
     pub fn set_limits(&self, limits: JobLimits) {
-        self.places.lock().expect("never held across a panic").max = limits.max_jobs;
-        let mut now = self.limits.write().expect("never held across a panic");
+        self.places.lock().max = limits.max_jobs;
+        let mut now = self.limits.write();
         *now = JobLimits {
             scratch_dir: now.scratch_dir.clone(),
             ..limits
@@ -299,7 +296,7 @@ impl Jobs {
     /// The jobs now, and what they did (P3-14).
     pub fn counts(&self) -> JobCounts {
         let jobs: Vec<Arc<EncodeJob>> = {
-            let mut live = self.live.lock().expect("never held across a panic");
+            let mut live = self.live.lock();
             live.retain(|job| job.strong_count() > 0);
             live.iter().filter_map(std::sync::Weak::upgrade).collect()
         };
@@ -348,7 +345,7 @@ impl Jobs {
                 }
             },
         };
-        let slot = Arc::new(std::sync::Mutex::new(Some(slot)));
+        let slot = Arc::new(parking_lot::Mutex::new(Some(slot)));
         std::fs::create_dir_all(&dir).map_err(|e| JobError::Prepare(e.to_string()))?;
         let Run {
             args,
@@ -380,7 +377,7 @@ impl Jobs {
             .kill_on_drop(true)
             .spawn()
             .map_err(cannot_run)?;
-        // The run's process group: ffmpeg, or bubblewrap with ffmpeg in it.
+        // The run's process group, which ffmpeg leads.
         let pid = child.id().unwrap_or(0);
         let (progress_tx, progress) = watch::channel(Progress::default());
         let progress_tx = Arc::new(progress_tx);
@@ -390,7 +387,7 @@ impl Jobs {
             reader_segment: AtomicU32::new(0),
             first_kept: AtomicU32::new(first_segment),
             paused: AtomicBool::new(false),
-            stderr: std::sync::Mutex::default(),
+            stderr: parking_lot::Mutex::default(),
         });
         let supervisor = Supervisor {
             pid,
@@ -430,7 +427,7 @@ impl Jobs {
             task,
             slot,
         });
-        let mut live = self.live.lock().expect("never held across a panic");
+        let mut live = self.live.lock();
         live.retain(|job| job.strong_count() > 0);
         live.push(Arc::downgrade(&job));
         Ok(job)
@@ -476,12 +473,12 @@ struct Shared {
     first_kept: AtomicU32,
     paused: AtomicBool,
     /// ffmpeg's last [`STDERR_KEPT`] lines of stderr.
-    stderr: std::sync::Mutex<VecDeque<String>>,
+    stderr: parking_lot::Mutex<VecDeque<String>>,
 }
 
 impl Shared {
     fn stderr_line(&self, line: String) {
-        let mut kept = self.stderr.lock().expect("never poisoned");
+        let mut kept = self.stderr.lock();
         if kept.len() == STDERR_KEPT {
             kept.pop_front();
         }
@@ -490,7 +487,7 @@ impl Shared {
 
     /// The last [`STDERR_LINES`], for a failure's report.
     fn stderr_tail(&self) -> Vec<String> {
-        let kept = self.stderr.lock().expect("never poisoned");
+        let kept = self.stderr.lock();
         kept.iter()
             .skip(kept.len().saturating_sub(STDERR_LINES))
             .cloned()
@@ -519,7 +516,7 @@ pub struct EncodeJob {
     task: JoinHandle<()>,
     /// Held while ffmpeg may run; released by [`EncodeJob::stop`], or by
     /// the job itself when it ends a stalled ffmpeg.
-    slot: Arc<std::sync::Mutex<Option<Slot>>>,
+    slot: Arc<parking_lot::Mutex<Option<Slot>>>,
 }
 
 impl EncodeJob {
@@ -533,7 +530,7 @@ impl EncodeJob {
             }
             signal(self.pid, libc::SIGKILL);
         }
-        self.slot.lock().expect("never poisoned").take();
+        self.slot.lock().take();
     }
 
     /// End the encode where it is (P3-15's End conversion): ffmpeg is
@@ -581,18 +578,12 @@ impl EncodeJob {
     /// ffmpeg's last lines of stderr, oldest first, at most
     /// [`STDERR_KEPT`].
     pub fn stderr(&self) -> Vec<String> {
-        self.shared
-            .stderr
-            .lock()
-            .expect("never poisoned")
-            .iter()
-            .cloned()
-            .collect()
+        self.shared.stderr.lock().iter().cloned().collect()
     }
 
     /// The job's slot, for the job that replaces it; none once stopped.
     pub fn slot(&self) -> Option<Slot> {
-        self.slot.lock().expect("never poisoned").clone()
+        self.slot.lock().clone()
     }
 
     pub fn dir(&self) -> &Path {
@@ -656,8 +647,7 @@ impl Drop for EncodeJob {
     }
 }
 
-/// `sig` to the run's process group, which `pid` leads: ffmpeg, or
-/// bubblewrap and the ffmpeg it runs.
+/// `sig` to the run's process group, which `pid` (ffmpeg) leads.
 fn signal(pid: u32, sig: libc::c_int) {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return;
@@ -685,7 +675,7 @@ struct Supervisor {
     stalled_after: Duration,
     shared: Arc<Shared>,
     /// The job's slot, let go of when a stalled ffmpeg is ended.
-    slot: Arc<std::sync::Mutex<Option<Slot>>>,
+    slot: Arc<parking_lot::Mutex<Option<Slot>>>,
     progress: Arc<watch::Sender<Progress>>,
     counters: Arc<JobCounters>,
     /// Counted as encoding for as long as the supervisor runs: until
@@ -755,7 +745,7 @@ impl Supervisor {
                             stderr = ?self.shared.stderr_tail(),
                             "an encode stalled"
                         );
-                        self.slot.lock().expect("never poisoned").take();
+                        self.slot.lock().take();
                         self.counters.stalled.inc();
                         self.finish(Err(Failure::server(format!(
                             "the conversion stalled: ffmpeg made no progress for {:?}",
@@ -999,17 +989,17 @@ mod tests {
 
     #[test]
     fn a_lower_limit_takes_effect_as_jobs_end_and_a_higher_one_at_once() {
-        let places = Arc::new(std::sync::Mutex::new(Places { taken: 0, max: 2 }));
+        let places = Arc::new(parking_lot::Mutex::new(Places { taken: 0, max: 2 }));
         let first = Place::take(&places).unwrap();
         let second = Place::take(&places).unwrap();
         assert!(Place::take(&places).is_none());
-        places.lock().unwrap().max = 1;
+        places.lock().max = 1;
         drop(first);
         // Still one taken, and one is all there is.
         assert!(Place::take(&places).is_none());
         drop(second);
         let third = Place::take(&places).unwrap();
-        places.lock().unwrap().max = 3;
+        places.lock().max = 3;
         let _fourth = Place::take(&places).unwrap();
         drop(third);
     }

@@ -12,8 +12,9 @@
 //! against the row's `updated_at`. A pull keeps Plex's timestamp, so the
 //! next run finds both sides equal and does nothing: no ping-pong.
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use spoolframe_admin_api::{PlexSyncRun, SyncDirection};
@@ -341,19 +342,14 @@ impl WatchSync {
     }
 
     fn runs(&self, user: LocalUserId) -> Arc<UserRuns> {
-        self.users
-            .lock()
-            .expect("never held across a panic")
-            .entry(user)
-            .or_default()
-            .clone()
+        self.users.lock().entry(user).or_default().clone()
     }
 
     /// `user`'s last run since the server started, and whether one is
     /// going on.
     pub fn status(&self, user: LocalUserId) -> (Option<PlexSyncRun>, bool) {
         let runs = self.runs(user);
-        let last = runs.last.lock().expect("never held across a panic").clone();
+        let last = runs.last.lock().clone();
         (last, runs.running.try_lock().is_err())
     }
 
@@ -390,8 +386,7 @@ impl WatchSync {
             }
         }
         if !dry_run {
-            *runs.last.lock().expect("never held across a panic") =
-                Some(report.run(crate::store::now()));
+            *runs.last.lock() = Some(report.run(crate::store::now()));
         }
         Ok(report)
     }
@@ -485,10 +480,7 @@ impl WatchSync {
                     .into_iter()
                     .filter_map(|r| Some((r.machine_id, r.access_token?)))
                     .collect();
-                self.access
-                    .lock()
-                    .expect("never held across a panic")
-                    .insert(user, tokens);
+                self.access.lock().insert(user, tokens);
                 self.known_token(user, &machine).ok_or_else(no_access)
             }
             Err(e) => {
@@ -505,7 +497,6 @@ impl WatchSync {
     fn known_token(&self, user: LocalUserId, machine: &str) -> Option<String> {
         self.access
             .lock()
-            .expect("never held across a panic")
             .get(&user)
             .and_then(|tokens| tokens.get(machine).cloned())
     }
@@ -513,30 +504,19 @@ impl WatchSync {
     /// The machine identifier of the PMS `plex` reaches, asked once.
     async fn machine(&self, plex: &PlexCatalog) -> Result<String, CatalogError> {
         let url = plex.base_url().to_owned();
-        let known = self
-            .machines
-            .lock()
-            .expect("never held across a panic")
-            .get(&url)
-            .cloned();
+        let known = self.machines.lock().get(&url).cloned();
         if let Some(id) = known {
             return Ok(id);
         }
         let id = plex.machine_id().await?.unwrap_or_default();
-        self.machines
-            .lock()
-            .expect("never held across a panic")
-            .insert(url, id.clone());
+        self.machines.lock().insert(url, id.clone());
         Ok(id)
     }
 
     /// Forget what `user`'s account was told about servers: plex.tv is
     /// asked again at their next run.
     fn forget_access(&self, user: LocalUserId) {
-        self.access
-            .lock()
-            .expect("never held across a panic")
-            .remove(&user);
+        self.access.lock().remove(&user);
     }
 
     /// The section each of `ids` is in, asked of Plex once per item; left
@@ -546,12 +526,7 @@ impl WatchSync {
         let mut found = HashMap::new();
         for id in ids {
             let key = (url.clone(), id.clone());
-            let cached = self
-                .sections
-                .lock()
-                .expect("never held across a panic")
-                .get(&key)
-                .cloned();
+            let cached = self.sections.lock().get(&key).cloned();
             let section = match cached {
                 Some(section) => section,
                 None => {
@@ -566,10 +541,7 @@ impl WatchSync {
                         }
                     };
                     if let Some(section) = &asked {
-                        self.sections
-                            .lock()
-                            .expect("never held across a panic")
-                            .insert(key, section.clone());
+                        self.sections.lock().insert(key, section.clone());
                     }
                     asked.flatten()
                 }
@@ -757,11 +729,7 @@ impl WatchSync {
             let principal = Principal::LocalUser(user);
             schedule(sync.interval, changes, principal, || sync.run_logged(user)).await;
         });
-        let before = self
-            .tasks
-            .lock()
-            .expect("never held across a panic")
-            .insert(user, task.abort_handle());
+        let before = self.tasks.lock().insert(user, task.abort_handle());
         if let Some(before) = before {
             before.abort();
         }
@@ -769,20 +737,12 @@ impl WatchSync {
 
     /// Stop `user`'s runs: unlinked, not synced.
     fn unfollow(&self, user: LocalUserId) {
-        let task = self
-            .tasks
-            .lock()
-            .expect("never held across a panic")
-            .remove(&user);
+        let task = self.tasks.lock().remove(&user);
         if let Some(task) = task {
             task.abort();
         }
         self.forget_access(user);
-        *self
-            .runs(user)
-            .last
-            .lock()
-            .expect("never held across a panic") = None;
+        *self.runs(user).last.lock() = None;
     }
 
     async fn run_logged(&self, user: LocalUserId) {
@@ -798,11 +758,7 @@ impl WatchSync {
             ),
             Err(e) => {
                 tracing::warn!(user = %user, error = %e, "Plex watch sync; trying again later");
-                *self
-                    .runs(user)
-                    .last
-                    .lock()
-                    .expect("never held across a panic") = Some(PlexSyncRun {
+                *self.runs(user).last.lock() = Some(PlexSyncRun {
                     at: crate::store::now(),
                     notes: vec![format!("Not synced: {e}")],
                     ..PlexSyncRun::default()
@@ -1164,15 +1120,15 @@ mod tests {
     /// Run [`schedule`] every 2 minutes; the seconds at which it ran.
     fn scheduled() -> (
         tokio::sync::broadcast::Sender<Principal>,
-        Arc<std::sync::Mutex<Vec<u64>>>,
+        Arc<parking_lot::Mutex<Vec<u64>>>,
     ) {
         let changed = tokio::sync::broadcast::Sender::new(16);
         let changes = changed.subscribe();
-        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runs = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let ran = runs.clone();
         let start = tokio::time::Instant::now();
         tokio::spawn(schedule(Duration::from_secs(120), changes, ME, move || {
-            ran.lock().unwrap().push(start.elapsed().as_secs());
+            ran.lock().push(start.elapsed().as_secs());
             async {}
         }));
         (changed, runs)
@@ -1188,7 +1144,7 @@ mod tests {
             changed.send(ME).unwrap();
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
-        assert_eq!(*runs.lock().unwrap(), [0, 60, 120, 180, 240, 300]);
+        assert_eq!(*runs.lock(), [0, 60, 120, 180, 240, 300]);
     }
 
     /// The minute is counted from the last run, not from the change, and
@@ -1199,7 +1155,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(70)).await;
         changed.send(ME).unwrap();
         tokio::time::sleep(Duration::from_secs(10)).await;
-        assert_eq!(*runs.lock().unwrap(), [0, 75]);
+        assert_eq!(*runs.lock(), [0, 75]);
     }
 
     /// The interval's run is due at 120 s. A change 3 s before it does not
@@ -1210,7 +1166,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(117)).await;
         changed.send(ME).unwrap();
         tokio::time::sleep(Duration::from_secs(133)).await;
-        assert_eq!(*runs.lock().unwrap(), [0, 120, 240]);
+        assert_eq!(*runs.lock(), [0, 120, 240]);
     }
 
     /// Changes while a run waits to settle are in that run: none brings
@@ -1224,7 +1180,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         tokio::time::sleep(Duration::from_secs(80)).await;
-        assert_eq!(*runs.lock().unwrap(), [0, 75]);
+        assert_eq!(*runs.lock(), [0, 75]);
     }
 
     /// Another user's changes are theirs: they bring no run of mine
@@ -1238,9 +1194,9 @@ mod tests {
         changed.send(ME).unwrap();
         changed.send(SOMEONE_ELSE).unwrap();
         tokio::time::sleep(Duration::from_secs(9)).await;
-        assert_eq!(*runs.lock().unwrap(), [0, 76]);
+        assert_eq!(*runs.lock(), [0, 76]);
         changed.send(SOMEONE_ELSE).unwrap();
         tokio::time::sleep(Duration::from_secs(60)).await;
-        assert_eq!(*runs.lock().unwrap(), [0, 76]);
+        assert_eq!(*runs.lock(), [0, 76]);
     }
 }

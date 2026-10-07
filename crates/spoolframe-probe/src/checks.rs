@@ -1,0 +1,493 @@
+//! The checks. Each one is a stranger doing one thing the server documents
+//! a limit for, with well-formed frames only, and what the server must
+//! answer. Each ends with a `Ping`, to show the connection or the server
+//! is still fine after it.
+
+use std::time::{Duration, Instant};
+
+use iroh::endpoint::{Connection, ConnectionError, ReadError, VarInt};
+use spoolframe_protocol::streams::{bi, reset};
+use spoolframe_protocol::{
+    BitmapSubtitles, Error, LoginPassword, PROTOCOL_VERSION, Reply, Request, Response, ServerInfo,
+    close,
+};
+use spoolframe_types::{MediaId, MediaKind, Namespace};
+use tokio::io::AsyncWriteExt;
+use tokio::time::{sleep, timeout};
+
+use crate::wire::{Conn, Probe, Problem, describe, hello, hello_for};
+use crate::{Config, Status};
+
+/// How long an open the server gives no credit for is given. Credit comes
+/// in the handshake, so an open either returns at once or never.
+const NO_CREDIT: Duration = Duration::from_secs(1);
+
+/// How long the probe's own closed connections are given to leave the
+/// server's count before the stranger-cap check counts.
+const SETTLE: Duration = Duration::from_secs(1);
+
+/// One check's verdict and what it saw.
+pub(crate) struct Outcome {
+    pub status: Status,
+    pub evidence: Vec<String>,
+}
+
+impl Outcome {
+    fn skip(why: &str) -> Self {
+        Self {
+            status: Status::Skip,
+            evidence: vec![why.to_owned()],
+        }
+    }
+}
+
+/// Lines of evidence, each one as expected or not: the check passes when
+/// all are.
+#[derive(Default)]
+struct Findings {
+    lines: Vec<String>,
+    failed: bool,
+}
+
+impl Findings {
+    fn expect(&mut self, ok: bool, line: String) {
+        self.failed |= !ok;
+        self.lines.push(if ok {
+            line
+        } else {
+            format!("UNEXPECTED: {line}")
+        });
+    }
+
+    fn note(&mut self, line: String) {
+        self.lines.push(line);
+    }
+
+    /// `request` on `conn` is answered with an error `matches` accepts.
+    async fn expect_error(
+        &mut self,
+        probe: &Probe,
+        conn: &Connection,
+        what: &str,
+        request: Request,
+        matches: impl Fn(&Error) -> bool,
+    ) -> Result<(), Problem> {
+        let response = probe.request(conn, None, request).await?;
+        let ok = matches!(&response, Response::Err(e) if matches(e));
+        self.expect(ok, format!("{what}: {}", describe(&response)));
+        Ok(())
+    }
+
+    /// A `Ping` on `conn` is still answered `Pong`.
+    async fn still_usable(
+        &mut self,
+        probe: &Probe,
+        conn: &Connection,
+        after: &str,
+    ) -> Result<(), Problem> {
+        match probe.request(conn, None, Request::Ping).await {
+            Ok(response) => {
+                let ok = response == Response::Ok(Reply::Pong);
+                self.expect(ok, format!("Ping after {after}: {}", describe(&response)));
+                Ok(())
+            }
+            Err(Problem::Failed(why)) => {
+                self.expect(false, format!("Ping after {after}: {why}"));
+                Ok(())
+            }
+            Err(stop) => Err(stop),
+        }
+    }
+
+    fn done(self) -> Outcome {
+        Outcome {
+            status: if self.failed {
+                Status::Fail
+            } else {
+                Status::Pass
+            },
+            evidence: self.lines,
+        }
+    }
+}
+
+/// A good `Hello` and a `Ping`: the server is there to probe.
+pub(crate) async fn preflight(probe: &Probe) -> Result<ServerInfo, Problem> {
+    let (conn, info) = probe.connect_hello().await?;
+    match probe.request(&conn, None, Request::Ping).await? {
+        Response::Ok(Reply::Pong) => Ok(info),
+        other => Err(Problem::Failed(format!(
+            "Ping after Hello: {}",
+            describe(&other)
+        ))),
+    }
+}
+
+/// The checks, in the order they run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Check {
+    HelloVersion,
+    Unauthenticated,
+    UniStream,
+    BiStreams,
+    FrameSize,
+    FirstFrame,
+    SignInLimits,
+    StrangerCap,
+}
+
+impl Check {
+    pub const ALL: [Check; 8] = [
+        Check::HelloVersion,
+        Check::Unauthenticated,
+        Check::UniStream,
+        Check::BiStreams,
+        Check::FrameSize,
+        Check::FirstFrame,
+        Check::SignInLimits,
+        // Last: it fills the server's stranger slots, and nothing after it
+        // should meet a full server.
+        Check::StrangerCap,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Check::HelloVersion => "hello-version",
+            Check::Unauthenticated => "unauthenticated",
+            Check::UniStream => "uni-stream",
+            Check::BiStreams => "bi-streams",
+            Check::FrameSize => "frame-size",
+            Check::FirstFrame => "first-frame",
+            Check::SignInLimits => "sign-in-limits",
+            Check::StrangerCap => "stranger-cap",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Check::HelloVersion => "Hello with the wrong PROTOCOL_VERSION is refused",
+            Check::Unauthenticated => {
+                "requests that need a session are Unauthenticated without one"
+            }
+            Check::UniStream => "a stranger cannot open a unidirectional stream",
+            Check::BiStreams => "a stranger gets no more bidirectional streams than the limit",
+            Check::FrameSize => {
+                "a stranger's well-formed request above the frame limit is Malformed"
+            }
+            Check::FirstFrame => "a stream that sends nothing after its kind byte is reset",
+            Check::SignInLimits => "wrong passwords for a made-up user reach RateLimited",
+            Check::StrangerCap => "the stranger connection past the cap is closed BUSY",
+        }
+    }
+
+    pub(crate) async fn run(self, probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
+        match self {
+            Check::HelloVersion => hello_version(probe).await,
+            Check::Unauthenticated => unauthenticated(probe).await,
+            Check::UniStream => uni_stream(probe).await,
+            Check::BiStreams => bi_streams(probe, config).await,
+            Check::FrameSize => frame_size(probe, config).await,
+            Check::FirstFrame => first_frame(probe, config).await,
+            Check::SignInLimits if config.check_limits => sign_in_limits(probe, config).await,
+            Check::SignInLimits => Ok(Outcome::skip(
+                "not asked for: pass --check-limits (failed logins for a made-up username)",
+            )),
+            Check::StrangerCap if config.check_cap => stranger_cap(probe, config).await,
+            Check::StrangerCap => Ok(Outcome::skip(
+                "not asked for: pass --check-cap (opens cap+1 connections)",
+            )),
+        }
+    }
+}
+
+/// Check 1: a `Hello` from another protocol revision is refused, and not
+/// kept: the connection still has to say a good one.
+async fn hello_version(probe: &Probe) -> Result<Outcome, Problem> {
+    let mut f = Findings::default();
+    let conn = probe.connect().await?;
+    let wrong = PROTOCOL_VERSION + 1000;
+    f.expect_error(
+        probe,
+        &conn,
+        &format!("Hello with protocol_version {wrong} (the server's is {PROTOCOL_VERSION})"),
+        hello_for(wrong, None),
+        |e| matches!(e, Error::Unsupported { .. }),
+    )
+    .await?;
+    f.expect_error(
+        probe,
+        &conn,
+        "Ping after the refused Hello",
+        Request::Ping,
+        |e| *e == Error::HandshakeRequired,
+    )
+    .await?;
+    let response = probe.request(&conn, None, hello(None)).await?;
+    f.expect(
+        matches!(response, Response::Ok(Reply::ServerInfo(_))),
+        format!("a good Hello after it: {}", describe(&response)),
+    );
+    f.still_usable(probe, &conn, "the good Hello").await?;
+    Ok(f.done())
+}
+
+/// Check 2: a sample of the requests that need a session (a read, a
+/// mutation and the server's own addresses), sent with none.
+async fn unauthenticated(probe: &Probe) -> Result<Outcome, Problem> {
+    let mut f = Findings::default();
+    let (conn, _) = probe.connect_hello().await?;
+    let id = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").expect("a valid media id");
+    let sample = [
+        ("Libraries", Request::Libraries),
+        ("Item", Request::Item { id: id.clone() }),
+        (
+            "StartPlayback",
+            Request::StartPlayback {
+                id,
+                selection: None,
+                start_ms: None,
+                bitmap: BitmapSubtitles::Auto,
+            },
+        ),
+        ("ServerAddresses", Request::ServerAddresses),
+    ];
+    for (what, request) in sample {
+        f.expect_error(probe, &conn, &format!("{what}, no session"), request, |e| {
+            *e == Error::Unauthenticated
+        })
+        .await?;
+    }
+    f.still_usable(probe, &conn, "the refused requests").await?;
+    Ok(f.done())
+}
+
+/// Check 3a: the server takes no unidirectional stream from a client
+/// (events go the other way), so a stranger gets no credit for one.
+/// Nothing is written on it if it opens.
+async fn uni_stream(probe: &Probe) -> Result<Outcome, Problem> {
+    let mut f = Findings::default();
+    let (conn, _) = probe.connect_hello().await?;
+    probe.spend()?;
+    match timeout(NO_CREDIT, conn.open_uni()).await {
+        Err(_) => f.expect(
+            true,
+            format!("open_uni: no stream credit within {NO_CREDIT:?} (refused)"),
+        ),
+        Ok(Err(e)) => f.expect(true, format!("open_uni: refused: {e}")),
+        Ok(Ok(mut send)) => {
+            // Opened: a server that resets it still keeps the limit.
+            let _ = send.finish();
+            match timeout(NO_CREDIT, send.stopped()).await {
+                Ok(Ok(Some(code))) => f.expect(
+                    true,
+                    format!("open_uni: opened, then stopped by the server with code {code}"),
+                ),
+                other => f.expect(
+                    false,
+                    format!("open_uni: a stranger opened a uni stream and it was kept ({other:?})"),
+                ),
+            }
+        }
+    }
+    f.still_usable(probe, &conn, "the uni stream").await?;
+    Ok(f.done())
+}
+
+/// Check 3b: a stranger has `bi_streams` bidirectional streams at once
+/// and not one more. On a connection that has used none, so every credit
+/// is in.
+async fn bi_streams(probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
+    let mut f = Findings::default();
+    let conn = probe.connect().await?;
+    let limit = config.expect.bi_streams;
+    let mut held = Vec::new();
+    for _ in 0..=limit {
+        probe.spend()?;
+        match timeout(NO_CREDIT, conn.open_bi()).await {
+            Ok(Ok(stream)) => held.push(stream),
+            Ok(Err(e)) => {
+                f.note(format!("open_bi #{}: {e}", held.len() + 1));
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    f.expect(
+        held.len() == limit as usize,
+        format!(
+            "{} of {} bidirectional streams opened at once (limit {limit})",
+            held.len(),
+            limit + 1
+        ),
+    );
+    // Dropped unwritten, they are finished, and their credit comes back.
+    drop(held);
+    let response = probe.request(&conn, None, hello(None)).await?;
+    f.expect(
+        matches!(response, Response::Ok(Reply::ServerInfo(_))),
+        format!("Hello once they are closed: {}", describe(&response)),
+    );
+    f.still_usable(probe, &conn, "the held streams").await?;
+    Ok(f.done())
+}
+
+/// Check 3c: a real request (a `Hello` with a long `device_name`) encoded
+/// past the stranger frame limit, and within the protocol's own, is
+/// refused by its length, `Malformed`; the same connection carries on.
+async fn frame_size(probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
+    let mut f = Findings::default();
+    let (conn, _) = probe.connect_hello().await?;
+    let max = config.expect.max_frame as usize;
+    let request = hello(Some(format!("spoolframe-probe {}", "x".repeat(max + 1024))));
+    let size = probe.encode(None, request.clone())?.len();
+    f.note(format!(
+        "a Hello whose device_name makes it {size} bytes encoded (limit {max})"
+    ));
+    let response = probe.request(&conn, None, request).await?;
+    f.expect(
+        matches!(response, Response::Err(Error::Malformed { .. })),
+        format!("its reply: {}", describe(&response)),
+    );
+    f.still_usable(probe, &conn, "the long request").await?;
+    Ok(f.done())
+}
+
+/// Check 3d: a stream that sends its kind byte and then nothing (the
+/// server cannot see a stream before its first byte) is reset with
+/// `FIRST_FRAME_TIMEOUT` once `network.first_frame_timeout_secs` passes.
+async fn first_frame(probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
+    let mut f = Findings::default();
+    let (conn, _) = probe.connect_hello().await?;
+    let (mut send, mut recv) = probe.open(&conn).await?;
+    if let Err(e) = send.write_u8(bi::RPC).await {
+        return Err(Problem::Failed(format!("cannot write the kind byte: {e}")));
+    }
+    let began = Instant::now();
+    let mut buf = [0u8; 16];
+    let read = timeout(config.first_frame_wait, recv.read(&mut buf)).await;
+    let waited = began.elapsed();
+    let want = VarInt::from_u32(reset::FIRST_FRAME_TIMEOUT);
+    match read {
+        Ok(Err(ReadError::Reset(code))) => f.expect(
+            code == want,
+            format!(
+                "the stream was reset with code {code} after {:.1} s (FIRST_FRAME_TIMEOUT is {want})",
+                waited.as_secs_f64()
+            ),
+        ),
+        Ok(other) => f.expect(
+            false,
+            format!(
+                "the stream ended otherwise after {:.1} s: {other:?}",
+                waited.as_secs_f64()
+            ),
+        ),
+        Err(_) => f.expect(
+            false,
+            format!(
+                "the stream was still open after {:.1} s",
+                config.first_frame_wait.as_secs_f64()
+            ),
+        ),
+    }
+    drop((send, recv));
+    probe.answered();
+    f.still_usable(probe, &conn, "the reset").await?;
+    Ok(f.done())
+}
+
+/// Check 5: failed logins for a username no server has, made from this
+/// run's own fresh key: `failures` are refused as wrong, the next is
+/// `RateLimited`. Never a real username.
+async fn sign_in_limits(probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
+    let mut f = Findings::default();
+    let (conn, _) = probe.connect_hello().await?;
+    let id = probe.id().to_string();
+    let username = format!("spoolframe-probe-{}", &id[..16]);
+    f.note(format!("username {username:?}, made up for this run"));
+    let failures = config.expect.failures;
+    for attempt in 1..=failures + 1 {
+        let request = Request::LoginPassword(LoginPassword {
+            username: username.clone(),
+            password: format!("not-the-password-{attempt}"),
+            remember: false,
+        });
+        let response = probe.request(&conn, None, request).await?;
+        let ok = if attempt <= failures {
+            response == Response::Err(Error::InvalidCredentials)
+        } else {
+            matches!(response, Response::Err(Error::RateLimited { .. }))
+        };
+        f.expect(ok, format!("attempt {attempt}: {}", describe(&response)));
+    }
+    f.still_usable(probe, &conn, "the refused logins").await?;
+    Ok(f.done())
+}
+
+/// Check 4: stranger connections, one at a time and each with a `Hello`,
+/// until one is closed `BUSY` or `cap`+1 are held. All are closed after.
+async fn stranger_cap(probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
+    let mut f = Findings::default();
+    let cap = config.expect.cap as usize;
+    sleep(SETTLE).await;
+    let mut held: Vec<Conn> = Vec::new();
+    let mut busy_at = None;
+    while held.len() <= cap {
+        sleep(config.cap_pace).await;
+        let conn = probe.connect().await?;
+        match probe.request(&conn, None, hello(None)).await {
+            Ok(Response::Ok(Reply::ServerInfo(_))) => held.push(conn),
+            Ok(other) => {
+                return Err(Problem::Failed(format!(
+                    "connection {}: Hello answered {}",
+                    held.len() + 1,
+                    describe(&other)
+                )));
+            }
+            Err(Problem::Failed(why)) => match timeout(probe.reply_timeout, conn.closed()).await {
+                Ok(ConnectionError::ApplicationClosed(c))
+                    if c.error_code == VarInt::from_u32(close::BUSY) =>
+                {
+                    // The refusal is the server's answer.
+                    probe.answered();
+                    busy_at = Some(held.len() + 1);
+                    break;
+                }
+                other => {
+                    return Err(Problem::Failed(format!(
+                        "connection {}: {why}; closed {other:?}",
+                        held.len() + 1
+                    )));
+                }
+            },
+            Err(stop) => return Err(stop),
+        }
+    }
+    let admitted = held.len();
+    drop(held);
+    match busy_at {
+        Some(n) if n == cap + 1 => f.expect(
+            true,
+            format!("{admitted} connections admitted; connection {n} closed BUSY (cap {cap})"),
+        ),
+        // Strangers the probe does not know of hold the rest.
+        Some(n) => f.expect(
+            true,
+            format!(
+                "{admitted} connections admitted; connection {n} closed BUSY (cap {cap}: {} \
+                 other stranger connections were held)",
+                cap + 1 - n
+            ),
+        ),
+        None => f.expect(
+            false,
+            format!("{admitted} connections admitted, past the cap of {cap}"),
+        ),
+    }
+    // The closes reach the server, and its count goes down.
+    sleep(SETTLE).await;
+    let (conn, _) = probe.connect_hello().await?;
+    f.still_usable(probe, &conn, "closing the connections")
+        .await?;
+    Ok(f.done())
+}
