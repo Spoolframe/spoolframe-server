@@ -67,7 +67,8 @@ pub(crate) fn reservation(request: &Request) -> usize {
 /// capacity; and they are held in two pools of their own (finding 48):
 ///
 /// - sign-ins a stranger makes only with a token from the bucket all
-///   strangers share (`LoginPassword`, `Begin`/`FinishPasskeySignIn`),
+///   strangers share (`LoginPassword`, `Begin`/`FinishPasskeySignIn`,
+///   `RedeemInvite`),
 ///   which the bucket's rate keeps from filling theirs;
 /// - requests that draw on no rate limit (`BeginDeviceSignIn`,
 ///   `AwaitDeviceSignIn`, `ResumeProfile`), held by what they wait on: a
@@ -102,7 +103,8 @@ impl Pools {
         match request {
             Request::LoginPassword(_)
             | Request::BeginPasskeySignIn { .. }
-            | Request::FinishPasskeySignIn { .. } => (&self.sign_in, true),
+            | Request::FinishPasskeySignIn { .. }
+            | Request::RedeemInvite(_) => (&self.sign_in, true),
             Request::BeginDeviceSignIn { .. }
             | Request::AwaitDeviceSignIn { .. }
             | Request::ResumeProfile { .. } => (&self.device, true),
@@ -542,6 +544,22 @@ mod tests {
             retry.execute.is_some(),
             "the retry was answered from a kept outcome"
         );
+    }
+
+    /// An invite's redemption (P6-01) is a sign-in on the strangers'
+    /// budget: held in their sign-in pool, where a refusal is not kept.
+    #[test]
+    fn an_invite_s_redemption_is_held_as_an_anonymous_sign_in() {
+        let pools = Pools::default();
+        let redeem = Request::RedeemInvite(spoolframe_protocol::RedeemInvite {
+            code: "QW7K-2MFP-XR4T".into(),
+            username: "mum".into(),
+            display_name: None,
+            password: "correct horse".into(),
+        });
+        let (pool, anonymous) = pools.of(&redeem);
+        assert!(anonymous);
+        assert!(Arc::ptr_eq(pool, &pools.sign_in));
     }
 
     /// Independent review M-1 (finding 48): eight strangers, each keeping

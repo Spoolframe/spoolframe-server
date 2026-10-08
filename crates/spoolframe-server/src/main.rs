@@ -132,7 +132,7 @@ unsafe impl std::alloc::GlobalAlloc for Allocator {
     }
 }
 
-use admin_cli::UserCommand;
+use admin_cli::{InviteCommand, UserCommand};
 
 /// How many items per library the startup check samples.
 const STARTUP_SAMPLE: u32 = 5;
@@ -204,6 +204,12 @@ enum Command {
     User {
         #[command(subcommand)]
         command: UserCommand,
+    },
+    /// Make, list and revoke invites (P6-01) through the running server's
+    /// admin API, logged in as an admin; and print the server's link.
+    Invite {
+        #[command(subcommand)]
+        command: InviteCommand,
     },
     /// The server's settings, and the layers they come from.
     Config {
@@ -496,6 +502,9 @@ async fn serve(cli: Cli) -> Result<Option<RestartMode>> {
             password_stdin,
         }) => admin_cli::setup(config.admin.listen()?, code, username, password_stdin).await,
         Some(Command::User { command }) => admin_cli::user(config.admin.listen()?, command).await,
+        Some(Command::Invite { command }) => {
+            admin_cli::invite(config.admin.listen()?, command).await
+        }
         Some(Command::Status) => admin_cli::status(config.admin.listen()?).await,
         Some(Command::Id) => {
             let key = identity::load_or_create(state_dir)?;

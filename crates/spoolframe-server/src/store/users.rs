@@ -135,7 +135,7 @@ impl From<sqlx::Error> for UserError {
     }
 }
 
-fn is_unique_violation(e: &sqlx::Error) -> bool {
+pub(super) fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.is_unique_violation())
 }
 
@@ -471,7 +471,7 @@ pub(super) async fn add_first_user(
     Ok(id)
 }
 
-async fn add_password(
+pub(super) async fn add_password(
     tx: &mut sqlx::SqliteConnection,
     user: LocalUserId,
     phc: &str,

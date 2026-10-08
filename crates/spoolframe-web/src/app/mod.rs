@@ -9,6 +9,7 @@ mod catalog_item;
 mod device;
 mod http;
 mod icons;
+mod invites;
 mod libraries;
 mod logs;
 mod overview;
@@ -31,6 +32,7 @@ use admin::{Server, UserSessions, Users};
 use catalog::CatalogLibrary;
 use catalog_item::CatalogItem;
 use device::DeviceApproval;
+use invites::Invites;
 use libraries::{AddLibrary, Libraries};
 use logs::LogsPage;
 use overview::AdminHome;
@@ -84,6 +86,9 @@ enum Route {
             Users {},
             #[route("/users/:username")]
             UserSessions { username: String },
+            // Invites (P6-01): under Users and devices in the sidebar.
+            #[route("/invites")]
+            Invites {},
             #[route("/server")]
             Server {},
             // Server's sub-pages (P3-14): what it does now, and its log.
@@ -1277,6 +1282,7 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::AdminHome {} => "Overview",
         Route::Profile {} => "My profile",
         Route::Server {} => "Server",
+        Route::Invites {} => "Invites",
         Route::ActivityPage {} => "Activity",
         Route::LogsPage {} => "Logs",
         Route::PlaybackPage {} | Route::PlaybackDetail { .. } => "Playback",
@@ -1339,6 +1345,7 @@ fn SignedIn(user: UserInfo) -> Element {
                 nav { class: "flex flex-col gap-0.5",
                     {link(Route::AdminHome {}, "Overview", false)}
                     {link(Route::Users {}, "Users and devices", false)}
+                    {users_links(&route)}
                     {link(Route::Server {}, "Server", false)}
                     {server_links(&route)}
                     {link(plex_page(), "Plex", false)}
@@ -1380,6 +1387,7 @@ fn SignedIn(user: UserInfo) -> Element {
                 nav { class: "drawer md:hidden", aria_label: "Admin", onclick: move |_| menu.set(false),
                     {link(Route::AdminHome {}, "Overview", false)}
                     {link(Route::Users {}, "Users and devices", false)}
+                    {users_links(&route)}
                     {link(Route::Server {}, "Server", false)}
                     {server_links(&route)}
                     {link(plex_page(), "Plex", false)}
@@ -1407,6 +1415,19 @@ fn SignedIn(user: UserInfo) -> Element {
 /// where the Plex Media Server and the admin's Plex account are.
 fn plex_page() -> Route {
     Route::Settings { tab: "plex".into() }
+}
+
+/// Users and devices' sub-page in the sidebar, one step in: Invites
+/// (P6-01).
+fn users_links(route: &Route) -> Element {
+    let here = matches!(route, Route::Invites {});
+    rsx! {
+        Link {
+            class: if here { "nav-link nav-link-here nav-sub" } else { "nav-link nav-sub" },
+            to: Route::Invites {},
+            "Invites"
+        }
+    }
 }
 
 /// Server's sub-pages in the sidebar, one step in: Activity (P3-14),

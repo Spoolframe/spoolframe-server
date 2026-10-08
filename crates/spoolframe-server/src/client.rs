@@ -31,8 +31,8 @@ use spoolframe_protocol::{
 };
 use spoolframe_protocol::{
     AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, FinishPasskeySignIn, Hello,
-    LoginPassword, PasskeyInfo, PinProof, PinState, PlexLink, PlexSyncSummary, Reply, Request,
-    Response, ServerInfo, SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile,
+    LoginPassword, PasskeyInfo, PinProof, PinState, PlexLink, PlexSyncSummary, RedeemInvite, Reply,
+    Request, Response, ServerInfo, SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile,
     UserSummary, is_app_rp_id,
 };
 use spoolframe_types::{ArtworkId, MediaId, Namespace, SubtitleFormat};
@@ -642,6 +642,14 @@ impl ClientProtocol {
                 let hello = state.hello.get().expect("checked above");
                 self.resume_profile(connection, &user_id, hello).await
             }
+            // P6-01: a sign-in a stranger makes, on the same budget.
+            Request::RedeemInvite(redeem) => {
+                let hello = state.hello.get().expect("checked above");
+                match self.stranger_attempt(state) {
+                    Ok(()) => self.redeem_invite(connection, &redeem, hello).await,
+                    Err(e) => Err(e),
+                }
+            }
             // Everything else needs a session that is live on this
             // endpoint. Each request names its own, so one connection can
             // serve several users at once (§15).
@@ -1056,7 +1064,10 @@ impl ClientProtocol {
             Error::ProfileLocked => Kind::ProfileLocked,
             Error::RecentSignInRequired => Kind::RecentSignInRequired,
             Error::RateLimited { .. } => Kind::RateLimited,
-            Error::InvalidCredentials => Kind::SignInFailed,
+            Error::InvalidCredentials
+            | Error::InviteInvalid
+            | Error::InviteExpired
+            | Error::InviteExhausted => Kind::SignInFailed,
             _ => return,
         };
         let source = connection.remote_id().fmt_short().to_string();
@@ -1083,6 +1094,11 @@ impl ClientProtocol {
                     // playback another session started (PB).
                     Some(_) => (kind, "playback is another session's"),
                 },
+            },
+            Kind::SignInFailed if asked.invite => match error {
+                Error::InviteExpired => (kind, "invite expired"),
+                Error::InviteExhausted => (kind, "invite used up"),
+                _ => (kind, "wrong or revoked invite code"),
             },
             Kind::SignInFailed => match (&asked.username, asked.credential) {
                 (Some(username), _) => (kind, auth.why_password_refused(username).await),
@@ -2283,6 +2299,7 @@ impl ClientProtocol {
             | Request::FinishPasskeySignIn { .. }
             | Request::TrustedProfiles
             | Request::ResumeProfile { .. }
+            | Request::RedeemInvite(_)
             | Request::Unknown => {
                 unreachable!("pre-auth and unknown requests are answered before the session check")
             }
@@ -2347,6 +2364,43 @@ impl ClientProtocol {
             }
             Err(e) => Err(login_error(e)),
         }
+    }
+
+    /// Make an account with an invite (P6-01) from this connection's
+    /// endpoint, and a session bound to it, as [`Self::login_password`]
+    /// opens: the endpoint is also what its wrong codes are counted as.
+    async fn redeem_invite(
+        &self,
+        connection: &Connection,
+        redeem: &RedeemInvite,
+        hello: &Hello,
+    ) -> Result<Reply, Error> {
+        let endpoint_id = connection.remote_id().to_string();
+        let (user, role) = crate::invites::redeem(&self.services.auth, &endpoint_id, redeem)
+            .await
+            .map_err(redeem_error)?;
+        let binding = SessionBinding::Endpoint {
+            endpoint_id: endpoint_id.clone(),
+            device_name: hello.device_name.clone(),
+            platform: hello.platform,
+        };
+        let token = self
+            .services
+            .auth
+            .open_session(user, &binding)
+            .await
+            .map_err(internal)?;
+        tracing::info!(
+            endpoint = %endpoint_id,
+            %user,
+            %role,
+            "an account was made with an invite"
+        );
+        self.signed_in(connection);
+        Ok(Reply::LoggedIn {
+            session: SessionId(token.0),
+            remembered: false,
+        })
     }
 
     /// A sign-in with an app passkey (P3-19) from this connection's
@@ -3107,6 +3161,9 @@ struct Asked {
     credential: Option<&'static str>,
     /// A trusted device's resume (P4-01), which has no session yet.
     resume: bool,
+    /// An invite's redemption (P6-01): the username in it is one asked
+    /// for, not one tried.
+    invite: bool,
 }
 
 impl Asked {
@@ -3154,6 +3211,7 @@ impl Asked {
             | Request::FinishConfirmPasskey(_)
             | Request::FinishPasskeyRegistration(_) => asked.credential = Some("passkey refused"),
             Request::ResumeProfile { .. } => asked.resume = true,
+            Request::RedeemInvite(_) => asked.invite = true,
             _ => {}
         }
         asked
@@ -3174,6 +3232,25 @@ impl Asked {
             session,
             ..Self::default()
         }
+    }
+}
+
+/// A redemption that made no account, for the client.
+fn redeem_error(e: crate::invites::RedeemError) -> Error {
+    use crate::invites::RedeemError;
+    match e {
+        RedeemError::Invalid => Error::InviteInvalid,
+        RedeemError::Expired => Error::InviteExpired,
+        RedeemError::Exhausted => Error::InviteExhausted,
+        RedeemError::UsernameTaken => Error::UsernameTaken,
+        RedeemError::InvalidInput(message) => Error::InvalidInput { message },
+        RedeemError::RateLimited { retry_after } => Error::RateLimited {
+            retry_after_ms: u64::try_from(retry_after.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1),
+        },
+        RedeemError::Store(e) => internal(e),
+        RedeemError::Hash(e) => internal(e),
     }
 }
 

@@ -655,3 +655,55 @@ pub fn Download(#[props(default = 15)] size: u32) -> Element {
         }
     }
 }
+
+/// An invite (P6-01): a ticket.
+#[component]
+pub fn Ticket(#[props(default = 16)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z" }
+            path { d: "M13 5v2" }
+            path { d: "M13 17v2" }
+            path { d: "M13 11v2" }
+        }
+    }
+}
+
+/// Show a QR code.
+#[component]
+pub fn QrCode(#[props(default = 16)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            rect { x: "3", y: "3", width: "7", height: "7", rx: "1" }
+            rect { x: "14", y: "3", width: "7", height: "7", rx: "1" }
+            rect { x: "3", y: "14", width: "7", height: "7", rx: "1" }
+            path { d: "M14 14h3v3h-3z" }
+            path { d: "M21 14v.01" }
+            path { d: "M21 21h-4v-4" }
+            path { d: "M14 21v-.01" }
+        }
+    }
+}
+
+/// Copy to the clipboard.
+#[component]
+pub fn Copy(#[props(default = 16)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            rect { x: "8", y: "8", width: "14", height: "14", rx: "2" }
+            path { d: "M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" }
+        }
+    }
+}
+
+/// Send through the system's share sheet.
+#[component]
+pub fn Share(#[props(default = 16)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            path { d: "M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" }
+            path { d: "m16 6-4-4-4 4" }
+            path { d: "M12 2v13" }
+        }
+    }
+}

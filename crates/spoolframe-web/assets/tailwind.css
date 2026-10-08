@@ -220,8 +220,14 @@
   .m-0 {
     margin: 0px;
   }
+  .mx-1 {
+    margin-inline: var(--spacing);
+  }
   .-mt-1\.5 {
     margin-top: calc(var(--spacing) * -1.5);
+  }
+  .-mt-2\.5 {
+    margin-top: calc(var(--spacing) * -2.5);
   }
   .mt-0\.5 {
     margin-top: calc(var(--spacing) * 0.5);
@@ -331,6 +337,9 @@
   .max-w-\[520px\] {
     max-width: 520px;
   }
+  .max-w-\[680px\] {
+    max-width: 680px;
+  }
   .max-w-\[760px\] {
     max-width: 760px;
   }
@@ -348,6 +357,12 @@
   }
   .min-w-\[150px\] {
     min-width: 150px;
+  }
+  .flex-1 {
+    flex: 1;
+  }
+  .flex-\[1_1_360px\] {
+    flex: 1 1 360px;
   }
   .flex-\[1_1_600px\] {
     flex: 1 1 600px;
@@ -405,6 +420,9 @@
   }
   .items-start {
     align-items: flex-start;
+  }
+  .items-stretch {
+    align-items: stretch;
   }
   .justify-between {
     justify-content: space-between;
@@ -716,6 +734,21 @@
     }
     .md\:hidden {
       display: none;
+    }
+    .md\:inline {
+      display: inline;
+    }
+    .md\:inline-flex {
+      display: inline-flex;
+    }
+    .md\:w-auto {
+      width: auto;
+    }
+    .md\:flex-row {
+      flex-direction: row;
+    }
+    .md\:items-start {
+      align-items: flex-start;
     }
     .md\:px-10 {
       padding-inline: calc(var(--spacing) * 10);
@@ -4619,6 +4652,157 @@
     .wan-row, .wan-fields {
       grid-template-columns: 1fr;
       gap: 4px;
+    }
+  }
+  .invite-name {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .invite-icon {
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    background: var(--ctp-surface0);
+    color: var(--ctp-teal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .invite-when {
+    display: flex;
+    flex-direction: column;
+  }
+  .invite-when span:last-child {
+    font-size: 12px;
+    color: var(--ctp-subtext0);
+  }
+  .invite-soon {
+    color: var(--ctp-yellow);
+  }
+  .btn-revoke {
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 6px;
+    border: 1px solid var(--ctp-red);
+    background: transparent;
+    color: var(--ctp-red);
+    font: 600 12px var(--font-sans);
+    cursor: pointer;
+  }
+  .btn-revoke:hover {
+    background: var(--ctp-red);
+    @supports (color: color-mix(in lab, red, red)) {
+      background: color-mix(in srgb, var(--ctp-red) 12%, transparent);
+    }
+  }
+  .invite-card {
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: var(--ctp-mantle);
+    border: 1px solid var(--ctp-surface0);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .invite-card > span {
+    font-size: 13px;
+    color: var(--ctp-subtext0);
+    line-height: 1.4;
+  }
+  .invite-card .btn-revoke {
+    align-self: flex-start;
+    height: 32px;
+    padding: 0 12px;
+    font-size: 13px;
+  }
+  .invite-share {
+    background: var(--ctp-mantle);
+    border: 1px solid var(--ctp-surface0);
+    border-radius: 12px;
+    padding: 18px;
+    display: flex;
+    gap: 18px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .invite-share-icon {
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
+    background: var(--ctp-surface0);
+    color: var(--ctp-blue);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .invite-qr {
+    background: #cdd6f4;
+    border-radius: 18px;
+    padding: 18px;
+    display: flex;
+    flex-shrink: 0;
+  }
+  .invite-qr-inner {
+    position: relative;
+    display: flex;
+  }
+  .invite-qr-mark {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 20%;
+    height: 20%;
+    transform: translate(-50%, -50%);
+    border-radius: 22%;
+    background: #11111b;
+    color: #cdd6f4;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .invite-qr-mark svg {
+    width: 78%;
+    height: 78%;
+  }
+  .invite-code {
+    font: 600 28px var(--font-mono);
+    letter-spacing: 0.08em;
+    color: var(--ctp-teal);
+  }
+  .invite-link {
+    font: 12px/1.5 var(--font-mono);
+    color: var(--ctp-subtext1);
+    background: var(--ctp-base);
+    border-radius: 8px;
+    padding: 10px 12px;
+    word-break: break-all;
+  }
+  .invite-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ctp-subtext0);
+  }
+  .dialog-result {
+    width: 760px;
+  }
+  @media (max-width: 767px) {
+    .scrim-sheet {
+      align-items: flex-end;
+      padding: 0;
+    }
+    .scrim-sheet .dialog {
+      width: 100%;
+      max-height: calc(100vh - 64px);
+      overflow-y: auto;
+      border-radius: 24px 24px 0 0;
+      padding: 22px 18px 24px;
+    }
+    .invite-code {
+      font-size: 24px;
+      text-align: center;
     }
   }
 }

@@ -543,6 +543,123 @@ async fn setup_then_manage_users_from_the_cli() {
     running.stop();
 }
 
+/// `spoolframe-server invite` (P6-01): an invite made, listed as made by
+/// the server CLI, refused for the later kinds, revoked; and the server's
+/// link without a code. The server is off the LAN (no mDNS) and named for
+/// the test.
+#[tokio::test]
+async fn invites_from_the_cli() {
+    let tmp = spoolframe_test_dir::TestDir::new("spoolframe-cli-invites").await;
+    let config = tmp.as_ref().join("invites.ucl");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+            schema = "spoolframe.server.v1";
+            name = "CLI Invites";
+            plex {{ url = "{}"; }}
+            admin {{ listen = "127.0.0.1:{}"; }}
+            network {{ mdns = false; plex_discovery_port = 0; }}
+            "#,
+            closed_port_url(),
+            free_port()
+        ),
+    )
+    .unwrap();
+    let (running, log) = Running::start(&config);
+    let code = setup_code(&log);
+    let out = cli(
+        &config,
+        &[
+            "setup",
+            "--code",
+            &code,
+            "--username",
+            "root",
+            "--password-stdin",
+        ],
+        "correct horse\n",
+        &[],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let admin = [
+        ("SPOOLFRAME_ADMIN_USER", "root"),
+        ("SPOOLFRAME_ADMIN_PASSWORD", "correct horse"),
+    ];
+    let stdout = |out: Output| {
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    let made = stdout(cli(
+        &config,
+        &[
+            "invite",
+            "create",
+            "--note",
+            "Mum's iPad",
+            "--uses",
+            "2",
+            "--expires",
+            "3d",
+        ],
+        "",
+        &admin,
+    ));
+    let line = |label: &str| {
+        made.lines()
+            .find_map(|l| l.strip_prefix(label))
+            .map(str::trim)
+            .unwrap_or_else(|| panic!("no {label:?} in {made}"))
+            .to_owned()
+    };
+    let link = spoolframe_protocol::invite::parse_link(&line("link"))
+        .unwrap_or_else(|| panic!("not a link: {made}"));
+    assert_eq!(link.name.as_deref(), Some("CLI Invites"));
+    assert_eq!(
+        link.code,
+        spoolframe_protocol::invite::normalize_code(&line("code"))
+    );
+    assert!(link.code.is_some(), "{made}");
+    assert_eq!(link.role, Some(spoolframe_types::Role::Consumer));
+
+    let listed = stdout(cli(&config, &["invite", "list"], "", &admin));
+    let row = listed
+        .lines()
+        .find(|l| l.contains("Mum's iPad"))
+        .unwrap_or_else(|| panic!("not listed: {listed}"));
+    for part in ["consumer", "2 of 2 left", "by server CLI"] {
+        assert!(row.contains(part), "{part:?} in {row}");
+    }
+    assert!(
+        !listed.contains(&line("code")),
+        "the code was listed: {listed}"
+    );
+
+    let refused = cli(
+        &config,
+        &["invite", "create", "--kind", "portable-account"],
+        "",
+        &admin,
+    );
+    assert!(!refused.status.success(), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("P7"), "{stderr}");
+
+    let id = row.split_whitespace().next().unwrap();
+    stdout(cli(&config, &["invite", "revoke", id], "", &admin));
+    let listed = stdout(cli(&config, &["invite", "list"], "", &admin));
+    assert!(!listed.contains("Mum's iPad"), "{listed}");
+
+    let server = spoolframe_protocol::invite::parse_link(
+        stdout(cli(&config, &["invite", "link"], "", &admin)).trim(),
+    )
+    .expect("the server's link");
+    assert_eq!((server.server, server.code), (link.server, None));
+
+    running.stop();
+}
+
 #[tokio::test]
 async fn the_cli_says_when_the_server_is_not_running() {
     let (_tmp, config) = config_with_state("cli-no-server", &closed_port_url()).await;

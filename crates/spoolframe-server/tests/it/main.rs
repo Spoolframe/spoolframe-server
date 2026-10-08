@@ -19,6 +19,7 @@ mod encode;
 mod endpoint;
 mod forget_device;
 mod hwdec;
+mod invites;
 mod lan;
 mod libraries;
 mod license_boundary;

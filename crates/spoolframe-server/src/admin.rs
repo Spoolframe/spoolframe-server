@@ -34,6 +34,7 @@ use spoolframe_admin_api::{
 use spoolframe_admin_api::{
     AudioPick, SsoLink, SubtitlePick, TrackOverrideEntry, TrackPreferences, TrackPreferencesInfo,
 };
+use spoolframe_admin_api::{InviteCreated, InviteEntry, InviteKind, NewInvite};
 use spoolframe_admin_api::{LookupStatus, MappingStatus};
 use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
@@ -58,6 +59,7 @@ use crate::principal::Principal;
 use crate::refusals::{Channel, Kind, Refusal};
 use crate::runtime::{ChangeError, RuntimeSettings};
 use crate::store::identities::{IdentityError, IdentityRecord};
+use crate::store::invites::InviteError;
 use crate::store::passkeys::{FirstPasskey, PasskeyError, PasskeyRecord, passkey_name};
 use crate::store::pins::{DeviceRecord, PinError};
 use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionRecord};
@@ -296,6 +298,31 @@ impl StatusSource {
     /// What a signed-in device is told, once the endpoint is up.
     pub fn set_told(&self, told: crate::announce::Told) {
         let _ = self.told.set(told);
+    }
+
+    /// What an invite link says of this server (P6-01): its key, its name,
+    /// the addresses a signed-in device is told (`network.announce` and
+    /// `network.wan`) and its relays; `None` until the endpoint is up.
+    /// It reads the interfaces, off the async threads.
+    pub(crate) async fn invite(&self) -> Option<spoolframe_protocol::invite::Invite> {
+        let server = self.endpoint_id.get()?.clone();
+        let told = self.told.get().cloned();
+        let (addrs, relays) = match told {
+            Some(told) => tokio::task::spawn_blocking(move || (told.addrs(), told.relays()))
+                .await
+                .unwrap_or_default(),
+            None => Default::default(),
+        };
+        Some(spoolframe_protocol::invite::Invite {
+            server,
+            name: Some(self.name.get()),
+            addrs: addrs
+                .into_iter()
+                .take(spoolframe_protocol::invite::MAX_HINTS)
+                .collect(),
+            relays,
+            ..Default::default()
+        })
     }
 
     /// The endpoint key's fingerprint (P1-21), once the endpoint is up.
@@ -652,6 +679,46 @@ impl From<LoginError> for ErrorObjectOwned {
             ),
             LoginError::Internal(e) => internal(e),
         }
+    }
+}
+
+impl From<InviteError> for ErrorObjectOwned {
+    fn from(e: InviteError) -> Self {
+        match e {
+            InviteError::NotYet(_) => error(error_code::INVALID_INPUT, e.to_string()),
+            InviteError::NoSuchInvite(_) => error(error_code::NO_SUCH_INVITE, e.to_string()),
+            InviteError::Store(e) => internal(e),
+        }
+    }
+}
+
+/// The admin API's invite kind as the store has it.
+fn store_invite_kind(kind: InviteKind) -> crate::store::invites::InviteKind {
+    use crate::store::invites::InviteKind as Stored;
+    match kind {
+        InviteKind::CreateUser => Stored::CreateUser,
+        InviteKind::PortableAccount => Stored::PortableAccount,
+        InviteKind::Federation => Stored::Federation,
+    }
+}
+
+/// A kept invite as the admin API shows it.
+fn invite_entry(record: crate::store::invites::InviteRecord) -> InviteEntry {
+    use crate::store::invites::InviteKind as Stored;
+    InviteEntry {
+        id: record.id,
+        kind: match record.kind {
+            Stored::CreateUser => InviteKind::CreateUser,
+            Stored::PortableAccount => InviteKind::PortableAccount,
+            Stored::Federation => InviteKind::Federation,
+        },
+        note: record.note,
+        role: record.role,
+        uses: record.uses,
+        uses_left: record.uses_left,
+        expires_at: record.expires_at,
+        created_by: record.created_by,
+        created_at: record.created_at,
     }
 }
 
@@ -2887,6 +2954,117 @@ impl AdminApiServer for AdminApi {
             .await
             .map(|ip| ip.to_string())
             .map_err(|e| error(error_code::UNAVAILABLE, e))
+    }
+
+    async fn invite_create(&self, ext: &Extensions, invite: NewInvite) -> RpcResult<InviteCreated> {
+        use spoolframe_admin_api::invite::{
+            DEFAULT_EXPIRES_SECS, DEFAULT_USES, MADE_BY_CLI, MAX_EXPIRES_SECS, MAX_NOTE_CHARS,
+            MAX_USES, MIN_EXPIRES_SECS,
+        };
+        let caller = self.recent_admin(ext).await?;
+        let kind = store_invite_kind(invite.kind);
+        if kind != crate::store::invites::InviteKind::CreateUser {
+            return Err(InviteError::NotYet(kind).into());
+        }
+        let uses = invite.uses.unwrap_or(DEFAULT_USES);
+        if !(1..=MAX_USES).contains(&uses) {
+            return Err(error(
+                error_code::INVALID_INPUT,
+                format!("an invite makes 1 to {MAX_USES} accounts"),
+            ));
+        }
+        let expires = invite.expires.unwrap_or(DEFAULT_EXPIRES_SECS);
+        if !(MIN_EXPIRES_SECS..=MAX_EXPIRES_SECS).contains(&expires) {
+            return Err(error(
+                error_code::INVALID_INPUT,
+                "an invite lasts an hour to 30 days",
+            ));
+        }
+        let role = invite.role.unwrap_or(Role::Consumer);
+        if role == Role::Unknown {
+            return Err(error(error_code::INVALID_INPUT, "use admin or consumer"));
+        }
+        let note = invite
+            .note
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty());
+        if note
+            .is_some_and(|n| n.chars().count() > MAX_NOTE_CHARS || n.chars().any(char::is_control))
+        {
+            return Err(error(
+                error_code::INVALID_INPUT,
+                format!("a note is at most {MAX_NOTE_CHARS} characters, on one line"),
+            ));
+        }
+        let Some(mut link) = self.status.invite().await else {
+            return Err(error(
+                error_code::NOT_CONFIGURED,
+                "the server's endpoint is starting; try again in a moment",
+            ));
+        };
+        // The browser's pages send their origin; the CLI does not.
+        let created_by = if ext.get::<PageOrigin>().is_some() {
+            self.account(caller).await?.username
+        } else {
+            MADE_BY_CLI.to_owned()
+        };
+        let code = crate::invites::InviteCode::generate();
+        let hash = code.hash();
+        let expires_at =
+            self.auth.store().clock().unix_secs() + i64::try_from(expires).unwrap_or(i64::MAX);
+        let record = self
+            .auth
+            .store()
+            .create_invite(crate::store::invites::NewInvite {
+                kind,
+                capability_hash: &hash,
+                role,
+                note,
+                uses,
+                expires_at,
+                created_by: &created_by,
+            })
+            .await?;
+        tracing::info!(
+            id = %record.id,
+            %role,
+            uses,
+            by = %created_by,
+            "invite made"
+        );
+        link.code = Some(code.as_str().to_owned());
+        link.expires_at = u64::try_from(expires_at).ok();
+        link.role = Some(role);
+        Ok(InviteCreated {
+            invite: invite_entry(record),
+            code: code.shown(),
+            link: link.link(),
+        })
+    }
+
+    async fn invite_list(&self, ext: &Extensions) -> RpcResult<Vec<InviteEntry>> {
+        self.admin(ext).await?;
+        let invites = self.auth.store().live_invites().await.map_err(internal)?;
+        Ok(invites.into_iter().map(invite_entry).collect())
+    }
+
+    async fn invite_revoke(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        self.recent_admin(ext).await?;
+        self.auth.store().revoke_invite(&id).await?;
+        tracing::info!(%id, "invite revoked");
+        Ok(())
+    }
+
+    async fn invite_link(&self, ext: &Extensions) -> RpcResult<String> {
+        self.admin(ext).await?;
+        match self.status.invite().await {
+            Some(link) => Ok(link.link()),
+            None => Err(error(
+                error_code::NOT_CONFIGURED,
+                "the server's endpoint is starting; try again in a moment",
+            )),
+        }
     }
 
     async fn wan_host_ipv6(&self, ext: &Extensions) -> RpcResult<Vec<String>> {

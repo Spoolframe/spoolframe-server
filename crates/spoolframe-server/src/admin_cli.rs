@@ -1,5 +1,6 @@
-//! `spoolframe-server setup` and `spoolframe-server user …`: clients of the
-//! running server's admin API. They never open the database.
+//! `spoolframe-server setup`, `spoolframe-server user …` and
+//! `spoolframe-server invite …`: clients of the running server's admin
+//! API. They never open the database.
 //!
 //! The admin logs in like any user. For scripts, `SPOOLFRAME_ADMIN_USER`
 //! and `SPOOLFRAME_ADMIN_PASSWORD` stand in for the prompts, and
@@ -13,7 +14,8 @@ use clap::Subcommand;
 use jsonrpsee::core::ClientError;
 use jsonrpsee::ws_client::{HeaderMap, WsClient, WsClientBuilder};
 use spoolframe_admin_api::{
-    AdminApiClient, Credentials, MeApiClient, NewUser, Role, SetupRequest, error_code,
+    AdminApiClient, Credentials, InviteKind, MeApiClient, NewInvite, NewUser, Role, SetupRequest,
+    error_code,
 };
 
 #[derive(Subcommand)]
@@ -77,6 +79,66 @@ pub enum UserCommand {
     Disable { username: String },
     /// Let a disabled user log in again.
     Enable { username: String },
+}
+
+/// Invites (P6-01): codes that let someone make their own account, and
+/// the server's link without one.
+#[derive(Subcommand)]
+pub enum InviteCommand {
+    /// Make an invite. Its code and link are printed this once: the server
+    /// keeps only the code's hash.
+    Create {
+        /// Who it is for; only admins see it.
+        #[arg(long)]
+        note: Option<String>,
+        /// How many accounts it can make.
+        #[arg(long, default_value_t = spoolframe_admin_api::invite::DEFAULT_USES)]
+        uses: u32,
+        /// How long it lasts: hours or days, as `12h` or `7d`; an hour to
+        /// 30 days.
+        #[arg(long, default_value = "7d", value_parser = expiry)]
+        expires: u64,
+        /// The role its accounts get: `consumer` or `admin`.
+        #[arg(long, default_value = "consumer")]
+        role: Role,
+        /// `create-user`; `portable-account` and `federation` arrive with
+        /// P7 and P8.
+        #[arg(long, default_value = "create-user", value_parser = invite_kind)]
+        kind: InviteKind,
+    },
+    /// The invites that can still make an account, with their ids.
+    List,
+    /// Stop an invite's unused code, by the id `invite list` shows. The
+    /// accounts it made stay.
+    Revoke { id: String },
+    /// The server's link without a code: it finds and saves the server,
+    /// and whoever has it signs in with an account they have.
+    Link,
+}
+
+/// `12h` or `7d` as seconds.
+fn expiry(text: &str) -> Result<u64, String> {
+    let (number, unit) = text.split_at(text.len().saturating_sub(1));
+    let secs = match unit {
+        "h" => 3600,
+        "d" => 24 * 3600,
+        _ => return Err(format!("{text:?}: say hours or days, as 12h or 7d")),
+    };
+    number
+        .parse::<u64>()
+        .map(|n| n * secs)
+        .map_err(|_| format!("{text:?}: say hours or days, as 12h or 7d"))
+}
+
+fn invite_kind(text: &str) -> Result<InviteKind, String> {
+    match text {
+        "create-user" => Ok(InviteKind::CreateUser),
+        "portable-account" => Ok(InviteKind::PortableAccount),
+        "federation" => Ok(InviteKind::Federation),
+        _ => Err(format!(
+            "{text:?}: create-user, portable-account or federation"
+        )),
+    }
 }
 
 #[derive(Subcommand)]
@@ -606,6 +668,85 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
         }
     }
     Ok(())
+}
+
+/// Make, list or revoke invites, or print the server's link, logged in
+/// as an admin. The CLI sends no page origin, so the server records its
+/// invites as made by "server CLI".
+pub async fn invite(listen: SocketAddr, command: InviteCommand) -> Result<()> {
+    let login = connect(listen, None)
+        .await?
+        .login(admin_credentials()?)
+        .await
+        .map_err(api_error)?;
+    let api = connect(listen, Some(&login.token)).await?;
+    let result = run_invite(&api, command).await;
+    if let Err(e) = api.logout().await {
+        tracing::debug!(error = %e, "logout");
+    }
+    result
+}
+
+async fn run_invite(api: &WsClient, command: InviteCommand) -> Result<()> {
+    match command {
+        InviteCommand::Create {
+            note,
+            uses,
+            expires,
+            role,
+            kind,
+        } => {
+            let made = api
+                .invite_create(NewInvite {
+                    kind,
+                    note,
+                    uses: Some(uses),
+                    expires: Some(expires),
+                    role: Some(role),
+                })
+                .await
+                .map_err(api_error)?;
+            println!("{}", invite_line(&made.invite));
+            println!("code  {}", made.code);
+            println!("link  {}", made.link);
+            eprintln!(
+                "The code is shown only this once: the server keeps only its hash. \
+                 Lost it? Revoke the invite and make another."
+            );
+        }
+        InviteCommand::List => {
+            let invites = api.invite_list().await.map_err(api_error)?;
+            if invites.is_empty() {
+                println!("no invites can make an account now");
+            }
+            for invite in &invites {
+                println!("{}", invite_line(invite));
+            }
+        }
+        InviteCommand::Revoke { id } => {
+            api.invite_revoke(id.clone()).await.map_err(api_error)?;
+            println!("revoked invite {id}; the accounts it made stay");
+        }
+        InviteCommand::Link => {
+            println!("{}", api.invite_link().await.map_err(api_error)?);
+        }
+    }
+    Ok(())
+}
+
+/// One invite as `invite list` prints it: its id first, then who it is
+/// for, the role, the uses left, when it expires and who made it.
+fn invite_line(invite: &spoolframe_admin_api::InviteEntry) -> String {
+    format!(
+        "{}  {}  {}  {} of {} left  expires {}  by {}",
+        invite.id,
+        invite.note.as_deref().unwrap_or("(no note)"),
+        invite.role,
+        invite.uses_left,
+        invite.uses,
+        when(invite.expires_at),
+        invite.created_by,
+    )
 }
 
 /// Unix seconds as a UTC date and time, to the minute.

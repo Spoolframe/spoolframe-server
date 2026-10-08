@@ -1,4 +1,14 @@
-# Development wire revision 7
+# Development wire revision 8
+
+Revision 8 (P6-01, invites) keeps the `spoolframe/client/1` ALPN and sets
+`PROTOCOL_VERSION` to 8. Update the server and SDK together: a
+revision-7 client gets `Unsupported` from a revision-8 server's `Hello`.
+There is a new pre-auth request, `redeem_invite { code, username,
+display_name, password }`, answered `logged_in`, and four new errors:
+`invite_invalid`, `invite_expired`, `invite_exhausted` and
+`username_taken`. The invite link that carries the code is not a
+message; its format is in "Invites" below, with what the server and the
+SDK do with both.
 
 Revision 7 (PX-12, pushed addresses) keeps the `spoolframe/client/1` ALPN
 and sets `PROTOCOL_VERSION` to 7. Update the server and SDK together: a
@@ -656,6 +666,99 @@ server's advertised addresses apart from every dial hint in `addrs`:
 `advertised_addrs` (in the server's order), `relays` and
 `advertised_at` (when the event came, to the second). They are empty and
 `None` until a server tells this device.
+
+## Invites
+
+An invite (P6-01) finds a server from anywhere and, with a code, makes an
+account there. It is one string, the link, shown as a QR code and pasted
+as it is (`spoolframe_protocol::invite`):
+
+```
+spoolframe://invite?server=3f9a…a0f1&name=Home%20Media&addr=203.0.113.24:41641&relay=https://relay.home-media.example&exp=1792003200&role=consumer&cap=QW7K-2MFP-XR4T
+```
+
+| parameter | |
+|---|---|
+| `server` | The server's `EndpointId`, 64 hex digits. Required. |
+| `name` | What the server calls itself. |
+| `addr` | An address it may be reached at, `ip:port` or `[ipv6]:port`. Repeated, one per address. |
+| `relay` | An `http(s)` URL of a relay it may be reached through. Repeated. Empty until relays exist (P6-03). |
+| `exp` | When the code stops working, in Unix seconds. A hint. |
+| `role` | `consumer` or `admin`: the role the account gets. A hint. |
+| `cap` | The code, 12 characters from `ABCDEFGHJKMNPQRSTVWXYZ23456789`, shown in groups of four. |
+
+Values are percent-encoded where they would break the link (`&`, `=`,
+`#`, `%`, `+`, spaces, anything outside ASCII); `:` and `/` are written as
+they are. A reader ignores a parameter it does not know, and a hint it
+cannot read, as it does in the device sign-in link. A link without
+`server`, with a `server` that is not a key, or with a `cap` that is not a
+code is not an invite. At most 32 `addr` and 32 `relay` hints are read.
+
+Without `cap` the link only finds the server: a client pins the key
+straight from it (it came from the server's admin, so there is nothing to
+trust on first use), learns the server id at `Hello` and pins the pair,
+and its hints join the addresses it knows as told ones. The user then
+signs in as usual. `exp` and `role` only fill in the join form ("Joins as
+a consumer · expires Oct 14"); the server decides both when the code is
+redeemed.
+
+With `cap`, the client sends, before any session:
+
+```json
+{"type": "redeem_invite", "code": "QW7K-2MFP-XR4T", "username": "mum",
+ "display_name": "Mum", "password": "correct horse"}
+```
+
+Every field is required; `display_name` is `null` for none. The code may
+have any case, dashes or spaces. The answer is `logged_in { session,
+remembered: false }`: the account is made with the invite's role, and the
+session is bound to the device that sent it, as a password sign-in's is.
+Refusals:
+
+- `invite_invalid`: no invite has that code, or its invite was revoked.
+  It is counted as a wrong guess before it is checked, as a wrong
+  password is, so guessing ends in `rate_limited`.
+- `invite_expired`, `invite_exhausted`: the code is right, and its invite
+  is past its expiry, or has made every account it could.
+- `username_taken`; `invalid_input` for a username, display name or
+  password that is not acceptable. Neither uses the invite up.
+
+A device that is not signed in draws on the sign-in budget every such
+device shares, as `login_password` does (`rate_limited` once it is
+spent). A refused redemption is not kept as an operation: sent again
+with the same operation id, it runs again. Of two redemptions of an
+invite's last use, one makes its account and the other is
+`invite_exhausted`. It is never retried on its own on a new connection.
+
+### SDK
+
+`spoolframe_client_sdk::invite` is the link codec. A `Client` takes the
+link as the user pasted or opened it:
+
+- `read_invite(link) -> InviteInfo`: what the link says, with nothing
+  sent: the key and its fingerprint, the name, the hints, whether it has
+  a code, and the expiry and role hints as `expires_at` and `role` for
+  "Joins as a consumer · expires Oct 14". `saved` says the key is a
+  saved server already. `NotAnInvite` for anything else.
+- `connect_invite(link) -> ServerEntry`: `Hello` at the link's hints,
+  for "Is this the server you were invited to?": the name, fingerprint
+  and server id that answered. Nothing is saved.
+- `save_invite_server(link) -> ServerEntry`: pins the key as the link
+  names it, verified, with the server id it answers with ("Save server
+  only", and all a link without a code does). A saved server keeps its
+  pin and gains the hints.
+- `redeem_invite(link, username, display_name, password) -> Session`:
+  `redeem_invite`, then the server saved as above and the session kept as
+  a password sign-in's. A refused redemption saves nothing. Its refusals
+  are `InviteInvalid`, `InviteExpired`, `InviteExhausted`,
+  `UsernameTaken`, `InvalidInput` and `RateLimited`.
+
+The link's addresses join the server's known addresses as told ones,
+replacing none; the server's next `server_addresses` list replaces them
+as it replaces any told address. Its relays are kept beside the ones the
+server told. A key the device has not saved is another server, whatever
+its name; one that answers with a saved server's server id is that
+server with a new key, `IdentityChanged`, before any account is made.
 
 ## Picture subtitles
 

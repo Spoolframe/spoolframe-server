@@ -126,13 +126,13 @@ pub(crate) struct Inner {
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) device: Device,
     pub(crate) timeouts: Timeouts,
-    discovery: Discovery,
-    /// Addresses the app gave for servers (P6's invite tickets will too).
-    manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
+    pub(crate) discovery: Discovery,
+    /// Addresses the app gave for servers, and invites' hints (P6-01).
+    pub(crate) manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
     /// Each server's connection and its state.
     links: Mutex<HashMap<EndpointId, Arc<Link>>>,
     /// Serializes read-modify-write of the saved servers and sessions.
-    saving: tokio::sync::Mutex<()>,
+    pub(crate) saving: tokio::sync::Mutex<()>,
     revisions: Mutex<HashMap<PlaybackKey, RevisionState>>,
     progress_sequences: Mutex<HashMap<PlaybackKey, RevisionState>>,
     activating: tokio::sync::Mutex<()>,
@@ -322,7 +322,7 @@ impl Client {
     }
 
     /// Where to find server `endpoint_id`, from outside the LAN's records:
-    /// typed in, or (P6) from an invite. A hint like any other: the key is
+    /// typed in, or from an invite (P6-01). A hint like any other: the key is
     /// still proven on connect.
     pub fn add_address(&self, endpoint_id: &str, addrs: Vec<SocketAddr>) -> Result<(), SdkError> {
         let id = parse_id(endpoint_id)?;
@@ -546,7 +546,7 @@ impl Client {
     }
 
     /// `id` as `conn` reached it, saved as `saved` says.
-    fn entry(
+    pub(crate) fn entry(
         &self,
         id: EndpointId,
         conn: &ServerConnection,
@@ -874,7 +874,7 @@ impl Client {
     /// Keep `token`, a new session on `server` made by `method` (`None`: a
     /// resume, which keeps the user's last method and place), under the
     /// user it is.
-    async fn keep_session(
+    pub(crate) async fn keep_session(
         &self,
         server: EndpointId,
         token: SessionId,
@@ -1101,7 +1101,7 @@ impl Client {
         Ok(self.link(parse_id(endpoint_id)?).sign_outs())
     }
 
-    fn link(&self, id: EndpointId) -> Arc<Link> {
+    pub(crate) fn link(&self, id: EndpointId) -> Arc<Link> {
         self.inner
             .links
             .lock()
@@ -1610,7 +1610,7 @@ impl Client {
 
 /// The saved server, under another key than `id`, whose pinned server id is
 /// `server_id`: the server `id` says it is, with its key replaced (PX-14).
-fn same_server<'a>(
+pub(crate) fn same_server<'a>(
     saved: &'a [SavedServer],
     id: EndpointId,
     server_id: &str,
@@ -1652,7 +1652,7 @@ async fn save_reached(
 }
 
 /// The addresses of `groups`, in order, each once.
-fn listed(groups: impl IntoIterator<Item = Vec<SocketAddr>>) -> Vec<SocketAddr> {
+pub(crate) fn listed(groups: impl IntoIterator<Item = Vec<SocketAddr>>) -> Vec<SocketAddr> {
     let mut addrs: Vec<SocketAddr> = Vec::new();
     for addr in groups.into_iter().flatten() {
         if !addrs.contains(&addr) {
@@ -1662,7 +1662,7 @@ fn listed(groups: impl IntoIterator<Item = Vec<SocketAddr>>) -> Vec<SocketAddr> 
     addrs
 }
 
-fn parse_id(endpoint_id: &str) -> Result<EndpointId, SdkError> {
+pub(crate) fn parse_id(endpoint_id: &str) -> Result<EndpointId, SdkError> {
     EndpointId::from_str(endpoint_id)
         .map_err(|e| SdkError::UnknownServer(format!("{endpoint_id:?} is not a server key: {e}")))
 }

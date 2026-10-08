@@ -27,7 +27,7 @@ use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -124,6 +124,19 @@ pub enum Request {
     ResumeProfile {
         user_id: String,
     },
+    /// Make an account with an invite's code (P6-01) and sign in to it:
+    /// `LoggedIn`, a session bound to this device as `LoginPassword`
+    /// gives, `remembered: false`. The account has the invite's role.
+    ///
+    /// A code that is not one, or whose invite was revoked, is
+    /// `InviteInvalid`, counted as a wrong guess (then `RateLimited`); one
+    /// past its expiry `InviteExpired`; one with no uses left
+    /// `InviteExhausted`. A username someone has is `UsernameTaken`, and a
+    /// username, display name or password that is not acceptable
+    /// `InvalidInput`; the invite is not used up by either. A device that
+    /// is not signed in draws on the sign-in budget all such devices share,
+    /// as `LoginPassword` does.
+    RedeemInvite(RedeemInvite),
 
     // Need a session.
     Libraries,
@@ -460,6 +473,7 @@ impl Request {
                 | Request::FinishPasskeySignIn { .. }
                 | Request::TrustedProfiles
                 | Request::ResumeProfile { .. }
+                | Request::RedeemInvite(_)
         )
     }
 }
@@ -525,6 +539,30 @@ impl fmt::Debug for LoginPassword {
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .field("remember", &self.remember)
+            .finish()
+    }
+}
+
+/// An invite's code and the account to make with it (`RedeemInvite`,
+/// P6-01). `code` as the link carries it ([`crate::invite::Invite::code`]);
+/// any case, dashes or spaces are taken.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedeemInvite {
+    pub code: String,
+    pub username: String,
+    /// What to show for them; the username when `None`.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub display_name: Option<String>,
+    pub password: String,
+}
+
+impl fmt::Debug for RedeemInvite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RedeemInvite")
+            .field("code", &"<redacted>")
+            .field("username", &self.username)
+            .field("display_name", &self.display_name)
+            .field("password", &"<redacted>")
             .finish()
     }
 }
@@ -1087,6 +1125,22 @@ pub enum Error {
     /// in and the rest work.
     #[error("this server is not set up yet")]
     NotSetUp,
+    /// `RedeemInvite` with a code that is no invite's, or whose invite
+    /// was revoked (P6-01). Counted as a wrong guess. Offer "Save server
+    /// only", which pins the server as a link without a code does.
+    #[error("that invite code is not valid")]
+    InviteInvalid,
+    /// The invite's code is right, and it has expired: ask for another.
+    #[error("the invite has expired")]
+    InviteExpired,
+    /// The invite's code is right, and every account it could make has
+    /// been made: ask for another.
+    #[error("the invite has been used up")]
+    InviteExhausted,
+    /// Someone on this server has that username: pick another. Nothing
+    /// was made and the invite was not used up.
+    #[error("that username is taken")]
+    UsernameTaken,
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.

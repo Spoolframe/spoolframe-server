@@ -12,6 +12,7 @@ pub mod artwork;
 pub mod codec;
 pub mod device_sign_in;
 pub mod fingerprint;
+pub mod invite;
 pub mod lan;
 pub mod media;
 pub mod messages;
@@ -31,8 +32,8 @@ pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, Playback
 pub use messages::{
     AddressNetwork, AuthMethod, ConfirmPassword, DeviceAddress, DeviceInfo, DeviceSignInRequest,
     Error, Event, Hello, HomeScreen, LoginPassword, MAX_HELLO_TEXT, ManifestKind, PROTOCOL_VERSION,
-    PinProof, PinState, Reply, Request, RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo,
-    SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary,
+    PinProof, PinState, RedeemInvite, Reply, Request, RequestEnvelope, Response, SUBTITLE_CHUNK,
+    ServerInfo, SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary,
 };
 pub use passkeys::{
     FinishPasskeyRegistration, FinishPasskeySignIn, LEGACY_APP_RP_ID, NONCE_LEN, PasskeyCreation,

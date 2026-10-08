@@ -3077,3 +3077,32 @@
   logged once. A run whose GPU filters fail before its first output runs
   again on the CPU, and the file stays on the CPU until a restart, as a
   failed GPU decode does.
+- Invites (P6-01): an admin makes one in the web UI (Users and devices ›
+  Invites) or with `spoolframe-server invite create`, and whoever has its
+  link finds the server from anywhere and makes their own account. The
+  link is one string, `spoolframe://invite?server=&name=&addr=…&relay=…
+  &exp=&role=&cap=`, shown as a QR code: the server's key, its told and
+  public addresses, its relays, and the code. The code is 12 characters
+  (about 59 bits), shown once: the server keeps its BLAKE3 hash. An
+  invite makes 1 to 100 accounts (1 by default) with the role it names
+  (consumer by default) for an hour to 30 days (7 by default), and is
+  revoked from its list. `portable-account` and `federation` invites are
+  refused until P7 and P8. The server's link without a code (Copy link,
+  Show QR) only finds and saves the server.
+- Wire revision 8 (`PROTOCOL_VERSION` 8): the pre-auth `RedeemInvite {
+  code, username, display_name, password }`, answered `LoggedIn` with a
+  session bound to the device, and the errors `InviteInvalid`,
+  `InviteExpired`, `InviteExhausted` and `UsernameTaken`. It draws on the
+  strangers' sign-in budget, a wrong or revoked code counts as a guess
+  before it is checked, refusals are not kept as operations and are
+  logged as refused sign-ins, and the last use goes to exactly one of two
+  redemptions. Admin calls `inviteCreate` and `inviteRevoke` (recent
+  sign-in), `inviteList` and `inviteLink`; the error code
+  `NO_SUCH_INVITE`.
+- The SDK takes invite links: `read_invite` (what it says, nothing
+  sent), `connect_invite` (who answers), `save_invite_server` (pin the
+  key it names, verified, with the server id it answers with) and
+  `redeem_invite` (the account, the server saved, a session). Its hints
+  join the known addresses as told ones; `SdkError` gains `NotAnInvite`,
+  `InviteInvalid`, `InviteExpired`, `InviteExhausted` and
+  `UsernameTaken`.

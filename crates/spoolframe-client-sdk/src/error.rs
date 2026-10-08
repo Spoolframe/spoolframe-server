@@ -91,6 +91,25 @@ pub enum SdkError {
     SignInRequired,
     #[error("the username or password is wrong")]
     InvalidCredentials,
+    /// The text is not a Spoolframe invite link (P6-01): checked before
+    /// anything is sent. Say so under the paste field.
+    #[error("this isn't a Spoolframe invite")]
+    NotAnInvite,
+    /// The invite's code is wrong, or its invite was revoked. Offer "Save
+    /// server only" ([`crate::Client::save_invite_server`]).
+    #[error("this invite doesn't work: its code is wrong or was revoked")]
+    InviteInvalid,
+    /// The invite expired. Offer "Save server only".
+    #[error("this invite has expired")]
+    InviteExpired,
+    /// Every account the invite could make is made. Offer "Save server
+    /// only".
+    #[error("this invite has been used")]
+    InviteExhausted,
+    /// Someone has that username: back to the form, the name selected. The
+    /// invite is still unused.
+    #[error("that username is taken")]
+    UsernameTaken,
     #[error("too many failed sign-ins; try again in {} s", retry_after.as_secs())]
     RateLimited { retry_after: Duration },
     /// One reason per stream that this device cannot play.
@@ -252,6 +271,10 @@ impl SdkError {
             ServerError::NotSetUp => SdkError::NotSetUp,
             ServerError::RecentSignInRequired => SdkError::RecentSignInRequired,
             ServerError::LastSignInMethod => SdkError::LastSignInMethod,
+            ServerError::InviteInvalid => SdkError::InviteInvalid,
+            ServerError::InviteExpired => SdkError::InviteExpired,
+            ServerError::InviteExhausted => SdkError::InviteExhausted,
+            ServerError::UsernameTaken => SdkError::UsernameTaken,
             other => SdkError::Server(other.to_string()),
         }
     }

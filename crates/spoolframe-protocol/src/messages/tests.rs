@@ -584,7 +584,7 @@ fn every_error_round_trips() {
         Error::HandshakeRequired,
         Error::Unauthenticated,
         Error::Unsupported {
-            request: "redeem_invite".into(),
+            request: "join_federation".into(),
         },
         Error::Malformed {
             message: "x".into(),
@@ -1033,7 +1033,7 @@ mod newer {
     #[derive(Serialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum Request {
-        RedeemInvite { code: String },
+        JoinFederation { code: String },
     }
 
     #[derive(Serialize)]
@@ -1045,7 +1045,7 @@ mod newer {
     #[derive(Serialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum Error {
-        InviteExpired { at: u64 },
+        PairingExpired { at: u64 },
     }
 
     #[derive(Serialize)]
@@ -1072,20 +1072,20 @@ mod newer {
 fn an_unknown_request_decodes_as_unknown_and_can_be_named() {
     let bytes = codec::encode(&newer::Envelope {
         session: None,
-        request: newer::Request::RedeemInvite { code: "abc".into() },
+        request: newer::Request::JoinFederation { code: "abc".into() },
     })
     .unwrap();
     let envelope: RequestEnvelope = codec::decode(&bytes).unwrap();
     assert_eq!(envelope.request, Request::Unknown);
     assert_eq!(
         codec::request_type(&bytes).as_deref(),
-        Some("redeem_invite")
+        Some("join_federation")
     );
 }
 
 #[test]
 fn an_unknown_error_decodes_as_unknown() {
-    let bytes = codec::encode(&newer::Error::InviteExpired { at: 1 }).unwrap();
+    let bytes = codec::encode(&newer::Error::PairingExpired { at: 1 }).unwrap();
     assert_eq!(codec::decode::<Error>(&bytes).unwrap(), Error::Unknown);
 }
 
@@ -1824,4 +1824,73 @@ fn a_device_address_s_network_has_its_wire_name() {
         codec::decode::<DeviceAddress>(&bytes).unwrap().network,
         AddressNetwork::Unknown
     );
+}
+
+fn redeem() -> crate::RedeemInvite {
+    crate::RedeemInvite {
+        code: "QW7K2MFPXR4T".into(),
+        username: "mum".into(),
+        display_name: Some("Mum".into()),
+        password: "correct horse".into(),
+    }
+}
+
+/// Redeeming an invite (P6-01) is a sign-in a stranger makes: next to
+/// `Hello` and `LoginPassword`, before any session.
+#[test]
+fn redeeming_an_invite_round_trips_and_is_pre_auth() {
+    round_trip(RequestEnvelope {
+        session: None,
+        request: Request::RedeemInvite(redeem()),
+    });
+    assert!(Request::RedeemInvite(redeem()).is_pre_auth());
+    let bytes = codec::encode(&RequestEnvelope {
+        session: None,
+        request: Request::RedeemInvite(redeem()),
+    })
+    .unwrap();
+    assert_eq!(
+        codec::request_type(&bytes).as_deref(),
+        Some("redeem_invite")
+    );
+}
+
+/// Every field of it is required, the display name too, sent as `null`
+/// for none.
+#[test]
+fn a_redemption_missing_a_field_is_refused() {
+    assert_each_required(
+        &Request::RedeemInvite(crate::RedeemInvite {
+            display_name: None,
+            ..redeem()
+        }),
+        &["code", "username", "display_name", "password"],
+    );
+}
+
+/// It makes an account and uses up the invite: never sent twice on its
+/// own.
+#[test]
+fn a_redemption_is_not_retried() {
+    assert!(!crate::policy::retry_safe(&Request::RedeemInvite(redeem())));
+}
+
+#[test]
+fn a_redemption_keeps_its_code_and_password_out_of_debug_output() {
+    let shown = format!("{:?}", Request::RedeemInvite(redeem()));
+    assert!(!shown.contains("QW7K"), "{shown}");
+    assert!(!shown.contains("correct horse"), "{shown}");
+    assert!(shown.contains("mum"), "{shown}");
+}
+
+#[test]
+fn the_invite_errors_round_trip() {
+    for error in [
+        Error::InviteInvalid,
+        Error::InviteExpired,
+        Error::InviteExhausted,
+        Error::UsernameTaken,
+    ] {
+        round_trip(Response::Err(error));
+    }
 }

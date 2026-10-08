@@ -18,6 +18,7 @@ mod client;
 mod connection;
 mod discovery;
 mod error;
+mod invites;
 mod link;
 mod servers;
 mod session;
@@ -26,6 +27,7 @@ pub mod storage;
 pub use client::{Client, ClientOptions, Device, DeviceSignIn, ServersWatch};
 pub use connection::Timeouts;
 pub use error::SdkError;
+pub use invites::InviteInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
 pub use servers::ServerEntry;
 pub use session::{
@@ -52,6 +54,8 @@ pub use spoolframe_protocol::{
 pub use spoolframe_protocol::fingerprint;
 // Sign-in codes and the links their QR codes carry (P3-07).
 pub use spoolframe_protocol::device_sign_in;
+// Invite links (P6-01): the codec, for an app that makes or checks one.
+pub use spoolframe_protocol::invite;
 pub use spoolframe_types as types;
 pub use storage::{MemoryStorage, Storage, StorageError};
 

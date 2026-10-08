@@ -21,6 +21,7 @@ pub mod encode;
 mod events;
 pub mod files;
 pub mod identity;
+pub mod invites;
 mod keyed_locks;
 pub mod libraries;
 pub mod logs;

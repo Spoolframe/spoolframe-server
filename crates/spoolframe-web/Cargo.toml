@@ -16,6 +16,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # Its types build only with a side chosen.
 spoolframe-admin-api = { workspace = true, features = ["client"] }
+# The invite's QR code (P6-01), drawn as an SVG path; the encoder only,
+# as the Linux app takes it.
+qrcode = { version = "0.14", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 dioxus = { workspace = true }

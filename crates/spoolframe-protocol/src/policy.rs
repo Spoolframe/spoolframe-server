@@ -77,6 +77,8 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::AwaitDeviceSignIn { .. }
         | Request::BeginPasskeySignIn { .. }
         | Request::FinishPasskeySignIn { .. }
+        // An invite makes an account and uses itself up.
+        | Request::RedeemInvite(_)
         // A resume makes a session; trust changes end sessions.
         | Request::ResumeProfile { .. }
         | Request::SetDeviceTrust { .. }

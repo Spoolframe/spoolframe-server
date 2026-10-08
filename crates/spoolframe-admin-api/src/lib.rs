@@ -189,6 +189,109 @@ pub mod error_code {
     pub const NO_SUCH_PLAYBACK: i32 = -32023;
     /// End conversion on a playback that plays the file directly (P3-15).
     pub const NO_CONVERSION: i32 = -32024;
+    /// Not an invite that can still make an account (P6-01): unknown,
+    /// revoked, expired or used up.
+    pub const NO_SUCH_INVITE: i32 = -32025;
+}
+
+/// Invites (P6-01): what an admin makes and sees of them.
+pub mod invite {
+    /// Accounts an invite makes when the admin does not say.
+    pub const DEFAULT_USES: u32 = 1;
+    /// The most accounts one invite may make.
+    pub const MAX_USES: u32 = 100;
+    /// How long an invite lasts when the admin does not say: 7 days.
+    pub const DEFAULT_EXPIRES_SECS: u64 = 7 * DAY;
+    /// The shortest it may last: an hour.
+    pub const MIN_EXPIRES_SECS: u64 = 3600;
+    /// The longest: 30 days.
+    pub const MAX_EXPIRES_SECS: u64 = 30 * DAY;
+    /// The most characters of an invite's note.
+    pub const MAX_NOTE_CHARS: usize = 64;
+    /// What `createdBy` says of an invite made with
+    /// `spoolframe-server invite create`, or any caller that is not a
+    /// browser's page.
+    pub const MADE_BY_CLI: &str = "server CLI";
+
+    const DAY: u64 = 24 * 3600;
+}
+
+/// What redeeming an invite does (P6-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InviteKind {
+    /// Makes an account on this server. The only kind made so far.
+    CreateUser,
+    /// Moves an account here from another server: refused until P7-05.
+    PortableAccount,
+    /// Pairs another server with this one: refused until P8.
+    Federation,
+}
+
+/// An invite to make (`inviteCreate`). Each `None` is the default:
+/// [`invite::DEFAULT_USES`] uses, [`invite::DEFAULT_EXPIRES_SECS`], and
+/// the consumer role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewInvite {
+    pub kind: InviteKind,
+    /// Who it is for, for the admins' list; at most
+    /// [`invite::MAX_NOTE_CHARS`] characters.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub note: Option<String>,
+    /// How many accounts it may make: 1 to [`invite::MAX_USES`].
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub uses: Option<u32>,
+    /// How long it lasts, in seconds from now: an hour to 30 days.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub expires: Option<u64>,
+    /// The role its accounts get.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub role: Option<Role>,
+}
+
+/// An invite as admins see it: never its code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteEntry {
+    /// What `inviteRevoke` takes.
+    pub id: String,
+    pub kind: InviteKind,
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub note: Option<String>,
+    pub role: Role,
+    /// How many accounts it could make, and how many it still can.
+    pub uses: u32,
+    pub uses_left: u32,
+    /// Unix seconds.
+    pub expires_at: i64,
+    /// The admin who made it, or [`invite::MADE_BY_CLI`].
+    pub created_by: String,
+    /// Unix seconds.
+    pub created_at: i64,
+}
+
+/// A new invite, with its code: shown this once, since the server keeps
+/// only its hash.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteCreated {
+    pub invite: InviteEntry,
+    /// As shown: `QW7K-2MFP-XR4T`.
+    pub code: String,
+    /// The link that carries it, the server's key and where to find it:
+    /// what the QR code shows and what is sent.
+    pub link: String,
+}
+
+impl fmt::Debug for InviteCreated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InviteCreated")
+            .field("invite", &self.invite)
+            .field("code", &"<redacted>")
+            .field("link", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A username and password.
@@ -3023,6 +3126,33 @@ pub trait AdminApi {
     #[method(name = "catalogDebug", with_extensions)]
     async fn catalog_debug(&self, id: String) -> jsonrpsee::core::RpcResult<ItemDebug>;
 
+    /// Make an invite (P6-01): its code, shown this once, and its link.
+    /// Needs a recent sign-in: the code makes an account
+    /// (`RECENT_SIGN_IN_REQUIRED`). `INVALID_INPUT`, saying why, for a
+    /// kind this server does not make yet (`portable-account` and
+    /// `federation` arrive with P7 and P8), or a note, a number of uses or
+    /// a time that is out of range. `NOT_CONFIGURED` while the endpoint
+    /// is starting: the link needs its key.
+    #[method(name = "inviteCreate", with_extensions)]
+    async fn invite_create(&self, invite: NewInvite) -> jsonrpsee::core::RpcResult<InviteCreated>;
+
+    /// The invites that can still make an account, newest first; never a
+    /// code. Used-up, expired and revoked ones are left out.
+    #[method(name = "inviteList", with_extensions)]
+    async fn invite_list(&self) -> jsonrpsee::core::RpcResult<Vec<InviteEntry>>;
+
+    /// Revoke invite `id`: its unused code stops working; the accounts it
+    /// made stay. Needs a recent sign-in. `NO_SUCH_INVITE` for one that
+    /// cannot make an account anyway.
+    #[method(name = "inviteRevoke", with_extensions)]
+    async fn invite_revoke(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// The server's link without a code: it finds and saves the server,
+    /// and the person signs in with an account they have. It never
+    /// expires. `NOT_CONFIGURED` while the endpoint is starting.
+    #[method(name = "inviteLink", with_extensions)]
+    async fn invite_link(&self) -> jsonrpsee::core::RpcResult<String>;
+
     /// The plan the server would make for item `id` on `request`'s
     /// device, exactly as `PlaybackPlan` would answer it (P3-15).
     /// Nothing plays.
@@ -3118,6 +3248,46 @@ mod required_field_tests {
             },
             &["name"],
         );
+    }
+
+    /// Invites (P6-01): what is left out is a choice, so it is said.
+    #[test]
+    fn invites() {
+        assert_each_required(
+            &NewInvite {
+                kind: InviteKind::CreateUser,
+                note: None,
+                uses: None,
+                expires: None,
+                role: None,
+            },
+            &["kind", "note", "uses", "expires", "role"],
+        );
+        assert_each_required(
+            &InviteEntry {
+                id: "1".into(),
+                kind: InviteKind::CreateUser,
+                note: None,
+                role: Role::Consumer,
+                uses: 1,
+                uses_left: 1,
+                expires_at: 0,
+                created_by: invite::MADE_BY_CLI.into(),
+                created_at: 0,
+            },
+            &["note", "usesLeft", "expiresAt", "createdBy"],
+        );
+    }
+
+    #[test]
+    fn invite_kinds_are_named_as_the_ticket_names_them() {
+        for (kind, name) in [
+            (InviteKind::CreateUser, "create-user"),
+            (InviteKind::PortableAccount, "portable-account"),
+            (InviteKind::Federation, "federation"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), name);
+        }
     }
 
     #[test]

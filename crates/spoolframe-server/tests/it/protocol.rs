@@ -187,7 +187,7 @@ async fn an_unknown_request_is_unsupported_and_the_connection_stays_up() {
     #[derive(Serialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     enum Newer {
-        RedeemInvite { code: String },
+        JoinFederation { code: String },
     }
     #[derive(Serialize)]
     struct Envelope {
@@ -200,13 +200,13 @@ async fn an_unknown_request_is_unsupported_and_the_connection_stays_up() {
     let response = client
         .send(&Envelope {
             session: None,
-            request: Newer::RedeemInvite { code: "abc".into() },
+            request: Newer::JoinFederation { code: "abc".into() },
         })
         .await;
     assert_eq!(
         response,
         Response::Err(Error::Unsupported {
-            request: "redeem_invite".into()
+            request: "join_federation".into()
         })
     );
     assert_eq!(

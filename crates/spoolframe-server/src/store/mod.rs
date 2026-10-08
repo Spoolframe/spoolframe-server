@@ -5,6 +5,7 @@
 //! API, so users, sessions and rate limits have a single owner.
 
 pub mod identities;
+pub mod invites;
 pub mod passkeys;
 pub mod pins;
 pub mod sessions;

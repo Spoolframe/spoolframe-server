@@ -180,6 +180,15 @@ impl SavedServer {
         self.sighted(addrs, now, AddrSource::Told) || dropped
     }
 
+    /// An invite named `addrs` as where the server is (P6-01): they join
+    /// the addresses known as told ones, as [`SavedServer::told`] keeps
+    /// them, but replace nothing: an invite is not the server's whole
+    /// list. The server's next list replaces them as it replaces any told
+    /// address.
+    pub fn hinted(&mut self, addrs: impl IntoIterator<Item = SocketAddr>, now: u64) -> bool {
+        self.sighted(addrs, now, AddrSource::Told)
+    }
+
     fn sighted(
         &mut self,
         addrs: impl IntoIterator<Item = SocketAddr>,
@@ -708,6 +717,25 @@ mod tests {
                 (addr("192.168.1.10:4433"), AddrSource::Reached),
             ]
         );
+    }
+
+    /// An invite's hints (P6-01) join as told addresses and replace none:
+    /// unlike the server's own list, an invite is not the whole of it.
+    #[test]
+    fn an_invite_s_hints_join_as_told_and_replace_nothing() {
+        let mut server = server();
+        server.saw([addr("192.168.1.10:4433")], 1_000);
+        server.told([addr("10.10.0.2:4433")], 2_000);
+        assert!(server.hinted([addr("203.0.113.9:7420")], 3_000));
+        assert_eq!(
+            sources(&server),
+            [
+                (addr("203.0.113.9:7420"), AddrSource::Told),
+                (addr("10.10.0.2:4433"), AddrSource::Told),
+                (addr("192.168.1.10:4433"), AddrSource::Reached),
+            ]
+        );
+        assert_eq!(server.advertised_addrs, [addr("10.10.0.2:4433")]);
     }
 
     #[test]
