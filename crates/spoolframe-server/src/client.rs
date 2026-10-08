@@ -50,7 +50,7 @@ use crate::events::{Addresses, EventStreams};
 use crate::network::{ConnectionAuth, Connections, ServerName, Services};
 use crate::passkeys::{CeremonyError, SignInError};
 use crate::planner;
-use crate::playback::{Changed, FileId, Opened, Playback, Playbacks, Refusal, Sidecar};
+use crate::playback::{Changed, FileId, Opened, Playback, Playbacks, Refusal, Sidecar, Using};
 use crate::plex_accounts::Link;
 use crate::previews::{self, PreviewState};
 use crate::principal::Principal;
@@ -90,6 +90,11 @@ pub(crate) struct ClientProtocol {
 /// What one connection has said so far.
 #[derive(Debug)]
 struct ConnectionState {
+    /// Its number, never another's: what its playbacks name it by, so
+    /// they are known as a killed app's once it closes or a newer one
+    /// opens. Not the connection's `stable_id`, which a later connection
+    /// may get again.
+    number: u64,
     /// Its limits, and its streams being answered (PX-10).
     peer: Arc<Peer>,
     hello: OnceLock<Hello>,
@@ -980,17 +985,32 @@ impl ClientProtocol {
 
     /// The playback behind `handle`, if `session` on this connection's
     /// endpoint may use it. The session itself is checked again at most
-    /// every `playback::RECHECK`, so reads stay off the database.
+    /// every `playback::RECHECK`, so reads stay off the database, and
+    /// whether its item is still served with it: the backstop to ending
+    /// playbacks when sessions end or the catalog changes (B-10).
     async fn use_playback(
         &self,
         connection: &Connection,
         handle: &PlaybackHandle,
         session: &SessionId,
     ) -> Result<Playback, Error> {
+        self.use_playback_as(connection, handle, session, Using::Plays)
+            .await
+    }
+
+    /// [`Self::use_playback`], used `how`: a progress report, which a
+    /// paused client sends too, keeps it alive without playing it.
+    async fn use_playback_as(
+        &self,
+        connection: &Connection,
+        handle: &PlaybackHandle,
+        session: &SessionId,
+        how: Using,
+    ) -> Result<Playback, Error> {
         let endpoint = connection.remote_id().to_string();
         let playbacks = &self.services.playbacks;
         let using = playbacks
-            .use_handle(handle, session, &endpoint)
+            .use_handle(handle, session, &endpoint, how)
             .map_err(playback_refusal)?;
         if using.recheck {
             let live = self
@@ -1000,9 +1020,21 @@ impl ClientProtocol {
                 .await
                 .map_err(internal)?;
             if live.is_none() {
-                playbacks.end(handle, crate::playback::EndReason::SignedOut);
+                playbacks.end_session(session);
                 return Err(Error::Unauthenticated);
             }
+            // Beside the read, not before it: a Plex that is slow or down
+            // must not hold up a file this server reads on its own.
+            let catalog = self.services.catalog.clone();
+            let playbacks = playbacks.clone();
+            let item = using.playback.item.clone();
+            tokio::spawn(async move {
+                if let Err(e) = catalog.item(&item).await
+                    && unserved(&e)
+                {
+                    playbacks.end_item(&item, crate::playback::EndReason::AccessRemoved);
+                }
+            });
         }
         Ok(using.playback)
     }
@@ -1711,7 +1743,12 @@ impl ClientProtocol {
                 sequence,
                 position_ms,
             } => {
-                let playback = self.use_playback(connection, &handle, &session).await?;
+                // Alive, not played: a paused client reports on (once a
+                // minute, PROTOCOL.md) and must not hold its slot against
+                // its own device's next start.
+                let playback = self
+                    .use_playback_as(connection, &handle, &session, Using::Reports)
+                    .await?;
                 let _progress = self
                     .services
                     .playbacks
@@ -1896,26 +1933,41 @@ impl ClientProtocol {
                 let handle = Playbacks::new_handle();
                 // A device keeps "now + next": the one playing and this
                 // one, which may be the next track it prepares while that
-                // plays (iOS gapless audio). Its older encodes are
-                // abandoned: free their slots before this one takes one.
+                // plays (iOS gapless audio). Its other encodes, not read
+                // lately, are abandoned: free their slots before this one
+                // takes one. One still read is never ended for it.
                 let endpoint = connection.remote_id().to_string();
-                let ended = self.services.playbacks.make_room_for_next(&endpoint);
-                if ended > 0 {
-                    tracing::info!(%endpoint, ended, "a device's earlier conversions ended");
+                match self
+                    .services
+                    .playbacks
+                    .make_room_for_next(&endpoint, state.number)
+                {
+                    Ok(_) => {}
+                    Err(crate::playback::DeviceFull) => {
+                        tracing::info!(
+                            %endpoint,
+                            "a device reading all its conversions is refused another"
+                        );
+                        return Err(Error::Busy);
+                    }
                 }
                 let start = start_ms.map(Duration::from_millis);
                 let prepared = match self
                     .prepare(&handle, &id, (&path, &descriptor), &plan, start, None)
                     .await
                 {
-                    // No slot free, and the device holds one: what it
-                    // starts now comes before what it started earlier, as
-                    // it did before "now + next" (one slot, a film started
-                    // again). Another device's slot is never taken.
+                    // No slot free, and the device holds one it does not
+                    // read: what it starts now comes before that, as it did
+                    // before "now + next" (one slot, a film started again).
+                    // One it reads plays on, and this start is busy.
+                    // Another device's slot is never taken.
                     Err(Error::Busy)
-                        if self.services.playbacks.end_conversions_on(&endpoint) > 0 =>
+                        if self
+                            .services
+                            .playbacks
+                            .end_conversions_on(&endpoint, state.number)
+                            > 0 =>
                     {
-                        tracing::info!(%endpoint, "a device's conversion ended for its new one");
                         self.prepare(&handle, &id, (&path, &descriptor), &plan, start, None)
                             .await
                     }
@@ -1945,6 +1997,7 @@ impl ClientProtocol {
                         file,
                         subtitle,
                         conversion,
+                        connection: state.number,
                     },
                 );
                 // What was decided, so a playback that then goes quiet
@@ -2450,10 +2503,7 @@ impl ClientProtocol {
             if connections.has_endpoint(&endpoint) {
                 return;
             }
-            let ended = playbacks.end_device(&endpoint.to_string());
-            if ended > 0 {
-                tracing::info!(%endpoint, ended, "a gone device's playbacks ended");
-            }
+            playbacks.end_device(&endpoint.to_string());
         });
     }
 
@@ -2762,6 +2812,7 @@ impl ProtocolHandler for ClientProtocol {
         };
         tracing::info!(?auth, known, "client connected");
         let state = Arc::new(ConnectionState {
+            number: self.services.playbacks.connection_opened(),
             peer,
             hello: OnceLock::new(),
             locks: parking_lot::Mutex::default(),
@@ -2782,6 +2833,7 @@ impl ProtocolHandler for ClientProtocol {
         self.addresses.streams.remove(id);
         self.connections.remove(id);
         self.services.connected.closed(id);
+        self.services.playbacks.connection_closed(state.number);
         tracing::info!(?auth, %reason, "client disconnected");
         self.end_playbacks_unless_back(connection.remote_id());
         Ok(())
@@ -3136,7 +3188,7 @@ fn playback_refusal(refusal: Refusal) -> Error {
     match refusal {
         Refusal::Expired => Error::PlaybackExpired,
         Refusal::Stopped => Error::PlaybackStopped,
-        Refusal::NotYours => Error::Unauthenticated,
+        Refusal::SignedOut | Refusal::NotYours => Error::Unauthenticated,
     }
 }
 
@@ -3456,6 +3508,19 @@ fn catalog_error(e: CatalogError) -> Error {
         }
         CatalogError::NotSetUp => Error::NotSetUp,
     }
+}
+
+/// Whether `e` says the item is not served now: in a library removed or
+/// never added, on a Plex server no longer configured, or gone. Not a
+/// failure to reach Plex, which says nothing of whether it is served.
+pub(crate) fn unserved(e: &CatalogError) -> bool {
+    matches!(
+        e,
+        CatalogError::NotFound(_)
+            | CatalogError::ForeignId(_)
+            | CatalogError::NotServed(_)
+            | CatalogError::NotSetUp
+    )
 }
 
 fn watch_error(e: WatchError) -> Error {

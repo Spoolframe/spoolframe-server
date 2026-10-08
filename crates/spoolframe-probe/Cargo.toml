@@ -24,4 +24,6 @@ spoolframe-protocol = { workspace = true }
 spoolframe-types = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
+# Installs aws-lc-rs as the process's TLS provider at start.
+rustls = { workspace = true }
 tokio = { workspace = true }

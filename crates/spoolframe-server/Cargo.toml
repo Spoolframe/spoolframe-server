@@ -29,6 +29,8 @@ axum = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 reqwest = { workspace = true }
+# Installs aws-lc-rs as the process's TLS provider at start.
+rustls = { workspace = true }
 anyhow = { workspace = true }
 argon2 = { workspace = true }
 base64 = { workspace = true }
@@ -60,7 +62,9 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
-tonic = { workspace = true }
+# webpki roots for an https OTLP endpoint, which opentelemetry-otlp's own
+# feature would bring with ring (the workspace Cargo.toml).
+tonic = { workspace = true, features = ["tls-webpki-roots"] }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
 uclicious = { workspace = true }

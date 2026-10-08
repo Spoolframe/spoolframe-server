@@ -53,9 +53,16 @@ futures-util = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "signal", "io-util"] }
 
 # Transport and endpoint identity (ARCHITECTURE §11). No default features:
-# ring for TLS, and no portmapper (UPnP/NAT-PMP) or metrics while Phase 1
-# is LAN only.
-iroh = { version = "1.3", default-features = false, features = ["tls-ring"] }
+# aws-lc-rs for TLS, and no portmapper (UPnP/NAT-PMP) or metrics while
+# Phase 1 is LAN only. aws-lc-rs, not ring: it is rustls's own default
+# provider, and the one the other TLS users here can share (below). Its C
+# library builds with cmake (devenv.nix, nix/package.nix). Iroh picks its
+# provider from its own features, so it never falls back to ring while
+# nothing turns on `tls-ring`.
+iroh = { version = "1.3", default-features = false, features = ["tls-aws-lc-rs"] }
+# The process's TLS provider, installed by the binaries that also link
+# reqwest 0.12 (see `reqwest` below): aws-lc-rs, the same as iroh's.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 # LAN discovery (P1-13). Iroh keeps mDNS out of its own crate since 1.0.
 iroh-mdns-address-lookup = "0.6"
 
@@ -113,7 +120,13 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # encoders the cache writes; nothing else.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
-# HTTP, for the PMS API. rustls, so the build needs no OpenSSL.
+# HTTP, for the PMS API. rustls, so the build needs no OpenSSL. 0.12,
+# which openidconnect 4 and opentelemetry-otlp 0.31 also take, has no
+# aws-lc-rs feature: `rustls-tls` brings ring in as the fallback reqwest
+# uses only when no process provider is installed. The server and the
+# probe install aws-lc-rs first thing (`rustls` above), so ring is linked
+# but never chosen. Its `-no-provider` features would drop ring, but then
+# every client built before that install, in a test say, panics.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"
 wiremock = "0.6"
@@ -152,9 +165,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # runtime's threads at shutdown; the server queues and batches itself.
 # The metrics reader runs on tokio. gRPC (tonic) and HTTP/protobuf (on the
 # reqwest the server already has), both with TLS for an https endpoint.
+# gRPC's TLS is aws-lc-rs (`tls-aws-lc`). Not `tls-webpki-roots`: it turns
+# on `tls`, which is tonic's ring; the server's tonic takes the webpki
+# roots itself (spoolframe-server's Cargo.toml).
 opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics", "logs"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics", "logs", "rt-tokio", "experimental_metrics_periodicreader_with_async_runtime"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "http-proto", "reqwest-client", "trace", "metrics", "logs", "tls-ring", "tls-webpki-roots"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "http-proto", "reqwest-client", "trace", "metrics", "logs", "tls-aws-lc"] }
 tracing-opentelemetry = { version = "0.32", default-features = false }
 opentelemetry-appender-tracing = { version = "0.31", default-features = false }
 # The headers sent to a gRPC collector, and the test collector's server.

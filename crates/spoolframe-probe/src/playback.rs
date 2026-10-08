@@ -8,15 +8,22 @@
 //! run has one. Each is refused `Unauthenticated`, as the authorization
 //! matrix says, and A's playback is as it was after. A stops it.
 //!
+//! Then the same item as an HLS conversion, and progress from B and C
+//! ([`hls`]): one playback at a time, never two.
+//!
 //! Safe on a real server by construction:
-//! - A's `Hello` says it reads ranges only, so no plan converts: no
+//! - A's first `Hello` says it reads ranges only, so no plan converts: no
 //!   encode starts. The item is planned first (`PlaybackPlan`), and only
-//!   one that plays directly is started.
+//!   one that plays directly is started. The HLS part starts only a plan
+//!   that copies the audio alone: a remux, never an encode.
 //! - Were a refusal not one, the worst it does is seek, re-plan or stop
-//!   the probe's own playback. `UpdatePlaybackProgress` is never sent:
-//!   allowed, it would write watch state.
-//! - A stops the playback; if the check cannot, the run's end does
+//!   the probe's own playback, or move the account's resume point on the
+//!   item (B's and C's `UpdatePlaybackProgress`, which is checked for).
+//!   A itself never sends progress.
+//! - A stops each playback; if the check cannot, the run's end does
 //!   ([`AccountState::finish`]), as it signs out B and C.
+
+mod hls;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -109,7 +116,8 @@ pub(crate) async fn playback_ownership(
 ) -> Result<Outcome, Problem> {
     if !config.check_playback {
         return Ok(Outcome::skip(
-            "not asked for: pass --check-playback (starts and stops one direct playback)",
+            "not asked for: pass --check-playback (starts and stops one direct playback, then one \
+             HLS remux of its audio)",
         ));
     }
     let a = ready!(state.unlocked(probe, config).await);
@@ -193,6 +201,11 @@ pub(crate) async fn playback_ownership(
         after == Response::Err(Error::PlaybackExpired),
         format!("A: PlaybackRevision after it: {}", describe(&after)),
     );
+    if stopped {
+        hls::converted(probe, config, state, account, &a, &id, &mut f).await?;
+    } else {
+        f.note("HLS part not checked: the direct playback did not stop".into());
+    }
     Ok(f.done())
 }
 

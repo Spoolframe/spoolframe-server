@@ -308,6 +308,7 @@ fn main() -> Result<()> {
     {
         decode_subtitle(*format, pictures, *from_file_start);
     }
+    spoolframe_server::tls::install_provider()?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -592,6 +593,7 @@ async fn run(
     let plex = runtime::plex_catalog(config, layers, &Secrets::new(state_dir))?.map(Arc::new);
     let live = Arc::new(LiveCatalog::new(plex.clone()));
     let catalog: Arc<dyn Catalog> = live.clone();
+    let catalog_changes = live.changes();
     match &plex {
         Some(plex) => check_catalog(plex).await,
         None => tracing::warn!(
@@ -864,6 +866,7 @@ async fn run(
             plex_sync: Some(plex_sync),
             auth,
             catalog,
+            catalog_changes: Some(catalog_changes),
             prober,
             artwork,
             playbacks: playbacks.clone(),

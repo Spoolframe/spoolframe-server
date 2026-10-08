@@ -190,15 +190,18 @@ impl Connections {
         }
     }
 
-    /// Close the connections of every device that is no longer signed in:
+    /// End the playbacks of every session that has ended (B-10), and
+    /// close the connections of every device that is no longer signed in:
     /// each time sessions end, and every [`admission::RECHECK`].
-    async fn close_signed_out(self, store: crate::store::Store) {
+    async fn close_signed_out(self, auth: Auth, playbacks: Arc<Playbacks>) {
+        let store = auth.store().clone();
         let mut ended = store.sessions_ended();
         loop {
             tokio::select! {
                 changed = ended.changed() => if changed.is_err() { return },
                 () = tokio::time::sleep(admission::RECHECK) => {}
             }
+            end_signed_out_playbacks(&auth, &playbacks).await;
             for endpoint in self.known_endpoints() {
                 match store.endpoint_signed_in(&endpoint.to_string()).await {
                     Ok(true) => {}
@@ -206,6 +209,51 @@ impl Connections {
                     Err(e) => tracing::warn!(error = %e, "cannot check a device's sessions"),
                 }
             }
+        }
+    }
+}
+
+/// End the playbacks of each session that is no longer live, at once
+/// (B-10): their encodes stop, rather than after the disconnect grace that
+/// closing the device's connection starts. A session that cannot be
+/// looked up is left to the next check, and to each read's recheck.
+async fn end_signed_out_playbacks(auth: &Auth, playbacks: &Playbacks) {
+    for session in playbacks.sessions() {
+        match auth.session_owner(&session.0).await {
+            Ok(Some(owner)) if owner.live => {}
+            Ok(_) => {
+                playbacks.end_session(&session);
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot check a playing session"),
+        }
+    }
+}
+
+/// Each time the catalog changes, end the playbacks of items it no longer
+/// serves (B-10).
+async fn end_unserved_playbacks_on_change(
+    mut changes: tokio::sync::watch::Receiver<u64>,
+    catalog: Arc<dyn Catalog>,
+    playbacks: Arc<Playbacks>,
+) {
+    while changes.changed().await.is_ok() {
+        end_unserved_playbacks(catalog.as_ref(), &playbacks).await;
+    }
+}
+
+/// End, at once, the playbacks of every item in a library no longer
+/// served (B-10): removed, or on a Plex server no longer configured. Their
+/// encodes stop, and a client still using one is told `PlaybackExpired`;
+/// starting it again is refused as not found. An item that cannot be
+/// looked up now (Plex down) plays on, left to its read's recheck.
+pub(crate) async fn end_unserved_playbacks(catalog: &dyn Catalog, playbacks: &Playbacks) {
+    for item in playbacks.items() {
+        match catalog.item(&item).await {
+            Err(e) if client::unserved(&e) => {
+                playbacks.end_item(&item, crate::playback::EndReason::AccessRemoved);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(%item, error = %e, "cannot check a playing item"),
         }
     }
 }
@@ -221,6 +269,10 @@ pub enum NetworkError {
 pub struct Services {
     pub auth: Auth,
     pub catalog: Arc<dyn Catalog>,
+    /// Changes each time the catalog's libraries may have changed
+    /// ([`crate::catalog::LiveCatalog::changes`]); `None` for a catalog
+    /// that never changes.
+    pub catalog_changes: Option<tokio::sync::watch::Receiver<u64>>,
     pub prober: Arc<Prober>,
     pub artwork: Arc<ArtworkCache>,
     pub playbacks: Arc<Playbacks>,
@@ -263,6 +315,9 @@ pub struct Server {
     connections: Connections,
     /// Closes signed-out devices' connections; ends with the server.
     sign_outs: tokio::task::JoinHandle<()>,
+    /// Ends the playbacks of libraries no longer served; ends with the
+    /// server.
+    unserved: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Server {
@@ -358,8 +413,15 @@ impl Server {
         let sign_outs = tokio::spawn(
             connections
                 .clone()
-                .close_signed_out(services.auth.store().clone()),
+                .close_signed_out(services.auth.clone(), services.playbacks.clone()),
         );
+        let unserved = services.catalog_changes.clone().map(|changes| {
+            tokio::spawn(end_unserved_playbacks_on_change(
+                changes,
+                services.catalog.clone(),
+                services.playbacks.clone(),
+            ))
+        });
         // Unknown ALPNs never get this far: the TLS handshake refuses them.
         let told = Told::new(endpoint.clone(), options.announce.clone(), relays);
         let client = ClientProtocol::new(
@@ -379,6 +441,7 @@ impl Server {
             told,
             connections,
             sign_outs,
+            unserved,
         })
     }
 
@@ -404,16 +467,25 @@ impl Server {
 
     /// Close every connection and the endpoint.
     pub async fn shutdown(self) {
-        self.sign_outs.abort();
+        self.stop_tasks();
         if let Err(e) = self.router.shutdown().await {
             tracing::warn!(error = %e, "endpoint shutdown");
         }
     }
 }
 
+impl Server {
+    fn stop_tasks(&self) {
+        self.sign_outs.abort();
+        if let Some(unserved) = &self.unserved {
+            unserved.abort();
+        }
+    }
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
-        self.sign_outs.abort();
+        self.stop_tasks();
     }
 }
 

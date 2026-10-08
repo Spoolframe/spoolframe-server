@@ -222,6 +222,21 @@ segment regeneration can change the encoder epoch without changing the
 playback configuration. Existing SDK epoch fields and read methods retain
 their meaning.
 
+### SDK: a playback the server ended
+
+The server ends a playback that idles out, at a restart, and when it lets a
+device's playbacks go; a later use of its handle is `PlaybackExpired`. A new
+`StartPlayback` of the same item, selection and `bitmap`, with `start_ms` at
+the viewer's position, goes on: HLS segments are numbered on the item's own
+time, so the media playlist of the same plan is the same, and segment `n` of
+the new playback is segment `n` of the old. A progressive output, and the bytes
+of a segment, are the new encode's, and do not continue the old one's.
+
+`ManagedPlayback` in the SDK does this itself, at most 3 times in 5 minutes.
+It does not start again after `Unauthenticated`, or when the start is
+`NotFound` (the item is no longer served to the user), `CannotPlay` or
+`PlaybackStopped`. A client that holds raw handles does the same.
+
 ## Resource streams
 
 Byte `2` identifies a resource stream. One CBOR `ResourceRequest` is followed
@@ -708,6 +723,40 @@ Before, removing an episode hid its whole show from both rows. The
 encoding did not change, so `PROTOCOL_VERSION` stays the same. The
 server drops the hides it stored per show (migration 0015), so those
 shows come back once.
+
+## Paused playback and the idle limit
+
+A playback handle lives for 30 minutes without use. Before, the limit
+was 5 minutes. These count as use:
+
+- a media read: a range of the file, an HLS playlist, or an HLS segment;
+- a request that names the handle: `UpdatePlaybackProgress`,
+  `SeekPlayback`, `ChangeSubtitle` or `StopPlayback`.
+
+While the player is paused, send `UpdatePlaybackProgress { handle,
+sequence, position_ms }` once a minute. Send the paused position and the
+next sequence number. This keeps the playback alive for as long as the
+pause lasts. It does not change the watch state: the same position gives
+the same result, and a paused item does not become watched.
+
+A progress report keeps a playback alive, but it does not count as
+playing. If the device starts another playback and the server has no
+conversion slot free, the server ends a converted playback of that
+device that was not read in the last 30 s. A paused playback is one of
+these.
+
+After the limit, every use of the handle gets `PlaybackExpired`. Do not
+send the old handle again. Call `StartPlayback` with `start_ms` set to
+the paused position, and play the new handle. `ManagedPlayback` in the SDK does
+this itself; see "SDK: a playback the server ended".
+
+The server logs each playback that it ends, at INFO, as `a playback
+ended`. The log line has the reason (`idle`, `replaced`, `device_gone`,
+`signed_out`, `access_removed`, `stopped_by_admin` or `failed`) and how
+long the playback was not used. A client's own `StopPlayback` is not
+logged.
+
+The encoding did not change, so `PROTOCOL_VERSION` stays the same.
 
 ## SDK migration in 0.3.0
 

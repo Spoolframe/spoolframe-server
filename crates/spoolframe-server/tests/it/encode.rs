@@ -318,6 +318,51 @@ async fn a_device_back_within_the_grace_keeps_its_encode() {
     server.stop().await;
 }
 
+/// B-10: a revoked session's playback ends at once, and its encode with
+/// it, not after the reconnect grace: the device is signed out, so there
+/// is nothing to come back to.
+#[tokio::test]
+async fn a_revoked_session_s_hls_playback_ends_at_once() {
+    let options = ServerOptions {
+        real_media: true,
+        read_ahead: Duration::from_millis(500),
+        // The grace as it ships: ending within it is not ending after it.
+        disconnect_grace: spoolframe_server::playback::DISCONNECT_GRACE,
+        ..ServerOptions::default()
+    };
+    let server = TestServer::start_with(fresh_dir("encode-revoked").await, options).await;
+    // Long enough that the encode is still held back for its reader when
+    // the session is revoked.
+    server.generate_media(120, "libx264", "ac3");
+    server.add_user("alice", "correct horse", None).await;
+    let tv = server.client().await;
+    tv.hello_with(None, Some(hls_capabilities())).await;
+    let session = tv.login("alice", "correct horse").await;
+    let handle = started(&tv, &session, None).await;
+    until("the encode is held back", Duration::from_secs(10), || {
+        held_back(&handle)
+    })
+    .await;
+    server
+        .store
+        .revoke_session(&spoolframe_server::auth::SessionToken(session.0.clone()).hash())
+        .await
+        .unwrap();
+    until(
+        "the revoked session's ffmpeg is gone",
+        Duration::from_secs(5),
+        || ffmpeg_for(&handle).is_empty(),
+    )
+    .await;
+    let ended = server.debug.playbacks.ended();
+    assert_eq!(
+        ended.first().map(|e| e.why.clone()),
+        Some(spoolframe_server::playback::EndReason::SignedOut)
+    );
+    tv.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn a_start_position_keeps_the_film_s_own_time() {
     let (server, client, session) = ready("encode-start", unthrottled(), 20).await;
@@ -1398,7 +1443,7 @@ async fn a_failed_hls_segment_read_is_logged() {
 
 /// An iOS app starts the next track 140 ms after this one, for gapless
 /// audio: this one's HLS must play on. The device keeps "now + next", so
-/// only a third start ends the first.
+/// only a third start ends the first, once the first is no longer read.
 #[tokio::test]
 async fn a_device_s_next_hls_playback_leaves_the_one_playing() {
     let (server, client, session) = hls_ready("hls-next", hls_capabilities()).await;
@@ -1407,6 +1452,8 @@ async fn a_device_s_next_hls_playback_leaves_the_one_playing() {
     let next = started(&client, &session, None).await;
     assert!(!segment(&client, &session, &now, 1).await.is_empty());
     assert!(!segment(&client, &session, &next, 1).await.is_empty());
+    // The first has played out: read longer ago than the second.
+    server.clock.advance(spoolframe_server::playback::READING);
     // The third: the first is abandoned, and its slot is the third's.
     let third = started(&client, &session, None).await;
     let (response, _) = client
@@ -1426,6 +1473,209 @@ async fn a_device_s_next_hls_playback_leaves_the_one_playing() {
     assert!(!segment(&client, &session, &next, 2).await.is_empty());
     assert!(!segment(&client, &session, &third, 1).await.is_empty());
     client.close().await;
+    server.stop().await;
+}
+
+/// A viewer pauses an HLS conversion for ten minutes and plays on. Its
+/// ffmpeg, held back for the reader, was stopped all that time (no CPU),
+/// and the next segment is there. An Apple TV paused past the old five
+/// minutes was told "the playback has expired" on every segment after.
+#[tokio::test]
+async fn a_paused_hls_playback_reads_on_after_ten_minutes() {
+    // At twice real time, so the throttle surely holds it back.
+    let (dir, ffmpeg) = removable_ffmpeg("hls-paused").await;
+    let options = ServerOptions {
+        ffmpeg,
+        read_ahead: Duration::from_secs(3),
+        ..ServerOptions::default()
+    };
+    let (server, client, session) = hls_ready_with(dir, hls_capabilities(), options).await;
+    let handle = started(&client, &session, None).await;
+    assert!(!segment(&client, &session, &handle, 1).await.is_empty());
+    until("ffmpeg is held back", Duration::from_secs(20), || {
+        held_back(&handle)
+    })
+    .await;
+    // Paused: no reads, no progress.
+    server.clock.advance(Duration::from_secs(10 * 60));
+    server.debug.playbacks.sweep();
+    assert!(held_back(&handle), "a paused playback's ffmpeg runs on");
+    assert!(!segment(&client, &session, &handle, 2).await.is_empty());
+    client.close().await;
+    server.stop().await;
+}
+
+/// A paused client's progress reports keep its playback alive, but do not
+/// make it one that plays. Right after a report, with no slot free, its
+/// device's next start ends it instead of being busy for as long as the
+/// pause lasts.
+#[tokio::test]
+async fn a_paused_playback_s_progress_reports_do_not_hold_its_slot_against_its_device() {
+    let (dir, ffmpeg) = removable_ffmpeg("hls-paused-reports").await;
+    let options = ServerOptions {
+        max_jobs: 1,
+        ffmpeg,
+        read_ahead: Duration::from_secs(3),
+        ..ServerOptions::default()
+    };
+    let (server, client, session) = hls_ready_with(dir, hls_capabilities(), options).await;
+    let paused = started(&client, &session, None).await;
+    assert!(!segment(&client, &session, &paused, 1).await.is_empty());
+    until("ffmpeg is held back", Duration::from_secs(20), || {
+        held_back(&paused)
+    })
+    .await;
+    server.clock.advance(spoolframe_server::playback::READING);
+    let reported = client
+        .call(
+            Some(&session),
+            Request::UpdatePlaybackProgress {
+                handle: paused.clone(),
+                sequence: 1,
+                position_ms: 2_000,
+            },
+        )
+        .await;
+    assert_eq!(reported, Response::Ok(Reply::Done));
+    let next = started(&client, &session, None).await;
+    assert!(!segment(&client, &session, &next, 1).await.is_empty());
+    let (response, _) = client
+        .media(MediaRead {
+            session: session.clone(),
+            handle: paused.clone(),
+            offset: 0,
+            length: MAX_READ,
+            epoch: 0,
+            segment: Some(2),
+        })
+        .await;
+    assert!(
+        matches!(response, MediaReadResponse::Err(Error::PlaybackExpired)),
+        "{response:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// The next track, with no slot free for it, does not end the one playing:
+/// its start is busy, to be tried again, and the one read plays on. It
+/// ended before, and the player got "the playback has expired" as soon as
+/// it prepared the next.
+#[tokio::test]
+async fn a_device_s_next_with_no_slot_free_leaves_the_one_playing() {
+    let (server, client, session) = hls_ready_with(
+        fresh_dir("hls-next-busy").await,
+        hls_capabilities(),
+        ServerOptions {
+            max_jobs: 1,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    let now = started(&client, &session, None).await;
+    assert!(!segment(&client, &session, &now, 1).await.is_empty());
+    let next = start(&client, &session, None).await;
+    assert!(
+        matches!(next, Response::Err(Error::Busy)),
+        "the next took the playing one's slot: {next:?}"
+    );
+    assert!(!segment(&client, &session, &now, 2).await.is_empty());
+    client.close().await;
+    server.stop().await;
+}
+
+/// An app killed mid-track and opened again at once: its two conversions,
+/// read a moment ago, hold every slot. The new connection's start ends
+/// them, rather than being busy until they were read 30 s ago.
+async fn a_relaunched_app_s_start_ends_the_killed_app_s_conversions(test: &str, closed: bool) {
+    let (server, killed, session) = hls_ready_with(
+        fresh_dir(test).await,
+        hls_capabilities(),
+        ServerOptions {
+            max_jobs: 2,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    let now = started(&killed, &session, None).await;
+    assert!(!segment(&killed, &session, &now, 1).await.is_empty());
+    let next = started(&killed, &session, None).await;
+    assert!(!segment(&killed, &session, &next, 1).await.is_empty());
+    if closed {
+        killed.conn.close(0u32.into(), b"killed");
+        killed.conn.closed().await;
+    }
+    let relaunched = killed
+        .reconnect_with(&server, Some(hls_capabilities()))
+        .await;
+    let again = start(&relaunched, &session, None).await;
+    assert!(
+        matches!(again, Response::Ok(Reply::PlaybackStarted { .. })),
+        "the relaunched app cannot start: {again:?}"
+    );
+    for gone in [&now, &next] {
+        until(
+            "the killed app's ffmpeg is gone",
+            Duration::from_secs(10),
+            || ffmpeg_for(gone).is_empty(),
+        )
+        .await;
+    }
+    relaunched.close().await;
+    killed.close().await;
+    server.stop().await;
+}
+
+/// The killed app's connection closed before the new one opened.
+#[tokio::test]
+async fn a_relaunched_app_s_start_ends_a_closed_connection_s_conversions() {
+    a_relaunched_app_s_start_ends_the_killed_app_s_conversions("hls-relaunch-closed", true).await;
+}
+
+/// A killed app sends no close: the server holds its connection until it
+/// idles out, after the app is open again.
+#[tokio::test]
+async fn a_relaunched_app_s_start_ends_a_silent_connection_s_conversions() {
+    a_relaunched_app_s_start_ends_the_killed_app_s_conversions("hls-relaunch-silent", false).await;
+}
+
+/// A read still waiting when its playback ends (a killed app's, its
+/// connection not yet gone) holds the conversion: its ffmpeg stops and
+/// its slot is let go of all the same.
+#[tokio::test]
+async fn an_ended_playback_s_encode_stops_while_a_read_holds_it() {
+    let options = ServerOptions {
+        max_jobs: 1,
+        read_ahead: Duration::from_millis(500),
+        ..ServerOptions::default()
+    };
+    let (server, tv, session) = ready("encode-ended-held", options, 120).await;
+    let handle = started(&tv, &session, None).await;
+    until("ffmpeg runs", Duration::from_secs(10), || {
+        !ffmpeg_for(&handle).is_empty()
+    })
+    .await;
+    let playbacks = &server.debug.playbacks;
+    let endpoint = tv.endpoint.id().to_string();
+    let reading = playbacks
+        .use_handle(
+            &handle,
+            &session,
+            &endpoint,
+            spoolframe_server::playback::Using::Plays,
+        )
+        .unwrap();
+    playbacks.end(&handle, spoolframe_server::playback::EndReason::Replaced);
+    until(
+        "the ended playback's ffmpeg is gone",
+        Duration::from_secs(10),
+        || ffmpeg_for(&handle).is_empty(),
+    )
+    .await;
+    // Its slot, the only one, is free.
+    started(&tv, &session, None).await;
+    drop(reading);
+    tv.close().await;
     server.stop().await;
 }
 

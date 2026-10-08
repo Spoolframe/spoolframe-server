@@ -7,7 +7,8 @@
 //! Every run signs in as a consumer, over QUIC and on a web listener
 //! beside the server, for the signed-in checks; and, for the
 //! playback-ownership check, plays the fake catalog's movie and signs in
-//! as a second consumer.
+//! as a second consumer. Its HLS part needs a file HLS takes as a copy
+//! of the audio: real FLAC, in a test of its own.
 //!
 //! The playback-ownership check has no weakened server here: PB is not a
 //! setting, and a server that let another session use a handle would
@@ -20,6 +21,7 @@ use std::time::Duration;
 use spoolframe_probe::{Account, Config, Limits, Report, Status, Web};
 use spoolframe_server::admission::Admission;
 use spoolframe_server::auth::hash_password;
+use spoolframe_server::principal::Principal;
 use spoolframe_types::Role;
 use support::{ServerOptions, TestServer};
 
@@ -59,6 +61,27 @@ async fn server_with(test: &str, admission: Admission, role: Role) -> (TestServe
         },
     )
     .await;
+    server.write_media(1000);
+    users_and_web(server, role).await
+}
+
+/// As [`server_with`], the movie's file 20 s of real FLAC that ffprobe
+/// reads: it plays directly, and HLS takes it as a copy of its audio.
+async fn server_with_flac(test: &str) -> (TestServer, Web) {
+    let server = TestServer::start_with(
+        support::fresh_dir(test).await,
+        ServerOptions {
+            admission: quick(),
+            real_media: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_flac_noise(20);
+    users_and_web(server, Role::Consumer).await
+}
+
+async fn users_and_web(server: TestServer, role: Role) -> (TestServer, Web) {
     server
         .store
         .add_user(USER, None, &hash_password(PASSWORD).await.unwrap(), role)
@@ -74,7 +97,6 @@ async fn server_with(test: &str, admission: Admission, role: Role) -> (TestServe
         )
         .await
         .unwrap();
-    server.write_media(1000);
     let web = crate::admin::serve_beside(&server, WEB).await;
     let web = Web {
         url: format!("http://{web}"),
@@ -262,6 +284,107 @@ async fn another_device_and_another_user_are_refused_the_playback() {
         "{summary}"
     );
     assert_eq!(sessions_left(&server).await, 0, "{summary}");
+    // The fake movie has a picture: HLS would encode it, so it is not
+    // started.
+    assert!(
+        check
+            .evidence
+            .iter()
+            .any(|l| l.starts_with("HLS part not checked: A: PlaybackPlan")),
+        "{summary}"
+    );
+    server.stop().await;
+}
+
+/// The FLAC movie is played directly, then as an HLS copy of its audio.
+/// B and C are refused A's playlists, segments, seek, stop and progress;
+/// A's resume point is as it was, and the server logs every refusal.
+#[tokio::test]
+async fn another_device_and_another_user_are_refused_an_hls_playback_and_its_progress() {
+    const TEST: &str =
+        "probe::another_device_and_another_user_are_refused_an_hls_playback_and_its_progress";
+    if !support::alone(TEST) {
+        return;
+    }
+    let (server, web) = server_with_flac("probe-playback-hls").await;
+    let (capture, _guard) = support::LogCapture::start();
+    let report = probe(&server, web, Duration::from_secs(5)).await;
+    let summary = spoolframe_probe::summary(&report);
+    // Shown with --nocapture: the evidence, not only the verdicts.
+    eprintln!("{summary}");
+    let check = report.check("playback-ownership").unwrap();
+    assert_eq!(check.status, Status::Pass, "{summary}");
+    let refused = |who: &str, hls: bool| {
+        check
+            .evidence
+            .iter()
+            .filter(|line| {
+                line.starts_with(who)
+                    && line.contains(", HLS: ") == hls
+                    && line.contains("Unauthenticated")
+            })
+            .count()
+    };
+    // Direct: five RPC requests, three resource reads and the stop.
+    assert_eq!(refused("B (", false), 9, "{summary}");
+    assert_eq!(refused("C (", false), 9, "{summary}");
+    // HLS: two playlists, progress and its sequence, a seek, three
+    // resource reads and the stop.
+    assert_eq!(refused("B (", true), 9, "{summary}");
+    assert_eq!(refused("C (", true), 9, "{summary}");
+    for line in [
+        "B (\"probe-consumer\" on another device), HLS: UpdatePlaybackProgress: Err(Unauthenticated)",
+        "C (\"probe-consumer-2\" on another device), HLS: UpdatePlaybackProgress: Err(Unauthenticated)",
+        "HLS: A: PlaybackProgressSequence (none accepted): Ok(PlaybackProgressSequence { sequence: 0 })",
+        "HLS: A: StopPlayback: Ok(Done)",
+    ] {
+        assert!(
+            check.evidence.iter().any(|l| l == line),
+            "{line}\n{summary}"
+        );
+    }
+    assert!(
+        !check.evidence.iter().any(|l| l.contains("not checked")),
+        "{summary}"
+    );
+
+    // Both playbacks were started and ended, and nothing is playing.
+    let counts = server.debug.playbacks.counts();
+    assert_eq!(
+        (
+            counts.started,
+            counts.ended,
+            counts.direct + counts.remux + counts.transcode
+        ),
+        (2, 2, 0),
+        "{summary}"
+    );
+    // No progress was written for the probe's user.
+    let user = server
+        .store
+        .list_users()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|u| u.username == USER)
+        .unwrap();
+    let id = support::movie().id().to_string();
+    let written = server
+        .store
+        .watch_states(Principal::LocalUser(user.id), std::slice::from_ref(&id))
+        .await
+        .unwrap();
+    assert!(written.is_empty(), "{written:?}");
+    assert_eq!(sessions_left(&server).await, 0, "{summary}");
+
+    // Each refusal of the playback is a line of its own: 9 a part from
+    // each of B and C, under the log's 10 a minute for one key.
+    let logged = capture
+        .refused()
+        .into_iter()
+        .filter(|l| l.field("reason") == Some("playback is another session's"))
+        .count();
+    assert_eq!(logged, 36, "{summary}");
     server.stop().await;
 }
 

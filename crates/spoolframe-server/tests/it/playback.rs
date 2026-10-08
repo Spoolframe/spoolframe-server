@@ -177,6 +177,110 @@ async fn an_idle_handle_expires_and_a_new_start_reads_on() {
     server.stop().await;
 }
 
+/// A paused client reports its position once a minute (PROTOCOL.md).
+/// Each report keeps the playback alive, past the idle limit, and leaves
+/// its watch state as it was. Without them it idles out at the limit.
+#[tokio::test]
+async fn progress_reports_while_paused_keep_a_playback_past_the_idle_limit() {
+    let (server, client, session) = ready("paused-reports").await;
+    let file = server.write_media(1000);
+    let (handle, _) = started(&client, &session).await;
+    ok(client.read(&session, &handle, 0, 100).await.0);
+    let paused_at = Duration::from_secs(600);
+    let minutes = PLAYBACK_IDLE.as_secs() / 60 + 5;
+    for sequence in 1..=minutes {
+        server.clock.advance(Duration::from_secs(60));
+        let response = client
+            .call(
+                Some(&session),
+                Request::UpdatePlaybackProgress {
+                    handle: handle.clone(),
+                    sequence,
+                    position_ms: paused_at.as_millis() as u64,
+                },
+            )
+            .await;
+        assert_eq!(response, Response::Ok(Reply::Done), "report {sequence}");
+    }
+    server.debug.playbacks.sweep();
+    let (response, bytes) = client.read(&session, &handle, 100, 100).await;
+    ok(response);
+    assert_eq!(bytes, file[100..200]);
+    let item = client
+        .call(
+            Some(&session),
+            Request::Item {
+                id: movie().id().clone(),
+            },
+        )
+        .await;
+    let Response::Ok(Reply::Item {
+        item: spoolframe_types::Item::Movie(movie),
+        ..
+    }) = item
+    else {
+        panic!("no movie: {item:?}");
+    };
+    assert_eq!(
+        movie.playback,
+        spoolframe_types::PlaybackState {
+            position: Some(paused_at),
+            watched: false,
+        }
+    );
+    server.clock.advance(PLAYBACK_IDLE);
+    server.debug.playbacks.sweep();
+    let (response, _) = client.read(&session, &handle, 200, 100).await;
+    assert_eq!(err(response), Error::PlaybackExpired);
+    client.close().await;
+    server.stop().await;
+}
+
+/// A playback the server ends, rather than its client, is logged once at
+/// INFO: how it ended, whose it was, and how long it had been idle. An
+/// Apple TV paused past the limit was told its playback had expired, and
+/// the log had said nothing of it.
+#[tokio::test]
+async fn a_playback_the_server_ends_is_logged_once_and_one_its_client_stops_is_not() {
+    const TEST: &str =
+        "playback::a_playback_the_server_ends_is_logged_once_and_one_its_client_stops_is_not";
+    if !support::alone(TEST) {
+        return;
+    }
+    let (server, client, session) = ready("ended-logged").await;
+    server.write_media(1000);
+    let (stopped, _) = started(&client, &session).await;
+    let (idle, _) = started(&client, &session).await;
+    ok(client.read(&session, &idle, 0, 10).await.0);
+    let (capture, _guard) = support::LogCapture::start();
+    let response = client
+        .call(Some(&session), Request::StopPlayback { handle: stopped })
+        .await;
+    assert_eq!(response, Response::Ok(Reply::Done));
+    let after = PLAYBACK_IDLE + Duration::from_secs(1);
+    server.clock.advance(after);
+    server.debug.playbacks.sweep();
+    let ended = capture.saying("a playback ended");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    let line = &ended[0];
+    assert_eq!(line.level, tracing::Level::INFO);
+    let id = &server.debug.playbacks.ended()[0].last.id;
+    let endpoint = client.endpoint.id().to_string();
+    for (field, value) in [
+        ("why", "idle"),
+        ("user", "alice"),
+        ("playback", id.as_str()),
+        ("endpoint", endpoint.as_str()),
+        ("plan", "direct"),
+    ] {
+        assert_eq!(line.field(field), Some(value), "{field} in {line:?}");
+    }
+    let idle_secs: u64 = line.field("idle_secs").unwrap().parse().unwrap();
+    assert!(idle_secs >= after.as_secs(), "{line:?}");
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn revoking_the_session_stops_reads_within_the_recheck_interval() {
     let (server, client, session) = ready("revoked").await;
@@ -190,6 +294,63 @@ async fn revoking_the_session_stops_reads_within_the_recheck_interval() {
     server.clock.advance(PLAYBACK_RECHECK);
     let (response, _) = client.read(&session, &handle, 0, 10).await;
     assert_eq!(err(response), Error::Unauthenticated);
+    client.close().await;
+    server.stop().await;
+}
+
+/// B-10's backstop: an item no longer served, though the catalog was not
+/// replaced (Plex moved it to a section not served here), ends at the
+/// next recheck of a read.
+#[tokio::test]
+async fn an_item_no_longer_served_ends_at_the_recheck() {
+    let (server, client, session) = ready("unserved-recheck").await;
+    server.write_media(1000);
+    let (handle, _) = started(&client, &session).await;
+    ok(client.read(&session, &handle, 0, 10).await.0);
+    server.catalog.set_old_key(
+        movie().id(),
+        spoolframe_server::test_support::OldKey::Foreign,
+    );
+    server.clock.advance(PLAYBACK_RECHECK);
+    // The read that rechecks is served: the item is looked up beside it.
+    client.read(&session, &handle, 0, 10).await;
+    let playbacks = &server.debug.playbacks;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while playbacks.ended().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the playback ends");
+    assert_eq!(
+        playbacks.ended()[0].why,
+        spoolframe_server::playback::EndReason::AccessRemoved
+    );
+    assert_eq!(
+        err(client.read(&session, &handle, 0, 10).await.0),
+        Error::PlaybackExpired
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// A Plex that cannot be reached at the recheck says nothing of whether
+/// the item is served: the playback plays on.
+#[tokio::test]
+async fn an_item_that_cannot_be_looked_up_at_the_recheck_plays_on() {
+    let (server, client, session) = ready("unreachable-recheck").await;
+    server.write_media(1000);
+    let (handle, _) = started(&client, &session).await;
+    server.catalog.set_old_key(
+        movie().id(),
+        spoolframe_server::test_support::OldKey::Unreachable,
+    );
+    server.clock.advance(PLAYBACK_RECHECK);
+    ok(client.read(&session, &handle, 0, 10).await.0);
+    // Once the lookup beside that read has surely been answered.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ok(client.read(&session, &handle, 0, 10).await.0);
+    assert!(server.debug.playbacks.ended().is_empty());
     client.close().await;
     server.stop().await;
 }

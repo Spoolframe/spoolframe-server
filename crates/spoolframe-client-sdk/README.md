@@ -15,10 +15,29 @@ An abandoned admission is stopped. Dropping the last owner also attempts cleanup
 call `finish` or `close` before shutting down Tokio to await it reliably.
 Construct an owner in a Tokio runtime (`adopt` also requires an entered runtime).
 
-Direct range reads recover an expired handle once per call, with concurrent
-recoveries sharing one replacement. Recovery requires another direct plan with
-the same size. Converted readers stay pinned to their starting handle and epoch: retire the
-old reader before `seek`, then build its replacement from the returned snapshot.
+A playback the server ended (a long pause, a server restart, the device let
+go) is resumed by the `ManagedPlayback` itself. On `PlaybackExpired` it starts
+the item again with the same tracks and options, at the last known position
+(the reported progress, a seek, or the HLS segment asked for), swaps the new
+handle in for every clone, and tries the operation once more. Concurrent
+operations share one replacement. Direct reads, HLS playlists and segments read
+from offset 0, progress, seeks, subtitle changes and `finish` go on with no
+error: HLS segments are numbered on the item's own time, so the playlist stays
+the same. Drive HLS through `ManagedPlayback::manifest`, `read_segment` and
+`read_subtitle_segment`, not `Session`, to get this.
+
+A progressive read (`read_chunk`), or the rest of an HLS segment read part-way,
+gets `PlaybackResumed { at }` instead: a new encode's bytes do not continue the
+old one's. Retire the reader, build one from `snapshot()` from offset 0, and
+show the player at `at`; read the segment again from offset 0. Converted readers
+stay pinned to their starting handle and epoch the same way after a `seek`
+(`PlaybackRestarted`).
+
+It does not resume one the app closed, one whose start is refused for good
+(`SignInRequired`, `NotFound`, `CannotPlay`, `PlaybackStopped`; the same error
+every time after), one that would play differently (`PlaybackChanged`), or more
+than `MAX_RESUMES` (3) times in `RESUME_WINDOW` (5 minutes): then the operation
+fails with `PlaybackExpired`.
 
 The optional `media-readers` feature provides `reader::MediaReader` and
 `progressive::ProgressiveReader`, with bounded read-ahead, buffering reports and

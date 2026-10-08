@@ -1727,6 +1727,8 @@ pub enum EndedWhy {
     DeviceGone,
     /// Its session ended or its user was disabled.
     SignedOut,
+    /// What it played is in a library no longer served (B-10).
+    AccessRemoved,
     /// Its conversion failed.
     #[serde(rename_all = "camelCase")]
     Failed { reason: String },

@@ -21,12 +21,34 @@ use crate::encode::Conversion;
 use crate::metrics::Counter;
 use crate::subtitles::TextState;
 
-/// How long a handle lives without reads.
-pub const IDLE: Duration = Duration::from_secs(5 * 60);
+/// How long a handle lives unused: no reads, and no request naming it (a
+/// paused client's progress report counts). Long enough for a pause: a
+/// viewer away for a few minutes plays on where they left off. A paused
+/// conversion keeps its ffmpeg, stopped by the read-ahead throttle (no
+/// CPU), its slot and its files for this long, unless its device starts
+/// another that needs the slot: it is not played ([`READING`]), so it
+/// gives way. A client that comes back later starts again at its position.
+pub const IDLE: Duration = Duration::from_secs(30 * 60);
 /// How long a device's playbacks outlive its last connection: long enough
 /// for a reconnect (a network change, an app brought back), short of
 /// holding an encode slot for [`IDLE`] for an app that was killed.
 pub const DISCONNECT_GRACE: Duration = Duration::from_secs(30);
+/// How recently a playback must have been used (a segment, playlist or
+/// media read, or any request naming it) to count as playing: making room
+/// on its device never ends it. Five 6-second HLS segments: a player
+/// fetches about one per segment it plays once its buffer is full, since an
+/// encode runs at most `read_ahead_secs` ahead of its reader, so a track
+/// that plays is read far more often than this. One fully read (its end
+/// within the read-ahead) may go quiet longer, but its player holds all of
+/// it by then.
+pub const READING: Duration = Duration::from_secs(30);
+/// The converted playbacks a device keeps when it starts another, "now +
+/// next": the one playing and the one starting, the next it prepares.
+pub const NOW_AND_NEXT: usize = 2;
+/// The most converted playbacks a device holds, however many it reads: a
+/// third only while the track before is still read as the next is
+/// prepared, so a broken client cannot run conversions without end.
+pub const DEVICE_MOST: usize = 3;
 /// How often, while a handle is used, its session is checked again, so a
 /// revoked session or a disabled user stops playback promptly.
 pub const RECHECK: Duration = Duration::from_secs(30);
@@ -241,11 +263,45 @@ pub struct Playback {
     /// For a converted playback, its encode (P2-03). Ending the handle
     /// drops it, which stops ffmpeg and removes its files.
     pub conversion: Option<Arc<Conversion>>,
+    /// The connection that started it (a number of the server's own).
+    connection: u64,
     last_used: Instant,
+    /// When its client last used it ([`READING`]); never at the start, so
+    /// a playback prepared and not yet read is not counted as playing.
+    last_read: Option<Instant>,
+    /// When the connection that started it closed.
+    orphaned_at: Option<Instant>,
     last_checked: Instant,
 }
 
 impl Playback {
+    /// Its client used it in the last [`READING`].
+    fn reading(&self, now: Instant) -> bool {
+        self.last_read
+            .is_some_and(|at| now.saturating_duration_since(at) < READING)
+    }
+
+    /// The connection that started it closed, and no other has used it
+    /// since: a killed app's.
+    fn orphaned(&self) -> bool {
+        self.orphaned_at
+            .is_some_and(|closed| self.last_read.is_none_or(|read| read <= closed))
+    }
+
+    /// A killed app's, as a start from `starting` sees it: its connection
+    /// closed ([`Playback::orphaned`]), or a newer connection of its
+    /// device is starting and it has not been used since that one opened.
+    /// A killed app sends no close, so its connection stays open until
+    /// it idles out, after the app is open again; and an app runs one
+    /// connection at a time, so a newer one means the older is left. A
+    /// reconnect that reads it on (a resume) takes it back.
+    fn left_behind(&self, starting: Option<(u64, Instant)>) -> bool {
+        self.orphaned()
+            || starting.is_some_and(|(connection, opened)| {
+                self.connection < connection && self.last_read.is_none_or(|read| read < opened)
+            })
+    }
+
     /// How it is served.
     pub fn plan(&self) -> Plan {
         match &self.conversion {
@@ -271,6 +327,8 @@ pub struct Opened {
     pub file: Option<FileId>,
     pub subtitle: Option<Sidecar>,
     pub conversion: Option<Arc<Conversion>>,
+    /// The connection starting it ([`Playbacks::connection_closed`]).
+    pub connection: u64,
 }
 
 /// What a playback becomes when its subtitle changes.
@@ -284,6 +342,11 @@ pub struct Changed {
     pub conversion: Option<Arc<Conversion>>,
 }
 
+/// A device holds [`DEVICE_MOST`] converted playbacks, all playing: it
+/// may start no other until one is let go of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceFull;
+
 /// Why a handle cannot be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
@@ -293,6 +356,20 @@ pub enum Refusal {
     NotYours,
     /// Stopped by an admin (P3-15): over, not to be started again.
     Stopped,
+    /// Its session ended (B-10): the client must sign in again.
+    SignedOut,
+}
+
+/// How a client uses a handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Using {
+    /// A read, or a control (a seek, a subtitle change, a stop): it is
+    /// played ([`READING`]).
+    Plays,
+    /// A progress report, which a paused client sends too: the playback
+    /// stays alive ([`IDLE`]), but is not played for it, so its device's
+    /// next start that needs its slot may still end it.
+    Reports,
 }
 
 /// What a use of a handle needs to do.
@@ -317,12 +394,17 @@ pub struct Playbacks {
     ended: Counter,
     /// The last hour's ended playbacks, newest last (P3-15).
     gone: Mutex<VecDeque<EndedPlayback>>,
-    /// Handles an admin stopped, and when: a client still using one is
-    /// told so, not that it expired (P3-15). Kept as long as an idle
-    /// handle would have lived.
-    stopped: Mutex<HashMap<String, Instant>>,
+    /// Handles ended for a reason their client is told, when, and the
+    /// refusal it gets: an admin stopped it (P3-15), or its session ended
+    /// (B-10), rather than that it expired. Kept as long as an idle handle
+    /// would have lived.
+    let_go: Mutex<HashMap<String, (Instant, Refusal)>>,
     /// What idling out and rechecks are timed by (PX-09).
     clock: crate::clock::Clock,
+    /// The open connections, by number, and when each opened.
+    connections: Mutex<HashMap<u64, Instant>>,
+    /// The last connection number given out.
+    numbered: std::sync::atomic::AtomicU64,
 }
 
 /// How a playback ended (P3-15).
@@ -334,16 +416,35 @@ pub enum EndReason {
     StoppedByAdmin,
     /// No reads for [`IDLE`].
     Idle,
-    /// Its device started two more after it: it holds only the one
-    /// playing now and the next ("now + next"), or, with no slot
-    /// free, only the new one.
+    /// Its device started another and needed room: it keeps the one
+    /// playing now and the next ("now + next"), and this one was neither
+    /// (not used in the last [`READING`]).
     Replaced,
     /// Its device was gone longer than the grace.
     DeviceGone,
     /// Its session ended, or its user was disabled.
     SignedOut,
+    /// What it plays is in a library its user can no longer see (B-10):
+    /// removed, or on a Plex server no longer served.
+    AccessRemoved,
     /// Its conversion failed, with ffmpeg's reason.
     Failed(String),
+}
+
+impl EndReason {
+    /// What the log calls it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EndReason::Finished => "finished",
+            EndReason::StoppedByAdmin => "stopped_by_admin",
+            EndReason::Idle => "idle",
+            EndReason::Replaced => "replaced",
+            EndReason::DeviceGone => "device_gone",
+            EndReason::SignedOut => "signed_out",
+            EndReason::AccessRemoved => "access_removed",
+            EndReason::Failed(_) => "failed",
+        }
+    }
 }
 
 /// One playback as playback debug shows it (P3-15): read from the
@@ -538,8 +639,10 @@ impl Playbacks {
             started: Counter::default(),
             ended: Counter::default(),
             gone: Mutex::default(),
-            stopped: Mutex::default(),
+            let_go: Mutex::default(),
             clock: crate::clock::Clock::default(),
+            connections: Mutex::default(),
+            numbered: Default::default(),
         }
     }
 
@@ -584,16 +687,14 @@ impl Playbacks {
     }
 
     /// Why `handle`, which is not open, cannot be used: an admin stopped
-    /// it, or it is unknown or idled out.
+    /// it, its session ended, or it is unknown or idled out.
     fn gone(&self, handle: &str) -> Refusal {
-        let mut stopped = self.stopped.lock();
+        let mut let_go = self.let_go.lock();
         let now = self.clock.now();
-        stopped.retain(|_, at| now.saturating_duration_since(*at) < self.idle);
-        if stopped.contains_key(handle) {
-            Refusal::Stopped
-        } else {
-            Refusal::Expired
-        }
+        let_go.retain(|_, (at, _)| now.saturating_duration_since(*at) < self.idle);
+        let_go
+            .get(handle)
+            .map_or(Refusal::Expired, |(_, refusal)| *refusal)
     }
 
     /// Serialize changes to this handle. The caller must look up the
@@ -671,7 +772,10 @@ impl Playbacks {
                 file: opened.file,
                 subtitle: opened.subtitle,
                 conversion: opened.conversion,
+                connection: opened.connection,
                 last_used: now,
+                last_read: None,
+                orphaned_at: None,
                 last_checked: now,
             },
         );
@@ -696,12 +800,14 @@ impl Playbacks {
     }
 
     /// Use `handle` from `session` on `endpoint`: refused if it is not
-    /// theirs or has expired, and otherwise marked used.
+    /// theirs or has expired, and otherwise marked used, and played if
+    /// `using` plays it.
     pub fn use_handle(
         &self,
         handle: &PlaybackHandle,
         session: &SessionId,
         endpoint: &str,
+        using: Using,
     ) -> Result<Use, Refusal> {
         let now = self.clock.now();
         let mut handles = self.lock();
@@ -719,6 +825,9 @@ impl Playbacks {
             return Err(Refusal::Expired);
         }
         playback.last_used = now;
+        if using == Using::Plays {
+            playback.last_read = Some(now);
+        }
         let recheck = now.duration_since(playback.last_checked) >= self.recheck;
         if recheck {
             playback.last_checked = now;
@@ -737,6 +846,8 @@ impl Playbacks {
 
     /// Mark `handle` used now, as a read that is still waiting for an
     /// encode does, so the playback does not idle out under it.
+    /// Not a use by the client ([`READING`]): the server waits on, even
+    /// for a killed app whose connection it has not yet seen go.
     pub fn touch(&self, handle: &PlaybackHandle) {
         if let Some(p) = self.lock().get_mut(&handle.0) {
             p.last_used = self.clock.now();
@@ -813,6 +924,7 @@ impl Playbacks {
             drop(handles);
             return Err(match self.gone(&handle.0) {
                 Refusal::Stopped => spoolframe_protocol::Error::PlaybackStopped,
+                Refusal::SignedOut => spoolframe_protocol::Error::Unauthenticated,
                 _ => spoolframe_protocol::Error::PlaybackExpired,
             });
         };
@@ -838,51 +950,181 @@ impl Playbacks {
         self.ended_all(ended, why);
     }
 
-    /// End all of `endpoint`'s converted playbacks: it is starting
-    /// another, and no slot is free for it, so its own encodes give way
-    /// (one device's two playbacks with `max_jobs = 1`). Returns how many.
-    pub fn end_conversions_on(&self, endpoint: &str) -> usize {
+    /// End `endpoint`'s converted playbacks that are not playing: it is
+    /// starting another from connection `starting`, and no slot is free
+    /// for it, so its own idle encodes give way (one device's two
+    /// playbacks with `max_jobs = 1`). A killed app's always does
+    /// ([`Playback::left_behind`]); one its client used in the last
+    /// [`READING`] is playing and stays, and the new start is then refused
+    /// as busy: a track that stops mid-play is worse than a next track
+    /// that waits. Returns how many.
+    pub fn end_conversions_on(&self, endpoint: &str, starting: u64) -> usize {
+        self.end_conversions_on_where(endpoint, starting, |p| p.conversion.is_some())
+    }
+
+    /// [`Playbacks::end_conversions_on`], counting the playbacks `holds`
+    /// picks.
+    fn end_conversions_on_where(
+        &self,
+        endpoint: &str,
+        starting: u64,
+        holds: impl Fn(&Playback) -> bool,
+    ) -> usize {
+        let now = self.clock.now();
+        let starting = self.opened(starting);
         self.end_where(
-            |p| p.endpoint == endpoint && p.conversion.is_some(),
+            |p| p.endpoint == endpoint && holds(p) && (p.left_behind(starting) || !p.reading(now)),
             EndReason::Replaced,
         )
     }
 
-    /// Make room on `endpoint` for a playback it is starting: a device
-    /// holds at most two converted playbacks, "now + next": the one
-    /// playing now and the next it prepares (an iOS app opens the next track while
-    /// this one plays, for gapless audio). So all of the device's
-    /// converted playbacks but the newest end: those are abandoned (an app
-    /// killed mid-film and opened again), and their encodes would only
-    /// hold slots. Direct play holds no slot, and is left alone. Returns
-    /// how many ended.
-    pub fn make_room_for_next(&self, endpoint: &str) -> usize {
-        self.make_room_for_next_where(endpoint, |p| p.conversion.is_some())
+    /// Connection `connection` and when it opened, if it is open.
+    fn opened(&self, connection: u64) -> Option<(u64, Instant)> {
+        self.connections
+            .lock()
+            .get(&connection)
+            .map(|at| (connection, *at))
+    }
+
+    /// Make room on `endpoint` for a playback that connection `starting`
+    /// is starting: a device keeps "now + next" ([`NOW_AND_NEXT`]), the
+    /// one playing now and the next it prepares (an iOS app opens the next
+    /// track while this one plays, for gapless audio). A killed app's
+    /// playbacks all end first, however lately they were read
+    /// ([`Playback::left_behind`]): the app opened again can use none of
+    /// them. Of the others, enough end to keep one besides the new start,
+    /// those used least recently first, never used first, the oldest first
+    /// among equals. One used in the last [`READING`] is playing and never
+    /// ends; the one starting is not open yet, so it cannot be chosen.
+    /// With too few to end the device holds more than two, up to
+    /// [`DEVICE_MOST`]: past that the start is refused ([`DeviceFull`]).
+    /// Direct play holds no slot, and is left alone. Returns how many
+    /// ended.
+    pub fn make_room_for_next(&self, endpoint: &str, starting: u64) -> Result<usize, DeviceFull> {
+        self.make_room_for_next_where(endpoint, starting, |p| p.conversion.is_some())
     }
 
     /// [`Playbacks::make_room_for_next`], counting the playbacks `holds`
     /// picks.
-    fn make_room_for_next_where(&self, endpoint: &str, holds: impl Fn(&Playback) -> bool) -> usize {
-        let newest = self
-            .lock()
-            .values()
-            .filter(|p| p.endpoint == endpoint && holds(p))
-            .map(|p| p.order)
-            .max();
-        let Some(newest) = newest else {
-            return 0;
-        };
-        // The newest stays, as "now" once the one starting is "next".
-        self.end_where(
-            |p| p.endpoint == endpoint && holds(p) && p.order < newest,
-            EndReason::Replaced,
-        )
+    fn make_room_for_next_where(
+        &self,
+        endpoint: &str,
+        starting: u64,
+        holds: impl Fn(&Playback) -> bool,
+    ) -> Result<usize, DeviceFull> {
+        let now = self.clock.now();
+        let starting = self.opened(starting);
+        let mut handles = self.lock();
+        let (left_behind, held): (Vec<(&String, &Playback)>, Vec<_>) = handles
+            .iter()
+            .filter(|(_, p)| p.endpoint == endpoint && holds(p))
+            .partition(|(_, p)| p.left_behind(starting));
+        // One stays besides the one starting: "now", once that is "next".
+        let over = held.len().saturating_sub(NOW_AND_NEXT - 1);
+        let mut idle: Vec<&(&String, &Playback)> =
+            held.iter().filter(|(_, p)| !p.reading(now)).collect();
+        idle.sort_by_key(|(_, p)| (p.last_read, p.order));
+        let idle = idle.into_iter().take(over);
+        let ending: Vec<String> = left_behind
+            .iter()
+            .chain(idle)
+            .map(|(h, _)| (*h).clone())
+            .collect();
+        let left = held.len() + left_behind.len() - ending.len();
+        let ended: Vec<(String, Playback)> = ending
+            .into_iter()
+            .filter_map(|h| handles.remove_entry(&h))
+            .collect();
+        drop(handles);
+        let count = ended.len();
+        self.ended_all(ended, EndReason::Replaced);
+        if left >= DEVICE_MOST {
+            return Err(DeviceFull);
+        }
+        Ok(count)
+    }
+
+    /// A connection opened: its number, never another's, which its
+    /// playbacks are started with ([`Opened::connection`]).
+    pub fn connection_opened(&self) -> u64 {
+        let number = self
+            .numbered
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.connections.lock().insert(number, self.clock.now());
+        number
+    }
+
+    /// The connection numbered `connection` closed: its playbacks are a
+    /// killed app's, unless another connection of the device uses them
+    /// again (a reconnect).
+    pub fn connection_closed(&self, connection: u64) {
+        let now = self.clock.now();
+        self.connections.lock().remove(&connection);
+        for p in self.lock().values_mut() {
+            if p.connection == connection {
+                p.orphaned_at = Some(now);
+            }
+        }
     }
 
     /// End every playback of `endpoint`: it has been gone longer than the
     /// grace. Returns how many.
     pub fn end_device(&self, endpoint: &str) -> usize {
         self.end_where(|p| p.endpoint == endpoint, EndReason::DeviceGone)
+    }
+
+    /// The items open playbacks play, each once.
+    pub fn items(&self) -> Vec<MediaId> {
+        let mut items: Vec<MediaId> = Vec::new();
+        for playback in self.lock().values() {
+            if !items.contains(&playback.item) {
+                items.push(playback.item.clone());
+            }
+        }
+        items
+    }
+
+    /// End every playback of `item`, `why`. Returns how many.
+    pub fn end_item(&self, item: &MediaId, why: EndReason) -> usize {
+        self.end_where(|p| &p.item == item, why)
+    }
+
+    /// The sessions with a playback open, each once.
+    pub fn sessions(&self) -> Vec<SessionId> {
+        let mut sessions: Vec<SessionId> =
+            self.lock().values().map(|p| p.session.clone()).collect();
+        sessions.sort_by(|a, b| a.0.cmp(&b.0));
+        sessions.dedup();
+        sessions
+    }
+
+    /// End every playback of `session`, which has ended (B-10): revoked,
+    /// signed out, or its user disabled. At once, not after the
+    /// disconnect grace, which is for a device coming back to a session
+    /// still live: their encodes stop now, and a client still using one
+    /// is told to sign in again. Returns how many.
+    pub fn end_session(&self, session: &SessionId) -> usize {
+        let mut handles = self.lock();
+        let ending: Vec<String> = handles
+            .iter()
+            .filter(|(_, p)| &p.session == session)
+            .map(|(h, _)| h.clone())
+            .collect();
+        let ended: Vec<(String, Playback)> = ending
+            .into_iter()
+            .filter_map(|h| handles.remove_entry(&h))
+            .collect();
+        let now = self.clock.now();
+        self.let_go.lock().extend(
+            ended
+                .iter()
+                .map(|(h, _)| (h.clone(), (now, Refusal::SignedOut))),
+        );
+        drop(handles);
+        let count = ended.len();
+        self.ended_all(ended, EndReason::SignedOut);
+        count
     }
 
     fn end_where(&self, ends: impl Fn(&Playback) -> bool, why: EndReason) -> usize {
@@ -920,12 +1162,24 @@ impl Playbacks {
     /// Count `ended` playbacks and keep them for the last hour's list, as
     /// they were (P3-15). Called outside the lock: their conversions are
     /// dropped here, which stops their encodes and removes their files.
+    /// Each one the server ends, rather than its client, is logged here
+    /// and nowhere else, once.
     fn ended_all(&self, ended: impl IntoIterator<Item = (String, Playback)>, why: EndReason) {
         let at = unix_ms();
+        let now = self.clock.now();
+        // A client that stops its own playback knows why; every other end
+        // is something its user may ask about later.
+        let logged = why != EndReason::Finished;
         let mut kept = Vec::new();
         for (handle, playback) in ended {
             self.ended.inc();
             let last = playback.snapshot(&handle);
+            // Its ffmpeg stops and its slot is let go of now: a read still
+            // waiting (a killed app's) holds the conversion, which would
+            // keep both until that read gave up.
+            if let Some(conversion) = &playback.conversion {
+                conversion.end();
+            }
             // A failed conversion says more than how its playback was let go.
             let why = match (
                 &why,
@@ -934,6 +1188,23 @@ impl Playbacks {
                 (EndReason::StoppedByAdmin, _) | (_, None) => why.clone(),
                 (_, Some(reason)) => EndReason::Failed(reason),
             };
+            if logged {
+                let error = match &why {
+                    EndReason::Failed(reason) => Some(reason.as_str()),
+                    _ => None,
+                };
+                tracing::info!(
+                    playback = %playback.id,
+                    item = %playback.item,
+                    user = %playback.viewer.username,
+                    endpoint = %playback.endpoint,
+                    plan = playback.plan().as_str(),
+                    why = why.as_str(),
+                    idle_secs = now.saturating_duration_since(playback.last_used).as_secs(),
+                    error,
+                    "a playback ended"
+                );
+            }
             kept.push(EndedPlayback { at, why, last });
         }
         if kept.is_empty() {
@@ -1008,7 +1279,9 @@ impl Playbacks {
             return false;
         };
         let ended = handles.remove_entry(&handle);
-        self.stopped.lock().insert(handle, self.clock.now());
+        self.let_go
+            .lock()
+            .insert(handle, (self.clock.now(), Refusal::Stopped));
         drop(handles);
         self.ended_all(ended, EndReason::StoppedByAdmin);
         true
@@ -1051,41 +1324,59 @@ mod tests {
     }
 
     fn start_on(p: &Playbacks, endpoint: &str) -> PlaybackHandle {
+        start_from(p, endpoint, 0)
+    }
+
+    /// A playback `connection` starts on `endpoint`.
+    fn start_from(p: &Playbacks, endpoint: &str, connection: u64) -> PlaybackHandle {
         p.start(
             Playbacks::new_handle(),
             Opened {
-                viewer: viewer(),
-                shown: Shown {
-                    title: "Alien".into(),
-                    subtitle: None,
-                    duration_ms: Some(10_000),
-                },
-                planned: PlaybackPlan::Unknown,
-                session: SessionId("s".into()),
-                endpoint: endpoint.into(),
-                item: "plex:movie:1".parse().unwrap(),
-                selection: Selection::default(),
-                path: "/media/a.mkv".into(),
-                size: 10,
-                file: None,
-                subtitle: None,
-                conversion: None,
+                connection,
+                ..opened_on(endpoint)
             },
         )
+    }
+
+    /// Session `s`'s playback of the movie on `endpoint`.
+    fn opened_on(endpoint: &str) -> Opened {
+        Opened {
+            viewer: viewer(),
+            shown: Shown {
+                title: "Alien".into(),
+                subtitle: None,
+                duration_ms: Some(10_000),
+            },
+            planned: PlaybackPlan::Unknown,
+            session: SessionId("s".into()),
+            endpoint: endpoint.into(),
+            item: "plex:movie:1".parse().unwrap(),
+            selection: Selection::default(),
+            path: "/media/a.mkv".into(),
+            size: 10,
+            file: None,
+            subtitle: None,
+            conversion: None,
+            connection: 0,
+        }
     }
 
     #[test]
     fn a_handle_is_usable_by_its_session_on_its_endpoint_only() {
         let p = Playbacks::default();
         let h = start(&p);
-        assert!(p.use_handle(&h, &SessionId("s".into()), "e").is_ok());
+        assert!(
+            p.use_handle(&h, &SessionId("s".into()), "e", Using::Plays)
+                .is_ok()
+        );
         assert_eq!(
-            p.use_handle(&h, &SessionId("other".into()), "e")
+            p.use_handle(&h, &SessionId("other".into()), "e", Using::Plays)
                 .unwrap_err(),
             Refusal::NotYours
         );
         assert_eq!(
-            p.use_handle(&h, &SessionId("s".into()), "x").unwrap_err(),
+            p.use_handle(&h, &SessionId("s".into()), "x", Using::Plays)
+                .unwrap_err(),
             Refusal::NotYours
         );
     }
@@ -1105,7 +1396,10 @@ mod tests {
         assert_eq!(p.end_device("tv"), 1);
         clock.advance(IDLE);
         // Found idle when used, then forgotten.
-        assert!(p.use_handle(&idle, &SessionId("s".into()), "e").is_err());
+        assert!(
+            p.use_handle(&idle, &SessionId("s".into()), "e", Using::Plays)
+                .is_err()
+        );
         p.sweep();
         let counts = p.counts();
         assert_eq!(
@@ -1118,8 +1412,13 @@ mod tests {
     fn an_unknown_handle_is_expired() {
         let p = Playbacks::default();
         assert_eq!(
-            p.use_handle(&PlaybackHandle("nope".into()), &SessionId("s".into()), "e")
-                .unwrap_err(),
+            p.use_handle(
+                &PlaybackHandle("nope".into()),
+                &SessionId("s".into()),
+                "e",
+                Using::Plays
+            )
+            .unwrap_err(),
             Refusal::Expired
         );
     }
@@ -1131,10 +1430,13 @@ mod tests {
         let h = start(&p);
         let s = SessionId("s".into());
         clock.advance(IDLE - Duration::from_secs(1));
-        assert!(p.use_handle(&h, &s, "e").is_ok());
+        assert!(p.use_handle(&h, &s, "e", Using::Plays).is_ok());
         // Used a moment ago: idle from then.
         clock.advance(IDLE);
-        assert_eq!(p.use_handle(&h, &s, "e").unwrap_err(), Refusal::Expired);
+        assert_eq!(
+            p.use_handle(&h, &s, "e", Using::Plays).unwrap_err(),
+            Refusal::Expired
+        );
     }
 
     #[test]
@@ -1143,12 +1445,12 @@ mod tests {
         let p = Playbacks::default().with_clock(clock.clone());
         let h = start(&p);
         let s = SessionId("s".into());
-        assert!(!p.use_handle(&h, &s, "e").unwrap().recheck);
+        assert!(!p.use_handle(&h, &s, "e", Using::Plays).unwrap().recheck);
         clock.advance(RECHECK - Duration::from_secs(1));
-        assert!(!p.use_handle(&h, &s, "e").unwrap().recheck);
+        assert!(!p.use_handle(&h, &s, "e", Using::Plays).unwrap().recheck);
         clock.advance(Duration::from_secs(1));
-        assert!(p.use_handle(&h, &s, "e").unwrap().recheck);
-        assert!(!p.use_handle(&h, &s, "e").unwrap().recheck);
+        assert!(p.use_handle(&h, &s, "e", Using::Plays).unwrap().recheck);
+        assert!(!p.use_handle(&h, &s, "e", Using::Plays).unwrap().recheck);
     }
 
     #[test]
@@ -1158,8 +1460,11 @@ mod tests {
         let phone = start_on(&p, "phone");
         assert_eq!(p.end_device("tv"), 1);
         let s = SessionId("s".into());
-        assert_eq!(p.use_handle(&tv, &s, "tv").unwrap_err(), Refusal::Expired);
-        assert!(p.use_handle(&phone, &s, "phone").is_ok());
+        assert_eq!(
+            p.use_handle(&tv, &s, "tv", Using::Plays).unwrap_err(),
+            Refusal::Expired
+        );
+        assert!(p.use_handle(&phone, &s, "phone", Using::Plays).is_ok());
     }
 
     #[test]
@@ -1167,17 +1472,25 @@ mod tests {
         let p = Playbacks::default();
         let direct = start_on(&p, "tv");
         // Direct play holds no slot: it stays.
-        assert_eq!(p.end_conversions_on("tv"), 0);
-        assert_eq!(p.make_room_for_next("tv"), 0);
-        assert!(p.use_handle(&direct, &SessionId("s".into()), "tv").is_ok());
+        assert_eq!(p.end_conversions_on("tv", 0), 0);
+        assert_eq!(p.make_room_for_next("tv", 0), Ok(0));
+        assert!(
+            p.use_handle(&direct, &SessionId("s".into()), "tv", Using::Plays)
+                .is_ok()
+        );
     }
 
     /// A start as StartPlayback makes it: room first, then the playback.
     /// Every playback here stands in for a converted one, since a real
     /// conversion needs ffmpeg; tests/it/encode.rs has those.
     fn start_next(p: &Playbacks, endpoint: &str) -> PlaybackHandle {
-        p.make_room_for_next_where(endpoint, |_| true);
-        start_on(p, endpoint)
+        start_next_from(p, endpoint, 0)
+    }
+
+    fn start_next_from(p: &Playbacks, endpoint: &str, connection: u64) -> PlaybackHandle {
+        p.make_room_for_next_where(endpoint, connection, |_| true)
+            .expect("room on the device");
+        start_from(p, endpoint, connection)
     }
 
     /// An app prepares the next track while this one plays (iOS gapless
@@ -1188,8 +1501,8 @@ mod tests {
         let s = SessionId("s".into());
         let now = start_next(&p, "phone");
         let next = start_next(&p, "phone");
-        assert!(p.use_handle(&now, &s, "phone").is_ok());
-        assert!(p.use_handle(&next, &s, "phone").is_ok());
+        assert!(p.use_handle(&now, &s, "phone", Using::Plays).is_ok());
+        assert!(p.use_handle(&next, &s, "phone", Using::Plays).is_ok());
     }
 
     /// A third start ends the oldest: its encode was abandoned, and its
@@ -1202,11 +1515,186 @@ mod tests {
         let next = start_next(&p, "phone");
         let third = start_next(&p, "phone");
         assert_eq!(
-            p.use_handle(&oldest, &s, "phone").unwrap_err(),
+            p.use_handle(&oldest, &s, "phone", Using::Plays)
+                .unwrap_err(),
             Refusal::Expired
         );
-        assert!(p.use_handle(&next, &s, "phone").is_ok());
-        assert!(p.use_handle(&third, &s, "phone").is_ok());
+        assert!(p.use_handle(&next, &s, "phone", Using::Plays).is_ok());
+        assert!(p.use_handle(&third, &s, "phone", Using::Plays).is_ok());
+        let why: Vec<EndReason> = p.ended().into_iter().map(|e| e.why).collect();
+        assert_eq!(why, [EndReason::Replaced]);
+    }
+
+    /// A killed app's conversion is left over on its device, its encode
+    /// still holding a slot. The app, opened again, plays a track and
+    /// prepares the next: the leftover is what ends, and the track being
+    /// read plays on, even when no slot is free and the device must give
+    /// way to its new start.
+    #[test]
+    fn a_leftover_conversion_ends_and_the_track_being_read_plays_on() {
+        let clock = Clock::default();
+        let p = Playbacks::default().with_clock(clock.clone());
+        let s = SessionId("s".into());
+        let leftover = start_next(&p, "phone");
+        clock.advance(Duration::from_secs(60));
+        let now = start_next(&p, "phone");
+        p.use_handle(&now, &s, "phone", Using::Plays).unwrap();
+        clock.advance(Duration::from_secs(1));
+        // The next, as StartPlayback starts it with no slot free.
+        p.make_room_for_next_where("phone", 0, |_| true).unwrap();
+        p.end_conversions_on_where("phone", 0, |_| true);
+        let next = start_on(&p, "phone");
+        assert!(
+            p.use_handle(&now, &s, "phone", Using::Plays).is_ok(),
+            "the track played"
+        );
+        assert_eq!(
+            p.use_handle(&leftover, &s, "phone", Using::Plays)
+                .unwrap_err(),
+            Refusal::Expired
+        );
+        assert!(p.use_handle(&next, &s, "phone", Using::Plays).is_ok());
+    }
+
+    /// An app that starts more than the next while one track is read: the
+    /// ones far ahead give way to each other, and the track being read
+    /// plays on.
+    #[test]
+    fn starts_past_the_next_end_the_ones_far_ahead_not_the_one_being_read() {
+        let clock = Clock::default();
+        let p = Playbacks::default().with_clock(clock.clone());
+        let s = SessionId("s".into());
+        let now = start_next(&p, "phone");
+        p.use_handle(&now, &s, "phone", Using::Plays).unwrap();
+        clock.advance(Duration::from_secs(1));
+        let second = start_next(&p, "phone");
+        let third = start_next(&p, "phone");
+        let fourth = start_next(&p, "phone");
+        assert!(
+            p.use_handle(&now, &s, "phone", Using::Plays).is_ok(),
+            "the track played"
+        );
+        for far in [&second, &third] {
+            assert_eq!(
+                p.use_handle(far, &s, "phone", Using::Plays).unwrap_err(),
+                Refusal::Expired
+            );
+        }
+        assert!(p.use_handle(&fourth, &s, "phone", Using::Plays).is_ok());
+    }
+
+    /// An app killed mid-track and opened again at once, its connection
+    /// seen closed: its playbacks, read a moment ago, all end at the new
+    /// connection's first start, which needs no room for them.
+    #[test]
+    fn a_closed_connection_s_playbacks_end_though_read_just_now() {
+        let p = Playbacks::default();
+        let s = SessionId("s".into());
+        let killed = p.connection_opened();
+        let now = start_next_from(&p, "phone", killed);
+        let next = start_next_from(&p, "phone", killed);
+        p.use_handle(&now, &s, "phone", Using::Plays).unwrap();
+        p.use_handle(&next, &s, "phone", Using::Plays).unwrap();
+        p.connection_closed(killed);
+        let relaunched = p.connection_opened();
+        assert_eq!(
+            p.make_room_for_next_where("phone", relaunched, |_| true),
+            Ok(2)
+        );
+    }
+
+    /// A killed app sends no close: its connection is still open when the
+    /// app, opened again, starts on a newer one. What the older one read
+    /// and the newer has not ends, read a moment ago or not, and gives
+    /// way to the new start when no slot is free.
+    #[test]
+    fn an_older_connection_s_playbacks_end_at_a_newer_one_s_start() {
+        let clock = Clock::default();
+        let p = Playbacks::default().with_clock(clock.clone());
+        let s = SessionId("s".into());
+        let killed = p.connection_opened();
+        let now = start_next_from(&p, "phone", killed);
+        p.use_handle(&now, &s, "phone", Using::Plays).unwrap();
+        clock.advance(Duration::from_millis(1));
+        let relaunched = p.connection_opened();
+        assert_eq!(p.end_conversions_on_where("phone", relaunched, |_| true), 1);
+        // The older connection's own start leaves its playbacks alone.
+        let mine = start_next_from(&p, "phone", killed);
+        p.use_handle(&mine, &s, "phone", Using::Plays).unwrap();
+        assert_eq!(p.end_conversions_on_where("phone", killed, |_| true), 0);
+    }
+
+    /// A device that reconnects and reads its playback on keeps it: read
+    /// after its connection closed and the new one opened, it is not a
+    /// killed app's.
+    #[test]
+    fn a_playback_read_after_a_reconnect_is_not_a_killed_app_s() {
+        let clock = Clock::default();
+        let p = Playbacks::default().with_clock(clock.clone());
+        let s = SessionId("s".into());
+        let before = p.connection_opened();
+        let resumed = start_next_from(&p, "phone", before);
+        p.connection_closed(before);
+        clock.advance(Duration::from_secs(1));
+        let back = p.connection_opened();
+        clock.advance(Duration::from_secs(1));
+        p.use_handle(&resumed, &s, "phone", Using::Plays).unwrap();
+        let next = start_next_from(&p, "phone", back);
+        assert!(p.use_handle(&resumed, &s, "phone", Using::Plays).is_ok());
+        // Not read for a while (paused), it is still not a killed app's:
+        // the next start ends the one never read instead.
+        clock.advance(READING);
+        let unread = start_next_from(&p, "phone", back);
+        assert!(p.use_handle(&resumed, &s, "phone", Using::Plays).is_ok());
+        assert_eq!(
+            p.use_handle(&next, &s, "phone", Using::Plays).unwrap_err(),
+            Refusal::Expired
+        );
+        assert!(p.use_handle(&unread, &s, "phone", Using::Plays).is_ok());
+    }
+
+    /// While the track before is still read as the next is prepared, a
+    /// device holds a third, and no more: a fourth start, all three being
+    /// read, is refused rather than ending one that plays.
+    #[test]
+    fn a_device_reading_all_it_holds_gets_a_third_and_no_fourth() {
+        let clock = Clock::default();
+        let p = Playbacks::default().with_clock(clock.clone());
+        let s = SessionId("s".into());
+        let mut held = Vec::new();
+        for _ in 0..DEVICE_MOST {
+            let h = start_next(&p, "phone");
+            p.use_handle(&h, &s, "phone", Using::Plays).unwrap();
+            held.push(h);
+        }
+        assert_eq!(
+            p.make_room_for_next_where("phone", 0, |_| true),
+            Err(DeviceFull)
+        );
+        for h in &held {
+            assert!(p.use_handle(h, &s, "phone", Using::Plays).is_ok());
+        }
+        // Once one is no longer read, it makes the room.
+        clock.advance(READING);
+        p.use_handle(&held[1], &s, "phone", Using::Plays).unwrap();
+        p.use_handle(&held[2], &s, "phone", Using::Plays).unwrap();
+        assert_eq!(p.make_room_for_next_where("phone", 0, |_| true), Ok(1));
+    }
+
+    /// A playback paused for most of the idle limit is alive, and is not
+    /// playing: with no slot free, the device's next start ends it rather
+    /// than being refused as busy.
+    #[test]
+    fn a_long_paused_playback_lives_and_gives_way_to_its_device_s_next_start() {
+        let clock = Clock::default();
+        let p = Playbacks::default().with_clock(clock.clone());
+        let s = SessionId("s".into());
+        let paused = start_next(&p, "tv");
+        p.use_handle(&paused, &s, "tv", Using::Plays).unwrap();
+        clock.advance(Duration::from_secs(29 * 60));
+        p.sweep();
+        assert_eq!(p.counts().ended, 0, "ended while paused");
+        assert_eq!(p.end_conversions_on_where("tv", 0, |_| true), 1);
         let why: Vec<EndReason> = p.ended().into_iter().map(|e| e.why).collect();
         assert_eq!(why, [EndReason::Replaced]);
     }
@@ -1219,7 +1707,10 @@ mod tests {
         start_next(&p, "phone");
         start_next(&p, "phone");
         start_next(&p, "phone");
-        assert!(p.use_handle(&tv, &SessionId("s".into()), "tv").is_ok());
+        assert!(
+            p.use_handle(&tv, &SessionId("s".into()), "tv", Using::Plays)
+                .is_ok()
+        );
     }
 
     fn id_of(p: &Playbacks, endpoint: &str) -> String {
@@ -1229,6 +1720,36 @@ mod tests {
             .unwrap()
             .id
             .clone()
+    }
+
+    /// B-10: an ended session's playbacks end at once, its own only, and
+    /// its client is told to sign in again rather than that they expired.
+    #[test]
+    fn an_ended_session_s_playbacks_end_and_are_refused_as_signed_out() {
+        let p = Playbacks::default();
+        let h = start_on(&p, "tv");
+        let s = SessionId("s".into());
+        let other = p.start(
+            Playbacks::new_handle(),
+            Opened {
+                session: SessionId("other".into()),
+                ..opened_on("laptop")
+            },
+        );
+        assert_eq!(p.end_session(&s), 1);
+        assert_eq!(
+            p.use_handle(&h, &s, "tv", Using::Plays).unwrap_err(),
+            Refusal::SignedOut
+        );
+        assert_eq!(
+            p.check_progress(&h, 1).unwrap_err(),
+            spoolframe_protocol::Error::Unauthenticated
+        );
+        assert!(
+            p.use_handle(&other, &SessionId("other".into()), "laptop", Using::Plays)
+                .is_ok()
+        );
+        assert_eq!(p.ended()[0].why, EndReason::SignedOut);
     }
 
     /// An admin's Stop (P3-15) ends the playback, and its client is told
@@ -1241,14 +1762,17 @@ mod tests {
         assert!(p.stop(&id));
         assert!(!p.stop(&id), "stopped twice");
         let s = SessionId("s".into());
-        assert_eq!(p.use_handle(&h, &s, "tv").unwrap_err(), Refusal::Stopped);
+        assert_eq!(
+            p.use_handle(&h, &s, "tv", Using::Plays).unwrap_err(),
+            Refusal::Stopped
+        );
         assert_eq!(
             p.check_progress(&h, 1).unwrap_err(),
             spoolframe_protocol::Error::PlaybackStopped
         );
         // Any other gone handle is still merely expired.
         assert_eq!(
-            p.use_handle(&PlaybackHandle("nope".into()), &s, "tv")
+            p.use_handle(&PlaybackHandle("nope".into()), &s, "tv", Using::Plays)
                 .unwrap_err(),
             Refusal::Expired
         );

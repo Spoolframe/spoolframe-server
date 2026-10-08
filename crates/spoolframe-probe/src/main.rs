@@ -50,7 +50,9 @@ struct Args {
     web_origin: Option<String>,
     /// Also check playback ownership as the account: start one direct
     /// playback, try its handle from another device signed in as the same
-    /// account (and as --second-username), then stop it.
+    /// account (and as --second-username), then stop it; then the same
+    /// item as an HLS remux of its audio, if it is planned as one, with
+    /// progress sent from the others too.
     #[arg(long, requires = "username")]
     check_playback: bool,
     /// A second consumer account, for the playback check's cross-user part.
@@ -67,6 +69,14 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
+    // aws-lc-rs, iroh's provider, for reqwest too: reqwest 0.12 falls back
+    // to ring when no provider is installed (the workspace Cargo.toml).
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        anyhow::bail!("a TLS provider was installed before the probe's own");
+    }
     let target = args
         .addr
         .iter()

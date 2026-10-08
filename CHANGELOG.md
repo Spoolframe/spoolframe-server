@@ -2835,3 +2835,92 @@
   fails `anonymous-pool` (third review G-16): the limits check's wrong
   passwords come from a key of its own, so the source they lock is not
   the run's key, from which the pool check then logs in.
+- A device's playing track is no longer ended when it prepares the next
+  (P2-03). When a start needs room on its device, a conversion used in
+  the last 30 s (a segment, playlist or media read, or any request
+  naming it) is playing and never ends. Of the others, the first to end
+  is a killed app's, whose connection closed and that no new connection
+  has used; then the least recently used, never-used first. With none to
+  end, the device may hold a third conversion, and a fourth start is
+  `Busy`. With no slot free, only the device's conversions not in use
+  give way; with none, the start is `Busy` and the client tries again.
+  Before, the iOS app's playing track failed as `PlaybackExpired` when
+  the next was prepared. Earlier connections of the same app, killed
+  without `EndPlayback`, had left conversions behind. With no slot free,
+  every conversion of the device ended, the playing one with them.
+- An app killed mid-track and opened again at once can play again
+  (P2-03). Before, every start from the new connection was `Busy`: the
+  killed app's conversions had been read in the last 30 s, so they
+  counted as playing and held every slot. A killed app sends no close,
+  and the server holds its connection until it idles out. A conversion
+  is now a killed app's if its connection closed, or if a newer
+  connection of its device is starting and has not used it since that
+  connection opened. Such a conversion is never protected. All of them
+  end at the new connection's first start that needs room or a slot. A
+  reconnect that reads a playback on (a resume) keeps it.
+- An ended playback's ffmpeg stops, and its slot is free, at once. Before,
+  a read still waiting on it (a killed app's) kept both until the read
+  gave up. A read in progress no longer counts as the client using the
+  playback while it waits.
+- A session that ends ends its playbacks at once (B-10): revoked, logged
+  out, its user disabled, its device forgotten, its user's password
+  changed, or too many wrong PINs. Their ffmpeg stops and their slot is
+  free; Server › Playback lists them as "Signed out". A client still
+  using one is told `Unauthenticated`. Before, closing the device's
+  connection stopped its reads, but the playback and its encode lived on
+  for the 30 s reconnect grace. That grace is now only for a device that
+  drops off the network with its session still live.
+- Removing a library ends its open playbacks at once (B-10), as does
+  removing a Plex server or any other change that stops a library being
+  served. Their ffmpeg stops; a client still using one is told
+  `PlaybackExpired`, and starting it again is `NotFound`. Server ›
+  Playback lists them as "Its library was removed". Each read's 30 s
+  recheck now also asks whether the item is still served, beside the
+  read, so a film Plex moves to a section not served here ends there; a
+  Plex that cannot be reached ends nothing. Before, such a playback went
+  on until it idled out, 5 minutes after its last read.
+- TLS is aws-lc-rs, not ring: iroh (`tls-aws-lc-rs`) and the OTLP gRPC
+  exporter (`tls-aws-lc`). The server and the probe install aws-lc-rs as
+  the process's provider at start, so reqwest 0.12 (Plex, SSO, OTLP over
+  HTTP) uses it too. ring stays linked in those two binaries as reqwest
+  0.12's fallback. The client SDK and the Linux client link no ring.
+  aws-lc-sys builds with the C compiler alone (its cc builder); no cmake.
+- A paused playback lives 30 minutes without use, not 5. An Apple TV
+  paused an HLS remux for more than 5 minutes; on unpause, every segment
+  read was `PlaybackExpired`. A paused conversion keeps its ffmpeg for
+  that time. The read-ahead throttle has stopped ffmpeg (SIGSTOP), so it
+  uses no CPU, but it keeps its slot, its memory and its scratch files.
+  The device's next start that needs the slot still ends it: a playback
+  not read in the last 30 s is not protected.
+- A paused client keeps its playback alive with `UpdatePlaybackProgress`
+  at the paused position, once a minute. The report resets the idle
+  limit. It does not count as playing, so it does not hold the slot
+  against the device's next start. A report at the same position does
+  not change the watch state. See PROTOCOL.md, "Paused playback and the
+  idle limit".
+- Each playback that the server ends is logged once at INFO, as
+  `a playback ended`. The fields are `playback` (the debug id), `item`,
+  `user`, `endpoint`, `plan`, `why` and `idle_secs`, plus `error` for a
+  failed conversion. Before, an idle end was not logged, and the other
+  ends were logged as counts without the playback. A client's own
+  `StopPlayback` is not logged.
+- The client SDK's `ManagedPlayback` resumes a playback the server ended, for
+  every app. A pause longer than the server's idle limit, a server restart
+  or the device being let go made the next read or control
+  `PlaybackExpired`, and each app had to notice and start again: the Apple
+  TV asked the dead handle 9 times and froze. On `PlaybackExpired` the SDK
+  now starts the same item again with the same tracks and options, at the
+  last known position (the reported progress, a seek, or the HLS segment
+  asked for). It swaps the new handle in behind the same object and tries
+  the operation once more. Direct reads, HLS playlists and segments,
+  progress (also in the background), seeks, subtitle changes and `finish`
+  go on with no error; the new playback is told the viewer's position. HLS
+  is read through the new `ManagedPlayback::manifest`, `read_segment` and
+  `read_subtitle_segment`. A progressive reader, or a segment read
+  part-way, gets the new `SdkError::PlaybackResumed { at }`: build a new
+  reader from `snapshot()` at `at`, or read the segment again from 0.
+  Nothing is resumed after the app closed it, after a start refused for
+  good (`SignInRequired`, `NotFound`, `CannotPlay`, `PlaybackStopped`,
+  given again on every later call), for a plan that changed, or more than
+  3 times in 5 minutes. Before, only a direct read was started again, at
+  most once a call and with no bound.

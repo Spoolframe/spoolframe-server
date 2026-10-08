@@ -23,16 +23,33 @@ pub use composite::{Composite, PlexSource, Served, Synced};
 
 /// The libraries now, if there are any. Every call without them is
 /// [`CatalogError::NotSetUp`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LiveCatalog {
     now: RwLock<Option<Arc<Composite>>>,
+    /// Bumped at each [`LiveCatalog::replace`]: libraries may have gone
+    /// (B-10).
+    replaced: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for LiveCatalog {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl LiveCatalog {
     pub fn new(now: Option<Arc<Composite>>) -> Self {
         Self {
             now: RwLock::new(now),
+            replaced: tokio::sync::watch::Sender::new(0),
         }
+    }
+
+    /// Changes each time the catalog is replaced: a library or Plex
+    /// server was added, removed or changed, so an open playback's item
+    /// may no longer be served.
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.replaced.subscribe()
     }
 
     /// The Plex servers and libraries now. A call in progress keeps the
@@ -50,6 +67,7 @@ impl LiveCatalog {
     /// Serve from `now` from now on; `None` is not set up.
     pub fn replace(&self, now: Option<Arc<Composite>>) {
         *self.now.write() = now;
+        self.replaced.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     fn current(&self) -> Result<Arc<Composite>, CatalogError> {

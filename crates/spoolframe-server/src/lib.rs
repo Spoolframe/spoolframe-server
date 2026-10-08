@@ -45,6 +45,7 @@ pub mod subtitles;
 pub mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub mod tls;
 pub mod tracks;
 pub mod transcode;
 pub mod watch;

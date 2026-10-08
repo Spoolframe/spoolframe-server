@@ -60,6 +60,18 @@ count, so you can keep them while you fix them. This is necessary because, with
 overnight run printed "no crashes" over 64 crashes in `ffprobe_json` before the
 script counted files.
 
+For long campaigns use independent workers, not fork mode:
+
+```sh
+FUZZ_FLAGS="-jobs=16 -workers=16" scripts/fuzz.sh 6300
+```
+
+Each worker runs the target for the whole time and writes `fuzz/fuzz-N.log`
+(ignored). With libfuzzer-sys 0.4.13 and the 2026-10-01 nightly, `-fork=16`
+aborts within seconds of starting, in libFuzzer's own parent process
+(AddressSanitizer `negative-size-param`, no frame of ours, no input saved),
+on every target. Workers are not affected.
+
 To reproduce a crash, and to make an input smaller:
 
 ```sh

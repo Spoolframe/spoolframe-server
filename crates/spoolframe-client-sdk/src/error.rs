@@ -86,7 +86,11 @@ pub enum SdkError {
     /// One reason per stream that this device cannot play.
     #[error("cannot play: {}", reasons.join("; "))]
     CannotPlay { reasons: Vec<String> },
-    /// Start the playback again and go on from where it was.
+    /// The server ended the playback. Through [`crate::Session`], start
+    /// it again and go on from where it was. [`crate::ManagedPlayback`]
+    /// does that itself, and gives this only when it may not: more than
+    /// [`crate::ManagedPlayback::MAX_RESUMES`] times in
+    /// [`crate::ManagedPlayback::RESUME_WINDOW`].
     #[error("the playback has expired")]
     PlaybackExpired,
     /// The server's admin stopped the playback (P3-15): it is over, and
@@ -113,6 +117,21 @@ pub enum SdkError {
     /// A seek restarted the conversion: read `epoch` from offset 0.
     #[error("the playback restarted (epoch {epoch})")]
     PlaybackRestarted { epoch: u32 },
+    /// The server had ended the playback (it idled out, the server
+    /// restarted, the device was gone), and [`crate::ManagedPlayback`]
+    /// started it again, with the same tracks, at `at` in the item. The
+    /// same `ManagedPlayback` goes on with the new handle; its
+    /// [`crate::ManagedPlayback::snapshot`] is the new playback.
+    ///
+    /// Only bytes that cannot continue across the restart give it: a
+    /// progressive reader's ([`crate::ManagedPlayback::read_chunk`]),
+    /// whose new encode begins at `at`, and an HLS segment read part-way
+    /// ([`crate::ManagedPlayback::read_segment`] at an offset past 0).
+    /// Build a new reader from the snapshot, from offset 0, and show the
+    /// player at `at`; read the segment again from offset 0. Direct play,
+    /// playlists, whole segments and controls go on with no error.
+    #[error("the playback was started again at {} s", at.as_secs())]
+    PlaybackResumed { at: Duration },
     /// This profile is locked on this device (P2-08): ask for its PIN and
     /// [`crate::Session::unlock`]. The profile's [`crate::Session::user`]
     /// from [`crate::Client::profiles`] says `locked` before anything is

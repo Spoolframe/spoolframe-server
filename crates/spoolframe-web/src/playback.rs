@@ -159,6 +159,7 @@ pub fn ended_text(why: &EndedWhy) -> (String, bool) {
         ),
         EndedWhy::DeviceGone => ("The device went away".to_owned(), false),
         EndedWhy::SignedOut => ("Signed out".to_owned(), false),
+        EndedWhy::AccessRemoved => ("Its library was removed".to_owned(), false),
         EndedWhy::Failed { reason } => (format!("Failed: {reason}"), true),
     }
 }

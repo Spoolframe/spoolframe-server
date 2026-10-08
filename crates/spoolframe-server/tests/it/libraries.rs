@@ -8,11 +8,12 @@ use std::sync::Arc;
 use serde_json::json;
 use spoolframe_protocol::HomeScreen;
 use spoolframe_protocol::{
-    Error, Reply, Request, Response, SearchRequest, SearchResults, SessionId,
+    Error, MediaReadResponse, Reply, Request, Response, SearchRequest, SearchResults, SessionId,
 };
 use spoolframe_server::catalog::LiveCatalog;
 use spoolframe_server::config::layers::{Layers, Locations};
 use spoolframe_server::config::secrets::Secrets;
+use spoolframe_server::playback::EndReason;
 use spoolframe_server::principal::Principal;
 use spoolframe_server::runtime::{Live, RuntimeSettings};
 use spoolframe_server::store::watch::WatchUpdate;
@@ -636,6 +637,68 @@ async fn removing_a_library_and_adding_it_back_keeps_its_watch_state() {
         ids(&served.home().await.continue_watching),
         ["plex:movie:cabin:11"]
     );
+}
+
+/// B-10: removing a library ends its open playbacks at once, not at the
+/// next 30 s recheck or the 5 min idle; another library's play on.
+#[tokio::test]
+async fn removing_a_library_ends_its_playbacks_at_once() {
+    let tower = pms("Tower", TOWER_SECTIONS, TOWER_FILMS).await;
+    let file = format!(
+        r#"
+        plex {{ url = "{}"; path_mapping [ {{ from = "/data"; to = "{{dir}}/tower"; }} ] }}
+        libraries [
+          {{ name = "Films"; kind = "movies"; plex {{ server = "plex"; section = "1"; }} }},
+          {{ name = "Docs"; kind = "movies"; plex {{ server = "plex"; section = "4"; }} }},
+        ]
+        "#,
+        tower.uri()
+    );
+    let served = Served::start("remove-while-playing", &file).await;
+    served.write_film("tower", "Alien", 1000);
+    served.write_film("tower", "Baraka", 1000);
+    let start = |id: &str| Request::StartPlayback {
+        id: media(id),
+        selection: None,
+        start_ms: None,
+        bitmap: Default::default(),
+    };
+    let Response::Ok(Reply::PlaybackStarted { handle: docs, .. }) =
+        served.call(start("plex:movie:41")).await
+    else {
+        panic!("Baraka does not play")
+    };
+    let Response::Ok(Reply::PlaybackStarted { handle: films, .. }) =
+        served.call(start("plex:movie:11")).await
+    else {
+        panic!("Alien does not play")
+    };
+    let read = |handle| served.client.read(&served.session, handle, 0, 10);
+    assert!(matches!(read(&docs).await.0, MediaReadResponse::Ok(_)));
+
+    served
+        .settings
+        .library_remove("plex:4", "root")
+        .await
+        .unwrap();
+    let playbacks = &served.server.debug.playbacks;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while playbacks.ended().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the removed library's playback ends at once");
+    let ended = playbacks.ended();
+    assert_eq!(
+        (ended.len(), &ended[0].why, ended[0].last.item.to_string()),
+        (1, &EndReason::AccessRemoved, "plex:movie:41".to_owned())
+    );
+    assert!(matches!(
+        read(&docs).await.0,
+        MediaReadResponse::Err(Error::PlaybackExpired)
+    ));
+    assert!(matches!(read(&films).await.0, MediaReadResponse::Ok(_)));
 }
 
 #[tokio::test]

@@ -3,14 +3,41 @@
 //! Clones share a handle. Recovery replaces it for readers, progress and controls
 //! together. Call `finish`/`close` before shutting down the runtime: Drop cleanup
 //! is best effort and cannot run after runtime shutdown.
-use crate::{Chunk, Playback, PlaybackChange, PlaybackOptions, SdkError, Session};
+//!
+//! # Resuming a playback the server ended
+//!
+//! The server ends a playback it has not heard from for a while (a long
+//! pause), when it restarts, and when it lets a device's playbacks go. The
+//! next use of the old handle is [`SdkError::PlaybackExpired`]. A
+//! [`ManagedPlayback`] then starts the item again with the tracks and
+//! options it was opened with, at the last known position, swaps the new
+//! handle in behind every clone, and tries the operation once more:
+//!
+//! - direct reads, HLS playlists, HLS segments read from offset 0,
+//!   progress reports, seeks, subtitle changes and `finish` go on with no
+//!   error. An HLS resume starts at the segment asked for: segments are
+//!   numbered on the item's own time, so the playlist does not change;
+//! - a progressive read ([`ManagedPlayback::read_chunk`]) and the rest of
+//!   an HLS segment read part-way get [`SdkError::PlaybackResumed`]: a new
+//!   encode's bytes do not continue the old one's.
+//!
+//! It does not resume a playback the app closed ([`SdkError::PlaybackClosed`]),
+//! one whose start is refused for good (signed out, no longer served,
+//! cannot play, stopped by an admin: that error, every time after), one
+//! whose new plan plays differently ([`SdkError::PlaybackChanged`]), or
+//! more than [`ManagedPlayback::MAX_RESUMES`] times in
+//! [`ManagedPlayback::RESUME_WINDOW`] ([`SdkError::PlaybackExpired`]).
+use crate::{Chunk, Playback, PlaybackChange, PlaybackOptions, SdkError, Session, Subtitle};
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use spoolframe_protocol::{BitmapSubtitles, PlaybackHandle, PlaybackPlan, Selection};
+use spoolframe_protocol::{BitmapSubtitles, ManifestKind, PlaybackHandle, PlaybackPlan, Selection};
 use spoolframe_types::MediaId;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, broadcast, oneshot, watch};
+use tokio::time::Instant;
 
 /// Small transport port for media adapters and deterministic client tests.
 #[async_trait]
@@ -44,6 +71,41 @@ pub trait PlaybackBackend: Send + Sync + 'static {
     ) -> Result<PlaybackChange, SdkError>;
     async fn progress(&self, handle: &PlaybackHandle, position: Duration) -> Result<(), SdkError>;
     async fn stop(&self, handle: &PlaybackHandle) -> Result<(), SdkError>;
+    /// An HLS playlist ([`Session::manifest`]). A backend with no HLS
+    /// keeps the default, which refuses.
+    async fn manifest(
+        &self,
+        handle: &PlaybackHandle,
+        kind: ManifestKind,
+    ) -> Result<String, SdkError> {
+        let _ = (handle, kind);
+        Err(no_hls())
+    }
+    /// Part of HLS segment `n` ([`Session::read_segment`]).
+    async fn read_segment(
+        &self,
+        handle: &PlaybackHandle,
+        epoch: u32,
+        n: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<Chunk, SdkError> {
+        let _ = (handle, epoch, n, offset, length);
+        Err(no_hls())
+    }
+    /// HLS subtitle segment `n` ([`Session::read_subtitle_segment`]).
+    async fn subtitle_segment(
+        &self,
+        handle: &PlaybackHandle,
+        n: u32,
+    ) -> Result<Subtitle, SdkError> {
+        let _ = (handle, n);
+        Err(no_hls())
+    }
+}
+
+fn no_hls() -> SdkError {
+    SdkError::InvalidInput("this playback backend has no HLS".into())
 }
 
 #[async_trait]
@@ -86,6 +148,22 @@ impl PlaybackBackend for Session {
     async fn stop(&self, h: &PlaybackHandle) -> Result<(), SdkError> {
         self.stop_playback(h).await
     }
+    async fn manifest(&self, h: &PlaybackHandle, k: ManifestKind) -> Result<String, SdkError> {
+        Session::manifest(self, h, k).await
+    }
+    async fn read_segment(
+        &self,
+        h: &PlaybackHandle,
+        e: u32,
+        n: u32,
+        o: u64,
+        l: u64,
+    ) -> Result<Chunk, SdkError> {
+        Session::read_segment(self, h, e, n, o, l).await
+    }
+    async fn subtitle_segment(&self, h: &PlaybackHandle, n: u32) -> Result<Subtitle, SdkError> {
+        self.read_subtitle_segment(h, n).await
+    }
 }
 
 struct State {
@@ -93,6 +171,26 @@ struct State {
     selection: Option<Selection>,
     options: PlaybackOptions,
     pending: Option<Duration>,
+    /// Where the viewer last was: reported, sought to, or where a subtitle
+    /// change restarted the encode. A resume starts there.
+    position: Option<Duration>,
+    /// Where each HLS segment starts (segment `n` at `[n - 1]`), from the
+    /// media playlist last read: a segment read says where the player is.
+    segments: Vec<Duration>,
+    /// One more each time the handle is replaced.
+    generation: u64,
+    /// The generation each HLS segment was last read from offset 0 in: the
+    /// rest of it must come from the same encode.
+    segment_reads: HashMap<u32, u64>,
+    /// Where a resume (not a seek) started the current handle: a reader of
+    /// an older handle is told so.
+    resumed_at: Option<Duration>,
+    /// When the resumes of the last [`ManagedPlayback::RESUME_WINDOW`]
+    /// were asked for, oldest first.
+    resumes: VecDeque<Instant>,
+    /// Why the playback is over for good: a resume refused for a reason
+    /// that starting again would not change.
+    ended: Option<SdkError>,
     finishing: bool,
     closed: bool,
 }
@@ -160,7 +258,72 @@ async fn admitted(
         .map_err(|e| SdkError::Protocol(format!("playback startup task ended: {e}")))?
 }
 
+/// What a restart is for.
+#[derive(Debug, Clone, Copy)]
+enum Restart {
+    /// The server ended the playback: go on as it was, from `at` or the
+    /// last known position. The new playback must play the same way.
+    Resume { at: Option<Duration> },
+    /// A seek or subtitle change at `at` met an ended playback: start it
+    /// there, as asked. Its plan may differ; the app builds a new reader
+    /// from the result either way.
+    Control { at: Duration },
+}
+
+/// A refusal of a start that starting again cannot change: the session
+/// ended, the item is no longer served to this user, it cannot play
+/// here, or an admin stopped it.
+fn ends_for_good(error: &SdkError) -> bool {
+    matches!(
+        error,
+        SdkError::SignInRequired
+            | SdkError::NotFound(_)
+            | SdkError::CannotPlay { .. }
+            | SdkError::PlaybackStopped
+    )
+}
+
+/// Whether `next` goes on where `before` was, with no seam: a direct
+/// file of the same size, or the same conversion. HLS segments are
+/// numbered on the item's own time, whatever an encode started from
+/// (`encode::hls` on the server), so the same plan has the same playlist.
+fn continues(before: &Playback, next: &Playback) -> bool {
+    match before.plan {
+        PlaybackPlan::Direct { .. } => {
+            matches!(next.plan, PlaybackPlan::Direct { .. }) && next.size == before.size
+        }
+        _ => next.plan == before.plan,
+    }
+}
+
+/// Where each segment of an HLS media playlist starts, from its
+/// `#EXTINF` durations.
+fn segment_starts(playlist: &str) -> Vec<Duration> {
+    let mut starts = Vec::new();
+    let mut at = Duration::ZERO;
+    for line in playlist.lines() {
+        let Some(info) = line.strip_prefix("#EXTINF:") else {
+            continue;
+        };
+        starts.push(at);
+        let secs: f64 = info
+            .split(',')
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|s: &f64| s.is_finite() && *s >= 0.0)
+            .unwrap_or(0.0);
+        at += Duration::from_millis((secs * 1000.0).round() as u64);
+    }
+    starts
+}
+
 impl ManagedPlayback {
+    /// The most resumes in [`Self::RESUME_WINDOW`]. A playback the server
+    /// keeps ending is not started again and again: past this the
+    /// operation fails with [`SdkError::PlaybackExpired`].
+    pub const MAX_RESUMES: usize = 3;
+    pub const RESUME_WINDOW: Duration = Duration::from_secs(5 * 60);
+
     pub async fn open(
         backend: Arc<dyn PlaybackBackend>,
         item: MediaId,
@@ -197,6 +360,13 @@ impl ManagedPlayback {
                 selection,
                 options,
                 pending: None,
+                position: None,
+                segments: Vec::new(),
+                generation: 0,
+                segment_reads: HashMap::new(),
+                resumed_at: None,
+                resumes: VecDeque::new(),
+                ended: None,
                 finishing: false,
                 closed: false,
             }),
@@ -222,6 +392,8 @@ impl ManagedPlayback {
     pub fn snapshot(&self) -> Playback {
         self.0.state.lock().playback.clone()
     }
+    /// The playback after each change: a seek, a subtitle change, or a
+    /// resume behind the app's back.
     pub fn changes(&self) -> watch::Receiver<Playback> {
         self.0.changed.subscribe()
     }
@@ -229,12 +401,18 @@ impl ManagedPlayback {
     pub fn errors(&self) -> broadcast::Receiver<SdkError> {
         self.0.errors.subscribe()
     }
+    /// Where the player is. Reports are coalesced and sent in the
+    /// background; a resume starts the new playback here.
     pub fn report_position(&self, position: Duration) -> Result<(), SdkError> {
         let mut state = self.0.state.lock();
         if state.finishing || state.closed {
             return Err(SdkError::PlaybackClosed);
         }
+        if let Some(ended) = &state.ended {
+            return Err(ended.clone());
+        }
         state.pending = Some(position);
+        state.position = Some(position);
         self.0.notify.notify_one();
         Ok(())
     }
@@ -248,7 +426,20 @@ impl ManagedPlayback {
     }
     async fn flush_inner(&self) -> Result<(), SdkError> {
         let _control = self.0.control.lock().await;
-        self.flush_locked().await
+        self.flush_resuming_locked().await
+    }
+    /// Sends the pending position. A playback the server ended is resumed
+    /// there, and the position sent to the new one.
+    async fn flush_resuming_locked(&self) -> Result<(), SdkError> {
+        match self.flush_locked().await {
+            Err(SdkError::PlaybackExpired) => {
+                let old = self.snapshot().handle;
+                self.restart_locked(&old, Restart::Resume { at: None })
+                    .await?;
+                self.flush_locked().await
+            }
+            answer => answer,
+        }
     }
     async fn flush_locked(&self) -> Result<(), SdkError> {
         let report = {
@@ -273,27 +464,43 @@ impl ManagedPlayback {
         let state = self.0.state.lock();
         if state.finishing || state.closed {
             Err(SdkError::PlaybackClosed)
+        } else if let Some(ended) = &state.ended {
+            Err(ended.clone())
         } else {
             Ok(state.playback.clone())
         }
     }
-    pub async fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>, SdkError> {
+    /// `op` on the live handle; if the server had ended the playback, it
+    /// is resumed (from `at`, or the last known position) and `op` tried
+    /// once more on the new handle.
+    async fn resuming<T, F, Fut>(&self, at: Option<Duration>, op: F) -> Result<T, SdkError>
+    where
+        F: Fn(Playback) -> Fut,
+        Fut: Future<Output = Result<T, SdkError>>,
+    {
         let playback = self.live()?;
-        match self.0.backend.read(&playback.handle, offset, length).await {
-            Err(SdkError::PlaybackExpired)
-                if matches!(playback.plan, PlaybackPlan::Direct { .. }) =>
-            {
-                self.recover(&playback.handle, None).await?;
-                self.0
-                    .backend
-                    .read(&self.live()?.handle, offset, length)
-                    .await
+        match op(playback.clone()).await {
+            Err(SdkError::PlaybackExpired) => {
+                self.restart(&playback.handle, Restart::Resume { at })
+                    .await?;
+                op(self.live()?).await
             }
             answer => answer,
         }
     }
-    /// A reader remains pinned to its handle and epoch snapshot. On restart, the media engine must
-    /// retire that reader and create a replacement from byte zero.
+    /// Up to `length` bytes of a direct playback's file from `offset`. A
+    /// playback the server ended is resumed and the read goes on.
+    pub async fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>, SdkError> {
+        let backend = &self.0.backend;
+        self.resuming(None, move |p| async move {
+            backend.read(&p.handle, offset, length).await
+        })
+        .await
+    }
+    /// A reader remains pinned to its handle and epoch snapshot. On a seek
+    /// ([`SdkError::PlaybackRestarted`]) or a resume
+    /// ([`SdkError::PlaybackResumed`]) the media engine must retire that
+    /// reader and create a replacement from byte zero of [`Self::snapshot`].
     pub async fn read_chunk(
         &self,
         source: &Playback,
@@ -302,46 +509,201 @@ impl ManagedPlayback {
     ) -> Result<Chunk, SdkError> {
         let p = self.live()?;
         if p.handle != source.handle || p.epoch != source.epoch {
-            return Err(SdkError::PlaybackRestarted { epoch: p.epoch });
+            return Err(self.moved_on(source));
         }
-        self.0
+        match self
+            .0
             .backend
             .read_chunk(&p.handle, source.epoch, offset, length)
             .await
-    }
-    async fn recover(&self, old: &PlaybackHandle, at: Option<Duration>) -> Result<(), SdkError> {
-        let _control = self.0.control.lock().await;
-        self.recover_locked(old, at).await
-    }
-    async fn recover_locked(
-        &self,
-        old: &PlaybackHandle,
-        at: Option<Duration>,
-    ) -> Result<(), SdkError> {
-        let before = self.live()?;
-        if &before.handle != old {
-            return Ok(());
+        {
+            Err(SdkError::PlaybackExpired) => {
+                self.restart(&p.handle, Restart::Resume { at: None })
+                    .await?;
+                Err(self.moved_on(source))
+            }
+            answer => answer,
         }
-        let selection = self.0.state.lock().selection;
-        let options = PlaybackOptions {
-            start: at,
-            ..self.0.state.lock().options
+    }
+    /// What a reader of `source` is told now that the playback is not it.
+    fn moved_on(&self, source: &Playback) -> SdkError {
+        let state = self.0.state.lock();
+        match state.resumed_at {
+            Some(at) if state.playback.handle != source.handle => SdkError::PlaybackResumed { at },
+            _ => SdkError::PlaybackRestarted {
+                epoch: state.playback.epoch,
+            },
+        }
+    }
+    /// An HLS playlist. One the server ended is resumed: the playlist of
+    /// the same plan is the same, so the player's copy stays good.
+    pub async fn manifest(&self, kind: ManifestKind) -> Result<String, SdkError> {
+        let backend = &self.0.backend;
+        let text = self
+            .resuming(None, move |p| async move {
+                backend.manifest(&p.handle, kind).await
+            })
+            .await?;
+        if matches!(kind, ManifestKind::Media) {
+            self.0.state.lock().segments = segment_starts(&text);
+        }
+        Ok(text)
+    }
+    /// Up to `length` bytes of HLS segment `n` (0 is the init segment) from
+    /// `offset`. Segments are numbered on the item's own time, so one read
+    /// from offset 0 goes on through a resume with no error: the new
+    /// playback starts at segment `n`. The rest of a segment read part-way
+    /// cannot come from another encode: that read is
+    /// [`SdkError::PlaybackResumed`], and the segment is read again from 0.
+    pub async fn read_segment(&self, n: u32, offset: u64, length: u64) -> Result<Chunk, SdkError> {
+        let at = self.segment_start(n);
+        let backend = &self.0.backend;
+        if offset == 0 {
+            let chunk = self
+                .resuming(at, move |p| async move {
+                    backend.read_segment(&p.handle, p.epoch, n, 0, length).await
+                })
+                .await?;
+            let mut state = self.0.state.lock();
+            let generation = state.generation;
+            state.segment_reads.insert(n, generation);
+            return Ok(chunk);
+        }
+        let p = self.live()?;
+        let begun = {
+            let state = self.0.state.lock();
+            state
+                .segment_reads
+                .get(&n)
+                .is_some_and(|g| *g != state.generation)
         };
-        let mut admission = admitted(
+        if begun {
+            return Err(self.resumed_error(at));
+        }
+        match backend
+            .read_segment(&p.handle, p.epoch, n, offset, length)
+            .await
+        {
+            Err(SdkError::PlaybackExpired) => {
+                self.restart(&p.handle, Restart::Resume { at }).await?;
+                Err(self.resumed_error(at))
+            }
+            answer => answer,
+        }
+    }
+    /// HLS subtitle segment `n` (from 1), resumed through as
+    /// [`Self::read_segment`] from offset 0.
+    pub async fn read_subtitle_segment(&self, n: u32) -> Result<Subtitle, SdkError> {
+        let backend = &self.0.backend;
+        self.resuming(self.segment_start(n), move |p| async move {
+            backend.subtitle_segment(&p.handle, n).await
+        })
+        .await
+    }
+    /// Where media segment `n` starts, once the media playlist was read.
+    fn segment_start(&self, n: u32) -> Option<Duration> {
+        let index = n.checked_sub(1)? as usize;
+        self.0.state.lock().segments.get(index).copied()
+    }
+    fn resumed_error(&self, at: Option<Duration>) -> SdkError {
+        let at = at.or(self.0.state.lock().resumed_at).unwrap_or_default();
+        SdkError::PlaybackResumed { at }
+    }
+    async fn restart(&self, old: &PlaybackHandle, restart: Restart) -> Result<(), SdkError> {
+        let _control = self.0.control.lock().await;
+        self.restart_locked(old, restart).await
+    }
+    /// Start the playback again in place of `old`, with the tracks and
+    /// options it was started with, and swap the new handle in for every
+    /// clone. Concurrent callers share one replacement: one that finds
+    /// `old` already replaced does nothing.
+    async fn restart_locked(&self, old: &PlaybackHandle, restart: Restart) -> Result<(), SdkError> {
+        let (before, selection, options) = {
+            let mut state = self.0.state.lock();
+            if state.closed {
+                return Err(SdkError::PlaybackClosed);
+            }
+            if let Some(ended) = &state.ended {
+                return Err(ended.clone());
+            }
+            if &state.playback.handle != old {
+                return Ok(());
+            }
+            let now = Instant::now();
+            while state
+                .resumes
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= Self::RESUME_WINDOW)
+            {
+                state.resumes.pop_front();
+            }
+            if state.resumes.len() >= Self::MAX_RESUMES {
+                tracing::warn!(
+                    handle = %old.0,
+                    "the playback expired again; not resuming it more than {} times in {} s",
+                    Self::MAX_RESUMES,
+                    Self::RESUME_WINDOW.as_secs()
+                );
+                return Err(SdkError::PlaybackExpired);
+            }
+            state.resumes.push_back(now);
+            let start = match restart {
+                Restart::Resume { at } => at.or(state.position),
+                Restart::Control { at } => Some(at),
+            }
+            .or(state.options.start);
+            let options = PlaybackOptions {
+                start,
+                ..state.options
+            };
+            (state.playback.clone(), state.selection, options)
+        };
+        let admission = admitted(
             self.0.backend.clone(),
             self.0.item.clone(),
             selection,
             options,
         )
-        .await?;
+        .await;
+        let mut admission = match admission {
+            Ok(admission) => admission,
+            Err(error) => {
+                if ends_for_good(&error) {
+                    tracing::info!(handle = %old.0, %error, "the playback cannot be resumed");
+                    self.0.state.lock().ended = Some(error.clone());
+                }
+                return Err(error);
+            }
+        };
         let next = admission.playback.as_ref().expect("admitted playback");
-        if at.is_none()
-            && (!matches!(next.plan, PlaybackPlan::Direct { .. }) || next.size != before.size)
-        {
+        if matches!(restart, Restart::Resume { .. }) && !continues(&before, next) {
+            // Dropping the admission stops the new playback.
+            tracing::info!(handle = %old.0, "the resumed playback plays differently; not swapped in");
+            self.0.state.lock().ended = Some(SdkError::PlaybackChanged);
             return Err(SdkError::PlaybackChanged);
         }
         let next = admission.playback.take().expect("admitted playback");
-        self.0.state.lock().playback = next.clone();
+        {
+            let mut state = self.0.state.lock();
+            state.playback = next.clone();
+            state.generation += 1;
+            state.resumed_at = match restart {
+                Restart::Resume { .. } => Some(options.start.unwrap_or_default()),
+                Restart::Control { .. } => None,
+            };
+            // The new playback learns where the viewer is (Continue
+            // watching) before the player reports again.
+            if state.pending.is_none() && state.position.is_some() {
+                state.pending = state.position;
+                self.0.notify.notify_one();
+            }
+        }
+        tracing::info!(
+            old = %old.0,
+            new = %next.handle.0,
+            start_ms = options.start.map(|s| s.as_millis() as u64),
+            "the server had ended the playback; started it again"
+        );
         self.0.changed.send_replace(next);
         Ok(())
     }
@@ -356,11 +718,13 @@ impl ManagedPlayback {
     async fn seek_inner(&self, position: Duration) -> Result<Playback, SdkError> {
         let _control = self.0.control.lock().await;
         let before = self.live()?;
+        let at = Restart::Control { at: position };
         match self.flush_locked().await {
             Ok(()) => {}
             Err(SdkError::PlaybackExpired) => {
                 // Pending progress must not prevent recovery of an idle encode.
-                self.recover_locked(&before.handle, Some(position)).await?;
+                self.restart_locked(&before.handle, at).await?;
+                self.0.state.lock().position = Some(position);
                 self.flush_locked().await?;
                 return Ok(self.snapshot());
             }
@@ -374,11 +738,10 @@ impl ManagedPlayback {
                 drop(state);
                 self.0.changed.send_replace(next);
             }
-            Err(SdkError::PlaybackExpired) => {
-                self.recover_locked(&before.handle, Some(position)).await?
-            }
+            Err(SdkError::PlaybackExpired) => self.restart_locked(&before.handle, at).await?,
             Err(error) => return Err(error),
         }
+        self.0.state.lock().position = Some(position);
         Ok(self.snapshot())
     }
     pub async fn change_subtitle(
@@ -401,19 +764,41 @@ impl ManagedPlayback {
         position: Duration,
     ) -> Result<Playback, SdkError> {
         let _control = self.0.control.lock().await;
-        self.flush_locked().await?;
+        let flushed = self.flush_locked().await;
         let p = self.live()?;
-        let changed = self
-            .0
-            .backend
-            .subtitle(&p.handle, selected, bitmap, position)
-            .await?;
+        let answer = match flushed {
+            Ok(()) => {
+                self.0
+                    .backend
+                    .subtitle(&p.handle, selected, bitmap, position)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let changed = match answer {
+            Ok(changed) => changed,
+            Err(SdkError::PlaybackExpired) => {
+                // Started again with the subtitle asked for, where asked.
+                {
+                    let mut state = self.0.state.lock();
+                    state.selection.get_or_insert(Selection::default()).subtitle = selected;
+                    state.options.bitmap = bitmap;
+                }
+                self.restart_locked(&p.handle, Restart::Control { at: position })
+                    .await?;
+                self.0.state.lock().position = Some(position);
+                self.flush_locked().await?;
+                return Ok(self.snapshot());
+            }
+            Err(error) => return Err(error),
+        };
         let mut state = self.0.state.lock();
         state.playback.plan = changed.plan;
         state.playback.size = changed.size;
         state.playback.epoch = changed.epoch;
         state.selection.get_or_insert(Selection::default()).subtitle = selected;
         state.options.bitmap = bitmap;
+        state.position = Some(position);
         if let Some(chosen) = state.playback.chosen.as_mut() {
             chosen.selection.subtitle = selected;
         }
@@ -422,6 +807,8 @@ impl ManagedPlayback {
         self.0.changed.send_replace(next.clone());
         Ok(next)
     }
+    /// Report `final_position` and stop. A playback the server had ended
+    /// is resumed to take the position (Continue watching), then stopped.
     pub async fn finish(&self, final_position: Duration) -> Result<(), SdkError> {
         self.close_at(Some(final_position)).await
     }
@@ -446,10 +833,15 @@ impl ManagedPlayback {
             state.finishing = true;
             if position.is_some() {
                 state.pending = position;
+                state.position = position;
             }
         }
-        let progress = self.flush_locked().await;
-        let stop = self.0.backend.stop(&self.snapshot().handle).await;
+        let progress = self.flush_resuming_locked().await;
+        let stop = match self.0.backend.stop(&self.snapshot().handle).await {
+            // Gone on the server already: stopped.
+            Err(SdkError::PlaybackExpired) => Ok(()),
+            answer => answer,
+        };
         if stop.is_ok() {
             let mut state = self.0.state.lock();
             state.closed = true;
@@ -630,10 +1022,11 @@ mod tests {
         changes.changed().await.unwrap();
         assert_eq!(changes.borrow().handle.0, "2");
         // A replacement handle can reuse epoch zero. Its bytes do not belong
-        // in a reader of the previous handle, even though the epochs match.
+        // in a reader of the previous handle, even though the epochs match:
+        // that reader is told where the playback was resumed.
         assert_eq!(
             p.read_chunk(&playback(1), 0, 1).await,
-            Err(SdkError::PlaybackRestarted { epoch: 0 })
+            Err(SdkError::PlaybackResumed { at: Duration::ZERO })
         );
         p.finish(Duration::from_secs(90)).await.unwrap();
         assert_eq!(*b.events.lock(), vec!["progress:2:90", "stop:2"]);
@@ -702,5 +1095,330 @@ mod tests {
         assert_eq!(next.handle.0, "2");
         assert_eq!(*b.events.lock(), vec!["progress:2:10"]);
         p.close().await.unwrap();
+    }
+
+    /// A server that ends every live playback on `expire`, as idling out,
+    /// a restart or a device gone do; it records each start.
+    mod resume {
+        use super::*;
+        use spoolframe_types::{Container, Delivery};
+        use std::collections::HashSet;
+
+        #[derive(Default)]
+        struct Server {
+            live: Mutex<HashSet<String>>,
+            starts: Mutex<Vec<(Option<Selection>, PlaybackOptions)>>,
+            refuse: Mutex<Option<SdkError>>,
+            /// Every start asked for, refused or not.
+            asked: std::sync::atomic::AtomicUsize,
+            delivery: Mutex<Option<Delivery>>,
+            reports: Mutex<Vec<(String, u64)>>,
+        }
+        impl Server {
+            fn expire(&self) {
+                self.live.lock().clear();
+            }
+            fn alive(&self, h: &PlaybackHandle) -> Result<(), SdkError> {
+                if self.live.lock().contains(&h.0) {
+                    Ok(())
+                } else {
+                    Err(SdkError::PlaybackExpired)
+                }
+            }
+            fn started(&self) -> usize {
+                self.starts.lock().len()
+            }
+            fn last_start(&self) -> Option<Duration> {
+                self.starts.lock().last().unwrap().1.start
+            }
+        }
+        /// Five 6 s segments.
+        const PLAYLIST: &str = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n\
+            #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"init.mp4\"\n\
+            #EXTINF:6.000,\nseg1.m4s\n#EXTINF:6.000,\nseg2.m4s\n#EXTINF:6.000,\nseg3.m4s\n\
+            #EXTINF:6.000,\nseg4.m4s\n#EXTINF:6.000,\nseg5.m4s\n#EXT-X-ENDLIST\n";
+        #[async_trait]
+        impl PlaybackBackend for Server {
+            async fn start(
+                &self,
+                _: &MediaId,
+                selection: Option<Selection>,
+                options: PlaybackOptions,
+            ) -> Result<Playback, SdkError> {
+                self.asked.fetch_add(1, SeqCst);
+                if let Some(e) = self.refuse.lock().clone() {
+                    return Err(e);
+                }
+                let mut starts = self.starts.lock();
+                starts.push((selection, options));
+                let handle = starts.len().to_string();
+                self.live.lock().insert(handle.clone());
+                let mut p = playback(0);
+                p.handle = PlaybackHandle(handle);
+                if let Some(delivery) = *self.delivery.lock() {
+                    p.size = 0;
+                    p.plan = PlaybackPlan::Converted {
+                        delivery,
+                        container: Container::Mp4,
+                        video: None,
+                        audio: None,
+                        subtitle: None,
+                        reasons: vec![],
+                    };
+                }
+                Ok(p)
+            }
+            async fn read(&self, h: &PlaybackHandle, _: u64, _: u64) -> Result<Vec<u8>, SdkError> {
+                self.alive(h)?;
+                Ok(vec![42])
+            }
+            async fn read_chunk(
+                &self,
+                h: &PlaybackHandle,
+                e: u32,
+                _: u64,
+                _: u64,
+            ) -> Result<Chunk, SdkError> {
+                self.alive(h)?;
+                Ok(Chunk {
+                    bytes: vec![42],
+                    size: 1,
+                    complete: true,
+                    epoch: e,
+                })
+            }
+            async fn seek(&self, h: &PlaybackHandle, _: Duration) -> Result<u32, SdkError> {
+                self.alive(h)?;
+                Ok(1)
+            }
+            async fn subtitle(
+                &self,
+                h: &PlaybackHandle,
+                _: Option<u32>,
+                _: BitmapSubtitles,
+                _: Duration,
+            ) -> Result<PlaybackChange, SdkError> {
+                self.alive(h)?;
+                Err(SdkError::Busy)
+            }
+            async fn progress(&self, h: &PlaybackHandle, p: Duration) -> Result<(), SdkError> {
+                self.alive(h)?;
+                self.reports.lock().push((h.0.clone(), p.as_secs()));
+                Ok(())
+            }
+            async fn stop(&self, h: &PlaybackHandle) -> Result<(), SdkError> {
+                self.alive(h)?;
+                self.live.lock().remove(&h.0);
+                Ok(())
+            }
+            async fn manifest(
+                &self,
+                h: &PlaybackHandle,
+                _: ManifestKind,
+            ) -> Result<String, SdkError> {
+                self.alive(h)?;
+                Ok(PLAYLIST.into())
+            }
+            async fn read_segment(
+                &self,
+                h: &PlaybackHandle,
+                e: u32,
+                n: u32,
+                _: u64,
+                _: u64,
+            ) -> Result<Chunk, SdkError> {
+                self.alive(h)?;
+                Ok(Chunk {
+                    bytes: vec![n as u8],
+                    size: 1,
+                    complete: true,
+                    epoch: e,
+                })
+            }
+        }
+        async fn opened(server: &Arc<Server>) -> ManagedPlayback {
+            let selection = Selection {
+                audio: Some(1),
+                subtitle: Some(2),
+            };
+            let options = PlaybackOptions {
+                start: Some(Duration::from_secs(5)),
+                bitmap: BitmapSubtitles::Text,
+            };
+            ManagedPlayback::open(server.clone(), item(), Some(selection), options)
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_resume_starts_the_same_tracks_at_the_reported_position() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            p.report_position(Duration::from_secs(600)).unwrap();
+            p.flush().await.unwrap();
+            s.expire();
+            assert_eq!(p.read(0, 1).await, Ok(vec![42]));
+            let (selection, options) = s.starts.lock()[1];
+            assert_eq!(selection, s.starts.lock()[0].0);
+            assert_eq!(options.bitmap, BitmapSubtitles::Text);
+            assert_eq!(options.start, Some(Duration::from_secs(600)));
+        }
+
+        /// The new playback knows where the viewer is, for Continue
+        /// watching, before the player reports again.
+        #[tokio::test]
+        async fn a_resume_reports_the_last_position_on_the_new_handle() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            p.report_position(Duration::from_secs(600)).unwrap();
+            p.flush().await.unwrap();
+            s.expire();
+            p.read(0, 1).await.unwrap();
+            p.flush().await.unwrap();
+            assert_eq!(s.reports.lock().last(), Some(&("2".to_owned(), 600)));
+        }
+
+        #[tokio::test]
+        async fn a_progress_report_on_an_expired_playback_resumes_it() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            s.expire();
+            p.report_position(Duration::from_secs(70)).unwrap();
+            p.flush().await.unwrap();
+            assert_eq!(p.snapshot().handle.0, "2");
+            assert_eq!(s.last_start(), Some(Duration::from_secs(70)));
+            assert_eq!(*s.reports.lock(), vec![("2".to_owned(), 70)]);
+        }
+
+        /// The Apple TV asked the dead handle 9 times and froze. A
+        /// session that ended is not resumed, and not asked again.
+        #[tokio::test]
+        async fn a_signed_out_session_is_not_resumed_or_retried() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            s.expire();
+            *s.refuse.lock() = Some(SdkError::SignInRequired);
+            assert_eq!(p.read(0, 1).await, Err(SdkError::SignInRequired));
+            assert_eq!(p.read(0, 1).await, Err(SdkError::SignInRequired));
+            assert_eq!(s.asked.load(SeqCst), 2);
+        }
+
+        /// The item's library was taken away (B-10): the start is
+        /// `NotFound`, and that is the end of it.
+        #[tokio::test]
+        async fn an_item_no_longer_served_is_not_resumed_or_retried() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            s.expire();
+            *s.refuse.lock() = Some(SdkError::NotFound("item".into()));
+            assert_eq!(p.read(0, 1).await, Err(SdkError::NotFound("item".into())));
+            assert_eq!(p.read(0, 1).await, Err(SdkError::NotFound("item".into())));
+            assert_eq!(s.asked.load(SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn a_playback_the_client_closed_is_not_resumed() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            p.close().await.unwrap();
+            assert_eq!(p.read(0, 1).await, Err(SdkError::PlaybackClosed));
+            assert_eq!(s.started(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn resumes_are_bounded_per_window() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            for _ in 0..ManagedPlayback::MAX_RESUMES {
+                s.expire();
+                assert_eq!(p.read(0, 1).await, Ok(vec![42]));
+            }
+            s.expire();
+            assert_eq!(p.read(0, 1).await, Err(SdkError::PlaybackExpired));
+            assert_eq!(s.started(), 1 + ManagedPlayback::MAX_RESUMES);
+            tokio::time::advance(ManagedPlayback::RESUME_WINDOW).await;
+            assert_eq!(p.read(0, 1).await, Ok(vec![42]));
+        }
+
+        /// The progressive output of a new encode begins where it was
+        /// started: its bytes do not follow the old reader's.
+        #[tokio::test]
+        async fn a_progressive_reader_is_told_where_its_playback_resumed() {
+            let s = Arc::new(Server::default());
+            *s.delivery.lock() = Some(Delivery::Progressive);
+            let p = opened(&s).await;
+            let source = p.snapshot();
+            p.report_position(Duration::from_secs(300)).unwrap();
+            p.flush().await.unwrap();
+            s.expire();
+            let resumed = SdkError::PlaybackResumed {
+                at: Duration::from_secs(300),
+            };
+            assert_eq!(p.read_chunk(&source, 4096, 1).await, Err(resumed.clone()));
+            assert_eq!(s.last_start(), Some(Duration::from_secs(300)));
+            // Another reader of the old handle is told the same.
+            assert_eq!(p.read_chunk(&source, 0, 1).await, Err(resumed));
+            assert!(p.read_chunk(&p.snapshot(), 0, 1).await.is_ok());
+        }
+
+        /// HLS segments are numbered on the item's own time, whatever the
+        /// encode started from: the next segment is read from the new
+        /// playback with no seam, which begins at that segment.
+        #[tokio::test]
+        async fn an_hls_segment_read_goes_on_from_the_new_playback() {
+            let s = Arc::new(Server::default());
+            *s.delivery.lock() = Some(Delivery::Hls);
+            let p = opened(&s).await;
+            p.manifest(ManifestKind::Media).await.unwrap();
+            p.read_segment(1, 0, 1).await.unwrap();
+            s.expire();
+            assert_eq!(p.read_segment(4, 0, 1).await.unwrap().bytes, vec![4]);
+            assert_eq!(p.snapshot().handle.0, "2");
+            // Segment 4 starts at 18 s.
+            assert_eq!(s.last_start(), Some(Duration::from_secs(18)));
+            s.expire();
+            assert_eq!(p.manifest(ManifestKind::Media).await.unwrap(), PLAYLIST);
+        }
+
+        /// A new encode's segment need not be the same bytes as the old
+        /// one's: the rest of a segment is not spliced on.
+        #[tokio::test]
+        async fn an_hls_segment_read_part_way_is_read_again_from_its_start() {
+            let s = Arc::new(Server::default());
+            *s.delivery.lock() = Some(Delivery::Hls);
+            let p = opened(&s).await;
+            p.manifest(ManifestKind::Media).await.unwrap();
+            s.expire();
+            assert_eq!(
+                p.read_segment(2, 100, 1).await,
+                Err(SdkError::PlaybackResumed {
+                    at: Duration::from_secs(6)
+                })
+            );
+            assert_eq!(p.read_segment(2, 0, 1).await.unwrap().bytes, vec![2]);
+        }
+
+        /// A different plan on the new start is not swapped in.
+        #[tokio::test]
+        async fn a_resume_that_plans_differently_is_refused_and_stopped() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            s.expire();
+            *s.delivery.lock() = Some(Delivery::Hls);
+            assert_eq!(p.read(0, 1).await, Err(SdkError::PlaybackChanged));
+            until(|| s.live.lock().is_empty()).await;
+            assert_eq!(p.read(0, 1).await, Err(SdkError::PlaybackChanged));
+            assert_eq!(s.started(), 2);
+        }
+
+        #[tokio::test]
+        async fn finishing_an_expired_playback_still_saves_the_final_position() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            s.expire();
+            p.finish(Duration::from_secs(900)).await.unwrap();
+            assert_eq!(*s.reports.lock(), vec![("2".to_owned(), 900)]);
+            assert!(s.live.lock().is_empty());
+        }
     }
 }

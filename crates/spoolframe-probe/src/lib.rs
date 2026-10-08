@@ -34,8 +34,10 @@
 //!
 //! Only when asked ([`Config::check_playback`]), it starts one direct
 //! playback as the account and tries its handle from another device of
-//! the same account, and of [`Config::second`] if given (`playback`).
-//! Nothing it sends there changes more than that playback.
+//! the same account, and of [`Config::second`] if given (`playback`);
+//! then one HLS remux of the same item's audio, with progress sent from
+//! the others too. Nothing it sends there changes more than those
+//! playbacks, unless a refusal fails and progress is taken.
 
 mod account;
 mod checks;
@@ -82,7 +84,8 @@ pub struct Config {
     /// Sign in as this account for the signed-in checks.
     pub account: Option<Account>,
     /// Run the playback-ownership check: start one direct playback as
-    /// [`Config::account`], and try its handle from other devices.
+    /// [`Config::account`], and try its handle from other devices; then
+    /// one HLS remux of the same item's audio, if it is planned as one.
     pub check_playback: bool,
     /// A second consumer account, for the playback-ownership check's
     /// cross-user part. Its `web` is not used.

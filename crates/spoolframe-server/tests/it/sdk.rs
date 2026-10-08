@@ -1843,3 +1843,184 @@ async fn a_tv_s_request_to_be_remembered_is_the_approver_s_to_grant() {
     phone.close().await;
     server.stop().await;
 }
+
+/// The server's own playbacks, as playback debug lists them.
+fn server_playbacks(server: &TestServer) -> Vec<spoolframe_server::playback::Snapshot> {
+    server.debug.playbacks.snapshots()
+}
+
+/// Idle past the server's limit, as its sweep finds it.
+fn idle_out(server: &TestServer) {
+    server.clock.advance(support::PLAYBACK_IDLE);
+    server.debug.playbacks.sweep();
+}
+
+/// Alice's movie, opened through the SDK's managed playback, at 42 s.
+async fn managed_at_42(
+    alice: &Session,
+    selection: Option<Selection>,
+) -> spoolframe_client_sdk::ManagedPlayback {
+    let playback = alice
+        .open_playback(movie().id(), selection, PlaybackOptions::default())
+        .await
+        .unwrap();
+    playback.report_position(Duration::from_secs(42)).unwrap();
+    playback.flush().await.unwrap();
+    playback
+}
+
+/// A playback the server idled out (a pause longer than its limit) goes
+/// on through the same SDK object, and the new playback is where the
+/// viewer was.
+#[tokio::test]
+async fn a_managed_playback_idled_out_on_the_server_resumes_where_it_was() {
+    let (server, client, _) = ready("sdk-resume-idle").await;
+    let file = server.write_media(1000);
+    let alice = alice(&server, &client).await;
+    let playback = managed_at_42(&alice, Some(Selection::default())).await;
+    let old = playback.snapshot().handle;
+    idle_out(&server);
+    assert!(server_playbacks(&server).is_empty());
+    assert_eq!(playback.read(0, 1000).await.unwrap(), file);
+    assert_ne!(playback.snapshot().handle, old);
+    playback.flush().await.unwrap();
+    let open = server_playbacks(&server);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].position_ms, Some(42_000));
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// The server let the device's playbacks go (gone past the reconnect
+/// grace, as after a server-side cleanup): the next read resumes.
+#[tokio::test]
+async fn a_managed_playback_whose_device_was_let_go_resumes() {
+    let (server, client, _) = ready("sdk-resume-device").await;
+    let file = server.write_media(1000);
+    let alice = alice(&server, &client).await;
+    let playback = managed_at_42(&alice, Some(Selection::default())).await;
+    assert_eq!(server.debug.playbacks.end_device(&client.id()), 1);
+    assert_eq!(playback.read(0, 1000).await.unwrap(), file);
+    playback.flush().await.unwrap();
+    let open = server_playbacks(&server);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].position_ms, Some(42_000));
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// A session that ended is not played on: the app is told to sign in,
+/// and nothing is started on the server.
+#[tokio::test]
+async fn a_managed_playback_of_a_signed_out_session_is_not_resumed() {
+    let (server, client, _) = ready("sdk-resume-signed-out").await;
+    server.write_media(1000);
+    let alice = alice(&server, &client).await;
+    let playback = managed_at_42(&alice, Some(Selection::default())).await;
+    idle_out(&server);
+    alice.sign_out().await.unwrap();
+    assert_eq!(playback.read(0, 1000).await, Err(SdkError::SignInRequired));
+    assert_eq!(playback.read(0, 1000).await, Err(SdkError::SignInRequired));
+    assert!(server_playbacks(&server).is_empty());
+    client.close().await;
+    server.stop().await;
+}
+
+/// A playback that keeps dying is not started again and again: past the
+/// bound the app is told it expired.
+#[tokio::test]
+async fn managed_playback_resumes_are_bounded() {
+    let (server, client, _) = ready("sdk-resume-bounded").await;
+    let file = server.write_media(1000);
+    let alice = alice(&server, &client).await;
+    let playback = managed_at_42(&alice, Some(Selection::default())).await;
+    for _ in 0..spoolframe_client_sdk::ManagedPlayback::MAX_RESUMES {
+        idle_out(&server);
+        assert_eq!(playback.read(0, 1000).await.unwrap(), file);
+    }
+    idle_out(&server);
+    assert_eq!(
+        playback.read(0, 1000).await.map(|b| b.len()),
+        Err(SdkError::PlaybackExpired)
+    );
+    assert!(server_playbacks(&server).is_empty());
+    client.close().await;
+    server.stop().await;
+}
+
+/// Every byte of HLS segment `n`, read through the managed playback.
+async fn whole_segment(playback: &spoolframe_client_sdk::ManagedPlayback, n: u32) -> u64 {
+    let mut got = 0;
+    loop {
+        let chunk = playback.read_segment(n, got, MAX_READ).await.unwrap();
+        got += chunk.bytes.len() as u64;
+        if chunk.complete && got == chunk.size {
+            return got;
+        }
+    }
+}
+
+/// HLS after the server idled the playback out: the playlist is the same
+/// and the next segment is read from the new playback, with no error for
+/// the player to handle.
+#[tokio::test]
+async fn an_hls_managed_playback_idled_out_reads_on() {
+    let (server, client, alice) =
+        converting("sdk-resume-hls", support::hls_capabilities(), false).await;
+    let playback = alice
+        .open_playback(movie().id(), None, PlaybackOptions::default())
+        .await
+        .unwrap();
+    let media = playback.manifest(ManifestKind::Media).await.unwrap();
+    assert!(whole_segment(&playback, 0).await > 0);
+    assert!(whole_segment(&playback, 1).await > 0);
+    let old = playback.snapshot().handle;
+    idle_out(&server);
+    assert!(whole_segment(&playback, 2).await > 0);
+    assert_ne!(playback.snapshot().handle, old);
+    assert_eq!(playback.manifest(ManifestKind::Media).await.unwrap(), media);
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// A progressive encode started again begins at the viewer's position:
+/// its reader is told where, and the new output is the rest of the film.
+#[tokio::test]
+async fn a_progressive_managed_playback_idled_out_says_where_it_resumed() {
+    let (server, client, alice) = converting(
+        "sdk-resume-progressive",
+        support::progressive_capabilities(),
+        false,
+    )
+    .await;
+    let playback = alice
+        .open_playback(movie().id(), None, PlaybackOptions::default())
+        .await
+        .unwrap();
+    let source = playback.snapshot();
+    let whole = read_all(&alice, &source.handle, source.epoch).await;
+    playback.report_position(Duration::from_secs(6)).unwrap();
+    playback.flush().await.unwrap();
+    idle_out(&server);
+    assert_eq!(
+        playback.read_chunk(&source, 0, MAX_READ).await,
+        Err(SdkError::PlaybackResumed {
+            at: Duration::from_secs(6)
+        })
+    );
+    let next = playback.snapshot();
+    assert_ne!(next.handle, source.handle);
+    let rest = read_all(&alice, &next.handle, next.epoch).await;
+    assert!(
+        rest.len() < whole.len(),
+        "{} of {}",
+        rest.len(),
+        whole.len()
+    );
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}

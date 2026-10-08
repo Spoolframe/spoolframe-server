@@ -121,7 +121,7 @@ pub fn search(query: &str) -> spoolframe_protocol::SearchRequest {
 }
 
 /// The playback timings of a test server. Idling out is the server's
-/// own five minutes: a test that needs a playback idle moves
+/// own limit (30 minutes): a test that needs a playback idle moves
 /// [`TestServer::clock`] on, so a slow machine never idles one out
 /// mid-test. Rechecks stay short, for the requests a test makes in real
 /// time.
@@ -275,6 +275,16 @@ impl LogCapture {
             })
             .collect();
         format!("{lines:?}")
+    }
+
+    /// Every event so far whose message is `message`.
+    pub fn saying(&self, message: &str) -> Vec<Logged> {
+        self.0
+            .lock()
+            .iter()
+            .filter(|line| line.field("message") == Some(message))
+            .cloned()
+            .collect()
     }
 
     pub fn clear(&self) {
@@ -614,6 +624,7 @@ impl TestServer {
             plex_sync: None,
             watch,
             catalog,
+            catalog_changes: options.catalog.as_ref().map(|live| live.changes()),
             prober,
             artwork: Arc::new(artwork),
             playbacks: Arc::new(

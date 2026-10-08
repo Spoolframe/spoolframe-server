@@ -570,6 +570,7 @@ fn why(reason: &EndReason) -> api::EndedWhy {
         EndReason::Replaced => api::EndedWhy::Replaced,
         EndReason::DeviceGone => api::EndedWhy::DeviceGone,
         EndReason::SignedOut => api::EndedWhy::SignedOut,
+        EndReason::AccessRemoved => api::EndedWhy::AccessRemoved,
         EndReason::Failed(reason) => api::EndedWhy::Failed {
             reason: reason.clone(),
         },
@@ -637,13 +638,10 @@ impl PlaybackDebug {
         })
     }
 
-    /// An admin's Stop: whether it was open.
+    /// An admin's Stop: whether it was open. The end is logged with
+    /// every other ([`Playbacks`]).
     pub fn stop(&self, id: &str) -> bool {
-        let stopped = self.playbacks.stop(id);
-        if stopped {
-            tracing::info!(playback = id, "an admin stopped a playback");
-        }
-        stopped
+        self.playbacks.stop(id)
     }
 
     /// An admin's End conversion.
