@@ -42,6 +42,15 @@ pkgs.testers.runNixOSTest {
         }
       ];
       openFirewall = true;
+      # P6-02: a public address written down, nothing asked of a router or
+      # a lookup service (the VM has neither), and the host's IPv6
+      # addresses: the test network's global 2001:db8:1::2, read over
+      # netlink, and not its site-local fec0:: ones.
+      wan = {
+        static = ["203.0.113.7:7420"];
+        mappedPort = null;
+        hostIpv6 = true;
+      };
       subtitles.ocrLanguages = ["eng" "fra"];
       # P3-10: behind a proxy on this host.
       admin = {
@@ -166,6 +175,9 @@ pkgs.testers.runNixOSTest {
     status = server.succeed(f"{admin} spoolframe status")
     assert "libx264" in status, status
     assert "vaapi" not in status and "nvenc" not in status, status
+    # The module's wan table parses, and each address shows its source.
+    assert "public addresses: 203.0.113.7:7420 (static), [2001:db8:1::2]:7420 (host IPv6)" in status, status
+    assert "fec0::" not in status.split("public addresses:")[1], status
 
     # tesseract with the languages asked for, and the cache for its text.
     ocr = [line for line in journal().splitlines() if "subtitle OCR available" in line]

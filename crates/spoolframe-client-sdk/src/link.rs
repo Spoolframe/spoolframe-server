@@ -14,7 +14,13 @@
 //! The server may also close a connection for a reason it gives
 //! ([`spoolframe_protocol::close`]). Signed out, the device has no session
 //! there: they are ended here, and nothing dials again until a call needs
-//! it. Refused as the server is full, the supervisor stops too.
+//! it. Refused as the server is full, the supervisor stops too, and so it
+//! does when a dial fails in a way dialling again cannot fix: the server
+//! speaks another protocol revision, or is not the server pinned. The
+//! state watch says why ([`StateWatch::stopped`]).
+//!
+//! Any other failed dial is tried again after [`FIRST_RETRY`], doubling
+//! up to [`MAX_RETRY`], each wait moved by up to [`JITTER`] either way.
 
 use parking_lot::Mutex;
 use std::collections::HashSet;
@@ -34,10 +40,16 @@ use crate::client::{Client, Inner};
 use crate::connection::{ServerConnection, closed_by_server};
 use crate::error::SdkError;
 
-/// The first wait after a connection is lost.
+/// The first wait after a connection is lost: a blip is dialled again at
+/// once.
 const FIRST_RETRY: Duration = Duration::from_millis(250);
-/// The longest wait between two dials.
-const MAX_RETRY: Duration = Duration::from_secs(10);
+/// The longest wait between two dials, before [`JITTER`]. A server that
+/// stays unreachable is tried every few minutes, not every few seconds:
+/// a phone left with an app open is not to dial all night.
+const MAX_RETRY: Duration = Duration::from_secs(5 * 60);
+/// How far each wait is moved at random, either way, as a share of it:
+/// devices that lost a server together do not all dial it in step.
+const JITTER: f64 = 0.2;
 /// How long a call waits for a reconnect before it fails.
 pub(crate) const CALL_WAIT: Duration = Duration::from_secs(10);
 
@@ -97,19 +109,62 @@ fn is_local(ip: IpAddr) -> bool {
     }
 }
 
+/// A link's state, and why the SDK stopped dialling, sent together so a
+/// watcher never sees one without the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Status {
+    state: ConnectionState,
+    /// Set only with [`ConnectionState::Disconnected`].
+    stopped: Option<SdkError>,
+}
+
+impl Status {
+    fn new(state: ConnectionState) -> Self {
+        Self {
+            state,
+            stopped: None,
+        }
+    }
+}
+
 /// Changes of one server's [`ConnectionState`].
 #[derive(Debug, Clone)]
-pub struct StateWatch(watch::Receiver<ConnectionState>);
+pub struct StateWatch(watch::Receiver<Status>);
 
 impl StateWatch {
     pub fn current(&self) -> ConnectionState {
-        *self.0.borrow()
+        self.0.borrow().state
     }
 
     /// The next state; `None` once the client is gone.
     pub async fn changed(&mut self) -> Option<ConnectionState> {
         self.0.changed().await.ok()?;
-        Some(*self.0.borrow_and_update())
+        Some(self.0.borrow_and_update().state)
+    }
+
+    /// Why the SDK stopped dialling this server by itself, while it is
+    /// [`ConnectionState::Disconnected`] for that reason; `None` in every
+    /// other state, and after [`crate::Client::forget`] or
+    /// [`crate::Client::close`]. Read it when [`StateWatch::changed`]
+    /// gives `Disconnected`, and show it in place of "Reconnecting…":
+    ///
+    /// - [`SdkError::UpdateRequired`]: the app and the server speak
+    ///   different protocol revisions;
+    /// - [`SdkError::IdentityChanged`], [`SdkError::ServerIdChanged`] or
+    ///   [`SdkError::WrongServer`]: the server is not the one pinned;
+    /// - [`SdkError::SignInRequired`]: the server signed this device out
+    ///   ([`crate::Client::signed_out`]);
+    /// - [`SdkError::ServerFull`]: the server holds no more devices that
+    ///   are not signed in;
+    /// - [`SdkError::UnknownServer`]: the server is no longer known.
+    ///
+    /// None of these goes away by dialling again, so the SDK does not. The
+    /// next call dials once, and fails the same way until the cause is
+    /// fixed. Every other failure (the server is unreachable, it did not
+    /// answer in time) is dialled again with backoff, as
+    /// [`ConnectionState::Reconnecting`].
+    pub fn stopped(&self) -> Option<SdkError> {
+        self.0.borrow().stopped.clone()
     }
 }
 
@@ -131,7 +186,7 @@ impl SignOutWatch {
 
 pub(crate) struct Link {
     id: EndpointId,
-    state: watch::Sender<ConnectionState>,
+    state: watch::Sender<Status>,
     /// How many times the server has signed this device out.
     sign_outs: watch::Sender<u64>,
     /// The sessions a sign-out ended: a call in one is
@@ -149,7 +204,7 @@ impl Link {
     pub fn new(id: EndpointId) -> Arc<Self> {
         Arc::new(Self {
             id,
-            state: watch::Sender::new(ConnectionState::Disconnected),
+            state: watch::Sender::new(Status::new(ConnectionState::Disconnected)),
             sign_outs: watch::Sender::new(0),
             ended: Mutex::default(),
             current: Mutex::default(),
@@ -206,7 +261,21 @@ impl Link {
             *self.info.lock() = Some(conn.info.clone());
         }
         *self.current.lock() = conn;
-        self.state.send_replace(state);
+        self.show(state);
+    }
+
+    /// Say `state`, with no reason to have stopped.
+    fn show(&self, state: ConnectionState) {
+        self.state.send_replace(Status::new(state));
+    }
+
+    /// Stop with no connection: `Disconnected`, because of `reason`.
+    fn stop(&self, reason: SdkError) {
+        *self.current.lock() = None;
+        self.state.send_replace(Status {
+            state: ConnectionState::Disconnected,
+            stopped: Some(reason),
+        });
     }
 
     /// The open connection: as it is, after the supervisor's reconnect, or
@@ -227,7 +296,7 @@ impl Link {
         if let Some(conn) = self.open() {
             return Ok(conn);
         }
-        self.state.send_replace(ConnectionState::Connecting);
+        self.show(ConnectionState::Connecting);
         match client.dial(self.id).await {
             Ok(conn) => {
                 let conn = Arc::new(conn);
@@ -240,8 +309,12 @@ impl Link {
                 *self.supervisor.lock() = Some(task);
                 Ok(conn)
             }
+            Err(e) if gives_up(&e) => {
+                self.stop(e.clone());
+                Err(e)
+            }
             Err(e) => {
-                self.state.send_replace(ConnectionState::Disconnected);
+                self.show(ConnectionState::Disconnected);
                 Err(e)
             }
         }
@@ -266,7 +339,7 @@ impl Link {
             if let Some(conn) = self.open() {
                 return Ok(Some(conn));
             }
-            if *state.borrow_and_update() == ConnectionState::Disconnected {
+            if state.borrow_and_update().state == ConnectionState::Disconnected {
                 return Ok(None);
             }
             match tokio::time::timeout_at(deadline, state.changed()).await {
@@ -291,7 +364,7 @@ impl Link {
             let mut current = self.current.lock();
             if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn)) {
                 *current = None;
-                self.state.send_replace(if supervised {
+                self.show(if supervised {
                     ConnectionState::Reconnecting { attempt: 1 }
                 } else {
                     ConnectionState::Disconnected
@@ -309,7 +382,7 @@ impl Link {
         if let Some(conn) = self.current.lock().take() {
             conn.conn.close(0u32.into(), b"closed");
         }
-        self.state.send_replace(ConnectionState::Disconnected);
+        self.show(ConnectionState::Disconnected);
     }
 }
 
@@ -324,37 +397,98 @@ async fn supervise(link: Arc<Link>, client: Weak<Inner>, mut conn: Arc<ServerCon
             return;
         }
         tracing::info!(server = %link.id, "connection lost; reconnecting");
-        let mut delay = FIRST_RETRY;
-        let mut attempt = 1;
-        conn = loop {
-            link.set(None, ConnectionState::Reconnecting { attempt });
-            let Some(inner) = client.upgrade() else {
-                return;
-            };
-            match (Client { inner }).dial(link.id).await {
-                Ok(conn) => break Arc::new(conn),
-                Err(SdkError::UnknownServer(_)) => {
-                    link.set(None, ConnectionState::Disconnected);
-                    return;
-                }
-                // Let in again only once signed in: dialling on would only
-                // be refused again, and the next call says why.
-                Err(SdkError::ServerFull) => {
-                    tracing::info!(server = %link.id, "the server is full; not reconnecting");
-                    link.set(None, ConnectionState::Disconnected);
-                    return;
-                }
-                Err(e) => {
-                    tracing::debug!(server = %link.id, attempt, error = %e, "reconnect failed")
-                }
-            }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(MAX_RETRY);
-            attempt += 1;
+        let dialled = redial(&link, || {
+            let client = client.upgrade();
+            let id = link.id;
+            async move { Some((Client { inner: client? }).dial(id).await) }
+        })
+        .await;
+        let Some((dialled, attempt)) = dialled else {
+            return;
         };
+        conn = Arc::new(dialled);
         tracing::info!(server = %link.id, attempt, "reconnected");
         link.set(Some(conn.clone()), ConnectionState::Connected);
     }
+}
+
+/// Dial with `dial` until it connects, waiting longer after each failure
+/// ([`Backoff`]): the connection and the attempt it took. `None` when the
+/// client is gone (`dial` gives `None`), or when the SDK gave up on an
+/// error dialling again would not fix: then the link is `Disconnected`,
+/// and says why ([`StateWatch::stopped`]).
+async fn redial<T, Fut>(link: &Link, mut dial: impl FnMut() -> Fut) -> Option<(T, u32)>
+where
+    Fut: Future<Output = Option<Result<T, SdkError>>>,
+{
+    let mut backoff = Backoff::default();
+    let mut attempt = 1;
+    loop {
+        link.set(None, ConnectionState::Reconnecting { attempt });
+        match dial().await? {
+            Ok(conn) => return Some((conn, attempt)),
+            Err(e) if gives_up(&e) => {
+                tracing::info!(server = %link.id, attempt, error = %e, "not reconnecting");
+                link.stop(e);
+                return None;
+            }
+            Err(e) => {
+                tracing::debug!(server = %link.id, attempt, error = %e, "reconnect failed");
+            }
+        }
+        tokio::time::sleep(backoff.next_wait()).await;
+        attempt += 1;
+    }
+}
+
+/// Whether the supervisor stops on `error` instead of dialling again: the
+/// same dial would fail the same way, and only the user, the app or the
+/// server's admin can change that.
+pub(crate) fn gives_up(error: &SdkError) -> bool {
+    matches!(
+        error,
+        SdkError::UnknownServer(_)
+            // Let in again only once signed in.
+            | SdkError::ServerFull
+            | SdkError::UpdateRequired { .. }
+            // Not the server pinned: the user decides, never a retry.
+            | SdkError::IdentityChanged { .. }
+            | SdkError::ServerIdChanged { .. }
+            | SdkError::WrongServer { .. }
+            | SdkError::SignInRequired
+    )
+}
+
+/// The waits between dials: [`FIRST_RETRY`], doubling up to [`MAX_RETRY`],
+/// each moved by up to [`JITTER`] either way.
+#[derive(Debug)]
+struct Backoff {
+    next: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self { next: FIRST_RETRY }
+    }
+}
+
+impl Backoff {
+    fn next_wait(&mut self) -> Duration {
+        let wait = self
+            .next
+            .mul_f64(1.0 + JITTER * (2.0 * unit_random() - 1.0));
+        self.next = (self.next * 2).min(MAX_RETRY);
+        wait
+    }
+}
+
+/// A number in `[0, 1)`, random enough to spread waits: std's hasher keys
+/// are random per process and per call, so no RNG crate is needed.
+fn unit_random() -> f64 {
+    use std::hash::{BuildHasher, RandomState};
+    let bits = RandomState::new().hash_one(std::time::SystemTime::now());
+    // The top 53 bits: as many as an f64 holds exactly.
+    (bits >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// The server closed the connection because this device's last session
@@ -369,7 +503,7 @@ async fn signed_out(link: &Link, client: &Weak<Inner>) {
             Err(e) => tracing::warn!(server = %link.id, error = %e, "cannot end the sessions kept"),
         }
     }
-    link.set(None, ConnectionState::Disconnected);
+    link.stop(SdkError::SignInRequired);
     link.sign_outs.send_modify(|n| *n += 1);
 }
 
@@ -416,6 +550,110 @@ async fn shutting_down(conn: &Connection, id: EndpointId, client: &Weak<Inner>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn link() -> Arc<Link> {
+        Link::new(iroh::SecretKey::from_bytes(&[7; 32]).public())
+    }
+
+    /// When each dial was made, `dial` failing with `error` until the
+    /// `succeed_at`th, which connects.
+    async fn dials(link: &Link, error: SdkError, succeed_at: usize) -> Vec<tokio::time::Instant> {
+        let made = Mutex::new(Vec::new());
+        redial(link, || {
+            let n = {
+                let mut made = made.lock();
+                made.push(tokio::time::Instant::now());
+                made.len()
+            };
+            let error = error.clone();
+            async move { Some(if n >= succeed_at { Ok(()) } else { Err(error) }) }
+        })
+        .await;
+        made.into_inner()
+    }
+
+    /// The waits between dials, under tokio's paused clock: each is the
+    /// time the supervisor slept.
+    fn waits(made: &[tokio::time::Instant]) -> Vec<Duration> {
+        made.windows(2).map(|w| w[1] - w[0]).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreachable_server_is_dialled_less_and_less_often_up_to_five_minutes() {
+        let made = dials(&link(), SdkError::Unreachable("down".into()), 40).await;
+        let waits = waits(&made);
+        let five_minutes = Duration::from_secs(300);
+        let mut nominal = Duration::from_millis(250);
+        for (n, wait) in waits.iter().enumerate() {
+            assert!(
+                *wait >= nominal.mul_f64(0.8) && *wait <= nominal.mul_f64(1.2),
+                "wait {n} was {wait:?}, not {nominal:?} \u{b1}20%: {waits:?}"
+            );
+            nominal = (nominal * 2).min(five_minutes);
+        }
+        // A blip is still dialled again quickly...
+        assert!(waits[0] <= Duration::from_millis(300), "{waits:?}");
+        // ...and a server that stays down is left alone for minutes.
+        assert!(
+            waits.iter().any(|w| *w >= Duration::from_secs(240)),
+            "the waits never grew past {:?}",
+            waits.iter().max()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_waits_are_spread_so_devices_do_not_dial_in_step() {
+        let made = dials(&link(), SdkError::Unreachable("down".into()), 40).await;
+        let capped: Vec<Duration> = waits(&made)
+            .into_iter()
+            .filter(|w| *w >= Duration::from_secs(240))
+            .collect();
+        assert!(capped.len() > 10, "{capped:?}");
+        let first = capped[0];
+        assert!(capped.iter().any(|w| *w != first), "{capped:?}");
+    }
+
+    /// What dialling again cannot fix stops the supervisor at once, with
+    /// the reason on the state watch.
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_error_is_dialled_once_and_shown() {
+        for error in [
+            SdkError::UpdateRequired {
+                server_protocol: None,
+            },
+            SdkError::IdentityChanged {
+                saved: "a".into(),
+                now: "b".into(),
+            },
+            SdkError::ServerIdChanged {
+                endpoint_id: "a".into(),
+                saved: "b".into(),
+                now: "c".into(),
+            },
+            SdkError::WrongServer {
+                expected: "a".into(),
+                actual: "b".into(),
+            },
+            SdkError::ServerFull,
+            SdkError::UnknownServer("a".into()),
+        ] {
+            let link = link();
+            let watch = link.watch();
+            let made = dials(&link, error.clone(), 5).await;
+            assert_eq!(made.len(), 1, "{error:?} was dialled again");
+            assert_eq!(watch.current(), ConnectionState::Disconnected, "{error:?}");
+            assert_eq!(watch.stopped(), Some(error));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_clears_the_reason() {
+        let link = link();
+        let watch = link.watch();
+        link.stop(SdkError::ServerFull);
+        dials(&link, SdkError::Unreachable("down".into()), 2).await;
+        assert_eq!(watch.stopped(), None);
+    }
 
     fn path(addr: &str) -> ConnectionPath {
         ConnectionPath::of_ip(addr.parse().unwrap())

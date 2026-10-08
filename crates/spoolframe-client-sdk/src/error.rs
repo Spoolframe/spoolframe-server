@@ -66,6 +66,16 @@ pub enum SdkError {
         saved: String,
         now: String,
     },
+    /// The server and this SDK speak different revisions of the protocol,
+    /// so they cannot talk: it refused this SDK's `Hello`, or answered it
+    /// with another revision. `server_protocol` is the server's revision
+    /// when it said it, `None` when it only refused: compare it with
+    /// [`spoolframe_protocol::PROTOCOL_VERSION`] to tell whether the app
+    /// (lower) or the server (higher) is the older one. Show "Update the
+    /// app" (or the server); dialling again does not help, so the SDK
+    /// stops reconnecting ([`crate::StateWatch::stopped`]).
+    #[error("the server speaks another protocol revision; update the app or the server")]
+    UpdateRequired { server_protocol: Option<u32> },
     /// The endpoint answered as another server than the one dialled.
     #[error("expected server {expected}, but {actual} answered")]
     WrongServer { expected: String, actual: String },

@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use spoolframe_admin_api::{SettingApply, SettingEntry, SettingLayer, Settings};
+use spoolframe_admin_api::{RestartMode, SettingApply, SettingEntry, SettingLayer, Settings};
 use spoolframe_plex::PlexCatalog;
 use spoolframe_types::{Library, LibraryId, Namespace};
 
@@ -62,11 +62,6 @@ pub enum ChangeError {
     Secret { key: String },
     #[error("cannot save the setting: {0}")]
     Write(std::io::Error),
-    /// Nothing would start the server again.
-    #[error(
-        "the server does not run under a supervisor that would start it again; restart it by hand"
-    )]
-    NotSupervised,
 }
 
 /// The server's settings as they change at run time.
@@ -79,9 +74,9 @@ pub struct RuntimeSettings {
     /// settings in effect are.
     started: Table,
     live: Live,
-    /// Under a supervisor that starts the server again when it exits for a
-    /// restart (`SPOOLFRAME_SUPERVISED`, which the NixOS module sets).
-    supervised: bool,
+    /// How a restart brings the server back: its supervisor
+    /// (`SPOOLFRAME_SUPERVISED`, which the NixOS module sets), or itself.
+    mode: RestartMode,
     restart: tokio::sync::Notify,
 }
 
@@ -175,14 +170,14 @@ fn insecure_over_https(layers: &Layers) -> bool {
 }
 
 impl RuntimeSettings {
-    pub fn new(layers: Layers, state_dir: &Path, live: Live, supervised: bool) -> Self {
+    pub fn new(layers: Layers, state_dir: &Path, live: Live, mode: RestartMode) -> Self {
         Self {
             started: layers.merged(),
             layers: Mutex::new(layers),
             secrets: Secrets::new(state_dir),
             state_dir: state_dir.to_owned(),
             live,
-            supervised,
+            mode,
             restart: tokio::sync::Notify::new(),
         }
     }
@@ -211,7 +206,8 @@ impl RuntimeSettings {
                 .map(|s| self.entry(&layers, &merged, s))
                 .collect(),
             config_file: layers.file_path().map(|p| p.display().to_string()),
-            can_restart: self.supervised,
+            can_restart: true,
+            restart_mode: self.mode,
         }
     }
 
@@ -521,15 +517,16 @@ impl RuntimeSettings {
         Ok(layers.setup())
     }
 
-    /// Ask for a restart: the server stops, and its supervisor starts it
-    /// again.
-    pub fn restart(&self, by: &str) -> Result<(), ChangeError> {
-        if !self.supervised {
-            return Err(ChangeError::NotSupervised);
-        }
-        tracing::warn!(by, "restart asked for");
+    /// Ask for a restart: the server stops, then its supervisor starts it
+    /// again, or it runs itself again in place (`RestartMode`).
+    pub fn restart(&self, by: &str) {
+        tracing::warn!(by, mode = ?self.mode, "restart asked for");
         self.restart.notify_one();
-        Ok(())
+    }
+
+    /// How a restart brings the server back.
+    pub fn restart_mode(&self) -> RestartMode {
+        self.mode
     }
 
     /// Done once a restart is asked for.
@@ -555,7 +552,10 @@ mod tests {
             name: Some(ServerName::new("Spoolframe")),
             ..Live::default()
         };
-        (RuntimeSettings::new(layers, dir.as_ref(), live, false), dir)
+        (
+            RuntimeSettings::new(layers, dir.as_ref(), live, RestartMode::InPlace),
+            dir,
+        )
     }
 
     #[tokio::test]
@@ -598,7 +598,7 @@ mod tests {
             watch: Some(watch.clone()),
             ..Live::default()
         };
-        let settings = RuntimeSettings::new(layers, dir.as_ref(), live, false);
+        let settings = RuntimeSettings::new(layers, dir.as_ref(), live, RestartMode::InPlace);
         settings
             .set("watch.watched_percent", &serde_json::json!(80), "root")
             .unwrap();
@@ -806,10 +806,20 @@ mod tests {
         // Back to what the server started with: nothing waits.
         let entry = settings.unset("network.port", "root").unwrap();
         assert!(!entry.restart_pending);
-        assert!(matches!(
-            settings.restart("root"),
-            Err(ChangeError::NotSupervised)
-        ));
+    }
+
+    /// Without a supervisor a restart is still asked for: the server
+    /// starts itself again in place.
+    #[tokio::test]
+    async fn an_unsupervised_restart_is_asked_for() {
+        let (settings, _dir) = settings(None).await;
+        settings.restart("root");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            settings.restart_requested(),
+        )
+        .await
+        .expect("the restart is asked for");
     }
 
     #[tokio::test]

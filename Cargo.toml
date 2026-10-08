@@ -65,6 +65,17 @@ iroh = { version = "1.3", default-features = false, features = ["tls-aws-lc-rs"]
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 # LAN discovery (P1-13). Iroh keeps mDNS out of its own crate since 1.0.
 iroh-mdns-address-lookup = "0.6"
+# The host's interfaces with each IPv6 address's flags, read over netlink
+# (`network.wan.host_ipv6`, P6-02): getifaddrs does not say which is a
+# temporary privacy address. Already in the build through iroh.
+netwatch = "0.19.3"
+# Asks the router to forward the server's port over UPnP, NAT-PMP or PCP
+# and renews it (`network.wan.mapped_port.mode = "auto"`, P6-02): iroh's
+# own port mapper, the crate its `portmapper` feature turns on. Taken
+# directly, by the server only: that feature would make every iroh
+# endpoint in a workspace build map its port, the SDK's and the tests'
+# included. No metrics, as iroh's are off.
+portmapper = { version = "0.19.3", default-features = false }
 
 # The server database: SQLite through sqlx, with its migrator. Runtime
 # queries only; `macros` is for `migrate!`, which embeds the migrations.

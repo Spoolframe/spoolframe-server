@@ -1487,8 +1487,12 @@ fn UserPasskeys(username: String, name: String) -> Element {
 pub fn Server() -> Element {
     rsx! {
         div { class: "flex flex-col gap-[22px]",
-            div { class: "page-head hidden md:flex",
-                h1 { class: "page-title page-title-admin", "Server" }
+            super::restart::PendingRestart {}
+            // The title only on a wide screen (WebAdminPhone 3); the
+            // restart everywhere, for an admin, whatever is pending.
+            div { class: "page-head",
+                h1 { class: "page-title page-title-admin max-md:hidden", "Server" }
+                super::restart::RestartButton { label: "Restart server", class: "btn" }
             }
             div { class: "server-grid",
                 ThisServer {}
@@ -1529,6 +1533,39 @@ fn Addresses(addresses: Vec<String>) -> Element {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The public addresses (`network.wan`) and their sources, or that none
+/// was found, with what went wrong finding them.
+#[component]
+fn PublicAddresses(
+    addresses: Vec<spoolframe_admin_api::PublicAddress>,
+    notes: Vec<String>,
+) -> Element {
+    rsx! {
+        div { class: "flex flex-col gap-1",
+            if addresses.is_empty() {
+                span { class: "text-ctp-subtext0", "No public address found." }
+            }
+            for found in addresses {
+                div { key: "{found.address}", class: "flex items-start gap-2.5",
+                    span { class: "mono-value address",
+                        {
+                            let (wraps, kept) = crate::logic::address_parts(&found.address);
+                            rsx! {
+                                span { "{wraps}" }
+                                span { class: "whitespace-nowrap", "{kept}" }
+                            }
+                        }
+                    }
+                    span { class: "text-xs text-ctp-subtext0", "{found.source.label()}" }
+                }
+            }
+            for note in notes {
+                span { key: "{note}", class: "text-xs text-ctp-yellow", "{note}" }
             }
         }
     }
@@ -1615,6 +1652,13 @@ fn ThisServer() -> Element {
                                 div { class: "mt-1 text-xs text-ctp-subtext0", "What a signed-in device is told to dial." }
                             }
                         }
+                        // `network.wan` (P6-02): what a device off the LAN
+                        // dials, each with where it came from.
+                        if s.wan {
+                            Pair { label: "Public addresses", class: "max-md:hidden",
+                                PublicAddresses { addresses: s.public_addresses, notes: s.public_notes }
+                            }
+                        }
                     },
                 }
             }
@@ -1631,6 +1675,30 @@ fn LanDiscovery(running: bool) -> Element {
     let mut settings = use_resource(super::wizard::load_settings);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
+    // `network.*` (finding 61): from an old session, "Confirm it's you"
+    // first, then the same flip again (`to`, kept for it).
+    let confirming = use_signal(|| None::<String>);
+    let mut to = use_signal(|| false);
+    let flip = use_callback(move |wanted: bool| {
+        to.set(wanted);
+        busy.set(true);
+        spawn(async move {
+            let set = async {
+                let client = rpc::client().await?;
+                client
+                    .setting_set("network.mdns".into(), serde_json::Value::Bool(wanted))
+                    .await
+                    .map_err(rpc::error)
+            };
+            match set.await {
+                Ok(_) => error.set(None),
+                Err(e) if asks_to_confirm(&e, confirming, "changing LAN discovery") => {}
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+            settings.restart();
+        });
+    });
     let current = settings.read().clone();
     let Some(Ok(loaded)) = current else {
         // Until the settings load (or if they cannot), what runs now.
@@ -1643,24 +1711,6 @@ fn LanDiscovery(running: bool) -> Element {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(running);
     let locked = entry.as_ref().is_some_and(|e| e.locked);
-    let flip = move |_| {
-        busy.set(true);
-        spawn(async move {
-            let set = async {
-                let client = rpc::client().await?;
-                client
-                    .setting_set("network.mdns".into(), serde_json::Value::Bool(!wanted))
-                    .await
-                    .map_err(rpc::error)
-            };
-            match set.await {
-                Ok(_) => error.set(None),
-                Err(e) => error.set(Some(e.explain())),
-            }
-            busy.set(false);
-            settings.restart();
-        });
-    };
     rsx! {
         div { class: "flex flex-col gap-2",
             div { class: "flex items-start gap-3",
@@ -1672,7 +1722,7 @@ fn LanDiscovery(running: bool) -> Element {
                     aria_label: "LAN discovery",
                     disabled: busy() || locked,
                     title: if locked { "Set by the server's config file." } else { "" },
-                    onclick: flip,
+                    onclick: move |_| flip.call(!wanted),
                 }
                 LanLine { on: wanted }
             }
@@ -1681,6 +1731,7 @@ fn LanDiscovery(running: bool) -> Element {
                 Alert { text }
             }
         }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| flip.call(to()) }
     }
 }
 

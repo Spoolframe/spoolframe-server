@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
@@ -18,8 +19,12 @@ struct Args {
     #[arg(long)]
     endpoint: EndpointId,
     /// Where to dial it.
-    #[arg(long, required = true)]
+    #[arg(long, required_unless_present = "check_wan")]
     addr: Vec<SocketAddr>,
+    /// Only check that the server answers through this public address
+    /// (`network.wan`), and nothing else: run it from another network.
+    #[arg(long, conflicts_with_all = ["addr", "check_cap", "check_limits", "check_pool", "username"])]
+    check_wan: Option<SocketAddr>,
     /// The most connections and streams the run opens.
     #[arg(long, default_value_t = 200)]
     budget: u32,
@@ -76,6 +81,20 @@ async fn main() -> anyhow::Result<ExitCode> {
         .is_err()
     {
         anyhow::bail!("a TLS provider was installed before the probe's own");
+    }
+    if let Some(addr) = args.check_wan {
+        let check =
+            spoolframe_probe::check_wan(args.endpoint, addr, Duration::from_secs(10)).await?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&check)?);
+        } else {
+            print!("{}", spoolframe_probe::wan_summary(&check));
+        }
+        return Ok(if check.reachable {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
     }
     let target = args
         .addr
@@ -146,4 +165,45 @@ fn password(file: &Path) -> anyhow::Result<String> {
         file.display()
     );
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ENDPOINT: &str = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6";
+
+    #[test]
+    fn check_wan_needs_only_the_endpoint_and_the_address() {
+        let args = Args::try_parse_from([
+            "probe",
+            "--endpoint",
+            ENDPOINT,
+            "--check-wan",
+            "203.0.113.7:7420",
+        ])
+        .unwrap();
+        assert_eq!(args.check_wan, Some("203.0.113.7:7420".parse().unwrap()));
+        assert!(args.addr.is_empty());
+    }
+
+    #[test]
+    fn check_wan_runs_alone() {
+        for other in [
+            &["--addr", "192.168.1.5:7420"][..],
+            &["--check-cap"],
+            &["--check-limits"],
+        ] {
+            let mut argv = vec![
+                "probe",
+                "--endpoint",
+                ENDPOINT,
+                "--check-wan",
+                "203.0.113.7:7420",
+            ];
+            argv.extend_from_slice(other);
+            assert!(Args::try_parse_from(argv).is_err(), "{other:?}");
+        }
+        assert!(Args::try_parse_from(["probe", "--endpoint", ENDPOINT]).is_err());
+    }
 }

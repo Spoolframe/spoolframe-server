@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use jsonrpsee::ws_client::WsClient;
 use serde_json::json;
-use spoolframe_admin_api::{AdminApiClient, MeApiClient, SettingApply, SettingLayer, error_code};
+use spoolframe_admin_api::{
+    AdminApiClient, MeApiClient, RestartMode, SettingApply, SettingLayer, error_code,
+};
 use spoolframe_server::admin::{
     self, Admin, CookiePolicy, Origins, SetupCode, TrustedProxies, Wizard,
 };
@@ -89,7 +91,7 @@ pub(crate) async fn serve_syncing(
             cookies: cookies.clone(),
             ..Live::default()
         },
-        false,
+        spoolframe_admin_api::RestartMode::InPlace,
     );
     let auth = Auth::new(Store::open(dir).await.unwrap());
     let owner = configured_owner(&settings.layers().config().unwrap(), auth.store())
@@ -270,17 +272,23 @@ async fn a_restart_setting_is_saved_and_flagged() {
     assert_eq!(entry.apply, SettingApply::Restart);
     assert!(entry.restart_pending);
     let all = root.settings().await.unwrap();
-    assert!(!all.can_restart);
     let listed = all
         .entries
         .iter()
         .find(|e| e.key == "admin.listen")
         .unwrap();
     assert!(listed.restart_pending);
-    assert_eq!(
-        code(root.restart().await.unwrap_err()),
-        error_code::NOT_CONFIGURED
-    );
+}
+
+/// Without a supervisor the server starts itself again in place, so a
+/// restart is offered, and said to be done that way.
+#[tokio::test]
+async fn an_unsupervised_server_offers_a_restart_in_place() {
+    let (_addr, root, _dir) = served("restart-in-place", "").await;
+    let all = root.settings().await.unwrap();
+    assert!(all.can_restart);
+    assert_eq!(all.restart_mode, RestartMode::InPlace);
+    root.restart().await.unwrap();
 }
 
 #[tokio::test]

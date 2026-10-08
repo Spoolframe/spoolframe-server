@@ -15,6 +15,8 @@ mod overview;
 mod playback;
 mod plex;
 mod profile;
+mod remote;
+mod restart;
 mod rpc;
 mod settings;
 mod telemetry;

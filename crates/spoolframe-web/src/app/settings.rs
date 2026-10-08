@@ -6,6 +6,8 @@ use dioxus::prelude::*;
 
 use super::Route;
 use super::admin::{Said, Toast, say};
+use super::remote::RemoteAccessForm;
+use super::restart::PendingRestart;
 use super::telemetry::TelemetryForm;
 use super::wizard::{
     AccessForm, Mode, PathsForm, PlaybackForm, PlexForm, SecurityForm, ServerForm,
@@ -18,6 +20,7 @@ const TABS: &[(&str, &str)] = &[
     ("paths", "Paths"),
     ("playback", "Playback"),
     ("access", "Access"),
+    ("remote", "Remote access"),
     ("security", "Security"),
     ("telemetry", "Telemetry"),
 ];
@@ -45,6 +48,10 @@ pub fn Settings(tab: String) -> Element {
             div { class: "page-head",
                 h1 { class: "page-title page-title-admin", "Settings" }
             }
+            // Read again after each save, which may be what it counts.
+            for n in [saved()] {
+                PendingRestart { key: "{n}" }
+            }
             nav { class: "tabs", aria_label: "Settings",
                 for (path, name) in TABS {
                     Link {
@@ -61,6 +68,14 @@ pub fn Settings(tab: String) -> Element {
                 div { class: "flex max-w-[800px] flex-col gap-4",
                     for n in [saved()] {
                         TelemetryForm { key: "{n}", on_done }
+                    }
+                }
+            } else if tab == "remote" {
+                // The live status card, then the form, as the
+                // WebRemoteAccess board draws them (P6-02).
+                div { class: "flex max-w-[820px] flex-col gap-[18px]",
+                    for n in [saved()] {
+                        RemoteAccessForm { key: "{n}", on_done }
                     }
                 }
             } else {

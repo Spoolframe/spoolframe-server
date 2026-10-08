@@ -393,6 +393,18 @@ impl Store {
         .await?)
     }
 
+    /// The name device `endpoint_id` gave when someone signed in from it;
+    /// `None` for a device no one signed in from, or one with no name.
+    pub async fn device_name(&self, endpoint_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(
+            sqlx::query_scalar("SELECT display_name FROM devices WHERE endpoint_id = ?1")
+                .bind(endpoint_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
+    }
+
     /// What kind of client `endpoint_id` runs now, as its `Hello` said, if
     /// it is a device someone has signed in from: so a device signed in
     /// before the server kept platforms gets one when it next connects.

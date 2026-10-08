@@ -51,6 +51,8 @@ spoolframe-plex = { workspace = true }
 spoolframe-protocol = { workspace = true }
 iroh = { workspace = true }
 iroh-mdns-address-lookup = { workspace = true }
+netwatch = { workspace = true }
+portmapper = { workspace = true }
 spoolframe-types = { workspace = true }
 spoolframe-policy = { workspace = true }
 sqlx = { workspace = true }

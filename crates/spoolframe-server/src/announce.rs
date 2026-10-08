@@ -228,7 +228,7 @@ impl Announce {
 }
 
 /// Whether interface `name` is a virtual one ([`VIRTUAL_INTERFACES`]).
-fn is_virtual(name: &str) -> bool {
+pub(crate) fn is_virtual(name: &str) -> bool {
     VIRTUAL_INTERFACES
         .iter()
         .any(|pattern| Glob(String::from(*pattern)).matches(name))
@@ -260,6 +260,8 @@ pub struct Told {
     endpoint: Endpoint,
     announce: Arc<Announce>,
     relays: Arc<Vec<String>>,
+    /// The public addresses (`network.wan`, P6-02), told after the rest.
+    public: crate::wan::Public,
 }
 
 impl std::fmt::Debug for Told {
@@ -267,31 +269,62 @@ impl std::fmt::Debug for Told {
         f.debug_struct("Told")
             .field("announce", &self.announce)
             .field("relays", &self.relays)
+            .field("public", &self.public)
             .finish_non_exhaustive()
     }
 }
 
 impl Told {
     /// What `endpoint` tells, as `announce` says, with the URLs of the
-    /// relays it uses.
-    pub(crate) fn new(endpoint: Endpoint, announce: Announce, relays: Vec<String>) -> Self {
+    /// relays it uses and the public addresses `public` has found.
+    pub(crate) fn new(
+        endpoint: Endpoint,
+        announce: Announce,
+        relays: Vec<String>,
+        public: crate::wan::Public,
+    ) -> Self {
         let mut relays = relays;
         relays.sort();
         Self {
             endpoint,
             announce: Arc::new(announce),
             relays: Arc::new(relays),
+            public,
         }
     }
 
-    /// The addresses told now. It reads the interfaces from the system,
-    /// so call it off the async threads.
+    /// The addresses told now: the endpoint's, as `network.announce`
+    /// filters them, then the public ones not among them. It reads the
+    /// interfaces from the system, so call it off the async threads.
     pub fn addrs(&self) -> Vec<SocketAddr> {
         let direct = direct_addrs(self.endpoint.addr().ip_addrs().copied());
         // Always read: a virtual interface is known by its name.
         let interfaces = interfaces();
-        self.announce
-            .told(&direct, &self.endpoint.bound_sockets(), &interfaces)
+        let mut told = self
+            .announce
+            .told(&direct, &self.endpoint.bound_sockets(), &interfaces);
+        for public in self.public.addrs() {
+            if !told.contains(&public.addr) {
+                told.push(public.addr);
+            }
+        }
+        told
+    }
+
+    /// The port of the endpoint's first IPv4 socket, else of its first:
+    /// the one a router is asked to map (`network.wan`).
+    pub fn own_port(&self) -> Option<u16> {
+        let bound = self.endpoint.bound_sockets();
+        bound
+            .iter()
+            .find(|b| b.is_ipv4())
+            .or_else(|| bound.first())
+            .map(SocketAddr::port)
+    }
+
+    /// The public addresses (`network.wan`), each with its source.
+    pub fn public(&self) -> &crate::wan::Public {
+        &self.public
     }
 
     /// The URLs of the relays the endpoint uses (`network.relay`), sorted;
@@ -310,11 +343,14 @@ impl Told {
     }
 
     /// A message each time the endpoint's own addresses change (iroh
-    /// watches the interfaces), until the endpoint closes.
+    /// watches the interfaces), or the public ones do (`network.wan`: a
+    /// mapping granted, a lookup answered, the host's IPv6 addresses
+    /// changed), until the endpoint closes.
     pub(crate) fn changes(&self) -> tokio::sync::mpsc::Receiver<()> {
         use iroh::Watcher as _;
         let (changed, changes) = tokio::sync::mpsc::channel(1);
         let mut watcher = self.endpoint.watch_addr();
+        let mut public = self.public.changes();
         let closed = self.endpoint.closed();
         tokio::spawn(async move {
             tokio::pin!(closed);
@@ -325,14 +361,16 @@ impl Told {
                         if updated.is_err() {
                             return;
                         }
-                        // Full: a change is waiting to be read already,
-                        // and reading it reads this one too.
-                        if let Err(tokio::sync::mpsc::error::TrySendError::Closed(())) =
-                            changed.try_send(())
-                        {
-                            return;
-                        }
                     }
+                    // Its sender lives as long as this `Told`: never closed.
+                    Ok(()) = public.changed() => {}
+                }
+                // Full: a change is waiting to be read already, and
+                // reading it reads this one too.
+                if let Err(tokio::sync::mpsc::error::TrySendError::Closed(())) =
+                    changed.try_send(())
+                {
+                    return;
                 }
             }
         });

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use spoolframe_admin_api::RestartMode;
 use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::Prober;
 use spoolframe_media::bitmap::Budget;
@@ -297,6 +298,10 @@ fn main() -> Result<()> {
     unsafe {
         libc::umask(0o077);
     }
+    // What a restart in place runs again (`restart_in_place`), taken
+    // before anything else: the program as it was started.
+    let exe = std::env::current_exe();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let cli = Cli::parse();
     // Before any runtime, thread or log: the decoder is a child the server
     // started, confined, which only reads its input and writes pictures.
@@ -309,11 +314,68 @@ fn main() -> Result<()> {
         decode_subtitle(*format, pictures, *from_file_start);
     }
     spoolframe_server::tls::install_provider()?;
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("cannot start the async runtime")?
-        .block_on(serve(cli))
+        .context("cannot start the async runtime")?;
+    let restart = runtime.block_on(serve(cli));
+    // The tasks still running end here, and the media tools they ran are
+    // killed with them; one stuck in a blocking call is not waited for.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    match restart? {
+        None => Ok(()),
+        // Not a success: systemd's Restart=on-failure starts it again.
+        Some(RestartMode::Supervisor) => std::process::exit(RESTART_EXIT),
+        Some(RestartMode::InPlace) => restart_in_place(exe, &args),
+    }
+}
+
+/// Run this binary again in this process, as it was started: the same
+/// PID, arguments, environment and standard streams, so a pipe the log
+/// goes to (`| tee`) keeps receiving it. Every other descriptor the server
+/// opened is close-on-exec, so the exec frees its ports for the new
+/// server. `exe` is the path the binary was started from, so a binary
+/// rebuilt there since is the one that runs. Returns only to exit,
+/// non-zero, when the exec fails.
+fn restart_in_place(exe: std::io::Result<PathBuf>, args: &[std::ffi::OsString]) -> ! {
+    use std::os::unix::process::CommandExt as _;
+    reap_children();
+    let failed = match exe {
+        Ok(exe) => {
+            tracing::warn!(
+                exe = %exe.display(),
+                pid = std::process::id(),
+                "restarting in place"
+            );
+            let mut command = std::process::Command::new(&exe);
+            if let Some((arg0, rest)) = args.split_first() {
+                command.arg0(arg0).args(rest);
+            }
+            command.exec()
+        }
+        Err(e) => e,
+    };
+    tracing::error!(error = %failed, "cannot run the server again in place: it has stopped");
+    std::process::exit(1)
+}
+
+/// Reap the media tools killed as the runtime stopped, waiting up to two
+/// seconds for them to go: after the exec nothing would, and each would
+/// stay a zombie.
+fn reap_children() {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let mut status = 0;
+        // SAFETY: waitpid(2) with a valid pointer to an int.
+        match unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) } {
+            reaped if reaped > 0 => {}
+            0 if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // None left (ECHILD), or one still running after the wait.
+            _ => return,
+        }
+    }
 }
 
 /// `decode-subtitle`: the track on standard input decoded within the
@@ -343,7 +405,9 @@ fn decode_subtitle(format: decode::Format, pictures: &Path, from_file_start: boo
     }
 }
 
-async fn serve(cli: Cli) -> Result<()> {
+/// Run what `cli` says. `Some` when the server stopped to restart, and
+/// how it is to start again.
+async fn serve(cli: Cli) -> Result<Option<RestartMode>> {
     let level = match cli.verbose {
         0 => "info",
         1 => "debug",
@@ -379,7 +443,7 @@ async fn serve(cli: Cli) -> Result<()> {
     }) = cli.command
     {
         print!("{DEFAULTS}");
-        return Ok(());
+        return Ok(None);
     }
     let locations = Locations::from_env(cli.state_dir, cli.config)?;
     let layers = Layers::load(&locations)?;
@@ -397,8 +461,8 @@ async fn serve(cli: Cli) -> Result<()> {
         );
     }
 
-    match cli.command {
-        None => run(&config, &layers, state_dir, ring, swap).await,
+    let done = match cli.command {
+        None => return run(&config, &layers, state_dir, ring, swap).await,
         Some(Command::Config {
             command: ConfigCommand::Defaults,
         }) => unreachable!("printed before the layers are read"),
@@ -463,7 +527,8 @@ async fn serve(cli: Cli) -> Result<()> {
             )
             .await
         }
-    }
+    };
+    done.map(|()| None)
 }
 
 /// Every Plex server and library, for the commands that read them
@@ -566,14 +631,15 @@ async fn probe(catalog: &dyn Catalog, id: &MediaId, ffprobe: Tool) -> Result<()>
     Ok(())
 }
 
-/// Run the server until SIGINT or SIGTERM.
+/// Run the server until SIGINT or SIGTERM, or until an admin asks for a
+/// restart: then `Some`, and how it is to start again.
 async fn run(
     config: &ServerConfig,
     layers: &Layers,
     state_dir: &Path,
     logs: Arc<LogRing>,
     swap: Swap,
-) -> Result<()> {
+) -> Result<Option<RestartMode>> {
     logs.set_capacity(config.logs.buffer_lines()?);
     // Before anything is logged: whatever waits for "listening" (a service
     // manager, the CLI tests) may send SIGTERM the moment it sees it, and a
@@ -681,6 +747,8 @@ async fn run(
     );
 
     let store = Store::open(state_dir).await?;
+    // Closed last, as the server stops.
+    let database = store.clone();
     // Previews made ahead (P3-13) start with what is being watched.
     previews::ahead::spawn(&previews, catalog.clone(), store.clone());
     let auth = Auth::new(store).with_trust_idle(config.auth.trust_idle()?);
@@ -774,10 +842,14 @@ async fn run(
         tracing::info!(providers = oidc.names().join(", "), "single sign-on");
     }
     // Said by whatever starts the server again when it exits for a restart
-    // (the NixOS module's unit does). Not systemd's INVOCATION_ID: every
-    // process started from a service inherits it, a shell and what it
-    // runs included.
-    let supervised = std::env::var_os("SPOOLFRAME_SUPERVISED").is_some_and(|v| !v.is_empty());
+    // (the NixOS module's unit does); without it, the server runs itself
+    // again in place. Not systemd's INVOCATION_ID: every process started
+    // from a service inherits it, a shell and what it runs included.
+    let restart_mode = if std::env::var_os("SPOOLFRAME_SUPERVISED").is_some_and(|v| !v.is_empty()) {
+        RestartMode::Supervisor
+    } else {
+        RestartMode::InPlace
+    };
     // GET /metrics (P3-14): its settings are live.
     let metrics = Arc::new(Metrics::default());
     let telemetry = Arc::new(Telemetry::new(
@@ -807,7 +879,7 @@ async fn run(
             logs: Some(logs.clone()),
             telemetry: Some(telemetry.clone()),
         },
-        supervised,
+        restart_mode,
     ));
     // Shared by the client protocol, which opens and plays them, and the
     // admin API's playback debug (P3-15), which looks at them.
@@ -878,6 +950,7 @@ async fn run(
             subtitles,
             previews,
             metrics,
+            wan: spoolframe_server::wan::Finders::system(),
         },
     )
     .await?;
@@ -892,23 +965,37 @@ async fn run(
         .iter()
         .map(ToString::to_string)
         .collect();
-    tracing::info!(endpoint_id = %server.id(), ?addrs, ?told, "listening");
+    // The PID: a restart in place keeps it.
+    tracing::info!(
+        endpoint_id = %server.id(),
+        ?addrs,
+        ?told,
+        pid = std::process::id(),
+        "listening"
+    );
 
     let restart = tokio::select! {
-        _ = shutdown => false,
-        _ = settings.restart_requested() => true,
+        _ = shutdown => None,
+        _ = settings.restart_requested() => Some(settings.restart_mode()),
     };
-    tracing::info!(restart, "shutting down");
+    if restart.is_some() {
+        // admin.restart's answer is on its way to the browser that asked:
+        // time for it to get there before the connection closes.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    tracing::info!(restart = ?restart, "shutting down");
     server.shutdown().await;
     let _ = admin.stop();
     admin.stopped().await;
     // What is queued for the collector goes before the process does.
     telemetry.shutdown().await;
-    if restart {
-        // Not a success: systemd's Restart=on-failure starts it again.
-        std::process::exit(RESTART_EXIT);
+    if tokio::time::timeout(std::time::Duration::from_secs(5), database.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!("the database did not close within 5 seconds");
     }
-    Ok(())
+    Ok(restart)
 }
 
 /// What the setup wizard reaches beyond the server: plex.tv, and Plex's

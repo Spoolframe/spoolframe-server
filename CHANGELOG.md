@@ -2924,3 +2924,107 @@
   given again on every later call), for a plan that changed, or more than
   3 times in 5 minutes. Before, only a direct read was started again, at
   most once a call and with no bound.
+- The server's public addresses (P6-02): a `network.wan` table, absent
+  by default. Absent, nothing changes. Present, its parts add to the
+  addresses a signed-in device is told (`ServerAddresses`), so clients
+  save them as `advertised_addrs`:
+  - `static`: public addresses with their port, told as written;
+  - `mapped_port`: one address from a port forwarded on the router.
+    `mode = "auto"` (the default) asks the router over UPnP, NAT-PMP or
+    PCP, through iroh's port mapper, and renews the mapping; `"manual"`
+    means the operator forwarded `port` (default `network.port`).
+    `public_ip` is an address or `"lookup"` (the default), one HTTPS GET
+    at start to `lookup_via` (`"wtfismyip"`, or `false` to never ask).
+    `mapped_port = false` turns it off;
+  - `host_ipv6 = true`: the host's stable global IPv6 addresses, never a
+    temporary one.
+
+  A private, loopback, link-local, CGNAT or unique local address is
+  refused at load, the range named; so is `public_ip = "lookup"` with
+  `lookup_via = false`. A refused mapping or a failed lookup is one log
+  line and a status note, retried with backoff; startup never waits for
+  either. Addresses found later are pushed to signed-in devices. The
+  admin status (`serverStatus`, `spoolframe-server status`, the Server
+  page) lists each public address with its source: static, mapped port,
+  lookup or host IPv6. The NixOS module has `services.spoolframe.wan`.
+- The web UI has Settings › Remote access (P6-02): what the server
+  advertises now, each address with its source's badge, the router's
+  answer, the IP lookup, then the `network.wan` form (the master switch,
+  the mapped port, static addresses, host IPv6). A typed address in a
+  private, loopback, link-local, CGNAT or ULA range is refused as typed,
+  in the server's words. The setup wizard's Access step ends with
+  "Reach this server from outside your home?": Not now (the default,
+  no `network.wan`), Automatic (asks the router at once and shows its
+  answer), Forwarded or Static. New admin calls `wanTryMapping`,
+  `wanLookup` and `wanHostIpv6`, and the status's `wanMapping` and
+  `wanLookup`, feed them. `network.wan` is one setting, set whole.
+- `spoolframe-probe --check-wan <addr> --endpoint <id>` dials the server
+  at one public address only and says whether it answered. Run it from
+  another network: a server cannot see its own port forward.
+- Changing any `network.*` setting needs a recent sign-in (finding 61),
+  as `admin.*`, `auth.*`, `media.*` and `telemetry.*` do. `network.wan`,
+  the announced addresses, the port and the relay say where signed-in
+  devices connect, so an old or stolen admin session could send them
+  elsewhere and learn their IP addresses. Settings › Remote access and
+  the LAN discovery switch now ask "Confirm it's you" and save again.
+- `admin.restart` works on a server started by hand (no supervisor): it
+  stops as for SIGTERM (connections closed, playbacks and encodes ended,
+  the database closed), then runs its own binary again in the same
+  process, with the same PID, arguments, environment and standard
+  streams. A pipe the log goes to, such as `| tee`, keeps receiving it.
+  The binary is the one at the path it was started from, so a rebuild is
+  picked up. A failed exec is logged, and the process exits non-zero.
+  Under a supervisor (`SPOOLFRAME_SUPERVISED`) it still exits with 75.
+  `Settings.canRestart` is always true now, and the new
+  `Settings.restartMode` says which way: `supervisor` or `inPlace`. The
+  "listening" log line has the PID. The admin listener waits up to five
+  seconds for its port if it is still taken as it starts.
+  `admin.restart` now needs a recent sign-in: every device connected
+  drops, and a server started by hand runs whatever binary is at its path.
+- The web UI restarts the server. While restart settings changed since
+  the server started (`restartPending`), every Settings tab and the
+  Server page show a banner: "N changes take effect after a restart",
+  the settings by key, and "Restart now". The Server page also has a
+  "Restart server" button for admins, shown whether or not anything is
+  pending. Every restart button, the setting notes' "Restart now"
+  included, first asks "Restart the server?" and says that connected
+  devices drop for a few seconds. Then it asks "Confirm it's you" if the
+  server wants a recent sign-in, and shows "Restarting…". It waits for
+  the old server's socket to close and for the server to answer again,
+  then loads the page again, which also loads a new web bundle. After a
+  minute without an answer it says to check the log. The setting notes'
+  "Restart now" no longer depends on `canRestart`.
+- The SDK stops reconnecting on its own when dialling again cannot help.
+  A server that refuses the SDK's `Hello`, or answers with another
+  protocol revision, is the new `SdkError::UpdateRequired
+  { server_protocol }`, where it was `Server`/`Protocol`; a server that
+  answers with another server id (`ServerIdChanged`), as another key
+  (`IdentityChanged`, `WrongServer`), signs the device out
+  (`SignInRequired`) or is full (`ServerFull`) stops it too. The link
+  goes `Disconnected`, and the new `StateWatch::stopped()` says why, so
+  an app can show it in place of "Reconnecting…". `ConnectionState` is
+  unchanged. Every other failure is dialled again after 250 ms, doubling
+  up to 5 minutes (was 10 s), each wait moved by up to 20% either way.
+  Before, an app kept a server that refused it dialled every 10 s for as
+  long as it ran.
+- A refused `Hello` is logged: one INFO line on `spoolframe::refused`,
+  `kind=hello_refused`, message "hello refused", with the device's short
+  endpoint id (`source`), its name if someone signed in from it
+  (`device`, from the devices table), the protocol revision it sent
+  (`client_protocol`), its `client` name and version, the server's
+  `server_protocol` and `server_version`, and the `reason`
+  ("unsupported protocol revision", or "malformed: …" for a `Hello`
+  that does not decode or a first frame that cannot be read). At most
+  one line per device an hour, then a count of those left out; past
+  10,000 devices, new ones share one line. Before, an app of another
+  revision left only its connects and disconnects in the log.
+- The server's connection log is quieter. "client connected" is DEBUG:
+  every connection starts anonymous. "client disconnected" is INFO only
+  when the connection was signed in at some point (a sign-in on its
+  device while it was open, or a session used on it; the new
+  `signed_in` field says which), or when it did not end with the app
+  closing it with code 0: an error code, a timeout, a reset, or the
+  server closing it (signed out, shutdown). An app that dials, says
+  `Hello` and hangs up without signing in is DEBUG at both ends, even
+  when its device has a session (`known=true`). Refusing a connection
+  as the server is full stays INFO.

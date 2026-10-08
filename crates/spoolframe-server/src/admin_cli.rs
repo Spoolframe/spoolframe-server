@@ -427,6 +427,17 @@ pub async fn status(listen: SocketAddr) -> Result<()> {
     println!("mDNS: {}", if status.mdns { "on" } else { "off" });
     println!("addresses: {}", list(&status.addresses));
     println!("told to devices: {}", list(&status.told_addresses));
+    if status.wan {
+        let public: Vec<String> = status
+            .public_addresses
+            .iter()
+            .map(|a| format!("{} ({})", a.address, a.source.label()))
+            .collect();
+        println!("public addresses: {}", list(&public));
+        for note in &status.public_notes {
+            println!("  {note}");
+        }
+    }
     let Some(plex) = plex else {
         println!("Plex: not set up");
         return Ok(());

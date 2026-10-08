@@ -628,6 +628,8 @@ pub struct Auth {
     clock: Clock,
     /// Which refused requests are logged (finding 46).
     refusals: Arc<Refusals>,
+    /// Which refused `Hello`s are logged: one per device an hour.
+    hellos: Arc<Refusals>,
 }
 
 impl Auth {
@@ -648,6 +650,7 @@ impl Auth {
             strangers: Arc::new(TokenBucket::new(STRANGER_ATTEMPTS)),
             trust_idle: TRUST_IDLE,
             refusals: Arc::new(Refusals::new(clock.clone())),
+            hellos: Arc::new(Refusals::hellos(clock.clone())),
             clock,
         }
     }
@@ -873,6 +876,11 @@ impl Auth {
     /// Which refused requests are logged, shared by every listener.
     pub fn refusals(&self) -> &Refusals {
         &self.refusals
+    }
+
+    /// Which refused `Hello`s are logged ([`Refusals::hellos`]).
+    pub fn refused_hellos(&self) -> &Refusals {
+        &self.hellos
     }
 
     /// Whose session `token` is, live or not (finding 46).

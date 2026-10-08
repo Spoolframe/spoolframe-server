@@ -222,7 +222,7 @@ pub(super) fn Footer(
 
 /// Under a field: that the locked config file sets it, that it overrides
 /// the file's value (with a way back to it), or that it applies after a
-/// restart, and once changed, a way to restart where the server can.
+/// restart, and once changed, a way to restart.
 #[component]
 pub(super) fn Note(
     settings: Settings,
@@ -230,7 +230,6 @@ pub(super) fn Note(
     on_changed: EventHandler<()>,
 ) -> Element {
     let key = setting;
-    let mut restarting = use_signal(|| None::<String>);
     // A sensitive setting (`admin.*`, `auth.*`, `media.*`, `telemetry.*`,
     // `plex.token`, `plex.token_file`, `plex.url`, `plex.servers`), from
     // an old session: "Confirm it's you" first, then the same change
@@ -257,33 +256,6 @@ pub(super) fn Note(
         return rsx! {};
     };
     let file = settings.config_file.clone().unwrap_or_default();
-    let restart = move |_| {
-        restarting.set(Some("Restarting…".into()));
-        spawn(async move {
-            let asked = async {
-                let client = rpc::client().await?;
-                client.restart().await.map_err(rpc::error)
-            };
-            if let Err(e) = asked.await {
-                restarting.set(Some(e.explain()));
-                return;
-            }
-            // Back when the listener answers again; then the page is read
-            // anew.
-            sleep(1500).await;
-            for _ in 0..60 {
-                if super::http::site().await.is_ok() {
-                    rpc::forget();
-                    if let Some(window) = web_sys::window() {
-                        let _ = window.location().reload();
-                    }
-                    return;
-                }
-                sleep(1000).await;
-            }
-            restarting.set(Some("The server has not come back. Check its log.".into()));
-        });
-    };
     rsx! {
         if e.locked {
             span { class: "note",
@@ -304,15 +276,8 @@ pub(super) fn Note(
         }
         if e.restart_pending {
             div { class: "restart-box",
-                span {
-                    match restarting() {
-                        Some(said) => rsx! { "{said}" },
-                        None => rsx! { "Saved. The server still runs with the value it started with until it restarts." },
-                    }
-                }
-                if settings.can_restart && restarting().is_none() {
-                    button { class: "btn btn-teal", onclick: restart, icons::RotateCcw { size: 13 } "Restart now" }
-                }
+                span { "Saved. The server still runs with the value it started with until it restarts." }
+                super::restart::RestartButton { label: "Restart now", class: "btn btn-teal" }
             }
         }
         ConfirmItsYou { asking: confirming, on_confirmed: move |_| use_file.call(()) }
@@ -1797,19 +1762,34 @@ fn AccessFields(
 ) -> Element {
     let public_url = use_signal(|| text(&settings, "admin.public_url"));
     let proxies = use_signal(|| text(&settings, "admin.trusted_proxies"));
+    // P6-02: the wizard's remote choice, saved with the rest on Continue.
+    let remote = use_signal(|| super::remote::WizardRemote::from_settings(&settings));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let s = settings.clone();
-    // `admin.*`: from an old session, "Confirm it's you" first.
+    // `admin.*`, and in the wizard `network.wan` (finding 61): from an old
+    // session, "Confirm it's you" first, then the save again. The wizard
+    // is past its first step here, so this is the admin's own session,
+    // never the setup code.
     let confirming = use_signal(|| None::<String>);
     let on_save = use_callback(move |()| {
         let s = s.clone();
         busy.set(true);
         spawn(async move {
-            let changes = vec![
+            let mut changes = vec![
                 ("admin.public_url", typed(&public_url())),
                 ("admin.trusted_proxies", typed(&proxies())),
             ];
+            if mode == Mode::Wizard {
+                match remote.read().setting() {
+                    Ok(wan) => changes.push(("network.wan", wan)),
+                    Err(why) => {
+                        error.set(Some(why));
+                        busy.set(false);
+                        return;
+                    }
+                }
+            }
             match save(&s, changes).await {
                 Ok(()) => on_done.call(()),
                 Err(e)
@@ -1885,11 +1865,20 @@ fn AccessFields(
             }
             span { class: "text-xs text-ctp-subtext0", "Change it with " span { class: "mono-value text-xs", "spoolframe-server config set admin.listen …" } " or in the server's config file." }
         }
-        div { class: "later", "Remote access, outside your home network, joins this step in a later version." }
+        if mode == Mode::Wizard {
+            super::remote::RemoteChoice { state: remote, server_port: text(&settings, "network.port") }
+        }
         if let Some(text) = error() {
             Alert { text }
         }
-        Footer { mode, step: "access", busy: busy(), on_save, on_discard: move |_| on_reload.call(()) }
+        Footer {
+            mode,
+            step: "access",
+            busy: busy(),
+            on_save,
+            on_discard: move |_| on_reload.call(()),
+            blocked: if mode == Mode::Wizard { remote.read().setting().err() } else { None },
+        }
         ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
     }
 }

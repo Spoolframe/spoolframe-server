@@ -111,6 +111,10 @@ pub(crate) struct Peer {
     pub endpoint: EndpointId,
     connection: Connection,
     known: AtomicBool,
+    /// Signed in at some point while open: a sign-in on its device, or a
+    /// session used on it. Unlike `known`, not set for a device that only
+    /// has a session: what the log names at INFO.
+    signed_in_here: AtomicBool,
     /// Signed out: closing once its streams are answered.
     closing: AtomicBool,
     /// How many of its streams are being answered.
@@ -132,6 +136,7 @@ impl Peer {
             endpoint: connection.remote_id(),
             connection: connection.clone(),
             known: AtomicBool::new(false),
+            signed_in_here: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             streams: watch::Sender::new(0),
         }
@@ -147,6 +152,18 @@ impl Peer {
     /// be pushed the server's addresses (PX-12).
     pub fn signed_in(&self) -> bool {
         self.known() && !self.closing.load(Ordering::Acquire)
+    }
+
+    /// The connection was signed in: its device signed in while it was
+    /// open, or a session was used on it.
+    pub(crate) fn note_signed_in(&self) {
+        self.signed_in_here.store(true, Ordering::Release);
+    }
+
+    /// Whether the connection was signed in at any point
+    /// ([`Peer::note_signed_in`]), signed out since or not.
+    pub fn was_signed_in(&self) -> bool {
+        self.signed_in_here.load(Ordering::Acquire)
     }
 
     /// The longest request frame its streams may carry.

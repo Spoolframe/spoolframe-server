@@ -13,6 +13,11 @@
 //! [`WINDOW`], then one line with how many more there were. At most
 //! [`MAX_KEYS`] sources are told apart; past them, new ones share one
 //! count, so a flood from many addresses is limited too.
+//!
+//! A refused `Hello` ([`HelloRefusal`]) is logged by a limiter of its own,
+//! [`Refusals::hellos`]: once per device an hour, at INFO. An app of
+//! another protocol revision is refused each time it dials, which may be
+//! every few seconds for days; one line an hour is enough to see it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -29,6 +34,9 @@ pub const PER_WINDOW: u32 = 10;
 
 /// The window [`PER_WINDOW`] counts in.
 pub const WINDOW: Duration = Duration::from_secs(60);
+
+/// The window a device's refused `Hello`s are counted in: one line each.
+pub const HELLO_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// The most sources counted apart. A key is a short string and three
 /// numbers, so this is about a megabyte at worst.
@@ -55,6 +63,10 @@ pub enum Kind {
     SignInFailed,
     /// Too many failed attempts, or attempts from strangers.
     RateLimited,
+    /// A `Hello` refused: another protocol revision, or one that could not
+    /// be read ([`HelloRefusal`]). INFO: nothing was tried that needs a
+    /// key.
+    HelloRefused,
 }
 
 impl Kind {
@@ -67,6 +79,7 @@ impl Kind {
             Kind::ProfileLocked => "profile_locked",
             Kind::SignInFailed => "sign_in_failed",
             Kind::RateLimited => "rate_limited",
+            Kind::HelloRefused => "hello_refused",
         }
     }
 }
@@ -129,12 +142,30 @@ struct Summary {
     suppressed: u64,
 }
 
+/// How many refusals of one kind from one source are logged, and in how
+/// long a window.
+#[derive(Debug, Clone, Copy)]
+struct Limit {
+    per_window: u32,
+    window: Duration,
+}
+
+impl Default for Limit {
+    fn default() -> Self {
+        Self {
+            per_window: PER_WINDOW,
+            window: WINDOW,
+        }
+    }
+}
+
 /// Which refusals are logged: the first [`PER_WINDOW`] per source and
 /// kind in each [`WINDOW`].
 #[derive(Debug, Default)]
 pub struct Refusals {
     windows: Mutex<Windows>,
     clock: Clock,
+    limit: Limit,
 }
 
 impl Refusals {
@@ -143,6 +174,20 @@ impl Refusals {
         Self {
             windows: Mutex::default(),
             clock,
+            limit: Limit::default(),
+        }
+    }
+
+    /// The limiter of refused `Hello`s: one per source in each
+    /// [`HELLO_WINDOW`], timed by `clock`, with [`MAX_KEYS`] as ever.
+    pub fn hellos(clock: Clock) -> Self {
+        Self {
+            windows: Mutex::default(),
+            clock,
+            limit: Limit {
+                per_window: 1,
+                window: HELLO_WINDOW,
+            },
         }
     }
 
@@ -154,8 +199,8 @@ impl Refusals {
         let mut summaries = Vec::new();
         let admitted = {
             let mut windows = self.windows.lock();
-            windows.sweep(now, &mut summaries);
-            windows.admit(source, kind, now, &mut summaries)
+            windows.sweep(now, self.limit, &mut summaries);
+            windows.admit(source, kind, now, self.limit, &mut summaries)
         };
         for summary in summaries {
             summary.log();
@@ -172,18 +217,18 @@ impl Refusals {
 }
 
 impl Windows {
-    /// Close every window that has ended, at most once a [`WINDOW`]: what
+    /// Close every window that has ended, at most once a window: what
     /// keeps a source that stopped from holding a key.
-    fn sweep(&mut self, now: Instant, summaries: &mut Vec<Summary>) {
+    fn sweep(&mut self, now: Instant, limit: Limit, summaries: &mut Vec<Summary>) {
         if self
             .swept
-            .is_some_and(|swept| now.duration_since(swept) < WINDOW)
+            .is_some_and(|swept| now.duration_since(swept) < limit.window)
         {
             return;
         }
         self.swept = Some(now);
         self.by_key.retain(|(source, kind), window| {
-            let ended = now.duration_since(window.began) >= WINDOW;
+            let ended = now.duration_since(window.began) >= limit.window;
             if ended && window.suppressed > 0 {
                 summaries.push(Summary {
                     source: source.clone(),
@@ -200,6 +245,7 @@ impl Windows {
         source: &str,
         kind: Kind,
         now: Instant,
+        limit: Limit,
         summaries: &mut Vec<Summary>,
     ) -> bool {
         let mut key = (source.to_owned(), kind);
@@ -212,7 +258,7 @@ impl Windows {
             logged: 0,
             suppressed: 0,
         });
-        if now.duration_since(window.began) >= WINDOW {
+        if now.duration_since(window.began) >= limit.window {
             if window.suppressed > 0 {
                 summaries.push(Summary {
                     source: counted_as,
@@ -226,7 +272,7 @@ impl Windows {
                 suppressed: 0,
             };
         }
-        if window.logged < PER_WINDOW {
+        if window.logged < limit.per_window {
             window.logged += 1;
             true
         } else {
@@ -238,15 +284,74 @@ impl Windows {
 
 impl Summary {
     fn log(&self) {
-        tracing::warn!(
-            target: TARGET,
-            kind = self.kind.as_str(),
-            source = %self.source,
-            suppressed = self.suppressed,
-            "{} more refusals suppressed",
-            self.suppressed
-        );
+        if self.kind == Kind::HelloRefused {
+            tracing::info!(
+                target: TARGET,
+                kind = self.kind.as_str(),
+                source = %self.source,
+                suppressed = self.suppressed,
+                "{} more refusals suppressed",
+                self.suppressed
+            );
+        } else {
+            tracing::warn!(
+                target: TARGET,
+                kind = self.kind.as_str(),
+                source = %self.source,
+                suppressed = self.suppressed,
+                "{} more refusals suppressed",
+                self.suppressed
+            );
+        }
     }
+}
+
+/// One refused `Hello`, as logged: what the device said of itself, as far
+/// as it could be read, and what the server speaks.
+#[derive(Debug, Clone)]
+pub struct HelloRefusal {
+    /// The device's endpoint, short.
+    pub source: String,
+    /// The device's name, if someone signed in from it: the server's own
+    /// record, never what this `Hello` says.
+    pub device: Option<String>,
+    /// The protocol revision the `Hello` said, if it could be read.
+    pub client_protocol: Option<u32>,
+    /// Its `client_name` and `client_version`, bounded, if they could be
+    /// read.
+    pub client: Option<String>,
+    pub server_protocol: u32,
+    /// This server's version.
+    pub server_version: String,
+    pub reason: String,
+}
+
+/// The refused-`Hello` line, unlimited: the caller has had it admitted by
+/// [`Refusals::hellos`].
+pub fn log_hello(refusal: &HelloRefusal) {
+    let HelloRefusal {
+        source,
+        device,
+        client_protocol,
+        client,
+        server_protocol,
+        server_version,
+        reason,
+    } = refusal;
+    tracing::info!(
+        target: TARGET,
+        kind = Kind::HelloRefused.as_str(),
+        channel = Channel::Quic.as_str(),
+        request = "hello",
+        source = %source,
+        device = device.as_deref(),
+        client_protocol = *client_protocol,
+        client = client.as_deref(),
+        server_protocol = *server_protocol,
+        server_version = %server_version,
+        reason = %reason,
+        "hello refused"
+    );
 }
 
 /// The line itself, unlimited: the caller has had it admitted.
@@ -354,6 +459,32 @@ mod tests {
             .count();
         assert_eq!(fresh, PER_WINDOW as usize);
         assert!(refusals.windows.lock().by_key.len() <= MAX_KEYS + 1);
+    }
+
+    #[test]
+    fn a_refused_hello_is_admitted_once_an_hour_per_source() {
+        let clock = Clock::default();
+        let hellos = Refusals::hellos(clock.clone());
+        assert!(hellos.admit("phone", Kind::HelloRefused));
+        assert!(!hellos.admit("phone", Kind::HelloRefused));
+        assert!(hellos.admit("tablet", Kind::HelloRefused));
+        clock.advance(HELLO_WINDOW - Duration::from_secs(1));
+        assert!(!hellos.admit("phone", Kind::HelloRefused));
+        clock.advance(Duration::from_secs(1));
+        assert!(hellos.admit("phone", Kind::HelloRefused));
+    }
+
+    #[test]
+    fn refused_hellos_from_endpoints_past_the_cap_share_one_line() {
+        let hellos = Refusals::hellos(Clock::default());
+        for i in 0..MAX_KEYS {
+            hellos.admit(&i.to_string(), Kind::HelloRefused);
+        }
+        let fresh = (0..1000)
+            .filter(|i| hellos.admit(&format!("new-{i}"), Kind::HelloRefused))
+            .count();
+        assert_eq!(fresh, 1);
+        assert!(hellos.windows.lock().by_key.len() <= MAX_KEYS + 1);
     }
 
     #[test]

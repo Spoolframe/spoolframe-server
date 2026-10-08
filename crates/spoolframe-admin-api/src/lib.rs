@@ -23,6 +23,116 @@ pub use spoolframe_types::{
 };
 
 /// JSON-RPC error codes the admin API returns, beside the standard ones.
+/// What makes an address a public one (`network.wan`, P6-02): one rule,
+/// so the web UI refuses a typed address with the words the server's
+/// config check uses.
+pub mod wan {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    /// Why `ip` cannot be reached from the Internet, if it cannot: the
+    /// range it is in, named (`"a private address (192.168.0.0/16)"`).
+    /// Documentation ranges (192.0.2.0/24, 2001:db8::/32 and the like)
+    /// are let through: they are what examples are written with.
+    pub fn not_public(ip: IpAddr) -> Option<&'static str> {
+        match ip.to_canonical() {
+            IpAddr::V4(v4) => not_public_v4(v4),
+            IpAddr::V6(v6) => not_public_v6(v6),
+        }
+    }
+
+    fn not_public_v4(ip: Ipv4Addr) -> Option<&'static str> {
+        let [a, b, ..] = ip.octets();
+        Some(match (a, b) {
+            (0, _) => "an unspecified address (0.0.0.0/8)",
+            (127, _) => "a loopback address (127.0.0.0/8)",
+            (10, _) => "a private address (10.0.0.0/8)",
+            (172, 16..=31) => "a private address (172.16.0.0/12)",
+            (192, 168) => "a private address (192.168.0.0/16)",
+            (100, 64..=127) => "a carrier-grade NAT address (100.64.0.0/10)",
+            (169, 254) => "a link-local address (169.254.0.0/16)",
+            (224..=239, _) => "a multicast address (224.0.0.0/4)",
+            (240.., _) => "a reserved address (240.0.0.0/4)",
+            _ => return None,
+        })
+    }
+
+    fn not_public_v6(ip: Ipv6Addr) -> Option<&'static str> {
+        let first = ip.segments()[0];
+        if ip.is_unspecified() {
+            Some("an unspecified address (::)")
+        } else if ip.is_loopback() {
+            Some("a loopback address (::1)")
+        } else if first & 0xffc0 == 0xfe80 {
+            Some("a link-local address (fe80::/10)")
+        } else if first & 0xffc0 == 0xfec0 {
+            Some("a site-local address (fec0::/10)")
+        } else if first & 0xfe00 == 0xfc00 {
+            Some("a unique local address (fc00::/7)")
+        } else if first & 0xff00 == 0xff00 {
+            Some("a multicast address (ff00::/8)")
+        } else {
+            None
+        }
+    }
+
+    /// A `static` entry: a public address with its port,
+    /// `"203.0.113.7:7420"` or `"[2001:db8::1]:7420"`.
+    pub fn check_static(text: &str) -> Result<SocketAddr, String> {
+        let text = text.trim();
+        let addr: SocketAddr = text
+            .parse()
+            .map_err(|_| format!("{text:?} is not an address and a port"))?;
+        if addr.port() == 0 {
+            return Err(format!("{text:?}: the port is 0"));
+        }
+        let ip = addr.ip().to_canonical();
+        if let Some(why) = not_public(ip) {
+            return Err(format!(
+                "{text:?} is {why}, which no device on the Internet reaches"
+            ));
+        }
+        Ok(SocketAddr::new(ip, addr.port()))
+    }
+
+    /// A typed public IP (`mapped_port.public_ip`).
+    pub fn check_public_ip(text: &str) -> Result<IpAddr, String> {
+        let text = text.trim();
+        let ip: IpAddr = text
+            .parse()
+            .map_err(|_| format!("{text:?} is not an IP address"))?;
+        let ip = ip.to_canonical();
+        match not_public(ip) {
+            Some(why) => Err(format!(
+                "{text:?} is {why}, which no device on the Internet reaches"
+            )),
+            None => Ok(ip),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_refusal_names_the_range() {
+            assert_eq!(
+                check_static("100.64.1.2:7420").unwrap_err(),
+                "\"100.64.1.2:7420\" is a carrier-grade NAT address (100.64.0.0/10), which no \
+                 device on the Internet reaches"
+            );
+            assert_eq!(
+                check_public_ip("10.0.0.5").unwrap_err(),
+                "\"10.0.0.5\" is a private address (10.0.0.0/8), which no device on the \
+                 Internet reaches"
+            );
+            assert_eq!(
+                check_static("[2001:db8::1]:7420"),
+                Ok("[2001:db8::1]:7420".parse().unwrap())
+            );
+        }
+    }
+}
+
 pub mod error_code {
     /// No session, or one that is revoked, expired or for a disabled user.
     pub const UNAUTHENTICATED: i32 = -32001;
@@ -445,6 +555,20 @@ pub struct ServerStatus {
     /// endpoint's, as `network.announce` filters them, read now. Empty
     /// while the endpoint is starting.
     pub told_addresses: Vec<String>,
+    /// Whether `network.wan` is set (P6-02): the server advertises public
+    /// addresses, and says here which it found.
+    pub wan: bool,
+    /// The public addresses advertised now (P6-02), each with where it
+    /// came from; they are among `told_addresses` too. Empty without
+    /// `network.wan`, and while none is found.
+    pub public_addresses: Vec<PublicAddress>,
+    /// What went wrong finding them, one line each: a router that refused
+    /// the port mapping, an IP lookup that failed.
+    pub public_notes: Vec<String>,
+    /// The router's answer about the mapped port.
+    pub wan_mapping: MappingStatus,
+    /// The public IP lookup, for the mapped port.
+    pub wan_lookup: LookupStatus,
     /// The tesseract languages bitmap subtitles are read as text in
     /// (P2-07), as tesseract names them (`eng`); none when OCR is off.
     pub ocr_languages: Vec<String>,
@@ -453,6 +577,81 @@ pub struct ServerStatus {
     /// How many files frame previews are made of ahead at once when
     /// `previews.workers` is not set (P3-13).
     pub preview_workers_default: DefaultWorkers,
+}
+
+/// A public address the server advertises (P6-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicAddress {
+    /// `203.0.113.7:7420`, `[2001:db8::1]:7420`.
+    pub address: String,
+    pub source: AddressSource,
+}
+
+/// Where a public address came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AddressSource {
+    /// `network.wan.static`, as written.
+    Static,
+    /// The mapped port with its public IP: the router's answer, or
+    /// `public_ip` as written.
+    MappedPort,
+    /// The mapped port with its public IP looked up.
+    Lookup,
+    /// One of the host's own stable global IPv6 addresses.
+    HostIpv6,
+}
+
+impl AddressSource {
+    /// As the status page says it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::MappedPort => "mapped port",
+            Self::Lookup => "lookup",
+            Self::HostIpv6 => "host IPv6",
+        }
+    }
+}
+
+/// The router's answer about the mapped port (`mode = "auto"`, P6-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum MappingStatus {
+    /// No router is asked: no `network.wan`, no mapped port, or one the
+    /// operator forwarded (`mode = "manual"`).
+    NotUsed,
+    /// Asking, or asking again after the mapping lapsed.
+    Asking,
+    /// Mapped: the server's port, and the address the router gave it.
+    Granted { local_port: u16, external: String },
+    /// No router answers, or it said no.
+    Refused { reason: String },
+}
+
+/// The public IP lookup (`public_ip = "lookup"`, P6-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum LookupStatus {
+    /// Nothing is looked up: no mapped port, or its IP is written down.
+    NotUsed,
+    /// The router reported a public address itself: no need to ask.
+    NotNeeded,
+    /// Asking now.
+    Asking,
+    /// The service's answer, and when it came (Unix seconds).
+    Found { ip: String, via: String, at: u64 },
+    /// It failed; `retrying` while tries are left.
+    Failed { error: String, retrying: bool },
 }
 
 /// A default worked out from the machine's CPUs.
@@ -739,9 +938,24 @@ pub struct Settings {
     pub entries: Vec<SettingEntry>,
     /// The server's config file, if it has one.
     pub config_file: Option<String>,
-    /// The server runs under a supervisor (systemd) that starts it again,
-    /// so `admin.restart` can apply restart settings.
+    /// `admin.restart` can apply restart settings. Always true now: a
+    /// server with no supervisor starts itself again in place.
     pub can_restart: bool,
+    /// How `admin.restart` brings the server back.
+    pub restart_mode: RestartMode,
+}
+
+/// How the server starts again after `admin.restart`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RestartMode {
+    /// It exits, and the supervisor that runs it (systemd, where
+    /// `SPOOLFRAME_SUPERVISED` is set) starts it again.
+    Supervisor,
+    /// It stops, then runs its own binary again in the same process: the
+    /// same PID, arguments, environment and standard streams. For a
+    /// server started by hand.
+    InPlace,
 }
 
 /// The setup wizard's progress (P3-10): which steps are confirmed, by
@@ -2462,9 +2676,16 @@ pub trait AdminApi {
     #[method(name = "settingUnset", with_extensions)]
     async fn setting_unset(&self, key: String) -> jsonrpsee::core::RpcResult<SettingEntry>;
 
-    /// Stop the server so its supervisor starts it again, with the restart
-    /// settings applied. `NOT_CONFIGURED` where nothing would start it
-    /// again (`Settings::can_restart`).
+    /// Restart the server, with the restart settings applied, the way
+    /// `Settings::restart_mode` says. It answers first, then stops as for
+    /// SIGTERM: connections closed, playbacks and encodes ended, the
+    /// store closed. Under a supervisor it exits with 75 (EX_TEMPFAIL)
+    /// for the supervisor to start it again. Started by hand, it runs
+    /// its own binary again in place: the same PID, arguments,
+    /// environment and standard streams, so a pipe its log goes to keeps
+    /// receiving it. A failed exec is logged, and the process exits
+    /// non-zero. Connected devices drop for a few seconds either way.
+    /// Needs a recent sign-in: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "restart", with_extensions)]
     async fn restart(&self) -> jsonrpsee::core::RpcResult<()>;
 
@@ -2484,6 +2705,24 @@ pub trait AdminApi {
     /// about a second and a half.
     #[method(name = "plexDiscover", with_extensions)]
     async fn plex_discover(&self) -> jsonrpsee::core::RpcResult<Vec<DiscoveredPlex>>;
+
+    /// Ask the router now to map the server's port (P6-02), and give the
+    /// mapping back when it answers: what `mode = "auto"` would get, for
+    /// the wizard to show before it is chosen. `Asking` if the router has
+    /// not answered within about half a minute. `NOT_CONFIGURED` while the
+    /// endpoint is starting.
+    #[method(name = "wanTryMapping", with_extensions)]
+    async fn wan_try_mapping(&self) -> jsonrpsee::core::RpcResult<MappingStatus>;
+
+    /// Ask wtfismyip for this network's public IPv4 address now (P6-02).
+    /// `UNAVAILABLE`, with why, when it does not answer with a public one.
+    #[method(name = "wanLookup", with_extensions)]
+    async fn wan_lookup(&self) -> jsonrpsee::core::RpcResult<String>;
+
+    /// This host's stable global IPv6 addresses now (P6-02), what
+    /// `host_ipv6` would advertise.
+    #[method(name = "wanHostIpv6", with_extensions)]
+    async fn wan_host_ipv6(&self) -> jsonrpsee::core::RpcResult<Vec<String>>;
 
     /// The PMS at `url` as `plexStatus` would show it, without saving
     /// anything: with `token`, or else the one the caller's linked Plex
@@ -2813,6 +3052,11 @@ mod required_field_tests {
                 mdns: false,
                 addresses: Vec::new(),
                 told_addresses: Vec::new(),
+                wan: false,
+                public_addresses: Vec::new(),
+                public_notes: Vec::new(),
+                wan_mapping: MappingStatus::NotUsed,
+                wan_lookup: LookupStatus::NotUsed,
                 ocr_languages: Vec::new(),
                 web_urls: Vec::new(),
                 preview_workers_default: DefaultWorkers {

@@ -664,3 +664,176 @@ async fn a_rate_limited_app_sign_in_is_logged() {
     tv.close().await;
     server.stop().await;
 }
+
+// Refused Hellos. An app of another protocol revision, or one that sends
+// a Hello the server cannot read, used to leave no line at all: only a
+// connect and a disconnect, the same as a working app's.
+
+/// A Hello of protocol revision `revision`.
+fn hello_of(revision: u32) -> Request {
+    Request::Hello(spoolframe_protocol::Hello {
+        protocol_version: revision,
+        client_name: "spoolframe-ios".into(),
+        client_version: "1.2.3".into(),
+        platform: spoolframe_types::Platform::Ios,
+        device_name: Some("what the app says".into()),
+        capabilities: None,
+    })
+}
+
+/// The refused-Hello lines so far, not the counts of those left out.
+fn hellos(capture: &LogCapture) -> Vec<Logged> {
+    capture
+        .refused()
+        .into_iter()
+        .filter(|line| line.field("message") == Some("hello refused"))
+        .collect()
+}
+
+async fn refused_hello(client: &TestClient, revision: u32) {
+    let response = client.call(None, hello_of(revision)).await;
+    assert!(
+        matches!(response, Response::Err(Error::Unsupported { .. })),
+        "{response:?}"
+    );
+}
+
+const SERVER_PROTOCOL: u32 = spoolframe_protocol::PROTOCOL_VERSION;
+
+#[tokio::test]
+async fn a_refused_hello_is_logged_once_an_hour_per_device() {
+    if !alone("refusals::a_refused_hello_is_logged_once_an_hour_per_device") {
+        return;
+    }
+    let server = TestServer::start("refused-hello").await;
+    let (capture, _guard) = LogCapture::start();
+    let phone = server.client().await;
+    let newer = SERVER_PROTOCOL + 1;
+    refused_hello(&phone, newer).await;
+    refused_hello(&phone, newer).await;
+    let lines = hellos(&capture);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    let line = &lines[0];
+    assert_eq!(line.level, tracing::Level::INFO);
+    let client_protocol = newer.to_string();
+    let server_protocol = SERVER_PROTOCOL.to_string();
+    assert_fields(
+        line,
+        &[
+            ("channel", "quic"),
+            ("request", "hello"),
+            ("source", &short(&phone)),
+            ("client_protocol", &client_protocol),
+            ("server_protocol", &server_protocol),
+            ("client", "spoolframe-ios 1.2.3"),
+            ("reason", "unsupported protocol revision"),
+        ],
+    );
+    // Only a device someone signed in from has a name the server keeps:
+    // what a refused Hello says is not taken.
+    assert_eq!(line.field("device"), None, "{line:#?}");
+
+    // Another device gets its own line.
+    let tablet = server.client().await;
+    refused_hello(&tablet, newer).await;
+    let lines = hellos(&capture);
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert_fields(&lines[1], &[("source", &short(&tablet))]);
+
+    // An hour on, the phone is logged again, after the count of the one
+    // left out.
+    server
+        .clock
+        .advance(std::time::Duration::from_secs(60 * 60));
+    refused_hello(&phone, newer).await;
+    assert_eq!(hellos(&capture).len(), 3);
+    let counts: Vec<Logged> = capture
+        .refused()
+        .into_iter()
+        .filter(|line| line.field("suppressed").is_some())
+        .collect();
+    assert_eq!(counts.len(), 1, "{counts:#?}");
+    assert_eq!(counts[0].level, tracing::Level::INFO);
+    assert_fields(
+        &counts[0],
+        &[
+            ("kind", "hello_refused"),
+            ("source", &short(&phone)),
+            ("suppressed", "1"),
+        ],
+    );
+    phone.close().await;
+    tablet.close().await;
+    server.stop().await;
+}
+
+/// A device someone signed in from is named as the server knows it.
+#[tokio::test]
+async fn a_refused_hello_names_a_known_device() {
+    if !alone("refusals::a_refused_hello_names_a_known_device") {
+        return;
+    }
+    let server = TestServer::start("refused-hello-known").await;
+    server.add_user("alice", ALICE_PASSWORD, None).await;
+    let ipad = server.client().await;
+    ipad.hello_as(Some("Kitchen iPad")).await;
+    ipad.login("alice", ALICE_PASSWORD).await;
+    let (capture, _guard) = LogCapture::start();
+    let older = SERVER_PROTOCOL - 1;
+    refused_hello(&ipad, older).await;
+    let lines = hellos(&capture);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    let client_protocol = older.to_string();
+    assert_fields(
+        &lines[0],
+        &[
+            ("device", "Kitchen iPad"),
+            ("client_protocol", &client_protocol),
+        ],
+    );
+    ipad.close().await;
+    server.stop().await;
+}
+
+/// A Hello the server cannot read is refused too, and says what of it
+/// could be read.
+#[tokio::test]
+async fn a_malformed_hello_is_logged() {
+    #[derive(serde::Serialize)]
+    struct Partial {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        protocol_version: u32,
+    }
+    #[derive(serde::Serialize)]
+    struct Envelope {
+        session: Option<String>,
+        request: Partial,
+    }
+    if !alone("refusals::a_malformed_hello_is_logged") {
+        return;
+    }
+    let server = TestServer::start("refused-hello-malformed").await;
+    let (capture, _guard) = LogCapture::start();
+    let phone = server.client().await;
+    let response = phone
+        .send(&Envelope {
+            session: None,
+            request: Partial {
+                kind: "hello",
+                protocol_version: 99,
+            },
+        })
+        .await;
+    assert!(
+        matches!(response, Response::Err(Error::Malformed { .. })),
+        "{response:?}"
+    );
+    let lines = hellos(&capture);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert_fields(&lines[0], &[("client_protocol", "99")]);
+    let reason = lines[0].field("reason").unwrap();
+    assert!(reason.starts_with("malformed: "), "{reason}");
+    phone.close().await;
+    server.stop().await;
+}

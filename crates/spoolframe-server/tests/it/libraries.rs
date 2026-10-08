@@ -213,7 +213,7 @@ impl Served {
                 catalog: live.clone(),
                 ..Live::default()
             },
-            false,
+            spoolframe_admin_api::RestartMode::InPlace,
         );
         let options = ServerOptions {
             catalog: Some(live),

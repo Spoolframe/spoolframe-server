@@ -1103,3 +1103,149 @@ async fn plex_sync_watch_reports_each_linked_user() {
     assert!(printed.contains("can't be reached"), "{printed}");
     drop(running);
 }
+
+/// A UDP port that was just free, for the endpoint to bind again after a
+/// restart.
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A server with no Plex, no mDNS and Plex's discovery on any port, its
+/// admin API and endpoint on ports of its own: the same ports after a
+/// restart. Its admin API's address too.
+async fn restart_config(name: &str) -> (spoolframe_test_dir::TestDir, std::path::PathBuf) {
+    let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-cli-{name}")).await;
+    let config = tmp.as_ref().join("server.ucl");
+    std::fs::write(
+        &config,
+        format!(
+            r#"name = "Restart test";
+            admin {{ listen = "127.0.0.1:{}"; }}
+            network {{ mdns = false; plex_discovery_port = 0; port = {}; }}"#,
+            free_port(),
+            free_udp_port(),
+        ),
+    )
+    .unwrap();
+    (tmp, config)
+}
+
+/// The first admin, set up with the code `log` printed, signed in now.
+async fn first_admin(config: &Path, log: &str) -> (jsonrpsee::ws_client::WsClient, String) {
+    use spoolframe_admin_api::AdminApiClient;
+    let addr = admin_addr(config);
+    let token = crate::admin::anonymous(addr)
+        .await
+        .setup(crate::admin::setup(
+            &setup_code(log),
+            "root",
+            "correct horse",
+        ))
+        .await
+        .unwrap()
+        .token;
+    (crate::admin::with_token(addr, &token).await, token)
+}
+
+/// The endpoint's "listening" line: the last of a start.
+fn started(line: &str) -> bool {
+    line.contains("listening") && line.contains("endpoint_id")
+}
+
+/// `line` without its colours.
+fn plain(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // CSI: up to and with the final letter.
+            chars.by_ref().find(char::is_ascii_alphabetic);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+impl Running {
+    /// The lines logged once `times` of them are `wanted`, waiting up to
+    /// 30 seconds.
+    fn lines_once(&self, wanted: fn(&str) -> bool, times: usize) -> Vec<String> {
+        for _ in 0..600 {
+            let lines: Vec<String> = self.log().lines().map(plain).collect();
+            if lines.iter().filter(|l| wanted(l)).count() >= times {
+                return lines;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("never logged it {times} times: {}", self.log());
+    }
+}
+
+/// Started by hand, with no supervisor, the server restarts in place: the
+/// same process, logging to the same pipe, starts again and answers on
+/// the same port, its sessions kept.
+#[tokio::test]
+async fn a_restart_without_a_supervisor_runs_the_server_again_in_place() {
+    use spoolframe_admin_api::{AdminApiClient, RestartMode};
+    let (_tmp, config) = restart_config("restart-in-place").await;
+    let (mut running, log) = Running::start(&config);
+    let pid = running.0.id();
+    let (root, token) = first_admin(&config, &log).await;
+    assert_eq!(
+        root.settings().await.unwrap().restart_mode,
+        RestartMode::InPlace
+    );
+    root.restart().await.unwrap();
+
+    // A fresh start, logged to the same pipe, by the same process.
+    let lines = running.lines_once(started, 2);
+    let log = lines.join("\n");
+    let starts: Vec<&String> = lines.iter().filter(|l| started(l)).collect();
+    assert_eq!(starts.len(), 2, "{log}");
+    for line in starts {
+        let field = format!("pid={pid}");
+        assert!(line.split_whitespace().any(|w| w == field), "{line}");
+    }
+    let config_loaded = lines.iter().filter(|l| l.contains("config loaded")).count();
+    assert_eq!(config_loaded, 2, "{log}");
+    assert!(log.contains("restarting in place"), "{log}");
+    assert!(running.0.try_wait().unwrap().is_none(), "{log}");
+
+    // The same port, and the session kept in the store.
+    let again = crate::admin::with_token(admin_addr(&config), &token).await;
+    assert_eq!(
+        again.settings().await.unwrap().restart_mode,
+        RestartMode::InPlace
+    );
+    running.stop_cleanly();
+}
+
+/// Under a supervisor, a restart is an exit with 75 (EX_TEMPFAIL), which
+/// systemd's Restart=on-failure starts again.
+#[tokio::test]
+async fn a_restart_under_a_supervisor_exits_for_it_to_start_the_server_again() {
+    use spoolframe_admin_api::{AdminApiClient, RestartMode};
+    let (_tmp, config) = restart_config("restart-supervised").await;
+    let (mut running, log) = Running::start_with(&config, &[("SPOOLFRAME_SUPERVISED", "test")]);
+    let (root, _) = first_admin(&config, &log).await;
+    assert_eq!(
+        root.settings().await.unwrap().restart_mode,
+        RestartMode::Supervisor
+    );
+    root.restart().await.unwrap();
+    let mut status = None;
+    for _ in 0..600 {
+        status = running.0.try_wait().unwrap();
+        if status.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let status = status.unwrap_or_else(|| panic!("still running: {}", running.log()));
+    assert_eq!(status.code(), Some(75), "{}", running.log());
+}

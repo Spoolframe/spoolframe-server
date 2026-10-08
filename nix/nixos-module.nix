@@ -34,6 +34,32 @@
   # 0.0.0.0): a proxy on this host may be in front, or may not.
   everywhere = listen: listen == null || lib.hasPrefix "0.0.0.0:" listen || matches "[[][0:]*:[0:]*[]]:[0-9]+" listen;
 
+  # `network.wan` (P6-02): absent unless set, and then each part as set.
+  wanConfig = let
+    mapped = cfg.wan.mappedPort;
+  in ''
+    wan {
+      static = [${lib.concatMapStringsSep ", " quote cfg.wan.static}];
+      ${
+      if mapped == null
+      then "mapped_port = false;"
+      else ''
+        mapped_port {
+          ${lib.optionalString (mapped.port != null) "port = ${toString mapped.port};"}
+          mode = ${quote mapped.mode};
+          public_ip = ${quote mapped.publicIp};
+          lookup_via = ${
+          if mapped.lookupVia == null
+          then "false"
+          else quote mapped.lookupVia
+        };
+        }
+      ''
+    }
+      host_ipv6 = ${lib.boolToString cfg.wan.hostIpv6};
+    }
+  '';
+
   # systemd hands the Plex token to the service as a credential, so the
   # secret file can stay root-only.
   tokenCredential = "/run/credentials/spoolframe.service/plex-token";
@@ -81,6 +107,7 @@
       port = ${toString cfg.port};
       mdns = ${lib.boolToString cfg.mdns};
       ${lib.optionalString cfg.plexDiscovery.enable "plex_discovery_port = ${toString cfg.plexDiscovery.port};"}
+      ${lib.optionalString (cfg.wan != null) wanConfig}
     }
     admin {
       ${lib.optionalString (cfg.admin.listen != null) "listen = ${quote cfg.admin.listen};"}
@@ -248,6 +275,73 @@ in {
           from a network of the interface it came in on.
         '';
       };
+    };
+
+    wan = lib.mkOption {
+      default = null;
+      example = lib.literalExpression ''{ static = ["203.0.113.7:7420"]; mappedPort = null; }'';
+      description = ''
+        The server's public addresses, the ones a device off the LAN dials
+        (`network.wan`). Null, the default: none is advertised, and devices
+        reach the server on the LAN. Set, the port mapping is on with its
+        defaults (ask the router, look the public IP up) unless
+        {option}`wan.mappedPort` is null. Each address is listed on the
+        status page with its source. Devices reach the server at
+        {option}`port`, UDP: open it on the interface the router forwards to
+        ({option}`openFirewall` opens it everywhere). The router's UPnP
+        answers to the server's search arrive from a multicast send the
+        firewall cannot match; NAT-PMP and PCP get through.
+      '';
+      type = lib.types.nullOr (lib.types.submodule {
+        options = {
+          static = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [];
+            example = ["203.0.113.7:7420" "[2001:db8::1]:7420"];
+            description = "Public addresses with their port, advertised as written. The forward is yours to set up.";
+          };
+          mappedPort = lib.mkOption {
+            default = {};
+            description = "One address made of the port forwarded on the router and the public IP; null for none.";
+            type = lib.types.nullOr (lib.types.submodule {
+              options = {
+                port = lib.mkOption {
+                  type = lib.types.nullOr lib.types.port;
+                  default = null;
+                  description = "The public port forwarded in manual mode; {option}`port` if null.";
+                };
+                mode = lib.mkOption {
+                  type = lib.types.enum ["auto" "manual"];
+                  default = "auto";
+                  description = ''
+                    "auto": the server asks the router (UPnP, NAT-PMP or PCP) to forward
+                    {option}`port` and renews it. "manual": you forwarded it.
+                  '';
+                };
+                publicIp = lib.mkOption {
+                  type = lib.types.str;
+                  default = "lookup";
+                  example = "203.0.113.7";
+                  description = ''
+                    This network's public IP address, or "lookup": asked of
+                    {option}`wan.mappedPort.lookupVia` once at start.
+                  '';
+                };
+                lookupVia = lib.mkOption {
+                  type = lib.types.nullOr (lib.types.enum ["wtfismyip"]);
+                  default = "wtfismyip";
+                  description = "Where \"lookup\" asks (https://ipv4.wtfismyip.com/text); null never asks.";
+                };
+              };
+            });
+          };
+          hostIpv6 = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = "Advertise this host's stable global IPv6 addresses on {option}`port`; never a temporary one.";
+          };
+        };
+      });
     };
 
     openFirewall = lib.mkOption {
@@ -510,6 +604,11 @@ in {
         assertion = cfg.admin.listen == null || parsed cfg.admin.listen;
         message = "services.spoolframe.admin.listen (${cfg.admin.listen}) must be an IP address and a port, such as 127.0.0.1:7421 or [::1]:7421: the server does not look up names.";
       }
+      # The server refuses this shape at load too (P6-02).
+      {
+        assertion = cfg.wan == null || cfg.wan.mappedPort == null || !(cfg.wan.mappedPort.publicIp == "lookup" && cfg.wan.mappedPort.lookupVia == null);
+        message = ''services.spoolframe.wan.mappedPort.publicIp is "lookup", but wan.mappedPort.lookupVia = null forbids looking the address up: set publicIp to this network's public address, or lookupVia to "wtfismyip".'';
+      }
       {
         assertion = cfg.auth.oidc == [] || cfg.admin.publicUrl != null;
         message = "services.spoolframe.auth.oidc needs services.spoolframe.admin.publicUrl: the provider sends the browser back to <publicUrl>/auth/oidc/callback.";
@@ -528,15 +627,21 @@ in {
       }
     ];
 
-    # Finding 58 (the third review's G-9): on every interface, a proxy on
-    # this host is as likely as browsers coming straight in, so the server
-    # warns at start rather than refuse, and so does the module.
-    warnings = lib.optional (everywhere cfg.admin.listen && cfg.admin.publicUrl != null && cfg.admin.trustedProxies == [] && !cfg.admin.notProxied) ''
-      services.spoolframe.admin.trustedProxies is empty, but admin.publicUrl is set and admin.listen is
-      on every interface: if a proxy on this host is in front, every caller through it looks like
-      loopback, so failed logins are not limited per caller, and /metrics, when on, answers whoever
-      the proxy lets in. Put admin.listen on loopback and set admin.trustedProxies = ["127.0.0.1"];
-      or, if nothing proxies to the listener, set admin.notProxied = true.'';
+    warnings =
+      # P6-02: the public addresses reach the server only through its port.
+      lib.optional (cfg.wan != null && !cfg.openFirewall) ''
+        services.spoolframe.wan is set but openFirewall is off: devices off the LAN reach the server at
+        UDP ${toString cfg.port}, so open it on the interface the router forwards to
+        (networking.firewall.interfaces.<name>.allowedUDPPorts).''
+      # Finding 58 (the third review's G-9): on every interface, a proxy on
+      # this host is as likely as browsers coming straight in, so the server
+      # warns at start rather than refuse, and so does the module.
+      ++ lib.optional (everywhere cfg.admin.listen && cfg.admin.publicUrl != null && cfg.admin.trustedProxies == [] && !cfg.admin.notProxied) ''
+        services.spoolframe.admin.trustedProxies is empty, but admin.publicUrl is set and admin.listen is
+        on every interface: if a proxy on this host is in front, every caller through it looks like
+        loopback, so failed logins are not limited per caller, and /metrics, when on, answers whoever
+        the proxy lets in. Put admin.listen on loopback and set admin.trustedProxies = ["127.0.0.1"];
+        or, if nothing proxies to the listener, set admin.notProxied = true.'';
 
     environment.etc."spoolframe/server.ucl".source = configFile;
     environment.systemPackages = [cli];
@@ -585,8 +690,10 @@ in {
           lib.optional (cfg.plex.tokenFile != null) "plex-token:${cfg.plex.tokenFile}"
           ++ lib.imap0 (i: p: "oidc-${toString i}:${p.clientSecretFile}") cfg.auth.oidc;
         # Also how the web UI's "Restart now" (P3-10) brings the server
-        # back: it exits with 75 when asked to restart, and offers it only
-        # where SPOOLFRAME_SUPERVISED says something will.
+        # back: with SPOOLFRAME_SUPERVISED it exits with 75 when asked to
+        # restart, for systemd to start it again. Without it, the server
+        # would run itself again in place, under a unit that no longer
+        # knows what it runs.
         Restart = "on-failure";
         Environment = ["SPOOLFRAME_SUPERVISED=systemd"];
         RestartSec = 2;

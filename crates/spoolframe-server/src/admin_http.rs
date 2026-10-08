@@ -321,6 +321,31 @@ impl TrustedProxies {
     }
 }
 
+/// How long a port that is taken is waited for. A server started again in
+/// place binds the port its old self has only just let go of; anything
+/// else that holds it still fails the start, only a few seconds later.
+const BIND_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Listen on `listen`, waiting up to `patience` while its port is taken.
+async fn bind(
+    listen: SocketAddr,
+    patience: std::time::Duration,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let until = tokio::time::Instant::now() + patience;
+    loop {
+        match tokio::net::TcpListener::bind(listen).await {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    && listen.port() != 0
+                    && tokio::time::Instant::now() < until =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            bound => return bound,
+        }
+    }
+}
+
 /// Serve `methods`, the `/auth` endpoints and the web UI's pages on
 /// `listen`.
 pub(crate) async fn serve(
@@ -330,7 +355,7 @@ pub(crate) async fn serve(
     origins: Origins,
     proxies: TrustedProxies,
 ) -> std::io::Result<(SocketAddr, ServerHandle)> {
-    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let listener = bind(listen, BIND_PATIENCE).await?;
     let addr = listener.local_addr()?;
     let (stop, handle) = stop_channel();
     let app = router(api, methods, stop.clone(), origins, proxies);
@@ -1407,5 +1432,32 @@ mod tests {
         // Live: the next sign-in reads it again.
         cookies.set_insecure(false);
         assert!(cookies.set("abc").to_str().unwrap().contains("Secure"));
+    }
+
+    /// A port still held as the server starts again in place is waited
+    /// for, briefly.
+    #[tokio::test]
+    async fn a_port_freed_soon_after_is_bound() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = held.local_addr().unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let listener = bind(addr, std::time::Duration::from_secs(5)).await.unwrap();
+        assert_eq!(listener.local_addr().unwrap(), addr);
+    }
+
+    /// One that stays taken is still refused, saying why.
+    #[tokio::test]
+    async fn a_port_that_stays_taken_is_refused() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let e = bind(
+            held.local_addr().unwrap(),
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
     }
 }

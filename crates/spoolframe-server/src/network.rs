@@ -79,6 +79,8 @@ pub struct EndpointOptions {
     pub admission: Admission,
     /// Which of its addresses a signed-in device is told (PX-12).
     pub announce: Announce,
+    /// Its public addresses (`network.wan`, P6-02); `None`: none.
+    pub wan: Option<crate::wan::Wan>,
 }
 
 /// What the server knows about who is on the other end of a connection.
@@ -160,6 +162,7 @@ impl Connections {
         let mut raised = Vec::new();
         for (id, peer) in self.lock().iter().filter(|(_, p)| &p.endpoint == endpoint) {
             peer.raise();
+            peer.note_signed_in();
             raised.push(*id);
         }
         raised
@@ -299,6 +302,8 @@ pub struct Services {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// The devices connected now and what they play (P3-15).
     pub connected: Arc<crate::connected::Connected>,
+    /// What finds the public addresses `network.wan` asks for (P6-02).
+    pub wan: crate::wan::Finders,
 }
 
 impl std::fmt::Debug for Services {
@@ -423,7 +428,11 @@ impl Server {
             ))
         });
         // Unknown ALPNs never get this far: the TLS handshake refuses them.
-        let told = Told::new(endpoint.clone(), options.announce.clone(), relays);
+        let public = crate::wan::Public::new(options.wan.as_ref());
+        if let Some(wan) = &options.wan {
+            crate::wan::start(&public, wan, &endpoint, &services.wan);
+        }
+        let told = Told::new(endpoint.clone(), options.announce.clone(), relays, public);
         let client = ClientProtocol::new(
             endpoint.clone(),
             told.clone(),

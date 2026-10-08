@@ -586,6 +586,11 @@ the events stream, without being asked (revision 7):
 `addrs` is the addresses on the server endpoint's interfaces that
 `network.announce` lets it tell, with their port: LAN, public and VPN
 addresses. Loopback, link-local and unspecified addresses are left out.
+After them come the server's public addresses (`network.wan`, P6-02),
+the ones a device off the LAN dials: written in the config, made of a
+port forwarded on the router and the network's public IP, or the host's
+own stable IPv6 addresses. The event does not say which address came
+from where; the admin status does.
 Each one is text, `192.168.1.10:4433` or `[2001:db8::1]:4433`, in CBOR as
 in JSON. `relays` is the URL of each iroh relay the server uses
 (`network.relay`); it is empty while relays are off, as they are by
@@ -604,7 +609,9 @@ The server pushes it to a connection:
   app opened again with a kept session, or a reconnect);
 - to every signed-in connection, when the addresses it would tell
   change. The server learns of a change when iroh sees the endpoint's
-  addresses change, as when an interface comes up or goes down.
+  addresses change, as when an interface comes up or goes down, and
+  when it finds a public address after start: the router maps the
+  port, the IP lookup answers, or the host's IPv6 addresses change.
 
 A connection with no live session is never pushed it. A device signed
 out is pushed nothing more, and its connections are closed with

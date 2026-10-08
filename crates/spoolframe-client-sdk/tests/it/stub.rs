@@ -46,6 +46,14 @@ struct State {
     events: Mutex<HashMap<usize, Arc<tokio::sync::Mutex<SendStream>>>>,
     /// What `ServerInfo` and `DeviceSignInStarted` give as the web UI.
     web_url: Mutex<Option<String>>,
+    /// Every connection accepted, to close them all at once.
+    open: Mutex<Vec<Connection>>,
+    /// `Hello` is refused as the server refuses another protocol revision.
+    refuse_hellos: AtomicBool,
+    /// The protocol revision `ServerInfo` says, when not this build's.
+    protocol: Mutex<Option<u32>>,
+    /// The server id `ServerInfo` says, when not the one made from the key.
+    server_id: Mutex<Option<String>>,
 }
 
 pub struct Stub {
@@ -108,6 +116,31 @@ impl Stub {
         for conn in self.state.connections.lock().iter() {
             conn.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Close every connection open now, as a server that restarted does.
+    /// New ones are taken.
+    pub fn close_open_connections(&self) {
+        for conn in self.state.open.lock().drain(..) {
+            conn.close(0u32.into(), b"restarting");
+        }
+    }
+
+    /// Refuse every `Hello` from now on, as a server refuses one of
+    /// another protocol revision.
+    pub fn refuse_hellos(&self) {
+        self.state.refuse_hellos.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer `Hello` with protocol revision `revision` from now on.
+    pub fn speak_protocol(&self, revision: u32) {
+        *self.state.protocol.lock() = Some(revision);
+    }
+
+    /// Answer `Hello` with server id `id` from now on: another server
+    /// under this one's key.
+    pub fn answer_as_server_id(&self, id: &str) {
+        *self.state.server_id.lock() = Some(id.to_owned());
     }
 
     /// Nothing is answered, on any connection, until [`Stub::thaw`].
@@ -200,6 +233,7 @@ impl Stub {
         let _ = self.task.await;
         self.endpoint.close().await;
         self.state.events.lock().clear();
+        self.state.open.lock().clear();
         drop(self.endpoint);
         drop(self.state);
         until_free(&bound).await;
@@ -232,6 +266,7 @@ async fn accept(endpoint: Endpoint, state: Arc<State>) {
             connections.push(dead.clone());
             connections.len() - 1
         };
+        state.open.lock().push(conn.clone());
         let id = endpoint.id();
         tokio::spawn(serve(conn, id, index, dead, state.clone()));
     }
@@ -368,16 +403,24 @@ fn answer(
 ) -> Response {
     let web_url = state.web_url.lock().clone();
     // Made from its key: two stubs are two servers (PX-14).
-    let server_id = spoolframe_protocol::ServerId::from_bytes(
-        id.as_bytes()[..10].try_into().expect("a key is 32 bytes"),
-    )
-    .to_string();
+    let server_id = state.server_id.lock().clone().unwrap_or_else(|| {
+        spoolframe_protocol::ServerId::from_bytes(
+            id.as_bytes()[..10].try_into().expect("a key is 32 bytes"),
+        )
+        .to_string()
+    });
     let reply = match envelope.request {
+        // What the server answers a Hello of another revision.
+        Request::Hello(_) if state.refuse_hellos.load(Ordering::SeqCst) => {
+            return Response::Err(Error::Unsupported {
+                request: "protocol revision; update the SDK".into(),
+            });
+        }
         Request::Hello(_) => Reply::ServerInfo(ServerInfo {
             name: "Stub".into(),
             endpoint_id: id.to_string(),
             server_id,
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: state.protocol.lock().unwrap_or(PROTOCOL_VERSION),
             server_version: "0".into(),
             auth_methods: vec![AuthMethod::Password],
             web_url,

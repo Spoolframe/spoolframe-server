@@ -230,6 +230,46 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
                 .await,
             ),
         ),
+        // Finding 61: where signed-in devices are told to connect, and
+        // so where they reveal their addresses. Each is taken out, then
+        // set, so a change that got through would still show after.
+        (
+            "settingUnset(network.wan)",
+            outcome(root.setting_unset("network.wan".into()).await),
+        ),
+        (
+            "settingSet(network.wan)",
+            outcome(
+                root.setting_set(
+                    "network.wan".into(),
+                    json!({ "static": ["203.0.113.7:7420"], "mapped_port": false }),
+                )
+                .await,
+            ),
+        ),
+        (
+            "settingUnset(network.announce.add)",
+            outcome(root.setting_unset("network.announce.add".into()).await),
+        ),
+        (
+            "settingSet(network.announce.add)",
+            outcome(
+                root.setting_set("network.announce.add".into(), json!(["203.0.113.7"]))
+                    .await,
+            ),
+        ),
+        (
+            "settingUnset(network.port)",
+            outcome(root.setting_unset("network.port".into()).await),
+        ),
+        (
+            "settingSet(network.port)",
+            outcome(root.setting_set("network.port".into(), json!(7421)).await),
+        ),
+        // Every device connected drops, and a server started by hand runs
+        // whatever binary is now at its path. Nothing in these tests
+        // starts it again: it is only asked for.
+        ("restart", outcome(root.restart().await)),
         // The first server added keeps a token set before it (the
         // wizard's), so adding it says where that token goes. Nothing
         // answers at port 1: a confirmed session is refused at once.
@@ -250,6 +290,7 @@ async fn an_old_admin_session_cannot_make_sensitive_changes() {
     let (_addr, root, dir) = served("recent-admin-old", FILE).await;
     root.user_add(user("bob", Role::Consumer)).await.unwrap();
     age(dir.as_ref(), "root").await;
+    let before = root.settings().await.unwrap();
 
     for (call, outcome) in sensitive(&root).await {
         assert_eq!(outcome, Some(error_code::RECENT_SIGN_IN_REQUIRED), "{call}");
@@ -265,6 +306,13 @@ async fn an_old_admin_session_cannot_make_sensitive_changes() {
     ] {
         let entry = settings.entries.iter().find(|e| e.key == key);
         assert!(entry.is_some_and(|e| !e.set), "{entry:?}");
+    }
+    // Some have defaults, so each is as it was.
+    for key in ["network.wan", "network.announce.add", "network.port"] {
+        let entry =
+            |s: &spoolframe_admin_api::Settings| s.entries.iter().find(|e| e.key == key).cloned();
+        assert!(entry(&before).is_some(), "{key}");
+        assert_eq!(entry(&settings), entry(&before), "{key}");
     }
     let users = root.user_list().await.unwrap();
     assert!(users.iter().all(|u| u.username != "carol"), "{users:?}");
@@ -342,6 +390,10 @@ async fn a_confirmed_admin_session_makes_sensitive_changes() {
 
     for (call, outcome) in sensitive(&root).await {
         assert_ne!(outcome, Some(error_code::RECENT_SIGN_IN_REQUIRED), "{call}");
+        // Nothing else stands in their way here: each is made.
+        if call.contains("(network.") {
+            assert_eq!(outcome, None, "{call}");
+        }
     }
     let users = root.user_list().await.unwrap();
     assert!(

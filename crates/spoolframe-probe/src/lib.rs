@@ -39,9 +39,16 @@
 //! the others too. Nothing it sends there changes more than those
 //! playbacks, unless a refusal fails and progress is taken.
 
+//!
+//! `--check-wan <addr>` ([`check_wan`], P6-02) is a mode of its own: it
+//! only dials the server at one public address and says whether it
+//! answered, for an operator checking a port forward from another
+//! network.
+
 mod account;
 mod checks;
 mod playback;
+pub mod wan;
 pub mod web;
 pub mod wire;
 
@@ -52,6 +59,7 @@ use serde::Serialize;
 
 use account::AccountState;
 pub use checks::Check;
+pub use wan::{WanCheck, check_wan, wan_summary};
 use wire::{Probe, Problem};
 
 /// What to probe and how hard.

@@ -66,6 +66,13 @@ pub struct Store {
 }
 
 impl Store {
+    /// Close every connection, once each is given back; SQLite
+    /// checkpoints the WAL as the last one closes. Every clone of the
+    /// store is closed with it: a call after this fails.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
     /// Open (creating if needed) the database in `state_dir` and apply the
     /// migrations it has not seen. Before migration 0012 (UUID user ids,
     /// P3-20) the database is copied to `spoolframe.db.pre-0012`; after

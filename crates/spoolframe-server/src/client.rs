@@ -261,6 +261,12 @@ impl ClientProtocol {
                 self.refused(&connection, Frame::Rpc(bytes, &name), error)
                     .await;
             }
+            // A frame that could not be read before any Hello was this
+            // device's Hello, as far as it can tell.
+            if name == "hello" || (request.is_err() && state.hello.get().is_none()) {
+                self.hello_refused(&connection, request.as_deref().ok(), error)
+                    .await;
+            }
         }
         let response = RpcResponse {
             server: self.instance(),
@@ -691,6 +697,7 @@ impl ClientProtocol {
         {
             Ok(Some(user)) => {
                 state.locks.lock().learn(&session, user.pin_required);
+                state.peer.note_signed_in();
                 Ok((session, user))
             }
             Ok(None) => Err(Error::Unauthenticated),
@@ -1086,7 +1093,7 @@ impl ClientProtocol {
             Kind::RecentSignInRequired => (kind, "sign-in too old for this change"),
             Kind::RateLimited => (kind, "rate-limited"),
             // Not among the protocol's errors above.
-            Kind::NoSession | Kind::Forbidden => return,
+            Kind::NoSession | Kind::Forbidden | Kind::HelloRefused => return,
         };
         refusals::log(&refusals::Refusal {
             kind,
@@ -1095,6 +1102,48 @@ impl ClientProtocol {
             source,
             user: asked.username.or(owner.map(|owner| owner.username)),
             reason: reason.to_owned(),
+        });
+    }
+
+    /// Log that a `Hello` (`frame`, if it could be read whole) was refused
+    /// with `error`, unless this device's was logged within the hour
+    /// ([`refusals::Refusals::hellos`]). The frame is read again, and the
+    /// device looked up, only then.
+    async fn hello_refused(&self, connection: &Connection, frame: Option<&[u8]>, error: &Error) {
+        let source = connection.remote_id().fmt_short().to_string();
+        if !self
+            .services
+            .auth
+            .refused_hellos()
+            .admit(&source, Kind::HelloRefused)
+        {
+            return;
+        }
+        let said = frame.map(SaidHello::of).unwrap_or_default();
+        let reason = match error {
+            Error::Unsupported { .. } => "unsupported protocol revision".to_owned(),
+            Error::Malformed { message } => format!("malformed: {}", refusals::bounded(message)),
+            other => refusals::bounded(&other.to_string()),
+        };
+        let device = match self
+            .store()
+            .device_name(&connection.remote_id().to_string())
+            .await
+        {
+            Ok(device) => device.map(|name| refusals::bounded(&name)),
+            Err(e) => {
+                tracing::debug!(error = %e, "cannot look the device's name up");
+                None
+            }
+        };
+        refusals::log_hello(&refusals::HelloRefusal {
+            source,
+            device,
+            client_protocol: said.protocol_version,
+            client: said.client(),
+            server_protocol: spoolframe_protocol::PROTOCOL_VERSION,
+            server_version: self.info.server_version.clone(),
+            reason,
         });
     }
 
@@ -2810,7 +2859,9 @@ impl ProtocolHandler for ClientProtocol {
             let _ = tokio::time::timeout(SHUTDOWN_NOTICE, connection.closed()).await;
             return Ok(());
         };
-        tracing::info!(?auth, known, "client connected");
+        // Every connection starts anonymous, and most that stay so are an
+        // app checking in: INFO is for the sign-in, and the disconnect.
+        tracing::debug!(?auth, known, "client connected");
         let state = Arc::new(ConnectionState {
             number: self.services.playbacks.connection_opened(),
             peer,
@@ -2834,7 +2885,12 @@ impl ProtocolHandler for ClientProtocol {
         self.connections.remove(id);
         self.services.connected.closed(id);
         self.services.playbacks.connection_closed(state.number);
-        tracing::info!(?auth, %reason, "client disconnected");
+        let signed_in = state.peer.was_signed_in();
+        if signed_in || !hung_up(&reason) {
+            tracing::info!(?auth, %reason, signed_in, "client disconnected");
+        } else {
+            tracing::debug!(?auth, %reason, signed_in, "client disconnected");
+        }
         self.end_playbacks_unless_back(connection.remote_id());
         Ok(())
     }
@@ -2859,6 +2915,18 @@ impl ProtocolHandler for ClientProtocol {
             });
         deliver(notices).await;
     }
+}
+
+/// Whether a connection ended as an app ends one that is done: closed by
+/// the app, with no error code. Anything else (an error code, a timeout,
+/// a reset, the server closing it for a sign-out or a shutdown) is worth
+/// INFO, signed in or not.
+fn hung_up(reason: &iroh::endpoint::ConnectionError) -> bool {
+    matches!(
+        reason,
+        iroh::endpoint::ConnectionError::ApplicationClosed(close)
+            if close.error_code == VarInt::from_u32(0)
+    )
 }
 
 /// Deliver every client's `ShuttingDown` notice, all at once, within
@@ -2984,6 +3052,44 @@ enum Frame<'a> {
     /// An RPC request's frame, and the type it was named by, bounded.
     Rpc(&'a [u8], &'a str),
     Resource(&'a [u8]),
+}
+
+/// What a refused `Hello` said of the device, as far as it could be read:
+/// a `Hello` from another protocol revision, or one missing a field, may
+/// not decode as this build's `Hello`, and still say these.
+#[derive(Debug, Default, serde::Deserialize)]
+struct SaidHello {
+    #[serde(default)]
+    protocol_version: Option<u32>,
+    #[serde(default)]
+    client_name: Option<String>,
+    #[serde(default)]
+    client_version: Option<String>,
+}
+
+impl SaidHello {
+    /// The `Hello` in an RPC frame, read leniently.
+    fn of(bytes: &[u8]) -> Self {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            envelope: Envelope,
+        }
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            request: SaidHello,
+        }
+        codec::decode::<Wire>(bytes)
+            .map(|wire| wire.envelope.request)
+            .unwrap_or_default()
+    }
+
+    /// `client_name client_version`, bounded, if it said both.
+    fn client(&self) -> Option<String> {
+        let (Some(name), Some(version)) = (&self.client_name, &self.client_version) else {
+            return None;
+        };
+        Some(refusals::bounded(&format!("{name} {version}")))
+    }
 }
 
 /// What a refused request asked, as far as the refused-request log needs
@@ -3557,6 +3663,26 @@ pub(crate) fn auth_methods() -> Vec<AuthMethod> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_app_closing_with_no_error_code_is_a_quiet_end() {
+        use iroh::endpoint::{ApplicationClose, ConnectionError};
+        let closed = |code: u32| {
+            ConnectionError::ApplicationClosed(ApplicationClose {
+                error_code: VarInt::from_u32(code),
+                reason: Default::default(),
+            })
+        };
+        assert!(hung_up(&closed(0)));
+        for reason in [
+            closed(1),
+            ConnectionError::LocallyClosed,
+            ConnectionError::TimedOut,
+            ConnectionError::Reset,
+        ] {
+            assert!(!hung_up(&reason), "{reason}");
+        }
+    }
     use crate::plex_accounts::AccountLink;
 
     /// C-13: shutdown notices went to clients one at a time, each given

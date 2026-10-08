@@ -457,3 +457,72 @@ async fn a_server_that_holds_more_strangers_fails_the_cap_check() {
     assert_eq!(report.count(Status::Fail), 1, "{summary}");
     server.stop().await;
 }
+
+/// `--check-wan` (P6-02), in-process: through an address that reaches the
+/// server it says so, with the server's name. Run for real from another
+/// network, against the advertised public address.
+#[tokio::test]
+async fn check_wan_reaches_the_server_through_the_address_given() {
+    let server = TestServer::start_with(
+        support::fresh_dir("probe-check-wan").await,
+        ServerOptions::default(),
+    )
+    .await;
+    let addr = *server
+        .server
+        .addr()
+        .ip_addrs()
+        .find(|a| a.is_ipv4())
+        .expect("an IPv4 address");
+    let addr = std::net::SocketAddr::new([127, 0, 0, 1].into(), addr.port());
+    let check = spoolframe_probe::check_wan(server.server.id(), addr, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(check.reachable, "{check:?}");
+    assert_eq!(check.server.unwrap().name, "Home Media");
+    assert_eq!(check.addr, addr.to_string());
+    server.stop().await;
+}
+
+/// Through an address nothing answers at, or that another key answers
+/// at, the check fails and says why.
+#[tokio::test]
+async fn check_wan_fails_where_the_server_is_not() {
+    let server = TestServer::start_with(
+        support::fresh_dir("probe-check-wan-not").await,
+        ServerOptions::default(),
+    )
+    .await;
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let nowhere = silent.local_addr().unwrap();
+    let check =
+        spoolframe_probe::check_wan(server.server.id(), nowhere, Duration::from_millis(500))
+            .await
+            .unwrap();
+    assert!(!check.reachable, "{check:?}");
+    assert!(check.error.is_some(), "{check:?}");
+    assert!(
+        spoolframe_probe::wan_summary(&check).starts_with("check-wan: FAIL"),
+        "{}",
+        spoolframe_probe::wan_summary(&check)
+    );
+
+    let port = server
+        .server
+        .addr()
+        .ip_addrs()
+        .find(|a| a.is_ipv4())
+        .expect("an IPv4 address")
+        .port();
+    let other = iroh::SecretKey::generate().public();
+    let check = spoolframe_probe::check_wan(
+        other,
+        std::net::SocketAddr::new([127, 0, 0, 1].into(), port),
+        Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
+    assert!(!check.reachable, "another key answers there: {check:?}");
+    drop(silent);
+    server.stop().await;
+}

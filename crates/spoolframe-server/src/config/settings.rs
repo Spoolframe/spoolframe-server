@@ -70,6 +70,10 @@ pub const SETTINGS: &[Setting] = &[
     restart("network.announce.ignore"),
     restart("network.announce.ignore_interfaces"),
     restart("network.announce.interfaces"),
+    // One setting, the whole table: present or absent is what it means,
+    // and its parts are checked together (`public_ip` against
+    // `lookup_via`), so the web UI sets it whole.
+    restart("network.wan"),
     restart("admin.listen"),
     restart("admin.public_url"),
     restart("admin.trusted_proxies"),

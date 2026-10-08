@@ -34,6 +34,7 @@ use spoolframe_admin_api::{
 use spoolframe_admin_api::{
     AudioPick, SsoLink, SubtitlePick, TrackOverrideEntry, TrackPreferences, TrackPreferencesInfo,
 };
+use spoolframe_admin_api::{LookupStatus, MappingStatus};
 use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
 
@@ -319,10 +320,84 @@ impl StatusSource {
             told_addresses: self.told.get().map_or_else(Vec::new, |told| {
                 told.addrs().iter().map(ToString::to_string).collect()
             }),
+            wan: self
+                .told
+                .get()
+                .is_some_and(|told| told.public().configured()),
+            public_addresses: self.told.get().map_or_else(Vec::new, |told| {
+                told.public()
+                    .addrs()
+                    .into_iter()
+                    .map(|found| spoolframe_admin_api::PublicAddress {
+                        address: found.addr.to_string(),
+                        source: match found.source {
+                            crate::wan::Source::Static => {
+                                spoolframe_admin_api::AddressSource::Static
+                            }
+                            crate::wan::Source::MappedPort => {
+                                spoolframe_admin_api::AddressSource::MappedPort
+                            }
+                            crate::wan::Source::Lookup => {
+                                spoolframe_admin_api::AddressSource::Lookup
+                            }
+                            crate::wan::Source::HostIpv6 => {
+                                spoolframe_admin_api::AddressSource::HostIpv6
+                            }
+                        },
+                    })
+                    .collect()
+            }),
+            public_notes: self
+                .told
+                .get()
+                .map_or_else(Vec::new, |told| told.public().notes()),
+            wan_mapping: mapping_status(
+                self.told
+                    .get()
+                    .and_then(|told| told.public().mapping())
+                    .as_ref(),
+            ),
+            wan_lookup: self.told.get().map_or(LookupStatus::NotUsed, |told| {
+                lookup_status(told.public().lookup())
+            }),
             ocr_languages: self.ocr_languages.clone(),
             web_urls: self.web_urls.get().cloned().unwrap_or_default(),
             preview_workers_default: preview_workers_default(),
         }
+    }
+}
+
+/// The router's answer about the mapped port as the admin API says it.
+fn mapping_status(mapping: Option<&(u16, crate::wan::Mapping)>) -> MappingStatus {
+    use crate::wan::Mapping;
+    match mapping {
+        None => MappingStatus::NotUsed,
+        Some((_, Mapping::Asking)) => MappingStatus::Asking,
+        Some((port, Mapping::Granted(external))) => MappingStatus::Granted {
+            local_port: *port,
+            external: external.to_string(),
+        },
+        Some((_, Mapping::Refused(reason))) => MappingStatus::Refused {
+            reason: reason.clone(),
+        },
+    }
+}
+
+/// The public IP lookup as the admin API says it.
+fn lookup_status(lookup: crate::wan::LookupState) -> LookupStatus {
+    use crate::wan::LookupState;
+    match lookup {
+        LookupState::NotUsed => LookupStatus::NotUsed,
+        LookupState::NotNeeded => LookupStatus::NotNeeded,
+        LookupState::Asking => LookupStatus::Asking,
+        LookupState::Found { ip, via, at } => LookupStatus::Found {
+            ip: ip.to_string(),
+            via: via.name().to_owned(),
+            at: at
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        },
+        LookupState::Failed { error, retrying } => LookupStatus::Failed { error, retrying },
     }
 }
 
@@ -378,6 +453,9 @@ pub struct Wizard {
     pub gdm: Vec<SocketAddr>,
     /// `None`: [`spoolframe_plex::paths::usual_bases`].
     pub path_bases: Option<Vec<std::path::PathBuf>>,
+    /// The router, the IP lookup and the host's interfaces, for trying
+    /// `network.wan` before it is chosen (P6-02).
+    pub wan: crate::wan::Finders,
 }
 
 impl Default for Wizard {
@@ -391,6 +469,7 @@ impl Default for Wizard {
                 .expect("a fixed URL"),
             gdm: spoolframe_plex::gdm::TARGETS.to_vec(),
             path_bases: None,
+            wan: crate::wan::Finders::system(),
         }
     }
 }
@@ -764,6 +843,8 @@ impl AdminApi {
                 _ => "wrong device sign-in code",
             },
             Kind::ProfileLocked => "profile locked",
+            // Only the client protocol has a Hello.
+            Kind::HelloRefused => return,
         };
         crate::refusals::log(&Refusal {
             kind,
@@ -910,7 +991,6 @@ impl From<ChangeError> for ErrorObjectOwned {
             ChangeError::Setting(_) | ChangeError::Secret { .. } => {
                 error(error_code::INVALID_INPUT, e.to_string())
             }
-            ChangeError::NotSupervised => error(error_code::NOT_CONFIGURED, e.to_string()),
             ChangeError::Write(_) => internal(e),
         }
     }
@@ -1106,10 +1186,16 @@ fn recent(user: &ApiSessionUser) -> RpcResult<()> {
 /// the OTLP export (`telemetry.*`, finding 56): its endpoint receives
 /// every span, metric and log record, refusal lines with usernames
 /// among them, and its headers are a secret sent with each export.
+/// And the network (`network.*`, finding 61): the endpoint's port and
+/// relay, the addresses it announces and its public ones (`network.wan`,
+/// P6-02) are where signed-in devices are told to connect. Pinning keeps
+/// another host from passing for this server, but a device still
+/// connects out to an address it is given and so shows where it is.
 fn sensitive_setting(key: &str) -> bool {
     key.starts_with("admin.")
         || key.starts_with("auth.")
         || key.starts_with("media.")
+        || key.starts_with("network.")
         || key.starts_with("telemetry.")
         || [PLEX_TOKEN, "plex.token_file", "plex.url", "plex.servers"].contains(&key)
 }
@@ -2703,8 +2789,11 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn restart(&self, ext: &Extensions) -> RpcResult<()> {
-        let (settings, by) = self.settings_as_admin(ext).await?;
-        Ok(settings.restart(&by)?)
+        // Every device connected drops, and a server started by hand runs
+        // whatever binary is at its path now.
+        let (settings, by) = self.settings_as_recent_admin(ext, true).await?;
+        settings.restart(&by);
+        Ok(())
     }
 
     async fn setup_state(&self, ext: &Extensions) -> RpcResult<SetupState> {
@@ -2750,6 +2839,39 @@ impl AdminApiServer for AdminApi {
                 version: f.version,
                 machine_id: f.machine_id,
             })
+            .collect())
+    }
+
+    async fn wan_try_mapping(&self, ext: &Extensions) -> RpcResult<MappingStatus> {
+        self.admin(ext).await?;
+        let port = self
+            .status
+            .told
+            .get()
+            .and_then(crate::announce::Told::own_port)
+            .and_then(std::num::NonZeroU16::new)
+            .ok_or_else(|| error(error_code::NOT_CONFIGURED, "the endpoint is starting"))?;
+        let mapping = crate::wan::try_mapping(&*self.wizard.wan.mapper, port).await;
+        Ok(mapping_status(Some(&(port.get(), mapping))))
+    }
+
+    async fn wan_lookup(&self, ext: &Extensions) -> RpcResult<String> {
+        self.admin(ext).await?;
+        self.wizard
+            .wan
+            .lookup
+            .once(crate::wan::LookupVia::Wtfismyip)
+            .await
+            .map(|ip| ip.to_string())
+            .map_err(|e| error(error_code::UNAVAILABLE, e))
+    }
+
+    async fn wan_host_ipv6(&self, ext: &Extensions) -> RpcResult<Vec<String>> {
+        self.admin(ext).await?;
+        let interfaces = self.wizard.wan.host.interfaces().await;
+        Ok(crate::wan::stable_global_ipv6(&interfaces)
+            .iter()
+            .map(ToString::to_string)
             .collect())
     }
 

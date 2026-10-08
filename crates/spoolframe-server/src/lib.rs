@@ -48,5 +48,6 @@ pub mod test_support;
 pub mod tls;
 pub mod tracks;
 pub mod transcode;
+pub mod wan;
 pub mod watch;
 mod web;

@@ -27,6 +27,10 @@ mod plex_sync;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod preferences;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod remote;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod restart;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod setup;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod sso;

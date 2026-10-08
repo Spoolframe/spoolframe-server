@@ -133,6 +133,44 @@ network {
     # ["enp*", "wg0"]. Naming a virtual one tells it: ["enp*", "docker0"].
     interfaces = [];
   }
+  # The server's public addresses: the ones a device off the LAN dials.
+  # Left out, as here, none is advertised, and devices reach the server
+  # on the LAN. Present, each part below adds addresses to what a
+  # signed-in device is told, and the status page lists each one with
+  # where it came from. Only public addresses: a private, loopback,
+  # link-local, carrier-grade NAT (100.64.0.0/10) or unique local one is
+  # refused. Nothing here waits at start: a router that refuses, or a
+  # lookup that fails, is one line in the log and a note on the status
+  # page. A change applies at the next start.
+  # wan {
+  #   # Public addresses with their port, told as written. The forward is
+  #   # yours to set up: ["203.0.113.7:7420", "[2001:db8::1]:7420"].
+  #   static = [];
+  #   # One address made of the port forwarded on the router and this
+  #   # network's public IP. On, with these defaults, whenever `wan` is
+  #   # present; `mapped_port = false;` turns it off.
+  #   mapped_port {
+  #     # "auto": the server asks the router to forward its own port
+  #     # (UPnP, NAT-PMP or PCP) and renews it; the address and port the
+  #     # router reports are told. "manual": you forwarded the port.
+  #     mode = "auto";
+  #     # The public port forwarded in "manual" mode; network.port if left
+  #     # out.
+  #     # port = 7420;
+  #     # This network's public IP, or "lookup": asked of `lookup_via`
+  #     # once at start. In "auto" mode it is used only when the router
+  #     # reports an address that is not a public one (a router behind
+  #     # carrier-grade NAT).
+  #     public_ip = "lookup";
+  #     # Where "lookup" asks: "wtfismyip" (https://ipv4.wtfismyip.com/text),
+  #     # or false: never ask, and public_ip must be an address.
+  #     lookup_via = "wtfismyip";
+  #   }
+  #   # Tell this host's stable global IPv6 addresses, on the server's
+  #   # port: no forward is needed, only the router's and the host's
+  #   # firewalls. Never a temporary (privacy) address.
+  #   host_ipv6 = false;
+  # }
 }
 
 # The admin API (JSON-RPC over WebSocket) and the web UI.

@@ -220,6 +220,9 @@
   .m-0 {
     margin: 0px;
   }
+  .-mt-1\.5 {
+    margin-top: calc(var(--spacing) * -1.5);
+  }
   .mt-0\.5 {
     margin-top: calc(var(--spacing) * 0.5);
   }
@@ -228,6 +231,9 @@
   }
   .mt-2 {
     margin-top: calc(var(--spacing) * 2);
+  }
+  .mt-\[22px\] {
+    margin-top: 22px;
   }
   .mt-auto {
     margin-top: auto;
@@ -477,6 +483,13 @@
   .rounded-\[10px\] {
     border-radius: 10px;
   }
+  .border-t {
+    border-top-style: var(--tw-border-style);
+    border-top-width: 1px;
+  }
+  .border-ctp-surface0 {
+    border-color: var(--ctp-surface0);
+  }
   .bg-ctp-base {
     background-color: var(--ctp-base);
   }
@@ -528,6 +541,12 @@
   .pt-3\.5 {
     padding-top: calc(var(--spacing) * 3.5);
   }
+  .pt-\[18px\] {
+    padding-top: 18px;
+  }
+  .pl-4 {
+    padding-left: calc(var(--spacing) * 4);
+  }
   .text-center {
     text-align: center;
   }
@@ -568,6 +587,9 @@
   }
   .text-\[17px\] {
     font-size: 17px;
+  }
+  .text-\[19px\] {
+    font-size: 19px;
   }
   .text-\[22px\] {
     font-size: 22px;
@@ -4436,6 +4458,168 @@
   .dbg-row:first-child {
     border-top: 0;
   }
+  .wan-card {
+    padding: 16px 22px 8px;
+    display: flex;
+    flex-direction: column;
+  }
+  .wan-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 10px;
+  }
+  .wan-card-head h2 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 700;
+  }
+  .wan-addr {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 0;
+    border-top: 1px solid var(--ctp-surface0);
+    flex-wrap: wrap;
+  }
+  .wan-addr .mono-value {
+    min-width: 230px;
+    font-size: 14px;
+  }
+  .wan-addr-why {
+    font-size: 12px;
+    color: var(--ctp-subtext0);
+    flex: 1 1 220px;
+  }
+  .wan-row {
+    display: grid;
+    grid-template-columns: 150px 1fr;
+    gap: 12px;
+    align-items: start;
+    padding: 10px 0;
+    border-top: 1px solid var(--ctp-surface0);
+  }
+  .wan-row-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ctp-subtext0);
+  }
+  .wan-row-value {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 13px;
+  }
+  .wan-row-value small {
+    font-size: 12px;
+    color: var(--ctp-subtext0);
+  }
+  .wan-good {
+    color: var(--ctp-green);
+    font-weight: 600;
+  }
+  .wan-bad {
+    color: var(--ctp-peach);
+    font-weight: 600;
+  }
+  .wan-quiet {
+    color: var(--ctp-subtext0);
+  }
+  .src-badge {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+    white-space: nowrap;
+  }
+  .src-static {
+    color: var(--ctp-blue);
+  }
+  .src-mapped {
+    color: var(--ctp-teal);
+  }
+  .src-lookup {
+    color: var(--ctp-mauve);
+  }
+  .src-ipv6 {
+    color: var(--ctp-peach);
+  }
+  .wan-part {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px 0;
+    border-top: 1px solid var(--ctp-surface0);
+  }
+  .wan-part:first-child {
+    border-top: 0;
+  }
+  .wan-part-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+  }
+  .wan-part-head > span {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .wan-part-head > span > span {
+    font-size: 13px;
+    color: var(--ctp-subtext0);
+    line-height: 1.45;
+    max-width: 560px;
+  }
+  .wan-fields {
+    display: grid;
+    grid-template-columns: 160px 1fr;
+    gap: 14px;
+    align-items: start;
+  }
+  .wan-statics {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .wan-static {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: var(--ctp-base);
+    border: 1px solid var(--ctp-surface0);
+  }
+  .wan-add {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+  }
+  .wan-add .field {
+    flex-grow: 1;
+  }
+  @media (max-width: 767px) {
+    .wan-card, .wan-part {
+      padding-left: 0;
+      padding-right: 0;
+    }
+    .wan-addr {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+    }
+    .wan-addr .mono-value {
+      min-width: 0;
+    }
+    .wan-row, .wan-fields {
+      grid-template-columns: 1fr;
+      gap: 4px;
+    }
+  }
 }
 @property --tw-rotate-x {
   syntax: "*";
@@ -4456,6 +4640,11 @@
 @property --tw-skew-y {
   syntax: "*";
   inherits: false;
+}
+@property --tw-border-style {
+  syntax: "*";
+  inherits: false;
+  initial-value: solid;
 }
 @property --tw-leading {
   syntax: "*";
@@ -4605,6 +4794,7 @@
       --tw-rotate-z: initial;
       --tw-skew-x: initial;
       --tw-skew-y: initial;
+      --tw-border-style: solid;
       --tw-leading: initial;
       --tw-font-weight: initial;
       --tw-tracking: initial;

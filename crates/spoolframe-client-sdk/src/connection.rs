@@ -149,14 +149,22 @@ impl ServerConnection {
             Response::Ok(other) => {
                 return Err(SdkError::Protocol(format!("Hello answered with {other:?}")));
             }
+            // The one `Hello` a server refuses is one of a revision it does
+            // not speak; it does not say its own.
+            Response::Err(spoolframe_protocol::Error::Unsupported { .. }) => {
+                conn.close(0u32.into(), b"wrong protocol revision");
+                return Err(SdkError::UpdateRequired {
+                    server_protocol: None,
+                });
+            }
             Response::Err(e) => return Err(SdkError::from_server(e)),
         };
         info.web_url = crate::client::web_page(info.web_url.take());
         if info.protocol_version != PROTOCOL_VERSION {
             conn.close(0u32.into(), b"wrong protocol revision");
-            return Err(SdkError::Protocol(
-                "server and SDK protocol revisions differ".into(),
-            ));
+            return Err(SdkError::UpdateRequired {
+                server_protocol: Some(info.protocol_version),
+            });
         }
         // Iroh has proven the key; the server must also say it is that key,
         // or its name and the pin would disagree.

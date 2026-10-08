@@ -287,6 +287,16 @@ impl LogCapture {
             .collect()
     }
 
+    /// Every event so far, with a message: lines, not spans.
+    pub fn saying_anything(&self) -> Vec<Logged> {
+        self.0
+            .lock()
+            .iter()
+            .filter(|line| line.field("message").is_some())
+            .cloned()
+            .collect()
+    }
+
     pub fn clear(&self) {
         self.0.lock().clear();
     }
@@ -411,6 +421,12 @@ pub struct ServerOptions {
     /// Which addresses a signed-in device is told (PX-12): all of them,
     /// unless a test is about the filter.
     pub announce: spoolframe_server::announce::Announce,
+    /// The public addresses (`network.wan`, P6-02): none unless a test is
+    /// about them.
+    pub wan: Option<spoolframe_server::wan::Wan>,
+    /// What finds them: stand-ins, which never reach a router or the
+    /// Internet.
+    pub finders: spoolframe_server::wan::Finders,
 }
 
 impl Default for ServerOptions {
@@ -445,7 +461,91 @@ impl Default for ServerOptions {
             admission: spoolframe_server::admission::Admission::default(),
             stranger_attempts: spoolframe_server::auth::STRANGER_ATTEMPTS,
             announce: spoolframe_server::announce::Announce::default(),
+            wan: None,
+            finders: offline_finders(),
         }
+    }
+}
+
+/// A host with these interfaces, as `network.wan.host_ipv6` reads them;
+/// a test changes them with [`FakeHost::set`].
+#[derive(Debug, Default)]
+pub struct FakeHost(parking_lot::Mutex<Vec<spoolframe_server::wan::HostInterface>>);
+
+impl FakeHost {
+    pub fn new(interfaces: Vec<spoolframe_server::wan::HostInterface>) -> Arc<Self> {
+        Arc::new(Self(parking_lot::Mutex::new(interfaces)))
+    }
+
+    pub fn set(&self, interfaces: Vec<spoolframe_server::wan::HostInterface>) {
+        *self.0.lock() = interfaces;
+    }
+}
+
+#[async_trait::async_trait]
+impl spoolframe_server::wan::HostAddresses for FakeHost {
+    async fn interfaces(&self) -> Vec<spoolframe_server::wan::HostInterface> {
+        self.0.lock().clone()
+    }
+}
+
+/// An IP lookup that asks `url` instead of wtfismyip, once, or again
+/// after each of `backoff`.
+pub fn lookup_at(url: &str, backoff: &[Duration]) -> spoolframe_server::wan::Lookup {
+    spoolframe_server::wan::Lookup {
+        client: reqwest::Client::new(),
+        wtfismyip: url.parse().unwrap(),
+        timeout: Duration::from_secs(5),
+        backoff: backoff.to_vec(),
+    }
+}
+
+/// A router that answers as a test says: [`FakeRouter::answer`] sets what
+/// it says about every port it was asked to map.
+#[derive(Debug)]
+pub struct FakeRouter {
+    answer: tokio::sync::watch::Sender<spoolframe_server::wan::Mapping>,
+    asked: parking_lot::Mutex<Vec<u16>>,
+}
+
+impl FakeRouter {
+    /// One that has not answered yet.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            answer: tokio::sync::watch::Sender::new(spoolframe_server::wan::Mapping::Asking),
+            asked: parking_lot::Mutex::default(),
+        })
+    }
+
+    pub fn answer(&self, mapping: spoolframe_server::wan::Mapping) {
+        self.answer.send_replace(mapping);
+    }
+
+    /// The local ports it was asked to map.
+    pub fn asked(&self) -> Vec<u16> {
+        self.asked.lock().clone()
+    }
+}
+
+impl spoolframe_server::wan::PortMapper for FakeRouter {
+    fn map(
+        &self,
+        local_port: std::num::NonZeroU16,
+    ) -> tokio::sync::watch::Receiver<spoolframe_server::wan::Mapping> {
+        self.asked.lock().push(local_port.get());
+        self.answer.subscribe()
+    }
+}
+
+/// Finders that find nothing and reach nothing: a host with no
+/// interfaces, a lookup at a port nothing listens on (discard), and a
+/// router that never answers.
+pub fn offline_finders() -> spoolframe_server::wan::Finders {
+    spoolframe_server::wan::Finders {
+        host: FakeHost::new(Vec::new()),
+        host_recheck: Duration::from_millis(50),
+        lookup: lookup_at("http://127.0.0.1:9/text", &[]),
+        mapper: FakeRouter::new(),
     }
 }
 
@@ -645,6 +745,7 @@ impl TestServer {
             ),
             metrics: metrics.clone(),
             connected: Arc::default(),
+            wan: options.finders.clone(),
         };
         let debug = Arc::new(spoolframe_server::playback_debug::PlaybackDebug {
             playbacks: services.playbacks.clone(),
@@ -661,6 +762,7 @@ impl TestServer {
             mdns: options.mdns,
             admission: options.admission,
             announce: options.announce.clone(),
+            wan: options.wan.clone(),
         };
         let name = ServerName::new(options.name.clone());
         let server = Server::start(key, &endpoint, &name, services)

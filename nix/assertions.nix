@@ -42,6 +42,12 @@
   unparsed = admin: lib.any (lib.hasInfix "admin.listen (") (failed admin);
   accepted = admin: failed admin == [];
   check = what: ok: lib.assertMsg ok "spoolframe module assertions: ${what}";
+  # P6-02: the module's failed assertions and warnings with `wan` set.
+  wanFailed = wan: map (a: a.message) (lib.filter (a: !a.assertion && lib.hasPrefix "services.spoolframe" a.message) (evaluatedWith {inherit wan;}).config.assertions);
+  wanRefused = wan: lib.any (lib.hasInfix "wan.mappedPort.publicIp") (wanFailed wan);
+  wanWarned = settings: lib.any (w: lib.hasInfix "services.spoolframe.wan is set but openFirewall is off" w) (evaluatedWith settings).config.warnings;
+  # The UCL the module writes for the server.
+  rendered = settings: (evaluatedWith settings).config.environment.etc."spoolframe/server.ucl".source.text;
   publicUrl = "https://media.example.org";
 in
   assert check "an unnamed proxy in front of a loopback listener is refused" (refused {inherit publicUrl;});
@@ -115,6 +121,41 @@ in
     listen = "0.0.0.0:7421";
   });
   assert check "the defaults are accepted" (accepted {});
+  assert check "a lookup with lookups forbidden is refused" (wanRefused {mappedPort.lookupVia = null;});
+  assert check "a written public IP without lookups is accepted" (!wanRefused {
+    mappedPort = {
+      publicIp = "203.0.113.7";
+      lookupVia = null;
+    };
+  });
+  assert check "the defaults with wan set are accepted" (wanFailed {} == []);
+  assert check "wan without openFirewall is warned of" (wanWarned {wan = {};});
+  assert check "wan with openFirewall is not warned of" (!wanWarned {
+    wan = {};
+    openFirewall = true;
+  });
+  assert check "without wan the config has no wan table" (!lib.hasInfix "wan {" (rendered {}));
+  assert check "wan's defaults are written out" (lib.hasInfix ''mode = "auto";'' (rendered {wan = {};}) && lib.hasInfix ''lookup_via = "wtfismyip";'' (rendered {wan = {};}));
+  assert check "a static-only wan turns the mapped port off" (lib.hasInfix "mapped_port = false;" (rendered {
+      wan = {
+        static = ["203.0.113.7:7420"];
+        mappedPort = null;
+      };
+    })
+    && lib.hasInfix ''static = ["203.0.113.7:7420"];'' (rendered {
+      wan = {
+        static = ["203.0.113.7:7420"];
+        mappedPort = null;
+      };
+    }));
+  assert check "lookups forbidden are written as false" (lib.hasInfix "lookup_via = false;" (rendered {
+    wan.mappedPort = {
+      mode = "manual";
+      port = 443;
+      publicIp = "203.0.113.7";
+      lookupVia = null;
+    };
+  }));
   # G-13: systemd splits ExecStart on whitespace, so the state directory
   # is one quoted argument.
   assert check "the state directory is one argument" (lib.hasInfix ''--state-dir "/var/lib/spool frame"'' (execStart "/var/lib/spool frame"));

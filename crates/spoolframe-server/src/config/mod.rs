@@ -14,7 +14,7 @@ pub mod secrets;
 pub mod settings;
 pub mod tree;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use spoolframe_admin_api::SyncDirection;
@@ -966,6 +966,196 @@ pub struct NetworkConfig {
     /// Which of its addresses a signed-in device is told (PX-12).
     #[ucl(default)]
     pub announce: AnnounceConfig,
+    /// The server's public addresses (P6-02); absent, none is advertised.
+    #[ucl(default)]
+    pub wan: Option<WanConfig>,
+}
+
+/// `wan { static = ["203.0.113.7:7420"]; mapped_port { port = 7420;
+/// mode = "auto"; public_ip = "lookup"; lookup_via = "wtfismyip"; }
+/// host_ipv6 = false; }`: what a device off the LAN dials (P6-02). Each
+/// part is optional; `mapped_port` is on with its defaults unless set to
+/// `false`.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct WanConfig {
+    /// Public addresses with their ports, advertised as written.
+    #[ucl(default, path = "static")]
+    pub statics: Option<Vec<String>>,
+    /// The port forwarded on the router, or `false` for none.
+    #[ucl(default, map = "mapped_port_setting")]
+    pub mapped_port: Option<MappedPortSetting>,
+    /// Advertise the host's stable global IPv6 addresses; off unless set.
+    #[ucl(default)]
+    pub host_ipv6: Option<bool>,
+}
+
+/// `mapped_port`: `false`, or its table.
+#[derive(Debug, Clone)]
+pub enum MappedPortSetting {
+    Off,
+    On(MappedPortConfig),
+}
+
+/// `mapped_port { port; mode; public_ip; lookup_via; }`, all optional.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct MappedPortConfig {
+    /// The public port; `network.port` if left out.
+    #[ucl(default)]
+    pub port: Option<u16>,
+    /// `"auto"` (the default): ask the router; `"manual"`: the operator
+    /// forwarded the port.
+    #[ucl(default)]
+    pub mode: Option<String>,
+    /// `"lookup"` (the default), or the public address.
+    #[ucl(default)]
+    pub public_ip: Option<String>,
+    /// `"wtfismyip"` (the default), or `false`: never look the address up.
+    #[ucl(default, map = "lookup_via_setting")]
+    pub lookup_via: Option<LookupViaSetting>,
+}
+
+/// `lookup_via`: `false`, or a service's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupViaSetting {
+    Off,
+    Named(String),
+}
+
+fn mapped_port_setting(
+    object: uclicious::ObjectRef,
+) -> Result<Option<MappedPortSetting>, uclicious::ObjectError> {
+    if let Some(on) = object.as_bool() {
+        return Ok(Some(if on {
+            MappedPortSetting::On(MappedPortConfig::default())
+        } else {
+            MappedPortSetting::Off
+        }));
+    }
+    let table: MappedPortConfig = uclicious::FromObject::try_from(object)?;
+    Ok(Some(MappedPortSetting::On(table)))
+}
+
+fn lookup_via_setting(
+    object: uclicious::ObjectRef,
+) -> Result<Option<LookupViaSetting>, uclicious::ObjectError> {
+    match object.as_bool() {
+        Some(false) => Ok(Some(LookupViaSetting::Off)),
+        Some(true) => Err(uclicious::ObjectError::other(
+            "lookup_via is false or a service's name (\"wtfismyip\"), not true",
+        )),
+        None => {
+            let name: String = uclicious::FromObject::try_from(object)?;
+            Ok(Some(LookupViaSetting::Named(name)))
+        }
+    }
+}
+
+impl WanConfig {
+    /// The settings, checked; `network_port` is `network.port`.
+    pub fn wan(&self, network_port: Option<u16>) -> Result<crate::wan::Wan, ConfigError> {
+        use crate::wan::{LookupVia, MappedPort, Mode, PublicIp};
+        let statics = self
+            .statics
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| {
+                crate::wan::parse_static(entry).map_err(|message| ConfigError::Invalid {
+                    key: "network.wan.static",
+                    message,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let table = match &self.mapped_port {
+            Some(MappedPortSetting::Off) => None,
+            Some(MappedPortSetting::On(table)) => Some(table.clone()),
+            None => Some(MappedPortConfig::default()),
+        };
+        let mapped_port = match table {
+            None => None,
+            Some(table) => {
+                let mode = match table.mode.as_deref() {
+                    None | Some("auto") => Mode::Auto,
+                    Some("manual") => Mode::Manual,
+                    Some(other) => {
+                        return Err(ConfigError::Invalid {
+                            key: "network.wan.mapped_port.mode",
+                            message: format!("{other:?}: \"auto\" or \"manual\""),
+                        });
+                    }
+                };
+                let public_ip = match table.public_ip.as_deref().map(str::trim) {
+                    None | Some("lookup") => PublicIp::Lookup,
+                    Some(text) => {
+                        let ip: IpAddr = text.parse().map_err(|_| ConfigError::Invalid {
+                            key: "network.wan.mapped_port.public_ip",
+                            message: format!("{text:?}: \"lookup\", or an IP address"),
+                        })?;
+                        let ip = ip.to_canonical();
+                        if let Some(why) = crate::wan::not_public(ip) {
+                            return Err(ConfigError::Invalid {
+                                key: "network.wan.mapped_port.public_ip",
+                                message: format!(
+                                    "{text:?} is {why}, which no device on the Internet reaches"
+                                ),
+                            });
+                        }
+                        PublicIp::Fixed(ip)
+                    }
+                };
+                let lookup_via = match &table.lookup_via {
+                    None => Some(LookupVia::Wtfismyip),
+                    Some(LookupViaSetting::Off) => None,
+                    Some(LookupViaSetting::Named(name)) => match name.trim() {
+                        "wtfismyip" => Some(LookupVia::Wtfismyip),
+                        other => {
+                            return Err(ConfigError::Invalid {
+                                key: "network.wan.mapped_port.lookup_via",
+                                message: format!("{other:?}: false, or \"wtfismyip\""),
+                            });
+                        }
+                    },
+                };
+                if public_ip == PublicIp::Lookup && lookup_via.is_none() {
+                    return Err(ConfigError::Invalid {
+                        key: "network.wan.mapped_port.public_ip",
+                        message: "is \"lookup\", but network.wan.mapped_port.lookup_via = \
+                                  false forbids looking the address up: set public_ip to this \
+                                  network's public address, or lookup_via to \"wtfismyip\""
+                            .into(),
+                    });
+                }
+                let port = table.port.or(network_port);
+                if port == Some(0) {
+                    return Err(ConfigError::Invalid {
+                        key: "network.wan.mapped_port.port",
+                        message: "must not be 0".into(),
+                    });
+                }
+                if mode == Mode::Manual && port.is_none() {
+                    return Err(ConfigError::Invalid {
+                        key: "network.wan.mapped_port.port",
+                        message: "is needed with mode = \"manual\": the port forwarded on the \
+                                  router (or set network.port, which it defaults to)"
+                            .into(),
+                    });
+                }
+                Some(MappedPort {
+                    port,
+                    mode,
+                    public_ip,
+                    lookup_via,
+                })
+            }
+        };
+        Ok(crate::wan::Wan {
+            statics,
+            mapped_port,
+            host_ipv6: self.host_ipv6.unwrap_or(false),
+        })
+    }
 }
 
 /// `announce { add = ["203.0.113.7"]; ignore = ["172.17.0.0/16"];
@@ -1086,6 +1276,11 @@ impl NetworkConfig {
             mdns: self.mdns.unwrap_or(true),
             admission,
             announce: self.announce.announce()?,
+            wan: self
+                .wan
+                .as_ref()
+                .map(|wan| wan.wan(self.port))
+                .transpose()?,
         })
     }
 }
@@ -2274,6 +2469,189 @@ mod tests {
                 "{setting}: {err:?}"
             );
         }
+    }
+
+    fn wan(section: &str) -> Result<Option<crate::wan::Wan>, ConfigError> {
+        plex(&format!("network {{ {section} }}"))
+            .map(|config| config.network.endpoint_options().unwrap().wan)
+    }
+
+    #[test]
+    fn without_network_wan_no_public_address_is_advertised() {
+        assert_eq!(wan("").unwrap(), None);
+        assert_eq!(wan("port = 7420;").unwrap(), None);
+    }
+
+    #[test]
+    fn wan_static_addresses_are_read_as_written() {
+        let wan =
+            wan(r#"wan { static = ["1.2.3.4:7420", "[2001:db8::1]:7420"]; mapped_port = false; }"#)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            wan,
+            crate::wan::Wan {
+                statics: vec![
+                    "1.2.3.4:7420".parse().unwrap(),
+                    "[2001:db8::1]:7420".parse().unwrap()
+                ],
+                mapped_port: None,
+                host_ipv6: false,
+            }
+        );
+    }
+
+    #[test]
+    fn wan_present_maps_the_network_port_and_looks_the_ip_up_by_default() {
+        use crate::wan::{LookupVia, MappedPort, Mode, PublicIp};
+        let wan = wan("port = 7420; wan { }").unwrap().unwrap();
+        assert_eq!(wan.statics, []);
+        assert!(!wan.host_ipv6);
+        assert_eq!(
+            wan.mapped_port,
+            Some(MappedPort {
+                port: Some(7420),
+                mode: Mode::Auto,
+                public_ip: PublicIp::Lookup,
+                lookup_via: Some(LookupVia::Wtfismyip),
+            })
+        );
+    }
+
+    #[test]
+    fn a_manual_mapped_port_with_its_public_ip_is_read() {
+        use crate::wan::{MappedPort, Mode, PublicIp};
+        let wan = wan(
+            r#"wan { mapped_port { port = 443; mode = "manual"; public_ip = "203.0.113.7";
+                     lookup_via = false; } host_ipv6 = true; }"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(wan.host_ipv6);
+        assert_eq!(
+            wan.mapped_port,
+            Some(MappedPort {
+                port: Some(443),
+                mode: Mode::Manual,
+                public_ip: PublicIp::Fixed("203.0.113.7".parse().unwrap()),
+                lookup_via: None,
+            })
+        );
+    }
+
+    /// The `check_proxy` tradition: a shape that cannot work is refused at
+    /// load, saying what to do instead.
+    #[test]
+    fn a_lookup_with_lookups_forbidden_is_refused_at_load() {
+        let err = wan(r#"wan { mapped_port { lookup_via = false; } }"#).unwrap_err();
+        let ConfigError::Invalid { key, message } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(*key, "network.wan.mapped_port.public_ip");
+        assert!(message.contains("lookup_via = false"), "{message}");
+        assert!(message.contains("set public_ip"), "{message}");
+        let explicit = wan(r#"wan { mapped_port { public_ip = "lookup"; lookup_via = false; } }"#);
+        assert!(
+            matches!(
+                explicit,
+                Err(ConfigError::Invalid {
+                    key: "network.wan.mapped_port.public_ip",
+                    ..
+                })
+            ),
+            "{explicit:?}"
+        );
+    }
+
+    #[test]
+    fn a_private_loopback_or_link_local_static_address_is_refused() {
+        for (entry, why) in [
+            ("192.168.1.5:7420", "a private address"),
+            ("10.0.0.2:7420", "a private address"),
+            ("127.0.0.1:7420", "a loopback address"),
+            ("[::1]:7420", "a loopback address"),
+            ("169.254.0.9:7420", "a link-local address"),
+            ("[fe80::1]:7420", "a link-local address"),
+            ("[fd00::1]:7420", "a unique local address (fc00::/7)"),
+            (
+                "100.64.0.1:7420",
+                "a carrier-grade NAT address (100.64.0.0/10)",
+            ),
+            ("100.100.100.100:7420", "(100.64.0.0/10)"),
+            ("172.20.0.1:7420", "(172.16.0.0/12)"),
+        ] {
+            let err = wan(&format!(r#"wan {{ static = ["{entry}"]; }}"#)).unwrap_err();
+            let ConfigError::Invalid { key, message } = &err else {
+                panic!("{entry}: {err:?}");
+            };
+            assert_eq!(*key, "network.wan.static", "{entry}");
+            assert!(message.contains(why), "{entry}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_public_ip_that_is_not_public_is_refused_naming_its_range() {
+        for (ip, range) in [
+            ("100.64.0.1", "(100.64.0.0/10)"),
+            ("192.168.1.1", "(192.168.0.0/16)"),
+            ("127.0.0.1", "(127.0.0.0/8)"),
+            ("fe80::1", "(fe80::/10)"),
+        ] {
+            let err = wan(&format!(
+                r#"wan {{ mapped_port {{ public_ip = "{ip}"; }} }}"#
+            ))
+            .unwrap_err();
+            let ConfigError::Invalid { key, message } = &err else {
+                panic!("{ip}: {err:?}");
+            };
+            assert_eq!(*key, "network.wan.mapped_port.public_ip", "{ip}");
+            assert!(message.contains(range), "{ip}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_bad_wan_setting_names_its_key() {
+        for (setting, key) in [
+            (r#"static = ["nas.local:7420"]"#, "network.wan.static"),
+            (r#"static = ["1.2.3.4"]"#, "network.wan.static"),
+            (
+                r#"mapped_port { mode = "upnp"; }"#,
+                "network.wan.mapped_port.mode",
+            ),
+            (
+                r#"mapped_port { public_ip = "nas.local"; }"#,
+                "network.wan.mapped_port.public_ip",
+            ),
+            (
+                r#"mapped_port { public_ip = "192.168.1.1"; }"#,
+                "network.wan.mapped_port.public_ip",
+            ),
+            (
+                r#"mapped_port { lookup_via = "ifconfig.me"; }"#,
+                "network.wan.mapped_port.lookup_via",
+            ),
+            (
+                r#"mapped_port { port = 0; }"#,
+                "network.wan.mapped_port.port",
+            ),
+            (
+                r#"mapped_port { mode = "manual"; public_ip = "1.2.3.4"; }"#,
+                "network.wan.mapped_port.port",
+            ),
+        ] {
+            let err = wan(&format!("wan {{ {setting}; }}")).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::Invalid { key: k, .. } if *k == key),
+                "{setting}: {err:?}"
+            );
+        }
+        for unknown in [
+            "wan { statics = []; }",
+            "wan { mapped_port { ip = \"1.2.3.4\"; } }",
+        ] {
+            assert!(wan(unknown).is_err(), "{unknown}");
+        }
+        assert!(wan("wan { mapped_port { lookup_via = true; } }").is_err());
     }
 
     #[test]
