@@ -176,7 +176,7 @@ pub fn add_static(text: &str, existing: &[String]) -> Result<String, String> {
     Ok(addr)
 }
 
-/// The wizard's answer to "Reach this server from outside your home?".
+/// The wizard's answer to "From outside your home?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
     /// Writes no `network.wan`.

@@ -216,6 +216,8 @@ pub struct StatusSource {
     /// Known from the start: it is read before anything listens (PX-14).
     pub server_id: spoolframe_protocol::ServerId,
     pub transcoding: Arc<Transcoding>,
+    /// The conversions, for the encode budget's use.
+    jobs: Option<Arc<crate::encode::job::Jobs>>,
     /// Whether the endpoint announces itself on the LAN.
     pub mdns: bool,
     endpoint_id: OnceLock<String>,
@@ -252,6 +254,7 @@ impl StatusSource {
             name,
             server_id,
             transcoding,
+            jobs: None,
             mdns: false,
             endpoint_id: OnceLock::new(),
             addresses: OnceLock::new(),
@@ -259,6 +262,11 @@ impl StatusSource {
             ocr_languages: Vec::new(),
             web_urls: OnceLock::new(),
         }
+    }
+
+    pub fn with_jobs(mut self, jobs: Arc<crate::encode::job::Jobs>) -> Self {
+        self.jobs = Some(jobs);
+        self
     }
 
     pub fn with_ocr_languages(mut self, languages: Vec<String>) -> Self {
@@ -314,6 +322,21 @@ impl StatusSource {
                     .iter()
                     .map(|d| format!("{} ({:?})", d.codec, d.hardware).to_lowercase())
                     .collect(),
+                gpu_filters: self.jobs.as_ref().is_some_and(|j| j.limits().gpu_filters),
+                gpu_tonemap: encoders.gpu_tonemap,
+                gpu_overlay: encoders.gpu_overlay,
+                budget: self.jobs.as_ref().map(|jobs| {
+                    let now = jobs.budget();
+                    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+                    spoolframe_admin_api::EncodeBudget {
+                        used_quarters: now.used.get(),
+                        max_quarters: now.max.get(),
+                        remuxes: count(now.remuxes),
+                        max_remux: count(now.max_remux),
+                        gpu_jobs: count(now.gpu_jobs),
+                        max_gpu_jobs: count(now.max_gpu_jobs),
+                    }
+                }),
             },
             mdns: self.mdns,
             addresses: self.addresses.get().cloned().unwrap_or_default(),

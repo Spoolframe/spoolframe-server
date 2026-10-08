@@ -1,7 +1,7 @@
 //! Settings › Remote access (P6-02), as the WebRemoteAccess boards draw
 //! it: what the server advertises now and how each address was found,
-//! then `network.wan`'s form; and the setup wizard's "Reach this server
-//! from outside your home?" (WebWizardRemoteChoices). The form's logic is
+//! then `network.wan`'s form; and the setup wizard's "From outside your
+//! home?", in the Access step's apps card (WebWizardRemoteChoices). The form's logic is
 //! `crate::remote`, tested on the host.
 
 use dioxus::prelude::*;
@@ -491,9 +491,9 @@ impl WizardRemote {
     }
 }
 
-/// "Reach this server from outside your home?", at the end of the Access
-/// step: Not now writes no `network.wan`; the others open their fields
-/// and the security note. Automatic asks the router at once, so the
+/// "From outside your home?", in the Access step's apps card: Not now
+/// writes no `network.wan`; the others open their fields and the
+/// security note. Automatic asks the router at once, so the
 /// answer is known before Continue.
 #[component]
 pub fn RemoteChoice(state: Signal<WizardRemote>, server_port: String) -> Element {
@@ -567,14 +567,14 @@ pub fn RemoteChoice(state: Signal<WizardRemote>, server_port: String) -> Element
         server_port.clone()
     };
     rsx! {
-        div { class: "flex flex-col gap-3.5 border-t border-ctp-surface0 pt-[18px]",
-            div { class: "flex flex-col gap-1.5",
+        div { class: "flex flex-col gap-3.5",
+            div { class: "flex flex-col gap-1",
                 div { class: "flex flex-wrap items-center gap-2.5",
-                    h2 { class: "m-0 text-[19px]", "Reach this server from outside your home?" }
+                    h2 { "From outside your home?" }
                     span { class: "pill", "Optional" }
                 }
                 p { class: "m-0 text-[13px] leading-normal text-ctp-subtext0",
-                    "For the apps, not this web page. Only if your connection has a public address. Not sure? Leave Not now: everything works at home, and relays will cover the rest in a later version. Change it any time in Settings › Remote access."
+                    "Only if your connection has a public address. Not sure? Leave Not now; relays will cover the rest in a later version. Change it any time in Settings › Remote access."
                 }
             }
             div { class: "flex flex-col gap-2", role: "radiogroup", aria_label: "Remote access",

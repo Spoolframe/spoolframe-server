@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use spoolframe_server::encode::Units;
+
 use spoolframe_protocol::{
     Error, MAX_READ, MediaReadResponse, PlaybackHandle, PlaybackPlan, Reply, Request, Response,
     SessionId,
@@ -202,29 +204,56 @@ async fn an_idle_playback_s_encode_ends_with_it() {
     server.stop().await;
 }
 
+/// The generated media's conversion encodes only its audio: a quarter of
+/// the budget. With `max_jobs = 1`, four run at once, two on each of two
+/// devices ("now + next"), and a third device's start is busy: none of
+/// those four is its own to end.
 #[tokio::test]
-async fn one_conversion_too_many_is_busy() {
+async fn four_audio_encodes_fill_a_budget_of_one_and_a_fifth_is_busy() {
     let options = ServerOptions {
-        max_jobs: 1,
+        budget: Units::jobs(1),
         read_ahead: Duration::from_millis(500),
         ..ServerOptions::default()
     };
     let (server, tv, session) = ready("encode-busy", options, 120).await;
-    // Another device, signed in first: a sign-in waits its turn for
+    // The other devices, signed in first: a sign-in waits its turn for
     // Argon2 (PX-10), and the TV's playback idles out after PLAYBACK_IDLE.
-    let desktop = server.client().await;
-    desktop
-        .hello_with(None, Some(progressive_capabilities()))
+    let mut others = Vec::new();
+    for _ in 0..2 {
+        let device = server.client().await;
+        device
+            .hello_with(None, Some(progressive_capabilities()))
+            .await;
+        let signed_in = device.login("alice", "correct horse").await;
+        others.push((device, signed_in));
+    }
+    let (desktop, desktop_session) = &others[0];
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        handles.push(started(&tv, &session, None).await);
+        handles.push(started(desktop, desktop_session, None).await);
+    }
+    for handle in &handles {
+        until("its ffmpeg runs", Duration::from_secs(10), || {
+            !ffmpeg_for(handle).is_empty()
+        })
         .await;
-    let other = desktop.login("alice", "correct horse").await;
-    started(&tv, &session, None).await;
-    // While the TV's encode holds the only slot.
+    }
+    let budget = server.jobs.budget();
+    assert_eq!(budget.used, Units::jobs(1), "{budget:?}");
+    let (phone, phone_session) = &others[1];
     assert!(matches!(
-        start(&desktop, &other, None).await,
+        start(phone, phone_session, None).await,
         Response::Err(Error::Busy)
     ));
+    // The four play on.
+    for handle in &handles {
+        assert!(!ffmpeg_for(handle).is_empty());
+    }
     tv.close().await;
-    desktop.close().await;
+    for (device, _) in others {
+        device.close().await;
+    }
     server.stop().await;
 }
 
@@ -234,7 +263,7 @@ async fn one_conversion_too_many_is_busy() {
 #[tokio::test]
 async fn a_device_starting_again_ends_its_earlier_encode() {
     let options = ServerOptions {
-        max_jobs: 1,
+        budget: Units::jobs(1),
         read_ahead: Duration::from_millis(500),
         ..ServerOptions::default()
     };
@@ -264,7 +293,7 @@ async fn a_device_starting_again_ends_its_earlier_encode() {
 #[tokio::test]
 async fn a_gone_device_s_encode_ends_after_the_grace() {
     let options = ServerOptions {
-        max_jobs: 1,
+        budget: Units::jobs(1),
         read_ahead: Duration::from_millis(500),
         disconnect_grace: Duration::from_millis(300),
         ..ServerOptions::default()
@@ -541,7 +570,7 @@ async fn a_seek_that_cannot_start_leaves_the_playback_playing() {
         dir,
         ServerOptions {
             real_media: true,
-            max_jobs: 1,
+            budget: Units::jobs(1),
             ffmpeg: ffmpeg.clone(),
             read_ahead: Duration::from_millis(500),
             ..ServerOptions::default()
@@ -591,7 +620,7 @@ async fn a_seek_that_cannot_start_leaves_the_playback_playing() {
 async fn an_hls_restart_that_cannot_start_leaves_the_playback_playing() {
     let (dir, ffmpeg) = removable_ffmpeg("hls-restart-failed").await;
     let options = ServerOptions {
-        max_jobs: 1,
+        budget: Units::jobs(1),
         ffmpeg: ffmpeg.clone(),
         // Held back with segment 1 (0 to 2 s) written: segment 4 is then
         // near enough to what is written to be waited for.
@@ -1513,7 +1542,8 @@ async fn a_paused_hls_playback_reads_on_after_ten_minutes() {
 async fn a_paused_playback_s_progress_reports_do_not_hold_its_slot_against_its_device() {
     let (dir, ffmpeg) = removable_ffmpeg("hls-paused-reports").await;
     let options = ServerOptions {
-        max_jobs: 1,
+        // Room for one audio encode, the generated media's conversion.
+        budget: Units::quarters(1),
         ffmpeg,
         read_ahead: Duration::from_secs(3),
         ..ServerOptions::default()
@@ -1567,7 +1597,8 @@ async fn a_device_s_next_with_no_slot_free_leaves_the_one_playing() {
         fresh_dir("hls-next-busy").await,
         hls_capabilities(),
         ServerOptions {
-            max_jobs: 1,
+            // Room for one audio encode, the generated media's conversion.
+            budget: Units::quarters(1),
             ..ServerOptions::default()
         },
     )
@@ -1592,7 +1623,7 @@ async fn a_relaunched_app_s_start_ends_the_killed_app_s_conversions(test: &str, 
         fresh_dir(test).await,
         hls_capabilities(),
         ServerOptions {
-            max_jobs: 2,
+            budget: Units::jobs(2),
             ..ServerOptions::default()
         },
     )
@@ -1645,7 +1676,7 @@ async fn a_relaunched_app_s_start_ends_a_silent_connection_s_conversions() {
 #[tokio::test]
 async fn an_ended_playback_s_encode_stops_while_a_read_holds_it() {
     let options = ServerOptions {
-        max_jobs: 1,
+        budget: Units::jobs(1),
         read_ahead: Duration::from_millis(500),
         ..ServerOptions::default()
     };
@@ -2065,11 +2096,13 @@ async fn a_subtitle_change_restarts_a_converted_playback_where_it_is() {
 
 /// A subtitle change replaces the playback's conversion while it still
 /// holds its slot. The new one runs in that slot: it once asked for
-/// another, and with none free every change was refused as `Busy`.
+/// another, and with none free every change was refused as `Busy`. A
+/// burned-in subtitle weighs more than the audio encode it replaces: it
+/// fits a budget of one only with that encode's quarter counted as free.
 #[tokio::test]
 async fn a_subtitle_change_needs_no_second_slot() {
     let options = ServerOptions {
-        max_jobs: 1,
+        budget: Units::jobs(1),
         ..ServerOptions::default()
     };
     let (server, tv, session) = ready("subtitle-change-slot", options, 12).await;
@@ -2084,7 +2117,8 @@ async fn a_subtitle_change_needs_no_second_slot() {
     let handle = started(&tv, &session, None).await;
     let (_, epoch) = change(&tv, &session, &handle, Some(0), 4_000).await;
     assert_eq!(epoch, 1);
-    // Still one slot, and the TV's playback holds it.
+    assert_eq!(server.jobs.budget().used, Units::jobs(1));
+    // The whole budget, and the TV's playback holds it.
     assert!(matches!(
         start(&desktop, &other, None).await,
         Response::Err(Error::Busy)
@@ -2099,7 +2133,7 @@ async fn simultaneous_subtitle_changes_get_distinct_epochs_in_one_slot() {
     let (server, client, session) = ready(
         "subtitle-concurrent",
         ServerOptions {
-            max_jobs: 1,
+            budget: Units::jobs(1),
             ..ServerOptions::default()
         },
         12,

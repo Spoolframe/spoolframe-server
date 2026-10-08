@@ -279,6 +279,93 @@ async fn a_conversion_moves_the_transcode_and_encode_counts() {
     server.stop().await;
 }
 
+/// The same audio-only conversion takes a quarter of the encode budget:
+/// the metrics, the admin status (and so the Server page and `spoolframe
+/// status`) say so, and count the running encode by its kind.
+#[tokio::test]
+async fn the_encode_budget_s_use_is_in_the_metrics_and_the_status() {
+    let server = TestServer::start_with(
+        fresh_dir("budget").await,
+        ServerOptions {
+            real_media: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    // Longer than the read-ahead: the encode is held back, still running.
+    server.generate_media(30, "libx264", "ac3");
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client
+        .hello_with(None, Some(progressive_capabilities()))
+        .await;
+    let session = client.login("alice", "correct horse").await;
+    let metrics = server.metrics.clone();
+    start(&client, &session).await;
+    assert_eq!(value(&metrics, "spoolframe_encode_budget_used", &[]), 0.25);
+    assert_eq!(value(&metrics, "spoolframe_encode_budget_max", &[]), 2.0);
+    let running = |kind| {
+        value(
+            &metrics,
+            "spoolframe_conversions_running",
+            &[("kind", kind)],
+        )
+    };
+    until("the audio encode runs", || running("audio") == 1.0).await;
+    assert_eq!(
+        (running("remux"), running("gpu"), running("software")),
+        (0.0, 0.0, 0.0)
+    );
+
+    let dir = state_dir("budget-status").await;
+    let auth = Auth::new(Store::open(dir.as_ref()).await.unwrap());
+    let status = admin::StatusSource::new(
+        server.name.clone(),
+        server.server_id.clone(),
+        crate::support::transcoding(),
+    )
+    .with_jobs(server.jobs.clone());
+    let (addr, handle) = admin::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        Admin {
+            status: Arc::new(status),
+            ..admin(auth, Some(SetupCode::new(CODE)))
+        },
+        Origins::default(),
+        TrustedProxies::default(),
+    )
+    .await
+    .unwrap();
+    std::mem::forget(handle);
+    let root = anonymous(addr)
+        .await
+        .setup(setup(CODE, "root", "correct horse"))
+        .await
+        .unwrap();
+    let budget = with_token(addr, &root.token)
+        .await
+        .server_status()
+        .await
+        .unwrap()
+        .transcoding
+        .budget
+        .expect("the budget, with jobs");
+    assert_eq!(
+        budget,
+        spoolframe_admin_api::EncodeBudget {
+            used_quarters: 1,
+            max_quarters: 8,
+            remuxes: 0,
+            max_remux: 32,
+            gpu_jobs: 0,
+            max_gpu_jobs: 3,
+        }
+    );
+    assert_eq!(budget.used_of_max(), "0.25 of 2");
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn admin_sockets_are_counted_while_open() {
     let metrics = Arc::new(Metrics::default());

@@ -2690,7 +2690,9 @@ impl ClientProtocol {
                 // A new conversion's first epoch is past the old one's, so
                 // reads of the old one are told to start over. The old one
                 // runs until the new one has started, so the new one takes
-                // no slot of its own: it shares the old one's.
+                // no slot of its own: it shares the old one's, or, weighing
+                // more or less (a subtitle burned in, or no longer), counts
+                // the old one's share as free.
                 let replaced = replaces
                     .and_then(|p| p.conversion.as_ref())
                     .map(|c| c.job());

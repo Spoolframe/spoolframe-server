@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use spoolframe_media::encoders::Hardware;
+use spoolframe_media::encoders::{Hardware, hwaccel_args};
 use spoolframe_media::sandbox::{Jail, Limits, Tool};
 
 use super::sheets::TILE_WIDTH;
@@ -57,19 +57,10 @@ pub fn tile_args(source: &Source, hardware: bool, at: Duration, out: &Path) -> V
         .map(String::from)
         .to_vec();
     if let (true, Some((family, device))) = (hardware, &source.hardware) {
-        // Without an output format the frames come back to memory, where
-        // the scale below runs; a decoder that cannot fails, and the tile
-        // is made again in software.
-        match family {
-            Hardware::Vaapi => args.extend([
-                "-hwaccel".into(),
-                "vaapi".into(),
-                "-hwaccel_device".into(),
-                device.display().to_string(),
-            ]),
-            Hardware::Nvenc => args.extend(["-hwaccel".into(), "cuda".into()]),
-            Hardware::Qsv => args.extend(["-hwaccel".into(), "qsv".into()]),
-        }
+        // Frames come back to memory, where the scale below runs; a
+        // decoder that cannot fails, and the tile is made again in
+        // software.
+        args.extend(hwaccel_args(*family, device, false));
     }
     // Keyframes only, and the one the seek lands on (at or before `at`),
     // not decoded on to `at` exactly: within a GOP is close enough for a

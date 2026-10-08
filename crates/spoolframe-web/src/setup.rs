@@ -446,9 +446,45 @@ pub fn ocr_note(on: bool, found: bool) -> &'static str {
     }
 }
 
+/// What `transcode.gpu_filters` does, under its switch.
+pub const GPU_FILTERS_NOTE: &str = "Faster and uses less CPU, but colours or subtitle placement \
+     may differ slightly; falls back to the CPU where the GPU can't.";
+
+/// What this server's GPU does of the GPU filters, from detection.
+pub fn gpu_filters_support(tonemap: bool, overlay: bool) -> &'static str {
+    match (tonemap, overlay) {
+        (true, true) => "This GPU tone maps HDR and burns in picture subtitles.",
+        (true, false) => "This GPU tone maps HDR. Picture subtitles are burned in on the CPU.",
+        (false, true) => "This GPU burns in picture subtitles. HDR is tone mapped on the CPU.",
+        (false, false) => {
+            "This GPU neither tone maps HDR nor burns in subtitles: the CPU does both."
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gpu_filters_note_says_what_this_gpu_does() {
+        assert_eq!(
+            gpu_filters_support(true, true),
+            "This GPU tone maps HDR and burns in picture subtitles."
+        );
+        assert_eq!(
+            gpu_filters_support(true, false),
+            "This GPU tone maps HDR. Picture subtitles are burned in on the CPU."
+        );
+        assert_eq!(
+            gpu_filters_support(false, true),
+            "This GPU burns in picture subtitles. HDR is tone mapped on the CPU."
+        );
+        assert_eq!(
+            gpu_filters_support(false, false),
+            "This GPU neither tone maps HDR nor burns in subtitles: the CPU does both."
+        );
+    }
 
     #[test]
     fn ocr_with_languages_names_what_the_languages_cover() {

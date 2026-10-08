@@ -20,6 +20,7 @@ use spoolframe_types::{
 };
 
 use crate::connected::Connected;
+use crate::encode::Load;
 use crate::planner;
 use crate::playback::{
     EndConversionError, EndReason, EndedPlayback, Found, Furthest, Playbacks, READS_KEPT, Snapshot,
@@ -558,6 +559,14 @@ fn row(s: &Snapshot) -> api::PlaybackRow {
             ended: c.ended,
             failed: c.failed.clone(),
             encodes: c.encodes,
+            load: match c.load {
+                Load::Remux => api::ConversionLoad::Remux,
+                Load::Audio => api::ConversionLoad::Audio,
+                Load::Gpu => api::ConversionLoad::Gpu,
+                Load::GpuOnly => api::ConversionLoad::GpuOnly,
+                Load::Software => api::ConversionLoad::Software,
+            },
+            weight_quarters: c.load.weight().get(),
         }),
     }
 }
@@ -733,7 +742,8 @@ impl PlaybackDebug {
         let bitmap = match request.pictures {
             api::PictureSubtitles::Auto => planner::Bitmap::Preferred(BitmapPreference::default()),
             api::PictureSubtitles::Text => planner::Bitmap::Text,
-            api::PictureSubtitles::BurnIn => planner::Bitmap::BurnIn,
+            // As the client protocol's `burn_in`: pictures.
+            api::PictureSubtitles::BurnIn => planner::Bitmap::Preferred(BitmapPreference::Pictures),
         };
         let encoders = self.transcoding.encoders();
         // As the client protocol plans it: without capabilities, nothing.

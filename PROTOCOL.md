@@ -675,8 +675,23 @@ The server applies it when a `PlaybackPlan`, `StartPlayback` or
 The server cannot read a track when `subtitles.ocr` is off, when
 tesseract has no data for the track's language, or when the client takes
 neither SubRip nor WebVTT. With `subtitles.ocr` off the preference has no
-effect. A request with `bitmap: "text"` or `"burn_in"` still gets what it
-asks for, whatever the preference.
+effect. A request with `bitmap: "text"` still gets text, whatever the
+preference, or the plan is `Unsupported` if the server cannot read the
+track. A request with `bitmap: "burn_in"` is planned as `pictures`: it
+asks for pictures, and they are burned in only if the client cannot draw
+them. The value stays on the wire, but it no longer forces a burn-in.
+
+The rules, for every plan:
+
+- A text subtitle is never burned in. It is copied if the client shows
+  it, else converted to a text format the client shows (WebVTT for HLS).
+  If the client shows no text format the output can carry, the subtitle
+  is not shown: the plan has no subtitle, and a reason says why, e.g.
+  "subtitle 1: the client shows no text subtitles; not shown". The video
+  is not encoded because of a text subtitle.
+- A picture subtitle is burned in only when it is not read as text (OCR
+  is off, the server cannot read the track, or pictures were asked for)
+  and the client cannot draw it in this delivery.
 
 The plan says which was used. A direct plan has the picked subtitle with
 its format and delivery: `pgs` `embedded` is drawn by the client, and

@@ -14,6 +14,9 @@ pub mod user_ids;
 pub mod users;
 pub mod watch;
 
+#[cfg(test)]
+mod disk_full_tests;
+
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -51,7 +54,83 @@ pub enum StoreError {
         source: std::io::Error,
     },
     #[error("database error: {0}")]
-    Db(#[from] sqlx::Error),
+    Db(#[source] sqlx::Error),
+}
+
+impl From<sqlx::Error> for StoreError {
+    fn from(e: sqlx::Error) -> Self {
+        if is_disk_full(&e) && DISK_FULL_REPORT.due(now()) {
+            tracing::error!("the disk is full: database writes fail until space is freed ({e})");
+        }
+        Self::Db(e)
+    }
+}
+
+/// SQLite's "database or disk is full" (SQLITE_FULL).
+fn is_disk_full(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(d) if d.code().as_deref() == Some("13"))
+}
+
+/// The disk-full error is said once a minute at most: while the disk is
+/// full every request that writes fails, and each says so itself.
+static DISK_FULL_REPORT: Throttle = Throttle::new(60);
+
+/// Says whether something is due again, at most once each `every_secs`.
+struct Throttle {
+    every_secs: i64,
+    /// When it was last due, in Unix seconds; `i64::MIN` for never.
+    last: std::sync::atomic::AtomicI64,
+}
+
+impl Throttle {
+    const fn new(every_secs: i64) -> Self {
+        Self {
+            every_secs,
+            last: std::sync::atomic::AtomicI64::new(i64::MIN),
+        }
+    }
+
+    /// Whether it is due at `now` (Unix seconds); if it is, the next is
+    /// `every_secs` later.
+    fn due(&self, now: i64) -> bool {
+        use std::sync::atomic::Ordering;
+        let last = self.last.load(Ordering::Relaxed);
+        last.checked_add(self.every_secs)
+            .is_none_or(|next| now >= next)
+            && self
+                .last
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
+}
+
+/// Whether a connection given back to the pool may be handed out again:
+/// not when sqlx still counts it inside a transaction.
+///
+/// A COMMIT that fails with SQLITE_FULL or an I/O error (a full disk:
+/// the WAL cannot grow) makes SQLite roll the whole transaction back by
+/// itself. sqlx is not told: its own ROLLBACK then fails with "no
+/// transaction is active", and it goes on counting the connection one
+/// transaction deep. Its next transaction on that connection is then a
+/// SAVEPOINT, which SQLite runs as a real transaction, and the
+/// `ROLLBACK TO` that sqlx sends when one fails leaves it, and the write
+/// lock it took, open: every other connection's write then fails with
+/// "database is locked" until the server restarts (2026-10-08). Closing
+/// the connection ends whatever SQLite still has open on it; the pool
+/// opens a new one when it needs one.
+async fn still_in_step(conn: &mut sqlx::SqliteConnection) -> Result<bool, sqlx::Error> {
+    use sqlx::Connection;
+    // A dropped transaction's ROLLBACK is queued, not yet run: a round
+    // trip to the connection's worker waits for it.
+    conn.ping().await?;
+    let in_step = !conn.is_in_transaction();
+    if !in_step {
+        tracing::warn!(
+            "a database connection came back to the pool still counted inside a \
+             transaction; closing it"
+        );
+    }
+    Ok(in_step)
 }
 
 /// The open database.
@@ -113,6 +192,7 @@ impl Store {
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
+            .after_release(|conn, _| Box::pin(still_in_step(conn)))
             .connect_with(options)
             .await
             .map_err(|source| StoreError::Open {
@@ -266,6 +346,15 @@ pub(crate) mod tests {
             assert_eq!(mode(&dir.as_ref().join(file)), 0o600, "{file}");
         }
         store.pool.close().await;
+    }
+
+    #[test]
+    fn a_throttle_is_due_once_each_period() {
+        let throttle = Throttle::new(60);
+        assert!(throttle.due(1_000));
+        assert!(!throttle.due(1_059));
+        assert!(throttle.due(1_060));
+        assert!(!throttle.due(1_061));
     }
 
     #[tokio::test]

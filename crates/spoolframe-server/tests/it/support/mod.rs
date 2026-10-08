@@ -36,8 +36,8 @@ use spoolframe_protocol::{MediaRead, MediaReadResponse, PlaybackHandle};
 use spoolframe_server::artwork::ArtworkCache;
 use spoolframe_server::auth::{Auth, hash_password};
 use spoolframe_server::clock::Clock;
-use spoolframe_server::encode::JobLimits;
 use spoolframe_server::encode::job::Jobs;
+use spoolframe_server::encode::{JobLimits, Units};
 use spoolframe_server::identity;
 use spoolframe_server::network::{EndpointOptions, Relay, Server, ServerName, Services};
 use spoolframe_server::playback::Playbacks;
@@ -375,7 +375,11 @@ pub struct ServerOptions {
     /// for converted playback (P2-03). Off: the stand-in ffprobe and its
     /// fixtures.
     pub real_media: bool,
-    pub max_jobs: usize,
+    /// The encode budget (`transcode.max_jobs`, in units): an audio-only
+    /// conversion of the generated media weighs [`Units::quarters`]`(1)`.
+    pub budget: Units,
+    pub max_remux: usize,
+    pub max_gpu_jobs: usize,
     /// The most all conversions may write together, in bytes.
     pub scratch_limit: u64,
     pub read_ahead: Duration,
@@ -436,7 +440,9 @@ impl Default for ServerOptions {
             port: None,
             mdns: false,
             real_media: false,
-            max_jobs: 2,
+            budget: Units::jobs(2),
+            max_remux: 32,
+            max_gpu_jobs: 3,
             scratch_limit: 1 << 30,
             read_ahead: Duration::from_secs(5),
             stalled_after: spoolframe_server::encode::job::STALLED_AFTER,
@@ -618,6 +624,8 @@ pub struct TestServer {
     pub metrics: Arc<spoolframe_server::metrics::Metrics>,
     /// Playback debug (P3-15) over its parts, for an admin API beside it.
     pub debug: Arc<spoolframe_server::playback_debug::PlaybackDebug>,
+    /// Its conversions, and the encode budget they take.
+    pub jobs: Arc<Jobs>,
 }
 
 impl TestServer {
@@ -658,15 +666,19 @@ impl TestServer {
         let prober = Arc::new(Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT));
         let jobs = Jobs::new(
             JobLimits {
-                max_jobs: options.max_jobs,
+                budget: options.budget,
+                max_remux: options.max_remux,
+                max_gpu_jobs: options.max_gpu_jobs,
                 scratch_dir: dir.join("cache").join("transcode"),
                 scratch_limit_bytes: options.scratch_limit,
                 read_ahead: options.read_ahead,
                 stalled_after: options.stalled_after,
+                gpu_filters: false,
             },
             tool(&options.ffmpeg, &sandbox),
         )
         .unwrap();
+        let jobs = Arc::new(jobs);
         let ocr = if options.ocr {
             Ocr::detect(&tool(&options.tesseract, &sandbox)).await
         } else {
@@ -733,7 +745,7 @@ impl TestServer {
                     .with_clock(clock.clone()),
             ),
             transcoding: transcoding(),
-            jobs: Arc::new(jobs),
+            jobs: jobs.clone(),
             subtitles: Arc::new(subtitles),
             previews,
             app_passkeys: Arc::new(
@@ -782,6 +794,7 @@ impl TestServer {
             media,
             metrics,
             debug,
+            jobs,
         }
     }
 

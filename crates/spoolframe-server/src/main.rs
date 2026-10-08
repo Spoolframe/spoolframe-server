@@ -737,6 +737,7 @@ async fn run(
     let name = ServerName::new(config.server_name());
     let status = Arc::new(
         StatusSource::new(name.clone(), server_id.clone(), transcoding.clone())
+            .with_jobs(jobs.clone())
             .with_mdns(config.network.endpoint_options()?.mdns)
             .with_ocr_languages(subtitles.ocr().languages().iter().cloned().collect()),
     );

@@ -3028,3 +3028,52 @@
   `Hello` and hangs up without signing in is DEBUG at both ends, even
   when its device has a session (`known=true`). Refusing a connection
   as the server is full stays INFO.
+- Fixed: once the disk filled, the server's database stayed "locked"
+  after space came back, and every write failed until a restart. A
+  COMMIT that cannot write to a full disk makes SQLite roll the
+  transaction back by itself; sqlx's own ROLLBACK then failed, it kept
+  counting that connection inside a transaction, and its next
+  transactions on it became savepoints inside a real transaction that
+  never ended and kept the write lock (and whose writes were never
+  saved). A connection given back to the pool while sqlx still counts it
+  inside a transaction is now closed, and the pool opens a new one. A
+  full disk is also logged as one ERROR, "the disk is full: database
+  writes fail until space is freed", at most once a minute.
+- Changed: text subtitles are never burned in. One the client shows in
+  no text format the output can carry is left out of the plan, with a
+  reason such as "subtitle 1: the client shows no text subtitles; not
+  shown", and the video is not encoded for it. Picture subtitles are
+  burned in only when they are not read as text and the client cannot
+  draw them. `bitmap: "burn_in"` (and "Burn in" in "Plan for…") now asks
+  for pictures: a client that can draw them draws them. The wire is
+  unchanged (protocol 7).
+- Transcodes decode on the GPU. A VA-API or software video encode decodes
+  its source with VA-API where detection found a decoder for its codec
+  (not 10-bit H.264 or anything but 4:2:0): the frames come back to
+  memory for tone mapping, burn-in and libx264, or, for a VA-API encode
+  that only scales or changes the codec, stay on the GPU and are scaled
+  with `scale_vaapi`. A run whose GPU decode fails before its first
+  output runs again in the same job decoding in software, and the file
+  decodes in software until the server restarts; one that fails later
+  fails, and the playback's next segment or seek goes on in software.
+  Measured for 60 s of output, a VA-API encode of a 1080p source went
+  from 10.4 to 0.5 s of CPU time (10 Mbit/s) and from 43.5 to 0.9 s
+  (96 Mbit/s); a 4K one scaled to 1080p from 36 to 1.9 s and from 176 to
+  3.9 s; libx264 saved 3 to 57%.
+- A conversion all on the GPU (decoded, scaled and encoded there, nothing
+  on the CPU) weighs 0.25 in the encode budget, as an audio-only encode
+  does, and counts against `transcode.max_gpu_jobs`. A GPU encode that
+  decodes or filters on the CPU still weighs 0.5. The metrics' `kind`
+  label gains `gpu_only`, and the playback page shows "video all on the
+  GPU".
+- `transcode.gpu_filters` (live, off by default; Settings › Playback,
+  "GPU filters"): a VA-API encode that decodes on the GPU also tone maps
+  HDR (`tonemap_vaapi`) and burns in picture subtitles (`overlay_vaapi`,
+  the pictures uploaded) there, staying on the GPU throughout. Detection
+  tries each filter with a one-second run, as it does the encoders, and
+  `spoolframe status`, the web UI and the encoders' log line say which
+  this GPU has; Mesa's VA-API (AMD) has neither. A filter the driver
+  lacks, and text burn-in (libass), run on the CPU for that conversion,
+  logged once. A run whose GPU filters fail before its first output runs
+  again on the CPU, and the file stays on the CPU until a restart, as a
+  failed GPU decode does.

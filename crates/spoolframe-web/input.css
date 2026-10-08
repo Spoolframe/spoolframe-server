@@ -1346,6 +1346,23 @@
       padding: 18px;
     }
   }
+  /* Step 6 (Access) is two cards, the web UI's and the apps'. The one card
+   * the wizard puts every step in steps back to a plain column around
+   * them, spaced as the page spaces its parts. */
+  .wizard-card:has(> .wizard-cards) {
+    background: none;
+    border: 0;
+    padding: 0;
+    box-shadow: none;
+    gap: 22px;
+  }
+  .wizard-cards {
+    display: contents;
+  }
+  .wizard-cards > .wizard-card {
+    width: 100%;
+    max-width: none;
+  }
   .wizard-card h1 {
     margin: 0;
     font: 700 26px var(--font-display);

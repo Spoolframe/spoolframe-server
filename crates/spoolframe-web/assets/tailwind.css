@@ -483,13 +483,6 @@
   .rounded-\[10px\] {
     border-radius: 10px;
   }
-  .border-t {
-    border-top-style: var(--tw-border-style);
-    border-top-width: 1px;
-  }
-  .border-ctp-surface0 {
-    border-color: var(--ctp-surface0);
-  }
   .bg-ctp-base {
     background-color: var(--ctp-base);
   }
@@ -541,9 +534,6 @@
   .pt-3\.5 {
     padding-top: calc(var(--spacing) * 3.5);
   }
-  .pt-\[18px\] {
-    padding-top: 18px;
-  }
   .pl-4 {
     padding-left: calc(var(--spacing) * 4);
   }
@@ -587,9 +577,6 @@
   }
   .text-\[17px\] {
     font-size: 17px;
-  }
-  .text-\[19px\] {
-    font-size: 19px;
   }
   .text-\[22px\] {
     font-size: 22px;
@@ -2010,6 +1997,20 @@
     .wizard-card {
       padding: 18px;
     }
+  }
+  .wizard-card:has(> .wizard-cards) {
+    background: none;
+    border: 0;
+    padding: 0;
+    box-shadow: none;
+    gap: 22px;
+  }
+  .wizard-cards {
+    display: contents;
+  }
+  .wizard-cards > .wizard-card {
+    width: 100%;
+    max-width: none;
   }
   .wizard-card h1 {
     margin: 0;
@@ -4641,11 +4642,6 @@
   syntax: "*";
   inherits: false;
 }
-@property --tw-border-style {
-  syntax: "*";
-  inherits: false;
-  initial-value: solid;
-}
 @property --tw-leading {
   syntax: "*";
   inherits: false;
@@ -4794,7 +4790,6 @@
       --tw-rotate-z: initial;
       --tw-skew-x: initial;
       --tw-skew-y: initial;
-      --tw-border-style: solid;
       --tw-leading: initial;
       --tw-font-weight: initial;
       --tw-tracking: initial;

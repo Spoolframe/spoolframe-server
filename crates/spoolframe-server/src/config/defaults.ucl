@@ -275,8 +275,18 @@ transcode {
   # families in order of preference: "nvenc,vaapi".
   hardware = "auto";
   vaapi_device = "/dev/dri/renderD128";
-  # Encodes at once.
+  # The encode budget: how many software video encodes (libx264) run at
+  # once. Lighter conversions take less of it: a GPU video encode half of
+  # one, or a quarter when it is decoded and scaled on the GPU too with
+  # nothing on the CPU; an audio-only encode (the video copied) a quarter;
+  # a remux (every stream copied) none. A conversion that does not fit is refused as
+  # busy; the same device's idle conversions give way first.
   max_jobs = 2;
+  # Remuxes at once. They cost next to no CPU, but each holds the file
+  # open and writes to the scratch directory.
+  max_remux = 32;
+  # GPU video encodes (VA-API, NVENC) at once, within the budget too.
+  max_gpu_jobs = 3;
   # Where encodes write; the state directory's cache/transcode if left
   # out.
   # scratch_dir = "/var/cache/spoolframe/transcode";
@@ -284,6 +294,12 @@ transcode {
   scratch_limit_mb = 20480;
   # How far an encode may run ahead of its reader.
   read_ahead_secs = 60;
+  # Tone map HDR (tonemap_vaapi) and burn in picture subtitles
+  # (overlay_vaapi) on the GPU for a VA-API encode, where the driver can:
+  # faster and lighter on the CPU, though colours or subtitle placement
+  # may differ slightly. Where it cannot (Mesa has neither), and for text
+  # subtitles, the CPU does it as when this is off.
+  gpu_filters = false;
 }
 
 # Offer bitmap subtitles (PGS, VobSub, DVB) as text, read with tesseract.

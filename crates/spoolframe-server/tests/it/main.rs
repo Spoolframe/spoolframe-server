@@ -18,6 +18,7 @@ mod device_sign_in;
 mod encode;
 mod endpoint;
 mod forget_device;
+mod hwdec;
 mod lan;
 mod libraries;
 mod license_boundary;

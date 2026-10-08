@@ -2,13 +2,18 @@
 //!
 //! Filters run on the CPU and the frames go to the encoder after them, so
 //! scaling, tone mapping and burn-in work with any encoder; a VA-API
-//! encoder gets its frames uploaded at the end of the chain.
+//! encoder gets its frames uploaded at the end of the chain. The video is
+//! decoded on the GPU where it can be ([`decode`]), the frames coming
+//! back to memory for those filters, or staying on the GPU for a VA-API
+//! encode that needs none.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use spoolframe_media::encoders::{Encoders, Hardware};
-use spoolframe_media::{MediaDescriptor, SubtitleKind, SubtitleSource};
+use spoolframe_media::encoders::{Encoders, Hardware, TONEMAP_VAAPI, hwaccel_args};
+use spoolframe_media::{
+    MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, VideoStream, codecs,
+};
 use spoolframe_protocol::{
     AudioAction, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, SubtitleAction,
 };
@@ -44,8 +49,147 @@ pub struct EncodeSpec<'a> {
     pub subtitle: Option<ConvertedSubtitle>,
     pub encoders: &'a Encoders,
     pub vaapi_device: &'a Path,
+    /// The video may be decoded on the GPU: false once that failed for
+    /// this file (see [`decode`]).
+    pub hardware_decode: bool,
+    /// Tone map and burn in pictures on the GPU where the driver can
+    /// (`transcode.gpu_filters`).
+    pub gpu_filters: bool,
     pub start: Option<Duration>,
     pub output: Output,
+}
+
+/// Where the video is decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decode {
+    /// In software.
+    Software,
+    /// On the GPU, with the frames back in memory for the filters on the
+    /// CPU.
+    Hardware,
+    /// On the GPU, and the frames stay there: scaled on it and encoded
+    /// from it, for a video that needs no filter on the CPU.
+    Gpu,
+}
+
+/// Where `spec`'s video is decoded: on the GPU when detection found a
+/// VA-API decoder for its codec and it is encoded with VA-API or in
+/// software, unless that failed for this file before; and with the
+/// frames left on the GPU when a VA-API encoder takes them there and no
+/// filter on the CPU needs them.
+///
+/// A software encode gains too. Measured for 60 s of output, a GPU decode
+/// cut libx264's CPU time by 3% on a 10 Mbit/s 1080p source and 20% on a
+/// 96 Mbit/s one, and by 17% (25 Mbit/s) to 57% (376 Mbit/s) on a 4K
+/// one, though the 4K ones take up to twice as long, the frames' way
+/// back from the GPU being slow: still over three times real time.
+pub fn decode(spec: &EncodeSpec<'_>) -> Decode {
+    match gpu_decodable(spec) {
+        None => Decode::Software,
+        Some(Some(Hardware::Vaapi)) if cpu_filters(spec).is_empty() => Decode::Gpu,
+        Some(_) => Decode::Hardware,
+    }
+}
+
+/// If `spec`'s video may be decoded on the GPU, what encodes it: `None`
+/// for software, or VA-API.
+fn gpu_decodable(spec: &EncodeSpec<'_>) -> Option<Option<Hardware>> {
+    let (Some(ConvertedVideo::Encode { codec, .. }), Some(stream)) =
+        (spec.video, &spec.descriptor.video)
+    else {
+        return None;
+    };
+    // NVENC and QSV would decode with their own hwaccels, which are not
+    // set up.
+    let hardware = spec.encoders.video_encoder(codec)?.hardware;
+    let source = codecs::video_codec(&stream.codec);
+    (spec.hardware_decode
+        && matches!(hardware, None | Some(Hardware::Vaapi))
+        && spec.encoders.decodes(source, Hardware::Vaapi)
+        && gpu_decodes(stream, source))
+    .then_some(hardware)
+}
+
+/// A filter of a video encode that runs on the CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpuFilter {
+    /// The GPU's driver has no `tonemap_vaapi`, or GPU filters are off.
+    ToneMap,
+    /// The GPU's driver has no `overlay_vaapi`, or GPU filters are off.
+    Pictures,
+    /// Text is rendered by libass, on the CPU only. It is burned in only
+    /// for a device that shows no text format at all, so it has no GPU
+    /// path.
+    Text,
+}
+
+/// The filters of `spec`'s video encode that run on the CPU: tone
+/// mapping and burn-in, unless GPU filters are on and the driver runs
+/// them. Scaling always can run on the GPU.
+fn cpu_filters(spec: &EncodeSpec<'_>) -> Vec<CpuFilter> {
+    let Some(ConvertedVideo::Encode { tone_map, .. }) = spec.video else {
+        return Vec::new();
+    };
+    let mut cpu = Vec::new();
+    if tone_map && !(spec.gpu_filters && spec.encoders.gpu_tonemap) {
+        cpu.push(CpuFilter::ToneMap);
+    }
+    match burned(spec).ok().flatten().map(|track| track.kind) {
+        Some(SubtitleKind::Bitmap) if spec.gpu_filters && spec.encoders.gpu_overlay => {}
+        Some(SubtitleKind::Bitmap) => cpu.push(CpuFilter::Pictures),
+        Some(SubtitleKind::Text) => cpu.push(CpuFilter::Text),
+        None => {}
+    }
+    cpu
+}
+
+/// The subtitle track burned in, if one is.
+fn burned<'a>(spec: &EncodeSpec<'a>) -> Result<Option<&'a SubtitleStream>, String> {
+    match spec.subtitle {
+        Some(
+            sub @ ConvertedSubtitle {
+                action: SubtitleAction::BurnIn { .. },
+                ..
+            },
+        ) => spec
+            .descriptor
+            .subtitles
+            .get(sub.index as usize)
+            .map(Some)
+            .ok_or_else(|| format!("subtitle {}: no such track", sub.index)),
+        _ => Ok(None),
+    }
+}
+
+/// With GPU filters on, why filters `spec` asks the GPU for run on the
+/// CPU instead: the driver lacks one, or the subtitle is text. Nothing
+/// when they are off, or the video is not decoded on the GPU at all.
+pub fn cpu_instead_of_gpu(spec: &EncodeSpec<'_>) -> Vec<&'static str> {
+    if !spec.gpu_filters || gpu_decodable(spec) != Some(Some(Hardware::Vaapi)) {
+        return Vec::new();
+    }
+    cpu_filters(spec)
+        .into_iter()
+        .map(|filter| match filter {
+            CpuFilter::ToneMap => "the GPU's driver does not tone map (tonemap_vaapi)",
+            CpuFilter::Pictures => "the GPU's driver does not overlay pictures (overlay_vaapi)",
+            CpuFilter::Text => "text subtitles are burned in on the CPU",
+        })
+        .collect()
+}
+
+/// Whether VA-API drivers decode `stream` at all: 4:2:0, and H.264 only
+/// in 8 bits. Detection's test decode is of 8-bit 4:2:0, so it says
+/// nothing of the rest. One this lets through that the driver still
+/// refuses, ffmpeg decodes in software itself, or the job is run again
+/// in software (`job`).
+fn gpu_decodes(stream: &VideoStream, codec: VideoCodec) -> bool {
+    let four_two_zero = stream.pixel_format.as_deref().is_none_or(|format| {
+        ["yuv420p", "yuvj420p", "nv12", "p010"]
+            .iter()
+            .any(|ok| format.starts_with(ok))
+    });
+    four_two_zero && !(codec == VideoCodec::H264 && stream.bit_depth > 8)
 }
 
 /// HDR to SDR (BT.709) with the Hable curve, in software: it works for any
@@ -76,6 +220,130 @@ fn seconds(d: Duration) -> String {
     format!("{:.3}", d.as_secs_f64())
 }
 
+/// The video's filters on the CPU: burn-in, tone mapping and scale, and
+/// the upload to a VA-API encoder.
+fn cpu_graph(
+    spec: &EncodeSpec<'_>,
+    stream: &VideoStream,
+    codec: VideoCodec,
+    height: u32,
+    tone_map: bool,
+    vaapi: bool,
+) -> Result<String, String> {
+    let d = spec.descriptor;
+    let mut chain = Vec::new();
+    let mut source = format!("[0:{}]", stream.index);
+    if let Some(sub) = spec.subtitle
+        && let SubtitleAction::BurnIn { .. } = sub.action
+    {
+        let picked = d
+            .subtitles
+            .get(sub.index as usize)
+            .ok_or_else(|| format!("subtitle {}: no such track", sub.index))?;
+        match (&picked.source, picked.kind) {
+            (source_of, SubtitleKind::Bitmap) => {
+                let pictures = pictures_input(source_of);
+                // Pictures go over the picture, their canvas scaled to it
+                // first: Blu-ray PGS is 1080p even over 4K video, and
+                // unscaled it would land small in the top left.
+                source = format!(
+                    "[{pictures}]scale={}:{}[subs];[0:{}][subs]overlay",
+                    stream.width, stream.height, stream.index
+                );
+            }
+            (SubtitleSource::Embedded { .. }, SubtitleKind::Text) => {
+                let nth = d.subtitles[..sub.index as usize]
+                    .iter()
+                    .filter(|s| matches!(s.source, SubtitleSource::Embedded { .. }))
+                    .count();
+                chain.push(format!(
+                    "subtitles=filename={}:si={nth}",
+                    filter_path(spec.input)?
+                ));
+            }
+            (SubtitleSource::External { path }, SubtitleKind::Text) => {
+                let path = spec.sidecar.unwrap_or(path);
+                chain.push(format!("subtitles=filename={}", filter_path(path)?));
+            }
+        }
+    }
+    if tone_map {
+        chain.push(s(TONE_MAP));
+    }
+    if height < stream.height {
+        chain.push(format!("scale=-2:{height}"));
+    }
+    if vaapi {
+        chain.push(s("format=nv12,hwupload"));
+    } else if codec == VideoCodec::H264 && !tone_map {
+        // H.264 decoders expect 8-bit 4:2:0.
+        chain.push(s("format=yuv420p"));
+    }
+    Ok(if chain.is_empty() {
+        format!("{source}null[v]")
+    } else if source.ends_with("overlay") {
+        format!("{source},{}[v]", chain.join(","))
+    } else {
+        format!("{source}{}[v]", chain.join(","))
+    })
+}
+
+/// The video's filters on the GPU, for frames decoded there, in the
+/// CPU's order: burned-in pictures laid over it (`overlay_vaapi`, their
+/// canvas scaled to the video and uploaded), the tone map to 8-bit SDR
+/// ([`TONEMAP_VAAPI`]), and the scale, to an even width as the CPU's
+/// `scale=-2` makes it, and to 8 bits, as the CPU's chain uploads `nv12`
+/// for every VA-API encode. [`decode`] chose this path, so the GPU runs
+/// every filter asked for.
+fn gpu_graph(
+    spec: &EncodeSpec<'_>,
+    stream: &VideoStream,
+    height: u32,
+    tone_map: bool,
+) -> Result<String, String> {
+    let mut chain = Vec::new();
+    if tone_map {
+        chain.push(s(TONEMAP_VAAPI));
+    }
+    let mut options = Vec::new();
+    if height < stream.height {
+        options.push(format!("w=-2:h={height}"));
+    }
+    if stream.bit_depth > 8 && !tone_map {
+        options.push(s("format=nv12"));
+    }
+    if !options.is_empty() {
+        chain.push(format!("scale_vaapi={}", options.join(":")));
+    }
+    let video = format!("[0:{}]", stream.index);
+    Ok(match burned(spec)? {
+        Some(track) => {
+            let mut graph = format!(
+                "[{}]scale={}:{},format=rgba,hwupload[subs];{video}[subs]overlay_vaapi",
+                pictures_input(&track.source),
+                stream.width,
+                stream.height
+            );
+            for filter in chain {
+                graph.push(',');
+                graph.push_str(&filter);
+            }
+            graph + "[v]"
+        }
+        None if chain.is_empty() => format!("{video}null[v]"),
+        None => format!("{video}{}[v]", chain.join(",")),
+    })
+}
+
+/// Where burned-in pictures come from: the film's own stream, or the
+/// external file, the second input.
+fn pictures_input(source: &SubtitleSource) -> String {
+    match source {
+        SubtitleSource::Embedded { index } => format!("0:{index}"),
+        SubtitleSource::External { .. } => s("1:0"),
+    }
+}
+
 /// The arguments, or why there are none: a plan naming an encoder this
 /// machine does not have, or a stream the file does not have.
 pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
@@ -94,8 +362,30 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
         _ => None,
     };
     let vaapi = encoder.is_some_and(|e| e.hardware == Some(Hardware::Vaapi));
-    if vaapi {
+    let decode = decode(spec);
+    // Frames decoded on the GPU and left there bring their device to the
+    // encoder; uploaded ones need it named.
+    if vaapi && decode != Decode::Gpu {
         args.extend([s("-vaapi_device"), s(spec.vaapi_device.display())]);
+    }
+    // An option of the film's input, so before its seek.
+    if decode == Decode::Gpu && matches!(burned(spec), Ok(Some(_))) {
+        // The pictures are uploaded to the device the film decodes on:
+        // one device, named, for both.
+        args.extend([
+            s("-init_hw_device"),
+            format!("vaapi=gpu:{}", spec.vaapi_device.display()),
+            s("-filter_hw_device"),
+            s("gpu"),
+        ]);
+        args.extend(["-hwaccel", "vaapi", "-hwaccel_device", "gpu"].map(s));
+        args.extend(["-hwaccel_output_format", "vaapi"].map(s));
+    } else if decode != Decode::Software {
+        args.extend(hwaccel_args(
+            Hardware::Vaapi,
+            spec.vaapi_device,
+            decode == Decode::Gpu,
+        ));
     }
 
     let seek = |args: &mut Vec<String>| {
@@ -171,65 +461,10 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 tone_map,
             } => {
                 let encoder = encoder.expect("set above for an encode");
-                let mut chain = Vec::new();
-                let mut source = format!("[0:{}]", stream.index);
-                if let Some(sub) = spec.subtitle
-                    && let SubtitleAction::BurnIn { .. } = sub.action
-                {
-                    let picked = d
-                        .subtitles
-                        .get(sub.index as usize)
-                        .ok_or_else(|| format!("subtitle {}: no such track", sub.index))?;
-                    match (&picked.source, picked.kind) {
-                        (source_of, SubtitleKind::Bitmap) => {
-                            // An external file is the second input.
-                            let pictures = match source_of {
-                                SubtitleSource::Embedded { index } => format!("0:{index}"),
-                                SubtitleSource::External { .. } => s("1:0"),
-                            };
-                            // Pictures go over the picture, their canvas
-                            // scaled to it first: Blu-ray PGS is 1080p even
-                            // over 4K video, and unscaled it would land
-                            // small in the top left.
-                            source = format!(
-                                "[{pictures}]scale={}:{}[subs];[0:{}][subs]overlay",
-                                stream.width, stream.height, stream.index
-                            );
-                        }
-                        (SubtitleSource::Embedded { .. }, SubtitleKind::Text) => {
-                            let nth = d.subtitles[..sub.index as usize]
-                                .iter()
-                                .filter(|s| matches!(s.source, SubtitleSource::Embedded { .. }))
-                                .count();
-                            chain.push(format!(
-                                "subtitles=filename={}:si={nth}",
-                                filter_path(spec.input)?
-                            ));
-                        }
-                        (SubtitleSource::External { path }, SubtitleKind::Text) => {
-                            let path = spec.sidecar.unwrap_or(path);
-                            chain.push(format!("subtitles=filename={}", filter_path(path)?));
-                        }
-                    }
-                }
-                if tone_map {
-                    chain.push(s(TONE_MAP));
-                }
-                if height < stream.height {
-                    chain.push(format!("scale=-2:{height}"));
-                }
-                if vaapi {
-                    chain.push(s("format=nv12,hwupload"));
-                } else if codec == VideoCodec::H264 && !tone_map {
-                    // H.264 decoders expect 8-bit 4:2:0.
-                    chain.push(s("format=yuv420p"));
-                }
-                let graph = if chain.is_empty() {
-                    format!("{source}null[v]")
-                } else if source.ends_with("overlay") {
-                    format!("{source},{}[v]", chain.join(","))
+                let graph = if decode == Decode::Gpu {
+                    gpu_graph(spec, stream, height, tone_map)?
                 } else {
-                    format!("{source}{}[v]", chain.join(","))
+                    cpu_graph(spec, stream, codec, height, tone_map, vaapi)?
                 };
                 args.extend([s("-filter_complex"), graph, s("-map"), s("[v]")]);
                 args.extend([s("-c:v"), encoder.name.clone()]);
@@ -408,7 +643,7 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
 mod tests {
     use std::time::Duration;
 
-    use spoolframe_media::encoders::{AudioEncoder, VideoEncoder};
+    use spoolframe_media::encoders::{AudioEncoder, HardwareDecoder, VideoEncoder};
     use spoolframe_media::{AudioStream, SubtitleStream, VideoStream};
     use spoolframe_types::{AudioCodec, AudioRole, HdrFormat, SubtitleRole};
 
@@ -500,6 +735,8 @@ mod tests {
                 },
             ],
             hardware_decoders: Vec::new(),
+            gpu_tonemap: false,
+            gpu_overlay: false,
             unusable: Vec::new(),
         }
     }
@@ -524,9 +761,487 @@ mod tests {
             subtitle,
             encoders,
             vaapi_device: Path::new("/dev/dri/renderD128"),
+            hardware_decode: true,
+            gpu_filters: false,
             start: None,
             output,
         }
+    }
+
+    /// `encoders(vaapi)`, with VA-API decoders for H.264, HEVC and AV1,
+    /// as on the dev machine.
+    fn with_decoders(vaapi: bool) -> Encoders {
+        Encoders {
+            hardware_decoders: [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1]
+                .map(|codec| HardwareDecoder {
+                    codec,
+                    hardware: Hardware::Vaapi,
+                })
+                .to_vec(),
+            ..encoders(vaapi)
+        }
+    }
+
+    /// An H.264 encode to 1080p, tone-mapped: on the CPU whatever decodes.
+    const TONE_MAPPED_H264: ConvertedVideo = ConvertedVideo::Encode {
+        codec: VideoCodec::H264,
+        height: 1080,
+        max_bitrate: None,
+        tone_map: true,
+    };
+
+    fn position(args: &[String], flag: &str) -> usize {
+        args.iter()
+            .position(|a| a == flag)
+            .unwrap_or_else(|| panic!("no {flag} in {args:?}"))
+    }
+
+    #[test]
+    fn a_vaapi_encode_decodes_on_the_gpu_into_memory_where_a_decoder_was_found() {
+        let (film, enc) = (film(), with_decoders(true));
+        let mut spec = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, hls());
+        spec.start = Some(Duration::from_secs(600));
+        assert_eq!(decode(&spec), Decode::Hardware);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(
+            has(
+                &args,
+                &[
+                    "-hwaccel",
+                    "vaapi",
+                    "-hwaccel_device",
+                    "/dev/dri/renderD128"
+                ]
+            ),
+            "{args:?}"
+        );
+        // The frames come back to memory, for the filters on the CPU.
+        assert!(!args.contains(&s("-hwaccel_output_format")), "{args:?}");
+        // An input option: before the seek and the film.
+        assert!(position(&args, "-hwaccel") < position(&args, "-ss"));
+        assert!(position(&args, "-hwaccel") < position(&args, "-i"));
+        // The chain is as it was: tone-mapped, scaled and uploaded on the
+        // CPU's side.
+        let graph = after(&args, "-filter_complex");
+        assert!(graph.contains("tonemap=tonemap=hable"), "{graph}");
+        assert!(graph.ends_with("format=nv12,hwupload[v]"), "{graph}");
+    }
+
+    #[test]
+    fn a_codec_without_a_hardware_decoder_decodes_in_software() {
+        let film = film();
+        // Detection found no decoder at all.
+        let enc = encoders(true);
+        let none = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, hls());
+        assert_eq!(decode(&none), Decode::Software);
+        assert!(!ffmpeg_args(&none).unwrap().contains(&s("-hwaccel")));
+        // Nor for this codec.
+        let enc = Encoders {
+            hardware_decoders: vec![HardwareDecoder {
+                codec: VideoCodec::H264,
+                hardware: Hardware::Vaapi,
+            }],
+            ..encoders(true)
+        };
+        let spec = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, hls());
+        assert_eq!(decode(&spec), Decode::Software);
+    }
+
+    /// A libx264 encode decodes on the GPU too, into memory, where it
+    /// encodes: it takes no VA-API device of its own.
+    #[test]
+    fn a_software_encode_decodes_on_the_gpu_into_memory() {
+        let (film, enc) = (film(), with_decoders(false));
+        // Not even a filter on the CPU keeps frames on the GPU for it.
+        let spec = spec(&film, &enc, plain_h264(1080), COPY_DTS, None, hls());
+        assert_eq!(decode(&spec), Decode::Hardware);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(
+            has(
+                &args,
+                &[
+                    "-hwaccel",
+                    "vaapi",
+                    "-hwaccel_device",
+                    "/dev/dri/renderD128",
+                    "-i"
+                ]
+            ),
+            "{args:?}"
+        );
+        assert!(!args.contains(&s("-vaapi_device")), "{args:?}");
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[0:0]scale=-2:1080,format=yuv420p[v]"
+        );
+        assert!(has(&args, &["-c:v", "libx264"]));
+    }
+
+    /// NVENC would decode with CUDA, which nothing here sets up.
+    #[test]
+    fn an_nvenc_encode_decodes_in_software() {
+        let film = film();
+        let mut enc = with_decoders(true);
+        for encoder in &mut enc.video {
+            encoder.hardware = Some(Hardware::Nvenc);
+            encoder.name = encoder.name.replace("vaapi", "nvenc");
+        }
+        let spec = spec(&film, &enc, plain_h264(1080), COPY_DTS, None, hls());
+        assert_eq!(decode(&spec), Decode::Software);
+        assert!(!ffmpeg_args(&spec).unwrap().contains(&s("-hwaccel")));
+    }
+
+    #[test]
+    fn a_file_whose_hardware_decode_failed_decodes_in_software() {
+        let (film, enc) = (film(), with_decoders(true));
+        let mut spec = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, hls());
+        spec.hardware_decode = false;
+        assert_eq!(decode(&spec), Decode::Software);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(!args.contains(&s("-hwaccel")), "{args:?}");
+        // Still encoded on the GPU.
+        assert!(has(&args, &["-c:v", "h264_vaapi"]));
+    }
+
+    #[test]
+    fn a_copied_video_is_not_decoded() {
+        let (film, enc) = (film(), with_decoders(true));
+        let spec = spec(&film, &enc, COPY_HEVC, COPY_DTS, None, hls());
+        assert_eq!(decode(&spec), Decode::Software);
+        assert!(!ffmpeg_args(&spec).unwrap().contains(&s("-hwaccel")));
+    }
+
+    /// No VA-API driver decodes 10-bit H.264 or 4:2:2: not tried.
+    /// An H.264 encode to `height`, nothing more.
+    fn plain_h264(height: u32) -> ConvertedVideo {
+        ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height,
+            max_bitrate: Some(8_000_000),
+            tone_map: false,
+        }
+    }
+
+    /// `film()` as an SDR 1080p 8-bit H.264 file.
+    fn sdr_1080p() -> MediaDescriptor {
+        let mut film = film();
+        let video = film.video.as_mut().unwrap();
+        video.codec = "h264".into();
+        video.profile = Some("High".into());
+        (video.width, video.height) = (1920, 1080);
+        video.pixel_format = Some("yuv420p".into());
+        video.bit_depth = 8;
+        video.color_transfer = None;
+        video.hdr = None;
+        film
+    }
+
+    #[test]
+    fn a_vaapi_encode_with_no_filter_on_the_cpu_stays_on_the_gpu() {
+        let enc = with_decoders(true);
+        // 4K 10-bit HEVC to 1080p H.264, not tone-mapped.
+        let film = film();
+        let spec = spec(&film, &enc, plain_h264(1080), COPY_DTS, None, hls());
+        assert_eq!(decode(&spec), Decode::Gpu);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(
+            has(
+                &args,
+                &[
+                    "-hwaccel",
+                    "vaapi",
+                    "-hwaccel_device",
+                    "/dev/dri/renderD128",
+                    "-hwaccel_output_format",
+                    "vaapi",
+                    "-i",
+                    "/media/Film.mkv"
+                ]
+            ),
+            "{args:?}"
+        );
+        // Scaled on the GPU to an even width, and 8-bit as the CPU's
+        // chain makes it; no upload, the frames are there.
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[0:0]scale_vaapi=w=-2:h=1080:format=nv12[v]"
+        );
+        assert!(has(&args, &["-map", "[v]", "-c:v", "h264_vaapi"]));
+        // The encoder takes its device from the frames.
+        assert!(!args.contains(&s("-vaapi_device")), "{args:?}");
+    }
+
+    #[test]
+    fn on_the_gpu_a_video_kept_at_its_height_is_only_converted_to_8_bits() {
+        let enc = with_decoders(true);
+        let film = film();
+        let same = spec(&film, &enc, plain_h264(2160), COPY_DTS, None, hls());
+        assert_eq!(decode(&same), Decode::Gpu);
+        assert_eq!(
+            after(&ffmpeg_args(&same).unwrap(), "-filter_complex"),
+            "[0:0]scale_vaapi=format=nv12[v]"
+        );
+        let sdr = sdr_1080p();
+        let plain = spec(&sdr, &enc, plain_h264(1080), COPY_DTS, None, hls());
+        assert_eq!(decode(&plain), Decode::Gpu);
+        assert_eq!(
+            after(&ffmpeg_args(&plain).unwrap(), "-filter_complex"),
+            "[0:0]null[v]"
+        );
+        let smaller = spec(&sdr, &enc, plain_h264(720), COPY_DTS, None, hls());
+        assert_eq!(
+            after(&ffmpeg_args(&smaller).unwrap(), "-filter_complex"),
+            "[0:0]scale_vaapi=w=-2:h=720[v]"
+        );
+    }
+
+    /// Tone mapping and burn-in run on the CPU: the frames come back to
+    /// memory for them.
+    #[test]
+    fn a_filter_on_the_cpu_keeps_the_gpu_decode_in_memory() {
+        let enc = with_decoders(true);
+        let film = film();
+        let tone_mapped = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, hls());
+        assert_eq!(decode(&tone_mapped), Decode::Hardware);
+        let burn = |index| ConvertedSubtitle {
+            index,
+            action: SubtitleAction::BurnIn {
+                format: SubtitleFormat::Pgs,
+            },
+        };
+        for index in [0, 1] {
+            let burned = spec(
+                &film,
+                &enc,
+                plain_h264(1080),
+                COPY_DTS,
+                Some(burn(index)),
+                hls(),
+            );
+            assert_eq!(decode(&burned), Decode::Hardware, "subtitle {index}");
+            let args = ffmpeg_args(&burned).unwrap();
+            assert!(!args.contains(&s("-hwaccel_output_format")), "{args:?}");
+            assert!(after(&args, "-filter_complex").ends_with("format=nv12,hwupload[v]"));
+        }
+        // A subtitle kept as a stream needs no filter.
+        let kept = ConvertedSubtitle {
+            index: 1,
+            action: SubtitleAction::Copy {
+                format: SubtitleFormat::Srt,
+            },
+        };
+        let spec = spec(
+            &film,
+            &enc,
+            plain_h264(1080),
+            COPY_DTS,
+            Some(kept),
+            progressive(),
+        );
+        assert_eq!(decode(&spec), Decode::Gpu);
+    }
+
+    /// What runs when the GPU path fails: the CPU's chain, decoded in
+    /// software, still encoded on the GPU.
+    #[test]
+    fn the_gpu_path_s_fallback_is_the_cpu_chain() {
+        let (film, enc) = (film(), with_decoders(true));
+        let mut spec = spec(&film, &enc, plain_h264(1080), COPY_DTS, None, hls());
+        assert_eq!(decode(&spec), Decode::Gpu);
+        spec.hardware_decode = false;
+        assert_eq!(decode(&spec), Decode::Software);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(!args.contains(&s("-hwaccel")), "{args:?}");
+        assert_eq!(after(&args, "-vaapi_device"), "/dev/dri/renderD128");
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[0:0]scale=-2:1080,format=nv12,hwupload[v]"
+        );
+    }
+
+    /// `with_decoders(true)` on a driver with these GPU filters.
+    fn with_filters(tonemap: bool, overlay: bool) -> Encoders {
+        Encoders {
+            gpu_tonemap: tonemap,
+            gpu_overlay: overlay,
+            ..with_decoders(true)
+        }
+    }
+
+    fn burn_in(index: u32, format: SubtitleFormat) -> Option<ConvertedSubtitle> {
+        Some(ConvertedSubtitle {
+            index,
+            action: SubtitleAction::BurnIn { format },
+        })
+    }
+
+    #[test]
+    fn with_gpu_filters_off_the_cpu_tone_maps_where_the_gpu_could() {
+        let (film, enc) = (film(), with_filters(true, true));
+        let spec = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, hls());
+        assert_eq!(decode(&spec), Decode::Hardware);
+        let graph = s(after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"));
+        assert!(graph.contains("tonemap=tonemap=hable"), "{graph}");
+        assert!(!graph.contains("tonemap_vaapi"), "{graph}");
+        assert!(cpu_instead_of_gpu(&spec).is_empty());
+        // Nor pictures.
+        let pgs = burn_in(0, SubtitleFormat::Pgs);
+        let burned = spec_with(&film, &enc, plain_h264(1080), pgs);
+        assert_eq!(decode(&burned), Decode::Hardware);
+        let graph = s(after(&ffmpeg_args(&burned).unwrap(), "-filter_complex"));
+        assert!(
+            graph.contains("overlay,") && !graph.contains("overlay_vaapi"),
+            "{graph}"
+        );
+    }
+
+    fn spec_with<'a>(
+        film: &'a MediaDescriptor,
+        encoders: &'a Encoders,
+        video: ConvertedVideo,
+        subtitle: Option<ConvertedSubtitle>,
+    ) -> EncodeSpec<'a> {
+        spec(film, encoders, video, COPY_DTS, subtitle, hls())
+    }
+
+    #[test]
+    fn with_gpu_filters_on_the_gpu_tone_maps_where_its_driver_can() {
+        let (film, enc) = (film(), with_filters(true, false));
+        let mut spec = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, hls());
+        spec.gpu_filters = true;
+        assert_eq!(decode(&spec), Decode::Gpu);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert_eq!(after(&args, "-hwaccel_output_format"), "vaapi");
+        // To 8-bit SDR, then scaled.
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[0:0]tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,\
+             scale_vaapi=w=-2:h=1080[v]"
+        );
+        assert!(!args.contains(&s("hwupload")));
+        assert!(cpu_instead_of_gpu(&spec).is_empty());
+        // At its own height, only tone-mapped.
+        let mut same = spec.clone();
+        same.video = Some(ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height: 2160,
+            max_bitrate: None,
+            tone_map: true,
+        });
+        assert_eq!(
+            after(&ffmpeg_args(&same).unwrap(), "-filter_complex"),
+            "[0:0]tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709[v]"
+        );
+    }
+
+    #[test]
+    fn with_gpu_filters_on_a_driver_that_cannot_tone_map_leaves_it_to_the_cpu() {
+        let (film, enc) = (film(), with_filters(false, true));
+        let mut spec = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, hls());
+        spec.gpu_filters = true;
+        assert_eq!(decode(&spec), Decode::Hardware);
+        let graph = s(after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"));
+        assert!(graph.contains("tonemap=tonemap=hable"), "{graph}");
+        assert_eq!(
+            cpu_instead_of_gpu(&spec),
+            ["the GPU's driver does not tone map (tonemap_vaapi)"]
+        );
+    }
+
+    #[test]
+    fn with_gpu_filters_on_pictures_are_burned_in_on_the_gpu_where_its_driver_can() {
+        let (film, enc) = (film(), with_filters(false, true));
+        // Embedded PGS, then an external one: the second input.
+        for (index, pictures) in [(0, "0:2"), (3, "1:0")] {
+            let mut spec = spec(
+                &film,
+                &enc,
+                plain_h264(1080),
+                COPY_DTS,
+                burn_in(index, SubtitleFormat::Pgs),
+                progressive(),
+            );
+            spec.sidecar = Some(Path::new("/scratch/h/0/sidecar"));
+            spec.gpu_filters = true;
+            assert_eq!(decode(&spec), Decode::Gpu, "subtitle {index}");
+            let args = ffmpeg_args(&spec).unwrap();
+            // One device for the decode and the pictures' upload.
+            assert!(
+                has(
+                    &args,
+                    &[
+                        "-init_hw_device",
+                        "vaapi=gpu:/dev/dri/renderD128",
+                        "-filter_hw_device",
+                        "gpu",
+                        "-hwaccel",
+                        "vaapi",
+                        "-hwaccel_device",
+                        "gpu",
+                        "-hwaccel_output_format",
+                        "vaapi"
+                    ]
+                ),
+                "{args:?}"
+            );
+            // The pictures' canvas scaled to the video, laid over it
+            // before it is scaled, as on the CPU.
+            assert_eq!(
+                after(&args, "-filter_complex"),
+                format!(
+                    "[{pictures}]scale=3840:2160,format=rgba,hwupload[subs];\
+                     [0:0][subs]overlay_vaapi,scale_vaapi=w=-2:h=1080:format=nv12[v]"
+                )
+            );
+            assert!(cpu_instead_of_gpu(&spec).is_empty());
+        }
+    }
+
+    #[test]
+    fn with_gpu_filters_on_text_and_what_the_driver_lacks_stay_on_the_cpu() {
+        let film = film();
+        let all = with_filters(true, true);
+        let text = burn_in(1, SubtitleFormat::Srt);
+        let mut spec_text = spec(&film, &all, plain_h264(1080), COPY_DTS, text, hls());
+        spec_text.gpu_filters = true;
+        assert_eq!(decode(&spec_text), Decode::Hardware);
+        assert!(
+            after(&ffmpeg_args(&spec_text).unwrap(), "-filter_complex")
+                .contains("subtitles=filename=")
+        );
+        assert_eq!(
+            cpu_instead_of_gpu(&spec_text),
+            ["text subtitles are burned in on the CPU"]
+        );
+        // Pictures on a driver that cannot overlay: tone map and burn-in
+        // both on the CPU, the frames being there anyway.
+        let no_overlay = with_filters(true, false);
+        let pgs = burn_in(0, SubtitleFormat::Pgs);
+        let mut spec = spec(&film, &no_overlay, TONE_MAPPED_H264, COPY_DTS, pgs, hls());
+        spec.gpu_filters = true;
+        assert_eq!(decode(&spec), Decode::Hardware);
+        let graph = s(after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"));
+        assert!(graph.contains("overlay,") && graph.contains("tonemap=tonemap=hable"));
+        assert_eq!(
+            cpu_instead_of_gpu(&spec),
+            ["the GPU's driver does not overlay pictures (overlay_vaapi)"]
+        );
+    }
+
+    #[test]
+    fn streams_no_gpu_decodes_are_decoded_in_software() {
+        let enc = with_decoders(true);
+        let mut high10 = film();
+        let video = high10.video.as_mut().unwrap();
+        video.codec = "h264".into();
+        video.profile = Some("High 10".into());
+        let spec_of = |film| spec(film, &enc, TONE_MAPPED_H264, COPY_DTS, None, hls());
+        assert_eq!(decode(&spec_of(&high10)), Decode::Software);
+        let mut four_two_two = film();
+        four_two_two.video.as_mut().unwrap().pixel_format = Some("yuv422p10le".into());
+        assert_eq!(decode(&spec_of(&four_two_two)), Decode::Software);
+        // 10-bit HEVC is decoded.
+        assert_eq!(decode(&spec_of(&film())), Decode::Hardware);
     }
 
     fn progressive() -> Output {

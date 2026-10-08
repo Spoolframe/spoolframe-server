@@ -651,8 +651,9 @@ impl PreviewsConfig {
 }
 
 /// `transcode { hardware = "nvenc,vaapi"; vaapi_device = "/dev/dri/renderD128";
-/// max_jobs = 2; scratch_dir = "…"; scratch_limit_mb = 20480;
-/// read_ahead_secs = 60; }`, all optional.
+/// max_jobs = 2; max_remux = 32; max_gpu_jobs = 3; scratch_dir = "…";
+/// scratch_limit_mb = 20480; read_ahead_secs = 60; gpu_filters = false; }`,
+/// all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct TranscodeConfig {
@@ -663,9 +664,18 @@ pub struct TranscodeConfig {
     pub hardware: Option<String>,
     #[ucl(default)]
     pub vaapi_device: Option<PathBuf>,
-    /// Encodes at once; 2 if left out.
+    /// The encode budget, in software video encodes; 2 if left out. A
+    /// GPU video encode weighs half of one, or a quarter when decoded and
+    /// scaled on the GPU too; an audio-only encode a quarter; a remux
+    /// nothing.
     #[ucl(default)]
     pub max_jobs: Option<u32>,
+    /// Remuxes at once; 32 if left out.
+    #[ucl(default)]
+    pub max_remux: Option<u32>,
+    /// GPU video encodes at once, within the budget too; 3 if left out.
+    #[ucl(default)]
+    pub max_gpu_jobs: Option<u32>,
     /// Where encodes write, in a directory of their own made there;
     /// `state_dir/cache/transcode` if left out.
     #[ucl(default)]
@@ -677,20 +687,30 @@ pub struct TranscodeConfig {
     /// Any value works: 0 holds the encode whenever its reader is behind.
     #[ucl(default)]
     pub read_ahead_secs: Option<u64>,
+    /// Tone map and burn in picture subtitles on the GPU, where its driver
+    /// can, rather than on the CPU; off if left out.
+    #[ucl(default)]
+    pub gpu_filters: Option<bool>,
 }
 
 impl TranscodeConfig {
     /// The job limits, with `state_dir` for the default scratch directory.
     pub fn limits(&self, state_dir: &Path) -> Result<JobLimits, ConfigError> {
-        let max_jobs = self.max_jobs.unwrap_or(2);
-        if max_jobs == 0 {
-            return Err(ConfigError::Invalid {
-                key: "transcode.max_jobs",
-                message: "0 would refuse every conversion; use at least 1".into(),
-            });
-        }
+        let at_least_one =
+            |key: &'static str, value: Option<u32>, default: u32| match value.unwrap_or(default) {
+                0 => Err(ConfigError::Invalid {
+                    key,
+                    message: "0 would refuse every conversion; use at least 1".into(),
+                }),
+                n => Ok(n),
+            };
+        let max_jobs = at_least_one("transcode.max_jobs", self.max_jobs, 2)?;
+        let max_remux = at_least_one("transcode.max_remux", self.max_remux, 32)?;
+        let max_gpu_jobs = at_least_one("transcode.max_gpu_jobs", self.max_gpu_jobs, 3)?;
         Ok(JobLimits {
-            max_jobs: max_jobs as usize,
+            budget: crate::encode::Units::jobs(max_jobs),
+            max_remux: max_remux as usize,
+            max_gpu_jobs: max_gpu_jobs as usize,
             scratch_dir: self
                 .scratch_dir
                 .clone()
@@ -698,6 +718,7 @@ impl TranscodeConfig {
             scratch_limit_bytes: self.scratch_limit_mb.unwrap_or(20 * 1024) << 20,
             read_ahead: Duration::from_secs(self.read_ahead_secs.unwrap_or(60)),
             stalled_after: crate::encode::job::STALLED_AFTER,
+            gpu_filters: self.gpu_filters.unwrap_or(false),
         })
     }
 
@@ -2094,24 +2115,48 @@ mod tests {
     fn job_limits_default_under_the_state_dir() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         let limits = config.transcode.limits(Path::new("/var/lib/sf")).unwrap();
-        assert_eq!(limits.max_jobs, 2);
+        assert_eq!(limits.budget, crate::encode::Units::jobs(2));
+        assert_eq!(limits.max_remux, 32);
+        assert_eq!(limits.max_gpu_jobs, 3);
         assert_eq!(
             limits.scratch_dir,
             PathBuf::from("/var/lib/sf/cache/transcode")
         );
         assert_eq!(limits.scratch_limit_bytes, 20 << 30);
         assert_eq!(limits.read_ahead, Duration::from_secs(60));
+        assert!(!limits.gpu_filters);
+    }
+
+    #[test]
+    fn gpu_filters_are_turned_on() {
+        let config =
+            plex(r#"plex { url = "http://nas:32400"; } transcode { gpu_filters = true; }"#)
+                .unwrap();
+        assert!(config.transcode.limits(Path::new("/")).unwrap().gpu_filters);
     }
 
     #[test]
     fn zero_jobs_is_refused() {
-        assert!(matches!(
-            plex(r#"plex { url = "http://nas:32400"; } transcode { max_jobs = 0; }"#),
-            Err(ConfigError::Invalid {
-                key: "transcode.max_jobs",
-                ..
-            })
-        ));
+        for key in ["max_jobs", "max_remux", "max_gpu_jobs"] {
+            let text =
+                format!(r#"plex {{ url = "http://nas:32400"; }} transcode {{ {key} = 0; }}"#);
+            let err = plex(&text).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::Invalid { key: k, .. } if *k == format!("transcode.{key}")),
+                "{text}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_remux_and_gpu_caps_are_read() {
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; } transcode { max_jobs = 3; max_remux = 8; max_gpu_jobs = 1; }"#,
+        )
+        .unwrap();
+        let limits = config.transcode.limits(Path::new("/")).unwrap();
+        assert_eq!(limits.budget, crate::encode::Units::jobs(3));
+        assert_eq!((limits.max_remux, limits.max_gpu_jobs), (8, 1));
     }
 
     #[test]

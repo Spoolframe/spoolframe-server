@@ -18,17 +18,24 @@ use spoolframe_protocol::{
 };
 use spoolframe_types::{Delivery, SubtitleFormat};
 
-use self::args::{EncodeSpec, Output, ffmpeg_args};
+use self::args::{Decode, EncodeSpec, Output, decode, ffmpeg_args};
 use self::hls::Segments;
-use self::job::{EncodeJob, JobError, Jobs, Run, Slot, Written};
-pub use self::job::{Encoding, EncodingGuard};
+pub use self::job::{BudgetUse, Encoding, EncodingGuard, Load, Units};
+use self::job::{EncodeJob, Fallback, JobError, Jobs, Run, Slot, Written};
 
 /// What the server allows encodes (`transcode { … }`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobLimits {
-    /// Encodes at once, copy-only ones too. One more is refused with
-    /// `Busy`, never queued.
-    pub max_jobs: usize,
+    /// The encode budget (`transcode.max_jobs`): what the conversions
+    /// running may weigh together ([`Load::weight`]). One that does not
+    /// fit is refused with `Busy`, never queued.
+    pub budget: Units,
+    /// Remuxes at once (`transcode.max_remux`): they weigh nothing, and
+    /// this bounds their file descriptors and disk.
+    pub max_remux: usize,
+    /// GPU video encodes at once (`transcode.max_gpu_jobs`), within the
+    /// budget too.
+    pub max_gpu_jobs: usize,
     /// Where jobs write, in a directory of their own
     /// ([`job::JOBS_DIR`]). Only that is emptied at start.
     pub scratch_dir: PathBuf,
@@ -40,6 +47,9 @@ pub struct JobLimits {
     /// reporting more encoded time before it is ended as stalled
     /// ([`job::STALLED_AFTER`]; tests shorten it).
     pub stalled_after: Duration,
+    /// Tone map and burn in pictures on the GPU where the driver can
+    /// (`transcode.gpu_filters`), rather than on the CPU.
+    pub gpu_filters: bool,
 }
 
 /// A playback's conversion: what to encode, and the encode running now.
@@ -55,6 +65,8 @@ pub struct Conversion {
     /// `<jobs>/<handle>`: the links to the input, and one directory per
     /// epoch.
     dir: PathBuf,
+    /// The film itself, which a failed GPU decode is remembered by.
+    file: PathBuf,
     input: PathBuf,
     sidecar: Option<PathBuf>,
     descriptor: Arc<MediaDescriptor>,
@@ -183,6 +195,7 @@ impl Conversion {
         let job = spawn(
             &jobs,
             &dir,
+            source.path,
             &input,
             sidecar.as_deref(),
             &source.descriptor,
@@ -204,6 +217,7 @@ impl Conversion {
         Ok(Arc::new(Self {
             jobs,
             dir,
+            file: source.path.to_path_buf(),
             input,
             sidecar,
             descriptor: source.descriptor,
@@ -238,6 +252,11 @@ impl Conversion {
     /// copying them into another container (P3-14's plans).
     pub fn encodes(&self) -> bool {
         encodes(self.video, self.audio)
+    }
+
+    /// What it weighs against the encode budget: its running job's load.
+    pub fn load(&self) -> Load {
+        self.current.lock().load
     }
 
     /// For HLS, the segments.
@@ -301,7 +320,12 @@ impl Conversion {
                 Err(JobError::Prepare(ENDED.into()))
             };
         }
-        if n >= current.first_kept() && n <= head + SEGMENTS_AHEAD {
+        // A run whose GPU decode failed past its first segment has only
+        // what it wrote: past that, a run decoding in software goes on.
+        let failed_on_gpu = current.decodes_in_hardware()
+            && matches!(current.progress().borrow().done, Some(Err(_)))
+            && written.is_none_or(|w| n > w);
+        if n >= current.first_kept() && n <= head + SEGMENTS_AHEAD && !failed_on_gpu {
             return Ok(current.clone());
         }
         let start = segment_seek(segments, n, self.video);
@@ -309,6 +333,7 @@ impl Conversion {
         let job = spawn(
             &self.jobs,
             &self.dir,
+            &self.file,
             &self.input,
             self.sidecar.as_deref(),
             &self.descriptor,
@@ -350,6 +375,7 @@ impl Conversion {
         let job = spawn(
             &self.jobs,
             &self.dir,
+            &self.file,
             &self.input,
             self.sidecar.as_deref(),
             &self.descriptor,
@@ -430,6 +456,7 @@ type Parts = (
 fn spawn(
     jobs: &Jobs,
     dir: &Path,
+    file: &Path,
     input: &Path,
     sidecar: Option<&Path>,
     descriptor: &MediaDescriptor,
@@ -458,7 +485,7 @@ fn spawn(
             )
         }
     };
-    let args = ffmpeg_args(&EncodeSpec {
+    let spec = EncodeSpec {
         input,
         sidecar,
         descriptor,
@@ -467,10 +494,41 @@ fn spawn(
         subtitle,
         encoders,
         vaapi_device,
+        hardware_decode: !jobs.hardware_decode_failed(file),
+        gpu_filters: jobs.limits().gpu_filters,
         start,
         output,
-    })
-    .map_err(JobError::Prepare)?;
+    };
+    let args = ffmpeg_args(&spec).map_err(JobError::Prepare)?;
+    for why in args::cpu_instead_of_gpu(&spec) {
+        if jobs.first_note(why) {
+            tracing::info!(
+                reason = why,
+                "transcode.gpu_filters is on, but a conversion filters on the CPU"
+            );
+        }
+    }
+    let gpu_encode = match video {
+        Some(ConvertedVideo::Encode { codec, .. }) => encoders
+            .video_encoder(codec)
+            .is_some_and(|e| e.hardware.is_some()),
+        _ => false,
+    };
+    // Decoding on the GPU may fail for a stream detection's test did not
+    // cover: the same run decoding in software is ready for it.
+    let decode = decode(&spec);
+    let fallback = match decode {
+        Decode::Software => None,
+        Decode::Hardware | Decode::Gpu => Some(Fallback {
+            args: ffmpeg_args(&EncodeSpec {
+                hardware_decode: false,
+                ..spec
+            })
+            .map_err(JobError::Prepare)?,
+            gpu: gpu_encode,
+            file: file.to_path_buf(),
+        }),
+    };
     let first_segment = if delivery == Delivery::Hls {
         start_number
     } else {
@@ -485,27 +543,45 @@ fn spawn(
         .flatten()
         .filter_map(|link| std::fs::read_link(link).ok())
         .collect();
-    let gpu = match video {
-        Some(ConvertedVideo::Encode { codec, .. }) => encoders
-            .video_encoder(codec)
-            .is_some_and(|e| e.hardware.is_some()),
-        _ => false,
-    };
     jobs.start(
         job_dir,
         Run {
             args,
             inputs,
             reads: vec![dir.to_path_buf()],
-            gpu,
+            // The same device nodes and driver files decode as encode.
+            gpu: gpu_encode || decode != Decode::Software,
+            fallback,
         },
         written,
-        encodes(video, audio),
+        load(video, audio, gpu_encode, decode),
         epoch,
         first_segment,
         start_ms,
         slot,
     )
+}
+
+/// What a conversion weighs: its video encode, on the GPU or not, and if
+/// on the GPU all of it there (`decode`) or not, if it has one (a
+/// burned-in subtitle is one); else an audio encode; else a remux.
+///
+/// One all on the GPU whose decode fails and runs again in software
+/// keeps its weight until it ends: that is rare, and the film decodes in
+/// software from the next run on.
+fn load(
+    video: Option<ConvertedVideo>,
+    audio: Option<ConvertedAudio>,
+    gpu: bool,
+    decode: Decode,
+) -> Load {
+    match video {
+        Some(ConvertedVideo::Encode { .. }) if gpu && decode == Decode::Gpu => Load::GpuOnly,
+        Some(ConvertedVideo::Encode { .. }) if gpu => Load::Gpu,
+        Some(ConvertedVideo::Encode { .. }) => Load::Software,
+        _ if encodes(video, audio) => Load::Audio,
+        _ => Load::Remux,
+    }
 }
 
 /// Whether a conversion decodes and encodes a stream again, rather than
@@ -535,11 +611,14 @@ mod tests {
         let jobs = Arc::new(
             Jobs::new(
                 JobLimits {
-                    max_jobs: 1,
+                    budget: Units::jobs(1),
+                    max_remux: 32,
+                    max_gpu_jobs: 3,
                     scratch_dir: tmp.as_ref().join("scratch"),
                     scratch_limit_bytes: 1 << 30,
                     read_ahead: Duration::from_secs(60),
                     stalled_after: Duration::from_secs(60),
+                    gpu_filters: false,
                 },
                 spoolframe_media::sandbox::Tool::unconfined("ffmpeg"),
             )
@@ -583,6 +662,125 @@ mod tests {
         assert!(!jobs.dir().join("h1").exists(), "the job directory is left");
     }
 
+    /// A playback whose GPU decode failed mid-film: once its job has
+    /// failed, the next segment asked for past what it wrote starts a new
+    /// run there, decoding in software, rather than the failure being all
+    /// the playback gets.
+    #[tokio::test]
+    async fn a_gpu_decode_that_failed_mid_film_goes_on_in_software() {
+        use spoolframe_media::VideoStream;
+        use spoolframe_media::encoders::{Hardware, HardwareDecoder, VideoEncoder};
+        use spoolframe_types::{HdrFormat, VideoCodec};
+
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-conversion-gpu-decode").await;
+        // Decoding on the GPU: writes segment 1 and fails. In software:
+        // runs on.
+        let ffmpeg = job::tests::ffmpeg(
+            &tmp.as_ref().join("bin"),
+            "for a; do last=$a; done\n\
+             case \"$*\" in *-hwaccel*)\n\
+               d=$(dirname \"$last\"); printf x > \"$d/seg1.m4s\"\n\
+               printf '#EXTM3U\\nseg1.m4s\\n' > \"$last\"; echo out_time_us=6000000\n\
+               echo 'hardware decoding failed' >&2; exit 1;;\n\
+             esac\n\
+             exec sleep 30",
+        );
+        let jobs = Arc::new(
+            Jobs::new(
+                JobLimits {
+                    budget: Units::jobs(1),
+                    max_remux: 32,
+                    max_gpu_jobs: 3,
+                    scratch_dir: tmp.as_ref().join("scratch"),
+                    scratch_limit_bytes: 1 << 30,
+                    read_ahead: Duration::from_secs(60),
+                    stalled_after: Duration::from_secs(60),
+                    gpu_filters: false,
+                },
+                spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
+            )
+            .unwrap(),
+        );
+        let film = tmp.as_ref().join("film.mkv");
+        std::fs::write(&film, b"x").unwrap();
+        let descriptor = Arc::new(MediaDescriptor {
+            container: "matroska,webm".into(),
+            duration: Some(Duration::from_secs(60)),
+            bit_rate: None,
+            video: Some(VideoStream {
+                index: 0,
+                codec: "hevc".into(),
+                profile: Some("Main".into()),
+                level: None,
+                width: 1920,
+                height: 1080,
+                pixel_format: Some("yuv420p".into()),
+                color_transfer: None,
+                frame_rate_millis: Some(24_000),
+                bit_depth: 8,
+                hdr: None::<HdrFormat>,
+            }),
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        });
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: spoolframe_types::Container::Mp4,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: None,
+                tone_map: false,
+            }),
+            audio: None,
+            subtitle: None,
+            reasons: Vec::new(),
+        };
+        let encoders = Encoders {
+            video: vec![VideoEncoder {
+                codec: VideoCodec::H264,
+                name: "h264_vaapi".into(),
+                hardware: Some(Hardware::Vaapi),
+            }],
+            hardware_decoders: vec![HardwareDecoder {
+                codec: VideoCodec::Hevc,
+                hardware: Hardware::Vaapi,
+            }],
+            ..Encoders::software_baseline()
+        };
+        let conversion = Conversion::start(
+            jobs.clone(),
+            ConversionSource {
+                handle: "h1",
+                path: &film,
+                descriptor,
+                plan: &plan,
+                encoders: Arc::new(encoders),
+                vaapi_device: Path::new("/dev/dri/renderD128"),
+                keyframes: None,
+                first_epoch: 0,
+                slot: None,
+            },
+            None,
+        )
+        .unwrap();
+        let first = conversion.job();
+        assert!(first.command().contains(&"-hwaccel".to_owned()));
+        let mut progress = first.progress();
+        progress.wait_for(|p| p.done.is_some()).await.unwrap();
+        assert!(jobs.hardware_decode_failed(&film));
+        // Segment 1 was written: it is the failed run's still.
+        assert_eq!(conversion.job_for_segment(1).unwrap().epoch, 0);
+        let next = conversion.job_for_segment(2).unwrap();
+        assert_eq!(next.epoch, 1);
+        assert!(
+            !next.command().contains(&"-hwaccel".to_owned()),
+            "{:?}",
+            next.command()
+        );
+        assert_eq!(next.progress().borrow().done, None);
+    }
+
     #[test]
     fn only_a_stream_encoded_again_is_encoding() {
         use spoolframe_types::{AudioCodec, VideoCodec};
@@ -610,6 +808,62 @@ mod tests {
         });
         assert!(encodes(copy_video, encode_audio));
         assert!(encodes(None, encode_audio));
+    }
+
+    /// A burned-in subtitle is a video encode in the plan, so it weighs as
+    /// one: only the video and audio actions decide.
+    #[test]
+    fn a_conversion_weighs_its_heaviest_encode() {
+        use spoolframe_types::{AudioCodec, VideoCodec};
+        let copy_video = Some(ConvertedVideo::Copy {
+            codec: VideoCodec::H264,
+        });
+        let encode_video = Some(ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height: 1080,
+            max_bitrate: None,
+            tone_map: false,
+        });
+        let copy_audio = Some(ConvertedAudio {
+            index: 1,
+            action: AudioAction::Copy {
+                codec: AudioCodec::Aac,
+            },
+        });
+        let encode_audio = Some(ConvertedAudio {
+            index: 1,
+            action: AudioAction::Encode {
+                codec: AudioCodec::Aac,
+                channels: 2,
+                bitrate: 192_000,
+            },
+        });
+        let software = Decode::Software;
+        assert_eq!(load(copy_video, copy_audio, false, software), Load::Remux);
+        assert_eq!(load(copy_video, None, false, software), Load::Remux);
+        assert_eq!(load(copy_video, encode_audio, false, software), Load::Audio);
+        assert_eq!(load(None, encode_audio, false, software), Load::Audio);
+        assert_eq!(
+            load(encode_video, encode_audio, false, software),
+            Load::Software
+        );
+        assert_eq!(load(encode_video, copy_audio, true, software), Load::Gpu);
+        // The GPU flag is the video encoder's: an audio encode stays one.
+        assert_eq!(load(copy_video, encode_audio, true, software), Load::Audio);
+        // Decoded on the GPU too: all on the GPU only without filters on
+        // the CPU; a software encode is one whatever decodes.
+        assert_eq!(
+            load(encode_video, copy_audio, true, Decode::Gpu),
+            Load::GpuOnly
+        );
+        assert_eq!(
+            load(encode_video, copy_audio, true, Decode::Hardware),
+            Load::Gpu
+        );
+        assert_eq!(
+            load(encode_video, copy_audio, false, Decode::Hardware),
+            Load::Software
+        );
     }
 
     #[test]

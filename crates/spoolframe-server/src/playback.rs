@@ -499,6 +499,8 @@ pub struct ConversionSnapshot {
     pub stderr: Vec<String>,
     /// It encodes a stream, rather than only copying.
     pub encodes: bool,
+    /// What it weighs against the encode budget.
+    pub load: crate::encode::Load,
 }
 
 /// A playback that ended in the last hour (P3-15), as it was at the end.
@@ -550,6 +552,7 @@ impl Playback {
                     .map(|l| crate::redact::hide(l, &[handle]))
                     .collect(),
                 encodes: c.encodes(),
+                load: c.load(),
             }
         });
         Snapshot {

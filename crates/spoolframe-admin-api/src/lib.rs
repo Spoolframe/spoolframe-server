@@ -881,6 +881,86 @@ pub struct TranscodingStatus {
     pub audio_encoders: Vec<String>,
     /// Codecs with a working hardware decoder, as `hevc (vaapi)`.
     pub hardware_decoders: Vec<String>,
+    /// `transcode.gpu_filters`: tone map and burn in pictures on the GPU
+    /// where it can.
+    pub gpu_filters: bool,
+    /// The GPU tone maps HDR (`tonemap_vaapi`).
+    pub gpu_tonemap: bool,
+    /// The GPU lays pictures over video (`overlay_vaapi`).
+    pub gpu_overlay: bool,
+    /// The encode budget's use now; `None` where the server runs no
+    /// conversions.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub budget: Option<EncodeBudget>,
+}
+
+/// The encode budget (`transcode.max_jobs`) and the caps beside it, now.
+/// Budget amounts are in quarters of one software video encode: a GPU
+/// video encode weighs 2, or 1 all on the GPU; an audio-only one 1; a
+/// remux none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodeBudget {
+    pub used_quarters: u32,
+    pub max_quarters: u32,
+    /// Remuxes running, and `transcode.max_remux`.
+    pub remuxes: u32,
+    pub max_remux: u32,
+    /// GPU video encodes running, and `transcode.max_gpu_jobs`.
+    pub gpu_jobs: u32,
+    pub max_gpu_jobs: u32,
+}
+
+impl EncodeBudget {
+    /// "1.25 of 2", as `max_jobs` is written.
+    pub fn used_of_max(&self) -> String {
+        format!(
+            "{} of {}",
+            quarters(self.used_quarters),
+            quarters(self.max_quarters)
+        )
+    }
+}
+
+/// An amount of the encode budget, in software video encodes: `0.25`, `2`.
+pub fn quarters(n: u32) -> String {
+    let whole = n / 4;
+    match n % 4 {
+        0 => format!("{whole}"),
+        1 => format!("{whole}.25"),
+        2 => format!("{whole}.5"),
+        _ => format!("{whole}.75"),
+    }
+}
+
+/// What a conversion asks of the machine, which sets its weight against
+/// the encode budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConversionLoad {
+    /// Every stream copied: weighs nothing, under `transcode.max_remux`.
+    Remux,
+    /// Only the audio encoded.
+    Audio,
+    /// The video encoded on a GPU, under `transcode.max_gpu_jobs` too.
+    Gpu,
+    /// The video encoded in software.
+    Software,
+    /// The video decoded, scaled and encoded on a GPU, with nothing on
+    /// the CPU; under `transcode.max_gpu_jobs` too.
+    GpuOnly,
+}
+
+impl ConversionLoad {
+    pub fn label(self) -> &'static str {
+        match self {
+            ConversionLoad::Remux => "remux",
+            ConversionLoad::Audio => "audio encode",
+            ConversionLoad::Gpu => "GPU video encode",
+            ConversionLoad::Software => "software video encode",
+            ConversionLoad::GpuOnly => "video all on the GPU",
+        }
+    }
 }
 
 /// Where a setting's value comes from (P3-10).
@@ -1551,7 +1631,8 @@ pub struct ActivityTotals {
     pub playbacks_expired: u64,
     /// `PlaybackFailed` sent to clients.
     pub playbacks_failed: u64,
-    /// Conversions refused because `transcode.max_jobs` were running.
+    /// Conversions refused because they did not fit the encode budget
+    /// (`transcode.max_jobs`) or their own cap.
     pub conversions_refused: u64,
     /// Encodes ended for making no progress.
     pub conversions_stalled: u64,
@@ -1883,6 +1964,10 @@ pub struct ConversionState {
     pub failed: Option<String>,
     /// It encodes a stream, rather than only copying them.
     pub encodes: bool,
+    /// What it asks of the machine, and what that weighs against the
+    /// encode budget, in quarters ([`EncodeBudget`]).
+    pub load: ConversionLoad,
+    pub weight_quarters: u32,
 }
 
 /// One playback as Server › Playback lists it (P3-15).
@@ -2008,7 +2093,8 @@ pub enum PictureSubtitles {
     Auto,
     /// Always read as text.
     Text,
-    /// Always burned in.
+    /// Pictures: drawn by the device if it can, else burned in. Planned as
+    /// the client protocol's `burn_in`, which no longer forces a burn-in.
     BurnIn,
 }
 
@@ -3048,6 +3134,10 @@ mod required_field_tests {
                     video_encoders: Vec::new(),
                     audio_encoders: Vec::new(),
                     hardware_decoders: Vec::new(),
+                    gpu_filters: false,
+                    gpu_tonemap: false,
+                    gpu_overlay: false,
+                    budget: None,
                 },
                 mdns: false,
                 addresses: Vec::new(),

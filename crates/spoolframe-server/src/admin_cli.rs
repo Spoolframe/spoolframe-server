@@ -424,6 +424,12 @@ pub async fn status(listen: SocketAddr) -> Result<()> {
         "hardware decoders: {}",
         list(&status.transcoding.hardware_decoders)
     );
+    println!("GPU filters: {}", gpu_filters(&status.transcoding));
+    if let Some(budget) = &status.transcoding.budget {
+        println!("encode budget used: {}", budget.used_of_max());
+        println!("remuxes: {} of {}", budget.remuxes, budget.max_remux);
+        println!("GPU jobs: {} of {}", budget.gpu_jobs, budget.max_gpu_jobs);
+    }
     println!("mDNS: {}", if status.mdns { "on" } else { "off" });
     println!("addresses: {}", list(&status.addresses));
     println!("told to devices: {}", list(&status.told_addresses));
@@ -662,9 +668,49 @@ pub async fn config_change(listen: SocketAddr, key: &str, value: Option<&str>) -
     Ok(())
 }
 
+/// `transcode.gpu_filters`, and where each filter runs with it on: on
+/// the CPU where this GPU cannot.
+fn gpu_filters(t: &spoolframe_admin_api::TranscodingStatus) -> String {
+    if !t.gpu_filters {
+        return "off".to_owned();
+    }
+    let place = |gpu: bool| {
+        if gpu {
+            "on the GPU"
+        } else {
+            "on the CPU, this GPU cannot"
+        }
+    };
+    format!(
+        "on; tone map {}; picture subtitles {}; text subtitles on the CPU",
+        place(t.gpu_tonemap),
+        place(t.gpu_overlay)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_status_says_where_gpu_filters_run() {
+        let mut t = spoolframe_admin_api::TranscodingStatus {
+            video_encoders: Vec::new(),
+            audio_encoders: Vec::new(),
+            hardware_decoders: Vec::new(),
+            gpu_filters: false,
+            gpu_tonemap: true,
+            gpu_overlay: false,
+            budget: None,
+        };
+        assert_eq!(gpu_filters(&t), "off");
+        t.gpu_filters = true;
+        assert_eq!(
+            gpu_filters(&t),
+            "on; tone map on the GPU; picture subtitles on the CPU, this GPU cannot; \
+             text subtitles on the CPU"
+        );
+    }
 
     #[test]
     fn times_read_as_utc_dates() {

@@ -38,7 +38,8 @@ pub struct Live {
     pub cookies: CookiePolicy,
     /// `watch.*`.
     pub watch: Option<Arc<Watch>>,
-    /// `transcode.max_jobs`, `scratch_limit_mb` and `read_ahead_secs`.
+    /// `transcode.max_jobs`, `max_remux`, `max_gpu_jobs`, `scratch_limit_mb`,
+    /// `read_ahead_secs` and `gpu_filters`.
     pub jobs: Option<Arc<Jobs>>,
     /// `previews.*`.
     pub previews: Option<Arc<Previews>>,

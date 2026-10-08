@@ -127,6 +127,10 @@ pub struct Encoders {
     pub video: Vec<VideoEncoder>,
     pub audio: Vec<AudioEncoder>,
     pub hardware_decoders: Vec<HardwareDecoder>,
+    /// VA-API tone maps HDR to SDR on the GPU (`tonemap_vaapi`).
+    pub gpu_tonemap: bool,
+    /// VA-API lays pictures over video on the GPU (`overlay_vaapi`).
+    pub gpu_overlay: bool,
     /// Hardware the settings named that did not work, for the log.
     #[serde(skip)]
     pub unusable: Vec<Hardware>,
@@ -147,8 +151,17 @@ impl Encoders {
                 name: "aac".into(),
             }],
             hardware_decoders: Vec::new(),
+            gpu_tonemap: false,
+            gpu_overlay: false,
             unusable: Vec::new(),
         }
+    }
+
+    /// Whether `hardware` decoded `codec` in the test decode.
+    pub fn decodes(&self, codec: VideoCodec, hardware: Hardware) -> bool {
+        self.hardware_decoders
+            .iter()
+            .any(|d| d.codec == codec && d.hardware == hardware)
     }
 
     /// The preferred encoder for `codec`.
@@ -169,8 +182,15 @@ impl Encoders {
                 v.join(", ")
             }
         };
+        let filters = [
+            (self.gpu_tonemap, "tone map"),
+            (self.gpu_overlay, "overlay"),
+        ]
+        .into_iter()
+        .filter_map(|(found, name)| found.then_some(name))
+        .collect();
         format!(
-            "video: {}; audio: {}; hardware decoders: {}",
+            "video: {}; audio: {}; hardware decoders: {}; GPU filters: {}",
             names(self.video.iter().map(|e| e.name.as_str()).collect()),
             names(self.audio.iter().map(|e| e.name.as_str()).collect()),
             names(
@@ -179,6 +199,7 @@ impl Encoders {
                     .map(|d| d.codec.as_str())
                     .collect()
             ),
+            names(filters),
         )
     }
 }
@@ -257,6 +278,35 @@ fn encode_args(
     args
 }
 
+/// ffmpeg's options to decode the next input on `hardware`, VA-API on
+/// `vaapi_device`: previews, test decodes and transcodes all decode this
+/// way.
+///
+/// Without `keep_frames` the decoded frames come back to memory, where
+/// any software filter takes them; and a decoder that cannot take the
+/// stream (10-bit H.264, 4:2:2) falls back to software inside ffmpeg,
+/// with no error. With it they stay in GPU memory for GPU filters and
+/// encoders, and that same stream fails instead: software frames are not
+/// what the filters after it take.
+pub fn hwaccel_args(hardware: Hardware, vaapi_device: &Path, keep_frames: bool) -> Vec<String> {
+    let (name, format) = match hardware {
+        Hardware::Vaapi => ("vaapi", "vaapi"),
+        Hardware::Nvenc => ("cuda", "cuda"),
+        Hardware::Qsv => ("qsv", "qsv"),
+    };
+    let mut args = vec!["-hwaccel".to_owned(), name.to_owned()];
+    if hardware == Hardware::Vaapi {
+        args.extend([
+            "-hwaccel_device".to_owned(),
+            vaapi_device.display().to_string(),
+        ]);
+    }
+    if keep_frames {
+        args.extend(["-hwaccel_output_format".to_owned(), format.to_owned()]);
+    }
+    args
+}
+
 /// A one-second hardware decode of `sample`.
 fn decode_args(hardware: Hardware, sample: &Path, settings: &TranscodeSettings) -> Vec<String> {
     let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error"]
@@ -264,22 +314,7 @@ fn decode_args(hardware: Hardware, sample: &Path, settings: &TranscodeSettings) 
         .to_vec();
     // Asking for frames to stay in hardware memory makes a decode that
     // would fall back to software fail instead.
-    match hardware {
-        Hardware::Vaapi => args.extend([
-            "-hwaccel".into(),
-            "vaapi".into(),
-            "-hwaccel_device".into(),
-            settings.vaapi_device.display().to_string(),
-            "-hwaccel_output_format".into(),
-            "vaapi".into(),
-        ]),
-        Hardware::Nvenc => {
-            args.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"].map(String::from))
-        }
-        Hardware::Qsv => {
-            args.extend(["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"].map(String::from))
-        }
-    }
+    args.extend(hwaccel_args(hardware, &settings.vaapi_device, true));
     args.extend([
         "-i".into(),
         sample.display().to_string(),
@@ -372,12 +407,82 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
         .copied()
         .filter(|h| !video.iter().any(|e: &VideoEncoder| e.hardware == Some(*h)))
         .collect();
+    // GPU filters feed a VA-API encoder; drivers differ in which they
+    // have (Mesa: neither; Intel's iHD: both).
+    let vaapi = video.iter().any(|e| e.hardware == Some(Hardware::Vaapi));
+    let gpu_tonemap = vaapi && ffmpeg.succeeds(&tonemap_args(settings), scratch).await;
+    let gpu_overlay = vaapi && ffmpeg.succeeds(&overlay_args(settings), scratch).await;
     Encoders {
         video,
         audio,
         hardware_decoders,
+        gpu_tonemap,
+        gpu_overlay,
         unusable,
     }
+}
+
+/// HDR (PQ or HLG) to SDR BT.709 on the GPU, in 8 bits: the transcodes'
+/// tone map when the GPU does it.
+pub const TONEMAP_VAAPI: &str = "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709";
+
+/// The start of a one-second VA-API filter test on the render node.
+fn filter_test(settings: &TranscodeSettings) -> Vec<String> {
+    vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-init_hw_device".into(),
+        format!("vaapi=va:{}", settings.vaapi_device.display()),
+        "-filter_hw_device".into(),
+        "va".into(),
+    ]
+}
+
+/// A second of HDR10 test pattern tone mapped on the GPU.
+fn tonemap_args(settings: &TranscodeSettings) -> Vec<String> {
+    let mut args = filter_test(settings);
+    args.extend([
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        "testsrc2=size=1280x720:rate=30:duration=1,format=p010le,\
+         setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc"
+            .into(),
+        "-vf".into(),
+        format!("hwupload,{TONEMAP_VAAPI}"),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ]);
+    args
+}
+
+/// A second of half-transparent pictures laid over a test pattern on the
+/// GPU, as burned-in subtitles are.
+fn overlay_args(settings: &TranscodeSettings) -> Vec<String> {
+    let mut args = filter_test(settings);
+    args.extend(
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=30:duration=1,format=nv12",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=white@0.5:size=640x80:rate=30:duration=1,format=rgba",
+            "-filter_complex",
+            "[0:v]hwupload[video];[1:v]hwupload[pictures];[video][pictures]overlay_vaapi=y=600[v]",
+            "-map",
+            "[v]",
+            "-f",
+            "null",
+            "-",
+        ]
+        .map(String::from),
+    );
+    args
 }
 
 /// A one-second software encode to `out`, for the decode tests.
@@ -507,11 +612,18 @@ mod tests {
 
         async fn succeeds(&self, args: &[String], _scratch: &Path) -> bool {
             self.runs.lock().push(args.to_vec());
-            // A sample encode writes a file; a decode names its hwaccel.
-            let name = args
-                .iter()
-                .position(|a| a == "-c:v")
-                .map(|i| args[i + 1].clone())
+            // A sample encode writes a file; a decode names its hwaccel; a
+            // filter test, its filter.
+            let filter = ["tonemap_vaapi", "overlay_vaapi"]
+                .into_iter()
+                .find(|f| args.iter().any(|a| a.contains(f)));
+            let name = filter
+                .map(str::to_owned)
+                .or_else(|| {
+                    args.iter()
+                        .position(|a| a == "-c:v")
+                        .map(|i| args[i + 1].clone())
+                })
                 .or_else(|| {
                     args.iter()
                         .position(|a| a == "-hwaccel")
@@ -571,6 +683,60 @@ mod tests {
                 .all(|d| d.hardware == Hardware::Vaapi)
         );
         assert_eq!(e.hardware_decoders.len(), 3);
+        // Mesa's VA-API tone maps nothing and overlays nothing.
+        assert!(!e.gpu_tonemap && !e.gpu_overlay);
+    }
+
+    /// Each GPU filter is tried with a tiny run, as the encoders are: an
+    /// Intel GPU (iHD) runs both, an AMD one neither.
+    #[tokio::test]
+    async fn gpu_filters_are_found_where_the_driver_runs_them() {
+        let ffmpeg = Recorded::new(&["h264_vaapi", "libx264", "decode_vaapi", "tonemap_vaapi"]);
+        let e = detect(
+            &ffmpeg,
+            &TranscodeSettings::default(),
+            scratch("gpu-filters").await.as_ref(),
+        )
+        .await;
+        assert!(e.gpu_tonemap);
+        assert!(!e.gpu_overlay);
+        let joined = ffmpeg
+            .runs
+            .lock()
+            .iter()
+            .find(|r| r.iter().any(|a| a.contains("tonemap_vaapi")))
+            .expect("a tone map test")
+            .join(" ");
+        // On the render node detection uses, from HDR10 to SDR.
+        assert!(joined.contains("vaapi=va:/dev/dri/renderD128"), "{joined}");
+        assert!(joined.contains("smpte2084"), "{joined}");
+        let overlay = Recorded::new(&["h264_vaapi", "libx264", "overlay_vaapi"]);
+        let e = detect(
+            &overlay,
+            &TranscodeSettings::default(),
+            scratch("gpu-overlay").await.as_ref(),
+        )
+        .await;
+        assert!(!e.gpu_tonemap);
+        assert!(e.gpu_overlay);
+    }
+
+    /// GPU filters feed a VA-API encoder: without one they are not tried.
+    #[tokio::test]
+    async fn gpu_filters_are_not_tried_without_a_vaapi_encoder() {
+        let ffmpeg = Recorded::new(&["libx264", "tonemap_vaapi", "overlay_vaapi"]);
+        let e = detect(
+            &ffmpeg,
+            &TranscodeSettings::default(),
+            scratch("gpu-filters-none").await.as_ref(),
+        )
+        .await;
+        assert!(!e.gpu_tonemap && !e.gpu_overlay);
+        let runs = ffmpeg.runs.lock();
+        assert!(
+            runs.iter()
+                .all(|r| !r.iter().any(|a| a.contains("_vaapi=")))
+        );
     }
 
     #[tokio::test]

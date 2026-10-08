@@ -5,20 +5,31 @@
 //! 1. `Direct`: the container, the picked streams and the file's bitrate
 //!    fit, and the client takes range reads.
 //! 2. `Converted` (P2-01): copy every stream that fits, encode only the
-//!    ones that do not. A subtitle the client cannot show and that cannot
-//!    become text is burned in, which forces a video encode.
+//!    ones that do not. Picture subtitles the client cannot draw are
+//!    burned in, which forces a video encode.
 //! 3. `Unsupported`: nothing above works, e.g. a Phase 1 client (range
 //!    reads only) with a file it cannot play.
 //!
 //! The picked subtitle is decided first, since it decides whether the file
-//! can play directly (P2-07). A bitmap one (PGS; VobSub and DVB since
-//! P3-08): the client draws it, the server reads it as text (sent as an
-//! external text subtitle, so the file still plays directly), or it is
-//! burned in. The client's [`BitmapSubtitles`] mode picks; for `Auto` the
-//! viewer's [`BitmapPreference`] does: text when the server can read the
-//! track, else the client draws it, else it is burned in; or, for
-//! pictures, the client draws it, else it is burned in. A text one the client cannot show is converted to
-//! SubRip or WebVTT and sent beside the file the same way.
+//! can play directly (P2-07). The rules:
+//!
+//! - A text subtitle is never burned in. It is copied if the client shows
+//!   it and the output carries it, else converted to a text format the
+//!   client shows (SubRip or WebVTT beside a file played directly; WebVTT
+//!   for HLS). If the client shows no text format the output carries, it
+//!   is not shown: the plan has no subtitle, and a reason says why. The
+//!   video is never encoded for a text subtitle.
+//! - A picture subtitle (PGS; VobSub and DVB since P3-08) is read as text
+//!   when text is wanted and the server can read the track (sent as a
+//!   text subtitle, so the file can still play directly). Text is wanted
+//!   when the client's [`BitmapSubtitles`] mode is `Text`, or for `Auto`
+//!   when the viewer's [`BitmapPreference`] is `Text`.
+//! - Otherwise (text recognition is off or cannot read the track, or
+//!   pictures are wanted), the client draws the pictures if it can in
+//!   this delivery, and only if it cannot are they burned in.
+//! - `BitmapSubtitles::BurnIn` asks for pictures, the same as the
+//!   `Pictures` preference: it no longer forces a burn-in on a client
+//!   that can draw them. The wire value stays (protocol 7).
 
 use spoolframe_media::encoders::Encoders;
 use spoolframe_media::ocr::Ocr;
@@ -36,23 +47,25 @@ use spoolframe_types::{
 
 /// How a picked bitmap subtitle is shown: as the client asked, or, when it
 /// left it to the server (`BitmapSubtitles::Auto`), as the viewer prefers.
+/// There is no burn-in mode: pictures are burned in only when the client
+/// cannot draw them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bitmap {
     /// Read as text, or the plan is unsupported.
     Text,
-    /// Burned into the video.
-    BurnIn,
     /// The viewer's preference, falling back to pictures.
     Preferred(BitmapPreference),
 }
 
 impl Bitmap {
     /// What the client asked for, or `None` when it left it to the
-    /// viewer's preference.
+    /// viewer's preference. `BitmapSubtitles::BurnIn` stays on the wire
+    /// (protocol 7) but asks for pictures: the client draws them if it
+    /// can, and they are burned in only if it cannot.
     pub fn asked(requested: BitmapSubtitles) -> Option<Self> {
         match requested {
             BitmapSubtitles::Text => Some(Bitmap::Text),
-            BitmapSubtitles::BurnIn => Some(Bitmap::BurnIn),
+            BitmapSubtitles::BurnIn => Some(Bitmap::Preferred(BitmapPreference::Pictures)),
             BitmapSubtitles::Auto | BitmapSubtitles::Unknown => None,
         }
     }
@@ -154,15 +167,17 @@ enum Shown {
     /// The server makes text of it (reads the pictures, or converts the
     /// text), sent beside the file as `to`.
     Text { to: SubtitleFormat },
-    /// Into the video; `asked` if the client asked for it rather than it
-    /// being the only way.
-    BurnIn { asked: bool },
+    /// Pictures the client cannot draw, burned into the video. Never a
+    /// text subtitle.
+    BurnIn,
 }
 
-/// How subtitle `stream` is shown: a bitmap one as `mode` says; a text one
-/// the client cannot show as text it can (`None` when it shows it as it
-/// is, or cannot take any text). An error is a `Text` the server cannot
-/// do: the plan is unsupported, rather than quietly something else.
+/// How subtitle `stream` is shown: a bitmap one as `mode` says (as text
+/// when that is wanted and the server can read it, else drawn by the
+/// client if it can, else burned in); a text one the client cannot show
+/// as text it can (`None` when it shows it as it is, or cannot take any
+/// text). An error is a `Text` the server cannot do: the plan is
+/// unsupported, rather than quietly something else.
 fn subtitle_shown(
     stream: &SubtitleStream,
     picked: u32,
@@ -176,11 +191,7 @@ fn subtitle_shown(
     let format = codecs::subtitle_format(&stream.codec);
     let native = format != SubtitleFormat::Unknown && caps.subtitles.contains(&format);
     let text = as_text(stream, format, caps, ocr);
-    let pictures = if native {
-        Shown::Native
-    } else {
-        Shown::BurnIn { asked: false }
-    };
+    let pictures = if native { Shown::Native } else { Shown::BurnIn };
     Ok(Some(match mode {
         Bitmap::Text => match text {
             Ok(to) => Shown::Text { to },
@@ -191,7 +202,6 @@ fn subtitle_shown(
                 ));
             }
         },
-        Bitmap::BurnIn => Shown::BurnIn { asked: true },
         Bitmap::Preferred(BitmapPreference::Text) => match text {
             Ok(to) => Shown::Text { to },
             Err(_) => pictures,
@@ -313,12 +323,7 @@ impl Fit {
         if let Some(picked) = subtitle {
             let stream = &descriptor.subtitles[picked as usize];
             let format = codecs::subtitle_format(&stream.codec);
-            if shown == Some(Shown::BurnIn { asked: true }) {
-                fit.subtitle.push(format!(
-                    "subtitle {picked}: {} burned into the video, as asked",
-                    name(format.as_str(), &stream.codec)
-                ));
-            } else if matches!(shown, Some(Shown::Text { .. })) {
+            if matches!(shown, Some(Shown::Text { .. })) {
                 // Read as text and sent beside the file: it fits.
             } else if !supported(&caps.subtitles, format, SubtitleFormat::Unknown) {
                 fit.subtitle.push(format!(
@@ -429,6 +434,15 @@ fn output_container(caps: &ClientCapabilities, delivery: Delivery) -> Option<Con
     order.iter().copied().find(|c| caps.containers.contains(c))
 }
 
+/// Every text subtitle format: a client that shows none of them is sent no
+/// text subtitle.
+const TEXT_FORMATS: [SubtitleFormat; 4] = [
+    SubtitleFormat::Srt,
+    SubtitleFormat::Ass,
+    SubtitleFormat::WebVtt,
+    SubtitleFormat::MovText,
+];
+
 /// Text formats `container` can carry, preferred first.
 fn text_formats(container: Container) -> &'static [SubtitleFormat] {
     match container {
@@ -456,8 +470,10 @@ fn converted(
         .ok_or_else(|| format!("delivery: no container this client plays can carry {delivery}"))?;
     let mut reasons = fit.reasons();
 
-    // Subtitles first: burning one in decides the video.
-    let subtitle = subtitle.map(|picked| {
+    // Subtitles first: burning one in decides the video. Only pictures the
+    // client cannot draw are burned in; a text one the client cannot show
+    // in any format the output carries is left out, never burned in.
+    let subtitle = subtitle.and_then(|picked| {
         let stream = &descriptor.subtitles[picked as usize];
         let format = codecs::subtitle_format(&stream.codec);
         let shown = caps.subtitles.contains(&format) && format != SubtitleFormat::Unknown;
@@ -476,30 +492,38 @@ fn converted(
                     to
                 };
             SubtitleAction::Ocr { from: format, to }
-        } else if treatment == Some(Shown::BurnIn { asked: true }) {
-            // The fit's reasons already say so.
-            SubtitleAction::BurnIn { format }
         } else if shown && carried {
             SubtitleAction::Copy { format }
-        } else if let (SubtitleKind::Text, Some(to)) = (
-            stream.kind,
-            text_formats(container)
+        } else if stream.kind == SubtitleKind::Text {
+            let Some(to) = text_formats(container)
                 .iter()
                 .copied()
-                .find(|f| caps.subtitles.contains(f)),
-        ) {
+                .find(|f| caps.subtitles.contains(f))
+            else {
+                reasons.push(if TEXT_FORMATS.iter().any(|f| caps.subtitles.contains(f)) {
+                    format!(
+                        "subtitle {picked}: {}: no text format the client shows goes in \
+                         {container}; not shown",
+                        name(format.as_str(), &stream.codec)
+                    )
+                } else {
+                    format!("subtitle {picked}: the client shows no text subtitles; not shown")
+                });
+                return None;
+            };
             SubtitleAction::Convert { from: format, to }
         } else {
+            // Pictures the client cannot draw in this output.
             reasons.push(format!(
                 "subtitle {picked}: {} cannot be shown; burned into the video",
                 name(format.as_str(), &stream.codec)
             ));
             SubtitleAction::BurnIn { format }
         };
-        ConvertedSubtitle {
+        Some(ConvertedSubtitle {
             index: picked,
             action,
-        }
+        })
     });
     let burn_in = matches!(
         subtitle,
@@ -815,6 +839,8 @@ mod tests {
                 audio(AudioCodec::Ac3, "ac3"),
             ],
             hardware_decoders: Vec::new(),
+            gpu_tonemap: false,
+            gpu_overlay: false,
             unusable: Vec::new(),
         }
     }
@@ -1176,6 +1202,61 @@ mod tests {
     }
 
     #[test]
+    fn a_text_subtitle_a_client_shows_in_no_text_format_is_not_shown_and_the_video_is_copied() {
+        let caps = ClientCapabilities {
+            subtitles: BTreeSet::new(),
+            ..avplayer()
+        };
+        let (_, _, video, _, subtitle, reasons) = converted(plan_with(
+            &hevc_dts(),
+            Some(&caps),
+            picked(1, Some(1)),
+            &dev_encoders(),
+        ));
+        assert_eq!(
+            video,
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc
+            }
+        );
+        assert_eq!(subtitle, None);
+        assert!(
+            reasons
+                .contains(&"subtitle 1: the client shows no text subtitles; not shown".to_owned()),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_text_subtitle_the_output_cannot_carry_in_a_format_the_client_shows_is_not_shown() {
+        // SubRip only, over HLS: fragmented MP4 carries WebVTT or mov_text.
+        let caps = ClientCapabilities {
+            subtitles: [SubtitleFormat::Srt].into(),
+            ..avplayer()
+        };
+        let (_, _, video, _, subtitle, reasons) = converted(plan_with(
+            &hevc_dts(),
+            Some(&caps),
+            picked(1, Some(1)),
+            &dev_encoders(),
+        ));
+        assert_eq!(
+            video,
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc
+            }
+        );
+        assert_eq!(subtitle, None);
+        assert!(
+            reasons.contains(
+                &"subtitle 1: srt: no text format the client shows goes in mp4; not shown"
+                    .to_owned()
+            ),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
     fn a_bitrate_cap_under_the_file_s_encodes_the_video_under_it() {
         let mut caps = avplayer();
         caps.max_bitrate = Some(8_000_000);
@@ -1446,7 +1527,11 @@ mod tests {
     #[test]
     fn a_mode_the_client_asks_for_is_what_the_request_resolves_to() {
         assert_eq!(Bitmap::asked(BitmapSubtitles::Text), Some(Bitmap::Text));
-        assert_eq!(Bitmap::asked(BitmapSubtitles::BurnIn), Some(Bitmap::BurnIn));
+        // Burn-in is no longer forced: it asks for pictures.
+        assert_eq!(
+            Bitmap::asked(BitmapSubtitles::BurnIn),
+            Some(Bitmap::Preferred(BitmapPreference::Pictures))
+        );
         assert_eq!(Bitmap::asked(BitmapSubtitles::Auto), None);
         assert_eq!(Bitmap::asked(BitmapSubtitles::Unknown), None);
     }
@@ -1497,17 +1582,45 @@ mod tests {
     }
 
     #[test]
-    fn burn_in_asked_for_encodes_the_video_even_for_a_client_that_draws_pgs() {
+    fn burn_in_asked_for_lets_a_client_that_draws_pgs_draw_it() {
         let caps = ClientCapabilities {
             subtitles: [SubtitleFormat::Srt, SubtitleFormat::Pgs].into(),
             delivery: vec![Delivery::Range, Delivery::Progressive],
             ..caps()
         };
+        // DTS needs encoding, so the plan is converted; the video is not.
         let (_, _, video, _, subtitle, reasons) = converted(with_mode(
             &dts_aac_pgs(),
             &caps,
+            picked(0, Some(0)),
+            Bitmap::asked(BitmapSubtitles::BurnIn).unwrap(),
+            &english(),
+        ));
+        assert_eq!(
+            video,
+            ConvertedVideo::Copy {
+                codec: VideoCodec::H264
+            }
+        );
+        assert_eq!(
+            subtitle,
+            Some(ConvertedSubtitle {
+                index: 0,
+                action: SubtitleAction::Copy {
+                    format: SubtitleFormat::Pgs
+                },
+            })
+        );
+        assert_eq!(reasons, ["audio 0: dts not supported"]);
+    }
+
+    #[test]
+    fn burn_in_asked_for_burns_in_for_a_client_that_cannot_draw_pgs() {
+        let (_, _, video, _, subtitle, _) = converted(with_mode(
+            &dts_aac_pgs(),
+            &caps_that_can_burn_in(),
             picked(1, Some(0)),
-            Bitmap::BurnIn,
+            Bitmap::asked(BitmapSubtitles::BurnIn).unwrap(),
             &english(),
         ));
         assert!(matches!(video, ConvertedVideo::Encode { .. }), "{video:?}");
@@ -1520,7 +1633,27 @@ mod tests {
                 },
             })
         );
-        assert_eq!(reasons, ["subtitle 0: pgs burned into the video, as asked"]);
+    }
+
+    #[test]
+    fn with_text_recognition_off_pictures_a_client_cannot_draw_are_burned_in() {
+        let (_, _, video, _, subtitle, _) = converted(with_mode(
+            &dts_aac_pgs(),
+            &caps_that_can_burn_in(),
+            picked(1, Some(0)),
+            Bitmap::Preferred(BitmapPreference::Text),
+            &Ocr::disabled(),
+        ));
+        assert!(matches!(video, ConvertedVideo::Encode { .. }), "{video:?}");
+        assert_eq!(
+            subtitle,
+            Some(ConvertedSubtitle {
+                index: 0,
+                action: SubtitleAction::BurnIn {
+                    format: SubtitleFormat::Pgs
+                },
+            })
+        );
     }
 
     #[test]
@@ -1684,7 +1817,7 @@ mod tests {
             &dts_aac_pgs(),
             &caps(),
             picked(1, Some(1)),
-            Bitmap::BurnIn,
+            Bitmap::Text,
             &english(),
         );
         assert_eq!(

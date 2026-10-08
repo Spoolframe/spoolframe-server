@@ -8,7 +8,7 @@
 //! gets new previews, and the old ones age out of the cache.
 //!
 //! Every ffmpeg run is at the lowest CPU and I/O priority, and outside
-//! the conversion slots (`transcode.max_jobs`), so a playback never waits
+//! the encode budget (`transcode.max_jobs`), so a playback never waits
 //! for previews, and never finds the server busy because of them.
 //!
 //! Two kinds of work, each with its own workers:

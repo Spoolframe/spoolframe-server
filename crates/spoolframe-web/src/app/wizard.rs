@@ -1499,6 +1499,7 @@ fn PlaybackFields(
     let ahead = use_signal(|| text(&settings, "transcode.read_ahead_secs"));
     let workers = use_signal(|| text(&settings, "previews.workers"));
     let mut ocr = use_signal(|| flag(&settings, "subtitles.ocr"));
+    let mut gpu_filters = use_signal(|| flag(&settings, "transcode.gpu_filters"));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let s = settings.clone();
@@ -1517,7 +1518,7 @@ fn PlaybackFields(
             };
             Ok(vec![
                 ("transcode.hardware", Some(json!(chosen.setting()))),
-                ("transcode.max_jobs", number("Encodes at once", &jobs())?),
+                ("transcode.max_jobs", number("Encode budget", &jobs())?),
                 ("transcode.scratch_limit_mb", scratch),
                 ("transcode.read_ahead_secs", number("Read ahead", &ahead())?),
                 (
@@ -1525,6 +1526,7 @@ fn PlaybackFields(
                     number("Previews made at once", &workers())?,
                 ),
                 ("subtitles.ocr", Some(json!(ocr()))),
+                ("transcode.gpu_filters", Some(json!(gpu_filters()))),
             ])
         })();
         let changes = match changes {
@@ -1556,6 +1558,9 @@ fn PlaybackFields(
         .as_ref()
         .map(|s| s.ocr_languages.clone())
         .unwrap_or_default();
+    let gpu_support = status
+        .as_ref()
+        .map(|s| setup::gpu_filters_support(s.transcoding.gpu_tonemap, s.transcoding.gpu_overlay));
     let hw_locked = locked(&settings, "transcode.hardware");
     // Worked out from the server's CPUs, so the server says it.
     let workers_default = match status.as_ref().map(|s| s.preview_workers_default) {
@@ -1639,8 +1644,8 @@ fn PlaybackFields(
             h2 { "Limits" }
             div { class: "limits",
                 div { class: "flex flex-col gap-1.5",
-                    Limit { label: "Encodes at once", value: jobs, unit: "", disabled: locked(&settings, "transcode.max_jobs") }
-                    span { class: "text-xs text-ctp-subtext0", "Default 2" }
+                    Limit { label: "Encode budget", value: jobs, unit: "", disabled: locked(&settings, "transcode.max_jobs") }
+                    span { class: "text-xs text-ctp-subtext0", "Default 2. In software video encodes: a GPU one takes half, or a quarter when it is all on the GPU; an audio-only one a quarter; a remux none." }
                     Note { settings: settings.clone(), setting: "transcode.max_jobs", on_changed: move |_| on_reload.call(()) }
                 }
                 div { class: "flex flex-col gap-1.5",
@@ -1653,6 +1658,27 @@ fn PlaybackFields(
                     span { class: "text-xs text-ctp-subtext0", "Default 60 s · how far an encode may run ahead of the player" }
                     Note { settings: settings.clone(), setting: "transcode.read_ahead_secs", on_changed: move |_| on_reload.call(()) }
                 }
+            }
+        }
+        div { class: "flex flex-col gap-2",
+            h2 { "GPU filters" }
+            div { class: "flex items-start gap-3",
+                button {
+                    class: "switch mt-0.5",
+                    role: "switch",
+                    aria_checked: "{gpu_filters()}",
+                    aria_label: "Tone map and burn in subtitles on the GPU",
+                    disabled: locked(&settings, "transcode.gpu_filters"),
+                    onclick: move |_| gpu_filters.toggle(),
+                }
+                span { class: "choice-what",
+                    b { "Tone map and burn in subtitles on the GPU" }
+                    {setup::GPU_FILTERS_NOTE}
+                }
+            }
+            Note { settings: settings.clone(), setting: "transcode.gpu_filters", on_changed: move |_| on_reload.call(()) }
+            if let Some(support) = gpu_support {
+                span { class: "text-xs text-ctp-subtext0", "{support}" }
             }
         }
         div { class: "flex flex-col gap-2",
@@ -1722,7 +1748,8 @@ fn Limit(label: String, value: Signal<String>, unit: String, disabled: bool) -> 
 }
 
 /// Step 6: the web UI's public address, the proxies in front of it, and
-/// where it listens.
+/// where it listens; in the wizard, also how the apps reach the server
+/// from outside.
 #[component]
 pub fn AccessForm(mode: Mode, on_done: EventHandler<()>) -> Element {
     let mut generation = use_signal(|| 0u32);
@@ -1815,13 +1842,8 @@ fn AccessFields(
         });
     let listen = text(&settings, "admin.listen");
     let answers = status.map(|s| s.web_urls).unwrap_or_default();
-    rsx! {
-        if mode == Mode::Wizard {
-            div { class: "flex flex-col gap-1.5",
-                h1 { "How people reach the web UI" }
-                p { class: "lede", "The address people type to open this page. It's also the address passkeys and sign-in providers are tied to." }
-            }
-        }
+    let wizard = mode == Mode::Wizard;
+    let web_ui = rsx! {
         div { class: "flex flex-col gap-2",
             Field { label: "Public address", value: public_url, placeholder: "https://media.example.org", tall: true, disabled: locked(&settings, "admin.public_url") }
             if !url.trim().is_empty() {
@@ -1840,13 +1862,22 @@ fn AccessFields(
                     }
                 }
             }
+            // The wizard's Access board says this as a plain line under the
+            // address; Settings › Access keeps its box.
+            if wizard {
+                p { class: "m-0 text-xs leading-normal text-ctp-subtext0",
+                    "Passkeys, sign-in providers and secure cookies need HTTPS (or localhost): put a reverse proxy such as Caddy or nginx in front and give its address here. Changing it later means passkeys are added again."
+                }
+            }
             Note { settings: settings.clone(), setting: "admin.public_url", on_changed: move |_| on_reload.call(()) }
         }
-        div { class: "alert alert-info", role: "note",
-            icons::Info {}
-            span {
-                b { "Why HTTPS matters" }
-                "Browsers only allow passkeys, sign-in providers and secure cookies over HTTPS (or at localhost). Put a reverse proxy such as Caddy or nginx in front of the server and give its address here. Changing it later means passkeys have to be added again."
+        if !wizard {
+            div { class: "alert alert-info", role: "note",
+                icons::Info {}
+                span {
+                    b { "Why HTTPS matters" }
+                    "Browsers only allow passkeys, sign-in providers and secure cookies over HTTPS (or at localhost). Put a reverse proxy such as Caddy or nginx in front of the server and give its address here. Changing it later means passkeys have to be added again."
+                }
             }
         }
         div { class: "flex flex-col gap-1.5",
@@ -1865,9 +1896,8 @@ fn AccessFields(
             }
             span { class: "text-xs text-ctp-subtext0", "Change it with " span { class: "mono-value text-xs", "spoolframe-server config set admin.listen …" } " or in the server's config file." }
         }
-        if mode == Mode::Wizard {
-            super::remote::RemoteChoice { state: remote, server_port: text(&settings, "network.port") }
-        }
+    };
+    let foot = rsx! {
         if let Some(text) = error() {
             Alert { text }
         }
@@ -1877,7 +1907,38 @@ fn AccessFields(
             busy: busy(),
             on_save,
             on_discard: move |_| on_reload.call(()),
-            blocked: if mode == Mode::Wizard { remote.read().setting().err() } else { None },
+            blocked: if wizard { remote.read().setting().err() } else { None },
+        }
+    };
+    // In the wizard the step is two cards, as the WebWizardAccess board
+    // draws it: the web UI is reached through its public address and the
+    // proxy in front, the apps reach the server directly on its own port,
+    // and one card for both read as if the remote choice were about this
+    // page. Back and Continue close the second card.
+    rsx! {
+        if wizard {
+            div { class: "wizard-cards",
+                section { class: "wizard-card",
+                    div { class: "flex flex-col gap-1.5",
+                        h1 { "How people reach the web UI" }
+                        p { class: "lede", "The address people type to open this page. It's also the address passkeys and sign-in providers are tied to." }
+                    }
+                    {web_ui}
+                }
+                section { class: "wizard-card",
+                    div { class: "flex flex-col gap-3.5",
+                        div { class: "flex flex-col gap-1.5",
+                            h1 { "How the apps reach this server" }
+                            p { class: "lede", "The Spoolframe apps connect to the server directly, on their own port. At home they find it by themselves." }
+                        }
+                        super::remote::RemoteChoice { state: remote, server_port: text(&settings, "network.port") }
+                    }
+                    {foot}
+                }
+            }
+        } else {
+            {web_ui}
+            {foot}
         }
         ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
     }

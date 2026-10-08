@@ -13,6 +13,7 @@ use spoolframe_protocol::{
 use crate::support::{
     ServerOptions, TestClient, TestServer, fresh_dir, movie, progressive_capabilities, write_script,
 };
+use spoolframe_server::encode::Units;
 use spoolframe_server::previews::{PreviewSettings, When};
 
 fn on_play() -> PreviewSettings {
@@ -274,7 +275,7 @@ async fn previews_being_made_never_hold_up_a_playback() {
     let dir = fresh_dir("no-stall").await;
     std::fs::create_dir_all(&dir).unwrap();
     let options = ServerOptions {
-        max_jobs: 1,
+        budget: Units::jobs(1),
         stalled_after: Duration::from_secs(2),
         read_ahead: Duration::from_secs(3600),
         previews_ffmpeg: slow_ffmpeg(&dir),

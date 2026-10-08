@@ -1632,6 +1632,18 @@ fn ThisServer() -> Element {
                                 None => rsx! { span { class: "text-ctp-subtext0", "starting…" } },
                             }
                         }
+                        // `transcode.max_jobs` and the caps beside it: what
+                        // the conversions running take now.
+                        if let Some(budget) = s.transcoding.budget {
+                            Pair { label: "Encode budget", class: "max-md:hidden",
+                                div { class: "flex flex-col gap-1",
+                                    span { "{budget.used_of_max()} used" }
+                                    span { class: "text-xs text-ctp-subtext0",
+                                        "Remuxes {budget.remuxes} of {budget.max_remux} · GPU jobs {budget.gpu_jobs} of {budget.max_gpu_jobs}"
+                                    }
+                                }
+                            }
+                        }
                         Pair { label: "LAN discovery", class: "max-md:hidden",
                             LanDiscovery { running: s.mdns }
                         }

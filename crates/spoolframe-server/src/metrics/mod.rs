@@ -23,7 +23,7 @@ pub use prometheus::{CONTENT_TYPE, render};
 use crate::admin::AddressRanges;
 use crate::artwork::ArtworkCache;
 use crate::catalog::LiveCatalog;
-use crate::encode::job::Jobs;
+use crate::encode::job::{Jobs, Load};
 use crate::network::{Connections, Services};
 use crate::playback::{Plan, Playbacks};
 use crate::plex_sync::WatchSync;
@@ -573,11 +573,35 @@ impl Metrics {
             .as_ref()
             .map(|j| j.counts())
             .unwrap_or_default();
+        families.push(Family {
+            name: "spoolframe_conversions_running",
+            help: "Encodes whose ffmpeg runs, paused or not, by kind: remux, audio (only the \
+                   audio encoded), gpu or software (the video encoded), gpu_only (the video \
+                   decoded and encoded on the GPU, nothing on the CPU).",
+            kind: Kind::Gauge,
+            samples: Load::ALL
+                .iter()
+                .zip(counts.running_by_load)
+                .map(|(load, n)| Sample::labelled(&[("kind", load.as_str())], n as f64))
+                .collect(),
+        });
+        let budget = sources
+            .jobs
+            .as_ref()
+            .map(|j| j.budget())
+            .unwrap_or_default();
         families.push(Family::single(
-            "spoolframe_conversions_running",
-            "Encodes whose ffmpeg runs, paused or not.",
+            "spoolframe_encode_budget_used",
+            "The encode budget the conversions running take, in software video encodes: a \
+             GPU video encode is 0.5, one all on the GPU or an audio-only one 0.25, a remux 0.",
             Kind::Gauge,
-            counts.running as f64,
+            budget.used.as_jobs(),
+        ));
+        families.push(Family::single(
+            "spoolframe_encode_budget_max",
+            "The encode budget, transcode.max_jobs, in software video encodes.",
+            Kind::Gauge,
+            budget.max.as_jobs(),
         ));
         families.push(Family::single(
             "spoolframe_conversions_paused",
@@ -587,7 +611,8 @@ impl Metrics {
         ));
         families.push(Family::single(
             "spoolframe_conversions_refused_total",
-            "Conversions refused because transcode.max_jobs were running: there is no queue.",
+            "Conversions refused because they did not fit the encode budget (transcode.max_jobs) \
+             or their cap (max_remux, max_gpu_jobs): there is no queue.",
             Kind::Counter,
             counts.refused as f64,
         ));

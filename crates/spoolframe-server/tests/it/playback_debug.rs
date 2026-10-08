@@ -264,6 +264,29 @@ async fn stop_ends_the_playback_and_the_client_is_told() {
     server.stop().await;
 }
 
+/// The playback page says what each conversion weighs against the encode
+/// budget: the generated media's encodes only its audio, a quarter.
+#[tokio::test]
+async fn a_conversion_s_weight_is_shown() {
+    let (server, root, client, _session, _handle) =
+        converting("weight", ServerOptions::default()).await;
+    let id = root.playbacks().await.unwrap().open[0].id.clone();
+    let conversion = root
+        .playback(id)
+        .await
+        .unwrap()
+        .playback
+        .conversion
+        .unwrap();
+    assert_eq!(
+        (conversion.load, conversion.weight_quarters),
+        (spoolframe_admin_api::ConversionLoad::Audio, 1),
+        "{conversion:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
 /// "End conversion" stops ffmpeg only: what it wrote is still read, then
 /// the end; a seek does not start it again.
 #[tokio::test]

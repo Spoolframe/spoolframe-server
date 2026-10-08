@@ -147,6 +147,16 @@ fn Pill(kind: spoolframe_admin_api::PlanKind) -> Element {
     }
 }
 
+/// What a conversion weighs against the encode budget, and why:
+/// "Weight 0.25 · audio encode".
+fn weight_line(c: &spoolframe_admin_api::ConversionState) -> String {
+    format!(
+        "Weight {} · {}",
+        spoolframe_admin_api::quarters(c.weight_quarters),
+        c.load.label()
+    )
+}
+
 /// The conversion's bar and its words, or a dash.
 #[component]
 fn ConversionCell(row: PlaybackRow) -> Element {
@@ -171,6 +181,7 @@ fn ConversionCell(row: PlaybackRow) -> Element {
             if c.paused {
                 b { class: "text-xs text-ctp-yellow", "Paused by the throttle" }
             }
+            span { class: "text-xs text-ctp-subtext0", {weight_line(c)} }
         }
     }
 }
@@ -417,6 +428,12 @@ fn Stats(row: PlaybackRow, now: i64) -> Element {
                         value: if c.failed.is_some() { "Failed".to_owned() } else if c.ended { "Ended".to_owned() } else if c.paused { "Paused".to_owned() } else if c.running { "Running".to_owned() } else { "Done".to_owned() },
                         note: if c.paused { "far enough ahead of the reader".to_owned() } else if c.ended { "an admin ended the conversion".to_owned() } else { String::new() },
                         tone: if c.failed.is_some() { "text-ctp-red".to_owned() } else if c.paused || c.ended { "text-ctp-yellow".to_owned() } else { String::new() },
+                    }
+                    Stat {
+                        label: "Encode budget".to_owned(),
+                        value: spoolframe_admin_api::quarters(c.weight_quarters),
+                        note: c.load.label().to_owned(),
+                        tone: String::new(),
                     }
                 },
                 None => rsx! {

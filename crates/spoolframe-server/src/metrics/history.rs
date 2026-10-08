@@ -71,7 +71,7 @@ impl Reading {
             playbacks_direct: whole(f, "spoolframe_playbacks_active", &[("plan", "direct")]),
             playbacks_remux: whole(f, "spoolframe_playbacks_active", &[("plan", "remux")]),
             playbacks_transcode: whole(f, "spoolframe_playbacks_active", &[("plan", "transcode")]),
-            conversions_running: whole(f, "spoolframe_conversions_running", &[]),
+            conversions_running: sum(f, "spoolframe_conversions_running"),
             conversions_paused: whole(f, "spoolframe_conversions_paused", &[]),
             previews_queued: sum(f, "spoolframe_previews_queued"),
             ocr_queued: whole(f, "spoolframe_ocr_queued", &[]),

@@ -19,7 +19,8 @@ pub struct Selection {
 
 /// How a picked bitmap subtitle (PGS) is shown (P2-07): drawn by the
 /// client, read as text by the server, or burned into the video. Text
-/// subtitles are not affected.
+/// subtitles are not affected; they are never burned in. Pictures are
+/// burned in only when the client cannot draw them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BitmapSubtitles {
@@ -34,7 +35,10 @@ pub enum BitmapSubtitles {
     /// could draw the pictures. The plan is `Unsupported` if the server
     /// cannot read this track.
     Text,
-    /// Burned into the video, even if the client could show it otherwise.
+    /// Pictures: drawn by the client if it can, else burned into the
+    /// video. The server plans it as the `pictures` preference; it no
+    /// longer forces a burn-in on a client that can draw the pictures.
+    /// Kept so the wire does not change.
     BurnIn,
     /// A mode this build does not know: treated as `Auto`.
     #[serde(other)]
@@ -167,9 +171,10 @@ pub enum SubtitleAction {
         from: SubtitleFormat,
         to: SubtitleFormat,
     },
-    /// Drawn into the picture: the client cannot show this format and the
-    /// server cannot read it as text, or the client asked for it. Forces a
-    /// video encode.
+    /// Picture subtitles drawn into the video: the client cannot draw them
+    /// in this delivery, and they are not read as text. Forces a video
+    /// encode. The server never burns in a text subtitle: one the client
+    /// cannot show is left out of the plan, with a reason.
     BurnIn { format: SubtitleFormat },
     /// A bitmap subtitle read as text by the server (P2-07). It is not in
     /// the output: the client fetches it whole with `ReadSubtitle`, which

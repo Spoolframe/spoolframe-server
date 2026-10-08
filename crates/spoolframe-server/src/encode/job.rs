@@ -1,7 +1,7 @@
 //! One ffmpeg run (P2-03): spawned for a playback, paused when it is far
 //! ahead of its reader, killed and cleaned up when dropped.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -91,7 +91,7 @@ pub const FFMPEG_FAILED: &str = "the conversion failed on the server";
 
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
-    /// Over `max_jobs`.
+    /// Over the encode budget (`max_jobs`), or the load's own cap.
     #[error("the server is converting as many files as it may")]
     Busy,
     /// Why, in words a client may see.
@@ -106,42 +106,211 @@ pub enum JobError {
 /// What a client is told of an encode that could not be run.
 pub const SPAWN_FAILED: &str = "the conversion could not be started on the server";
 
-/// One of the `max_jobs` places. A job that replaces another (a seek, a
-/// subtitle change) shares the place of the one it replaces, so nobody
-/// else can take it between the two; it is free once both have let go of
-/// it.
+/// A share of the encode budget (`transcode.max_jobs`), in quarters of
+/// one software video encode: whole numbers, so admission never compares
+/// floats.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Units(u32);
+
+impl Units {
+    /// What one software video encode weighs: `transcode.max_jobs = 1`.
+    pub const PER_JOB: u32 = 4;
+
+    /// `n` software video encodes' worth.
+    pub const fn jobs(n: u32) -> Self {
+        Self(n.saturating_mul(Self::PER_JOB))
+    }
+
+    /// `n` quarters of one.
+    pub const fn quarters(n: u32) -> Self {
+        Self(n)
+    }
+
+    /// In quarters.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// In software video encodes: what the metrics report.
+    pub fn as_jobs(self) -> f64 {
+        f64::from(self.0) / f64::from(Self::PER_JOB)
+    }
+}
+
+/// As `max_jobs` is written: `1.25`, `2`.
+impl std::fmt::Display for Units {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const { assert!(Units::PER_JOB == 4, "quarters, as the admin API shows them") };
+        f.write_str(&spoolframe_admin_api::quarters(self.0))
+    }
+}
+
+/// What a conversion asks of the machine, which says what it weighs
+/// against the encode budget and which cap of its own it counts against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Load {
+    /// Every stream copied into another container: disk and a file
+    /// descriptor, next to no CPU. Bounded by `transcode.max_remux`.
+    Remux,
+    /// The video copied (or none), the audio encoded.
+    Audio,
+    /// The video encoded on a GPU (VA-API, NVENC), with its decode or a
+    /// filter (tone mapping, burn-in) on the CPU. Bounded by
+    /// `transcode.max_gpu_jobs` too.
+    Gpu,
+    /// The video encoded in software (libx264, libx265).
+    Software,
+    /// The video decoded, scaled and encoded on a GPU (VA-API), with no
+    /// filter on the CPU. Bounded by `transcode.max_gpu_jobs` too.
+    GpuOnly,
+}
+
+impl Load {
+    pub const ALL: [Load; 5] = [
+        Load::Remux,
+        Load::Audio,
+        Load::Gpu,
+        Load::Software,
+        Load::GpuOnly,
+    ];
+
+    /// What it weighs against `transcode.max_jobs`. Measured on a 32-core
+    /// machine, for 60 s of output, a remux took under 1% of the CPU time
+    /// of a libx264 encode of the same source and an audio-only encode
+    /// about 0.5%. A VA-API encode took 10 to 45% decoding in software,
+    /// 1.5 to 26% decoding on the GPU with its frames back in memory, and
+    /// 0.4 to 1.7% all on the GPU; one tone-mapping 4K HDR on the CPU
+    /// took 70%. An audio encode, and one all on the GPU, weigh more than
+    /// they cost, as the least a conversion that encodes can weigh.
+    pub fn weight(self) -> Units {
+        match self {
+            Load::Remux => Units::quarters(0),
+            Load::Audio | Load::GpuOnly => Units::quarters(1),
+            Load::Gpu => Units::quarters(2),
+            Load::Software => Units::jobs(1),
+        }
+    }
+
+    /// Its name in the metrics' `kind` label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Load::Remux => "remux",
+            Load::Audio => "audio",
+            Load::Gpu => "gpu",
+            Load::Software => "software",
+            Load::GpuOnly => "gpu_only",
+        }
+    }
+
+    /// It decodes and encodes a stream again, rather than only copying:
+    /// what holds back frame previews made ahead (P3-13).
+    pub fn encodes(self) -> bool {
+        self != Load::Remux
+    }
+}
+
+/// A conversion's place in the budget. A job that replaces another (a
+/// seek, a subtitle change) with the same load shares the place of the
+/// one it replaces, so nobody else can take it between the two; it is
+/// free once both have let go of it.
 #[derive(Debug, Clone)]
 pub struct Slot {
-    _place: Arc<Place>,
+    place: Arc<Place>,
 }
 
-/// How many of the places are taken, and how many there are. A counter
-/// rather than a semaphore: `max_jobs` is a live setting (P3-10), and a
-/// lower limit takes effect as jobs end, without stopping any.
-#[derive(Debug, Default)]
-struct Places {
-    taken: usize,
-    max: usize,
+impl Slot {
+    pub fn load(&self) -> Load {
+        self.place.load
+    }
 }
 
-/// A taken place, given back when dropped.
+/// The budget's use now, and its limits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BudgetUse {
+    /// Taken by the conversions running now.
+    pub used: Units,
+    /// `transcode.max_jobs`.
+    pub max: Units,
+    /// Remuxes running, and `transcode.max_remux`.
+    pub remuxes: usize,
+    pub max_remux: usize,
+    /// GPU video encodes running, and `transcode.max_gpu_jobs`.
+    pub gpu_jobs: usize,
+    pub max_gpu_jobs: usize,
+}
+
+impl BudgetUse {
+    /// Whether a conversion of `load` may start now. `replacing`: the load
+    /// of the conversion it replaces, which still runs but ends once this
+    /// one has started, so what it holds counts as free.
+    fn admits(&self, load: Load, replacing: Option<Load>) -> bool {
+        let mut now = *self;
+        if let Some(old) = replacing {
+            now.give_back(old);
+        }
+        let fits = now.used.0 + load.weight().0 <= now.max.0;
+        match load {
+            Load::Remux => now.remuxes < now.max_remux,
+            Load::Gpu | Load::GpuOnly => fits && now.gpu_jobs < now.max_gpu_jobs,
+            Load::Audio | Load::Software => fits,
+        }
+    }
+
+    fn take(&mut self, load: Load) {
+        self.used.0 += load.weight().0;
+        match load {
+            Load::Remux => self.remuxes += 1,
+            Load::Gpu | Load::GpuOnly => self.gpu_jobs += 1,
+            Load::Audio | Load::Software => {}
+        }
+    }
+
+    fn give_back(&mut self, load: Load) {
+        self.used.0 -= load.weight().0;
+        match load {
+            Load::Remux => self.remuxes -= 1,
+            Load::Gpu | Load::GpuOnly => self.gpu_jobs -= 1,
+            Load::Audio | Load::Software => {}
+        }
+    }
+
+    fn set_limits(&mut self, limits: &JobLimits) {
+        self.max = limits.budget;
+        self.max_remux = limits.max_remux;
+        self.max_gpu_jobs = limits.max_gpu_jobs;
+    }
+}
+
+/// A taken place, given back when dropped. A counter rather than a
+/// semaphore: the limits are live settings (P3-10), and a lower one takes
+/// effect as jobs end, without stopping any.
 #[derive(Debug)]
-struct Place(Arc<parking_lot::Mutex<Places>>);
+struct Place {
+    budget: Arc<parking_lot::Mutex<BudgetUse>>,
+    load: Load,
+}
 
 impl Place {
-    fn take(places: &Arc<parking_lot::Mutex<Places>>) -> Option<Self> {
-        let mut now = places.lock();
-        if now.taken >= now.max {
+    fn take(
+        budget: &Arc<parking_lot::Mutex<BudgetUse>>,
+        load: Load,
+        replacing: Option<Load>,
+    ) -> Option<Self> {
+        let mut now = budget.lock();
+        if !now.admits(load, replacing) {
             return None;
         }
-        now.taken += 1;
-        Some(Self(places.clone()))
+        now.take(load);
+        Some(Self {
+            budget: budget.clone(),
+            load,
+        })
     }
 }
 
 impl Drop for Place {
     fn drop(&mut self) {
-        self.0.lock().taken -= 1;
+        self.budget.lock().give_back(self.load);
     }
 }
 
@@ -158,7 +327,7 @@ pub struct Jobs {
     /// [`JOBS_DIR`] in the scratch directory.
     dir: PathBuf,
     ffmpeg: Tool,
-    places: Arc<parking_lot::Mutex<Places>>,
+    budget: Arc<parking_lot::Mutex<BudgetUse>>,
     /// Held by the job that looks at a full scratch directory and makes
     /// room in it, so the next job to look sees what the first one freed.
     scratch_check: Arc<tokio::sync::Mutex<()>>,
@@ -168,6 +337,26 @@ pub struct Jobs {
     /// Every job started and not yet dropped, to count (P3-14).
     live: parking_lot::Mutex<Vec<std::sync::Weak<EncodeJob>>>,
     counters: Arc<JobCounters>,
+    /// Films whose GPU decode failed: they decode in software from then on.
+    decode_failures: Arc<DecodeFailures>,
+    /// What [`Jobs::first_note`] was told.
+    notes: parking_lot::Mutex<HashSet<&'static str>>,
+}
+
+/// Films whose GPU decode failed, for as long as the server runs: few,
+/// and a restart (a new driver, say) tries again.
+#[derive(Debug, Default)]
+struct DecodeFailures(parking_lot::Mutex<HashSet<PathBuf>>);
+
+impl DecodeFailures {
+    /// Remember `file`: true the first time.
+    fn remember(&self, file: &Path) -> bool {
+        self.0.lock().insert(file.to_owned())
+    }
+
+    fn contains(&self, file: &Path) -> bool {
+        self.0.lock().contains(file)
+    }
 }
 
 /// What the jobs did since the server started (P3-14).
@@ -186,6 +375,8 @@ struct JobCounters {
 pub struct JobCounts {
     /// Jobs whose ffmpeg runs (paused or not).
     pub running: u64,
+    /// Of those, how many of each load, in [`Load::ALL`]'s order.
+    pub running_by_load: [u64; 5],
     /// Of those, the ones held back for their reader.
     pub paused: u64,
     pub refused: u64,
@@ -250,19 +441,32 @@ impl Jobs {
         // The scratch directory may be shared (`/tmp`): only the jobs'
         // own is closed to others.
         crate::files::private_dir(&dir)?;
+        let mut budget = BudgetUse::default();
+        budget.set_limits(&limits);
         Ok(Self {
-            places: Arc::new(parking_lot::Mutex::new(Places {
-                taken: 0,
-                max: limits.max_jobs,
-            })),
+            budget: Arc::new(parking_lot::Mutex::new(budget)),
             scratch_check: Arc::default(),
             encoding: Encoding::default(),
             live: parking_lot::Mutex::default(),
             counters: Arc::default(),
+            decode_failures: Arc::default(),
+            notes: parking_lot::Mutex::default(),
             limits: parking_lot::RwLock::new(limits),
             dir,
             ffmpeg,
         })
+    }
+
+    /// Whether decoding (or filtering) `file` on the GPU failed since the
+    /// server started.
+    pub fn hardware_decode_failed(&self, file: &Path) -> bool {
+        self.decode_failures.contains(file)
+    }
+
+    /// True the first time it is told `note`: a reason GPU filters were
+    /// not used, logged once rather than at every start and seek.
+    pub fn first_note(&self, note: &'static str) -> bool {
+        self.notes.lock().insert(note)
     }
 
     /// The limits now.
@@ -271,11 +475,11 @@ impl Jobs {
     }
 
     /// Run new jobs under `limits` from now on. Jobs running go on as they
-    /// started; with fewer places than are taken, none is free until
-    /// enough jobs end. The scratch directory stays the one the jobs
-    /// started in: it changes only with a restart.
+    /// started; with less budget than is taken, none starts until enough
+    /// jobs end. The scratch directory stays the one the jobs started in:
+    /// it changes only with a restart.
     pub fn set_limits(&self, limits: JobLimits) {
-        self.places.lock().max = limits.max_jobs;
+        self.budget.lock().set_limits(&limits);
         let mut now = self.limits.write();
         *now = JobLimits {
             scratch_dir: now.scratch_dir.clone(),
@@ -286,6 +490,11 @@ impl Jobs {
     /// Where jobs write: a directory per playback handle in it.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The encode budget's use now, and its limits.
+    pub fn budget(&self) -> BudgetUse {
+        *self.budget.lock()
     }
 
     /// How many jobs that encode run now.
@@ -305,8 +514,17 @@ impl Jobs {
             .iter()
             .filter(|job| job.progress.borrow().done.is_none() && !job.task.is_finished())
             .collect();
+        let mut running_by_load = [0; 5];
+        for job in &running {
+            let at = Load::ALL
+                .iter()
+                .position(|&l| l == job.load)
+                .expect("in ALL");
+            running_by_load[at] += 1;
+        }
         JobCounts {
             running: running.len() as u64,
+            running_by_load,
             paused: running.iter().filter(|job| job.paused()).count() as u64,
             refused: self.counters.refused.get(),
             stalled: self.counters.stalled.get(),
@@ -316,8 +534,9 @@ impl Jobs {
 
     /// Run ffmpeg with `args` into `dir` (created), which the job owns and
     /// removes when dropped. It runs in `slot`, the place of the job it
-    /// replaces, or takes a free one. One that `encodes` counts in
-    /// [`Jobs::encoding`] while ffmpeg runs.
+    /// replaces, when that has the same `load`; otherwise it takes a place
+    /// of its own, counting the replaced one's as free. One whose load
+    /// encodes counts in [`Jobs::encoding`] while ffmpeg runs.
     #[expect(
         clippy::too_many_arguments,
         reason = "one caller, which names each part"
@@ -327,23 +546,25 @@ impl Jobs {
         dir: PathBuf,
         run: impl Into<Run>,
         written: Written,
-        encodes: bool,
+        load: Load,
         epoch: u32,
         first_segment: u32,
         start_ms: u64,
         slot: Option<Slot>,
     ) -> Result<Arc<EncodeJob>, JobError> {
         let slot = match slot {
-            Some(slot) => slot,
-            None => match Place::take(&self.places) {
-                Some(place) => Slot {
-                    _place: Arc::new(place),
-                },
-                None => {
-                    self.counters.refused.inc();
-                    return Err(JobError::Busy);
+            Some(slot) if slot.load() == load => slot,
+            replacing => {
+                match Place::take(&self.budget, load, replacing.as_ref().map(Slot::load)) {
+                    Some(place) => Slot {
+                        place: Arc::new(place),
+                    },
+                    None => {
+                        self.counters.refused.inc();
+                        return Err(JobError::Busy);
+                    }
                 }
-            },
+            }
         };
         let slot = Arc::new(parking_lot::Mutex::new(Some(slot)));
         std::fs::create_dir_all(&dir).map_err(|e| JobError::Prepare(e.to_string()))?;
@@ -352,13 +573,14 @@ impl Jobs {
             inputs,
             reads,
             gpu,
+            fallback,
         } = run.into();
         let limits = self.limits();
         let cannot_run = |e: std::io::Error| {
             JobError::Spawn(format!("{}: {e}", self.ffmpeg.program().display()))
         };
         // No file of the job's is larger than all it may write.
-        let mut jail = Jail::new(Limits::encode(limits.scratch_limit_bytes)).gpu(gpu);
+        let mut jail = Jail::new(Limits::encode(limits.scratch_limit_bytes));
         for dir in reads {
             jail = jail.reads(dir);
         }
@@ -366,22 +588,17 @@ impl Jobs {
         for input in inputs {
             jail = jail.input(input);
         }
-        let mut child = self
-            .ffmpeg
-            .command(&jail)
-            .map_err(cannot_run)?
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(cannot_run)?;
+        let mut child = launch(&self.ffmpeg, &jail.clone().gpu(gpu), &args).map_err(cannot_run)?;
         // The run's process group, which ffmpeg leads.
         let pid = child.id().unwrap_or(0);
         let (progress_tx, progress) = watch::channel(Progress::default());
         let progress_tx = Arc::new(progress_tx);
+        let mut command = vec![self.ffmpeg.program().display().to_string()];
+        command.extend(args);
         let shared = Arc::new(Shared {
+            pid: AtomicU32::new(pid),
+            command: parking_lot::Mutex::new(command),
+            hardware_decode: AtomicBool::new(fallback.is_some()),
             furthest_bytes: AtomicU64::new(0),
             reader_ms: AtomicU64::new(0),
             reader_segment: AtomicU32::new(0),
@@ -390,7 +607,10 @@ impl Jobs {
             stderr: parking_lot::Mutex::default(),
         });
         let supervisor = Supervisor {
-            pid,
+            ffmpeg: self.ffmpeg.clone(),
+            jail,
+            fallback,
+            decode_failures: self.decode_failures.clone(),
             start_ms,
             dir: dir.clone(),
             written: written.clone(),
@@ -403,22 +623,19 @@ impl Jobs {
             slot: slot.clone(),
             progress: progress_tx.clone(),
             counters: self.counters.clone(),
-            _encoding: encodes.then(|| self.encoding.begin()),
+            _encoding: load.encodes().then(|| self.encoding.begin()),
         };
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
         let task = tokio::spawn(supervisor.run(child, stdout, stderr));
         tracing::debug!(pid, dir = %dir.display(), epoch, "encode started");
-        let mut command = vec![self.ffmpeg.program().display().to_string()];
-        command.extend(args);
         let job = Arc::new(EncodeJob {
             epoch,
             first_segment,
-            pid,
+            load,
             dir,
             written,
             start_ms,
-            command,
             progress,
             // Only the supervisor holds it otherwise: once it is gone, a
             // reader waiting for more hears so at once.
@@ -434,6 +651,18 @@ impl Jobs {
     }
 }
 
+/// ffmpeg with `args`, in `jail`, its output piped to the supervisor.
+fn launch(ffmpeg: &Tool, jail: &Jail, args: &[String]) -> std::io::Result<tokio::process::Child> {
+    ffmpeg
+        .command(jail)?
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+}
+
 /// One ffmpeg run: its arguments, and what it reads besides the directory
 /// it writes.
 #[derive(Debug, Clone, Default)]
@@ -447,6 +676,19 @@ pub struct Run {
     pub reads: Vec<PathBuf>,
     /// It decodes or encodes on the GPU.
     pub gpu: bool,
+    /// For a run that decodes on the GPU: the same run decoding in
+    /// software, for when that fails before the first output.
+    pub fallback: Option<Fallback>,
+}
+
+/// A run decoding in software, in place of one decoding on the GPU.
+#[derive(Debug, Clone)]
+pub struct Fallback {
+    pub args: Vec<String>,
+    /// It still encodes on the GPU.
+    pub gpu: bool,
+    /// The film, as remembered: later runs of it decode in software.
+    pub file: PathBuf,
 }
 
 impl From<Vec<String>> for Run {
@@ -458,9 +700,16 @@ impl From<Vec<String>> for Run {
     }
 }
 
-/// What the reader side tells the supervisor.
+/// What the reader side and the supervisor tell each other.
 #[derive(Debug)]
 struct Shared {
+    /// ffmpeg's: its process group's. Another once it runs again
+    /// decoding in software.
+    pid: AtomicU32,
+    /// The program and its arguments, as run.
+    command: parking_lot::Mutex<Vec<String>>,
+    /// ffmpeg decodes on the GPU.
+    hardware_decode: AtomicBool,
     furthest_bytes: AtomicU64,
     /// For HLS: the media time of the segment asked for last.
     reader_ms: AtomicU64,
@@ -501,13 +750,12 @@ pub struct EncodeJob {
     pub epoch: u32,
     /// For HLS, the number of the first segment this run writes.
     pub first_segment: u32,
-    pid: u32,
+    /// What it weighs against the encode budget.
+    pub load: Load,
     dir: PathBuf,
     written: Written,
     /// Where the run started in the film, ms.
     start_ms: u64,
-    /// The program and its arguments, as run.
-    command: Vec<String>,
     progress: watch::Receiver<Progress>,
     /// The supervisor's, while it runs: what [`EncodeJob::end`] says the
     /// job ended with.
@@ -525,10 +773,11 @@ impl EncodeJob {
     pub fn stop(&self) {
         self.task.abort();
         if self.progress.borrow().done.is_none() {
+            let pid = self.pid();
             if self.shared.paused.load(Ordering::Relaxed) {
-                signal(self.pid, libc::SIGCONT);
+                signal(pid, libc::SIGCONT);
             }
-            signal(self.pid, libc::SIGKILL);
+            signal(pid, libc::SIGKILL);
         }
         self.slot.lock().take();
     }
@@ -572,7 +821,7 @@ impl EncodeJob {
 
     /// The program and its arguments, as run (paths and all).
     pub fn command(&self) -> Vec<String> {
-        self.command.clone()
+        self.shared.command.lock().clone()
     }
 
     /// ffmpeg's last lines of stderr, oldest first, at most
@@ -591,11 +840,17 @@ impl EncodeJob {
     }
 
     pub fn pid(&self) -> u32 {
-        self.pid
+        self.shared.pid.load(Ordering::Relaxed)
     }
 
     pub fn progress(&self) -> watch::Receiver<Progress> {
         self.progress.clone()
+    }
+
+    /// Whether its ffmpeg decodes on the GPU: false once it fell back to
+    /// software.
+    pub fn decodes_in_hardware(&self) -> bool {
+        self.shared.hardware_decode.load(Ordering::Relaxed)
     }
 
     /// Whether the job is held back for its reader to catch up.
@@ -643,7 +898,7 @@ impl Drop for EncodeJob {
         {
             tracing::warn!(dir = %self.dir.display(), error = %e, "cannot remove an encode's files");
         }
-        tracing::debug!(pid = self.pid, "encode ended");
+        tracing::debug!(pid = self.pid(), "encode ended");
     }
 }
 
@@ -662,7 +917,13 @@ fn signal(pid: u32, sig: libc::c_int) {
 }
 
 struct Supervisor {
-    pid: u32,
+    /// What ran ffmpeg, and its jail but for the GPU: for the run in
+    /// software.
+    ffmpeg: Tool,
+    jail: Jail,
+    /// The run decoding in software, while it has not run.
+    fallback: Option<Fallback>,
+    decode_failures: Arc<DecodeFailures>,
     /// Where the run started in the film, ms.
     start_ms: u64,
     dir: PathBuf,
@@ -684,13 +945,156 @@ struct Supervisor {
     _encoding: Option<EncodingGuard>,
 }
 
+/// How one ffmpeg ended.
+enum Ended {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    /// No progress for `stalled_after`: killed.
+    Stalled,
+    /// The scratch directory is full: killed.
+    ScratchFull,
+    /// ffmpeg could not be run again, decoding in software.
+    NotRelaunched,
+}
+
 impl Supervisor {
     async fn run(
-        self,
-        mut child: tokio::process::Child,
+        mut self,
+        child: tokio::process::Child,
         stdout: tokio::process::ChildStdout,
         stderr: tokio::process::ChildStderr,
     ) {
+        // The furthest media time counted as output (P3-14): from where the
+        // run started, never twice, whichever ffmpeg encoded it.
+        let mut counted_ms = self.start_ms;
+        let mut ended = self.attempt(child, stdout, stderr, &mut counted_ms).await;
+        let decode_failed = matches!(ended, Ended::Exited(Ok(status)) if !status.success())
+            || matches!(ended, Ended::Stalled);
+        if decode_failed && self.shared.hardware_decode.load(Ordering::Relaxed) {
+            if let Some(fallback) = &self.fallback
+                && self.decode_failures.remember(&fallback.file)
+            {
+                tracing::warn!(
+                    file = %fallback.file.display(),
+                    stderr = ?self.shared.stderr_tail(),
+                    "decoding or filtering on the GPU failed; this file is decoded and \
+                     filtered on the CPU from now on"
+                );
+            }
+            // Before the first output nothing a reader has changes: the job
+            // runs again from the start, decoding in software.
+            if self.nothing_written()
+                && let Some(fallback) = self.fallback.take()
+            {
+                match self.relaunch(&fallback) {
+                    Ok((child, stdout, stderr)) => {
+                        ended = self.attempt(child, stdout, stderr, &mut counted_ms).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot run ffmpeg again, decoding in software");
+                        ended = Ended::NotRelaunched;
+                    }
+                }
+            }
+        }
+        self.conclude(ended);
+    }
+
+    /// Run ffmpeg again with `fallback`'s arguments, in its place.
+    fn relaunch(
+        &self,
+        fallback: &Fallback,
+    ) -> std::io::Result<(
+        tokio::process::Child,
+        tokio::process::ChildStdout,
+        tokio::process::ChildStderr,
+    )> {
+        let mut child = launch(
+            &self.ffmpeg,
+            &self.jail.clone().gpu(fallback.gpu),
+            &fallback.args,
+        )?;
+        let pid = child.id().unwrap_or(0);
+        self.shared.pid.store(pid, Ordering::Relaxed);
+        self.shared.hardware_decode.store(false, Ordering::Relaxed);
+        self.shared.paused.store(false, Ordering::Relaxed);
+        let mut command = vec![self.ffmpeg.program().display().to_string()];
+        command.extend(fallback.args.iter().cloned());
+        *self.shared.command.lock() = command;
+        self.shared.stderr_line(
+            "(the GPU failed: running again, decoding and filtering on the CPU)".into(),
+        );
+        tracing::debug!(pid, dir = %self.dir.display(), "encode running again, decoding in software");
+        let stdout = child.stdout.take().expect("piped");
+        let stderr = child.stderr.take().expect("piped");
+        Ok((child, stdout, stderr))
+    }
+
+    /// Whether the run has written nothing a reader could have: no
+    /// finished segment, or not a byte of the file.
+    fn nothing_written(&self) -> bool {
+        match self.measure() {
+            (_, Some(_)) => false,
+            (bytes, None) => self.written == Written::Hls || bytes == 0,
+        }
+    }
+
+    /// How the job ended, said once ffmpeg will not run again.
+    fn conclude(&self, ended: Ended) {
+        match ended {
+            Ended::Exited(Ok(status)) if status.success() => self.finish(Ok(())),
+            Ended::Exited(Ok(status)) => {
+                let tail = self.shared.stderr_tail();
+                let reason = tail
+                    .iter()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| format!("ffmpeg exited with {status}"));
+                tracing::warn!(pid = self.pid(), %status, stderr = ?tail, "an encode failed");
+                self.finish(Err(Failure {
+                    reason,
+                    from_ffmpeg: true,
+                }));
+            }
+            Ended::Exited(Err(e)) => {
+                self.finish(Err(Failure::server(format!("cannot wait for ffmpeg: {e}"))))
+            }
+            Ended::NotRelaunched => {
+                self.slot.lock().take();
+                self.finish(Err(Failure::server(SPAWN_FAILED)));
+            }
+            Ended::Stalled => {
+                self.slot.lock().take();
+                self.finish(Err(Failure::server(format!(
+                    "the conversion stalled: ffmpeg made no progress for {:?}",
+                    self.stalled_after
+                ))));
+            }
+            Ended::ScratchFull => {
+                // Of no use now, and in the way of the other jobs for as
+                // long as the playback lives.
+                if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+                    tracing::warn!(dir = %self.dir.display(), error = %e, "cannot remove an encode's files");
+                }
+                self.finish(Err(Failure::server(
+                    "the server's scratch space for conversions is full",
+                )));
+            }
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.shared.pid.load(Ordering::Relaxed)
+    }
+
+    /// Watch one ffmpeg until it ends, or is ended.
+    async fn attempt(
+        &self,
+        mut child: tokio::process::Child,
+        stdout: tokio::process::ChildStdout,
+        stderr: tokio::process::ChildStderr,
+        counted_ms: &mut u64,
+    ) -> Ended {
         let mut out = BufReader::new(stdout).lines();
         let mut err = BufReader::new(stderr).lines();
         let mut encoded_ms = 0u64;
@@ -703,16 +1107,13 @@ impl Supervisor {
         // With `-copyts` a run started at a seek reports the film's own
         // time, from where it started.
         let base_ms = self.start_ms;
-        // The furthest media time counted as output (P3-14): from where the
-        // run started, never twice.
-        let mut counted_ms = base_ms;
         let mut tick = tokio::time::interval(POLL);
         let mut out_open = true;
         let mut err_open = true;
         let status = loop {
             tokio::select! {
                 line = out.next_line(), if out_open => match line {
-                    Ok(Some(line)) => self.progress_line(&line, &mut encoded_ms, &mut counted_ms),
+                    Ok(Some(line)) => self.progress_line(&line, &mut encoded_ms, counted_ms),
                     _ => out_open = false,
                 },
                 line = err.next_line(), if err_open => match line {
@@ -738,20 +1139,15 @@ impl Supervisor {
                         let _ = child.start_kill();
                         let _ = child.wait().await;
                         tracing::warn!(
-                            pid = self.pid,
+                            pid = self.pid(),
                             after = ?self.stalled_after,
                             bytes,
                             encoded_ms,
                             stderr = ?self.shared.stderr_tail(),
                             "an encode stalled"
                         );
-                        self.slot.lock().take();
                         self.counters.stalled.inc();
-                        self.finish(Err(Failure::server(format!(
-                            "the conversion stalled: ffmpeg made no progress for {:?}",
-                            self.stalled_after
-                        ))));
-                        return;
+                        return Ended::Stalled;
                     }
                     // Only a job that wrote since it last looked can be the
                     // one that fills the scratch directory: a paused one
@@ -764,15 +1160,7 @@ impl Supervisor {
                         if !self.make_room() && !self.shared.paused.load(Ordering::Relaxed) {
                             let _ = child.start_kill();
                             let _ = child.wait().await;
-                            // Of no use now, and in the way of the other
-                            // jobs for as long as the playback lives.
-                            if let Err(e) = std::fs::remove_dir_all(&self.dir) {
-                                tracing::warn!(dir = %self.dir.display(), error = %e, "cannot remove an encode's files");
-                            }
-                            self.finish(Err(Failure::server(
-                                "the server's scratch space for conversions is full",
-                            )));
-                            return;
+                            return Ended::ScratchFull;
                         }
                         seen = self.measure().0;
                     }
@@ -782,7 +1170,7 @@ impl Supervisor {
         // What is left of its progress (a run that ends at once may have
         // written all of it unread), and of stderr for the report.
         while out_open && let Ok(Some(line)) = out.next_line().await {
-            self.progress_line(&line, &mut encoded_ms, &mut counted_ms);
+            self.progress_line(&line, &mut encoded_ms, counted_ms);
         }
         while let Ok(Some(line)) = err.next_line().await {
             self.shared.stderr_line(line);
@@ -793,24 +1181,7 @@ impl Supervisor {
             p.last_segment = last_segment;
             p.encoded_ms = p.encoded_ms.max(encoded_ms);
         });
-        match status {
-            Ok(status) if status.success() => self.finish(Ok(())),
-            Ok(status) => {
-                let tail = self.shared.stderr_tail();
-                let reason = tail
-                    .iter()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| format!("ffmpeg exited with {status}"));
-                tracing::warn!(pid = self.pid, %status, stderr = ?tail, "an encode failed");
-                self.finish(Err(Failure {
-                    reason,
-                    from_ffmpeg: true,
-                }));
-            }
-            Err(e) => self.finish(Err(Failure::server(format!("cannot wait for ffmpeg: {e}")))),
-        }
+        Ended::Exited(status)
     }
 
     /// A line of ffmpeg's `-progress`: key=value; out_time_us is the
@@ -858,7 +1229,7 @@ impl Supervisor {
                 n += 1;
             }
             tracing::debug!(
-                pid = self.pid,
+                pid = self.pid(),
                 first_kept = n,
                 "segments behind the reader removed for room"
             );
@@ -887,13 +1258,13 @@ impl Supervisor {
         let ahead = Duration::from_millis(encoded_ms.saturating_sub(reader_ms));
         let paused = self.shared.paused.load(Ordering::Relaxed);
         if !paused && ahead > self.read_ahead {
-            signal(self.pid, libc::SIGSTOP);
+            signal(self.pid(), libc::SIGSTOP);
             self.shared.paused.store(true, Ordering::Relaxed);
-            tracing::debug!(pid = self.pid, ?ahead, "encode paused for its reader");
+            tracing::debug!(pid = self.pid(), ?ahead, "encode paused for its reader");
         } else if paused && ahead <= self.read_ahead / 2 {
-            signal(self.pid, libc::SIGCONT);
+            signal(self.pid(), libc::SIGCONT);
             self.shared.paused.store(false, Ordering::Relaxed);
-            tracing::debug!(pid = self.pid, ?ahead, "encode resumed");
+            tracing::debug!(pid = self.pid(), ?ahead, "encode resumed");
         }
     }
 }
@@ -984,49 +1355,191 @@ fn last_listed(playlist: &str) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    /// A budget of `jobs` software video encodes, with the default caps.
+    fn budget(jobs: u32) -> Arc<parking_lot::Mutex<BudgetUse>> {
+        budget_with(jobs, 32, 3)
+    }
+
+    fn budget_with(
+        jobs: u32,
+        max_remux: usize,
+        max_gpu_jobs: usize,
+    ) -> Arc<parking_lot::Mutex<BudgetUse>> {
+        Arc::new(parking_lot::Mutex::new(BudgetUse {
+            max: Units::jobs(jobs),
+            max_remux,
+            max_gpu_jobs,
+            ..BudgetUse::default()
+        }))
+    }
+
+    fn take(budget: &Arc<parking_lot::Mutex<BudgetUse>>, load: Load) -> Option<Place> {
+        Place::take(budget, load, None)
+    }
 
     #[test]
     fn a_lower_limit_takes_effect_as_jobs_end_and_a_higher_one_at_once() {
-        let places = Arc::new(parking_lot::Mutex::new(Places { taken: 0, max: 2 }));
-        let first = Place::take(&places).unwrap();
-        let second = Place::take(&places).unwrap();
-        assert!(Place::take(&places).is_none());
-        places.lock().max = 1;
+        let budget = budget(2);
+        let first = take(&budget, Load::Software).unwrap();
+        let second = take(&budget, Load::Software).unwrap();
+        assert!(take(&budget, Load::Software).is_none());
+        budget.lock().max = Units::jobs(1);
         drop(first);
         // Still one taken, and one is all there is.
-        assert!(Place::take(&places).is_none());
+        assert!(take(&budget, Load::Software).is_none());
         drop(second);
-        let third = Place::take(&places).unwrap();
-        places.lock().max = 3;
-        let _fourth = Place::take(&places).unwrap();
+        let third = take(&budget, Load::Software).unwrap();
+        budget.lock().max = Units::jobs(3);
+        let _fourth = take(&budget, Load::Software).unwrap();
         drop(third);
+    }
+
+    #[test]
+    fn four_audio_encodes_fill_a_budget_of_one() {
+        let budget = budget(1);
+        let four: Vec<Place> = (0..4)
+            .map(|n| take(&budget, Load::Audio).unwrap_or_else(|| panic!("audio encode {n}")))
+            .collect();
+        assert!(take(&budget, Load::Audio).is_none(), "a fifth fits");
+        assert_eq!(budget.lock().used, Units::jobs(1));
+        drop(four);
+        assert_eq!(budget.lock().used, Units::default());
+    }
+
+    #[test]
+    fn remuxes_weigh_nothing_and_run_up_to_their_own_cap() {
+        let budget = budget_with(1, 5, 3);
+        let _video = take(&budget, Load::Software).unwrap();
+        let remuxes: Vec<Place> = (0..5)
+            .map(|n| take(&budget, Load::Remux).unwrap_or_else(|| panic!("remux {n}")))
+            .collect();
+        assert!(take(&budget, Load::Remux).is_none(), "a sixth remux fits");
+        let used = *budget.lock();
+        assert_eq!((used.used, used.remuxes), (Units::jobs(1), 5));
+        drop(remuxes);
+        assert_eq!(budget.lock().remuxes, 0);
+    }
+
+    #[test]
+    fn a_video_encode_needs_a_whole_unit_where_an_audio_one_needs_a_quarter() {
+        let budget = budget(1);
+        let _three: Vec<Place> = (0..3)
+            .map(|_| take(&budget, Load::Audio).unwrap())
+            .collect();
+        assert_eq!(budget.lock().used, Units::quarters(3));
+        assert!(take(&budget, Load::Software).is_none(), "1.75 of 1");
+        assert!(take(&budget, Load::Gpu).is_none(), "1.25 of 1");
+        assert!(take(&budget, Load::Audio).is_some());
+    }
+
+    #[test]
+    fn gpu_encodes_weigh_half_and_stop_at_their_own_cap() {
+        let budget = budget_with(4, 32, 2);
+        let first = take(&budget, Load::Gpu).unwrap();
+        let _second = take(&budget, Load::Gpu).unwrap();
+        assert_eq!(budget.lock().used, Units::jobs(1));
+        // 3 of the budget is free, but the GPU cap is reached.
+        assert!(take(&budget, Load::Gpu).is_none());
+        let _software = take(&budget, Load::Software).unwrap();
+        drop(first);
+        assert!(take(&budget, Load::Gpu).is_some());
+    }
+
+    /// Decoded, scaled and encoded on the GPU, a conversion takes 1 to 2%
+    /// of a software encode's CPU: the least an encode weighs. It is still
+    /// a GPU job.
+    #[test]
+    fn a_conversion_all_on_the_gpu_weighs_a_quarter_under_the_gpu_cap() {
+        let budget = budget_with(1, 32, 3);
+        let first = take(&budget, Load::GpuOnly).unwrap();
+        let _second = take(&budget, Load::GpuOnly).unwrap();
+        assert_eq!(budget.lock().used, Units::quarters(2));
+        assert_eq!(budget.lock().gpu_jobs, 2);
+        // The cap counts both kinds of GPU job.
+        let _third = take(&budget, Load::Gpu).unwrap();
+        assert_eq!(budget.lock().used, Units::jobs(1));
+        drop(first);
+        let budget = budget_with(4, 32, 2);
+        let _gpu = take(&budget, Load::Gpu).unwrap();
+        let _only = take(&budget, Load::GpuOnly).unwrap();
+        assert!(take(&budget, Load::GpuOnly).is_none(), "over the GPU cap");
+        assert_eq!(budget.lock().gpu_jobs, 2);
+    }
+
+    #[test]
+    fn a_replacement_of_another_load_counts_what_it_replaces_as_free() {
+        let budget = budget(1);
+        let audio = take(&budget, Load::Audio).unwrap();
+        let _others: Vec<Place> = (0..3)
+            .map(|_| take(&budget, Load::Audio).unwrap())
+            .collect();
+        // A subtitle burned in where an audio encode ran: a software video
+        // encode, which fits only once that audio encode's quarter is free.
+        assert!(take(&budget, Load::Software).is_none());
+        drop(_others);
+        let video = Place::take(&budget, Load::Software, Some(Load::Audio)).unwrap();
+        // Both run for a moment, until the old one stops.
+        assert_eq!(budget.lock().used, Units::quarters(5));
+        drop(audio);
+        assert_eq!(budget.lock().used, Units::jobs(1));
+        drop(video);
+    }
+
+    #[test]
+    fn units_read_as_max_jobs_is_written() {
+        assert_eq!(Units::jobs(2).to_string(), "2");
+        assert_eq!(Units::quarters(5).to_string(), "1.25");
+        assert_eq!(Units::quarters(2).to_string(), "0.5");
+        assert_eq!(Units::quarters(7).to_string(), "1.75");
+        assert_eq!(Units::quarters(5).as_jobs(), 1.25);
     }
 
     #[tokio::test]
     async fn new_limits_apply_to_the_next_job_but_not_the_scratch_directory() {
         let tmp = spoolframe_test_dir::TestDir::new("spoolframe-job-limits").await;
         let limits = JobLimits {
-            max_jobs: 2,
+            budget: Units::jobs(2),
+            max_remux: 32,
+            max_gpu_jobs: 3,
             scratch_dir: tmp.as_ref().join("scratch"),
             scratch_limit_bytes: 1 << 30,
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
+            gpu_filters: false,
         };
         let jobs = Jobs::new(limits.clone(), Tool::unconfined("ffmpeg")).unwrap();
         jobs.set_limits(JobLimits {
-            max_jobs: 1,
+            budget: Units::jobs(1),
+            max_remux: 1,
+            max_gpu_jobs: 1,
             scratch_dir: tmp.as_ref().join("elsewhere"),
             read_ahead: Duration::from_secs(5),
             ..limits.clone()
         });
         let now = jobs.limits();
-        assert_eq!(now.max_jobs, 1);
+        assert_eq!(now.budget, Units::jobs(1));
         assert_eq!(now.read_ahead, Duration::from_secs(5));
         assert_eq!(now.scratch_dir, limits.scratch_dir);
-        let _taken = Place::take(&jobs.places).unwrap();
-        assert!(Place::take(&jobs.places).is_none());
+        let budget = jobs.budget();
+        assert_eq!(
+            (budget.max, budget.max_remux, budget.max_gpu_jobs),
+            (Units::jobs(1), 1, 1)
+        );
+        let _taken = take(&jobs.budget, Load::Software).unwrap();
+        assert!(take(&jobs.budget, Load::Software).is_none());
+        let _remux = take(&jobs.budget, Load::Remux).unwrap();
+        assert!(take(&jobs.budget, Load::Remux).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_note_is_new_once() {
+        let (jobs, _dir) = jobs("notes", "exit 0", 1, Duration::from_secs(60)).await;
+        assert!(jobs.first_note("the GPU's driver does not tone map"));
+        assert!(!jobs.first_note("the GPU's driver does not tone map"));
+        assert!(jobs.first_note("text subtitles are burned in on the CPU"));
     }
 
     #[test]
@@ -1060,7 +1573,7 @@ mod tests {
     }
 
     /// A stand-in for ffmpeg: a shell script.
-    fn ffmpeg(dir: &Path, body: &str) -> PathBuf {
+    pub(in crate::encode) fn ffmpeg(dir: &Path, body: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join("ffmpeg");
         write_script(&path, &format!("#!/bin/sh\n{body}\n"));
@@ -1090,11 +1603,14 @@ mod tests {
         let root = tmp.as_ref().to_path_buf();
         let bin = ffmpeg(&root.join("bin"), body);
         let limits = JobLimits {
-            max_jobs,
+            budget: Units::jobs(max_jobs as u32),
+            max_remux: 32,
+            max_gpu_jobs: 3,
             scratch_dir: root.join("scratch"),
             scratch_limit_bytes: 1 << 30,
             read_ahead,
             stalled_after,
+            gpu_filters: false,
         };
         (Jobs::new(limits, Tool::unconfined(bin)).unwrap(), tmp)
     }
@@ -1130,7 +1646,7 @@ mod tests {
         .await;
         let dir = jobs.dir().join("h/0");
         let job = jobs
-            .start(dir, Vec::new(), Written::Hls, false, 0, 0, 0, None)
+            .start(dir, Vec::new(), Written::Hls, Load::Remux, 0, 0, 0, None)
             .unwrap();
         assert_eq!(
             done(&job).await.unwrap_err(),
@@ -1154,7 +1670,7 @@ mod tests {
                 dir,
                 vec![file.display().to_string()],
                 Written::Progressive { file },
-                false,
+                Load::Remux,
                 0,
                 0,
                 0,
@@ -1186,7 +1702,7 @@ mod tests {
                 jobs.dir().join("h/0"),
                 Vec::new(),
                 Written::Hls,
-                false,
+                Load::Remux,
                 0,
                 0,
                 60_000,
@@ -1206,7 +1722,7 @@ mod tests {
                 scratch.join("a/0"),
                 Vec::new(),
                 Written::Hls,
-                false,
+                Load::Software,
                 0,
                 0,
                 0,
@@ -1218,7 +1734,7 @@ mod tests {
                 scratch.join("b/0"),
                 Vec::new(),
                 Written::Hls,
-                false,
+                Load::Software,
                 0,
                 0,
                 0,
@@ -1228,12 +1744,13 @@ mod tests {
         ));
         let counts = jobs.counts();
         assert_eq!((counts.running, counts.refused), (1, 1));
+        assert_eq!(counts.running_by_load, [0, 0, 0, 1, 0], "{counts:?}");
         first.stop();
         jobs.start(
             scratch.join("b/0"),
             Vec::new(),
             Written::Hls,
-            false,
+            Load::Software,
             0,
             0,
             0,
@@ -1252,7 +1769,7 @@ mod tests {
                 scratch.join("c/0"),
                 Vec::new(),
                 Written::Hls,
-                false,
+                Load::Remux,
                 0,
                 0,
                 0,
@@ -1265,7 +1782,7 @@ mod tests {
                 scratch.join("a/0"),
                 Vec::new(),
                 Written::Hls,
-                true,
+                Load::Software,
                 0,
                 0,
                 0,
@@ -1285,7 +1802,7 @@ mod tests {
                 quick.dir().join("e/0"),
                 Vec::new(),
                 Written::Hls,
-                true,
+                Load::Software,
                 0,
                 0,
                 0,
@@ -1333,7 +1850,7 @@ mod tests {
                 jobs.dir().join("h/0"),
                 Vec::new(),
                 Written::Hls,
-                false,
+                Load::Remux,
                 0,
                 0,
                 0,
@@ -1346,6 +1863,192 @@ mod tests {
         assert_eq!(kept[0], format!("line {}", 100 - STDERR_KEPT));
     }
 
+    /// A run decoding on the GPU, for `film`, as `jobs` gets it: `hw` as
+    /// its last argument, which the stand-in ffmpeg looks for, and no
+    /// `hw` in its software fallback.
+    fn gpu_run(file: &Path, film: &Path) -> Run {
+        let file = file.display().to_string();
+        Run {
+            args: vec![file.clone(), "hw".into()],
+            gpu: true,
+            fallback: Some(Fallback {
+                args: vec![file],
+                gpu: false,
+                file: film.to_owned(),
+            }),
+            ..Run::default()
+        }
+    }
+
+    /// The stand-in: `on_gpu` when the last argument is `hw`, else writes
+    /// `abc` to the first and reports a second encoded.
+    fn decoding(on_gpu: &str) -> String {
+        format!(
+            "for a; do last=$a; done\n\
+             if [ \"$last\" = hw ]; then {on_gpu}; fi\n\
+             printf abc > \"$1\"; echo out_time_us=1000000"
+        )
+    }
+
+    /// A GPU decode the driver refuses (10-bit H.264, an AV1 profile) fails
+    /// before ffmpeg writes anything: the same job runs again decoding in
+    /// software, and the film is remembered, so its next run decodes in
+    /// software from the start.
+    #[tokio::test]
+    async fn a_gpu_decode_that_fails_before_any_output_runs_again_in_software() {
+        let (jobs, tmp) = jobs(
+            "gpu-decode-fails",
+            &decoding(
+                "echo 'Impossible to convert between the formats supported by the filter' >&2; \
+                 exit 218",
+            ),
+            1,
+            Duration::from_secs(60),
+        )
+        .await;
+        let film = tmp.as_ref().join("film.mkv");
+        let dir = jobs.dir().join("h/0");
+        let file = dir.join("out.mkv");
+        let job = jobs
+            .start(
+                dir,
+                gpu_run(&file, &film),
+                Written::Progressive { file: file.clone() },
+                Load::Gpu,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(done(&job).await, Ok(()));
+        assert_eq!(job.progress().borrow().bytes, 3);
+        assert!(jobs.hardware_decode_failed(&film));
+        assert!(!jobs.hardware_decode_failed(&tmp.as_ref().join("other.mkv")));
+        assert!(!job.decodes_in_hardware());
+        // What ran last is what playback debug shows; what the GPU run
+        // said is kept above it.
+        assert_eq!(
+            job.command(),
+            [
+                jobs.ffmpeg.program().display().to_string(),
+                file.display().to_string()
+            ]
+        );
+        assert!(
+            job.stderr()
+                .iter()
+                .any(|l| l.starts_with("Impossible to convert")),
+            "{:?}",
+            job.stderr()
+        );
+    }
+
+    /// One that fails after it wrote is not run again from the start: what
+    /// its reader has would change under it. It fails, and the film is
+    /// remembered, so the playback's next run (a seek, the next segment)
+    /// decodes in software.
+    #[tokio::test]
+    async fn a_gpu_decode_that_fails_after_its_first_output_fails_and_is_remembered() {
+        let (jobs, tmp) = jobs(
+            "gpu-decode-fails-late",
+            &decoding("printf abc > \"$1\"; echo 'hardware decoding failed' >&2; exit 1"),
+            1,
+            Duration::from_secs(60),
+        )
+        .await;
+        let film = tmp.as_ref().join("film.mkv");
+        let dir = jobs.dir().join("h/0");
+        let file = dir.join("out.mkv");
+        let job = jobs
+            .start(
+                dir,
+                gpu_run(&file, &film),
+                Written::Progressive { file: file.clone() },
+                Load::Gpu,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(done(&job).await.unwrap_err(), "hardware decoding failed");
+        assert!(jobs.hardware_decode_failed(&film));
+        assert!(job.decodes_in_hardware());
+    }
+
+    /// A GPU decode that hangs before its first output is ended as stalled
+    /// and run again in software, rather than holding the playback.
+    #[tokio::test]
+    async fn a_gpu_decode_that_stalls_before_any_output_runs_again_in_software() {
+        let (jobs, tmp) = jobs_stalled_after(
+            "gpu-decode-stalls",
+            &decoding("exec sleep 30"),
+            1,
+            Duration::from_secs(60),
+            Duration::from_millis(600),
+        )
+        .await;
+        let film = tmp.as_ref().join("film.mkv");
+        let dir = jobs.dir().join("h/0");
+        let file = dir.join("out.mkv");
+        let job = jobs
+            .start(
+                dir,
+                gpu_run(&file, &film),
+                Written::Progressive { file: file.clone() },
+                Load::Gpu,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        let hung = job.pid();
+        assert_eq!(done(&job).await, Ok(()));
+        assert_ne!(job.pid(), hung);
+        assert!(!alive(hung), "the hung ffmpeg {hung} still runs");
+        assert!(jobs.hardware_decode_failed(&film));
+        // The hung run is counted as a stall all the same.
+        assert_eq!(jobs.counts().stalled, 1);
+    }
+
+    /// The software run is the job's ffmpeg in every way: held back for its
+    /// reader, and killed with the job.
+    #[tokio::test]
+    async fn the_software_run_is_throttled_and_killed_as_the_first_would_be() {
+        let (jobs, tmp) = jobs(
+            "gpu-decode-fallback-supervised",
+            "for a; do last=$a; done\n\
+             if [ \"$last\" = hw ]; then exit 218; fi\n\
+             head -c 100 /dev/zero > \"$1\"; echo out_time_us=60000000; exec sleep 30",
+            1,
+            Duration::from_secs(10),
+        )
+        .await;
+        let film = tmp.as_ref().join("film.mkv");
+        let dir = jobs.dir().join("h/0");
+        let file = dir.join("out.mkv");
+        let job = jobs
+            .start(
+                dir,
+                gpu_run(&file, &film),
+                Written::Progressive { file },
+                Load::Gpu,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        let first = job.pid();
+        eventually(|| job.pid() != first && stopped(job.pid())).await;
+        assert!(job.paused());
+        let pid = job.pid();
+        drop(job);
+        eventually(|| !alive(pid)).await;
+    }
+
     /// What the job runs, as it ran it: the program and its arguments.
     #[tokio::test]
     async fn a_job_knows_its_command_line() {
@@ -1356,7 +2059,7 @@ mod tests {
                 jobs.dir().join("h/0"),
                 args.clone(),
                 Written::Hls,
-                false,
+                Load::Remux,
                 0,
                 0,
                 0,
@@ -1387,7 +2090,7 @@ mod tests {
                 dir.clone(),
                 vec![file.display().to_string()],
                 Written::Progressive { file: file.clone() },
-                true,
+                Load::Software,
                 0,
                 0,
                 0,
@@ -1409,7 +2112,7 @@ mod tests {
             jobs.dir().join("i/0"),
             Vec::new(),
             Written::Hls,
-            false,
+            Load::Remux,
             0,
             0,
             0,
@@ -1424,7 +2127,16 @@ mod tests {
         let (jobs, _dir) = jobs("drop", "exec sleep 30", 2, Duration::from_secs(60)).await;
         let dir = jobs.dir().join("h/0");
         let job = jobs
-            .start(dir.clone(), Vec::new(), Written::Hls, false, 0, 0, 0, None)
+            .start(
+                dir.clone(),
+                Vec::new(),
+                Written::Hls,
+                Load::Remux,
+                0,
+                0,
+                0,
+                None,
+            )
             .unwrap();
         let pid = job.pid();
         assert!(alive(pid));
@@ -1452,7 +2164,7 @@ mod tests {
                 dir,
                 vec![file.display().to_string()],
                 Written::Progressive { file },
-                false,
+                Load::Remux,
                 0,
                 0,
                 0,
@@ -1503,7 +2215,7 @@ mod tests {
                 dir,
                 vec![file.display().to_string()],
                 Written::Progressive { file },
-                false,
+                Load::Remux,
                 0,
                 0,
                 0,
@@ -1537,7 +2249,7 @@ mod tests {
         let dir = jobs.dir().join("h/0");
         let args = vec![dir.display().to_string()];
         let job = jobs
-            .start(dir, args, Written::Hls, false, 0, 1, 0, None)
+            .start(dir, args, Written::Hls, Load::Remux, 0, 1, 0, None)
             .unwrap();
         job.reader_at(1, 6_000);
         let mut progress = job.progress();
@@ -1567,7 +2279,7 @@ mod tests {
                 dir,
                 vec![file.display().to_string()],
                 Written::Progressive { file },
-                false,
+                Load::Remux,
                 0,
                 0,
                 0,
@@ -1621,7 +2333,7 @@ mod tests {
                 scratch.join("a/0"),
                 Vec::new(),
                 Written::Hls,
-                false,
+                Load::Software,
                 0,
                 0,
                 0,
@@ -1645,7 +2357,7 @@ mod tests {
             scratch.join("b/0"),
             Vec::new(),
             Written::Hls,
-            false,
+            Load::Software,
             0,
             0,
             0,
@@ -1675,7 +2387,7 @@ mod tests {
                 dir,
                 vec![file.display().to_string()],
                 Written::Progressive { file },
-                false,
+                Load::Remux,
                 0,
                 0,
                 0,
@@ -1720,7 +2432,7 @@ mod tests {
         let slow_part_over = jobs.dir().join("over");
         let args = vec![slow_part_over.display().to_string()];
         let job = jobs
-            .start(dir, args, Written::Hls, false, 0, 0, 0, None)
+            .start(dir, args, Written::Hls, Load::Remux, 0, 0, 0, None)
             .unwrap();
         let ended = tokio::time::timeout(Duration::from_secs(10), done(&job))
             .await
@@ -1743,11 +2455,14 @@ mod tests {
         let root = tmp.as_ref().to_path_buf();
         let bin = ffmpeg(&root.join("bin"), body);
         let limits = JobLimits {
-            max_jobs: 2,
+            budget: Units::jobs(2),
+            max_remux: 32,
+            max_gpu_jobs: 3,
             scratch_dir: root.join("scratch"),
             scratch_limit_bytes: scratch_limit,
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
+            gpu_filters: false,
         };
         (Jobs::new(limits, Tool::unconfined(bin)).unwrap(), tmp)
     }
@@ -1785,7 +2500,7 @@ mod tests {
             let args = vec![file.display().to_string(), mode.to_owned()];
             let written = Written::Progressive { file: file.clone() };
             (
-                jobs.start(dir, args, written, false, 0, 0, 0, None)
+                jobs.start(dir, args, written, Load::Remux, 0, 0, 0, None)
                     .unwrap(),
                 file,
             )
@@ -1848,7 +2563,16 @@ mod tests {
         let (jobs, _dir) = jobs_within("trim", "exec sleep 30", 5_500).await;
         let dir = jobs.dir().join("h/0");
         let job = jobs
-            .start(dir.clone(), Vec::new(), Written::Hls, false, 0, 1, 0, None)
+            .start(
+                dir.clone(),
+                Vec::new(),
+                Written::Hls,
+                Load::Remux,
+                0,
+                1,
+                0,
+                None,
+            )
             .unwrap();
         // The reader asked for segment 7: 6 stays too, 1 to 5 may go.
         job.reader_at(7, 42_000);
@@ -1878,7 +2602,7 @@ mod tests {
         let dir = jobs.dir().join("h/0");
         let args = vec![dir.display().to_string()];
         let job = jobs
-            .start(dir.clone(), args, Written::Hls, false, 0, 1, 0, None)
+            .start(dir.clone(), args, Written::Hls, Load::Remux, 0, 1, 0, None)
             .unwrap();
         // The reader got to segment 7, then went back to 4.
         job.reader_at(7, 42_000);
@@ -1913,11 +2637,14 @@ mod tests {
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("out.mkv"), b"stale").unwrap();
         let limits = JobLimits {
-            max_jobs: 1,
+            budget: Units::jobs(1),
+            max_remux: 32,
+            max_gpu_jobs: 3,
             scratch_dir: root.join("scratch"),
             scratch_limit_bytes: 1 << 30,
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
+            gpu_filters: false,
         };
         let jobs = Jobs::new(limits, Tool::unconfined("ffmpeg")).unwrap();
         assert!(!jobs.dir().join("oldhandle").exists());
@@ -1937,11 +2664,14 @@ mod tests {
         std::fs::write(&key, b"secret").unwrap();
         std::fs::write(&text, b"WEBVTT").unwrap();
         let limits = JobLimits {
-            max_jobs: 1,
+            budget: Units::jobs(1),
+            max_remux: 32,
+            max_gpu_jobs: 3,
             scratch_dir: root.join("state"),
             scratch_limit_bytes: 1 << 30,
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
+            gpu_filters: false,
         };
         Jobs::new(limits, Tool::unconfined("ffmpeg")).unwrap();
         assert_eq!(std::fs::read(&key).unwrap(), b"secret");
