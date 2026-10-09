@@ -36,7 +36,7 @@ async fn progress(server: &TestServer, tv: &TestClient, who: &SessionId, id: &Me
                 selection: Some(Default::default()),
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await;

@@ -3130,3 +3130,16 @@
   whole direct read, so a long round trip no longer caps a read at about
   33 Mbit/s; `reader::Tuning` sets the reads in flight and the
   read-ahead.
+- A quality choice per playback (P6-06, wire revision 10): Auto (for
+  the link), a bitrate, or Original (the file, whatever the link), at
+  the start (`PlaybackOptions::quality`) and while playing
+  (`change_quality`). Only Auto is switched on a stall. A capped encode
+  is also made smaller: 1080p from 4.5 Mbit/s of H.264, 720p from 2.2,
+  and so on, rather than a starved 2160p.
+- Adaptive HLS for Auto quality (PX-21, wire revision 11): a playback
+  over HLS that encodes its video is a ladder of up to four encodes,
+  from the app's own cap down to 1 Mbit/s, each at the height its rate
+  carries, and the player moves between them as its link changes. One
+  encode runs at a time: a read of another rung moves it there, and the
+  rung it left keeps what it wrote. The player starts on the rung the
+  measured link chose. `MediaRead` and `GetManifest` name the rung.

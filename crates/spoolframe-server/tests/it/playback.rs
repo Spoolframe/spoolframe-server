@@ -31,7 +31,7 @@ async fn start(client: &TestClient, session: &SessionId, selection: Selection) -
                 selection: Some(selection),
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await
@@ -792,7 +792,7 @@ async fn mutation_ids_survive_reconnect_and_reject_changed_payloads() {
                 selection: Some(Selection::default()),
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         },
         operation: Some(client.operation()),
@@ -830,6 +830,7 @@ async fn mutation_ids_survive_reconnect_and_reject_changed_payloads() {
                 length: 10,
                 epoch: 0,
                 segment: None,
+                variant: 0,
             },
             revision: 1,
         })
@@ -1000,6 +1001,7 @@ async fn a_read_nobody_takes_is_reset() {
             length: size,
             epoch: 0,
             segment: None,
+            variant: 0,
         },
         revision,
     };

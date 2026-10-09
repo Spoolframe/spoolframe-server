@@ -10,6 +10,46 @@ use spoolframe_types::{AudioCodec, Container, Delivery, SubtitleFormat, VideoCod
 /// and the SDK asks for a new plan when a file needs more than it.
 pub const LINK_SHARE: f64 = 0.75;
 
+/// One encode of an HLS ladder (PX-21): its picture's height and its
+/// video's bitrate cap, bits per second. Its codec, range and burned-in
+/// subtitle are the plan's `video`'s; only the size and rate differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rung {
+    pub height: u32,
+    pub max_bitrate: u64,
+}
+
+/// What quality a playback is planned for (P6-06): the viewer's choice
+/// for this playback. The capabilities' `max_bitrate`, the app's own
+/// limit, stays a ceiling over each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Quality {
+    /// For the link: [`LINK_SHARE`] of what the device measured it
+    /// carrying lately, bits per second; `None`: it has measured nothing.
+    /// A playback that stalls is planned again for the link.
+    Auto {
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        link_bitrate: Option<u64>,
+    },
+    /// At most `max_bitrate` bits per second, whatever the link: encoded
+    /// under it when the file is over it.
+    Bitrate { max_bitrate: u64 },
+    /// The file as it is, whatever the link: converted only for what the
+    /// device cannot play, and never for the link.
+    Original,
+    /// A choice this build does not know: treated as `Auto` with nothing
+    /// measured.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Default for Quality {
+    fn default() -> Self {
+        Self::Auto { link_bitrate: None }
+    }
+}
+
 /// The tracks a client wants, as positions in the item's `MediaTracks`
 /// lists. Only these count: a track the user did not pick never blocks
 /// playback.
@@ -103,6 +143,10 @@ pub enum PlaybackPlan {
         video: Option<ConvertedVideo>,
         audio: Option<ConvertedAudio>,
         subtitle: Option<ConvertedSubtitle>,
+        /// The encodes an HLS player switches between as its link changes
+        /// (PX-21), highest first: `video` is the first of them. Empty for
+        /// one encode, as every plan but `Auto` quality over HLS is.
+        ladder: Vec<Rung>,
         /// Why the file is not played as it is, one per stream that is
         /// converted, e.g. "subtitle 0: pgs cannot be shown; burned into
         /// the video". A client can offer to avoid them (subtitles off).

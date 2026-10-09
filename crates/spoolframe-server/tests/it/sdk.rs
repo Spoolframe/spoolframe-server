@@ -761,7 +761,7 @@ async fn an_hls_playback_gives_its_playlist_and_segments() {
         .await
         .unwrap();
     let media = alice
-        .manifest(&playback.handle, ManifestKind::Media)
+        .manifest(&playback.handle, ManifestKind::Media, 0)
         .await
         .unwrap();
     assert!(
@@ -772,7 +772,7 @@ async fn an_hls_playback_gives_its_playlist_and_segments() {
         let mut got = 0;
         loop {
             let chunk = alice
-                .read_segment(&playback.handle, playback.epoch, n, got, MAX_READ)
+                .read_segment(&playback.handle, playback.epoch, 0, n, got, MAX_READ)
                 .await
                 .unwrap();
             got += chunk.bytes.len() as u64;
@@ -1954,7 +1954,7 @@ async fn managed_playback_resumes_are_bounded() {
 async fn whole_segment(playback: &spoolframe_client_sdk::ManagedPlayback, n: u32) -> u64 {
     let mut got = 0;
     loop {
-        let chunk = playback.read_segment(n, got, MAX_READ).await.unwrap();
+        let chunk = playback.read_segment(0, n, got, MAX_READ).await.unwrap();
         got += chunk.bytes.len() as u64;
         if chunk.complete && got == chunk.size {
             return got;
@@ -1973,14 +1973,17 @@ async fn an_hls_managed_playback_idled_out_reads_on() {
         .open_playback(movie().id(), None, PlaybackOptions::default())
         .await
         .unwrap();
-    let media = playback.manifest(ManifestKind::Media).await.unwrap();
+    let media = playback.manifest(ManifestKind::Media, 0).await.unwrap();
     assert!(whole_segment(&playback, 0).await > 0);
     assert!(whole_segment(&playback, 1).await > 0);
     let old = playback.snapshot().handle;
     idle_out(&server);
     assert!(whole_segment(&playback, 2).await > 0);
     assert_ne!(playback.snapshot().handle, old);
-    assert_eq!(playback.manifest(ManifestKind::Media).await.unwrap(), media);
+    assert_eq!(
+        playback.manifest(ManifestKind::Media, 0).await.unwrap(),
+        media
+    );
     playback.close().await.unwrap();
     client.close().await;
     server.stop().await;
@@ -2064,6 +2067,51 @@ async fn a_limit_the_plan_fits_leaves_the_playback_and_its_controls() {
         .change_subtitle(None, Default::default(), Duration::ZERO)
         .await
         .unwrap();
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// An Auto playback over HLS that encodes is a ladder (PX-21): the SDK
+/// reads its multivariant playlist and a rung's segments by the rung's
+/// number, as the Apple bridge maps `v{n}/` to it.
+#[tokio::test]
+async fn a_ladder_s_rungs_are_read_by_their_number() {
+    let dir = support::fresh_dir("sdk-ladder").await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let options = support::ServerOptions {
+        ffmpeg: crate::encode::ladder_ffmpeg(&dir),
+        ..support::ServerOptions::default()
+    };
+    let server = TestServer::start_with(dir, options).await;
+    server.write_media(1 << 20);
+    server.add_user("alice", "correct horse", None).await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = client_with(&server, &storage, support::hls_capabilities()).await;
+    let alice = alice(&server, &client).await;
+    let playback = alice
+        .open_playback(movie().id(), None, PlaybackOptions::default())
+        .await
+        .unwrap();
+    let PlaybackPlan::Converted { ladder, .. } = playback.snapshot().plan else {
+        panic!("not converted: {:?}", playback.snapshot().plan);
+    };
+    assert!(ladder.len() > 1, "{ladder:?}");
+    let text = playback
+        .manifest(ManifestKind::Multivariant, 0)
+        .await
+        .unwrap();
+    // No link measured: the player starts on the lowest rung.
+    let lowest = ladder.len() as u32 - 1;
+    assert!(text.contains(&format!("\nv{lowest}/media.m3u8")), "{text}");
+    let segment = loop {
+        let chunk = playback.read_segment(lowest, 1, 0, MAX_READ).await.unwrap();
+        if chunk.complete {
+            break chunk.bytes;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(segment, b"seg1");
     playback.close().await.unwrap();
     client.close().await;
     server.stop().await;

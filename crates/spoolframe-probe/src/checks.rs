@@ -320,7 +320,7 @@ async fn unauthenticated(probe: &Probe) -> Result<Outcome, Problem> {
                 selection: None,
                 start_ms: None,
                 bitmap: BitmapSubtitles::Auto,
-                link_bitrate: None,
+                quality: Default::default(),
             },
         ),
     ];

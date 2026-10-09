@@ -13,7 +13,7 @@ use spoolframe_protocol::{
     SessionId,
 };
 
-use spoolframe_protocol::{ManifestKind, MediaRead};
+use spoolframe_protocol::{ManifestKind, MediaRead, Quality};
 use spoolframe_types::{ClientCapabilities, VideoLimits};
 
 use crate::support::{
@@ -53,7 +53,7 @@ async fn start(client: &TestClient, session: &SessionId, start_ms: Option<u64>) 
                 selection: None,
                 start_ms,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await
@@ -644,6 +644,7 @@ async fn an_hls_restart_that_cannot_start_leaves_the_playback_playing() {
             length: MAX_READ,
             epoch: 0,
             segment: Some(15),
+            variant: 0,
         })
         .await;
     assert!(
@@ -816,6 +817,7 @@ async fn manifest(
             Request::GetManifest {
                 handle: handle.clone(),
                 kind,
+                variant: 0,
             },
         )
         .await
@@ -842,6 +844,7 @@ async fn segment(
                 length: MAX_READ,
                 epoch: 0,
                 segment: Some(n),
+                variant: 0,
             })
             .await;
         let MediaReadResponse::Ok(reply) = response else {
@@ -1354,6 +1357,7 @@ async fn an_explicit_hls_seek_keeps_segment_numbers_and_film_time() {
                 length: 1,
                 epoch: 0,
                 segment: Some(3),
+                variant: 0,
             })
             .await;
         assert!(matches!(read, MediaReadResponse::Ok(reply) if reply.epoch == 1));
@@ -1435,6 +1439,7 @@ async fn a_failed_hls_segment_read_is_logged() {
             length: MAX_READ,
             epoch: 0,
             segment: Some(999),
+            variant: 0,
         })
         .await;
     assert!(
@@ -1494,6 +1499,7 @@ async fn a_device_s_next_hls_playback_leaves_the_one_playing() {
             length: MAX_READ,
             epoch: 0,
             segment: Some(2),
+            variant: 0,
         })
         .await;
     assert!(
@@ -1578,6 +1584,7 @@ async fn a_paused_playback_s_progress_reports_do_not_hold_its_slot_against_its_d
             length: MAX_READ,
             epoch: 0,
             segment: Some(2),
+            variant: 0,
         })
         .await;
     assert!(
@@ -1893,7 +1900,7 @@ async fn an_hls_playback_carries_its_subtitle_as_a_webvtt_rendition() {
                 }),
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await;
@@ -1970,7 +1977,7 @@ async fn an_hls_playback_reads_a_vobsub_or_dvb_track_into_its_webvtt_rendition()
                     }),
                     start_ms: None,
                     bitmap: Default::default(),
-                    link_bitrate: None,
+                    quality: Default::default(),
                 },
             )
             .await;
@@ -2208,7 +2215,7 @@ async fn a_burned_in_subtitle_shows_in_the_picture_where_it_was_placed() {
                 }),
                 start_ms: None,
                 bitmap: BitmapSubtitles::BurnIn,
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await;
@@ -2270,7 +2277,7 @@ async fn burned_sidecar(
                 }),
                 start_ms,
                 bitmap: BitmapSubtitles::BurnIn,
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await;
@@ -2379,7 +2386,7 @@ async fn a_copied_pgs_file_beside_the_film_keeps_its_cues_times() {
                 }),
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await;
@@ -2445,7 +2452,7 @@ async fn a_copied_vobsub_file_beside_the_film_is_in_the_output() {
                 }),
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await;
@@ -2538,6 +2545,7 @@ async fn a_segment_gone_before_it_is_opened_is_not_an_empty_segment() {
             length: MAX_READ,
             epoch: 0,
             segment: Some(1),
+            variant: 0,
         })
         .await;
     let MediaReadResponse::Ok(reply) = response else {
@@ -2584,10 +2592,10 @@ async fn ready_for_range(test: &str) -> (TestServer, TestClient, SessionId) {
     (server, client, session)
 }
 
-async fn start_on_link(
+async fn start_for(
     client: &TestClient,
     session: &SessionId,
-    link_bitrate: Option<u64>,
+    quality: Quality,
 ) -> (PlaybackHandle, PlaybackPlan) {
     let response = client
         .call(
@@ -2597,7 +2605,7 @@ async fn start_on_link(
                 selection: None,
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate,
+                quality,
             },
         )
         .await;
@@ -2607,18 +2615,24 @@ async fn start_on_link(
     }
 }
 
-async fn limit(
+fn on_link(link_bitrate: u64) -> Quality {
+    Quality::Auto {
+        link_bitrate: Some(link_bitrate),
+    }
+}
+
+async fn change_quality(
     client: &TestClient,
     session: &SessionId,
     handle: &PlaybackHandle,
-    link_bitrate: u64,
+    quality: Quality,
 ) -> (PlaybackPlan, u32) {
     let response = client
         .call(
             Some(session),
-            Request::LimitPlayback {
+            Request::ChangeQuality {
                 handle: handle.clone(),
-                link_bitrate,
+                quality,
                 bitmap: Default::default(),
                 position_ms: 4_000,
             },
@@ -2645,7 +2659,7 @@ fn encoded_video(plan: &PlaybackPlan) -> Option<Option<u64>> {
 #[tokio::test]
 async fn a_device_that_measured_a_slow_link_starts_with_an_encode() {
     let (server, client, session) = ready_for_range("link-start-slow").await;
-    let (_, plan) = start_on_link(&client, &session, Some(SLOW_LINK)).await;
+    let (_, plan) = start_for(&client, &session, on_link(SLOW_LINK)).await;
     assert!(
         encoded_video(&plan).is_some_and(|cap| cap.is_some()),
         "{plan:?}"
@@ -2657,9 +2671,9 @@ async fn a_device_that_measured_a_slow_link_starts_with_an_encode() {
 #[tokio::test]
 async fn a_direct_play_on_a_link_found_slow_is_planned_again_as_an_encode() {
     let (server, client, session) = ready_for_range("link-limit-slow").await;
-    let (handle, plan) = start_on_link(&client, &session, None).await;
+    let (handle, plan) = start_for(&client, &session, Quality::default()).await;
     assert!(matches!(plan, PlaybackPlan::Direct { .. }), "{plan:?}");
-    let (plan, epoch) = limit(&client, &session, &handle, SLOW_LINK).await;
+    let (plan, epoch) = change_quality(&client, &session, &handle, on_link(SLOW_LINK)).await;
     assert!(
         encoded_video(&plan).is_some_and(|cap| cap.is_some()),
         "{plan:?}"
@@ -2674,9 +2688,219 @@ async fn a_direct_play_on_a_link_found_slow_is_planned_again_as_an_encode() {
 #[tokio::test]
 async fn a_link_fast_enough_leaves_the_playback_as_it_is() {
     let (server, client, session) = ready_for_range("link-limit-fast").await;
-    let (handle, before) = start_on_link(&client, &session, None).await;
-    let (after, epoch) = limit(&client, &session, &handle, 1_000_000_000).await;
+    let (handle, before) = start_for(&client, &session, Quality::default()).await;
+    let (after, epoch) = change_quality(&client, &session, &handle, on_link(1_000_000_000)).await;
     assert_eq!((after, epoch), (before, 0));
+    client.close().await;
+    server.stop().await;
+}
+
+/// A bitrate the viewer chose under the file's is an encode under it.
+#[tokio::test]
+async fn a_chosen_bitrate_under_the_file_s_is_an_encode() {
+    let (server, client, session) = ready_for_range("quality-bitrate").await;
+    let quality = Quality::Bitrate {
+        max_bitrate: SLOW_LINK,
+    };
+    let (_, plan) = start_for(&client, &session, quality).await;
+    assert!(
+        encoded_video(&plan).is_some_and(|cap| cap.is_some()),
+        "{plan:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// Original quality plays the file directly however slow the link, and
+/// takes a playback the link made an encode back to the file.
+#[tokio::test]
+async fn original_quality_plays_the_file_whatever_the_link() {
+    let (server, client, session) = ready_for_range("quality-original").await;
+    let (handle, plan) = start_for(&client, &session, on_link(SLOW_LINK)).await;
+    assert!(encoded_video(&plan).is_some(), "{plan:?}");
+    let (plan, _) = change_quality(&client, &session, &handle, Quality::Original).await;
+    assert!(matches!(plan, PlaybackPlan::Direct { .. }), "{plan:?}");
+    client.close().await;
+    server.stop().await;
+}
+
+/// A stand-in ffmpeg for ladder tests (PX-21): it writes its arguments,
+/// the init segment and four segments from the one it is started at, and
+/// lists them as finished.
+pub(crate) fn ladder_ffmpeg(dir: &Path) -> PathBuf {
+    let stub = dir.join("ladder-ffmpeg");
+    crate::support::write_script(
+        &stub,
+        "#!/bin/sh\n\
+         prev=; start=1\n\
+         for a; do [ \"$prev\" = -start_number ] && start=$a; prev=$a; done\n\
+         for playlist; do :; done\n\
+         dir=$(dirname \"$playlist\")\n\
+         echo \"$*\" > \"$dir/args\"\n\
+         printf 'init' > \"$dir/init.mp4\"\n\
+         list='#EXTM3U\\n'; n=$start\n\
+         while [ $n -lt $((start + 4)) ]; do\n\
+           printf \"seg$n\" > \"$dir/seg$n.m4s\"\n\
+           list=\"$list#EXTINF:6.000000,\\nseg$n.m4s\\n\"; n=$((n + 1))\n\
+         done\n\
+         printf \"$list\" > \"$playlist\"\n\
+         exec sleep 30\n",
+    );
+    stub
+}
+
+/// A server whose movie is the stand-in's 4K HEVC at about 25 Mbit/s,
+/// for an HLS client that plays H.264 only: Auto encodes it as a ladder.
+async fn ladder_ready(test: &str) -> (TestServer, TestClient, SessionId) {
+    let dir = fresh_dir(test).await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let options = ServerOptions {
+        ffmpeg: ladder_ffmpeg(&dir),
+        ..ServerOptions::default()
+    };
+    let server = TestServer::start_with(dir, options).await;
+    server.write_media(1 << 20);
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client.hello_with(None, Some(hls_capabilities())).await;
+    let session = client.login("alice", "correct horse").await;
+    (server, client, session)
+}
+
+/// Segment `n` of rung `variant`, whole.
+async fn rung_segment(
+    client: &TestClient,
+    session: &SessionId,
+    handle: &PlaybackHandle,
+    n: u32,
+    variant: u32,
+) -> Vec<u8> {
+    for _ in 0..200 {
+        let (response, bytes) = client
+            .media(MediaRead {
+                session: session.clone(),
+                handle: handle.clone(),
+                offset: 0,
+                length: MAX_READ,
+                epoch: 0,
+                segment: Some(n),
+                variant,
+            })
+            .await;
+        let MediaReadResponse::Ok(reply) = response else {
+            panic!("rung {variant} segment {n}: {response:?}");
+        };
+        if reply.complete {
+            return bytes;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("rung {variant} segment {n} never finished");
+}
+
+/// The playback's rungs, and the one it started on, from its plan.
+fn rungs_of(plan: &PlaybackPlan) -> Vec<spoolframe_protocol::Rung> {
+    match plan {
+        PlaybackPlan::Converted { ladder, .. } => ladder.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// The multivariant playlist's variant URIs, in order.
+fn variant_uris(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn auto_over_hls_lists_a_ladder_starting_on_the_link_s_rung() {
+    let (server, client, session) = ladder_ready("ladder-list").await;
+    let (handle, plan) = start_for(&client, &session, on_link(5_000_000)).await;
+    let rungs = rungs_of(&plan);
+    assert!(rungs.len() > 1, "{plan:?}");
+    let text = manifest(&client, &session, &handle, ManifestKind::Multivariant).await;
+    let uris = variant_uris(&text);
+    assert_eq!(uris.len(), rungs.len(), "{text}");
+    // The first is the highest rung within the link's share.
+    let first = rungs
+        .iter()
+        .position(|r| r.max_bitrate <= 3_750_000)
+        .unwrap();
+    assert_eq!(uris[0], format!("v{first}/media.m3u8"), "{text}");
+    assert_eq!(
+        text.matches("#EXT-X-STREAM-INF:").count(),
+        rungs.len(),
+        "{text}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// A read of another rung moves the encode there; what the first rung
+/// wrote stays readable, and reading it again starts nothing.
+#[tokio::test]
+async fn another_rung_s_segment_moves_the_encode_and_keeps_the_first_s() {
+    let (server, client, session) = ladder_ready("ladder-switch").await;
+    let (handle, plan) = start_for(&client, &session, on_link(5_000_000)).await;
+    let rungs = rungs_of(&plan);
+    let start = rungs
+        .iter()
+        .position(|r| r.max_bitrate <= 3_750_000)
+        .unwrap() as u32;
+    let other = start - 1;
+    assert_eq!(
+        rung_segment(&client, &session, &handle, 1, start).await,
+        b"seg1"
+    );
+    // The rung above, at segment 2: the encode moves there, as epoch 1.
+    assert_eq!(
+        rung_segment(&client, &session, &handle, 2, other).await,
+        b"seg2"
+    );
+    let args = std::fs::read_to_string(server.job_dir(&handle, 1).join("args")).unwrap();
+    let height = rungs[other as usize].height;
+    assert!(args.contains(&format!(":{height}")), "{args}");
+    // Back to the first rung's segment 1, which it wrote: no restart.
+    assert_eq!(
+        rung_segment(&client, &session, &handle, 1, start).await,
+        b"seg1"
+    );
+    assert_eq!(
+        rung_segment(&client, &session, &handle, 3, other).await,
+        b"seg3"
+    );
+    assert_eq!(
+        rung_segment(&client, &session, &handle, 1, start).await,
+        b"seg1"
+    );
+    assert!(!server.job_dir(&handle, 2).exists(), "an encode restarted");
+    client.close().await;
+    server.stop().await;
+}
+
+/// A rung that is not in the ladder is no segment.
+#[tokio::test]
+async fn a_rung_past_the_ladder_is_refused() {
+    let (server, client, session) = ladder_ready("ladder-past").await;
+    let (handle, plan) = start_for(&client, &session, on_link(5_000_000)).await;
+    let past = rungs_of(&plan).len() as u32;
+    let (response, _) = client
+        .media(MediaRead {
+            session: session.clone(),
+            handle: handle.clone(),
+            offset: 0,
+            length: MAX_READ,
+            epoch: 0,
+            segment: Some(1),
+            variant: past,
+        })
+        .await;
+    assert!(
+        matches!(response, MediaReadResponse::Err(_)),
+        "{response:?}"
+    );
     client.close().await;
     server.stop().await;
 }

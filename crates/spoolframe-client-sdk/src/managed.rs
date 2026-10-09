@@ -27,7 +27,9 @@
 //! whose new plan plays differently ([`SdkError::PlaybackChanged`]), or
 //! more than [`ManagedPlayback::MAX_RESUMES`] times in
 //! [`ManagedPlayback::RESUME_WINDOW`] ([`SdkError::PlaybackExpired`]).
-use crate::{Chunk, Playback, PlaybackChange, PlaybackOptions, SdkError, Session, Subtitle};
+use crate::{
+    Chunk, Playback, PlaybackChange, PlaybackOptions, PlaybackQuality, SdkError, Session, Subtitle,
+};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use spoolframe_protocol::{BitmapSubtitles, ManifestKind, PlaybackHandle, PlaybackPlan, Selection};
@@ -71,6 +73,21 @@ pub trait PlaybackBackend: Send + Sync + 'static {
     ) -> Result<PlaybackChange, SdkError>;
     async fn progress(&self, handle: &PlaybackHandle, position: Duration) -> Result<(), SdkError>;
     async fn stop(&self, handle: &PlaybackHandle) -> Result<(), SdkError>;
+    /// Plan the playback again for the quality the viewer chose
+    /// ([`Session::change_quality`]). A backend that cannot keeps the
+    /// default, which refuses.
+    async fn change_quality(
+        &self,
+        handle: &PlaybackHandle,
+        quality: PlaybackQuality,
+        bitmap: BitmapSubtitles,
+        position: Duration,
+    ) -> Result<PlaybackChange, SdkError> {
+        let _ = (handle, quality, bitmap, position);
+        Err(SdkError::InvalidInput(
+            "this playback backend cannot change a playback's quality".into(),
+        ))
+    }
     /// Plan the playback again for a link found slow
     /// ([`Session::limit_playback`]). A backend with no link keeps the
     /// default, which refuses.
@@ -92,20 +109,22 @@ pub trait PlaybackBackend: Send + Sync + 'static {
         &self,
         handle: &PlaybackHandle,
         kind: ManifestKind,
+        variant: u32,
     ) -> Result<String, SdkError> {
-        let _ = (handle, kind);
+        let _ = (handle, kind, variant);
         Err(no_hls())
     }
-    /// Part of HLS segment `n` ([`Session::read_segment`]).
+    /// Part of HLS segment `n` of rung `variant` ([`Session::read_segment`]).
     async fn read_segment(
         &self,
         handle: &PlaybackHandle,
         epoch: u32,
+        variant: u32,
         n: u32,
         offset: u64,
         length: u64,
     ) -> Result<Chunk, SdkError> {
-        let _ = (handle, epoch, n, offset, length);
+        let _ = (handle, epoch, variant, n, offset, length);
         Err(no_hls())
     }
     /// How fast the link to the server carries media (P6-06), for the
@@ -177,18 +196,33 @@ impl PlaybackBackend for Session {
     ) -> Result<PlaybackChange, SdkError> {
         self.limit_playback(h, l, b, p).await
     }
-    async fn manifest(&self, h: &PlaybackHandle, k: ManifestKind) -> Result<String, SdkError> {
-        Session::manifest(self, h, k).await
+    async fn change_quality(
+        &self,
+        h: &PlaybackHandle,
+        q: PlaybackQuality,
+        b: BitmapSubtitles,
+        p: Duration,
+    ) -> Result<PlaybackChange, SdkError> {
+        Session::change_quality(self, h, q, b, p).await
+    }
+    async fn manifest(
+        &self,
+        h: &PlaybackHandle,
+        k: ManifestKind,
+        v: u32,
+    ) -> Result<String, SdkError> {
+        Session::manifest(self, h, k, v).await
     }
     async fn read_segment(
         &self,
         h: &PlaybackHandle,
         e: u32,
+        v: u32,
         n: u32,
         o: u64,
         l: u64,
     ) -> Result<Chunk, SdkError> {
-        Session::read_segment(self, h, e, n, o, l).await
+        Session::read_segment(self, h, e, v, n, o, l).await
     }
     async fn subtitle_segment(&self, h: &PlaybackHandle, n: u32) -> Result<Subtitle, SdkError> {
         self.read_subtitle_segment(h, n).await
@@ -211,9 +245,9 @@ struct State {
     segments: Vec<Duration>,
     /// One more each time the handle is replaced.
     generation: u64,
-    /// The generation each HLS segment was last read from offset 0 in: the
-    /// rest of it must come from the same encode.
-    segment_reads: HashMap<u32, u64>,
+    /// The generation each HLS segment (by rung and number) was last read
+    /// from offset 0 in: the rest of it must come from the same encode.
+    segment_reads: HashMap<(u32, u32), u64>,
     /// Where a resume (not a seek) started the current handle: a reader of
     /// an older handle is told so.
     resumed_at: Option<Duration>,
@@ -572,13 +606,15 @@ impl ManagedPlayback {
             },
         }
     }
-    /// An HLS playlist. One the server ended is resumed: the playlist of
-    /// the same plan is the same, so the player's copy stays good.
-    pub async fn manifest(&self, kind: ManifestKind) -> Result<String, SdkError> {
+    /// An HLS playlist; a media playlist of rung `variant` (PX-21; 0 for
+    /// one encode, and for the other kinds). One the server ended is
+    /// resumed: the playlist of the same plan is the same, so the
+    /// player's copy stays good.
+    pub async fn manifest(&self, kind: ManifestKind, variant: u32) -> Result<String, SdkError> {
         let backend = &self.0.backend;
         let text = self
             .resuming(None, move |p| async move {
-                backend.manifest(&p.handle, kind).await
+                backend.manifest(&p.handle, kind, variant).await
             })
             .await?;
         if matches!(kind, ManifestKind::Media) {
@@ -592,18 +628,28 @@ impl ManagedPlayback {
     /// playback starts at segment `n`. The rest of a segment read part-way
     /// cannot come from another encode: that read is
     /// [`SdkError::PlaybackResumed`], and the segment is read again from 0.
-    pub async fn read_segment(&self, n: u32, offset: u64, length: u64) -> Result<Chunk, SdkError> {
+    /// `variant` is a ladder's rung (PX-21), as `v{n}/` in its playlist; 0
+    /// for one encode. The rungs share the grid and the segment numbers.
+    pub async fn read_segment(
+        &self,
+        variant: u32,
+        n: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<Chunk, SdkError> {
         let at = self.segment_start(n);
         let backend = &self.0.backend;
         if offset == 0 {
             let chunk = self
                 .resuming(at, move |p| async move {
-                    backend.read_segment(&p.handle, p.epoch, n, 0, length).await
+                    backend
+                        .read_segment(&p.handle, p.epoch, variant, n, 0, length)
+                        .await
                 })
                 .await?;
             let mut state = self.0.state.lock();
             let generation = state.generation;
-            state.segment_reads.insert(n, generation);
+            state.segment_reads.insert((variant, n), generation);
             return Ok(chunk);
         }
         let p = self.live()?;
@@ -611,14 +657,14 @@ impl ManagedPlayback {
             let state = self.0.state.lock();
             state
                 .segment_reads
-                .get(&n)
+                .get(&(variant, n))
                 .is_some_and(|g| *g != state.generation)
         };
         if begun {
             return Err(self.resumed_error(at));
         }
         match backend
-            .read_segment(&p.handle, p.epoch, n, offset, length)
+            .read_segment(&p.handle, p.epoch, variant, n, offset, length)
             .await
         {
             Err(SdkError::PlaybackExpired) => {
@@ -861,6 +907,11 @@ impl ManagedPlayback {
     }
     async fn limit_inner(&self, link_bitrate: u64) -> Result<Playback, SdkError> {
         let _control = self.0.control.lock().await;
+        // A bitrate or the original was the viewer's choice: the link
+        // does not overrule it.
+        if self.quality() != PlaybackQuality::Auto {
+            return self.live();
+        }
         self.flush_locked().await?;
         let p = self.live()?;
         let (position, bitmap) = {
@@ -899,6 +950,71 @@ impl ManagedPlayback {
             epoch = next.epoch,
             "the playback was planned again for its link"
         );
+        self.0.changed.send_replace(next.clone());
+        Ok(next)
+    }
+    /// The quality the viewer chose for this playback (P6-06).
+    pub fn quality(&self) -> PlaybackQuality {
+        self.0.state.lock().options.quality
+    }
+    /// Plan the playback again for `quality`, the viewer's choice now, at
+    /// `position` (P6-06). As [`Self::change_subtitle`]: the app makes a
+    /// new reader from the result. A choice that gives the same plan
+    /// changes nothing but what the next re-plan is for.
+    pub async fn change_quality(
+        &self,
+        quality: PlaybackQuality,
+        position: Duration,
+    ) -> Result<Playback, SdkError> {
+        let this = self.clone();
+        self.0
+            .runtime
+            .spawn(async move { this.change_quality_inner(quality, position).await })
+            .await
+            .map_err(|e| SdkError::Protocol(format!("playback control task ended: {e}")))?
+    }
+    async fn change_quality_inner(
+        &self,
+        quality: PlaybackQuality,
+        position: Duration,
+    ) -> Result<Playback, SdkError> {
+        let _control = self.0.control.lock().await;
+        let flushed = self.flush_locked().await;
+        let p = self.live()?;
+        let bitmap = self.0.state.lock().options.bitmap;
+        let answer = match flushed {
+            Ok(()) => {
+                self.0
+                    .backend
+                    .change_quality(&p.handle, quality, bitmap, position)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let changed = match answer {
+            Ok(changed) => changed,
+            Err(SdkError::PlaybackExpired) => {
+                // Started again where asked, for the quality asked.
+                self.0.state.lock().options.quality = quality;
+                self.restart_locked(&p.handle, Restart::Control { at: position })
+                    .await?;
+                self.0.state.lock().position = Some(position);
+                self.flush_locked().await?;
+                return Ok(self.snapshot());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut state = self.0.state.lock();
+        state.options.quality = quality;
+        state.position = Some(position);
+        if changed.plan == p.plan && changed.epoch == p.epoch {
+            return Ok(state.playback.clone());
+        }
+        state.playback.plan = changed.plan;
+        state.playback.size = changed.size;
+        state.playback.epoch = changed.epoch;
+        let next = state.playback.clone();
+        drop(state);
         self.0.changed.send_replace(next.clone());
         Ok(next)
     }
@@ -1258,6 +1374,7 @@ mod tests {
                         video: None,
                         audio: None,
                         subtitle: None,
+                        ladder: Vec::new(),
                         reasons: vec![],
                     };
                 }
@@ -1310,6 +1427,7 @@ mod tests {
                 &self,
                 h: &PlaybackHandle,
                 _: ManifestKind,
+                _: u32,
             ) -> Result<String, SdkError> {
                 self.alive(h)?;
                 Ok(PLAYLIST.into())
@@ -1318,6 +1436,7 @@ mod tests {
                 &self,
                 h: &PlaybackHandle,
                 e: u32,
+                _: u32,
                 n: u32,
                 _: u64,
                 _: u64,
@@ -1339,6 +1458,7 @@ mod tests {
             let options = PlaybackOptions {
                 start: Some(Duration::from_secs(5)),
                 bitmap: BitmapSubtitles::Text,
+                ..PlaybackOptions::default()
             };
             ManagedPlayback::open(server.clone(), item(), Some(selection), options)
                 .await
@@ -1464,15 +1584,15 @@ mod tests {
             let s = Arc::new(Server::default());
             *s.delivery.lock() = Some(Delivery::Hls);
             let p = opened(&s).await;
-            p.manifest(ManifestKind::Media).await.unwrap();
-            p.read_segment(1, 0, 1).await.unwrap();
+            p.manifest(ManifestKind::Media, 0).await.unwrap();
+            p.read_segment(0, 1, 0, 1).await.unwrap();
             s.expire();
-            assert_eq!(p.read_segment(4, 0, 1).await.unwrap().bytes, vec![4]);
+            assert_eq!(p.read_segment(0, 4, 0, 1).await.unwrap().bytes, vec![4]);
             assert_eq!(p.snapshot().handle.0, "2");
             // Segment 4 starts at 18 s.
             assert_eq!(s.last_start(), Some(Duration::from_secs(18)));
             s.expire();
-            assert_eq!(p.manifest(ManifestKind::Media).await.unwrap(), PLAYLIST);
+            assert_eq!(p.manifest(ManifestKind::Media, 0).await.unwrap(), PLAYLIST);
         }
 
         /// A new encode's segment need not be the same bytes as the old
@@ -1482,15 +1602,15 @@ mod tests {
             let s = Arc::new(Server::default());
             *s.delivery.lock() = Some(Delivery::Hls);
             let p = opened(&s).await;
-            p.manifest(ManifestKind::Media).await.unwrap();
+            p.manifest(ManifestKind::Media, 0).await.unwrap();
             s.expire();
             assert_eq!(
-                p.read_segment(2, 100, 1).await,
+                p.read_segment(0, 2, 100, 1).await,
                 Err(SdkError::PlaybackResumed {
                     at: Duration::from_secs(6)
                 })
             );
-            assert_eq!(p.read_segment(2, 0, 1).await.unwrap().bytes, vec![2]);
+            assert_eq!(p.read_segment(0, 2, 0, 1).await.unwrap().bytes, vec![2]);
         }
 
         /// A different plan on the new start is not swapped in.

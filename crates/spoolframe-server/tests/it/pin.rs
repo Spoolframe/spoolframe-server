@@ -122,7 +122,7 @@ async fn a_locked_session_gets_nothing_on_any_stream() {
             selection: Some(Selection::default()),
             start_ms: None,
             bitmap: Default::default(),
-            link_bitrate: None,
+            quality: Default::default(),
         },
     )
     .await
@@ -164,7 +164,7 @@ async fn a_locked_session_gets_nothing_on_any_stream() {
                 selection: Some(Selection::default()),
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             }
         )
         .await,

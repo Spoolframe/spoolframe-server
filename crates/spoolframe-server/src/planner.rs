@@ -38,7 +38,7 @@ use spoolframe_media::{
 };
 use spoolframe_protocol::{
     AudioAction, BitmapSubtitles, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, PlannedAudio,
-    PlannedSubtitle, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
+    PlannedSubtitle, PlaybackPlan, Quality, Selection, SubtitleAction, SubtitleDelivery,
 };
 use spoolframe_types::{
     AudioCodec, BitmapPreference, ClientCapabilities, Container, Delivery, SubtitleFormat,
@@ -153,14 +153,21 @@ pub fn plan(
 
 pub use spoolframe_protocol::playback::LINK_SHARE;
 
-/// `caps` for a device whose link carries `link_bitrate` bits per second
-/// (P6-06): its `max_bitrate` lowered to [`LINK_SHARE`] of the link, if
-/// that is lower. A device that measured nothing keeps its own cap.
-pub fn with_link(caps: &ClientCapabilities, link_bitrate: Option<u64>) -> ClientCapabilities {
+/// `caps` for a playback of `quality` (P6-06): its `max_bitrate`, the
+/// app's own limit, lowered to [`LINK_SHARE`] of the link for `Auto`, or
+/// to the bitrate chosen, whichever is lower. `Original`, and `Auto`
+/// with nothing measured, keep the app's limit alone.
+pub fn with_quality(caps: &ClientCapabilities, quality: Quality) -> ClientCapabilities {
+    let chosen = match quality {
+        Quality::Auto {
+            link_bitrate: Some(link),
+        } => Some((link as f64 * LINK_SHARE) as u64),
+        Quality::Bitrate { max_bitrate } => Some(max_bitrate),
+        Quality::Auto { link_bitrate: None } | Quality::Original | Quality::Unknown => None,
+    };
     let mut caps = caps.clone();
-    if let Some(link) = link_bitrate {
-        let share = (link as f64 * LINK_SHARE) as u64;
-        caps.max_bitrate = Some(caps.max_bitrate.map_or(share, |own| own.min(share)));
+    if let Some(chosen) = chosen {
+        caps.max_bitrate = Some(caps.max_bitrate.map_or(chosen, |own| own.min(chosen)));
     }
     caps
 }
@@ -580,8 +587,126 @@ fn converted(
         video,
         audio,
         subtitle,
+        ladder: Vec::new(),
         reasons,
     })
+}
+
+/// Plan `descriptor` for a playback of `quality` (P6-06): [`plan`],
+/// with the capabilities capped as [`with_quality`] says. Under `Auto`,
+/// a plan that encodes the video over HLS becomes a ladder (PX-21): the
+/// encodes run from the app's own cap (not the link's) down to
+/// [`RUNG_FLOOR`], and the player moves between them as its link
+/// changes. A plan that copies the video, or plays the file, stays as
+/// it is: it fit the link.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_for(
+    descriptor: &MediaDescriptor,
+    capabilities: Option<&ClientCapabilities>,
+    quality: Quality,
+    selection: Selection,
+    bitmap: Bitmap,
+    encoders: &Encoders,
+    ocr: &Ocr,
+) -> PlaybackPlan {
+    let capped = capabilities.map(|caps| with_quality(caps, quality));
+    let plan = plan(
+        descriptor,
+        capped.as_ref(),
+        selection,
+        bitmap,
+        encoders,
+        ocr,
+    );
+    let (Quality::Auto { .. }, Some(caps), Some(source)) =
+        (quality, capabilities, descriptor.video.as_ref())
+    else {
+        return plan;
+    };
+    let PlaybackPlan::Converted {
+        delivery: Delivery::Hls,
+        container,
+        video: Some(ConvertedVideo::Encode {
+            codec, tone_map, ..
+        }),
+        audio,
+        subtitle,
+        reasons,
+        ..
+    } = plan
+    else {
+        return plan;
+    };
+    let tallest = caps
+        .max_video
+        .as_ref()
+        .and_then(|limits| limits.height)
+        .map_or(source.height, |max| source.height.min(max));
+    let audio_bits = match audio.map(|a| a.action) {
+        Some(AudioAction::Encode { bitrate, .. }) => bitrate,
+        Some(_) => 640_000,
+        None => 0,
+    };
+    // The top rung: the source's own rate, or what its height is worth,
+    // under the app's own cap.
+    let source_bits = descriptor
+        .bit_rate
+        .map(|bits| bits.saturating_sub(audio_bits))
+        .unwrap_or_else(|| worth(tallest, codec));
+    let top = caps.max_bitrate.map_or(source_bits, |max| {
+        source_bits.min(max.saturating_sub(audio_bits))
+    });
+    let rungs = ladder(top, tallest, codec);
+    let first = rungs[0];
+    PlaybackPlan::Converted {
+        delivery: Delivery::Hls,
+        container,
+        video: Some(ConvertedVideo::Encode {
+            codec,
+            height: first.height,
+            max_bitrate: Some(first.max_bitrate),
+            tone_map,
+        }),
+        audio,
+        subtitle,
+        // One rung is one encode, as any other plan.
+        ladder: if rungs.len() > 1 { rungs } else { Vec::new() },
+        reasons,
+    }
+}
+
+/// The rung of `plan`'s ladder a player starts on (PX-21): the highest
+/// whose cap is within [`LINK_SHARE`] of what `Auto` measured, else the
+/// lowest, as with nothing measured. 0 for a plan with no ladder.
+pub fn start_rung(plan: &PlaybackPlan, quality: Quality) -> u32 {
+    let PlaybackPlan::Converted { ladder, .. } = plan else {
+        return 0;
+    };
+    let Some(lowest) = ladder.len().checked_sub(1) else {
+        return 0;
+    };
+    let fits = match quality {
+        Quality::Auto {
+            link_bitrate: Some(link),
+        } => {
+            let share = (link as f64 * LINK_SHARE) as u64;
+            ladder.iter().position(|r| r.max_bitrate <= share)
+        }
+        _ => None,
+    };
+    fits.unwrap_or(lowest) as u32
+}
+
+/// What a picture `height` tall is worth in `codec`, bits per second,
+/// when the source does not say its rate: twice the least its step
+/// takes ([`height_for`]), a generous encode of it.
+fn worth(height: u32, codec: VideoCodec) -> u64 {
+    let least = HEIGHT_STEPS
+        .iter()
+        .rev()
+        .find(|(_, step)| *step >= height)
+        .map_or(HEIGHT_STEPS[0].0, |(least, _)| *least);
+    2 * scaled(least, codec)
 }
 
 /// The first codec, in the server's order of preference (hardware first),
@@ -619,12 +744,86 @@ fn encode_video(
     let max_bitrate = caps
         .max_bitrate
         .map(|max| max.saturating_sub(audio_bits).max(500_000));
+    // A low cap is spent on fewer pixels, not on a blurred large picture.
+    let height = max_bitrate.map_or(height, |bits| height.min(height_for(bits, codec)));
     Ok(ConvertedVideo::Encode {
         codec,
         height,
         max_bitrate,
         tone_map,
     })
+}
+
+/// The most rungs an HLS ladder has (PX-21).
+pub const MAX_RUNGS: usize = 4;
+/// No rung is planned under this: below it a picture is not worth
+/// watching, and the bottom rung of a slow link's ladder is about here.
+pub const RUNG_FLOOR: u64 = 1_000_000;
+
+pub use spoolframe_protocol::playback::Rung;
+
+/// The ladder of encodes from `top` bits per second of `codec` video,
+/// for a picture no taller than `tallest` (the source's and the
+/// device's), highest first. Its rungs are spread evenly in ratio from
+/// `top` down to [`RUNG_FLOOR`], at most [`MAX_RUNGS`] and at least
+/// about half apart, so a fast link and a slow one each find one near
+/// them. Each rung's height is what its bitrate carries
+/// ([`height_for`]), so a rung and a single encode at the same bitrate
+/// look the same. Two rungs may share a height: the bitrate step is
+/// what lets AVPlayer fit the link, the picture size only follows it.
+pub fn ladder(top: u64, tallest: u32, codec: VideoCodec) -> Vec<Rung> {
+    let top = top.max(RUNG_FLOOR);
+    let span = top as f64 / RUNG_FLOOR as f64;
+    // Steps of at least 2x between rungs, and no more rungs than allowed.
+    let steps = (span.log2().floor() as usize).min(MAX_RUNGS - 1);
+    let ratio = if steps == 0 {
+        1.0
+    } else {
+        span.powf(1.0 / steps as f64)
+    };
+    let mut rungs: Vec<Rung> = Vec::new();
+    for step in 0..=steps {
+        let bits = if step == steps {
+            if steps == 0 { top } else { RUNG_FLOOR }
+        } else {
+            (top as f64 / ratio.powi(step as i32)) as u64
+        };
+        rungs.push(Rung {
+            height: tallest.min(height_for(bits, codec)),
+            max_bitrate: bits,
+        });
+    }
+    rungs
+}
+
+/// The tallest picture `bits` per second of `codec` video carries well
+/// (P6-06): at a low bitrate a smaller picture is sharper than a large
+/// one gone to blocks. Rough H.264 figures for film; HEVC and AV1 do as
+/// well with about two thirds of the bits.
+pub(crate) fn height_for(bits: u64, codec: VideoCodec) -> u32 {
+    HEIGHT_STEPS
+        .iter()
+        .find(|(least, _)| bits >= scaled(*least, codec))
+        .map_or(480, |(_, height)| *height)
+}
+
+/// The least H.264 bitrate for each height, tallest first: rough
+/// figures for film.
+const HEIGHT_STEPS: [(u64, u32); 4] = [
+    (14_000_000, 2160),
+    (4_500_000, 1080),
+    (2_200_000, 720),
+    (1_100_000, 540),
+];
+
+/// An H.264 bitrate as `codec` needs it: HEVC and AV1 do as well with
+/// about two thirds of the bits.
+fn scaled(h264: u64, codec: VideoCodec) -> u64 {
+    if matches!(codec, VideoCodec::Hevc | VideoCodec::Av1) {
+        h264 * 2 / 3
+    } else {
+        h264
+    }
 }
 
 /// Surround to the first surround codec the client plays and the server
@@ -1119,6 +1318,7 @@ mod tests {
                 audio,
                 subtitle,
                 reasons,
+                ..
             } => (
                 delivery,
                 container,
@@ -1270,21 +1470,231 @@ mod tests {
         );
     }
 
+    fn on_link(link: u64) -> Quality {
+        auto(link)
+    }
+
+    fn auto(link: u64) -> Quality {
+        Quality::Auto {
+            link_bitrate: Some(link),
+        }
+    }
+
+    fn rung(height: u32, max_bitrate: u64) -> Rung {
+        Rung {
+            height,
+            max_bitrate,
+        }
+    }
+
+    fn plan_for_quality(caps: &ClientCapabilities, quality: Quality) -> PlaybackPlan {
+        super::plan_for(
+            &hevc_dts(),
+            Some(caps),
+            quality,
+            picked(1, None),
+            Bitmap::Preferred(BitmapPreference::Text),
+            &dev_encoders(),
+            &Ocr::disabled(),
+        )
+    }
+
+    fn ladder_of(plan: &PlaybackPlan) -> &[Rung] {
+        match plan {
+            PlaybackPlan::Converted { ladder, .. } => ladder,
+            _ => &[],
+        }
+    }
+
+    /// A 4K HDR film that a slow link makes an encode: a ladder from its
+    /// own rate, not the link's, with a single encode's codec and tone map.
+    #[test]
+    fn auto_over_hls_that_encodes_is_a_ladder_from_the_source_s_rate() {
+        let plan = plan_for_quality(&avplayer(), on_link(5_000_000));
+        let rungs = ladder_of(&plan);
+        assert_eq!(rungs.len(), MAX_RUNGS, "{plan:?}");
+        assert_eq!(rungs[0].height, 2160);
+        assert!(rungs[0].max_bitrate > 30_000_000, "{rungs:?}");
+        let (_, _, video, _, _, _) = converted(plan.clone());
+        let ConvertedVideo::Encode { codec, .. } = video else {
+            panic!("not encoded: {video:?}");
+        };
+        for r in rungs {
+            assert_eq!(r.height, height_for(r.max_bitrate, codec).min(2160));
+        }
+        // The codec and tone map are a single encode's of this plan.
+        let single = plan_with(
+            &hevc_dts(),
+            Some(&with_quality(&avplayer(), on_link(5_000_000))),
+            picked(1, None),
+            &dev_encoders(),
+        );
+        let (_, _, one, _, _, _) = converted(single);
+        let (
+            ConvertedVideo::Encode {
+                codec: a,
+                tone_map: x,
+                height,
+                max_bitrate,
+            },
+            ConvertedVideo::Encode {
+                codec: b,
+                tone_map: y,
+                ..
+            },
+        ) = (video, one)
+        else {
+            panic!("not both encoded");
+        };
+        assert_eq!((a, x), (b, y));
+        assert_eq!((height, max_bitrate), (2160, Some(rungs[0].max_bitrate)));
+    }
+
+    #[test]
+    fn the_app_s_cap_and_height_bound_the_ladder() {
+        let mut caps = avplayer();
+        caps.max_bitrate = Some(6_000_000);
+        caps.max_video = Some(VideoLimits {
+            height: Some(1080),
+            ..VideoLimits::default()
+        });
+        let plan = plan_for_quality(&caps, on_link(2_000_000));
+        let rungs = ladder_of(&plan);
+        assert!(!rungs.is_empty(), "{plan:?}");
+        assert!(
+            rungs
+                .iter()
+                .all(|r| r.max_bitrate <= 6_000_000 && r.height <= 1080),
+            "{rungs:?}"
+        );
+    }
+
+    /// Auto on a fast link copies the video, as it fits: no ladder.
+    #[test]
+    fn auto_that_copies_the_video_has_no_ladder() {
+        let plan = plan_for_quality(&avplayer(), on_link(1_000_000_000));
+        let (_, _, video, _, _, _) = converted(plan.clone());
+        assert!(matches!(video, ConvertedVideo::Copy { .. }), "{video:?}");
+        assert!(ladder_of(&plan).is_empty());
+    }
+
+    /// A chosen bitrate is one encode, as P6-06 plans it.
+    #[test]
+    fn a_chosen_bitrate_over_hls_is_one_encode() {
+        let quality = Quality::Bitrate {
+            max_bitrate: 5_000_000,
+        };
+        let plan = plan_for_quality(&avplayer(), quality);
+        assert!(ladder_of(&plan).is_empty(), "{plan:?}");
+        assert_eq!(
+            plan,
+            plan_with(
+                &hevc_dts(),
+                Some(&with_quality(&avplayer(), quality)),
+                picked(1, None),
+                &dev_encoders()
+            )
+        );
+    }
+
+    #[test]
+    fn a_ladder_spans_a_fast_link_to_a_slow_one_in_four_rungs() {
+        // 40 Mbit/s down to 1: about 3.4x a step.
+        let rungs = ladder(40_000_000, 2160, VideoCodec::Hevc);
+        let bits: Vec<u64> = rungs.iter().map(|r| r.max_bitrate).collect();
+        let heights: Vec<u32> = rungs.iter().map(|r| r.height).collect();
+        assert_eq!(bits, [40_000_000, 11_696_070, 3_419_951, RUNG_FLOOR]);
+        assert_eq!(heights, [2160, 2160, 1080, 540]);
+        // Each rung's height is a single encode's at its bitrate.
+    }
+
+    #[test]
+    fn a_720p_source_s_rungs_step_down_in_bitrate_under_720p() {
+        let rungs = ladder(8_000_000, 720, VideoCodec::H264);
+        assert_eq!(
+            rungs,
+            [
+                rung(720, 8_000_000),
+                rung(720, 4_000_000),
+                rung(540, 2_000_000),
+                rung(480, RUNG_FLOOR)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rung_s_height_is_a_single_encode_s_at_its_bitrate() {
+        for r in ladder(16_000_000, 2160, VideoCodec::H264) {
+            assert_eq!(
+                r.height,
+                height_for(r.max_bitrate, VideoCodec::H264).min(2160)
+            );
+        }
+    }
+
+    #[test]
+    fn no_rung_is_taller_than_the_source() {
+        assert!(
+            ladder(30_000_000, 720, VideoCodec::H264)
+                .iter()
+                .all(|r| r.height <= 720)
+        );
+    }
+
+    #[test]
+    fn a_low_top_is_one_rung_at_the_floor() {
+        assert_eq!(
+            ladder(600_000, 1080, VideoCodec::H264),
+            [rung(480, RUNG_FLOOR)]
+        );
+    }
+
+    #[test]
+    fn a_low_cap_lowers_the_picture_too() {
+        assert_eq!(height_for(30_000_000, VideoCodec::H264), 2160);
+        assert_eq!(height_for(6_000_000, VideoCodec::H264), 1080);
+        assert_eq!(height_for(3_000_000, VideoCodec::H264), 720);
+        assert_eq!(height_for(1_500_000, VideoCodec::H264), 540);
+        assert_eq!(height_for(500_000, VideoCodec::H264), 480);
+    }
+
+    #[test]
+    fn hevc_keeps_a_taller_picture_at_the_same_cap() {
+        assert_eq!(height_for(3_000_000, VideoCodec::H264), 720);
+        assert_eq!(height_for(3_000_000, VideoCodec::Hevc), 1080);
+    }
+
+    #[test]
+    fn a_4k_file_capped_low_is_encoded_smaller() {
+        let mut caps = avplayer();
+        caps.max_bitrate = Some(3_000_000);
+        let (_, _, video, _, _, _) = converted(plan_with(
+            &hevc_dts(),
+            Some(&caps),
+            picked(1, None),
+            &dev_encoders(),
+        ));
+        let ConvertedVideo::Encode { height, .. } = video else {
+            panic!("not encoded: {video:?}");
+        };
+        assert!(height < 2160, "{height}");
+    }
+
     #[test]
     fn a_link_lowers_the_cap_to_its_share() {
         let caps = avplayer();
         assert_eq!(
-            with_link(&caps, Some(20_000_000)).max_bitrate,
+            with_quality(&caps, auto(20_000_000)).max_bitrate,
             Some(15_000_000)
         );
     }
 
     #[test]
-    fn a_fast_link_leaves_the_device_s_own_cap() {
+    fn a_fast_link_leaves_the_app_s_own_cap() {
         let mut caps = avplayer();
         caps.max_bitrate = Some(8_000_000);
         assert_eq!(
-            with_link(&caps, Some(100_000_000)).max_bitrate,
+            with_quality(&caps, auto(100_000_000)).max_bitrate,
             Some(8_000_000)
         );
     }
@@ -1292,7 +1702,33 @@ mod tests {
     #[test]
     fn no_measurement_leaves_the_caps_as_they_are() {
         let caps = avplayer();
-        assert_eq!(with_link(&caps, None), caps);
+        assert_eq!(with_quality(&caps, Quality::default()), caps);
+    }
+
+    #[test]
+    fn a_chosen_bitrate_caps_the_playback_whatever_the_link() {
+        let caps = avplayer();
+        let quality = Quality::Bitrate {
+            max_bitrate: 4_000_000,
+        };
+        assert_eq!(with_quality(&caps, quality).max_bitrate, Some(4_000_000));
+    }
+
+    #[test]
+    fn the_app_s_own_cap_stays_over_a_chosen_bitrate() {
+        let mut caps = avplayer();
+        caps.max_bitrate = Some(8_000_000);
+        let quality = Quality::Bitrate {
+            max_bitrate: 20_000_000,
+        };
+        assert_eq!(with_quality(&caps, quality).max_bitrate, Some(8_000_000));
+    }
+
+    #[test]
+    fn original_quality_leaves_the_caps_as_they_are() {
+        let mut caps = avplayer();
+        caps.max_bitrate = Some(8_000_000);
+        assert_eq!(with_quality(&caps, Quality::Original), caps);
     }
 
     #[test]
@@ -1916,6 +2352,7 @@ mod tests {
                     to: SubtitleFormat::WebVtt,
                 },
             }),
+            ladder: Vec::new(),
             reasons: Vec::new(),
         };
         assert_eq!(
@@ -1950,6 +2387,7 @@ mod tests {
                     format: SubtitleFormat::Pgs,
                 },
             }),
+            ladder: Vec::new(),
             reasons: Vec::new(),
         };
         let burned = summary(&burned);

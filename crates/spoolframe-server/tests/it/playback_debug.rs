@@ -92,7 +92,7 @@ async fn converting(
                 selection: None,
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await;

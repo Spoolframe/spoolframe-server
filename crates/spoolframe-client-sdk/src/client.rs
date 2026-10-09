@@ -1173,7 +1173,7 @@ impl Client {
         let limit = self.inner.timeouts.of(&request);
         let handle = match &request {
             Request::ChangeSubtitle { handle, .. }
-            | Request::LimitPlayback { handle, .. }
+            | Request::ChangeQuality { handle, .. }
             | Request::SeekPlayback { handle, .. }
             | Request::StopPlayback { handle } => Some(handle.clone()),
             _ => None,

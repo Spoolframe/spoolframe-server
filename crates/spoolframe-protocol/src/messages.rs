@@ -20,14 +20,14 @@ use crate::passkeys::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyInfo, PasskeyRegistrationBegun,
     PasskeySignInBegun,
 };
-use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Selection};
+use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Quality, Selection};
 use crate::plex::PlexLink;
 use crate::previews::Previews;
 use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -190,12 +190,9 @@ pub enum Request {
         start_ms: Option<u64>,
         /// How a picked bitmap subtitle is shown (P2-07).
         bitmap: BitmapSubtitles,
-        /// What the device measured its link to the server carrying lately,
-        /// bits per second (P6-06); `None`: it has not measured it. The
-        /// playback is planned for a share of it as well as for the
-        /// capabilities' `max_bitrate`.
-        #[serde(deserialize_with = "spoolframe_types::required::option")]
-        link_bitrate: Option<u64>,
+        /// The quality the viewer chose for it (P6-06): for the link, at
+        /// most a bitrate, or the original.
+        quality: Quality,
     },
     /// End a playback now, and any encode for it.
     StopPlayback {
@@ -374,16 +371,16 @@ pub enum Request {
         bitmap: BitmapSubtitles,
         position_ms: u64,
     },
-    /// The device's link to the server carries only `link_bitrate` bits
-    /// per second now (P6-06): a direct play that stalls on it. The
-    /// playback is planned again for a share of it, with the same tracks
-    /// and `bitmap` as `ChangeSubtitle` takes it. A plan that changes
-    /// restarts at `position_ms` as a new epoch, from offset 0, as
-    /// `ChangeSubtitle` does; one that does not is answered as it is,
-    /// nothing restarted. `PlaybackChanged`.
-    LimitPlayback {
+    /// Plan a playing playback again for `quality` (P6-06): the viewer
+    /// chose another, or, with `Auto`, the device found its link too slow
+    /// for a direct play that stalls. The same tracks, and `bitmap` as
+    /// `ChangeSubtitle` takes it. A plan that changes restarts at
+    /// `position_ms` as a new epoch, from offset 0, as `ChangeSubtitle`
+    /// does; one that does not is answered as it is, nothing restarted.
+    /// `PlaybackChanged`.
+    ChangeQuality {
         handle: PlaybackHandle,
-        link_bitrate: u64,
+        quality: Quality,
         bitmap: BitmapSubtitles,
         position_ms: u64,
     },
@@ -391,6 +388,10 @@ pub enum Request {
     GetManifest {
         handle: PlaybackHandle,
         kind: ManifestKind,
+        /// For a media playlist, the variant's (PX-21): a ladder's rung,
+        /// as `v{n}/media.m3u8` in the multivariant playlist. 0 for one
+        /// encode, and for the other kinds.
+        variant: u32,
     },
     /// The selected external subtitle of a playback, one chunk of it
     /// (P2-11). One the server reads as text (P2-07) answers
@@ -782,7 +783,7 @@ pub enum Reply {
     PlexLink {
         link: Option<PlexLink>,
     },
-    /// The playback's new plan after `ChangeSubtitle` or `LimitPlayback`:
+    /// The playback's new plan after `ChangeSubtitle` or `ChangeQuality`:
     /// read `epoch` (0 for direct play), whose size is `size` (0 while a
     /// conversion writes it).
     PlaybackChanged {

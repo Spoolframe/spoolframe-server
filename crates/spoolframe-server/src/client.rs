@@ -337,11 +337,11 @@ impl ClientProtocol {
                             revision: 0,
                         })
                     }
-                    // A limit the plan already fits changes nothing, and
+                    // A quality that gives the same plan restarts nothing, and
                     // its revision stays: told as it is.
                     (
                         Response::Ok(Reply::PlaybackChanged { .. }),
-                        Request::LimitPlayback { handle, .. },
+                        Request::ChangeQuality { handle, .. },
                     ) => this
                         .services
                         .playbacks
@@ -1324,7 +1324,7 @@ impl ClientProtocol {
         let _control = match &request {
             Request::UpdatePlaybackProgress { handle, .. }
             | Request::ChangeSubtitle { handle, .. }
-            | Request::LimitPlayback { handle, .. }
+            | Request::ChangeQuality { handle, .. }
             | Request::SeekPlayback { handle, .. }
             | Request::StopPlayback { handle } => Some(
                 self.services
@@ -1336,7 +1336,7 @@ impl ClientProtocol {
             _ => None,
         };
         if let Request::ChangeSubtitle { handle, .. }
-        | Request::LimitPlayback { handle, .. }
+        | Request::ChangeQuality { handle, .. }
         | Request::SeekPlayback { handle, .. }
         | Request::StopPlayback { handle } = &request
         {
@@ -1975,22 +1975,18 @@ impl ClientProtocol {
                 selection,
                 start_ms,
                 bitmap,
-                link_bitrate,
+                quality,
             } => {
-                let caps = state
-                    .hello
-                    .get()
-                    .and_then(|h| h.capabilities.as_ref())
-                    .map(|caps| planner::with_link(caps, link_bitrate));
-                let caps = caps.as_ref();
+                let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
                 let (path, descriptor) = self.describe(&id).await?;
                 let (selection, chosen) = self
                     .selection(principal, &id, &descriptor, selection)
                     .await?;
                 let bitmap = self.bitmap(principal, bitmap).await?;
-                let plan = planner::plan(
+                let plan = planner::plan_for(
                     &descriptor,
                     caps,
+                    quality,
                     selection,
                     bitmap,
                     &self.services.transcoding.encoders(),
@@ -2036,7 +2032,15 @@ impl ClientProtocol {
                 }
                 let start = start_ms.map(Duration::from_millis);
                 let prepared = match self
-                    .prepare(&handle, &id, (&path, &descriptor), &plan, start, None)
+                    .prepare(
+                        &handle,
+                        &id,
+                        (&path, &descriptor),
+                        &plan,
+                        quality,
+                        start,
+                        None,
+                    )
                     .await
                 {
                     // No slot free, and the device holds one it does not
@@ -2051,8 +2055,16 @@ impl ClientProtocol {
                             .end_conversions_on(&endpoint, state.number)
                             > 0 =>
                     {
-                        self.prepare(&handle, &id, (&path, &descriptor), &plan, start, None)
-                            .await
+                        self.prepare(
+                            &handle,
+                            &id,
+                            (&path, &descriptor),
+                            &plan,
+                            quality,
+                            start,
+                            None,
+                        )
+                        .await
                     }
                     prepared => prepared,
                 };
@@ -2080,7 +2092,7 @@ impl ClientProtocol {
                         file,
                         subtitle,
                         conversion,
-                        link_bitrate,
+                        quality,
                         connection: state.number,
                     },
                 );
@@ -2098,7 +2110,7 @@ impl ClientProtocol {
                     audio = %decided.audio,
                     subtitle = %decided.subtitle,
                     start_ms = start_ms.unwrap_or(0),
-                    link_bitrate,
+                    ?quality,
                     "playback started"
                 );
                 Ok(Reply::PlaybackStarted {
@@ -2117,21 +2129,18 @@ impl ClientProtocol {
                 position_ms,
             } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
-                let caps = state
-                    .hello
-                    .get()
-                    .and_then(|h| h.capabilities.as_ref())
-                    .map(|caps| planner::with_link(caps, playback.link_bitrate));
-                let caps = caps.as_ref();
+                let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
+                let quality = playback.quality;
                 let (path, descriptor) = self.describe(&playback.item).await?;
                 let selection = Selection {
                     audio: playback.selection.audio,
                     subtitle,
                 };
                 let bitmap = self.bitmap(principal, bitmap).await?;
-                let plan = planner::plan(
+                let plan = planner::plan_for(
                     &descriptor,
                     caps,
+                    quality,
                     selection,
                     bitmap,
                     &self.services.transcoding.encoders(),
@@ -2143,6 +2152,7 @@ impl ClientProtocol {
                         &playback.item,
                         (&path, &descriptor),
                         &plan,
+                        quality,
                         Some(Duration::from_millis(position_ms)),
                         Some(&playback),
                     )
@@ -2157,32 +2167,28 @@ impl ClientProtocol {
                         file,
                         subtitle,
                         conversion,
-                        link_bitrate: playback.link_bitrate,
+                        quality: playback.quality,
                     },
                 );
                 drop(replaced);
                 tracing::info!(id = %playback.item, epoch, "playback's subtitle changed");
                 Ok(Reply::PlaybackChanged { plan, size, epoch })
             }
-            Request::LimitPlayback {
+            Request::ChangeQuality {
                 handle,
-                link_bitrate,
+                quality,
                 bitmap,
                 position_ms,
             } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
-                let caps = state
-                    .hello
-                    .get()
-                    .and_then(|h| h.capabilities.as_ref())
-                    .map(|caps| planner::with_link(caps, Some(link_bitrate)));
-                let caps = caps.as_ref();
+                let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
                 let (path, descriptor) = self.describe(&playback.item).await?;
                 let selection = playback.selection;
                 let bitmap = self.bitmap(principal, bitmap).await?;
-                let plan = planner::plan(
+                let plan = planner::plan_for(
                     &descriptor,
                     caps,
+                    quality,
                     selection,
                     bitmap,
                     &self.services.transcoding.encoders(),
@@ -2190,7 +2196,9 @@ impl ClientProtocol {
                 );
                 let epoch_now = playback.conversion.as_ref().map_or(0, |c| c.job().epoch);
                 if plan == playback.planned {
-                    // Already fits the link: nothing to restart.
+                    // The same plan: nothing to restart. The quality is
+                    // kept for the next re-plan all the same.
+                    self.services.playbacks.set_quality(&handle, quality);
                     return Ok(Reply::PlaybackChanged {
                         plan,
                         size: playback.size,
@@ -2205,6 +2213,7 @@ impl ClientProtocol {
                         &playback.item,
                         (&path, &descriptor),
                         &plan,
+                        quality,
                         Some(Duration::from_millis(position_ms)),
                         Some(&playback),
                     )
@@ -2219,7 +2228,7 @@ impl ClientProtocol {
                         file,
                         subtitle,
                         conversion,
-                        link_bitrate: Some(link_bitrate),
+                        quality,
                     },
                 );
                 drop(replaced);
@@ -2227,10 +2236,10 @@ impl ClientProtocol {
                 tracing::info!(
                     id = %playback.item,
                     epoch,
-                    link_bitrate,
+                    ?quality,
                     plan = %decided.kind,
                     video = %decided.video,
-                    "playback planned again for its link"
+                    "playback planned again for its quality"
                 );
                 Ok(Reply::PlaybackChanged { plan, size, epoch })
             }
@@ -2261,11 +2270,15 @@ impl ClientProtocol {
                 self.services.playbacks.revised(&handle);
                 Ok(Reply::PlaybackSeeked { epoch })
             }
-            Request::GetManifest { handle, kind } => {
+            Request::GetManifest {
+                handle,
+                kind,
+                variant,
+            } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
                 playback
                     .conversion
-                    .and_then(|c| c.manifest(kind))
+                    .and_then(|c| c.manifest(kind, variant))
                     .map(|text| Reply::Manifest { text })
                     .ok_or_else(|| Error::NotFound {
                         what: "an HLS conversion in this playback".into(),
@@ -2732,12 +2745,17 @@ impl ClientProtocol {
     /// started at `start`. `replaces` is the playback as it was, when this
     /// is a subtitle change: direct play goes on reading the file it began
     /// with, or none.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the call sites name each part; a struct would only repeat them"
+    )]
     async fn prepare(
         &self,
         handle: &PlaybackHandle,
         id: &MediaId,
         (path, descriptor): (&Path, &Arc<MediaDescriptor>),
         plan: &PlaybackPlan,
+        quality: spoolframe_protocol::Quality,
         start: Option<Duration>,
         replaces: Option<&Playback>,
     ) -> Result<
@@ -2863,6 +2881,7 @@ impl ClientProtocol {
                         keyframes,
                         first_epoch,
                         slot: replaced.and_then(|job| job.slot()),
+                        start_rung: planner::start_rung(plan, quality),
                     },
                     start,
                 )
@@ -3578,9 +3597,13 @@ async fn segment_range(
         });
     }
     let job = if n == 0 {
-        conversion.job()
+        conversion
+            .job_for_init(read.variant)
+            .map_err(conversion_error)?
     } else {
-        conversion.job_for_segment(n).map_err(conversion_error)?
+        conversion
+            .job_for_segment(n, read.variant)
+            .map_err(conversion_error)?
     };
     // A segment is final once ffmpeg has finished it or the encode has
     // ended; the init segment once the first media segment is finished.

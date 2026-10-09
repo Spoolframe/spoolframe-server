@@ -34,7 +34,7 @@ pub use link_meter::LinkMeter;
 pub use servers::ServerEntry;
 pub use session::{
     ActiveProfile, Chunk, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange, PlaybackOptions,
-    ProfileSignIn, SavedProfile, Session, SignInMethod, Subtitle,
+    PlaybackQuality, ProfileSignIn, SavedProfile, Session, SignInMethod, Subtitle,
 };
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{

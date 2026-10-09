@@ -110,6 +110,7 @@ fn rpc_controls(handle: &PlaybackHandle) -> Vec<(&'static str, Request)> {
             Request::GetManifest {
                 handle: handle.clone(),
                 kind: ManifestKind::Multivariant,
+                variant: 0,
             },
         ),
         (
@@ -117,6 +118,7 @@ fn rpc_controls(handle: &PlaybackHandle) -> Vec<(&'static str, Request)> {
             Request::GetManifest {
                 handle: handle.clone(),
                 kind: ManifestKind::Media,
+                variant: 0,
             },
         ),
         (
@@ -124,6 +126,7 @@ fn rpc_controls(handle: &PlaybackHandle) -> Vec<(&'static str, Request)> {
             Request::GetManifest {
                 handle: handle.clone(),
                 kind: ManifestKind::Subtitles,
+                variant: 0,
             },
         ),
         (
@@ -225,7 +228,7 @@ async fn no_one_else_controls_or_reads_a_direct_playback() {
                 }),
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await
@@ -318,7 +321,7 @@ async fn no_one_else_controls_or_reads_a_converted_playback() {
                 }),
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await
@@ -336,6 +339,7 @@ async fn no_one_else_controls_or_reads_a_converted_playback() {
     let manifest = Request::GetManifest {
         handle: handle.clone(),
         kind: ManifestKind::Media,
+        variant: 0,
     };
     assert!(
         matches!(

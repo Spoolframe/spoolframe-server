@@ -10,7 +10,7 @@ use spoolframe_protocol::{
     ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChosenTracks, ConfirmPassword,
     DeviceInfo, DeviceSignInRequest, FinishPasskeyRegistration, FinishPasskeySignIn, HomeScreen,
     ManifestKind, MediaRead, MediaReadResponse, PasskeyCreation, PasskeyInfo, PasskeyRequest,
-    PinProof, PlaybackHandle, PlaybackPlan, PlexLink, Previews, Reply, Request, Response,
+    PinProof, PlaybackHandle, PlaybackPlan, PlexLink, Previews, Quality, Reply, Request, Response,
     SearchRequest, SearchResults, Selection, SessionId, SessionInfo, TrackPreferencesInfo,
     UserSummary,
 };
@@ -180,6 +180,24 @@ pub struct PlaybackOptions {
     pub start: Option<Duration>,
     /// How a picked bitmap subtitle (PGS) is shown (P2-07).
     pub bitmap: BitmapSubtitles,
+    /// The quality the viewer chose for it (P6-06).
+    pub quality: PlaybackQuality,
+}
+
+/// The quality a viewer chooses for a playback (P6-06). The app's own
+/// limit (`ClientCapabilities::max_bitrate`) stays a ceiling over each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlaybackQuality {
+    /// For the link, as the SDK measures it ([`Session::link_rate`]): a
+    /// slow link starts as a conversion sized to it, and a direct play
+    /// that stalls on it is switched to one.
+    #[default]
+    Auto,
+    /// At most this many bits per second, whatever the link.
+    Bitrate(u64),
+    /// The file as it is, whatever the link: converted only for what the
+    /// device cannot play. It may buffer on a slow link.
+    Original,
 }
 
 /// Part of a converted playback's output (P2-04, P2-05).
@@ -687,7 +705,7 @@ impl Session {
             selection,
             start_ms: options.start.map(millis),
             bitmap: options.bitmap,
-            link_bitrate: self.link_rate(),
+            quality: self.wire_quality(options.quality),
         };
         match self.call(request).await? {
             Reply::PlaybackStarted {
@@ -1048,11 +1066,35 @@ impl Session {
         }
     }
 
+    /// `quality` as the wire says it: `Auto` with the link's rate now.
+    fn wire_quality(&self, quality: PlaybackQuality) -> Quality {
+        match quality {
+            PlaybackQuality::Auto => Quality::Auto {
+                link_bitrate: self.link_rate(),
+            },
+            PlaybackQuality::Bitrate(max_bitrate) => Quality::Bitrate { max_bitrate },
+            PlaybackQuality::Original => Quality::Original,
+        }
+    }
+
+    /// Plan a playing playback again for the quality the viewer chose
+    /// now (P6-06). A plan that changes restarts at `position` as a new
+    /// epoch: read it from offset 0, as after [`Session::change_subtitle`].
+    /// One that is the same comes back as it is.
+    pub async fn change_quality(
+        &self,
+        handle: &PlaybackHandle,
+        quality: PlaybackQuality,
+        bitmap: BitmapSubtitles,
+        position: Duration,
+    ) -> Result<PlaybackChange, SdkError> {
+        self.quality_request(handle, self.wire_quality(quality), bitmap, position)
+            .await
+    }
+
     /// Tell the server the link carries only `link_bitrate` bits per
-    /// second now (P6-06): the playback is planned again for it. A plan
-    /// that changes restarts at `position` as a new epoch: read it from
-    /// offset 0, as after [`Session::change_subtitle`]. One that already
-    /// fits comes back as it is.
+    /// second now (P6-06): an `Auto` playback is planned again for it, as
+    /// [`Session::change_quality`] plans one.
     pub async fn limit_playback(
         &self,
         handle: &PlaybackHandle,
@@ -1060,9 +1102,23 @@ impl Session {
         bitmap: BitmapSubtitles,
         position: Duration,
     ) -> Result<PlaybackChange, SdkError> {
-        let request = Request::LimitPlayback {
+        let quality = Quality::Auto {
+            link_bitrate: Some(link_bitrate),
+        };
+        self.quality_request(handle, quality, bitmap, position)
+            .await
+    }
+
+    async fn quality_request(
+        &self,
+        handle: &PlaybackHandle,
+        quality: Quality,
+        bitmap: BitmapSubtitles,
+        position: Duration,
+    ) -> Result<PlaybackChange, SdkError> {
+        let request = Request::ChangeQuality {
             handle: handle.clone(),
-            link_bitrate,
+            quality,
             bitmap,
             position_ms: millis(position),
         };
@@ -1085,15 +1141,20 @@ impl Session {
 
     /// An HLS playback's playlist (P2-05). The media playlist's segment
     /// URIs (`seg3.m4s`, `init.mp4`) name what [`Session::read_segment`]
-    /// reads: 3, and 0.
+    /// reads: 3, and 0. A ladder's multivariant playlist (PX-21) names
+    /// each rung's media playlist `v{n}/media.m3u8`: `variant` is that `n`
+    /// for a media playlist, 0 for one encode and the other kinds; under
+    /// `v{n}/` the segments are rung `n`'s.
     pub async fn manifest(
         &self,
         handle: &PlaybackHandle,
         kind: ManifestKind,
+        variant: u32,
     ) -> Result<String, SdkError> {
         let request = Request::GetManifest {
             handle: handle.clone(),
             kind,
+            variant,
         };
         match self.call(request).await? {
             Reply::Manifest { text } => Ok(text),
@@ -1113,21 +1174,24 @@ impl Session {
         offset: u64,
         length: u64,
     ) -> Result<Chunk, SdkError> {
-        self.media(handle, epoch, None, offset, length).await
+        self.media(handle, epoch, None, 0, offset, length).await
     }
 
     /// As [`Session::read_chunk`], within HLS segment `n` (0 is the init
-    /// segment). A segment far from what is encoded restarts the encode
-    /// there; the chunk's epoch says so.
+    /// segment) of rung `variant` (PX-21; 0 for one encode). A segment far
+    /// from what is encoded, or of a rung not being encoded, restarts the
+    /// encode there; the chunk's epoch says so.
     pub async fn read_segment(
         &self,
         handle: &PlaybackHandle,
         epoch: u32,
+        variant: u32,
         n: u32,
         offset: u64,
         length: u64,
     ) -> Result<Chunk, SdkError> {
-        self.media(handle, epoch, Some(n), offset, length).await
+        self.media(handle, epoch, Some(n), variant, offset, length)
+            .await
     }
 
     async fn media(
@@ -1135,6 +1199,7 @@ impl Session {
         handle: &PlaybackHandle,
         epoch: u32,
         segment: Option<u32>,
+        variant: u32,
         offset: u64,
         length: u64,
     ) -> Result<Chunk, SdkError> {
@@ -1145,6 +1210,7 @@ impl Session {
             length,
             epoch,
             segment,
+            variant,
         };
         match self.read_media(&request, false).await? {
             (MediaReadResponse::Ok(reply), bytes) => Ok(Chunk {
@@ -1243,6 +1309,7 @@ impl Session {
             length,
             epoch: 0,
             segment: None,
+            variant: 0,
         };
         // Direct reads tell how fast the link is; converted ones wait on
         // the encode, and would not (P6-06).

@@ -880,6 +880,17 @@ impl EncodeJob {
         self.shared.reader_ms.fetch_max(ms, Ordering::Relaxed);
     }
 
+    /// For HLS, the last segment it has written, if any.
+    pub fn written(&self) -> Option<u32> {
+        self.progress.borrow().last_segment
+    }
+
+    /// For HLS, whether it has segment `n` on disk now: one it wrote and
+    /// has not removed for the scratch space.
+    pub fn has_segment(&self, n: u32) -> bool {
+        n >= self.first_segment.max(self.first_kept()) && self.written().is_some_and(|w| n <= w)
+    }
+
     /// For HLS, the first segment this run still has: the one it started
     /// at, or a later one once a full scratch directory made it remove
     /// those behind its reader.

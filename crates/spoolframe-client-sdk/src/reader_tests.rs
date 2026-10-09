@@ -124,6 +124,7 @@ impl TestBackend {
                     video: None,
                     audio: None,
                     subtitle: None,
+                    ladder: Vec::new(),
                     reasons: vec![],
                 }
             } else {
@@ -257,6 +258,7 @@ impl PlaybackBackend for TestBackend {
                 video: None,
                 audio: None,
                 subtitle: None,
+                ladder: Vec::new(),
                 reasons: vec![],
             },
             size: 0,

@@ -145,7 +145,7 @@ pub(crate) async fn playback_ownership(
         selection: plain(),
         start_ms: None,
         bitmap: BitmapSubtitles::Auto,
-        link_bitrate: None,
+        quality: Default::default(),
     };
     let (handle, size) = match probe.request(&conn, Some(&a.session), start).await? {
         Response::Ok(Reply::PlaybackStarted {
@@ -373,6 +373,7 @@ fn controls(handle: &PlaybackHandle) -> Vec<(&'static str, Request)> {
             Request::GetManifest {
                 handle: handle(),
                 kind: ManifestKind::Media,
+                variant: 0,
             },
         ),
         (
@@ -434,6 +435,7 @@ fn media(session: &str, handle: &PlaybackHandle, revision: u64) -> ResourceReque
             length: READ,
             epoch: 0,
             segment: None,
+            variant: 0,
         },
         revision,
     }

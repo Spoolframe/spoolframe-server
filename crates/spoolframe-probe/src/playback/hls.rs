@@ -130,7 +130,7 @@ pub(super) async fn converted(
         selection: plain(),
         start_ms: None,
         bitmap: BitmapSubtitles::Auto,
-        link_bitrate: None,
+        quality: Default::default(),
     };
     let handle = match probe.request(&conn, Some(&a.session), start).await? {
         Response::Ok(Reply::PlaybackStarted { handle, plan, .. }) => {
@@ -303,6 +303,7 @@ async fn reads(
         let asked = Request::GetManifest {
             handle: handle.clone(),
             kind,
+            variant: 0,
         };
         let response = probe.request(conn, Some(&a.session), asked).await?;
         let line = match &response {
@@ -364,6 +365,7 @@ async fn intrude(
             Request::GetManifest {
                 handle: h(),
                 kind: ManifestKind::Multivariant,
+                variant: 0,
             },
         ),
         (
@@ -371,6 +373,7 @@ async fn intrude(
             Request::GetManifest {
                 handle: h(),
                 kind: ManifestKind::Media,
+                variant: 0,
             },
         ),
         (
@@ -447,6 +450,7 @@ fn segment(session: &str, handle: &PlaybackHandle, revision: u64, n: u32) -> Res
             length: READ,
             epoch: 0,
             segment: Some(n),
+            variant: 0,
         },
         revision,
     }
@@ -491,6 +495,7 @@ mod tests {
             video,
             audio: Some(ConvertedAudio { index: 0, action }),
             subtitle: None,
+            ladder: Vec::new(),
             reasons: Vec::new(),
         }
     }
@@ -545,6 +550,7 @@ mod tests {
                 },
             }),
             subtitle: None,
+            ladder: Vec::new(),
             reasons: Vec::new(),
         };
         assert!(copy_only(&plan).is_err());

@@ -1,6 +1,33 @@
-# Development wire revision 9
+# Development wire revision 11
 
-Revision 9 (P6-06, media over the Internet) keeps the
+Revision 11 (PX-21, adaptive HLS) keeps the `spoolframe/client/1` ALPN
+and sets `PROTOCOL_VERSION` to 11. Update the server and SDK together.
+A converted plan has a new required field, `ladder`: the encodes an HLS
+player switches between, highest first, each `{ "height", "max_bitrate"
+}`; empty for one encode, which every plan but `auto` quality over HLS
+is. The multivariant playlist of a ladder lists one variant per rung at
+`v{n}/media.m3u8`, `n` the rung's place in `ladder`, the rung the link
+chose first; under `v{n}/` are that rung's `init.mp4` and `seg{k}.m4s`,
+on the same grid as every other rung. `MediaRead` and `GetManifest` have
+a new required field, `variant`: that `n` (0 for one encode, and for
+anything that is not a segment or a media playlist). One encode runs at
+a time: a read of another rung's segment moves it there, and the rung
+it left keeps what it wrote, readable.
+
+Revision 10 (P6-06, the quality choice) kept the `spoolframe/client/1`
+ALPN and sets `PROTOCOL_VERSION` to 10. Update the server and SDK
+together. `StartPlayback`'s `link_bitrate` becomes `quality`, an object
+tagged by `type`: `{ "type": "auto", "link_bitrate": n | null }` (for the
+link, as revision 9 planned it), `{ "type": "bitrate", "max_bitrate":
+n }` (at most that, whatever the link) or `{ "type": "original" }` (the
+file as it is, whatever the link). The capabilities' `max_bitrate`
+stays a ceiling over all three; an unknown type is `auto` with nothing
+measured. `LimitPlayback` becomes `ChangeQuality { handle, quality,
+bitmap, position_ms }`, the same control for any quality: the viewer's
+new choice, or `auto` with a link found slow. The playback keeps its
+quality for a later `ChangeSubtitle`.
+
+Revision 9 (P6-06, media over the Internet) kept the
 `spoolframe/client/1` ALPN and sets `PROTOCOL_VERSION` to 9. Update the
 server and SDK together: a revision-8 client gets `Unsupported` from a
 revision-9 server's `Hello`. `StartPlayback` has a new required field,

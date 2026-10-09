@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::{ManagedPlayback, SdkError as BackendError};
+use crate::{ManagedPlayback, PlaybackQuality, SdkError as BackendError};
 use spoolframe_protocol::playback::LINK_SHARE;
 use spoolframe_protocol::{MAX_READ, PlaybackPlan};
 use std::{future::Future, pin::Pin};
@@ -607,7 +607,7 @@ impl Shared {
     /// [`BackendError::PlaybackRestarted`], and the player makes a new
     /// one from the playback's snapshot, as after a subtitle change.
     fn limit_if_too_slow(&self, this: &Arc<Self>, state: &mut State) {
-        if state.limit_asked || state.stopped {
+        if state.limit_asked || state.stopped || self.playback.quality() != PlaybackQuality::Auto {
             return;
         }
         let (Some(meter), Some(bitrate)) = (&self.meter, self.bitrate) else {
@@ -676,15 +676,29 @@ impl MediaReader {
         spawn: Spawn,
         length: Option<Duration>,
     ) -> Self {
+        Self::for_test_with(
+            session,
+            item,
+            selection,
+            start,
+            spawn,
+            length,
+            crate::PlaybackOptions::default(),
+        )
+    }
+
+    fn for_test_with(
+        session: Arc<crate::reader_tests::TestBackend>,
+        item: spoolframe_types::MediaId,
+        selection: spoolframe_protocol::Selection,
+        start: crate::Playback,
+        spawn: Spawn,
+        length: Option<Duration>,
+        options: crate::PlaybackOptions,
+    ) -> Self {
         let _enter = crate::reader_tests::runtime().enter();
         Self::new(
-            ManagedPlayback::adopt(
-                session,
-                item,
-                Some(selection),
-                crate::PlaybackOptions::default(),
-                start,
-            ),
+            ManagedPlayback::adopt(session, item, Some(selection), options, start),
             spawn,
             length,
         )
@@ -1004,6 +1018,15 @@ mod tests {
     /// says carries `rate` bytes per second, for a file of three blocks
     /// lasting `length`.
     fn stalling_reader(name: &str, rate: u64, length: Duration) -> (MediaReader, Arc<Session>) {
+        stalling_reader_of(name, rate, length, PlaybackQuality::Auto)
+    }
+
+    fn stalling_reader_of(
+        name: &str,
+        rate: u64,
+        length: Duration,
+        quality: PlaybackQuality,
+    ) -> (MediaReader, Arc<Session>) {
         let meter = Arc::new(crate::LinkMeter::default());
         let now = Instant::now();
         meter.begin(now - Duration::from_secs(4));
@@ -1028,13 +1051,17 @@ mod tests {
                 drop(future);
             }
         });
-        let reader = MediaReader::for_test(
+        let reader = MediaReader::for_test_with(
             session.clone(),
             item,
             Selection::default(),
             start,
             spawn,
             Some(length),
+            crate::PlaybackOptions {
+                quality,
+                ..crate::PlaybackOptions::default()
+            },
         );
         (reader, session)
     }
@@ -1054,6 +1081,29 @@ mod tests {
             }))
         );
         assert_eq!(*session.limits.lock(), [8 << 20]);
+    }
+
+    /// Original quality was the viewer's choice: the link does not
+    /// overrule it, however slow, and the reader waits out the stall.
+    #[test]
+    fn a_stall_in_original_quality_asks_nothing() {
+        let (reader, session) = stalling_reader_of(
+            "reader-original",
+            1 << 20,
+            Duration::from_secs(2),
+            PlaybackQuality::Original,
+        );
+        reader.read(BLOCK - 100, 100).unwrap();
+        {
+            let reader = Arc::new(reader);
+            let flusher = reader.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(LIMIT_AFTER + Duration::from_secs(1));
+                flusher.set_flushing(true);
+            });
+            assert_eq!(reader.read(BLOCK, 100), Err(ReadError::Flushing));
+        }
+        assert!(session.limits.lock().is_empty());
     }
 
     /// A link fast enough for the file: a stall is a swing, and the

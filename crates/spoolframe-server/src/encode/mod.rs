@@ -14,7 +14,7 @@ use spoolframe_media::encoders::Encoders;
 use spoolframe_media::{MediaDescriptor, codecs};
 use spoolframe_protocol::{
     AudioAction, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, ManifestKind, PlaybackPlan,
-    SubtitleAction,
+    Rung, SubtitleAction,
 };
 use spoolframe_types::{Delivery, SubtitleFormat};
 
@@ -78,9 +78,27 @@ pub struct Conversion {
     vaapi_device: PathBuf,
     /// For HLS: where the segments are cut (P2-05).
     segments: Option<Segments>,
-    current: Mutex<Arc<EncodeJob>>,
+    /// For HLS under Auto (PX-21): the encodes a player switches between,
+    /// highest first. Empty for one encode, `video`.
+    ladder: Vec<Rung>,
+    /// The rung it started on, listed first for the player.
+    first_rung: u32,
+    current: Mutex<Current>,
     /// Ended by an admin (P3-15): no encode starts again for it.
     ended: std::sync::atomic::AtomicBool,
+}
+
+/// The job running now, which rung of the ladder it encodes (0 for one
+/// encode), and the last job of another rung, stopped (PX-21): what it
+/// wrote stays readable, so a player that fetches a segment it has from
+/// the rung it left gets it, and no restart. Only one is kept: each one's
+/// segments count against the scratch space, and only the running job's
+/// are reclaimed.
+#[derive(Debug)]
+struct Current {
+    job: Arc<EncodeJob>,
+    rung: u32,
+    left: Option<(u32, Arc<EncodeJob>)>,
 }
 
 /// Why a read past what an ended conversion wrote fails (P3-15).
@@ -108,6 +126,9 @@ pub struct ConversionSource<'a> {
     /// The slot of the conversion it replaces, which still runs: the two
     /// share it, so a subtitle change needs no second one.
     pub slot: Option<Slot>,
+    /// For a ladder (PX-21), the rung its first encode is: the one the
+    /// player is told to start on.
+    pub start_rung: u32,
 }
 
 impl Conversion {
@@ -122,6 +143,7 @@ impl Conversion {
             video,
             audio,
             subtitle,
+            ladder,
             ..
         } = source.plan
         else {
@@ -192,6 +214,12 @@ impl Conversion {
         };
         // An HLS start begins at the segment the position falls in.
         let (start, first_segment) = playback_seek(segments.as_ref(), start, *video);
+        let start_rung = if ladder.is_empty() {
+            0
+        } else {
+            source.start_rung.min(ladder.len() as u32 - 1)
+        };
+        let first_video = rung_video(*video, ladder, start_rung);
         let job = spawn(
             &jobs,
             &dir,
@@ -199,7 +227,7 @@ impl Conversion {
             &input,
             sidecar.as_deref(),
             &source.descriptor,
-            (*delivery, *video, *audio, *subtitle),
+            (*delivery, first_video, *audio, *subtitle),
             &source.encoders,
             source.vaapi_device,
             source.first_epoch,
@@ -228,7 +256,13 @@ impl Conversion {
             encoders: source.encoders,
             vaapi_device: source.vaapi_device.to_path_buf(),
             segments,
-            current: Mutex::new(job),
+            ladder: ladder.clone(),
+            first_rung: start_rung,
+            current: Mutex::new(Current {
+                job,
+                rung: start_rung,
+                left: None,
+            }),
             ended: Default::default(),
         }))
     }
@@ -240,7 +274,7 @@ impl Conversion {
     pub fn end(&self) {
         let current = self.current.lock();
         self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
-        current.end();
+        current.job.end();
     }
 
     /// Whether [`Conversion::end`] ended it.
@@ -256,7 +290,22 @@ impl Conversion {
 
     /// What it weighs against the encode budget: its running job's load.
     pub fn load(&self) -> Load {
-        self.current.lock().load
+        self.current.lock().job.load
+    }
+
+    /// For a ladder (PX-21), its rungs; empty for one encode.
+    pub fn ladder(&self) -> &[Rung] {
+        &self.ladder
+    }
+
+    /// The rung being encoded now: 0 for one encode.
+    pub fn rung(&self) -> u32 {
+        self.current.lock().rung
+    }
+
+    /// The rungs a player may ask for: 1 for one encode.
+    fn rungs(&self) -> u32 {
+        self.ladder.len().max(1) as u32
     }
 
     /// For HLS, the segments.
@@ -264,9 +313,13 @@ impl Conversion {
         self.segments.as_ref()
     }
 
-    /// For HLS, a playlist.
-    pub fn manifest(&self, kind: ManifestKind) -> Option<String> {
+    /// For HLS, a playlist; a media playlist of `variant`, a ladder's
+    /// rung (PX-21), is the same for every rung: they share the grid.
+    pub fn manifest(&self, kind: ManifestKind, variant: u32) -> Option<String> {
         let segments = self.segments.as_ref()?;
+        if kind == ManifestKind::Media && variant >= self.rungs() {
+            return None;
+        }
         let rendition = self
             .subtitle_rendition()
             .and_then(|index| self.descriptor.subtitles.get(index as usize));
@@ -276,8 +329,26 @@ impl Conversion {
                 rendition?;
                 segments.subtitle_playlist()
             }
-            _ => hls::multivariant_playlist(&self.descriptor, self.video, self.audio, rendition),
+            _ if self.ladder.is_empty() => {
+                hls::multivariant_playlist(&self.descriptor, self.video, self.audio, rendition)
+            }
+            // The rung the conversion started on first, as the player
+            // starts on the first; then the rest, highest first.
+            _ => {
+                let first = self.first_rung();
+                let rungs: Vec<(u32, ConvertedVideo)> = std::iter::once(first)
+                    .chain((0..self.rungs()).filter(|&n| n != first))
+                    .filter_map(|n| Some((n, rung_video(self.video, &self.ladder, n)?)))
+                    .collect();
+                hls::ladder_playlist(&self.descriptor, &rungs, self.audio, rendition)
+            }
         })
+    }
+
+    /// The rung the conversion started on: what the player is told to
+    /// start with.
+    fn first_rung(&self) -> u32 {
+        self.first_rung
     }
 
     /// For HLS, the subtitle track that goes as a WebVTT rendition (P2-07):
@@ -300,60 +371,171 @@ impl Conversion {
         Some((segments.start(n)?, segments.end(n)?))
     }
 
-    /// The job that writes HLS segment `n`: the running one, or, if `n` is
-    /// behind where it started (or behind what it has kept, with the
-    /// scratch space full) or far past what it has written, a new one
-    /// started at `n`.
-    pub fn job_for_segment(&self, n: u32) -> Result<Arc<EncodeJob>, JobError> {
+    /// The job that writes HLS segment `n` of `rung` (0 for one encode):
+    /// the running one, or, if `n` is behind where it started (or behind
+    /// what it has kept, with the scratch space full) or far past what it
+    /// has written, a new one started at `n`.
+    ///
+    /// Another rung than the running one (PX-21) is the player switching:
+    /// the job that left that rung serves `n` if it wrote it, and
+    /// otherwise the encode moves to that rung at `n`, the running job
+    /// kept as the one left, so its segments stay readable.
+    pub fn job_for_segment(&self, n: u32, rung: u32) -> Result<Arc<EncodeJob>, JobError> {
         let segments = self
             .segments
             .as_ref()
             .ok_or_else(|| JobError::Prepare("not an HLS playback".into()))?;
+        if rung >= self.rungs() {
+            return Err(JobError::Prepare(format!(
+                "no rung {rung} in this playback"
+            )));
+        }
         let mut current = self.current.lock();
-        let written = current.progress().borrow().last_segment;
-        let head = written.unwrap_or(current.first_segment.saturating_sub(1));
+        if rung != current.rung {
+            if let Some((left, job)) = &current.left
+                && *left == rung
+                && job.has_segment(n)
+            {
+                return Ok(job.clone());
+            }
+            if self.ended() {
+                return Err(JobError::Prepare(ENDED.into()));
+            }
+            return self.switch(&mut current, rung, n, segments);
+        }
+        let job = &current.job;
+        let written = job.written();
+        let head = written.unwrap_or(job.first_segment.saturating_sub(1));
         if self.ended() {
             // Only what it wrote: nothing more is coming.
-            return if n >= current.first_kept() && written.is_some_and(|w| n <= w) {
-                Ok(current.clone())
+            return if n >= job.first_kept() && written.is_some_and(|w| n <= w) {
+                Ok(job.clone())
             } else {
                 Err(JobError::Prepare(ENDED.into()))
             };
         }
         // A run whose GPU decode failed past its first segment has only
         // what it wrote: past that, a run decoding in software goes on.
-        let failed_on_gpu = current.decodes_in_hardware()
-            && matches!(current.progress().borrow().done, Some(Err(_)))
+        let failed_on_gpu = job.decodes_in_hardware()
+            && matches!(job.progress().borrow().done, Some(Err(_)))
             && written.is_none_or(|w| n > w);
-        if n >= current.first_kept() && n <= head + SEGMENTS_AHEAD && !failed_on_gpu {
-            return Ok(current.clone());
+        if n >= job.first_kept() && n <= head + SEGMENTS_AHEAD && !failed_on_gpu {
+            return Ok(job.clone());
         }
         let start = segment_seek(segments, n, self.video);
-        let epoch = current.epoch + 1;
-        let job = spawn(
+        let epoch = job.epoch + 1;
+        let next = spawn(
             &self.jobs,
             &self.dir,
             &self.file,
             &self.input,
             self.sidecar.as_deref(),
             &self.descriptor,
-            (self.delivery, self.video, self.audio, self.subtitle),
+            self.parts(rung),
             &self.encoders,
             &self.vaapi_device,
             epoch,
             start,
             n,
-            current.slot(),
+            job.slot(),
         )?;
-        current.stop();
-        *current = job;
+        current.job.stop();
+        current.job = next;
         tracing::debug!(segment = n, epoch, "HLS encode restarted at a segment");
-        Ok(current.clone())
+        Ok(current.job.clone())
+    }
+
+    /// The job whose init segment `rung` plays from: the running one, the
+    /// one that left that rung, or, for a rung neither is, the encode
+    /// moved to it just past what is written: where a player switching
+    /// to it asks next.
+    pub fn job_for_init(&self, rung: u32) -> Result<Arc<EncodeJob>, JobError> {
+        let segments = self
+            .segments
+            .as_ref()
+            .ok_or_else(|| JobError::Prepare("not an HLS playback".into()))?;
+        if rung >= self.rungs() {
+            return Err(JobError::Prepare(format!(
+                "no rung {rung} in this playback"
+            )));
+        }
+        let mut current = self.current.lock();
+        if rung == current.rung {
+            return Ok(current.job.clone());
+        }
+        // The one left, once it wrote a segment: its init was finished then.
+        if let Some((left, job)) = &current.left
+            && *left == rung
+            && job.written().is_some()
+        {
+            return Ok(job.clone());
+        }
+        if self.ended() {
+            return Err(JobError::Prepare(ENDED.into()));
+        }
+        let next = current
+            .job
+            .written()
+            .map_or(current.job.first_segment, |w| w + 1)
+            .min(segments.count())
+            .max(1);
+        self.switch(&mut current, rung, next, segments)
+    }
+
+    /// Move the encode to `rung` at segment `n`: started first in the
+    /// running job's slot, then the running job stopped and kept as the
+    /// one left (the one left before it goes, its files with it).
+    fn switch(
+        &self,
+        current: &mut Current,
+        rung: u32,
+        n: u32,
+        segments: &Segments,
+    ) -> Result<Arc<EncodeJob>, JobError> {
+        let start = segment_seek(segments, n, self.video);
+        let epoch = current.job.epoch + 1;
+        let next = spawn(
+            &self.jobs,
+            &self.dir,
+            &self.file,
+            &self.input,
+            self.sidecar.as_deref(),
+            &self.descriptor,
+            self.parts(rung),
+            &self.encoders,
+            &self.vaapi_device,
+            epoch,
+            start,
+            n,
+            current.job.slot(),
+        )?;
+        let left = std::mem::replace(&mut current.job, next);
+        left.stop();
+        tracing::debug!(
+            segment = n,
+            epoch,
+            from = current.rung,
+            to = rung,
+            "HLS encode moved to another rung"
+        );
+        current.left = Some((current.rung, left));
+        current.rung = rung;
+        Ok(current.job.clone())
+    }
+
+    /// What `rung`'s encode is made of.
+    fn parts(&self, rung: u32) -> Parts {
+        (
+            self.delivery,
+            rung_video(self.video, &self.ladder, rung),
+            self.audio,
+            self.subtitle,
+        )
     }
 
     /// The job running now.
     pub fn job(&self) -> Arc<EncodeJob> {
-        self.current.lock().clone()
+        self.current.lock().job.clone()
     }
 
     /// Seek using the same timeline and keyframe alignment as a new
@@ -371,7 +553,7 @@ impl Conversion {
         if self.ended() {
             return Err(JobError::Prepare(ENDED.into()));
         }
-        let epoch = current.epoch + 1;
+        let epoch = current.job.epoch + 1;
         let job = spawn(
             &self.jobs,
             &self.dir,
@@ -379,23 +561,49 @@ impl Conversion {
             &self.input,
             self.sidecar.as_deref(),
             &self.descriptor,
-            (self.delivery, self.video, self.audio, self.subtitle),
+            self.parts(current.rung),
             &self.encoders,
             &self.vaapi_device,
             epoch,
             Some(start),
             start_number,
-            current.slot(),
+            current.job.slot(),
         )?;
-        current.stop();
-        *current = job;
+        current.job.stop();
+        current.job = job;
+        // What the rung left wrote is from before the seek: let it go.
+        current.left = None;
         Ok(epoch)
+    }
+}
+
+/// The video of `rung`: a ladder's rung at its own height and cap, the
+/// rest of the encode as `video`'s; for one encode, `video`.
+fn rung_video(video: Option<ConvertedVideo>, ladder: &[Rung], rung: u32) -> Option<ConvertedVideo> {
+    match (video, ladder.get(rung as usize)) {
+        (
+            Some(ConvertedVideo::Encode {
+                codec, tone_map, ..
+            }),
+            Some(r),
+        ) => Some(ConvertedVideo::Encode {
+            codec,
+            height: r.height,
+            max_bitrate: Some(r.max_bitrate),
+            tone_map,
+        }),
+        _ => video,
     }
 }
 
 impl Drop for Conversion {
     fn drop(&mut self) {
-        self.current.lock().stop();
+        let current = self.current.lock();
+        current.job.stop();
+        if let Some((_, left)) = &current.left {
+            left.stop();
+        }
+        drop(current);
         if let Err(e) = std::fs::remove_dir_all(&self.dir)
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -641,6 +849,7 @@ mod tests {
             video: None,
             audio: None,
             subtitle: None,
+            ladder: Vec::new(),
             reasons: Vec::new(),
         };
         let started = Conversion::start(
@@ -655,6 +864,7 @@ mod tests {
                 keyframes: None,
                 first_epoch: 0,
                 slot: None,
+                start_rung: 0,
             },
             None,
         );
@@ -734,6 +944,7 @@ mod tests {
             }),
             audio: None,
             subtitle: None,
+            ladder: Vec::new(),
             reasons: Vec::new(),
         };
         let encoders = Encoders {
@@ -760,6 +971,7 @@ mod tests {
                 keyframes: None,
                 first_epoch: 0,
                 slot: None,
+                start_rung: 0,
             },
             None,
         )
@@ -770,8 +982,8 @@ mod tests {
         progress.wait_for(|p| p.done.is_some()).await.unwrap();
         assert!(jobs.hardware_decode_failed(&film));
         // Segment 1 was written: it is the failed run's still.
-        assert_eq!(conversion.job_for_segment(1).unwrap().epoch, 0);
-        let next = conversion.job_for_segment(2).unwrap();
+        assert_eq!(conversion.job_for_segment(1, 0).unwrap().epoch, 0);
+        let next = conversion.job_for_segment(2, 0).unwrap();
         assert_eq!(next.epoch, 1);
         assert!(
             !next.command().contains(&"-hwaccel".to_owned()),

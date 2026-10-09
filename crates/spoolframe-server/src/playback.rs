@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 use password_hash::rand_core::{OsRng, RngCore};
-use spoolframe_protocol::{PlaybackHandle, PlaybackPlan, Selection, SessionId};
+use spoolframe_protocol::{PlaybackHandle, PlaybackPlan, Quality, Selection, SessionId};
 use spoolframe_types::{Delivery, Item, MediaId, Platform, SubtitleFormat};
 use tokio::sync::watch;
 
@@ -263,9 +263,8 @@ pub struct Playback {
     /// For a converted playback, its encode (P2-03). Ending the handle
     /// drops it, which stops ffmpeg and removes its files.
     pub conversion: Option<Arc<Conversion>>,
-    /// What the device last measured its link carrying (P6-06), bits per
-    /// second: it is planned for, again at a subtitle change.
-    pub link_bitrate: Option<u64>,
+    /// The quality it is planned for (P6-06), again at a subtitle change.
+    pub quality: Quality,
     /// The connection that started it (a number of the server's own).
     connection: u64,
     last_used: Instant,
@@ -330,13 +329,13 @@ pub struct Opened {
     pub file: Option<FileId>,
     pub subtitle: Option<Sidecar>,
     pub conversion: Option<Arc<Conversion>>,
-    /// The device's measured link, bits per second (P6-06).
-    pub link_bitrate: Option<u64>,
+    /// The quality the viewer chose (P6-06).
+    pub quality: Quality,
     /// The connection starting it ([`Playbacks::connection_closed`]).
     pub connection: u64,
 }
 
-/// What a playback becomes when its subtitle or its link changes.
+/// What a playback becomes when its subtitle or its quality changes.
 #[derive(Debug)]
 pub struct Changed {
     pub planned: PlaybackPlan,
@@ -345,7 +344,7 @@ pub struct Changed {
     pub file: Option<FileId>,
     pub subtitle: Option<Sidecar>,
     pub conversion: Option<Arc<Conversion>>,
-    pub link_bitrate: Option<u64>,
+    pub quality: Quality,
 }
 
 /// A device holds [`DEVICE_MOST`] converted playbacks, all playing: it
@@ -781,7 +780,7 @@ impl Playbacks {
                 file: opened.file,
                 subtitle: opened.subtitle,
                 conversion: opened.conversion,
-                link_bitrate: opened.link_bitrate,
+                quality: opened.quality,
                 connection: opened.connection,
                 last_used: now,
                 last_read: None,
@@ -806,7 +805,7 @@ impl Playbacks {
         playback.size = changed.size;
         playback.file = changed.file;
         playback.subtitle = changed.subtitle;
-        playback.link_bitrate = changed.link_bitrate;
+        playback.quality = changed.quality;
         std::mem::replace(&mut playback.conversion, changed.conversion)
     }
 
@@ -907,6 +906,14 @@ impl Playbacks {
             converted_ms,
         };
         playback.trace.lock().read(point, epoch, mark);
+    }
+
+    /// Keep `quality` for `handle`'s next re-plan, its plan unchanged:
+    /// not a change of configuration, so the revision stays.
+    pub fn set_quality(&self, handle: &PlaybackHandle, quality: Quality) {
+        if let Some(playback) = self.lock().get_mut(&handle.0) {
+            playback.quality = quality;
+        }
     }
 
     /// `handle`'s revision now, if it is open.
@@ -1373,7 +1380,7 @@ mod tests {
             file: None,
             subtitle: None,
             conversion: None,
-            link_bitrate: None,
+            quality: Quality::default(),
             connection: 0,
         }
     }

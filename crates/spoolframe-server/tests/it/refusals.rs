@@ -528,7 +528,7 @@ async fn another_session_s_playback_is_logged() {
                 selection: None,
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await
@@ -565,6 +565,7 @@ async fn another_session_s_playback_is_logged() {
                 length: 10,
                 epoch: 0,
                 segment: None,
+                variant: 0,
             },
             revision,
         })

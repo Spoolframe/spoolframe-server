@@ -1334,7 +1334,7 @@ impl TestClient {
         use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
         let control = match &request {
             Request::ChangeSubtitle { handle, .. }
-            | Request::LimitPlayback { handle, .. }
+            | Request::ChangeQuality { handle, .. }
             | Request::SeekPlayback { handle, .. }
             | Request::StopPlayback { handle } => Some(handle),
             _ => None,
@@ -1555,6 +1555,7 @@ impl TestClient {
             length,
             epoch,
             segment: None,
+            variant: 0,
         })
         .await
     }

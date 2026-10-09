@@ -227,14 +227,14 @@ fn every_request_round_trips() {
             selection: Some(Selection::default()),
             start_ms: Some(1_800_000),
             bitmap: BitmapSubtitles::Text,
-            link_bitrate: None,
+            quality: Default::default(),
         },
         Request::StartPlayback {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
             selection: None,
             start_ms: None,
             bitmap: BitmapSubtitles::Auto,
-            link_bitrate: None,
+            quality: Default::default(),
         },
         Request::StopPlayback {
             handle: crate::PlaybackHandle("h".into()),
@@ -272,6 +272,7 @@ fn every_request_round_trips() {
         Request::GetManifest {
             handle: crate::PlaybackHandle("h".into()),
             kind: crate::ManifestKind::Subtitles,
+            variant: 0,
         },
         Request::SeekPlayback {
             handle: crate::PlaybackHandle("h".into()),
@@ -280,6 +281,7 @@ fn every_request_round_trips() {
         Request::GetManifest {
             handle: crate::PlaybackHandle("h".into()),
             kind: crate::ManifestKind::Media,
+            variant: 0,
         },
         Request::GetTrackPreferences,
         Request::SetTrackPreferences {
@@ -637,6 +639,7 @@ fn every_plan_kind_round_trips_phase_2_ones_included() {
                 },
             }),
             subtitle: None,
+            ladder: Vec::new(),
             reasons: vec!["container: matroska not supported".into()],
         },
         PlaybackPlan::Converted {
@@ -662,6 +665,7 @@ fn every_plan_kind_round_trips_phase_2_ones_included() {
                     format: SubtitleFormat::Pgs,
                 },
             }),
+            ladder: Vec::new(),
             reasons: vec!["subtitle 0: pgs cannot be shown; burned into the video".into()],
         },
         PlaybackPlan::Converted {
@@ -678,6 +682,7 @@ fn every_plan_kind_round_trips_phase_2_ones_included() {
                     to: SubtitleFormat::Srt,
                 },
             }),
+            ladder: Vec::new(),
             reasons: vec!["subtitle 2: pgs read as text".into()],
         },
         PlaybackPlan::Unsupported {
@@ -741,6 +746,7 @@ fn media_reads_round_trip() {
         length: crate::MAX_READ,
         epoch: 2,
         segment: Some(14),
+        variant: 0,
     });
     round_trip(crate::MediaReadResponse::Ok(crate::MediaReadReply {
         sent: 4096,
@@ -1665,7 +1671,7 @@ fn a_request_missing_a_field_is_refused() {
             selection: None,
             start_ms: None,
             bitmap: BitmapSubtitles::Auto,
-            link_bitrate: None,
+            quality: Default::default(),
         },
         &["selection", "start_ms", "bitmap"],
     );
@@ -1771,6 +1777,7 @@ fn a_media_read_or_its_reply_missing_a_field_is_refused() {
             length: 1,
             epoch: 0,
             segment: None,
+            variant: 0,
         },
         &["epoch", "segment"],
     );

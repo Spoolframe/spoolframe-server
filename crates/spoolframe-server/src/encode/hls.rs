@@ -202,6 +202,68 @@ pub fn multivariant_playlist(
     audio: Option<ConvertedAudio>,
     subtitle: Option<&SubtitleStream>,
 ) -> String {
+    let mut text = header(subtitle);
+    text.push_str(&stream_inf(descriptor, video, audio, subtitle.is_some()));
+    text.push_str("\nmedia.m3u8\n");
+    text
+}
+
+/// The multivariant playlist of a ladder (PX-21): one variant per rung,
+/// `rungs` as `(n, video)` in the order the player is to see them (it
+/// starts on the first), each at `v{n}/media.m3u8`, all with the same
+/// audio and subtitle rendition: every rung is on the same grid.
+pub fn ladder_playlist(
+    descriptor: &MediaDescriptor,
+    rungs: &[(u32, ConvertedVideo)],
+    audio: Option<ConvertedAudio>,
+    subtitle: Option<&SubtitleStream>,
+) -> String {
+    let mut text = header(subtitle);
+    for (n, video) in rungs {
+        text.push_str(&stream_inf(
+            descriptor,
+            Some(*video),
+            audio,
+            subtitle.is_some(),
+        ));
+        let _ = write!(text, "\nv{n}/media.m3u8\n");
+    }
+    text
+}
+
+/// The playlist's head, with `subtitle` as the rendition its variants
+/// share.
+fn header(subtitle: Option<&SubtitleStream>) -> String {
+    let mut text = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    if let Some(track) = subtitle {
+        let name = track
+            .title
+            .as_deref()
+            .or(track.language.as_deref())
+            .map(quoted_string)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "Subtitles".into());
+        let _ = write!(
+            text,
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",DEFAULT=YES,\
+             AUTOSELECT=YES,FORCED={},URI=\"subtitles.m3u8\"",
+            if track.forced { "YES" } else { "NO" }
+        );
+        if let Some(language) = track.language.as_deref().and_then(language_tag) {
+            let _ = write!(text, ",LANGUAGE=\"{language}\"");
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// One variant's `#EXT-X-STREAM-INF` line, without its URI.
+fn stream_inf(
+    descriptor: &MediaDescriptor,
+    video: Option<ConvertedVideo>,
+    audio: Option<ConvertedAudio>,
+    subtitles: bool,
+) -> String {
     let mut codecs = Vec::new();
     let mut resolution = None;
     let mut picture = None;
@@ -253,28 +315,7 @@ pub fn multivariant_playlist(
         }
         rate = rate.plus(audio_rate);
     }
-    let mut text = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-    if let Some(track) = subtitle {
-        let name = track
-            .title
-            .as_deref()
-            .or(track.language.as_deref())
-            .map(quoted_string)
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "Subtitles".into());
-        let _ = write!(
-            text,
-            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",DEFAULT=YES,\
-             AUTOSELECT=YES,FORCED={},URI=\"subtitles.m3u8\"",
-            if track.forced { "YES" } else { "NO" }
-        );
-        if let Some(language) = track.language.as_deref().and_then(language_tag) {
-            let _ = write!(text, ",LANGUAGE=\"{language}\"");
-        }
-        text.push('\n');
-    }
-    let _ = write!(
-        text,
+    let mut text = format!(
         "#EXT-X-STREAM-INF:BANDWIDTH={},AVERAGE-BANDWIDTH={}",
         rate.peak, rate.average
     );
@@ -292,10 +333,9 @@ pub fn multivariant_playlist(
         // Apple's players want it said for HDR, and read none as SDR.
         let _ = write!(text, ",VIDEO-RANGE={}", range.as_str());
     }
-    if subtitle.is_some() {
+    if subtitles {
         text.push_str(",SUBTITLES=\"subs\"");
     }
-    text.push_str("\nmedia.m3u8\n");
     text
 }
 
@@ -636,6 +676,47 @@ mod tests {
         let (peak, average) = bandwidths(&text);
         assert_eq!(average, Some(1_000_000));
         assert!(peak >= 1_500_000, "{text}");
+    }
+
+    /// A ladder (PX-21) lists a variant per rung, in the order given,
+    /// each at its own size and cap, at `v{n}/media.m3u8`.
+    #[test]
+    fn a_ladder_lists_each_rung_with_its_own_size_and_rate() {
+        let rung = |height, cap| ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height,
+            max_bitrate: Some(cap),
+            tone_map: false,
+        };
+        let rungs = [
+            (2, rung(720, 3_000_000)),
+            (0, rung(1080, 8_000_000)),
+            (1, rung(1080, 5_000_000)),
+        ];
+        let text = ladder_playlist(&film("bt709"), &rungs, None, None);
+        let Ok(m3u8_rs::Playlist::MasterPlaylist(p)) = m3u8_rs::parse_playlist_res(text.as_bytes())
+        else {
+            panic!("not a multivariant playlist: {text}");
+        };
+        let listed: Vec<(&str, Option<u64>, Option<u64>)> = p
+            .variants
+            .iter()
+            .map(|v| {
+                (
+                    v.uri.as_str(),
+                    v.resolution.map(|r| r.height),
+                    v.average_bandwidth,
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("v2/media.m3u8", Some(720), Some(3_000_000)),
+                ("v0/media.m3u8", Some(1080), Some(8_000_000)),
+                ("v1/media.m3u8", Some(1080), Some(5_000_000)),
+            ]
+        );
     }
 
     /// A capped encode's segments can run over its cap by what the

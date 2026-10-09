@@ -47,6 +47,10 @@ pub struct MediaRead {
     /// reads the file itself (direct play) or the progressive output.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub segment: Option<u32>,
+    /// For HLS, the variant the segment is of (PX-21): a ladder's rung,
+    /// as `v{n}/` in its playlist. 0 for one encode, and for anything
+    /// that is not a segment.
+    pub variant: u32,
 }
 
 /// What follows on the stream. Every field is required (PX-15).

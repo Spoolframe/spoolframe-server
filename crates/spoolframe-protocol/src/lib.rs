@@ -42,8 +42,8 @@ pub use passkeys::{
 };
 pub use playback::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
-    PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
-    TrackReason,
+    PlannedAudio, PlannedSubtitle, PlaybackPlan, Quality, Rung, Selection, SubtitleAction,
+    SubtitleDelivery, TrackReason,
 };
 pub use plex::{PlexLink, PlexSyncSummary};
 pub use previews::{PreviewTile, Previews};

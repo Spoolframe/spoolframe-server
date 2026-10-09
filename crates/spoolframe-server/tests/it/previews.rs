@@ -230,7 +230,7 @@ async fn start(client: &TestClient, session: &SessionId) -> Response {
                 selection: None,
                 start_ms: None,
                 bitmap: Default::default(),
-                link_bitrate: None,
+                quality: Default::default(),
             },
         )
         .await
