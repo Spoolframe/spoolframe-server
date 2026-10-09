@@ -1,6 +1,22 @@
-# Development wire revision 8
+# Development wire revision 9
 
-Revision 8 (P6-01, invites) keeps the `spoolframe/client/1` ALPN and sets
+Revision 9 (P6-06, media over the Internet) keeps the
+`spoolframe/client/1` ALPN and sets `PROTOCOL_VERSION` to 9. Update the
+server and SDK together: a revision-8 client gets `Unsupported` from a
+revision-9 server's `Hello`. `StartPlayback` has a new required field,
+`link_bitrate` (bits per second, or `null`): what the device measured
+its link to the server carrying lately. The playback is planned for 75%
+of it as well as for the capabilities' `max_bitrate`, and keeps it for
+later re-plans. There is a new request, `LimitPlayback { handle,
+link_bitrate, bitmap, position_ms }`, answered `PlaybackChanged`: a
+playback that stalls on its link is planned again for it, as
+`ChangeSubtitle` plans one again for a subtitle. It is a playback
+control, so it carries the expected revision, as `ChangeSubtitle` does.
+A plan that changes restarts at `position_ms` as a new epoch; one that
+does not is answered as it is, nothing restarted. A plan nothing plays
+under is `CannotPlay`, and the playback goes on as it was.
+
+Revision 8 (P6-01, invites) kept the `spoolframe/client/1` ALPN and sets
 `PROTOCOL_VERSION` to 8. Update the server and SDK together: a
 revision-7 client gets `Unsupported` from a revision-8 server's `Hello`.
 There is a new pre-auth request, `redeem_invite { code, username,
@@ -602,9 +618,10 @@ port forwarded on the router and the network's public IP, or the host's
 own stable IPv6 addresses. The event does not say which address came
 from where; the admin status does.
 Each one is text, `192.168.1.10:4433` or `[2001:db8::1]:4433`, in CBOR as
-in JSON. `relays` is the URL of each iroh relay the server uses
-(`network.relay`); it is empty while relays are off, as they are by
-default. Both fields are required, and an empty list is sent as `[]`.
+in JSON. `relays` is the URL of each iroh relay the server may use
+(`network.relays`, P6-03), its home relay at the time first: the one it
+is reached through, the rest where it fails over to. It is empty while
+relays are off, as they are by default. Both fields are required, and an empty list is sent as `[]`.
 
 Each event is the whole list. It replaces what the server told before:
 an address it no longer tells is gone.

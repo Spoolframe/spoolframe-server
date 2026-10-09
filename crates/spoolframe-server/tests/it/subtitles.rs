@@ -79,6 +79,7 @@ async fn start(
                 selection: with_pgs(),
                 start_ms: None,
                 bitmap,
+                link_bitrate: None,
             },
         )
         .await;
@@ -459,6 +460,7 @@ async fn text_without_tesseract_cannot_play_and_says_why() {
                 selection: with_pgs(),
                 start_ms: None,
                 bitmap: BitmapSubtitles::Text,
+                link_bitrate: None,
             },
         )
         .await;
@@ -562,6 +564,7 @@ async fn a_subtitle_change_in_direct_play_changes_only_the_text() {
                 }),
                 start_ms: None,
                 bitmap: BitmapSubtitles::Auto,
+                link_bitrate: None,
             },
         )
         .await;

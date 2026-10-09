@@ -54,3 +54,10 @@ lists what it hears beside the saved servers. `Client::open_with_options` with
 servers are listed, and a server is dialled only at its saved addresses or at
 the ones given with `add_address`. Tests use it so that a real server on the
 developer's network cannot change their results.
+
+`ClientOptions::relays`, on by default, reaches a server through the relays it
+told the device of (in an invite, or its `ServerAddresses`) when it cannot be
+dialled directly. The device has no relay of its own: none is contacted until a
+server is dialled through one. Off, the endpoint has no relay transport, and a
+server is reached only at its addresses. It is fixed for the life of a
+`Client`; an app whose user changes it opens a new one.

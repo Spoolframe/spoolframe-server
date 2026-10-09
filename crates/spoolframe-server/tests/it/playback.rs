@@ -31,6 +31,7 @@ async fn start(client: &TestClient, session: &SessionId, selection: Selection) -
                 selection: Some(selection),
                 start_ms: None,
                 bitmap: Default::default(),
+                link_bitrate: None,
             },
         )
         .await
@@ -791,6 +792,7 @@ async fn mutation_ids_survive_reconnect_and_reject_changed_payloads() {
                 selection: Some(Selection::default()),
                 start_ms: None,
                 bitmap: Default::default(),
+                link_bitrate: None,
             },
         },
         operation: Some(client.operation()),

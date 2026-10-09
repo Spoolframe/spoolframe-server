@@ -337,6 +337,16 @@ impl ClientProtocol {
                             revision: 0,
                         })
                     }
+                    // A limit the plan already fits changes nothing, and
+                    // its revision stays: told as it is.
+                    (
+                        Response::Ok(Reply::PlaybackChanged { .. }),
+                        Request::LimitPlayback { handle, .. },
+                    ) => this
+                        .services
+                        .playbacks
+                        .revision_of(&handle)
+                        .map(|revision| PlaybackRevision { handle, revision }),
                     (
                         Response::Ok(Reply::PlaybackChanged { .. } | Reply::PlaybackSeeked { .. }),
                         Request::ChangeSubtitle { handle, .. }
@@ -1314,6 +1324,7 @@ impl ClientProtocol {
         let _control = match &request {
             Request::UpdatePlaybackProgress { handle, .. }
             | Request::ChangeSubtitle { handle, .. }
+            | Request::LimitPlayback { handle, .. }
             | Request::SeekPlayback { handle, .. }
             | Request::StopPlayback { handle } => Some(
                 self.services
@@ -1325,6 +1336,7 @@ impl ClientProtocol {
             _ => None,
         };
         if let Request::ChangeSubtitle { handle, .. }
+        | Request::LimitPlayback { handle, .. }
         | Request::SeekPlayback { handle, .. }
         | Request::StopPlayback { handle } = &request
         {
@@ -1963,8 +1975,14 @@ impl ClientProtocol {
                 selection,
                 start_ms,
                 bitmap,
+                link_bitrate,
             } => {
-                let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
+                let caps = state
+                    .hello
+                    .get()
+                    .and_then(|h| h.capabilities.as_ref())
+                    .map(|caps| planner::with_link(caps, link_bitrate));
+                let caps = caps.as_ref();
                 let (path, descriptor) = self.describe(&id).await?;
                 let (selection, chosen) = self
                     .selection(principal, &id, &descriptor, selection)
@@ -2062,6 +2080,7 @@ impl ClientProtocol {
                         file,
                         subtitle,
                         conversion,
+                        link_bitrate,
                         connection: state.number,
                     },
                 );
@@ -2079,6 +2098,7 @@ impl ClientProtocol {
                     audio = %decided.audio,
                     subtitle = %decided.subtitle,
                     start_ms = start_ms.unwrap_or(0),
+                    link_bitrate,
                     "playback started"
                 );
                 Ok(Reply::PlaybackStarted {
@@ -2097,7 +2117,12 @@ impl ClientProtocol {
                 position_ms,
             } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
-                let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
+                let caps = state
+                    .hello
+                    .get()
+                    .and_then(|h| h.capabilities.as_ref())
+                    .map(|caps| planner::with_link(caps, playback.link_bitrate));
+                let caps = caps.as_ref();
                 let (path, descriptor) = self.describe(&playback.item).await?;
                 let selection = Selection {
                     audio: playback.selection.audio,
@@ -2132,10 +2157,81 @@ impl ClientProtocol {
                         file,
                         subtitle,
                         conversion,
+                        link_bitrate: playback.link_bitrate,
                     },
                 );
                 drop(replaced);
                 tracing::info!(id = %playback.item, epoch, "playback's subtitle changed");
+                Ok(Reply::PlaybackChanged { plan, size, epoch })
+            }
+            Request::LimitPlayback {
+                handle,
+                link_bitrate,
+                bitmap,
+                position_ms,
+            } => {
+                let playback = self.use_playback(connection, &handle, &session).await?;
+                let caps = state
+                    .hello
+                    .get()
+                    .and_then(|h| h.capabilities.as_ref())
+                    .map(|caps| planner::with_link(caps, Some(link_bitrate)));
+                let caps = caps.as_ref();
+                let (path, descriptor) = self.describe(&playback.item).await?;
+                let selection = playback.selection;
+                let bitmap = self.bitmap(principal, bitmap).await?;
+                let plan = planner::plan(
+                    &descriptor,
+                    caps,
+                    selection,
+                    bitmap,
+                    &self.services.transcoding.encoders(),
+                    self.services.subtitles.ocr(),
+                );
+                let epoch_now = playback.conversion.as_ref().map_or(0, |c| c.job().epoch);
+                if plan == playback.planned {
+                    // Already fits the link: nothing to restart.
+                    return Ok(Reply::PlaybackChanged {
+                        plan,
+                        size: playback.size,
+                        epoch: epoch_now,
+                    });
+                }
+                // A plan nothing plays under is `CannotPlay` from here, and
+                // the playback goes on as it was, as slow as the link is.
+                let (subtitle, (size, file), conversion) = self
+                    .prepare(
+                        &handle,
+                        &playback.item,
+                        (&path, &descriptor),
+                        &plan,
+                        Some(Duration::from_millis(position_ms)),
+                        Some(&playback),
+                    )
+                    .await?;
+                let epoch = conversion.as_ref().map_or(0, |c| c.job().epoch);
+                let replaced = self.services.playbacks.change(
+                    &handle,
+                    Changed {
+                        planned: plan.clone(),
+                        selection,
+                        size,
+                        file,
+                        subtitle,
+                        conversion,
+                        link_bitrate: Some(link_bitrate),
+                    },
+                );
+                drop(replaced);
+                let decided = planner::summary(&plan);
+                tracing::info!(
+                    id = %playback.item,
+                    epoch,
+                    link_bitrate,
+                    plan = %decided.kind,
+                    video = %decided.video,
+                    "playback planned again for its link"
+                );
                 Ok(Reply::PlaybackChanged { plan, size, epoch })
             }
             Request::StopPlayback { handle } => {
@@ -3010,7 +3106,7 @@ where
 }
 
 /// The address `connection` reaches the server from now, if it is an IP
-/// path (relays are off, so it is).
+/// path; `None` through a relay (P6-03), which hides it.
 fn remote_ip(connection: &Connection) -> Option<std::net::IpAddr> {
     connection
         .paths()

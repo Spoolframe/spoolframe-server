@@ -386,6 +386,18 @@ impl Session {
         self.client.path_of(self.server)
     }
 
+    /// How fast the link to the server carried direct play lately, in bits
+    /// per second (P6-06): over the last few seconds of fetching, or the
+    /// last such reading if it is no more than ten minutes old. `None`
+    /// until enough was read directly to tell.
+    pub fn link_rate(&self) -> Option<u64> {
+        self.client
+            .link(self.server)
+            .meter()
+            .recent(std::time::Instant::now())
+            .map(|bytes| (bytes * 8.0) as u64)
+    }
+
     /// Who this session is, as of sign-in or the last [`Session::whoami`].
     pub fn user(&self) -> &UserSummary {
         &self.user
@@ -661,7 +673,9 @@ impl Session {
     /// (P2-03) starts the server's encode: read it with
     /// [`Session::read_chunk`] (progressive) or [`Session::manifest`] and
     /// [`Session::read_segment`] (HLS). [`SdkError::Busy`] means the
-    /// server is converting all it may.
+    /// server is converting all it may. The link's measured rate
+    /// ([`Session::link_rate`]) goes with it: a slow link starts as a
+    /// conversion sized to it (P6-06).
     pub async fn start_playback_with(
         &self,
         id: &MediaId,
@@ -673,6 +687,7 @@ impl Session {
             selection,
             start_ms: options.start.map(millis),
             bitmap: options.bitmap,
+            link_bitrate: self.link_rate(),
         };
         match self.call(request).await? {
             Reply::PlaybackStarted {
@@ -1033,6 +1048,32 @@ impl Session {
         }
     }
 
+    /// Tell the server the link carries only `link_bitrate` bits per
+    /// second now (P6-06): the playback is planned again for it. A plan
+    /// that changes restarts at `position` as a new epoch: read it from
+    /// offset 0, as after [`Session::change_subtitle`]. One that already
+    /// fits comes back as it is.
+    pub async fn limit_playback(
+        &self,
+        handle: &PlaybackHandle,
+        link_bitrate: u64,
+        bitmap: BitmapSubtitles,
+        position: Duration,
+    ) -> Result<PlaybackChange, SdkError> {
+        let request = Request::LimitPlayback {
+            handle: handle.clone(),
+            link_bitrate,
+            bitmap,
+            position_ms: millis(position),
+        };
+        match self.call(request).await? {
+            Reply::PlaybackChanged { plan, size, epoch } => {
+                Ok(PlaybackChange { plan, size, epoch })
+            }
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// End a playback now, and its encode. Otherwise it ends when it has
     /// not been read for a while.
     pub async fn stop_playback(&self, handle: &PlaybackHandle) -> Result<(), SdkError> {
@@ -1105,7 +1146,7 @@ impl Session {
             epoch,
             segment,
         };
-        match self.read_media(&request).await? {
+        match self.read_media(&request, false).await? {
             (MediaReadResponse::Ok(reply), bytes) => Ok(Chunk {
                 bytes,
                 size: reply.size,
@@ -1121,16 +1162,25 @@ impl Session {
     async fn read_media(
         &self,
         request: &MediaRead,
+        metered: bool,
     ) -> Result<(MediaReadResponse, Vec<u8>), SdkError> {
         let timeouts = self.client.inner.timeouts;
         let revision = self
             .client
             .playback_revision(self.server, &self.token, &request.handle)
             .await?;
+        let meter = metered.then(|| self.client.link(self.server).meter());
+        let meter = meter.as_deref();
         self.client
             .on_connection(self.server, Some(&self.token), true, |conn| async move {
-                conn.read(request, revision, timeouts.of_read(), timeouts.request)
-                    .await
+                conn.read(
+                    request,
+                    revision,
+                    timeouts.of_read(),
+                    timeouts.request,
+                    meter,
+                )
+                .await
             })
             .await
     }
@@ -1194,7 +1244,9 @@ impl Session {
             epoch: 0,
             segment: None,
         };
-        match self.read_media(&request).await? {
+        // Direct reads tell how fast the link is; converted ones wait on
+        // the encode, and would not (P6-06).
+        match self.read_media(&request, true).await? {
             (MediaReadResponse::Ok(_), bytes) => Ok(bytes),
             (MediaReadResponse::Err(e), _) => Err(self.failed(e).await),
         }

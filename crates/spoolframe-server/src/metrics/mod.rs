@@ -492,6 +492,10 @@ impl Metrics {
             .connections
             .as_ref()
             .map_or(0, |c| c.snapshot().len());
+        let (direct, relayed) = sources
+            .connections
+            .as_ref()
+            .map_or((0, 0), Connections::paths);
         families.push(Family {
             name: "spoolframe_connections_open",
             help: "Open connections: app (clients over Iroh) and web (admin API sockets).",
@@ -502,6 +506,15 @@ impl Metrics {
                     &[("kind", "web")],
                     self.web_connections.load(Ordering::Relaxed) as f64,
                 ),
+            ],
+        });
+        families.push(Family {
+            name: "spoolframe_connection_paths",
+            help: "Open app connections by the way they go now: direct to the device, or through a relay.",
+            kind: Kind::Gauge,
+            samples: vec![
+                Sample::labelled(&[("path", "direct")], direct as f64),
+                Sample::labelled(&[("path", "relay")], relayed as f64),
             ],
         });
         let mut samples = Vec::new();

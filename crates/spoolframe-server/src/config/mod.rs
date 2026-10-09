@@ -947,7 +947,7 @@ impl AdminConfig {
     }
 }
 
-/// `network { port = 7420; relay = "disabled"; mdns = true; }`, all
+/// `network { port = 7420; relays = "default"; mdns = true; }`, all
 /// optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
@@ -956,9 +956,14 @@ pub struct NetworkConfig {
     /// when a firewall needs to know.
     #[ucl(default)]
     pub port: Option<u16>,
-    /// `"disabled"` (the default), `"default"` for the public n0 relays,
-    /// or a relay URL. Phase 1 is LAN only and accepts only `"disabled"`;
-    /// the others are parsed so remote access (P6) only has to lift that.
+    /// The relays the endpoint may take its home relay from (P6-03), in
+    /// the style of `admin.trusted_proxies`: a comma-separated list of
+    /// `default` (n0's public relays) and relay URLs. Empty or left out:
+    /// relays off, the server reached on the LAN or at a public address.
+    #[ucl(default)]
+    pub relays: Option<String>,
+    /// The single relay before P6-03. Refused, naming `relays`: a config
+    /// that still sets it meant something by it.
     #[ucl(default)]
     pub relay: Option<String>,
     /// Announce the server on the LAN over mDNS (P1-13), so clients list
@@ -1243,25 +1248,50 @@ impl NetworkConfig {
             .unwrap_or(spoolframe_plex::gdm::PORT)
     }
 
-    /// How to build the endpoint.
-    pub fn endpoint_options(&self) -> Result<EndpointOptions, ConfigError> {
+    /// `relays`, each entry checked: `default` or an http(s) URL, none
+    /// twice. `disabled` is not one: an empty list says that.
+    fn relays(&self) -> Result<Vec<Relay>, ConfigError> {
         let invalid = |message: String| ConfigError::Invalid {
-            key: "network.relay",
+            key: "network.relays",
             message,
         };
-        let relay = match self.relay.as_deref() {
-            None | Some("disabled") => Relay::Disabled,
-            Some("default") => Relay::Default,
-            Some(url) => {
-                Relay::Custom(Url::parse(url).map_err(|e| invalid(format!("{url:?}: {e}")))?)
+        let mut relays = Vec::new();
+        let entries = self.relays.as_deref().unwrap_or_default().split(',');
+        for entry in entries.map(str::trim).filter(|e| !e.is_empty()) {
+            let relay = if entry == "default" {
+                Relay::Default
+            } else {
+                let url = Url::parse(entry).map_err(|e| {
+                    invalid(format!(
+                        "{entry:?}: {e}; an entry is \"default\" or a relay URL, and an \
+                         empty list turns relays off"
+                    ))
+                })?;
+                if !matches!(url.scheme(), "https" | "http") {
+                    return Err(invalid(format!("{entry:?}: a relay URL is http(s)")));
+                }
+                Relay::Custom(url)
+            };
+            if relays.contains(&relay) {
+                return Err(invalid(format!("{entry:?} is listed twice")));
             }
-        };
-        if relay != Relay::Disabled {
-            return Err(invalid(format!(
-                "{:?}: only \"disabled\" is supported until remote access",
-                self.relay.as_deref().unwrap_or_default()
-            )));
+            relays.push(relay);
         }
+        Ok(relays)
+    }
+
+    /// How to build the endpoint.
+    pub fn endpoint_options(&self) -> Result<EndpointOptions, ConfigError> {
+        if let Some(old) = &self.relay {
+            return Err(ConfigError::Invalid {
+                key: "network.relay",
+                message: format!(
+                    "{old:?}: replaced by network.relays, a list of \"default\" and relay \
+                     URLs; empty for none"
+                ),
+            });
+        }
+        let relays = self.relays()?;
         let admission = Admission {
             max_strangers: self
                 .max_stranger_connections
@@ -1293,7 +1323,7 @@ impl NetworkConfig {
         }
         Ok(EndpointOptions {
             port: self.port,
-            relay,
+            relays,
             mdns: self.mdns.unwrap_or(true),
             admission,
             announce: self.announce.announce()?,
@@ -1910,7 +1940,7 @@ mod tests {
     fn the_network_section_is_optional_and_lan_only() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         let options = config.network.endpoint_options().unwrap();
-        assert_eq!(options.relay, Relay::Disabled);
+        assert_eq!(options.relays, []);
         assert_eq!(options.port, None);
         assert!(options.mdns);
     }
@@ -2699,24 +2729,63 @@ mod tests {
         assert!(wan("wan { mapped_port { lookup_via = true; } }").is_err());
     }
 
+    fn relays(list: &str) -> Result<Vec<Relay>, ConfigError> {
+        plex(&format!(
+            r#"plex {{ url = "http://nas:32400"; }} network {{ relays = "{list}"; }}"#
+        ))?
+        .network
+        .endpoint_options()
+        .map(|options| options.relays)
+    }
+
     #[test]
-    fn relays_are_refused_in_phase_1() {
-        for relay in ["default", "https://relay.example.com"] {
-            let err = plex(&format!(
-                r#"plex {{ url = "http://nas:32400"; }} network {{ relay = "{relay}"; }}"#
-            ))
-            .unwrap_err();
+    fn relays_are_a_list_of_default_and_urls_in_order() {
+        let custom = Url::parse("https://relay.example.com").unwrap();
+        assert_eq!(
+            relays(" https://relay.example.com , default").unwrap(),
+            [Relay::Custom(custom), Relay::Default]
+        );
+    }
+
+    #[test]
+    fn an_empty_relay_list_is_relays_off() {
+        assert_eq!(relays("").unwrap(), []);
+        assert_eq!(relays(" , ").unwrap(), []);
+    }
+
+    #[test]
+    fn a_relay_list_with_a_bad_or_repeated_entry_is_refused() {
+        for list in [
+            "disabled",
+            "relay.example.com",
+            "ftp://relay.example.com",
+            "default, default",
+            "https://relay.example.com, https://relay.example.com",
+        ] {
+            let err = relays(list).unwrap_err();
             assert!(
                 matches!(
                     err,
                     ConfigError::Invalid {
-                        key: "network.relay",
+                        key: "network.relays",
                         ..
                     }
                 ),
-                "{relay}: {err:?}"
+                "{list}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_old_relay_key_is_refused_with_a_pointer_to_relays() {
+        let err = plex(r#"plex { url = "http://nas:32400"; } network { relay = "disabled"; }"#)
+            .and_then(|config| config.network.endpoint_options())
+            .unwrap_err();
+        let ConfigError::Invalid { key, message } = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(key, "network.relay");
+        assert!(message.contains("network.relays"), "{message}");
     }
 
     #[test]

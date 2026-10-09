@@ -54,6 +54,7 @@ pub(crate) fn reservation(request: &Request) -> usize {
     match request {
         Request::StartPlayback { .. }
         | Request::ChangeSubtitle { .. }
+        | Request::LimitPlayback { .. }
         | Request::SeekPlayback { .. } => MAX_OUTCOME,
         Request::BeginPasskeySignIn { .. }
         | Request::BeginPasskeyRegistration

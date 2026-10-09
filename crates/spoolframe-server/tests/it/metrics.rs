@@ -160,6 +160,7 @@ async fn start(client: &TestClient, session: &SessionId) -> PlaybackHandle {
                 selection: None,
                 start_ms: None,
                 bitmap: Default::default(),
+                link_bitrate: None,
             },
         )
         .await;
@@ -182,6 +183,8 @@ async fn a_direct_playback_its_reads_and_its_end_move_the_counts() {
         value(metrics, "spoolframe_connections_open", &[("kind", "app")]),
         1.0
     );
+    let path = |path| value(metrics, "spoolframe_connection_paths", &[("path", path)]);
+    assert_eq!((path("direct"), path("relay")), (1.0, 0.0));
 
     let handle = start(&client, &session).await;
     let active = |plan| value(metrics, "spoolframe_playbacks_active", &[("plan", plan)]);

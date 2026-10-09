@@ -8,7 +8,9 @@
 //! and, if that goes unanswered too, dropped (see `Client::call`).
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::LinkMeter;
 
 use futures_util::StreamExt;
 use iroh::endpoint::{
@@ -304,10 +306,25 @@ impl ServerConnection {
         limit: Duration,
         stall: Duration,
     ) -> Result<(ResourceResponse, Vec<u8>), SdkError> {
+        self.resource_metered(request, maximum, limit, stall, None)
+            .await
+    }
+
+    /// [`Self::resource`], its time and bytes counted by `meter` as they
+    /// arrive (P6-06).
+    async fn resource_metered(
+        &self,
+        request: &ResourceRequest,
+        maximum: u64,
+        limit: Duration,
+        stall: Duration,
+        meter: Option<&LinkMeter>,
+    ) -> Result<(ResourceResponse, Vec<u8>), SdkError> {
+        let _metered = meter.map(Metered::begin);
         let (mut recv, response) = exchange(&self.conn, bi::RESOURCE, request, limit).await?;
         let bytes = match &response {
             ResourceResponse::Ready { length, .. } => {
-                body(&self.conn, &mut recv, *length, maximum, stall).await?
+                body(&self.conn, &mut recv, *length, maximum, stall, meter).await?
             }
             ResourceResponse::Error { .. } => Vec::new(),
         };
@@ -346,19 +363,24 @@ impl ServerConnection {
         Ok((response, bytes))
     }
 
+    /// One media read; `meter`, for a direct read, counts how fast it
+    /// arrives (P6-06).
     pub async fn read(
         &self,
         request: &MediaRead,
         revision: u64,
         limit: Duration,
         stall: Duration,
+        meter: Option<&LinkMeter>,
     ) -> Result<(MediaReadResponse, Vec<u8>), SdkError> {
         let maximum = request.length.min(MAX_READ);
         let request = ResourceRequest::Media {
             request: request.clone(),
             revision,
         };
-        let (response, bytes) = self.resource(&request, maximum, limit, stall).await?;
+        let (response, bytes) = self
+            .resource_metered(&request, maximum, limit, stall, meter)
+            .await?;
         let response = match response {
             ResourceResponse::Ready {
                 length,
@@ -503,12 +525,30 @@ fn stream_name(kind: u8) -> &'static str {
 
 /// The `length` bytes after a response frame, and nothing more, with no
 /// pause longer than `stall`.
+/// A read [`LinkMeter`] counts, ended when dropped: a read that fails or
+/// is given up on ends too.
+struct Metered<'a>(&'a LinkMeter);
+
+impl<'a> Metered<'a> {
+    fn begin(meter: &'a LinkMeter) -> Self {
+        meter.begin(Instant::now());
+        Self(meter)
+    }
+}
+
+impl Drop for Metered<'_> {
+    fn drop(&mut self) {
+        self.0.end(Instant::now());
+    }
+}
+
 async fn body(
     conn: &Connection,
     recv: &mut RecvStream,
     length: u64,
     maximum: u64,
     stall: Duration,
+    meter: Option<&LinkMeter>,
 ) -> Result<Vec<u8>, SdkError> {
     if length > maximum {
         return Err(SdkError::Protocol(format!(
@@ -537,6 +577,9 @@ async fn body(
             )));
         }
         bytes.extend_from_slice(&buf[..n]);
+        if let Some(meter) = meter {
+            meter.received(Instant::now(), n as u64);
+        }
     }
     if bytes.len() as u64 != length {
         return Err(SdkError::Protocol(format!(

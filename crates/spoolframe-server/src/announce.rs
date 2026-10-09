@@ -276,15 +276,14 @@ impl std::fmt::Debug for Told {
 
 impl Told {
     /// What `endpoint` tells, as `announce` says, with the URLs of the
-    /// relays it uses and the public addresses `public` has found.
+    /// relays it may use (`network.relays`, in order) and the public
+    /// addresses `public` has found.
     pub(crate) fn new(
         endpoint: Endpoint,
         announce: Announce,
         relays: Vec<String>,
         public: crate::wan::Public,
     ) -> Self {
-        let mut relays = relays;
-        relays.sort();
         Self {
             endpoint,
             announce: Arc::new(announce),
@@ -327,10 +326,22 @@ impl Told {
         &self.public
     }
 
-    /// The URLs of the relays the endpoint uses (`network.relay`), sorted;
-    /// none while relays are off.
+    /// The URLs of the relays the endpoint may use (`network.relays`),
+    /// its home relay now first: the one it is reached through, while the
+    /// rest are where it fails over to (P6-03). None while relays are off.
     pub fn relays(&self) -> Vec<String> {
-        self.relays.as_ref().clone()
+        let mut told: Vec<String> = self
+            .endpoint
+            .addr()
+            .relay_urls()
+            .map(ToString::to_string)
+            .collect();
+        for relay in self.relays.iter() {
+            if !told.contains(relay) {
+                told.push(relay.clone());
+            }
+        }
+        told
     }
 
     /// What a signed-in connection is pushed now: [`Self::addrs`] and

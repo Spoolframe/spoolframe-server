@@ -35,6 +35,7 @@ async fn given(sent: &str) -> (Option<String>, Option<String>) {
                 ping: Duration::from_secs(1),
             },
             lan_discovery: false,
+            ..ClientOptions::default()
         },
     )
     .await

@@ -7,7 +7,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use iroh::endpoint::{QuicTransportConfig, presets};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
+};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use std::time::Duration;
 
@@ -35,6 +37,12 @@ const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// per-path limit is already 15 s, and a connection is no better than its
 /// paths. The lower of this and the server's own limit applies.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How much the server may send on one stream before this device reads
+/// it (P6-06): a direct read's whole block (`reader::BLOCK`). QUIC's
+/// default, 1.25 MB, lets a stream carry only that per round trip, about
+/// 33 Mbit/s at 300 ms, a relay's or another continent's: less than a
+/// remux needs, however few reads are in flight.
+const STREAM_WINDOW: u32 = 8 << 20;
 
 type RevisionState = Arc<tokio::sync::Mutex<Option<u64>>>;
 type PlaybackKey = (EndpointId, String, String);
@@ -104,6 +112,13 @@ pub struct ClientOptions {
     /// [`Client::add_address`]. For tests, and for any app that must not
     /// depend on what else is on the network.
     pub lan_discovery: bool,
+    /// Reach a server through the relays it told this device of, in an
+    /// invite or its addresses (P6-03), when it cannot be dialled
+    /// directly. On by default. Off, the endpoint has no relay transport
+    /// at all: a server is reached only at its addresses, and no relay is
+    /// ever contacted. It is fixed for the life of the [`Client`]: an app
+    /// whose user changes it opens a new one.
+    pub relays: bool,
 }
 
 impl Default for ClientOptions {
@@ -111,6 +126,7 @@ impl Default for ClientOptions {
         Self {
             timeouts: Timeouts::default(),
             lan_discovery: true,
+            relays: true,
         }
     }
 }
@@ -129,6 +145,10 @@ pub(crate) struct Inner {
     pub(crate) discovery: Discovery,
     /// Addresses the app gave for servers, and invites' hints (P6-01).
     pub(crate) manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
+    /// Invites' relays, for a server not saved yet (P6-03).
+    pub(crate) invite_relays: Mutex<HashMap<EndpointId, Vec<String>>>,
+    /// [`ClientOptions::relays`].
+    relays: bool,
     /// Each server's connection and its state.
     links: Mutex<HashMap<EndpointId, Arc<Link>>>,
     /// Serializes read-modify-write of the saved servers and sessions.
@@ -149,10 +169,11 @@ impl std::fmt::Debug for Client {
 
 impl Client {
     /// Open this device: its key from `storage` (made on first start), and
-    /// an endpoint with relays off that listens for servers on the LAN and
-    /// never announces itself. Requests wait for answers as
-    /// [`Timeouts::default`] says. [`Client::open_with_options`] can turn
-    /// the listening off.
+    /// an endpoint that listens for servers on the LAN, never announces
+    /// itself, and reaches a server through the relays it told (P6-03).
+    /// Requests wait for answers as [`Timeouts::default`] says.
+    /// [`Client::open_with_options`] can turn the listening or the relays
+    /// off.
     pub async fn open(storage: Arc<dyn Storage>, device: Device) -> Result<Self, SdkError> {
         Self::open_with(storage, device, Timeouts::default()).await
     }
@@ -181,6 +202,7 @@ impl Client {
         let ClientOptions {
             timeouts,
             lan_discovery,
+            relays,
         } = options;
         let key = load_or_create_key(storage.as_ref()).await?;
         // Minimal: no pkarr or DNS lookup, so a LAN client never tries the
@@ -200,15 +222,25 @@ impl Client {
         };
         let transport = QuicTransportConfig::builder()
             .keep_alive_interval(KEEP_ALIVE)
+            .stream_receive_window(STREAM_WINDOW.into())
             .max_idle_timeout(Some(
                 IDLE_TIMEOUT
                     .try_into()
                     .expect("15 s is a valid idle timeout"),
             ))
             .build();
+        // With relays on, an empty map: no home relay of its own, and so
+        // no relay contacted at start or ever probed. Iroh reaches any
+        // relay a server is dialled through; the server's own list is
+        // where it can be reached.
+        let relay_mode = if relays {
+            RelayMode::Custom(RelayMap::empty())
+        } else {
+            RelayMode::Disabled
+        };
         let endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(key)
-            .relay_mode(RelayMode::Disabled)
+            .relay_mode(relay_mode)
             .transport_config(transport)
             .bind()
             .await
@@ -233,6 +265,8 @@ impl Client {
                 timeouts,
                 discovery,
                 manual: Mutex::default(),
+                invite_relays: Mutex::default(),
+                relays,
                 links: Mutex::default(),
                 saving: tokio::sync::Mutex::default(),
                 revisions: Mutex::default(),
@@ -1139,6 +1173,7 @@ impl Client {
         let limit = self.inner.timeouts.of(&request);
         let handle = match &request {
             Request::ChangeSubtitle { handle, .. }
+            | Request::LimitPlayback { handle, .. }
             | Request::SeekPlayback { handle, .. }
             | Request::StopPlayback { handle } => Some(handle.clone()),
             _ => None,
@@ -1439,6 +1474,26 @@ impl Client {
         while checks.join_next().await.is_some() {}
     }
 
+    /// The relays to reach `id` through: none with relays off, else those
+    /// it told (saved with `pinned`) and an invite's. One that is not a
+    /// URL is left out: what a server tells is not trusted to be one.
+    fn relays_of(&self, id: EndpointId, pinned: Option<&SavedServer>) -> Vec<RelayUrl> {
+        if !self.inner.relays {
+            return Vec::new();
+        }
+        let invited = self.inner.invite_relays.lock().get(&id).cloned();
+        let mut urls: Vec<RelayUrl> = Vec::new();
+        let told = pinned.map(|s| s.relays.clone()).unwrap_or_default();
+        for relay in told.iter().chain(invited.iter().flatten()) {
+            match relay.parse::<RelayUrl>() {
+                Ok(url) if !urls.contains(&url) => urls.push(url),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(relay, error = %e, "not a relay URL; left out"),
+            }
+        }
+        urls
+    }
+
     /// Dial `id`. Once it answers as itself, a saved server's name and
     /// addresses are refreshed; an unsaved one stays unsaved.
     pub(crate) async fn dial(&self, id: EndpointId) -> Result<ServerConnection, SdkError> {
@@ -1446,7 +1501,10 @@ impl Client {
         let pinned = saved.iter().find(|s| s.endpoint_id == id.to_string());
         let heard = self.inner.discovery.get(&id);
         let manual = self.inner.manual.lock().get(&id).cloned();
-        if pinned.is_none() && heard.is_none() && manual.is_none() {
+        // An invite with only relays names a server too (P6-03); with
+        // relays off it is then one with nowhere to dial: unreachable.
+        let invited = self.inner.invite_relays.lock().contains_key(&id);
+        if pinned.is_none() && heard.is_none() && manual.is_none() && !invited {
             return Err(SdkError::UnknownServer(id.to_string()));
         }
         // Every address known: iroh tries them all at once.
@@ -1455,7 +1513,15 @@ impl Client {
             heard.as_ref().map(|h| h.addrs.clone()).unwrap_or_default(),
             pinned.map(SavedServer::addrs).unwrap_or_default(),
         ]);
-        let addr = EndpointAddr::from_parts(id, addrs.iter().copied().map(TransportAddr::Ip));
+        let relays = self.relays_of(id, pinned);
+        let addr = EndpointAddr::from_parts(
+            id,
+            addrs
+                .iter()
+                .copied()
+                .map(TransportAddr::Ip)
+                .chain(relays.into_iter().map(TransportAddr::Relay)),
+        );
         let conn = ServerConnection::dial(
             &self.inner.endpoint,
             addr,

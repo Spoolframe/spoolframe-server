@@ -366,7 +366,13 @@ mod tests {
         assert_eq!(invite.note.as_deref(), Some("Mum's iPad"));
         assert_eq!((invite.uses, invite.uses_left), (4, 4));
         assert_eq!(invite.created_by, "root");
-        assert_eq!(invite.expires_at, store.now() + 7 * DAY);
+        // Made a moment before: a second may have turned since.
+        let expected = store.now() + 7 * DAY;
+        assert!(
+            (expected - 1..=expected).contains(&invite.expires_at),
+            "expires {} for {expected}",
+            invite.expires_at
+        );
     }
 
     #[tokio::test]

@@ -63,7 +63,7 @@ pub const SETTINGS: &[Setting] = &[
     live("plex.servers"),
     live("libraries"),
     restart("network.port"),
-    restart("network.relay"),
+    restart("network.relays"),
     restart("network.mdns"),
     live("network.plex_discovery_port"),
     restart("network.announce.add"),

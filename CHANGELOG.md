@@ -3106,3 +3106,27 @@
   join the known addresses as told ones; `SdkError` gains `NotAnInvite`,
   `InviteInvalid`, `InviteExpired`, `InviteExhausted` and
   `UsernameTaken`.
+- Relays (P6-03): `network.relays` lists the relays the server may take
+  its home relay from, `default` (n0's public relays) and relay URLs,
+  comma-separated; empty, as by default, is relays off. The old
+  `network.relay` is refused at load, pointing to it. The log names the
+  home relay, devices are told the list with it first (in
+  `ServerAddresses` and invite links), and
+  `spoolframe_connection_paths{path="direct"|"relay"}` counts the open
+  app connections by the way they go.
+- The SDK reaches a server through the relays it told, when it cannot be
+  dialled directly: `ClientOptions::relays`, on by default. The device
+  has no relay of its own and contacts none until it dials through one;
+  off, it has no relay transport at all.
+- Media over the Internet (P6-06): the SDK measures the link to each
+  server from its direct reads, all of them together, as they arrive
+  (`Session::link_rate`), and a playback is planned for 75% of it as
+  well as for the device's own cap. Wire revision 9: `StartPlayback`
+  carries `link_bitrate`, and `LimitPlayback` plans a live playback
+  again for a link found slow. A direct play that stalls for 3 s on a
+  link too slow for the file is switched to a conversion where the
+  viewer is; the player makes a new reader on `PlaybackRestarted`.
+- The SDK lets the server send 8 MiB on a stream before reading it, a
+  whole direct read, so a long round trip no longer caps a read at about
+  33 Mbit/s; `reader::Tuning` sets the reads in flight and the
+  read-ahead.

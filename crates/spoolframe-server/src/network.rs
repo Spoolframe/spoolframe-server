@@ -32,15 +32,43 @@ use crate::transcode::Transcoding;
 use crate::watch::Watch;
 use url::Url;
 
-/// Which relays the endpoint uses to reach peers it cannot dial directly.
+/// One entry of `network.relays` (P6-03): relays the endpoint may take
+/// its home relay from, which clients that cannot dial it directly reach
+/// it through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Relay {
-    /// LAN only: no relay, no hole punching. Phase 1.
-    Disabled,
     /// The public n0 relays.
     Default,
-    /// A relay of our own.
+    /// A relay of our own, or anyone's.
     Custom(Url),
+}
+
+/// `relays` as iroh's mode: none is off, `default` alone n0's own, and
+/// any other list one map of every entry, `default` as n0's relays.
+fn relay_mode(relays: &[Relay]) -> RelayMode {
+    match relays {
+        [] => RelayMode::Disabled,
+        [Relay::Default] => RelayMode::Default,
+        _ => RelayMode::Custom(relay_urls(relays).into_iter().collect()),
+    }
+}
+
+/// Every relay URL `relays` names, in their order, `default` expanded to
+/// n0's: what a device is told to reach the server through.
+fn relay_urls(relays: &[Relay]) -> Vec<RelayUrl> {
+    let mut urls: Vec<RelayUrl> = Vec::new();
+    for relay in relays {
+        let more = match relay {
+            Relay::Default => RelayMode::Default.relay_map().urls(),
+            Relay::Custom(url) => vec![RelayUrl::from(url.clone())],
+        };
+        for url in more {
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+    }
+    urls
 }
 
 /// What the server is called (`name`, P3-10): a live setting, so `Hello`,
@@ -72,7 +100,8 @@ impl ServerName {
 pub struct EndpointOptions {
     /// The UDP port to listen on (IPv4 and IPv6); `None` picks a free one.
     pub port: Option<u16>,
-    pub relay: Relay,
+    /// `network.relays`; empty: relays off.
+    pub relays: Vec<Relay>,
     /// Announce the server on the LAN over mDNS (P1-13).
     pub mdns: bool,
     /// Who may hold connections (PX-10).
@@ -117,6 +146,21 @@ impl Connections {
 
     pub(crate) fn admission(&self) -> Admission {
         self.admission
+    }
+
+    /// How many open client connections go straight to their device now,
+    /// and how many through a relay (P6-03): what remote access costs.
+    /// One with no path selected yet is neither.
+    pub fn paths(&self) -> (usize, usize) {
+        let (mut direct, mut relayed) = (0, 0);
+        for peer in self.lock().values() {
+            match peer.relayed() {
+                Some(false) => direct += 1,
+                Some(true) => relayed += 1,
+                None => {}
+            }
+        }
+        (direct, relayed)
     }
 
     /// Every open client connection.
@@ -210,6 +254,43 @@ impl Connections {
                     Ok(true) => {}
                     Ok(false) => self.sign_out(&endpoint),
                     Err(e) => tracing::warn!(error = %e, "cannot check a device's sessions"),
+                }
+            }
+        }
+    }
+}
+
+/// Log the home relay iroh picks from `network.relays` by latency, and
+/// each time it fails over or loses it, until the endpoint closes: the
+/// admin's proof that relays are up (P6-03).
+async fn log_home_relay(endpoint: Endpoint) {
+    use iroh::Watcher as _;
+    let mut status = endpoint.home_relay_status();
+    let closed = endpoint.closed();
+    tokio::pin!(closed);
+    let mut logged: Option<Vec<String>> = None;
+    loop {
+        let connected: Vec<String> = status
+            .get()
+            .iter()
+            .filter(|s| s.is_connected())
+            .map(|s| s.url().to_string())
+            .collect();
+        if logged.as_ref() != Some(&connected) {
+            if connected.is_empty() {
+                if logged.is_some() {
+                    tracing::warn!("no home relay: devices that cannot dial in cannot connect");
+                }
+            } else {
+                tracing::info!(relay = %connected.join(", "), "home relay");
+            }
+            logged = Some(connected);
+        }
+        tokio::select! {
+            () = &mut closed => return,
+            updated = status.updated() => {
+                if updated.is_err() {
+                    return;
                 }
             }
         }
@@ -334,15 +415,10 @@ impl Server {
         name: &ServerName,
         services: Services,
     ) -> Result<Self, NetworkError> {
-        let relay = match &options.relay {
-            Relay::Disabled => RelayMode::Disabled,
-            Relay::Default => RelayMode::Default,
-            Relay::Custom(url) => RelayMode::Custom(RelayUrl::from(url.clone()).into()),
-        };
-        // What a signed-in device is told of them (PX-12).
-        let relays: Vec<String> = relay
-            .relay_map()
-            .urls::<Vec<RelayUrl>>()
+        let relay = relay_mode(&options.relays);
+        // What a signed-in device and an invite are told of them (PX-12,
+        // P6-01), the home relay put first at each ask.
+        let relays: Vec<String> = relay_urls(&options.relays)
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -377,6 +453,9 @@ impl Server {
             .bind()
             .await
             .map_err(|e| bind_failed(e.to_string()))?;
+        if !options.relays.is_empty() {
+            tokio::spawn(log_home_relay(endpoint.clone()));
+        }
 
         // Idle playbacks end on their own, conversions with them.
         let playbacks = Arc::downgrade(&services.playbacks);

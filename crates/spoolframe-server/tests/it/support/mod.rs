@@ -39,7 +39,7 @@ use spoolframe_server::clock::Clock;
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::encode::{JobLimits, Units};
 use spoolframe_server::identity;
-use spoolframe_server::network::{EndpointOptions, Relay, Server, ServerName, Services};
+use spoolframe_server::network::{EndpointOptions, Server, ServerName, Services};
 use spoolframe_server::playback::Playbacks;
 use spoolframe_server::previews::{PreviewSettings, PreviewSources, Previews, When};
 use spoolframe_server::store::Store;
@@ -431,6 +431,8 @@ pub struct ServerOptions {
     /// What finds them: stand-ins, which never reach a router or the
     /// Internet.
     pub finders: spoolframe_server::wan::Finders,
+    /// `network.relays` (P6-03): none unless a test is about them.
+    pub relays: Vec<spoolframe_server::network::Relay>,
 }
 
 impl Default for ServerOptions {
@@ -468,6 +470,7 @@ impl Default for ServerOptions {
             stranger_attempts: spoolframe_server::auth::STRANGER_ATTEMPTS,
             announce: spoolframe_server::announce::Announce::default(),
             wan: None,
+            relays: Vec::new(),
             finders: offline_finders(),
         }
     }
@@ -770,7 +773,7 @@ impl TestServer {
         });
         let endpoint = EndpointOptions {
             port: options.port,
-            relay: Relay::Disabled,
+            relays: options.relays.clone(),
             mdns: options.mdns,
             admission: options.admission,
             announce: options.announce.clone(),
@@ -1331,6 +1334,7 @@ impl TestClient {
         use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
         let control = match &request {
             Request::ChangeSubtitle { handle, .. }
+            | Request::LimitPlayback { handle, .. }
             | Request::SeekPlayback { handle, .. }
             | Request::StopPlayback { handle } => Some(handle),
             _ => None,

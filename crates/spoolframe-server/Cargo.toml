@@ -97,5 +97,7 @@ webauthn-authenticator-rs = { workspace = true }
 chrono = { workspace = true }
 # PGS tracks for the OCR tests.
 spoolframe-media = { workspace = true, features = ["fixtures"] }
+# A real relay on loopback, for the relayed connection tests (P6-03).
+iroh-relay = { version = "1.3", default-features = false, features = ["server"] }
 # Paused time, for the Plex sync's schedule.
 tokio = { workspace = true, features = ["test-util"] }

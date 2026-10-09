@@ -227,12 +227,14 @@ fn every_request_round_trips() {
             selection: Some(Selection::default()),
             start_ms: Some(1_800_000),
             bitmap: BitmapSubtitles::Text,
+            link_bitrate: None,
         },
         Request::StartPlayback {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
             selection: None,
             start_ms: None,
             bitmap: BitmapSubtitles::Auto,
+            link_bitrate: None,
         },
         Request::StopPlayback {
             handle: crate::PlaybackHandle("h".into()),
@@ -1663,6 +1665,7 @@ fn a_request_missing_a_field_is_refused() {
             selection: None,
             start_ms: None,
             bitmap: BitmapSubtitles::Auto,
+            link_bitrate: None,
         },
         &["selection", "start_ms", "bitmap"],
     );

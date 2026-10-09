@@ -45,6 +45,7 @@ async fn client() -> Client {
     let options = ClientOptions {
         timeouts: TIMEOUTS,
         lan_discovery: false,
+        ..ClientOptions::default()
     };
     Client::open_with_options(Arc::new(MemoryStorage::default()), device(), options)
         .await

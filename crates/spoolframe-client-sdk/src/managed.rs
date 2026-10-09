@@ -71,6 +71,21 @@ pub trait PlaybackBackend: Send + Sync + 'static {
     ) -> Result<PlaybackChange, SdkError>;
     async fn progress(&self, handle: &PlaybackHandle, position: Duration) -> Result<(), SdkError>;
     async fn stop(&self, handle: &PlaybackHandle) -> Result<(), SdkError>;
+    /// Plan the playback again for a link found slow
+    /// ([`Session::limit_playback`]). A backend with no link keeps the
+    /// default, which refuses.
+    async fn limit(
+        &self,
+        handle: &PlaybackHandle,
+        link_bitrate: u64,
+        bitmap: BitmapSubtitles,
+        position: Duration,
+    ) -> Result<PlaybackChange, SdkError> {
+        let _ = (handle, link_bitrate, bitmap, position);
+        Err(SdkError::InvalidInput(
+            "this playback backend cannot plan for its link".into(),
+        ))
+    }
     /// An HLS playlist ([`Session::manifest`]). A backend with no HLS
     /// keeps the default, which refuses.
     async fn manifest(
@@ -92,6 +107,11 @@ pub trait PlaybackBackend: Send + Sync + 'static {
     ) -> Result<Chunk, SdkError> {
         let _ = (handle, epoch, n, offset, length);
         Err(no_hls())
+    }
+    /// How fast the link to the server carries media (P6-06), for the
+    /// direct reader to feed. A backend with no link keeps the default.
+    fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
+        None
     }
     /// HLS subtitle segment `n` ([`Session::read_subtitle_segment`]).
     async fn subtitle_segment(
@@ -148,6 +168,15 @@ impl PlaybackBackend for Session {
     async fn stop(&self, h: &PlaybackHandle) -> Result<(), SdkError> {
         self.stop_playback(h).await
     }
+    async fn limit(
+        &self,
+        h: &PlaybackHandle,
+        l: u64,
+        b: BitmapSubtitles,
+        p: Duration,
+    ) -> Result<PlaybackChange, SdkError> {
+        self.limit_playback(h, l, b, p).await
+    }
     async fn manifest(&self, h: &PlaybackHandle, k: ManifestKind) -> Result<String, SdkError> {
         Session::manifest(self, h, k).await
     }
@@ -163,6 +192,9 @@ impl PlaybackBackend for Session {
     }
     async fn subtitle_segment(&self, h: &PlaybackHandle, n: u32) -> Result<Subtitle, SdkError> {
         self.read_subtitle_segment(h, n).await
+    }
+    fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
+        Some(self.client.link(self.server).meter())
     }
 }
 
@@ -391,6 +423,11 @@ impl ManagedPlayback {
     }
     pub fn snapshot(&self) -> Playback {
         self.0.state.lock().playback.clone()
+    }
+    /// The link meter of the server this plays from, if it has one.
+    #[cfg(feature = "media-readers")]
+    pub(crate) fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
+        self.0.backend.link_meter()
     }
     /// The playback after each change: a seek, a subtitle change, or a
     /// resume behind the app's back.
@@ -804,6 +841,64 @@ impl ManagedPlayback {
         }
         let next = state.playback.clone();
         drop(state);
+        self.0.changed.send_replace(next.clone());
+        Ok(next)
+    }
+    /// The link carries only `link_bitrate` bits per second (P6-06): the
+    /// playback is planned again for it where the viewer last was. A plan
+    /// that changes is swapped in for every clone, as a subtitle change's
+    /// is, and readers of the old one are told to make new ones
+    /// ([`SdkError::PlaybackRestarted`]); one that already fits changes
+    /// nothing. The direct reader asks for it when it stalls on a link too
+    /// slow for the file; an app need not.
+    pub async fn limit(&self, link_bitrate: u64) -> Result<Playback, SdkError> {
+        let this = self.clone();
+        self.0
+            .runtime
+            .spawn(async move { this.limit_inner(link_bitrate).await })
+            .await
+            .map_err(|e| SdkError::Protocol(format!("playback control task ended: {e}")))?
+    }
+    async fn limit_inner(&self, link_bitrate: u64) -> Result<Playback, SdkError> {
+        let _control = self.0.control.lock().await;
+        self.flush_locked().await?;
+        let p = self.live()?;
+        let (position, bitmap) = {
+            let state = self.0.state.lock();
+            (state.position.unwrap_or_default(), state.options.bitmap)
+        };
+        let changed = match self
+            .0
+            .backend
+            .limit(&p.handle, link_bitrate, bitmap, position)
+            .await
+        {
+            Ok(changed) => changed,
+            // Started again where the viewer was: the start carries the
+            // link's rate, so it is planned for it as well.
+            Err(SdkError::PlaybackExpired) => {
+                self.restart_locked(&p.handle, Restart::Control { at: position })
+                    .await?;
+                return Ok(self.snapshot());
+            }
+            Err(error) => return Err(error),
+        };
+        if changed.plan == p.plan && changed.epoch == p.epoch {
+            return Ok(p);
+        }
+        let mut state = self.0.state.lock();
+        state.playback.plan = changed.plan;
+        state.playback.size = changed.size;
+        state.playback.epoch = changed.epoch;
+        state.position = Some(position);
+        let next = state.playback.clone();
+        drop(state);
+        tracing::info!(
+            handle = %p.handle.0,
+            link_bitrate,
+            epoch = next.epoch,
+            "the playback was planned again for its link"
+        );
         self.0.changed.send_replace(next.clone());
         Ok(next)
     }

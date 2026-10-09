@@ -52,6 +52,7 @@ pub struct FakeClient {
     path: PathBuf,
     limit: u64,
     grow: Option<u64>,
+    meter: Option<Arc<crate::LinkMeter>>,
 }
 impl FakeClient {
     pub fn new(path: Option<PathBuf>) -> Self {
@@ -59,7 +60,14 @@ impl FakeClient {
             path: path.unwrap(),
             limit: u64::MAX,
             grow: None,
+            meter: None,
         }
+    }
+    /// A link measured by `meter`, which `LimitPlayback` plans for: it
+    /// becomes a progressive conversion, epoch 1.
+    pub fn with_meter(mut self, meter: Arc<crate::LinkMeter>) -> Self {
+        self.meter = Some(meter);
+        self
     }
     pub fn with_read_limit(mut self, limit: u64) -> Self {
         self.limit = limit;
@@ -77,6 +85,8 @@ impl FakeClient {
             bytes: std::fs::read(&self.path).unwrap(),
             limit: self.limit,
             grow: self.grow,
+            meter: self.meter.clone(),
+            limits: Mutex::default(),
             state: Mutex::new(TestState::default()),
         }))
     }
@@ -90,6 +100,9 @@ pub struct TestBackend {
     bytes: Vec<u8>,
     limit: u64,
     grow: Option<u64>,
+    meter: Option<Arc<crate::LinkMeter>>,
+    /// The link rates `limit` was asked for.
+    pub limits: Mutex<Vec<u64>>,
     state: Mutex<TestState>,
 }
 impl TestBackend {
@@ -225,5 +238,29 @@ impl PlaybackBackend for TestBackend {
     async fn stop(&self, h: &PlaybackHandle) -> Result<(), SdkError> {
         self.state.lock().handles.remove(&h.0);
         Ok(())
+    }
+    fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
+        self.meter.clone()
+    }
+    async fn limit(
+        &self,
+        _: &PlaybackHandle,
+        link_bitrate: u64,
+        _: BitmapSubtitles,
+        _: Duration,
+    ) -> Result<PlaybackChange, SdkError> {
+        self.limits.lock().push(link_bitrate);
+        Ok(PlaybackChange {
+            plan: PlaybackPlan::Converted {
+                delivery: Delivery::Progressive,
+                container: Container::Matroska,
+                video: None,
+                audio: None,
+                subtitle: None,
+                reasons: vec![],
+            },
+            size: 0,
+            epoch: 1,
+        })
     }
 }

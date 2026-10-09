@@ -27,7 +27,7 @@ use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -190,6 +190,12 @@ pub enum Request {
         start_ms: Option<u64>,
         /// How a picked bitmap subtitle is shown (P2-07).
         bitmap: BitmapSubtitles,
+        /// What the device measured its link to the server carrying lately,
+        /// bits per second (P6-06); `None`: it has not measured it. The
+        /// playback is planned for a share of it as well as for the
+        /// capabilities' `max_bitrate`.
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        link_bitrate: Option<u64>,
     },
     /// End a playback now, and any encode for it.
     StopPlayback {
@@ -365,6 +371,19 @@ pub enum Request {
     ChangeSubtitle {
         handle: PlaybackHandle,
         subtitle: Option<u32>,
+        bitmap: BitmapSubtitles,
+        position_ms: u64,
+    },
+    /// The device's link to the server carries only `link_bitrate` bits
+    /// per second now (P6-06): a direct play that stalls on it. The
+    /// playback is planned again for a share of it, with the same tracks
+    /// and `bitmap` as `ChangeSubtitle` takes it. A plan that changes
+    /// restarts at `position_ms` as a new epoch, from offset 0, as
+    /// `ChangeSubtitle` does; one that does not is answered as it is,
+    /// nothing restarted. `PlaybackChanged`.
+    LimitPlayback {
+        handle: PlaybackHandle,
+        link_bitrate: u64,
         bitmap: BitmapSubtitles,
         position_ms: u64,
     },
@@ -763,8 +782,9 @@ pub enum Reply {
     PlexLink {
         link: Option<PlexLink>,
     },
-    /// The playback's new plan after `ChangeSubtitle`: read `epoch` (0 for
-    /// direct play), whose size is `size` (0 while a conversion writes it).
+    /// The playback's new plan after `ChangeSubtitle` or `LimitPlayback`:
+    /// read `epoch` (0 for direct play), whose size is `size` (0 while a
+    /// conversion writes it).
     PlaybackChanged {
         plan: PlaybackPlan,
         size: u64,
@@ -1165,8 +1185,9 @@ pub enum Event {
         /// text: `192.168.1.10:4433` or `[2001:db8::1]:4433`.
         #[serde(with = "socket_addrs_as_text")]
         addrs: Vec<std::net::SocketAddr>,
-        /// The URLs of the iroh relays the server uses (`network.relay`);
-        /// empty while relays are off.
+        /// The URLs of the iroh relays the server may use
+        /// (`network.relays`), its home relay now first; empty while
+        /// relays are off.
         relays: Vec<String>,
     },
     /// An event type this build does not know; ignore it.

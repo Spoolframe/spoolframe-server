@@ -142,6 +142,16 @@ impl Peer {
         }
     }
 
+    /// Whether its connection goes through a relay now (P6-03); `None`
+    /// before iroh has selected a path.
+    pub(crate) fn relayed(&self) -> Option<bool> {
+        self.connection
+            .paths()
+            .iter()
+            .find(|path| path.is_selected())
+            .map(|path| matches!(path.remote_addr(), iroh::TransportAddr::Relay(_)))
+    }
+
     /// Whether the device is signed in: its connection has the normal
     /// limits.
     pub fn known(&self) -> bool {

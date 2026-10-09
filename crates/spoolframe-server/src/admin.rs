@@ -1277,7 +1277,7 @@ fn recent(user: &ApiSessionUser) -> RpcResult<()> {
 /// every span, metric and log record, refusal lines with usernames
 /// among them, and its headers are a secret sent with each export.
 /// And the network (`network.*`, finding 61): the endpoint's port and
-/// relay, the addresses it announces and its public ones (`network.wan`,
+/// relays, the addresses it announces and its public ones (`network.wan`,
 /// P6-02) are where signed-in devices are told to connect. Pinning keeps
 /// another host from passing for this server, but a device still
 /// connects out to an address it is given and so shows where it is.

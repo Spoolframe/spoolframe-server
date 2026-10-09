@@ -4,6 +4,12 @@
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{AudioCodec, Container, Delivery, SubtitleFormat, VideoCodec};
 
+/// Of a link's measured rate, the share a playback is planned for
+/// (P6-06): the rest is room for the link's swings and for the requests,
+/// artwork and progress reports that share it. The server plans for it,
+/// and the SDK asks for a new plan when a file needs more than it.
+pub const LINK_SHARE: f64 = 0.75;
+
 /// The tracks a client wants, as positions in the item's `MediaTracks`
 /// lists. Only these count: a track the user did not pick never blocks
 /// playback.

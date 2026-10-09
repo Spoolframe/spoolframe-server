@@ -217,6 +217,15 @@ impl Client {
             let known = manual.remove(&id).unwrap_or_default();
             manual.insert(id, listed([invite.addrs.clone(), known]));
         }
+        if !invite.relays.is_empty() {
+            let mut invited = self.inner.invite_relays.lock();
+            let known = invited.entry(id).or_default();
+            for relay in &invite.relays {
+                if !known.contains(relay) {
+                    known.push(relay.clone());
+                }
+            }
+        }
         self.link(id).connection(self).await
     }
 }

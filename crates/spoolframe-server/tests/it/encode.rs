@@ -53,6 +53,7 @@ async fn start(client: &TestClient, session: &SessionId, start_ms: Option<u64>) 
                 selection: None,
                 start_ms,
                 bitmap: Default::default(),
+                link_bitrate: None,
             },
         )
         .await
@@ -1892,6 +1893,7 @@ async fn an_hls_playback_carries_its_subtitle_as_a_webvtt_rendition() {
                 }),
                 start_ms: None,
                 bitmap: Default::default(),
+                link_bitrate: None,
             },
         )
         .await;
@@ -1968,6 +1970,7 @@ async fn an_hls_playback_reads_a_vobsub_or_dvb_track_into_its_webvtt_rendition()
                     }),
                     start_ms: None,
                     bitmap: Default::default(),
+                    link_bitrate: None,
                 },
             )
             .await;
@@ -2205,6 +2208,7 @@ async fn a_burned_in_subtitle_shows_in_the_picture_where_it_was_placed() {
                 }),
                 start_ms: None,
                 bitmap: BitmapSubtitles::BurnIn,
+                link_bitrate: None,
             },
         )
         .await;
@@ -2266,6 +2270,7 @@ async fn burned_sidecar(
                 }),
                 start_ms,
                 bitmap: BitmapSubtitles::BurnIn,
+                link_bitrate: None,
             },
         )
         .await;
@@ -2374,6 +2379,7 @@ async fn a_copied_pgs_file_beside_the_film_keeps_its_cues_times() {
                 }),
                 start_ms: None,
                 bitmap: Default::default(),
+                link_bitrate: None,
             },
         )
         .await;
@@ -2439,6 +2445,7 @@ async fn a_copied_vobsub_file_beside_the_film_is_in_the_output() {
                 }),
                 start_ms: None,
                 bitmap: Default::default(),
+                link_bitrate: None,
             },
         )
         .await;
@@ -2539,6 +2546,137 @@ async fn a_segment_gone_before_it_is_opened_is_not_an_empty_segment() {
     // Not ready: the client asks again.
     assert_eq!((reply.complete, reply.size, reply.sent), (false, 0, 0));
     assert!(bytes.is_empty());
+    client.close().await;
+    server.stop().await;
+}
+
+/// A link too slow for the generated file (P6-06): its share is under
+/// the file's bitrate, whatever x264 made it.
+const SLOW_LINK: u64 = 100_000;
+
+/// A device that plays the generated file itself, by range, and takes a
+/// progressive stream when it cannot.
+fn range_or_progressive() -> ClientCapabilities {
+    use spoolframe_types::{AudioCodec, Container, Delivery, VideoCodec};
+    ClientCapabilities {
+        video: [VideoCodec::H264].into(),
+        audio: [AudioCodec::Ac3, AudioCodec::Aac].into(),
+        containers: [Container::Matroska].into(),
+        delivery: vec![Delivery::Range, Delivery::Progressive],
+        ..ClientCapabilities::default()
+    }
+}
+
+async fn ready_for_range(test: &str) -> (TestServer, TestClient, SessionId) {
+    let server = TestServer::start_with(
+        fresh_dir(test).await,
+        ServerOptions {
+            real_media: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_media(12, "libx264", "ac3");
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client.hello_with(None, Some(range_or_progressive())).await;
+    let session = client.login("alice", "correct horse").await;
+    (server, client, session)
+}
+
+async fn start_on_link(
+    client: &TestClient,
+    session: &SessionId,
+    link_bitrate: Option<u64>,
+) -> (PlaybackHandle, PlaybackPlan) {
+    let response = client
+        .call(
+            Some(session),
+            Request::StartPlayback {
+                id: movie().id().clone(),
+                selection: None,
+                start_ms: None,
+                bitmap: Default::default(),
+                link_bitrate,
+            },
+        )
+        .await;
+    match response {
+        Response::Ok(Reply::PlaybackStarted { handle, plan, .. }) => (handle, plan),
+        other => panic!("not started: {other:?}"),
+    }
+}
+
+async fn limit(
+    client: &TestClient,
+    session: &SessionId,
+    handle: &PlaybackHandle,
+    link_bitrate: u64,
+) -> (PlaybackPlan, u32) {
+    let response = client
+        .call(
+            Some(session),
+            Request::LimitPlayback {
+                handle: handle.clone(),
+                link_bitrate,
+                bitmap: Default::default(),
+                position_ms: 4_000,
+            },
+        )
+        .await;
+    match response {
+        Response::Ok(Reply::PlaybackChanged { plan, epoch, .. }) => (plan, epoch),
+        other => panic!("not changed: {other:?}"),
+    }
+}
+
+/// The video's encode in `plan`, if it is encoded.
+fn encoded_video(plan: &PlaybackPlan) -> Option<Option<u64>> {
+    use spoolframe_protocol::ConvertedVideo;
+    match plan {
+        PlaybackPlan::Converted {
+            video: Some(ConvertedVideo::Encode { max_bitrate, .. }),
+            ..
+        } => Some(*max_bitrate),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn a_device_that_measured_a_slow_link_starts_with_an_encode() {
+    let (server, client, session) = ready_for_range("link-start-slow").await;
+    let (_, plan) = start_on_link(&client, &session, Some(SLOW_LINK)).await;
+    assert!(
+        encoded_video(&plan).is_some_and(|cap| cap.is_some()),
+        "{plan:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_direct_play_on_a_link_found_slow_is_planned_again_as_an_encode() {
+    let (server, client, session) = ready_for_range("link-limit-slow").await;
+    let (handle, plan) = start_on_link(&client, &session, None).await;
+    assert!(matches!(plan, PlaybackPlan::Direct { .. }), "{plan:?}");
+    let (plan, epoch) = limit(&client, &session, &handle, SLOW_LINK).await;
+    assert!(
+        encoded_video(&plan).is_some_and(|cap| cap.is_some()),
+        "{plan:?}"
+    );
+    // The encode runs: its output is read from the new epoch.
+    let (bytes, _) = read_all(&client, &session, &handle, epoch).await;
+    assert!(!bytes.is_empty());
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_link_fast_enough_leaves_the_playback_as_it_is() {
+    let (server, client, session) = ready_for_range("link-limit-fast").await;
+    let (handle, before) = start_on_link(&client, &session, None).await;
+    let (after, epoch) = limit(&client, &session, &handle, 1_000_000_000).await;
+    assert_eq!((after, epoch), (before, 0));
     client.close().await;
     server.stop().await;
 }

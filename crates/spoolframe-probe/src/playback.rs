@@ -145,6 +145,7 @@ pub(crate) async fn playback_ownership(
         selection: plain(),
         start_ms: None,
         bitmap: BitmapSubtitles::Auto,
+        link_bitrate: None,
     };
     let (handle, size) = match probe.request(&conn, Some(&a.session), start).await? {
         Response::Ok(Reply::PlaybackStarted {

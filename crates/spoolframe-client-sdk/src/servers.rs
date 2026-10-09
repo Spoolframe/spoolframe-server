@@ -101,9 +101,9 @@ pub(crate) struct SavedServer {
     #[serde(default)]
     pub last_connected_at: Option<u64>,
     /// The URLs of the relays the server said it uses (revision 7), as its
-    /// last `ServerAddresses` event listed them. Kept for when this device
-    /// dials through relays; it does not yet. Absent from a file written
-    /// before the SDK kept them: none.
+    /// last `ServerAddresses` event listed them, and an invite's: what
+    /// this device dials it through with relays on (P6-03). Absent from a
+    /// file written before the SDK kept them: none.
     #[serde(default)]
     pub relays: Vec<String>,
     /// The addresses of the server's last `ServerAddresses` event, in its

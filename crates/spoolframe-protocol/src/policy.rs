@@ -31,7 +31,9 @@ pub fn server_wait(request: &Request) -> Duration {
         Request::Tracks { .. }
         | Request::PlaybackPlan { .. }
         | Request::SetTrackOverride { .. } => wait::PROBE,
-        Request::StartPlayback { .. } | Request::ChangeSubtitle { .. } => wait::PLAYBACK,
+        Request::StartPlayback { .. }
+        | Request::ChangeSubtitle { .. }
+        | Request::LimitPlayback { .. } => wait::PLAYBACK,
         _ => Duration::ZERO,
     }
 }
@@ -89,6 +91,7 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::StopPlayback { .. }
         | Request::SeekPlayback { .. }
         | Request::ChangeSubtitle { .. }
+        | Request::LimitPlayback { .. }
         // PINs: a wrong one counts towards the lock-out.
         | Request::SetPin { .. }
         | Request::ClearPin { .. }

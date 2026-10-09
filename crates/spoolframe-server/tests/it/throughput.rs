@@ -43,6 +43,7 @@ async fn read_a_large_file() {
                 selection: Some(Selection::default()),
                 start_ms: None,
                 bitmap: Default::default(),
+                link_bitrate: None,
             },
         )
         .await

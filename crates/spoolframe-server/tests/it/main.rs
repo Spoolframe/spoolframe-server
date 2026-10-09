@@ -40,6 +40,7 @@ mod profile;
 mod protocol;
 mod recent_admin;
 mod refusals;
+mod relays;
 mod sdk;
 mod search;
 mod server_addresses;

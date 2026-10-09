@@ -20,6 +20,7 @@ mod discovery;
 mod error;
 mod invites;
 mod link;
+mod link_meter;
 mod servers;
 mod session;
 pub mod storage;
@@ -29,6 +30,7 @@ pub use connection::Timeouts;
 pub use error::SdkError;
 pub use invites::InviteInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
+pub use link_meter::LinkMeter;
 pub use servers::ServerEntry;
 pub use session::{
     ActiveProfile, Chunk, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange, PlaybackOptions,

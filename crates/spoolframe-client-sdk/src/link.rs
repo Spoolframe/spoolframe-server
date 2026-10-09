@@ -22,6 +22,7 @@
 //! Any other failed dial is tried again after [`FIRST_RETRY`], doubling
 //! up to [`MAX_RETRY`], each wait moved by up to [`JITTER`] either way.
 
+use crate::link_meter::LinkMeter;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -80,8 +81,8 @@ pub enum ConnectionPath {
     /// Straight to a public address, across the internet: through an open
     /// port or a hole punched in NAT.
     Direct { addr: SocketAddr },
-    /// Through a relay server. Relays are off in this build, so it is not
-    /// seen yet.
+    /// Through a relay server: one the server told this device of, with
+    /// [`crate::ClientOptions::relays`] on (P6-03).
     Relay,
     /// Not connected now, or no path selected yet.
     Unknown,
@@ -198,6 +199,8 @@ pub(crate) struct Link {
     /// One first dial at a time.
     dialing: tokio::sync::Mutex<()>,
     supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// How fast media comes from the server (P6-06), across connections.
+    meter: Arc<LinkMeter>,
 }
 
 impl Link {
@@ -211,7 +214,13 @@ impl Link {
             info: Mutex::default(),
             dialing: tokio::sync::Mutex::default(),
             supervisor: Mutex::default(),
+            meter: Arc::default(),
         })
+    }
+
+    /// How fast media comes from the server (P6-06).
+    pub fn meter(&self) -> Arc<LinkMeter> {
+        self.meter.clone()
     }
 
     pub fn id(&self) -> EndpointId {

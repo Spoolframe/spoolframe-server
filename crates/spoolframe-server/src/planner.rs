@@ -151,6 +151,20 @@ pub fn plan(
     }
 }
 
+pub use spoolframe_protocol::playback::LINK_SHARE;
+
+/// `caps` for a device whose link carries `link_bitrate` bits per second
+/// (P6-06): its `max_bitrate` lowered to [`LINK_SHARE`] of the link, if
+/// that is lower. A device that measured nothing keeps its own cap.
+pub fn with_link(caps: &ClientCapabilities, link_bitrate: Option<u64>) -> ClientCapabilities {
+    let mut caps = caps.clone();
+    if let Some(link) = link_bitrate {
+        let share = (link as f64 * LINK_SHARE) as u64;
+        caps.max_bitrate = Some(caps.max_bitrate.map_or(share, |own| own.min(share)));
+    }
+    caps
+}
+
 /// The plan for a client that sent no capabilities: nothing can be
 /// promised to play.
 pub fn plan_without_capabilities() -> PlaybackPlan {
@@ -1254,6 +1268,31 @@ mod tests {
             ),
             "{reasons:?}"
         );
+    }
+
+    #[test]
+    fn a_link_lowers_the_cap_to_its_share() {
+        let caps = avplayer();
+        assert_eq!(
+            with_link(&caps, Some(20_000_000)).max_bitrate,
+            Some(15_000_000)
+        );
+    }
+
+    #[test]
+    fn a_fast_link_leaves_the_device_s_own_cap() {
+        let mut caps = avplayer();
+        caps.max_bitrate = Some(8_000_000);
+        assert_eq!(
+            with_link(&caps, Some(100_000_000)).max_bitrate,
+            Some(8_000_000)
+        );
+    }
+
+    #[test]
+    fn no_measurement_leaves_the_caps_as_they_are() {
+        let caps = avplayer();
+        assert_eq!(with_link(&caps, None), caps);
     }
 
     #[test]

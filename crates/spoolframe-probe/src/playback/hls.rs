@@ -130,6 +130,7 @@ pub(super) async fn converted(
         selection: plain(),
         start_ms: None,
         bitmap: BitmapSubtitles::Auto,
+        link_bitrate: None,
     };
     let handle = match probe.request(&conn, Some(&a.session), start).await? {
         Response::Ok(Reply::PlaybackStarted { handle, plan, .. }) => {

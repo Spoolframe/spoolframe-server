@@ -84,9 +84,13 @@ network {
   # The UDP port. Left out, a free one is picked at every start; fix it
   # when a firewall needs to know.
   # port = 7420;
-  # "disabled", "default" (the public relays) or a relay URL. Only
-  # "disabled" until remote access.
-  relay = "disabled";
+  # The relays the server may take its home relay from: a comma-separated
+  # list of "default" (n0's public relays) and relay URLs, as
+  # "default, https://relay.example.com". Devices that cannot dial the
+  # server directly reach it through its home relay, and invites carry the
+  # list. Empty: relays off, the server reached only on the LAN or at a
+  # public address.
+  relays = "";
   # Announce the server on the LAN over mDNS, so clients find it.
   mdns = true;
   # The UDP port the setup wizard's search for Plex servers on the LAN

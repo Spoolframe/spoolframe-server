@@ -2024,3 +2024,47 @@ async fn a_progressive_managed_playback_idled_out_says_where_it_resumed() {
     client.close().await;
     server.stop().await;
 }
+
+/// Direct reads tell the session how fast its link is (P6-06), and the
+/// next playback starts from it.
+#[tokio::test]
+async fn direct_reads_give_the_session_its_link_rate() {
+    let (server, client, _) = ready("sdk-link-rate").await;
+    server.write_media(16 << 20);
+    let alice = alice(&server, &client).await;
+    assert_eq!(alice.link_rate(), None);
+    let playback = alice
+        .open_playback(movie().id(), None, PlaybackOptions::default())
+        .await
+        .unwrap();
+    let bytes = playback.read(0, 8 << 20).await.unwrap();
+    assert_eq!(bytes.len(), 8 << 20);
+    assert!(alice.link_rate().is_some_and(|rate| rate > 0));
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// A limit the plan already fits changes nothing, and the playback's
+/// controls go on with the revision the server has: a subtitle change
+/// after it is not a conflict.
+#[tokio::test]
+async fn a_limit_the_plan_fits_leaves_the_playback_and_its_controls() {
+    let (server, client, _) = ready("sdk-link-limit-fits").await;
+    server.write_media(1 << 20);
+    let alice = alice(&server, &client).await;
+    let playback = alice
+        .open_playback(movie().id(), None, PlaybackOptions::default())
+        .await
+        .unwrap();
+    let before = playback.snapshot();
+    let after = playback.limit(10_000_000_000).await.unwrap();
+    assert_eq!(after, before);
+    playback
+        .change_subtitle(None, Default::default(), Duration::ZERO)
+        .await
+        .unwrap();
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}

@@ -22,7 +22,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{ManagedPlayback, SdkError as BackendError};
-use spoolframe_protocol::MAX_READ;
+use spoolframe_protocol::playback::LINK_SHARE;
+use spoolframe_protocol::{MAX_READ, PlaybackPlan};
 use std::{future::Future, pin::Pin};
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -49,6 +50,32 @@ pub const MAX_IN_FLIGHT: usize = 4;
 const EXPECT_IN_FLIGHT: usize = 2;
 /// How often a waiting read reports progress while buffering.
 const REPORT_EVERY: Duration = Duration::from_millis(250);
+/// How long an underrun goes on before the reader asks whether the link
+/// can carry the file at all (P6-06): a short one is a swing.
+pub const LIMIT_AFTER: Duration = Duration::from_secs(3);
+
+/// How hard the reader works the link (P6-06). The defaults,
+/// [`MAX_IN_FLIGHT`] and [`TARGET_AHEAD`], suit the LAN and most of the
+/// Internet. A link with a long round trip carries more with more reads
+/// in flight, each a block; one that swings needs more ahead. An app
+/// that lets its user change them passes them to
+/// [`MediaReader::with_tuning`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tuning {
+    /// Read-ahead fetches in flight at once, at least 1.
+    pub in_flight: usize,
+    /// How much playback is kept fetched ahead of the playhead.
+    pub target_ahead: Duration,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            in_flight: MAX_IN_FLIGHT,
+            target_ahead: TARGET_AHEAD,
+        }
+    }
+}
 
 /// Runs a fetch somewhere it can await the network: the app passes its
 /// tokio runtime, tests a thread.
@@ -74,7 +101,8 @@ pub struct Status {
     /// What the reader aims for.
     pub target: Option<Duration>,
     pub in_flight: usize,
-    /// Recent fetch throughput, bytes per second.
+    /// The link's recent rate, bytes per second: what every fetch in
+    /// flight carried together over the time any was (P6-06).
     pub throughput: Option<f64>,
 }
 
@@ -163,9 +191,12 @@ pub struct MediaReader {
 
 struct Shared {
     playback: ManagedPlayback,
+    /// The server's link meter: how fast direct reads arrive.
+    meter: Option<Arc<crate::LinkMeter>>,
     size: u64,
     /// Bytes per second of playback, when the length is known.
     bitrate: Option<f64>,
+    tuning: Tuning,
     ahead: u64,
     spawn: Spawn,
     state: Mutex<State>,
@@ -183,10 +214,15 @@ struct State {
     /// Where reading is expected to go next (a resume), held against
     /// eviction until a read reaches it; see [`MediaReader::expect`].
     expected: Option<u64>,
-    /// An average of recent fetch throughput, bytes per second.
+    /// An average of recent fetch throughput, bytes per second: each
+    /// fetch's own, for a backend with no link meter.
     throughput: Option<f64>,
     /// The reader was dropped: fetches still running start no more.
     stopped: bool,
+    /// A stall made the reader ask for a plan the link can carry (P6-06).
+    limit_asked: bool,
+    /// The playback was planned again: reads are over, with this epoch.
+    replanned: Option<u32>,
 }
 
 impl Drop for MediaReader {
@@ -201,10 +237,25 @@ impl MediaReader {
     /// tracks and replaces expired handles for all readers and controls.
     /// With the item's `length` read-ahead is a time; without, a few blocks.
     pub fn new(playback: ManagedPlayback, spawn: Spawn, length: Option<Duration>) -> Self {
+        Self::with_tuning(playback, spawn, length, Tuning::default())
+    }
+
+    /// [`MediaReader::new`], working the link as `tuning` says (P6-06).
+    pub fn with_tuning(
+        playback: ManagedPlayback,
+        spawn: Spawn,
+        length: Option<Duration>,
+        tuning: Tuning,
+    ) -> Self {
+        let tuning = Tuning {
+            in_flight: tuning.in_flight.max(1),
+            ..tuning
+        };
         let size = playback.snapshot().size;
         let length = length.filter(|l| !l.is_zero());
         MediaReader {
             shared: Arc::new(Shared {
+                meter: playback.link_meter(),
                 playback,
                 size,
                 // None for a size of 0 too: a rate of 0 made status()'s
@@ -212,7 +263,8 @@ impl MediaReader {
                 bitrate: length
                     .map(|l| size as f64 / l.as_secs_f64())
                     .filter(|rate| *rate > 0.0),
-                ahead: ahead_blocks(size, length, TARGET_AHEAD),
+                tuning,
+                ahead: ahead_blocks(size, length, tuning.target_ahead),
                 spawn,
                 state: Mutex::new(State {
                     blocks: HashMap::new(),
@@ -224,6 +276,8 @@ impl MediaReader {
                     expected: None,
                     throughput: None,
                     stopped: false,
+                    limit_asked: false,
+                    replanned: None,
                 }),
                 changed: Condvar::new(),
             }),
@@ -308,9 +362,14 @@ impl MediaReader {
                 .shared
                 .bitrate
                 .map(|rate| Duration::from_secs_f64(ready_bytes as f64 / rate)),
-            target: self.shared.bitrate.map(|_| TARGET_AHEAD),
+            target: self.shared.bitrate.map(|_| self.shared.tuning.target_ahead),
             in_flight: state.pending.len(),
-            throughput: state.throughput,
+            throughput: self
+                .shared
+                .meter
+                .as_ref()
+                .and_then(|meter| meter.rate(Instant::now()))
+                .or(state.throughput),
         }
     }
 
@@ -331,11 +390,14 @@ impl MediaReader {
             .max(1)
             .min(shared.size.saturating_sub(index * BLOCK));
         let mut reported = false;
+        let stalled = Instant::now();
         loop {
             // Leaving early still ends a buffering this read started:
             // GstPlay pauses under 100 and plays again only at 100.
             let early = if state.flushing {
                 Some(ReadError::Flushing)
+            } else if let Some(epoch) = state.replanned {
+                Some(BackendError::PlaybackRestarted { epoch }.into())
             } else {
                 state.failed.remove(&index).map(ReadError::from)
             };
@@ -361,6 +423,9 @@ impl MediaReader {
                     }
                     return Ok(block);
                 }
+            }
+            if underrun && stalled.elapsed() >= LIMIT_AFTER {
+                shared.limit_if_too_slow(&shared.clone(), &mut state);
             }
             if underrun {
                 // A read-ahead block that failed is fetched again here:
@@ -388,8 +453,12 @@ impl MediaReader {
         let index = offset.min(self.shared.size.saturating_sub(1)) / BLOCK;
         let mut state = self.shared.lock();
         state.expected = Some(index);
-        self.shared
-            .top_up_to(&self.shared.clone(), &mut state, index, EXPECT_IN_FLIGHT);
+        self.shared.top_up_to(
+            &self.shared.clone(),
+            &mut state,
+            index,
+            self.shared.expect_in_flight(),
+        );
     }
 
     /// Starts fetches up to the in-flight limit, nearest first; for tests
@@ -404,6 +473,12 @@ impl MediaReader {
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock()
+    }
+
+    /// Fetch slots a resume's place may take: [`EXPECT_IN_FLIGHT`], or
+    /// fewer when fewer are in flight at all.
+    fn expect_in_flight(&self) -> usize {
+        EXPECT_IN_FLIGHT.min(self.tuning.in_flight)
     }
 
     /// The last block of the file.
@@ -458,7 +533,7 @@ impl Shared {
     /// Queues the blocks from `from` through the read-ahead, nearest
     /// first, up to the in-flight limit.
     fn top_up(&self, this: &Arc<Self>, state: &mut State, from: u64) {
-        self.top_up_to(this, state, from, MAX_IN_FLIGHT);
+        self.top_up_to(this, state, from, self.tuning.in_flight);
     }
 
     /// The same, stopping once `limit` fetches are in flight.
@@ -513,7 +588,8 @@ impl Shared {
                 let from = state.last_block.unwrap_or(index);
                 self.top_up(&self, &mut state, from);
                 if let Some(expected) = state.expected {
-                    self.top_up_to(&self, &mut state, expected, EXPECT_IN_FLIGHT);
+                    let limit = self.expect_in_flight();
+                    self.top_up_to(&self, &mut state, expected, limit);
                 }
             }
             Err(error) => {
@@ -522,6 +598,47 @@ impl Shared {
         }
         drop(state);
         self.changed.notify_all();
+    }
+
+    /// Through a long underrun: when the link's measured rate cannot
+    /// carry the file (its share of the link, [`LINK_SHARE`], is under
+    /// the file's bitrate), ask once for the playback to be planned for
+    /// the link (P6-06). A new plan ends this reader: its reads are then
+    /// [`BackendError::PlaybackRestarted`], and the player makes a new
+    /// one from the playback's snapshot, as after a subtitle change.
+    fn limit_if_too_slow(&self, this: &Arc<Self>, state: &mut State) {
+        if state.limit_asked || state.stopped {
+            return;
+        }
+        let (Some(meter), Some(bitrate)) = (&self.meter, self.bitrate) else {
+            return;
+        };
+        let Some(rate) = meter.rate(Instant::now()) else {
+            return;
+        };
+        if rate * LINK_SHARE >= bitrate {
+            return;
+        }
+        state.limit_asked = true;
+        let link_bitrate = (rate * 8.0) as u64;
+        tracing::info!(
+            link_bitrate,
+            file_bitrate = (bitrate * 8.0) as u64,
+            "the link cannot carry the file; asking for a plan it can"
+        );
+        let shared = this.clone();
+        (self.spawn)(Box::pin(async move {
+            match shared.playback.limit(link_bitrate).await {
+                Ok(next) if !matches!(next.plan, PlaybackPlan::Direct { .. }) => {
+                    shared.lock().replanned = Some(next.epoch);
+                    shared.changed.notify_all();
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "could not plan the playback for its link");
+                }
+            }
+        }));
     }
 
     /// Reads a whole block. The server may answer a read with fewer bytes
@@ -777,6 +894,34 @@ mod tests {
     }
 
     #[test]
+    fn a_tuned_reader_keeps_its_own_number_in_flight() {
+        let (_dir, path, _) = media_file("reader-tuned", 10);
+        let client = FakeClient::new(Some(path));
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        let mut start = ready(session.start_playback(&item, None, None)).unwrap();
+        start.size = 100 * BLOCK;
+        let (spawn, spawned) = held_spawn();
+        let reader = {
+            let _enter = crate::reader_tests::runtime().enter();
+            let playback = ManagedPlayback::adopt(
+                session,
+                item,
+                Some(Selection::default()),
+                crate::PlaybackOptions::default(),
+                start,
+            );
+            let tuning = Tuning {
+                in_flight: 8,
+                ..Tuning::default()
+            };
+            MediaReader::with_tuning(playback, spawn, Some(Duration::from_secs(60)), tuning)
+        };
+        reader.prefetch(0);
+        assert_eq!(*spawned.lock(), 8);
+    }
+
+    #[test]
     fn after_a_read_the_status_counts_the_bytes_ready_ahead() {
         let (_dir, path, _) = media_file("reader-status", 10_000);
         let (reader, _) = reader_for(path);
@@ -853,6 +998,82 @@ mod tests {
         let read = reader.read_reporting(BLOCK, 100, &mut |p| reports.push(p));
         assert_eq!(read, Err(ReadError::Flushing));
         assert_eq!(reports.last(), Some(&100), "reports: {reports:?}");
+    }
+
+    /// A reader whose second block never arrives, on a link `meter`
+    /// says carries `rate` bytes per second, for a file of three blocks
+    /// lasting `length`.
+    fn stalling_reader(name: &str, rate: u64, length: Duration) -> (MediaReader, Arc<Session>) {
+        let meter = Arc::new(crate::LinkMeter::default());
+        let now = Instant::now();
+        meter.begin(now - Duration::from_secs(4));
+        meter.received(now, 4 * rate);
+        meter.end(now);
+        let len = 3 * BLOCK as usize;
+        let (_dir, path, _) = media_file(name, len);
+        let client = FakeClient::new(Some(path)).with_meter(meter);
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        let start = ready(session.start_playback(&item, None, None)).unwrap();
+        // The first fetch runs, and the other blocks never come: their
+        // fetches are dropped. What is spawned once the underrun is long
+        // runs: the limit.
+        let first = Arc::new(Mutex::new(true));
+        let threads = thread_spawn();
+        let made = Instant::now();
+        let spawn: Spawn = Arc::new(move |future| {
+            if std::mem::replace(&mut *first.lock(), false) || made.elapsed() >= LIMIT_AFTER {
+                threads(future);
+            } else {
+                drop(future);
+            }
+        });
+        let reader = MediaReader::for_test(
+            session.clone(),
+            item,
+            Selection::default(),
+            start,
+            spawn,
+            Some(length),
+        );
+        (reader, session)
+    }
+
+    /// A stall on a link too slow for the file asks for a plan it can
+    /// carry, and the new plan ends the reader (P6-06).
+    #[test]
+    fn a_long_underrun_on_a_slow_link_asks_for_a_plan_it_can_carry() {
+        // 24 MiB over 2 s is 12 MiB/s; the link carries 1.
+        let (reader, session) = stalling_reader("reader-limit", 1 << 20, Duration::from_secs(2));
+        reader.read(BLOCK - 100, 100).unwrap();
+        let read = reader.read(BLOCK, 100);
+        assert_eq!(
+            read,
+            Err(ReadError::Backend(BackendError::PlaybackRestarted {
+                epoch: 1
+            }))
+        );
+        assert_eq!(*session.limits.lock(), [8 << 20]);
+    }
+
+    /// A link fast enough for the file: a stall is a swing, and the
+    /// reader waits it out without asking.
+    #[test]
+    fn an_underrun_on_a_fast_enough_link_asks_nothing() {
+        // 24 MiB over 600 s is 40 KiB/s; the link carries 1 MiB.
+        let (reader, session) =
+            stalling_reader("reader-no-limit", 1 << 20, Duration::from_secs(600));
+        reader.read(BLOCK - 100, 100).unwrap();
+        {
+            let reader = Arc::new(reader);
+            let flusher = reader.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(LIMIT_AFTER + Duration::from_secs(1));
+                flusher.set_flushing(true);
+            });
+            assert_eq!(reader.read(BLOCK, 100), Err(ReadError::Flushing));
+        }
+        assert!(session.limits.lock().is_empty());
     }
 
     #[test]
