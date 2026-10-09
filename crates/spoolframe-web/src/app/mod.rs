@@ -319,6 +319,18 @@ fn secure_context() -> bool {
     web_sys::window().is_some_and(|window| window.is_secure_context())
 }
 
+/// Whether this page is plain HTTP across the network (PX-23), as
+/// [`crate::logic::plain_http_across_network`] decides from its address.
+fn plain_http_page() -> bool {
+    web_sys::window().is_some_and(|window| {
+        let location = window.location();
+        crate::logic::plain_http_across_network(
+            &location.protocol().unwrap_or_default(),
+            &location.hostname().unwrap_or_default(),
+        )
+    })
+}
+
 /// The server as a signed-out page knows it: its name and public URL.
 async fn site() -> http::Site {
     // Without an answer the card still works, under the plain name.
@@ -456,6 +468,9 @@ fn SignInForm(
     let mut request = use_resource(passkey_request);
     let passkeys = secure_context();
     let secure = passkeys || insecure_cookies;
+    // Signing in works here, and what is typed crosses the network in
+    // clear (PX-23); where it does not work, the error below says so.
+    let exposed = secure && plain_http_page();
     let submit = move |e: FormEvent| {
         e.prevent_default();
         busy.set(true);
@@ -543,6 +558,17 @@ fn SignInForm(
                         } else {
                             "{elsewhere}"
                         }
+                    }
+                }
+            }
+            if exposed {
+                div { class: "alert alert-warning", role: "alert",
+                    icons::Warning {}
+                    span { class: "text-ctp-text",
+                        b { "This connection isn't encrypted" }
+                        // Not `public_url`: insecure cookies are refused
+                        // when it is HTTPS, so here it is plain HTTP too.
+                        "Your password and your session can be read by anyone on the network between this browser and the server. Use the server's HTTPS address, or an SSH tunnel to http://localhost, instead."
                     }
                 }
             }
@@ -713,7 +739,7 @@ fn CodeCard(name: String, on_ok: EventHandler<String>) -> Element {
                         }
                         span { class: "choice-what",
                             b { "Allow insecure cookies" }
-                            "The session cookie crosses your network unencrypted. Anyone on the network who can see the traffic could take over the session. Passkeys still need HTTPS or localhost, so setup here is password-only. You can turn this off later in Server › Settings."
+                            "With this on, your password and the session cookie cross your network unencrypted: anyone on the network who can see the traffic can read them and take over the session. Opening the web UI over HTTPS, or through an SSH tunnel to http://localhost, is the better fix. Passkeys still need HTTPS or localhost, so setup here is password-only. You can turn this off later in Server › Settings."
                         }
                     }
                 }
@@ -1292,6 +1318,10 @@ fn SignedIn(user: UserInfo) -> Element {
     };
     let site = use_resource(site);
     let insecure = admin && site.read().as_ref().is_some_and(|s| s.insecure_cookies);
+    // Plain HTTP across the network (PX-23) says more than insecure
+    // cookies do, and takes that banner's place: turning them off there
+    // would only sign the admin out.
+    let plain = admin && plain_http_page();
     if !admin {
         // A consumer has My profile alone (the WebProfile board): a slim
         // bar over one column, no sidebar.
@@ -1389,7 +1419,15 @@ fn SignedIn(user: UserInfo) -> Element {
                 }
             }
             main { class: "box-border min-w-0 flex-[1_1_600px] max-w-[1200px] p-3.5 md:px-10 md:py-8",
-                if insecure {
+                if plain {
+                    div { class: "banner", role: "alert",
+                        icons::Warning {}
+                        span {
+                            b { "This connection isn't encrypted. " }
+                            "Your password and session can be read on the network. Use the server's HTTPS address, or an SSH tunnel to http://localhost."
+                        }
+                    }
+                } else if insecure {
                     div { class: "banner", role: "alert",
                         icons::Warning {}
                         span {

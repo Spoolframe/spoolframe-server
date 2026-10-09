@@ -9,14 +9,19 @@
 //! counted as a wrong guess before it is checked (A-13), and only a code
 //! some invite has, revoked or not, takes the guess back. Expired or used
 //! up, it was still the right code: telling so helps no one guess.
+//!
+//! Before redeeming, the holder proves the code to the server's relay
+//! with a token (P6-08, [`holder_tier`]), guarded as a redemption is: a
+//! token that matches no live invite is a wrong guess at a code.
 
 use spoolframe_protocol::RedeemInvite;
 use spoolframe_protocol::invite::{CODE_ALPHABET, CODE_LEN, display_code, normalize_code};
+use spoolframe_protocol::relay_access::Tier;
 use spoolframe_types::Role;
 
 use crate::auth::{Auth, PasswordError, hash_password};
 use crate::store::StoreError;
-use crate::store::invites::{InviteState, Redeemed};
+use crate::store::invites::{InviteKind, InviteState, Redeemed};
 use crate::store::users::{LocalUserId, UserError, display_name, normalize_username};
 
 /// An invite's code, normalized (`QW7K2MFPXR4T`).
@@ -165,6 +170,61 @@ pub async fn redeem(
     }
 }
 
+/// The tier the holder of an invite of `kind` relays as on the server's
+/// own relay (P6-08), and the user's decision: the kind alone says. A
+/// `create-user` invite is for an account here, whatever its role: an
+/// owner's. A `portable-account` (P7) or `federation` (P8) invite is for
+/// a user or a server from elsewhere: a friend's.
+pub fn holder_tier_of(kind: InviteKind) -> Tier {
+    match kind {
+        InviteKind::CreateUser => Tier::Owner,
+        InviteKind::PortableAccount | InviteKind::Federation => Tier::Friend,
+    }
+}
+
+/// The tier the holder of a live invite relays as, if `token` is theirs
+/// as `endpoint` (P6-08): [`holder_tier_of`] the invite's kind, else
+/// `None`. For a device that is no one's yet, so it draws on the
+/// strangers' budget first (PX-10), and counts as a guess at a code as
+/// [`redeem`] does (A-13): a token that matches no live invite (revoked,
+/// expired, used up, or never one) stays counted. Every live invite is
+/// checked, in constant time each, whether one matched or not.
+pub async fn holder_tier(auth: &Auth, endpoint: &iroh::EndpointId, token: &str) -> Option<Tier> {
+    use spoolframe_protocol::relay_access::{invite_mac, parse_invite_token};
+    let source = endpoint.to_string();
+    if let Err(wait) = auth.stranger_attempt() {
+        tracing::debug!(endpoint = %source, ?wait, "an invite token not checked: strangers wait");
+        return None;
+    }
+    let Ok(guess) = auth.guess(format!("invite@{source}"), Some(source.clone())) else {
+        tracing::debug!(endpoint = %source, "an invite token not checked: too many wrong codes");
+        return None;
+    };
+    let mac = blake3::Hash::from_bytes(parse_invite_token(token)?);
+    let invites = match auth.store().live_invite_hashes().await {
+        Ok(invites) => invites,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot check an invite token");
+            return None;
+        }
+    };
+    let mut matched = None;
+    for (hash, kind) in invites {
+        let Ok(hash) = blake3::Hash::from_hex(&hash) else {
+            continue;
+        };
+        // blake3::Hash compares in constant time.
+        let expected = blake3::Hash::from_bytes(invite_mac(hash.as_bytes(), endpoint.as_bytes()));
+        if expected == mac {
+            matched = Some(holder_tier_of(kind));
+        }
+    }
+    if matched.is_some() {
+        auth.guessed_right(guess);
+    }
+    matched
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +244,14 @@ mod tests {
             InviteCode::parse("QW7K2MFPXR4T").unwrap().hash()
         );
         assert_ne!(typed.hash(), InviteCode::generate().hash());
+    }
+
+    /// P6-08: the kind alone says the holder's tier.
+    #[test]
+    fn an_account_here_is_an_owner_s_and_one_from_elsewhere_a_friend_s() {
+        assert_eq!(holder_tier_of(InviteKind::CreateUser), Tier::Owner);
+        assert_eq!(holder_tier_of(InviteKind::PortableAccount), Tier::Friend);
+        assert_eq!(holder_tier_of(InviteKind::Federation), Tier::Friend);
     }
 
     #[test]

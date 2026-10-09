@@ -20,13 +20,22 @@
 //!    account, the server saved, and a session. Without one, or when a
 //!    redemption is refused and the user picks "Save server only",
 //!    [`Client::save_invite_server`].
+//!
+//! Until then the device is no one's, and the server's own relay (P6-04)
+//! carries only its owner's and friends'. A link with a code makes the
+//! device its holder (P6-08): from the first connection to the last step
+//! it reaches the link's relays with the code's token
+//! ([`spoolframe_protocol::relay_access::invite_token`]), which says to
+//! the relay whom the invite is for. Once redeemed, or the server saved
+//! without it, the token is dropped: the session says who the device is.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use iroh::EndpointId;
+use iroh::{EndpointId, RelayConfig, RelayUrl};
 use spoolframe_protocol::invite::{Invite, MAX_HINTS, parse_link};
+use spoolframe_protocol::relay_access::invite_token;
 use spoolframe_protocol::{RedeemInvite, Reply, Request, Response, fingerprint};
 use spoolframe_types::Role;
 
@@ -118,7 +127,13 @@ impl Client {
     /// pin, and gains the link's hints.
     pub async fn save_invite_server(&self, link: &str) -> Result<ServerEntry, SdkError> {
         let (invite, id) = parsed(link)?;
-        let conn = self.reach(&invite, id).await?;
+        let saved = self.save_invited(&invite, id).await;
+        self.drop_token(&invite).await;
+        saved
+    }
+
+    async fn save_invited(&self, invite: &Invite, id: EndpointId) -> Result<ServerEntry, SdkError> {
+        let conn = self.reach(invite, id).await?;
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
         let mut saved = servers::load(storage).await?;
@@ -128,7 +143,7 @@ impl Client {
                 if !server.verified {
                     server.set_verified(true);
                 }
-                hint(server, &invite, now);
+                hint(server, invite, now);
                 server.clone()
             }
             None => {
@@ -140,7 +155,7 @@ impl Client {
                     conn.reached(),
                     true,
                 );
-                hint(&mut server, &invite, now);
+                hint(&mut server, invite, now);
                 tracing::info!(id = %invite.server, name = server.name, "pinned a server from an invite");
                 saved.push(server.clone());
                 server
@@ -163,6 +178,21 @@ impl Client {
     /// the form; the invite is still unused); [`SdkError::RateLimited`].
     /// A link with no code is [`SdkError::InvalidInput`]: sign in instead.
     pub async fn redeem_invite(
+        &self,
+        link: &str,
+        username: &str,
+        display_name: Option<&str>,
+        password: &str,
+    ) -> Result<Session, SdkError> {
+        let (invite, _) = parsed(link)?;
+        let redeemed = self.redeem(link, username, display_name, password).await;
+        // Refused, the form is sent again, and reaches the relay with the
+        // token again.
+        self.drop_token(&invite).await;
+        redeemed
+    }
+
+    async fn redeem(
         &self,
         link: &str,
         username: &str,
@@ -220,6 +250,7 @@ impl Client {
         if let Some(url) = &invite.lookup {
             self.look_up_at(url);
         }
+        self.hold_token(invite).await;
         // Named by the invite: dialled even with no address or relay, the
         // lookup (or a hint learned since) the way to it.
         self.inner.invite_relays.lock().entry(id).or_default();
@@ -229,6 +260,53 @@ impl Client {
             *known = newest_first(&invite.relays, known, MAX_HINTS);
         }
         self.link(id).connection(self).await
+    }
+}
+
+impl Client {
+    /// The link's relays, as this device would reach them with `invite`'s
+    /// token: none with relays off, or for a link without a code.
+    fn token_relays(&self, invite: &Invite) -> Option<(String, Vec<RelayUrl>)> {
+        if !self.inner.relays {
+            return None;
+        }
+        let token = invite_token(invite.code.as_deref()?, self.inner.endpoint.id().as_bytes())?;
+        let urls = invite
+            .relays
+            .iter()
+            .take(MAX_HINTS)
+            .filter_map(|relay| relay.parse().ok())
+            .collect();
+        Some((token, urls))
+    }
+
+    /// Reach `invite`'s relays with its token (P6-08): its holder relays
+    /// as the invite's tier. In the endpoint's relay map, so each
+    /// connection to them made from now on carries it; the map is
+    /// otherwise empty, so they may also be the device's home relay for
+    /// that long.
+    async fn hold_token(&self, invite: &Invite) {
+        let Some((token, urls)) = self.token_relays(invite) else {
+            return;
+        };
+        for url in urls {
+            let config = RelayConfig::new(url.clone(), None).with_auth_token(token.clone());
+            self.inner
+                .endpoint
+                .insert_relay(url, Arc::new(config))
+                .await;
+        }
+    }
+
+    /// Stop reaching `invite`'s relays with its token: a connection made
+    /// with it lasts until it closes, and the next one is made without.
+    async fn drop_token(&self, invite: &Invite) {
+        let Some((_, urls)) = self.token_relays(invite) else {
+            return;
+        };
+        for url in urls {
+            self.inner.endpoint.remove_relay(&url).await;
+        }
     }
 }
 

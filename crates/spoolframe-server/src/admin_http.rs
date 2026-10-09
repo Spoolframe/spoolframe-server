@@ -707,17 +707,24 @@ fn failure(e: ErrorObjectOwned) -> Response<Body> {
 async fn signed_in(api: &AdminApi, headers: &HeaderMap, done: LoggedIn) -> Response<Body> {
     api.mark_web_session(&done.token).await;
     let cookies = api.cookies();
-    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
-        && !cookies.insecure()
-        && drops_secure_cookies(origin)
-    {
-        tracing::warn!(
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    match origin.and_then(|o| plain_http(o, cookies.insecure()).map(|p| (o, p))) {
+        Some((origin, PlainHttp::CookieDropped)) => tracing::warn!(
             username = %done.username,
             origin,
             "signed in from a plain HTTP page: the browser will drop the session cookie, so the \
              sign-in will appear to do nothing; open the web UI over HTTPS (admin.public_url) or \
              at http://localhost"
-        );
+        ),
+        // It works, which is the worse case: nothing tells anyone.
+        Some((origin, PlainHttp::Exposed)) => tracing::warn!(
+            username = %done.username,
+            origin,
+            "signed in over plain HTTP across the network: the sign-in (a password, if one was \
+             typed) and the session cookie were readable by anyone on the way; open the web UI \
+             over HTTPS (admin.public_url) or through an SSH tunnel to http://localhost"
+        ),
+        None => {}
     }
     let mut response =
         axum::Json(json!({ "username": done.username, "role": done.role })).into_response();
@@ -725,6 +732,31 @@ async fn signed_in(api: &AdminApi, headers: &HeaderMap, done: LoggedIn) -> Respo
         .headers_mut()
         .insert(header::SET_COOKIE, cookies.set(&done.token));
     response
+}
+
+/// What a sign-in from a page at `origin` means, when it is over plain
+/// HTTP across the network (PX-23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlainHttp {
+    /// Secure cookies: the browser drops the session's, and the sign-in
+    /// appears to do nothing.
+    CookieDropped,
+    /// Insecure cookies: it works, and what was sent, the password among
+    /// it, crossed the network unencrypted.
+    Exposed,
+}
+
+/// Whether, and how, a sign-in from `origin` went over plain HTTP across
+/// the network; `None` over HTTPS or on loopback.
+fn plain_http(origin: &str, insecure_cookies: bool) -> Option<PlainHttp> {
+    if !drops_secure_cookies(origin) {
+        return None;
+    }
+    Some(if insecure_cookies {
+        PlainHttp::Exposed
+    } else {
+        PlainHttp::CookieDropped
+    })
 }
 
 /// Whether a page at `origin` is one a browser keeps no `Secure` cookie
@@ -1188,6 +1220,22 @@ async fn metrics_page(State(api): State<AdminApi>, req: Request) -> Response<Bod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plain_http_sign_in_across_the_network_is_told_apart() {
+        let lan = "http://192.168.1.10:7421";
+        assert_eq!(plain_http(lan, false), Some(PlainHttp::CookieDropped));
+        assert_eq!(plain_http(lan, true), Some(PlainHttp::Exposed));
+        // HTTPS (a proxy's) and loopback (an SSH tunnel's) are neither.
+        for origin in [
+            "https://media.example.org",
+            "http://localhost:7421",
+            "http://127.0.0.1:7421",
+            "http://[::1]:7421",
+        ] {
+            assert_eq!(plain_http(origin, true), None, "{origin}");
+        }
+    }
 
     #[test]
     fn who_is_signed_in_answers_null_for_no_one_only_when_asked() {

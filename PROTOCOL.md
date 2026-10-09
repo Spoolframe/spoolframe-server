@@ -836,7 +836,7 @@ on it (P6-07); one more is closed `BUSY`.
 One bidirectional stream per question, each one frame:
 
 ```json
-{"endpoint": "3f9a…a0f1"}
+{"endpoint": "3f9a…a0f1", "invite": "sf-invite.1.Xq3…"}
 ```
 
 answered
@@ -845,14 +845,69 @@ answered
 {"tier": "owner"}
 ```
 
-`tier` is `owner` (the server itself, or a device with a live session or
-trusted for a user), `friend` (none until P7 and P8) or `stranger`. A
-tier the relay does not know is a stranger. The question is at most
-1 KiB and must arrive within 10 s of the stream opening.
+`tier` is `owner`, `friend` or `stranger`. A tier the relay does not
+know is a stranger. The question is at most 1 KiB and must arrive within
+10 s of the stream opening.
+
+- The server itself is `owner`.
+- A device with a live session, or trusted for a user (P4-01), is
+  `owner`: any local account's, a consumer's as much as an admin's.
+- A device that is no one's, with a live invite's token (below), is the
+  tier of the invite's kind (P6-08): `create-user` (an account here, of
+  either role) is `owner`; `portable-account` (P7) and `federation`
+  (P8) are `friend`. The kind alone decides it.
+- Anyone else is a `stranger`. Friends are otherwise the portable users
+  and servers of P7 and P8; until then there are none.
+
+### The invite holder's token
+
+A device redeeming an invite is no one's until it has redeemed it. Off
+the LAN the relay may be its only way to the server, so it proves to the
+relay that it holds the code. It connects to the invite's relays with an
+auth token, sent as `Authorization: Bearer` (iroh's
+`RelayConfig::with_auth_token`):
+
+```
+sf-invite.1.<base64url, no padding, of BLAKE3-keyed(key = BLAKE3(code), msg = endpoint key)>
+```
+
+`code` is the invite's code, normalized (`QW7K2MFPXR4T`); the endpoint
+key is the device's 32 bytes, which the relay's handshake has already
+proved. The token proves the code without carrying it, and admits no
+other endpoint: a token copied from a log is no use to anyone else
+(`spoolframe_protocol::relay_access::invite_token`).
+
+The relay passes a well-formed token on in `invite`, and nothing for
+anything else. Without one `invite` is left out, so the question is the
+one before it, and a server from before it ignores the field. The ALPN
+stays `/1`.
+
+The server checks a token only for a device that is no one's, against
+every live invite (not revoked, expired or used up), in constant time.
+It is a sign-in a stranger makes, so it is guarded as redeeming is: it
+draws on the strangers' budget (PX-10), and counts as a guess at an
+invite code from that endpoint (A-13), taken back only when it matches.
+A token that matches no live invite stays counted, with the device's
+wrong codes in `RedeemInvite`, and the device is what it would be
+without it.
+
+The SDK holds the token on the link's relays from `connect_invite` to
+`redeem_invite`, and drops it once the invite is redeemed or the server
+is saved without it: from then on the session says who the device is.
+
+The token is no session. The relay only carries the holder's packets to
+the server, where redeeming is guarded as before.
+
+**Offline guessing.** The token is a MAC under the code's hash: whoever
+has a token and its endpoint key can test codes against it offline, 59
+bits of them, with no limit. The token travels only in the
+`Authorization` header, over TLS, to the operator's own relay. Proxies
+do not log that header by default; do not make yours log it.
 
 The relay keeps an answer 60 s and a failure 5 s, at most 10,000 of them,
-and lets through the tiers its `access` allows. An answer it cannot get
-is a stranger's.
+by endpoint and token: an endpoint's answer with a token is not its
+answer without one. It lets through the tiers its `access` allows. An
+answer it cannot get is a stranger's.
 
 ## Picture subtitles
 

@@ -6,9 +6,10 @@
 //!
 //! Who it relays for is by tier: the main server says which tier an
 //! endpoint is in ([`crate::relay_access`]), asked once a minute at most
-//! for each, and the config says which tiers are let through. Relayed
-//! traffic stays encrypted end to end; the relay learns only which keys
-//! talk.
+//! for each, and the config says which tiers are let through. A device
+//! redeeming an invite connects with the invite holder's token (P6-08),
+//! passed on in the question. Relayed traffic stays encrypted end to end;
+//! the relay learns only which keys talk.
 
 pub mod config;
 
@@ -26,12 +27,15 @@ use iroh_relay::server::{
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use spoolframe_protocol::codec::{read_frame_within, write_frame};
-use spoolframe_protocol::relay_access::{AccessAnswer, AccessQuery, RELAY_ACCESS_ALPN, Tier};
+use spoolframe_protocol::relay_access::{
+    AccessAnswer, AccessQuery, RELAY_ACCESS_ALPN, Tier, parse_invite_token,
+};
 
 pub use config::{Access, RelayConfig, RelayConfigError, Serve};
 
-/// How long the main server's answer for an endpoint is kept: a device
-/// signed out is let through this much longer at most.
+/// How long the main server's answer for an endpoint is kept, with or
+/// without an invite token: a device signed out, or an invite revoked, is
+/// let through this much longer at most.
 pub const CACHE: Duration = Duration::from_secs(60);
 /// How long a failed answer is kept: the main server unreachable is asked
 /// again soon, but not on every connection.
@@ -142,14 +146,14 @@ impl Gate {
         })
     }
 
-    /// Whether `endpoint` may relay through it.
-    async fn admits(&self, endpoint: EndpointId) -> bool {
+    /// Whether `endpoint` may relay through it, connected with `invite`.
+    async fn admits(&self, endpoint: EndpointId, invite: Option<String>) -> bool {
         // The main server homes on it; and with everyone let through
         // there is nothing to ask.
         if endpoint == self.server || self.access.everyone {
             return true;
         }
-        match self.asker.tier(endpoint).await {
+        match self.asker.tier(endpoint, invite).await {
             Tier::Owner => self.access.owner,
             Tier::Friend => self.access.friends,
             Tier::Stranger | Tier::Unknown => self.access.everyone,
@@ -160,7 +164,12 @@ impl Gate {
 impl AccessControl for Gate {
     async fn on_connect(&self, request: &ClientRequest) -> iroh_relay::server::Access {
         let endpoint = request.endpoint_id();
-        if self.admits(endpoint).await {
+        // Only an invite holder's token is passed on: anything else in the
+        // header is no token, and does not split the endpoint's answers.
+        let invite = request
+            .auth_token()
+            .filter(|token| parse_invite_token(token).is_some());
+        if self.admits(endpoint, invite).await {
             tracing::debug!(endpoint = %endpoint.fmt_short(), "relaying for an endpoint");
             iroh_relay::server::Access::Allow
         } else {
@@ -184,10 +193,15 @@ struct Asker {
     answers: parking_lot::Mutex<Answers>,
 }
 
+/// What an answer is for: an endpoint, and the invite token it connected
+/// with, if any (P6-08). The same endpoint with and without one may be
+/// answered differently.
+type Asked = (EndpointId, Option<String>);
+
 /// The answers kept, each until it expires, at most `max` of them.
 #[derive(Debug)]
 struct Answers {
-    kept: HashMap<EndpointId, (Tier, Instant)>,
+    kept: HashMap<Asked, (Tier, Instant)>,
     max: usize,
 }
 
@@ -201,25 +215,28 @@ impl Default for Answers {
 }
 
 impl Answers {
-    /// `endpoint`'s answer, if it has not expired at `now`.
-    fn get(&self, endpoint: &EndpointId, now: Instant) -> Option<Tier> {
+    /// `asked`'s answer, if it has not expired at `now`.
+    fn get(&self, asked: &Asked, now: Instant) -> Option<Tier> {
         self.kept
-            .get(endpoint)
+            .get(asked)
             .filter(|(_, until)| now < *until)
             .map(|(tier, _)| *tier)
     }
 
-    /// Keep `tier` for `endpoint` until `until`. Only a full cache is
+    /// Keep `tier` for `asked` until `until`. Only a full cache is
     /// swept: the expired go, and if that frees nothing, the tenth that
     /// would expire soonest. A flood of fresh keys then scans the map once
     /// per tenth of `max` new keys, not once per key, under the lock every
     /// connection's lookup takes.
-    fn keep(&mut self, endpoint: EndpointId, tier: Tier, until: Instant, now: Instant) {
-        if self.kept.len() >= self.max && !self.kept.contains_key(&endpoint) {
+    fn keep(&mut self, asked: Asked, tier: Tier, until: Instant, now: Instant) {
+        if self.kept.len() >= self.max && !self.kept.contains_key(&asked) {
             self.kept.retain(|_, (_, at)| now < *at);
             if self.kept.len() >= self.max {
-                let mut by_expiry: Vec<(Instant, EndpointId)> =
-                    self.kept.iter().map(|(key, (_, at))| (*at, *key)).collect();
+                let mut by_expiry: Vec<(Instant, Asked)> = self
+                    .kept
+                    .iter()
+                    .map(|(key, (_, at))| (*at, key.clone()))
+                    .collect();
                 let evict = (self.max / 10).max(1);
                 by_expiry.select_nth_unstable(evict - 1);
                 for (_, key) in &by_expiry[..evict] {
@@ -227,7 +244,7 @@ impl Answers {
                 }
             }
         }
-        self.kept.insert(endpoint, (tier, until));
+        self.kept.insert(asked, (tier, until));
     }
 }
 
@@ -248,12 +265,13 @@ impl Asker {
         })
     }
 
-    async fn tier(&self, endpoint: EndpointId) -> Tier {
+    async fn tier(&self, endpoint: EndpointId, invite: Option<String>) -> Tier {
         let now = Instant::now();
-        if let Some(tier) = self.answers.lock().get(&endpoint, now) {
+        let asked = (endpoint, invite);
+        if let Some(tier) = self.answers.lock().get(&asked, now) {
             return tier;
         }
-        let (tier, keep) = match tokio::time::timeout(ASK_WAIT, self.ask(endpoint)).await {
+        let (tier, keep) = match tokio::time::timeout(ASK_WAIT, self.ask(&asked)).await {
             Ok(Ok(tier)) => (tier, CACHE),
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "cannot ask the main server who an endpoint is");
@@ -264,11 +282,11 @@ impl Asker {
                 (Tier::Stranger, FAILED_CACHE)
             }
         };
-        self.answers.lock().keep(endpoint, tier, now + keep, now);
+        self.answers.lock().keep(asked, tier, now + keep, now);
         tier
     }
 
-    async fn ask(&self, endpoint: EndpointId) -> Result<Tier, String> {
+    async fn ask(&self, (endpoint, invite): &Asked) -> Result<Tier, String> {
         let connection = self.connection().await?;
         let asked = async {
             let (mut send, mut recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
@@ -276,6 +294,7 @@ impl Asker {
                 &mut send,
                 &AccessQuery {
                     endpoint: endpoint.to_string(),
+                    invite: invite.clone(),
                 },
             )
             .await
@@ -316,8 +335,8 @@ impl Asker {
 mod tests {
     use super::*;
 
-    fn key(n: u8) -> EndpointId {
-        SecretKey::from_bytes(&[n; 32]).public()
+    fn key(n: u8) -> Asked {
+        (SecretKey::from_bytes(&[n; 32]).public(), None)
     }
 
     #[test]
@@ -353,5 +372,21 @@ mod tests {
         assert_eq!(answers.get(&key(2), later), Some(Tier::Owner));
         assert_eq!(answers.get(&key(3), later), Some(Tier::Owner));
         assert_eq!(answers.kept.len(), 2);
+    }
+
+    /// P6-08: an endpoint's answer with an invite token is not its answer
+    /// without one, nor with another token.
+    #[test]
+    fn answers_are_kept_by_endpoint_and_token() {
+        let now = Instant::now();
+        let mut answers = Answers::default();
+        let (endpoint, _) = key(1);
+        let token = Some("sf-invite.1.a".to_owned());
+        answers.keep((endpoint, token.clone()), Tier::Friend, now + CACHE, now);
+        answers.keep((endpoint, None), Tier::Stranger, now + CACHE, now);
+        assert_eq!(answers.get(&(endpoint, token), now), Some(Tier::Friend));
+        assert_eq!(answers.get(&(endpoint, None), now), Some(Tier::Stranger));
+        let other = Some("sf-invite.1.b".to_owned());
+        assert_eq!(answers.get(&(endpoint, other), now), None);
     }
 }

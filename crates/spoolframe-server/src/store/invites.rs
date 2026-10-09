@@ -200,6 +200,30 @@ impl Store {
         Ok(rows.iter().map(record).collect::<Result<_, _>>()?)
     }
 
+    /// The invites that can still be redeemed, as their codes' hashes and
+    /// their kinds: what an invite holder's token is checked against
+    /// (P6-08). Every kind, as the relay carries the holder of each.
+    pub async fn live_invite_hashes(&self) -> Result<Vec<(String, InviteKind)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT capability_hash, kind FROM invites \
+             WHERE revoked_at IS NULL AND expires_at > ?1 AND uses_left > 0",
+        )
+        .bind(self.now())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let kind: String = row.try_get("kind")?;
+                Ok((
+                    row.try_get("capability_hash")?,
+                    kind.parse()
+                        .map_err(|e: String| sqlx::Error::Decode(e.into()))?,
+                ))
+            })
+            .collect::<Result<_, sqlx::Error>>()?)
+    }
+
     /// Revoke invite `id`: its unused code stops working. The accounts it
     /// made stay. [`InviteError::NoSuchInvite`] for one that is not live.
     pub async fn revoke_invite(&self, id: &str) -> Result<(), InviteError> {

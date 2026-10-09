@@ -6659,6 +6659,8 @@ dependencies = [
 name = "spoolframe-protocol"
 version = "0.5.0"
 dependencies = [
+ "base64 0.22.1",
+ "blake3",
  "ciborium",
  "ciborium-ll",
  "serde",

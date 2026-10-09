@@ -2134,7 +2134,7 @@ fn AccessFields(
             // address; Settings › Access keeps its box.
             if wizard {
                 p { class: "m-0 text-xs leading-normal text-ctp-subtext0",
-                    "Passkeys, sign-in providers and secure cookies need HTTPS (or localhost): put a reverse proxy such as Caddy or nginx in front and give its address here. Changing it later means passkeys are added again."
+                    "Best: HTTPS. Put a reverse proxy such as Caddy or nginx in front and give its address here; passkeys, sign-in providers and secure cookies need it. Without one, reach the web UI through an SSH tunnel to http://localhost. Allowing insecure cookies (Server › Settings › Security) is the last resort: your password and session then cross the network unencrypted. Changing the address later means passkeys are added again."
                 }
             }
             Note { settings: settings.clone(), setting: "admin.public_url", on_changed: move |_| on_reload.call(()) }
@@ -2273,7 +2273,7 @@ pub fn SecurityForm() -> Element {
             }
             span { class: "choice-what",
                 b { "Allow insecure cookies" }
-                "Sends the session cookie without its Secure flag, so signing in over plain HTTP on your network works. The cookie then crosses your network unencrypted. Passkeys still need HTTPS or localhost. Not allowed when the public URL is HTTPS."
+                "Sends the session cookie without its Secure flag, so signing in over plain HTTP on your network works. The password and the cookie then cross your network unencrypted; HTTPS or an SSH tunnel to http://localhost is the better fix. Passkeys still need HTTPS or localhost. Not allowed when the public URL is HTTPS."
             }
         }
         Note { settings: loaded.clone(), setting: "admin.insecure_cookies", on_changed: move |_| generation += 1 }

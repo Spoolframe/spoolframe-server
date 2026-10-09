@@ -235,6 +235,31 @@ pub fn page_serves(page: &str, rp_id: &str) -> bool {
     page == rp_id || page.ends_with(&format!(".{rp_id}"))
 }
 
+/// Whether a page at `protocol` (`location.protocol`, with its colon) and
+/// `hostname` (`location.hostname`) is plain HTTP across the network
+/// (PX-23): what is typed and sent there, a password and the session
+/// cookie among it, can be read on the way. HTTPS (a proxy's) is not, nor
+/// is loopback (an SSH tunnel's, or the server's own browser): `localhost`,
+/// `*.localhost`, 127.0.0.0/8 and `::1`. The same rule the server's
+/// `drops_secure_cookies` applies to the page's `Origin`.
+pub fn plain_http_across_network(protocol: &str, hostname: &str) -> bool {
+    if protocol != "http:" {
+        return false;
+    }
+    // A browser gives an IPv6 host in its brackets.
+    let bare = hostname
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(hostname);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        Err(_) => {
+            let name = hostname.to_ascii_lowercase();
+            !name.is_empty() && name != "localhost" && !name.ends_with(".localhost")
+        }
+    }
+}
+
 /// A device sign-in code as it is shown, `BCDF-GHJK`, however it was typed
 /// or linked; unchanged if it is not eight characters.
 pub fn display_code(code: &str) -> String {
@@ -1116,6 +1141,49 @@ mod tests {
         // The standard alphabet's letters, a space, a length no bytes have.
         for bad in ["Zm9v+A", "Zm9v/A", "Zm 9v", "Zm9vY"] {
             assert_eq!(from_base64url(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_plain_http_page_on_a_network_address_is_across_the_network() {
+        for (protocol, hostname) in [
+            ("http:", "192.168.1.10"),
+            ("http:", "media.example.org"),
+            ("http:", "nas"),
+            ("http:", "[fd00::10]"),
+            ("http:", "10.0.0.2"),
+            // Only 127.0.0.0/8 is loopback.
+            ("http:", "128.0.0.1"),
+            // `localhost` as a label, not the name's end.
+            ("http:", "localhost.example.org"),
+        ] {
+            assert!(
+                plain_http_across_network(protocol, hostname),
+                "{protocol}//{hostname}"
+            );
+        }
+    }
+
+    #[test]
+    fn https_or_loopback_is_not_across_the_network() {
+        for (protocol, hostname) in [
+            // A reverse proxy's TLS.
+            ("https:", "media.example.org"),
+            ("https:", "192.168.1.10"),
+            // An SSH tunnel, or the server's own browser.
+            ("http:", "localhost"),
+            ("http:", "LOCALHOST"),
+            ("http:", "spoolframe.localhost"),
+            ("http:", "127.0.0.1"),
+            ("http:", "127.8.9.10"),
+            ("http:", "[::1]"),
+            // Not a page on the network at all.
+            ("file:", ""),
+        ] {
+            assert!(
+                !plain_http_across_network(protocol, hostname),
+                "{protocol}//{hostname}"
+            );
         }
     }
 

@@ -8,6 +8,9 @@ repository.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# The invite holder's token for the server's relay (P6-08).
+base64 = { workspace = true }
+blake3 = { workspace = true }
 ciborium = { workspace = true }
 ciborium-ll = { workspace = true }
 serde = { workspace = true }

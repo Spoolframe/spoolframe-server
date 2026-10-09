@@ -150,7 +150,7 @@ pub(crate) struct Inner {
     /// The pkarr relays servers are looked up at (P6-05).
     lookups: Mutex<std::collections::HashSet<String>>,
     /// [`ClientOptions::relays`].
-    relays: bool,
+    pub(crate) relays: bool,
     /// Each server's connection and its state.
     links: Mutex<HashMap<EndpointId, Arc<Link>>>,
     /// Serializes read-modify-write of the saved servers and sessions.

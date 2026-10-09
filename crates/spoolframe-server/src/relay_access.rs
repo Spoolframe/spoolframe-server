@@ -83,9 +83,12 @@ impl RelayAccess {
     }
 
     /// Which tier `endpoint` is in: the server itself and a device with a
-    /// live session, or trusted for a user, are its owner's. Friends come
-    /// with P7 and P8; until then there are none.
-    pub async fn tier(&self, endpoint: &str) -> Tier {
+    /// live session, or trusted for a user, are its owner's. A device that
+    /// is no one's, with a live invite's token for it, is the tier of the
+    /// invite's kind (P6-08, [`crate::invites::holder_tier`]); anyone else
+    /// a stranger. Friends are otherwise the users and servers of P7 and
+    /// P8; until then there are none.
+    pub async fn tier(&self, endpoint: &str, invite: Option<&str>) -> Tier {
         if endpoint == self.server.to_string() {
             return Tier::Owner;
         }
@@ -93,15 +96,20 @@ impl RelayAccess {
         let signed_in = store.endpoint_signed_in(endpoint).await;
         let trusted = self.auth.trusted_profiles(endpoint).await;
         match (signed_in, trusted) {
-            (Ok(true), _) => Tier::Owner,
-            (_, Ok(profiles)) if !profiles.is_empty() => Tier::Owner,
+            (Ok(true), _) => return Tier::Owner,
+            (_, Ok(profiles)) if !profiles.is_empty() => return Tier::Owner,
             (Err(e), _) | (_, Err(e)) => {
                 // Not known to be the owner's: refused, as a stranger.
                 tracing::warn!(error = %e, endpoint, "cannot tell the relay who an endpoint is");
-                Tier::Stranger
+                return Tier::Stranger;
             }
-            _ => Tier::Stranger,
+            _ => {}
         }
+        let holder = match (invite, endpoint.parse::<EndpointId>()) {
+            (Some(token), Ok(id)) => crate::invites::holder_tier(&self.auth, &id, token).await,
+            _ => None,
+        };
+        holder.unwrap_or(Tier::Stranger)
     }
 }
 
@@ -138,7 +146,7 @@ impl ProtocolHandler for RelayAccess {
                         Ok(Ok(query)) => query,
                         _ => return,
                     };
-                let tier = this.tier(&query.endpoint).await;
+                let tier = this.tier(&query.endpoint, query.invite.as_deref()).await;
                 if write_frame(&mut send, &AccessAnswer { tier }).await.is_ok() {
                     let _ = send.finish();
                 }

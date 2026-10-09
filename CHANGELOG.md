@@ -3199,6 +3199,15 @@
     so.
   - `spoolframe-probe --check-limits` also sends wrong invite codes until
     they are `RateLimited`.
+- An invite's holder on your relay (P6-08): a device redeeming an
+  invite relays as the invite's kind says before it has an account. An
+  invite that makes an account here, admin or consumer, is an owner's;
+  a portable user's (P7) or a server's (P8) a friend's. The SDK reaches
+  the link's relays with a token made from the code and its own key,
+  until the invite is redeemed. A token that matches no live invite
+  counts as a wrong invite code. The relay-access question gains an
+  optional `invite`; its ALPN stays `spoolframe/relay-access/1`, and an
+  older server ignores it.
 - `nix build .#docker`: the server as an OCI image
   (`ghcr.io/spoolframe/spoolframe-server`), ffmpeg and tesseract included,
   running as uid 1000 with its state in a volume.
@@ -3240,3 +3249,9 @@
 - The web UI's setup asks for the first admin's password, the passkey
   optional; My profile and a user's page remove a password, after
   saying what that ends.
+- The web UI says when it is open over plain HTTP across the network:
+  above the sign-in form, in a banner on every admin page, and at the
+  setup page's insecure cookies switch. The password and the session
+  can be read on the way; HTTPS or an SSH tunnel to localhost is the
+  fix. The wizard's Access step names those first, insecure cookies
+  last.
