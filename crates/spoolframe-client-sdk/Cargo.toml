@@ -13,6 +13,12 @@ media-readers = []
 
 [dependencies]
 async-trait = { workspace = true }
+# The portable identity's root and its recovery phrase (P7-01).
+bip39 = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true }
 iroh-mdns-address-lookup = { workspace = true }

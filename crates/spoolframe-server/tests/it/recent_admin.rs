@@ -96,6 +96,8 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
                     .await,
             ),
         ),
+        // P7-04: severing a tie takes a way back to the account away.
+        ("userUntie", outcome(root.user_untie(bob()).await)),
         (
             "userAdd(admin)",
             outcome(root.user_add(user("carol", Role::Admin)).await),

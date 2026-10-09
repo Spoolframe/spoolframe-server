@@ -31,6 +31,8 @@ mod playback;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod plex_sync;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod portable;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod preferences;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod providers;

@@ -473,6 +473,7 @@ fn every_reply_round_trips() {
             role: spoolframe_types::Role::Consumer,
             locked: true,
             pin: Some(crate::PinState { digits: Some(6) }),
+            portable: Some(tie_user()),
         }),
         Reply::Devices {
             devices: vec![crate::DeviceInfo {
@@ -1734,8 +1735,9 @@ fn a_reply_missing_a_field_is_refused() {
             role: spoolframe_types::Role::Consumer,
             locked: false,
             pin: None,
+            portable: None,
         },
-        &["locked"],
+        &["locked", "portable"],
     );
     assert_each_required(
         &crate::DeviceInfo {
@@ -1906,5 +1908,108 @@ fn the_invite_errors_round_trip() {
         Error::UsernameTaken,
     ] {
         round_trip(Response::Err(error));
+    }
+}
+
+/// P7-04's root: seed 7, as the portable vectors.
+fn tie_root() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+}
+
+fn tie_user() -> crate::PortableUserId {
+    crate::PortableUserId::from_bytes(tie_root().verifying_key().to_bytes()).unwrap()
+}
+
+fn tie_proofs() -> Vec<crate::TieProof> {
+    use ed25519_dalek::Signer;
+    let message = crate::tie_message(&[0x5a; 32], &[0xa5; 32], &tie_user(), "alice").unwrap();
+    let device = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+    let credential = crate::UserDeviceCredential::new(
+        tie_user(),
+        crate::DevicePublicKey::from_bytes(device.verifying_key().to_bytes()).unwrap(),
+        1,
+        1_791_504_000,
+        1_791_504_000 + 86_400,
+        |m| tie_root().sign(m),
+    );
+    vec![
+        crate::TieProof::Root {
+            signature: tie_root().sign(&message),
+        },
+        crate::TieProof::Device {
+            credential,
+            signature: device.sign(&message),
+        },
+    ]
+}
+
+/// P7-04's requests and replies go over the wire as they are, and each
+/// needs a session.
+#[test]
+fn the_tie_messages_round_trip() {
+    let mut requests = vec![Request::TieBegin, Request::Untie];
+    requests.extend(tie_proofs().into_iter().map(|proof| Request::TieFinish {
+        user: tie_user(),
+        proof,
+    }));
+    for request in requests {
+        assert!(!request.is_pre_auth(), "{request:?}");
+        round_trip(request);
+    }
+    round_trip(Response::Ok(Reply::TieChallenge {
+        nonce: [0xa5; 32],
+        server: [0x5a; 32],
+        expires_in_secs: 300,
+    }));
+    for error in [
+        Error::TieChallengeExpired,
+        Error::AlreadyTied,
+        Error::PortableIdTaken,
+    ] {
+        round_trip(Response::Err(error));
+    }
+}
+
+/// Its nonce and server id are CBOR byte strings, and every field is
+/// required.
+#[test]
+fn a_tie_challenge_is_bytes_and_whole() {
+    let challenge = Reply::TieChallenge {
+        nonce: [0xa5; 32],
+        server: [0x5a; 32],
+        expires_in_secs: 300,
+    };
+    let value: ciborium::Value =
+        ciborium::from_reader(codec::encode(&challenge).unwrap().as_slice()).unwrap();
+    let ciborium::Value::Map(entries) = value else {
+        panic!("not a map");
+    };
+    let nonce = entries
+        .iter()
+        .find(|(key, _)| key.as_text() == Some("nonce"))
+        .map(|(_, value)| value.clone());
+    assert_eq!(nonce, Some(ciborium::Value::Bytes(vec![0xa5; 32])));
+    assert_each_required(&challenge, &["nonce", "server", "expires_in_secs"]);
+    assert_each_required(
+        &Request::TieFinish {
+            user: tie_user(),
+            proof: tie_proofs().remove(0),
+        },
+        &["user", "proof"],
+    );
+}
+
+/// Neither is a read: a tie uses its nonce up, a sever changes the
+/// account. A second challenge only replaces the first.
+#[test]
+fn a_tie_is_never_sent_twice_but_a_challenge_may_be() {
+    use crate::policy::retry_safe;
+    assert!(retry_safe(&Request::TieBegin));
+    assert!(!retry_safe(&Request::Untie));
+    for proof in tie_proofs() {
+        assert!(!retry_safe(&Request::TieFinish {
+            user: tie_user(),
+            proof
+        }));
     }
 }

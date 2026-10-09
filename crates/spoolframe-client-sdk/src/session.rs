@@ -22,6 +22,7 @@ use spoolframe_types::{
 use crate::client::Client;
 use crate::error::SdkError;
 use crate::link::ConnectionPath;
+use crate::portable::PortableUserId;
 use crate::storage::{Storage, StorageError, keys};
 
 /// A session as it is stored: the token is the secret, the names are what
@@ -940,6 +941,63 @@ impl Session {
     pub async fn remove_passkey(&self, id: &str) -> Result<(), SdkError> {
         self.done(Request::RemovePasskey { id: id.to_owned() })
             .await
+    }
+
+    /// Tie this user's account on this server to portable identity
+    /// `identity` (P7-04), proved by this device: with the identity's root
+    /// if it holds it (the phone), else with its device credential for it
+    /// ([`crate::Portable::tie_proof`]). The root is never sent. The
+    /// account then shows the identity ([`UserSummary::portable`]); no
+    /// second account is made.
+    ///
+    /// Only soon after signing in ([`SdkError::RecentSignInRequired`]:
+    /// confirm, then ask again). An account tied already is
+    /// [`SdkError::AlreadyTied`]; an identity tied to another account here
+    /// [`SdkError::PortableIdTaken`]; a proof the server does not take
+    /// (a key it has seen revoked, say) [`SdkError::InvalidCredentials`].
+    pub async fn tie(&self, identity: PortableUserId) -> Result<(), SdkError> {
+        let nonce = match self.call(Request::TieBegin).await? {
+            Reply::TieChallenge { nonce, server, .. } => {
+                // Signed for the server dialled, whatever it names; one
+                // that names another is not asking for itself.
+                if server != *self.server.as_bytes() {
+                    return Err(SdkError::Protocol(
+                        "the tie challenge names another server".into(),
+                    ));
+                }
+                nonce
+            }
+            other => return Err(unexpected(other)),
+        };
+        let proof = self
+            .client
+            .portable()
+            .tie_proof(
+                identity,
+                self.server.as_bytes(),
+                &nonce,
+                &self.user.username,
+            )
+            .await?;
+        self.done(Request::TieFinish {
+            user: identity,
+            proof,
+        })
+        .await
+    }
+
+    /// Sever this account's tie to its portable identity (P7-04). Only the
+    /// link goes: the account, its sessions and its watch state stay. Only
+    /// soon after signing in, as for [`Session::tie`]; no tie is
+    /// [`SdkError::NotFound`].
+    pub async fn untie(&self) -> Result<(), SdkError> {
+        self.done(Request::Untie).await
+    }
+
+    /// The portable identity this account is tied to, as the server says
+    /// now (P7-04).
+    pub async fn tie_info(&self) -> Result<Option<PortableUserId>, SdkError> {
+        Ok(self.whoami().await?.portable)
     }
 
     /// Confirm it is this user with their account password (P3-07), when

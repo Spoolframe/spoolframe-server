@@ -1963,6 +1963,8 @@ Authentication to a Spoolframe server proves:
 
 The server does not need to contact an account server to verify this chain.
 
+As built (P7-02): `expires_at` is required, at most 90 days after `issued_at`; the signature is over a fixed binary layout under a domain string, not CBOR (PROTOCOL.md, "Portable identities"). Proof of possession is the device key's signature over the server's endpoint id and a nonce it chose.
+
 ---
 
 # 46. Portable User Recovery
@@ -1983,6 +1985,8 @@ same PortableUserId
 ```
 
 The exact mnemonic format is an implementation choice. The important property is deterministic recovery of the same portable identity.
+
+As built (P7-01): BIP-39, English wordlist, 24 words (256 bits); the standard BIP-39 seed (empty passphrase) → `blake3::derive_key("spoolframe 2026-10-09 portable root v1", seed)` → the Ed25519 root key, whose public key is the `PortableUserId`.
 
 This recovery method is intentionally not optimized for mainstream convenience. It exists to preserve user ownership and eliminate dependency on a hosted account authority.
 
@@ -2046,6 +2050,8 @@ revoked:
 The state is signed by the user root. Servers cache the newest valid revision they have seen. Authorized devices may carry newer signed state to servers they contact.
 
 This means revocation may not propagate instantly to every disconnected server, but the system remains decentralized and offline-capable. An optional future personal/home server may improve synchronization speed without becoming the root identity authority.
+
+As built (P7-02): the state lists revoked keys only, each with when it was revoked, and no authorized list (the user's choice, 2026-10-09): adding a device needs no new state. Revocation only grows: a server refuses an unexpired credential whose key any valid state it has seen revokes, older revisions included, and keeps the highest revision to hand on. A revocation lapses 90 days and 5 minutes after it was made, when no credential it could stop can still hold, and may then be dropped; at most 1024 live revocations per state.
 
 ---
 

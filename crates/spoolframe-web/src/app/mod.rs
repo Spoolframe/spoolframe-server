@@ -15,6 +15,7 @@ mod logs;
 mod overview;
 mod playback;
 mod plex;
+mod portable;
 mod profile;
 mod remote;
 mod restart;

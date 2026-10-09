@@ -3255,3 +3255,34 @@
   can be read on the way; HTTPS or an SSH tunnel to localhost is the
   fix. The wizard's Access step names those first, insecure cookies
   last.
+- Portable identities begin (P7-01): the client SDK makes a root
+  signing key with a 24-word BIP-39 recovery phrase, recovers the same
+  key and `PortableUserId` from the phrase on any device, and keeps
+  several identities apart in the app's storage. The root stays on the
+  device; the server and the protocol do not build the phrase code, and
+  nothing on the wire changes yet.
+- Portable device credentials (P7-02): the root signs a 90-day credential
+  for each device's own key, and revokes keys with a signed, versioned
+  identity state that stamps each revocation with its time. The
+  protocol crate defines both, and a device's proof of its key, as fixed
+  signed byte layouts (PROTOCOL.md "Portable identities"); the SDK
+  issues, installs, renews and revokes them, and gives a device a fresh
+  key once its old one is revoked. Revocation only grows: the server
+  refuses a credential whose key any valid state it has seen revokes,
+  older revisions included, and drops a revocation once no credential
+  it could stop can still hold (90 days and 5 minutes). No request
+  carries them yet (P7-06).
+- Ties (P7-04, wire revision 13): a signed-in local account ties itself
+  to a portable identity. The server gives the session a nonce
+  (`TieBegin`, 5 minutes, used once); the phone signs it with the root,
+  or a TV with its device key and credential, over the server's id, the
+  nonce, the identity and the username (`TieFinish`), so the proof
+  works nowhere else. One identity per account, one account per
+  identity on a server; an account already tied severs first
+  (`Untie`). Each needs a recent sign-in. The tie is a row beside the
+  account: severing it leaves sessions, passkeys and watch state as
+  they were. `WhoAmI` and the admin API's `UserInfo` carry it, and the
+  web UI shows it as a badge on a user's page and in My profile, with
+  Sever (`admin.userUntie`, `me.portableUntie`); tying is done from the
+  phone app only. The SDK ties with `Session::tie` and severs with
+  `Session::untie`. Signing in with a tied credential is P7-06.

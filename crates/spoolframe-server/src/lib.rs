@@ -36,6 +36,7 @@ pub mod playback;
 pub mod playback_debug;
 pub mod plex_accounts;
 pub mod plex_sync;
+pub mod portable;
 pub mod previews;
 pub mod principal;
 pub mod redact;
@@ -48,6 +49,7 @@ pub mod subtitles;
 pub mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub mod ties;
 pub mod tls;
 pub mod tracks;
 pub mod transcode;

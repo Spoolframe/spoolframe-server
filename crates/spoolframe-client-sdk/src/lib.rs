@@ -21,6 +21,7 @@ mod error;
 mod invites;
 mod link;
 mod link_meter;
+pub mod portable;
 mod servers;
 mod session;
 pub mod storage;
@@ -31,6 +32,12 @@ pub use error::SdkError;
 pub use invites::InviteInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
 pub use link_meter::LinkMeter;
+// Portable identities (P7-01) and their device credentials (P7-02).
+pub use portable::{
+    CredentialError, DevicePublicKey, PhraseError, Portable, PortableIdentity,
+    PortableIdentityState, PortableRoot, PortableUserId, RecoveryPhrase, RevokedKey, StateError,
+    TieProof, UserDeviceCredential,
+};
 pub use servers::ServerEntry;
 pub use session::{
     ActiveProfile, Chunk, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange, PlaybackOptions,

@@ -2116,3 +2116,45 @@ async fn a_ladder_s_rungs_are_read_by_their_number() {
     client.close().await;
     server.stop().await;
 }
+
+/// P7-04: the phone holding an identity's root ties alice's account to it,
+/// and the account says so; severing it says so too.
+#[tokio::test]
+async fn the_phone_ties_the_account_to_its_identity_and_severs_it() {
+    let (server, client, _) = ready("sdk-tie-root").await;
+    let alice = alice(&server, &client).await;
+    let (identity, _phrase) = client.portable().create("Alice").await.unwrap();
+    assert_eq!(alice.tie_info().await.unwrap(), None);
+    alice.tie(identity).await.unwrap();
+    assert_eq!(alice.tie_info().await.unwrap(), Some(identity));
+    assert_eq!(alice.tie(identity).await, Err(SdkError::AlreadyTied));
+    alice.untie().await.unwrap();
+    assert_eq!(alice.tie_info().await.unwrap(), None);
+    assert!(matches!(alice.untie().await, Err(SdkError::NotFound(_))));
+}
+
+/// A TV that never sees the root ties with the credential the phone gave
+/// it; another account here cannot then take the same identity.
+#[tokio::test]
+async fn a_device_ties_with_its_credential_and_the_identity_is_taken_after() {
+    let (server, tv, _) = ready("sdk-tie-device").await;
+    let phone = client_on(&server, &Arc::new(MemoryStorage::default())).await;
+    let (identity, _phrase) = phone.portable().create("Alice").await.unwrap();
+    let key = tv.portable().device_key(identity).await.unwrap();
+    let credential = phone
+        .portable()
+        .issue_credential(identity, key)
+        .await
+        .unwrap();
+    tv.portable().install_credential(credential).await.unwrap();
+
+    let alice = alice(&server, &tv).await;
+    alice.tie(identity).await.unwrap();
+    assert_eq!(alice.tie_info().await.unwrap(), Some(identity));
+
+    let bob = phone
+        .sign_in(&id(&server), "bob", "battery staple", false)
+        .await
+        .unwrap();
+    assert_eq!(bob.tie(identity).await, Err(SdkError::PortableIdTaken));
+}

@@ -445,6 +445,7 @@ fn answer(
             role: Role::Consumer,
             locked: false,
             pin: None,
+            portable: None,
         }),
         Request::Libraries => Reply::Libraries {
             libraries: Vec::new(),

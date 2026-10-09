@@ -20,6 +20,7 @@ pub mod passkeys;
 pub mod playback;
 pub mod plex;
 pub mod policy;
+pub mod portable;
 pub mod previews;
 pub mod relay_access;
 pub mod resource;
@@ -47,6 +48,11 @@ pub use playback::{
     SubtitleDelivery, TrackReason,
 };
 pub use plex::{PlexLink, PlexSyncSummary};
+pub use portable::{
+    CredentialError, DevicePublicKey, InvalidDevicePublicKey, InvalidPortableUserId,
+    PORTABLE_USER_ID_LEN, PortableIdentityState, PortableUserId, RevokedKey, StateError, TieProof,
+    TieProofError, UserDeviceCredential, tie_message,
+};
 pub use previews::{PreviewTile, Previews};
 pub use search::{SearchCounts, SearchGroup, SearchRequest, SearchResults, TopResult};
 pub use server_id::{APP_RP_DOMAIN, InvalidServerId, SERVER_ID_LEN, ServerId};

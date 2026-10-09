@@ -1647,6 +1647,35 @@ fn info(u: UserRecord, limited: Option<std::time::Duration>) -> UserInfo {
         has_pin: u.has_pin,
         device_count: u.device_count,
         session_count: u.session_count,
+        portable: u.tie.map(|tie| spoolframe_admin_api::PortableTie {
+            id: tie.portable.to_string(),
+            fingerprint: tie.portable.fingerprint(),
+            tied_at: tie.tied_at,
+        }),
+    }
+}
+
+/// Sever `user`'s tie (P7-04), `by` whom for the log: the identity it
+/// was to, or `NO_SUCH_LINK` for none.
+async fn untie(
+    store: &crate::store::Store,
+    user: crate::store::users::LocalUserId,
+    username: &str,
+    by: &str,
+) -> RpcResult<()> {
+    match store.untie(user).await.map_err(internal)? {
+        Some(portable) => {
+            tracing::info!(
+                user = %username,
+                portable = %portable.fingerprint(),
+                "portable identity untied by {by}"
+            );
+            Ok(())
+        }
+        None => Err(error(
+            error_code::NO_SUCH_LINK,
+            "the account is tied to no portable identity",
+        )),
     }
 }
 
@@ -2116,6 +2145,12 @@ impl MeApiServer for AdminApi {
             .await?;
         tracing::info!(user = %user.user, provider = ?self.oidc.provider_of(&issuer), "sign-in provider account unlinked by its user");
         Ok(())
+    }
+
+    async fn portable_untie(&self, ext: &Extensions) -> RpcResult<()> {
+        let (_, user) = self.recently_signed_in(ext).await?;
+        let me = self.account(user).await?;
+        untie(self.auth.store(), me.id, &me.username, "its user").await
     }
 
     async fn plex_link(&self, ext: &Extensions) -> RpcResult<PlexUser> {
@@ -2631,6 +2666,12 @@ impl AdminApiServer for AdminApi {
         self.auth.store().unlink_identity(user.id, &issuer).await?;
         tracing::info!(%username, provider = ?self.oidc.provider_of(&issuer), "sign-in provider account unlinked by an admin");
         Ok(())
+    }
+
+    async fn user_untie(&self, ext: &Extensions, username: String) -> RpcResult<()> {
+        self.recent_admin(ext).await?;
+        let user = self.record(&username).await?;
+        untie(self.auth.store(), user.id, &user.username, "an admin").await
     }
 
     async fn sso_set_client_secret(

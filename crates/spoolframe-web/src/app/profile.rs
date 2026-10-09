@@ -56,6 +56,7 @@ pub fn Profile() -> Element {
                         div { style: "order:2", Passkeys { has_password, said: said.clone() } }
                         div { style: "order:4", DevicesAndSessions { has_pin } }
                         div { style: "order:6", super::plex::PlexAccountCard {} }
+                        div { style: "order:7", MyPortable { tied: user.portable.clone() } }
                     }
                 }
             }
@@ -79,11 +80,30 @@ pub fn Profile() -> Element {
             }
             Account { user: user.clone(), has_password }
             Passkeys { has_password, said }
+            MyPortable { tied: user.portable.clone() }
             super::plex::PlexAccountCard {}
             DevicesAndSessions { has_pin }
             PinCard { has_password, has_pin }
             Playback {}
         }
+    }
+}
+
+/// The signed-in user's tie to a portable identity (P7-04), as read at
+/// sign-in and kept here: severing it takes the badge away.
+#[component]
+fn MyPortable(tied: Option<spoolframe_admin_api::PortableTie>) -> Element {
+    let toast = use_signal(|| None::<Said>);
+    let mut tie = use_signal(|| tied);
+    rsx! {
+        super::portable::PortableCard {
+            owner: crate::portable::Owner::Me,
+            username: String::new(),
+            tie: tie(),
+            toast,
+            on_severed: move |_| tie.set(None),
+        }
+        Toast { said: toast }
     }
 }
 

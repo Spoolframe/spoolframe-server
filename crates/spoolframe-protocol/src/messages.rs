@@ -22,12 +22,13 @@ use crate::passkeys::{
 };
 use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Quality, Selection};
 use crate::plex::PlexLink;
+use crate::portable::{PortableUserId, TieProof};
 use crate::previews::Previews;
 use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -471,6 +472,33 @@ pub enum Request {
     ClearTrackOverride {
         id: MediaId,
     },
+    /// Begin tying the session user's account to a portable identity
+    /// (P7-04): `TieChallenge`, a nonce for the identity to sign over
+    /// ([`crate::portable::tie_message`]). The nonce is this session's,
+    /// for its user, for `expires_in_secs` (5 minutes), and is used once,
+    /// whatever `TieFinish` makes of it. Needs a session signed in within
+    /// the last 10 minutes, or `RecentSignInRequired`. An account already
+    /// tied gets `AlreadyTied`: `Untie` first.
+    TieBegin,
+    /// Tie the session user's account to `user`, with `proof` that `user`
+    /// signed the tie message over the nonce `TieBegin` gave: by the root,
+    /// or by a device key with a credential for `user` that holds and is
+    /// not revoked by any identity state this server has seen. `Done`.
+    ///
+    /// Needs a recent sign-in, as `TieBegin`. A nonce that is not this
+    /// session's, is used or is over is `TieChallengeExpired`: begin
+    /// again. A proof that does not hold is `InvalidCredentials`. An
+    /// account already tied is `AlreadyTied`; an identity tied to another
+    /// account here is `PortableIdTaken`. Nothing about the account
+    /// moves: the tie is a link beside it.
+    TieFinish {
+        user: PortableUserId,
+        proof: TieProof,
+    },
+    /// Sever the session user's tie (P7-04): `Done`. Only the link goes;
+    /// the account, its sessions, passkeys and watch state stay as they
+    /// are. Needs a recent sign-in. No tie is `NotFound`.
+    Untie,
 
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
@@ -836,6 +864,19 @@ pub enum Reply {
     Passkeys {
         passkeys: Vec<PasskeyInfo>,
     },
+    /// What a portable identity signs to tie the session user's account
+    /// to it (`TieBegin`, P7-04).
+    TieChallenge {
+        /// Used once, for `expires_in_secs`, by this session.
+        #[serde(with = "serde_bytes")]
+        nonce: [u8; 32],
+        /// This server's endpoint id, as the tie message names it. A
+        /// client signs with the id it dialled, never this one: the field
+        /// says which server meant to ask.
+        #[serde(with = "serde_bytes")]
+        server: [u8; 32],
+        expires_in_secs: u64,
+    },
 }
 
 /// Which HLS playlist (P2-05).
@@ -882,6 +923,10 @@ pub struct UserSummary {
     /// The user's PIN, if they have one (P2-08): for "Set · 4 digits", and
     /// for how many boxes a PIN pad shows. Never the PIN itself.
     pub pin: Option<PinState>,
+    /// The portable identity the account is tied to (P7-04), if any:
+    /// shown on the account, never as a second one.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub portable: Option<PortableUserId>,
 }
 
 /// A user's PIN as clients may know it.
@@ -1165,6 +1210,20 @@ pub enum Error {
     /// was made and the invite was not used up.
     #[error("that username is taken")]
     UsernameTaken,
+    /// `TieFinish` with a nonce that is not outstanding for this session:
+    /// it was used, it is over, or `TieBegin` never gave it here (P7-04).
+    /// Begin again.
+    #[error("the tie challenge is used or has expired; begin again")]
+    TieChallengeExpired,
+    /// The session user's account is tied to a portable identity already
+    /// (P7-04): `Untie` first. Nothing was changed.
+    #[error("this account is tied to a portable identity already")]
+    AlreadyTied,
+    /// Another account on this server is tied to that portable identity
+    /// (P7-04): one identity ties to one account per server. Sever that
+    /// tie first. Nothing was changed.
+    #[error("that portable identity is tied to another account here")]
+    PortableIdTaken,
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.

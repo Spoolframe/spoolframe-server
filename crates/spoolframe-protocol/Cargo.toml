@@ -13,6 +13,8 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 ciborium = { workspace = true }
 ciborium-ll = { workspace = true }
+# Checks what a portable user's root signed (P7-01); never signs.
+ed25519-dalek = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 sha2 = { workspace = true }

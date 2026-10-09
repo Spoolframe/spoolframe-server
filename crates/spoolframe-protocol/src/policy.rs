@@ -71,7 +71,10 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::GetPreviews { .. }
         | Request::Home
         | Request::TrustedProfiles
-        | Request::GetTrackPreferences => true,
+        | Request::GetTrackPreferences
+        // A second challenge only takes the place of the first, which
+        // stays bounded per session and user (P7-04).
+        | Request::TieBegin => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)
@@ -118,6 +121,9 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::SetTrackPreferences { .. }
         | Request::SetTrackOverride { .. }
         | Request::ClearTrackOverride { .. }
+        // A tie uses its nonce up; severing one is a change (P7-04).
+        | Request::TieFinish { .. }
+        | Request::Untie
         | Request::Unknown => false,
     }
 }

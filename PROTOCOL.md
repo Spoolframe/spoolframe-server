@@ -1,6 +1,16 @@
-# Development wire revision 12
+# Development wire revision 13
 
-Revision 12 (P6-05, pkarr) keeps the `spoolframe/client/1` ALPN and sets
+Revision 13 (P7-04, ties) keeps the `spoolframe/client/1` ALPN and sets
+`PROTOCOL_VERSION` to 13. Update the server and SDK together. There are
+three new session requests, `tie_begin` (answered `tie_challenge`),
+`tie_finish { user, proof }` and `untie` (both answered `done`), and
+three new errors, `tie_challenge_expired`, `already_tied` and
+`portable_id_taken`. `UserSummary` (the `WhoAmI` reply) has a new
+required field, `portable`: the `PortableUserId` the account is tied
+to, or `null`. What they do is in "Ties" under "Portable identities"
+below.
+
+Revision 12 (P6-05, pkarr) kept the `spoolframe/client/1` ALPN and sets
 `PROTOCOL_VERSION` to 12. Update the server and SDK together.
 `ServerAddresses` has a new required field, `lookup`: the URL of the
 pkarr relay the server publishes where it is to (`network.pkarr`), or
@@ -324,7 +334,8 @@ Some requests need a session that proved its user within the last 10
 minutes: `ApproveDeviceSignIn`, `BeginPasskeyRegistration`,
 `RemovePasskey`, `SetPin` with no `proof` (a user's first PIN),
 `SetPinRequired` with `required: false`, `SetDeviceTrust` except to
-stop trusting this device, and `ForgetDevice`. An older
+stop trusting this device, `ForgetDevice`, and `TieBegin`, `TieFinish`
+and `Untie` (P7-04). An older
 session gets `RecentSignInRequired`. The app then asks its user to
 confirm, and sends the request again. It does not sign out.
 
@@ -1031,6 +1042,179 @@ long the playback was not used. A client's own `StopPlayback` is not
 logged.
 
 The encoding did not change, so `PROTOCOL_VERSION` stays the same.
+
+## Portable identities
+
+A portable user (P7) is an Ed25519 root key the user holds on their
+phone; its public key, 64 hex digits, is the `PortableUserId`. The root
+never travels. What it signs does, and the formats are the protocol
+crate's (`spoolframe_protocol::portable`, MIT OR Apache-2.0), so any
+client can make and check them. The tie requests (revision 13, "Ties"
+below) carry a device credential; the sign-in that carries one is
+P7-06.
+
+Every signature is Ed25519 over a domain string (with its trailing NUL)
+followed by fixed-width fields: keys and ids as their 32 bytes,
+integers big-endian. There is one encoding of each value, so nothing
+needs canonicalising. A verifier uses strict Ed25519 verification.
+
+### Device credential
+
+The root's word that one device key may act as the user (§45). Each
+device has its own Ed25519 key for this, apart from its Iroh endpoint
+key.
+
+```
+"spoolframe device credential v1\0"
+user        32 bytes   the PortableUserId
+device_key  32 bytes   the device's public key
+serial      u64        the root's count of credentials issued
+issued_at   i64        Unix seconds
+expires_at  i64        Unix seconds; required
+```
+
+signed by the root. In serde (JSON here):
+
+```json
+{"user": "ea4a…d22c", "device_key": "fd17…f618", "serial": 3,
+ "issued_at": 1791504000, "expires_at": 1799280000,
+ "signature": "9113…1308"}
+```
+
+Keys are 64 lowercase hex digits (either case is read), the signature
+128. A credential is good at time `now` when the user's root signed it,
+`issued_at <= now + 300` (five minutes of clock skew), `now <
+expires_at`, and `expires_at - issued_at` is at most 90 days. Renewal
+is a new credential for the same key with the next serial.
+
+### Identity state
+
+The root's list of revoked device keys, each with when it was revoked
+(§48):
+
+```
+"spoolframe identity state v2\0"
+user        32 bytes
+revision    u64        higher is newer
+issued_at   i64        Unix seconds; does not order states
+count       u32        number of entries that follow
+entries     sorted ascending by key, one per key, each:
+  key         32 bytes
+  revoked_at  i64      Unix seconds
+```
+
+```json
+{"user": "ea4a…d22c", "revision": 2,
+ "revoked": [{"key": "66be…473a", "revoked_at": 1791500400},
+             {"key": "fd17…f618", "revoked_at": 1791417600}],
+ "issued_at": 1791504000, "signature": "0185…da0d"}
+```
+
+The signature covers the set, so the order of `revoked` in the serde
+form does not matter; a key listed twice counts once, at its earliest
+`revoked_at`. There is no list of authorized keys: adding a device
+needs no new state. (v1, without `revoked_at`, was never sent.)
+
+Revocation only grows. A verifier keeps the union of the entries of
+every valid state it has seen for a user, older revisions included, at
+each key's earliest `revoked_at`, and refuses any credential whose
+device key is in that union. Separately it keeps the state of the
+highest revision, to hand on to others. A later state from a second
+holder of the root that did not know of a revocation cannot undo it.
+
+A revocation lapses 90 days and 5 minutes (`REVOCATION_WINDOW`: the
+longest credential plus the clock skew) after its `revoked_at`: no
+credential issued before it can still hold, and a root issues none to
+a key it has revoked. A verifier may drop lapsed entries from its
+union, and a root leaves them out of the states it signs. A state may
+list at most 1024 entries, so the limit bounds live revocations only;
+a state with more is refused.
+
+### Device proof
+
+Possession of the device key, shown to one server:
+
+```
+"spoolframe device proof v1\0"
+server      32 bytes   the server's EndpointId
+nonce       32 bytes   chosen by the server for this sign-in
+```
+
+signed by the device key the credential names. The server's id keeps a
+proof from being replayed to another server, and the nonce from being
+replayed to the same one.
+
+### Ties
+
+A local account and a portable identity are one person once the
+identity proves it to the server for that account (P7-04). The tie is a
+link beside the account: sessions, passkeys and watch state stay keyed
+on the local user, and severing the tie removes the link only. One
+account ties to at most one identity, and one identity to at most one
+account on a server. A server never holds the root, so a tie is access
+continuity, not recovery.
+
+The identity signs, with its root or with a device key:
+
+```
+"spoolframe tie v1\0"
+server      32 bytes   the server's EndpointId
+nonce       32 bytes   from tie_challenge
+user        32 bytes   the PortableUserId
+length      u16        the local username's length in bytes
+username    UTF-8      the local username
+```
+
+so a proof cannot be used on another server, again on this one, for
+another identity, or for another account here. The SDK signs with the
+id it dialled, never the one the challenge names.
+
+| Request | Reply |
+|---|---|
+| `{"type": "tie_begin"}` | `{"type": "tie_challenge", "nonce": bytes(32), "server": bytes(32), "expires_in_secs": 300}` |
+| `{"type": "tie_finish", "user": "<id>", "proof": {"type": "root", "signature": "<128 hex>"}}` | `Done` |
+| `{"type": "tie_finish", "user": "<id>", "proof": {"type": "device", "credential": {…}, "signature": "<128 hex>"}}` | `Done` |
+| `{"type": "untie"}` | `Done` |
+
+`nonce` and `server` are CBOR byte strings. Each request needs a
+session that signed in within the last 10 minutes
+(`RecentSignInRequired`). `TieBegin` is retry-safe; the other two are
+mutations, with an operation ID, never sent again on a new connection.
+
+- The nonce belongs to the session that began it, for its user, for 5
+  minutes. Beginning again replaces it; a user holds at most 4 across
+  their sessions (the oldest goes). `TieFinish` uses it up whatever
+  the proof: one that is not this session's, used or over is
+  `TieChallengeExpired`.
+- A `root` proof is the root's signature. A `device` proof is a device
+  key's, with a credential for `user` that holds now ("Device
+  credential") and whose key no identity state the server has seen
+  revokes. Anything else is `InvalidCredentials`, logged as a refused
+  sign-in (`tie proof refused`).
+- An account already tied gets `AlreadyTied` (at `TieBegin` and
+  `TieFinish`): `Untie` first. An identity tied to another account here
+  gets `PortableIdTaken`.
+- `Untie` with no tie is `NotFound`.
+- `WhoAmI`'s `portable` is the tie, or `null`.
+
+The admin API shows the tie on `UserInfo.portable` (`{ id,
+fingerprint, tiedAt }` or `null`) and severs it with `admin.userUntie`
+(recent admin) and `me.portableUntie` (recent sign-in); with no tie
+both answer `NO_SUCH_LINK`. Neither ties: the web UI never holds the
+root.
+
+### SDK
+
+`Session::tie(identity)` begins, signs with the root if this device
+holds it (`Portable::tie_proof`), else with its device credential, and
+finishes; the root is never sent. `Session::untie()` severs;
+`Session::tie_info()` reads the tie from `WhoAmI`. The new errors are
+`SdkError::TieChallengeExpired`, `AlreadyTied` and `PortableIdTaken`.
+
+The test vectors in `portable.rs` (root seed `[7; 32]`, device seeds
+`[9; 32]` and `[11; 32]`) were computed apart from the code, with
+Python and `openssl pkeyutl -rawin`; the tie vector signs for username
+`alice` on server `[0x5a; 32]` over nonce `[0xa5; 32]`.
 
 ## SDK migration in 0.3.0
 

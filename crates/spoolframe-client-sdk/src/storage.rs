@@ -18,7 +18,8 @@ pub struct StorageError(pub String);
 /// that stops the store from answering is an error.
 #[async_trait]
 pub trait Storage: Send + Sync {
-    /// Secrets: the device's key and the session tokens.
+    /// Secrets: the device's key, the session tokens, portable roots and
+    /// portable device keys.
     async fn secret(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError>;
     /// Set a secret; `None` removes it.
     async fn set_secret(&self, key: &str, value: Option<Vec<u8>>) -> Result<(), StorageError>;
@@ -37,9 +38,50 @@ pub mod keys {
     /// Data: the saved servers, JSON.
     pub const SERVERS: &str = "servers";
 
+    /// Data: the portable identities on this device, JSON (P7-01).
+    pub const PORTABLE_IDENTITIES: &str = "portable-identities";
+
+    /// Data: the device credentials this device acts with, JSON: each
+    /// identity's id → its credential (P7-02). The identity's root need
+    /// not be on this device.
+    pub const PORTABLE_CREDENTIALS: &str = "portable-credentials";
+
     /// Secret: the sessions on one server, JSON.
     pub fn sessions(server: &str) -> String {
         format!("sessions/{server}")
+    }
+
+    /// Secret: one portable identity's root signing key, 32 bytes
+    /// (P7-01). The most valuable secret the SDK keeps: whoever reads it
+    /// is that user everywhere, until they recover elsewhere and revoke.
+    pub fn portable_root(id: &str) -> String {
+        format!("portable-root/{id}")
+    }
+
+    /// Secret: this device's own key for acting as portable identity
+    /// `id`, 32 bytes (P7-02). Its credential names the public half.
+    pub fn portable_device(id: &str) -> String {
+        format!("portable-device/{id}")
+    }
+
+    /// Data: the last serial the root of `id` gave a credential, JSON
+    /// (P7-02). Saved before each credential is signed, so no two share
+    /// one.
+    pub fn portable_serial(id: &str) -> String {
+        format!("portable-serial/{id}")
+    }
+
+    /// Data: the newest identity state of `id` this device has, JSON
+    /// (P7-02): made here by its root, or brought from elsewhere.
+    pub fn portable_state(id: &str) -> String {
+        format!("portable-state/{id}")
+    }
+
+    /// Data: every device key of `id` revoked here, and when, JSON (key →
+    /// Unix seconds): the union of all the states this device has made or
+    /// accepted, older revisions too (P7-02).
+    pub fn portable_revoked(id: &str) -> String {
+        format!("portable-revoked/{id}")
     }
 }
 

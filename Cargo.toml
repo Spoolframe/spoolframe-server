@@ -85,6 +85,18 @@ blake3 = "1"
 # Server key fingerprints (P1-21): SHA-256, as the format specifies.
 sha2 = "0.10"
 
+# Portable identities (P7-01). Ed25519 for the root key: the version iroh
+# already builds, so the graph carries one curve, not two. Its defaults
+# zeroize a signing key when dropped.
+ed25519-dalek = "3"
+# The recovery phrase: BIP-39, its English wordlist and checksum (CC0).
+# `zeroize` clears a parsed phrase when dropped.
+bip39 = { version = "2", default-features = false, features = ["std", "zeroize"] }
+# The root's entropy, from the OS. Already in the build through iroh.
+getrandom = "0.4"
+# Clears the phrase's words and the seed once used.
+zeroize = "1"
+
 # Passkeys (P3-05). `conditional-ui` is the feature the username-less
 # (discoverable) sign-in sits behind. It links OpenSSL.
 # `danger-allow-state-serialisation` lets an app passkey ceremony's state

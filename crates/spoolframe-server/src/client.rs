@@ -85,6 +85,8 @@ pub(crate) struct ClientProtocol {
     addresses: Addresses,
     instance: String,
     operations: crate::operations::Pools,
+    /// Tie challenges begun and not yet answered (P7-04).
+    ties: Arc<crate::ties::TieChallenges>,
 }
 
 /// What one connection has said so far.
@@ -264,6 +266,9 @@ impl ClientProtocol {
             told,
         };
         tokio::spawn(addresses.clone().tell_changes());
+        let ties = Arc::new(crate::ties::TieChallenges::new(
+            services.auth.store().clock().clone(),
+        ));
         Self {
             id: endpoint.id(),
             connections,
@@ -273,6 +278,7 @@ impl ClientProtocol {
             addresses,
             instance: uuid::Uuid::now_v7().to_string(),
             operations: crate::operations::Pools::default(),
+            ties,
         }
     }
 
@@ -1468,6 +1474,7 @@ impl ClientProtocol {
             Request::WhoAmI => {
                 // Asked while locked too: a PIN pad sizes itself by it.
                 let pin = self.store().pin_info(user.user).await.map_err(internal)?;
+                let tie = self.store().tie_of(user.user).await.map_err(internal)?;
                 Ok(Reply::WhoAmI(UserSummary {
                     user_id: format!("local:{}", user.user),
                     username: user.username,
@@ -1475,6 +1482,7 @@ impl ClientProtocol {
                     role: user.role,
                     locked: state.locks.lock().locked(&session),
                     pin: pin.map(|p| PinState { digits: p.digits }),
+                    portable: tie.map(|tie| tie.portable),
                 }))
             }
             Request::BeginPasskeyRegistration => {
@@ -2500,6 +2508,55 @@ impl ClientProtocol {
                     Err(wrong_sign_in_code())
                 }
             }
+            // P7-04: each needs a recent sign-in, as every change to how
+            // the account is reached does.
+            Request::TieBegin => {
+                recently_signed_in(&user)?;
+                if self
+                    .store()
+                    .tie_of(user.user)
+                    .await
+                    .map_err(internal)?
+                    .is_some()
+                {
+                    return Err(Error::AlreadyTied);
+                }
+                let session = SessionToken(session.0.clone()).hash();
+                let (nonce, lasts) =
+                    self.ties
+                        .begin(&session, user.user)
+                        .map_err(|_| Error::RateLimited {
+                            retry_after_ms: crate::ties::TIE_CHALLENGE_LIFETIME.as_millis() as u64,
+                        })?;
+                Ok(Reply::TieChallenge {
+                    nonce,
+                    server: *self.id.as_bytes(),
+                    expires_in_secs: lasts.as_secs(),
+                })
+            }
+            Request::TieFinish {
+                user: portable,
+                proof,
+            } => {
+                recently_signed_in(&user)?;
+                self.tie(&session, &user, portable, &proof).await
+            }
+            Request::Untie => {
+                recently_signed_in(&user)?;
+                match self.store().untie(user.user).await.map_err(internal)? {
+                    Some(portable) => {
+                        tracing::info!(
+                            user = %user.username,
+                            portable = %portable.fingerprint(),
+                            "portable identity untied by its user, in an app"
+                        );
+                        Ok(Reply::Done)
+                    }
+                    None => Err(Error::NotFound {
+                        what: "portable identity tie".into(),
+                    }),
+                }
+            }
             Request::Hello(_)
             | Request::AuthMethods
             | Request::LoginPassword(_)
@@ -2696,6 +2753,72 @@ impl ClientProtocol {
             }
             Err(e) => Err(internal(e)),
         }
+    }
+
+    /// Tie `user`'s account to `portable` (P7-04), with `proof` over the
+    /// challenge `session` began. The challenge is used up first, whatever
+    /// follows: a proof gets one try.
+    async fn tie(
+        &self,
+        session: &SessionId,
+        user: &SessionUser,
+        portable: spoolframe_protocol::PortableUserId,
+        proof: &spoolframe_protocol::TieProof,
+    ) -> Result<Reply, Error> {
+        let Some(nonce) = self
+            .ties
+            .take(&SessionToken(session.0.clone()).hash(), user.user)
+        else {
+            return Err(Error::TieChallengeExpired);
+        };
+        if self
+            .store()
+            .tie_of(user.user)
+            .await
+            .map_err(internal)?
+            .is_some()
+        {
+            return Err(Error::AlreadyTied);
+        }
+        let now = self.store().clock().unix_secs();
+        if let Err(e) = crate::ties::check_tie(
+            self.store(),
+            proof,
+            portable,
+            self.id.as_bytes(),
+            &nonce,
+            &user.username,
+            now,
+        )
+        .await
+        {
+            if let crate::ties::TieCheckError::Store(e) = e {
+                return Err(internal(e));
+            }
+            // The refusal itself is logged as every one is; why, here.
+            tracing::debug!(
+                user = %user.username,
+                portable = %portable.fingerprint(),
+                error = %e,
+                "a tie proof did not hold"
+            );
+            return Err(Error::InvalidCredentials);
+        }
+        self.store()
+            .tie(user.user, portable, proof.kind())
+            .await
+            .map_err(|e| match e {
+                crate::store::ties::TieError::AlreadyTied => Error::AlreadyTied,
+                crate::store::ties::TieError::PortableIdTaken => Error::PortableIdTaken,
+                crate::store::ties::TieError::Store(e) => internal(e),
+            })?;
+        tracing::info!(
+            user = %user.username,
+            portable = %portable.fingerprint(),
+            proof = proof.kind(),
+            "portable identity tied, in an app"
+        );
+        Ok(Reply::Done)
     }
 
     /// `session`'s user proved who they are again, `how`: it counts as
@@ -3465,6 +3588,7 @@ impl Asked {
             Request::FinishPasskeySignIn { .. }
             | Request::FinishConfirmPasskey(_)
             | Request::FinishPasskeyRegistration(_) => asked.credential = Some("passkey refused"),
+            Request::TieFinish { .. } => asked.credential = Some("tie proof refused"),
             Request::ResumeProfile { .. } => asked.resume = true,
             Request::RedeemInvite(_) => asked.invite = true,
             _ => {}

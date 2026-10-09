@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use spoolframe_protocol::Error as ServerError;
 
+use crate::portable::{CredentialError, PhraseError, StateError};
 use crate::storage::StorageError;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -218,6 +219,40 @@ pub enum SdkError {
     /// The device sign-in is over (it timed out): begin another.
     #[error("the sign-in code has expired")]
     SignInExpired,
+    /// The recovery phrase is not one (P7-01): back to the entry, the
+    /// reason under it.
+    #[error(transparent)]
+    Phrase(#[from] PhraseError),
+    /// This device holds no portable identity with that id (P7-01).
+    #[error("no portable identity {0} on this device")]
+    UnknownIdentity(String),
+    /// A device credential that does not hold (P7-02): not signed by the
+    /// identity it names, out of date, or with a proof that fails.
+    #[error(transparent)]
+    Credential(#[from] CredentialError),
+    /// An identity state that is not one (P7-02).
+    #[error(transparent)]
+    IdentityState(#[from] StateError),
+    /// The credential is for a device key this device does not hold for
+    /// that identity (P7-02): another device's.
+    #[error("the credential is for another device")]
+    NotThisDevice,
+    /// The newest identity state this device has revokes the device key
+    /// (P7-02): it no longer acts as that identity.
+    #[error("this device's key for the identity is revoked")]
+    DeviceKeyRevoked,
+    /// The tie's challenge is used or over (P7-04): tie again from the
+    /// start ([`crate::Session::tie`]).
+    #[error("the tie took too long; try again")]
+    TieChallengeExpired,
+    /// This account is tied to a portable identity already (P7-04): sever
+    /// it first ([`crate::Session::untie`]).
+    #[error("this account is tied to a portable identity already")]
+    AlreadyTied,
+    /// Another account on the server is tied to that identity (P7-04):
+    /// one identity, one account per server. Sever that tie first.
+    #[error("that identity is tied to another account on this server")]
+    PortableIdTaken,
     /// Any other error the server answered with.
     #[error("server: {0}")]
     Server(String),
@@ -275,6 +310,9 @@ impl SdkError {
             ServerError::InviteExpired => SdkError::InviteExpired,
             ServerError::InviteExhausted => SdkError::InviteExhausted,
             ServerError::UsernameTaken => SdkError::UsernameTaken,
+            ServerError::TieChallengeExpired => SdkError::TieChallengeExpired,
+            ServerError::AlreadyTied => SdkError::AlreadyTied,
+            ServerError::PortableIdTaken => SdkError::PortableIdTaken,
             other => SdkError::Server(other.to_string()),
         }
     }
@@ -305,6 +343,22 @@ mod tests {
         assert_eq!(
             SdkError::from_server(ServerError::LastSignInMethod),
             SdkError::LastSignInMethod
+        );
+    }
+
+    #[test]
+    fn the_tie_errors_are_told_apart() {
+        assert_eq!(
+            SdkError::from_server(ServerError::TieChallengeExpired),
+            SdkError::TieChallengeExpired
+        );
+        assert_eq!(
+            SdkError::from_server(ServerError::AlreadyTied),
+            SdkError::AlreadyTied
+        );
+        assert_eq!(
+            SdkError::from_server(ServerError::PortableIdTaken),
+            SdkError::PortableIdTaken
         );
     }
 }

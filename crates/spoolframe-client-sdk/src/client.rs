@@ -23,6 +23,7 @@ use crate::connection::{ServerConnection, Timeouts};
 use crate::discovery::Discovery;
 use crate::error::SdkError;
 use crate::link::{ConnectionPath, Link, SignOutWatch, StateWatch};
+use crate::portable::Portable;
 use crate::servers::{self, SavedServer, ServerEntry};
 use crate::session::{self, SavedProfile, Session, SignInMethod, StoredSession};
 use crate::storage::{Storage, StorageError, keys};
@@ -158,6 +159,8 @@ pub(crate) struct Inner {
     revisions: Mutex<HashMap<PlaybackKey, RevisionState>>,
     progress_sequences: Mutex<HashMap<PlaybackKey, RevisionState>>,
     activating: tokio::sync::Mutex<()>,
+    /// The portable identities on this device, over the same storage.
+    portable: Portable,
 }
 
 impl std::fmt::Debug for Client {
@@ -262,7 +265,7 @@ impl Client {
         let client = Self {
             inner: Arc::new(Inner {
                 endpoint,
-                storage,
+                storage: storage.clone(),
                 device,
                 timeouts,
                 discovery,
@@ -275,6 +278,7 @@ impl Client {
                 revisions: Mutex::default(),
                 progress_sequences: Mutex::default(),
                 activating: tokio::sync::Mutex::default(),
+                portable: Portable::new(storage.clone()),
             }),
         };
         // Where saved servers publish (P6-05): looked up there from the start.
@@ -1686,6 +1690,13 @@ impl Client {
             self.inner.discovery.changed();
         }
         Ok(())
+    }
+
+    /// The portable identities this device holds the roots of (P7-01).
+    /// Every call shares one lock, so take them from here rather than
+    /// making another [`Portable`] over the same storage.
+    pub fn portable(&self) -> Portable {
+        self.inner.portable.clone()
     }
 
     /// This device's identity, as servers see it.

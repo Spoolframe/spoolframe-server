@@ -96,6 +96,8 @@ pub struct UserRecord {
     /// Their live sessions: not revoked, not expired, as `list_sessions`
     /// lists them.
     pub session_count: u64,
+    /// Their account's tie to a portable identity (P7-04), if any.
+    pub tie: Option<super::ties::Tie>,
 }
 
 /// What a password login needs about a user.
@@ -440,8 +442,10 @@ impl Store {
                      WHERE s.user_id = u.id) AS device_count, \
                     (SELECT count(*) FROM sessions s \
                      WHERE s.user_id = u.id AND s.revoked_at IS NULL AND s.expires_at > ?1) \
-                        AS session_count \
+                        AS session_count, \
+                    t.portable_user_id, t.tied_at, t.proof_kind \
              FROM users u LEFT JOIN password_credentials p ON p.user_id = u.id \
+                  LEFT JOIN portable_ties t ON t.local_user_id = u.id \
              ORDER BY u.username",
         )
         .bind(self.now())
@@ -464,6 +468,16 @@ impl Store {
                     has_pin: row.try_get("has_pin")?,
                     device_count: row.try_get::<i64, _>("device_count")? as u64,
                     session_count: row.try_get::<i64, _>("session_count")? as u64,
+                    tie: match row.try_get::<Option<String>, _>("portable_user_id")? {
+                        None => None,
+                        Some(portable) => Some(super::ties::Tie {
+                            portable: portable
+                                .parse()
+                                .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                            tied_at: row.try_get("tied_at")?,
+                            proof_kind: row.try_get("proof_kind")?,
+                        }),
+                    },
                 })
             })
             .collect()

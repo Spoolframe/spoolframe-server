@@ -729,6 +729,13 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
         UserSessionList { username: username.clone(), name: name.clone(), disabled: user.disabled, toast, devices_changed }
         super::plex::UserPlex { username: username.clone(), name: name.clone(), toast }
         UserSso { username: username.clone(), name: name.clone(), toast }
+        super::portable::PortableCard {
+            owner: crate::portable::Owner::User { name: name.clone() },
+            username: username.clone(),
+            tie: user.portable.clone(),
+            toast,
+            on_severed: move |_| on_changed.call(()),
+        }
         UserDevices {
             username: username.clone(),
             name: name.clone(),

@@ -93,6 +93,8 @@ spoolframe-test-dir = { workspace = true }
 cargo_metadata = { workspace = true }
 m3u8-rs = { workspace = true }
 spoolframe-client-sdk = { workspace = true }
+# Signs the portable credentials and states the store tests check (P7-02).
+ed25519-dalek = { workspace = true }
 # Its live checks of the stranger limits, run against a test server (PX-11).
 spoolframe-probe = { workspace = true }
 webauthn-authenticator-rs = { workspace = true }
