@@ -15,6 +15,7 @@ use iroh::endpoint_info::UserData;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
+use spoolframe_protocol::relay_access::RELAY_ACCESS_ALPN;
 use spoolframe_protocol::{CLIENT_ALPN, FEDERATION_ALPN, PROTOCOL_VERSION, ServerInfo, close, lan};
 
 use spoolframe_catalog::Catalog;
@@ -41,6 +42,61 @@ pub enum Relay {
     Default,
     /// A relay of our own, or anyone's.
     Custom(Url),
+}
+
+/// The ALPNs the endpoint takes: the client protocol, federation (to
+/// refuse it with a reason), and its relays' question when it has relays
+/// of its own (P6-04).
+fn alpns(options: &EndpointOptions) -> Vec<Vec<u8>> {
+    let mut alpns = vec![CLIENT_ALPN.to_vec(), FEDERATION_ALPN.to_vec()];
+    if !options.own_relays.is_empty() {
+        alpns.push(RELAY_ACCESS_ALPN.to_vec());
+    }
+    alpns
+}
+
+/// Where the server publishes where it is (`network.pkarr`, P6-05).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Pkarr {
+    /// Nothing is published.
+    #[default]
+    Off,
+    /// n0's public pkarr relay, which its DNS (dns.iroh.link) serves.
+    N0,
+    /// A pkarr relay of the operator's own.
+    Custom(Url),
+}
+
+/// n0's pkarr relay, as iroh names it: where `Pkarr::N0` publishes, and
+/// what a device is told to look the server up at.
+pub const N0_PKARR: &str = "https://dns.iroh.link/pkarr";
+
+impl Pkarr {
+    /// The pkarr relay's URL; `None` while off.
+    pub fn url(&self) -> Option<Url> {
+        match self {
+            Pkarr::Off => None,
+            Pkarr::N0 => Some(Url::parse(N0_PKARR).expect("a valid URL")),
+            Pkarr::Custom(url) => Some(url.clone()),
+        }
+    }
+}
+
+/// What the server publishes (P6-05): its relays and the addresses that
+/// are public. A LAN, link-local or loopback address is never put in a
+/// record anyone can read.
+fn published() -> iroh::address_lookup::AddrFilter {
+    iroh::address_lookup::AddrFilter::new(|addrs| {
+        let kept = addrs
+            .iter()
+            .filter(|addr| match addr {
+                iroh::TransportAddr::Ip(ip) => crate::wan::not_public(ip.ip()).is_none(),
+                _ => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        std::borrow::Cow::Owned(kept)
+    })
 }
 
 /// `relays` as iroh's mode: none is off, `default` alone n0's own, and
@@ -102,6 +158,11 @@ pub struct EndpointOptions {
     pub port: Option<u16>,
     /// `network.relays`; empty: relays off.
     pub relays: Vec<Relay>,
+    /// `network.pkarr` (P6-05).
+    pub pkarr: Pkarr,
+    /// `network.own_relays` (P6-04): the relay processes of its own it
+    /// tells who an endpoint is.
+    pub own_relays: Vec<EndpointId>,
     /// Announce the server on the LAN over mDNS (P1-13).
     pub mdns: bool,
     /// Who may hold connections (PX-10).
@@ -432,7 +493,7 @@ impl Server {
             .secret_key(key)
             .relay_mode(relay)
             .transport_config(admission::transport_config())
-            .alpns(vec![CLIENT_ALPN.to_vec(), FEDERATION_ALPN.to_vec()]);
+            .alpns(alpns(options));
         if options.mdns {
             let advert: UserData = lan::advert(&name.get())
                 .parse()
@@ -440,6 +501,13 @@ impl Server {
             builder = builder
                 .address_lookup(MdnsAddressLookup::builder().service_name(lan::MDNS_SERVICE))
                 .user_data_for_address_lookup(advert);
+        }
+        if let Some(url) = options.pkarr.url() {
+            // Signed with the server's key; iroh republishes it as what it
+            // knows of itself changes, and every few minutes.
+            builder = builder.address_lookup(
+                iroh::address_lookup::PkarrPublisher::builder(url).addr_filter(published()),
+            );
         }
         if let Some(port) = options.port {
             builder = builder
@@ -511,7 +579,23 @@ impl Server {
         if let Some(wan) = &options.wan {
             crate::wan::start(&public, wan, &endpoint, &services.wan);
         }
-        let told = Told::new(endpoint.clone(), options.announce.clone(), relays, public);
+        let lookup = options.pkarr.url().map(|url| url.to_string());
+        let told = Told::new(
+            endpoint.clone(),
+            options.announce.clone(),
+            relays,
+            lookup,
+            public,
+        );
+        // The relays of its own it answers (P6-04); none, and the ALPN is
+        // refused as any other unknown one.
+        let relay_access = (!options.own_relays.is_empty()).then(|| {
+            crate::relay_access::RelayAccess::new(
+                options.own_relays.clone(),
+                endpoint.id(),
+                services.auth.clone(),
+            )
+        });
         let client = ClientProtocol::new(
             endpoint.clone(),
             told.clone(),
@@ -520,10 +604,13 @@ impl Server {
             name.clone(),
             services,
         );
-        let router = Router::builder(endpoint)
+        let mut router = Router::builder(endpoint)
             .accept(CLIENT_ALPN, client)
-            .accept(FEDERATION_ALPN, Unsupported("spoolframe/federation/1"))
-            .spawn();
+            .accept(FEDERATION_ALPN, Unsupported("spoolframe/federation/1"));
+        if let Some(relay_access) = relay_access {
+            router = router.accept(RELAY_ACCESS_ALPN, relay_access);
+        }
+        let router = router.spawn();
         Ok(Self {
             router,
             told,
@@ -597,5 +684,29 @@ impl ProtocolHandler for Unsupported {
         // Stay until the close is delivered, or the peer never sees why.
         connection.closed().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The record anyone can read holds the relays and the public
+    /// addresses, never a LAN one (P6-05).
+    #[test]
+    fn only_relays_and_public_addresses_are_published() {
+        let relay: RelayUrl = "https://relay.example.org".parse().unwrap();
+        let ip = |s: &str| iroh::TransportAddr::Ip(s.parse().unwrap());
+        let addrs = vec![
+            iroh::TransportAddr::Relay(relay.clone()),
+            ip("192.168.1.10:7420"),
+            ip("127.0.0.1:7420"),
+            ip("[fe80::1]:7420"),
+            ip("203.0.113.7:7420"),
+        ];
+        assert_eq!(
+            published().apply(&addrs).into_owned(),
+            [iroh::TransportAddr::Relay(relay), ip("203.0.113.7:7420")]
+        );
     }
 }

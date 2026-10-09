@@ -106,6 +106,11 @@ pub(crate) struct SavedServer {
     /// file written before the SDK kept them: none.
     #[serde(default)]
     pub relays: Vec<String>,
+    /// The pkarr relay the server publishes where it is to (P6-05), as it
+    /// or an invite told: where this device looks it up by its key. Absent
+    /// from a file written before the SDK kept it: none.
+    #[serde(default)]
+    pub lookup: Option<String>,
     /// The addresses of the server's last `ServerAddresses` event, in its
     /// order: what it advertises, for an app to show. Unlike
     /// `known_addrs`, never capped, aged or mixed with addresses reached.
@@ -138,6 +143,7 @@ impl SavedServer {
             verified_at: verified.then_some(now),
             last_connected_at: Some(now),
             relays: Vec::new(),
+            lookup: None,
             advertised_addrs: Vec::new(),
             advertised_at: None,
         };
@@ -396,6 +402,7 @@ mod tests {
                     verified_at: None,
                     last_connected_at: None,
                     relays: Vec::new(),
+                    lookup: None,
                     advertised_addrs: Vec::new(),
                     advertised_at: None,
                 },
@@ -410,6 +417,7 @@ mod tests {
                     verified_at: None,
                     last_connected_at: None,
                     relays: Vec::new(),
+                    lookup: None,
                     advertised_addrs: Vec::new(),
                     advertised_at: None,
                 },

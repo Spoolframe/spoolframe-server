@@ -997,6 +997,7 @@ fn events_round_trip() {
     round_trip(Event::ServerAddresses {
         addrs: Vec::new(),
         relays: Vec::new(),
+        lookup: None,
     });
 }
 
@@ -1007,6 +1008,7 @@ fn server_addresses_event() -> Event {
             "[2001:db8::1]:4433".parse().unwrap(),
         ],
         relays: vec!["https://relay.example.net./".into()],
+        lookup: Some("https://dns.iroh.link/pkarr".into()),
     }
 }
 
@@ -1020,18 +1022,20 @@ fn the_server_addresses_event_goes_as_text() {
             "type": "server_addresses",
             "addrs": ["10.10.0.2:4433", "[2001:db8::1]:4433"],
             "relays": ["https://relay.example.net./"],
+            "lookup": "https://dns.iroh.link/pkarr",
         })
     );
     let bad: Result<Event, _> = serde_json::from_value(serde_json::json!({
-        "type": "server_addresses", "addrs": ["nimble.local:4433"], "relays": []
+        "type": "server_addresses", "addrs": ["nimble.local:4433"], "relays": [], "lookup": null
     }));
     assert!(bad.is_err(), "{bad:?}");
 }
 
-/// Neither list may be left out: an empty one is sent as empty.
+/// No field may be left out: an empty list is sent as empty, no lookup
+/// as `null`.
 #[test]
 fn the_server_addresses_event_missing_a_field_is_refused() {
-    assert_each_required(&server_addresses_event(), &["addrs", "relays"]);
+    assert_each_required(&server_addresses_event(), &["addrs", "relays", "lookup"]);
 }
 
 /// What a newer peer might send.

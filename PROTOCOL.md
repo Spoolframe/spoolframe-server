@@ -1,6 +1,16 @@
-# Development wire revision 11
+# Development wire revision 12
 
-Revision 11 (PX-21, adaptive HLS) keeps the `spoolframe/client/1` ALPN
+Revision 12 (P6-05, pkarr) keeps the `spoolframe/client/1` ALPN and sets
+`PROTOCOL_VERSION` to 12. Update the server and SDK together.
+`ServerAddresses` has a new required field, `lookup`: the URL of the
+pkarr relay the server publishes where it is to (`network.pkarr`), or
+`null`. The record there, signed with the server's key, holds its relays
+and public addresses, never a LAN one; a device looks the server up
+there by its key when nothing it knows reaches it. An invite link may
+carry the same URL as `lookup=`. A record is a hint only: the
+connection still proves the key.
+
+Revision 11 (PX-21, adaptive HLS) kept the `spoolframe/client/1` ALPN
 and sets `PROTOCOL_VERSION` to 11. Update the server and SDK together.
 A converted plan has a new required field, `ladder`: the encodes an HLS
 player switches between, highest first, each `{ "height", "max_bitrate"

@@ -178,7 +178,7 @@ async fn the_start_up_check_shows_the_decoder_confined() {
         .await
         .unwrap();
     assert!(
-        shown.contains(&format!("could not write {}", dir.display())),
+        shown.contains(&format!("refused writing {}", dir.display())),
         "{shown}"
     );
     assert!(!dir.join("cache").join("decoder-check").exists());

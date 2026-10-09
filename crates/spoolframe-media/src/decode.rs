@@ -234,7 +234,8 @@ async fn check_in(decoder: &Tool, scratch: &Path, secret: &Path) -> Result<Strin
     match spawn(decoder, Format::Pgs, false, one(), scratch, secret).await {
         Err(OcrError::Failed { reason, .. }) if reason.contains("Permission denied") => {
             Ok(format!(
-                "a confined subtitle decoder {program} decoded a track and could not write {}",
+                "the subtitle decoder is confined: a test run of {program} decoded a track and \
+                 was refused writing {}, as it should be",
                 secret.display()
             ))
         }

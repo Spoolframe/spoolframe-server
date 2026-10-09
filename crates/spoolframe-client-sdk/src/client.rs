@@ -147,6 +147,8 @@ pub(crate) struct Inner {
     pub(crate) manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
     /// Invites' relays, for a server not saved yet (P6-03).
     pub(crate) invite_relays: Mutex<HashMap<EndpointId, Vec<String>>>,
+    /// The pkarr relays servers are looked up at (P6-05).
+    lookups: Mutex<std::collections::HashSet<String>>,
     /// [`ClientOptions::relays`].
     relays: bool,
     /// Each server's connection and its state.
@@ -257,7 +259,7 @@ impl Client {
             }
             None => Discovery::off(),
         };
-        Ok(Self {
+        let client = Self {
             inner: Arc::new(Inner {
                 endpoint,
                 storage,
@@ -266,6 +268,7 @@ impl Client {
                 discovery,
                 manual: Mutex::default(),
                 invite_relays: Mutex::default(),
+                lookups: Mutex::default(),
                 relays,
                 links: Mutex::default(),
                 saving: tokio::sync::Mutex::default(),
@@ -273,7 +276,14 @@ impl Client {
                 progress_sequences: Mutex::default(),
                 activating: tokio::sync::Mutex::default(),
             }),
-        })
+        };
+        // Where saved servers publish (P6-05): looked up there from the start.
+        for server in servers::load(client.inner.storage.as_ref()).await? {
+            if let Some(url) = &server.lookup {
+                client.look_up_at(url);
+            }
+        }
+        Ok(client)
     }
 
     /// The servers this device knows: saved ones and ones heard on the LAN,
@@ -1614,18 +1624,48 @@ impl Client {
 
     /// Saved server `id` told this device just now where it is (PX-12,
     /// the `ServerAddresses` event): `addrs` replace the addresses it told
-    /// before, and `relays` the relays. Nothing for a server not saved.
+    /// before, `relays` the relays, and `lookup` where it publishes
+    /// (P6-05), which this device looks servers up at from now on. Nothing
+    /// for a server not saved.
     pub(crate) async fn told(
         &self,
         id: EndpointId,
         addrs: Vec<SocketAddr>,
         relays: Vec<String>,
+        lookup: Option<String>,
     ) -> Result<(), SdkError> {
+        if let Some(url) = &lookup {
+            self.look_up_at(url);
+        }
         self.sighted(id, |server, now| {
             server.relays = relays;
+            server.lookup = lookup;
             server.told(addrs, now)
         })
         .await
+    }
+
+    /// Look servers up at the pkarr relay `url` (P6-05) from now on, once:
+    /// iroh asks it for a server's record by its key when what this device
+    /// knows does not reach the server. A record is a hint only: the
+    /// connection still proves the key.
+    pub(crate) fn look_up_at(&self, url: &str) {
+        let Ok(parsed) = url.parse::<url::Url>() else {
+            tracing::debug!(url, "not a pkarr relay's URL; not looked up at");
+            return;
+        };
+        if !self.inner.lookups.lock().insert(url.to_owned()) {
+            return;
+        }
+        let endpoint = &self.inner.endpoint;
+        let Ok(services) = endpoint.address_lookup() else {
+            return;
+        };
+        services.add(
+            iroh::address_lookup::PkarrResolver::builder(parsed)
+                .build(endpoint.tls_config().clone()),
+        );
+        tracing::debug!(url, "servers are looked up here too");
     }
 
     /// Change saved server `id` with `change`, given the time now, which

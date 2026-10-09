@@ -109,7 +109,7 @@ async fn next_event(events: &mut RecvStream, wait: Duration) -> Option<Event> {
 /// The addresses of a `ServerAddresses` event, with its relays.
 fn pushed(event: Option<Event>) -> (BTreeSet<SocketAddr>, Vec<String>) {
     match event {
-        Some(Event::ServerAddresses { addrs, relays }) => {
+        Some(Event::ServerAddresses { addrs, relays, .. }) => {
             let set: BTreeSet<SocketAddr> = addrs.iter().copied().collect();
             assert_eq!(set.len(), addrs.len(), "each once: {addrs:?}");
             (set, relays)

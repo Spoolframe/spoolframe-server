@@ -93,6 +93,12 @@ async fn a_signed_in_connection_s_disconnect_is_info() {
     let line = disconnected(&capture).await;
     assert_eq!(line.level, tracing::Level::INFO, "{line:#?}");
     assert_eq!(line.field("signed_in"), Some("true"), "{line:#?}");
+    // The paths it went by: this machine's own, none a public one.
+    let paths = line.field("paths").unwrap_or_default();
+    assert!(
+        paths.split(" -> ").all(|path| path.starts_with("lan ")),
+        "{line:#?}"
+    );
     assert_eq!(capture.saying("client disconnected").len(), 1);
     assert_eq!(capture.saying("logged in").len(), 1);
     server.stop().await;

@@ -307,10 +307,12 @@ impl StatusSource {
     pub(crate) async fn invite(&self) -> Option<spoolframe_protocol::invite::Invite> {
         let server = self.endpoint_id.get()?.clone();
         let told = self.told.get().cloned();
-        let (addrs, relays) = match told {
-            Some(told) => tokio::task::spawn_blocking(move || (told.addrs(), told.relays()))
-                .await
-                .unwrap_or_default(),
+        let (addrs, relays, lookup) = match told {
+            Some(told) => {
+                tokio::task::spawn_blocking(move || (told.addrs(), told.relays(), told.lookup()))
+                    .await
+                    .unwrap_or_default()
+            }
             None => Default::default(),
         };
         Some(spoolframe_protocol::invite::Invite {
@@ -321,6 +323,7 @@ impl StatusSource {
                 .take(spoolframe_protocol::invite::MAX_HINTS)
                 .collect(),
             relays,
+            lookup,
             ..Default::default()
         })
     }

@@ -36,6 +36,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "invite_link"
+path = "fuzz_targets/invite_link.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "protocol_cbor"
 path = "fuzz_targets/protocol_cbor.rs"
 test = false

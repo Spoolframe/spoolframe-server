@@ -539,11 +539,15 @@ async fn shutting_down(conn: &Connection, id: EndpointId, client: &Weak<Inner>) 
         loop {
             match read_frame::<_, Event>(&mut recv).await.ok()? {
                 Event::ShuttingDown => return Some(()),
-                Event::ServerAddresses { addrs, relays } => {
+                Event::ServerAddresses {
+                    addrs,
+                    relays,
+                    lookup,
+                } => {
                     let Some(inner) = client.upgrade() else {
                         continue;
                     };
-                    if let Err(e) = (Client { inner }).told(id, addrs, relays).await {
+                    if let Err(e) = (Client { inner }).told(id, addrs, relays, lookup).await {
                         tracing::warn!(server = %id, error = %e, "cannot save the addresses the server told");
                     }
                 }

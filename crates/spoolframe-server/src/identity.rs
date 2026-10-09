@@ -50,9 +50,19 @@ pub enum IdentityError {
     },
 }
 
+/// The key of a relay of the operator's own (P6-04): its identity, apart
+/// from the server's, so the two may share a state directory.
+pub const RELAY_KEY_FILE: &str = "relay.key";
+
 /// The key in `state_dir`, made (with mode `0600`) if there is none yet.
 pub fn load_or_create(state_dir: &Path) -> Result<SecretKey, IdentityError> {
-    let path = state_dir.join(KEY_FILE);
+    load_or_create_at(state_dir, KEY_FILE)
+}
+
+/// The key in `state_dir`'s `file`, made (with mode `0600`) if there is
+/// none yet: [`load_or_create`]'s, for another key.
+pub fn load_or_create_at(state_dir: &Path, file: &str) -> Result<SecretKey, IdentityError> {
+    let path = state_dir.join(file);
     match fs::metadata(&path) {
         Ok(meta) => {
             // Like ssh: a key others can read may already be someone

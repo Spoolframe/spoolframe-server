@@ -392,6 +392,7 @@ async fn push(state: &State, index: usize) {
     let event = Event::ServerAddresses {
         addrs: state.told.lock().clone(),
         relays: state.relays.lock().clone(),
+        lookup: None,
     };
     let _ = write_frame(&mut *events.lock().await, &event).await;
 }

@@ -25,7 +25,7 @@ use spoolframe_types::LibraryKind;
 
 use crate::admission::Admission;
 use crate::encode::JobLimits;
-use crate::network::{EndpointOptions, Relay};
+use crate::network::{EndpointOptions, Pkarr, Relay};
 use crate::previews::{PreviewSettings, When};
 use crate::subtitles::OcrSettings;
 use crate::watch::WatchRules;
@@ -966,6 +966,23 @@ pub struct NetworkConfig {
     /// that still sets it meant something by it.
     #[ucl(default)]
     pub relay: Option<String>,
+    /// Optional, for one case only (P6-05): a device that knows the
+    /// server's identity but no longer an address that reaches it (the
+    /// public IP changed while it was away). The server publishes where it
+    /// is, signed with its key, for the device to look it up by that key.
+    /// Not needed on the LAN, with a public address that does not change,
+    /// or with relays on. `"off"` (the default), `"n0"` (n0's public
+    /// service at dns.iroh.link), or the URL of a pkarr relay of the
+    /// operator's own (an `iroh-dns-server`'s `/pkarr`). The record is
+    /// public: relays and public addresses only, never a LAN address.
+    #[ucl(default)]
+    pub pkarr: Option<String>,
+    /// The relays of the operator's own (P6-04, `spoolframe-server relay`)
+    /// this server tells who an endpoint is, so they let its devices
+    /// through: their keys (`spoolframe-server relay id`), comma-separated.
+    /// None by default.
+    #[ucl(default)]
+    pub own_relays: Option<String>,
     /// Announce the server on the LAN over mDNS (P1-13), so clients list
     /// it without being told its address. On unless set to `false`.
     #[ucl(default)]
@@ -1280,6 +1297,45 @@ impl NetworkConfig {
         Ok(relays)
     }
 
+    /// `own_relays`: endpoint keys, comma-separated.
+    fn own_relays(&self) -> Result<Vec<iroh::EndpointId>, ConfigError> {
+        let mut keys = Vec::new();
+        let entries = self.own_relays.as_deref().unwrap_or_default().split(',');
+        for entry in entries.map(str::trim).filter(|e| !e.is_empty()) {
+            let key = entry.parse().map_err(|e| ConfigError::Invalid {
+                key: "network.own_relays",
+                message: format!("{entry:?}: {e}; a relay's key is `spoolframe-server relay id`'s"),
+            })?;
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
+    }
+
+    /// `pkarr`: off, n0's, or a pkarr relay's http(s) URL.
+    fn pkarr(&self) -> Result<Pkarr, ConfigError> {
+        Ok(match self.pkarr.as_deref().map(str::trim) {
+            None | Some("off") => Pkarr::Off,
+            Some("n0") => Pkarr::N0,
+            Some(text) => {
+                let invalid = |message: String| ConfigError::Invalid {
+                    key: "network.pkarr",
+                    message,
+                };
+                let url = Url::parse(text).map_err(|e| {
+                    invalid(format!(
+                        "{text:?}: {e}; it is \"off\", \"n0\" or a pkarr relay's URL"
+                    ))
+                })?;
+                if !matches!(url.scheme(), "https" | "http") {
+                    return Err(invalid(format!("{text:?}: a pkarr relay's URL is http(s)")));
+                }
+                Pkarr::Custom(url)
+            }
+        })
+    }
+
     /// How to build the endpoint.
     pub fn endpoint_options(&self) -> Result<EndpointOptions, ConfigError> {
         if let Some(old) = &self.relay {
@@ -1292,6 +1348,8 @@ impl NetworkConfig {
             });
         }
         let relays = self.relays()?;
+        let pkarr = self.pkarr()?;
+        let own_relays = self.own_relays()?;
         let admission = Admission {
             max_strangers: self
                 .max_stranger_connections
@@ -1324,6 +1382,8 @@ impl NetworkConfig {
         Ok(EndpointOptions {
             port: self.port,
             relays,
+            pkarr,
+            own_relays,
             mdns: self.mdns.unwrap_or(true),
             admission,
             announce: self.announce.announce()?,
@@ -2772,6 +2832,48 @@ mod tests {
                     }
                 ),
                 "{list}: {err:?}"
+            );
+        }
+    }
+
+    fn pkarr(value: &str) -> Result<Pkarr, ConfigError> {
+        plex(&format!(
+            r#"plex {{ url = "http://nas:32400"; }} network {{ pkarr = "{value}"; }}"#
+        ))?
+        .network
+        .endpoint_options()
+        .map(|options| options.pkarr)
+    }
+
+    #[test]
+    fn pkarr_is_off_unless_set() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(config.network.endpoint_options().unwrap().pkarr, Pkarr::Off);
+        assert_eq!(pkarr("off").unwrap(), Pkarr::Off);
+    }
+
+    #[test]
+    fn pkarr_is_n0_or_a_relay_of_one_s_own() {
+        assert_eq!(pkarr("n0").unwrap(), Pkarr::N0);
+        let url = Url::parse("https://dns.example.org/pkarr").unwrap();
+        assert_eq!(
+            pkarr("https://dns.example.org/pkarr").unwrap(),
+            Pkarr::Custom(url)
+        );
+    }
+
+    #[test]
+    fn a_pkarr_setting_that_is_no_relay_is_refused() {
+        for bad in ["on", "dns.example.org", "ftp://dns.example.org/pkarr"] {
+            assert!(
+                matches!(
+                    pkarr(bad),
+                    Err(ConfigError::Invalid {
+                        key: "network.pkarr",
+                        ..
+                    })
+                ),
+                "{bad}"
             );
         }
     }

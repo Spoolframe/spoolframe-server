@@ -100,6 +100,99 @@ struct ConnectionState {
     hello: OnceLock<Hello>,
     /// Profile locks (P2-08).
     locks: parking_lot::Mutex<Locks>,
+    /// The paths its packets went by, as the log names them (`lan`,
+    /// `direct` or `relay`, and where), the one now last: a relay, then a
+    /// direct path, is a hole punched. Empty before iroh selects one.
+    paths: parking_lot::Mutex<Vec<String>>,
+}
+
+impl ConnectionState {
+    /// The path now, for the log; `none` before one is selected.
+    fn path(&self) -> String {
+        self.paths
+            .lock()
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "none".into())
+    }
+
+    /// Every path it went by, oldest first, for the log.
+    fn paths(&self) -> String {
+        let paths = self.paths.lock();
+        if paths.is_empty() {
+            "none".into()
+        } else {
+            paths.join(" -> ")
+        }
+    }
+}
+
+/// The most paths a connection's log line names: the first few, which
+/// tell how it came to be direct, and the rest left out.
+const LOGGED_PATHS: usize = 8;
+
+/// `addr`, the path a connection goes by, as the log names it: `relay`
+/// and its URL; or `direct` and the address, `lan` for a private one.
+/// Whether a direct path is a hole punched in NAT or an open port, iroh
+/// does not say.
+fn path_name(addr: &iroh::TransportAddr) -> String {
+    match addr {
+        iroh::TransportAddr::Relay(url) => format!("relay {url}"),
+        iroh::TransportAddr::Ip(ip) if crate::wan::not_public(ip.ip()).is_some() => {
+            format!("lan {ip}")
+        }
+        iroh::TransportAddr::Ip(ip) => format!("direct {ip}"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Follow the path `connection`'s packets go by, into `state`, and log
+/// each change of it: at INFO once it has signed in (a move from a relay
+/// to a direct path is a hole punched), else at DEBUG, as most
+/// connections are an app checking in. The disconnect line names them
+/// all either way.
+async fn log_paths(
+    connection: iroh::endpoint::WeakConnectionHandle,
+    mut events: iroh::endpoint::PathEventStream,
+    state: std::sync::Weak<ConnectionState>,
+) {
+    use futures_util::StreamExt as _;
+    use iroh::endpoint::PathEvent;
+    let closed = connection.closed();
+    tokio::pin!(closed);
+    loop {
+        let event = tokio::select! {
+            event = events.next() => event,
+            _ = &mut closed => return,
+        };
+        let selected = match event {
+            None => return,
+            Some(PathEvent::Selected { remote_addr, .. }) => path_name(&remote_addr),
+            Some(_) => continue,
+        };
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let before = {
+            let mut paths = state.paths.lock();
+            let before = paths.last().cloned();
+            if before.as_deref() == Some(selected.as_str()) {
+                continue;
+            }
+            if paths.len() < LOGGED_PATHS {
+                paths.push(selected.clone());
+            } else if let Some(last) = paths.last_mut() {
+                *last = selected.clone();
+            }
+            before.unwrap_or_else(|| "none".into())
+        };
+        let endpoint = state.peer.endpoint.fmt_short();
+        if state.peer.was_signed_in() {
+            tracing::info!(%endpoint, path = %selected, %before, "connection path");
+        } else {
+            tracing::debug!(%endpoint, path = %selected, %before, "connection path");
+        }
+    }
 }
 
 /// Which sessions on one connection need their user's PIN, and which are
@@ -2111,6 +2204,7 @@ impl ClientProtocol {
                     subtitle = %decided.subtitle,
                     start_ms = start_ms.unwrap_or(0),
                     ?quality,
+                    path = %state.path(),
                     "playback started"
                 );
                 Ok(Reply::PlaybackStarted {
@@ -3038,7 +3132,21 @@ impl ProtocolHandler for ClientProtocol {
             peer,
             hello: OnceLock::new(),
             locks: parking_lot::Mutex::default(),
+            paths: parking_lot::Mutex::new(
+                connection
+                    .paths()
+                    .iter()
+                    .find(|p| p.is_selected())
+                    .map(|p| path_name(p.remote_addr()))
+                    .into_iter()
+                    .collect(),
+            ),
         });
+        tokio::spawn(log_paths(
+            connection.weak_handle(),
+            connection.path_events(),
+            Arc::downgrade(&state),
+        ));
 
         let reason = loop {
             match connection.accept_bi().await {
@@ -3058,9 +3166,9 @@ impl ProtocolHandler for ClientProtocol {
         self.services.playbacks.connection_closed(state.number);
         let signed_in = state.peer.was_signed_in();
         if signed_in || !hung_up(&reason) {
-            tracing::info!(?auth, %reason, signed_in, "client disconnected");
+            tracing::info!(?auth, %reason, signed_in, paths = %state.paths(), "client disconnected");
         } else {
-            tracing::debug!(?auth, %reason, signed_in, "client disconnected");
+            tracing::debug!(?auth, %reason, signed_in, paths = %state.paths(), "client disconnected");
         }
         self.end_playbacks_unless_back(connection.remote_id());
         Ok(())

@@ -354,10 +354,34 @@ fn with_media(config: &Path, media: &str) {
     std::fs::write(config, text).unwrap();
 }
 
+/// The start's last line names the wire revision the server speaks, so
+/// the log says which apps it takes before any is refused.
+#[tokio::test]
+async fn the_listening_line_names_the_wire_revision() {
+    let (_tmp, config) = config_with_state("start-protocol", &closed_port_url()).await;
+    let (running, log) = Running::start(&config);
+    // The fields as plain text: the log colours their names.
+    let listening: String = log
+        .lines()
+        .find(|l| started(l))
+        .unwrap()
+        .split('\x1b')
+        .map(|part| part.split_once('m').map_or(part, |(_, rest)| rest))
+        .collect();
+    assert!(
+        listening.contains(&format!(
+            "protocol={}",
+            spoolframe_protocol::PROTOCOL_VERSION
+        )),
+        "{listening}"
+    );
+    running.stop_cleanly();
+}
+
 /// PX-11 finding 34: on a kernel with Landlock the media tools run
-/// confined without being asked, and the server shows it at start: a
-/// confined ffprobe could neither read its state directory nor connect
-/// to a listener on loopback.
+/// confined without being asked, and the server checks it at start: a
+/// confined ffprobe is refused its state directory and a listener on
+/// loopback. The check's pass is logged at DEBUG: it is the usual case.
 #[tokio::test]
 async fn the_media_tools_run_confined_by_default() {
     let (_tmp, config) = config_with_state("sandbox-auto", &closed_port_url()).await;
@@ -366,10 +390,16 @@ async fn the_media_tools_run_confined_by_default() {
         log.contains("media tools run confined: Landlock ABI"),
         "{log}"
     );
-    assert!(log.contains("a confined ffprobe"), "{log}");
-    assert!(log.contains("could not read"), "{log}");
+    assert!(!log.contains("the media tools are confined"), "{log}");
+    running.stop_cleanly();
+    let (running, log) = Running::start_with(
+        &config,
+        &[("SPOOLFRAME_LOG", "info,spoolframe_server=debug")],
+    );
+    assert!(log.contains("the media tools are confined"), "{log}");
+    assert!(log.contains("refused reading"), "{log}");
     // And the subtitle decoder, this binary run again (finding 45).
-    assert!(log.contains("a confined subtitle decoder"), "{log}");
+    assert!(log.contains("the subtitle decoder is confined"), "{log}");
     running.stop_cleanly();
 }
 

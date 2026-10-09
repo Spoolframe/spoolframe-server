@@ -27,7 +27,7 @@ use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -1190,6 +1190,12 @@ pub enum Event {
         /// (`network.relays`), its home relay now first; empty while
         /// relays are off.
         relays: Vec<String>,
+        /// The pkarr relay the server publishes where it is to
+        /// (`network.pkarr`, P6-05), for the device to look it up by its
+        /// key when nothing else reaches it; `None` while it publishes
+        /// nothing.
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        lookup: Option<String>,
     },
     /// An event type this build does not know; ignore it.
     #[serde(other)]

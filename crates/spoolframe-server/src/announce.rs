@@ -260,6 +260,8 @@ pub struct Told {
     endpoint: Endpoint,
     announce: Arc<Announce>,
     relays: Arc<Vec<String>>,
+    /// The pkarr relay it publishes to (`network.pkarr`, P6-05).
+    lookup: Option<String>,
     /// The public addresses (`network.wan`, P6-02), told after the rest.
     public: crate::wan::Public,
 }
@@ -282,12 +284,14 @@ impl Told {
         endpoint: Endpoint,
         announce: Announce,
         relays: Vec<String>,
+        lookup: Option<String>,
         public: crate::wan::Public,
     ) -> Self {
         Self {
             endpoint,
             announce: Arc::new(announce),
             relays: Arc::new(relays),
+            lookup,
             public,
         }
     }
@@ -344,12 +348,20 @@ impl Told {
         told
     }
 
-    /// What a signed-in connection is pushed now: [`Self::addrs`] and
-    /// [`Self::relays`]. It reads the interfaces, as `addrs` does.
+    /// The pkarr relay the server publishes where it is to
+    /// (`network.pkarr`, P6-05), for a device to look it up there.
+    pub fn lookup(&self) -> Option<String> {
+        self.lookup.clone()
+    }
+
+    /// What a signed-in connection is pushed now: [`Self::addrs`],
+    /// [`Self::relays`] and [`Self::lookup`]. It reads the interfaces, as
+    /// `addrs` does.
     pub fn event(&self) -> spoolframe_protocol::Event {
         spoolframe_protocol::Event::ServerAddresses {
             addrs: self.addrs(),
             relays: self.relays(),
+            lookup: self.lookup(),
         }
     }
 

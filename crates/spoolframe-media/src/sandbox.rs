@@ -551,7 +551,8 @@ impl Tool {
             }
         }
         Ok(format!(
-            "a confined {} could not read {} nor connect to {address}",
+            "the media tools are confined: a test {} was refused reading {} and connecting \
+             to {address}, as it should be",
             self.program.display(),
             secret.display()
         ))

@@ -107,6 +107,9 @@
       port = ${toString cfg.port};
       mdns = ${lib.boolToString cfg.mdns};
       ${lib.optionalString cfg.plexDiscovery.enable "plex_discovery_port = ${toString cfg.plexDiscovery.port};"}
+      ${lib.optionalString (cfg.relays != []) "relays = ${quote (lib.concatStringsSep ", " cfg.relays)};"}
+      ${lib.optionalString (cfg.pkarr != "off") "pkarr = ${quote cfg.pkarr};"}
+      ${lib.optionalString (cfg.ownRelays != []) "own_relays = ${quote (lib.concatStringsSep ", " cfg.ownRelays)};"}
       ${lib.optionalString (cfg.wan != null) wanConfig}
     }
     admin {
@@ -235,6 +238,41 @@ in {
       type = lib.types.bool;
       default = true;
       description = "Announce the server on the LAN, so clients list it.";
+    };
+
+    relays = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [];
+      example = ["https://relay.example.org"];
+      description = ''
+        The relays devices that cannot dial the server directly reach it
+        through (`network.relays`, P6-03): `"default"` for n0's public
+        ones, and relay URLs, such as a relay of your own
+        (`services.spoolframe-relay`). None: relays off.
+      '';
+    };
+
+    pkarr = lib.mkOption {
+      type = lib.types.str;
+      default = "off";
+      example = "n0";
+      description = ''
+        Optional, and only for one case (`network.pkarr`, P6-05): a device
+        that knows the server's identity but no longer an address that
+        reaches it, as after the public IP changed. `"off"`, `"n0"`
+        (dns.iroh.link), or your own pkarr relay's URL. Not needed with
+        relays on.
+      '';
+    };
+
+    ownRelays = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [];
+      description = ''
+        The keys of relays of your own (`spoolframe-server relay id`) the
+        server tells who its devices are, so they let them through
+        (`network.own_relays`, P6-04).
+      '';
     };
 
     plexDiscovery = {

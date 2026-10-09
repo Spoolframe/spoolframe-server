@@ -14,13 +14,14 @@ use std::process::Command;
 use spoolframe_media::sandbox::Tool;
 use spoolframe_media::{ocr, pgs::fixture};
 use spoolframe_protocol::codec;
+use spoolframe_protocol::invite::Invite;
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::rpc::{Operation, RpcReply, RpcRequest, RpcResponse, ServerInstance};
 use spoolframe_protocol::{
-    Error, Hello, LoginPassword, MediaRead, PlaybackHandle, Reply, Request, RequestEnvelope,
-    Response, SessionId,
+    ConvertedVideo, Error, Hello, LoginPassword, ManifestKind, MediaRead, PlaybackHandle,
+    PlaybackPlan, Quality, Reply, Request, RequestEnvelope, Response, Rung, SessionId,
 };
-use spoolframe_types::{Platform, SubtitleFormat};
+use spoolframe_types::{Container, Delivery, MediaId, Platform, SubtitleFormat, VideoCodec};
 
 fn write(target: &str, name: &str, bytes: &[u8]) {
     let dir = Path::new("seeds").join(target);
@@ -84,10 +85,73 @@ fn requests() -> Vec<(&'static str, RpcRequest)> {
             rpc(
                 session.clone(),
                 Request::SeekPlayback {
-                    handle,
+                    handle: handle.clone(),
                     position_ms: 4_000,
                 },
                 Some(1),
+            ),
+        ),
+        // P6-06, PX-21: a start for the link, the quality choices, a rung's
+        // playlist.
+        (
+            "start",
+            rpc(
+                session.clone(),
+                Request::StartPlayback {
+                    id: MediaId::new(
+                        spoolframe_types::Namespace::Plex,
+                        spoolframe_types::MediaKind::Movie,
+                        "1",
+                    )
+                    .unwrap(),
+                    selection: None,
+                    start_ms: Some(60_000),
+                    bitmap: Default::default(),
+                    quality: Quality::Auto {
+                        link_bitrate: Some(20_000_000),
+                    },
+                },
+                None,
+            ),
+        ),
+        (
+            "quality-bitrate",
+            rpc(
+                session.clone(),
+                Request::ChangeQuality {
+                    handle: handle.clone(),
+                    quality: Quality::Bitrate {
+                        max_bitrate: 4_000_000,
+                    },
+                    bitmap: Default::default(),
+                    position_ms: 4_000,
+                },
+                Some(2),
+            ),
+        ),
+        (
+            "quality-original",
+            rpc(
+                session.clone(),
+                Request::ChangeQuality {
+                    handle: handle.clone(),
+                    quality: Quality::Original,
+                    bitmap: Default::default(),
+                    position_ms: 4_000,
+                },
+                Some(3),
+            ),
+        ),
+        (
+            "manifest-rung",
+            rpc(
+                session.clone(),
+                Request::GetManifest {
+                    handle,
+                    kind: ManifestKind::Media,
+                    variant: 2,
+                },
+                None,
             ),
         ),
         ("ping", rpc(session, Request::Ping, None)),
@@ -108,8 +172,24 @@ fn resources() -> Vec<(&'static str, ResourceRequest)> {
                     length: 65_536,
                     epoch: 0,
                     segment: Some(1),
+                    variant: 0,
                 },
                 revision: 0,
+            },
+        ),
+        (
+            "media-rung",
+            ResourceRequest::Media {
+                request: MediaRead {
+                    session: session.clone(),
+                    handle: handle.clone(),
+                    offset: 0,
+                    length: 65_536,
+                    epoch: 1,
+                    segment: Some(7),
+                    variant: 2,
+                },
+                revision: 1,
             },
         ),
         (
@@ -141,11 +221,70 @@ fn responses() -> Vec<(&'static str, RpcResponse)> {
         (
             "error",
             RpcResponse {
-                server,
+                server: server.clone(),
                 reply: RpcReply::from(Response::Err(Error::Unauthenticated)),
             },
         ),
+        // PX-21: a plan that is a ladder of encodes.
+        (
+            "ladder",
+            RpcResponse {
+                server,
+                reply: RpcReply::from(Response::Ok(Reply::PlaybackChanged {
+                    plan: PlaybackPlan::Converted {
+                        delivery: Delivery::Hls,
+                        container: Container::Mp4,
+                        video: Some(ConvertedVideo::Encode {
+                            codec: VideoCodec::H264,
+                            height: 1080,
+                            max_bitrate: Some(8_000_000),
+                            tone_map: false,
+                        }),
+                        audio: None,
+                        subtitle: None,
+                        ladder: vec![
+                            Rung {
+                                height: 1080,
+                                max_bitrate: 8_000_000,
+                            },
+                            Rung {
+                                height: 540,
+                                max_bitrate: 1_000_000,
+                            },
+                        ],
+                        reasons: vec!["bitrate: 24.7 Mbit/s over the link's".into()],
+                    },
+                    size: 0,
+                    epoch: 1,
+                })),
+            },
+        ),
     ]
+}
+
+/// Invite links (P6-01, P6-05): one whole, one that only finds the
+/// server.
+fn invites() {
+    let server = "3f9a1c7e5b2d8a04e6c1f7b39d52a8e0c4b6f1a2d3e5c7b9a1f0e2d4c6b8a0f1";
+    let whole = Invite {
+        server: server.into(),
+        name: Some("Home Media".into()),
+        addrs: vec![
+            "203.0.113.24:41641".parse().unwrap(),
+            "[2001:db8::1]:7420".parse().unwrap(),
+        ],
+        relays: vec!["https://relay.home-media.example".into()],
+        lookup: Some("https://dns.iroh.link/pkarr".into()),
+        code: Some("QW7K2MFPXR4T".into()),
+        expires_at: Some(1_792_003_200),
+        role: Some(spoolframe_types::Role::Consumer),
+    };
+    write("invite_link", "whole", whole.link().as_bytes());
+    let bare = Invite {
+        server: server.into(),
+        ..Invite::default()
+    };
+    write("invite_link", "server-only", bare.link().as_bytes());
 }
 
 /// The protocol seeds: payloads for `protocol_cbor`, and the same as
@@ -305,5 +444,6 @@ async fn bitmaps() {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     protocol().await;
+    invites();
     bitmaps().await;
 }

@@ -78,6 +78,9 @@ pub struct Invite {
     pub addrs: Vec<SocketAddr>,
     /// The URLs of relays it may be reached through.
     pub relays: Vec<String>,
+    /// The pkarr relay it publishes where it is to (P6-05): a device
+    /// looks it up there by its key when no hint reaches it.
+    pub lookup: Option<String>,
     /// The invite's code, normalized; `None` for a link that only finds
     /// the server.
     pub code: Option<String>,
@@ -95,6 +98,7 @@ impl fmt::Debug for Invite {
             .field("name", &self.name)
             .field("addrs", &self.addrs)
             .field("relays", &self.relays)
+            .field("lookup", &self.lookup)
             .field("code", &self.code.as_ref().map(|_| "<redacted>"))
             .field("expires_at", &self.expires_at)
             .field("role", &self.role)
@@ -120,6 +124,9 @@ impl Invite {
         }
         for relay in &self.relays {
             add("relay", relay);
+        }
+        if let Some(lookup) = &self.lookup {
+            add("lookup", lookup);
         }
         if let Some(at) = self.expires_at {
             add("exp", &at.to_string());
@@ -161,6 +168,8 @@ pub fn parse_link(text: &str) -> Option<Invite> {
                     invite.relays.push(value);
                 }
             }
+            // An http(s) URL, as a relay's is.
+            ("lookup", Some(value)) if is_relay_url(&value) => invite.lookup = Some(value),
             ("exp", Some(value)) => invite.expires_at = value.parse().ok(),
             ("role", Some(value)) => {
                 invite.role = match value.as_str() {
@@ -248,6 +257,7 @@ mod tests {
             name: Some("Home Media".into()),
             addrs: vec!["203.0.113.24:41641".parse().unwrap()],
             relays: vec!["https://relay.home-media.example".into()],
+            lookup: None,
             code: Some("QW7K2MFPXR4T".into()),
             expires_at: Some(1_792_003_200),
             role: Some(Role::Consumer),
@@ -285,6 +295,7 @@ mod tests {
                 "https://relay.example.org/".into(),
                 "https://other.example.org:8443/path?a=1&b=2#x".into(),
             ],
+            lookup: Some("https://dns.example.org/pkarr".into()),
             code: None,
             expires_at: None,
             role: Some(Role::Admin),

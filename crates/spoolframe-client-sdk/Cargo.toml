@@ -24,6 +24,8 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# The pkarr relays servers are looked up at (P6-05).
+url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

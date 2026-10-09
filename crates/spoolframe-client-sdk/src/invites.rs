@@ -217,6 +217,12 @@ impl Client {
             let known = manual.remove(&id).unwrap_or_default();
             manual.insert(id, listed([invite.addrs.clone(), known]));
         }
+        if let Some(url) = &invite.lookup {
+            self.look_up_at(url);
+        }
+        // Named by the invite: dialled even with no address or relay, the
+        // lookup (or a hint learned since) the way to it.
+        self.inner.invite_relays.lock().entry(id).or_default();
         if !invite.relays.is_empty() {
             let mut invited = self.inner.invite_relays.lock();
             let known = invited.entry(id).or_default();
@@ -250,6 +256,9 @@ fn refuse_another_key(
 /// its relays beside those the server told.
 fn hint(server: &mut SavedServer, invite: &Invite, now: u64) {
     server.hinted(invite.addrs.iter().copied(), now);
+    if invite.lookup.is_some() {
+        server.lookup = invite.lookup.clone();
+    }
     for relay in &invite.relays {
         if !server.relays.contains(relay) {
             server.relays.push(relay.clone());

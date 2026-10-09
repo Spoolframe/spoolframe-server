@@ -337,7 +337,7 @@ async fn the_start_check_tells_a_confined_ffprobe_from_one_that_is_not() {
         .check_confined(&state)
         .await
         .unwrap();
-    assert!(shown.contains("could not read"), "{shown}");
+    assert!(shown.contains("refused reading"), "{shown}");
     assert!(
         Tool::unconfined("ffprobe")
             .check_confined(&state)

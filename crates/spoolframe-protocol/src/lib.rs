@@ -21,6 +21,7 @@ pub mod playback;
 pub mod plex;
 pub mod policy;
 pub mod previews;
+pub mod relay_access;
 pub mod resource;
 pub mod rpc;
 pub mod search;

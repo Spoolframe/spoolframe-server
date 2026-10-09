@@ -164,11 +164,28 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum RelayCommand {
+    /// Run the relay.
+    Run,
+    /// Print the relay's key: what the main server's
+    /// `network.own_relays` names. Creates it if there is none yet.
+    Id,
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Plex integration tools.
     Plex {
         #[command(subcommand)]
         command: PlexCommand,
+    },
+    /// A relay of your own (P6-04), for devices that cannot reach the
+    /// server directly, in place of n0's public ones. `--config` names
+    /// its file (`spoolframe.relay.v1`); its key is kept in the state
+    /// directory, apart from the server's.
+    Relay {
+        #[command(subcommand)]
+        command: RelayCommand,
     },
     /// Media file tools.
     Media {
@@ -413,6 +430,48 @@ fn decode_subtitle(format: decode::Format, pictures: &Path, from_file_start: boo
 
 /// Run what `cli` says. `Some` when the server stopped to restart, and
 /// how it is to start again.
+/// `relay run` or `relay id` (P6-04): a relay of the operator's own,
+/// from its `config` file, as the key in `state_dir`.
+async fn relay(command: RelayCommand, config: Option<PathBuf>, state_dir: &Path) -> Result<()> {
+    use spoolframe_server::own_relay;
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("cannot make {}", state_dir.display()))?;
+    let key = identity::load_or_create_at(state_dir, identity::RELAY_KEY_FILE)?;
+    if matches!(command, RelayCommand::Id) {
+        println!("{}", key.public());
+        return Ok(());
+    }
+    let path = config.context("relay run needs --config: a spoolframe.relay.v1 file")?;
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let settings = own_relay::RelayConfig::parse(&text)
+        .with_context(|| format!("{} is not a relay config", path.display()))?;
+    let server = own_relay::spawn(&settings, key.clone(), state_dir).await?;
+    tracing::info!(
+        key = %key.public(),
+        http = ?server.http_addr(),
+        https = ?server.https_addr(),
+        owner = settings.access.owner,
+        friends = settings.access.friends,
+        everyone = settings.access.everyone,
+        server = %settings.server.id.fmt_short(),
+        "relay listening"
+    );
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = terminate.recv() => {}
+    }
+    tracing::info!("relay stopping");
+    server
+        .shutdown()
+        .await
+        .map_err(|e| anyhow::anyhow!("the relay did not stop cleanly: {e}"))?;
+    Ok(())
+}
+
 async fn serve(cli: Cli) -> Result<Option<RestartMode>> {
     let level = match cli.verbose {
         0 => "info",
@@ -451,6 +510,12 @@ async fn serve(cli: Cli) -> Result<Option<RestartMode>> {
         print!("{DEFAULTS}");
         return Ok(None);
     }
+    // A relay reads no server config: its own file, and its key.
+    if let Some(Command::Relay { command }) = cli.command {
+        let locations = Locations::from_env(cli.state_dir, None)?;
+        relay(command, cli.config, &locations.state_dir).await?;
+        return Ok(None);
+    }
     let locations = Locations::from_env(cli.state_dir, cli.config)?;
     let layers = Layers::load(&locations)?;
     let config = layers.config()?;
@@ -473,6 +538,7 @@ async fn serve(cli: Cli) -> Result<Option<RestartMode>> {
             command: ConfigCommand::Defaults,
         }) => unreachable!("printed before the layers are read"),
         Some(Command::DecodeSubtitle { .. }) => unreachable!("decoded before the runtime starts"),
+        Some(Command::Relay { .. }) => unreachable!("run before the config is read"),
         Some(Command::Config {
             command: ConfigCommand::Show,
         }) => {
@@ -582,8 +648,10 @@ async fn check_media_sandbox(
         return Ok(());
     }
     match ffprobe.check_confined(state_dir).await {
+        // A pass is what is expected: only a failure is worth a line at
+        // INFO or above.
         Ok(shown) => {
-            tracing::info!("{shown}");
+            tracing::debug!("{shown}");
             Ok(())
         }
         Err(reason) if config.media.sandbox()? == sandbox::Mode::Required => bail!(
@@ -613,8 +681,10 @@ async fn check_decoder(
     state_dir: &Path,
 ) -> Result<()> {
     match decode::check(decoder, scratch, state_dir).await {
+        // A pass is what is expected: only a failure is worth a line at
+        // INFO or above.
         Ok(shown) => {
-            tracing::info!("{shown}");
+            tracing::debug!("{shown}");
             Ok(())
         }
         Err(reason) if config.media.sandbox()? == sandbox::Mode::Required => bail!(
@@ -975,12 +1045,15 @@ async fn run(
         .iter()
         .map(ToString::to_string)
         .collect();
-    // The PID: a restart in place keeps it.
+    // The PID: a restart in place keeps it. The wire revision, so which
+    // apps it takes is in the log, not only in a refused Hello.
     tracing::info!(
         endpoint_id = %server.id(),
         ?addrs,
         ?told,
         pid = std::process::id(),
+        protocol = spoolframe_protocol::PROTOCOL_VERSION,
+        version = env!("CARGO_PKG_VERSION"),
         "listening"
     );
 

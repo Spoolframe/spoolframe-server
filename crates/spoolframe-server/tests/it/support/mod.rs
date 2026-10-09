@@ -433,6 +433,10 @@ pub struct ServerOptions {
     pub finders: spoolframe_server::wan::Finders,
     /// `network.relays` (P6-03): none unless a test is about them.
     pub relays: Vec<spoolframe_server::network::Relay>,
+    /// `network.pkarr` (P6-05): off unless a test is about it.
+    pub pkarr: spoolframe_server::network::Pkarr,
+    /// `network.own_relays` (P6-04): none unless a test is about them.
+    pub own_relays: Vec<iroh::EndpointId>,
 }
 
 impl Default for ServerOptions {
@@ -471,6 +475,8 @@ impl Default for ServerOptions {
             announce: spoolframe_server::announce::Announce::default(),
             wan: None,
             relays: Vec::new(),
+            pkarr: spoolframe_server::network::Pkarr::Off,
+            own_relays: Vec::new(),
             finders: offline_finders(),
         }
     }
@@ -774,6 +780,8 @@ impl TestServer {
         let endpoint = EndpointOptions {
             port: options.port,
             relays: options.relays.clone(),
+            pkarr: options.pkarr.clone(),
+            own_relays: options.own_relays.clone(),
             mdns: options.mdns,
             admission: options.admission,
             announce: options.announce.clone(),

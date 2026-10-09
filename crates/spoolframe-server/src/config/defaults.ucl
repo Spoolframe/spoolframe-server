@@ -91,6 +91,18 @@ network {
   # list. Empty: relays off, the server reached only on the LAN or at a
   # public address.
   relays = "";
+  # Optional, and only for one case: a device that knows the server's
+  # identity (from an invite or an earlier sign-in) but no longer knows an
+  # address that reaches it, as when your public IP changed while it was
+  # away. Then the server publishes a record of where it is, signed with
+  # its key, and devices look it up by that key. You do not need it on
+  # the LAN, with a public address that does not change, or with relays
+  # on: devices that know the server's relays reach it through them.
+  # "off" (the default), "n0" (n0's public service, dns.iroh.link), or
+  # the URL of your own pkarr relay (an iroh-dns-server's /pkarr). The
+  # record is public: it holds the relays and public addresses only,
+  # never a LAN one.
+  pkarr = "off";
   # Announce the server on the LAN over mDNS, so clients find it.
   mdns = true;
   # The UDP port the setup wizard's search for Plex servers on the LAN

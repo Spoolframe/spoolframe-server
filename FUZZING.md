@@ -17,6 +17,7 @@ the dev shell to fuzz.
 | target | reads | code |
 |---|---|---|
 | `protocol_frame` | a stream: a frame (length, then CBOR), a multipart RPC reply | `spoolframe-protocol` `codec.rs` |
+| `invite_link` | an invite link, as pasted or read from a QR code; one that parses must be written back as itself | `spoolframe-protocol` `invite.rs` |
 | `protocol_cbor` | a CBOR payload as `RpcRequest`, `RpcResponse`, `ResourceRequest`, `ResourceResponse`; a decoded request must encode and decode back to itself | `codec.rs`, `rpc.rs`, `resource.rs` |
 | `pgs` | a PGS (`.sup`) stream | `spoolframe-media` `pgs.rs` |
 | `dvb` | a DVB subtitle track's packets | `spoolframe-media` `dvb.rs` |
@@ -88,7 +89,9 @@ with the smallest input that shows it. Do not add crash inputs to `fuzz/seeds/`.
 
 `fuzz/seeds/` holds small inputs only. `cargo run --example seeds`, run in
 `fuzz/` in the dev shell (it needs ffmpeg), writes them again: protocol
-messages, a two-cue PGS stream (whole, and split into fragments), and the same
+messages (rewrite them whenever the wire revision changes: a seed of an
+older revision no longer decodes, and the target starts from nothing),
+invite links, a two-cue PGS stream (whole, and split into fragments), and the same
 cues encoded by ffmpeg's `dvbsub` and `dvdsub` encoders and read back as the
 server reads a track.
 

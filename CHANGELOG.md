@@ -3143,3 +3143,17 @@
   encode runs at a time: a read of another rung moves it there, and the
   rung it left keeps what it wrote. The player starts on the rung the
   measured link chose. `MediaRead` and `GetManifest` name the rung.
+- pkarr (P6-05, wire revision 12): `network.pkarr = "n0"` or a pkarr
+  relay's URL publishes where the server is, signed with its key: its
+  relays and public addresses, never a LAN one. Devices are told where
+  (in `ServerAddresses` and invite links) and look the server up there
+  by its key when nothing they know reaches it, as after an IP change.
+- A relay of your own (P6-04): `spoolframe-server relay run --config`
+  runs an iroh relay that lets through only whom you allow, by tier:
+  owner (the server and its users' devices, which it asks the main server
+  about), friends (none until federation) and everyone else, each allowed
+  or denied. TLS from files, from Let's Encrypt (TLS-ALPN-01, or its
+  staging, or another ACME directory), or at a proxy in front. The main
+  server answers the relays `network.own_relays` names. NixOS:
+  `services.spoolframe-relay`, and the server module's `relays`, `pkarr`
+  and `ownRelays`.

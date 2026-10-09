@@ -18,6 +18,7 @@
       flake.nixosModules = {
         default = ./nix/nixos-module.nix;
         spoolframe = ./nix/nixos-module.nix;
+        spoolframe-relay = ./nix/relay-module.nix;
       };
 
       systems = [
