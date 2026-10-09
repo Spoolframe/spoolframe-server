@@ -122,6 +122,18 @@ pub enum UserError {
     /// Demoting or disabling the last enabled admin (P2-09).
     #[error("{0:?} is the last enabled admin; make another admin first")]
     LastAdmin(String),
+    /// Demoting or disabling the last enabled admin with a password: an
+    /// admin's passkeys and providers can all be lost, a password cannot
+    /// be, and getting back in otherwise needs a shell on the server.
+    #[error("{0:?} is the last enabled admin with a password; give another admin a password first")]
+    LastPasswordAdmin(String),
+    /// Removing the password of a user who has no passkey and no linked
+    /// provider account: they could not sign in again.
+    #[error("{0:?} has no other way to sign in: add a passkey or link a sign-in provider first")]
+    LastSignInMethod(String),
+    /// Removing a password that is not there.
+    #[error("{0:?} has no password")]
+    NoPassword(String),
     /// A display name that is too long or has control characters (P3-03).
     #[error("a display name is at most {MAX_DISPLAY_NAME_LEN} characters, on one line")]
     InvalidDisplayName,
@@ -261,6 +273,56 @@ impl Store {
         Ok(revoked)
     }
 
+    /// Remove `username`'s password: they sign in with a passkey or a
+    /// provider from then on. Not their last way to sign in, nor the last
+    /// enabled admin's password. As a new password does, it ends every
+    /// session of theirs but `keep` and forgets their trusted devices: a
+    /// password taken away is often one that leaked.
+    pub async fn remove_password(
+        &self,
+        username: &str,
+        keep: Option<&str>,
+    ) -> Result<u64, UserError> {
+        let name = normalize_username(username)?;
+        let now = self.now();
+        let mut tx = self.pool.begin().await?;
+        let id = user_id(&mut tx, &name).await?;
+        let (has_password, other_ways): (bool, bool) = sqlx::query_as(
+            "SELECT \
+               EXISTS (SELECT 1 FROM password_credentials WHERE user_id = ?1), \
+               EXISTS (SELECT 1 FROM passkeys WHERE user_id = ?1) \
+               OR EXISTS (SELECT 1 FROM external_identities WHERE user_id = ?1)",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !has_password {
+            return Err(UserError::NoPassword(name));
+        }
+        if !other_ways {
+            return Err(UserError::LastSignInMethod(name));
+        }
+        keep_a_password_admin(&mut tx, id, &name).await?;
+        sqlx::query("DELETE FROM password_credentials WHERE user_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let revoked = sqlx::query(
+            "UPDATE sessions SET revoked_at = ?2 \
+             WHERE user_id = ?1 AND revoked_at IS NULL AND token_hash IS NOT ?3",
+        )
+        .bind(id)
+        .bind(now)
+        .bind(keep)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        forget_trust(&mut tx, id).await?;
+        tx.commit().await?;
+        self.note_sessions_ended();
+        Ok(revoked)
+    }
+
     /// Make `username` an admin or a consumer (P2-09). The last enabled
     /// admin stays one.
     pub async fn set_role(&self, username: &str, role: Role) -> Result<(), UserError> {
@@ -301,6 +363,18 @@ impl Store {
     /// One user, by id.
     pub async fn user_by_id(&self, id: LocalUserId) -> Result<Option<UserRecord>, UserError> {
         Ok(self.list_users().await?.into_iter().find(|u| u.id == id))
+    }
+
+    /// Whether an enabled admin has a password: the rule every change
+    /// keeps once setup is finished, so the server is never left to
+    /// passkeys and providers alone.
+    pub async fn an_admin_has_a_password(&self) -> Result<bool, UserError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM users u JOIN password_credentials p ON p.user_id = u.id \
+             WHERE u.role = 'admin' AND u.disabled_at IS NULL)",
+        )
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     /// Disable a user and revoke every session they have. Returns how many
@@ -486,24 +560,55 @@ pub(super) async fn add_password(
     Ok(())
 }
 
-/// Refuse to take `id` out of the enabled admins if it is the last one.
-/// In the change's own transaction, so two admins demoting each other at
-/// once cannot both succeed.
+/// Refuse to take `id` out of the enabled admins if it is the last one,
+/// or the last one with a password. In the change's own transaction, so
+/// two admins demoting each other at once cannot both succeed.
 async fn keep_an_admin(
     tx: &mut sqlx::SqliteConnection,
     id: LocalUserId,
     name: &str,
 ) -> Result<(), UserError> {
-    let (is_enabled_admin, others): (bool, i64) = sqlx::query_as(
+    let (is_enabled_admin, has_password, others, others_with_password): (bool, bool, i64, i64) =
+        sqlx::query_as(
+            "SELECT \
+               EXISTS (SELECT 1 FROM users \
+                       WHERE id = ?1 AND role = 'admin' AND disabled_at IS NULL), \
+               EXISTS (SELECT 1 FROM password_credentials WHERE user_id = ?1), \
+               (SELECT count(*) FROM users \
+                WHERE id != ?1 AND role = 'admin' AND disabled_at IS NULL), \
+               (SELECT count(*) FROM users u JOIN password_credentials p ON p.user_id = u.id \
+                WHERE u.id != ?1 AND u.role = 'admin' AND u.disabled_at IS NULL)",
+        )
+        .bind(id)
+        .fetch_one(tx)
+        .await?;
+    if is_enabled_admin && others == 0 {
+        return Err(UserError::LastAdmin(name.to_owned()));
+    }
+    if is_enabled_admin && has_password && others_with_password == 0 {
+        return Err(UserError::LastPasswordAdmin(name.to_owned()));
+    }
+    Ok(())
+}
+
+/// Refuse to take the password of `id` if it is the last enabled admin
+/// with one.
+async fn keep_a_password_admin(
+    tx: &mut sqlx::SqliteConnection,
+    id: LocalUserId,
+    name: &str,
+) -> Result<(), UserError> {
+    let (is_enabled_admin, others_with_password): (bool, i64) = sqlx::query_as(
         "SELECT \
            EXISTS (SELECT 1 FROM users WHERE id = ?1 AND role = 'admin' AND disabled_at IS NULL), \
-           (SELECT count(*) FROM users WHERE id != ?1 AND role = 'admin' AND disabled_at IS NULL)",
+           (SELECT count(*) FROM users u JOIN password_credentials p ON p.user_id = u.id \
+            WHERE u.id != ?1 AND u.role = 'admin' AND u.disabled_at IS NULL)",
     )
     .bind(id)
     .fetch_one(tx)
     .await?;
-    if is_enabled_admin && others == 0 {
-        return Err(UserError::LastAdmin(name.to_owned()));
+    if is_enabled_admin && others_with_password == 0 {
+        return Err(UserError::LastPasswordAdmin(name.to_owned()));
     }
     Ok(())
 }
@@ -616,6 +721,80 @@ mod tests {
             store.set_role("alice", Role::Consumer).await,
             Err(UserError::LastAdmin(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn the_last_enabled_admin_with_a_password_cannot_be_demoted_or_disabled() {
+        let store = store("last-password-admin").await;
+        store.add_first_admin("root", "phc").await.unwrap();
+        store
+            .add_user("alice", None, "phc", Role::Admin)
+            .await
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM password_credentials \
+             WHERE user_id = (SELECT id FROM users WHERE username = 'alice')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(store.an_admin_has_a_password().await.unwrap());
+        // Alice, with no password, may go; root may not.
+        assert!(matches!(
+            store.set_role("root", Role::Consumer).await,
+            Err(UserError::LastPasswordAdmin(_))
+        ));
+        assert!(matches!(
+            store.disable_user("root").await,
+            Err(UserError::LastPasswordAdmin(_))
+        ));
+        store.set_role("alice", Role::Consumer).await.unwrap();
+        // Once another admin has one, root may go too.
+        store
+            .add_user("bob", None, "phc", Role::Admin)
+            .await
+            .unwrap();
+        store.disable_user("root").await.unwrap();
+        assert!(store.an_admin_has_a_password().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_password_is_removed_only_while_another_way_in_and_another_admin_password_stay() {
+        let store = store("remove-password").await;
+        let root = store.add_first_admin("root", "phc").await.unwrap();
+        let alice = store
+            .add_user("alice", None, "phc", Role::Consumer)
+            .await
+            .unwrap();
+        // No passkey, no provider: it is alice's only way in.
+        assert!(matches!(
+            store.remove_password("alice", None).await,
+            Err(UserError::LastSignInMethod(_))
+        ));
+        store
+            .link_identity(alice, "https://id.example.org", "sub-a", None)
+            .await
+            .unwrap();
+        store.remove_password("alice", None).await.unwrap();
+        assert!(matches!(
+            store.remove_password("alice", None).await,
+            Err(UserError::NoPassword(_))
+        ));
+        // Root has another way in, but is the only admin with a password.
+        store
+            .link_identity(root, "https://id.example.org", "sub-r", None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.remove_password("root", None).await,
+            Err(UserError::LastPasswordAdmin(_))
+        ));
+        store
+            .add_user("bob", None, "phc", Role::Admin)
+            .await
+            .unwrap();
+        store.remove_password("root", None).await.unwrap();
+        assert!(store.an_admin_has_a_password().await.unwrap());
     }
 
     /// A database from before P2-09: `is_admin` becomes `role`.

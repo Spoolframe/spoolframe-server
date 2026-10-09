@@ -183,9 +183,56 @@ struct Provider {
     client_id: String,
     /// Asked for besides `openid`, which is always.
     scopes: Vec<String>,
-    /// The file the secret is in: the config's `client_secret_file`, or
-    /// the secret kept in the state directory.
-    secret: PathBuf,
+    secret: SecretSource,
+}
+
+/// Where a provider's client secret comes from, first found first:
+/// `client_secret_file`, `client_secret` (`${SF_ENV_…}` already expanded),
+/// then the secret pasted in the web UI, kept in the state directory.
+#[derive(Clone, PartialEq, Eq)]
+enum SecretSource {
+    /// Read at each sign-in: it may have been changed or renewed.
+    File(PathBuf),
+    Value(String),
+}
+
+impl std::fmt::Debug for SecretSource {
+    /// The path, never the secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretSource::File(path) => f.debug_tuple("File").field(path).finish(),
+            SecretSource::Value(_) => f.write_str("Value(..)"),
+        }
+    }
+}
+
+impl SecretSource {
+    fn of(p: &OidcConfig, secrets: Option<&Secrets>) -> Self {
+        match (&p.client_secret_file, &p.client_secret, secrets) {
+            (Some(file), _, _) => SecretSource::File(file.clone()),
+            (None, Some(value), _) => SecretSource::Value(value.clone()),
+            (None, None, Some(secrets)) => SecretSource::File(secrets.path(&p.secret_name())),
+            // Nowhere to keep one: a test without a state dir.
+            (None, None, None) => SecretSource::File(PathBuf::from("/nonexistent")),
+        }
+    }
+
+    /// The secret now, trimmed; `None` when there is none.
+    fn read(&self) -> Option<String> {
+        let text = match self {
+            SecretSource::File(path) => std::fs::read_to_string(path).ok()?,
+            SecretSource::Value(value) => value.clone(),
+        };
+        Some(text.trim().to_owned()).filter(|s| !s.is_empty())
+    }
+
+    /// Where to put one, for the log.
+    fn place(&self) -> String {
+        match self {
+            SecretSource::File(path) => path.display().to_string(),
+            SecretSource::Value(_) => "auth.oidc client_secret".to_owned(),
+        }
+    }
 }
 
 /// What the discovery document says beyond OpenID Connect Discovery:
@@ -369,12 +416,7 @@ impl Oidc {
                 issuer: p.issuer.clone(),
                 client_id: p.client_id.clone(),
                 scopes: p.scopes().into_iter().filter(|s| s != "openid").collect(),
-                secret: match (&p.client_secret_file, &self.secrets) {
-                    (Some(file), _) => file.clone(),
-                    (None, Some(secrets)) => secrets.path(&p.secret_name()),
-                    // Nowhere to keep one: a test without a state dir.
-                    (None, None) => PathBuf::from("/nonexistent"),
-                },
+                secret: SecretSource::of(p, self.secrets.as_ref()),
             })
             .collect();
         *self.providers.write() = providers;
@@ -425,22 +467,18 @@ impl Oidc {
         provider: &Provider,
         metadata: Metadata,
     ) -> Result<(Client, Vec<CoreJwsSigningAlgorithm>), OidcError> {
-        let secret = std::fs::read_to_string(&provider.secret)
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                // The path says where to put it; the secret is never shown.
-                tracing::warn!(
-                    provider = provider.name,
-                    path = %provider.secret.display(),
-                    "no client secret for this sign-in provider"
-                );
-                OidcError::NotConfigured(format!(
-                    "{} has no client secret on this server",
-                    provider.name
-                ))
-            })?;
+        let secret = provider.secret.read().ok_or_else(|| {
+            // The place says where to put it; the secret is never shown.
+            tracing::warn!(
+                provider = provider.name,
+                path = %provider.secret.place(),
+                "no client secret for this sign-in provider"
+            );
+            OidcError::NotConfigured(format!(
+                "{} has no client secret on this server",
+                provider.name
+            ))
+        })?;
         let algs: Vec<CoreJwsSigningAlgorithm> = metadata
             .id_token_signing_alg_values_supported()
             .iter()
@@ -812,12 +850,45 @@ mod tests {
     }
 
     #[test]
+    fn the_client_secret_is_the_file_then_the_setting_then_the_pasted_one() {
+        // Only paths: nothing is read from it.
+        let secrets = Secrets::new(std::path::Path::new("/var/lib/spoolframe"));
+        let mut p = OidcConfig {
+            name: "Pocket ID".into(),
+            issuer: "https://id.example.org".into(),
+            client_id: "x".into(),
+            client_secret_file: Some("/run/secrets/oidc".into()),
+            client_secret: Some("from-env".into()),
+            scopes: None,
+        };
+        assert_eq!(
+            SecretSource::of(&p, Some(&secrets)),
+            SecretSource::File("/run/secrets/oidc".into())
+        );
+        p.client_secret_file = None;
+        assert_eq!(
+            SecretSource::of(&p, Some(&secrets)).read().as_deref(),
+            Some("from-env")
+        );
+        p.client_secret = None;
+        assert_eq!(
+            SecretSource::of(&p, Some(&secrets)),
+            SecretSource::File(secrets.path("oidc-pocket-id"))
+        );
+        assert_eq!(
+            format!("{:?}", SecretSource::Value("s3cret".into())),
+            "Value(..)"
+        );
+    }
+
+    #[test]
     fn without_a_public_url_there_are_no_providers() {
         let config = OidcConfig {
             name: "Pocket ID".into(),
             issuer: "https://id.example.org".into(),
             client_id: "x".into(),
             client_secret_file: None,
+            client_secret: None,
             scopes: None,
         };
         let without = Oidc::new(None, None);

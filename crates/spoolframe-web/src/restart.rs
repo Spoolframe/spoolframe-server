@@ -1,7 +1,8 @@
 //! Restarting the server from the web UI: what is waiting for a restart,
 //! and what the page says about it.
 
-use spoolframe_admin_api::{RestartMode, Settings};
+use serde_json::Value;
+use spoolframe_admin_api::{RestartMode, SettingEntry, Settings};
 
 /// The settings changed since the server started that apply only at the
 /// next start, by key, in the order the server lists them.
@@ -35,6 +36,32 @@ pub fn what_happens(mode: RestartMode) -> &'static str {
     }
 }
 
+/// A setting's value as the "Now" and "After restart" lines say it: text
+/// as it is, a list's entries joined, and nothing as "not set".
+pub fn said(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => "not set".into(),
+        Some(Value::String(s)) if s.is_empty() => "not set".into(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) if items.is_empty() => "none".into(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| said(Some(v)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// What the server runs with now and what it will after a restart (PX-22),
+/// for a restart setting changed since it started; `None` otherwise. An
+/// address or a port is the difference between reaching it and not.
+pub fn now_and_after(entry: &SettingEntry) -> Option<(String, String)> {
+    entry
+        .restart_pending
+        .then(|| (said(entry.running.as_ref()), said(entry.value.as_ref())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,6 +78,7 @@ mod tests {
             overrides: None,
             apply,
             restart_pending,
+            running: None,
         }
     }
 
@@ -72,6 +100,38 @@ mod tests {
             entry("admin.listen", SettingApply::Restart, true),
         ]);
         assert_eq!(pending(&listed), ["network.port", "admin.listen"]);
+    }
+
+    #[test]
+    fn a_pending_port_says_now_and_after() {
+        let mut e = entry("network.port", SettingApply::Restart, true);
+        e.running = Some(serde_json::json!(7420));
+        e.value = Some(serde_json::json!(7440));
+        assert_eq!(now_and_after(&e), Some(("7420".into(), "7440".into())));
+    }
+
+    #[test]
+    fn nothing_set_at_start_is_said_as_not_set() {
+        let mut e = entry("network.port", SettingApply::Restart, true);
+        e.value = Some(serde_json::json!(7440));
+        assert_eq!(now_and_after(&e), Some(("not set".into(), "7440".into())));
+    }
+
+    #[test]
+    fn a_list_is_said_joined_and_an_empty_one_as_none() {
+        let mut e = entry("network.relays", SettingApply::Restart, true);
+        e.running = Some(serde_json::json!(["default", "https://relay.example.org"]));
+        e.value = Some(serde_json::json!([]));
+        assert_eq!(
+            now_and_after(&e),
+            Some(("default, https://relay.example.org".into(), "none".into()))
+        );
+    }
+
+    #[test]
+    fn a_setting_not_waiting_for_a_restart_says_nothing() {
+        let e = entry("admin.listen", SettingApply::Restart, false);
+        assert_eq!(now_and_after(&e), None);
     }
 
     #[test]

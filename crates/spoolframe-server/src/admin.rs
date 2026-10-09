@@ -731,7 +731,11 @@ impl From<UserError> for ErrorObjectOwned {
                 error(error_code::INVALID_INPUT, e.to_string())
             }
             UserError::AlreadySetUp => error(error_code::ALREADY_SET_UP, e.to_string()),
-            UserError::LastAdmin(_) => error(error_code::LAST_ADMIN, e.to_string()),
+            UserError::LastAdmin(_) | UserError::LastPasswordAdmin(_) => {
+                error(error_code::LAST_ADMIN, e.to_string())
+            }
+            UserError::LastSignInMethod(_) => error(error_code::LAST_SIGN_IN_METHOD, e.to_string()),
+            UserError::NoPassword(_) => error(error_code::INVALID_INPUT, e.to_string()),
             UserError::Store(_) => internal(e),
         }
     }
@@ -2078,6 +2082,20 @@ impl MeApiServer for AdminApi {
             .await?)
     }
 
+    async fn password_remove(&self, ext: &Extensions) -> RpcResult<()> {
+        let (token, user) = self.recently_signed_in(ext).await?;
+        let me = self.account(user).await?;
+        // Every other session of theirs ends, as with a new password.
+        let keep = SessionToken(token).hash();
+        let revoked = self
+            .auth
+            .store()
+            .remove_password(&me.username, Some(&keep))
+            .await?;
+        tracing::info!(username = %me.username, revoked, "password removed by its user");
+        Ok(())
+    }
+
     async fn passkey_remove(&self, ext: &Extensions, id: String) -> RpcResult<()> {
         let (_, user) = self.recently_signed_in(ext).await?;
         self.auth.store().remove_passkey(user.user, &id).await?;
@@ -2569,6 +2587,20 @@ impl AdminApiServer for AdminApi {
         self.passkey_entries(user.id).await
     }
 
+    async fn user_remove_password(&self, ext: &Extensions, username: String) -> RpcResult<()> {
+        self.recent_admin(ext).await?;
+        let (token, _) = self.caller(ext).await?;
+        // Their own sessions but this one, when an admin takes their own.
+        let keep = SessionToken(token).hash();
+        let revoked = self
+            .auth
+            .store()
+            .remove_password(&username, Some(&keep))
+            .await?;
+        tracing::info!(%username, revoked, "password removed by an admin");
+        Ok(())
+    }
+
     async fn user_remove_passkey(
         &self,
         ext: &Extensions,
@@ -2619,6 +2651,12 @@ impl AdminApiServer for AdminApi {
                     "{provider}'s client secret is read from {}, as the config file says",
                     file.display()
                 ),
+            ));
+        }
+        if p.client_secret.is_some() {
+            return Err(error(
+                error_code::SETTING_LOCKED,
+                format!("{provider}'s client secret is its client_secret setting"),
             ));
         }
         let name = p.secret_name();
@@ -2902,6 +2940,14 @@ impl AdminApiServer for AdminApi {
 
     async fn setup_finish(&self, ext: &Extensions) -> RpcResult<SetupState> {
         let (settings, by) = self.settings_as_admin(ext).await?;
+        // A first admin made with a passkey adds a password before setup
+        // ends: passkeys can all be lost, and then only a shell gets in.
+        if !self.auth.store().an_admin_has_a_password().await? {
+            return Err(error(
+                error_code::INVALID_INPUT,
+                "give the admin account a password before finishing: at least one admin needs one",
+            ));
+        }
         Ok(setup_state(settings.setup_progress(None, true, &by)?))
     }
 
@@ -3881,6 +3927,54 @@ mod tests {
             .login_password("root", "correct horse", SessionBinding::Api, None, false)
             .await
             .unwrap();
+    }
+
+    /// Removing a password, the caller's or a user's, needs a recent
+    /// sign-in; and the last admin with a password keeps it.
+    #[tokio::test]
+    async fn a_password_is_removed_only_soon_after_signing_in() {
+        let dir = crate::store::tests::state_dir("remove-password-api").await;
+        let store = crate::store::Store::open(dir.as_ref()).await.unwrap();
+        let root = store.add_first_admin("root", "phc").await.unwrap();
+        store
+            .add_passkey(root, "cred-1", "iPhone", "{}", "media.example.org")
+            .await
+            .unwrap();
+        let alice = store
+            .add_user("alice", None, "phc", Role::Admin)
+            .await
+            .unwrap();
+        store
+            .add_passkey(alice, "cred-2", "Pixel", "{}", "media.example.org")
+            .await
+            .unwrap();
+        let auth = Auth::new(store.clone());
+        let token = auth.open_api_session(root).await.unwrap();
+        let api = api(auth);
+        let mut ext = Extensions::new();
+        ext.insert(Bearer(token.0.clone()));
+        ext.insert(Peer(Some("127.0.0.1".parse().unwrap())));
+        store
+            .age_session(&token.hash(), RECENT_SIGN_IN.as_secs() as i64 + 1)
+            .await;
+        let stale = api.password_remove(&ext).await.unwrap_err();
+        assert_eq!(stale.code(), error_code::RECENT_SIGN_IN_REQUIRED);
+        let stale = api
+            .user_remove_password(&ext, "alice".into())
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), error_code::RECENT_SIGN_IN_REQUIRED);
+
+        store
+            .age_session(&token.hash(), -(RECENT_SIGN_IN.as_secs() as i64))
+            .await;
+        api.user_remove_password(&ext, "alice".into())
+            .await
+            .unwrap();
+        // Root is now the last admin with a password.
+        let last = api.password_remove(&ext).await.unwrap_err();
+        assert_eq!(last.code(), error_code::LAST_ADMIN);
+        assert!(api.who_am_i(&ext).await.unwrap().has_password);
     }
 
     /// P3-03: a sensitive change needs a sign-in, or a confirmation, within

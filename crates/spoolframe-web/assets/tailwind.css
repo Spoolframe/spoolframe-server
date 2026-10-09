@@ -187,6 +187,9 @@
   .visible {
     visibility: visible;
   }
+  .\!fixed {
+    position: fixed !important;
+  }
   .absolute {
     position: absolute;
   }

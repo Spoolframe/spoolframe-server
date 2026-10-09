@@ -3199,3 +3199,44 @@
     so.
   - `spoolframe-probe --check-limits` also sends wrong invite codes until
     they are `RateLimited`.
+- `nix build .#docker`: the server as an OCI image
+  (`ghcr.io/spoolframe/spoolframe-server`), ffmpeg and tesseract included,
+  running as uid 1000 with its state in a volume.
+- PX-22, the server side:
+  - Any string setting may name an environment variable as
+    `${SF_ENV_NAME}`. Only `SF_ENV_` variables are read; an unset one
+    stops the server (or refuses the change) naming it. `config show`,
+    the settings API and runtime.ucl keep the reference.
+  - `auth.oidc[].client_secret`, read after `client_secret_file` and
+    before the secret pasted in the web UI. The runtime layer takes only
+    a `${SF_ENV_…}` reference; a provided file's literal one shows as
+    `(hidden)`.
+  - The settings API's restart-pending entries carry `running`, what
+    the server runs with until it restarts.
+- PX-22, the web UI:
+  - Every network setting: the app and Plex discovery ports on the
+    Server tab; the relays, relay keys, pkarr record and the addresses
+    devices are told on Remote access. Lists are edited one entry a
+    row.
+  - Settings › Sign-in providers: SSO providers added, changed and
+    removed. The client secret from an environment variable (saved as
+    `${SF_ENV_<NAME>}`, recommended), pasted (kept unencrypted on the
+    server's disk, as the form says before the field), or from a file.
+  - Playback: when frame previews are made, how often, their cache and
+    the artwork cache (in GiB), and when an item counts as started and
+    as watched. Security: the media tools and their sandbox.
+  - A restart setting changed since the start shows what the server
+    runs with now and after the restart.
+  - "Show advanced settings", off by default and kept per browser, hides
+    the settings few servers need; a tab with hidden ones set says how
+    many.
+- At least one enabled admin keeps a password: the last one with a
+  password cannot be demoted, disabled or have it removed, setup cannot
+  finish without one, and a server set up before says so at start.
+- `passwordRemove` (a user's own) and `userRemovePassword` (an admin's),
+  each after a recent sign-in, and never a user's last way to sign in.
+  Their other sessions end and trusted devices are forgotten, as with a
+  new password.
+- The web UI's setup asks for the first admin's password, the passkey
+  optional; My profile and a user's page remove a password, after
+  saying what that ends.

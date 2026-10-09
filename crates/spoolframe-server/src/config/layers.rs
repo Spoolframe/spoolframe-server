@@ -111,6 +111,15 @@ pub struct Layers {
 pub enum SettingError {
     #[error("there is no setting {0}")]
     Unknown(String),
+    /// A client secret for the runtime layer that is the secret itself,
+    /// not `${SF_ENV_…}` (PX-22): runtime.ucl is plain text, shown by
+    /// `config show` and copied with the state directory.
+    #[error(
+        "auth.oidc: {provider:?}'s client_secret must be an environment variable, \
+         ${{SF_ENV_<NAME>}}; paste the secret itself as the provider's client secret \
+         instead (kept apart from the settings)"
+    )]
+    PlainSecret { provider: String },
     /// The provided file sets it, and is locked.
     #[error("{key} is set by the server's config file ({path}), which is locked")]
     Locked { key: String, path: PathBuf },
@@ -466,6 +475,9 @@ impl Layers {
     /// The merged settings checked, with a mistake as the file would have
     /// it without naming the file.
     fn check(&self) -> Result<ServerConfig, SettingError> {
+        if let Some(provider) = plain_client_secret(&self.runtime) {
+            return Err(SettingError::PlainSecret { provider });
+        }
         ServerConfig::from_table(&self.merged()).map_err(SettingError::Invalid)
     }
 
@@ -623,8 +635,10 @@ impl Layers {
                 };
                 (value.to_owned(), describe(&origin))
             } else {
-                let value = tree::get(&merged, setting.key)
-                    .map_or_else(|| "(not set)".to_owned(), Value::to_ucl);
+                let value = tree::get(&merged, setting.key).map_or_else(
+                    || "(not set)".to_owned(),
+                    |v| shown(setting.key, v).to_ucl(),
+                );
                 (value, describe(&origin))
             };
             let _ = writeln!(out, "{} = {value};  # {origin}", setting.key);
@@ -645,6 +659,58 @@ fn describe(origin: &Origin) -> String {
             format!("runtime, over the config file's {}", file.to_ucl())
         }
     }
+}
+
+/// What a provider's literal client secret is shown as, in `config show`
+/// and the settings API: a provided file may hold one, and it is never
+/// shown. The runtime layer refuses it back, as any literal.
+pub const HIDDEN_SECRET: &str = "(hidden)";
+
+/// `value` as shown for setting `key`: `auth.oidc` with each client
+/// secret that is not a `${SF_ENV_…}` reference hidden.
+pub fn shown(key: &str, value: &Value) -> Value {
+    let Value::Array(providers) = value else {
+        return value.clone();
+    };
+    if key != "auth.oidc" {
+        return value.clone();
+    }
+    Value::Array(
+        providers
+            .iter()
+            .map(|p| match p {
+                Value::Object(p) => {
+                    let mut p = p.clone();
+                    if let Some(secret) = p.get_mut("client_secret")
+                        && !matches!(secret, Value::String(s) if tree::is_env_reference(s))
+                    {
+                        *secret = Value::String(HIDDEN_SECRET.to_owned());
+                    }
+                    Value::Object(p)
+                }
+                other => other.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// The name of a provider in `table`'s `auth.oidc` whose `client_secret`
+/// is not a `${SF_ENV_…}` reference, if any.
+pub fn plain_client_secret(table: &Table) -> Option<String> {
+    let Some(Value::Array(providers)) = tree::get(table, "auth.oidc") else {
+        return None;
+    };
+    providers.iter().find_map(|p| match p {
+        Value::Object(p) => match p.get("client_secret") {
+            Some(Value::String(s)) if tree::is_env_reference(s) => None,
+            Some(_) => Some(match p.get("name") {
+                Some(Value::String(name)) => name.clone(),
+                _ => String::new(),
+            }),
+            None => None,
+        },
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -890,6 +956,76 @@ mod tests {
             .with_set("plex.path_mapping", Value::Array(vec![]))
             .unwrap();
         assert!(changed.config().is_ok());
+    }
+
+    fn provider(secret: &str) -> Value {
+        Value::from_json(&serde_json::json!([{
+            "name": "Pocket ID", "issuer": "https://id.example.org",
+            "client_id": "spoolframe", "client_secret": secret,
+        }]))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_runtime_layer_takes_a_client_secret_only_as_an_sf_env_reference() {
+        let layers = layers(None, None).unwrap();
+        let refused = layers
+            .with_set("auth.oidc", provider("hunter2"))
+            .unwrap_err();
+        assert!(
+            matches!(&refused, SettingError::PlainSecret { provider } if provider == "Pocket ID"),
+            "{refused}"
+        );
+        // A reference is checked like any other value: this variable is
+        // not set, so the change is refused naming it.
+        let unset = layers
+            .with_set("auth.oidc", provider("${SF_ENV_PX22_NEVER_SET}"))
+            .unwrap_err();
+        assert_eq!(
+            unset.to_string(),
+            "auth.oidc.client_secret names ${SF_ENV_PX22_NEVER_SET}, but the server has no \
+             environment variable SF_ENV_PX22_NEVER_SET"
+        );
+    }
+
+    #[test]
+    fn a_files_literal_client_secret_is_never_shown() {
+        let layers = layers(
+            Some(
+                r#"auth { oidc [ { name = "Pocket ID"; issuer = "https://id.example.org";
+                   client_id = "spoolframe"; client_secret = "hunter2"; } ] }"#,
+            ),
+            None,
+        )
+        .unwrap();
+        let text = layers.show(&Secrets::new(Path::new("/nonexistent")));
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains(r#"client_secret = "(hidden)""#), "{text}");
+        // Written back as shown, it is refused: "(hidden)" is no reference.
+        let back = shown(
+            "auth.oidc",
+            tree::get(&layers.merged(), "auth.oidc").unwrap(),
+        );
+        assert!(matches!(
+            layers.with_set("auth.oidc", back),
+            Err(SettingError::PlainSecret { .. })
+        ));
+    }
+
+    #[test]
+    fn a_reference_is_kept_as_written_and_expanded_only_in_the_typed_config() {
+        let layers = layers(
+            None,
+            Some(r#"plex { url = "http://${SF_ENV_PLEX_HOST}:32400"; }"#),
+        )
+        .unwrap();
+        let env = |name: &str| (name == "SF_ENV_PLEX_HOST").then(|| "nas".to_owned());
+        let config = ServerConfig::from_table_with_env(&layers.merged(), &env).unwrap();
+        assert_eq!(config.plex.unwrap().url, "http://nas:32400");
+        assert_eq!(
+            tree::get(&layers.merged(), "plex.url"),
+            Some(&Value::String("http://${SF_ENV_PLEX_HOST}:32400".into()))
+        );
     }
 
     #[test]

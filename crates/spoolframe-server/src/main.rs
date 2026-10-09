@@ -1017,6 +1017,12 @@ async fn run(
     tracing::info!(addr = %admin_addr, web = urls.join(" "), "admin API listening");
     if let Some(code) = setup_code {
         admin::log_setup_code(&urls, &code);
+    } else if !auth.store().an_admin_has_a_password().await? {
+        // Set up before the rule (PX-22's follow-up): said, not refused.
+        tracing::warn!(
+            "no enabled admin has a password: if their passkeys are lost, only a shell gets \
+             in; give one a password in My profile, or with `spoolframe-server user passwd <name>`"
+        );
     }
     let server = Server::start(
         key,

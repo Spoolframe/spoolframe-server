@@ -76,6 +76,7 @@ async fn server_behind(
         issuer: issuer.into(),
         client_id: CLIENT_ID.into(),
         client_secret_file: Some(secret),
+        client_secret: None,
         scopes,
     }]);
     let origins = Origins::Exactly(WEB.into());

@@ -1109,6 +1109,11 @@ pub struct SettingEntry {
     /// A restart setting changed since the server started: what the
     /// server runs with is not `value` yet.
     pub restart_pending: bool,
+    /// When `restart_pending`, what the server runs with until it starts
+    /// again (PX-22): "Now", beside `value`, "After restart". `None` there
+    /// when nothing set it then; always `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<serde_json::Value>,
 }
 
 /// Every setting, and what the page around them needs to know.
@@ -2544,6 +2549,14 @@ pub trait MeApi {
     #[method(name = "passkeyRename", with_extensions)]
     async fn passkey_rename(&self, id: String, name: String) -> jsonrpsee::core::RpcResult<()>;
 
+    /// Remove the caller's password: a passkey or a linked provider signs
+    /// them in from then on. Needs a recent sign-in. Refused for their last
+    /// way to sign in (`LAST_SIGN_IN_METHOD`) and for the last enabled
+    /// admin with a password (`LAST_ADMIN`). Their other sessions end and
+    /// their trusted devices are forgotten, as with a new password.
+    #[method(name = "passwordRemove", with_extensions)]
+    async fn password_remove(&self) -> jsonrpsee::core::RpcResult<()>;
+
     /// Remove one of the caller's passkeys. Needs a recent sign-in; their
     /// last way to sign in stays (`LAST_SIGN_IN_METHOD`).
     #[method(name = "passkeyRemove", with_extensions)]
@@ -2724,6 +2737,12 @@ pub trait AdminApi {
         &self,
         username: String,
     ) -> jsonrpsee::core::RpcResult<Vec<PasskeyEntry>>;
+
+    /// Remove a user's password, as `passwordRemove` does the caller's.
+    /// Needs a recent sign-in (PX-10): `RECENT_SIGN_IN_REQUIRED` otherwise.
+    /// Every session of the user's is revoked, but the caller's own.
+    #[method(name = "userRemovePassword", with_extensions)]
+    async fn user_remove_password(&self, username: String) -> jsonrpsee::core::RpcResult<()>;
 
     /// Remove one of a user's passkeys, by its id from `userPasskeys`.
     /// Needs a recent sign-in (PX-10), as

@@ -1,8 +1,10 @@
 //! Settings › Remote access (P6-02), as the WebRemoteAccess boards draw
 //! it: what the server advertises now and how each address was found,
-//! then `network.wan`'s form; and the setup wizard's "From outside your
-//! home?", in the Access step's apps card (WebWizardRemoteChoices). The form's logic is
-//! `crate::remote`, tested on the host.
+//! then `network.wan`'s form, and with advanced settings shown, the relays
+//! and the addresses devices are told (PX-22); and the setup wizard's
+//! "From outside your home?", in the Access step's apps card
+//! (WebWizardRemoteChoices). The form's logic is `crate::remote`, tested
+//! on the host.
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{AdminApiClient, MappingStatus, ServerStatus, Settings};
@@ -10,9 +12,10 @@ use wasm_bindgen::JsValue;
 
 use super::admin::sleep;
 use super::profile::{ConfirmItsYou, asks_to_confirm};
-use super::wizard::{Note, load_settings, loading, locked, save, value};
+use super::wizard::{ListField, Note, entry, load_settings, loading, locked, save, value};
 use super::{Alert, Field, icons, rpc};
-use crate::logic::ApiError;
+use crate::logic::{ApiError, list_setting, string_values};
+use crate::network::{Pkarr, pkarr_form, pkarr_setting, relays_form, relays_list};
 use crate::remote::{
     Choice, Ip, Line, Opened, Tone, WanForm, add_static, badge, listens_on_ipv6, lookup_line,
     mapping_line, service_name, source_detail, tried_line, wizard_setting,
@@ -62,7 +65,7 @@ fn RelaysNote() -> Element {
             icons::Info {}
             span {
                 b { "Most homes don’t need this" }
-                "Few home connections have a public IP you can forward to. Relays, coming in a later version, let people connect from anywhere without any of this. Set a public address only when your connection has one: it gives a direct, faster path."
+                "Few home connections have a public IP you can forward to. Relays, below, let people connect from anywhere without any of this. Set a public address only when your connection has one: it gives a direct, faster path."
             }
         }
     }
@@ -147,6 +150,7 @@ fn StatusCard(status: ServerStatus, opened: Opened) -> Element {
 /// Settings › Remote access.
 #[component]
 pub fn RemoteAccessForm(on_done: EventHandler<()>) -> Element {
+    let advanced = crate::advanced::shown(super::settings::show_advanced(), "network.relays");
     let mut generation = use_signal(|| 0u32);
     let settings = use_resource(move || async move {
         let _ = generation();
@@ -186,6 +190,25 @@ pub fn RemoteAccessForm(on_done: EventHandler<()>) -> Element {
                 on_done,
                 on_reload: move |_| generation += 1,
             }
+        }
+        // The relays and the addresses told are advanced (PX-22).
+        if advanced {
+        for g in [generation()] {
+            RelayFields {
+                key: "{g}",
+                settings: loaded.clone(),
+                on_done,
+                on_reload: move |_| generation += 1,
+            }
+        }
+        for g in [generation()] {
+            AnnounceFields {
+                key: "{g}",
+                settings: loaded.clone(),
+                on_done,
+                on_reload: move |_| generation += 1,
+            }
+        }
         }
     }
 }
@@ -444,6 +467,244 @@ fn RemoteFields(
             SecurityNote {}
         }
         RelaysNote {}
+    }
+}
+
+/// The strings of list setting `key`.
+fn listed(settings: &Settings, key: &str) -> Vec<String> {
+    value(settings, key)
+        .map(super::wizard::strings)
+        .unwrap_or_default()
+}
+
+/// A list's value at Save, beside what `key` has now.
+fn list_change(settings: &Settings, key: &str, items: &[String]) -> Option<serde_json::Value> {
+    list_setting(string_values(items), entry(settings, key))
+}
+
+/// Relays (P6-03, P6-04) and the pkarr record (P6-05): the other ways in
+/// besides a public address, a card of their own with its own Save.
+#[component]
+fn RelayFields(
+    settings: Settings,
+    on_done: EventHandler<()>,
+    on_reload: EventHandler<()>,
+) -> Element {
+    let (n0_saved, urls_saved) = relays_form(value(&settings, "network.relays"));
+    let relays_fixed = locked(&settings, "network.relays");
+    let n0 = use_signal(|| n0_saved);
+    let urls = use_signal(|| urls_saved);
+    let own = use_signal(|| listed(&settings, "network.own_relays"));
+    let (pkarr_saved, pkarr_url_saved) = pkarr_form(value(&settings, "network.pkarr"));
+    let pkarr_fixed = locked(&settings, "network.pkarr");
+    let mut pkarr = use_signal(|| pkarr_saved);
+    let pkarr_url = use_signal(|| pkarr_url_saved);
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let s = settings.clone();
+    let confirming = use_signal(|| None::<String>);
+    let on_save = use_callback(move |()| {
+        let s = s.clone();
+        let pkarr_value = match pkarr_setting(pkarr(), &pkarr_url()) {
+            Ok(v) => v,
+            Err(why) => {
+                error.set(Some(why));
+                return;
+            }
+        };
+        let changes = vec![
+            (
+                "network.relays",
+                list_change(&s, "network.relays", &relays_list(n0(), &urls())),
+            ),
+            (
+                "network.own_relays",
+                list_change(&s, "network.own_relays", &own()),
+            ),
+            ("network.pkarr", Some(pkarr_value)),
+        ];
+        busy.set(true);
+        spawn(async move {
+            match save(&s, changes).await {
+                Ok(()) => on_done.call(()),
+                Err(e) if asks_to_confirm(&e, confirming, "changing the relays") => {}
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+        });
+    });
+    let own_fixed = locked(&settings, "network.own_relays");
+    rsx! {
+        section { class: "card tele-card",
+            div { class: "wan-part",
+                PartHead {
+                    title: "n0’s public relays",
+                    about: if n0() { "On: devices that cannot reach the server directly go through n0’s free public relays. They pass encrypted traffic they cannot read." } else { "Off: no public relays. Devices reach the server on your network, at a public address, or through relays of your own." },
+                    on: n0,
+                    disabled: relays_fixed,
+                }
+            }
+            div { class: "wan-part",
+                span { class: "flex flex-col gap-0.5",
+                    b { class: "text-[15px]", "Relays of your own" }
+                    span { class: "text-[13px] text-ctp-subtext0", "The URLs of relays you run. The server takes its home relay from these and n0’s, and invites carry the list. None: relays off." }
+                }
+                ListField { add: "Add a relay URL", items: urls, placeholder: "https://relay.example.org", disabled: relays_fixed }
+                Note { settings: settings.clone(), setting: "network.relays", on_changed: move |_| on_reload.call(()) }
+            }
+            div { class: "wan-part",
+                span { class: "flex flex-col gap-0.5",
+                    b { class: "text-[15px]", "Relays that let your devices through" }
+                    span { class: "text-[13px] text-ctp-subtext0",
+                        "The keys of relays of your own (spoolframe-server relay), so they let this server’s devices through. Print a relay’s key with "
+                        span { class: "mono-value text-xs", "spoolframe-server relay id" }
+                        "."
+                    }
+                }
+                ListField { add: "Add a relay key", items: own, disabled: own_fixed }
+                Note { settings: settings.clone(), setting: "network.own_relays", on_changed: move |_| on_reload.call(()) }
+            }
+            div { class: "wan-part",
+                span { class: "flex flex-col gap-0.5",
+                    b { class: "text-[15px]", "Find the server by its key" }
+                    span { class: "text-[13px] text-ctp-subtext0",
+                        "Only for a device that knows this server but no longer an address that reaches it, as when your public IP changed while it was away. The server publishes where it is, signed with its key. Not needed on your network, with a public address that does not change, or with relays on. The record is public: relays and public addresses only, never a home one."
+                    }
+                }
+                div { class: "seg", role: "radiogroup", aria_label: "Where the record goes",
+                    for (choice, label) in [(Pkarr::Off, "Off"), (Pkarr::N0, "n0 (dns.iroh.link)"), (Pkarr::Own, "My own pkarr relay")] {
+                        button {
+                            key: "{label}",
+                            class: if pkarr() == choice { "seg-item seg-item-on" } else { "seg-item" },
+                            role: "radio",
+                            aria_checked: "{pkarr() == choice}",
+                            disabled: pkarr_fixed,
+                            onclick: move |_| pkarr.set(choice),
+                            "{label}"
+                        }
+                    }
+                }
+                if pkarr() == Pkarr::Own {
+                    Field { label: "Pkarr relay URL", value: pkarr_url, placeholder: "https://dns.example.org/pkarr", disabled: pkarr_fixed }
+                }
+                Note { settings: settings.clone(), setting: "network.pkarr", on_changed: move |_| on_reload.call(()) }
+            }
+            if let Some(text) = error() {
+                Alert { text }
+            }
+            div { class: "wizard-foot",
+                span { class: "wizard-foot-end",
+                    button { class: "btn-dialog btn-dialog-grey", disabled: busy(), onclick: move |_| on_reload.call(()), "Discard" }
+                    button { class: "btn-dialog btn-dialog-primary", disabled: busy() || (relays_fixed && own_fixed && pkarr_fixed), onclick: move |_| on_save.call(()), "Save" }
+                }
+            }
+        }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
+    }
+}
+
+/// `network.announce.*` (PX-12): which of its addresses a signed-in
+/// device is told.
+#[component]
+fn AnnounceFields(
+    settings: Settings,
+    on_done: EventHandler<()>,
+    on_reload: EventHandler<()>,
+) -> Element {
+    const ADD: &str = "network.announce.add";
+    const IGNORE: &str = "network.announce.ignore";
+    const IGNORE_INTERFACES: &str = "network.announce.ignore_interfaces";
+    const INTERFACES: &str = "network.announce.interfaces";
+    let add = use_signal(|| listed(&settings, ADD));
+    let ignore = use_signal(|| listed(&settings, IGNORE));
+    let ignore_interfaces = use_signal(|| listed(&settings, IGNORE_INTERFACES));
+    let interfaces = use_signal(|| listed(&settings, INTERFACES));
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let s = settings.clone();
+    let confirming = use_signal(|| None::<String>);
+    let on_save = use_callback(move |()| {
+        let s = s.clone();
+        let changes = vec![
+            (ADD, list_change(&s, ADD, &add())),
+            (IGNORE, list_change(&s, IGNORE, &ignore())),
+            (
+                IGNORE_INTERFACES,
+                list_change(&s, IGNORE_INTERFACES, &ignore_interfaces()),
+            ),
+            (INTERFACES, list_change(&s, INTERFACES, &interfaces())),
+        ];
+        busy.set(true);
+        spawn(async move {
+            match save(&s, changes).await {
+                Ok(()) => on_done.call(()),
+                Err(e)
+                    if asks_to_confirm(
+                        &e,
+                        confirming,
+                        "changing the addresses devices are told",
+                    ) => {}
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+        });
+    });
+    let all_fixed = [ADD, IGNORE, IGNORE_INTERFACES, INTERFACES]
+        .iter()
+        .all(|k| locked(&settings, k));
+    rsx! {
+        section { class: "card tele-card",
+            div { class: "wan-part",
+                span { class: "flex flex-col gap-0.5",
+                    b { class: "text-[15px]", "Addresses devices are told" }
+                    span { class: "text-[13px] text-ctp-subtext0",
+                        "A signed-in device is told the server’s address on each network interface, but container and VM bridges (docker*, br-*, veth*, virbr*), which no device reaches. Narrow or add to that here. Interface names take * and ?."
+                    }
+                }
+            }
+            div { class: "wan-part",
+                span { class: "flex flex-col gap-0.5",
+                    b { class: "text-[15px]", "Only these interfaces" }
+                    span { class: "text-[13px] text-ctp-subtext0", "None: every interface but the virtual ones. Naming a virtual one, such as docker0, tells it too." }
+                }
+                ListField { add: "Add an interface", items: interfaces, placeholder: "enp*", disabled: locked(&settings, INTERFACES) }
+                Note { settings: settings.clone(), setting: INTERFACES, on_changed: move |_| on_reload.call(()) }
+            }
+            div { class: "wan-part",
+                span { class: "flex flex-col gap-0.5",
+                    b { class: "text-[15px]", "Never these interfaces" }
+                    span { class: "text-[13px] text-ctp-subtext0", "Even when listed above. The virtual ones need not be listed." }
+                }
+                ListField { add: "Add an interface", items: ignore_interfaces, placeholder: "wg1", disabled: locked(&settings, IGNORE_INTERFACES) }
+                Note { settings: settings.clone(), setting: IGNORE_INTERFACES, on_changed: move |_| on_reload.call(()) }
+            }
+            div { class: "wan-part",
+                span { class: "flex flex-col gap-0.5",
+                    b { class: "text-[15px]", "Never these addresses" }
+                    span { class: "text-[13px] text-ctp-subtext0", "Addresses and ranges, such as 172.17.0.0/16 or 10.0.0.9." }
+                }
+                ListField { add: "Add an address or range", items: ignore, placeholder: "172.17.0.0/16", disabled: locked(&settings, IGNORE) }
+                Note { settings: settings.clone(), setting: IGNORE, on_changed: move |_| on_reload.call(()) }
+            }
+            div { class: "wan-part",
+                span { class: "flex flex-col gap-0.5",
+                    b { class: "text-[15px]", "Also these addresses" }
+                    span { class: "text-[13px] text-ctp-subtext0", "Ones the server does not see itself, such as a NAT’s public address that forwards the port: 203.0.113.7 (with the server’s port) or 203.0.113.7:7420. Told even when a rule above leaves them out." }
+                }
+                ListField { add: "Add an address", items: add, placeholder: "203.0.113.7:7420", disabled: locked(&settings, ADD) }
+                Note { settings: settings.clone(), setting: ADD, on_changed: move |_| on_reload.call(()) }
+            }
+            if let Some(text) = error() {
+                Alert { text }
+            }
+            div { class: "wizard-foot",
+                span { class: "wizard-foot-end",
+                    button { class: "btn-dialog btn-dialog-grey", disabled: busy(), onclick: move |_| on_reload.call(()), "Discard" }
+                    button { class: "btn-dialog btn-dialog-primary", disabled: busy() || all_fixed, onclick: move |_| on_save.call(()), "Save" }
+                }
+            }
+        }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
     }
 }
 

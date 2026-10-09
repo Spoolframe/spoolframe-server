@@ -78,6 +78,10 @@ pub enum ConfigError {
         path.display()
     )]
     StateDirKey { path: PathBuf, value: String },
+    /// A value names `${SF_ENV_…}` (PX-22), and the server has no such
+    /// variable.
+    #[error("{key} names ${{{var}}}, but the server has no environment variable {var}")]
+    EnvUnset { key: String, var: String },
     /// Nothing says where the state directory is.
     #[error(
         "no state directory: pass --state-dir <dir> or set SPOOLFRAME_STATE_DIR \
@@ -175,10 +179,16 @@ pub struct OidcConfig {
     /// on loopback only.
     pub issuer: String,
     pub client_id: String,
-    /// A file holding the client secret. Left out, the secret set in the
-    /// web UI, kept as `secrets/oidc-<name>` under the state directory.
+    /// A file holding the client secret. Read before `client_secret`.
     #[ucl(default)]
     pub client_secret_file: Option<PathBuf>,
+    /// The client secret itself (PX-22). Meant as `${SF_ENV_NAME}`, so
+    /// the secret stays in the environment: the runtime layer takes
+    /// nothing else, and the provided file is plain text. Without either,
+    /// the secret pasted in the web UI, kept as `secrets/oidc-<name>`
+    /// under the state directory.
+    #[ucl(default)]
+    pub client_secret: Option<String>,
     /// The scopes asked for; `openid profile email` if left out. `openid`
     /// is asked for whether it is listed or not.
     #[ucl(default)]
@@ -1950,8 +1960,20 @@ impl ServerConfig {
     }
 
     /// Parse merged layers.
+    /// `${SF_ENV_…}` is expanded here and only here (PX-22): the layers,
+    /// `config show`, the settings API and the runtime layer written back
+    /// all keep the reference.
     pub fn from_table(table: &tree::Table) -> Result<Self, ConfigError> {
-        Self::parse(&tree::to_document(table))
+        Self::from_table_with_env(table, &|name| std::env::var(name).ok())
+    }
+
+    pub fn from_table_with_env(
+        table: &tree::Table,
+        env: &impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let expanded = tree::expand_env(table, env)
+            .map_err(|(key, var)| ConfigError::EnvUnset { key, var })?;
+        Self::parse(&tree::to_document(&expanded))
     }
 }
 

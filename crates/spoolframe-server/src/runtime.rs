@@ -16,7 +16,9 @@ use spoolframe_types::{Library, LibraryId, Namespace};
 
 use crate::admin::CookiePolicy;
 use crate::catalog::{Composite, LiveCatalog, PlexSource, Served, ids};
-use crate::config::layers::{Layer, Layers, PLEX_TOKEN_SECRET, SettingError, plex_token_secret};
+use crate::config::layers::{
+    self, Layer, Layers, PLEX_TOKEN_SECRET, SettingError, plex_token_secret,
+};
 use crate::config::secrets::Secrets;
 use crate::config::settings::{self, Apply, PLEX_TOKEN, SETTINGS, Setting};
 use crate::config::tree::{self, Table, Value};
@@ -230,6 +232,7 @@ impl RuntimeSettings {
                 overrides: None,
                 apply,
                 restart_pending: false,
+                running: None,
             };
         }
         let value = tree::get(merged, setting.key);
@@ -250,11 +253,14 @@ impl RuntimeSettings {
                 overrides: None,
                 apply,
                 restart_pending: false,
+                running: None,
             };
         }
+        let running = tree::get(&self.started, setting.key);
+        let restart_pending = setting.apply == Apply::Restart && value != running;
         SettingEntry {
             key: setting.key.to_owned(),
-            value: value.map(Value::to_json),
+            value: value.map(|v| layers::shown(setting.key, v).to_json()),
             secret: false,
             set: value.is_some(),
             layer: origin.layer.map(|layer| match layer {
@@ -263,10 +269,15 @@ impl RuntimeSettings {
                 Layer::Runtime => SettingLayer::Runtime,
             }),
             locked: origin.locked,
-            overrides: origin.overrides.as_ref().map(Value::to_json),
+            overrides: origin
+                .overrides
+                .as_ref()
+                .map(|v| layers::shown(setting.key, v).to_json()),
             apply,
-            restart_pending: setting.apply == Apply::Restart
-                && value != tree::get(&self.started, setting.key),
+            restart_pending,
+            running: restart_pending
+                .then(|| running.map(|v| layers::shown(setting.key, v).to_json()))
+                .flatten(),
         }
     }
 
@@ -802,11 +813,21 @@ mod tests {
             .unwrap();
         assert_eq!(entry.apply, SettingApply::Restart);
         assert!(entry.restart_pending);
+        // Before the restart: no port was set at start (a free one is
+        // picked); after it, 7440.
+        assert_eq!(entry.running, None);
+        assert_eq!(entry.value, Some(serde_json::json!(7440)));
         let saved = std::fs::read_to_string(dir.as_ref().join("runtime.ucl")).unwrap();
         assert!(saved.contains("port = 7440;"), "{saved}");
+        let entry = settings
+            .set("network.mdns", &serde_json::json!(false), "root")
+            .unwrap();
+        assert_eq!(entry.running, Some(serde_json::json!(true)));
+        assert_eq!(entry.value, Some(serde_json::json!(false)));
         // Back to what the server started with: nothing waits.
         let entry = settings.unset("network.port", "root").unwrap();
         assert!(!entry.restart_pending);
+        assert_eq!(entry.running, None);
     }
 
     /// Without a supervisor a restart is still asked for: the server

@@ -54,7 +54,14 @@
           wasm-bindgen-cli = inputs.ports.packages.${system}.wasm-bindgen-cli_0_2_126;
         };
       in {
-        packages.default = spoolframe;
+        packages =
+          {default = spoolframe;}
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            docker = pkgs.callPackage ./nix/docker.nix {
+              inherit spoolframe;
+              rev = inputs.self.shortRev or null;
+            };
+          };
         checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           nixos-module = import ./nix/tests.nix {
             inherit pkgs;

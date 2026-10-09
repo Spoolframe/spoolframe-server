@@ -247,9 +247,14 @@ auth {
   # oidc [
   #   { name = "Pocket ID"; issuer = "https://id.example.org";
   #     client_id = "…";
-  #     # A file holding the client secret. Left out, the secret set in
-  #     # the web UI, kept as secrets/oidc-<name> in the state directory.
+  #     # The client secret, first found first: a file holding it; or
+  #     # client_secret, best as an environment variable the server
+  #     # reads, ${SF_ENV_<NAME>} (this file is plain text, and the
+  #     # runtime layer takes nothing but such a reference); or, with
+  #     # neither, the secret pasted in the web UI, kept unencrypted as
+  #     # secrets/oidc-<name> in the state directory.
   #     client_secret_file = "/run/secrets/spoolframe-oidc";
+  #     # client_secret = "${SF_ENV_OIDC_SECRET}";
   #     # What is asked for; openid is always.
   #     scopes = ["openid", "profile", "email"]; },
   # ]

@@ -12,8 +12,8 @@ use super::profile::{ConfirmItsYou, DevicesLegend, TrustDialog, asks_to_confirm}
 use super::{Alert, Field, Route, icons, initial, now, role_name, rpc};
 use crate::logic::{
     AddUserError, ApiError, PathState, UserStatus, add_user_error, ago, avatar_class, client_kind,
-    count, key_start, last_admin, path_state, plex_line, server_version, shared_devices,
-    sign_in_methods, thousands, user_change_error, user_status, users_in_order,
+    count, key_start, last_admin, password_remove_error, path_state, plex_line, server_version,
+    shared_devices, sign_in_methods, thousands, user_change_error, user_status, users_in_order,
 };
 use crate::trust::{self, Change, LegendLine, Question, Switch, Whose};
 
@@ -607,6 +607,9 @@ enum Ask {
     Role(Role),
     Disable,
     ClearPin,
+    /// Take the user's password away: a passkey or a provider signs them
+    /// in from then on.
+    RemovePassword,
 }
 
 /// One user's page (the WebUserSessions board): who, what can be done to
@@ -699,6 +702,9 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
             }
             span { class: "flex flex-wrap gap-2",
                 button { class: "btn", onclick: move |_| resetting.set(true), icons::Key { size: 15 } "Reset password" }
+                if user.has_password {
+                    button { class: "btn", onclick: move |_| asking.set(Some(Ask::RemovePassword)), icons::Trash {} "Remove password" }
+                }
                 button {
                     class: "btn",
                     disabled: role_blocked,
@@ -792,10 +798,18 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
             format!("No device asks for it any more. {username} can set a new one in the app."),
             "Clear PIN",
         ),
+        Ask::RemovePassword => (
+            format!("Remove {username}'s password?"),
+            format!(
+                "{username} signs in with their passkey or sign-in provider from then on. Their sessions end, and their trusted devices are forgotten."
+            ),
+            "Remove password",
+        ),
     };
     let confirming = use_signal(|| None::<String>);
     let about = match ask {
         Ask::Role(_) => "making an admin",
+        Ask::RemovePassword => "removing a password",
         _ => "clearing a PIN",
     };
     let name = username.clone();
@@ -838,6 +852,13 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
                             .map_err(rpc::error)?;
                         Ok(format!("{username}'s PIN cleared"))
                     }
+                    Ask::RemovePassword => {
+                        client
+                            .user_remove_password(username.clone())
+                            .await
+                            .map_err(rpc::error)?;
+                        Ok(format!("{username}'s password removed"))
+                    }
                 }
             }
             .await;
@@ -849,11 +870,14 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
             }
             on_done.call(Some(match done {
                 Ok(text) => (true, text),
+                Err(e) if ask == Ask::RemovePassword => {
+                    (false, password_remove_error(&e, Some(&username)))
+                }
                 Err(e) => (false, user_change_error(&e, &username)),
             }));
         });
     });
-    let danger = ask == Ask::Disable;
+    let danger = matches!(ask, Ask::Disable | Ask::RemovePassword);
     rsx! {
         div { class: "scrim",
             section { class: "dialog w-[440px]", role: "dialog",
@@ -861,6 +885,7 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
                     match ask {
                         Ask::Disable => rsx! { icons::CircleX { size: 22 } },
                         Ask::ClearPin => rsx! { icons::Lock { size: 22 } },
+                        Ask::RemovePassword => rsx! { icons::KeyRound { size: 22 } },
                         Ask::Role(_) => rsx! { icons::UserCog { size: 22 } },
                     }
                     h1 { "{title}" }

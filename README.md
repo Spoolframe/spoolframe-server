@@ -20,6 +20,26 @@ wizard there. Every step is a tab of Server › Settings afterwards. The state d
 changed at run time (`config show` lists every setting and where it comes
 from; `config set` and `config unset` change one on the running server).
 
+### Container
+
+`nix build .#docker` makes a script that streams an OCI image of the server,
+with ffmpeg and tesseract, tagged `ghcr.io/spoolframe/spoolframe-server`:
+
+```bash
+nix build .#docker && ./result | docker load
+docker run -d --name spoolframe \
+  -v spoolframe:/var/lib/spoolframe -v /srv/media:/srv/media:ro \
+  -p 7420:7420/udp -p 7421:7421 \
+  ghcr.io/spoolframe/spoolframe-server:0.5.0
+docker logs spoolframe   # the web UI's address and the setup code
+```
+
+It runs as uid 1000 with its state in `/var/lib/spoolframe`, and reads
+`/etc/spoolframe/server.ucl` (UDP 7420, admin on 7421); mount your own
+config there to replace it. Media tools run confined as on any host: Docker
+29's default seccomp profile allows Landlock. With `--network host`, mDNS
+and Plex discovery reach the LAN too.
+
 ### Web UI
 
 `crates/spoolframe-web` is a Dioxus app, bundled to wasm and embedded in the

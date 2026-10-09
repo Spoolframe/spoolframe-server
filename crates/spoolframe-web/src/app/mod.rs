@@ -20,6 +20,7 @@ mod remote;
 mod restart;
 mod rpc;
 mod settings;
+mod sso;
 mod telemetry;
 mod webauthn;
 mod wizard;
@@ -992,14 +993,15 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
             busy.set(false);
         });
     };
-    let only_passkey = made() && !password_added;
     rsx! {
         section { class: "glass-card glass-card-setup",
             SetupHeading { name }
             NameFields { display, username, disabled: made() }
             div { class: "flex flex-col gap-0.5",
                 h2 { class: "m-0 text-base font-bold", "Ways to sign in" }
-                span { class: "text-[13px] text-ctp-subtext0", "One is enough to finish. Two is safer." }
+                span { class: "text-[13px] text-ctp-subtext0",
+                    "A password is required: passkeys can all be lost, and the server is never left to them alone. A passkey is optional."
+                }
             }
             div { class: "flex flex-col gap-2",
                 div { class: "method",
@@ -1017,7 +1019,7 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
                 div { class: "method",
                     span { class: "method-icon", icons::Lock {} }
                     span { class: "method-what",
-                        b { "Password" span { class: "chip", "Optional" } }
+                        b { "Password" span { class: "chip", "Required" } }
                         "Works from any browser, including ones without passkeys"
                     }
                     if password_added {
@@ -1039,17 +1041,7 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
                     }
                 }
             }
-            if only_passkey {
-                div { class: "alert alert-warning", role: "note",
-                    icons::Warning {}
-                    span { class: "flex flex-col gap-1",
-                        b { class: "text-sm", "The passkey is your only way in" }
-                        span { class: "text-ctp-text",
-                            "If this device is lost or its passkeys are reset, nobody can sign in as admin, and getting back in needs shell access to the server. Add a password as well. You can also do it later in My profile, where a sign-in provider the server has can be linked too."
-                        }
-                    }
-                }
-            } else if made() {
+            if made() && password_added {
                 div { class: "alert alert-success", role: "note",
                     icons::ShieldCheck {}
                     span { "Two ways to sign in. Losing one device won't lock you out." }
@@ -1061,10 +1053,12 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
             div { class: "flex justify-end",
                 button {
                     class: "btn-dialog btn-dialog-primary",
-                    disabled: busy() || !(made() || waiting().is_some()),
+                    // At least one admin keeps a password: setupFinish
+                    // refuses without one.
+                    disabled: busy() || !password_added,
                     onclick: finish,
                     icons::ArrowRight {}
-                    if only_passkey { "Continue with passkey only" } else { "Continue" }
+                    "Continue"
                 }
             }
         }

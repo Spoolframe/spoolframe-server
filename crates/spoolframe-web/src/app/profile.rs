@@ -16,7 +16,10 @@ use spoolframe_admin_api::{
 
 use super::admin::{Said, Toast, say};
 use super::{Alert, Field, Notice, ShownName, http, icons, now, rpc, webauthn};
-use crate::logic::{ApiError, ago, avatar_class, client_kind, date, page_serves, passkey_title};
+use crate::logic::{
+    ApiError, ago, avatar_class, can_remove_password, client_kind, date, page_serves,
+    passkey_title, password_remove_error,
+};
 use crate::preferences::{
     self, PICTURE_SUBTITLES, SDH, SUBTITLE_MODES, audio_choices, avoids_extras, index_of,
     override_line, picture_row, subtitle_choices,
@@ -261,6 +264,9 @@ enum Sensitive {
     /// Link an account at the sign-in provider called this (P3-04).
     Link(String),
     Unlink(SsoLink),
+    /// Remove the password: a passkey or a linked provider signs the user
+    /// in from then on.
+    RemovePassword,
 }
 
 async fn passkeys() -> Result<Vec<PasskeyEntry>, ApiError> {
@@ -313,6 +319,7 @@ fn provider_name(link: &SsoLink) -> String {
 /// link whose provider is gone.
 #[component]
 fn Passkeys(has_password: Signal<bool>, said: Option<(String, Option<String>)>) -> Element {
+    let mut has_password = has_password;
     let mut list = use_resource(passkeys);
     let host = use_resource(host);
     let mut links = use_resource(sso_links);
@@ -344,6 +351,8 @@ fn Passkeys(has_password: Signal<bool>, said: Option<(String, Option<String>)>) 
     // passkey is open.
     let mut adding = use_signal(|| None::<Value>);
     let mut confirming = use_signal(|| None::<Sensitive>);
+    // "Remove it?" asked of the password, until answered.
+    let mut removing_password = use_signal(|| false);
     // Try `change`; if the session is too old for it, ask the user to
     // confirm it is them and try again.
     let attempt = use_callback(move |change: Sensitive| {
@@ -375,6 +384,13 @@ fn Passkeys(has_password: Signal<bool>, said: Option<(String, Option<String>)>) 
                         notice.set(Some(format!("{} unlinked.", provider_name(link))));
                         links.restart();
                     }
+                    Sensitive::RemovePassword => {
+                        client.password_remove().await.map_err(rpc::error)?;
+                        has_password.set(false);
+                        notice.set(Some(
+                            "Password removed. Your other sessions have ended.".into(),
+                        ));
+                    }
                 }
                 Ok::<(), ApiError>(())
             };
@@ -388,7 +404,10 @@ fn Passkeys(has_password: Signal<bool>, said: Option<(String, Option<String>)>) 
                 }
                 Err(e) => {
                     confirming.set(None);
-                    error.set(Some(e.explain()));
+                    error.set(Some(match change {
+                        Sensitive::RemovePassword => password_remove_error(&e, None),
+                        _ => e.explain(),
+                    }));
                 }
             }
         });
@@ -407,11 +426,33 @@ fn Passkeys(has_password: Signal<bool>, said: Option<(String, Option<String>)>) 
                 div { class: "row",
                     span { class: "row-what", span { icons::KeyRound {} b { "Password" } } }
                     span { class: "row-do",
-                        if has_password() {
+                        if removing_password() {
+                            span { class: "text-[13px]", "Remove it?" }
+                            button {
+                                class: "btn btn-danger",
+                                onclick: move |_| {
+                                    removing_password.set(false);
+                                    notice.set(None);
+                                    attempt.call(Sensitive::RemovePassword);
+                                },
+                                "Remove"
+                            }
+                            button { class: "btn", onclick: move |_| removing_password.set(false), "Keep" }
+                        } else if has_password() {
                             span { class: "text-xs text-ctp-green", "Set" }
+                            // Only beside another way in: the server never
+                            // takes the last one.
+                            if can_remove_password(has_password(), has_passkeys, has_links) {
+                                button { class: "btn btn-danger", onclick: move |_| removing_password.set(true), icons::Trash {} "Remove password" }
+                            }
                         } else {
                             span { class: "text-xs text-ctp-subtext0", "Not set" }
                         }
+                    }
+                }
+                if removing_password() {
+                    span { class: "hint",
+                        "You'll sign in with your passkey or sign-in provider from then on. Your other sessions end, and your trusted devices are forgotten."
                     }
                 }
                 if !has_password() {

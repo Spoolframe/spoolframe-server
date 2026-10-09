@@ -3,7 +3,9 @@
 
 use serde::Deserialize;
 use serde_json::Value;
-use spoolframe_admin_api::{PasskeyEntry, Platform, Role, UserInfo, error_code};
+use spoolframe_admin_api::{
+    PasskeyEntry, Platform, Role, SettingEntry, SettingLayer, UserInfo, error_code,
+};
 
 /// Where a browser opening the web UI belongs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +133,33 @@ pub fn add_user_error(e: &ApiError, username: &str) -> AddUserError {
         return AddUserError::Username("Use 1–64 letters, digits, “.”, “_” or “-”.".into());
     }
     AddUserError::Form(user_change_error(e, username))
+}
+
+/// Whether My profile offers "Remove password": there is one, and a
+/// passkey or a linked sign-in provider signs the user in without it.
+pub fn can_remove_password(has_password: bool, passkeys: bool, links: bool) -> bool {
+    has_password && (passkeys || links)
+}
+
+/// A refusal of removing a password: the user's own (`whose` `None`), or
+/// `whose`'s, by an admin.
+pub fn password_remove_error(e: &ApiError, whose: Option<&str>) -> String {
+    match (e.code, whose) {
+        (error_code::LAST_ADMIN, None) => {
+            "You're the last admin with a password. Give another admin a password first.".into()
+        }
+        (error_code::LAST_ADMIN, Some(username)) => format!(
+            "{username} is the last admin with a password. Give another admin a password first."
+        ),
+        (error_code::LAST_SIGN_IN_METHOD, None) => {
+            "Your password is your only way to sign in. Add a passkey or link a sign-in provider first."
+                .into()
+        }
+        (error_code::LAST_SIGN_IN_METHOD, Some(username)) => format!(
+            "The password is {username}'s only way to sign in. They need a passkey or a linked sign-in provider first."
+        ),
+        _ => e.explain(),
+    }
 }
 
 /// What went wrong in the browser's own passkey prompt, from the name of
@@ -504,6 +533,45 @@ pub fn entries(typed: &str) -> Vec<String> {
         .collect()
 }
 
+/// `list` with `typed` added at its end, trimmed (PX-22's list fields);
+/// `Err` says why not: nothing typed, or listed already.
+pub fn add_entry(list: &[String], typed: &str) -> Result<Vec<String>, String> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return Err("Type something to add.".into());
+    }
+    if list.iter().any(|e| e == typed) {
+        return Err(format!("{typed} is listed already."));
+    }
+    let mut out = list.to_vec();
+    out.push(typed.to_owned());
+    Ok(out)
+}
+
+/// A list setting's value at Save, as `save` takes it: `None` takes the
+/// runtime value out. An emptied list is `None` when that leaves nothing
+/// under it, or an empty list, but an empty list when the file or the
+/// defaults would bring entries back.
+pub fn list_setting(items: Vec<Value>, current: Option<&SettingEntry>) -> Option<Value> {
+    if !items.is_empty() {
+        return Some(Value::Array(items));
+    }
+    let under = match current {
+        None => return None,
+        Some(e) if e.layer == Some(SettingLayer::Runtime) => e.overrides.as_ref(),
+        Some(e) => e.value.as_ref(),
+    };
+    match under {
+        Some(Value::Array(under)) if !under.is_empty() => Some(Value::Array(Vec::new())),
+        _ => None,
+    }
+}
+
+/// A list setting's strings, for [`list_setting`].
+pub fn string_values(items: &[String]) -> Vec<Value> {
+    items.iter().cloned().map(Value::String).collect()
+}
+
 /// A Plex URL as the Server page shows it: its host and port.
 pub fn host_port(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
@@ -692,6 +760,78 @@ mod tests {
             ["127.0.0.1", "10.0.0.0/8", "fd00::/8"]
         );
         assert!(entries(" , ").is_empty());
+    }
+
+    #[test]
+    fn an_entry_is_added_trimmed_at_the_end() {
+        let list = vec!["eth0".to_owned()];
+        assert_eq!(add_entry(&list, "  enp* ").unwrap(), ["eth0", "enp*"]);
+    }
+
+    #[test]
+    fn an_entry_listed_already_is_refused() {
+        let list = vec!["eth0".to_owned()];
+        assert_eq!(
+            add_entry(&list, "eth0").unwrap_err(),
+            "eth0 is listed already."
+        );
+    }
+
+    #[test]
+    fn nothing_typed_is_not_an_entry() {
+        assert!(add_entry(&[], "  ").is_err());
+    }
+
+    fn list_entry(
+        layer: Option<SettingLayer>,
+        value: Option<Value>,
+        overrides: Option<Value>,
+    ) -> SettingEntry {
+        SettingEntry {
+            key: "network.relays".into(),
+            set: value.is_some(),
+            value,
+            secret: false,
+            layer,
+            locked: false,
+            overrides,
+            apply: spoolframe_admin_api::SettingApply::Restart,
+            restart_pending: false,
+            running: None,
+        }
+    }
+
+    #[test]
+    fn a_list_with_entries_is_saved_as_a_json_array() {
+        assert_eq!(
+            list_setting(string_values(&["default".into()]), None),
+            Some(json!(["default"]))
+        );
+    }
+
+    #[test]
+    fn an_emptied_runtime_list_is_taken_out_when_nothing_is_under_it() {
+        let e = list_entry(Some(SettingLayer::Runtime), Some(json!(["a"])), None);
+        assert_eq!(list_setting(Vec::new(), Some(&e)), None);
+    }
+
+    #[test]
+    fn an_emptied_list_stays_empty_over_the_files_entries() {
+        let e = list_entry(
+            Some(SettingLayer::Runtime),
+            Some(json!(["a"])),
+            Some(json!(["default"])),
+        );
+        assert_eq!(list_setting(Vec::new(), Some(&e)), Some(json!([])));
+        let file = list_entry(Some(SettingLayer::File), Some(json!(["default"])), None);
+        assert_eq!(list_setting(Vec::new(), Some(&file)), Some(json!([])));
+    }
+
+    #[test]
+    fn an_empty_list_over_an_empty_default_is_left_alone() {
+        let e = list_entry(Some(SettingLayer::Default), Some(json!([])), None);
+        assert_eq!(list_setting(Vec::new(), Some(&e)), None);
+        assert_eq!(list_setting(Vec::new(), None), None);
     }
 
     #[test]
@@ -1056,6 +1196,49 @@ mod tests {
             message: message.into(),
             data: None,
         }
+    }
+
+    #[test]
+    fn a_password_is_offered_for_removal_only_beside_another_way_in() {
+        assert!(can_remove_password(true, true, false));
+        assert!(can_remove_password(true, false, true));
+        assert!(!can_remove_password(true, false, false));
+        assert!(!can_remove_password(false, true, true));
+    }
+
+    #[test]
+    fn removing_the_last_admin_password_says_whose_it_is() {
+        let last = refusal(
+            error_code::LAST_ADMIN,
+            "\"andrey\" is the last enabled admin with a password; give another admin a password first",
+        );
+        assert_eq!(
+            password_remove_error(&last, None),
+            "You're the last admin with a password. Give another admin a password first."
+        );
+        assert_eq!(
+            password_remove_error(&last, Some("andrey")),
+            "andrey is the last admin with a password. Give another admin a password first."
+        );
+    }
+
+    #[test]
+    fn removing_the_last_way_in_says_what_to_add() {
+        let only = refusal(
+            error_code::LAST_SIGN_IN_METHOD,
+            "\"sam\" has no other way to sign in: add a passkey or link a sign-in provider first",
+        );
+        assert_eq!(
+            password_remove_error(&only, None),
+            "Your password is your only way to sign in. Add a passkey or link a sign-in provider first."
+        );
+        assert_eq!(
+            password_remove_error(&only, Some("sam")),
+            "The password is sam's only way to sign in. They need a passkey or a linked sign-in provider first."
+        );
+        // Anything else as the server says it.
+        let gone = refusal(error_code::NO_SUCH_USER, "no user \"sam\"");
+        assert_eq!(password_remove_error(&gone, Some("sam")), "no user \"sam\"");
     }
 
     #[test]

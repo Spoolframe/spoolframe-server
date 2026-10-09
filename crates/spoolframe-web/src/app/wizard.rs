@@ -238,7 +238,8 @@ pub(super) fn Footer(
 
 /// Under a field: that the locked config file sets it, that it overrides
 /// the file's value (with a way back to it), or that it applies after a
-/// restart, and once changed, a way to restart.
+/// restart, and once changed, what the server runs with now and after the
+/// restart, with a way to restart.
 #[component]
 pub(super) fn Note(
     settings: Settings,
@@ -246,8 +247,9 @@ pub(super) fn Note(
     on_changed: EventHandler<()>,
 ) -> Element {
     let key = setting;
-    // A sensitive setting (`admin.*`, `auth.*`, `media.*`, `telemetry.*`,
-    // `plex.token`, `plex.token_file`, `plex.url`, `plex.servers`), from
+    // A sensitive setting (`admin.*`, `auth.*`, `media.*`, `network.*`,
+    // `telemetry.*`, `plex.token`, `plex.token_file`, `plex.url`,
+    // `plex.servers`), from
     // an old session: "Confirm it's you" first, then the same change
     // again.
     let confirming = use_signal(|| None::<String>);
@@ -287,14 +289,18 @@ pub(super) fn Note(
                 button { onclick: move |_| use_file.call(()), "Use the file's value" }
             }
         }
-        if e.apply == SettingApply::Restart && !e.locked {
-            span { class: "note note-restart", icons::RotateCcw { size: 13 } "Applies after a restart" }
-        }
-        if e.restart_pending {
-            div { class: "restart-box",
-                span { "Saved. The server still runs with the value it started with until it restarts." }
+        if let Some((now, after)) = crate::restart::now_and_after(&e) {
+            // Both, so an address or a port changed here is not taken for
+            // the one the server answers at (PX-22).
+            div { class: "restart-box flex-wrap",
+                span { class: "flex min-w-0 flex-col gap-0.5",
+                    span { "Now: " b { class: "mono-value break-all", "{now}" } }
+                    span { "After restart: " b { class: "mono-value break-all", "{after}" } }
+                }
                 super::restart::RestartButton { label: "Restart now", class: "btn btn-teal" }
             }
+        } else if e.apply == SettingApply::Restart && !e.locked {
+            span { class: "note note-restart", icons::RotateCcw { size: 13 } "Applies after a restart" }
         }
         ConfirmItsYou { asking: confirming, on_confirmed: move |_| use_file.call(()) }
     }
@@ -355,21 +361,50 @@ fn ServerFields(
     on_done: EventHandler<()>,
     on_reload: EventHandler<()>,
 ) -> Element {
+    let ports = mode == Mode::Settings
+        && crate::advanced::shown(super::settings::show_advanced(), "network.port");
     let name = use_signal(|| text(&settings, "name"));
+    let port = use_signal(|| text(&settings, "network.port"));
+    let discovery_port = use_signal(|| text(&settings, "network.plex_discovery_port"));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let s = settings.clone();
-    let on_save = move |_| {
+    // The ports are `network.*` (PX-22): from an old session, "Confirm
+    // it's you" first, then the save again.
+    let confirming = use_signal(|| None::<String>);
+    let on_save = use_callback(move |()| {
         let s = s.clone();
+        let mut changes = vec![("name", typed(&name()))];
+        // The wizard's step is the name only; hidden, the ports are left
+        // as they are.
+        if ports {
+            let typed_ports = (|| -> Result<_, String> {
+                Ok([
+                    ("network.port", number("App port", &port())?),
+                    (
+                        "network.plex_discovery_port",
+                        number("Plex discovery port", &discovery_port())?,
+                    ),
+                ])
+            })();
+            match typed_ports {
+                Ok(typed_ports) => changes.extend(typed_ports),
+                Err(why) => {
+                    error.set(Some(why));
+                    return;
+                }
+            }
+        }
         busy.set(true);
         spawn(async move {
-            match save(&s, vec![("name", typed(&name()))]).await {
+            match save(&s, changes).await {
                 Ok(()) => on_done.call(()),
+                Err(e) if asks_to_confirm(&e, confirming, "changing the server's ports") => {}
                 Err(e) => error.set(Some(e.explain())),
             }
             busy.set(false);
         });
-    };
+    });
     let fingerprint = status.as_ref().and_then(|s| s.fingerprint.clone());
     let key = status.as_ref().and_then(|s| s.endpoint_id.clone());
     rsx! {
@@ -404,10 +439,28 @@ fn ServerFields(
                 }
             }
         }
+        if ports {
+            div { class: "flex flex-col gap-2",
+                h2 { "Ports" }
+                div { class: "limits",
+                    div { class: "flex flex-col gap-1.5",
+                        Field { label: "App port", value: port, kind: "number", placeholder: "Picked at each start", disabled: locked(&settings, "network.port") }
+                        span { class: "text-xs text-ctp-subtext0", "The UDP port the apps connect to. Empty: a free one is picked at each start. Fix it when a firewall or a port forward needs to know." }
+                        Note { settings: settings.clone(), setting: "network.port", on_changed: move |_| on_reload.call(()) }
+                    }
+                    div { class: "flex flex-col gap-1.5",
+                        Field { label: "Plex discovery port", value: discovery_port, kind: "number", placeholder: "32415", disabled: locked(&settings, "network.plex_discovery_port") }
+                        span { class: "text-xs text-ctp-subtext0", "Default 32415. The UDP port the search for Plex servers on your network is sent from, and Plex answers to. Open it in the host's firewall. 0 is any free port, whose answers a firewall drops." }
+                        Note { settings: settings.clone(), setting: "network.plex_discovery_port", on_changed: move |_| on_reload.call(()) }
+                    }
+                }
+            }
+        }
         if let Some(text) = error() {
             Alert { text }
         }
         Footer { mode, step: "server", busy: busy(), on_save, on_discard: move |_| on_reload.call(()) }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
     }
 }
 
@@ -1514,6 +1567,28 @@ fn PlaybackFields(
     });
     let ahead = use_signal(|| text(&settings, "transcode.read_ahead_secs"));
     let workers = use_signal(|| text(&settings, "previews.workers"));
+    // PX-22: when previews are made in Settings, and with the advanced
+    // settings shown, how often and how much, the artwork cache and when
+    // an item counts as started or watched. The wizard's step stays as
+    // its board draws it.
+    let settings_tab = mode == Mode::Settings;
+    let advanced = settings_tab
+        && crate::advanced::shown(super::settings::show_advanced(), "previews.cache_mb");
+    let mut when = use_signal(|| match text(&settings, "previews.when").as_str() {
+        "" => "ahead".to_owned(),
+        other => other.to_owned(),
+    });
+    let interval = use_signal(|| text(&settings, "previews.interval_secs"));
+    let in_gib = |key: &str| {
+        text(&settings, key)
+            .parse::<i64>()
+            .map(setup::gib)
+            .unwrap_or_default()
+    };
+    let previews_cache = use_signal(|| in_gib("previews.cache_mb"));
+    let artwork_cache = use_signal(|| in_gib("artwork.cache_mb"));
+    let started = use_signal(|| text(&settings, "watch.started_after_secs"));
+    let watched = use_signal(|| text(&settings, "watch.watched_percent"));
     let mut ocr = use_signal(|| flag(&settings, "subtitles.ocr"));
     let mut gpu_filters = use_signal(|| flag(&settings, "transcode.gpu_filters"));
     let mut error = use_signal(|| None::<String>);
@@ -1532,7 +1607,7 @@ fn PlaybackFields(
                 Hardware::Ordered(_) => Hardware::Ordered(order()),
                 other => other,
             };
-            Ok(vec![
+            let mut changes = vec![
                 ("transcode.hardware", Some(chosen.setting())),
                 ("transcode.max_jobs", number("Encode budget", &jobs())?),
                 ("transcode.scratch_limit_mb", scratch),
@@ -1543,7 +1618,44 @@ fn PlaybackFields(
                 ),
                 ("subtitles.ocr", Some(json!(ocr()))),
                 ("transcode.gpu_filters", Some(json!(gpu_filters()))),
-            ])
+            ];
+            if settings_tab {
+                changes.push(("previews.when", Some(json!(when()))));
+            }
+            // Hidden, they are left as they are.
+            if advanced {
+                let gib = |label: &str, typed: String| match typed.trim() {
+                    "" => Ok(None),
+                    typed => setup::mib(typed)
+                        .map(|mib| Some(json!(mib)))
+                        .ok_or(format!("{label} is a number of GiB.")),
+                };
+                let watched = number("Watched at", &watched())?;
+                if watched
+                    .as_ref()
+                    .and_then(Value::as_u64)
+                    .is_some_and(|p| !(1..=100).contains(&p))
+                {
+                    return Err("Watched at is a percentage, 1 to 100.".into());
+                }
+                changes.extend([
+                    (
+                        "previews.interval_secs",
+                        number("Picture every", &interval())?,
+                    ),
+                    (
+                        "previews.cache_mb",
+                        gib("Previews cache", previews_cache())?,
+                    ),
+                    ("artwork.cache_mb", gib("Artwork cache", artwork_cache())?),
+                    (
+                        "watch.started_after_secs",
+                        number("Started after", &started())?,
+                    ),
+                    ("watch.watched_percent", watched),
+                ]);
+            }
+            Ok(changes)
         })();
         let changes = match changes {
             Ok(changes) => changes,
@@ -1699,11 +1811,76 @@ fn PlaybackFields(
         }
         div { class: "flex flex-col gap-2",
             h2 { "Frame previews" }
+            if settings_tab {
+                div { class: "flex flex-col gap-1.5",
+                    div { class: "seg", role: "radiogroup", aria_label: "When previews are made",
+                        for (value, label) in [("ahead", "Ahead"), ("on_play", "When played"), ("never", "Never")] {
+                            button {
+                                key: "{value}",
+                                class: if when() == value { "seg-item seg-item-on" } else { "seg-item" },
+                                role: "radio",
+                                aria_checked: "{when() == value}",
+                                disabled: locked(&settings, "previews.when"),
+                                onclick: move |_| when.set(value.to_owned()),
+                                "{label}"
+                            }
+                        }
+                    }
+                    span { class: "text-xs text-ctp-subtext0",
+                        {match when().as_str() {
+                            "on_play" => "Only for what is played, as it is played.",
+                            "never" => "None: apps show the time alone when scrubbing.",
+                            _ => "Default. For every file, newest and in progress first, until the cache is full, and at once for anything played.",
+                        }}
+                        " A preview Plex made already is read from Plex instead."
+                    }
+                    Note { settings: settings.clone(), setting: "previews.when", on_changed: move |_| on_reload.call(()) }
+                }
+            }
             div { class: "limits",
                 div { class: "flex flex-col gap-1.5",
                     Limit { label: "Made at once", value: workers, unit: "", disabled: locked(&settings, "previews.workers") }
                     span { class: "text-xs text-ctp-subtext0", "{workers_default} · files made ahead together, only while nothing is converted" }
                     Note { settings: settings.clone(), setting: "previews.workers", on_changed: move |_| on_reload.call(()) }
+                }
+                if advanced {
+                    div { class: "flex flex-col gap-1.5",
+                        Limit { label: "Picture every", value: interval, unit: "s", disabled: locked(&settings, "previews.interval_secs") }
+                        span { class: "text-xs text-ctp-subtext0", "Default 10 s · the time between two pictures" }
+                        Note { settings: settings.clone(), setting: "previews.interval_secs", on_changed: move |_| on_reload.call(()) }
+                    }
+                    div { class: "flex flex-col gap-1.5",
+                        Limit { label: "Cache", value: previews_cache, unit: "GiB", disabled: locked(&settings, "previews.cache_mb") }
+                        span { class: "text-xs text-ctp-subtext0", "Default 4 GiB · the least recently used go first; a two-hour film's take a few MiB" }
+                        Note { settings: settings.clone(), setting: "previews.cache_mb", on_changed: move |_| on_reload.call(()) }
+                    }
+                }
+            }
+        }
+        if advanced {
+            div { class: "flex flex-col gap-2",
+                h2 { "Artwork" }
+                div { class: "limits",
+                    div { class: "flex flex-col gap-1.5",
+                        Limit { label: "Cache", value: artwork_cache, unit: "GiB", disabled: locked(&settings, "artwork.cache_mb") }
+                        span { class: "text-xs text-ctp-subtext0", "Default 1 GiB · posters and backdrops kept for the apps" }
+                        Note { settings: settings.clone(), setting: "artwork.cache_mb", on_changed: move |_| on_reload.call(()) }
+                    }
+                }
+            }
+            div { class: "flex flex-col gap-2",
+                h2 { "Watch progress" }
+                div { class: "limits",
+                    div { class: "flex flex-col gap-1.5",
+                        Limit { label: "Started after", value: started, unit: "s", disabled: locked(&settings, "watch.started_after_secs") }
+                        span { class: "text-xs text-ctp-subtext0", "Default 60 s · played this long, an item counts as started" }
+                        Note { settings: settings.clone(), setting: "watch.started_after_secs", on_changed: move |_| on_reload.call(()) }
+                    }
+                    div { class: "flex flex-col gap-1.5",
+                        Limit { label: "Watched at", value: watched, unit: "%", disabled: locked(&settings, "watch.watched_percent") }
+                        span { class: "text-xs text-ctp-subtext0", "Default 95 % · played this far, it counts as watched, unless it has credits markers" }
+                        Note { settings: settings.clone(), setting: "watch.watched_percent", on_changed: move |_| on_reload.call(()) }
+                    }
                 }
             }
         }
@@ -1757,6 +1934,70 @@ fn Limit(label: String, value: Signal<String>, unit: String, disabled: bool) -> 
                 }
                 if !unit.is_empty() {
                     span { "{unit}" }
+                }
+            }
+        }
+    }
+}
+
+/// A list setting edited one entry a row (PX-22), as Remote access's
+/// static addresses are: each with Remove, and a field to add one. `add`
+/// labels that field. The server checks the entries at Save.
+#[component]
+pub(super) fn ListField(
+    add: String,
+    items: Signal<Vec<String>>,
+    #[props(default)] placeholder: String,
+    disabled: bool,
+) -> Element {
+    let mut items = items;
+    let typed = use_signal(String::new);
+    let mut refusal = use_signal(|| None::<String>);
+    let mut add_typed = move || {
+        let mut typed = typed;
+        let added = crate::logic::add_entry(&items.peek(), &typed.peek());
+        match added {
+            Ok(list) => {
+                items.set(list);
+                typed.set(String::new());
+                refusal.set(None);
+            }
+            Err(why) => refusal.set(Some(why)),
+        }
+    };
+    rsx! {
+        div { class: "wan-statics",
+            for (i, item) in items().into_iter().enumerate() {
+                div { key: "{item}", class: "wan-static",
+                    span { class: "mono-value min-w-0 break-all", "{item}" }
+                    button {
+                        class: "icon-button",
+                        r#type: "button",
+                        aria_label: "Remove {item}",
+                        disabled,
+                        onclick: move |_| {
+                            items.write().remove(i);
+                        },
+                        icons::Trash {}
+                    }
+                }
+            }
+            if !disabled {
+                // Enter adds, as the button does, rather than saving.
+                form {
+                    class: "wan-add",
+                    onsubmit: move |e: FormEvent| {
+                        e.prevent_default();
+                        add_typed();
+                    },
+                    Field { label: "{add}", value: typed, placeholder, error: refusal() }
+                    button {
+                        class: "btn-dialog btn-dialog-grey mt-[22px]",
+                        r#type: "submit",
+                        disabled: typed().trim().is_empty(),
+                        icons::Plus {}
+                        "Add"
+                    }
                 }
             }
         }
@@ -1913,11 +2154,9 @@ fn AccessFields(
             Note { settings: settings.clone(), setting: "admin.trusted_proxies", on_changed: move |_| on_reload.call(()) }
         }
         div { class: "flex flex-col gap-1.5",
-            div { class: "flex items-baseline justify-between gap-3",
-                h2 { "Listen address" }
-                span { class: "note note-restart", icons::RotateCcw { size: 13 } "Applies after a restart" }
-            }
+            h2 { "Listen address" }
             span { class: "mono-value", "{listen}" }
+            Note { settings: settings.clone(), setting: "admin.listen", on_changed: move |_| on_reload.call(()) }
             if !answers.is_empty() {
                 span { class: "text-xs text-ctp-subtext0", {format!("The web UI answers at {}", answers.join(" · "))} }
             }
@@ -2042,6 +2281,138 @@ pub fn SecurityForm() -> Element {
             Alert { text }
         }
         ConfirmItsYou { asking: confirming, on_confirmed: move |_| toggle.call(on) }
+    }
+}
+
+/// Settings' Security tab, with the advanced settings shown: the tools the
+/// server runs on media, and whether they run confined (PX-22). Each is
+/// `media.*`, behind a recent sign-in, and applies after a restart.
+#[component]
+pub fn MediaToolsForm(on_done: EventHandler<()>) -> Element {
+    let mut generation = use_signal(|| 0u32);
+    let settings = use_resource(move || async move {
+        let _ = generation();
+        load_settings().await
+    });
+    let current = settings.read().clone();
+    if let Some(wait) = loading(&current) {
+        return wait;
+    }
+    let Some(Ok(loaded)) = current else {
+        return rsx! {};
+    };
+    rsx! {
+        for g in [generation()] {
+            MediaToolsFields {
+                key: "{g}",
+                settings: loaded.clone(),
+                on_done,
+                on_reload: move |_| generation += 1,
+            }
+        }
+    }
+}
+
+/// The sandbox's choices: the setting's value, its name, what it does.
+const SANDBOX: [(&str, &str, &str); 3] = [
+    (
+        "required",
+        "Required",
+        "Each run is confined with Landlock and a seccomp filter: no network, no state directory, only its own files. A kernel without Landlock (before Linux 6.2) stops the server from starting.",
+    ),
+    (
+        "auto",
+        "Automatic",
+        "Default. Confined as Required where the kernel has Landlock; elsewhere with the seccomp filter alone, and an error in the log.",
+    ),
+    (
+        "off",
+        "Off",
+        "Not confined. Not recommended: the tools read files anyone who can add to a library made.",
+    ),
+];
+
+#[component]
+fn MediaToolsFields(
+    settings: Settings,
+    on_done: EventHandler<()>,
+    on_reload: EventHandler<()>,
+) -> Element {
+    let mut sandbox = use_signal(|| match text(&settings, "media.sandbox").as_str() {
+        "" => "auto".to_owned(),
+        other => other.to_owned(),
+    });
+    let ffmpeg = use_signal(|| text(&settings, "media.ffmpeg"));
+    let ffprobe = use_signal(|| text(&settings, "media.ffprobe"));
+    let tesseract = use_signal(|| text(&settings, "media.tesseract"));
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let s = settings.clone();
+    // `media.*`: from an old session, "Confirm it's you" first, then the
+    // save again.
+    let confirming = use_signal(|| None::<String>);
+    let on_save = use_callback(move |()| {
+        let s = s.clone();
+        let changes = vec![
+            ("media.sandbox", Some(json!(sandbox()))),
+            ("media.ffmpeg", typed(&ffmpeg())),
+            ("media.ffprobe", typed(&ffprobe())),
+            ("media.tesseract", typed(&tesseract())),
+        ];
+        busy.set(true);
+        spawn(async move {
+            match save(&s, changes).await {
+                Ok(()) => on_done.call(()),
+                Err(e) if asks_to_confirm(&e, confirming, "changing the media tools") => {}
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+        });
+    });
+    let sandbox_locked = locked(&settings, "media.sandbox");
+    let choice = |here: bool| if here { "choice choice-here" } else { "choice" };
+    rsx! {
+        div { class: "flex flex-col gap-1.5",
+            h2 { "Media tools" }
+            span { class: "text-sm text-ctp-subtext0", "ffmpeg, ffprobe and tesseract read and convert the media files. Every change here applies after a restart." }
+        }
+        div { class: "flex flex-col gap-2", role: "radiogroup", aria_label: "Sandbox",
+            b { class: "text-sm", "Sandbox" }
+            for (value, name, about) in SANDBOX {
+                button {
+                    key: "{value}",
+                    class: choice(sandbox() == value),
+                    r#type: "button",
+                    role: "radio",
+                    aria_checked: "{sandbox() == value}",
+                    disabled: sandbox_locked,
+                    onclick: move |_| sandbox.set(value.to_owned()),
+                    span { class: "radio" }
+                    span { class: "choice-what", b { "{name}" } "{about}" }
+                }
+            }
+            span { class: "text-xs text-ctp-subtext0", "Either way, the tools' environment is cleared, and their memory, CPU time and file sizes are limited." }
+            Note { settings: settings.clone(), setting: "media.sandbox", on_changed: move |_| on_reload.call(()) }
+        }
+        div { class: "alert alert-warning", role: "note",
+            icons::Warning {}
+            span {
+                b { "The server runs the program named here on every play" }
+                "Name a program only if you trust it. In the Docker image, leave these as they are: the image brings its own."
+            }
+        }
+        for (label, value, key) in [("ffmpeg", ffmpeg, "media.ffmpeg"), ("ffprobe", ffprobe, "media.ffprobe"), ("tesseract", tesseract, "media.tesseract")] {
+            div { key: "{key}", class: "flex flex-col gap-1.5",
+                Field { label: "{label}", value, placeholder: "{label}", autocomplete: "off", disabled: locked(&settings, key) }
+                Note { settings: settings.clone(), setting: key, on_changed: move |_| on_reload.call(()) }
+            }
+        }
+        span { class: "text-xs text-ctp-subtext0", "A name is looked up on the server's PATH; a path is used as it is. Empty: the default, the name alone." }
+        if let Some(text) = error() {
+            Alert { text }
+        }
+        Footer { mode: Mode::Settings, step: "security", busy: busy(), on_save, on_discard: move |_| on_reload.call(()) }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
     }
 }
 

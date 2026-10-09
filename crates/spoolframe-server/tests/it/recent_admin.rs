@@ -66,6 +66,10 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
             "userRemovePasskey",
             outcome(root.user_remove_passkey(bob(), "cred".into()).await),
         ),
+        (
+            "userRemovePassword",
+            outcome(root.user_remove_password(bob()).await),
+        ),
         ("userClearPin", outcome(root.user_clear_pin(bob()).await)),
         (
             "userSetDeviceTrust",

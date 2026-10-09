@@ -209,6 +209,93 @@ fn collect<'t>(table: &'t Table, prefix: &str, out: &mut Vec<(String, &'t Value)
     }
 }
 
+/// What a string names to be read from the environment: `${SF_ENV_…}`
+/// (PX-22). Only this prefix is read, so a value cannot reach `HOME` or
+/// the server's own variables.
+pub const ENV_PREFIX: &str = "SF_ENV_";
+
+/// `table` with every `${SF_ENV_NAME}` in its strings replaced by that
+/// variable, as `env` has it. Anything else, `${HOME}` included, stays as
+/// written. The dotted key and the variable of the first one `env` does
+/// not have, if any.
+pub fn expand_env(
+    table: &Table,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Table, (String, String)> {
+    let mut out = Table::new();
+    for (k, v) in table {
+        out.insert(k.clone(), expand_value(v, k, env)?);
+    }
+    Ok(out)
+}
+
+fn expand_value(
+    value: &Value,
+    path: &str,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Value, (String, String)> {
+    Ok(match value {
+        Value::String(s) => {
+            Value::String(expand_str(s, env).map_err(|var| (path.to_owned(), var))?)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| expand_value(v, path, env))
+                .collect::<Result<_, _>>()?,
+        ),
+        Value::Object(table) => {
+            let mut out = Table::new();
+            for (k, v) in table {
+                out.insert(k.clone(), expand_value(v, &join(path, k), env)?);
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    })
+}
+
+/// `s` with its `${SF_ENV_…}` references replaced, or the first variable
+/// `env` does not have.
+fn expand_str(s: &str, env: &impl Fn(&str) -> Option<String>) -> Result<String, String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let name = after
+            .find('}')
+            .map(|end| &after[..end])
+            .filter(|name| is_env_name(name));
+        match name {
+            Some(name) => {
+                out.push_str(&env(name).ok_or_else(|| name.to_owned())?);
+                rest = &after[name.len() + 1..];
+            }
+            None => {
+                out.push_str("${");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// `SF_ENV_` and at least one letter, digit or `_` after it.
+fn is_env_name(name: &str) -> bool {
+    name.strip_prefix(ENV_PREFIX).is_some_and(|rest| {
+        !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Whether `s` is one reference and nothing else: `${SF_ENV_NAME}`.
+pub fn is_env_reference(s: &str) -> bool {
+    s.strip_prefix("${")
+        .and_then(|s| s.strip_suffix('}'))
+        .is_some_and(is_env_name)
+}
+
 /// The value at dotted `key`, if `table` has one.
 pub fn get<'t>(table: &'t Table, key: &str) -> Option<&'t Value> {
     let (first, rest) = match key.split_once('.') {
@@ -335,6 +422,65 @@ mod tests {
         assert_eq!(to_document(&table), "plex {\n  url = \"http://a\";\n}\n");
         assert!(remove(&mut table, "plex.url"));
         assert!(table.is_empty());
+    }
+
+    fn env(name: &str) -> Option<String> {
+        match name {
+            "SF_ENV_SECRET" => Some("s3cret".into()),
+            "SF_ENV_HOST" => Some("nas".into()),
+            "HOME" => Some("/root".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn sf_env_references_expand_anywhere_in_a_string() {
+        let table = parse(
+            r#"
+            plex { url = "http://${SF_ENV_HOST}:32400"; }
+            auth { oidc [ { name = "Pocket"; client_secret = "${SF_ENV_SECRET}"; } ] }
+            "#,
+        )
+        .unwrap();
+        let expanded = expand_env(&table, &env).unwrap();
+        assert_eq!(
+            get(&expanded, "plex.url"),
+            Some(&Value::String("http://nas:32400".into()))
+        );
+        let Some(Value::Array(oidc)) = get(&expanded, "auth.oidc") else {
+            panic!("no auth.oidc");
+        };
+        let Value::Object(p) = &oidc[0] else { panic!() };
+        assert_eq!(
+            p.get("client_secret"),
+            Some(&Value::String("s3cret".into()))
+        );
+    }
+
+    #[test]
+    fn only_the_sf_env_prefix_is_read() {
+        let table = parse(r#"name = "${HOME} ${SF_ENV_} $SF_ENV_HOST ${SF_ENV_HOST";"#).unwrap();
+        assert_eq!(expand_env(&table, &env).unwrap(), table);
+    }
+
+    #[test]
+    fn an_unset_sf_env_variable_is_an_error_naming_it_and_its_key() {
+        let table = parse(r#"telemetry { otlp { headers { key = "${SF_ENV_NOPE}"; } } }"#).unwrap();
+        assert_eq!(
+            expand_env(&table, &env),
+            Err((
+                "telemetry.otlp.headers.key".to_owned(),
+                "SF_ENV_NOPE".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_reference_is_one_variable_and_nothing_else() {
+        assert!(is_env_reference("${SF_ENV_OIDC_SECRET}"));
+        assert!(!is_env_reference("x${SF_ENV_OIDC_SECRET}"));
+        assert!(!is_env_reference("${HOME}"));
+        assert!(!is_env_reference("hunter2"));
     }
 
     #[test]
