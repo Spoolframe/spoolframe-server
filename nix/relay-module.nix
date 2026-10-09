@@ -164,6 +164,20 @@ in {
       example = "0.0.0.0:7842";
       description = "QUIC address discovery, if wanted (not under `proxy`).";
     };
+
+    # The relay faces the Internet: bound it as the server is (finding 34).
+    resources = {
+      memoryMax = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = "1G";
+        description = "systemd's MemoryMax: past it the kernel kills in the service. Null leaves it unset.";
+      };
+      tasksMax = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.positive;
+        default = 512;
+        description = "systemd's TasksMax: the relay's threads. Null leaves it unset.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -181,6 +195,14 @@ in {
         message = "services.spoolframe-relay: quic needs the relay's own TLS, not tls.mode = \"proxy\".";
       }
     ];
+
+    # P6-07: shapes that work but are likely not meant; the relay warns
+    # of the same at start.
+    warnings =
+      lib.optional (cfg.tls.mode == "proxy" && !(lib.hasPrefix "127." cfg.http || lib.hasPrefix "[::1]" cfg.http))
+      "services.spoolframe-relay: tls.mode = \"proxy\" serves the relay in plain HTTP on http = ${cfg.http}, not loopback: it is reachable around the proxy meant to hold its TLS. Set http to 127.0.0.1:<port> unless the proxy is on another host."
+      ++ lib.optional (cfg.access.everyone == "allow")
+      "services.spoolframe-relay: access.everyone = \"allow\" lets anyone relay through it, on your bandwidth, without asking the main server.";
 
     systemd.services.spoolframe-relay = {
       description = "Spoolframe relay";
@@ -226,6 +248,8 @@ in {
         SystemCallArchitectures = "native";
         SystemCallFilter = ["@system-service" "~@privileged @resources"];
         SystemCallErrorNumber = "EPERM";
+        MemoryMax = lib.mkIf (cfg.resources.memoryMax != null) cfg.resources.memoryMax;
+        TasksMax = lib.mkIf (cfg.resources.tasksMax != null) cfg.resources.tasksMax;
       };
     };
   };

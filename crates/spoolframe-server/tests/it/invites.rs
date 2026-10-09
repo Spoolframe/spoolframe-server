@@ -643,6 +643,52 @@ async fn a_refused_redemption_is_logged_without_its_secrets() {
     invites.server.stop().await;
 }
 
+/// P6-07, glm E-8: a working code with a taken username or a password
+/// too short is a refusal too, and leaves a line; the code and the
+/// password do not reach it.
+#[tokio::test]
+async fn a_redemption_refused_for_its_username_or_password_is_logged() {
+    if !alone("invites::a_redemption_refused_for_its_username_or_password_is_logged") {
+        return;
+    }
+    let invites = Invites::start("invite-logged-taken").await;
+    let created = invites.create(create_user()).await;
+    let device = invites.stranger().await;
+    let (capture, _guard) = LogCapture::start();
+    assert_eq!(
+        device.call(None, redeem(&created.code, "Root")).await,
+        Response::Err(Error::UsernameTaken)
+    );
+    let short = Request::RedeemInvite(RedeemInvite {
+        code: created.code.clone(),
+        username: "mum".into(),
+        display_name: None,
+        password: "short".into(),
+    });
+    assert!(matches!(
+        device.call(None, short).await,
+        Response::Err(Error::InvalidInput { .. })
+    ));
+    let lines = capture.refused();
+    let reasons: Vec<_> = lines.iter().map(|l| l.field("reason")).collect();
+    assert_eq!(
+        reasons,
+        [
+            Some("username taken"),
+            Some("username or password not acceptable")
+        ],
+        "{lines:#?}"
+    );
+    for line in &lines {
+        assert_eq!(line.field("kind"), Some("sign_in_failed"), "{line:#?}");
+        assert_eq!(line.field("request"), Some("redeem_invite"), "{line:#?}");
+    }
+    let text = capture.text();
+    assert!(!text.contains(&created.code), "the code was logged: {text}");
+    assert!(!text.contains("short"), "the password was logged: {text}");
+    invites.server.stop().await;
+}
+
 // The SDK (P6-01): a device that has nothing but the link. Its server
 // tells loopback besides its LAN addresses, so the link reaches it on a
 // machine with no network.

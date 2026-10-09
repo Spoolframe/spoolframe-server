@@ -132,11 +132,21 @@ pub struct Origin {
 }
 
 /// `upper` over `lower`, key by key: objects are merged, anything else is
-/// replaced whole.
+/// replaced whole. So is an object that is one setting (`network.wan`, the
+/// OTLP headers): its keys are its value, not settings of their own.
 fn merge(lower: &mut Table, upper: &Table) {
+    merge_at(lower, upper, "");
+}
+
+fn merge_at(lower: &mut Table, upper: &Table, prefix: &str) {
     for (key, value) in upper {
+        let path = tree::join(prefix, key);
         match (lower.get_mut(key), value) {
-            (Some(Value::Object(below)), Value::Object(above)) => merge(below, above),
+            (Some(Value::Object(below)), Value::Object(above))
+                if settings::setting(&path).is_none() =>
+            {
+                merge_at(below, above, &path)
+            }
             _ => {
                 lower.insert(key.clone(), value.clone());
             }
@@ -144,9 +154,30 @@ fn merge(lower: &mut Table, upper: &Table) {
     }
 }
 
+/// `network.wan.host_ipv6`, gone: iroh tells devices the host's IPv6
+/// addresses itself, so it added nothing, and turning it off did not stop
+/// IPv6 either.
+const HOST_IPV6: &str = "network.wan.host_ipv6";
+
+fn host_ipv6_is_gone() -> ConfigError {
+    ConfigError::Invalid {
+        key: HOST_IPV6,
+        message: "is gone: iroh advertises the host's IPv6 addresses itself; network.ipv6 = \
+                  false turns IPv6 off"
+            .into(),
+    }
+}
+
 /// A layer's document as a table: `schema` checked and taken out, and the
-/// keys only the provided file may have refused anywhere else.
-fn layer(text: &str, path: &Path) -> Result<(Table, Option<bool>), ConfigError> {
+/// keys only the provided file may have refused anywhere else. A gone key
+/// in the provided file (`written_by_hand`) is refused; in the runtime
+/// layer, which the server wrote itself, it is dropped with a warning, so
+/// a server whose web UI saved it still starts.
+fn layer(
+    text: &str,
+    path: &Path,
+    written_by_hand: bool,
+) -> Result<(Table, Option<bool>), ConfigError> {
     let in_file = |source: ConfigError| ConfigError::File {
         path: path.to_owned(),
         source: Box::new(source),
@@ -163,6 +194,17 @@ fn layer(text: &str, path: &Path) -> Result<(Table, Option<bool>), ConfigError> 
             key: "admin.allow_remote",
             message: "is gone: the admin listener takes any address now (P3-10); remove it".into(),
         }));
+    }
+    if tree::get(&table, HOST_IPV6).is_some() {
+        if written_by_hand {
+            return Err(in_file(host_ipv6_is_gone()));
+        }
+        tree::remove(&mut table, HOST_IPV6);
+        tracing::warn!(
+            path = %path.display(),
+            "{}; dropped from the runtime layer",
+            host_ipv6_is_gone()
+        );
     }
     match table.remove("schema") {
         None => {}
@@ -233,14 +275,14 @@ impl Layers {
         let (file, locked) = match file {
             None => (None, false),
             Some((path, text)) => {
-                let (table, locked) = layer(text, path)?;
+                let (table, locked) = layer(text, path, true)?;
                 (Some((path.to_owned(), table)), locked.unwrap_or(false))
             }
         };
         let runtime = match runtime {
             None => Table::new(),
             Some(text) => {
-                let (table, locked) = layer(text, &runtime_path)?;
+                let (table, locked) = layer(text, &runtime_path, false)?;
                 if locked.is_some() {
                     return Err(ConfigError::File {
                         path: runtime_path,
@@ -790,6 +832,34 @@ mod tests {
     }
 
     #[test]
+    fn a_setting_that_is_a_table_is_replaced_whole() {
+        // network.wan is one setting: the runtime's table is the whole of
+        // it, not added to the file's, so a static address the web UI took
+        // out stays out.
+        let layers = layers(
+            Some(
+                r#"network { port = 7420; wan { static = ["203.0.113.7:7420"];
+                   mapped_port { port = 7420; } } }"#,
+            ),
+            Some(r#"network { wan { static = ["198.51.100.7:7420"]; } }"#),
+        )
+        .unwrap();
+        let config = layers.config().unwrap();
+        let wan = config.network.wan.unwrap();
+        assert_eq!(wan.statics, Some(vec!["198.51.100.7:7420".to_owned()]));
+        assert!(wan.mapped_port.is_none());
+        // The table's neighbours still merge key by key.
+        assert_eq!(config.network.port, Some(7420));
+        assert_eq!(
+            tree::leaves(&layers.runtime)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>(),
+            ["network.wan"]
+        );
+    }
+
+    #[test]
     fn a_locked_file_wins_over_the_runtime_layer_and_refuses_changes_to_what_it_sets() {
         let layers = layers(
             Some(r#"locked = true; name = "Nimble"; plex { url = "http://nas:32400"; }"#),
@@ -893,6 +963,28 @@ mod tests {
             "/etc/spoolframe.ucl: invalid config: admin.allow_remote: is gone: the admin \
              listener takes any address now (P3-10); remove it"
         );
+    }
+
+    #[test]
+    fn host_ipv6_in_the_file_is_refused_saying_it_is_gone() {
+        let err = layers(Some("network { wan { host_ipv6 = true; } }"), None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "/etc/spoolframe.ucl: invalid config: network.wan.host_ipv6: is gone: iroh \
+             advertises the host's IPv6 addresses itself; network.ipv6 = false turns IPv6 off"
+        );
+    }
+
+    #[test]
+    fn host_ipv6_the_web_ui_saved_is_dropped_from_the_runtime_layer() {
+        let layers = layers(
+            None,
+            Some(r#"network { wan { static = ["203.0.113.7:7420"]; host_ipv6 = false; } }"#),
+        )
+        .unwrap();
+        assert_eq!(tree::get(&layers.runtime, "network.wan.host_ipv6"), None);
+        let wan = layers.config().unwrap().network.wan.unwrap();
+        assert_eq!(wan.statics, Some(vec!["203.0.113.7:7420".to_owned()]));
     }
 
     #[test]

@@ -8,6 +8,7 @@
 {
   pkgs,
   spoolframeModule,
+  relayModule,
 }: let
   inherit (pkgs) lib;
   # The module evaluated with `settings` set.
@@ -49,6 +50,27 @@
   # The UCL the module writes for the server.
   rendered = settings: (evaluatedWith settings).config.environment.etc."spoolframe/server.ucl".source.text;
   publicUrl = "https://media.example.org";
+  # The relay module evaluated with `settings` set (P6-04, P6-07).
+  relayWith = settings:
+    (import (pkgs.path + "/nixos/lib/eval-config.nix") {
+      inherit (pkgs.stdenv.hostPlatform) system;
+      modules = [
+        relayModule
+        {
+          nixpkgs.pkgs = pkgs;
+          system.stateVersion = lib.trivial.release;
+          services.spoolframe-relay =
+            {
+              enable = true;
+              package = pkgs.emptyDirectory;
+              server.key = "0000000000000000000000000000000000000000000000000000000000000000";
+            }
+            // settings;
+        }
+      ];
+    }).config;
+  # Whether the relay module warns, naming `what`, with `settings`.
+  relayWarned = what: settings: lib.any (w: lib.hasPrefix "services.spoolframe-relay" w && lib.hasInfix what w) (relayWith settings).warnings;
 in
   assert check "an unnamed proxy in front of a loopback listener is refused" (refused {inherit publicUrl;});
   assert check "an unnamed proxy in front of [::1] is refused" (refused {
@@ -134,6 +156,8 @@ in
     wan = {};
     openFirewall = true;
   });
+  assert check "IPv6 is left at the server's default unless turned off" (!lib.hasInfix "ipv6 =" (rendered {}));
+  assert check "IPv6 turned off is written as false" (lib.hasInfix "ipv6 = false;" (rendered {ipv6 = false;}));
   assert check "without wan the config has no wan table" (!lib.hasInfix "wan {" (rendered {}));
   assert check "wan's defaults are written out" (lib.hasInfix ''mode = "auto";'' (rendered {wan = {};}) && lib.hasInfix ''lookup_via = "wtfismyip";'' (rendered {wan = {};}));
   assert check "a static-only wan turns the mapped port off" (lib.hasInfix "mapped_port = false;" (rendered {
@@ -160,4 +184,22 @@ in
   # is one quoted argument.
   assert check "the state directory is one argument" (lib.hasInfix ''--state-dir "/var/lib/spool frame"'' (execStart "/var/lib/spool frame"));
   assert check "the defaults are not warned of" (!warned {});
+  # The comma-separated settings are lists in the config the module writes.
+  assert check "relays are written as a list" (lib.hasInfix ''relays = ["https://relay.example.org","default"];'' (rendered {relays = ["https://relay.example.org" "default"];}));
+  assert check "trusted proxies are written as a list" (lib.hasInfix ''trusted_proxies = ["127.0.0.1"];'' (rendered {
+    admin = {
+      listen = "127.0.0.1:7421";
+      inherit publicUrl;
+      trustedProxies = ["127.0.0.1"];
+    };
+  }));
+  assert check "relays of your own that no device is told about are warned of" (lib.any (lib.hasInfix "services.spoolframe.ownRelays") (evaluatedWith {ownRelays = ["0000000000000000000000000000000000000000000000000000000000000001"];}).config.warnings);
+  # P6-07: the relay's shapes that work but are likely not meant.
+  assert check "a proxied relay on every interface is warned of" (relayWarned "tls.mode" {});
+  assert check "a proxied relay on loopback is not warned of" (!relayWarned "tls.mode" {http = "127.0.0.1:3340";});
+  assert check "a relay open to everyone is warned of" (relayWarned "access.everyone" {
+    http = "127.0.0.1:3340";
+    access.everyone = "allow";
+  });
+  assert check "the relay's memory is bounded" ((relayWith {}).systemd.services.spoolframe-relay.serviceConfig.MemoryMax == "1G");
     pkgs.runCommand "spoolframe-module-assertions" {} "touch $out"

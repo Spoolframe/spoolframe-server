@@ -890,7 +890,7 @@ async fn one_address_cannot_begin_every_sso_flow() {
         "sso-begin-source",
         &idp.issuer,
         None,
-        "127.0.0.1".parse().unwrap(),
+        TrustedProxies::new(&["127.0.0.1"]).unwrap(),
     )
     .await;
     let addr = server.addr;

@@ -7,11 +7,6 @@
 }: let
   cfg = config.services.spoolframe;
 
-  # "auto", "none", or families in order.
-  hardware =
-    if builtins.isList cfg.transcode.hardware
-    then lib.concatStringsSep "," cfg.transcode.hardware
-    else cfg.transcode.hardware;
   uses = family: cfg.transcode.hardware == "auto" || (builtins.isList cfg.transcode.hardware && builtins.elem family cfg.transcode.hardware);
   vaapi = uses "vaapi" || uses "qsv";
   nvenc = uses "nvenc";
@@ -56,7 +51,6 @@
         }
       ''
     }
-      host_ipv6 = ${lib.boolToString cfg.wan.hostIpv6};
     }
   '';
 
@@ -106,21 +100,23 @@
     network {
       port = ${toString cfg.port};
       mdns = ${lib.boolToString cfg.mdns};
+      ${lib.optionalString (!cfg.ipv6) "ipv6 = false;"}
       ${lib.optionalString cfg.plexDiscovery.enable "plex_discovery_port = ${toString cfg.plexDiscovery.port};"}
-      ${lib.optionalString (cfg.relays != []) "relays = ${quote (lib.concatStringsSep ", " cfg.relays)};"}
+      ${lib.optionalString (cfg.relays != []) "relays = ${quote cfg.relays};"}
       ${lib.optionalString (cfg.pkarr != "off") "pkarr = ${quote cfg.pkarr};"}
-      ${lib.optionalString (cfg.ownRelays != []) "own_relays = ${quote (lib.concatStringsSep ", " cfg.ownRelays)};"}
+      ${lib.optionalString (cfg.ownRelays != []) "own_relays = ${quote cfg.ownRelays};"}
       ${lib.optionalString (cfg.wan != null) wanConfig}
     }
     admin {
       ${lib.optionalString (cfg.admin.listen != null) "listen = ${quote cfg.admin.listen};"}
       ${lib.optionalString (!cfg.admin.allowInsecureCookies) "insecure_cookies = false;"}
       ${lib.optionalString (cfg.admin.publicUrl != null) "public_url = ${quote cfg.admin.publicUrl};"}
-      ${lib.optionalString (cfg.admin.trustedProxies != []) "trusted_proxies = ${quote (lib.concatStringsSep ", " cfg.admin.trustedProxies)};"}
+      ${lib.optionalString (cfg.admin.trustedProxies != []) "trusted_proxies = ${quote cfg.admin.trustedProxies};"}
       ${lib.optionalString cfg.admin.notProxied "not_proxied = true;"}
     }
     transcode {
-      hardware = ${quote hardware};
+      # "auto", "none", or a list of families in order.
+      hardware = ${quote cfg.transcode.hardware};
       vaapi_device = ${quote cfg.transcode.vaapiDevice};
       scratch_dir = "/var/cache/spoolframe/transcode";
     }
@@ -231,7 +227,17 @@ in {
     port = lib.mkOption {
       type = lib.types.port;
       default = 7420;
-      description = "The UDP port clients connect to (QUIC, IPv4 and IPv6).";
+      description = "The UDP port clients connect to (QUIC, IPv4 and, unless {option}`ipv6` is off, IPv6).";
+    };
+
+    ipv6 = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Listen on IPv6 too (`network.ipv6`). Off, the server listens on
+        IPv4 only, so no device reaches it over IPv6, directly or by hole
+        punching.
+      '';
     };
 
     mdns = lib.mkOption {
@@ -372,11 +378,6 @@ in {
                 };
               };
             });
-          };
-          hostIpv6 = lib.mkOption {
-            type = lib.types.bool;
-            default = false;
-            description = "Advertise this host's stable global IPv6 addresses on {option}`port`; never a temporary one.";
           };
         };
       });
@@ -666,8 +667,13 @@ in {
     ];
 
     warnings =
+      # P6-07: relays of your own that no device is told about.
+      lib.optional (cfg.ownRelays != [] && cfg.relays == []) ''
+        services.spoolframe.ownRelays names relays of your own, but services.spoolframe.relays is
+        empty: the server answers them, yet tells no device about a relay. Add each relay's URL
+        to relays.''
       # P6-02: the public addresses reach the server only through its port.
-      lib.optional (cfg.wan != null && !cfg.openFirewall) ''
+      ++ lib.optional (cfg.wan != null && !cfg.openFirewall) ''
         services.spoolframe.wan is set but openFirewall is off: devices off the LAN reach the server at
         UDP ${toString cfg.port}, so open it on the interface the router forwards to
         (networking.firewall.interfaces.<name>.allowedUDPPorts).''

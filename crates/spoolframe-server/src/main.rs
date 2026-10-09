@@ -446,6 +446,9 @@ async fn relay(command: RelayCommand, config: Option<PathBuf>, state_dir: &Path)
         .with_context(|| format!("cannot read {}", path.display()))?;
     let settings = own_relay::RelayConfig::parse(&text)
         .with_context(|| format!("{} is not a relay config", path.display()))?;
+    for warning in settings.warnings() {
+        tracing::warn!("{warning}");
+    }
     let server = own_relay::spawn(&settings, key.clone(), state_dir).await?;
     tracing::info!(
         key = %key.public(),
@@ -885,6 +888,13 @@ async fn run(
     }
     // Finding 58: on every interface, a proxy on this host is as likely
     // as browsers coming straight in, so this is said, not refused.
+    if config.network.own_relays_untold()? {
+        tracing::warn!(
+            "network.own_relays names relays of your own, but network.relays is empty: the \
+             server answers them, yet tells no device about a relay, so only devices that \
+             know a relay's URL another way use it. Add each relay's URL to network.relays"
+        );
+    }
     if config.admin.proxy_maybe_unnamed()? {
         tracing::warn!(
             listen = %admin_listen,

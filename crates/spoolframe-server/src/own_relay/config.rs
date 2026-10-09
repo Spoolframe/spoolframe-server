@@ -154,6 +154,30 @@ impl RelayConfig {
     pub const DEFAULT_HTTP: &'static str = "0.0.0.0:80";
     pub const DEFAULT_HTTPS: &'static str = "0.0.0.0:443";
 
+    /// Shapes that load but are likely not what the operator meant, for
+    /// the log at start (P6-07): in `check_proxy`'s tradition, warned of
+    /// rather than refused, as each can be meant.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.serve == Serve::Proxy && !self.http.ip().is_loopback() {
+            out.push(format!(
+                "tls.mode is \"proxy\", but http listens on {}, not loopback: the relay is \
+                 reachable in plain HTTP around the proxy that is meant to hold its TLS. \
+                 Listen on 127.0.0.1 unless the proxy is on another host",
+                self.http
+            ));
+        }
+        if self.access.everyone {
+            out.push(
+                "access.everyone is \"allow\": anyone may relay through this relay, using its \
+                 bandwidth, and the main server is not asked. For your own devices only, \
+                 \"allow\" the owner and \"deny\" everyone"
+                    .into(),
+            );
+        }
+        out
+    }
+
     pub fn parse(input: &str) -> Result<Self, RelayConfigError> {
         let ucl = |e: uclicious::UclError| RelayConfigError::Ucl(e.to_string());
         let mut builder = RelayFile::builder().map_err(ucl)?;
@@ -413,5 +437,20 @@ mod tests {
             }
         );
         assert!(config(r#"tls { mode = "proxy"; } access { everyone = "1 Mbit/s"; }"#).is_err());
+    }
+
+    /// P6-07 (ds4 P6-2 and P6-3, glm E-5): a plain-HTTP relay off loopback
+    /// behind a proxy, and a relay open to everyone, load but are warned of.
+    #[test]
+    fn a_proxied_relay_off_loopback_or_one_open_to_everyone_is_warned_of() {
+        let warned = |rest: &str| config(rest).unwrap().warnings();
+        assert_eq!(warned(r#"tls { mode = "proxy"; }"#).len(), 1);
+        assert!(warned(r#"tls { mode = "proxy"; }"#)[0].contains("0.0.0.0:80"));
+        assert!(warned(r#"http = "127.0.0.1:3340"; tls { mode = "proxy"; }"#).is_empty());
+        let open = warned(
+            r#"http = "127.0.0.1:3340"; tls { mode = "proxy"; } access { everyone = "allow"; }"#,
+        );
+        assert_eq!(open.len(), 1);
+        assert!(open[0].contains("access.everyone"));
     }
 }

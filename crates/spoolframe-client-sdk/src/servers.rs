@@ -34,6 +34,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use spoolframe_protocol::invite::{MAX_HINTS, is_relay_url};
 
 use crate::storage::{Storage, StorageError, keys};
 
@@ -123,6 +124,16 @@ pub(crate) struct SavedServer {
 }
 
 impl SavedServer {
+    /// The relays and lookup the server told (P6-03, P6-05), held to what
+    /// an invite link may carry (P6-07, glm E-3): each a plain http(s) URL,
+    /// once, at most [`MAX_HINTS`] relays. The rest is left out: a pinned
+    /// server is trusted for its key, not to size what this device keeps.
+    pub fn told_relays(&mut self, relays: Vec<String>, lookup: Option<String>) {
+        let urls: Vec<String> = relays.into_iter().filter(|r| is_relay_url(r)).collect();
+        self.relays = crate::client::newest_first(&urls, &[], MAX_HINTS);
+        self.lookup = lookup.filter(|url| is_relay_url(url));
+    }
+
     /// A key pinned now, from a connection to it just made at `addrs`.
     pub fn pinned_now(
         name: String,
@@ -753,6 +764,28 @@ mod tests {
         server.told([addr("172.17.0.1:4433")], 2_000);
         assert!(server.told([], 3_000));
         assert_eq!(server.addrs(), [addr("192.168.1.10:4433")]);
+    }
+
+    /// P6-07, glm E-3: what a server pushes is held to an invite's limits.
+    #[test]
+    fn told_relays_are_urls_once_and_at_most_the_hint_limit() {
+        let mut server = server();
+        let mut pushed: Vec<String> = (0..100)
+            .map(|n| format!("https://relay{n}.example.net/"))
+            .collect();
+        pushed.insert(0, "javascript:alert(1)".into());
+        pushed.insert(1, "https://relay0.example.net/".into());
+        pushed.insert(2, "https://bad host/".into());
+        server.told_relays(pushed, Some("file:///etc/passwd".into()));
+        assert_eq!(server.relays.len(), MAX_HINTS);
+        assert_eq!(server.relays[0], "https://relay0.example.net/");
+        assert_eq!(server.relays[1], "https://relay1.example.net/");
+        assert_eq!(server.lookup, None);
+        server.told_relays(vec![], Some("https://dns.iroh.link/pkarr".into()));
+        assert_eq!(
+            server.lookup.as_deref(),
+            Some("https://dns.iroh.link/pkarr")
+        );
     }
 
     #[tokio::test]

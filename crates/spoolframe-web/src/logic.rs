@@ -493,6 +493,17 @@ pub fn thousands(n: u64) -> String {
     out
 }
 
+/// A list typed in one field, its entries split at commas and spaces:
+/// "127.0.0.1, 10.0.0.0/8" for a list setting such as
+/// `admin.trusted_proxies`.
+pub fn entries(typed: &str) -> Vec<String> {
+    typed
+        .split([',', ' ', '\t', '\n'])
+        .filter(|e| !e.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// A Plex URL as the Server page shows it: its host and port.
 pub fn host_port(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
@@ -673,6 +684,15 @@ pub fn address_parts(address: &str) -> (&str, &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_typed_list_splits_at_commas_and_spaces() {
+        assert_eq!(
+            entries(" 127.0.0.1,10.0.0.0/8  fd00::/8 ,"),
+            ["127.0.0.1", "10.0.0.0/8", "fd00::/8"]
+        );
+        assert!(entries(" , ").is_empty());
+    }
 
     #[test]
     fn an_ipv4_address_does_not_wrap() {

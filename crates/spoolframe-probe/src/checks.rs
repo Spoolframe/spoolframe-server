@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use iroh::endpoint::{Connection, ConnectionError, ReadError, VarInt};
 use spoolframe_protocol::streams::{bi, reset};
 use spoolframe_protocol::{
-    BitmapSubtitles, Error, LoginPassword, PROTOCOL_VERSION, Reply, Request, Response, ServerInfo,
-    close,
+    BitmapSubtitles, Error, LoginPassword, PROTOCOL_VERSION, RedeemInvite, Reply, Request,
+    Response, ServerInfo, close,
 };
 use spoolframe_types::{MediaId, MediaKind, Namespace};
 use tokio::io::AsyncWriteExt;
@@ -136,6 +136,7 @@ pub enum Check {
     FrameSize,
     FirstFrame,
     SignInLimits,
+    InviteLimits,
     ConsumerAdminRefused,
     SessionBound,
     Visibility,
@@ -148,7 +149,7 @@ pub enum Check {
 }
 
 impl Check {
-    pub const ALL: [Check; 16] = [
+    pub const ALL: [Check; 17] = [
         Check::HelloVersion,
         Check::Unauthenticated,
         Check::UniStream,
@@ -156,6 +157,7 @@ impl Check {
         Check::FrameSize,
         Check::FirstFrame,
         Check::SignInLimits,
+        Check::InviteLimits,
         // As the account (`--username`), one QUIC sign-in for all of them.
         Check::ConsumerAdminRefused,
         Check::SessionBound,
@@ -184,6 +186,7 @@ impl Check {
             Check::FrameSize => "frame-size",
             Check::FirstFrame => "first-frame",
             Check::SignInLimits => "sign-in-limits",
+            Check::InviteLimits => "invite-limits",
             Check::ConsumerAdminRefused => "consumer-admin-refused",
             Check::SessionBound => "session-bound",
             Check::Visibility => "visibility",
@@ -209,6 +212,7 @@ impl Check {
             }
             Check::FirstFrame => "a stream that sends nothing after its kind byte is reset",
             Check::SignInLimits => "wrong passwords for a made-up user reach RateLimited",
+            Check::InviteLimits => "wrong invite codes reach RateLimited",
             Check::ConsumerAdminRefused => "a consumer is refused the admin reads, FORBIDDEN",
             Check::SessionBound => "the session from another endpoint key is Unauthenticated",
             Check::Visibility => {
@@ -247,6 +251,10 @@ impl Check {
             Check::SignInLimits if config.check_limits => sign_in_limits(probe, config).await,
             Check::SignInLimits => Ok(Outcome::skip(
                 "not asked for: pass --check-limits (failed logins for a made-up username)",
+            )),
+            Check::InviteLimits if config.check_limits => invite_limits(probe, config).await,
+            Check::InviteLimits => Ok(Outcome::skip(
+                "not asked for: pass --check-limits (wrong invite codes)",
             )),
             Check::StrangerCap if config.check_cap => stranger_cap(probe, config).await,
             Check::StrangerCap => Ok(Outcome::skip(
@@ -481,41 +489,70 @@ async fn first_frame(probe: &Probe, config: &Config) -> Result<Outcome, Problem>
 /// check's logins from the run's key would then be `RateLimited` too
 /// (the third review's G-16).
 async fn sign_in_limits(probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
-    let key = bind()
-        .await
-        .map_err(|e| Problem::Failed(format!("cannot bind the check's key: {e}")))?;
-    let outcome = sign_in_limits_from(probe, config, &key).await;
-    key.close().await;
-    outcome
-}
-
-async fn sign_in_limits_from(
-    probe: &Probe,
-    config: &Config,
-    key: &iroh::Endpoint,
-) -> Result<Outcome, Problem> {
-    let mut f = Findings::default();
-    let (conn, _) = probe.connect_hello_from(key).await?;
-    let id = probe.id().to_string();
-    let username = format!("spoolframe-probe-{}", &id[..16]);
-    f.note(format!("username {username:?}, made up for this run"));
-    let failures = config.expect.failures;
-    for attempt in 1..=failures + 1 {
-        let request = Request::LoginPassword(LoginPassword {
+    let username = format!("spoolframe-probe-{}", &probe.id().to_string()[..16]);
+    let note = format!("username {username:?}, made up for this run");
+    until_limited(probe, config, note, Error::InvalidCredentials, |attempt| {
+        Request::LoginPassword(LoginPassword {
             username: username.clone(),
             password: format!("not-the-password-{attempt}"),
             remember: false,
-        });
-        let response = probe.request(&conn, None, request).await?;
-        let ok = if attempt <= failures {
-            response == Response::Err(Error::InvalidCredentials)
-        } else {
-            matches!(response, Response::Err(Error::RateLimited { .. }))
-        };
-        f.expect(ok, format!("attempt {attempt}: {}", describe(&response)));
+        })
+    })
+    .await
+}
+
+/// Wrong invite codes (P6-07), as [`sign_in_limits`]: `failures` are
+/// `InviteInvalid`, the next `RateLimited`. Each guess is counted before
+/// the code is looked at (A-13), so guessing a code is as slow as guessing
+/// a password. The codes are well formed and no server made them: nothing
+/// is redeemed.
+async fn invite_limits(probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
+    let note = "codes made up for this run".to_owned();
+    until_limited(probe, config, note, Error::InviteInvalid, |attempt| {
+        Request::RedeemInvite(RedeemInvite {
+            // Well formed, and one of 30^12 a server makes at random:
+            // never one it made.
+            code: format!("2222-2222-222{}", char::from(b'A' + (attempt % 26) as u8)),
+            username: "spoolframe-probe".into(),
+            display_name: None,
+            password: "not-a-password-it-keeps".into(),
+        })
+    })
+    .await
+}
+
+/// `config.expect.failures` requests made by `attempt`, from a key of the
+/// check's own, each refused `wrong`; then one more, `RateLimited`.
+async fn until_limited(
+    probe: &Probe,
+    config: &Config,
+    note: String,
+    wrong: Error,
+    attempt: impl Fn(u32) -> Request,
+) -> Result<Outcome, Problem> {
+    let key = bind()
+        .await
+        .map_err(|e| Problem::Failed(format!("cannot bind the check's key: {e}")))?;
+    let outcome = async {
+        let mut f = Findings::default();
+        let (conn, _) = probe.connect_hello_from(&key).await?;
+        f.note(note);
+        let failures = config.expect.failures;
+        for n in 1..=failures + 1 {
+            let response = probe.request(&conn, None, attempt(n)).await?;
+            let ok = if n <= failures {
+                response == Response::Err(wrong.clone())
+            } else {
+                matches!(response, Response::Err(Error::RateLimited { .. }))
+            };
+            f.expect(ok, format!("attempt {n}: {}", describe(&response)));
+        }
+        f.still_usable(probe, &conn, "the refused attempts").await?;
+        Ok(f.done())
     }
-    f.still_usable(probe, &conn, "the refused logins").await?;
-    Ok(f.done())
+    .await;
+    key.close().await;
+    outcome
 }
 
 /// Check 4: stranger connections, one at a time and each with a `Hello`,

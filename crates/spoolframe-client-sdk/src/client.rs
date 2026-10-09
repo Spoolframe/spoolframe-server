@@ -1634,12 +1634,11 @@ impl Client {
         relays: Vec<String>,
         lookup: Option<String>,
     ) -> Result<(), SdkError> {
-        if let Some(url) = &lookup {
-            self.look_up_at(url);
-        }
         self.sighted(id, |server, now| {
-            server.relays = relays;
-            server.lookup = lookup;
+            server.told_relays(relays, lookup);
+            if let Some(url) = &server.lookup {
+                self.look_up_at(url);
+            }
             server.told(addrs, now)
         })
         .await
@@ -1654,7 +1653,7 @@ impl Client {
             tracing::debug!(url, "not a pkarr relay's URL; not looked up at");
             return;
         };
-        if !self.inner.lookups.lock().insert(url.to_owned()) {
+        if !admit_lookup(&mut self.inner.lookups.lock(), url) {
             return;
         }
         let endpoint = &self.inner.endpoint;
@@ -1755,6 +1754,43 @@ async fn save_reached(
             Err(e) => tracing::warn!(server = %id, error = %e, "cannot save where it was reached"),
         }
     }
+}
+
+/// The most pkarr relays a client looks servers up at (P6-07, glm E-3).
+/// iroh cannot take a lookup service back once added, so each distinct URL
+/// a server or invite names would otherwise add one for the client's life.
+/// A household names one or two.
+pub(crate) const MAX_LOOKUPS: usize = 8;
+
+/// Whether `url` is a lookup to add: not added yet, and room for it.
+fn admit_lookup(lookups: &mut std::collections::HashSet<String>, url: &str) -> bool {
+    if lookups.contains(url) {
+        return false;
+    }
+    if lookups.len() >= MAX_LOOKUPS {
+        tracing::debug!(
+            url,
+            max = MAX_LOOKUPS,
+            "too many pkarr relays; not looked up at"
+        );
+        return false;
+    }
+    lookups.insert(url.to_owned())
+}
+
+/// `new` then `known`, each once, at most `max`: the newest hints win
+/// (P6-07, glm E-3), so pasting link after link cannot grow them.
+pub(crate) fn newest_first<T: PartialEq + Clone>(new: &[T], known: &[T], max: usize) -> Vec<T> {
+    let mut kept: Vec<T> = Vec::new();
+    for item in new.iter().chain(known) {
+        if kept.len() == max {
+            break;
+        }
+        if !kept.contains(item) {
+            kept.push(item.clone());
+        }
+    }
+    kept
 }
 
 /// The addresses of `groups`, in order, each once.
@@ -1858,6 +1894,30 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+
+    /// P6-07, glm E-3: hints from link after link do not pile up.
+    #[test]
+    fn newest_hints_win_and_are_held_to_the_limit() {
+        let known: Vec<u32> = (0..40).collect();
+        let kept = newest_first(&[100, 3, 101], &known, 32);
+        assert_eq!(kept.len(), 32);
+        assert_eq!(&kept[..4], &[100, 3, 101, 0]);
+        assert!(!kept.contains(&39));
+    }
+
+    /// P6-07, glm E-3: each pkarr relay is added once, and at most
+    /// MAX_LOOKUPS of them, however many servers or links name one.
+    #[test]
+    fn lookups_are_added_once_and_at_most_the_limit() {
+        let mut lookups = std::collections::HashSet::new();
+        assert!(admit_lookup(&mut lookups, "https://dns.iroh.link/pkarr"));
+        assert!(!admit_lookup(&mut lookups, "https://dns.iroh.link/pkarr"));
+        let admitted = (0..20)
+            .filter(|n| admit_lookup(&mut lookups, &format!("https://pkarr{n}.example.net/")))
+            .count();
+        assert_eq!(admitted, MAX_LOOKUPS - 1);
+        assert_eq!(lookups.len(), MAX_LOOKUPS);
+    }
     use crate::storage::MemoryStorage;
 
     fn device() -> Device {

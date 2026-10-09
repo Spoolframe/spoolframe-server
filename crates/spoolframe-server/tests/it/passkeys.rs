@@ -731,8 +731,12 @@ async fn an_assertion_without_a_user_handle_is_refused() {
 /// password, under where it comes from: the address the proxy names.
 #[tokio::test]
 async fn failed_passkey_sign_ins_count_in_the_login_limit() {
-    let (addr, _dir) =
-        server_at_behind("passkey-limit", ORIGIN, "127.0.0.1".parse().unwrap()).await;
+    let (addr, _dir) = server_at_behind(
+        "passkey-limit",
+        ORIGIN,
+        spoolframe_server::admin::TrustedProxies::new(&["127.0.0.1"]).unwrap(),
+    )
+    .await;
     let root = anonymous(addr)
         .await
         .setup(setup(CODE, "root", PASSWORD))
@@ -903,8 +907,12 @@ async fn a_passkey_confirms_its_own_user_and_no_one_else() {
 /// hold only a few, and the table stays open to everyone else.
 #[tokio::test]
 async fn one_address_cannot_begin_every_passkey_sign_in() {
-    let (addr, _dir) =
-        server_at_behind("passkey-begin-source", ORIGIN, "127.0.0.1".parse().unwrap()).await;
+    let (addr, _dir) = server_at_behind(
+        "passkey-begin-source",
+        ORIGIN,
+        spoolframe_server::admin::TrustedProxies::new(&["127.0.0.1"]).unwrap(),
+    )
+    .await;
     let begin_from = |caller: &'static str| async move {
         reqwest::Client::new()
             .post(format!("http://{addr}/auth/passkey/begin"))

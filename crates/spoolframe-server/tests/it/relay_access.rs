@@ -96,3 +96,59 @@ async fn a_relay_the_server_does_not_name_is_closed_on() {
     other.close().await;
     server.stop().await;
 }
+
+/// P6-07 (both reviews' first finding): a named relay holds at most
+/// `MAX_CONNECTIONS` connections on the ALPN, so a relay whose key is
+/// stolen cannot open enough to load the server's store. The ones it
+/// holds keep answering.
+#[tokio::test]
+async fn a_named_relay_past_its_connections_is_closed_on() {
+    use spoolframe_server::relay_access::MAX_CONNECTIONS;
+    let key = SecretKey::generate();
+    let server = server_for("relay-access-cap", &key).await;
+    let relay = relay_endpoint(key).await;
+    let me = server.server.id().to_string();
+    let mut held = Vec::new();
+    for _ in 0..MAX_CONNECTIONS {
+        let conn = relay
+            .connect(server.server.addr(), RELAY_ACCESS_ALPN)
+            .await
+            .unwrap();
+        assert_eq!(ask(&conn, me.clone()).await, Tier::Owner);
+        held.push(conn);
+    }
+    let over = relay
+        .connect(server.server.addr(), RELAY_ACCESS_ALPN)
+        .await
+        .unwrap();
+    let asked = async {
+        let (mut send, mut recv) = over.open_bi().await?;
+        write_frame(
+            &mut send,
+            &AccessQuery {
+                endpoint: me.clone(),
+            },
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        read_frame::<_, AccessAnswer>(&mut recv)
+            .await
+            .map_err(std::io::Error::other)
+    };
+    assert!(
+        asked.await.is_err(),
+        "a connection past the cap was answered"
+    );
+    assert_eq!(ask(&held[0], me.clone()).await, Tier::Owner);
+
+    // One closed makes room again.
+    held.pop().unwrap().close(0u32.into(), b"done");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let again = relay
+        .connect(server.server.addr(), RELAY_ACCESS_ALPN)
+        .await
+        .unwrap();
+    assert_eq!(ask(&again, me).await, Tier::Owner);
+    relay.close().await;
+    server.stop().await;
+}

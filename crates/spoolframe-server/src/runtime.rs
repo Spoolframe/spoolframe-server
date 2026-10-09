@@ -756,7 +756,7 @@ mod tests {
         settings
             .set(
                 "telemetry.otlp.headers",
-                &serde_json::json!("authorization=Bearer s3cr3t"),
+                &serde_json::json!({ "authorization": "Bearer s3cr3t" }),
                 "root",
             )
             .unwrap();

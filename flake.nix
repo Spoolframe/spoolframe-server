@@ -64,6 +64,7 @@
           nixos-module-assertions = import ./nix/assertions.nix {
             inherit pkgs;
             spoolframeModule = ./nix/nixos-module.nix;
+            relayModule = ./nix/relay-module.nix;
           };
         };
         formatter = pkgs.alejandra;

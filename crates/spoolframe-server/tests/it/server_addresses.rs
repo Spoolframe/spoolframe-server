@@ -345,3 +345,39 @@ async fn added_addresses_are_told_with_the_endpoint_port() {
     );
     server.stop().await;
 }
+
+/// `network.ipv6 = false`: the endpoint listens on IPv4 only, so it has no
+/// IPv6 address to be dialled at or to punch holes through, and a
+/// signed-in device is told none.
+#[tokio::test]
+async fn with_ipv6_off_no_ipv6_address_is_bound_or_told() {
+    let options = ServerOptions {
+        ipv6: false,
+        ..ServerOptions::default()
+    };
+    let server = TestServer::start_with(fresh_dir("addrs-ipv6-off").await, options).await;
+    server.add_user("alice", PASSWORD, Some("Alice")).await;
+    let bound = server.server.bound_sockets();
+    assert!(
+        !bound.is_empty() && bound.iter().all(SocketAddr::is_ipv4),
+        "{bound:?}"
+    );
+    let dialled: Vec<SocketAddr> = server.server.addr().ip_addrs().copied().collect();
+    assert!(dialled.iter().all(SocketAddr::is_ipv4), "{dialled:?}");
+    let client = server.client().await;
+    let told = told(&client).await;
+    assert!(
+        !told.is_empty() && told.iter().all(SocketAddr::is_ipv4),
+        "{told:?}"
+    );
+    server.stop().await;
+}
+
+/// By default the endpoint listens on IPv6 too.
+#[tokio::test]
+async fn by_default_the_endpoint_listens_on_ipv6_too() {
+    let server = TestServer::start("addrs-ipv6-on").await;
+    let bound = server.server.bound_sockets();
+    assert!(bound.iter().any(SocketAddr::is_ipv6), "{bound:?}");
+    server.stop().await;
+}

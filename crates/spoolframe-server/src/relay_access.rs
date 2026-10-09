@@ -3,6 +3,7 @@
 //! relays `network.own_relays` names are answered; anyone else is closed
 //! on at once.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,12 @@ use crate::auth::Auth;
 const MAX_QUERY: u32 = 1024;
 /// How long a relay may take to send its question once it opens a stream.
 const QUERY_WAIT: Duration = Duration::from_secs(10);
+/// The connections one named relay may hold on this ALPN at once (P6-07,
+/// both reviews' first finding). A relay asks over one kept connection;
+/// the second is room for a reconnect while the old one closes. The
+/// transport holds each to 4 streams, so a relay whose key is stolen
+/// holds at most 8 asks on the store, not as many as it can open.
+pub const MAX_CONNECTIONS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct RelayAccess {
@@ -27,6 +34,27 @@ pub struct RelayAccess {
     /// The server's own key: its relay must carry it too.
     server: EndpointId,
     auth: Auth,
+    /// How many connections each relay holds now.
+    open: Arc<parking_lot::Mutex<HashMap<EndpointId, usize>>>,
+}
+
+/// One connection counted against its relay's [`MAX_CONNECTIONS`]; it
+/// is uncounted when dropped.
+struct Held {
+    open: Arc<parking_lot::Mutex<HashMap<EndpointId, usize>>>,
+    relay: EndpointId,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut open = self.open.lock();
+        if let Some(n) = open.get_mut(&self.relay) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.relay);
+            }
+        }
+    }
 }
 
 impl RelayAccess {
@@ -35,7 +63,23 @@ impl RelayAccess {
             relays: Arc::new(relays),
             server,
             auth,
+            open: Arc::default(),
         }
+    }
+
+    /// Count a connection from `relay`, if it holds fewer than
+    /// [`MAX_CONNECTIONS`].
+    fn hold(&self, relay: EndpointId) -> Option<Held> {
+        let mut open = self.open.lock();
+        let n = open.entry(relay).or_default();
+        if *n >= MAX_CONNECTIONS {
+            return None;
+        }
+        *n += 1;
+        Some(Held {
+            open: self.open.clone(),
+            relay,
+        })
     }
 
     /// Which tier `endpoint` is in: the server itself and a device with a
@@ -73,6 +117,16 @@ impl ProtocolHandler for RelayAccess {
             connection.closed().await;
             return Ok(());
         }
+        let Some(_held) = self.hold(relay) else {
+            tracing::warn!(
+                relay = %relay.fmt_short(),
+                max = MAX_CONNECTIONS,
+                "refusing a connection: the relay holds as many as it may"
+            );
+            connection.close(VarInt::from_u32(close::BUSY), b"too many connections");
+            connection.closed().await;
+            return Ok(());
+        };
         tracing::debug!(relay = %relay.fmt_short(), "the server's relay connected");
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
             let this = self.clone();

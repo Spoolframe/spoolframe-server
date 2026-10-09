@@ -38,6 +38,10 @@ pub const CACHE: Duration = Duration::from_secs(60);
 const FAILED_CACHE: Duration = Duration::from_secs(5);
 /// How long a question may take.
 const ASK_WAIT: Duration = Duration::from_secs(5);
+/// The most answers kept (P6-07, glm E-2). Endpoint keys are free, so a
+/// flood of fresh ones would otherwise grow the cache by its rate times
+/// [`CACHE`]; past this, the answer that would expire first goes.
+const MAX_ANSWERS: usize = 10_000;
 
 /// Why the relay cannot start.
 #[derive(Debug, thiserror::Error)]
@@ -177,7 +181,54 @@ struct Asker {
     endpoint: Endpoint,
     server: EndpointAddr,
     connection: tokio::sync::Mutex<Option<Connection>>,
-    answers: parking_lot::Mutex<HashMap<EndpointId, (Tier, Instant)>>,
+    answers: parking_lot::Mutex<Answers>,
+}
+
+/// The answers kept, each until it expires, at most `max` of them.
+#[derive(Debug)]
+struct Answers {
+    kept: HashMap<EndpointId, (Tier, Instant)>,
+    max: usize,
+}
+
+impl Default for Answers {
+    fn default() -> Self {
+        Self {
+            kept: HashMap::new(),
+            max: MAX_ANSWERS,
+        }
+    }
+}
+
+impl Answers {
+    /// `endpoint`'s answer, if it has not expired at `now`.
+    fn get(&self, endpoint: &EndpointId, now: Instant) -> Option<Tier> {
+        self.kept
+            .get(endpoint)
+            .filter(|(_, until)| now < *until)
+            .map(|(tier, _)| *tier)
+    }
+
+    /// Keep `tier` for `endpoint` until `until`. Only a full cache is
+    /// swept: the expired go, and if that frees nothing, the tenth that
+    /// would expire soonest. A flood of fresh keys then scans the map once
+    /// per tenth of `max` new keys, not once per key, under the lock every
+    /// connection's lookup takes.
+    fn keep(&mut self, endpoint: EndpointId, tier: Tier, until: Instant, now: Instant) {
+        if self.kept.len() >= self.max && !self.kept.contains_key(&endpoint) {
+            self.kept.retain(|_, (_, at)| now < *at);
+            if self.kept.len() >= self.max {
+                let mut by_expiry: Vec<(Instant, EndpointId)> =
+                    self.kept.iter().map(|(key, (_, at))| (*at, *key)).collect();
+                let evict = (self.max / 10).max(1);
+                by_expiry.select_nth_unstable(evict - 1);
+                for (_, key) in &by_expiry[..evict] {
+                    self.kept.remove(key);
+                }
+            }
+        }
+        self.kept.insert(endpoint, (tier, until));
+    }
 }
 
 impl Asker {
@@ -199,9 +250,7 @@ impl Asker {
 
     async fn tier(&self, endpoint: EndpointId) -> Tier {
         let now = Instant::now();
-        if let Some((tier, until)) = self.answers.lock().get(&endpoint).copied()
-            && now < until
-        {
+        if let Some(tier) = self.answers.lock().get(&endpoint, now) {
             return tier;
         }
         let (tier, keep) = match tokio::time::timeout(ASK_WAIT, self.ask(endpoint)).await {
@@ -215,9 +264,7 @@ impl Asker {
                 (Tier::Stranger, FAILED_CACHE)
             }
         };
-        let mut answers = self.answers.lock();
-        answers.retain(|_, (_, until)| now < *until);
-        answers.insert(endpoint, (tier, now + keep));
+        self.answers.lock().keep(endpoint, tier, now + keep, now);
         tier
     }
 
@@ -262,5 +309,49 @@ impl Asker {
             .map_err(|e| e.to_string())?;
         *kept = Some(connection.clone());
         Ok(connection)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(n: u8) -> EndpointId {
+        SecretKey::from_bytes(&[n; 32]).public()
+    }
+
+    #[test]
+    fn answers_past_the_cap_drop_the_one_that_expires_soonest() {
+        let now = Instant::now();
+        let mut answers = Answers {
+            max: 3,
+            ..Answers::default()
+        };
+        for n in 1..=3 {
+            let until = now + Duration::from_secs(10 * u64::from(n));
+            answers.keep(key(n), Tier::Stranger, until, now);
+        }
+        answers.keep(key(4), Tier::Owner, now + CACHE, now);
+        assert_eq!(answers.kept.len(), 3);
+        assert_eq!(answers.get(&key(1), now), None);
+        assert_eq!(answers.get(&key(2), now), Some(Tier::Stranger));
+        assert_eq!(answers.get(&key(4), now), Some(Tier::Owner));
+    }
+
+    #[test]
+    fn an_expired_answer_is_not_given_and_goes_before_a_live_one() {
+        let now = Instant::now();
+        let mut answers = Answers {
+            max: 2,
+            ..Answers::default()
+        };
+        answers.keep(key(1), Tier::Owner, now + FAILED_CACHE, now);
+        answers.keep(key(2), Tier::Owner, now + CACHE, now);
+        let later = now + FAILED_CACHE + Duration::from_secs(1);
+        assert_eq!(answers.get(&key(1), later), None);
+        answers.keep(key(3), Tier::Owner, later + CACHE, later);
+        assert_eq!(answers.get(&key(2), later), Some(Tier::Owner));
+        assert_eq!(answers.get(&key(3), later), Some(Tier::Owner));
+        assert_eq!(answers.kept.len(), 2);
     }
 }

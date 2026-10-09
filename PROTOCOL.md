@@ -736,7 +736,8 @@ spoolframe://invite?server=3f9a…a0f1&name=Home%20Media&addr=203.0.113.24:41641
 | `server` | The server's `EndpointId`, 64 hex digits. Required. |
 | `name` | What the server calls itself. |
 | `addr` | An address it may be reached at, `ip:port` or `[ipv6]:port`. Repeated, one per address. |
-| `relay` | An `http(s)` URL of a relay it may be reached through. Repeated. Empty until relays exist (P6-03). |
+| `relay` | An `http(s)` URL of a relay it may be reached through. Repeated. |
+| `lookup` | An `http(s)` URL of the pkarr relay the server publishes its record at (P6-05). |
 | `exp` | When the code stops working, in Unix seconds. A hint. |
 | `role` | `consumer` or `admin`: the role the account gets. A hint. |
 | `cap` | The code, 12 characters from `ABCDEFGHJKMNPQRSTVWXYZ23456789`, shown in groups of four. |
@@ -747,6 +748,8 @@ they are. A reader ignores a parameter it does not know, and a hint it
 cannot read, as it does in the device sign-in link. A link without
 `server`, with a `server` that is not a key, or with a `cap` that is not a
 code is not an invite. At most 32 `addr` and 32 `relay` hints are read.
+A link longer than 4096 bytes is not an invite either, and `name` is cut
+to 128 characters, as `Hello`'s strings are (P6-07).
 
 Without `cap` the link only finds the server: a client pins the key
 straight from it (it came from the server's admin, so there is nothing to
@@ -810,9 +813,46 @@ link as the user pasted or opened it:
 The link's addresses join the server's known addresses as told ones,
 replacing none; the server's next `server_addresses` list replaces them
 as it replaces any told address. Its relays are kept beside the ones the
-server told. A key the device has not saved is another server, whatever
+server told. What a device keeps from links, and from `server_addresses`,
+is held to a link's limits (P6-07): relays and lookups that are `http(s)`
+URLs only, at most 32 relays and 32 addresses per server, newest first,
+and at most 8 pkarr relays looked up at in all. A key the device has not saved is another server, whatever
 its name; one that answers with a saved server's server id is that
 server with a new key, `IdentityChanged`, before any account is made.
+
+## Relay access
+
+A relay of the server's own (P6-04, `spoolframe-server relay run`) asks
+the main server who may relay through it. That is a second ALPN on the
+main server's endpoint, `spoolframe/relay-access/1`
+(`spoolframe_protocol::relay_access`); it is not the client wire, and no
+app speaks it.
+
+The main server accepts it only while `network.own_relays` names a relay,
+and answers only those relays' keys: any other key is closed
+`UNSUPPORTED_PROTOCOL` at once. A named relay holds at most 2 connections
+on it (P6-07); one more is closed `BUSY`.
+
+One bidirectional stream per question, each one frame:
+
+```json
+{"endpoint": "3f9a…a0f1"}
+```
+
+answered
+
+```json
+{"tier": "owner"}
+```
+
+`tier` is `owner` (the server itself, or a device with a live session or
+trusted for a user), `friend` (none until P7 and P8) or `stranger`. A
+tier the relay does not know is a stranger. The question is at most
+1 KiB and must arrive within 10 s of the stream opening.
+
+The relay keeps an answer 60 s and a failure 5 s, at most 10,000 of them,
+and lets through the tiers its `access` allows. An answer it cannot get
+is a stranger's.
 
 ## Picture subtitles
 

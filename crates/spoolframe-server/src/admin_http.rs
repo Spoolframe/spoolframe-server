@@ -233,16 +233,16 @@ impl std::str::FromStr for Network {
     }
 }
 
-impl std::str::FromStr for TrustedProxies {
-    type Err = String;
-
-    /// A comma-separated list of addresses and CIDR ranges.
-    fn from_str(list: &str) -> Result<Self, String> {
-        list.split(',')
-            .map(|entry| entry.trim().parse())
-            .collect::<Result<_, _>>()
-            .map(Self)
+impl TrustedProxies {
+    /// Addresses and CIDR ranges, one each; none is no proxy.
+    pub fn new<S: AsRef<str>>(entries: &[S]) -> Result<Self, String> {
+        networks(entries).map(Self)
     }
+}
+
+/// Each of `entries` as an address or a CIDR range.
+fn networks<S: AsRef<str>>(entries: &[S]) -> Result<Vec<Network>, String> {
+    entries.iter().map(|e| e.as_ref().trim().parse()).collect()
 }
 
 /// Addresses and CIDR ranges a scraper may read `GET /metrics` from
@@ -252,30 +252,20 @@ pub struct AddressRanges(Vec<Network>);
 
 impl AddressRanges {
     /// What `admin.metrics_from` is when left out.
-    pub const LOOPBACK: &'static str = "127.0.0.0/8, ::1";
+    pub const LOOPBACK: &'static [&'static str] = &["127.0.0.0/8", "::1"];
+
+    /// Addresses and CIDR ranges, one each; none lets nobody in.
+    pub fn new<S: AsRef<str>>(entries: &[S]) -> Result<Self, String> {
+        networks(entries).map(Self)
+    }
 
     /// This machine's loopback addresses, IPv4 and IPv6.
     pub fn loopback() -> Self {
-        Self::LOOPBACK.parse().expect("fixed ranges")
+        Self::new(Self::LOOPBACK).expect("fixed ranges")
     }
 
     pub fn contains(&self, ip: IpAddr) -> bool {
         self.0.iter().any(|network| network.contains(ip))
-    }
-}
-
-impl std::str::FromStr for AddressRanges {
-    type Err = String;
-
-    /// A comma-separated list of addresses and CIDR ranges; an empty one
-    /// lets nobody in.
-    fn from_str(list: &str) -> Result<Self, String> {
-        list.split(',')
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-            .map(str::parse)
-            .collect::<Result<_, _>>()
-            .map(Self)
     }
 }
 
@@ -1274,8 +1264,8 @@ mod tests {
         ])));
     }
 
-    fn proxies(list: &str) -> TrustedProxies {
-        list.parse().unwrap()
+    fn proxies(list: &[&str]) -> TrustedProxies {
+        TrustedProxies::new(list).unwrap()
     }
 
     fn forwarded(values: &[&str]) -> HeaderMap {
@@ -1292,7 +1282,7 @@ mod tests {
 
     #[test]
     fn a_trusted_proxy_s_caller_is_the_address_it_forwards_for() {
-        let proxies = proxies("10.0.0.5, 172.17.0.0/16");
+        let proxies = proxies(&["10.0.0.5", "172.17.0.0/16"]);
         let from = forwarded(&["203.0.113.9"]);
         assert_eq!(
             proxies.caller(ip("10.0.0.5"), &from),
@@ -1311,7 +1301,7 @@ mod tests {
     #[test]
     fn a_forwarding_header_from_anyone_else_is_not_read() {
         let from = forwarded(&["203.0.113.9"]);
-        let proxies = proxies("10.0.0.5, 172.17.0.0/16");
+        let proxies = proxies(&["10.0.0.5", "172.17.0.0/16"]);
         assert_eq!(proxies.caller(ip("10.0.0.6"), &from), Some(ip("10.0.0.6")));
         assert_eq!(
             proxies.caller(ip("172.18.0.1"), &from),
@@ -1325,7 +1315,7 @@ mod tests {
 
     #[test]
     fn the_caller_is_the_right_most_address_no_trusted_proxy_wrote() {
-        let proxies = proxies("10.0.0.0/24");
+        let proxies = proxies(&["10.0.0.0/24"]);
         // The caller sent a header of its own; two of our proxies in a row.
         let chain = forwarded(&["198.51.100.1, 203.0.113.9, 10.0.0.6"]);
         assert_eq!(
@@ -1342,7 +1332,7 @@ mod tests {
 
     #[test]
     fn a_trusted_proxy_without_a_usable_header_names_no_caller() {
-        let proxies = proxies("10.0.0.0/24");
+        let proxies = proxies(&["10.0.0.0/24"]);
         assert_eq!(proxies.caller(ip("10.0.0.5"), &HeaderMap::new()), None);
         // Only our own proxies.
         assert_eq!(
@@ -1358,19 +1348,19 @@ mod tests {
 
     #[test]
     fn trusted_proxies_are_addresses_and_ranges() {
-        let proxies = proxies("10.0.0.5,fd00::/8, 0.0.0.0/0");
+        let proxies = proxies(&["10.0.0.5", "fd00::/8", "0.0.0.0/0"]);
         assert!(proxies.contains(ip("10.0.0.5")));
         assert!(proxies.contains(ip("fd12::1")));
         assert!(proxies.contains(ip("192.0.2.1")));
         assert!(!proxies.contains(ip("2001:db8::1")));
         for bad in [
             "",
-            "10.0.0.5,",
+            "10.0.0.5, 10.0.0.6",
             "proxy.example.org",
             "10.0.0.0/33",
             "fd00::/x",
         ] {
-            assert!(bad.parse::<TrustedProxies>().is_err(), "{bad:?}");
+            assert!(TrustedProxies::new(&[bad]).is_err(), "{bad:?}");
         }
     }
 

@@ -525,15 +525,18 @@ pub struct Hello {
     pub capabilities: Option<ClientCapabilities>,
 }
 
+/// `text` cut to [`MAX_HELLO_TEXT`] characters: what a server keeps of a
+/// device's strings, and a device of an invite link's name.
+pub(crate) fn cut(text: &mut String) {
+    if let Some((at, _)) = text.char_indices().nth(MAX_HELLO_TEXT) {
+        text.truncate(at);
+    }
+}
+
 impl Hello {
     /// This `Hello` with each string cut to [`MAX_HELLO_TEXT`] characters:
     /// what a server keeps of it.
     pub fn within_bounds(mut self) -> Self {
-        fn cut(text: &mut String) {
-            if let Some((at, _)) = text.char_indices().nth(MAX_HELLO_TEXT) {
-                text.truncate(at);
-            }
-        }
         cut(&mut self.client_name);
         cut(&mut self.client_version);
         if let Some(name) = &mut self.device_name {

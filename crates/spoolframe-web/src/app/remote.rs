@@ -10,12 +10,12 @@ use wasm_bindgen::JsValue;
 
 use super::admin::sleep;
 use super::profile::{ConfirmItsYou, asks_to_confirm};
-use super::wizard::{Note, entry, load_settings, loading, locked, save};
+use super::wizard::{Note, load_settings, loading, locked, save, value};
 use super::{Alert, Field, icons, rpc};
 use crate::logic::ApiError;
 use crate::remote::{
-    Choice, Ip, Line, Opened, Tone, WanForm, add_static, badge, lookup_line, mapping_line,
-    service_name, source_detail, tried_line, wizard_setting,
+    Choice, Ip, Line, Opened, Tone, WanForm, add_static, badge, listens_on_ipv6, lookup_line,
+    mapping_line, service_name, source_detail, tried_line, wizard_setting,
 };
 
 /// How often the status card asks again: a mapping or a lookup may land
@@ -168,7 +168,7 @@ pub fn RemoteAccessForm(on_done: EventHandler<()>) -> Element {
     let Some(Ok(loaded)) = current else {
         return rsx! {};
     };
-    let saved = WanForm::from_setting(entry(&loaded, "network.wan").and_then(|e| e.value.as_ref()));
+    let saved = WanForm::from_setting(value(&loaded, "network.wan"));
     rsx! {
         div { class: "flex flex-col gap-1.5",
             h2 { class: "m-0 text-[22px] font-semibold", "Remote access" }
@@ -218,8 +218,7 @@ fn RemoteFields(
     on_done: EventHandler<()>,
     on_reload: EventHandler<()>,
 ) -> Element {
-    let saved =
-        WanForm::from_setting(entry(&settings, "network.wan").and_then(|e| e.value.as_ref()));
+    let saved = WanForm::from_setting(value(&settings, "network.wan"));
     let fixed = locked(&settings, "network.wan");
     let on = use_signal(|| saved.on);
     let mapped = use_signal(|| saved.mapped);
@@ -230,13 +229,10 @@ fn RemoteFields(
     let mut lookup_service = use_signal(|| saved.lookup_service);
     let mut statics = use_signal(|| saved.statics.clone());
     let new_static = use_signal(String::new);
-    let host_ipv6 = use_signal(|| saved.host_ipv6);
+    let ipv6_fixed = locked(&settings, "network.ipv6");
+    let ipv6 = use_signal(|| listens_on_ipv6(value(&settings, "network.ipv6")));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
-    let found_ipv6 = use_resource(|| async {
-        let client = rpc::client().await?;
-        client.wan_host_ipv6().await.map_err(rpc::error)
-    });
     let form = move || WanForm {
         on: on(),
         mapped: mapped(),
@@ -246,7 +242,6 @@ fn RemoteFields(
         typed_ip: typed_ip(),
         lookup_service: lookup_service(),
         statics: statics(),
-        host_ipv6: host_ipv6(),
     };
     let s = settings.clone();
     // `network.*` says where devices connect (finding 61): from an old
@@ -263,7 +258,11 @@ fn RemoteFields(
         };
         busy.set(true);
         spawn(async move {
-            match save(&s, vec![("network.wan", setting)]).await {
+            let changes = vec![
+                ("network.wan", setting),
+                ("network.ipv6", Some(serde_json::Value::Bool(ipv6()))),
+            ];
+            match save(&s, changes).await {
                 Ok(()) => on_done.call(()),
                 Err(e) if asks_to_confirm(&e, confirming, "changing remote access") => {}
                 Err(e) => error.set(Some(e.explain())),
@@ -420,21 +419,15 @@ fn RemoteFields(
                         span { class: "text-xs text-ctp-subtext0", "A public IPv4 or IPv6 with its port, such as 1.2.3.4:7420 or [2001:db8::1]:7420. Forwarding it is up to you." }
                     }
                 }
-                div { class: "wan-part",
-                    PartHead {
-                        title: "Host IPv6",
-                        about: "Advertise this machine’s own stable public IPv6 addresses. No forwarding needed: only the router’s and this machine’s firewalls must let the server’s port in. Temporary privacy addresses are never used.",
-                        on: host_ipv6,
-                        disabled: fixed,
-                    }
-                    match &*found_ipv6.read() {
-                        Some(Ok(found)) if !found.is_empty() => rsx! {
-                            span { class: "text-xs text-ctp-subtext0", "Found: " span { class: "mono-value text-xs", {found.join(", ")} } }
-                        },
-                        Some(Ok(_)) => rsx! { span { class: "text-xs text-ctp-subtext0", "This machine has no stable public IPv6 address now." } },
-                        _ => rsx! {},
-                    }
+            }
+            div { class: "wan-part",
+                PartHead {
+                    title: "Listen on IPv6",
+                    about: if ipv6() { "On: devices may reach the server at this machine’s IPv6 addresses, directly or by hole punching." } else { "Off: the server listens on IPv4 only, so no device reaches it over IPv6." },
+                    on: ipv6,
+                    disabled: ipv6_fixed,
                 }
+                Note { settings: settings.clone(), setting: "network.ipv6", on_changed: move |_| on_reload.call(()) }
             }
             if let Some(text) = error() {
                 Alert { text }
@@ -442,7 +435,7 @@ fn RemoteFields(
             div { class: "wizard-foot",
                 span { class: "wizard-foot-end",
                     button { class: "btn-dialog btn-dialog-grey", disabled: busy(), onclick: move |_| on_reload.call(()), "Discard" }
-                    button { class: "btn-dialog btn-dialog-primary", disabled: busy() || fixed || blocked.is_some(), onclick: move |_| on_save.call(()), "Save" }
+                    button { class: "btn-dialog btn-dialog-primary", disabled: busy() || (fixed && ipv6_fixed) || blocked.is_some(), onclick: move |_| on_save.call(()), "Save" }
                 }
             }
         }
@@ -468,7 +461,7 @@ pub struct WizardRemote {
 impl WizardRemote {
     /// What `network.wan` says now, for a step opened again.
     pub fn from_settings(settings: &Settings) -> Self {
-        let value = entry(settings, "network.wan").and_then(|e| e.value.as_ref());
+        let value = value(settings, "network.wan");
         let form = WanForm::from_setting(value);
         Self {
             choice: crate::remote::choice_of(value),

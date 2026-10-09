@@ -38,7 +38,6 @@ pub struct WanForm {
     /// The lookup service: wtfismyip, or none (`lookup_via = false`).
     pub lookup_service: bool,
     pub statics: Vec<String>,
-    pub host_ipv6: bool,
 }
 
 impl Default for WanForm {
@@ -54,7 +53,6 @@ impl Default for WanForm {
             typed_ip: String::new(),
             lookup_service: true,
             statics: Vec::new(),
-            host_ipv6: false,
         }
     }
 }
@@ -80,7 +78,6 @@ impl WanForm {
                 .map(str::to_owned)
                 .collect();
         }
-        form.host_ipv6 = wan.get("host_ipv6").and_then(Value::as_bool) == Some(true);
         match wan.get("mapped_port") {
             Some(Value::Bool(false)) => form.mapped = false,
             Some(Value::Object(mapped)) => {
@@ -124,7 +121,6 @@ impl WanForm {
         }
         let mut wan = serde_json::Map::new();
         wan.insert("static".into(), json!(self.statics));
-        wan.insert("host_ipv6".into(), json!(self.host_ipv6));
         if !self.mapped {
             wan.insert("mapped_port".into(), json!(false));
             return Ok(Some(Value::Object(wan)));
@@ -152,6 +148,12 @@ impl WanForm {
         wan.insert("mapped_port".into(), Value::Object(mapped));
         Ok(Some(Value::Object(wan)))
     }
+}
+
+/// Whether the `network.ipv6` setting's value has the server listen on
+/// IPv6: on unless it is `false`.
+pub fn listens_on_ipv6(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_bool).unwrap_or(true)
 }
 
 /// A typed port; empty is the server's own.
@@ -241,13 +243,12 @@ pub fn choice_of(value: Option<&Value>) -> Choice {
 }
 
 /// A source's badge: its words and its class (Static blue, Mapped port
-/// teal, Looked up mauve, Host IPv6 peach).
+/// teal, Looked up mauve).
 pub fn badge(source: AddressSource) -> (&'static str, &'static str) {
     match source {
         AddressSource::Static => ("Static", "src-badge src-static"),
         AddressSource::MappedPort => ("Mapped port", "src-badge src-mapped"),
         AddressSource::Lookup => ("Looked up", "src-badge src-lookup"),
-        AddressSource::HostIpv6 => ("Host IPv6", "src-badge src-ipv6"),
     }
 }
 
@@ -263,9 +264,6 @@ pub fn source_detail(
     let port = address.rsplit(':').next().unwrap_or_default();
     match source {
         AddressSource::Static => "Typed in Static addresses.".into(),
-        AddressSource::HostIpv6 => {
-            "This machine’s stable address on the router’s IPv6 prefix.".into()
-        }
         AddressSource::MappedPort => match mapping {
             MappingStatus::Granted { external, .. } if external == address => {
                 "Granted by the router; it reported this address.".into()
@@ -458,7 +456,6 @@ mod tests {
             form.to_setting(),
             Ok(Some(json!({
                 "static": [],
-                "host_ipv6": false,
                 "mapped_port": {
                     "mode": "auto",
                     "public_ip": "lookup",
@@ -478,7 +475,6 @@ mod tests {
             typed_ip: "203.0.113.24".into(),
             lookup_service: false,
             statics: vec!["198.51.100.7:7420".into()],
-            host_ipv6: true,
             ..WanForm::default()
         };
         let saved = form.to_setting().unwrap().unwrap();
@@ -486,7 +482,6 @@ mod tests {
             saved,
             json!({
                 "static": ["198.51.100.7:7420"],
-                "host_ipv6": true,
                 "mapped_port": {
                     "port": 443,
                     "mode": "manual",
@@ -496,6 +491,13 @@ mod tests {
             })
         );
         assert_eq!(WanForm::from_setting(Some(&saved)), form);
+    }
+
+    #[test]
+    fn ipv6_is_on_unless_set_to_false() {
+        assert!(listens_on_ipv6(None));
+        assert!(listens_on_ipv6(Some(&json!(true))));
+        assert!(!listens_on_ipv6(Some(&json!(false))));
     }
 
     #[test]
@@ -621,7 +623,6 @@ mod tests {
         assert_eq!(badge(AddressSource::Static).0, "Static");
         assert_eq!(badge(AddressSource::MappedPort).0, "Mapped port");
         assert_eq!(badge(AddressSource::Lookup).0, "Looked up");
-        assert_eq!(badge(AddressSource::HostIpv6).0, "Host IPv6");
     }
 
     #[test]

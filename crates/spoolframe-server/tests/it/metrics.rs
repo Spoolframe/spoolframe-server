@@ -42,7 +42,7 @@ async fn serve_with(
     let dir = state_dir(test).await;
     let auth = Auth::new(Store::open(dir.as_ref()).await.unwrap());
     let proxies = if proxied {
-        "127.0.0.1".parse().unwrap()
+        TrustedProxies::new(&["127.0.0.1"]).unwrap()
     } else {
         TrustedProxies::default()
     };
@@ -62,9 +62,13 @@ async fn serve_with(
     (addr, dir)
 }
 
+/// Metrics on for `from`'s ranges, written "a, b" for short.
 fn on(from: &str) -> Arc<Metrics> {
     let metrics = Arc::new(Metrics::default());
-    metrics.access().set(true, from.parse().unwrap());
+    metrics.access().set(
+        true,
+        admin::AddressRanges::new(&from.split(", ").collect::<Vec<_>>()).unwrap(),
+    );
     metrics
 }
 

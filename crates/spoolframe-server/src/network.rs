@@ -7,7 +7,7 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use iroh::endpoint::{Connection, VarInt, presets};
@@ -156,6 +156,9 @@ impl ServerName {
 pub struct EndpointOptions {
     /// The UDP port to listen on (IPv4 and IPv6); `None` picks a free one.
     pub port: Option<u16>,
+    /// Listen on IPv6 too (`network.ipv6`). Off, the endpoint has only an
+    /// IPv4 socket, so iroh has no IPv6 address to tell or punch through.
+    pub ipv6: bool,
     /// `network.relays`; empty: relays off.
     pub relays: Vec<Relay>,
     /// `network.pkarr` (P6-05).
@@ -261,13 +264,13 @@ impl Connections {
         self.lock().values().any(|peer| &peer.endpoint == endpoint)
     }
 
-    /// `endpoint` signed in: each of its connections gets the normal
-    /// limits. Their ids.
-    pub(crate) fn signed_in(&self, endpoint: &EndpointId) -> Vec<usize> {
+    /// `endpoint` signed in, as `user` when known: each of its connections
+    /// gets the normal limits. Their ids.
+    pub(crate) fn signed_in(&self, endpoint: &EndpointId, user: Option<&str>) -> Vec<usize> {
         let mut raised = Vec::new();
         for (id, peer) in self.lock().iter().filter(|(_, p)| &p.endpoint == endpoint) {
             peer.raise();
-            peer.note_signed_in();
+            peer.note_signed_in(user);
             raised.push(*id);
         }
         raised
@@ -509,13 +512,19 @@ impl Server {
                 iroh::address_lookup::PkarrPublisher::builder(url).addr_filter(published()),
             );
         }
-        if let Some(port) = options.port {
+        // The builder binds 0.0.0.0 and [::] on a free port unless told
+        // otherwise: a fixed port, or IPv4 only, replaces both.
+        if options.port.is_some() || !options.ipv6 {
+            let port = options.port.unwrap_or(0);
             builder = builder
                 .clear_ip_transports()
                 .bind_addr((Ipv4Addr::UNSPECIFIED, port))
-                .map_err(|e| bind_failed(e.to_string()))?
-                .bind_addr((Ipv6Addr::UNSPECIFIED, port))
                 .map_err(|e| bind_failed(e.to_string()))?;
+            if options.ipv6 {
+                builder = builder
+                    .bind_addr((Ipv6Addr::UNSPECIFIED, port))
+                    .map_err(|e| bind_failed(e.to_string()))?;
+            }
         }
         let endpoint = builder
             .bind()
@@ -628,6 +637,12 @@ impl Server {
     /// Where the endpoint can be dialled right now.
     pub fn addr(&self) -> EndpointAddr {
         self.router.endpoint().addr()
+    }
+
+    /// The endpoint's sockets: IPv4 and, unless `network.ipv6 = false`,
+    /// IPv6.
+    pub fn bound_sockets(&self) -> Vec<SocketAddr> {
+        self.router.endpoint().bound_sockets()
     }
 
     /// What a signed-in device is told about where to dial (PX-12):

@@ -393,9 +393,6 @@ impl StatusSource {
                             crate::wan::Source::Lookup => {
                                 spoolframe_admin_api::AddressSource::Lookup
                             }
-                            crate::wan::Source::HostIpv6 => {
-                                spoolframe_admin_api::AddressSource::HostIpv6
-                            }
                         },
                     })
                     .collect()
@@ -3068,15 +3065,6 @@ impl AdminApiServer for AdminApi {
                 "the server's endpoint is starting; try again in a moment",
             )),
         }
-    }
-
-    async fn wan_host_ipv6(&self, ext: &Extensions) -> RpcResult<Vec<String>> {
-        self.admin(ext).await?;
-        let interfaces = self.wizard.wan.host.interfaces().await;
-        Ok(crate::wan::stable_global_ipv6(&interfaces)
-            .iter()
-            .map(ToString::to_string)
-            .collect())
     }
 
     async fn plex_probe(

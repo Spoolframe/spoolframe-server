@@ -3949,9 +3949,6 @@
   .src-lookup {
     color: var(--ctp-mauve);
   }
-  .src-ipv6 {
-    color: var(--ctp-peach);
-  }
   .wan-part {
     display: flex;
     flex-direction: column;

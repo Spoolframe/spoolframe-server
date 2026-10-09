@@ -84,13 +84,18 @@ network {
   # The UDP port. Left out, a free one is picked at every start; fix it
   # when a firewall needs to know.
   # port = 7420;
-  # The relays the server may take its home relay from: a comma-separated
-  # list of "default" (n0's public relays) and relay URLs, as
-  # "default, https://relay.example.com". Devices that cannot dial the
+  # Listen on IPv6 too. Off, the server listens on IPv4 only, so no
+  # device reaches it over IPv6, directly or by hole punching. On, it
+  # tells devices every global IPv6 address the host has, temporary
+  # (privacy) ones included.
+  ipv6 = true;
+  # The relays the server may take its home relay from: a list of
+  # "default" (n0's public relays) and relay URLs, as
+  # ["default", "https://relay.example.com"]. Devices that cannot dial the
   # server directly reach it through its home relay, and invites carry the
   # list. Empty: relays off, the server reached only on the LAN or at a
   # public address.
-  relays = "";
+  relays = [];
   # Optional, and only for one case: a device that knows the server's
   # identity (from an invite or an earlier sign-in) but no longer knows an
   # address that reaches it, as when your public IP changed while it was
@@ -182,10 +187,6 @@ network {
   #     # or false: never ask, and public_ip must be an address.
   #     lookup_via = "wtfismyip";
   #   }
-  #   # Tell this host's stable global IPv6 addresses, on the server's
-  #   # port: no forward is needed, only the router's and the host's
-  #   # firewalls. Never a temporary (privacy) address.
-  #   host_ipv6 = false;
   # }
 }
 
@@ -198,7 +199,7 @@ admin {
   # With the proxy on this host, listen on loopback and name the proxy:
   #   listen = "127.0.0.1:7421";
   #   public_url = "https://media.example.org";
-  #   trusted_proxies = "127.0.0.1";
+  #   trusted_proxies = ["127.0.0.1"];
   # The proxy connects from loopback, so without trusted_proxies every
   # caller through it would look like loopback.
   listen = "0.0.0.0:7421";
@@ -209,7 +210,7 @@ admin {
   # public_url = "https://media.example.org";
   # The reverse proxies in front of the listener, as addresses and CIDR
   # ranges, comma-separated. Left out, no X-Forwarded-For is read.
-  # trusted_proxies = "10.0.0.5, 172.17.0.0/16";
+  # trusted_proxies = ["10.0.0.5", "172.17.0.0/16"];
   # A loopback listen with a public_url means a proxy on this host, and
   # the server refuses to start without trusted_proxies: every caller
   # would look like loopback. On every interface with a public_url there
@@ -225,10 +226,10 @@ admin {
   # Answer GET /metrics on this listener with Prometheus text. Off, it is
   # not found.
   metrics = false;
-  # The addresses and CIDR ranges a scraper may read it from,
-  # comma-separated; anyone else is refused. Behind trusted_proxies, the
+  # The addresses and CIDR ranges a scraper may read it from, a list;
+  # anyone else is refused. Behind trusted_proxies, the
   # address the proxy forwards for.
-  metrics_from = "127.0.0.0/8, ::1";
+  metrics_from = ["127.0.0.0/8", "::1"];
 }
 
 # Single sign-on (P3-04): OpenID Connect providers a user may link to
@@ -287,8 +288,8 @@ media {
 
 # Converting for clients that cannot play a file as it is.
 transcode {
-  # "auto" (every family that works), "none" (software only), or
-  # families in order of preference: "nvenc,vaapi".
+  # "auto" (every family that works), "none" (software only), or a list
+  # of families in order of preference: ["nvenc", "vaapi"].
   hardware = "auto";
   vaapi_device = "/dev/dri/renderD128";
   # The encode budget: how many software video encodes (libx264) run at
@@ -368,9 +369,9 @@ telemetry {
     # endpoint = "http://alloy.lan:4317";
     # "grpc" or "http" (protobuf).
     protocol = "grpc";
-    # Sent with every export, name=value pairs, comma-separated; never
+    # Sent with every export, a table of header name to value; never
     # logged.
-    # headers = "x-scope-orgid=home";
+    # headers { x-scope-orgid = "home"; }
     traces = true;
     metrics = true;
     logs = true;

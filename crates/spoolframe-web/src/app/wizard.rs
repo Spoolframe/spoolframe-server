@@ -50,16 +50,32 @@ pub(super) fn entry<'s>(settings: &'s Settings, key: &str) -> Option<&'s Setting
 /// A setting's value as a field shows it: a string as it is, a number as
 /// its digits, nothing as nothing.
 pub(super) fn text(settings: &Settings, key: &str) -> String {
-    match entry(settings, key).and_then(|e| e.value.as_ref()) {
+    match value(settings, key) {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Null) | None => String::new(),
         Some(other) => other.to_string(),
     }
 }
 
+/// A setting's value, if it has one.
+pub(super) fn value<'s>(settings: &'s Settings, key: &str) -> Option<&'s Value> {
+    entry(settings, key).and_then(|e| e.value.as_ref())
+}
+
+/// A list setting's entries; an entry that is not a string is left out.
+pub(super) fn strings(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        Value::String(s) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
 pub(super) fn flag(settings: &Settings, key: &str) -> bool {
-    entry(settings, key)
-        .and_then(|e| e.value.as_ref())
+    value(settings, key)
         .and_then(Value::as_bool)
         .unwrap_or(false)
 }
@@ -1481,10 +1497,10 @@ fn PlaybackFields(
     on_reload: EventHandler<()>,
 ) -> Element {
     let mut hardware =
-        use_signal(|| Hardware::from_setting(&text(&settings, "transcode.hardware")));
+        use_signal(|| Hardware::from_setting(value(&settings, "transcode.hardware")));
     let mut order =
         use_signal(
-            || match Hardware::from_setting(&text(&settings, "transcode.hardware")) {
+            || match Hardware::from_setting(value(&settings, "transcode.hardware")) {
                 Hardware::Ordered(list) => list,
                 _ => "nvenc, vaapi".to_owned(),
             },
@@ -1517,7 +1533,7 @@ fn PlaybackFields(
                 other => other,
             };
             Ok(vec![
-                ("transcode.hardware", Some(json!(chosen.setting()))),
+                ("transcode.hardware", Some(chosen.setting())),
                 ("transcode.max_jobs", number("Encode budget", &jobs())?),
                 ("transcode.scratch_limit_mb", scratch),
                 ("transcode.read_ahead_secs", number("Read ahead", &ahead())?),
@@ -1788,7 +1804,13 @@ fn AccessFields(
     on_reload: EventHandler<()>,
 ) -> Element {
     let public_url = use_signal(|| text(&settings, "admin.public_url"));
-    let proxies = use_signal(|| text(&settings, "admin.trusted_proxies"));
+    // A list setting typed as one field: "127.0.0.1, 10.0.0.0/8".
+    let proxies = use_signal(|| {
+        value(&settings, "admin.trusted_proxies")
+            .map(strings)
+            .unwrap_or_default()
+            .join(", ")
+    });
     // P6-02: the wizard's remote choice, saved with the rest on Continue.
     let remote = use_signal(|| super::remote::WizardRemote::from_settings(&settings));
     let mut error = use_signal(|| None::<String>);
@@ -1805,7 +1827,12 @@ fn AccessFields(
         spawn(async move {
             let mut changes = vec![
                 ("admin.public_url", typed(&public_url())),
-                ("admin.trusted_proxies", typed(&proxies())),
+                (
+                    "admin.trusted_proxies",
+                    Some(crate::logic::entries(&proxies()))
+                        .filter(|list| !list.is_empty())
+                        .map(|list| json!(list)),
+                ),
             ];
             if mode == Mode::Wizard {
                 match remote.read().setting() {
@@ -2108,7 +2135,7 @@ pub fn DoneCard() -> Element {
         .as_ref()
         .map(|s| {
             setup::playback_summary(
-                &Hardware::from_setting(&text(s, "transcode.hardware")),
+                &Hardware::from_setting(value(s, "transcode.hardware")),
                 encoders.as_deref(),
                 text(s, "transcode.max_jobs").parse().unwrap_or(2),
             )

@@ -227,6 +227,8 @@ async fn the_limits_and_pool_checks_pass_in_one_run() {
         .expect("the probe runs");
     let summary = spoolframe_probe::summary(&report);
     assert_eq!(status(&report, "sign-in-limits"), Status::Pass, "{summary}");
+    // P6-07: wrong invite codes are counted before they are checked.
+    assert_eq!(status(&report, "invite-limits"), Status::Pass, "{summary}");
     assert_eq!(status(&report, "anonymous-pool"), Status::Pass, "{summary}");
     server.stop().await;
 }

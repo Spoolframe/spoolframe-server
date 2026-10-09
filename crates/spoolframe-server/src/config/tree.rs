@@ -180,22 +180,30 @@ fn write_table(out: &mut String, table: &Table, depth: usize) {
 }
 
 /// Every leaf of `table` with its dotted key (`plex.url`), in key order.
-/// An array is a leaf: it is set and replaced whole.
+/// An array is a leaf: it is set and replaced whole. So is an object that
+/// is one setting (`network.wan`).
 pub fn leaves(table: &Table) -> Vec<(String, &Value)> {
     let mut out = Vec::new();
     collect(table, "", &mut out);
     out
 }
 
+/// `prefix.key`, or `key` at the top.
+pub fn join(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
 fn collect<'t>(table: &'t Table, prefix: &str, out: &mut Vec<(String, &'t Value)>) {
     for (k, v) in table {
-        let path = if prefix.is_empty() {
-            k.clone()
-        } else {
-            format!("{prefix}.{k}")
-        };
+        let path = join(prefix, k);
         match v {
-            Value::Object(inner) => collect(inner, &path, out),
+            Value::Object(inner) if super::settings::setting(&path).is_none() => {
+                collect(inner, &path, out)
+            }
             leaf => out.push((path, leaf)),
         }
     }

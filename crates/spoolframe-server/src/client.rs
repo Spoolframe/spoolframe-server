@@ -47,7 +47,7 @@ use crate::device_sign_in::{self, ClaimError, Outcome, Waiting};
 use crate::encode::job::{EncodeJob, JobError, Progress};
 use crate::encode::{Conversion, ConversionSource, hls};
 use crate::events::{Addresses, EventStreams};
-use crate::network::{ConnectionAuth, Connections, ServerName, Services};
+use crate::network::{Connections, ServerName, Services};
 use crate::passkeys::{CeremonyError, SignInError};
 use crate::planner;
 use crate::playback::{Changed, FileId, Opened, Playback, Playbacks, Refusal, Sidecar, Using};
@@ -678,7 +678,7 @@ impl ClientProtocol {
                             remembered = handover.remembered,
                             "device signed in by approval"
                         );
-                        self.signed_in(connection);
+                        self.signed_in(connection, &handover.token.0).await;
                         Ok(Reply::LoggedIn {
                             session: SessionId(handover.token.0),
                             remembered: handover.remembered,
@@ -808,7 +808,7 @@ impl ClientProtocol {
         {
             Ok(Some(user)) => {
                 state.locks.lock().learn(&session, user.pin_required);
-                state.peer.note_signed_in();
+                state.peer.note_signed_in(Some(&user.username));
                 Ok((session, user))
             }
             Ok(None) => Err(Error::Unauthenticated),
@@ -1162,7 +1162,12 @@ impl ClientProtocol {
     /// ([`crate::refusals`]). The frame is read again, and whose session
     /// it named looked up, only then: a flood costs a counter each.
     async fn refused(&self, connection: &Connection, frame: Frame<'_>, error: &Error) {
+        // A working invite code with a username taken or not acceptable is
+        // a refused redemption too (P6-07, glm E-8); elsewhere those
+        // answers are a form's, not refusals.
+        let redeeming = matches!(frame, Frame::Rpc(_, "redeem_invite"));
         let kind = match error {
+            Error::UsernameTaken | Error::InvalidInput { .. } if redeeming => Kind::SignInFailed,
             Error::Unauthenticated => Kind::Unauthenticated,
             Error::ProfileLocked => Kind::ProfileLocked,
             Error::RecentSignInRequired => Kind::RecentSignInRequired,
@@ -1201,6 +1206,9 @@ impl ClientProtocol {
             Kind::SignInFailed if asked.invite => match error {
                 Error::InviteExpired => (kind, "invite expired"),
                 Error::InviteExhausted => (kind, "invite used up"),
+                Error::UsernameTaken => (kind, "username taken"),
+                // Its message may quote what was typed: not logged.
+                Error::InvalidInput { .. } => (kind, "username or password not acceptable"),
                 _ => (kind, "wrong or revoked invite code"),
             },
             Kind::SignInFailed => match (&asked.username, asked.credential) {
@@ -2559,7 +2567,7 @@ impl ClientProtocol {
                     remembered = done.remembered,
                     "logged in"
                 );
-                self.signed_in(connection);
+                self.signed_in(connection, &done.token.0).await;
                 Ok(Reply::LoggedIn {
                     session: SessionId(done.token.0),
                     remembered: done.remembered,
@@ -2599,7 +2607,7 @@ impl ClientProtocol {
             %role,
             "an account was made with an invite"
         );
-        self.signed_in(connection);
+        self.signed_in(connection, &token.0).await;
         Ok(Reply::LoggedIn {
             session: SessionId(token.0),
             remembered: false,
@@ -2645,7 +2653,7 @@ impl ClientProtocol {
             remembered,
             "logged in with an app passkey"
         );
-        self.signed_in(connection);
+        self.signed_in(connection, &token.0).await;
         Ok(Reply::LoggedIn {
             session: SessionId(token.0),
             remembered,
@@ -2676,7 +2684,7 @@ impl ClientProtocol {
         match self.services.auth.resume(user, &binding).await {
             Ok(Some(token)) => {
                 tracing::info!(endpoint = %endpoint_id, user = %user, "resumed on a trusted device");
-                self.signed_in(connection);
+                self.signed_in(connection, &token.0).await;
                 Ok(Reply::LoggedIn {
                     session: SessionId(token.0),
                     remembered: true,
@@ -3068,8 +3076,19 @@ impl ClientProtocol {
 
     /// `connection`'s device signed in: each of its connections gets the
     /// normal limits and is told the server's addresses.
-    fn signed_in(&self, connection: &Connection) {
-        for id in self.connections.signed_in(&connection.remote_id()) {
+    async fn signed_in(&self, connection: &Connection, session: &str) {
+        // Whose session it is, for the log when the connection closes.
+        let user = match self.services.auth.session_owner(session).await {
+            Ok(owner) => owner.map(|owner| owner.username),
+            Err(e) => {
+                tracing::debug!(error = %e, "cannot look up whose session it is");
+                None
+            }
+        };
+        for id in self
+            .connections
+            .signed_in(&connection.remote_id(), user.as_deref())
+        {
             self.addresses.tell(id);
         }
     }
@@ -3095,9 +3114,9 @@ impl ClientProtocol {
 impl ProtocolHandler for ClientProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let id = connection.stable_id();
-        let auth = ConnectionAuth::Anonymous {
-            endpoint: connection.remote_id(),
-        };
+        // Named by its key in the log: who is signed in on it is a matter
+        // of each request's session, not of the connection (P1-12).
+        let endpoint = connection.remote_id();
         // A device with a live session gets the normal limits; any other
         // is a stranger, held only while there is room for one (PX-10).
         let known = match self
@@ -3113,7 +3132,7 @@ impl ProtocolHandler for ClientProtocol {
         };
         let Some(peer) = self.connections.admit(&connection, known) else {
             tracing::info!(
-                ?auth,
+                endpoint = %endpoint.fmt_short(),
                 "refusing a connection: too many devices that are not signed in"
             );
             connection.close(
@@ -3126,7 +3145,7 @@ impl ProtocolHandler for ClientProtocol {
         };
         // Every connection starts anonymous, and most that stay so are an
         // app checking in: INFO is for the sign-in, and the disconnect.
-        tracing::debug!(?auth, known, "client connected");
+        tracing::debug!(endpoint = %endpoint.fmt_short(), known, "client connected");
         let state = Arc::new(ConnectionState {
             number: self.services.playbacks.connection_opened(),
             peer,
@@ -3166,9 +3185,22 @@ impl ProtocolHandler for ClientProtocol {
         self.services.playbacks.connection_closed(state.number);
         let signed_in = state.peer.was_signed_in();
         if signed_in || !hung_up(&reason) {
-            tracing::info!(?auth, %reason, signed_in, paths = %state.paths(), "client disconnected");
+            tracing::info!(
+                endpoint = %endpoint.fmt_short(),
+                users = %state.peer.users(),
+                %reason,
+                signed_in,
+                paths = %state.paths(),
+                "client disconnected"
+            );
         } else {
-            tracing::debug!(?auth, %reason, signed_in, paths = %state.paths(), "client disconnected");
+            tracing::debug!(
+                endpoint = %endpoint.fmt_short(),
+                %reason,
+                signed_in,
+                paths = %state.paths(),
+                "client disconnected"
+            );
         }
         self.end_playbacks_unless_back(connection.remote_id());
         Ok(())

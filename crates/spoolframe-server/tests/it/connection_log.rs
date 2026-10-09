@@ -88,11 +88,17 @@ async fn a_signed_in_connection_s_disconnect_is_info() {
     let phone = server.client().await;
     phone.hello().await;
     phone.login("alice", PASSWORD).await;
+    let short = phone.endpoint.id().fmt_short().to_string();
     phone.close().await;
 
     let line = disconnected(&capture).await;
     assert_eq!(line.level, tracing::Level::INFO, "{line:#?}");
     assert_eq!(line.field("signed_in"), Some("true"), "{line:#?}");
+    // Who it was: the user, and the device by its key. Not `auth`, which
+    // was the connection's state at its start, always anonymous.
+    assert_eq!(line.field("users"), Some("alice"), "{line:#?}");
+    assert_eq!(line.field("endpoint"), Some(short.as_str()), "{line:#?}");
+    assert_eq!(line.field("auth"), None, "{line:#?}");
     // The paths it went by: this machine's own, none a public one.
     let paths = line.field("paths").unwrap_or_default();
     assert!(
@@ -125,6 +131,7 @@ async fn a_connection_that_uses_a_kept_session_is_info() {
     again.conn.close(0u32.into(), b"done");
     let line = disconnected(&capture).await;
     assert_eq!(line.level, tracing::Level::INFO, "{line:#?}");
+    assert_eq!(line.field("users"), Some("alice"), "{line:#?}");
     phone.close().await;
     server.stop().await;
 }

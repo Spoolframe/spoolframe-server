@@ -49,11 +49,11 @@ pub fn is_loopback(entry: &str) -> bool {
 /// The addresses `/metrics` answers, from `admin.metrics_from` (`None`
 /// when nothing sets it: loopback only), loopback first, and added when
 /// the setting left it out.
-pub fn allowed_from(value: Option<&str>) -> Vec<String> {
+pub fn allowed_from(value: Option<&[String]>) -> Vec<String> {
     let listed: Vec<String> = value
         .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
+        .iter()
+        .map(|e| e.trim())
         .filter(|e| !e.is_empty())
         .map(str::to_owned)
         .collect();
@@ -92,11 +92,11 @@ pub fn remove_address(list: &[String], entry: &str) -> Vec<String> {
 
 /// The setting for `list`: `None` for loopback alone, which is what the
 /// server does with nothing set.
-pub fn metrics_from_value(list: &[String]) -> Option<String> {
+pub fn metrics_from_value(list: &[String]) -> Option<Vec<String>> {
     if list.iter().all(|e| is_loopback(e)) {
         return None;
     }
-    Some(list.join(", "))
+    Some(list.to_vec())
 }
 
 /// The refused addresses the tab offers to allow: those not in `list`.
@@ -129,12 +129,14 @@ pub struct HeaderRow {
     pub value: String,
 }
 
-/// `telemetry.otlp.headers` for `rows`, `name=value, …`: `None` with
-/// none, which takes the setting out. `Err` names the header that cannot
-/// be written, never its value.
-pub fn headers_value(rows: &[HeaderRow]) -> Result<Option<String>, String> {
+/// `telemetry.otlp.headers` for `rows`, a table of name to value: `None`
+/// with none, which takes the setting out. `Err` names the header that
+/// cannot be written, never its value.
+pub fn headers_value(
+    rows: &[HeaderRow],
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
     let token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
-    let mut pairs = Vec::new();
+    let mut table = serde_json::Map::new();
     for row in rows {
         let name = row.name.trim();
         let value = row.value.trim();
@@ -146,14 +148,18 @@ pub fn headers_value(rows: &[HeaderRow]) -> Result<Option<String>, String> {
                 "{name:?} is not a header name: letters, digits and - only, such as Authorization."
             ));
         }
-        if value.contains(',') || value.chars().any(char::is_control) {
+        if value.chars().any(char::is_control) {
             return Err(format!(
-                "The value of {name} cannot have a comma or a control character."
+                "The value of {name} cannot have a control character."
             ));
         }
-        pairs.push(format!("{name}={value}"));
+        // A table has one value per name, and HTTP names ignore case.
+        if table.keys().any(|k: &String| k.eq_ignore_ascii_case(name)) {
+            return Err(format!("{name} is there twice: keep one."));
+        }
+        table.insert(name.to_owned(), value.into());
     }
-    Ok((!pairs.is_empty()).then(|| pairs.join(", ")))
+    Ok((!table.is_empty()).then_some(table))
 }
 
 /// How the OTLP export is going.
@@ -324,11 +330,11 @@ mod tests {
     #[test]
     fn loopback_comes_first_and_is_put_back_when_left_out() {
         assert_eq!(
-            allowed_from(Some("10.10.0.2, ::1, 127.0.0.1")),
+            allowed_from(Some(&strings(&["10.10.0.2", "::1", "127.0.0.1"]))),
             strings(&["::1", "127.0.0.1", "10.10.0.2"])
         );
         assert_eq!(
-            allowed_from(Some("10.10.0.2")),
+            allowed_from(Some(&strings(&["10.10.0.2"]))),
             strings(&["127.0.0.0/8", "::1", "10.10.0.2"])
         );
     }
@@ -337,8 +343,8 @@ mod tests {
     fn an_added_address_is_saved_with_loopback() {
         let list = add_address(&allowed_from(None), "10.10.0.2").unwrap();
         assert_eq!(
-            metrics_from_value(&list).as_deref(),
-            Some("127.0.0.0/8, ::1, 10.10.0.2")
+            metrics_from_value(&list),
+            Some(strings(&["127.0.0.0/8", "::1", "10.10.0.2"]))
         );
         assert_eq!(
             add_address(&list, "10.10.0.2").unwrap_err(),
@@ -399,7 +405,22 @@ mod tests {
                 header("", ""),
                 header("x-scope-orgid", "home"),
             ]),
-            Ok(Some("Authorization=Bearer k, x-scope-orgid=home".into()))
+            Ok(Some(
+                serde_json::json!({ "Authorization": "Bearer k", "x-scope-orgid": "home" })
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            ))
+        );
+        // A comma was refused only by the comma-separated string it was.
+        assert_eq!(
+            headers_value(&[header("Accept", "a, b")]),
+            Ok(Some(
+                serde_json::json!({ "Accept": "a, b" })
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            ))
         );
         assert_eq!(headers_value(&[]), Ok(None));
         assert_eq!(headers_value(&[header("", "")]), Ok(None));
@@ -412,11 +433,17 @@ mod tests {
         assert!(!e.contains("s3cr3t"));
         let e = headers_value(&[header("", "s3cr3t")]).unwrap_err();
         assert!(!e.contains("s3cr3t"), "{e}");
-        let e = headers_value(&[header("Authorization", "a,b")]).unwrap_err();
+        let e = headers_value(&[header("Authorization", "s3\u{7}cr3t")]).unwrap_err();
         assert_eq!(
             e,
-            "The value of Authorization cannot have a comma or a control character."
+            "The value of Authorization cannot have a control character."
         );
+        let e = headers_value(&[
+            header("Authorization", "s3cr3t"),
+            header("authorization", "s3cr3t"),
+        ])
+        .unwrap_err();
+        assert_eq!(e, "authorization is there twice: keep one.");
     }
 
     fn status() -> OtlpStatus {

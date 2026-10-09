@@ -44,6 +44,9 @@ pub const CODE_LEN: usize = 12;
 /// are left out, so a link cannot make a client keep or dial without
 /// end.
 pub const MAX_HINTS: usize = 32;
+/// The longest link read, in bytes (P6-07, glm E-4). A QR code holds a
+/// few hundred; a pasted link past this is not one a server wrote.
+pub const MAX_LINK: usize = 4096;
 
 const LINK_PREFIX: &str = "spoolframe://invite?";
 
@@ -145,7 +148,11 @@ impl Invite {
 /// scheme, no `server`, a `server` that is not a key, or a `cap` that is
 /// not a code (a damaged link, not one without a code).
 pub fn parse_link(text: &str) -> Option<Invite> {
-    let query = text.trim().strip_prefix(LINK_PREFIX)?;
+    let text = text.trim();
+    if text.len() > MAX_LINK {
+        return None;
+    }
+    let query = text.strip_prefix(LINK_PREFIX)?;
     let mut server = None;
     let mut invite = Invite::default();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
@@ -157,7 +164,11 @@ pub fn parse_link(text: &str) -> Option<Invite> {
             ("server", None) => return None,
             ("cap", Some(value)) => invite.code = Some(normalize_code(&value)?),
             ("cap", None) => return None,
-            ("name", Some(value)) => invite.name = Some(value),
+            // Shown in the join form: cut as a device's name is (PX-10).
+            ("name", Some(mut value)) => {
+                crate::messages::cut(&mut value);
+                invite.name = Some(value);
+            }
             ("addr", Some(value)) if invite.addrs.len() < MAX_HINTS => {
                 if let Ok(addr) = value.parse() {
                     invite.addrs.push(addr);
@@ -191,8 +202,9 @@ pub fn parse_link(text: &str) -> Option<Invite> {
 }
 
 /// Whether `value` may be a relay's URL: `https://` or `http://` and a
-/// host, and nothing an opener could read another way.
-fn is_relay_url(value: &str) -> bool {
+/// host, and nothing an opener could read another way. The SDK holds a
+/// server's pushed relays and lookup to it as well (P6-07, glm E-3).
+pub fn is_relay_url(value: &str) -> bool {
     let rest = value
         .strip_prefix("https://")
         .or_else(|| value.strip_prefix("http://"));
@@ -247,6 +259,19 @@ fn decode(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P6-07, glm E-4: a pasted link past MAX_LINK is not read, and the
+    /// name shown from one is cut as a device's name is.
+    #[test]
+    fn a_link_too_long_is_not_read_and_a_long_name_is_cut() {
+        let key = "ab".repeat(32);
+        let name = "x".repeat(500);
+        let link = format!("{LINK_PREFIX}server={key}&name={name}");
+        let invite = parse_link(&link).unwrap();
+        assert_eq!(invite.name.unwrap().chars().count(), crate::MAX_HELLO_TEXT);
+        let padded = format!("{link}&pad={}", "y".repeat(MAX_LINK));
+        assert_eq!(parse_link(&padded), None);
+    }
 
     const SERVER: &str = "3f9a1c7e5b2d8a04e6c1f7b39d52a8e0c4b6f1a2d3e5c7b9a1f0e2d4c6b8a0f1";
 

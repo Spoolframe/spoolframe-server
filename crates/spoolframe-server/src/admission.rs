@@ -115,6 +115,9 @@ pub(crate) struct Peer {
     /// session used on it. Unlike `known`, not set for a device that only
     /// has a session: what the log names at INFO.
     signed_in_here: AtomicBool,
+    /// Who signed in on it, or whose session it used: what the log names
+    /// when it closes.
+    users: parking_lot::Mutex<std::collections::BTreeSet<String>>,
     /// Signed out: closing once its streams are answered.
     closing: AtomicBool,
     /// How many of its streams are being answered.
@@ -137,6 +140,7 @@ impl Peer {
             connection: connection.clone(),
             known: AtomicBool::new(false),
             signed_in_here: AtomicBool::new(false),
+            users: parking_lot::Mutex::default(),
             closing: AtomicBool::new(false),
             streams: watch::Sender::new(0),
         }
@@ -165,9 +169,26 @@ impl Peer {
     }
 
     /// The connection was signed in: its device signed in while it was
-    /// open, or a session was used on it.
-    pub(crate) fn note_signed_in(&self) {
+    /// open, or a session was used on it; by `user`, when it is known.
+    pub(crate) fn note_signed_in(&self, user: Option<&str>) {
         self.signed_in_here.store(true, Ordering::Release);
+        if let Some(user) = user {
+            let mut users = self.users.lock();
+            // Every request names its user: allocate only for a new one.
+            if !users.contains(user) {
+                users.insert(user.to_owned());
+            }
+        }
+    }
+
+    /// Who was signed in on the connection, comma-separated: for the log.
+    pub fn users(&self) -> String {
+        let users = self.users.lock();
+        users
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     /// Whether the connection was signed in at any point

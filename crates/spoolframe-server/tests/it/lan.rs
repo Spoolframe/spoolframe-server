@@ -569,3 +569,42 @@ async fn a_client_with_discovery_off_hears_no_server() {
     listening.close().await;
     server.stop().await;
 }
+
+/// P1-18 with remote access on (P6-07): a server with a public address,
+/// relays and a pkarr record configured, none of which it can reach, as
+/// on a LAN whose Internet is down. Turning remote access on must not
+/// cost the LAN anything: the server starts, is heard, is pinned, and a
+/// user signs in and is answered, all over the LAN.
+#[tokio::test]
+async fn with_remote_access_on_and_no_internet_the_lan_still_works() {
+    if !private_lan("with_remote_access_on_and_no_internet_the_lan_still_works") {
+        return;
+    }
+    use spoolframe_server::network::{Pkarr, Relay};
+    let options = ServerOptions {
+        wan: Some(spoolframe_server::wan::Wan {
+            statics: vec!["203.0.113.7:7420".parse().unwrap()],
+            mapped_port: None,
+        }),
+        relays: vec![
+            Relay::Default,
+            Relay::Custom("https://relay.example.org".parse().unwrap()),
+        ],
+        pkarr: Pkarr::N0,
+        ..on_lan("Den")
+    };
+    let server = TestServer::start_with(fresh_dir("remote-no-internet").await, options).await;
+    server.add_user("alice", "battery staple", None).await;
+
+    let client = open(&Arc::new(MemoryStorage::default())).await;
+    let heard = entry(&client, &server, |e| e.on_network).await;
+    client.connect(&heard.endpoint_id).await.unwrap();
+    client.pin(&heard.endpoint_id, true).await.unwrap();
+    let session = client
+        .sign_in(&heard.endpoint_id, "alice", "battery staple", false)
+        .await
+        .unwrap();
+    assert_eq!(session.whoami().await.unwrap().username, "alice");
+    client.close().await;
+    server.stop().await;
+}

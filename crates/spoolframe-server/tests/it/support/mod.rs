@@ -370,6 +370,8 @@ pub fn mkv_capabilities() -> ClientCapabilities {
 pub struct ServerOptions {
     pub name: String,
     pub port: Option<u16>,
+    /// `network.ipv6`: on unless a test is about turning it off.
+    pub ipv6: bool,
     pub mdns: bool,
     /// Real ffprobe and ffmpeg, on a file made with [`TestServer::generate_media`],
     /// for converted playback (P2-03). Off: the stand-in ffprobe and its
@@ -444,6 +446,7 @@ impl Default for ServerOptions {
         Self {
             name: "Home Media".into(),
             port: None,
+            ipv6: true,
             mdns: false,
             real_media: false,
             budget: Units::jobs(2),
@@ -479,28 +482,6 @@ impl Default for ServerOptions {
             own_relays: Vec::new(),
             finders: offline_finders(),
         }
-    }
-}
-
-/// A host with these interfaces, as `network.wan.host_ipv6` reads them;
-/// a test changes them with [`FakeHost::set`].
-#[derive(Debug, Default)]
-pub struct FakeHost(parking_lot::Mutex<Vec<spoolframe_server::wan::HostInterface>>);
-
-impl FakeHost {
-    pub fn new(interfaces: Vec<spoolframe_server::wan::HostInterface>) -> Arc<Self> {
-        Arc::new(Self(parking_lot::Mutex::new(interfaces)))
-    }
-
-    pub fn set(&self, interfaces: Vec<spoolframe_server::wan::HostInterface>) {
-        *self.0.lock() = interfaces;
-    }
-}
-
-#[async_trait::async_trait]
-impl spoolframe_server::wan::HostAddresses for FakeHost {
-    async fn interfaces(&self) -> Vec<spoolframe_server::wan::HostInterface> {
-        self.0.lock().clone()
     }
 }
 
@@ -552,13 +533,10 @@ impl spoolframe_server::wan::PortMapper for FakeRouter {
     }
 }
 
-/// Finders that find nothing and reach nothing: a host with no
-/// interfaces, a lookup at a port nothing listens on (discard), and a
-/// router that never answers.
+/// Finders that find nothing and reach nothing: a lookup at a port
+/// nothing listens on (discard), and a router that never answers.
 pub fn offline_finders() -> spoolframe_server::wan::Finders {
     spoolframe_server::wan::Finders {
-        host: FakeHost::new(Vec::new()),
-        host_recheck: Duration::from_millis(50),
         lookup: lookup_at("http://127.0.0.1:9/text", &[]),
         mapper: FakeRouter::new(),
     }
@@ -779,6 +757,7 @@ impl TestServer {
         });
         let endpoint = EndpointOptions {
             port: options.port,
+            ipv6: options.ipv6,
             relays: options.relays.clone(),
             pkarr: options.pkarr.clone(),
             own_relays: options.own_relays.clone(),

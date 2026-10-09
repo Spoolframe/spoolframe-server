@@ -94,19 +94,33 @@ pub enum Hardware {
 }
 
 impl Hardware {
-    pub fn from_setting(value: &str) -> Self {
-        match value.trim() {
-            "auto" | "" => Hardware::Auto,
-            "none" => Hardware::Software,
-            list => Hardware::Ordered(list.to_owned()),
+    /// From the setting: `"auto"`, `"none"`, or a list of families (one
+    /// family alone may be a string). Nothing set is auto.
+    pub fn from_setting(value: Option<&serde_json::Value>) -> Self {
+        use serde_json::Value;
+        match value {
+            None | Some(Value::Null) => Hardware::Auto,
+            Some(Value::String(word)) => match word.trim() {
+                "auto" | "" => Hardware::Auto,
+                "none" => Hardware::Software,
+                family => Hardware::Ordered(family.to_owned()),
+            },
+            Some(Value::Array(list)) => Hardware::Ordered(
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            Some(_) => Hardware::Auto,
         }
     }
 
-    pub fn setting(&self) -> String {
+    /// The setting: a word, or the typed order as a list.
+    pub fn setting(&self) -> serde_json::Value {
         match self {
             Hardware::Auto => "auto".into(),
             Hardware::Software => "none".into(),
-            Hardware::Ordered(list) => list.trim().to_owned(),
+            Hardware::Ordered(list) => crate::logic::entries(list).into(),
         }
     }
 }
@@ -599,14 +613,19 @@ mod tests {
 
     #[test]
     fn hardware_goes_both_ways() {
+        use serde_json::json;
         for (setting, choice) in [
-            ("auto", Hardware::Auto),
-            ("none", Hardware::Software),
-            ("nvenc,vaapi", Hardware::Ordered("nvenc,vaapi".into())),
+            (json!("auto"), Hardware::Auto),
+            (json!("none"), Hardware::Software),
+            (
+                json!(["nvenc", "vaapi"]),
+                Hardware::Ordered("nvenc, vaapi".into()),
+            ),
         ] {
-            assert_eq!(Hardware::from_setting(setting), choice);
+            assert_eq!(Hardware::from_setting(Some(&setting)), choice);
             assert_eq!(choice.setting(), setting);
         }
+        assert_eq!(Hardware::from_setting(None), Hardware::Auto);
     }
 
     #[test]

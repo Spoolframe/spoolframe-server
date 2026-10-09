@@ -26,11 +26,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh::EndpointId;
-use spoolframe_protocol::invite::{Invite, parse_link};
+use spoolframe_protocol::invite::{Invite, MAX_HINTS, parse_link};
 use spoolframe_protocol::{RedeemInvite, Reply, Request, Response, fingerprint};
 use spoolframe_types::Role;
 
-use crate::client::{Client, listed, parse_id, same_server};
+use crate::client::{Client, newest_first, parse_id, same_server};
 use crate::connection::ServerConnection;
 use crate::servers::{self, SavedServer};
 use crate::session::{Session, SignInMethod};
@@ -215,7 +215,7 @@ impl Client {
         if !invite.addrs.is_empty() {
             let mut manual = self.inner.manual.lock();
             let known = manual.remove(&id).unwrap_or_default();
-            manual.insert(id, listed([invite.addrs.clone(), known]));
+            manual.insert(id, newest_first(&invite.addrs, &known, MAX_HINTS));
         }
         if let Some(url) = &invite.lookup {
             self.look_up_at(url);
@@ -226,11 +226,7 @@ impl Client {
         if !invite.relays.is_empty() {
             let mut invited = self.inner.invite_relays.lock();
             let known = invited.entry(id).or_default();
-            for relay in &invite.relays {
-                if !known.contains(relay) {
-                    known.push(relay.clone());
-                }
-            }
+            *known = newest_first(&invite.relays, known, MAX_HINTS);
         }
         self.link(id).connection(self).await
     }

@@ -821,7 +821,7 @@ mod tests {
         assert!(access.allows("127.0.0.1".parse().unwrap()));
         assert!(access.allows("::1".parse().unwrap()));
         assert!(!access.allows("192.0.2.7".parse().unwrap()));
-        access.set(true, "10.0.0.0/8".parse().unwrap());
+        access.set(true, AddressRanges::new(&["10.0.0.0/8"]).unwrap());
         assert!(access.enabled());
         assert!(access.allows("10.1.2.3".parse().unwrap()));
         assert!(!access.allows("127.0.0.1".parse().unwrap()));

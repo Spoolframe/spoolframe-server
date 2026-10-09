@@ -21,12 +21,9 @@ use spoolframe_protocol::streams::uni;
 use spoolframe_server::admin::{self, Origins, TrustedProxies};
 use spoolframe_server::passkeys::Passkeys;
 use spoolframe_server::wan::{
-    Finders, HostInterface, HostIpv6, Lookup, LookupVia, MappedPort, Mapping, Mode, PublicAddr,
-    PublicIp, Source, Wan,
+    Finders, Lookup, LookupVia, MappedPort, Mapping, Mode, PublicAddr, PublicIp, Source, Wan,
 };
-use support::{
-    FakeHost, FakeRouter, ServerOptions, TestClient, TestServer, fresh_dir, mkv_capabilities,
-};
+use support::{FakeRouter, ServerOptions, TestClient, TestServer, fresh_dir, mkv_capabilities};
 use tokio::io::AsyncReadExt;
 
 const PASSWORD: &str = "correct horse";
@@ -37,7 +34,6 @@ fn statics(addrs: &[&str]) -> Wan {
     Wan {
         statics: addrs.iter().map(|a| a.parse().unwrap()).collect(),
         mapped_port: None,
-        host_ipv6: false,
     }
 }
 
@@ -237,26 +233,6 @@ async fn without_wan_nothing_public_is_told_or_listed() {
     server.stop().await;
 }
 
-fn host_v6(addr: &str, temporary: bool) -> HostIpv6 {
-    HostIpv6 {
-        addr: addr.parse().unwrap(),
-        temporary,
-        deprecated: false,
-        tentative: false,
-    }
-}
-
-/// The port a device dials the endpoint's IPv6 socket at.
-fn ipv6_port(server: &TestServer) -> u16 {
-    let addrs: Vec<SocketAddr> = server.server.addr().ip_addrs().copied().collect();
-    addrs
-        .iter()
-        .find(|a| a.is_ipv6())
-        .or_else(|| addrs.first())
-        .expect("an address")
-        .port()
-}
-
 /// The public addresses once they are `wanted`, or after 10 s.
 async fn public_once(
     server: &TestServer,
@@ -270,88 +246,6 @@ async fn public_once(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-}
-
-/// `host_ipv6`: the host's stable global address is advertised on the
-/// endpoint's port, and its privacy address beside it is not.
-#[tokio::test]
-async fn host_ipv6_advertises_the_stable_address_and_not_the_temporary_one() {
-    let host = FakeHost::new(vec![HostInterface {
-        name: "enp5s0".into(),
-        up: true,
-        ipv6: vec![
-            host_v6("2001:db8:1::5", false),
-            host_v6("2001:db8:1::abcd:1234", true),
-        ],
-    }]);
-    let options = ServerOptions {
-        wan: Some(Wan {
-            host_ipv6: true,
-            ..statics(&[])
-        }),
-        finders: Finders {
-            host,
-            ..support::offline_finders()
-        },
-        ..ServerOptions::default()
-    };
-    let server = TestServer::start_with(fresh_dir("wan-host-ipv6").await, options).await;
-    let port = ipv6_port(&server);
-    let found = public_once(&server, |found| !found.is_empty()).await;
-    assert_eq!(
-        found,
-        [PublicAddr {
-            addr: SocketAddr::new("2001:db8:1::5".parse().unwrap(), port),
-            source: Source::HostIpv6,
-        }]
-    );
-    let status = status(&server).await;
-    assert_eq!(
-        status.public_addresses,
-        [PublicAddress {
-            address: format!("[2001:db8:1::5]:{port}"),
-            source: AddressSource::HostIpv6,
-        }]
-    );
-    server.stop().await;
-}
-
-/// A host with no stable global IPv6 address advertises none, and the
-/// status says why.
-#[tokio::test]
-async fn host_ipv6_without_a_stable_address_says_so() {
-    let host = FakeHost::new(vec![HostInterface {
-        name: "enp5s0".into(),
-        up: true,
-        ipv6: vec![
-            host_v6("2001:db8:1::abcd:1234", true),
-            host_v6("fd00::5", false),
-        ],
-    }]);
-    let options = ServerOptions {
-        wan: Some(Wan {
-            host_ipv6: true,
-            ..statics(&[])
-        }),
-        finders: Finders {
-            host,
-            ..support::offline_finders()
-        },
-        ..ServerOptions::default()
-    };
-    let server = TestServer::start_with(fresh_dir("wan-host-ipv6-none").await, options).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while server.server.told().public().notes().is_empty() {
-        assert!(tokio::time::Instant::now() < deadline, "no note");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let status = status(&server).await;
-    assert_eq!(status.public_addresses, []);
-    assert_eq!(
-        status.public_notes,
-        ["host_ipv6: this host has no stable global IPv6 address to advertise"]
-    );
-    server.stop().await;
 }
 
 /// A stand-in for wtfismyip answering `body` to every GET of /text.
@@ -609,7 +503,6 @@ async fn server_asking(
         finders: Finders {
             lookup,
             mapper: router,
-            ..support::offline_finders()
         },
         ..ServerOptions::default()
     };
@@ -855,43 +748,6 @@ async fn a_lookup_that_succeeds_later_is_pushed_to_signed_in_devices() {
     server.stop().await;
 }
 
-/// The host's IPv6 addresses changing (a new delegated prefix) is pushed.
-#[tokio::test]
-async fn a_change_of_the_host_ipv6_addresses_is_pushed_to_signed_in_devices() {
-    let interface = |addr: &str| HostInterface {
-        name: "enp5s0".into(),
-        up: true,
-        ipv6: vec![host_v6(addr, false)],
-    };
-    let host = FakeHost::new(vec![interface("2001:db8:1::5")]);
-    let options = ServerOptions {
-        wan: Some(Wan {
-            host_ipv6: true,
-            ..statics(&[])
-        }),
-        finders: Finders {
-            host: host.clone(),
-            ..support::offline_finders()
-        },
-        ..ServerOptions::default()
-    };
-    let server = TestServer::start_with(fresh_dir("wan-push-ipv6").await, options).await;
-    server.add_user("alice", PASSWORD, None).await;
-    let port = ipv6_port(&server);
-    let old = SocketAddr::new("2001:db8:1::5".parse().unwrap(), port);
-    let new = SocketAddr::new("2001:db8:2::5".parse().unwrap(), port);
-    public_once(&server, |found| !found.is_empty()).await;
-    let client = server.client().await;
-    let (mut events, first) = signed_in(&client).await;
-    assert!(first.contains(&old), "{first:?}");
-
-    host.set(vec![interface("2001:db8:2::5")]);
-    let pushed = next_addresses(&mut events).await.expect("a second push");
-    assert!(pushed.contains(&new), "{pushed:?}");
-    assert!(!pushed.contains(&old), "{pushed:?}");
-    server.stop().await;
-}
-
 /// The wizard tries the router before `mode = "auto"` is chosen: the
 /// router's answer comes back, for the server's own port.
 #[tokio::test]
@@ -930,28 +786,17 @@ async fn the_wizard_tries_the_router_and_hears_its_answer() {
     server.stop().await;
 }
 
-/// The wizard looks the public IP up before it is chosen, and reads the
-/// host's stable IPv6 addresses.
+/// The wizard looks the public IP up before it is chosen.
 #[tokio::test]
-async fn the_wizard_looks_the_ip_up_and_reads_the_host_s_ipv6() {
+async fn the_wizard_looks_the_ip_up() {
     let server = server_with("wan-try-lookup", None).await;
     let service = lookup_service(200, "203.0.113.24\n").await;
-    let host = FakeHost::new(vec![HostInterface {
-        name: "enp5s0".into(),
-        up: true,
-        ipv6: vec![
-            host_v6("2001:db8:4a1::20", false),
-            host_v6("2001:db8:4a1::beef", true),
-        ],
-    }]);
     let finders = Finders {
-        host,
         lookup: support::lookup_at(&text_url(&service), &[]),
         ..support::offline_finders()
     };
     let admin = admin_of(&server, finders).await;
     assert_eq!(admin.wan_lookup().await.unwrap(), "203.0.113.24");
-    assert_eq!(admin.wan_host_ipv6().await.unwrap(), ["2001:db8:4a1::20"]);
 
     let failing = lookup_service(200, "10.0.0.1").await;
     let finders = Finders {

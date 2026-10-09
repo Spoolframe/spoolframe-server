@@ -6693,7 +6693,6 @@ dependencies = [
  "jsonrpsee",
  "libc",
  "m3u8-rs",
- "netwatch",
  "openidconnect",
  "opentelemetry",
  "opentelemetry-appender-tracing",

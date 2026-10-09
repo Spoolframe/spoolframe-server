@@ -14,6 +14,7 @@ pub mod secrets;
 pub mod settings;
 pub mod tree;
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
@@ -359,7 +360,7 @@ pub struct TelemetryConfig {
 }
 
 /// `otlp { endpoint = "http://alloy:4317"; protocol = "grpc";
-/// headers = "x-scope-orgid=home"; traces = true; metrics = true;
+/// headers { x-scope-orgid = "home"; } traces = true; metrics = true;
 /// logs = true; }`, all optional: without an endpoint nothing is exported.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
@@ -371,10 +372,10 @@ pub struct OtlpConfig {
     /// `grpc` (the default) or `http` (protobuf).
     #[ucl(default)]
     pub protocol: Option<String>,
-    /// Sent with every export, as `name=value` pairs, comma-separated (the
-    /// format of OTEL_EXPORTER_OTLP_HEADERS). Never logged.
-    #[ucl(default)]
-    pub headers: Option<String>,
+    /// Sent with every export: a table of header name to value, as
+    /// `headers { authorization = "Bearer …"; }`. Never logged.
+    #[ucl(default, map = "otlp_headers")]
+    pub headers: Option<OtlpHeaders>,
     /// Each signal, on unless set to false.
     #[ucl(default)]
     pub traces: Option<bool>,
@@ -415,36 +416,19 @@ impl OtlpConfig {
                 ));
             }
         };
-        let mut headers = Vec::new();
-        for pair in self.headers.as_deref().unwrap_or_default().split(',') {
-            let pair = pair.trim();
-            if pair.is_empty() {
-                continue;
-            }
-            // The value is never in a message: it may be a key.
-            let Some((name, value)) = pair.split_once('=') else {
+        let headers = match &self.headers {
+            None => Vec::new(),
+            // The name=value string it was before it took a table; never
+            // echoed, as it may carry a key.
+            Some(OtlpHeaders::Text) => {
                 return Err(invalid(
                     "telemetry.otlp.headers",
-                    "each header is name=value".into(),
-                ));
-            };
-            let name = name.trim();
-            let token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
-            if name.is_empty() || !name.chars().all(token) {
-                return Err(invalid(
-                    "telemetry.otlp.headers",
-                    format!("{name:?} is not a header name"),
+                    "a table now, one header each, as headers { authorization = \"Bearer …\"; }"
+                        .into(),
                 ));
             }
-            let value = value.trim();
-            if value.chars().any(|c| c.is_control()) {
-                return Err(invalid(
-                    "telemetry.otlp.headers",
-                    format!("the value of {name:?} has a control character"),
-                ));
-            }
-            headers.push((name.to_owned(), value.to_owned()));
-        }
+            Some(OtlpHeaders::Table(table)) => otlp_header_list(table)?,
+        };
         Ok(Some(OtlpSettings {
             endpoint: endpoint.to_owned(),
             protocol,
@@ -454,6 +438,50 @@ impl OtlpConfig {
             logs: self.logs.unwrap_or(true),
         }))
     }
+}
+
+/// `telemetry.otlp.headers` as written: a table, or the string it was
+/// before. The string is not kept: it may carry a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtlpHeaders {
+    Table(HashMap<String, String>),
+    Text,
+}
+
+fn otlp_headers(
+    object: uclicious::ObjectRef,
+) -> Result<Option<OtlpHeaders>, uclicious::ObjectError> {
+    if !object.is_object() {
+        return Ok(Some(OtlpHeaders::Text));
+    }
+    let table: HashMap<String, String> = uclicious::FromObject::try_from(object)?;
+    Ok(Some(OtlpHeaders::Table(table)))
+}
+
+/// The headers, checked and sorted by name. The value is never in a
+/// message: it may be a key.
+fn otlp_header_list(table: &HashMap<String, String>) -> Result<Vec<(String, String)>, ConfigError> {
+    let invalid = |message: String| ConfigError::Invalid {
+        key: "telemetry.otlp.headers",
+        message,
+    };
+    let token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    let mut headers = Vec::with_capacity(table.len());
+    for (name, value) in table {
+        let name = name.trim();
+        if name.is_empty() || !name.chars().all(token) {
+            return Err(invalid(format!("{name:?} is not a header name")));
+        }
+        // Before trimming: a trailing newline is a control character too.
+        if value.chars().any(|c| c.is_control()) {
+            return Err(invalid(format!(
+                "the value of {name:?} has a control character"
+            )));
+        }
+        headers.push((name.to_owned(), value.trim().to_owned()));
+    }
+    headers.sort();
+    Ok(headers)
 }
 
 /// `setup { done = ["admin", "server"]; finished = false; }`: written by
@@ -650,18 +678,18 @@ impl PreviewsConfig {
     }
 }
 
-/// `transcode { hardware = "nvenc,vaapi"; vaapi_device = "/dev/dri/renderD128";
+/// `transcode { hardware = ["nvenc", "vaapi"]; vaapi_device = "/dev/dri/renderD128";
 /// max_jobs = 2; max_remux = 32; max_gpu_jobs = 3; scratch_dir = "…";
 /// scratch_limit_mb = 20480; read_ahead_secs = 60; gpu_filters = false; }`,
 /// all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct TranscodeConfig {
-    /// `auto` (every family that works), `none` for software only, or
-    /// families in order of preference, comma-separated: `nvenc,vaapi`
+    /// `"auto"` (every family that works), `"none"` for software only, or
+    /// a list of families in order of preference: `["nvenc", "vaapi"]`
     /// encodes on NVIDIA what it can and the rest on VA-API.
-    #[ucl(default)]
-    pub hardware: Option<String>,
+    #[ucl(default, map = "hardware_setting")]
+    pub hardware: Option<HardwareSetting>,
     #[ucl(default)]
     pub vaapi_device: Option<PathBuf>,
     /// The encode budget, in software video encodes; 2 if left out. A
@@ -691,6 +719,54 @@ pub struct TranscodeConfig {
     /// can, rather than on the CPU; off if left out.
     #[ucl(default)]
     pub gpu_filters: Option<bool>,
+}
+
+/// `transcode.hardware` as written: a word, or a list of families.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HardwareSetting {
+    /// `"auto"`, `"none"`, or one family alone.
+    Word(String),
+    List(Vec<String>),
+}
+
+fn hardware_setting(
+    object: uclicious::ObjectRef,
+) -> Result<Option<HardwareSetting>, uclicious::ObjectError> {
+    if object.is_array() {
+        let list: Vec<String> = uclicious::FromObject::try_from(object)?;
+        return Ok(Some(HardwareSetting::List(list)));
+    }
+    let word: String = uclicious::FromObject::try_from(object)?;
+    Ok(Some(HardwareSetting::Word(word)))
+}
+
+/// `transcode.hardware`'s families, in order; each at most once.
+/// `transcode.hardware`'s key, for its messages.
+const HARDWARE: &str = "transcode.hardware";
+
+fn hardware_order(names: &[&str]) -> Result<HardwarePolicy, ConfigError> {
+    let invalid = |message: String| ConfigError::Invalid {
+        key: HARDWARE,
+        message,
+    };
+    let mut order = Vec::new();
+    for &name in names {
+        let family = match name {
+            "vaapi" => Hardware::Vaapi,
+            "nvenc" => Hardware::Nvenc,
+            "qsv" => Hardware::Qsv,
+            other => {
+                return Err(invalid(format!(
+                    "{other:?}: expected \"auto\", \"none\", or a list of vaapi, nvenc and qsv"
+                )));
+            }
+        };
+        if order.contains(&family) {
+            return Err(invalid(format!("{name:?} is listed twice")));
+        }
+        order.push(family);
+    }
+    Ok(HardwarePolicy::Ordered(order))
 }
 
 impl TranscodeConfig {
@@ -723,32 +799,17 @@ impl TranscodeConfig {
     }
 
     pub fn settings(&self) -> Result<TranscodeSettings, ConfigError> {
-        let invalid = |message: String| ConfigError::Invalid {
-            key: "transcode.hardware",
-            message,
-        };
-        let hardware = match self.hardware.as_deref().unwrap_or("auto").trim() {
-            "auto" => HardwarePolicy::Auto,
-            "none" => HardwarePolicy::None,
-            list => {
-                let mut order = Vec::new();
-                for name in list.split(',').map(str::trim) {
-                    let family = match name {
-                        "vaapi" => Hardware::Vaapi,
-                        "nvenc" => Hardware::Nvenc,
-                        "qsv" => Hardware::Qsv,
-                        other => {
-                            return Err(invalid(format!(
-                                "{other:?}: expected auto, none, or a list of vaapi, nvenc and qsv"
-                            )));
-                        }
-                    };
-                    if order.contains(&family) {
-                        return Err(invalid(format!("{name:?} is listed twice")));
-                    }
-                    order.push(family);
-                }
-                HardwarePolicy::Ordered(order)
+        const EXAMPLE: &str = r#"["nvenc", "vaapi"]"#;
+        let hardware = match &self.hardware {
+            None => HardwarePolicy::Auto,
+            Some(HardwareSetting::Word(word)) => match word.trim() {
+                "auto" => HardwarePolicy::Auto,
+                "none" => HardwarePolicy::None,
+                // One family alone; the old comma string is refused here.
+                _ => hardware_order(&one_each(HARDWARE, std::slice::from_ref(word), EXAMPLE)?)?,
+            },
+            Some(HardwareSetting::List(list)) => {
+                hardware_order(&one_each(HARDWARE, list, EXAMPLE)?)?
             }
         };
         let defaults = TranscodeSettings::default();
@@ -779,7 +840,7 @@ impl ArtworkConfig {
 }
 
 /// `admin { listen = "0.0.0.0:7421"; public_url = "https://media.example.org";
-/// trusted_proxies = "10.0.0.5, 172.17.0.0/16"; insecure_cookies = false; }`,
+/// trusted_proxies = ["10.0.0.5", "172.17.0.0/16"]; insecure_cookies = false; }`,
 /// all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
@@ -798,15 +859,15 @@ pub struct AdminConfig {
     /// (the log names each at start).
     #[ucl(default)]
     pub public_url: Option<String>,
-    /// The reverse proxies in front of the listener, as addresses and CIDR
-    /// ranges, comma-separated. A connection from one of them is counted
+    /// The reverse proxies in front of the listener: a list of addresses
+    /// and CIDR ranges. A connection from one of them is counted
     /// by the failure limit under the caller its `X-Forwarded-For` names
     /// (the right-most address that is not a trusted proxy; `Forwarded` is
     /// not read), and under no address if it names none. Left out, no
     /// header is read: every connection counts under its own address, and
     /// a loopback one under none.
     #[ucl(default)]
-    pub trusted_proxies: Option<String>,
+    pub trusted_proxies: Option<Vec<String>>,
     /// Nothing proxies to this listener: a loopback caller is on this
     /// host, or comes through an SSH tunnel. Only read with a public URL
     /// and no `trusted_proxies`: a loopback listener then means a proxy
@@ -825,12 +886,35 @@ pub struct AdminConfig {
     /// out: the listener says nothing about it.
     #[ucl(default)]
     pub metrics: Option<bool>,
-    /// The addresses and CIDR ranges `GET /metrics` answers,
-    /// comma-separated; loopback if left out, so a scraper on the same
+    /// The addresses and CIDR ranges `GET /metrics` answers, a list;
+    /// loopback if left out, so a scraper on the same
     /// host works and nobody else does. Behind a trusted proxy, the
     /// address it forwards for.
     #[ucl(default)]
-    pub metrics_from: Option<String>,
+    pub metrics_from: Option<Vec<String>>,
+}
+
+/// A list setting's entries, trimmed. One with a comma in it is the
+/// comma-separated string these settings were before they were lists,
+/// refused with how to write it as one: `example`.
+fn one_each<'a>(
+    key: &'static str,
+    entries: &'a [String],
+    example: &str,
+) -> Result<Vec<&'a str>, ConfigError> {
+    entries
+        .iter()
+        .map(|entry| {
+            let entry = entry.trim();
+            if entry.contains(',') {
+                return Err(ConfigError::Invalid {
+                    key,
+                    message: format!("{entry:?}: a list now, one entry each, as {example}"),
+                });
+            }
+            Ok(entry)
+        })
+        .collect()
 }
 
 impl AdminConfig {
@@ -861,13 +945,13 @@ impl AdminConfig {
 
     /// The proxies whose `X-Forwarded-For` is believed; none if left out.
     pub fn trusted_proxies(&self) -> Result<crate::admin::TrustedProxies, ConfigError> {
+        const KEY: &str = "admin.trusted_proxies";
         let Some(list) = &self.trusted_proxies else {
             return Ok(crate::admin::TrustedProxies::default());
         };
-        list.parse().map_err(|message| ConfigError::Invalid {
-            key: "admin.trusted_proxies",
-            message,
-        })
+        let entries = one_each(KEY, list, r#"["127.0.0.1", "10.0.0.0/8"]"#)?;
+        crate::admin::TrustedProxies::new(&entries)
+            .map_err(|message| ConfigError::Invalid { key: KEY, message })
     }
 
     pub fn metrics(&self) -> bool {
@@ -880,14 +964,13 @@ impl AdminConfig {
 
     /// Who may read `GET /metrics`.
     pub fn metrics_from(&self) -> Result<crate::admin::AddressRanges, ConfigError> {
-        let list = self
-            .metrics_from
-            .as_deref()
-            .unwrap_or(crate::admin::AddressRanges::LOOPBACK);
-        list.parse().map_err(|message| ConfigError::Invalid {
-            key: "admin.metrics_from",
-            message,
-        })
+        const KEY: &str = "admin.metrics_from";
+        let Some(list) = &self.metrics_from else {
+            return Ok(crate::admin::AddressRanges::loopback());
+        };
+        let entries = one_each(KEY, list, r#"["127.0.0.0/8", "::1"]"#)?;
+        crate::admin::AddressRanges::new(&entries)
+            .map_err(|message| ConfigError::Invalid { key: KEY, message })
     }
 
     /// Whether this is the shape of a proxy on the same host that the
@@ -947,7 +1030,7 @@ impl AdminConfig {
     }
 }
 
-/// `network { port = 7420; relays = "default"; mdns = true; }`, all
+/// `network { port = 7420; relays = ["default"]; mdns = true; }`, all
 /// optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
@@ -956,12 +1039,17 @@ pub struct NetworkConfig {
     /// when a firewall needs to know.
     #[ucl(default)]
     pub port: Option<u16>,
-    /// The relays the endpoint may take its home relay from (P6-03), in
-    /// the style of `admin.trusted_proxies`: a comma-separated list of
-    /// `default` (n0's public relays) and relay URLs. Empty or left out:
-    /// relays off, the server reached on the LAN or at a public address.
+    /// Listen on IPv6 too. On unless set to false. Off, the server listens
+    /// on IPv4 only, so no device reaches it over IPv6, directly or by hole
+    /// punching.
     #[ucl(default)]
-    pub relays: Option<String>,
+    pub ipv6: Option<bool>,
+    /// The relays the endpoint may take its home relay from (P6-03): a
+    /// list of `default` (n0's public relays) and relay URLs. Empty or left
+    /// out: relays off, the server reached on the LAN or at a public
+    /// address.
+    #[ucl(default)]
+    pub relays: Option<Vec<String>>,
     /// The single relay before P6-03. Refused, naming `relays`: a config
     /// that still sets it meant something by it.
     #[ucl(default)]
@@ -979,10 +1067,10 @@ pub struct NetworkConfig {
     pub pkarr: Option<String>,
     /// The relays of the operator's own (P6-04, `spoolframe-server relay`)
     /// this server tells who an endpoint is, so they let its devices
-    /// through: their keys (`spoolframe-server relay id`), comma-separated.
-    /// None by default.
+    /// through: a list of their keys (`spoolframe-server relay id`). None
+    /// by default.
     #[ucl(default)]
-    pub own_relays: Option<String>,
+    pub own_relays: Option<Vec<String>>,
     /// Announce the server on the LAN over mDNS (P1-13), so clients list
     /// it without being told its address. On unless set to `false`.
     #[ucl(default)]
@@ -1015,10 +1103,10 @@ pub struct NetworkConfig {
 }
 
 /// `wan { static = ["203.0.113.7:7420"]; mapped_port { port = 7420;
-/// mode = "auto"; public_ip = "lookup"; lookup_via = "wtfismyip"; }
-/// host_ipv6 = false; }`: what a device off the LAN dials (P6-02). Each
-/// part is optional; `mapped_port` is on with its defaults unless set to
-/// `false`.
+/// mode = "auto"; public_ip = "lookup"; lookup_via = "wtfismyip"; } }`:
+/// what a device off the LAN dials (P6-02). Each part is optional;
+/// `mapped_port` is on with its defaults unless set to `false`. The host's
+/// own IPv6 addresses need no part: iroh tells devices about them itself.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct WanConfig {
@@ -1028,9 +1116,6 @@ pub struct WanConfig {
     /// The port forwarded on the router, or `false` for none.
     #[ucl(default, map = "mapped_port_setting")]
     pub mapped_port: Option<MappedPortSetting>,
-    /// Advertise the host's stable global IPv6 addresses; off unless set.
-    #[ucl(default)]
-    pub host_ipv6: Option<bool>,
 }
 
 /// `mapped_port`: `false`, or its table.
@@ -1196,7 +1281,6 @@ impl WanConfig {
         Ok(crate::wan::Wan {
             statics,
             mapped_port,
-            host_ipv6: self.host_ipv6.unwrap_or(false),
         })
     }
 }
@@ -1273,8 +1357,12 @@ impl NetworkConfig {
             message,
         };
         let mut relays = Vec::new();
-        let entries = self.relays.as_deref().unwrap_or_default().split(',');
-        for entry in entries.map(str::trim).filter(|e| !e.is_empty()) {
+        let entries = one_each(
+            "network.relays",
+            self.relays.as_deref().unwrap_or_default(),
+            r#"["default", "https://relay.example.com"]"#,
+        )?;
+        for entry in entries {
             let relay = if entry == "default" {
                 Relay::Default
             } else {
@@ -1297,13 +1385,26 @@ impl NetworkConfig {
         Ok(relays)
     }
 
-    /// `own_relays`: endpoint keys, comma-separated.
+    /// Whether `own_relays` names relays while `relays` is empty (P6-07,
+    /// glm E-6 and ds4 P6-5): the server answers them, but tells no
+    /// device about any relay, so they serve only devices that know their
+    /// URL another way. Warned of at start, not refused: that may be meant.
+    pub fn own_relays_untold(&self) -> Result<bool, ConfigError> {
+        Ok(!self.own_relays()?.is_empty() && self.relays()?.is_empty())
+    }
+
+    /// `own_relays`: a list of endpoint keys.
     fn own_relays(&self) -> Result<Vec<iroh::EndpointId>, ConfigError> {
+        const KEY: &str = "network.own_relays";
         let mut keys = Vec::new();
-        let entries = self.own_relays.as_deref().unwrap_or_default().split(',');
-        for entry in entries.map(str::trim).filter(|e| !e.is_empty()) {
+        let entries = one_each(
+            KEY,
+            self.own_relays.as_deref().unwrap_or_default(),
+            r#"["<key>", "<key>"]"#,
+        )?;
+        for entry in entries {
             let key = entry.parse().map_err(|e| ConfigError::Invalid {
-                key: "network.own_relays",
+                key: KEY,
                 message: format!("{entry:?}: {e}; a relay's key is `spoolframe-server relay id`'s"),
             })?;
             if !keys.contains(&key) {
@@ -1381,6 +1482,7 @@ impl NetworkConfig {
         }
         Ok(EndpointOptions {
             port: self.port,
+            ipv6: self.ipv6.unwrap_or(true),
             relays,
             pkarr,
             own_relays,
@@ -2110,7 +2212,7 @@ mod tests {
         let from = config.admin.metrics_from().unwrap();
         assert!(from.contains("127.0.0.1".parse().unwrap()));
         assert!(!from.contains("192.168.1.5".parse().unwrap()));
-        let on = plex(r#"admin { metrics = true; metrics_from = "192.168.1.0/24"; }"#).unwrap();
+        let on = plex(r#"admin { metrics = true; metrics_from = ["192.168.1.0/24"]; }"#).unwrap();
         assert!(on.admin.metrics());
         assert!(
             on.admin
@@ -2132,7 +2234,7 @@ mod tests {
         assert_eq!(plex("").unwrap().telemetry.otlp.settings().unwrap(), None);
         let on = plex(
             r#"telemetry { otlp { endpoint = "http://alloy:4318"; protocol = "http";
-               headers = "x-scope-orgid=home, authorization=Bearer k"; logs = false; } }"#,
+               headers { x-scope-orgid = "home"; authorization = "Bearer k"; } logs = false; } }"#,
         )
         .unwrap()
         .telemetry
@@ -2141,11 +2243,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(on.protocol, crate::telemetry::Protocol::Http);
+        // By name: a table has no order.
         assert_eq!(
             on.headers,
             [
+                ("authorization".to_owned(), "Bearer k".to_owned()),
                 ("x-scope-orgid".to_owned(), "home".to_owned()),
-                ("authorization".to_owned(), "Bearer k".to_owned())
             ]
         );
         assert!(on.traces && on.metrics && !on.logs);
@@ -2167,12 +2270,17 @@ mod tests {
                 r#"endpoint = "http://a:4317"; protocol = "udp";"#,
                 "telemetry.otlp.protocol",
             ),
+            // The name=value string it was before it took a table.
             (
-                r#"endpoint = "http://a:4317"; headers = "s3cr3t";"#,
+                r#"endpoint = "http://a:4317"; headers = "authorization=s3cr3t";"#,
                 "telemetry.otlp.headers",
             ),
             (
-                r#"endpoint = "http://a:4317"; headers = "bad name=s3cr3t";"#,
+                r#"endpoint = "http://a:4317"; headers { "bad name" = "s3cr3t"; }"#,
+                "telemetry.otlp.headers",
+            ),
+            (
+                r#"endpoint = "http://a:4317"; headers { authorization = "s3cr3t\n"; }"#,
                 "telemetry.otlp.headers",
             ),
         ] {
@@ -2258,20 +2366,43 @@ mod tests {
         let settings = config.transcode.settings().unwrap();
         assert_eq!(settings.hardware, HardwarePolicy::None);
         assert_eq!(settings.vaapi_device, PathBuf::from("/dev/dri/renderD129"));
-        let ordered =
-            plex(r#"plex { url = "http://nas:32400"; } transcode { hardware = "nvenc, vaapi"; }"#)
-                .unwrap();
+        let ordered = plex(
+            r#"plex { url = "http://nas:32400"; } transcode { hardware = ["nvenc", "vaapi"]; }"#,
+        )
+        .unwrap();
         assert_eq!(
             ordered.transcode.settings().unwrap().hardware,
             HardwarePolicy::Ordered(vec![Hardware::Nvenc, Hardware::Vaapi])
         );
-        assert!(matches!(
-            plex(r#"plex { url = "http://nas:32400"; } transcode { hardware = "cuda"; }"#),
-            Err(ConfigError::Invalid {
-                key: "transcode.hardware",
-                ..
-            })
-        ));
+        // One family alone may be a plain string.
+        let one = plex(r#"plex { url = "http://nas:32400"; } transcode { hardware = "vaapi"; }"#)
+            .unwrap();
+        assert_eq!(
+            one.transcode.settings().unwrap().hardware,
+            HardwarePolicy::Ordered(vec![Hardware::Vaapi])
+        );
+        for refused in [
+            r#""cuda""#,
+            r#"["cuda"]"#,
+            r#"["auto"]"#,
+            r#"["vaapi", "vaapi"]"#,
+            // The comma-separated string it was before it took a list.
+            r#""nvenc, vaapi""#,
+        ] {
+            let config = plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} transcode {{ hardware = {refused}; }}"#
+            ));
+            assert!(
+                matches!(
+                    config,
+                    Err(ConfigError::Invalid {
+                        key: "transcode.hardware",
+                        ..
+                    })
+                ),
+                "{refused}: {config:?}"
+            );
+        }
     }
 
     #[test]
@@ -2465,6 +2596,19 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_is_on_unless_set() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert!(config.network.endpoint_options().unwrap().ipv6);
+    }
+
+    #[test]
+    fn ipv6_can_be_turned_off() {
+        let config =
+            plex(r#"plex { url = "http://nas:32400"; } network { ipv6 = false; }"#).unwrap();
+        assert!(!config.network.endpoint_options().unwrap().ipv6);
+    }
+
+    #[test]
     fn a_fixed_port_is_read() {
         let config =
             plex(r#"plex { url = "http://nas:32400"; } network { port = 7420; }"#).unwrap();
@@ -2631,7 +2775,6 @@ mod tests {
                     "[2001:db8::1]:7420".parse().unwrap()
                 ],
                 mapped_port: None,
-                host_ipv6: false,
             }
         );
     }
@@ -2641,7 +2784,6 @@ mod tests {
         use crate::wan::{LookupVia, MappedPort, Mode, PublicIp};
         let wan = wan("port = 7420; wan { }").unwrap().unwrap();
         assert_eq!(wan.statics, []);
-        assert!(!wan.host_ipv6);
         assert_eq!(
             wan.mapped_port,
             Some(MappedPort {
@@ -2658,11 +2800,10 @@ mod tests {
         use crate::wan::{MappedPort, Mode, PublicIp};
         let wan = wan(
             r#"wan { mapped_port { port = 443; mode = "manual"; public_ip = "203.0.113.7";
-                     lookup_via = false; } host_ipv6 = true; }"#,
+                     lookup_via = false; } }"#,
         )
         .unwrap()
         .unwrap();
-        assert!(wan.host_ipv6);
         assert_eq!(
             wan.mapped_port,
             Some(MappedPort {
@@ -2789,9 +2930,10 @@ mod tests {
         assert!(wan("wan { mapped_port { lookup_via = true; } }").is_err());
     }
 
-    fn relays(list: &str) -> Result<Vec<Relay>, ConfigError> {
+    /// `network.relays` set to `value`, as UCL.
+    fn relays(value: &str) -> Result<Vec<Relay>, ConfigError> {
         plex(&format!(
-            r#"plex {{ url = "http://nas:32400"; }} network {{ relays = "{list}"; }}"#
+            r#"plex {{ url = "http://nas:32400"; }} network {{ relays = {value}; }}"#
         ))?
         .network
         .endpoint_options()
@@ -2802,25 +2944,38 @@ mod tests {
     fn relays_are_a_list_of_default_and_urls_in_order() {
         let custom = Url::parse("https://relay.example.com").unwrap();
         assert_eq!(
-            relays(" https://relay.example.com , default").unwrap(),
+            relays(r#"["https://relay.example.com", "default"]"#).unwrap(),
             [Relay::Custom(custom), Relay::Default]
         );
     }
 
     #[test]
     fn an_empty_relay_list_is_relays_off() {
-        assert_eq!(relays("").unwrap(), []);
-        assert_eq!(relays(" , ").unwrap(), []);
+        assert_eq!(relays("[]").unwrap(), []);
+    }
+
+    #[test]
+    fn relays_written_as_one_comma_separated_string_are_refused_naming_the_list() {
+        let err = relays(r#""https://relay.example.com, default""#).unwrap_err();
+        let ConfigError::Invalid {
+            key: "network.relays",
+            message,
+        } = err
+        else {
+            panic!("{err:?}");
+        };
+        assert!(message.contains("a list now"), "{message}");
     }
 
     #[test]
     fn a_relay_list_with_a_bad_or_repeated_entry_is_refused() {
         for list in [
-            "disabled",
-            "relay.example.com",
-            "ftp://relay.example.com",
-            "default, default",
-            "https://relay.example.com, https://relay.example.com",
+            r#"["disabled"]"#,
+            r#"[""]"#,
+            r#"["relay.example.com"]"#,
+            r#"["ftp://relay.example.com"]"#,
+            r#"["default", "default"]"#,
+            r#"["https://relay.example.com", "https://relay.example.com"]"#,
         ] {
             let err = relays(list).unwrap_err();
             assert!(
@@ -2832,6 +2987,58 @@ mod tests {
                     }
                 ),
                 "{list}: {err:?}"
+            );
+        }
+    }
+
+    /// `network.own_relays` set to `value`, as UCL.
+    fn own_relays(value: &str) -> Result<Vec<iroh::EndpointId>, ConfigError> {
+        plex(&format!(
+            r#"plex {{ url = "http://nas:32400"; }} network {{ own_relays = {value}; }}"#
+        ))?
+        .network
+        .endpoint_options()
+        .map(|options| options.own_relays)
+    }
+
+    #[test]
+    fn own_relays_with_no_relays_told_are_warned_of() {
+        let key = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let network = |rest: &str| {
+            plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} network {{ {rest} }}"#
+            ))
+            .unwrap()
+            .network
+        };
+        let untold = network(&format!(r#"own_relays = ["{key}"];"#));
+        assert!(untold.own_relays_untold().unwrap());
+        let told = network(&format!(
+            r#"own_relays = ["{key}"]; relays = ["https://relay.example.org"];"#
+        ));
+        assert!(!told.own_relays_untold().unwrap());
+        assert!(!network("").own_relays_untold().unwrap());
+    }
+
+    #[test]
+    fn own_relays_are_a_list_of_relay_keys() {
+        let (a, b) = (
+            iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            iroh::SecretKey::from_bytes(&[2; 32]).public(),
+        );
+        assert_eq!(own_relays(&format!(r#"["{a}", "{b}"]"#)).unwrap(), [a, b]);
+        assert_eq!(own_relays("[]").unwrap(), []);
+        for refused in [format!(r#""{a}, {b}""#), r#"["not a key"]"#.to_owned()] {
+            let err = own_relays(&refused).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        key: "network.own_relays",
+                        ..
+                    }
+                ),
+                "{refused}: {err:?}"
             );
         }
     }
@@ -3007,13 +3214,41 @@ mod tests {
             crate::admin::TrustedProxies::default()
         );
         let config = plex(
-            r#"plex { url = "http://nas:32400"; } admin { trusted_proxies = "10.0.0.5, 172.17.0.0/16"; }"#,
+            r#"plex { url = "http://nas:32400"; } admin { trusted_proxies = ["10.0.0.5", "172.17.0.0/16"]; }"#,
         )
         .unwrap();
         assert_eq!(
             config.admin.trusted_proxies().unwrap(),
-            "10.0.0.5,172.17.0.0/16".parse().unwrap()
+            crate::admin::TrustedProxies::new(&["10.0.0.5", "172.17.0.0/16"]).unwrap()
         );
+    }
+
+    /// The comma-separated strings these lists were refused, saying how
+    /// to write each as a list.
+    #[test]
+    fn a_list_setting_written_as_one_comma_separated_string_is_refused_naming_the_list() {
+        for (config, key) in [
+            (
+                r#"admin { trusted_proxies = "10.0.0.5, 172.17.0.0/16"; }"#,
+                "admin.trusted_proxies",
+            ),
+            (
+                r#"admin { metrics_from = "127.0.0.0/8, ::1"; }"#,
+                "admin.metrics_from",
+            ),
+        ] {
+            let err =
+                plex(&format!(r#"plex {{ url = "http://nas:32400"; }} {config}"#)).unwrap_err();
+            let ConfigError::Invalid {
+                key: found,
+                message,
+            } = &err
+            else {
+                panic!("{config}: {err:?}");
+            };
+            assert_eq!(*found, key, "{config}");
+            assert!(message.contains("a list now"), "{config}: {message}");
+        }
     }
 
     #[test]

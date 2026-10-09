@@ -225,7 +225,7 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
             outcome(
                 root.setting_set(
                     "telemetry.otlp.headers".into(),
-                    json!("authorization=Bearer x"),
+                    json!({ "authorization": "Bearer x" }),
                 )
                 .await,
             ),

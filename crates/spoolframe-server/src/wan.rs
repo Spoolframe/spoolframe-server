@@ -8,15 +8,18 @@
 //! - `static`: what the operator wrote, advertised as written;
 //! - `mapped_port`: one address built from the port forwarded on the
 //!   router, by the operator (`manual`) or by asking it (`auto`), with the
-//!   public IP written down or looked up;
-//! - `host_ipv6`: the host's own stable global IPv6 addresses.
+//!   public IP written down or looked up.
+//!
+//! The host's own IPv6 addresses are no part of it: iroh tells devices
+//! every global IPv6 address on the host's interfaces itself, and
+//! `network.ipv6 = false` is what keeps the server off IPv6.
 //!
 //! The set joins the told list ([`crate::announce::Told`]): signed-in
 //! devices are pushed it in `ServerAddresses` and save it (PX-12), and the
 //! status page lists it with each address's source.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU16;
 use std::sync::Arc;
 
@@ -29,8 +32,6 @@ pub struct Wan {
     pub statics: Vec<SocketAddr>,
     /// `mapped_port`; `None` when set to `false`.
     pub mapped_port: Option<MappedPort>,
-    /// `host_ipv6`: advertise the host's stable global IPv6 addresses.
-    pub host_ipv6: bool,
 }
 
 /// `network.wan.mapped_port`, checked.
@@ -90,8 +91,6 @@ pub enum Source {
     MappedPort,
     /// The mapped port with the public IP looked up.
     Lookup,
-    /// One of the host's own stable global IPv6 addresses.
-    HostIpv6,
 }
 
 /// An advertised address and its source.
@@ -117,14 +116,12 @@ pub fn parse_static(text: &str) -> Result<SocketAddr, String> {
 pub(crate) enum Part {
     Mapping,
     Lookup,
-    HostIpv6,
 }
 
 #[derive(Debug, Default)]
 struct State {
     statics: Vec<SocketAddr>,
     mapped: Option<PublicAddr>,
-    host_ipv6: Vec<SocketAddr>,
     notes: BTreeMap<Part, String>,
     /// The router's answer, with the port asked for; `None` when no
     /// router is asked.
@@ -192,8 +189,8 @@ impl Public {
         self.0.configured
     }
 
-    /// Every address advertised now, each once: the static ones, the
-    /// mapped port's, then the host's IPv6 ones.
+    /// Every address advertised now, each once: the static ones, then
+    /// the mapped port's.
     pub fn addrs(&self) -> Vec<PublicAddr> {
         let state = self.0.state.lock();
         let mut out: Vec<PublicAddr> = Vec::new();
@@ -201,11 +198,7 @@ impl Public {
             addr,
             source: Source::Static,
         });
-        let ipv6 = state.host_ipv6.iter().map(|&addr| PublicAddr {
-            addr,
-            source: Source::HostIpv6,
-        });
-        for entry in statics.chain(state.mapped).chain(ipv6) {
+        for entry in statics.chain(state.mapped) {
             if !out.iter().any(|e| e.addr == entry.addr) {
                 out.push(entry);
             }
@@ -238,11 +231,6 @@ impl Public {
         self.update(|state| state.mapped = mapped);
     }
 
-    /// The host's stable global IPv6 addresses.
-    pub(crate) fn set_host_ipv6(&self, addrs: Vec<SocketAddr>) {
-        self.update(|state| state.host_ipv6 = addrs);
-    }
-
     /// The router's answer about the mapped port and the port asked for;
     /// `None` when no router is asked.
     pub fn mapping(&self) -> Option<(u16, Mapping)> {
@@ -269,84 +257,6 @@ impl Public {
             Some(note) => state.notes.insert(part, note),
             None => state.notes.remove(&part),
         };
-    }
-}
-
-/// One of the host's IPv6 addresses, with what says whether it lasts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostIpv6 {
-    pub addr: Ipv6Addr,
-    /// A privacy address (RFC 4941), replaced every few hours.
-    pub temporary: bool,
-    /// Past its preferred lifetime: on its way out.
-    pub deprecated: bool,
-    /// Still being checked for duplicates, or found to be one.
-    pub tentative: bool,
-}
-
-/// A network interface of the host's, with its IPv6 addresses.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostInterface {
-    pub name: String,
-    pub up: bool,
-    pub ipv6: Vec<HostIpv6>,
-}
-
-/// Of `interfaces`, the IPv6 addresses a device on the Internet may dial
-/// for long: global ones on an interface that is up and not a container's
-/// or a VM's bridge, never a temporary privacy address, one on its way out
-/// or one not yet usable; never unique local or link-local. Sorted, each
-/// once.
-pub fn stable_global_ipv6(interfaces: &[HostInterface]) -> Vec<Ipv6Addr> {
-    let mut found: Vec<Ipv6Addr> = interfaces
-        .iter()
-        .filter(|i| i.up && !crate::announce::is_virtual(&i.name))
-        .flat_map(|i| &i.ipv6)
-        .filter(|a| !a.temporary && !a.deprecated && !a.tentative)
-        .filter(|a| a.addr.to_ipv4_mapped().is_none() && not_public(IpAddr::V6(a.addr)).is_none())
-        .map(|a| a.addr)
-        .collect();
-    found.sort();
-    found.dedup();
-    found
-}
-
-/// Where the host's interfaces are read: the system, or a stand-in.
-#[async_trait::async_trait]
-pub trait HostAddresses: Send + Sync + std::fmt::Debug {
-    async fn interfaces(&self) -> Vec<HostInterface>;
-}
-
-/// The system's interfaces, read over netlink (on Linux): getifaddrs does
-/// not say which address is a temporary one, and the NixOS service has no
-/// /proc/net to read it from.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemInterfaces;
-
-#[async_trait::async_trait]
-impl HostAddresses for SystemInterfaces {
-    async fn interfaces(&self) -> Vec<HostInterface> {
-        let state = netwatch::interfaces::State::new().await;
-        state
-            .interfaces
-            .values()
-            .map(|i| HostInterface {
-                name: i.name().to_owned(),
-                up: i.is_up(),
-                ipv6: i
-                    .addrs()
-                    .filter_map(|net| match net {
-                        netwatch::interfaces::IpNet::V6 { net, flags, .. } => Some(HostIpv6 {
-                            addr: net.addr(),
-                            temporary: flags.temporary,
-                            deprecated: flags.deprecated,
-                            tentative: flags.tentative || flags.duplicated,
-                        }),
-                        netwatch::interfaces::IpNet::V4(_) => None,
-                    })
-                    .collect(),
-            })
-            .collect()
     }
 }
 
@@ -608,10 +518,6 @@ pub async fn try_mapping(mapper: &dyn PortMapper, local_port: NonZeroU16) -> Map
 /// stand-ins in tests, which must never reach a router or the Internet.
 #[derive(Debug, Clone)]
 pub struct Finders {
-    pub host: Arc<dyn HostAddresses>,
-    /// How often the host's IPv6 addresses are read again when nothing
-    /// says they changed: [`HOST_RECHECK`] in the server.
-    pub host_recheck: std::time::Duration,
     pub lookup: Lookup,
     pub mapper: Arc<dyn PortMapper>,
 }
@@ -620,29 +526,15 @@ impl Finders {
     /// The system's.
     pub fn system() -> Self {
         Self {
-            host: Arc::new(SystemInterfaces),
-            host_recheck: HOST_RECHECK,
             lookup: Lookup::system(),
             mapper: Arc::new(RouterMapper),
         }
     }
 }
 
-/// A prefix the router hands out anew changes the host's IPv6 addresses
-/// quietly: they are read again this often.
-pub const HOST_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Find what `wan` says to find, into `public`, until `endpoint` closes.
 /// Nothing here waits: startup never blocks on a router or a lookup.
 pub(crate) fn start(public: &Public, wan: &Wan, endpoint: &iroh::Endpoint, finders: &Finders) {
-    if wan.host_ipv6 {
-        tokio::spawn(find_host_ipv6(
-            public.clone(),
-            finders.host.clone(),
-            finders.host_recheck,
-            endpoint.clone(),
-        ));
-    }
     let Some(mapped) = wan.mapped_port.clone() else {
         return;
     };
@@ -825,50 +717,6 @@ async fn router_mapped(
     }
 }
 
-/// The host's stable global IPv6 addresses on the endpoint's IPv6 port:
-/// read now, again when the endpoint's addresses change, and every
-/// `recheck`.
-async fn find_host_ipv6(
-    public: Public,
-    host: Arc<dyn HostAddresses>,
-    recheck: std::time::Duration,
-    endpoint: iroh::Endpoint,
-) {
-    use iroh::Watcher as _;
-    let bound = endpoint.bound_sockets();
-    let Some(port) = bound
-        .iter()
-        .find(|b| b.is_ipv6())
-        .or_else(|| bound.first())
-        .map(SocketAddr::port)
-    else {
-        return;
-    };
-    let mut watcher = endpoint.watch_addr();
-    let closed = endpoint.closed();
-    tokio::pin!(closed);
-    loop {
-        let found = stable_global_ipv6(&host.interfaces().await);
-        public.note(
-            Part::HostIpv6,
-            found.is_empty().then(|| {
-                "host_ipv6: this host has no stable global IPv6 address to advertise".to_owned()
-            }),
-        );
-        public.set_host_ipv6(
-            found
-                .into_iter()
-                .map(|ip| SocketAddr::new(IpAddr::V6(ip), port))
-                .collect(),
-        );
-        tokio::select! {
-            () = &mut closed => return,
-            updated = watcher.updated() => if updated.is_err() { return },
-            () = tokio::time::sleep(recheck) => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,7 +813,6 @@ mod tests {
         Wan {
             statics: addrs.iter().map(|a| a.parse().unwrap()).collect(),
             mapped_port: None,
-            host_ipv6: false,
         }
     }
 
@@ -983,7 +830,6 @@ mod tests {
             addr: "1.2.3.4:7420".parse().unwrap(),
             source: Source::Lookup,
         }));
-        public.set_host_ipv6(vec!["[2001:db8::9]:7420".parse().unwrap()]);
         assert_eq!(
             public.addrs(),
             [
@@ -994,10 +840,6 @@ mod tests {
                 PublicAddr {
                     addr: "[2001:db8::1]:7420".parse().unwrap(),
                     source: Source::Static,
-                },
-                PublicAddr {
-                    addr: "[2001:db8::9]:7420".parse().unwrap(),
-                    source: Source::HostIpv6,
                 },
             ]
         );
@@ -1010,97 +852,14 @@ mod tests {
         public.note(Part::Lookup, Some("the lookup failed".into()));
         assert!(!changes.has_changed().unwrap());
         assert_eq!(public.notes(), ["the lookup failed"]);
-        public.set_host_ipv6(vec!["[2001:db8::9]:7420".parse().unwrap()]);
+        let mapped = PublicAddr {
+            addr: "203.0.113.9:7420".parse().unwrap(),
+            source: Source::MappedPort,
+        };
+        public.set_mapped(Some(mapped));
         assert!(changes.has_changed().unwrap());
         changes.mark_unchanged();
-        public.set_host_ipv6(vec!["[2001:db8::9]:7420".parse().unwrap()]);
+        public.set_mapped(Some(mapped));
         assert!(!changes.has_changed().unwrap());
-    }
-
-    fn v6(addr: &str) -> HostIpv6 {
-        HostIpv6 {
-            addr: addr.parse().unwrap(),
-            temporary: false,
-            deprecated: false,
-            tentative: false,
-        }
-    }
-
-    fn up(name: &str, ipv6: Vec<HostIpv6>) -> HostInterface {
-        HostInterface {
-            name: name.into(),
-            up: true,
-            ipv6,
-        }
-    }
-
-    /// The user's host: a SLAAC address and a privacy one beside it, a
-    /// deprecated one from the last prefix, ULA and link-local, Docker's
-    /// bridge, and an interface that is down.
-    #[test]
-    fn only_stable_global_ipv6_addresses_are_the_host_s() {
-        let interfaces = vec![
-            up("lo", vec![v6("::1")]),
-            up(
-                "enp5s0",
-                vec![
-                    v6("2001:db8:1::5"),
-                    HostIpv6 {
-                        temporary: true,
-                        ..v6("2001:db8:1::abcd:1234")
-                    },
-                    HostIpv6 {
-                        deprecated: true,
-                        ..v6("2001:db8:2::5")
-                    },
-                    HostIpv6 {
-                        tentative: true,
-                        ..v6("2001:db8:1::77")
-                    },
-                    v6("fd12:3456::5"),
-                    v6("fe80::5"),
-                ],
-            ),
-            up("docker0", vec![v6("2001:db8:d0c::1")]),
-            HostInterface {
-                up: false,
-                ..up("wlp3s0", vec![v6("2001:db8:3::5")])
-            },
-            up("wg0", vec![v6("2001:db8:1::5"), v6("2001:db8:9::1")]),
-        ];
-        assert_eq!(
-            stable_global_ipv6(&interfaces),
-            [
-                "2001:db8:1::5".parse::<Ipv6Addr>().unwrap(),
-                "2001:db8:9::1".parse().unwrap()
-            ]
-        );
-    }
-
-    #[test]
-    fn a_host_with_only_temporary_or_local_ipv6_has_none_to_advertise() {
-        let interfaces = vec![up(
-            "enp5s0",
-            vec![
-                HostIpv6 {
-                    temporary: true,
-                    ..v6("2001:db8:1::abcd")
-                },
-                v6("fd00::1"),
-                v6("fe80::1"),
-                v6("::ffff:203.0.113.7"),
-            ],
-        )];
-        assert_eq!(stable_global_ipv6(&interfaces), Vec::<Ipv6Addr>::new());
-    }
-
-    /// Netlink, not the network: reads this machine's own interfaces.
-    #[tokio::test]
-    async fn this_machine_s_interfaces_are_read_with_their_names() {
-        let found = SystemInterfaces.interfaces().await;
-        assert!(
-            found.iter().any(|i| i.up && !i.name.is_empty()),
-            "{found:?}"
-        );
     }
 }

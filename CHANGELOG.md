@@ -3157,3 +3157,45 @@
   server answers the relays `network.own_relays` names. NixOS:
   `services.spoolframe-relay`, and the server module's `relays`, `pkarr`
   and `ownRelays`.
+- The settings that were comma-separated strings are UCL lists and
+  tables now: `network.relays`, `network.own_relays`,
+  `admin.trusted_proxies` and `admin.metrics_from` are lists, as
+  `relays = ["default"];`; `transcode.hardware` is `"auto"`, `"none"`
+  or a list of families in order, as `["nvenc", "vaapi"]`; and
+  `telemetry.otlp.headers` is a table of name to value, as
+  `headers { authorization = "Bearer …"; }`. A later layer replaces the
+  table whole. The old comma string does not load: the error names the
+  setting and shows the new form, and never echoes the headers' string.
+- `network.ipv6`, on by default: off, the server listens on IPv4 only,
+  so no device reaches it over IPv6, directly or by hole punching. It
+  applies at the next start. Settings › Remote access has a "Listen on
+  IPv6" switch for it, and the NixOS module `ipv6`.
+- `network.wan.host_ipv6` is gone, with the admin API's `wanHostIpv6`,
+  the "Host IPv6" address source and the NixOS module's
+  `wan.hostIpv6`. It added nothing: iroh tells devices every global
+  IPv6 address on the host's interfaces itself, and offers them when it
+  punches holes. Turning it off did not keep the server off IPv6
+  either. Set in the config file it is refused at load, pointing to
+  `network.ipv6`; saved by the web UI in the runtime layer it is
+  dropped, with a warning in the log.
+- P6-07, the review of remote access, and its fixes:
+  - A relay of your own holds at most 2 connections on the main server's
+    relay-access ALPN, and keeps at most 10,000 answers.
+  - The relay warns at start, as does its NixOS module, when `proxy`
+    mode's plain HTTP is not on loopback and when `access.everyone` is
+    `"allow"`. The module gains `resources.memoryMax` (1G) and
+    `resources.tasksMax` (512).
+  - The server warns at start when `network.own_relays` is set and
+    `network.relays` is empty.
+  - The SDK keeps from a server's `server_addresses` only `http(s)`
+    relay and lookup URLs: at most 32 relays, and at most 8 pkarr relays
+    looked up at in all. Invite hints are kept newest first, 32 at most.
+  - An invite link longer than 4 KiB is not read, and its name is cut
+    to 128 characters.
+  - A redemption refused for a taken username or an unacceptable
+    password is logged as a refused sign-in.
+  - "client disconnected" names the device's key and the users signed in
+    on the connection, in place of an `auth=Anonymous` that was always
+    so.
+  - `spoolframe-probe --check-limits` also sends wrong invite codes until
+    they are `RateLimited`.

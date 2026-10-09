@@ -702,8 +702,6 @@ pub enum AddressSource {
     MappedPort,
     /// The mapped port with its public IP looked up.
     Lookup,
-    /// One of the host's own stable global IPv6 addresses.
-    HostIpv6,
 }
 
 impl AddressSource {
@@ -713,7 +711,6 @@ impl AddressSource {
             Self::Static => "static",
             Self::MappedPort => "mapped port",
             Self::Lookup => "lookup",
-            Self::HostIpv6 => "host IPv6",
         }
     }
 }
@@ -2907,11 +2904,6 @@ pub trait AdminApi {
     /// `UNAVAILABLE`, with why, when it does not answer with a public one.
     #[method(name = "wanLookup", with_extensions)]
     async fn wan_lookup(&self) -> jsonrpsee::core::RpcResult<String>;
-
-    /// This host's stable global IPv6 addresses now (P6-02), what
-    /// `host_ipv6` would advertise.
-    #[method(name = "wanHostIpv6", with_extensions)]
-    async fn wan_host_ipv6(&self) -> jsonrpsee::core::RpcResult<Vec<String>>;
 
     /// The PMS at `url` as `plexStatus` would show it, without saving
     /// anything: with `token`, or else the one the caller's linked Plex

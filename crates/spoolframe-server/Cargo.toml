@@ -56,7 +56,6 @@ iroh-relay = { version = "1.3", default-features = false, features = ["server"] 
 # The path events of a connection, followed for the log.
 futures-util = { workspace = true }
 iroh-mdns-address-lookup = { workspace = true }
-netwatch = { workspace = true }
 portmapper = { workspace = true }
 spoolframe-types = { workspace = true }
 spoolframe-policy = { workspace = true }

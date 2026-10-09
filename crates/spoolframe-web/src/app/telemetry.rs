@@ -12,7 +12,9 @@ use wasm_bindgen::JsValue;
 
 use super::admin::sleep;
 use super::profile::{ConfirmItsYou, asks_to_confirm};
-use super::wizard::{Footer, Mode, Note, entry, load_settings, loading, locked, save, text};
+use super::wizard::{
+    Footer, Mode, Note, entry, load_settings, loading, locked, save, strings, text, value,
+};
 use super::{Alert, icons, now_ms, page_address, rpc};
 use crate::logic::ApiError;
 use crate::logs::hours_minutes;
@@ -54,8 +56,7 @@ fn unless_default(settings: &Settings, key: &str, value: Value, default: Value) 
 
 /// A boolean setting's value, or its default when nothing sets it.
 fn flag_or(settings: &Settings, key: &str, default: bool) -> bool {
-    entry(settings, key)
-        .and_then(|e| e.value.as_ref())
+    value(settings, key)
         .and_then(Value::as_bool)
         .unwrap_or(default)
 }
@@ -115,9 +116,8 @@ fn TelemetryFields(
 ) -> Element {
     let s = &settings;
     let mut metrics_on = use_signal(|| flag_or(s, "admin.metrics", false));
-    let from_setting = text(s, "admin.metrics_from");
-    let mut from =
-        use_signal(|| allowed_from((!from_setting.is_empty()).then_some(from_setting.as_str())));
+    let from_setting = value(s, "admin.metrics_from").map(strings);
+    let mut from = use_signal(|| allowed_from(from_setting.as_deref()));
     let mut adding = use_signal(|| None::<String>);
     let mut add_error = use_signal(|| None::<String>);
     let endpoint_now = text(s, "telemetry.otlp.endpoint");
@@ -155,7 +155,7 @@ fn TelemetryFields(
             Headers::Replace(rows) => match headers_value(&rows) {
                 // None typed where none were set: nothing to take out.
                 Ok(None) if !headers_were_set => None,
-                Ok(value) => Some(value.map(Value::String)),
+                Ok(value) => Some(value.map(Value::Object)),
                 Err(e) => {
                     error.set(Some(e));
                     return;
@@ -171,7 +171,7 @@ fn TelemetryFields(
             ("admin.metrics", metrics_value),
             (
                 "admin.metrics_from",
-                metrics_from_value(&from()).map(Value::String),
+                metrics_from_value(&from()).map(|list| json!(list)),
             ),
         ];
         if otlp_on() {

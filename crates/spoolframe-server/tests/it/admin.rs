@@ -150,7 +150,7 @@ pub(crate) async fn server_behind_a_proxy(
         "127.0.0.1:0".parse().unwrap(),
         admin(auth, Some(SetupCode::new(CODE))),
         Origins::default(),
-        "127.0.0.1".parse().unwrap(),
+        TrustedProxies::new(&["127.0.0.1"]).unwrap(),
     )
     .await
     .unwrap();
