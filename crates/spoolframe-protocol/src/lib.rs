@@ -16,6 +16,7 @@ pub mod invite;
 pub mod lan;
 pub mod media;
 pub mod messages;
+pub mod pairing;
 pub mod passkeys;
 pub mod playback;
 pub mod plex;
@@ -65,6 +66,10 @@ pub const CLIENT_ALPN: &[u8] = b"spoolframe/client/1";
 /// Reserved: a server refuses it with [`close::UNSUPPORTED_PROTOCOL`] until
 /// federation exists.
 pub const FEDERATION_ALPN: &[u8] = b"spoolframe/federation/1";
+
+/// The ALPN a device pairs with a portable identity's phone on (P7-03),
+/// directly, with no server: [`pairing`].
+pub use pairing::PAIR_ALPN;
 
 /// QUIC application close codes a Spoolframe peer sends, with a
 /// human-readable reason beside them.

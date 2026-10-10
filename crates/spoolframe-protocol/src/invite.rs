@@ -224,7 +224,7 @@ fn plain(b: u8) -> bool {
 
 /// `value` percent-encoded where it is not [`plain`], byte by byte of its
 /// UTF-8.
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
         if plain(b) {
@@ -239,7 +239,7 @@ fn encode(value: &str) -> String {
 /// `raw` with its `%XX` escapes decoded; `None` if an escape is broken or
 /// the bytes are not UTF-8. `+` is itself, as [`encode`] never writes one
 /// for a space.
-fn decode(raw: &str) -> Option<String> {
+pub(crate) fn decode(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

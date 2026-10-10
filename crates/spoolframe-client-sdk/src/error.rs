@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use spoolframe_protocol::Error as ServerError;
 
+use crate::pairing::PairingError;
 use crate::portable::{CredentialError, PhraseError, StateError};
 use crate::storage::StorageError;
 
@@ -253,6 +254,10 @@ pub enum SdkError {
     /// one identity, one account per server. Sever that tie first.
     #[error("that identity is tied to another account on this server")]
     PortableIdTaken,
+    /// Pairing this device with a portable identity, or a phone with a
+    /// device, did not happen (P7-03); [`PairingError`] says why.
+    #[error(transparent)]
+    Pairing(#[from] PairingError),
     /// Any other error the server answered with.
     #[error("server: {0}")]
     Server(String),

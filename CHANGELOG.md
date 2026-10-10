@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- P7-03, guests on a shared device: a device-local "guest sign-ins"
+  setting in the SDK, off by default, and pairing by QR code. A TV
+  with it on shows a code; the guest's phone scans it, shows "Authorize
+  <TV>?" with the TV's key fingerprint, and its root signs a device
+  credential that goes back over a direct Iroh connection on the new
+  ALPN `spoolframe/pair/1`. No server takes part, and the client
+  protocol is unchanged. With the setting off the device shows no code
+  and takes no pairing; each refusal is logged as the server logs its
+  own. Guests are listed and signed out one by one. The TV learns
+  which identity is pairing, and the fingerprint to show beside the
+  phone's, as soon as the phone connects (`Pairing::connected`), before
+  the person authorizes.
+
 ## 0.6.0 (2026-10-09)
 
 - An invite's holder on your relay (P6-08): a device redeeming an

@@ -21,7 +21,9 @@ mod error;
 mod invites;
 mod link;
 mod link_meter;
+pub mod pairing;
 pub mod portable;
+mod refusals;
 mod servers;
 mod session;
 pub mod storage;
@@ -32,6 +34,8 @@ pub use error::SdkError;
 pub use invites::InviteInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
 pub use link_meter::LinkMeter;
+// Pairing a guest onto this device by QR code (P7-03).
+pub use pairing::{Connected, Paired, Pairing, PairingError, PairingOffer};
 // Portable identities (P7-01) and their device credentials (P7-02).
 pub use portable::{
     CredentialError, DevicePublicKey, PhraseError, Portable, PortableIdentity,

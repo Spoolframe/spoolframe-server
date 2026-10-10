@@ -10,6 +10,11 @@ required field, `portable`: the `PortableUserId` the account is tied
 to, or `null`. What they do is in "Ties" under "Portable identities"
 below.
 
+P7-03 (pairing a guest by QR code) adds a second ALPN between two
+devices, `spoolframe/pair/1`, and no server request: the client
+protocol and `PROTOCOL_VERSION` stay as they are. It is in "Pairing"
+under "Portable identities" below.
+
 Revision 12 (P6-05, pkarr) kept the `spoolframe/client/1` ALPN and sets
 `PROTOCOL_VERSION` to 12. Update the server and SDK together.
 `ServerAddresses` has a new required field, `lookup`: the URL of the
@@ -1203,6 +1208,97 @@ fingerprint, tiedAt }` or `null`) and severs it with `admin.userUntie`
 both answer `NO_SUCH_LINK`. Neither ties: the web UI never holds the
 root.
 
+### Pairing
+
+A device acts as a portable user once that user's root has given it a
+device credential (§45, §47). A TV has no camera, so it shows a QR code
+and the user's phone, which holds the root, scans it; the credential
+comes back over a direct Iroh connection between the two (P7-03). No
+Spoolframe server takes part.
+
+Only a device whose owner allows it pairs: the device-local setting
+"guest sign-ins" (`Portable::allow_guests`), off by default. Off, the
+device shows no code, and its endpoint does not accept
+`spoolframe/pair/1`, so a pairing connection fails its handshake: the
+device made no key and contacted nothing. The same setting is the gate
+for every external principal: federated users (P8) will pass it too.
+
+The QR code carries a link:
+
+```
+spoolframe://pair?e=<endpoint id>&c=<code>&n=<name>&a=<ip:port>&r=<relay url>
+```
+
+- `e`: the device's `EndpointId`, 64 hex digits. Required.
+- `c`: a one-time code, 32 random bytes as 43 base64url characters
+  without padding. Required. Good for 5 minutes and one attempt.
+- `n`: what the device calls itself, at most 32 characters.
+- `a` (at most 8) and `r` (at most 2): where the device may be
+  reached. Hints only: Iroh proves the key whatever the path.
+
+Values are percent-encoded as in an invite link. A link longer than
+1024 bytes, a second `e` or `c`, or one that cannot be read is
+refused; an unknown parameter is ignored. A usual link is under 250
+bytes.
+
+The device accepts `spoolframe/pair/1` only while it shows a code. The
+phone dials `e` with the addresses and relays in the link, and opens
+one bidirectional stream. Each frame is a client protocol frame
+(big-endian `u32` length, then CBOR) of at most 256 KiB, tagged by
+`type`:
+
+| # | From | Frame | |
+|---|---|---|---|
+| 1 | phone | `{"type": "hello", "code": bytes(32), "identity": "<PortableUserId>"}` | |
+| 2 | device | `{"type": "key", "device_key": "<64 hex>", "name": "<name>"}` | or `refused` |
+| 3 | phone | `{"type": "credential", "credential": {…}, "state": {…} or null}` | or `{"type": "declined"}` |
+| 4 | device | `{"type": "done"}` | or `refused` |
+
+`refused` is `{"type": "refused", "reason": r}` with `r` one of
+`not_allowed` (guest sign-ins were turned off after the code was
+shown), `wrong_code`, `expired`, `credential_refused` and `failed`.
+
+- At `hello` the device takes the code: compared in constant time, and
+  used up whether it matches or not. A wrong code ends the pairing
+  (`wrong_code`); so does a code presented after its 5 minutes
+  (`expired`). The device then checks the setting again, and makes, or
+  reuses, its key for `identity` (one per identity, as P7-02 has it).
+- `key` is what the phone shows: "Authorize <name>?" with the key's
+  fingerprint (the server key format, P1-21). The phone signs only
+  when the person says yes, with the root it holds; without one it
+  refuses before it sends anything.
+- `credential` must hold now, name `identity` and the key in `key`;
+  `state`, if any, must be `identity`'s, verify, and not revoke that
+  key (`credential_refused` otherwise). The device installs the
+  credential, then takes the state in (P7-02's rules).
+- The device waits 2 minutes for frame 3 and 10 seconds for any other.
+  A pairing that ends in any other way than `done` leaves no credential
+  on the device, and removes the key if this pairing made it. A key the
+  device had before stays: it is harmless, and reused next time.
+
+Each refusal on the device is one WARN line on `spoolframe::refused`
+(`kind=external_sign_in_refused`, `channel=pair`, `request`, `source`
+as the phone's short endpoint id, `user`, `reason`), limited per source
+and reason to 10 a minute, as the server's (finding 46). A refused
+`start_pairing` is one such line with `source=local`. No line holds the
+code.
+
+What the QR code gives away. The phone dials only the endpoint id in
+the link and Iroh proves it, so a phone never pairs with another
+device. The code proves to the device that a phone saw the screen.
+Someone else who sees the screen within the 5 minutes, and dials
+first, can do one of two things. With a wrong code or none, they end
+the pairing: the TV shows a new code (a nuisance, not a breach). With
+the code, they take the pairing, and can give the TV a credential for
+their own identity only: the phone that authorizes is the one whose
+root signs, and the credential names the key the TV made for the
+identity the phone named. The real owner's phone then fails with
+`wrong_code`. The TV ends up acting as the intruder's portable
+identity: a guest on it, which is what turning guest sign-ins on
+allows. It never gets anyone else's credential, and nothing the
+device holds is sent. Turning the setting off, or forgetting the guest
+(`Portable::forget_guest`), undoes it.
+
 ### SDK
 
 `Session::tie(identity)` begins, signs with the root if this device
@@ -1210,6 +1306,31 @@ holds it (`Portable::tie_proof`), else with its device credential, and
 finishes; the root is never sent. `Session::untie()` severs;
 `Session::tie_info()` reads the tie from `WhoAmI`. The new errors are
 `SdkError::TieChallengeExpired`, `AlreadyTied` and `PortableIdTaken`.
+
+Pairing (P7-03). On the device: `Portable::allow_guests()` /
+`set_allow_guests(bool)`; `Client::start_pairing(name) -> Pairing`,
+whose `link()` is the QR text, `connected()` gives `Connected {
+identity, device_key, fingerprint }` once a phone's `hello` is taken
+and the key sent, and `wait()` ends in `Paired { identity, device_key,
+fingerprint }` or `SdkError::Pairing(PairingError)`; `cancel()` or
+dropping it stops at once. The TV's flow:
+
+1. Show `link()` as a QR code.
+2. `connected()`: the phone has scanned it. Show "Check your phone
+   shows <fingerprint>". It is `DevicePublicKey::fingerprint()`, the
+   same string the phone shows as `PairingOffer::fingerprint()`.
+3. `wait()`: the person on the phone authorized or declined.
+
+`connected()` and `wait()` both take `&self`, may run side by side,
+and give the same answer each call. If the pairing ends before a phone
+connects, `connected()` is the error `wait()` gives (`Expired`,
+`WrongCode`, `NotAllowed`, `Aborted` when cancelled). Once a phone has
+connected, `connected()` gives it however the pairing ends. `Portable::guests()` lists the identities
+held without their root, `Portable::forget_guest(id)` signs one out.
+On the phone: `Client::scan_pairing(link, identity) -> PairingOffer`,
+with `device_name()`, `fingerprint()`, `authorize(label)` and
+`decline()`. The device reaches no relay of its own, so its link has
+LAN addresses only: the phone has to be on the same network.
 
 The test vectors in `portable.rs` (root seed `[7; 32]`, device seeds
 `[9; 32]` and `[11; 32]`) were computed apart from the code, with

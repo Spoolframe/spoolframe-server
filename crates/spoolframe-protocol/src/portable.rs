@@ -141,6 +141,13 @@ impl DevicePublicKey {
         &self.0
     }
 
+    /// The short code a person compares between the device and the phone
+    /// that authorizes it (P7-03), in the same format as an identity's
+    /// ([`PortableUserId::fingerprint`]).
+    pub fn fingerprint(&self) -> String {
+        fingerprint::fingerprint(&self.0)
+    }
+
     /// Whether `signature` is this device key's over `message`, strictly
     /// (as [`PortableUserId::verify`]).
     pub fn verify(&self, message: &[u8], signature: &Signature) -> bool {

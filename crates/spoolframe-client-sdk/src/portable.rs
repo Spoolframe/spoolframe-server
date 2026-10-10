@@ -696,6 +696,123 @@ impl Portable {
         })
     }
 
+    // Guests (P7-03): identities this device acts as without holding
+    // their root, by the device's own leave.
+
+    /// Whether this device lets people sign in on it as an account that
+    /// is not its own: off unless the user turned it on. The shared
+    /// living-room TV turns it on; a phone or a laptop keeps it off. Off,
+    /// the device shows no pairing code and takes no pairing
+    /// ([`crate::Client::start_pairing`]), before anything is sent
+    /// anywhere.
+    ///
+    /// The one gate for every external principal: a portable identity
+    /// paired by QR now (P7-03), a federated server's user when P8 pairs
+    /// servers. Storage that cannot be read is an error, never "on".
+    pub async fn allow_guests(&self) -> Result<bool, SdkError> {
+        match self.storage.data(keys::ALLOW_GUESTS).await? {
+            None => Ok(false),
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                StorageError(format!("the guest sign-in setting cannot be read: {e}")).into()
+            }),
+        }
+    }
+
+    /// Turn guest sign-ins on or off ([`Portable::allow_guests`]). Turning
+    /// it off refuses any pairing from then on, one under way included;
+    /// guests already here stay until forgotten
+    /// ([`Portable::forget_guest`]).
+    pub async fn set_allow_guests(&self, allowed: bool) -> Result<(), SdkError> {
+        self.storage
+            .set_data(
+                keys::ALLOW_GUESTS,
+                Some(serde_json::to_vec(&allowed).expect("a bool serializes")),
+            )
+            .await?;
+        tracing::info!(allowed, "guest sign-ins changed");
+        Ok(())
+    }
+
+    /// The identities this device holds a credential for but not the root
+    /// of: the guests paired onto it, oldest id first. Each signs out on
+    /// its own ([`Portable::forget_guest`]).
+    pub async fn guests(&self) -> Result<Vec<PortableUserId>, SdkError> {
+        let storage = self.storage.as_ref();
+        let mut guests = Vec::new();
+        for id in load_credentials(storage).await?.into_keys() {
+            if storage
+                .secret(&keys::portable_root(&id.to_string()))
+                .await?
+                .is_none()
+            {
+                guests.push(id);
+            }
+        }
+        Ok(guests)
+    }
+
+    /// Sign guest `id` out of this device: its credential, its device key
+    /// and the state it brought go. Other guests are untouched. Refused
+    /// for an identity whose root is here ([`Portable::forget`] is for
+    /// that). Forgetting one not here does nothing.
+    pub async fn forget_guest(&self, id: PortableUserId) -> Result<(), SdkError> {
+        let storage = self.storage.as_ref();
+        if storage
+            .secret(&keys::portable_root(&id.to_string()))
+            .await?
+            .is_some()
+        {
+            return Err(SdkError::InvalidInput(format!(
+                "this device holds the root of {id}: it is not a guest"
+            )));
+        }
+        let _saving = self.saving.lock().await;
+        // The credential first: should the rest fail, nothing acts as
+        // the guest, and forgetting again clears what is left.
+        let mut credentials = load_credentials(storage).await?;
+        if credentials.remove(&id).is_some() {
+            save_credentials(storage, &credentials).await?;
+        }
+        storage
+            .set_secret(&keys::portable_device(&id.to_string()), None)
+            .await?;
+        storage
+            .set_data(&keys::portable_state(&id.to_string()), None)
+            .await?;
+        tracing::info!(%id, "forgot a guest");
+        Ok(())
+    }
+
+    /// Whether this device has made a key for acting as `id`.
+    pub(crate) async fn has_device_key(&self, id: PortableUserId) -> Result<bool, SdkError> {
+        Ok(load_device_key(self.storage.as_ref(), id).await?.is_some())
+    }
+
+    /// Remove this device's key for `id` unless a credential names it: a
+    /// pairing that made the key and did not finish leaves nothing.
+    pub(crate) async fn drop_unused_device_key(&self, id: PortableUserId) -> Result<(), SdkError> {
+        let _saving = self.saving.lock().await;
+        let storage = self.storage.as_ref();
+        if load_credentials(storage).await?.contains_key(&id) {
+            return Ok(());
+        }
+        storage
+            .set_secret(&keys::portable_device(&id.to_string()), None)
+            .await?;
+        Ok(())
+    }
+
+    /// Remove the credential this device acts as `id` with, if any.
+    pub(crate) async fn drop_credential(&self, id: PortableUserId) -> Result<(), SdkError> {
+        let _saving = self.saving.lock().await;
+        let storage = self.storage.as_ref();
+        let mut credentials = load_credentials(storage).await?;
+        if credentials.remove(&id).is_some() {
+            save_credentials(storage, &credentials).await?;
+        }
+        Ok(())
+    }
+
     /// Store `root`'s secret, then list it if it is not listed yet. The
     /// secret goes first, so a listed identity always has its root.
     async fn keep(&self, root: &PortableRoot, name: &str) -> Result<(), SdkError> {

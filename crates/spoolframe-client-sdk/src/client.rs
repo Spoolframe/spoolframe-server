@@ -161,6 +161,10 @@ pub(crate) struct Inner {
     activating: tokio::sync::Mutex<()>,
     /// The portable identities on this device, over the same storage.
     portable: Portable,
+    /// A pairing code is shown (P7-03): one at a time.
+    pub(crate) pairing: Arc<std::sync::atomic::AtomicBool>,
+    /// Refusals on this device, as logged (finding 46).
+    pub(crate) refusals: Arc<crate::refusals::Refusals>,
 }
 
 impl std::fmt::Debug for Client {
@@ -279,6 +283,8 @@ impl Client {
                 progress_sequences: Mutex::default(),
                 activating: tokio::sync::Mutex::default(),
                 portable: Portable::new(storage.clone()),
+                pairing: Arc::default(),
+                refusals: Arc::default(),
             }),
         };
         // Where saved servers publish (P6-05): looked up there from the start.

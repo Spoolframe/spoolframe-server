@@ -46,6 +46,13 @@ pub mod keys {
     /// not be on this device.
     pub const PORTABLE_CREDENTIALS: &str = "portable-credentials";
 
+    /// Data: whether this device lets people sign in on it with an
+    /// account that is not this device's own (P7-03), JSON `true` or
+    /// `false`; not there is `false`. The gate for every external
+    /// principal: portable identities paired by QR now, federated users
+    /// (P8) later.
+    pub const ALLOW_GUESTS: &str = "allow-guests";
+
     /// Secret: the sessions on one server, JSON.
     pub fn sessions(server: &str) -> String {
         format!("sessions/{server}")
