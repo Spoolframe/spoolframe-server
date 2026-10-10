@@ -18,8 +18,9 @@ use crate::activity::{since, updated_line};
 use crate::logic::ApiError;
 use crate::logs::hours_minutes;
 use crate::playback::{
-    ReadsChart, at, converted_percent, delivery, ended_text, furthest, out_text, plan_pill,
-    reads_chart, stream_name, why_line,
+    ReadsChart, at, converted_percent, decoder_text, delivery, encoder_text, ended_text,
+    filter_text, furthest, made_line, out_text, output_text, plan_pill, reads_chart, start_parts,
+    stream_name, why_line,
 };
 
 /// How often the pages ask: reads move by the second.
@@ -221,6 +222,7 @@ fn OpenTable(rows: Vec<PlaybackRow>, now: i64) -> Element {
                                 div { class: "flex flex-col items-start gap-1",
                                     Pill { kind: row.plan }
                                     span { class: "text-xs text-ctp-subtext1", "{why_line(&row)}" }
+                                    span { class: "text-xs text-ctp-subtext0", "{made_line(&row)}" }
                                 }
                             }
                             td {
@@ -261,6 +263,7 @@ fn PhoneCard(row: PlaybackRow) -> Element {
                 Pill { kind: row.plan }
             }
             span { class: "text-xs text-ctp-subtext0", "{row.display_name} · {row.device} · {at(row.position_ms)}" }
+            span { class: "text-xs text-ctp-subtext1", "{made_line(&row)}" }
             if row.conversion.is_some() {
                 ConversionCell { row: row.clone() }
             }
@@ -390,6 +393,8 @@ fn Page(detail: Detail, now: i64, asking: Signal<Option<Ask>>) -> Element {
             }
         }
         Stats { row: row.clone(), now }
+        Made { row: row.clone() }
+        Start { row: row.clone() }
         PlanCard { plan: detail.plan.clone(), title: "Plan" }
         div { class: "pb-two",
             Reads { detail: detail.clone() }
@@ -445,6 +450,56 @@ fn Stats(row: PlaybackRow, now: i64) -> Element {
                 value: row.last_read_at.map_or_else(|| "—".to_owned(), |r| since(now, r)),
                 note: furthest(row.furthest),
                 tone: String::new(),
+            }
+        }
+    }
+}
+
+/// How the playback is made (PX-24), in the order a tester asks: how it
+/// is delivered, what decodes and encodes it, where its filters run, and
+/// what comes out.
+#[component]
+fn Made(row: PlaybackRow) -> Element {
+    let made = &row.made;
+    let direct = row.plan == spoolframe_admin_api::PlanKind::Direct;
+    let (word, _) = plan_pill(row.plan);
+    let (tone_map, tone_map_tone) = filter_text(made.tone_map);
+    let (burn_in, burn_in_tone) = filter_text(made.burn_in);
+    let (output, output_note) = output_text(made, direct);
+    rsx! {
+        section { class: "card",
+            div { class: "card-head", h2 { "How it is made" } }
+            div { class: "card-body",
+                div { class: "pb-stats",
+                    Stat { label: "Delivery".to_owned(), value: word.to_owned(), note: delivery(&row.line.delivery), tone: String::new() }
+                    Stat { label: "Decoder".to_owned(), value: decoder_text(made.decoder), note: String::new(), tone: String::new() }
+                    Stat {
+                        label: "Encoder".to_owned(),
+                        value: encoder_text(made.encoder.as_ref()),
+                        note: made.encoder.as_ref().map_or_else(String::new, |e| e.name.clone()),
+                        tone: String::new(),
+                    }
+                    Stat { label: "HDR tone mapping".to_owned(), value: tone_map.to_owned(), note: String::new(), tone: tone_map_tone.to_owned() }
+                    Stat { label: "Subtitle burn-in".to_owned(), value: burn_in.to_owned(), note: String::new(), tone: burn_in_tone.to_owned() }
+                    Stat { label: "Output".to_owned(), value: output, note: output_note, tone: String::new() }
+                }
+            }
+        }
+    }
+}
+
+/// How long it took to start (PX-24), from the request.
+#[component]
+fn Start(row: PlaybackRow) -> Element {
+    rsx! {
+        section { class: "card",
+            div { class: "card-head", h2 { "Start" } }
+            div { class: "card-body",
+                div { class: "pb-stats",
+                    for (label, value, note) in start_parts(&row.start) {
+                        Stat { key: "{label}", label: label.to_owned(), value, note, tone: String::new() }
+                    }
+                }
             }
         }
     }

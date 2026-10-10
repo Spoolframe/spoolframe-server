@@ -10,6 +10,7 @@ use easy_ffprobe::FfProbe;
 
 use crate::descriptor::{MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream};
 use crate::external;
+use crate::keyframe_index::{self, IndexKind};
 use crate::ocr::{self, OcrError};
 use crate::roles;
 use crate::sandbox::{Jail, Limits, Tool};
@@ -66,11 +67,30 @@ pub struct Prober {
     ffprobe: Tool,
     timeout: Duration,
     cache: Mutex<HashMap<PathBuf, (Stamp, Arc<MediaDescriptor>)>>,
-    keyframes: Mutex<HashMap<PathBuf, (Stamp, Keyframes)>>,
+    keyframes: Mutex<HashMap<PathBuf, (Stamp, Keyframes, KeyframesFrom)>>,
 }
 
 /// A file's keyframe times, ms.
 type Keyframes = Arc<Vec<u64>>;
+
+/// Where a file's keyframes were read from (PX-25).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyframesFrom {
+    /// The file's own index, checked against what ffprobe reads around a
+    /// few of its entries.
+    Index(IndexKind),
+    /// Every packet of the file, and why not the index.
+    Scan { why: String },
+}
+
+/// The intervals between indexed keyframes that are read to check an
+/// index: the first, two between, and the last.
+const CHECKED_INTERVALS: usize = 4;
+
+/// The longest interval between indexed keyframes the check reads, and
+/// that an index may have: a GOP longer than this is rare, and an index
+/// with one is more likely missing keyframes.
+const LONGEST_INDEXED_GOP_MS: u64 = 30_000;
 
 /// How long listing a file's keyframes may take: it reads the whole file,
 /// which on a network mount is minutes for a large remux.
@@ -167,19 +187,129 @@ impl Prober {
         }))
     }
 
-    /// One ffprobe run. The process is killed if it outlives the timeout.
     /// The times of the main video stream's keyframes, in milliseconds,
     /// ascending, one before time 0 as 0: where a copied video can be cut
-    /// (P2-05's HLS segments).
-    /// Read once per file from the packets' flags, without decoding, and
-    /// remembered until the file changes.
+    /// (P2-05's HLS segments). Remembered until the file changes.
     pub async fn keyframes(&self, path: &Path) -> Result<Keyframes, ProbeError> {
+        Ok(self.keyframes_from(path).await?.0)
+    }
+
+    /// [`Prober::keyframes`], and where they were read from.
+    ///
+    /// PX-25: from the file's own index (Matroska `Cues`, MP4 `stss`,
+    /// `keyframe_index`) where it lists them all, so a copied video's HLS
+    /// starts without reading the whole file first. An index is a claim:
+    /// a muxer may index only some keyframes. It is used only if ffprobe,
+    /// reading the packets of a few intervals between its entries, finds
+    /// a keyframe at each entry and none between; otherwise, and for a
+    /// file with no index the reader follows, every packet is read
+    /// ([`Prober::scan_keyframes`]).
+    pub async fn keyframes_from(
+        &self,
+        path: &Path,
+    ) -> Result<(Keyframes, KeyframesFrom), ProbeError> {
         let stamp = stamp(path).await?;
-        if let Some((cached, times)) = self.keyframes.lock().get(path)
+        if let Some((cached, times, from)) = self.keyframes.lock().get(path)
             && *cached == stamp
         {
-            return Ok(times.clone());
+            return Ok((times.clone(), from.clone()));
         }
+        let indexed = match read_index(path).await {
+            Ok(indexed) => self
+                .check_index(path, &indexed.times_ms)
+                .await
+                .map(|()| indexed),
+            Err(why) => Err(why),
+        };
+        let (times, from) = match indexed {
+            Ok(indexed) => (
+                Arc::new(indexed.times_ms),
+                KeyframesFrom::Index(indexed.kind),
+            ),
+            Err(why) => {
+                tracing::debug!(path = %path.display(), %why, "keyframes from every packet");
+                (
+                    self.scan_keyframes(path).await?,
+                    KeyframesFrom::Scan { why },
+                )
+            }
+        };
+        self.keyframes
+            .lock()
+            .insert(path.to_owned(), (stamp, times.clone(), from.clone()));
+        Ok((times, from))
+    }
+
+    /// Whether ffprobe finds `index`'s keyframes, and only those, in a few
+    /// of the intervals between them: the first, the last and two
+    /// between, each read from its keyframe (ffmpeg seeks there by the
+    /// same index) to the next. A muxer that indexes only some keyframes
+    /// (one per cluster, one every few seconds) leaves some inside the
+    /// intervals, in every part of the film alike; a keyframe left out
+    /// here and there, nowhere near the intervals read, is not found.
+    async fn check_index(&self, path: &Path, index: &[u64]) -> Result<(), String> {
+        let gaps = index.windows(2).map(|w| w[1] - w[0]);
+        match gaps.max() {
+            None => return Err("the index lists one keyframe".into()),
+            Some(gap) if gap > LONGEST_INDEXED_GOP_MS => {
+                return Err(format!("the index has {gap} ms between two keyframes"));
+            }
+            Some(_) => {}
+        }
+        let last = index.len() - 2;
+        let mut picked: Vec<usize> = (0..CHECKED_INTERVALS)
+            .map(|k| last * k / (CHECKED_INTERVALS - 1))
+            .collect();
+        picked.dedup();
+        let windows: Vec<(u64, u64)> = picked.iter().map(|&i| (index[i], index[i + 1])).collect();
+        // From half a millisecond in, so a keyframe the index rounds up a
+        // little is still the one sought to.
+        let intervals = windows
+            .iter()
+            .map(|&(from, to)| {
+                format!(
+                    "{:.4}%{:.4}",
+                    (from as f64 + 0.5) / 1000.0,
+                    to as f64 / 1000.0
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut cmd = self.command(path).map_err(|e| e.to_string())?;
+        cmd.args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-read_intervals", &intervals])
+            .args([
+                "-show_entries",
+                "packet=pts_time,flags",
+                "-of",
+                "csv=p=0",
+                "-i",
+            ])
+            .arg(path);
+        let output = self
+            .output(cmd, path, MAX_KEYFRAME_LISTING, self.timeout)
+            .await
+            .map_err(|e| format!("checking the index: {e}"))?;
+        let read = keyframe_times(&String::from_utf8_lossy(&output));
+        for (from, to) in windows {
+            let found: Vec<u64> = read
+                .iter()
+                .copied()
+                .filter(|t| (from..to).contains(t))
+                .collect();
+            if found != [from] {
+                return Err(format!(
+                    "the index lists a keyframe at {from} ms and the next at {to} ms; \
+                     the packets between have keyframes at {found:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The keyframes from every packet of the file, read without
+    /// decoding: all of the file is read. Not cached.
+    pub async fn scan_keyframes(&self, path: &Path) -> Result<Keyframes, ProbeError> {
         let mut cmd = self.command(path)?;
         cmd.args(["-v", "error", "-select_streams", "v:0"])
             .args([
@@ -193,11 +323,7 @@ impl Prober {
         let output = self
             .output(cmd, path, MAX_KEYFRAME_LISTING, KEYFRAME_TIMEOUT)
             .await?;
-        let times = Arc::new(keyframe_times(&String::from_utf8_lossy(&output)));
-        self.keyframes
-            .lock()
-            .insert(path.to_owned(), (stamp, times.clone()));
-        Ok(times)
+        Ok(Arc::new(keyframe_times(&String::from_utf8_lossy(&output))))
     }
 
     /// ffprobe confined to `path`: a VobSub `.idx` with its `.sub`, which
@@ -282,6 +408,20 @@ impl Prober {
     }
 }
 
+/// The keyframes `path`'s index lists, read on a blocking thread.
+async fn read_index(path: &Path) -> Result<keyframe_index::Indexed, String> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        // Unbuffered: the reader asks for what it reads, a header or a
+        // whole element, and seeks between.
+        let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        keyframe_index::read(&mut file, len).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// `pts_time,flags` lines (`12.345000,K__`) → the keyframes' times in ms,
 /// ascending. A keyframe before time 0 counts as at 0: it is still the
 /// file's first keyframe (an MP4 cut with stream copy starts at the
@@ -296,7 +436,7 @@ fn keyframe_times(csv: &str) -> Vec<u64> {
                 return None;
             }
             let seconds: f64 = time.parse().ok()?;
-            Some((seconds.max(0.0) * 1000.0).round() as u64)
+            Some(keyframe_index::ms(seconds))
         })
         .collect();
     times.sort_unstable();

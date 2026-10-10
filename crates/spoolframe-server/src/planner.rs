@@ -882,7 +882,9 @@ fn encode_audio(
 /// part short enough to read in a row. `none` is no such stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanSummary {
-    /// `direct`, `converted` or `unsupported`.
+    /// `direct`; `remux` when a conversion encodes nothing, only copying
+    /// its streams into another container (PX-24), or `transcode`; or
+    /// `unsupported`.
     pub kind: &'static str,
     pub delivery: Delivery,
     /// `direct:hevc`, `copy:hevc`, `encode:h264:1080p` (`:tonemap` after
@@ -924,7 +926,13 @@ pub fn summary(plan: &PlaybackPlan) -> PlanSummary {
             subtitle,
             ..
         } => PlanSummary {
-            kind: "converted",
+            kind: if matches!(video, Some(ConvertedVideo::Encode { .. }))
+                || audio.is_some_and(|a| matches!(a.action, AudioAction::Encode { .. }))
+            {
+                "transcode"
+            } else {
+                "remux"
+            },
             delivery: *delivery,
             video: video.map_or_else(none, |video| match video {
                 ConvertedVideo::Copy { codec } => format!("copy:{codec}"),
@@ -2358,7 +2366,7 @@ mod tests {
         assert_eq!(
             summary(&plan),
             PlanSummary {
-                kind: "converted",
+                kind: "transcode",
                 delivery: Delivery::Hls,
                 video: "copy:hevc".into(),
                 audio: "encode:eac3:6ch".into(),
@@ -2391,6 +2399,7 @@ mod tests {
             reasons: Vec::new(),
         };
         let burned = summary(&burned);
+        assert_eq!(burned.kind, "transcode");
         assert_eq!(burned.video, "encode:h264:1080p:tonemap");
         assert_eq!(burned.audio, "copy:aac");
         assert_eq!(burned.subtitle, "burn_in:pgs");
@@ -2415,5 +2424,34 @@ mod tests {
                 subtitle: "external:srt".into(),
             }
         );
+    }
+
+    /// PX-24: an HLS playback that copies its video and audio is a remux,
+    /// whatever it does with text beside them.
+    #[test]
+    fn a_copy_of_video_and_audio_is_a_remux() {
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: Container::Mp4,
+            video: Some(ConvertedVideo::Copy {
+                codec: VideoCodec::H264,
+            }),
+            audio: Some(ConvertedAudio {
+                index: 0,
+                action: AudioAction::Copy {
+                    codec: AudioCodec::Aac,
+                },
+            }),
+            subtitle: Some(ConvertedSubtitle {
+                index: 0,
+                action: SubtitleAction::Convert {
+                    from: SubtitleFormat::Srt,
+                    to: SubtitleFormat::WebVtt,
+                },
+            }),
+            ladder: Vec::new(),
+            reasons: Vec::new(),
+        };
+        assert_eq!(summary(&plan).kind, "remux");
     }
 }

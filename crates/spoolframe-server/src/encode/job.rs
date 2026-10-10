@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use spoolframe_media::sandbox::{Jail, Limits, Tool};
 
 use super::JobLimits;
-use super::args::PLAYLIST;
+use super::args::{Made, PLAYLIST};
 use crate::metrics::Counter;
 
 /// How often a job looks at its output.
@@ -54,6 +54,45 @@ pub struct Progress {
     pub last_segment: Option<u32>,
     /// `None` while running; then how it ended.
     pub done: Option<Result<(), Failure>>,
+    /// What was written, over how much of the film (PX-24): what its
+    /// measured bitrate is from.
+    pub output: Measured,
+}
+
+/// Bytes written over the media time they hold (PX-24). For HLS, each
+/// finished segment's file size and its duration in ffmpeg's playlist,
+/// counted once, as it is listed: a run from 0 lists only its last
+/// segment, and a full scratch directory removes old ones. For a
+/// progressive file, the file over the time encoded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Measured {
+    pub bytes: u64,
+    pub ms: u64,
+    /// For HLS, the last segment counted.
+    pub through: Option<u32>,
+}
+
+impl Measured {
+    /// Bits per second, once some media time is written.
+    pub fn bitrate(&self) -> Option<u64> {
+        (self.ms > 0).then(|| (u128::from(self.bytes) * 8000 / u128::from(self.ms)) as u64)
+    }
+
+    /// The segments of `dir`'s ffmpeg `playlist` past [`Measured::through`]
+    /// counted in: their files' sizes and listed durations. A segment
+    /// whose file is gone already is passed over, not counted.
+    fn count_segments(&mut self, dir: &Path, playlist: &str) {
+        for (n, ms) in listed_segments(playlist) {
+            if self.through.is_some_and(|through| n <= through) {
+                continue;
+            }
+            if let Ok(meta) = std::fs::metadata(dir.join(format!("seg{n}.m4s"))) {
+                self.bytes += meta.len();
+                self.ms += ms;
+            }
+            self.through = Some(n);
+        }
+    }
 }
 
 /// Why a job ended unfinished.
@@ -202,8 +241,7 @@ impl Load {
         }
     }
 
-    /// It decodes and encodes a stream again, rather than only copying:
-    /// what holds back frame previews made ahead (P3-13).
+    /// It decodes and encodes a stream again, rather than only copying.
     pub fn encodes(self) -> bool {
         self != Load::Remux
     }
@@ -331,8 +369,8 @@ pub struct Jobs {
     /// Held by the job that looks at a full scratch directory and makes
     /// room in it, so the next job to look sees what the first one freed.
     scratch_check: Arc<tokio::sync::Mutex<()>>,
-    /// How many jobs that encode a stream run now: frame previews made
-    /// ahead wait while any does (P3-13).
+    /// How many jobs run now, and playbacks being prepared: frame
+    /// previews made ahead wait while any is (P3-13, PX-25).
     encoding: Encoding,
     /// Every job started and not yet dropped, to count (P3-14).
     live: parking_lot::Mutex<Vec<std::sync::Weak<EncodeJob>>>,
@@ -385,8 +423,14 @@ pub struct JobCounts {
     pub output_seconds: f64,
 }
 
-/// How many encodes (a stream decoded and encoded again, not only copied
-/// into another container) run now, and a way to wait for that to change.
+/// How many conversions run now, an encode or a remux, and playbacks
+/// being prepared (their keyframes read, PX-25), and a way to wait for
+/// that to change: frame previews made ahead wait while any is (P3-13).
+///
+/// A remux counts as much as an encode: it reads the film as fast as the
+/// disk gives it until it is a read-ahead past its reader, and previews
+/// made ahead read whole films from the same disks. A beta tester's first
+/// remuxes of 4K films took 20–30 s to start beside eight preview workers.
 #[derive(Debug, Clone)]
 pub struct Encoding(Arc<watch::Sender<usize>>);
 
@@ -397,7 +441,8 @@ impl Default for Encoding {
 }
 
 impl Encoding {
-    /// One more encode runs until the guard is dropped.
+    /// One more conversion runs, or playback is prepared, until the guard
+    /// is dropped.
     pub fn begin(&self) -> EncodingGuard {
         self.0.send_modify(|n| *n += 1);
         EncodingGuard(self.0.clone())
@@ -414,7 +459,8 @@ impl Encoding {
     }
 }
 
-/// An encode counted in [`Encoding`] while held.
+/// A conversion or a playback being prepared, counted in [`Encoding`]
+/// while held.
 #[derive(Debug)]
 pub struct EncodingGuard(Arc<watch::Sender<usize>>);
 
@@ -574,6 +620,7 @@ impl Jobs {
             reads,
             gpu,
             fallback,
+            made,
         } = run.into();
         let limits = self.limits();
         let cannot_run = |e: std::io::Error| {
@@ -599,6 +646,7 @@ impl Jobs {
             pid: AtomicU32::new(pid),
             command: parking_lot::Mutex::new(command),
             hardware_decode: AtomicBool::new(fallback.is_some()),
+            made: parking_lot::Mutex::new(made),
             furthest_bytes: AtomicU64::new(0),
             reader_ms: AtomicU64::new(0),
             reader_segment: AtomicU32::new(0),
@@ -623,7 +671,7 @@ impl Jobs {
             slot: slot.clone(),
             progress: progress_tx.clone(),
             counters: self.counters.clone(),
-            _encoding: load.encodes().then(|| self.encoding.begin()),
+            _encoding: self.encoding.begin(),
         };
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
@@ -679,6 +727,8 @@ pub struct Run {
     /// For a run that decodes on the GPU: the same run decoding in
     /// software, for when that fails before the first output.
     pub fallback: Option<Fallback>,
+    /// How it makes its video (PX-24).
+    pub made: Option<Made>,
 }
 
 /// A run decoding in software, in place of one decoding on the GPU.
@@ -689,6 +739,8 @@ pub struct Fallback {
     pub gpu: bool,
     /// The film, as remembered: later runs of it decode in software.
     pub file: PathBuf,
+    /// How it makes its video (PX-24).
+    pub made: Option<Made>,
 }
 
 impl From<Vec<String>> for Run {
@@ -710,6 +762,9 @@ struct Shared {
     command: parking_lot::Mutex<Vec<String>>,
     /// ffmpeg decodes on the GPU.
     hardware_decode: AtomicBool,
+    /// How the ffmpeg running now makes its video (PX-24): the fallback's
+    /// once it runs.
+    made: parking_lot::Mutex<Option<Made>>,
     furthest_bytes: AtomicU64,
     /// For HLS: the media time of the segment asked for last.
     reader_ms: AtomicU64,
@@ -847,6 +902,12 @@ impl EncodeJob {
         self.progress.clone()
     }
 
+    /// How its ffmpeg makes the video (PX-24): the run decoding in
+    /// software once it fell back to it.
+    pub fn made(&self) -> Option<Made> {
+        self.shared.made.lock().clone()
+    }
+
     /// Whether its ffmpeg decodes on the GPU: false once it fell back to
     /// software.
     pub fn decodes_in_hardware(&self) -> bool {
@@ -950,10 +1011,10 @@ struct Supervisor {
     slot: Arc<parking_lot::Mutex<Option<Slot>>>,
     progress: Arc<watch::Sender<Progress>>,
     counters: Arc<JobCounters>,
-    /// Counted as encoding for as long as the supervisor runs: until
+    /// Counted in [`Encoding`] for as long as the supervisor runs: until
     /// ffmpeg exits, is ended as stalled, or the job is stopped (which
     /// aborts the supervisor).
-    _encoding: Option<EncodingGuard>,
+    _encoding: EncodingGuard,
 }
 
 /// How one ffmpeg ended.
@@ -1027,6 +1088,7 @@ impl Supervisor {
         let pid = child.id().unwrap_or(0);
         self.shared.pid.store(pid, Ordering::Relaxed);
         self.shared.hardware_decode.store(false, Ordering::Relaxed);
+        *self.shared.made.lock() = fallback.made.clone();
         self.shared.paused.store(false, Ordering::Relaxed);
         let mut command = vec![self.ffmpeg.program().display().to_string()];
         command.extend(fallback.args.iter().cloned());
@@ -1135,10 +1197,12 @@ impl Supervisor {
                 _ = tick.tick() => {
                     let (bytes, last_segment) = self.measure();
                     self.throttle(encoded_ms, base_ms, bytes, last_segment);
+                    let output = self.output(bytes, encoded_ms, last_segment);
                     self.progress.send_modify(|p| {
                         p.bytes = bytes;
                         p.encoded_ms = encoded_ms;
                         p.last_segment = last_segment;
+                        p.output = output;
                     });
                     // ffmpeg can wait for ever with nothing wrong that it
                     // knows of. One held back for its reader is not
@@ -1187,10 +1251,13 @@ impl Supervisor {
             self.shared.stderr_line(line);
         }
         let (bytes, last_segment) = self.measure();
+        let encoded_ms = self.progress.borrow().encoded_ms.max(encoded_ms);
+        let output = self.output(bytes, encoded_ms, last_segment);
         self.progress.send_modify(|p| {
             p.bytes = bytes;
             p.last_segment = last_segment;
-            p.encoded_ms = p.encoded_ms.max(encoded_ms);
+            p.encoded_ms = encoded_ms;
+            p.output = output;
         });
         Ended::Exited(status)
     }
@@ -1251,6 +1318,27 @@ impl Supervisor {
     /// Bytes written, and for HLS the highest segment on disk.
     fn measure(&self) -> (u64, Option<u32>) {
         measure(&self.written, &self.dir)
+    }
+
+    /// [`Progress::output`] now, `bytes` and `last_segment` just measured
+    /// and `encoded_ms` reported: for HLS, the segments finished since it
+    /// last counted added in.
+    fn output(&self, bytes: u64, encoded_ms: u64, last_segment: Option<u32>) -> Measured {
+        let mut output = self.progress.borrow().output;
+        match self.written {
+            Written::Progressive { .. } => {
+                output.bytes = bytes;
+                output.ms = encoded_ms.saturating_sub(self.start_ms);
+            }
+            Written::Hls => {
+                if last_segment > output.through
+                    && let Ok(playlist) = std::fs::read_to_string(self.dir.join(PLAYLIST))
+                {
+                    output.count_segments(&self.dir, &playlist);
+                }
+            }
+        }
+        output
     }
 
     /// Pause ffmpeg once it is `read_ahead` past its reader; resume it at
@@ -1355,6 +1443,29 @@ fn dir_size(dir: &Path) -> u64 {
             _ => 0,
         })
         .sum()
+}
+
+/// Each `seg<n>.m4s` an ffmpeg HLS playlist lists, with the duration its
+/// `#EXTINF` gives it, ms.
+fn listed_segments(playlist: &str) -> Vec<(u32, u64)> {
+    let mut listed = Vec::new();
+    let mut duration = None;
+    for line in playlist.lines() {
+        if let Some(info) = line.strip_prefix("#EXTINF:") {
+            duration = info
+                .split(',')
+                .next()
+                .and_then(|secs| secs.trim().parse::<f64>().ok())
+                .map(|secs| (secs * 1000.0).round() as u64);
+        } else if let Some(n) = line
+            .strip_prefix("seg")
+            .and_then(|rest| rest.strip_suffix(".m4s"))
+            .and_then(|n| n.parse().ok())
+        {
+            listed.push((n, duration.take().unwrap_or(0)));
+        }
+    }
+    listed
 }
 
 /// The highest `seg<n>.m4s` an ffmpeg HLS playlist lists.
@@ -1559,6 +1670,47 @@ pub(super) mod tests {
                         #EXTINF:6.000000,\nseg4.m4s\n#EXTINF:6.000000,\nseg5.m4s\n";
         assert_eq!(last_listed(playlist), Some(5));
         assert_eq!(last_listed("#EXTM3U\n#EXT-X-VERSION:7\n"), None);
+    }
+
+    /// PX-24: the measured bitrate is the finished segments' bytes over
+    /// their listed durations, each counted once as the playlist lists it,
+    /// though a run from 0 lists only its last.
+    #[tokio::test]
+    async fn the_measured_bitrate_is_segment_bytes_over_their_durations() {
+        let dir = scratch("measured").await;
+        let dir = dir.as_ref();
+        // Segment 1: 2 s, 500 kB; 2: 2 s, 500 kB; 3: 4 s, 1 MB.
+        for (n, bytes) in [(1, 500_000), (2, 500_000), (3, 1_000_000)] {
+            std::fs::write(dir.join(format!("seg{n}.m4s")), vec![0u8; bytes]).unwrap();
+        }
+        let listing = |n: u32, secs: &str| {
+            format!(
+                "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.mp4\"\n\
+                 #EXTINF:{secs},\nseg{n}.m4s\n"
+            )
+        };
+        let mut output = Measured::default();
+        assert_eq!(output.bitrate(), None, "nothing written yet");
+        output.count_segments(dir, &listing(1, "2.000000"));
+        output.count_segments(dir, &listing(1, "2.000000"));
+        assert_eq!((output.bytes, output.ms), (500_000, 2000), "counted once");
+        assert_eq!(output.bitrate(), Some(2_000_000));
+        output.count_segments(dir, &listing(2, "2.000000"));
+        output.count_segments(dir, &listing(3, "4.000000"));
+        // 2 MB over 8 s.
+        assert_eq!(output.through, Some(3));
+        assert_eq!(output.bitrate(), Some(2_000_000));
+        // One with every segment listed counts only the ones after.
+        std::fs::write(dir.join("seg4.m4s"), vec![0u8; 3_000_000]).unwrap();
+        let all = format!(
+            "{}#EXTINF:2.000000,\nseg2.m4s\n#EXTINF:4.000000,\nseg3.m4s\n\
+             #EXTINF:4.000000,\nseg4.m4s\n",
+            listing(1, "2.000000")
+        );
+        output.count_segments(dir, &all);
+        // 5 MB over 12 s.
+        assert_eq!((output.bytes, output.ms), (5_000_000, 12_000));
+        assert_eq!(output.bitrate(), Some(3_333_333));
     }
 
     /// A directory of the test's own, removed when dropped.
@@ -1771,7 +1923,8 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn an_encode_counts_as_encoding_while_ffmpeg_runs_and_a_copy_never_does() {
+    /// PX-25: a remux counts as an encode does.
+    async fn a_conversion_counts_while_ffmpeg_runs_a_remux_too() {
         let (some, _dir) = jobs("encoding", "exec sleep 30", 3, Duration::from_secs(60)).await;
         let encoding = some.encoding();
         let scratch = some.dir().to_path_buf();
@@ -1787,7 +1940,7 @@ pub(super) mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(encoding.running(), 0);
+        assert_eq!(encoding.running(), 1);
         let stopped = some
             .start(
                 scratch.join("a/0"),
@@ -1800,10 +1953,10 @@ pub(super) mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(encoding.running(), 1);
+        assert_eq!(encoding.running(), 2);
         stopped.stop();
+        copy.stop();
         none_encoding(&encoding).await;
-        drop(copy);
         // One whose ffmpeg exits by itself stops counting then, though
         // the job (its playback) lives on.
         let (quick, _dir) = jobs("encoding-exits", "exit 0", 1, Duration::from_secs(60)).await;
@@ -1886,8 +2039,28 @@ pub(super) mod tests {
                 args: vec![file],
                 gpu: false,
                 file: film.to_owned(),
+                made: Some(made_by(crate::encode::Decoder::Software)),
             }),
+            made: Some(made_by(crate::encode::Decoder::Hardware(
+                spoolframe_media::encoders::Hardware::Vaapi,
+            ))),
             ..Run::default()
+        }
+    }
+
+    /// A 1080p encode decoded by `decoder`, tone-mapped where it decodes.
+    fn made_by(decoder: crate::encode::Decoder) -> Made {
+        use crate::encode::{Decoder, FilterOn};
+        Made {
+            decoder,
+            encoder: None,
+            tone_map: match decoder {
+                Decoder::Hardware(_) => FilterOn::Gpu,
+                _ => FilterOn::Cpu,
+            },
+            burn_in: FilterOn::None,
+            size: Some((1920, 1080)),
+            target_bitrate: None,
         }
     }
 
@@ -1937,6 +2110,9 @@ pub(super) mod tests {
         assert!(jobs.hardware_decode_failed(&film));
         assert!(!jobs.hardware_decode_failed(&tmp.as_ref().join("other.mkv")));
         assert!(!job.decodes_in_hardware());
+        // PX-24: what playback debug says is made now is the run in
+        // software's.
+        assert_eq!(job.made(), Some(made_by(crate::encode::Decoder::Software)));
         // What ran last is what playback debug shows; what the GPU run
         // said is kept above it.
         assert_eq!(
@@ -2130,7 +2306,8 @@ pub(super) mod tests {
             None,
         );
         assert!(other.is_ok(), "the ended job still holds its place");
-        eventually(|| jobs.encoding().running() == 0).await;
+        // The ended job no longer counts for previews; the new remux does.
+        eventually(|| jobs.encoding().running() == 1).await;
     }
 
     #[tokio::test]

@@ -6,9 +6,16 @@
 //! cuts are therefore decided here, and the encode is made to cut at them,
 //! across restarts too:
 //!
-//! - An encoded video gets a keyframe forced every 6 s from the first, so
-//!   segments are a 6 s grid. A restart begins on the grid, and ffmpeg's
-//!   HLS muxer, which cuts at `start + 6 s × n`, stays on it.
+//! - An encoded video gets a keyframe forced at every cut, so segments are
+//!   a grid: 2 s, 2 s and 4 s first (PX-26: the player has a segment to
+//!   play two seconds into the encode, not six), then 6 s. ffmpeg's HLS
+//!   muxer cuts at the first keyframe from `start + 6 s × n` on; for a run
+//!   from 0, `hls_init_time` 2 s with a one-entry list makes that 2 s, 4 s,
+//!   then 8 s and every 6 s on ([`Segments::encoded`]). A keyframe the
+//!   encoder adds itself (a scene change) is never past a threshold
+//!   before the forced one, so it does not move a cut. A restart begins on
+//!   the grid past the head, at `start + 6 s × n`, and stays on it; one in
+//!   the head starts from 0.
 //! - A copied video can only be cut at the source's keyframes. ffmpeg
 //!   counts its 6 s from where a run starts, so a restart at a keyframe off
 //!   the grid would cut elsewhere than a run from 0. Instead every keyframe
@@ -24,10 +31,14 @@ use spoolframe_media::{MAX_DURATION, MediaDescriptor, SubtitleStream, VideoRange
 use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo};
 use spoolframe_types::{AudioCodec, VideoCodec, language};
 
-use super::args::SEGMENT_SECS;
+use super::args::{FIRST_SEGMENT_SECS, SEGMENT_SECS};
 
 /// The shortest last segment kept on its own.
 const TAIL_MS: u64 = 500;
+
+/// The segments of an encoded video that only a run from 0 cuts where
+/// [`Segments::encoded`] says: 0–2 s, 2–4 s and 4–8 s.
+const ENCODED_HEAD: u32 = 3;
 
 /// The segments of a converted playback: segment `n` (from 1) starts at
 /// `starts_ms[n - 1]` and ends where the next starts, or at `total_ms`.
@@ -35,6 +46,9 @@ const TAIL_MS: u64 = 500;
 pub struct Segments {
     pub starts_ms: Vec<u64>,
     pub total_ms: u64,
+    /// Segments 1 to `head` are written only by a run from 0: a run for
+    /// any of them starts at segment 1 ([`Segments::run_from`]).
+    head: u32,
 }
 
 /// The length an HLS grid is cut over, in ms, from ffprobe's length of
@@ -53,11 +67,35 @@ pub fn hls_total_ms(duration: Option<std::time::Duration>) -> Result<u64, String
 }
 
 impl Segments {
-    /// A grid of [`SEGMENT_SECS`].
+    /// A grid of [`SEGMENT_SECS`]: audio alone.
     pub fn grid(total_ms: u64) -> Self {
+        Self::tidy(Self::cuts(total_ms, 0, 0), total_ms, 0)
+    }
+
+    /// An encoded video's grid (PX-26): [`FIRST_SEGMENT_SECS`] twice, then
+    /// what is left to [`FIRST_SEGMENT_SECS`] + [`SEGMENT_SECS`], then
+    /// [`SEGMENT_SECS`]: 0, 2, 4, 8, 14, 20 s… These are the thresholds
+    /// ffmpeg's HLS muxer cuts at with `hls_init_time` and a one-entry list
+    /// (see `args`), and the times keyframes are forced at.
+    pub fn encoded(total_ms: u64) -> Self {
+        let first = u64::from(FIRST_SEGMENT_SECS) * 1000;
+        let head = [0, first, 2 * first];
+        let mut starts_ms: Vec<u64> = head
+            .into_iter()
+            .filter(|&t| t == 0 || t < total_ms)
+            .collect();
+        if starts_ms.len() == head.len() {
+            starts_ms.extend(Self::cuts(total_ms, first, 1));
+        }
+        Self::tidy(starts_ms, total_ms, ENCODED_HEAD)
+    }
+
+    /// Every [`SEGMENT_SECS`] from `from_ms` up to `total_ms`, the first
+    /// `skip` of them left out; 0 alone for an empty file.
+    fn cuts(total_ms: u64, from_ms: u64, skip: usize) -> Vec<u64> {
         let step = u64::from(SEGMENT_SECS) * 1000;
-        let count = total_ms.div_ceil(step).max(1);
-        Self::tidy((0..count).map(|i| i * step).collect(), total_ms)
+        let count = total_ms.saturating_sub(from_ms).div_ceil(step).max(1);
+        (0..count).map(|i| from_ms + i * step).skip(skip).collect()
     }
 
     /// A cut at every keyframe but the first: the first segment starts at 0
@@ -67,13 +105,13 @@ impl Segments {
         let mut starts_ms = vec![0];
         let later = keyframes.iter().skip(1).copied();
         starts_ms.extend(later.filter(|&t| t > 0 && t < total_ms));
-        Self::tidy(starts_ms, total_ms)
+        Self::tidy(starts_ms, total_ms, 0)
     }
 
     /// A last segment shorter than [`TAIL_MS`] is folded into the one
     /// before: the file's duration often runs a few milliseconds past its
     /// last video frame (the audio), and ffmpeg does not cut there.
-    fn tidy(mut starts_ms: Vec<u64>, total_ms: u64) -> Self {
+    fn tidy(mut starts_ms: Vec<u64>, total_ms: u64, head: u32) -> Self {
         if starts_ms.len() > 1
             && let Some(&last) = starts_ms.last()
             && total_ms.saturating_sub(last) < TAIL_MS
@@ -83,7 +121,15 @@ impl Segments {
         Self {
             starts_ms,
             total_ms,
+            head,
         }
+    }
+
+    /// The segment a run that is to write segment `n` starts at: `n`
+    /// itself, or 1 for a segment of the head, which a run started
+    /// anywhere else cuts elsewhere.
+    pub fn run_from(&self, n: u32) -> u32 {
+        if n <= self.head { 1 } else { n }
     }
 
     pub fn count(&self) -> u32 {
@@ -169,10 +215,12 @@ impl Rate {
     }
 
     /// A video encode capped at `cap` (`-maxrate cap -bufsize 2×cap`): a
-    /// segment holds at most its time at the cap plus the full buffer.
+    /// segment holds at most its time at the cap plus the full buffer, and
+    /// the shortest, the first ([`FIRST_SEGMENT_SECS`], PX-26), has the
+    /// most over its time: twice the cap at 2 s.
     fn capped(cap: u64) -> Self {
         Self {
-            peak: cap.saturating_add(cap.saturating_mul(2) / u64::from(SEGMENT_SECS)),
+            peak: cap.saturating_add(cap.saturating_mul(2) / u64::from(FIRST_SEGMENT_SECS)),
             average: cap,
         }
     }
@@ -523,6 +571,69 @@ mod tests {
         assert!(playlist.ends_with("#EXT-X-ENDLIST\n"));
     }
 
+    /// PX-26: an encoded video's first segment is 2 s, so the player has
+    /// one to play two seconds into the encode; the second 2 s and the
+    /// third 4 s, where ffmpeg's muxer cuts, then 6 s.
+    #[test]
+    fn an_encoded_grid_starts_with_two_second_segments() {
+        let s = Segments::encoded(30_000);
+        assert_eq!(s.starts_ms, [0, 2000, 4000, 8000, 14_000, 20_000, 26_000]);
+        assert_eq!(s.end(1), Some(2000));
+        assert_eq!(s.start(4), Some(8000));
+        assert_eq!(s.end(7), Some(30_000));
+    }
+
+    #[test]
+    fn a_short_encoded_film_keeps_what_of_the_head_it_reaches() {
+        assert_eq!(Segments::encoded(0).starts_ms, [0]);
+        assert_eq!(Segments::encoded(1_500).starts_ms, [0]);
+        assert_eq!(Segments::encoded(3_000).starts_ms, [0, 2000]);
+        assert_eq!(Segments::encoded(8_000).starts_ms, [0, 2000, 4000]);
+        assert_eq!(Segments::encoded(8_600).starts_ms, [0, 2000, 4000, 8000]);
+        // A sliver past the head joins its last segment.
+        assert_eq!(Segments::encoded(8_200).starts_ms, [0, 2000, 4000]);
+    }
+
+    #[test]
+    fn an_encoded_playlist_lists_the_short_head_and_the_longest_as_its_target() {
+        let playlist = Segments::encoded(20_000).media_playlist();
+        let extinf: Vec<&str> = playlist
+            .lines()
+            .filter(|l| l.starts_with("#EXTINF:"))
+            .collect();
+        assert_eq!(
+            extinf,
+            [
+                "#EXTINF:2.000,",
+                "#EXTINF:2.000,",
+                "#EXTINF:4.000,",
+                "#EXTINF:6.000,",
+                "#EXTINF:6.000,"
+            ]
+        );
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:6\n"), "{playlist}");
+        assert!(
+            playlist.contains("#EXTINF:2.000,\nseg1.m4s\n"),
+            "{playlist}"
+        );
+    }
+
+    /// A run started in the head would cut on the 6 s grid from where it
+    /// started: a segment of the head is written by a run from 0.
+    #[test]
+    fn a_run_for_a_segment_of_the_head_starts_at_the_first() {
+        let s = Segments::encoded(60_000);
+        assert_eq!([1, 2, 3].map(|n| s.run_from(n)), [1, 1, 1]);
+        assert_eq!(s.run_from(4), 4);
+        assert_eq!(s.run_from(9), 9);
+        // The audio grid and keyframe cuts start a run anywhere.
+        assert_eq!(Segments::grid(60_000).run_from(2), 2);
+        assert_eq!(
+            Segments::at_keyframes(&[0, 2000, 4000], 6000).run_from(2),
+            2
+        );
+    }
+
     #[test]
     fn a_sliver_at_the_end_joins_the_last_segment() {
         // 30.005 s: the audio runs 5 ms past the last frame.
@@ -720,7 +831,8 @@ mod tests {
     }
 
     /// A capped encode's segments can run over its cap by what the
-    /// encoder's buffer holds, twice the cap, spread over one segment.
+    /// encoder's buffer holds, twice the cap, spread over the shortest
+    /// segment: the first, 2 s (PX-26).
     #[test]
     fn a_capped_encode_declares_its_cap_and_its_buffer() {
         let video = Some(ConvertedVideo::Encode {
@@ -738,7 +850,7 @@ mod tests {
             },
         });
         let text = multivariant_playlist(&film("bt709"), video, aac, None);
-        assert_eq!(bandwidths(&text), (8_000_000 + 220_000, Some(6_200_000)));
+        assert_eq!(bandwidths(&text), (12_000_000 + 220_000, Some(6_200_000)));
     }
 
     #[test]

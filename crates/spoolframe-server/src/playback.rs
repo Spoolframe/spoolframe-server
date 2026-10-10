@@ -229,6 +229,120 @@ impl FileId {
     }
 }
 
+/// Where a playback's keyframes were read from (PX-25, shown by PX-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframesFrom {
+    /// The file's own index.
+    Index,
+    /// Every packet of the file.
+    Scan,
+}
+
+impl KeyframesFrom {
+    pub fn of(from: &spoolframe_media::KeyframesFrom) -> Self {
+        match from {
+            spoolframe_media::KeyframesFrom::Index(_) => KeyframesFrom::Index,
+            spoolframe_media::KeyframesFrom::Scan { .. } => KeyframesFrom::Scan,
+        }
+    }
+}
+
+/// When a playback's first segment was ready (PX-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstSegment {
+    /// Direct play has none: the file is there to read at once, and when
+    /// the client first reads it is the client's doing.
+    Direct,
+    /// Its conversion has written none yet.
+    Waiting,
+    /// This long after the request.
+    Ready(Duration),
+    /// Its first encode ended (failed, ended, or replaced by a seek)
+    /// before it wrote one.
+    Never,
+}
+
+/// How long a playback took to start (PX-24), from its `StartPlayback`
+/// request: what the "playback start timed" log line says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartTimes {
+    /// From the request to the plan made.
+    pub plan: Duration,
+    /// How long its keyframes took to read, and where from; `None` when
+    /// none were read (only a copied video's HLS needs them).
+    pub keyframes: Option<(Duration, KeyframesFrom)>,
+    /// From the request to the first segment written (or, progressive,
+    /// the first bytes).
+    pub first_segment: FirstSegment,
+}
+
+impl StartTimes {
+    /// Log the start's breakdown: once per start, when its first segment
+    /// is ready, or at once for direct play.
+    pub fn log(&self, id: &MediaId) {
+        let (keyframes_ms, keyframes) = match self.keyframes {
+            Some((took, from)) => (
+                took.as_millis().to_string(),
+                match from {
+                    KeyframesFrom::Index => "index",
+                    KeyframesFrom::Scan => "scan",
+                },
+            ),
+            None => ("none".to_owned(), "none"),
+        };
+        let first_segment_ms = match self.first_segment {
+            FirstSegment::Ready(took) => took.as_millis().to_string(),
+            FirstSegment::Direct => "n/a".to_owned(),
+            FirstSegment::Waiting | FirstSegment::Never => "none".to_owned(),
+        };
+        tracing::info!(
+            %id,
+            plan_ms = self.plan.as_millis() as u64,
+            %keyframes_ms,
+            keyframes,
+            %first_segment_ms,
+            "playback start timed"
+        );
+    }
+}
+
+/// Wait for the first segment of a conversion's first run, whose progress
+/// is `progress`, and say when it was ready in `times`, then log the
+/// start. HLS waits for a finished segment; a progressive file for its
+/// first bytes. `requested` is when the request came.
+pub async fn time_first_segment(
+    times: Arc<Mutex<StartTimes>>,
+    requested: Instant,
+    mut progress: watch::Receiver<crate::encode::job::Progress>,
+    hls: bool,
+    id: MediaId,
+) {
+    let ready = |p: &crate::encode::job::Progress| {
+        if hls {
+            p.last_segment.is_some()
+        } else {
+            p.bytes > 0
+        }
+    };
+    // Ready, or ended without one; or the run was stopped (a seek, the
+    // playback ended), and what it wrote by then is all there is.
+    let wrote = match progress.wait_for(|p| ready(p) || p.done.is_some()).await {
+        Ok(p) => ready(&p),
+        Err(_) => false,
+    } || ready(&progress.borrow());
+    let first = if wrote {
+        FirstSegment::Ready(requested.elapsed())
+    } else {
+        FirstSegment::Never
+    };
+    let now = {
+        let mut times = times.lock();
+        times.first_segment = first;
+        *times
+    };
+    now.log(&id);
+}
+
 /// One playback.
 #[derive(Debug, Clone)]
 pub struct Playback {
@@ -265,6 +379,11 @@ pub struct Playback {
     pub conversion: Option<Arc<Conversion>>,
     /// The quality it is planned for (P6-06), again at a subtitle change.
     pub quality: Quality,
+    /// The file's picture, width × height (PX-24): what direct play
+    /// writes.
+    pub video_size: Option<(u32, u32)>,
+    /// How long it took to start (PX-24).
+    pub start: Arc<Mutex<StartTimes>>,
     /// The connection that started it (a number of the server's own).
     connection: u64,
     last_used: Instant,
@@ -331,6 +450,11 @@ pub struct Opened {
     pub conversion: Option<Arc<Conversion>>,
     /// The quality the viewer chose (P6-06).
     pub quality: Quality,
+    /// The file's picture, width × height.
+    pub video_size: Option<(u32, u32)>,
+    /// How long it took to start (PX-24); its first segment filled in
+    /// once ready.
+    pub start: Arc<Mutex<StartTimes>>,
     /// The connection starting it ([`Playbacks::connection_closed`]).
     pub connection: u64,
 }
@@ -480,6 +604,9 @@ pub struct Snapshot {
     /// The last [`READS_KEPT`], oldest first.
     pub reads: Vec<ReadPoint>,
     pub conversion: Option<ConversionSnapshot>,
+    /// The file's picture, width × height.
+    pub video_size: Option<(u32, u32)>,
+    pub start: StartTimes,
 }
 
 /// A playback's conversion at one moment (P3-15).
@@ -506,6 +633,10 @@ pub struct ConversionSnapshot {
     pub encodes: bool,
     /// What it weighs against the encode budget.
     pub load: crate::encode::Load,
+    /// How its running encode makes the video (PX-24).
+    pub made: Option<crate::encode::Made>,
+    /// What that encode has written, over how much of the film.
+    pub output: crate::encode::Measured,
 }
 
 /// A playback that ended in the last hour (P3-15), as it was at the end.
@@ -558,6 +689,8 @@ impl Playback {
                     .collect(),
                 encodes: c.encodes(),
                 load: c.load(),
+                made: job.made(),
+                output: progress.output,
             }
         });
         Snapshot {
@@ -578,6 +711,8 @@ impl Playback {
             last_read_at: trace.last_read,
             reads: trace.reads.iter().copied().collect(),
             conversion,
+            video_size: self.video_size,
+            start: *self.start.lock(),
         }
     }
 }
@@ -781,6 +916,8 @@ impl Playbacks {
                 subtitle: opened.subtitle,
                 conversion: opened.conversion,
                 quality: opened.quality,
+                video_size: opened.video_size,
+                start: opened.start,
                 connection: opened.connection,
                 last_used: now,
                 last_read: None,
@@ -1381,6 +1518,12 @@ mod tests {
             subtitle: None,
             conversion: None,
             quality: Quality::default(),
+            video_size: None,
+            start: Arc::new(Mutex::new(StartTimes {
+                plan: Duration::ZERO,
+                keyframes: None,
+                first_segment: FirstSegment::Direct,
+            })),
             connection: 0,
         }
     }

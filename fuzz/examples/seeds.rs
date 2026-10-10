@@ -441,9 +441,33 @@ async fn bitmaps() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Two seconds of a test pattern with sound, as Matroska with its Cues
+/// and as MP4 with its sync samples, for `keyframe_index`.
+fn films() {
+    let dir = std::env::temp_dir().join(format!("spoolframe-fuzz-films-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, extension) in [("cues", "mkv"), ("stss", "mp4")] {
+        let film = dir.join(format!("film.{extension}"));
+        run(Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .args(["testsrc2=s=32x18:r=10:d=2", "-f", "lavfi", "-i"])
+            .args(["sine=d=2:sample_rate=8000", "-c:v", "libx264", "-g", "5"])
+            .args(["-c:a", "aac", "-b:a", "8k"])
+            .arg(&film));
+        let bytes = std::fs::read(&film).unwrap();
+        let mut reader = std::io::Cursor::new(&bytes);
+        let indexed = spoolframe_media::keyframe_index::read(&mut reader, bytes.len() as u64)
+            .unwrap_or_else(|e| panic!("the {extension} seed: {e}"));
+        assert!(indexed.times_ms.len() >= 2, "the {extension} seed");
+        write("keyframe_index", name, &bytes);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     protocol().await;
     invites();
     bitmaps().await;
+    films();
 }

@@ -3286,3 +3286,33 @@
   Sever (`admin.userUntie`, `me.portableUntie`); tying is done from the
   phone app only. The SDK ties with `Session::tie` and severs with
   `Session::untie`. Signing in with a tied credential is P7-06.
+- An encoded HLS playback's first segment is 2 s (PX-26): the grid is
+  0, 2, 4, 8, 14 s… and the player has a segment two seconds into the
+  encode, not six. A copied video is still cut at its keyframes, audio
+  alone every 6 s. A run for one of the first three segments starts
+  from 0. The forced keyframes count from the run's first frame, where
+  ffmpeg's HLS muxer counts its cuts from, so they no longer drift off
+  the grid (at 23.976 fps they fell 7 s behind over two hours). A
+  capped encode's BANDWIDTH is now twice its cap: what a 2 s segment
+  can hold.
+- A remux over HLS starts without reading the whole file first (PX-25):
+  a copied video's keyframes come from the file's own index, Matroska's
+  Cues or MP4's sync sample table, read in a fraction of a second where
+  every packet took a minute or two on a 4K remux. The index is used
+  only after ffprobe finds exactly its keyframes in four intervals
+  between them; a file without one, or with one that misses keyframes,
+  is read whole as before. The reader is bounded (48 MiB read, 32 MiB of
+  times) and has a fuzz target, `keyframe_index`.
+- Frame previews made ahead also wait while a remux runs and while a
+  converted playback is being prepared (its keyframes read), not only
+  while an encode runs.
+- Server › Playback says how each playback is made (PX-24), from the
+  plan and the filter graph the server built: delivery (direct, remux,
+  transcode), decoder (software or the GPU's API), video encoder with
+  its codec, HDR tone mapping and subtitle burn-in (GPU, CPU or none),
+  and the output's bitrate measured from the segments written beside
+  the encoder's target, with its size. A playback's page also shows its
+  start: request to plan, the keyframes' read (from the index or a full
+  scan), and the first segment ready; the server logs the same once per
+  start as `playback start timed`. The "playback started" line's
+  `plan=` says `remux` or `transcode` where it said `converted`.

@@ -390,6 +390,9 @@ pub struct ServerOptions {
     pub stalled_after: Duration,
     /// The encoder jobs run: real ffmpeg, or a stand-in script.
     pub ffmpeg: PathBuf,
+    /// With `real_media`, the ffprobe run instead of `ffprobe` (a script
+    /// around it, say).
+    pub real_ffprobe: Option<PathBuf>,
     /// Read bitmap subtitles as text with real tesseract (P2-07). Off: the
     /// server cannot.
     pub ocr: bool,
@@ -456,6 +459,7 @@ impl Default for ServerOptions {
             read_ahead: Duration::from_secs(5),
             stalled_after: spoolframe_server::encode::job::STALLED_AFTER,
             ffmpeg: PathBuf::from("ffmpeg"),
+            real_ffprobe: None,
             ocr: false,
             tesseract: PathBuf::from("tesseract"),
             failure_window: spoolframe_server::auth::FAILURE_WINDOW,
@@ -643,7 +647,9 @@ impl TestServer {
         };
         let artwork =
             ArtworkCache::open(&dir.join("cache/artwork"), 64 << 20, catalog.clone()).unwrap();
-        let ffprobe = if options.real_media {
+        let ffprobe = if let Some(ffprobe) = &options.real_ffprobe {
+            ffprobe.clone()
+        } else if options.real_media {
             PathBuf::from("ffprobe")
         } else {
             fake_ffprobe(&dir, options.ffprobe_fixture)

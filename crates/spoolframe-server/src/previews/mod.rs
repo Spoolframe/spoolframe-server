@@ -14,10 +14,11 @@
 //! Two kinds of work, each with its own workers:
 //!
 //! - Made ahead (`when = ahead`): up to `previews.workers` files at once
-//!   (the physical cores by default, [`workers`]), only while no encode
-//!   runs. When one starts, each file being made stops before its next
-//!   tile and waits, keeping the tiles it has; when the last one ends,
-//!   they go on from there.
+//!   (the physical cores by default, [`workers`]), only while no
+//!   conversion runs, an encode or a remux, and no playback is being
+//!   prepared (its keyframes read, PX-25): [`Encoding`]. When one starts,
+//!   each file being made stops before its next tile and waits, keeping
+//!   the tiles it has; when the last one ends, they go on from there.
 //! - Played, or asked for by a client: one file at a time, at once,
 //!   encodes or not. A file being made ahead that is then played goes on
 //!   at once too, where it is.
@@ -211,7 +212,8 @@ pub struct PreviewSources {
     /// The hardware decoders P2-02 found.
     pub transcoding: Arc<Transcoding>,
     pub ffmpeg: spoolframe_media::sandbox::Tool,
-    /// The encodes running, which previews made ahead wait for.
+    /// The conversions running and playbacks being prepared, which
+    /// previews made ahead wait for.
     pub encoding: Encoding,
 }
 

@@ -25,6 +25,7 @@ the dev shell to fuzz.
 | `bif` | a PMS preview index (BIF) | `spoolframe-plex` `bif.rs` |
 | `plex_json` | a PMS JSON response, decoded and converted to items | `spoolframe-plex` `wire.rs`, `convert.rs` |
 | `ffprobe_json` | ffprobe's JSON for a file, made into a `MediaDescriptor` | the vendored `easy-ffprobe` model, `spoolframe-media` `descriptor.rs` |
+| `keyframe_index` | a media file's own keyframe index: Matroska `Cues`, MP4 `stss` (PX-25) | `spoolframe-media` `keyframe_index.rs` |
 
 The `dvb` and `vobsub` inputs are packets framed as `u16 LE length, u32 LE pts
 in ms, data`. A VobSub input starts with a `u16 LE` length and that much `.idx`
@@ -37,6 +38,13 @@ parsers into the targets only with its `fuzzing` feature.
 such an input can still use about 1 GiB before it is refused; libFuzzer's
 default `-rss_limit_mb=2048` leaves room for that. The server runs this code in
 a child (`decode.rs`), but the targets call it directly.
+
+`keyframe_index` runs in the server process itself, not a child: it reads no
+more than 48 MiB of a file in all and 32 MiB at once, walks MP4's sample
+tables where they lie in what it read (no allocation from a count the file
+states), and keeps at most about 4 million times (32 MiB).
+An input it does not follow is a `NoIndex` error (the server then reads the
+keyframes with ffprobe, confined), never a panic.
 
 ## Running
 
@@ -93,7 +101,7 @@ messages (rewrite them whenever the wire revision changes: a seed of an
 older revision no longer decodes, and the target starts from nothing),
 invite links, a two-cue PGS stream (whole, and split into fragments), and the same
 cues encoded by ffmpeg's `dvbsub` and `dvdsub` encoders and read back as the
-server reads a track.
+server reads a track, and two seconds of film as Matroska and as MP4.
 
 ## Pins
 

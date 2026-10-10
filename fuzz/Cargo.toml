@@ -91,6 +91,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "keyframe_index"
+path = "fuzz_targets/keyframe_index.rs"
+test = false
+doc = false
+bench = false
+
 # For examples/seeds.rs only: the PGS writer, and a runtime to read the
 # DVB and VobSub tracks ffmpeg makes from it.
 [dev-dependencies]

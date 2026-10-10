@@ -1958,7 +1958,7 @@ pub enum PlanKind {
 }
 
 /// A plan in the words of the server's "playback started" log line
-/// (P3-15): `direct`, `converted`, `unsupported`; `range`, `hls`,
+/// (P3-15): `direct`, `remux`, `transcode`, `unsupported`; `range`, `hls`,
 /// `progressive`; `copy:hevc`, `encode:h264:1080p:tonemap`,
 /// `copy:eac3`, `ocr:pgs>srt`, `none`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2094,6 +2094,122 @@ pub struct ConversionState {
     pub weight_quarters: u32,
 }
 
+/// A GPU's video API (PX-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GpuApi {
+    /// VA-API: Intel and AMD on Linux.
+    Vaapi,
+    /// NVIDIA: NVENC to encode, NVDEC (CUDA) to decode.
+    Nvidia,
+    /// Intel Quick Sync.
+    Qsv,
+}
+
+/// What decodes a playback's video (PX-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum VideoDecoder {
+    /// Nothing: direct play, or a copied video.
+    None,
+    Software,
+    #[serde(rename_all = "camelCase")]
+    Gpu {
+        api: GpuApi,
+    },
+}
+
+/// What encodes a playback's video (PX-24).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoEncoderUsed {
+    /// The protocol's codec name: `h264`, `hevc`.
+    pub codec: String,
+    /// ffmpeg's encoder: `h264_nvenc`, `libx264`.
+    pub name: String,
+    /// The GPU it runs on; `None` in software.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub gpu: Option<GpuApi>,
+}
+
+/// Where a filter of the video runs (PX-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FilterPlace {
+    /// Not done: an SDR source or HDR kept; no subtitle burned in.
+    None,
+    Gpu,
+    Cpu,
+}
+
+/// How a playback is made (PX-24), from the plan and the filter graph
+/// the server built, not from ffmpeg's output. The delivery (direct,
+/// remux, transcode) is the row's `plan`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackMade {
+    pub decoder: VideoDecoder,
+    /// `None` when the video is not encoded.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub encoder: Option<VideoEncoderUsed>,
+    /// HDR tone mapped to SDR.
+    pub tone_map: FilterPlace,
+    /// A subtitle burned into the picture.
+    pub burn_in: FilterPlace,
+    /// The picture written, px; `None` with no video.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub width: Option<u32>,
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub height: Option<u32>,
+    /// The encoder's stated target, bit/s, when it has one.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub target_bitrate: Option<u64>,
+    /// What was written, bit/s: HLS segments' bytes over their durations,
+    /// or a progressive file over the time encoded. `None` for direct
+    /// play, and until something is written.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub measured_bitrate: Option<u64>,
+}
+
+/// Where a playback's keyframes came from (PX-24, PX-25).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "camelCase")]
+pub enum KeyframesRead {
+    /// None were read: only a copied video's HLS needs them.
+    None,
+    /// The file's own index.
+    Index { ms: u64 },
+    /// Every packet of the file.
+    Scan { ms: u64 },
+}
+
+/// When a playback's first segment was ready (PX-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum FirstSegment {
+    /// Direct play has none: the file is read as it is.
+    NotApplicable,
+    /// Its conversion has written none yet.
+    Waiting,
+    /// This long after the request.
+    Ready { ms: u64 },
+    /// Its first encode ended before it wrote one.
+    Never,
+}
+
+/// How long a playback took to start, from its request (PX-24): what the
+/// server's "playback start timed" log line says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackStart {
+    /// From the request to the plan.
+    pub plan_ms: u64,
+    /// The keyframes' read alone.
+    pub keyframes: KeyframesRead,
+    /// From the request to the first segment.
+    pub first_segment: FirstSegment,
+}
+
 /// One playback as Server › Playback lists it (P3-15).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2132,6 +2248,10 @@ pub struct PlaybackRow {
     /// Unix ms.
     pub last_read_at: Option<i64>,
     pub conversion: Option<ConversionState>,
+    /// How it is made (PX-24).
+    pub made: PlaybackMade,
+    /// How long it took to start (PX-24).
+    pub start: PlaybackStart,
 }
 
 /// How a playback ended (P3-15).

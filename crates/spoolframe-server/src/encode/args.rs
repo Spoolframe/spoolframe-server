@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use spoolframe_media::encoders::{Encoders, Hardware, TONEMAP_VAAPI, hwaccel_args};
+use spoolframe_media::encoders::{Encoders, Hardware, TONEMAP_VAAPI, VideoEncoder, hwaccel_args};
 use spoolframe_media::{
     MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, VideoStream, codecs,
 };
@@ -22,8 +22,36 @@ use spoolframe_types::{SubtitleFormat, VideoCodec};
 /// HLS segment length (P2-05): Apple's recommendation.
 pub const SEGMENT_SECS: u32 = 6;
 
+/// An encoded video's first segment (PX-26), and its second: what the
+/// player waits for before the first frame. See `hls::Segments::encoded`.
+pub const FIRST_SEGMENT_SECS: u32 = 2;
+
 /// ffmpeg's own HLS playlist, in the job's directory.
 pub const PLAYLIST: &str = "ffmpeg.m3u8";
+
+/// Whether `spec`'s run starts at the film's start: a run of HLS
+/// segment 1, which cuts the encoded grid's short head.
+fn from_start(spec: &EncodeSpec<'_>) -> bool {
+    spec.start.is_none_or(|start| start.is_zero())
+}
+
+/// `-force_key_frames` for an HLS encode: a keyframe at each cut of the
+/// grid, from the run's first frame on. ffmpeg's `t` is the time since
+/// that frame, the same origin the HLS muxer measures its cuts from, so
+/// each target is where the muxer cuts and the keyframes do not drift off
+/// the grid (`prev_forced_t + 6` lands a frame late each time: at
+/// 23.976 fps, 6 ms a segment, 7 s over two hours). A run from 0 cuts at
+/// 0, 2, 4, 8, 14… s (PX-26); any other at 0, 6, 12… s from its start.
+fn forced_keyframes(from_start: bool) -> String {
+    let (first, step) = (FIRST_SEGMENT_SECS, SEGMENT_SECS);
+    if from_start {
+        // The n-th forced keyframe (from 0) at `first × n` for n < 3,
+        // then at `first + step × (n - 2)`.
+        format!("expr:gte(t,if(lt(n_forced,3),{first}*n_forced,{first}+{step}*(n_forced-2)))")
+    } else {
+        format!("expr:gte(t,{step}*n_forced)")
+    }
+}
 
 /// Where and how the job writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +204,96 @@ pub fn cpu_instead_of_gpu(spec: &EncodeSpec<'_>) -> Vec<&'static str> {
             CpuFilter::Text => "text subtitles are burned in on the CPU",
         })
         .collect()
+}
+
+/// Where one of a video encode's filters runs (PX-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOn {
+    /// Not in the graph.
+    None,
+    Gpu,
+    Cpu,
+}
+
+/// What decodes a run's video (PX-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decoder {
+    /// Nothing: the video is copied, or there is none.
+    None,
+    Software,
+    /// On the GPU, through this API.
+    Hardware(Hardware),
+}
+
+/// How a run makes its video (PX-24): what Server › Playback shows,
+/// read from the spec its arguments are built from, so it says what
+/// [`ffmpeg_args`] built, not what ffmpeg's output claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Made {
+    pub decoder: Decoder,
+    /// The video encoder, for an encoded video.
+    pub encoder: Option<VideoEncoder>,
+    pub tone_map: FilterOn,
+    pub burn_in: FilterOn,
+    /// The picture written, width × height: the source's, or scaled to
+    /// the plan's height as `scale=-2:h` (or `scale_vaapi=w=-2`) scales
+    /// it. `None` with no video.
+    pub size: Option<(u32, u32)>,
+    /// The encoder's stated target (`-b:v`), when it has one.
+    pub target_bitrate: Option<u64>,
+}
+
+/// [`Made`] for `spec`: the same decisions [`ffmpeg_args`] makes.
+pub fn made(spec: &EncodeSpec<'_>) -> Made {
+    let stream = spec.descriptor.video.as_ref();
+    let source = stream.map(|v| (v.width, v.height));
+    let Some(ConvertedVideo::Encode {
+        codec,
+        height,
+        max_bitrate,
+        tone_map,
+    }) = spec.video
+    else {
+        return Made {
+            decoder: Decoder::None,
+            encoder: None,
+            tone_map: FilterOn::None,
+            burn_in: FilterOn::None,
+            size: source.filter(|_| matches!(spec.video, Some(ConvertedVideo::Copy { .. }))),
+            target_bitrate: None,
+        };
+    };
+    let decode = decode(spec);
+    // Every filter is on the GPU or none is: `decode` keeps the frames
+    // there only when nothing on the CPU needs them.
+    let on = |used: bool| match (used, decode) {
+        (false, _) => FilterOn::None,
+        (true, Decode::Gpu) => FilterOn::Gpu,
+        (true, _) => FilterOn::Cpu,
+    };
+    Made {
+        decoder: match decode {
+            Decode::Software => Decoder::Software,
+            // Only VA-API decodes on the GPU (`gpu_decodable`).
+            Decode::Hardware | Decode::Gpu => Decoder::Hardware(Hardware::Vaapi),
+        },
+        encoder: spec.encoders.video_encoder(codec).cloned(),
+        tone_map: on(tone_map),
+        burn_in: on(matches!(burned(spec), Ok(Some(_)))),
+        size: source.map(|(w, h)| scaled(w, h, height)),
+        target_bitrate: max_bitrate,
+    }
+}
+
+/// `width` × `height` scaled to `to` high as `scale=-2:to` does: the
+/// width kept in proportion, rounded to the nearest even number. A video
+/// no taller than `to` is not scaled.
+fn scaled(width: u32, height: u32, to: u32) -> (u32, u32) {
+    if to >= height || height == 0 {
+        return (width, height);
+    }
+    let half = (u64::from(width) * u64::from(to) + u64::from(height)) / (2 * u64::from(height));
+    ((half * 2) as u32, to)
 }
 
 /// Whether VA-API drivers decode `stream` at all: 4:2:0, and H.264 only
@@ -479,13 +597,8 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                     ]);
                 }
                 if matches!(spec.output, Output::Hls { .. }) {
-                    // A keyframe every segment, so HLS cuts land on the grid.
-                    args.extend([
-                        s("-force_key_frames"),
-                        format!(
-                            "expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+{SEGMENT_SECS}))"
-                        ),
-                    ]);
+                    // A keyframe at every cut, so HLS cuts land on the grid.
+                    args.extend([s("-force_key_frames"), forced_keyframes(from_start(spec))]);
                 }
             }
             ConvertedVideo::Unknown => return Err(s("a video action this build does not know")),
@@ -573,6 +686,19 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 Some(ConvertedVideo::Copy { .. }) => s("0.1"),
                 _ => s(SEGMENT_SECS),
             };
+            // An encoded video's run from 0 cuts its short head (PX-26):
+            // the muxer's thresholds are `hls_init_time` × n until its list
+            // is full, then go on by `hls_time` from the list's end. With
+            // one entry that is 2 s, 4 s, 8 s, then every 6 s: the grid of
+            // `hls::Segments::encoded`. The list is ffmpeg's own playlist,
+            // which the server reads only for its last segment (`job`).
+            let list_size = match spec.video {
+                Some(ConvertedVideo::Encode { .. }) if from_start(spec) => {
+                    args.extend([s("-hls_init_time"), s(FIRST_SEGMENT_SECS)]);
+                    s(1)
+                }
+                _ => s(0),
+            };
             // ffmpeg names HEVC in MP4 `hev1`, copied or from any encoder;
             // Apple's players take only `hvc1`, which is also what the
             // playlist says (`hls`). The parameter sets are in `init.mp4`
@@ -628,7 +754,7 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 s("-start_number"),
                 s(start_number),
                 s("-hls_list_size"),
-                s("0"),
+                list_size,
                 // ffmpeg's own playlist; the server writes the one clients
                 // see (P2-05), and reads this one to know which segments
                 // are finished.
@@ -643,7 +769,7 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
 mod tests {
     use std::time::Duration;
 
-    use spoolframe_media::encoders::{AudioEncoder, HardwareDecoder, VideoEncoder};
+    use spoolframe_media::encoders::{AudioEncoder, HardwareDecoder};
     use spoolframe_media::{AudioStream, SubtitleStream, VideoStream};
     use spoolframe_types::{AudioCodec, AudioRole, HdrFormat, SubtitleRole};
 
@@ -1228,6 +1354,114 @@ mod tests {
         );
     }
 
+    /// PX-24: a VA-API encode with GPU filters on a driver that runs both
+    /// says the tone map and the burn-in are on the GPU, as the graph has
+    /// them.
+    #[test]
+    fn made_says_a_gpu_tone_map_and_a_gpu_burn_in() {
+        let (film, enc) = (film(), with_filters(true, true));
+        let mut spec = spec_with(
+            &film,
+            &enc,
+            TONE_MAPPED_H264,
+            burn_in(0, SubtitleFormat::Pgs),
+        );
+        spec.gpu_filters = true;
+        let graph = s(after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"));
+        assert!(graph.contains("tonemap_vaapi") && graph.contains("overlay_vaapi"));
+        let made = made(&spec);
+        assert_eq!(made.decoder, Decoder::Hardware(Hardware::Vaapi));
+        assert_eq!(made.encoder.map(|e| e.name), Some(s("h264_vaapi")));
+        assert_eq!(
+            (made.tone_map, made.burn_in),
+            (FilterOn::Gpu, FilterOn::Gpu)
+        );
+        assert_eq!(made.size, Some((1920, 1080)));
+    }
+
+    /// A driver that tone maps but cannot overlay: the pictures are laid
+    /// over on the CPU, so the frames come back and the tone map is done
+    /// there too. What the graph does, not what the driver could.
+    #[test]
+    fn made_says_a_cpu_burn_in_takes_the_tone_map_to_the_cpu() {
+        let (film, enc) = (film(), with_filters(true, false));
+        let mut spec = spec_with(
+            &film,
+            &enc,
+            TONE_MAPPED_H264,
+            burn_in(0, SubtitleFormat::Pgs),
+        );
+        spec.gpu_filters = true;
+        let graph = s(after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"));
+        assert!(graph.contains("tonemap=tonemap=hable") && graph.contains("overlay,"));
+        let made = made(&spec);
+        assert_eq!(made.decoder, Decoder::Hardware(Hardware::Vaapi));
+        assert_eq!(
+            (made.tone_map, made.burn_in),
+            (FilterOn::Cpu, FilterOn::Cpu)
+        );
+    }
+
+    /// NVENC decodes in software here, and filters on the CPU.
+    #[test]
+    fn made_says_nvenc_decodes_in_software() {
+        let film = film();
+        let enc = Encoders {
+            video: vec![VideoEncoder {
+                codec: VideoCodec::H264,
+                name: "h264_nvenc".into(),
+                hardware: Some(Hardware::Nvenc),
+            }],
+            ..with_decoders(false)
+        };
+        let video = ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height: 720,
+            max_bitrate: Some(4_000_000),
+            tone_map: true,
+        };
+        let made = made(&spec_with(&film, &enc, video, None));
+        assert_eq!(made.decoder, Decoder::Software);
+        assert_eq!(
+            made.encoder.map(|e| (e.name, e.hardware)),
+            Some((s("h264_nvenc"), Some(Hardware::Nvenc)))
+        );
+        assert_eq!(
+            (made.tone_map, made.burn_in),
+            (FilterOn::Cpu, FilterOn::None)
+        );
+        assert_eq!(made.size, Some((1280, 720)));
+        assert_eq!(made.target_bitrate, Some(4_000_000));
+    }
+
+    /// A copied video is neither decoded nor encoded nor filtered: it is
+    /// written at its own size.
+    #[test]
+    fn made_says_a_copy_runs_nothing() {
+        let (film, enc) = (film(), with_filters(true, true));
+        let made = made(&spec_with(&film, &enc, COPY_HEVC, None));
+        assert_eq!(
+            made,
+            Made {
+                decoder: Decoder::None,
+                encoder: None,
+                tone_map: FilterOn::None,
+                burn_in: FilterOn::None,
+                size: Some((3840, 2160)),
+                target_bitrate: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_scaled_width_is_even_and_in_proportion() {
+        assert_eq!(scaled(3840, 2160, 1080), (1920, 1080));
+        assert_eq!(scaled(1920, 800, 720), (1728, 720));
+        // 1918 × 720 / 1080 = 1278.7: 639.3 pairs, rounded to 639.
+        assert_eq!(scaled(1918, 1080, 720), (1278, 720));
+        assert_eq!(scaled(1280, 720, 1080), (1280, 720));
+    }
+
     #[test]
     fn streams_no_gpu_decodes_are_decoded_in_software() {
         let enc = with_decoders(true);
@@ -1587,8 +1821,7 @@ mod tests {
         assert!(args.contains(&s("-copyts")));
     }
 
-    #[test]
-    fn an_encoded_hls_video_forces_a_keyframe_every_segment() {
+    fn encoded_hls(start: Option<Duration>, start_number: u32) -> Vec<String> {
         let (film, enc) = (film(), encoders(false));
         let video = ConvertedVideo::Encode {
             codec: VideoCodec::H264,
@@ -1598,14 +1831,52 @@ mod tests {
         };
         let output = Output::Hls {
             dir: "/scratch/h/0".into(),
-            start_number: 4,
+            start_number,
         };
-        let args = ffmpeg_args(&spec(&film, &enc, video, COPY_DTS, None, output)).unwrap();
-        assert_eq!(
-            after(&args, "-force_key_frames"),
-            "expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+6))"
-        );
+        let mut spec = spec(&film, &enc, video, COPY_DTS, None, output);
+        spec.start = start;
+        ffmpeg_args(&spec).unwrap()
+    }
+
+    /// PX-26: a run from 0 forces keyframes at 0, 2, 4, 8, 14… s from its
+    /// first frame, and has the muxer cut there: 2 s twice, then 6 s from
+    /// the end of a one-entry list.
+    #[test]
+    fn an_encoded_hls_run_from_the_start_cuts_the_short_head() {
+        for start in [None, Some(Duration::ZERO)] {
+            let args = encoded_hls(start, 1);
+            assert_eq!(
+                after(&args, "-force_key_frames"),
+                "expr:gte(t,if(lt(n_forced,3),2*n_forced,2+6*(n_forced-2)))"
+            );
+            assert_eq!(after(&args, "-hls_time"), "6");
+            assert_eq!(after(&args, "-hls_init_time"), "2");
+            assert_eq!(after(&args, "-hls_list_size"), "1");
+        }
+    }
+
+    /// A run from segment 4 on is on the 6 s grid from where it starts.
+    #[test]
+    fn an_encoded_hls_restart_forces_a_keyframe_every_six_seconds() {
+        let args = encoded_hls(Some(Duration::from_secs(8)), 4);
+        assert_eq!(after(&args, "-force_key_frames"), "expr:gte(t,6*n_forced)");
         assert_eq!(after(&args, "-hls_time"), "6");
+        assert!(!args.contains(&s("-hls_init_time")), "{args:?}");
+        assert_eq!(after(&args, "-hls_list_size"), "0");
+    }
+
+    /// A copied video is cut at its own keyframes: no head of its own.
+    #[test]
+    fn a_copied_hls_video_has_no_short_head() {
+        let (film, enc) = (film(), encoders(false));
+        let output = Output::Hls {
+            dir: "/scratch/h/0".into(),
+            start_number: 1,
+        };
+        let args = ffmpeg_args(&spec(&film, &enc, COPY_HEVC, COPY_DTS, None, output)).unwrap();
+        assert!(!args.contains(&s("-hls_init_time")), "{args:?}");
+        assert!(!args.contains(&s("-force_key_frames")), "{args:?}");
+        assert_eq!(after(&args, "-hls_list_size"), "0");
     }
 
     #[test]

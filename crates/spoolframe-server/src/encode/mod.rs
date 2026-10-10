@@ -19,8 +19,9 @@ use spoolframe_protocol::{
 use spoolframe_types::{Delivery, SubtitleFormat};
 
 use self::args::{Decode, EncodeSpec, Output, decode, ffmpeg_args};
+pub use self::args::{Decoder, FilterOn, Made};
 use self::hls::Segments;
-pub use self::job::{BudgetUse, Encoding, EncodingGuard, Load, Units};
+pub use self::job::{BudgetUse, Encoding, EncodingGuard, Load, Measured, Units};
 use self::job::{EncodeJob, Fallback, JobError, Jobs, Run, Slot, Written};
 
 /// What the server allows encodes (`transcode { … }`).
@@ -198,6 +199,7 @@ impl Conversion {
                         (Some(ConvertedVideo::Copy { .. }), Some(keyframes)) => {
                             Segments::at_keyframes(keyframes, total)
                         }
+                        (Some(ConvertedVideo::Encode { .. }), _) => Segments::encoded(total),
                         _ => Segments::grid(total),
                     })
                 }
@@ -422,7 +424,7 @@ impl Conversion {
         if n >= job.first_kept() && n <= head + SEGMENTS_AHEAD && !failed_on_gpu {
             return Ok(job.clone());
         }
-        let start = segment_seek(segments, n, self.video);
+        let (start, from) = run_at(segments, n, self.video);
         let epoch = job.epoch + 1;
         let next = spawn(
             &self.jobs,
@@ -436,12 +438,17 @@ impl Conversion {
             &self.vaapi_device,
             epoch,
             start,
-            n,
+            from,
             job.slot(),
         )?;
         current.job.stop();
         current.job = next;
-        tracing::debug!(segment = n, epoch, "HLS encode restarted at a segment");
+        tracing::debug!(
+            segment = n,
+            from,
+            epoch,
+            "HLS encode restarted at a segment"
+        );
         Ok(current.job.clone())
     }
 
@@ -492,7 +499,7 @@ impl Conversion {
         n: u32,
         segments: &Segments,
     ) -> Result<Arc<EncodeJob>, JobError> {
-        let start = segment_seek(segments, n, self.video);
+        let (start, from) = run_at(segments, n, self.video);
         let epoch = current.job.epoch + 1;
         let next = spawn(
             &self.jobs,
@@ -506,7 +513,7 @@ impl Conversion {
             &self.vaapi_device,
             epoch,
             start,
-            n,
+            from,
             current.job.slot(),
         )?;
         let left = std::mem::replace(&mut current.job, next);
@@ -623,11 +630,19 @@ fn playback_seek(
                 .starts_ms
                 .partition_point(|&s| u128::from(s) <= at.as_millis())
                 .max(1) as u32;
-            (segment_seek(segments, n, video), n)
+            run_at(segments, n, video)
         }
         (Some(_), None) => (None, 1),
         (None, start) => (start, 0),
     }
+}
+
+/// Where a run that is to write HLS segment `n` seeks, and the segment it
+/// starts at: `n`, or 1 for a segment of an encoded video's head (PX-26),
+/// which only a run from 0 cuts as the playlist says.
+fn run_at(segments: &Segments, n: u32, video: Option<ConvertedVideo>) -> (Option<Duration>, u32) {
+    let from = segments.run_from(n);
+    (segment_seek(segments, from, video), from)
 }
 
 /// Where to seek for segment `n`.
@@ -727,16 +742,20 @@ fn spawn(
     let decode = decode(&spec);
     let fallback = match decode {
         Decode::Software => None,
-        Decode::Hardware | Decode::Gpu => Some(Fallback {
-            args: ffmpeg_args(&EncodeSpec {
+        Decode::Hardware | Decode::Gpu => {
+            let software = EncodeSpec {
                 hardware_decode: false,
-                ..spec
+                ..spec.clone()
+            };
+            Some(Fallback {
+                args: ffmpeg_args(&software).map_err(JobError::Prepare)?,
+                gpu: gpu_encode,
+                file: file.to_path_buf(),
+                made: Some(args::made(&software)),
             })
-            .map_err(JobError::Prepare)?,
-            gpu: gpu_encode,
-            file: file.to_path_buf(),
-        }),
+        }
     };
+    let made = Some(args::made(&spec));
     let first_segment = if delivery == Delivery::Hls {
         start_number
     } else {
@@ -760,6 +779,7 @@ fn spawn(
             // The same device nodes and driver files decode as encode.
             gpu: gpu_encode || decode != Decode::Software,
             fallback,
+            made,
         },
         written,
         load(video, audio, gpu_encode, decode),
@@ -1096,5 +1116,37 @@ mod tests {
         // Encoded: exactly at the start.
         let grid = Segments::grid(30_000);
         assert_eq!(segment_seek(&grid, 2, None), Some(Duration::from_secs(6)));
+    }
+
+    /// PX-26: a run for a segment of an encoded video's head starts from
+    /// 0, the only run that cuts the head as listed; past it, a run starts
+    /// at its segment's start.
+    #[test]
+    fn an_encoded_restart_in_the_head_starts_from_zero() {
+        let encoded = Segments::encoded(60_000);
+        let video = Some(ConvertedVideo::Encode {
+            codec: spoolframe_types::VideoCodec::H264,
+            height: 720,
+            max_bitrate: None,
+            tone_map: false,
+        });
+        assert_eq!(run_at(&encoded, 2, video), (None, 1));
+        assert_eq!(run_at(&encoded, 3, video), (None, 1));
+        assert_eq!(
+            run_at(&encoded, 4, video),
+            (Some(Duration::from_secs(8)), 4)
+        );
+        assert_eq!(
+            run_at(&encoded, 5, video),
+            (Some(Duration::from_secs(14)), 5)
+        );
+        // A position 5 s in is in segment 3, 4 to 8 s: written from 0.
+        let at = Some(Duration::from_secs(5));
+        assert_eq!(playback_seek(Some(&encoded), at, video), (None, 1));
+        let at = Some(Duration::from_secs(13));
+        assert_eq!(
+            playback_seek(Some(&encoded), at, video),
+            (Some(Duration::from_secs(8)), 4)
+        );
     }
 }

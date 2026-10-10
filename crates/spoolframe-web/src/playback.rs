@@ -3,8 +3,9 @@
 //! Host-compiled, so `cargo test` covers it.
 
 use spoolframe_admin_api::{
-    CacheState, EndedWhy, PlanKind, PlaybackRow, PreviewCache, ReadMark, ReadPoint, StreamKind,
-    StreamOut,
+    CacheState, EndedWhy, FilterPlace, FirstSegment, GpuApi, KeyframesRead, PlanKind, PlaybackMade,
+    PlaybackRow, PlaybackStart, PreviewCache, ReadMark, ReadPoint, StreamKind, StreamOut,
+    VideoDecoder, VideoEncoderUsed,
 };
 
 use crate::catalog::{bytes, clock};
@@ -145,6 +146,129 @@ pub fn bitrate_text(bits: u64) -> String {
     } else {
         format!("{} kbit/s", bits / 1000)
     }
+}
+
+/// What decodes the video (PX-24): `Software`, `GPU · VA-API`, `None`.
+pub fn decoder_text(decoder: VideoDecoder) -> String {
+    match decoder {
+        VideoDecoder::None => "None".to_owned(),
+        VideoDecoder::Software => "Software".to_owned(),
+        VideoDecoder::Gpu { api } => format!(
+            "GPU · {}",
+            match api {
+                GpuApi::Vaapi => "VA-API",
+                GpuApi::Nvidia => "NVDEC (CUDA)",
+                GpuApi::Qsv => "Quick Sync",
+            }
+        ),
+    }
+}
+
+/// What encodes the video (PX-24): `NVENC · H.264`, `Software · HEVC`,
+/// `None` when it is not encoded.
+pub fn encoder_text(encoder: Option<&VideoEncoderUsed>) -> String {
+    let Some(e) = encoder else {
+        return "None".to_owned();
+    };
+    let on = match e.gpu {
+        Some(GpuApi::Vaapi) => "VA-API",
+        Some(GpuApi::Nvidia) => "NVENC",
+        Some(GpuApi::Qsv) => "Quick Sync",
+        None => "Software",
+    };
+    format!("{on} · {}", codec(&e.codec))
+}
+
+/// Where a filter runs (PX-24), and its tone: the CPU is the one to
+/// notice, as the slow path on a machine with a GPU.
+pub fn filter_text(place: FilterPlace) -> (&'static str, &'static str) {
+    match place {
+        FilterPlace::None => ("None", ""),
+        FilterPlace::Gpu => ("On the GPU", "text-ctp-green"),
+        FilterPlace::Cpu => ("On the CPU", "text-ctp-peach"),
+    }
+}
+
+/// The output's measured bitrate, and beside it what was asked and the
+/// picture's size: (`6.2 Mbit/s`, `target 8.0 Mbit/s · 1920×1080`).
+pub fn output_text(made: &PlaybackMade, direct: bool) -> (String, String) {
+    let value = match made.measured_bitrate {
+        Some(bits) => bitrate_text(bits),
+        None if direct => "As the file".to_owned(),
+        None => "—".to_owned(),
+    };
+    let mut note = Vec::new();
+    match made.target_bitrate {
+        Some(bits) => note.push(format!("target {}", bitrate_text(bits))),
+        None if !direct && made.encoder.is_some() => note.push("no target".to_owned()),
+        None => {}
+    }
+    if let (Some(w), Some(h)) = (made.width, made.height) {
+        note.push(format!("{w}×{h}"));
+    }
+    (value, note.join(" · "))
+}
+
+/// Milliseconds as a person reads a wait: `340 ms`, `1.2 s`.
+pub fn ms_text(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    }
+}
+
+/// The start's breakdown (PX-24): each part's name, how long, and a note.
+pub fn start_parts(start: &PlaybackStart) -> [(&'static str, String, String); 3] {
+    let (keyframes, from) = match start.keyframes {
+        KeyframesRead::None => ("—".to_owned(), "none needed".to_owned()),
+        KeyframesRead::Index { ms } => (ms_text(ms), "from the file's index".to_owned()),
+        KeyframesRead::Scan { ms } => (ms_text(ms), "read the whole file".to_owned()),
+    };
+    let (first, note) = match start.first_segment {
+        FirstSegment::NotApplicable => ("n/a".to_owned(), "direct play has none".to_owned()),
+        FirstSegment::Waiting => ("…".to_owned(), "not written yet".to_owned()),
+        FirstSegment::Ready { ms } => (ms_text(ms), "after the request".to_owned()),
+        FirstSegment::Never => ("Never".to_owned(), "its encode ended first".to_owned()),
+    };
+    [
+        (
+            "Plan",
+            ms_text(start.plan_ms),
+            "after the request".to_owned(),
+        ),
+        ("Keyframes", keyframes, from),
+        ("First segment", first, note),
+    ]
+}
+
+/// A playback's making in one line, for the list (PX-24): its decoder
+/// and encoder, where its filters run, and the bitrate written.
+pub fn made_line(row: &PlaybackRow) -> String {
+    let made = &row.made;
+    if row.plan == PlanKind::Direct {
+        return "The file as it is".to_owned();
+    }
+    let mut parts = Vec::new();
+    match (made.decoder, &made.encoder) {
+        (VideoDecoder::None, None) => parts.push("video copied".to_owned()),
+        (decoder, encoder) => {
+            parts.push(format!("decode {}", decoder_text(decoder)));
+            parts.push(format!("encode {}", encoder_text(encoder.as_ref())));
+        }
+    }
+    for (what, place) in [("tone map", made.tone_map), ("burn-in", made.burn_in)] {
+        if place != FilterPlace::None {
+            parts.push(format!(
+                "{what} {}",
+                filter_text(place).0.replacen("On", "on", 1)
+            ));
+        }
+    }
+    if let Some(bits) = made.measured_bitrate {
+        parts.push(bitrate_text(bits));
+    }
+    parts.join(" · ")
 }
 
 /// How a playback ended, and whether that is a failure.
@@ -333,6 +457,134 @@ mod tests {
             }),
             ("Failed: ffmpeg exited with status 1".to_owned(), true)
         );
+    }
+
+    fn nvenc() -> VideoEncoderUsed {
+        VideoEncoderUsed {
+            codec: "h264".into(),
+            name: "h264_nvenc".into(),
+            gpu: Some(GpuApi::Nvidia),
+        }
+    }
+
+    fn made(decoder: VideoDecoder, encoder: Option<VideoEncoderUsed>) -> PlaybackMade {
+        PlaybackMade {
+            decoder,
+            encoder,
+            tone_map: FilterPlace::None,
+            burn_in: FilterPlace::None,
+            width: Some(1920),
+            height: Some(1080),
+            target_bitrate: None,
+            measured_bitrate: None,
+        }
+    }
+
+    #[test]
+    fn decoders_and_encoders_are_named_by_what_runs_them() {
+        assert_eq!(decoder_text(VideoDecoder::None), "None");
+        assert_eq!(decoder_text(VideoDecoder::Software), "Software");
+        assert_eq!(
+            decoder_text(VideoDecoder::Gpu { api: GpuApi::Vaapi }),
+            "GPU · VA-API"
+        );
+        assert_eq!(
+            decoder_text(VideoDecoder::Gpu {
+                api: GpuApi::Nvidia
+            }),
+            "GPU · NVDEC (CUDA)"
+        );
+        assert_eq!(encoder_text(Some(&nvenc())), "NVENC · H.264");
+        let software = VideoEncoderUsed {
+            codec: "hevc".into(),
+            name: "libx265".into(),
+            gpu: None,
+        };
+        assert_eq!(encoder_text(Some(&software)), "Software · HEVC");
+        assert_eq!(encoder_text(None), "None");
+    }
+
+    #[test]
+    fn a_filter_says_where_it_runs() {
+        assert_eq!(filter_text(FilterPlace::Gpu).0, "On the GPU");
+        assert_eq!(filter_text(FilterPlace::Cpu).0, "On the CPU");
+        assert_eq!(filter_text(FilterPlace::None).0, "None");
+    }
+
+    #[test]
+    fn the_output_shows_what_was_measured_beside_the_target() {
+        let mut encoded = made(VideoDecoder::Software, Some(nvenc()));
+        encoded.measured_bitrate = Some(6_200_000);
+        encoded.target_bitrate = Some(8_000_000);
+        assert_eq!(
+            output_text(&encoded, false),
+            (
+                "6.2 Mbit/s".to_owned(),
+                "target 8.0 Mbit/s · 1920×1080".to_owned()
+            )
+        );
+        let waiting = made(VideoDecoder::None, None);
+        assert_eq!(
+            output_text(&waiting, false),
+            ("—".to_owned(), "1920×1080".to_owned())
+        );
+        assert_eq!(output_text(&waiting, true).0, "As the file");
+    }
+
+    #[test]
+    fn the_start_is_told_part_by_part() {
+        let start = PlaybackStart {
+            plan_ms: 12,
+            keyframes: KeyframesRead::Scan { ms: 4_300 },
+            first_segment: FirstSegment::Ready { ms: 5_100 },
+        };
+        let [plan, keyframes, first] = start_parts(&start);
+        assert_eq!((plan.0, plan.1.as_str()), ("Plan", "12 ms"));
+        assert_eq!(
+            (keyframes.1.as_str(), keyframes.2.as_str()),
+            ("4.3 s", "read the whole file")
+        );
+        assert_eq!(first.1, "5.1 s");
+        let direct = PlaybackStart {
+            plan_ms: 3,
+            keyframes: KeyframesRead::None,
+            first_segment: FirstSegment::NotApplicable,
+        };
+        let [_, keyframes, first] = start_parts(&direct);
+        assert_eq!(keyframes.2, "none needed");
+        assert_eq!(first.1, "n/a");
+    }
+
+    #[test]
+    fn the_list_says_how_a_playback_is_made_in_a_line() {
+        let mut row: PlaybackRow = serde_json::from_value(serde_json::json!({
+            "id": "p1", "userId": "local:1", "username": "alice",
+            "displayName": "Alice", "device": "iPhone", "platform": "ios",
+            "item": "plex:movie:1", "title": "Alien", "subtitle": null,
+            "durationMs": null, "plan": "transcode",
+            "line": { "kind": "transcode", "delivery": "hls", "video": "encode:h264:1080p:tonemap",
+                      "audio": "copy:aac", "subtitle": "burn_in:pgs" },
+            "reasons": [], "epoch": 0, "revision": 0, "startedAt": 0,
+            "positionMs": null, "readToMs": null, "furthest": null, "lastReadAt": null,
+            "conversion": null,
+            "made": {
+                "decoder": { "kind": "software" },
+                "encoder": { "codec": "h264", "name": "h264_nvenc", "gpu": "nvidia" },
+                "toneMap": "cpu", "burnIn": "cpu", "width": 1920, "height": 1080,
+                "targetBitrate": 8000000, "measuredBitrate": 6200000
+            },
+            "start": { "planMs": 12, "keyframes": { "from": "none" },
+                       "firstSegment": { "state": "ready", "ms": 900 } }
+        }))
+        .unwrap();
+        assert_eq!(
+            made_line(&row),
+            "decode Software · encode NVENC · H.264 · tone map on the CPU · \
+             burn-in on the CPU · 6.2 Mbit/s"
+        );
+        row.plan = PlanKind::Remux;
+        row.made = made(VideoDecoder::None, None);
+        assert_eq!(made_line(&row), "video copied");
     }
 
     #[test]

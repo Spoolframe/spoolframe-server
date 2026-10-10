@@ -4,6 +4,7 @@
 //! here, never as a new file under `tests/`.
 
 mod dvb;
+mod keyframes;
 mod ocr;
 mod prober;
 mod samples;

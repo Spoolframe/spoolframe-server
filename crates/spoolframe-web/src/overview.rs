@@ -58,6 +58,21 @@ mod tests {
             "furthest": null,
             "lastReadAt": null,
             "conversion": null,
+            "made": {
+                "decoder": { "kind": "none" },
+                "encoder": null,
+                "toneMap": "none",
+                "burnIn": "none",
+                "width": 1920,
+                "height": 1080,
+                "targetBitrate": null,
+                "measuredBitrate": null,
+            },
+            "start": {
+                "planMs": 12,
+                "keyframes": { "from": "none" },
+                "firstSegment": { "state": "notApplicable" },
+            },
         }))
         .unwrap()
     }

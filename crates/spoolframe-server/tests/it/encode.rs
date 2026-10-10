@@ -920,8 +920,10 @@ async fn hls_of_a_copied_video_is_cut_at_its_keyframes_and_plays_whole() {
     server.stop().await;
 }
 
+/// PX-26: an encoded video's first segment is 2 s, the second 2 s and the
+/// third 4 s, then 6 s each; and ffmpeg cuts where the playlist says.
 #[tokio::test]
-async fn hls_of_an_encoded_video_is_a_six_second_grid_and_plays_whole() {
+async fn hls_of_an_encoded_video_starts_with_two_second_segments_and_plays_whole() {
     let caps = ClientCapabilities {
         // 360p source, 180p client: the video is encoded.
         max_video: Some(VideoLimits {
@@ -934,13 +936,24 @@ async fn hls_of_an_encoded_video_is_a_six_second_grid_and_plays_whole() {
     let handle = started(&client, &session, None).await;
     let (durations, (first, last)) =
         play_hls(&server, &client, &session, &handle, "encode.mp4").await;
-    assert_eq!(durations.len(), 5, "{durations:?}");
+    let expected = [2.0, 2.0, 4.0, 6.0, 6.0, 6.0, 4.0];
+    assert_eq!(durations.len(), expected.len(), "{durations:?}");
     assert!(
-        durations.iter().all(|d| (d - 6.0).abs() < 0.05),
+        durations
+            .iter()
+            .zip(expected)
+            .all(|(d, e)| (d - e).abs() < 0.05),
         "{durations:?}"
     );
     assert!(first < 0.1, "first packet at {first}");
     assert!((last - 30.0).abs() < 0.5, "last packet at {last}");
+    let (_, firsts) = listed_and_written(&server, &client, &session, &handle).await;
+    for (first, start) in firsts.iter().zip(segment_starts(&durations)) {
+        assert!(
+            (first - start).abs() < 0.1,
+            "segments start at {firsts:?}, the playlist says {durations:?}"
+        );
+    }
     client.close().await;
     server.stop().await;
 }
@@ -974,7 +987,7 @@ async fn hls_plays_whole_with_a_read_ahead_shorter_than_a_segment() {
     let (durations, _) = tokio::time::timeout(Duration::from_secs(60), play)
         .await
         .expect("every segment arrives");
-    assert_eq!(durations.len(), 5, "{durations:?}");
+    assert_eq!(durations.len(), 7, "{durations:?}");
     client.close().await;
     server.stop().await;
 }
@@ -1033,6 +1046,43 @@ async fn asking_for_a_late_segment_first_restarts_the_encode_there() {
     // The first run's files are gone; the new one is epoch 1.
     assert!(!server.job_dir(&handle, 0).exists());
     assert!(server.job_dir(&handle, 1).exists());
+    client.close().await;
+    server.stop().await;
+}
+
+/// PX-25: frame previews made ahead wait while a playback is prepared
+/// (its keyframes read, here slowly) and while its remux runs, not only
+/// while an encode does: a beta tester's remuxes of 4K films were slow to
+/// start beside eight preview workers reading the same disks.
+#[tokio::test]
+async fn a_remux_counts_for_the_previews_while_it_is_prepared_and_while_it_runs() {
+    let dir = fresh_dir("hls-prepare-counts").await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let ffprobe = dir.join("slow-ffprobe");
+    crate::support::write_script(
+        &ffprobe,
+        "#!/bin/sh\ncase \"$*\" in *packet=pts_time*) sleep 2 ;; esac\nexec ffprobe \"$@\"\n",
+    );
+    let options = ServerOptions {
+        real_ffprobe: Some(ffprobe),
+        ..ServerOptions::default()
+    };
+    let (server, client, session) = hls_ready_with(dir, hls_capabilities(), options).await;
+    let encoding = server.jobs.encoding();
+    assert_eq!(encoding.running(), 0);
+    let preparing = async {
+        until("the start counts", Duration::from_secs(10), || {
+            encoding.running() == 1
+        })
+        .await;
+        // No conversion yet: the keyframes are being read.
+        assert_eq!(server.jobs.counts().running, 0);
+    };
+    let (handle, ()) = tokio::join!(started(&client, &session, None), preparing);
+    // The remux counts itself.
+    assert_eq!(server.jobs.counts().running, 1);
+    assert_eq!(encoding.running(), 1);
+    assert!(!segment(&client, &session, &handle, 1).await.is_empty());
     client.close().await;
     server.stop().await;
 }
@@ -1268,8 +1318,23 @@ async fn hls_of_an_encoded_video_started_far_in_stores_the_film_s_own_time() {
         }),
         ..hls_capabilities()
     };
-    // 13 s is in segment 3 of the 6 s grid, 12 to 18 s.
-    starts_with_film_time("hls-times-encoded", caps, Some(13_000), 3).await;
+    // 13 s is in segment 4, 8 to 14 s (PX-26's grid: 0, 2, 4, 8, 14…).
+    starts_with_film_time("hls-times-encoded", caps, Some(13_000), 4).await;
+}
+
+/// PX-26: a start in the encoded grid's head runs from 0, the one run
+/// that cuts the head where the playlist says.
+#[tokio::test]
+async fn hls_of_an_encoded_video_started_in_its_head_stores_the_film_s_own_time() {
+    let caps = ClientCapabilities {
+        max_video: Some(VideoLimits {
+            height: Some(180),
+            ..VideoLimits::default()
+        }),
+        ..hls_capabilities()
+    };
+    // 3 s is in segment 2, 2 to 4 s.
+    starts_with_film_time("hls-times-encoded-head", caps, Some(3_000), 2).await;
 }
 
 /// A far seek starts a new run in a new epoch, with an `init.mp4` of its
@@ -1319,9 +1384,10 @@ async fn an_explicit_hls_seek_keeps_segment_numbers_and_film_time() {
         let handle = started(&client, &session, None).await;
         let playlist = manifest(&client, &session, &handle, ManifestKind::Media).await;
         let starts = segment_starts(&media_segments(&playlist));
-        // Inside segment 2, not at its boundary. Starting numbering at 1
+        // Inside segment n, not at its boundary. Starting numbering at 1
         // would serve the following segment's content under this number.
-        let position_ms = if encode { 9_000 } else { 3_000 };
+        // An encoded video's is past its head (PX-26), 14 to 20 s.
+        let (n, position_ms) = if encode { (5, 15_000) } else { (2, 3_000) };
         assert_eq!(
             client
                 .call(
@@ -1334,7 +1400,7 @@ async fn an_explicit_hls_seek_keeps_segment_numbers_and_film_time() {
                 .await,
             Response::Ok(Reply::PlaybackSeeked { epoch: 1 }),
         );
-        for n in [2, 3] {
+        for n in [n, n + 1] {
             assert_stores_film_time(
                 &client,
                 &session,
@@ -1356,7 +1422,7 @@ async fn an_explicit_hls_seek_keeps_segment_numbers_and_film_time() {
                 offset: 0,
                 length: 1,
                 epoch: 0,
-                segment: Some(3),
+                segment: Some(n + 1),
                 variant: 0,
             })
             .await;

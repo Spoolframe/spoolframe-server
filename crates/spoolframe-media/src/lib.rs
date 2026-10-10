@@ -12,6 +12,7 @@ mod descriptor;
 pub mod dvb;
 pub mod encoders;
 mod external;
+pub mod keyframe_index;
 pub mod ocr;
 pub mod pgs;
 mod probe;
@@ -19,7 +20,7 @@ pub mod roles;
 pub mod sandbox;
 pub mod vobsub;
 
-pub use probe::{ProbeError, Prober};
+pub use probe::{KeyframesFrom, ProbeError, Prober};
 
 pub use descriptor::{
     AudioStream, MAX_DURATION, MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream,

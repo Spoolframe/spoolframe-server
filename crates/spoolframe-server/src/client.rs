@@ -50,7 +50,10 @@ use crate::events::{Addresses, EventStreams};
 use crate::network::{Connections, ServerName, Services};
 use crate::passkeys::{CeremonyError, SignInError};
 use crate::planner;
-use crate::playback::{Changed, FileId, Opened, Playback, Playbacks, Refusal, Sidecar, Using};
+use crate::playback::{
+    Changed, FileId, FirstSegment, KeyframesFrom, Opened, Playback, Playbacks, Refusal, Sidecar,
+    StartTimes, Using,
+};
 use crate::plex_accounts::Link;
 use crate::previews::{self, PreviewState};
 use crate::principal::Principal;
@@ -2086,6 +2089,8 @@ impl ClientProtocol {
                 bitmap,
                 quality,
             } => {
+                // The start's breakdown is timed from here (PX-24).
+                let requested = std::time::Instant::now();
                 let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
                 let (path, descriptor) = self.describe(&id).await?;
                 let (selection, chosen) = self
@@ -2101,6 +2106,7 @@ impl ClientProtocol {
                     &self.services.transcoding.encoders(),
                     self.services.subtitles.ocr(),
                 );
+                let planned_in = requested.elapsed();
                 // The item's markers go with the playback (P2-10), so a
                 // player needs no second request for them.
                 let found = catalog.item(&id).await.map_err(catalog_error)?;
@@ -2177,7 +2183,20 @@ impl ClientProtocol {
                     }
                     prepared => prepared,
                 };
-                let (subtitle, (size, file), conversion) = prepared?;
+                let (subtitle, (size, file), conversion, keyframes) = prepared?;
+                let start_times = Arc::new(parking_lot::Mutex::new(StartTimes {
+                    plan: planned_in,
+                    keyframes,
+                    first_segment: if conversion.is_some() {
+                        FirstSegment::Waiting
+                    } else {
+                        FirstSegment::Direct
+                    },
+                }));
+                // The first encode's progress, to time its first segment.
+                let first_run = conversion
+                    .as_ref()
+                    .map(|c| (c.job().progress(), c.delivery == Delivery::Hls));
                 // Its previews next, if it has none yet: the player asks
                 // for them as soon as it shows a seek bar.
                 self.services.previews.played(&id);
@@ -2202,6 +2221,8 @@ impl ClientProtocol {
                         subtitle,
                         conversion,
                         quality,
+                        video_size: descriptor.video.as_ref().map(|v| (v.width, v.height)),
+                        start: start_times.clone(),
                         connection: state.number,
                     },
                 );
@@ -2223,6 +2244,20 @@ impl ClientProtocol {
                     path = %state.path(),
                     "playback started"
                 );
+                // Then how long it took: for direct play now, for a
+                // conversion once its first segment is ready.
+                match first_run {
+                    Some((progress, hls)) => {
+                        tokio::spawn(crate::playback::time_first_segment(
+                            start_times,
+                            requested,
+                            progress,
+                            hls,
+                            id.clone(),
+                        ));
+                    }
+                    None => start_times.lock().log(&id),
+                }
                 Ok(Reply::PlaybackStarted {
                     handle,
                     plan,
@@ -2256,7 +2291,7 @@ impl ClientProtocol {
                     &self.services.transcoding.encoders(),
                     self.services.subtitles.ocr(),
                 );
-                let (subtitle, (size, file), conversion) = self
+                let (subtitle, (size, file), conversion, _) = self
                     .prepare(
                         &handle,
                         &playback.item,
@@ -2317,7 +2352,7 @@ impl ClientProtocol {
                 }
                 // A plan nothing plays under is `CannotPlay` from here, and
                 // the playback goes on as it was, as slow as the link is.
-                let (subtitle, (size, file), conversion) = self
+                let (subtitle, (size, file), conversion, _) = self
                     .prepare(
                         &handle,
                         &playback.item,
@@ -2966,8 +3001,9 @@ impl ClientProtocol {
 
     /// What `plan` needs to play as `handle`: the subtitle the client
     /// fetches beside it, the size of what it reads (0 while a conversion
-    /// writes it) with the file read for direct play, and the conversion,
-    /// started at `start`. `replaces` is the playback as it was, when this
+    /// writes it) with the file read for direct play, the conversion,
+    /// started at `start`, and how long its keyframes took to read and
+    /// where from, if it needed them (PX-24). `replaces` is the playback as it was, when this
     /// is a subtitle change: direct play goes on reading the file it began
     /// with, or none.
     #[expect(
@@ -2988,6 +3024,7 @@ impl ClientProtocol {
             Option<Sidecar>,
             (u64, Option<FileId>),
             Option<Arc<Conversion>>,
+            Option<(Duration, KeyframesFrom)>,
         ),
         Error,
     > {
@@ -3027,7 +3064,7 @@ impl ClientProtocol {
                         message: "the media file changed during playback".into(),
                     });
                 }
-                (subtitle, (metadata.len(), Some(file)), None)
+                (subtitle, (metadata.len(), Some(file)), None, None)
             }
             PlaybackPlan::Converted {
                 delivery,
@@ -3035,6 +3072,11 @@ impl ClientProtocol {
                 subtitle,
                 ..
             } => {
+                // Frame previews made ahead wait while the playback is
+                // prepared (PX-25): its subtitle read, its keyframes read
+                // (a whole file, when its index will not do), until its
+                // conversion, which counts itself, has started.
+                let _preparing = self.services.jobs.encoding().begin();
                 // Text the client fetches beside the stream: read from
                 // pictures; or, for HLS, any text, as the WebVTT of
                 // its subtitle rendition (P2-07).
@@ -3068,15 +3110,26 @@ impl ClientProtocol {
                     ),
                     _ => None,
                 };
-                // HLS of a copied video is cut at its keyframes.
+                // HLS of a copied video is cut at its keyframes: from the
+                // file's index where it lists them all (PX-25).
+                let mut keyframes_read = None;
                 let keyframes = match (delivery, video) {
                     (Delivery::Hls, Some(ConvertedVideo::Copy { .. })) => {
-                        Some(self.services.prober.keyframes(path).await.map_err(|e| {
-                            tracing::warn!(%id, error = %e, "cannot list keyframes");
-                            Error::PlaybackFailed {
-                                reason: "the file's keyframes could not be read".into(),
-                            }
-                        })?)
+                        let reading = std::time::Instant::now();
+                        let (keyframes, from) = self
+                            .services
+                            .prober
+                            .keyframes_from(path)
+                            .await
+                            .map_err(|e| {
+                                tracing::warn!(%id, error = %e, "cannot list keyframes");
+                                Error::PlaybackFailed {
+                                    reason: "the file's keyframes could not be read".into(),
+                                }
+                            })?;
+                        tracing::debug!(%id, ?from, count = keyframes.len(), "keyframes");
+                        keyframes_read = Some((reading.elapsed(), KeyframesFrom::of(&from)));
+                        Some(keyframes)
                     }
                     _ => None,
                 };
@@ -3116,7 +3169,7 @@ impl ClientProtocol {
                     }
                     conversion_error(e)
                 })?;
-                (text, (0, None), Some(conversion))
+                (text, (0, None), Some(conversion), keyframes_read)
             }
             PlaybackPlan::Unsupported { reasons } => {
                 return Err(Error::CannotPlay {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use spoolframe_admin_api as api;
 use spoolframe_catalog::{Catalog, CatalogError};
-use spoolframe_media::encoders::Encoders;
+use spoolframe_media::encoders::{Encoders, Hardware};
 use spoolframe_media::{MediaDescriptor, Prober, SubtitleKind, SubtitleSource, codecs};
 use spoolframe_protocol::{
     AudioAction, ConvertedVideo, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
@@ -20,10 +20,11 @@ use spoolframe_types::{
 };
 
 use crate::connected::Connected;
-use crate::encode::Load;
+use crate::encode::{Decoder, FilterOn, Load};
 use crate::planner;
 use crate::playback::{
-    EndConversionError, EndReason, EndedPlayback, Found, Furthest, Playbacks, READS_KEPT, Snapshot,
+    EndConversionError, EndReason, EndedPlayback, FirstSegment, Found, Furthest, KeyframesFrom,
+    Playbacks, READS_KEPT, Snapshot, StartTimes,
 };
 use crate::previews::{PreviewPeek, Previews};
 use crate::subtitles::{Subtitles, TextPeek, TextSource, TextState};
@@ -568,6 +569,87 @@ fn row(s: &Snapshot) -> api::PlaybackRow {
             },
             weight_quarters: c.load.weight().get(),
         }),
+        made: made(s),
+        start: start(&s.start),
+    }
+}
+
+fn gpu_api(hardware: Hardware) -> api::GpuApi {
+    match hardware {
+        Hardware::Vaapi => api::GpuApi::Vaapi,
+        Hardware::Nvenc => api::GpuApi::Nvidia,
+        Hardware::Qsv => api::GpuApi::Qsv,
+    }
+}
+
+fn filter_place(on: FilterOn) -> api::FilterPlace {
+    match on {
+        FilterOn::None => api::FilterPlace::None,
+        FilterOn::Gpu => api::FilterPlace::Gpu,
+        FilterOn::Cpu => api::FilterPlace::Cpu,
+    }
+}
+
+/// How `s` is made (PX-24): its running encode's facts, as the server
+/// built its graph; for direct play, the file as it is.
+fn made(s: &Snapshot) -> api::PlaybackMade {
+    let conversion = s.conversion.as_ref();
+    let Some(made) = conversion.and_then(|c| c.made.as_ref()) else {
+        let (width, height) = s.video_size.unzip();
+        return api::PlaybackMade {
+            decoder: api::VideoDecoder::None,
+            encoder: None,
+            tone_map: api::FilterPlace::None,
+            burn_in: api::FilterPlace::None,
+            width,
+            height,
+            target_bitrate: None,
+            measured_bitrate: conversion.and_then(|c| c.output.bitrate()),
+        };
+    };
+    let (width, height) = made.size.unzip();
+    api::PlaybackMade {
+        decoder: match made.decoder {
+            Decoder::None => api::VideoDecoder::None,
+            Decoder::Software => api::VideoDecoder::Software,
+            Decoder::Hardware(hardware) => api::VideoDecoder::Gpu {
+                api: gpu_api(hardware),
+            },
+        },
+        encoder: made.encoder.as_ref().map(|e| api::VideoEncoderUsed {
+            codec: e.codec.to_string(),
+            name: e.name.clone(),
+            gpu: e.hardware.map(gpu_api),
+        }),
+        tone_map: filter_place(made.tone_map),
+        burn_in: filter_place(made.burn_in),
+        width,
+        height,
+        target_bitrate: made.target_bitrate,
+        measured_bitrate: conversion.and_then(|c| c.output.bitrate()),
+    }
+}
+
+fn start(t: &StartTimes) -> api::PlaybackStart {
+    api::PlaybackStart {
+        plan_ms: t.plan.as_millis() as u64,
+        keyframes: match t.keyframes {
+            None => api::KeyframesRead::None,
+            Some((took, KeyframesFrom::Index)) => api::KeyframesRead::Index {
+                ms: took.as_millis() as u64,
+            },
+            Some((took, KeyframesFrom::Scan)) => api::KeyframesRead::Scan {
+                ms: took.as_millis() as u64,
+            },
+        },
+        first_segment: match t.first_segment {
+            FirstSegment::Direct => api::FirstSegment::NotApplicable,
+            FirstSegment::Waiting => api::FirstSegment::Waiting,
+            FirstSegment::Ready(took) => api::FirstSegment::Ready {
+                ms: took.as_millis() as u64,
+            },
+            FirstSegment::Never => api::FirstSegment::Never,
+        },
     }
 }
 

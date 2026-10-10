@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use jsonrpsee::ws_client::WsClient;
 use spoolframe_admin_api::{
-    AdminApiClient, CacheState, EndedWhy, MeApiClient, NewUser, PictureSubtitles, PlanFor,
-    PlanKind, PreviewCache, ReadMark, Role, StreamKind, StreamOut, error_code,
+    AdminApiClient, CacheState, EndedWhy, FilterPlace, FirstSegment, KeyframesRead, MeApiClient,
+    NewUser, PictureSubtitles, PlanFor, PlanKind, PlaybackRow, PreviewCache, ReadMark, Role,
+    StreamKind, StreamOut, VideoDecoder, error_code,
 };
 use spoolframe_protocol::{
     Error, MediaReadResponse, PlaybackHandle, PlaybackPlan, Reply, Request, Response, Selection,
@@ -18,7 +19,8 @@ use spoolframe_server::admin::{self, Admin, Origins, SetupCode, TrustedProxies};
 
 use crate::admin::{CODE, admin, anonymous, code, creds, setup, with_token};
 use crate::support::{
-    ServerOptions, TestClient, TestServer, fresh_dir, movie, progressive_capabilities,
+    ServerOptions, TestClient, TestServer, fresh_dir, hls_capabilities, movie,
+    progressive_capabilities,
 };
 
 /// An admin API beside `server`, on the auth it shares: its root admin,
@@ -68,6 +70,17 @@ async fn converting(
     test: &str,
     options: ServerOptions,
 ) -> (TestServer, WsClient, TestClient, SessionId, PlaybackHandle) {
+    playing(test, options, "ac3", progressive_capabilities()).await
+}
+
+/// A server with an 8 s 640×360 H.264 file with `audio` (an encoder's
+/// name), a device that plays `caps`, and alice playing it.
+async fn playing(
+    test: &str,
+    options: ServerOptions,
+    audio: &str,
+    caps: spoolframe_types::ClientCapabilities,
+) -> (TestServer, WsClient, TestClient, SessionId, PlaybackHandle) {
     let server = TestServer::start_with(
         fresh_dir(test).await,
         ServerOptions {
@@ -77,12 +90,10 @@ async fn converting(
         },
     )
     .await;
-    server.generate_media(8, "libx264", "ac3");
+    server.generate_media(8, "libx264", audio);
     let (root, _alice) = admin_beside(&server).await;
     let client = server.client().await;
-    client
-        .hello_with(Some("Den PC"), Some(progressive_capabilities()))
-        .await;
+    client.hello_with(Some("Den PC"), Some(caps)).await;
     let session = client.login("alice", "battery staple").await;
     let started = client
         .call(
@@ -234,6 +245,98 @@ async fn a_converted_playback_is_listed_with_its_plan_and_reads() {
                 && matches!(&s.out, StreamOut::Encode { codec, .. } if codec == "aac")),
         "{:?}",
         detail.plan.streams
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// The one open playback, once `done` says it is as the test wants.
+async fn row_once(root: &WsClient, what: &str, done: impl Fn(&PlaybackRow) -> bool) -> PlaybackRow {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let row = root.playbacks().await.unwrap().open.remove(0);
+            if done(&row) {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("not within 20 s: {what}"))
+}
+
+/// PX-24: a converted playback says how it is made, from its plan and
+/// graph: the generated file's video is copied, so nothing decodes or
+/// encodes it; its audio is encoded, so it is a transcode. Its start is
+/// timed, and its output's bitrate measured once written.
+#[tokio::test]
+async fn a_converted_playback_says_how_it_is_made_and_how_it_started() {
+    let (server, root, client, _session, _handle) =
+        converting("made", ServerOptions::default()).await;
+    let row = row_once(&root, "a first segment and a bitrate", |row| {
+        matches!(row.start.first_segment, FirstSegment::Ready { .. })
+            && row.made.measured_bitrate.is_some()
+    })
+    .await;
+    assert_eq!(row.plan, PlanKind::Transcode);
+    assert_eq!(row.line.kind, "transcode");
+    let made = &row.made;
+    assert_eq!(made.decoder, VideoDecoder::None);
+    assert_eq!(made.encoder, None);
+    assert_eq!(
+        (made.tone_map, made.burn_in),
+        (FilterPlace::None, FilterPlace::None)
+    );
+    assert_eq!((made.width, made.height), (Some(640), Some(360)));
+    assert_eq!(made.target_bitrate, None);
+    assert!(made.measured_bitrate.is_some_and(|b| b > 0), "{made:?}");
+    // A progressive stream needs no keyframes; its first segment is its
+    // first bytes, after the plan.
+    assert_eq!(row.start.keyframes, KeyframesRead::None);
+    let FirstSegment::Ready { ms } = row.start.first_segment else {
+        unreachable!()
+    };
+    assert!(row.start.plan_ms <= ms, "{:?}", row.start);
+    client.close().await;
+    server.stop().await;
+}
+
+/// PX-24: an HLS playback that copies its video and audio is a remux: no
+/// decoder, encoder, tone map or burn-in. Its keyframes were read, from
+/// the file's index or a scan, before its first segment was ready.
+#[tokio::test]
+async fn a_copy_copy_hls_playback_is_a_remux_and_runs_nothing_on_the_video() {
+    let (server, root, client, _session, _handle) =
+        playing("remux", ServerOptions::default(), "aac", hls_capabilities()).await;
+    let row = row_once(&root, "a first segment and a bitrate", |row| {
+        matches!(row.start.first_segment, FirstSegment::Ready { .. })
+            && row.made.measured_bitrate.is_some()
+    })
+    .await;
+    assert_eq!(row.plan, PlanKind::Remux);
+    assert_eq!(row.line.kind, "remux");
+    assert_eq!(row.line.delivery, "hls");
+    let made = &row.made;
+    assert_eq!(made.decoder, VideoDecoder::None);
+    assert_eq!(made.encoder, None);
+    assert_eq!(
+        (made.tone_map, made.burn_in),
+        (FilterPlace::None, FilterPlace::None)
+    );
+    assert_eq!((made.width, made.height), (Some(640), Some(360)));
+    assert!(made.measured_bitrate.is_some_and(|b| b > 0), "{made:?}");
+    let (KeyframesRead::Index { ms: keyframes } | KeyframesRead::Scan { ms: keyframes }) =
+        row.start.keyframes
+    else {
+        panic!("no keyframes read: {:?}", row.start);
+    };
+    let FirstSegment::Ready { ms: first } = row.start.first_segment else {
+        unreachable!()
+    };
+    assert!(
+        row.start.plan_ms <= first && keyframes <= first,
+        "{:?}",
+        row.start
     );
     client.close().await;
     server.stop().await;
