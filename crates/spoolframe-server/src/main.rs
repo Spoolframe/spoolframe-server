@@ -9,7 +9,7 @@ use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::Prober;
 use spoolframe_media::bitmap::Budget;
 use spoolframe_media::decode;
-use spoolframe_media::encoders::{FfmpegCommand, Hardware};
+use spoolframe_media::gpus;
 use spoolframe_media::harden;
 use spoolframe_media::ocr::Ocr;
 use spoolframe_media::sandbox::{self, Sandbox, Tool};
@@ -563,6 +563,8 @@ async fn serve(cli: Cli, hardened: harden::Filter) -> Result<Option<RestartMode>
         config = ?locations.config,
         "config loaded"
     );
+    // The locked file's shadows and the deprecated keys (PGPU-05), as a
+    // reload logs them again.
     reload::shadowed_warnings(&layers);
 
     let done = match cli.command {
@@ -653,21 +655,15 @@ fn plex(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result<Comp
 
 /// How ffmpeg, ffprobe and tesseract run (PX-11 finding 34): confined as
 /// `media.sandbox` says, kept out of the state directory and systemd's
-/// credentials, with the GPU's device nodes when hardware may be used.
+/// credentials, with no GPU's device nodes: a run on a GPU is given its
+/// one card's (PGPU-05, `Transcoding`).
 fn media_sandbox(config: &ServerConfig, state_dir: &Path) -> Result<Sandbox> {
-    let transcode = config.transcode.settings(&config.experimental)?;
-    let families = transcode.hardware.families();
-    let vaapi = families
-        .iter()
-        .any(|f| matches!(f, Hardware::Vaapi | Hardware::Qsv))
-        .then_some(transcode.vaapi_device.as_path());
-    let nvidia = families.contains(&Hardware::Nvenc);
     let mut hidden = vec![state_dir.to_path_buf()];
     hidden.extend(std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from));
     Ok(Sandbox::new(
         config.media.sandbox()?,
         hidden,
-        sandbox::gpu_devices(vaapi, nvidia),
+        sandbox::GpuDevices::default(),
     )?)
 }
 
@@ -801,11 +797,18 @@ async fn run(
     );
     let prober = Arc::new(Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT));
     reload::config_warnings(config);
-    let transcoding = Arc::new(Transcoding::new(
-        Box::new(FfmpegCommand::new(ffmpeg.clone())),
-        config.transcode.settings(&config.experimental)?,
-        state_dir.join("cache").join("encoder-test"),
-    ));
+    let transcoding = Arc::new(
+        Transcoding::new(
+            ffmpeg.clone(),
+            config.transcode.gpus()?,
+            state_dir.join("cache").join("encoder-test"),
+        )
+        .with_settings(config.transcode.settings(&config.experimental)?)
+        .on_host(
+            gpus::host_cards(&gpus::HostRoots::default()),
+            Path::new("/dev"),
+        ),
+    );
     transcode::spawn_detection(transcoding.clone());
     let limits = config.transcode.limits(state_dir)?;
     let jobs = Arc::new(Jobs::new(limits.clone(), ffmpeg.clone()).with_context(|| {

@@ -337,7 +337,8 @@ impl StatusSource {
     }
 
     fn status(&self) -> ServerStatus {
-        let encoders = self.transcoding.encoders();
+        let detected = self.transcoding.detected();
+        let encoders = detected.encoders.clone();
         ServerStatus {
             name: self.name.get(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -366,7 +367,17 @@ impl StatusSource {
                         remuxes: count(now.remuxes),
                         max_remux: count(now.max_remux),
                         gpu_jobs: count(now.gpu_jobs),
-                        max_gpu_jobs: count(now.max_gpu_jobs),
+                        // Every card's own limit together (PGPU-05); the
+                        // setting itself with no GPU detected.
+                        max_gpu_jobs: count(if detected.gpus.is_empty() {
+                            now.max_gpu_jobs
+                        } else {
+                            detected
+                                .gpus
+                                .iter()
+                                .map(|g| g.max_jobs.unwrap_or(now.max_gpu_jobs))
+                                .sum()
+                        }),
                     }
                 }),
             },
@@ -3849,10 +3860,8 @@ mod tests {
     /// The API over `auth`, at `https://media.example.org`.
     fn api(auth: Auth) -> AdminApi {
         let transcoding = Transcoding::new(
-            Box::new(spoolframe_media::encoders::FfmpegCommand::new(
-                spoolframe_media::sandbox::Tool::unconfined("/nonexistent/ffmpeg"),
-            )),
-            Default::default(),
+            spoolframe_media::sandbox::Tool::unconfined("/nonexistent/ffmpeg"),
+            Vec::new(),
             std::env::temp_dir(),
         );
         let origins = Origins::Exactly("https://media.example.org".into());

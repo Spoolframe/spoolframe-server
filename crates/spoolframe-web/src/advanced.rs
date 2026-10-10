@@ -31,6 +31,7 @@ const BY_TAB: &[(&str, &[&str])] = &[
             "watch.watched_percent",
             // PGPU-04: in the tab's Experimental section.
             "experimental.libplacebo_shared_on_amd",
+            "transcode.gpus",
         ],
     ),
     (
@@ -115,6 +116,7 @@ mod tests {
             apply: SettingApply::Restart,
             restart_pending,
             running: None,
+            deprecated: None,
         }
     }
 
@@ -148,6 +150,7 @@ mod tests {
             "artwork.cache_mb",
             "watch.started_after_secs",
             "watch.watched_percent",
+            "transcode.gpus",
         ] {
             assert!(is_advanced(key), "{key}");
         }

@@ -1,4 +1,4 @@
-//! NVDEC for NVENC encodes (PX-27) and CUDA filters (PX-29), end to end
+//! NVDEC for NVENC encodes (PGPU-01) and CUDA filters (PGPU-03), end to end
 //! on an NVIDIA host: real ffmpeg, confined as the server confines it,
 //! detection's probes, and a film encoded to 1080p H.264 on NVENC three
 //! ways, with the CPU each took: decoded in software and filtered on the
@@ -43,7 +43,7 @@ fn sandbox() -> Sandbox {
         .expect("this kernel has Landlock")
 }
 
-/// A 5-second 4K SDR HEVC clip, 8-bit: what PX-29 measures, a film
+/// A 5-second 4K SDR HEVC clip, 8-bit: what PGPU-03 measures, a film
 /// NVIDIA can now scale on the GPU.
 fn clip(dir: &Path) -> PathBuf {
     let film = dir.join("sdr-4k.mkv");
@@ -261,7 +261,7 @@ async fn an_nvenc_encode_decodes_on_nvdec_and_scales_on_cuda() {
         cpu.push(used);
     }
     eprintln!(
-        "\nPX-29 nvdec: {} ({}x{} {} {}-bit {}), {} to 1080p H.264 on NVENC:\n{}\n",
+        "\nPGPU-03 nvdec: {} ({}x{} {} {}-bit {}), {} to 1080p H.264 on NVENC:\n{}\n",
         film.display(),
         video.width,
         video.height,

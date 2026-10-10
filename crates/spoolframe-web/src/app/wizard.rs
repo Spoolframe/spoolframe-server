@@ -1597,6 +1597,27 @@ fn PlaybackFields(
         other => other.to_owned(),
     });
     let mut shared_on_amd = use_signal(|| flag(&settings, "experimental.libplacebo_shared_on_amd"));
+    // PGPU-05: `transcode.gpus`, advanced; the deprecated `hardware` and
+    // `vaapi_device` shown only while a layer of the operator's sets one.
+    let set_by = |key: &str| entry(&settings, key).and_then(|e| e.layer);
+    let old_keys = ["transcode.hardware", "transcode.vaapi_device"];
+    let old_set = old_keys
+        .iter()
+        .any(|k| matches!(set_by(k), Some(SettingLayer::File | SettingLayer::Runtime)));
+    // Converting unsets them in the runtime layer: one in the config file
+    // stays, and gpus beside it is refused.
+    let old_in_file = old_keys
+        .iter()
+        .any(|k| set_by(k) == Some(SettingLayer::File));
+    let instead = old_keys
+        .iter()
+        .find_map(|k| entry(&settings, k).and_then(|e| e.deprecated.clone()));
+    let gpus_shown = advanced && !old_set;
+    let gpus_locked = locked(&settings, "transcode.gpus");
+    let mut gpu_rows = use_signal(|| setup::GpuRow::rows(value(&settings, "transcode.gpus")));
+    let mut no_gpu = use_signal(
+        || matches!(value(&settings, "transcode.gpus"), Some(Value::Array(list)) if list.is_empty()),
+    );
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let s = settings.clone();
@@ -1614,7 +1635,6 @@ fn PlaybackFields(
                 other => other,
             };
             let mut changes = vec![
-                ("transcode.hardware", Some(chosen.setting())),
                 ("transcode.max_jobs", number("Encode budget", &jobs())?),
                 ("transcode.scratch_limit_mb", scratch),
                 ("transcode.read_ahead_secs", number("Read ahead", &ahead())?),
@@ -1628,6 +1648,18 @@ fn PlaybackFields(
             if settings_tab {
                 changes.push(("previews.when", Some(json!(when()))));
                 changes.push(("transcode.tone_map", Some(json!(tone_map()))));
+            }
+            // Deprecated: saved only while it is set and shown.
+            if old_set {
+                changes.push(("transcode.hardware", Some(chosen.setting())));
+            }
+            if gpus_shown {
+                let gpus = match (no_gpu(), gpu_rows().is_empty()) {
+                    (true, _) => Some(json!([])),
+                    (false, true) => None,
+                    (false, false) => Some(setup::GpuRow::setting(&gpu_rows())?),
+                };
+                changes.push(("transcode.gpus", gpus));
             }
             // Hidden, they are left as they are.
             if advanced {
@@ -1709,6 +1741,35 @@ fn PlaybackFields(
         .map(|s| setup::tone_maps_line(&s.transcoding.gpu_tone_maps));
     let tone_map_locked = locked(&settings, "transcode.tone_map");
     let hw_locked = locked(&settings, "transcode.hardware");
+    let s = settings.clone();
+    let convert = move |_| {
+        let s = s.clone();
+        let rows = setup::gpus_from_hardware(
+            value(&s, "transcode.hardware"),
+            value(&s, "transcode.vaapi_device"),
+        );
+        busy.set(true);
+        spawn(async move {
+            // The old ones out first: gpus beside them is refused.
+            let changes = match setup::GpuRow::setting(&rows) {
+                Ok(gpus) => vec![
+                    ("transcode.hardware", None),
+                    ("transcode.vaapi_device", None),
+                    ("transcode.gpus", Some(gpus)),
+                ],
+                Err(why) => {
+                    error.set(Some(why));
+                    busy.set(false);
+                    return;
+                }
+            };
+            match save(&s, changes).await {
+                Ok(()) => on_reload.call(()),
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+        });
+    };
     // Worked out from the server's CPUs, so the server says it.
     let workers_default = match status.as_ref().map(|s| s.preview_workers_default) {
         Some(d) => format!("Default {} ({})", d.count, d.counted.label()),
@@ -1751,8 +1812,28 @@ fn PlaybackFields(
                 }
             }
         }
+        if old_set {
         div { class: "flex flex-col gap-2",
-            h2 { "Hardware" }
+            h2 { class: "flex items-center gap-2",
+                "Hardware"
+                span { class: "state state-warn", "Deprecated" }
+            }
+            span { class: "text-xs text-ctp-subtext0",
+                "transcode.hardware and vaapi_device are deprecated and will be removed: GPUs, among the advanced settings, say which cards to use. "
+                if let Some(instead) = &instead {
+                    "In their place: "
+                    span { class: "mono-value", "{instead}" }
+                }
+            }
+            if !old_in_file && !hw_locked {
+                button {
+                    class: "btn-dialog btn-dialog-grey self-start",
+                    r#type: "button",
+                    disabled: busy(),
+                    onclick: convert,
+                    "Convert to GPUs"
+                }
+            }
             button {
                 class: choice(hardware() == Hardware::Auto),
                 disabled: hw_locked,
@@ -1789,6 +1870,86 @@ fn PlaybackFields(
                 }
             }
             Note { settings: settings.clone(), setting: "transcode.hardware", on_changed: move |_| on_reload.call(()) }
+        }
+        }
+        if gpus_shown {
+            div { class: "flex flex-col gap-2",
+                h2 { "GPUs" }
+                span { class: "text-xs text-ctp-subtext0",
+                    "Which GPUs encodes run on, in order of preference. Each job goes to the card that does the most of it, and to the next when one runs its most jobs at once. None listed: every card of every API, NVIDIA first. Applies after a restart."
+                }
+                for (i, row) in gpu_rows().into_iter().enumerate() {
+                    div { key: "{i}", class: "flex flex-wrap items-center gap-2",
+                        span { class: "text-xs text-ctp-subtext0", "{i + 1}." }
+                        select {
+                            class: "pref-select",
+                            aria_label: "GPU {i + 1}: API",
+                            disabled: gpus_locked || no_gpu(),
+                            onchange: move |e| gpu_rows.write()[i].api = e.value(),
+                            for (api, label) in setup::GPU_APIS {
+                                option { key: "{api}", value: "{api}", selected: row.api == api, "{label}" }
+                            }
+                        }
+                        select {
+                            class: "pref-select",
+                            aria_label: "GPU {i + 1}: which cards",
+                            disabled: gpus_locked || no_gpu(),
+                            onchange: move |e| gpu_rows.write()[i].pick = e.value(),
+                            for (pick, label) in setup::GPU_PICKS {
+                                option { key: "{pick}", value: "{pick}", selected: row.pick == pick, "{label}" }
+                            }
+                        }
+                        if row.pick == "device" {
+                            input {
+                                value: "{row.device}",
+                                placeholder: if row.api == "nvenc" { "CUDA index: 0" } else { "/dev/dri/by-path/pci-…-render" },
+                                aria_label: "GPU {i + 1}: the card",
+                                disabled: gpus_locked || no_gpu(),
+                                oninput: move |e| gpu_rows.write()[i].device = e.value(),
+                            }
+                        }
+                        input {
+                            class: "w-32",
+                            value: "{row.max_jobs}",
+                            placeholder: "Jobs at once",
+                            inputmode: "numeric",
+                            aria_label: "GPU {i + 1}: jobs at once on each card",
+                            disabled: gpus_locked || no_gpu(),
+                            oninput: move |e| gpu_rows.write()[i].max_jobs = e.value(),
+                        }
+                        button {
+                            class: "icon-button",
+                            r#type: "button",
+                            aria_label: "Remove GPU {i + 1}",
+                            disabled: gpus_locked || no_gpu(),
+                            onclick: move |_| {
+                                gpu_rows.write().remove(i);
+                            },
+                            icons::Trash {}
+                        }
+                    }
+                }
+                button {
+                    class: "btn-dialog btn-dialog-grey self-start",
+                    r#type: "button",
+                    disabled: gpus_locked || no_gpu(),
+                    onclick: move |_| gpu_rows.write().push(setup::GpuRow::new()),
+                    icons::Plus {}
+                    "Add GPUs"
+                }
+                div { class: "flex items-start gap-3",
+                    button {
+                        class: "switch mt-0.5",
+                        role: "switch",
+                        aria_checked: "{no_gpu()}",
+                        aria_label: "No GPU: software only",
+                        disabled: gpus_locked,
+                        onclick: move |_| no_gpu.toggle(),
+                    }
+                    span { class: "choice-what", b { "No GPU" } "Every encode in software, on the CPU" }
+                }
+                Note { settings: settings.clone(), setting: "transcode.gpus", on_changed: move |_| on_reload.call(()) }
+            }
         }
         div { class: "flex flex-col gap-2",
             h2 { "Limits" }

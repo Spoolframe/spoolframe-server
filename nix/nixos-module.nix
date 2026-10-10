@@ -7,10 +7,56 @@
 }: let
   cfg = config.services.spoolframe;
 
-  uses = family: cfg.transcode.hardware == "auto" || (builtins.isList cfg.transcode.hardware && builtins.elem family cfg.transcode.hardware);
-  vaapi = uses "vaapi" || uses "qsv";
-  nvenc = uses "nvenc";
+  # The GPUs the server may use (PGPU-05): transcode.gpus, or what the
+  # deprecated hardware and vaapiDevice mean, as the server reads them
+  # (each family every card of it, VA-API and QSV on vaapiDevice alone
+  # when that is set), or every card of every API.
+  oldFamilies =
+    if cfg.transcode.hardware == null || cfg.transcode.hardware == "auto"
+    then ["nvenc" "vaapi" "qsv"]
+    else if cfg.transcode.hardware == "none"
+    then []
+    else cfg.transcode.hardware;
+  oldGpus = map (api:
+    if api != "nvenc" && cfg.transcode.vaapiDevice != null
+    then {
+      inherit api;
+      pick = null;
+      device = cfg.transcode.vaapiDevice;
+      maxJobs = null;
+    }
+    else {
+      inherit api;
+      pick = "all";
+      device = null;
+      maxJobs = null;
+    })
+  oldFamilies;
+  gpus =
+    if cfg.transcode.gpus != null
+    then cfg.transcode.gpus
+    else oldGpus;
+  oldSet = cfg.transcode.hardware != null || cfg.transcode.vaapiDevice != null;
+  # An entry as the server's config takes it.
+  gpuEntry = e:
+    {inherit (e) api;}
+    // lib.optionalAttrs (e.pick != null) {inherit (e) pick;}
+    // lib.optionalAttrs (e.device != null) {device = toString e.device;}
+    // lib.optionalAttrs (e.maxJobs != null) {max_jobs = e.maxJobs;};
+  # An entry as this module's option is written, for the warning.
+  gpuNix = e:
+    "{ api = ${quote e.api}; "
+    + lib.optionalString (e.pick != null) "pick = ${quote e.pick}; "
+    + lib.optionalString (e.device != null) "device = ${quote (toString e.device)}; "
+    + "}";
+  onDrm = e: e.api == "vaapi" || e.api == "qsv";
+  vaapi = lib.any onDrm gpus;
+  nvenc = lib.any (e: e.api == "nvenc") gpus;
   gpu = vaapi || nvenc;
+  # A pick cannot name its render nodes before the server lists the cards:
+  # every DRM node then. A device entry names its own.
+  vaapiPicks = lib.any (e: onDrm e && e.device == null) gpus;
+  vaapiDevices = map (e: toString e.device) (lib.filter (e: onDrm e && e.device != null) gpus);
 
   # Each media tool confined by Landlock and seccomp (PX-11 finding 34).
   sandboxed = cfg.media.sandbox != "off";
@@ -115,9 +161,9 @@
       ${lib.optionalString cfg.admin.notProxied "not_proxied = true;"}
     }
     transcode {
-      # "auto", "none", or a list of families in order.
-      hardware = ${quote cfg.transcode.hardware};
-      vaapi_device = ${quote cfg.transcode.vaapiDevice};
+      ${lib.optionalString (cfg.transcode.gpus != null) "gpus = ${quote (map gpuEntry cfg.transcode.gpus)};"}
+      ${lib.optionalString (cfg.transcode.hardware != null) "hardware = ${quote cfg.transcode.hardware};"}
+      ${lib.optionalString (cfg.transcode.vaapiDevice != null) "vaapi_device = ${quote cfg.transcode.vaapiDevice};"}
       scratch_dir = "/var/cache/spoolframe/transcode";
       ${lib.optionalString (cfg.transcode.toneMap != null) "tone_map = ${quote cfg.transcode.toneMap};"}
     }
@@ -532,34 +578,94 @@ in {
     };
 
     transcode = {
+      gpus = lib.mkOption {
+        type = lib.types.nullOr (lib.types.listOf (lib.types.submodule {
+          options = {
+            api = lib.mkOption {
+              type = lib.types.enum ["nvenc" "vaapi" "qsv"];
+              description = "The API: NVIDIA's NVENC, VA-API (AMD, Intel), or Intel's Quick Sync.";
+            };
+            pick = lib.mkOption {
+              type = lib.types.nullOr (lib.types.enum ["all" "best" "dgpu" "igpu"]);
+              default = null;
+              description = ''
+                Which of that API's cards: `all` (every one, the most
+                capable first, a job going to the next when one is full),
+                `best` (the most capable alone), `dgpu` (discrete only) or
+                `igpu` (integrated only). Neither this nor `device`: `all`.
+              '';
+            };
+            device = lib.mkOption {
+              type = lib.types.nullOr (lib.types.either lib.types.str lib.types.ints.unsigned);
+              default = null;
+              example = "/dev/dri/by-path/pci-0000:c8:00.0-render";
+              description = ''
+                Exactly one card, in place of `pick`: a CUDA index for
+                NVIDIA (0, 1, …, as nvidia-smi numbers them), a render node
+                for VA-API and QSV; name it by PCI path, as the renderD
+                numbers follow probe order.
+              '';
+            };
+            maxJobs = lib.mkOption {
+              type = lib.types.nullOr lib.types.ints.positive;
+              default = null;
+              description = "GPU video encodes at once on each of the entry's cards; transcode.max_gpu_jobs (Settings › Playback) if null.";
+            };
+          };
+        }));
+        default = null;
+        example = [
+          {
+            api = "nvenc";
+            pick = "all";
+          }
+          {
+            api = "vaapi";
+            pick = "dgpu";
+          }
+          {
+            api = "vaapi";
+            device = "/dev/dri/by-path/pci-0000:c8:00.0-render";
+          }
+        ];
+        description = ''
+          The GPUs encodes run on (PGPU-05), in order of preference. The
+          server lists the host's cards at start, test-encodes on each
+          card an entry takes (and again on `systemctl reload`), and puts each video
+          encode on the card that does the most of it (encodes the
+          output, decodes the source, runs its tone map, burn-in and
+          scale), the entries' order then each card's rank deciding
+          between equals, and the next card when one runs its most jobs.
+          `spoolframe status` and the log list what each card does.
+          `null`: every card of every API, NVIDIA first; `[]`: software
+          only. A `pick` entry for VA-API or QSV lets the service open
+          every DRM node (DeviceAllow `char-drm`), as the cards are only
+          known at start; a `device` entry, that node alone.
+        '';
+      };
+
       hardware = lib.mkOption {
-        type = lib.types.either (lib.types.enum ["auto" "none"]) (lib.types.nonEmptyListOf (lib.types.enum ["vaapi" "nvenc" "qsv"]));
-        default = "auto";
+        type = lib.types.nullOr (lib.types.either (lib.types.enum ["auto" "none"]) (lib.types.nonEmptyListOf (lib.types.enum ["vaapi" "nvenc" "qsv"])));
+        default = null;
         example = ["nvenc" "vaapi"];
         description = ''
-          Which hardware encoders to try. The server test-encodes with each
-          at start (and on `systemctl reload`) and keeps what works; `spoolframe status`
-          lists it. A list sets the order of preference: each video
-          encode runs on the one family that does the most of it
-          (encodes the output, decodes the source, runs its tone map,
-          burn-in and scale), the order deciding between equals. With
-          `["nvenc" "vaapi"]` on a GTX 1060 and an AMD GPU, an AV1 film
-          goes to the AMD GPU, which decodes AV1, and a film both do
-          whole to NVIDIA. NVIDIA scales and burns in pictures on the GPU
-          only with `transcode.gpu_filters` on (Settings › Playback), so
-          with it off a 4K film made 1080p goes to the AMD GPU, which
-          scales there. `none` encodes in software only.
+          Deprecated, to be removed in a later release: use
+          {option}`services.spoolframe.transcode.gpus`. Still read, as the
+          gpus it means: each family named every card of it, in that
+          order (`auto` every API, `none` none), VA-API and QSV on
+          {option}`services.spoolframe.transcode.vaapiDevice` alone when
+          that is set. Not with gpus.
         '';
       };
 
       vaapiDevice = lib.mkOption {
-        type = lib.types.str;
-        default = "/dev/dri/renderD128";
+        type = lib.types.nullOr lib.types.str;
+        default = null;
         example = "/dev/dri/by-path/pci-0000:c8:00.0-render";
         description = ''
-          The render node VA-API encodes on. With more than one GPU, name it
-          by PCI path: the renderD numbers follow probe order and can swap
-          after a reboot.
+          Deprecated, to be removed in a later release: use a
+          {option}`services.spoolframe.transcode.gpus` entry with
+          `device`. The one render node VA-API encodes on. Not with gpus.
         '';
       };
 
@@ -694,6 +800,15 @@ in {
         assertion = cfg.wan == null || cfg.wan.mappedPort == null || !(cfg.wan.mappedPort.publicIp == "lookup" && cfg.wan.mappedPort.lookupVia == null);
         message = ''services.spoolframe.wan.mappedPort.publicIp is "lookup", but wan.mappedPort.lookupVia = null forbids looking the address up: set publicIp to this network's public address, or lookupVia to "wtfismyip".'';
       }
+      # The server refuses both at load (PGPU-05).
+      {
+        assertion = cfg.transcode.gpus == null || !oldSet;
+        message = "services.spoolframe.transcode.gpus is set, and so is the deprecated transcode.hardware or vaapiDevice: gpus says everything they did, so set gpus alone.";
+      }
+      {
+        assertion = lib.all (e: e.pick == null || e.device == null) gpus;
+        message = "services.spoolframe.transcode.gpus: an entry has pick or device, not both: pick chooses among the cards found, device names one.";
+      }
       {
         assertion = cfg.auth.oidc == [] || cfg.admin.publicUrl != null;
         message = "services.spoolframe.auth.oidc needs services.spoolframe.admin.publicUrl: the provider sends the browser back to <publicUrl>/auth/oidc/callback.";
@@ -713,8 +828,12 @@ in {
     ];
 
     warnings =
+      # PGPU-05: still read, as the gpus they mean.
+      lib.optional oldSet ''
+        services.spoolframe.transcode.hardware and vaapiDevice are deprecated and will be removed:
+        use services.spoolframe.transcode.gpus = [ ${lib.concatMapStringsSep " " gpuNix oldGpus} ];''
       # P6-07: relays of your own that no device is told about.
-      lib.optional (cfg.ownRelays != [] && cfg.relays == []) ''
+      ++ lib.optional (cfg.ownRelays != [] && cfg.relays == []) ''
         services.spoolframe.ownRelays names relays of your own, but services.spoolframe.relays is
         empty: the server answers them, yet tells no device about a relay. Add each relay's URL
         to relays.''
@@ -804,12 +923,16 @@ in {
         # What it writes is its own (PX-11 finding 35); the server sets
         # the same umask itself.
         UMask = "0077";
-        # No other devices; the GPU's only when hardware encoding may be
-        # used: VA-API's one render node, not every DRM node.
+        # No other devices; the GPUs' only when hardware encoding may be
+        # used: a VA-API or QSV entry's render node, or every DRM node for
+        # an entry that picks among the cards (they are listed at start);
+        # NVIDIA's character devices for an NVIDIA entry. Each run is then
+        # confined to its own card's nodes by the server (PGPU-05).
         PrivateDevices = !gpu;
         DevicePolicy = "closed";
         DeviceAllow =
-          lib.optionals vaapi ["${cfg.transcode.vaapiDevice} rw"]
+          lib.optionals vaapiPicks ["char-drm rw"]
+          ++ map (node: "${node} rw") vaapiDevices
           ++ lib.optionals nvenc ["char-nvidia-frontend rw" "char-nvidia-uvm rw" "char-nvidia-caps rw"];
         # The GPU's device nodes belong to groups the service's user is in
         # (render), which a user namespace would hide.

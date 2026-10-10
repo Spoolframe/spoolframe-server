@@ -1,7 +1,7 @@
 //! One ffmpeg run (P2-03): spawned for a playback, paused when it is far
 //! ahead of its reader, killed and cleaned up when dropped.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -260,10 +260,25 @@ impl Slot {
     pub fn load(&self) -> Load {
         self.place.load
     }
+
+    /// The GPU card it counts against, for a GPU video encode.
+    pub fn card(&self) -> Option<&CardLimit> {
+        self.place.card.as_ref()
+    }
+}
+
+/// A GPU card a GPU video encode counts against (PGPU-05): each card has
+/// its own count, and its own limit or `transcode.max_gpu_jobs`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CardLimit {
+    /// Which card: `gpus::Card::key`.
+    pub key: String,
+    /// Its entry's `max_jobs`; `None` for `transcode.max_gpu_jobs`.
+    pub max_jobs: Option<usize>,
 }
 
 /// The budget's use now, and its limits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BudgetUse {
     /// Taken by the conversions running now.
     pub used: Units,
@@ -272,42 +287,84 @@ pub struct BudgetUse {
     /// Remuxes running, and `transcode.max_remux`.
     pub remuxes: usize,
     pub max_remux: usize,
-    /// GPU video encodes running, and `transcode.max_gpu_jobs`.
+    /// GPU video encodes running on every card together, and
+    /// `transcode.max_gpu_jobs`: each card's limit unless its entry sets
+    /// one (PGPU-05).
     pub gpu_jobs: usize,
     pub max_gpu_jobs: usize,
+    /// GPU video encodes running on each card, by `CardLimit::key`. A GPU
+    /// encode with no card (none was detected) counts under `""`.
+    pub gpu_jobs_by_card: HashMap<String, usize>,
+}
+
+/// A card's key in [`BudgetUse::gpu_jobs_by_card`].
+fn card_key(card: Option<&CardLimit>) -> &str {
+    card.map_or("", |c| c.key.as_str())
 }
 
 impl BudgetUse {
-    /// Whether a conversion of `load` may start now. `replacing`: the load
-    /// of the conversion it replaces, which still runs but ends once this
-    /// one has started, so what it holds counts as free.
-    fn admits(&self, load: Load, replacing: Option<Load>) -> bool {
-        let mut now = *self;
-        if let Some(old) = replacing {
-            now.give_back(old);
+    /// Whether a conversion of `load` on `card` may start now.
+    /// `replacing`: the load and card of the conversion it replaces, which
+    /// still runs but ends once this one has started, so what it holds
+    /// counts as free.
+    fn admits(
+        &self,
+        load: Load,
+        card: Option<&CardLimit>,
+        replacing: Option<(Load, Option<&CardLimit>)>,
+    ) -> bool {
+        let mut now = self.clone();
+        if let Some((old, old_card)) = replacing {
+            now.give_back(old, old_card);
         }
         let fits = now.used.0 + load.weight().0 <= now.max.0;
         match load {
             Load::Remux => now.remuxes < now.max_remux,
-            Load::Gpu | Load::GpuOnly => fits && now.gpu_jobs < now.max_gpu_jobs,
+            Load::Gpu | Load::GpuOnly => fits && now.card_has_room(card),
             Load::Audio | Load::Software => fits,
         }
     }
 
-    fn take(&mut self, load: Load) {
+    /// Whether `card` runs fewer GPU encodes than its limit.
+    pub fn card_has_room(&self, card: Option<&CardLimit>) -> bool {
+        let running = self
+            .gpu_jobs_by_card
+            .get(card_key(card))
+            .copied()
+            .unwrap_or(0);
+        let max = card.and_then(|c| c.max_jobs).unwrap_or(self.max_gpu_jobs);
+        running < max
+    }
+
+    fn take(&mut self, load: Load, card: Option<&CardLimit>) {
         self.used.0 += load.weight().0;
         match load {
             Load::Remux => self.remuxes += 1,
-            Load::Gpu | Load::GpuOnly => self.gpu_jobs += 1,
+            Load::Gpu | Load::GpuOnly => {
+                self.gpu_jobs += 1;
+                *self
+                    .gpu_jobs_by_card
+                    .entry(card_key(card).to_owned())
+                    .or_default() += 1;
+            }
             Load::Audio | Load::Software => {}
         }
     }
 
-    fn give_back(&mut self, load: Load) {
+    fn give_back(&mut self, load: Load, card: Option<&CardLimit>) {
         self.used.0 -= load.weight().0;
         match load {
             Load::Remux => self.remuxes -= 1,
-            Load::Gpu | Load::GpuOnly => self.gpu_jobs -= 1,
+            Load::Gpu | Load::GpuOnly => {
+                self.gpu_jobs -= 1;
+                let key = card_key(card);
+                if let Some(running) = self.gpu_jobs_by_card.get_mut(key) {
+                    *running -= 1;
+                    if *running == 0 {
+                        self.gpu_jobs_by_card.remove(key);
+                    }
+                }
+            }
             Load::Audio | Load::Software => {}
         }
     }
@@ -326,29 +383,35 @@ impl BudgetUse {
 struct Place {
     budget: Arc<parking_lot::Mutex<BudgetUse>>,
     load: Load,
+    /// The card a GPU encode counts against.
+    card: Option<CardLimit>,
 }
 
 impl Place {
     fn take(
         budget: &Arc<parking_lot::Mutex<BudgetUse>>,
         load: Load,
-        replacing: Option<Load>,
+        card: Option<CardLimit>,
+        replacing: Option<&Slot>,
     ) -> Option<Self> {
+        // Only a GPU encode counts against a card.
+        let card = card.filter(|_| matches!(load, Load::Gpu | Load::GpuOnly));
         let mut now = budget.lock();
-        if !now.admits(load, replacing) {
+        if !now.admits(load, card.as_ref(), replacing.map(|r| (r.load(), r.card()))) {
             return None;
         }
-        now.take(load);
+        now.take(load, card.as_ref());
         Some(Self {
             budget: budget.clone(),
             load,
+            card,
         })
     }
 }
 
 impl Drop for Place {
     fn drop(&mut self) {
-        self.budget.lock().give_back(self.load);
+        self.budget.lock().give_back(self.load, self.card.as_ref());
     }
 }
 
@@ -540,7 +603,13 @@ impl Jobs {
 
     /// The encode budget's use now, and its limits.
     pub fn budget(&self) -> BudgetUse {
-        *self.budget.lock()
+        self.budget.lock().clone()
+    }
+
+    /// Whether `card` runs fewer GPU encodes than its limit now: a
+    /// conversion goes to the next card when not (PGPU-05).
+    pub fn card_has_room(&self, card: &CardLimit) -> bool {
+        self.budget.lock().card_has_room(Some(card))
     }
 
     /// How many jobs that encode run now.
@@ -598,19 +667,19 @@ impl Jobs {
         start_ms: u64,
         slot: Option<Slot>,
     ) -> Result<Arc<EncodeJob>, JobError> {
+        let run: Run = run.into();
+        let card = run.card.clone();
         let slot = match slot {
-            Some(slot) if slot.load() == load => slot,
-            replacing => {
-                match Place::take(&self.budget, load, replacing.as_ref().map(Slot::load)) {
-                    Some(place) => Slot {
-                        place: Arc::new(place),
-                    },
-                    None => {
-                        self.counters.refused.inc();
-                        return Err(JobError::Busy);
-                    }
+            Some(slot) if slot.load() == load && slot.card() == card.as_ref() => slot,
+            replacing => match Place::take(&self.budget, load, card, replacing.as_ref()) {
+                Some(place) => Slot {
+                    place: Arc::new(place),
+                },
+                None => {
+                    self.counters.refused.inc();
+                    return Err(JobError::Busy);
                 }
-            }
+            },
         };
         let slot = Arc::new(parking_lot::Mutex::new(Some(slot)));
         std::fs::create_dir_all(&dir).map_err(|e| JobError::Prepare(e.to_string()))?;
@@ -622,11 +691,13 @@ impl Jobs {
             vulkan,
             fallback,
             made,
-        } = run.into();
+            card: _,
+            ffmpeg,
+        } = run;
+        let ffmpeg = ffmpeg.unwrap_or_else(|| self.ffmpeg.clone());
         let limits = self.limits();
-        let cannot_run = |e: std::io::Error| {
-            JobError::Spawn(format!("{}: {e}", self.ffmpeg.program().display()))
-        };
+        let cannot_run =
+            |e: std::io::Error| JobError::Spawn(format!("{}: {e}", ffmpeg.program().display()));
         // No file of the job's is larger than all it may write.
         let mut jail = Jail::new(Limits::encode(limits.scratch_limit_bytes));
         for dir in reads {
@@ -637,13 +708,13 @@ impl Jobs {
             jail = jail.input(input);
         }
         // The fallback's run is `jail` with its own GPU: no Vulkan.
-        let mut child = launch(&self.ffmpeg, &jail.clone().gpu(gpu).vulkan(vulkan), &args)
-            .map_err(cannot_run)?;
+        let mut child =
+            launch(&ffmpeg, &jail.clone().gpu(gpu).vulkan(vulkan), &args).map_err(cannot_run)?;
         // The run's process group, which ffmpeg leads.
         let pid = child.id().unwrap_or(0);
         let (progress_tx, progress) = watch::channel(Progress::default());
         let progress_tx = Arc::new(progress_tx);
-        let mut command = vec![self.ffmpeg.program().display().to_string()];
+        let mut command = vec![ffmpeg.program().display().to_string()];
         command.extend(args);
         let shared = Arc::new(Shared {
             pid: AtomicU32::new(pid),
@@ -658,7 +729,7 @@ impl Jobs {
             stderr: parking_lot::Mutex::default(),
         });
         let supervisor = Supervisor {
-            ffmpeg: self.ffmpeg.clone(),
+            ffmpeg: ffmpeg.clone(),
             jail,
             fallback,
             decode_failures: self.decode_failures.clone(),
@@ -735,6 +806,11 @@ pub struct Run {
     pub fallback: Option<Fallback>,
     /// How it makes its video (PX-24).
     pub made: Option<Made>,
+    /// For a GPU video encode, the card it counts against (PGPU-05).
+    pub card: Option<CardLimit>,
+    /// ffmpeg confined to the GPU card it runs on, in place of the jobs'
+    /// own (which is given no GPU's nodes).
+    pub ffmpeg: Option<Tool>,
 }
 
 /// A run decoding in software, in place of one decoding on the GPU.
@@ -1505,7 +1581,71 @@ pub(super) mod tests {
     }
 
     fn take(budget: &Arc<parking_lot::Mutex<BudgetUse>>, load: Load) -> Option<Place> {
-        Place::take(budget, load, None)
+        Place::take(budget, load, None, None)
+    }
+
+    fn card(key: &str, max_jobs: Option<usize>) -> CardLimit {
+        CardLimit {
+            key: key.into(),
+            max_jobs,
+        }
+    }
+
+    fn take_on(
+        budget: &Arc<parking_lot::Mutex<BudgetUse>>,
+        load: Load,
+        card: &CardLimit,
+    ) -> Option<Place> {
+        Place::take(budget, load, Some(card.clone()), None)
+    }
+
+    /// PGPU-05: `max_gpu_jobs` is each card's, not all of theirs: a full
+    /// card leaves the other's room, and an entry's `max_jobs` is its
+    /// cards' own limit.
+    #[test]
+    fn each_card_has_its_own_gpu_cap() {
+        let budget = budget_with(8, 32, 2);
+        let (xtx, igpu) = (
+            card("vaapi:0000:03:00.0", None),
+            card("vaapi:0000:6d:00.0", Some(1)),
+        );
+        let _a = take_on(&budget, Load::Gpu, &xtx).unwrap();
+        let _b = take_on(&budget, Load::GpuOnly, &xtx).unwrap();
+        assert!(
+            take_on(&budget, Load::Gpu, &xtx).is_none(),
+            "a third on a card of 2"
+        );
+        assert!(!budget.lock().card_has_room(Some(&xtx)));
+        assert!(budget.lock().card_has_room(Some(&igpu)));
+        let c = take_on(&budget, Load::Gpu, &igpu).unwrap();
+        assert!(
+            take_on(&budget, Load::Gpu, &igpu).is_none(),
+            "its entry says 1"
+        );
+        assert_eq!(budget.lock().gpu_jobs, 3);
+        drop(c);
+        assert!(budget.lock().card_has_room(Some(&igpu)));
+        assert_eq!(
+            budget.lock().gpu_jobs_by_card.get("vaapi:0000:6d:00.0"),
+            None
+        );
+        // A software encode counts against no card.
+        let _software = take_on(&budget, Load::Software, &xtx).unwrap();
+        assert_eq!(budget.lock().gpu_jobs_by_card["vaapi:0000:03:00.0"], 2);
+    }
+
+    /// A job that replaces another counts the replaced one's place as
+    /// free, on the card it was on.
+    #[test]
+    fn a_replaced_job_s_card_counts_as_free() {
+        let budget = budget_with(8, 32, 1);
+        let one = card("nvenc:0000:01:00.0", None);
+        let old = Slot {
+            place: Arc::new(take_on(&budget, Load::Gpu, &one).unwrap()),
+        };
+        assert!(take_on(&budget, Load::GpuOnly, &one).is_none());
+        let new = Place::take(&budget, Load::GpuOnly, Some(one.clone()), Some(&old));
+        assert!(new.is_some(), "the old one's place on the card is free");
     }
 
     #[test]
@@ -1545,7 +1685,7 @@ pub(super) mod tests {
             .map(|n| take(&budget, Load::Remux).unwrap_or_else(|| panic!("remux {n}")))
             .collect();
         assert!(take(&budget, Load::Remux).is_none(), "a sixth remux fits");
-        let used = *budget.lock();
+        let used = budget.lock().clone();
         assert_eq!((used.used, used.remuxes), (Units::jobs(1), 5));
         drop(remuxes);
         assert_eq!(budget.lock().remuxes, 0);
@@ -1600,7 +1740,9 @@ pub(super) mod tests {
     #[test]
     fn a_replacement_of_another_load_counts_what_it_replaces_as_free() {
         let budget = budget(1);
-        let audio = take(&budget, Load::Audio).unwrap();
+        let audio = Slot {
+            place: Arc::new(take(&budget, Load::Audio).unwrap()),
+        };
         let _others: Vec<Place> = (0..3)
             .map(|_| take(&budget, Load::Audio).unwrap())
             .collect();
@@ -1608,7 +1750,7 @@ pub(super) mod tests {
         // encode, which fits only once that audio encode's quarter is free.
         assert!(take(&budget, Load::Software).is_none());
         drop(_others);
-        let video = Place::take(&budget, Load::Software, Some(Load::Audio)).unwrap();
+        let video = Place::take(&budget, Load::Software, None, Some(&audio)).unwrap();
         // Both run for a moment, until the old one stops.
         assert_eq!(budget.lock().used, Units::quarters(5));
         drop(audio);

@@ -30,7 +30,7 @@ nix build .#docker && ./result | docker load
 docker run -d --name spoolframe \
   -v spoolframe:/var/lib/spoolframe -v /srv/media:/srv/media:ro \
   -p 7420:7420/udp -p 7421:7421 \
-  ghcr.io/spoolframe/spoolframe-server:0.5.0
+  ghcr.io/spoolframe/spoolframe-server:0.6.0
 docker logs spoolframe   # the web UI's address and the setup code
 ```
 
@@ -42,14 +42,31 @@ and Plex discovery reach the LAN too. After editing the mounted config,
 `docker kill -s HUP spoolframe` has the server read it again: live
 settings apply at once, the others at the next `docker restart`.
 
-GPUs: pass an AMD GPU's render node in with `--device
-/dev/dri/renderD128` (and `--group-add` its group, often `render`); the
-image carries Mesa's VA-API (radeonsi) and Vulkan (RADV) drivers, but not
-Intel's VA-API driver (iHD). An NVIDIA GPU needs
-the NVIDIA Container Toolkit (`--gpus all`), and `NVIDIA_DRIVER_CAPABILITIES`
+Pick a tag by the GPU it runs on. They share every layer but the GPU
+drivers':
+
+| tag | for | size |
+|---|---|---|
+| `:0.6.0` (`.#docker`), the default | any GPU, or not sure: AMD (old and new), Intel (old and new), NVIDIA, VMs (virgl), Docker Desktop on Windows (WSL2, d3d12) | about 1.5 GiB |
+| `:0.6.0-slim` (`.#docker-slim`) | a recent AMD or Intel GPU (radeonsi, RADV, ANV, iHD) | about 590 MiB |
+| `:0.6.0-nvidia` (`.#docker-nvidia`) | NVIDIA | about 450 MiB |
+| `:0.6.0-cpu` | no GPU: the `-nvidia` image under a second tag | about 450 MiB |
+
+Pass an AMD or Intel GPU's render node in with `--device
+/dev/dri/renderD128` and `--group-add` its group (often `render`). With no
+GPU everything is encoded on the CPU, which for a 4K HDR film to 1080p
+takes roughly 6 cores per stream at real time.
+
+An NVIDIA GPU needs the NVIDIA Container Toolkit (`--gpus all`, or CDI's
+`--device nvidia.com/gpu=all`); every tag runs it. `NVIDIA_DRIVER_CAPABILITIES`
 must include `graphics` as well as `compute,video,utility` for libplacebo's
-tone map, which runs on NVIDIA's Vulkan driver: the image sets
+tone map, which runs on NVIDIA's Vulkan driver: the images set
 `compute,video,utility,graphics`, so set it again only if you override it.
+The toolkit's Vulkan manifest is found in `/usr/share/vulkan/icd.d`,
+`/etc/vulkan/icd.d` or a NixOS host's `/run/opengl-driver`, and its
+libraries in `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` or `/usr/lib`
+(`LD_LIBRARY_PATH`); the images carry the libX11, libXext and glvnd
+`libEGL` that NVIDIA's Vulkan driver loads.
 
 ### Web UI
 

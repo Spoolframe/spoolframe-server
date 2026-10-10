@@ -93,6 +93,7 @@ pub const SETTINGS: &[Setting] = &[
     restart("media.ffprobe"),
     restart("media.tesseract"),
     restart("media.sandbox"),
+    restart("transcode.gpus"),
     restart("transcode.hardware"),
     restart("transcode.vaapi_device"),
     live("transcode.max_jobs"),

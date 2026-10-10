@@ -299,13 +299,33 @@ media {
 
 # Converting for clients that cannot play a file as it is.
 transcode {
-  # "auto" (every family that works), "none" (software only), or a list
-  # of families in order of preference: ["nvenc", "vaapi"]. Each video
-  # encode runs on one family: the one that also decodes the source and
-  # runs its filters (tone map, burn-in, scale), the order deciding
-  # between equals.
-  hardware = "auto";
-  vaapi_device = "/dev/dri/renderD128";
+  # The GPUs encodes run on, in order of preference. Each entry is an api
+  # ("nvenc", "vaapi" or "qsv") and either pick or device:
+  #   pick = "all"   every card of that API, the most capable first, a
+  #                  job going to the next when one is full (the default);
+  #   pick = "best"  the most capable card alone;
+  #   pick = "dgpu"  discrete cards only; pick = "igpu" integrated ones;
+  #   device = …     exactly one card: a CUDA index for NVIDIA (0, 1, …,
+  #                  as nvidia-smi numbers them), a render node for VA-API
+  #                  and QSV ("/dev/dri/by-path/pci-0000:03:00.0-render").
+  # max_jobs = n bounds the GPU video encodes on each of the entry's cards
+  # (max_gpu_jobs if left out). Each video encode runs on one card: the
+  # one that does the most of it (decoding the source and running its
+  # filters too), then the entries' order deciding. Left out, every card
+  # of every API, as:
+  # gpus = [
+  #   { api = "nvenc"; pick = "all"; },
+  #   { api = "vaapi"; pick = "all"; },
+  #   { api = "qsv"; pick = "all"; },
+  # ];
+  # [] is no GPU: software only.
+  #
+  # Deprecated, and not with gpus: hardware ("auto", "none", or families
+  # in order: ["nvenc", "vaapi"]) and vaapi_device (VA-API's one render
+  # node) are read as the gpus they mean: each family every card of it,
+  # VA-API on vaapi_device alone when that is set.
+  # hardware = "auto";
+  # vaapi_device = "/dev/dri/renderD128";
   # The encode budget: how many software video encodes (libx264) run at
   # once. Lighter conversions take less of it: a GPU video encode half of
   # one, or a quarter when it is decoded and scaled on the GPU too with
@@ -316,7 +336,8 @@ transcode {
   # Remuxes at once. They cost next to no CPU, but each holds the file
   # open and writes to the scratch directory.
   max_remux = 32;
-  # GPU video encodes (VA-API, NVENC) at once, within the budget too.
+  # GPU video encodes (VA-API, NVENC) at once on each GPU, within the
+  # budget too; a gpus entry's max_jobs overrides it for its cards.
   max_gpu_jobs = 3;
   # Where encodes write; the state directory's cache/transcode if left
   # out.

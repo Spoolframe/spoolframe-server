@@ -4,13 +4,14 @@
 pub mod args;
 pub mod hls;
 pub mod job;
+pub mod pick;
 
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use spoolframe_media::encoders::{Encoders, Hardware};
+use spoolframe_media::encoders::Hardware;
 use spoolframe_media::sandbox::GpuUse;
 use spoolframe_media::{MediaDescriptor, codecs};
 use spoolframe_protocol::{
@@ -24,6 +25,8 @@ pub use self::args::{Decoder, FilterOn, Made};
 use self::hls::Segments;
 pub use self::job::{BudgetUse, Encoding, EncodingGuard, Load, Measured, Units};
 use self::job::{EncodeJob, Fallback, JobError, Jobs, Run, Slot, Written};
+use self::pick::RunOn;
+use crate::transcode::{Detected, Gpu};
 
 /// What the server allows encodes (`transcode { … }`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,8 +82,9 @@ pub struct Conversion {
     video: Option<ConvertedVideo>,
     audio: Option<ConvertedAudio>,
     subtitle: Option<ConvertedSubtitle>,
-    encoders: Arc<Encoders>,
-    vaapi_device: PathBuf,
+    /// The GPU its runs go to, picked once at its start (PGPU-05): a seek
+    /// or another rung stays on it, as on one encoder (PGPU-02).
+    run_on: RunOn,
     /// For HLS: where the segments are cut (P2-05).
     segments: Option<Segments>,
     /// For HLS under Auto (PX-21): the encodes a player switches between,
@@ -120,8 +124,8 @@ pub struct ConversionSource<'a> {
     pub path: &'a Path,
     pub descriptor: Arc<MediaDescriptor>,
     pub plan: &'a PlaybackPlan,
-    pub encoders: Arc<Encoders>,
-    pub vaapi_device: &'a Path,
+    /// The GPUs detection found, and what they and the CPU encode.
+    pub gpus: Arc<Detected>,
     /// For HLS of a copied video: the source's keyframes, its only cuts.
     pub keyframes: Option<Arc<Vec<u64>>>,
     /// The epoch of its first encode: 0 for a new playback; one past the
@@ -226,6 +230,27 @@ impl Conversion {
             source.start_rung.min(ladder.len() as u32 - 1)
         };
         let first_video = rung_video(*video, ladder, start_rung);
+        let run_on = run_on(
+            &jobs,
+            &source,
+            EncodeSpec {
+                input: &input,
+                sidecar: sidecar.as_deref(),
+                descriptor: &source.descriptor,
+                video: first_video,
+                audio: *audio,
+                subtitle: *subtitle,
+                encoders: &source.gpus.software,
+                vaapi_device: Path::new(""),
+                hardware_decode: !jobs.hardware_decode_failed(source.path),
+                gpu_filters: jobs.limits().gpu_filters,
+                tone_map: jobs.limits().tone_map,
+                start: None,
+                output: Output::Progressive {
+                    file: PathBuf::new(),
+                },
+            },
+        );
         let job = spawn(
             &jobs,
             &dir,
@@ -234,8 +259,7 @@ impl Conversion {
             sidecar.as_deref(),
             &source.descriptor,
             (*delivery, first_video, *audio, *subtitle),
-            &source.encoders,
-            source.vaapi_device,
+            &run_on,
             source.first_epoch,
             start,
             first_segment,
@@ -259,8 +283,7 @@ impl Conversion {
             video: *video,
             audio: *audio,
             subtitle: *subtitle,
-            encoders: source.encoders,
-            vaapi_device: source.vaapi_device.to_path_buf(),
+            run_on,
             segments,
             ladder: ladder.clone(),
             first_rung: start_rung,
@@ -438,8 +461,7 @@ impl Conversion {
             self.sidecar.as_deref(),
             &self.descriptor,
             self.parts(rung),
-            &self.encoders,
-            &self.vaapi_device,
+            &self.run_on,
             epoch,
             start,
             from,
@@ -513,8 +535,7 @@ impl Conversion {
             self.sidecar.as_deref(),
             &self.descriptor,
             self.parts(rung),
-            &self.encoders,
-            &self.vaapi_device,
+            &self.run_on,
             epoch,
             start,
             from,
@@ -573,8 +594,7 @@ impl Conversion {
             self.sidecar.as_deref(),
             &self.descriptor,
             self.parts(current.rung),
-            &self.encoders,
-            &self.vaapi_device,
+            &self.run_on,
             epoch,
             Some(start),
             start_number,
@@ -586,6 +606,20 @@ impl Conversion {
         current.left = None;
         Ok(epoch)
     }
+}
+
+/// Where `source`'s runs go: the GPU [`pick::choose`] picks for `probe`,
+/// its first run (PGPU-05), passing over a card with no room for another
+/// GPU encode. The card of the conversion it replaces has room: that one
+/// lets go of its place as this one starts.
+fn run_on(jobs: &Jobs, source: &ConversionSource<'_>, probe: EncodeSpec<'_>) -> RunOn {
+    let replaced = source.slot.as_ref().and_then(Slot::card);
+    let room = |gpu: &Gpu| {
+        let limit = gpu.limit();
+        replaced.is_some_and(|r| r.key == limit.key) || jobs.card_has_room(&limit)
+    };
+    let gpu = pick::choose(&probe, &source.gpus.gpus, &room).cloned();
+    RunOn::new(&source.gpus, gpu)
 }
 
 /// The video of `rung`: a ladder's rung at its own height and cap, the
@@ -688,8 +722,7 @@ fn spawn(
     sidecar: Option<&Path>,
     descriptor: &MediaDescriptor,
     (delivery, video, audio, subtitle): Parts,
-    encoders: &Encoders,
-    vaapi_device: &Path,
+    run_on: &RunOn,
     epoch: u32,
     start: Option<Duration>,
     start_number: u32,
@@ -719,8 +752,8 @@ fn spawn(
         video,
         audio,
         subtitle,
-        encoders,
-        vaapi_device,
+        encoders: run_on.encoders(),
+        vaapi_device: run_on.vaapi_device(),
         hardware_decode: !jobs.hardware_decode_failed(file),
         gpu_filters: jobs.limits().gpu_filters,
         tone_map: jobs.limits().tone_map,
@@ -741,7 +774,7 @@ fn spawn(
     {
         tracing::info!(reason = why, "a conversion tone maps on the CPU");
     }
-    // One GPU family for the whole job (PX-28): the run may open its
+    // One GPU family for the whole job (PGPU-02): the run may open its
     // device nodes and no other's.
     let placement = args::placement(&spec);
     let encoder = placement.and_then(|place| place.encoder.hardware);
@@ -793,6 +826,10 @@ fn spawn(
             vulkan,
             fallback,
             made,
+            // A GPU encode counts against its card (PGPU-05); the run may
+            // open that card's nodes, its ffmpeg confined to them.
+            card: run_on.gpu().filter(|_| gpu_encode).map(|g| g.limit()),
+            ffmpeg: run_on.gpu().map(|g| g.ffmpeg.clone()),
         },
         written,
         load(video, audio, gpu_encode, args::all_on_gpu(&spec)),
@@ -843,6 +880,23 @@ fn encodes(video: Option<ConvertedVideo>, audio: Option<ConvertedAudio>) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spoolframe_media::encoders::Encoders;
+
+    /// `encoders` as the one GPU detection found, on renderD128 for
+    /// VA-API, its runs made with `ffmpeg`.
+    fn one_gpu(encoders: Encoders, ffmpeg: &Path) -> Arc<Detected> {
+        let api = encoders
+            .video
+            .iter()
+            .find_map(|e| e.hardware)
+            .expect("a GPU encoder");
+        let gpu =
+            crate::transcode::test_gpu(0, api, spoolframe_media::gpus::Kind::Discrete, encoders);
+        Arc::new(Detected::with_gpus(vec![Gpu {
+            ffmpeg: spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
+            ..gpu
+        }]))
+    }
 
     /// B-13: a conversion that fails before its encode starts (a link
     /// that cannot be made, an HLS grid refused for the file's length)
@@ -894,8 +948,7 @@ mod tests {
                 path: &film,
                 descriptor,
                 plan: &plan,
-                encoders: Arc::new(Encoders::software_baseline()),
-                vaapi_device: Path::new("/dev/dri/renderD128"),
+                gpus: Arc::new(Detected::software_baseline()),
                 keyframes: None,
                 first_epoch: 0,
                 slot: None,
@@ -943,7 +996,7 @@ mod tests {
                     gpu_filters: false,
                     tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
                 },
-                spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
+                spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
             )
             .unwrap(),
         );
@@ -1003,8 +1056,7 @@ mod tests {
                 path: &film,
                 descriptor,
                 plan: &plan,
-                encoders: Arc::new(encoders),
-                vaapi_device: Path::new("/dev/dri/renderD128"),
+                gpus: one_gpu(encoders, &ffmpeg),
                 keyframes: None,
                 first_epoch: 0,
                 slot: None,
@@ -1030,7 +1082,7 @@ mod tests {
         assert_eq!(next.progress().borrow().done, None);
     }
 
-    /// PX-27: an NVENC encode decoding on NVDEC whose decode fails before
+    /// PGPU-01: an NVENC encode decoding on NVDEC whose decode fails before
     /// any output runs again in software, still on NVENC, and PX-24 says
     /// which decoded: NVDEC first, software after.
     #[tokio::test]
@@ -1063,7 +1115,7 @@ mod tests {
                     gpu_filters: false,
                     tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
                 },
-                spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
+                spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
             )
             .unwrap(),
         );
@@ -1123,8 +1175,7 @@ mod tests {
                 path: &film,
                 descriptor,
                 plan: &plan,
-                encoders: Arc::new(encoders),
-                vaapi_device: Path::new("/dev/dri/renderD128"),
+                gpus: one_gpu(encoders, &ffmpeg),
                 keyframes: None,
                 first_epoch: 0,
                 slot: None,
@@ -1148,7 +1199,7 @@ mod tests {
         assert_eq!(job.progress().borrow().done, None);
     }
 
-    /// PX-29: an NVENC encode filtering on CUDA weighs as one all on the
+    /// PGPU-03: an NVENC encode filtering on CUDA weighs as one all on the
     /// GPU, and a CUDA filter that fails before any output (a driver
     /// without the PTX JIT, say) runs it again as a failed VA-API filter
     /// does: decoded in software, filtered on the CPU, still on NVENC.
@@ -1180,7 +1231,7 @@ mod tests {
                     gpu_filters: true,
                     tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
                 },
-                spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
+                spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
             )
             .unwrap(),
         );
@@ -1242,8 +1293,7 @@ mod tests {
                 path: &film,
                 descriptor,
                 plan: &plan,
-                encoders: Arc::new(encoders),
-                vaapi_device: Path::new("/dev/dri/renderD128"),
+                gpus: one_gpu(encoders, &ffmpeg),
                 keyframes: None,
                 first_epoch: 0,
                 slot: None,
@@ -1306,7 +1356,7 @@ mod tests {
                     gpu_filters: false,
                     tone_map: spoolframe_media::encoders::ToneMapSetting::Libplacebo,
                 },
-                spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
+                spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
             )
             .unwrap(),
         );
@@ -1370,8 +1420,7 @@ mod tests {
                 path: &film,
                 descriptor,
                 plan: &plan,
-                encoders: Arc::new(encoders),
-                vaapi_device: Path::new("/dev/dri/renderD128"),
+                gpus: one_gpu(encoders, &ffmpeg),
                 keyframes: None,
                 first_epoch: 0,
                 slot: None,

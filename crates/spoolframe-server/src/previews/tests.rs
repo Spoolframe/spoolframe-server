@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use spoolframe_catalog::{
     Found, Image, ItemPage, ItemWithChildren, Page, PreviewFrames, SearchQuery,
 };
-use spoolframe_media::encoders::{FfmpegCommand, TranscodeSettings};
 use spoolframe_media::sandbox::Tool;
 use spoolframe_types::{Item, Library, LibraryId, PersonId};
 
@@ -111,8 +110,8 @@ async fn setup_making(
             Prober::DEFAULT_TIMEOUT,
         )),
         transcoding: Arc::new(Transcoding::new(
-            Box::new(FfmpegCommand::new(Tool::unconfined("ffmpeg"))),
-            TranscodeSettings::default(),
+            Tool::unconfined("ffmpeg"),
+            Vec::new(),
             tmp.as_ref().join("encoder-test"),
         )),
         ffmpeg: Tool::unconfined(ffmpeg),

@@ -174,7 +174,7 @@ pub fn families(video_encoders: &[String]) -> Vec<Family> {
 }
 
 /// What a family's GPU decodes, as the Playback step lists it under the
-/// family (PX-27): `NVDEC decodes H.264, HEVC, HEVC 10-bit`, from the
+/// family (PGPU-01): `NVDEC decodes H.264, HEVC, HEVC 10-bit`, from the
 /// server's `hevc 10-bit (nvdec)`. `None` where it decodes nothing.
 pub fn decoders_line(family: &str, hardware_decoders: &[String]) -> Option<String> {
     let (api, by) = match family {
@@ -558,9 +558,236 @@ pub fn tone_maps_line(found: &[GpuToneMap]) -> String {
 pub const EXPERIMENTAL_NOTE: &str =
     "These may change or go away in any release, without notice. The server logs the ones on.";
 
+/// One entry of `transcode.gpus` (PGPU-05) as Server › Settings ›
+/// Playback edits it: as typed, checked at Save.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuRow {
+    /// `nvenc`, `vaapi` or `qsv`.
+    pub api: String,
+    /// `all`, `best`, `dgpu`, `igpu`, or `device` for one card.
+    pub pick: String,
+    /// The card, when `pick` is `device`: a CUDA index or a render node.
+    pub device: String,
+    /// GPU jobs at once on each of its cards; empty for
+    /// `transcode.max_gpu_jobs`.
+    pub max_jobs: String,
+}
+
+/// The APIs an entry may name, and what the page calls them.
+pub const GPU_APIS: [(&str, &str); 3] = [
+    ("nvenc", "NVIDIA (NVENC)"),
+    ("vaapi", "VA-API (AMD, Intel)"),
+    ("qsv", "Quick Sync (Intel)"),
+];
+
+/// How an entry may take cards, and what the page calls each.
+pub const GPU_PICKS: [(&str, &str); 5] = [
+    ("all", "Every card, best first"),
+    ("best", "The best card"),
+    ("dgpu", "Discrete cards"),
+    ("igpu", "Integrated cards"),
+    ("device", "This card"),
+];
+
+impl GpuRow {
+    /// A new row: every VA-API card.
+    pub fn new() -> Self {
+        Self {
+            api: "vaapi".into(),
+            pick: "all".into(),
+            device: String::new(),
+            max_jobs: String::new(),
+        }
+    }
+
+    /// The rows of the setting's value: a list of `{ api; pick | device;
+    /// max_jobs }`. Nothing set is no row (every card of every API).
+    pub fn rows(value: Option<&serde_json::Value>) -> Vec<GpuRow> {
+        use serde_json::Value;
+        let Some(Value::Array(entries)) = value else {
+            return Vec::new();
+        };
+        let text = |entry: &Value, key: &str| match entry.get(key) {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        };
+        entries
+            .iter()
+            .map(|entry| {
+                let device = text(entry, "device");
+                GpuRow {
+                    api: text(entry, "api"),
+                    pick: if device.is_empty() {
+                        match text(entry, "pick") {
+                            pick if pick.is_empty() => "all".into(),
+                            pick => pick,
+                        }
+                    } else {
+                        "device".into()
+                    },
+                    device,
+                    max_jobs: text(entry, "max_jobs"),
+                }
+            })
+            .collect()
+    }
+
+    /// The setting for `rows`, or what is wrong with one, numbered as the
+    /// page shows them. The server checks it again.
+    pub fn setting(rows: &[GpuRow]) -> Result<serde_json::Value, String> {
+        let mut entries = Vec::new();
+        for (n, row) in rows.iter().enumerate() {
+            let n = n + 1;
+            let mut entry = serde_json::Map::new();
+            entry.insert("api".into(), row.api.clone().into());
+            if row.pick == "device" {
+                let device = row.device.trim();
+                if device.is_empty() {
+                    return Err(format!(
+                        "GPU {n}: name the card: a CUDA index (0, 1, …) or a render node."
+                    ));
+                }
+                entry.insert("device".into(), device.into());
+            } else {
+                entry.insert("pick".into(), row.pick.clone().into());
+            }
+            match row.max_jobs.trim() {
+                "" => {}
+                typed => match typed.parse::<u32>() {
+                    Ok(max) if max > 0 => {
+                        entry.insert("max_jobs".into(), max.into());
+                    }
+                    _ => return Err(format!("GPU {n}: jobs at once is a number, 1 or more.")),
+                },
+            }
+            entries.push(serde_json::Value::Object(entry));
+        }
+        Ok(serde_json::Value::Array(entries))
+    }
+}
+
+impl Default for GpuRow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The `transcode.gpus` rows the deprecated `transcode.hardware` and
+/// `vaapi_device` mean, as the server reads them: each family every card
+/// of it, VA-API (and QSV) on `vaapi_device` alone when that is set;
+/// `auto` (or nothing) every API, NVIDIA first; `none` no row at all.
+pub fn gpus_from_hardware(
+    hardware: Option<&serde_json::Value>,
+    vaapi_device: Option<&serde_json::Value>,
+) -> Vec<GpuRow> {
+    let families: Vec<String> = match Hardware::from_setting(hardware) {
+        Hardware::Auto => GPU_APIS.iter().map(|(api, _)| (*api).to_owned()).collect(),
+        Hardware::Software => Vec::new(),
+        Hardware::Ordered(list) => crate::logic::entries(&list),
+    };
+    let node = vaapi_device
+        .and_then(serde_json::Value::as_str)
+        .filter(|n| !n.trim().is_empty());
+    families
+        .into_iter()
+        .map(|api| {
+            let mut row = GpuRow {
+                api,
+                ..GpuRow::new()
+            };
+            if let ("vaapi" | "qsv", Some(node)) = (row.api.as_str(), node) {
+                row.pick = "device".into();
+                row.device = node.to_owned();
+            }
+            row
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gpu_rows_read_and_write_the_setting() {
+        let setting = json!([
+            { "api": "nvenc", "pick": "all" },
+            { "api": "vaapi", "device": "/dev/dri/renderD128", "max_jobs": 1 },
+            { "api": "nvenc", "device": 1 },
+            { "api": "qsv" },
+        ]);
+        let rows = GpuRow::rows(Some(&setting));
+        let picks: Vec<(&str, &str, &str, &str)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.api.as_str(),
+                    r.pick.as_str(),
+                    r.device.as_str(),
+                    r.max_jobs.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            picks,
+            [
+                ("nvenc", "all", "", ""),
+                ("vaapi", "device", "/dev/dri/renderD128", "1"),
+                ("nvenc", "device", "1", ""),
+                ("qsv", "all", "", ""),
+            ]
+        );
+        assert_eq!(
+            GpuRow::setting(&rows).unwrap(),
+            json!([
+                { "api": "nvenc", "pick": "all" },
+                { "api": "vaapi", "device": "/dev/dri/renderD128", "max_jobs": 1 },
+                { "api": "nvenc", "device": "1" },
+                { "api": "qsv", "pick": "all" },
+            ])
+        );
+        assert!(GpuRow::rows(None).is_empty());
+    }
+
+    #[test]
+    fn a_gpu_row_needs_its_card_and_a_number_of_jobs() {
+        let no_card = GpuRow {
+            pick: "device".into(),
+            ..GpuRow::new()
+        };
+        assert!(
+            GpuRow::setting(&[GpuRow::new(), no_card])
+                .unwrap_err()
+                .starts_with("GPU 2: ")
+        );
+        let zero = GpuRow {
+            max_jobs: "0".into(),
+            ..GpuRow::new()
+        };
+        assert!(GpuRow::setting(&[zero]).is_err());
+    }
+
+    /// What Convert writes: the server's own reading of the old setting.
+    #[test]
+    fn the_old_hardware_setting_converts_as_the_server_reads_it() {
+        let rows = gpus_from_hardware(
+            Some(&json!(["nvenc", "vaapi"])),
+            Some(&json!("/dev/dri/renderD129")),
+        );
+        assert_eq!(
+            GpuRow::setting(&rows).unwrap(),
+            json!([
+                { "api": "nvenc", "pick": "all" },
+                { "api": "vaapi", "device": "/dev/dri/renderD129" },
+            ])
+        );
+        assert!(gpus_from_hardware(Some(&json!("none")), None).is_empty());
+        let auto = gpus_from_hardware(Some(&json!("auto")), None);
+        let apis: Vec<&str> = auto.iter().map(|r| r.api.as_str()).collect();
+        assert_eq!(apis, ["nvenc", "vaapi", "qsv"]);
+    }
 
     #[test]
     fn the_tone_map_line_names_what_each_gpu_runs() {
@@ -721,7 +948,6 @@ mod tests {
 
     #[test]
     fn hardware_goes_both_ways() {
-        use serde_json::json;
         for (setting, choice) in [
             (json!("auto"), Hardware::Auto),
             (json!("none"), Hardware::Software),

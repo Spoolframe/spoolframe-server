@@ -18,6 +18,7 @@ mod device_sign_in;
 mod encode;
 mod endpoint;
 mod forget_device;
+mod gpu_cards;
 mod gpu_pick;
 mod harden;
 mod hwdec;

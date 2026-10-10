@@ -487,6 +487,59 @@ async fn a_run_not_on_nvidia_has_no_proc() {
     }
 }
 
+/// PGPU-05: a run on one card opens that card's nodes and no other's. Two
+/// stand-in render nodes and two NVIDIA card nodes (plain files: Landlock
+/// rules are by path): a VA-API run on the first card opens its node
+/// alone; an NVIDIA run on the second card its own node and the shared
+/// control node, not the first card's.
+#[tokio::test]
+async fn a_run_on_one_card_opens_that_card_s_nodes_only() {
+    let (_tmp, root) = scratch("one-card").await;
+    std::fs::create_dir_all(root.join("dri")).unwrap();
+    for node in [
+        "dri/renderD128",
+        "dri/renderD129",
+        "nvidiactl",
+        "nvidia0",
+        "nvidia1",
+    ] {
+        std::fs::write(root.join(node), "").unwrap();
+    }
+    let path = |node: &str| root.join(node).display().to_string();
+    let nodes = [
+        path("dri/renderD128"),
+        path("dri/renderD129"),
+        path("nvidiactl"),
+        path("nvidia0"),
+        path("nvidia1"),
+    ];
+    let nodes: Vec<&str> = nodes.iter().map(String::as_str).collect();
+    let opened = |devices: GpuDevices, gpu: GpuUse| {
+        let nodes = nodes.clone();
+        async move {
+            let sandbox = Sandbox::new(Mode::Required, Vec::new(), devices).unwrap();
+            let mut command = Tool::new("bash", sandbox)
+                .command(&Jail::new(Limits::PASS).gpu(gpu))
+                .unwrap();
+            command
+                .args(["-c", &open_each("<", &nodes)])
+                .stdin(Stdio::null());
+            said(&command.output().await.unwrap())
+                .into_iter()
+                .filter_map(|line| line.strip_prefix("opened ").map(str::to_owned))
+                .collect::<Vec<String>>()
+        }
+    };
+    let vaapi = opened(
+        GpuDevices::vaapi_card(&root.join("dri/renderD128")),
+        GpuUse::Vaapi,
+    )
+    .await;
+    assert_eq!(vaapi, [path("dri/renderD128")]);
+    let nvidia = opened(GpuDevices::nvidia_card(&root, 1, 1), GpuUse::Nvidia).await;
+    assert_eq!(nvidia, [path("nvidiactl"), path("nvidia1")]);
+}
+
 /// What the server checks at start: a confined ffprobe is refused the
 /// state directory and loopback; an unconfined one is not.
 #[tokio::test]

@@ -61,7 +61,7 @@ impl Hardware {
 ///
 /// Detection lists each codec's working encoders in this order, and the
 /// server runs each video encode on the family that does the most of it
-/// (`encode::args::placement`, PX-28), this order deciding between
+/// (`encode::args::placement`, PGPU-02), this order deciding between
 /// equals. So `[Nvenc, Vaapi]` on a host with a GTX 1060 and a Radeon
 /// encodes AV1, which Pascal's NVENC lacks, on the Radeon, and an AV1
 /// film to H.264 there too, Pascal's NVDEC not decoding AV1; software
@@ -277,7 +277,7 @@ pub struct Encoders {
     /// VA-API lays pictures over video on the GPU (`overlay_vaapi`).
     pub gpu_overlay: bool,
     /// NVIDIA keeps NVDEC's frames on the GPU and scales them there
-    /// (`scale_cuda`, PX-29): converting a 10-bit picture to 8 bits too.
+    /// (`scale_cuda`, PGPU-03): converting a 10-bit picture to 8 bits too.
     pub cuda_scale: bool,
     /// NVIDIA lays pictures over video on the GPU (`overlay_cuda`).
     pub cuda_overlay: bool,
@@ -286,7 +286,7 @@ pub struct Encoders {
     /// Hardware the settings named that did not work, for the log.
     #[serde(skip)]
     pub unusable: Vec<Hardware>,
-    /// Each family's tests that failed, for the log (PX-28).
+    /// Each family's tests that failed, for the log (PGPU-02).
     #[serde(skip)]
     pub failed: Vec<FailedTest>,
 }
@@ -500,6 +500,12 @@ pub trait Ffmpeg: Send + Sync {
     /// is the last of what it wrote to stderr when it ran. What it reads
     /// and writes is in `scratch`; `gpu` is the GPU it may use.
     async fn succeeds(&self, args: &[String], scratch: &Path, gpu: TestGpu) -> Result<(), String>;
+    /// What ffmpeg with `args` wrote to stderr, however it ended: a
+    /// card's name, as its driver tells it at `-v verbose` (PGPU-05).
+    /// `None` where it could not run; stand-ins say nothing.
+    async fn stderr(&self, _args: &[String], _scratch: &Path, _gpu: GpuUse) -> Option<String> {
+        None
+    }
 }
 
 /// The names in `ffmpeg -encoders` output.
@@ -743,7 +749,7 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
             overlay_args(settings),
         )
         .await;
-    // CUDA filters (PX-29) feed NVENC from NVDEC's frames: tried where
+    // CUDA filters (PGPU-03) feed NVENC from NVDEC's frames: tried where
     // both work, on the sample NVDEC decoded.
     let h264_nvenc = video
         .iter()
@@ -1165,7 +1171,7 @@ struct Sample {
 }
 
 /// The decode tests' samples. The 8-bit H.264, HEVC and AV1 ones are
-/// tried on every family, as before PX-27. NVDEC also takes 10-bit HEVC
+/// tried on every family, as before PGPU-01. NVDEC also takes 10-bit HEVC
 /// and AV1 (HDR sources; Pascal has no AV1 at all) and VP9: its decodes
 /// are trusted only as far as its tests went (`decodes_depth`), where
 /// VA-API's are settled by `gpu_decodes` in the server and a GPU decode
@@ -1340,6 +1346,22 @@ impl Ffmpeg for FfmpegCommand {
             return Ok(());
         }
         Err(last_words(&output.stderr, output.status))
+    }
+
+    async fn stderr(&self, args: &[String], scratch: &Path, gpu: GpuUse) -> Option<String> {
+        let mut command = self
+            .tool
+            .command(&test_jail(Some(scratch), gpu.into()))
+            .ok()?;
+        let run = command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(self.timeout, run).await.ok()?.ok()?;
+        Some(String::from_utf8_lossy(&output.stderr).into_owned())
     }
 }
 
@@ -1828,7 +1850,7 @@ mod tests {
         assert_eq!(encoders, ["libx265", "libsvtav1"]);
     }
 
-    /// PX-28: what a family's failed tests say it lacks, for the one
+    /// PGPU-02: what a family's failed tests say it lacks, for the one
     /// line the server logs of a family it names: a GTX 1060's NVENC
     /// has no AV1 encode, and NVDEC no AV1 of either depth.
     #[tokio::test]
@@ -1963,7 +1985,7 @@ mod tests {
         );
     }
 
-    /// PX-29: where NVENC and NVDEC work, `scale_cuda` and `overlay_cuda`
+    /// PGPU-03: where NVENC and NVDEC work, `scale_cuda` and `overlay_cuda`
     /// are each tried with a short run on NVIDIA's GPU: the H.264 sample
     /// decoded on CUDA, the frames kept there, filtered and encoded on
     /// NVENC.

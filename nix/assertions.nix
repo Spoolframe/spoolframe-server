@@ -49,6 +49,11 @@
   wanWarned = settings: lib.any (w: lib.hasInfix "services.spoolframe.wan is set but openFirewall is off" w) (evaluatedWith settings).config.warnings;
   # The UCL the module writes for the server.
   rendered = settings: (evaluatedWith settings).config.environment.etc."spoolframe/server.ucl".source.text;
+  # PGPU-05: the service's DeviceAllow, failed assertions and warnings
+  # with `transcode` set.
+  deviceAllow = transcode: (evaluatedWith {inherit transcode;}).config.systemd.services.spoolframe.serviceConfig.DeviceAllow;
+  gpuFailed = transcode: lib.any (lib.hasPrefix "services.spoolframe.transcode.gpus") (map (a: a.message) (lib.filter (a: !a.assertion) (evaluatedWith {inherit transcode;}).config.assertions));
+  gpuWarned = transcode: lib.findFirst (lib.hasPrefix "services.spoolframe.transcode.hardware") null (evaluatedWith {inherit transcode;}).config.warnings;
   publicUrl = "https://media.example.org";
   # The relay module evaluated with `settings` set (P6-04, P6-07).
   relayWith = settings:
@@ -184,6 +189,58 @@ in
   # is one quoted argument.
   assert check "the state directory is one argument" (lib.hasInfix ''--state-dir "/var/lib/spool frame"'' (execStart "/var/lib/spool frame"));
   assert check "the defaults are not warned of" (!warned {});
+  # PGPU-05: transcode.gpus, and the deprecated hardware and vaapiDevice.
+  assert check "by default no GPU setting is written" (!lib.hasInfix "hardware =" (rendered {}) && !lib.hasInfix "vaapi_device =" (rendered {}) && !lib.hasInfix "gpus =" (rendered {}));
+  assert check "by default every DRM node and NVIDIA's are allowed" (deviceAllow {} == ["char-drm rw" "char-nvidia-frontend rw" "char-nvidia-uvm rw" "char-nvidia-caps rw"]);
+  assert check "gpus are written as the server takes them" (lib.hasInfix ''gpus = [{"api":"vaapi","pick":"dgpu"},{"api":"nvenc","device":"1","max_jobs":2}];'' (rendered {
+    transcode.gpus = [
+      {
+        api = "vaapi";
+        pick = "dgpu";
+      }
+      {
+        api = "nvenc";
+        device = 1;
+        maxJobs = 2;
+      }
+    ];
+  }));
+  assert check "a device entry allows its node alone" (deviceAllow {
+      gpus = [
+        {
+          api = "vaapi";
+          device = "/dev/dri/renderD129";
+        }
+      ];
+    }
+    == ["/dev/dri/renderD129 rw"]);
+  assert check "no GPU allows no device" (deviceAllow {gpus = [];} == []);
+  assert check "the old setting is warned of with the gpus it means" (gpuWarned {
+      hardware = ["nvenc" "vaapi"];
+      vaapiDevice = "/dev/dri/renderD128";
+    }
+    == ''
+      services.spoolframe.transcode.hardware and vaapiDevice are deprecated and will be removed:
+      use services.spoolframe.transcode.gpus = [ { api = "nvenc"; pick = "all"; } { api = "vaapi"; device = "/dev/dri/renderD128"; } ];'');
+  assert check "the old setting keeps its one render node" (deviceAllow {
+      hardware = ["vaapi"];
+      vaapiDevice = "/dev/dri/renderD128";
+    }
+    == ["/dev/dri/renderD128 rw"]);
+  assert check "gpus alone is not warned of" (gpuWarned {gpus = [{api = "vaapi";}];} == null);
+  assert check "gpus with the old setting is refused" (gpuFailed {
+    gpus = [{api = "vaapi";}];
+    hardware = "auto";
+  });
+  assert check "an entry with pick and device is refused" (gpuFailed {
+    gpus = [
+      {
+        api = "vaapi";
+        pick = "all";
+        device = "/dev/dri/renderD128";
+      }
+    ];
+  });
   # The comma-separated settings are lists in the config the module writes.
   assert check "relays are written as a list" (lib.hasInfix ''relays = ["https://relay.example.org","default"];'' (rendered {relays = ["https://relay.example.org" "default"];}));
   assert check "trusted proxies are written as a list" (lib.hasInfix ''trusted_proxies = ["127.0.0.1"];'' (rendered {

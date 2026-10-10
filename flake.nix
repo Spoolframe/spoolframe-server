@@ -60,8 +60,23 @@
           {default = spoolframe;}
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             inherit ffmpeg;
+            # Any GPU, anywhere: nixpkgs' whole Mesa (PGPU-04).
             docker = pkgs.callPackage ./nix/docker.nix {
               inherit spoolframe;
+              rev = inputs.self.shortRev or null;
+            };
+            # AMD and recent Intel: a trimmed Mesa, no LLVM.
+            docker-slim = pkgs.callPackage ./nix/docker.nix {
+              inherit spoolframe;
+              mesa = pkgs.callPackage ./nix/mesa.nix {};
+              variant = "slim";
+              rev = inputs.self.shortRev or null;
+            };
+            # NVIDIA and the CPU only: no Mesa.
+            docker-nvidia = pkgs.callPackage ./nix/docker.nix {
+              inherit spoolframe;
+              mesa = null;
+              variant = "nvidia";
               rev = inputs.self.shortRev or null;
             };
           };

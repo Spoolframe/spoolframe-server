@@ -1138,6 +1138,11 @@ pub struct SettingEntry {
     /// when nothing set it then; always `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<serde_json::Value>,
+    /// A deprecated setting (PGPU-05: `transcode.hardware`,
+    /// `transcode.vaapi_device`): what to set instead, as it reads for
+    /// the settings now (`transcode.gpus = [ … ]`). Still read meanwhile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<String>,
 }
 
 /// Every setting, and what the page around them needs to know.

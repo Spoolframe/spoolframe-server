@@ -243,6 +243,7 @@ impl RuntimeSettings {
                 apply,
                 restart_pending: false,
                 running: None,
+                deprecated: None,
             };
         }
         let value = tree::get(merged, setting.key);
@@ -264,6 +265,7 @@ impl RuntimeSettings {
                 apply,
                 restart_pending: false,
                 running: None,
+                deprecated: None,
             };
         }
         let running = tree::get(&self.started, setting.key);
@@ -288,6 +290,9 @@ impl RuntimeSettings {
             running: restart_pending
                 .then(|| running.map(|v| layers::shown(setting.key, v).to_json()))
                 .flatten(),
+            deprecated: layers::DEPRECATED
+                .contains(&setting.key)
+                .then(|| layers.gpus_instead()),
         }
     }
 
@@ -327,6 +332,14 @@ impl RuntimeSettings {
         };
         self.change(key, by, |layers| layers.with_set(key, value))?;
         tracing::info!(by, key, value = shown, "setting changed");
+        if layers::DEPRECATED.contains(&key) {
+            tracing::warn!(
+                by,
+                key,
+                "{key} is deprecated: use {}",
+                self.layers().gpus_instead()
+            );
+        }
         Ok(self.entry_for(key).expect("a known setting"))
     }
 
@@ -642,10 +655,8 @@ mod tests {
                     spoolframe_media::Prober::DEFAULT_TIMEOUT,
                 )),
                 transcoding: Arc::new(crate::transcode::Transcoding::new(
-                    Box::new(spoolframe_media::encoders::FfmpegCommand::new(
-                        spoolframe_media::sandbox::Tool::unconfined("ffmpeg"),
-                    )),
-                    Default::default(),
+                    spoolframe_media::sandbox::Tool::unconfined("ffmpeg"),
+                    Vec::new(),
                     dir.as_ref().join("encoder-test"),
                 )),
                 ffmpeg: spoolframe_media::sandbox::Tool::unconfined("ffmpeg"),

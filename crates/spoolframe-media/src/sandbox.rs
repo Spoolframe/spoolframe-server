@@ -57,7 +57,10 @@
 //! both read already, and RADV opens the render node and reads `/sys`, as
 //! VA-API does. Because only the job's render node may be opened, RADV
 //! lists that GPU and no other, which is how libplacebo's own Vulkan
-//! device lands on the job's GPU. What a Vulkan run gets is its
+//! device lands on the job's GPU. With several cards (PGPU-05) that node
+//! is the job's card's: each card's runs go through its own sandbox
+//! ([`Sandbox::with_gpu`]), whose GPU nodes are that card's alone, and
+//! its detection's libplacebo test the same. What a Vulkan run gets is its
 //! environment: Mesa's and NVIDIA's shader disk caches off (they would be
 //! written into the job's directory, for no other job to read), and the
 //! device-select layer told the GPU's PCI ids, for a run that is not
@@ -127,7 +130,7 @@ pub const MIN_LANDLOCK_ABI: i32 = 3;
 #[derive(Debug, Clone)]
 pub struct Sandbox(Arc<Inner>);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Inner {
     /// Landlock's ABI on this kernel, when runs are confined by it.
     landlock: Option<i32>,
@@ -255,6 +258,15 @@ impl Sandbox {
     pub fn landlock_abi(&self) -> Option<i32> {
         self.0.landlock
     }
+
+    /// The same confinement with `gpu` as the host's GPU nodes: one card's
+    /// (PGPU-05), so a run on it may open its nodes and no other card's.
+    pub fn with_gpu(&self, gpu: GpuDevices) -> Self {
+        Self(Arc::new(Inner {
+            gpu,
+            ..(*self.0).clone()
+        }))
+    }
 }
 
 /// This kernel's Landlock ABI, or why it has none.
@@ -309,6 +321,11 @@ pub struct GpuDevices {
     /// NVIDIA's control, UVM, modeset and capability nodes, and one a
     /// card.
     pub nvidia: Vec<PathBuf>,
+    /// For one NVIDIA card (PGPU-05): its CUDA index in PCI order, the
+    /// one device CUDA shows an NVIDIA run (`CUDA_VISIBLE_DEVICES` with
+    /// `CUDA_DEVICE_ORDER=PCI_BUS_ID`), so the run's CUDA device 0 is
+    /// the card whose node it was given.
+    pub cuda_visible: Option<u32>,
 }
 
 impl GpuDevices {
@@ -320,6 +337,43 @@ impl GpuDevices {
             GpuUse::Nvidia => &self.nvidia,
         }
     }
+
+    /// One VA-API (or QSV) card's: its render node.
+    pub fn vaapi_card(render: &Path) -> Self {
+        Self {
+            vaapi: vec![render.to_path_buf()],
+            ..Self::default()
+        }
+    }
+
+    /// One NVIDIA card's: the nodes every NVIDIA run opens and
+    /// `/dev/nvidia<minor>`, and CUDA shown that card alone (`index`, its
+    /// place in PCI order among NVIDIA cards). Those of `dev` that exist.
+    pub fn nvidia_card(dev: &Path, minor: u32, index: u32) -> Self {
+        let mut nvidia = nvidia_shared(dev);
+        nvidia.push(dev.join(format!("nvidia{minor}")));
+        nvidia.retain(|d| d.exists());
+        Self {
+            nvidia,
+            cuda_visible: Some(index),
+            ..Self::default()
+        }
+    }
+}
+
+/// The NVIDIA nodes that are not a card's own: every NVIDIA run opens
+/// them, whichever card it uses.
+fn nvidia_shared(dev: &Path) -> Vec<PathBuf> {
+    [
+        "nvidiactl",
+        "nvidia-uvm",
+        "nvidia-uvm-tools",
+        "nvidia-modeset",
+        "nvidia-caps",
+    ]
+    .into_iter()
+    .map(|name| dev.join(name))
+    .collect()
 }
 
 /// The GPU device nodes a host may encode or decode on: VA-API's render
@@ -332,18 +386,10 @@ pub fn gpu_devices(vaapi: Option<&Path>, nvidia: bool) -> GpuDevices {
 fn gpu_devices_in(dev: &Path, vaapi: Option<&Path>, nvidia: bool) -> GpuDevices {
     let mut devices = GpuDevices {
         vaapi: vaapi.map(Path::to_path_buf).into_iter().collect(),
-        nvidia: Vec::new(),
+        ..GpuDevices::default()
     };
     if nvidia {
-        for name in [
-            "nvidiactl",
-            "nvidia-uvm",
-            "nvidia-uvm-tools",
-            "nvidia-modeset",
-            "nvidia-caps",
-        ] {
-            devices.nvidia.push(dev.join(name));
-        }
+        devices.nvidia = nvidia_shared(dev);
         if let Ok(dir) = std::fs::read_dir(dev) {
             let mut cards: Vec<PathBuf> = dir
                 .flatten()
@@ -620,7 +666,7 @@ impl Tool {
         };
         let mut command = std::process::Command::new(&program);
         command.env_clear();
-        for (key, value) in environment(jail) {
+        for (key, value) in environment(sandbox, jail) {
             command.env(key, value);
         }
         command.process_group(0);
@@ -961,11 +1007,22 @@ const KEPT: &[&str] = &[
     "VK_ICD_FILENAMES",
 ];
 
-fn environment(jail: &Jail) -> Vec<(OsString, OsString)> {
+fn environment(sandbox: &Inner, jail: &Jail) -> Vec<(OsString, OsString)> {
+    // An NVIDIA run on one card (PGPU-05) sees that card alone: the
+    // server's own CUDA_VISIBLE_DEVICES, if it has one, is not kept then.
+    let cuda = match (jail.gpu, sandbox.gpu.cuda_visible) {
+        (GpuUse::Nvidia, Some(index)) => Some(index),
+        _ => None,
+    };
     let mut env: Vec<(OsString, OsString)> = KEPT
         .iter()
+        .filter(|key| cuda.is_none() || **key != "CUDA_VISIBLE_DEVICES")
         .filter_map(|key| Some((OsString::from(key), std::env::var_os(key)?)))
         .collect();
+    if let Some(index) = cuda {
+        env.push(("CUDA_DEVICE_ORDER".into(), "PCI_BUS_ID".into()));
+        env.push(("CUDA_VISIBLE_DEVICES".into(), index.to_string().into()));
+    }
     // Caches and temporary files (fontconfig's, say) go where the run
     // may write, or nowhere.
     let home = jail
@@ -1477,7 +1534,7 @@ mod tests {
     }
 
     fn env_of(jail: &Jail) -> Vec<(String, String)> {
-        environment(jail)
+        environment(&Sandbox::off().0, jail)
             .into_iter()
             .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
             .collect()
@@ -1540,6 +1597,74 @@ mod tests {
         assert_eq!(pci_ids(&drm, &node), Some((0x1002, 0x164e)));
         assert_eq!(pci_ids(&drm, &link), Some((0x1002, 0x164e)));
         assert_eq!(pci_ids(&drm, &root.join("dev/dri/renderD130")), None);
+    }
+
+    /// PGPU-05: one card's nodes. A VA-API card's run gets its render
+    /// node alone; an NVIDIA card's the shared nodes and its own
+    /// `/dev/nvidiaN`, not the other card's.
+    #[tokio::test]
+    async fn a_card_s_runs_get_that_card_s_nodes_only() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-gpu-card").await;
+        let dev = tmp.to_path_buf();
+        std::fs::create_dir_all(dev.join("dri")).unwrap();
+        for node in [
+            "dri/renderD128",
+            "dri/renderD129",
+            "nvidiactl",
+            "nvidia-uvm",
+            "nvidia-modeset",
+            "nvidia0",
+            "nvidia1",
+        ] {
+            std::fs::write(dev.join(node), "").unwrap();
+        }
+        let second = dev.join("dri/renderD129");
+        let vaapi = GpuDevices::vaapi_card(&second);
+        assert_eq!(vaapi.of(GpuUse::Vaapi), [second]);
+        assert!(vaapi.of(GpuUse::Nvidia).is_empty());
+        assert_eq!(vaapi.cuda_visible, None);
+
+        let nvidia = GpuDevices::nvidia_card(&dev, 1, 1);
+        assert_eq!(
+            nvidia.of(GpuUse::Nvidia),
+            [
+                dev.join("nvidiactl"),
+                dev.join("nvidia-uvm"),
+                dev.join("nvidia-modeset"),
+                dev.join("nvidia1"),
+            ]
+        );
+        assert!(nvidia.of(GpuUse::Vaapi).is_empty());
+        assert_eq!(nvidia.cuda_visible, Some(1));
+    }
+
+    /// An NVIDIA card's run is shown that card alone by CUDA; a VA-API or
+    /// CPU run of the same sandbox is told nothing of CUDA.
+    #[test]
+    fn an_nvidia_card_s_run_sees_its_card_alone() {
+        let card = Sandbox::off().with_gpu(GpuDevices {
+            cuda_visible: Some(1),
+            ..GpuDevices::default()
+        });
+        let env = |gpu: GpuUse| {
+            environment(&card.0, &Jail::new(Limits::PROBE).gpu(gpu))
+                .into_iter()
+                .filter(|(key, _)| key.to_string_lossy().starts_with("CUDA_"))
+                .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            env(GpuUse::Nvidia),
+            ["CUDA_DEVICE_ORDER=PCI_BUS_ID", "CUDA_VISIBLE_DEVICES=1"]
+        );
+        for other in [GpuUse::Vaapi, GpuUse::None] {
+            assert!(
+                !env(other)
+                    .iter()
+                    .any(|e| e.starts_with("CUDA_DEVICE_ORDER")),
+                "{other:?}"
+            );
+        }
     }
 
     #[test]

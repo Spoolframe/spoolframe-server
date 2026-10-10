@@ -80,14 +80,18 @@ pub fn config_warnings(config: &ServerConfig) {
     }
 }
 
-/// The runtime settings a locked file overrides, logged at start and on
-/// each reload.
+/// What the layers earn, logged at start and on each reload: the
+/// runtime settings a locked file overrides, and each deprecated key a
+/// layer sets (PGPU-05: still read, as the `gpus` they mean).
 pub fn shadowed_warnings(layers: &Layers) {
     for key in layers.shadowed() {
         tracing::warn!(
             key,
             "the locked config file sets this; the runtime settings' value is not used"
         );
+    }
+    for deprecated in layers.deprecations() {
+        tracing::warn!("{deprecated}");
     }
 }
 
@@ -376,5 +380,36 @@ mod tests {
             settings.entry_for("transcode.max_jobs").unwrap().value,
             Some(serde_json::json!(3))
         );
+    }
+
+    /// PGPU-05's deprecated keys are warned of again on each reload, as
+    /// at start, through the same hook: once a reload.
+    #[tokio::test]
+    async fn a_deprecated_key_is_warned_of_on_each_reload() {
+        use crate::logs::{LogRing, RingLayer};
+        use spoolframe_admin_api::{LogLevel, LogQuery};
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let (settings, _dir, _file) = started(
+            "spoolframe-reload-deprecated",
+            r#"transcode { hardware = "auto"; }"#,
+        )
+        .await;
+        let ring = Arc::new(LogRing::default());
+        let _logged = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(RingLayer(ring.clone())),
+        );
+        let warned = || {
+            ring.page(&LogQuery {
+                level: Some(LogLevel::Warn),
+                text: Some("transcode.hardware is deprecated".into()),
+                ..LogQuery::default()
+            })
+            .lines
+            .len()
+        };
+        settings.reload("SIGHUP").await.unwrap();
+        assert_eq!(warned(), 1);
+        settings.reload("SIGHUP").await.unwrap();
+        assert_eq!(warned(), 2);
     }
 }

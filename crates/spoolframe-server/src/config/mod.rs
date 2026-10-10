@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use spoolframe_admin_api::SyncDirection;
 use spoolframe_media::encoders::{Hardware, HardwarePolicy, ToneMapSetting, TranscodeSettings};
+use spoolframe_media::gpus::{GpuEntry, Pick, Which};
 use spoolframe_media::sandbox::Mode as SandboxMode;
 use spoolframe_plex::{PathMap, PathMapping};
 use spoolframe_types::LibraryKind;
@@ -727,16 +728,28 @@ impl PreviewsConfig {
     }
 }
 
-/// `transcode { hardware = ["nvenc", "vaapi"]; vaapi_device = "/dev/dri/renderD128";
-/// max_jobs = 2; max_remux = 32; max_gpu_jobs = 3; scratch_dir = "…";
-/// scratch_limit_mb = 20480; read_ahead_secs = 60; gpu_filters = false;
-/// tone_map = "auto"; }`, all optional.
+/// `transcode { gpus = [ { api = "nvenc"; pick = "all"; } ]; max_jobs = 2;
+/// max_remux = 32; max_gpu_jobs = 3; scratch_dir = "…"; scratch_limit_mb =
+/// 20480; read_ahead_secs = 60; gpu_filters = false; tone_map = "auto"; }`,
+/// all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct TranscodeConfig {
+    /// The GPUs encodes run on (PGPU-05), in order of preference: each
+    /// entry an `api` (`nvenc`, `vaapi`, `qsv`) and either `pick` (`all`,
+    /// `best`, `dgpu`, `igpu`; `all` if left out) or `device` (a CUDA
+    /// index for NVIDIA, a render node for VA-API and QSV), and
+    /// `max_jobs`, GPU video encodes at once on each of its cards. Left
+    /// out, every card of every API, NVIDIA first. Not with `hardware`.
+    #[ucl(default)]
+    pub gpus: Option<Vec<GpuConfig>>,
+    /// Deprecated (PGPU-05): `gpus` says more. Still read, as the `gpus`
+    /// it means: each family every card of it, VA-API on `vaapi_device`
+    /// alone when that is set.
+    ///
     /// `"auto"` (every family that works), `"none"` for software only, or
     /// a list of families in order of preference: `["nvenc", "vaapi"]`.
-    /// Each video encode runs on one family (PX-28): the one that does
+    /// Each video encode runs on one family (PGPU-02): the one that does
     /// the most of it, decoding the source, then running its filters
     /// (tone map, picture burn-in, scale) on the GPU too, the order
     /// deciding between equals. So on a GTX 1060 beside an AMD GPU, an
@@ -785,6 +798,108 @@ pub struct TranscodeConfig {
     /// mapping on the CPU.
     #[ucl(default)]
     pub tone_map: Option<String>,
+}
+
+/// One entry of `transcode.gpus` as written (PGPU-05).
+#[derive(Debug, Clone, PartialEq, Eq, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct GpuConfig {
+    /// `nvenc`, `vaapi` or `qsv`.
+    pub api: String,
+    /// `all`, `best`, `dgpu` or `igpu`; `all` if neither this nor
+    /// `device` is set.
+    #[ucl(default)]
+    pub pick: Option<String>,
+    /// One card: a CUDA index (`0`, as a number or a string) or a render
+    /// node path.
+    #[ucl(default, map = "gpu_device")]
+    pub device: Option<String>,
+    /// GPU video encodes at once on each of the entry's cards;
+    /// `transcode.max_gpu_jobs` if left out.
+    #[ucl(default)]
+    pub max_jobs: Option<u32>,
+}
+
+/// A GPU entry's `device`: a CUDA index may be written as a number.
+fn gpu_device(object: uclicious::ObjectRef) -> Result<Option<String>, uclicious::ObjectError> {
+    if let Some(index) = object.as_i64().filter(|_| object.is_integer()) {
+        return Ok(Some(index.to_string()));
+    }
+    let text: String = uclicious::FromObject::try_from(object)?;
+    Ok(Some(text))
+}
+
+/// `transcode.gpus`' key, for its messages.
+const GPUS: &str = "transcode.gpus";
+
+impl GpuConfig {
+    /// The entry it says, or why it says none.
+    fn entry(&self, n: usize) -> Result<GpuEntry, ConfigError> {
+        let invalid = |message: String| ConfigError::Invalid {
+            key: GPUS,
+            message: format!("entry {}: {message}", n + 1),
+        };
+        let api = match self.api.trim() {
+            "nvenc" => Hardware::Nvenc,
+            "vaapi" => Hardware::Vaapi,
+            "qsv" => Hardware::Qsv,
+            other => {
+                return Err(invalid(format!(
+                    "api {other:?}: expected \"nvenc\", \"vaapi\" or \"qsv\""
+                )));
+            }
+        };
+        let which = match (&self.pick, &self.device) {
+            (Some(_), Some(_)) => {
+                return Err(invalid(
+                    "pick or device, not both: pick chooses among the cards found, device \
+                     names one"
+                        .into(),
+                ));
+            }
+            (None, None) => Which::Pick(Pick::All),
+            (Some(pick), None) => Which::Pick(Pick::parse(pick.trim()).ok_or_else(|| {
+                invalid(format!(
+                    "pick {pick:?}: expected \"all\", \"best\", \"dgpu\" or \"igpu\""
+                ))
+            })?),
+            (None, Some(device)) => {
+                let device = device.trim();
+                let fits = match api {
+                    Hardware::Nvenc => device.parse::<u32>().is_ok(),
+                    Hardware::Vaapi | Hardware::Qsv => device.starts_with('/'),
+                };
+                if !fits {
+                    return Err(invalid(match api {
+                        Hardware::Nvenc => format!(
+                            "device {device:?}: an NVIDIA card is named by its CUDA index, as \
+                             nvidia-smi numbers them: 0, 1, …"
+                        ),
+                        _ => format!(
+                            "device {device:?}: a render node's path, as \
+                             /dev/dri/by-path/pci-0000:03:00.0-render"
+                        ),
+                    }));
+                }
+                Which::Device(device.to_owned())
+            }
+        };
+        let max_jobs = match self.max_jobs {
+            Some(0) => {
+                return Err(invalid(
+                    "max_jobs = 0 would keep every job off its cards; leave the entry out \
+                     instead"
+                        .into(),
+                ));
+            }
+            max => max.map(|n| n as usize),
+        };
+        Ok(GpuEntry {
+            api,
+            which,
+            max_jobs,
+        })
+    }
 }
 
 /// `transcode.hardware` as written: a word, or a list of families.
@@ -875,6 +990,35 @@ impl TranscodeConfig {
             gpu_filters: self.gpu_filters.unwrap_or(false),
             tone_map: self.tone_map()?,
         })
+    }
+
+    /// The GPUs to use (PGPU-05): `gpus`, or what the deprecated
+    /// `hardware` and `vaapi_device` mean, or every card of every API.
+    /// Both is an error: which would win is a guess.
+    pub fn gpus(&self) -> Result<Vec<GpuEntry>, ConfigError> {
+        let old = self.hardware.is_some() || self.vaapi_device.is_some();
+        match &self.gpus {
+            Some(_) if old => Err(ConfigError::Invalid {
+                key: GPUS,
+                message: "set gpus, or the older hardware and vaapi_device, not both: gpus \
+                          says everything they did"
+                    .into(),
+            }),
+            Some(entries) => entries
+                .iter()
+                .enumerate()
+                .map(|(n, entry)| entry.entry(n))
+                .collect(),
+            None => {
+                // Only `hardware` is read here; the experimental switches
+                // do not change which cards an entry takes.
+                let settings = self.settings(&ExperimentalConfig::default())?;
+                Ok(GpuEntry::from_hardware(
+                    &settings.hardware,
+                    self.vaapi_device.as_deref(),
+                ))
+            }
+        }
     }
 
     /// How encoders are detected; `experimental` says whether
@@ -2026,6 +2170,7 @@ impl ServerConfig {
         parsed.auth.trust_idle()?;
         parsed.watch.rules()?;
         parsed.transcode.settings(&parsed.experimental)?;
+        parsed.transcode.gpus()?;
         // Any directory: only the values are checked here.
         parsed.transcode.limits(Path::new("/"))?;
         parsed.subtitles.ocr_settings(Path::new("/"))?;
@@ -2578,6 +2723,176 @@ mod tests {
                 "{refused}: {config:?}"
             );
         }
+    }
+
+    /// PGPU-05: `transcode.gpus` as written, each entry an API and a
+    /// pick, a device, or neither (every card).
+    #[test]
+    fn gpus_are_read_in_order() {
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; } transcode { gpus = [
+                { api = "nvenc"; pick = "all"; },
+                { api = "vaapi"; pick = "dgpu"; max_jobs = 1; },
+                { api = "vaapi"; device = "/dev/dri/by-path/pci-0000:c8:00.0-render"; },
+                { api = "nvenc"; device = 1; },
+                { api = "qsv"; },
+            ]; }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.transcode.gpus().unwrap(),
+            [
+                GpuEntry::all(Hardware::Nvenc),
+                GpuEntry {
+                    api: Hardware::Vaapi,
+                    which: Which::Pick(Pick::Dgpu),
+                    max_jobs: Some(1),
+                },
+                GpuEntry {
+                    api: Hardware::Vaapi,
+                    which: Which::Device("/dev/dri/by-path/pci-0000:c8:00.0-render".into()),
+                    max_jobs: None,
+                },
+                GpuEntry {
+                    api: Hardware::Nvenc,
+                    which: Which::Device("1".into()),
+                    max_jobs: None,
+                },
+                GpuEntry::all(Hardware::Qsv),
+            ]
+        );
+        // An empty list: no GPU.
+        let none = plex(r#"plex { url = "http://nas:32400"; } transcode { gpus = []; }"#).unwrap();
+        assert!(none.transcode.gpus().unwrap().is_empty());
+    }
+
+    /// The NixOS module writes each entry as JSON, which UCL reads too.
+    #[test]
+    fn gpus_written_as_json_are_read() {
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; } transcode { gpus = [{"api":"vaapi","pick":"dgpu"},{"api":"nvenc","device":"1","max_jobs":2}]; }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.transcode.gpus().unwrap(),
+            [
+                GpuEntry {
+                    api: Hardware::Vaapi,
+                    which: Which::Pick(Pick::Dgpu),
+                    max_jobs: None,
+                },
+                GpuEntry {
+                    api: Hardware::Nvenc,
+                    which: Which::Device("1".into()),
+                    max_jobs: Some(2),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn gpus_default_to_every_card_of_every_api() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(config.transcode.gpus().unwrap(), GpuEntry::defaults());
+    }
+
+    /// The deprecated `hardware` and `vaapi_device` keep working, as the
+    /// `gpus` they mean.
+    #[test]
+    fn the_old_hardware_setting_is_read_as_gpus() {
+        let gpus = |transcode: &str| {
+            plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} transcode {{ {transcode} }}"#
+            ))
+            .unwrap()
+            .transcode
+            .gpus()
+            .unwrap()
+        };
+        assert_eq!(
+            gpus(r#"hardware = ["nvenc", "vaapi"];"#),
+            [
+                GpuEntry::all(Hardware::Nvenc),
+                GpuEntry::all(Hardware::Vaapi)
+            ]
+        );
+        assert_eq!(
+            gpus(r#"hardware = ["nvenc", "vaapi"]; vaapi_device = "/dev/dri/renderD129";"#),
+            [
+                GpuEntry::all(Hardware::Nvenc),
+                GpuEntry {
+                    api: Hardware::Vaapi,
+                    which: Which::Device("/dev/dri/renderD129".into()),
+                    max_jobs: None,
+                },
+            ]
+        );
+        assert!(gpus(r#"hardware = "none";"#).is_empty());
+        assert_eq!(gpus(r#"hardware = "auto";"#), GpuEntry::defaults());
+    }
+
+    #[test]
+    fn gpus_and_hardware_together_are_refused() {
+        for old in [
+            r#"hardware = ["vaapi"];"#,
+            r#"vaapi_device = "/dev/dri/renderD128";"#,
+        ] {
+            let config = plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} transcode {{ gpus = [ {{ api = "vaapi"; }} ]; {old} }}"#
+            ));
+            assert!(
+                matches!(
+                    &config,
+                    Err(ConfigError::Invalid { key: "transcode.gpus", message }) if message.contains("not both")
+                ),
+                "{old}: {config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_gpu_entry_is_refused_with_its_number() {
+        for (entry, says) in [
+            (r#"{ api = "cuda"; }"#, "api \"cuda\""),
+            (
+                r#"{ api = "vaapi"; pick = "dgpu"; device = "/dev/dri/renderD128"; }"#,
+                "pick or device, not both",
+            ),
+            (
+                r#"{ api = "vaapi"; pick = "discrete"; }"#,
+                "pick \"discrete\"",
+            ),
+            (
+                r#"{ api = "nvenc"; device = "/dev/nvidia0"; }"#,
+                "CUDA index",
+            ),
+            (
+                r#"{ api = "vaapi"; device = "renderD128"; }"#,
+                "render node",
+            ),
+            (r#"{ api = "vaapi"; max_jobs = 0; }"#, "max_jobs = 0"),
+        ] {
+            let config = plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} transcode {{ gpus = [ {{ api = "nvenc"; }}, {entry} ]; }}"#
+            ));
+            match &config {
+                Err(ConfigError::Invalid {
+                    key: "transcode.gpus",
+                    message,
+                }) => {
+                    assert!(message.starts_with("entry 2: "), "{entry}: {message}");
+                    assert!(message.contains(says), "{entry}: {message}");
+                }
+                other => panic!("{entry}: {other:?}"),
+            }
+        }
+        // An unknown key is refused as everywhere.
+        assert!(
+            plex(
+                r#"plex { url = "http://nas:32400"; } transcode { gpus = [ { api = "vaapi"; node = "x"; } ]; }"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

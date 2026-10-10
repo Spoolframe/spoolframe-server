@@ -40,6 +40,9 @@ pub struct Source {
     /// Decode on this hardware (P2-02 found a decoder for the codec),
     /// and the VA-API render node.
     pub hardware: Option<(Hardware, PathBuf)>,
+    /// ffmpeg confined to that GPU's card (PGPU-05): a tile decoded on it
+    /// runs with this one.
+    pub gpu_ffmpeg: Option<Tool>,
 }
 
 /// The times of the tiles: every `interval` from 0, up to the end.
@@ -222,6 +225,10 @@ async fn tile(
         (Some((family, _)), true) => family.gpu(),
         _ => GpuUse::None,
     };
+    let ffmpeg = match (&source.gpu_ffmpeg, gpu) {
+        (Some(on_card), GpuUse::Vaapi | GpuUse::Nvidia) => on_card,
+        _ => ffmpeg,
+    };
     let mut jail = Jail::new(Limits::TILE).input(&source.input).gpu(gpu);
     if let Some(dir) = out.parent() {
         jail = jail.writes(dir);
@@ -276,6 +283,7 @@ mod tests {
             duration: Duration::from_secs(60),
             hdr,
             hardware: hardware.map(|h| (h, PathBuf::from("/dev/dri/renderD129"))),
+            gpu_ffmpeg: None,
         }
     }
 

@@ -2,6 +2,303 @@
 
 ## Unreleased
 
+## 0.6.0 (2026-10-09)
+
+- An invite's holder on your relay (P6-08): a device redeeming an
+  invite relays as the invite's kind says before it has an account. An
+  invite that makes an account here, admin or consumer, is an owner's;
+  a portable user's (P7) or a server's (P8) a friend's. The SDK reaches
+  the link's relays with a token made from the code and its own key,
+  until the invite is redeemed. A token that matches no live invite
+  counts as a wrong invite code. The relay-access question gains an
+  optional `invite`; its ALPN stays `spoolframe/relay-access/1`, and an
+  older server ignores it.
+- PX-22, the server side:
+  - Any string setting may name an environment variable as
+    `${SF_ENV_NAME}`. Only `SF_ENV_` variables are read; an unset one
+    stops the server (or refuses the change) naming it. `config show`,
+    the settings API and runtime.ucl keep the reference.
+  - `auth.oidc[].client_secret`, read after `client_secret_file` and
+    before the secret pasted in the web UI. The runtime layer takes only
+    a `${SF_ENV_…}` reference; a provided file's literal one shows as
+    `(hidden)`.
+  - The settings API's restart-pending entries carry `running`, what
+    the server runs with until it restarts.
+- PX-22, the web UI:
+  - Every network setting: the app and Plex discovery ports on the
+    Server tab; the relays, relay keys, pkarr record and the addresses
+    devices are told on Remote access. Lists are edited one entry a
+    row.
+  - Settings › Sign-in providers: SSO providers added, changed and
+    removed. The client secret from an environment variable (saved as
+    `${SF_ENV_<NAME>}`, recommended), pasted (kept unencrypted on the
+    server's disk, as the form says before the field), or from a file.
+  - Playback: when frame previews are made, how often, their cache and
+    the artwork cache (in GiB), and when an item counts as started and
+    as watched. Security: the media tools and their sandbox.
+  - A restart setting changed since the start shows what the server
+    runs with now and after the restart.
+  - "Show advanced settings", off by default and kept per browser, hides
+    the settings few servers need; a tab with hidden ones set says how
+    many.
+- At least one enabled admin keeps a password: the last one with a
+  password cannot be demoted, disabled or have it removed, setup cannot
+  finish without one, and a server set up before says so at start.
+- `passwordRemove` (a user's own) and `userRemovePassword` (an admin's),
+  each after a recent sign-in, and never a user's last way to sign in.
+  Their other sessions end and trusted devices are forgotten, as with a
+  new password.
+- The web UI's setup asks for the first admin's password, the passkey
+  optional; My profile and a user's page remove a password, after
+  saying what that ends.
+- The web UI says when it is open over plain HTTP across the network:
+  above the sign-in form, in a banner on every admin page, and at the
+  setup page's insecure cookies switch. The password and the session
+  can be read on the way; HTTPS or an SSH tunnel to localhost is the
+  fix. The wizard's Access step names those first, insecure cookies
+  last.
+- Portable identities begin (P7-01): the client SDK makes a root
+  signing key with a 24-word BIP-39 recovery phrase, recovers the same
+  key and `PortableUserId` from the phrase on any device, and keeps
+  several identities apart in the app's storage. The root stays on the
+  device; the server and the protocol do not build the phrase code, and
+  nothing on the wire changes yet.
+- Portable device credentials (P7-02): the root signs a 90-day credential
+  for each device's own key, and revokes keys with a signed, versioned
+  identity state that stamps each revocation with its time. The
+  protocol crate defines both, and a device's proof of its key, as fixed
+  signed byte layouts (PROTOCOL.md "Portable identities"); the SDK
+  issues, installs, renews and revokes them, and gives a device a fresh
+  key once its old one is revoked. Revocation only grows: the server
+  refuses a credential whose key any valid state it has seen revokes,
+  older revisions included, and drops a revocation once no credential
+  it could stop can still hold (90 days and 5 minutes). No request
+  carries them yet (P7-06). The root's phone keeps the devices it
+  issued to, under a label the user gives (`Portable::issued`: the
+  newest credential per key, and whether it is revoked), and
+  `Portable::list` says whether each identity's root is still there,
+  which a restored backup that leaves out device-only secrets is not.
+- Ties (P7-04, wire revision 13): a signed-in local account ties itself
+  to a portable identity. The server gives the session a nonce
+  (`TieBegin`, 5 minutes, used once); the phone signs it with the root,
+  or a TV with its device key and credential, over the server's id, the
+  nonce, the identity and the username (`TieFinish`), so the proof
+  works nowhere else. One identity per account, one account per
+  identity on a server; an account already tied severs first
+  (`Untie`). Each needs a recent sign-in. The tie is a row beside the
+  account: severing it leaves sessions, passkeys and watch state as
+  they were. `WhoAmI` and the admin API's `UserInfo` carry it, and the
+  web UI shows it as a badge on a user's page and in My profile, with
+  Sever (`admin.userUntie`, `me.portableUntie`); tying is done from the
+  phone app only. The SDK ties with `Session::tie` and severs with
+  `Session::untie`. Signing in with a tied credential is P7-06.
+- An encoded HLS playback's first segment is 2 s (PX-26): the grid is
+  0, 2, 4, 8, 14 s… and the player has a segment two seconds into the
+  encode, not six. A copied video is still cut at its keyframes, audio
+  alone every 6 s. A run for one of the first three segments starts
+  from 0. The forced keyframes count from the run's first frame, where
+  ffmpeg's HLS muxer counts its cuts from, so they no longer drift off
+  the grid (at 23.976 fps they fell 7 s behind over two hours). A
+  capped encode's BANDWIDTH is now twice its cap: what a 2 s segment
+  can hold.
+- A remux over HLS starts without reading the whole file first (PX-25):
+  a copied video's keyframes come from the file's own index, Matroska's
+  Cues or MP4's sync sample table, read in a fraction of a second where
+  every packet took a minute or two on a 4K remux. The index is used
+  only after ffprobe finds exactly its keyframes in four intervals
+  between them; a file without one, or with one that misses keyframes,
+  is read whole as before. The reader is bounded (48 MiB read, 32 MiB of
+  times) and has a fuzz target, `keyframe_index`.
+- Frame previews made ahead also wait while a remux runs and while a
+  converted playback is being prepared (its keyframes read), not only
+  while an encode runs.
+- Server › Playback says how each playback is made (PX-24), from the
+  plan and the filter graph the server built: delivery (direct, remux,
+  transcode), decoder (software or the GPU's API), video encoder with
+  its codec, HDR tone mapping and subtitle burn-in (GPU, CPU or none),
+  and the output's bitrate measured from the segments written beside
+  the encoder's target, with its size. A playback's page also shows its
+  start: request to plan, the keyframes' read (from the index or a full
+  scan), and the first segment ready; the server logs the same once per
+  start as `playback start timed`. The "playback started" line's
+  `plan=` says `remux` or `transcode` where it said `converted`.
+- An NVENC encode decodes on NVDEC (PGPU-01): `-hwaccel cuda`, the frames
+  back in memory, so tone mapping, burn-in and scaling run on the CPU as
+  before. Detection tests NVDEC per codec and depth (H.264, 8- and
+  10-bit HEVC and AV1, VP9) where NVENC works, and a source it did not
+  decode in a test, or one whose GPU decode fails, decodes in software.
+  The transcoding line, the admin API and the Playback step's encoder
+  list name what each GPU decodes (`hevc 10-bit (nvdec)`), and a
+  playback's page says `GPU · NVDEC (CUDA)`.
+- NVENC and NVDEC start under the media sandbox: CUDA names a thread
+  through `/proc/self/task/<tid>/comm` and reads `/proc/self/maps`, and
+  failed with `CUDA_ERROR_OPERATING_SYSTEM` when Landlock refused them.
+  A run on the NVIDIA GPU may now write its own threads' names and read
+  its own `maps`, and nothing else of `/proc`; other runs still have no
+  `/proc` at all. A run on a GPU opens only that GPU's device nodes: a
+  VA-API run no NVIDIA node, an NVIDIA run no render node.
+- A failed test encode or decode at start logs what ffmpeg said last
+  (`stderr=`): as a warning for a family `transcode.hardware` names, at
+  debug for one only `auto` tried. Before, a GPU left out said nothing
+  of why.
+- A video encode runs on the one GPU that does the most of it (PGPU-02).
+  With `transcode.hardware = ["nvenc", "vaapi"]` the encoder was the
+  first family that encodes the output codec, and the source decoded on
+  it or on the CPU. Now each family that encodes the codec is ranked:
+  the whole job on it (decode, then tone map, picture burn-in and scale
+  on the GPU), decode and encode with the filters on the CPU, or encode
+  only; the best wins, the list's order between equals. A GTX 1060
+  beside an AMD GPU sends an AV1 film to the AMD GPU, which decodes it,
+  and a film both decode to NVIDIA unless the AMD GPU also runs its
+  filters (VA-API scales on the GPU, NVDEC's frames scale on the CPU, so
+  a downscale goes to VA-API). A job never decodes on one GPU and
+  encodes on another. A software encode decodes on the first GPU that
+  decodes the source, NVDEC too now. A run whose GPU decode fails runs
+  again in software on the same encoder. Server › Playback's plan and
+  "How it is made" name the encoder the run picked.
+- A family `transcode.hardware` names that lacks a codec logs one line
+  at info, `nvenc lacks: av1 encode, av1 decode, av1 10-bit decode`,
+  rather than a warning per failed test at every start; each test's
+  stderr is at debug. A named family with no working encoder still
+  warns, now with its first failed test's stderr.
+- With `transcode.gpu_filters` on, an NVIDIA job filters on the GPU too
+  (PGPU-03): NVDEC's frames stay there (`-hwaccel_output_format cuda`),
+  `scale_cuda` scales them (and makes a 10-bit source 8-bit for H.264),
+  and picture subtitles are uploaded and burned in with `overlay_cuda`.
+  NVIDIA tone maps on the CPU, so an HDR film, or one with text burned
+  in, filters all on the CPU as before. Detection tries both filters
+  with a short run where NVENC and NVDEC work; one that fails stays on
+  the CPU and shows in the `nvenc lacks: …` line, and the transcoding
+  line says GPU filters per family (`vaapi: tone map, overlay; nvenc:
+  scale, overlay`). Such a job weighs as all on the GPU, the playback
+  page says its burn-in ran there, and one whose CUDA filters fail runs
+  again decoded in software with the CPU's filters. With GPU filters on,
+  a 4K film made 1080p that both GPUs decode now goes to NVIDIA when it
+  is first in `transcode.hardware`, and a picture burn-in to NVIDIA over
+  an AMD GPU (Mesa has no `overlay_vaapi`).
+- The server hardens its own process as it starts, for every
+  subcommand (PX-31): it is not dumpable, so another process as the same
+  user can no longer read its `/proc/<pid>/environ` (the `SF_ENV_`
+  secrets) or memory, nor attach a debugger (root still can); it gains
+  no privileges from a setuid program it runs; it dumps no core; and a
+  seccomp deny-list refuses, with `EPERM`, the calls it never makes:
+  `ptrace`, `process_vm_*`, `bpf`, `perf_event_open`, `userfaultfd`,
+  `io_uring_*`, the mount calls, `unshare`, `setns`, a `clone` into a
+  new namespace, keyrings, modules, `kexec`, `reboot`, swap, `acct`,
+  `quotactl`, `open_by_handle_at`, a persona other than Linux's, and on
+  x86_64 `iopl`/`ioperm`. Processes, threads, every socket family and
+  the media tools' own confinement are unchanged; their filter stacks on
+  top. A restart in place keeps the filter rather than load it twice.
+- An HDR film is tone mapped on the GPU with libplacebo (PGPU-04).
+  `transcode.tone_map` (live; Settings › Playback): `"auto"`, the
+  default, takes the job's GPU's own tone map (`tonemap_vaapi`, Intel),
+  else libplacebo on the job's GPU through Vulkan, else the CPU, and the
+  CPU while `transcode.gpu_filters` is off, so a setup that tone mapped
+  on the CPU still does after the upgrade; `"cpu"`, `"gpu"` and
+  `"libplacebo"` force one, a job whose GPU lacks it tone mapping on the
+  CPU (noted once), and one no GPU here runs is a warning at start.
+  NVIDIA's libplacebo shares ffmpeg's Vulkan device: the film decoded on
+  it (`-hwaccel vulkan`), tone mapped and scaled there, and downloaded in
+  8 bits to NVENC (fulcrum's GTX 1060: 4.0× real time and 2 s of CPU
+  against 2.0× and 120 s on the CPU). On AMD, libplacebo makes its own
+  Vulkan device, the frames going through system memory: VA-API decodes
+  into memory, libplacebo tone maps and scales, the result is uploaded
+  to `h264_vaapi` (an RX 7900 XTX here, 20 s of 4K HDR10 confined:
+  1.7× real time and 8.4 s of CPU against 1.4× and 181 s on the CPU).
+  The run's jail opens only the job's render node, so RADV lists only
+  that GPU and libplacebo's own device lands on it; unconfined, Mesa's
+  device-select layer is told its PCI ids. A burn-in goes over
+  libplacebo's output on the CPU. Detection tries libplacebo per family
+  with a one-second confined run; the transcoding line says `GPU tone
+  maps: vaapi: libplacebo (own); nvenc: libplacebo (shared)`, a failure
+  shows in `… lacks: libplacebo tone map`, and `spoolframe status` and
+  Settings › Playback list them. Placement counts a GPU tone map as on
+  the GPU; a libplacebo job with nothing burned in weighs as all on the
+  GPU; a libplacebo failure before the first output runs again decoded
+  in software with the CPU's tone map; Server › Playback says which tone
+  map ran (`libplacebo (shared)`, `libplacebo (own)`, `VA-API`, `CPU`).
+- An `experimental { }` block, for switches that may change or go away
+  without notice: the server warns of each one on at start, and the web
+  UI shows them only with Show advanced settings on (Settings ›
+  Playback › Experimental). The first is `libplacebo_shared_on_amd`
+  (off): libplacebo on an AMD GPU uses ffmpeg's Vulkan device, derived
+  from the VA-API one, falling back to its own at detection where that
+  fails, as it does on RADV today.
+- The package, the Docker images and the dev shell ship nixpkgs'
+  ffmpeg-headless with libplacebo and a shader compiler (`nix build
+  .#ffmpeg`): 330.5 MiB against 305.4 MiB.
+- Docker images by GPU, sharing every layer but the drivers' (the
+  server's closure is layered the same way in each): `:<version>`
+  (`.#docker`, the default, 1.5 GiB) for any GPU or when unsure, with
+  nixpkgs' whole Mesa (radeonsi, r600, iris, crocus, nouveau, virgl, d3d12
+  for Docker Desktop on WSL2, zink, llvmpipe; RADV, ANV, hasvk, dzn,
+  lavapipe) and Intel's VA-API drivers iHD and i965; `:<version>-slim`
+  (`.#docker-slim`, 587 MiB) for a recent AMD or Intel GPU, with a Mesa
+  trimmed to radeonsi, RADV and ANV (172 MiB, no LLVM) and iHD;
+  `:<version>-nvidia` (`.#docker-nvidia`, 449 MiB) for NVIDIA, no Mesa;
+  and `:<version>-cpu`, the `-nvidia` image under a second tag, for a
+  machine with no GPU (a 4K HDR film to 1080p in software takes roughly 6
+  cores per stream at real time). Before, the image had no AMD or Intel
+  VA-API driver. NVIDIA's Vulkan driver works in every one (checked on
+  fulcrum's GTX 1060 under CDI): the images carry libX11, libXext and
+  glvnd's `libEGL.so.1`, which it loads and the toolkit does not mount,
+  set `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility,graphics`, find
+  the toolkit's Vulkan manifest in `/usr/share/vulkan/icd.d`,
+  `/etc/vulkan/icd.d` or a NixOS host's `/run/opengl-driver`, and its
+  libraries in `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` or `/usr/lib`.
+- SIGHUP reloads the server's config (PX-33). The config file and
+  `runtime.ucl` are read and checked again as at start; one that does
+  not load changes nothing, and an ERROR says what is wrong and in which
+  file. Live settings apply through the same path as a change in the web
+  UI (the Plex catalog, watch rules, job limits, previews, sign-in,
+  metrics, logs, telemetry); restart settings are pending, Settings
+  showing "Now / After restart". A runtime value still wins over the
+  file's unless the file is locked. Encoders are detected again, as
+  SIGHUP did before, and the config's warnings are logged again. One
+  line says what happened: `SIGHUP: config reloaded: applied name;
+  after a restart: network.mdns; unchanged otherwise`, or `nothing
+  changed`. A reload and a settings change never interleave, and
+  reloads run one at a time. The admin API's `configReload` (a recent
+  sign-in) and `spoolframe-server config reload` do the same; the NixOS
+  module's unit has `ExecReload`, so `systemctl reload spoolframe` does
+  too, and in Docker `docker kill -s HUP <container>`.
+- A server uses every GPU it has, several of one API too (PGPU-05):
+  `transcode.gpus` lists entries in order of preference, each an `api`
+  (`nvenc`, `vaapi`, `qsv`) and either `pick` (`all`, the default, every
+  card best first; `best`; `dgpu`; `igpu`) or one `device` (a CUDA index,
+  or a render node, by-path links accepted), and `max_jobs` for its
+  cards. Left out, every card of every API, NVIDIA first. Detection runs
+  on each card, confined to it; a card's rank is how much detection found
+  it does (encodes, decodes by depth, GPU filters), discrete before
+  integrated among equals. Discrete or integrated comes from the kernel:
+  NVIDIA is discrete, amdgpu says (its APU flag), Intel's iGPU is PCI
+  00:02.0. Each conversion runs on the card that does the most of it,
+  across entries, then in the entries' order and rank, skipping a card
+  that runs its most jobs; `transcode.max_gpu_jobs` is now each card's
+  limit, and the status sums them. A job's ffmpeg may open its own
+  card's nodes only, and an NVIDIA job is shown its one card by CUDA
+  (`CUDA_VISIBLE_DEVICES`, PCI order). The start's log has a line per
+  card: name, node, discrete or integrated and how that was known, its
+  entry, what it does and lacks. A host with one GPU runs as before.
+  libplacebo's tone map is tested on each card, confined to it, and a
+  card that runs it counts the tone map as on the GPU; a reload (SIGHUP,
+  `configReload`) detects again on the cards found at start.
+  Server › Settings › Playback edits `gpus` among the advanced settings;
+  the NixOS module has `transcode.gpus`, and allows every DRM node for a
+  VA-API pick (its cards are only known at start), a device's node alone
+  otherwise.
+- `transcode.hardware` and `transcode.vaapi_device` are deprecated and
+  will be removed in a later release. They are still read, as the `gpus`
+  they mean (each family every card of it; VA-API on `vaapi_device` alone
+  when that is set); setting `gpus` too is refused. A warning at start,
+  `config set`, `config show`, the settings API and the web UI each name
+  the exact `transcode.gpus` to write instead; the web UI shows them only
+  while they are set, with a Convert button for runtime settings. The
+  NixOS options `transcode.hardware` and `transcode.vaapiDevice` are null
+  by default now, deprecated, and warn with the `gpus` equivalent.
+
+## 0.5.0 (2026-10-09)
+
 - The project skeleton, made with `foundry-make` from `__templates/rust`.
 - The crate layout: permissive `spoolframe-types`, `-protocol` and
   `-client-sdk`; AGPL `spoolframe-plex` and `spoolframe-server`. A workspace
@@ -3199,248 +3496,6 @@
     so.
   - `spoolframe-probe --check-limits` also sends wrong invite codes until
     they are `RateLimited`.
-- An invite's holder on your relay (P6-08): a device redeeming an
-  invite relays as the invite's kind says before it has an account. An
-  invite that makes an account here, admin or consumer, is an owner's;
-  a portable user's (P7) or a server's (P8) a friend's. The SDK reaches
-  the link's relays with a token made from the code and its own key,
-  until the invite is redeemed. A token that matches no live invite
-  counts as a wrong invite code. The relay-access question gains an
-  optional `invite`; its ALPN stays `spoolframe/relay-access/1`, and an
-  older server ignores it.
 - `nix build .#docker`: the server as an OCI image
   (`ghcr.io/spoolframe/spoolframe-server`), ffmpeg and tesseract included,
   running as uid 1000 with its state in a volume.
-- PX-22, the server side:
-  - Any string setting may name an environment variable as
-    `${SF_ENV_NAME}`. Only `SF_ENV_` variables are read; an unset one
-    stops the server (or refuses the change) naming it. `config show`,
-    the settings API and runtime.ucl keep the reference.
-  - `auth.oidc[].client_secret`, read after `client_secret_file` and
-    before the secret pasted in the web UI. The runtime layer takes only
-    a `${SF_ENV_…}` reference; a provided file's literal one shows as
-    `(hidden)`.
-  - The settings API's restart-pending entries carry `running`, what
-    the server runs with until it restarts.
-- PX-22, the web UI:
-  - Every network setting: the app and Plex discovery ports on the
-    Server tab; the relays, relay keys, pkarr record and the addresses
-    devices are told on Remote access. Lists are edited one entry a
-    row.
-  - Settings › Sign-in providers: SSO providers added, changed and
-    removed. The client secret from an environment variable (saved as
-    `${SF_ENV_<NAME>}`, recommended), pasted (kept unencrypted on the
-    server's disk, as the form says before the field), or from a file.
-  - Playback: when frame previews are made, how often, their cache and
-    the artwork cache (in GiB), and when an item counts as started and
-    as watched. Security: the media tools and their sandbox.
-  - A restart setting changed since the start shows what the server
-    runs with now and after the restart.
-  - "Show advanced settings", off by default and kept per browser, hides
-    the settings few servers need; a tab with hidden ones set says how
-    many.
-- At least one enabled admin keeps a password: the last one with a
-  password cannot be demoted, disabled or have it removed, setup cannot
-  finish without one, and a server set up before says so at start.
-- `passwordRemove` (a user's own) and `userRemovePassword` (an admin's),
-  each after a recent sign-in, and never a user's last way to sign in.
-  Their other sessions end and trusted devices are forgotten, as with a
-  new password.
-- The web UI's setup asks for the first admin's password, the passkey
-  optional; My profile and a user's page remove a password, after
-  saying what that ends.
-- The web UI says when it is open over plain HTTP across the network:
-  above the sign-in form, in a banner on every admin page, and at the
-  setup page's insecure cookies switch. The password and the session
-  can be read on the way; HTTPS or an SSH tunnel to localhost is the
-  fix. The wizard's Access step names those first, insecure cookies
-  last.
-- Portable identities begin (P7-01): the client SDK makes a root
-  signing key with a 24-word BIP-39 recovery phrase, recovers the same
-  key and `PortableUserId` from the phrase on any device, and keeps
-  several identities apart in the app's storage. The root stays on the
-  device; the server and the protocol do not build the phrase code, and
-  nothing on the wire changes yet.
-- Portable device credentials (P7-02): the root signs a 90-day credential
-  for each device's own key, and revokes keys with a signed, versioned
-  identity state that stamps each revocation with its time. The
-  protocol crate defines both, and a device's proof of its key, as fixed
-  signed byte layouts (PROTOCOL.md "Portable identities"); the SDK
-  issues, installs, renews and revokes them, and gives a device a fresh
-  key once its old one is revoked. Revocation only grows: the server
-  refuses a credential whose key any valid state it has seen revokes,
-  older revisions included, and drops a revocation once no credential
-  it could stop can still hold (90 days and 5 minutes). No request
-  carries them yet (P7-06). The root's phone keeps the devices it
-  issued to, under a label the user gives (`Portable::issued`: the
-  newest credential per key, and whether it is revoked), and
-  `Portable::list` says whether each identity's root is still there,
-  which a restored backup that leaves out device-only secrets is not.
-- Ties (P7-04, wire revision 13): a signed-in local account ties itself
-  to a portable identity. The server gives the session a nonce
-  (`TieBegin`, 5 minutes, used once); the phone signs it with the root,
-  or a TV with its device key and credential, over the server's id, the
-  nonce, the identity and the username (`TieFinish`), so the proof
-  works nowhere else. One identity per account, one account per
-  identity on a server; an account already tied severs first
-  (`Untie`). Each needs a recent sign-in. The tie is a row beside the
-  account: severing it leaves sessions, passkeys and watch state as
-  they were. `WhoAmI` and the admin API's `UserInfo` carry it, and the
-  web UI shows it as a badge on a user's page and in My profile, with
-  Sever (`admin.userUntie`, `me.portableUntie`); tying is done from the
-  phone app only. The SDK ties with `Session::tie` and severs with
-  `Session::untie`. Signing in with a tied credential is P7-06.
-- An encoded HLS playback's first segment is 2 s (PX-26): the grid is
-  0, 2, 4, 8, 14 s… and the player has a segment two seconds into the
-  encode, not six. A copied video is still cut at its keyframes, audio
-  alone every 6 s. A run for one of the first three segments starts
-  from 0. The forced keyframes count from the run's first frame, where
-  ffmpeg's HLS muxer counts its cuts from, so they no longer drift off
-  the grid (at 23.976 fps they fell 7 s behind over two hours). A
-  capped encode's BANDWIDTH is now twice its cap: what a 2 s segment
-  can hold.
-- A remux over HLS starts without reading the whole file first (PX-25):
-  a copied video's keyframes come from the file's own index, Matroska's
-  Cues or MP4's sync sample table, read in a fraction of a second where
-  every packet took a minute or two on a 4K remux. The index is used
-  only after ffprobe finds exactly its keyframes in four intervals
-  between them; a file without one, or with one that misses keyframes,
-  is read whole as before. The reader is bounded (48 MiB read, 32 MiB of
-  times) and has a fuzz target, `keyframe_index`.
-- Frame previews made ahead also wait while a remux runs and while a
-  converted playback is being prepared (its keyframes read), not only
-  while an encode runs.
-- Server › Playback says how each playback is made (PX-24), from the
-  plan and the filter graph the server built: delivery (direct, remux,
-  transcode), decoder (software or the GPU's API), video encoder with
-  its codec, HDR tone mapping and subtitle burn-in (GPU, CPU or none),
-  and the output's bitrate measured from the segments written beside
-  the encoder's target, with its size. A playback's page also shows its
-  start: request to plan, the keyframes' read (from the index or a full
-  scan), and the first segment ready; the server logs the same once per
-  start as `playback start timed`. The "playback started" line's
-  `plan=` says `remux` or `transcode` where it said `converted`.
-- An NVENC encode decodes on NVDEC (PX-27): `-hwaccel cuda`, the frames
-  back in memory, so tone mapping, burn-in and scaling run on the CPU as
-  before. Detection tests NVDEC per codec and depth (H.264, 8- and
-  10-bit HEVC and AV1, VP9) where NVENC works, and a source it did not
-  decode in a test, or one whose GPU decode fails, decodes in software.
-  The transcoding line, the admin API and the Playback step's encoder
-  list name what each GPU decodes (`hevc 10-bit (nvdec)`), and a
-  playback's page says `GPU · NVDEC (CUDA)`.
-- NVENC and NVDEC start under the media sandbox: CUDA names a thread
-  through `/proc/self/task/<tid>/comm` and reads `/proc/self/maps`, and
-  failed with `CUDA_ERROR_OPERATING_SYSTEM` when Landlock refused them.
-  A run on the NVIDIA GPU may now write its own threads' names and read
-  its own `maps`, and nothing else of `/proc`; other runs still have no
-  `/proc` at all. A run on a GPU opens only that GPU's device nodes: a
-  VA-API run no NVIDIA node, an NVIDIA run no render node.
-- A failed test encode or decode at start logs what ffmpeg said last
-  (`stderr=`): as a warning for a family `transcode.hardware` names, at
-  debug for one only `auto` tried. Before, a GPU left out said nothing
-  of why.
-- A video encode runs on the one GPU that does the most of it (PX-28).
-  With `transcode.hardware = ["nvenc", "vaapi"]` the encoder was the
-  first family that encodes the output codec, and the source decoded on
-  it or on the CPU. Now each family that encodes the codec is ranked:
-  the whole job on it (decode, then tone map, picture burn-in and scale
-  on the GPU), decode and encode with the filters on the CPU, or encode
-  only; the best wins, the list's order between equals. A GTX 1060
-  beside an AMD GPU sends an AV1 film to the AMD GPU, which decodes it,
-  and a film both decode to NVIDIA unless the AMD GPU also runs its
-  filters (VA-API scales on the GPU, NVDEC's frames scale on the CPU, so
-  a downscale goes to VA-API). A job never decodes on one GPU and
-  encodes on another. A software encode decodes on the first GPU that
-  decodes the source, NVDEC too now. A run whose GPU decode fails runs
-  again in software on the same encoder. Server › Playback's plan and
-  "How it is made" name the encoder the run picked.
-- A family `transcode.hardware` names that lacks a codec logs one line
-  at info, `nvenc lacks: av1 encode, av1 decode, av1 10-bit decode`,
-  rather than a warning per failed test at every start; each test's
-  stderr is at debug. A named family with no working encoder still
-  warns, now with its first failed test's stderr.
-- With `transcode.gpu_filters` on, an NVIDIA job filters on the GPU too
-  (PX-29): NVDEC's frames stay there (`-hwaccel_output_format cuda`),
-  `scale_cuda` scales them (and makes a 10-bit source 8-bit for H.264),
-  and picture subtitles are uploaded and burned in with `overlay_cuda`.
-  NVIDIA tone maps on the CPU, so an HDR film, or one with text burned
-  in, filters all on the CPU as before. Detection tries both filters
-  with a short run where NVENC and NVDEC work; one that fails stays on
-  the CPU and shows in the `nvenc lacks: …` line, and the transcoding
-  line says GPU filters per family (`vaapi: tone map, overlay; nvenc:
-  scale, overlay`). Such a job weighs as all on the GPU, the playback
-  page says its burn-in ran there, and one whose CUDA filters fail runs
-  again decoded in software with the CPU's filters. With GPU filters on,
-  a 4K film made 1080p that both GPUs decode now goes to NVIDIA when it
-  is first in `transcode.hardware`, and a picture burn-in to NVIDIA over
-  an AMD GPU (Mesa has no `overlay_vaapi`).
-- The server hardens its own process as it starts, for every
-  subcommand (PX-31): it is not dumpable, so another process as the same
-  user can no longer read its `/proc/<pid>/environ` (the `SF_ENV_`
-  secrets) or memory, nor attach a debugger (root still can); it gains
-  no privileges from a setuid program it runs; it dumps no core; and a
-  seccomp deny-list refuses, with `EPERM`, the calls it never makes:
-  `ptrace`, `process_vm_*`, `bpf`, `perf_event_open`, `userfaultfd`,
-  `io_uring_*`, the mount calls, `unshare`, `setns`, a `clone` into a
-  new namespace, keyrings, modules, `kexec`, `reboot`, swap, `acct`,
-  `quotactl`, `open_by_handle_at`, a persona other than Linux's, and on
-  x86_64 `iopl`/`ioperm`. Processes, threads, every socket family and
-  the media tools' own confinement are unchanged; their filter stacks on
-  top. A restart in place keeps the filter rather than load it twice.
-- An HDR film is tone mapped on the GPU with libplacebo (PGPU-04).
-  `transcode.tone_map` (live; Settings › Playback): `"auto"`, the
-  default, takes the job's GPU's own tone map (`tonemap_vaapi`, Intel),
-  else libplacebo on the job's GPU through Vulkan, else the CPU, and the
-  CPU while `transcode.gpu_filters` is off, so a setup that tone mapped
-  on the CPU still does after the upgrade; `"cpu"`, `"gpu"` and
-  `"libplacebo"` force one, a job whose GPU lacks it tone mapping on the
-  CPU (noted once), and one no GPU here runs is a warning at start.
-  NVIDIA's libplacebo shares ffmpeg's Vulkan device: the film decoded on
-  it (`-hwaccel vulkan`), tone mapped and scaled there, and downloaded in
-  8 bits to NVENC (fulcrum's GTX 1060: 4.0× real time and 2 s of CPU
-  against 2.0× and 120 s on the CPU). On AMD, libplacebo makes its own
-  Vulkan device, the frames going through system memory: VA-API decodes
-  into memory, libplacebo tone maps and scales, the result is uploaded
-  to `h264_vaapi` (an RX 7900 XTX here, 20 s of 4K HDR10 confined:
-  1.7× real time and 8.4 s of CPU against 1.4× and 181 s on the CPU).
-  The run's jail opens only the job's render node, so RADV lists only
-  that GPU and libplacebo's own device lands on it; unconfined, Mesa's
-  device-select layer is told its PCI ids. A burn-in goes over
-  libplacebo's output on the CPU. Detection tries libplacebo per family
-  with a one-second confined run; the transcoding line says `GPU tone
-  maps: vaapi: libplacebo (own); nvenc: libplacebo (shared)`, a failure
-  shows in `… lacks: libplacebo tone map`, and `spoolframe status` and
-  Settings › Playback list them. Placement counts a GPU tone map as on
-  the GPU; a libplacebo job with nothing burned in weighs as all on the
-  GPU; a libplacebo failure before the first output runs again decoded
-  in software with the CPU's tone map; Server › Playback says which tone
-  map ran (`libplacebo (shared)`, `libplacebo (own)`, `VA-API`, `CPU`).
-- An `experimental { }` block, for switches that may change or go away
-  without notice: the server warns of each one on at start, and the web
-  UI shows them only with Show advanced settings on (Settings ›
-  Playback › Experimental). The first is `libplacebo_shared_on_amd`
-  (off): libplacebo on an AMD GPU uses ffmpeg's Vulkan device, derived
-  from the VA-API one, falling back to its own at detection where that
-  fails, as it does on RADV today.
-- The package, the Docker image and the dev shell ship nixpkgs'
-  ffmpeg-headless with libplacebo and a shader compiler (`nix build
-  .#ffmpeg`): 330.5 MiB against 305.4 MiB. The Docker image carries
-  Mesa (RADV and radeonsi's VA-API driver) for AMD GPUs, about 980 MiB
-  more, and `NVIDIA_DRIVER_CAPABILITIES` gains `graphics` for NVIDIA's
-  Vulkan driver.
-- SIGHUP reloads the server's config (PX-33). The config file and
-  `runtime.ucl` are read and checked again as at start; one that does
-  not load changes nothing, and an ERROR says what is wrong and in which
-  file. Live settings apply through the same path as a change in the web
-  UI (the Plex catalog, watch rules, job limits, previews, sign-in,
-  metrics, logs, telemetry); restart settings are pending, Settings
-  showing "Now / After restart". A runtime value still wins over the
-  file's unless the file is locked. Encoders are detected again, as
-  SIGHUP did before, and the config's warnings are logged again. One
-  line says what happened: `SIGHUP: config reloaded: applied name;
-  after a restart: network.mdns; unchanged otherwise`, or `nothing
-  changed`. A reload and a settings change never interleave, and
-  reloads run one at a time. The admin API's `configReload` (a recent
-  sign-in) and `spoolframe-server config reload` do the same; the NixOS
-  module's unit has `ExecReload`, so `systemctl reload spoolframe` does
-  too, and in Docker `docker kill -s HUP <container>`.

@@ -22,7 +22,6 @@ use iroh::{Endpoint, RelayMode};
 use serde::Serialize;
 use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
-use spoolframe_media::encoders::{FfmpegCommand, TranscodeSettings};
 use spoolframe_media::ocr::Ocr;
 use spoolframe_media::sandbox::{GpuDevices, Mode, Sandbox, Tool};
 use spoolframe_protocol::codec::{read_frame, write_frame};
@@ -69,8 +68,8 @@ pub async fn sdk_client(
 /// No test runs a real ffmpeg.
 pub fn transcoding() -> Arc<Transcoding> {
     Arc::new(Transcoding::new(
-        Box::new(FfmpegCommand::new(Tool::unconfined("/nonexistent/ffmpeg"))),
-        TranscodeSettings::default(),
+        Tool::unconfined("/nonexistent/ffmpeg"),
+        Vec::new(),
         std::env::temp_dir(),
     ))
 }

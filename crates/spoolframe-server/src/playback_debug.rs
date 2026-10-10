@@ -10,6 +10,8 @@ use std::sync::Arc;
 use spoolframe_admin_api as api;
 use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::encoders::{Encoders, Hardware, ToneMapper, VulkanDevice};
+
+use crate::transcode::Detected;
 use spoolframe_media::{MediaDescriptor, Prober, SubtitleKind, SubtitleSource, codecs};
 use spoolframe_protocol::{
     AudioAction, ConvertedVideo, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
@@ -40,7 +42,7 @@ pub struct PlaybackDebug {
     pub subtitles: Arc<Subtitles>,
     pub previews: Arc<Previews>,
     /// For `transcode.gpu_filters`, which decides where a plan's video
-    /// encode runs (PX-28); none in tests that run no encode.
+    /// encode runs (PGPU-02); none in tests that run no encode.
     pub jobs: Option<Arc<crate::encode::job::Jobs>>,
 }
 
@@ -327,9 +329,10 @@ pub fn plan_view(
     plan: &PlaybackPlan,
     d: Option<&MediaDescriptor>,
     selection: Selection,
-    encoders: &Encoders,
+    detected: &Detected,
     gpu_filters: bool,
 ) -> api::PlanView {
+    let encoders = &detected.encoders;
     use api::{StreamKind as K, StreamOut as Out};
     let empty = MediaDescriptor {
         container: String::new(),
@@ -429,9 +432,9 @@ pub fn plan_view(
                         channels: None,
                         bitrate: *max_bitrate,
                         tone_map: *tone_map,
-                        // The one the run picks for this film (PX-28).
-                        encoder: crate::encode::args::planned_encoder(
-                            encoders,
+                        // The one the run picks for this film (PGPU-02).
+                        encoder: crate::encode::pick::planned_encoder(
+                            detected,
                             d,
                             ConvertedVideo::Encode {
                                 codec: *codec,
@@ -754,7 +757,7 @@ impl PlaybackDebug {
             &snapshot.planned,
             descriptor.as_deref(),
             snapshot.selection,
-            &self.transcoding.encoders(),
+            &self.transcoding.detected(),
             self.gpu_filters(),
         );
         Some(api::PlaybackDetail {
@@ -879,7 +882,8 @@ impl PlaybackDebug {
             // As the client protocol's `burn_in`: pictures.
             api::PictureSubtitles::BurnIn => planner::Bitmap::Preferred(BitmapPreference::Pictures),
         };
-        let encoders = self.transcoding.encoders();
+        let detected = self.transcoding.detected();
+        let encoders = detected.encoders.clone();
         // As the client protocol plans it: without capabilities, nothing.
         let plan = match &caps {
             None => planner::plan_without_capabilities(),
@@ -896,7 +900,7 @@ impl PlaybackDebug {
             &plan,
             Some(&descriptor),
             selection,
-            &encoders,
+            &detected,
             self.gpu_filters(),
         ))
     }
@@ -1132,7 +1136,7 @@ mod tests {
         assert_eq!(named("the client sent no capabilities"), None);
     }
 
-    /// PX-27: a run decoded on NVDEC reaches the page as NVIDIA's API,
+    /// PGPU-01: a run decoded on NVDEC reaches the page as NVIDIA's API,
     /// which the web names `NVDEC (CUDA)`.
     #[test]
     fn an_nvdec_decode_is_reported_as_nvidias() {
@@ -1145,23 +1149,31 @@ mod tests {
         );
     }
 
-    /// PX-28: the plan names the encoder the run picks for this film, not
+    /// PGPU-02: the plan names the encoder the run picks for this film, not
     /// the first for the codec: an AV1 film to H.264 on a host with a
     /// GTX 1060 (no AV1 decode) before an AMD GPU (AV1 decode) encodes on
     /// the AMD one.
     #[test]
     fn the_plan_names_the_encoder_the_run_picks() {
         use spoolframe_media::VideoStream;
-        use spoolframe_media::encoders::{HardwareDecoder, VideoEncoder};
+        use spoolframe_media::encoders::{Encoders, HardwareDecoder, VideoEncoder};
 
         let encoder = |name: &str, hardware| VideoEncoder {
             codec: VideoCodec::H264,
             name: name.into(),
             hardware,
         };
-        let encoders = Encoders {
+        // A GTX 1060 first, an AMD GPU second (PGPU-05: two cards, each
+        // its own detection).
+        let nvidia = Encoders {
             video: vec![
                 encoder("h264_nvenc", Some(Hardware::Nvenc)),
+                encoder("libx264", None),
+            ],
+            ..Encoders::software_baseline()
+        };
+        let amd = Encoders {
+            video: vec![
                 encoder("h264_vaapi", Some(Hardware::Vaapi)),
                 encoder("libx264", None),
             ],
@@ -1172,6 +1184,11 @@ mod tests {
             }],
             ..Encoders::software_baseline()
         };
+        let kind = spoolframe_media::gpus::Kind::Discrete;
+        let detected = Detected::with_gpus(vec![
+            crate::transcode::test_gpu(1, Hardware::Nvenc, kind, nvidia),
+            crate::transcode::test_gpu(2, Hardware::Vaapi, kind, amd),
+        ]);
         let film = MediaDescriptor {
             container: "matroska,webm".into(),
             duration: None,
@@ -1210,7 +1227,7 @@ mod tests {
             audio: None,
             subtitle: None,
         };
-        let view = plan_view(&plan, Some(&film), selection, &encoders, false);
+        let view = plan_view(&plan, Some(&film), selection, &detected, false);
         let encoders: Vec<_> = view
             .streams
             .iter()

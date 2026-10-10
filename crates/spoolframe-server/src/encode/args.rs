@@ -87,7 +87,7 @@ pub struct EncodeSpec<'a> {
     /// GPU: false once that failed for this file (see [`decode`]).
     pub hardware_decode: bool,
     /// Run the filters on the GPU where it can (`transcode.gpu_filters`):
-    /// VA-API's tone map and burn-in, NVIDIA's scale and burn-in (PX-29).
+    /// VA-API's tone map and burn-in, NVIDIA's scale and burn-in (PGPU-03).
     /// Under `tone_map = "auto"`, the tone map on the GPU too.
     pub gpu_filters: bool,
     /// How HDR is tone mapped (`transcode.tone_map`, PGPU-04).
@@ -159,7 +159,7 @@ pub fn gpu_decoder(spec: &EncodeSpec<'_>) -> Option<Hardware> {
     placement(spec).and_then(|place| place.decoder)
 }
 
-/// What runs a video encode (PX-28): its encoder, and the GPU API that
+/// What runs a video encode (PGPU-02): its encoder, and the GPU API that
 /// decodes its source, if one does. One family at most: the decoder is
 /// the encoder's own family or, for a software encode, any one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,9 +179,9 @@ impl Placement<'_> {
     }
 }
 
-/// How much of a job a family does (PX-28), best first.
+/// How much of a job a family does (PGPU-02), best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Share {
+pub enum Share {
     /// Decodes, filters and encodes: nothing on the CPU.
     Whole,
     /// Decodes and encodes; a filter runs on the CPU.
@@ -190,7 +190,7 @@ enum Share {
     EncodeOnly,
 }
 
-/// The one GPU family `spec`'s video encode runs on (PX-28), and so its
+/// The one GPU family `spec`'s video encode runs on (PGPU-02), and so its
 /// encoder and decoder: of the families that encode the output codec,
 /// the one that does the most of the job ([`Share`]), the first in
 /// `transcode.hardware`'s order among equals (detection lists each
@@ -217,16 +217,7 @@ pub fn placement<'a>(spec: &EncodeSpec<'a>) -> Option<Placement<'a>> {
         .filter_map(|e| e.hardware.map(|h| (e, h)))
         .enumerate()
         .map(|(order, (encoder, family))| {
-            let share = match stream {
-                Some(_) if decodes(family) => {
-                    if whole_on(spec, family) {
-                        Share::Whole
-                    } else {
-                        Share::DecodeAndEncode
-                    }
-                }
-                _ => Share::EncodeOnly,
-            };
+            let share = share_of(spec, family, decodes(family));
             ((share, order), encoder, family)
         })
         .min_by_key(|(rank, _, _)| *rank);
@@ -248,6 +239,30 @@ pub fn placement<'a>(spec: &EncodeSpec<'a>) -> Option<Placement<'a>> {
         encoder,
         decoder: decoder.filter(|_| spec.hardware_decode),
     })
+}
+
+/// How much of `spec`'s job `family` does, encoding it, and decoding it
+/// when it `decodes` the source.
+fn share_of(spec: &EncodeSpec<'_>, family: Hardware, decodes: bool) -> Share {
+    match (decodes, decodes && whole_on(spec, family)) {
+        (true, true) => Share::Whole,
+        (true, false) => Share::DecodeAndEncode,
+        (false, _) => Share::EncodeOnly,
+    }
+}
+
+/// How much of `spec`'s video encode the GPU [`placement`] puts it on
+/// does: `None` when it is encoded in software (or not at all). With one
+/// card's detection in `spec`, how much that card would do: what the
+/// cards are ranked by for a job (PGPU-05, `encode::pick`).
+pub fn share(spec: &EncodeSpec<'_>) -> Option<Share> {
+    let family = placement(spec)?.encoder.hardware?;
+    let decodes = spec
+        .descriptor
+        .video
+        .as_ref()
+        .is_some_and(|stream| decodes_source(spec.encoders, stream, family));
+    Some(share_of(spec, family, decodes))
 }
 
 /// The video encoder [`placement`] picks for `video`, an encode of
@@ -301,7 +316,7 @@ fn decodes_source(encoders: &Encoders, stream: &VideoStream, hardware: Hardware)
 /// every filter it needs on the GPU too: where [`cpu_filters`] leaves
 /// none on the CPU. With GPU filters off, NVDEC's frames come back to
 /// memory, so on NVIDIA only a job with no filter at all (no tone map,
-/// no burn-in, no scale) is all on the GPU, as PX-28 had it.
+/// no burn-in, no scale) is all on the GPU, as PGPU-02 had it.
 fn whole_on(spec: &EncodeSpec<'_>, family: Hardware) -> bool {
     match family {
         Hardware::Vaapi | Hardware::Nvenc => cpu_filters(spec, family).is_empty(),
@@ -310,7 +325,7 @@ fn whole_on(spec: &EncodeSpec<'_>, family: Hardware) -> bool {
 }
 
 /// Whether NVDEC's frames stay on the GPU for `spec`'s NVENC encode
-/// (PX-29): GPU filters on, `scale_cuda` found (its test is of this very
+/// (PGPU-03): GPU filters on, `scale_cuda` found (its test is of this very
 /// path: a CUDA decode, filtered and encoded on the GPU), and every
 /// filter the job needs runs on CUDA. A tone map or text burn-in takes
 /// all of the job's filters to the CPU, rather than a chain half on each.
@@ -846,7 +861,7 @@ fn gpu_graph(
     })
 }
 
-/// The video's filters on NVIDIA's GPU (PX-29), for frames NVDEC left
+/// The video's filters on NVIDIA's GPU (PGPU-03), for frames NVDEC left
 /// there: `scale_cuda` scales to an even width as the CPU's `scale=-2`
 /// does, and converts a 10-bit picture to 8 bits for H.264, as the CPU's
 /// chain does with `format=yuv420p`; HEVC and AV1 keep the source's
@@ -1641,7 +1656,7 @@ mod tests {
         }
     }
 
-    /// PX-27: the tester's case, 4K HDR10 HEVC to 1080p H.264 on NVENC,
+    /// PGPU-01: the tester's case, 4K HDR10 HEVC to 1080p H.264 on NVENC,
     /// here with PGS burned in too. NVDEC decodes (`-hwaccel cuda`, an
     /// input option before the seek), the frames come back to memory, and
     /// the burn-in, tone map and scale run on the CPU as after a software
@@ -1819,7 +1834,7 @@ mod tests {
         assert_eq!(made(&spec).decoder, Decoder::Software);
     }
 
-    // PX-29: NVIDIA's filters on the GPU, `scale_cuda` and `overlay_cuda`.
+    // PGPU-03: NVIDIA's filters on the GPU, `scale_cuda` and `overlay_cuda`.
 
     /// `nvidia()` where detection found these CUDA filters.
     fn cuda(scale: bool, overlay: bool) -> Encoders {
@@ -2006,7 +2021,7 @@ mod tests {
     }
 
     /// An HDR source NVIDIA tone maps on the CPU: the frames come back to
-    /// memory and every filter of the job runs there, as before PX-29,
+    /// memory and every filter of the job runs there, as before PGPU-03,
     /// pictures too: no chain half on each.
     #[test]
     fn an_hdr_source_on_nvenc_filters_all_on_the_cpu() {
@@ -3063,7 +3078,7 @@ mod tests {
         assert!(!args.iter().any(|a| a == "-c:s" || a == "0:2"), "{args:?}");
     }
 
-    // PX-28: one GPU per job, the one that does the most of it.
+    // PGPU-02: one GPU per job, the one that does the most of it.
 
     /// A host with a GTX 1060 and an AMD GPU, as detection finds it for
     /// `transcode.hardware = ["nvenc", "vaapi"]`: NVENC encodes H.264 and
@@ -3134,7 +3149,7 @@ mod tests {
             hardware_decoders,
             gpu_tonemap: tonemap,
             gpu_overlay: false,
-            // fulcrum's ffmpeg has both (PX-29).
+            // fulcrum's ffmpeg has both (PGPU-03).
             cuda_scale: true,
             cuda_overlay: true,
             ..encoders(false)
@@ -3232,7 +3247,7 @@ mod tests {
     }
 
     /// Scaling is a filter too: VA-API scales on the GPU always; NVIDIA
-    /// with GPU filters on and `scale_cuda` (PX-29), else NVDEC's frames
+    /// with GPU filters on and `scale_cuda` (PGPU-03), else NVDEC's frames
     /// come back to memory and are scaled on the CPU. So a 4K film made
     /// 1080p goes to VA-API where both decode it and GPU filters are off,
     /// and with them on both do all of it and the order decides.
@@ -3245,7 +3260,7 @@ mod tests {
         let mut spec = spec_with(&film, &enc, to(VideoCodec::H264), None);
         assert_eq!(picked(&spec), (s("h264_vaapi"), Some(Hardware::Vaapi)));
         assert_eq!(decode(&spec), Decode::Gpu);
-        // PX-29: GPU filters on, NVIDIA first and scaling on CUDA.
+        // PGPU-03: GPU filters on, NVIDIA first and scaling on CUDA.
         spec.gpu_filters = true;
         assert_eq!(picked(&spec), (s("h264_nvenc"), Some(Hardware::Nvenc)));
         assert_eq!(decode(&spec), Decode::Gpu);

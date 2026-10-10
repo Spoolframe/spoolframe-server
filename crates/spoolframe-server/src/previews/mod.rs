@@ -655,23 +655,24 @@ impl Previews {
         let video = descriptor.video.as_ref().ok_or("the file has no video")?;
         let duration = descriptor.duration.ok_or("the file's length is unknown")?;
         let codec = codecs::video_codec(&video.codec);
-        let encoders = self.sources.transcoding.encoders();
-        let hardware = encoders
-            .hardware_decoders
-            .iter()
-            .find(|d| d.codec == codec)
-            .map(|d| {
-                (
-                    d.hardware,
-                    self.sources.transcoding.settings().vaapi_device.clone(),
-                )
-            });
+        // The first GPU, in the order jobs try them, that decoded the
+        // codec in a test (PGPU-05), confined to its card.
+        let detected = self.sources.transcoding.detected();
+        let gpu = detected.gpus.iter().find_map(|gpu| {
+            let decoder = gpu
+                .encoders()
+                .hardware_decoders
+                .iter()
+                .find(|d| d.codec == codec)?;
+            Some((decoder.hardware, gpu))
+        });
         let source = make::Source {
             input: path.to_owned(),
             stream: video.index,
             duration,
             hdr: video.range() != VideoRange::Sdr,
-            hardware,
+            hardware: gpu.map(|(family, gpu)| (family, gpu.vaapi_device())),
+            gpu_ffmpeg: gpu.map(|(_, gpu)| gpu.ffmpeg.clone()),
         };
         let work = self.dir.join(WORK).join(key);
         tokio::fs::create_dir_all(&work)
