@@ -30,8 +30,8 @@
 //! 2. device → phone: [`DeviceFrame::Key`], the device's key for that
 //!    identity and its name, or [`DeviceFrame::Refused`];
 //! 3. phone → device: [`PhoneFrame::Credential`], the root's credential
-//!    for that key and the identity's newest state, or
-//!    [`PhoneFrame::Declined`];
+//!    for that key, the identity's newest state and the servers it signs
+//!    in to (P7-06), or [`PhoneFrame::Declined`];
 //! 4. device → phone: [`DeviceFrame::Done`], or [`DeviceFrame::Refused`].
 
 use std::fmt;
@@ -253,14 +253,62 @@ pub enum PhoneFrame {
         code: PairingCode,
         identity: PortableUserId,
     },
-    /// The root's credential for the key [`DeviceFrame::Key`] gave, and
-    /// the identity's newest state if the phone has one.
+    /// The root's credential for the key [`DeviceFrame::Key`] gave, the
+    /// identity's newest state if the phone has one, and the servers the
+    /// identity signs in to (P7-06), for the device to save and sign in
+    /// to. A phone from before P7-06 sends none: absent is empty.
     Credential {
         credential: Box<UserDeviceCredential>,
         state: Option<PortableIdentityState>,
+        #[serde(default)]
+        servers: Vec<PairedServer>,
     },
     /// The person on the phone said no.
     Declined,
+}
+
+/// The most servers a [`PhoneFrame::Credential`] carries; a device reads
+/// no more.
+pub const MAX_PAIRED_SERVERS: usize = 16;
+
+/// A server the paired identity signs in to, as the phone has it saved
+/// (P7-06): enough for the device to pin and reach it. The phone vouches
+/// for it as the invite that brought it there did; the device dials the
+/// key and nothing else, and Iroh proves it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedServer {
+    /// Its `EndpointId`, 64 hex digits.
+    pub endpoint_id: String,
+    /// The server id pinned with the key (PX-14).
+    pub server_id: String,
+    pub name: String,
+    /// Where it may be reached, at most [`MAX_ADDRS`]: hints. As text,
+    /// as `ServerAddresses` sends them.
+    #[serde(with = "crate::messages::socket_addrs_as_text")]
+    pub addrs: Vec<SocketAddr>,
+    /// Its relays' URLs, at most [`MAX_RELAYS`]: hints.
+    pub relays: Vec<String>,
+}
+
+impl PairedServer {
+    /// This server held to what a device keeps of one: `None` if its key
+    /// is not one; its name cut, and its hints to their limits, a relay
+    /// that is not a relay's URL left out.
+    pub fn within_bounds(mut self) -> Option<Self> {
+        let key = &self.endpoint_id;
+        if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        self.endpoint_id = key.to_ascii_lowercase();
+        if self.server_id.is_empty() || self.server_id.len() > 128 {
+            return None;
+        }
+        crate::messages::cut(&mut self.name);
+        self.addrs.truncate(MAX_ADDRS);
+        self.relays.retain(|r| is_relay_url(r));
+        self.relays.truncate(MAX_RELAYS);
+        Some(self)
+    }
 }
 
 /// What the device sends.
@@ -481,5 +529,98 @@ mod tests {
         };
         let json = serde_json::to_string(&refused).unwrap();
         assert_eq!(json, r#"{"type":"refused","reason":"not_allowed"}"#);
+    }
+
+    /// A credential frame for user 7's device 9, with `servers`.
+    fn credential_frame(servers: Vec<PairedServer>) -> PhoneFrame {
+        use ed25519_dalek::{Signer, SigningKey};
+        let root = SigningKey::from_bytes(&[7; 32]);
+        let device = SigningKey::from_bytes(&[9; 32]);
+        let credential = UserDeviceCredential::new(
+            PortableUserId::from_bytes(root.verifying_key().to_bytes()).unwrap(),
+            DevicePublicKey::from_bytes(device.verifying_key().to_bytes()).unwrap(),
+            1,
+            1_791_504_000,
+            1_791_504_000 + 3600,
+            |m| root.sign(m),
+        );
+        PhoneFrame::Credential {
+            credential: Box::new(credential),
+            state: None,
+            servers,
+        }
+    }
+
+    fn home() -> PairedServer {
+        PairedServer {
+            endpoint_id: "ab".repeat(32),
+            server_id: "q7k3mpa9trdwf2h".into(),
+            name: "Home Media".into(),
+            addrs: vec![
+                "192.168.1.10:7420".parse().unwrap(),
+                "[2001:db8::1]:7420".parse().unwrap(),
+            ],
+            relays: vec!["https://relay.example.org/".into()],
+        }
+    }
+
+    /// P7-06: the servers ride the credential frame, their addresses as
+    /// text (a tagged frame cannot carry serde's own form through CBOR).
+    #[test]
+    fn a_credential_frame_carries_its_servers() {
+        let frame = credential_frame(vec![home()]);
+        let read: PhoneFrame =
+            crate::codec::decode(&crate::codec::encode(&frame).unwrap()).unwrap();
+        assert_eq!(read, frame);
+        let json = serde_json::to_value(&frame).unwrap();
+        assert_eq!(json["servers"][0]["addrs"][1], "[2001:db8::1]:7420");
+    }
+
+    /// A phone from before P7-06 sends no servers: none, not an error.
+    #[test]
+    fn a_credential_frame_without_servers_reads_as_none() {
+        let mut json = serde_json::to_value(credential_frame(vec![home()])).unwrap();
+        json.as_object_mut().unwrap().remove("servers");
+        let read: PhoneFrame = serde_json::from_value(json).unwrap();
+        let PhoneFrame::Credential { servers, .. } = read else {
+            panic!("not a credential frame");
+        };
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn a_paired_server_is_held_to_bounds() {
+        assert_eq!(home().within_bounds(), Some(home()));
+        let loud = PairedServer {
+            endpoint_id: "AB".repeat(32),
+            name: "x".repeat(500),
+            addrs: (0..20)
+                .map(|n| format!("10.0.0.{n}:7420").parse().unwrap())
+                .collect(),
+            relays: vec![
+                "ftp://nope".into(),
+                "https://a.example/".into(),
+                "https://b.example/".into(),
+                "https://c.example/".into(),
+            ],
+            ..home()
+        };
+        let held = loud.within_bounds().unwrap();
+        assert_eq!(held.endpoint_id, "ab".repeat(32));
+        assert_eq!(held.name.chars().count(), crate::MAX_HELLO_TEXT);
+        assert_eq!(held.addrs.len(), MAX_ADDRS);
+        assert_eq!(held.relays, ["https://a.example/", "https://b.example/"]);
+        for bad in [
+            PairedServer {
+                endpoint_id: "not a key".into(),
+                ..home()
+            },
+            PairedServer {
+                server_id: String::new(),
+                ..home()
+            },
+        ] {
+            assert_eq!(bad.within_bounds(), None);
+        }
     }
 }

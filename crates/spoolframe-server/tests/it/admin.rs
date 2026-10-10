@@ -272,6 +272,12 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
     // Nothing detected in tests: the software baseline.
     assert_eq!(status.transcoding.video_encoders, ["libx264"]);
     assert_eq!(status.transcoding.audio_encoders, ["aac"]);
+    // No GPU here, and no conversions: the Overview lists no card and
+    // no route.
+    assert!(status.transcoding.gpus.is_empty());
+    assert!(status.transcoding.other_gpus.is_empty());
+    assert!(status.transcoding.gpu_notes.is_empty());
+    assert!(status.transcoding.routes.is_empty());
 
     admin
         .user_add(NewUser {

@@ -9,6 +9,7 @@
 //! proprietary, can link it. It never depends on an AGPL server crate.
 
 pub mod codec;
+pub mod date;
 mod duration_ms;
 pub mod id;
 pub mod language;
@@ -26,6 +27,7 @@ pub use codec::{
     AudioCodec, ClientCapabilities, Container, Delivery, HdrFormat, SubtitleFormat, VideoCodec,
     VideoLimits,
 };
+pub use date::{CalendarDate, DateError};
 pub use id::{ArtworkId, IdError, LibraryId, MediaId, MediaKind, Namespace, PersonId};
 pub use media::{AudioRole, AudioTrack, MediaTracks, SubtitleRole, SubtitleTrack, VideoTrack};
 pub use model::{

@@ -111,6 +111,10 @@ pub(crate) struct Peer {
     pub endpoint: EndpointId,
     connection: Connection,
     known: AtomicBool,
+    /// Its device has a local user's live session (P7-06): only such a
+    /// device's sign-ins skip the strangers' budget. A portable guest's
+    /// session raises its limits, not this.
+    local: AtomicBool,
     /// Signed in at some point while open: a sign-in on its device, or a
     /// session used on it. Unlike `known`, not set for a device that only
     /// has a session: what the log names at INFO.
@@ -139,6 +143,7 @@ impl Peer {
             endpoint: connection.remote_id(),
             connection: connection.clone(),
             known: AtomicBool::new(false),
+            local: AtomicBool::new(false),
             signed_in_here: AtomicBool::new(false),
             users: parking_lot::Mutex::default(),
             closing: AtomicBool::new(false),
@@ -166,6 +171,17 @@ impl Peer {
     /// be pushed the server's addresses (PX-12).
     pub fn signed_in(&self) -> bool {
         self.known() && !self.closing.load(Ordering::Acquire)
+    }
+
+    /// Whether a local user is signed in on the device, and it has not
+    /// signed out since: its sign-ins skip the strangers' budget.
+    pub fn signed_in_locally(&self) -> bool {
+        self.signed_in() && self.local.load(Ordering::Acquire)
+    }
+
+    /// A local user's session is live on the device.
+    pub(crate) fn note_local(&self) {
+        self.local.store(true, Ordering::Release);
     }
 
     /// The connection was signed in: its device signed in while it was

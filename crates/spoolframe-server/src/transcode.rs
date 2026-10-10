@@ -63,6 +63,36 @@ pub struct Detected {
     pub gpus: Vec<Arc<Gpu>>,
     /// What the CPU encodes alone: a conversion on no GPU runs with it.
     pub software: Arc<Encoders>,
+    /// The host's GPUs that do none of the work, and why: for the
+    /// Overview, as the start lines say them.
+    pub others: Vec<Other>,
+    /// The entries of `transcode.gpus` that took no card, as the log
+    /// says them.
+    pub notes: Vec<String>,
+}
+
+/// A GPU of the host's that encodes nothing here.
+#[derive(Debug, Clone)]
+pub struct Other {
+    pub host: HostCard,
+    /// The driver's name for it where detection read one, else
+    /// [`HostCard::fallback_name`].
+    pub name: String,
+    pub why: OtherWhy,
+}
+
+/// Why a GPU does none of the work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtherWhy {
+    /// No entry of `transcode.gpus` takes it.
+    NoEntry,
+    /// `entry` takes it, for `api`, and none of its tests passed: the
+    /// first that failed is `test`.
+    NothingWorks {
+        api: spoolframe_media::encoders::Hardware,
+        entry: String,
+        test: Option<String>,
+    },
 }
 
 impl Detected {
@@ -73,6 +103,8 @@ impl Detected {
             encoders: software.clone(),
             gpus: Vec::new(),
             software,
+            others: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -86,6 +118,8 @@ impl Detected {
             encoders: Arc::new(merge(&software, &gpus)),
             gpus,
             software: Arc::new(software),
+            others: Vec::new(),
+            notes: Vec::new(),
         }
     }
 }
@@ -210,14 +244,21 @@ impl Transcoding {
     /// from here on.
     pub async fn detect(&self) {
         let (cards, missing) = gpus::select(&self.entries, &self.host);
-        for missed in &missing {
-            log_missing(&self.entries, missed);
-        }
+        let notes = missing
+            .iter()
+            .map(|missed| log_missing(&self.entries, missed))
+            .collect();
+        let mut others = Vec::new();
         for host in self
             .host
             .iter()
             .filter(|h| !cards.iter().any(|c| c.host.pci == h.pci))
         {
+            others.push(Other {
+                host: host.clone(),
+                name: host.fallback_name(),
+                why: OtherWhy::NoEntry,
+            });
             tracing::info!(
                 pci = host.pci,
                 driver = host.driver,
@@ -247,7 +288,24 @@ impl Transcoding {
         // A card that encodes nothing may still decode for a software
         // encode, as a family's decoders were kept; one that does nothing
         // at all is left out.
-        let usable: Vec<Found> = found.into_iter().filter(|f| f.capability > 0).collect();
+        let (usable, useless): (Vec<Found>, Vec<Found>) =
+            found.into_iter().partition(|f| f.capability > 0);
+        others.extend(useless.into_iter().map(|f| {
+            Other {
+                why: OtherWhy::NothingWorks {
+                    api: f.card.api,
+                    entry: entry_label(&self.entries, f.card.entry),
+                    test: f
+                        .encoders
+                        .failed
+                        .iter()
+                        .find(|failed| failed.hardware == f.card.api)
+                        .map(|failed| failed.test.clone()),
+                },
+                name: f.name,
+                host: f.card.host,
+            }
+        }));
         let gpus: Vec<Arc<Gpu>> = gpus::rank(usable, &self.entries)
             .into_iter()
             .map(|found| {
@@ -275,6 +333,8 @@ impl Transcoding {
             encoders: Arc::new(encoders),
             gpus,
             software: Arc::new(baseline),
+            others,
+            notes,
         });
     }
 
@@ -288,7 +348,7 @@ impl Transcoding {
 }
 
 /// `entry N (vaapi pick=dgpu)`, for the log.
-fn entry_label(entries: &[GpuEntry], n: usize) -> String {
+pub(crate) fn entry_label(entries: &[GpuEntry], n: usize) -> String {
     match entries.get(n) {
         Some(entry) => format!("transcode.gpus entry {} ({})", n + 1, entry.describe()),
         None => format!("transcode.gpus entry {}", n + 1),
@@ -296,13 +356,16 @@ fn entry_label(entries: &[GpuEntry], n: usize) -> String {
 }
 
 /// An entry that took no card: a pick that found none is how the host
-/// is; a device named and missing is a mistake.
-fn log_missing(entries: &[GpuEntry], missed: &Missing) {
+/// is; a device named and missing is a mistake. What it says, for the
+/// Overview too.
+fn log_missing(entries: &[GpuEntry], missed: &Missing) -> String {
     let entry = entry_label(entries, missed.entry);
     if missed.fixed {
         tracing::warn!(why = missed.why, "{entry} names a GPU that is not here");
+        format!("{entry} names a GPU that is not here: {}", missed.why)
     } else {
         tracing::info!(why = missed.why, "{entry} takes no GPU");
+        format!("{entry} takes no GPU: {}", missed.why)
     }
 }
 
@@ -725,6 +788,53 @@ mod tests {
             ),
             "{}",
             warned[0]
+        );
+    }
+
+    /// The Overview's other GPUs: a card no entry takes, and one taken
+    /// whose every test failed, with the first; and an entry that took
+    /// none, as the log says it.
+    #[tokio::test]
+    async fn detection_keeps_the_cards_that_do_nothing_and_why() {
+        let (_, untaken) = detect_on(
+            "spoolframe-transcode-untaken",
+            vec![GpuEntry::all(Hardware::Vaapi)],
+            vec![geforce()],
+            NO_CUDA,
+        )
+        .await;
+        assert_eq!(untaken.others.len(), 1);
+        assert_eq!(untaken.others[0].host.pci, geforce().pci);
+        assert_eq!(untaken.others[0].why, OtherWhy::NoEntry);
+        assert_eq!(untaken.notes.len(), 1, "{:?}", untaken.notes);
+        assert!(
+            untaken.notes[0].starts_with("transcode.gpus entry 1 (vaapi pick=all) takes no GPU: "),
+            "{}",
+            untaken.notes[0]
+        );
+
+        // Without its driver: no NVENC encode and no NVDEC decode.
+        const DEAD: &str = "#!/bin/sh\n\
+             case \"$*\" in\n\
+             *-encoders*) printf ' ------\\n V....D h264_nvenc NVIDIA\\n V....D libx264 x264\\n' ;;\n\
+             *cuda*|*nvenc*) echo 'Cannot load libcuda.so.1' >&2; exit 1 ;;\n\
+             esac\n";
+        let (_, broken) = detect_on(
+            "spoolframe-transcode-broken",
+            vec![GpuEntry::all(Hardware::Nvenc)],
+            vec![geforce()],
+            DEAD,
+        )
+        .await;
+        assert!(broken.gpus.is_empty());
+        assert!(broken.notes.is_empty(), "{:?}", broken.notes);
+        assert_eq!(
+            broken.others.iter().map(|o| &o.why).collect::<Vec<_>>(),
+            [&OtherWhy::NothingWorks {
+                api: Hardware::Nvenc,
+                entry: "transcode.gpus entry 1 (nvenc pick=all)".into(),
+                test: Some("h264_nvenc".into()),
+            }]
         );
     }
 

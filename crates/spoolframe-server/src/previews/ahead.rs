@@ -209,6 +209,8 @@ mod tests {
             title: key.into(),
             summary: None,
             content_rating: None,
+            year: None,
+            air_date: None,
             duration: None,
             artwork: Vec::new(),
             playback: PlaybackState::default(),

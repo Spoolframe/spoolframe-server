@@ -23,7 +23,7 @@ use crate::connection::{ServerConnection, Timeouts};
 use crate::discovery::Discovery;
 use crate::error::SdkError;
 use crate::link::{ConnectionPath, Link, SignOutWatch, StateWatch};
-use crate::portable::Portable;
+use crate::portable::{Portable, PortableUserId};
 use crate::servers::{self, SavedServer, ServerEntry};
 use crate::session::{self, SavedProfile, Session, SignInMethod, StoredSession};
 use crate::storage::{Storage, StorageError, keys};
@@ -654,7 +654,7 @@ impl Client {
     }
 
     /// Requests other than `Hello` go only to a pinned server (P1-21).
-    async fn require_pinned(&self, id: EndpointId) -> Result<(), SdkError> {
+    pub(crate) async fn require_pinned(&self, id: EndpointId) -> Result<(), SdkError> {
         let saved = servers::load(self.inner.storage.as_ref()).await?;
         if saved.iter().any(|s| s.endpoint_id == id.to_string()) {
             Ok(())
@@ -935,6 +935,20 @@ impl Client {
         method: Option<SignInMethod>,
         remembered: bool,
     ) -> Result<Session, SdkError> {
+        self.keep_session_as(server, token, method, remembered, None)
+            .await
+    }
+
+    /// [`Client::keep_session`], signed in with portable identity
+    /// `portable` if `Some` (P7-06): kept with it, to sign in again.
+    pub(crate) async fn keep_session_as(
+        &self,
+        server: EndpointId,
+        token: SessionId,
+        method: Option<SignInMethod>,
+        remembered: bool,
+        portable: Option<PortableUserId>,
+    ) -> Result<Session, SdkError> {
         let user = match self.call(server, Some(&token), Request::WhoAmI).await? {
             Response::Ok(Reply::WhoAmI(user)) => user,
             Response::Ok(other) => {
@@ -950,6 +964,7 @@ impl Client {
             username: user.username.clone(),
             display_name: user.display_name.clone(),
             method,
+            portable,
         };
         match (
             method,
@@ -959,6 +974,7 @@ impl Client {
             (None, Some(old)) => {
                 *old = StoredSession {
                     method: old.method,
+                    portable: old.portable,
                     ..kept
                 };
             }

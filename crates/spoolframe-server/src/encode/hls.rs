@@ -707,6 +707,7 @@ mod tests {
                 frame_rate_millis: Some(23_976),
                 bit_depth: 10,
                 hdr: None,
+                bit_rate: None,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),

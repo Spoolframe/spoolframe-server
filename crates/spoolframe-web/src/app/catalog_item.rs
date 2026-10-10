@@ -264,6 +264,7 @@ fn Overview(seen: ItemView, item: Item, library: String) -> Element {
                             Field { label: "Show", IdLink { library: library.clone(), title: crumb(&e.show_id.to_string()), id: e.show_id.to_string() } }
                             Field { label: "Season", IdLink { library: library.clone(), title: crumb(&e.season_id.to_string()), id: e.season_id.to_string() } }
                             Field { label: "Episode", "{e.episode}" }
+                            if let Some(date) = e.air_date { Field { label: "Aired", "{date}" } }
                         },
                         Item::Album(a) => rsx! {
                             Field { label: "Artist", IdLink { library: library.clone(), title: crumb(&a.artist_id.to_string()), id: a.artist_id.to_string() } }

@@ -74,7 +74,8 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::GetTrackPreferences
         // A second challenge only takes the place of the first, which
         // stays bounded per session and user (P7-04).
-        | Request::TieBegin => true,
+        | Request::TieBegin
+        | Request::ListInvites => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)
@@ -82,8 +83,11 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::AwaitDeviceSignIn { .. }
         | Request::BeginPasskeySignIn { .. }
         | Request::FinishPasskeySignIn { .. }
-        // An invite makes an account and uses itself up.
+        | Request::BeginPortableSignIn
+        | Request::FinishPortableSignIn(_)
+        // An invite makes an account or a grant and uses itself up.
         | Request::RedeemInvite(_)
+        | Request::RedeemPortableInvite(_)
         // A resume makes a session; trust changes end sessions.
         | Request::ResumeProfile { .. }
         | Request::SetDeviceTrust { .. }
@@ -124,6 +128,10 @@ pub fn retry_safe(request: &Request) -> bool {
         // A tie uses its nonce up; severing one is a change (P7-04).
         | Request::TieFinish { .. }
         | Request::Untie
+        // A second invite would be a second code; a revoke is a change
+        // (PX-44).
+        | Request::CreateInvite(_)
+        | Request::RevokeInvite { .. }
         | Request::Unknown => false,
     }
 }

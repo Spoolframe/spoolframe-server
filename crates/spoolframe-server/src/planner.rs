@@ -1116,6 +1116,7 @@ mod tests {
                 frame_rate_millis: Some(23_976),
                 bit_depth: 8,
                 hdr: None,
+                bit_rate: None,
             }),
             audio: vec![audio(1, "dts", true), audio(2, "aac", false)],
             subtitles: vec![

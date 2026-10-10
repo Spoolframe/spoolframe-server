@@ -85,9 +85,9 @@ impl RelayAccess {
     /// Which tier `endpoint` is in: the server itself and a device with a
     /// live session, or trusted for a user, are its owner's. A device that
     /// is no one's, with a live invite's token for it, is the tier of the
-    /// invite's kind (P6-08, [`crate::invites::holder_tier`]); anyone else
-    /// a stranger. Friends are otherwise the users and servers of P7 and
-    /// P8; until then there are none.
+    /// invite's kind (P6-08, [`crate::invites::holder_tier`]); one with a
+    /// portable user's session (P7-06) a friend's; anyone else a stranger.
+    /// Servers paired with this one (P8) will be friends too.
     pub async fn tier(&self, endpoint: &str, invite: Option<&str>) -> Tier {
         if endpoint == self.server.to_string() {
             return Tier::Owner;
@@ -104,6 +104,14 @@ impl RelayAccess {
                 return Tier::Stranger;
             }
             _ => {}
+        }
+        match store.endpoint_has_portable_session(endpoint).await {
+            Ok(true) => return Tier::Friend,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, endpoint, "cannot tell the relay who an endpoint is");
+                return Tier::Stranger;
+            }
         }
         let holder = match (invite, endpoint.parse::<EndpointId>()) {
             (Some(token), Ok(id)) => crate::invites::holder_tier(&self.auth, &id, token).await,

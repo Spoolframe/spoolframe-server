@@ -101,8 +101,10 @@ pub enum InviteCommand {
         /// The role its accounts get: `consumer` or `admin`.
         #[arg(long, default_value = "consumer")]
         role: Role,
-        /// `create-user`; `portable-account` and `federation` arrive with
-        /// P7 and P8.
+        /// `create-user` (an account here), or `portable-account` (P7-05:
+        /// someone with their own portable identity watches as
+        /// themselves; the role is a consumer's). `federation` arrives
+        /// with P8.
         #[arg(long, default_value = "create-user", value_parser = invite_kind)]
         kind: InviteKind,
     },
@@ -114,6 +116,17 @@ pub enum InviteCommand {
     /// The server's link without a code: it finds and saves the server,
     /// and whoever has it signs in with an account they have.
     Link,
+}
+
+/// Portable users granted access here (P7-06): people whose accounts
+/// this server does not host.
+#[derive(Subcommand)]
+pub enum GrantCommand {
+    /// The portable users granted access, with their ids.
+    List,
+    /// Take a portable user's grant away, by the id `grant list` shows:
+    /// their sessions end at once.
+    Revoke { id: String },
 }
 
 /// `12h` or `7d` as seconds.
@@ -735,14 +748,60 @@ async fn run_invite(api: &WsClient, command: InviteCommand) -> Result<()> {
     Ok(())
 }
 
+/// List or revoke portable users' grants (P7-06), logged in as an admin.
+pub async fn grant(listen: SocketAddr, command: GrantCommand) -> Result<()> {
+    let login = connect(listen, None)
+        .await?
+        .login(admin_credentials()?)
+        .await
+        .map_err(api_error)?;
+    let api = connect(listen, Some(&login.token)).await?;
+    let result = run_grant(&api, command).await;
+    if let Err(e) = api.logout().await {
+        tracing::debug!(error = %e, "logout");
+    }
+    result
+}
+
+async fn run_grant(api: &WsClient, command: GrantCommand) -> Result<()> {
+    match command {
+        GrantCommand::List => {
+            let grants = api.grant_list().await.map_err(api_error)?;
+            if grants.is_empty() {
+                println!("no portable users are granted access");
+            }
+            for grant in &grants {
+                println!(
+                    "{}  {}  {}  granted {}  {} live sessions",
+                    grant.id,
+                    grant.fingerprint,
+                    grant.display_name.as_deref().unwrap_or("(no name)"),
+                    when(grant.granted_at),
+                    grant.live_sessions,
+                );
+            }
+        }
+        GrantCommand::Revoke { id } => {
+            api.grant_revoke(id.clone()).await.map_err(api_error)?;
+            println!("revoked the grant to {id}; their sessions have ended");
+        }
+    }
+    Ok(())
+}
+
 /// One invite as `invite list` prints it: its id first, then who it is
 /// for, the role, the uses left, when it expires and who made it.
 fn invite_line(invite: &spoolframe_admin_api::InviteEntry) -> String {
+    let what = match invite.kind {
+        InviteKind::CreateUser => invite.role.to_string(),
+        InviteKind::PortableAccount => "portable guest".to_owned(),
+        InviteKind::Federation => "federation".to_owned(),
+    };
     format!(
         "{}  {}  {}  {} of {} left  expires {}  by {}",
         invite.id,
         invite.note.as_deref().unwrap_or("(no note)"),
-        invite.role,
+        what,
         invite.uses_left,
         invite.uses,
         when(invite.expires_at),
@@ -905,6 +964,10 @@ mod tests {
             gpu_overlay: false,
             gpu_tone_maps: Vec::new(),
             budget: None,
+            gpus: Vec::new(),
+            other_gpus: Vec::new(),
+            gpu_notes: Vec::new(),
+            routes: Vec::new(),
         };
         assert_eq!(gpu_tone_maps(&t), "none");
         t.gpu_tone_maps = vec![
@@ -938,6 +1001,10 @@ mod tests {
             gpu_overlay: false,
             gpu_tone_maps: Vec::new(),
             budget: None,
+            gpus: Vec::new(),
+            other_gpus: Vec::new(),
+            gpu_notes: Vec::new(),
+            routes: Vec::new(),
         };
         assert_eq!(gpu_filters(&t), "off");
         t.gpu_filters = true;

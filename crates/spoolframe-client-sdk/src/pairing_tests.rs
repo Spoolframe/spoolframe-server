@@ -631,3 +631,130 @@ async fn a_refused_pairing_is_logged_once_without_the_code() {
     })
     .await;
 }
+
+/// Keep server `endpoint` (with server id `server_id`, at `addr`,
+/// `verified` or not) on `storage`, and a session on it signed in as
+/// portable identity `id` if `Some`.
+async fn saved_with_session(
+    storage: &MemoryStorage,
+    endpoint: &str,
+    server_id: &str,
+    addr: &str,
+    verified: bool,
+    id: Option<PortableUserId>,
+) {
+    let mut saved = crate::servers::load(storage).await.unwrap();
+    saved.push(crate::servers::SavedServer::pinned_now(
+        "Home Media".into(),
+        endpoint.into(),
+        server_id.into(),
+        vec![addr.parse().unwrap()],
+        verified,
+    ));
+    crate::servers::save(storage, &saved).await.unwrap();
+    let server: EndpointId = endpoint.parse().unwrap();
+    crate::session::save(
+        storage,
+        &server,
+        &[crate::session::StoredSession {
+            token: Some("t".into()),
+            username: "u".into(),
+            display_name: "U".into(),
+            method: Some(crate::session::SignInMethod::Portable),
+            portable: id,
+        }],
+    )
+    .await
+    .unwrap();
+}
+
+/// P7-06: the phone hands the servers it signs in to as the identity and
+/// has verified, and only those. The TV pins them unverified (the guest
+/// vouches, not its owner), leaves a pin it had exactly as it was, and
+/// leaves out one whose server id it has saved under another key.
+#[tokio::test]
+async fn the_phone_hands_the_identity_s_servers_and_the_tv_saves_them() {
+    within(async {
+        let (tv_storage, tv) = tv().await;
+        let (phone_storage, phone) = open("phone").await;
+        let (id, _) = phone.portable().create("Steve").await.unwrap();
+        let (other, _) = phone.portable().create("Someone").await.unwrap();
+        let key = |n: u8| iroh::SecretKey::from_bytes(&[n; 32]).public().to_string();
+        let (home, friend, theirs, clash, unchecked) = (key(1), key(2), key(3), key(4), key(6));
+        let phone_at = "127.0.0.1:7420";
+        saved_with_session(&phone_storage, &home, "home-id", phone_at, true, Some(id)).await;
+        saved_with_session(
+            &phone_storage,
+            &friend,
+            "friend-id",
+            phone_at,
+            true,
+            Some(id),
+        )
+        .await;
+        saved_with_session(
+            &phone_storage,
+            &theirs,
+            "theirs-id",
+            phone_at,
+            true,
+            Some(other),
+        )
+        .await;
+        saved_with_session(&phone_storage, &clash, "clash-id", phone_at, true, Some(id)).await;
+        saved_with_session(
+            &phone_storage,
+            &unchecked,
+            "unchecked-id",
+            phone_at,
+            false,
+            Some(id),
+        )
+        .await;
+        // The TV has "clash-id" saved already under another key, and
+        // friend's key saved, unverified, at another address.
+        saved_with_session(
+            &tv_storage,
+            &key(5),
+            "clash-id",
+            "10.0.0.5:7420",
+            true,
+            None,
+        )
+        .await;
+        saved_with_session(
+            &tv_storage,
+            &friend,
+            "friend-id",
+            "10.0.0.2:7420",
+            false,
+            None,
+        )
+        .await;
+
+        let paired = pair(&tv, &phone, id).await;
+        let mut handed: Vec<_> = paired
+            .servers
+            .iter()
+            .map(|s| s.endpoint_id.clone())
+            .collect();
+        handed.sort();
+        let mut expected = [home.clone(), friend.clone()];
+        expected.sort();
+        assert_eq!(handed, expected);
+        let saved = tv.servers().await.unwrap();
+        let entry = |key: &str| saved.iter().find(|s| s.endpoint_id == key).unwrap().clone();
+        let new = entry(&home);
+        assert!(new.pinned && !new.verified, "{new:?}");
+        assert!(new.addrs.contains(&phone_at.parse().unwrap()));
+        let had = entry(&friend);
+        assert!(had.pinned && !had.verified, "{had:?}");
+        assert!(!had.addrs.contains(&phone_at.parse().unwrap()), "{had:?}");
+        assert!(
+            !saved
+                .iter()
+                .any(|s| [&theirs, &clash, &unchecked].contains(&&s.endpoint_id))
+        );
+    })
+    .await;
+}

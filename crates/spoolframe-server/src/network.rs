@@ -240,7 +240,12 @@ impl Connections {
     /// Hold `connection`, if there is room: a signed-in device (`known`)
     /// always, with the normal limits; a stranger only while fewer than
     /// [`Admission::max_strangers`] are held.
-    pub(crate) fn admit(&self, connection: &Connection, known: bool) -> Option<Arc<Peer>> {
+    pub(crate) fn admit(
+        &self,
+        connection: &Connection,
+        known: bool,
+        local: bool,
+    ) -> Option<Arc<Peer>> {
         let mut peers = self.lock();
         if !known
             && peers.values().filter(|peer| !peer.known()).count() >= self.admission.max_strangers
@@ -250,6 +255,9 @@ impl Connections {
         let peer = Arc::new(Peer::new(connection));
         if known {
             peer.raise();
+        }
+        if local {
+            peer.note_local();
         }
         peers.insert(connection.stable_id(), peer.clone());
         Some(peer)
@@ -264,12 +272,21 @@ impl Connections {
         self.lock().values().any(|peer| &peer.endpoint == endpoint)
     }
 
-    /// `endpoint` signed in, as `user` when known: each of its connections
+    /// `endpoint` signed in, as `user` when known, a local user if
+    /// `local` (else a portable guest, P7-06): each of its connections
     /// gets the normal limits. Their ids.
-    pub(crate) fn signed_in(&self, endpoint: &EndpointId, user: Option<&str>) -> Vec<usize> {
+    pub(crate) fn signed_in(
+        &self,
+        endpoint: &EndpointId,
+        user: Option<&str>,
+        local: bool,
+    ) -> Vec<usize> {
         let mut raised = Vec::new();
         for (id, peer) in self.lock().iter().filter(|(_, p)| &p.endpoint == endpoint) {
             peer.raise();
+            if local {
+                peer.note_local();
+            }
             peer.note_signed_in(user);
             raised.push(*id);
         }
@@ -314,7 +331,7 @@ impl Connections {
             }
             end_signed_out_playbacks(&auth, &playbacks).await;
             for endpoint in self.known_endpoints() {
-                match store.endpoint_signed_in(&endpoint.to_string()).await {
+                match store.endpoint_has_any_session(&endpoint.to_string()).await {
                     Ok(true) => {}
                     Ok(false) => self.sign_out(&endpoint),
                     Err(e) => tracing::warn!(error = %e, "cannot check a device's sessions"),

@@ -15,6 +15,7 @@ use spoolframe_types::{
     Role, SubtitleFormat, TrackPreferences,
 };
 
+use crate::invite_admin::{CreateInvite, InviteCreated, InviteSummary};
 use crate::media::PlaybackHandle;
 use crate::passkeys::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyInfo, PasskeyRegistrationBegun,
@@ -22,13 +23,15 @@ use crate::passkeys::{
 };
 use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Quality, Selection};
 use crate::plex::PlexLink;
-use crate::portable::{PortableUserId, TieProof};
+use crate::portable::{
+    PortableIdentityState, PortableUserId, TieProof, UserDeviceCredential, signature_hex,
+};
 use crate::previews::Previews;
 use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -138,6 +141,36 @@ pub enum Request {
     /// is not signed in draws on the sign-in budget all such devices share,
     /// as `LoginPassword` does.
     RedeemInvite(RedeemInvite),
+    /// Begin signing in as a portable user with a device credential
+    /// (P7-06): `PortableSignInBegun`, a nonce for the device key to sign
+    /// over ([`crate::portable::device_proof_message`] of this server's
+    /// endpoint id and it). The nonce is this device's, for
+    /// `expires_in_secs` (5 minutes), and is used once, whatever the
+    /// finish makes of it; beginning again replaces it. Draws on the
+    /// sign-in budget all devices not signed in share.
+    BeginPortableSignIn,
+    /// Finish it (P7-06, §58): `LoggedIn`, `remembered: false`, a session
+    /// bound to this device. Local-first: where the identity is tied to an
+    /// account here (P7-04) the session is that account's, as any sign-in
+    /// to it (its PIN is asked as usual); else, where it has a grant here,
+    /// the portable user's own; else nothing. Every refusal (no grant, a
+    /// credential or proof that does not hold, a revoked key, an expired
+    /// or missing nonce, a disabled account) is `InvalidCredentials`,
+    /// counted as a failed sign-in (then `RateLimited`).
+    FinishPortableSignIn(PortableSignIn),
+    /// Redeem a `portable-account` invite (P7-05) as the portable user
+    /// `sign_in` proves, over the nonce `BeginPortableSignIn` gave: the
+    /// server grants them access (no account is made), uses one of the
+    /// invite's uses, and signs them in as `FinishPortableSignIn` does:
+    /// `LoggedIn`. Someone granted here already keeps their grant, and
+    /// the invite its use.
+    ///
+    /// The code is checked as `RedeemInvite` checks it (`InviteInvalid`,
+    /// counted as a wrong guess; `InviteExpired`; `InviteExhausted`); a
+    /// `create-user` invite's code is `WrongInviteKind`, and its use is
+    /// kept. The credential is checked as `FinishPortableSignIn` checks
+    /// it: `InvalidCredentials`, counted.
+    RedeemPortableInvite(RedeemPortableInvite),
 
     // Need a session.
     Libraries,
@@ -500,6 +533,25 @@ pub enum Request {
     /// are. Needs a recent sign-in. No tie is `NotFound`.
     Untie,
 
+    /// Make an invite (PX-44, [`crate::invite_admin`]), as the web UI's
+    /// `inviteCreate` does, with its limits: `InviteCreated`, the code
+    /// shown this once. An admin's only (`AdminRequired`), and only after
+    /// they confirmed it is them recently (`RecentSignInRequired`: confirm
+    /// with `ConfirmPassword` or a passkey, then ask again). A
+    /// `federation` invite is `InvalidInput` until P8 builds them, as are
+    /// fields out of their limits.
+    CreateInvite(CreateInvite),
+    /// The invites that can still be redeemed, newest first, made here or
+    /// in the web UI: `Invites`. An admin's only; no confirmation needed.
+    ListInvites,
+    /// Revoke invite `id`: its code stops working, and what it made stays.
+    /// `Done`. An admin's only, after a recent confirmation, as
+    /// `CreateInvite`. One that is not live (revoked, expired, used up, or
+    /// none) is `NotFound`.
+    RevokeInvite {
+        id: String,
+    },
+
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
     #[serde(other)]
@@ -522,6 +574,9 @@ impl Request {
                 | Request::TrustedProfiles
                 | Request::ResumeProfile { .. }
                 | Request::RedeemInvite(_)
+                | Request::BeginPortableSignIn
+                | Request::FinishPortableSignIn(_)
+                | Request::RedeemPortableInvite(_)
         )
     }
 }
@@ -614,6 +669,48 @@ impl fmt::Debug for RedeemInvite {
             .field("username", &self.username)
             .field("display_name", &self.display_name)
             .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The most identity states a portable sign-in carries.
+pub const MAX_SIGN_IN_STATES: usize = 2;
+
+/// A portable user's device proving itself (`FinishPortableSignIn`,
+/// P7-06): the credential their root gave the device's key, and that
+/// key's signature over this server's nonce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableSignIn {
+    pub credential: UserDeviceCredential,
+    /// The device key's signature over
+    /// [`crate::portable::device_proof_message`] of the server's endpoint
+    /// id and the nonce `BeginPortableSignIn` gave.
+    #[serde(with = "signature_hex")]
+    pub proof: ed25519_dalek::Signature,
+    /// The identity's states the device has, newest last, at most
+    /// [`MAX_SIGN_IN_STATES`]: the server takes them in before it checks
+    /// the credential (§48), so a device carries revocations to servers
+    /// it signs in to.
+    pub states: Vec<PortableIdentityState>,
+    /// What they would be called here, for a grant made with this
+    /// sign-in (P7-05's invite); a grant there already keeps its name.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub display_name: Option<String>,
+}
+
+/// A `portable-account` invite's code and the portable user redeeming it
+/// (`RedeemPortableInvite`, P7-05).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedeemPortableInvite {
+    pub code: String,
+    pub sign_in: PortableSignIn,
+}
+
+impl fmt::Debug for RedeemPortableInvite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RedeemPortableInvite")
+            .field("code", &"<redacted>")
+            .field("sign_in", &self.sign_in)
             .finish()
     }
 }
@@ -876,6 +973,20 @@ pub enum Reply {
         #[serde(with = "serde_bytes")]
         server: [u8; 32],
         expires_in_secs: u64,
+    },
+    /// What a portable user's device signs to sign in
+    /// (`BeginPortableSignIn`, P7-06).
+    PortableSignInBegun {
+        /// Used once, for `expires_in_secs`, by this device.
+        #[serde(with = "serde_bytes")]
+        nonce: [u8; 32],
+        expires_in_secs: u64,
+    },
+    /// A new invite, with its code (`CreateInvite`, PX-44).
+    InviteCreated(InviteCreated),
+    /// The invites that can still be redeemed (`ListInvites`, PX-44).
+    Invites {
+        invites: Vec<InviteSummary>,
     },
 }
 
@@ -1194,6 +1305,13 @@ pub enum Error {
     /// in and the rest work.
     #[error("this server is not set up yet")]
     NotSetUp,
+    /// The invite's code is right, and it is of another kind than the
+    /// request redeems (P7-05): a `portable-account` invite's code to
+    /// `RedeemInvite`, or a `create-user` one's to
+    /// `RedeemPortableInvite`. Nothing was made and the invite keeps its
+    /// use: redeem it the other way.
+    #[error("that invite is of another kind")]
+    WrongInviteKind,
     /// `RedeemInvite` with a code that is no invite's, or whose invite
     /// was revoked (P6-01). Counted as a wrong guess. Offer "Save server
     /// only", which pins the server as a link without a code does.
@@ -1224,6 +1342,16 @@ pub enum Error {
     /// tie first. Nothing was changed.
     #[error("that portable identity is tied to another account here")]
     PortableIdTaken,
+    /// The session is a portable user's (P7-06), and this is for an
+    /// account here only: its password, PIN, passkeys, devices, sessions,
+    /// ties, approving sign-ins. Hide what asks for it while signed in as
+    /// one. Nothing was changed.
+    #[error("not for a guest from another identity")]
+    NotForPortableUsers,
+    /// The request is an admin's (PX-44: making and revoking invites),
+    /// and the session user is not one. Nothing was changed.
+    #[error("only an admin can do that")]
+    AdminRequired,
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.
@@ -1268,7 +1396,7 @@ pub enum Event {
 /// `[2001:db8::1]:4433`). CBOR is not a human-readable format to serde, so
 /// a bare `SocketAddr` would go as serde's enum of byte tuples, which a
 /// peer outside Rust would have to copy; text is also what JSON shows.
-mod socket_addrs_as_text {
+pub(crate) mod socket_addrs_as_text {
     use std::net::SocketAddr;
 
     use serde::de::Error as _;

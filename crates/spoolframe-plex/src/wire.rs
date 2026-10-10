@@ -7,6 +7,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
+use spoolframe_types::CalendarDate;
 
 /// A field read only for an admin's look at an item (P3-16): one Plex
 /// sends in another shape is left out rather than failing the item.
@@ -123,6 +124,11 @@ pub struct Metadata {
     pub kind: String,
     pub title: String,
     pub year: Option<u16>,
+    /// The day it was first released or aired, `YYYY-MM-DD`; on
+    /// episodes, in listings too. A date in another shape is left out
+    /// rather than losing the item.
+    #[serde(default, deserialize_with = "lenient")]
+    pub originally_available_at: Option<CalendarDate>,
     pub summary: Option<String>,
     /// The age rating: `R`, `TV-MA`. Plex sends it on movies, shows and
     /// episodes, in listings too.

@@ -69,8 +69,9 @@ pub(crate) fn reservation(request: &Request) -> usize {
 ///
 /// - sign-ins a stranger makes only with a token from the bucket all
 ///   strangers share (`LoginPassword`, `Begin`/`FinishPasskeySignIn`,
-///   `RedeemInvite`),
-///   which the bucket's rate keeps from filling theirs;
+///   `RedeemInvite`, `Begin`/`FinishPortableSignIn`,
+///   `RedeemPortableInvite`), which the bucket's
+///   rate keeps from filling theirs;
 /// - requests that draw on no rate limit (`BeginDeviceSignIn`,
 ///   `AwaitDeviceSignIn`, `ResumeProfile`), held by what they wait on: a
 ///   device's few pending sign-ins, each waited on once at a time
@@ -105,7 +106,10 @@ impl Pools {
             Request::LoginPassword(_)
             | Request::BeginPasskeySignIn { .. }
             | Request::FinishPasskeySignIn { .. }
-            | Request::RedeemInvite(_) => (&self.sign_in, true),
+            | Request::RedeemInvite(_)
+            | Request::BeginPortableSignIn
+            | Request::FinishPortableSignIn(_)
+            | Request::RedeemPortableInvite(_) => (&self.sign_in, true),
             Request::BeginDeviceSignIn { .. }
             | Request::AwaitDeviceSignIn { .. }
             | Request::ResumeProfile { .. } => (&self.device, true),

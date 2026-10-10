@@ -1094,6 +1094,76 @@ impl Auth {
             .await
     }
 
+    /// Whose endpoint session token is, used from `endpoint_id`, if it
+    /// is live there: a local user's ([`Auth::endpoint_session`]) or a
+    /// granted portable user's (P7-06). Renews the session.
+    pub async fn endpoint_who(
+        &self,
+        token: &str,
+        endpoint_id: &str,
+    ) -> Result<Option<crate::principal::Who>, StoreError> {
+        use crate::principal::Who;
+        if let Some(user) = self.endpoint_session(token, endpoint_id).await? {
+            return Ok(Some(Who::Local(user)));
+        }
+        Ok(self
+            .store
+            .use_portable_session(
+                &SessionToken(token.to_owned()).hash(),
+                endpoint_id,
+                ENDPOINT_SESSION.as_secs() as i64,
+            )
+            .await?
+            .map(Who::Portable))
+    }
+
+    /// Open a session for granted portable user `credential.user` (P7-06)
+    /// on `endpoint_id`, as an endpoint session is (same lifetime, renewed
+    /// on use), never past `credential`'s expiry.
+    pub async fn open_portable_session(
+        &self,
+        credential: &crate::store::grants::CredentialBinding,
+        endpoint_id: &str,
+        device_name: Option<&str>,
+        platform: spoolframe_types::Platform,
+    ) -> Result<SessionToken, StoreError> {
+        let token = SessionToken::generate();
+        self.store
+            .create_portable_session(
+                &token.hash(),
+                credential,
+                endpoint_id,
+                device_name,
+                platform,
+                self.store.now() + ENDPOINT_SESSION.as_secs() as i64,
+            )
+            .await?;
+        Ok(token)
+    }
+
+    /// Open a session for `user`, whose account is tied to the portable
+    /// identity `credential` names, signed in with it (P7-06): as
+    /// [`Auth::open_session`], but never past the credential's expiry,
+    /// revoked with its key, and not a recent sign-in.
+    pub async fn open_credential_session(
+        &self,
+        user: LocalUserId,
+        binding: &SessionBinding,
+        credential: &crate::store::grants::CredentialBinding,
+    ) -> Result<SessionToken, StoreError> {
+        let token = SessionToken::generate();
+        self.store
+            .create_credential_session(
+                &token.hash(),
+                user,
+                binding,
+                self.store.now() + ENDPOINT_SESSION.as_secs() as i64,
+                credential,
+            )
+            .await?;
+        Ok(token)
+    }
+
     pub async fn logout(&self, token: &str) -> Result<(), StoreError> {
         self.store
             .revoke_session(&SessionToken(token.to_owned()).hash())

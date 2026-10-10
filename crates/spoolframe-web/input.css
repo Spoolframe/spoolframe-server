@@ -3361,6 +3361,50 @@
   .ov-playing:hover b {
     color: var(--ctp-teal);
   }
+  /* The Overview's GPUs (PGPU-05): a card each, side by side where they
+     fit, each a few labelled lines; then where conversions run, a table
+     whose cells name the card over what it does there. */
+  .ov-gpus {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+    gap: 12px;
+  }
+  .ov-gpu {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 12px 14px;
+    border: 1px solid var(--ctp-surface0);
+    border-radius: 12px;
+    background: var(--ctp-base);
+    font-size: 14px;
+    min-width: 0;
+  }
+  .ov-gpu .mono-value {
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+  .ov-gpu dl {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 2px 10px;
+    margin: 6px 0 0;
+    font-size: 13px;
+  }
+  .ov-gpu dt {
+    color: var(--ctp-subtext0);
+  }
+  .ov-gpu dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .ov-routes td {
+    vertical-align: top;
+  }
+  .ov-routes td:first-child {
+    white-space: nowrap;
+    color: var(--ctp-subtext1);
+  }
   .act-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));

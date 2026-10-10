@@ -2038,6 +2038,8 @@ mod tests {
             title: "Woe's Hollow".into(),
             summary: None,
             content_rating: None,
+            year: None,
+            air_date: None,
             duration: Some(Duration::from_secs(3000)),
             artwork: Vec::new(),
             playback: Default::default(),

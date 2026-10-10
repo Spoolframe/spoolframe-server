@@ -193,6 +193,8 @@ pub mod error_code {
     /// Not an invite that can still make an account (P6-01): unknown,
     /// revoked, expired or used up.
     pub const NO_SUCH_INVITE: i32 = -32025;
+    /// Not a portable user with a grant here (P7-06).
+    pub const NO_SUCH_GRANT: i32 = -32026;
 }
 
 /// Invites (P6-01): what an admin makes and sees of them.
@@ -221,9 +223,11 @@ pub mod invite {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InviteKind {
-    /// Makes an account on this server. The only kind made so far.
+    /// Makes an account on this server.
     CreateUser,
-    /// Moves an account here from another server: refused until P7-05.
+    /// Grants a portable identity access here (P7-05): its holder watches
+    /// as themselves, signed in from their own phone, and no account is
+    /// made. Its role is always the consumer's.
     PortableAccount,
     /// Pairs another server with this one: refused until P8.
     Federation,
@@ -447,6 +451,29 @@ pub struct PortableTie {
     pub fingerprint: String,
     /// Unix seconds.
     pub tied_at: i64,
+}
+
+/// A portable user granted access here (P7-06): someone whose account
+/// this server does not host, who watches as themselves. Not a user: the
+/// users list never shows them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortableGrant {
+    /// The `PortableUserId`: 64 lowercase hex digits. What `grantRevoke`
+    /// takes.
+    pub id: String,
+    /// The short code to compare with their phone's.
+    pub fingerprint: String,
+    /// What they asked to be called; `None`: show the fingerprint.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub display_name: Option<String>,
+    /// Unix seconds.
+    pub granted_at: i64,
+    /// The invite that made it (P7-05), as `inviteList` names invites.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub invite_id: Option<String>,
+    /// Their sessions live now.
+    pub live_sessions: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1016,6 +1043,165 @@ pub struct TranscodingStatus {
     /// conversions.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub budget: Option<EncodeBudget>,
+    /// The GPUs encodes run on (PGPU-05), in the order jobs try them:
+    /// what the server's start lines say of each, for the Overview.
+    pub gpus: Vec<GpuCard>,
+    /// The host's other GPUs, and why none of their work goes there.
+    pub other_gpus: Vec<OtherGpu>,
+    /// Entries of `transcode.gpus` that took no card, as the log says
+    /// them: `transcode.gpus entry 2 (nvenc device=1) names a GPU that is
+    /// not here`.
+    pub gpu_notes: Vec<String>,
+    /// Where typical conversions would run now, as the jobs pick
+    /// (PGPU-02, PGPU-05), each card as if it had room.
+    pub routes: Vec<GpuRoute>,
+}
+
+/// A GPU the server encodes on (PGPU-05).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuCard {
+    /// `transcode`'s key for it, `vaapi:0000:03:00.0`: what a
+    /// [`GpuRoute`] names.
+    pub key: String,
+    /// The driver's name for it: `AMD Radeon RX 7900 XTX`.
+    pub name: String,
+    pub api: GpuApi,
+    /// Its render node, or for NVIDIA its CUDA index, with the PCI
+    /// address: `/dev/dri/by-path/pci-0000:03:00.0-render`,
+    /// `cuda:0 (0000:01:00.0)`.
+    pub place: String,
+    pub kind: GpuKind,
+    /// How `kind` was known: `amdgpu fusion flag: not an APU`.
+    pub classified: String,
+    /// The entry that took it: `transcode.gpus entry 2 (vaapi pick=all)`.
+    pub entry: String,
+    /// GPU video encodes on it now, and at most.
+    pub jobs: u32,
+    pub max_jobs: u32,
+    /// The limit is its entry's `max_jobs`, not `transcode.max_gpu_jobs`.
+    pub own_limit: bool,
+    /// ffmpeg's encoders on it: `hevc_vaapi`.
+    pub encodes: Vec<String>,
+    /// What it decodes: `hevc 10-bit (vaapi)`.
+    pub decodes: Vec<String>,
+    /// Its filters: `scale`, `overlay`, `tone map`.
+    pub filters: Vec<String>,
+    /// How it tone maps HDR, best first; empty when only the CPU does.
+    pub tone_maps: Vec<ToneMapper>,
+    /// What its failed tests say it lacks: `av1 encode`.
+    pub lacks: Vec<String>,
+}
+
+/// Discrete or integrated (PGPU-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GpuKind {
+    Discrete,
+    Integrated,
+}
+
+impl GpuKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Discrete => "discrete",
+            Self::Integrated => "integrated",
+        }
+    }
+}
+
+/// A GPU of the host's that encodes nothing here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtherGpu {
+    pub name: String,
+    /// `0000:6d:00.0`.
+    pub pci: String,
+    /// The kernel driver: `amdgpu`, `nvidia`.
+    pub driver: String,
+    pub kind: GpuKind,
+    pub why: OtherGpuWhy,
+}
+
+/// Why a GPU does none of the work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum OtherGpuWhy {
+    /// No entry of `transcode.gpus` takes it.
+    NoEntry,
+    /// An entry takes it, and none of its tests passed.
+    #[serde(rename_all = "camelCase")]
+    NothingWorks {
+        api: GpuApi,
+        entry: String,
+        /// The first failed test: `h264_vaapi`.
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        test: Option<String>,
+    },
+}
+
+/// A typical conversion (PGPU-02), for the Overview's routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RouteJob {
+    /// A 1080p 8-bit source of `source`'s codec, scaled to 720p.
+    Convert,
+    /// A 4K HDR10 source, tone mapped to 1080p SDR.
+    ToneMap,
+    /// A 1080p source with picture subtitles burned in.
+    BurnIn,
+}
+
+/// Where a conversion runs: on which card, and what of it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RouteShare {
+    /// Decoded, filtered and encoded on the GPU: nothing on the CPU.
+    Whole,
+    /// Decoded and encoded on the GPU; a filter on the CPU.
+    DecodeAndEncode,
+    /// Encoded on the GPU from what the CPU decoded.
+    EncodeOnly,
+    /// Encoded in software from what the GPU decoded.
+    DecodeOnly,
+    /// All in software.
+    Cpu,
+    /// Nothing here encodes the codec: never planned.
+    None,
+}
+
+impl RouteShare {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Whole => "all on GPU",
+            Self::DecodeAndEncode => "decode + encode",
+            Self::EncodeOnly => "encode only",
+            Self::DecodeOnly => "decode only",
+            Self::Cpu => "CPU",
+            Self::None => "not offered",
+        }
+    }
+}
+
+/// One cell of the routes: `job` of a `source` video to `target`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuRoute {
+    pub job: RouteJob,
+    /// The protocol's codec names: `h264`, `hevc`, `av1`.
+    pub source: String,
+    pub target: String,
+    /// A [`GpuCard::key`]; `None` for one on the CPU alone.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub gpu: Option<String>,
+    pub share: RouteShare,
+    pub decoder: VideoDecoder,
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub encoder: Option<VideoEncoderUsed>,
+    pub tone_map: FilterPlace,
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub tone_mapper: Option<ToneMapper>,
+    pub burn_in: FilterPlace,
 }
 
 /// The encode budget (`transcode.max_jobs`) and the caps beside it, now.
@@ -3363,9 +3549,9 @@ pub trait AdminApi {
     /// Make an invite (P6-01): its code, shown this once, and its link.
     /// Needs a recent sign-in: the code makes an account
     /// (`RECENT_SIGN_IN_REQUIRED`). `INVALID_INPUT`, saying why, for a
-    /// kind this server does not make yet (`portable-account` and
-    /// `federation` arrive with P7 and P8), or a note, a number of uses or
-    /// a time that is out of range. `NOT_CONFIGURED` while the endpoint
+    /// kind this server does not make yet (`federation` arrives with P8),
+    /// a `portable-account` invite with a role other than consumer, or a
+    /// note, a number of uses or a time that is out of range. `NOT_CONFIGURED` while the endpoint
     /// is starting: the link needs its key.
     #[method(name = "inviteCreate", with_extensions)]
     async fn invite_create(&self, invite: NewInvite) -> jsonrpsee::core::RpcResult<InviteCreated>;
@@ -3386,6 +3572,17 @@ pub trait AdminApi {
     /// expires. `NOT_CONFIGURED` while the endpoint is starting.
     #[method(name = "inviteLink", with_extensions)]
     async fn invite_link(&self) -> jsonrpsee::core::RpcResult<String>;
+
+    /// The portable users granted access here (P7-06), oldest first.
+    #[method(name = "grantList", with_extensions)]
+    async fn grant_list(&self) -> jsonrpsee::core::RpcResult<Vec<PortableGrant>>;
+
+    /// Take portable user `id`'s grant away (P7-06): their sessions end
+    /// at once, and only an invite brings them back. Their watch state
+    /// stays, for if they do. Needs a recent sign-in. `NO_SUCH_GRANT` for
+    /// one with no grant.
+    #[method(name = "grantRevoke", with_extensions)]
+    async fn grant_revoke(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
 
     /// The plan the server would make for item `id` on `request`'s
     /// device, exactly as `PlaybackPlan` would answer it (P3-15).
@@ -3525,6 +3722,52 @@ mod required_field_tests {
         }
     }
 
+    /// The Overview's GPUs (PGPU-05): a server and a web UI that
+    /// disagree about them fail on the call.
+    #[test]
+    fn gpu_cards_and_routes() {
+        assert_each_required(
+            &TranscodingStatus {
+                video_encoders: Vec::new(),
+                audio_encoders: Vec::new(),
+                hardware_decoders: Vec::new(),
+                gpu_filters: false,
+                gpu_tonemap: false,
+                gpu_overlay: false,
+                gpu_tone_maps: Vec::new(),
+                budget: None,
+                gpus: Vec::new(),
+                other_gpus: Vec::new(),
+                gpu_notes: Vec::new(),
+                routes: Vec::new(),
+            },
+            &["budget", "gpus", "otherGpus", "gpuNotes", "routes"],
+        );
+        assert_each_required(
+            &GpuRoute {
+                job: RouteJob::Convert,
+                source: "hevc".into(),
+                target: "h264".into(),
+                gpu: None,
+                share: RouteShare::Cpu,
+                decoder: VideoDecoder::Software,
+                encoder: None,
+                tone_map: FilterPlace::None,
+                tone_mapper: None,
+                burn_in: FilterPlace::None,
+            },
+            &["gpu", "share", "encoder", "toneMapper"],
+        );
+        assert_each_required(
+            &OtherGpuWhy::NothingWorks {
+                api: GpuApi::Vaapi,
+                entry: "transcode.gpus entry 1 (vaapi pick=all)".into(),
+                test: None,
+            },
+            &["api", "entry", "test"],
+        );
+    }
+
     #[test]
     fn server_and_plex_status() {
         assert_each_required(
@@ -3544,6 +3787,10 @@ mod required_field_tests {
                     gpu_overlay: false,
                     gpu_tone_maps: Vec::new(),
                     budget: None,
+                    gpus: Vec::new(),
+                    other_gpus: Vec::new(),
+                    gpu_notes: Vec::new(),
+                    routes: Vec::new(),
                 },
                 mdns: false,
                 addresses: Vec::new(),

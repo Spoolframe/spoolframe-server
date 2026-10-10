@@ -2,16 +2,18 @@
 //! uses the server, how long it has run, whether Plex answers, and the
 //! libraries, from the APIs the Server pages already use. Laid out as
 //! WebAdminPhone 4 draws it at phone width (four tiles over "Playing
-//! now"), and as two columns of cards on a wide screen.
+//! now"), and as two columns of cards on a wide screen. Under them the
+//! GPUs (PGPU-05): each card encodes run on, and where typical
+//! conversions go, as the server's own pick says.
 
 use dioxus::prelude::*;
-use spoolframe_admin_api::AdminApiClient;
+use spoolframe_admin_api::{AdminApiClient, TranscodingStatus};
 
 use super::admin::{CopyButton, sleep};
 use super::{Route, icons, rpc};
 use crate::activity::uptime;
 use crate::libraries::{PathCell, down, items_line, path_cell};
-use crate::overview::playing_lines;
+use crate::overview::{card_lines, codec_label, other_why, playing_lines, route_cell, route_rows};
 
 /// How often the page asks again: what plays changes by the minute.
 const REFRESH_MS: i32 = 15_000;
@@ -28,7 +30,9 @@ pub fn AdminHome() -> Element {
             }
         });
     });
-    let status = use_resource(|| async {
+    // Read again with the rest: the GPUs' jobs change by the minute.
+    let status = use_resource(move || async move {
+        let _ = tick();
         let client = rpc::client().await?;
         client.server_status().await.map_err(rpc::error)
     });
@@ -180,6 +184,105 @@ pub fn AdminHome() -> Element {
                                 },
                             }
                         }
+                    }
+                }
+            }
+            if let Some(Ok(s)) = &*status.read() {
+                Gpus { transcoding: s.transcoding.clone() }
+            }
+        }
+    }
+}
+
+/// The GPUs (PGPU-05): each card encodes run on, with what its start
+/// line says; the host's other cards and why they do nothing; the
+/// entries that took none; and where typical conversions run now. None
+/// at all, a line: every conversion is in software.
+#[component]
+fn Gpus(transcoding: TranscodingStatus) -> Element {
+    let t = transcoding;
+    let rows = route_rows(&t.routes);
+    let targets: Vec<&str> = rows
+        .first()
+        .map(|(_, cells)| cells.iter().map(|r| codec_label(&r.target)).collect())
+        .unwrap_or_default();
+    rsx! {
+        section { class: "card",
+            div { class: "card-head",
+                icons::Chip {}
+                h2 { "GPUs" }
+                Link { class: "ml-auto text-[13px]", to: Route::Settings { tab: "playback".into() }, "Settings" }
+            }
+            div { class: "card-body",
+                if t.gpus.is_empty() {
+                    p { class: "m-0 text-sm text-ctp-subtext0", "No GPU encodes here: every conversion runs in software." }
+                }
+                div { class: "ov-gpus",
+                    for gpu in t.gpus.iter() {
+                        {
+                            let (about, lines) = card_lines(gpu);
+                            rsx! {
+                                div { key: "{gpu.key}", class: "ov-gpu",
+                                    b { "{gpu.name}" }
+                                    span { class: "row-sub", "{about}" }
+                                    span { class: "row-sub mono-value", "{gpu.place} · {gpu.classified}" }
+                                    dl {
+                                        for (label, value) in lines {
+                                            dt { "{label}" }
+                                            dd { class: if label == "Lacks" { "text-ctp-yellow" } else { "" }, "{value}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for other in t.other_gpus.iter() {
+                    div { key: "{other.pci}", class: "row",
+                        span { class: "row-what",
+                            b { "{other.name}" }
+                            span { class: "row-sub", "{other.pci} · {other.driver} · {other.kind.label()} · {other_why(other)}" }
+                        }
+                        span { class: "row-do", span { class: "state text-ctp-subtext0", "Not used" } }
+                    }
+                }
+                for note in t.gpu_notes.iter() {
+                    p { key: "{note}", class: "m-0 text-xs text-ctp-subtext0", "{note}" }
+                }
+                if !rows.is_empty() {
+                    div { class: "row-label", "Where conversions run" }
+                    div { class: "table-card",
+                        table { class: "table ov-routes",
+                            thead {
+                                tr {
+                                    th { "Source" }
+                                    for target in targets.iter() {
+                                        th { "→ {target}" }
+                                    }
+                                }
+                            }
+                            tbody {
+                                for (label, cells) in rows.iter() {
+                                    tr { key: "{label}",
+                                        td { "{label}" }
+                                        for cell in cells.iter() {
+                                            {
+                                                let (place, how) = route_cell(cell, &t.gpus);
+                                                rsx! {
+                                                    td {
+                                                        div { "{place}" }
+                                                        div { class: "text-xs text-ctp-subtext0", "{how}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    p { class: "m-0 text-xs text-ctp-subtext0",
+                        "A 1080p source to 720p, a 4K HDR10 one to 1080p SDR, a 1080p one with picture subtitles: each asked of the server's own pick, as if every card had room."
                     }
                 }
             }

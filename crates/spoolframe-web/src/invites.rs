@@ -29,7 +29,10 @@ pub struct InviteForm {
     pub uses: String,
     /// Seconds, one of [`EXPIRY_CHOICES`].
     pub expires: u64,
+    /// For an account here; a portable guest's is always a consumer's.
     pub role: Role,
+    /// An account here, or a guest with their own identity (P7-05).
+    pub kind: InviteKind,
 }
 
 impl Default for InviteForm {
@@ -39,6 +42,7 @@ impl Default for InviteForm {
             uses: invite::DEFAULT_USES.to_string(),
             expires: invite::DEFAULT_EXPIRES_SECS,
             role: Role::Consumer,
+            kind: InviteKind::CreateUser,
         }
     }
 }
@@ -60,12 +64,13 @@ pub fn new_invite(form: &InviteForm) -> Result<NewInvite, String> {
             invite::MAX_NOTE_CHARS
         ));
     }
+    let portable = form.kind == InviteKind::PortableAccount;
     Ok(NewInvite {
-        kind: InviteKind::CreateUser,
+        kind: form.kind,
         note: (!note.is_empty()).then(|| note.to_owned()),
         uses: Some(uses),
         expires: Some(form.expires),
-        role: Some(form.role),
+        role: (!portable).then_some(form.role),
     })
 }
 
@@ -271,6 +276,7 @@ mod tests {
             uses: " 4".into(),
             expires: HOUR,
             role: Role::Admin,
+            kind: InviteKind::CreateUser,
         };
         let made = new_invite(&form).unwrap();
         assert_eq!(made.note.as_deref(), Some("Mum's iPad"));
@@ -278,6 +284,19 @@ mod tests {
             (made.uses, made.expires, made.role),
             (Some(4), Some(HOUR), Some(Role::Admin))
         );
+    }
+
+    /// P7-05: a guest's invite sends no role, whatever the form held.
+    #[test]
+    fn a_portable_guest_s_invite_has_no_role() {
+        let form = InviteForm {
+            role: Role::Admin,
+            kind: InviteKind::PortableAccount,
+            ..InviteForm::default()
+        };
+        let made = new_invite(&form).unwrap();
+        assert_eq!(made.kind, InviteKind::PortableAccount);
+        assert_eq!(made.role, None);
     }
 
     #[test]

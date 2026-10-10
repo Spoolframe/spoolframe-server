@@ -30,8 +30,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use parking_lot::Mutex;
 use spoolframe_protocol::codec::{read_frame_within, write_frame};
 use spoolframe_protocol::pairing::{
-    self, CODE_LEN, CODE_TTL_SECS, DeviceFrame, LinkError, MAX_FRAME, PAIR_ALPN, PairingCode,
-    PairingLink, PhoneFrame, Refusal,
+    self, CODE_LEN, CODE_TTL_SECS, DeviceFrame, LinkError, MAX_FRAME, PAIR_ALPN, PairedServer,
+    PairingCode, PairingLink, PhoneFrame, Refusal,
 };
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
@@ -115,6 +115,15 @@ pub struct Paired {
     pub device_key: DevicePublicKey,
     /// `device_key`'s fingerprint: [`Connected::fingerprint`].
     pub fingerprint: String,
+    /// The servers the phone signs in to as `identity` (P7-06), and has
+    /// verified, saved on this device now: [`Client::sign_in_portable`] on
+    /// each. Saved pinned but not verified, since the guest's phone
+    /// vouches for them and not this device's owner: a password sign-in
+    /// there shows "Not verified" as for any pin no one confirmed. A
+    /// server this device had saved already is left as it was. Empty from
+    /// a phone that has none, or is from before P7-06. One whose server
+    /// id a saved server has under another key is left out.
+    pub servers: Vec<PairedServer>,
 }
 
 /// A phone that scanned the code and named `identity`; the device made
@@ -395,9 +404,22 @@ impl Client {
             progress: watch::Sender::new(Progress::default()),
         });
         let progress = shared.progress.subscribe();
+        let client = self.clone();
         let task = tokio::spawn(async move {
-            let outcome = serve(endpoint, shared.clone()).await;
+            let mut outcome = serve(endpoint, shared.clone()).await;
             drop(listening);
+            // The servers the phone handed, saved before the app hears it
+            // paired: it signs in to them next. The guest is paired
+            // whether or not they could be.
+            if let Ok(paired) = &mut outcome {
+                let handed = std::mem::take(&mut paired.servers);
+                match client.save_paired_servers(handed).await {
+                    Ok(saved) => paired.servers = saved,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not save the servers a pairing handed")
+                    }
+                }
+            }
             match &outcome {
                 Ok(paired) => tracing::info!(identity = %paired.identity, "paired a guest"),
                 Err(e) => tracing::info!(error = %e, "a pairing ended without a guest"),
@@ -499,6 +521,7 @@ impl Client {
                     device_key,
                     device_name: name,
                     portable,
+                    client: self.clone(),
                     streams: tokio::sync::Mutex::new(Some(Streams { conn, send, recv })),
                 })
             }
@@ -539,6 +562,8 @@ pub struct PairingOffer {
     device_key: DevicePublicKey,
     device_name: String,
     portable: Portable,
+    /// What knows the servers the identity signs in to.
+    client: Client,
     streams: tokio::sync::Mutex<Option<Streams>>,
 }
 
@@ -578,9 +603,11 @@ impl PairingOffer {
     /// Authorize the device: the root signs a credential for its key,
     /// recorded as `label` ([`crate::Portable::issued`]; the device's
     /// name if `None`), and the device installs it with the identity's
-    /// newest state. Done once the device says so. Refused, with nothing
-    /// sent, if this device no longer holds the root
-    /// ([`PairingError::NoRoot`]). Once only.
+    /// newest state. With them go the servers this phone signs in to as
+    /// the identity (P7-06), for the device to save and sign in to. Done
+    /// once the device says so. Refused, with nothing sent, if this
+    /// device no longer holds the root ([`PairingError::NoRoot`]). Once
+    /// only.
     pub async fn authorize(&self, label: Option<&str>) -> Result<(), SdkError> {
         let Some(Streams {
             conn,
@@ -606,12 +633,14 @@ impl PairingOffer {
             }
         };
         let state = self.portable.identity_state(self.identity).await?;
+        let servers = self.client.paired_servers(self.identity).await?;
         let cut = |e: String| SdkError::from(PairingError::Aborted(e));
         write_frame(
             &mut send,
             &PhoneFrame::Credential {
                 credential: Box::new(credential),
                 state,
+                servers,
             },
         )
         .await
@@ -772,8 +801,12 @@ async fn pair(
         )
         .await
         .map_err(|e| (None, e))?;
-        let (credential, state) = match answer {
-            PhoneFrame::Credential { credential, state } => (*credential, state),
+        let (credential, state, servers) = match answer {
+            PhoneFrame::Credential {
+                credential,
+                state,
+                servers,
+            } => (*credential, state, servers),
             PhoneFrame::Declined => return Err((None, PairingError::Declined.into())),
             PhoneFrame::Hello { .. } => return Err(aborted("a second hello".into())),
         };
@@ -814,6 +847,7 @@ async fn pair(
             identity,
             device_key,
             fingerprint: device_key.fingerprint(),
+            servers,
         })
     }
     .await;

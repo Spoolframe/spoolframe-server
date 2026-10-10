@@ -16,6 +16,10 @@
 //! - `exp` and `role` are hints for the join form ("Joins as a consumer ·
 //!   expires Oct 14"). The server enforces its own when the code is
 //!   redeemed, and a link without them works the same.
+//! - `kind=portable-account` (P7-05): the code grants a portable identity
+//!   access (`RedeemPortableInvite`) rather than making an account. Absent,
+//!   it makes an account (`RedeemInvite`). A hint for which form to show:
+//!   the server answers the other request with `WrongInviteKind`.
 //!
 //! Values are percent-encoded where they would break the link (`&`, `=`,
 //! `#`, `%`, `+`, spaces, anything outside ASCII); `:` and `/` stay as
@@ -91,6 +95,19 @@ pub struct Invite {
     pub expires_at: Option<u64>,
     /// The role the account is made with: a hint.
     pub role: Option<Role>,
+    /// What the code does: a hint.
+    pub kind: InviteLinkKind,
+}
+
+/// What an invite link's code does, as the link says (P7-05).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InviteLinkKind {
+    /// Makes an account on the server (`RedeemInvite`): a link without
+    /// `kind`.
+    #[default]
+    CreateUser,
+    /// Grants a portable identity access (`RedeemPortableInvite`).
+    PortableAccount,
 }
 
 impl fmt::Debug for Invite {
@@ -105,6 +122,7 @@ impl fmt::Debug for Invite {
             .field("code", &self.code.as_ref().map(|_| "<redacted>"))
             .field("expires_at", &self.expires_at)
             .field("role", &self.role)
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -136,6 +154,9 @@ impl Invite {
         }
         if let Some(role) = self.role {
             add("role", role.as_str());
+        }
+        if self.kind == InviteLinkKind::PortableAccount {
+            add("kind", "portable-account");
         }
         if let Some(code) = &self.code {
             add("cap", &display_code(code));
@@ -188,6 +209,9 @@ pub fn parse_link(text: &str) -> Option<Invite> {
                     "admin" => Some(Role::Admin),
                     _ => None,
                 }
+            }
+            ("kind", Some(value)) if value == "portable-account" => {
+                invite.kind = InviteLinkKind::PortableAccount;
             }
             // A parameter a newer server added, or a hint past the limit.
             _ => {}
@@ -286,6 +310,7 @@ mod tests {
             code: Some("QW7K2MFPXR4T".into()),
             expires_at: Some(1_792_003_200),
             role: Some(Role::Consumer),
+            kind: InviteLinkKind::CreateUser,
         }
     }
 
@@ -306,6 +331,24 @@ mod tests {
         assert_eq!(parse_link(&invite().link()), Some(invite()));
     }
 
+    /// P7-05: a portable-account invite says so; one that does not is an
+    /// account's, as every link before it was.
+    #[test]
+    fn a_portable_account_link_says_its_kind_and_reads_back() {
+        let portable = Invite {
+            role: None,
+            kind: InviteLinkKind::PortableAccount,
+            ..invite()
+        };
+        let link = portable.link();
+        assert!(link.contains("&kind=portable-account&"), "{link}");
+        assert_eq!(parse_link(&link), Some(portable));
+        assert!(!invite().link().contains("kind="));
+        // A kind this build does not know is a hint it cannot read.
+        let other = invite().link().replace("&cap=", "&kind=federation&cap=");
+        assert_eq!(parse_link(&other).unwrap().kind, InviteLinkKind::CreateUser);
+    }
+
     #[test]
     fn every_hint_reads_back_however_many_and_whatever_they_hold() {
         let invite = Invite {
@@ -324,6 +367,7 @@ mod tests {
             code: None,
             expires_at: None,
             role: Some(Role::Admin),
+            kind: InviteLinkKind::PortableAccount,
         };
         assert_eq!(parse_link(&invite.link()), Some(invite));
     }

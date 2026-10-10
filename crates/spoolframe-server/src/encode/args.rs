@@ -1422,6 +1422,7 @@ mod tests {
                 frame_rate_millis: Some(23_976),
                 bit_depth: 10,
                 hdr: Some(HdrFormat::Hdr10),
+                bit_rate: None,
             }),
             audio: vec![AudioStream {
                 index: 1,

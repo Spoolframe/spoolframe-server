@@ -237,6 +237,8 @@ mod tests {
             title: "Pilot".into(),
             summary: None,
             content_rating: None,
+            year: None,
+            air_date: None,
             duration: None,
             artwork: vec![Artwork {
                 id: "plex:/library/metadata/3/thumb/9".parse().unwrap(),

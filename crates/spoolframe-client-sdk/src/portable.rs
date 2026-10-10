@@ -569,6 +569,49 @@ impl Portable {
         Ok(load_credentials(self.storage.as_ref()).await?.remove(&id))
     }
 
+    /// This device's credential for identity `id`, whose root it holds
+    /// (P7-06): the phone signs one for its own key, as it signs a TV's,
+    /// to sign in to servers and redeem invites as `id` with the proof
+    /// any device gives. The one it has is kept while it holds for
+    /// [`OWN_CREDENTIAL_RENEW`] more; else a new one is issued (recorded
+    /// as "This device" in [`Portable::issued`]) and installed. Without
+    /// the root, the credential this device was given, if it still holds.
+    pub async fn own_credential(
+        &self,
+        id: PortableUserId,
+    ) -> Result<UserDeviceCredential, SdkError> {
+        self.own_credential_at(id, unix_now()).await
+    }
+
+    async fn own_credential_at(
+        &self,
+        id: PortableUserId,
+        now: i64,
+    ) -> Result<UserDeviceCredential, SdkError> {
+        let key = self.device_key(id).await?;
+        let current = self
+            .credential(id)
+            .await?
+            .filter(|c| c.device_key == key && c.verify(now).is_ok());
+        if let Some(credential) = &current
+            && credential.expires_at - now > OWN_CREDENTIAL_RENEW
+        {
+            return Ok(credential.clone());
+        }
+        match self
+            .issue_credential_at(id, key, Some(OWN_DEVICE_LABEL), now)
+            .await
+        {
+            Ok(credential) => {
+                self.install_credential_at(credential.clone(), now).await?;
+                Ok(credential)
+            }
+            // Not the root's phone: what it was given, while it holds.
+            Err(SdkError::UnknownIdentity(_)) if current.is_some() => Ok(current.expect("checked")),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Take in `state`, a state another device brought: its revocations
     /// join the ones here whatever its revision (revocation only grows),
     /// and it is kept as the newest, to carry on to servers, if its
@@ -952,6 +995,13 @@ async fn save_issued(
 }
 
 /// Unix seconds now, as credentials count them.
+/// How long before its own credential expires a root's phone signs
+/// itself a new one ([`Portable::own_credential`]): 30 days.
+pub const OWN_CREDENTIAL_RENEW: i64 = 30 * 24 * 3600;
+
+/// What [`Portable::issued`] calls the root's phone's own credential.
+pub const OWN_DEVICE_LABEL: &str = "This device";
+
 fn unix_now() -> i64 {
     i64::try_from(now()).unwrap_or(i64::MAX)
 }
@@ -1921,5 +1971,36 @@ mod tests {
                 .unwrap_err(),
             SdkError::UnknownIdentity(id.to_string())
         );
+    }
+
+    /// P7-06: the root's phone signs its own key a credential, keeps it
+    /// while it holds for long, and renews it near its end.
+    #[tokio::test]
+    async fn the_root_s_phone_signs_itself_a_credential_and_renews_it_late() {
+        let (phone, id) = phone().await;
+        let first = phone.own_credential_at(id, T).await.unwrap();
+        assert_eq!(first.device_key, phone.device_key(id).await.unwrap());
+        assert_eq!(phone.credential(id).await.unwrap(), Some(first.clone()));
+        assert_eq!(
+            phone.own_credential_at(id, T + 86_400).await.unwrap(),
+            first
+        );
+        let late = first.expires_at - OWN_CREDENTIAL_RENEW + 1;
+        let renewed = phone.own_credential_at(id, late).await.unwrap();
+        assert!(renewed.serial > first.serial);
+        assert_eq!(phone.credential(id).await.unwrap(), Some(renewed));
+        let issued = phone.issued(id).await.unwrap();
+        assert_eq!(issued.len(), 1);
+        assert_eq!(issued[0].label.as_deref(), Some(OWN_DEVICE_LABEL));
+    }
+
+    /// A device without the root keeps what it was given.
+    #[tokio::test]
+    async fn a_device_without_the_root_uses_the_credential_it_was_given() {
+        let (phone, id) = phone().await;
+        let tv = device_of(&phone, id).await;
+        let given = tv.credential(id).await.unwrap().unwrap();
+        let late = given.expires_at - OWN_CREDENTIAL_RENEW + 1;
+        assert_eq!(tv.own_credential_at(id, late).await.unwrap(), given);
     }
 }

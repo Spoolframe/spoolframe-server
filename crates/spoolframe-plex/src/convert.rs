@@ -6,9 +6,9 @@
 use std::time::Duration;
 
 use spoolframe_types::{
-    Album, Artist, Artwork, ArtworkId, ArtworkKind, AudioCodec, Episode, Item, Library, LibraryId,
-    LibraryKind, Marker, MarkerKind, MediaId, MediaKind, Movie, Namespace, PlaybackState, Season,
-    Show, Track,
+    Album, Artist, Artwork, ArtworkId, ArtworkKind, AudioCodec, CalendarDate, Episode, Item,
+    Library, LibraryId, LibraryKind, Marker, MarkerKind, MediaId, MediaKind, Movie, Namespace,
+    PlaybackState, Season, Show, Track,
 };
 
 use serde::Deserialize;
@@ -156,6 +156,10 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             title: m.title.clone(),
             summary: summary(m),
             content_rating: content_rating(m),
+            // Plex gives an episode a year too; where it has only the
+            // date, the year is the date's.
+            year: m.year.or(m.originally_available_at.map(CalendarDate::year)),
+            air_date: m.originally_available_at,
             duration: duration(m),
             // An episode's thumb is a still from it, not a poster; its
             // poster is its season's, else its show's.
@@ -618,6 +622,40 @@ mod tests {
         assert_eq!((ep.season, ep.episode), (1, 1));
         assert_eq!(ep.title, "Splinter");
         assert_eq!(ep.artwork[0].kind, ArtworkKind::Thumb);
+    }
+
+    #[test]
+    fn an_episode_carries_the_day_it_aired_and_its_year() {
+        let Item::Episode(ep) = only_item("metadata-episode") else {
+            panic!("not an episode")
+        };
+        assert_eq!(ep.air_date, CalendarDate::new(2015, 1, 16));
+        assert_eq!(ep.year, Some(2015));
+    }
+
+    #[test]
+    fn an_episode_with_only_an_air_date_takes_its_year() {
+        let mut m = fixture("metadata-episode").metadata.remove(0);
+        m.year = None;
+        let Item::Episode(ep) = item(&m).unwrap() else {
+            panic!("not an episode")
+        };
+        assert_eq!(ep.year, Some(2015));
+    }
+
+    #[test]
+    fn an_air_date_in_another_shape_is_left_out_not_an_error() {
+        let text = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/metadata-episode.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("\"2015-01-16\"", "\"16/01/2015\"");
+        let mut c = serde_json::from_str::<Envelope>(&text).unwrap().container;
+        let Item::Episode(ep) = item(&c.metadata.remove(0)).unwrap() else {
+            panic!("not an episode")
+        };
+        assert_eq!((ep.air_date, ep.year), (None, Some(2015)));
     }
 
     #[test]

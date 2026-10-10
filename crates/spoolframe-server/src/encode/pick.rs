@@ -11,9 +11,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use spoolframe_media::MediaDescriptor;
 use spoolframe_media::encoders::{Encoders, VideoEncoder};
-use spoolframe_protocol::{ConvertedSubtitle, ConvertedVideo};
+use spoolframe_media::{
+    MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, VideoStream,
+};
+use spoolframe_protocol::{ConvertedSubtitle, ConvertedVideo, SubtitleAction};
+use spoolframe_types::{HdrFormat, SubtitleFormat, SubtitleRole, VideoCodec};
 
 use super::args::{self, EncodeSpec, Share};
 use crate::transcode::{Detected, Gpu};
@@ -101,6 +104,151 @@ pub fn planned_encoder(
         None => &detected.software,
     };
     args::planned_encoder(encoders, descriptor, video, subtitle, gpu_filters)
+}
+
+/// A typical conversion, for the Overview's routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteJob {
+    /// A 1080p 8-bit SDR source scaled to 720p.
+    Convert,
+    /// A 4K HDR10 source tone mapped to 1080p SDR.
+    ToneMap,
+    /// A 1080p source with picture subtitles burned in.
+    BurnIn,
+}
+
+/// Where `job` of a `source` video to `target` runs now: the card
+/// [`choose`] picks (as if every card had room), how much of the job it
+/// does, and what [`args::made`] says each part runs on there.
+#[derive(Debug, Clone)]
+pub struct Route {
+    pub job: RouteJob,
+    pub source: VideoCodec,
+    pub target: VideoCodec,
+    pub gpu: Option<Arc<Gpu>>,
+    /// `None` for a software encode, or a codec nothing here encodes
+    /// (`made.encoder` is then `None`).
+    pub share: Option<Share>,
+    pub made: args::Made,
+}
+
+/// The routes the Overview shows: H.264, HEVC and AV1 sources each
+/// converted to H.264, HEVC and AV1; an HDR10 HEVC film tone mapped to
+/// each; and an H.264 film with picture subtitles burned in to each.
+/// Each asked of the jobs' own pick ([`choose`], [`args::share`],
+/// [`args::made`]) with the server's GPU filters and tone map setting, so
+/// the table cannot say other than what a job would do.
+pub fn routes(
+    detected: &Detected,
+    gpu_filters: bool,
+    tone_map: spoolframe_media::encoders::ToneMapSetting,
+) -> Vec<Route> {
+    use VideoCodec::{Av1, H264, Hevc};
+    let cases = [
+        (RouteJob::Convert, H264),
+        (RouteJob::Convert, Hevc),
+        (RouteJob::Convert, Av1),
+        (RouteJob::ToneMap, Hevc),
+        (RouteJob::BurnIn, H264),
+    ];
+    let mut routes = Vec::new();
+    for (job, source) in cases {
+        let descriptor = sample(job, source);
+        for target in [H264, Hevc, Av1] {
+            let (height, tone_map_video, subtitle) = match job {
+                RouteJob::Convert => (720, false, None),
+                RouteJob::ToneMap => (1080, true, None),
+                RouteJob::BurnIn => (
+                    1080,
+                    false,
+                    Some(ConvertedSubtitle {
+                        index: 0,
+                        action: SubtitleAction::BurnIn {
+                            format: SubtitleFormat::Pgs,
+                        },
+                    }),
+                ),
+            };
+            let probe = EncodeSpec {
+                input: Path::new(""),
+                sidecar: None,
+                descriptor: &descriptor,
+                video: Some(ConvertedVideo::Encode {
+                    codec: target,
+                    height,
+                    max_bitrate: None,
+                    tone_map: tone_map_video,
+                }),
+                audio: None,
+                subtitle,
+                encoders: &detected.software,
+                vaapi_device: Path::new(""),
+                hardware_decode: true,
+                gpu_filters,
+                tone_map,
+                start: None,
+                output: args::Output::Progressive {
+                    file: PathBuf::new(),
+                },
+            };
+            let gpu = choose(&probe, &detected.gpus, &|_| true).cloned();
+            let node = gpu.as_ref().map(|g| g.vaapi_device()).unwrap_or_default();
+            let spec = match &gpu {
+                Some(gpu) => on_card(&probe, gpu, &node),
+                None => probe.clone(),
+            };
+            routes.push(Route {
+                job,
+                source,
+                target,
+                share: args::share(&spec),
+                made: args::made(&spec),
+                gpu,
+            });
+        }
+    }
+    routes
+}
+
+/// The source [`routes`] asks about for `job`: `codec` video, 1080p 8-bit
+/// SDR, or 4K 10-bit HDR10 to tone map; with a PGS track to burn in.
+fn sample(job: RouteJob, codec: VideoCodec) -> MediaDescriptor {
+    let hdr = job == RouteJob::ToneMap;
+    let (width, height) = if hdr { (3840, 2160) } else { (1920, 1080) };
+    let subtitles = match job {
+        RouteJob::BurnIn => vec![SubtitleStream {
+            source: SubtitleSource::Embedded { index: 2 },
+            codec: "hdmv_pgs_subtitle".into(),
+            kind: SubtitleKind::Bitmap,
+            language: None,
+            title: None,
+            forced: false,
+            default: false,
+            role: SubtitleRole::Full,
+        }],
+        RouteJob::Convert | RouteJob::ToneMap => Vec::new(),
+    };
+    MediaDescriptor {
+        container: "matroska,webm".into(),
+        duration: Some(std::time::Duration::from_secs(3600)),
+        bit_rate: None,
+        video: Some(VideoStream {
+            index: 0,
+            codec: codec.as_str().into(),
+            profile: None,
+            level: None,
+            width,
+            height,
+            pixel_format: Some(if hdr { "yuv420p10le" } else { "yuv420p" }.into()),
+            color_transfer: hdr.then(|| "smpte2084".into()),
+            frame_rate_millis: Some(23_976),
+            bit_depth: if hdr { 10 } else { 8 },
+            hdr: hdr.then_some(HdrFormat::Hdr10),
+            bit_rate: None,
+        }),
+        audio: Vec::new(),
+        subtitles,
+    }
 }
 
 /// Where a conversion's runs go: the GPU [`choose`] picked, its
@@ -201,6 +349,7 @@ mod tests {
                 frame_rate_millis: Some(24_000),
                 bit_depth: 8,
                 hdr: None,
+                bit_rate: None,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),
@@ -353,6 +502,83 @@ mod tests {
             ..spec(&h264, 1080, &software)
         };
         assert_eq!(picked(&gpus, &copy, &[]), None);
+    }
+
+    /// The Overview's routes are the jobs' own pick: an AV1 film to H.264
+    /// on the card that decodes AV1, HEVC on the first card, AV1 out
+    /// (which no card encodes) in software decoding on the first card
+    /// that decodes the source; five jobs, three targets each, in order.
+    #[test]
+    fn routes_say_what_a_job_would_pick() {
+        // SVT-AV1 in software, as a real ffmpeg has it, here and on each
+        // card's own detection.
+        let svt = VideoEncoder {
+            codec: AV1,
+            name: "libsvtav1".into(),
+            hardware: None,
+        };
+        let mut software = Encoders::software_baseline();
+        software.video.push(svt.clone());
+        let with_svt = |gpu: Arc<Gpu>, n: u8| {
+            let mut encoders = gpu.encoders().clone();
+            encoders.video.push(svt.clone());
+            Arc::new(test_gpu(
+                n,
+                gpu.card().api,
+                gpu.card().host.class.kind,
+                encoders,
+            ))
+        };
+        let gpus = vec![
+            with_svt(
+                card(
+                    1,
+                    Hardware::Nvenc,
+                    Kind::Discrete,
+                    &[H264, HEVC],
+                    &[H264, HEVC],
+                ),
+                1,
+            ),
+            with_svt(
+                card(2, Hardware::Vaapi, Kind::Integrated, &[H264], &[H264, AV1]),
+                2,
+            ),
+        ];
+        let detected = Detected {
+            encoders: Arc::new(software.clone()),
+            gpus,
+            software: Arc::new(software),
+            others: Vec::new(),
+            notes: Vec::new(),
+        };
+        let routes = routes(&detected, false, ToneMapSetting::Auto);
+        assert_eq!(routes.len(), 15);
+        let at = |job, source, target| {
+            routes
+                .iter()
+                .find(|r| r.job == job && r.source == source && r.target == target)
+                .unwrap()
+        };
+        let pci = |r: &Route| r.gpu.as_ref().map(|g| g.card().host.pci.clone());
+        let av1_h264 = at(RouteJob::Convert, AV1, H264);
+        assert_eq!(pci(av1_h264).as_deref(), Some("0000:02:00.0"));
+        assert_eq!(av1_h264.share, Some(Share::Whole));
+        let hevc_h264 = at(RouteJob::Convert, HEVC, H264);
+        assert_eq!(pci(hevc_h264).as_deref(), Some("0000:01:00.0"));
+        let h264_av1 = at(RouteJob::Convert, H264, AV1);
+        assert_eq!(pci(h264_av1).as_deref(), Some("0000:01:00.0"));
+        assert_eq!(h264_av1.share, None);
+        assert_eq!(
+            h264_av1.made.encoder.as_ref().map(|e| e.hardware),
+            Some(None),
+            "a software AV1 encode"
+        );
+        // The HDR film is tone mapped; the burn-in's pictures are drawn.
+        let hdr = at(RouteJob::ToneMap, HEVC, H264);
+        assert!(hdr.made.tone_mapper.is_some());
+        let burn = at(RouteJob::BurnIn, H264, HEVC);
+        assert_ne!(burn.made.burn_in, crate::encode::FilterOn::None);
     }
 
     /// PGPU-04 per card: an HDR film to SDR goes, under `tone_map =

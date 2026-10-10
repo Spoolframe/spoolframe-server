@@ -102,6 +102,47 @@ impl Store {
         Ok(())
     }
 
+    /// Record a session for `user` opened with a portable identity's
+    /// device credential, the account being tied to it (P7-06): expiring
+    /// at `expires_at` or when the credential does, whichever is first,
+    /// never renewed past it, and revoked with the credential's key. Its
+    /// user did not prove who they are to this server here: it counts as
+    /// signed in long ago, so what needs a recent sign-in asks them to
+    /// confirm first, as after a trusted device's resume.
+    pub async fn create_credential_session(
+        &self,
+        token_hash: &str,
+        user: LocalUserId,
+        binding: &SessionBinding,
+        expires_at: i64,
+        credential: &super::grants::CredentialBinding,
+    ) -> Result<(), StoreError> {
+        let now = self.now();
+        let mut tx = self.pool.begin().await?;
+        Self::insert_session(
+            &mut tx,
+            token_hash,
+            user,
+            binding,
+            expires_at.min(credential.expires_at),
+            now,
+            0,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE sessions SET portable_user_id = ?2, portable_device_key = ?3, \
+               portable_expires_at = ?4 WHERE token_hash = ?1",
+        )
+        .bind(token_hash)
+        .bind(credential.user.to_string())
+        .bind(credential.device_key.to_string())
+        .bind(credential.expires_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// [`Store::create_session`] inside `tx`, at `now`, its user last
     /// proving who they are at `authenticated_at`.
     pub(super) async fn insert_session(
@@ -244,11 +285,22 @@ impl Store {
         .bind(self.now())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(username, endpoint_id, live)| SessionOwner {
-            username,
-            endpoint_id,
-            live,
-        }))
+        if let Some((username, endpoint_id, live)) = row {
+            return Ok(Some(SessionOwner {
+                username,
+                endpoint_id,
+                live,
+            }));
+        }
+        // A portable user's (P7-06), named by their fingerprint.
+        Ok(self
+            .portable_session_owner(token_hash)
+            .await?
+            .map(|(user, endpoint_id, live)| SessionOwner {
+                username: format!("portable:{}", user.fingerprint()),
+                endpoint_id: Some(endpoint_id),
+                live,
+            }))
     }
 
     /// The session's user proved who they are again, now.
@@ -294,7 +346,10 @@ impl Store {
                     s.authenticated_at \
              FROM sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.token_hash = ?1 AND s.kind = 'endpoint' AND s.endpoint_id = ?2 \
-               AND s.revoked_at IS NULL AND s.expires_at > ?3 AND u.disabled_at IS NULL",
+               AND s.revoked_at IS NULL AND s.expires_at > ?3 AND u.disabled_at IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM portable_revoked_keys r \
+                               WHERE r.user_id = s.portable_user_id \
+                                 AND r.device_key = s.portable_device_key)",
         )
         .bind(token_hash)
         .bind(endpoint_id)
@@ -316,7 +371,9 @@ impl Store {
         if now - last_used_at >= RENEW_EVERY_SECS {
             let mut tx = self.pool.begin().await?;
             sqlx::query(
-                "UPDATE sessions SET last_used_at = ?2, expires_at = ?3 WHERE token_hash = ?1",
+                "UPDATE sessions SET last_used_at = ?2, \
+                   expires_at = min(?3, coalesce(portable_expires_at, ?3)) \
+                 WHERE token_hash = ?1",
             )
             .bind(token_hash)
             .bind(now)
@@ -478,6 +535,16 @@ impl Store {
         .bind(self.now())
         .execute(&mut *tx)
         .await?;
+        // Or a portable user's (P7-06): the token says which, not the
+        // caller.
+        sqlx::query(
+            "UPDATE portable_sessions SET revoked_at = ?2 \
+             WHERE token_hash = ?1 AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .bind(self.now())
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         self.note_sessions_ended();
         Ok(())
@@ -501,7 +568,9 @@ impl Store {
 
     /// Whether `endpoint_id` is a device with a live session (PX-10): one
     /// not revoked, not expired, and its user not disabled. Such a device
-    /// gets the normal connection limits; any other is a stranger.
+    /// is its owner's on the server's relay; one with only a portable
+    /// user's session ([`Store::endpoint_has_portable_session`]) is a
+    /// friend's there.
     pub async fn endpoint_signed_in(&self, endpoint_id: &str) -> Result<bool, StoreError> {
         let (live,): (bool,) = sqlx::query_as(
             "SELECT EXISTS (SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id \

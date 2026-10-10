@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.6.1 (2026-10-10)
+
+- The web UI's Overview shows the GPUs (PGPU-05): a card for each GPU
+  encodes run on, as the server's start lines say it (its API, render
+  node or CUDA index, discrete or integrated and how that was known, the
+  `transcode.gpus` entry that took it, its GPU jobs now and its limit,
+  what it encodes, decodes, filters and tone maps with, and what it
+  lacks); the host's other GPUs and why they do nothing (no entry takes
+  them, or none of their tests passed); and the entries that took no
+  card. Under them, where typical conversions run now: H.264, HEVC and
+  AV1 sources to each of H.264, HEVC and AV1, an HDR10 film tone mapped
+  to SDR, and a film with picture subtitles burned in, each cell the
+  card the jobs' own pick chooses and how much of the job it does
+  there. In the admin API, `serverStatus`'s `transcoding` gains `gpus`,
+  `otherGpus`, `gpuNotes` and `routes`.
 - P7-03, guests on a shared device: a device-local "guest sign-ins"
   setting in the SDK, off by default, and pairing by QR code. A TV
   with it on shows a code; the guest's phone scans it, shows "Authorize
@@ -14,6 +29,95 @@
   which identity is pairing, and the fingerprint to show beside the
   phone's, as soon as the phone connects (`Pairing::connected`), before
   the person authorizes.
+- P7-06, signing in with a portable identity (wire revision 14): a
+  device with a credential signs in to a server by signing the server's
+  nonce with its key (`begin_portable_sign_in`, then
+  `finish_portable_sign_in` with the credential, the proof and the
+  identity states the device has). Local-first: an identity tied to an
+  account here signs in as that account; an untied one with a grant
+  here as itself, a portable session that browses, plays and keeps
+  watch state of its own, and gets `not_for_portable_users` for what
+  only an account here has (password, PIN, passkeys, devices,
+  sessions, ties, approving sign-ins). Every refusal is
+  `invalid_credentials`, counted as a wrong guess. Grants are not
+  users: the users list never shows them; the admin API lists and
+  revokes them (`grantList`, `grantRevoke`), as do
+  `spoolframe-server grant list|revoke` and the web UI's Invites page
+  ("Guests with their own identity"). Revoking a grant ends its
+  sessions at once. A device signed in only as a portable user is a
+  friend's on the server's relay, not the owner's.
+- P7-05, inviting a portable identity: `inviteCreate` (and `invite
+  create --kind portable-account`, and the web UI's "For: A guest with
+  their own identity") makes a `portable-account` invite. Its link says
+  `kind=portable-account`. The guest's phone redeems it with its own
+  device credential (`redeem_portable_invite`): the server grants the
+  identity access, makes no account, and signs it in. A code redeemed
+  the other way is `wrong_invite_kind`, and keeps its use. `federation`
+  invites stay refused until P8.
+- The SDK side of P7-05 and P7-06: `Client::redeem_invite_portable`
+  joins a server with a guest invite as a portable identity (the root's
+  phone signs itself a credential, `Portable::own_credential`);
+  `Client::sign_in_portable` signs in with this device's credential,
+  kept as a profile (`SignInMethod::Portable`, `SavedProfile::portable`)
+  that signs in again with no password. Pairing hands the TV the
+  servers the phone signs in to as the identity (`Paired::servers`),
+  pinned on the TV before `Pairing::wait` returns. `InviteInfo::kind`
+  says which redemption a link wants; `SdkError::WrongInviteKind` and
+  `SdkError::NotForPortableUsers` are new.
+- P7-05/P7-06 after review, the server:
+  - A session a credential opened (a guest's, or a tied account's)
+    ends when the credential does, and at once when an identity state
+    revoking its key arrives; it is never renewed past the credential's
+    expiry. Its key is checked on every use too.
+  - A tied account's session opened with a credential counts as signed
+    in long ago: adding a passkey, approving a device, trusting one,
+    removing a passkey and tying or untying ask to confirm first.
+  - A revoked guest is kept as a tombstone: the invite that brought
+    them, or any made before the revocation, cannot bring them back
+    (`invite_invalid`, its use kept). The grants list shows live ones.
+  - A sign-in carries at most 2 identity states, each the credential's
+    own identity's; the credential is checked before them, and they are
+    kept only for an identity tied or granted here.
+  - A tied identity redeeming a guest invite signs in as its account;
+    no grant is made and no use taken. A redemption whose credential
+    holds is not counted as a guess whatever the code. Racing
+    redemptions of one invite no longer fail as internal errors.
+  - A guest's session gives its device the normal connection limits,
+    not a local user's standing with the strangers' sign-in budget.
+- P7-06 after review, the SDK: a phone hands a paired TV only the
+  servers it has verified; the TV pins them unverified (a password
+  sign-in there shows "Not verified"), never changes a pin it had, and
+  `sign_in_portable` works on such a pin.
+- An episode says when it first aired, for the apps' "2019": `Episode`
+  has `year` and `air_date` (`"YYYY-MM-DD"`, `spoolframe_types::
+  CalendarDate`), from Plex's `year` and `originallyAvailableAt`; with
+  only the date, the year is the date's. Both are `null` where Plex has
+  neither. Both are optional on the wire: an episode from an older
+  server, without the keys, reads as `null`, and `PROTOCOL_VERSION`
+  stays. Items come from Plex on each request, so existing libraries
+  have them at once, without a rescan. The web UI's item page shows
+  "Aired", and its Year column covers episodes.
+- A file's bit rate, for the apps' "4K · Dolby Vision · 42 Mbit/s":
+  `MediaTracks` has `bit_rate`, the whole file's average in bits per
+  second, and `VideoTrack` has `bit_rate`, the picture's alone. The
+  file's is what the container says, else its size over its length; the
+  picture's is what an MP4 says of the stream, else a Matroska muxer's
+  `BPS` tag, else `null`. Both are optional on the wire as above, and
+  `PROTOCOL_VERSION` stays. Files are probed when asked about, so
+  existing libraries have them at once, without a rescan. The
+  playback planner's bit rate check now also covers a file whose
+  container states no rate.
+- PX-44, invites made in the apps: an admin's session makes, lists
+  and revokes invites over the client protocol as the web UI's Invites
+  page does, with the same kinds, limits and store (`create_invite`,
+  `list_invites`, `revoke_invite`; `Session::create_invite`,
+  `Session::invites`, `Session::revoke_invite` in the SDK). Making and
+  revoking need a recent confirmation (`recent_sign_in_required`, then
+  `confirm_password` or a passkey); anyone but an admin is the new
+  `admin_required`. Each invite now says where it was made, the web UI,
+  the CLI or an app's device (`created_from`), and who by, with their
+  display name; those made before are the web UI's, or the CLI's.
+  Additions to wire revision 14, not a new one.
 
 ## 0.6.0 (2026-10-09)
 

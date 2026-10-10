@@ -14,15 +14,21 @@
 //! with a token (P6-08, [`holder_tier`]), guarded as a redemption is: a
 //! token that matches no live invite is a wrong guess at a code.
 
-use spoolframe_protocol::RedeemInvite;
-use spoolframe_protocol::invite::{CODE_ALPHABET, CODE_LEN, display_code, normalize_code};
+use spoolframe_protocol::invite::{
+    CODE_ALPHABET, CODE_LEN, Invite, InviteLinkKind, MAX_HINTS, display_code, normalize_code,
+};
 use spoolframe_protocol::relay_access::Tier;
+use spoolframe_protocol::{PortableUserId, RedeemInvite};
 use spoolframe_types::Role;
 
+use crate::announce::Told;
 use crate::auth::{Auth, PasswordError, hash_password};
-use crate::store::StoreError;
-use crate::store::invites::{InviteKind, InviteState, Redeemed};
+use crate::store::invites::{
+    InviteError, InviteKind, InviteOrigin, InviteRecord, InviteState, NewInvite, PortableRedeemed,
+    Redeemed,
+};
 use crate::store::users::{LocalUserId, UserError, display_name, normalize_username};
+use crate::store::{Store, StoreError};
 
 /// An invite's code, normalized (`QW7K2MFPXR4T`).
 #[derive(Clone, PartialEq, Eq)]
@@ -76,6 +82,155 @@ impl InviteCode {
     }
 }
 
+/// An invite an admin asks for (P6-01), in the web UI (`inviteCreate`) or
+/// an app (`CreateInvite`, PX-44): both make the same invites, with the
+/// same limits. Each `None` is the default: one use, 7 days, the consumer
+/// role.
+#[derive(Debug, Clone, Copy)]
+pub struct InviteRequest<'a> {
+    pub kind: InviteKind,
+    pub note: Option<&'a str>,
+    pub uses: Option<u32>,
+    /// How long it lasts from now, in seconds.
+    pub expires_secs: Option<u64>,
+    pub role: Option<Role>,
+}
+
+/// Why no invite was made.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateError {
+    /// A field out of its limits; the message says which.
+    #[error("{0}")]
+    Invalid(String),
+    /// A kind not made yet ([`InviteError::NotYet`]), or the store.
+    #[error(transparent)]
+    Invite(#[from] InviteError),
+}
+
+/// An invite just made, and its code: the code is shown this once.
+#[derive(Debug)]
+pub struct Created {
+    pub record: InviteRecord,
+    pub code: InviteCode,
+}
+
+impl Created {
+    /// The invite link: `server`'s ([`server_link`]) with the code, its
+    /// expiry, and what redeeming it does.
+    pub fn link(&self, mut server: Invite) -> String {
+        server.code = Some(self.code.as_str().to_owned());
+        server.expires_at = u64::try_from(self.record.expires_at).ok();
+        if self.record.kind == InviteKind::PortableAccount {
+            server.kind = InviteLinkKind::PortableAccount;
+        } else {
+            server.role = Some(self.record.role);
+        }
+        server.link()
+    }
+}
+
+/// Make the invite `request` asks for, as `created_by` from `origin`, once
+/// every field is within its limits.
+pub async fn create(
+    store: &Store,
+    request: InviteRequest<'_>,
+    created_by: &str,
+    origin: &InviteOrigin,
+) -> Result<Created, CreateError> {
+    use spoolframe_admin_api::invite::{
+        DEFAULT_EXPIRES_SECS, DEFAULT_USES, MAX_EXPIRES_SECS, MAX_NOTE_CHARS, MAX_USES,
+        MIN_EXPIRES_SECS,
+    };
+    if request.kind == InviteKind::Federation {
+        return Err(InviteError::NotYet(request.kind).into());
+    }
+    let uses = request.uses.unwrap_or(DEFAULT_USES);
+    if !(1..=MAX_USES).contains(&uses) {
+        return Err(CreateError::Invalid(format!(
+            "an invite makes 1 to {MAX_USES} accounts"
+        )));
+    }
+    let expires = request.expires_secs.unwrap_or(DEFAULT_EXPIRES_SECS);
+    if !(MIN_EXPIRES_SECS..=MAX_EXPIRES_SECS).contains(&expires) {
+        return Err(CreateError::Invalid(
+            "an invite lasts an hour to 30 days".into(),
+        ));
+    }
+    let role = request.role.unwrap_or(Role::Consumer);
+    if role == Role::Unknown {
+        return Err(CreateError::Invalid("use admin or consumer".into()));
+    }
+    // A portable user is no account here, and has no role but a
+    // consumer's (P7-05).
+    if request.kind == InviteKind::PortableAccount && role != Role::Consumer {
+        return Err(CreateError::Invalid(
+            "a portable-account invite grants watching only: leave the role out".into(),
+        ));
+    }
+    let note = request.note.map(str::trim).filter(|n| !n.is_empty());
+    if note.is_some_and(|n| n.chars().count() > MAX_NOTE_CHARS || n.chars().any(char::is_control)) {
+        return Err(CreateError::Invalid(format!(
+            "a note is at most {MAX_NOTE_CHARS} characters, on one line"
+        )));
+    }
+    let code = InviteCode::generate();
+    let hash = code.hash();
+    let expires_at = store.clock().unix_secs() + i64::try_from(expires).unwrap_or(i64::MAX);
+    let record = store
+        .create_invite(NewInvite {
+            kind: request.kind,
+            capability_hash: &hash,
+            role,
+            note,
+            uses,
+            expires_at,
+            created_by,
+            origin,
+        })
+        .await?;
+    tracing::info!(
+        id = %record.id,
+        kind = %record.kind,
+        %role,
+        uses,
+        by = %created_by,
+        from = origin_name(origin),
+        "invite made"
+    );
+    Ok(Created { record, code })
+}
+
+fn origin_name(origin: &InviteOrigin) -> &'static str {
+    match origin {
+        InviteOrigin::Web => "web",
+        InviteOrigin::Cli => "cli",
+        InviteOrigin::Device { .. } => "device",
+    }
+}
+
+/// What an invite link says of this server (P6-01), before a code is put
+/// in it: its key `endpoint_id`, its `name`, and the addresses and relays
+/// `told` tells a signed-in device. It reads the interfaces, off the
+/// async threads.
+pub async fn server_link(endpoint_id: String, name: String, told: Option<Told>) -> Invite {
+    let (addrs, relays, lookup) = match told {
+        Some(told) => {
+            tokio::task::spawn_blocking(move || (told.addrs(), told.relays(), told.lookup()))
+                .await
+                .unwrap_or_default()
+        }
+        None => Default::default(),
+    };
+    Invite {
+        server: endpoint_id,
+        name: Some(name),
+        addrs: addrs.into_iter().take(MAX_HINTS).collect(),
+        relays,
+        lookup,
+        ..Default::default()
+    }
+}
+
 /// Why a redemption made no account.
 #[derive(Debug, thiserror::Error)]
 pub enum RedeemError {
@@ -91,6 +246,9 @@ pub enum RedeemError {
     /// A username, display name or password that is not acceptable.
     #[error("{0}")]
     InvalidInput(String),
+    /// The code is a live invite's, of another kind than redeemed (P7-05).
+    #[error("that invite is of another kind")]
+    WrongKind,
     /// Too many wrong codes from this device.
     #[error("too many wrong invite codes")]
     RateLimited { retry_after: std::time::Duration },
@@ -118,30 +276,7 @@ pub async fn redeem(
     endpoint: &str,
     request: &RedeemInvite,
 ) -> Result<(LocalUserId, Role), RedeemError> {
-    // Per device, as device sign-in codes are: endpoints are free, so
-    // what holds guessing from many to a crawl is the strangers' budget,
-    // which the caller drew on before this.
-    let guess = auth
-        .guess(format!("invite@{endpoint}"), Some(endpoint.to_owned()))
-        .map_err(|retry_after| RedeemError::RateLimited { retry_after })?;
-    // A code that cannot be one is a wrong one, and stays counted.
-    let Some(code) = InviteCode::parse(&request.code) else {
-        return Err(RedeemError::Invalid);
-    };
-    let hash = code.hash();
-    let state = auth.store().invite_state(&hash).await?;
-    match state {
-        InviteState::Invalid => return Err(RedeemError::Invalid),
-        InviteState::Expired => {
-            auth.guessed_right(guess);
-            return Err(RedeemError::Expired);
-        }
-        InviteState::Exhausted => {
-            auth.guessed_right(guess);
-            return Err(RedeemError::Exhausted);
-        }
-        InviteState::Usable { .. } => auth.guessed_right(guess),
-    }
+    let hash = usable_code(auth, endpoint, &request.code, InviteKind::CreateUser).await?;
     // The cheap checks before the password's hash.
     normalize_username(&request.username)?;
     display_name(request.display_name.as_deref())?;
@@ -167,6 +302,69 @@ pub async fn redeem(
         Redeemed::Refused(InviteState::Expired) => Err(RedeemError::Expired),
         Redeemed::Refused(InviteState::Exhausted) => Err(RedeemError::Exhausted),
         Redeemed::Refused(_) => Err(RedeemError::Invalid),
+    }
+}
+
+/// The hash of `typed`, a code of a live invite of `kind`, from a device
+/// whose guesses are counted as `endpoint`'s.
+///
+/// Per device, as device sign-in codes are: endpoints are free, so what
+/// holds guessing from many to a crawl is the strangers' budget, which
+/// the caller drew on before this. The guess is counted before the code
+/// is looked at, and taken back for any code an invite has, revoked or
+/// not: expired, used up or of another kind, it was still the right code.
+async fn usable_code(
+    auth: &Auth,
+    endpoint: &str,
+    typed: &str,
+    kind: InviteKind,
+) -> Result<String, RedeemError> {
+    let guess = auth
+        .guess(format!("invite@{endpoint}"), Some(endpoint.to_owned()))
+        .map_err(|retry_after| RedeemError::RateLimited { retry_after })?;
+    // A code that cannot be one is a wrong one, and stays counted.
+    let Some(code) = InviteCode::parse(typed) else {
+        return Err(RedeemError::Invalid);
+    };
+    let hash = code.hash();
+    let state = auth.store().invite_state(&hash).await?;
+    if state != InviteState::Invalid {
+        auth.guessed_right(guess);
+    }
+    match state {
+        InviteState::Invalid => Err(RedeemError::Invalid),
+        InviteState::Expired => Err(RedeemError::Expired),
+        InviteState::Exhausted => Err(RedeemError::Exhausted),
+        InviteState::Usable { kind: found, .. } if found != kind => Err(RedeemError::WrongKind),
+        InviteState::Usable { .. } => Ok(hash),
+    }
+}
+
+/// Grant `portable` access here with the `portable-account` invite whose
+/// code is `typed` (P7-05), from a device whose guesses are counted as
+/// `endpoint`'s, calling them `display`. Who `portable` is was proved
+/// before this ([`crate::portable::check_presentation`]). Nothing is
+/// granted, and the invite keeps its uses, unless this answers `Ok`; one
+/// granted here already keeps their grant, and the invite its use.
+pub async fn redeem_portable(
+    auth: &Auth,
+    endpoint: &str,
+    typed: &str,
+    portable: PortableUserId,
+    display: Option<&str>,
+) -> Result<PortableRedeemed, RedeemError> {
+    let hash = usable_code(auth, endpoint, typed, InviteKind::PortableAccount).await?;
+    let display = display_name(display)?;
+    match auth
+        .store()
+        .redeem_portable_invite(&hash, portable, display)
+        .await?
+    {
+        // Revoked, expired or used up since it was looked at.
+        PortableRedeemed::Refused(InviteState::Expired) => Err(RedeemError::Expired),
+        PortableRedeemed::Refused(InviteState::Exhausted) => Err(RedeemError::Exhausted),
+        PortableRedeemed::Refused(_) => Err(RedeemError::Invalid),
+        done => Ok(done),
     }
 }
 

@@ -1,6 +1,24 @@
-# Development wire revision 13
+# Development wire revision 14
 
-Revision 13 (P7-04, ties) keeps the `spoolframe/client/1` ALPN and sets
+Revision 14 (P7-06, portable sign-in) keeps the `spoolframe/client/1`
+ALPN and sets `PROTOCOL_VERSION` to 14. Update the server and SDK
+together. There are two new pre-auth requests,
+`begin_portable_sign_in` (answered `portable_sign_in_begun`) and
+`finish_portable_sign_in` (answered `logged_in`), a third,
+`redeem_portable_invite` (P7-05), and two new errors,
+`not_for_portable_users` and `wrong_invite_kind`. Invite links may say
+`kind=portable-account`. A session may now be a portable user's:
+`WhoAmI`'s `user_id` is then `portable:<id>`. What they do is in "Signing
+in with a device credential" under "Portable identities" below.
+
+PX-44 adds three session requests to revision 14, an admin's:
+`create_invite` (answered `invite_created`), `list_invites` (answered
+`invites`) and `revoke_invite { id }` (answered `done`), and one error,
+`admin_required`. They are new requests, so a revision-14 peer that does
+not know them answers `unsupported` and the revision stays. What they do
+is in "Making invites in an app" under "Invites" below.
+
+Revision 13 (P7-04, ties) kept the `spoolframe/client/1` ALPN and sets
 `PROTOCOL_VERSION` to 13. Update the server and SDK together. There are
 three new session requests, `tie_begin` (answered `tie_challenge`),
 `tie_finish { user, proof }` and `untie` (both answered `done`), and
@@ -756,6 +774,7 @@ spoolframe://invite?server=3f9a…a0f1&name=Home%20Media&addr=203.0.113.24:41641
 | `lookup` | An `http(s)` URL of the pkarr relay the server publishes its record at (P6-05). |
 | `exp` | When the code stops working, in Unix seconds. A hint. |
 | `role` | `consumer` or `admin`: the role the account gets. A hint. |
+| `kind` | `portable-account` (P7-05): the code grants a portable identity access rather than making an account. Absent, it makes an account. A hint. |
 | `cap` | The code, 12 characters from `ABCDEFGHJKMNPQRSTVWXYZ23456789`, shown in groups of four. |
 
 Values are percent-encoded where they would break the link (`&`, `=`,
@@ -803,6 +822,82 @@ with the same operation id, it runs again. Of two redemptions of an
 invite's last use, one makes its account and the other is
 `invite_exhausted`. It is never retried on its own on a new connection.
 
+### Portable-account invites
+
+An invite of kind `portable-account` (P7-05; its link says
+`kind=portable-account`, and has no `role`) grants someone with their
+own portable identity access, and makes no account: they watch as
+`PortableUser(U)`, appear in `admin.grantList`, and never in
+`userList`. Their phone, which holds the identity, redeems it with its
+own device credential, over a nonce from `begin_portable_sign_in`
+("Signing in with a device credential"):
+
+```json
+{"type": "redeem_portable_invite", "code": "QW7K-2MFP-XR4T",
+ "sign_in": {"credential": {…}, "proof": "<128 hex>", "states": [],
+             "display_name": "Sam"}}
+```
+
+The answer is `logged_in`, the session `finish_portable_sign_in` would
+give (the tied account here, if the identity has one, with no grant made
+and no use taken; else the new portable session). The credential is checked, and counted, as there;
+then the code, as `redeem_invite` checks it (`invite_invalid` counted,
+`invite_expired`, `invite_exhausted`). An identity granted here already
+keeps its grant and the invite its use. `display_name` is what the grant
+calls them (`invalid_input` if it is not acceptable as a display name).
+
+A code redeemed the other way is `wrong_invite_kind`: a
+`portable-account` invite's code to `redeem_invite`, or a `create-user`
+one's to `redeem_portable_invite`. The code was right, so it is not
+counted, and the invite keeps its use.
+
+`admin.inviteCreate` makes one with `kind: "portable-account"` and no
+role (`INVALID_INPUT` for one other than `consumer`), as does
+`spoolframe-server invite create --kind portable-account`.
+`federation` invites are refused until P8.
+
+### Making invites in an app
+
+An admin makes, lists and revokes invites from an app (PX-44) as the web
+UI's Invites page does: the same kinds, fields, limits and store, so each
+lists and revokes the other's.
+
+```json
+{"type": "create_invite", "kind": "create-user", "note": "Mum",
+ "uses": 4, "expires_in_secs": 172800, "role": null}
+```
+
+Each `null` is the default (one use, 7 days, `consumer`). The answer is
+`invite_created { invite, code, link }`: the code (`QW7K-2MFP-XR4T`) and
+the link with it, shown this once, and `invite`, as `list_invites` lists
+it:
+
+```json
+{"id": "0192…", "kind": "create-user", "note": "Mum", "role": "consumer",
+ "uses": 4, "uses_left": 3, "expires_at": 1792003200,
+ "created_at": 1791830400,
+ "created_by": {"username": "andrey", "display_name": "Andrey"},
+ "created_from": {"type": "device", "endpoint_id": "3f9a…",
+                  "name": "Andrey's iPhone", "platform": "ios"}}
+```
+
+`created_from` is `web_admin`, `cli` or `device` (the device's
+`EndpointId`, and the name and platform its `Hello` gave); an invite made
+before PX-44 is `web_admin`, or `cli` when the CLI made it. A CLI
+invite's `created_by` has no `username`, and `display_name` "server
+CLI". `list_invites` lists only invites that can still be redeemed,
+newest first. `revoke_invite { id }` stops one's code (`done`); one not
+on the list is `not_found`.
+
+All three are an admin's: anyone else is `admin_required`, and a
+portable guest `not_for_portable_users`. `create_invite` and
+`revoke_invite` also need a recent confirmation, as the web UI's admin
+changes do: `recent_sign_in_required` past it, and `confirm_password` or
+a passkey confirmation lets them through. A field out of its limits,
+and a `federation` invite until P8, is `invalid_input`. Neither is
+retried on its own on a new connection: a second `create_invite` makes a
+second code.
+
 ### SDK
 
 `spoolframe_client_sdk::invite` is the link codec. A `Client` takes the
@@ -825,6 +920,14 @@ link as the user pasted or opened it:
   a password sign-in's. A refused redemption saves nothing. Its refusals
   are `InviteInvalid`, `InviteExpired`, `InviteExhausted`,
   `UsernameTaken`, `InvalidInput` and `RateLimited`.
+
+An admin's `Session` makes them (PX-44): `create_invite(InviteSpec) ->
+MintedInvite` (its `link` and `copy_string` are the same link, the one
+the web UI copies), `invites() -> Vec<InviteSummary>` (`used` is
+`uses - uses_left`; `created_from`'s `Device` says `this_device`) and
+`revoke_invite(id)`. Their refusals are `AdminRequired`,
+`NotForPortableUsers`, `RecentSignInRequired` (confirm, then ask
+again), `InvalidInput` and `NotFound`.
 
 The link's addresses join the server's known addresses as told ones,
 replacing none; the server's next `server_addresses` list replaces them
@@ -1208,6 +1311,69 @@ fingerprint, tiedAt }` or `null`) and severs it with `admin.userUntie`
 both answer `NO_SUCH_LINK`. Neither ties: the web UI never holds the
 root.
 
+### Signing in with a device credential
+
+A device with a credential (from pairing, or the phone's own) signs in
+to a server as the portable user (P7-06, §58). It proves it holds the
+credential's key by signing, with it:
+
+```
+"spoolframe device proof v1\0"
+server      32 bytes   the server's EndpointId, as the device dialled it
+nonce       32 bytes   from portable_sign_in_begun
+```
+
+| Request | Reply |
+|---|---|
+| `{"type": "begin_portable_sign_in"}` | `{"type": "portable_sign_in_begun", "nonce": bytes(32), "expires_in_secs": 300}` |
+| `{"type": "finish_portable_sign_in", "credential": {…}, "proof": "<128 hex>", "states": [{…}], "display_name": "Sam" or null}` | `LoggedIn`, `remembered: false` |
+
+Both are pre-auth mutations, with an operation ID, never sent again on
+a new connection, and each draws on the sign-in budget every device not
+signed in shares, as `LoginPassword` does.
+
+- The nonce is this device's (its endpoint), for 5 minutes, and is used
+  up by the finish whatever it makes of it. Beginning again replaces
+  it.
+- The credential must hold now (its root's signature, its dates), its
+  key must have signed the proof, and neither a state it carries nor
+  one the server has seen may revoke the key.
+- `states` are the identity's states the device has, at most 2, each
+  the credential's own identity's and verified. The server keeps them
+  only for an identity it knows (tied here, or with a live grant; for a
+  redemption, once the grant is made): a stranger's are checked and
+  dropped. A state it keeps that revokes a key ends every session that
+  key opened, at once.
+- Then, local-first: an identity tied to an account here signs in as
+  that account, a normal session (its PIN asked as usual) that counts as
+  signed in long ago, so what needs a recent sign-in asks for
+  `ConfirmPassword` or a passkey confirm first; an untied
+  one with a grant here as itself, a portable session; any other gets
+  nothing.
+
+Every refusal is `InvalidCredentials`, counted as a wrong guess before
+anything is checked, then `RateLimited`, and logged as a refused
+sign-in (`portable credential refused`). Refusals keep nothing in the
+operation pools.
+
+A portable session lives as a device's does (renewed on use) while the
+grant lasts, and never past the credential's expiry: an admin revoking
+the grant (`admin.grantRevoke`) ends it at once, as does a state
+revoking its key. So does a tied account's session opened with a
+credential. A revoked grant is kept as a tombstone: only an invite made
+after the revocation brings the identity back. `WhoAmI` answers `user_id: "portable:<id>"`, `username` the
+id's 64 hex digits (what a device keeps the session by), the name the
+grant has or the fingerprint as `display_name`, `role: consumer`, no
+PIN, never locked, and `portable` the id. It browses, plays, and keeps
+watch state and track preferences of its own. What only an account here
+has (password, PIN, passkeys, devices, sessions, ties, approving
+sign-ins) is `NotForPortableUsers`; `GetPlexLink` is `null`.
+
+The admin API lists grants with `admin.grantList` (`{ id, fingerprint,
+displayName, grantedAt, inviteId, liveSessions }`) and revokes one with
+`admin.grantRevoke` (recent admin; `NO_SUCH_GRANT` for none). Grants are
+not users: `userList` never shows them.
+
 ### Pairing
 
 A device acts as a portable user once that user's root has given it a
@@ -1251,7 +1417,7 @@ one bidirectional stream. Each frame is a client protocol frame
 |---|---|---|---|
 | 1 | phone | `{"type": "hello", "code": bytes(32), "identity": "<PortableUserId>"}` | |
 | 2 | device | `{"type": "key", "device_key": "<64 hex>", "name": "<name>"}` | or `refused` |
-| 3 | phone | `{"type": "credential", "credential": {…}, "state": {…} or null}` | or `{"type": "declined"}` |
+| 3 | phone | `{"type": "credential", "credential": {…}, "state": {…} or null, "servers": [{…}]}` | or `{"type": "declined"}` |
 | 4 | device | `{"type": "done"}` | or `refused` |
 
 `refused` is `{"type": "refused", "reason": r}` with `r` one of
@@ -1271,6 +1437,16 @@ shown), `wrong_code`, `expired`, `credential_refused` and `failed`.
   `state`, if any, must be `identity`'s, verify, and not revoke that
   key (`credential_refused` otherwise). The device installs the
   credential, then takes the state in (P7-02's rules).
+- `servers` (P7-06; absent from an older phone, read as none) are the
+  servers the phone signs in to as `identity` and has verified, at most
+  16, each
+  `{"endpoint_id": "<64 hex>", "server_id": "…", "name": "…", "addrs":
+  ["ip:port", …], "relays": ["https://…", …]}` (at most 8 addresses
+  and 2 relays). After `done`, the device pins each, key and server
+  id, but not verified: the guest's phone vouches for it, not the
+  device's owner. A server it has saved already is left exactly as it
+  was, hints and all; one whose server id it has saved under another key
+  is left out. It then signs in to them with `finish_portable_sign_in`.
 - The device waits 2 minutes for frame 3 and 10 seconds for any other.
   A pairing that ends in any other way than `done` leaves no credential
   on the device, and removes the key if this pairing made it. A key the

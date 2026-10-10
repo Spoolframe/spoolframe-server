@@ -522,33 +522,273 @@ async fn a_consumer_sees_no_invites() {
     invites.server.stop().await;
 }
 
-/// `portable-account` and `federation` are parsed and refused, saying
-/// when they arrive: nothing is made, so nothing can be half-redeemed or
-/// made a `create-user` invite instead.
+/// `federation` is parsed and refused, saying when it arrives: nothing
+/// is made, so nothing can be half-redeemed or made another kind of
+/// invite instead.
 #[tokio::test]
-async fn the_kinds_of_later_phases_are_refused_and_nothing_is_made() {
+async fn federation_invites_are_refused_and_nothing_is_made() {
     let invites = Invites::start("invite-kinds").await;
-    for kind in [InviteKind::PortableAccount, InviteKind::Federation] {
+    let refused = invites
+        .root
+        .invite_create(NewInvite {
+            kind: InviteKind::Federation,
+            ..create_user()
+        })
+        .await
+        .unwrap_err();
+    let jsonrpsee::core::ClientError::Call(refused) = refused else {
+        panic!("not a call error");
+    };
+    assert_eq!(refused.code(), error_code::INVALID_INPUT);
+    assert!(refused.message().contains("P8"), "{}", refused.message());
+    assert!(invites.root.invite_list().await.unwrap().is_empty());
+    invites.server.stop().await;
+}
+
+// P7-05: portable-account invites, redeemed by a portable identity's
+// device credential into a grant, never an account.
+
+mod portable {
+    use ed25519_dalek::{Signer, SigningKey};
+    use spoolframe_protocol::invite::InviteLinkKind;
+    use spoolframe_protocol::portable::{
+        DevicePublicKey, MAX_CREDENTIAL_VALIDITY, PortableUserId, UserDeviceCredential,
+        device_proof_message,
+    };
+    use spoolframe_protocol::{PortableSignIn, RedeemPortableInvite};
+
+    use super::*;
+
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn identity(seed: u8) -> PortableUserId {
+        PortableUserId::from_bytes(key(seed).verifying_key().to_bytes()).unwrap()
+    }
+
+    fn guest_invite() -> NewInvite {
+        NewInvite {
+            kind: InviteKind::PortableAccount,
+            note: Some("Sam".into()),
+            uses: None,
+            expires: None,
+            role: None,
+        }
+    }
+
+    /// Identity 7's sign-in from device 9 on `device`, over a nonce it
+    /// begins now.
+    async fn sign_in(invites: &Invites, device: &TestClient) -> PortableSignIn {
+        let Response::Ok(Reply::PortableSignInBegun { nonce, .. }) =
+            device.call(None, Request::BeginPortableSignIn).await
+        else {
+            panic!("not begun");
+        };
+        let now = invites.server.store.clock().unix_secs();
+        PortableSignIn {
+            credential: UserDeviceCredential::new(
+                identity(7),
+                DevicePublicKey::from_bytes(key(9).verifying_key().to_bytes()).unwrap(),
+                1,
+                now - 60,
+                now - 60 + MAX_CREDENTIAL_VALIDITY,
+                |m| key(7).sign(m),
+            ),
+            proof: key(9).sign(&device_proof_message(
+                device.conn.remote_id().as_bytes(),
+                &nonce,
+            )),
+            states: vec![],
+            display_name: Some("Sam".into()),
+        }
+    }
+
+    async fn redeem_as_guest(invites: &Invites, device: &TestClient, code: &str) -> Response {
+        let sign_in = sign_in(invites, device).await;
+        device
+            .call(
+                None,
+                Request::RedeemPortableInvite(RedeemPortableInvite {
+                    code: code.into(),
+                    sign_in,
+                }),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_guest_invite_grants_a_portable_identity_and_makes_no_account() {
+        let invites = Invites::start("invite-portable").await;
+        let created = invites.create(guest_invite()).await;
+        let link = parse_link(&created.link).unwrap();
+        assert_eq!(link.kind, InviteLinkKind::PortableAccount);
+        assert_eq!(link.role, None);
+        assert_eq!(created.invite.kind, InviteKind::PortableAccount);
+        let users = invites.root.user_list().await.unwrap();
+
+        let phone = invites.stranger().await;
+        let session = logged_in(redeem_as_guest(&invites, &phone, &created.code).await);
+        match phone.call(Some(&session), Request::WhoAmI).await {
+            Response::Ok(Reply::WhoAmI(me)) => {
+                assert_eq!(me.user_id, format!("portable:{}", identity(7)));
+                assert_eq!(me.display_name, "Sam");
+            }
+            other => panic!("no WhoAmI: {other:?}"),
+        }
+        let grants = invites.root.grant_list().await.unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].id, identity(7).to_string());
+        assert_eq!(
+            grants[0].invite_id.as_deref(),
+            Some(created.invite.id.as_str())
+        );
+        assert_eq!(invites.root.user_list().await.unwrap(), users);
+        // Used up: the list drops it.
+        assert!(invites.root.invite_list().await.unwrap().is_empty());
+        invites.server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_code_redeems_only_as_its_kind_and_keeps_its_use() {
+        let invites = Invites::start("invite-portable-kind").await;
+        let guest = invites.create(guest_invite()).await;
+        let account = invites.create(create_user()).await;
+        let device = invites.stranger().await;
+        assert_eq!(
+            device.call(None, redeem(&guest.code, "sam")).await,
+            Response::Err(Error::WrongInviteKind)
+        );
+        assert_eq!(
+            redeem_as_guest(&invites, &device, &account.code).await,
+            Response::Err(Error::WrongInviteKind)
+        );
+        let left: Vec<u32> = invites
+            .root
+            .invite_list()
+            .await
+            .unwrap()
+            .iter()
+            .map(|i| i.uses_left)
+            .collect();
+        assert_eq!(left, [1, 1]);
+        assert!(invites.root.grant_list().await.unwrap().is_empty());
+        invites.server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_expired_or_revoked_guest_invite_is_refused_with_a_good_credential() {
+        let invites = Invites::start("invite-portable-refused").await;
+        let revoked = invites.create(guest_invite()).await;
+        invites
+            .root
+            .invite_revoke(revoked.invite.id.clone())
+            .await
+            .unwrap();
+        let expiring = invites
+            .create(NewInvite {
+                expires: Some(invite::MIN_EXPIRES_SECS),
+                ..guest_invite()
+            })
+            .await;
+        let device = invites.stranger().await;
+        assert_eq!(
+            redeem_as_guest(&invites, &device, &revoked.code).await,
+            Response::Err(Error::InviteInvalid)
+        );
+        invites.server.clock.advance(Duration::from_secs(3601));
+        assert_eq!(
+            redeem_as_guest(&invites, &device, &expiring.code).await,
+            Response::Err(Error::InviteExpired)
+        );
+        // The admin's API session idled out with the clock: the store.
+        assert!(invites.server.store.grants().await.unwrap().is_empty());
+        invites.server.stop().await;
+    }
+
+    /// Review, finding 2: a revoked guest cannot redeem the invite that
+    /// brought them again; only a newer invite lets them back.
+    #[tokio::test]
+    async fn a_revoked_guest_needs_a_new_invite() {
+        let invites = Invites::start("invite-portable-revoked-guest").await;
+        let created = invites
+            .create(NewInvite {
+                uses: Some(3),
+                ..guest_invite()
+            })
+            .await;
+        let device = invites.stranger().await;
+        logged_in(redeem_as_guest(&invites, &device, &created.code).await);
+        invites
+            .root
+            .grant_revoke(identity(7).to_string())
+            .await
+            .unwrap();
+        let device = invites.stranger().await;
+        assert_eq!(
+            redeem_as_guest(&invites, &device, &created.code).await,
+            Response::Err(Error::InviteInvalid)
+        );
+        assert_eq!(invites.root.invite_list().await.unwrap()[0].uses_left, 2);
+        assert!(invites.root.grant_list().await.unwrap().is_empty());
+        invites.server.clock.advance(Duration::from_secs(2));
+        let newer = invites.create(guest_invite()).await;
+        logged_in(redeem_as_guest(&invites, &device, &newer.code).await);
+        assert_eq!(invites.root.grant_list().await.unwrap().len(), 1);
+        invites.server.stop().await;
+    }
+
+    /// Review: an identity tied to an account here signs in as it; no
+    /// grant is made and the invite keeps its use.
+    #[tokio::test]
+    async fn a_tied_identity_redeeming_signs_in_as_its_account() {
+        let invites = Invites::start("invite-portable-tied").await;
+        invites
+            .server
+            .add_user("alice", "correct horse", None)
+            .await;
+        let alice = invites
+            .server
+            .store
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|u| u.username == "alice")
+            .unwrap()
+            .id;
+        invites
+            .server
+            .store
+            .tie(alice, identity(7), "root")
+            .await
+            .unwrap();
+        let created = invites.create(guest_invite()).await;
+        let device = invites.stranger().await;
+        let session = logged_in(redeem_as_guest(&invites, &device, &created.code).await);
+        match device.call(Some(&session), Request::WhoAmI).await {
+            Response::Ok(Reply::WhoAmI(me)) => assert_eq!(me.username, "alice"),
+            other => panic!("no WhoAmI: {other:?}"),
+        }
+        assert!(invites.root.grant_list().await.unwrap().is_empty());
+        assert_eq!(invites.root.invite_list().await.unwrap()[0].uses_left, 1);
+        invites.server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_guest_invite_with_a_role_other_than_consumer_is_refused() {
+        let invites = Invites::start("invite-portable-role").await;
         let refused = invites
             .root
             .invite_create(NewInvite {
-                kind,
-                ..create_user()
+                role: Some(Role::Admin),
+                ..guest_invite()
             })
             .await
             .unwrap_err();
-        let jsonrpsee::core::ClientError::Call(refused) = refused else {
-            panic!("not a call error");
-        };
-        assert_eq!(refused.code(), error_code::INVALID_INPUT);
-        assert!(
-            refused.message().contains("P7") && refused.message().contains("P8"),
-            "{}",
-            refused.message()
-        );
+        assert_eq!(code(refused), error_code::INVALID_INPUT);
+        invites.server.stop().await;
     }
-    assert!(invites.root.invite_list().await.unwrap().is_empty());
-    invites.server.stop().await;
 }
 
 #[tokio::test]
@@ -797,6 +1037,83 @@ mod sdk {
         // The user is kept: the app opened again finds the profile.
         assert_eq!(client.profiles(&id).await.unwrap().len(), 1);
         client.close().await;
+        invites.server.stop().await;
+    }
+
+    /// P7: the user's goal, end to end. A new portable identity on the
+    /// phone joins the server with a guest invite; the living-room TV,
+    /// guests allowed, pairs with the phone by QR, saves the server the
+    /// phone hands it, signs in as the identity and plays. The server
+    /// gains a grant, and no user.
+    #[tokio::test]
+    async fn a_new_identity_joins_on_the_phone_and_watches_on_the_tv() {
+        let invites = invites("sdk-portable-tv").await;
+        let file = invites.server.write_media(1 << 20);
+        let created = invites
+            .create(NewInvite {
+                kind: spoolframe_admin_api::InviteKind::PortableAccount,
+                note: Some("Sam".into()),
+                uses: None,
+                expires: None,
+                role: None,
+            })
+            .await;
+        let users = invites.root.user_list().await.unwrap();
+        let server = invites.server.server.id().to_string();
+
+        let phone = new_device().await;
+        let (identity, _phrase) = phone.portable().create("Sam").await.unwrap();
+        let info = phone.read_invite(&created.link).await.unwrap();
+        assert_eq!(
+            info.kind,
+            spoolframe_client_sdk::InviteLinkKind::PortableAccount
+        );
+        let on_phone = phone
+            .redeem_invite_portable(&created.link, identity, Some("Sam"))
+            .await
+            .unwrap();
+        assert_eq!(on_phone.user().user_id, format!("portable:{identity}"));
+        assert_eq!(on_phone.user().display_name, "Sam");
+
+        let tv = new_device().await;
+        tv.portable().set_allow_guests(true).await.unwrap();
+        let pairing = tv.start_pairing("Living room TV").await.unwrap();
+        let offer = phone.scan_pairing(pairing.link(), identity).await.unwrap();
+        offer.authorize(None).await.unwrap();
+        let paired = pairing.wait().await.unwrap();
+        assert_eq!(paired.identity, identity);
+        let handed: Vec<_> = paired.servers.iter().map(|s| &s.endpoint_id).collect();
+        assert_eq!(handed, [&server]);
+
+        // Pinned on the TV, not verified: the guest's phone vouched.
+        let pinned = tv.servers().await.unwrap();
+        let entry = pinned.iter().find(|s| s.endpoint_id == server).unwrap();
+        assert!(entry.pinned && !entry.verified, "{entry:?}");
+        let on_tv = tv.sign_in_portable(&server, identity).await.unwrap();
+        assert_eq!(on_tv.user().user_id, format!("portable:{identity}"));
+        let playback = on_tv
+            .start_playback(movie().id(), Some(Selection::default()))
+            .await
+            .unwrap();
+        let bytes = on_tv.read(&playback.handle, 0, 4096).await.unwrap();
+        assert_eq!(bytes, file[..4096]);
+
+        // Signed out on the TV, it signs in again with no password.
+        let profiles = tv.saved_profiles(&server).await.unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            profiles[0].method,
+            Some(spoolframe_client_sdk::SignInMethod::Portable)
+        );
+        assert_eq!(profiles[0].portable, Some(identity));
+
+        let grants = invites.root.grant_list().await.unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].id, identity.to_string());
+        assert_eq!(grants[0].live_sessions, 2);
+        assert_eq!(invites.root.user_list().await.unwrap(), users);
+        phone.close().await;
+        tv.close().await;
         invites.server.stop().await;
     }
 

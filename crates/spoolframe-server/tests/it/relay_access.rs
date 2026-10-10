@@ -20,7 +20,7 @@ use spoolframe_protocol::{RedeemInvite, Reply, Request, Response};
 use spoolframe_server::invites::InviteCode;
 use spoolframe_server::network::Relay;
 use spoolframe_server::own_relay::{self, Access, RelayConfig, Serve};
-use spoolframe_server::store::invites::{InviteKind, NewInvite};
+use spoolframe_server::store::invites::{InviteKind, InviteOrigin, NewInvite};
 use spoolframe_types::Role;
 
 use crate::support::{self, ServerOptions, TestServer};
@@ -98,6 +98,65 @@ async fn the_server_and_its_signed_in_devices_are_the_owner_s_and_others_strange
     server.stop().await;
 }
 
+/// A device signed in only as a granted portable user (P7-06) is a
+/// friend's on the relay, not the owner's.
+#[tokio::test]
+async fn a_portable_user_s_device_is_a_friend_s() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use spoolframe_protocol::PortableSignIn;
+    use spoolframe_protocol::portable::{
+        DevicePublicKey, MAX_CREDENTIAL_VALIDITY, PortableUserId, UserDeviceCredential,
+        device_proof_message,
+    };
+    let key = SecretKey::generate();
+    let server = server_for("relay-access-portable", &key).await;
+    let root = SigningKey::from_bytes(&[7; 32]);
+    let device = SigningKey::from_bytes(&[9; 32]);
+    let user = PortableUserId::from_bytes(root.verifying_key().to_bytes()).unwrap();
+    server.store.grant_portable(user, None, None).await.unwrap();
+    let tv = server.client().await;
+    tv.hello().await;
+    let Response::Ok(Reply::PortableSignInBegun { nonce, .. }) =
+        tv.call(None, Request::BeginPortableSignIn).await
+    else {
+        panic!("not begun");
+    };
+    let now = server.store.clock().unix_secs();
+    let credential = UserDeviceCredential::new(
+        user,
+        DevicePublicKey::from_bytes(device.verifying_key().to_bytes()).unwrap(),
+        1,
+        now - 60,
+        now - 60 + MAX_CREDENTIAL_VALIDITY,
+        |m| root.sign(m),
+    );
+    let proof = device.sign(&device_proof_message(
+        tv.conn.remote_id().as_bytes(),
+        &nonce,
+    ));
+    let signed_in = tv
+        .call(
+            None,
+            Request::FinishPortableSignIn(PortableSignIn {
+                credential,
+                proof,
+                states: vec![],
+                display_name: None,
+            }),
+        )
+        .await;
+    assert!(
+        matches!(signed_in, Response::Ok(Reply::LoggedIn { .. })),
+        "{signed_in:?}"
+    );
+
+    let (relay, conn) = relay_to(&server, key).await;
+    assert_eq!(ask(&conn, tv.endpoint.id().to_string()).await, Tier::Friend);
+    relay.close().await;
+    tv.close().await;
+    server.stop().await;
+}
+
 /// A live `create-user` invite with `role`, `uses` times: its code and
 /// id.
 async fn invite(server: &TestServer, role: Role, uses: u32) -> (InviteCode, String) {
@@ -112,6 +171,7 @@ async fn invite(server: &TestServer, role: Role, uses: u32) -> (InviteCode, Stri
             uses,
             expires_at: server.store.clock().unix_secs() + 3600,
             created_by: "root",
+            origin: &InviteOrigin::Web,
         })
         .await
         .unwrap();

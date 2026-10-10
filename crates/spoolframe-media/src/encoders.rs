@@ -347,6 +347,23 @@ impl Encoders {
         own.into_iter().chain(placebo).collect()
     }
 
+    /// The filters `hardware`'s GPU runs that detection found: VA-API's
+    /// `tone map` and `overlay`, NVIDIA's `scale` and `overlay`.
+    pub fn gpu_filters(&self, hardware: Hardware) -> Vec<&'static str> {
+        let filters: &[(bool, &'static str)] = match hardware {
+            Hardware::Vaapi => &[
+                (self.gpu_tonemap, "tone map"),
+                (self.gpu_overlay, "overlay"),
+            ],
+            Hardware::Nvenc => &[(self.cuda_scale, "scale"), (self.cuda_overlay, "overlay")],
+            Hardware::Qsv => &[],
+        };
+        filters
+            .iter()
+            .filter_map(|(found, name)| found.then_some(*name))
+            .collect()
+    }
+
     /// Whether `setting` forces a method no GPU here runs: what the
     /// server warns of once detection is done.
     pub fn forced_nowhere(&self, setting: ToneMapSetting) -> bool {
@@ -403,29 +420,12 @@ impl Encoders {
             }
         };
         // Per family: `vaapi: tone map, overlay; nvenc: scale, overlay`.
-        let found = |filters: &[(bool, &'static str)]| -> Vec<&'static str> {
-            filters
-                .iter()
-                .filter_map(|(found, name)| found.then_some(*name))
-                .collect()
-        };
-        let families: Vec<String> = [
-            (
-                Hardware::Vaapi,
-                found(&[
-                    (self.gpu_tonemap, "tone map"),
-                    (self.gpu_overlay, "overlay"),
-                ]),
-            ),
-            (
-                Hardware::Nvenc,
-                found(&[(self.cuda_scale, "scale"), (self.cuda_overlay, "overlay")]),
-            ),
-        ]
-        .into_iter()
-        .filter(|(_, filters)| !filters.is_empty())
-        .map(|(family, filters)| format!("{}: {}", family.as_str(), filters.join(", ")))
-        .collect();
+        let families: Vec<String> = [Hardware::Vaapi, Hardware::Nvenc]
+            .into_iter()
+            .map(|family| (family, self.gpu_filters(family)))
+            .filter(|(_, filters)| !filters.is_empty())
+            .map(|(family, filters)| format!("{}: {}", family.as_str(), filters.join(", ")))
+            .collect();
         let decoders: Vec<String> = self
             .hardware_decoders
             .iter()

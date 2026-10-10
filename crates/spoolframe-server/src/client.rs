@@ -19,6 +19,7 @@ use spoolframe_protocol::codec::{self, write_frame};
 use spoolframe_protocol::device_sign_in::{
     normalize as device_sign_in_code, web_link as device_sign_in_web_link,
 };
+use spoolframe_protocol::invite_admin::{InviteCreated, InviteCreator, InviteSummary};
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::rpc::{
     PlaybackRevision, RpcReply, RpcRequest, RpcResponse, ServerInstance,
@@ -31,9 +32,9 @@ use spoolframe_protocol::{
 };
 use spoolframe_protocol::{
     AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, FinishPasskeySignIn, Hello,
-    LoginPassword, PasskeyInfo, PinProof, PinState, PlexLink, PlexSyncSummary, RedeemInvite, Reply,
-    Request, Response, ServerInfo, SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile,
-    UserSummary, is_app_rp_id,
+    LoginPassword, PasskeyInfo, PinProof, PinState, PlexLink, PlexSyncSummary, PortableSignIn,
+    RedeemInvite, RedeemPortableInvite, Reply, Request, Response, ServerInfo, SessionId,
+    SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary, is_app_rp_id,
 };
 use spoolframe_types::{ArtworkId, MediaId, Namespace, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -57,6 +58,7 @@ use crate::playback::{
 use crate::plex_accounts::Link;
 use crate::previews::{self, PreviewState};
 use crate::principal::Principal;
+use crate::principal::Who;
 use crate::refusals::{self, Channel, Kind};
 use crate::store::passkeys::{PasskeyError, PasskeyRecord};
 use crate::store::pins::PinError;
@@ -90,6 +92,8 @@ pub(crate) struct ClientProtocol {
     operations: crate::operations::Pools,
     /// Tie challenges begun and not yet answered (P7-04).
     ties: Arc<crate::ties::TieChallenges>,
+    /// Portable sign-ins begun and not yet finished (P7-06).
+    portable_sign_ins: Arc<crate::portable::SignInNonces>,
 }
 
 /// What one connection has said so far.
@@ -272,6 +276,9 @@ impl ClientProtocol {
         let ties = Arc::new(crate::ties::TieChallenges::new(
             services.auth.store().clock().clone(),
         ));
+        let portable_sign_ins = Arc::new(crate::portable::SignInNonces::new(
+            services.auth.store().clock().clone(),
+        ));
         Self {
             id: endpoint.id(),
             connections,
@@ -282,6 +289,7 @@ impl ClientProtocol {
             instance: uuid::Uuid::now_v7().to_string(),
             operations: crate::operations::Pools::default(),
             ties,
+            portable_sign_ins,
         }
     }
 
@@ -510,7 +518,7 @@ impl ClientProtocol {
                 {
                     return Response::Err(error).into();
                 }
-                user = Some(signed_in.user.to_string());
+                user = Some(signed_in.principal().to_string());
             }
             operations.begin(
                 crate::operations::Owner {
@@ -754,6 +762,40 @@ impl ClientProtocol {
                 let hello = state.hello.get().expect("checked above");
                 self.resume_profile(connection, &user_id, hello).await
             }
+            // P7-06: a sign-in a stranger makes, on the same budget.
+            Request::BeginPortableSignIn => {
+                if let Err(e) = self.stranger_attempt(state) {
+                    return Response::Err(e);
+                }
+                let endpoint = connection.remote_id().to_string();
+                match self.portable_sign_ins.begin(&endpoint) {
+                    Some(nonce) => Ok(Reply::PortableSignInBegun {
+                        nonce,
+                        expires_in_secs: crate::portable::SIGN_IN_NONCE_LIFETIME.as_secs(),
+                    }),
+                    None => Err(Error::RateLimited {
+                        retry_after_ms: crate::portable::SIGN_IN_NONCE_LIFETIME.as_millis() as u64,
+                    }),
+                }
+            }
+            Request::FinishPortableSignIn(sign_in) => {
+                let hello = state.hello.get().expect("checked above");
+                match self.stranger_attempt(state) {
+                    Ok(()) => self.portable_sign_in(connection, &sign_in, hello).await,
+                    Err(e) => Err(e),
+                }
+            }
+            // P7-05: a sign-in a stranger makes, on the same budget.
+            Request::RedeemPortableInvite(redeem) => {
+                let hello = state.hello.get().expect("checked above");
+                match self.stranger_attempt(state) {
+                    Ok(()) => {
+                        self.redeem_portable_invite(connection, &redeem, hello)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             // P6-01: a sign-in a stranger makes, on the same budget.
             Request::RedeemInvite(redeem) => {
                 let hello = state.hello.get().expect("checked above");
@@ -766,7 +808,7 @@ impl ClientProtocol {
             // endpoint. Each request names its own, so one connection can
             // serve several users at once (§15).
             request => match self.authenticate(connection, state, envelope.session).await {
-                Ok((session, user)) => {
+                Ok((session, who)) => {
                     // Locked, only these two (P2-08).
                     let exempt = matches!(
                         request,
@@ -783,7 +825,7 @@ impl ClientProtocol {
                                 connection,
                                 state,
                                 session,
-                                user,
+                                who,
                                 request,
                                 wire.expected_revision,
                             )
@@ -806,19 +848,17 @@ impl ClientProtocol {
         connection: &Connection,
         state: &ConnectionState,
         session: Option<SessionId>,
-    ) -> Result<(SessionId, SessionUser), Error> {
+    ) -> Result<(SessionId, Who), Error> {
         let session = session.ok_or(Error::Unauthenticated)?;
         let endpoint = connection.remote_id().to_string();
-        match self
-            .services
-            .auth
-            .endpoint_session(&session.0, &endpoint)
-            .await
-        {
-            Ok(Some(user)) => {
-                state.locks.lock().learn(&session, user.pin_required);
-                state.peer.note_signed_in(Some(&user.username));
-                Ok((session, user))
+        match self.services.auth.endpoint_who(&session.0, &endpoint).await {
+            Ok(Some(who)) => {
+                if matches!(who, Who::Local(_)) {
+                    state.peer.note_local();
+                }
+                state.locks.lock().learn(&session, who.pin_required());
+                state.peer.note_signed_in(Some(&who.log_name()));
+                Ok((session, who))
             }
             Ok(None) => Err(Error::Unauthenticated),
             Err(e) => Err(internal(e)),
@@ -992,7 +1032,7 @@ impl ClientProtocol {
                     ),
                     _ => unreachable!(),
                 };
-                let (session, user) = self.authenticate(connection, state, Some(session)).await?;
+                let (session, who) = self.authenticate(connection, state, Some(session)).await?;
                 state.locks.lock().use_session(&session)?;
                 // Preparing the selected subtitle and its metadata is atomic
                 // with control changes. Sending its bytes holds no lock.
@@ -1009,7 +1049,7 @@ impl ClientProtocol {
                     });
                 }
                 let reply = self
-                    .serve(connection, state, session, user, read, None)
+                    .serve(connection, state, session, who, read, None)
                     .await?;
                 let (format, bytes, total, version) = match reply {
                     Reply::SubtitleChunk {
@@ -1143,7 +1183,7 @@ impl ClientProtocol {
             let live = self
                 .services
                 .auth
-                .endpoint_session(&session.0, &endpoint)
+                .endpoint_who(&session.0, &endpoint)
                 .await
                 .map_err(internal)?;
             if live.is_none() {
@@ -1423,12 +1463,12 @@ impl ClientProtocol {
         connection: &Connection,
         state: &ConnectionState,
         session: SessionId,
-        user: SessionUser,
+        who: Who,
         request: Request,
         expected_revision: Option<u64>,
     ) -> Result<Reply, Error> {
         let catalog = &self.services.catalog;
-        let principal = Principal::LocalUser(user.user);
+        let principal = who.principal();
         // Hold across preparation and publication, and re-read the handle
         // inside the handler. QUIC requests may arrive concurrently.
         let _control = match &request {
@@ -1475,13 +1515,29 @@ impl ClientProtocol {
                     .revision,
             }),
             Request::WhoAmI => {
+                let user = match &who {
+                    Who::Local(user) => user,
+                    // P7-06: no PIN, no lock, no tie; the id is the
+                    // name a device keeps their session by.
+                    Who::Portable(portable) => {
+                        return Ok(Reply::WhoAmI(UserSummary {
+                            user_id: principal.to_string(),
+                            username: who.username(),
+                            display_name: portable.display_name.clone(),
+                            role: spoolframe_types::Role::Consumer,
+                            locked: false,
+                            pin: None,
+                            portable: Some(portable.user),
+                        }));
+                    }
+                };
                 // Asked while locked too: a PIN pad sizes itself by it.
                 let pin = self.store().pin_info(user.user).await.map_err(internal)?;
                 let tie = self.store().tie_of(user.user).await.map_err(internal)?;
                 Ok(Reply::WhoAmI(UserSummary {
                     user_id: format!("local:{}", user.user),
-                    username: user.username,
-                    display_name: user.display_name,
+                    username: user.username.clone(),
+                    display_name: user.display_name.clone(),
                     role: user.role,
                     locked: state.locks.lock().locked(&session),
                     pin: pin.map(|p| PinState { digits: p.digits }),
@@ -1489,10 +1545,11 @@ impl ClientProtocol {
                 }))
             }
             Request::BeginPasskeyRegistration => {
+                let user = local(&who)?;
                 // P3-03's rule, as for a passkey added in the web UI: a
                 // session left signed in on a device does not add one.
-                recently_signed_in(&user)?;
-                let account = self.account(&user).await?;
+                recently_signed_in(user)?;
+                let account = self.account(user).await?;
                 self.services
                     .app_passkeys
                     .begin_registration(
@@ -1508,7 +1565,8 @@ impl ClientProtocol {
                     .map_err(ceremony_error)
             }
             Request::FinishPasskeyRegistration(made) => {
-                let account = self.account(&user).await?;
+                let user = local(&who)?;
+                let account = self.account(user).await?;
                 self.services
                     .app_passkeys
                     .finish_registration(
@@ -1523,6 +1581,7 @@ impl ClientProtocol {
                 Ok(Reply::Done)
             }
             Request::UnlockProfile { pin } => {
+                let user = local(&who)?;
                 let generation = state.locks.lock().generation;
                 let endpoint = connection.remote_id().to_string();
                 self.services
@@ -1550,15 +1609,16 @@ impl ClientProtocol {
             // Where it is asked for needs only the session (a locked one
             // never gets here, and a PIN is never a way to sign in).
             Request::SetPin { pin, proof } => {
+                let user = local(&who)?;
                 let Some(digits) = auth::pin_digits(&pin) else {
                     return Err(Error::InvalidInput {
                         message: "a PIN is 4 to 8 digits".into(),
                     });
                 };
                 match proof {
-                    Some(proof) => self.check_pin_proof(connection, &user, proof).await?,
+                    Some(proof) => self.check_pin_proof(connection, user, proof).await?,
                     None => {
-                        recently_signed_in(&user)?;
+                        recently_signed_in(user)?;
                         if self
                             .store()
                             .pin_info(user.user)
@@ -1582,7 +1642,8 @@ impl ClientProtocol {
                 Ok(Reply::Done)
             }
             Request::ClearPin { proof } => {
-                self.check_pin_proof(connection, &user, proof).await?;
+                let user = local(&who)?;
+                self.check_pin_proof(connection, user, proof).await?;
                 self.store().clear_pin(user.user).await.map_err(internal)?;
                 tracing::info!(user = %user.username, "PIN cleared");
                 Ok(Reply::Done)
@@ -1592,6 +1653,7 @@ impl ClientProtocol {
             // the same rules: only the user's own, the name's length, and
             // the last way to sign in kept.
             Request::ListPasskeys => {
+                let user = local(&who)?;
                 let passkeys = self
                     .store()
                     .list_passkeys(user.user)
@@ -1603,6 +1665,7 @@ impl ClientProtocol {
                 Ok(Reply::Passkeys { passkeys })
             }
             Request::RenamePasskey { id, name } => {
+                let user = local(&who)?;
                 self.store()
                     .rename_passkey(user.user, &id, &name)
                     .await
@@ -1610,9 +1673,10 @@ impl ClientProtocol {
                 Ok(Reply::Done)
             }
             Request::RemovePasskey { id } => {
+                let user = local(&who)?;
                 // As the web UI asks: a device left signed in does not
                 // take a way to sign in away.
-                recently_signed_in(&user)?;
+                recently_signed_in(user)?;
                 self.store()
                     .remove_passkey(user.user, &id)
                     .await
@@ -1625,11 +1689,13 @@ impl ClientProtocol {
             // here: it guards switching profiles on a shared device, and
             // is weaker than a sign-in. A locked session never gets here.
             Request::ConfirmPassword(confirm) => {
-                self.confirm_password(connection, &user, &confirm.password)
+                let user = local(&who)?;
+                self.confirm_password(connection, user, &confirm.password)
                     .await?;
-                self.confirmed(&session, &user, "password").await
+                self.confirmed(&session, user, "password").await
             }
             Request::BeginConfirmPasskey => {
+                let user = local(&who)?;
                 let endpoint = connection.remote_id().to_string();
                 // Refused before a challenge is made that could only fail.
                 if let Some(retry_after) = self
@@ -1656,6 +1722,7 @@ impl ClientProtocol {
                 })
             }
             Request::FinishConfirmPasskey(signed) => {
+                let user = local(&who)?;
                 user_handle_given(&signed)?;
                 let signer = self
                     .services
@@ -1678,9 +1745,10 @@ impl ClientProtocol {
                     );
                     return Err(Error::InvalidCredentials);
                 }
-                self.confirmed(&session, &user, "app passkey").await
+                self.confirmed(&session, user, "app passkey").await
             }
             Request::ListDevices => {
+                let user = local(&who)?;
                 let this = connection.remote_id().to_string();
                 let devices = self
                     .store()
@@ -1702,6 +1770,10 @@ impl ClientProtocol {
                 Ok(Reply::Devices { devices })
             }
             Request::GetPlexLink => {
+                // A portable user links no Plex account here (P7-06).
+                let Some(user) = who.local() else {
+                    return Ok(Reply::PlexLink { link: None });
+                };
                 let Some(accounts) = &self.services.plex_accounts else {
                     return Ok(Reply::PlexLink { link: None });
                 };
@@ -1715,8 +1787,9 @@ impl ClientProtocol {
                 })
             }
             Request::SetPinRequired { device, required } => {
+                let user = local(&who)?;
                 if !required {
-                    recently_signed_in(&user)?;
+                    recently_signed_in(user)?;
                 }
                 let generation = state.locks.lock().generation;
                 let this = connection.remote_id().to_string();
@@ -1765,6 +1838,7 @@ impl ClientProtocol {
                 trusted,
                 auto_login,
             } => {
+                let user = local(&who)?;
                 let this = connection.remote_id().to_string();
                 let device = device.unwrap_or_else(|| this.clone());
                 let own = device == this;
@@ -1780,7 +1854,7 @@ impl ClientProtocol {
                 // grant them, nor end another device's sessions. Stopping
                 // trust on this very device only takes away.
                 if trusted || !own {
-                    recently_signed_in(&user)?;
+                    recently_signed_in(user)?;
                 }
                 let revoked = self
                     .store()
@@ -1806,6 +1880,7 @@ impl ClientProtocol {
                 Ok(Reply::Done)
             }
             Request::ForgetDevice { device } => {
+                let user = local(&who)?;
                 // This device leaves by signing out; deleting it here would
                 // end this session with no `LoggedOut` to say so.
                 if device == connection.remote_id().to_string() {
@@ -1815,7 +1890,7 @@ impl ClientProtocol {
                 }
                 // It ends sessions elsewhere and takes away trust: a
                 // session left signed in does not (P4-03).
-                recently_signed_in(&user)?;
+                recently_signed_in(user)?;
                 let deleted = self
                     .store()
                     .delete_device(user.user, &device)
@@ -1835,6 +1910,7 @@ impl ClientProtocol {
                 Ok(Reply::Done)
             }
             Request::ListSessions => {
+                let user = local(&who)?;
                 let current = SessionToken(session.0).hash();
                 let sessions = self
                     .services
@@ -2117,9 +2193,9 @@ impl ClientProtocol {
                 }
                 let hello = state.hello.get().expect("served after Hello");
                 let viewer = crate::playback::Viewer {
-                    user_id: format!("local:{}", user.user),
-                    username: user.username.clone(),
-                    display_name: user.display_name.clone(),
+                    user_id: principal.to_string(),
+                    username: who.log_name(),
+                    display_name: who.display_name().to_owned(),
                     device_name: hello.device_name.clone(),
                     client_name: hello.client_name.clone(),
                     platform: hello.platform,
@@ -2232,7 +2308,7 @@ impl ClientProtocol {
                 let decided = planner::summary(&plan);
                 tracing::info!(
                     %id,
-                    user = %user.username,
+                    user = %who.log_name(),
                     endpoint = %connection.remote_id().fmt_short(),
                     plan = %decided.kind,
                     delivery = %decided.delivery,
@@ -2476,7 +2552,8 @@ impl ClientProtocol {
                 read
             }
             Request::LookupDeviceSignIn { code } => {
-                let (code, guess) = self.sign_in_code(connection, &user, &code)?;
+                let user = local(&who)?;
+                let (code, guess) = self.sign_in_code(connection, user, &code)?;
                 let waiting = self.services.auth.sign_ins().lookup(&code);
                 if waiting.is_some() {
                     self.services.auth.guessed_right(guess);
@@ -2494,8 +2571,9 @@ impl ClientProtocol {
                 }
             }
             Request::ApproveDeviceSignIn { code, remember } => {
-                recently_signed_in(&user)?;
-                let (code, guess) = self.sign_in_code(connection, &user, &code)?;
+                let user = local(&who)?;
+                recently_signed_in(user)?;
+                let (code, guess) = self.sign_in_code(connection, user, &code)?;
                 let approver = connection.remote_id().to_string();
                 let claim = self.services.auth.sign_ins().claim(&code, Some(&approver));
                 if !matches!(claim, Err(ClaimError::Unknown)) {
@@ -2534,7 +2612,8 @@ impl ClientProtocol {
                 }
             }
             Request::DenyDeviceSignIn { code } => {
-                let (code, guess) = self.sign_in_code(connection, &user, &code)?;
+                let user = local(&who)?;
+                let (code, guess) = self.sign_in_code(connection, user, &code)?;
                 if self.services.auth.sign_ins().deny(&code) {
                     self.services.auth.guessed_right(guess);
                     tracing::info!(user = %user.username, "device sign-in denied");
@@ -2546,7 +2625,8 @@ impl ClientProtocol {
             // P7-04: each needs a recent sign-in, as every change to how
             // the account is reached does.
             Request::TieBegin => {
-                recently_signed_in(&user)?;
+                let user = local(&who)?;
+                recently_signed_in(user)?;
                 if self
                     .store()
                     .tie_of(user.user)
@@ -2573,11 +2653,13 @@ impl ClientProtocol {
                 user: portable,
                 proof,
             } => {
-                recently_signed_in(&user)?;
-                self.tie(&session, &user, portable, &proof).await
+                let user = local(&who)?;
+                recently_signed_in(user)?;
+                self.tie(&session, user, portable, &proof).await
             }
             Request::Untie => {
-                recently_signed_in(&user)?;
+                let user = local(&who)?;
+                recently_signed_in(user)?;
                 match self.store().untie(user.user).await.map_err(internal)? {
                     Some(portable) => {
                         tracing::info!(
@@ -2592,6 +2674,66 @@ impl ClientProtocol {
                     }),
                 }
             }
+            // PX-44: the web UI's invite pages, for an admin in an app.
+            // The role first, so a consumer is told `AdminRequired`, not
+            // asked to confirm; then the same recent confirmation the web
+            // UI's `recent_admin` asks for creating and revoking.
+            Request::CreateInvite(create) => {
+                let user = admin(&who)?;
+                recently_signed_in(user)?;
+                let hello = state.hello.get();
+                let origin = crate::store::invites::InviteOrigin::Device {
+                    endpoint_id: connection.remote_id().to_string(),
+                    name: hello.and_then(|h| h.device_name.clone()),
+                    platform: hello.map_or(spoolframe_types::Platform::Unknown, |h| h.platform),
+                };
+                let request = crate::invites::InviteRequest {
+                    kind: invite_kind(create.kind)?,
+                    note: create.note.as_deref(),
+                    uses: create.uses,
+                    expires_secs: create.expires_in_secs,
+                    role: create.role,
+                };
+                let created =
+                    crate::invites::create(self.store(), request, &user.username, &origin)
+                        .await
+                        .map_err(create_invite_error)?;
+                let server = crate::invites::server_link(
+                    self.id.to_string(),
+                    self.name.get(),
+                    Some(self.addresses.told.clone()),
+                )
+                .await;
+                let link = created.link(server);
+                Ok(Reply::InviteCreated(InviteCreated {
+                    code: created.code.shown(),
+                    link,
+                    invite: invite_summary(created.record),
+                }))
+            }
+            Request::ListInvites => {
+                admin(&who)?;
+                let invites = self.store().live_invites().await.map_err(internal)?;
+                Ok(Reply::Invites {
+                    invites: invites.into_iter().map(invite_summary).collect(),
+                })
+            }
+            Request::RevokeInvite { id } => {
+                let user = admin(&who)?;
+                recently_signed_in(user)?;
+                match self.store().revoke_invite(&id).await {
+                    Ok(()) => {
+                        tracing::info!(%id, by = %user.username, "invite revoked, in an app");
+                        Ok(Reply::Done)
+                    }
+                    Err(crate::store::invites::InviteError::NoSuchInvite(_)) => {
+                        Err(Error::NotFound {
+                            what: "live invite".into(),
+                        })
+                    }
+                    Err(e) => Err(internal(e)),
+                }
+            }
             Request::Hello(_)
             | Request::AuthMethods
             | Request::LoginPassword(_)
@@ -2603,6 +2745,9 @@ impl ClientProtocol {
             | Request::TrustedProfiles
             | Request::ResumeProfile { .. }
             | Request::RedeemInvite(_)
+            | Request::BeginPortableSignIn
+            | Request::FinishPortableSignIn(_)
+            | Request::RedeemPortableInvite(_)
             | Request::Unknown => {
                 unreachable!("pre-auth and unknown requests are answered before the session check")
             }
@@ -2614,7 +2759,7 @@ impl ClientProtocol {
     /// share (PX-10); a signed-in one (adding a user) does not. One signed
     /// out is a stranger again while its connection drains (G-14).
     fn stranger_attempt(&self, state: &ConnectionState) -> Result<(), Error> {
-        if state.peer.signed_in() {
+        if state.peer.signed_in_locally() {
             return Ok(());
         }
         self.services
@@ -2749,6 +2894,260 @@ impl ClientProtocol {
         Ok(Reply::LoggedIn {
             session: SessionId(token.0),
             remembered,
+        })
+    }
+
+    /// A sign-in with a portable user's device credential (P7-06, §58)
+    /// from this connection's endpoint: the credential and its device's
+    /// proof over the nonce this endpoint began, then the session
+    /// [`Self::open_portable`] resolves.
+    ///
+    /// Counted as a wrong guess before anything is checked, and taken back
+    /// only once a session is open (A-13): no grant here is as wrong as a
+    /// forged credential. Every refusal is `InvalidCredentials`; why is
+    /// logged here.
+    async fn portable_sign_in(
+        &self,
+        connection: &Connection,
+        sign_in: &PortableSignIn,
+        hello: &Hello,
+    ) -> Result<Reply, Error> {
+        let endpoint_id = connection.remote_id().to_string();
+        let auth = &self.services.auth;
+        let guess = auth
+            .guess(format!("portable@{endpoint_id}"), Some(endpoint_id.clone()))
+            .map_err(|wait| Error::RateLimited {
+                retry_after_ms: wait.as_millis().max(1) as u64,
+            })?;
+        let credential = self.check_portable(&endpoint_id, sign_in).await?;
+        // Kept only for someone this server knows: a stranger's states
+        // would fill its disk.
+        if self.known_here(credential.user).await? {
+            self.keep_states(&sign_in.states).await?;
+        }
+        let reply = self.open_portable(connection, &credential, hello).await?;
+        auth.guessed_right(guess);
+        Ok(reply)
+    }
+
+    /// Redeem a `portable-account` invite (P7-05) as the portable user
+    /// its sign-in proves, then sign them in as [`Self::portable_sign_in`]
+    /// does. The credential is checked first, and counted as a wrong
+    /// guess until it holds; the code is counted as `RedeemInvite` counts
+    /// it. An identity tied to an account here needs no grant: it signs
+    /// in as the account, and the invite keeps its use.
+    async fn redeem_portable_invite(
+        &self,
+        connection: &Connection,
+        redeem: &RedeemPortableInvite,
+        hello: &Hello,
+    ) -> Result<Reply, Error> {
+        let endpoint_id = connection.remote_id().to_string();
+        let auth = &self.services.auth;
+        let guess = auth
+            .guess(format!("portable@{endpoint_id}"), Some(endpoint_id.clone()))
+            .map_err(|wait| Error::RateLimited {
+                retry_after_ms: wait.as_millis().max(1) as u64,
+            })?;
+        let credential = self.check_portable(&endpoint_id, &redeem.sign_in).await?;
+        let user = credential.user;
+        // The credential held: whatever the code makes of it, it was no
+        // guess at one.
+        auth.guessed_right(guess);
+        let tied = self
+            .store()
+            .tied_account(user)
+            .await
+            .map_err(internal)?
+            .is_some();
+        if !tied {
+            let redeemed = crate::invites::redeem_portable(
+                auth,
+                &endpoint_id,
+                &redeem.code,
+                user,
+                redeem.sign_in.display_name.as_deref(),
+            )
+            .await
+            .map_err(redeem_error)?;
+            tracing::info!(
+                endpoint = %endpoint_id,
+                portable = %user.fingerprint(),
+                granted = matches!(redeemed, crate::store::invites::PortableRedeemed::Granted),
+                "a portable identity redeemed an invite"
+            );
+        }
+        // Known here now: its states are worth keeping.
+        self.keep_states(&redeem.sign_in.states).await?;
+        self.open_portable(connection, &credential, hello).await
+    }
+
+    /// The credential `sign_in` proves from `endpoint_id`, with the nonce
+    /// that endpoint began, used up whatever follows. Its own signature
+    /// and dates first; then the device's proof; then whether any state
+    /// it carries (its identity's, verified, held in memory only) or any
+    /// seen here revokes its key. Nothing is written: [`Self::keep_states`]
+    /// keeps the states once the identity is known here.
+    async fn check_portable(
+        &self,
+        endpoint_id: &str,
+        sign_in: &PortableSignIn,
+    ) -> Result<spoolframe_protocol::portable::UserDeviceCredential, Error> {
+        let credential = &sign_in.credential;
+        let refused = |why: &dyn std::fmt::Display| {
+            tracing::debug!(
+                endpoint = %endpoint_id,
+                portable = %credential.user.fingerprint(),
+                %why,
+                "a portable sign-in did not hold"
+            );
+            Error::InvalidCredentials
+        };
+        let Some(nonce) = self.portable_sign_ins.take(endpoint_id) else {
+            return Err(refused(&"no sign-in begun, or it is over"));
+        };
+        if sign_in.states.len() > spoolframe_protocol::messages::MAX_SIGN_IN_STATES {
+            return Err(refused(&"too many identity states"));
+        }
+        let now = self.store().clock().unix_secs();
+        credential.verify(now).map_err(|e| refused(&e))?;
+        for state in &sign_in.states {
+            if state.user != credential.user {
+                return Err(refused(&"an identity state of another identity"));
+            }
+            state.verify().map_err(|e| refused(&e))?;
+            let revokes = state.revoked.iter().any(|entry| {
+                entry.key == credential.device_key
+                    && !spoolframe_protocol::portable::revocation_lapsed(entry.revoked_at, now)
+            });
+            if revokes {
+                return Err(refused(&"a state it carries revokes its key"));
+            }
+        }
+        match crate::portable::check_presentation(
+            self.store(),
+            credential,
+            self.id.as_bytes(),
+            &nonce,
+            &sign_in.proof,
+            now,
+        )
+        .await
+        {
+            Ok(_) => Ok(credential.clone()),
+            Err(crate::portable::PresentationError::Store(e)) => Err(internal(e)),
+            Err(e) => Err(refused(&e)),
+        }
+    }
+
+    /// Whether `user` is someone this server knows: tied to an account
+    /// here, or with a live grant.
+    async fn known_here(&self, user: spoolframe_protocol::PortableUserId) -> Result<bool, Error> {
+        let store = self.store();
+        Ok(store.tied_account(user).await.map_err(internal)?.is_some()
+            || store.grant_of(user).await.map_err(internal)?.is_some())
+    }
+
+    /// Take in `states`, already checked by [`Self::check_portable`]: a
+    /// revocation one brings ends the sessions of the key it names (§48).
+    async fn keep_states(
+        &self,
+        states: &[spoolframe_protocol::portable::PortableIdentityState],
+    ) -> Result<(), Error> {
+        let now = self.store().clock().unix_secs();
+        for state in states {
+            match self.store().accept_identity_state(state, now).await {
+                Ok(_) => {}
+                Err(crate::store::portable::IdentityStateError::Store(e)) => {
+                    return Err(internal(e));
+                }
+                // Checked before: only a revision past the database's
+                // range gets here, and the sign-in stands without it.
+                Err(e) => tracing::debug!(error = %e, "an identity state not kept"),
+            }
+        }
+        Ok(())
+    }
+
+    /// A session for the portable user `credential` names on this
+    /// connection's endpoint, local-first (§58): the account tied to them
+    /// here if there is one (and it is not disabled), else their own if
+    /// they have a live grant here, else `InvalidCredentials`. Either ends
+    /// when the credential does, or its key is revoked; the account's
+    /// counts as signed in long ago.
+    async fn open_portable(
+        &self,
+        connection: &Connection,
+        credential: &spoolframe_protocol::portable::UserDeviceCredential,
+        hello: &Hello,
+    ) -> Result<Reply, Error> {
+        let endpoint_id = connection.remote_id().to_string();
+        let store = self.store();
+        let user = credential.user;
+        let binding_of = crate::store::grants::CredentialBinding::of(credential);
+        let local = store.tied_account(user).await.map_err(internal)?;
+        let token = if let Some(local) = local {
+            let account = store.user_by_id(local).await.map_err(internal)?;
+            if account.is_none_or(|a| a.disabled_at.is_some()) {
+                tracing::debug!(
+                    endpoint = %endpoint_id,
+                    portable = %user.fingerprint(),
+                    "a portable sign-in for a disabled account"
+                );
+                return Err(Error::InvalidCredentials);
+            }
+            let binding = SessionBinding::Endpoint {
+                endpoint_id: endpoint_id.clone(),
+                device_name: hello.device_name.clone(),
+                platform: hello.platform,
+            };
+            let token = self
+                .services
+                .auth
+                .open_credential_session(local, &binding, &binding_of)
+                .await
+                .map_err(internal)?;
+            tracing::info!(
+                endpoint = %endpoint_id,
+                user = %local,
+                portable = %user.fingerprint(),
+                "logged in with a tied portable credential"
+            );
+            token
+        } else if store.grant_of(user).await.map_err(internal)?.is_some() {
+            let token = self
+                .services
+                .auth
+                .open_portable_session(
+                    &binding_of,
+                    &endpoint_id,
+                    hello.device_name.as_deref(),
+                    hello.platform,
+                )
+                .await
+                .map_err(internal)?;
+            tracing::info!(
+                endpoint = %endpoint_id,
+                portable = %user.fingerprint(),
+                "a portable user signed in"
+            );
+            token
+        } else {
+            tracing::debug!(
+                endpoint = %endpoint_id,
+                portable = %user.fingerprint(),
+                "a portable sign-in with neither a tie nor a grant here"
+            );
+            return Err(Error::InvalidCredentials);
+        };
+        if local.is_some() {
+            self.signed_in(connection, &token.0).await;
+        } else {
+            self.guest_signed_in(connection);
+        }
+        Ok(Reply::LoggedIn {
+            session: SessionId(token.0),
+            remembered: false,
         })
     }
 
@@ -3262,7 +3661,19 @@ impl ClientProtocol {
         };
         for id in self
             .connections
-            .signed_in(&connection.remote_id(), user.as_deref())
+            .signed_in(&connection.remote_id(), user.as_deref(), true)
+        {
+            self.addresses.tell(id);
+        }
+    }
+
+    /// `connection`'s device signed in as a portable guest (P7-06): the
+    /// normal limits and the server's addresses, as after a sign-in, but
+    /// its sign-ins stay on the strangers' budget.
+    fn guest_signed_in(&self, connection: &Connection) {
+        for id in self
+            .connections
+            .signed_in(&connection.remote_id(), None, false)
         {
             self.addresses.tell(id);
         }
@@ -3294,18 +3705,22 @@ impl ProtocolHandler for ClientProtocol {
         let endpoint = connection.remote_id();
         // A device with a live session gets the normal limits; any other
         // is a stranger, held only while there is room for one (PX-10).
-        let known = match self
-            .store()
-            .endpoint_signed_in(&connection.remote_id().to_string())
-            .await
-        {
-            Ok(known) => known,
+        // A portable guest's session (P7-06) gives the limits, not a
+        // local user's standing with the strangers' budget.
+        let id_text = connection.remote_id().to_string();
+        let sessions = async {
+            let local = self.store().endpoint_signed_in(&id_text).await?;
+            let guest = local || self.store().endpoint_has_portable_session(&id_text).await?;
+            Ok::<_, crate::store::StoreError>((local || guest, local))
+        };
+        let (known, local) = match sessions.await {
+            Ok(found) => found,
             Err(e) => {
                 tracing::warn!(error = %e, "cannot look the device's sessions up");
-                false
+                (false, false)
             }
         };
-        let Some(peer) = self.connections.admit(&connection, known) else {
+        let Some(peer) = self.connections.admit(&connection, known, local) else {
             tracing::info!(
                 endpoint = %endpoint.fmt_short(),
                 "refusing a connection: too many devices that are not signed in"
@@ -3641,8 +4056,11 @@ impl Asked {
             | Request::FinishConfirmPasskey(_)
             | Request::FinishPasskeyRegistration(_) => asked.credential = Some("passkey refused"),
             Request::TieFinish { .. } => asked.credential = Some("tie proof refused"),
+            Request::FinishPortableSignIn(_) => {
+                asked.credential = Some("portable credential refused");
+            }
             Request::ResumeProfile { .. } => asked.resume = true,
-            Request::RedeemInvite(_) => asked.invite = true,
+            Request::RedeemInvite(_) | Request::RedeemPortableInvite(_) => asked.invite = true,
             _ => {}
         }
         asked
@@ -3674,6 +4092,7 @@ fn redeem_error(e: crate::invites::RedeemError) -> Error {
         RedeemError::Expired => Error::InviteExpired,
         RedeemError::Exhausted => Error::InviteExhausted,
         RedeemError::UsernameTaken => Error::UsernameTaken,
+        RedeemError::WrongKind => Error::WrongInviteKind,
         RedeemError::InvalidInput(message) => Error::InvalidInput { message },
         RedeemError::RateLimited { retry_after } => Error::RateLimited {
             retry_after_ms: u64::try_from(retry_after.as_millis())
@@ -3702,6 +4121,99 @@ fn login_error(e: LoginError) -> Error {
 
 /// P3-03's rule for what adds or takes away a way to sign in: `user`'s
 /// session proved who they are within [`RECENT_SIGN_IN`].
+/// The session's local account, for a request only an account here can
+/// make; a portable user's session (P7-06) has none.
+fn local(who: &Who) -> Result<&SessionUser, Error> {
+    who.local().ok_or(Error::NotForPortableUsers)
+}
+
+/// The session's local user, if an admin (PX-44).
+fn admin(who: &Who) -> Result<&SessionUser, Error> {
+    let user = local(who)?;
+    if user.role != spoolframe_types::Role::Admin {
+        return Err(Error::AdminRequired);
+    }
+    Ok(user)
+}
+
+/// The kind an app asked for, as the store keeps it; one this build does
+/// not know is refused.
+fn invite_kind(
+    kind: spoolframe_protocol::invite_admin::InviteKind,
+) -> Result<crate::store::invites::InviteKind, Error> {
+    use crate::store::invites::InviteKind as Stored;
+    use spoolframe_protocol::invite_admin::InviteKind as Wire;
+    match kind {
+        Wire::CreateUser => Ok(Stored::CreateUser),
+        Wire::PortableAccount => Ok(Stored::PortableAccount),
+        Wire::Federation => Ok(Stored::Federation),
+        Wire::Unknown => Err(Error::InvalidInput {
+            message: "use create-user, portable-account or federation".into(),
+        }),
+    }
+}
+
+fn create_invite_error(e: crate::invites::CreateError) -> Error {
+    use crate::invites::CreateError;
+    use crate::store::invites::InviteError;
+    match e {
+        CreateError::Invalid(message) => Error::InvalidInput { message },
+        CreateError::Invite(e @ InviteError::NotYet(_)) => Error::InvalidInput {
+            message: e.to_string(),
+        },
+        CreateError::Invite(e) => internal(e),
+    }
+}
+
+/// An invite as the apps list it (PX-44): who made it by their display
+/// name, and where.
+fn invite_summary(record: crate::store::invites::InviteRecord) -> InviteSummary {
+    use crate::store::invites::{InviteKind as Stored, InviteOrigin as Origin};
+    use spoolframe_protocol::invite_admin::{InviteKind as Wire, InviteOrigin};
+    let created_from = match record.origin {
+        Origin::Web => InviteOrigin::WebAdmin,
+        Origin::Cli => InviteOrigin::Cli,
+        Origin::Device {
+            endpoint_id,
+            name,
+            platform,
+        } => InviteOrigin::Device {
+            endpoint_id,
+            name,
+            platform,
+        },
+    };
+    // The CLI signs in as no one: its invites say so in `created_by`.
+    let created_by = match created_from {
+        InviteOrigin::Cli => InviteCreator {
+            username: None,
+            display_name: record.created_by,
+        },
+        _ => InviteCreator {
+            display_name: record
+                .created_by_display_name
+                .unwrap_or_else(|| record.created_by.clone()),
+            username: Some(record.created_by),
+        },
+    };
+    InviteSummary {
+        id: record.id,
+        kind: match record.kind {
+            Stored::CreateUser => Wire::CreateUser,
+            Stored::PortableAccount => Wire::PortableAccount,
+            Stored::Federation => Wire::Federation,
+        },
+        note: record.note,
+        role: record.role,
+        uses: record.uses,
+        uses_left: record.uses_left,
+        expires_at: record.expires_at,
+        created_at: record.created_at,
+        created_by,
+        created_from,
+    }
+}
+
 fn recently_signed_in(user: &SessionUser) -> Result<(), Error> {
     let age = crate::store::now() - user.authenticated_at;
     if age > RECENT_SIGN_IN.as_secs() as i64 {

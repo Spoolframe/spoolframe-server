@@ -34,13 +34,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh::{EndpointId, RelayConfig, RelayUrl};
-use spoolframe_protocol::invite::{Invite, MAX_HINTS, parse_link};
+use spoolframe_protocol::invite::{Invite, InviteLinkKind, MAX_HINTS, parse_link};
 use spoolframe_protocol::relay_access::invite_token;
-use spoolframe_protocol::{RedeemInvite, Reply, Request, Response, fingerprint};
+use spoolframe_protocol::{
+    RedeemInvite, RedeemPortableInvite, Reply, Request, Response, fingerprint,
+};
 use spoolframe_types::Role;
 
 use crate::client::{Client, newest_first, parse_id, same_server};
 use crate::connection::ServerConnection;
+use crate::portable::PortableUserId;
 use crate::servers::{self, SavedServer};
 use crate::session::{Session, SignInMethod};
 use crate::{SdkError, ServerEntry};
@@ -70,6 +73,12 @@ pub struct InviteInfo {
     /// The role the account gets, as the link says; a hint, the server
     /// decides.
     pub role: Option<Role>,
+    /// What the code does, as the link says (P7-05): makes an account
+    /// ([`Client::redeem_invite`]), or grants a portable identity access
+    /// ([`Client::redeem_invite_portable`]). A hint for which form to
+    /// show; the server answers the other with
+    /// [`SdkError::WrongInviteKind`].
+    pub kind: InviteLinkKind,
     /// This key is a saved server already: the link only adds its hints.
     pub saved: bool,
 }
@@ -101,6 +110,7 @@ impl Client {
                 .expires_at
                 .map(|secs| UNIX_EPOCH + Duration::from_secs(secs)),
             role: invite.role,
+            kind: invite.kind,
             saved,
         })
     }
@@ -233,6 +243,71 @@ impl Client {
         self.save_invite_server(link).await?;
         self.keep_session(id, token, Some(SignInMethod::Password), remembered)
             .await
+    }
+
+    /// Join the server guest invite `link` names as portable identity
+    /// `identity` (P7-05), on the phone that holds its root: the phone
+    /// signs itself a credential if it has none fresh
+    /// ([`crate::Portable::own_credential`]), proves it, and redeems the
+    /// code. The server grants the identity access (no account is made),
+    /// calls it `display_name`, and signs it in; the server is saved as
+    /// [`Client::save_invite_server`] saves it, and the session kept, to
+    /// sign in again with [`Client::sign_in_portable`]. A refused
+    /// redemption saves nothing.
+    ///
+    /// Refusals: [`SdkError::InviteInvalid`], [`SdkError::InviteExpired`],
+    /// [`SdkError::InviteExhausted`]; [`SdkError::WrongInviteKind`] for an
+    /// account's invite ([`Client::redeem_invite`] it); a display name
+    /// that is not acceptable [`SdkError::InvalidInput`];
+    /// [`SdkError::InvalidCredentials`]; [`SdkError::RateLimited`]. An
+    /// identity whose root is not here and that has no credential is
+    /// [`SdkError::UnknownIdentity`].
+    pub async fn redeem_invite_portable(
+        &self,
+        link: &str,
+        identity: PortableUserId,
+        display_name: Option<&str>,
+    ) -> Result<Session, SdkError> {
+        let (invite, _) = parsed(link)?;
+        let redeemed = self.redeem_portable(link, identity, display_name).await;
+        self.drop_token(&invite).await;
+        redeemed
+    }
+
+    async fn redeem_portable(
+        &self,
+        link: &str,
+        identity: PortableUserId,
+        display_name: Option<&str>,
+    ) -> Result<Session, SdkError> {
+        let (invite, id) = parsed(link)?;
+        let Some(code) = invite.code.clone() else {
+            return Err(SdkError::InvalidInput(
+                "this invite has no code: it only finds the server".into(),
+            ));
+        };
+        let portable = self.portable();
+        match portable.own_credential(identity).await {
+            Ok(_) | Err(SdkError::UnknownIdentity(_) | SdkError::Credential(_)) => {}
+            Err(e) => return Err(e),
+        }
+        let conn = self.reach(&invite, id).await?;
+        let saved = servers::load(self.inner.storage.as_ref()).await?;
+        if !saved.iter().any(|s| s.endpoint_id == invite.server) {
+            refuse_another_key(&saved, id, &conn)?;
+        }
+        let sign_in = self.portable_sign_in(id, identity, display_name).await?;
+        let request = Request::RedeemPortableInvite(RedeemPortableInvite { code, sign_in });
+        let token = crate::portable_sign_in::logged_in(self.call(id, None, request).await?)?;
+        self.save_invite_server(link).await?;
+        self.keep_session_as(
+            id,
+            token,
+            Some(SignInMethod::Portable),
+            false,
+            Some(identity),
+        )
+        .await
     }
 
     /// The connection to server `id`, dialled with `invite`'s hints too;

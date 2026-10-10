@@ -182,6 +182,8 @@ pub fn episode(key: &str, season_key: &str, season: u32, episode: u32) -> Item {
         title: format!("S{season}E{episode}"),
         summary: None,
         content_rating: None,
+        year: None,
+        air_date: None,
         duration: Some(Duration::from_secs(2640)),
         artwork: Vec::new(),
         playback: PlaybackState::default(),

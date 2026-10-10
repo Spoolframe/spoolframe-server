@@ -627,7 +627,7 @@ pub(crate) fn gpu_tone_maps(encoders: &Encoders) -> Vec<api::GpuToneMap> {
         .collect()
 }
 
-fn filter_place(on: FilterOn) -> api::FilterPlace {
+pub(crate) fn filter_place(on: FilterOn) -> api::FilterPlace {
     match on {
         FilterOn::None => api::FilterPlace::None,
         FilterOn::Gpu => api::FilterPlace::Gpu,
@@ -655,21 +655,8 @@ fn made(s: &Snapshot) -> api::PlaybackMade {
     };
     let (width, height) = made.size.unzip();
     api::PlaybackMade {
-        decoder: match made.decoder {
-            Decoder::None => api::VideoDecoder::None,
-            Decoder::Software => api::VideoDecoder::Software,
-            Decoder::Hardware(hardware) => api::VideoDecoder::Gpu {
-                api: gpu_api(hardware),
-            },
-            Decoder::Vulkan => api::VideoDecoder::Gpu {
-                api: api::GpuApi::Vulkan,
-            },
-        },
-        encoder: made.encoder.as_ref().map(|e| api::VideoEncoderUsed {
-            codec: e.codec.to_string(),
-            name: e.name.clone(),
-            gpu: e.hardware.map(gpu_api),
-        }),
+        decoder: video_decoder(made.decoder),
+        encoder: made.encoder.as_ref().map(encoder_used),
         tone_map: filter_place(made.tone_map),
         tone_mapper: made.tone_mapper.map(tone_mapper),
         burn_in: filter_place(made.burn_in),
@@ -677,6 +664,31 @@ fn made(s: &Snapshot) -> api::PlaybackMade {
         height,
         target_bitrate: made.target_bitrate,
         measured_bitrate: conversion.and_then(|c| c.output.bitrate()),
+    }
+}
+
+/// What decodes the video, as the admin API names it (PX-24).
+pub(crate) fn video_decoder(decoder: Decoder) -> api::VideoDecoder {
+    match decoder {
+        Decoder::None => api::VideoDecoder::None,
+        Decoder::Software => api::VideoDecoder::Software,
+        Decoder::Hardware(hardware) => api::VideoDecoder::Gpu {
+            api: gpu_api(hardware),
+        },
+        Decoder::Vulkan => api::VideoDecoder::Gpu {
+            api: api::GpuApi::Vulkan,
+        },
+    }
+}
+
+/// The video encoder, as the admin API names it (PX-24).
+pub(crate) fn encoder_used(
+    encoder: &spoolframe_media::encoders::VideoEncoder,
+) -> api::VideoEncoderUsed {
+    api::VideoEncoderUsed {
+        codec: encoder.codec.to_string(),
+        name: encoder.name.clone(),
+        gpu: encoder.hardware.map(gpu_api),
     }
 }
 
@@ -1205,6 +1217,7 @@ mod tests {
                 frame_rate_millis: None,
                 bit_depth: 8,
                 hdr: None,
+                bit_rate: None,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),

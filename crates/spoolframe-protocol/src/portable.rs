@@ -191,7 +191,7 @@ impl<'de> Deserialize<'de> for DevicePublicKey {
 }
 
 /// A signature in serde: 128 lowercase hex digits (64 bytes).
-mod signature_hex {
+pub(crate) mod signature_hex {
     use super::*;
 
     struct Hex<'a>(&'a Signature);

@@ -35,7 +35,7 @@ use spoolframe_admin_api::{
 use spoolframe_admin_api::{
     AudioPick, SsoLink, SubtitlePick, TrackOverrideEntry, TrackPreferences, TrackPreferencesInfo,
 };
-use spoolframe_admin_api::{InviteCreated, InviteEntry, InviteKind, NewInvite};
+use spoolframe_admin_api::{InviteCreated, InviteEntry, InviteKind, NewInvite, PortableGrant};
 use spoolframe_admin_api::{LookupStatus, MappingStatus};
 use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
@@ -307,26 +307,7 @@ impl StatusSource {
     /// It reads the interfaces, off the async threads.
     pub(crate) async fn invite(&self) -> Option<spoolframe_protocol::invite::Invite> {
         let server = self.endpoint_id.get()?.clone();
-        let told = self.told.get().cloned();
-        let (addrs, relays, lookup) = match told {
-            Some(told) => {
-                tokio::task::spawn_blocking(move || (told.addrs(), told.relays(), told.lookup()))
-                    .await
-                    .unwrap_or_default()
-            }
-            None => Default::default(),
-        };
-        Some(spoolframe_protocol::invite::Invite {
-            server,
-            name: Some(self.name.get()),
-            addrs: addrs
-                .into_iter()
-                .take(spoolframe_protocol::invite::MAX_HINTS)
-                .collect(),
-            relays,
-            lookup,
-            ..Default::default()
-        })
+        Some(crate::invites::server_link(server, self.name.get(), self.told.get().cloned()).await)
     }
 
     /// The endpoint key's fingerprint (P1-21), once the endpoint is up.
@@ -339,6 +320,8 @@ impl StatusSource {
     fn status(&self) -> ServerStatus {
         let detected = self.transcoding.detected();
         let encoders = detected.encoders.clone();
+        let budget_now = self.jobs.as_ref().map(|jobs| jobs.budget());
+        let limits = self.jobs.as_ref().map(|jobs| jobs.limits());
         ServerStatus {
             name: self.name.get(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -358,6 +341,24 @@ impl StatusSource {
                 gpu_tonemap: encoders.gpu_tonemap,
                 gpu_overlay: encoders.gpu_overlay,
                 gpu_tone_maps: crate::playback_debug::gpu_tone_maps(&encoders),
+                gpus: crate::gpu_status::cards(
+                    &detected,
+                    self.transcoding.entries(),
+                    &budget_now
+                        .as_ref()
+                        .map(|now| now.gpu_jobs_by_card.clone())
+                        .unwrap_or_default(),
+                    budget_now.as_ref().map_or(0, |now| now.max_gpu_jobs),
+                ),
+                other_gpus: crate::gpu_status::others(&detected),
+                gpu_notes: detected.notes.clone(),
+                // With no conversions here, nothing goes anywhere.
+                routes: match &limits {
+                    Some(limits) => {
+                        crate::gpu_status::routes(&detected, limits.gpu_filters, limits.tone_map)
+                    }
+                    None => Vec::new(),
+                },
                 budget: self.jobs.as_ref().map(|jobs| {
                     let now = jobs.budget();
                     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
@@ -3069,89 +3070,41 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn invite_create(&self, ext: &Extensions, invite: NewInvite) -> RpcResult<InviteCreated> {
-        use spoolframe_admin_api::invite::{
-            DEFAULT_EXPIRES_SECS, DEFAULT_USES, MADE_BY_CLI, MAX_EXPIRES_SECS, MAX_NOTE_CHARS,
-            MAX_USES, MIN_EXPIRES_SECS,
-        };
+        use crate::store::invites::InviteOrigin;
+        use spoolframe_admin_api::invite::MADE_BY_CLI;
         let caller = self.recent_admin(ext).await?;
-        let kind = store_invite_kind(invite.kind);
-        if kind != crate::store::invites::InviteKind::CreateUser {
-            return Err(InviteError::NotYet(kind).into());
-        }
-        let uses = invite.uses.unwrap_or(DEFAULT_USES);
-        if !(1..=MAX_USES).contains(&uses) {
-            return Err(error(
-                error_code::INVALID_INPUT,
-                format!("an invite makes 1 to {MAX_USES} accounts"),
-            ));
-        }
-        let expires = invite.expires.unwrap_or(DEFAULT_EXPIRES_SECS);
-        if !(MIN_EXPIRES_SECS..=MAX_EXPIRES_SECS).contains(&expires) {
-            return Err(error(
-                error_code::INVALID_INPUT,
-                "an invite lasts an hour to 30 days",
-            ));
-        }
-        let role = invite.role.unwrap_or(Role::Consumer);
-        if role == Role::Unknown {
-            return Err(error(error_code::INVALID_INPUT, "use admin or consumer"));
-        }
-        let note = invite
-            .note
-            .as_deref()
-            .map(str::trim)
-            .filter(|n| !n.is_empty());
-        if note
-            .is_some_and(|n| n.chars().count() > MAX_NOTE_CHARS || n.chars().any(char::is_control))
-        {
-            return Err(error(
-                error_code::INVALID_INPUT,
-                format!("a note is at most {MAX_NOTE_CHARS} characters, on one line"),
-            ));
-        }
-        let Some(mut link) = self.status.invite().await else {
+        let Some(server) = self.status.invite().await else {
             return Err(error(
                 error_code::NOT_CONFIGURED,
                 "the server's endpoint is starting; try again in a moment",
             ));
         };
         // The browser's pages send their origin; the CLI does not.
-        let created_by = if ext.get::<PageOrigin>().is_some() {
-            self.account(caller).await?.username
+        let (created_by, origin) = if ext.get::<PageOrigin>().is_some() {
+            (self.account(caller).await?.username, InviteOrigin::Web)
         } else {
-            MADE_BY_CLI.to_owned()
+            (MADE_BY_CLI.to_owned(), InviteOrigin::Cli)
         };
-        let code = crate::invites::InviteCode::generate();
-        let hash = code.hash();
-        let expires_at =
-            self.auth.store().clock().unix_secs() + i64::try_from(expires).unwrap_or(i64::MAX);
-        let record = self
-            .auth
-            .store()
-            .create_invite(crate::store::invites::NewInvite {
-                kind,
-                capability_hash: &hash,
-                role,
-                note,
-                uses,
-                expires_at,
-                created_by: &created_by,
-            })
-            .await?;
-        tracing::info!(
-            id = %record.id,
-            %role,
-            uses,
-            by = %created_by,
-            "invite made"
-        );
-        link.code = Some(code.as_str().to_owned());
-        link.expires_at = u64::try_from(expires_at).ok();
-        link.role = Some(role);
+        let request = crate::invites::InviteRequest {
+            kind: store_invite_kind(invite.kind),
+            note: invite.note.as_deref(),
+            uses: invite.uses,
+            expires_secs: invite.expires,
+            role: invite.role,
+        };
+        let created = crate::invites::create(self.auth.store(), request, &created_by, &origin)
+            .await
+            .map_err(|e| match e {
+                crate::invites::CreateError::Invalid(message) => {
+                    error(error_code::INVALID_INPUT, message)
+                }
+                crate::invites::CreateError::Invite(e) => e.into(),
+            })?;
+        let link = created.link(server);
         Ok(InviteCreated {
-            invite: invite_entry(record),
-            code: code.shown(),
-            link: link.link(),
+            code: created.code.shown(),
+            link,
+            invite: invite_entry(created.record),
         })
     }
 
@@ -3165,6 +3118,39 @@ impl AdminApiServer for AdminApi {
         self.recent_admin(ext).await?;
         self.auth.store().revoke_invite(&id).await?;
         tracing::info!(%id, "invite revoked");
+        Ok(())
+    }
+
+    async fn grant_list(&self, ext: &Extensions) -> RpcResult<Vec<PortableGrant>> {
+        self.admin(ext).await?;
+        let grants = self.auth.store().grants().await.map_err(internal)?;
+        Ok(grants
+            .into_iter()
+            .map(|g| PortableGrant {
+                id: g.portable.to_string(),
+                fingerprint: g.portable.fingerprint(),
+                display_name: g.display_name,
+                granted_at: g.granted_at,
+                invite_id: g.invite_id,
+                live_sessions: g.live_sessions,
+            })
+            .collect())
+    }
+
+    async fn grant_revoke(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        self.recent_admin(ext).await?;
+        let no_such = || error(error_code::NO_SUCH_GRANT, format!("no grant to {id:?}"));
+        let portable: spoolframe_protocol::PortableUserId = id.parse().map_err(|_| no_such())?;
+        if !self
+            .auth
+            .store()
+            .revoke_grant(portable)
+            .await
+            .map_err(internal)?
+        {
+            return Err(no_such());
+        }
+        tracing::info!(portable = %portable.fingerprint(), "portable grant revoked");
         Ok(())
     }
 

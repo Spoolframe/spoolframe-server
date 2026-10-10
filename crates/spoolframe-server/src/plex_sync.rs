@@ -562,7 +562,10 @@ impl WatchSync {
         dry_run: bool,
         report: &mut Report,
     ) {
-        let Principal::LocalUser(user) = principal;
+        // Only a local user links a Plex account (P7-06).
+        let Principal::LocalUser(user) = principal else {
+            return;
+        };
         let keys: HashSet<String> = on.sections.keys().cloned().collect();
         let plex = match on.plex.watch_states(Some(&keys)).await {
             Ok(plex) => plex,

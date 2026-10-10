@@ -327,6 +327,25 @@ pub fn Server(#[props(default = 18)] size: u32) -> Element {
     }
 }
 
+/// A GPU, for the Overview's GPUs (lucide's chip).
+#[component]
+pub fn Chip(#[props(default = 18)] size: u32) -> Element {
+    rsx! {
+        Stroke { size,
+            rect { width: "16", height: "16", x: "4", y: "4", rx: "2" }
+            rect { width: "6", height: "6", x: "9", y: "9", rx: "1" }
+            path { d: "M15 2v2" }
+            path { d: "M15 20v2" }
+            path { d: "M2 15h2" }
+            path { d: "M2 9h2" }
+            path { d: "M20 15h2" }
+            path { d: "M20 9h2" }
+            path { d: "M9 2v2" }
+            path { d: "M9 20v2" }
+        }
+    }
+}
+
 /// Plex.
 #[component]
 pub fn Tv(#[props(default = 18)] size: u32) -> Element {

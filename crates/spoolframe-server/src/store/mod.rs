@@ -4,6 +4,7 @@
 //! Only the running server opens it. Admin tools go through the admin
 //! API, so users, sessions and rate limits have a single owner.
 
+pub mod grants;
 pub mod identities;
 pub mod invites;
 pub mod passkeys;

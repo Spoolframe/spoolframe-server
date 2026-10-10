@@ -61,6 +61,7 @@ impl Store {
         let json = serde_json::to_string(state).expect("an identity state always serializes");
         let mut tx = self.pool.begin().await?;
         let mut revocations = 0;
+        let mut ended = 0;
         for entry in state.revoked.iter() {
             if revocation_lapsed(entry.revoked_at, now) {
                 continue;
@@ -74,6 +75,29 @@ impl Store {
             .bind(&user)
             .bind(entry.key.to_string())
             .bind(entry.revoked_at)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            // The sessions the key opened end with it (P7-06): a guest's,
+            // and a tied account's opened with the credential.
+            let key = entry.key.to_string();
+            ended += sqlx::query(
+                "UPDATE portable_sessions SET revoked_at = ?3 \
+                 WHERE portable_user_id = ?1 AND device_key = ?2 AND revoked_at IS NULL",
+            )
+            .bind(&user)
+            .bind(&key)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            ended += sqlx::query(
+                "UPDATE sessions SET revoked_at = ?3 \
+                 WHERE portable_user_id = ?1 AND portable_device_key = ?2 AND revoked_at IS NULL",
+            )
+            .bind(&user)
+            .bind(&key)
+            .bind(now)
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -95,6 +119,10 @@ impl Store {
         .rows_affected()
             > 0;
         tx.commit().await?;
+        if ended > 0 {
+            tracing::info!(user = %state.user, sessions = ended, "ended the sessions of revoked device keys");
+            self.note_sessions_ended();
+        }
         if newest || revocations > 0 {
             tracing::info!(
                 user = %state.user,

@@ -254,6 +254,22 @@ pub enum SdkError {
     /// one identity, one account per server. Sever that tie first.
     #[error("that identity is tied to another account on this server")]
     PortableIdTaken,
+    /// The invite's code is right and of the other kind (P7-05): a guest
+    /// invite redeemed for an account ([`crate::Client::redeem_invite`]),
+    /// or an account's redeemed as a guest
+    /// ([`crate::Client::redeem_invite_portable`]). Nothing was used up:
+    /// redeem it the other way ([`crate::InviteInfo::kind`] says which).
+    #[error("this invite is of another kind")]
+    WrongInviteKind,
+    /// Signed in as a portable user (P7-06), who has no account on this
+    /// server: its password, PIN, passkeys, devices and sessions are an
+    /// account's. Hide what asks for them.
+    #[error("not available to a guest from another identity")]
+    NotForPortableUsers,
+    /// Only an admin may do this (PX-44: making and revoking invites), and
+    /// the session's user is not one. Hide what asks for it.
+    #[error("only an admin can do that")]
+    AdminRequired,
     /// Pairing this device with a portable identity, or a phone with a
     /// device, did not happen (P7-03); [`PairingError`] says why.
     #[error(transparent)]
@@ -318,6 +334,9 @@ impl SdkError {
             ServerError::TieChallengeExpired => SdkError::TieChallengeExpired,
             ServerError::AlreadyTied => SdkError::AlreadyTied,
             ServerError::PortableIdTaken => SdkError::PortableIdTaken,
+            ServerError::WrongInviteKind => SdkError::WrongInviteKind,
+            ServerError::NotForPortableUsers => SdkError::NotForPortableUsers,
+            ServerError::AdminRequired => SdkError::AdminRequired,
             other => SdkError::Server(other.to_string()),
         }
     }
@@ -364,6 +383,26 @@ mod tests {
         assert_eq!(
             SdkError::from_server(ServerError::PortableIdTaken),
             SdkError::PortableIdTaken
+        );
+    }
+
+    #[test]
+    fn portable_sign_in_errors_are_told_apart() {
+        assert_eq!(
+            SdkError::from_server(ServerError::WrongInviteKind),
+            SdkError::WrongInviteKind
+        );
+        assert_eq!(
+            SdkError::from_server(ServerError::NotForPortableUsers),
+            SdkError::NotForPortableUsers
+        );
+    }
+
+    #[test]
+    fn an_admin_request_by_someone_else_is_told_apart() {
+        assert_eq!(
+            SdkError::from_server(ServerError::AdminRequired),
+            SdkError::AdminRequired
         );
     }
 }

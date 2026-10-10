@@ -25,7 +25,8 @@ pub struct MediaDescriptor {
     pub container: String,
     #[serde(serialize_with = "millis")]
     pub duration: Option<Duration>,
-    /// Bits per second over the whole file.
+    /// Bits per second over the whole file: ffprobe's, else the file's
+    /// size over its length.
     pub bit_rate: Option<u64>,
     /// The main picture. Cover art embedded as a video stream is not it.
     pub video: Option<VideoStream>,
@@ -55,6 +56,9 @@ pub struct VideoStream {
     pub bit_depth: u32,
     /// The HDR format, `None` for SDR.
     pub hdr: Option<HdrFormat>,
+    /// Bits per second of this stream alone: what an MP4 says of it, else
+    /// a Matroska muxer's `BPS` statistics tag; `None` where neither does.
+    pub bit_rate: Option<u64>,
 }
 
 /// The transfer function of the picture, as HLS names it (`VIDEO-RANGE`).
@@ -185,6 +189,10 @@ impl MediaDescriptor {
                             v.color_transfer.as_deref(),
                             stream.side_data_list.iter().any(|d| d.dv_profile.is_some()),
                         ),
+                        bit_rate: positive(
+                            v.bit_rate
+                                .or_else(|| v.tags.as_ref().and_then(|t| t.tags.bps)),
+                        ),
                     });
                 }
                 StreamKinds::Audio(a) => {
@@ -223,7 +231,8 @@ impl MediaDescriptor {
         Self {
             container: probe.format.format_name.clone(),
             duration: probe.format.duration,
-            bit_rate: probe.format.bit_rate.and_then(|b| u64::try_from(b).ok()),
+            bit_rate: positive(probe.format.bit_rate)
+                .or_else(|| average_bit_rate(probe.format.size, probe.format.duration)),
             video,
             audio,
             subtitles,
@@ -235,12 +244,14 @@ impl MediaDescriptor {
         MediaTracks {
             duration: self.duration,
             container: Some(codecs::container(&self.container)),
+            bit_rate: self.bit_rate,
             video: self.video.as_ref().map(|v| VideoTrack {
                 codec: codecs::video_codec(&v.codec),
                 width: v.width,
                 height: v.height,
                 bit_depth: v.bit_depth,
                 hdr: v.hdr,
+                bit_rate: v.bit_rate,
             }),
             audio: self
                 .audio
@@ -310,6 +321,21 @@ fn hdr(transfer: Option<&str>, dolby_vision: bool) -> Option<HdrFormat> {
         Some("arib-std-b67") => Some(HdrFormat::Hlg),
         _ => None,
     }
+}
+
+/// A rate ffprobe gives as a number, where it is one: ffprobe prints 0
+/// or leaves it out for one it does not know.
+fn positive(rate: Option<i64>) -> Option<u64> {
+    rate.and_then(|r| u64::try_from(r).ok()).filter(|&r| r > 0)
+}
+
+/// Bits per second from the file's size in bytes over its length, for
+/// a file whose container states no rate. ffprobe prints a size of 0
+/// where it has none.
+fn average_bit_rate(size: i64, duration: Option<Duration>) -> Option<u64> {
+    let bits = u128::try_from(size).ok().filter(|&s| s > 0)? * 8;
+    let millis = duration?.as_millis();
+    (millis > 0).then(|| u64::try_from(bits * 1000 / millis).unwrap_or(u64::MAX))
 }
 
 fn flag(value: i64) -> bool {
@@ -503,6 +529,7 @@ mod tests {
                 height: 1920,
                 bit_depth: 10,
                 hdr: Some(HdrFormat::DolbyVision),
+                bit_rate: Some(23_920_982),
             })
         );
         let hdr10 = describe("mkv-cover-art").tracks().video.unwrap();
@@ -517,8 +544,49 @@ mod tests {
                 height: 1036,
                 bit_depth: 8,
                 hdr: None,
+                bit_rate: Some(2_500_625),
             })
         );
+    }
+
+    #[test]
+    fn the_client_sees_the_file_s_bit_rate_and_the_picture_s() {
+        // Matroska: the container's rate, and the picture's from
+        // mkvmerge's BPS tag.
+        let mkv = describe("mkv-hevc-pgs").tracks();
+        assert_eq!(mkv.bit_rate, Some(60_263_183));
+        assert_eq!(mkv.video.unwrap().bit_rate, Some(49_981_891));
+        // MP4 states the picture's rate on its stream.
+        let mp4 = describe("mp4-h264-aac").tracks();
+        assert_eq!(mp4.bit_rate, Some(2_730_647));
+        assert_eq!(mp4.video.unwrap().bit_rate, Some(2_500_625));
+    }
+
+    #[test]
+    fn a_file_with_no_stated_rate_is_its_size_over_its_length() {
+        let mut p = probe("mp4-h264-aac");
+        p.format.bit_rate = None;
+        // 2_265_985_716 bytes over 6638.677 s: what ffprobe stated, as
+        // it works it out the same way for MP4.
+        assert_eq!(MediaDescriptor::from_probe(&p).bit_rate, Some(2_730_647));
+        p.format.duration = None;
+        assert_eq!(MediaDescriptor::from_probe(&p).bit_rate, None);
+    }
+
+    #[test]
+    fn a_picture_with_no_stated_rate_has_none() {
+        let mut p = probe("mkv-hevc-pgs");
+        for stream in &mut p.streams {
+            if let StreamKinds::Video(v) = &mut stream.stream {
+                v.bit_rate = None;
+                if let Some(tags) = &mut v.tags {
+                    tags.tags.bps = None;
+                }
+            }
+        }
+        let d = MediaDescriptor::from_probe(&p);
+        assert_eq!(d.video.unwrap().bit_rate, None);
+        assert_eq!(d.bit_rate, Some(60_263_183));
     }
 
     #[test]

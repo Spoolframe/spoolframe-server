@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::codec::AudioCodec;
+use crate::date::CalendarDate;
 use crate::duration_ms;
 use crate::id::{ArtworkId, LibraryId, MediaId};
 
@@ -118,6 +119,15 @@ pub struct Episode {
     /// The episode's own age rating, as on a movie; a client that has
     /// none here may show the show's.
     pub content_rating: Option<String>,
+    /// The year it first aired, for "2019" on its page: the catalog's
+    /// own, else `air_date`'s.
+    ///
+    /// This and `air_date` were added without a PROTOCOL_VERSION bump,
+    /// so they are not `required::option`: a server from before them
+    /// leaves the keys out, and that reads as `None`.
+    pub year: Option<u16>,
+    /// The day it first aired, `"YYYY-MM-DD"`.
+    pub air_date: Option<CalendarDate>,
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,
     pub artwork: Vec<Artwork>,
@@ -395,6 +405,8 @@ mod tests {
             title: "Dulcinea".into(),
             summary: None,
             content_rating: None,
+            year: None,
+            air_date: None,
             duration: None,
             artwork: Vec::new(),
             playback: PlaybackState::default(),
@@ -412,6 +424,33 @@ mod tests {
         crate::test_support::assert_each_required(&album, &["artist_name"]);
         // `null` is how none is sent.
         round_trip(album);
+    }
+
+    #[test]
+    fn an_episode_from_a_server_without_air_dates_still_decodes() {
+        let episode = Episode {
+            id: media(MediaKind::Episode, "22"),
+            show_id: media(MediaKind::Show, "20"),
+            show_title: None,
+            season_id: media(MediaKind::Season, "21"),
+            season: 1,
+            episode: 1,
+            title: "Dulcinea".into(),
+            summary: None,
+            content_rating: None,
+            year: Some(2015),
+            air_date: CalendarDate::new(2015, 11, 23),
+            duration: None,
+            artwork: Vec::new(),
+            playback: PlaybackState::default(),
+        };
+        let mut json = serde_json::to_value(&episode).unwrap();
+        assert_eq!(json["air_date"], "2015-11-23");
+        let object = json.as_object_mut().unwrap();
+        object.remove("year");
+        object.remove("air_date");
+        let older: Episode = serde_json::from_value(json).unwrap();
+        assert_eq!((older.year, older.air_date), (None, None));
     }
 
     #[test]
@@ -459,6 +498,8 @@ mod tests {
             title: "Dulcinea".into(),
             summary: None,
             content_rating: Some("TV-14".into()),
+            year: Some(2015),
+            air_date: CalendarDate::new(2015, 11, 23),
             duration: Some(Duration::from_secs(2640)),
             artwork: poster(),
             playback: PlaybackState::default(),

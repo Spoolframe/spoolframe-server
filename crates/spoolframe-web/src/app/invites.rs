@@ -2,10 +2,13 @@
 //! WebInviteReauth, WebInviteCreate, WebInviteResult and WebInvitesPhone
 //! boards lay it out: the invites that can still make an account, making
 //! one (its code shown once, with its QR code and link), revoking one, and
-//! the server's own link without a code.
+//! the server's own link without a code. Below them, the guests: portable
+//! users granted access here (P7-06), who are no users of this server.
 
 use dioxus::prelude::*;
-use spoolframe_admin_api::{AdminApiClient, InviteCreated, InviteEntry, Role};
+use spoolframe_admin_api::{
+    AdminApiClient, InviteCreated, InviteEntry, InviteKind, PortableGrant, Role,
+};
 use wasm_bindgen::{JsCast, JsValue};
 
 use super::admin::{Said, Toast, say};
@@ -23,6 +26,11 @@ const CONFIRMING: &str = "making an invite: its code lets someone create an acco
 async fn invites() -> Result<Vec<InviteEntry>, ApiError> {
     let client = rpc::client().await?;
     client.invite_list().await.map_err(rpc::error)
+}
+
+async fn grants() -> Result<Vec<PortableGrant>, ApiError> {
+    let client = rpc::client().await?;
+    client.grant_list().await.map_err(rpc::error)
 }
 
 async fn server_link() -> Result<String, ApiError> {
@@ -120,6 +128,7 @@ pub fn Invites() -> Element {
                 "Used-up and expired invites drop off this list. Revoking stops the unused codes; accounts already made stay."
             }
             ServerLink { on_show: move |link: String| showing.set(Some(link)) }
+            Guests { toast }
         }
         if creating() {
             CreateInvite {
@@ -154,9 +163,15 @@ pub fn Invites() -> Element {
     }
 }
 
-/// The role as the list's pill shows it.
+/// The role as the list's pill shows it; "Guest" for a portable guest's
+/// invite (P7-05), which makes no account.
 #[component]
-fn RolePill(role: Role) -> Element {
+fn RolePill(role: Role, #[props(default)] guest: bool) -> Element {
+    if guest {
+        return rsx! {
+            span { class: "pill", "Guest" }
+        };
+    }
     rsx! {
         span { class: if role == Role::Admin { "pill pill-admin" } else { "pill" }, "{role_name(role)}" }
     }
@@ -192,7 +207,12 @@ fn InviteTable(
                                     b { "{name(&invite)}" }
                                 }
                             }
-                            td { RolePill { role: invite.role } }
+                            td {
+                                RolePill {
+                                    role: invite.role,
+                                    guest: invite.kind == InviteKind::PortableAccount,
+                                }
+                            }
                             td { "{uses_left(&invite)}" }
                             td {
                                 div { class: "invite-when",
@@ -233,7 +253,7 @@ fn InviteCard(invite: InviteEntry, now: i64, on_revoke: EventHandler<InviteEntry
         div { class: "invite-card",
             div { class: "flex items-center gap-2",
                 b { class: "flex-grow", "{name(&invite)}" }
-                RolePill { role: invite.role }
+                RolePill { role: invite.role, guest: invite.kind == InviteKind::PortableAccount }
             }
             span { "{card_line(&invite, now)}" }
             button {
@@ -300,6 +320,140 @@ fn ServerLink(on_show: EventHandler<String>) -> Element {
     }
 }
 
+/// The guests: portable users granted access here (P7-06). They sign in
+/// with their own identity, from their phone, and are not users of this
+/// server: they never show in Users and devices. Revoking ends their
+/// sessions at once.
+#[component]
+fn Guests(toast: Signal<Option<Said>>) -> Element {
+    let mut list = use_resource(grants);
+    let mut revoking = use_signal(|| None::<PortableGrant>);
+    let current = list.read().clone();
+    let Some(Ok(guests)) = current else {
+        return rsx! {};
+    };
+    if guests.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        section { class: "table-card",
+            div { class: "flex flex-col gap-1 p-4",
+                b { class: "text-[15px]", "Guests with their own identity" }
+                span { class: "text-[13px] leading-normal text-ctp-subtext0",
+                    "They watch here as themselves, signed in from their own phone. This server keeps only their public id."
+                }
+            }
+            table { class: "table",
+                thead {
+                    tr {
+                        th { "Name" }
+                        th { "Fingerprint" }
+                        th { "Granted" }
+                        th { "Signed in" }
+                        th {}
+                    }
+                }
+                tbody {
+                    for guest in guests {
+                        tr { key: "{guest.id}",
+                            td {
+                                div { class: "invite-name",
+                                    span { class: "invite-icon", icons::User {} }
+                                    b { "{guest_name(&guest)}" }
+                                }
+                            }
+                            td { class: "quiet", "{guest.fingerprint}" }
+                            td { "{day_month(local(guest.granted_at))}" }
+                            td { "{guest.live_sessions}" }
+                            td { class: "end",
+                                button {
+                                    class: "btn-revoke",
+                                    onclick: {
+                                        let guest = guest.clone();
+                                        move |_| revoking.set(Some(guest.clone()))
+                                    },
+                                    "Revoke"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(guest) = revoking() {
+            RevokeGrant {
+                guest,
+                on_done: move |said: Option<(bool, String)>| {
+                    revoking.set(None);
+                    if let Some((ok, text)) = said {
+                        say(toast, ok, text);
+                        list.restart();
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// What a guest is called: the name they asked for, else their
+/// fingerprint.
+fn guest_name(guest: &PortableGrant) -> String {
+    guest
+        .display_name
+        .clone()
+        .unwrap_or_else(|| guest.fingerprint.clone())
+}
+
+/// "Revoke Sam's access?". From a session signed in long ago, "Confirm
+/// it's you" first.
+#[component]
+fn RevokeGrant(guest: PortableGrant, on_done: EventHandler<Option<(bool, String)>>) -> Element {
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let confirming = use_signal(|| None::<String>);
+    let shown = guest_name(&guest);
+    let id = guest.id.clone();
+    let attempt = use_callback({
+        let shown = shown.clone();
+        move |()| {
+            busy.set(true);
+            let id = id.clone();
+            let shown = shown.clone();
+            spawn(async move {
+                let revoked = async {
+                    let client = rpc::client().await?;
+                    client.grant_revoke(id).await.map_err(rpc::error)
+                };
+                match revoked.await {
+                    Ok(()) => on_done.call(Some((true, format!("{shown}: access revoked")))),
+                    Err(e) if asks_to_confirm(&e, confirming, "revoking a guest's access") => {}
+                    Err(e) => error.set(Some(e.explain())),
+                }
+                busy.set(false);
+            });
+        }
+    });
+    rsx! {
+        div { class: "scrim scrim-sheet",
+            section { class: "dialog", role: "dialog",
+                div { class: "dialog-head dialog-head-danger",
+                    icons::User { size: 22 }
+                    h1 { "Revoke {shown}'s access?" }
+                }
+                p { "They are signed out everywhere at once, and only a new invite lets them back. What they watched stays, for if one does." }
+                if let Some(text) = error() {
+                    Alert { text }
+                }
+                div { class: "dialog-actions",
+                    button { class: "btn-dialog btn-dialog-grey", onclick: move |_| on_done.call(None), "Keep it" }
+                    button { class: "btn-dialog btn-dialog-outline text-ctp-red", disabled: busy(), onclick: move |_| attempt.call(()), "Revoke access" }
+                }
+            }
+        }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| attempt.call(()) }
+    }
+}
+
 /// A QR code of `data`, `px` pixels a side, with the mark in the middle,
 /// as the design draws it: dark on light, whatever the theme.
 #[component]
@@ -336,6 +490,7 @@ fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
     let uses = use_signal(|| "1".to_owned());
     let mut expires = use_signal(|| InviteForm::default().expires);
     let mut admin = use_signal(|| false);
+    let mut guest = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let confirming = use_signal(|| None::<String>);
@@ -345,6 +500,11 @@ fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
             uses: uses(),
             expires: expires(),
             role: if admin() { Role::Admin } else { Role::Consumer },
+            kind: if guest() {
+                InviteKind::PortableAccount
+            } else {
+                InviteKind::CreateUser
+            },
         };
         let invite = match new_invite(&form) {
             Ok(invite) => invite,
@@ -411,13 +571,26 @@ fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
                     }
                 }
                 label { class: "field",
-                    "Role"
-                    select { onchange: move |e| admin.set(e.value() == "admin"),
-                        option { value: "consumer", selected: !admin(), "Consumer" }
-                        option { value: "admin", selected: admin(), "Admin" }
+                    "For"
+                    select { onchange: move |e| guest.set(e.value() == "guest"),
+                        option { value: "account", selected: !guest(), "An account on this server" }
+                        option { value: "guest", selected: guest(), "A guest with their own identity" }
                     }
                 }
-                span { class: "hint", "Consumers watch and listen. Admins can change the server." }
+                if guest() {
+                    span { class: "hint",
+                        "They join from their phone with their own Spoolframe identity, and watch here as themselves. No account is made; they show under Guests."
+                    }
+                } else {
+                    label { class: "field",
+                        "Role"
+                        select { onchange: move |e| admin.set(e.value() == "admin"),
+                            option { value: "consumer", selected: !admin(), "Consumer" }
+                            option { value: "admin", selected: admin(), "Admin" }
+                        }
+                    }
+                    span { class: "hint", "Consumers watch and listen. Admins can change the server." }
+                }
                 if let Some(text) = error() {
                     Alert { text }
                 }
@@ -492,7 +665,11 @@ fn InviteResult(created: InviteCreated, on_done: EventHandler<()>) -> Element {
                             }
                         }
                         div { class: "flex flex-wrap gap-2",
-                            span { class: "pill", "{role_name(invite.role)}" }
+                            if invite.kind == InviteKind::PortableAccount {
+                                span { class: "pill", "Guest with their own identity" }
+                            } else {
+                                span { class: "pill", "{role_name(invite.role)}" }
+                            }
                             span { class: "pill", "{uses_chip(invite.uses)}" }
                             span { class: "pill hidden md:inline", "Expires {day_month_time(local(invite.expires_at))}" }
                             span { class: "pill md:hidden", "Expires {day_month(local(invite.expires_at))}" }

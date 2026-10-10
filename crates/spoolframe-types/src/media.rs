@@ -21,6 +21,15 @@ pub struct MediaTracks {
     /// The file's container, from the server's own probe of it. `None`
     /// only where nothing was probed.
     pub container: Option<Container>,
+    /// The file's average bits per second, every stream counted, for
+    /// "42 Mbit/s": what the container says, else its size over its
+    /// length. `None` where the server knows neither.
+    ///
+    /// This and `VideoTrack::bit_rate` were added without a
+    /// PROTOCOL_VERSION bump, so they are not `required::option`: a
+    /// server from before them leaves the keys out, and that reads as
+    /// `None`.
+    pub bit_rate: Option<u64>,
     /// The main picture; `None` for audio only (music).
     pub video: Option<VideoTrack>,
     pub audio: Vec<AudioTrack>,
@@ -42,6 +51,10 @@ pub struct VideoTrack {
     /// Dolby Vision. HDR10+ is HDR10 here: its metadata is in the frames,
     /// which the probe does not read.
     pub hdr: Option<HdrFormat>,
+    /// The picture's own average bits per second, where the file says:
+    /// MP4 does for each stream, Matroska where its muxer wrote
+    /// statistics tags (mkvmerge does).
+    pub bit_rate: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,12 +148,14 @@ mod tests {
         let tracks = MediaTracks {
             duration: Some(Duration::from_millis(6_106_791)),
             container: Some(Container::Matroska),
+            bit_rate: Some(42_000_000),
             video: Some(VideoTrack {
                 codec: VideoCodec::Hevc,
                 width: 3840,
                 height: 1600,
                 bit_depth: 10,
                 hdr: Some(HdrFormat::DolbyVision),
+                bit_rate: Some(38_500_000),
             }),
             audio: vec![AudioTrack {
                 language: Some("eng".into()),
@@ -161,6 +176,29 @@ mod tests {
         let json = serde_json::to_value(&tracks).unwrap();
         assert_eq!(json["duration"], 6_106_791);
         assert_eq!(serde_json::from_value::<MediaTracks>(json).unwrap(), tracks);
+    }
+
+    #[test]
+    fn tracks_from_a_server_without_bit_rates_still_decode() {
+        let tracks = MediaTracks {
+            bit_rate: Some(42_000_000),
+            video: Some(VideoTrack {
+                codec: VideoCodec::Hevc,
+                width: 3840,
+                height: 2160,
+                bit_depth: 10,
+                hdr: None,
+                bit_rate: Some(38_500_000),
+            }),
+            ..MediaTracks::default()
+        };
+        let mut json = serde_json::to_value(&tracks).unwrap();
+        assert_eq!(json["bit_rate"], 42_000_000);
+        json.as_object_mut().unwrap().remove("bit_rate");
+        json["video"].as_object_mut().unwrap().remove("bit_rate");
+        let older: MediaTracks = serde_json::from_value(json).unwrap();
+        assert_eq!(older.bit_rate, None);
+        assert_eq!(older.video.unwrap().bit_rate, None);
     }
 
     #[test]

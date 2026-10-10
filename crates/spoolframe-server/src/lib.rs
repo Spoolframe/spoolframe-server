@@ -20,6 +20,7 @@ pub mod device_sign_in;
 pub mod encode;
 mod events;
 pub mod files;
+pub mod gpu_status;
 pub mod identity;
 pub mod invites;
 mod keyed_locks;

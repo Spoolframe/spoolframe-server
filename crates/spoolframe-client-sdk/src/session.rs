@@ -38,6 +38,11 @@ pub(crate) struct StoredSession {
     /// was kept have no such field: `None`.
     #[serde(default)]
     pub method: Option<SignInMethod>,
+    /// The portable identity it signed in with (P7-06), whether the
+    /// session is that identity's own or the account it is tied to here:
+    /// what signs it in again. `None` for any other sign-in.
+    #[serde(default)]
+    pub portable: Option<PortableUserId>,
 }
 
 /// Someone who signed in on a server from this device, as "Who's
@@ -53,6 +58,9 @@ pub struct SavedProfile {
     /// "Who's watching" can offer the same again once their session has
     /// ended. `None` for a profile kept before the SDK remembered it.
     pub method: Option<SignInMethod>,
+    /// With [`SignInMethod::Portable`], the identity to sign in again
+    /// with: [`crate::Client::sign_in_portable`], no password asked.
+    pub portable: Option<PortableUserId>,
 }
 
 /// How a profile signed in.
@@ -66,6 +74,12 @@ pub enum SignInMethod {
     /// [`crate::Client::await_device_sign_in`]: approved on another device
     /// they were signed in on (P3-07).
     Device,
+    /// [`crate::Client::sign_in_portable`] or
+    /// [`crate::Client::redeem_invite_portable`]: this device's credential
+    /// for a portable identity (P7-06). Signing in again asks nothing:
+    /// call [`crate::Client::sign_in_portable`] with
+    /// [`SavedProfile::portable`].
+    Portable,
 }
 
 /// How choosing a saved profile signs them in.
@@ -91,6 +105,7 @@ impl From<&StoredSession> for SavedProfile {
                 None => ProfileSignIn::Password,
             },
             method: stored.method,
+            portable: stored.portable,
         }
     }
 }
@@ -434,7 +449,7 @@ impl Session {
 
     /// One request in this session. A session the server no longer knows
     /// is forgotten here, and the caller gets [`SdkError::SignInRequired`].
-    async fn call(&self, request: Request) -> Result<Reply, SdkError> {
+    pub(crate) async fn call(&self, request: Request) -> Result<Reply, SdkError> {
         if matches!(
             request,
             Request::ReadSubtitle { .. } | Request::ReadSubtitleSegment { .. }
@@ -1534,6 +1549,7 @@ mod tests {
                 display_name: "Alice".into(),
                 sign_in: ProfileSignIn::Automatic,
                 method: None,
+                portable: None,
             }]
         );
     }
@@ -1583,6 +1599,7 @@ mod tests {
                 username: name.into(),
                 display_name: name.into(),
                 method: Some(method),
+                portable: None,
             })
             .collect();
         save(&storage, &server, &stored).await.unwrap();

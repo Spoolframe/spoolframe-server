@@ -2,15 +2,67 @@
 //! ARCHITECTURE §45, §48), checked by this server alone: no account
 //! server is asked.
 //!
-//! Only the check. The pre-auth request that carries a credential, the
-//! nonce it answers, the session it makes and the principal it resolves
-//! to (local-first where tied) are P7-06's.
+//! And the nonces a device signs over to sign in with one (P7-06): the
+//! request that carries it and the session it makes are `crate::client`'s.
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
+use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::portable::{
     CredentialError, PortableUserId, Signature, UserDeviceCredential, verify_device_proof,
 };
 
+use crate::clock::Clock;
 use crate::store::{Store, StoreError};
+
+/// How long a portable sign-in's nonce can be answered.
+pub const SIGN_IN_NONCE_LIFETIME: Duration = Duration::from_secs(5 * 60);
+
+/// The most nonces outstanding on the server. Each draws on the
+/// strangers' budget, so this is a backstop, never reached by people.
+const MAX_SIGN_IN_NONCES: usize = 10_000;
+
+/// The portable sign-ins begun and not yet finished, by device endpoint:
+/// one at a time each, a new one replacing it.
+#[derive(Debug)]
+pub struct SignInNonces {
+    clock: Clock,
+    pending: Mutex<HashMap<String, ([u8; 32], Instant)>>,
+}
+
+impl SignInNonces {
+    pub fn new(clock: Clock) -> Self {
+        Self {
+            clock,
+            pending: Mutex::default(),
+        }
+    }
+
+    /// A new nonce for `endpoint`, replacing any it had; `None` when the
+    /// server holds as many as it takes.
+    pub fn begin(&self, endpoint: &str) -> Option<[u8; 32]> {
+        let now = self.clock.now();
+        let mut nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut nonce);
+        let mut pending = self.pending.lock();
+        pending.retain(|_, (_, began)| now.duration_since(*began) < SIGN_IN_NONCE_LIFETIME);
+        pending.remove(endpoint);
+        if pending.len() >= MAX_SIGN_IN_NONCES {
+            return None;
+        }
+        pending.insert(endpoint.to_owned(), (nonce, now));
+        Some(nonce)
+    }
+
+    /// `endpoint`'s nonce, used up; `None` if it has none, or it is over.
+    pub fn take(&self, endpoint: &str) -> Option<[u8; 32]> {
+        let now = self.clock.now();
+        let (nonce, began) = self.pending.lock().remove(endpoint)?;
+        (now.duration_since(began) < SIGN_IN_NONCE_LIFETIME).then_some(nonce)
+    }
+}
 
 /// Why a presented credential does not authenticate.
 #[derive(Debug, thiserror::Error)]

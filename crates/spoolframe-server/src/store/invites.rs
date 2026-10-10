@@ -1,4 +1,5 @@
-//! Invites (P6-01): codes that make an account, kept by their hash.
+//! Invites (P6-01): codes that make an account, or grant a portable
+//! identity access (P7-05), kept by their hash.
 //!
 //! Redeeming one uses it up and makes its user in one transaction, the
 //! use taken first: of two redemptions of an invite's last use, one makes
@@ -8,7 +9,8 @@
 use std::fmt;
 use std::str::FromStr;
 
-use spoolframe_types::Role;
+use spoolframe_protocol::PortableUserId;
+use spoolframe_types::{Platform, Role};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -21,9 +23,10 @@ use super::{Store, StoreError};
 /// What redeeming an invite does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InviteKind {
-    /// Makes a user on this server: the only kind made so far.
+    /// Makes a user on this server.
     CreateUser,
-    /// Moves an account from another server here (P7-05).
+    /// Grants a portable identity access here (P7-05): no account is
+    /// made.
     PortableAccount,
     /// Pairs another server with this one (P8).
     Federation,
@@ -61,6 +64,34 @@ impl FromStr for InviteKind {
     }
 }
 
+/// Where an invite was made (PX-44).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteOrigin {
+    /// The web UI's admin pages; every invite from before PX-44 but the
+    /// CLI's.
+    Web,
+    /// `spoolframe-server invite create`.
+    Cli,
+    /// An app, on the device whose `Hello` gave its name and platform.
+    Device {
+        /// Hex `EndpointId`.
+        endpoint_id: String,
+        name: Option<String>,
+        platform: Platform,
+    },
+}
+
+impl InviteOrigin {
+    /// Its name in the database.
+    fn as_str(&self) -> &'static str {
+        match self {
+            InviteOrigin::Web => "web",
+            InviteOrigin::Cli => "cli",
+            InviteOrigin::Device { .. } => "device",
+        }
+    }
+}
+
 /// An invite to make: everything but its id and when it was made.
 #[derive(Debug, Clone, Copy)]
 pub struct NewInvite<'a> {
@@ -73,6 +104,7 @@ pub struct NewInvite<'a> {
     /// Unix seconds.
     pub expires_at: i64,
     pub created_by: &'a str,
+    pub origin: &'a InviteOrigin,
 }
 
 /// An invite as the admin sees it: never its code.
@@ -86,13 +118,18 @@ pub struct InviteRecord {
     pub uses_left: u32,
     pub expires_at: i64,
     pub created_by: String,
+    /// `created_by`'s display name, if they are a user here who has one.
+    pub created_by_display_name: Option<String>,
     pub created_at: i64,
+    pub origin: InviteOrigin,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum InviteError {
     /// A kind this server does not make yet.
-    #[error("{0} invites arrive with P7 and P8; this server makes create-user invites only")]
+    #[error(
+        "{0} invites arrive with P8; this server makes create-user and portable-account invites"
+    )]
     NotYet(InviteKind),
     #[error("no live invite {0:?}")]
     NoSuchInvite(String),
@@ -113,10 +150,25 @@ pub enum InviteState {
     Invalid,
     Expired,
     Exhausted,
-    /// It would make a user with `role` now.
+    /// It can be redeemed now: it is of `kind`, and a `create-user` one
+    /// makes a user with `role`.
     Usable {
+        kind: InviteKind,
         role: Role,
     },
+}
+
+/// What a portable-account redemption did (P7-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortableRedeemed {
+    /// The grant was made, and a use taken.
+    Granted,
+    /// The identity had a grant here already: nothing changed, and the
+    /// invite keeps its use.
+    AlreadyGranted,
+    /// Nothing was made: the invite is not usable (or of another kind),
+    /// as this says.
+    Refused(InviteState),
 }
 
 /// What a redemption did.
@@ -128,6 +180,23 @@ pub enum Redeemed {
     Refused(InviteState),
     /// Nothing was made, and the invite keeps its use.
     UsernameTaken,
+}
+
+fn origin(row: &sqlx::sqlite::SqliteRow) -> Result<InviteOrigin, sqlx::Error> {
+    let origin: String = row.try_get("origin")?;
+    Ok(match origin.as_str() {
+        "cli" => InviteOrigin::Cli,
+        "device" => InviteOrigin::Device {
+            endpoint_id: row
+                .try_get::<Option<String>, _>("origin_endpoint_id")?
+                .unwrap_or_default(),
+            name: row.try_get("origin_device_name")?,
+            platform: row
+                .try_get::<Option<String>, _>("origin_platform")?
+                .map_or(Platform::Unknown, |p| Platform::from_name(&p)),
+        },
+        _ => InviteOrigin::Web,
+    })
 }
 
 fn record(row: &sqlx::sqlite::SqliteRow) -> Result<InviteRecord, sqlx::Error> {
@@ -143,23 +212,38 @@ fn record(row: &sqlx::sqlite::SqliteRow) -> Result<InviteRecord, sqlx::Error> {
         uses_left: row.try_get("uses_left")?,
         expires_at: row.try_get("expires_at")?,
         created_by: row.try_get("created_by")?,
+        created_by_display_name: row.try_get("created_by_display_name")?,
         created_at: row.try_get("created_at")?,
+        origin: origin(row)?,
     })
 }
 
 impl Store {
-    /// Keep a new invite. A kind other than `create-user` is refused
-    /// before anything is written ([`InviteError::NotYet`]).
+    /// Keep a new invite. A `federation` one is refused before anything
+    /// is written ([`InviteError::NotYet`]): P8 makes it.
     pub async fn create_invite(&self, invite: NewInvite<'_>) -> Result<InviteRecord, InviteError> {
-        if invite.kind != InviteKind::CreateUser {
+        if invite.kind == InviteKind::Federation {
             return Err(InviteError::NotYet(invite.kind));
         }
         let now = self.now();
         let id = Uuid::now_v7().hyphenated().to_string();
+        let (endpoint_id, device_name, platform) = match invite.origin {
+            InviteOrigin::Device {
+                endpoint_id,
+                name,
+                platform,
+            } => (
+                Some(endpoint_id.as_str()),
+                name.as_deref(),
+                Some(platform.as_str()),
+            ),
+            InviteOrigin::Web | InviteOrigin::Cli => (None, None, None),
+        };
         sqlx::query(
             "INSERT INTO invites (id, kind, capability_hash, role, note, uses, uses_left, \
-                                  expires_at, created_by, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9)",
+                                  expires_at, created_by, created_at, origin, \
+                                  origin_endpoint_id, origin_device_name, origin_platform) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
         .bind(&id)
         .bind(invite.kind.as_str())
@@ -170,8 +254,18 @@ impl Store {
         .bind(invite.expires_at)
         .bind(invite.created_by)
         .bind(now)
+        .bind(invite.origin.as_str())
+        .bind(endpoint_id)
+        .bind(device_name)
+        .bind(platform)
         .execute(&self.pool)
         .await?;
+        let created_by_display_name: Option<String> =
+            sqlx::query_scalar("SELECT display_name FROM users WHERE username = ?1")
+                .bind(invite.created_by)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
         Ok(InviteRecord {
             id,
             kind: invite.kind,
@@ -181,18 +275,27 @@ impl Store {
             uses_left: invite.uses,
             expires_at: invite.expires_at,
             created_by: invite.created_by.to_owned(),
+            created_by_display_name,
             created_at: now,
+            origin: invite.origin.clone(),
         })
     }
 
     /// The invites that can still make an account, newest first: not
     /// revoked, not expired, not used up.
     pub async fn live_invites(&self) -> Result<Vec<InviteRecord>, StoreError> {
+        // With the display name of the user who made each, if they are
+        // one here (usernames are kept lowercased, as `created_by` is).
         let rows = sqlx::query(
-            "SELECT id, kind, role, note, uses, uses_left, expires_at, created_by, created_at \
-             FROM invites \
-             WHERE revoked_at IS NULL AND expires_at > ?1 AND uses_left > 0 \
-             ORDER BY created_at DESC, id DESC",
+            "SELECT invites.id, invites.kind, invites.role, invites.note, invites.uses, \
+                    invites.uses_left, invites.expires_at, invites.created_by, \
+                    u.display_name AS created_by_display_name, invites.created_at, \
+                    invites.origin, invites.origin_endpoint_id, invites.origin_device_name, \
+                    invites.origin_platform \
+             FROM invites LEFT JOIN users u ON u.username = invites.created_by \
+             WHERE invites.revoked_at IS NULL AND invites.expires_at > ?1 \
+               AND invites.uses_left > 0 \
+             ORDER BY invites.created_at DESC, invites.id DESC",
         )
         .bind(self.now())
         .fetch_all(&self.pool)
@@ -309,6 +412,83 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Grant portable user `portable` access here, called `display`, with
+    /// the `portable-account` invite whose code hashes to
+    /// `capability_hash`, and take one of its uses, in one transaction.
+    /// Someone granted here already keeps their grant, and the invite its
+    /// use. Someone whose grant was revoked is let back only by an invite
+    /// made after the revocation: an older one is
+    /// [`InviteState::Invalid`] to them, and keeps its use.
+    ///
+    /// The use is taken first: a write, so the transaction holds the
+    /// database's write lock from its first statement, and a redemption
+    /// racing it waits, then sees what it left, rather than failing.
+    pub async fn redeem_portable_invite(
+        &self,
+        capability_hash: &str,
+        portable: PortableUserId,
+        display: Option<&str>,
+    ) -> Result<PortableRedeemed, StoreError> {
+        let now = self.now();
+        let id = portable.to_string();
+        let mut tx = self.pool.begin().await?;
+        let taken: Option<(String, i64)> = sqlx::query_as(
+            "UPDATE invites SET uses_left = uses_left - 1 \
+             WHERE capability_hash = ?1 AND kind = 'portable-account' AND revoked_at IS NULL \
+               AND expires_at > ?2 AND uses_left > 0 \
+             RETURNING id, created_at",
+        )
+        .bind(capability_hash)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((invite_id, created_at)) = taken else {
+            let refused = state(&mut tx, capability_hash, now).await?;
+            tx.rollback().await?;
+            return Ok(PortableRedeemed::Refused(refused));
+        };
+        let grant: Option<Option<i64>> = sqlx::query_scalar(
+            "SELECT revoked_at FROM portable_grants WHERE portable_user_id = ?1",
+        )
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match grant {
+            Some(None) => {
+                tx.rollback().await?;
+                return Ok(PortableRedeemed::AlreadyGranted);
+            }
+            Some(Some(revoked_at)) if created_at <= revoked_at => {
+                tx.rollback().await?;
+                return Ok(PortableRedeemed::Refused(InviteState::Invalid));
+            }
+            _ => {}
+        }
+        let granted = sqlx::query(
+            "INSERT INTO portable_grants (portable_user_id, display_name, granted_at, invite_id) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (portable_user_id) DO UPDATE SET \
+               display_name = excluded.display_name, granted_at = excluded.granted_at, \
+               invite_id = excluded.invite_id, revoked_at = NULL \
+             WHERE portable_grants.revoked_at IS NOT NULL",
+        )
+        .bind(&id)
+        .bind(display)
+        .bind(now)
+        .bind(&invite_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if granted == 0 {
+            tx.rollback().await?;
+            return Ok(PortableRedeemed::AlreadyGranted);
+        }
+        tx.commit().await?;
+        Ok(PortableRedeemed::Granted)
+    }
+}
+
 /// Where the invite whose code hashes to `capability_hash` stands at
 /// `now`, read on `conn`. A revoked one is [`InviteState::Invalid`], as
 /// no invite is.
@@ -331,7 +511,10 @@ async fn state(
     let revoked: bool = row.try_get("revoked")?;
     let expires_at: i64 = row.try_get("expires_at")?;
     let uses_left: i64 = row.try_get("uses_left")?;
-    Ok(if revoked || kind != InviteKind::CreateUser.as_str() {
+    let Ok(kind) = kind.parse::<InviteKind>() else {
+        return Ok(InviteState::Invalid);
+    };
+    Ok(if revoked {
         InviteState::Invalid
     } else if expires_at <= now {
         InviteState::Expired
@@ -339,6 +522,7 @@ async fn state(
         InviteState::Exhausted
     } else {
         InviteState::Usable {
+            kind,
             role: role(row.try_get("role")?),
         }
     })
@@ -360,6 +544,7 @@ mod tests {
             uses,
             expires_at: store.now() + 7 * DAY,
             created_by: "root",
+            origin: &InviteOrigin::Web,
         }
     }
 
@@ -522,28 +707,163 @@ mod tests {
         assert_eq!(store.live_invites().await.unwrap()[0].uses_left, 1);
     }
 
-    /// The other kinds are known and refused: nothing is kept, so nothing
-    /// can be half-redeemed or quietly made a `create-user` invite.
+    /// Federation is known and refused: nothing is kept, so nothing can
+    /// be half-redeemed or quietly made another kind of invite.
     #[tokio::test]
-    async fn the_kinds_of_later_phases_are_refused_and_nothing_is_kept() {
+    async fn federation_invites_are_refused_and_nothing_is_kept() {
         let store = test_store("invite-kinds").await;
-        for kind in [InviteKind::PortableAccount, InviteKind::Federation] {
-            let refused = store
-                .create_invite(NewInvite {
-                    kind,
-                    ..new_invite(&store, "h1", 1)
-                })
-                .await;
-            assert!(
-                matches!(refused, Err(InviteError::NotYet(k)) if k == kind),
-                "{refused:?}"
-            );
-        }
+        let refused = store
+            .create_invite(NewInvite {
+                kind: InviteKind::Federation,
+                ..new_invite(&store, "h1", 1)
+            })
+            .await;
+        assert!(
+            matches!(refused, Err(InviteError::NotYet(InviteKind::Federation))),
+            "{refused:?}"
+        );
         assert!(store.live_invites().await.unwrap().is_empty());
         assert_eq!(
             store.invite_state("h1").await.unwrap(),
             InviteState::Invalid
         );
+    }
+
+    async fn portable_store(test: &str, uses: u32) -> TestStore {
+        let store = test_store(test).await;
+        store
+            .create_invite(NewInvite {
+                kind: InviteKind::PortableAccount,
+                ..new_invite(&store, "p1", uses)
+            })
+            .await
+            .unwrap();
+        store
+    }
+
+    /// P7-05: a grant, a use taken, and no user made.
+    #[tokio::test]
+    async fn a_portable_invite_grants_and_makes_no_user() {
+        use crate::store::portable::tests::user;
+        let store = portable_store("invite-portable", 2).await;
+        assert_eq!(
+            store
+                .redeem_portable_invite("p1", user(7), Some("Sam"))
+                .await
+                .unwrap(),
+            PortableRedeemed::Granted
+        );
+        let grant = store.grant_of(user(7)).await.unwrap().unwrap();
+        assert_eq!(grant.display_name.as_deref(), Some("Sam"));
+        let invite = &store.live_invites().await.unwrap()[0];
+        assert_eq!(grant.invite_id.as_deref(), Some(invite.id.as_str()));
+        assert_eq!(invite.uses_left, 1);
+        assert_eq!(store.user_count().await.unwrap(), 0);
+        // Again: nothing changes, and the use is kept.
+        assert_eq!(
+            store
+                .redeem_portable_invite("p1", user(7), Some("Other"))
+                .await
+                .unwrap(),
+            PortableRedeemed::AlreadyGranted
+        );
+        assert_eq!(store.live_invites().await.unwrap()[0].uses_left, 1);
+        // The last use, then none.
+        store
+            .redeem_portable_invite("p1", user(8), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .redeem_portable_invite("p1", user(9), None)
+                .await
+                .unwrap(),
+            PortableRedeemed::Refused(InviteState::Exhausted)
+        );
+    }
+
+    /// P7-05 review: a revoked guest is let back only by an invite made
+    /// after the revocation; an older one keeps its use.
+    #[tokio::test]
+    async fn a_revoked_guest_needs_an_invite_made_after_the_revocation() {
+        use crate::store::portable::tests::user;
+        let store = portable_store("invite-portable-tombstone", 3).await;
+        store
+            .redeem_portable_invite("p1", user(7), None)
+            .await
+            .unwrap();
+        store.clock().advance(std::time::Duration::from_secs(5));
+        assert!(store.revoke_grant(user(7)).await.unwrap());
+        assert_eq!(
+            store
+                .redeem_portable_invite("p1", user(7), None)
+                .await
+                .unwrap(),
+            PortableRedeemed::Refused(InviteState::Invalid)
+        );
+        assert_eq!(store.live_invites().await.unwrap()[0].uses_left, 2);
+        // Another identity still redeems the old invite.
+        assert_eq!(
+            store
+                .redeem_portable_invite("p1", user(8), None)
+                .await
+                .unwrap(),
+            PortableRedeemed::Granted
+        );
+        store.clock().advance(std::time::Duration::from_secs(5));
+        store
+            .create_invite(NewInvite {
+                kind: InviteKind::PortableAccount,
+                ..new_invite(&store, "p2", 1)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .redeem_portable_invite("p2", user(7), None)
+                .await
+                .unwrap(),
+            PortableRedeemed::Granted
+        );
+        assert!(store.grant_of(user(7)).await.unwrap().is_some());
+    }
+
+    /// Neither kind's code redeems the other way, and neither use goes.
+    #[tokio::test]
+    async fn a_code_redeems_only_as_its_kind() {
+        use crate::store::portable::tests::user;
+        let store = portable_store("invite-wrong-kind", 1).await;
+        store
+            .create_invite(new_invite(&store, "h1", 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            redeem(&store, "p1", "anna").await,
+            Redeemed::Refused(InviteState::Usable {
+                kind: InviteKind::PortableAccount,
+                role: Role::Consumer
+            })
+        );
+        assert!(matches!(
+            store
+                .redeem_portable_invite("h1", user(7), None)
+                .await
+                .unwrap(),
+            PortableRedeemed::Refused(InviteState::Usable {
+                kind: InviteKind::CreateUser,
+                ..
+            })
+        ));
+        assert!(
+            store
+                .live_invites()
+                .await
+                .unwrap()
+                .iter()
+                .all(|i| i.uses_left == 1)
+        );
+        assert_eq!(store.user_count().await.unwrap(), 0);
+        assert!(store.grants().await.unwrap().is_empty());
     }
 
     #[test]

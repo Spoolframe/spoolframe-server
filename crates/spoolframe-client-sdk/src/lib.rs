@@ -18,11 +18,13 @@ mod client;
 mod connection;
 mod discovery;
 mod error;
+mod invite_admin;
 mod invites;
 mod link;
 mod link_meter;
 pub mod pairing;
 pub mod portable;
+mod portable_sign_in;
 mod refusals;
 mod servers;
 mod session;
@@ -31,11 +33,16 @@ pub mod storage;
 pub use client::{Client, ClientOptions, Device, DeviceSignIn, ServersWatch};
 pub use connection::Timeouts;
 pub use error::SdkError;
+pub use invite_admin::{
+    InviteCreator, InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite,
+};
 pub use invites::InviteInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
 pub use link_meter::LinkMeter;
 // Pairing a guest onto this device by QR code (P7-03).
 pub use pairing::{Connected, Paired, Pairing, PairingError, PairingOffer};
+pub use spoolframe_protocol::invite::InviteLinkKind;
+pub use spoolframe_protocol::pairing::PairedServer;
 // Portable identities (P7-01) and their device credentials (P7-02).
 pub use portable::{
     CredentialError, DevicePublicKey, PhraseError, Portable, PortableIdentity,

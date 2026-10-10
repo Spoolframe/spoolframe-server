@@ -705,13 +705,13 @@ async fn invites_from_the_cli() {
 
     let refused = cli(
         &config,
-        &["invite", "create", "--kind", "portable-account"],
+        &["invite", "create", "--kind", "federation"],
         "",
         &admin,
     );
     assert!(!refused.status.success(), "{refused:?}");
     let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert!(stderr.contains("P7"), "{stderr}");
+    assert!(stderr.contains("P8"), "{stderr}");
 
     let id = row.split_whitespace().next().unwrap();
     stdout(cli(&config, &["invite", "revoke", id], "", &admin));

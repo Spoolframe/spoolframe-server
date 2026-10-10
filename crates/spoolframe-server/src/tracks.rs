@@ -281,6 +281,7 @@ mod tests {
     fn the_tracks_say_what_the_file_and_its_picture_are() {
         let tracks = b99();
         assert_eq!(tracks.container, Some(Container::Matroska));
+        assert_eq!(tracks.bit_rate, Some(11_473_194));
         assert_eq!(
             tracks.video,
             Some(VideoTrack {
@@ -289,6 +290,7 @@ mod tests {
                 height: 1080,
                 bit_depth: 8,
                 hdr: None,
+                bit_rate: Some(4_934_228),
             })
         );
     }

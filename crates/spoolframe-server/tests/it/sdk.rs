@@ -2158,3 +2158,91 @@ async fn a_device_ties_with_its_credential_and_the_identity_is_taken_after() {
         .unwrap();
     assert_eq!(bob.tie(identity).await, Err(SdkError::PortableIdTaken));
 }
+
+/// An admin makes an invite in the app (PX-44): after confirming it is
+/// them, it is listed as made on this device, and a revoke takes it off
+/// the list. A consumer is told it is an admin's.
+#[tokio::test]
+async fn an_admin_makes_and_revokes_an_invite_in_the_app() {
+    use spoolframe_client_sdk::{InviteKind, InviteOrigin, InviteSpec};
+    let (server, client, _) = ready("sdk-invites").await;
+    server
+        .store
+        .set_role("alice", spoolframe_client_sdk::types::Role::Admin)
+        .await
+        .unwrap();
+    let alice = alice(&server, &client).await;
+    let spec = InviteSpec {
+        kind: InviteKind::CreateUser,
+        note: Some("Mum".into()),
+        uses: Some(4),
+        expires_in: Some(Duration::from_secs(2 * 24 * 3600)),
+        role: None,
+    };
+    let made = alice.create_invite(spec.clone()).await.unwrap();
+    assert_eq!(made.kind, InviteKind::CreateUser);
+    assert_eq!(made.uses, 4);
+    assert_eq!(made.copy_string, made.link);
+    let read = client.read_invite(&made.link).await.unwrap();
+    assert!(read.has_code);
+
+    let listed = alice.invites().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, made.id);
+    assert_eq!((listed[0].uses, listed[0].used), (4, 0));
+    assert_eq!(listed[0].created_by.display_name, "Alice");
+    assert_eq!(
+        listed[0].created_from,
+        InviteOrigin::Device {
+            name: Some("living room".into()),
+            platform: spoolframe_client_sdk::types::Platform::Tvos,
+            this_device: true,
+        }
+    );
+    alice.revoke_invite(&made.id).await.unwrap();
+    assert!(alice.invites().await.unwrap().is_empty());
+    assert!(matches!(
+        alice.revoke_invite(&made.id).await,
+        Err(SdkError::NotFound(_))
+    ));
+
+    let bob = client
+        .sign_in(&id(&server), "bob", "battery staple", false)
+        .await
+        .unwrap();
+    assert_eq!(bob.invites().await, Err(SdkError::AdminRequired));
+    assert_eq!(bob.create_invite(spec).await, Err(SdkError::AdminRequired));
+}
+
+/// Past the recent window, making an invite asks for a confirmation; the
+/// password gives it.
+#[tokio::test]
+async fn an_old_session_confirms_before_it_makes_an_invite() {
+    use spoolframe_client_sdk::{InviteKind, InviteSpec};
+    let (server, client, _) = ready("sdk-invites-confirm").await;
+    server
+        .store
+        .set_role("alice", spoolframe_client_sdk::types::Role::Admin)
+        .await
+        .unwrap();
+    let alice = alice(&server, &client).await;
+    crate::recent_admin::age(&server.dir, "alice").await;
+    let spec = InviteSpec {
+        kind: InviteKind::PortableAccount,
+        note: None,
+        uses: None,
+        expires_in: None,
+        role: None,
+    };
+    assert_eq!(
+        alice.create_invite(spec.clone()).await,
+        Err(SdkError::RecentSignInRequired)
+    );
+    alice.confirm_password("correct horse").await.unwrap();
+    let made = alice.create_invite(spec).await.unwrap();
+    assert_eq!(made.kind, InviteKind::PortableAccount);
+    assert_eq!(
+        client.read_invite(&made.link).await.unwrap().kind,
+        spoolframe_client_sdk::InviteLinkKind::PortableAccount
+    );
+}

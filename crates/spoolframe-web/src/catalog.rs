@@ -351,6 +351,7 @@ pub fn year(item: &Item) -> Option<u16> {
     match item {
         Item::Movie(v) => v.year,
         Item::Show(v) => v.year,
+        Item::Episode(v) => v.year,
         Item::Album(v) => v.year,
         _ => None,
     }
@@ -905,6 +906,8 @@ mod tests {
             title: "Woe's Hollow".into(),
             summary: None,
             content_rating: None,
+            year: None,
+            air_date: None,
             duration: None,
             artwork: Vec::new(),
             playback: PlaybackState::default(),
