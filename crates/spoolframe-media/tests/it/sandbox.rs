@@ -359,6 +359,50 @@ fn said(output: &std::process::Output) -> Vec<String> {
 /// its own `/proc/self/maps`: an NVIDIA run may, as CUDA does it.
 #[tokio::test]
 async fn an_nvidia_run_may_name_its_threads_and_read_its_own_maps() {
+    names_its_threads_and_reads_its_maps().await;
+}
+
+/// The same with the server hardened (PX-31), as `main` hardens it: the
+/// child is not dumpable from the fork to the exec, when it opens its
+/// `/proc/self` entries, and carries the server's seccomp filter under
+/// its own.
+#[tokio::test]
+async fn an_nvidia_run_may_name_its_threads_under_a_hardened_server() {
+    if !hardened("sandbox::an_nvidia_run_may_name_its_threads_under_a_hardened_server") {
+        return;
+    }
+    names_its_threads_and_reads_its_maps().await;
+}
+
+/// Marks the copy of a test that [`hardened`] runs.
+const HARDENED: &str = "SPOOLFRAME_TEST_HARDENED";
+
+/// Run `test` (as `--exact` names it) again in a process of its own,
+/// which hardens itself as the server does first, and assert it passed
+/// there. `true` in that copy, once hardened; `false` here.
+fn hardened(test: &str) -> bool {
+    if std::env::var_os(HARDENED).is_some() {
+        spoolframe_media::harden::harden().unwrap();
+        // SAFETY: a PR_GET_ option only reads.
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(HARDENED, "1")
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{test} hardened:\n{log}");
+    assert!(log.contains("1 passed"), "{test} did not run:\n{log}");
+    false
+}
+
+async fn names_its_threads_and_reads_its_maps() {
     let jail = Jail::new(Limits::PASS).gpu(GpuUse::Nvidia);
     let output = confined_bash(
         &jail,

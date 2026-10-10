@@ -276,6 +276,9 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
         // whatever binary is now at its path. Nothing in these tests
         // starts it again: it is only asked for.
         ("restart", outcome(root.restart().await)),
+        // PX-33: what the config file says, applied without the web UI's
+        // checks of who asked for each change.
+        ("configReload", outcome(root.config_reload().await)),
         // The first server added keeps a token set before it (the
         // wizard's), so adding it says where that token goes. Nothing
         // answers at port 1: a confirmed session is refused at once.

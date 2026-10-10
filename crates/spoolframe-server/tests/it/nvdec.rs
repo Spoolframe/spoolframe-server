@@ -205,6 +205,9 @@ async fn an_nvenc_encode_decodes_on_nvdec_and_scales_on_cuda() {
             vaapi_device: &settings.vaapi_device,
             hardware_decode: way.hardware_decode,
             gpu_filters: way.gpu_filters,
+            // PGPU-03 measures CUDA's filters: an HDR source keeps the
+            // CPU's tone map here (PGPU-04's tone_map test has the GPU's).
+            tone_map: spoolframe_media::encoders::ToneMapSetting::Cpu,
             start: None,
             output: Output::Progressive { file: out.clone() },
         };

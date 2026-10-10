@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use spoolframe_media::sandbox::{GpuUse, Jail, Limits, Tool};
+use spoolframe_media::sandbox::{GpuUse, Jail, Limits, Tool, Vulkan};
 
 use super::JobLimits;
 use super::args::{Made, PLAYLIST};
@@ -619,6 +619,7 @@ impl Jobs {
             inputs,
             reads,
             gpu,
+            vulkan,
             fallback,
             made,
         } = run.into();
@@ -635,7 +636,9 @@ impl Jobs {
         for input in inputs {
             jail = jail.input(input);
         }
-        let mut child = launch(&self.ffmpeg, &jail.clone().gpu(gpu), &args).map_err(cannot_run)?;
+        // The fallback's run is `jail` with its own GPU: no Vulkan.
+        let mut child = launch(&self.ffmpeg, &jail.clone().gpu(gpu).vulkan(vulkan), &args)
+            .map_err(cannot_run)?;
         // The run's process group, which ffmpeg leads.
         let pid = child.id().unwrap_or(0);
         let (progress_tx, progress) = watch::channel(Progress::default());
@@ -724,8 +727,11 @@ pub struct Run {
     pub reads: Vec<PathBuf>,
     /// The GPU it decodes or encodes on, if any.
     pub gpu: GpuUse,
-    /// For a run that decodes on the GPU: the same run decoding in
-    /// software, for when that fails before the first output.
+    /// How it uses Vulkan, if it does (libplacebo, PGPU-04).
+    pub vulkan: Option<Vulkan>,
+    /// For a run that decodes or tone maps on the GPU: the same run
+    /// decoding in software, its tone map on the CPU, for when that fails
+    /// before the first output.
     pub fallback: Option<Fallback>,
     /// How it makes its video (PX-24).
     pub made: Option<Made>,
@@ -1631,6 +1637,7 @@ pub(super) mod tests {
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
+            tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
         };
         let jobs = Jobs::new(limits.clone(), Tool::unconfined("ffmpeg")).unwrap();
         jobs.set_limits(JobLimits {
@@ -1774,6 +1781,7 @@ pub(super) mod tests {
             read_ahead,
             stalled_after,
             gpu_filters: false,
+            tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
         };
         (Jobs::new(limits, Tool::unconfined(bin)).unwrap(), tmp)
     }
@@ -2058,6 +2066,7 @@ pub(super) mod tests {
                 Decoder::Hardware(_) => FilterOn::Gpu,
                 _ => FilterOn::Cpu,
             },
+            tone_mapper: None,
             burn_in: FilterOn::None,
             size: Some((1920, 1080)),
             target_bitrate: None,
@@ -2651,6 +2660,7 @@ pub(super) mod tests {
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
+            tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
         };
         (Jobs::new(limits, Tool::unconfined(bin)).unwrap(), tmp)
     }
@@ -2833,6 +2843,7 @@ pub(super) mod tests {
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
+            tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
         };
         let jobs = Jobs::new(limits, Tool::unconfined("ffmpeg")).unwrap();
         assert!(!jobs.dir().join("oldhandle").exists());
@@ -2860,6 +2871,7 @@ pub(super) mod tests {
             read_ahead: Duration::from_secs(60),
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
+            tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
         };
         Jobs::new(limits, Tool::unconfined("ffmpeg")).unwrap();
         assert_eq!(std::fs::read(&key).unwrap(), b"secret");

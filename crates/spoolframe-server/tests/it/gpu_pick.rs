@@ -126,6 +126,7 @@ async fn each_job_runs_on_the_gpu_that_does_the_most_of_it() {
     let settings = TranscodeSettings {
         hardware: HardwarePolicy::Ordered(vec![Hardware::Nvenc, Hardware::Vaapi]),
         vaapi_device: vaapi.clone(),
+        ..TranscodeSettings::default()
     };
     let ffmpeg = FfmpegCommand::new(Tool::new("ffmpeg", sandbox.clone()));
     let found = encoders::detect(&ffmpeg, &settings, &dir.join("detect")).await;
@@ -166,6 +167,7 @@ async fn each_job_runs_on_the_gpu_that_does_the_most_of_it() {
                 vaapi_device: &vaapi,
                 hardware_decode: true,
                 gpu_filters: true,
+                tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
                 start: None,
                 output: Output::Progressive { file: out.clone() },
             };

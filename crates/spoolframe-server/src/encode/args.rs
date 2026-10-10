@@ -5,15 +5,18 @@
 //! encoder gets its frames uploaded at the end of the chain. The video is
 //! decoded on the GPU where it can be ([`decode`]), the frames coming
 //! back to memory for those filters, or staying on the GPU for a VA-API
-//! or NVENC encode whose filters all run there.
+//! or NVENC encode whose filters all run there. An HDR source's tone map
+//! may run on the GPU with libplacebo (PGPU-04, [`libplacebo`]), which
+//! scales too, through Vulkan.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use spoolframe_media::encoders::{
-    Encoders, Hardware, TONEMAP_VAAPI, VideoEncoder, cuda_device_args, hwaccel_args,
+    Encoders, Hardware, NVIDIA_VULKAN, TONEMAP_VAAPI, ToneMapSetting, ToneMapper, VideoEncoder,
+    VulkanDevice, cuda_device_args, hwaccel_args, libplacebo_filter,
 };
-use spoolframe_media::sandbox::GpuUse;
+use spoolframe_media::sandbox::{GpuUse, Vulkan};
 use spoolframe_media::{
     MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, VideoStream, codecs,
 };
@@ -80,12 +83,15 @@ pub struct EncodeSpec<'a> {
     pub subtitle: Option<ConvertedSubtitle>,
     pub encoders: &'a Encoders,
     pub vaapi_device: &'a Path,
-    /// The video may be decoded on the GPU: false once that failed for
-    /// this file (see [`decode`]).
+    /// The video may be decoded, and tone mapped by libplacebo, on the
+    /// GPU: false once that failed for this file (see [`decode`]).
     pub hardware_decode: bool,
     /// Run the filters on the GPU where it can (`transcode.gpu_filters`):
     /// VA-API's tone map and burn-in, NVIDIA's scale and burn-in (PX-29).
+    /// Under `tone_map = "auto"`, the tone map on the GPU too.
     pub gpu_filters: bool,
+    /// How HDR is tone mapped (`transcode.tone_map`, PGPU-04).
+    pub tone_map: ToneMapSetting,
     pub start: Option<Duration>,
     pub output: Output,
 }
@@ -115,6 +121,9 @@ pub enum Decode {
 /// one, though the 4K ones take up to twice as long, the frames' way
 /// back from the GPU being slow: still over three times real time.
 pub fn decode(spec: &EncodeSpec<'_>) -> Decode {
+    if let Some((family, device)) = libplacebo(spec) {
+        return libplacebo_decode(spec, family, device);
+    }
     match placement(spec) {
         Some(Placement {
             decoder: Some(Hardware::Vaapi),
@@ -262,6 +271,7 @@ pub fn planned_encoder(
         vaapi_device: Path::new(""),
         hardware_decode: true,
         gpu_filters,
+        tone_map: ToneMapSetting::Auto,
         start: None,
         output: Output::Progressive {
             file: PathBuf::new(),
@@ -311,9 +321,9 @@ fn cuda_frames(spec: &EncodeSpec<'_>) -> bool {
 /// A filter of a video encode that runs on the CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CpuFilter {
-    /// VA-API's driver has no `tonemap_vaapi`, or GPU filters are off.
-    /// NVIDIA tone maps on the CPU always (the operator's choice: no
-    /// `tonemap_opencl`).
+    /// No tone map the job's GPU runs is chosen (`tone_mapper_on`):
+    /// VA-API's driver has no `tonemap_vaapi` and libplacebo does not run,
+    /// or GPU filters are off, or `transcode.tone_map` says the CPU.
     ToneMap,
     /// The driver has no `overlay_vaapi` or `overlay_cuda`, or GPU
     /// filters are off.
@@ -328,6 +338,9 @@ enum CpuFilter {
     /// NVIDIA has no `scale_cuda`, or GPU filters are off. VA-API always
     /// scales on the GPU.
     Scale,
+    /// libplacebo tone maps (PGPU-04): pictures are laid over its output
+    /// on the CPU.
+    PicturesAfterLibplacebo,
 }
 
 /// The filters of `spec`'s video encode that run on the CPU on `family`:
@@ -347,12 +360,20 @@ fn cpu_filters(spec: &EncodeSpec<'_>, family: Hardware) -> Vec<CpuFilter> {
     let on = spec.gpu_filters;
     let encoders = spec.encoders;
     let stream = spec.descriptor.video.as_ref();
+    // libplacebo tone maps and scales; what is burned in goes over its
+    // output on the CPU (`libplacebo_graph`).
+    let mapper = tone_mapper_on(spec, family);
+    let placebo = tone_map && matches!(mapper, ToneMapper::Libplacebo(_));
     let (tonemaps, scales, overlays) = match family {
-        Hardware::Vaapi => (on && encoders.gpu_tonemap, true, on && encoders.gpu_overlay),
+        Hardware::Vaapi => (
+            mapper.on_gpu(),
+            true,
+            on && encoders.gpu_overlay && !placebo,
+        ),
         Hardware::Nvenc => (
-            false,
-            on && encoders.cuda_scale,
-            on && encoders.cuda_overlay,
+            placebo,
+            (on && encoders.cuda_scale) || placebo,
+            on && encoders.cuda_overlay && !placebo,
         ),
         Hardware::Qsv => (false, false, false),
     };
@@ -367,6 +388,7 @@ fn cpu_filters(spec: &EncodeSpec<'_>, family: Hardware) -> Vec<CpuFilter> {
     let ten_bits_out =
         codec != VideoCodec::H264 && !tone_map && stream.is_some_and(|s| s.bit_depth > 8);
     match burned(spec).ok().flatten().map(|track| track.kind) {
+        Some(SubtitleKind::Bitmap) if placebo => cpu.push(CpuFilter::PicturesAfterLibplacebo),
         Some(SubtitleKind::Bitmap) if !overlays => cpu.push(CpuFilter::Pictures),
         Some(SubtitleKind::Bitmap) if family == Hardware::Nvenc && ten_bits_out => {
             cpu.push(CpuFilter::PicturesOverTenBits);
@@ -414,9 +436,13 @@ pub fn cpu_instead_of_gpu(spec: &EncodeSpec<'_>) -> Vec<&'static str> {
     let vaapi = family == Hardware::Vaapi;
     cpu_filters(spec, family)
         .into_iter()
+        // A forced tone map has a note of its own (`tone_map_note`).
+        .filter(|filter| *filter != CpuFilter::ToneMap || spec.tone_map == ToneMapSetting::Auto)
         .map(|filter| match filter {
-            CpuFilter::ToneMap if vaapi => "the GPU's driver does not tone map (tonemap_vaapi)",
-            CpuFilter::ToneMap => "NVIDIA GPUs tone map on the CPU",
+            CpuFilter::ToneMap if vaapi => {
+                "the GPU tone maps neither with its driver (tonemap_vaapi) nor with libplacebo"
+            }
+            CpuFilter::ToneMap => "libplacebo does not tone map on the NVIDIA GPU",
             CpuFilter::Pictures if vaapi => {
                 "the GPU's driver does not overlay pictures (overlay_vaapi)"
             }
@@ -426,8 +452,147 @@ pub fn cpu_instead_of_gpu(spec: &EncodeSpec<'_>) -> Vec<&'static str> {
             }
             CpuFilter::Text => "text subtitles are burned in on the CPU",
             CpuFilter::Scale => "the NVIDIA GPU does not scale (scale_cuda)",
+            CpuFilter::PicturesAfterLibplacebo => {
+                "pictures are burned in on the CPU after libplacebo's tone map"
+            }
         })
         .collect()
+}
+
+/// What tone maps `spec`'s video when it runs on `family` (PGPU-04), if
+/// it is tone mapped: as `transcode.tone_map` says, of what detection
+/// found on that GPU. `"auto"` takes the GPU's own (`tonemap_vaapi`),
+/// then libplacebo, and the CPU while `gpu_filters` is off; a forced
+/// method the GPU lacks is the CPU. A run after a GPU failure
+/// (`hardware_decode` off) tone maps on the CPU.
+fn tone_mapper_on(spec: &EncodeSpec<'_>, family: Hardware) -> ToneMapper {
+    let encoders = spec.encoders;
+    let own = (family == Hardware::Vaapi && encoders.gpu_tonemap).then_some(ToneMapper::Vaapi);
+    let placebo = encoders
+        .libplacebo(family)
+        .map(ToneMapper::Libplacebo)
+        .filter(|_| spec.hardware_decode);
+    let chosen = match spec.tone_map {
+        ToneMapSetting::Cpu => None,
+        ToneMapSetting::Gpu => own,
+        ToneMapSetting::Libplacebo => placebo,
+        ToneMapSetting::Auto if !spec.gpu_filters => None,
+        ToneMapSetting::Auto => own.or(placebo),
+    };
+    chosen.unwrap_or(ToneMapper::Cpu)
+}
+
+/// Whether `spec`'s video is tone mapped by libplacebo (PGPU-04), and on
+/// which family's GPU, with which device: a tone-mapped video encoded on
+/// a GPU whose chosen tone map is libplacebo. A software encode tone maps
+/// on the CPU.
+pub fn libplacebo(spec: &EncodeSpec<'_>) -> Option<(Hardware, VulkanDevice)> {
+    let Some(ConvertedVideo::Encode { tone_map: true, .. }) = spec.video else {
+        return None;
+    };
+    let family = placement(spec)?.encoder.hardware?;
+    match tone_mapper_on(spec, family) {
+        ToneMapper::Libplacebo(device) => Some((family, device)),
+        ToneMapper::Cpu | ToneMapper::Vaapi => None,
+    }
+}
+
+/// What tone mapped `spec`'s video, if it is tone mapped: libplacebo, VA-API
+/// on frames kept on the GPU, or the CPU (PGPU-04).
+pub fn tone_mapper(spec: &EncodeSpec<'_>) -> Option<ToneMapper> {
+    let Some(ConvertedVideo::Encode { tone_map: true, .. }) = spec.video else {
+        return None;
+    };
+    Some(match libplacebo(spec) {
+        Some((_, device)) => ToneMapper::Libplacebo(device),
+        None if decode(spec) == Decode::Gpu && gpu_decoder(spec) == Some(Hardware::Vaapi) => {
+            ToneMapper::Vaapi
+        }
+        None => ToneMapper::Cpu,
+    })
+}
+
+/// With a tone map forced by `transcode.tone_map`, why `spec`'s runs on
+/// the CPU instead, if it does: what the server notes once (PGPU-04).
+pub fn tone_map_note(spec: &EncodeSpec<'_>) -> Option<&'static str> {
+    if tone_mapper(spec)? != ToneMapper::Cpu || !spec.hardware_decode {
+        return None;
+    }
+    let family = placement(spec).and_then(|place| place.encoder.hardware);
+    let chosen = family.map(|family| tone_mapper_on(spec, family));
+    match (spec.tone_map, family, chosen) {
+        (ToneMapSetting::Auto | ToneMapSetting::Cpu, _, _) => None,
+        (_, None, _) => Some(
+            "transcode.tone_map forces a GPU tone map, but the job is encoded in software; \
+             tone mapped on the CPU",
+        ),
+        (ToneMapSetting::Gpu, _, Some(ToneMapper::Vaapi)) => Some(
+            "transcode.tone_map is \"gpu\", but a filter of the job runs on the CPU, so its \
+             tone map does too",
+        ),
+        (ToneMapSetting::Gpu, _, _) => Some(
+            "transcode.tone_map is \"gpu\", but the job's GPU has no tone map of its own \
+             (tonemap_vaapi); tone mapped on the CPU",
+        ),
+        (ToneMapSetting::Libplacebo, _, _) => Some(
+            "transcode.tone_map is \"libplacebo\", but libplacebo does not run on the job's \
+             GPU; tone mapped on the CPU",
+        ),
+    }
+}
+
+/// Whether NVIDIA's Vulkan device decodes `spec`'s source for a shared
+/// libplacebo run: where NVDEC decodes it (detection's test), and only
+/// H.264 and HEVC, the codecs Vulkan Video's decode began with. Others
+/// decode on NVDEC into memory and are uploaded.
+fn vulkan_decodes(spec: &EncodeSpec<'_>) -> bool {
+    let codec = spec
+        .descriptor
+        .video
+        .as_ref()
+        .map(|s| codecs::video_codec(&s.codec));
+    gpu_decoder(spec) == Some(Hardware::Nvenc)
+        && matches!(codec, Some(VideoCodec::H264 | VideoCodec::Hevc))
+}
+
+/// Where a libplacebo run's video is decoded (PGPU-04). Shared: on the
+/// GPU with the frames kept there for libplacebo, through Vulkan on
+/// NVIDIA ([`vulkan_decodes`], else NVDEC into memory), through VA-API on
+/// AMD; libplacebo's own device takes frames from memory, so the GPU
+/// decodes into memory. With no GPU decode, in software.
+fn libplacebo_decode(spec: &EncodeSpec<'_>, family: Hardware, device: VulkanDevice) -> Decode {
+    if gpu_decoder(spec).is_none() {
+        return Decode::Software;
+    }
+    match (family, device) {
+        (Hardware::Nvenc, VulkanDevice::Shared) if !vulkan_decodes(spec) => Decode::Hardware,
+        (_, VulkanDevice::Shared) => Decode::Gpu,
+        (_, VulkanDevice::Own) => Decode::Hardware,
+    }
+}
+
+/// The Vulkan a run uses (PGPU-04), for its jail: on the VA-API GPU's
+/// render node, or on NVIDIA's GPU (chosen by name); none without
+/// libplacebo.
+pub fn vulkan(spec: &EncodeSpec<'_>) -> Option<Vulkan> {
+    match libplacebo(spec)? {
+        (Hardware::Nvenc, _) => Some(Vulkan::default()),
+        _ => Some(Vulkan::on(spec.vaapi_device)),
+    }
+}
+
+/// Whether `spec`'s video is made all on the GPU, nothing on the CPU but
+/// moving frames: decoded and filtered on it and encoded from it, or tone
+/// mapped by libplacebo on its own device from frames the GPU decoded
+/// into memory, with nothing burned in. What weighs a quarter.
+pub fn all_on_gpu(spec: &EncodeSpec<'_>) -> bool {
+    match (decode(spec), libplacebo(spec)) {
+        (Decode::Software, _) => false,
+        // A burn-in after libplacebo is on the CPU, the frames on the GPU
+        // or not.
+        (_, Some((family, _))) => cpu_filters(spec, family).is_empty(),
+        (decode, None) => decode == Decode::Gpu,
+    }
 }
 
 /// Where one of a video encode's filters runs (PX-24).
@@ -447,6 +612,8 @@ pub enum Decoder {
     Software,
     /// On the GPU, through this API.
     Hardware(Hardware),
+    /// On NVIDIA's GPU through Vulkan, for libplacebo (PGPU-04).
+    Vulkan,
 }
 
 /// How a run makes its video (PX-24): what Server › Playback shows,
@@ -458,6 +625,8 @@ pub struct Made {
     /// The video encoder, for an encoded video.
     pub encoder: Option<VideoEncoder>,
     pub tone_map: FilterOn,
+    /// What tone mapped (PGPU-04), when the video is tone mapped.
+    pub tone_mapper: Option<ToneMapper>,
     pub burn_in: FilterOn,
     /// The picture written, width × height: the source's, or scaled to
     /// the plan's height as `scale=-2:h` (or `scale_vaapi=w=-2`,
@@ -482,26 +651,35 @@ pub fn made(spec: &EncodeSpec<'_>) -> Made {
             decoder: Decoder::None,
             encoder: None,
             tone_map: FilterOn::None,
+            tone_mapper: None,
             burn_in: FilterOn::None,
             size: source.filter(|_| matches!(spec.video, Some(ConvertedVideo::Copy { .. }))),
             target_bitrate: None,
         };
     };
     let decode = decode(spec);
+    let placebo = libplacebo(spec);
     // Every filter is on the GPU or none is: `decode` keeps the frames
-    // there only when nothing on the CPU needs them.
+    // there only when nothing on the CPU needs them. But for libplacebo,
+    // which tone maps on the GPU whatever burns in after it on the CPU.
     let on = |used: bool| match (used, decode) {
         (false, _) => FilterOn::None,
-        (true, Decode::Gpu) => FilterOn::Gpu,
+        (true, Decode::Gpu) if placebo.is_none() => FilterOn::Gpu,
         (true, _) => FilterOn::Cpu,
     };
+    let tone_mapper = tone_mapper(spec);
     Made {
         decoder: match gpu_decoder(spec) {
             None => Decoder::Software,
+            Some(Hardware::Nvenc) if placebo.is_some() && decode == Decode::Gpu => Decoder::Vulkan,
             Some(hardware) => Decoder::Hardware(hardware),
         },
         encoder: placement(spec).map(|place| place.encoder.clone()),
-        tone_map: on(tone_map),
+        tone_map: match tone_mapper {
+            Some(mapper) if mapper.on_gpu() => FilterOn::Gpu,
+            _ => on(tone_map),
+        },
+        tone_mapper,
         burn_in: on(matches!(burned(spec), Ok(Some(_)))),
         size: source.map(|(w, h)| scaled(w, h, height)),
         target_bitrate: max_bitrate,
@@ -597,20 +775,7 @@ fn cpu_graph(
                     stream.width, stream.height, stream.index
                 );
             }
-            (SubtitleSource::Embedded { .. }, SubtitleKind::Text) => {
-                let nth = d.subtitles[..sub.index as usize]
-                    .iter()
-                    .filter(|s| matches!(s.source, SubtitleSource::Embedded { .. }))
-                    .count();
-                chain.push(format!(
-                    "subtitles=filename={}:si={nth}",
-                    filter_path(spec.input)?
-                ));
-            }
-            (SubtitleSource::External { path }, SubtitleKind::Text) => {
-                let path = spec.sidecar.unwrap_or(path);
-                chain.push(format!("subtitles=filename={}", filter_path(path)?));
-            }
+            (_, SubtitleKind::Text) => chain.push(text_burn_in(spec, sub.index, picked)?),
         }
     }
     if tone_map {
@@ -725,6 +890,157 @@ fn cuda_graph(
     })
 }
 
+/// The filter that burns text track `track` (the plan's subtitle `index`)
+/// in: libass, reading the film or the external file itself.
+fn text_burn_in(
+    spec: &EncodeSpec<'_>,
+    index: u32,
+    track: &SubtitleStream,
+) -> Result<String, String> {
+    Ok(match &track.source {
+        SubtitleSource::Embedded { .. } => {
+            let nth = spec.descriptor.subtitles[..index as usize]
+                .iter()
+                .filter(|s| matches!(s.source, SubtitleSource::Embedded { .. }))
+                .count();
+            format!("subtitles=filename={}:si={nth}", filter_path(spec.input)?)
+        }
+        SubtitleSource::External { path } => {
+            let path = spec.sidecar.unwrap_or(path);
+            format!("subtitles=filename={}", filter_path(path)?)
+        }
+    })
+}
+
+/// The devices of a libplacebo run (PGPU-04), before the film's input,
+/// and its decode, as [`libplacebo_decode`] chose it:
+///
+/// - **own** device, on VA-API: the encoder's VA-API device, which is the
+///   filters' too (`hwupload`), libplacebo seeing no Vulkan device there
+///   and making its own; the GPU's decode into memory.
+/// - **shared**, on VA-API (experimental): a Vulkan device derived from
+///   the VA-API one, the filters'; VA-API's frames kept, to be mapped.
+/// - **shared**, on NVIDIA: ffmpeg's NVIDIA Vulkan device, the filters';
+///   decoded on it (`-hwaccel vulkan`), or on NVDEC into memory.
+fn libplacebo_devices(
+    spec: &EncodeSpec<'_>,
+    family: Hardware,
+    device: VulkanDevice,
+    decode: Decode,
+) -> Vec<String> {
+    let node = spec.vaapi_device.display();
+    let mut args = Vec::new();
+    match (family, device) {
+        (Hardware::Nvenc, VulkanDevice::Shared) => {
+            args.extend(["-init_hw_device", NVIDIA_VULKAN, "-filter_hw_device", "vk"].map(s));
+            match decode {
+                Decode::Gpu => args.extend(
+                    [
+                        "-hwaccel",
+                        "vulkan",
+                        "-hwaccel_device",
+                        "vk",
+                        "-hwaccel_output_format",
+                        "vulkan",
+                    ]
+                    .map(s),
+                ),
+                Decode::Hardware => {
+                    args.extend(hwaccel_args(Hardware::Nvenc, spec.vaapi_device, false));
+                }
+                Decode::Software => {}
+            }
+        }
+        (_, VulkanDevice::Shared) => {
+            args.extend([
+                s("-init_hw_device"),
+                format!("vaapi=va:{node}"),
+                s("-init_hw_device"),
+                s("vulkan=vk@va"),
+                s("-filter_hw_device"),
+                s("vk"),
+            ]);
+            if decode == Decode::Gpu {
+                args.extend(
+                    [
+                        "-hwaccel",
+                        "vaapi",
+                        "-hwaccel_device",
+                        "va",
+                        "-hwaccel_output_format",
+                        "vaapi",
+                    ]
+                    .map(s),
+                );
+            }
+        }
+        (_, VulkanDevice::Own) => {
+            if family == Hardware::Vaapi {
+                args.extend([s("-vaapi_device"), s(node)]);
+            }
+            if let (Some(decoder), Decode::Hardware) = (gpu_decoder(spec), decode) {
+                args.extend(hwaccel_args(decoder, spec.vaapi_device, false));
+            }
+        }
+    }
+    args
+}
+
+/// The video's filters for a libplacebo run (PGPU-04): libplacebo tone
+/// maps to 8-bit SDR BT.709 and scales to the plan's height
+/// ([`libplacebo_filter`]); shared, on frames on ffmpeg's Vulkan device
+/// (mapped there from VA-API, decoded there, or uploaded), downloaded
+/// after it. A subtitle burned in goes over its output on the CPU, at the
+/// size written: pictures scaled to it and laid over, text drawn by
+/// libass. Then up to the VA-API encoder (its device found again from the
+/// derived Vulkan one when shared), or to NVENC from memory.
+fn libplacebo_graph(
+    spec: &EncodeSpec<'_>,
+    stream: &VideoStream,
+    height: u32,
+    (family, device): (Hardware, VulkanDevice),
+    decode: Decode,
+) -> Result<String, String> {
+    let vaapi = family == Hardware::Vaapi;
+    let mut head = Vec::new();
+    match (device, decode) {
+        (VulkanDevice::Shared, Decode::Gpu) if vaapi => head.push(s("hwmap=derive_device=vulkan")),
+        (VulkanDevice::Shared, Decode::Gpu) | (VulkanDevice::Own, _) => {}
+        (VulkanDevice::Shared, _) => head.push(s("hwupload")),
+    }
+    head.push(libplacebo_filter(
+        (height < stream.height).then_some(height),
+    ));
+    if device == VulkanDevice::Shared {
+        head.push(s("hwdownload,format=nv12"));
+    }
+    let tail = match (vaapi, device) {
+        (true, VulkanDevice::Shared) => Some("hwupload=derive_device=vaapi"),
+        (true, VulkanDevice::Own) => Some("format=nv12,hwupload"),
+        (false, _) => None,
+    };
+    let video = format!("[0:{}]", stream.index);
+    let index = spec.subtitle.map_or(0, |sub| sub.index);
+    Ok(match burned(spec)? {
+        Some(track) if track.kind == SubtitleKind::Bitmap => {
+            let (width, height) = scaled(stream.width, stream.height, height);
+            let tail = tail.map_or_else(String::new, |tail| format!(",{tail}"));
+            format!(
+                "[{}]scale={width}:{height}[subs];{video}{}[main];[main][subs]overlay{tail}[v]",
+                pictures_input(&track.source),
+                head.join(",")
+            )
+        }
+        burned => {
+            if let Some(track) = burned {
+                head.push(text_burn_in(spec, index, track)?);
+            }
+            head.extend(tail.map(s));
+            format!("{video}{}[v]", head.join(","))
+        }
+    })
+}
+
 /// Where burned-in pictures come from: the film's own stream, or the
 /// external file, the second input.
 fn pictures_input(source: &SubtitleSource) -> String {
@@ -753,14 +1069,19 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
     };
     let vaapi = encoder.is_some_and(|e| e.hardware == Some(Hardware::Vaapi));
     let decode = decode(spec);
-    // Frames decoded on the GPU and left there bring their device to the
-    // encoder; uploaded ones need it named.
-    if vaapi && decode != Decode::Gpu {
-        args.extend([s("-vaapi_device"), s(spec.vaapi_device.display())]);
-    }
+    let placebo = libplacebo(spec);
     // An option of the film's input, so before its seek.
     let decoder = gpu_decoder(spec);
-    if decode == Decode::Gpu && matches!(burned(spec), Ok(Some(_))) {
+    if let Some((family, device)) = placebo {
+        args.extend(libplacebo_devices(spec, family, device, decode));
+    } else if vaapi && decode != Decode::Gpu {
+        // Frames decoded on the GPU and left there bring their device to
+        // the encoder; uploaded ones need it named.
+        args.extend([s("-vaapi_device"), s(spec.vaapi_device.display())]);
+    }
+    if placebo.is_some() {
+        // Its devices and decode are set.
+    } else if decode == Decode::Gpu && matches!(burned(spec), Ok(Some(_))) {
         // The pictures are uploaded to the device the film decodes on:
         // one device, named, for both.
         if decoder == Some(Hardware::Nvenc) {
@@ -857,7 +1178,9 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 tone_map,
             } => {
                 let encoder = encoder.expect("set above for an encode");
-                let graph = if decode == Decode::Gpu && decoder == Some(Hardware::Nvenc) {
+                let graph = if let Some(placebo) = placebo {
+                    libplacebo_graph(spec, stream, height, placebo, decode)?
+                } else if decode == Decode::Gpu && decoder == Some(Hardware::Nvenc) {
                     cuda_graph(spec, stream, codec, height)?
                 } else if decode == Decode::Gpu {
                     gpu_graph(spec, stream, height, tone_map)?
@@ -1145,6 +1468,7 @@ mod tests {
             gpu_overlay: false,
             cuda_scale: false,
             cuda_overlay: false,
+            libplacebo: Vec::new(),
             unusable: Vec::new(),
             failed: Vec::new(),
         }
@@ -1172,6 +1496,7 @@ mod tests {
             vaapi_device: Path::new("/dev/dri/renderD128"),
             hardware_decode: true,
             gpu_filters: false,
+            tone_map: ToneMapSetting::Auto,
             start: None,
             output,
         }
@@ -1369,7 +1694,7 @@ mod tests {
         assert_eq!(
             cpu_instead_of_gpu(&spec),
             [
-                "NVIDIA GPUs tone map on the CPU",
+                "libplacebo does not tone map on the NVIDIA GPU",
                 "the NVIDIA GPU does not scale (scale_cuda)",
                 "the NVIDIA GPU does not overlay pictures (overlay_cuda)"
             ]
@@ -1702,7 +2027,7 @@ mod tests {
         );
         assert_eq!(
             cpu_instead_of_gpu(&spec),
-            ["NVIDIA GPUs tone map on the CPU"]
+            ["libplacebo does not tone map on the NVIDIA GPU"]
         );
         let made = made(&spec);
         assert_eq!(
@@ -2055,7 +2380,7 @@ mod tests {
         assert!(graph.contains("tonemap=tonemap=hable"), "{graph}");
         assert_eq!(
             cpu_instead_of_gpu(&spec),
-            ["the GPU's driver does not tone map (tonemap_vaapi)"]
+            ["the GPU tone maps neither with its driver (tonemap_vaapi) nor with libplacebo"]
         );
     }
 
@@ -2232,6 +2557,7 @@ mod tests {
                 decoder: Decoder::None,
                 encoder: None,
                 tone_map: FilterOn::None,
+                tone_mapper: None,
                 burn_in: FilterOn::None,
                 size: Some((3840, 2160)),
                 target_bitrate: None,
@@ -3097,5 +3423,403 @@ mod tests {
             GpuUse::Nvidia
         );
         assert_eq!(gpu(&av1, &software_av1, to(VideoCodec::Av1)), GpuUse::Vaapi);
+    }
+
+    // PGPU-04: the tone map on the GPU with libplacebo.
+
+    use spoolframe_media::encoders::Libplacebo;
+
+    /// libplacebo's tone map to 1080p, as the jobs write it.
+    const PLACEBO_1080: &str = "libplacebo=w=-2:h=1080:tonemapping=bt.2390:colorspace=bt709:\
+                                color_primaries=bt709:color_trc=bt709:range=tv:format=nv12";
+
+    /// `encoders`, libplacebo tone mapping on `family` with `device`.
+    fn placebo(encoders: Encoders, family: Hardware, device: VulkanDevice) -> Encoders {
+        Encoders {
+            libplacebo: vec![Libplacebo {
+                hardware: family,
+                device,
+            }],
+            ..encoders
+        }
+    }
+
+    /// A GTX 1060 whose libplacebo shares ffmpeg's Vulkan device.
+    fn nvidia_placebo() -> Encoders {
+        placebo(nvidia(), Hardware::Nvenc, VulkanDevice::Shared)
+    }
+
+    /// An AMD GPU (VA-API, Mesa: no tonemap_vaapi) whose libplacebo makes
+    /// its own device.
+    fn amd_placebo() -> Encoders {
+        placebo(with_decoders(true), Hardware::Vaapi, VulkanDevice::Own)
+    }
+
+    /// NVIDIA, shared: the 4K HDR10 HEVC film decoded on ffmpeg's NVIDIA
+    /// Vulkan device (`-hwaccel vulkan`, frames kept), tone mapped and
+    /// scaled by libplacebo there, downloaded in 8 bits to NVENC: the
+    /// measured path. All on the GPU; its jail uses Vulkan, on whichever
+    /// GPU the NVIDIA jail opens.
+    #[test]
+    fn nvidia_tone_maps_with_libplacebo_on_ffmpeg_s_vulkan_device() {
+        let (film, enc) = (film(), nvidia_placebo());
+        let mut spec = spec_with(&film, &enc, TONE_MAPPED_H264, None);
+        spec.gpu_filters = true;
+        spec.start = Some(Duration::from_secs(600));
+        assert_eq!(
+            libplacebo(&spec),
+            Some((Hardware::Nvenc, VulkanDevice::Shared))
+        );
+        assert_eq!(decode(&spec), Decode::Gpu);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(
+            has(
+                &args,
+                &[
+                    "-init_hw_device",
+                    "vulkan=vk:NVIDIA",
+                    "-filter_hw_device",
+                    "vk",
+                    "-hwaccel",
+                    "vulkan",
+                    "-hwaccel_device",
+                    "vk",
+                    "-hwaccel_output_format",
+                    "vulkan",
+                    "-ss",
+                ]
+            ),
+            "{args:?}"
+        );
+        assert!(!has(&args, &["-hwaccel", "cuda"]), "{args:?}");
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            format!("[0:0]{PLACEBO_1080},hwdownload,format=nv12[v]")
+        );
+        assert!(has(&args, &["-c:v", "h264_nvenc"]));
+        assert_eq!(
+            tone_mapper(&spec),
+            Some(ToneMapper::Libplacebo(VulkanDevice::Shared))
+        );
+        let made = made(&spec);
+        assert_eq!(made.decoder, Decoder::Vulkan);
+        assert_eq!(made.tone_map, FilterOn::Gpu);
+        assert_eq!(
+            made.tone_mapper,
+            Some(ToneMapper::Libplacebo(VulkanDevice::Shared))
+        );
+        assert_eq!(made.size, Some((1920, 1080)));
+        assert!(all_on_gpu(&spec));
+        assert_eq!(vulkan(&spec), Some(Vulkan::default()));
+        assert!(cpu_instead_of_gpu(&spec).is_empty());
+    }
+
+    /// AMD, own device: decoded on VA-API into memory, tone mapped and
+    /// scaled by libplacebo's own device (the filters' device being
+    /// VA-API's, it sees no Vulkan one), uploaded to `h264_vaapi`. Its
+    /// jail's Vulkan names the render node's GPU.
+    #[test]
+    fn amd_tone_maps_with_libplacebo_s_own_device_through_memory() {
+        let (film, enc) = (film(), amd_placebo());
+        let mut spec = spec_with(&film, &enc, TONE_MAPPED_H264, None);
+        spec.gpu_filters = true;
+        assert_eq!(decode(&spec), Decode::Hardware);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(
+            has(
+                &args,
+                &[
+                    "-vaapi_device",
+                    "/dev/dri/renderD128",
+                    "-hwaccel",
+                    "vaapi",
+                    "-hwaccel_device",
+                    "/dev/dri/renderD128",
+                    "-i",
+                ]
+            ),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a.starts_with("vulkan")), "{args:?}");
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            format!("[0:0]{PLACEBO_1080},format=nv12,hwupload[v]")
+        );
+        assert!(has(&args, &["-c:v", "h264_vaapi"]));
+        let made = made(&spec);
+        assert_eq!(made.decoder, Decoder::Hardware(Hardware::Vaapi));
+        assert_eq!(made.tone_map, FilterOn::Gpu);
+        assert_eq!(
+            made.tone_mapper,
+            Some(ToneMapper::Libplacebo(VulkanDevice::Own))
+        );
+        assert!(all_on_gpu(&spec));
+        assert_eq!(
+            vulkan(&spec),
+            Some(Vulkan::on(Path::new("/dev/dri/renderD128")))
+        );
+    }
+
+    /// AMD with `experimental.libplacebo_shared_on_amd` where it works:
+    /// VA-API's frames kept, mapped to a Vulkan device derived from the
+    /// VA-API one, tone mapped, downloaded in 8 bits and uploaded to the
+    /// VA-API device found again from the Vulkan one.
+    #[test]
+    fn amd_shared_maps_vaapi_frames_to_a_derived_vulkan_device() {
+        let film = film();
+        let enc = placebo(with_decoders(true), Hardware::Vaapi, VulkanDevice::Shared);
+        let mut spec = spec_with(&film, &enc, TONE_MAPPED_H264, None);
+        spec.gpu_filters = true;
+        assert_eq!(decode(&spec), Decode::Gpu);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(
+            has(
+                &args,
+                &[
+                    "-init_hw_device",
+                    "vaapi=va:/dev/dri/renderD128",
+                    "-init_hw_device",
+                    "vulkan=vk@va",
+                    "-filter_hw_device",
+                    "vk",
+                    "-hwaccel",
+                    "vaapi",
+                    "-hwaccel_device",
+                    "va",
+                    "-hwaccel_output_format",
+                    "vaapi",
+                    "-i",
+                ]
+            ),
+            "{args:?}"
+        );
+        assert!(!args.contains(&s("-vaapi_device")), "{args:?}");
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            format!(
+                "[0:0]hwmap=derive_device=vulkan,{PLACEBO_1080},hwdownload,format=nv12,\
+                 hwupload=derive_device=vaapi[v]"
+            )
+        );
+        assert_eq!(
+            made(&spec).tone_mapper,
+            Some(ToneMapper::Libplacebo(VulkanDevice::Shared))
+        );
+    }
+
+    /// `"auto"` tone maps on the GPU only with GPU filters on, as it did
+    /// before PGPU-04; a forced method is used whatever they say, and
+    /// `"cpu"` keeps the CPU's.
+    #[test]
+    fn auto_follows_gpu_filters_and_a_forced_method_does_not() {
+        let (film, enc) = (film(), nvidia_placebo());
+        let graph = |tone_map: ToneMapSetting, gpu_filters: bool| {
+            let mut spec = spec_with(&film, &enc, TONE_MAPPED_H264, None);
+            spec.tone_map = tone_map;
+            spec.gpu_filters = gpu_filters;
+            s(after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"))
+        };
+        assert!(graph(ToneMapSetting::Auto, false).contains("tonemap=tonemap=hable"));
+        assert!(graph(ToneMapSetting::Auto, true).contains("libplacebo="));
+        assert!(graph(ToneMapSetting::Libplacebo, false).contains("libplacebo="));
+        assert!(graph(ToneMapSetting::Cpu, true).contains("tonemap=tonemap=hable"));
+        // "gpu" is the driver's own, which NVIDIA has not.
+        assert!(graph(ToneMapSetting::Gpu, true).contains("tonemap=tonemap=hable"));
+    }
+
+    /// On a GPU with both, auto takes the driver's own tone map first
+    /// (Intel's `tonemap_vaapi`, as before); `"libplacebo"` takes
+    /// libplacebo; a forced method the GPU lacks is the CPU's, noted once.
+    #[test]
+    fn the_driver_s_own_tone_map_comes_first_under_auto() {
+        let film = film();
+        let both = placebo(
+            with_filters(true, false),
+            Hardware::Vaapi,
+            VulkanDevice::Own,
+        );
+        let mut spec = spec_with(&film, &both, TONE_MAPPED_H264, None);
+        spec.gpu_filters = true;
+        assert_eq!(tone_mapper(&spec), Some(ToneMapper::Vaapi));
+        assert!(after(&ffmpeg_args(&spec).unwrap(), "-filter_complex").contains("tonemap_vaapi"));
+        assert_eq!(tone_map_note(&spec), None);
+        spec.tone_map = ToneMapSetting::Libplacebo;
+        assert_eq!(
+            tone_mapper(&spec),
+            Some(ToneMapper::Libplacebo(VulkanDevice::Own))
+        );
+        let amd = amd_placebo();
+        let mut forced = spec_with(&film, &amd, TONE_MAPPED_H264, None);
+        forced.tone_map = ToneMapSetting::Gpu;
+        assert_eq!(tone_mapper(&forced), Some(ToneMapper::Cpu));
+        assert!(
+            tone_map_note(&forced).is_some_and(|note| note.contains("tonemap_vaapi")),
+            "{:?}",
+            tone_map_note(&forced)
+        );
+        let no_placebo = with_decoders(true);
+        let mut forced = spec_with(&film, &no_placebo, TONE_MAPPED_H264, None);
+        forced.tone_map = ToneMapSetting::Libplacebo;
+        assert_eq!(tone_mapper(&forced), Some(ToneMapper::Cpu));
+        assert!(
+            tone_map_note(&forced).is_some_and(|note| note.contains("\"libplacebo\"")),
+            "{:?}",
+            tone_map_note(&forced)
+        );
+    }
+
+    /// What is burned in goes over libplacebo's output on the CPU, at the
+    /// size written: pictures scaled to it and laid over before NVENC;
+    /// text drawn by libass before the upload to VA-API. The tone map
+    /// stays on the GPU, so the job is not all there.
+    #[test]
+    fn burn_in_with_libplacebo_is_laid_over_its_output_on_the_cpu() {
+        let film = film();
+        let enc = nvidia_placebo();
+        let mut pictures = spec_with(
+            &film,
+            &enc,
+            TONE_MAPPED_H264,
+            burn_in(0, SubtitleFormat::Pgs),
+        );
+        pictures.gpu_filters = true;
+        assert_eq!(
+            after(&ffmpeg_args(&pictures).unwrap(), "-filter_complex"),
+            format!(
+                "[0:2]scale=1920:1080[subs];[0:0]{PLACEBO_1080},hwdownload,format=nv12[main];\
+                 [main][subs]overlay[v]"
+            )
+        );
+        let made = made(&pictures);
+        assert_eq!(made.tone_map, FilterOn::Gpu);
+        assert_eq!(made.burn_in, FilterOn::Cpu);
+        assert!(!all_on_gpu(&pictures));
+        assert_eq!(
+            cpu_instead_of_gpu(&pictures),
+            ["pictures are burned in on the CPU after libplacebo's tone map"]
+        );
+
+        let enc = amd_placebo();
+        let mut text = spec_with(
+            &film,
+            &enc,
+            TONE_MAPPED_H264,
+            burn_in(1, SubtitleFormat::Srt),
+        );
+        text.gpu_filters = true;
+        assert_eq!(
+            after(&ffmpeg_args(&text).unwrap(), "-filter_complex"),
+            format!(
+                "[0:0]{PLACEBO_1080},subtitles=filename='/media/Film.mkv':si=1,\
+                 format=nv12,hwupload[v]"
+            )
+        );
+        assert!(!all_on_gpu(&text));
+    }
+
+    /// NVIDIA shared, a source Vulkan Video is not trusted with: decoded
+    /// on NVDEC into memory (VP9) or in software (AV1 on Pascal), and
+    /// uploaded to the Vulkan device for libplacebo.
+    #[test]
+    fn a_source_not_decoded_on_vulkan_is_uploaded_to_it() {
+        let enc = nvidia_placebo();
+        for (codec, decoded) in [("vp9", Decode::Hardware), ("av1", Decode::Software)] {
+            let mut film = film();
+            let video = film.video.as_mut().unwrap();
+            video.codec = codec.into();
+            video.bit_depth = 8;
+            video.pixel_format = Some("yuv420p".into());
+            let mut spec = spec_with(&film, &enc, TONE_MAPPED_H264, None);
+            spec.gpu_filters = true;
+            assert_eq!(decode(&spec), decoded, "{codec}");
+            let args = ffmpeg_args(&spec).unwrap();
+            assert!(!args.contains(&s("vulkan")), "{args:?}");
+            assert_eq!(
+                args.windows(2).any(|w| w == ["-hwaccel", "cuda"]),
+                decoded == Decode::Hardware,
+                "{args:?}"
+            );
+            assert!(!args.contains(&s("-hwaccel_output_format")), "{args:?}");
+            assert_eq!(
+                after(&args, "-filter_complex"),
+                format!("[0:0]hwupload,{PLACEBO_1080},hwdownload,format=nv12[v]")
+            );
+            assert!(!all_on_gpu(&spec) || decoded == Decode::Hardware);
+        }
+    }
+
+    /// A run after the GPU failed for the file (`hardware_decode` off)
+    /// tone maps on the CPU, with no Vulkan: what a libplacebo failure
+    /// runs again as.
+    #[test]
+    fn a_run_after_a_gpu_failure_tone_maps_on_the_cpu() {
+        let (film, enc) = (film(), nvidia_placebo());
+        let mut spec = spec_with(&film, &enc, TONE_MAPPED_H264, None);
+        spec.gpu_filters = true;
+        spec.hardware_decode = false;
+        assert_eq!(libplacebo(&spec), None);
+        assert_eq!(vulkan(&spec), None);
+        assert_eq!(tone_mapper(&spec), Some(ToneMapper::Cpu));
+        let graph = s(after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"));
+        assert!(graph.contains("tonemap=tonemap=hable"), "{graph}");
+        assert_eq!(tone_map_note(&spec), None);
+    }
+
+    /// HDR kept (HEVC out, no tone map) runs no libplacebo, as before.
+    #[test]
+    fn hdr_kept_runs_no_libplacebo() {
+        let (film, enc) = (film(), nvidia_placebo());
+        let hevc = ConvertedVideo::Encode {
+            codec: VideoCodec::Hevc,
+            height: 1080,
+            max_bitrate: None,
+            tone_map: false,
+        };
+        let mut spec = spec_with(&film, &enc, hevc, None);
+        spec.gpu_filters = true;
+        assert_eq!(libplacebo(&spec), None);
+        assert_eq!(tone_mapper(&spec), None);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(args.iter().all(|a| !a.contains("libplacebo")), "{args:?}");
+        assert_eq!(made(&spec).tone_mapper, None);
+        // Its jail has no Vulkan: only a libplacebo run's has.
+        assert_eq!(vulkan(&spec), None);
+    }
+
+    /// PGPU-02's ranking counts a GPU tone map as on the GPU: with the
+    /// AMD GPU first and neither tonemap_vaapi nor libplacebo there, a
+    /// tone-mapped film goes to NVIDIA, which runs libplacebo, as the
+    /// one that does all of it; once AMD runs libplacebo too, the order
+    /// decides again.
+    #[test]
+    fn a_gpu_tone_map_counts_toward_the_whole_job() {
+        let film = film();
+        let to = |encoders: &Encoders| {
+            let mut spec = spec_with(&film, encoders, TONE_MAPPED_H264, None);
+            spec.gpu_filters = true;
+            placement(&spec).unwrap().encoder.name.clone()
+        };
+        let amd_first = [Hardware::Vaapi, Hardware::Nvenc];
+        assert_eq!(to(&two_gpus(amd_first, false)), "h264_vaapi");
+        let nvidia_only = placebo(
+            two_gpus(amd_first, false),
+            Hardware::Nvenc,
+            VulkanDevice::Shared,
+        );
+        assert_eq!(to(&nvidia_only), "h264_nvenc");
+        let both = Encoders {
+            libplacebo: vec![
+                Libplacebo {
+                    hardware: Hardware::Vaapi,
+                    device: VulkanDevice::Own,
+                },
+                Libplacebo {
+                    hardware: Hardware::Nvenc,
+                    device: VulkanDevice::Shared,
+                },
+            ],
+            ..two_gpus(amd_first, false)
+        };
+        assert_eq!(to(&both), "h264_vaapi");
     }
 }

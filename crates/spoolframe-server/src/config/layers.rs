@@ -245,17 +245,29 @@ impl Layers {
     /// Read the layers at `locations`. A missing runtime layer is an
     /// empty one: the server has not changed anything yet.
     pub fn load(locations: &Locations) -> Result<Self, ConfigError> {
-        let file = match &locations.config {
+        Self::read(
+            locations.config.as_deref(),
+            locations.state_dir.join(RUNTIME_FILE),
+        )
+    }
+
+    /// The same layers read again from their files (PX-33): the provided
+    /// file where it was, and the runtime layer.
+    pub fn reread(&self) -> Result<Self, ConfigError> {
+        Self::read(self.file_path(), self.runtime_path.clone())
+    }
+
+    fn read(config: Option<&Path>, runtime_path: PathBuf) -> Result<Self, ConfigError> {
+        let file = match config {
             None => None,
             Some(path) => {
                 let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-                    path: path.clone(),
+                    path: path.to_owned(),
                     source,
                 })?;
-                Some((path.clone(), text))
+                Some((path.to_owned(), text))
             }
         };
-        let runtime_path = locations.state_dir.join(RUNTIME_FILE);
         let runtime = match std::fs::read_to_string(&runtime_path) {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -825,8 +837,11 @@ mod tests {
             bare.media.sandbox().unwrap()
         );
         assert_eq!(
-            documented.transcode.settings().unwrap(),
-            bare.transcode.settings().unwrap()
+            documented
+                .transcode
+                .settings(&documented.experimental)
+                .unwrap(),
+            bare.transcode.settings(&bare.experimental).unwrap()
         );
         assert_eq!(
             documented.transcode.limits(dir).unwrap(),

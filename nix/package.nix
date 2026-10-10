@@ -9,7 +9,8 @@
   libucl,
   openssl,
   makeWrapper,
-  ffmpeg-headless,
+  # nix/ffmpeg.nix: nixpkgs' ffmpeg-headless with libplacebo (PGPU-04).
+  ffmpeg,
   tesseract,
   # The web UI (P3-01).
   dioxus-cli,
@@ -79,9 +80,10 @@ in
       # encode (P2-02) and tesseract to read bitmap subtitles (P2-07), each
       # confined by Landlock and seccomp (PX-11 finding 34); put them on the
       # binary's PATH rather than relying on the host having them.
-      # nixpkgs' ffmpeg-headless already has VA-API and NVENC (the CUDA
-      # driver is loaded at run time), so no override: QSV is the one it
-      # lacks, and Intel GPUs encode through VA-API.
+      # nixpkgs' ffmpeg-headless has VA-API, NVENC (the CUDA driver is
+      # loaded at run time) and Vulkan; nix/ffmpeg.nix adds libplacebo for
+      # the HDR tone map on the GPU (PGPU-04). QSV is the one it lacks, and
+      # Intel GPUs encode through VA-API.
       nativeBuildInputs =
         commonArgs.nativeBuildInputs
         ++ [
@@ -94,7 +96,7 @@ in
         ];
       postInstall = ''
         wrapProgram $out/bin/spoolframe-server \
-          --prefix PATH : ${lib.makeBinPath [ffmpeg-headless ocr]}
+          --prefix PATH : ${lib.makeBinPath [ffmpeg ocr]}
       '';
       # Tests run in devenv/CI; the license-boundary test shells out to
       # `cargo metadata`, which the package build has no reason to do.

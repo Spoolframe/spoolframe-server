@@ -15,6 +15,12 @@
 # UI and `config set` cannot change them. Keys it leaves out stay
 # editable.
 #
+# SIGHUP (`systemctl reload`, `spoolframe-server config reload`) has a
+# running server read the provided file and runtime.ucl again. They are
+# checked as at start; if they do not load, nothing changes and the log
+# says why. Live settings apply at once; the others, the ones the web UI
+# marks "after a restart", at the next start.
+#
 # Where the layers are is not configuration: the state directory comes
 # from --state-dir, SPOOLFRAME_STATE_DIR, systemd's $STATE_DIRECTORY,
 # $XDG_STATE_HOME/spoolframe, or /var/lib/spoolframe when run as root.
@@ -326,8 +332,15 @@ transcode {
   # NVIDIA scales (scale_cuda) and burns in picture subtitles
   # (overlay_cuda), and tone maps on the CPU, its whole chain with it.
   # What the GPU cannot, and text subtitles, the CPU does as when this
-  # is off.
+  # is off. The tone map is tone_map's.
   gpu_filters = false;
+  # How HDR is tone mapped to SDR for a screen that shows no HDR:
+  # "auto" uses the job's GPU's own tone map (tonemap_vaapi, Intel), else
+  # libplacebo on the job's GPU through Vulkan (AMD, NVIDIA), else the
+  # CPU; and the CPU while gpu_filters is off. "cpu", "gpu" (the
+  # driver's own) or "libplacebo" forces one, whatever gpu_filters says;
+  # a job whose GPU cannot run it is tone mapped on the CPU.
+  tone_map = "auto";
 }
 
 # Offer bitmap subtitles (PGS, VobSub, DVB) as text, read with tesseract.
@@ -387,4 +400,14 @@ telemetry {
     metrics = true;
     logs = true;
   }
+}
+
+# Switches that may change or go away in any release, without notice. The
+# server logs the ones set at start.
+experimental {
+  # On an AMD GPU, libplacebo's tone map uses ffmpeg's Vulkan device, so
+  # the frames stay on the GPU, rather than one of its own, which takes
+  # them through system memory. Tried at start, and its own used where
+  # that fails, as it does with Mesa's RADV today. NVIDIA always shares.
+  libplacebo_shared_on_amd = false;
 }

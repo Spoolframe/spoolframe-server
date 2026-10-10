@@ -10,6 +10,7 @@ use spoolframe_media::Prober;
 use spoolframe_media::bitmap::Budget;
 use spoolframe_media::decode;
 use spoolframe_media::encoders::{FfmpegCommand, Hardware};
+use spoolframe_media::harden;
 use spoolframe_media::ocr::Ocr;
 use spoolframe_media::sandbox::{self, Sandbox, Tool};
 use spoolframe_plex::{Failures, LibraryPaths, Scope};
@@ -34,7 +35,7 @@ use spoolframe_server::playback_debug::PlaybackDebug;
 use spoolframe_server::plex_accounts::{PlexAccounts, configured_owner};
 use spoolframe_server::plex_sync::WatchSync;
 use spoolframe_server::previews::{self, PreviewSources, Previews};
-use spoolframe_server::runtime::{self, Live, RuntimeSettings};
+use spoolframe_server::runtime::{self, Live, RuntimeSettings, reload};
 use spoolframe_server::store::Store;
 use spoolframe_server::subtitles::Subtitles;
 use spoolframe_server::telemetry::{OtelLayer, Swap, Telemetry};
@@ -278,6 +279,11 @@ enum ConfigCommand {
     /// Take a setting out of the runtime settings: the config file's value
     /// or the default applies again.
     Unset { key: String },
+    /// Have the running server read its config file and runtime settings
+    /// again, as SIGHUP does, logged in as an admin: the live settings
+    /// apply, the restart ones wait; a file that does not load changes
+    /// nothing.
+    Reload,
 }
 
 #[derive(Subcommand)]
@@ -312,6 +318,11 @@ enum PlexCommand {
 }
 
 fn main() -> Result<()> {
+    // First, before any thread, for every subcommand (PX-31): not
+    // dumpable, no new privileges, no core, the seccomp deny-list. The
+    // admin commands hold a session's token or read a password; the
+    // subtitle decoder, a confined child, loses nothing it uses.
+    let hardened = harden::harden().context("cannot harden the server's process")?;
     // What the server writes is its own (PX-11 finding 35): the database
     // holds password and session hashes, the caches what users watch. Its
     // subprocesses (ffmpeg, tesseract, its own subtitle decoder) write into
@@ -341,7 +352,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("cannot start the async runtime")?;
-    let restart = runtime.block_on(serve(cli));
+    let restart = runtime.block_on(serve(cli, hardened));
     // The tasks still running end here, and the media tools they ran are
     // killed with them; one stuck in a blocking call is not waited for.
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
@@ -353,12 +364,34 @@ fn main() -> Result<()> {
     }
 }
 
+/// What `main` did to harden the process, said once the log is up.
+fn log_hardened(hardened: &harden::Filter) {
+    const FLAGS: &str = "not dumpable (its /proc is root's), no new privileges, no core dumps";
+    match hardened {
+        harden::Filter::Loaded => tracing::debug!(
+            "the server's process is hardened: {FLAGS}, and a seccomp filter refuses the \
+             calls it never makes"
+        ),
+        harden::Filter::Kept => tracing::debug!(
+            "the server's process is hardened: {FLAGS}, and its seccomp filter is kept from \
+             before the restart"
+        ),
+        harden::Filter::Unavailable(reason) => tracing::warn!(
+            reason,
+            "the server's process is hardened: {FLAGS}, but there is no seccomp filter for \
+             this machine"
+        ),
+    }
+}
+
 /// Run this binary again in this process, as it was started: the same
 /// PID, arguments, environment and standard streams, so a pipe the log
 /// goes to (`| tee`) keeps receiving it. Every other descriptor the server
 /// opened is close-on-exec, so the exec frees its ports for the new
 /// server. `exe` is the path the binary was started from, so a binary
-/// rebuilt there since is the one that runs. Returns only to exit,
+/// rebuilt there since is the one that runs. The environment gains one
+/// variable: the seccomp filter survives the exec, and the new start
+/// keeps it rather than load a second copy (PX-31). Returns only to exit,
 /// non-zero, when the exec fails.
 fn restart_in_place(exe: std::io::Result<PathBuf>, args: &[std::ffi::OsString]) -> ! {
     use std::os::unix::process::CommandExt as _;
@@ -374,6 +407,7 @@ fn restart_in_place(exe: std::io::Result<PathBuf>, args: &[std::ffi::OsString]) 
             if let Some((arg0, rest)) = args.split_first() {
                 command.arg0(arg0).args(rest);
             }
+            harden::keep_across_exec(&mut command);
             command.exec()
         }
         Err(e) => e,
@@ -475,7 +509,7 @@ async fn relay(command: RelayCommand, config: Option<PathBuf>, state_dir: &Path)
     Ok(())
 }
 
-async fn serve(cli: Cli) -> Result<Option<RestartMode>> {
+async fn serve(cli: Cli, hardened: harden::Filter) -> Result<Option<RestartMode>> {
     let level = match cli.verbose {
         0 => "info",
         1 => "debug",
@@ -505,6 +539,7 @@ async fn serve(cli: Cli) -> Result<Option<RestartMode>> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(RingLayer(ring.clone()))
         .init();
+    log_hardened(&hardened);
 
     if let Some(Command::Config {
         command: ConfigCommand::Defaults,
@@ -528,12 +563,7 @@ async fn serve(cli: Cli) -> Result<Option<RestartMode>> {
         config = ?locations.config,
         "config loaded"
     );
-    for key in layers.shadowed() {
-        tracing::warn!(
-            key,
-            "the locked config file sets this; the runtime settings' value is not used"
-        );
-    }
+    reload::shadowed_warnings(&layers);
 
     let done = match cli.command {
         None => return run(&config, &layers, state_dir, ring, swap).await,
@@ -565,6 +595,9 @@ async fn serve(cli: Cli) -> Result<Option<RestartMode>> {
         Some(Command::Config {
             command: ConfigCommand::Unset { key },
         }) => admin_cli::config_change(config.admin.listen()?, &key, None).await,
+        Some(Command::Config {
+            command: ConfigCommand::Reload,
+        }) => admin_cli::config_reload(config.admin.listen()?).await,
         Some(Command::Setup {
             code,
             username,
@@ -622,7 +655,7 @@ fn plex(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result<Comp
 /// `media.sandbox` says, kept out of the state directory and systemd's
 /// credentials, with the GPU's device nodes when hardware may be used.
 fn media_sandbox(config: &ServerConfig, state_dir: &Path) -> Result<Sandbox> {
-    let transcode = config.transcode.settings()?;
+    let transcode = config.transcode.settings(&config.experimental)?;
     let families = transcode.hardware.families();
     let vaapi = families
         .iter()
@@ -727,6 +760,8 @@ async fn run(
     // manager, the CLI tests) may send SIGTERM the moment it sees it, and a
     // signal with no handler yet kills the process instead of stopping it.
     let shutdown = shutdown_signal()?;
+    // SIGHUP too (PX-33): unhandled, it would end the process.
+    let hangup = reload::listen();
     // The key first: if it cannot be loaded nothing else should start.
     let key = identity::load_or_create(state_dir)?;
     let server_id = identity::load_or_create_server_id(state_dir)?;
@@ -765,9 +800,10 @@ async fn run(
         sandbox.clone(),
     );
     let prober = Arc::new(Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT));
+    reload::config_warnings(config);
     let transcoding = Arc::new(Transcoding::new(
         Box::new(FfmpegCommand::new(ffmpeg.clone())),
-        config.transcode.settings()?,
+        config.transcode.settings(&config.experimental)?,
         state_dir.join("cache").join("encoder-test"),
     ));
     transcode::spawn_detection(transcoding.clone());
@@ -968,9 +1004,13 @@ async fn run(
             metrics: Some(metrics.clone()),
             logs: Some(logs.clone()),
             telemetry: Some(telemetry.clone()),
+            transcoding: Some(transcoding.clone()),
         },
         restart_mode,
     ));
+    if let Some(hangup) = hangup {
+        reload::on_hangup(hangup, settings.clone());
+    }
     // Shared by the client protocol, which opens and plays them, and the
     // admin API's playback debug (P3-15), which looks at them.
     let playbacks: Arc<Playbacks> = Arc::default();

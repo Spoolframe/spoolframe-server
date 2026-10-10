@@ -119,7 +119,13 @@
       hardware = ${quote cfg.transcode.hardware};
       vaapi_device = ${quote cfg.transcode.vaapiDevice};
       scratch_dir = "/var/cache/spoolframe/transcode";
+      ${lib.optionalString (cfg.transcode.toneMap != null) "tone_map = ${quote cfg.transcode.toneMap};"}
     }
+    ${lib.optionalString cfg.experimental.libplaceboSharedOnAmd ''
+      experimental {
+        libplacebo_shared_on_amd = true;
+      }
+    ''}
     media {
       tesseract = ${quote "${tesseract}/bin/tesseract"};
       sandbox = ${quote cfg.media.sandbox};
@@ -532,7 +538,7 @@ in {
         example = ["nvenc" "vaapi"];
         description = ''
           Which hardware encoders to try. The server test-encodes with each
-          at start (and on SIGHUP) and keeps what works; `spoolframe status`
+          at start (and on `systemctl reload`) and keeps what works; `spoolframe status`
           lists it. A list sets the order of preference: each video
           encode runs on the one family that does the most of it
           (encodes the output, decodes the source, runs its tone map,
@@ -554,6 +560,39 @@ in {
           The render node VA-API encodes on. With more than one GPU, name it
           by PCI path: the renderD numbers follow probe order and can swap
           after a reboot.
+        '';
+      };
+
+      toneMap = lib.mkOption {
+        type = lib.types.nullOr (lib.types.enum ["auto" "cpu" "gpu" "libplacebo"]);
+        default = null;
+        example = "libplacebo";
+        description = ''
+          How HDR is tone mapped to SDR for a screen that shows no HDR
+          (PGPU-04). `auto` uses the job's GPU's own tone map
+          (`tonemap_vaapi`, Intel), else libplacebo on the job's GPU
+          through Vulkan (AMD, NVIDIA), else the CPU; and the CPU while
+          `transcode.gpu_filters` is off. `cpu`, `gpu` (the driver's own)
+          or `libplacebo` forces one; a job whose GPU cannot run it is tone
+          mapped on the CPU. libplacebo needs the GPU's Vulkan driver:
+          {option}`hardware.graphics.enable` (RADV for AMD; NVIDIA's own).
+          Null leaves it to Settings › Playback in the web UI (`auto`
+          until set there).
+        '';
+      };
+    };
+
+    experimental = {
+      libplaceboSharedOnAmd = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Experimental: may change or go away in any release, without
+          notice. On an AMD GPU, libplacebo's tone map uses ffmpeg's
+          Vulkan device, so the frames stay on the GPU, rather than one of
+          its own, which takes them through system memory. Tried at start,
+          and its own used where that fails, as it does with Mesa's RADV
+          today. NVIDIA always shares.
         '';
       };
     };
@@ -723,12 +762,18 @@ in {
       wantedBy = ["multi-user.target"];
       after = ["network-online.target"];
       wants = ["network-online.target"];
-      # A new config is a restart: the server reads it once.
+      # A new config is a restart: it is a new file in the store, and the
+      # running server reads again (SIGHUP, PX-33) only the one it was
+      # started with.
       restartTriggers = [configFile];
       serviceConfig = {
         # The state directory quoted (G-13), as the CLI wrapper's is:
         # systemd splits on whitespace, and expands % and $.
         ExecStart = "${cfg.package}/bin/spoolframe-server --config ${configFile} --state-dir ${utils.escapeSystemdExecArg cfg.stateDir}";
+        # `systemctl reload spoolframe` (PX-33): the server reads its
+        # config file and runtime settings again, applies the live
+        # settings, and detects the encoders again.
+        ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
         User = "spoolframe";
         Group = "spoolframe";
         StateDirectory = lib.removePrefix "/var/lib/" cfg.stateDir;
@@ -798,6 +843,11 @@ in {
         # @system-service has: the server makes each media tool's ruleset,
         # and the tool confines itself with it before it starts. The
         # tool's seccomp filter is loaded with prctl(2), which is allowed.
+        # The server loads a deny-list of its own as it starts (PX-31),
+        # which stacks on this one: it also refuses the keyrings,
+        # io_uring, userfaultfd, process_vm_* and kcmp, which
+        # @system-service allows. It also makes itself not dumpable and
+        # sets no new privileges and a core limit of 0 itself.
         SystemCallFilter =
           ["@system-service" "~@privileged @resources" "setpriority ioprio_set"]
           ++ lib.optional sandboxed "landlock_create_ruleset landlock_add_rule landlock_restrict_self";

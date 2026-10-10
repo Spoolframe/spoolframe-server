@@ -176,6 +176,7 @@ fn spec<'a>(
         vaapi_device: &gpu.node,
         hardware_decode,
         gpu_filters: false,
+        tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
         start: None,
         output: Output::Progressive {
             file: out.to_path_buf(),
@@ -271,6 +272,7 @@ async fn a_gpu_decode_that_fails_at_once_finishes_in_software() {
             read_ahead: Duration::from_secs(600),
             stalled_after: Duration::from_secs(60),
             gpu_filters: false,
+            tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
         },
         Tool::new("ffmpeg", gpu.sandbox.clone()),
     )
@@ -293,6 +295,7 @@ async fn a_gpu_decode_that_fails_at_once_finishes_in_software() {
                 inputs: vec![film.clone()],
                 reads: Vec::new(),
                 gpu: GpuUse::Vaapi,
+                vulkan: None,
                 fallback: Some(Fallback {
                     args: software,
                     gpu: GpuUse::Vaapi,

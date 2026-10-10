@@ -1064,6 +1064,7 @@ mod tests {
             gpu_overlay: false,
             cuda_scale: false,
             cuda_overlay: false,
+            libplacebo: Vec::new(),
             unusable: Vec::new(),
             failed: Vec::new(),
         }

@@ -15,6 +15,7 @@ use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::server::ServerHandle;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
+use spoolframe_admin_api::ConfigReload;
 use spoolframe_admin_api::{
     Activity, LogPage, LogQuery, MetricsEndpointStatus, OtlpStatus, PlexServerActivity,
     RefusedScrape, ResourceAttribute, TelemetryStatus, UserSessionCount,
@@ -355,6 +356,7 @@ impl StatusSource {
                 gpu_filters: self.jobs.as_ref().is_some_and(|j| j.limits().gpu_filters),
                 gpu_tonemap: encoders.gpu_tonemap,
                 gpu_overlay: encoders.gpu_overlay,
+                gpu_tone_maps: crate::playback_debug::gpu_tone_maps(&encoders),
                 budget: self.jobs.as_ref().map(|jobs| {
                     let now = jobs.budget();
                     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
@@ -2963,6 +2965,18 @@ impl AdminApiServer for AdminApi {
         let (settings, by) = self.settings_as_recent_admin(ext, true).await?;
         settings.restart(&by);
         Ok(())
+    }
+
+    async fn config_reload(&self, ext: &Extensions) -> RpcResult<ConfigReload> {
+        let (settings, by) = self.settings_as_recent_admin(ext, true).await?;
+        let reloaded = settings
+            .reload(&format!("configReload by {by}"))
+            .await
+            .map_err(|e| error(error_code::INVALID_INPUT, e.to_string()))?;
+        Ok(ConfigReload {
+            applied: reloaded.applied,
+            after_restart: reloaded.after_restart,
+        })
     }
 
     async fn setup_state(&self, ext: &Extensions) -> RpcResult<SetupState> {

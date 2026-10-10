@@ -12,6 +12,9 @@
   cacert,
   tzdata,
   writeTextDir,
+  # Mesa: RADV, AMD's Vulkan driver, for libplacebo's tone map (PGPU-04),
+  # and radeonsi's VA-API driver beside it.
+  mesa,
   spoolframe,
   rev ? null,
 }: let
@@ -48,6 +51,12 @@ in
       # Toolkit (`--gpus`) puts the host's driver in /usr/lib64 in an image
       # with no /etc/debian_version, as this one.
       ln -s /usr/lib64 run/opengl-driver/lib
+      # Mesa's Vulkan drivers and layers where nixpkgs' Vulkan loader looks
+      # for them, as on NixOS (PGPU-04): RADV for an AMD GPU passed in with
+      # `--device /dev/dri`, and the device-select layer. NVIDIA's comes
+      # from the toolkit, in /etc/vulkan or /usr/share/vulkan.
+      mkdir -p run/opengl-driver/share
+      ln -s ${mesa}/share/vulkan run/opengl-driver/share/vulkan
     '';
     enableFakechroot = false;
     config = {
@@ -58,8 +67,12 @@ in
         "SPOOLFRAME_CONFIG=/etc/spoolframe/server.ucl"
         "SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
         "TZDIR=${tzdata}/share/zoneinfo"
-        # The toolkit's default is compute,utility: no NVENC or NVDEC.
-        "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility"
+        # The toolkit's default is compute,utility: no NVENC or NVDEC, and
+        # without graphics no Vulkan driver, which libplacebo's tone map
+        # runs on (PGPU-04).
+        "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility,graphics"
+        # radeonsi's VA-API driver: /run/opengl-driver/lib is NVIDIA's.
+        "LIBVA_DRIVERS_PATH=${mesa}/lib/dri"
       ];
       ExposedPorts = {
         "7420/udp" = {};

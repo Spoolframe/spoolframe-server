@@ -46,8 +46,10 @@
         # Named versions, not ports' floating `dioxus-cli`: dx, the dioxus
         # crate and wasm-bindgen move together, and dx refuses to bundle on a
         # mismatch (scribe's FD-451 found the floating one moving under it).
+        # nixpkgs' ffmpeg-headless with libplacebo (PGPU-04).
+        ffmpeg = pkgs.callPackage ./nix/ffmpeg.nix {};
         spoolframe = pkgs.callPackage ./nix/package.nix {
-          inherit lib craneLib;
+          inherit lib craneLib ffmpeg;
           # A dirty tree says so; a tree without git has no revision.
           rev = inputs.self.shortRev or inputs.self.dirtyShortRev or null;
           dioxus-cli = inputs.ports.packages.${system}.dioxus-cli_0_7_10;
@@ -57,6 +59,7 @@
         packages =
           {default = spoolframe;}
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            inherit ffmpeg;
             docker = pkgs.callPackage ./nix/docker.nix {
               inherit spoolframe;
               rev = inputs.self.shortRev or null;

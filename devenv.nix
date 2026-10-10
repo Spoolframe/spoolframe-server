@@ -34,8 +34,10 @@ in {
     libucl
     # webauthn-rs (passkeys, P3-05) verifies signatures with OpenSSL.
     openssl
-    # ffprobe, which the server runs on every media file it serves (P1-06).
-    ffmpeg-headless
+    # ffprobe, which the server runs on every media file it serves (P1-06),
+    # and ffmpeg: the package's, with libplacebo (PGPU-04), so the tone map
+    # tests run here as they run on a host.
+    (callPackage ./nix/ffmpeg.nix {})
     # Reads bitmap subtitles as text (P2-07); English is what the tests
     # read.
     (tesseract.override {enableLanguages = ["eng"];})

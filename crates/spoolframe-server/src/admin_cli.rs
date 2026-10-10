@@ -487,6 +487,7 @@ pub async fn status(listen: SocketAddr) -> Result<()> {
         list(&status.transcoding.hardware_decoders)
     );
     println!("GPU filters: {}", gpu_filters(&status.transcoding));
+    println!("GPU tone maps: {}", gpu_tone_maps(&status.transcoding));
     if let Some(budget) = &status.transcoding.budget {
         println!("encode budget used: {}", budget.used_of_max());
         println!("remuxes: {} of {}", budget.remuxes, budget.max_remux);
@@ -809,6 +810,34 @@ pub async fn config_change(listen: SocketAddr, key: &str, value: Option<&str>) -
     Ok(())
 }
 
+/// `config reload` (PX-33): the running server reads its config again,
+/// and what changed is printed as its log says it.
+pub async fn config_reload(listen: SocketAddr) -> Result<()> {
+    let login = connect(listen, None)
+        .await?
+        .login(admin_credentials()?)
+        .await
+        .map_err(api_error)?;
+    let api = connect(listen, Some(&login.token)).await?;
+    let result = api.config_reload().await;
+    if let Err(e) = api.logout().await {
+        tracing::debug!(error = %e, "logout");
+    }
+    let reloaded = result.map_err(api_error)?;
+    if reloaded.applied.is_empty() && reloaded.after_restart.is_empty() {
+        println!("config reloaded: nothing changed");
+        return Ok(());
+    }
+    println!("config reloaded");
+    if !reloaded.applied.is_empty() {
+        println!("applied: {}", reloaded.applied.join(", "));
+    }
+    if !reloaded.after_restart.is_empty() {
+        println!("after a restart: {}", reloaded.after_restart.join(", "));
+    }
+    Ok(())
+}
+
 /// `transcode.gpu_filters`, and where each filter runs with it on: on
 /// the CPU where this GPU cannot.
 fn gpu_filters(t: &spoolframe_admin_api::TranscodingStatus) -> String {
@@ -829,9 +858,71 @@ fn gpu_filters(t: &spoolframe_admin_api::TranscodingStatus) -> String {
     )
 }
 
+/// The tone maps each GPU runs (PGPU-04): `vaapi: VA-API, libplacebo
+/// (own); nvidia: libplacebo (shared)`, or `none`.
+fn gpu_tone_maps(t: &spoolframe_admin_api::TranscodingStatus) -> String {
+    let mut per_gpu: Vec<(spoolframe_admin_api::GpuApi, Vec<&str>)> = Vec::new();
+    for found in &t.gpu_tone_maps {
+        match per_gpu.iter_mut().find(|(gpu, _)| *gpu == found.gpu) {
+            Some((_, labels)) => labels.push(found.mapper.label()),
+            None => per_gpu.push((found.gpu, vec![found.mapper.label()])),
+        }
+    }
+    if per_gpu.is_empty() {
+        return "none".to_owned();
+    }
+    per_gpu
+        .into_iter()
+        .map(|(gpu, labels)| {
+            let name = match gpu {
+                spoolframe_admin_api::GpuApi::Vaapi => "vaapi",
+                spoolframe_admin_api::GpuApi::Nvidia => "nvidia",
+                spoolframe_admin_api::GpuApi::Qsv => "qsv",
+                spoolframe_admin_api::GpuApi::Vulkan => "vulkan",
+            };
+            format!("{name}: {}", labels.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_status_says_which_tone_maps_each_gpu_runs() {
+        use spoolframe_admin_api::{GpuApi, GpuToneMap, ToneMapper};
+        let mut t = spoolframe_admin_api::TranscodingStatus {
+            video_encoders: Vec::new(),
+            audio_encoders: Vec::new(),
+            hardware_decoders: Vec::new(),
+            gpu_filters: false,
+            gpu_tonemap: false,
+            gpu_overlay: false,
+            gpu_tone_maps: Vec::new(),
+            budget: None,
+        };
+        assert_eq!(gpu_tone_maps(&t), "none");
+        t.gpu_tone_maps = vec![
+            GpuToneMap {
+                gpu: GpuApi::Vaapi,
+                mapper: ToneMapper::Vaapi,
+            },
+            GpuToneMap {
+                gpu: GpuApi::Nvidia,
+                mapper: ToneMapper::LibplaceboShared,
+            },
+            GpuToneMap {
+                gpu: GpuApi::Vaapi,
+                mapper: ToneMapper::LibplaceboOwn,
+            },
+        ];
+        assert_eq!(
+            gpu_tone_maps(&t),
+            "vaapi: VA-API, libplacebo (own); nvidia: libplacebo (shared)"
+        );
+    }
 
     #[test]
     fn the_status_says_where_gpu_filters_run() {
@@ -842,6 +933,7 @@ mod tests {
             gpu_filters: false,
             gpu_tonemap: true,
             gpu_overlay: false,
+            gpu_tone_maps: Vec::new(),
             budget: None,
         };
         assert_eq!(gpu_filters(&t), "off");

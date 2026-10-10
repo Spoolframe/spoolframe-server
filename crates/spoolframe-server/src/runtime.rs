@@ -4,7 +4,10 @@
 //! A change is checked by the same parse a config file goes through,
 //! written to the runtime layer (or, for a secret, its own file), and then
 //! applied: a live setting reaches the running server at once, a restart
-//! one waits for the next start and says so.
+//! one waits for the next start and says so. The config file is read
+//! again on SIGHUP ([`reload`], PX-33).
+
+pub mod reload;
 
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -53,6 +56,9 @@ pub struct Live {
     pub logs: Option<Arc<crate::logs::LogRing>>,
     /// `telemetry.otlp.*` (P3-14).
     pub telemetry: Option<Arc<crate::telemetry::Telemetry>>,
+    /// Not a setting: what a reload detects the encoders again for
+    /// (PX-33), as SIGHUP did before.
+    pub transcoding: Option<Arc<crate::transcode::Transcoding>>,
 }
 
 /// Why a change was not made.
@@ -81,6 +87,9 @@ pub struct RuntimeSettings {
     /// (`SPOOLFRAME_SUPERVISED`, which the NixOS module sets), or itself.
     mode: RestartMode,
     restart: tokio::sync::Notify,
+    /// Held for a whole reload (PX-33), detection included: one at a
+    /// time.
+    reloading: tokio::sync::Mutex<()>,
 }
 
 /// The libraries as clients see them: each with its Spoolframe name, an id
@@ -182,6 +191,7 @@ impl RuntimeSettings {
             live,
             mode,
             restart: tokio::sync::Notify::new(),
+            reloading: tokio::sync::Mutex::new(()),
         }
     }
 

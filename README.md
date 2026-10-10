@@ -38,7 +38,18 @@ It runs as uid 1000 with its state in `/var/lib/spoolframe`, and reads
 `/etc/spoolframe/server.ucl` (UDP 7420, admin on 7421); mount your own
 config there to replace it. Media tools run confined as on any host: Docker
 29's default seccomp profile allows Landlock. With `--network host`, mDNS
-and Plex discovery reach the LAN too.
+and Plex discovery reach the LAN too. After editing the mounted config,
+`docker kill -s HUP spoolframe` has the server read it again: live
+settings apply at once, the others at the next `docker restart`.
+
+GPUs: pass an AMD GPU's render node in with `--device
+/dev/dri/renderD128` (and `--group-add` its group, often `render`); the
+image carries Mesa's VA-API (radeonsi) and Vulkan (RADV) drivers, but not
+Intel's VA-API driver (iHD). An NVIDIA GPU needs
+the NVIDIA Container Toolkit (`--gpus all`), and `NVIDIA_DRIVER_CAPABILITIES`
+must include `graphics` as well as `compute,video,utility` for libplacebo's
+tone map, which runs on NVIDIA's Vulkan driver: the image sets
+`compute,video,utility,graphics`, so set it again only if you override it.
 
 ### Web UI
 

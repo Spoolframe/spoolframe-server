@@ -3374,3 +3374,73 @@
   a 4K film made 1080p that both GPUs decode now goes to NVIDIA when it
   is first in `transcode.hardware`, and a picture burn-in to NVIDIA over
   an AMD GPU (Mesa has no `overlay_vaapi`).
+- The server hardens its own process as it starts, for every
+  subcommand (PX-31): it is not dumpable, so another process as the same
+  user can no longer read its `/proc/<pid>/environ` (the `SF_ENV_`
+  secrets) or memory, nor attach a debugger (root still can); it gains
+  no privileges from a setuid program it runs; it dumps no core; and a
+  seccomp deny-list refuses, with `EPERM`, the calls it never makes:
+  `ptrace`, `process_vm_*`, `bpf`, `perf_event_open`, `userfaultfd`,
+  `io_uring_*`, the mount calls, `unshare`, `setns`, a `clone` into a
+  new namespace, keyrings, modules, `kexec`, `reboot`, swap, `acct`,
+  `quotactl`, `open_by_handle_at`, a persona other than Linux's, and on
+  x86_64 `iopl`/`ioperm`. Processes, threads, every socket family and
+  the media tools' own confinement are unchanged; their filter stacks on
+  top. A restart in place keeps the filter rather than load it twice.
+- An HDR film is tone mapped on the GPU with libplacebo (PGPU-04).
+  `transcode.tone_map` (live; Settings › Playback): `"auto"`, the
+  default, takes the job's GPU's own tone map (`tonemap_vaapi`, Intel),
+  else libplacebo on the job's GPU through Vulkan, else the CPU, and the
+  CPU while `transcode.gpu_filters` is off, so a setup that tone mapped
+  on the CPU still does after the upgrade; `"cpu"`, `"gpu"` and
+  `"libplacebo"` force one, a job whose GPU lacks it tone mapping on the
+  CPU (noted once), and one no GPU here runs is a warning at start.
+  NVIDIA's libplacebo shares ffmpeg's Vulkan device: the film decoded on
+  it (`-hwaccel vulkan`), tone mapped and scaled there, and downloaded in
+  8 bits to NVENC (fulcrum's GTX 1060: 4.0× real time and 2 s of CPU
+  against 2.0× and 120 s on the CPU). On AMD, libplacebo makes its own
+  Vulkan device, the frames going through system memory: VA-API decodes
+  into memory, libplacebo tone maps and scales, the result is uploaded
+  to `h264_vaapi` (an RX 7900 XTX here, 20 s of 4K HDR10 confined:
+  1.7× real time and 8.4 s of CPU against 1.4× and 181 s on the CPU).
+  The run's jail opens only the job's render node, so RADV lists only
+  that GPU and libplacebo's own device lands on it; unconfined, Mesa's
+  device-select layer is told its PCI ids. A burn-in goes over
+  libplacebo's output on the CPU. Detection tries libplacebo per family
+  with a one-second confined run; the transcoding line says `GPU tone
+  maps: vaapi: libplacebo (own); nvenc: libplacebo (shared)`, a failure
+  shows in `… lacks: libplacebo tone map`, and `spoolframe status` and
+  Settings › Playback list them. Placement counts a GPU tone map as on
+  the GPU; a libplacebo job with nothing burned in weighs as all on the
+  GPU; a libplacebo failure before the first output runs again decoded
+  in software with the CPU's tone map; Server › Playback says which tone
+  map ran (`libplacebo (shared)`, `libplacebo (own)`, `VA-API`, `CPU`).
+- An `experimental { }` block, for switches that may change or go away
+  without notice: the server warns of each one on at start, and the web
+  UI shows them only with Show advanced settings on (Settings ›
+  Playback › Experimental). The first is `libplacebo_shared_on_amd`
+  (off): libplacebo on an AMD GPU uses ffmpeg's Vulkan device, derived
+  from the VA-API one, falling back to its own at detection where that
+  fails, as it does on RADV today.
+- The package, the Docker image and the dev shell ship nixpkgs'
+  ffmpeg-headless with libplacebo and a shader compiler (`nix build
+  .#ffmpeg`): 330.5 MiB against 305.4 MiB. The Docker image carries
+  Mesa (RADV and radeonsi's VA-API driver) for AMD GPUs, about 980 MiB
+  more, and `NVIDIA_DRIVER_CAPABILITIES` gains `graphics` for NVIDIA's
+  Vulkan driver.
+- SIGHUP reloads the server's config (PX-33). The config file and
+  `runtime.ucl` are read and checked again as at start; one that does
+  not load changes nothing, and an ERROR says what is wrong and in which
+  file. Live settings apply through the same path as a change in the web
+  UI (the Plex catalog, watch rules, job limits, previews, sign-in,
+  metrics, logs, telemetry); restart settings are pending, Settings
+  showing "Now / After restart". A runtime value still wins over the
+  file's unless the file is locked. Encoders are detected again, as
+  SIGHUP did before, and the config's warnings are logged again. One
+  line says what happened: `SIGHUP: config reloaded: applied name;
+  after a restart: network.mdns; unchanged otherwise`, or `nothing
+  changed`. A reload and a settings change never interleave, and
+  reloads run one at a time. The admin API's `configReload` (a recent
+  sign-in) and `spoolframe-server config reload` do the same; the NixOS
+  module's unit has `ExecReload`, so `systemctl reload spoolframe` does
+  too, and in Docker `docker kill -s HUP <container>`.

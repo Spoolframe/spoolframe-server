@@ -102,6 +102,7 @@ pub const SETTINGS: &[Setting] = &[
     live("transcode.scratch_limit_mb"),
     live("transcode.read_ahead_secs"),
     live("transcode.gpu_filters"),
+    live("transcode.tone_map"),
     restart("subtitles.ocr"),
     restart("subtitles.ocr_threads"),
     restart("subtitles.cache_dir"),
@@ -121,6 +122,8 @@ pub const SETTINGS: &[Setting] = &[
     live("telemetry.otlp.traces"),
     live("telemetry.otlp.metrics"),
     live("telemetry.otlp.logs"),
+    // Detection reads it, at start.
+    restart("experimental.libplacebo_shared_on_amd"),
 ];
 
 /// The setting called `key`, if there is one.

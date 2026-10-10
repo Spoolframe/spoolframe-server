@@ -1,5 +1,6 @@
 //! The encoders this server can use (P2-02): detected at start and again
-//! on SIGHUP, read by the planner.
+//! on each config reload (SIGHUP, PX-33: `runtime::reload`), read by the
+//! planner.
 
 use parking_lot::RwLock;
 use std::path::PathBuf;
@@ -81,19 +82,11 @@ fn log_named(found: &Encoders, hardware: Hardware) {
     }
 }
 
-/// Detect now, then again on every SIGHUP, in the background.
+/// Detect now, in the background. A config reload (SIGHUP) detects again
+/// (`runtime::reload`, PX-33).
 pub fn spawn_detection(transcoding: Arc<Transcoding>) {
     tokio::spawn(async move {
         transcoding.detect().await;
-        let Ok(mut hangup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        else {
-            tracing::warn!("cannot listen for SIGHUP; encoders are detected only at start");
-            return;
-        };
-        while hangup.recv().await.is_some() {
-            tracing::info!("SIGHUP: detecting encoders again");
-            transcoding.detect().await;
-        }
     });
 }
 

@@ -62,6 +62,7 @@ mod tests {
                 "decoder": { "kind": "none" },
                 "encoder": null,
                 "toneMap": "none",
+                "toneMapper": null,
                 "burnIn": "none",
                 "width": 1920,
                 "height": 1080,

@@ -7,7 +7,9 @@
 //! A server's settings come from three layers merged key by key
 //! ([`layers`], P3-10): the built-in defaults, the provided file, and the
 //! runtime layer the server writes itself. [`ServerConfig`] is what they
-//! make together.
+//! make together. They are read at start, and again on SIGHUP
+//! ([`crate::runtime::reload`], PX-33): checked the same way, a reload
+//! that does not load changes nothing.
 
 pub mod layers;
 pub mod secrets;
@@ -19,7 +21,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use spoolframe_admin_api::SyncDirection;
-use spoolframe_media::encoders::{Hardware, HardwarePolicy, TranscodeSettings};
+use spoolframe_media::encoders::{Hardware, HardwarePolicy, ToneMapSetting, TranscodeSettings};
 use spoolframe_media::sandbox::Mode as SandboxMode;
 use spoolframe_plex::{PathMap, PathMapping};
 use spoolframe_types::LibraryKind;
@@ -145,6 +147,43 @@ pub struct ServerConfig {
     /// runtime layer, not a setting.
     #[ucl(default)]
     pub setup: SetupConfig,
+    /// Switches that may change or go away without notice (PGPU-04).
+    #[ucl(default)]
+    pub experimental: ExperimentalConfig,
+}
+
+/// `experimental { libplacebo_shared_on_amd = false; }` (PGPU-04): switches
+/// that may change or go away in any release, without notice. The server
+/// logs the ones turned on at start, and the web UI shows them only with
+/// "Show advanced settings" on. The built-in defaults name each one off,
+/// so what is logged is what differs from them.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct ExperimentalConfig {
+    /// On an AMD GPU, libplacebo's tone map uses ffmpeg's Vulkan device,
+    /// so the frames stay on the GPU, rather than one of its own, which
+    /// takes them through system memory. Tried at detection, and its own
+    /// used where that fails, as it does on RADV today. Off if left out.
+    #[ucl(default)]
+    pub libplacebo_shared_on_amd: Option<bool>,
+}
+
+impl ExperimentalConfig {
+    /// `libplacebo_shared_on_amd`.
+    pub fn libplacebo_shared_on_amd(&self) -> bool {
+        self.libplacebo_shared_on_amd.unwrap_or(false)
+    }
+
+    /// The switches turned on, by key, as the start's log names them.
+    pub fn on(&self) -> Vec<&'static str> {
+        [(
+            "experimental.libplacebo_shared_on_amd",
+            self.libplacebo_shared_on_amd(),
+        )]
+        .into_iter()
+        .filter_map(|(key, on)| on.then_some(key))
+        .collect()
+    }
 }
 
 /// `auth { oidc [ { name; issuer; client_id; client_secret_file; } ] }`
@@ -690,8 +729,8 @@ impl PreviewsConfig {
 
 /// `transcode { hardware = ["nvenc", "vaapi"]; vaapi_device = "/dev/dri/renderD128";
 /// max_jobs = 2; max_remux = 32; max_gpu_jobs = 3; scratch_dir = "…";
-/// scratch_limit_mb = 20480; read_ahead_secs = 60; gpu_filters = false; }`,
-/// all optional.
+/// scratch_limit_mb = 20480; read_ahead_secs = 60; gpu_filters = false;
+/// tone_map = "auto"; }`, all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct TranscodeConfig {
@@ -735,9 +774,17 @@ pub struct TranscodeConfig {
     /// the CPU: on VA-API the tone map (`tonemap_vaapi`) and picture
     /// burn-in (`overlay_vaapi`); on NVIDIA the scale (`scale_cuda`) and
     /// picture burn-in (`overlay_cuda`), NVIDIA's tone map staying on the
-    /// CPU. Off if left out.
+    /// CPU. Off if left out. The tone map is `tone_map`'s.
     #[ucl(default)]
     pub gpu_filters: Option<bool>,
+    /// How HDR is tone mapped to SDR (PGPU-04): `"auto"` (if left out) the
+    /// job's GPU's own tone map (`tonemap_vaapi`), else libplacebo on the
+    /// job's GPU, else the CPU, and the CPU while `gpu_filters` is off;
+    /// `"cpu"`, `"gpu"` (the driver's own) or `"libplacebo"` forces one,
+    /// whatever `gpu_filters` says, a job whose GPU cannot run it tone
+    /// mapping on the CPU.
+    #[ucl(default)]
+    pub tone_map: Option<String>,
 }
 
 /// `transcode.hardware` as written: a word, or a list of families.
@@ -789,6 +836,18 @@ fn hardware_order(names: &[&str]) -> Result<HardwarePolicy, ConfigError> {
 }
 
 impl TranscodeConfig {
+    /// `tone_map`.
+    pub fn tone_map(&self) -> Result<ToneMapSetting, ConfigError> {
+        self.tone_map
+            .as_deref()
+            .unwrap_or("auto")
+            .parse()
+            .map_err(|message| ConfigError::Invalid {
+                key: "transcode.tone_map",
+                message,
+            })
+    }
+
     /// The job limits, with `state_dir` for the default scratch directory.
     pub fn limits(&self, state_dir: &Path) -> Result<JobLimits, ConfigError> {
         let at_least_one =
@@ -814,10 +873,16 @@ impl TranscodeConfig {
             read_ahead: Duration::from_secs(self.read_ahead_secs.unwrap_or(60)),
             stalled_after: crate::encode::job::STALLED_AFTER,
             gpu_filters: self.gpu_filters.unwrap_or(false),
+            tone_map: self.tone_map()?,
         })
     }
 
-    pub fn settings(&self) -> Result<TranscodeSettings, ConfigError> {
+    /// How encoders are detected; `experimental` says whether
+    /// libplacebo tries ffmpeg's Vulkan device on AMD.
+    pub fn settings(
+        &self,
+        experimental: &ExperimentalConfig,
+    ) -> Result<TranscodeSettings, ConfigError> {
         const EXAMPLE: &str = r#"["nvenc", "vaapi"]"#;
         let hardware = match &self.hardware {
             None => HardwarePolicy::Auto,
@@ -835,6 +900,8 @@ impl TranscodeConfig {
         Ok(TranscodeSettings {
             hardware,
             vaapi_device: self.vaapi_device.clone().unwrap_or(defaults.vaapi_device),
+            tone_map: self.tone_map()?,
+            libplacebo_shared_on_amd: experimental.libplacebo_shared_on_amd(),
         })
     }
 }
@@ -1958,7 +2025,7 @@ impl ServerConfig {
         parsed.auth.check(&parsed.admin)?;
         parsed.auth.trust_idle()?;
         parsed.watch.rules()?;
-        parsed.transcode.settings()?;
+        parsed.transcode.settings(&parsed.experimental)?;
         // Any directory: only the values are checked here.
         parsed.transcode.limits(Path::new("/"))?;
         parsed.subtitles.ocr_settings(Path::new("/"))?;
@@ -2142,7 +2209,7 @@ mod tests {
     fn transcoding_defaults_to_auto_on_the_first_render_node() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         assert_eq!(
-            config.transcode.settings().unwrap(),
+            config.transcode.settings(&config.experimental).unwrap(),
             TranscodeSettings::default()
         );
         assert_eq!(config.media.ffmpeg(), PathBuf::from("ffmpeg"));
@@ -2354,6 +2421,79 @@ mod tests {
         assert_eq!(limits.scratch_limit_bytes, 20 << 30);
         assert_eq!(limits.read_ahead, Duration::from_secs(60));
         assert!(!limits.gpu_filters);
+        assert_eq!(limits.tone_map, ToneMapSetting::Auto);
+    }
+
+    /// PGPU-04: `transcode.tone_map` is one of four words, for the jobs
+    /// (live) and for detection's warning alike.
+    #[test]
+    fn the_tone_map_is_chosen_or_forced() {
+        for (word, setting) in [
+            ("auto", ToneMapSetting::Auto),
+            ("cpu", ToneMapSetting::Cpu),
+            ("gpu", ToneMapSetting::Gpu),
+            ("libplacebo", ToneMapSetting::Libplacebo),
+        ] {
+            let config = plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} transcode {{ tone_map = "{word}"; }}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                config.transcode.limits(Path::new("/")).unwrap().tone_map,
+                setting
+            );
+            assert_eq!(
+                config
+                    .transcode
+                    .settings(&config.experimental)
+                    .unwrap()
+                    .tone_map,
+                setting
+            );
+        }
+        let refused =
+            plex(r#"plex { url = "http://nas:32400"; } transcode { tone_map = "opencl"; }"#);
+        assert!(
+            matches!(
+                &refused,
+                Err(ConfigError::Invalid { key: "transcode.tone_map", message })
+                    if message.contains("\"libplacebo\"")
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// PGPU-04: the experimental block, off if left out; on, it reaches
+    /// detection and is named for the start's log.
+    #[test]
+    fn experimental_switches_are_off_unless_set() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert!(!config.experimental.libplacebo_shared_on_amd());
+        assert!(config.experimental.on().is_empty());
+        assert!(
+            !config
+                .transcode
+                .settings(&config.experimental)
+                .unwrap()
+                .libplacebo_shared_on_amd
+        );
+        let on = plex(
+            r#"plex { url = "http://nas:32400"; } experimental { libplacebo_shared_on_amd = true; }"#,
+        )
+        .unwrap();
+        assert!(
+            on.transcode
+                .settings(&on.experimental)
+                .unwrap()
+                .libplacebo_shared_on_amd
+        );
+        assert_eq!(
+            on.experimental.on(),
+            ["experimental.libplacebo_shared_on_amd"]
+        );
+        assert!(
+            plex(r#"plex { url = "http://nas:32400"; } experimental { shared = true; }"#).is_err()
+        );
     }
 
     #[test]
@@ -2394,7 +2534,7 @@ mod tests {
             r#"plex { url = "http://nas:32400"; } transcode { hardware = "none"; vaapi_device = "/dev/dri/renderD129"; }"#,
         )
         .unwrap();
-        let settings = config.transcode.settings().unwrap();
+        let settings = config.transcode.settings(&config.experimental).unwrap();
         assert_eq!(settings.hardware, HardwarePolicy::None);
         assert_eq!(settings.vaapi_device, PathBuf::from("/dev/dri/renderD129"));
         let ordered = plex(
@@ -2402,14 +2542,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            ordered.transcode.settings().unwrap().hardware,
+            ordered
+                .transcode
+                .settings(&ordered.experimental)
+                .unwrap()
+                .hardware,
             HardwarePolicy::Ordered(vec![Hardware::Nvenc, Hardware::Vaapi])
         );
         // One family alone may be a plain string.
         let one = plex(r#"plex { url = "http://nas:32400"; } transcode { hardware = "vaapi"; }"#)
             .unwrap();
         assert_eq!(
-            one.transcode.settings().unwrap().hardware,
+            one.transcode.settings(&one.experimental).unwrap().hardware,
             HardwarePolicy::Ordered(vec![Hardware::Vaapi])
         );
         for refused in [

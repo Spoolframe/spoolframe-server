@@ -667,6 +667,7 @@ impl TestServer {
                 read_ahead: options.read_ahead,
                 stalled_after: options.stalled_after,
                 gpu_filters: false,
+                tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
             },
             tool(&options.ffmpeg, &sandbox),
         )

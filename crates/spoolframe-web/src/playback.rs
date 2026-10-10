@@ -5,7 +5,7 @@
 use spoolframe_admin_api::{
     CacheState, EndedWhy, FilterPlace, FirstSegment, GpuApi, KeyframesRead, PlanKind, PlaybackMade,
     PlaybackRow, PlaybackStart, PreviewCache, ReadMark, ReadPoint, StreamKind, StreamOut,
-    VideoDecoder, VideoEncoderUsed,
+    ToneMapper, VideoDecoder, VideoEncoderUsed,
 };
 
 use crate::catalog::{bytes, clock};
@@ -159,9 +159,17 @@ pub fn decoder_text(decoder: VideoDecoder) -> String {
                 GpuApi::Vaapi => "VA-API",
                 GpuApi::Nvidia => "NVDEC (CUDA)",
                 GpuApi::Qsv => "Quick Sync",
+                GpuApi::Vulkan => "Vulkan",
             }
         ),
     }
+}
+
+/// What tone mapped (PGPU-04), under where: `libplacebo (shared)`,
+/// `VA-API`, `CPU`; nothing when nothing is tone mapped.
+pub fn tone_mapper_text(made: &PlaybackMade) -> String {
+    made.tone_mapper
+        .map_or_else(String::new, |mapper| mapper.label().to_owned())
 }
 
 /// What encodes the video (PX-24): `NVENC · H.264`, `Software · HEVC`,
@@ -174,6 +182,7 @@ pub fn encoder_text(encoder: Option<&VideoEncoderUsed>) -> String {
         Some(GpuApi::Vaapi) => "VA-API",
         Some(GpuApi::Nvidia) => "NVENC",
         Some(GpuApi::Qsv) => "Quick Sync",
+        Some(GpuApi::Vulkan) => "Vulkan",
         None => "Software",
     };
     format!("{on} · {}", codec(&e.codec))
@@ -264,6 +273,12 @@ pub fn made_line(row: &PlaybackRow) -> String {
                 filter_text(place).0.replacen("On", "on", 1)
             ));
         }
+    }
+    // Which GPU tone map ran (PGPU-04), after where it ran.
+    if let Some(mapper) = made.tone_mapper.filter(|m| *m != ToneMapper::Cpu)
+        && let Some(part) = parts.iter_mut().find(|p| p.starts_with("tone map "))
+    {
+        part.push_str(&format!(" ({})", mapper.label()));
     }
     if let Some(bits) = made.measured_bitrate {
         parts.push(bitrate_text(bits));
@@ -472,6 +487,7 @@ mod tests {
             decoder,
             encoder,
             tone_map: FilterPlace::None,
+            tone_mapper: None,
             burn_in: FilterPlace::None,
             width: Some(1920),
             height: Some(1080),
@@ -570,7 +586,7 @@ mod tests {
             "made": {
                 "decoder": { "kind": "software" },
                 "encoder": { "codec": "h264", "name": "h264_nvenc", "gpu": "nvidia" },
-                "toneMap": "cpu", "burnIn": "cpu", "width": 1920, "height": 1080,
+                "toneMap": "cpu", "toneMapper": "cpu", "burnIn": "cpu", "width": 1920, "height": 1080,
                 "targetBitrate": 8000000, "measuredBitrate": 6200000
             },
             "start": { "planMs": 12, "keyframes": { "from": "none" },
@@ -590,6 +606,17 @@ mod tests {
             "decode GPU · NVDEC (CUDA) · encode NVENC · H.264 · tone map on the CPU · \
              burn-in on the CPU · 6.2 Mbit/s"
         );
+        // PGPU-04: decoded through Vulkan, tone mapped by libplacebo.
+        row.made.decoder =
+            serde_json::from_value(serde_json::json!({ "kind": "gpu", "api": "vulkan" })).unwrap();
+        row.made.tone_map = FilterPlace::Gpu;
+        row.made.tone_mapper = Some(ToneMapper::LibplaceboShared);
+        assert_eq!(
+            made_line(&row),
+            "decode GPU · Vulkan · encode NVENC · H.264 · tone map on the GPU \
+             (libplacebo (shared)) · burn-in on the CPU · 6.2 Mbit/s"
+        );
+        assert_eq!(tone_mapper_text(&row.made), "libplacebo (shared)");
         row.plan = PlanKind::Remux;
         row.made = made(VideoDecoder::None, None);
         assert_eq!(made_line(&row), "video copied");

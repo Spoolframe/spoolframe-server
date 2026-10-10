@@ -49,9 +49,12 @@ pub struct JobLimits {
     /// reporting more encoded time before it is ended as stalled
     /// ([`job::STALLED_AFTER`]; tests shorten it).
     pub stalled_after: Duration,
-    /// Tone map and burn in pictures on the GPU where the driver can
-    /// (`transcode.gpu_filters`), rather than on the CPU.
+    /// Scale and burn in pictures on the GPU where the driver can
+    /// (`transcode.gpu_filters`), rather than on the CPU; and under
+    /// `tone_map = "auto"`, tone map there too.
     pub gpu_filters: bool,
+    /// How HDR is tone mapped (`transcode.tone_map`, PGPU-04).
+    pub tone_map: spoolframe_media::encoders::ToneMapSetting,
 }
 
 /// A playback's conversion: what to encode, and the encode running now.
@@ -720,6 +723,7 @@ fn spawn(
         vaapi_device,
         hardware_decode: !jobs.hardware_decode_failed(file),
         gpu_filters: jobs.limits().gpu_filters,
+        tone_map: jobs.limits().tone_map,
         start,
         output,
     };
@@ -732,6 +736,11 @@ fn spawn(
             );
         }
     }
+    if let Some(why) = args::tone_map_note(&spec)
+        && jobs.first_note(why)
+    {
+        tracing::info!(reason = why, "a conversion tone maps on the CPU");
+    }
     // One GPU family for the whole job (PX-28): the run may open its
     // device nodes and no other's.
     let placement = args::placement(&spec);
@@ -739,11 +748,14 @@ fn spawn(
     let gpu_encode = encoder.is_some();
     let gpu = placement.map_or(GpuUse::None, |place| place.gpu());
     // Decoding on the GPU may fail for a stream detection's test did not
-    // cover: the same run decoding in software is ready for it.
+    // cover, and libplacebo for a GPU or a stream its test did not
+    // (PGPU-04): the same run decoding in software, its tone map on the
+    // CPU, is ready for it.
     let decode = decode(&spec);
+    let vulkan = args::vulkan(&spec);
     let fallback = match decode {
-        Decode::Software => None,
-        Decode::Hardware | Decode::Gpu => {
+        Decode::Software if vulkan.is_none() => None,
+        Decode::Software | Decode::Hardware | Decode::Gpu => {
             let software = EncodeSpec {
                 hardware_decode: false,
                 ..spec.clone()
@@ -778,11 +790,12 @@ fn spawn(
             inputs,
             reads: vec![dir.to_path_buf()],
             gpu,
+            vulkan,
             fallback,
             made,
         },
         written,
-        load(video, audio, gpu_encode, decode),
+        load(video, audio, gpu_encode, args::all_on_gpu(&spec)),
         epoch,
         first_segment,
         start_ms,
@@ -791,8 +804,9 @@ fn spawn(
 }
 
 /// What a conversion weighs: its video encode, on the GPU or not, and if
-/// on the GPU all of it there (`decode`) or not, if it has one (a
-/// burned-in subtitle is one); else an audio encode; else a remux.
+/// on the GPU all of it there (`all_gpu`: `args::all_on_gpu`) or not, if
+/// it has one (a burned-in subtitle is one); else an audio encode; else
+/// a remux.
 ///
 /// One all on the GPU whose decode fails and runs again in software
 /// keeps its weight until it ends: that is rare, and the film decodes in
@@ -801,10 +815,10 @@ fn load(
     video: Option<ConvertedVideo>,
     audio: Option<ConvertedAudio>,
     gpu: bool,
-    decode: Decode,
+    all_gpu: bool,
 ) -> Load {
     match video {
-        Some(ConvertedVideo::Encode { .. }) if gpu && decode == Decode::Gpu => Load::GpuOnly,
+        Some(ConvertedVideo::Encode { .. }) if gpu && all_gpu => Load::GpuOnly,
         Some(ConvertedVideo::Encode { .. }) if gpu => Load::Gpu,
         Some(ConvertedVideo::Encode { .. }) => Load::Software,
         _ if encodes(video, audio) => Load::Audio,
@@ -847,6 +861,7 @@ mod tests {
                     read_ahead: Duration::from_secs(60),
                     stalled_after: Duration::from_secs(60),
                     gpu_filters: false,
+                    tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
                 },
                 spoolframe_media::sandbox::Tool::unconfined("ffmpeg"),
             )
@@ -926,6 +941,7 @@ mod tests {
                     read_ahead: Duration::from_secs(60),
                     stalled_after: Duration::from_secs(60),
                     gpu_filters: false,
+                    tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
                 },
                 spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
             )
@@ -1045,6 +1061,7 @@ mod tests {
                     read_ahead: Duration::from_secs(60),
                     stalled_after: Duration::from_secs(60),
                     gpu_filters: false,
+                    tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
                 },
                 spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
             )
@@ -1161,6 +1178,7 @@ mod tests {
                     read_ahead: Duration::from_secs(60),
                     stalled_after: Duration::from_secs(60),
                     gpu_filters: true,
+                    tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
                 },
                 spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
             )
@@ -1254,6 +1272,139 @@ mod tests {
         assert_eq!(job.progress().borrow().done, None);
     }
 
+    /// PGPU-04: an NVENC encode tone mapped by libplacebo on ffmpeg's
+    /// Vulkan device weighs as one all on the GPU, its jail uses Vulkan,
+    /// and a libplacebo failure before any output runs it again decoded
+    /// in software with the CPU's tone map, still on NVENC.
+    #[tokio::test]
+    async fn a_libplacebo_failure_runs_again_with_the_cpu_tone_map() {
+        use crate::encode::{Decoder, Made};
+        use spoolframe_media::VideoStream;
+        use spoolframe_media::encoders::{
+            Hardware, HardwareDecoder, Libplacebo, ToneMapper, VideoEncoder, VulkanDevice,
+        };
+        use spoolframe_types::{HdrFormat, VideoCodec};
+
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-conversion-gpu-tone-map").await;
+        let ffmpeg = job::tests::ffmpeg(
+            &tmp.as_ref().join("bin"),
+            "case \"$*\" in *libplacebo*)\n\
+               sleep 1; echo 'Error initializing filters' >&2; exit 1;;\n\
+             esac\n\
+             exec sleep 30",
+        );
+        let jobs = Arc::new(
+            Jobs::new(
+                JobLimits {
+                    budget: Units::jobs(1),
+                    max_remux: 32,
+                    max_gpu_jobs: 3,
+                    scratch_dir: tmp.as_ref().join("scratch"),
+                    scratch_limit_bytes: 1 << 30,
+                    read_ahead: Duration::from_secs(60),
+                    stalled_after: Duration::from_secs(60),
+                    gpu_filters: false,
+                    tone_map: spoolframe_media::encoders::ToneMapSetting::Libplacebo,
+                },
+                spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
+            )
+            .unwrap(),
+        );
+        let film = tmp.as_ref().join("film.mkv");
+        std::fs::write(&film, b"x").unwrap();
+        let descriptor = Arc::new(MediaDescriptor {
+            container: "matroska,webm".into(),
+            duration: Some(Duration::from_secs(60)),
+            bit_rate: None,
+            video: Some(VideoStream {
+                index: 0,
+                codec: "hevc".into(),
+                profile: Some("Main 10".into()),
+                level: None,
+                width: 3840,
+                height: 2160,
+                pixel_format: Some("yuv420p10le".into()),
+                color_transfer: Some("smpte2084".into()),
+                frame_rate_millis: Some(24_000),
+                bit_depth: 10,
+                hdr: Some(HdrFormat::Hdr10),
+            }),
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        });
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: spoolframe_types::Container::Mp4,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: None,
+                tone_map: true,
+            }),
+            audio: None,
+            subtitle: None,
+            ladder: Vec::new(),
+            reasons: Vec::new(),
+        };
+        let encoders = Encoders {
+            video: vec![VideoEncoder {
+                codec: VideoCodec::H264,
+                name: "h264_nvenc".into(),
+                hardware: Some(Hardware::Nvenc),
+            }],
+            hardware_decoders: vec![HardwareDecoder {
+                codec: VideoCodec::Hevc,
+                hardware: Hardware::Nvenc,
+                bit_depth: 10,
+            }],
+            libplacebo: vec![Libplacebo {
+                hardware: Hardware::Nvenc,
+                device: VulkanDevice::Shared,
+            }],
+            ..Encoders::software_baseline()
+        };
+        let conversion = Conversion::start(
+            jobs.clone(),
+            ConversionSource {
+                handle: "h1",
+                path: &film,
+                descriptor,
+                plan: &plan,
+                encoders: Arc::new(encoders),
+                vaapi_device: Path::new("/dev/dri/renderD128"),
+                keyframes: None,
+                first_epoch: 0,
+                slot: None,
+                start_rung: 0,
+            },
+            None,
+        )
+        .unwrap();
+        let job = conversion.job();
+        assert_eq!(job.slot().map(|slot| slot.load()), Some(Load::GpuOnly));
+        let made = |job: &EncodeJob| job.made().map(|m: Made| (m.decoder, m.tone_mapper));
+        let first = job.command().join(" ");
+        assert!(
+            first.contains("-hwaccel vulkan -hwaccel_device vk -hwaccel_output_format vulkan -i"),
+            "{first}"
+        );
+        assert!(first.contains("libplacebo=w=-2:h=1080"), "{first}");
+        assert_eq!(
+            made(&job),
+            Some((
+                Decoder::Vulkan,
+                Some(ToneMapper::Libplacebo(VulkanDevice::Shared))
+            ))
+        );
+        job::tests::eventually(|| !job.command().join(" ").contains("libplacebo=")).await;
+        let rerun = job.command().join(" ");
+        assert!(rerun.contains("tonemap=tonemap=hable"), "{rerun}");
+        assert!(!rerun.contains("vulkan"), "{rerun}");
+        assert!(rerun.contains("-c:v h264_nvenc"), "{rerun}");
+        assert_eq!(made(&job), Some((Decoder::Software, Some(ToneMapper::Cpu))));
+        assert!(jobs.hardware_decode_failed(&film));
+    }
+
     #[test]
     fn only_a_stream_encoded_again_is_encoding() {
         use spoolframe_types::{AudioCodec, VideoCodec};
@@ -1311,7 +1462,7 @@ mod tests {
                 bitrate: 192_000,
             },
         });
-        let software = Decode::Software;
+        let software = false;
         assert_eq!(load(copy_video, copy_audio, false, software), Load::Remux);
         assert_eq!(load(copy_video, None, false, software), Load::Remux);
         assert_eq!(load(copy_video, encode_audio, false, software), Load::Audio);
@@ -1323,20 +1474,11 @@ mod tests {
         assert_eq!(load(encode_video, copy_audio, true, software), Load::Gpu);
         // The GPU flag is the video encoder's: an audio encode stays one.
         assert_eq!(load(copy_video, encode_audio, true, software), Load::Audio);
-        // Decoded on the GPU too: all on the GPU only without filters on
-        // the CPU; a software encode is one whatever decodes.
-        assert_eq!(
-            load(encode_video, copy_audio, true, Decode::Gpu),
-            Load::GpuOnly
-        );
-        assert_eq!(
-            load(encode_video, copy_audio, true, Decode::Hardware),
-            Load::Gpu
-        );
-        assert_eq!(
-            load(encode_video, copy_audio, false, Decode::Hardware),
-            Load::Software
-        );
+        // All on the GPU (`args::all_on_gpu`): a quarter; a software
+        // encode is one whatever decodes.
+        assert_eq!(load(encode_video, copy_audio, true, true), Load::GpuOnly);
+        assert_eq!(load(encode_video, copy_audio, true, false), Load::Gpu);
+        assert_eq!(load(encode_video, copy_audio, false, true), Load::Software);
     }
 
     #[test]

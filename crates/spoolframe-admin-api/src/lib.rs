@@ -1009,6 +1009,9 @@ pub struct TranscodingStatus {
     pub gpu_tonemap: bool,
     /// The GPU lays pictures over video (`overlay_vaapi`).
     pub gpu_overlay: bool,
+    /// The tone maps each GPU runs (PGPU-04), in `transcode.tone_map =
+    /// "auto"`'s order per GPU.
+    pub gpu_tone_maps: Vec<GpuToneMap>,
     /// The encode budget's use now; `None` where the server runs no
     /// conversions.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
@@ -1149,6 +1152,17 @@ pub struct Settings {
     pub can_restart: bool,
     /// How `admin.restart` brings the server back.
     pub restart_mode: RestartMode,
+}
+
+/// What `admin.configReload` changed (PX-33), by setting key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigReload {
+    /// Settings now in effect: the live ones that changed.
+    pub applied: Vec<String>,
+    /// Restart settings that changed: `restartPending` until the next
+    /// start.
+    pub after_restart: Vec<String>,
 }
 
 /// How the server starts again after `admin.restart`.
@@ -2106,6 +2120,42 @@ pub enum GpuApi {
     Nvidia,
     /// Intel Quick Sync.
     Qsv,
+    /// Vulkan: NVIDIA's GPU decoding for libplacebo (PGPU-04).
+    Vulkan,
+}
+
+/// What tone maps HDR to SDR (PGPU-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToneMapper {
+    Cpu,
+    /// The VA-API driver's own (`tonemap_vaapi`).
+    Vaapi,
+    /// libplacebo on ffmpeg's Vulkan device: the frames stay on the GPU.
+    LibplaceboShared,
+    /// libplacebo on a Vulkan device of its own, on the same GPU: the
+    /// frames go through system memory.
+    LibplaceboOwn,
+}
+
+impl ToneMapper {
+    /// `CPU`, `VA-API`, `libplacebo (shared)`, `libplacebo (own)`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Vaapi => "VA-API",
+            Self::LibplaceboShared => "libplacebo (shared)",
+            Self::LibplaceboOwn => "libplacebo (own)",
+        }
+    }
+}
+
+/// A tone map a GPU runs (PGPU-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuToneMap {
+    pub gpu: GpuApi,
+    pub mapper: ToneMapper,
 }
 
 /// What decodes a playback's video (PX-24).
@@ -2156,6 +2206,9 @@ pub struct PlaybackMade {
     pub encoder: Option<VideoEncoderUsed>,
     /// HDR tone mapped to SDR.
     pub tone_map: FilterPlace,
+    /// What tone mapped it (PGPU-04); `None` when nothing is tone mapped.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub tone_mapper: Option<ToneMapper>,
     /// A subtitle burned into the picture.
     pub burn_in: FilterPlace,
     /// The picture written, px; `None` with no video.
@@ -3050,6 +3103,15 @@ pub trait AdminApi {
     #[method(name = "restart", with_extensions)]
     async fn restart(&self) -> jsonrpsee::core::RpcResult<()>;
 
+    /// Read the config file and the runtime settings again, as SIGHUP
+    /// does (PX-33): checked as at start, the live settings applied, the
+    /// restart ones `restartPending`, the encoders detected again. A file
+    /// the server would not start with changes nothing: `INVALID_INPUT`
+    /// with what is wrong and where. Needs a recent sign-in:
+    /// `RECENT_SIGN_IN_REQUIRED` otherwise.
+    #[method(name = "configReload", with_extensions)]
+    async fn config_reload(&self) -> jsonrpsee::core::RpcResult<ConfigReload>;
+
     /// The setup wizard's progress (P3-10).
     #[method(name = "setupState", with_extensions)]
     async fn setup_state(&self) -> jsonrpsee::core::RpcResult<SetupState>;
@@ -3475,6 +3537,7 @@ mod required_field_tests {
                     gpu_filters: false,
                     gpu_tonemap: false,
                     gpu_overlay: false,
+                    gpu_tone_maps: Vec::new(),
                     budget: None,
                 },
                 mdns: false,

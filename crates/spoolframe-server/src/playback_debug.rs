@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use spoolframe_admin_api as api;
 use spoolframe_catalog::{Catalog, CatalogError};
-use spoolframe_media::encoders::{Encoders, Hardware};
+use spoolframe_media::encoders::{Encoders, Hardware, ToneMapper, VulkanDevice};
 use spoolframe_media::{MediaDescriptor, Prober, SubtitleKind, SubtitleSource, codecs};
 use spoolframe_protocol::{
     AudioAction, ConvertedVideo, PlaybackPlan, Selection, SubtitleAction, SubtitleDelivery,
@@ -590,12 +590,38 @@ fn row(s: &Snapshot) -> api::PlaybackRow {
     }
 }
 
-fn gpu_api(hardware: Hardware) -> api::GpuApi {
+pub(crate) fn gpu_api(hardware: Hardware) -> api::GpuApi {
     match hardware {
         Hardware::Vaapi => api::GpuApi::Vaapi,
         Hardware::Nvenc => api::GpuApi::Nvidia,
         Hardware::Qsv => api::GpuApi::Qsv,
     }
+}
+
+/// A tone map (PGPU-04), as the admin API names it.
+pub(crate) fn tone_mapper(mapper: ToneMapper) -> api::ToneMapper {
+    match mapper {
+        ToneMapper::Cpu => api::ToneMapper::Cpu,
+        ToneMapper::Vaapi => api::ToneMapper::Vaapi,
+        ToneMapper::Libplacebo(VulkanDevice::Shared) => api::ToneMapper::LibplaceboShared,
+        ToneMapper::Libplacebo(VulkanDevice::Own) => api::ToneMapper::LibplaceboOwn,
+    }
+}
+
+/// The tone maps each GPU runs (PGPU-04), for the transcoding status.
+pub(crate) fn gpu_tone_maps(encoders: &Encoders) -> Vec<api::GpuToneMap> {
+    [Hardware::Vaapi, Hardware::Nvenc]
+        .into_iter()
+        .flat_map(|family| {
+            encoders
+                .gpu_tone_mappers(family)
+                .into_iter()
+                .map(move |mapper| api::GpuToneMap {
+                    gpu: gpu_api(family),
+                    mapper: tone_mapper(mapper),
+                })
+        })
+        .collect()
 }
 
 fn filter_place(on: FilterOn) -> api::FilterPlace {
@@ -616,6 +642,7 @@ fn made(s: &Snapshot) -> api::PlaybackMade {
             decoder: api::VideoDecoder::None,
             encoder: None,
             tone_map: api::FilterPlace::None,
+            tone_mapper: None,
             burn_in: api::FilterPlace::None,
             width,
             height,
@@ -631,6 +658,9 @@ fn made(s: &Snapshot) -> api::PlaybackMade {
             Decoder::Hardware(hardware) => api::VideoDecoder::Gpu {
                 api: gpu_api(hardware),
             },
+            Decoder::Vulkan => api::VideoDecoder::Gpu {
+                api: api::GpuApi::Vulkan,
+            },
         },
         encoder: made.encoder.as_ref().map(|e| api::VideoEncoderUsed {
             codec: e.codec.to_string(),
@@ -638,6 +668,7 @@ fn made(s: &Snapshot) -> api::PlaybackMade {
             gpu: e.hardware.map(gpu_api),
         }),
         tone_map: filter_place(made.tone_map),
+        tone_mapper: made.tone_mapper.map(tone_mapper),
         burn_in: filter_place(made.burn_in),
         width,
         height,

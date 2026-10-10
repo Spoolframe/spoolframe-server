@@ -1591,6 +1591,12 @@ fn PlaybackFields(
     let watched = use_signal(|| text(&settings, "watch.watched_percent"));
     let mut ocr = use_signal(|| flag(&settings, "subtitles.ocr"));
     let mut gpu_filters = use_signal(|| flag(&settings, "transcode.gpu_filters"));
+    // PGPU-04: Settings only; the wizard's step stays as its board draws it.
+    let mut tone_map = use_signal(|| match text(&settings, "transcode.tone_map").as_str() {
+        "" => "auto".to_owned(),
+        other => other.to_owned(),
+    });
+    let mut shared_on_amd = use_signal(|| flag(&settings, "experimental.libplacebo_shared_on_amd"));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let s = settings.clone();
@@ -1621,6 +1627,7 @@ fn PlaybackFields(
             ];
             if settings_tab {
                 changes.push(("previews.when", Some(json!(when()))));
+                changes.push(("transcode.tone_map", Some(json!(tone_map()))));
             }
             // Hidden, they are left as they are.
             if advanced {
@@ -1653,6 +1660,10 @@ fn PlaybackFields(
                         number("Started after", &started())?,
                     ),
                     ("watch.watched_percent", watched),
+                    (
+                        "experimental.libplacebo_shared_on_amd",
+                        Some(json!(shared_on_amd())),
+                    ),
                 ]);
             }
             Ok(changes)
@@ -1693,6 +1704,10 @@ fn PlaybackFields(
     let gpu_support = status
         .as_ref()
         .map(|s| setup::gpu_filters_support(s.transcoding.gpu_tonemap, s.transcoding.gpu_overlay));
+    let tone_maps_found = status
+        .as_ref()
+        .map(|s| setup::tone_maps_line(&s.transcoding.gpu_tone_maps));
+    let tone_map_locked = locked(&settings, "transcode.tone_map");
     let hw_locked = locked(&settings, "transcode.hardware");
     // Worked out from the server's CPUs, so the server says it.
     let workers_default = match status.as_ref().map(|s| s.preview_workers_default) {
@@ -1816,6 +1831,26 @@ fn PlaybackFields(
                 span { class: "text-xs text-ctp-subtext0", "{support}" }
             }
         }
+        if settings_tab {
+            div { class: "flex flex-col gap-2",
+                h2 { "HDR tone map" }
+                p { class: "text-xs text-ctp-subtext0", "How HDR video is made SDR for a screen that shows no HDR." }
+                for (word, name, what) in setup::TONE_MAPS {
+                    button {
+                        key: "{word}",
+                        class: choice(tone_map() == word),
+                        disabled: tone_map_locked,
+                        onclick: move |_| tone_map.set(word.to_owned()),
+                        span { class: "radio" }
+                        span { class: "choice-what", b { "{name}" } "{what}" }
+                    }
+                }
+                Note { settings: settings.clone(), setting: "transcode.tone_map", on_changed: move |_| on_reload.call(()) }
+                if let Some(found) = tone_maps_found {
+                    span { class: "text-xs text-ctp-subtext0", "{found}" }
+                }
+            }
+        }
         div { class: "flex flex-col gap-2",
             h2 { "Frame previews" }
             if settings_tab {
@@ -1916,6 +1951,29 @@ fn PlaybackFields(
                 }
             }
             span { class: "text-xs text-ctp-subtext0", {setup::ocr_note(ocr(), !languages.is_empty())} }
+        }
+        // PGPU-04: switches that may change or go away, with the advanced
+        // settings only.
+        if advanced {
+            div { class: "flex flex-col gap-2",
+                h2 { "Experimental" }
+                p { class: "text-xs text-ctp-subtext0", {setup::EXPERIMENTAL_NOTE} }
+                div { class: "flex items-start gap-3",
+                    button {
+                        class: "switch mt-0.5",
+                        role: "switch",
+                        aria_checked: "{shared_on_amd()}",
+                        aria_label: "libplacebo shares ffmpeg's Vulkan device on AMD",
+                        disabled: locked(&settings, "experimental.libplacebo_shared_on_amd"),
+                        onclick: move |_| shared_on_amd.toggle(),
+                    }
+                    span { class: "choice-what",
+                        b { "libplacebo shares ffmpeg's Vulkan device on AMD" }
+                        "The frames stay on the GPU from decode to tone map, rather than going through memory to a device of libplacebo's own. Tried at start; where it fails, as it does with Mesa's RADV today, libplacebo uses its own."
+                    }
+                }
+                Note { settings: settings.clone(), setting: "experimental.libplacebo_shared_on_amd", on_changed: move |_| on_reload.call(()) }
+            }
         }
         if let Some(text) = error() {
             Alert { text }

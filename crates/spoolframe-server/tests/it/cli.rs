@@ -403,6 +403,43 @@ async fn the_media_tools_run_confined_by_default() {
     running.stop_cleanly();
 }
 
+/// A process's line `field` of `/proc/<pid>/status`.
+fn status_line(pid: u32, field: &str) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find(|l| l.starts_with(&format!("{field}:")))
+        .unwrap_or_else(|| panic!("no {field} in /proc/{pid}/status"))
+        .to_owned()
+}
+
+/// PX-31: the server hardens its own process before anything else. Its
+/// parent, this test, as the same user, cannot read its environment and
+/// the secrets in it; it has no new privileges and a seccomp filter.
+/// Said at DEBUG: it is the usual case.
+#[tokio::test]
+async fn the_server_s_process_is_hardened() {
+    let (_tmp, config) = config_with_state("hardened", &closed_port_url()).await;
+    let (running, log) = Running::start_with(
+        &config,
+        &[
+            ("SF_ENV_PX31_SECRET", "s3cret"),
+            ("SPOOLFRAME_LOG", "info,spoolframe_server=debug"),
+        ],
+    );
+    let pid = running.0.id();
+    let environ = std::fs::read(format!("/proc/{pid}/environ"));
+    assert_eq!(
+        environ.as_ref().map_err(std::io::Error::kind).err(),
+        Some(std::io::ErrorKind::PermissionDenied),
+        "{environ:?}"
+    );
+    assert_eq!(status_line(pid, "NoNewPrivs"), "NoNewPrivs:\t1");
+    assert_eq!(status_line(pid, "Seccomp"), "Seccomp:\t2");
+    assert!(log.contains("the server's process is hardened"), "{log}");
+    running.stop_cleanly();
+}
+
 /// "required" refuses to start when the start check cannot show the
 /// tools confined: here ffprobe cannot run at all.
 #[tokio::test]
@@ -1347,6 +1384,7 @@ async fn a_restart_without_a_supervisor_runs_the_server_again_in_place() {
         root.settings().await.unwrap().restart_mode,
         RestartMode::InPlace
     );
+    let filters = status_line(pid, "Seccomp_filters");
     root.restart().await.unwrap();
 
     // A fresh start, logged to the same pipe, by the same process.
@@ -1362,6 +1400,11 @@ async fn a_restart_without_a_supervisor_runs_the_server_again_in_place() {
     assert_eq!(config_loaded, 2, "{log}");
     assert!(log.contains("restarting in place"), "{log}");
     assert!(running.0.try_wait().unwrap().is_none(), "{log}");
+    // Hardened again (exec made it dumpable), its seccomp filter kept
+    // rather than loaded a second time (PX-31).
+    let environ = std::fs::read(format!("/proc/{pid}/environ"));
+    assert!(environ.is_err(), "{environ:?}");
+    assert_eq!(status_line(pid, "Seccomp_filters"), filters, "{log}");
 
     // The same port, and the session kept in the store.
     let again = crate::admin::with_token(admin_addr(&config), &token).await;
@@ -1395,4 +1438,114 @@ async fn a_restart_under_a_supervisor_exits_for_it_to_start_the_server_again() {
     }
     let status = status.unwrap_or_else(|| panic!("still running: {}", running.log()));
     assert_eq!(status.code(), Some(75), "{}", running.log());
+}
+
+/// PX-33: SIGHUP to a running server reads its config file again. A live
+/// setting applies, a restart one waits with the old value running, a
+/// file that does not load changes nothing and says why, and a reload
+/// with nothing new says so. `config reload` asks for the same through
+/// the admin API.
+#[tokio::test]
+async fn sighup_reloads_the_config_file() {
+    use spoolframe_admin_api::AdminApiClient;
+    let (_tmp, config) = restart_config("sighup-reload").await;
+    let original = std::fs::read_to_string(&config).unwrap();
+    let (mut running, log) = Running::start(&config);
+    let pid = running.0.id().to_string();
+    let (root, _) = first_admin(&config, &log).await;
+    let hangup = || {
+        let sent = Command::new("kill").args(["-HUP", &pid]).status().unwrap();
+        assert!(sent.success());
+    };
+    let reloads = |running: &Running, times: usize| {
+        running
+            .lines_once(
+                |l| l.contains("config reloaded") || l.contains("not reloaded"),
+                times,
+            )
+            .into_iter()
+            .filter(|l| l.contains("config reloaded") || l.contains("not reloaded"))
+            .nth(times - 1)
+            .unwrap()
+    };
+
+    // A live and a restart setting.
+    std::fs::write(
+        &config,
+        original
+            .replace("Restart test", "Reloaded")
+            .replace("mdns = false", "mdns = true"),
+    )
+    .unwrap();
+    hangup();
+    let line = reloads(&running, 1);
+    assert!(line.contains("INFO"), "{line}");
+    assert!(
+        line.contains(
+            "SIGHUP: config reloaded: applied name; after a restart: network.mdns; unchanged \
+             otherwise"
+        ),
+        "{line}"
+    );
+    let status = root.server_status().await.unwrap();
+    assert_eq!(status.name, "Reloaded");
+    let settings = root.settings().await.unwrap();
+    let mdns = settings
+        .entries
+        .iter()
+        .find(|e| e.key == "network.mdns")
+        .unwrap();
+    assert!(mdns.restart_pending, "{mdns:?}");
+    assert_eq!(mdns.running, Some(serde_json::json!(false)));
+
+    // A file that does not load: nothing changes, one ERROR says where.
+    let good = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, good.replace("Reloaded", "Broken") + "nmae = 1;\n").unwrap();
+    hangup();
+    let line = reloads(&running, 2);
+    assert!(line.contains("ERROR"), "{line}");
+    assert!(
+        line.contains("the server keeps the one it had")
+            && line.contains(&config.display().to_string()),
+        "{line}"
+    );
+    assert_eq!(root.server_status().await.unwrap().name, "Reloaded");
+    assert!(running.0.try_wait().unwrap().is_none(), "{}", running.log());
+
+    // Back, and asked for through the admin API from the CLI: the file
+    // is as the server already has it.
+    std::fs::write(&config, &good).unwrap();
+    let out = cli(
+        &config,
+        &["config", "reload"],
+        "",
+        &[
+            ("SPOOLFRAME_ADMIN_USER", "root"),
+            ("SPOOLFRAME_ADMIN_PASSWORD", "correct horse"),
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "config reloaded: nothing changed\n"
+    );
+    let line = reloads(&running, 3);
+    assert!(
+        line.contains("configReload by root: config reloaded: nothing changed"),
+        "{line}"
+    );
+    hangup();
+    let line = reloads(&running, 4);
+    assert!(
+        line.contains("SIGHUP: config reloaded: nothing changed"),
+        "{line}"
+    );
+    // Encoders detected again on each, as SIGHUP always did.
+    let detected = running
+        .log()
+        .lines()
+        .filter(|l| l.contains("transcoding") && l.contains("encoders"))
+        .count();
+    assert!(detected >= 2, "{}", running.log());
+    running.stop_cleanly();
 }

@@ -1,7 +1,7 @@
 //! What the setup wizard and the Settings pages decide (P3-10), apart from
 //! the pages: host-compiled, so `cargo test` covers it.
 
-use spoolframe_admin_api::{LibraryPathCheck, PathMappingEntry};
+use spoolframe_admin_api::{GpuApi, GpuToneMap, LibraryPathCheck, PathMappingEntry};
 
 /// One step of the wizard. Later phases add and replace steps here (P9
 /// adds the native catalog's); a step's id is what the server keeps as
@@ -499,9 +499,94 @@ pub fn gpu_filters_support(tonemap: bool, overlay: bool) -> &'static str {
     }
 }
 
+/// `transcode.tone_map`'s choices (PGPU-04): its word, its name, and what
+/// it does.
+pub const TONE_MAPS: [(&str, &str, &str); 4] = [
+    (
+        "auto",
+        "Automatic",
+        "The GPU's own tone map, else libplacebo on the GPU, else the CPU. \
+         On the CPU while GPU filters are off.",
+    ),
+    (
+        "cpu",
+        "CPU",
+        "Always on the CPU: the most CPU, the same picture on any server.",
+    ),
+    (
+        "gpu",
+        "The GPU driver's own",
+        "tonemap_vaapi, which Intel's VA-API driver has. On the CPU for a GPU without it.",
+    ),
+    (
+        "libplacebo",
+        "libplacebo",
+        "On the GPU through Vulkan, AMD and NVIDIA alike: fast, and little CPU. \
+         On the CPU for a GPU without it.",
+    ),
+];
+
+/// What this server's GPUs tone map with, from detection: `Found here:
+/// VA-API: libplacebo (own) · NVIDIA: libplacebo (shared).`
+pub fn tone_maps_line(found: &[GpuToneMap]) -> String {
+    let mut per_gpu: Vec<(GpuApi, Vec<&str>)> = Vec::new();
+    for tone_map in found {
+        match per_gpu.iter_mut().find(|(gpu, _)| *gpu == tone_map.gpu) {
+            Some((_, labels)) => labels.push(tone_map.mapper.label()),
+            None => per_gpu.push((tone_map.gpu, vec![tone_map.mapper.label()])),
+        }
+    }
+    if per_gpu.is_empty() {
+        return "No GPU here tone maps: the CPU does.".to_owned();
+    }
+    let gpus: Vec<String> = per_gpu
+        .into_iter()
+        .map(|(gpu, labels)| {
+            let name = match gpu {
+                GpuApi::Vaapi => "VA-API",
+                GpuApi::Nvidia => "NVIDIA",
+                GpuApi::Qsv => "Quick Sync",
+                GpuApi::Vulkan => "Vulkan",
+            };
+            format!("{name}: {}", labels.join(", "))
+        })
+        .collect();
+    format!("Found here: {}.", gpus.join(" · "))
+}
+
+/// What the experimental section says above its switches.
+pub const EXPERIMENTAL_NOTE: &str =
+    "These may change or go away in any release, without notice. The server logs the ones on.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tone_map_line_names_what_each_gpu_runs() {
+        use spoolframe_admin_api::ToneMapper;
+        assert_eq!(tone_maps_line(&[]), "No GPU here tone maps: the CPU does.");
+        let found = [
+            GpuToneMap {
+                gpu: GpuApi::Vaapi,
+                mapper: ToneMapper::LibplaceboOwn,
+            },
+            GpuToneMap {
+                gpu: GpuApi::Nvidia,
+                mapper: ToneMapper::LibplaceboShared,
+            },
+        ];
+        assert_eq!(
+            tone_maps_line(&found),
+            "Found here: VA-API: libplacebo (own) · NVIDIA: libplacebo (shared)."
+        );
+    }
+
+    #[test]
+    fn every_tone_map_setting_has_a_choice() {
+        let words: Vec<&str> = TONE_MAPS.iter().map(|(word, _, _)| *word).collect();
+        assert_eq!(words, ["auto", "cpu", "gpu", "libplacebo"]);
+    }
 
     #[test]
     fn the_gpu_filters_note_says_what_this_gpu_does() {

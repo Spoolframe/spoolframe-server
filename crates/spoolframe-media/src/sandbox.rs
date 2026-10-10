@@ -48,6 +48,22 @@
 //! name, which procfs would otherwise make anew (another inode, outside
 //! the rules) once nothing holds them. A VA-API run, or a run on no GPU,
 //! has no `/proc` at all.
+//!
+//! **Vulkan, for libplacebo's tone map (PGPU-04)** ([`Jail::vulkan`]): no
+//! rule more than the GPU's own. Found on RADV (an RX 7900 XTX and a
+//! Raphael iGPU) by running libplacebo's test confined with the VA-API
+//! jail and nothing added: the Vulkan loader reads its manifests from
+//! `/run/opengl-driver/share/vulkan` (NixOS) or `/usr/share/vulkan`,
+//! both read already, and RADV opens the render node and reads `/sys`, as
+//! VA-API does. Because only the job's render node may be opened, RADV
+//! lists that GPU and no other, which is how libplacebo's own Vulkan
+//! device lands on the job's GPU. What a Vulkan run gets is its
+//! environment: Mesa's and NVIDIA's shader disk caches off (they would be
+//! written into the job's directory, for no other job to read), and the
+//! device-select layer told the GPU's PCI ids, for a run that is not
+//! confined. NVIDIA's Vulkan driver is not granted anything blind: what
+//! it is expected to need is in the PGPU-04 ticket, to be checked on an
+//! NVIDIA host.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -125,9 +141,10 @@ struct Inner {
     gpu: GpuDevices,
 }
 
-/// The seccomp filters, as BPF, in the order they are loaded.
+/// The seccomp filters, as BPF, in the order they are loaded. The
+/// server's own deny-list ([`crate::harden`]) is made of them too.
 #[derive(Debug)]
-struct Filters(Vec<BpfProgram>);
+pub(crate) struct Filters(Vec<BpfProgram>);
 
 impl Sandbox {
     /// Nothing confined: for tests with stand-in programs, and
@@ -460,6 +477,7 @@ pub struct Jail {
     reads: Vec<PathBuf>,
     writes: Vec<PathBuf>,
     gpu: GpuUse,
+    vulkan: Option<Vulkan>,
     limits: Limits,
 }
 
@@ -470,6 +488,7 @@ impl Jail {
             reads: Vec::new(),
             writes: Vec::new(),
             gpu: GpuUse::None,
+            vulkan: None,
             limits,
         }
     }
@@ -504,6 +523,49 @@ impl Jail {
         self.gpu = gpu;
         self
     }
+
+    /// The run uses the GPU through Vulkan too (libplacebo, PGPU-04), or
+    /// not: what changes is its environment (see the module's doc).
+    pub fn vulkan(mut self, vulkan: Option<Vulkan>) -> Self {
+        self.vulkan = vulkan;
+        self
+    }
+}
+
+/// How a run uses Vulkan (PGPU-04): on which GPU, for a run that is not
+/// confined to one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Vulkan {
+    /// The GPU's PCI vendor and device ids, for Mesa's device-select
+    /// layer (`MESA_VK_DEVICE_SELECT=<vendor>:<device>!`, the `!` hiding
+    /// every other GPU). Confined, the jail already opens no other GPU's
+    /// render node; this is for `media.sandbox = "off"`, or a kernel
+    /// without Landlock. `None`: whichever GPU the run can open, as
+    /// ffmpeg's NVIDIA Vulkan device is chosen by name.
+    pub pci_ids: Option<(u16, u16)>,
+}
+
+impl Vulkan {
+    /// Vulkan on the GPU whose render node is `node` (a path under
+    /// `/dev/dri`, or a link to one: `/dev/dri/by-path/…`).
+    pub fn on(node: &Path) -> Self {
+        Self {
+            pci_ids: pci_ids(Path::new("/sys/class/drm"), node),
+        }
+    }
+}
+
+/// The PCI vendor and device ids of the GPU whose render node is `node`,
+/// from `drm`'s (`/sys/class/drm`) `<node>/device/vendor` and `device`:
+/// `0x1002`, `0x744c`.
+fn pci_ids(drm: &Path, node: &Path) -> Option<(u16, u16)> {
+    let node = std::fs::canonicalize(node).unwrap_or_else(|_| node.to_path_buf());
+    let device = drm.join(node.file_name()?).join("device");
+    let id = |name: &str| {
+        let text = std::fs::read_to_string(device.join(name)).ok()?;
+        u16::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+    };
+    Some((id("vendor")?, id("device")?))
 }
 
 /// A program and how it runs.
@@ -843,7 +905,7 @@ fn restrict(ruleset: RulesetCreated) -> std::io::Result<()> {
 /// The child loads the seccomp filters. Through prctl(2), not seccomp(2),
 /// which systemd's @system-service does not allow. After the fork: see
 /// [`Tool::command`].
-fn install(filters: &Filters) -> std::io::Result<()> {
+pub(crate) fn install(filters: &Filters) -> std::io::Result<()> {
     // SAFETY: prctl(2) with integer arguments, and with a pointer to a
     // filter that lives as long as `filters` (the closure's).
     unsafe {
@@ -893,6 +955,10 @@ const KEPT: &[&str] = &[
     "CUDA_VISIBLE_DEVICES",
     "NVIDIA_VISIBLE_DEVICES",
     "__EGL_VENDOR_LIBRARY_DIRS",
+    // Which Vulkan drivers the loader takes (PGPU-04): an operator may name
+    // one, as RADV alone beside NVIDIA's.
+    "VK_DRIVER_FILES",
+    "VK_ICD_FILENAMES",
 ];
 
 fn environment(jail: &Jail) -> Vec<(OsString, OsString)> {
@@ -908,6 +974,18 @@ fn environment(jail: &Jail) -> Vec<(OsString, OsString)> {
         .map_or_else(|| OsString::from("/"), |dir| dir.clone().into_os_string());
     for key in ["HOME", "TMPDIR", "XDG_CACHE_HOME"] {
         env.push((key.into(), home.clone()));
+    }
+    if let Some(vulkan) = &jail.vulkan {
+        // Shaders compiled again each run: a cache in the job's directory
+        // would count against its scratch space and help no other job.
+        env.push(("MESA_SHADER_CACHE_DISABLE".into(), "true".into()));
+        env.push(("__GL_SHADER_DISK_CACHE".into(), "0".into()));
+        if let Some((vendor, device)) = vulkan.pci_ids {
+            env.push((
+                "MESA_VK_DEVICE_SELECT".into(),
+                format!("{vendor:04x}:{device:04x}!").into(),
+            ));
+        }
     }
     env
 }
@@ -1149,7 +1227,12 @@ fn filters() -> Result<Filters, String> {
         arch,
     )
     .map_err(|e| e.to_string())?;
-    let programs = [refused, clone3]
+    compile([refused, clone3])
+}
+
+/// `filters` as BPF, each checked to fit in one program.
+pub(crate) fn compile(filters: impl IntoIterator<Item = SeccompFilter>) -> Result<Filters, String> {
+    let programs = filters
         .into_iter()
         .map(|filter| {
             let program: BpfProgram = filter
@@ -1391,6 +1474,72 @@ mod tests {
         let devices = gpu_devices_in(&dev, None, false);
         assert!(devices.of(GpuUse::Nvidia).is_empty());
         assert!(devices.of(GpuUse::Vaapi).is_empty());
+    }
+
+    fn env_of(jail: &Jail) -> Vec<(String, String)> {
+        environment(jail)
+            .into_iter()
+            .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
+            .collect()
+    }
+
+    /// PGPU-04: a Vulkan run's environment turns the shader disk caches
+    /// off and names its GPU to Mesa's device-select layer; any other
+    /// run's has none of it.
+    #[test]
+    fn a_vulkan_run_names_its_gpu_and_caches_no_shader() {
+        let plain = env_of(&Jail::new(Limits::PROBE).gpu(GpuUse::Vaapi));
+        assert!(
+            plain
+                .iter()
+                .all(|(k, _)| !k.starts_with("MESA_") && !k.starts_with("__GL")),
+            "{plain:?}"
+        );
+        let vulkan = env_of(
+            &Jail::new(Limits::PROBE)
+                .gpu(GpuUse::Vaapi)
+                .vulkan(Some(Vulkan {
+                    pci_ids: Some((0x1002, 0x744c)),
+                })),
+        );
+        for wanted in [
+            ("MESA_SHADER_CACHE_DISABLE", "true"),
+            ("__GL_SHADER_DISK_CACHE", "0"),
+            ("MESA_VK_DEVICE_SELECT", "1002:744c!"),
+        ] {
+            assert!(
+                vulkan.contains(&(wanted.0.to_owned(), wanted.1.to_owned())),
+                "{wanted:?} in {vulkan:?}"
+            );
+        }
+        let any_gpu = env_of(
+            &Jail::new(Limits::PROBE)
+                .gpu(GpuUse::Nvidia)
+                .vulkan(Some(Vulkan::default())),
+        );
+        assert!(any_gpu.iter().all(|(k, _)| k != "MESA_VK_DEVICE_SELECT"));
+        assert!(any_gpu.iter().any(|(k, _)| k == "__GL_SHADER_DISK_CACHE"));
+    }
+
+    /// The render node's PCI ids come from sysfs, through a by-path link
+    /// too.
+    #[tokio::test]
+    async fn a_render_node_s_pci_ids_are_read_from_sysfs() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-pci-ids").await;
+        let root = tmp.to_path_buf();
+        let device = root.join("drm/renderD129/device");
+        std::fs::create_dir_all(&device).unwrap();
+        std::fs::write(device.join("vendor"), "0x1002\n").unwrap();
+        std::fs::write(device.join("device"), "0x164e\n").unwrap();
+        std::fs::create_dir_all(root.join("dev/dri/by-path")).unwrap();
+        let node = root.join("dev/dri/renderD129");
+        std::fs::write(&node, "").unwrap();
+        let link = root.join("dev/dri/by-path/pci-0000:6d:00.0-render");
+        std::os::unix::fs::symlink(&node, &link).unwrap();
+        let drm = root.join("drm");
+        assert_eq!(pci_ids(&drm, &node), Some((0x1002, 0x164e)));
+        assert_eq!(pci_ids(&drm, &link), Some((0x1002, 0x164e)));
+        assert_eq!(pci_ids(&drm, &root.join("dev/dri/renderD130")), None);
     }
 
     #[test]

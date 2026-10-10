@@ -20,7 +20,7 @@ use crate::logs::hours_minutes;
 use crate::playback::{
     ReadsChart, at, converted_percent, decoder_text, delivery, encoder_text, ended_text,
     filter_text, furthest, made_line, out_text, output_text, plan_pill, reads_chart, start_parts,
-    stream_name, why_line,
+    stream_name, tone_mapper_text, why_line,
 };
 
 /// How often the pages ask: reads move by the second.
@@ -479,7 +479,7 @@ fn Made(row: PlaybackRow) -> Element {
                         note: made.encoder.as_ref().map_or_else(String::new, |e| e.name.clone()),
                         tone: String::new(),
                     }
-                    Stat { label: "HDR tone mapping".to_owned(), value: tone_map.to_owned(), note: String::new(), tone: tone_map_tone.to_owned() }
+                    Stat { label: "HDR tone mapping".to_owned(), value: tone_map.to_owned(), note: tone_mapper_text(made), tone: tone_map_tone.to_owned() }
                     Stat { label: "Subtitle burn-in".to_owned(), value: burn_in.to_owned(), note: String::new(), tone: burn_in_tone.to_owned() }
                     Stat { label: "Output".to_owned(), value: output, note: output_note, tone: String::new() }
                 }

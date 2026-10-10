@@ -12,6 +12,7 @@ mod descriptor;
 pub mod dvb;
 pub mod encoders;
 mod external;
+pub mod harden;
 pub mod keyframe_index;
 pub mod ocr;
 pub mod pgs;
