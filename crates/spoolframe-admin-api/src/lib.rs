@@ -998,7 +998,9 @@ pub struct TranscodingStatus {
     /// ffmpeg's names, e.g. `hevc_vaapi`, `libx264`.
     pub video_encoders: Vec<String>,
     pub audio_encoders: Vec<String>,
-    /// Codecs with a working hardware decoder, as `hevc (vaapi)`.
+    /// Codecs with a working hardware decoder, as `hevc (vaapi)` or
+    /// `hevc 10-bit (nvdec)`: the API it decodes through, and the test
+    /// sample's depth where it was over 8 bits.
     pub hardware_decoders: Vec<String>,
     /// `transcode.gpu_filters`: tone map and burn in pictures on the GPU
     /// where it can.

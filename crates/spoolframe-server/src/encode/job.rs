@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use spoolframe_media::sandbox::{Jail, Limits, Tool};
+use spoolframe_media::sandbox::{GpuUse, Jail, Limits, Tool};
 
 use super::JobLimits;
 use super::args::{Made, PLAYLIST};
@@ -722,8 +722,8 @@ pub struct Run {
     /// Directories of the server's own it reads: the conversion's, with its
     /// links to the inputs.
     pub reads: Vec<PathBuf>,
-    /// It decodes or encodes on the GPU.
-    pub gpu: bool,
+    /// The GPU it decodes or encodes on, if any.
+    pub gpu: GpuUse,
     /// For a run that decodes on the GPU: the same run decoding in
     /// software, for when that fails before the first output.
     pub fallback: Option<Fallback>,
@@ -735,8 +735,8 @@ pub struct Run {
 #[derive(Debug, Clone)]
 pub struct Fallback {
     pub args: Vec<String>,
-    /// It still encodes on the GPU.
-    pub gpu: bool,
+    /// The GPU it still encodes on, if any.
+    pub gpu: GpuUse,
     /// The film, as remembered: later runs of it decode in software.
     pub file: PathBuf,
     /// How it makes its video (PX-24).
@@ -1988,7 +1988,7 @@ pub(super) mod tests {
     }
 
     /// Waits up to 5 s for `ready`, checking every 20 ms.
-    async fn eventually(ready: impl Fn() -> bool) {
+    pub(crate) async fn eventually(ready: impl Fn() -> bool) {
         tokio::time::timeout(Duration::from_secs(5), async {
             while !ready() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2034,10 +2034,10 @@ pub(super) mod tests {
         let file = file.display().to_string();
         Run {
             args: vec![file.clone(), "hw".into()],
-            gpu: true,
+            gpu: GpuUse::Vaapi,
             fallback: Some(Fallback {
                 args: vec![file],
-                gpu: false,
+                gpu: GpuUse::None,
                 file: film.to_owned(),
                 made: Some(made_by(crate::encode::Decoder::Software)),
             }),

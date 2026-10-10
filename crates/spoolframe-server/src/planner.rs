@@ -1062,7 +1062,10 @@ mod tests {
             hardware_decoders: Vec::new(),
             gpu_tonemap: false,
             gpu_overlay: false,
+            cuda_scale: false,
+            cuda_overlay: false,
             unusable: Vec::new(),
+            failed: Vec::new(),
         }
     }
 

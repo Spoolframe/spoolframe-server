@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use spoolframe_types::{AudioCodec, VideoCodec};
 
-use crate::sandbox::{Jail, Limits, Tool};
+use crate::sandbox::{GpuUse, Jail, Limits, Tool};
 
 /// A family of hardware video encoders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -36,7 +36,18 @@ pub enum Hardware {
 impl Hardware {
     pub const ALL: [Hardware; 3] = [Hardware::Vaapi, Hardware::Nvenc, Hardware::Qsv];
 
-    fn suffix(self) -> &'static str {
+    /// The GPU a run on this family uses: QSV goes through VA-API's
+    /// render node, NVENC and NVDEC through NVIDIA's nodes.
+    pub fn gpu(self) -> GpuUse {
+        match self {
+            Hardware::Vaapi | Hardware::Qsv => GpuUse::Vaapi,
+            Hardware::Nvenc => GpuUse::Nvidia,
+        }
+    }
+
+    /// Its name in `transcode.hardware` and in ffmpeg's encoder names:
+    /// `vaapi`, `nvenc`, `qsv`.
+    pub fn as_str(self) -> &'static str {
         match self {
             Hardware::Vaapi => "vaapi",
             Hardware::Nvenc => "nvenc",
@@ -48,10 +59,13 @@ impl Hardware {
 /// Which hardware encoders to try, and in which order
 /// (`transcode { hardware = …; }`).
 ///
-/// For each codec the first family whose test encode works is preferred.
-/// So `[Nvenc, Vaapi]` on a host with a GTX 1060 and a Radeon encodes
-/// H.264 and HEVC on the 1060 and AV1, which Pascal's NVENC lacks, on the
-/// Radeon; software stays the last resort.
+/// Detection lists each codec's working encoders in this order, and the
+/// server runs each video encode on the family that does the most of it
+/// (`encode::args::placement`, PX-28), this order deciding between
+/// equals. So `[Nvenc, Vaapi]` on a host with a GTX 1060 and a Radeon
+/// encodes AV1, which Pascal's NVENC lacks, on the Radeon, and an AV1
+/// film to H.264 there too, Pascal's NVDEC not decoding AV1; software
+/// stays the last resort.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HardwarePolicy {
     /// Every family, in [`Hardware::ALL`]'s order.
@@ -72,7 +86,8 @@ impl HardwarePolicy {
         }
     }
 
-    /// The families named explicitly, whose failure is worth a warning.
+    /// The families named explicitly: what they lack is logged at info,
+    /// and one with no working encoder at all is a warning.
     pub fn named(&self) -> &[Hardware] {
         match self {
             HardwarePolicy::Ordered(order) => order,
@@ -117,7 +132,38 @@ pub struct AudioEncoder {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HardwareDecoder {
     pub codec: VideoCodec,
+    /// The family whose hwaccel decoded it: NVENC's is NVDEC, through
+    /// CUDA.
     pub hardware: Hardware,
+    /// The test sample's bits per sample: 8, or 10 for the 10-bit
+    /// samples (HDR sources are 10-bit).
+    pub bit_depth: u32,
+}
+
+impl HardwareDecoder {
+    /// What a family lacks when this decode fails: `hevc 10-bit decode`.
+    fn lacked(&self) -> String {
+        if self.bit_depth > 8 {
+            format!("{} {}-bit decode", self.codec.as_str(), self.bit_depth)
+        } else {
+            format!("{} decode", self.codec.as_str())
+        }
+    }
+
+    /// For the log and the admin API: `hevc (vaapi)`,
+    /// `hevc 10-bit (nvdec)`.
+    pub fn label(&self) -> String {
+        let api = match self.hardware {
+            Hardware::Vaapi => "vaapi",
+            Hardware::Nvenc => "nvdec",
+            Hardware::Qsv => "qsv",
+        };
+        if self.bit_depth > 8 {
+            format!("{} {}-bit ({api})", self.codec.as_str(), self.bit_depth)
+        } else {
+            format!("{} ({api})", self.codec.as_str())
+        }
+    }
 }
 
 /// What this machine can encode, in order of preference: hardware first,
@@ -131,9 +177,32 @@ pub struct Encoders {
     pub gpu_tonemap: bool,
     /// VA-API lays pictures over video on the GPU (`overlay_vaapi`).
     pub gpu_overlay: bool,
+    /// NVIDIA keeps NVDEC's frames on the GPU and scales them there
+    /// (`scale_cuda`, PX-29): converting a 10-bit picture to 8 bits too.
+    pub cuda_scale: bool,
+    /// NVIDIA lays pictures over video on the GPU (`overlay_cuda`).
+    pub cuda_overlay: bool,
     /// Hardware the settings named that did not work, for the log.
     #[serde(skip)]
     pub unusable: Vec<Hardware>,
+    /// Each family's tests that failed, for the log (PX-28).
+    #[serde(skip)]
+    pub failed: Vec<FailedTest>,
+}
+
+/// A test of a GPU family that failed at detection: what it says the
+/// family lacks, and why, for the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedTest {
+    pub hardware: Hardware,
+    /// What was tried: the encoder (`av1_nvenc`), the decode
+    /// (`decode hevc 10-bit (nvdec)`) or the filter (`tonemap_vaapi`).
+    pub test: String,
+    /// What the family lacks for it: `av1 encode`, `hevc 10-bit decode`,
+    /// `tone map`.
+    pub lacks: String,
+    /// What ffmpeg said last.
+    pub stderr: String,
 }
 
 impl Encoders {
@@ -153,15 +222,37 @@ impl Encoders {
             hardware_decoders: Vec::new(),
             gpu_tonemap: false,
             gpu_overlay: false,
+            cuda_scale: false,
+            cuda_overlay: false,
             unusable: Vec::new(),
+            failed: Vec::new(),
         }
     }
 
-    /// Whether `hardware` decoded `codec` in the test decode.
+    /// What `hardware`'s failed tests say it lacks, in the order tried:
+    /// `["av1 encode", "av1 decode"]`.
+    pub fn lacks(&self, hardware: Hardware) -> Vec<&str> {
+        self.failed
+            .iter()
+            .filter(|f| f.hardware == hardware)
+            .map(|f| f.lacks.as_str())
+            .collect()
+    }
+
+    /// Whether `hardware` decoded `codec` in a test decode, of any depth.
     pub fn decodes(&self, codec: VideoCodec, hardware: Hardware) -> bool {
         self.hardware_decoders
             .iter()
             .any(|d| d.codec == codec && d.hardware == hardware)
+    }
+
+    /// Whether `hardware` decoded a sample of `codec` with at least
+    /// `bit_depth` bits: a 10-bit source needs a 10-bit test decode, a
+    /// GPU that decodes 8-bit HEVC not always decoding 10-bit.
+    pub fn decodes_depth(&self, codec: VideoCodec, bit_depth: u32, hardware: Hardware) -> bool {
+        self.hardware_decoders
+            .iter()
+            .any(|d| d.codec == codec && d.hardware == hardware && d.bit_depth >= bit_depth)
     }
 
     /// The preferred encoder for `codec`.
@@ -173,7 +264,8 @@ impl Encoders {
         self.audio.iter().find(|e| e.codec == codec)
     }
 
-    /// One line for the log: `video: hevc_vaapi, h264_vaapi, libx264, …`.
+    /// One line for the log: `video: hevc_vaapi, h264_vaapi, libx264, …;
+    /// … hardware decoders: h264 (vaapi), hevc 10-bit (nvdec), …`.
     pub fn summary(&self) -> String {
         let names = |v: Vec<&str>| {
             if v.is_empty() {
@@ -182,24 +274,45 @@ impl Encoders {
                 v.join(", ")
             }
         };
-        let filters = [
-            (self.gpu_tonemap, "tone map"),
-            (self.gpu_overlay, "overlay"),
+        // Per family: `vaapi: tone map, overlay; nvenc: scale, overlay`.
+        let found = |filters: &[(bool, &'static str)]| -> Vec<&'static str> {
+            filters
+                .iter()
+                .filter_map(|(found, name)| found.then_some(*name))
+                .collect()
+        };
+        let families: Vec<String> = [
+            (
+                Hardware::Vaapi,
+                found(&[
+                    (self.gpu_tonemap, "tone map"),
+                    (self.gpu_overlay, "overlay"),
+                ]),
+            ),
+            (
+                Hardware::Nvenc,
+                found(&[(self.cuda_scale, "scale"), (self.cuda_overlay, "overlay")]),
+            ),
         ]
         .into_iter()
-        .filter_map(|(found, name)| found.then_some(name))
+        .filter(|(_, filters)| !filters.is_empty())
+        .map(|(family, filters)| format!("{}: {}", family.as_str(), filters.join(", ")))
         .collect();
+        let decoders: Vec<String> = self
+            .hardware_decoders
+            .iter()
+            .map(HardwareDecoder::label)
+            .collect();
         format!(
             "video: {}; audio: {}; hardware decoders: {}; GPU filters: {}",
             names(self.video.iter().map(|e| e.name.as_str()).collect()),
             names(self.audio.iter().map(|e| e.name.as_str()).collect()),
-            names(
-                self.hardware_decoders
-                    .iter()
-                    .map(|d| d.codec.as_str())
-                    .collect()
-            ),
-            names(filters),
+            names(decoders.iter().map(String::as_str).collect()),
+            if families.is_empty() {
+                "none".to_owned()
+            } else {
+                families.join("; ")
+            },
         )
     }
 }
@@ -224,9 +337,10 @@ const AUDIO: [(AudioCodec, &str); 4] = [
 pub trait Ffmpeg: Send + Sync {
     /// The output of `ffmpeg -encoders`.
     async fn encoders(&self) -> Result<String, String>;
-    /// Whether ffmpeg with `args` exits successfully. What it reads and
-    /// writes is in `scratch`.
-    async fn succeeds(&self, args: &[String], scratch: &Path) -> bool;
+    /// Whether ffmpeg with `args` exits successfully: if not, why, which
+    /// is the last of what it wrote to stderr when it ran. What it reads
+    /// and writes is in `scratch`; `gpu` is the GPU it may use.
+    async fn succeeds(&self, args: &[String], scratch: &Path, gpu: GpuUse) -> Result<(), String>;
 }
 
 /// The names in `ffmpeg -encoders` output.
@@ -343,26 +457,35 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
     let listed = listed(&list);
     let families = settings.hardware.families();
 
+    let mut failures = Vec::new();
     let mut video = Vec::new();
     for (codec, prefix, software) in VIDEO {
         let mut candidates: Vec<(String, Option<Hardware>)> = families
             .iter()
-            .map(|h| (format!("{prefix}_{}", h.suffix()), Some(*h)))
+            .map(|h| (format!("{prefix}_{}", h.as_str()), Some(*h)))
             .collect();
         candidates.push((software.to_owned(), None));
         for (name, hardware) in candidates {
             if !listed.contains(&name.as_str()) {
                 continue;
             }
-            if ffmpeg
-                .succeeds(&encode_args(&name, hardware, settings), scratch)
+            let gpu = hardware.map_or(GpuUse::None, Hardware::gpu);
+            match ffmpeg
+                .succeeds(&encode_args(&name, hardware, settings), scratch, gpu)
                 .await
             {
-                video.push(VideoEncoder {
+                Ok(()) => video.push(VideoEncoder {
                     codec,
                     name,
                     hardware,
-                });
+                }),
+                Err(why) => failed(
+                    &mut failures,
+                    hardware,
+                    &name,
+                    &format!("{} encode", codec.as_str()),
+                    why,
+                ),
             }
         }
     }
@@ -377,28 +500,61 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
         .collect();
 
     let mut hardware_decoders = Vec::new();
-    if !families.is_empty() && scratch_made {
-        for (codec, _, software) in VIDEO {
-            let sample = scratch.join(format!("sample-{}.mkv", codec.as_str()));
-            let made = listed.contains(&software)
-                && ffmpeg
-                    .succeeds(&sample_args(software, &sample), scratch)
-                    .await;
-            if !made {
+    // The H.264 sample, where NVDEC decoded it: the CUDA filter tests
+    // decode it again, as a job decodes its film.
+    let mut cuda_sample = None;
+    if scratch_made {
+        for sample in &SAMPLES {
+            let tried = sample.tried_on(&families, &video);
+            if tried.is_empty() || !listed.contains(&sample.encoder) {
                 continue;
             }
-            for hardware in &families {
-                if ffmpeg
-                    .succeeds(&decode_args(*hardware, &sample, settings), scratch)
+            let file = scratch.join(format!(
+                "sample-{}-{}.mkv",
+                sample.codec.as_str(),
+                sample.bit_depth
+            ));
+            if let Err(why) = ffmpeg
+                .succeeds(&sample.args(&file), scratch, GpuUse::None)
+                .await
+            {
+                failed(&mut failures, None, sample.encoder, "", why);
+                continue;
+            }
+            for hardware in tried {
+                let decoder = HardwareDecoder {
+                    codec: sample.codec,
+                    hardware,
+                    bit_depth: sample.bit_depth,
+                };
+                match ffmpeg
+                    .succeeds(
+                        &decode_args(hardware, &file, settings),
+                        scratch,
+                        hardware.gpu(),
+                    )
                     .await
                 {
-                    hardware_decoders.push(HardwareDecoder {
-                        codec,
-                        hardware: *hardware,
-                    });
+                    Ok(()) => hardware_decoders.push(decoder),
+                    Err(why) => failed(
+                        &mut failures,
+                        Some(hardware),
+                        &format!("decode {}", decoder.label()),
+                        &decoder.lacked(),
+                        why,
+                    ),
                 }
             }
-            let _ = std::fs::remove_file(&sample);
+            let nvdec_h264 = sample.codec == VideoCodec::H264
+                && sample.bit_depth == 8
+                && hardware_decoders
+                    .iter()
+                    .any(|d| d.codec == VideoCodec::H264 && d.hardware == Hardware::Nvenc);
+            if nvdec_h264 {
+                cuda_sample = Some(file);
+            } else {
+                let _ = std::fs::remove_file(&file);
+            }
         }
     }
 
@@ -410,15 +566,106 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
     // GPU filters feed a VA-API encoder; drivers differ in which they
     // have (Mesa: neither; Intel's iHD: both).
     let vaapi = video.iter().any(|e| e.hardware == Some(Hardware::Vaapi));
-    let gpu_tonemap = vaapi && ffmpeg.succeeds(&tonemap_args(settings), scratch).await;
-    let gpu_overlay = vaapi && ffmpeg.succeeds(&overlay_args(settings), scratch).await;
+    let gpu_tonemap = vaapi
+        && gpu_filter(
+            ffmpeg,
+            scratch,
+            &mut failures,
+            (Hardware::Vaapi, "tonemap_vaapi", "tone map"),
+            tonemap_args(settings),
+        )
+        .await;
+    let gpu_overlay = vaapi
+        && gpu_filter(
+            ffmpeg,
+            scratch,
+            &mut failures,
+            (Hardware::Vaapi, "overlay_vaapi", "overlay"),
+            overlay_args(settings),
+        )
+        .await;
+    // CUDA filters (PX-29) feed NVENC from NVDEC's frames: tried where
+    // both work, on the sample NVDEC decoded.
+    let h264_nvenc = video
+        .iter()
+        .any(|e| e.codec == VideoCodec::H264 && e.hardware == Some(Hardware::Nvenc));
+    let (mut cuda_scale, mut cuda_overlay) = (false, false);
+    if let Some(sample) = cuda_sample {
+        if h264_nvenc {
+            cuda_scale = gpu_filter(
+                ffmpeg,
+                scratch,
+                &mut failures,
+                (Hardware::Nvenc, "scale_cuda", "scale"),
+                cuda_scale_args(&sample),
+            )
+            .await;
+            cuda_overlay = gpu_filter(
+                ffmpeg,
+                scratch,
+                &mut failures,
+                (Hardware::Nvenc, "overlay_cuda", "overlay"),
+                cuda_overlay_args(&sample),
+            )
+            .await;
+        }
+        let _ = std::fs::remove_file(&sample);
+    }
     Encoders {
         video,
         audio,
         hardware_decoders,
         gpu_tonemap,
         gpu_overlay,
+        cuda_scale,
+        cuda_overlay,
         unusable,
+        failed: failures,
+    }
+}
+
+/// Whether a GPU filter test, `args`, works on `hardware`'s GPU; noted
+/// if not. `test` is the filter's name, `lacks` what lacking it means.
+async fn gpu_filter(
+    ffmpeg: &dyn Ffmpeg,
+    scratch: &Path,
+    failures: &mut Vec<FailedTest>,
+    (hardware, test, lacks): (Hardware, &str, &str),
+    args: Vec<String>,
+) -> bool {
+    match ffmpeg.succeeds(&args, scratch, hardware.gpu()).await {
+        Ok(()) => true,
+        Err(why) => {
+            failed(failures, Some(hardware), test, lacks, why);
+            false
+        }
+    }
+}
+
+/// Logs a test that failed at debug, with what ffmpeg said last, and
+/// keeps a GPU family's in `failures` for the summary the server logs
+/// after detection (`transcode`): one line per family named in
+/// `transcode.hardware`, rather than a warning per codec it lacks.
+fn failed(
+    failures: &mut Vec<FailedTest>,
+    hardware: Option<Hardware>,
+    test: &str,
+    lacks: &str,
+    why: String,
+) {
+    tracing::debug!(
+        ?hardware,
+        test,
+        stderr = why,
+        "a test encode or decode failed"
+    );
+    if let Some(hardware) = hardware {
+        failures.push(FailedTest {
+            hardware,
+            test: test.to_owned(),
+            lacks: lacks.to_owned(),
+            stderr: why,
+        });
     }
 }
 
@@ -485,26 +732,189 @@ fn overlay_args(settings: &TranscodeSettings) -> Vec<String> {
     args
 }
 
-/// A one-second software encode to `out`, for the decode tests.
-fn sample_args(encoder: &str, out: &Path) -> Vec<String> {
-    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-y"]
+/// The CUDA device a job's decode and its uploaded pictures share, by
+/// name: `-hwaccel cuda` and `hwupload_cuda` would each make a CUDA
+/// context of their own, and `overlay_cuda` takes frames of one.
+pub fn cuda_device_args() -> Vec<String> {
+    [
+        "-init_hw_device",
+        "cuda=gpu",
+        "-filter_hw_device",
+        "gpu",
+        "-hwaccel",
+        "cuda",
+        "-hwaccel_device",
+        "gpu",
+        "-hwaccel_output_format",
+        "cuda",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// The end of a CUDA filter test: H.264 on NVENC, from the frames on
+/// the GPU, written nowhere.
+fn nvenc_to_null(args: &mut Vec<String>) {
+    args.extend(["-c:v", "h264_nvenc", "-f", "null", "-"].map(String::from));
+}
+
+/// The H.264 sample decoded on NVDEC, its frames kept on the GPU, scaled
+/// there to 360 lines and an even width, and encoded on NVENC: what a
+/// job scaling on CUDA runs.
+fn cuda_scale_args(sample: &Path) -> Vec<String> {
+    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error"]
         .map(String::from)
         .to_vec();
+    args.extend(hwaccel_args(Hardware::Nvenc, Path::new(""), true));
+    args.extend([
+        "-i".into(),
+        sample.display().to_string(),
+        "-vf".into(),
+        "scale_cuda=w=-2:h=360:format=nv12".into(),
+    ]);
+    nvenc_to_null(&mut args);
+    args
+}
+
+/// The H.264 sample decoded on NVDEC with half-transparent pictures
+/// uploaded to the same device and laid over it, as burned-in subtitles
+/// are: `overlay_cuda` lays `yuva420p` over `yuv420p` only.
+fn cuda_overlay_args(sample: &Path) -> Vec<String> {
+    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error"]
+        .map(String::from)
+        .to_vec();
+    args.extend(cuda_device_args());
+    args.extend(["-i".into(), sample.display().to_string()]);
     args.extend(
         [
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=size=1280x720:rate=30",
-            "-t",
-            "1",
-            "-pix_fmt",
-            "yuv420p",
+            "color=c=white@0.5:size=640x80:rate=30:duration=1,format=yuva420p",
+            "-filter_complex",
+            "[1:v]hwupload[pictures];[0:v]scale_cuda=format=yuv420p[video];\
+             [video][pictures]overlay_cuda=y=600[v]",
+            "-map",
+            "[v]",
         ]
         .map(String::from),
     );
-    args.extend(["-c:v".into(), encoder.into(), out.display().to_string()]);
+    nvenc_to_null(&mut args);
     args
+}
+
+/// A sample the hardware decoders are tried on: a second of test pattern
+/// encoded in software.
+struct Sample {
+    codec: VideoCodec,
+    bit_depth: u32,
+    /// The software encoder that makes it.
+    encoder: &'static str,
+    pixel_format: &'static str,
+    /// Options that keep a slow encoder within a second or two.
+    options: &'static [&'static str],
+    /// Tried on every family, or on NVDEC alone (`tried_on`).
+    every_family: bool,
+}
+
+/// The decode tests' samples. The 8-bit H.264, HEVC and AV1 ones are
+/// tried on every family, as before PX-27. NVDEC also takes 10-bit HEVC
+/// and AV1 (HDR sources; Pascal has no AV1 at all) and VP9: its decodes
+/// are trusted only as far as its tests went (`decodes_depth`), where
+/// VA-API's are settled by `gpu_decodes` in the server and a GPU decode
+/// failure's rerun in software.
+const SAMPLES: [Sample; 6] = [
+    Sample {
+        codec: VideoCodec::H264,
+        bit_depth: 8,
+        encoder: "libx264",
+        pixel_format: "yuv420p",
+        options: &[],
+        every_family: true,
+    },
+    Sample {
+        codec: VideoCodec::Hevc,
+        bit_depth: 8,
+        encoder: "libx265",
+        pixel_format: "yuv420p",
+        options: &[],
+        every_family: true,
+    },
+    Sample {
+        codec: VideoCodec::Hevc,
+        bit_depth: 10,
+        encoder: "libx265",
+        pixel_format: "yuv420p10le",
+        options: &["-preset", "ultrafast"],
+        every_family: false,
+    },
+    Sample {
+        codec: VideoCodec::Av1,
+        bit_depth: 8,
+        encoder: "libsvtav1",
+        pixel_format: "yuv420p",
+        options: &[],
+        every_family: true,
+    },
+    Sample {
+        codec: VideoCodec::Av1,
+        bit_depth: 10,
+        encoder: "libsvtav1",
+        pixel_format: "yuv420p10le",
+        options: &["-preset", "12"],
+        every_family: false,
+    },
+    Sample {
+        codec: VideoCodec::Vp9,
+        bit_depth: 8,
+        encoder: "libvpx-vp9",
+        pixel_format: "yuv420p",
+        options: &["-deadline", "realtime", "-cpu-used", "8"],
+        every_family: false,
+    },
+];
+
+impl Sample {
+    /// The families to try this sample on, of `families`. NVDEC decodes
+    /// only for an NVENC encode, so NVDEC's own samples are made only
+    /// where an NVENC encoder works: a host without one spends no time
+    /// on them.
+    fn tried_on(&self, families: &[Hardware], video: &[VideoEncoder]) -> Vec<Hardware> {
+        if self.every_family {
+            return families.to_vec();
+        }
+        let nvenc = video.iter().any(|e| e.hardware == Some(Hardware::Nvenc));
+        families
+            .iter()
+            .copied()
+            .filter(|h| *h == Hardware::Nvenc && nvenc)
+            .collect()
+    }
+
+    /// A one-second software encode to `out`.
+    fn args(&self, out: &Path) -> Vec<String> {
+        let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-y"]
+            .map(String::from)
+            .to_vec();
+        args.extend(
+            [
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=1280x720:rate=30",
+                "-t",
+                "1",
+                "-pix_fmt",
+                self.pixel_format,
+                "-c:v",
+                self.encoder,
+            ]
+            .map(String::from),
+        );
+        args.extend(self.options.iter().map(|o| (*o).to_owned()));
+        args.push(out.display().to_string());
+        args
+    }
 }
 
 /// The real ffmpeg.
@@ -525,10 +935,10 @@ impl FfmpegCommand {
 }
 
 /// What a test encode or decode may use: an encode's memory (less, and an
-/// encoder that works would be left out), the GPU, and its scratch
-/// directory.
-fn test_jail(scratch: Option<&Path>) -> Jail {
-    let jail = Jail::new(Limits::encode(64 << 20)).gpu(true);
+/// encoder that works would be left out), the GPU it tests, and its
+/// scratch directory.
+fn test_jail(scratch: Option<&Path>, gpu: GpuUse) -> Jail {
+    let jail = Jail::new(Limits::encode(64 << 20)).gpu(gpu);
     match scratch {
         Some(dir) => jail.writes(dir),
         None => jail,
@@ -541,7 +951,7 @@ impl Ffmpeg for FfmpegCommand {
         let path = self.tool.program().display();
         let mut command = self
             .tool
-            .command(&test_jail(None))
+            .command(&test_jail(None, GpuUse::None))
             .map_err(|e| format!("cannot run {path}: {e}"))?;
         let output = tokio::time::timeout(
             self.timeout,
@@ -560,22 +970,52 @@ impl Ffmpeg for FfmpegCommand {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    async fn succeeds(&self, args: &[String], scratch: &Path) -> bool {
-        let Ok(mut command) = self.tool.command(&test_jail(Some(scratch))) else {
-            return false;
-        };
+    async fn succeeds(&self, args: &[String], scratch: &Path, gpu: GpuUse) -> Result<(), String> {
+        let path = self.tool.program().display();
+        let mut command = self
+            .tool
+            .command(&test_jail(Some(scratch), gpu))
+            .map_err(|e| format!("cannot run {path}: {e}"))?;
         let run = command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .status();
-        matches!(
-            tokio::time::timeout(self.timeout, run).await,
-            Ok(Ok(status)) if status.success()
-        )
+            .output();
+        let output = tokio::time::timeout(self.timeout, run)
+            .await
+            .map_err(|_| format!("{path} took over {:?}", self.timeout))?
+            .map_err(|e| format!("cannot run {path}: {e}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(last_words(&output.stderr, output.status))
     }
+}
+
+/// What a failed ffmpeg said last: its last two lines on stderr, each cut
+/// short, after how it ended.
+fn last_words(stderr: &[u8], status: std::process::ExitStatus) -> String {
+    const LINES: usize = 2;
+    const LONGEST: usize = 300;
+    let stderr = String::from_utf8_lossy(stderr);
+    let mut lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(LINES)
+        .map(|line| match line.char_indices().nth(LONGEST) {
+            Some((at, _)) => &line[..at],
+            None => line,
+        })
+        .collect();
+    if lines.is_empty() {
+        return format!("{status}, saying nothing");
+    }
+    lines.reverse();
+    format!("{status}: {}", lines.join(" / "))
 }
 
 #[cfg(test)]
@@ -610,13 +1050,24 @@ mod tests {
             .unwrap())
         }
 
-        async fn succeeds(&self, args: &[String], _scratch: &Path) -> bool {
+        async fn succeeds(
+            &self,
+            args: &[String],
+            _scratch: &Path,
+            _gpu: GpuUse,
+        ) -> Result<(), String> {
             self.runs.lock().push(args.to_vec());
             // A sample encode writes a file; a decode names its hwaccel; a
             // filter test, its filter.
-            let filter = ["tonemap_vaapi", "overlay_vaapi"]
-                .into_iter()
-                .find(|f| args.iter().any(|a| a.contains(f)));
+            // `overlay_cuda`'s test scales on CUDA too: named first.
+            let filter = [
+                "tonemap_vaapi",
+                "overlay_vaapi",
+                "overlay_cuda",
+                "scale_cuda",
+            ]
+            .into_iter()
+            .find(|f| args.iter().any(|a| a.contains(f)));
             let name = filter
                 .map(str::to_owned)
                 .or_else(|| {
@@ -630,7 +1081,11 @@ mod tests {
                         .map(|i| format!("decode_{}", args[i + 1]))
                 })
                 .unwrap();
-            self.works.iter().any(|w| *w == name)
+            if self.works.iter().any(|w| *w == name) {
+                Ok(())
+            } else {
+                Err("refused".into())
+            }
         }
     }
 
@@ -845,6 +1300,433 @@ mod tests {
             .map(|v| v.name.as_str())
             .collect();
         assert_eq!(h264, ["h264_nvenc", "h264_vaapi", "libx264"]);
+    }
+
+    /// A host's ffmpeg by the encoders whose test encode works, and the
+    /// samples each hwaccel decodes, as `cuda:hevc-10` (sample
+    /// `sample-hevc-10.mkv` through `-hwaccel cuda`).
+    struct Host {
+        encodes: Vec<&'static str>,
+        decodes: Vec<&'static str>,
+        /// The CUDA filters whose test works: `scale_cuda`, `overlay_cuda`.
+        filters: Vec<&'static str>,
+        runs: Mutex<Vec<Vec<String>>>,
+        /// Each run's arguments, with the GPU its jail was given.
+        gpus: Mutex<Vec<(Vec<String>, GpuUse)>>,
+    }
+
+    impl Host {
+        fn new(encodes: &[&'static str], decodes: &[&'static str]) -> Self {
+            Self {
+                encodes: encodes.to_vec(),
+                decodes: decodes.to_vec(),
+                filters: Vec::new(),
+                runs: Mutex::default(),
+                gpus: Mutex::default(),
+            }
+        }
+
+        /// This host, its CUDA filter tests working for `filters`.
+        fn running(self, filters: &[&'static str]) -> Self {
+            Self {
+                filters: filters.to_vec(),
+                ..self
+            }
+        }
+
+        /// The runs whose arguments contain `arg`.
+        fn runs_with(&self, arg: &str) -> Vec<Vec<String>> {
+            let runs = self.runs.lock();
+            runs.iter()
+                .filter(|r| r.iter().any(|a| a == arg))
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl Ffmpeg for Host {
+        async fn encoders(&self) -> Result<String, String> {
+            Recorded::new(&[]).encoders().await
+        }
+
+        async fn succeeds(
+            &self,
+            args: &[String],
+            _scratch: &Path,
+            gpu: GpuUse,
+        ) -> Result<(), String> {
+            self.runs.lock().push(args.to_vec());
+            self.gpus.lock().push((args.to_vec(), gpu));
+            let works = self.works(args);
+            if works { Ok(()) } else { Err("refused".into()) }
+        }
+    }
+
+    impl Host {
+        fn works(&self, args: &[String]) -> bool {
+            let after = |flag: &str| {
+                args.iter()
+                    .position(|a| a == flag)
+                    .map(|i| args[i + 1].as_str())
+            };
+            // A CUDA filter test decodes the sample too: told apart by its
+            // filter, `overlay_cuda`'s first as it scales on CUDA too.
+            if let Some(filter) = ["overlay_cuda", "scale_cuda"]
+                .into_iter()
+                .find(|f| args.iter().any(|a| a.contains(f)))
+            {
+                return self.filters.contains(&filter);
+            }
+            if let Some(hwaccel) = after("-hwaccel") {
+                let input = Path::new(after("-i").unwrap());
+                let stem = input.file_stem().unwrap().to_str().unwrap();
+                let sample = stem.strip_prefix("sample-").unwrap();
+                return self
+                    .decodes
+                    .contains(&format!("{hwaccel}:{sample}").as_str());
+            }
+            if args.iter().any(|a| a.contains("_vaapi=")) {
+                return false;
+            }
+            after("-c:v").is_some_and(|name| self.encodes.contains(&name))
+        }
+    }
+
+    /// A GTX 1060 (Pascal): NVENC encodes H.264 and HEVC; NVDEC decodes
+    /// H.264, 8- and 10-bit HEVC and VP9, but no AV1; CUDA scales and
+    /// overlays.
+    fn gtx_1060() -> Host {
+        gtx_1060_without_filters().running(&["scale_cuda", "overlay_cuda"])
+    }
+
+    /// `gtx_1060()` with neither CUDA filter working: an ffmpeg without
+    /// them, or a driver without `libnvidia-ptxjitcompiler`.
+    fn gtx_1060_without_filters() -> Host {
+        Host::new(
+            &[
+                "h264_nvenc",
+                "hevc_nvenc",
+                "libx264",
+                "libx265",
+                "libsvtav1",
+                "libvpx-vp9",
+            ],
+            &["cuda:h264-8", "cuda:hevc-8", "cuda:hevc-10", "cuda:vp9-8"],
+        )
+    }
+
+    fn nvenc_only() -> TranscodeSettings {
+        TranscodeSettings {
+            hardware: HardwarePolicy::Ordered(vec![Hardware::Nvenc]),
+            ..TranscodeSettings::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn nvdec_is_probed_per_codec_and_depth_through_cuda() {
+        let host = gtx_1060();
+        let e = detect(&host, &nvenc_only(), scratch("nvdec").await.as_ref()).await;
+        let found: Vec<String> = e.hardware_decoders.iter().map(|d| d.label()).collect();
+        assert_eq!(
+            found,
+            [
+                "h264 (nvdec)",
+                "hevc (nvdec)",
+                "hevc 10-bit (nvdec)",
+                "vp9 (nvdec)"
+            ]
+        );
+        assert!(e.decodes_depth(VideoCodec::Hevc, 10, Hardware::Nvenc));
+        assert!(e.decodes_depth(VideoCodec::Hevc, 8, Hardware::Nvenc));
+        // Pascal has no AV1, of either depth; and nothing is 12-bit.
+        assert!(!e.decodes(VideoCodec::Av1, Hardware::Nvenc));
+        assert!(!e.decodes_depth(VideoCodec::Hevc, 12, Hardware::Nvenc));
+        // Each decode through CUDA, the frames kept on the GPU so a
+        // decode NVDEC cannot do fails rather than falling back.
+        // (The CUDA filter tests decode too, and encode: not these.)
+        let decodes: Vec<Vec<String>> = host
+            .runs_with("-hwaccel")
+            .into_iter()
+            .filter(|r| !r.iter().any(|a| a == "-c:v"))
+            .collect();
+        assert_eq!(decodes.len(), 6, "every sample: {decodes:?}");
+        for run in &decodes {
+            let joined = run.join(" ");
+            assert!(
+                joined.contains("-hwaccel cuda -hwaccel_output_format cuda"),
+                "{joined}"
+            );
+        }
+        // The 10-bit samples are 10-bit.
+        let ten_bit = host.runs_with("yuv420p10le");
+        let encoders: Vec<&str> = ten_bit
+            .iter()
+            .map(|r| r[r.iter().position(|a| a == "-c:v").unwrap() + 1].as_str())
+            .collect();
+        assert_eq!(encoders, ["libx265", "libsvtav1"]);
+    }
+
+    /// PX-28: what a family's failed tests say it lacks, for the one
+    /// line the server logs of a family it names: a GTX 1060's NVENC
+    /// has no AV1 encode, and NVDEC no AV1 of either depth.
+    #[tokio::test]
+    async fn a_family_s_failed_tests_say_what_it_lacks() {
+        let e = detect(&gtx_1060(), &nvenc_only(), scratch("lacks").await.as_ref()).await;
+        assert_eq!(
+            e.lacks(Hardware::Nvenc),
+            ["av1 encode", "av1 decode", "av1 10-bit decode"]
+        );
+        assert!(e.unusable.is_empty());
+        let test: Vec<&str> = e.failed.iter().map(|f| f.test.as_str()).collect();
+        assert_eq!(
+            test,
+            [
+                "av1_nvenc",
+                "decode av1 (nvdec)",
+                "decode av1 10-bit (nvdec)"
+            ]
+        );
+        assert!(e.failed.iter().all(|f| f.stderr == "refused"));
+    }
+
+    /// The transcoding line at start names what NVDEC decodes.
+    #[tokio::test]
+    async fn the_summary_lists_nvdec_codecs() {
+        let e = detect(
+            &gtx_1060(),
+            &nvenc_only(),
+            scratch("nvdec-summary").await.as_ref(),
+        )
+        .await;
+        assert!(
+            e.summary().contains(
+                "hardware decoders: h264 (nvdec), hevc (nvdec), hevc 10-bit (nvdec), vp9 (nvdec)"
+            ),
+            "{}",
+            e.summary()
+        );
+    }
+
+    /// NVDEC is used only for an NVENC encode: with no NVENC encoder its
+    /// own samples (10-bit, VP9) are not made, and VA-API is tried on the
+    /// 8-bit ones as before.
+    #[tokio::test]
+    async fn nvdec_samples_are_made_only_where_nvenc_encodes() {
+        let host = Host::new(
+            &[
+                "h264_vaapi",
+                "libx264",
+                "libx265",
+                "libsvtav1",
+                "libvpx-vp9",
+            ],
+            &["vaapi:h264-8", "vaapi:hevc-8", "cuda:hevc-10"],
+        );
+        let e = detect(
+            &host,
+            &TranscodeSettings::default(),
+            scratch("no-nvenc").await.as_ref(),
+        )
+        .await;
+        assert!(host.runs_with("yuv420p10le").is_empty());
+        assert!(host.runs_with("libvpx-vp9").is_empty());
+        let found: Vec<String> = e.hardware_decoders.iter().map(|d| d.label()).collect();
+        assert_eq!(found, ["h264 (vaapi)", "hevc (vaapi)"]);
+    }
+
+    /// Each probe's jail gets the GPU it tests and no other: NVENC and
+    /// NVDEC NVIDIA's nodes, VA-API the render node, the software sample
+    /// encodes none.
+    #[tokio::test]
+    async fn each_probe_runs_with_the_gpu_it_tests_only() {
+        let host = Host::new(
+            &["h264_nvenc", "h264_vaapi", "libx264", "libx265"],
+            &["cuda:h264-8", "vaapi:h264-8"],
+        );
+        let settings = TranscodeSettings {
+            hardware: HardwarePolicy::Ordered(vec![Hardware::Nvenc, Hardware::Vaapi]),
+            ..TranscodeSettings::default()
+        };
+        detect(&host, &settings, scratch("probe-gpus").await.as_ref()).await;
+        let gpus = host.gpus.lock();
+        let gpu_of = |wanted: &dyn Fn(&str) -> bool| -> Vec<GpuUse> {
+            gpus.iter()
+                .filter(|(args, _)| args.iter().any(|a| wanted(a)))
+                .map(|(_, gpu)| *gpu)
+                .collect()
+        };
+        let nvidia = gpu_of(&|a| a.ends_with("_nvenc") || a == "cuda");
+        assert!(!nvidia.is_empty());
+        assert!(nvidia.iter().all(|g| *g == GpuUse::Nvidia), "{nvidia:?}");
+        let vaapi = gpu_of(&|a| a.ends_with("_vaapi") || a == "vaapi");
+        assert!(!vaapi.is_empty());
+        assert!(vaapi.iter().all(|g| *g == GpuUse::Vaapi), "{vaapi:?}");
+        let software = gpu_of(&|a| a == "libx264" || a == "libx265");
+        assert!(!software.is_empty());
+        assert!(software.iter().all(|g| *g == GpuUse::None), "{software:?}");
+    }
+
+    /// A failed test says what ffmpeg said last on stderr, and only that:
+    /// a stand-in ffmpeg that fails as NVENC without its driver does.
+    #[tokio::test]
+    async fn a_failed_test_says_what_ffmpeg_said_last() {
+        let dir = scratch("last-words").await;
+        let script = dir.join("ffmpeg");
+        let source = dir.join("ffmpeg.txt");
+        std::fs::write(
+            &source,
+            "#!/bin/sh\n\
+             echo 'Input #0, lavfi' >&2\n\
+             echo '[h264_nvenc @ 0x1] Cannot load libcuda.so.1' >&2\n\
+             echo '[vost#0:0/h264_nvenc @ 0x2] Error while opening encoder' >&2\n\
+             exit 1\n",
+        )
+        .unwrap();
+        let installed = std::process::Command::new("install")
+            .args(["-m", "755"])
+            .arg(&source)
+            .arg(&script)
+            .status()
+            .unwrap();
+        assert!(installed.success());
+        let ffmpeg = FfmpegCommand::new(Tool::unconfined(&script));
+        let why = ffmpeg
+            .succeeds(&[], dir.as_ref(), GpuUse::Nvidia)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            why,
+            "exit status: 1: [h264_nvenc @ 0x1] Cannot load libcuda.so.1 / \
+             [vost#0:0/h264_nvenc @ 0x2] Error while opening encoder"
+        );
+    }
+
+    /// PX-29: where NVENC and NVDEC work, `scale_cuda` and `overlay_cuda`
+    /// are each tried with a short run on NVIDIA's GPU: the H.264 sample
+    /// decoded on CUDA, the frames kept there, filtered and encoded on
+    /// NVENC.
+    #[tokio::test]
+    async fn cuda_filters_are_found_where_nvidia_runs_them() {
+        let host = gtx_1060();
+        let e = detect(&host, &nvenc_only(), scratch("cuda-filters").await.as_ref()).await;
+        assert!(e.cuda_scale && e.cuda_overlay);
+        // VA-API's are not NVIDIA's.
+        assert!(!e.gpu_tonemap && !e.gpu_overlay);
+        let gpus = host.gpus.lock();
+        let test = |filter: &str| {
+            gpus.iter()
+                .find(|(args, _)| args.iter().any(|a| a.contains(filter)))
+                .cloned()
+                .unwrap_or_else(|| panic!("no {filter} test"))
+        };
+        let (scale, gpu) = test("scale_cuda=w=-2");
+        assert_eq!(gpu, GpuUse::Nvidia);
+        let joined = scale.join(" ");
+        assert!(
+            joined.contains("-hwaccel cuda -hwaccel_output_format cuda -i ")
+                && joined.contains("sample-h264-8.mkv")
+                && joined.contains("-vf scale_cuda=w=-2:h=360:format=nv12 -c:v h264_nvenc"),
+            "{joined}"
+        );
+        let (overlay, gpu) = test("overlay_cuda");
+        assert_eq!(gpu, GpuUse::Nvidia);
+        let joined = overlay.join(" ");
+        // One named device for the decode and the pictures' upload.
+        assert!(
+            joined.contains(
+                "-init_hw_device cuda=gpu -filter_hw_device gpu -hwaccel cuda \
+                 -hwaccel_device gpu -hwaccel_output_format cuda"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("[1:v]hwupload[pictures]")
+                && joined.contains("scale_cuda=format=yuv420p")
+                && joined.contains("-c:v h264_nvenc"),
+            "{joined}"
+        );
+    }
+
+    /// A CUDA filter test that fails leaves that filter on the CPU, and
+    /// the family's one info line says it lacks it.
+    #[tokio::test]
+    async fn a_cuda_filter_that_fails_is_lacked() {
+        let host = gtx_1060_without_filters().running(&["scale_cuda"]);
+        let e = detect(&host, &nvenc_only(), scratch("cuda-overlay").await.as_ref()).await;
+        assert!(e.cuda_scale);
+        assert!(!e.cuda_overlay);
+        assert_eq!(
+            e.lacks(Hardware::Nvenc),
+            ["av1 encode", "av1 decode", "av1 10-bit decode", "overlay"]
+        );
+        let host = gtx_1060_without_filters();
+        let e = detect(&host, &nvenc_only(), scratch("cuda-none").await.as_ref()).await;
+        assert!(!e.cuda_scale && !e.cuda_overlay);
+        let failed: Vec<&str> = e.failed.iter().map(|f| f.test.as_str()).collect();
+        assert!(
+            failed.ends_with(&["scale_cuda", "overlay_cuda"]),
+            "{failed:?}"
+        );
+    }
+
+    /// No CUDA filter test where NVDEC did not decode the H.264 sample,
+    /// or no NVENC encoder works: the filters feed one from the other.
+    #[tokio::test]
+    async fn cuda_filters_are_not_tried_without_nvdec_and_nvenc() {
+        let no_nvdec = Host::new(&["h264_nvenc", "libx264", "libx265"], &["cuda:hevc-8"])
+            .running(&["scale_cuda", "overlay_cuda"]);
+        let e = detect(
+            &no_nvdec,
+            &nvenc_only(),
+            scratch("cuda-no-nvdec").await.as_ref(),
+        )
+        .await;
+        assert!(!e.cuda_scale && !e.cuda_overlay);
+        assert!(no_nvdec.runs_with("-filter_complex").is_empty());
+        assert!(
+            e.lacks(Hardware::Nvenc)
+                .iter()
+                .all(|l| !l.contains("scale"))
+        );
+        let vaapi = Host::new(&["h264_vaapi", "libx264"], &["vaapi:h264-8", "cuda:h264-8"])
+            .running(&["scale_cuda", "overlay_cuda"]);
+        let e = detect(
+            &vaapi,
+            &TranscodeSettings::default(),
+            scratch("cuda-no-nvenc").await.as_ref(),
+        )
+        .await;
+        assert!(!e.cuda_scale && !e.cuda_overlay);
+        let runs = vaapi.runs.lock();
+        assert!(runs.iter().all(|r| !r.iter().any(|a| a.contains("_cuda"))));
+    }
+
+    /// The transcoding line says what each family filters on the GPU.
+    #[test]
+    fn the_summary_names_each_family_s_gpu_filters() {
+        let mut e = Encoders::software_baseline();
+        assert!(
+            e.summary().ends_with("GPU filters: none"),
+            "{}",
+            e.summary()
+        );
+        (e.gpu_tonemap, e.gpu_overlay) = (true, true);
+        (e.cuda_scale, e.cuda_overlay) = (true, true);
+        assert!(
+            e.summary()
+                .ends_with("GPU filters: vaapi: tone map, overlay; nvenc: scale, overlay"),
+            "{}",
+            e.summary()
+        );
+        e.gpu_tonemap = false;
+        e.gpu_overlay = false;
+        e.cuda_overlay = false;
+        assert!(
+            e.summary().ends_with("GPU filters: nvenc: scale"),
+            "{}",
+            e.summary()
+        );
     }
 
     #[test]

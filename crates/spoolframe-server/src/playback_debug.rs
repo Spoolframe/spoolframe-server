@@ -39,6 +39,9 @@ pub struct PlaybackDebug {
     pub transcoding: Arc<Transcoding>,
     pub subtitles: Arc<Subtitles>,
     pub previews: Arc<Previews>,
+    /// For `transcode.gpu_filters`, which decides where a plan's video
+    /// encode runs (PX-28); none in tests that run no encode.
+    pub jobs: Option<Arc<crate::encode::job::Jobs>>,
 }
 
 impl std::fmt::Debug for PlaybackDebug {
@@ -325,6 +328,7 @@ pub fn plan_view(
     d: Option<&MediaDescriptor>,
     selection: Selection,
     encoders: &Encoders,
+    gpu_filters: bool,
 ) -> api::PlanView {
     use api::{StreamKind as K, StreamOut as Out};
     let empty = MediaDescriptor {
@@ -336,7 +340,6 @@ pub fn plan_view(
         subtitles: Vec::new(),
     };
     let d = d.unwrap_or(&empty);
-    let encoder = |codec: VideoCodec| encoders.video_encoder(codec).map(|e| e.name.clone());
     let audio_encoder = |codec: AudioCodec| encoders.audio_encoder(codec).map(|e| e.name.clone());
     let mut rows: Vec<api::PlanStream> = Vec::new();
     let mut row = |stream, index, source: String, out| {
@@ -426,7 +429,20 @@ pub fn plan_view(
                         channels: None,
                         bitrate: *max_bitrate,
                         tone_map: *tone_map,
-                        encoder: encoder(*codec),
+                        // The one the run picks for this film (PX-28).
+                        encoder: crate::encode::args::planned_encoder(
+                            encoders,
+                            d,
+                            ConvertedVideo::Encode {
+                                codec: *codec,
+                                height: *height,
+                                max_bitrate: *max_bitrate,
+                                tone_map: *tone_map,
+                            },
+                            *subtitle,
+                            gpu_filters,
+                        )
+                        .map(|e| e.name),
                     },
                 ),
                 _ => {}
@@ -681,6 +697,10 @@ fn unix_ms() -> i64 {
 }
 
 impl PlaybackDebug {
+    fn gpu_filters(&self) -> bool {
+        self.jobs.as_ref().is_some_and(|j| j.limits().gpu_filters)
+    }
+
     /// Server › Playback.
     pub fn list(&self) -> api::PlaybackList {
         api::PlaybackList {
@@ -704,6 +724,7 @@ impl PlaybackDebug {
             descriptor.as_deref(),
             snapshot.selection,
             &self.transcoding.encoders(),
+            self.gpu_filters(),
         );
         Some(api::PlaybackDetail {
             now: unix_ms(),
@@ -840,7 +861,13 @@ impl PlaybackDebug {
                 self.subtitles.ocr(),
             ),
         };
-        Ok(plan_view(&plan, Some(&descriptor), selection, &encoders))
+        Ok(plan_view(
+            &plan,
+            Some(&descriptor),
+            selection,
+            &encoders,
+            self.gpu_filters(),
+        ))
     }
 
     /// An item's Debug tab.
@@ -1072,6 +1099,96 @@ mod tests {
             Some((api::StreamKind::Container, None))
         );
         assert_eq!(named("the client sent no capabilities"), None);
+    }
+
+    /// PX-27: a run decoded on NVDEC reaches the page as NVIDIA's API,
+    /// which the web names `NVDEC (CUDA)`.
+    #[test]
+    fn an_nvdec_decode_is_reported_as_nvidias() {
+        let decoder = api::VideoDecoder::Gpu {
+            api: gpu_api(Hardware::Nvenc),
+        };
+        assert_eq!(
+            serde_json::to_value(decoder).unwrap(),
+            serde_json::json!({ "kind": "gpu", "api": "nvidia" })
+        );
+    }
+
+    /// PX-28: the plan names the encoder the run picks for this film, not
+    /// the first for the codec: an AV1 film to H.264 on a host with a
+    /// GTX 1060 (no AV1 decode) before an AMD GPU (AV1 decode) encodes on
+    /// the AMD one.
+    #[test]
+    fn the_plan_names_the_encoder_the_run_picks() {
+        use spoolframe_media::VideoStream;
+        use spoolframe_media::encoders::{HardwareDecoder, VideoEncoder};
+
+        let encoder = |name: &str, hardware| VideoEncoder {
+            codec: VideoCodec::H264,
+            name: name.into(),
+            hardware,
+        };
+        let encoders = Encoders {
+            video: vec![
+                encoder("h264_nvenc", Some(Hardware::Nvenc)),
+                encoder("h264_vaapi", Some(Hardware::Vaapi)),
+                encoder("libx264", None),
+            ],
+            hardware_decoders: vec![HardwareDecoder {
+                codec: VideoCodec::Av1,
+                hardware: Hardware::Vaapi,
+                bit_depth: 8,
+            }],
+            ..Encoders::software_baseline()
+        };
+        let film = MediaDescriptor {
+            container: "matroska,webm".into(),
+            duration: None,
+            bit_rate: None,
+            video: Some(VideoStream {
+                index: 0,
+                codec: "av1".into(),
+                profile: None,
+                level: None,
+                width: 1920,
+                height: 1080,
+                pixel_format: Some("yuv420p".into()),
+                color_transfer: None,
+                frame_rate_millis: None,
+                bit_depth: 8,
+                hdr: None,
+            }),
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        };
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: Container::Mp4,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: None,
+                tone_map: false,
+            }),
+            audio: None,
+            subtitle: None,
+            ladder: Vec::new(),
+            reasons: Vec::new(),
+        };
+        let selection = Selection {
+            audio: None,
+            subtitle: None,
+        };
+        let view = plan_view(&plan, Some(&film), selection, &encoders, false);
+        let encoders: Vec<_> = view
+            .streams
+            .iter()
+            .filter_map(|s| match &s.out {
+                api::StreamOut::Encode { encoder, .. } => encoder.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(encoders, ["h264_vaapi"]);
     }
 
     #[test]

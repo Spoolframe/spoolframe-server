@@ -24,7 +24,7 @@ use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
 use spoolframe_media::encoders::{FfmpegCommand, TranscodeSettings};
 use spoolframe_media::ocr::Ocr;
-use spoolframe_media::sandbox::{Mode, Sandbox, Tool};
+use spoolframe_media::sandbox::{GpuDevices, Mode, Sandbox, Tool};
 use spoolframe_protocol::codec::{read_frame, write_frame};
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{ArtworkRequest, ArtworkResponse, ArtworkSize};
@@ -87,7 +87,7 @@ pub fn media_sandbox(dir: &Path) -> Sandbox {
             dir.join("endpoint.key"),
             dir.join("secrets"),
         ],
-        Vec::new(),
+        GpuDevices::default(),
     )
     .expect("this kernel has Landlock")
 }
@@ -760,6 +760,7 @@ impl TestServer {
             transcoding: services.transcoding.clone(),
             subtitles: services.subtitles.clone(),
             previews: services.previews.clone(),
+            jobs: Some(jobs.clone()),
         });
         let endpoint = EndpointOptions {
             port: options.port,

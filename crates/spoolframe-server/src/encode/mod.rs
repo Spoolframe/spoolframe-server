@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use spoolframe_media::encoders::Encoders;
+use spoolframe_media::encoders::{Encoders, Hardware};
+use spoolframe_media::sandbox::GpuUse;
 use spoolframe_media::{MediaDescriptor, codecs};
 use spoolframe_protocol::{
     AudioAction, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, ManifestKind, PlaybackPlan,
@@ -731,12 +732,12 @@ fn spawn(
             );
         }
     }
-    let gpu_encode = match video {
-        Some(ConvertedVideo::Encode { codec, .. }) => encoders
-            .video_encoder(codec)
-            .is_some_and(|e| e.hardware.is_some()),
-        _ => false,
-    };
+    // One GPU family for the whole job (PX-28): the run may open its
+    // device nodes and no other's.
+    let placement = args::placement(&spec);
+    let encoder = placement.and_then(|place| place.encoder.hardware);
+    let gpu_encode = encoder.is_some();
+    let gpu = placement.map_or(GpuUse::None, |place| place.gpu());
     // Decoding on the GPU may fail for a stream detection's test did not
     // cover: the same run decoding in software is ready for it.
     let decode = decode(&spec);
@@ -749,7 +750,7 @@ fn spawn(
             };
             Some(Fallback {
                 args: ffmpeg_args(&software).map_err(JobError::Prepare)?,
-                gpu: gpu_encode,
+                gpu: encoder.map_or(GpuUse::None, Hardware::gpu),
                 file: file.to_path_buf(),
                 made: Some(args::made(&software)),
             })
@@ -776,8 +777,7 @@ fn spawn(
             args,
             inputs,
             reads: vec![dir.to_path_buf()],
-            // The same device nodes and driver files decode as encode.
-            gpu: gpu_encode || decode != Decode::Software,
+            gpu,
             fallback,
             made,
         },
@@ -976,6 +976,7 @@ mod tests {
             hardware_decoders: vec![HardwareDecoder {
                 codec: VideoCodec::Hevc,
                 hardware: Hardware::Vaapi,
+                bit_depth: 8,
             }],
             ..Encoders::software_baseline()
         };
@@ -1011,6 +1012,246 @@ mod tests {
             next.command()
         );
         assert_eq!(next.progress().borrow().done, None);
+    }
+
+    /// PX-27: an NVENC encode decoding on NVDEC whose decode fails before
+    /// any output runs again in software, still on NVENC, and PX-24 says
+    /// which decoded: NVDEC first, software after.
+    #[tokio::test]
+    async fn an_nvdec_decode_that_fails_at_once_runs_again_in_software() {
+        use crate::encode::{Decoder, Made};
+        use spoolframe_media::VideoStream;
+        use spoolframe_media::encoders::{Hardware, HardwareDecoder, VideoEncoder};
+        use spoolframe_types::{HdrFormat, VideoCodec};
+
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-conversion-nvdec").await;
+        // Decoding through CUDA: fails after a moment, writing nothing. In
+        // software: runs on.
+        let ffmpeg = job::tests::ffmpeg(
+            &tmp.as_ref().join("bin"),
+            "case \"$*\" in *'-hwaccel cuda'*)\n\
+               sleep 1; echo 'cuInit failed' >&2; exit 1;;\n\
+             esac\n\
+             exec sleep 30",
+        );
+        let jobs = Arc::new(
+            Jobs::new(
+                JobLimits {
+                    budget: Units::jobs(1),
+                    max_remux: 32,
+                    max_gpu_jobs: 3,
+                    scratch_dir: tmp.as_ref().join("scratch"),
+                    scratch_limit_bytes: 1 << 30,
+                    read_ahead: Duration::from_secs(60),
+                    stalled_after: Duration::from_secs(60),
+                    gpu_filters: false,
+                },
+                spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
+            )
+            .unwrap(),
+        );
+        let film = tmp.as_ref().join("film.mkv");
+        std::fs::write(&film, b"x").unwrap();
+        let descriptor = Arc::new(MediaDescriptor {
+            container: "matroska,webm".into(),
+            duration: Some(Duration::from_secs(60)),
+            bit_rate: None,
+            video: Some(VideoStream {
+                index: 0,
+                codec: "hevc".into(),
+                profile: Some("Main 10".into()),
+                level: None,
+                width: 3840,
+                height: 2160,
+                pixel_format: Some("yuv420p10le".into()),
+                color_transfer: Some("smpte2084".into()),
+                frame_rate_millis: Some(24_000),
+                bit_depth: 10,
+                hdr: Some(HdrFormat::Hdr10),
+            }),
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        });
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: spoolframe_types::Container::Mp4,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: None,
+                tone_map: true,
+            }),
+            audio: None,
+            subtitle: None,
+            ladder: Vec::new(),
+            reasons: Vec::new(),
+        };
+        let encoders = Encoders {
+            video: vec![VideoEncoder {
+                codec: VideoCodec::H264,
+                name: "h264_nvenc".into(),
+                hardware: Some(Hardware::Nvenc),
+            }],
+            hardware_decoders: vec![HardwareDecoder {
+                codec: VideoCodec::Hevc,
+                hardware: Hardware::Nvenc,
+                bit_depth: 10,
+            }],
+            ..Encoders::software_baseline()
+        };
+        let conversion = Conversion::start(
+            jobs.clone(),
+            ConversionSource {
+                handle: "h1",
+                path: &film,
+                descriptor,
+                plan: &plan,
+                encoders: Arc::new(encoders),
+                vaapi_device: Path::new("/dev/dri/renderD128"),
+                keyframes: None,
+                first_epoch: 0,
+                slot: None,
+                start_rung: 0,
+            },
+            None,
+        )
+        .unwrap();
+        let job = conversion.job();
+        let decoder = |job: &EncodeJob| job.made().map(|m: Made| m.decoder);
+        let first = job.command().join(" ");
+        assert!(first.contains("-hwaccel cuda -i"), "{first}");
+        assert!(first.contains("-c:v h264_nvenc"), "{first}");
+        assert_eq!(decoder(&job), Some(Decoder::Hardware(Hardware::Nvenc)));
+        job::tests::eventually(|| !job.command().contains(&"-hwaccel".to_owned())).await;
+        let rerun = job.command().join(" ");
+        assert!(rerun.contains("-c:v h264_nvenc"), "{rerun}");
+        assert_eq!(decoder(&job), Some(Decoder::Software));
+        assert!(!job.decodes_in_hardware());
+        assert!(jobs.hardware_decode_failed(&film));
+        assert_eq!(job.progress().borrow().done, None);
+    }
+
+    /// PX-29: an NVENC encode filtering on CUDA weighs as one all on the
+    /// GPU, and a CUDA filter that fails before any output (a driver
+    /// without the PTX JIT, say) runs it again as a failed VA-API filter
+    /// does: decoded in software, filtered on the CPU, still on NVENC.
+    #[tokio::test]
+    async fn a_cuda_filter_that_fails_at_once_runs_again_on_the_cpu() {
+        use crate::encode::{Decoder, Made};
+        use spoolframe_media::VideoStream;
+        use spoolframe_media::encoders::{Hardware, HardwareDecoder, VideoEncoder};
+        use spoolframe_types::VideoCodec;
+
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-conversion-cuda").await;
+        let ffmpeg = job::tests::ffmpeg(
+            &tmp.as_ref().join("bin"),
+            "case \"$*\" in *scale_cuda*)\n\
+               sleep 1; echo 'cuModuleLoadData failed' >&2; exit 1;;\n\
+             esac\n\
+             exec sleep 30",
+        );
+        let jobs = Arc::new(
+            Jobs::new(
+                JobLimits {
+                    budget: Units::jobs(1),
+                    max_remux: 32,
+                    max_gpu_jobs: 3,
+                    scratch_dir: tmp.as_ref().join("scratch"),
+                    scratch_limit_bytes: 1 << 30,
+                    read_ahead: Duration::from_secs(60),
+                    stalled_after: Duration::from_secs(60),
+                    gpu_filters: true,
+                },
+                spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
+            )
+            .unwrap(),
+        );
+        let film = tmp.as_ref().join("film.mkv");
+        std::fs::write(&film, b"x").unwrap();
+        let descriptor = Arc::new(MediaDescriptor {
+            container: "matroska,webm".into(),
+            duration: Some(Duration::from_secs(60)),
+            bit_rate: None,
+            video: Some(VideoStream {
+                index: 0,
+                codec: "hevc".into(),
+                profile: Some("Main".into()),
+                level: None,
+                width: 3840,
+                height: 2160,
+                pixel_format: Some("yuv420p".into()),
+                color_transfer: None,
+                frame_rate_millis: Some(24_000),
+                bit_depth: 8,
+                hdr: None,
+            }),
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        });
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: spoolframe_types::Container::Mp4,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: None,
+                tone_map: false,
+            }),
+            audio: None,
+            subtitle: None,
+            ladder: Vec::new(),
+            reasons: Vec::new(),
+        };
+        let encoders = Encoders {
+            video: vec![VideoEncoder {
+                codec: VideoCodec::H264,
+                name: "h264_nvenc".into(),
+                hardware: Some(Hardware::Nvenc),
+            }],
+            hardware_decoders: vec![HardwareDecoder {
+                codec: VideoCodec::Hevc,
+                hardware: Hardware::Nvenc,
+                bit_depth: 8,
+            }],
+            cuda_scale: true,
+            cuda_overlay: true,
+            ..Encoders::software_baseline()
+        };
+        let conversion = Conversion::start(
+            jobs.clone(),
+            ConversionSource {
+                handle: "h1",
+                path: &film,
+                descriptor,
+                plan: &plan,
+                encoders: Arc::new(encoders),
+                vaapi_device: Path::new("/dev/dri/renderD128"),
+                keyframes: None,
+                first_epoch: 0,
+                slot: None,
+                start_rung: 0,
+            },
+            None,
+        )
+        .unwrap();
+        let job = conversion.job();
+        assert_eq!(job.slot().map(|slot| slot.load()), Some(Load::GpuOnly));
+        let decoder = |job: &EncodeJob| job.made().map(|m: Made| m.decoder);
+        let first = job.command().join(" ");
+        assert!(
+            first.contains("-hwaccel cuda -hwaccel_output_format cuda -i"),
+            "{first}"
+        );
+        assert!(first.contains("scale_cuda=w=-2:h=1080"), "{first}");
+        assert_eq!(decoder(&job), Some(Decoder::Hardware(Hardware::Nvenc)));
+        job::tests::eventually(|| !job.command().contains(&"-hwaccel".to_owned())).await;
+        let rerun = job.command().join(" ");
+        assert!(rerun.contains("scale=-2:1080,format=yuv420p"), "{rerun}");
+        assert!(!rerun.contains("scale_cuda"), "{rerun}");
+        assert!(rerun.contains("-c:v h264_nvenc"), "{rerun}");
+        assert_eq!(decoder(&job), Some(Decoder::Software));
+        assert!(jobs.hardware_decode_failed(&film));
+        assert_eq!(job.progress().borrow().done, None);
     }
 
     #[test]

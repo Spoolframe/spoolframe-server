@@ -350,7 +350,7 @@ impl StatusSource {
                 hardware_decoders: encoders
                     .hardware_decoders
                     .iter()
-                    .map(|d| format!("{} ({:?})", d.codec, d.hardware).to_lowercase())
+                    .map(|d| d.label())
                     .collect(),
                 gpu_filters: self.jobs.as_ref().is_some_and(|j| j.limits().gpu_filters),
                 gpu_tonemap: encoders.gpu_tonemap,

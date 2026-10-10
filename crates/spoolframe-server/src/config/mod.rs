@@ -696,8 +696,14 @@ impl PreviewsConfig {
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct TranscodeConfig {
     /// `"auto"` (every family that works), `"none"` for software only, or
-    /// a list of families in order of preference: `["nvenc", "vaapi"]`
-    /// encodes on NVIDIA what it can and the rest on VA-API.
+    /// a list of families in order of preference: `["nvenc", "vaapi"]`.
+    /// Each video encode runs on one family (PX-28): the one that does
+    /// the most of it, decoding the source, then running its filters
+    /// (tone map, picture burn-in, scale) on the GPU too, the order
+    /// deciding between equals. So on a GTX 1060 beside an AMD GPU, an
+    /// AV1 film, which Pascal cannot decode, encodes on the AMD one,
+    /// and a film both decode on NVIDIA unless the AMD GPU also runs its
+    /// filters; a codec neither encodes, in software.
     #[ucl(default, map = "hardware_setting")]
     pub hardware: Option<HardwareSetting>,
     #[ucl(default)]
@@ -725,8 +731,11 @@ pub struct TranscodeConfig {
     /// Any value works: 0 holds the encode whenever its reader is behind.
     #[ucl(default)]
     pub read_ahead_secs: Option<u64>,
-    /// Tone map and burn in picture subtitles on the GPU, where its driver
-    /// can, rather than on the CPU; off if left out.
+    /// Run a GPU encode's filters on the GPU, where it can, rather than on
+    /// the CPU: on VA-API the tone map (`tonemap_vaapi`) and picture
+    /// burn-in (`overlay_vaapi`); on NVIDIA the scale (`scale_cuda`) and
+    /// picture burn-in (`overlay_cuda`), NVIDIA's tone map staying on the
+    /// CPU. Off if left out.
     #[ucl(default)]
     pub gpu_filters: Option<bool>,
 }

@@ -7,10 +7,11 @@
 //! - **Landlock**, when [`Mode`] lets it confine: the system's programs and
 //!   libraries (the nix store, `/usr`, …) to read and run; each input file
 //!   to read, by the inode the server opened and checked; the directories
-//!   the run was given, to read or write. Nothing else: not the state
-//!   directory, not systemd's credentials, not `/home`, not `/proc`. No TCP
-//!   connect or bind (ABI 4), no signal or abstract Unix socket out of the
-//!   run (ABI 6).
+//!   the run was given, to read or write; the device nodes of the GPU it
+//!   uses ([`GpuUse`]) and no other's. Nothing else: not the state
+//!   directory, not systemd's credentials, not `/home`, not `/proc` (but
+//!   for one exception, below). No TCP connect or bind (ABI 4), no signal
+//!   or abstract Unix socket out of the run (ABI 6).
 //! - **seccomp**, unless `off`: no new processes (threads only), no sockets
 //!   but Unix ones and no `connect` at all, and none of the calls an escape
 //!   uses: `ptrace`, `mount`, namespaces, keyrings, `bpf`, `io_uring`, …
@@ -21,14 +22,37 @@
 //!
 //! Everything is made before the fork: the ruleset (its file descriptor
 //! holds the rules) and the BPF. After the fork the child only calls
-//! setrlimit(2), prctl(2) and landlock_restrict_self(2), and allocates
-//! nothing: the server is multithreaded, and another thread may have held
-//! the allocator's lock when it forked.
+//! setrlimit(2), prctl(2), landlock_restrict_self(2) and, for an NVIDIA
+//! run, open(2) and landlock_add_rule(2), and allocates nothing: the
+//! server is multithreaded, and another thread may have held the
+//! allocator's lock when it forked.
+//!
+//! **`/proc/self`, for NVIDIA runs only** ([`GpuUse::Nvidia`]; approved
+//! by the user on 2026-10-09 on that condition). CUDA's `cuInit` names a
+//! worker thread by opening `/proc/self/task/<tid>/comm` to write
+//! (`O_WRONLY | O_CREAT | O_TRUNC`) and reads `/proc/self/maps`; refused
+//! either, it fails (`CUDA_ERROR_OPERATING_SYSTEM`, or
+//! `CUDA_ERROR_OUT_OF_MEMORY` with `maps` alone refused), so NVENC and
+//! NVDEC cannot start. Found on an NVIDIA host by taking rules away one
+//! at a time; `/proc/driver/nvidia` is not needed. So the child of an
+//! NVIDIA run, after the fork, opens its own `/proc/self/task` and
+//! `/proc/self/maps` and adds them to its ruleset: read, write and
+//! truncate beneath the first, read the second. `self` is the child's
+//! pid, which exec keeps; the server never opens its own `/proc/self` for
+//! this, and `/proc` as a whole is never granted: a run as the same user
+//! could otherwise read the server's `/proc/<pid>/environ`, with its
+//! `SF_ENV_` secrets. What the exception gives is the run's own threads'
+//! entries: their names, `maps`, `status`, `mem` and `environ` (the run's
+//! own, cleared environment), nothing of another process. The two `O_PATH`
+//! descriptors are left open across exec: they hold the entries the rules
+//! name, which procfs would otherwise make anew (another inode, outside
+//! the rules) once nothing holds them. A VA-API run, or a run on no GPU,
+//! has no `/proc` at all.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -96,8 +120,9 @@ struct Inner {
     /// No input is read from in here: the state directory, with the
     /// database, the key and the secrets; systemd's credentials.
     hidden: Vec<PathBuf>,
-    /// The GPU's device nodes, for a run that asks for them.
-    gpu: Vec<PathBuf>,
+    /// The GPU device nodes this host has, by API; a run gets those of
+    /// the GPU it uses.
+    gpu: GpuDevices,
 }
 
 /// The seccomp filters, as BPF, in the order they are loaded.
@@ -112,16 +137,16 @@ impl Sandbox {
             landlock: None,
             seccomp: None,
             hidden: Vec::new(),
-            gpu: Vec::new(),
+            gpu: GpuDevices::default(),
         }))
     }
 
     /// Confine as `mode` says, with this kernel's Landlock. Without it (or
     /// with too old a one), `Required` is an error and `Auto` runs with
     /// seccomp alone and logs why. No input of a run may be inside
-    /// `hidden`, and a run that uses the GPU gets the device nodes in
-    /// `gpu`.
-    pub fn new(mode: Mode, hidden: Vec<PathBuf>, gpu: Vec<PathBuf>) -> Result<Self, SandboxError> {
+    /// `hidden`, and a run that uses a GPU gets that GPU's device nodes
+    /// of `gpu`.
+    pub fn new(mode: Mode, hidden: Vec<PathBuf>, gpu: GpuDevices) -> Result<Self, SandboxError> {
         Self::with_landlock(mode, landlock_abi(), hidden, gpu)
     }
 
@@ -131,7 +156,7 @@ impl Sandbox {
         mode: Mode,
         abi: Result<i32, String>,
         hidden: Vec<PathBuf>,
-        gpu: Vec<PathBuf>,
+        gpu: GpuDevices,
     ) -> Result<Self, SandboxError> {
         let hidden = hidden
             .into_iter()
@@ -245,10 +270,53 @@ fn landlock_abi() -> Result<i32, String> {
     })
 }
 
+/// Which GPU a run decodes or encodes on, if any: its jail gets that
+/// GPU's device nodes and no other's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GpuUse {
+    /// None: no device node, no driver file.
+    #[default]
+    None,
+    /// VA-API (and QSV, which goes through it): the render node.
+    Vaapi,
+    /// NVIDIA's NVENC or NVDEC, through CUDA: NVIDIA's nodes.
+    Nvidia,
+}
+
+/// The GPU device nodes a host may encode or decode on, by API. A run's
+/// jail takes those of the GPU it uses ([`GpuDevices::of`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GpuDevices {
+    /// VA-API's render node.
+    pub vaapi: Vec<PathBuf>,
+    /// NVIDIA's control, UVM, modeset and capability nodes, and one a
+    /// card.
+    pub nvidia: Vec<PathBuf>,
+}
+
+impl GpuDevices {
+    /// The nodes a run that uses `gpu` may open.
+    pub fn of(&self, gpu: GpuUse) -> &[PathBuf] {
+        match gpu {
+            GpuUse::None => &[],
+            GpuUse::Vaapi => &self.vaapi,
+            GpuUse::Nvidia => &self.nvidia,
+        }
+    }
+}
+
 /// The GPU device nodes a host may encode or decode on: VA-API's render
 /// node, and NVIDIA's nodes when `nvidia`. Only those that exist.
-pub fn gpu_devices(vaapi: Option<&Path>, nvidia: bool) -> Vec<PathBuf> {
-    let mut devices: Vec<PathBuf> = vaapi.map(Path::to_path_buf).into_iter().collect();
+pub fn gpu_devices(vaapi: Option<&Path>, nvidia: bool) -> GpuDevices {
+    gpu_devices_in(Path::new("/dev"), vaapi, nvidia)
+}
+
+/// [`gpu_devices`] with NVIDIA's nodes looked for in `dev`.
+fn gpu_devices_in(dev: &Path, vaapi: Option<&Path>, nvidia: bool) -> GpuDevices {
+    let mut devices = GpuDevices {
+        vaapi: vaapi.map(Path::to_path_buf).into_iter().collect(),
+        nvidia: Vec::new(),
+    };
     if nvidia {
         for name in [
             "nvidiactl",
@@ -257,22 +325,26 @@ pub fn gpu_devices(vaapi: Option<&Path>, nvidia: bool) -> Vec<PathBuf> {
             "nvidia-modeset",
             "nvidia-caps",
         ] {
-            devices.push(Path::new("/dev").join(name));
+            devices.nvidia.push(dev.join(name));
         }
-        if let Ok(dir) = std::fs::read_dir("/dev") {
-            for entry in dir.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name
-                    .strip_prefix("nvidia")
-                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-                {
-                    devices.push(entry.path());
-                }
-            }
+        if let Ok(dir) = std::fs::read_dir(dev) {
+            let mut cards: Vec<PathBuf> = dir
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .strip_prefix("nvidia")
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .map(|entry| entry.path())
+                .collect();
+            cards.sort();
+            devices.nvidia.extend(cards);
         }
     }
-    devices.retain(|d| d.exists());
+    devices.vaapi.retain(|d| d.exists());
+    devices.nvidia.retain(|d| d.exists());
     devices
 }
 
@@ -380,14 +452,14 @@ impl Limits {
 }
 
 /// One run's view of the file system: the inputs it reads, the
-/// directories it reads or writes, whether it uses the GPU, and its
+/// directories it reads or writes, which GPU it uses, and its
 /// [`Limits`].
 #[derive(Debug, Clone)]
 pub struct Jail {
     inputs: Vec<PathBuf>,
     reads: Vec<PathBuf>,
     writes: Vec<PathBuf>,
-    gpu: bool,
+    gpu: GpuUse,
     limits: Limits,
 }
 
@@ -397,7 +469,7 @@ impl Jail {
             inputs: Vec::new(),
             reads: Vec::new(),
             writes: Vec::new(),
-            gpu: false,
+            gpu: GpuUse::None,
             limits,
         }
     }
@@ -426,8 +498,9 @@ impl Jail {
         self
     }
 
-    /// The run may decode or encode on the GPU.
-    pub fn gpu(mut self, gpu: bool) -> Self {
+    /// The GPU the run decodes or encodes on: it may open that GPU's
+    /// device nodes, and no other's.
+    pub fn gpu(mut self, gpu: GpuUse) -> Self {
         self.gpu = gpu;
         self
     }
@@ -492,19 +565,30 @@ impl Tool {
         let limits = jail.limits;
         let memory = limits.memory.bytes();
         let seccomp = sandbox.seccomp.clone();
+        // An NVIDIA run's own /proc entries, which only the child can name
+        // (see the module's doc).
+        let own_proc = match (&ruleset, sandbox.landlock, jail.gpu) {
+            (Some(ruleset), Some(abi), GpuUse::Nvidia) => Some(OwnProc::new(ruleset, abi)?),
+            _ => None,
+        };
         let mut ruleset = ruleset;
         // SAFETY: between fork and exec only getrlimit(2), setrlimit(2),
-        // prctl(2) and landlock_restrict_self(2) run, which are
-        // async-signal-safe, and close(2) of the ruleset. Nothing
-        // allocates: the ruleset and the filters were made before the
-        // fork, the errors are errno values, and `take` moves the ruleset
-        // out of the child's copy of the closure without touching the heap.
+        // open(2), landlock_add_rule(2), prctl(2) and
+        // landlock_restrict_self(2) run, which are async-signal-safe, and
+        // close(2). Nothing allocates: the ruleset, its second descriptor
+        // and the filters were made before the fork, the paths are C
+        // string literals, the rule is on the stack, the errors are errno
+        // values, and `take` moves the ruleset out of the child's copy of
+        // the closure without touching the heap.
         unsafe {
             command.pre_exec(move || {
                 lower(libc::RLIMIT_DATA, memory)?;
                 lower(libc::RLIMIT_CPU, limits.cpu_secs)?;
                 lower(libc::RLIMIT_FSIZE, limits.file_size)?;
                 lower(libc::RLIMIT_CORE, 0)?;
+                if let Some(own) = &own_proc {
+                    own.allow()?;
+                }
                 if let Some(ruleset) = ruleset.take() {
                     restrict(ruleset)?;
                 }
@@ -585,7 +669,10 @@ impl Tool {
 }
 
 /// A command from [`Tool::command`]. It holds what the child confines
-/// itself with until it is dropped, so it must outlive its spawn.
+/// itself with until it is dropped, so it must outlive its spawn. Spawn it
+/// once: an NVIDIA run's child adds rules naming its own `/proc` entries
+/// to the ruleset it shares with the command, which a second child would
+/// inherit.
 #[derive(Debug)]
 pub struct Command {
     command: tokio::process::Command,
@@ -632,6 +719,99 @@ fn lower(resource: Resource, value: u64) -> std::io::Result<()> {
         if libc::setrlimit(resource, &new) == -1 {
             return Err(std::io::Error::last_os_error());
         }
+    }
+    Ok(())
+}
+
+/// What an NVIDIA run's child adds to its ruleset for itself, after the
+/// fork (see the module's doc): its own `/proc/self/task` to read, write
+/// and truncate beneath, its own `/proc/self/maps` to read.
+#[derive(Debug)]
+struct OwnProc {
+    /// The run's ruleset again: the same rules, through a second file
+    /// descriptor, since `restrict_self` takes the first.
+    ruleset: OwnedFd,
+    /// The rights beneath `/proc/self/task`, as Landlock's bits.
+    task: u64,
+    /// The rights on `/proc/self/maps`.
+    maps: u64,
+}
+
+/// `LANDLOCK_RULE_PATH_BENEATH`.
+const LANDLOCK_RULE_PATH_BENEATH: libc::c_int = 1;
+
+/// `struct landlock_path_beneath_attr`, packed as the kernel's is.
+#[repr(C, packed)]
+struct PathBeneathAttr {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+impl OwnProc {
+    /// Before the fork: a second descriptor of `ruleset`, and the rights,
+    /// of those ABI `abi` has.
+    fn new(ruleset: &RulesetCreated, abi: i32) -> std::io::Result<Self> {
+        let fd: Option<OwnedFd> = ruleset.try_clone()?.into();
+        let ruleset = fd.ok_or_else(|| std::io::Error::other("the Landlock ruleset has no fd"))?;
+        let all = AccessFs::from_all(ABI::from(abi));
+        // Truncate is ABI 3, which confining needs anyway.
+        let task = (AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate) & all;
+        let maps = BitFlags::from(AccessFs::ReadFile) & all;
+        Ok(Self {
+            ruleset,
+            task: task.bits(),
+            maps: maps.bits(),
+        })
+    }
+
+    /// After the fork, in the child: its own entries added to the
+    /// ruleset, before it confines itself.
+    fn allow(&self) -> std::io::Result<()> {
+        let ruleset = self.ruleset.as_raw_fd();
+        add_own(
+            ruleset,
+            c"/proc/self/task",
+            libc::O_PATH | libc::O_DIRECTORY,
+            self.task,
+        )?;
+        add_own(ruleset, c"/proc/self/maps", libc::O_PATH, self.maps)
+    }
+}
+
+/// After the fork: `access` beneath `path` (one of the child's own /proc
+/// entries) added to `ruleset`. The `O_PATH` descriptor is left open, and
+/// without `O_CLOEXEC`, so that the entry the rule names lives as long as
+/// the run (see the module's doc).
+fn add_own(
+    ruleset: RawFd,
+    path: &std::ffi::CStr,
+    flags: libc::c_int,
+    access: u64,
+) -> std::io::Result<()> {
+    // SAFETY: open(2) of a NUL-terminated literal.
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let attr = PathBeneathAttr {
+        allowed_access: access,
+        parent_fd: fd,
+    };
+    // SAFETY: landlock_add_rule(2) reads `attr`, which outlives the call.
+    let added = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset,
+            LANDLOCK_RULE_PATH_BENEATH,
+            &raw const attr,
+            0 as libc::c_uint,
+        )
+    };
+    if added != 0 {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: the descriptor opened above, closed once.
+        unsafe { libc::close(fd) };
+        return Err(error);
     }
     Ok(())
 }
@@ -776,8 +956,8 @@ const SYSTEM: &[&str] = &[
 const DEVICES_WRITTEN: &[&str] = &["/dev/null", "/dev/full"];
 const DEVICES_READ: &[&str] = &["/dev/zero", "/dev/random", "/dev/urandom"];
 
-/// What the GPU drivers read, with [`Jail::gpu`]: `/sys` for the device's
-/// PCI ids, and NixOS's driver directory.
+/// What the GPU drivers read, with a [`Jail::gpu`]: `/sys` for the
+/// device's PCI ids, and NixOS's driver directory.
 const GPU_READS: &[&str] = &["/sys", "/run/opengl-driver"];
 
 /// The Landlock ruleset for `program` in `jail`, ready for the child to
@@ -827,8 +1007,8 @@ fn ruleset(
     for device in DEVICES_READ {
         rules.allow(Path::new(device), AccessFs::ReadFile.into(), false)?;
     }
-    if jail.gpu {
-        for device in &sandbox.gpu {
+    if jail.gpu != GpuUse::None {
+        for device in sandbox.gpu.of(jail.gpu) {
             let access = AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::IoctlDev;
             rules.allow(device, access, false)?;
             // libdrm finds the render node by listing /dev/dri.
@@ -1136,7 +1316,7 @@ mod tests {
     }
 
     fn with(mode: Mode, abi: Result<i32, String>) -> Result<Sandbox, SandboxError> {
-        Sandbox::with_landlock(mode, abi, Vec::new(), Vec::new())
+        Sandbox::with_landlock(mode, abi, Vec::new(), GpuDevices::default())
     }
 
     #[test]
@@ -1163,6 +1343,54 @@ mod tests {
         let sandbox = with(Mode::Off, landlock_abi()).unwrap();
         assert!(!sandbox.confines());
         assert!(sandbox.0.seccomp.is_none());
+    }
+
+    /// A host with a render node and an NVIDIA card: a VA-API run gets the
+    /// render node alone, an NVIDIA run NVIDIA's nodes alone, a run on no
+    /// GPU none.
+    #[tokio::test]
+    async fn a_run_gets_the_device_nodes_of_the_gpu_it_uses_only() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-gpu-devices").await;
+        let dev = tmp.to_path_buf();
+        std::fs::create_dir_all(dev.join("dri")).unwrap();
+        std::fs::create_dir_all(dev.join("nvidia-caps")).unwrap();
+        for node in [
+            "dri/renderD128",
+            "nvidiactl",
+            "nvidia-uvm",
+            "nvidia0",
+            "nvidia1",
+            "nvidia-uvm-tools-not",
+        ] {
+            std::fs::write(dev.join(node), "").unwrap();
+        }
+        let render = dev.join("dri/renderD128");
+        let devices = gpu_devices_in(&dev, Some(&render), true);
+
+        assert_eq!(devices.of(GpuUse::Vaapi), [render]);
+        assert_eq!(
+            devices.of(GpuUse::Nvidia),
+            [
+                dev.join("nvidiactl"),
+                dev.join("nvidia-uvm"),
+                dev.join("nvidia-caps"),
+                dev.join("nvidia0"),
+                dev.join("nvidia1"),
+            ]
+        );
+        assert!(devices.of(GpuUse::None).is_empty());
+    }
+
+    /// Without NVIDIA's encoders asked for, no NVIDIA node is looked for.
+    #[tokio::test]
+    async fn nvidia_s_nodes_are_left_out_unless_asked_for() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-gpu-no-nvidia").await;
+        let dev = tmp.to_path_buf();
+        std::fs::write(dev.join("nvidiactl"), "").unwrap();
+        std::fs::write(dev.join("nvidia0"), "").unwrap();
+        let devices = gpu_devices_in(&dev, None, false);
+        assert!(devices.of(GpuUse::Nvidia).is_empty());
+        assert!(devices.of(GpuUse::Vaapi).is_empty());
     }
 
     #[test]

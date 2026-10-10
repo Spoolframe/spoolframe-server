@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use spoolframe_media::encoders::{self, Encoders, FfmpegCommand, Hardware, TranscodeSettings};
-use spoolframe_media::sandbox::{self, Jail, Limits, Mode, Sandbox, Tool};
+use spoolframe_media::sandbox::{self, GpuUse, Jail, Limits, Mode, Sandbox, Tool};
 use spoolframe_media::{MediaDescriptor, Prober};
 use spoolframe_protocol::ConvertedVideo;
 use spoolframe_server::encode::args::{Decode, EncodeSpec, Output, decode, ffmpeg_args};
@@ -188,7 +188,7 @@ async fn confined(gpu: &Gpu, film: &Path, dir: &Path, args: &[String]) -> std::p
     let jail = Jail::new(Limits::encode(1 << 30))
         .input(film)
         .writes(dir)
-        .gpu(true);
+        .gpu(GpuUse::Vaapi);
     let mut command = Tool::new("ffmpeg", gpu.sandbox.clone())
         .command(&jail)
         .unwrap();
@@ -292,10 +292,10 @@ async fn a_gpu_decode_that_fails_at_once_finishes_in_software() {
                 args,
                 inputs: vec![film.clone()],
                 reads: Vec::new(),
-                gpu: true,
+                gpu: GpuUse::Vaapi,
                 fallback: Some(Fallback {
                     args: software,
-                    gpu: true,
+                    gpu: GpuUse::Vaapi,
                     file: film.clone(),
                     made: None,
                 }),

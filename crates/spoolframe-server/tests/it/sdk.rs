@@ -2143,7 +2143,7 @@ async fn a_device_ties_with_its_credential_and_the_identity_is_taken_after() {
     let key = tv.portable().device_key(identity).await.unwrap();
     let credential = phone
         .portable()
-        .issue_credential(identity, key)
+        .issue_credential(identity, key, Some("TV"))
         .await
         .unwrap();
     tv.portable().install_credential(credential).await.unwrap();

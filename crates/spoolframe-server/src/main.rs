@@ -1005,6 +1005,7 @@ async fn run(
                 transcoding: transcoding.clone(),
                 subtitles: subtitles.clone(),
                 previews: previews.clone(),
+                jobs: Some(jobs.clone()),
             })),
         },
         admin_origins,

@@ -533,9 +533,16 @@ in {
         description = ''
           Which hardware encoders to try. The server test-encodes with each
           at start (and on SIGHUP) and keeps what works; `spoolframe status`
-          lists it. A list sets the order per codec: `["nvenc" "vaapi"]`
-          encodes on NVIDIA what it can and the rest on VA-API. `none`
-          encodes in software only.
+          lists it. A list sets the order of preference: each video
+          encode runs on the one family that does the most of it
+          (encodes the output, decodes the source, runs its tone map,
+          burn-in and scale), the order deciding between equals. With
+          `["nvenc" "vaapi"]` on a GTX 1060 and an AMD GPU, an AV1 film
+          goes to the AMD GPU, which decodes AV1, and a film both do
+          whole to NVIDIA. NVIDIA scales and burns in pictures on the GPU
+          only with `transcode.gpu_filters` on (Settings › Playback), so
+          with it off a 4K film made 1080p goes to the AMD GPU, which
+          scales there. `none` encodes in software only.
         '';
       };
 

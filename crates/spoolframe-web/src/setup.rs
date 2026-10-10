@@ -173,6 +173,29 @@ pub fn families(video_encoders: &[String]) -> Vec<Family> {
     out
 }
 
+/// What a family's GPU decodes, as the Playback step lists it under the
+/// family (PX-27): `NVDEC decodes H.264, HEVC, HEVC 10-bit`, from the
+/// server's `hevc 10-bit (nvdec)`. `None` where it decodes nothing.
+pub fn decoders_line(family: &str, hardware_decoders: &[String]) -> Option<String> {
+    let (api, by) = match family {
+        "VA-API" => ("vaapi", "VA-API"),
+        "NVENC" => ("nvdec", "NVDEC"),
+        "Quick Sync" => ("qsv", "Quick Sync"),
+        _ => return None,
+    };
+    let suffix = format!(" ({api})");
+    let codecs: Vec<String> = hardware_decoders
+        .iter()
+        .filter_map(|d| d.strip_suffix(&suffix))
+        .filter_map(|d| {
+            let (codec, depth) = d.split_once(' ').map_or((d, None), |(c, r)| (c, Some(r)));
+            let name = codec_name(codec)?;
+            Some(depth.map_or_else(|| name.to_owned(), |depth| format!("{name} {depth}")))
+        })
+        .collect();
+    (!codecs.is_empty()).then(|| format!("{by} decodes {}", codecs.join(", ")))
+}
+
 fn codec_name(ffmpeg: &str) -> Option<&'static str> {
     Some(match ffmpeg {
         "h264" | "x264" | "openh264" => "H.264",
@@ -649,6 +672,29 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn what_a_family_decodes_is_named_under_it() {
+        let found: Vec<String> = [
+            "h264 (vaapi)",
+            "h264 (nvdec)",
+            "hevc (nvdec)",
+            "hevc 10-bit (nvdec)",
+            "vp9 (nvdec)",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            decoders_line("NVENC", &found).as_deref(),
+            Some("NVDEC decodes H.264, HEVC, HEVC 10-bit, VP9")
+        );
+        assert_eq!(
+            decoders_line("VA-API", &found).as_deref(),
+            Some("VA-API decodes H.264")
+        );
+        assert_eq!(decoders_line("Quick Sync", &found), None);
+        assert_eq!(decoders_line("Software", &found), None);
     }
 
     #[test]

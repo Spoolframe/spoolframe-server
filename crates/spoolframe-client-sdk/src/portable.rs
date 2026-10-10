@@ -190,6 +190,33 @@ pub struct PortableIdentity {
     pub name: String,
     /// Unix seconds: made, or first recovered, here.
     pub created_at: u64,
+    /// Whether its root is here now, as [`Portable::list`] found it. Not
+    /// stored: an app's storage restored from a backup that leaves out
+    /// secrets (the iOS keychain's this-device-only items) lists the
+    /// identity without its root. Without it nothing is issued, revoked
+    /// or tied with the root; recovering from the phrase puts it back.
+    #[serde(skip)]
+    pub has_root: bool,
+}
+
+/// A device the root gave a credential to, as kept on the root's phone:
+/// the newest credential for that device key. Nothing here is sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuedCredential {
+    pub device_key: DevicePublicKey,
+    pub serial: u64,
+    /// Unix seconds.
+    pub issued_at: i64,
+    /// Unix seconds.
+    pub expires_at: i64,
+    /// What the user called the device when issuing ("Living room TV");
+    /// theirs alone. A renewal without one keeps the one before.
+    pub label: Option<String>,
+    /// Unix seconds: revoked here (by this root, or in a state accepted
+    /// from elsewhere), however long ago. Not stored: read from the
+    /// revoked keys when listed.
+    #[serde(skip)]
+    pub revoked_at: Option<i64>,
 }
 
 /// The portable identities on this device, kept in the app's [`Storage`]:
@@ -237,9 +264,39 @@ impl Portable {
         Ok(root.id())
     }
 
-    /// The identities on this device, oldest first.
+    /// The identities on this device, oldest first, each with whether its
+    /// root is here ([`PortableIdentity::has_root`]).
     pub async fn list(&self) -> Result<Vec<PortableIdentity>, SdkError> {
-        Ok(load(self.storage.as_ref()).await?)
+        let storage = self.storage.as_ref();
+        let mut listed = load(storage).await?;
+        for entry in &mut listed {
+            entry.has_root = storage
+                .secret(&keys::portable_root(&entry.id.to_string()))
+                .await?
+                .is_some();
+        }
+        Ok(listed)
+    }
+
+    /// The devices identity `id`'s root has given credentials to here,
+    /// in the order first issued: the newest credential of each, revoked
+    /// ones too ([`IssuedCredential::revoked_at`]). Empty on a device
+    /// that never issued for it.
+    pub async fn issued(&self, id: PortableUserId) -> Result<Vec<IssuedCredential>, SdkError> {
+        let storage = self.storage.as_ref();
+        let mut issued = load_issued(storage, id).await?;
+        let revoked = load_revoked(storage, id).await?;
+        let state = load_state(storage, id).await?;
+        for entry in &mut issued {
+            entry.revoked_at = revoked.get(&entry.device_key).copied().or_else(|| {
+                state
+                    .iter()
+                    .flat_map(|s| &s.revoked)
+                    .find(|r| r.key == entry.device_key)
+                    .map(|r| r.revoked_at)
+            });
+        }
+        Ok(issued)
     }
 
     /// Remove identity `id` from this device: its root and its entry. Its
@@ -293,18 +350,26 @@ impl Portable {
     /// is saved before the credential is signed, so a failure in between
     /// skips one rather than giving two credentials the same serial.
     /// Refused for a key revoked here, however long ago.
+    ///
+    /// Recorded for [`Portable::issued`] under `label`, what the user
+    /// calls the device; `None` keeps the label it had. Should the record
+    /// fail to save, the credential is not given out: the list of devices
+    /// stays whole.
     pub async fn issue_credential(
         &self,
         id: PortableUserId,
         device_key: DevicePublicKey,
+        label: Option<&str>,
     ) -> Result<UserDeviceCredential, SdkError> {
-        self.issue_credential_at(id, device_key, unix_now()).await
+        self.issue_credential_at(id, device_key, label, unix_now())
+            .await
     }
 
     async fn issue_credential_at(
         &self,
         id: PortableUserId,
         device_key: DevicePublicKey,
+        label: Option<&str>,
         now: i64,
     ) -> Result<UserDeviceCredential, SdkError> {
         let storage = self.storage.as_ref();
@@ -333,6 +398,26 @@ impl Portable {
             now.saturating_add(MAX_CREDENTIAL_VALIDITY),
             |message| root.sign(message),
         );
+        let mut issued = load_issued(storage, id).await?;
+        let record = IssuedCredential {
+            device_key,
+            serial,
+            issued_at: credential.issued_at,
+            expires_at: credential.expires_at,
+            label: None,
+            revoked_at: None,
+        };
+        match issued.iter_mut().find(|e| e.device_key == device_key) {
+            Some(entry) => {
+                let label = label.map(str::to_owned).or(entry.label.take());
+                *entry = IssuedCredential { label, ..record };
+            }
+            None => issued.push(IssuedCredential {
+                label: label.map(str::to_owned),
+                ..record
+            }),
+        }
+        save_issued(storage, id, &issued).await?;
         tracing::info!(%id, %device_key, serial, "issued a portable device credential");
         Ok(credential)
     }
@@ -629,6 +714,7 @@ impl Portable {
                 id,
                 name: name.to_owned(),
                 created_at: now(),
+                has_root: true,
             });
             save(storage, &saved).await?;
         }
@@ -715,6 +801,36 @@ async fn save_revoked(
     let bytes = serde_json::to_vec(union).expect("revoked keys always serialize");
     storage
         .set_data(&keys::portable_revoked(&id.to_string()), Some(bytes))
+        .await
+}
+
+/// The devices `id`'s root issued to; unreadable is an error, never
+/// "none".
+async fn load_issued(
+    storage: &dyn Storage,
+    id: PortableUserId,
+) -> Result<Vec<IssuedCredential>, StorageError> {
+    match storage
+        .data(&keys::portable_issued(&id.to_string()))
+        .await?
+    {
+        None => Ok(Vec::new()),
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            StorageError(format!(
+                "the devices issued credentials by {id} cannot be read: {e}"
+            ))
+        }),
+    }
+}
+
+async fn save_issued(
+    storage: &dyn Storage,
+    id: PortableUserId,
+    issued: &[IssuedCredential],
+) -> Result<(), StorageError> {
+    let bytes = serde_json::to_vec(issued).expect("issued credentials always serialize");
+    storage
+        .set_data(&keys::portable_issued(&id.to_string()), Some(bytes))
         .await
 }
 
@@ -1089,7 +1205,7 @@ mod tests {
     async fn device_of(phone: &Portable, id: PortableUserId) -> Portable {
         let (_, device) = portable();
         let key = device.device_key(id).await.unwrap();
-        let credential = phone.issue_credential_at(id, key, T).await.unwrap();
+        let credential = phone.issue_credential_at(id, key, None, T).await.unwrap();
         device.install_credential_at(credential, T).await.unwrap();
         device
     }
@@ -1147,13 +1263,16 @@ mod tests {
         let (storage, phone) = portable();
         let (id, _) = phone.create("Steve").await.unwrap();
         let key = phone.device_key(id).await.unwrap();
-        let first = phone.issue_credential_at(id, key, T).await.unwrap();
-        let renewed = phone.issue_credential_at(id, key, T + 1).await.unwrap();
+        let first = phone.issue_credential_at(id, key, None, T).await.unwrap();
+        let renewed = phone
+            .issue_credential_at(id, key, None, T + 1)
+            .await
+            .unwrap();
         assert_eq!((first.serial, renewed.serial), (1, 2));
         let restarted = Portable::new(storage);
         assert_eq!(
             restarted
-                .issue_credential_at(id, key, T)
+                .issue_credential_at(id, key, None, T)
                 .await
                 .unwrap()
                 .serial,
@@ -1192,7 +1311,10 @@ mod tests {
         let (id, _) = phone.create("Steve").await.unwrap();
         let key = phone.device_key(id).await.unwrap();
         assert_eq!(
-            phone.issue_credential_at(id, key, T).await.unwrap_err(),
+            phone
+                .issue_credential_at(id, key, None, T)
+                .await
+                .unwrap_err(),
             SdkError::Storage(StorageError("full".into()))
         );
     }
@@ -1203,7 +1325,7 @@ mod tests {
         let tv = device_of(&phone, id).await;
         let key = tv.device_key(id).await.unwrap();
         assert_eq!(
-            tv.issue_credential(id, key).await.unwrap_err(),
+            tv.issue_credential(id, key, None).await.unwrap_err(),
             SdkError::UnknownIdentity(id.to_string())
         );
     }
@@ -1213,7 +1335,7 @@ mod tests {
         let (phone, id) = phone().await;
         let (_, tv) = portable();
         let key = tv.device_key(id).await.unwrap();
-        let good = phone.issue_credential_at(id, key, T).await.unwrap();
+        let good = phone.issue_credential_at(id, key, None, T).await.unwrap();
         let tampered = UserDeviceCredential {
             serial: good.serial + 1,
             ..good.clone()
@@ -1231,7 +1353,7 @@ mod tests {
         // A credential for a key this device never made for the identity.
         let (_, other) = portable();
         let elsewhere = phone
-            .issue_credential_at(id, other.device_key(id).await.unwrap(), T)
+            .issue_credential_at(id, other.device_key(id).await.unwrap(), None, T)
             .await
             .unwrap();
         assert_eq!(
@@ -1284,7 +1406,7 @@ mod tests {
         // And a revoked key gets no new credential.
         assert_eq!(
             restarted
-                .issue_credential_at(id, tv_key, T)
+                .issue_credential_at(id, tv_key, None, T)
                 .await
                 .unwrap_err(),
             SdkError::DeviceKeyRevoked
@@ -1344,7 +1466,7 @@ mod tests {
         let locked = SdkError::Storage(StorageError("locked".into()));
         assert_eq!(tv.credential(id).await.unwrap_err(), locked);
         let key = tv.device_key(id).await.unwrap();
-        let credential = phone.issue_credential_at(id, key, T).await.unwrap();
+        let credential = phone.issue_credential_at(id, key, None, T).await.unwrap();
         // Not overwritten with a list of one, either.
         assert_eq!(
             tv.install_credential_at(credential, T).await.unwrap_err(),
@@ -1395,7 +1517,10 @@ mod tests {
         );
         // The root itself still never issues to it.
         assert_eq!(
-            phone.issue_credential_at(id, old, later).await.unwrap_err(),
+            phone
+                .issue_credential_at(id, old, None, later)
+                .await
+                .unwrap_err(),
             SdkError::DeviceKeyRevoked
         );
     }
@@ -1450,7 +1575,7 @@ mod tests {
         assert_eq!(carrier.identity_state(id).await.unwrap(), Some(from_first));
         assert_eq!(
             carrier
-                .issue_credential_at(id, laptop_key, T)
+                .issue_credential_at(id, laptop_key, None, T)
                 .await
                 .unwrap_err(),
             SdkError::DeviceKeyRevoked
@@ -1480,7 +1605,7 @@ mod tests {
             tv.prove_at(id, &SERVER, &NONCE, T).await.unwrap_err(),
             SdkError::DeviceKeyRevoked
         );
-        let renewed = phone.issue_credential_at(id, new, T).await.unwrap();
+        let renewed = phone.issue_credential_at(id, new, None, T).await.unwrap();
         tv.install_credential_at(renewed, T).await.unwrap();
         tv.prove_at(id, &SERVER, &NONCE, T).await.unwrap();
     }
@@ -1498,13 +1623,118 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            phone.issue_credential_at(id, key, T).await.unwrap_err(),
+            phone
+                .issue_credential_at(id, key, None, T)
+                .await
+                .unwrap_err(),
             SdkError::Storage(_)
         ));
         assert!(matches!(
             phone.device_key(id).await.unwrap_err(),
             SdkError::Storage(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn issued_lists_each_device_once_with_its_newest_credential() {
+        let (storage, phone) = portable();
+        let (id, _) = phone.create("Steve").await.unwrap();
+        assert_eq!(phone.issued(id).await.unwrap(), []);
+        let tv = some_key(1);
+        let laptop = some_key(2);
+        phone
+            .issue_credential_at(id, tv, Some("Living room"), T)
+            .await
+            .unwrap();
+        phone
+            .issue_credential_at(id, laptop, Some("Laptop"), T)
+            .await
+            .unwrap();
+        // A renewal without a label keeps the one before.
+        let renewed = phone
+            .issue_credential_at(id, tv, None, T + 5)
+            .await
+            .unwrap();
+        let issued = Portable::new(storage).issued(id).await.unwrap();
+        let seen: Vec<_> = issued
+            .iter()
+            .map(|e| (e.device_key, e.serial, e.issued_at, e.label.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (tv, 3, T + 5, Some("Living room")),
+                (laptop, 2, T, Some("Laptop"))
+            ]
+        );
+        assert_eq!(issued[0].expires_at, renewed.expires_at);
+        // A renewal with a label takes it.
+        phone
+            .issue_credential_at(id, laptop, Some("Old laptop"), T + 6)
+            .await
+            .unwrap();
+        assert_eq!(
+            phone.issued(id).await.unwrap()[1].label.as_deref(),
+            Some("Old laptop")
+        );
+    }
+
+    #[tokio::test]
+    async fn issued_says_which_devices_are_revoked() {
+        let (phone, id) = phone().await;
+        phone
+            .issue_credential_at(id, some_key(1), None, T)
+            .await
+            .unwrap();
+        phone
+            .issue_credential_at(id, some_key(2), None, T)
+            .await
+            .unwrap();
+        phone.revoke_at(id, some_key(1), T + 7).await.unwrap();
+        let revoked: Vec<_> = phone
+            .issued(id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.revoked_at)
+            .collect();
+        assert_eq!(revoked, [Some(T + 7), None]);
+    }
+
+    #[tokio::test]
+    async fn no_credential_is_given_out_unless_its_device_is_recorded() {
+        let phone = Portable::new(Arc::new(RefusesWrites(
+            MemoryStorage::default(),
+            "portable-issued/",
+        )));
+        let (id, _) = phone.create("Steve").await.unwrap();
+        assert_eq!(
+            phone
+                .issue_credential_at(id, some_key(1), None, T)
+                .await
+                .unwrap_err(),
+            SdkError::Storage(StorageError("full".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identity_whose_root_is_gone_is_listed_without_it() {
+        let (storage, phone) = portable();
+        let (steve, _) = phone.create("Steve").await.unwrap();
+        let ann = phone.recover(&zero_phrase(), "Ann").await.unwrap();
+        // As a restore that left out this-device-only secrets would.
+        storage
+            .set_secret(&keys::portable_root(&steve.to_string()), None)
+            .await
+            .unwrap();
+        let has_root: Vec<_> = phone
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| (e.id, e.has_root))
+            .collect();
+        assert_eq!(has_root, [(steve, false), (ann, true)]);
     }
 
     // P7-04: the proof that ties a local account.

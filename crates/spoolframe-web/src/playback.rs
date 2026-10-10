@@ -582,6 +582,14 @@ mod tests {
             "decode Software · encode NVENC · H.264 · tone map on the CPU · \
              burn-in on the CPU · 6.2 Mbit/s"
         );
+        // PX-27: decoded on NVDEC, the filters still on the CPU.
+        row.made.decoder =
+            serde_json::from_value(serde_json::json!({ "kind": "gpu", "api": "nvidia" })).unwrap();
+        assert_eq!(
+            made_line(&row),
+            "decode GPU · NVDEC (CUDA) · encode NVENC · H.264 · tone map on the CPU · \
+             burn-in on the CPU · 6.2 Mbit/s"
+        );
         row.plan = PlanKind::Remux;
         row.made = made(VideoDecoder::None, None);
         assert_eq!(made_line(&row), "video copied");

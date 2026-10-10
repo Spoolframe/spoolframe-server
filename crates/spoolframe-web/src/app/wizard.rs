@@ -1678,6 +1678,10 @@ fn PlaybackFields(
         .map(|s| s.transcoding.video_encoders.clone())
         .unwrap_or_default();
     let families = setup::families(&encoders);
+    let decoders = status
+        .as_ref()
+        .map(|s| s.transcoding.hardware_decoders.clone())
+        .unwrap_or_default();
     let best = families
         .first()
         .filter(|f| f.name != "Software")
@@ -1713,7 +1717,10 @@ fn PlaybackFields(
                             span { class: "text-xs text-ctp-subtext0",
                                 {match families.iter().find(|f| f.name == family) {
                                     Some(f) if family == "Software" => format!("Always available, uses the CPU · {}", f.codecs.join(", ")),
-                                    Some(f) => f.codecs.join(", "),
+                                    Some(f) => match setup::decoders_line(family, &decoders) {
+                                        Some(decodes) => format!("{} · {decodes}", f.codecs.join(", ")),
+                                        None => f.codecs.join(", "),
+                                    },
                                     None if family == "Software" => "Always available, uses the CPU".to_owned(),
                                     None => "Not found on this server".to_owned(),
                                 }}

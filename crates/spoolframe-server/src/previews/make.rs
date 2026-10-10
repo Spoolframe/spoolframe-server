@@ -16,7 +16,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use spoolframe_media::encoders::{Hardware, hwaccel_args};
-use spoolframe_media::sandbox::{Jail, Limits, Tool};
+use spoolframe_media::sandbox::{GpuUse, Jail, Limits, Tool};
 
 use super::sheets::TILE_WIDTH;
 use crate::encode::args::TONE_MAP;
@@ -216,9 +216,13 @@ async fn tile(
     out: &Path,
 ) -> Result<Option<Vec<u8>>, String> {
     let _ = tokio::fs::remove_file(out).await;
-    let mut jail = Jail::new(Limits::TILE)
-        .input(&source.input)
-        .gpu(hardware && source.hardware.is_some());
+    // The GPU it decodes on, when it does: VA-API's render node or
+    // NVIDIA's nodes, not both.
+    let gpu = match (&source.hardware, hardware) {
+        (Some((family, _)), true) => family.gpu(),
+        _ => GpuUse::None,
+    };
+    let mut jail = Jail::new(Limits::TILE).input(&source.input).gpu(gpu);
     if let Some(dir) = out.parent() {
         jail = jail.writes(dir);
     }

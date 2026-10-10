@@ -71,6 +71,12 @@ pub mod keys {
         format!("portable-serial/{id}")
     }
 
+    /// Data: the devices the root of `id` has given credentials to, JSON:
+    /// the newest credential per device key, and its label (P7-02).
+    pub fn portable_issued(id: &str) -> String {
+        format!("portable-issued/{id}")
+    }
+
     /// Data: the newest identity state of `id` this device has, JSON
     /// (P7-02): made here by its root, or brought from elsewhere.
     pub fn portable_state(id: &str) -> String {

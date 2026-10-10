@@ -294,7 +294,10 @@ media {
 # Converting for clients that cannot play a file as it is.
 transcode {
   # "auto" (every family that works), "none" (software only), or a list
-  # of families in order of preference: ["nvenc", "vaapi"].
+  # of families in order of preference: ["nvenc", "vaapi"]. Each video
+  # encode runs on one family: the one that also decodes the source and
+  # runs its filters (tone map, burn-in, scale), the order deciding
+  # between equals.
   hardware = "auto";
   vaapi_device = "/dev/dri/renderD128";
   # The encode budget: how many software video encodes (libx264) run at
@@ -316,11 +319,14 @@ transcode {
   scratch_limit_mb = 20480;
   # How far an encode may run ahead of its reader.
   read_ahead_secs = 60;
-  # Tone map HDR (tonemap_vaapi) and burn in picture subtitles
-  # (overlay_vaapi) on the GPU for a VA-API encode, where the driver can:
-  # faster and lighter on the CPU, though colours or subtitle placement
-  # may differ slightly. Where it cannot (Mesa has neither), and for text
-  # subtitles, the CPU does it as when this is off.
+  # Run a GPU encode's filters on the GPU, where it can: faster and
+  # lighter on the CPU, though colours or subtitle placement may differ
+  # slightly. VA-API tone maps HDR (tonemap_vaapi) and burns in picture
+  # subtitles (overlay_vaapi) where the driver can (Mesa has neither);
+  # NVIDIA scales (scale_cuda) and burns in picture subtitles
+  # (overlay_cuda), and tone maps on the CPU, its whole chain with it.
+  # What the GPU cannot, and text subtitles, the CPU does as when this
+  # is off.
   gpu_filters = false;
 }
 

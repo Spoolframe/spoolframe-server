@@ -3271,7 +3271,11 @@
   refuses a credential whose key any valid state it has seen revokes,
   older revisions included, and drops a revocation once no credential
   it could stop can still hold (90 days and 5 minutes). No request
-  carries them yet (P7-06).
+  carries them yet (P7-06). The root's phone keeps the devices it
+  issued to, under a label the user gives (`Portable::issued`: the
+  newest credential per key, and whether it is revoked), and
+  `Portable::list` says whether each identity's root is still there,
+  which a restored backup that leaves out device-only secrets is not.
 - Ties (P7-04, wire revision 13): a signed-in local account ties itself
   to a portable identity. The server gives the session a nonce
   (`TieBegin`, 5 minutes, used once); the phone signs it with the root,
@@ -3316,3 +3320,57 @@
   scan), and the first segment ready; the server logs the same once per
   start as `playback start timed`. The "playback started" line's
   `plan=` says `remux` or `transcode` where it said `converted`.
+- An NVENC encode decodes on NVDEC (PX-27): `-hwaccel cuda`, the frames
+  back in memory, so tone mapping, burn-in and scaling run on the CPU as
+  before. Detection tests NVDEC per codec and depth (H.264, 8- and
+  10-bit HEVC and AV1, VP9) where NVENC works, and a source it did not
+  decode in a test, or one whose GPU decode fails, decodes in software.
+  The transcoding line, the admin API and the Playback step's encoder
+  list name what each GPU decodes (`hevc 10-bit (nvdec)`), and a
+  playback's page says `GPU · NVDEC (CUDA)`.
+- NVENC and NVDEC start under the media sandbox: CUDA names a thread
+  through `/proc/self/task/<tid>/comm` and reads `/proc/self/maps`, and
+  failed with `CUDA_ERROR_OPERATING_SYSTEM` when Landlock refused them.
+  A run on the NVIDIA GPU may now write its own threads' names and read
+  its own `maps`, and nothing else of `/proc`; other runs still have no
+  `/proc` at all. A run on a GPU opens only that GPU's device nodes: a
+  VA-API run no NVIDIA node, an NVIDIA run no render node.
+- A failed test encode or decode at start logs what ffmpeg said last
+  (`stderr=`): as a warning for a family `transcode.hardware` names, at
+  debug for one only `auto` tried. Before, a GPU left out said nothing
+  of why.
+- A video encode runs on the one GPU that does the most of it (PX-28).
+  With `transcode.hardware = ["nvenc", "vaapi"]` the encoder was the
+  first family that encodes the output codec, and the source decoded on
+  it or on the CPU. Now each family that encodes the codec is ranked:
+  the whole job on it (decode, then tone map, picture burn-in and scale
+  on the GPU), decode and encode with the filters on the CPU, or encode
+  only; the best wins, the list's order between equals. A GTX 1060
+  beside an AMD GPU sends an AV1 film to the AMD GPU, which decodes it,
+  and a film both decode to NVIDIA unless the AMD GPU also runs its
+  filters (VA-API scales on the GPU, NVDEC's frames scale on the CPU, so
+  a downscale goes to VA-API). A job never decodes on one GPU and
+  encodes on another. A software encode decodes on the first GPU that
+  decodes the source, NVDEC too now. A run whose GPU decode fails runs
+  again in software on the same encoder. Server › Playback's plan and
+  "How it is made" name the encoder the run picked.
+- A family `transcode.hardware` names that lacks a codec logs one line
+  at info, `nvenc lacks: av1 encode, av1 decode, av1 10-bit decode`,
+  rather than a warning per failed test at every start; each test's
+  stderr is at debug. A named family with no working encoder still
+  warns, now with its first failed test's stderr.
+- With `transcode.gpu_filters` on, an NVIDIA job filters on the GPU too
+  (PX-29): NVDEC's frames stay there (`-hwaccel_output_format cuda`),
+  `scale_cuda` scales them (and makes a 10-bit source 8-bit for H.264),
+  and picture subtitles are uploaded and burned in with `overlay_cuda`.
+  NVIDIA tone maps on the CPU, so an HDR film, or one with text burned
+  in, filters all on the CPU as before. Detection tries both filters
+  with a short run where NVENC and NVDEC work; one that fails stays on
+  the CPU and shows in the `nvenc lacks: …` line, and the transcoding
+  line says GPU filters per family (`vaapi: tone map, overlay; nvenc:
+  scale, overlay`). Such a job weighs as all on the GPU, the playback
+  page says its burn-in ran there, and one whose CUDA filters fail runs
+  again decoded in software with the CPU's filters. With GPU filters on,
+  a 4K film made 1080p that both GPUs decode now goes to NVIDIA when it
+  is first in `transcode.hardware`, and a picture burn-in to NVIDIA over
+  an AMD GPU (Mesa has no `overlay_vaapi`).

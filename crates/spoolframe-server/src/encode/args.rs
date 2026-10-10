@@ -5,12 +5,15 @@
 //! encoder gets its frames uploaded at the end of the chain. The video is
 //! decoded on the GPU where it can be ([`decode`]), the frames coming
 //! back to memory for those filters, or staying on the GPU for a VA-API
-//! encode that needs none.
+//! or NVENC encode whose filters all run there.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use spoolframe_media::encoders::{Encoders, Hardware, TONEMAP_VAAPI, VideoEncoder, hwaccel_args};
+use spoolframe_media::encoders::{
+    Encoders, Hardware, TONEMAP_VAAPI, VideoEncoder, cuda_device_args, hwaccel_args,
+};
+use spoolframe_media::sandbox::GpuUse;
 use spoolframe_media::{
     MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, VideoStream, codecs,
 };
@@ -80,8 +83,8 @@ pub struct EncodeSpec<'a> {
     /// The video may be decoded on the GPU: false once that failed for
     /// this file (see [`decode`]).
     pub hardware_decode: bool,
-    /// Tone map and burn in pictures on the GPU where the driver can
-    /// (`transcode.gpu_filters`).
+    /// Run the filters on the GPU where it can (`transcode.gpu_filters`):
+    /// VA-API's tone map and burn-in, NVIDIA's scale and burn-in (PX-29).
     pub gpu_filters: bool,
     pub start: Option<Duration>,
     pub output: Output,
@@ -95,16 +98,16 @@ pub enum Decode {
     /// On the GPU, with the frames back in memory for the filters on the
     /// CPU.
     Hardware,
-    /// On the GPU, and the frames stay there: scaled on it and encoded
+    /// On the GPU, and the frames stay there: filtered on it and encoded
     /// from it, for a video that needs no filter on the CPU.
     Gpu,
 }
 
-/// Where `spec`'s video is decoded: on the GPU when detection found a
-/// VA-API decoder for its codec and it is encoded with VA-API or in
-/// software, unless that failed for this file before; and with the
-/// frames left on the GPU when a VA-API encoder takes them there and no
-/// filter on the CPU needs them.
+/// Where `spec`'s video is decoded: on the GPU [`placement`] picked for
+/// it, unless that failed for this file before; and with the frames left
+/// on the GPU when that GPU's encoder takes them there and no filter on
+/// the CPU needs them: on VA-API, which scales there always; on NVIDIA
+/// only with GPU filters on and `scale_cuda` found ([`cuda_frames`]).
 ///
 /// A software encode gains too. Measured for 60 s of output, a GPU decode
 /// cut libx264's CPU time by 3% on a 10 Mbit/s 1080p source and 20% on a
@@ -112,61 +115,264 @@ pub enum Decode {
 /// one, though the 4K ones take up to twice as long, the frames' way
 /// back from the GPU being slow: still over three times real time.
 pub fn decode(spec: &EncodeSpec<'_>) -> Decode {
-    match gpu_decodable(spec) {
-        None => Decode::Software,
-        Some(Some(Hardware::Vaapi)) if cpu_filters(spec).is_empty() => Decode::Gpu,
-        Some(_) => Decode::Hardware,
+    match placement(spec) {
+        Some(Placement {
+            decoder: Some(Hardware::Vaapi),
+            encoder:
+                VideoEncoder {
+                    hardware: Some(Hardware::Vaapi),
+                    ..
+                },
+        }) if cpu_filters(spec, Hardware::Vaapi).is_empty() => Decode::Gpu,
+        Some(Placement {
+            decoder: Some(Hardware::Nvenc),
+            encoder:
+                VideoEncoder {
+                    hardware: Some(Hardware::Nvenc),
+                    ..
+                },
+        }) if cuda_frames(spec) => Decode::Gpu,
+        Some(Placement {
+            decoder: Some(_), ..
+        }) => Decode::Hardware,
+        _ => Decode::Software,
     }
 }
 
-/// If `spec`'s video may be decoded on the GPU, what encodes it: `None`
-/// for software, or VA-API.
-fn gpu_decodable(spec: &EncodeSpec<'_>) -> Option<Option<Hardware>> {
-    let (Some(ConvertedVideo::Encode { codec, .. }), Some(stream)) =
-        (spec.video, &spec.descriptor.video)
-    else {
+/// The GPU API `spec`'s video decodes through, if it decodes on one:
+/// VA-API, or NVDEC (`Hardware::Nvenc`, `-hwaccel cuda`).
+///
+/// NVDEC's frames come back to memory (no `-hwaccel_output_format
+/// cuda`) for filters on the CPU, NVENC uploading them as it does after
+/// a software decode; they stay on the GPU where [`cuda_frames`] says.
+/// QSV decodes in software: its hwaccel is not set up.
+pub fn gpu_decoder(spec: &EncodeSpec<'_>) -> Option<Hardware> {
+    placement(spec).and_then(|place| place.decoder)
+}
+
+/// What runs a video encode (PX-28): its encoder, and the GPU API that
+/// decodes its source, if one does. One family at most: the decoder is
+/// the encoder's own family or, for a software encode, any one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement<'a> {
+    pub encoder: &'a VideoEncoder,
+    pub decoder: Option<Hardware>,
+}
+
+impl Placement<'_> {
+    /// The GPU the run may open: the encoder's, or for a software encode
+    /// the decoder's; none for software throughout.
+    pub fn gpu(&self) -> GpuUse {
+        self.encoder
+            .hardware
+            .or(self.decoder)
+            .map_or(GpuUse::None, Hardware::gpu)
+    }
+}
+
+/// How much of a job a family does (PX-28), best first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Share {
+    /// Decodes, filters and encodes: nothing on the CPU.
+    Whole,
+    /// Decodes and encodes; a filter runs on the CPU.
+    DecodeAndEncode,
+    /// Encodes what the CPU decoded.
+    EncodeOnly,
+}
+
+/// The one GPU family `spec`'s video encode runs on (PX-28), and so its
+/// encoder and decoder: of the families that encode the output codec,
+/// the one that does the most of the job ([`Share`]), the first in
+/// `transcode.hardware`'s order among equals (detection lists each
+/// codec's encoders in that order). With none, software, decoding on the
+/// first family that decodes the source (detection lists each sample's
+/// decoders in that order). A family never decodes for another's
+/// encoder: frames would go from one GPU to the other through memory.
+///
+/// The pick is of what detection found, not of this file's GPU decode
+/// having failed before: the run that follows such a failure decodes in
+/// software on the same encoder (`hardware_decode`). `None` for a video
+/// that is not encoded, or a codec nothing here encodes.
+pub fn placement<'a>(spec: &EncodeSpec<'a>) -> Option<Placement<'a>> {
+    let Some(ConvertedVideo::Encode { codec, .. }) = spec.video else {
         return None;
     };
-    // NVENC and QSV would decode with their own hwaccels, which are not
-    // set up.
-    let hardware = spec.encoders.video_encoder(codec)?.hardware;
+    let encoders = spec.encoders;
+    let candidates = encoders.video.iter().filter(|e| e.codec == codec);
+    let stream = spec.descriptor.video.as_ref();
+    let decodes =
+        |hardware: Hardware| stream.is_some_and(|s| decodes_source(encoders, s, hardware));
+    let hardware = candidates
+        .clone()
+        .filter_map(|e| e.hardware.map(|h| (e, h)))
+        .enumerate()
+        .map(|(order, (encoder, family))| {
+            let share = match stream {
+                Some(_) if decodes(family) => {
+                    if whole_on(spec, family) {
+                        Share::Whole
+                    } else {
+                        Share::DecodeAndEncode
+                    }
+                }
+                _ => Share::EncodeOnly,
+            };
+            ((share, order), encoder, family)
+        })
+        .min_by_key(|(rank, _, _)| *rank);
+    let (encoder, decoder) = match hardware {
+        Some((_, encoder, family)) => (encoder, decodes(family).then_some(family)),
+        None => {
+            let software = candidates.clone().find(|e| e.hardware.is_none())?;
+            let source = stream.map(|s| codecs::video_codec(&s.codec));
+            let first = encoders
+                .hardware_decoders
+                .iter()
+                .filter(|d| Some(d.codec) == source)
+                .map(|d| d.hardware)
+                .find(|h| decodes(*h));
+            (software, first)
+        }
+    };
+    Some(Placement {
+        encoder,
+        decoder: decoder.filter(|_| spec.hardware_decode),
+    })
+}
+
+/// The video encoder [`placement`] picks for `video`, an encode of
+/// `descriptor`'s video with `subtitle`: what Server › Playback's plan
+/// names, before or without a run.
+pub fn planned_encoder(
+    encoders: &Encoders,
+    descriptor: &MediaDescriptor,
+    video: ConvertedVideo,
+    subtitle: Option<ConvertedSubtitle>,
+    gpu_filters: bool,
+) -> Option<VideoEncoder> {
+    let spec = EncodeSpec {
+        input: Path::new(""),
+        sidecar: None,
+        descriptor,
+        video: Some(video),
+        audio: None,
+        subtitle,
+        encoders,
+        vaapi_device: Path::new(""),
+        hardware_decode: true,
+        gpu_filters,
+        start: None,
+        output: Output::Progressive {
+            file: PathBuf::new(),
+        },
+    };
+    placement(&spec).map(|place| place.encoder.clone())
+}
+
+/// Whether `hardware` decodes `stream`, as far as detection's tests and
+/// what drivers take say. VA-API's tests were of 8-bit samples, and
+/// [`gpu_decodes`] says what else drivers take. NVDEC's were of each
+/// depth it is used for: a 10-bit source needs a 10-bit test decode to
+/// have worked, and 10-bit H.264 has none. QSV's hwaccel is not set up.
+fn decodes_source(encoders: &Encoders, stream: &VideoStream, hardware: Hardware) -> bool {
     let source = codecs::video_codec(&stream.codec);
-    (spec.hardware_decode
-        && matches!(hardware, None | Some(Hardware::Vaapi))
-        && spec.encoders.decodes(source, Hardware::Vaapi)
-        && gpu_decodes(stream, source))
-    .then_some(hardware)
+    match hardware {
+        Hardware::Vaapi => encoders.decodes(source, Hardware::Vaapi) && gpu_decodes(stream, source),
+        Hardware::Nvenc => {
+            encoders.decodes_depth(source, stream.bit_depth, Hardware::Nvenc)
+                && four_two_zero(stream)
+        }
+        Hardware::Qsv => false,
+    }
+}
+
+/// Whether `family`, decoding and encoding `spec`'s video, would run
+/// every filter it needs on the GPU too: where [`cpu_filters`] leaves
+/// none on the CPU. With GPU filters off, NVDEC's frames come back to
+/// memory, so on NVIDIA only a job with no filter at all (no tone map,
+/// no burn-in, no scale) is all on the GPU, as PX-28 had it.
+fn whole_on(spec: &EncodeSpec<'_>, family: Hardware) -> bool {
+    match family {
+        Hardware::Vaapi | Hardware::Nvenc => cpu_filters(spec, family).is_empty(),
+        Hardware::Qsv => false,
+    }
+}
+
+/// Whether NVDEC's frames stay on the GPU for `spec`'s NVENC encode
+/// (PX-29): GPU filters on, `scale_cuda` found (its test is of this very
+/// path: a CUDA decode, filtered and encoded on the GPU), and every
+/// filter the job needs runs on CUDA. A tone map or text burn-in takes
+/// all of the job's filters to the CPU, rather than a chain half on each.
+fn cuda_frames(spec: &EncodeSpec<'_>) -> bool {
+    spec.gpu_filters && spec.encoders.cuda_scale && cpu_filters(spec, Hardware::Nvenc).is_empty()
 }
 
 /// A filter of a video encode that runs on the CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CpuFilter {
-    /// The GPU's driver has no `tonemap_vaapi`, or GPU filters are off.
+    /// VA-API's driver has no `tonemap_vaapi`, or GPU filters are off.
+    /// NVIDIA tone maps on the CPU always (the operator's choice: no
+    /// `tonemap_opencl`).
     ToneMap,
-    /// The GPU's driver has no `overlay_vaapi`, or GPU filters are off.
+    /// The driver has no `overlay_vaapi` or `overlay_cuda`, or GPU
+    /// filters are off.
     Pictures,
+    /// `overlay_cuda` lays pictures over 8-bit video only, and the
+    /// output keeps the source's 10 bits (HEVC, AV1).
+    PicturesOverTenBits,
     /// Text is rendered by libass, on the CPU only. It is burned in only
     /// for a device that shows no text format at all, so it has no GPU
     /// path.
     Text,
+    /// NVIDIA has no `scale_cuda`, or GPU filters are off. VA-API always
+    /// scales on the GPU.
+    Scale,
 }
 
-/// The filters of `spec`'s video encode that run on the CPU: tone
-/// mapping and burn-in, unless GPU filters are on and the driver runs
-/// them. Scaling always can run on the GPU.
-fn cpu_filters(spec: &EncodeSpec<'_>) -> Vec<CpuFilter> {
-    let Some(ConvertedVideo::Encode { tone_map, .. }) = spec.video else {
+/// The filters of `spec`'s video encode that run on the CPU on `family`:
+/// tone mapping and burn-in, unless GPU filters are on and the driver
+/// runs them; and on NVIDIA the scale, unless GPU filters are on and
+/// `scale_cuda` runs. VA-API always scales on the GPU.
+fn cpu_filters(spec: &EncodeSpec<'_>, family: Hardware) -> Vec<CpuFilter> {
+    let Some(ConvertedVideo::Encode {
+        codec,
+        height,
+        tone_map,
+        ..
+    }) = spec.video
+    else {
         return Vec::new();
     };
+    let on = spec.gpu_filters;
+    let encoders = spec.encoders;
+    let stream = spec.descriptor.video.as_ref();
+    let (tonemaps, scales, overlays) = match family {
+        Hardware::Vaapi => (on && encoders.gpu_tonemap, true, on && encoders.gpu_overlay),
+        Hardware::Nvenc => (
+            false,
+            on && encoders.cuda_scale,
+            on && encoders.cuda_overlay,
+        ),
+        Hardware::Qsv => (false, false, false),
+    };
     let mut cpu = Vec::new();
-    if tone_map && !(spec.gpu_filters && spec.encoders.gpu_tonemap) {
+    if tone_map && !tonemaps {
         cpu.push(CpuFilter::ToneMap);
     }
+    if !scales && stream.is_some_and(|s| height < s.height) {
+        cpu.push(CpuFilter::Scale);
+    }
+    // NVIDIA's pictures go over `yuv420p`: an 8-bit output only.
+    let ten_bits_out =
+        codec != VideoCodec::H264 && !tone_map && stream.is_some_and(|s| s.bit_depth > 8);
     match burned(spec).ok().flatten().map(|track| track.kind) {
-        Some(SubtitleKind::Bitmap) if spec.gpu_filters && spec.encoders.gpu_overlay => {}
-        Some(SubtitleKind::Bitmap) => cpu.push(CpuFilter::Pictures),
+        Some(SubtitleKind::Bitmap) if !overlays => cpu.push(CpuFilter::Pictures),
+        Some(SubtitleKind::Bitmap) if family == Hardware::Nvenc && ten_bits_out => {
+            cpu.push(CpuFilter::PicturesOverTenBits);
+        }
+        Some(SubtitleKind::Bitmap) | None => {}
         Some(SubtitleKind::Text) => cpu.push(CpuFilter::Text),
-        None => {}
     }
     cpu
 }
@@ -190,18 +396,36 @@ fn burned<'a>(spec: &EncodeSpec<'a>) -> Result<Option<&'a SubtitleStream>, Strin
 }
 
 /// With GPU filters on, why filters `spec` asks the GPU for run on the
-/// CPU instead: the driver lacks one, or the subtitle is text. Nothing
-/// when they are off, or the video is not decoded on the GPU at all.
+/// CPU instead: the driver lacks one, NVIDIA does not tone map, or the
+/// subtitle is text. Nothing when they are off, or the video is not
+/// decoded and encoded on one GPU.
 pub fn cpu_instead_of_gpu(spec: &EncodeSpec<'_>) -> Vec<&'static str> {
-    if !spec.gpu_filters || gpu_decodable(spec) != Some(Some(Hardware::Vaapi)) {
+    let family = placement(spec).and_then(|place| {
+        place
+            .decoder
+            .filter(|decoder| place.encoder.hardware == Some(*decoder))
+    });
+    let Some(family @ (Hardware::Vaapi | Hardware::Nvenc)) = family else {
+        return Vec::new();
+    };
+    if !spec.gpu_filters {
         return Vec::new();
     }
-    cpu_filters(spec)
+    let vaapi = family == Hardware::Vaapi;
+    cpu_filters(spec, family)
         .into_iter()
         .map(|filter| match filter {
-            CpuFilter::ToneMap => "the GPU's driver does not tone map (tonemap_vaapi)",
-            CpuFilter::Pictures => "the GPU's driver does not overlay pictures (overlay_vaapi)",
+            CpuFilter::ToneMap if vaapi => "the GPU's driver does not tone map (tonemap_vaapi)",
+            CpuFilter::ToneMap => "NVIDIA GPUs tone map on the CPU",
+            CpuFilter::Pictures if vaapi => {
+                "the GPU's driver does not overlay pictures (overlay_vaapi)"
+            }
+            CpuFilter::Pictures => "the NVIDIA GPU does not overlay pictures (overlay_cuda)",
+            CpuFilter::PicturesOverTenBits => {
+                "pictures are burned into 10-bit video on the CPU (overlay_cuda is 8-bit)"
+            }
             CpuFilter::Text => "text subtitles are burned in on the CPU",
+            CpuFilter::Scale => "the NVIDIA GPU does not scale (scale_cuda)",
         })
         .collect()
 }
@@ -236,8 +460,8 @@ pub struct Made {
     pub tone_map: FilterOn,
     pub burn_in: FilterOn,
     /// The picture written, width × height: the source's, or scaled to
-    /// the plan's height as `scale=-2:h` (or `scale_vaapi=w=-2`) scales
-    /// it. `None` with no video.
+    /// the plan's height as `scale=-2:h` (or `scale_vaapi=w=-2`,
+    /// `scale_cuda=w=-2`) scales it. `None` with no video.
     pub size: Option<(u32, u32)>,
     /// The encoder's stated target (`-b:v`), when it has one.
     pub target_bitrate: Option<u64>,
@@ -248,10 +472,10 @@ pub fn made(spec: &EncodeSpec<'_>) -> Made {
     let stream = spec.descriptor.video.as_ref();
     let source = stream.map(|v| (v.width, v.height));
     let Some(ConvertedVideo::Encode {
-        codec,
         height,
         max_bitrate,
         tone_map,
+        ..
     }) = spec.video
     else {
         return Made {
@@ -272,12 +496,11 @@ pub fn made(spec: &EncodeSpec<'_>) -> Made {
         (true, _) => FilterOn::Cpu,
     };
     Made {
-        decoder: match decode {
-            Decode::Software => Decoder::Software,
-            // Only VA-API decodes on the GPU (`gpu_decodable`).
-            Decode::Hardware | Decode::Gpu => Decoder::Hardware(Hardware::Vaapi),
+        decoder: match gpu_decoder(spec) {
+            None => Decoder::Software,
+            Some(hardware) => Decoder::Hardware(hardware),
         },
-        encoder: spec.encoders.video_encoder(codec).cloned(),
+        encoder: placement(spec).map(|place| place.encoder.clone()),
         tone_map: on(tone_map),
         burn_in: on(matches!(burned(spec), Ok(Some(_)))),
         size: source.map(|(w, h)| scaled(w, h, height)),
@@ -302,12 +525,17 @@ fn scaled(width: u32, height: u32, to: u32) -> (u32, u32) {
 /// refuses, ffmpeg decodes in software itself, or the job is run again
 /// in software (`job`).
 fn gpu_decodes(stream: &VideoStream, codec: VideoCodec) -> bool {
-    let four_two_zero = stream.pixel_format.as_deref().is_none_or(|format| {
+    four_two_zero(stream) && !(codec == VideoCodec::H264 && stream.bit_depth > 8)
+}
+
+/// Whether `stream` is 4:2:0, all detection's samples are: the only
+/// chroma every GPU decoder takes (NVDEC's HEVC 4:4:4 is Turing on).
+fn four_two_zero(stream: &VideoStream) -> bool {
+    stream.pixel_format.as_deref().is_none_or(|format| {
         ["yuv420p", "yuvj420p", "nv12", "p010"]
             .iter()
             .any(|ok| format.starts_with(ok))
-    });
-    four_two_zero && !(codec == VideoCodec::H264 && stream.bit_depth > 8)
+    })
 }
 
 /// HDR to SDR (BT.709) with the Hable curve, in software: it works for any
@@ -453,6 +681,50 @@ fn gpu_graph(
     })
 }
 
+/// The video's filters on NVIDIA's GPU (PX-29), for frames NVDEC left
+/// there: `scale_cuda` scales to an even width as the CPU's `scale=-2`
+/// does, and converts a 10-bit picture to 8 bits for H.264, as the CPU's
+/// chain does with `format=yuv420p`; HEVC and AV1 keep the source's
+/// depth, as on the CPU. Burned-in pictures are scaled on the CPU to the
+/// picture written, uploaded to the decode's device (named by
+/// [`cuda_device_args`]) and laid over it after the scale: the same
+/// picture as the CPU's overlay-then-scale, with a smaller upload.
+/// `overlay_cuda` lays `yuva420p` over `yuv420p` only, so the video is
+/// converted to it; [`cpu_filters`] keeps a 10-bit output's pictures on
+/// the CPU. [`decode`] chose this path, so CUDA runs every filter asked
+/// for (no tone map: NVIDIA's is on the CPU).
+fn cuda_graph(
+    spec: &EncodeSpec<'_>,
+    stream: &VideoStream,
+    codec: VideoCodec,
+    height: u32,
+) -> Result<String, String> {
+    let burned = burned(spec)?;
+    let mut options = Vec::new();
+    if height < stream.height {
+        options.push(format!("w=-2:h={height}"));
+    }
+    if burned.is_some() {
+        options.push(s("format=yuv420p"));
+    } else if codec == VideoCodec::H264 && stream.bit_depth > 8 {
+        options.push(s("format=nv12"));
+    }
+    let video = format!("[0:{}]", stream.index);
+    let scale = format!("scale_cuda={}", options.join(":"));
+    Ok(match burned {
+        Some(track) => {
+            let (width, height) = scaled(stream.width, stream.height, height);
+            format!(
+                "[{}]scale={width}:{height},format=yuva420p,hwupload[subs];\
+                 {video}{scale}[main];[main][subs]overlay_cuda[v]",
+                pictures_input(&track.source),
+            )
+        }
+        None if options.is_empty() => format!("{video}null[v]"),
+        None => format!("{video}{scale}[v]"),
+    })
+}
+
 /// Where burned-in pictures come from: the film's own stream, or the
 /// external file, the second input.
 fn pictures_input(source: &SubtitleSource) -> String {
@@ -473,8 +745,8 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
     // The video encoder, if any: VA-API wants its device before the inputs.
     let encoder = match spec.video {
         Some(ConvertedVideo::Encode { codec, .. }) => Some(
-            spec.encoders
-                .video_encoder(codec)
+            placement(spec)
+                .map(|place| place.encoder)
                 .ok_or_else(|| format!("no encoder for {codec} on this machine"))?,
         ),
         _ => None,
@@ -487,20 +759,26 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
         args.extend([s("-vaapi_device"), s(spec.vaapi_device.display())]);
     }
     // An option of the film's input, so before its seek.
+    let decoder = gpu_decoder(spec);
     if decode == Decode::Gpu && matches!(burned(spec), Ok(Some(_))) {
         // The pictures are uploaded to the device the film decodes on:
         // one device, named, for both.
-        args.extend([
-            s("-init_hw_device"),
-            format!("vaapi=gpu:{}", spec.vaapi_device.display()),
-            s("-filter_hw_device"),
-            s("gpu"),
-        ]);
-        args.extend(["-hwaccel", "vaapi", "-hwaccel_device", "gpu"].map(s));
-        args.extend(["-hwaccel_output_format", "vaapi"].map(s));
-    } else if decode != Decode::Software {
+        if decoder == Some(Hardware::Nvenc) {
+            args.extend(cuda_device_args());
+        } else {
+            args.extend([
+                s("-init_hw_device"),
+                format!("vaapi=gpu:{}", spec.vaapi_device.display()),
+                s("-filter_hw_device"),
+                s("gpu"),
+            ]);
+            args.extend(["-hwaccel", "vaapi", "-hwaccel_device", "gpu"].map(s));
+            args.extend(["-hwaccel_output_format", "vaapi"].map(s));
+        }
+    } else if let Some(decoder) = decoder {
+        // The frames back in memory, or kept on the GPU.
         args.extend(hwaccel_args(
-            Hardware::Vaapi,
+            decoder,
             spec.vaapi_device,
             decode == Decode::Gpu,
         ));
@@ -579,7 +857,9 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 tone_map,
             } => {
                 let encoder = encoder.expect("set above for an encode");
-                let graph = if decode == Decode::Gpu {
+                let graph = if decode == Decode::Gpu && decoder == Some(Hardware::Nvenc) {
+                    cuda_graph(spec, stream, codec, height)?
+                } else if decode == Decode::Gpu {
                     gpu_graph(spec, stream, height, tone_map)?
                 } else {
                     cpu_graph(spec, stream, codec, height, tone_map, vaapi)?
@@ -863,7 +1143,10 @@ mod tests {
             hardware_decoders: Vec::new(),
             gpu_tonemap: false,
             gpu_overlay: false,
+            cuda_scale: false,
+            cuda_overlay: false,
             unusable: Vec::new(),
+            failed: Vec::new(),
         }
     }
 
@@ -902,6 +1185,7 @@ mod tests {
                 .map(|codec| HardwareDecoder {
                     codec,
                     hardware: Hardware::Vaapi,
+                    bit_depth: 8,
                 })
                 .to_vec(),
             ..encoders(vaapi)
@@ -966,6 +1250,7 @@ mod tests {
             hardware_decoders: vec![HardwareDecoder {
                 codec: VideoCodec::H264,
                 hardware: Hardware::Vaapi,
+                bit_depth: 8,
             }],
             ..encoders(true)
         };
@@ -1003,18 +1288,518 @@ mod tests {
         assert!(has(&args, &["-c:v", "libx264"]));
     }
 
-    /// NVENC would decode with CUDA, which nothing here sets up.
-    #[test]
-    fn an_nvenc_encode_decodes_in_software() {
-        let film = film();
-        let mut enc = with_decoders(true);
-        for encoder in &mut enc.video {
-            encoder.hardware = Some(Hardware::Nvenc);
-            encoder.name = encoder.name.replace("vaapi", "nvenc");
+    /// NVENC for H.264 and HEVC, and NVDEC's decoders as a GTX 1060's
+    /// tests find them: H.264, 8- and 10-bit HEVC, VP9; no AV1.
+    fn nvidia() -> Encoders {
+        let nvenc = |codec, name: &str| VideoEncoder {
+            codec,
+            name: name.into(),
+            hardware: Some(Hardware::Nvenc),
+        };
+        let nvdec = |codec, bit_depth| HardwareDecoder {
+            codec,
+            hardware: Hardware::Nvenc,
+            bit_depth,
+        };
+        Encoders {
+            video: vec![
+                nvenc(VideoCodec::H264, "h264_nvenc"),
+                nvenc(VideoCodec::Hevc, "hevc_nvenc"),
+            ],
+            hardware_decoders: vec![
+                nvdec(VideoCodec::H264, 8),
+                nvdec(VideoCodec::Hevc, 8),
+                nvdec(VideoCodec::Hevc, 10),
+                nvdec(VideoCodec::Vp9, 8),
+            ],
+            ..encoders(false)
         }
-        let spec = spec(&film, &enc, plain_h264(1080), COPY_DTS, None, hls());
+    }
+
+    /// PX-27: the tester's case, 4K HDR10 HEVC to 1080p H.264 on NVENC,
+    /// here with PGS burned in too. NVDEC decodes (`-hwaccel cuda`, an
+    /// input option before the seek), the frames come back to memory, and
+    /// the burn-in, tone map and scale run on the CPU as after a software
+    /// decode; NVENC takes the frames from memory. GPU filters on, on a
+    /// GPU where no CUDA filter was found, change nothing but the reasons
+    /// logged.
+    #[test]
+    fn an_nvenc_encode_decodes_on_nvdec_with_a_cpu_tone_map_and_burn_in() {
+        let (film, enc) = (film(), nvidia());
+        let mut spec = spec_with(
+            &film,
+            &enc,
+            TONE_MAPPED_H264,
+            burn_in(0, SubtitleFormat::Pgs),
+        );
+        spec.start = Some(Duration::from_secs(600));
+        spec.gpu_filters = true;
+        assert_eq!(decode(&spec), Decode::Hardware);
+        assert_eq!(gpu_decoder(&spec), Some(Hardware::Nvenc));
+        let args = ffmpeg_args(&spec).unwrap();
+        assert_eq!(
+            args[..11],
+            [
+                "-hide_banner",
+                "-nostdin",
+                "-y",
+                "-loglevel",
+                "error",
+                "-hwaccel",
+                "cuda",
+                "-ss",
+                "600.000",
+                "-i",
+                "/media/Film.mkv"
+            ]
+        );
+        for vaapi_only in [
+            "-hwaccel_output_format",
+            "-hwaccel_device",
+            "-vaapi_device",
+            "-init_hw_device",
+        ] {
+            assert!(!args.contains(&s(vaapi_only)), "{vaapi_only}: {args:?}");
+        }
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            format!("[0:2]scale=3840:2160[subs];[0:0][subs]overlay,{TONE_MAP},scale=-2:1080[v]")
+        );
+        assert!(has(&args, &["-c:v", "h264_nvenc"]));
+        assert_eq!(
+            cpu_instead_of_gpu(&spec),
+            [
+                "NVIDIA GPUs tone map on the CPU",
+                "the NVIDIA GPU does not scale (scale_cuda)",
+                "the NVIDIA GPU does not overlay pictures (overlay_cuda)"
+            ]
+        );
+        // PX-24 says so.
+        let made = made(&spec);
+        assert_eq!(made.decoder, Decoder::Hardware(Hardware::Nvenc));
+        assert_eq!(made.encoder.map(|e| e.name), Some(s("h264_nvenc")));
+        assert_eq!(
+            (made.tone_map, made.burn_in),
+            (FilterOn::Cpu, FilterOn::Cpu)
+        );
+        assert_eq!(made.size, Some((1920, 1080)));
+    }
+
+    /// The same graph as a software decode's: NVDEC only moves the decode.
+    #[test]
+    fn an_nvdec_decode_filters_as_a_software_one_does() {
+        let (film, enc) = (film(), nvidia());
+        let on_gpu = spec_with(
+            &film,
+            &enc,
+            TONE_MAPPED_H264,
+            burn_in(0, SubtitleFormat::Pgs),
+        );
+        let software = EncodeSpec {
+            hardware_decode: false,
+            ..on_gpu.clone()
+        };
+        let (gpu_args, cpu_args) = (
+            ffmpeg_args(&on_gpu).unwrap(),
+            ffmpeg_args(&software).unwrap(),
+        );
+        let without_hwaccel: Vec<&String> = gpu_args
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| *a != "-hwaccel" && !(*i > 0 && gpu_args[i - 1] == "-hwaccel"))
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(without_hwaccel, cpu_args.iter().collect::<Vec<_>>());
+    }
+
+    /// What NVDEC's tests did not decode, or a stream they did not cover,
+    /// decodes in software: AV1 on Pascal, 10-bit H.264 (no NVIDIA GPU
+    /// decodes it), 4:2:2, 10-bit HEVC where only 8-bit was decoded; and
+    /// VA-API's decoders are not NVENC's.
+    #[test]
+    fn a_source_nvdec_lacks_decodes_in_software() {
+        let enc = nvidia();
+        let with = |change: fn(&mut VideoStream)| {
+            let mut film = film();
+            change(film.video.as_mut().unwrap());
+            film
+        };
+        let av1 = with(|v| v.codec = "av1".into());
+        let high10 = with(|v| {
+            v.codec = "h264".into();
+            v.profile = Some("High 10".into());
+        });
+        let four_two_two = with(|v| v.pixel_format = Some("yuv422p10le".into()));
+        for (name, film) in [("av1", &av1), ("high10", &high10), ("4:2:2", &four_two_two)] {
+            let spec = spec_with(film, &enc, TONE_MAPPED_H264, None);
+            assert_eq!(decode(&spec), Decode::Software, "{name}");
+            assert!(
+                !ffmpeg_args(&spec).unwrap().contains(&s("-hwaccel")),
+                "{name}"
+            );
+            assert_eq!(made(&spec).decoder, Decoder::Software, "{name}");
+        }
+        // 10-bit HEVC where only 8-bit decoded.
+        let film = film();
+        let eight_bit = Encoders {
+            hardware_decoders: enc
+                .hardware_decoders
+                .iter()
+                .filter(|d| d.bit_depth == 8)
+                .cloned()
+                .collect(),
+            ..nvidia()
+        };
+        let spec = spec_with(&film, &eight_bit, TONE_MAPPED_H264, None);
+        assert_eq!(decode(&spec), Decode::Software);
+        // VA-API's decoders, beside an NVENC encode.
+        let vaapi_decoders = Encoders {
+            hardware_decoders: with_decoders(true).hardware_decoders,
+            ..nvidia()
+        };
+        let spec = spec_with(&film, &vaapi_decoders, plain_h264(1080), None);
         assert_eq!(decode(&spec), Decode::Software);
         assert!(!ffmpeg_args(&spec).unwrap().contains(&s("-hwaccel")));
+    }
+
+    /// QSV is as it was: its hwaccel is not set up, so it decodes in
+    /// software whatever was found.
+    #[test]
+    fn a_qsv_encode_decodes_in_software() {
+        let film = film();
+        let mut enc = nvidia();
+        for encoder in &mut enc.video {
+            encoder.hardware = Some(Hardware::Qsv);
+            encoder.name = encoder.name.replace("nvenc", "qsv");
+        }
+        for decoder in &mut enc.hardware_decoders {
+            decoder.hardware = Hardware::Qsv;
+        }
+        let spec = spec_with(&film, &enc, plain_h264(1080), None);
+        assert_eq!(decode(&spec), Decode::Software);
+        assert!(!ffmpeg_args(&spec).unwrap().contains(&s("-hwaccel")));
+    }
+
+    /// A film whose NVDEC decode failed before decodes in software, still
+    /// encoded on NVENC: the run the job falls back to.
+    #[test]
+    fn an_nvenc_encode_whose_gpu_decode_failed_decodes_in_software() {
+        let (film, enc) = (film(), nvidia());
+        let mut spec = spec_with(&film, &enc, TONE_MAPPED_H264, None);
+        spec.hardware_decode = false;
+        assert_eq!(decode(&spec), Decode::Software);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(!args.contains(&s("-hwaccel")), "{args:?}");
+        assert!(has(&args, &["-c:v", "h264_nvenc"]));
+        assert_eq!(made(&spec).decoder, Decoder::Software);
+    }
+
+    // PX-29: NVIDIA's filters on the GPU, `scale_cuda` and `overlay_cuda`.
+
+    /// `nvidia()` where detection found these CUDA filters.
+    fn cuda(scale: bool, overlay: bool) -> Encoders {
+        Encoders {
+            cuda_scale: scale,
+            cuda_overlay: overlay,
+            ..nvidia()
+        }
+    }
+
+    /// `film()` as SDR 4K HEVC of `bit_depth` bits.
+    fn sdr_4k(bit_depth: u32) -> MediaDescriptor {
+        let mut film = film();
+        let video = film.video.as_mut().unwrap();
+        video.bit_depth = bit_depth;
+        video.pixel_format = Some(
+            if bit_depth > 8 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            }
+            .into(),
+        );
+        video.color_transfer = None;
+        video.hdr = None;
+        film
+    }
+
+    /// `spec_with`, GPU filters on.
+    fn filtered<'a>(
+        film: &'a MediaDescriptor,
+        encoders: &'a Encoders,
+        video: ConvertedVideo,
+        subtitle: Option<ConvertedSubtitle>,
+    ) -> EncodeSpec<'a> {
+        EncodeSpec {
+            gpu_filters: true,
+            ..spec_with(film, encoders, video, subtitle)
+        }
+    }
+
+    /// SDR 4K to 1080p H.264 on NVENC with GPU filters on: NVDEC's
+    /// frames stay on the GPU (an input option, before the seek) and
+    /// `scale_cuda` scales them; nothing is uploaded or filtered on the
+    /// CPU, and PX-24 and the weight say all on the GPU.
+    #[test]
+    fn an_nvenc_encode_scales_on_cuda_with_gpu_filters_on() {
+        let (film, enc) = (sdr_4k(8), cuda(true, true));
+        let mut spec = filtered(&film, &enc, plain_h264(1080), None);
+        spec.start = Some(Duration::from_secs(600));
+        assert_eq!(decode(&spec), Decode::Gpu);
+        assert_eq!(gpu_decoder(&spec), Some(Hardware::Nvenc));
+        let args = ffmpeg_args(&spec).unwrap();
+        assert_eq!(
+            args[5..13],
+            [
+                "-hwaccel",
+                "cuda",
+                "-hwaccel_output_format",
+                "cuda",
+                "-ss",
+                "600.000",
+                "-i",
+                "/media/Film.mkv"
+            ]
+        );
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[0:0]scale_cuda=w=-2:h=1080[v]"
+        );
+        assert!(has(&args, &["-map", "[v]", "-c:v", "h264_nvenc"]));
+        for absent in ["-vaapi_device", "-init_hw_device", "-hwaccel_device"] {
+            assert!(!args.contains(&s(absent)), "{absent}: {args:?}");
+        }
+        assert!(cpu_instead_of_gpu(&spec).is_empty());
+        let made = made(&spec);
+        assert_eq!(made.decoder, Decoder::Hardware(Hardware::Nvenc));
+        assert_eq!(made.size, Some((1920, 1080)));
+        assert_eq!(
+            (made.tone_map, made.burn_in),
+            (FilterOn::None, FilterOn::None)
+        );
+        // At its own height, 8-bit to H.264: nothing to filter.
+        let same = filtered(&film, &enc, plain_h264(2160), None);
+        assert_eq!(decode(&same), Decode::Gpu);
+        assert_eq!(
+            after(&ffmpeg_args(&same).unwrap(), "-filter_complex"),
+            "[0:0]null[v]"
+        );
+    }
+
+    /// Pictures burned in on CUDA: scaled on the CPU to the picture
+    /// written, uploaded to the decode's own device (named, one for
+    /// both), and laid over the scaled video, converted to `yuv420p` for
+    /// `overlay_cuda`. Embedded PGS, then an external file.
+    #[test]
+    fn an_nvenc_encode_burns_pictures_in_on_cuda() {
+        let (film, enc) = (sdr_4k(8), cuda(true, true));
+        for (index, pictures) in [(0, "0:2"), (3, "1:0")] {
+            let mut spec = filtered(
+                &film,
+                &enc,
+                plain_h264(1080),
+                burn_in(index, SubtitleFormat::Pgs),
+            );
+            spec.sidecar = Some(Path::new("/scratch/h/0/sidecar"));
+            assert_eq!(decode(&spec), Decode::Gpu, "subtitle {index}");
+            let args = ffmpeg_args(&spec).unwrap();
+            assert!(
+                has(
+                    &args,
+                    &[
+                        "-init_hw_device",
+                        "cuda=gpu",
+                        "-filter_hw_device",
+                        "gpu",
+                        "-hwaccel",
+                        "cuda",
+                        "-hwaccel_device",
+                        "gpu",
+                        "-hwaccel_output_format",
+                        "cuda",
+                        "-i",
+                        "/media/Film.mkv"
+                    ]
+                ),
+                "{args:?}"
+            );
+            assert_eq!(
+                after(&args, "-filter_complex"),
+                format!(
+                    "[{pictures}]scale=1920:1080,format=yuva420p,hwupload[subs];\
+                     [0:0]scale_cuda=w=-2:h=1080:format=yuv420p[main];\
+                     [main][subs]overlay_cuda[v]"
+                )
+            );
+            assert!(cpu_instead_of_gpu(&spec).is_empty());
+            let made = made(&spec);
+            assert_eq!(made.burn_in, FilterOn::Gpu, "subtitle {index}");
+            assert_eq!(made.tone_map, FilterOn::None);
+        }
+    }
+
+    /// A 10-bit SDR source: to H.264, `scale_cuda` converts it to 8 bits
+    /// as the CPU's `format=yuv420p` does; to HEVC it keeps its 10 bits,
+    /// as on the CPU, and so pictures over it are burned in on the CPU
+    /// (`overlay_cuda` is 8-bit).
+    #[test]
+    fn a_10_bit_sdr_source_is_made_8_bit_on_cuda_for_h264() {
+        let (film, enc) = (sdr_4k(10), cuda(true, true));
+        let spec = filtered(&film, &enc, plain_h264(1080), None);
+        assert_eq!(decode(&spec), Decode::Gpu);
+        assert_eq!(
+            after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"),
+            "[0:0]scale_cuda=w=-2:h=1080:format=nv12[v]"
+        );
+        let same = filtered(&film, &enc, plain_h264(2160), None);
+        assert_eq!(
+            after(&ffmpeg_args(&same).unwrap(), "-filter_complex"),
+            "[0:0]scale_cuda=format=nv12[v]"
+        );
+        let hevc = ConvertedVideo::Encode {
+            codec: VideoCodec::Hevc,
+            height: 1080,
+            max_bitrate: None,
+            tone_map: false,
+        };
+        let spec = filtered(&film, &enc, hevc, None);
+        assert_eq!(decode(&spec), Decode::Gpu);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[0:0]scale_cuda=w=-2:h=1080[v]"
+        );
+        assert!(has(&args, &["-c:v", "hevc_nvenc"]));
+        let pictures = filtered(&film, &enc, hevc, burn_in(0, SubtitleFormat::Pgs));
+        assert_eq!(decode(&pictures), Decode::Hardware);
+        let graph = s(after(&ffmpeg_args(&pictures).unwrap(), "-filter_complex"));
+        assert!(!graph.contains("_cuda"), "{graph}");
+        assert_eq!(
+            cpu_instead_of_gpu(&pictures),
+            ["pictures are burned into 10-bit video on the CPU (overlay_cuda is 8-bit)"]
+        );
+    }
+
+    /// An HDR source NVIDIA tone maps on the CPU: the frames come back to
+    /// memory and every filter of the job runs there, as before PX-29,
+    /// pictures too: no chain half on each.
+    #[test]
+    fn an_hdr_source_on_nvenc_filters_all_on_the_cpu() {
+        let (film, enc) = (film(), cuda(true, true));
+        let spec = filtered(
+            &film,
+            &enc,
+            TONE_MAPPED_H264,
+            burn_in(0, SubtitleFormat::Pgs),
+        );
+        assert_eq!(decode(&spec), Decode::Hardware);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(has(&args, &["-hwaccel", "cuda", "-i"]), "{args:?}");
+        assert!(!args.contains(&s("-hwaccel_output_format")), "{args:?}");
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            format!("[0:2]scale=3840:2160[subs];[0:0][subs]overlay,{TONE_MAP},scale=-2:1080[v]")
+        );
+        assert_eq!(
+            cpu_instead_of_gpu(&spec),
+            ["NVIDIA GPUs tone map on the CPU"]
+        );
+        let made = made(&spec);
+        assert_eq!(
+            (made.tone_map, made.burn_in),
+            (FilterOn::Cpu, FilterOn::Cpu)
+        );
+    }
+
+    /// GPU filters off: NVIDIA filters on the CPU, though CUDA could, and
+    /// says nothing of it.
+    #[test]
+    fn with_gpu_filters_off_nvenc_scales_on_the_cpu() {
+        let (film, enc) = (sdr_4k(8), cuda(true, true));
+        let spec = spec_with(&film, &enc, plain_h264(1080), None);
+        assert_eq!(decode(&spec), Decode::Hardware);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(!args.contains(&s("-hwaccel_output_format")), "{args:?}");
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[0:0]scale=-2:1080,format=yuv420p[v]"
+        );
+        assert!(cpu_instead_of_gpu(&spec).is_empty());
+    }
+
+    /// CUDA filters detection did not find run on the CPU, logged: no
+    /// `scale_cuda`, no frames on the GPU at all; no `overlay_cuda`,
+    /// pictures (and so the scale) on the CPU.
+    #[test]
+    fn cuda_filters_not_found_run_on_the_cpu() {
+        let film = sdr_4k(8);
+        let none = cuda(false, false);
+        let spec = filtered(&film, &none, plain_h264(1080), None);
+        assert_eq!(decode(&spec), Decode::Hardware);
+        assert_eq!(
+            after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"),
+            "[0:0]scale=-2:1080,format=yuv420p[v]"
+        );
+        assert_eq!(
+            cpu_instead_of_gpu(&spec),
+            ["the NVIDIA GPU does not scale (scale_cuda)"]
+        );
+        // Nothing to scale: nothing on the CPU, and still nothing kept on
+        // the GPU without `scale_cuda`'s test having passed.
+        let same = filtered(&film, &none, plain_h264(2160), None);
+        assert_eq!(decode(&same), Decode::Hardware);
+        assert!(cpu_instead_of_gpu(&same).is_empty());
+        let scale_only = cuda(true, false);
+        let pgs = filtered(
+            &film,
+            &scale_only,
+            plain_h264(1080),
+            burn_in(0, SubtitleFormat::Pgs),
+        );
+        assert_eq!(decode(&pgs), Decode::Hardware);
+        let graph = s(after(&ffmpeg_args(&pgs).unwrap(), "-filter_complex"));
+        assert!(graph.contains("overlay,scale=-2:1080"), "{graph}");
+        assert_eq!(
+            cpu_instead_of_gpu(&pgs),
+            ["the NVIDIA GPU does not overlay pictures (overlay_cuda)"]
+        );
+        // Text is libass's, on the CPU whatever the GPU has.
+        let all = cuda(true, true);
+        let text = filtered(
+            &film,
+            &all,
+            plain_h264(1080),
+            burn_in(1, SubtitleFormat::Srt),
+        );
+        assert_eq!(decode(&text), Decode::Hardware);
+        assert_eq!(
+            cpu_instead_of_gpu(&text),
+            ["text subtitles are burned in on the CPU"]
+        );
+    }
+
+    /// The CUDA path's fallback is the CPU's chain decoded in software,
+    /// still on NVENC: what the job runs when a CUDA filter fails.
+    #[test]
+    fn the_cuda_path_s_fallback_is_the_cpu_chain() {
+        let (film, enc) = (sdr_4k(8), cuda(true, true));
+        let mut spec = filtered(
+            &film,
+            &enc,
+            plain_h264(1080),
+            burn_in(0, SubtitleFormat::Pgs),
+        );
+        assert_eq!(decode(&spec), Decode::Gpu);
+        spec.hardware_decode = false;
+        assert_eq!(decode(&spec), Decode::Software);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(!args.iter().any(|a| a.contains("cuda")), "{args:?}");
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[0:2]scale=3840:2160[subs];[0:0][subs]overlay,scale=-2:1080,format=yuv420p[v]"
+        );
+        assert!(has(&args, &["-c:v", "h264_nvenc"]));
+        assert_eq!(made(&spec).burn_in, FilterOn::Cpu);
     }
 
     #[test]
@@ -1402,9 +2187,10 @@ mod tests {
         );
     }
 
-    /// NVENC decodes in software here, and filters on the CPU.
+    /// NVENC with no NVDEC decoder found decodes in software, and filters
+    /// on the CPU.
     #[test]
-    fn made_says_nvenc_decodes_in_software() {
+    fn made_says_nvenc_without_nvdec_decodes_in_software() {
         let film = film();
         let enc = Encoders {
             video: vec![VideoEncoder {
@@ -1949,5 +2735,367 @@ mod tests {
         ))
         .unwrap();
         assert!(!args.iter().any(|a| a == "-c:s" || a == "0:2"), "{args:?}");
+    }
+
+    // PX-28: one GPU per job, the one that does the most of it.
+
+    /// A host with a GTX 1060 and an AMD GPU, as detection finds it for
+    /// `transcode.hardware = ["nvenc", "vaapi"]`: NVENC encodes H.264 and
+    /// HEVC, VA-API H.264, HEVC and AV1; NVDEC decodes H.264, 8- and
+    /// 10-bit HEVC and VP9, no AV1; VA-API decodes H.264, HEVC and AV1.
+    /// Each codec's encoders, and each sample's decoders, in the policy's
+    /// order, as detection lists them.
+    fn two_gpus(order: [Hardware; 2], tonemap: bool) -> Encoders {
+        let encoder = |codec: VideoCodec, hardware: Option<Hardware>| {
+            let prefix = match codec {
+                VideoCodec::Hevc => "hevc",
+                VideoCodec::Av1 => "av1",
+                _ => "h264",
+            };
+            let name = match hardware {
+                Some(Hardware::Nvenc) => format!("{prefix}_nvenc"),
+                Some(Hardware::Vaapi) => format!("{prefix}_vaapi"),
+                Some(Hardware::Qsv) => format!("{prefix}_qsv"),
+                None => match codec {
+                    VideoCodec::Hevc => s("libx265"),
+                    VideoCodec::Av1 => s("libsvtav1"),
+                    _ => s("libx264"),
+                },
+            };
+            VideoEncoder {
+                codec,
+                name,
+                hardware,
+            }
+        };
+        let encodes = |hardware: Hardware, codec: VideoCodec| {
+            hardware == Hardware::Vaapi || codec != VideoCodec::Av1
+        };
+        let mut video = Vec::new();
+        for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
+            for hardware in order {
+                if encodes(hardware, codec) {
+                    video.push(encoder(codec, Some(hardware)));
+                }
+            }
+            video.push(encoder(codec, None));
+        }
+        let decodes = |hardware: Hardware, codec: VideoCodec, bit_depth: u32| match hardware {
+            Hardware::Nvenc => codec != VideoCodec::Av1,
+            // VA-API is tried on the 8-bit samples only.
+            _ => bit_depth == 8 && codec != VideoCodec::Vp9,
+        };
+        let mut hardware_decoders = Vec::new();
+        for (codec, bit_depth) in [
+            (VideoCodec::H264, 8),
+            (VideoCodec::Hevc, 8),
+            (VideoCodec::Hevc, 10),
+            (VideoCodec::Av1, 8),
+            (VideoCodec::Vp9, 8),
+        ] {
+            for hardware in order {
+                if decodes(hardware, codec, bit_depth) {
+                    hardware_decoders.push(HardwareDecoder {
+                        codec,
+                        hardware,
+                        bit_depth,
+                    });
+                }
+            }
+        }
+        Encoders {
+            video,
+            hardware_decoders,
+            gpu_tonemap: tonemap,
+            gpu_overlay: false,
+            // fulcrum's ffmpeg has both (PX-29).
+            cuda_scale: true,
+            cuda_overlay: true,
+            ..encoders(false)
+        }
+    }
+
+    const NVIDIA_FIRST: [Hardware; 2] = [Hardware::Nvenc, Hardware::Vaapi];
+
+    /// `film()`'s video as `codec`, 8-bit SDR at 1080p.
+    fn source(codec: &str) -> MediaDescriptor {
+        let mut film = sdr_1080p();
+        film.video.as_mut().unwrap().codec = codec.into();
+        film
+    }
+
+    /// An encode to `codec` at 1080p, nothing else asked of it.
+    fn to(codec: VideoCodec) -> ConvertedVideo {
+        ConvertedVideo::Encode {
+            codec,
+            height: 1080,
+            max_bitrate: None,
+            tone_map: false,
+        }
+    }
+
+    /// The encoder and the decoder `spec` runs, as ffmpeg's arguments
+    /// and PX-24 have them.
+    fn picked(spec: &EncodeSpec<'_>) -> (String, Option<Hardware>) {
+        let place = placement(spec).expect("a video encode");
+        let args = ffmpeg_args(spec).unwrap();
+        assert!(has(&args, &["-c:v", &place.encoder.name]), "{args:?}");
+        let made = made(spec);
+        assert_eq!(made.encoder.as_ref(), Some(place.encoder));
+        assert_eq!(
+            made.decoder,
+            place.decoder.map_or(Decoder::Software, Decoder::Hardware)
+        );
+        (place.encoder.name.clone(), place.decoder)
+    }
+
+    /// The user's case: NVDEC cannot decode AV1 on a Pascal card, VA-API
+    /// can, so the AMD GPU encodes it too rather than NVENC encoding
+    /// what the CPU decoded.
+    #[test]
+    fn an_av1_source_goes_to_the_gpu_that_decodes_it() {
+        let (film, enc) = (source("av1"), two_gpus(NVIDIA_FIRST, false));
+        for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+            let (encoder, decoder) = picked(&spec_with(&film, &enc, to(codec), None));
+            assert!(encoder.ends_with("_vaapi"), "{encoder}");
+            assert_eq!(decoder, Some(Hardware::Vaapi));
+        }
+    }
+
+    /// An SDR HEVC film to H.264, nothing to filter: both GPUs do all of
+    /// it, so the order decides, and NVIDIA is first.
+    #[test]
+    fn a_job_both_gpus_do_whole_goes_to_the_first_in_order() {
+        let film = source("hevc");
+        let enc = two_gpus(NVIDIA_FIRST, false);
+        let spec = spec_with(&film, &enc, to(VideoCodec::H264), None);
+        assert_eq!(picked(&spec), (s("h264_nvenc"), Some(Hardware::Nvenc)));
+        let enc = two_gpus([Hardware::Vaapi, Hardware::Nvenc], false);
+        let spec = spec_with(&film, &enc, to(VideoCodec::H264), None);
+        assert_eq!(picked(&spec), (s("h264_vaapi"), Some(Hardware::Vaapi)));
+    }
+
+    /// 4K HDR10 HEVC to H.264 at its own height, tone-mapped: with GPU
+    /// filters on and `tonemap_vaapi`, VA-API does all of it and NVIDIA
+    /// would tone map on the CPU, so VA-API. Without either, both tone
+    /// map on the CPU, and the order decides.
+    #[test]
+    fn a_tone_map_goes_to_the_gpu_that_runs_it() {
+        let film = film();
+        let video = ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height: 2160,
+            max_bitrate: None,
+            tone_map: true,
+        };
+        let tone_maps = two_gpus(NVIDIA_FIRST, true);
+        let mut spec = spec_with(&film, &tone_maps, video, None);
+        spec.gpu_filters = true;
+        assert_eq!(picked(&spec), (s("h264_vaapi"), Some(Hardware::Vaapi)));
+        assert_eq!(decode(&spec), Decode::Gpu);
+        assert_eq!(made(&spec).tone_map, FilterOn::Gpu);
+        // GPU filters off: on the CPU either way.
+        spec.gpu_filters = false;
+        assert_eq!(picked(&spec), (s("h264_nvenc"), Some(Hardware::Nvenc)));
+        // A driver with no tone map.
+        let cannot = two_gpus(NVIDIA_FIRST, false);
+        let mut spec = spec_with(&film, &cannot, video, None);
+        spec.gpu_filters = true;
+        assert_eq!(picked(&spec), (s("h264_nvenc"), Some(Hardware::Nvenc)));
+        assert_eq!(made(&spec).tone_map, FilterOn::Cpu);
+    }
+
+    /// Scaling is a filter too: VA-API scales on the GPU always; NVIDIA
+    /// with GPU filters on and `scale_cuda` (PX-29), else NVDEC's frames
+    /// come back to memory and are scaled on the CPU. So a 4K film made
+    /// 1080p goes to VA-API where both decode it and GPU filters are off,
+    /// and with them on both do all of it and the order decides.
+    #[test]
+    fn a_scaled_job_goes_to_the_gpu_that_scales() {
+        let mut film = source("hevc");
+        let video = film.video.as_mut().unwrap();
+        (video.width, video.height) = (3840, 2160);
+        let enc = two_gpus(NVIDIA_FIRST, false);
+        let mut spec = spec_with(&film, &enc, to(VideoCodec::H264), None);
+        assert_eq!(picked(&spec), (s("h264_vaapi"), Some(Hardware::Vaapi)));
+        assert_eq!(decode(&spec), Decode::Gpu);
+        // PX-29: GPU filters on, NVIDIA first and scaling on CUDA.
+        spec.gpu_filters = true;
+        assert_eq!(picked(&spec), (s("h264_nvenc"), Some(Hardware::Nvenc)));
+        assert_eq!(decode(&spec), Decode::Gpu);
+        assert_eq!(placement(&spec).unwrap().gpu(), GpuUse::Nvidia);
+        let vaapi_first = two_gpus([Hardware::Vaapi, Hardware::Nvenc], false);
+        let spec = filtered(&film, &vaapi_first, to(VideoCodec::H264), None);
+        assert_eq!(picked(&spec), (s("h264_vaapi"), Some(Hardware::Vaapi)));
+        // Without `scale_cuda`, VA-API's again.
+        let no_cuda = Encoders {
+            cuda_scale: false,
+            ..enc.clone()
+        };
+        let spec = filtered(&film, &no_cuda, to(VideoCodec::H264), None);
+        assert_eq!(picked(&spec), (s("h264_vaapi"), Some(Hardware::Vaapi)));
+    }
+
+    /// Pictures burned in go to the GPU that overlays them: NVIDIA with
+    /// `overlay_cuda`, the AMD GPU (Mesa) having no `overlay_vaapi`,
+    /// whatever the order.
+    #[test]
+    fn a_picture_burn_in_goes_to_the_gpu_that_overlays() {
+        let mut film = source("hevc");
+        let video = film.video.as_mut().unwrap();
+        (video.width, video.height) = (3840, 2160);
+        let enc = two_gpus([Hardware::Vaapi, Hardware::Nvenc], false);
+        let spec = filtered(
+            &film,
+            &enc,
+            to(VideoCodec::H264),
+            burn_in(0, SubtitleFormat::Pgs),
+        );
+        assert_eq!(picked(&spec), (s("h264_nvenc"), Some(Hardware::Nvenc)));
+        assert_eq!(decode(&spec), Decode::Gpu);
+        assert_eq!(made(&spec).burn_in, FilterOn::Gpu);
+    }
+
+    /// Text burned in runs on the CPU whatever decodes: no GPU does it
+    /// all, both decode, and the order decides.
+    #[test]
+    fn what_no_gpu_runs_leaves_it_to_the_order() {
+        let film = source("hevc");
+        let enc = two_gpus(NVIDIA_FIRST, true);
+        let mut spec = spec_with(
+            &film,
+            &enc,
+            to(VideoCodec::H264),
+            burn_in(1, SubtitleFormat::Srt),
+        );
+        spec.gpu_filters = true;
+        assert_eq!(picked(&spec), (s("h264_nvenc"), Some(Hardware::Nvenc)));
+    }
+
+    /// A family that encodes but cannot decode loses to one that does
+    /// both, whatever the order: here NVDEC was found to decode nothing.
+    #[test]
+    fn encoding_and_decoding_beats_encoding_alone() {
+        let film = source("h264");
+        let enc = Encoders {
+            hardware_decoders: two_gpus(NVIDIA_FIRST, false)
+                .hardware_decoders
+                .into_iter()
+                .filter(|d| d.hardware == Hardware::Vaapi)
+                .collect(),
+            ..two_gpus(NVIDIA_FIRST, false)
+        };
+        let spec = spec_with(&film, &enc, to(VideoCodec::Hevc), None);
+        assert_eq!(picked(&spec), (s("hevc_vaapi"), Some(Hardware::Vaapi)));
+    }
+
+    /// A 10-bit source goes to the family that decodes 10-bit: NVDEC's
+    /// tests here decoded 8-bit HEVC only.
+    #[test]
+    fn a_10_bit_source_goes_to_the_family_that_decodes_10_bit() {
+        let mut film = source("hevc");
+        let video = film.video.as_mut().unwrap();
+        video.bit_depth = 10;
+        video.pixel_format = Some("yuv420p10le".into());
+        let enc = two_gpus(NVIDIA_FIRST, false);
+        let spec = spec_with(&film, &enc, to(VideoCodec::H264), None);
+        assert_eq!(picked(&spec), (s("h264_nvenc"), Some(Hardware::Nvenc)));
+        let eight_bit = Encoders {
+            hardware_decoders: enc
+                .hardware_decoders
+                .iter()
+                .filter(|d| d.bit_depth == 8)
+                .cloned()
+                .collect(),
+            ..enc.clone()
+        };
+        let spec = spec_with(&film, &eight_bit, to(VideoCodec::H264), None);
+        assert_eq!(picked(&spec), (s("h264_vaapi"), Some(Hardware::Vaapi)));
+    }
+
+    /// No GPU decodes the source (VP9 on VA-API, here alone): each only
+    /// encodes, and the order decides.
+    #[test]
+    fn where_no_gpu_decodes_the_order_decides_the_encoder() {
+        let film = source("vp9");
+        let enc = Encoders {
+            hardware_decoders: Vec::new(),
+            ..two_gpus(NVIDIA_FIRST, false)
+        };
+        let spec = spec_with(&film, &enc, to(VideoCodec::H264), None);
+        assert_eq!(picked(&spec), (s("h264_nvenc"), None));
+    }
+
+    /// No GPU encodes the codec: software, decoding on the first family
+    /// in order that decodes the source, NVDEC as VA-API.
+    #[test]
+    fn where_no_gpu_encodes_software_does_decoding_on_the_first_that_can() {
+        let film = source("hevc");
+        let enc = Encoders {
+            video: two_gpus(NVIDIA_FIRST, false)
+                .video
+                .into_iter()
+                .filter(|e| e.codec != VideoCodec::Av1 || e.hardware.is_none())
+                .collect(),
+            ..two_gpus(NVIDIA_FIRST, false)
+        };
+        let spec = spec_with(&film, &enc, to(VideoCodec::Av1), None);
+        assert_eq!(picked(&spec), (s("libsvtav1"), Some(Hardware::Nvenc)));
+        // AV1, which NVDEC lacks, on VA-API.
+        let av1 = source("av1");
+        let spec = spec_with(&av1, &enc, to(VideoCodec::Av1), None);
+        assert_eq!(picked(&spec), (s("libsvtav1"), Some(Hardware::Vaapi)));
+    }
+
+    /// `transcode.hardware = "none"`: detection finds software encoders
+    /// and no GPU decoders, so all of it is software.
+    #[test]
+    fn hardware_none_is_software_throughout() {
+        let film = source("hevc");
+        let enc = encoders(false);
+        let spec = spec_with(&film, &enc, to(VideoCodec::H264), None);
+        assert_eq!(picked(&spec), (s("libx264"), None));
+        assert_eq!(placement(&spec).unwrap().gpu(), GpuUse::None);
+    }
+
+    /// A film whose GPU decode failed before runs on the encoder the
+    /// whole-job pick chose, decoding in software: the rerun changes the
+    /// decode, not the GPU.
+    #[test]
+    fn a_failed_gpu_decode_keeps_the_picked_encoder() {
+        let (film, enc) = (source("av1"), two_gpus(NVIDIA_FIRST, false));
+        let mut spec = spec_with(&film, &enc, to(VideoCodec::H264), None);
+        spec.hardware_decode = false;
+        assert_eq!(picked(&spec), (s("h264_vaapi"), None));
+        assert_eq!(decode(&spec), Decode::Software);
+        assert_eq!(placement(&spec).unwrap().gpu(), GpuUse::Vaapi);
+    }
+
+    /// The run is confined to the picked family's GPU and no other: the
+    /// encoder's, or for a software encode the decoder's.
+    #[test]
+    fn the_run_uses_the_picked_family_s_gpu() {
+        let enc = two_gpus(NVIDIA_FIRST, false);
+        let av1 = source("av1");
+        let hevc = source("hevc");
+        let gpu = |film: &MediaDescriptor, enc: &Encoders, video| {
+            placement(&spec_with(film, enc, video, None)).unwrap().gpu()
+        };
+        assert_eq!(gpu(&av1, &enc, to(VideoCodec::H264)), GpuUse::Vaapi);
+        assert_eq!(gpu(&hevc, &enc, to(VideoCodec::H264)), GpuUse::Nvidia);
+        let software_av1 = Encoders {
+            video: enc
+                .video
+                .iter()
+                .filter(|e| e.codec != VideoCodec::Av1 || e.hardware.is_none())
+                .cloned()
+                .collect(),
+            ..enc.clone()
+        };
+        assert_eq!(
+            gpu(&hevc, &software_av1, to(VideoCodec::Av1)),
+            GpuUse::Nvidia
+        );
+        assert_eq!(gpu(&av1, &software_av1, to(VideoCodec::Av1)), GpuUse::Vaapi);
     }
 }

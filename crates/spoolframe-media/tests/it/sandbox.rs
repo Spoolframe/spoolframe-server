@@ -10,14 +10,15 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use spoolframe_media::Prober;
-use spoolframe_media::sandbox::{Jail, Limits, Memory, Mode, Sandbox, Tool};
+use spoolframe_media::sandbox::{GpuDevices, GpuUse, Jail, Limits, Memory, Mode, Sandbox, Tool};
 
 /// The sandbox the suites' real tools run in, with nothing hidden.
 fn shared() -> Sandbox {
     static SANDBOX: OnceLock<Sandbox> = OnceLock::new();
     SANDBOX
         .get_or_init(|| {
-            Sandbox::new(Mode::Required, Vec::new(), Vec::new()).expect("this kernel has Landlock")
+            Sandbox::new(Mode::Required, Vec::new(), GpuDevices::default())
+                .expect("this kernel has Landlock")
         })
         .clone()
 }
@@ -29,7 +30,12 @@ pub fn confined(program: &str) -> Tool {
 
 /// A sandbox that hides `state`, as the server hides its state directory.
 fn hiding(state: &Path) -> Sandbox {
-    Sandbox::new(Mode::Required, vec![state.to_path_buf()], Vec::new()).unwrap()
+    Sandbox::new(
+        Mode::Required,
+        vec![state.to_path_buf()],
+        GpuDevices::default(),
+    )
+    .unwrap()
 }
 
 /// A second of test pattern with sound, as Matroska, at `path`.
@@ -324,6 +330,117 @@ async fn a_confined_program_can_neither_signal_nor_read_the_server() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// What a shell tells of each of `paths`: `opened <path>` or `refused
+/// <path>`, opened to read (`<`) or to write and truncate (`>`), as
+/// `mode` says. No subshell: a confined shell cannot fork.
+fn open_each(mode: &str, paths: &[&str]) -> String {
+    let mut script = String::new();
+    for path in paths {
+        script.push_str(&format!(
+            "if : {mode} \"{path}\"; then echo \"opened {path}\"; \
+             else echo \"refused {path}\"; fi\n"
+        ));
+    }
+    script
+}
+
+/// The lines of a run's output.
+fn said(output: &std::process::Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// CUDA's cuInit names a thread through its own
+/// `/proc/self/task/<tid>/comm`, opened to write and truncate, and reads
+/// its own `/proc/self/maps`: an NVIDIA run may, as CUDA does it.
+#[tokio::test]
+async fn an_nvidia_run_may_name_its_threads_and_read_its_own_maps() {
+    let jail = Jail::new(Limits::PASS).gpu(GpuUse::Nvidia);
+    let output = confined_bash(
+        &jail,
+        "printf cuda-worker > /proc/self/task/$$/comm && read -r name < /proc/self/task/$$/comm \
+         && read -r mapping < /proc/self/maps && echo \"$name ${#mapping}\"",
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let said = said(&output);
+    let (name, length) = said[0].split_once(' ').unwrap();
+    assert_eq!(name, "cuda-worker");
+    assert!(length.parse::<usize>().unwrap() > 0);
+}
+
+/// The exception is the run's own entries: not the server's (its parent's)
+/// `environ`, `maps` or thread names, not its own `/proc/self/environ` (only
+/// `task` and `maps` were named), not init's.
+#[tokio::test]
+async fn an_nvidia_run_may_not_read_another_process_s_proc() {
+    let server = std::process::id();
+    let environ = format!("/proc/{server}/environ");
+    let maps = format!("/proc/{server}/maps");
+    let comm = format!("/proc/{server}/task/{server}/comm");
+    let others = [
+        environ.as_str(),
+        maps.as_str(),
+        comm.as_str(),
+        "/proc/self/environ",
+        "/proc/self/status",
+        "/proc/1/maps",
+        "/proc/1/environ",
+        "/proc/cpuinfo",
+    ];
+    // Unconfined, the server's entries open: they are there to refuse.
+    let mut unconfined = Tool::unconfined("bash")
+        .command(&Jail::new(Limits::PASS))
+        .unwrap();
+    unconfined
+        .args(["-c", &open_each("<", &others[..5])])
+        .stdin(Stdio::null());
+    let output = unconfined.output().await.unwrap();
+    assert!(
+        said(&output).iter().all(|line| line.starts_with("opened")),
+        "{:?}",
+        said(&output)
+    );
+
+    let jail = Jail::new(Limits::PASS).gpu(GpuUse::Nvidia);
+    let output = confined_bash(&jail, &open_each("<", &others)).await;
+    let refused: Vec<String> = others.iter().map(|p| format!("refused {p}")).collect();
+    assert_eq!(said(&output), refused);
+    let output = confined_bash(&jail, &open_each(">", &[comm.as_str()])).await;
+    assert_eq!(said(&output), [format!("refused {comm}")]);
+}
+
+/// A VA-API run, or a run on no GPU, has no /proc at all: not even its
+/// own threads' names or maps.
+#[tokio::test]
+async fn a_run_not_on_nvidia_has_no_proc() {
+    let own = ["/proc/self/task/$$/comm", "/proc/self/maps"];
+    for gpu in [GpuUse::None, GpuUse::Vaapi] {
+        let jail = Jail::new(Limits::PASS).gpu(gpu);
+        let output = confined_bash(&jail, &open_each("<", &own)).await;
+        let lines = said(&output);
+        assert_eq!(lines.len(), 2, "{gpu:?}: {lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.starts_with("refused /proc/self/")),
+            "{gpu:?}: {lines:?}"
+        );
+        let output = confined_bash(&jail, &open_each(">", &own[..1])).await;
+        let lines = said(&output);
+        assert!(
+            lines[0].starts_with("refused /proc/self/task/"),
+            "{gpu:?}: {lines:?}"
+        );
+    }
 }
 
 /// What the server checks at start: a confined ffprobe is refused the
