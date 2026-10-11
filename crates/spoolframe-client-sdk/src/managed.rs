@@ -28,7 +28,8 @@
 //! more than [`ManagedPlayback::MAX_RESUMES`] times in
 //! [`ManagedPlayback::RESUME_WINDOW`] ([`SdkError::PlaybackExpired`]).
 use crate::{
-    Chunk, Playback, PlaybackChange, PlaybackOptions, PlaybackQuality, SdkError, Session, Subtitle,
+    Chunk, ChunkStream, Playback, PlaybackChange, PlaybackOptions, PlaybackQuality, SdkError,
+    Session, Subtitle,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -126,6 +127,36 @@ pub trait PlaybackBackend: Send + Sync + 'static {
     ) -> Result<Chunk, SdkError> {
         let _ = (handle, epoch, variant, n, offset, length);
         Err(no_hls())
+    }
+    /// [`Self::read_segment`], its bytes handed on as they arrive
+    /// ([`Session::read_segment_stream`], PX-46). A backend that reads
+    /// whole keeps the default: its chunk, as one piece.
+    async fn open_segment(
+        &self,
+        handle: &PlaybackHandle,
+        epoch: u32,
+        variant: u32,
+        n: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<ChunkStream, SdkError> {
+        self.read_segment(handle, epoch, variant, n, offset, length)
+            .await
+            .map(ChunkStream::from)
+    }
+    /// [`Self::read_chunk`], its bytes handed on as they arrive
+    /// ([`Session::read_chunk_stream`], PX-46). A backend that reads whole
+    /// keeps the default: its chunk, as one piece.
+    async fn open_chunk(
+        &self,
+        handle: &PlaybackHandle,
+        epoch: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<ChunkStream, SdkError> {
+        self.read_chunk(handle, epoch, offset, length)
+            .await
+            .map(ChunkStream::from)
     }
     /// How fast the link to the server carries media (P6-06), for the
     /// direct reader to feed. A backend with no link keeps the default.
@@ -232,6 +263,26 @@ impl PlaybackBackend for Session {
     }
     async fn subtitle_segment(&self, h: &PlaybackHandle, n: u32) -> Result<Subtitle, SdkError> {
         self.read_subtitle_segment(h, n).await
+    }
+    async fn open_segment(
+        &self,
+        h: &PlaybackHandle,
+        e: u32,
+        v: u32,
+        n: u32,
+        o: u64,
+        l: u64,
+    ) -> Result<ChunkStream, SdkError> {
+        Session::read_segment_stream(self, h, e, v, n, o, l).await
+    }
+    async fn open_chunk(
+        &self,
+        h: &PlaybackHandle,
+        e: u32,
+        o: u64,
+        l: u64,
+    ) -> Result<ChunkStream, SdkError> {
+        Session::read_chunk_stream(self, h, e, o, l).await
     }
     fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
         Some(self.client.link(self.server).meter())
@@ -715,7 +766,7 @@ impl ManagedPlayback {
                 let generation = state.generation;
                 state.segment_reads.insert((variant, n), generation);
             }
-            self.segment_read(n, 0, &chunk);
+            self.segment_read(n, 0, chunk.bytes.len() as u64, chunk.size, chunk.complete);
             return Ok(chunk);
         }
         let p = self.live()?;
@@ -738,8 +789,100 @@ impl ManagedPlayback {
                 Err(self.resumed_error(at))
             }
             Ok(chunk) => {
-                self.segment_read(n, offset, &chunk);
+                let read = chunk.bytes.len() as u64;
+                self.segment_read(n, offset, read, chunk.size, chunk.complete);
                 Ok(chunk)
+            }
+            answer => answer,
+        }
+    }
+
+    /// [`Self::read_segment`], its bytes handed on as they arrive (PX-46):
+    /// the answer first (its length, the segment's size and whether it is
+    /// whole), so a bridge can promise a player the length and start the
+    /// body at once, then the body piece by piece. The same rules as a
+    /// read: from offset 0 it goes on through a resume; the rest of a
+    /// segment begun in an encode since replaced is
+    /// [`SdkError::PlaybackResumed`]. A resume while it is arriving ends it
+    /// with that error too: read the segment again from 0. The link meter
+    /// and the step-down count it as they count a read.
+    pub async fn segment_stream(
+        &self,
+        variant: u32,
+        n: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<SegmentStream, SdkError> {
+        let at = self.segment_start(n);
+        let backend = &self.0.backend;
+        let body = if offset == 0 {
+            let body = self
+                .resuming(at, move |p| async move {
+                    backend
+                        .open_segment(&p.handle, p.epoch, variant, n, 0, length)
+                        .await
+                })
+                .await?;
+            let mut state = self.0.state.lock();
+            let generation = state.generation;
+            state.segment_reads.insert((variant, n), generation);
+            body
+        } else {
+            let p = self.live()?;
+            let begun = {
+                let state = self.0.state.lock();
+                state
+                    .segment_reads
+                    .get(&(variant, n))
+                    .is_some_and(|g| *g != state.generation)
+            };
+            if begun {
+                return Err(self.resumed_error(at));
+            }
+            match backend
+                .open_segment(&p.handle, p.epoch, variant, n, offset, length)
+                .await
+            {
+                Err(SdkError::PlaybackExpired) => {
+                    self.restart(&p.handle, Restart::Resume { at }).await?;
+                    return Err(self.resumed_error(at));
+                }
+                answer => answer?,
+            }
+        };
+        let generation = self.0.state.lock().generation;
+        Ok(SegmentStream {
+            playback: self.clone(),
+            body,
+            n,
+            offset,
+            at,
+            generation,
+            ended: false,
+        })
+    }
+
+    /// [`Self::read_chunk`], its bytes handed on as they arrive (PX-46).
+    pub async fn chunk_stream(
+        &self,
+        source: &Playback,
+        offset: u64,
+        length: u64,
+    ) -> Result<ChunkStream, SdkError> {
+        let p = self.live()?;
+        if p.handle != source.handle || p.epoch != source.epoch {
+            return Err(self.moved_on(source));
+        }
+        match self
+            .0
+            .backend
+            .open_chunk(&p.handle, source.epoch, offset, length)
+            .await
+        {
+            Err(SdkError::PlaybackExpired) => {
+                self.restart(&p.handle, Restart::Resume { at: None })
+                    .await?;
+                Err(self.moved_on(source))
             }
             answer => answer,
         }
@@ -755,8 +898,8 @@ impl ManagedPlayback {
     /// link carries less than its segments need asks to be planned again
     /// for the link, as the direct reader does when it stalls (P6-06). A
     /// ladder is left to the player, which moves between its rungs.
-    fn segment_read(&self, n: u32, offset: u64, chunk: &Chunk) {
-        if n == 0 || !chunk.complete || offset + chunk.bytes.len() as u64 != chunk.size {
+    fn segment_read(&self, n: u32, offset: u64, read: u64, size: u64, complete: bool) {
+        if n == 0 || !complete || offset + read != size {
             return;
         }
         let link = self
@@ -771,7 +914,7 @@ impl ManagedPlayback {
             return;
         };
         let time = end.saturating_sub(*start);
-        state.recent_segments.push_back((chunk.size, time));
+        state.recent_segments.push_back((size, time));
         while state.recent_segments.len() > Self::RECENT_SEGMENTS {
             state.recent_segments.pop_front();
         }
@@ -1216,6 +1359,72 @@ impl Session {
         options: PlaybackOptions,
     ) -> Result<ManagedPlayback, SdkError> {
         ManagedPlayback::open(Arc::new(self.clone()), item.clone(), selection, options).await
+    }
+}
+
+/// An HLS segment read as it arrives ([`ManagedPlayback::segment_stream`],
+/// PX-46).
+#[derive(Debug)]
+pub struct SegmentStream {
+    playback: ManagedPlayback,
+    body: ChunkStream,
+    n: u32,
+    offset: u64,
+    /// Where the segment starts, for the error a resume ends it with.
+    at: Option<Duration>,
+    /// The playback's generation when it was opened: a resume since means
+    /// the rest would come from another encode.
+    generation: u64,
+    ended: bool,
+}
+
+impl SegmentStream {
+    /// The bytes this answer carries.
+    pub fn sent(&self) -> u64 {
+        self.body.sent
+    }
+
+    /// The segment's bytes written so far: all of it once [`Self::complete`].
+    pub fn size(&self) -> u64 {
+        self.body.size
+    }
+
+    /// The encode has finished the segment: `offset + sent()` of `size()`
+    /// is all there will be.
+    pub fn complete(&self) -> bool {
+        self.body.complete
+    }
+
+    pub fn epoch(&self) -> u32 {
+        self.body.epoch
+    }
+
+    /// The bytes handed on so far.
+    pub fn received(&self) -> u64 {
+        self.body.received()
+    }
+
+    /// The next piece, as much as arrived; `None` once all `sent()` bytes
+    /// did. [`SdkError::PlaybackResumed`] if the playback was resumed in
+    /// another encode since it opened: read the segment again from 0. Any
+    /// other error part-way (a lost connection, a stall): read on from
+    /// `offset + received()`.
+    pub async fn next(&mut self) -> Result<Option<Vec<u8>>, SdkError> {
+        if self.playback.0.state.lock().generation != self.generation {
+            return Err(self.playback.resumed_error(self.at));
+        }
+        let piece = self.body.next().await?;
+        if piece.is_none() && !self.ended {
+            self.ended = true;
+            self.playback.segment_read(
+                self.n,
+                self.offset,
+                self.body.received(),
+                self.body.size,
+                self.body.complete,
+            );
+        }
+        Ok(piece)
     }
 }
 
@@ -1828,6 +2037,43 @@ mod tests {
                 })
             );
             assert_eq!(p.read_segment(0, 2, 0, 1).await.unwrap().bytes, vec![2]);
+        }
+
+        /// A segment streamed as it arrives (PX-46) ends when the playback
+        /// is resumed under it: the rest would come from another encode.
+        /// Opened again from 0, it comes from the new one, whole.
+        #[tokio::test]
+        async fn a_streamed_hls_segment_ends_when_the_playback_resumes_under_it() {
+            let s = Arc::new(Server::default());
+            *s.delivery.lock() = Some(Delivery::Hls);
+            let p = opened(&s).await;
+            p.manifest(ManifestKind::Media, 0).await.unwrap();
+            let mut stream = p.segment_stream(0, 2, 0, 1).await.unwrap();
+            assert_eq!((stream.sent(), stream.size()), (1, 1));
+            assert!(stream.complete());
+            // Another read finds the playback over, and resumes it.
+            s.expire();
+            assert_eq!(p.read_segment(0, 3, 0, 1).await.unwrap().bytes, vec![3]);
+            assert_eq!(
+                stream.next().await,
+                Err(SdkError::PlaybackResumed {
+                    at: Duration::from_secs(6)
+                })
+            );
+            let mut again = p.segment_stream(0, 2, 0, 1).await.unwrap();
+            assert_eq!(again.next().await, Ok(Some(vec![2])));
+            assert_eq!(again.next().await, Ok(None));
+            assert_eq!(again.received(), 1);
+            // The rest of a segment begun in the old encode is refused, as
+            // a read of it is.
+            s.expire();
+            p.read_segment(0, 4, 0, 1).await.unwrap();
+            assert_eq!(
+                p.segment_stream(0, 2, 1, 1).await.err(),
+                Some(SdkError::PlaybackResumed {
+                    at: Duration::from_secs(6)
+                })
+            );
         }
 
         /// A different plan on the new start is not swapped in.

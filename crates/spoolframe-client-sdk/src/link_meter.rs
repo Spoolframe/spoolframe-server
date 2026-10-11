@@ -24,8 +24,15 @@ pub(crate) const WINDOW: Duration = Duration::from_secs(10);
 /// started this long after the last one still starts from it.
 pub(crate) const REMEMBER: Duration = Duration::from_secs(10 * 60);
 /// The fewest bytes a rate is worked out from: a header read or two is
-/// all round trip, and says nothing about the link's speed.
+/// all round trip, and says nothing about the link's speed. Unless the
+/// link was busy for [`MIN_BUSY`]: a slow link never carries this much
+/// inside [`WINDOW`] (1 MiB segments at 1 Mbit/s carry 1.2 MiB in it).
 pub(crate) const MIN_BYTES: u64 = 4 * 1024 * 1024;
+/// The least busy time a rate is worked out from when fewer than
+/// [`MIN_BYTES`] arrived: long enough that no round trip or burst is
+/// most of it, short enough that a slow link has a reading within a
+/// segment or two.
+pub(crate) const MIN_BUSY: Duration = Duration::from_secs(2);
 
 /// The link to one server's measured rate. Its readings are on
 /// [`crate::Session::link_rate`] and a reader's status.
@@ -138,7 +145,8 @@ impl Meter {
                 time += busy.time();
             }
         }
-        (bytes >= MIN_BYTES && !time.is_zero()).then(|| bytes as f64 / time.as_secs_f64())
+        let enough = bytes >= MIN_BYTES || (bytes > 0 && time >= MIN_BUSY);
+        (enough && !time.is_zero()).then(|| bytes as f64 / time.as_secs_f64())
     }
 }
 
@@ -179,6 +187,76 @@ mod tests {
         meter.received(at(t, 7000), 8 * MIB);
         meter.end(at(t, 7000));
         assert_eq!(meter.rate(at(t, 7000)), Some(8.0 * MIB as f64));
+    }
+
+    /// The reviewer's case: 1 MiB segments one after another at 1 Mbit/s,
+    /// in 64 KiB reads as a body arrives. 1.2 MiB fit in the window, under
+    /// [`MIN_BYTES`], so it never had a reading and the step-down never
+    /// fired. Two busy seconds are one now.
+    #[test]
+    fn a_slow_link_has_a_reading_within_a_segment() {
+        let (meter, t) = (LinkMeter::default(), Instant::now());
+        const RATE: u64 = 125_000; // bytes per second: 1 Mbit/s
+        const PIECE: u64 = 64 * 1024;
+        let mut now_ms = 0u64;
+        let mut first_reading = None;
+        for _segment in 0..100 {
+            meter.begin(at(t, now_ms));
+            let mut left = MIB;
+            while left > 0 {
+                let n = left.min(PIECE);
+                now_ms += n * 1000 / RATE;
+                meter.received(at(t, now_ms), n);
+                left -= n;
+                if first_reading.is_none() {
+                    first_reading = meter.rate(at(t, now_ms)).map(|r| (now_ms, r));
+                }
+            }
+            meter.end(at(t, now_ms));
+        }
+        let (when, rate) = first_reading.expect("a reading on a 1 Mbit/s link");
+        assert!(when <= 3_000, "first reading after {when} ms");
+        assert!((rate - RATE as f64).abs() / (RATE as f64) < 0.01, "{rate}");
+        let now = meter.rate(at(t, now_ms)).expect("a reading at the end");
+        assert!((now - RATE as f64).abs() / (RATE as f64) < 0.01, "{now}");
+    }
+
+    /// What the apps read now: a segment as 512 KiB reads, one after
+    /// another, each timed from its first chunk (not counted, as a
+    /// converted read is), with a round trip between them, at 1 Mbit/s,
+    /// and a short last read. A reading comes within the first reads.
+    #[test]
+    fn a_run_of_512_kib_reads_on_a_slow_link_has_a_reading() {
+        let (meter, t) = (LinkMeter::default(), Instant::now());
+        const RATE: u64 = 125_000;
+        const PIECE: u64 = 16 * 1024;
+        let mut now_ms = 0u64;
+        let mut first_reading = None;
+        // 6 MiB of segments, read 512 KiB at a time; the last read short.
+        let mut left_total = 6 * MIB + 100 * 1024;
+        while left_total > 0 {
+            let read = left_total.min(512 * 1024);
+            left_total -= read;
+            now_ms += 100; // the request's round trip
+            // The first chunk, with the response: the time starts here.
+            let first = read.min(PIECE);
+            now_ms += first * 1000 / RATE;
+            meter.begin(at(t, now_ms));
+            let mut left = read - first;
+            while left > 0 {
+                let n = left.min(PIECE);
+                now_ms += n * 1000 / RATE;
+                meter.received(at(t, now_ms), n);
+                left -= n;
+                if first_reading.is_none() {
+                    first_reading = meter.rate(at(t, now_ms)).map(|r| (now_ms, r));
+                }
+            }
+            meter.end(at(t, now_ms));
+        }
+        let (when, rate) = first_reading.expect("a reading on a 1 Mbit/s link");
+        assert!(when <= 10_000, "first reading after {when} ms");
+        assert!((rate - RATE as f64).abs() / (RATE as f64) < 0.02, "{rate}");
     }
 
     #[test]

@@ -24,6 +24,9 @@ use crate::discovery::Discovery;
 use crate::error::SdkError;
 use crate::link::{ConnectionPath, Link, SignOutWatch, StateWatch};
 use crate::portable::{Portable, PortableUserId};
+use crate::reachability::{
+    self, DialReport, KnownPath, LivePath, PathKind, ReachLog, Reachability,
+};
 use crate::relay_policy::{RelayFiltered, RelayPolicy};
 use crate::servers::{self, SavedServer, ServerEntry};
 use crate::session::{self, SavedProfile, Session, SignInMethod, StoredSession};
@@ -159,6 +162,11 @@ pub(crate) struct Inner {
     /// Which servers are reached through relays: their choices, and
     /// [`ClientOptions::relays`] for the rest.
     pub(crate) relay_policy: Arc<RelayPolicy>,
+    /// What lookups answered and how dials went, for
+    /// [`Client::reachability`].
+    pub(crate) reach: Arc<ReachLog>,
+    /// [`ClientOptions::lan_discovery`]: mDNS is one of the lookups.
+    lan_discovery: bool,
     /// Each server's connection and its state.
     links: Mutex<HashMap<EndpointId, Arc<Link>>>,
     /// Serializes read-modify-write of the saved servers and sessions.
@@ -224,6 +232,7 @@ impl Client {
             relays,
         } = options;
         let relay_policy = Arc::new(RelayPolicy::new(relays));
+        let reach = Arc::new(ReachLog::default());
         let key = load_or_create_key(storage.as_ref()).await?;
         // Minimal: no pkarr or DNS lookup, so a LAN client never tries the
         // Internet. mDNS only listens: a laptop or a TV must not announce
@@ -271,7 +280,12 @@ impl Client {
                 endpoint
                     .address_lookup()
                     .map_err(|e| cannot_bind(e.to_string()))?
-                    .add(RelayFiltered::new(mdns.clone(), relay_policy.clone()));
+                    .add(RelayFiltered::new(
+                        mdns.clone(),
+                        relay_policy.clone(),
+                        MDNS_LOOKUP,
+                        reach.clone(),
+                    ));
                 Discovery::start(&mdns).await
             }
             None => Discovery::off(),
@@ -288,6 +302,8 @@ impl Client {
                 lookups: Mutex::default(),
                 relays,
                 relay_policy,
+                reach,
+                lan_discovery,
                 links: Mutex::default(),
                 saving: tokio::sync::Mutex::default(),
                 revisions: Mutex::default(),
@@ -1659,13 +1675,36 @@ impl Client {
                 .map(TransportAddr::Ip)
                 .chain(relays.into_iter().map(TransportAddr::Relay)),
         );
-        let conn = ServerConnection::dial(
+        let dialled = addr
+            .addrs
+            .iter()
+            .filter_map(PathKind::of)
+            .map(|(_, addr)| addr)
+            .take(reachability::MAX_LISTED)
+            .collect();
+        let (at, started) = (servers::now(), std::time::Instant::now());
+        let dial = ServerConnection::dial(
             &self.inner.endpoint,
             addr,
             &self.inner.device,
             &self.inner.timeouts,
         )
-        .await?;
+        .await;
+        let failed = dial.as_ref().err();
+        let report = DialReport {
+            at,
+            took_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            connected: failed.is_none(),
+            stage: failed.map(|f| f.stage),
+            error: failed.map(|f| f.error.to_string()),
+            dialled,
+            known: self.known_paths(id).await,
+        };
+        if let Some(failed) = failed {
+            tracing::debug!(server = %id, stage = ?failed.stage, error = %failed.error, "dial failed");
+        }
+        self.inner.reach.dialled(id, report);
+        let conn = dial.map_err(|f| f.error)?;
         // Where the server answered. Not what was heard before dialling:
         // when the endpoint resolves a server through mDNS while dialling,
         // that record is not passed on to the discovery subscription, so
@@ -1792,8 +1831,114 @@ impl Client {
             iroh::address_lookup::PkarrResolver::builder(parsed)
                 .build(endpoint.tls_config().clone()),
             self.inner.relay_policy.clone(),
+            url,
+            self.inner.reach.clone(),
         ));
         tracing::debug!(url, "servers are looked up here too");
+    }
+
+    /// Every path iroh knows of for `id` now, from what it was given and
+    /// what lookups found, and whether a connection uses it.
+    async fn known_paths(&self, id: EndpointId) -> Vec<KnownPath> {
+        let Some(info) = self.inner.endpoint.remote_info(id).await else {
+            return Vec::new();
+        };
+        info.addrs()
+            .filter_map(|a| {
+                let (kind, addr) = PathKind::of(a.addr())?;
+                Some(KnownPath {
+                    kind,
+                    addr,
+                    active: matches!(a.usage(), iroh::endpoint::TransportAddrUsage::Active),
+                })
+            })
+            .take(reachability::MAX_LISTED)
+            .collect()
+    }
+
+    /// How this device stands with server `endpoint_id` now, for an app's
+    /// "can't be reached" details: what it knows of the server, what each
+    /// lookup last answered, how its last dial in this run went, and the
+    /// paths of the connection open now. Never dials.
+    ///
+    /// Iroh does not say how each path of a failed dial fared: a dial's
+    /// [`DialReport::known`] lists the paths it knew of, and its stage is
+    /// where the dial as a whole stopped.
+    ///
+    /// [`SdkError::UnknownServer`] for a server this device knows nothing
+    /// of: not saved, not heard on the LAN, named by no address or invite,
+    /// and never dialled.
+    pub async fn reachability(&self, endpoint_id: &str) -> Result<Reachability, SdkError> {
+        let id = parse_id(endpoint_id)?;
+        let saved = servers::load(self.inner.storage.as_ref()).await?;
+        let pinned = saved.iter().find(|s| s.endpoint_id == endpoint_id);
+        let heard = self.inner.discovery.get(&id);
+        let hinted: Vec<String> = self
+            .inner
+            .manual
+            .lock()
+            .get(&id)
+            .map(|a| a.iter().map(ToString::to_string).collect())
+            .unwrap_or_default();
+        let invite_relays = self
+            .inner
+            .invite_relays
+            .lock()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        let last_dial = self.inner.reach.last_dial(&id);
+        let link = self.inner.links.lock().get(&id).cloned();
+        if pinned.is_none()
+            && heard.is_none()
+            && hinted.is_empty()
+            && invite_relays.is_empty()
+            && last_dial.is_none()
+            && link.is_none()
+        {
+            return Err(SdkError::UnknownServer(endpoint_id.to_owned()));
+        }
+        let mut lookups: Vec<String> = Vec::new();
+        if self.inner.lan_discovery {
+            lookups.push(MDNS_LOOKUP.to_owned());
+        }
+        let mut pkarr: Vec<String> = self.inner.lookups.lock().iter().cloned().collect();
+        pkarr.sort();
+        lookups.extend(pkarr);
+        let live = link
+            .as_ref()
+            .and_then(|l| l.open())
+            .map(|conn| live_paths(&conn.conn))
+            .unwrap_or_default();
+        let name = pinned
+            .map(|s| s.name.clone())
+            .or_else(|| link.as_ref().and_then(|l| l.info()).map(|i| i.name))
+            .or_else(|| heard.as_ref().map(|h| h.name.clone()));
+        Ok(Reachability {
+            endpoint_id: endpoint_id.to_owned(),
+            name,
+            saved: pinned.is_some(),
+            addrs: pinned.map(reachability::saved_addrs).unwrap_or_default(),
+            advertised_addrs: pinned
+                .map(|s| s.advertised_addrs.iter().map(ToString::to_string).collect())
+                .unwrap_or_default(),
+            advertised_at: pinned.and_then(|s| s.advertised_at),
+            relays: pinned.map(|s| s.relays.clone()).unwrap_or_default(),
+            relays_edited: pinned.is_some_and(|s| s.relays_edited),
+            lookup: pinned.and_then(|s| s.lookup.clone()),
+            use_relays: pinned.and_then(|s| s.use_relays),
+            relays_effective: self.inner.relay_policy.allows(&id),
+            heard_on_lan: heard
+                .map(|h| h.addrs.iter().map(ToString::to_string).collect())
+                .unwrap_or_default(),
+            hinted_addrs: hinted,
+            invite_relays,
+            lookups,
+            lookup_results: self.inner.reach.lookups_of(&id),
+            last_dial,
+            last_connected_at: pinned.and_then(|s| s.last_connected_at),
+            live,
+        })
     }
 
     /// Look servers up at n0 too when saved `server` has no other way to
@@ -1901,6 +2046,28 @@ async fn save_reached(
             Err(e) => tracing::warn!(server = %id, error = %e, "cannot save where it was reached"),
         }
     }
+}
+
+/// The name mDNS goes by among [`Client::reachability`]'s lookups.
+const MDNS_LOOKUP: &str = "mdns";
+
+/// The paths of `conn` open now, the selected one first.
+fn live_paths(conn: &iroh::endpoint::Connection) -> Vec<LivePath> {
+    let paths = conn.paths();
+    let mut live: Vec<LivePath> = paths
+        .iter()
+        .filter_map(|p| {
+            let (kind, addr) = PathKind::of(p.remote_addr())?;
+            Some(LivePath {
+                kind,
+                addr,
+                rtt_ms: p.rtt().as_millis().try_into().unwrap_or(u64::MAX),
+                selected: p.is_selected(),
+            })
+        })
+        .collect();
+    live.sort_by_key(|p| !p.selected);
+    live
 }
 
 /// The most pkarr relays a client looks servers up at (P6-07, glm E-3).

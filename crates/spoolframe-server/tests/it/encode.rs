@@ -1120,6 +1120,51 @@ async fn listed_and_written(
     (durations, firsts)
 }
 
+/// An encoded video resumed mid-film: every segment from where it
+/// starts holds what the playlist says, audio and video. The copied audio
+/// began at the source's keyframe before the seek, 8 s early here, and the
+/// muxer measured its cuts from it: the run's first segment held audio
+/// alone, and every one after held the time the playlist gave the one
+/// before it (an iPhone resuming a film played sound over a black picture).
+#[tokio::test]
+async fn hls_of_an_encoded_video_resumed_mid_film_is_cut_where_the_playlist_says() {
+    let mut caps = ClientCapabilities {
+        max_video: Some(VideoLimits {
+            height: Some(180),
+            ..VideoLimits::default()
+        }),
+        ..hls_capabilities()
+    };
+    // AC-3 as it is: a copied track starts where the demuxer lands, an
+    // encoded one where the decoded sound is cut, at the seek.
+    caps.audio.insert(spoolframe_types::AudioCodec::Ac3);
+    let (server, client, session) = hls_ready("hls-resume-encode", caps).await;
+    // Keyframes at 0, 10, 20… s; segment 9 runs from 38 s, so a seek
+    // there lands at 30 s.
+    server.generate_media_keyed_every_ten_seconds(60, "libx264", "ac3");
+    let handle = started(&client, &session, Some(39_000)).await;
+    let durations =
+        media_segments(&manifest(&client, &session, &handle, ManifestKind::Media).await);
+    let starts = segment_starts(&durations);
+    assert!((starts[8] - 38.0).abs() < 0.01, "{starts:?}");
+    let init = segment(&client, &session, &handle, 0).await;
+    for n in 9..=durations.len() as u32 {
+        let bytes = segment(&client, &session, &handle, n).await;
+        let file = write(&server, "one.mp4", &[init.clone(), bytes].concat());
+        let (first, last) = probe(&file);
+        let (start, end) = (
+            starts[n as usize - 1],
+            starts[n as usize - 1] + f64::from(durations[n as usize - 1]),
+        );
+        assert!(
+            (first - start).abs() < 0.1 && last < end,
+            "segment {n} holds {first}..{last}, the playlist says {start}..{end}"
+        );
+    }
+    client.close().await;
+    server.stop().await;
+}
+
 /// ffmpeg does not cut at the first keyframe it sees. A playlist with a
 /// cut there listed one segment more than ffmpeg wrote, and every segment
 /// held the time the playlist gave to the one after it.

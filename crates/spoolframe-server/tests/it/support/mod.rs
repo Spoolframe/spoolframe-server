@@ -833,6 +833,12 @@ impl TestServer {
         self.generate(secs, video, audio, "0");
     }
 
+    /// As [`TestServer::generate_media`], keyed every 10 s instead of 2 s,
+    /// as some encodes are: a seek lands up to 10 s before where it aims.
+    pub fn generate_media_keyed_every_ten_seconds(&self, secs: u32, video: &str, audio: &str) {
+        self.generate_keyed(secs, video, audio, "0", "250");
+    }
+
     /// As [`TestServer::generate_media`], with the picture starting 0.5 s
     /// after the sound, as in many real files: the keyframes are at about
     /// 0.5 s, 2.5 s and so on, none at 0.
@@ -939,13 +945,20 @@ impl TestServer {
     }
 
     fn generate(&self, secs: u32, video: &str, audio: &str, video_offset: &str) {
+        self.generate_keyed(secs, video, audio, video_offset, "50");
+    }
+
+    /// A keyframe every `gop` frames (25 a second), and only there.
+    fn generate_keyed(&self, secs: u32, video: &str, audio: &str, video_offset: &str, gop: &str) {
         std::fs::create_dir_all(self.media.parent().unwrap()).unwrap();
         let status = std::process::Command::new("ffmpeg")
             .args(["-hide_banner", "-loglevel", "error", "-y"])
             .args(["-f", "lavfi", "-itsoffset", video_offset])
             .args(["-i", "testsrc2=size=640x360:rate=25"])
             .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
-            .args(["-t", &secs.to_string(), "-pix_fmt", "yuv420p", "-g", "50"])
+            .args(["-t", &secs.to_string(), "-pix_fmt", "yuv420p", "-g", gop])
+            // Nothing in between, a scene change included.
+            .args(["-sc_threshold", "0"])
             .args(["-c:v", video, "-c:a", audio, "-ac", "2"])
             .arg(&self.media)
             .status()

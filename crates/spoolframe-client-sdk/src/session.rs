@@ -234,6 +234,80 @@ pub struct Chunk {
     pub epoch: u32,
 }
 
+/// A converted read's answer with its bytes still arriving (PX-46): what
+/// a [`Chunk`] holds, handed on piece by piece, so a player gets the first
+/// bytes of a segment while the rest is on the link. The link meter is fed
+/// as they arrive, as for a [`Chunk`].
+#[derive(Debug)]
+pub struct ChunkStream {
+    /// The bytes this answer carries: all of the body.
+    pub sent: u64,
+    /// Bytes written so far: the whole output (or segment) once
+    /// `complete`.
+    pub size: u64,
+    /// The encode has finished it: no more bytes will come.
+    pub complete: bool,
+    pub epoch: u32,
+    body: ChunkBody,
+    received: u64,
+}
+
+#[derive(Debug)]
+enum ChunkBody {
+    Arriving(crate::connection::BodyStream),
+    /// A backend that reads whole hands its chunk on at once.
+    Whole(Option<Vec<u8>>),
+}
+
+impl ChunkStream {
+    /// The next piece of the body, as much as arrived; `None` once all of
+    /// it (`sent` bytes) did. An error part-way (a lost connection, a
+    /// stall) ends it: read again from `offset + received()`.
+    pub async fn next(&mut self) -> Result<Option<Vec<u8>>, SdkError> {
+        let piece = match &mut self.body {
+            ChunkBody::Arriving(body) => body.next().await?,
+            ChunkBody::Whole(bytes) => bytes.take().filter(|b| !b.is_empty()),
+        };
+        if let Some(piece) = &piece {
+            self.received += piece.len() as u64;
+        }
+        Ok(piece)
+    }
+
+    /// The bytes handed on so far.
+    pub fn received(&self) -> u64 {
+        self.received
+    }
+
+    /// All that is left of the body, as one [`Chunk`].
+    pub async fn into_chunk(mut self) -> Result<Chunk, SdkError> {
+        let mut bytes = Vec::new();
+        while let Some(piece) = self.next().await? {
+            bytes.extend_from_slice(&piece);
+        }
+        Ok(Chunk {
+            bytes,
+            size: self.size,
+            complete: self.complete,
+            epoch: self.epoch,
+        })
+    }
+}
+
+impl From<Chunk> for ChunkStream {
+    /// A chunk read whole, handed on as one piece.
+    fn from(chunk: Chunk) -> Self {
+        Self {
+            sent: chunk.bytes.len() as u64,
+            size: chunk.size,
+            complete: chunk.complete,
+            epoch: chunk.epoch,
+            body: ChunkBody::Whole(Some(chunk.bytes)),
+            received: 0,
+        }
+    }
+}
+
 /// An external subtitle, whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subtitle {
@@ -1291,6 +1365,68 @@ impl Session {
             .await
     }
 
+    /// [`Session::read_chunk`], its bytes handed on as they arrive (PX-46).
+    pub async fn read_chunk_stream(
+        &self,
+        handle: &PlaybackHandle,
+        epoch: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<ChunkStream, SdkError> {
+        self.media_stream(handle, epoch, None, 0, offset, length)
+            .await
+    }
+
+    /// [`Session::read_segment`], its bytes handed on as they arrive
+    /// (PX-46): the answer (`sent`, `size`, `complete`) comes first, and a
+    /// bridge can promise a player the length and start the body at once.
+    pub async fn read_segment_stream(
+        &self,
+        handle: &PlaybackHandle,
+        epoch: u32,
+        variant: u32,
+        n: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<ChunkStream, SdkError> {
+        self.media_stream(handle, epoch, Some(n), variant, offset, length)
+            .await
+    }
+
+    async fn media_stream(
+        &self,
+        handle: &PlaybackHandle,
+        epoch: u32,
+        segment: Option<u32>,
+        variant: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<ChunkStream, SdkError> {
+        let request = MediaRead {
+            session: self.token.clone(),
+            handle: handle.clone(),
+            offset,
+            length,
+            epoch,
+            segment,
+            variant,
+        };
+        match self.read_media_open(&request).await? {
+            (MediaReadResponse::Ok(reply), Some(body)) => Ok(ChunkStream {
+                sent: reply.sent,
+                size: reply.size,
+                complete: reply.complete,
+                epoch: reply.epoch,
+                body: ChunkBody::Arriving(body),
+                received: 0,
+            }),
+            (MediaReadResponse::Ok(_), None) => {
+                Err(SdkError::Protocol("a media answer with no body".into()))
+            }
+            (MediaReadResponse::Err(e), _) => Err(self.failed(e).await),
+        }
+    }
+
     async fn media(
         &self,
         handle: &PlaybackHandle,
@@ -1332,26 +1468,65 @@ impl Session {
             .client
             .playback_revision(self.server, &self.token, &request.handle)
             .await?;
-        let meter = self.client.link(self.server).meter();
-        // A direct read whole; a converted one (an HLS segment, a chunk)
-        // from its first byte, the encode's time left out (PX-46).
-        let metering = if direct {
-            crate::connection::Metering::Whole(&meter)
-        } else {
-            crate::connection::Metering::FromFirstByte(&meter)
-        };
+        let metering = self.metering(direct);
         self.client
-            .on_connection(self.server, Some(&self.token), true, |conn| async move {
-                conn.read(
-                    request,
-                    revision,
-                    timeouts.of_read(),
-                    timeouts.request,
-                    metering,
-                )
-                .await
+            .on_connection(self.server, Some(&self.token), true, |conn| {
+                let metering = metering.clone();
+                async move {
+                    conn.read(
+                        request,
+                        revision,
+                        timeouts.of_read(),
+                        timeouts.request,
+                        metering,
+                    )
+                    .await
+                }
             })
             .await
+    }
+
+    /// [`Self::read_media`]'s answer, with its body to read as it arrives
+    /// (PX-46). Asked again on a new connection if the first one died
+    /// before the answer; once the body is under way, a lost connection is
+    /// the body's error, and the caller reads on from where it stopped.
+    async fn read_media_open(
+        &self,
+        request: &MediaRead,
+    ) -> Result<(MediaReadResponse, Option<crate::connection::BodyStream>), SdkError> {
+        let timeouts = self.client.inner.timeouts;
+        let revision = self
+            .client
+            .playback_revision(self.server, &self.token, &request.handle)
+            .await?;
+        let metering = self.metering(false);
+        self.client
+            .on_connection(self.server, Some(&self.token), true, |conn| {
+                let metering = metering.clone();
+                async move {
+                    conn.read_open(
+                        request,
+                        revision,
+                        timeouts.of_read(),
+                        timeouts.request,
+                        metering,
+                    )
+                    .await
+                }
+            })
+            .await
+    }
+
+    /// How a read is metered: a direct read whole; a converted one (an HLS
+    /// segment, a chunk) from its first byte, the encode's time left out
+    /// (PX-46).
+    fn metering(&self, direct: bool) -> crate::connection::Metering {
+        let meter = self.client.link(self.server).meter();
+        if direct {
+            crate::connection::Metering::Whole(meter)
+        } else {
+            crate::connection::Metering::FromFirstByte(meter)
+        }
     }
 
     /// How this user wants tracks chosen, on every device, and whether

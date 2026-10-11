@@ -8,14 +8,15 @@
 //! and, if that goes unanswered too, dropped (see `Client::call`).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::LinkMeter;
 
 use futures_util::StreamExt;
 use iroh::endpoint::{
-    ConnectError, ConnectingError, Connection, ConnectionError, PathEvent, PathEventStream,
-    RecvStream, WeakConnectionHandle,
+    ConnectError, ConnectWithOptsError, ConnectingError, Connection, ConnectionError, PathEvent,
+    PathEventStream, RecvStream, WeakConnectionHandle,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 use serde::Serialize;
@@ -36,6 +37,7 @@ use spoolframe_protocol::rpc::{RpcReply, RpcRequest, RpcResponse, ServerInstance
 use crate::client::Device;
 use crate::error::SdkError;
 use crate::link::ConnectionPath;
+use crate::reachability::DialStage;
 
 /// How long a dial may take before the server counts as unreachable.
 pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -97,19 +99,46 @@ pub(crate) struct ServerConnection {
 
 impl ServerConnection {
     /// Dial `addr`, say `Hello` as `device`, and check that the server is
-    /// the one dialled.
+    /// the one dialled. A failure says at which stage
+    /// ([`crate::reachability::DialStage`]).
     pub async fn dial(
         endpoint: &Endpoint,
         addr: EndpointAddr,
         device: &Device,
         timeouts: &Timeouts,
-    ) -> Result<Self, SdkError> {
+    ) -> Result<Self, DialFailed> {
         let expected: EndpointId = addr.id;
         let unreachable = |e: String| SdkError::Unreachable(format!("{expected}: {e}"));
-        let conn = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, CLIENT_ALPN))
+        let conn =
+            match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, CLIENT_ALPN)).await {
+                Err(_) => {
+                    return Err(DialFailed {
+                        error: unreachable(format!("no answer within {DIAL_TIMEOUT:?}")),
+                        stage: DialStage::Timeout,
+                    });
+                }
+                Ok(Err(e)) => {
+                    return Err(DialFailed {
+                        stage: stage_of(&e),
+                        error: refused(&e).unwrap_or_else(|| unreachable(e.to_string())),
+                    });
+                }
+                Ok(Ok(conn)) => conn,
+            };
+        Self::greet(conn, expected, device, timeouts)
             .await
-            .map_err(|_| unreachable(format!("no answer within {DIAL_TIMEOUT:?}")))?
-            .map_err(|e| refused(&e).unwrap_or_else(|| unreachable(e.to_string())))?;
+            .map_err(|(error, stage)| DialFailed { error, stage })
+    }
+
+    /// Say `Hello` on `conn`, just made to `expected`, and check the answer.
+    async fn greet(
+        conn: Connection,
+        expected: EndpointId,
+        device: &Device,
+        timeouts: &Timeouts,
+    ) -> Result<Self, (SdkError, DialStage)> {
+        let unreachable = |e: String| SdkError::Unreachable(format!("{expected}: {e}"));
+        let refusal = |e: SdkError| (e, DialStage::Refused);
         // Followed from here, before anything is sent. Once the server
         // has the connection, it announces each of its addresses; iroh
         // opens a path to every one it can reach, keeps the best, and
@@ -140,8 +169,9 @@ impl ServerConnection {
             Err(e) => {
                 conn.close(0u32.into(), b"no hello");
                 return Err(match e {
-                    SdkError::TimedOut(why) => unreachable(why),
-                    other => other,
+                    SdkError::TimedOut(why) => (unreachable(why), DialStage::Hello),
+                    e @ SdkError::Unreachable(_) => (e, DialStage::Hello),
+                    other => refusal(other),
                 });
             }
         };
@@ -149,39 +179,41 @@ impl ServerConnection {
         let mut info = match answer.reply.response {
             Response::Ok(Reply::ServerInfo(info)) => info,
             Response::Ok(other) => {
-                return Err(SdkError::Protocol(format!("Hello answered with {other:?}")));
+                return Err(refusal(SdkError::Protocol(format!(
+                    "Hello answered with {other:?}"
+                ))));
             }
             // The one `Hello` a server refuses is one of a revision it does
             // not speak; it does not say its own.
             Response::Err(spoolframe_protocol::Error::Unsupported { .. }) => {
                 conn.close(0u32.into(), b"wrong protocol revision");
-                return Err(SdkError::UpdateRequired {
+                return Err(refusal(SdkError::UpdateRequired {
                     server_protocol: None,
-                });
+                }));
             }
-            Response::Err(e) => return Err(SdkError::from_server(e)),
+            Response::Err(e) => return Err(refusal(SdkError::from_server(e))),
         };
         info.web_url = crate::client::web_page(info.web_url.take());
         if info.protocol_version != PROTOCOL_VERSION {
             conn.close(0u32.into(), b"wrong protocol revision");
-            return Err(SdkError::UpdateRequired {
+            return Err(refusal(SdkError::UpdateRequired {
                 server_protocol: Some(info.protocol_version),
-            });
+            }));
         }
         // Iroh has proven the key; the server must also say it is that key,
         // or its name and the pin would disagree.
         if info.endpoint_id != expected.to_string() {
             conn.close(0u32.into(), b"wrong server");
-            return Err(SdkError::WrongServer {
+            return Err(refusal(SdkError::WrongServer {
                 expected: expected.to_string(),
                 actual: info.endpoint_id,
-            });
+            }));
         }
         // It names the relying party of the server's app passkeys (PX-14):
         // one that is not an id is never pinned or used.
         if let Err(e) = spoolframe_protocol::ServerId::parse(&info.server_id) {
             conn.close(0u32.into(), b"not a server id");
-            return Err(SdkError::Protocol(e.to_string()));
+            return Err(refusal(SdkError::Protocol(e.to_string())));
         }
         Ok(Self {
             conn,
@@ -318,32 +350,62 @@ impl ServerConnection {
         maximum: u64,
         limit: Duration,
         stall: Duration,
-        metering: Metering<'_>,
+        metering: Metering,
     ) -> Result<(ResourceResponse, Vec<u8>), SdkError> {
-        let mut _metered = match metering {
-            Metering::Whole(meter) => Some(Metered::begin(meter)),
-            _ => None,
-        };
-        let (mut recv, response) = exchange(&self.conn, bi::RESOURCE, request, limit).await?;
-        let bytes = match &response {
-            ResourceResponse::Ready { length, .. } => {
-                let meter = match metering {
-                    Metering::Off => None,
-                    Metering::Whole(meter) => Some(meter),
-                    // From the first byte: the server held the read while
-                    // the encode caught up, which is not the link's time.
-                    // A short body is mostly its round trip, and left out.
-                    Metering::FromFirstByte(meter) if *length >= METERED_BODY => {
-                        _metered = Some(Metered::begin(meter));
-                        Some(meter)
-                    }
-                    Metering::FromFirstByte(_) => None,
-                };
-                body(&self.conn, &mut recv, *length, maximum, stall, meter).await?
-            }
-            ResourceResponse::Error { .. } => Vec::new(),
+        let (response, body) = self
+            .resource_open(request, maximum, limit, stall, metering)
+            .await?;
+        let bytes = match body {
+            Some(body) => body.collect().await?,
+            None => Vec::new(),
         };
         Ok((response, bytes))
+    }
+
+    /// The response to `request`, and its body to read as it arrives
+    /// (`None` for an error, which has none): what [`Self::resource_metered`]
+    /// gathers whole.
+    async fn resource_open(
+        &self,
+        request: &ResourceRequest,
+        maximum: u64,
+        limit: Duration,
+        stall: Duration,
+        metering: Metering,
+    ) -> Result<(ResourceResponse, Option<BodyStream>), SdkError> {
+        // A direct read's time starts with the request.
+        let whole = match &metering {
+            Metering::Whole(meter) => Some(Metered::begin(meter.clone())),
+            _ => None,
+        };
+        let (recv, response) = exchange(&self.conn, bi::RESOURCE, request, limit).await?;
+        let body = match &response {
+            ResourceResponse::Ready { length, .. } => {
+                if *length > maximum {
+                    return Err(SdkError::Protocol(format!(
+                        "a body of {length} bytes exceeds the {maximum}-byte limit"
+                    )));
+                }
+                let meter = match metering {
+                    Metering::Off => BodyMeter::Off,
+                    Metering::Whole(meter) => BodyMeter::Counting(meter),
+                    // From the first byte: the server held the read while
+                    // the encode caught up, which is not the link's time.
+                    Metering::FromFirstByte(meter) => BodyMeter::FromFirstChunk(meter),
+                };
+                Some(BodyStream {
+                    conn: self.conn.clone(),
+                    recv,
+                    length: *length,
+                    received: 0,
+                    stall,
+                    meter,
+                    timed: whole,
+                })
+            }
+            ResourceResponse::Error { .. } => None,
+        };
+        Ok((response, body))
     }
 
     pub async fn artwork(
@@ -386,15 +448,36 @@ impl ServerConnection {
         revision: u64,
         limit: Duration,
         stall: Duration,
-        metering: Metering<'_>,
+        metering: Metering,
     ) -> Result<(MediaReadResponse, Vec<u8>), SdkError> {
+        let (response, body) = self
+            .read_open(request, revision, limit, stall, metering)
+            .await?;
+        let bytes = match body {
+            Some(body) => body.collect().await?,
+            None => Vec::new(),
+        };
+        Ok((response, bytes))
+    }
+
+    /// [`Self::read`]'s answer, its body to read as it arrives (PX-46): a
+    /// bridge hands a player the first bytes of a segment while the rest
+    /// is on its way. `None` for a refusal, which has no body.
+    pub async fn read_open(
+        &self,
+        request: &MediaRead,
+        revision: u64,
+        limit: Duration,
+        stall: Duration,
+        metering: Metering,
+    ) -> Result<(MediaReadResponse, Option<BodyStream>), SdkError> {
         let maximum = request.length.min(MAX_READ);
         let request = ResourceRequest::Media {
             request: request.clone(),
             revision,
         };
-        let (response, bytes) = self
-            .resource_metered(&request, maximum, limit, stall, metering)
+        let (response, body) = self
+            .resource_open(&request, maximum, limit, stall, metering)
             .await?;
         let response = match response {
             ResourceResponse::Ready {
@@ -419,7 +502,7 @@ impl ServerConnection {
                 ));
             }
         };
-        Ok((response, bytes))
+        Ok((response, body))
     }
 }
 
@@ -447,6 +530,47 @@ fn refused(error: &ConnectError) -> Option<SdkError> {
             ..
         } => closed_by_server(source),
         _ => None,
+    }
+}
+
+/// A dial that failed: why, as the app is told, and at which stage.
+#[derive(Debug)]
+pub(crate) struct DialFailed {
+    pub error: SdkError,
+    pub stage: DialStage,
+}
+
+/// The stage a dial iroh could not complete failed at.
+pub(crate) fn stage_of(error: &ConnectError) -> DialStage {
+    match error {
+        ConnectError::Connect {
+            source: ConnectWithOptsError::NoAddress { .. },
+            ..
+        } => DialStage::NoAddress,
+        ConnectError::Connecting {
+            source: ConnectingError::HandshakeFailure { .. },
+            ..
+        } => DialStage::Handshake,
+        ConnectError::Connection { source, .. }
+        | ConnectError::Connecting {
+            source: ConnectingError::ConnectionError { source, .. },
+            ..
+        } => stage_of_connection(source),
+        _ => DialStage::Connect,
+    }
+}
+
+/// The stage a connection being set up was lost at, by how.
+pub(crate) fn stage_of_connection(error: &ConnectionError) -> DialStage {
+    match error {
+        ConnectionError::TimedOut => DialStage::Timeout,
+        ConnectionError::VersionMismatch | ConnectionError::TransportError(_) => {
+            DialStage::Handshake
+        }
+        ConnectionError::ApplicationClosed(_)
+        | ConnectionError::ConnectionClosed(_)
+        | ConnectionError::Reset => DialStage::Closed,
+        _ => DialStage::Connect,
     }
 }
 
@@ -541,81 +665,162 @@ fn stream_name(kind: u8) -> &'static str {
 /// The `length` bytes after a response frame, and nothing more, with no
 /// pause longer than `stall`.
 /// How a read is counted by the link meter.
-#[derive(Debug, Clone, Copy)]
-pub enum Metering<'a> {
+#[derive(Debug, Clone)]
+pub enum Metering {
     Off,
     /// From the request to the last byte: a direct read, whose server
     /// answers at once.
-    Whole(&'a LinkMeter),
-    /// From the first byte to the last, a body of [`METERED_BODY`] or more:
-    /// a converted read, which the server may hold while it encodes.
-    FromFirstByte(&'a LinkMeter),
+    Whole(Arc<LinkMeter>),
+    /// From the first chunk of the body to the last, that chunk not
+    /// counted: a converted read, which the server may hold while it
+    /// encodes. Any length: a short body (a short final read) adds little
+    /// and takes no time, and a run of 512 KiB reads on a slow link is
+    /// each seconds long.
+    FromFirstByte(Arc<LinkMeter>),
 }
 
-/// The least body a converted read is metered by.
-pub const METERED_BODY: u64 = 512 << 10;
+/// How a [`BodyStream`] tells the link meter what arrives.
+#[derive(Debug)]
+enum BodyMeter {
+    Off,
+    /// Every byte, timed by a [`Metered`] begun with the request.
+    Counting(Arc<LinkMeter>),
+    /// Timed from the first chunk, which is not counted: it came with the
+    /// response, all at once, and would read as an instant transfer.
+    FromFirstChunk(Arc<LinkMeter>),
+}
 
 /// A read [`LinkMeter`] counts, ended when dropped: a read that fails or
 /// is given up on ends too.
-struct Metered<'a>(&'a LinkMeter);
+#[derive(Debug)]
+struct Metered(Arc<LinkMeter>);
 
-impl<'a> Metered<'a> {
-    fn begin(meter: &'a LinkMeter) -> Self {
+impl Metered {
+    fn begin(meter: Arc<LinkMeter>) -> Self {
         meter.begin(Instant::now());
         Self(meter)
     }
 }
 
-impl Drop for Metered<'_> {
+impl Drop for Metered {
     fn drop(&mut self) {
         self.0.end(Instant::now());
     }
 }
 
-async fn body(
-    conn: &Connection,
-    recv: &mut RecvStream,
+/// The body of a resource read, as it arrives (PX-46): its announced
+/// `length`, then pieces of it until it is all there. No pause between
+/// pieces may be longer than the read's stall limit. The link meter is
+/// fed as pieces arrive, the same as for a read gathered whole; dropping
+/// the body part-way ends its time there.
+#[derive(Debug)]
+pub struct BodyStream {
+    conn: Connection,
+    recv: RecvStream,
     length: u64,
-    maximum: u64,
+    received: u64,
     stall: Duration,
-    meter: Option<&LinkMeter>,
-) -> Result<Vec<u8>, SdkError> {
-    if length > maximum {
-        return Err(SdkError::Protocol(format!(
-            "a body of {length} bytes exceeds the {maximum}-byte limit"
-        )));
-    }
-    let limit = usize::try_from(length)
-        .map_err(|_| SdkError::Protocol(format!("a body of {length} bytes")))?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(limit)
-        .map_err(|e| SdkError::Protocol(format!("cannot buffer {length} bytes: {e}")))?;
-    let mut buf = vec![0; 64 << 10];
-    loop {
-        let read = tokio::time::timeout(stall, recv.read(&mut buf))
+    meter: BodyMeter,
+    /// The meter's time, once begun.
+    timed: Option<Metered>,
+}
+
+impl BodyStream {
+    /// The next piece of the body, as much as arrived (at most 64 KiB);
+    /// `None` once all of it arrived and the server ended the stream.
+    pub async fn next(&mut self) -> Result<Option<Vec<u8>>, SdkError> {
+        let mut buf = vec![0; 64 << 10];
+        let read = tokio::time::timeout(self.stall, self.recv.read(&mut buf))
             .await
-            .map_err(|_| timed_out(conn, "the rest of a body", stall))?
-            .map_err(|e| lost(conn, e))?;
+            .map_err(|_| timed_out(&self.conn, "the rest of a body", self.stall))?
+            .map_err(|e| lost(&self.conn, e))?;
         // `None`: the server finished the stream.
         let Some(n) = read else {
-            break;
+            self.timed = None;
+            if self.received != self.length {
+                return Err(SdkError::Protocol(format!(
+                    "{} bytes followed where {} were announced",
+                    self.received, self.length
+                )));
+            }
+            return Ok(None);
         };
-        if n > limit - bytes.len() {
+        if n as u64 > self.length - self.received {
             return Err(SdkError::Protocol(format!(
-                "more than {length} bytes followed the response"
+                "more than {} bytes followed the response",
+                self.length
             )));
         }
-        bytes.extend_from_slice(&buf[..n]);
-        if let Some(meter) = meter {
-            meter.received(Instant::now(), n as u64);
+        self.received += n as u64;
+        buf.truncate(n);
+        match &self.meter {
+            BodyMeter::Off => {}
+            BodyMeter::Counting(meter) => meter.received(Instant::now(), n as u64),
+            BodyMeter::FromFirstChunk(meter) => match &self.timed {
+                Some(_) => meter.received(Instant::now(), n as u64),
+                None => self.timed = Some(Metered::begin(meter.clone())),
+            },
         }
+        Ok(Some(buf))
     }
-    if bytes.len() as u64 != length {
-        return Err(SdkError::Protocol(format!(
-            "{} bytes followed where {length} were announced",
-            bytes.len()
-        )));
+
+    /// All of the body.
+    pub async fn collect(mut self) -> Result<Vec<u8>, SdkError> {
+        let limit = usize::try_from(self.length)
+            .map_err(|_| SdkError::Protocol(format!("a body of {} bytes", self.length)))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(limit)
+            .map_err(|e| SdkError::Protocol(format!("cannot buffer {} bytes: {e}", self.length)))?;
+        while let Some(piece) = self.next().await? {
+            bytes.extend_from_slice(&piece);
+        }
+        Ok(bytes)
     }
-    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh::endpoint::presets;
+    use iroh::{RelayMode, SecretKey};
+
+    use super::*;
+
+    /// A key with no address, relay or lookup to find it by: iroh says so
+    /// before it sends anything.
+    #[tokio::test]
+    async fn a_dial_with_nothing_to_dial_is_no_address() {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let nowhere = SecretKey::from_bytes(&[7; 32]).public();
+        let error = endpoint
+            .connect(EndpointAddr::new(nowhere), CLIENT_ALPN)
+            .await
+            .unwrap_err();
+        assert_eq!(stage_of(&error), DialStage::NoAddress, "{error:#}");
+        endpoint.close().await;
+    }
+
+    #[test]
+    fn a_connection_lost_as_it_is_set_up_is_staged_by_how() {
+        assert_eq!(
+            stage_of_connection(&ConnectionError::TimedOut),
+            DialStage::Timeout
+        );
+        assert_eq!(
+            stage_of_connection(&ConnectionError::VersionMismatch),
+            DialStage::Handshake
+        );
+        assert_eq!(
+            stage_of_connection(&ConnectionError::Reset),
+            DialStage::Closed
+        );
+        assert_eq!(
+            stage_of_connection(&ConnectionError::LocallyClosed),
+            DialStage::Connect
+        );
+    }
 }

@@ -20,7 +20,7 @@ use spoolframe_protocol::{
 };
 use spoolframe_types::{Delivery, SubtitleFormat};
 
-use self::args::{Decode, EncodeSpec, Output, decode, ffmpeg_args};
+use self::args::{Decode, EncodeSpec, Output, decode, ffmpeg_args, forced_through};
 pub use self::args::{Decoder, FilterOn, Made};
 use self::hls::Segments;
 pub use self::job::{BudgetUse, Encoding, EncodingGuard, Load, Measured, Units};
@@ -111,6 +111,33 @@ struct Current {
     job: Arc<EncodeJob>,
     rung: u32,
     left: Option<(u32, Arc<EncodeJob>)>,
+}
+
+/// Where a rung's init segment is read from ([`Conversion::init_for`]).
+#[derive(Debug)]
+pub enum Init {
+    /// One a run of the rung wrote, kept: whole, read at once.
+    Kept(PathBuf),
+    /// A run's own, whole once it has finished its first segment.
+    Job(Arc<EncodeJob>),
+}
+
+/// What a player asked a rung for, for the switch's log line.
+#[derive(Debug, Clone, Copy)]
+enum Asked {
+    Init,
+    Segment(u32),
+}
+
+/// What answered it, for the switch's log line.
+#[derive(Debug)]
+enum Served {
+    /// The rung's kept init (no run).
+    Kept,
+    /// The run that left the rung, which has it.
+    LeftRun,
+    /// A run started for it.
+    NewRun(Arc<EncodeJob>),
 }
 
 /// Why a read past what an ended conversion wrote fails (P3-15).
@@ -438,20 +465,24 @@ impl Conversion {
             if let Some((left, job)) = &current.left
                 && *left == rung
                 && job.has_segment(n)
+                && self.aligned(rung, job, n)
             {
                 return Ok(job.clone());
             }
             if self.ended() {
                 return Err(JobError::Prepare(ENDED.into()));
             }
-            return self.switch(&mut current, rung, n, segments);
+            return self.switch(&mut current, rung, n, Asked::Segment(n), segments);
         }
         let job = &current.job;
         let written = job.written();
         let head = written.unwrap_or(job.first_segment.saturating_sub(1));
         if self.ended() {
             // Only what it wrote: nothing more is coming.
-            return if n >= job.first_kept() && written.is_some_and(|w| n <= w) {
+            return if n >= job.first_kept()
+                && written.is_some_and(|w| n <= w)
+                && self.aligned(rung, job, n)
+            {
                 Ok(job.clone())
             } else {
                 Err(JobError::Prepare(ENDED.into()))
@@ -462,7 +493,11 @@ impl Conversion {
         let failed_on_gpu = job.decodes_in_hardware()
             && matches!(job.progress().borrow().done, Some(Err(_)))
             && written.is_none_or(|w| n > w);
-        if n >= job.first_kept() && n <= head + SEGMENTS_AHEAD && !failed_on_gpu {
+        if n >= job.first_kept()
+            && n <= head + SEGMENTS_AHEAD
+            && !failed_on_gpu
+            && self.aligned(rung, job, n)
+        {
             return Ok(job.clone());
         }
         let (start, from) = run_at(segments, n, rung_video(self.video, &self.ladder, rung));
@@ -484,20 +519,30 @@ impl Conversion {
         )?;
         current.job.stop();
         current.job = next;
-        tracing::debug!(
-            segment = n,
-            from,
-            epoch,
-            "HLS encode restarted at a segment"
+        self.log_switch(
+            rung,
+            rung,
+            Asked::Segment(n),
+            Served::NewRun(current.job.clone()),
         );
         Ok(current.job.clone())
     }
 
-    /// The job whose init segment `rung` plays from: the running one, the
-    /// one that left that rung, or, for a rung neither is, the encode
-    /// moved to it just past what is written: where a player switching
-    /// to it asks next.
-    pub fn job_for_init(&self, rung: u32) -> Result<Arc<EncodeJob>, JobError> {
+    /// Where `rung`'s init segment is read from (PX-21): one a run of that
+    /// rung wrote already, kept; the running job, or the one that left
+    /// that rung; or, for a rung neither is, the encode moved to it at the
+    /// segment the player asks for next.
+    ///
+    /// A rung's init is the same from any run of it, whatever its start
+    /// (its codecs and their settings, the same encoder for the whole
+    /// playback): kept from the first run that wrote it, a player coming
+    /// back to the rung has it at once, with no run started for it. And
+    /// the run started for an init begins where the player reads on, the
+    /// segment after the last it asked for: begun past what is written,
+    /// as it was, the player's next segment came before it and a second
+    /// run started there, two ffmpeg starts before the player had a
+    /// picture (an iPhone gave up on the init after 6 s).
+    pub fn init_for(&self, rung: u32) -> Result<Init, JobError> {
         let segments = self
             .segments
             .as_ref()
@@ -507,27 +552,62 @@ impl Conversion {
                 "no rung {rung} in this playback"
             )));
         }
+        let kept = self.kept_init(rung);
         let mut current = self.current.lock();
+        if kept.exists() {
+            if rung != current.rung {
+                self.log_switch(current.rung, rung, Asked::Init, Served::Kept);
+            }
+            return Ok(Init::Kept(kept));
+        }
         if rung == current.rung {
-            return Ok(current.job.clone());
+            self.keep_init(rung, &current.job);
+            return Ok(Init::Job(current.job.clone()));
         }
         // The one left, once it wrote a segment: its init was finished then.
         if let Some((left, job)) = &current.left
             && *left == rung
             && job.written().is_some()
         {
-            return Ok(job.clone());
+            self.keep_init(rung, job);
+            self.log_switch(current.rung, rung, Asked::Init, Served::LeftRun);
+            return Ok(Init::Job(job.clone()));
         }
         if self.ended() {
             return Err(JobError::Prepare(ENDED.into()));
         }
-        let next = current
-            .job
-            .written()
-            .map_or(current.job.first_segment, |w| w + 1)
-            .min(segments.count())
-            .max(1);
-        self.switch(&mut current, rung, next, segments)
+        let job = &current.job;
+        let next = match job.reader_segment() {
+            0 => job.written().map_or(job.first_segment, |w| w + 1),
+            read => read + 1,
+        }
+        .min(segments.count())
+        .max(1);
+        self.switch(&mut current, rung, next, Asked::Init, segments)
+            .map(Init::Job)
+    }
+
+    /// Where a run of `rung` that wrote its init has it kept: in the
+    /// conversion's directory, which outlives each run's.
+    fn kept_init(&self, rung: u32) -> PathBuf {
+        self.dir.join(format!("init-v{rung}.mp4"))
+    }
+
+    /// Keep `job`'s init as `rung`'s, once it has written a segment (its
+    /// init is whole then), if none is kept yet. Copied, then renamed into
+    /// place: a reader never opens half of one.
+    fn keep_init(&self, rung: u32, job: &EncodeJob) {
+        let kept = self.kept_init(rung);
+        if job.written().is_none() || kept.exists() {
+            return;
+        }
+        let part = self.dir.join(format!("init-v{rung}.part"));
+        let copied = std::fs::copy(job.dir().join("init.mp4"), &part)
+            .and_then(|_| std::fs::rename(&part, &kept));
+        if let Err(e) = copied {
+            tracing::debug!(rung, error = %e, "a rung's init segment was not kept");
+            let _ = std::fs::remove_file(&part);
+        }
     }
 
     /// Move the encode to `rung` at segment `n`: started first in the
@@ -538,6 +618,7 @@ impl Conversion {
         current: &mut Current,
         rung: u32,
         n: u32,
+        asked: Asked,
         segments: &Segments,
     ) -> Result<Arc<EncodeJob>, JobError> {
         let (start, from) = run_at(segments, n, rung_video(self.video, &self.ladder, rung));
@@ -559,16 +640,80 @@ impl Conversion {
         )?;
         let left = std::mem::replace(&mut current.job, next);
         left.stop();
-        tracing::debug!(
-            segment = n,
-            epoch,
-            from = current.rung,
-            to = rung,
-            "HLS encode moved to another rung"
+        self.keep_init(current.rung, &left);
+        self.log_switch(
+            current.rung,
+            rung,
+            asked,
+            Served::NewRun(current.job.clone()),
         );
         current.left = Some((current.rung, left));
         current.rung = rung;
         Ok(current.job.clone())
+    }
+
+    /// One line for a player moving to rung `to` from `from` (PX-21), or
+    /// a run restarted on its rung for a segment it does not have: what
+    /// was asked, and what answered it. For a new run, logged once it has
+    /// written its first segment (its init with it, as ffmpeg writes
+    /// both), with how long that took: what the player waited for.
+    fn log_switch(&self, from: u32, to: u32, asked: Asked, served: Served) {
+        let playback = self
+            .dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let asked = match asked {
+            Asked::Init => "init".to_owned(),
+            Asked::Segment(n) => format!("segment {n}"),
+        };
+        let what = if from == to {
+            "hls run restarted"
+        } else {
+            "hls rung switch"
+        };
+        let job = match served {
+            Served::Kept | Served::LeftRun => {
+                let init = if matches!(served, Served::Kept) {
+                    "kept"
+                } else {
+                    "left run"
+                };
+                tracing::info!(target: "spoolframe_server::playback", playback, from, to, asked, init, "{what}");
+                return;
+            }
+            Served::NewRun(job) => job,
+        };
+        let (run_from, epoch) = (job.first_segment, job.epoch);
+        let log = move |ready_ms: Option<u128>| {
+            tracing::info!(
+                target: "spoolframe_server::playback",
+                playback,
+                from,
+                to,
+                asked,
+                run_from,
+                epoch,
+                init = "new run",
+                ready_ms,
+                "{what}"
+            );
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return log(None);
+        };
+        let started = std::time::Instant::now();
+        let mut progress = job.progress();
+        drop(job);
+        runtime.spawn(async move {
+            let written = tokio::time::timeout(
+                Duration::from_secs(60),
+                progress.wait_for(|p| p.last_segment.is_some() || p.done.is_some()),
+            )
+            .await;
+            let ready = matches!(written, Ok(Ok(ref p)) if p.last_segment.is_some());
+            log(ready.then(|| started.elapsed().as_millis()));
+        });
     }
 
     /// What `rung`'s encode is made of.
@@ -579,6 +724,30 @@ impl Conversion {
             self.audio,
             self.subtitle,
         )
+    }
+
+    /// Whether `job`, a run of `rung`, cut segment `n` where the playlist
+    /// says. A remux ladder's encoded rung is cut at the keyframes it is
+    /// told to force, and a run's list of them stops at what one argument
+    /// holds (`args::forced_through`): past its last, the run cuts where
+    /// its encoder keys, and its segments there have other times than
+    /// their numbers say (a two-hour film keyed every 500 ms, from about
+    /// 1:55:50 on). A segment past that is a new run's, from there.
+    fn aligned(&self, rung: u32, job: &EncodeJob, n: u32) -> bool {
+        let (Some(cuts), Some(segments)) = (self.cuts(rung), self.segments.as_ref()) else {
+            return true;
+        };
+        let start = segments
+            .start(job.first_segment)
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis);
+        let Some(last) = forced_through(&cuts, start) else {
+            return true;
+        };
+        // Segment `s` starts at the last forced keyframe; its end is not
+        // forced, the one before it is the last cut as listed.
+        let s = cuts.partition_point(|&ms| ms < last) as u32 + 1;
+        n < s
     }
 
     /// Where an encode of `rung` cuts, when it is not its own grid: see
@@ -1006,6 +1175,363 @@ mod tests {
             ffmpeg: spoolframe_media::sandbox::Tool::unconfined(ffmpeg),
             ..gpu
         }]))
+    }
+
+    /// A stand-in ffmpeg for a ladder: writes `init.mp4` (its own
+    /// arguments, so a test can tell whose it is) and six segments from its
+    /// `-start_number`, lists them, then runs on.
+    const LADDER_FFMPEG: &str = "for a; do last=$a; done; d=$(dirname \"$last\")\n\
+         n=$(printf '%s\\n' \"$@\" | grep -A1 -x -- -start_number | tail -n 1)\n\
+         printf '%s' \"$*\" > \"$d/init.mp4\"\n\
+         list='#EXTM3U'\n\
+         for i in 0 1 2 3 4 5; do printf x > \"$d/seg$((n+i)).m4s\"\n\
+           list=\"$list\nseg$((n+i)).m4s\"; done\n\
+         printf '%s\\n' \"$list\" > \"$last\"\n\
+         echo out_time_us=36000000\n\
+         exec sleep 30";
+
+    /// An H.264 ladder of four rungs (8, 4, 2 and 1 Mbit/s) of a two-hour
+    /// film, resumed at 10 min on its lowest, run by [`LADDER_FFMPEG`].
+    async fn resumed_ladder(test: &str) -> (Arc<Conversion>, spoolframe_test_dir::TestDir) {
+        use spoolframe_media::VideoStream;
+        use spoolframe_media::encoders::{Hardware, VideoEncoder};
+        use spoolframe_types::VideoCodec;
+
+        let tmp = spoolframe_test_dir::TestDir::new(test).await;
+        let ffmpeg = job::tests::ffmpeg(&tmp.as_ref().join("bin"), LADDER_FFMPEG);
+        let jobs = Arc::new(
+            Jobs::new(
+                JobLimits {
+                    budget: Units::jobs(4),
+                    max_remux: 32,
+                    max_gpu_jobs: 3,
+                    scratch_dir: tmp.as_ref().join("scratch"),
+                    scratch_limit_bytes: 1 << 30,
+                    read_ahead: Duration::from_secs(3600),
+                    stalled_after: Duration::from_secs(60),
+                    gpu_filters: false,
+                    tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+                    video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
+                },
+                spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
+            )
+            .unwrap(),
+        );
+        let film = tmp.as_ref().join("film.mkv");
+        std::fs::write(&film, b"x").unwrap();
+        let descriptor = Arc::new(MediaDescriptor {
+            container: "matroska,webm".into(),
+            duration: Some(Duration::from_secs(7200)),
+            bit_rate: None,
+            video: Some(VideoStream {
+                index: 0,
+                codec: "h264".into(),
+                profile: Some("High".into()),
+                level: None,
+                width: 1920,
+                height: 1080,
+                pixel_format: Some("yuv420p".into()),
+                color_transfer: None,
+                frame_rate_millis: Some(24_000),
+                bit_depth: 8,
+                hdr: None,
+                dolby_vision: None,
+                bit_rate: None,
+            }),
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        });
+        let rungs = [
+            (1080, 8_000_000),
+            (720, 4_000_000),
+            (540, 2_000_000),
+            (360, 1_000_000),
+        ];
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: spoolframe_types::Container::Mp4,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: Some(8_000_000),
+                tone_map: false,
+            }),
+            audio: None,
+            subtitle: None,
+            ladder: rungs
+                .map(|(height, max_bitrate)| Rung {
+                    height,
+                    max_bitrate,
+                    video: None,
+                })
+                .to_vec(),
+            reasons: Vec::new(),
+        };
+        let encoders = Encoders {
+            video: vec![VideoEncoder {
+                codec: VideoCodec::H264,
+                name: "h264_vaapi".into(),
+                hardware: Some(Hardware::Vaapi),
+            }],
+            ..Encoders::software_baseline()
+        };
+        let conversion = Conversion::start(
+            jobs,
+            ConversionSource {
+                handle: "h1",
+                path: &film,
+                descriptor,
+                plan: &plan,
+                gpus: one_gpu(encoders, &ffmpeg),
+                keyframes: None,
+                first_epoch: 0,
+                slot: None,
+                start_rung: 3,
+            },
+            Some(Duration::from_secs(600)),
+        )
+        .unwrap();
+        (conversion, tmp)
+    }
+
+    async fn written(job: &EncodeJob) -> u32 {
+        let mut progress = job.progress();
+        let p = progress
+            .wait_for(|p| p.last_segment.is_some())
+            .await
+            .unwrap()
+            .clone();
+        p.last_segment.unwrap()
+    }
+
+    /// A player reading the lowest rung of a resumed ladder, then
+    /// switching up: its init and its next segment come from one run, which
+    /// starts at that segment. The init's run started past what the old
+    /// rung had written, behind which the player's next segment was, and a
+    /// second run started for it: two ffmpeg starts before a picture.
+    #[tokio::test]
+    async fn a_rung_switch_starts_one_run_where_the_player_reads_on() {
+        let (conversion, _tmp) = resumed_ladder("spoolframe-conversion-switch").await;
+        let first = conversion.job();
+        let start = first.first_segment;
+        assert!(start > 90, "a run from 10 min: {start}");
+        assert_eq!(written(&first).await, start + 5);
+        let segments = conversion.segments().unwrap().clone();
+        for n in start..start + 3 {
+            let job = conversion.job_for_segment(n, 3).unwrap();
+            assert!(Arc::ptr_eq(&job, &first));
+            job.reader_at(n, segments.end(n).unwrap());
+        }
+        let Init::Job(init) = conversion.init_for(1).unwrap() else {
+            panic!("rung 1 had no run yet");
+        };
+        assert_eq!(init.first_segment, start + 3);
+        written(&init).await;
+        let next = conversion.job_for_segment(start + 3, 1).unwrap();
+        assert!(
+            Arc::ptr_eq(&next, &init),
+            "the next segment started run {} after the init's {}",
+            next.epoch,
+            init.epoch
+        );
+    }
+
+    /// A rung's init is kept from the first run of it that wrote one: a
+    /// player coming back to the rung after that run is gone has it at
+    /// once, and no run starts for it.
+    #[tokio::test]
+    async fn a_rung_s_init_is_read_from_a_run_that_wrote_it() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let ring = Arc::new(crate::logs::LogRing::new(50));
+        let subscriber = tracing_subscriber::registry().with(crate::logs::RingLayer(ring.clone()));
+        // This test's thread, which its tasks run on too.
+        let _logged = tracing::subscriber::set_default(subscriber);
+        let (conversion, _tmp) = resumed_ladder("spoolframe-conversion-kept-init").await;
+        let lowest = conversion.job();
+        written(&lowest).await;
+        let Init::Job(up) = conversion.init_for(1).unwrap() else {
+            panic!("rung 1 had no run yet");
+        };
+        written(&up).await;
+        // Up again: the rung left is 1 now, and the lowest one's run goes.
+        let Init::Job(top) = conversion.init_for(0).unwrap() else {
+            panic!("rung 0 had no run yet");
+        };
+        let epoch = top.epoch;
+        let Init::Kept(file) = conversion.init_for(3).unwrap() else {
+            panic!("the lowest rung's init was not kept");
+        };
+        let init = std::fs::read_to_string(&file).unwrap();
+        assert!(init.contains("-b:v 1000000 "), "{init}");
+        assert_eq!(conversion.job().epoch, epoch, "a run started for the init");
+        assert_eq!(conversion.rung(), 0);
+        // One line a switch: those to new runs once their first segment
+        // is written, with how long it took.
+        let switches = || -> Vec<String> {
+            ring.page(&spoolframe_admin_api::LogQuery::default())
+                .lines
+                .into_iter()
+                .map(|l| l.text)
+                .filter(|t| t.contains("hls rung switch"))
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while switches().len() < 3 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let lines = switches();
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("from=3 to=1 asked=\"init\"")
+                    && l.contains("init=\"new run\"")
+                    && l.contains("ready_ms=")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("from=0 to=3") && l.contains("init=\"kept\"")),
+            "{lines:#?}"
+        );
+    }
+
+    /// A remux ladder's encoded rung of a two-hour film keyed every
+    /// 500 ms: a run's list of keyframes to force stops at what one
+    /// argument holds, near the end. A segment past its last is a new
+    /// run's, from there, not the old run's, which cut it where its
+    /// encoder keyed; one before it is still the old run's.
+    #[tokio::test]
+    async fn a_run_s_segments_past_its_forced_keyframes_are_a_new_run_s() {
+        use spoolframe_media::VideoStream;
+        use spoolframe_media::encoders::{Hardware, VideoEncoder};
+        use spoolframe_types::VideoCodec;
+
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-conversion-forced-list").await;
+        // Says it wrote far ahead: every segment is "written".
+        let ffmpeg = job::tests::ffmpeg(
+            &tmp.as_ref().join("bin"),
+            "for a; do last=$a; done; d=$(dirname \"$last\")\n\
+             printf i > \"$d/init.mp4\"\n\
+             printf '#EXTM3U\\nseg20000.m4s\\n' > \"$last\"\n\
+             echo out_time_us=36000000\n\
+             exec sleep 30",
+        );
+        let jobs = Arc::new(
+            Jobs::new(
+                JobLimits {
+                    budget: Units::jobs(4),
+                    max_remux: 32,
+                    max_gpu_jobs: 3,
+                    scratch_dir: tmp.as_ref().join("scratch"),
+                    scratch_limit_bytes: 1 << 30,
+                    read_ahead: Duration::from_secs(36_000),
+                    stalled_after: Duration::from_secs(60),
+                    gpu_filters: false,
+                    tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+                    video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
+                },
+                spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
+            )
+            .unwrap(),
+        );
+        let film = tmp.as_ref().join("film.mkv");
+        std::fs::write(&film, b"x").unwrap();
+        let descriptor = Arc::new(MediaDescriptor {
+            container: "matroska,webm".into(),
+            duration: Some(Duration::from_secs(7200)),
+            bit_rate: Some(30_000_000),
+            video: Some(VideoStream {
+                index: 0,
+                codec: "h264".into(),
+                profile: Some("High".into()),
+                level: None,
+                width: 1920,
+                height: 1080,
+                pixel_format: Some("yuv420p".into()),
+                color_transfer: None,
+                frame_rate_millis: Some(24_000),
+                bit_depth: 8,
+                hdr: None,
+                dolby_vision: None,
+                bit_rate: None,
+            }),
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        });
+        let encode = ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height: 720,
+            max_bitrate: Some(4_000_000),
+            tone_map: false,
+        };
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: spoolframe_types::Container::Mp4,
+            video: Some(ConvertedVideo::Copy {
+                codec: VideoCodec::H264,
+                dolby_vision: false,
+            }),
+            audio: None,
+            subtitle: None,
+            ladder: vec![
+                Rung {
+                    height: 1080,
+                    max_bitrate: 30_000_000,
+                    video: None,
+                },
+                Rung {
+                    height: 720,
+                    max_bitrate: 4_000_000,
+                    video: Some(encode),
+                },
+            ],
+            reasons: Vec::new(),
+        };
+        let encoders = Encoders {
+            video: vec![VideoEncoder {
+                codec: VideoCodec::H264,
+                name: "h264_vaapi".into(),
+                hardware: Some(Hardware::Vaapi),
+            }],
+            ..Encoders::software_baseline()
+        };
+        let keyframes: Vec<u64> = (0..14_400).map(|n| n * 500).collect();
+        let conversion = Conversion::start(
+            jobs,
+            ConversionSource {
+                handle: "h1",
+                path: &film,
+                descriptor,
+                plan: &plan,
+                gpus: one_gpu(encoders, &ffmpeg),
+                keyframes: Some(Arc::new(keyframes.clone())),
+                first_epoch: 0,
+                slot: None,
+                start_rung: 1,
+            },
+            None,
+        )
+        .unwrap();
+        let first = conversion.job();
+        written(&first).await;
+        let segments = conversion.segments().unwrap().clone();
+        let last = args::forced_through(&segments.starts_ms, None).expect("a list cut short");
+        // About 1:55:50, as the review found.
+        assert!((6_900_000..7_000_000).contains(&last), "{last}");
+        let past = segments.starts_ms.partition_point(|&ms| ms < last) as u32 + 1;
+        let before = conversion.job_for_segment(past - 1, 1).unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &first),
+            "a segment it forced is its own"
+        );
+        let after = conversion.job_for_segment(past, 1).unwrap();
+        assert!(
+            !Arc::ptr_eq(&after, &first),
+            "segment {past} came from the run whose cuts stopped at {last} ms"
+        );
+        assert_eq!(after.first_segment, past);
     }
 
     /// B-13: a conversion that fails before its encode starts (a link

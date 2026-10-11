@@ -1023,6 +1023,11 @@ impl EncodeJob {
         self.shared.reader_ms.fetch_max(ms, Ordering::Relaxed);
     }
 
+    /// For HLS, the segment its reader asked for last (0: none yet).
+    pub fn reader_segment(&self) -> u32 {
+        self.shared.reader_segment.load(Ordering::Relaxed)
+    }
+
     /// For HLS, the last segment it has written, if any.
     pub fn written(&self) -> Option<u32> {
         self.progress.borrow().last_segment

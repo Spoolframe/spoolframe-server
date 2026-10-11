@@ -34,6 +34,9 @@ struct State {
     invocations: Mutex<Vec<(String, spoolframe_protocol::rpc::RpcRequest)>>,
     /// The length advertised by binary replies and the bytes actually sent.
     body: Mutex<(u64, Vec<u8>)>,
+    /// Binary replies' bytes go out this many at a time, this far apart:
+    /// a slow link, or an encode still writing.
+    trickle: Mutex<Option<(usize, std::time::Duration)>>,
     /// The addresses the `ServerAddresses` event pushes (PX-12).
     told: Mutex<Vec<SocketAddr>>,
     /// The relays the `ServerAddresses` event lists.
@@ -198,6 +201,11 @@ impl Stub {
         *self.state.body.lock() = (announced, bytes.to_vec());
     }
 
+    /// Send binary replies `piece` bytes at a time, `every` apart.
+    pub fn trickle(&self, piece: usize, every: std::time::Duration) {
+        *self.state.trickle.lock() = Some((piece, every));
+    }
+
     pub fn invocations(&self, kind: &str) -> Vec<spoolframe_protocol::rpc::RpcRequest> {
         self.state
             .invocations
@@ -325,7 +333,25 @@ async fn stream(
             _ => panic!("unexpected resource"),
         };
         let sent = write_frame(&mut send, &ResourceResponse::Ready { length, metadata }).await;
-        if sent.is_ok() && send.write_all(&bytes).await.is_ok() {
+        let trickle = *state.trickle.lock();
+        let written = match (sent, trickle) {
+            (Err(_), _) => false,
+            (Ok(_), None) => send.write_all(&bytes).await.is_ok(),
+            (Ok(_), Some((piece, every))) => {
+                let mut ok = true;
+                for (i, part) in bytes.chunks(piece.max(1)).enumerate() {
+                    if i > 0 {
+                        tokio::time::sleep(every).await;
+                    }
+                    if send.write_all(part).await.is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                ok
+            }
+        };
+        if written {
             let _ = send.finish();
         }
         let _ = send.stopped().await;

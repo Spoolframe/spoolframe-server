@@ -46,7 +46,7 @@ use crate::artwork::{Artwork, ArtworkError};
 use crate::auth::{self, Approval, LoginError, RECENT_SIGN_IN, SessionToken, UnlockError};
 use crate::device_sign_in::{self, ClaimError, Outcome, Waiting};
 use crate::encode::job::{EncodeJob, JobError, Progress};
-use crate::encode::{Conversion, ConversionSource, hls};
+use crate::encode::{Conversion, ConversionSource, Init, hls};
 use crate::events::{Addresses, EventStreams};
 use crate::network::{Connections, ServerName, Services};
 use crate::passkeys::{CeremonyError, SignInError};
@@ -4626,6 +4626,40 @@ async fn open_at(file: &Path, offset: u64, sent: u64) -> std::io::Result<tokio::
     Ok(handle)
 }
 
+/// A range of a rung's kept init segment ([`Init::Kept`]): whole, so
+/// read at once.
+async fn kept_init(
+    file: &Path,
+    read: &MediaRead,
+    epoch: u32,
+) -> Result<(tokio::fs::File, MediaReadReply), Error> {
+    let unreadable = |e: std::io::Error| {
+        tracing::warn!(path = %file.display(), error = %e, "cannot read a kept init segment");
+        Error::PlaybackFailed {
+            reason: "a segment of the conversion could not be read".into(),
+        }
+    };
+    let mut handle = tokio::fs::File::open(file).await.map_err(unreadable)?;
+    let size = handle.metadata().await.map_err(unreadable)?.len();
+    let sent = read
+        .length
+        .min(MAX_READ)
+        .min(size.saturating_sub(read.offset));
+    handle
+        .seek(std::io::SeekFrom::Start(read.offset.min(size)))
+        .await
+        .map_err(unreadable)?;
+    Ok((
+        handle,
+        MediaReadReply {
+            sent,
+            size,
+            complete: true,
+            epoch,
+        },
+    ))
+}
+
 /// A range of HLS segment `n` (P2-05), 0 being the init segment. Segments
 /// are addressed by number, not by epoch: a read far from what is written
 /// restarts the encode there and waits for it.
@@ -4644,9 +4678,13 @@ async fn segment_range(
         });
     }
     let job = if n == 0 {
-        conversion
-            .job_for_init(read.variant)
+        match conversion
+            .init_for(read.variant)
             .map_err(conversion_error)?
+        {
+            Init::Job(job) => job,
+            Init::Kept(file) => return kept_init(&file, read, conversion.job().epoch).await,
+        }
     } else {
         conversion
             .job_for_segment(n, read.variant)

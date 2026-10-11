@@ -70,33 +70,88 @@ const MAX_KEYFRAME_LIST: usize = 120 * 1024;
 /// start on. The times are the output's: the film's own after a seek
 /// (`-copyts`), and from 0 for a run from the start, as the copy's are.
 fn keyframes_at(cuts: &[u64], start: Option<Duration>) -> String {
+    forced_list(cuts, start).0
+}
+
+/// The last of `cuts` a run from `start` forces a keyframe at, when its
+/// list ([`keyframes_at`]) stops short of the last cut: past it the run
+/// cuts where its encoder keys, not where the playlist says, and its
+/// segments there are not to be read (`Conversion::job_for_segment`
+/// starts another run, with a list of its own). `None` when the list
+/// holds every cut from `start` on.
+pub(crate) fn forced_through(cuts: &[u64], start: Option<Duration>) -> Option<u64> {
+    forced_list(cuts, start).1
+}
+
+fn forced_list(cuts: &[u64], start: Option<Duration>) -> (String, Option<u64>) {
     let from = start.map_or(0, |d| d.as_millis() as u64);
     let mut list = String::new();
+    let mut last = None;
     for &ms in cuts.iter().filter(|&&ms| ms >= from) {
         let entry = format!("{}.{:03}", ms / 1000, ms % 1000);
         if list.len() + entry.len() + 1 > MAX_KEYFRAME_LIST {
-            break;
+            return (list, last);
         }
         if !list.is_empty() {
             list.push(',');
         }
         list.push_str(&entry);
+        last = Some(ms);
     }
-    list
+    (list, None)
 }
 
 /// What keeps `encoder` from adding keyframes of its own between the
-/// forced ones: a scene cut or a GOP's end would be a cut the copy does
-/// not have. The GOP is long (40 s at 25 fps) rather than unbounded: a
-/// source keyed less often than that is cut where the copy is not.
+/// forced ones: a scene cut or a GOP's end would be a cut the playlist
+/// (or the copy) does not have. The GOP is long (40 s at 25 fps) rather
+/// than unbounded: a source keyed less often than that is cut where the
+/// copy is not. Each encoder in its own words: ffmpeg's `-sc_threshold`
+/// reaches libx264 alone, and every other encoder reports it unused.
+///
+/// - libx265: `scenecut=0`, and `open-gop=0`. Its forced keyframes are
+///   otherwise CRA pictures (`-forced-idr` notwithstanding), whose
+///   leading pictures refer to the segment before: a player starting at
+///   one, after a switch or a seek, cannot decode them.
+/// - libsvtav1: `scd=0`, its scene change detection (off by default).
+/// - NVENC: `-no-scenecut`, and IDR at the forced ones.
+/// - VA-API and QSV add no keyframe at a scene change (measured on a clip
+///   cut every 1.5 s): the long GOP is all they need.
 fn only_forced_keyframes(encoder: &str) -> Vec<String> {
     let mut args = vec![s("-g"), s("1000")];
-    if encoder.starts_with("lib") {
-        args.extend([s("-sc_threshold"), s("0")]);
-    } else if encoder.ends_with("_nvenc") {
-        args.extend([s("-no-scenecut"), s("1"), s("-forced-idr"), s("1")]);
+    match encoder {
+        "libx264" => args.extend([s("-sc_threshold"), s("0")]),
+        "libx265" => args.extend([s("-x265-params"), s("scenecut=0:open-gop=0")]),
+        "libsvtav1" => args.extend([s("-svtav1-params"), s("scd=0")]),
+        nvenc if nvenc.ends_with("_nvenc") => {
+            args.extend([s("-no-scenecut"), s("1"), s("-forced-idr"), s("1")]);
+        }
+        _ => {}
     }
     args
+}
+
+/// For an HLS run of an encoded video from a seek, a copied audio track
+/// cut to start where the video does. A seek lands the demuxer on the
+/// source's keyframe before the time, and a copied track starts there,
+/// up to a source GOP early (1.6 s in American Sniper, 10 s in a film
+/// keyed that rarely), while the decoded video starts at the time. The
+/// HLS muxer measures its cuts from the first packet it gets, the audio:
+/// its thresholds came that much early, so a cut landed on whatever
+/// keyframe came first past one, and with a lead over a segment's length
+/// the run began with a segment of audio alone and every number after it
+/// was one off the playlist. The `noise` filter drops the packets before
+/// the time: the rest keep their own times (`-copyts`), where an output
+/// `-ss` would move them back to 0.
+fn copied_audio_from_start(spec: &EncodeSpec<'_>) -> Vec<String> {
+    let encoded = matches!(spec.video, Some(ConvertedVideo::Encode { .. }));
+    match (&spec.output, spec.start) {
+        (Output::Hls { .. }, Some(start)) if encoded && !start.is_zero() => vec![
+            s("-bsf:a"),
+            // `\,`: a bare comma would end the filter's options.
+            format!("noise=drop=lt(pts*tb\\,{})", seconds(start)),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 /// Where and how the job writes.
@@ -808,7 +863,9 @@ pub fn made(spec: &EncodeSpec<'_>) -> Made {
         },
         tone_mapper,
         burn_in: on(matches!(burned(spec), Ok(Some(_)))),
-        size: source.map(|(w, h)| scaled(w, h, height)),
+        size: stream.map(|v| {
+            whole_av1_size(spec, v, height).unwrap_or_else(|| scaled(v.width, v.height, height))
+        }),
         target_bitrate: max_bitrate,
     }
 }
@@ -822,6 +879,35 @@ fn scaled(width: u32, height: u32, to: u32) -> (u32, u32) {
     }
     let half = (u64::from(width) * u64::from(to) + u64::from(height)) / (2 * u64::from(height));
     ((half * 2) as u32, to)
+}
+
+/// The picture an AV1 encode on VA-API writes, when the size `scaled`
+/// gives is not one it can: a width of 64s and a height of 16s. AMD's
+/// encoder (radeonsi) codes any other size padded out to them, and says
+/// so in its sequence header but not as a smaller render size: 1296×540
+/// is coded 1344×544, 1920×1080 1920×1082, while the track and its
+/// `av1C` say the size asked for. AVPlayer configures its decoder from
+/// `av1C` and gets a different sequence header in every key frame: on a
+/// switch to such a rung it played the sound over a black or frozen
+/// picture. Measured on nimble's 7900 XTX: every 64×16 size was coded
+/// as asked. `None` for any other encoder, and for a size already whole.
+///
+/// The height is cut to the 16s at or under it, so a device's height
+/// limit holds; the width is that height's, kept in proportion, to the
+/// nearest 64 (at most 32 px off, 2.5 % at 1280 wide).
+fn whole_av1_size(spec: &EncodeSpec<'_>, stream: &VideoStream, height: u32) -> Option<(u32, u32)> {
+    let encoder = placement(spec)?.encoder;
+    if encoder.codec != VideoCodec::Av1 || encoder.hardware != Some(Hardware::Vaapi) {
+        return None;
+    }
+    let (width, to) = scaled(stream.width, stream.height, height);
+    if width % 64 == 0 && to % 16 == 0 {
+        return None;
+    }
+    let h = (to / 16 * 16).max(16);
+    let natural = u64::from(stream.width) * u64::from(h) / u64::from(stream.height.max(1));
+    let w = ((natural + 32) / 64 * 64).max(64) as u32;
+    Some((w, h))
 }
 
 /// Whether VA-API drivers decode `stream` at all: 4:2:0, and H.264 only
@@ -1331,6 +1417,16 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
             } => {
                 let encoder = encoder.expect("set above for an encode");
                 let ten_bits = ten_bits_out(spec, codec, tone_map, encoder.hardware);
+                // A size AV1 on VA-API cannot write as it is: the graph
+                // keeps the source's, and the frames, on the GPU at its
+                // end whichever path they took, are scaled there to one it
+                // can ([`whole_av1_size`]).
+                let whole = whole_av1_size(spec, stream, height);
+                let height = if whole.is_some() {
+                    stream.height
+                } else {
+                    height
+                };
                 let graph = if let Some(placebo) = placebo {
                     libplacebo_graph(spec, stream, height, placebo, decode)?
                 } else if decode == Decode::Gpu && decoder == Some(Hardware::Nvenc) {
@@ -1339,6 +1435,13 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                     gpu_graph(spec, stream, height, tone_map, ten_bits)?
                 } else {
                     cpu_graph(spec, stream, codec, height, tone_map, vaapi, ten_bits)?
+                };
+                let graph = match whole {
+                    Some((w, h)) => {
+                        let graph = graph.strip_suffix("[v]").unwrap_or(&graph);
+                        format!("{graph},scale_vaapi=w={w}:h={h}[v]")
+                    }
+                    None => graph,
                 };
                 args.extend([s("-filter_complex"), graph, s("-map"), s("[v]")]);
                 args.extend([s("-c:v"), encoder.name.clone()]);
@@ -1382,9 +1485,17 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                         args.extend([s("-force_key_frames"), keyframes_at(cuts, spec.start)]);
                         args.extend(only_forced_keyframes(&encoder.name));
                     }
-                    // A keyframe at every cut, so HLS cuts land on the grid.
+                    // A keyframe at every cut and nowhere else, so HLS
+                    // cuts land on the grid. The muxer cuts at the first
+                    // keyframe past each threshold, and a restart's
+                    // thresholds can come early (see
+                    // `copied_audio_from_start`): a keyframe of the
+                    // encoder's own there, VA-API's every 120 frames,
+                    // cut every segment of a resumed film a second off
+                    // the playlist's grid.
                     Output::Hls { .. } => {
                         args.extend([s("-force_key_frames"), forced_keyframes(from_start(spec))]);
+                        args.extend(only_forced_keyframes(&encoder.name));
                     }
                     Output::Progressive { .. } => {}
                 }
@@ -1401,7 +1512,10 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
             .ok_or_else(|| format!("audio {}: no such track", audio.index))?;
         args.extend([s("-map"), format!("0:{}", stream.index)]);
         match audio.action {
-            AudioAction::Copy { .. } => args.extend([s("-c:a"), s("copy")]),
+            AudioAction::Copy { .. } => {
+                args.extend([s("-c:a"), s("copy")]);
+                args.extend(copied_audio_from_start(spec));
+            }
             AudioAction::Encode {
                 codec,
                 channels,
@@ -3351,6 +3465,69 @@ mod tests {
         assert!(args.contains(&s("-copyts")));
     }
 
+    /// AMD's AV1 encoder on VA-API codes a size it cannot write padded to
+    /// 64×16, and the track's `av1C` says one size while every key frame
+    /// says another. A rung of a 2.4:1 film at 540 (1296×540) is scaled to
+    /// a whole one at the graph's end, on the GPU; one already whole, and
+    /// any other encoder, keep `w=-2`.
+    #[test]
+    fn an_av1_vaapi_encode_writes_a_size_of_64_by_16() {
+        use spoolframe_media::encoders::VideoEncoder;
+        let mut film = film();
+        if let Some(v) = film.video.as_mut() {
+            v.codec = "h264".into();
+            v.profile = Some("High".into());
+            v.width = 1920;
+            v.height = 800;
+            v.pixel_format = Some("yuv420p".into());
+            v.color_transfer = None;
+            v.bit_depth = 8;
+            v.hdr = None;
+        }
+        let mut enc = with_decoders(true);
+        enc.video.push(VideoEncoder {
+            codec: VideoCodec::Av1,
+            name: "av1_vaapi".into(),
+            hardware: Some(Hardware::Vaapi),
+        });
+        let run = |codec, height| {
+            let output = Output::Hls {
+                dir: "/scratch/h/0".into(),
+                start_number: 1,
+                cuts: None,
+            };
+            let video = ConvertedVideo::Encode {
+                codec,
+                height,
+                max_bitrate: Some(1_000_000),
+                tone_map: false,
+            };
+            let spec = spec(&film, &enc, video, COPY_DTS, None, output);
+            (
+                after(&ffmpeg_args(&spec).unwrap(), "-filter_complex").to_owned(),
+                made(&spec).size,
+            )
+        };
+        assert_eq!(
+            run(VideoCodec::Av1, 540),
+            (
+                s("[0:0]null,scale_vaapi=w=1280:h=528[v]"),
+                Some((1280, 528))
+            )
+        );
+        // 1728×720 and 1920×800 are whole already.
+        assert_eq!(
+            run(VideoCodec::Av1, 720),
+            (s("[0:0]scale_vaapi=w=-2:h=720[v]"), Some((1728, 720)))
+        );
+        assert_eq!(run(VideoCodec::Av1, 800).0, "[0:0]null[v]");
+        // H.264 crops its padding in the stream itself.
+        assert_eq!(
+            run(VideoCodec::H264, 540).0,
+            "[0:0]scale_vaapi=w=-2:h=540[v]"
+        );
+    }
+
     fn encoded_hls(start: Option<Duration>, start_number: u32) -> Vec<String> {
         let (film, enc) = (film(), encoders(false));
         let video = ConvertedVideo::Encode {
@@ -3394,6 +3571,71 @@ mod tests {
         assert_eq!(after(&args, "-hls_time"), "6");
         assert!(!args.contains(&s("-hls_init_time")), "{args:?}");
         assert_eq!(after(&args, "-hls_list_size"), "0");
+    }
+
+    /// Every HLS encode has a keyframe where it is forced and nowhere else:
+    /// a VA-API encoder's own, every 120 frames, was the first past an
+    /// early cut threshold, and a resumed film was cut a second off the
+    /// grid, every segment of it.
+    #[test]
+    fn an_encoded_hls_run_keys_only_where_it_is_forced() {
+        for (start, number) in [(None, 1), (Some(Duration::from_secs(122)), 23)] {
+            let args = encoded_hls(start, number);
+            assert!(
+                has(&args, &["-g", "1000", "-sc_threshold", "0"]),
+                "{args:?}"
+            );
+        }
+        let (film, enc) = (film(), encoders(true));
+        let output = Output::Hls {
+            dir: "/scratch/h/0".into(),
+            start_number: 23,
+            cuts: None,
+        };
+        let mut spec = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, output);
+        spec.start = Some(Duration::from_secs(122));
+        let args = ffmpeg_args(&spec).unwrap();
+        assert_eq!(after(&args, "-g"), "1000", "{args:?}");
+    }
+
+    /// A resumed encode's copied sound starts where its picture does, not
+    /// at the source's keyframe before the seek; a run from 0, a copied
+    /// picture and encoded sound are as they were.
+    #[test]
+    fn a_resumed_encode_s_copied_audio_starts_at_the_seek() {
+        let (film, enc) = (film(), encoders(false));
+        let run = |video, audio, start: Option<Duration>| {
+            let output = Output::Hls {
+                dir: "/scratch/h/0".into(),
+                start_number: 632,
+                cuts: None,
+            };
+            let mut spec = spec(&film, &enc, video, audio, None, output);
+            spec.start = start;
+            ffmpeg_args(&spec).unwrap()
+        };
+        let at = Some(Duration::from_millis(3_776_000));
+        let args = run(TONE_MAPPED_H264, COPY_DTS, at);
+        assert_eq!(
+            after(&args, "-bsf:a"),
+            "noise=drop=lt(pts*tb\\,3776.000)",
+            "{args:?}"
+        );
+        let eac3 = AudioAction::Encode {
+            codec: AudioCodec::Eac3,
+            channels: 6,
+            bitrate: 640_000,
+        };
+        for args in [
+            run(TONE_MAPPED_H264, COPY_DTS, None),
+            run(TONE_MAPPED_H264, COPY_DTS, Some(Duration::ZERO)),
+            // A copied picture starts at a keyframe, as its sound does.
+            run(COPY_HEVC, COPY_DTS, at),
+            // Encoded sound is cut at the seek as it is decoded.
+            run(TONE_MAPPED_H264, eac3, at),
+        ] {
+            assert!(!args.contains(&s("-bsf:a")), "{args:?}");
+        }
     }
 
     /// A remux ladder's encoded rung (PX-21) cuts where the copy does: a
@@ -3448,6 +3690,12 @@ mod tests {
         assert!(list.len() <= MAX_KEYFRAME_LIST);
         assert!(list.starts_with("0.000,1.000,"));
         assert!(!list.ends_with(','));
+        // Where it stops: the last time in it.
+        let last = list.rsplit(',').next().unwrap();
+        let through = forced_through(&cuts, None).unwrap();
+        assert_eq!(format!("{}.{:03}", through / 1000, through % 1000), last);
+        // A list with room for every cut stops nowhere.
+        assert_eq!(forced_through(&cuts[..100], None), None);
     }
 
     /// NVIDIA's encoder is told the same in its own words.
@@ -3459,6 +3707,26 @@ mod tests {
             ["-g", "1000", "-no-scenecut", "1", "-forced-idr", "1"]
         );
         assert_eq!(only_forced_keyframes("av1_vaapi"), ["-g", "1000"]);
+    }
+
+    /// libx265 takes neither `-sc_threshold` (ffmpeg reports it unused,
+    /// and it cut at every scene change) nor a closed GOP from ffmpeg (its
+    /// forced keyframes were CRA): both in its own parameters. libsvtav1
+    /// likewise; libx264 takes ffmpeg's own.
+    #[test]
+    fn software_encoders_add_no_keyframes_of_their_own() {
+        assert_eq!(
+            only_forced_keyframes("libx265"),
+            ["-g", "1000", "-x265-params", "scenecut=0:open-gop=0"]
+        );
+        assert_eq!(
+            only_forced_keyframes("libsvtav1"),
+            ["-g", "1000", "-svtav1-params", "scd=0"]
+        );
+        assert_eq!(
+            only_forced_keyframes("libx264"),
+            ["-g", "1000", "-sc_threshold", "0"]
+        );
     }
 
     /// A copied video is cut at its own keyframes: no head of its own.

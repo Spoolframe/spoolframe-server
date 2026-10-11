@@ -289,3 +289,65 @@ async fn resume_does_not_dial_a_server_with_no_connection() {
     })
     .await;
 }
+
+/// A segment read as a stream hands on its first bytes while the rest is
+/// still on its way (PX-46): the stub sends 1 MiB 64 KiB at a time, a
+/// quarter second apart, about 4 s in all. The first piece comes long
+/// before the last, the bytes are the segment's, and the link meter has
+/// a reading from them, as it has from the same segment read whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_segment_hands_on_its_first_bytes_before_the_rest() {
+    use spoolframe_client_sdk::PlaybackHandle;
+    const PIECE: usize = 64 << 10;
+    const EVERY: Duration = Duration::from_millis(250);
+    within(async {
+        let stub = Stub::start().await;
+        let segment: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 251) as u8).collect();
+        stub.body(segment.len() as u64, &segment);
+        stub.trickle(PIECE, EVERY);
+        let handle = PlaybackHandle("stub".into());
+
+        let (client, alice) = signed_in(&stub).await;
+        let started = Instant::now();
+        let mut stream = alice
+            .read_segment_stream(&handle, 0, 0, 3, 0, segment.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(stream.sent, segment.len() as u64);
+        assert!(stream.complete);
+        let first = stream.next().await.unwrap().expect("a first piece");
+        let first_at = started.elapsed();
+        let mut bytes = first;
+        while let Some(piece) = stream.next().await.unwrap() {
+            bytes.extend_from_slice(&piece);
+        }
+        let all_at = started.elapsed();
+        assert_eq!(bytes, segment);
+        assert_eq!(stream.received(), segment.len() as u64);
+        assert!(
+            first_at < Duration::from_secs(1),
+            "first piece after {first_at:?}"
+        );
+        assert!(all_at >= Duration::from_secs(3), "whole after {all_at:?}");
+        // 1 MiB less its first piece over about 3.75 s: about 2 Mbit/s.
+        let streamed = alice.link_rate().expect("a reading from the stream");
+        assert!(
+            (1_500_000..3_000_000).contains(&streamed),
+            "{streamed} bit/s"
+        );
+        client.close().await;
+
+        // The same segment read whole feeds the meter the same way.
+        let (client, alice) = signed_in(&stub).await;
+        let chunk = alice
+            .read_segment(&handle, 0, 0, 3, 0, segment.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(chunk.bytes, segment);
+        let whole = alice.link_rate().expect("a reading from the read");
+        assert!((1_500_000..3_000_000).contains(&whole), "{whole} bit/s");
+        client.close().await;
+        stub.stop().await;
+    })
+    .await;
+}

@@ -6578,7 +6578,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-admin-api"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "jsonrpsee",
  "serde",
@@ -6588,7 +6588,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-catalog"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "async-trait",
  "spoolframe-types",
@@ -6597,7 +6597,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-client-sdk"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6625,7 +6625,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-media"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "async-trait",
  "easy-ffprobe",
@@ -6645,7 +6645,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-plex"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -6666,7 +6666,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-policy"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "serde",
  "spoolframe-protocol",
@@ -6675,7 +6675,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-probe"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -6692,7 +6692,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-protocol"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -6710,7 +6710,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-server"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -6781,7 +6781,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-test-dir"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "tmpdir",
  "tokio",
@@ -6789,7 +6789,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-types"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -6798,7 +6798,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-web"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "dioxus",
  "dioxus-fullstack",

@@ -4,6 +4,7 @@
 //! a module here, never as a new file under `tests/`.
 
 mod addresses;
+mod reachability;
 mod reconnect;
 mod stalls;
 mod stub;

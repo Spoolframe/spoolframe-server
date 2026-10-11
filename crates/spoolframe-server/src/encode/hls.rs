@@ -11,11 +11,15 @@
 //!   play two seconds into the encode, not six), then 6 s. ffmpeg's HLS
 //!   muxer cuts at the first keyframe from `start + 6 s × n` on; for a run
 //!   from 0, `hls_init_time` 2 s with a one-entry list makes that 2 s, 4 s,
-//!   then 8 s and every 6 s on ([`Segments::encoded`]). A keyframe the
-//!   encoder adds itself (a scene change) is never past a threshold
-//!   before the forced one, so it does not move a cut. A restart begins on
-//!   the grid past the head, at `start + 6 s × n`, and stays on it; one in
-//!   the head starts from 0.
+//!   then 8 s and every 6 s on ([`Segments::encoded`]). The encoder adds
+//!   no keyframe of its own (no scene cuts, a long GOP): the muxer cuts at
+//!   the first keyframe past each threshold, and a restart's thresholds
+//!   can come early, so one of the encoder's (VA-API's every 120 frames)
+//!   would be cut at instead. A restart begins on the grid past the head,
+//!   at `start + 6 s × n`, and stays on it; one in the head starts from 0.
+//!   A copied audio track begins where the seek lands, at the source's
+//!   keyframe before it, and is cut back to the start (`args`): the muxer
+//!   measures from the first packet it gets.
 //! - A copied video can only be cut at the source's keyframes. ffmpeg
 //!   counts its 6 s from where a run starts, so a restart at a keyframe off
 //!   the grid would cut elsewhere than a run from 0. Instead every keyframe

@@ -836,10 +836,12 @@ fn remux_ladder(
         .bit_rate
         .map(|bits| bits.saturating_sub(audio_bits))
         .unwrap_or_else(|| worth(source.height, codec));
-    let under: Vec<Rung> = ladder(copy_bits / 2, tallest, codec)
+    // At most one rung fewer than a ladder, spread over the same span
+    // to the floor: cut from a ladder of `MAX_RUNGS`, a fast copy's lost
+    // its floor (32 Mbit/s: 16, 6.35 and 2.52, nothing under 1).
+    let under: Vec<Rung> = rungs_of(copy_bits / 2, tallest, codec, MAX_RUNGS - 1)
         .into_iter()
         .filter(|r| r.max_bitrate <= copy_bits / 2)
-        .take(MAX_RUNGS - 1)
         .map(|r| Rung {
             video: Some(ConvertedVideo::Encode {
                 codec,
@@ -1013,10 +1015,15 @@ pub use spoolframe_protocol::playback::Rung;
 /// look the same. Two rungs may share a height: the bitrate step is
 /// what lets AVPlayer fit the link, the picture size only follows it.
 pub fn ladder(top: u64, tallest: u32, codec: VideoCodec) -> Vec<Rung> {
+    rungs_of(top, tallest, codec, MAX_RUNGS)
+}
+
+/// [`ladder`], of at most `most` rungs.
+fn rungs_of(top: u64, tallest: u32, codec: VideoCodec, most: usize) -> Vec<Rung> {
     let top = top.max(RUNG_FLOOR);
     let span = top as f64 / RUNG_FLOOR as f64;
     // Steps of at least 2x between rungs, and no more rungs than allowed.
-    let steps = (span.log2().floor() as usize).min(MAX_RUNGS - 1);
+    let steps = (span.log2().floor() as usize).min(most.max(1) - 1);
     let ratio = if steps == 0 {
         1.0
     } else {
@@ -1839,6 +1846,32 @@ mod tests {
         assert!(rungs.len() >= 2, "{plan:?}");
         assert!(rungs.iter().all(|r| r.video.is_none()), "{rungs:?}");
         assert!(rungs[0].max_bitrate <= 10_000_000 - 640_000, "{rungs:?}");
+    }
+
+    /// A fast copy's encodes still reach the floor: three rungs from half
+    /// its rate down to [`RUNG_FLOOR`]. Cut from a ladder of four, a
+    /// 32 Mbit/s copy's were 16, 6.35 and 2.52 Mbit/s, and a slow link had
+    /// nothing under 2.5.
+    #[test]
+    fn a_fast_copy_s_encodes_reach_the_floor() {
+        let mut d = dts_aac_pgs();
+        d.bit_rate = Some(32_640_000);
+        let plan = super::plan_for(
+            &d,
+            Some(&avplayer()),
+            Quality::Auto { link_bitrate: None },
+            Some(60_000_000),
+            true,
+            picked(1, None),
+            Bitmap::Preferred(BitmapPreference::Text),
+            &dev_encoders(),
+            &Ocr::disabled(),
+        );
+        assert!(copies_video(&plan), "{plan:?}");
+        let rungs = ladder_of(&plan);
+        assert_eq!(rungs.len(), MAX_RUNGS, "{rungs:?}");
+        assert_eq!(rungs[1].max_bitrate, 16_000_000, "{rungs:?}");
+        assert_eq!(rungs.last().unwrap().max_bitrate, RUNG_FLOOR, "{rungs:?}");
     }
 
     /// On the LAN a copy plays alone: it fits, and nothing is gained.

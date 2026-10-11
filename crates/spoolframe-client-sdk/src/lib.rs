@@ -25,6 +25,7 @@ mod link_meter;
 pub mod pairing;
 pub mod portable;
 mod portable_sign_in;
+mod reachability;
 mod refusals;
 mod relay_policy;
 mod servers;
@@ -50,10 +51,14 @@ pub use portable::{
     PortableIdentityState, PortableRoot, PortableUserId, RecoveryPhrase, RevokedKey, StateError,
     TieProof, UserDeviceCredential,
 };
+pub use reachability::{
+    DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,
+    Reachability, SavedAddr,
+};
 pub use servers::ServerEntry;
 pub use session::{
-    ActiveProfile, Chunk, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange, PlaybackOptions,
-    PlaybackQuality, ProfileSignIn, SavedProfile, Session, SignInMethod, Subtitle,
+    ActiveProfile, Chunk, ChunkStream, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange,
+    PlaybackOptions, PlaybackQuality, ProfileSignIn, SavedProfile, Session, SignInMethod, Subtitle,
 };
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{
@@ -81,7 +86,7 @@ pub use spoolframe_types as types;
 pub use storage::{MemoryStorage, Storage, StorageError};
 
 mod managed;
-pub use managed::{ManagedPlayback, PlaybackBackend};
+pub use managed::{ManagedPlayback, PlaybackBackend, SegmentStream};
 mod profile_scope;
 pub use profile_scope::{ProfileScope, ProfileToken};
 

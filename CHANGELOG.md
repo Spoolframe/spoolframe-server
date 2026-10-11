@@ -2,6 +2,100 @@
 
 ## Unreleased
 
+## 0.6.3 (2026-10-11)
+
+- SDK: an HLS segment or a converted chunk can be read as it arrives.
+  `ManagedPlayback::segment_stream` and `chunk_stream` (and
+  `Session::read_segment_stream`, `read_chunk_stream`) answer first with
+  the read's length, the segment's size and whether it is whole, then
+  hand on the body piece by piece, so a bridge gives its player the
+  first bytes of a segment while the rest is on the link instead of
+  after the whole read. The link meter and the step-down count it as
+  they count a read; a resume while a segment is arriving ends it with
+  `PlaybackResumed`, as reading on from part-way does.
+
+- SDK: the link meter has a reading on a slow link. It needed 4 MiB
+  inside its 10 s window, which a 1 Mbit/s link never carries (1 MiB
+  segments, or the apps' 512 KiB reads, one after another), so the Auto
+  step-down of a single-rung conversion never fired there. Two seconds
+  of the link busy are enough now. A converted read is metered whatever
+  its length, timed from its body's first chunk (which is not counted,
+  as it came with the response), where a body under 512 KiB was not
+  metered at all.
+
+- A remux ladder's encodes reach the 1 Mbit/s floor whatever the
+  copy's rate. Three encodes were cut from a ladder of four, so a fast
+  copy lost its lowest: 32 Mbit/s gave 16, 6.35 and 2.52 Mbit/s, and a
+  slow link had nothing under 2.5. They are now spread from half the
+  copy's rate down to the floor (16, 4 and 1 Mbit/s).
+
+- A remux ladder's encoded rung keeps to the playlist to the film's
+  end. A run's list of keyframes to force stops at what one argument
+  holds (120 KiB). Past its last, the run cut where its encoder keyed,
+  and segments there held other times than their numbers said: from
+  about 1:55:50 in a two-hour film keyed every 500 ms. A segment past a
+  run's last forced keyframe now starts a new run there, with a list
+  of its own, as a switch does.
+
+- A software HEVC encode (libx265) adds no keyframes of its own and
+  writes IDR at the forced ones. It ignored ffmpeg's `-sc_threshold`
+  and keyed every scene change, each one an extra HLS segment off the
+  playlist. Its forced keyframes were open-GOP CRA pictures, which a
+  player starting there after a switch or a seek could not decode.
+  libx265 now gets `scenecut=0:open-gop=0`, and libsvtav1 `scd=0`, in
+  their own parameters.
+
+- The server log has a line for each rung switch of an HLS ladder, and
+  for each run restarted for a segment it does not have, under
+  `spoolframe_server::playback`. It gives the playback, the rung from
+  and to, what the player asked for, and where the new run starts.
+  It says whether the init came from the kept copy, the run that left
+  that rung, or a new run, and for a new run how long its init and
+  first segment took to be written (`ready_ms`).
+
+- An AV1 encode on VA-API is written at a size its encoder codes as it
+  is: a width of 64s and a height of 16s (1296x540 becomes 1280x528).
+  AMD's encoder coded any other size padded (1344x544, and 1920x1082
+  for 1080p) without saying so in the track. AVPlayer then met a
+  sequence header in every key frame that its decoder setup did not
+  have, and a switch to such a rung played the sound over a black or
+  frozen picture for seconds.
+
+- A player switching to another rung of a ladder gets its init segment
+  from one run, not two. The run for a rung's init started past what
+  the old rung had written. The player's next segment was behind that,
+  so a second run started for it: two ffmpeg starts before a picture.
+  For a 4K HDR film on nimble that was 8.5 to 11.4 s tone-mapped to
+  H.264 with libplacebo, where an iPhone gives up on an init after 6 s.
+  That run now starts at the segment after the last one the player
+  read: 4.6 to 6.2 s, and 0.7 to 0.9 s for AV1 keeping HDR. A rung's init is also kept from the first
+  run that wrote it, so a player coming back to that rung has it at
+  once.
+
+- A converted film resumed partway through is cut where its playlist
+  says. Each segment a resumed encode wrote was about a second off the
+  playlist's grid (American Sniper on VA-API), or a whole segment off
+  for a film keyed every 10 s, and an iPhone switching quality there
+  played the sound over a black picture or jumped back. The HLS muxer
+  measures its cuts from the first packet it gets: the copied audio,
+  which began at the source's keyframe before the seek, up to a GOP
+  early. So it cut early, at whatever keyframe came next, including
+  the encoder's own (VA-API adds one every 120 frames). Now an HLS
+  encode keys only where it is forced (a long GOP, no scene cuts), and
+  a resumed encode's copied audio starts at the seek.
+
+- SDK: `Client::reachability(endpoint_id)`, how this device stands with a
+  server, for an app's "can't be reached" details: the addresses, relays
+  and lookup it keeps, whether relays are on for it as the dialler
+  applies them, what each address lookup (mDNS, each pkarr relay) last
+  answered about it, its last dial in this run (when, how long, the
+  stage it stopped at: no address, connect, timeout, handshake, closed,
+  Hello, refused; the error, the addresses dialled, and every path iroh
+  knew of then), and the paths of the connection open now with their
+  round trips. Plain serde structs. Iroh does not say how each path of a
+  failed dial fared, so a failed dial lists the paths known, not a
+  result for each.
+
 - SDK: a saved server this device reaches through relays, yet knows no
   relay or lookup for, is looked up at n0 (dns.iroh.link) too. A server
   saved while its relays and discovery were off, which turned them on
