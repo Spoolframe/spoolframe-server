@@ -558,7 +558,10 @@ async fn shutting_down(conn: &Connection, id: EndpointId, client: &Weak<Inner>) 
                 } => {
                     tracing::debug!(server = %id, ?max_bitrate, "a playback's share changed");
                     if let Some(inner) = client.upgrade() {
-                        let _ = inner.shares.send(handle);
+                        let _ = inner.shares.send(crate::PlaybackShare {
+                            handle,
+                            max_bitrate,
+                        });
                     }
                 }
                 Event::Unknown => {}

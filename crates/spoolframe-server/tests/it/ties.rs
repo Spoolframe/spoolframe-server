@@ -102,7 +102,11 @@ fn finish(user: u8, proof: TieProof) -> Request {
 /// Root `user`'s proof for `username` over `nonce`.
 fn by_root(phone: &TestClient, nonce: &[u8; 32], user: u8, username: &str) -> TieProof {
     TieProof::Root {
-        signature: root(user).sign(&message(phone, nonce, user, username)),
+        signature: root(user)
+            .sign(&message(phone, nonce, user, username))
+            .into(),
+        root: None,
+        genesis: None,
     }
 }
 
@@ -180,7 +184,10 @@ async fn a_proof_made_for_anything_else_is_refused() {
     let nonce = begin(&phone, &session).await;
     let for_another_server = TieProof::Root {
         signature: root(7)
-            .sign(&tie_message(&other_server, &nonce, &identity(7), "alice").unwrap()),
+            .sign(&tie_message(&other_server, &nonce, &identity(7), "alice").unwrap())
+            .into(),
+        root: None,
+        genesis: None,
     };
     assert_eq!(
         phone

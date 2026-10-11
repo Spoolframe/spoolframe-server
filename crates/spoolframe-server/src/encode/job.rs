@@ -693,6 +693,7 @@ impl Jobs {
             made,
             card: _,
             ffmpeg,
+            aligned_until,
         } = run;
         let ffmpeg = ffmpeg.unwrap_or_else(|| self.ffmpeg.clone());
         let limits = self.limits();
@@ -754,6 +755,7 @@ impl Jobs {
         let job = Arc::new(EncodeJob {
             epoch,
             first_segment,
+            aligned_until,
             load,
             dir,
             written,
@@ -811,6 +813,10 @@ pub struct Run {
     /// ffmpeg confined to the GPU card it runs on, in place of the jobs'
     /// own (which is given no GPU's nodes).
     pub ffmpeg: Option<Tool>,
+    /// For HLS cut at given keyframes, the first segment it does not cut
+    /// where the playlist says: its list of keyframes to force stopped
+    /// short (`args::forced_through`). Worked out once, when it starts.
+    pub aligned_until: Option<u32>,
 }
 
 /// A run decoding in software, in place of one decoding on the GPU.
@@ -887,6 +893,9 @@ pub struct EncodeJob {
     pub epoch: u32,
     /// For HLS, the number of the first segment this run writes.
     pub first_segment: u32,
+    /// See [`Run::aligned_until`]: the first of its segments not cut
+    /// where the playlist says, `None` for all of them.
+    pub aligned_until: Option<u32>,
     /// What it weighs against the encode budget.
     pub load: Load,
     dir: PathBuf,

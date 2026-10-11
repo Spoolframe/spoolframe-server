@@ -287,6 +287,33 @@ async fn a_kept_session_is_pushed_them_on_the_next_connection() {
     .await;
 }
 
+/// A playback's share of the server's uplink (PX-46) reaches the app
+/// with the bitrate the server gave it, not only its handle: an app can
+/// say what its playback may take.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pushed_share_reaches_the_app_with_its_bitrate() {
+    within(async {
+        let key = SecretKey::generate();
+        let id = key.public().to_string();
+        let stub = Stub::start_on(key, &["127.0.0.1:0".parse().unwrap()]).await;
+        let v4 = stub.bound()[0];
+        let bridge: SocketAddr = "172.17.0.1:4433".parse().unwrap();
+        stub.tell(&[v4, bridge]);
+        let storage = Arc::new(MemoryStorage::default());
+        let client = signed_in_via(&storage, &stub, v4).await;
+        // The events stream is open once the first push is saved.
+        until_saved(&client, &id, bridge).await;
+        let mut shares = client.playback_shares();
+        stub.push_share("h1", Some(4_500_000)).await;
+        let share = shares.recv().await.unwrap();
+        assert_eq!(share.handle.0, "h1");
+        assert_eq!(share.max_bitrate, Some(4_500_000));
+        client.close().await;
+        stub.stop().await;
+    })
+    .await;
+}
+
 /// A second push replaces what the first told: an address the server no
 /// longer tells (a Docker bridge it now ignores) is gone at once, and the
 /// one this device reached stays though the server leaves it out.

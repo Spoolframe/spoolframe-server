@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::portable::{
-    CredentialError, PortableUserId, Signature, UserDeviceCredential, verify_device_proof,
+    CredentialError, GenesisError, PortableIdentityState, PortableUserId, Signature,
+    UserDeviceCredential, verify_device_proof,
 };
 
 use crate::clock::Clock;
@@ -73,6 +74,16 @@ pub enum PresentationError {
     /// An identity state seen here revokes its device key.
     #[error("the device key is revoked")]
     Revoked,
+    /// The root that signed it is not one of its identity's now (P7-08):
+    /// never added, or removed.
+    #[error("the credential's root is not one of its identity's")]
+    NotARoot,
+    /// A state it carries is signed by a root its identity never had.
+    #[error("an identity state it carries is not signed by one of its roots")]
+    StateNotARoot,
+    /// The genesis it carries is not one, or is another identity's.
+    #[error("the genesis it carries is not its identity's: {0}")]
+    Genesis(GenesisError),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -86,7 +97,12 @@ pub enum PresentationError {
 /// 2. its device key signed this server's nonce ([`verify_device_proof`]);
 /// 3. no identity state seen here revokes the key ([`Store::revokes`]:
 ///    the union of every valid state's revocations, not only the
-///    newest's, since revocation only grows).
+///    newest's, since revocation only grows);
+/// 4. (P7-08) the root that signed it is one of its identity's now, as
+///    the genesis (`genesis`, the one it carries, or the one kept here)
+///    and the states kept here and `states` (carried, already verified,
+///    held in memory only) work them out ([`Store::root_set`]); and every
+///    state in `states` is signed by a root the identity ever had.
 ///
 /// The third is only as fresh as the states that have reached this
 /// server (§48): a revocation stops a credential here once a device or
@@ -95,6 +111,7 @@ pub enum PresentationError {
 pub async fn check_presentation(
     store: &Store,
     credential: &UserDeviceCredential,
+    states: &[PortableIdentityState],
     server: &[u8; 32],
     nonce: &[u8; 32],
     signature: &Signature,
@@ -102,6 +119,28 @@ pub async fn check_presentation(
 ) -> Result<PortableUserId, PresentationError> {
     credential.verify(now)?;
     verify_device_proof(credential, server, nonce, signature)?;
+    if let Some(genesis) = credential.genesis.as_deref() {
+        genesis.verify().map_err(PresentationError::Genesis)?;
+        if genesis.user() != credential.user {
+            return Err(PresentationError::Genesis(GenesisError::BadSignature));
+        }
+    }
+    let roots = store
+        .root_set(credential.user, credential.genesis.as_deref(), states)
+        .await?;
+    let before = store
+        .root_set(credential.user, credential.genesis.as_deref(), &[])
+        .await?;
+    if states.iter().any(|state| {
+        state.user != credential.user
+            || !roots.knew(&state.signer())
+            || before.refuses_additions(&state.roots_added)
+    }) {
+        return Err(PresentationError::StateNotARoot);
+    }
+    if !roots.holds(&credential.signer()) {
+        return Err(PresentationError::NotARoot);
+    }
     if store
         .revokes(credential.user, &credential.device_key, now)
         .await?
@@ -149,7 +188,7 @@ mod tests {
         signature: &Signature,
         now: i64,
     ) -> Result<PortableUserId, PresentationError> {
-        check_presentation(store, credential, &SERVER, &NONCE, signature, now).await
+        check_presentation(store, credential, &[], &SERVER, &NONCE, signature, now).await
     }
 
     #[tokio::test]
@@ -361,5 +400,231 @@ mod tests {
             Err(PresentationError::Revoked)
         ));
         check(&store, &late, &proof(9), issued + 1).await.unwrap();
+    }
+
+    // P7-08: an identity with security key roots.
+
+    use spoolframe_protocol::portable::soft_key::SoftKey;
+    use spoolframe_protocol::portable::{IdentityGenesis, RemovedRoot, RootKey, StateChanges};
+
+    /// An identity begun with keys 3 and 4.
+    fn key_identity() -> (IdentityGenesis, SoftKey, SoftKey) {
+        let (a, b) = (SoftKey::from_seed(3), SoftKey::from_seed(4));
+        let handle = [0x33; 32];
+        let roots = vec![a.root(), b.root()];
+        let message = IdentityGenesis::message(&handle, &roots).unwrap();
+        let genesis = IdentityGenesis {
+            handle,
+            signatures: vec![a.assert(&message), b.assert(&message)],
+            roots,
+        };
+        (genesis, a, b)
+    }
+
+    /// `by`'s credential for device `seed` of `genesis`'s identity,
+    /// carrying the genesis.
+    fn key_credential(genesis: &IdentityGenesis, by: &SoftKey, seed: u8) -> UserDeviceCredential {
+        let mut credential = UserDeviceCredential::signed_by(
+            genesis.user(),
+            by.root(),
+            device(seed),
+            1,
+            T,
+            T + MAX_CREDENTIAL_VALIDITY,
+            |m| by.assert(m),
+        );
+        credential.genesis = Some(Box::new(genesis.clone()));
+        credential
+    }
+
+    #[tokio::test]
+    async fn a_key_identity_s_credential_holds_with_its_genesis() {
+        let store = test_store("presentation-key").await;
+        let (genesis, a, b) = key_identity();
+        for key in [&a, &b] {
+            let who = check(&store, &key_credential(&genesis, key, 9), &proof(9), T)
+                .await
+                .unwrap();
+            assert_eq!(who, genesis.user());
+        }
+        // Without the genesis, and none kept here: no root is known.
+        let mut bare = key_credential(&genesis, &a, 9);
+        bare.genesis = None;
+        assert!(matches!(
+            check(&store, &bare, &proof(9), T).await,
+            Err(PresentationError::NotARoot)
+        ));
+        // Kept, it is not needed again.
+        store.accept_genesis(&genesis, T).await.unwrap();
+        check(&store, &bare, &proof(9), T).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_key_that_is_not_the_identity_s_signs_no_credential_for_it() {
+        let store = test_store("presentation-key-stranger").await;
+        let (genesis, _, _) = key_identity();
+        let stranger = SoftKey::from_seed(5);
+        assert!(matches!(
+            check(
+                &store,
+                &key_credential(&genesis, &stranger, 9),
+                &proof(9),
+                T
+            )
+            .await,
+            Err(PresentationError::NotARoot)
+        ));
+        // Nor does another identity's genesis pass for this one.
+        let (other, a, _) = {
+            let (a, b) = (SoftKey::from_seed(6), SoftKey::from_seed(7));
+            let roots = vec![a.root(), b.root()];
+            let message = IdentityGenesis::message(&[0x44; 32], &roots).unwrap();
+            (
+                IdentityGenesis {
+                    handle: [0x44; 32],
+                    signatures: vec![a.assert(&message), b.assert(&message)],
+                    roots,
+                },
+                a,
+                b,
+            )
+        };
+        let mut swapped = key_credential(&other, &a, 9);
+        swapped.user = genesis.user();
+        swapped.signature = a.assert(&UserDeviceCredential::message(
+            &genesis.user(),
+            &device(9),
+            1,
+            T,
+            T + MAX_CREDENTIAL_VALIDITY,
+        ));
+        assert!(matches!(
+            check(&store, &swapped, &proof(9), T).await,
+            Err(PresentationError::Genesis(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_removed_key_s_credentials_fail_and_the_backup_s_hold() {
+        let store = test_store("presentation-key-removed").await;
+        let (genesis, a, b) = key_identity();
+        store.accept_genesis(&genesis, T).await.unwrap();
+        let removal = PortableIdentityState::signed_by(
+            genesis.user(),
+            b.root(),
+            1,
+            StateChanges {
+                roots_removed: vec![RemovedRoot {
+                    root: a.root(),
+                    removed_at: T,
+                }],
+                ..StateChanges::default()
+            },
+            T,
+            |m| b.assert(m),
+        )
+        .unwrap();
+        store.accept_identity_state(&removal, T).await.unwrap();
+        assert!(matches!(
+            check(&store, &key_credential(&genesis, &a, 9), &proof(9), T).await,
+            Err(PresentationError::NotARoot)
+        ));
+        check(&store, &key_credential(&genesis, &b, 11), &proof(11), T)
+            .await
+            .unwrap();
+        // A state the removed key signs now changes nothing it could use.
+        let late = PortableIdentityState::signed_by(
+            genesis.user(),
+            a.root(),
+            2,
+            StateChanges::default(),
+            T,
+            |m| a.assert(m),
+        )
+        .unwrap();
+        store.accept_identity_state(&late, T).await.unwrap();
+        assert!(matches!(
+            check(&store, &key_credential(&genesis, &a, 9), &proof(9), T).await,
+            Err(PresentationError::NotARoot)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_carried_state_by_a_stranger_root_is_refused() {
+        let store = test_store("presentation-key-stranger-state").await;
+        let (genesis, a, _) = key_identity();
+        let stranger = SoftKey::from_seed(5);
+        let state = PortableIdentityState::signed_by(
+            genesis.user(),
+            stranger.root(),
+            1,
+            StateChanges::default(),
+            T,
+            |m| stranger.assert(m),
+        )
+        .unwrap();
+        assert!(matches!(
+            check_presentation(
+                &store,
+                &key_credential(&genesis, &a, 9),
+                &[state],
+                &SERVER,
+                &NONCE,
+                &proof(9),
+                T,
+            )
+            .await,
+            Err(PresentationError::StateNotARoot)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_phrase_identity_s_added_key_signs_credentials_once_the_state_is_here() {
+        let store = test_store("presentation-phrase-adds-key").await;
+        let key = SoftKey::from_seed(3);
+        let by_key = UserDeviceCredential::signed_by(
+            user(7),
+            key.root(),
+            device(9),
+            1,
+            T,
+            T + MAX_CREDENTIAL_VALIDITY,
+            |m| key.assert(m),
+        );
+        assert!(matches!(
+            check(&store, &by_key, &proof(9), T).await,
+            Err(PresentationError::NotARoot)
+        ));
+        let adds = PortableIdentityState::signed_by(
+            user(7),
+            RootKey::phrase_of(&user(7)),
+            1,
+            StateChanges {
+                roots_added: vec![spoolframe_protocol::portable::AddedRoot {
+                    root: key.root(),
+                    added_by: RootKey::phrase_of(&user(7)),
+                    added_at: T,
+                    endorsement: root(7)
+                        .sign(&spoolframe_protocol::portable::root_endorse_message(
+                            &user(7),
+                            &key.root(),
+                            T,
+                        ))
+                        .into(),
+                    possession: key.assert(&spoolframe_protocol::portable::root_add_message(
+                        &user(7),
+                        &key.root(),
+                    )),
+                }],
+                ..StateChanges::default()
+            },
+            T,
+            |m| root(7).sign(m).into(),
+        )
+        .unwrap();
+        store.accept_identity_state(&adds, T).await.unwrap();
+        assert_eq!(check(&store, &by_key, &proof(9), T).await.unwrap(), user(7));
+        // The phrase root still signs, as before.
+        check(&store, &credential(11), &proof(11), T).await.unwrap();
     }
 }

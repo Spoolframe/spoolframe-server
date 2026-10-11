@@ -32,6 +32,7 @@ pub mod network;
 pub mod oidc;
 mod operations;
 pub mod own_relay;
+pub mod pairing_relay;
 pub mod passkeys;
 pub mod planner;
 pub mod playback;

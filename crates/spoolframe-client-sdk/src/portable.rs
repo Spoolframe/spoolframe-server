@@ -42,6 +42,14 @@ use crate::error::SdkError;
 use crate::servers::now;
 use crate::storage::{Storage, StorageError, keys};
 
+mod key_roots;
+
+pub use key_roots::{
+    AddedRoot, GenesisError, HANDLE_LEN, IdentityGenesis, IdentityRecord, KeyAssertion,
+    PORTABLE_RP, RENEWAL_DUE, RemovedRoot, RootKey, RootSet, RootSignature, RootSigner,
+    SecurityKey, SecurityKeyError, SoftKey, SoftSecurityKey, StateChanges,
+};
+
 /// Words in a recovery phrase: 24, for 256 bits of entropy.
 pub const PHRASE_WORDS: usize = 24;
 
@@ -197,6 +205,12 @@ pub struct PortableIdentity {
     /// or tied with the root; recovering from the phrase puts it back.
     #[serde(skip)]
     pub has_root: bool,
+    /// Rooted in security keys (P7-08): its genesis is kept here, and its
+    /// root actions take a key ([`RootSigner::Key`]). A phrase identity
+    /// that added a key is not one: its phrase is still a root.
+    // compat(v1): required at the protocol reset
+    #[serde(default)]
+    pub key_rooted: bool,
 }
 
 /// A device the root gave a credential to, as kept on the root's phone:
@@ -545,6 +559,7 @@ impl Portable {
     ) -> Result<(), SdkError> {
         credential.verify(now)?;
         let id = credential.user;
+        self.check_signer(&credential).await?;
         let _saving = self.saving.lock().await;
         let storage = self.storage.as_ref();
         let ours = load_device_key(storage, id).await?;
@@ -558,6 +573,46 @@ impl Portable {
         credentials.insert(id, credential);
         save_credentials(storage, &credentials).await?;
         tracing::info!(%id, "installed a portable device credential");
+        Ok(())
+    }
+
+    /// Whether `credential`'s signer is one of its identity's roots, as
+    /// this device knows them (P7-08): from the genesis it carries or the
+    /// one kept here, and the newest state here. A key identity's
+    /// genesis is kept from it.
+    async fn check_signer(&self, credential: &UserDeviceCredential) -> Result<(), SdkError> {
+        let id = credential.user;
+        let storage = self.storage.as_ref();
+        let carried = credential.genesis.as_deref();
+        if let Some(genesis) = carried {
+            genesis
+                .verify()
+                .map_err(|e| SdkError::InvalidInput(e.to_string()))?;
+            if genesis.user() != id {
+                return Err(SdkError::InvalidInput(
+                    "the credential's genesis is another identity's".into(),
+                ));
+            }
+        }
+        let kept = key_roots::load_genesis(storage, id).await?;
+        let genesis = carried.or(kept.as_ref());
+        let states: Vec<PortableIdentityState> =
+            load_state(storage, id).await?.into_iter().collect();
+        let roots = spoolframe_protocol::portable::root_set(&id, genesis, &states);
+        if !roots.holds(&credential.signer()) {
+            // A credential from elsewhere, not a key in hand: not NotARoot.
+            return Err(CredentialError::BadSignature.into());
+        }
+        if let Some(genesis) = carried
+            && kept.is_none()
+        {
+            storage
+                .set_data(
+                    &keys::portable_genesis(&id.to_string()),
+                    Some(serde_json::to_vec(genesis).expect("a genesis serializes")),
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -623,6 +678,19 @@ impl Portable {
         state.verify()?;
         let id = state.user;
         let storage = self.storage.as_ref();
+        // Signed by one of the identity's roots, ever (P7-08).
+        let genesis = key_roots::load_genesis(storage, id).await?;
+        let mut held: Vec<PortableIdentityState> =
+            load_state(storage, id).await?.into_iter().collect();
+        let before = spoolframe_protocol::portable::root_set(&id, genesis.as_ref(), &held);
+        held.push(state.clone());
+        if !spoolframe_protocol::portable::root_set(&id, genesis.as_ref(), &held)
+            .knew(&state.signer())
+            || before.refuses_additions(&state.roots_added)
+        {
+            // A state from elsewhere, not a key in hand: not NotARoot.
+            return Err(StateError::BadSignature.into());
+        }
         let _saving = self.saving.lock().await;
         let known = load(storage).await?.iter().any(|entry| entry.id == id)
             || load_credentials(storage).await?.contains_key(&id);
@@ -713,7 +781,9 @@ impl Portable {
         match self.load_root(id).await {
             Ok(root) => {
                 return Ok(TieProof::Root {
-                    signature: root.sign(&message),
+                    signature: root.sign(&message).into(),
+                    root: None,
+                    genesis: None,
                 });
             }
             Err(SdkError::UnknownIdentity(_)) => {}
@@ -845,17 +915,6 @@ impl Portable {
         Ok(())
     }
 
-    /// Remove the credential this device acts as `id` with, if any.
-    pub(crate) async fn drop_credential(&self, id: PortableUserId) -> Result<(), SdkError> {
-        let _saving = self.saving.lock().await;
-        let storage = self.storage.as_ref();
-        let mut credentials = load_credentials(storage).await?;
-        if credentials.remove(&id).is_some() {
-            save_credentials(storage, &credentials).await?;
-        }
-        Ok(())
-    }
-
     /// Store `root`'s secret, then list it if it is not listed yet. The
     /// secret goes first, so a listed identity always has its root.
     async fn keep(&self, root: &PortableRoot, name: &str) -> Result<(), SdkError> {
@@ -875,6 +934,7 @@ impl Portable {
                 name: name.to_owned(),
                 created_at: now(),
                 has_root: true,
+                key_rooted: false,
             });
             save(storage, &saved).await?;
         }

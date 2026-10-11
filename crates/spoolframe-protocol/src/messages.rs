@@ -17,6 +17,7 @@ use spoolframe_types::{
 
 use crate::invite_admin::{CreateInvite, InviteCreated, InviteSummary};
 use crate::media::PlaybackHandle;
+use crate::pairing::{PairingAnswer, PairingOffer, RelayCode};
 use crate::passkeys::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyInfo, PasskeyRegistrationBegun,
     PasskeySignInBegun,
@@ -24,7 +25,8 @@ use crate::passkeys::{
 use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Quality, Selection};
 use crate::plex::PlexLink;
 use crate::portable::{
-    PortableIdentityState, PortableUserId, TieProof, UserDeviceCredential, signature_hex,
+    IdentityRecord, PortableIdentityState, PortableUserId, TieProof, UserDeviceCredential,
+    signature_hex,
 };
 use crate::previews::Previews;
 use crate::search::{SearchRequest, SearchResults};
@@ -171,6 +173,55 @@ pub enum Request {
     /// kept. The credential is checked as `FinishPortableSignIn` checks
     /// it: `InvalidCredentials`, counted.
     RedeemPortableInvite(RedeemPortableInvite),
+    /// What this server keeps of portable identity `user` (P7-08): its
+    /// genesis and newest state, `IdentityRecord`, for a device recovering
+    /// the identity with one of its roots. Only an identity known here
+    /// (tied or granted) has one; any other is `NotFound`. Public data,
+    /// served to anyone, on the strangers' budget.
+    IdentityRecord {
+        user: PortableUserId,
+    },
+    /// The record, as `IdentityRecord` answers it, of the identity whose
+    /// genesis handle is `handle` (P7-08): what a security key gives back
+    /// as its credential's user handle, for a fresh install that holds a
+    /// key and nothing else. A key added to a phrase identity carries the
+    /// identity's id as its handle, so a handle that is the id of a phrase
+    /// identity known here answers that identity's record. Only an
+    /// identity known here has one; any other is `NotFound`. Handles are
+    /// 32 random bytes, so a miss says nothing. Public data, served to
+    /// anyone, on the strangers' budget.
+    IdentityRecordByHandle {
+        #[serde(with = "crate::portable::handle_hex")]
+        handle: [u8; crate::portable::HANDLE_LEN],
+    },
+    /// Hold a device's pairing request under its relay code (P7-08), for a
+    /// root terminal with no camera to fetch: `Done`. For
+    /// [`crate::pairing::RELAY_TTL_SECS`]; offering again from the same
+    /// device replaces it. A code another device holds is
+    /// `InvalidInput`. On the strangers' budget.
+    OfferPairing(PairingOffer),
+    /// The pairing request held under `code` (P7-08): `PairingOffered`, or
+    /// `NotFound`. On the strangers' budget, so codes are not guessed.
+    FetchPairing {
+        code: RelayCode,
+    },
+    /// The root terminal's answer to the request under `code` (P7-08):
+    /// `Done`. One answer only, for the key the request named; another,
+    /// or no request, is `NotFound`; a credential for another key
+    /// `InvalidInput`. The server carries it and checks nothing else: the
+    /// device does. On the strangers' budget.
+    AnswerPairing {
+        code: RelayCode,
+        answer: PairingAnswer,
+    },
+    /// The answer to this device's request under `code`, if one came
+    /// (P7-08): `PairingAnswered`, taken (the request ends with it) or
+    /// `None` while there is none yet. Only the device that offered it;
+    /// any other, or no request, is `NotFound`. Not on the strangers'
+    /// budget: the device asks every few seconds.
+    CollectPairing {
+        code: RelayCode,
+    },
 
     // Need a session.
     Libraries,
@@ -600,6 +651,12 @@ impl Request {
                 | Request::BeginPortableSignIn
                 | Request::FinishPortableSignIn(_)
                 | Request::RedeemPortableInvite(_)
+                | Request::IdentityRecord { .. }
+                | Request::IdentityRecordByHandle { .. }
+                | Request::OfferPairing(_)
+                | Request::FetchPairing { .. }
+                | Request::AnswerPairing { .. }
+                | Request::CollectPairing { .. }
         )
     }
 }
@@ -1007,6 +1064,16 @@ pub enum Reply {
     },
     /// A new invite, with its code (`CreateInvite`, PX-44).
     InviteCreated(InviteCreated),
+    /// What the server keeps of a portable identity (`IdentityRecord`,
+    /// P7-08).
+    IdentityRecord(IdentityRecord),
+    /// The pairing request held under a code (`FetchPairing`, P7-08).
+    PairingOffered(PairingOffer),
+    /// The answer to a device's pairing request, or `None` while none
+    /// came yet (`CollectPairing`, P7-08).
+    PairingAnswered {
+        answer: Option<PairingAnswer>,
+    },
     /// The invites that can still be redeemed (`ListInvites`, PX-44).
     Invites {
         invites: Vec<InviteSummary>,

@@ -96,6 +96,17 @@ pub mod keys {
     pub fn portable_revoked(id: &str) -> String {
         format!("portable-revoked/{id}")
     }
+
+    /// Data: the genesis of `id`, JSON (P7-08): an identity begun with a
+    /// security key root. A phrase identity has none.
+    pub fn portable_genesis(id: &str) -> String {
+        format!("portable-genesis/{id}")
+    }
+
+    /// Secret: the device key this device offered a pairing through a
+    /// server with (P7-08), before it knows the identity it will act as:
+    /// taken as that identity's device key when the pairing is accepted.
+    pub const PORTABLE_PENDING_DEVICE: &str = "portable-device-pending";
 }
 
 /// Storage in memory: lost when dropped. For tests, and as the simplest

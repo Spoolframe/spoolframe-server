@@ -255,34 +255,48 @@ impl Rate {
 }
 
 /// The multivariant playlist: the one variant, described for the player,
-/// with `subtitle` (the picked track) as its subtitle rendition.
+/// with `subtitle` (the picked track) as its subtitle rendition. `size`
+/// is the picture the encode writes (`args::written_size`), where known.
 pub fn multivariant_playlist(
     descriptor: &MediaDescriptor,
     video: Option<ConvertedVideo>,
+    size: Option<(u32, u32)>,
     audio: Option<ConvertedAudio>,
     subtitle: Option<&SubtitleStream>,
 ) -> String {
     let mut text = header(subtitle);
-    text.push_str(&stream_inf(descriptor, video, audio, subtitle.is_some()));
+    text.push_str(&stream_inf(
+        descriptor,
+        video,
+        size,
+        audio,
+        subtitle.is_some(),
+    ));
     text.push_str("\nmedia.m3u8\n");
     text
 }
 
+/// A variant of a ladder's playlist: its rung, its video, and the
+/// picture its encode writes, where known.
+pub type LadderVariant = (u32, ConvertedVideo, Option<(u32, u32)>);
+
 /// The multivariant playlist of a ladder (PX-21): one variant per rung,
 /// `rungs` as `(n, video)` in the order the player is to see them (it
 /// starts on the first), each at `v{n}/media.m3u8`, all with the same
-/// audio and subtitle rendition: every rung is on the same grid.
+/// audio and subtitle rendition: every rung is on the same grid. Each
+/// rung's size is the picture its encode writes, where known.
 pub fn ladder_playlist(
     descriptor: &MediaDescriptor,
-    rungs: &[(u32, ConvertedVideo)],
+    rungs: &[LadderVariant],
     audio: Option<ConvertedAudio>,
     subtitle: Option<&SubtitleStream>,
 ) -> String {
     let mut text = header(subtitle);
-    for (n, video) in rungs {
+    for (n, video, size) in rungs {
         text.push_str(&stream_inf(
             descriptor,
             Some(*video),
+            *size,
             audio,
             subtitle.is_some(),
         ));
@@ -317,10 +331,13 @@ fn header(subtitle: Option<&SubtitleStream>) -> String {
     text
 }
 
-/// One variant's `#EXT-X-STREAM-INF` line, without its URI.
+/// One variant's `#EXT-X-STREAM-INF` line, without its URI. `size` is
+/// the picture written; without it, the source's scaled to the plan's
+/// height as `scale=-2` scales it.
 fn stream_inf(
     descriptor: &MediaDescriptor,
     video: Option<ConvertedVideo>,
+    size: Option<(u32, u32)>,
     audio: Option<ConvertedAudio>,
     subtitles: bool,
 ) -> String {
@@ -377,9 +394,11 @@ fn stream_inf(
             }
             None => codecs.push(video_codec_string(codec, depth, height, level, fast)),
         }
-        let width =
-            (u64::from(source.width) * u64::from(height) / u64::from(source.height.max(1))) as u32;
-        resolution = Some((width & !1, height));
+        resolution = Some(size.unwrap_or_else(|| {
+            let width = (u64::from(source.width) * u64::from(height)
+                / u64::from(source.height.max(1))) as u32;
+            (width & !1, height)
+        }));
         // What the output is: a tone-mapped encode is SDR, anything else
         // keeps the source's transfer. No conversion changes the rate.
         let range = match plan {
@@ -802,7 +821,7 @@ mod tests {
                 bitrate: 640_000,
             },
         });
-        let text = multivariant_playlist(&film("smpte2084"), COPY_HEVC, eac3, None);
+        let text = multivariant_playlist(&film("smpte2084"), COPY_HEVC, None, eac3, None);
         assert_eq!(
             variant(&text),
             "#EXT-X-STREAM-INF:BANDWIDTH=90704000,AVERAGE-BANDWIDTH=60640000,\
@@ -851,7 +870,7 @@ mod tests {
     /// was declared at 640 kbit/s, whatever its rate.
     #[test]
     fn copied_flac_declares_its_own_rate_and_a_peak_above_it() {
-        let text = multivariant_playlist(&flac_track(1_000_000), None, COPY_FLAC, None);
+        let text = multivariant_playlist(&flac_track(1_000_000), None, None, COPY_FLAC, None);
         let (peak, average) = bandwidths(&text);
         assert_eq!(average, Some(1_000_000));
         assert!(peak >= 1_500_000, "{text}");
@@ -868,9 +887,9 @@ mod tests {
             tone_map: false,
         };
         let rungs = [
-            (2, rung(720, 3_000_000)),
-            (0, rung(1080, 8_000_000)),
-            (1, rung(1080, 5_000_000)),
+            (2, rung(720, 3_000_000), None),
+            (0, rung(1080, 8_000_000), None),
+            (1, rung(1080, 5_000_000), None),
         ];
         let text = ladder_playlist(&film("bt709"), &rungs, None, None);
         let Ok(m3u8_rs::Playlist::MasterPlaylist(p)) = m3u8_rs::parse_playlist_res(text.as_bytes())
@@ -914,12 +933,12 @@ mod tests {
             tone_map: false,
         };
         let film = film("smpte2084");
-        let text = ladder_playlist(&film, &[(1, encode), (0, copy)], None, None);
+        let text = ladder_playlist(&film, &[(1, encode, None), (0, copy, None)], None, None);
         let Ok(m3u8_rs::Playlist::MasterPlaylist(p)) = m3u8_rs::parse_playlist_res(text.as_bytes())
         else {
             panic!("not a multivariant playlist: {text}");
         };
-        let alone = multivariant_playlist(&film, Some(copy), None, None);
+        let alone = multivariant_playlist(&film, Some(copy), None, None, None);
         let (peak, average) = bandwidths(&alone);
         let top = &p.variants[1];
         assert_eq!(top.uri, "v0/media.m3u8");
@@ -948,25 +967,25 @@ mod tests {
                 bitrate: 200_000,
             },
         });
-        let text = multivariant_playlist(&film("bt709"), video, aac, None);
+        let text = multivariant_playlist(&film("bt709"), video, None, aac, None);
         assert_eq!(bandwidths(&text), (12_000_000 + 220_000, Some(6_200_000)));
     }
 
     #[test]
     fn an_sdr_film_is_declared_sdr() {
         for transfer in ["bt709", "unknown"] {
-            let text = multivariant_playlist(&film(transfer), COPY_HEVC, None, None);
+            let text = multivariant_playlist(&film(transfer), COPY_HEVC, None, None, None);
             assert!(variant(&text).ends_with(",VIDEO-RANGE=SDR"), "{text}");
         }
         let mut untold = film("bt709");
         untold.video.as_mut().unwrap().color_transfer = None;
-        let text = multivariant_playlist(&untold, COPY_HEVC, None, None);
+        let text = multivariant_playlist(&untold, COPY_HEVC, None, None, None);
         assert!(variant(&text).ends_with(",VIDEO-RANGE=SDR"), "{text}");
     }
 
     #[test]
     fn a_copied_hlg_film_is_declared_hlg() {
-        let text = multivariant_playlist(&film("arib-std-b67"), COPY_HEVC, None, None);
+        let text = multivariant_playlist(&film("arib-std-b67"), COPY_HEVC, None, None, None);
         assert!(variant(&text).ends_with(",VIDEO-RANGE=HLG"), "{text}");
     }
 
@@ -981,10 +1000,10 @@ mod tests {
             })
         };
         let pq = film("smpte2084");
-        let mapped = multivariant_playlist(&pq, encode(VideoCodec::H264, true), None, None);
+        let mapped = multivariant_playlist(&pq, encode(VideoCodec::H264, true), None, None, None);
         assert!(variant(&mapped).ends_with(",VIDEO-RANGE=SDR"), "{mapped}");
         // Encoded as it is: still PQ.
-        let kept = multivariant_playlist(&pq, encode(VideoCodec::Hevc, false), None, None);
+        let kept = multivariant_playlist(&pq, encode(VideoCodec::Hevc, false), None, None, None);
         assert!(variant(&kept).ends_with(",VIDEO-RANGE=PQ"), "{kept}");
     }
 
@@ -1010,7 +1029,7 @@ mod tests {
                 dolby_vision,
             })
         };
-        let p81 = multivariant_playlist(&dv(8, 1, "smpte2084"), copy(true), None, None);
+        let p81 = multivariant_playlist(&dv(8, 1, "smpte2084"), copy(true), None, None, None);
         let line = variant(&p81);
         assert!(line.contains("CODECS=\"hvc1.2.4."), "{p81}");
         assert!(
@@ -1018,16 +1037,16 @@ mod tests {
             "{p81}"
         );
         assert!(line.ends_with(",VIDEO-RANGE=PQ"), "{p81}");
-        let p84 = multivariant_playlist(&dv(8, 4, "arib-std-b67"), copy(true), None, None);
+        let p84 = multivariant_playlist(&dv(8, 4, "arib-std-b67"), copy(true), None, None, None);
         assert!(variant(&p84).contains("dvh1.08.06/db4h"), "{p84}");
         assert!(variant(&p84).ends_with(",VIDEO-RANGE=HLG"), "{p84}");
         // Profile 5's transfer as a player reads it says nothing: PQ.
-        let p5 = multivariant_playlist(&dv(5, 0, "unknown"), copy(true), None, None);
+        let p5 = multivariant_playlist(&dv(5, 0, "unknown"), copy(true), None, None, None);
         assert!(variant(&p5).contains("CODECS=\"dvh1.05.06"), "{p5}");
         assert!(!variant(&p5).contains("SUPPLEMENTAL"), "{p5}");
         assert!(variant(&p5).ends_with(",VIDEO-RANGE=PQ"), "{p5}");
         // The base layer alone: HEVC, nothing beside.
-        let base = multivariant_playlist(&dv(8, 1, "smpte2084"), copy(false), None, None);
+        let base = multivariant_playlist(&dv(8, 1, "smpte2084"), copy(false), None, None, None);
         assert!(!variant(&base).contains("dvh1"), "{base}");
     }
 
@@ -1050,7 +1069,7 @@ mod tests {
             (VideoCodec::Av1, false, "av01.0.08M.10", "PQ"),
             (VideoCodec::Av1, true, "av01.0.08M.08", "SDR"),
         ] {
-            let text = multivariant_playlist(&pq, encode(codec, tone_map), None, None);
+            let text = multivariant_playlist(&pq, encode(codec, tone_map), None, None, None);
             assert!(text.contains(&format!("CODECS=\"{name}")), "{text}");
             assert!(
                 variant(&text).ends_with(&format!(",VIDEO-RANGE={range}")),
@@ -1079,7 +1098,7 @@ mod tests {
             let mut film = film("smpte2084");
             let video = film.video.as_mut().unwrap();
             (video.height, video.level) = (height, Some(level));
-            let text = multivariant_playlist(&film, COPY_HEVC, None, None);
+            let text = multivariant_playlist(&film, COPY_HEVC, None, None, None);
             assert!(text.contains(&format!("CODECS=\"{name}\"")), "{text}");
         }
     }
@@ -1148,7 +1167,7 @@ mod tests {
             default: false,
             role: spoolframe_types::SubtitleRole::Full,
         };
-        let text = multivariant_playlist(&descriptor, None, None, Some(&track));
+        let text = multivariant_playlist(&descriptor, None, None, None, Some(&track));
         match m3u8_rs::parse_playlist_res(text.as_bytes()).unwrap() {
             m3u8_rs::Playlist::MasterPlaylist(p) => {
                 let subs = &p.alternatives[0];
@@ -1182,7 +1201,7 @@ mod tests {
             default: false,
             role: spoolframe_types::SubtitleRole::Full,
         };
-        multivariant_playlist(&descriptor, None, None, Some(&track))
+        multivariant_playlist(&descriptor, None, None, None, Some(&track))
     }
 
     /// The lines of `playlist` that are neither tags nor blank: the URIs a

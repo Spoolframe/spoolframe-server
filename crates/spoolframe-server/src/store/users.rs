@@ -196,7 +196,7 @@ impl Store {
         let display_name = display_name.map(str::trim).filter(|d| !d.is_empty());
         let now = self.now();
         let id = LocalUserId::generate();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let inserted = sqlx::query(
             "INSERT INTO users (id, username, display_name, role, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -226,7 +226,7 @@ impl Store {
         phc: &str,
     ) -> Result<LocalUserId, UserError> {
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let id = add_first_user(&mut tx, username, now).await?;
         add_password(&mut tx, id, phc, now).await?;
         tx.commit().await?;
@@ -245,7 +245,7 @@ impl Store {
     ) -> Result<u64, UserError> {
         let name = normalize_username(username)?;
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let id = user_id(&mut tx, &name).await?;
         sqlx::query(
             "INSERT INTO password_credentials (user_id, phc, updated_at) VALUES (?1, ?2, ?3) \
@@ -287,7 +287,7 @@ impl Store {
     ) -> Result<u64, UserError> {
         let name = normalize_username(username)?;
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let id = user_id(&mut tx, &name).await?;
         let (has_password, other_ways): (bool, bool) = sqlx::query_as(
             "SELECT \
@@ -329,7 +329,7 @@ impl Store {
     /// admin stays one.
     pub async fn set_role(&self, username: &str, role: Role) -> Result<(), UserError> {
         let name = normalize_username(username)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let id = user_id(&mut tx, &name).await?;
         if !role.is_admin() {
             keep_an_admin(&mut tx, id, &name).await?;
@@ -364,7 +364,7 @@ impl Store {
 
     /// One user, by id.
     pub async fn user_by_id(&self, id: LocalUserId) -> Result<Option<UserRecord>, UserError> {
-        Ok(self.list_users().await?.into_iter().find(|u| u.id == id))
+        Ok(self.users_where(Some(id)).await?.pop())
     }
 
     /// Whether an enabled admin has a password: the rule every change
@@ -384,7 +384,7 @@ impl Store {
     pub async fn disable_user(&self, username: &str) -> Result<u64, UserError> {
         let name = normalize_username(username)?;
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let id = user_id(&mut tx, &name).await?;
         keep_an_admin(&mut tx, id, &name).await?;
         sqlx::query("UPDATE users SET disabled_at = ?2 WHERE id = ?1 AND disabled_at IS NULL")
@@ -411,7 +411,7 @@ impl Store {
     /// revoked.
     pub async fn enable_user(&self, username: &str) -> Result<(), UserError> {
         let name = normalize_username(username)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let id = user_id(&mut tx, &name).await?;
         sqlx::query("UPDATE users SET disabled_at = NULL WHERE id = ?1")
             .bind(id)
@@ -429,8 +429,16 @@ impl Store {
     }
 
     pub async fn list_users(&self) -> Result<Vec<UserRecord>, UserError> {
-        let rows = sqlx::query(
-            "SELECT u.id, u.username, u.display_name, u.role, u.created_at, u.disabled_at, \
+        self.users_where(None).await
+    }
+
+    /// Every user, or with `one` only that one: the same record either
+    /// way, each column worked out only for the rows asked for.
+    async fn users_where(&self, one: Option<LocalUserId>) -> Result<Vec<UserRecord>, UserError> {
+        macro_rules! select {
+            () => {
+                "SELECT u.id, u.username, u.display_name, u.role, u.created_at, \
+                    u.disabled_at, \
                     p.user_id IS NOT NULL AS has_password, p.updated_at AS password_changed_at, \
                     (SELECT max(s.last_used_at) FROM sessions s WHERE s.user_id = u.id) \
                         AS last_seen_at, \
@@ -445,12 +453,24 @@ impl Store {
                         AS session_count, \
                     t.portable_user_id, t.tied_at, t.proof_kind \
              FROM users u LEFT JOIN password_credentials p ON p.user_id = u.id \
-                  LEFT JOIN portable_ties t ON t.local_user_id = u.id \
-             ORDER BY u.username",
-        )
-        .bind(self.now())
-        .fetch_all(&self.pool)
-        .await?;
+                  LEFT JOIN portable_ties t ON t.local_user_id = u.id "
+            };
+        }
+        let rows = match one {
+            None => {
+                sqlx::query(concat!(select!(), "ORDER BY u.username"))
+                    .bind(self.now())
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            Some(id) => {
+                sqlx::query(concat!(select!(), "WHERE u.id = ?2"))
+                    .bind(self.now())
+                    .bind(id)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
         rows.into_iter()
             .map(|row| {
                 Ok(UserRecord {
@@ -852,6 +872,28 @@ mod tests {
                 ("root".into(), Role::Admin)
             ]
         );
+    }
+
+    /// Review 2026-10-11 M20: one user is read on its own, and is the
+    /// same record the whole list has for it.
+    #[tokio::test]
+    async fn a_user_by_id_is_the_lists_record_of_them() {
+        let store = store("by-id").await;
+        let alice = store
+            .add_user("alice", Some("Alice"), "phc", Role::Consumer)
+            .await
+            .unwrap();
+        let bob = store
+            .add_user("bob", None, "phc", Role::Admin)
+            .await
+            .unwrap();
+        let listed = store.list_users().await.unwrap();
+        for id in [alice, bob] {
+            let one = store.user_by_id(id).await.unwrap();
+            assert_eq!(one.as_ref(), listed.iter().find(|u| u.id == id));
+        }
+        let nobody = LocalUserId::from_uuid(uuid::Uuid::from_u128(99));
+        assert_eq!(store.user_by_id(nobody).await.unwrap(), None);
     }
 
     #[tokio::test]

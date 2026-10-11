@@ -93,17 +93,24 @@ impl RelayAccess {
             return Tier::Owner;
         }
         let store = self.auth.store();
-        let signed_in = store.endpoint_signed_in(endpoint).await;
-        let trusted = self.auth.trusted_profiles(endpoint).await;
-        match (signed_in, trusted) {
-            (Ok(true), _) => return Tier::Owner,
-            (_, Ok(profiles)) if !profiles.is_empty() => return Tier::Owner,
-            (Err(e), _) | (_, Err(e)) => {
+        // A device signed in here is the owner's; one trusted for a user
+        // is too. Asked in turn: most answers end at the first.
+        match store.endpoint_signed_in(endpoint).await {
+            Ok(true) => return Tier::Owner,
+            Ok(false) => {}
+            Err(e) => {
                 // Not known to be the owner's: refused, as a stranger.
                 tracing::warn!(error = %e, endpoint, "cannot tell the relay who an endpoint is");
                 return Tier::Stranger;
             }
-            _ => {}
+        }
+        match self.auth.trusted_profiles(endpoint).await {
+            Ok(profiles) if !profiles.is_empty() => return Tier::Owner,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, endpoint, "cannot tell the relay who an endpoint is");
+                return Tier::Stranger;
+            }
         }
         match store.endpoint_has_portable_session(endpoint).await {
             Ok(true) => return Tier::Friend,

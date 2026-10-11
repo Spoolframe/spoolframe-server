@@ -1118,6 +1118,225 @@ mod sdk {
         invites.server.stop().await;
     }
 
+    /// P7-08, end to end: an identity rooted in two security keys (one in
+    /// hand, one in a drawer) is made on a Linux desktop, which pairs
+    /// itself and joins with a guest invite. The TV, with no camera on
+    /// the desktop to scan it, pairs by a code through the server; the
+    /// desktop answers with the backup key. A fresh install with only the
+    /// backup key fetches the identity from the server and acts for it.
+    #[tokio::test]
+    async fn a_key_identity_joins_pairs_a_tv_by_code_and_recovers_with_its_backup() {
+        use spoolframe_client_sdk::{RootSigner, SecurityKey, SoftSecurityKey};
+
+        let invites = invites("sdk-p7-08").await;
+        let file = invites.server.write_media(1 << 20);
+        let created = invites
+            .create(NewInvite {
+                kind: spoolframe_admin_api::InviteKind::PortableAccount,
+                note: Some("Sam".into()),
+                uses: None,
+                expires: None,
+                role: None,
+            })
+            .await;
+        let server = invites.server.server.id().to_string();
+        let (in_hand, drawer) = (SoftSecurityKey::new(), SoftSecurityKey::new());
+
+        let desktop = new_device().await;
+        let identity = desktop
+            .portable()
+            .create_with_keys(&[&in_hand, &drawer], "Sam")
+            .await
+            .unwrap();
+        desktop
+            .portable()
+            .pair_self(identity, RootSigner::Key(&in_hand))
+            .await
+            .unwrap();
+        let on_desktop = desktop
+            .redeem_invite_portable(&created.link, identity, Some("Sam"))
+            .await
+            .unwrap();
+        assert_eq!(on_desktop.user().user_id, format!("portable:{identity}"));
+
+        // The TV knows the server (a link with no code), and offers.
+        let tv = new_device().await;
+        tv.portable().set_allow_guests(true).await.unwrap();
+        let find = invites.root.invite_link().await.unwrap();
+        tv.save_invite_server(&find).await.unwrap();
+        let offered = tv
+            .offer_relay_pairing(&server, "Living room TV")
+            .await
+            .unwrap();
+        assert!(tv.collect_relay_pairing(&offered).await.unwrap().is_none());
+
+        // The desktop types the code (lower case, as people do), checks
+        // the fingerprint, and answers with the backup key.
+        let request = desktop
+            .fetch_relay_pairing(&server, &offered.code().to_lowercase())
+            .await
+            .unwrap();
+        assert_eq!(request.name(), "Living room TV");
+        assert_eq!(request.fingerprint(), offered.fingerprint());
+        desktop
+            .answer_relay_pairing(&request, identity, RootSigner::Key(&drawer), Some("TV"))
+            .await
+            .unwrap();
+
+        let answer = tv.collect_relay_pairing(&offered).await.unwrap().unwrap();
+        assert_eq!(answer.identity_fingerprint(), identity.fingerprint());
+        let paired = tv.accept_relay_pairing(answer).await.unwrap();
+        assert_eq!(paired.identity, identity);
+        let handed: Vec<_> = paired.servers.iter().map(|s| &s.endpoint_id).collect();
+        assert_eq!(handed, [&server]);
+        let on_tv = tv.sign_in_portable(&server, identity).await.unwrap();
+        assert_eq!(on_tv.user().user_id, format!("portable:{identity}"));
+        let playback = on_tv
+            .start_playback(movie().id(), Some(Selection::default()))
+            .await
+            .unwrap();
+        let bytes = on_tv.read(&playback.handle, 0, 4096).await.unwrap();
+        assert_eq!(bytes, file[..4096]);
+
+        // A fresh install with only the drawer key: the server knows the
+        // identity, so it hands over its record.
+        let fresh = new_device().await;
+        fresh.save_invite_server(&find).await.unwrap();
+        let record = fresh
+            .fetch_identity_record(&server, identity)
+            .await
+            .unwrap();
+        assert!(record.genesis.is_some(), "{record:?}");
+        fresh.portable().import_record(record, "Sam").await.unwrap();
+        fresh
+            .portable()
+            .pair_self(identity, RootSigner::Key(&drawer))
+            .await
+            .unwrap();
+        let on_fresh = fresh.sign_in_portable(&server, identity).await.unwrap();
+        assert_eq!(on_fresh.user().user_id, format!("portable:{identity}"));
+
+        // A stranger's identity is not one the server hands over.
+        let (stranger, _) = new_device().await.portable().create("Eve").await.unwrap();
+        assert!(matches!(
+            fresh.fetch_identity_record(&server, stranger).await,
+            Err(SdkError::NotFound(_))
+        ));
+
+        // Another fresh install knows neither the id nor a record: only the
+        // drawer key, whose credential carries the identity's handle.
+        let bare = new_device().await;
+        bare.save_invite_server(&find).await.unwrap();
+        let recovered = bare
+            .recover_with_key(&server, &drawer, "Sam")
+            .await
+            .unwrap();
+        assert_eq!(recovered, identity);
+        bare.portable()
+            .pair_self(identity, RootSigner::Key(&drawer))
+            .await
+            .unwrap();
+        let on_bare = bare.sign_in_portable(&server, identity).await.unwrap();
+        assert_eq!(on_bare.user().user_id, format!("portable:{identity}"));
+        // A key the server knows no identity of finds nothing.
+        let unknown = SoftSecurityKey::new();
+        unknown
+            .register(spoolframe_client_sdk::PORTABLE_RP, [7; 32], "nobody")
+            .await
+            .unwrap();
+        assert!(matches!(
+            bare.recover_with_key(&server, &unknown, "Nobody").await,
+            Err(SdkError::NotFound(_))
+        ));
+        // Once the drawer key is removed, it recovers nothing: the record
+        // names its identity, but the key is not one of its roots now.
+        desktop
+            .portable()
+            .remove_root(
+                identity,
+                RootSigner::Key(&in_hand),
+                &drawer.credentials()[0].root(),
+            )
+            .await
+            .unwrap();
+        // Signing in carries the state to the server.
+        desktop.sign_in_portable(&server, identity).await.unwrap();
+        let later = new_device().await;
+        later.save_invite_server(&find).await.unwrap();
+        assert!(matches!(
+            later.recover_with_key(&server, &drawer, "Sam").await,
+            Err(SdkError::NotARoot)
+        ));
+        desktop.close().await;
+        tv.close().await;
+        fresh.close().await;
+        bare.close().await;
+        later.close().await;
+        invites.server.stop().await;
+    }
+
+    /// P7-08: a key added to a phrase identity carries the identity's id as
+    /// its handle, so a fresh install with only that key finds the
+    /// identity by handle too, and keeps its id.
+    #[tokio::test]
+    async fn a_phrase_identity_s_added_key_recovers_it_by_handle() {
+        use spoolframe_client_sdk::{RootSigner, SoftSecurityKey};
+
+        let invites = invites("sdk-p7-08-phrase-key").await;
+        let created = invites
+            .create(NewInvite {
+                kind: spoolframe_admin_api::InviteKind::PortableAccount,
+                note: Some("Sam".into()),
+                uses: None,
+                expires: None,
+                role: None,
+            })
+            .await;
+        let server = invites.server.server.id().to_string();
+        let phone = new_device().await;
+        let (identity, _phrase) = phone.portable().create("Sam").await.unwrap();
+        phone
+            .redeem_invite_portable(&created.link, identity, Some("Sam"))
+            .await
+            .unwrap();
+        let key = SoftSecurityKey::new();
+        phone
+            .portable()
+            .add_root(identity, RootSigner::Phrase, &key, "Sam")
+            .await
+            .unwrap();
+        assert_eq!(
+            key.credentials()[0].user_handle(),
+            Some(*identity.as_bytes())
+        );
+        // Signing in again carries the state that adds the key.
+        phone.sign_in_portable(&server, identity).await.unwrap();
+
+        let find = invites.root.invite_link().await.unwrap();
+        let fresh = new_device().await;
+        fresh.save_invite_server(&find).await.unwrap();
+        let record = fresh
+            .fetch_identity_record_by_handle(&server, *identity.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(record.user, identity);
+        assert!(record.genesis.is_none(), "{record:?}");
+        assert_eq!(
+            fresh.recover_with_key(&server, &key, "Sam").await.unwrap(),
+            identity
+        );
+        fresh
+            .portable()
+            .pair_self(identity, RootSigner::Key(&key))
+            .await
+            .unwrap();
+        let on_fresh = fresh.sign_in_portable(&server, identity).await.unwrap();
+        assert_eq!(on_fresh.user().user_id, format!("portable:{identity}"));
+        phone.close().await;
+        fresh.close().await;
+        invites.server.stop().await;
+    }
+
     /// A link without a code only finds and saves the server; the user
     /// signs in with an account they have.
     #[tokio::test]

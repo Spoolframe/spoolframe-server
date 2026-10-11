@@ -6,11 +6,23 @@
 //! once it has lapsed, when no credential it could stop still holds.
 
 use spoolframe_protocol::portable::{
-    DevicePublicKey, PortableIdentityState, PortableUserId, REVOCATION_WINDOW, StateError,
-    revocation_lapsed,
+    DevicePublicKey, GenesisError, HANDLE_LEN, IdentityGenesis, PortableIdentityState,
+    PortableUserId, REVOCATION_WINDOW, RootSet, StateError, revocation_lapsed, root_set,
 };
 
 use super::{Store, StoreError};
+
+/// A genesis handle as kept in `portable_geneses.handle`: 64 lowercase hex
+/// digits, as the genesis JSON writes it (migration 0025 copied them from
+/// there).
+fn handle_hex(handle: &[u8; HANDLE_LEN]) -> String {
+    handle.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The most root-changing states kept for an identity (P7-08). Each
+/// lists every change so far, so the newest few carry it all; more are
+/// kept for rival roots' states.
+const MAX_ROOT_STATES: i64 = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityStateError {
@@ -21,6 +33,12 @@ pub enum IdentityStateError {
     /// this project signs with comes near it.
     #[error("the identity state's revision is out of range")]
     RevisionOutOfRange,
+    /// Signed by a root that was never one of its identity's here (P7-08).
+    #[error("the identity state is signed by a root that is not its identity's")]
+    NotARoot,
+    /// A genesis that is not one, or not of the identity it is kept for.
+    #[error("not the identity's genesis: {0}")]
+    Genesis(GenesisError),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -55,11 +73,30 @@ impl Store {
         now: i64,
     ) -> Result<StateAccepted, IdentityStateError> {
         state.verify()?;
+        // The signer must be one of the identity's roots, ever (P7-08):
+        // the genesis's, or one a root added. A removed root's states
+        // still count, for what they remove.
+        let roots = self
+            .root_set(state.user, None, std::slice::from_ref(state))
+            .await?;
+        if !roots.knew(&state.signer()) {
+            return Err(IdentityStateError::NotARoot);
+        }
+        // A root removed here adds no one new from now on, whatever time
+        // its endorsement claims: a stolen key cannot backdate its way
+        // past a removal this server already has.
+        let before = self.root_set(state.user, None, &[]).await?;
+        if before.refuses_additions(&state.roots_added) {
+            return Err(IdentityStateError::NotARoot);
+        }
+        let changes_roots = state.signer.is_some()
+            || !state.roots_added.is_empty()
+            || !state.roots_removed.is_empty();
         let revision =
             i64::try_from(state.revision).map_err(|_| IdentityStateError::RevisionOutOfRange)?;
         let user = state.user.to_string();
         let json = serde_json::to_string(state).expect("an identity state always serializes");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let mut revocations = 0;
         let mut ended = 0;
         for entry in state.revoked.iter() {
@@ -103,6 +140,36 @@ impl Store {
             .rows_affected();
         }
         Self::prune_revocations(&mut tx, &user, now).await?;
+        if changes_roots {
+            let mut digest = blake3::Hasher::new();
+            digest.update(&state.signed_message());
+            digest.update(
+                serde_json::to_string(&state.signature)
+                    .expect("a signature always serializes")
+                    .as_bytes(),
+            );
+            sqlx::query(
+                "INSERT INTO portable_root_states (user_id, digest, revision, state) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (user_id, digest) DO NOTHING",
+            )
+            .bind(&user)
+            .bind(digest.finalize().to_hex().as_str())
+            .bind(revision)
+            .bind(&json)
+            .execute(&mut *tx)
+            .await?;
+            // Bounded: a root that signs many states keeps its newest. Each
+            // lists every change so far, so the newest carry the older's.
+            sqlx::query(
+                "DELETE FROM portable_root_states WHERE user_id = ?1 AND digest NOT IN \
+                 (SELECT digest FROM portable_root_states WHERE user_id = ?1 \
+                  ORDER BY revision DESC LIMIT ?2)",
+            )
+            .bind(&user)
+            .bind(MAX_ROOT_STATES)
+            .execute(&mut *tx)
+            .await?;
+        }
         let newest = sqlx::query(
             "INSERT INTO portable_identity_states (user_id, revision, state, seen_at) \
              VALUES (?1, ?2, ?3, ?4) \
@@ -178,7 +245,7 @@ impl Store {
         now: i64,
     ) -> Result<bool, StoreError> {
         let user = user.to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         Self::prune_revocations(&mut tx, &user, now).await?;
         let (revoked,): (bool,) = sqlx::query_as(
             "SELECT EXISTS (SELECT 1 FROM portable_revoked_keys \
@@ -190,6 +257,104 @@ impl Store {
         .await?;
         tx.commit().await?;
         Ok(revoked)
+    }
+
+    /// Keep `genesis` for the identity it begins (P7-08), if it is one: the
+    /// first seen stays (another of the same id has the same roots).
+    /// Only for an identity known here, as states are.
+    pub async fn accept_genesis(
+        &self,
+        genesis: &IdentityGenesis,
+        now: i64,
+    ) -> Result<PortableUserId, IdentityStateError> {
+        genesis.verify().map_err(IdentityStateError::Genesis)?;
+        let user = genesis.user();
+        let json = serde_json::to_string(genesis).expect("a genesis always serializes");
+        let added = sqlx::query(
+            "INSERT INTO portable_geneses (user_id, genesis, seen_at, handle) \
+             VALUES (?1, ?2, ?3, ?4) ON CONFLICT (user_id) DO NOTHING",
+        )
+        .bind(user.to_string())
+        .bind(json)
+        .bind(now)
+        .bind(handle_hex(&genesis.handle))
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            > 0;
+        if added {
+            tracing::info!(
+                user = %user,
+                roots = genesis.roots.len(),
+                "took in a portable identity's genesis"
+            );
+        }
+        Ok(user)
+    }
+
+    /// The identity whose genesis kept here has `handle` (P7-08): what a
+    /// security key gives back as its credential's user handle.
+    pub async fn identity_by_handle(
+        &self,
+        handle: &[u8; HANDLE_LEN],
+    ) -> Result<Option<PortableUserId>, StoreError> {
+        let user: Option<String> = sqlx::query_scalar(
+            "SELECT user_id FROM portable_geneses WHERE handle = ?1 ORDER BY seen_at LIMIT 1",
+        )
+        .bind(handle_hex(handle))
+        .fetch_optional(&self.pool)
+        .await?;
+        user.map(|user| {
+            user.parse()
+                .map_err(|e: spoolframe_protocol::portable::InvalidPortableUserId| {
+                    StoreError::Db(sqlx::Error::Decode(e.into()))
+                })
+        })
+        .transpose()
+    }
+
+    /// The genesis of `user` kept here, if any.
+    pub async fn identity_genesis(
+        &self,
+        user: PortableUserId,
+    ) -> Result<Option<IdentityGenesis>, StoreError> {
+        let json: Option<String> =
+            sqlx::query_scalar("SELECT genesis FROM portable_geneses WHERE user_id = ?1")
+                .bind(user.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        json.map(|json| {
+            serde_json::from_str(&json).map_err(|e| StoreError::Db(sqlx::Error::Decode(e.into())))
+        })
+        .transpose()
+    }
+
+    /// The roots of `user` (P7-08): from its genesis (`genesis`, if given
+    /// and of `user`, else the one kept here, else the phrase root its id
+    /// is), and every root-changing state kept here with `states`, each
+    /// already verified. `states` are held in memory only.
+    pub async fn root_set(
+        &self,
+        user: PortableUserId,
+        genesis: Option<&IdentityGenesis>,
+        states: &[PortableIdentityState],
+    ) -> Result<RootSet, StoreError> {
+        let kept = match genesis.filter(|g| g.user() == user) {
+            Some(_) => None,
+            None => self.identity_genesis(user).await?,
+        };
+        let genesis = genesis.filter(|g| g.user() == user).or(kept.as_ref());
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT state FROM portable_root_states WHERE user_id = ?1")
+                .bind(user.to_string())
+                .fetch_all(&self.pool)
+                .await?;
+        let mut all: Vec<PortableIdentityState> = rows
+            .iter()
+            .filter_map(|json| serde_json::from_str(json).ok())
+            .collect();
+        all.extend(states.iter().filter(|s| s.user == user).cloned());
+        Ok(root_set(&user, genesis, &all))
     }
 
     /// Drop `user`'s revocations that have lapsed at `now`.
@@ -433,5 +598,199 @@ pub(crate) mod tests {
             store.accept_identity_state(&huge, T).await,
             Err(IdentityStateError::RevisionOutOfRange)
         ));
+    }
+
+    // P7-08.
+
+    use spoolframe_protocol::portable::soft_key::SoftKey;
+    use spoolframe_protocol::portable::{IdentityGenesis, RootKey, StateChanges};
+
+    fn genesis_of(keys: &[&SoftKey]) -> IdentityGenesis {
+        let handle = [0x33; 32];
+        let roots: Vec<RootKey> = keys.iter().map(|k| k.root()).collect();
+        let message = IdentityGenesis::message(&handle, &roots).unwrap();
+        IdentityGenesis {
+            handle,
+            signatures: keys.iter().map(|k| k.assert(&message)).collect(),
+            roots,
+        }
+    }
+
+    fn key_state(genesis: &IdentityGenesis, by: &SoftKey, revision: u64) -> PortableIdentityState {
+        PortableIdentityState::signed_by(
+            genesis.user(),
+            by.root(),
+            revision,
+            StateChanges {
+                revoked: vec![entry(9)],
+                ..StateChanges::default()
+            },
+            T,
+            |m| by.assert(m),
+        )
+        .unwrap()
+    }
+
+    /// P7-08: a kept genesis is found by its handle, the one a security
+    /// key gives back; and the handle column holds what the genesis JSON
+    /// holds, which migration 0025 copied for rows kept before it.
+    #[tokio::test]
+    async fn a_kept_genesis_is_found_by_its_handle() {
+        let store = test_store("portable-genesis-handle").await;
+        let (a, b) = (SoftKey::from_seed(3), SoftKey::from_seed(4));
+        let genesis = genesis_of(&[&a, &b]);
+        let user = store.accept_genesis(&genesis, T).await.unwrap();
+        assert_eq!(
+            store.identity_by_handle(&genesis.handle).await.unwrap(),
+            Some(user)
+        );
+        assert_eq!(store.identity_by_handle(&[0x44; 32]).await.unwrap(), None);
+        let (copied,): (bool,) = sqlx::query_as(
+            "SELECT lower(json_extract(genesis, '$.handle')) = handle \
+             FROM portable_geneses WHERE user_id = ?1",
+        )
+        .bind(user.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert!(copied);
+    }
+
+    #[tokio::test]
+    async fn a_key_identity_s_state_is_taken_once_its_genesis_is_here() {
+        let store = test_store("portable-key-genesis").await;
+        let (a, b) = (SoftKey::from_seed(3), SoftKey::from_seed(4));
+        let genesis = genesis_of(&[&a, &b]);
+        let user = genesis.user();
+        assert!(matches!(
+            store
+                .accept_identity_state(&key_state(&genesis, &a, 1), T)
+                .await,
+            Err(IdentityStateError::NotARoot)
+        ));
+        assert_eq!(store.accept_genesis(&genesis, T).await.unwrap(), user);
+        assert_eq!(
+            store.identity_genesis(user).await.unwrap(),
+            Some(genesis.clone())
+        );
+        store
+            .accept_identity_state(&key_state(&genesis, &a, 1), T)
+            .await
+            .unwrap();
+        assert!(store.revokes(user, &device(9), T).await.unwrap());
+        // A key the identity never had signs no state of it.
+        let stranger = SoftKey::from_seed(5);
+        assert!(matches!(
+            store
+                .accept_identity_state(&key_state(&genesis, &stranger, 2), T)
+                .await,
+            Err(IdentityStateError::NotARoot)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_genesis_that_does_not_hold_is_not_kept() {
+        let store = test_store("portable-bad-genesis").await;
+        let (a, b) = (SoftKey::from_seed(3), SoftKey::from_seed(4));
+        let mut genesis = genesis_of(&[&a, &b]);
+        genesis.signatures.swap(0, 1);
+        assert!(matches!(
+            store.accept_genesis(&genesis, T).await,
+            Err(IdentityStateError::Genesis(_))
+        ));
+        assert_eq!(store.identity_genesis(genesis.user()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_root_states_kept_are_bounded() {
+        let store = test_store("portable-root-states-bounded").await;
+        let a = SoftKey::from_seed(3);
+        let genesis = genesis_of(&[&a]);
+        store.accept_genesis(&genesis, T).await.unwrap();
+        for revision in 1..=(MAX_ROOT_STATES as u64 + 5) {
+            store
+                .accept_identity_state(&key_state(&genesis, &a, revision), T)
+                .await
+                .unwrap();
+        }
+        let (kept,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM portable_root_states WHERE user_id = ?1")
+                .bind(genesis.user().to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(kept, MAX_ROOT_STATES);
+    }
+
+    #[tokio::test]
+    async fn a_removed_key_s_backdated_addition_is_refused_once_the_removal_is_here() {
+        use spoolframe_protocol::portable::{
+            AddedRoot, RemovedRoot, root_add_message, root_endorse_message,
+        };
+
+        let store = test_store("portable-backdated").await;
+        let (a, b, thief) = (
+            SoftKey::from_seed(3),
+            SoftKey::from_seed(4),
+            SoftKey::from_seed(5),
+        );
+        let genesis = genesis_of(&[&a]);
+        let user = genesis.user();
+        store.accept_genesis(&genesis, T).await.unwrap();
+        let added = |key: &SoftKey, by: &SoftKey, at: i64| AddedRoot {
+            root: key.root(),
+            added_by: by.root(),
+            added_at: at,
+            endorsement: by.assert(&root_endorse_message(&user, &key.root(), at)),
+            possession: key.assert(&root_add_message(&user, &key.root())),
+        };
+        let signed = |by: &SoftKey, revision, add: Vec<AddedRoot>, remove: Vec<RemovedRoot>| {
+            PortableIdentityState::signed_by(
+                user,
+                by.root(),
+                revision,
+                StateChanges {
+                    roots_added: add,
+                    roots_removed: remove,
+                    ..StateChanges::default()
+                },
+                T,
+                |m| by.assert(m),
+            )
+            .unwrap()
+        };
+        let b_added = added(&b, &a, T);
+        store
+            .accept_identity_state(&signed(&a, 1, vec![b_added.clone()], vec![]), T)
+            .await
+            .unwrap();
+        let b_removed = RemovedRoot {
+            root: b.root(),
+            removed_at: T + 10,
+        };
+        store
+            .accept_identity_state(
+                &signed(&a, 2, vec![b_added.clone()], vec![b_removed.clone()]),
+                T,
+            )
+            .await
+            .unwrap();
+        // B, stolen and removed, adds the thief's key, claiming it did so
+        // before its removal.
+        let backdated = signed(
+            &b,
+            3,
+            vec![b_added, added(&thief, &b, T + 5)],
+            vec![b_removed],
+        );
+        assert_eq!(backdated.verify(), Ok(()));
+        assert!(matches!(
+            store.accept_identity_state(&backdated, T).await,
+            Err(IdentityStateError::NotARoot)
+        ));
+        let roots = store.root_set(user, None, &[]).await.unwrap();
+        assert!(roots.holds(&a.root()));
+        assert!(!roots.holds(&b.root()));
+        assert!(!roots.holds(&thief.root()));
     }
 }

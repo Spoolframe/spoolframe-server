@@ -192,6 +192,20 @@ impl Stub {
         }
     }
 
+    /// Push a `PlaybackShare` event (PX-46) to every connection that said
+    /// Hello, as the server does when a playback's share of its uplink
+    /// moves.
+    pub async fn push_share(&self, handle: &str, max_bitrate: Option<u64>) {
+        let streams: Vec<_> = self.state.events.lock().values().cloned().collect();
+        let event = Event::PlaybackShare {
+            handle: spoolframe_protocol::PlaybackHandle(handle.to_owned()),
+            max_bitrate,
+        };
+        for events in streams {
+            let _ = write_frame(&mut *events.lock().await, &event).await;
+        }
+    }
+
     /// Say `url` is the server's web UI from now on.
     pub fn web_url(&self, url: &str) {
         *self.state.web_url.lock() = Some(url.to_owned());

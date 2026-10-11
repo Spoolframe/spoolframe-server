@@ -34,6 +34,18 @@ app runs (Match Dynamic Range, another TV or receiver) works it out at
 each start. Left out, as a revision-14 client before it does, `Hello`'s
 apply, so the revision stays.
 
+P7-08 (security key roots) adds, still at revision 14: optional fields
+`root` and `genesis` on a device credential and on a `root` tie proof,
+`signer`, `roots_added` and `roots_removed` on an identity state, and a
+CTAP2 assertion as a second form of a root's `signature`; and six new
+pre-auth requests, `identity_record` and `identity_record_by_handle`
+(both answered `identity_record`),
+`offer_pairing`, `fetch_pairing` (answered `pairing_offered`),
+`answer_pairing` and `collect_pairing` (answered `pairing_answered`). A
+phrase identity's credential, state and proof read exactly as before;
+a peer that does not know the requests answers `unsupported`. What they
+do is in "Security key roots" under "Portable identities" below.
+
 Every field above that may be left out is a dev-era leniency, marked
 `compat(v1): required at the protocol reset` in the code: at the reset
 to revision 1 (PX-16) each becomes required.
@@ -1592,6 +1604,92 @@ identity: a guest on it, which is what turning guest sign-ins on
 allows. It never gets anyone else's credential, and nothing the
 device holds is sent. Turning the setting off, or forgetting the guest
 (`Portable::forget_guest`), undoes it.
+
+### Security key roots
+
+An identity may have more roots than the phrase root its id is (P7-08):
+a FIDO2 security key's P-256 credential, which signs only CTAP2
+assertions under the relying party `portable.spoolframe.app`. Any one
+root is enough to act. A root on the wire:
+
+```json
+{"type": "phrase", "public_key": "<64 hex>"}
+{"type": "security_key", "public_key": "<130 hex, SEC1 04‖x‖y>", "credential_id": "<hex, 1–128 bytes>"}
+```
+
+A root's `signature` is 128 hex digits (Ed25519, as before) or an
+assertion, `{"authenticator_data": "<hex, ≤512 bytes>", "signature":
+"<hex DER, ≤72 bytes>"}`, over `authenticator_data ‖ SHA-256(message)`,
+the message being the same bytes a phrase root signs. It holds when
+`authenticator_data` starts with SHA-256 of the RP, its flags have UP
+(0x01) and UV (0x04) set (other bits are ignored), and the P-256
+signature verifies. The counter is not looked at.
+
+**Genesis.** `{"handle": "<64 hex>", "roots": [...], "signatures":
+[...]}`: 1 to 8 roots, each signing `"spoolframe identity genesis
+v1\0" ‖ handle ‖ count (u8) ‖ each root's bytes` (a phrase root `01 ‖
+key`, a key `02 ‖ public key ‖ id length (u8) ‖ id`). One phrase root
+alone keeps its public key as the id; any other genesis's id is
+`blake3::derive_key("spoolframe portable user id v1", that message)`.
+The id is fixed at genesis. A credential or `root` tie proof carries
+`genesis` where the server may not have it; a server keeps it once the
+identity is known there.
+
+**Who signed.** A credential's `root`, a state's `signer`, a tie proof's
+`root`: absent, the phrase root the id is. Present, the server checks it
+is one of the identity's roots now.
+
+**Root changes.** A state lists every root added so far, each
+self-certifying: `roots_added: [{"root", "added_by", "added_at",
+"endorsement", "possession"}]`, `endorsement` the adder's signature over
+`"spoolframe root endorse v1\0" ‖ user ‖ root ‖ added_at (i64)` and
+`possession` the added root's over `"spoolframe root add v1\0" ‖ user ‖
+root`; and every one removed, `roots_removed: [{"root", "removed_at"}]`.
+A state with a `signer` or any changes signs `"spoolframe identity state
+v3\0"`, P7-02's fields, the signer, then the added roots sorted (root,
+adder, added_at) and the removed ones sorted (root, removed_at).
+
+A verifier works the roots out from the genesis and every such state it
+holds: a state counts if a root the identity ever had signed it; a root
+counts if a member added it no later than that member's own removal; a
+removed root never comes back. Times are the roots' own word, so a
+server (and the SDK) refuses a state that brings an addition by a root
+it already holds as removed: a stolen key cannot backdate its way past
+a removal that reached the verifier first. Two roots that remove each
+other are both gone: the identity is locked, not taken.
+
+**`identity_record { user }`** answers `{"user", "genesis", "state"}`,
+the genesis and newest state kept for an identity this server knows
+(tied or granted), for a device recovering it with one of its roots.
+Any other is `not_found`. On the strangers' budget.
+
+**`identity_record_by_handle { handle }`** (64 hex digits) answers the
+same record, for the identity whose genesis has `handle`: the user
+handle a security key gives back for its credential, which is all a
+fresh install with only the key knows (the id is a hash of the whole
+genesis). A key added to a phrase identity carries the identity's id as
+its handle, so a handle that is the id of a phrase identity known here
+answers that identity. Only an identity known here answers; any other
+handle is `not_found`. Handles are 32 random bytes, so a miss says
+nothing. On the strangers' budget.
+
+**Pairing through a server.** A device with no one to scan its QR code
+shows a 10-character code (Crockford base32, `ABCDE-FGHJK`) and holds
+its request here for 5 minutes:
+
+1. device: `offer_pairing {code, device_key, name}` → `done`. A code
+   another device holds is `invalid_input`.
+2. root terminal: `fetch_pairing {code}` → `pairing_offered {code,
+   device_key, name}`. At most 5 fetches per request.
+3. root terminal: `answer_pairing {code, answer: {credential, state,
+   servers}}` → `done`: once, and only for the offered key
+   (`invalid_input` otherwise).
+4. device, every few seconds: `collect_pairing {code}` →
+   `pairing_answered {answer}`, `null` until the answer comes, then the
+   answer, once. Only the offering device; not on the strangers' budget.
+
+The server checks nothing else: the device checks the credential is for
+its own key and shows whose identity it is before keeping it.
 
 ### SDK
 

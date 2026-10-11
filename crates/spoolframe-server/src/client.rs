@@ -94,6 +94,8 @@ pub(crate) struct ClientProtocol {
     ties: Arc<crate::ties::TieChallenges>,
     /// Portable sign-ins begun and not yet finished (P7-06).
     portable_sign_ins: Arc<crate::portable::SignInNonces>,
+    /// Pairing requests held for root terminals with no camera (P7-08).
+    pairing_relay: Arc<crate::pairing_relay::PairingRelay>,
 }
 
 /// What one connection has said so far.
@@ -422,6 +424,9 @@ impl ClientProtocol {
         let portable_sign_ins = Arc::new(crate::portable::SignInNonces::new(
             services.auth.store().clock().clone(),
         ));
+        let pairing_relay = Arc::new(crate::pairing_relay::PairingRelay::new(
+            services.auth.store().clock().clone(),
+        ));
         Self {
             id: endpoint.id(),
             connections,
@@ -433,6 +438,7 @@ impl ClientProtocol {
             operations: crate::operations::Pools::default(),
             ties,
             portable_sign_ins,
+            pairing_relay,
         }
     }
 
@@ -939,6 +945,47 @@ impl ClientProtocol {
                     Err(e) => Err(e),
                 }
             }
+            // P7-08: public data, on the strangers' budget.
+            Request::IdentityRecord { user } => match self.stranger_attempt(state) {
+                Ok(()) => self.identity_record(user).await,
+                Err(e) => Err(e),
+            },
+            Request::IdentityRecordByHandle { handle } => match self.stranger_attempt(state) {
+                Ok(()) => self.identity_record_by_handle(&handle).await,
+                Err(e) => Err(e),
+            },
+            // P7-08: pairing through this server, the code guessed only at
+            // the strangers' rate. Collecting is the offering device's
+            // own, every few seconds, and off the budget.
+            Request::OfferPairing(offer) => match self.stranger_attempt(state) {
+                Ok(()) => self
+                    .pairing_relay
+                    .offer(&connection.remote_id().to_string(), offer)
+                    .map(|()| Reply::Done)
+                    .map_err(relay_error),
+                Err(e) => Err(e),
+            },
+            Request::FetchPairing { code } => match self.stranger_attempt(state) {
+                Ok(()) => self
+                    .pairing_relay
+                    .fetch(&code)
+                    .map(Reply::PairingOffered)
+                    .map_err(relay_error),
+                Err(e) => Err(e),
+            },
+            Request::AnswerPairing { code, answer } => match self.stranger_attempt(state) {
+                Ok(()) => self
+                    .pairing_relay
+                    .answer(&code, answer)
+                    .map(|()| Reply::Done)
+                    .map_err(relay_error),
+                Err(e) => Err(e),
+            },
+            Request::CollectPairing { code } => self
+                .pairing_relay
+                .collect(&connection.remote_id().to_string(), &code)
+                .map(|answer| Reply::PairingAnswered { answer })
+                .map_err(relay_error),
             // P6-01: a sign-in a stranger makes, on the same budget.
             Request::RedeemInvite(redeem) => {
                 let hello = state.hello.get().expect("checked above");
@@ -2947,6 +2994,12 @@ impl ClientProtocol {
             | Request::BeginPortableSignIn
             | Request::FinishPortableSignIn(_)
             | Request::RedeemPortableInvite(_)
+            | Request::IdentityRecord { .. }
+            | Request::IdentityRecordByHandle { .. }
+            | Request::OfferPairing(_)
+            | Request::FetchPairing { .. }
+            | Request::AnswerPairing { .. }
+            | Request::CollectPairing { .. }
             | Request::Unknown => {
                 unreachable!("pre-auth and unknown requests are answered before the session check")
             }
@@ -3122,7 +3175,7 @@ impl ClientProtocol {
         // Kept only for someone this server knows: a stranger's states
         // would fill its disk.
         if self.known_here(credential.user).await? {
-            self.keep_states(&sign_in.states).await?;
+            self.keep_states(&credential, &sign_in.states).await?;
         }
         let reply = self.open_portable(connection, &credential, hello).await?;
         auth.guessed_right(guess);
@@ -3177,7 +3230,8 @@ impl ClientProtocol {
             );
         }
         // Known here now: its states are worth keeping.
-        self.keep_states(&redeem.sign_in.states).await?;
+        self.keep_states(&credential, &redeem.sign_in.states)
+            .await?;
         self.open_portable(connection, &credential, hello).await
     }
 
@@ -3226,6 +3280,7 @@ impl ClientProtocol {
         match crate::portable::check_presentation(
             self.store(),
             credential,
+            &sign_in.states,
             self.id.as_bytes(),
             &nonce,
             &sign_in.proof,
@@ -3237,6 +3292,68 @@ impl ClientProtocol {
             Err(crate::portable::PresentationError::Store(e)) => Err(internal(e)),
             Err(e) => Err(refused(&e)),
         }
+    }
+
+    /// What this server keeps of `user` (P7-08): its genesis and newest
+    /// state, for a device recovering it. Only an identity known here has
+    /// one kept; any other is `NotFound`, the same whether or not a stray
+    /// row exists.
+    async fn identity_record(
+        &self,
+        user: spoolframe_protocol::PortableUserId,
+    ) -> Result<Reply, Error> {
+        if !self.known_here(user).await? {
+            return Err(Error::NotFound {
+                what: "portable identity".into(),
+            });
+        }
+        let store = self.store();
+        Ok(Reply::IdentityRecord(
+            spoolframe_protocol::portable::IdentityRecord {
+                user,
+                genesis: store.identity_genesis(user).await.map_err(internal)?,
+                state: store.identity_state(user).await.map_err(internal)?,
+            },
+        ))
+    }
+
+    /// What this server keeps of the identity whose genesis handle is
+    /// `handle` (P7-08), as [`Self::identity_record`]: the handle a
+    /// security key gives back, for a fresh install with nothing else. A
+    /// genesis kept here with that handle names the identity; else, for a
+    /// key added to a phrase identity, the handle is the identity's id
+    /// (a phrase identity keeps no genesis here). Either way only an
+    /// identity known here answers, and a miss is `NotFound`.
+    async fn identity_record_by_handle(
+        &self,
+        handle: &[u8; spoolframe_protocol::portable::HANDLE_LEN],
+    ) -> Result<Reply, Error> {
+        let store = self.store();
+        let user = match store.identity_by_handle(handle).await.map_err(internal)? {
+            Some(user) => user,
+            None => {
+                let user =
+                    spoolframe_protocol::PortableUserId::from_bytes(*handle).map_err(|e| {
+                        Error::InvalidInput {
+                            message: e.to_string(),
+                        }
+                    })?;
+                if store
+                    .identity_genesis(user)
+                    .await
+                    .map_err(internal)?
+                    .is_some()
+                {
+                    // A key identity whose id happens to be this handle:
+                    // not the identity the handle names.
+                    return Err(Error::NotFound {
+                        what: "portable identity".into(),
+                    });
+                }
+                user
+            }
+        };
+        self.identity_record(user).await
     }
 
     /// Whether `user` is someone this server knows: tied to an account
@@ -3251,9 +3368,21 @@ impl ClientProtocol {
     /// revocation one brings ends the sessions of the key it names (§48).
     async fn keep_states(
         &self,
+        credential: &spoolframe_protocol::portable::UserDeviceCredential,
         states: &[spoolframe_protocol::portable::PortableIdentityState],
     ) -> Result<(), Error> {
         let now = self.store().clock().unix_secs();
+        // The genesis first (P7-08): a key identity's states are checked
+        // against its roots.
+        if let Some(genesis) = credential.genesis.as_deref() {
+            match self.store().accept_genesis(genesis, now).await {
+                Ok(_) => {}
+                Err(crate::store::portable::IdentityStateError::Store(e)) => {
+                    return Err(internal(e));
+                }
+                Err(e) => tracing::debug!(error = %e, "a genesis not kept"),
+            }
+        }
         for state in states {
             match self.store().accept_identity_state(state, now).await {
                 Ok(_) => {}
@@ -3445,6 +3574,12 @@ impl ClientProtocol {
                 crate::store::ties::TieError::PortableIdTaken => Error::PortableIdTaken,
                 crate::store::ties::TieError::Store(e) => internal(e),
             })?;
+        // Known here now: a key identity's genesis is kept (P7-08).
+        if let Some(genesis) = proof.genesis()
+            && let Err(e) = self.store().accept_genesis(genesis, now).await
+        {
+            tracing::warn!(error = %e, "a tied identity's genesis not kept");
+        }
         tracing::info!(
             user = %user.username,
             portable = %portable.fingerprint(),
@@ -4293,6 +4428,22 @@ impl Asked {
 }
 
 /// A redemption that made no account, for the client.
+/// A pairing relay's refusal on the wire (P7-08).
+fn relay_error(e: crate::pairing_relay::RelayError) -> Error {
+    use crate::pairing_relay::RelayError;
+    match e {
+        RelayError::NotFound => Error::NotFound {
+            what: "pairing request".into(),
+        },
+        RelayError::Taken | RelayError::WrongAnswer => Error::InvalidInput {
+            message: e.to_string(),
+        },
+        RelayError::Full => Error::RateLimited {
+            retry_after_ms: crate::pairing_relay::RELAY_TTL.as_millis() as u64,
+        },
+    }
+}
+
 fn redeem_error(e: crate::invites::RedeemError) -> Error {
     use crate::invites::RedeemError;
     match e {

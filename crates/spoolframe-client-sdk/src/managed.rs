@@ -163,10 +163,10 @@ pub trait PlaybackBackend: Send + Sync + 'static {
     fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
         None
     }
-    /// The handles of playbacks whose share of the server's uplink changed
-    /// (PX-46): a managed playback in Auto plans itself again on its own.
-    /// A backend with no server keeps the default.
-    fn shares(&self) -> Option<broadcast::Receiver<PlaybackHandle>> {
+    /// Playbacks whose share of the server's uplink changed (PX-46): a
+    /// managed playback in Auto plans itself again on its own. A backend
+    /// with no server keeps the default.
+    fn shares(&self) -> Option<broadcast::Receiver<PlaybackShare>> {
         None
     }
     /// HLS subtitle segment `n` ([`Session::read_subtitle_segment`]).
@@ -287,7 +287,7 @@ impl PlaybackBackend for Session {
     fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
         Some(self.client.link(self.server).meter())
     }
-    fn shares(&self) -> Option<broadcast::Receiver<PlaybackHandle>> {
+    fn shares(&self) -> Option<broadcast::Receiver<PlaybackShare>> {
         Some(self.client.inner.shares.subscribe())
     }
 }
@@ -324,6 +324,8 @@ struct State {
     recent_segments: VecDeque<(u64, Duration)>,
     /// When a slow link last made this ask to be planned again for it.
     limit_asked: Option<std::time::Instant>,
+    /// The share of the server's uplink it was last told (PX-46).
+    share: Option<PlaybackShare>,
 }
 struct Inner {
     backend: Arc<dyn PlaybackBackend>,
@@ -399,6 +401,16 @@ enum Restart {
     /// there, as asked. Its plan may differ; the app builds a new reader
     /// from the result either way.
     Control { at: Duration },
+}
+
+/// A playback's share of its server's uplink changed (PX-46, the
+/// server's `PlaybackShare` event): `max_bitrate` is what it may take now,
+/// bits/s, `None` for no limit. From [`crate::Client::playback_shares`],
+/// and as a managed playback's own [`ManagedPlayback::share`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlaybackShare {
+    pub handle: PlaybackHandle,
+    pub max_bitrate: Option<u64>,
 }
 
 /// A refusal of a start that starting again cannot change: the session
@@ -517,6 +529,7 @@ impl ManagedPlayback {
                 closed: false,
                 recent_segments: VecDeque::new(),
                 limit_asked: None,
+                share: None,
             }),
             control: tokio::sync::Mutex::new(()),
             changed,
@@ -531,19 +544,21 @@ impl ManagedPlayback {
             let weak = Arc::downgrade(&inner);
             inner.runtime.spawn(async move {
                 loop {
-                    let handle = match shares.recv().await {
-                        Ok(handle) => handle,
+                    let share = match shares.recv().await {
+                        Ok(share) => share,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => return,
                     };
                     let Some(inner) = weak.upgrade() else { return };
                     let this = ManagedPlayback(inner);
                     let (mine, position) = {
-                        let state = this.0.state.lock();
+                        let mut state = this.0.state.lock();
+                        let ours = state.playback.handle == share.handle && !state.closed;
+                        if ours {
+                            state.share = Some(share);
+                        }
                         (
-                            state.playback.handle == handle
-                                && !state.closed
-                                && state.options.quality == PlaybackQuality::Auto,
+                            ours && state.options.quality == PlaybackQuality::Auto,
                             state.position.unwrap_or_default(),
                         )
                     };
@@ -581,6 +596,17 @@ impl ManagedPlayback {
     /// resume behind the app's back.
     pub fn changes(&self) -> watch::Receiver<Playback> {
         self.0.changed.subscribe()
+    }
+    /// The share of the server's uplink this playback was last told
+    /// (PX-46): `max_bitrate` is what it may take, bits/s, `None` for no
+    /// limit. `None` before the server said, and after the playback
+    /// started again under another handle, until it says again.
+    pub fn share(&self) -> Option<PlaybackShare> {
+        let state = self.0.state.lock();
+        state
+            .share
+            .clone()
+            .filter(|share| share.handle == state.playback.handle)
     }
     /// Background reporting failures; explicit `flush` and `finish` return errors.
     pub fn errors(&self) -> broadcast::Receiver<SdkError> {
@@ -1443,7 +1469,7 @@ mod tests {
         entered: Notify,
         release: Notify,
         /// The server's share events, once a test sends some (PX-46).
-        shares: Mutex<Option<broadcast::Sender<PlaybackHandle>>>,
+        shares: Mutex<Option<broadcast::Sender<PlaybackShare>>>,
     }
     use std::sync::atomic::Ordering::SeqCst;
     fn item() -> MediaId {
@@ -1550,7 +1576,7 @@ mod tests {
                 epoch: 0,
             })
         }
-        fn shares(&self) -> Option<broadcast::Receiver<PlaybackHandle>> {
+        fn shares(&self) -> Option<broadcast::Receiver<PlaybackShare>> {
             self.shares
                 .lock()
                 .as_ref()
@@ -1571,6 +1597,13 @@ mod tests {
         .await
         .unwrap();
     }
+    fn share(handle: &str, max_bitrate: Option<u64>) -> PlaybackShare {
+        PlaybackShare {
+            handle: PlaybackHandle(handle.into()),
+            max_bitrate,
+        }
+    }
+
     /// PX-46: the server tells this playback its share moved; in Auto it
     /// plans itself again where the viewer is. Another handle's event, or
     /// a quality the viewer chose, changes nothing.
@@ -1581,8 +1614,9 @@ mod tests {
         *b.shares.lock() = Some(shares.clone());
         let p = open(b.clone()).await;
         p.report_position(Duration::from_secs(42)).unwrap();
-        shares.send(PlaybackHandle("someone-else".into())).unwrap();
-        shares.send(PlaybackHandle("1".into())).unwrap();
+        shares.send(share("someone-else", Some(1_000_000))).unwrap();
+        assert_eq!(p.share(), None, "another playback's share");
+        shares.send(share("1", Some(4_500_000))).unwrap();
         until(|| {
             b.events
                 .lock()
@@ -1590,6 +1624,7 @@ mod tests {
                 .any(|e| e.starts_with("quality:1:Auto:42"))
         })
         .await;
+        assert_eq!(p.share(), Some(share("1", Some(4_500_000))));
         assert_eq!(
             b.events
                 .lock()
@@ -1602,8 +1637,10 @@ mod tests {
         p.change_quality(PlaybackQuality::Bitrate(4_000_000), Duration::from_secs(42))
             .await
             .unwrap();
-        shares.send(PlaybackHandle("1".into())).unwrap();
+        shares.send(share("1", Some(3_000_000))).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
+        // Kept all the same, for the app to show.
+        assert_eq!(p.share(), Some(share("1", Some(3_000_000))));
         assert_eq!(
             b.events
                 .lock()

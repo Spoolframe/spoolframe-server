@@ -98,6 +98,8 @@ m3u8-rs = { workspace = true }
 spoolframe-client-sdk = { workspace = true }
 # Signs the portable credentials and states the store tests check (P7-02).
 ed25519-dalek = { workspace = true }
+# A software security key root for the P7-08 tests.
+spoolframe-protocol = { workspace = true, features = ["soft-key"] }
 # Its live checks of the stranger limits, run against a test server (PX-11).
 spoolframe-probe = { workspace = true }
 webauthn-authenticator-rs = { workspace = true }

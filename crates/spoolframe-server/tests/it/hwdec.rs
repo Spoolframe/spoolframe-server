@@ -306,6 +306,7 @@ async fn a_gpu_decode_that_fails_at_once_finishes_in_software() {
                 made: None,
                 card: None,
                 ffmpeg: None,
+                aligned_until: None,
             },
             Written::Progressive { file: out.clone() },
             Load::Gpu,

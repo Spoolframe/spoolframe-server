@@ -233,6 +233,19 @@ impl Store {
         self.clock.unix_secs()
     }
 
+    /// A transaction that writes, begun IMMEDIATE: it takes SQLite's
+    /// writer at once, waiting for it as any write does (busy_timeout).
+    /// A deferred one that reads first holds a WAL snapshot, and if
+    /// another connection commits before it writes, its first write
+    /// fails with SQLITE_BUSY_SNAPSHOT ("database is locked"), which the
+    /// busy handler never retries: an admin's password change racing a
+    /// progress write or a session renewal failed that way.
+    pub(crate) async fn begin_write(
+        &self,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error> {
+        self.pool.begin_with("BEGIN IMMEDIATE").await
+    }
+
     /// Changes each time sessions may have ended: revoked, or their user
     /// disabled. What changed is not said; the connections of every
     /// signed-in device are checked again.
@@ -298,6 +311,69 @@ pub(crate) mod tests {
             applied as usize,
             sqlx::migrate!("./migrations").iter().count()
         );
+    }
+
+    /// A write transaction that reads first, while another connection
+    /// commits a write before it writes: what an admin's password change
+    /// beside a progress report does. `race` begins it.
+    async fn read_then_write_beside_a_commit(
+        store: &Store,
+        race: impl std::future::Future<
+            Output = Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error>,
+        >,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("CREATE TABLE IF NOT EXISTS race (n INTEGER)")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let mut tx = race.await?;
+        let _: i64 = sqlx::query_scalar("SELECT count(*) FROM race")
+            .fetch_one(&mut *tx)
+            .await?;
+        let pool = store.pool.clone();
+        let other = tokio::spawn(async move {
+            sqlx::query("INSERT INTO race (n) VALUES (1)")
+                .execute(&pool)
+                .await
+        });
+        // The other write commits now, unless this one holds the writer.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let written = sqlx::query("INSERT INTO race (n) VALUES (2)")
+            .execute(&mut *tx)
+            .await;
+        let committed = match written {
+            Ok(_) => tx.commit().await,
+            Err(e) => Err(e),
+        };
+        other.await.unwrap().unwrap();
+        committed
+    }
+
+    /// The race itself: a deferred transaction's snapshot goes stale and
+    /// its write is refused, not waited for (SQLITE_BUSY_SNAPSHOT).
+    #[tokio::test]
+    async fn a_deferred_transaction_that_read_first_loses_the_race() {
+        let store = test_store("race-deferred").await;
+        let err = read_then_write_beside_a_commit(&store, store.pool.begin())
+            .await
+            .unwrap_err();
+        let code = err.as_database_error().and_then(|e| e.code());
+        assert_eq!(code.as_deref(), Some("517"), "{err}");
+    }
+
+    /// Review 2026-10-11 H4: one begun IMMEDIATE holds the writer from its
+    /// read, so the other write waits for it and both land.
+    #[tokio::test]
+    async fn a_write_transaction_that_read_first_still_writes() {
+        let store = test_store("race-immediate").await;
+        read_then_write_beside_a_commit(&store, store.begin_write())
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM race")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
     }
 
     #[tokio::test]

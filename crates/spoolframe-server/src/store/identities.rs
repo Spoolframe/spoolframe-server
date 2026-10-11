@@ -51,7 +51,7 @@ impl Store {
         subject: &str,
         display: Option<&str>,
     ) -> Result<IdentityRecord, IdentityError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let owner: Option<LocalUserId> = sqlx::query_scalar(
             "SELECT user_id FROM external_identities WHERE issuer = ?1 AND subject = ?2",
         )
@@ -152,7 +152,7 @@ impl Store {
         user: LocalUserId,
         issuer: &str,
     ) -> Result<(), IdentityError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let (theirs, others): (bool, i64) = sqlx::query_as(
             "SELECT \
                EXISTS (SELECT 1 FROM external_identities WHERE user_id = ?1 AND issuer = ?2), \

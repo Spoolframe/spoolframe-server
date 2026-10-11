@@ -182,7 +182,7 @@ pub(crate) struct Inner {
     pub(crate) refusals: Arc<crate::refusals::Refusals>,
     /// Playbacks whose share of a server's uplink changed (PX-46), as the
     /// servers told: each managed playback in Auto follows its own.
-    pub(crate) shares: tokio::sync::broadcast::Sender<spoolframe_protocol::PlaybackHandle>,
+    pub(crate) shares: tokio::sync::broadcast::Sender<crate::PlaybackShare>,
 }
 
 impl std::fmt::Debug for Client {
@@ -410,6 +410,16 @@ impl Client {
     /// again on every change.
     pub fn watch_servers(&self) -> ServersWatch {
         ServersWatch(self.inner.discovery.watch())
+    }
+
+    /// Every change of a playback's share of its server's uplink, from
+    /// every server this device is connected to (PX-46), as the server
+    /// tells it: the handle and the most it may take now, bits/s. A
+    /// managed playback in Auto plans itself again on its own; this is for
+    /// showing it ([`crate::ManagedPlayback::share`] holds a playback's
+    /// last). Changes before the call are not seen.
+    pub fn playback_shares(&self) -> tokio::sync::broadcast::Receiver<crate::PlaybackShare> {
+        self.inner.shares.subscribe()
     }
 
     /// Where to find server `endpoint_id`, from outside the LAN's records:

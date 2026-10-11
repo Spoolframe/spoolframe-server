@@ -25,6 +25,7 @@
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use openidconnect::core::{
@@ -312,8 +313,10 @@ struct Flow {
     pkce: PkceCodeVerifier,
     nonce: Nonce,
     /// The provider's discovery document as it was at the start: its
-    /// endpoints and keys.
-    metadata: Metadata,
+    /// endpoints and keys. Shared with the cache and every other flow
+    /// begun from it: up to [`MAX_FLOWS`] are held, and a document with
+    /// its keys runs to tens of kilobytes.
+    metadata: Arc<Metadata>,
     began: Instant,
     /// When it began by the wall clock, in Unix seconds, which a
     /// provider's `auth_time` is compared with.
@@ -334,7 +337,7 @@ pub struct Oidc {
     flows: Mutex<HashMap<String, Flow>>,
     lifetime: Duration,
     /// Each issuer's discovery document, and when it was fetched.
-    discovered: Mutex<HashMap<String, (Instant, Metadata)>>,
+    discovered: Mutex<HashMap<String, (Instant, Arc<Metadata>)>>,
 }
 
 impl std::fmt::Debug for Oidc {
@@ -465,7 +468,7 @@ impl Oidc {
     fn client(
         &self,
         provider: &Provider,
-        metadata: Metadata,
+        metadata: &Metadata,
     ) -> Result<(Client, Vec<CoreJwsSigningAlgorithm>), OidcError> {
         let secret = provider.secret.read().ok_or_else(|| {
             // The place says where to put it; the secret is never shown.
@@ -494,18 +497,19 @@ impl Oidc {
             );
             OidcError::NotConfigured(format!("{}: {why}", provider.name))
         };
-        if !takes_s256(&metadata) {
+        if !takes_s256(metadata) {
             return Err(not_configured(
                 "its discovery document offers no S256 PKCE, only plain",
             ));
         }
-        let auth = token_auth(&metadata).ok_or_else(|| {
+        let auth = token_auth(metadata).ok_or_else(|| {
             not_configured(
                 "its token endpoint takes neither client_secret_basic nor client_secret_post",
             )
         })?;
+        // The client takes its own copy; it lives for one request.
         let client = CoreClient::from_provider_metadata(
-            metadata,
+            metadata.clone(),
             ClientId::new(provider.client_id.clone()),
             Some(ClientSecret::new(secret)),
         )
@@ -522,13 +526,13 @@ impl Oidc {
 
     /// The provider's discovery document and keys, fetched within the
     /// last [`DISCOVERY_FRESH`].
-    async fn discover(&self, provider: &Provider) -> Result<Metadata, OidcError> {
+    async fn discover(&self, provider: &Provider) -> Result<Arc<Metadata>, OidcError> {
         if let Some((at, metadata)) = self.discovered.lock().get(&provider.issuer)
             && at.elapsed() < DISCOVERY_FRESH
         {
             return Ok(metadata.clone());
         }
-        let metadata = self.fetch_discovery(provider).await?;
+        let metadata = Arc::new(self.fetch_discovery(provider).await?);
         self.discovered
             .lock()
             .insert(provider.issuer.clone(), (Instant::now(), metadata.clone()));
@@ -581,7 +585,7 @@ impl Oidc {
     ) -> Result<Begun, OidcError> {
         let provider = self.provider(provider)?;
         let metadata = self.discover(&provider).await?;
-        let (client, _) = self.client(&provider, metadata.clone())?;
+        let (client, _) = self.client(&provider, &metadata)?;
         let (challenge, pkce) = PkceCodeChallenge::new_random_sha256();
         let request = client
             .authorize_url(
@@ -683,7 +687,7 @@ impl Oidc {
     async fn exchange(&self, flow: Flow, code: &str) -> Result<Identity, OidcError> {
         let provider = self.provider(&flow.provider)?;
         let name = provider.name.clone();
-        let (client, algs) = self.client(&provider, flow.metadata)?;
+        let (client, algs) = self.client(&provider, &flow.metadata)?;
         let unavailable = |why: String| {
             tracing::warn!(provider = name, why, "sign-in provider unavailable");
             OidcError::Unavailable {
@@ -879,6 +883,34 @@ mod tests {
             format!("{:?}", SecretSource::Value("s3cret".into())),
             "Value(..)"
         );
+    }
+
+    /// Review 2026-10-11 M38: flows begun from one discovery document
+    /// share it with the cache, rather than holding a copy each.
+    #[tokio::test]
+    async fn flows_share_the_cached_discovery_document() {
+        let oidc = Oidc::new(Some("https://media.example.org/"), None);
+        oidc.set_providers(&[OidcConfig {
+            name: "Pocket ID".into(),
+            issuer: "https://id.example.org".into(),
+            client_id: "x".into(),
+            client_secret_file: None,
+            client_secret: Some("s3cret".into()),
+            scopes: None,
+        }]);
+        let cached = Arc::new(document(None, Some(&["S256"])));
+        oidc.discovered.lock().insert(
+            "https://id.example.org".into(),
+            (Instant::now(), cached.clone()),
+        );
+        for _ in 0..2 {
+            oidc.begin("Pocket ID", Purpose::SignIn { return_to: None }, None)
+                .await
+                .unwrap();
+        }
+        let flows = oidc.flows.lock();
+        assert_eq!(flows.len(), 2);
+        assert!(flows.values().all(|f| Arc::ptr_eq(&f.metadata, &cached)));
     }
 
     #[test]

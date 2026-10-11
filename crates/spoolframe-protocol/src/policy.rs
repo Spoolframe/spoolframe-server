@@ -75,6 +75,10 @@ pub fn retry_safe(request: &Request) -> bool {
         // A second challenge only takes the place of the first, which
         // stays bounded per session and user (P7-04).
         | Request::TieBegin
+        // P7-08: public data read, and an offer that replaces itself.
+        | Request::IdentityRecord { .. }
+        | Request::IdentityRecordByHandle { .. }
+        | Request::OfferPairing(_)
         | Request::ListInvites => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
@@ -88,6 +92,11 @@ pub fn retry_safe(request: &Request) -> bool {
         // An invite makes an account or a grant and uses itself up.
         | Request::RedeemInvite(_)
         | Request::RedeemPortableInvite(_)
+        // P7-08: a fetch counts against the code's tries, an answer is
+        // taken once, and a collected answer is gone.
+        | Request::FetchPairing { .. }
+        | Request::AnswerPairing { .. }
+        | Request::CollectPairing { .. }
         // A resume makes a session; trust changes end sessions.
         | Request::ResumeProfile { .. }
         | Request::SetDeviceTrust { .. }

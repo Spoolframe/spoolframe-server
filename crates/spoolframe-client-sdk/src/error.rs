@@ -247,6 +247,26 @@ pub enum SdkError {
     /// (P7-02): it no longer acts as that identity.
     #[error("this device's key for the identity is revoked")]
     DeviceKeyRevoked,
+    /// The security key (or the phrase root) asked to act is not one of
+    /// the identity's roots now (P7-08): never added, or removed. For a
+    /// root action with a key, a key that holds none of the identity's
+    /// credentials is this, not [`SecurityKeyError::NoCredential`]; so is
+    /// [`Client::recover_with_key`]'s key that is not among the roots of
+    /// the identity its credential names, and [`Portable::remove_root`]'s
+    /// root that is not one now. A record, state or credential that came
+    /// from elsewhere and is not signed by one of its identity's roots is
+    /// [`Self::IdentityState`] or [`Self::Credential`] (`BadSignature`),
+    /// never this: an app may say "this key isn't one of theirs".
+    ///
+    /// [`SecurityKeyError::NoCredential`]: crate::portable::SecurityKeyError::NoCredential
+    /// [`Client::recover_with_key`]: crate::Client::recover_with_key
+    /// [`Portable::remove_root`]: crate::Portable::remove_root
+    #[error("that key is not one of the identity's roots")]
+    NotARoot,
+    /// A security key did not do what was asked (P7-08); which way, so
+    /// the app says the right thing.
+    #[error(transparent)]
+    SecurityKey(#[from] crate::portable::SecurityKeyError),
     /// The tie's challenge is used or over (P7-04): tie again from the
     /// start ([`crate::Session::tie`]).
     #[error("the tie took too long; try again")]

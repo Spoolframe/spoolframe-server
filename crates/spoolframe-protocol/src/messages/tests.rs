@@ -337,6 +337,19 @@ fn every_request_round_trips() {
             bitmap: BitmapSubtitles::BurnIn,
             display: None,
         },
+        Request::IdentityRecord { user: p7_08_user() },
+        Request::IdentityRecordByHandle { handle: [0x5a; 32] },
+        Request::OfferPairing(p7_08_offer()),
+        Request::FetchPairing {
+            code: p7_08_offer().code,
+        },
+        Request::AnswerPairing {
+            code: p7_08_offer().code,
+            answer: p7_08_answer(),
+        },
+        Request::CollectPairing {
+            code: p7_08_offer().code,
+        },
     ] {
         round_trip(RequestEnvelope {
             session: Some(SessionId("s".into())),
@@ -582,6 +595,16 @@ fn every_reply_round_trips() {
                 current: true,
             }],
         },
+        Reply::IdentityRecord(crate::portable::IdentityRecord {
+            user: p7_08_user(),
+            genesis: None,
+            state: None,
+        }),
+        Reply::PairingOffered(p7_08_offer()),
+        Reply::PairingAnswered {
+            answer: Some(p7_08_answer()),
+        },
+        Reply::PairingAnswered { answer: None },
     ] {
         round_trip(Response::Ok(reply));
     }
@@ -1266,6 +1289,17 @@ fn only_hello_auth_methods_logins_and_ping_are_pre_auth() {
             device: None,
             trusted: true,
             auto_login: false,
+        }
+        .is_pre_auth()
+    );
+    // Pairing through a server, and an identity's record (P7-08): devices
+    // with no session do both.
+    assert!(Request::IdentityRecord { user: p7_08_user() }.is_pre_auth());
+    assert!(Request::IdentityRecordByHandle { handle: [0x5a; 32] }.is_pre_auth());
+    assert!(Request::OfferPairing(p7_08_offer()).is_pre_auth());
+    assert!(
+        Request::CollectPairing {
+            code: p7_08_offer().code
         }
         .is_pre_auth()
     );
@@ -2030,7 +2064,9 @@ fn tie_proofs() -> Vec<crate::TieProof> {
     );
     vec![
         crate::TieProof::Root {
-            signature: tie_root().sign(&message),
+            signature: tie_root().sign(&message).into(),
+            root: None,
+            genesis: None,
         },
         crate::TieProof::Device {
             credential,
@@ -2108,4 +2144,75 @@ fn a_tie_is_never_sent_twice_but_a_challenge_may_be() {
             proof
         }));
     }
+}
+
+fn p7_08_user() -> crate::PortableUserId {
+    crate::PortableUserId::from_bytes([0x33; 32]).unwrap()
+}
+
+fn p7_08_offer() -> crate::pairing::PairingOffer {
+    use ed25519_dalek::SigningKey;
+    crate::pairing::PairingOffer {
+        code: crate::pairing::RelayCode::parse("ABCDE-FGHJK").unwrap(),
+        device_key: crate::DevicePublicKey::from_bytes(
+            SigningKey::from_bytes(&[9; 32]).verifying_key().to_bytes(),
+        )
+        .unwrap(),
+        name: "Living room".into(),
+    }
+}
+
+fn p7_08_answer() -> crate::pairing::PairingAnswer {
+    use ed25519_dalek::{Signer, SigningKey};
+    let root = SigningKey::from_bytes(&[7; 32]);
+    let user = crate::PortableUserId::from_bytes(root.verifying_key().to_bytes()).unwrap();
+    crate::pairing::PairingAnswer {
+        credential: Box::new(crate::UserDeviceCredential::new(
+            user,
+            p7_08_offer().device_key,
+            1,
+            1,
+            2,
+            |m| root.sign(m),
+        )),
+        state: None,
+        servers: vec![],
+    }
+}
+
+#[test]
+fn a_relay_code_reads_as_a_person_types_it() {
+    use crate::pairing::RelayCode;
+    let code = RelayCode::parse("abcde fghjk").unwrap();
+    assert_eq!(code.as_str(), "ABCDEFGHJK");
+    assert_eq!(code.display(), "ABCDE-FGHJK");
+    // I and L read as 1, O as 0.
+    assert_eq!(
+        RelayCode::parse("IL0O1-23456").unwrap().as_str(),
+        "11001".to_owned() + "23456"
+    );
+    assert!(RelayCode::parse("ABCDE").is_none());
+    assert!(RelayCode::parse("ABCDE-FGHJU").is_none());
+    assert!(serde_json::from_str::<RelayCode>("\"UUUUUUUUUU\"").is_err());
+    let random = RelayCode::from_random([255; 10]);
+    assert_eq!(RelayCode::parse(random.as_str()), Some(random));
+}
+
+/// P7-08: a lookup by genesis handle is its 64 hex digits on the wire,
+/// as the genesis writes its handle.
+#[test]
+fn an_identity_record_by_handle_is_its_hex() {
+    let request = Request::IdentityRecordByHandle { handle: [0xab; 32] };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"type": "identity_record_by_handle", "handle": "ab".repeat(32)})
+    );
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+    assert!(
+        serde_json::from_value::<Request>(
+            serde_json::json!({"type": "identity_record_by_handle", "handle": "ab"})
+        )
+        .is_err()
+    );
 }

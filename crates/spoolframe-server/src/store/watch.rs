@@ -54,7 +54,7 @@ impl Store {
         updated_at: i64,
     ) -> Result<(), StoreError> {
         let principal = principal.to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO watch_state \
                (principal, media_id, show_id, position_ms, duration_ms, watched, updated_at) \
@@ -107,7 +107,7 @@ impl Store {
         external_ids: &[String],
     ) -> Result<(), StoreError> {
         let principal = principal.to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO continue_hidden (principal, media_id, hidden_at) VALUES (?1, ?2, ?3) \
              ON CONFLICT (principal, media_id) DO UPDATE SET hidden_at = excluded.hidden_at",
@@ -139,7 +139,7 @@ impl Store {
         principal: Principal,
         media_id: &str,
     ) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         clear_hidden(&mut tx, &principal.to_string(), media_id).await?;
         tx.commit().await?;
         Ok(())
@@ -167,7 +167,7 @@ impl Store {
         if !hidden {
             return Ok(());
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         clear_hidden(&mut tx, &principal.to_string(), media_id).await?;
         tx.commit().await?;
         Ok(())

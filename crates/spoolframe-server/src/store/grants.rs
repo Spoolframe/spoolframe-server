@@ -103,27 +103,45 @@ impl Store {
 
     /// `portable`'s live grant, if they have one here.
     pub async fn grant_of(&self, portable: PortableUserId) -> Result<Option<Grant>, StoreError> {
-        Ok(self
-            .grants()
-            .await?
-            .into_iter()
-            .find(|g| g.portable == portable))
+        Ok(self.grants_where(Some(portable)).await?.pop())
     }
 
     /// Every live grant, oldest first; revoked ones are left out.
     pub async fn grants(&self) -> Result<Vec<Grant>, StoreError> {
+        self.grants_where(None).await
+    }
+
+    /// Every live grant, or with `one` only that portable user's: the same
+    /// record either way, its sessions counted only for the rows asked for.
+    async fn grants_where(&self, one: Option<PortableUserId>) -> Result<Vec<Grant>, StoreError> {
+        macro_rules! select {
+            () => {
+                "SELECT g.portable_user_id, g.display_name, g.granted_at, g.invite_id, \
+                        (SELECT count(*) FROM portable_sessions s \
+                         WHERE s.portable_user_id = g.portable_user_id \
+                           AND s.revoked_at IS NULL AND s.expires_at > ?1) \
+                 FROM portable_grants g WHERE g.revoked_at IS NULL "
+            };
+        }
         type Row = (String, Option<String>, i64, Option<String>, i64);
-        let rows: Vec<Row> = sqlx::query_as(
-            "SELECT g.portable_user_id, g.display_name, g.granted_at, g.invite_id, \
-                    (SELECT count(*) FROM portable_sessions s \
-                     WHERE s.portable_user_id = g.portable_user_id \
-                       AND s.revoked_at IS NULL AND s.expires_at > ?1) \
-             FROM portable_grants g WHERE g.revoked_at IS NULL \
-             ORDER BY g.granted_at, g.portable_user_id",
-        )
-        .bind(self.now())
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<Row> = match one {
+            None => {
+                sqlx::query_as(concat!(
+                    select!(),
+                    "ORDER BY g.granted_at, g.portable_user_id"
+                ))
+                .bind(self.now())
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Some(portable) => {
+                sqlx::query_as(concat!(select!(), "AND g.portable_user_id = ?2"))
+                    .bind(self.now())
+                    .bind(portable.to_string())
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
         rows.into_iter()
             .map(|(id, display_name, granted_at, invite_id, live)| {
                 Ok(Grant {
@@ -142,7 +160,7 @@ impl Store {
     /// (`revoked_at`): an invite made before it cannot bring them back
     /// ([`Store::redeem_portable_invite`]), only a newer one.
     pub async fn revoke_grant(&self, portable: PortableUserId) -> Result<bool, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query("DELETE FROM portable_sessions WHERE portable_user_id = ?1")
             .bind(portable.to_string())
             .execute(&mut *tx)

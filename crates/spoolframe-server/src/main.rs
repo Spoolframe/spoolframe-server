@@ -878,6 +878,7 @@ async fn run(
     let store = Store::open(state_dir).await?;
     // Closed last, as the server stops.
     let database = store.clone();
+    store.spawn_session_purge();
     // Previews made ahead (P3-13) start with what is being watched.
     previews::ahead::spawn(&previews, catalog.clone(), store.clone());
     let auth = Auth::new(store).with_trust_idle(config.auth.trust_idle()?);

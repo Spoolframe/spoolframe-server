@@ -86,6 +86,13 @@ impl SessionRecord {
 /// often, so busy clients do not turn every request into a write.
 pub const RENEW_EVERY_SECS: i64 = 60;
 
+/// How long a dead session (revoked or expired) is kept before it is
+/// purged: a month, so recent sign-outs are still there to look into.
+pub const DEAD_SESSION_KEEP_SECS: i64 = 30 * 86_400;
+
+/// How often dead sessions are purged.
+const PURGE_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 impl Store {
     /// Record a session for `user`, expiring at `expires_at`.
     pub async fn create_session(
@@ -96,7 +103,7 @@ impl Store {
         expires_at: i64,
     ) -> Result<(), StoreError> {
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         Self::insert_session(&mut tx, token_hash, user, binding, expires_at, now, now).await?;
         tx.commit().await?;
         Ok(())
@@ -118,7 +125,7 @@ impl Store {
         credential: &super::grants::CredentialBinding,
     ) -> Result<(), StoreError> {
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         Self::insert_session(
             &mut tx,
             token_hash,
@@ -299,7 +306,7 @@ impl Store {
         now: i64,
         lifetime_secs: i64,
     ) -> Result<bool, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let renewed = sqlx::query(
             "UPDATE sessions SET last_used_at = ?2, \
                expires_at = min(?3, coalesce(portable_expires_at, ?3)) \
@@ -528,7 +535,7 @@ impl Store {
         user: LocalUserId,
         keep: &str,
     ) -> Result<u64, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let revoked = sqlx::query(
             "UPDATE sessions SET revoked_at = ?3 \
              WHERE user_id = ?1 AND token_hash != ?2 AND revoked_at IS NULL",
@@ -558,7 +565,7 @@ impl Store {
     /// as a resume. Revoking an unknown or already revoked one is not an
     /// error.
     pub async fn revoke_session(&self, token_hash: &str) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "DELETE FROM trusted_endpoints WHERE (user_id, endpoint_id) IN \
                (SELECT user_id, endpoint_id FROM sessions \
@@ -603,6 +610,61 @@ impl Store {
         .await?;
         self.note_sessions_ended();
         Ok(())
+    }
+
+    /// Remove sessions dead (revoked or expired) since before `keep_secs`
+    /// ago, as a portable user's. Of a local user's, the newest row for
+    /// each device (and the newest API one) is kept however old: those
+    /// rows are also the record of which devices the user signed in from
+    /// and when they were last seen (`user_devices`, `device_count`,
+    /// `last_seen_at`, a PIN's "is this their device"). How many went.
+    pub async fn purge_dead_sessions(&self, keep_secs: i64) -> Result<u64, StoreError> {
+        let before = self.now() - keep_secs;
+        let mut tx = self.begin_write().await?;
+        let local = sqlx::query(
+            "DELETE FROM sessions \
+             WHERE min(coalesce(revoked_at, expires_at), expires_at) <= ?1 \
+               AND token_hash NOT IN ( \
+                 SELECT token_hash FROM ( \
+                   SELECT token_hash, row_number() OVER ( \
+                     PARTITION BY user_id, kind, endpoint_id \
+                     ORDER BY coalesce(last_used_at, created_at) DESC, created_at DESC \
+                   ) AS newest FROM sessions) \
+                 WHERE newest = 1)",
+        )
+        .bind(before)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let portable = sqlx::query(
+            "DELETE FROM portable_sessions \
+             WHERE min(coalesce(revoked_at, expires_at), expires_at) <= ?1",
+        )
+        .bind(before)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(local + portable)
+    }
+
+    /// Purge dead sessions every [`PURGE_EVERY`], keeping
+    /// [`DEAD_SESSION_KEEP_SECS`] of them, until the store is closed.
+    pub fn spawn_session_purge(&self) {
+        let store = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PURGE_EVERY).await;
+                if store.pool.is_closed() {
+                    return;
+                }
+                match store.purge_dead_sessions(DEAD_SESSION_KEEP_SECS).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(removed = n, "purged dead sessions"),
+                    Err(e) => tracing::warn!(error = %e, "cannot purge dead sessions"),
+                }
+            }
+        });
     }
 
     /// Whether `endpoint_id` is a device with a live session (PX-10): one
@@ -706,6 +768,120 @@ mod tests {
             endpoint_id: id.into(),
             device_name: Some(format!("device {id}")),
             platform: Platform::Tvos,
+        }
+    }
+
+    /// Review 2026-10-11 M18: dead sessions past the keep go, but each
+    /// device's newest row stays, so the user's devices, their count and
+    /// when the user was last seen read as before; a live one is never
+    /// touched.
+    #[tokio::test]
+    async fn dead_sessions_are_purged_but_each_devices_newest_stays() {
+        let (store, alice) = store_with_alice("purge").await;
+        for (hash, binding) in [
+            ("tv-1", endpoint("tv")),
+            ("tv-2", endpoint("tv")),
+            ("tv-3", endpoint("tv")),
+            ("web-1", SessionBinding::Api),
+            ("web-2", SessionBinding::Api),
+            ("phone", endpoint("phone")),
+        ] {
+            store
+                .create_session(hash, alice, &binding, now() + 3600)
+                .await
+                .unwrap();
+        }
+        for hash in ["tv-1", "tv-2", "tv-3", "web-1", "web-2"] {
+            store.revoke_session(hash).await.unwrap();
+        }
+        // Long dead: revoked and last used years ago, the newest of each
+        // device's last.
+        for (hash, age) in [
+            ("tv-1", 300),
+            ("tv-2", 200),
+            ("tv-3", 100),
+            ("web-1", 300),
+            ("web-2", 100),
+        ] {
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = revoked_at - ?2 * 86400, \
+                        last_used_at = last_used_at - ?2 * 86400, \
+                        created_at = created_at - ?2 * 86400 WHERE token_hash = ?1",
+            )
+            .bind(hash)
+            .bind(age)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        let devices = |store: &Store| {
+            let store = store.clone();
+            async move {
+                let mut d: Vec<String> = store
+                    .user_devices(alice)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|d| d.endpoint_id)
+                    .collect();
+                d.sort();
+                d
+            }
+        };
+        let record = store.user_by_id(alice).await.unwrap().unwrap();
+        let before = devices(&store).await;
+        assert_eq!(
+            store
+                .purge_dead_sessions(DEAD_SESSION_KEEP_SECS)
+                .await
+                .unwrap(),
+            3
+        );
+        let mut left: Vec<String> = sqlx::query_scalar("SELECT token_hash FROM sessions")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        left.sort();
+        assert_eq!(left, ["phone", "tv-3", "web-2"]);
+        assert_eq!(devices(&store).await, before);
+        let after = store.user_by_id(alice).await.unwrap().unwrap();
+        assert_eq!(after.device_count, record.device_count);
+        assert_eq!(after.last_seen_at, record.last_seen_at);
+        assert_eq!(after.session_count, record.session_count);
+        // Purging again removes nothing more.
+        assert_eq!(
+            store
+                .purge_dead_sessions(DEAD_SESSION_KEEP_SECS)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Review 2026-10-11 M18: whether a device is signed in is found by
+    /// its endpoint, not by reading every session.
+    #[tokio::test]
+    async fn signed_in_devices_are_looked_up_by_endpoint() {
+        let store = test_store("by-endpoint").await;
+        for (query, index) in [
+            (
+                "SELECT 1 FROM sessions s WHERE s.kind = 'endpoint' AND s.endpoint_id = 'tv'",
+                "sessions_by_endpoint",
+            ),
+            (
+                "SELECT 1 FROM portable_sessions WHERE endpoint_id = 'tv'",
+                "portable_sessions_by_endpoint",
+            ),
+        ] {
+            let plan: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {query}")))
+                    .fetch_all(&store.pool)
+                    .await
+                    .unwrap();
+            assert!(
+                plan.iter().any(|(_, _, _, detail)| detail.contains(index)),
+                "{query}: {plan:?}"
+            );
         }
     }
 

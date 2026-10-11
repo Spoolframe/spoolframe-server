@@ -85,7 +85,7 @@ impl Store {
         user: LocalUserId,
         fresh: &str,
     ) -> Result<String, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO passkey_users (user_id, handle) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
         )
@@ -185,7 +185,7 @@ impl Store {
         passkey: FirstPasskey<'_>,
     ) -> Result<LocalUserId, UserError> {
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let id = add_first_user(&mut tx, username, now).await?;
         sqlx::query("INSERT INTO passkey_users (user_id, handle) VALUES (?1, ?2)")
             .bind(id)
@@ -237,7 +237,7 @@ impl Store {
         user: LocalUserId,
         credential_id: &str,
     ) -> Result<(), PasskeyError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let (theirs, others, has_password): (bool, i64, bool) = sqlx::query_as(
             "SELECT \
                EXISTS (SELECT 1 FROM passkeys WHERE user_id = ?1 AND credential_id = ?2), \

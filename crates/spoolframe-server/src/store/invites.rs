@@ -367,7 +367,7 @@ impl Store {
         let name = normalize_username(username)?;
         let display = display_name(display)?;
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         // The use is taken first: a write, so a second redemption waits
         // for this one's transaction and then sees what it left.
         let taken = sqlx::query(
@@ -432,7 +432,7 @@ impl Store {
     ) -> Result<PortableRedeemed, StoreError> {
         let now = self.now();
         let id = portable.to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let taken: Option<(String, i64)> = sqlx::query_as(
             "UPDATE invites SET uses_left = uses_left - 1 \
              WHERE capability_hash = ?1 AND kind = 'portable-account' AND revoked_at IS NULL \

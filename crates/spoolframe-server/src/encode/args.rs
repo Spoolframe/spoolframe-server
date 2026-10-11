@@ -820,10 +820,7 @@ pub struct Made {
 
 /// [`Made`] for `spec`: the same decisions [`ffmpeg_args`] makes.
 pub fn made(spec: &EncodeSpec<'_>) -> Made {
-    let stream = spec.descriptor.video.as_ref();
-    let source = stream.map(|v| (v.width, v.height));
     let Some(ConvertedVideo::Encode {
-        height,
         max_bitrate,
         tone_map,
         ..
@@ -835,7 +832,7 @@ pub fn made(spec: &EncodeSpec<'_>) -> Made {
             tone_map: FilterOn::None,
             tone_mapper: None,
             burn_in: FilterOn::None,
-            size: source.filter(|_| matches!(spec.video, Some(ConvertedVideo::Copy { .. }))),
+            size: written_size(spec),
             target_bitrate: None,
         };
     };
@@ -863,10 +860,26 @@ pub fn made(spec: &EncodeSpec<'_>) -> Made {
         },
         tone_mapper,
         burn_in: on(matches!(burned(spec), Ok(Some(_)))),
-        size: stream.map(|v| {
-            whole_av1_size(spec, v, height).unwrap_or_else(|| scaled(v.width, v.height, height))
-        }),
+        size: written_size(spec),
         target_bitrate: max_bitrate,
+    }
+}
+
+/// The picture `spec` writes, width × height: a copy's is the source's;
+/// an encode's is scaled to the plan's height as `scale=-2:h` does, or to
+/// the size AV1 on VA-API can write ([`whole_av1_size`]), as the filter
+/// graph scales it. What [`Made`] reports and the HLS playlist states
+/// (`RESOLUTION`), so neither says a size the encode does not write.
+/// `None` with no video.
+pub fn written_size(spec: &EncodeSpec<'_>) -> Option<(u32, u32)> {
+    let stream = spec.descriptor.video.as_ref()?;
+    match spec.video? {
+        ConvertedVideo::Encode { height, .. } => Some(
+            whole_av1_size(spec, stream, height)
+                .unwrap_or_else(|| scaled(stream.width, stream.height, height)),
+        ),
+        ConvertedVideo::Copy { .. } => Some((stream.width, stream.height)),
+        ConvertedVideo::Unknown => None,
     }
 }
 

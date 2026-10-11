@@ -121,7 +121,7 @@ impl Store {
             return Err(TrustError::AutoLoginUntrusted);
         }
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let theirs: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM sessions WHERE user_id = ?1 AND endpoint_id = ?2 LIMIT 1",
         )
@@ -186,19 +186,35 @@ impl Store {
     }
 
     /// The users `endpoint_id` may resume, by username. Trust unused for
-    /// `idle_secs` has lapsed: it is removed here, and not listed. Only
+    /// `idle_secs` has lapsed: it is not listed, and is removed here. Only
     /// this endpoint's rows, and only enabled users.
     pub async fn trusted_profiles(
         &self,
         endpoint_id: &str,
         idle_secs: i64,
     ) -> Result<Vec<TrustedProfile>, StoreError> {
-        let now = self.now();
-        sqlx::query("DELETE FROM trusted_endpoints WHERE endpoint_id = ?1 AND last_used_at <= ?2")
+        let lapsed_before = self.now() - idle_secs;
+        // Every relay admission asks this, and a lapsed row is rare. A
+        // DELETE, even of no rows, would take SQLite's writer each time:
+        // look first, outside a transaction. A row that lapses between
+        // the two is left out of the list below all the same.
+        let lapsed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM trusted_endpoints \
+                            WHERE endpoint_id = ?1 AND last_used_at <= ?2)",
+        )
+        .bind(endpoint_id)
+        .bind(lapsed_before)
+        .fetch_one(&self.pool)
+        .await?;
+        if lapsed {
+            sqlx::query(
+                "DELETE FROM trusted_endpoints WHERE endpoint_id = ?1 AND last_used_at <= ?2",
+            )
             .bind(endpoint_id)
-            .bind(now - idle_secs)
+            .bind(lapsed_before)
             .execute(&self.pool)
             .await?;
+        }
         type Row = (LocalUserId, String, Option<String>, bool, bool);
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT u.id, u.username, u.display_name, \
@@ -207,10 +223,11 @@ impl Store {
                                 WHERE r.user_id = u.id AND r.endpoint_id = t.endpoint_id), \
                     t.auto_login \
              FROM trusted_endpoints t JOIN users u ON u.id = t.user_id \
-             WHERE t.endpoint_id = ?1 AND u.disabled_at IS NULL \
+             WHERE t.endpoint_id = ?1 AND t.last_used_at > ?2 AND u.disabled_at IS NULL \
              ORDER BY u.username",
         )
         .bind(endpoint_id)
+        .bind(lapsed_before)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -246,7 +263,7 @@ impl Store {
             return Ok(Resumed::Refused);
         };
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let renewed = sqlx::query(
             "UPDATE trusted_endpoints SET last_used_at = ?3 \
              WHERE user_id = ?1 AND endpoint_id = ?2 AND last_used_at > ?4 \
@@ -413,6 +430,28 @@ mod tests {
         assert_eq!(resume(&store, "r", alice, "tv").await, Resumed::Refused);
         assert!(!store.device_trusted(alice, "tv").await.unwrap());
         assert!(listed(&store, "tv").await.is_empty());
+    }
+
+    /// Review 2026-10-11 M19: listing a device's profiles, which every
+    /// relay admission does, does not wait for SQLite's writer when there
+    /// is nothing lapsed to remove.
+    #[tokio::test]
+    async fn listing_profiles_does_not_wait_for_sqlites_writer() {
+        let (store, _alice) = alice_trusted_on_tv("trust-list-read-only").await;
+        let mut writer = store.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.trusted_profiles("tv", IDLE),
+        )
+        .await
+        .expect("listing profiles waited for the writer")
+        .unwrap();
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+        assert_eq!(listed.len(), 1);
     }
 
     #[tokio::test]

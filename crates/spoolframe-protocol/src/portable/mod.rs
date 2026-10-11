@@ -19,26 +19,39 @@ pub use ed25519_dalek::Signature;
 
 use crate::fingerprint;
 
+mod roots;
+pub(crate) use roots::handle_hex;
+#[cfg(any(test, feature = "soft-key"))]
+pub mod soft_key;
+
+pub use roots::{
+    AddedRoot, GENESIS_DOMAIN, GenesisError, HANDLE_LEN, IdentityGenesis, MAX_AUTHENTICATOR_DATA,
+    MAX_CREDENTIAL_ID, MAX_DER_SIGNATURE, MAX_ROOT_CHANGES, MAX_ROOTS, P256_PUBLIC_KEY_LEN,
+    PORTABLE_RP, ROOT_ADD_DOMAIN, ROOT_ENDORSE_DOMAIN, RemovedRoot, RootChanges, RootKey, RootSet,
+    RootSignature, USER_ID_CONTEXT, portable_rp_id_hash, root_add_message, root_endorse_message,
+};
+
 /// Bytes in a [`PortableUserId`]: an Ed25519 public key.
 pub const PORTABLE_USER_ID_LEN: usize = 32;
 
-/// Who a portable user is: their root's Ed25519 public key. Written as 64
-/// lowercase hex digits, as iroh writes an `EndpointId`; serialized the
-/// same way.
+/// Who a portable user is. For an identity begun with one phrase root, its
+/// root's Ed25519 public key (P7-01); for any other, derived from its
+/// genesis ([`IdentityGenesis::user`], P7-08). Written as 64 lowercase hex
+/// digits, as iroh writes an `EndpointId`; serialized the same way.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PortableUserId([u8; PORTABLE_USER_ID_LEN]);
 
-/// Not a portable user id: not 64 hex digits, or not an Ed25519 public key.
+/// Not a portable user id: not 64 hex digits.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("not a portable user id: {0}")]
 pub struct InvalidPortableUserId(&'static str);
 
 impl PortableUserId {
-    /// The id whose public key is `bytes`; an error if they are not a
-    /// point on the curve, which no root could have.
+    /// The id `bytes` are. Any 32 bytes: an id derived from a genesis
+    /// (P7-08) is a hash, not a curve point. A phrase identity's is its
+    /// root's public key, and [`Self::verify`] fails for one that is not
+    /// a point.
     pub fn from_bytes(bytes: [u8; PORTABLE_USER_ID_LEN]) -> Result<Self, InvalidPortableUserId> {
-        VerifyingKey::from_bytes(&bytes)
-            .map_err(|_| InvalidPortableUserId("not an Ed25519 public key"))?;
         Ok(Self(bytes))
     }
 
@@ -52,9 +65,11 @@ impl PortableUserId {
         fingerprint::fingerprint(&self.0)
     }
 
-    /// Whether `signature` is this user's root's over `message`. Strict
-    /// Ed25519 verification: a signature another could forge from a
-    /// valid one, or one under a weak key, does not pass.
+    /// Whether `signature` is this user's phrase root's over `message`,
+    /// the root a phrase identity's id is. Strict Ed25519 verification: a
+    /// signature another could forge from a valid one, or one under a
+    /// weak key, does not pass. An identity with other roots checks them
+    /// with [`RootKey::verify`].
     pub fn verify(&self, message: &[u8], signature: &Signature) -> bool {
         VerifyingKey::from_bytes(&self.0)
             .is_ok_and(|key| key.verify_strict(message, signature).is_ok())
@@ -298,14 +313,28 @@ pub struct UserDeviceCredential {
     /// Required: every credential expires (§45 allowed none; P7-02 does
     /// not).
     pub expires_at: i64,
-    /// The root's, over [`Self::message`].
-    #[serde(with = "signature_hex")]
-    pub signature: Signature,
+    /// The root's, over [`Self::message`]: Ed25519 from a phrase root,
+    /// written as P7-02 wrote it; a CTAP2 assertion from a security key
+    /// (P7-08).
+    pub signature: RootSignature,
+    /// The root that signed it (P7-08); absent, the phrase root the
+    /// user's id is, as every credential before P7-08. Whether it is one
+    /// of the user's roots is the verifier's to check, against the
+    /// identity's [`RootSet`].
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<RootKey>,
+    /// The identity's genesis, carried for a verifier that has not seen
+    /// it: an identity with a security key root cannot be checked
+    /// without it. Not signed: it proves itself, its hash being the id.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis: Option<Box<IdentityGenesis>>,
 }
 
 impl UserDeviceCredential {
-    /// A credential `sign` signs with `user`'s root: the client SDK's
-    /// root, which this crate never holds.
+    /// A credential `sign` signs with `user`'s phrase root: the client
+    /// SDK's root, which this crate never holds.
     pub fn new(
         user: PortableUserId,
         device_key: DevicePublicKey,
@@ -327,8 +356,50 @@ impl UserDeviceCredential {
             serial,
             issued_at,
             expires_at,
-            signature,
+            signature: RootSignature::Ed25519(signature),
+            root: None,
+            genesis: None,
         }
+    }
+
+    /// A credential `root` signs with `sign` (P7-08), any kind of root.
+    /// A phrase identity's own phrase root is left unnamed, as before.
+    #[allow(clippy::too_many_arguments)]
+    pub fn signed_by(
+        user: PortableUserId,
+        root: RootKey,
+        device_key: DevicePublicKey,
+        serial: u64,
+        issued_at: i64,
+        expires_at: i64,
+        sign: impl FnOnce(&[u8]) -> RootSignature,
+    ) -> Self {
+        let signature = sign(&Self::message(
+            &user,
+            &device_key,
+            serial,
+            issued_at,
+            expires_at,
+        ));
+        let root = (root != RootKey::phrase_of(&user)).then_some(root);
+        Self {
+            user,
+            device_key,
+            serial,
+            issued_at,
+            expires_at,
+            signature,
+            root,
+            genesis: None,
+        }
+    }
+
+    /// The root it says signed it: the one it names, or the phrase root
+    /// its user's id is.
+    pub fn signer(&self) -> RootKey {
+        self.root
+            .clone()
+            .unwrap_or_else(|| RootKey::phrase_of(&self.user))
     }
 
     /// What the root signs: [`CREDENTIAL_DOMAIN`], then user (32 bytes),
@@ -352,11 +423,12 @@ impl UserDeviceCredential {
         message
     }
 
-    /// Whether it is good at `now` (Unix seconds): signed by the root of
-    /// the user it names, issued no later than `now` + [`CLOCK_SKEW`],
-    /// not yet expired, and good for no longer than
-    /// [`MAX_CREDENTIAL_VALIDITY`]. Says nothing of revocation, which is
-    /// the newest [`PortableIdentityState`] the verifier holds.
+    /// Whether it is good at `now` (Unix seconds): signed by the root it
+    /// names ([`Self::signer`]), issued no later than `now` +
+    /// [`CLOCK_SKEW`], not yet expired, and good for no longer than
+    /// [`MAX_CREDENTIAL_VALIDITY`]. Says nothing of whether that root is
+    /// one of the user's ([`RootSet`]) nor of revocation, which are the
+    /// verifier's, from the states it holds.
     pub fn verify(&self, now: i64) -> Result<(), CredentialError> {
         let message = Self::message(
             &self.user,
@@ -365,7 +437,7 @@ impl UserDeviceCredential {
             self.issued_at,
             self.expires_at,
         );
-        if !self.user.verify(&message, &self.signature) {
+        if !self.signer().verify(&message, &self.signature) {
             return Err(CredentialError::BadSignature);
         }
         if self
@@ -420,12 +492,20 @@ pub fn verify_device_proof(
 /// Why an identity state is not one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StateError {
-    /// The root of the user it names did not sign it, as it is.
+    /// The root it names (or the phrase root its user's id is) did not
+    /// sign it, as it is.
     #[error("the identity state is not signed by the identity it names")]
     BadSignature,
     /// It lists more than [`MAX_REVOKED`] keys.
     #[error("the identity state revokes more than {MAX_REVOKED} device keys")]
     TooManyRevoked,
+    /// It adds or removes more than [`MAX_ROOT_CHANGES`] roots.
+    #[error("the identity state changes more than {MAX_ROOT_CHANGES} roots")]
+    TooManyRootChanges,
+    /// A root it adds is not a valid key, did not sign its addition, or
+    /// its adder did not endorse it.
+    #[error("a root the identity state adds does not prove it is held, or who added it")]
+    BadPossession,
 }
 
 /// One revoked device key, and when the root revoked it (Unix seconds).
@@ -444,12 +524,38 @@ fn canonical(entries: &[RevokedKey]) -> Vec<RevokedKey> {
     entries
 }
 
-/// A user's root's list of revoked device keys, at a revision (§48).
-/// Revocation only grows: a verifier checks credentials against the union
-/// of every valid state it has seen for the user, and keeps the newest
-/// (by revision) to hand on. A credential is good unless that union
-/// revokes its device key: adding a device needs no new state (the user's
-/// choice, 2026-10-09), so it lists no authorized keys.
+/// `added` as a state signs it: sorted by root, one per root.
+fn canonical_added(added: &[AddedRoot]) -> Vec<AddedRoot> {
+    let mut added = added.to_vec();
+    added.sort_by(|a, b| a.root.cmp(&b.root));
+    added.dedup_by(|a, b| a.root == b.root);
+    added
+}
+
+/// `removed` as a state signs it: sorted by root, one per root, the
+/// earliest `removed_at` where a root repeats.
+fn canonical_removed(removed: &[RemovedRoot]) -> Vec<RemovedRoot> {
+    let mut removed = removed.to_vec();
+    removed.sort_by(|a, b| (&a.root, a.removed_at).cmp(&(&b.root, b.removed_at)));
+    removed.dedup_by(|a, b| a.root == b.root);
+    removed
+}
+
+/// The domain of a state that names its signer or changes roots (P7-08).
+/// One that does neither signs [`STATE_DOMAIN`]'s layout, as before.
+pub const STATE_V3_DOMAIN: &[u8] = b"spoolframe identity state v3\0";
+
+/// A user's root's list of revoked device keys, at a revision (§48), and
+/// (P7-08) the roots it has added and removed. Revocation only grows: a
+/// verifier checks credentials against the union of every valid state it
+/// has seen for the user, and keeps the newest (by revision) to hand on.
+/// A credential is good unless that union revokes its device key: adding
+/// a device needs no new state (the user's choice, 2026-10-09), so it
+/// lists no authorized keys.
+///
+/// Root changes are cumulative too: a state lists every root added and
+/// removed so far, and a verifier works out the roots from all of them
+/// ([`RootSet`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableIdentityState {
     pub user: PortableUserId,
@@ -460,14 +566,35 @@ pub struct PortableIdentityState {
     pub revoked: Vec<RevokedKey>,
     /// Unix seconds. Not used to order states: the revision is.
     pub issued_at: i64,
-    /// The root's, over [`Self::message`].
-    #[serde(with = "signature_hex")]
-    pub signature: Signature,
+    /// The signer's, over [`Self::message`].
+    pub signature: RootSignature,
+    /// The root that signed it (P7-08); absent, the phrase root the
+    /// user's id is.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<RootKey>,
+    /// Every root added so far, each with its proof that it is held.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots_added: Vec<AddedRoot>,
+    /// Every root removed so far.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots_removed: Vec<RemovedRoot>,
+}
+
+/// What a state changes, for [`PortableIdentityState::signed_by`]:
+/// revocations and roots, each cumulative.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StateChanges {
+    pub revoked: Vec<RevokedKey>,
+    pub roots_added: Vec<AddedRoot>,
+    pub roots_removed: Vec<RemovedRoot>,
 }
 
 impl PortableIdentityState {
-    /// A state `sign` signs with `user`'s root. `revoked` is put in
-    /// [`Self::message`]'s order, one entry per key (the earliest);
+    /// A state `sign` signs with `user`'s phrase root. `revoked` is put
+    /// in [`Self::message`]'s order, one entry per key (the earliest);
     /// more than [`MAX_REVOKED`] is refused. Dropping lapsed entries
     /// ([`revocation_lapsed`]) is the caller's.
     pub fn new(
@@ -477,37 +604,105 @@ impl PortableIdentityState {
         issued_at: i64,
         sign: impl FnOnce(&[u8]) -> Signature,
     ) -> Result<Self, StateError> {
-        let revoked = canonical(&revoked);
+        Self::signed_by(
+            user,
+            RootKey::phrase_of(&user),
+            revision,
+            StateChanges {
+                revoked,
+                ..StateChanges::default()
+            },
+            issued_at,
+            |message| RootSignature::Ed25519(sign(message)),
+        )
+    }
+
+    /// A state `signer` signs with `sign` (P7-08): any kind of root, and
+    /// any root changes. Lists are put in [`Self::message`]'s order, one
+    /// entry each; over the limits is refused. A phrase identity's own
+    /// phrase root, changing no roots, signs P7-02's layout.
+    pub fn signed_by(
+        user: PortableUserId,
+        signer: RootKey,
+        revision: u64,
+        changes: StateChanges,
+        issued_at: i64,
+        sign: impl FnOnce(&[u8]) -> RootSignature,
+    ) -> Result<Self, StateError> {
+        let revoked = canonical(&changes.revoked);
+        let roots_added = canonical_added(&changes.roots_added);
+        let roots_removed = canonical_removed(&changes.roots_removed);
         if revoked.len() > MAX_REVOKED {
             return Err(StateError::TooManyRevoked);
         }
-        let signature = sign(&Self::message(&user, revision, &revoked, issued_at));
-        Ok(Self {
+        if roots_added.len() > MAX_ROOT_CHANGES || roots_removed.len() > MAX_ROOT_CHANGES {
+            return Err(StateError::TooManyRootChanges);
+        }
+        let signer = (signer != RootKey::phrase_of(&user)).then_some(signer);
+        let mut state = Self {
             user,
             revision,
             revoked,
             issued_at,
-            signature,
-        })
+            // Replaced below, once the message is laid out.
+            signature: RootSignature::Ed25519(Signature::from_bytes(&[0; 64])),
+            signer,
+            roots_added,
+            roots_removed,
+        };
+        state.signature = sign(&state.signed_message());
+        Ok(state)
     }
 
-    /// What the root signs: [`STATE_DOMAIN`], then user (32 bytes),
-    /// revision (u64), issued_at (i64), the count of entries (u32), then
-    /// the entries sorted ascending by key, one per key, each the key (32
-    /// bytes) and its revoked_at (i64); the integers big-endian.
-    /// `revoked` is taken as a set; a key given twice counts once, with
-    /// its earliest `revoked_at`.
+    /// The root it says signed it: the one it names, or the phrase root
+    /// its user's id is.
+    pub fn signer(&self) -> RootKey {
+        self.signer
+            .clone()
+            .unwrap_or_else(|| RootKey::phrase_of(&self.user))
+    }
+
+    /// Its root changes, as [`RootSet`] reads them.
+    pub fn root_changes(&self) -> (RootKey, &[AddedRoot], &[RemovedRoot]) {
+        (self.signer(), &self.roots_added, &self.roots_removed)
+    }
+
+    /// What the root signs, P7-02's layout: [`STATE_DOMAIN`], then user
+    /// (32 bytes), revision (u64), issued_at (i64), the count of entries
+    /// (u32), then the entries sorted ascending by key, one per key, each
+    /// the key (32 bytes) and its revoked_at (i64); the integers
+    /// big-endian. `revoked` is taken as a set; a key given twice counts
+    /// once, with its earliest `revoked_at`.
     pub fn message(
         user: &PortableUserId,
         revision: u64,
         revoked: &[RevokedKey],
         issued_at: i64,
     ) -> Vec<u8> {
+        let mut message = Vec::new();
+        Self::lay_out(
+            &mut message,
+            STATE_DOMAIN,
+            user,
+            revision,
+            revoked,
+            issued_at,
+        );
+        message
+    }
+
+    fn lay_out(
+        message: &mut Vec<u8>,
+        domain: &[u8],
+        user: &PortableUserId,
+        revision: u64,
+        revoked: &[RevokedKey],
+        issued_at: i64,
+    ) {
         let entries = canonical(revoked);
         let count = u32::try_from(entries.len()).expect("fewer than 2^32 keys in memory");
-        let mut message =
-            Vec::with_capacity(STATE_DOMAIN.len() + 32 + 8 + 8 + 4 + 40 * entries.len());
-        message.extend_from_slice(STATE_DOMAIN);
+        message.reserve(domain.len() + 32 + 8 + 8 + 4 + 40 * entries.len());
+        message.extend_from_slice(domain);
         message.extend_from_slice(user.as_bytes());
         message.extend_from_slice(&revision.to_be_bytes());
         message.extend_from_slice(&issued_at.to_be_bytes());
@@ -516,18 +711,70 @@ impl PortableIdentityState {
             message.extend_from_slice(entry.key.as_bytes());
             message.extend_from_slice(&entry.revoked_at.to_be_bytes());
         }
+    }
+
+    /// What its signer signed. P7-02's [`Self::message`] for a state of
+    /// the phrase root its user's id is that changes no roots; else
+    /// (P7-08) [`STATE_V3_DOMAIN`], the same fields, then the signer
+    /// ([`RootKey::bytes`]), the count of roots added (u8) and each sorted
+    /// ascending by root, as the root, its adder and its added_at (i64),
+    /// and the count of roots removed (u8) and each root sorted ascending
+    /// with its removed_at (i64). The additions' signatures are not in
+    /// it: each is checked against its own message.
+    pub fn signed_message(&self) -> Vec<u8> {
+        if self.signer.is_none() && self.roots_added.is_empty() && self.roots_removed.is_empty() {
+            return Self::message(&self.user, self.revision, &self.revoked, self.issued_at);
+        }
+        let mut message = Vec::new();
+        Self::lay_out(
+            &mut message,
+            STATE_V3_DOMAIN,
+            &self.user,
+            self.revision,
+            &self.revoked,
+            self.issued_at,
+        );
+        message.extend_from_slice(&self.signer().bytes());
+        let added = canonical_added(&self.roots_added);
+        message.push(u8::try_from(added.len()).unwrap_or(u8::MAX));
+        for root in &added {
+            message.extend_from_slice(&root.root.bytes());
+            message.extend_from_slice(&root.added_by.bytes());
+            message.extend_from_slice(&root.added_at.to_be_bytes());
+        }
+        let removed = canonical_removed(&self.roots_removed);
+        message.push(u8::try_from(removed.len()).unwrap_or(u8::MAX));
+        for root in &removed {
+            message.extend_from_slice(&root.root.bytes());
+            message.extend_from_slice(&root.removed_at.to_be_bytes());
+        }
         message
     }
 
-    /// Whether the root of the user it names signed it, and it is within
-    /// [`MAX_REVOKED`]. The count is checked first, on the list as given,
-    /// so an oversized one costs no sorting.
+    /// Whether the root it names signed it, it is within the limits, and
+    /// every root it adds is valid and signed its addition. The counts
+    /// are checked first, on the lists as given, so an oversized one
+    /// costs no sorting. Whether its signer is one of the user's roots is
+    /// the verifier's ([`RootSet`]).
     pub fn verify(&self) -> Result<(), StateError> {
         if self.revoked.len() > MAX_REVOKED {
             return Err(StateError::TooManyRevoked);
         }
-        let message = Self::message(&self.user, self.revision, &self.revoked, self.issued_at);
-        if self.user.verify(&message, &self.signature) {
+        if self.roots_added.len() > MAX_ROOT_CHANGES || self.roots_removed.len() > MAX_ROOT_CHANGES
+        {
+            return Err(StateError::TooManyRootChanges);
+        }
+        if !self
+            .roots_added
+            .iter()
+            .all(|added| added.verify(&self.user))
+        {
+            return Err(StateError::BadPossession);
+        }
+        if self
+            .signer()
+            .verify(&self.signed_message(), &self.signature)
+        {
             Ok(())
         } else {
             Err(StateError::BadSignature)
@@ -540,12 +787,51 @@ impl PortableIdentityState {
     }
 
     /// Whether `other` says the same as this: the same signed bytes and
-    /// signature, whatever order its list is in.
+    /// signature, whatever order its lists are in.
     pub fn same_as(&self, other: &PortableIdentityState) -> bool {
         self.signature == other.signature
-            && Self::message(&self.user, self.revision, &self.revoked, self.issued_at)
-                == Self::message(&other.user, other.revision, &other.revoked, other.issued_at)
+            && self.signer() == other.signer()
+            && self.signed_message() == other.signed_message()
     }
+}
+
+/// The roots of `user`, from its genesis (none for a phrase identity
+/// whose genesis the verifier has not seen: its one root is the phrase
+/// root its id is) and `states`, each already checked
+/// ([`PortableIdentityState::verify`]) and of `user`.
+pub fn root_set(
+    user: &PortableUserId,
+    genesis: Option<&IdentityGenesis>,
+    states: &[PortableIdentityState],
+) -> RootSet {
+    let first = match genesis {
+        Some(genesis) => genesis.roots.clone(),
+        None => vec![RootKey::phrase_of(user)],
+    };
+    let signers: Vec<RootKey> = states.iter().map(PortableIdentityState::signer).collect();
+    let changes: Vec<RootChanges<'_>> = states
+        .iter()
+        .zip(&signers)
+        .map(|(state, signer)| RootChanges {
+            signer,
+            added: &state.roots_added,
+            removed: &state.roots_removed,
+        })
+        .collect();
+    RootSet::of(&first, &changes)
+}
+
+/// What a device or server keeps of an identity to check it, and hands
+/// on so another can (P7-08): its genesis, absent for a phrase identity
+/// (its one root is its id), and its newest state, if any. Recovery with
+/// a root needs it from anywhere that has it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityRecord {
+    pub user: PortableUserId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis: Option<IdentityGenesis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<PortableIdentityState>,
 }
 
 /// The domain of the signature that ties a local account to a portable
@@ -585,10 +871,18 @@ pub fn tie_message(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TieProof {
-    /// The root's signature.
+    /// A root's signature: the phrase root the user's id is, or (P7-08)
+    /// the root it names, which the verifier checks is one of the user's.
     Root {
-        #[serde(with = "signature_hex")]
-        signature: Signature,
+        signature: RootSignature,
+        // compat(v1): required at the protocol reset
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root: Option<RootKey>,
+        /// The identity's genesis, for a verifier that has not seen it
+        /// (P7-08, as [`UserDeviceCredential::genesis`]).
+        // compat(v1): required at the protocol reset
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        genesis: Option<Box<IdentityGenesis>>,
     },
     /// `credential`'s device key's signature.
     Device {
@@ -615,9 +909,10 @@ pub enum TieProofError {
 
 impl TieProof {
     /// Whether it proves `user` signed `message` (a [`tie_message`]) at
-    /// `now` (Unix seconds): the root's signature, or a device key's with
-    /// a credential for `user` that holds now. Revocation is the
-    /// verifier's to check, against every state it has seen.
+    /// `now` (Unix seconds): the signature of the root it names, or a
+    /// device key's with a credential for `user` that holds now. Whether
+    /// that root is one of the user's ([`Self::root`]) and revocation are
+    /// the verifier's to check, against every state it has seen.
     pub fn verify(
         &self,
         user: &PortableUserId,
@@ -625,7 +920,11 @@ impl TieProof {
         now: i64,
     ) -> Result<(), TieProofError> {
         match self {
-            TieProof::Root { signature } => user
+            TieProof::Root {
+                signature, root, ..
+            } => root
+                .clone()
+                .unwrap_or_else(|| RootKey::phrase_of(user))
                 .verify(message, signature)
                 .then_some(())
                 .ok_or(TieProofError::BadSignature),
@@ -643,6 +942,23 @@ impl TieProof {
                     .then_some(())
                     .ok_or(TieProofError::BadSignature)
             }
+        }
+    }
+
+    /// The root whose word it is: the one that signed it, or the one that
+    /// signed the device's credential.
+    pub fn root(&self, user: &PortableUserId) -> RootKey {
+        match self {
+            TieProof::Root { root, .. } => root.clone().unwrap_or_else(|| RootKey::phrase_of(user)),
+            TieProof::Device { credential, .. } => credential.signer(),
+        }
+    }
+
+    /// The identity's genesis it carries, if any.
+    pub fn genesis(&self) -> Option<&IdentityGenesis> {
+        match self {
+            TieProof::Root { genesis, .. } => genesis.as_deref(),
+            TieProof::Device { credential, .. } => credential.genesis.as_deref(),
         }
     }
 
@@ -694,19 +1010,21 @@ mod tests {
     }
 
     #[test]
-    fn bytes_that_are_not_a_curve_point_are_refused() {
-        // About half of all y have no x on the curve; the first few small
-        // ones include some.
-        let refused = (0..=255u8)
+    fn an_id_that_is_not_a_curve_point_is_an_id_no_phrase_root_signs_for() {
+        // An id derived from a genesis (P7-08) is a hash, half of which
+        // have no point on the curve: such an id reads, but no phrase
+        // root's signature passes for it.
+        let point = (0..=255u8)
             .map(|y| {
                 let mut bytes = [0u8; 32];
                 bytes[0] = y;
                 bytes
             })
-            .filter(|bytes| VerifyingKey::from_bytes(bytes).is_err())
-            .inspect(|bytes| assert!(PortableUserId::from_bytes(*bytes).is_err()))
-            .count();
-        assert!(refused > 0);
+            .find(|bytes| VerifyingKey::from_bytes(bytes).is_err())
+            .unwrap();
+        let id = PortableUserId::from_bytes(point).unwrap();
+        assert_eq!(id.to_string().parse::<PortableUserId>(), Ok(id));
+        assert!(!id.verify(b"anything", &key().sign(b"anything")));
     }
 
     #[test]
@@ -840,13 +1158,16 @@ mod tests {
             credential.expires_at,
         );
         assert_eq!(hex(&message), CREDENTIAL_MESSAGE);
-        assert_eq!(hex(&credential.signature.to_bytes()), CREDENTIAL_SIGNATURE);
+        assert_eq!(
+            hex(&credential.signature.as_ed25519().unwrap().to_bytes()),
+            CREDENTIAL_SIGNATURE
+        );
     }
 
     #[test]
     fn a_credential_signed_elsewhere_verifies() {
         let credential = UserDeviceCredential {
-            signature: signature(CREDENTIAL_SIGNATURE),
+            signature: signature(CREDENTIAL_SIGNATURE).into(),
             ..credential()
         };
         assert_eq!(credential.verify(T), Ok(()));
@@ -860,10 +1181,13 @@ mod tests {
         assert_eq!(state.revoked, [eleven(), nine()]);
         let message = PortableIdentityState::message(&state.user, 2, &state.revoked, T);
         assert_eq!(hex(&message), STATE_MESSAGE);
-        assert_eq!(hex(&state.signature.to_bytes()), STATE_SIGNATURE);
+        assert_eq!(
+            hex(&state.signature.as_ed25519().unwrap().to_bytes()),
+            STATE_SIGNATURE
+        );
         let reordered = PortableIdentityState {
             revoked: vec![nine(), eleven(), revoked(9, T)],
-            signature: signature(STATE_SIGNATURE),
+            signature: signature(STATE_SIGNATURE).into(),
             ..state.clone()
         };
         assert_eq!(reordered.verify(), Ok(()));
@@ -1084,9 +1408,14 @@ mod tests {
         let oversized = PortableIdentityState {
             user: id(),
             revision: 1,
-            signature: root().sign(&PortableIdentityState::message(&id(), 1, &keys, T)),
+            signature: root()
+                .sign(&PortableIdentityState::message(&id(), 1, &keys, T))
+                .into(),
             revoked: keys,
             issued_at: T,
+            signer: None,
+            roots_added: vec![],
+            roots_removed: vec![],
         };
         assert_eq!(oversized.verify(), Err(StateError::TooManyRevoked));
     }
@@ -1137,7 +1466,9 @@ mod tests {
     #[test]
     fn a_tie_signed_elsewhere_verifies_by_root_or_device() {
         let by_root = TieProof::Root {
-            signature: signature(TIE_ROOT_SIGNATURE),
+            signature: signature(TIE_ROOT_SIGNATURE).into(),
+            root: None,
+            genesis: None,
         };
         assert_eq!(by_root.verify(&id(), &tie("alice"), T), Ok(()));
         let by_device = TieProof::Device {
@@ -1150,7 +1481,9 @@ mod tests {
     #[test]
     fn a_tie_for_another_server_nonce_identity_or_account_is_refused() {
         let by_root = TieProof::Root {
-            signature: signature(TIE_ROOT_SIGNATURE),
+            signature: signature(TIE_ROOT_SIGNATURE).into(),
+            root: None,
+            genesis: None,
         };
         let other_user =
             PortableUserId::from_bytes(SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes())
@@ -1211,7 +1544,9 @@ mod tests {
     #[test]
     fn serde_pins_the_tie_proof() {
         let json = serde_json::to_value(TieProof::Root {
-            signature: signature(TIE_ROOT_SIGNATURE),
+            signature: signature(TIE_ROOT_SIGNATURE).into(),
+            root: None,
+            genesis: None,
         })
         .unwrap();
         assert_eq!(

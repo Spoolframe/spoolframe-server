@@ -70,10 +70,13 @@ pub(crate) fn reservation(request: &Request) -> usize {
 /// - sign-ins a stranger makes only with a token from the bucket all
 ///   strangers share (`LoginPassword`, `Begin`/`FinishPasskeySignIn`,
 ///   `RedeemInvite`, `Begin`/`FinishPortableSignIn`,
-///   `RedeemPortableInvite`), which the bucket's
+///   `RedeemPortableInvite`, and P7-08's `IdentityRecord`,
+///   `IdentityRecordByHandle`, `OfferPairing`,
+///   `FetchPairing` and `AnswerPairing`), which the bucket's
 ///   rate keeps from filling theirs;
 /// - requests that draw on no rate limit (`BeginDeviceSignIn`,
-///   `AwaitDeviceSignIn`, `ResumeProfile`), held by what they wait on: a
+///   `AwaitDeviceSignIn`, `ResumeProfile`, `CollectPairing`), held by what
+///   they wait on: a
 ///   device's few pending sign-ins, each waited on once at a time
 ///   ([`crate::device_sign_in::DeviceSignIns::wait`]), and a trusted
 ///   device's resume.
@@ -109,10 +112,18 @@ impl Pools {
             | Request::RedeemInvite(_)
             | Request::BeginPortableSignIn
             | Request::FinishPortableSignIn(_)
-            | Request::RedeemPortableInvite(_) => (&self.sign_in, true),
+            | Request::RedeemPortableInvite(_)
+            // P7-08: on the strangers' budget too.
+            | Request::IdentityRecord { .. }
+            | Request::IdentityRecordByHandle { .. }
+            | Request::OfferPairing(_)
+            | Request::FetchPairing { .. }
+            | Request::AnswerPairing { .. } => (&self.sign_in, true),
             Request::BeginDeviceSignIn { .. }
             | Request::AwaitDeviceSignIn { .. }
-            | Request::ResumeProfile { .. } => (&self.device, true),
+            | Request::ResumeProfile { .. }
+            // P7-08: the offering device's own, polled, off the budget.
+            | Request::CollectPairing { .. } => (&self.device, true),
             _ => (&self.signed_in, false),
         }
     }

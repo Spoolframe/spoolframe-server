@@ -2,6 +2,88 @@
 
 ## Unreleased
 
+- P7-08: a fresh install with only a security key recovers its identity
+  from a server that knows it, without knowing the identity's id. The key
+  gives back the genesis handle its credential carries; the new pre-auth
+  request `identity_record_by_handle` finds the record by it (a key added
+  to a phrase identity carries the identity's id, which finds it too),
+  and `Client::recover_with_key` asks the key, fetches, checks the key is
+  one of the identity's roots now, and imports. `SdkError::NotARoot` now
+  means only "this key (or root) is not one of the identity's": a key
+  holding none of the identity's credentials in a root action is
+  `NotARoot`, not `SecurityKey(NoCredential)`, and a record, state or
+  credential from elsewhere signed by no root of its identity is
+  `IdentityState`/`Credential` `BadSignature` (or `InvalidInput` for a
+  genesis of another identity), not `NotARoot`. Wire revision 14,
+  additive; migration 0025 adds the handle column.
+
+- Dead sessions (revoked or expired) are purged after 30 days, every
+  6 hours; each device's newest one stays, so a user's devices and when
+  they were last seen read as before. Sessions are looked up by device
+  through an index (migration 0024), where every relay admission and
+  every minute's check of each device read the whole table.
+
+- Every database transaction that writes begins IMMEDIATE. One that
+  read first, while another connection committed, failed its write with
+  "database is locked" (SQLite's stale-snapshot error, which waiting
+  does not retry): an admin's password change, disable or trust change
+  racing a progress report or a session renewal.
+
+- SDK: security key roots (P7-08). A `SecurityKey` (libfido2 on Linux,
+  Core NFC on the iPhone, `SoftSecurityKey` in software) is the root of
+  an identity made with `Portable::create_with_keys` (one key in hand,
+  others as backups), or added to a phrase identity (`add_root`, the id
+  kept). With a key (`RootSigner::Key`): `pair_self` (also renewal),
+  `issue_credential_by`, `revoke_by`, `add_root`, `remove_root`;
+  `renewal_due` says when a credential is in its last 14 days. An
+  identity's record (genesis and newest state) exports and imports, or
+  comes from a server that knows it (`Client::fetch_identity_record`),
+  and any one key acts for it there. A device pairs through a server by
+  a 10-character code (`offer_relay_pairing`, `collect_relay_pairing`,
+  `accept_relay_pairing`; the root terminal `fetch_relay_pairing`,
+  `answer_relay_pairing`), for a root terminal with no camera.
+
+- The server checks security key roots (P7-08): a credential, a state
+  or a tie counts only from a root the identity has now, worked out from
+  its genesis (carried, or kept once the identity is known here) and
+  every root-changing state kept (at most 32 per identity). A server
+  answers `identity_record` with what it keeps of an identity it knows,
+  for recovery, and relays a pairing for a root terminal with no camera:
+  a device holds its request under a 10-character code for 5 minutes,
+  the terminal fetches it (5 tries) and answers once for the offered key,
+  and the device collects the answer. Codes are tried on the strangers'
+  budget.
+
+- Portable identities can have security key roots (P7-08, protocol): a
+  FIDO2 key's P-256 credential signs CTAP2 assertions under
+  `portable.spoolframe.app`, with touch and PIN, over the same bytes a
+  phrase root signs. An identity begins with a genesis of 1 to 8 roots,
+  each signing it; one of a single phrase root keeps its id (its public
+  key), any other's id is derived from the genesis. States list the
+  roots added (each proving it is held, endorsed by its adder with the
+  time) and removed, cumulatively, and a verifier works out the roots
+  from all it holds: a removed root never comes back, and what it adds
+  after its removal does not count. Credentials, states and tie proofs name
+  the root that signed them. Additive: revision 14, and a phrase
+  identity's credential and state read as before.
+
+- SDK: a playback's share of its server's uplink reaches the app with
+  its bitrate (PX-46). `Client::playback_shares()` gives each
+  `PlaybackShare { handle, max_bitrate }` as the server tells it, and
+  `ManagedPlayback::share()` the last one for that playback; the SDK
+  used to drop the bitrate and keep the event to itself.
+
+- Where a run of a remux ladder's encoded rung stops cutting at the
+  copy's keyframes is worked out once, when the run starts. Every
+  segment read rebuilt the run's list of keyframes to force, up to
+  120 KiB, to find it.
+
+- An HLS playlist states each variant at the size its encode writes. AV1
+  on VA-API writes 64×16 sizes only, and its rungs are scaled to one
+  (1296×540 written 1280×528), but the playlist still said the size
+  asked for. The playlist and the admin playback detail now take it from
+  the same function the filter graph does.
+
 ## 0.6.3 (2026-10-11)
 
 - SDK: an HLS segment or a converted chunk can be read as it arrives.

@@ -98,6 +98,45 @@ pub struct Conversion {
     current: Mutex<Current>,
     /// Ended by an admin (P3-15): no encode starts again for it.
     ended: std::sync::atomic::AtomicBool,
+    /// Every switch it logged, for tests to read: log capture races
+    /// other tests' (tracing caches a callsite's interest process-wide).
+    #[cfg(test)]
+    switches: Arc<Mutex<Vec<Switch>>>,
+}
+
+/// One rung switch or restart of an HLS conversion, as it is logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Switch {
+    playback: String,
+    from: u32,
+    to: u32,
+    asked: String,
+    init: &'static str,
+    run_from: Option<u32>,
+    epoch: Option<u32>,
+    ready_ms: Option<u128>,
+}
+
+impl Switch {
+    fn log(&self) {
+        let what = if self.from == self.to {
+            "hls run restarted"
+        } else {
+            "hls rung switch"
+        };
+        tracing::info!(
+            target: "spoolframe_server::playback",
+            playback = self.playback,
+            from = self.from,
+            to = self.to,
+            asked = self.asked,
+            init = self.init,
+            run_from = self.run_from,
+            epoch = self.epoch,
+            ready_ms = self.ready_ms,
+            "{what}"
+        );
+    }
 }
 
 /// The job running now, which rung of the ladder it encodes (0 for one
@@ -334,6 +373,8 @@ impl Conversion {
                 left: None,
             }),
             ended: Default::default(),
+            #[cfg(test)]
+            switches: Arc::default(),
         }))
     }
 
@@ -399,19 +440,53 @@ impl Conversion {
                 rendition?;
                 segments.subtitle_playlist()
             }
-            _ if self.ladder.is_empty() => {
-                hls::multivariant_playlist(&self.descriptor, self.video, self.audio, rendition)
-            }
+            _ if self.ladder.is_empty() => hls::multivariant_playlist(
+                &self.descriptor,
+                self.video,
+                self.video.and_then(|v| self.written_size(v)),
+                self.audio,
+                rendition,
+            ),
             // The rung the conversion started on first, as the player
             // starts on the first; then the rest, highest first.
             _ => {
                 let first = self.first_rung();
-                let rungs: Vec<(u32, ConvertedVideo)> = std::iter::once(first)
+                let rungs: Vec<hls::LadderVariant> = std::iter::once(first)
                     .chain((0..self.rungs()).filter(|&n| n != first))
-                    .filter_map(|n| Some((n, rung_video(self.video, &self.ladder, n)?)))
+                    .filter_map(|n| {
+                        let video = rung_video(self.video, &self.ladder, n)?;
+                        Some((n, video, self.written_size(video)))
+                    })
                     .collect();
                 hls::ladder_playlist(&self.descriptor, &rungs, self.audio, rendition)
             }
+        })
+    }
+
+    /// The picture an encode of `video` writes here, on the GPU its runs
+    /// go to ([`args::written_size`]): what the playlist states, so a
+    /// rung AV1 on VA-API writes at a size of its own (1296×540 written
+    /// 1280×528) is not listed at the size asked for.
+    fn written_size(&self, video: ConvertedVideo) -> Option<(u32, u32)> {
+        let jobs = &self.jobs;
+        args::written_size(&EncodeSpec {
+            input: &self.input,
+            sidecar: self.sidecar.as_deref(),
+            descriptor: &self.descriptor,
+            video: Some(video),
+            audio: self.audio,
+            subtitle: self.subtitle,
+            encoders: self.run_on.encoders(),
+            vaapi_device: self.run_on.vaapi_device(),
+            hardware_decode: !jobs.hardware_decode_failed(&self.file),
+            gpu_filters: jobs.limits().gpu_filters,
+            tone_map: jobs.limits().tone_map,
+            start: None,
+            output: Output::Hls {
+                dir: self.dir.clone(),
+                start_number: 1,
+                cuts: None,
+            },
         })
     }
 
@@ -465,7 +540,7 @@ impl Conversion {
             if let Some((left, job)) = &current.left
                 && *left == rung
                 && job.has_segment(n)
-                && self.aligned(rung, job, n)
+                && Self::aligned(job, n)
             {
                 return Ok(job.clone());
             }
@@ -481,7 +556,7 @@ impl Conversion {
             // Only what it wrote: nothing more is coming.
             return if n >= job.first_kept()
                 && written.is_some_and(|w| n <= w)
-                && self.aligned(rung, job, n)
+                && Self::aligned(job, n)
             {
                 Ok(job.clone())
             } else {
@@ -496,7 +571,7 @@ impl Conversion {
         if n >= job.first_kept()
             && n <= head + SEGMENTS_AHEAD
             && !failed_on_gpu
-            && self.aligned(rung, job, n)
+            && Self::aligned(job, n)
         {
             return Ok(job.clone());
         }
@@ -667,40 +742,42 @@ impl Conversion {
             Asked::Init => "init".to_owned(),
             Asked::Segment(n) => format!("segment {n}"),
         };
-        let what = if from == to {
-            "hls run restarted"
-        } else {
-            "hls rung switch"
+        let mut switch = Switch {
+            playback,
+            from,
+            to,
+            asked,
+            init: "new run",
+            run_from: None,
+            epoch: None,
+            ready_ms: None,
+        };
+        #[cfg(test)]
+        let switches = self.switches.clone();
+        let record = move |switch: Switch| {
+            switch.log();
+            #[cfg(test)]
+            switches.lock().push(switch);
         };
         let job = match served {
-            Served::Kept | Served::LeftRun => {
-                let init = if matches!(served, Served::Kept) {
-                    "kept"
-                } else {
-                    "left run"
-                };
-                tracing::info!(target: "spoolframe_server::playback", playback, from, to, asked, init, "{what}");
-                return;
+            Served::Kept => {
+                return record(Switch {
+                    init: "kept",
+                    ..switch
+                });
+            }
+            Served::LeftRun => {
+                return record(Switch {
+                    init: "left run",
+                    ..switch
+                });
             }
             Served::NewRun(job) => job,
         };
-        let (run_from, epoch) = (job.first_segment, job.epoch);
-        let log = move |ready_ms: Option<u128>| {
-            tracing::info!(
-                target: "spoolframe_server::playback",
-                playback,
-                from,
-                to,
-                asked,
-                run_from,
-                epoch,
-                init = "new run",
-                ready_ms,
-                "{what}"
-            );
-        };
+        switch.run_from = Some(job.first_segment);
+        switch.epoch = Some(job.epoch);
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return log(None);
+            return record(switch);
         };
         let started = std::time::Instant::now();
         let mut progress = job.progress();
@@ -712,7 +789,8 @@ impl Conversion {
             )
             .await;
             let ready = matches!(written, Ok(Ok(ref p)) if p.last_segment.is_some());
-            log(ready.then(|| started.elapsed().as_millis()));
+            switch.ready_ms = ready.then(|| started.elapsed().as_millis());
+            record(switch);
         });
     }
 
@@ -733,21 +811,11 @@ impl Conversion {
     /// its encoder keys, and its segments there have other times than
     /// their numbers say (a two-hour film keyed every 500 ms, from about
     /// 1:55:50 on). A segment past that is a new run's, from there.
-    fn aligned(&self, rung: u32, job: &EncodeJob, n: u32) -> bool {
-        let (Some(cuts), Some(segments)) = (self.cuts(rung), self.segments.as_ref()) else {
-            return true;
-        };
-        let start = segments
-            .start(job.first_segment)
-            .filter(|&ms| ms > 0)
-            .map(Duration::from_millis);
-        let Some(last) = forced_through(&cuts, start) else {
-            return true;
-        };
-        // Segment `s` starts at the last forced keyframe; its end is not
-        // forced, the one before it is the last cut as listed.
-        let s = cuts.partition_point(|&ms| ms < last) as u32 + 1;
-        n < s
+    ///
+    /// Worked out once per run, when it starts ([`aligned_until`]): the
+    /// list is up to 120 KiB, and this is asked on every segment read.
+    fn aligned(job: &EncodeJob, n: u32) -> bool {
+        job.aligned_until.is_none_or(|s| n < s)
     }
 
     /// Where an encode of `rung` cuts, when it is not its own grid: see
@@ -961,6 +1029,7 @@ fn spawn(
     cuts: Option<Vec<u64>>,
 ) -> Result<Arc<EncodeJob>, JobError> {
     let job_dir = dir.join(epoch.to_string());
+    let aligned_until = aligned_until(cuts.as_deref(), start);
     let (output, written) = match delivery {
         Delivery::Hls => (
             Output::Hls {
@@ -1063,6 +1132,7 @@ fn spawn(
             // open that card's nodes, its ffmpeg confined to them.
             card: run_on.gpu().filter(|_| gpu_encode).map(|g| g.limit()),
             ffmpeg: run_on.gpu().map(|g| g.ffmpeg.clone()),
+            aligned_until,
         },
         written,
         load(video, audio, gpu_encode, args::all_on_gpu(&spec)),
@@ -1071,6 +1141,17 @@ fn spawn(
         start_ms,
         slot,
     )
+}
+
+/// The first segment a run from `start` cut at `cuts` does not cut where
+/// the playlist says: its list of keyframes to force stops at what one
+/// argument holds ([`forced_through`]), and segment `s` starts at the last
+/// forced one, its end not forced. `None` for a run that forces every cut
+/// from `start` on, and for one not cut at given keyframes.
+fn aligned_until(cuts: Option<&[u64]>, start: Option<Duration>) -> Option<u32> {
+    let cuts = cuts?;
+    let last = forced_through(cuts, start)?;
+    Some(cuts.partition_point(|&ms| ms < last) as u32 + 1)
 }
 
 /// What a conversion weighs: its video encode, on the GPU or not, and if
@@ -1193,9 +1274,17 @@ mod tests {
     /// An H.264 ladder of four rungs (8, 4, 2 and 1 Mbit/s) of a two-hour
     /// film, resumed at 10 min on its lowest, run by [`LADDER_FFMPEG`].
     async fn resumed_ladder(test: &str) -> (Arc<Conversion>, spoolframe_test_dir::TestDir) {
+        resumed_ladder_of(test, spoolframe_types::VideoCodec::H264, "h264_vaapi").await
+    }
+
+    /// [`resumed_ladder`] encoded in `codec` by VA-API's `encoder`.
+    async fn resumed_ladder_of(
+        test: &str,
+        codec: spoolframe_types::VideoCodec,
+        encoder: &str,
+    ) -> (Arc<Conversion>, spoolframe_test_dir::TestDir) {
         use spoolframe_media::VideoStream;
         use spoolframe_media::encoders::{Hardware, VideoEncoder};
-        use spoolframe_types::VideoCodec;
 
         let tmp = spoolframe_test_dir::TestDir::new(test).await;
         let ffmpeg = job::tests::ffmpeg(&tmp.as_ref().join("bin"), LADDER_FFMPEG);
@@ -1251,7 +1340,7 @@ mod tests {
             delivery: Delivery::Hls,
             container: spoolframe_types::Container::Mp4,
             video: Some(ConvertedVideo::Encode {
-                codec: VideoCodec::H264,
+                codec,
                 height: 1080,
                 max_bitrate: Some(8_000_000),
                 tone_map: false,
@@ -1269,8 +1358,8 @@ mod tests {
         };
         let encoders = Encoders {
             video: vec![VideoEncoder {
-                codec: VideoCodec::H264,
-                name: "h264_vaapi".into(),
+                codec,
+                name: encoder.into(),
                 hardware: Some(Hardware::Vaapi),
             }],
             ..Encoders::software_baseline()
@@ -1292,6 +1381,59 @@ mod tests {
         )
         .unwrap();
         (conversion, tmp)
+    }
+
+    /// An AV1 ladder on VA-API lists each rung at the size its encode
+    /// writes: AMD's encoder writes 64×16 sizes only, so 1080p, 540p and
+    /// 360p are scaled to whole ones (`args::whole_av1_size`), and the
+    /// playlist said the sizes asked for.
+    #[tokio::test]
+    async fn an_av1_vaapi_ladder_lists_the_sizes_it_writes() {
+        let (conversion, _tmp) = resumed_ladder_of(
+            "spoolframe-conversion-av1-sizes",
+            spoolframe_types::VideoCodec::Av1,
+            "av1_vaapi",
+        )
+        .await;
+        let text = conversion
+            .manifest(ManifestKind::Multivariant, 0)
+            .expect("a multivariant playlist");
+        let Ok(m3u8_rs::Playlist::MasterPlaylist(p)) = m3u8_rs::parse_playlist_res(text.as_bytes())
+        else {
+            panic!("not a multivariant playlist: {text}");
+        };
+        let mut sizes: Vec<(u64, u64)> = p
+            .variants
+            .iter()
+            .filter_map(|v| v.resolution.map(|r| (r.width, r.height)))
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            [(640, 352), (960, 528), (1280, 720), (1920, 1072)],
+            "{text}"
+        );
+    }
+
+    /// A run's first segment off the playlist's grid: past its last
+    /// forced keyframe when its list stops short; none when the list holds
+    /// every cut, or the run is not cut at given keyframes.
+    #[test]
+    fn a_run_knows_where_its_forced_keyframes_end() {
+        // Keyed every 500 ms for two hours: more than one argument holds.
+        let long: Vec<u64> = (0..14_400).map(|n| n * 500).collect();
+        let last = args::forced_through(&long, None).expect("cut short");
+        let s = aligned_until(Some(&long), None).expect("cut short");
+        // Segment `s` (from 1) starts at the last forced keyframe.
+        assert_eq!(long[s as usize - 1], last);
+        // From near the end the rest fits.
+        assert_eq!(
+            aligned_until(Some(&long), Some(Duration::from_secs(7_000))),
+            None
+        );
+        let short = [0, 6_000, 12_000];
+        assert_eq!(aligned_until(Some(&short), None), None);
+        assert_eq!(aligned_until(None, None), None);
     }
 
     async fn written(job: &EncodeJob) -> u32 {
@@ -1341,11 +1483,6 @@ mod tests {
     /// once, and no run starts for it.
     #[tokio::test]
     async fn a_rung_s_init_is_read_from_a_run_that_wrote_it() {
-        use tracing_subscriber::layer::SubscriberExt;
-        let ring = Arc::new(crate::logs::LogRing::new(50));
-        let subscriber = tracing_subscriber::registry().with(crate::logs::RingLayer(ring.clone()));
-        // This test's thread, which its tasks run on too.
-        let _logged = tracing::subscriber::set_default(subscriber);
         let (conversion, _tmp) = resumed_ladder("spoolframe-conversion-kept-init").await;
         let lowest = conversion.job();
         written(&lowest).await;
@@ -1366,34 +1503,37 @@ mod tests {
         assert_eq!(conversion.job().epoch, epoch, "a run started for the init");
         assert_eq!(conversion.rung(), 0);
         // One line a switch: those to new runs once their first segment
-        // is written, with how long it took.
-        let switches = || -> Vec<String> {
-            ring.page(&spoolframe_admin_api::LogQuery::default())
-                .lines
-                .into_iter()
-                .map(|l| l.text)
-                .filter(|t| t.contains("hls rung switch"))
+        // is written, with how long it took. Read from what the conversion
+        // logged, not captured from the log: tracing caches a callsite's
+        // interest process-wide, and another test's thread could leave
+        // this one's lines unseen.
+        let switches = || -> Vec<Switch> {
+            conversion
+                .switches
+                .lock()
+                .iter()
+                .filter(|s| s.from != s.to)
+                .cloned()
                 .collect()
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while switches().len() < 3 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let lines = switches();
-        assert_eq!(lines.len(), 3, "{lines:#?}");
+        let switches = switches();
+        assert_eq!(switches.len(), 3, "{switches:#?}");
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("from=3 to=1 asked=\"init\"")
-                    && l.contains("init=\"new run\"")
-                    && l.contains("ready_ms=")),
-            "{lines:#?}"
+            switches.iter().any(|s| (s.from, s.to) == (3, 1)
+                && s.asked == "init"
+                && s.init == "new run"
+                && s.ready_ms.is_some()),
+            "{switches:#?}"
         );
         assert!(
-            lines
+            switches
                 .iter()
-                .any(|l| l.contains("from=0 to=3") && l.contains("init=\"kept\"")),
-            "{lines:#?}"
+                .any(|s| (s.from, s.to) == (0, 3) && s.init == "kept"),
+            "{switches:#?}"
         );
     }
 
@@ -1521,6 +1661,8 @@ mod tests {
         // About 1:55:50, as the review found.
         assert!((6_900_000..7_000_000).contains(&last), "{last}");
         let past = segments.starts_ms.partition_point(|&ms| ms < last) as u32 + 1;
+        // Worked out once, when the run started, not on every read.
+        assert_eq!(first.aligned_until, Some(past));
         let before = conversion.job_for_segment(past - 1, 1).unwrap();
         assert!(
             Arc::ptr_eq(&before, &first),

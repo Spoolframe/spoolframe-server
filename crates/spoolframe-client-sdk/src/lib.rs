@@ -23,6 +23,7 @@ mod invites;
 mod link;
 mod link_meter;
 pub mod pairing;
+mod pairing_relay;
 pub mod portable;
 mod portable_sign_in;
 mod reachability;
@@ -46,10 +47,12 @@ pub use pairing::{Connected, Paired, Pairing, PairingError, PairingOffer};
 pub use spoolframe_protocol::invite::InviteLinkKind;
 pub use spoolframe_protocol::pairing::PairedServer;
 // Portable identities (P7-01) and their device credentials (P7-02).
+pub use pairing_relay::{RelayAnswer, RelayOffer, RelayPairing};
 pub use portable::{
-    CredentialError, DevicePublicKey, PhraseError, Portable, PortableIdentity,
-    PortableIdentityState, PortableRoot, PortableUserId, RecoveryPhrase, RevokedKey, StateError,
-    TieProof, UserDeviceCredential,
+    CredentialError, DevicePublicKey, HANDLE_LEN, IdentityGenesis, IdentityRecord, KeyAssertion,
+    PORTABLE_RP, PhraseError, Portable, PortableIdentity, PortableIdentityState, PortableRoot,
+    PortableUserId, RecoveryPhrase, RevokedKey, RootKey, RootSet, RootSigner, SecurityKey,
+    SecurityKeyError, SoftSecurityKey, StateError, TieProof, UserDeviceCredential,
 };
 pub use reachability::{
     DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,
@@ -86,7 +89,7 @@ pub use spoolframe_types as types;
 pub use storage::{MemoryStorage, Storage, StorageError};
 
 mod managed;
-pub use managed::{ManagedPlayback, PlaybackBackend, SegmentStream};
+pub use managed::{ManagedPlayback, PlaybackBackend, PlaybackShare, SegmentStream};
 mod profile_scope;
 pub use profile_scope::{ProfileScope, ProfileToken};
 

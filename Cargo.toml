@@ -89,6 +89,10 @@ sha2 = "0.10"
 # already builds, so the graph carries one curve, not two. Its defaults
 # zeroize a signing key when dropped.
 ed25519-dalek = "3"
+# A security key as an identity's root (P7-08): P-256 ECDSA, the one
+# algorithm FIDO2 keys all sign with. 0.13, the version already in the
+# graph through webauthn.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 # The recovery phrase: BIP-39, its English wordlist and checksum (CC0).
 # `zeroize` clears a parsed phrase when dropped.
 bip39 = { version = "2", default-features = false, features = ["std", "zeroize"] }

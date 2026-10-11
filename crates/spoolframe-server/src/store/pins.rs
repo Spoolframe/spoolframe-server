@@ -107,7 +107,7 @@ impl Store {
     /// Remove `user`'s PIN, and with it its requirement on every device:
     /// a requirement for a PIN nobody can enter would lock them out.
     pub async fn clear_pin(&self, user: LocalUserId) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query("DELETE FROM pin_required WHERE user_id = ?1")
             .bind(user)
             .execute(&mut *tx)
@@ -128,7 +128,7 @@ impl Store {
         endpoint_id: &str,
         required: bool,
     ) -> Result<(), PinError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let theirs: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM sessions WHERE user_id = ?1 AND endpoint_id = ?2 LIMIT 1",
         )
@@ -202,7 +202,7 @@ impl Store {
         user: LocalUserId,
         endpoint_id: &str,
     ) -> Result<u64, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let revoked = sqlx::query(
             "UPDATE sessions SET revoked_at = ?3 \
              WHERE user_id = ?1 AND endpoint_id = ?2 AND revoked_at IS NULL",
@@ -234,7 +234,7 @@ impl Store {
         user: LocalUserId,
         endpoint_id: &str,
     ) -> Result<u64, PinError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let theirs: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM sessions WHERE user_id = ?1 AND endpoint_id = ?2 LIMIT 1",
         )

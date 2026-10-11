@@ -7,6 +7,11 @@ authors.workspace = true
 repository.workspace = true
 license = "MIT OR Apache-2.0"
 
+[features]
+# A software security key (P7-08) that writes real CTAP2 assertions: for
+# tests, and for a device that has no key at hand to test with.
+soft-key = []
+
 [dependencies]
 # The invite holder's token for the server's relay (P6-08).
 base64 = { workspace = true }
@@ -15,6 +20,8 @@ ciborium = { workspace = true }
 ciborium-ll = { workspace = true }
 # Checks what a portable user's root signed (P7-01); never signs.
 ed25519-dalek = { workspace = true }
+# Checks what a security key root signed (P7-08); never signs.
+p256 = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 sha2 = { workspace = true }

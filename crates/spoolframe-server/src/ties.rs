@@ -125,15 +125,20 @@ pub enum TieCheckError {
     /// An identity state seen here revokes the device key that signed.
     #[error("the device key is revoked")]
     Revoked,
+    /// The root whose word it is is not one of the identity's now
+    /// (P7-08), or the genesis it carries is not the identity's.
+    #[error("the root is not one of the identity's")]
+    NotARoot,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
 
 /// Whether `proof` shows `user` tying to the account `username` on the
 /// server whose endpoint id is `server`, over `nonce`, at `now` (Unix
-/// seconds): the root's signature, or a device key's with a credential
+/// seconds): a root's signature, or a device key's with a credential
 /// for `user` that holds and that no identity state seen here revokes
-/// ([`Store::revokes`]).
+/// ([`Store::revokes`]); either way the root is one of `user`'s now
+/// (P7-08, [`Store::root_set`], with the genesis the proof carries).
 pub async fn check_tie(
     store: &Store,
     proof: &TieProof,
@@ -146,6 +151,19 @@ pub async fn check_tie(
     // A username is at most 64 characters: always some message.
     let message = tie_message(server, nonce, &user, username).ok_or(TieProofError::BadSignature)?;
     proof.verify(&user, &message, now)?;
+    let genesis = proof.genesis();
+    if let Some(genesis) = genesis
+        && (genesis.verify().is_err() || genesis.user() != user)
+    {
+        return Err(TieCheckError::NotARoot);
+    }
+    if !store
+        .root_set(user, genesis, &[])
+        .await?
+        .holds(&proof.root(&user))
+    {
+        return Err(TieCheckError::NotARoot);
+    }
     if let TieProof::Device { credential, .. } = proof
         && store.revokes(user, &credential.device_key, now).await?
     {
@@ -240,7 +258,9 @@ mod tests {
     async fn the_root_or_a_device_ties() {
         let store = test_store("tie-check-good").await;
         let by_root = TieProof::Root {
-            signature: signed(&root(7), "alice"),
+            signature: signed(&root(7), "alice").into(),
+            root: None,
+            genesis: None,
         };
         for proof in [by_root, by_device(9)] {
             check_tie(&store, &proof, user(7), &SERVER, &NONCE, "alice", T)
@@ -253,7 +273,9 @@ mod tests {
     async fn a_proof_for_another_account_is_refused() {
         let store = test_store("tie-check-account").await;
         let proof = TieProof::Root {
-            signature: signed(&root(7), "alice"),
+            signature: signed(&root(7), "alice").into(),
+            root: None,
+            genesis: None,
         };
         assert!(matches!(
             check_tie(&store, &proof, user(7), &SERVER, &NONCE, "bob", T).await,
@@ -276,5 +298,61 @@ mod tests {
         check_tie(&store, &by_device(11), user(7), &SERVER, &NONCE, "alice", T)
             .await
             .unwrap();
+    }
+
+    // P7-08: a tie by a security key root.
+
+    #[tokio::test]
+    async fn a_key_identity_ties_by_its_root_with_its_genesis_and_a_stranger_key_does_not() {
+        use spoolframe_protocol::portable::soft_key::SoftKey;
+        use spoolframe_protocol::portable::{IdentityGenesis, RootKey};
+
+        let store = test_store("tie-key-root").await;
+        let a = SoftKey::from_seed(3);
+        let handle = [0x33; 32];
+        let roots: Vec<RootKey> = vec![a.root()];
+        let message = IdentityGenesis::message(&handle, &roots).unwrap();
+        let genesis = IdentityGenesis {
+            handle,
+            signatures: vec![a.assert(&message)],
+            roots,
+        };
+        let user = genesis.user();
+        let tie = tie_message(&SERVER, &NONCE, &user, "alice").unwrap();
+        let by = |key: &SoftKey, genesis: Option<IdentityGenesis>| TieProof::Root {
+            signature: key.assert(&tie),
+            root: Some(key.root()),
+            genesis: genesis.map(Box::new),
+        };
+        check_tie(
+            &store,
+            &by(&a, Some(genesis.clone())),
+            user,
+            &SERVER,
+            &NONCE,
+            "alice",
+            T,
+        )
+        .await
+        .unwrap();
+        // Without the genesis, and none kept: its root is not known.
+        assert!(matches!(
+            check_tie(&store, &by(&a, None), user, &SERVER, &NONCE, "alice", T).await,
+            Err(TieCheckError::NotARoot)
+        ));
+        let stranger = SoftKey::from_seed(5);
+        assert!(matches!(
+            check_tie(
+                &store,
+                &by(&stranger, Some(genesis)),
+                user,
+                &SERVER,
+                &NONCE,
+                "alice",
+                T,
+            )
+            .await,
+            Err(TieCheckError::NotARoot)
+        ));
     }
 }

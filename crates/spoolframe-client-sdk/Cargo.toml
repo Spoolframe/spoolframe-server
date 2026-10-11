@@ -22,7 +22,10 @@ zeroize = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true }
 iroh-mdns-address-lookup = { workspace = true }
-spoolframe-protocol = { workspace = true }
+# soft-key: the software security key the SDK offers (P7-08).
+spoolframe-protocol = { workspace = true, features = ["soft-key"] }
+# The clientDataHash a security key root signs (P7-08).
+sha2 = { workspace = true }
 spoolframe-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

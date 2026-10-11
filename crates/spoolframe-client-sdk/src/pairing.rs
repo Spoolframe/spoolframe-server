@@ -639,7 +639,7 @@ impl PairingOffer {
             &mut send,
             &PhoneFrame::Credential {
                 credential: Box::new(credential),
-                state,
+                state: state.map(Box::new),
                 servers,
             },
         )
@@ -823,20 +823,16 @@ async fn pair(
                 return Err(refused(SdkError::DeviceKeyRevoked));
             }
         }
+        // The state first (P7-08): a root it adds may have signed the
+        // credential. Nothing half done: a refused credential leaves no
+        // state this device did not have.
         portable
-            .install_credential(credential)
+            .install_with_state(credential, state.map(|s| *s))
             .await
             .map_err(|e| match e {
                 SdkError::Storage(_) => failed(e),
                 e => refused(e),
             })?;
-        if let Some(state) = state
-            && let Err(e) = portable.accept_state(state).await
-        {
-            // Nothing half done: the credential goes with the state.
-            let _ = portable.drop_credential(identity).await;
-            return Err(failed(e));
-        }
         write_frame(send, &DeviceFrame::Done)
             .await
             .map_err(|e| aborted(e.to_string()))?;

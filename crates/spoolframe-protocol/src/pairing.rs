@@ -259,7 +259,7 @@ pub enum PhoneFrame {
     /// to. A phone from before P7-06 sends none: absent is empty.
     Credential {
         credential: Box<UserDeviceCredential>,
-        state: Option<PortableIdentityState>,
+        state: Option<Box<PortableIdentityState>>,
         // compat(v1): required at the protocol reset
         #[serde(default)]
         servers: Vec<PairedServer>,
@@ -368,6 +368,106 @@ fn unhex(text: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
     }
     Some(bytes)
+}
+
+/// Characters in a [`RelayCode`]: 10 of Crockford's base32, 50 bits.
+/// Typed by a person, so short; guessed only at the rate the server lets
+/// a stranger try, against a code that lives [`RELAY_TTL_SECS`].
+pub const RELAY_CODE_LEN: usize = 10;
+
+/// How long a server holds a relayed pairing (P7-08), from its offer.
+pub const RELAY_TTL_SECS: u64 = 5 * 60;
+
+/// Crockford's base32 alphabet: no I, L, O or U.
+const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// The short code a device shows beside its QR code, for a root terminal
+/// with no camera to pair it through a server both reach (P7-08): 10
+/// characters of Crockford's base32, written in two groups of five.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RelayCode(String);
+
+impl RelayCode {
+    /// The code `bytes` make: each of the first 10 taken mod 32.
+    pub fn from_random(bytes: [u8; RELAY_CODE_LEN]) -> Self {
+        Self(
+            bytes
+                .iter()
+                .map(|b| CROCKFORD[usize::from(b % 32)] as char)
+                .collect(),
+        )
+    }
+
+    /// The code a person typed: case, spaces and dashes ignored; I and L
+    /// read as 1, O as 0, as Crockford's base32 reads them. `None` if it
+    /// is not 10 such characters.
+    pub fn parse(text: &str) -> Option<Self> {
+        let code: String = text
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .map(|c| match c.to_ascii_uppercase() {
+                'I' | 'L' => '1',
+                'O' => '0',
+                c => c,
+            })
+            .collect();
+        (code.len() == RELAY_CODE_LEN && code.bytes().all(|b| CROCKFORD.contains(&b)))
+            .then_some(Self(code))
+    }
+
+    /// As a person reads it: `ABCDE-FGHJK`.
+    pub fn display(&self) -> String {
+        format!("{}-{}", &self.0[..5], &self.0[5..])
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RelayCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RelayCode(<redacted>)")
+    }
+}
+
+impl TryFrom<String> for RelayCode {
+    type Error = &'static str;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::parse(&text).ok_or("a relay code is 10 characters of Crockford's base32")
+    }
+}
+
+impl From<RelayCode> for String {
+    fn from(code: RelayCode) -> Self {
+        code.0
+    }
+}
+
+/// A device's pairing request, held on a server under a [`RelayCode`]
+/// for a root terminal to fetch (P7-08): the key the root is to vouch for
+/// and the device's name. Public data: whoever has the code may read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingOffer {
+    pub code: RelayCode,
+    /// The device's key for the identity it is to act as.
+    pub device_key: DevicePublicKey,
+    /// Cut to [`MAX_NAME`] characters.
+    pub name: String,
+}
+
+/// The root terminal's answer to a [`PairingOffer`]: what
+/// [`PhoneFrame::Credential`] carries on a direct pairing. The server only
+/// carries it: the device checks the credential names its own key and
+/// shows whose identity it is before it keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingAnswer {
+    pub credential: Box<UserDeviceCredential>,
+    pub state: Option<Box<PortableIdentityState>>,
+    /// At most [`MAX_PAIRED_SERVERS`].
+    pub servers: Vec<PairedServer>,
 }
 
 #[cfg(test)]
