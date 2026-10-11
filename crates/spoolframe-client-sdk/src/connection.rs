@@ -306,24 +306,39 @@ impl ServerConnection {
         limit: Duration,
         stall: Duration,
     ) -> Result<(ResourceResponse, Vec<u8>), SdkError> {
-        self.resource_metered(request, maximum, limit, stall, None)
+        self.resource_metered(request, maximum, limit, stall, Metering::Off)
             .await
     }
 
-    /// [`Self::resource`], its time and bytes counted by `meter` as they
-    /// arrive (P6-06).
+    /// [`Self::resource`], its time and bytes counted as `metering`
+    /// says (P6-06, PX-46).
     async fn resource_metered(
         &self,
         request: &ResourceRequest,
         maximum: u64,
         limit: Duration,
         stall: Duration,
-        meter: Option<&LinkMeter>,
+        metering: Metering<'_>,
     ) -> Result<(ResourceResponse, Vec<u8>), SdkError> {
-        let _metered = meter.map(Metered::begin);
+        let mut _metered = match metering {
+            Metering::Whole(meter) => Some(Metered::begin(meter)),
+            _ => None,
+        };
         let (mut recv, response) = exchange(&self.conn, bi::RESOURCE, request, limit).await?;
         let bytes = match &response {
             ResourceResponse::Ready { length, .. } => {
+                let meter = match metering {
+                    Metering::Off => None,
+                    Metering::Whole(meter) => Some(meter),
+                    // From the first byte: the server held the read while
+                    // the encode caught up, which is not the link's time.
+                    // A short body is mostly its round trip, and left out.
+                    Metering::FromFirstByte(meter) if *length >= METERED_BODY => {
+                        _metered = Some(Metered::begin(meter));
+                        Some(meter)
+                    }
+                    Metering::FromFirstByte(_) => None,
+                };
                 body(&self.conn, &mut recv, *length, maximum, stall, meter).await?
             }
             ResourceResponse::Error { .. } => Vec::new(),
@@ -363,15 +378,15 @@ impl ServerConnection {
         Ok((response, bytes))
     }
 
-    /// One media read; `meter`, for a direct read, counts how fast it
-    /// arrives (P6-06).
+    /// One media read, counted as `metering` says: a direct read whole, a
+    /// converted one from its first byte (P6-06, PX-46).
     pub async fn read(
         &self,
         request: &MediaRead,
         revision: u64,
         limit: Duration,
         stall: Duration,
-        meter: Option<&LinkMeter>,
+        metering: Metering<'_>,
     ) -> Result<(MediaReadResponse, Vec<u8>), SdkError> {
         let maximum = request.length.min(MAX_READ);
         let request = ResourceRequest::Media {
@@ -379,7 +394,7 @@ impl ServerConnection {
             revision,
         };
         let (response, bytes) = self
-            .resource_metered(&request, maximum, limit, stall, meter)
+            .resource_metered(&request, maximum, limit, stall, metering)
             .await?;
         let response = match response {
             ResourceResponse::Ready {
@@ -525,6 +540,21 @@ fn stream_name(kind: u8) -> &'static str {
 
 /// The `length` bytes after a response frame, and nothing more, with no
 /// pause longer than `stall`.
+/// How a read is counted by the link meter.
+#[derive(Debug, Clone, Copy)]
+pub enum Metering<'a> {
+    Off,
+    /// From the request to the last byte: a direct read, whose server
+    /// answers at once.
+    Whole(&'a LinkMeter),
+    /// From the first byte to the last, a body of [`METERED_BODY`] or more:
+    /// a converted read, which the server may hold while it encodes.
+    FromFirstByte(&'a LinkMeter),
+}
+
+/// The least body a converted read is metered by.
+pub const METERED_BODY: u64 = 512 << 10;
+
 /// A read [`LinkMeter`] counts, ended when dropped: a read that fails or
 /// is given up on ends too.
 struct Metered<'a>(&'a LinkMeter);

@@ -83,6 +83,30 @@ pub fn plan(
     encoders: &Encoders,
     ocr: &Ocr,
 ) -> PlaybackPlan {
+    plan_checked(
+        descriptor,
+        capabilities,
+        selection,
+        bitmap,
+        encoders,
+        ocr,
+        false,
+    )
+}
+
+/// [`plan`], with `copy_peak` asking a copied file to fit its peak, not
+/// its average, under the bitrate cap ([`crate::encode::hls::copy_peak`]):
+/// off the LAN in `Auto`, where the cap is the link's or the uplink's
+/// share and a peak over it stalls the player (PX-46).
+fn plan_checked(
+    descriptor: &MediaDescriptor,
+    capabilities: Option<&ClientCapabilities>,
+    selection: Selection,
+    bitmap: Bitmap,
+    encoders: &Encoders,
+    ocr: &Ocr,
+    copy_peak: bool,
+) -> PlaybackPlan {
     let Some(caps) = capabilities else {
         return plan_without_capabilities();
     };
@@ -126,7 +150,7 @@ pub fn plan(
         }
     };
 
-    let fit = Fit::check(descriptor, caps, audio, subtitle, shown);
+    let fit = Fit::check(descriptor, caps, audio, subtitle, shown, copy_peak);
     let deliveries = caps.deliveries();
     if fit.reasons().is_empty() && deliveries.contains(&Delivery::Range) {
         return direct(descriptor, audio, subtitle, shown);
@@ -155,15 +179,24 @@ pub use spoolframe_protocol::playback::LINK_SHARE;
 
 /// `caps` for a playback of `quality` (P6-06): its `max_bitrate`, the
 /// app's own limit, lowered to [`LINK_SHARE`] of the link for `Auto`, or
-/// to the bitrate chosen, whichever is lower. `Original`, and `Auto`
-/// with nothing measured, keep the app's limit alone.
-pub fn with_quality(caps: &ClientCapabilities, quality: Quality) -> ClientCapabilities {
+/// to the bitrate chosen, whichever is lower. `Auto` off the LAN is also
+/// held to its `share` of the uplink (PX-46). `Original`, and `Auto` with
+/// nothing measured and no share, keep the app's limit alone.
+pub fn with_quality(
+    caps: &ClientCapabilities,
+    quality: Quality,
+    share: Option<u64>,
+) -> ClientCapabilities {
     let chosen = match quality {
-        Quality::Auto {
-            link_bitrate: Some(link),
-        } => Some((link as f64 * LINK_SHARE) as u64),
+        Quality::Auto { link_bitrate } => {
+            let link = link_bitrate.map(|link| (link as f64 * LINK_SHARE) as u64);
+            match (link, share) {
+                (Some(link), Some(share)) => Some(link.min(share)),
+                (link, share) => link.or(share),
+            }
+        }
         Quality::Bitrate { max_bitrate } => Some(max_bitrate),
-        Quality::Auto { link_bitrate: None } | Quality::Original | Quality::Unknown => None,
+        Quality::Original | Quality::Unknown => None,
     };
     let mut caps = caps.clone();
     if let Some(chosen) = chosen {
@@ -293,6 +326,7 @@ impl Fit {
         audio: Option<usize>,
         subtitle: Option<u32>,
         shown: Option<Shown>,
+        copy_peak: bool,
     ) -> Self {
         let mut fit = Fit {
             shown,
@@ -314,14 +348,21 @@ impl Fit {
                 ));
             }
             fit.video.extend(over_limits(v, caps));
-            if let (Some(max), Some(rate)) = (caps.max_bitrate, descriptor.bit_rate)
-                && rate > max
-            {
-                fit.video.push(format!(
-                    "bitrate: {} over the client's {}",
-                    mbits(rate),
-                    mbits(max)
-                ));
+            if let (Some(max), Some(rate)) = (caps.max_bitrate, descriptor.bit_rate) {
+                if rate > max {
+                    fit.video.push(format!(
+                        "bitrate: {} over the client's {}",
+                        mbits(rate),
+                        mbits(max)
+                    ));
+                } else if copy_peak && crate::encode::hls::copy_peak(rate) > max {
+                    fit.video.push(format!(
+                        "bitrate: {} peaks near {}, over the {} this link takes",
+                        mbits(rate),
+                        mbits(crate::encode::hls::copy_peak(rate)),
+                        mbits(max)
+                    ));
+                }
             }
         }
         if let Some(index) = audio {
@@ -656,30 +697,44 @@ fn converted(
 /// encodes run from the app's own cap (not the link's) down to
 /// [`RUNG_FLOOR`], and the player moves between them as its link
 /// changes. A plan that copies the video, or plays the file, stays as
-/// it is: it fit the link.
+/// it is: it fit the link. Off the LAN (`wan`) in `Auto`, a copy must
+/// fit its peak under the cap, not only its average (PX-46).
 #[allow(clippy::too_many_arguments)]
 pub fn plan_for(
     descriptor: &MediaDescriptor,
     capabilities: Option<&ClientCapabilities>,
     quality: Quality,
+    share: Option<u64>,
+    wan: bool,
     selection: Selection,
     bitmap: Bitmap,
     encoders: &Encoders,
     ocr: &Ocr,
 ) -> PlaybackPlan {
-    let capped = capabilities.map(|caps| with_quality(caps, quality));
-    let plan = plan(
+    let capped = capabilities.map(|caps| with_quality(caps, quality, share));
+    let plan = plan_checked(
         descriptor,
         capped.as_ref(),
         selection,
         bitmap,
         encoders,
         ocr,
+        wan && matches!(quality, Quality::Auto { .. }),
     );
     let (Quality::Auto { .. }, Some(caps), Some(source)) =
         (quality, capabilities, descriptor.video.as_ref())
     else {
         return plan;
+    };
+    // Off the LAN, a copy over HLS is the top of a ladder of encodes under
+    // it (PX-21): the player starts low and climbs to the original while
+    // the link carries it, where one copied variant has nowhere lower to
+    // go. On the LAN the copy plays alone, as it fits. An encode goes on
+    // to its own ladder below, on the LAN or off it.
+    let plan = if wan {
+        remux_ladder(plan, descriptor, capped.as_ref().unwrap_or(caps), encoders)
+    } else {
+        plan
     };
     let PlaybackPlan::Converted {
         delivery: Delivery::Hls,
@@ -711,7 +766,13 @@ pub fn plan_for(
         .bit_rate
         .map(|bits| bits.saturating_sub(audio_bits))
         .unwrap_or_else(|| worth(tallest, codec));
-    let top = caps.max_bitrate.map_or(source_bits, |max| {
+    // Under the uplink share too (PX-46): the ladder's top is what this
+    // playback may take of it.
+    let own = match (caps.max_bitrate, share) {
+        (Some(own), Some(share)) => Some(own.min(share)),
+        (own, share) => own.or(share),
+    };
+    let top = own.map_or(source_bits, |max| {
         source_bits.min(max.saturating_sub(audio_bits))
     });
     let rungs = ladder(top, tallest, codec);
@@ -733,12 +794,110 @@ pub fn plan_for(
     }
 }
 
+/// `plan`, a copy over HLS (PX-21's remux ladder): the copy as the top
+/// rung, then encodes under it as [`ladder`] spreads them from half the
+/// copy's rate down, with the codec, range and size this client takes
+/// ([`encode_video`]), at most [`MAX_RUNGS`] in all. Every rung has the
+/// same audio and subtitle, and is cut where the copy is (`encode`). Any
+/// other plan, or one no encode under the copy fits, is `plan` as it is.
+fn remux_ladder(
+    plan: PlaybackPlan,
+    descriptor: &MediaDescriptor,
+    caps: &ClientCapabilities,
+    encoders: &Encoders,
+) -> PlaybackPlan {
+    let PlaybackPlan::Converted {
+        delivery: Delivery::Hls,
+        video: Some(ConvertedVideo::Copy { .. }),
+        audio,
+        ..
+    } = &plan
+    else {
+        return plan;
+    };
+    let Some(source) = descriptor.video.as_ref() else {
+        return plan;
+    };
+    let Ok(ConvertedVideo::Encode {
+        codec,
+        height: tallest,
+        tone_map,
+        ..
+    }) = encode_video(source, caps, encoders, audio.as_ref())
+    else {
+        return plan;
+    };
+    let audio_bits = match audio.map(|a| a.action) {
+        Some(AudioAction::Encode { bitrate, .. }) => bitrate,
+        Some(_) => 640_000,
+        None => 0,
+    };
+    let copy_bits = descriptor
+        .bit_rate
+        .map(|bits| bits.saturating_sub(audio_bits))
+        .unwrap_or_else(|| worth(source.height, codec));
+    let under: Vec<Rung> = ladder(copy_bits / 2, tallest, codec)
+        .into_iter()
+        .filter(|r| r.max_bitrate <= copy_bits / 2)
+        .take(MAX_RUNGS - 1)
+        .map(|r| Rung {
+            video: Some(ConvertedVideo::Encode {
+                codec,
+                height: r.height,
+                max_bitrate: Some(r.max_bitrate),
+                tone_map,
+            }),
+            ..r
+        })
+        .collect();
+    // The floor itself under a copy near it is no ladder worth starting.
+    if under.is_empty() || copy_bits <= RUNG_FLOOR {
+        return plan;
+    }
+    let PlaybackPlan::Converted {
+        delivery,
+        container,
+        video,
+        audio,
+        subtitle,
+        mut reasons,
+        ..
+    } = plan
+    else {
+        unreachable!("matched above");
+    };
+    reasons.push(format!(
+        "video: off the LAN, the copy is the top of a ladder of {} encodes under it",
+        under.len()
+    ));
+    let top = Rung {
+        height: source.height,
+        max_bitrate: copy_bits,
+        video: None,
+    };
+    PlaybackPlan::Converted {
+        delivery,
+        container,
+        video,
+        audio,
+        subtitle,
+        ladder: std::iter::once(top).chain(under).collect(),
+        reasons,
+    }
+}
+
 /// The rung of `plan`'s ladder a player starts on (PX-21): the highest
 /// whose cap is within [`LINK_SHARE`] of what `Auto` measured, else the
-/// lowest, as with nothing measured. 0 for a plan with no ladder.
+/// lowest, as with nothing measured. A copied rung counts at its peak
+/// (`hls::copy_peak`), not its average. 0 for a plan with no ladder.
 pub fn start_rung(plan: &PlaybackPlan, quality: Quality) -> u32 {
-    let PlaybackPlan::Converted { ladder, .. } = plan else {
+    let PlaybackPlan::Converted { ladder, video, .. } = plan else {
         return 0;
+    };
+    let copied = matches!(video, Some(ConvertedVideo::Copy { .. }));
+    let rate = |r: &Rung| match r.video {
+        None if copied => crate::encode::hls::copy_peak(r.max_bitrate),
+        _ => r.max_bitrate,
     };
     let Some(lowest) = ladder.len().checked_sub(1) else {
         return 0;
@@ -748,7 +907,7 @@ pub fn start_rung(plan: &PlaybackPlan, quality: Quality) -> u32 {
             link_bitrate: Some(link),
         } => {
             let share = (link as f64 * LINK_SHARE) as u64;
-            ladder.iter().position(|r| r.max_bitrate <= share)
+            ladder.iter().position(|r| rate(r) <= share)
         }
         _ => None,
     };
@@ -873,6 +1032,7 @@ pub fn ladder(top: u64, tallest: u32, codec: VideoCodec) -> Vec<Rung> {
         rungs.push(Rung {
             height: tallest.min(height_for(bits, codec)),
             max_bitrate: bits,
+            video: None,
         });
     }
     rungs
@@ -1091,7 +1251,7 @@ mod tests {
 
     use spoolframe_media::encoders::{AudioEncoder, Hardware, VideoEncoder};
     use spoolframe_media::sandbox::Tool;
-    use spoolframe_types::{AudioRole, HdrFormat, SubtitleRole, VideoLimits};
+    use spoolframe_types::{AudioRole, DisplayCapabilities, HdrFormat, SubtitleRole, VideoLimits};
 
     use super::*;
 
@@ -1585,14 +1745,160 @@ mod tests {
         Rung {
             height,
             max_bitrate,
+            video: None,
         }
     }
 
+    /// American Sniper as the user's server has it: an H.264 1080p
+    /// Blu-ray rip averaging 9.4 Mbit/s, with AAC picked (its second
+    /// audio track, by position).
+    fn sniper(quality: Quality, share: Option<u64>, wan: bool) -> PlaybackPlan {
+        let mut d = dts_aac_pgs();
+        d.bit_rate = Some(9_400_000);
+        super::plan_for(
+            &d,
+            Some(&avplayer()),
+            quality,
+            share,
+            wan,
+            picked(1, None),
+            Bitmap::Preferred(BitmapPreference::Text),
+            &dev_encoders(),
+            &Ocr::disabled(),
+        )
+    }
+
+    fn copies_video(plan: &PlaybackPlan) -> bool {
+        match plan {
+            PlaybackPlan::Direct { .. } => true,
+            PlaybackPlan::Converted { video, .. } => {
+                matches!(video, Some(ConvertedVideo::Copy { .. }))
+            }
+            _ => false,
+        }
+    }
+
+    /// Off the LAN in Auto, a copy fits its peak (half again over the
+    /// average) under the cap: 9.4 Mbit/s peaks near 14.1, over a share of
+    /// 10 and under one of 15 (PX-46, the cellular play that never
+    /// started).
+    #[test]
+    fn off_the_lan_a_copy_fits_its_peak_under_the_cap() {
+        let unmeasured = Quality::Auto { link_bitrate: None };
+        assert!(!copies_video(&sniper(unmeasured, Some(10_000_000), true)));
+        assert!(copies_video(&sniper(unmeasured, Some(15_000_000), true)));
+        // A measured link of 18 Mbit/s is a 13.5 Mbit/s cap (LINK_SHARE):
+        // under the peak, though over the average.
+        assert!(!copies_video(&sniper(auto(18_000_000), None, true)));
+    }
+
+    /// Off the LAN, a copy that fits is the top of a ladder (PX-21's remux
+    /// ladder): the copy, then encodes from half its rate down, each with
+    /// a video of its own; the player starts on the lowest, as nothing was
+    /// measured, and climbs. One that does not fit is a ladder of encodes
+    /// as before, its top under the share.
+    #[test]
+    fn off_the_lan_a_copy_is_the_top_of_a_ladder() {
+        let unmeasured = Quality::Auto { link_bitrate: None };
+        let plan = sniper(unmeasured, Some(15_000_000), true);
+        assert!(copies_video(&plan), "{plan:?}");
+        let rungs = ladder_of(&plan);
+        assert!(rungs.len() >= 2 && rungs.len() <= MAX_RUNGS, "{rungs:?}");
+        // The copy: the source's height, its video's average, no video of
+        // its own (the plan's, copied).
+        assert_eq!(rungs[0].video, None);
+        assert_eq!(rungs[0].height, 1080);
+        let copy_bits = 9_400_000 - 640_000;
+        assert_eq!(rungs[0].max_bitrate, copy_bits);
+        for r in &rungs[1..] {
+            let Some(ConvertedVideo::Encode {
+                height,
+                max_bitrate: Some(cap),
+                ..
+            }) = r.video
+            else {
+                panic!("a lower rung is an encode: {r:?}");
+            };
+            assert_eq!((height, cap), (r.height, r.max_bitrate));
+            assert!(cap <= copy_bits / 2, "{r:?}");
+        }
+        assert_eq!(start_rung(&plan, unmeasured), rungs.len() as u32 - 1);
+        // A link whose share takes the copy's peak starts on the copy; one
+        // that takes only its average does not.
+        let peak = crate::encode::hls::copy_peak(copy_bits);
+        let link = |share: u64| (share as f64 / LINK_SHARE) as u64 + 1;
+        assert_eq!(start_rung(&plan, auto(link(peak))), 0);
+        assert_ne!(start_rung(&plan, auto(link(copy_bits))), 0);
+
+        // Not fitting: encodes only, as before.
+        let plan = sniper(unmeasured, Some(10_000_000), true);
+        assert!(!copies_video(&plan));
+        let rungs = ladder_of(&plan);
+        // A ladder still, not one encode with nowhere lower to go (the
+        // remux ladder's first cut left an encode off the LAN rungless).
+        assert!(rungs.len() >= 2, "{plan:?}");
+        assert!(rungs.iter().all(|r| r.video.is_none()), "{rungs:?}");
+        assert!(rungs[0].max_bitrate <= 10_000_000 - 640_000, "{rungs:?}");
+    }
+
+    /// On the LAN a copy plays alone: it fits, and nothing is gained.
+    #[test]
+    fn on_the_lan_a_copy_has_no_ladder() {
+        let plan = sniper(Quality::Auto { link_bitrate: None }, None, false);
+        assert!(copies_video(&plan));
+        assert!(ladder_of(&plan).is_empty(), "{plan:?}");
+        // Nor does a quality the viewer chose, off the LAN.
+        let chosen = sniper(
+            Quality::Bitrate {
+                max_bitrate: 20_000_000,
+            },
+            Some(20_000_000),
+            true,
+        );
+        assert!(ladder_of(&chosen).is_empty(), "{chosen:?}");
+    }
+
+    /// On the LAN, and for a quality the viewer chose, the average is
+    /// still what has to fit.
+    #[test]
+    fn on_the_lan_or_chosen_the_average_fits() {
+        assert!(copies_video(&sniper(auto(18_000_000), None, false)));
+        assert!(copies_video(&sniper(
+            Quality::Auto { link_bitrate: None },
+            None,
+            false
+        )));
+        assert!(copies_video(&sniper(
+            Quality::Bitrate {
+                max_bitrate: 10_000_000
+            },
+            Some(10_000_000),
+            true
+        )));
+        assert!(!copies_video(&sniper(
+            Quality::Bitrate {
+                max_bitrate: 9_000_000
+            },
+            None,
+            true
+        )));
+    }
+
     fn plan_for_quality(caps: &ClientCapabilities, quality: Quality) -> PlaybackPlan {
+        plan_for_share(caps, quality, None)
+    }
+
+    fn plan_for_share(
+        caps: &ClientCapabilities,
+        quality: Quality,
+        share: Option<u64>,
+    ) -> PlaybackPlan {
         super::plan_for(
             &hevc_dts(),
             Some(caps),
             quality,
+            share,
+            share.is_some(),
             picked(1, None),
             Bitmap::Preferred(BitmapPreference::Text),
             &dev_encoders(),
@@ -1626,7 +1932,7 @@ mod tests {
         // The codec and tone map are a single encode's of this plan.
         let single = plan_with(
             &hevc_dts(),
-            Some(&with_quality(&avplayer(), on_link(5_000_000))),
+            Some(&with_quality(&avplayer(), on_link(5_000_000), None)),
             picked(1, None),
             &dev_encoders(),
         );
@@ -1679,6 +1985,53 @@ mod tests {
         assert!(ladder_of(&plan).is_empty());
     }
 
+    /// PX-46: Auto off the LAN with nothing measured, a 40 Mbit/s film
+    /// and a 5 Mbit/s share: converted under the share, not copied.
+    #[test]
+    fn auto_off_the_lan_is_held_to_its_share() {
+        let unmeasured = Quality::Auto { link_bitrate: None };
+        let plan = plan_for_share(&avplayer(), unmeasured, Some(5_000_000));
+        let (_, _, video, _, _, _) = converted(plan.clone());
+        assert!(matches!(video, ConvertedVideo::Encode { .. }), "{video:?}");
+        for rung in ladder_of(&plan) {
+            assert!(rung.max_bitrate <= 5_000_000, "{rung:?}");
+        }
+        // Without a share, as before: the film's own rate.
+        let open = plan_for_share(&avplayer(), unmeasured, None);
+        let (_, _, video, _, _, _) = converted(open);
+        assert!(matches!(video, ConvertedVideo::Copy { .. }), "{video:?}");
+    }
+
+    /// A measured link under the share is the cap; a share under the link
+    /// is.
+    #[test]
+    fn auto_takes_the_lower_of_its_link_and_its_share() {
+        assert_eq!(
+            with_quality(&avplayer(), auto(4_000_000), Some(20_000_000)).max_bitrate,
+            Some((4_000_000_f64 * LINK_SHARE) as u64)
+        );
+        assert_eq!(
+            with_quality(&avplayer(), auto(100_000_000), Some(5_000_000)).max_bitrate,
+            Some(5_000_000)
+        );
+    }
+
+    /// A quality the viewer chose is theirs: the share does not touch it.
+    #[test]
+    fn a_chosen_quality_ignores_the_share() {
+        assert_eq!(
+            with_quality(&avplayer(), Quality::Original, Some(1_000_000)),
+            with_quality(&avplayer(), Quality::Original, None)
+        );
+        let chosen = Quality::Bitrate {
+            max_bitrate: 8_000_000,
+        };
+        assert_eq!(
+            with_quality(&avplayer(), chosen, Some(1_000_000)).max_bitrate,
+            Some(8_000_000)
+        );
+    }
+
     /// A chosen bitrate is one encode, as P6-06 plans it.
     #[test]
     fn a_chosen_bitrate_over_hls_is_one_encode() {
@@ -1691,7 +2044,7 @@ mod tests {
             plan,
             plan_with(
                 &hevc_dts(),
-                Some(&with_quality(&avplayer(), quality)),
+                Some(&with_quality(&avplayer(), quality, None)),
                 picked(1, None),
                 &dev_encoders()
             )
@@ -1785,7 +2138,7 @@ mod tests {
     fn a_link_lowers_the_cap_to_its_share() {
         let caps = avplayer();
         assert_eq!(
-            with_quality(&caps, auto(20_000_000)).max_bitrate,
+            with_quality(&caps, auto(20_000_000), None).max_bitrate,
             Some(15_000_000)
         );
     }
@@ -1795,7 +2148,7 @@ mod tests {
         let mut caps = avplayer();
         caps.max_bitrate = Some(8_000_000);
         assert_eq!(
-            with_quality(&caps, auto(100_000_000)).max_bitrate,
+            with_quality(&caps, auto(100_000_000), None).max_bitrate,
             Some(8_000_000)
         );
     }
@@ -1803,7 +2156,7 @@ mod tests {
     #[test]
     fn no_measurement_leaves_the_caps_as_they_are() {
         let caps = avplayer();
-        assert_eq!(with_quality(&caps, Quality::default()), caps);
+        assert_eq!(with_quality(&caps, Quality::default(), None), caps);
     }
 
     #[test]
@@ -1812,7 +2165,10 @@ mod tests {
         let quality = Quality::Bitrate {
             max_bitrate: 4_000_000,
         };
-        assert_eq!(with_quality(&caps, quality).max_bitrate, Some(4_000_000));
+        assert_eq!(
+            with_quality(&caps, quality, None).max_bitrate,
+            Some(4_000_000)
+        );
     }
 
     #[test]
@@ -1822,14 +2178,17 @@ mod tests {
         let quality = Quality::Bitrate {
             max_bitrate: 20_000_000,
         };
-        assert_eq!(with_quality(&caps, quality).max_bitrate, Some(8_000_000));
+        assert_eq!(
+            with_quality(&caps, quality, None).max_bitrate,
+            Some(8_000_000)
+        );
     }
 
     #[test]
     fn original_quality_leaves_the_caps_as_they_are() {
         let mut caps = avplayer();
         caps.max_bitrate = Some(8_000_000);
-        assert_eq!(with_quality(&caps, Quality::Original), caps);
+        assert_eq!(with_quality(&caps, Quality::Original, None), caps);
     }
 
     #[test]
@@ -1976,6 +2335,49 @@ mod tests {
         assert_eq!(
             encoded(&caps, &hevc_dts(), &encoders),
             (VideoCodec::Av1, true)
+        );
+    }
+
+    /// A start's display (PGPU-06) is planned for over Hello's: a TV that
+    /// said HDR10 at Hello but is in an SDR mode now gets a tone map.
+    #[test]
+    fn a_display_without_hdr_tone_maps_over_hello_s_hdr() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let sdr_now = DisplayCapabilities {
+            bit_depth: None,
+            hdr: Some(BTreeSet::new()),
+        };
+        assert_eq!(
+            encoded(
+                &hdr_tv().with_display(Some(&sdr_now)),
+                &hevc_dts(),
+                &encoders
+            ),
+            (VideoCodec::Av1, true)
+        );
+    }
+
+    /// And one that said no HDR at Hello, in an HDR10 mode now, keeps it.
+    #[test]
+    fn a_display_with_hdr_keeps_it_over_hello_s_sdr() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let mut sdr_at_hello = hdr_tv();
+        sdr_at_hello.max_video.as_mut().unwrap().hdr = Some(BTreeSet::new());
+        let hdr_now = DisplayCapabilities {
+            bit_depth: Some(10),
+            hdr: Some([HdrFormat::Hdr10].into()),
+        };
+        assert_eq!(
+            encoded(&sdr_at_hello, &hevc_dts(), &encoders),
+            (VideoCodec::Av1, true)
+        );
+        assert_eq!(
+            encoded(
+                &sdr_at_hello.with_display(Some(&hdr_now)),
+                &hevc_dts(),
+                &encoders
+            ),
+            (VideoCodec::Av1, false)
         );
     }
 

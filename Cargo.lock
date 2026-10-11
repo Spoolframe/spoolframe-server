@@ -6732,6 +6732,7 @@ dependencies = [
  "jsonrpsee",
  "libc",
  "m3u8-rs",
+ "noq-proto",
  "openidconnect",
  "opentelemetry",
  "opentelemetry-appender-tracing",

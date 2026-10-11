@@ -99,6 +99,7 @@ pub(super) async fn converted(
         id: id.clone(),
         selection: plain(),
         bitmap: BitmapSubtitles::Auto,
+        display: None,
     };
     match probe.request(&conn, Some(&a.session), asked).await? {
         Response::Ok(Reply::PlaybackPlan { plan, .. }) => {
@@ -132,6 +133,7 @@ pub(super) async fn converted(
         start_ms: None,
         bitmap: BitmapSubtitles::Auto,
         quality: Default::default(),
+        display: None,
     };
     let handle = match probe.request(&conn, Some(&a.session), start).await? {
         Response::Ok(Reply::PlaybackStarted { handle, plan, .. }) => {

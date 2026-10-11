@@ -8,7 +8,7 @@ use crate::TrackPreferencesInfo;
 use crate::codec::{self, CodecError, MAX_FRAME};
 use crate::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
-    SubtitleAction, TrackReason,
+    Quality, SubtitleAction, TrackReason,
 };
 use crate::{
     AuthMethod, ConfirmPassword, Error, Event, Hello, LoginPassword, PROTOCOL_VERSION, PinProof,
@@ -228,6 +228,7 @@ fn every_request_round_trips() {
             start_ms: Some(1_800_000),
             bitmap: BitmapSubtitles::Text,
             quality: Default::default(),
+            display: None,
         },
         Request::StartPlayback {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
@@ -235,6 +236,7 @@ fn every_request_round_trips() {
             start_ms: None,
             bitmap: BitmapSubtitles::Auto,
             quality: Default::default(),
+            display: None,
         },
         Request::StopPlayback {
             handle: crate::PlaybackHandle("h".into()),
@@ -264,6 +266,7 @@ fn every_request_round_trips() {
             subtitle: Some(2),
             bitmap: BitmapSubtitles::BurnIn,
             position_ms: 61_000,
+            display: None,
         },
         Request::ReadSubtitleSegment {
             handle: crate::PlaybackHandle("h".into()),
@@ -332,6 +335,7 @@ fn every_request_round_trips() {
                 subtitle: None,
             }),
             bitmap: BitmapSubtitles::BurnIn,
+            display: None,
         },
     ] {
         round_trip(RequestEnvelope {
@@ -708,6 +712,28 @@ fn plan_parts_from_a_newer_peer_decode_as_unknown() {
     assert_eq!(video, ConvertedVideo::Unknown);
     let delivery: Delivery = wire(serde_json::json!("dash"));
     assert_eq!(delivery, Delivery::Unknown);
+}
+
+/// A rung from a server before the remux ladder (PX-21) has no `video`:
+/// the plan's, as before. A remux ladder's lower rung names its own.
+#[test]
+fn a_rung_without_a_video_is_the_plan_s() {
+    fn wire<T: DeserializeOwned>(value: serde_json::Value) -> T {
+        codec::decode(&codec::encode(&value).unwrap()).unwrap()
+    }
+    let rung: crate::playback::Rung =
+        wire(serde_json::json!({"height": 720, "max_bitrate": 3_000_000}));
+    assert_eq!(rung.video, None);
+    round_trip(crate::playback::Rung {
+        height: 720,
+        max_bitrate: 3_000_000,
+        video: Some(ConvertedVideo::Encode {
+            codec: spoolframe_types::VideoCodec::H264,
+            height: 720,
+            max_bitrate: Some(3_000_000),
+            tone_map: false,
+        }),
+    });
 }
 
 #[test]
@@ -1385,6 +1411,71 @@ fn an_older_client_s_start_playback_does_not_decode() {
     assert!(error.to_string().contains("missing field"), "{error}");
 }
 
+/// A revision 14 client from before the display field (build 32) sends
+/// `StartPlayback` without `display`: read as `None`, Hello's capabilities
+/// (PGPU-06), not refused.
+#[test]
+fn a_start_playback_without_a_display_decodes_as_none() {
+    #[derive(Serialize)]
+    struct Start {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        id: &'static str,
+        selection: Option<Selection>,
+        start_ms: Option<u64>,
+        bitmap: BitmapSubtitles,
+        quality: Quality,
+    }
+    #[derive(Serialize)]
+    struct Envelope {
+        session: Option<SessionId>,
+        request: Start,
+    }
+    let bytes = codec::encode(&Envelope {
+        session: None,
+        request: Start {
+            kind: "start_playback",
+            id: "plex:movie:1",
+            selection: None,
+            start_ms: None,
+            bitmap: BitmapSubtitles::Auto,
+            quality: Quality::Original,
+        },
+    })
+    .unwrap();
+    let envelope = codec::decode::<RequestEnvelope>(&bytes).unwrap();
+    assert!(
+        matches!(
+            envelope.request,
+            Request::StartPlayback { display: None, .. }
+        ),
+        "{:?}",
+        envelope.request
+    );
+}
+
+/// One that sends a display has it read back.
+#[test]
+fn a_start_playback_s_display_round_trips() {
+    let display = spoolframe_types::DisplayCapabilities {
+        bit_depth: Some(10),
+        hdr: Some([spoolframe_types::HdrFormat::Hdr10].into()),
+    };
+    let request = Request::StartPlayback {
+        id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
+        selection: None,
+        start_ms: None,
+        bitmap: BitmapSubtitles::Auto,
+        quality: Quality::Original,
+        display: Some(display.clone()),
+    };
+    let decoded: Request = codec::decode(&codec::encode(&request).unwrap()).unwrap();
+    assert!(
+        matches!(&decoded, Request::StartPlayback { display: Some(d), .. } if *d == display),
+        "{decoded:?}"
+    );
+}
+
 #[test]
 fn a_bitmap_mode_from_a_newer_client_is_unknown() {
     let mode: BitmapSubtitles = codec::decode(&codec::encode(&"draw_in_3d").unwrap()).unwrap();
@@ -1669,6 +1760,7 @@ fn a_request_missing_a_field_is_refused() {
             id: movie_id(),
             selection: None,
             bitmap: BitmapSubtitles::Auto,
+            display: None,
         },
         &["selection", "bitmap"],
     );
@@ -1679,6 +1771,7 @@ fn a_request_missing_a_field_is_refused() {
             start_ms: None,
             bitmap: BitmapSubtitles::Auto,
             quality: Default::default(),
+            display: None,
         },
         &["selection", "start_ms", "bitmap"],
     );
@@ -1695,6 +1788,7 @@ fn a_request_missing_a_field_is_refused() {
             subtitle: None,
             bitmap: BitmapSubtitles::Auto,
             position_ms: 0,
+            display: None,
         },
         &["bitmap"],
     );

@@ -104,6 +104,7 @@ async fn playing(
                 start_ms: None,
                 bitmap: Default::default(),
                 quality: Default::default(),
+                display: None,
             },
         )
         .await;
@@ -535,6 +536,7 @@ async fn plan_for_gives_what_playback_plan_gives_that_device() {
                     id: movie().id().clone(),
                     selection: Some(selection),
                     bitmap,
+                    display: None,
                 },
             )
             .await;

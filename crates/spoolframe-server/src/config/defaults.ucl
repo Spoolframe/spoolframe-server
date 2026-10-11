@@ -114,6 +114,11 @@ network {
   # record is public: it holds the relays and public addresses only,
   # never a LAN one.
   pkarr = "off";
+  # How the server paces what it sends: "cubic" (the default) backs off on
+  # every lost packet; "bbr" paces by the speed it measures, and keeps it
+  # on a lossy link such as cellular. One choice for every connection,
+  # home ones too. Applies after a restart.
+  congestion_control = "cubic";
   # Announce the server on the LAN over mDNS, so clients find it.
   mdns = true;
   # The UDP port the setup wizard's search for Plex servers on the LAN
@@ -194,6 +199,28 @@ network {
   #     lookup_via = "wtfismyip";
   #   }
   # }
+  # Address ranges whose devices are on the LAN besides this host's own
+  # subnets: a device in one of the host's subnets (a global IPv6
+  # address in the home's /64 too), or at a private, link-local or
+  # unique local address, already is. A WireGuard network, another VLAN:
+  # ["10.10.0.0/24", "2001:db8:1::/64"]. A playback on the LAN plays the
+  # original under Auto and is not counted against the uplink budget.
+  lan_prefixes = [];
+  # What the home's upload carries for playbacks off the LAN. Applies at
+  # once.
+  uplink {
+    # What they may take together, in Mbit/s; 0 is no limit. The web UI
+    # can measure the upload and offer 80% of it. Split equally between
+    # the playbacks off the LAN, and a playback in Auto quality takes at
+    # most its part.
+    budget_mbps = 0;
+    # The most playbacks off the LAN at once; 0 is no limit. One more is
+    # refused, and the app says why.
+    max_streams = 0;
+    # While an admin plays off the LAN beside anyone else, the admins'
+    # playbacks share this part of the budget and the others the rest.
+    owner_share_percent = 50;
+  }
 }
 
 # The admin API (JSON-RPC over WebSocket) and the web UI.

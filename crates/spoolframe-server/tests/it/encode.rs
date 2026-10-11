@@ -54,6 +54,7 @@ async fn start(client: &TestClient, session: &SessionId, start_ms: Option<u64>) 
                 start_ms,
                 bitmap: Default::default(),
                 quality: Default::default(),
+                display: None,
             },
         )
         .await
@@ -1969,6 +1970,7 @@ async fn an_hls_playback_carries_its_subtitle_as_a_webvtt_rendition() {
                 start_ms: None,
                 bitmap: Default::default(),
                 quality: Default::default(),
+                display: None,
             },
         )
         .await;
@@ -2046,6 +2048,7 @@ async fn an_hls_playback_reads_a_vobsub_or_dvb_track_into_its_webvtt_rendition()
                     start_ms: None,
                     bitmap: Default::default(),
                     quality: Default::default(),
+                    display: None,
                 },
             )
             .await;
@@ -2100,6 +2103,7 @@ async fn change(
                 subtitle,
                 bitmap: Default::default(),
                 position_ms,
+                display: None,
             },
         )
         .await;
@@ -2284,6 +2288,7 @@ async fn a_burned_in_subtitle_shows_in_the_picture_where_it_was_placed() {
                 start_ms: None,
                 bitmap: BitmapSubtitles::BurnIn,
                 quality: Default::default(),
+                display: None,
             },
         )
         .await;
@@ -2346,6 +2351,7 @@ async fn burned_sidecar(
                 start_ms,
                 bitmap: BitmapSubtitles::BurnIn,
                 quality: Default::default(),
+                display: None,
             },
         )
         .await;
@@ -2455,6 +2461,7 @@ async fn a_copied_pgs_file_beside_the_film_keeps_its_cues_times() {
                 start_ms: None,
                 bitmap: Default::default(),
                 quality: Default::default(),
+                display: None,
             },
         )
         .await;
@@ -2521,6 +2528,7 @@ async fn a_copied_vobsub_file_beside_the_film_is_in_the_output() {
                 start_ms: None,
                 bitmap: Default::default(),
                 quality: Default::default(),
+                display: None,
             },
         )
         .await;
@@ -2674,6 +2682,7 @@ async fn start_for(
                 start_ms: None,
                 bitmap: Default::default(),
                 quality,
+                display: None,
             },
         )
         .await;
@@ -2703,6 +2712,7 @@ async fn change_quality(
                 quality,
                 bitmap: Default::default(),
                 position_ms: 4_000,
+                display: None,
             },
         )
         .await;

@@ -19,8 +19,8 @@ use crate::logic::ApiError;
 use crate::logs::hours_minutes;
 use crate::playback::{
     ReadsChart, at, converted_percent, decoder_text, delivery, encoder_text, ended_text,
-    filter_text, furthest, made_line, out_text, output_text, plan_pill, reads_chart, start_parts,
-    stream_name, tone_mapper_text, why_line,
+    filter_text, furthest, link_parts, made_line, out_text, output_text, plan_pill, reads_chart,
+    start_parts, stream_name, tone_mapper_text, why_line,
 };
 
 /// How often the pages ask: reads move by the second.
@@ -395,6 +395,9 @@ fn Page(detail: Detail, now: i64, asking: Signal<Option<Ask>>) -> Element {
         Stats { row: row.clone(), now }
         Made { row: row.clone() }
         Start { row: row.clone() }
+        if let Some(link) = row.link.clone() {
+            LinkCard { link }
+        }
         PlanCard { plan: detail.plan.clone(), title: "Plan" }
         div { class: "pb-two",
             Reads { detail: detail.clone() }
@@ -497,6 +500,25 @@ fn Start(row: PlaybackRow) -> Element {
             div { class: "card-body",
                 div { class: "pb-stats",
                     for (label, value, note) in start_parts(&row.start) {
+                        Stat { key: "{label}", label: label.to_owned(), value, note, tone: String::new() }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Its device's link, from the server's "link" readings every 10 s: why a
+/// playback off the LAN stalls (a slow or lossy link, a relay, a path
+/// that will not hold still).
+#[component]
+fn LinkCard(link: spoolframe_admin_api::PlaybackLink) -> Element {
+    rsx! {
+        section { class: "card",
+            div { class: "card-head", h2 { "Link" } }
+            div { class: "card-body",
+                div { class: "pb-stats",
+                    for (label, value, note) in link_parts(&link) {
                         Stat { key: "{label}", label: label.to_owned(), value, note, tone: String::new() }
                     }
                 }

@@ -152,6 +152,15 @@
       ${lib.optionalString (cfg.pkarr != "off") "pkarr = ${quote cfg.pkarr};"}
       ${lib.optionalString (cfg.ownRelays != []) "own_relays = ${quote cfg.ownRelays};"}
       ${lib.optionalString (cfg.wan != null) wanConfig}
+      ${lib.optionalString (cfg.lanPrefixes != []) "lan_prefixes = ${quote cfg.lanPrefixes};"}
+      ${lib.optionalString (cfg.congestionControl != null) "congestion_control = ${quote cfg.congestionControl};"}
+      ${lib.optionalString (cfg.uplink.budgetMbps != null || cfg.uplink.maxStreams != null || cfg.uplink.ownerSharePercent != null) ''
+      uplink {
+        ${lib.optionalString (cfg.uplink.budgetMbps != null) "budget_mbps = ${toString cfg.uplink.budgetMbps};"}
+        ${lib.optionalString (cfg.uplink.maxStreams != null) "max_streams = ${toString cfg.uplink.maxStreams};"}
+        ${lib.optionalString (cfg.uplink.ownerSharePercent != null) "owner_share_percent = ${toString cfg.uplink.ownerSharePercent};"}
+      }
+      ''}
     }
     admin {
       ${lib.optionalString (cfg.admin.listen != null) "listen = ${quote cfg.admin.listen};"}
@@ -332,6 +341,63 @@ in {
         server tells who its devices are, so they let them through
         (`network.own_relays`, P6-04).
       '';
+    };
+
+    lanPrefixes = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [];
+      example = ["10.10.0.0/24"];
+      description = ''
+        Address ranges whose devices count as home besides the host's own
+        networks (`network.lan_prefixes`, PX-46): a WireGuard network,
+        another VLAN. A device at home is not counted against the uplink
+        budget, and Auto plays the original for it.
+      '';
+    };
+
+    congestionControl = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["cubic" "bbr"]);
+      default = null;
+      example = "bbr";
+      description = ''
+        How the server paces what it sends (`network.congestion_control`):
+        "cubic" backs off on every lost packet; "bbr" paces by the speed it
+        measures and keeps it on a lossy link such as cellular. One choice
+        for every connection. Null leaves it to the web UI (cubic until set
+        there). Applies after a restart.
+      '';
+    };
+
+    uplink = {
+      budgetMbps = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.unsigned;
+        default = null;
+        example = 20;
+        description = ''
+          What playbacks outside the home may take of its upload
+          together, in Mbit/s (`network.uplink.budget_mbps`, PX-46); 0 is
+          no limit. Null leaves it to Settings › Remote access, which can
+          measure the upload (no limit until set there).
+        '';
+      };
+      maxStreams = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.unsigned;
+        default = null;
+        description = ''
+          The most playbacks outside the home at once
+          (`network.uplink.max_streams`); 0 is no limit. Null leaves it
+          to the web UI.
+        '';
+      };
+      ownerSharePercent = lib.mkOption {
+        type = lib.types.nullOr (lib.types.ints.between 0 100);
+        default = null;
+        description = ''
+          The admins' part of the budget while one of them plays outside
+          the home beside guests (`network.uplink.owner_share_percent`).
+          Null leaves it to the web UI (50 until set there).
+        '';
+      };
     };
 
     plexDiscovery = {

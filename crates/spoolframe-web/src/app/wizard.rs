@@ -91,7 +91,7 @@ fn typed(text: &str) -> Option<Value> {
 }
 
 /// A typed whole number; `Err` says which field is wrong.
-fn number(label: &str, text: &str) -> Result<Option<Value>, String> {
+pub(super) fn number(label: &str, text: &str) -> Result<Option<Value>, String> {
     let text = text.trim();
     if text.is_empty() {
         return Ok(None);
@@ -2162,7 +2162,7 @@ fn PlaybackFields(
 
 /// A number with its unit beside it.
 #[component]
-fn Limit(label: String, value: Signal<String>, unit: String, disabled: bool) -> Element {
+pub(super) fn Limit(label: String, value: Signal<String>, unit: String, disabled: bool) -> Element {
     let mut value = value;
     rsx! {
         label { class: "field",

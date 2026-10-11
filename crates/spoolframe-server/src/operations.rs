@@ -430,6 +430,7 @@ mod tests {
             subtitle: None,
             bitmap: Default::default(),
             position_ms: 0,
+            display: None,
         })
     }
 

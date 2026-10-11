@@ -193,6 +193,14 @@ impl Segments {
     }
 }
 
+/// The most a copied stream averaging `average` bit/s carries over a
+/// segment: half again over it, as variable rates run. What a variant
+/// declares as its `BANDWIDTH`, and what a copy off the LAN must fit
+/// under its cap (PX-46).
+pub(crate) fn copy_peak(average: u64) -> u64 {
+    average.saturating_mul(3) / 2
+}
+
 /// What a variant declares, in bit/s: `BANDWIDTH`, the peak, is what
 /// AVPlayer holds every segment to, and it refuses one over it
 /// (CoreMediaErrorDomain -12318); `AVERAGE-BANDWIDTH` is the mean. The
@@ -209,7 +217,7 @@ impl Rate {
     /// segment up to half again over it, as variable rates run.
     fn varying(average: u64) -> Self {
         Self {
-            peak: average.saturating_mul(3) / 2,
+            peak: copy_peak(average),
             average,
         }
     }
@@ -884,6 +892,37 @@ mod tests {
                 ("v1/media.m3u8", Some(1080), Some(5_000_000)),
             ]
         );
+    }
+
+    /// A remux ladder (PX-21): the copy, at the source's size, codec and
+    /// rate (its peak in BANDWIDTH, as for one copied variant), beside the
+    /// encodes under it at theirs.
+    #[test]
+    fn a_remux_ladder_lists_the_copy_with_the_source_s_codec_and_rate() {
+        let copy = ConvertedVideo::Copy {
+            codec: VideoCodec::Hevc,
+            dolby_vision: false,
+        };
+        let encode = ConvertedVideo::Encode {
+            codec: VideoCodec::Hevc,
+            height: 720,
+            max_bitrate: Some(4_000_000),
+            tone_map: false,
+        };
+        let film = film("smpte2084");
+        let text = ladder_playlist(&film, &[(1, encode), (0, copy)], None, None);
+        let Ok(m3u8_rs::Playlist::MasterPlaylist(p)) = m3u8_rs::parse_playlist_res(text.as_bytes())
+        else {
+            panic!("not a multivariant playlist: {text}");
+        };
+        let alone = multivariant_playlist(&film, Some(copy), None, None);
+        let (peak, average) = bandwidths(&alone);
+        let top = &p.variants[1];
+        assert_eq!(top.uri, "v0/media.m3u8");
+        assert_eq!(top.resolution.map(|r| r.height), Some(1600));
+        assert_eq!((top.bandwidth, top.average_bandwidth), (peak, average));
+        assert_eq!(p.variants[0].resolution.map(|r| r.height), Some(720));
+        assert!(text.contains("#EXT-X-INDEPENDENT-SEGMENTS"), "{text}");
     }
 
     /// A capped encode's segments can run over its cap by what the

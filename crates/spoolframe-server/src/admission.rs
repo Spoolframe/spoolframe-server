@@ -91,8 +91,13 @@ impl Default for Admission {
 /// The endpoint's transport config: a stranger's limits, which a known
 /// device's connection raises ([`Peer`]). The server never accepts a
 /// unidirectional stream (events go the other way), so none may be opened.
-pub fn transport_config() -> QuicTransportConfig {
+/// Each path's congestion controller comes from `congestion`
+/// (`network.congestion_control`).
+pub fn transport_config(
+    congestion: std::sync::Arc<dyn iroh::endpoint::ControllerFactory + Send + Sync + 'static>,
+) -> QuicTransportConfig {
     QuicTransportConfig::builder()
+        .congestion_controller_factory(congestion)
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         .max_concurrent_bidi_streams(VarInt::from_u32(STRANGER_BI_STREAMS))
         .stream_receive_window(VarInt::from_u32(STREAM_WINDOW))

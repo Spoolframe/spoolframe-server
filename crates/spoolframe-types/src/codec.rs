@@ -168,11 +168,43 @@ pub struct ClientCapabilities {
     /// `None`: it does not say, and every codec it plays counts. Unlike
     /// the fields above it may be left out (a revision 14 client does not
     /// send it), and is `None` then.
+    // compat(v1): required at the protocol reset
     #[serde(default)]
     pub hardware_video: Option<BTreeSet<VideoCodec>>,
 }
 
+/// What the screen shows now, as a playback starts: [`VideoLimits::hdr`]
+/// and [`VideoLimits::bit_depth`] for that playback only, over what the
+/// client said at Hello. A TV's display mode changes while the app runs
+/// (Match Dynamic Range, another TV or receiver, HDR turned off), and
+/// capabilities from Hello would send HDR to an SDR mode or tone map for
+/// an HDR one.
+///
+/// Both fields are required, as in [`VideoLimits`]: `None` is no limit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayCapabilities {
+    /// As [`VideoLimits::bit_depth`].
+    #[serde(deserialize_with = "crate::required::option")]
+    pub bit_depth: Option<u32>,
+    /// As [`VideoLimits::hdr`].
+    #[serde(deserialize_with = "crate::required::option")]
+    pub hdr: Option<BTreeSet<HdrFormat>>,
+}
+
 impl ClientCapabilities {
+    /// These capabilities with `display`'s HDR formats and bit depth in
+    /// place of [`ClientCapabilities::max_video`]'s; unchanged without a
+    /// `display`.
+    pub fn with_display(&self, display: Option<&DisplayCapabilities>) -> ClientCapabilities {
+        let mut caps = self.clone();
+        if let Some(display) = display {
+            let limits = caps.max_video.get_or_insert_with(VideoLimits::default);
+            limits.hdr = display.hdr.clone();
+            limits.bit_depth = display.bit_depth;
+        }
+        caps
+    }
+
     /// Whether it decodes `codec` in hardware, as it says; every codec it
     /// plays when it does not say (PGPU-06).
     pub fn decodes_in_hardware(&self, codec: VideoCodec) -> bool {
@@ -196,6 +228,41 @@ impl ClientCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A start's display replaces Hello's HDR formats and bit depth, and
+    /// nothing else (PGPU-06); none leaves them as they are.
+    #[test]
+    fn a_display_replaces_hdr_and_bit_depth_only() {
+        let hello = ClientCapabilities {
+            video: [VideoCodec::Hevc].into(),
+            max_video: Some(VideoLimits {
+                height: Some(1080),
+                frame_rate: Some(60),
+                bit_depth: Some(10),
+                hdr: Some([HdrFormat::Hdr10, HdrFormat::DolbyVision].into()),
+            }),
+            ..ClientCapabilities::default()
+        };
+        assert_eq!(hello.with_display(None), hello);
+        let sdr = DisplayCapabilities {
+            bit_depth: Some(8),
+            hdr: Some(BTreeSet::new()),
+        };
+        let now = hello.with_display(Some(&sdr));
+        assert_eq!(
+            now.max_video,
+            Some(VideoLimits {
+                height: Some(1080),
+                frame_rate: Some(60),
+                bit_depth: Some(8),
+                hdr: Some(BTreeSet::new()),
+            })
+        );
+        assert_eq!(now.video, hello.video);
+        // A client with no limits at Hello gets the display's.
+        let unlimited = ClientCapabilities::default().with_display(Some(&sdr));
+        assert_eq!(unlimited.max_video.unwrap().hdr, Some(BTreeSet::new()));
+    }
 
     #[test]
     fn codecs_are_snake_case_on_the_wire() {

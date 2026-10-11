@@ -24,8 +24,8 @@ pub mod search;
 mod test_support;
 
 pub use codec::{
-    AudioCodec, ClientCapabilities, Container, Delivery, HdrFormat, SubtitleFormat, VideoCodec,
-    VideoLimits,
+    AudioCodec, ClientCapabilities, Container, Delivery, DisplayCapabilities, HdrFormat,
+    SubtitleFormat, VideoCodec, VideoLimits,
 };
 pub use date::{CalendarDate, DateError};
 pub use id::{ArtworkId, IdError, LibraryId, MediaId, MediaKind, Namespace, PersonId};

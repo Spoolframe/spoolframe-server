@@ -171,6 +171,7 @@ impl Client {
                 server
             }
         };
+        self.look_up_fallback(&server);
         servers::save(storage, &saved).await?;
         self.inner.discovery.changed();
         Ok(self.entry(id, &conn, Some(&server)))
@@ -330,6 +331,11 @@ impl Client {
         // lookup (or a hint learned since) the way to it.
         self.inner.invite_relays.lock().entry(id).or_default();
         if !invite.relays.is_empty() {
+            // Acting on an invite whose link names relays is consent to
+            // them: the server is reached through them for the rest of the
+            // run, whatever the client's relays, and saving it
+            // (`save_invited`) keeps that as its choice.
+            self.inner.relay_policy.choose(id, Some(true));
             let mut invited = self.inner.invite_relays.lock();
             let known = invited.entry(id).or_default();
             *known = newest_first(&invite.relays, known, MAX_HINTS);
@@ -339,12 +345,10 @@ impl Client {
 }
 
 impl Client {
-    /// The link's relays, as this device would reach them with `invite`'s
-    /// token: none with relays off, or for a link without a code.
+    /// The link's relays, as this device reaches them with `invite`'s
+    /// token: none for a link without a code. Whatever the client's
+    /// relays: redeeming the invite is consent to them (see `reach`).
     fn token_relays(&self, invite: &Invite) -> Option<(String, Vec<RelayUrl>)> {
-        if !self.inner.relays {
-            return None;
-        }
         let token = invite_token(invite.code.as_deref()?, self.inner.endpoint.id().as_bytes())?;
         let urls = invite
             .relays
@@ -401,12 +405,20 @@ fn refuse_another_key(
     }
 }
 
-/// `invite`'s hints, joining `server`'s: its addresses as told ones, and
-/// its relays beside those the server told.
+/// `invite`'s hints, joining `server`'s: its addresses as told ones, its
+/// lookup, and its relays beside those the server told (not into a list
+/// the user edited), chosen for it.
 fn hint(server: &mut SavedServer, invite: &Invite, now: u64) {
     server.hinted(invite.addrs.iter().copied(), now);
     if invite.lookup.is_some() {
         server.lookup = invite.lookup.clone();
+    }
+    if invite.relays.is_empty() {
+        return;
+    }
+    server.use_relays = Some(true);
+    if server.relays_edited {
+        return;
     }
     for relay in &invite.relays {
         if !server.relays.contains(relay) {

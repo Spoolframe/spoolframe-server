@@ -32,6 +32,7 @@ async fn start(client: &TestClient, session: &SessionId, selection: Selection) -
                 start_ms: None,
                 bitmap: Default::default(),
                 quality: Default::default(),
+                display: None,
             },
         )
         .await
@@ -658,6 +659,7 @@ async fn a_subtitle_changed_for_another_between_chunks_is_refused() {
                 subtitle: Some(sidecars[1]),
                 bitmap: Default::default(),
                 position_ms: 0,
+                display: None,
             },
         )
         .await;
@@ -793,6 +795,7 @@ async fn mutation_ids_survive_reconnect_and_reject_changed_payloads() {
                 start_ms: None,
                 bitmap: Default::default(),
                 quality: Default::default(),
+                display: None,
             },
         },
         operation: Some(client.operation()),
@@ -873,6 +876,7 @@ async fn two_controls_with_the_same_revision_cannot_both_apply() {
                 subtitle: None,
                 bitmap: Default::default(),
                 position_ms: 0,
+                display: None,
             },
         },
         operation: Some(operation),

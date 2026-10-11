@@ -125,8 +125,10 @@ pub struct Episode {
     /// This and `air_date` were added without a PROTOCOL_VERSION bump,
     /// so they are not `required::option`: a server from before them
     /// leaves the keys out, and that reads as `None`.
+    // compat(v1): required at the protocol reset
     pub year: Option<u16>,
     /// The day it first aired, `"YYYY-MM-DD"`.
+    // compat(v1): required at the protocol reset
     pub air_date: Option<CalendarDate>,
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,

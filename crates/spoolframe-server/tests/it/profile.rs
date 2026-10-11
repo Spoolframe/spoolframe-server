@@ -153,6 +153,7 @@ async fn chosen(client: &TestClient, session: &SessionId, id: &MediaId) -> Chose
         id: id.clone(),
         selection: None,
         bitmap: Default::default(),
+        display: None,
     };
     match client.call(Some(session), request).await {
         Response::Ok(Reply::PlaybackPlan {

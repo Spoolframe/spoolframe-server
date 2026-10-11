@@ -167,6 +167,7 @@ async fn every_other_request_needs_a_session() {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
             selection: Default::default(),
             bitmap: Default::default(),
+            display: None,
         },
     ];
     let made_up = SessionId("made-up".into());

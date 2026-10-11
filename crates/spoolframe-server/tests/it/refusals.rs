@@ -529,6 +529,7 @@ async fn another_session_s_playback_is_logged() {
                 start_ms: None,
                 bitmap: Default::default(),
                 quality: Default::default(),
+                display: None,
             },
         )
         .await

@@ -12,7 +12,9 @@ use wasm_bindgen::JsValue;
 
 use super::admin::sleep;
 use super::profile::{ConfirmItsYou, asks_to_confirm};
-use super::wizard::{ListField, Note, entry, load_settings, loading, locked, save, value};
+use super::wizard::{
+    Limit, ListField, Note, entry, load_settings, loading, locked, number, save, text, value,
+};
 use super::{Alert, Field, icons, rpc};
 use crate::logic::{ApiError, list_setting, string_values};
 use crate::network::{Pkarr, pkarr_form, pkarr_setting, relays_form, relays_list};
@@ -187,6 +189,15 @@ pub fn RemoteAccessForm(on_done: EventHandler<()>) -> Element {
             RemoteFields {
                 key: "{g}",
                 settings: loaded.clone(),
+                on_done,
+                on_reload: move |_| generation += 1,
+            }
+        }
+        for g in [generation()] {
+            UplinkFields {
+                key: "{g}",
+                settings: loaded.clone(),
+                advanced,
                 on_done,
                 on_reload: move |_| generation += 1,
             }
@@ -596,6 +607,164 @@ fn RelayFields(
                 span { class: "wizard-foot-end",
                     button { class: "btn-dialog btn-dialog-grey", disabled: busy(), onclick: move |_| on_reload.call(()), "Discard" }
                     button { class: "btn-dialog btn-dialog-primary", disabled: busy() || (relays_fixed && own_fixed && pkarr_fixed), onclick: move |_| on_save.call(()), "Save" }
+                }
+            }
+        }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
+    }
+}
+
+/// `network.uplink.*` and `network.lan_prefixes` (PX-46): what the
+/// home's upload carries for playbacks outside it, and how they share
+/// it. The ranges that count as home are advanced.
+#[component]
+fn UplinkFields(
+    settings: Settings,
+    advanced: bool,
+    on_done: EventHandler<()>,
+    on_reload: EventHandler<()>,
+) -> Element {
+    const BUDGET: &str = "network.uplink.budget_mbps";
+    const STREAMS: &str = "network.uplink.max_streams";
+    const OWNER: &str = "network.uplink.owner_share_percent";
+    const LAN: &str = "network.lan_prefixes";
+    const CONGESTION: &str = "network.congestion_control";
+    let mut congestion = use_signal(|| {
+        let saved = text(&settings, CONGESTION);
+        if saved.is_empty() {
+            "cubic".to_owned()
+        } else {
+            saved
+        }
+    });
+    let mut budget = use_signal(|| text(&settings, BUDGET));
+    let streams = use_signal(|| text(&settings, STREAMS));
+    let owner = use_signal(|| text(&settings, OWNER));
+    let lan = use_signal(|| listed(&settings, LAN));
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let mut measuring = use_signal(|| false);
+    let mut measured = use_signal(|| None::<spoolframe_admin_api::UplinkMeasurement>);
+    let confirming = use_signal(|| None::<String>);
+    let s = settings.clone();
+    let on_save = use_callback(move |()| {
+        let s = s.clone();
+        let changes = (|| {
+            Ok::<_, String>(vec![
+                (BUDGET, number("The upload budget", &budget())?),
+                (STREAMS, number("The most streams", &streams())?),
+                (OWNER, number("The admins' share", &owner())?),
+                (LAN, list_change(&s, LAN, &lan())),
+                (CONGESTION, Some(serde_json::Value::String(congestion()))),
+            ])
+        })();
+        let changes = match changes {
+            Ok(changes) => changes,
+            Err(e) => {
+                error.set(Some(e));
+                return;
+            }
+        };
+        busy.set(true);
+        spawn(async move {
+            match save(&s, changes).await {
+                Ok(()) => on_done.call(()),
+                Err(e) if asks_to_confirm(&e, confirming, "changing the upload budget") => {}
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+        });
+    });
+    let measure = move |_| {
+        measuring.set(true);
+        error.set(None);
+        spawn(async move {
+            let found = async {
+                let client = rpc::client().await?;
+                client.uplink_measure().await.map_err(rpc::error)
+            };
+            match found.await {
+                Ok(m) => measured.set(Some(m)),
+                Err(e) => error.set(Some(e.explain())),
+            }
+            measuring.set(false);
+        });
+    };
+    let all_fixed = [BUDGET, STREAMS, OWNER, LAN, CONGESTION]
+        .iter()
+        .all(|k| locked(&settings, k));
+    let meaning = crate::uplink::budget_meaning(&budget());
+    rsx! {
+        section { class: "card tele-card",
+            div { class: "wan-part",
+                span { class: "flex flex-col gap-0.5",
+                    b { class: "text-[15px]", "Upload for playback outside your home" }
+                    span { class: "text-[13px] text-ctp-subtext0",
+                        "Devices on your home network are not counted: one in the server’s own network (its IPv6 /64 too) plays the original in Auto quality. Outside, playbacks share the budget below, and the admins’ together keep their share while they watch beside guests."
+                    }
+                }
+            }
+            div { class: "wan-part",
+                Limit { label: "Upload budget", value: budget, unit: "Mbit/s", disabled: locked(&settings, BUDGET) }
+                span { class: "text-[13px] text-ctp-subtext0", "{meaning}" }
+                div { class: "flex flex-wrap items-center gap-2",
+                    button {
+                        class: "btn-dialog btn-dialog-grey",
+                        disabled: measuring() || locked(&settings, BUDGET),
+                        onclick: measure,
+                        if measuring() { "Measuring… (about 30 MB to Cloudflare)" } else { "Measure the upload" }
+                    }
+                    if let Some(m) = measured() {
+                        span { class: "text-[13px]", "{crate::uplink::measured_line(&m)}" }
+                        button {
+                            class: "btn-dialog btn-dialog-primary",
+                            onclick: move |_| budget.set(m.suggested_budget_mbps.to_string()),
+                            "{crate::uplink::use_suggested(&m)}"
+                        }
+                    }
+                }
+                Note { settings: settings.clone(), setting: BUDGET, on_changed: move |_| on_reload.call(()) }
+            }
+            div { class: "wan-part",
+                Limit { label: "Most playbacks outside at once", value: streams, unit: "0 = no limit", disabled: locked(&settings, STREAMS) }
+                Note { settings: settings.clone(), setting: STREAMS, on_changed: move |_| on_reload.call(()) }
+            }
+            div { class: "wan-part",
+                Limit { label: "Admins’ share while guests watch", value: owner, unit: "%", disabled: locked(&settings, OWNER) }
+                Note { settings: settings.clone(), setting: OWNER, on_changed: move |_| on_reload.call(()) }
+            }
+            if advanced {
+                div { class: "wan-part",
+                    span { class: "flex flex-col gap-0.5",
+                        b { class: "text-[15px]", "Also home" }
+                        span { class: "text-[13px] text-ctp-subtext0", "Ranges whose devices count as home besides the server’s own networks: a WireGuard network, another VLAN." }
+                    }
+                    ListField { add: "Add a range", items: lan, placeholder: "10.10.0.0/24", disabled: locked(&settings, LAN) }
+                    Note { settings: settings.clone(), setting: LAN, on_changed: move |_| on_reload.call(()) }
+                }
+                div { class: "wan-part",
+                    span { class: "flex flex-col gap-0.5",
+                        b { class: "text-[15px]", "Congestion control" }
+                        span { class: "text-[13px] text-ctp-subtext0", "How the server paces what it sends. Cubic backs off on every lost packet; BBR paces by the speed it measures, and keeps it on a lossy link such as cellular. It applies to every connection, home ones too, after a restart." }
+                    }
+                    select {
+                        class: "pref-select",
+                        disabled: locked(&settings, CONGESTION),
+                        value: "{congestion}",
+                        onchange: move |e| congestion.set(e.value()),
+                        option { value: "cubic", "Cubic (the default)" }
+                        option { value: "bbr", "BBR" }
+                    }
+                    Note { settings: settings.clone(), setting: CONGESTION, on_changed: move |_| on_reload.call(()) }
+                }
+            }
+            if let Some(text) = error() {
+                Alert { text }
+            }
+            div { class: "wizard-foot",
+                span { class: "wizard-foot-end",
+                    button { class: "btn-dialog btn-dialog-grey", disabled: busy(), onclick: move |_| on_reload.call(()), "Discard" }
+                    button { class: "btn-dialog btn-dialog-primary", disabled: busy() || all_fixed, onclick: move |_| on_save.call(()), "Save" }
                 }
             }
         }

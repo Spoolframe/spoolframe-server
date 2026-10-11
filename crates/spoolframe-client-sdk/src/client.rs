@@ -24,6 +24,7 @@ use crate::discovery::Discovery;
 use crate::error::SdkError;
 use crate::link::{ConnectionPath, Link, SignOutWatch, StateWatch};
 use crate::portable::{Portable, PortableUserId};
+use crate::relay_policy::{RelayFiltered, RelayPolicy};
 use crate::servers::{self, SavedServer, ServerEntry};
 use crate::session::{self, SavedProfile, Session, SignInMethod, StoredSession};
 use crate::storage::{Storage, StorageError, keys};
@@ -115,10 +116,13 @@ pub struct ClientOptions {
     pub lan_discovery: bool,
     /// Reach a server through the relays it told this device of, in an
     /// invite or its addresses (P6-03), when it cannot be dialled
-    /// directly. On by default. Off, the endpoint has no relay transport
-    /// at all: a server is reached only at its addresses, and no relay is
-    /// ever contacted. It is fixed for the life of the [`Client`]: an app
-    /// whose user changes it opens a new one.
+    /// directly. On by default. Off, a server is reached only at its
+    /// addresses and no relay is contacted for it, unless the server has a
+    /// choice of its own ([`Client::set_server_relays`]; redeeming or
+    /// saving an invite whose link names relays chooses them: accepting
+    /// the invite is consent to that server's relays). It is fixed for the
+    /// life of the [`Client`]: an app whose user changes it opens a new
+    /// one.
     pub relays: bool,
 }
 
@@ -152,6 +156,9 @@ pub(crate) struct Inner {
     lookups: Mutex<std::collections::HashSet<String>>,
     /// [`ClientOptions::relays`].
     pub(crate) relays: bool,
+    /// Which servers are reached through relays: their choices, and
+    /// [`ClientOptions::relays`] for the rest.
+    pub(crate) relay_policy: Arc<RelayPolicy>,
     /// Each server's connection and its state.
     links: Mutex<HashMap<EndpointId, Arc<Link>>>,
     /// Serializes read-modify-write of the saved servers and sessions.
@@ -165,6 +172,9 @@ pub(crate) struct Inner {
     pub(crate) pairing: Arc<std::sync::atomic::AtomicBool>,
     /// Refusals on this device, as logged (finding 46).
     pub(crate) refusals: Arc<crate::refusals::Refusals>,
+    /// Playbacks whose share of a server's uplink changed (PX-46), as the
+    /// servers told: each managed playback in Auto follows its own.
+    pub(crate) shares: tokio::sync::broadcast::Sender<spoolframe_protocol::PlaybackHandle>,
 }
 
 impl std::fmt::Debug for Client {
@@ -213,6 +223,7 @@ impl Client {
             lan_discovery,
             relays,
         } = options;
+        let relay_policy = Arc::new(RelayPolicy::new(relays));
         let key = load_or_create_key(storage.as_ref()).await?;
         // Minimal: no pkarr or DNS lookup, so a LAN client never tries the
         // Internet. mDNS only listens: a laptop or a TV must not announce
@@ -238,18 +249,17 @@ impl Client {
                     .expect("15 s is a valid idle timeout"),
             ))
             .build();
-        // With relays on, an empty map: no home relay of its own, and so
+        // An empty map, relays on or off: no home relay of its own, and so
         // no relay contacted at start or ever probed. Iroh reaches any
         // relay a server is dialled through; the server's own list is
-        // where it can be reached.
-        let relay_mode = if relays {
-            RelayMode::Custom(RelayMap::empty())
-        } else {
-            RelayMode::Disabled
-        };
+        // where it can be reached. Whether a server is dialled through
+        // its relays is its own choice or the client's (`RelayPolicy`):
+        // a disabled relay transport would make that choice for every
+        // server, and an invite could not be redeemed through its relays
+        // on a device with them off.
         let endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(key)
-            .relay_mode(relay_mode)
+            .relay_mode(RelayMode::Custom(RelayMap::empty()))
             .transport_config(transport)
             .bind()
             .await
@@ -261,7 +271,7 @@ impl Client {
                 endpoint
                     .address_lookup()
                     .map_err(|e| cannot_bind(e.to_string()))?
-                    .add(mdns.clone());
+                    .add(RelayFiltered::new(mdns.clone(), relay_policy.clone()));
                 Discovery::start(&mdns).await
             }
             None => Discovery::off(),
@@ -277,6 +287,7 @@ impl Client {
                 invite_relays: Mutex::default(),
                 lookups: Mutex::default(),
                 relays,
+                relay_policy,
                 links: Mutex::default(),
                 saving: tokio::sync::Mutex::default(),
                 revisions: Mutex::default(),
@@ -285,12 +296,18 @@ impl Client {
                 portable: Portable::new(storage.clone()),
                 pairing: Arc::default(),
                 refusals: Arc::default(),
+                shares: tokio::sync::broadcast::channel(16).0,
             }),
         };
-        // Where saved servers publish (P6-05): looked up there from the start.
+        // Where saved servers publish (P6-05): looked up there from the
+        // start; and each one's relay choice.
         for server in servers::load(client.inner.storage.as_ref()).await? {
             if let Some(url) = &server.lookup {
                 client.look_up_at(url);
+            }
+            client.look_up_fallback(&server);
+            if let Ok(id) = parse_id(&server.endpoint_id) {
+                client.inner.relay_policy.choose(id, server.use_relays);
             }
         }
         Ok(client)
@@ -338,6 +355,8 @@ impl Client {
                     advertised_at: servers::time(s.advertised_at),
                     advertised_addrs: s.advertised_addrs,
                     relays: s.relays,
+                    relays_edited: s.relays_edited,
+                    use_relays: s.use_relays,
                 }
             })
             .collect();
@@ -359,6 +378,8 @@ impl Client {
                 verified_at: None,
                 last_connected_at: None,
                 server_id: None,
+                use_relays: None,
+                relays_edited: false,
             })
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -475,6 +496,8 @@ impl Client {
                     advertised_addrs: server.advertised_addrs.clone(),
                     relays: server.relays.clone(),
                     advertised_at: servers::time(server.advertised_at),
+                    use_relays: server.use_relays,
+                    relays_edited: server.relays_edited,
                 };
                 servers::save(storage, &saved).await?;
                 self.inner.discovery.changed();
@@ -627,6 +650,8 @@ impl Client {
                 .unwrap_or_default(),
             relays: saved.map(|s| s.relays.clone()).unwrap_or_default(),
             advertised_at: saved.and_then(|s| servers::time(s.advertised_at)),
+            use_relays: saved.and_then(|s| s.use_relays),
+            relays_edited: saved.is_some_and(|s| s.relays_edited),
         }
     }
 
@@ -674,9 +699,84 @@ impl Client {
         let mut saved = servers::load(storage).await?;
         saved.retain(|s| s.endpoint_id != endpoint_id);
         servers::save(storage, &saved).await?;
+        self.inner.relay_policy.choose(id, None);
         storage
             .set_secret(&keys::sessions(endpoint_id), None)
             .await?;
+        self.inner.discovery.changed();
+        Ok(())
+    }
+
+    /// Whether saved server `endpoint_id` is reached through relays: `Some`
+    /// whatever [`ClientOptions::relays`] says, `None` as it says. Saved
+    /// with the server, and used from the next connection: an open one is
+    /// closed, and the next request dials again. [`SdkError::NotPinned`]
+    /// for a server not saved.
+    ///
+    /// Off, the server is dialled at its addresses only, and an address
+    /// lookup's record of it loses its relays. A path iroh opened through
+    /// a relay earlier in this run may still be known to it; nothing
+    /// dials a new one.
+    pub async fn set_server_relays(
+        &self,
+        endpoint_id: &str,
+        relays: Option<bool>,
+    ) -> Result<(), SdkError> {
+        let id = parse_id(endpoint_id)?;
+        {
+            let storage = self.inner.storage.as_ref();
+            let _saving = self.inner.saving.lock().await;
+            let mut saved = servers::load(storage).await?;
+            let Some(server) = saved.iter_mut().find(|s| s.endpoint_id == endpoint_id) else {
+                return Err(SdkError::NotPinned(endpoint_id.to_owned()));
+            };
+            if server.use_relays == relays {
+                return Ok(());
+            }
+            server.use_relays = relays;
+            self.look_up_fallback(server);
+            servers::save(storage, &saved).await?;
+        }
+        self.inner.relay_policy.choose(id, relays);
+        if let Some(link) = self.inner.links.lock().remove(&id) {
+            link.close();
+        }
+        self.inner.discovery.changed();
+        Ok(())
+    }
+
+    /// Saved server `endpoint_id`'s relays from now on: those it is
+    /// dialled through while its relays are on. Empty gives the list back
+    /// to the server (its next `ServerAddresses` event, and an invite's
+    /// link, fill it); otherwise it is the user's, and neither changes it.
+    /// Used from the next connection: an open one is closed.
+    /// [`SdkError::InvalidInput`] for one that is not an http(s) URL;
+    /// [`SdkError::NotPinned`] for a server not saved. At most
+    /// [`spoolframe_protocol::invite::MAX_HINTS`] are kept.
+    pub async fn set_server_relay_urls(
+        &self,
+        endpoint_id: &str,
+        relays: Vec<String>,
+    ) -> Result<(), SdkError> {
+        let id = parse_id(endpoint_id)?;
+        {
+            let storage = self.inner.storage.as_ref();
+            let _saving = self.inner.saving.lock().await;
+            let mut saved = servers::load(storage).await?;
+            let Some(server) = saved.iter_mut().find(|s| s.endpoint_id == endpoint_id) else {
+                return Err(SdkError::NotPinned(endpoint_id.to_owned()));
+            };
+            if !server.edit_relays(relays) {
+                return Err(SdkError::InvalidInput(
+                    "a relay is an http:// or https:// URL".into(),
+                ));
+            }
+            self.look_up_fallback(server);
+            servers::save(storage, &saved).await?;
+        }
+        if let Some(link) = self.inner.links.lock().remove(&id) {
+            link.close();
+        }
         self.inner.discovery.changed();
         Ok(())
     }
@@ -1510,11 +1610,12 @@ impl Client {
         while checks.join_next().await.is_some() {}
     }
 
-    /// The relays to reach `id` through: none with relays off, else those
-    /// it told (saved with `pinned`) and an invite's. One that is not a
-    /// URL is left out: what a server tells is not trusted to be one.
+    /// The relays to reach `id` through: none with its relays off
+    /// ([`crate::relay_policy::RelayPolicy`]), else those it told (saved
+    /// with `pinned`) and an invite's. One that is not a URL is left out:
+    /// what a server tells is not trusted to be one.
     fn relays_of(&self, id: EndpointId, pinned: Option<&SavedServer>) -> Vec<RelayUrl> {
-        if !self.inner.relays {
+        if !self.inner.relay_policy.allows(&id) {
             return Vec::new();
         }
         let invited = self.inner.invite_relays.lock().get(&id).cloned();
@@ -1537,8 +1638,8 @@ impl Client {
         let pinned = saved.iter().find(|s| s.endpoint_id == id.to_string());
         let heard = self.inner.discovery.get(&id);
         let manual = self.inner.manual.lock().get(&id).cloned();
-        // An invite with only relays names a server too (P6-03); with
-        // relays off it is then one with nowhere to dial: unreachable.
+        // An invite with only relays names a server too (P6-03), dialled
+        // through them whatever the client's relays (see `reach`).
         let invited = self.inner.invite_relays.lock().contains_key(&id);
         if pinned.is_none() && heard.is_none() && manual.is_none() && !invited {
             return Err(SdkError::UnknownServer(id.to_string()));
@@ -1665,6 +1766,7 @@ impl Client {
             if let Some(url) = &server.lookup {
                 self.look_up_at(url);
             }
+            self.look_up_fallback(server);
             server.told(addrs, now)
         })
         .await
@@ -1686,11 +1788,23 @@ impl Client {
         let Ok(services) = endpoint.address_lookup() else {
             return;
         };
-        services.add(
+        services.add(RelayFiltered::new(
             iroh::address_lookup::PkarrResolver::builder(parsed)
                 .build(endpoint.tls_config().clone()),
-        );
+            self.inner.relay_policy.clone(),
+        ));
         tracing::debug!(url, "servers are looked up here too");
+    }
+
+    /// Look servers up at n0 too when saved `server` has no other way to
+    /// it off the LAN ([`SavedServer::needs_n0_lookup`]): one saved while
+    /// its relays and record were off, which turned them on since, is
+    /// found again if it publishes there, without first reaching it on
+    /// the LAN to hear its new relays.
+    pub(crate) fn look_up_fallback(&self, server: &SavedServer) {
+        if server.needs_n0_lookup(self.inner.relays) {
+            self.look_up_at(servers::N0_LOOKUP);
+        }
     }
 
     /// Change saved server `id` with `change`, given the time now, which

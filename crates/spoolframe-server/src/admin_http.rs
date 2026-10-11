@@ -192,6 +192,16 @@ pub struct Network {
 }
 
 impl Network {
+    /// `addr/prefix`; `prefix` is clamped to the address's length.
+    pub fn new(addr: IpAddr, prefix: u32) -> Self {
+        let addr = addr.to_canonical();
+        let bits = if addr.is_ipv4() { 32 } else { 128 };
+        Self {
+            addr,
+            prefix: prefix.min(bits),
+        }
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip.to_canonical()) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {

@@ -48,6 +48,20 @@ impl EventStreams {
         self.0.lock().drain().map(|(_, stream)| stream).collect()
     }
 
+    /// Write `event` on connection `id`'s stream, in the background; a
+    /// connection gone gets nothing.
+    pub(crate) fn send(&self, id: usize, event: Event) {
+        let Some(stream) = self.get(id) else {
+            return;
+        };
+        tokio::spawn(async move {
+            let mut stream = stream.lock().await;
+            if let Err(e) = write_frame(&mut *stream, &event).await {
+                tracing::debug!(error = %e, "cannot push an event");
+            }
+        });
+    }
+
     fn get(&self, id: usize) -> Option<EventStream> {
         self.0.lock().get(&id).cloned()
     }

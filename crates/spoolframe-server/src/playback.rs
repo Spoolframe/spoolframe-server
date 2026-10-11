@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::{PlaybackHandle, PlaybackPlan, Quality, Selection, SessionId};
-use spoolframe_types::{Delivery, Item, MediaId, Platform, SubtitleFormat};
+use spoolframe_types::{Delivery, DisplayCapabilities, Item, MediaId, Platform, SubtitleFormat};
 use tokio::sync::watch;
 
 use crate::encode::Conversion;
@@ -379,11 +379,18 @@ pub struct Playback {
     pub conversion: Option<Arc<Conversion>>,
     /// The quality it is planned for (P6-06), again at a subtitle change.
     pub quality: Quality,
+    /// What the screen showed when it was planned (PGPU-06): a re-plan
+    /// that does not say again plans for it.
+    pub display: Option<DisplayCapabilities>,
     /// The file's picture, width × height (PX-24): what direct play
     /// writes.
     pub video_size: Option<(u32, u32)>,
     /// How long it took to start (PX-24).
     pub start: Arc<Mutex<StartTimes>>,
+    /// What its device's connection carried while it was live, read every
+    /// [`crate::link_stats::EVERY`]: logged when it ends, and its last
+    /// interval shown in its detail.
+    link: Arc<Mutex<crate::link_stats::Totals>>,
     /// The connection that started it (a number of the server's own).
     connection: u64,
     last_used: Instant,
@@ -423,6 +430,12 @@ impl Playback {
             })
     }
 
+    /// The display a re-plan of it is for (PGPU-06): the one `asked`
+    /// gives, or else the one it was planned for.
+    pub fn display_for(&self, asked: Option<DisplayCapabilities>) -> Option<DisplayCapabilities> {
+        asked.or_else(|| self.display.clone())
+    }
+
     /// How it is served.
     pub fn plan(&self) -> Plan {
         match &self.conversion {
@@ -450,6 +463,8 @@ pub struct Opened {
     pub conversion: Option<Arc<Conversion>>,
     /// The quality the viewer chose (P6-06).
     pub quality: Quality,
+    /// What the screen shows (PGPU-06), if the start said.
+    pub display: Option<DisplayCapabilities>,
     /// The file's picture, width × height.
     pub video_size: Option<(u32, u32)>,
     /// How long it took to start (PX-24); its first segment filled in
@@ -469,6 +484,8 @@ pub struct Changed {
     pub subtitle: Option<Sidecar>,
     pub conversion: Option<Arc<Conversion>>,
     pub quality: Quality,
+    /// What the screen shows (PGPU-06): the change's, or the playback's.
+    pub display: Option<DisplayCapabilities>,
 }
 
 /// A device holds [`DEVICE_MOST`] converted playbacks, all playing: it
@@ -534,6 +551,20 @@ pub struct Playbacks {
     connections: Mutex<HashMap<u64, Instant>>,
     /// The last connection number given out.
     numbered: std::sync::atomic::AtomicU64,
+    /// Called with each handle as its playback ends, however it ends:
+    /// the uplink's share is given back (PX-46).
+    on_end: std::sync::OnceLock<OnEnd>,
+}
+
+/// What [`Playbacks::on_end`] calls.
+pub type EndHook = Box<dyn Fn(&str) + Send + Sync>;
+
+struct OnEnd(EndHook);
+
+impl std::fmt::Debug for OnEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnEnd")
+    }
 }
 
 /// How a playback ended (P3-15).
@@ -607,6 +638,8 @@ pub struct Snapshot {
     /// The file's picture, width × height.
     pub video_size: Option<(u32, u32)>,
     pub start: StartTimes,
+    /// Its device's link so far.
+    pub link: crate::link_stats::Totals,
 }
 
 /// A playback's conversion at one moment (P3-15).
@@ -713,6 +746,7 @@ impl Playback {
             conversion,
             video_size: self.video_size,
             start: *self.start.lock(),
+            link: self.link.lock().clone(),
         }
     }
 }
@@ -786,7 +820,14 @@ impl Playbacks {
             clock: crate::clock::Clock::default(),
             connections: Mutex::default(),
             numbered: Default::default(),
+            on_end: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Call `hook` with each playback's handle as it ends. Set once; a
+    /// second is ignored.
+    pub fn on_end(&self, hook: EndHook) {
+        let _ = self.on_end.set(OnEnd(hook));
     }
 
     /// Time idling and rechecks by `clock` (tests move it instead of
@@ -916,8 +957,10 @@ impl Playbacks {
                 subtitle: opened.subtitle,
                 conversion: opened.conversion,
                 quality: opened.quality,
+                display: opened.display,
                 video_size: opened.video_size,
                 start: opened.start,
+                link: Arc::default(),
                 connection: opened.connection,
                 last_used: now,
                 last_read: None,
@@ -943,6 +986,7 @@ impl Playbacks {
         playback.file = changed.file;
         playback.subtitle = changed.subtitle;
         playback.quality = changed.quality;
+        playback.display = changed.display;
         std::mem::replace(&mut playback.conversion, changed.conversion)
     }
 
@@ -1045,11 +1089,17 @@ impl Playbacks {
         playback.trace.lock().read(point, epoch, mark);
     }
 
-    /// Keep `quality` for `handle`'s next re-plan, its plan unchanged:
-    /// not a change of configuration, so the revision stays.
-    pub fn set_quality(&self, handle: &PlaybackHandle, quality: Quality) {
+    /// Keep `quality` and `display` for `handle`'s next re-plan, its plan
+    /// unchanged: not a change of configuration, so the revision stays.
+    pub fn set_quality(
+        &self,
+        handle: &PlaybackHandle,
+        quality: Quality,
+        display: Option<DisplayCapabilities>,
+    ) {
         if let Some(playback) = self.lock().get_mut(&handle.0) {
             playback.quality = quality;
+            playback.display = display;
         }
     }
 
@@ -1365,6 +1415,10 @@ impl Playbacks {
                     "a playback ended"
                 );
             }
+            log_link(&playback.id, &last.link);
+            if let Some(OnEnd(hook)) = self.on_end.get() {
+                hook(&handle);
+            }
             kept.push(EndedPlayback { at, why, last });
         }
         if kept.is_empty() {
@@ -1373,6 +1427,31 @@ impl Playbacks {
         let mut gone = self.gone_lock();
         gone.extend(kept);
         Self::prune(&mut gone, at);
+    }
+
+    /// Whether `endpoint` (hex) has a playback open: its connection's link
+    /// is then looked at every [`crate::link_stats::EVERY`].
+    pub fn live_on(&self, endpoint: &str) -> bool {
+        self.lock().values().any(|p| p.endpoint == endpoint)
+    }
+
+    /// Add one interval of `endpoint`'s connection to each of its open
+    /// playbacks' link totals.
+    pub fn record_link(
+        &self,
+        endpoint: &str,
+        interval: &crate::link_stats::Interval,
+        path: &crate::link_stats::PathNow,
+    ) {
+        let links: Vec<_> = self
+            .lock()
+            .values()
+            .filter(|p| p.endpoint == endpoint)
+            .map(|p| p.link.clone())
+            .collect();
+        for link in links {
+            link.lock().add(interval, path);
+        }
     }
 
     fn gone_lock(&self) -> parking_lot::MutexGuard<'_, VecDeque<EndedPlayback>> {
@@ -1463,6 +1542,31 @@ impl Playbacks {
     }
 }
 
+/// The line that sums up a playback's link when it ends, next to "a
+/// playback ended": every end, a client's own included, since a stalled
+/// one is often stopped by its viewer. Nothing when no interval was read
+/// (it ended within the first [`crate::link_stats::EVERY`]).
+fn log_link(playback: &str, link: &crate::link_stats::Totals) {
+    if link.intervals == 0 {
+        return;
+    }
+    tracing::info!(
+        target: "spoolframe_server::link",
+        playback,
+        secs = %format_args!("{:.0}", link.secs),
+        send_mbps = %format_args!("{:.2}", link.send_mbps()),
+        max_rtt_ms = link.max_rtt.as_millis() as u64,
+        lost_pct = %format_args!("{:.2}", link.loss_percent()),
+        lost_packets = link.lost_packets,
+        congestion = link.congestion_events,
+        switches = link.path_switches,
+        lan_secs = %format_args!("{:.0}", link.lan_secs),
+        direct_secs = %format_args!("{:.0}", link.direct_secs),
+        relay_secs = %format_args!("{:.0}", link.relay_secs),
+        "playback link"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1525,6 +1629,7 @@ mod tests {
                 first_segment: FirstSegment::Direct,
             })),
             connection: 0,
+            display: None,
         }
     }
 
@@ -1546,6 +1651,52 @@ mod tests {
                 .unwrap_err(),
             Refusal::NotYours
         );
+    }
+
+    /// A re-plan keeps the display the playback started with unless it
+    /// gives another, which it then keeps (PGPU-06); a change of quality
+    /// that plans the same keeps it too.
+    #[test]
+    fn a_playback_keeps_its_display_until_a_re_plan_gives_another() {
+        let p = Playbacks::default();
+        let sdr = DisplayCapabilities {
+            bit_depth: Some(8),
+            hdr: Some(std::collections::BTreeSet::new()),
+        };
+        let hdr = DisplayCapabilities {
+            bit_depth: Some(10),
+            hdr: Some([spoolframe_types::HdrFormat::Hdr10].into()),
+        };
+        let h = p.start(
+            Playbacks::new_handle(),
+            Opened {
+                display: Some(sdr.clone()),
+                ..opened_on("e")
+            },
+        );
+        let using = |p: &Playbacks| {
+            p.use_handle(&h, &SessionId("s".into()), "e", Using::Plays)
+                .unwrap()
+                .playback
+        };
+        assert_eq!(using(&p).display_for(None), Some(sdr.clone()));
+        assert_eq!(using(&p).display_for(Some(hdr.clone())), Some(hdr.clone()));
+        p.set_quality(&h, Quality::default(), Some(hdr.clone()));
+        assert_eq!(using(&p).display_for(None), Some(hdr.clone()));
+        p.change(
+            &h,
+            Changed {
+                planned: PlaybackPlan::Unknown,
+                selection: Selection::default(),
+                size: 10,
+                file: None,
+                subtitle: None,
+                conversion: None,
+                quality: Quality::default(),
+                display: Some(sdr.clone()),
+            },
+        );
+        assert_eq!(using(&p).display_for(None), Some(sdr));
     }
 
     /// Each playback ends once in the counts, however it ends (P3-14).

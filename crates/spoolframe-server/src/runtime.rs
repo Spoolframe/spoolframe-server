@@ -59,6 +59,8 @@ pub struct Live {
     /// Not a setting: what a reload detects the encoders again for
     /// (PX-33), as SIGHUP did before.
     pub transcoding: Option<Arc<crate::transcode::Transcoding>>,
+    /// `network.uplink.*` and `network.lan_prefixes` (PX-46).
+    pub uplink: Option<Arc<crate::uplink::Uplink>>,
 }
 
 /// Why a change was not made.
@@ -477,6 +479,9 @@ impl RuntimeSettings {
         }
         if let (Some(jobs), Ok(limits)) = (&live.jobs, config.transcode.limits(&self.state_dir)) {
             jobs.set_limits(limits);
+        }
+        if let (Some(uplink), Ok(settings)) = (&live.uplink, config.network.uplink()) {
+            uplink.set_settings(settings);
         }
         if let (Some(previews), Ok(settings)) = (&live.previews, config.previews.settings()) {
             previews.set_settings(settings);

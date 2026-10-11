@@ -113,6 +113,13 @@ struct ConnectionState {
     /// `direct` or `relay`, and where), the one now last: a relay, then a
     /// direct path, is a hole punched. Empty before iroh selects one.
     paths: parking_lot::Mutex<Vec<String>>,
+    /// Changes of its path since it opened, every one: the link lines
+    /// count them per interval, where the log of each is coalesced.
+    switches: std::sync::atomic::AtomicU64,
+    /// Which path changes are logged (a flapping path once in a while).
+    path_log: parking_lot::Mutex<crate::link_stats::PathLog>,
+    /// What tells the LAN from the WAN (PX-46).
+    uplink: Arc<crate::uplink::Uplink>,
 }
 
 impl ConnectionState {
@@ -141,18 +148,24 @@ impl ConnectionState {
 const LOGGED_PATHS: usize = 8;
 
 /// `addr`, the path a connection goes by, as the log names it: `relay`
-/// and its URL; or `direct` and the address, `lan` for a private one.
-/// Whether a direct path is a hole punched in NAT or an open port, iroh
-/// does not say.
-fn path_name(addr: &iroh::TransportAddr) -> String {
+/// and its URL; or `direct` and the address, `lan` for one on the LAN
+/// (PX-46: in one of this host's subnets, a global IPv6 address in the
+/// home's /64 too, private, or in `network.lan_prefixes`). Whether a
+/// direct path is a hole punched in NAT or an open port, iroh does not
+/// say.
+fn path_name(addr: &iroh::TransportAddr, uplink: &crate::uplink::Uplink) -> String {
     match addr {
         iroh::TransportAddr::Relay(url) => format!("relay {url}"),
-        iroh::TransportAddr::Ip(ip) if crate::wan::not_public(ip.ip()).is_some() => {
-            format!("lan {ip}")
-        }
+        iroh::TransportAddr::Ip(ip) if uplink.is_lan(ip.ip()) => format!("lan {ip}"),
         iroh::TransportAddr::Ip(ip) => format!("direct {ip}"),
         other => format!("{other:?}"),
     }
+}
+
+/// Whether a path named by [`path_name`] is on the LAN (PX-46); before
+/// one is selected, `none`, it is not.
+fn on_lan(path: &str) -> bool {
+    path.starts_with("lan ")
 }
 
 /// Follow the path `connection`'s packets go by, into `state`, and log
@@ -174,14 +187,15 @@ async fn log_paths(
             event = events.next() => event,
             _ = &mut closed => return,
         };
-        let selected = match event {
+        let remote_addr = match event {
             None => return,
-            Some(PathEvent::Selected { remote_addr, .. }) => path_name(&remote_addr),
+            Some(PathEvent::Selected { remote_addr, .. }) => remote_addr,
             Some(_) => continue,
         };
         let Some(state) = state.upgrade() else {
             return;
         };
+        let selected = path_name(&remote_addr, &state.uplink);
         let before = {
             let mut paths = state.paths.lock();
             let before = paths.last().cloned();
@@ -195,12 +209,129 @@ async fn log_paths(
             }
             before.unwrap_or_else(|| "none".into())
         };
+        state
+            .switches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A phone on a cellular network can flip between two of its
+        // addresses several times a second: the first change is logged,
+        // then one line a [`crate::link_stats::PATH_LOG_EVERY`] counting
+        // the rest.
+        let Some(line) = state
+            .path_log
+            .lock()
+            .change(&selected, std::time::Instant::now())
+        else {
+            continue;
+        };
         let endpoint = state.peer.endpoint.fmt_short();
+        let held = line.held;
+        let between = line.between.join(" , ");
         if state.peer.was_signed_in() {
-            tracing::info!(%endpoint, path = %selected, %before, "connection path");
+            tracing::info!(%endpoint, path = %selected, %before, held, %between, "connection path");
         } else {
-            tracing::debug!(%endpoint, path = %selected, %before, "connection path");
+            tracing::debug!(%endpoint, path = %selected, %before, held, %between, "connection path");
         }
+    }
+}
+
+/// Read `connection`'s counters and its selected path now, for
+/// [`watch_link`].
+fn link_reading(
+    connection: &iroh::endpoint::Connection,
+    state: &ConnectionState,
+) -> (crate::link_stats::Counters, crate::link_stats::PathNow) {
+    let stats = connection.stats();
+    let paths = connection.paths();
+    let mut path = crate::link_stats::PathNow {
+        open: paths.len(),
+        ..Default::default()
+    };
+    let mut congestion_events = 0;
+    for p in paths.iter() {
+        let s = p.stats();
+        congestion_events += s.congestion_events;
+        if p.is_selected() {
+            path.name = path_name(p.remote_addr(), &state.uplink);
+            path.kind = crate::link_stats::PathKind::of(&path.name);
+            path.rtt = s.rtt;
+            path.cwnd = s.cwnd;
+            path.mtu = s.current_mtu;
+        }
+    }
+    let counters = crate::link_stats::Counters {
+        sent_bytes: stats.udp_tx.bytes,
+        sent_datagrams: stats.udp_tx.datagrams,
+        received_bytes: stats.udp_rx.bytes,
+        lost_packets: stats.lost_packets,
+        lost_bytes: stats.lost_bytes,
+        congestion_events,
+        path_switches: state.switches.load(std::sync::atomic::Ordering::Relaxed),
+    };
+    (counters, path)
+}
+
+/// Every [`crate::link_stats::EVERY`] while its device has a playback open,
+/// log what `connection` carried and add it to those playbacks' link
+/// totals: for telling a link too slow for the film from a relay or from a
+/// path that will not hold still.
+async fn watch_link(
+    connection: iroh::endpoint::WeakConnectionHandle,
+    endpoint_hex: String,
+    state: std::sync::Weak<ConnectionState>,
+    playbacks: Arc<crate::playback::Playbacks>,
+) {
+    // Weak, as for the path log: this task must not keep the connection
+    // open.
+    let closed = connection.closed();
+    tokio::pin!(closed);
+    let mut ticks = tokio::time::interval(crate::link_stats::EVERY);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The reading an interval starts from, and when; none while no
+    // playback is open, so an idle stretch is not counted.
+    let mut from: Option<(crate::link_stats::Counters, std::time::Instant)> = None;
+    loop {
+        tokio::select! {
+            _ = ticks.tick() => {}
+            _ = &mut closed => return,
+        }
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        if !playbacks.live_on(&endpoint_hex) {
+            from = None;
+            continue;
+        }
+        let Some(live) = connection.upgrade() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let (counters, path) = link_reading(&live, &state);
+        drop(live);
+        let Some((before, at)) = from.replace((counters, now)) else {
+            continue;
+        };
+        let interval = crate::link_stats::Interval::between(
+            &before,
+            &counters,
+            now.saturating_duration_since(at).as_secs_f64(),
+        );
+        playbacks.record_link(&endpoint_hex, &interval, &path);
+        tracing::info!(
+            target: "spoolframe_server::link",
+            endpoint = %state.peer.endpoint.fmt_short(),
+            path = %path.name,
+            rtt_ms = path.rtt.as_millis() as u64,
+            cwnd_kb = path.cwnd / 1024,
+            mtu = path.mtu,
+            open_paths = path.open,
+            send_mbps = %format_args!("{:.2}", interval.send_mbps()),
+            recv_mbps = %format_args!("{:.2}", interval.receive_mbps()),
+            lost_pct = %format_args!("{:.2}", interval.loss_percent()),
+            lost_packets = interval.lost_packets,
+            congestion = interval.congestion_events,
+            switches = interval.path_switches,
+            "link"
+        );
     }
 }
 
@@ -273,6 +404,18 @@ impl ClientProtocol {
             told,
         };
         tokio::spawn(addresses.clone().tell_changes());
+        // PX-46: a WAN playback that ends gives its share back, and the
+        // others are told theirs once starts and ends settle.
+        let uplink = Arc::downgrade(&services.uplink);
+        services.playbacks.on_end(Box::new(move |handle| {
+            if let Some(uplink) = uplink.upgrade() {
+                uplink.ended(handle);
+            }
+        }));
+        tokio::spawn(crate::uplink::tell_shares(
+            Arc::downgrade(&services.uplink),
+            addresses.streams.clone(),
+        ));
         let ties = Arc::new(crate::ties::TieChallenges::new(
             services.auth.store().clock().clone(),
         ));
@@ -2131,9 +2274,12 @@ impl ClientProtocol {
                 id,
                 selection,
                 bitmap,
+                display,
             } => {
-                // Capabilities belong to the connection: they came with Hello.
-                let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
+                // Capabilities belong to the connection: they came with
+                // Hello, the screen's over them when the request says
+                // (PGPU-06).
+                let caps = capabilities(state, display.as_ref());
                 if caps.is_none() {
                     // No file needs reading to know the answer.
                     return Ok(Reply::PlaybackPlan {
@@ -2149,7 +2295,7 @@ impl ClientProtocol {
                 Ok(Reply::PlaybackPlan {
                     plan: planner::plan(
                         &descriptor,
-                        caps,
+                        caps.as_ref(),
                         selection,
                         bitmap,
                         &crate::encode::planning_encoders(
@@ -2167,10 +2313,23 @@ impl ClientProtocol {
                 start_ms,
                 bitmap,
                 quality,
+                display,
             } => {
                 // The start's breakdown is timed from here (PX-24).
                 let requested = std::time::Instant::now();
-                let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
+                let caps = capabilities(state, display.as_ref());
+                // Off the LAN, this playback takes a share of the uplink
+                // (PX-46), and may be one too many.
+                let wan = (!on_lan(&state.path())).then(|| uplink_class(&who));
+                let share =
+                    match wan {
+                        Some(class) => self.services.uplink.admit(class).map_err(|full| {
+                            Error::WanStreamsFull {
+                                max: u32::try_from(full.max).unwrap_or(u32::MAX),
+                            }
+                        })?,
+                        None => None,
+                    };
                 let (path, descriptor) = self.describe(&id).await?;
                 let (selection, chosen) = self
                     .selection(principal, &id, &descriptor, selection)
@@ -2178,8 +2337,10 @@ impl ClientProtocol {
                 let bitmap = self.bitmap(principal, bitmap).await?;
                 let plan = planner::plan_for(
                     &descriptor,
-                    caps,
+                    caps.as_ref(),
                     quality,
+                    share,
+                    !on_lan(&state.path()),
                     selection,
                     bitmap,
                     &crate::encode::planning_encoders(
@@ -2303,11 +2464,19 @@ impl ClientProtocol {
                         subtitle,
                         conversion,
                         quality,
+                        display,
                         video_size: descriptor.video.as_ref().map(|v| (v.width, v.height)),
                         start: start_times.clone(),
                         connection: state.number,
                     },
                 );
+                // Counted off the LAN from now (PX-46): the others' shares
+                // follow once starts settle.
+                if let Some(class) = wan {
+                    self.services
+                        .uplink
+                        .started(&handle.0, class, connection.stable_id(), share);
+                }
                 // What was decided, so a playback that then goes quiet
                 // can be read from the log; the endpoint as the
                 // connection lines print it.
@@ -2324,6 +2493,8 @@ impl ClientProtocol {
                     start_ms = start_ms.unwrap_or(0),
                     ?quality,
                     path = %state.path(),
+                    wan = wan.is_some(),
+                    share,
                     "playback started"
                 );
                 // Then how long it took: for direct play now, for a
@@ -2354,10 +2525,13 @@ impl ClientProtocol {
                 subtitle,
                 bitmap,
                 position_ms,
+                display,
             } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
-                let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
+                let display = playback.display_for(display);
+                let caps = capabilities(state, display.as_ref());
                 let quality = playback.quality;
+                let share = self.services.uplink.share_of(&handle.0);
                 let (path, descriptor) = self.describe(&playback.item).await?;
                 let selection = Selection {
                     audio: playback.selection.audio,
@@ -2366,8 +2540,10 @@ impl ClientProtocol {
                 let bitmap = self.bitmap(principal, bitmap).await?;
                 let plan = planner::plan_for(
                     &descriptor,
-                    caps,
+                    caps.as_ref(),
                     quality,
+                    share,
+                    !on_lan(&state.path()),
                     selection,
                     bitmap,
                     &crate::encode::planning_encoders(
@@ -2398,6 +2574,7 @@ impl ClientProtocol {
                         subtitle,
                         conversion,
                         quality: playback.quality,
+                        display,
                     },
                 );
                 drop(replaced);
@@ -2409,16 +2586,23 @@ impl ClientProtocol {
                 quality,
                 bitmap,
                 position_ms,
+                display,
             } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
-                let caps = state.hello.get().and_then(|h| h.capabilities.as_ref());
+                let display = playback.display_for(display);
+                let caps = capabilities(state, display.as_ref());
                 let (path, descriptor) = self.describe(&playback.item).await?;
                 let selection = playback.selection;
                 let bitmap = self.bitmap(principal, bitmap).await?;
+                // Its share now (PX-46): a re-plan after `PlaybackShare`
+                // takes the one the event told.
+                let share = self.services.uplink.share_of(&handle.0);
                 let plan = planner::plan_for(
                     &descriptor,
-                    caps,
+                    caps.as_ref(),
                     quality,
+                    share,
+                    !on_lan(&state.path()),
                     selection,
                     bitmap,
                     &crate::encode::planning_encoders(
@@ -2429,9 +2613,11 @@ impl ClientProtocol {
                 );
                 let epoch_now = playback.conversion.as_ref().map_or(0, |c| c.job().epoch);
                 if plan == playback.planned {
-                    // The same plan: nothing to restart. The quality is
-                    // kept for the next re-plan all the same.
-                    self.services.playbacks.set_quality(&handle, quality);
+                    // The same plan: nothing to restart. The quality and
+                    // the screen are kept for the next re-plan all the same.
+                    self.services
+                        .playbacks
+                        .set_quality(&handle, quality, display);
                     return Ok(Reply::PlaybackChanged {
                         plan,
                         size: playback.size,
@@ -2462,6 +2648,7 @@ impl ClientProtocol {
                         subtitle,
                         conversion,
                         quality,
+                        display,
                     },
                 );
                 drop(replaced);
@@ -3758,15 +3945,24 @@ impl ProtocolHandler for ClientProtocol {
                     .paths()
                     .iter()
                     .find(|p| p.is_selected())
-                    .map(|p| path_name(p.remote_addr()))
+                    .map(|p| path_name(p.remote_addr(), &self.services.uplink))
                     .into_iter()
                     .collect(),
             ),
+            switches: std::sync::atomic::AtomicU64::new(0),
+            path_log: parking_lot::Mutex::default(),
+            uplink: self.services.uplink.clone(),
         });
         tokio::spawn(log_paths(
             connection.weak_handle(),
             connection.path_events(),
             Arc::downgrade(&state),
+        ));
+        tokio::spawn(watch_link(
+            connection.weak_handle(),
+            connection.remote_id().to_string(),
+            Arc::downgrade(&state),
+            self.services.playbacks.clone(),
         ));
 
         let reason = loop {
@@ -4131,8 +4327,17 @@ fn login_error(e: LoginError) -> Error {
     }
 }
 
-/// P3-03's rule for what adds or takes away a way to sign in: `user`'s
-/// session proved who they are within [`RECENT_SIGN_IN`].
+/// Whose share of the uplink a playback off the LAN takes (PX-46): an
+/// admin's is the owner's.
+fn uplink_class(who: &Who) -> crate::uplink::Class {
+    match who {
+        Who::Local(user) if user.role == spoolframe_types::Role::Admin => {
+            crate::uplink::Class::Owner
+        }
+        _ => crate::uplink::Class::Guest,
+    }
+}
+
 /// The session's local account, for a request only an account here can
 /// make; a portable user's session (P7-06) has none.
 fn local(who: &Who) -> Result<&SessionUser, Error> {
@@ -4226,6 +4431,8 @@ fn invite_summary(record: crate::store::invites::InviteRecord) -> InviteSummary 
     }
 }
 
+/// P3-03's rule for what adds or takes away a way to sign in: `user`'s
+/// session proved who they are within [`RECENT_SIGN_IN`].
 fn recently_signed_in(user: &SessionUser) -> Result<(), Error> {
     let age = crate::store::now() - user.authenticated_at;
     if age > RECENT_SIGN_IN.as_secs() as i64 {
@@ -4696,6 +4903,20 @@ fn sign_in_code_keys(connection: &Connection, user: &SessionUser) -> (String, St
 
 pub(crate) fn auth_methods() -> Vec<AuthMethod> {
     vec![AuthMethod::Password, AuthMethod::DeviceApproval]
+}
+
+/// The connection's capabilities from Hello, with `display` over their
+/// HDR formats and bit depth (PGPU-06); `None` before a Hello that gave
+/// any.
+fn capabilities(
+    state: &ConnectionState,
+    display: Option<&spoolframe_types::DisplayCapabilities>,
+) -> Option<spoolframe_types::ClientCapabilities> {
+    state
+        .hello
+        .get()
+        .and_then(|h| h.capabilities.as_ref())
+        .map(|caps| caps.with_display(display))
 }
 
 #[cfg(test)]

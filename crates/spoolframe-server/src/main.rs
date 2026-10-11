@@ -1000,10 +1000,16 @@ async fn run(
         .set(config.admin.metrics(), config.admin.metrics_from()?);
     metrics.observe_catalog(live.clone());
     metrics.spawn_sampler();
+    // The WAN uplink budget (PX-46): a live setting, read by the client
+    // protocol's plans and the admin API's measurement.
+    let uplink = Arc::new(spoolframe_server::uplink::Uplink::new(
+        config.network.uplink()?,
+    ));
     let settings = Arc::new(RuntimeSettings::new(
         layers.clone(),
         state_dir,
         Live {
+            uplink: Some(uplink.clone()),
             name: Some(name.clone()),
             catalog: live.clone(),
             cookies: cookies.clone(),
@@ -1098,6 +1104,7 @@ async fn run(
             previews,
             metrics,
             wan: spoolframe_server::wan::Finders::system(),
+            uplink: uplink.clone(),
         },
     )
     .await?;

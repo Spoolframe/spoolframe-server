@@ -15,8 +15,8 @@ use spoolframe_protocol::{
     UserSummary,
 };
 use spoolframe_types::{
-    ArtworkId, Item, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId, SubtitleFormat,
-    TrackPreferences,
+    ArtworkId, DisplayCapabilities, Item, Library, LibraryId, Marker, MediaId, MediaTracks,
+    PersonId, SubtitleFormat, TrackPreferences,
 };
 
 use crate::client::Client;
@@ -189,7 +189,7 @@ pub struct PlaybackChange {
 }
 
 /// How to start a playback, beyond its tracks.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlaybackOptions {
     /// Where a converted playback's encode begins (P2-03). Direct play
     /// reads from wherever the app likes.
@@ -198,6 +198,12 @@ pub struct PlaybackOptions {
     pub bitmap: BitmapSubtitles,
     /// The quality the viewer chose for it (P6-06).
     pub quality: PlaybackQuality,
+    /// What the screen shows as it starts (PGPU-06): its HDR formats and
+    /// bit depth, over the device's capabilities, for this playback and
+    /// its re-plans. An app whose display mode changes while it runs (a
+    /// TV's Match Dynamic Range) works it out at each start. `None`: the
+    /// device's capabilities as they are.
+    pub display: Option<DisplayCapabilities>,
 }
 
 /// The quality a viewer chooses for a playback (P6-06). The app's own
@@ -681,10 +687,23 @@ impl Session {
         selection: Option<Selection>,
         bitmap: BitmapSubtitles,
     ) -> Result<Plan, SdkError> {
+        self.playback_plan_on(id, selection, bitmap, None).await
+    }
+
+    /// [`Session::playback_plan_with`] for a screen showing `display`
+    /// (PGPU-06), as [`PlaybackOptions::display`] would start it.
+    pub async fn playback_plan_on(
+        &self,
+        id: &MediaId,
+        selection: Option<Selection>,
+        bitmap: BitmapSubtitles,
+        display: Option<DisplayCapabilities>,
+    ) -> Result<Plan, SdkError> {
         let request = Request::PlaybackPlan {
             id: id.clone(),
             selection,
             bitmap,
+            display,
         };
         match self.call(request).await? {
             Reply::PlaybackPlan { plan, chosen } => Ok(Plan { plan, chosen }),
@@ -722,6 +741,7 @@ impl Session {
             start_ms: options.start.map(millis),
             bitmap: options.bitmap,
             quality: self.wire_quality(options.quality),
+            display: options.display,
         };
         match self.call(request).await? {
             Reply::PlaybackStarted {
@@ -1130,6 +1150,8 @@ impl Session {
             subtitle,
             bitmap,
             position_ms: millis(position),
+            // The playback's own, as it started.
+            display: None,
         };
         match self.call(request).await? {
             Reply::PlaybackChanged { plan, size, epoch } => {
@@ -1194,6 +1216,8 @@ impl Session {
             quality,
             bitmap,
             position_ms: millis(position),
+            // The playback's own, as it started.
+            display: None,
         };
         match self.call(request).await? {
             Reply::PlaybackChanged { plan, size, epoch } => {
@@ -1301,15 +1325,21 @@ impl Session {
     async fn read_media(
         &self,
         request: &MediaRead,
-        metered: bool,
+        direct: bool,
     ) -> Result<(MediaReadResponse, Vec<u8>), SdkError> {
         let timeouts = self.client.inner.timeouts;
         let revision = self
             .client
             .playback_revision(self.server, &self.token, &request.handle)
             .await?;
-        let meter = metered.then(|| self.client.link(self.server).meter());
-        let meter = meter.as_deref();
+        let meter = self.client.link(self.server).meter();
+        // A direct read whole; a converted one (an HLS segment, a chunk)
+        // from its first byte, the encode's time left out (PX-46).
+        let metering = if direct {
+            crate::connection::Metering::Whole(&meter)
+        } else {
+            crate::connection::Metering::FromFirstByte(&meter)
+        };
         self.client
             .on_connection(self.server, Some(&self.token), true, |conn| async move {
                 conn.read(
@@ -1317,7 +1347,7 @@ impl Session {
                     revision,
                     timeouts.of_read(),
                     timeouts.request,
-                    meter,
+                    metering,
                 )
                 .await
             })
@@ -1384,8 +1414,8 @@ impl Session {
             segment: None,
             variant: 0,
         };
-        // Direct reads tell how fast the link is; converted ones wait on
-        // the encode, and would not (P6-06).
+        // Direct reads are timed whole; converted ones from their first
+        // byte, as they wait on the encode (P6-06, PX-46).
         match self.read_media(&request, true).await? {
             (MediaReadResponse::Ok(_), bytes) => Ok(bytes),
             (MediaReadResponse::Err(e), _) => Err(self.failed(e).await),

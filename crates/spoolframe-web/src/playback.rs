@@ -3,9 +3,9 @@
 //! Host-compiled, so `cargo test` covers it.
 
 use spoolframe_admin_api::{
-    CacheState, EndedWhy, FilterPlace, FirstSegment, GpuApi, KeyframesRead, PlanKind, PlaybackMade,
-    PlaybackRow, PlaybackStart, PreviewCache, ReadMark, ReadPoint, StreamKind, StreamOut,
-    ToneMapper, VideoDecoder, VideoEncoderUsed,
+    CacheState, EndedWhy, FilterPlace, FirstSegment, GpuApi, KeyframesRead, PlanKind, PlaybackLink,
+    PlaybackMade, PlaybackRow, PlaybackStart, PreviewCache, ReadMark, ReadPoint, StreamKind,
+    StreamOut, ToneMapper, VideoDecoder, VideoEncoderUsed,
 };
 
 use crate::catalog::{bytes, clock};
@@ -248,6 +248,35 @@ pub fn start_parts(start: &PlaybackStart) -> [(&'static str, String, String); 3]
         ),
         ("Keyframes", keyframes, from),
         ("First segment", first, note),
+    ]
+}
+
+/// Its device's link (the server's "link" lines): each part's name, the
+/// last 10 s, and the playback so far.
+pub fn link_parts(link: &PlaybackLink) -> [(&'static str, String, String); 4] {
+    let pct = |h: u32| format!("{}.{:02} %", h / 100, h % 100);
+    [
+        ("Path", link.path.clone(), String::new()),
+        (
+            "Round trip",
+            ms_text(link.rtt_ms),
+            format!("at most {} so far", ms_text(link.max_rtt_ms)),
+        ),
+        (
+            "Sent",
+            bitrate_text(link.send_bps),
+            format!("{} on average", bitrate_text(link.average_bps)),
+        ),
+        (
+            "Lost",
+            pct(link.lost_hundredths),
+            format!(
+                "{} so far · path changed {} times ({} so far)",
+                pct(link.total_lost_hundredths),
+                link.switches,
+                link.total_switches
+            ),
+        ),
     ]
 }
 
@@ -627,5 +656,30 @@ mod tests {
         assert_eq!(converted_percent(30_000, Some(60_000)), Some(50));
         assert_eq!(converted_percent(90_000, Some(60_000)), Some(100));
         assert_eq!(converted_percent(1, None), None);
+    }
+
+    #[test]
+    fn a_link_reads_as_its_last_ten_seconds_and_so_far() {
+        let link = PlaybackLink {
+            path: "direct [2607:fb90::1]:51454".into(),
+            rtt_ms: 84,
+            send_bps: 3_400_000,
+            lost_hundredths: 250,
+            switches: 37,
+            average_bps: 2_100_000,
+            max_rtt_ms: 410,
+            total_lost_hundredths: 105,
+            total_switches: 412,
+        };
+        let parts = link_parts(&link);
+        assert_eq!(parts[0].1, "direct [2607:fb90::1]:51454");
+        assert_eq!(parts[3].1, "2.50 %");
+        assert!(parts[3].2.starts_with("1.05 % so far"), "{}", parts[3].2);
+        assert!(
+            parts[3].2.contains("37 times (412 so far)"),
+            "{}",
+            parts[3].2
+        );
+        assert_eq!(parts[1].2, format!("at most {} so far", ms_text(410)));
     }
 }

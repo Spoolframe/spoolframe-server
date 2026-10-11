@@ -241,6 +241,7 @@ async fn a_client_without_capabilities_gets_an_unsupported_plan() {
         id: movie().id().clone(),
         selection: Default::default(),
         bitmap: Default::default(),
+        display: None,
     };
     let Response::Ok(Reply::PlaybackPlan {
         plan: PlaybackPlan::Unsupported { reasons },
@@ -266,6 +267,7 @@ async fn a_plan_for_an_item_without_a_file_is_not_found() {
         id: movie().id().clone(),
         selection: Default::default(),
         bitmap: Default::default(),
+        display: None,
     };
     assert!(matches!(
         tv.call(Some(&alice), request).await,

@@ -2,6 +2,140 @@
 
 ## Unreleased
 
+- SDK: a saved server this device reaches through relays, yet knows no
+  relay or lookup for, is looked up at n0 (dns.iroh.link) too. A server
+  saved while its relays and discovery were off, which turned them on
+  since, was unreachable off the LAN until the device next reached it
+  on the LAN and heard its new relays (a tester's iPhone on 5G).
+
+- Off the LAN, an encode is an HLS ladder again. The remux ladder left
+  an encode off the LAN as one rung with nowhere lower to go: American
+  Sniper on 5G played AV1 800p alone at a 10 Mbit/s share while the
+  link fell to 2.5 Mbit/s, and stalled.
+
+- Single sign-on settings keep an issuer's trailing slash. The web UI
+  dropped it on save, and a provider whose issuer ends in `/`
+  (Authentik's) then failed every sign-in with an unexpected issuer: an
+  ID token's `iss` has to match the configured issuer exactly.
+
+- Off the LAN in Auto, a remux is the top of an HLS ladder (PX-21): the
+  copied original, then encodes under it from half its rate down, so
+  AVPlayer starts low and climbs to the original while the link carries
+  it, where one copied variant had nowhere lower to go (the 9.4 Mbit/s
+  remux that never started on cellular). Every variant has the copy's
+  segments: an encoded rung forces a keyframe at each of the source's
+  keyframes and adds none of its own (no scene cuts, a 1000-frame GOP).
+  Only the rung being read is encoded, as for any ladder, and a rung
+  counts against the encode budget when it runs. The copy's rung counts
+  at its peak when choosing where to start. On the LAN, and for Original
+  or a chosen bitrate, a copy plays alone as before. `Rung` gains
+  `video`, an encoded rung's own (lenient, `None` from an older server).
+
+- Off the LAN in Auto, a copy (direct play or a remux) has to fit its
+  peak under the cap, not only its average (PX-46): half again over the
+  average, the rule an HLS variant's `BANDWIDTH` already used. A 9.4
+  Mbit/s H.264 rip under a 10 Mbit/s share now converts instead of
+  remuxing at peaks near 14 Mbit/s that the link could not carry. On the
+  LAN, and for a quality the viewer chose, the average still decides.
+
+- `network.congestion_control`: `"cubic"` (the default, as before) or
+  `"bbr"`, how the server's QUIC paths pace what they send. Cubic halves
+  its window on every lost packet, which on a lossy cellular link held a
+  window of 20 to 30 KB at 80 ms, a few Mbit/s; BBR (noq's BBRv3) paces
+  by the rate and round trip it measures. One choice for every
+  connection, home ones too: noq builds each path's controller knowing
+  neither its address nor whether it crosses the WAN. Applies after a
+  restart; logged at start; in the web UI under Settings › Remote
+  access with advanced settings shown, and the NixOS module's
+  `network.congestionControl`.
+
+- The SDK measures its link through HLS too (PX-46): HLS segments and
+  progressive chunks are metered from their first byte, so the encode's
+  wait is not counted, and a managed HLS playback in Auto steps down for
+  a link slower than its segments need, as direct play did. A managed
+  playback follows `Event::PlaybackShare` by itself.
+  `SdkError::WanStreamsFull { max }` is new.
+
+- Settings › Remote access has an upload card (PX-46): the budget, the
+  most playbacks outside at once and the admins' share, and *Measure the
+  upload*, which times three 10 MB uploads to Cloudflare's public speed
+  test (`admin.uplinkMeasure`) and offers 80% of their median as the
+  budget. With advanced settings shown, *Also home* edits
+  `network.lan_prefixes`. The NixOS module has `lanPrefixes` and
+  `uplink.{budgetMbps,maxStreams,ownerSharePercent}`.
+
+- PX-46, the WAN uplink budget: a playback off the LAN with Auto
+  quality is planned under its share of `network.uplink.budget_mbps`
+  (0, the default, is no limit), split equally between the playbacks
+  off the LAN, the admins' together holding
+  `network.uplink.owner_share_percent` (50) while they play beside
+  anyone else. `network.uplink.max_streams` refuses one more with
+  `WanStreamsFull { max }`. As playbacks start and end, the others are
+  told their new share (`Event::PlaybackShare`, for a move of 15% or
+  more, after a few seconds' settling) and re-plan. The LAN is now told
+  by the server's own subnets: a phone on the home's IPv6 /64 is `lan`,
+  one on 5G `direct`, and `network.lan_prefixes` adds ranges (a
+  WireGuard network). On the LAN, Auto plays the original as before.
+
+- The link to a playing device, in the log and the web UI: every 10 s
+  while a device has a playback open, a `link` line
+  (`spoolframe_server::link`) gives its connection's path, round trip,
+  congestion window, MTU, open paths, the rate sent and received, packets
+  lost and the share of them, congestion events, and the path changes in
+  those 10 s. When a playback ends, a `playback link` line sums it up
+  beside "a playback ended": seconds, the average rate, the largest
+  round trip, the loss, the congestion events and path changes, and the
+  seconds on a LAN, direct and relayed path. Server › Playback's detail
+  shows the same in a Link card (`PlaybackRow.link` in the admin API,
+  left out by an older server). The "connection path" line logs the
+  first change, then at most one every 10 s that counts the changes
+  since and the paths they went between: a phone flipping between two of
+  its cellular IPv6 addresses wrote several lines a second.
+
+- Relays are a choice per server in the SDK. `ClientOptions::relays`
+  (on by default) is the default; a saved server may choose its own
+  (`ServerEntry::use_relays`, `Client::set_server_relays`): `Some(true)`
+  reaches it through its relays even with the client's off,
+  `Some(false)` never, `None` follows the client's. Its relays are an
+  editable list (`ServerEntry::relays`, `relays_edited`,
+  `Client::set_server_relay_urls`): what its `ServerAddresses` event and
+  an invite's link name, until the user edits it; empty gives it back.
+  Acting on an invite whose link names relays is consent to them: a
+  device with relays off connects, redeems (P6-08's token included) and
+  saves through them, and the saved server chooses them (`Some(true)`).
+  The endpoint now always has relays as a way to dial, with an empty
+  relay map (no home relay, nothing contacted at start, never probed);
+  "off" is kept per server by dialling it with no relay URL and by
+  dropping the relay URLs from address lookups' records of it.
+
+- A playback is planned for the screen as it is now (PGPU-06):
+  `playback_plan`, `start_playback`, `change_subtitle` and
+  `change_quality` take an optional `display` (`DisplayCapabilities {
+  bit_depth, hdr }`) over the HDR formats and bit depth the app gave at
+  `Hello`, and the playback keeps it for its re-plans. An Apple TV
+  whose display mode changes while the app runs (Match Dynamic Range)
+  no longer has HDR sent to an SDR mode, or a tone map for an HDR one,
+  until the app is opened again. SDK: `PlaybackOptions::display`, and
+  `Session::playback_plan_on` (`PlaybackOptions` is no longer `Copy`).
+  Wire revision 14 still: a request without it plans as before.
+- Each wire field added since 0.6.0 that a peer may leave out is
+  marked `compat(v1): required at the protocol reset`, for PX-16's
+  reset to revision 1: `ClientCapabilities.hardware_video`, the
+  `display` fields, `ConvertedVideo::Copy.dolby_vision`,
+  `MediaTracks.bit_rate`, `VideoTrack.bit_rate`, `Episode.year`,
+  `Episode.air_date`, and the pairing `Credential` frame's `servers`.
+
+- A relay on the server's own side of the NAT is no longer asked what
+  address it sees the server at (QUIC address discovery): one whose name
+  resolves to a private, loopback, link-local or CGNAT address, to one of
+  the host's own, or to the server's public address (the router's
+  hairpin). From inside the NAT it saw a private address where n0 saw the
+  public one, and iroh warned every report that "IPv4 address detected by
+  QAD varies by destination". The relays are placed again as the
+  server's addresses change, and every 10 minutes; one at a public
+  address not yet placed is left unasked beside n0 and asked alone. It
+  still carries connections. A relay outside (a VPS) is asked as before.
+
 ## 0.6.2 (2026-10-10)
 
 - PGPU-06, Dolby Vision: the probe reads the DOVI record's profile,

@@ -441,6 +441,9 @@ pub struct ServerOptions {
     pub pkarr: spoolframe_server::network::Pkarr,
     /// `network.own_relays` (P6-04): none unless a test is about them.
     pub own_relays: Vec<iroh::EndpointId>,
+    /// `network.uplink` and `network.lan_prefixes` (PX-46): no budget
+    /// unless a test is about it.
+    pub uplink: spoolframe_server::uplink::UplinkSettings,
 }
 
 impl Default for ServerOptions {
@@ -484,6 +487,7 @@ impl Default for ServerOptions {
             pkarr: spoolframe_server::network::Pkarr::Off,
             own_relays: Vec::new(),
             finders: offline_finders(),
+            uplink: Default::default(),
         }
     }
 }
@@ -752,6 +756,9 @@ impl TestServer {
             metrics: metrics.clone(),
             connected: Arc::default(),
             wan: options.finders.clone(),
+            uplink: Arc::new(spoolframe_server::uplink::Uplink::new(
+                options.uplink.clone(),
+            )),
         };
         let debug = Arc::new(spoolframe_server::playback_debug::PlaybackDebug {
             playbacks: services.playbacks.clone(),
@@ -773,6 +780,7 @@ impl TestServer {
             admission: options.admission,
             announce: options.announce.clone(),
             wan: options.wan.clone(),
+            congestion: Default::default(),
         };
         let name = ServerName::new(options.name.clone());
         let server = Server::start(key, &endpoint, &name, services)

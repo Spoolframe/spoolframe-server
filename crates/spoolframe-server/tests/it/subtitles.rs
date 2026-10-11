@@ -80,6 +80,7 @@ async fn start(
                 start_ms: None,
                 bitmap,
                 quality: Default::default(),
+                display: None,
             },
         )
         .await;
@@ -145,6 +146,7 @@ async fn subtitle_planned(
         id: movie().id().clone(),
         selection: with_pgs(),
         bitmap,
+        display: None,
     };
     match client.call(Some(session), request).await {
         Response::Ok(Reply::PlaybackPlan {
@@ -232,6 +234,7 @@ async fn a_user_who_wants_pictures_on_a_client_that_cannot_draw_them_has_them_bu
         id: movie().id().clone(),
         selection: with_pgs(),
         bitmap: BitmapSubtitles::Auto,
+        display: None,
     };
     let response = client.call(Some(&session), request).await;
     let Response::Ok(Reply::PlaybackPlan {
@@ -461,6 +464,7 @@ async fn text_without_tesseract_cannot_play_and_says_why() {
                 start_ms: None,
                 bitmap: BitmapSubtitles::Text,
                 quality: Default::default(),
+                display: None,
             },
         )
         .await;
@@ -565,6 +569,7 @@ async fn a_subtitle_change_in_direct_play_changes_only_the_text() {
                 start_ms: None,
                 bitmap: BitmapSubtitles::Auto,
                 quality: Default::default(),
+                display: None,
             },
         )
         .await;
@@ -576,6 +581,7 @@ async fn a_subtitle_change_in_direct_play_changes_only_the_text() {
         subtitle,
         bitmap: BitmapSubtitles::Auto,
         position_ms: 3_000,
+        display: None,
     };
 
     let response = client.call(Some(&session), change(Some(0))).await;

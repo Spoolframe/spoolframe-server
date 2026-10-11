@@ -15,7 +15,6 @@ use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::server::ServerHandle;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
-use spoolframe_admin_api::ConfigReload;
 use spoolframe_admin_api::{
     Activity, LogPage, LogQuery, MetricsEndpointStatus, OtlpStatus, PlexServerActivity,
     RefusedScrape, ResourceAttribute, TelemetryStatus, UserSessionCount,
@@ -35,6 +34,7 @@ use spoolframe_admin_api::{
 use spoolframe_admin_api::{
     AudioPick, SsoLink, SubtitlePick, TrackOverrideEntry, TrackPreferences, TrackPreferencesInfo,
 };
+use spoolframe_admin_api::{ConfigReload, UplinkMeasurement};
 use spoolframe_admin_api::{InviteCreated, InviteEntry, InviteKind, NewInvite, PortableGrant};
 use spoolframe_admin_api::{LookupStatus, MappingStatus};
 use spoolframe_plex::PlexCatalog;
@@ -2992,6 +2992,33 @@ impl AdminApiServer for AdminApi {
         Ok(ConfigReload {
             applied: reloaded.applied,
             after_restart: reloaded.after_restart,
+        })
+    }
+
+    async fn uplink_measure(&self, ext: &Extensions) -> RpcResult<UplinkMeasurement> {
+        self.admin(ext).await?;
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("spoolframe-server/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| error(error_code::UNAVAILABLE, e.to_string()))?;
+        let rates = crate::uplink::measure_upload(
+            &client,
+            crate::uplink::SPEED_TEST_UP,
+            crate::uplink::MEASURE_BYTES,
+            crate::uplink::MEASURE_UPLOADS,
+        )
+        .await
+        .map_err(|e| error(error_code::UNAVAILABLE, e))?;
+        let (upload_mbps, suggested_budget_mbps) = crate::uplink::summarize(&rates);
+        tracing::info!(
+            upload_mbps,
+            suggested_budget_mbps,
+            "the home's upload measured"
+        );
+        Ok(UplinkMeasurement {
+            upload_mbps,
+            samples_mbps: rates.iter().map(|r| r / 1_000_000.0).collect(),
+            suggested_budget_mbps,
         })
     }
 

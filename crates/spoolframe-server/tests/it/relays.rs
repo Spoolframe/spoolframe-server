@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh_relay::server::{RelayConfig, Server as RelayServer, ServerConfig};
-use spoolframe_client_sdk::{Client, ClientOptions, Device, MemoryStorage, SdkError};
+use spoolframe_client_sdk::{Client, ClientOptions, Device, MemoryStorage, SdkError, Storage};
 use spoolframe_protocol::invite::Invite;
 use spoolframe_server::network::Relay;
 
@@ -63,13 +63,20 @@ fn relay_only_link(server: &TestServer) -> String {
 }
 
 async fn device(relays: bool) -> Client {
+    device_on(relays, Arc::new(MemoryStorage::default())).await
+}
+
+/// A device with relays `relays`, over `storage`: the same device (its
+/// key, saved servers) as every other opened over it, but a new endpoint,
+/// with no path from an earlier run.
+async fn device_on(relays: bool, storage: Arc<MemoryStorage>) -> Client {
     let options = ClientOptions {
         lan_discovery: false,
         relays,
         ..ClientOptions::default()
     };
     Client::open_with_options(
-        Arc::new(MemoryStorage::default()),
+        storage,
         Device {
             name: "Den PC".into(),
             client_name: "sdk-test".into(),
@@ -107,17 +114,146 @@ async fn a_device_with_relays_on_reaches_the_server_through_its_relay_alone() {
     drop(relay);
 }
 
+/// Acting on an invite whose link names relays is consent to them: a
+/// device with relays off reaches the server through them, and saving it
+/// keeps them chosen for it.
 #[tokio::test]
-async fn a_device_with_relays_off_never_reaches_a_server_through_one() {
+async fn a_device_with_relays_off_reaches_an_invite_s_server_through_its_relays() {
+    let (relay, url) = relay().await;
+    let server = server_on("relay-off-invite", &url).await;
+    let client = device(false).await;
+    let link = relay_only_link(&server);
+    assert_eq!(
+        client.connect_invite(&link).await.unwrap().name,
+        "Home Media"
+    );
+    let saved = client.save_invite_server(&link).await.unwrap();
+    assert_eq!(saved.use_relays, Some(true));
+    assert_eq!(saved.relays, [url.to_string()]);
+    client.close().await;
+    server.stop().await;
+    drop(relay);
+}
+
+/// A server saved from a relay-only link, by a device with relays
+/// `relays`, over the storage it returns.
+async fn saved_through_relay(server: &TestServer, relays: bool) -> Arc<MemoryStorage> {
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device_on(relays, storage.clone()).await;
+    client
+        .save_invite_server(&relay_only_link(server))
+        .await
+        .unwrap();
+    client.close().await;
+    storage
+}
+
+/// Whether a device with relays `relays` over `storage`, newly opened,
+/// reaches saved `server`: through its relay only, every address saved
+/// for it forgotten first (on loopback a relayed connection finds the
+/// direct path, and the address it reached is saved).
+async fn reaches(storage: Arc<MemoryStorage>, relays: bool, server: &TestServer) -> bool {
+    forget_addresses(&storage).await;
+    let client = device_on(relays, storage).await;
+    let id = server.server.id().to_string();
+    let reached = match client.connect(&id).await {
+        Ok(_) => true,
+        Err(SdkError::Unreachable(_)) => false,
+        Err(e) => panic!("{e:?}"),
+    };
+    client.close().await;
+    reached
+}
+
+/// Every address saved for every server in `storage`, forgotten.
+async fn forget_addresses(storage: &MemoryStorage) {
+    use spoolframe_client_sdk::storage::keys;
+    let bytes = storage.data(keys::SERVERS).await.unwrap().unwrap();
+    let mut servers: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    for server in &mut servers {
+        server["known_addrs"] = serde_json::json!([]);
+        server["advertised_addrs"] = serde_json::json!([]);
+    }
+    let bytes = serde_json::to_vec(&servers).unwrap();
+    storage.set_data(keys::SERVERS, Some(bytes)).await.unwrap();
+}
+
+/// A server's own choice wins over the client's both ways, and `None`
+/// follows the client's.
+#[tokio::test]
+async fn a_server_s_relay_choice_wins_over_the_client_s_and_none_follows_it() {
+    let (relay, url) = relay().await;
+    let server = server_on("relay-choice", &url).await;
+    let id = server.server.id().to_string();
+    let storage = saved_through_relay(&server, false).await;
+    // Chosen on by the invite: reached with the client's relays off.
+    assert!(reaches(storage.clone(), false, &server).await);
+
+    let client = device_on(true, storage.clone()).await;
+    client.set_server_relays(&id, Some(false)).await.unwrap();
+    client.close().await;
+    // Off for it: not reached with the client's relays on.
+    assert!(!reaches(storage.clone(), true, &server).await);
+
+    let client = device_on(true, storage.clone()).await;
+    client.set_server_relays(&id, None).await.unwrap();
+    assert_eq!(client.servers().await.unwrap()[0].use_relays, None);
+    client.close().await;
+    // No choice: the client's.
+    assert!(!reaches(storage.clone(), false, &server).await);
+    assert!(reaches(storage, true, &server).await);
+    server.stop().await;
+    drop(relay);
+}
+
+/// A device with relays off never reaches, through a relay, a server
+/// that has no choice of its own: one it only knows a relay of.
+#[tokio::test]
+async fn a_device_with_relays_off_never_reaches_a_server_without_a_choice_through_one() {
     let (relay, url) = relay().await;
     let server = server_on("relay-off", &url).await;
-    let client = device(false).await;
-    let refused = client.connect_invite(&relay_only_link(&server)).await;
-    assert!(
-        matches!(refused, Err(SdkError::Unreachable(_))),
-        "{refused:?}"
-    );
+    let id = server.server.id().to_string();
+    let storage = saved_through_relay(&server, true).await;
+    let client = device_on(true, storage.clone()).await;
+    client.set_server_relays(&id, None).await.unwrap();
     client.close().await;
+    assert!(!reaches(storage, false, &server).await);
+    server.stop().await;
+    drop(relay);
+}
+
+/// The relays a server is reached through are the user's once edited:
+/// a dead one alone does not reach it, and empty gives the list back.
+#[tokio::test]
+async fn an_edited_relay_list_is_the_one_dialled() {
+    let (relay, url) = relay().await;
+    let server = server_on("relay-edited", &url).await;
+    let id = server.server.id().to_string();
+    let storage = saved_through_relay(&server, true).await;
+    let client = device_on(true, storage.clone()).await;
+    client
+        .set_server_relay_urls(&id, vec!["http://127.0.0.1:9/".into()])
+        .await
+        .unwrap();
+    let entry = client.servers().await.unwrap().remove(0);
+    assert!(entry.relays_edited);
+    assert_eq!(entry.relays, ["http://127.0.0.1:9/"]);
+    assert!(matches!(
+        client
+            .set_server_relay_urls(&id, vec!["ftp://relay".into()])
+            .await,
+        Err(SdkError::InvalidInput(_))
+    ));
+    client.close().await;
+    assert!(!reaches(storage.clone(), true, &server).await);
+
+    let client = device_on(true, storage.clone()).await;
+    client
+        .set_server_relay_urls(&id, vec![url.to_string()])
+        .await
+        .unwrap();
+    client.close().await;
+    assert!(reaches(storage, true, &server).await);
     server.stop().await;
     drop(relay);
 }

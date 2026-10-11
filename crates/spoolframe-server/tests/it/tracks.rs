@@ -42,6 +42,7 @@ async fn chosen(client: &TestClient, session: &SessionId, id: &MediaId) -> Chose
         id: id.clone(),
         selection: None,
         bitmap: Default::default(),
+        display: None,
     };
     match client.call(Some(session), request).await {
         Response::Ok(Reply::PlaybackPlan {
@@ -121,6 +122,7 @@ async fn an_explicit_selection_is_used_as_sent() {
             subtitle: None,
         }),
         bitmap: Default::default(),
+        display: None,
     };
     let Response::Ok(Reply::PlaybackPlan { chosen, .. }) = client.call(Some(&alice), request).await
     else {

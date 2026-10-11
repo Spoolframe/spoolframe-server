@@ -152,6 +152,7 @@ async fn an_invite_makes_an_account_that_signs_in_and_plays() {
                 start_ms: None,
                 bitmap: Default::default(),
                 quality: Default::default(),
+                display: None,
             },
         )
         .await;

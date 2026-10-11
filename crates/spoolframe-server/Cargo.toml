@@ -53,6 +53,9 @@ iroh = { workspace = true }
 # A relay of the operator's own (P6-04), and the relay the relayed
 # connection tests run on loopback (P6-03).
 iroh-relay = { version = "1.3", default-features = false, features = ["server"] }
+# noq's congestion controllers (network.congestion_control); iroh re-exports
+# only the trait, not Cubic or BBR.
+noq-proto = { version = "1.3", default-features = false }
 # The path events of a connection, followed for the log.
 futures-util = { workspace = true }
 iroh-mdns-address-lookup = { workspace = true }

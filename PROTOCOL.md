@@ -24,6 +24,20 @@ peer may leave out (a revision-14 client does not send it), read then as
 `null`, so the revision stays. A conversion's codec, and whether an HDR
 film keeps its HDR, follow from it: see "Output codecs and HDR" below.
 
+Then a `display` on `playback_plan`, `start_playback`, `change_subtitle`
+and `change_quality`: `{ bit_depth, hdr }` (`DisplayCapabilities`, both
+fields required inside it, as in `VideoLimits`), what the screen shows
+now. It replaces `max_video.bit_depth` and `max_video.hdr` from `Hello`
+for that plan, and the playback keeps it: a re-plan without one plans
+for the screen it started on. A TV whose display mode changes while the
+app runs (Match Dynamic Range, another TV or receiver) works it out at
+each start. Left out, as a revision-14 client before it does, `Hello`'s
+apply, so the revision stays.
+
+Every field above that may be left out is a dev-era leniency, marked
+`compat(v1): required at the protocol reset` in the code: at the reset
+to revision 1 (PX-16) each becomes required.
+
 Revision 13 (P7-04, ties) kept the `spoolframe/client/1` ALPN and sets
 `PROTOCOL_VERSION` to 13. Update the server and SDK together. There are
 three new session requests, `tie_begin` (answered `tie_challenge`),
@@ -62,6 +76,13 @@ a new required field, `variant`: that `n` (0 for one encode, and for
 anything that is not a segment or a media playlist). One encode runs at
 a time: a read of another rung's segment moves it there, and the rung
 it left keeps what it wrote, readable.
+
+Since revision 14, a rung may carry `video`, its own converted video,
+where it is not the plan's resized: a remux ladder (PX-21, off the LAN
+in `auto`) has the plan's `video` a copy, its top rung with no `video`
+(the copy), and encodes under it, each with `video` an `encode`. All are
+cut at the source's keyframes, on one grid. Left out, as an older
+server does, it is `null`: the plan's.
 
 Revision 10 (P6-06, the quality choice) kept the `spoolframe/client/1`
 ALPN and sets `PROTOCOL_VERSION` to 10. Update the server and SDK
@@ -209,6 +230,49 @@ encodes. The server encodes in software only to H.264.
   tone-mapped or 8-bit encode `hvc1.1.6.L…`, `av01.0.<level>M.08` or
   `avc1…`, with `VIDEO-RANGE=SDR`. The fMP4 init segment carries `colr`,
   `mdcv` and `clli`, and HEVC is tagged `hvc1`.
+
+## The WAN uplink budget
+
+Since PX-46 the server splits its home's upload between the playbacks
+of devices off its LAN (`network.uplink`). A device is on the LAN when
+the address its connection uses is in one of the server's own interface
+subnets (a global IPv6 address in the home's /64 too), private,
+link-local or unique local, or in `network.lan_prefixes`; a relay path
+is never the LAN.
+
+- `StartPlayback` off the LAN with `Quality::Auto` is planned under the
+  playback's share of `network.uplink.budget_mbps`, and under the
+  client's measured `link_bitrate` if that is lower. On the LAN, and for
+  `Original` or a chosen `Bitrate` anywhere, the budget is not applied.
+- The share is equal, but while an admin plays off the LAN beside
+  anyone else, the admins' playbacks share
+  `network.uplink.owner_share_percent` of the budget and the others the
+  rest.
+- One playback off the LAN over `network.uplink.max_streams` is
+  refused with `Error::WanStreamsFull { max }`.
+- When a playback off the LAN starts or ends, the others' shares move.
+  Each one whose share moved by 15% or more is told
+  `Event::PlaybackShare { handle, max_bitrate }` on its connection's
+  events stream, a few seconds after the last start or end. A client in
+  `Auto` re-plans with `ChangeQuality` (the same `Auto`, at its
+  position), which the server plans under the new share. The SDK's
+  managed playback does this by itself. An older client ignores the
+  event (an unknown event type) and plays on as planned.
+
+### SDK
+
+- Converted reads (HLS segments, progressive chunks) are metered from
+  their first byte to their last, when the body is 512 KiB or more, so
+  the server's wait for its encode is not the link's time. Direct reads
+  are timed whole, as before.
+- A managed HLS playback in `Auto` that is not a ladder notes each whole
+  segment's bytes against its time; when the link carries less than
+  `LINK_SHARE` of what the last segments needed, it asks to be planned
+  for the link (`limit`), at most once every 30 s. A ladder is left to
+  the player.
+- On `Event::PlaybackShare` for its handle, a managed playback in
+  `Auto` re-plans with `change_quality(Auto, position)`.
+- `SdkError::WanStreamsFull { max }`.
 
 ## The server id
 

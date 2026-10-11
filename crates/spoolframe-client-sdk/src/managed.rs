@@ -132,6 +132,12 @@ pub trait PlaybackBackend: Send + Sync + 'static {
     fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
         None
     }
+    /// The handles of playbacks whose share of the server's uplink changed
+    /// (PX-46): a managed playback in Auto plans itself again on its own.
+    /// A backend with no server keeps the default.
+    fn shares(&self) -> Option<broadcast::Receiver<PlaybackHandle>> {
+        None
+    }
     /// HLS subtitle segment `n` ([`Session::read_subtitle_segment`]).
     async fn subtitle_segment(
         &self,
@@ -230,6 +236,9 @@ impl PlaybackBackend for Session {
     fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
         Some(self.client.link(self.server).meter())
     }
+    fn shares(&self) -> Option<broadcast::Receiver<PlaybackHandle>> {
+        Some(self.client.inner.shares.subscribe())
+    }
 }
 
 struct State {
@@ -259,6 +268,11 @@ struct State {
     ended: Option<SdkError>,
     finishing: bool,
     closed: bool,
+    /// The last few whole HLS segments read: their bytes and their time
+    /// (PX-46), what the stream needs of the link.
+    recent_segments: VecDeque<(u64, Duration)>,
+    /// When a slow link last made this ask to be planned again for it.
+    limit_asked: Option<std::time::Instant>,
 }
 struct Inner {
     backend: Arc<dyn PlaybackBackend>,
@@ -364,6 +378,20 @@ fn continues(before: &Playback, next: &Playback) -> bool {
 
 /// Where each segment of an HLS media playlist starts, from its
 /// `#EXTINF` durations.
+/// Whether a link carrying `link` bit/s is too slow for a stream whose
+/// recent segments held `segments` (bytes, time) (PX-46): under
+/// [`spoolframe_protocol::playback::LINK_SHARE`] of it is what a plan for
+/// the link takes, so it must be at least what the segments need.
+pub(crate) fn too_slow(link: f64, segments: &[(u64, Duration)]) -> bool {
+    let bytes: u64 = segments.iter().map(|(b, _)| b).sum();
+    let secs: f64 = segments.iter().map(|(_, t)| t.as_secs_f64()).sum();
+    if secs <= 0.0 {
+        return false;
+    }
+    let needs = bytes as f64 * 8.0 / secs;
+    link * spoolframe_protocol::playback::LINK_SHARE < needs
+}
+
 fn segment_starts(playlist: &str) -> Vec<Duration> {
     let mut starts = Vec::new();
     let mut at = Duration::ZERO;
@@ -396,7 +424,8 @@ impl ManagedPlayback {
         selection: Option<Selection>,
         options: PlaybackOptions,
     ) -> Result<Self, SdkError> {
-        let mut admission = admitted(backend.clone(), item.clone(), selection, options).await?;
+        let mut admission =
+            admitted(backend.clone(), item.clone(), selection, options.clone()).await?;
         let playback = admission.playback.take().expect("admitted playback");
         Ok(Self::adopt(backend, item, selection, options, playback))
     }
@@ -435,6 +464,8 @@ impl ManagedPlayback {
                 ended: None,
                 finishing: false,
                 closed: false,
+                recent_segments: VecDeque::new(),
+                limit_asked: None,
             }),
             control: tokio::sync::Mutex::new(()),
             changed,
@@ -442,6 +473,38 @@ impl ManagedPlayback {
             notify: notify.clone(),
             runtime: tokio::runtime::Handle::current(),
         });
+        // A share of the server's uplink that moved (PX-46): a playback in
+        // Auto plans itself again where the viewer is, as the viewer's own
+        // quality change would.
+        if let Some(mut shares) = inner.backend.shares() {
+            let weak = Arc::downgrade(&inner);
+            inner.runtime.spawn(async move {
+                loop {
+                    let handle = match shares.recv().await {
+                        Ok(handle) => handle,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    };
+                    let Some(inner) = weak.upgrade() else { return };
+                    let this = ManagedPlayback(inner);
+                    let (mine, position) = {
+                        let state = this.0.state.lock();
+                        (
+                            state.playback.handle == handle
+                                && !state.closed
+                                && state.options.quality == PlaybackQuality::Auto,
+                            state.position.unwrap_or_default(),
+                        )
+                    };
+                    if mine
+                        && let Err(error) =
+                            this.change_quality(PlaybackQuality::Auto, position).await
+                    {
+                        let _ = this.0.errors.send(error);
+                    }
+                }
+            });
+        }
         let weak = Arc::downgrade(&inner);
         inner.runtime.spawn(async move {
             loop {
@@ -647,9 +710,12 @@ impl ManagedPlayback {
                         .await
                 })
                 .await?;
-            let mut state = self.0.state.lock();
-            let generation = state.generation;
-            state.segment_reads.insert((variant, n), generation);
+            {
+                let mut state = self.0.state.lock();
+                let generation = state.generation;
+                state.segment_reads.insert((variant, n), generation);
+            }
+            self.segment_read(n, 0, &chunk);
             return Ok(chunk);
         }
         let p = self.live()?;
@@ -671,8 +737,69 @@ impl ManagedPlayback {
                 self.restart(&p.handle, Restart::Resume { at }).await?;
                 Err(self.resumed_error(at))
             }
+            Ok(chunk) => {
+                self.segment_read(n, offset, &chunk);
+                Ok(chunk)
+            }
             answer => answer,
         }
+    }
+
+    /// The most whole segments a stream's need is worked out over.
+    const RECENT_SEGMENTS: usize = 4;
+    /// The least time between two asks to be planned for the link.
+    const LIMIT_EVERY: Duration = Duration::from_secs(30);
+
+    /// HLS segment `n` read from `offset` (PX-46): once it is whole, what
+    /// it held is noted against its time, and an Auto playback whose
+    /// link carries less than its segments need asks to be planned again
+    /// for the link, as the direct reader does when it stalls (P6-06). A
+    /// ladder is left to the player, which moves between its rungs.
+    fn segment_read(&self, n: u32, offset: u64, chunk: &Chunk) {
+        if n == 0 || !chunk.complete || offset + chunk.bytes.len() as u64 != chunk.size {
+            return;
+        }
+        let link = self
+            .0
+            .backend
+            .link_meter()
+            .and_then(|meter| meter.rate(std::time::Instant::now()));
+        let mut state = self.0.state.lock();
+        let index = n as usize - 1;
+        let (Some(start), Some(end)) = (state.segments.get(index), state.segments.get(index + 1))
+        else {
+            return;
+        };
+        let time = end.saturating_sub(*start);
+        state.recent_segments.push_back((chunk.size, time));
+        while state.recent_segments.len() > Self::RECENT_SEGMENTS {
+            state.recent_segments.pop_front();
+        }
+        let ladder = matches!(
+            &state.playback.plan,
+            PlaybackPlan::Converted { ladder, .. } if !ladder.is_empty()
+        );
+        let Some(link) = link.map(|bytes| bytes * 8.0) else {
+            return;
+        };
+        if ladder
+            || state.options.quality != PlaybackQuality::Auto
+            || state.recent_segments.len() < 2
+            || state
+                .limit_asked
+                .is_some_and(|at| at.elapsed() < Self::LIMIT_EVERY)
+            || !too_slow(link, state.recent_segments.make_contiguous())
+        {
+            return;
+        }
+        state.limit_asked = Some(std::time::Instant::now());
+        drop(state);
+        let this = self.clone();
+        self.0.runtime.spawn(async move {
+            if let Err(error) = this.limit(link as u64).await {
+                let _ = this.0.errors.send(error);
+            }
+        });
     }
     /// HLS subtitle segment `n` (from 1), resumed through as
     /// [`Self::read_segment`] from offset 0.
@@ -737,7 +864,7 @@ impl ManagedPlayback {
             .or(state.options.start);
             let options = PlaybackOptions {
                 start,
-                ..state.options
+                ..state.options.clone()
             };
             (state.playback.clone(), state.selection, options)
         };
@@ -745,7 +872,7 @@ impl ManagedPlayback {
             self.0.backend.clone(),
             self.0.item.clone(),
             selection,
-            options,
+            options.clone(),
         )
         .await;
         let mut admission = match admission {
@@ -1106,6 +1233,8 @@ mod tests {
         hold_seek: std::sync::atomic::AtomicBool,
         entered: Notify,
         release: Notify,
+        /// The server's share events, once a test sends some (PX-46).
+        shares: Mutex<Option<broadcast::Sender<PlaybackHandle>>>,
     }
     use std::sync::atomic::Ordering::SeqCst;
     fn item() -> MediaId {
@@ -1194,6 +1323,30 @@ mod tests {
             self.entered.notify_one();
             Ok(())
         }
+        async fn change_quality(
+            &self,
+            h: &PlaybackHandle,
+            quality: PlaybackQuality,
+            _: BitmapSubtitles,
+            position: Duration,
+        ) -> Result<PlaybackChange, SdkError> {
+            self.events.lock().push(format!(
+                "quality:{}:{quality:?}:{}",
+                h.0,
+                position.as_secs()
+            ));
+            Ok(PlaybackChange {
+                plan: playback(1).plan,
+                size: 100,
+                epoch: 0,
+            })
+        }
+        fn shares(&self) -> Option<broadcast::Receiver<PlaybackHandle>> {
+            self.shares
+                .lock()
+                .as_ref()
+                .map(broadcast::Sender::subscribe)
+        }
     }
     async fn open(b: Arc<Backend>) -> ManagedPlayback {
         ManagedPlayback::open(b, item(), None, PlaybackOptions::default())
@@ -1209,6 +1362,59 @@ mod tests {
         .await
         .unwrap();
     }
+    /// PX-46: the server tells this playback its share moved; in Auto it
+    /// plans itself again where the viewer is. Another handle's event, or
+    /// a quality the viewer chose, changes nothing.
+    #[tokio::test]
+    async fn a_moved_share_plans_an_auto_playback_again() {
+        let b = Arc::new(Backend::default());
+        let (shares, _) = broadcast::channel(4);
+        *b.shares.lock() = Some(shares.clone());
+        let p = open(b.clone()).await;
+        p.report_position(Duration::from_secs(42)).unwrap();
+        shares.send(PlaybackHandle("someone-else".into())).unwrap();
+        shares.send(PlaybackHandle("1".into())).unwrap();
+        until(|| {
+            b.events
+                .lock()
+                .iter()
+                .any(|e| e.starts_with("quality:1:Auto:42"))
+        })
+        .await;
+        assert_eq!(
+            b.events
+                .lock()
+                .iter()
+                .filter(|e| e.starts_with("quality:"))
+                .count(),
+            1
+        );
+        // Chosen by the viewer: the share is not theirs to follow.
+        p.change_quality(PlaybackQuality::Bitrate(4_000_000), Duration::from_secs(42))
+            .await
+            .unwrap();
+        shares.send(PlaybackHandle("1".into())).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            b.events
+                .lock()
+                .iter()
+                .filter(|e| e.starts_with("quality:1:Auto"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_link_under_what_the_segments_need_is_too_slow() {
+        // Four 6 s segments of 6 MB: 8 Mbit/s.
+        let segments = [(6_000_000, Duration::from_secs(6)); 4];
+        assert!(too_slow(7_000_000.0, &segments));
+        assert!(!too_slow(20_000_000.0, &segments));
+        // Nothing timed says nothing.
+        assert!(!too_slow(1.0, &[(1_000, Duration::ZERO)]));
+    }
+
     #[tokio::test]
     async fn cancelled_start_stops_its_admitted_handle() {
         let b = Arc::new(Backend::default());
@@ -1450,6 +1656,14 @@ mod tests {
                 })
             }
         }
+        /// A screen in an SDR mode, 8 bits.
+        fn sdr_display() -> spoolframe_types::DisplayCapabilities {
+            spoolframe_types::DisplayCapabilities {
+                bit_depth: Some(8),
+                hdr: Some(std::collections::BTreeSet::new()),
+            }
+        }
+
         async fn opened(server: &Arc<Server>) -> ManagedPlayback {
             let selection = Selection {
                 audio: Some(1),
@@ -1458,6 +1672,7 @@ mod tests {
             let options = PlaybackOptions {
                 start: Some(Duration::from_secs(5)),
                 bitmap: BitmapSubtitles::Text,
+                display: Some(sdr_display()),
                 ..PlaybackOptions::default()
             };
             ManagedPlayback::open(server.clone(), item(), Some(selection), options)
@@ -1473,10 +1688,12 @@ mod tests {
             p.flush().await.unwrap();
             s.expire();
             assert_eq!(p.read(0, 1).await, Ok(vec![42]));
-            let (selection, options) = s.starts.lock()[1];
+            let (selection, options) = s.starts.lock()[1].clone();
             assert_eq!(selection, s.starts.lock()[0].0);
             assert_eq!(options.bitmap, BitmapSubtitles::Text);
             assert_eq!(options.start, Some(Duration::from_secs(600)));
+            // And for the screen it started for (PGPU-06).
+            assert_eq!(options.display, Some(sdr_display()));
         }
 
         /// The new playback knows where the viewer is, for Continue

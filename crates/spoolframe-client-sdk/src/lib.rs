@@ -26,6 +26,7 @@ pub mod pairing;
 pub mod portable;
 mod portable_sign_in;
 mod refusals;
+mod relay_policy;
 mod servers;
 mod session;
 pub mod storage;

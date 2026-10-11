@@ -65,6 +65,7 @@ mod ties;
 mod tone_map;
 mod tracks;
 mod trust;
+mod uplink;
 mod wan;
 mod watch;
 mod wizard;

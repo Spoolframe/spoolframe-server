@@ -29,6 +29,7 @@ pub struct MediaTracks {
     /// PROTOCOL_VERSION bump, so they are not `required::option`: a
     /// server from before them leaves the keys out, and that reads as
     /// `None`.
+    // compat(v1): required at the protocol reset
     pub bit_rate: Option<u64>,
     /// The main picture; `None` for audio only (music).
     pub video: Option<VideoTrack>,
@@ -54,6 +55,7 @@ pub struct VideoTrack {
     /// The picture's own average bits per second, where the file says:
     /// MP4 does for each stream, Matroska where its muxer wrote
     /// statistics tags (mkvmerge does).
+    // compat(v1): required at the protocol reset
     pub bit_rate: Option<u64>,
 }
 

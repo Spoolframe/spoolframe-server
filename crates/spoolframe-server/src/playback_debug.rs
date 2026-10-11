@@ -590,7 +590,25 @@ fn row(s: &Snapshot) -> api::PlaybackRow {
         }),
         made: made(s),
         start: start(&s.start),
+        link: link(&s.link),
     }
+}
+
+/// Its link (the "link" log lines), once an interval was read.
+fn link(t: &crate::link_stats::Totals) -> Option<api::PlaybackLink> {
+    let (interval, path) = t.last.as_ref()?;
+    let hundredths = |pct: f64| (pct * 100.0).round().clamp(0.0, f64::from(u32::MAX)) as u32;
+    Some(api::PlaybackLink {
+        path: path.name.clone(),
+        rtt_ms: path.rtt.as_millis() as u64,
+        send_bps: (interval.send_mbps() * 1e6) as u64,
+        lost_hundredths: hundredths(interval.loss_percent()),
+        switches: interval.path_switches,
+        average_bps: (t.send_mbps() * 1e6) as u64,
+        max_rtt_ms: t.max_rtt.as_millis() as u64,
+        total_lost_hundredths: hundredths(t.loss_percent()),
+        total_switches: t.path_switches,
+    })
 }
 
 pub(crate) fn gpu_api(hardware: Hardware) -> api::GpuApi {

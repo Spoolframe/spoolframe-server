@@ -50,6 +50,8 @@ mod sso;
 mod telemetry;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod trust;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod uplink;
 
 #[cfg(target_arch = "wasm32")]
 mod app;

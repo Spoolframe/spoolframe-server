@@ -1421,6 +1421,20 @@ pub struct ConfigReload {
     pub after_restart: Vec<String>,
 }
 
+/// What `admin.uplinkMeasure` found (PX-46): the home's upload, from
+/// timed uploads to Cloudflare's public speed test.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UplinkMeasurement {
+    /// The upload, in Mbit/s: the median of the samples.
+    pub upload_mbps: f64,
+    /// Each upload's rate, in Mbit/s, in the order made.
+    pub samples_mbps: Vec<f64>,
+    /// What `network.uplink.budget_mbps` would be at 80% of it, rounded
+    /// down, at least 1.
+    pub suggested_budget_mbps: u64,
+}
+
 /// How the server starts again after `admin.restart`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2563,6 +2577,33 @@ pub struct PlaybackRow {
     pub made: PlaybackMade,
     /// How long it took to start (PX-24).
     pub start: PlaybackStart,
+    /// Its device's link, as the server's "link" log lines read it every
+    /// 10 s; `None` before the first interval. Added after the web UI
+    /// shipped with the server, so an older server leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<PlaybackLink>,
+}
+
+/// A playback's link to its device (the server's "link" lines): the last
+/// interval, and the totals so far.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackLink {
+    /// `lan …`, `direct …` or `relay …`.
+    pub path: String,
+    pub rtt_ms: u64,
+    /// The last interval's send rate, bits per second.
+    pub send_bps: u64,
+    /// The last interval's packets lost, in hundredths of a percent.
+    pub lost_hundredths: u32,
+    /// Path changes in the last interval.
+    pub switches: u64,
+    /// Sent over the playback so far, bits per second.
+    pub average_bps: u64,
+    pub max_rtt_ms: u64,
+    /// Lost over the playback so far, hundredths of a percent.
+    pub total_lost_hundredths: u32,
+    pub total_switches: u64,
 }
 
 /// How a playback ended (P3-15).
@@ -3367,6 +3408,14 @@ pub trait AdminApi {
     /// `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "configReload", with_extensions)]
     async fn config_reload(&self) -> jsonrpsee::core::RpcResult<ConfigReload>;
+
+    /// Measure the home's upload (PX-46) with Cloudflare's public speed
+    /// test (`speed.cloudflare.com/__up`): a few uploads of 10 MB, each
+    /// timed, for `network.uplink.budget_mbps`. Sends about 30 MB and
+    /// takes up to half a minute; changes no setting. Cloudflare out of
+    /// reach is `UNAVAILABLE` with why. Needs an admin.
+    #[method(name = "uplinkMeasure", with_extensions)]
+    async fn uplink_measure(&self) -> jsonrpsee::core::RpcResult<UplinkMeasurement>;
 
     /// The setup wizard's progress (P3-10).
     #[method(name = "setupState", with_extensions)]

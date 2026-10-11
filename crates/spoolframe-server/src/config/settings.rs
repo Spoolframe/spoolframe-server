@@ -77,6 +77,11 @@ pub const SETTINGS: &[Setting] = &[
     // and its parts are checked together (`public_ip` against
     // `lookup_via`), so the web UI sets it whole.
     restart("network.wan"),
+    live("network.lan_prefixes"),
+    live("network.uplink.budget_mbps"),
+    live("network.uplink.max_streams"),
+    live("network.uplink.owner_share_percent"),
+    restart("network.congestion_control"),
     restart("admin.listen"),
     restart("admin.public_url"),
     restart("admin.trusted_proxies"),

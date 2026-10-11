@@ -121,17 +121,57 @@ pub(crate) struct SavedServer {
     /// When that event came, in Unix seconds; `None` if none has.
     #[serde(default)]
     pub advertised_at: Option<u64>,
+    /// Whether this device reaches it through relays: the user's choice,
+    /// or an invite's (redeeming or saving one whose link names relays
+    /// chooses them); `None` follows [`crate::ClientOptions::relays`].
+    /// Absent from a file written before the SDK kept it: `None`.
+    #[serde(default)]
+    pub use_relays: Option<bool>,
+    /// `relays` is the user's list ([`crate::Client::set_server_relay_urls`]):
+    /// what the server advertises and what invites name no longer change
+    /// it. Absent from a file written before the SDK kept it: false.
+    #[serde(default)]
+    pub relays_edited: bool,
 }
+
+/// n0's public pkarr relay, where a server with `network.pkarr = "n0"`
+/// publishes its record.
+pub(crate) const N0_LOOKUP: &str = "https://dns.iroh.link/pkarr";
 
 impl SavedServer {
     /// The relays and lookup the server told (P6-03, P6-05), held to what
     /// an invite link may carry (P6-07, glm E-3): each a plain http(s) URL,
     /// once, at most [`MAX_HINTS`] relays. The rest is left out: a pinned
     /// server is trusted for its key, not to size what this device keeps.
+    /// A list the user edited is kept as they left it; the lookup is
+    /// taken either way.
     pub fn told_relays(&mut self, relays: Vec<String>, lookup: Option<String>) {
-        let urls: Vec<String> = relays.into_iter().filter(|r| is_relay_url(r)).collect();
-        self.relays = crate::client::newest_first(&urls, &[], MAX_HINTS);
+        if !self.relays_edited {
+            self.relays = relay_list(relays);
+        }
         self.lookup = lookup.filter(|url| is_relay_url(url));
+    }
+
+    /// Whether n0's lookup ([`N0_LOOKUP`]) is this device's only way to it
+    /// off the LAN: reached through relays (its own choice, else
+    /// `relays_on`, the client's), yet with no relay and no lookup known.
+    /// So is a server saved while it had both off, until it next says
+    /// otherwise, which it can only do over a connection.
+    pub fn needs_n0_lookup(&self, relays_on: bool) -> bool {
+        self.use_relays.unwrap_or(relays_on) && self.relays.is_empty() && self.lookup.is_none()
+    }
+
+    /// The user's own relay list from now on; empty gives it back to the
+    /// server, which fills it at its next `ServerAddresses` event (and an
+    /// invite's link meanwhile). Held as [`SavedServer::told_relays`]
+    /// holds a told one; `false` if a URL is not a relay's.
+    pub fn edit_relays(&mut self, relays: Vec<String>) -> bool {
+        if !relays.iter().all(|r| is_relay_url(r)) {
+            return false;
+        }
+        self.relays_edited = !relays.is_empty();
+        self.relays = relay_list(relays);
+        true
     }
 
     /// A key pinned now, from a connection to it just made at `addrs`.
@@ -157,6 +197,8 @@ impl SavedServer {
             lookup: None,
             advertised_addrs: Vec::new(),
             advertised_at: None,
+            use_relays: None,
+            relays_edited: false,
         };
         server.saw(addrs, now);
         server
@@ -293,6 +335,13 @@ pub(crate) fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// `relays` as a server's relay list: each once, at most [`MAX_HINTS`],
+/// only plain http(s) URLs.
+fn relay_list(relays: Vec<String>) -> Vec<String> {
+    let urls: Vec<String> = relays.into_iter().filter(|r| is_relay_url(r)).collect();
+    crate::client::newest_first(&urls, &[], MAX_HINTS)
+}
+
 /// Unix seconds as a time.
 pub(crate) fn time(secs: Option<u64>) -> Option<SystemTime> {
     secs.map(|s| UNIX_EPOCH + Duration::from_secs(s))
@@ -313,9 +362,15 @@ pub struct ServerEntry {
     /// device, and for a server not saved. An address this device only
     /// reached is not in it.
     pub advertised_addrs: Vec<SocketAddr>,
-    /// The URLs of the relays that event listed; empty while the server
-    /// has relays off.
+    /// The relays this device reaches it through when its relays are on
+    /// (`use_relays`): those its latest `ServerAddresses` event listed and
+    /// an invite's link named, or the user's own list once edited
+    /// (`relays_edited`). Empty while the server has relays off and none
+    /// was named.
     pub relays: Vec<String>,
+    /// `relays` is the user's ([`crate::Client::set_server_relay_urls`]):
+    /// what the server advertises does not change it.
+    pub relays_edited: bool,
     /// When that event came, to the second, for "as of" text. `None` if
     /// none has.
     pub advertised_at: Option<SystemTime>,
@@ -344,6 +399,10 @@ pub struct ServerEntry {
     /// When it last answered a connect as itself. `None` for a server not
     /// saved, or not connected to since the SDK kept the date.
     pub last_connected_at: Option<SystemTime>,
+    /// Whether this device reaches it through relays: `Some` its own
+    /// choice ([`crate::Client::set_server_relays`], or an invite's), `None`
+    /// [`crate::ClientOptions::relays`]. `None` for a server not saved.
+    pub use_relays: Option<bool>,
 }
 
 pub(crate) async fn load(storage: &dyn Storage) -> Result<Vec<SavedServer>, StorageError> {
@@ -416,6 +475,8 @@ mod tests {
                     lookup: None,
                     advertised_addrs: Vec::new(),
                     advertised_at: None,
+                    use_relays: None,
+                    relays_edited: false,
                 },
                 SavedServer {
                     name: "Cabin".into(),
@@ -431,6 +492,8 @@ mod tests {
                     lookup: None,
                     advertised_addrs: Vec::new(),
                     advertised_at: None,
+                    use_relays: None,
+                    relays_edited: false,
                 },
             ]
         );
@@ -474,6 +537,25 @@ mod tests {
             Vec::new(),
             false,
         )
+    }
+
+    /// What the server tells refreshes its relays until the user edits
+    /// them; an empty edit gives them back.
+    #[test]
+    fn an_edited_relay_list_is_kept_from_what_the_server_tells() {
+        let mut server = server();
+        server.told_relays(vec!["https://a.example.net/".into()], None);
+        assert_eq!(server.relays, ["https://a.example.net/"]);
+        assert!(server.edit_relays(vec!["https://mine.example.net/".into()]));
+        assert!(server.relays_edited);
+        server.told_relays(vec!["https://b.example.net/".into()], None);
+        assert_eq!(server.relays, ["https://mine.example.net/"]);
+        assert!(!server.edit_relays(vec!["ftp://nope".into()]));
+        assert_eq!(server.relays, ["https://mine.example.net/"]);
+        assert!(server.edit_relays(Vec::new()));
+        assert!(!server.relays_edited);
+        server.told_relays(vec!["https://b.example.net/".into()], None);
+        assert_eq!(server.relays, ["https://b.example.net/"]);
     }
 
     #[test]
@@ -786,6 +868,23 @@ mod tests {
             server.lookup.as_deref(),
             Some("https://dns.iroh.link/pkarr")
         );
+    }
+
+    /// A server saved with relays and its record off, which turned both on
+    /// since (the tester's on 5G): n0's lookup until it tells its own.
+    #[test]
+    fn a_server_with_no_relay_or_lookup_is_looked_up_at_n0_while_relays_are_on() {
+        let mut server = server();
+        assert!(server.needs_n0_lookup(true));
+        assert!(!server.needs_n0_lookup(false));
+        server.use_relays = Some(false);
+        assert!(!server.needs_n0_lookup(true));
+        server.use_relays = Some(true);
+        assert!(server.needs_n0_lookup(false));
+        server.told_relays(vec!["https://relay.example.net/".into()], None);
+        assert!(!server.needs_n0_lookup(true));
+        server.told_relays(vec![], Some("https://pkarr.example.net/".into()));
+        assert!(!server.needs_n0_lookup(true));
     }
 
     #[tokio::test]

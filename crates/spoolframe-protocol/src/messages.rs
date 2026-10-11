@@ -11,8 +11,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{
-    ClientCapabilities, Item, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId, Platform,
-    Role, SubtitleFormat, TrackPreferences,
+    ClientCapabilities, DisplayCapabilities, Item, Library, LibraryId, Marker, MediaId,
+    MediaTracks, PersonId, Platform, Role, SubtitleFormat, TrackPreferences,
 };
 
 use crate::invite_admin::{CreateInvite, InviteCreated, InviteSummary};
@@ -211,6 +211,11 @@ pub enum Request {
         selection: Option<Selection>,
         /// How a picked bitmap subtitle is shown (P2-07).
         bitmap: BitmapSubtitles,
+        /// What the screen shows now (PGPU-06): its HDR formats and bit
+        /// depth, over Hello's, for this plan. Left out, Hello's.
+        // compat(v1): required at the protocol reset
+        #[serde(default)]
+        display: Option<DisplayCapabilities>,
     },
     /// Plan `id` and, if it plays directly, open a playback session to
     /// read it through. Without a selection, as for `PlaybackPlan`.
@@ -227,6 +232,12 @@ pub enum Request {
         /// The quality the viewer chose for it (P6-06): for the link, at
         /// most a bitrate, or the original.
         quality: Quality,
+        /// What the screen shows now (PGPU-06): its HDR formats and bit
+        /// depth, over Hello's, for this plan and the playback it starts;
+        /// a re-plan without one keeps it. Left out, Hello's.
+        // compat(v1): required at the protocol reset
+        #[serde(default)]
+        display: Option<DisplayCapabilities>,
     },
     /// End a playback now, and any encode for it.
     StopPlayback {
@@ -404,6 +415,12 @@ pub enum Request {
         subtitle: Option<u32>,
         bitmap: BitmapSubtitles,
         position_ms: u64,
+        /// What the screen shows now (PGPU-06), over Hello's, for this
+        /// plan and the playback from then on. Left out, what the playback
+        /// started with.
+        // compat(v1): required at the protocol reset
+        #[serde(default)]
+        display: Option<DisplayCapabilities>,
     },
     /// Plan a playing playback again for `quality` (P6-06): the viewer
     /// chose another, or, with `Auto`, the device found its link too slow
@@ -417,6 +434,12 @@ pub enum Request {
         quality: Quality,
         bitmap: BitmapSubtitles,
         position_ms: u64,
+        /// What the screen shows now (PGPU-06), over Hello's, for this
+        /// plan and the playback from then on. Left out, what the playback
+        /// started with.
+        // compat(v1): required at the protocol reset
+        #[serde(default)]
+        display: Option<DisplayCapabilities>,
     },
     /// A converted playback's HLS playlist (P2-05).
     GetManifest {
@@ -1233,6 +1256,12 @@ pub enum Error {
     /// The server is converting as many files as it may at once.
     #[error("the server is busy converting; try again later")]
     Busy,
+    /// The server plays at most `max` playbacks off its LAN at once
+    /// (PX-46, `network.uplink.max_streams`), and that many are playing.
+    /// Try again when one ends; a device on the server's LAN is not
+    /// counted.
+    #[error("the server plays at most {max} playbacks outside its home at once")]
+    WanStreamsFull { max: u32 },
     /// The encode for this playback failed; `reason` is ffmpeg's.
     #[error("the conversion failed: {reason}")]
     PlaybackFailed { reason: String },
@@ -1386,6 +1415,18 @@ pub enum Event {
         /// nothing.
         #[serde(deserialize_with = "spoolframe_types::required::option")]
         lookup: Option<String>,
+    },
+    /// Playback `handle`'s share of the server's WAN uplink changed
+    /// (PX-46): another WAN playback started or ended, or the budget
+    /// changed. A playback in `Quality::Auto` re-plans with
+    /// `ChangeQuality` at its position (the SDK's managed playback does
+    /// it by itself); `max_bitrate` is the new cap, `None` none. Sent only
+    /// for a move of 15% or more, a few seconds after the last start or
+    /// end. One of another quality may ignore it.
+    PlaybackShare {
+        handle: PlaybackHandle,
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        max_bitrate: Option<u64>,
     },
     /// An event type this build does not know; ignore it.
     #[serde(other)]

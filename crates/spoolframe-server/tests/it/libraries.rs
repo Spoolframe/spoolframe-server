@@ -303,6 +303,7 @@ impl Served {
             start_ms: None,
             bitmap: Default::default(),
             quality: Default::default(),
+            display: None,
         };
         match self.call(request).await {
             Response::Ok(Reply::PlaybackStarted { size, .. }) => size,
@@ -597,6 +598,7 @@ async fn removing_a_library_and_adding_it_back_keeps_its_watch_state() {
             start_ms: None,
             bitmap: Default::default(),
             quality: Default::default(),
+            display: None,
         })
         .await
     else {
@@ -665,6 +667,7 @@ async fn removing_a_library_ends_its_playbacks_at_once() {
         start_ms: None,
         bitmap: Default::default(),
         quality: Default::default(),
+        display: None,
     };
     let Response::Ok(Reply::PlaybackStarted { handle: docs, .. }) =
         served.call(start("plex:movie:41")).await

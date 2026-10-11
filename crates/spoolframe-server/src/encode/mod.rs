@@ -225,14 +225,24 @@ impl Conversion {
                 return Err(e);
             }
         };
-        // An HLS start begins at the segment the position falls in.
-        let (start, first_segment) = playback_seek(segments.as_ref(), start, *video);
         let start_rung = if ladder.is_empty() {
             0
         } else {
             source.start_rung.min(ladder.len() as u32 - 1)
         };
         let first_video = rung_video(*video, ladder, start_rung);
+        // An HLS start begins at the segment the position falls in, sought
+        // as the rung it starts on is: a copy only at a keyframe.
+        let (start, first_segment) = playback_seek(segments.as_ref(), start, first_video);
+        // The GPU is picked for an encode (PGPU-05): a remux ladder that
+        // starts on its copy has its encodes picked for, its highest.
+        let encoded = (0..ladder.len() as u32)
+            .map(|n| rung_video(*video, ladder, n))
+            .find(|v| matches!(v, Some(ConvertedVideo::Encode { .. })));
+        let picked_for = match first_video {
+            Some(ConvertedVideo::Copy { .. }) => encoded.unwrap_or(first_video),
+            _ => first_video,
+        };
         let run_on = run_on(
             &jobs,
             &source,
@@ -240,7 +250,7 @@ impl Conversion {
                 input: &input,
                 sidecar: sidecar.as_deref(),
                 descriptor: &source.descriptor,
-                video: first_video,
+                video: picked_for,
                 audio: *audio,
                 subtitle: *subtitle,
                 encoders: &source.gpus.software,
@@ -267,6 +277,7 @@ impl Conversion {
             start,
             first_segment,
             source.slot,
+            keyframe_cuts(*video, first_video, segments.as_ref()),
         );
         let job = match job {
             Ok(job) => job,
@@ -454,7 +465,7 @@ impl Conversion {
         if n >= job.first_kept() && n <= head + SEGMENTS_AHEAD && !failed_on_gpu {
             return Ok(job.clone());
         }
-        let (start, from) = run_at(segments, n, self.video);
+        let (start, from) = run_at(segments, n, rung_video(self.video, &self.ladder, rung));
         let epoch = job.epoch + 1;
         let next = spawn(
             &self.jobs,
@@ -469,6 +480,7 @@ impl Conversion {
             start,
             from,
             job.slot(),
+            self.cuts(rung),
         )?;
         current.job.stop();
         current.job = next;
@@ -528,7 +540,7 @@ impl Conversion {
         n: u32,
         segments: &Segments,
     ) -> Result<Arc<EncodeJob>, JobError> {
-        let (start, from) = run_at(segments, n, self.video);
+        let (start, from) = run_at(segments, n, rung_video(self.video, &self.ladder, rung));
         let epoch = current.job.epoch + 1;
         let next = spawn(
             &self.jobs,
@@ -543,6 +555,7 @@ impl Conversion {
             start,
             from,
             current.job.slot(),
+            self.cuts(rung),
         )?;
         let left = std::mem::replace(&mut current.job, next);
         left.stop();
@@ -568,6 +581,16 @@ impl Conversion {
         )
     }
 
+    /// Where an encode of `rung` cuts, when it is not its own grid: see
+    /// [`keyframe_cuts`].
+    fn cuts(&self, rung: u32) -> Option<Vec<u64>> {
+        keyframe_cuts(
+            self.video,
+            rung_video(self.video, &self.ladder, rung),
+            self.segments.as_ref(),
+        )
+    }
+
     /// The job running now.
     pub fn job(&self) -> Arc<EncodeJob> {
         self.current.lock().job.clone()
@@ -576,7 +599,9 @@ impl Conversion {
     /// Seek using the same timeline and keyframe alignment as a new
     /// playback. HLS segment numbers always refer to the full film.
     pub fn seek(&self, position: Duration) -> Result<u32, JobError> {
-        let (start, number) = playback_seek(self.segments.as_ref(), Some(position), self.video);
+        let rung = self.rung();
+        let video = rung_video(self.video, &self.ladder, rung);
+        let (start, number) = playback_seek(self.segments.as_ref(), Some(position), video);
         self.restart(start.unwrap_or(Duration::ZERO), number)
     }
 
@@ -602,6 +627,7 @@ impl Conversion {
             Some(start),
             start_number,
             current.job.slot(),
+            self.cuts(current.rung),
         )?;
         current.job.stop();
         current.job = job;
@@ -636,9 +662,31 @@ pub fn planning_encoders(
     pick::planning(detected, &jobs.limits().video_codecs, &room)
 }
 
+/// The cuts an encode of a remux ladder's lower rung (PX-21) makes: the
+/// copied original's, at the source's keyframes, so every variant has the
+/// same segments and AVPlayer can move between them at any one. The
+/// encode forces a keyframe at each and cuts there (`args`). `None` for an
+/// encode on its own grid, a copy, and anything not HLS.
+fn keyframe_cuts(
+    plan: Option<ConvertedVideo>,
+    run: Option<ConvertedVideo>,
+    segments: Option<&Segments>,
+) -> Option<Vec<u64>> {
+    match (plan, run, segments) {
+        (Some(ConvertedVideo::Copy { .. }), Some(ConvertedVideo::Encode { .. }), Some(s)) => {
+            Some(s.starts_ms.clone())
+        }
+        _ => None,
+    }
+}
+
 /// The video of `rung`: a ladder's rung at its own height and cap, the
 /// rest of the encode as `video`'s; for one encode, `video`.
 fn rung_video(video: Option<ConvertedVideo>, ladder: &[Rung], rung: u32) -> Option<ConvertedVideo> {
+    // A rung with a video of its own: an encode under a copied original.
+    if let Some(own @ Some(_)) = ladder.get(rung as usize).map(|r| r.video) {
+        return own;
+    }
     match (video, ladder.get(rung as usize)) {
         (
             Some(ConvertedVideo::Encode {
@@ -741,6 +789,7 @@ fn spawn(
     start: Option<Duration>,
     start_number: u32,
     slot: Option<Slot>,
+    cuts: Option<Vec<u64>>,
 ) -> Result<Arc<EncodeJob>, JobError> {
     let job_dir = dir.join(epoch.to_string());
     let (output, written) = match delivery {
@@ -748,6 +797,7 @@ fn spawn(
             Output::Hls {
                 dir: job_dir.clone(),
                 start_number,
+                cuts,
             },
             Written::Hls,
         ),
@@ -894,6 +944,52 @@ fn encodes(video: Option<ConvertedVideo>, audio: Option<ConvertedAudio>) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spoolframe_types::VideoCodec;
+
+    const COPY: ConvertedVideo = ConvertedVideo::Copy {
+        codec: VideoCodec::H264,
+        dolby_vision: false,
+    };
+
+    fn under(height: u32, cap: u64) -> Rung {
+        Rung {
+            height,
+            max_bitrate: cap,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height,
+                max_bitrate: Some(cap),
+                tone_map: false,
+            }),
+        }
+    }
+
+    /// A remux ladder's (PX-21) top rung is the plan's copy; each rung
+    /// under it is its own encode, cut at the copy's keyframes; the copy
+    /// cuts by itself.
+    #[test]
+    fn a_remux_ladder_s_rungs_are_the_copy_and_encodes_cut_where_it_is() {
+        let ladder = [
+            Rung {
+                height: 1080,
+                max_bitrate: 8_000_000,
+                video: None,
+            },
+            under(720, 4_000_000),
+            under(480, 2_000_000),
+        ];
+        assert_eq!(rung_video(Some(COPY), &ladder, 0), Some(COPY));
+        assert_eq!(rung_video(Some(COPY), &ladder, 2), ladder[2].video);
+        let segments = Segments::at_keyframes(&[0, 1_001, 2_002], 3_000);
+        let encoded = rung_video(Some(COPY), &ladder, 1);
+        assert_eq!(
+            keyframe_cuts(Some(COPY), encoded, Some(&segments)),
+            Some(segments.starts_ms.clone())
+        );
+        assert_eq!(keyframe_cuts(Some(COPY), Some(COPY), Some(&segments)), None);
+        // A ladder of encodes is on its own grid.
+        assert_eq!(keyframe_cuts(encoded, encoded, Some(&segments)), None);
+    }
     use spoolframe_media::encoders::Encoders;
 
     /// `encoders` as the one GPU detection found, on renderD128 for

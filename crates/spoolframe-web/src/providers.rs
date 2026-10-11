@@ -121,7 +121,10 @@ impl Provider {
                 "A provider's name is at most {MAX_NAME} characters."
             ));
         }
-        let issuer = self.issuer.trim().trim_end_matches('/');
+        // Kept as typed, a trailing slash included: a provider's ID tokens
+        // name its issuer exactly, and one that ends in `/` (Authentik's)
+        // fails every sign-in without it.
+        let issuer = self.issuer.trim();
         if !issuer_allowed(issuer) {
             return Err(
                 "The issuer is the provider's https:// address, such as https://id.example.org."
@@ -324,6 +327,18 @@ mod tests {
             env: "OIDC_SECRET".into(),
             ..Provider::new()
         }
+    }
+
+    #[test]
+    fn an_issuer_keeps_its_trailing_slash() {
+        let authentik = Provider {
+            issuer: " https://auth.example.org/application/o/spoolframe/ ".into(),
+            ..pocket()
+        };
+        assert_eq!(
+            authentik.to_value().unwrap()["issuer"],
+            "https://auth.example.org/application/o/spoolframe/"
+        );
     }
 
     #[test]

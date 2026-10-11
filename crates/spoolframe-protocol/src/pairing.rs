@@ -260,6 +260,7 @@ pub enum PhoneFrame {
     Credential {
         credential: Box<UserDeviceCredential>,
         state: Option<PortableIdentityState>,
+        // compat(v1): required at the protocol reset
         #[serde(default)]
         servers: Vec<PairedServer>,
     },

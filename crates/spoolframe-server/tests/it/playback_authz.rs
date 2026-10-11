@@ -103,6 +103,7 @@ fn rpc_controls(handle: &PlaybackHandle) -> Vec<(&'static str, Request)> {
                 subtitle: None,
                 bitmap: Default::default(),
                 position_ms: 0,
+                display: None,
             },
         ),
         (
@@ -229,6 +230,7 @@ async fn no_one_else_controls_or_reads_a_direct_playback() {
                 start_ms: None,
                 bitmap: Default::default(),
                 quality: Default::default(),
+                display: None,
             },
         )
         .await
@@ -322,6 +324,7 @@ async fn no_one_else_controls_or_reads_a_converted_playback() {
                 start_ms: None,
                 bitmap: Default::default(),
                 quality: Default::default(),
+                display: None,
             },
         )
         .await

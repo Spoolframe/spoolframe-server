@@ -59,14 +59,60 @@ fn forced_keyframes(from_start: bool) -> String {
     }
 }
 
+/// The most of `-force_key_frames`' list one run is given, in bytes: one
+/// argument is held to 128 KiB by Linux (`MAX_ARG_STRLEN`). A two-hour
+/// film keyed every second is about 60 KiB from its start; a run of a
+/// longer or denser one stops forcing past the list's end, and a player
+/// switching rungs there may land a little off until the next seek.
+const MAX_KEYFRAME_LIST: usize = 120 * 1024;
+
+/// `-force_key_frames` at `cuts` (the film's times, ms) from the run's
+/// start on. The times are the output's: the film's own after a seek
+/// (`-copyts`), and from 0 for a run from the start, as the copy's are.
+fn keyframes_at(cuts: &[u64], start: Option<Duration>) -> String {
+    let from = start.map_or(0, |d| d.as_millis() as u64);
+    let mut list = String::new();
+    for &ms in cuts.iter().filter(|&&ms| ms >= from) {
+        let entry = format!("{}.{:03}", ms / 1000, ms % 1000);
+        if list.len() + entry.len() + 1 > MAX_KEYFRAME_LIST {
+            break;
+        }
+        if !list.is_empty() {
+            list.push(',');
+        }
+        list.push_str(&entry);
+    }
+    list
+}
+
+/// What keeps `encoder` from adding keyframes of its own between the
+/// forced ones: a scene cut or a GOP's end would be a cut the copy does
+/// not have. The GOP is long (40 s at 25 fps) rather than unbounded: a
+/// source keyed less often than that is cut where the copy is not.
+fn only_forced_keyframes(encoder: &str) -> Vec<String> {
+    let mut args = vec![s("-g"), s("1000")];
+    if encoder.starts_with("lib") {
+        args.extend([s("-sc_threshold"), s("0")]);
+    } else if encoder.ends_with("_nvenc") {
+        args.extend([s("-no-scenecut"), s("1"), s("-forced-idr"), s("1")]);
+    }
+    args
+}
+
 /// Where and how the job writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
     /// One Matroska file, readable while it grows (P2-04).
     Progressive { file: PathBuf },
     /// fMP4 segments `seg<n>.m4s` and `init.mp4` in `dir`, numbered from
-    /// `start_number` (P2-05).
-    Hls { dir: PathBuf, start_number: u32 },
+    /// `start_number` (P2-05). `cuts`: where an encode is to cut instead of
+    /// its own grid, the film's times in milliseconds (a remux ladder's
+    /// lower rung, PX-21); `None` for its own grid.
+    Hls {
+        dir: PathBuf,
+        start_number: u32,
+        cuts: Option<Vec<u64>>,
+    },
 }
 
 /// One encode: the plan's parts and what they run on.
@@ -1326,9 +1372,21 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                         s(rate * 2),
                     ]);
                 }
-                if matches!(spec.output, Output::Hls { .. }) {
+                match &spec.output {
+                    // A remux ladder's lower rung (PX-21): a keyframe at
+                    // each of the copy's cuts and nowhere else, so its
+                    // segments are the copy's.
+                    Output::Hls {
+                        cuts: Some(cuts), ..
+                    } => {
+                        args.extend([s("-force_key_frames"), keyframes_at(cuts, spec.start)]);
+                        args.extend(only_forced_keyframes(&encoder.name));
+                    }
                     // A keyframe at every cut, so HLS cuts land on the grid.
-                    args.extend([s("-force_key_frames"), forced_keyframes(from_start(spec))]);
+                    Output::Hls { .. } => {
+                        args.extend([s("-force_key_frames"), forced_keyframes(from_start(spec))]);
+                    }
+                    Output::Progressive { .. } => {}
                 }
             }
             ConvertedVideo::Unknown => return Err(s("a video action this build does not know")),
@@ -1424,11 +1482,17 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 s(file.display()),
             ]);
         }
-        Output::Hls { dir, start_number } => {
+        Output::Hls {
+            dir,
+            start_number,
+            cuts,
+        } => {
             // A copied video is cut at every keyframe (see `hls`): a length
-            // under any GOP does that.
+            // under any GOP does that. So is a remux ladder's encoded rung,
+            // whose keyframes are the copy's cuts and no others.
             let cut = match spec.video {
                 Some(ConvertedVideo::Copy { .. }) => s("0.1"),
+                _ if cuts.is_some() => s("0.1"),
                 _ => s(SEGMENT_SECS),
             };
             // An encoded video's run from 0 cuts its short head (PX-26):
@@ -1438,7 +1502,7 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
             // `hls::Segments::encoded`. The list is ffmpeg's own playlist,
             // which the server reads only for its last segment (`job`).
             let list_size = match spec.video {
-                Some(ConvertedVideo::Encode { .. }) if from_start(spec) => {
+                Some(ConvertedVideo::Encode { .. }) if from_start(spec) && cuts.is_none() => {
                     args.extend([s("-hls_init_time"), s(FIRST_SEGMENT_SECS)]);
                     s(1)
                 }
@@ -2919,6 +2983,7 @@ mod tests {
         let output = Output::Hls {
             dir: "/scratch/h/0".into(),
             start_number: 1,
+            cuts: None,
         };
         let eac3 = AudioAction::Encode {
             codec: AudioCodec::Eac3,
@@ -2948,6 +3013,7 @@ mod tests {
         Output::Hls {
             dir: "/scratch/h/0".into(),
             start_number: 1,
+            cuts: None,
         }
     }
 
@@ -3296,6 +3362,7 @@ mod tests {
         let output = Output::Hls {
             dir: "/scratch/h/0".into(),
             start_number,
+            cuts: None,
         };
         let mut spec = spec(&film, &enc, video, COPY_DTS, None, output);
         spec.start = start;
@@ -3329,6 +3396,71 @@ mod tests {
         assert_eq!(after(&args, "-hls_list_size"), "0");
     }
 
+    /// A remux ladder's encoded rung (PX-21) cuts where the copy does: a
+    /// keyframe forced at each of the copy's cuts from the run's start on,
+    /// the encoder's own keyframes (scene cuts, a GOP's end) off, and the
+    /// muxer cutting at every keyframe, as for the copy; no short head.
+    #[test]
+    fn a_remux_ladder_rung_is_keyed_and_cut_where_the_copy_is() {
+        let (film, enc) = (film(), encoders(false));
+        let video = ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height: 720,
+            max_bitrate: Some(3_000_000),
+            tone_map: false,
+        };
+        let cuts = vec![0, 1_001, 2_502, 4_004, 9_009];
+        let run = |start: Option<Duration>, start_number| {
+            let output = Output::Hls {
+                dir: "/scratch/h/0".into(),
+                start_number,
+                cuts: Some(cuts.clone()),
+            };
+            let mut spec = spec(&film, &enc, video, COPY_DTS, None, output);
+            spec.start = start;
+            ffmpeg_args(&spec).unwrap()
+        };
+        let args = run(None, 1);
+        assert_eq!(
+            after(&args, "-force_key_frames"),
+            "0.000,1.001,2.502,4.004,9.009"
+        );
+        assert!(
+            has(&args, &["-g", "1000", "-sc_threshold", "0"]),
+            "{args:?}"
+        );
+        assert_eq!(after(&args, "-hls_time"), "0.1");
+        assert!(!args.contains(&s("-hls_init_time")), "{args:?}");
+        assert_eq!(after(&args, "-hls_list_size"), "0");
+        // A run from the copy's third cut on: the film's own times (the
+        // run is `-copyts`), from there.
+        let args = run(Some(Duration::from_millis(2_502)), 3);
+        assert_eq!(after(&args, "-force_key_frames"), "2.502,4.004,9.009");
+        assert!(args.contains(&s("-copyts")));
+    }
+
+    /// The list stops where one argument may not grow past, rather than
+    /// failing the run.
+    #[test]
+    fn a_keyframe_list_is_held_to_one_argument() {
+        let cuts: Vec<u64> = (0..100_000).map(|n| n * 1_000).collect();
+        let list = keyframes_at(&cuts, None);
+        assert!(list.len() <= MAX_KEYFRAME_LIST);
+        assert!(list.starts_with("0.000,1.000,"));
+        assert!(!list.ends_with(','));
+    }
+
+    /// NVIDIA's encoder is told the same in its own words.
+    #[test]
+    fn nvenc_adds_no_keyframes_of_its_own() {
+        let args = only_forced_keyframes("hevc_nvenc");
+        assert_eq!(
+            args,
+            ["-g", "1000", "-no-scenecut", "1", "-forced-idr", "1"]
+        );
+        assert_eq!(only_forced_keyframes("av1_vaapi"), ["-g", "1000"]);
+    }
+
     /// A copied video is cut at its own keyframes: no head of its own.
     #[test]
     fn a_copied_hls_video_has_no_short_head() {
@@ -3336,6 +3468,7 @@ mod tests {
         let output = Output::Hls {
             dir: "/scratch/h/0".into(),
             start_number: 1,
+            cuts: None,
         };
         let args = ffmpeg_args(&spec(&film, &enc, COPY_HEVC, COPY_DTS, None, output)).unwrap();
         assert!(!args.contains(&s("-hls_init_time")), "{args:?}");

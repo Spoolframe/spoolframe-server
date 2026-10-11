@@ -1379,6 +1379,81 @@ pub struct NetworkConfig {
     /// The server's public addresses (P6-02); absent, none is advertised.
     #[ucl(default)]
     pub wan: Option<WanConfig>,
+    /// Address ranges whose devices are on the LAN besides this host's
+    /// own subnets (PX-46): a WireGuard network, another VLAN. A playback
+    /// on the LAN is not counted against the uplink budget.
+    #[ucl(default)]
+    pub lan_prefixes: Option<Vec<String>>,
+    /// The WAN uplink budget and its share (PX-46).
+    #[ucl(default)]
+    pub uplink: UplinkConfig,
+    /// How QUIC paths share the link: `"cubic"` (the default) or `"bbr"`,
+    /// which holds its rate on a lossy link such as cellular. Every path,
+    /// LAN ones too: noq picks one controller for all of them.
+    #[ucl(default)]
+    pub congestion_control: Option<String>,
+}
+
+/// `uplink { budget_mbps = 20; max_streams = 4; owner_share_percent =
+/// 50; }` (PX-46), all optional.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct UplinkConfig {
+    /// What the playbacks off the LAN may take together, in Mbit/s; 0 or
+    /// left out is no limit.
+    #[ucl(default)]
+    pub budget_mbps: Option<u64>,
+    /// The most playbacks off the LAN at once; 0 or left out is no limit.
+    #[ucl(default)]
+    pub max_streams: Option<u32>,
+    /// The owners' (admins') part of the budget while one of them plays
+    /// off the LAN beside anyone else, in percent; 50 if left out.
+    #[ucl(default)]
+    pub owner_share_percent: Option<u32>,
+}
+
+impl NetworkConfig {
+    /// `network.uplink` and `network.lan_prefixes`, checked (PX-46).
+    pub fn uplink(&self) -> Result<crate::uplink::UplinkSettings, ConfigError> {
+        let share = self.uplink.owner_share_percent.map_or(
+            Ok(crate::uplink::DEFAULT_OWNER_SHARE_PERCENT),
+            |p| {
+                u8::try_from(p)
+                    .ok()
+                    .filter(|p| *p <= 100)
+                    .ok_or_else(|| ConfigError::Invalid {
+                        key: "network.uplink.owner_share_percent",
+                        message: format!("{p}: a percentage, 0 to 100"),
+                    })
+            },
+        )?;
+        let lan_prefixes = self
+            .lan_prefixes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|text| {
+                text.trim().parse().map_err(|message| ConfigError::Invalid {
+                    key: "network.lan_prefixes",
+                    message,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(crate::uplink::UplinkSettings {
+            budget: self
+                .uplink
+                .budget_mbps
+                .filter(|m| *m > 0)
+                .map(|m| m.saturating_mul(1_000_000)),
+            max_streams: self
+                .uplink
+                .max_streams
+                .filter(|m| *m > 0)
+                .map(|m| m as usize),
+            owner_share_percent: share,
+            lan_prefixes,
+        })
+    }
 }
 
 /// `wan { static = ["203.0.113.7:7420"]; mapped_port { port = 7420;
@@ -1730,6 +1805,16 @@ impl NetworkConfig {
         let relays = self.relays()?;
         let pkarr = self.pkarr()?;
         let own_relays = self.own_relays()?;
+        let congestion = match self.congestion_control.as_deref().map(str::trim) {
+            None | Some("cubic") => crate::network::CongestionControl::Cubic,
+            Some("bbr") => crate::network::CongestionControl::Bbr,
+            Some(other) => {
+                return Err(ConfigError::Invalid {
+                    key: "network.congestion_control",
+                    message: format!("{other:?}: it is \"cubic\" or \"bbr\""),
+                });
+            }
+        };
         let admission = Admission {
             max_strangers: self
                 .max_stranger_connections
@@ -1773,6 +1858,7 @@ impl NetworkConfig {
                 .as_ref()
                 .map(|wan| wan.wan(self.port))
                 .transpose()?,
+            congestion,
         })
     }
 }
@@ -2616,6 +2702,47 @@ mod tests {
         assert_eq!(limits.read_ahead, Duration::from_secs(60));
         assert!(!limits.gpu_filters);
         assert_eq!(limits.tone_map, ToneMapSetting::Auto);
+    }
+
+    /// PX-46: `network.uplink` and `network.lan_prefixes`. Left out, no
+    /// budget, no stream limit, the owners' half; 0 is no limit; a
+    /// percentage over 100 or a range that is none is refused.
+    #[test]
+    fn the_uplink_budget_is_read() {
+        let uplink = |section: &str| {
+            plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} network {{ {section} }}"#
+            ))
+            .and_then(|config| config.network.uplink())
+        };
+        assert_eq!(
+            uplink("").unwrap(),
+            crate::uplink::UplinkSettings::default()
+        );
+        let set = uplink(
+            r#"lan_prefixes = ["10.10.0.0/24"]; uplink { budget_mbps = 20; max_streams = 3; owner_share_percent = 60; }"#,
+        )
+        .unwrap();
+        assert_eq!(set.budget, Some(20_000_000));
+        assert_eq!(set.max_streams, Some(3));
+        assert_eq!(set.owner_share_percent, 60);
+        assert!(set.lan_prefixes[0].contains("10.10.0.7".parse().unwrap()));
+        let none = uplink("uplink { budget_mbps = 0; max_streams = 0; }").unwrap();
+        assert_eq!((none.budget, none.max_streams), (None, None));
+        assert!(matches!(
+            uplink("uplink { owner_share_percent = 101; }"),
+            Err(ConfigError::Invalid {
+                key: "network.uplink.owner_share_percent",
+                ..
+            })
+        ));
+        assert!(matches!(
+            uplink(r#"lan_prefixes = ["home"];"#),
+            Err(ConfigError::Invalid {
+                key: "network.lan_prefixes",
+                ..
+            })
+        ));
     }
 
     /// PGPU-06: `transcode.video_codecs` orders the GPU's codecs; AV1,
@@ -3626,6 +3753,36 @@ mod tests {
                 "{refused}: {err:?}"
             );
         }
+    }
+
+    fn congestion(network: &str) -> Result<crate::network::CongestionControl, ConfigError> {
+        plex(&format!(
+            r#"plex {{ url = "http://nas:32400"; }} network {{ {network} }}"#
+        ))?
+        .network
+        .endpoint_options()
+        .map(|options| options.congestion)
+    }
+
+    #[test]
+    fn congestion_control_is_cubic_unless_bbr_is_asked() {
+        use crate::network::CongestionControl;
+        assert_eq!(congestion("").unwrap(), CongestionControl::Cubic);
+        assert_eq!(
+            congestion(r#"congestion_control = "cubic";"#).unwrap(),
+            CongestionControl::Cubic
+        );
+        assert_eq!(
+            congestion(r#"congestion_control = "bbr";"#).unwrap(),
+            CongestionControl::Bbr
+        );
+        assert!(matches!(
+            congestion(r#"congestion_control = "reno";"#),
+            Err(ConfigError::Invalid {
+                key: "network.congestion_control",
+                ..
+            })
+        ));
     }
 
     fn pkarr(value: &str) -> Result<Pkarr, ConfigError> {

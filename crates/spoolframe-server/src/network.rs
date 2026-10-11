@@ -82,6 +82,44 @@ impl Pkarr {
     }
 }
 
+/// How the server's QUIC paths share the link (`network.congestion_control`).
+/// One choice for every path: noq builds each path's controller knowing
+/// neither its address nor whether it crosses the WAN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CongestionControl {
+    /// noq's default, and iroh's: backs off on every loss, which on a
+    /// lossy cellular link holds a window of a few dozen KB.
+    #[default]
+    Cubic,
+    /// BBR (v3): paces by the rate and round trip it measures, not by
+    /// loss, so a lossy link keeps its throughput.
+    Bbr,
+}
+
+impl CongestionControl {
+    /// As the setting writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CongestionControl::Cubic => "cubic",
+            CongestionControl::Bbr => "bbr",
+        }
+    }
+
+    /// What builds each path's controller.
+    fn factory(
+        self,
+    ) -> std::sync::Arc<dyn iroh::endpoint::ControllerFactory + Send + Sync + 'static> {
+        match self {
+            CongestionControl::Cubic => {
+                std::sync::Arc::new(noq_proto::congestion::CubicConfig::default())
+            }
+            CongestionControl::Bbr => {
+                std::sync::Arc::new(noq_proto::congestion::Bbr3Config::default())
+            }
+        }
+    }
+}
+
 /// What the server publishes (P6-05): its relays and the addresses that
 /// are public. A LAN, link-local or loopback address is never put in a
 /// record anyone can read.
@@ -100,18 +138,28 @@ fn published() -> iroh::address_lookup::AddrFilter {
 }
 
 /// `relays` as iroh's mode: none is off, `default` alone n0's own, and
-/// any other list one map of every entry, `default` as n0's relays.
-fn relay_mode(relays: &[Relay]) -> RelayMode {
+/// any other list one map of every entry, `default` as n0's relays, each
+/// relay of its own asked for the server's address or not by which side
+/// of the NAT it is on ([`crate::relay_nat`]); `public` is the public
+/// addresses already known. Also where each of its own relays was placed,
+/// for [`crate::relay_nat::watch`] to go on from.
+async fn relay_mode(
+    relays: &[Relay],
+    public: &[std::net::IpAddr],
+) -> (RelayMode, HashMap<RelayUrl, crate::relay_nat::Side>) {
     match relays {
-        [] => RelayMode::Disabled,
-        [Relay::Default] => RelayMode::Default,
-        _ => RelayMode::Custom(relay_urls(relays).into_iter().collect()),
+        [] => (RelayMode::Disabled, HashMap::new()),
+        [Relay::Default] => (RelayMode::Default, HashMap::new()),
+        _ => {
+            let (map, sides) = crate::relay_nat::initial(relays, public).await;
+            (RelayMode::Custom(map), sides)
+        }
     }
 }
 
 /// Every relay URL `relays` names, in their order, `default` expanded to
 /// n0's: what a device is told to reach the server through.
-fn relay_urls(relays: &[Relay]) -> Vec<RelayUrl> {
+pub(crate) fn relay_urls(relays: &[Relay]) -> Vec<RelayUrl> {
     let mut urls: Vec<RelayUrl> = Vec::new();
     for relay in relays {
         let more = match relay {
@@ -174,6 +222,8 @@ pub struct EndpointOptions {
     pub announce: Announce,
     /// Its public addresses (`network.wan`, P6-02); `None`: none.
     pub wan: Option<crate::wan::Wan>,
+    /// `network.congestion_control`.
+    pub congestion: CongestionControl,
 }
 
 /// What the server knows about who is on the other end of a connection.
@@ -466,6 +516,8 @@ pub struct Services {
     pub connected: Arc<crate::connected::Connected>,
     /// What finds the public addresses `network.wan` asks for (P6-02).
     pub wan: crate::wan::Finders,
+    /// The WAN uplink budget, the LAN, and the playbacks off it (PX-46).
+    pub uplink: Arc<crate::uplink::Uplink>,
 }
 
 impl std::fmt::Debug for Services {
@@ -496,7 +548,11 @@ impl Server {
         name: &ServerName,
         services: Services,
     ) -> Result<Self, NetworkError> {
-        let relay = relay_mode(&options.relays);
+        // The public addresses found so far: `network.wan`'s static ones
+        // now, the rest as they are found (P6-02).
+        let public = crate::wan::Public::new(options.wan.as_ref());
+        let known: Vec<std::net::IpAddr> = public.addrs().iter().map(|p| p.addr.ip()).collect();
+        let (relay, sides) = relay_mode(&options.relays, &known).await;
         // What a signed-in device and an invite are told of them (PX-12,
         // P6-01), the home relay put first at each ask.
         let relays: Vec<String> = relay_urls(&options.relays)
@@ -507,12 +563,16 @@ impl Server {
             port: options.port,
             message,
         };
+        tracing::info!(
+            congestion_control = options.congestion.as_str(),
+            "QUIC congestion control"
+        );
         // Minimal: no address lookup services but the mDNS added here;
         // pkarr/DNS lookup comes with remote access (P6).
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(key)
             .relay_mode(relay)
-            .transport_config(admission::transport_config())
+            .transport_config(admission::transport_config(options.congestion.factory()))
             .alpns(alpns(options));
         if options.mdns {
             let advert: UserData = lan::advert(&name.get())
@@ -550,6 +610,7 @@ impl Server {
         if !options.relays.is_empty() {
             tokio::spawn(log_home_relay(endpoint.clone()));
         }
+        crate::relay_nat::watch(endpoint.clone(), &options.relays, public.clone(), sides);
 
         // Idle playbacks end on their own, conversions with them.
         let playbacks = Arc::downgrade(&services.playbacks);
@@ -601,7 +662,6 @@ impl Server {
             ))
         });
         // Unknown ALPNs never get this far: the TLS handshake refuses them.
-        let public = crate::wan::Public::new(options.wan.as_ref());
         if let Some(wan) = &options.wan {
             crate::wan::start(&public, wan, &endpoint, &services.wan);
         }
@@ -722,6 +782,26 @@ impl ProtocolHandler for Unsupported {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each setting builds its own controller for a path.
+    #[test]
+    fn congestion_control_builds_the_controller_it_names() {
+        let built = |c: CongestionControl| {
+            c.factory()
+                .build(std::time::Instant::now(), 1200)
+                .into_any()
+        };
+        assert!(
+            built(CongestionControl::Cubic)
+                .downcast::<noq_proto::congestion::Cubic>()
+                .is_ok()
+        );
+        assert!(
+            built(CongestionControl::Bbr)
+                .downcast::<noq_proto::congestion::Bbr3>()
+                .is_ok()
+        );
+    }
 
     /// The record anyone can read holds the relays and the public
     /// addresses, never a LAN one (P6-05).

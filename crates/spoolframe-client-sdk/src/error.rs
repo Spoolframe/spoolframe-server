@@ -134,6 +134,11 @@ pub enum SdkError {
     /// again later, or pick tracks that play without converting.
     #[error("the server is busy converting other files")]
     Busy,
+    /// The server plays at most `max` playbacks outside its home at once
+    /// (PX-46), and that many are playing: say so, and let the user try
+    /// again when one ends. At home this never happens.
+    #[error("the server plays at most {max} playbacks outside its home at once")]
+    WanStreamsFull { max: u32 },
     /// The server holds as many devices with no session as it takes, and
     /// closed this connection ([`spoolframe_protocol::close::BUSY`],
     /// PX-10). Nothing is wrong with the network or the server: say it is
@@ -309,6 +314,7 @@ impl SdkError {
             ServerError::PlaybackStopped => SdkError::PlaybackStopped,
             ServerError::NotFound { what } => SdkError::NotFound(what),
             ServerError::Busy => SdkError::Busy,
+            ServerError::WanStreamsFull { max } => SdkError::WanStreamsFull { max },
             ServerError::PlaybackFailed { reason } => SdkError::PlaybackFailed(reason),
             ServerError::PlaybackRestarted { epoch } => SdkError::PlaybackRestarted { epoch },
             ServerError::ProfileLocked => SdkError::ProfileLocked,

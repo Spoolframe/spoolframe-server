@@ -10,13 +10,22 @@ use spoolframe_types::{AudioCodec, Container, Delivery, SubtitleFormat, VideoCod
 /// and the SDK asks for a new plan when a file needs more than it.
 pub const LINK_SHARE: f64 = 0.75;
 
-/// One encode of an HLS ladder (PX-21): its picture's height and its
-/// video's bitrate cap, bits per second. Its codec, range and burned-in
-/// subtitle are the plan's `video`'s; only the size and rate differ.
+/// One variant of an HLS ladder (PX-21): its picture's height and its
+/// video's bitrate, bits per second (an encode's cap; a copy's average).
+/// Its codec, range and burned-in subtitle are the plan's `video`'s, only
+/// the size and rate differing, unless `video` says otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rung {
     pub height: u32,
     pub max_bitrate: u64,
+    /// This variant's own video, where it is not the plan's resized: the
+    /// encodes under a copied original (PX-21's remux ladder), whose plan
+    /// `video` is the copy, the top variant. `None` for a ladder of
+    /// encodes, and the copy's own rung. Unlike the rest of a plan it may
+    /// be left out, as a server before it does, and is `None` then.
+    // compat(v1): required at the protocol reset
+    #[serde(default)]
+    pub video: Option<ConvertedVideo>,
 }
 
 /// What quality a playback is planned for (P6-06): the viewer's choice
@@ -173,6 +182,7 @@ pub enum ConvertedVideo {
         /// Dolby Vision stream copied as its base layer, HDR10 or HLG, or
         /// any other stream. Unlike the rest of a plan it may be left
         /// out, as a server before it does, and is `false` then.
+        // compat(v1): required at the protocol reset
         #[serde(default)]
         dolby_vision: bool,
     },

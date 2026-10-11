@@ -551,6 +551,16 @@ async fn shutting_down(conn: &Connection, id: EndpointId, client: &Weak<Inner>) 
                         tracing::warn!(server = %id, error = %e, "cannot save the addresses the server told");
                     }
                 }
+                // Followed by the managed playback of `handle` (PX-46).
+                Event::PlaybackShare {
+                    handle,
+                    max_bitrate,
+                } => {
+                    tracing::debug!(server = %id, ?max_bitrate, "a playback's share changed");
+                    if let Some(inner) = client.upgrade() {
+                        let _ = inner.shares.send(handle);
+                    }
+                }
                 Event::Unknown => {}
             }
         }
