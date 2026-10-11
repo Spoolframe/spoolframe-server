@@ -73,12 +73,31 @@ pub enum ChangeError {
     Secret { key: String },
     #[error("cannot save the setting: {0}")]
     Write(std::io::Error),
+    /// The settings an edit was worked out from changed before it was
+    /// saved (another admin's edit, or the same one sent twice): saving
+    /// it would undo that one (review 2026-10-11 M25).
+    #[error("{key} changed meanwhile; look again and repeat the change")]
+    Conflict { key: String },
+}
+
+/// What [`RuntimeSettings::apply`] does with the Plex catalog.
+enum Plex {
+    /// Its settings did not change: kept.
+    Same,
+    /// Made from the settings already, and checked.
+    Made(Option<Composite>),
+    /// Made here (a token set): one that cannot be made is logged.
+    Remake,
 }
 
 /// The server's settings as they change at run time.
 #[derive(Debug)]
 pub struct RuntimeSettings {
     layers: Mutex<Layers>,
+    /// Held while a change is worked out and saved, or the files reread:
+    /// one at a time, so `layers` is held only to read or swap it, never
+    /// across a file written and synced (review 2026-10-11 M26).
+    writing: Mutex<()>,
     secrets: Secrets,
     state_dir: PathBuf,
     /// Every layer merged as the server started: what the restart
@@ -188,6 +207,7 @@ impl RuntimeSettings {
         Self {
             started: layers.merged(),
             layers: Mutex::new(layers),
+            writing: Mutex::new(()),
             secrets: Secrets::new(state_dir),
             state_dir: state_dir.to_owned(),
             live,
@@ -332,7 +352,7 @@ impl RuntimeSettings {
         } else {
             value.to_ucl()
         };
-        self.change(key, by, |layers| layers.with_set(key, value))?;
+        self.change(key, by, |layers| Ok(layers.with_set(key, value)?))?;
         tracing::info!(by, key, value = shown, "setting changed");
         if layers::DEPRECATED.contains(&key) {
             tracing::warn!(
@@ -351,7 +371,7 @@ impl RuntimeSettings {
         if key == PLEX_TOKEN {
             return self.set_secret(key, None, by);
         }
-        self.change(key, by, |layers| layers.with_unset(key))?;
+        self.change(key, by, |layers| Ok(layers.with_unset(key)?))?;
         tracing::info!(
             by,
             key,
@@ -365,9 +385,10 @@ impl RuntimeSettings {
         &self,
         key: &str,
         by: &str,
-        change: impl FnOnce(&Layers) -> Result<Layers, SettingError>,
+        change: impl FnOnce(&Layers) -> Result<Layers, ChangeError>,
     ) -> Result<(), ChangeError> {
-        let mut layers = self.layers.lock();
+        let _writing = self.writing.lock();
+        let layers = self.layers();
         let changed = change(&layers)?;
         if insecure_over_https(&changed) && !insecure_over_https(&layers) {
             return Err(SettingError::Invalid(ConfigError::Invalid {
@@ -379,13 +400,25 @@ impl RuntimeSettings {
             })
             .into());
         }
-        changed.write_runtime().map_err(ChangeError::Write)?;
         let (before, after) = (layers.merged(), changed.merged());
         let plex_changed = ["plex", "libraries"]
             .iter()
             .any(|key| tree::get(&before, key) != tree::get(&after, key));
-        *layers = changed;
-        self.apply(&layers, plex_changed, key, by);
+        // The catalog the change makes, made before anything is saved: a
+        // token file that cannot be read refuses the change, as it
+        // refuses the server's start (review 2026-10-11 M24), rather than
+        // saving it while the catalog keeps the old token.
+        let plex = if plex_changed {
+            let config = changed.config().map_err(SettingError::Invalid)?;
+            Plex::Made(
+                plex_catalog(&config, &changed, &self.secrets).map_err(SettingError::Invalid)?,
+            )
+        } else {
+            Plex::Same
+        };
+        changed.write_runtime().map_err(ChangeError::Write)?;
+        *self.layers.lock() = changed.clone();
+        self.apply(&changed, plex, key, by);
         Ok(())
     }
 
@@ -407,7 +440,8 @@ impl RuntimeSettings {
         value: Option<&str>,
         by: &str,
     ) -> Result<(), ChangeError> {
-        let layers = self.layers.lock();
+        let _writing = self.writing.lock();
+        let layers = self.layers();
         layers.server_token_changeable(server)?;
         let secret = plex_token_secret(server);
         match value {
@@ -421,7 +455,7 @@ impl RuntimeSettings {
         }
         // Never the value: only that it changed, and who changed it.
         tracing::info!(by, server, set = value.is_some(), "secret setting changed");
-        self.apply(&layers, true, &secret, by);
+        self.apply(&layers, Plex::Remake, &secret, by);
         Ok(())
     }
 
@@ -433,7 +467,35 @@ impl RuntimeSettings {
         by: &str,
         keys: Vec<(&str, Option<Value>)>,
     ) -> Result<(), ChangeError> {
-        self.change(what, by, |layers| layers.with_changes(keys))?;
+        self.change(what, by, |layers| Ok(layers.with_changes(keys)?))?;
+        tracing::info!(by, what, "settings changed");
+        Ok(())
+    }
+
+    /// [`RuntimeSettings::change_keys`] for an edit worked out from
+    /// `base` (read, then Plex asked, then the new list made): refused
+    /// with [`ChangeError::Conflict`] if a key it sets is no longer what
+    /// `base` had, rather than writing over another edit (M25).
+    pub(crate) fn change_keys_from(
+        &self,
+        base: &Layers,
+        what: &str,
+        by: &str,
+        keys: Vec<(&str, Option<Value>)>,
+    ) -> Result<(), ChangeError> {
+        let was = base.merged();
+        self.change(what, by, |layers| {
+            let now = layers.merged();
+            if let Some((key, _)) = keys
+                .iter()
+                .find(|(key, _)| tree::get(&now, key) != tree::get(&was, key))
+            {
+                return Err(ChangeError::Conflict {
+                    key: (*key).to_owned(),
+                });
+            }
+            Ok(layers.with_changes(keys)?)
+        })?;
         tracing::info!(by, what, "settings changed");
         Ok(())
     }
@@ -447,7 +509,7 @@ impl RuntimeSettings {
     /// again (it is cheap), but the Plex catalog only when its settings
     /// or token changed: a new one starts without the old one's
     /// connections.
-    fn apply(&self, layers: &Layers, plex_changed: bool, key: &str, by: &str) {
+    fn apply(&self, layers: &Layers, plex: Plex, key: &str, by: &str) {
         // Checked when the change was made; a failure here is a file
         // changed under the server, and only logged.
         let config = match layers.config() {
@@ -489,16 +551,20 @@ impl RuntimeSettings {
         if let Some(oidc) = &live.oidc {
             oidc.set_providers(&config.auth.oidc);
         }
-        if plex_changed {
-            match plex_catalog(&config, layers, &self.secrets) {
-                Ok(plex) => {
-                    let set_up = plex.is_some();
-                    live.catalog.replace(plex.map(Arc::new));
-                    tracing::info!(set_up, "the catalog follows the new settings");
+        let made = match plex {
+            Plex::Same => return,
+            Plex::Made(made) => made,
+            Plex::Remake => match plex_catalog(&config, layers, &self.secrets) {
+                Ok(made) => made,
+                Err(e) => {
+                    tracing::error!(error = %e, "cannot make the Plex catalog");
+                    return;
                 }
-                Err(e) => tracing::error!(error = %e, "cannot make the Plex catalog"),
-            }
-        }
+            },
+        };
+        let set_up = made.is_some();
+        live.catalog.replace(made.map(Arc::new));
+        tracing::info!(set_up, "the catalog follows the new settings");
     }
 
     /// The Plex token the server has now: the one set at run time, else
@@ -683,6 +749,66 @@ mod tests {
         assert_eq!(now.when, When::Never);
         assert_eq!(now.interval, std::time::Duration::from_secs(4));
         assert_eq!(now.workers, 3);
+    }
+
+    /// A token file the server cannot read refuses the change that names
+    /// it, as it would refuse the start, and nothing is saved: the setting
+    /// keeps saying what the catalog uses. Review 2026-10-11 M24.
+    #[tokio::test]
+    async fn an_unreadable_plex_token_file_is_refused_not_saved() {
+        let (settings, dir) = settings(Some(r#"plex { url = "http://127.0.0.1:32400"; }"#)).await;
+        let missing = dir.as_ref().join("no-such-token");
+        let refused = settings
+            .set(
+                "plex.token_file",
+                &serde_json::json!(missing.display().to_string()),
+                "root",
+            )
+            .unwrap_err();
+        assert!(refused.to_string().contains("token_file"), "{refused}");
+        assert!(!dir.as_ref().join("runtime.ucl").exists());
+        let merged = settings.layers().merged();
+        assert_eq!(tree::get(&merged, "plex.token_file"), None);
+    }
+
+    /// An edit worked out from settings that changed before it was saved
+    /// is refused, not written over the other: two admins renaming
+    /// libraries at once lost one rename. Review 2026-10-11 M25.
+    #[tokio::test]
+    async fn an_edit_from_stale_settings_is_refused() {
+        let (settings, _dir) = settings(None).await;
+        let base = settings.layers();
+        settings
+            .change_keys(
+                "name",
+                "a",
+                vec![("name", Some(tree::Value::String("First".into())))],
+            )
+            .unwrap();
+        let stale = settings.change_keys_from(
+            &base,
+            "name",
+            "b",
+            vec![("name", Some(tree::Value::String("Second".into())))],
+        );
+        assert!(
+            matches!(stale, Err(ChangeError::Conflict { .. })),
+            "{stale:?}"
+        );
+        assert_eq!(
+            tree::get(&settings.layers().merged(), "name"),
+            Some(&tree::Value::String("First".into()))
+        );
+        // From the settings as they are now, it is saved.
+        let base = settings.layers();
+        settings
+            .change_keys_from(
+                &base,
+                "name",
+                "b",
+                vec![("name", Some(tree::Value::String("Second".into())))],
+            )
+            .unwrap();
     }
 
     #[tokio::test]

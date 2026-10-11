@@ -201,8 +201,10 @@ network {
   # }
   # Address ranges whose devices are on the LAN besides this host's own
   # subnets: a device in one of the host's subnets (a global IPv6
-  # address in the home's /64 too), or at a private, link-local or
-  # unique local address, already is. A WireGuard network, another VLAN:
+  # address in the home's /64 too), or at a link-local address, already
+  # is. A private address elsewhere is not: a tunnel's (Tailscale,
+  # WireGuard) devices may be anywhere, their bytes through the uplink.
+  # A WireGuard network to count as home, another VLAN:
   # ["10.10.0.0/24", "2001:db8:1::/64"]. A playback on the LAN plays the
   # original under Auto and is not counted against the uplink budget.
   lan_prefixes = [];

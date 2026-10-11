@@ -1023,10 +1023,17 @@ fn cpu_graph(
         // An encoder that took no 10-bit test frame gets 8 bits.
         chain.push(s("format=yuv420p"));
     }
-    Ok(if chain.is_empty() {
+    // Pictures laid over a picture nothing else changes end the graph at
+    // the overlay: `overlaynull` is no filter, and a 1080p HEVC encode of
+    // a Blu-ray with PGS failed on it, on the GPU and in software alike.
+    Ok(if source.ends_with("overlay") {
+        if chain.is_empty() {
+            format!("{source}[v]")
+        } else {
+            format!("{source},{}[v]", chain.join(","))
+        }
+    } else if chain.is_empty() {
         format!("{source}null[v]")
-    } else if source.ends_with("overlay") {
-        format!("{source},{}[v]", chain.join(","))
     } else {
         format!("{source}{}[v]", chain.join(","))
     })
@@ -2628,6 +2635,25 @@ mod tests {
             max_bitrate: Some(8_000_000),
             tone_map: false,
         }
+    }
+
+    /// Pictures burned into a 1080p SDR HEVC encode at its own size: the
+    /// overlay is the whole graph, with nothing after it (no `overlaynull`,
+    /// which is no filter). Review 2026-10-11 H1.
+    #[test]
+    fn pictures_over_an_unchanged_picture_end_the_graph_at_the_overlay() {
+        let (film, enc) = (sdr_1080p(), encoders(false));
+        let hevc = ConvertedVideo::Encode {
+            codec: VideoCodec::Hevc,
+            height: 1080,
+            max_bitrate: None,
+            tone_map: false,
+        };
+        let spec = spec_with(&film, &enc, hevc, burn_in(0, SubtitleFormat::Pgs));
+        let args = ffmpeg_args(&spec).unwrap();
+        let graph = after(&args, "-filter_complex");
+        assert!(!graph.contains("overlaynull"), "{graph}");
+        assert!(graph.ends_with("overlay[v]"), "{graph}");
     }
 
     /// `film()` as an SDR 1080p 8-bit H.264 file.

@@ -335,6 +335,80 @@ async fn the_first_chunk_of_a_subtitle_still_being_read_is_not_ready() {
     server.stop().await;
 }
 
+/// A subtitle read waiting for its text (up to the read wait while OCR
+/// runs) holds no lock on its playback: a progress report on the same
+/// playback is answered meanwhile, not after the wait. Review 2026-10-11
+/// M8.
+#[tokio::test]
+async fn a_subtitle_read_waiting_for_its_text_holds_up_nothing_else() {
+    let dir = fresh_dir("ocr-wait-holds-nothing").await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let tesseract = dir.join("endless-tesseract");
+    support::write_script(
+        &tesseract,
+        "#!/bin/sh\n\
+         if [ \"$1\" = --list-langs ]; then\n\
+         printf 'List of available languages (1):\\neng\\n'\n\
+         exit 0\n\
+         fi\n\
+         exec sleep 600\n",
+    );
+    let server = TestServer::start_with(
+        dir,
+        ServerOptions {
+            real_media: true,
+            ocr: true,
+            tesseract,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_media(10, "libx264", "aac");
+    server.add_pgs(&[("Hello there", 1_000, 3_500)]);
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client.hello_with(None, Some(capabilities(false))).await;
+    let session = client.login("alice", "correct horse").await;
+    let (handle, _) = start(&client, &session, BitmapSubtitles::Auto).await;
+
+    let read = client.call(
+        Some(&session),
+        Request::ReadSubtitle {
+            handle: handle.clone(),
+            offset: 0,
+            version: None,
+        },
+    );
+    let progress = async {
+        // Once the read is waiting for its text.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let asked = Instant::now();
+        let response = client
+            .call(
+                Some(&session),
+                Request::UpdatePlaybackProgress {
+                    handle: handle.clone(),
+                    sequence: 1,
+                    position_ms: 1_000,
+                },
+            )
+            .await;
+        (asked.elapsed(), response)
+    };
+    let (read, (took, response)) = tokio::join!(read, progress);
+    assert!(
+        matches!(read, Response::Err(Error::SubtitleNotReady { .. })),
+        "{read:?}"
+    );
+    assert!(matches!(response, Response::Ok(_)), "{response:?}");
+    assert!(
+        took < Duration::from_secs(3),
+        "the progress waited {took:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
 /// A number from the server's metrics (P3-14).
 fn ocr(server: &TestServer, name: &str, labels: &[(&str, &str)]) -> f64 {
     let families = server.metrics.families();

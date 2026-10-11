@@ -248,9 +248,10 @@ encodes. The server encodes in software only to H.264.
 Since PX-46 the server splits its home's upload between the playbacks
 of devices off its LAN (`network.uplink`). A device is on the LAN when
 the address its connection uses is in one of the server's own interface
-subnets (a global IPv6 address in the home's /64 too), private,
-link-local or unique local, or in `network.lan_prefixes`; a relay path
-is never the LAN.
+subnets (a global IPv6 address in the home's /64 too; tunnels such as
+Tailscale or WireGuard left out), link-local, or in
+`network.lan_prefixes`; a relay path is never the LAN. A private address
+elsewhere is not: a device over a tunnel may be anywhere.
 
 - `StartPlayback` off the LAN with `Quality::Auto` is planned under the
   playback's share of `network.uplink.budget_mbps`, and under the

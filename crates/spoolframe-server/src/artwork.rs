@@ -121,6 +121,30 @@ pub struct ArtworkCache {
     /// Images asked for, and of those found in the cache (P3-14).
     requests: Counter,
     hits: Counter,
+    /// Artwork the catalog said this server serves, and when: asked again
+    /// only after [`AUTHORIZED_FOR`], or once the catalog changed (review
+    /// 2026-10-11 H3). Plex answers it with a GET of the item, so a grid of
+    /// cached posters cost one Plex request each.
+    authorized: Mutex<Authorized>,
+    /// The catalog's changes ([`crate::catalog::LiveCatalog::changes`]):
+    /// a library added, removed or changed forgets every answer.
+    changes: Option<tokio::sync::watch::Receiver<u64>>,
+}
+
+/// How long the catalog's word that an artwork is served is taken: a
+/// library unshared in Plex itself, which the server is not told of, is
+/// denied within this.
+pub const AUTHORIZED_FOR: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The most artwork answers kept: a large library's posters, and then
+/// all are forgotten at once.
+const MOST_AUTHORIZED: usize = 50_000;
+
+#[derive(Debug, Default)]
+struct Authorized {
+    /// The catalog change they were given under.
+    change: u64,
+    at: std::collections::HashMap<String, std::time::Instant>,
 }
 
 /// Images asked for since the server started, and how many of them the
@@ -221,7 +245,41 @@ impl ArtworkCache {
             inflight: Default::default(),
             requests: Counter::default(),
             hits: Counter::default(),
+            authorized: Mutex::default(),
+            changes: None,
         })
+    }
+
+    /// Forget what the catalog said each time it changes (`changes`, the
+    /// live catalog's).
+    pub fn with_changes(mut self, changes: tokio::sync::watch::Receiver<u64>) -> Self {
+        self.changes = Some(changes);
+        self
+    }
+
+    /// Whether the catalog said lately that `id` is served, under the
+    /// catalog as it is now.
+    fn authorized_lately(&self, id: &ArtworkId) -> bool {
+        let change = self.changes.as_ref().map_or(0, |c| *c.borrow());
+        let mut authorized = self.authorized.lock();
+        if authorized.change != change {
+            authorized.at.clear();
+            authorized.change = change;
+        }
+        authorized
+            .at
+            .get(&id.to_string())
+            .is_some_and(|at| at.elapsed() < AUTHORIZED_FOR)
+    }
+
+    fn remember_authorized(&self, id: &ArtworkId) {
+        let mut authorized = self.authorized.lock();
+        if authorized.at.len() >= MOST_AUTHORIZED {
+            authorized.at.clear();
+        }
+        authorized
+            .at
+            .insert(id.to_string(), std::time::Instant::now());
     }
 
     /// What was asked for, and found (P3-14).
@@ -261,7 +319,10 @@ impl ArtworkCache {
         if size == ArtworkSize::Unknown {
             return Err(ArtworkError::BadSize(size));
         }
-        self.catalog.authorize_artwork(id).await?;
+        if !self.authorized_lately(id) {
+            self.catalog.authorize_artwork(id).await?;
+            self.remember_authorized(id);
+        }
         self.get_authorized(id, size).await
     }
 
@@ -432,11 +493,25 @@ mod tests {
 
     use super::*;
 
-    /// Serves an 800×400 PNG for every image path, counting fetches.
-    #[derive(Debug, Default)]
+    /// Serves an 800×400 PNG for every image path, counting fetches and
+    /// authorizations; `changed` is its changes, as the live catalog's.
+    #[derive(Debug)]
     struct Counting {
         fetches: AtomicUsize,
+        authorizations: AtomicUsize,
         denied: std::sync::atomic::AtomicBool,
+        changed: tokio::sync::watch::Sender<u64>,
+    }
+
+    impl Default for Counting {
+        fn default() -> Self {
+            Self {
+                fetches: AtomicUsize::default(),
+                authorizations: AtomicUsize::default(),
+                denied: Default::default(),
+                changed: tokio::sync::watch::Sender::new(0),
+            }
+        }
     }
 
     fn png(width: u32, height: u32) -> Vec<u8> {
@@ -478,6 +553,7 @@ mod tests {
             &self,
             id: &spoolframe_types::ArtworkId,
         ) -> Result<(), CatalogError> {
+            self.authorizations.fetch_add(1, Ordering::SeqCst);
             if self.denied.load(Ordering::SeqCst) {
                 return Err(CatalogError::NotServed(id.to_string()));
             }
@@ -518,7 +594,9 @@ mod tests {
         let catalog = Arc::new(Counting::default());
         let (tmp, path) = dir(test).await;
         (
-            ArtworkCache::open(&path, limit, catalog.clone()).unwrap(),
+            ArtworkCache::open(&path, limit, catalog.clone())
+                .unwrap()
+                .with_changes(catalog.changed.subscribe()),
             catalog,
             tmp,
         )
@@ -534,6 +612,8 @@ mod tests {
         cache.get(&id(1), ArtworkSize::Small).await.unwrap();
         let fetched = catalog.fetches.load(Ordering::SeqCst);
         catalog.denied.store(true, Ordering::SeqCst);
+        // The library removed: the catalog is replaced.
+        catalog.changed.send_modify(|n| *n += 1);
         for size in [ArtworkSize::Small, ArtworkSize::Original] {
             assert!(matches!(
                 cache.get(&id(1), size).await,
@@ -541,6 +621,22 @@ mod tests {
             ));
         }
         assert_eq!(catalog.fetches.load(Ordering::SeqCst), fetched);
+    }
+
+    /// A cached poster asked for again is not authorized with the catalog
+    /// again (a Plex GET of its item each time), until the catalog changes.
+    /// Review 2026-10-11 H3.
+    #[tokio::test]
+    async fn a_cached_image_is_not_authorized_again_until_the_catalog_changes() {
+        let (cache, catalog, _dir) = cache("authorized-once", u64::MAX).await;
+        let asked = || catalog.authorizations.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            cache.get(&id(1), ArtworkSize::Small).await.unwrap();
+        }
+        assert_eq!(asked(), 1);
+        catalog.changed.send_modify(|n| *n += 1);
+        cache.get(&id(1), ArtworkSize::Small).await.unwrap();
+        assert_eq!(asked(), 2);
     }
 
     #[tokio::test]

@@ -549,6 +549,16 @@ impl Previews {
     }
 
     async fn make(&self, id: &MediaId, urgent: bool) -> Result<(), String> {
+        let settings = self.settings();
+        if settings.when == When::Never {
+            return Ok(());
+        }
+        // A set made ahead fits or is not made: decided before asking Plex
+        // where the file is, which a full cache would otherwise ask for
+        // every item in the library each sweep (review 2026-10-11 M13).
+        if !urgent && !self.cache.has_room() {
+            return Ok(());
+        }
         let path = match self.sources.catalog.media_path(id).await {
             Ok(path) => path,
             // Plex or the mount is away: not a failure of the file's, and
@@ -558,17 +568,10 @@ impl Previews {
                 return Ok(());
             }
         };
-        let settings = self.settings();
-        if settings.when == When::Never {
-            return Ok(());
-        }
         let key = key(&path, settings.interval)
             .await
             .map_err(|e| e.to_string())?;
         if self.cache.get(&key).is_some() {
-            return Ok(());
-        }
-        if !urgent && !self.cache.has_room() {
             return Ok(());
         }
         let started = std::time::Instant::now();

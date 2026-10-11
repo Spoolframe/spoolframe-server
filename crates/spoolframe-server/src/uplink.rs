@@ -61,13 +61,35 @@ pub enum Class {
     Guest,
 }
 
-/// Whether `ip` is on the LAN: private, link-local or unique local, or in
-/// one of `subnets` (this host's) or `extra` (`network.lan_prefixes`).
+/// Whether `ip` is on the LAN: loopback or link-local, or in one of
+/// `subnets` (this host's, tunnels left out) or `extra`
+/// (`network.lan_prefixes`). A private address is not the LAN for being
+/// private (review 2026-10-11 M28): a phone on cellular reaching the
+/// server over Tailscale (100.64.0.0/10) or WireGuard (10.x) has a private
+/// address, and its bytes leave through the home's uplink. A tunnel's
+/// network counts as home only when an admin lists it.
 pub fn is_lan(ip: IpAddr, subnets: &[Network], extra: &[Network]) -> bool {
     let ip = ip.to_canonical();
-    crate::wan::not_public(ip).is_some()
+    ip.is_loopback()
+        || link_local(ip)
         || subnets.iter().any(|n| n.contains(ip))
         || extra.iter().any(|n| n.contains(ip))
+}
+
+fn link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    }
+}
+
+/// Whether an interface named `name` is a tunnel (Tailscale, WireGuard,
+/// tun): the devices at its far end are wherever they are, so its
+/// subnet is not the LAN's.
+fn tunnel(name: &str) -> bool {
+    ["tailscale", "wg", "tun", "utun"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// How long the host's subnets are kept before they are read again: an
@@ -311,7 +333,8 @@ impl Uplink {
 pub const SETTLE: Duration = Duration::from_secs(3);
 
 /// This host's interface subnets now: each address with its netmask's
-/// prefix. Loopback and link-local ones are left out (not public anyway).
+/// prefix. Loopback ones are left out (`is_lan` takes them anyway), and a
+/// tunnel's ([`tunnel`]) is its own address only.
 pub fn host_subnets() -> Vec<Network> {
     let mut found = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -331,6 +354,8 @@ pub fn host_subnets() -> Vec<Network> {
             {
                 continue;
             }
+            let tunnel = !ifa.ifa_name.is_null()
+                && tunnel(&std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy());
             let (ip, prefix) = match i32::from((*ifa.ifa_addr).sa_family) {
                 libc::AF_INET => {
                     let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
@@ -353,6 +378,13 @@ pub fn host_subnets() -> Vec<Network> {
             if ip.is_loopback() || prefix == 0 {
                 continue;
             }
+            // A tunnel's own address is this machine's, the LAN: its
+            // network's other devices are not.
+            let prefix = match (tunnel, ip) {
+                (true, IpAddr::V4(_)) => 32,
+                (true, IpAddr::V6(_)) => 128,
+                (false, _) => prefix,
+            };
             found.push(Network::new(ip, prefix));
         }
         libc::freeifaddrs(head);
@@ -483,12 +515,27 @@ mod tests {
         assert!(is_lan(ip("2603:8000:c33e:6ac6:5c3e::1"), &subnets, &[]));
         assert!(!is_lan(ip("2607:fb90:bd81:1d9::1"), &subnets, &[]));
         assert!(is_lan(ip("192.168.86.134"), &subnets, &[]));
-        // Private and link-local, as the log always called them.
-        assert!(is_lan(ip("10.1.2.3"), &[], &[]));
+        // Link-local and loopback always are.
         assert!(is_lan(ip("fe80::1"), &[], &[]));
-        assert!(is_lan(ip("fd00::1"), &[], &[]));
+        assert!(is_lan(ip("169.254.1.2"), &[], &[]));
+        assert!(is_lan(ip("127.0.0.1"), &[], &[]));
         // A public IPv4 address off the host's subnets is the WAN.
         assert!(!is_lan(ip("76.50.95.40"), &subnets, &[]));
+    }
+
+    /// A private address off the host's subnets is not the LAN for being
+    /// private: a phone on cellular over Tailscale or WireGuard is one,
+    /// and its bytes leave through the uplink. Listed in
+    /// `lan_prefixes`, a tunnel's network is home. Review 2026-10-11 M28.
+    #[test]
+    fn a_tunnel_s_private_address_is_not_the_lan_unless_listed() {
+        let subnets = [net("192.168.86.10/24")];
+        assert!(!is_lan(ip("100.101.102.103"), &subnets, &[]));
+        assert!(!is_lan(ip("10.10.0.7"), &subnets, &[]));
+        assert!(!is_lan(ip("fd7a:115c:a1e0::1"), &subnets, &[]));
+        assert!(is_lan(ip("10.10.0.7"), &subnets, &[net("10.10.0.0/24")]));
+        assert!(tunnel("tailscale0") && tunnel("wg0") && tunnel("tun0"));
+        assert!(!tunnel("enp5s0") && !tunnel("wlan0") && !tunnel("br0"));
     }
 
     #[test]

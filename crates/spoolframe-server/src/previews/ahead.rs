@@ -147,6 +147,9 @@ async fn sweep_loop(previews: Weak<Previews>, catalog: Arc<dyn Catalog>, store: 
         was_ahead = ahead;
         let everything = last_all.is_none_or(|t| t.elapsed() >= ALL_EVERY);
         let newest = last_newest.is_none_or(|t| t.elapsed() >= NEWEST_EVERY);
+        // Nothing made ahead fits a full cache: the walk of every item
+        // would only ask Plex where each file is to make none.
+        let everything = everything && now.cache.has_room();
         if ahead && (everything || newest) {
             let in_progress = match store.in_progress_anyone(FIRST).await {
                 Ok(ids) => ids.iter().filter_map(|id| id.parse().ok()).collect(),

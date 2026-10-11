@@ -29,6 +29,8 @@ pub enum PgsError {
     Short(&'static str),
     #[error("a {width} × {height} picture is larger than {MAX_SIDE} × {MAX_SIDE}")]
     TooLarge { width: usize, height: usize },
+    #[error("object {0}'s run-length data is longer than its picture can need")]
+    Overlong(u16),
     #[error(transparent)]
     Budget(#[from] OverBudget),
 }
@@ -139,7 +141,14 @@ pub fn cues_within(stream: &[u8], budget: &Budget) -> Result<Vec<Cue>, PgsError>
                     data = &data[7..];
                     partial.insert(id, (width, height, Vec::new()));
                 }
-                if let Some((_, _, rle)) = partial.get_mut(&id) {
+                if let Some((width, height, rle)) = partial.get_mut(&id) {
+                    // Fragments are held until the last, and only a decoded
+                    // object counts against the budget: past what any
+                    // coding of this picture needs, the stream is refused
+                    // rather than held (review 2026-10-11 M35).
+                    if rle.len() + data.len() > most_rle(*width, *height) {
+                        return Err(PgsError::Overlong(id));
+                    }
                     rle.extend_from_slice(data);
                 }
                 if sequence & 0x40 != 0
@@ -181,6 +190,13 @@ pub fn cues_within(stream: &[u8], budget: &Budget) -> Result<Vec<Cue>, PgsError>
     // A stream that ends while a cue shows: it is dropped, with no end
     // time to give it.
     Ok(out.into_cues())
+}
+
+/// The most run-length bytes a `width` × `height` object can take: its
+/// longest coding is two bytes a pixel (a single pixel of colour 0) and
+/// two at each line's end. The declared length is not trusted for it.
+fn most_rle(width: usize, height: usize) -> usize {
+    2 * width * height + 2 * height + 4
 }
 
 fn composition(body: &[u8], pts_ms: u64) -> Result<Composition, PgsError> {
@@ -712,6 +728,25 @@ mod tests {
         assert_eq!((cues[0].image.width, cues[0].image.height), (152, 62));
         let row = &ink(&cues[0].image)[20 * 152..21 * 152];
         assert!(!row[16 + 39] && row[16 + 40] && row[16 + 79] && !row[16 + 80]);
+    }
+
+    /// Continuation fragments past what the object's picture can need
+    /// refuse the stream, rather than growing what is held without bound
+    /// (review 2026-10-11 M35).
+    #[test]
+    fn fragments_past_what_a_picture_needs_are_refused() {
+        let mut sup = Vec::new();
+        // Object 7, 2 × 2, its first fragment: a 24-bit length, then size.
+        let mut first = vec![0, 7, 0, 0x80, 0, 0, 12, 0, 2, 0, 2];
+        first.extend([1, 1, 0, 0]);
+        fixture::segment(&mut sup, 0, ODS, &first);
+        // Then middle fragments of a megabyte, far past 2 × 2's need.
+        let mut middle = vec![0, 7, 0, 0x00];
+        middle.extend(std::iter::repeat_n(1u8, 60_000));
+        for _ in 0..20 {
+            fixture::segment(&mut sup, 0, ODS, &middle);
+        }
+        assert!(matches!(cues(&sup), Err(PgsError::Overlong(7))));
     }
 
     #[test]

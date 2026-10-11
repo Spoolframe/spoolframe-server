@@ -39,6 +39,9 @@ const MAX_CONVERSIONS: usize = 4;
 /// (PX-09 finding 15).
 const MAX_MAKING: usize = 64;
 
+/// Tracks remembered as failed at once (review 2026-10-11 M14).
+const MAX_FAILED: usize = 4096;
+
 /// `subtitles { … }`, with the defaults filled in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OcrSettings {
@@ -92,6 +95,11 @@ pub struct Subtitles {
     threads: usize,
     cache_dir: PathBuf,
     making: Mutex<HashMap<String, watch::Receiver<TextState>>>,
+    /// Tracks whose text could not be made, and why, until a restart: a
+    /// client asking again is told at once instead of running the
+    /// extract, decode and OCR again on the one OCR turn. At most
+    /// [`MAX_FAILED`].
+    failed: Mutex<HashMap<String, String>>,
     one_track: Arc<Semaphore>,
     /// [`MAX_CONVERSIONS`] places for text conversions.
     conversions: Arc<Semaphore>,
@@ -148,6 +156,7 @@ impl Subtitles {
             threads: settings.threads,
             cache_dir: settings.cache_dir.clone(),
             making: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
             one_track: Arc::new(Semaphore::new(1)),
             conversions: Arc::new(Semaphore::new(MAX_CONVERSIONS)),
             ocr_pending: Default::default(),
@@ -201,10 +210,27 @@ impl Subtitles {
         if tokio::fs::try_exists(&text).await.unwrap_or(false) {
             return TextPeek::Ready;
         }
+        if let Some(reason) = self.failed.lock().get(&key) {
+            return TextPeek::Making(TextState::Failed(reason.clone()));
+        }
         match self.making.lock().get(&key) {
             Some(state) => TextPeek::Making(state.borrow().clone()),
             None => TextPeek::NotMade,
         }
+    }
+
+    /// `key`'s text could not be made, for `reason`: kept until a restart,
+    /// as previews keep theirs. Past [`MAX_FAILED`] one is forgotten for
+    /// it, so the map stays bounded; a forgotten one is only tried again.
+    fn remember_failed(&self, key: &str, reason: &str) {
+        let mut failed = self.failed.lock();
+        if failed.len() >= MAX_FAILED
+            && !failed.contains_key(key)
+            && let Some(any) = failed.keys().next().cloned()
+        {
+            failed.remove(&any);
+        }
+        failed.insert(key.to_owned(), reason.to_owned());
     }
 
     /// The text of `source`: ready at once from the cache, or being made.
@@ -232,6 +258,9 @@ impl Subtitles {
             .join(format!("{key}.{}", extension(source.to)));
         if tokio::fs::try_exists(&text).await.unwrap_or(false) {
             return watch::channel(TextState::Ready(text)).1;
+        }
+        if let Some(reason) = self.failed.lock().get(&key) {
+            return failed(reason.clone());
         }
         let mut making = self.making.lock();
         if let Some(state) = making.get(&key) {
@@ -285,6 +314,9 @@ impl Subtitles {
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             let _ = tokio::fs::remove_dir_all(&job.work).await;
+            if let TextState::Failed(reason) = &state {
+                job.subtitles.remember_failed(&key, reason);
+            }
             let _ = tx.send(state);
             job.subtitles.making.lock().remove(&key);
         });
@@ -591,7 +623,10 @@ mod tests {
     /// `subtitles`, once it is made or has failed.
     async fn read_pgs(subtitles: &Arc<Subtitles>, film: &Path) -> TextState {
         let sup = film.with_file_name("Film.en.sup");
-        std::fs::write(&sup, b"PG").unwrap();
+        // Once: written again it would be another file to the cache.
+        if !sup.exists() {
+            std::fs::write(&sup, b"PG").unwrap();
+        }
         let stream = SubtitleStream {
             source: SubtitleSource::External { path: sup },
             codec: "hdmv_pgs_subtitle".into(),
@@ -661,6 +696,35 @@ exit 101
             other => panic!("{other:?}"),
         }
         assert_eq!(subtitles.ocr_counts().failed, 1);
+    }
+
+    /// A track that failed is not made again: asked a second time, its
+    /// reason comes back at once and the decoder does not run. Review
+    /// 2026-10-11 M14.
+    #[tokio::test]
+    async fn a_track_that_failed_is_not_made_again() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-subtitles-failed-once").await;
+        let dir = tmp.as_ref();
+        let runs = dir.join("runs");
+        let subtitles = decoding_with(
+            dir,
+            &format!(
+                "#!/bin/sh
+echo run >> '{}'
+echo 'not a subtitle stream' >&2
+exit 1
+",
+                runs.display()
+            ),
+        );
+        let film = dir.join("Film.mkv");
+        std::fs::write(&film, b"a film").unwrap();
+        let first = read_pgs(&subtitles, &film).await;
+        let second = read_pgs(&subtitles, &film).await;
+        assert!(matches!(first, TextState::Failed(_)), "{first:?}");
+        assert_eq!(first, second);
+        let ran = std::fs::read_to_string(&runs).unwrap();
+        assert_eq!(ran.lines().count(), 1, "the decoder ran again");
     }
 
     /// One killed (past its memory limit, say) fails the same way.

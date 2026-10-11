@@ -22,6 +22,8 @@ struct Files {
     files: Mutex<HashMap<String, PathBuf>>,
     indexed: Mutex<HashMap<String, PreviewFrames>>,
     broken: Mutex<HashSet<String>>,
+    /// How many times a file's path was asked for.
+    asked: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait]
@@ -45,6 +47,7 @@ impl Catalog for Files {
         unreachable!()
     }
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.files
             .lock()
             .get(id.key())
@@ -774,4 +777,24 @@ async fn n_workers_make_n_files_ahead_at_once() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
+}
+
+/// With no room in the cache, a set made ahead is not made, and Plex is
+/// not asked where its file is first: a full cache asked once per item
+/// of the library every sweep. A set for a play is still made. Review
+/// 2026-10-11 M13.
+#[tokio::test]
+async fn a_full_cache_asks_plex_nothing_for_previews_made_ahead() {
+    let full = PreviewSettings {
+        cache_limit_bytes: 0,
+        ..settings()
+    };
+    let setup = setup("full-cache", full).await;
+    let asked = || setup.files.asked.load(std::sync::atomic::Ordering::SeqCst);
+    let id = film("not-here");
+    setup.previews.make(&id, false).await.unwrap();
+    assert_eq!(asked(), 0);
+    // A play's set is made whatever the room: Plex is asked.
+    setup.previews.make(&id, true).await.unwrap();
+    assert_eq!(asked(), 1);
 }

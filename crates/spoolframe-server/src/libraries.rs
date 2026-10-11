@@ -420,8 +420,16 @@ impl RuntimeSettings {
             .collect())
     }
 
-    fn save_libraries(&self, list: &[LibraryConfig], by: &str) -> Result<(), LibraryError> {
-        self.change_keys(
+    /// Save `list` as the libraries, worked out from `base`: refused if
+    /// they changed meanwhile (review 2026-10-11 M25).
+    fn save_libraries(
+        &self,
+        base: &Layers,
+        list: &[LibraryConfig],
+        by: &str,
+    ) -> Result<(), LibraryError> {
+        self.change_keys_from(
+            base,
             "libraries",
             by,
             vec![("libraries", Some(libraries_value(list)))],
@@ -444,7 +452,7 @@ impl RuntimeSettings {
         name: Option<&str>,
         by: &str,
     ) -> Result<String, LibraryError> {
-        let (_, config) = self.config_now()?;
+        let (base, config) = self.config_now()?;
         let composite = self.composite()?;
         let source = composite
             .server(server)
@@ -514,7 +522,7 @@ impl RuntimeSettings {
         let id = library_id(&added.plex);
         tracing::info!(by, library = id, name = added.name, "library added");
         list.push(added);
-        self.save_libraries(&list, by)?;
+        self.save_libraries(&base, &list, by)?;
         Ok(id)
     }
 
@@ -524,11 +532,11 @@ impl RuntimeSettings {
         if name.is_empty() {
             return Err(LibraryError::Invalid("a library needs a name".into()));
         }
-        let (_, config) = self.config_now()?;
+        let (base, config) = self.config_now()?;
         let mut list = self.chosen(&config).await?;
         let at = Self::position(&list, id)?;
         list[at].name = name.to_owned();
-        self.save_libraries(&list, by)
+        self.save_libraries(&base, &list, by)
     }
 
     /// Put library `id` at `position`, or last if that is past the end.
@@ -538,12 +546,12 @@ impl RuntimeSettings {
         position: usize,
         by: &str,
     ) -> Result<(), LibraryError> {
-        let (_, config) = self.config_now()?;
+        let (base, config) = self.config_now()?;
         let mut list = self.chosen(&config).await?;
         let at = Self::position(&list, id)?;
         let library = list.remove(at);
         list.insert(position.min(list.len()), library);
-        self.save_libraries(&list, by)
+        self.save_libraries(&base, &list, by)
     }
 
     /// Sync library `id`'s watch state with linked Plex accounts this way
@@ -554,11 +562,11 @@ impl RuntimeSettings {
         sync: SyncDirection,
         by: &str,
     ) -> Result<(), LibraryError> {
-        let (_, config) = self.config_now()?;
+        let (base, config) = self.config_now()?;
         let mut list = self.chosen(&config).await?;
         let at = Self::position(&list, id)?;
         list[at].plex.sync = Some(sync.config_name().to_owned());
-        self.save_libraries(&list, by)?;
+        self.save_libraries(&base, &list, by)?;
         tracing::info!(
             by,
             library = id,
@@ -570,11 +578,11 @@ impl RuntimeSettings {
 
     /// Stop serving library `id`; its watch state is kept.
     pub async fn library_remove(&self, id: &str, by: &str) -> Result<(), LibraryError> {
-        let (_, config) = self.config_now()?;
+        let (base, config) = self.config_now()?;
         let mut list = self.chosen(&config).await?;
         let at = Self::position(&list, id)?;
         let removed = list.remove(at);
-        self.save_libraries(&list, by)?;
+        self.save_libraries(&base, &list, by)?;
         tracing::info!(
             by,
             library = id,
@@ -744,7 +752,7 @@ impl RuntimeSettings {
             keys.push(("libraries", Some(libraries_value(&kept))));
         }
         keys.push(("plex.servers", Some(servers_value(&servers))));
-        self.change_keys("plex.servers", by, keys)?;
+        self.change_keys_from(&layers, "plex.servers", by, keys)?;
         if let Err(e) = self.secrets().remove(&plex_token_secret(id)) {
             tracing::warn!(server = id, error = %e, "cannot forget the removed server's token");
         }
@@ -810,7 +818,7 @@ impl RuntimeSettings {
         .into_iter()
         .map(|key| (key, None))
         .collect();
-        self.change_keys("plex", by, keys)?;
+        self.change_keys_from(layers, "plex", by, keys)?;
         if let Err(e) = self.secrets().remove(&plex_token_secret(FIRST_PLEX_SERVER)) {
             tracing::warn!(error = %e, "cannot forget the removed first server's token");
         }

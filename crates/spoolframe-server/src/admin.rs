@@ -1103,6 +1103,7 @@ impl From<ChangeError> for ErrorObjectOwned {
             ChangeError::Setting(_) | ChangeError::Secret { .. } => {
                 error(error_code::INVALID_INPUT, e.to_string())
             }
+            ChangeError::Conflict { .. } => error(error_code::INVALID_INPUT, e.to_string()),
             ChangeError::Write(_) => internal(e),
         }
     }

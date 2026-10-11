@@ -365,6 +365,20 @@ impl Fit {
                 }
             }
         }
+        // A file with no picture is held to the cap too (review 2026-10-11
+        // M9): hi-res FLAC is several Mbit/s, over a WAN share of two.
+        // Its audio is what is encoded to fit.
+        if descriptor.video.is_none()
+            && let Some(index) = audio
+            && let (Some(max), Some(rate)) = (caps.max_bitrate, descriptor.bit_rate)
+            && rate > max
+        {
+            fit.audio.push(format!(
+                "audio {index}: {} over the client's {}",
+                mbits(rate),
+                mbits(max)
+            ));
+        }
         if let Some(index) = audio {
             let stream = &descriptor.audio[index];
             let codec = codecs::audio_codec(&stream.codec);
@@ -1391,6 +1405,44 @@ mod tests {
             subtitles: [SubtitleFormat::Srt].into(),
             ..ClientCapabilities::default()
         }
+    }
+
+    /// A file with no picture over the client's cap converts its audio
+    /// to fit, as a film's video does; under it, it plays as it is.
+    /// Review 2026-10-11 M9.
+    #[test]
+    fn audio_alone_over_the_cap_is_encoded_to_fit() {
+        let mut flac = dts_aac_pgs();
+        flac.video = None;
+        flac.subtitles.clear();
+        flac.audio = vec![audio(0, "flac", true)];
+        flac.bit_rate = Some(4_600_000);
+        let mut capped = caps();
+        capped.audio.insert(AudioCodec::Flac);
+        capped.delivery = vec![Delivery::Range, Delivery::Progressive];
+        capped.max_bitrate = Some(2_000_000);
+        let plan = plan(&flac, Some(&capped), picked(0, None));
+        let PlaybackPlan::Converted {
+            audio: Some(audio),
+            reasons,
+            ..
+        } = &plan
+        else {
+            panic!("not converted: {plan:?}");
+        };
+        assert!(
+            matches!(audio.action, AudioAction::Encode { .. }),
+            "{plan:?}"
+        );
+        assert!(
+            reasons[0].starts_with("audio 0: 4.6 Mbit/s over"),
+            "{reasons:?}"
+        );
+        capped.max_bitrate = Some(5_000_000);
+        assert!(matches!(
+            super::tests::plan(&flac, Some(&capped), picked(0, None)),
+            PlaybackPlan::Direct { .. }
+        ));
     }
 
     fn reasons(plan: PlaybackPlan) -> Vec<String> {

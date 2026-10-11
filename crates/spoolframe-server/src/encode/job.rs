@@ -432,6 +432,10 @@ pub struct Jobs {
     /// Held by the job that looks at a full scratch directory and makes
     /// room in it, so the next job to look sees what the first one freed.
     scratch_check: Arc<tokio::sync::Mutex<()>>,
+    /// What the running jobs have written to the scratch directory, each
+    /// job adding what it measured since it last did: what decides whether
+    /// one walks the whole directory to make room (review 2026-10-11 H2).
+    scratch_used: Arc<AtomicU64>,
     /// How many jobs run now, and playbacks being prepared: frame
     /// previews made ahead wait while any is (P3-13, PX-25).
     encoding: Encoding,
@@ -555,6 +559,7 @@ impl Jobs {
         Ok(Self {
             budget: Arc::new(parking_lot::Mutex::new(budget)),
             scratch_check: Arc::default(),
+            scratch_used: Arc::default(),
             encoding: Encoding::default(),
             live: parking_lot::Mutex::default(),
             counters: Arc::default(),
@@ -727,6 +732,7 @@ impl Jobs {
             reader_segment: AtomicU32::new(0),
             first_kept: AtomicU32::new(first_segment),
             paused: AtomicBool::new(false),
+            counted: AtomicU64::new(0),
             stderr: parking_lot::Mutex::default(),
         });
         let supervisor = Supervisor {
@@ -740,6 +746,7 @@ impl Jobs {
             scratch: self.dir.clone(),
             scratch_limit: limits.scratch_limit_bytes,
             scratch_check: self.scratch_check.clone(),
+            scratch_used: self.scratch_used.clone(),
             read_ahead: limits.read_ahead,
             stalled_after: limits.stalled_after,
             shared: shared.clone(),
@@ -767,6 +774,7 @@ impl Jobs {
             shared,
             task,
             slot,
+            scratch_used: self.scratch_used.clone(),
         });
         let mut live = self.live.lock();
         live.retain(|job| job.strong_count() > 0);
@@ -864,6 +872,8 @@ struct Shared {
     /// never written by this run, or removed to make room.
     first_kept: AtomicU32,
     paused: AtomicBool,
+    /// What it has counted into [`Jobs::scratch_used`].
+    counted: AtomicU64,
     /// ffmpeg's last [`STDERR_KEPT`] lines of stderr.
     stderr: parking_lot::Mutex<VecDeque<String>>,
 }
@@ -911,6 +921,8 @@ pub struct EncodeJob {
     /// Held while ffmpeg may run; released by [`EncodeJob::stop`], or by
     /// the job itself when it ends a stalled ffmpeg.
     slot: Arc<parking_lot::Mutex<Option<Slot>>>,
+    /// [`Jobs::scratch_used`]: what it counted there goes with its files.
+    scratch_used: Arc<AtomicU64>,
 }
 
 impl EncodeJob {
@@ -1061,12 +1073,31 @@ impl Drop for EncodeJob {
         // The task owns the child, which is killed when dropped; the signal
         // makes it now rather than when the runtime gets to the task.
         self.stop();
-        if let Err(e) = std::fs::remove_dir_all(&self.dir)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(dir = %self.dir.display(), error = %e, "cannot remove an encode's files");
+        // A run's directory holds up to about 1200 files, and a job is
+        // dropped on async workers, often under a conversion's lock: the
+        // removal runs on the blocking pool, not there (review 2026-10-11
+        // M3). Outside a runtime (a test's end, shutdown) it runs here.
+        let dir = std::mem::take(&mut self.dir);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || remove_run_dir(&dir));
+            }
+            Err(_) => remove_run_dir(&dir),
         }
+        uncount(
+            &self.scratch_used,
+            self.shared.counted.swap(0, Ordering::Relaxed),
+        );
         tracing::debug!(pid = self.pid(), "encode ended");
+    }
+}
+
+/// A run's files removed; one already gone is fine.
+fn remove_run_dir(dir: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(dir = %dir.display(), error = %e, "cannot remove an encode's files");
     }
 }
 
@@ -1100,6 +1131,7 @@ struct Supervisor {
     scratch: PathBuf,
     scratch_limit: u64,
     scratch_check: Arc<tokio::sync::Mutex<()>>,
+    scratch_used: Arc<AtomicU64>,
     read_ahead: Duration,
     stalled_after: Duration,
     shared: Arc<Shared>,
@@ -1150,7 +1182,7 @@ impl Supervisor {
             }
             // Before the first output nothing a reader has changes: the job
             // runs again from the start, decoding in software.
-            if self.nothing_written()
+            if self.nothing_written().await
                 && let Some(fallback) = self.fallback.take()
             {
                 match self.relaunch(&fallback) {
@@ -1200,8 +1232,8 @@ impl Supervisor {
 
     /// Whether the run has written nothing a reader could have: no
     /// finished segment, or not a byte of the file.
-    fn nothing_written(&self) -> bool {
-        match self.measure() {
+    async fn nothing_written(&self) -> bool {
+        match self.measure().await {
             (_, Some(_)) => false,
             (bytes, None) => self.written == Written::Hls || bytes == 0,
         }
@@ -1269,6 +1301,11 @@ impl Supervisor {
         let mut encoded_ms = 0u64;
         // What the job had written when it last looked.
         let mut seen = 0u64;
+        // When it last walked the scratch directory: not yet, so its first
+        // write does, as every write did before (H2).
+        let mut walked = tokio::time::Instant::now()
+            .checked_sub(WALK_EVERY)
+            .unwrap_or_else(tokio::time::Instant::now);
         // What it had written and encoded when it last got further, and
         // when that was.
         let mut reached = (0u64, 0u64);
@@ -1291,7 +1328,8 @@ impl Supervisor {
                 },
                 status = child.wait() => break status,
                 _ = tick.tick() => {
-                    let (bytes, last_segment) = self.measure();
+                    let (bytes, last_segment) = self.measure().await;
+                    self.count(bytes);
                     self.throttle(encoded_ms, base_ms, bytes, last_segment);
                     let output = self.output(bytes, encoded_ms, last_segment);
                     self.progress.send_modify(|p| {
@@ -1323,17 +1361,29 @@ impl Supervisor {
                     // Only a job that wrote since it last looked can be the
                     // one that fills the scratch directory: a paused one
                     // is left alone, whoever fills it.
-                    if bytes > seen {
+                    // The whole directory is walked only when what the
+                    // jobs count says it may be full, or now and then to
+                    // see what they do not count (H2): it was walked by
+                    // every job that wrote, every tick.
+                    if bytes > seen
+                        && (self.scratch_used.load(Ordering::Relaxed) > self.scratch_limit
+                            || walked.elapsed() >= WALK_EVERY)
+                    {
                         let _one_job_at_a_time = self.scratch_check.lock().await;
+                        walked = tokio::time::Instant::now();
                         // A job just held back for its reader writes no
                         // more: what it cannot free now it can once the
                         // reader has moved on and it writes again.
-                        if !self.make_room() && !self.shared.paused.load(Ordering::Relaxed) {
+                        if !self.make_room().await && !self.shared.paused.load(Ordering::Relaxed) {
                             let _ = child.start_kill();
                             let _ = child.wait().await;
                             return Ended::ScratchFull;
                         }
-                        seen = self.measure().0;
+                        let measured = self.measure().await.0;
+                        self.count(measured);
+                        seen = measured;
+                    } else if bytes > seen {
+                        seen = bytes;
                     }
                 }
             }
@@ -1346,7 +1396,8 @@ impl Supervisor {
         while let Ok(Some(line)) = err.next_line().await {
             self.shared.stderr_line(line);
         }
-        let (bytes, last_segment) = self.measure();
+        let (bytes, last_segment) = self.measure().await;
+        self.count(bytes);
         let encoded_ms = self.progress.borrow().encoded_ms.max(encoded_ms);
         let output = self.output(bytes, encoded_ms, last_segment);
         self.progress.send_modify(|p| {
@@ -1382,38 +1433,40 @@ impl Supervisor {
     /// an HLS job first removes its own segments behind its reader, the
     /// oldest first, until it is (P2-03). The segment before the one
     /// asked for last stays: a reader may still be fetching it.
-    fn make_room(&self) -> bool {
-        let mut total = dir_size(&self.scratch);
-        if total > self.scratch_limit && self.written == Written::Hls {
-            let behind = self
-                .shared
-                .reader_segment
-                .load(Ordering::Relaxed)
-                .saturating_sub(1);
-            let mut n = self.shared.first_kept.load(Ordering::Relaxed);
-            while total > self.scratch_limit && n < behind {
-                // Said first, so no reader takes the missing file for an
-                // empty segment.
-                self.shared.first_kept.store(n + 1, Ordering::Relaxed);
-                let file = self.dir.join(format!("seg{n}.m4s"));
-                let size = std::fs::metadata(&file).map_or(0, |m| m.len());
-                if std::fs::remove_file(&file).is_ok() {
-                    total = total.saturating_sub(size);
-                }
-                n += 1;
-            }
-            tracing::debug!(
-                pid = self.pid(),
-                first_kept = n,
-                "segments behind the reader removed for room"
-            );
-        }
-        total <= self.scratch_limit
+    ///
+    /// On the blocking pool: it walks every job's files (H2).
+    async fn make_room(&self) -> bool {
+        let (scratch, limit, hls, shared, dir) = (
+            self.scratch.clone(),
+            self.scratch_limit,
+            self.written == Written::Hls,
+            self.shared.clone(),
+            self.dir.clone(),
+        );
+        tokio::task::spawn_blocking(move || make_room(&scratch, limit, hls, &shared, &dir))
+            .await
+            .unwrap_or(true)
     }
 
-    /// Bytes written, and for HLS the highest segment on disk.
-    fn measure(&self) -> (u64, Option<u32>) {
-        measure(&self.written, &self.dir)
+    /// Bytes written, and for HLS the highest segment on disk: read on the
+    /// blocking pool, not this worker (H2).
+    async fn measure(&self) -> (u64, Option<u32>) {
+        let (written, dir) = (self.written.clone(), self.dir.clone());
+        tokio::task::spawn_blocking(move || measure(&written, &dir))
+            .await
+            .unwrap_or((0, None))
+    }
+
+    /// `bytes`, just measured, counted into [`Jobs::scratch_used`] in place
+    /// of what it counted before.
+    fn count(&self, bytes: u64) {
+        let before = self.shared.counted.swap(bytes, Ordering::Relaxed);
+        if bytes >= before {
+            self.scratch_used
+                .fetch_add(bytes - before, Ordering::Relaxed);
+        } else {
+            uncount(&self.scratch_used, before - bytes);
+        }
     }
 
     /// [`Progress::output`] now, `bytes` and `last_segment` just measured
@@ -1499,6 +1552,50 @@ fn reader_ms(
             }
         }
     }
+}
+
+/// `bytes` taken off what the jobs counted, never below nothing.
+fn uncount(used: &AtomicU64, bytes: u64) {
+    let _ = used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
+        Some(now.saturating_sub(bytes))
+    });
+}
+
+/// How often a job that writes walks the whole scratch directory though
+/// what the jobs count says it has room: to see what they do not count
+/// (the inputs' links, kept inits) and catch a count gone wrong.
+const WALK_EVERY: Duration = Duration::from_secs(30);
+
+/// Whether the scratch directory is within `limit`. When it is not, an
+/// HLS job (`hls`) first removes its own segments in `dir` behind its
+/// reader, the oldest first, until it is (P2-03). The segment before the
+/// one asked for last stays: a reader may still be fetching it.
+fn make_room(scratch: &Path, limit: u64, hls: bool, shared: &Shared, dir: &Path) -> bool {
+    let mut total = dir_size(scratch);
+    if total > limit && hls {
+        let behind = shared
+            .reader_segment
+            .load(Ordering::Relaxed)
+            .saturating_sub(1);
+        let mut n = shared.first_kept.load(Ordering::Relaxed);
+        while total > limit && n < behind {
+            // Said first, so no reader takes the missing file for an
+            // empty segment.
+            shared.first_kept.store(n + 1, Ordering::Relaxed);
+            let file = dir.join(format!("seg{n}.m4s"));
+            let size = std::fs::metadata(&file).map_or(0, |m| m.len());
+            if std::fs::remove_file(&file).is_ok() {
+                total = total.saturating_sub(size);
+            }
+            n += 1;
+        }
+        tracing::debug!(
+            pid = shared.pid.load(Ordering::Relaxed),
+            first_kept = n,
+            "segments behind the reader removed for room"
+        );
+    }
+    total <= limit
 }
 
 /// Bytes `written` in `dir`, and for HLS the highest segment finished.
@@ -2932,6 +3029,30 @@ pub(super) mod tests {
         (1..=8)
             .map(|n| dir.join(format!("seg{n}.m4s")).exists())
             .collect()
+    }
+
+    /// What a job writes is counted for the scratch space as it is
+    /// measured, and uncounted when the job goes: what decides whether a
+    /// job walks every job's files, which each did on every look. Review
+    /// 2026-10-11 H2.
+    #[tokio::test]
+    async fn a_job_s_bytes_are_counted_while_it_lives() {
+        let script = "head -c 3000 /dev/zero > \"$1/a\"; echo out_time_us=1000000; exec sleep 30";
+        let (jobs, _dir) = jobs_within("counted", script, 1 << 30).await;
+        let dir = jobs.dir().join("h/0");
+        let args = vec![dir.display().to_string()];
+        let job = jobs
+            .start(dir.clone(), args, Written::Hls, Load::Remux, 0, 1, 0, None)
+            .unwrap();
+        let used = || jobs.scratch_used.load(Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while used() < 3000 {
+            assert!(std::time::Instant::now() < deadline, "counted {}", used());
+            looked(&job, 1).await;
+        }
+        assert_eq!(used(), 3000);
+        drop(job);
+        assert_eq!(used(), 0);
     }
 
     #[tokio::test]

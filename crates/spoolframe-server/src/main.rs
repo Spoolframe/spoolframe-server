@@ -872,7 +872,8 @@ async fn run(
     let artwork_dir = state_dir.join("cache").join("artwork");
     let artwork = Arc::new(
         ArtworkCache::open(&artwork_dir, config.artwork.cache_bytes(), catalog.clone())
-            .with_context(|| format!("cannot open the artwork cache {}", artwork_dir.display()))?,
+            .with_context(|| format!("cannot open the artwork cache {}", artwork_dir.display()))?
+            .with_changes(live.changes()),
     );
 
     let store = Store::open(state_dir).await?;

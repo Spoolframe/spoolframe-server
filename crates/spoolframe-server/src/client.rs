@@ -1166,12 +1166,16 @@ impl ClientProtocol {
                     .await
                     .map_err(playback_refusal)?;
                 let current = self
-                    .use_playback(connection, &request.handle, &request.session)
+                    .use_playback_with(
+                        connection,
+                        &request.handle,
+                        &request.session,
+                        Using::Plays,
+                        |p| p.revision,
+                    )
                     .await?;
-                if current.revision != revision {
-                    return Err(Error::RevisionConflict {
-                        revision: current.revision,
-                    });
+                if current != revision {
+                    return Err(Error::RevisionConflict { revision: current });
                 }
                 // On its chart in playback debug (P3-15).
                 self.services.playbacks.read(
@@ -1224,23 +1228,35 @@ impl ClientProtocol {
                 };
                 let (session, who) = self.authenticate(connection, state, Some(session)).await?;
                 state.locks.lock().use_session(&session)?;
-                // Preparing the selected subtitle and its metadata is atomic
-                // with control changes. Sending its bytes holds no lock.
+                // A stale revision is refused before any work.
+                let now = self
+                    .use_playback_with(connection, &handle, &session, Using::Plays, |p| p.revision)
+                    .await?;
+                if now != revision {
+                    return Err(Error::RevisionConflict { revision: now });
+                }
+                // The text is found, or waited for (up to READ_WAIT while
+                // OCR runs), holding no lock: a seek, a subtitle change, a
+                // stop or a progress report on this playback goes on
+                // meanwhile (review 2026-10-11 M8). As for media, the
+                // revision is checked again under the control lock after,
+                // so a subtitle changed meanwhile is never labelled with
+                // this revision.
+                let reply = self
+                    .serve(connection, state, session.clone(), who, read, None)
+                    .await?;
                 let _control = self
                     .services
                     .playbacks
                     .control(&handle, &session, &connection.remote_id().to_string())
                     .await
                     .map_err(playback_refusal)?;
-                let playback = self.use_playback(connection, &handle, &session).await?;
-                if playback.revision != revision {
-                    return Err(Error::RevisionConflict {
-                        revision: playback.revision,
-                    });
-                }
-                let reply = self
-                    .serve(connection, state, session, who, read, None)
+                let now = self
+                    .use_playback_with(connection, &handle, &session, Using::Plays, |p| p.revision)
                     .await?;
+                if now != revision {
+                    return Err(Error::RevisionConflict { revision: now });
+                }
                 let (format, bytes, total, version) = match reply {
                     Reply::SubtitleChunk {
                         format,
@@ -1364,10 +1380,24 @@ impl ClientProtocol {
         session: &SessionId,
         how: Using,
     ) -> Result<Playback, Error> {
+        self.use_playback_with(connection, handle, session, how, Playback::clone)
+            .await
+    }
+
+    /// [`Self::use_playback_as`], taking only what `read` reads of the
+    /// playback (review 2026-10-11 M10).
+    async fn use_playback_with<T>(
+        &self,
+        connection: &Connection,
+        handle: &PlaybackHandle,
+        session: &SessionId,
+        how: Using,
+        read: impl FnOnce(&Playback) -> T,
+    ) -> Result<T, Error> {
         let endpoint = connection.remote_id().to_string();
         let playbacks = &self.services.playbacks;
         let using = playbacks
-            .use_handle(handle, session, &endpoint, how)
+            .use_handle_with(handle, session, &endpoint, how, read)
             .map_err(playback_refusal)?;
         if using.recheck {
             let live = self
@@ -1384,7 +1414,7 @@ impl ClientProtocol {
             // must not hold up a file this server reads on its own.
             let catalog = self.services.catalog.clone();
             let playbacks = playbacks.clone();
-            let item = using.playback.item.clone();
+            let item = using.item;
             tokio::spawn(async move {
                 if let Err(e) = catalog.item(&item).await
                     && unserved(&e)
@@ -1574,7 +1604,13 @@ impl ClientProtocol {
         revision: u64,
     ) -> Result<(tokio::fs::File, MediaReadReply), Error> {
         let playback = self
-            .use_playback(connection, &read.handle, &read.session)
+            .use_playback_with(
+                connection,
+                &read.handle,
+                &read.session,
+                Using::Plays,
+                RangeOf::of,
+            )
             .await?;
         if playback.revision != revision {
             return Err(Error::RevisionConflict {
@@ -4994,6 +5030,27 @@ fn subtitle_version(metadata: &std::fs::Metadata) -> u64 {
 /// A conversion that could not start or restart, as the client is told:
 /// a failure to run ffmpeg names where it is, so only the log has it
 /// (PX-09 finding 23).
+/// What a range read uses of its playback (review 2026-10-11 M10).
+struct RangeOf {
+    revision: u64,
+    conversion: Option<Arc<Conversion>>,
+    size: u64,
+    path: PathBuf,
+    file: Option<FileId>,
+}
+
+impl RangeOf {
+    fn of(playback: &Playback) -> Self {
+        Self {
+            revision: playback.revision,
+            conversion: playback.conversion.clone(),
+            size: playback.size,
+            path: playback.path.clone(),
+            file: playback.file,
+        }
+    }
+}
+
 fn conversion_error(e: JobError) -> Error {
     match e {
         JobError::Busy => Error::Busy,

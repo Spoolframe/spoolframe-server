@@ -520,8 +520,12 @@ pub enum Using {
 
 /// What a use of a handle needs to do.
 #[derive(Debug, Clone)]
-pub struct Use {
-    pub playback: Playback,
+pub struct Use<T = Playback> {
+    /// What the caller read of the playback ([`Playbacks::use_handle_with`]):
+    /// all of it, by default.
+    pub playback: T,
+    /// What it plays, for a recheck.
+    pub item: MediaId,
     /// The session must be checked again before serving.
     pub recheck: bool,
 }
@@ -974,9 +978,21 @@ impl Playbacks {
     }
 
     /// Play `handle` as `changed` from now (a subtitle change, P2-07). The
-    /// conversion it replaces is returned, to be dropped outside the lock:
-    /// dropping it stops its encode and removes its files.
+    /// conversion it replaces is ended here and returned, to be dropped
+    /// outside the lock: dropping its last clone removes its files.
     pub fn change(&self, handle: &PlaybackHandle, changed: Changed) -> Option<Arc<Conversion>> {
+        let replaced = self.swap(handle, changed);
+        // Its ffmpeg stops and its slot is let go of now, as
+        // `ended_all` does: a read still waiting holds the conversion, and
+        // would keep both until it gave up, beside the new one already
+        // running. Outside the lock, which `end` does not need.
+        if let Some(conversion) = &replaced {
+            conversion.end();
+        }
+        replaced
+    }
+
+    fn swap(&self, handle: &PlaybackHandle, changed: Changed) -> Option<Arc<Conversion>> {
         let mut handles = self.lock();
         let playback = handles.get_mut(&handle.0)?;
         playback.revision += 1;
@@ -1000,6 +1016,21 @@ impl Playbacks {
         endpoint: &str,
         using: Using,
     ) -> Result<Use, Refusal> {
+        self.use_handle_with(handle, session, endpoint, using, Playback::clone)
+    }
+
+    /// [`Playbacks::use_handle`], reading only what `read` takes of the
+    /// playback, under the lock: a range read needs its revision and its
+    /// file, not a copy of everything a playback holds, several times a
+    /// second per client (review 2026-10-11 M10).
+    pub fn use_handle_with<T>(
+        &self,
+        handle: &PlaybackHandle,
+        session: &SessionId,
+        endpoint: &str,
+        using: Using,
+        read: impl FnOnce(&Playback) -> T,
+    ) -> Result<Use<T>, Refusal> {
         let now = self.clock.now();
         let mut handles = self.lock();
         let Some(playback) = handles.get_mut(&handle.0) else {
@@ -1024,7 +1055,8 @@ impl Playbacks {
             playback.last_checked = now;
         }
         Ok(Use {
-            playback: playback.clone(),
+            playback: read(playback),
+            item: playback.item.clone(),
             recheck,
         })
     }
@@ -1049,17 +1081,23 @@ impl Playbacks {
     /// it names one (P3-15): where that is in the film, and how far its
     /// conversion had got, go on its chart.
     pub fn read(&self, handle: &PlaybackHandle, offset: u64, sent: u64, segment: Option<u32>) {
-        let Some(playback) = self.lock().get(&handle.0).cloned() else {
+        // What the chart needs, not the whole playback (M10).
+        let Some((trace, conversion, duration_ms, size)) = self.lock().get(&handle.0).map(|p| {
+            (
+                p.trace.clone(),
+                p.conversion.clone(),
+                p.shown.duration_ms,
+                p.size,
+            )
+        }) else {
             return;
         };
-        let (epoch, read_ms, converted_ms, mark) = match &playback.conversion {
+        let (epoch, read_ms, converted_ms, mark) = match &conversion {
             None => {
                 let to = offset + sent;
-                let read_ms = playback
-                    .shown
-                    .duration_ms
-                    .filter(|_| playback.size > 0)
-                    .map(|d| (u128::from(d) * u128::from(to) / u128::from(playback.size)) as u64);
+                let read_ms = duration_ms
+                    .filter(|_| size > 0)
+                    .map(|d| (u128::from(d) * u128::from(to) / u128::from(size)) as u64);
                 (0, read_ms, None, Furthest::Byte(to))
             }
             Some(conversion) => {
@@ -1086,7 +1124,7 @@ impl Playbacks {
             read_ms,
             converted_ms,
         };
-        playback.trace.lock().read(point, epoch, mark);
+        trace.lock().read(point, epoch, mark);
     }
 
     /// Keep `quality` and `display` for `handle`'s next re-plan, its plan
@@ -1631,6 +1669,72 @@ mod tests {
             connection: 0,
             display: None,
         }
+    }
+
+    /// A change ends the conversion it replaces, though a read still
+    /// waiting holds it: its ffmpeg and its slot go with the change, not
+    /// when that read gives up. Review 2026-10-11 M7.
+    #[tokio::test]
+    async fn a_change_ends_the_conversion_it_replaces() {
+        use spoolframe_types::VideoCodec;
+        let (old, _a) = crate::encode::tests::resumed_ladder_of(
+            "spoolframe-change-ends-old",
+            VideoCodec::H264,
+            "h264_vaapi",
+        )
+        .await;
+        let (new, _b) = crate::encode::tests::resumed_ladder_of(
+            "spoolframe-change-ends-new",
+            VideoCodec::H264,
+            "h264_vaapi",
+        )
+        .await;
+        let p = Playbacks::default();
+        let h = p.start(
+            Playbacks::new_handle(),
+            Opened {
+                conversion: Some(old.clone()),
+                ..opened_on("e")
+            },
+        );
+        let waiting = old.clone();
+        let replaced = p.change(
+            &h,
+            Changed {
+                planned: PlaybackPlan::Unknown,
+                selection: Selection::default(),
+                size: 0,
+                file: None,
+                subtitle: None,
+                conversion: Some(new.clone()),
+                quality: Quality::default(),
+                display: None,
+            },
+        );
+        drop(replaced);
+        assert!(waiting.ended());
+        assert!(!new.ended());
+    }
+
+    /// A use can read only what it needs of the playback, under the lock,
+    /// and still counts as a use: a range read takes its revision, not a
+    /// copy of the whole playback. Review 2026-10-11 M10.
+    #[test]
+    fn a_use_reads_only_what_it_asks_for() {
+        let p = Playbacks::default();
+        let h = start(&p);
+        let used = p
+            .use_handle_with(&h, &SessionId("s".into()), "e", Using::Plays, |p| {
+                (p.revision, p.size)
+            })
+            .unwrap();
+        assert_eq!(used.playback, (0, 10));
+        assert_eq!(used.item.to_string(), "plex:movie:1");
+        assert!(
+            p.use_handle_with(&h, &SessionId("other".into()), "e", Using::Plays, |p| p
+                .revision)
+                .is_err()
+        );
     }
 
     #[test]

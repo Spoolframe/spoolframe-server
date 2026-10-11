@@ -648,8 +648,11 @@ impl TestServer {
             }
             None => fake.clone(),
         };
-        let artwork =
+        let mut artwork =
             ArtworkCache::open(&dir.join("cache/artwork"), 64 << 20, catalog.clone()).unwrap();
+        if let Some(live) = &options.catalog {
+            artwork = artwork.with_changes(live.changes());
+        }
         let ffprobe = if let Some(ffprobe) = &options.real_ffprobe {
             ffprobe.clone()
         } else if options.real_media {

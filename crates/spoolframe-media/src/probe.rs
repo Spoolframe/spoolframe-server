@@ -66,12 +66,101 @@ struct Stamp {
 pub struct Prober {
     ffprobe: Tool,
     timeout: Duration,
-    cache: Mutex<HashMap<PathBuf, (Stamp, Arc<MediaDescriptor>)>>,
-    keyframes: Mutex<HashMap<PathBuf, (Stamp, Keyframes, KeyframesFrom)>>,
+    /// At most [`MAX_DESCRIPTORS`], the least used let go first.
+    cache: Mutex<Lru<(Stamp, Arc<MediaDescriptor>)>>,
+    /// At most [`MAX_KEYFRAME_LISTS`]: a film's list is 1 to 1.5 MB.
+    keyframes: Mutex<Lru<(Stamp, Keyframes, KeyframesFrom)>>,
+    /// The files whose keyframes are being read now, each with a turn a
+    /// later caller waits on: one read of a file at a time, not one per
+    /// caller (review 2026-10-11 M33). A scan reads the whole file.
+    reading: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// A file's keyframe times, ms.
 type Keyframes = Arc<Vec<u64>>;
+
+/// The most descriptors kept: a film's is a few KB.
+const MAX_DESCRIPTORS: usize = 4096;
+/// The most keyframe lists kept: a film's is 1 to 1.5 MB, so about 100 MB.
+const MAX_KEYFRAME_LISTS: usize = 64;
+
+/// What a [`Prober`] remembers per file, at most `most` files, the one
+/// used longest ago let go first (review 2026-10-11 M34). Entries for a
+/// file that is gone are dropped when it is next asked for.
+#[derive(Debug)]
+struct Lru<V> {
+    entries: HashMap<PathBuf, (u64, V)>,
+    used: u64,
+    most: usize,
+}
+
+impl<V> Lru<V> {
+    fn new(most: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            used: 0,
+            most,
+        }
+    }
+
+    fn get(&mut self, path: &Path) -> Option<&V> {
+        self.used += 1;
+        let used = self.used;
+        self.entries.get_mut(path).map(|(at, v)| {
+            *at = used;
+            &*v
+        })
+    }
+
+    fn insert(&mut self, path: PathBuf, value: V) {
+        self.used += 1;
+        if self.entries.len() >= self.most
+            && !self.entries.contains_key(&path)
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(p, _)| p.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(path, (self.used, value));
+    }
+
+    fn remove(&mut self, path: &Path) {
+        self.entries.remove(path);
+    }
+}
+
+/// A caller's place in line to read a file's keyframes; the last one out,
+/// done or given up, takes the file off [`Prober::reading`].
+struct Turn<'a> {
+    prober: &'a Prober,
+    path: &'a Path,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> Turn<'a> {
+    fn take(prober: &'a Prober, path: &'a Path) -> Self {
+        let gate = prober
+            .reading
+            .lock()
+            .entry(path.to_owned())
+            .or_default()
+            .clone();
+        Self { prober, path, gate }
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut reading = self.prober.reading.lock();
+        // The map's and this one's: no one else is in line.
+        if Arc::strong_count(&self.gate) == 2 {
+            reading.remove(self.path);
+        }
+    }
+}
 
 /// Where a file's keyframes were read from (PX-25).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,15 +205,16 @@ impl Prober {
         Self {
             ffprobe,
             timeout,
-            cache: Mutex::new(HashMap::new()),
-            keyframes: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Lru::new(MAX_DESCRIPTORS)),
+            keyframes: Mutex::new(Lru::new(MAX_KEYFRAME_LISTS)),
+            reading: Mutex::new(HashMap::new()),
         }
     }
 
     /// The descriptor of the media file at `path`, with the subtitle files
     /// beside it.
     pub async fn describe(&self, path: &Path) -> Result<Arc<MediaDescriptor>, ProbeError> {
-        let stamp = stamp(path).await?;
+        let stamp = self.stamp_or_forget(path).await?;
         if let Some(hit) = self.cached(path, stamp) {
             return Ok(hit);
         }
@@ -152,8 +242,8 @@ impl Prober {
     }
 
     fn cached(&self, path: &Path, stamp: Stamp) -> Option<Arc<MediaDescriptor>> {
-        let cache = self.cache.lock();
-        cache
+        self.cache
+            .lock()
             .get(path)
             .filter(|(cached, _)| *cached == stamp)
             .map(|(_, d)| d.clone())
@@ -208,12 +298,45 @@ impl Prober {
         &self,
         path: &Path,
     ) -> Result<(Keyframes, KeyframesFrom), ProbeError> {
-        let stamp = stamp(path).await?;
-        if let Some((cached, times, from)) = self.keyframes.lock().get(path)
-            && *cached == stamp
-        {
-            return Ok((times.clone(), from.clone()));
+        let stamp = self.stamp_or_forget(path).await?;
+        if let Some(hit) = self.keyframes_cached(path, stamp) {
+            return Ok(hit);
         }
+        // Two starts of one film (or a client asking again during a slow
+        // scan) wait for one read; the second finds it cached.
+        let turn = Turn::take(self, path);
+        let _mine = turn.gate.lock().await;
+        if let Some(hit) = self.keyframes_cached(path, stamp) {
+            return Ok(hit);
+        }
+        self.read_keyframes(path, stamp).await
+    }
+
+    /// `path`'s stamp; one that cannot be had (the file is gone or
+    /// renamed) drops what is remembered of it.
+    async fn stamp_or_forget(&self, path: &Path) -> Result<Stamp, ProbeError> {
+        let stamped = stamp(path).await;
+        if stamped.is_err() {
+            self.cache.lock().remove(path);
+            self.keyframes.lock().remove(path);
+        }
+        stamped
+    }
+
+    fn keyframes_cached(&self, path: &Path, stamp: Stamp) -> Option<(Keyframes, KeyframesFrom)> {
+        self.keyframes
+            .lock()
+            .get(path)
+            .filter(|(cached, _, _)| *cached == stamp)
+            .map(|(_, times, from)| (times.clone(), from.clone()))
+    }
+
+    /// `path`'s keyframes read, and remembered under `stamp`.
+    async fn read_keyframes(
+        &self,
+        path: &Path,
+        stamp: Stamp,
+    ) -> Result<(Keyframes, KeyframesFrom), ProbeError> {
         let indexed = match read_index(path).await {
             Ok(indexed) => self
                 .check_index(path, &indexed.times_ms)
@@ -467,7 +590,23 @@ async fn stamp(path: &Path) -> Result<Stamp, ProbeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::keyframe_times;
+    use super::{Lru, keyframe_times};
+    use std::path::{Path, PathBuf};
+
+    /// Past its bound the entry used longest ago goes, not the newest.
+    /// Review 2026-10-11 M34.
+    #[test]
+    fn a_full_cache_lets_go_of_the_least_used() {
+        let mut lru = Lru::new(2);
+        lru.insert(PathBuf::from("/a"), 1);
+        lru.insert(PathBuf::from("/b"), 2);
+        assert_eq!(lru.get(Path::new("/a")), Some(&1));
+        lru.insert(PathBuf::from("/c"), 3);
+        assert_eq!(lru.get(Path::new("/b")), None);
+        assert_eq!(lru.get(Path::new("/a")), Some(&1));
+        assert_eq!(lru.get(Path::new("/c")), Some(&3));
+        assert_eq!(lru.entries.len(), 2);
+    }
 
     #[test]
     fn only_keyframes_count_in_order() {

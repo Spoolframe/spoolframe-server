@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+- Two library or Plex server edits at once no longer lose one: an edit
+  made from settings that changed meanwhile is refused with "changed
+  meanwhile; look again and repeat the change". Saving a setting no
+  longer holds up everything that reads the settings while the file is
+  written.
+
+- Posters and other artwork already in the cache are served without a
+  Plex request each: whether the server serves one is remembered for
+  five minutes, and forgotten at once when a library is added, removed
+  or changed.
+
+- A subtitle still being read as text no longer holds up its playback:
+  seeks, subtitle changes, stops and progress reports on it were
+  answered only after each subtitle read's wait, up to 10 s each poll.
+
+- A converted film whose file ends before its playlist does (a duration
+  overstated, a file cut short) ends playback there with "the film ends
+  before this segment", instead of the app asking for the missing
+  segment again and again.
+
+- A Plex setting the server cannot use (a token file it cannot read,
+  say) is refused with the reason when it is changed, as it is at start,
+  instead of being saved while the catalog keeps the old one. A config
+  reload that names one is refused the same way.
+
+- A device reaching the server over Tailscale or WireGuard no longer
+  counts as on the LAN for being at a private address: it shares the
+  uplink budget like any device outside the home. List the tunnel's
+  network in `network.lan_prefixes` to count it as home.
+
+- Music and other files with no picture are held to the bitrate cap
+  (the app's own, a chosen quality, the link's share and the uplink
+  share off the LAN): one over it has its audio converted to fit
+  instead of being sent at its full rate.
+
+- A subtitle track whose text could not be made is remembered as failed
+  until a restart: asking again answers at once with the reason instead
+  of running the extract, decode and OCR again on the one OCR turn.
+
+- A subtitle or quality change stops the conversion it replaces at
+  once, instead of when a read still waiting on it gives up: the old
+  ffmpeg no longer holds an encode slot beside the new one.
+
+- A converted film with picture subtitles burned in plays when nothing
+  else changes its picture (a 1080p Blu-ray to HEVC or AV1): its filter
+  graph ended in `overlaynull`, which is no filter, and ffmpeg refused
+  it, in software too.
+
 - P7-08: a fresh install with only a security key recovers its identity
   from a server that knows it, without knowing the identity's id. The key
   gives back the genesis handle its credential carries; the new pre-auth

@@ -16,7 +16,7 @@ use crate::config::settings::{Apply, SETTINGS};
 use crate::config::tree::{self, Table};
 use crate::config::{ConfigError, ServerConfig};
 
-use super::RuntimeSettings;
+use super::{Plex, RuntimeSettings, plex_catalog};
 
 /// What a reload changed: the settings by key, in `config show`'s order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -126,7 +126,10 @@ impl RuntimeSettings {
     /// Read and check the layers, and, if they load, make them the
     /// server's and apply them; all under the settings lock.
     fn reload_layers(&self, by: &str) -> Result<(Reloaded, Layers, ServerConfig), ConfigError> {
-        let mut layers = self.layers.lock();
+        // The files read with the settings lock let go (M26); one reload
+        // or change at a time.
+        let _writing = self.writing.lock();
+        let layers = self.layers();
         let fresh = layers.reread()?;
         let config = fresh.config()?;
         let (before, after) = (layers.merged(), fresh.merged());
@@ -134,11 +137,18 @@ impl RuntimeSettings {
         let plex_changed = ["plex", "libraries"]
             .iter()
             .any(|key| tree::get(&before, key) != tree::get(&after, key));
-        *layers = fresh;
+        // A catalog the files cannot make refuses the reload, as it does
+        // the start: the server goes on as it was (review 2026-10-11 M24).
+        let plex = if plex_changed {
+            Plex::Made(plex_catalog(&config, &fresh, &self.secrets)?)
+        } else {
+            Plex::Same
+        };
+        *self.layers.lock() = fresh.clone();
         if !reloaded.applied.is_empty() {
-            self.apply(&layers, plex_changed, "config", by);
+            self.apply(&fresh, plex, "config", by);
         }
-        Ok((reloaded, layers.clone(), config))
+        Ok((reloaded, fresh, config))
     }
 }
 

@@ -178,3 +178,36 @@ async fn cues_on_only_some_keyframes_are_not_used() {
     );
     assert_eq!(times, all);
 }
+
+/// Two callers asking for one file's keyframes at once share one read of
+/// it: a scan reads the whole file, minutes on a network mount, and a
+/// second start of the same film ran another. Review 2026-10-11 M33.
+#[tokio::test]
+async fn two_callers_at_once_share_one_scan() {
+    let tmp = scratch("one-scan").await;
+    let dir = tmp.as_ref();
+    let scans = dir.join("scans");
+    let ffprobe = dir.join("ffprobe");
+    std::fs::write(
+        &ffprobe,
+        format!(
+            "#!/bin/sh\necho scan >> '{}'\nsleep 0.5\necho 0.000000,K__\necho 2.000000,K__\n",
+            scans.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &ffprobe,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    // No index the reader follows: every packet is read.
+    let film = dir.join("film.ts");
+    std::fs::write(&film, b"not a container with an index").unwrap();
+    let prober = Prober::new(Tool::unconfined(&ffprobe), Duration::from_secs(30));
+    let (a, b) = tokio::join!(prober.keyframes(&film), prober.keyframes(&film));
+    assert_eq!(*a.unwrap(), [0, 2000]);
+    assert_eq!(*b.unwrap(), [0, 2000]);
+    let ran = std::fs::read_to_string(&scans).unwrap();
+    assert_eq!(ran.lines().count(), 1, "{ran}");
+}

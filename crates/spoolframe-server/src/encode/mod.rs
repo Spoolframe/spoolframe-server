@@ -96,6 +96,9 @@ pub struct Conversion {
     /// The rung it started on, listed first for the player.
     first_rung: u32,
     current: Mutex<Current>,
+    /// The epoch the next run takes: each run its own, and its own
+    /// directory, though two are started at once with the lock let go.
+    epochs: std::sync::atomic::AtomicU32,
     /// Ended by an admin (P3-15): no encode starts again for it.
     ended: std::sync::atomic::AtomicBool,
     /// Every switch it logged, for tests to read: log capture races
@@ -181,6 +184,10 @@ enum Served {
 
 /// Why a read past what an ended conversion wrote fails (P3-15).
 pub const ENDED: &str = "the conversion was ended on the server";
+
+/// What a client is told of a segment past where the file ended: the
+/// conversion finished the file before the playlist did.
+pub const ENDED_SHORT: &str = "the film ends before this segment";
 
 /// How far past what is written a segment may be asked for before the
 /// encode restarts there rather than the reader waiting.
@@ -367,6 +374,7 @@ impl Conversion {
             segments,
             ladder: ladder.clone(),
             first_rung: start_rung,
+            epochs: std::sync::atomic::AtomicU32::new(job.epoch + 1),
             current: Mutex::new(Current {
                 job,
                 rung: start_rung,
@@ -535,7 +543,7 @@ impl Conversion {
                 "no rung {rung} in this playback"
             )));
         }
-        let mut current = self.current.lock();
+        let current = self.current.lock();
         if rung != current.rung {
             if let Some((left, job)) = &current.left
                 && *left == rung
@@ -547,7 +555,15 @@ impl Conversion {
             if self.ended() {
                 return Err(JobError::Prepare(ENDED.into()));
             }
-            return self.switch(&mut current, rung, n, Asked::Segment(n), segments);
+            return self.switch(
+                current,
+                rung,
+                n,
+                Asked::Segment(n),
+                segments,
+                |job| job,
+                || self.job_for_segment(n, rung),
+            );
         }
         let job = &current.job;
         let written = job.written();
@@ -568,6 +584,20 @@ impl Conversion {
         let failed_on_gpu = job.decodes_in_hardware()
             && matches!(job.progress().borrow().done, Some(Err(_)))
             && written.is_none_or(|w| n > w);
+        // ffmpeg finished the file short of the playlist (a duration
+        // overstated, a file cut short): nothing past what it wrote is
+        // coming. Refused, where the finished run was returned for a
+        // segment just past it and an empty answer had the client ask
+        // again at its round trip for ever (review 2026-10-11 M1). One
+        // further on is a new run's, from there; if that one ends short too,
+        // it is refused then.
+        if matches!(job.progress().borrow().done, Some(Ok(_)))
+            && n >= job.first_segment
+            && n <= head + SEGMENTS_AHEAD
+            && written.is_none_or(|w| n > w)
+        {
+            return Err(JobError::Prepare(ENDED_SHORT.into()));
+        }
         if n >= job.first_kept()
             && n <= head + SEGMENTS_AHEAD
             && !failed_on_gpu
@@ -576,22 +606,19 @@ impl Conversion {
             return Ok(job.clone());
         }
         let (start, from) = run_at(segments, n, rung_video(self.video, &self.ladder, rung));
-        let epoch = job.epoch + 1;
-        let next = spawn(
-            &self.jobs,
-            &self.dir,
-            &self.file,
-            &self.input,
-            self.sidecar.as_deref(),
-            &self.descriptor,
-            self.parts(rung),
-            &self.run_on,
-            epoch,
-            start,
-            from,
-            job.slot(),
-            self.cuts(rung),
-        )?;
+        let run = self.next_run(&current, rung, start, from);
+        let replaces = current.job.epoch;
+        drop(current);
+        let next = self.start_run(run)?;
+        let mut current = self.current.lock();
+        if current.job.epoch != replaces || current.rung != rung || self.ended() {
+            // Another read moved the encode meanwhile: this run goes
+            // (stopped, its files removed), and the segment is asked of the
+            // encode as it is now.
+            drop(current);
+            drop(next);
+            return self.job_for_segment(n, rung);
+        }
         current.job.stop();
         current.job = next;
         self.log_switch(
@@ -601,6 +628,48 @@ impl Conversion {
             Served::NewRun(current.job.clone()),
         );
         Ok(current.job.clone())
+    }
+
+    /// The run that starts `rung` at `start` (segment `from`) in place of
+    /// `current`'s: worked out under the lock, started with it let go
+    /// ([`Conversion::start_run`]), so the arguments, the links and the
+    /// fork and exec of ffmpeg through its jail hold up no other reader of
+    /// this playback (review 2026-10-11 M4).
+    fn next_run(
+        &self,
+        current: &Current,
+        rung: u32,
+        start: Option<Duration>,
+        from: u32,
+    ) -> NextRun {
+        NextRun {
+            parts: self.parts(rung),
+            epoch: self
+                .epochs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            start,
+            from,
+            slot: current.job.slot(),
+            cuts: self.cuts(rung),
+        }
+    }
+
+    fn start_run(&self, run: NextRun) -> Result<Arc<EncodeJob>, JobError> {
+        spawn(
+            &self.jobs,
+            &self.dir,
+            &self.file,
+            &self.input,
+            self.sidecar.as_deref(),
+            &self.descriptor,
+            run.parts,
+            &self.run_on,
+            run.epoch,
+            run.start,
+            run.from,
+            run.slot,
+            run.cuts,
+        )
     }
 
     /// Where `rung`'s init segment is read from (PX-21): one a run of that
@@ -628,7 +697,7 @@ impl Conversion {
             )));
         }
         let kept = self.kept_init(rung);
-        let mut current = self.current.lock();
+        let current = self.current.lock();
         if kept.exists() {
             if rung != current.rung {
                 self.log_switch(current.rung, rung, Asked::Init, Served::Kept);
@@ -658,8 +727,15 @@ impl Conversion {
         }
         .min(segments.count())
         .max(1);
-        self.switch(&mut current, rung, next, Asked::Init, segments)
-            .map(Init::Job)
+        self.switch(
+            current,
+            rung,
+            next,
+            Asked::Init,
+            segments,
+            Init::Job,
+            || self.init_for(rung),
+        )
     }
 
     /// Where a run of `rung` that wrote its init has it kept: in the
@@ -688,31 +764,31 @@ impl Conversion {
     /// Move the encode to `rung` at segment `n`: started first in the
     /// running job's slot, then the running job stopped and kept as the
     /// one left (the one left before it goes, its files with it).
-    fn switch(
+    ///
+    /// The run starts with the lock let go (M4); if the encode moved
+    /// meanwhile, it goes, and `again` asks of the encode as it is now.
+    #[allow(clippy::too_many_arguments)]
+    fn switch<T>(
         &self,
-        current: &mut Current,
+        current: parking_lot::MutexGuard<'_, Current>,
         rung: u32,
         n: u32,
         asked: Asked,
         segments: &Segments,
-    ) -> Result<Arc<EncodeJob>, JobError> {
+        done: impl FnOnce(Arc<EncodeJob>) -> T,
+        again: impl FnOnce() -> Result<T, JobError>,
+    ) -> Result<T, JobError> {
         let (start, from) = run_at(segments, n, rung_video(self.video, &self.ladder, rung));
-        let epoch = current.job.epoch + 1;
-        let next = spawn(
-            &self.jobs,
-            &self.dir,
-            &self.file,
-            &self.input,
-            self.sidecar.as_deref(),
-            &self.descriptor,
-            self.parts(rung),
-            &self.run_on,
-            epoch,
-            start,
-            from,
-            current.job.slot(),
-            self.cuts(rung),
-        )?;
+        let run = self.next_run(&current, rung, start, from);
+        let (replaces, was) = (current.job.epoch, current.rung);
+        drop(current);
+        let next = self.start_run(run)?;
+        let mut current = self.current.lock();
+        if current.job.epoch != replaces || current.rung != was || self.ended() {
+            drop(current);
+            drop(next);
+            return again();
+        }
         let left = std::mem::replace(&mut current.job, next);
         left.stop();
         self.keep_init(current.rung, &left);
@@ -724,7 +800,7 @@ impl Conversion {
         );
         current.left = Some((current.rung, left));
         current.rung = rung;
-        Ok(current.job.clone())
+        Ok(done(current.job.clone()))
     }
 
     /// One line for a player moving to rung `to` from `from` (PX-21), or
@@ -846,26 +922,20 @@ impl Conversion {
     /// restarts at a segment, [`Conversion::job_for_segment`]). Returns the
     /// new epoch.
     pub fn restart(&self, start: Duration, start_number: u32) -> Result<u32, JobError> {
+        let current = self.current.lock();
+        if self.ended() {
+            return Err(JobError::Prepare(ENDED.into()));
+        }
+        let run = self.next_run(&current, current.rung, Some(start), start_number);
+        let epoch = run.epoch;
+        drop(current);
+        // Started with the lock let go (M4). A seek is the client's last
+        // word: it replaces whatever runs by then, on its rung.
+        let job = self.start_run(run)?;
         let mut current = self.current.lock();
         if self.ended() {
             return Err(JobError::Prepare(ENDED.into()));
         }
-        let epoch = current.job.epoch + 1;
-        let job = spawn(
-            &self.jobs,
-            &self.dir,
-            &self.file,
-            &self.input,
-            self.sidecar.as_deref(),
-            &self.descriptor,
-            self.parts(current.rung),
-            &self.run_on,
-            epoch,
-            Some(start),
-            start_number,
-            current.job.slot(),
-            self.cuts(current.rung),
-        )?;
         current.job.stop();
         current.job = job;
         // What the rung left wrote is from before the seek: let it go.
@@ -948,10 +1018,21 @@ impl Drop for Conversion {
             left.stop();
         }
         drop(current);
-        if let Err(e) = std::fs::remove_dir_all(&self.dir)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(dir = %self.dir.display(), error = %e, "cannot remove a conversion's files");
+        // Its runs' directories too, many files: on the blocking pool, not
+        // the async worker that let go of it (review 2026-10-11 M3).
+        let dir = std::mem::take(&mut self.dir);
+        let remove = move || {
+            if let Err(e) = std::fs::remove_dir_all(&dir)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(dir = %dir.display(), error = %e, "cannot remove a conversion's files");
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(remove);
+            }
+            Err(_) => remove(),
         }
     }
 }
@@ -1000,6 +1081,17 @@ fn segment_seek(segments: &Segments, n: u32, video: Option<ConvertedVideo>) -> O
         _ => start,
     };
     (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// A run worked out under a conversion's lock, to be started with it let
+/// go ([`Conversion::next_run`]).
+struct NextRun {
+    parts: Parts,
+    epoch: u32,
+    start: Option<Duration>,
+    from: u32,
+    slot: Option<Slot>,
+    cuts: Option<Vec<u64>>,
 }
 
 type Parts = (
@@ -1192,7 +1284,7 @@ fn encodes(video: Option<ConvertedVideo>, audio: Option<ConvertedAudio>) -> bool
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use spoolframe_types::VideoCodec;
 
@@ -1278,16 +1370,26 @@ mod tests {
     }
 
     /// [`resumed_ladder`] encoded in `codec` by VA-API's `encoder`.
-    async fn resumed_ladder_of(
+    pub(crate) async fn resumed_ladder_of(
         test: &str,
         codec: spoolframe_types::VideoCodec,
         encoder: &str,
+    ) -> (Arc<Conversion>, spoolframe_test_dir::TestDir) {
+        resumed_ladder_run_by(test, codec, encoder, LADDER_FFMPEG).await
+    }
+
+    /// [`resumed_ladder_of`], its runs made by `script` in ffmpeg's place.
+    async fn resumed_ladder_run_by(
+        test: &str,
+        codec: spoolframe_types::VideoCodec,
+        encoder: &str,
+        script: &str,
     ) -> (Arc<Conversion>, spoolframe_test_dir::TestDir) {
         use spoolframe_media::VideoStream;
         use spoolframe_media::encoders::{Hardware, VideoEncoder};
 
         let tmp = spoolframe_test_dir::TestDir::new(test).await;
-        let ffmpeg = job::tests::ffmpeg(&tmp.as_ref().join("bin"), LADDER_FFMPEG);
+        let ffmpeg = job::tests::ffmpeg(&tmp.as_ref().join("bin"), script);
         let jobs = Arc::new(
             Jobs::new(
                 JobLimits {
@@ -1381,6 +1483,69 @@ mod tests {
         )
         .unwrap();
         (conversion, tmp)
+    }
+
+    /// Two reads that each need a new run at one far segment, at once:
+    /// both are answered by one run, the other started with the lock let
+    /// go is let go too, and each run had a directory of its own. Review
+    /// 2026-10-11 M4.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_reads_restarting_at_once_end_on_one_run() {
+        let (conversion, _tmp) = resumed_ladder("spoolframe-conversion-two-restarts").await;
+        let far = conversion.job().first_segment + 500;
+        let read = || {
+            let conversion = conversion.clone();
+            tokio::task::spawn_blocking(move || conversion.job_for_segment(far, 3))
+        };
+        let (a, b) = tokio::join!(read(), read());
+        let (a, b) = (a.unwrap().unwrap(), b.unwrap().unwrap());
+        assert_eq!(a.epoch, b.epoch);
+        assert_eq!(conversion.job().epoch, a.epoch);
+        assert!(a.first_segment <= far);
+        // Every run started had its own epoch: none was written over.
+        let started = conversion.epochs.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(started > a.epoch, "{started} after {}", a.epoch);
+    }
+
+    /// A run that finishes the file short of the playlist (its duration
+    /// overstated, the file cut short): a segment past what it wrote is
+    /// refused, not answered empty for the client to ask again at its
+    /// round trip for ever. Review 2026-10-11 M1.
+    #[tokio::test]
+    async fn a_segment_past_a_run_that_ended_short_is_refused() {
+        const SHORT: &str = "for a; do last=$a; done; d=$(dirname \"$last\")\n\
+             n=$(printf '%s\\n' \"$@\" | grep -A1 -x -- -start_number | tail -n 1)\n\
+             printf x > \"$d/init.mp4\"\n\
+             printf x > \"$d/seg$n.m4s\"\n\
+             printf '#EXTM3U\\nseg%s.m4s\\n' \"$n\" > \"$last\"\n\
+             echo out_time_us=6000000\n\
+             echo progress=end";
+        let (conversion, _tmp) = resumed_ladder_run_by(
+            "spoolframe-conversion-ended-short",
+            spoolframe_types::VideoCodec::H264,
+            "h264_vaapi",
+            SHORT,
+        )
+        .await;
+        let job = conversion.job();
+        let mut progress = job.progress();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            progress.wait_for(|p| p.done.is_some()),
+        )
+        .await
+        .expect("the run ends")
+        .unwrap();
+        let first = job.first_segment;
+        assert_eq!(job.written(), Some(first));
+        // What it wrote is served; the next segment, inside what a run
+        // would be kept for, is refused.
+        assert!(conversion.job_for_segment(first, 3).is_ok());
+        let past = conversion.job_for_segment(first + 1, 3).unwrap_err();
+        assert!(
+            matches!(past, JobError::Prepare(ref why) if why == ENDED_SHORT),
+            "{past:?}"
+        );
     }
 
     /// An AV1 ladder on VA-API lists each rung at the size its encode
