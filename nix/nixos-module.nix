@@ -166,6 +166,7 @@
       ${lib.optionalString (cfg.transcode.vaapiDevice != null) "vaapi_device = ${quote cfg.transcode.vaapiDevice};"}
       scratch_dir = "/var/cache/spoolframe/transcode";
       ${lib.optionalString (cfg.transcode.toneMap != null) "tone_map = ${quote cfg.transcode.toneMap};"}
+      ${lib.optionalString (cfg.transcode.videoCodecs != null) "video_codecs = [${lib.concatMapStringsSep ", " quote cfg.transcode.videoCodecs}];"}
     }
     ${lib.optionalString cfg.experimental.libplaceboSharedOnAmd ''
       experimental {
@@ -684,6 +685,23 @@ in {
           {option}`hardware.graphics.enable` (RADV for AMD; NVIDIA's own).
           Null leaves it to Settings › Playback in the web UI (`auto`
           until set there).
+        '';
+      };
+
+      videoCodecs = lib.mkOption {
+        type = lib.types.nullOr (lib.types.listOf (lib.types.enum ["h264" "hevc" "av1"]));
+        default = null;
+        example = ["hevc" "h264"];
+        description = ''
+          The codecs a GPU encodes to, the first preferred (PGPU-06): a
+          conversion takes the first the client plays (decodes in
+          hardware, where it says) and a GPU here encodes with room, and an
+          HDR film for a screen that shows HDR keeps it in HEVC or AV1 at
+          10 bits rather than being tone mapped. With none left, the
+          conversion is encoded in software, which is H.264 only. Each at
+          most once; `[]` keeps video off the GPUs. Null leaves it to
+          Settings › Playback in the web UI (`["av1" "hevc" "h264"]` until
+          set there).
         '';
       };
     };

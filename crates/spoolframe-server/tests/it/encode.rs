@@ -1453,6 +1453,7 @@ async fn hls_of_a_copied_hevc_video_is_hvc1_as_the_playlist_says() {
                     video:
                         Some(ConvertedVideo::Copy {
                             codec: VideoCodec::Hevc,
+                            ..
                         }),
                     ..
                 },
@@ -1878,6 +1879,7 @@ async fn hls_of_a_copied_hevc_video_with_its_parameter_sets_in_the_stream_names_
                     video:
                         Some(ConvertedVideo::Copy {
                             codec: VideoCodec::Hevc,
+                            ..
                         }),
                     ..
                 },

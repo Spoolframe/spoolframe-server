@@ -23,7 +23,7 @@ use spoolframe_media::{
 use spoolframe_protocol::{
     AudioAction, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, SubtitleAction,
 };
-use spoolframe_types::{SubtitleFormat, VideoCodec};
+use spoolframe_types::{HdrFormat, SubtitleFormat, VideoCodec};
 
 /// HLS segment length (P2-05): Apple's recommendation.
 pub const SEGMENT_SECS: u32 = 6;
@@ -343,8 +343,8 @@ enum CpuFilter {
     /// The driver has no `overlay_vaapi` or `overlay_cuda`, or GPU
     /// filters are off.
     Pictures,
-    /// `overlay_cuda` lays pictures over 8-bit video only, and the
-    /// output keeps the source's 10 bits (HEVC, AV1).
+    /// `overlay_cuda` and `overlay_vaapi` lay pictures over 8-bit video
+    /// here, and the output keeps the source's 10 bits (HEVC, AV1).
     PicturesOverTenBits,
     /// Text is rendered by libass, on the CPU only. It is burned in only
     /// for a device that shows no text format at all, so it has no GPU
@@ -399,19 +399,59 @@ fn cpu_filters(spec: &EncodeSpec<'_>, family: Hardware) -> Vec<CpuFilter> {
     if !scales && stream.is_some_and(|s| height < s.height) {
         cpu.push(CpuFilter::Scale);
     }
-    // NVIDIA's pictures go over `yuv420p`: an 8-bit output only.
-    let ten_bits_out =
-        codec != VideoCodec::H264 && !tone_map && stream.is_some_and(|s| s.bit_depth > 8);
+    // The GPU's overlays lay pictures over 8-bit video: NVIDIA's over
+    // `yuv420p`, VA-API's as its chain has always fed it, `nv12`.
+    let ten_bits_out = ten_bits_out(spec, codec, tone_map, Some(family));
     match burned(spec).ok().flatten().map(|track| track.kind) {
         Some(SubtitleKind::Bitmap) if placebo => cpu.push(CpuFilter::PicturesAfterLibplacebo),
         Some(SubtitleKind::Bitmap) if !overlays => cpu.push(CpuFilter::Pictures),
-        Some(SubtitleKind::Bitmap) if family == Hardware::Nvenc && ten_bits_out => {
+        Some(SubtitleKind::Bitmap) if ten_bits_out => {
             cpu.push(CpuFilter::PicturesOverTenBits);
         }
         Some(SubtitleKind::Bitmap) | None => {}
         Some(SubtitleKind::Text) => cpu.push(CpuFilter::Text),
     }
     cpu
+}
+
+/// Whether an encode of `spec`'s video to `codec` on `hardware`'s
+/// encoder writes 10 bits (PGPU-06): HEVC or AV1, not tone mapped, of a
+/// source deeper than 8 bits, on an encoder that took a 10-bit test frame
+/// at detection. Anything else is written in 8 bits, as every encode was
+/// on VA-API before.
+pub(crate) fn ten_bits_out(
+    spec: &EncodeSpec<'_>,
+    codec: VideoCodec,
+    tone_map: bool,
+    hardware: Option<Hardware>,
+) -> bool {
+    codec != VideoCodec::H264
+        && !tone_map
+        && spec
+            .descriptor
+            .video
+            .as_ref()
+            .is_some_and(|s| s.bit_depth > 8)
+        && spec
+            .encoders
+            .video
+            .iter()
+            .find(|e| e.codec == codec && e.hardware == hardware)
+            .is_some_and(|e| spec.encoders.encodes_ten_bit(e))
+}
+
+/// The transfer an encode that keeps `stream`'s HDR writes (PGPU-06):
+/// PQ for HDR10, HLG for HLG, as [`VideoStream::keepable_hdr`] says; `None`
+/// for SDR, or HDR an encode cannot keep.
+fn kept_transfer(stream: &VideoStream) -> Option<&'static str> {
+    // Dolby Vision profile 5 is made HDR10 by libplacebo.
+    if stream.needs_rpu() {
+        return Some("smpte2084");
+    }
+    match stream.keepable_hdr()? {
+        HdrFormat::Hlg => Some("arib-std-b67"),
+        _ => Some("smpte2084"),
+    }
 }
 
 /// The subtitle track burned in, if one is.
@@ -462,6 +502,9 @@ pub fn cpu_instead_of_gpu(spec: &EncodeSpec<'_>) -> Vec<&'static str> {
                 "the GPU's driver does not overlay pictures (overlay_vaapi)"
             }
             CpuFilter::Pictures => "the NVIDIA GPU does not overlay pictures (overlay_cuda)",
+            CpuFilter::PicturesOverTenBits if vaapi => {
+                "pictures are burned into 10-bit video on the CPU (overlay_vaapi is fed 8 bits)"
+            }
             CpuFilter::PicturesOverTenBits => {
                 "pictures are burned into 10-bit video on the CPU (overlay_cuda is 8-bit)"
             }
@@ -476,10 +519,12 @@ pub fn cpu_instead_of_gpu(spec: &EncodeSpec<'_>) -> Vec<&'static str> {
 
 /// What tone maps `spec`'s video when it runs on `family` (PGPU-04), if
 /// it is tone mapped: as `transcode.tone_map` says, of what detection
-/// found on that GPU. `"auto"` takes the GPU's own (`tonemap_vaapi`),
-/// then libplacebo, and the CPU while `gpu_filters` is off; a forced
-/// method the GPU lacks is the CPU. A run after a GPU failure
-/// (`hardware_decode` off) tone maps on the CPU.
+/// found on that GPU. `"auto"` takes the GPU's own (`tonemap_vaapi`)
+/// while `gpu_filters` is on, then libplacebo whatever `gpu_filters` says
+/// (its tone map is the one a CPU spends minutes per film on, and it
+/// matches the CPU's closely: the user's decision, 2026-10-10), then the
+/// CPU; a forced method the GPU lacks is the CPU. A run after a GPU
+/// failure (`hardware_decode` off) tone maps on the CPU.
 fn tone_mapper_on(spec: &EncodeSpec<'_>, family: Hardware) -> ToneMapper {
     let encoders = spec.encoders;
     let own = (family == Hardware::Vaapi && encoders.gpu_tonemap).then_some(ToneMapper::Vaapi);
@@ -487,11 +532,19 @@ fn tone_mapper_on(spec: &EncodeSpec<'_>, family: Hardware) -> ToneMapper {
         .libplacebo(family)
         .map(ToneMapper::Libplacebo)
         .filter(|_| spec.hardware_decode);
+    // Dolby Vision profile 5 is right only with its RPU applied, which
+    // libplacebo does and the others do not (PGPU-06): libplacebo wherever
+    // it runs, whatever the setting.
+    if needs_rpu(spec)
+        && let Some(placebo) = placebo
+    {
+        return placebo;
+    }
     let chosen = match spec.tone_map {
         ToneMapSetting::Cpu => None,
         ToneMapSetting::Gpu => own,
         ToneMapSetting::Libplacebo => placebo,
-        ToneMapSetting::Auto if !spec.gpu_filters => None,
+        ToneMapSetting::Auto if !spec.gpu_filters => placebo,
         ToneMapSetting::Auto => own.or(placebo),
     };
     chosen.unwrap_or(ToneMapper::Cpu)
@@ -502,14 +555,27 @@ fn tone_mapper_on(spec: &EncodeSpec<'_>, family: Hardware) -> ToneMapper {
 /// a GPU whose chosen tone map is libplacebo. A software encode tone maps
 /// on the CPU.
 pub fn libplacebo(spec: &EncodeSpec<'_>) -> Option<(Hardware, VulkanDevice)> {
-    let Some(ConvertedVideo::Encode { tone_map: true, .. }) = spec.video else {
+    // A tone map, or Dolby Vision profile 5 made HDR10 (PGPU-06).
+    let Some(ConvertedVideo::Encode { tone_map, .. }) = spec.video else {
         return None;
     };
+    if !tone_map && !needs_rpu(spec) {
+        return None;
+    }
     let family = placement(spec)?.encoder.hardware?;
     match tone_mapper_on(spec, family) {
         ToneMapper::Libplacebo(device) => Some((family, device)),
         ToneMapper::Cpu | ToneMapper::Vaapi => None,
     }
+}
+
+/// Whether `spec`'s source is Dolby Vision profile 5 (PGPU-06), whose
+/// picture is right only with its RPU applied.
+fn needs_rpu(spec: &EncodeSpec<'_>) -> bool {
+    spec.descriptor
+        .video
+        .as_ref()
+        .is_some_and(VideoStream::needs_rpu)
 }
 
 /// What tone mapped `spec`'s video, if it is tone mapped: libplacebo, VA-API
@@ -768,6 +834,7 @@ fn cpu_graph(
     height: u32,
     tone_map: bool,
     vaapi: bool,
+    ten_bits: bool,
 ) -> Result<String, String> {
     let d = spec.descriptor;
     let mut chain = Vec::new();
@@ -799,10 +866,16 @@ fn cpu_graph(
     if height < stream.height {
         chain.push(format!("scale=-2:{height}"));
     }
-    if vaapi {
+    if vaapi && ten_bits {
+        // HDR kept (PGPU-06): 10 bits to the encoder.
+        chain.push(s("format=p010,hwupload"));
+    } else if vaapi {
         chain.push(s("format=nv12,hwupload"));
     } else if codec == VideoCodec::H264 && !tone_map {
         // H.264 decoders expect 8-bit 4:2:0.
+        chain.push(s("format=yuv420p"));
+    } else if !ten_bits && !tone_map && stream.bit_depth > 8 {
+        // An encoder that took no 10-bit test frame gets 8 bits.
         chain.push(s("format=yuv420p"));
     }
     Ok(if chain.is_empty() {
@@ -826,6 +899,7 @@ fn gpu_graph(
     stream: &VideoStream,
     height: u32,
     tone_map: bool,
+    ten_bits: bool,
 ) -> Result<String, String> {
     let mut chain = Vec::new();
     if tone_map {
@@ -835,7 +909,8 @@ fn gpu_graph(
     if height < stream.height {
         options.push(format!("w=-2:h={height}"));
     }
-    if stream.bit_depth > 8 && !tone_map {
+    // An encode that keeps HDR (PGPU-06) keeps the decode's 10 bits.
+    if stream.bit_depth > 8 && !tone_map && !ten_bits {
         options.push(s("format=nv12"));
     }
     if !options.is_empty() {
@@ -876,8 +951,8 @@ fn gpu_graph(
 fn cuda_graph(
     spec: &EncodeSpec<'_>,
     stream: &VideoStream,
-    codec: VideoCodec,
     height: u32,
+    ten_bits: bool,
 ) -> Result<String, String> {
     let burned = burned(spec)?;
     let mut options = Vec::new();
@@ -886,7 +961,9 @@ fn cuda_graph(
     }
     if burned.is_some() {
         options.push(s("format=yuv420p"));
-    } else if codec == VideoCodec::H264 && stream.bit_depth > 8 {
+    } else if stream.bit_depth > 8 && !ten_bits {
+        // 8 bits for H.264, and for an encoder that took no 10-bit test
+        // frame (PGPU-06).
         options.push(s("format=nv12"));
     }
     let video = format!("[0:{}]", stream.index);
@@ -1023,15 +1100,29 @@ fn libplacebo_graph(
         (VulkanDevice::Shared, Decode::Gpu) | (VulkanDevice::Own, _) => {}
         (VulkanDevice::Shared, _) => head.push(s("hwupload")),
     }
-    head.push(libplacebo_filter(
-        (height < stream.height).then_some(height),
-    ));
+    // Dolby Vision profile 5 not tone mapped is made HDR10, in 10 bits
+    // (PGPU-06); anything else libplacebo runs on is tone mapped to 8.
+    let hdr10 = matches!(
+        spec.video,
+        Some(ConvertedVideo::Encode {
+            tone_map: false,
+            ..
+        })
+    );
+    let scale = (height < stream.height).then_some(height);
+    head.push(if hdr10 {
+        spoolframe_media::encoders::libplacebo_hdr10_filter(scale)
+    } else {
+        libplacebo_filter(scale)
+    });
+    let format = if hdr10 { "p010" } else { "nv12" };
     if device == VulkanDevice::Shared {
-        head.push(s("hwdownload,format=nv12"));
+        head.push(format!("hwdownload,format={format}"));
     }
+    let own_upload = format!("format={format},hwupload");
     let tail = match (vaapi, device) {
         (true, VulkanDevice::Shared) => Some("hwupload=derive_device=vaapi"),
-        (true, VulkanDevice::Own) => Some("format=nv12,hwupload"),
+        (true, VulkanDevice::Own) => Some(own_upload.as_str()),
         (false, _) => None,
     };
     let video = format!("[0:{}]", stream.index);
@@ -1193,17 +1284,38 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 tone_map,
             } => {
                 let encoder = encoder.expect("set above for an encode");
+                let ten_bits = ten_bits_out(spec, codec, tone_map, encoder.hardware);
                 let graph = if let Some(placebo) = placebo {
                     libplacebo_graph(spec, stream, height, placebo, decode)?
                 } else if decode == Decode::Gpu && decoder == Some(Hardware::Nvenc) {
-                    cuda_graph(spec, stream, codec, height)?
+                    cuda_graph(spec, stream, height, ten_bits)?
                 } else if decode == Decode::Gpu {
-                    gpu_graph(spec, stream, height, tone_map)?
+                    gpu_graph(spec, stream, height, tone_map, ten_bits)?
                 } else {
-                    cpu_graph(spec, stream, codec, height, tone_map, vaapi)?
+                    cpu_graph(spec, stream, codec, height, tone_map, vaapi, ten_bits)?
                 };
                 args.extend([s("-filter_complex"), graph, s("-map"), s("[v]")]);
                 args.extend([s("-c:v"), encoder.name.clone()]);
+                if ten_bits {
+                    if codec == VideoCodec::Hevc {
+                        args.extend([s("-profile:v"), s("main10")]);
+                    }
+                    // The HDR kept (PGPU-06): its colours said in the
+                    // stream as well as carried on the frames, whatever
+                    // the encoder takes from them. Its HDR10 metadata
+                    // (mastering display, light level) the encoder
+                    // carries from the frames.
+                    if let Some(transfer) = kept_transfer(stream) {
+                        args.extend([
+                            s("-color_primaries"),
+                            s("bt2020"),
+                            s("-color_trc"),
+                            s(transfer),
+                            s("-colorspace"),
+                            s("bt2020nc"),
+                        ]);
+                    }
+                }
                 if let Some(rate) = max_bitrate {
                     args.extend([
                         s("-b:v"),
@@ -1282,6 +1394,21 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
         }
     }
 
+    // A Dolby Vision copy the client shows as such (PGPU-06): the muxers
+    // write its configuration record (MP4's `dvcC`, or `dvvC` from profile
+    // 8; Matroska's block addition mapping) only with `-strict
+    // unofficial`. Without it a Dolby Vision stream copied is its base
+    // layer to the player. Checked on profile 8.1 into HLS fMP4: `dvvC`
+    // with it, none without.
+    if matches!(
+        spec.video,
+        Some(ConvertedVideo::Copy {
+            dolby_vision: true,
+            ..
+        })
+    ) {
+        args.extend([s("-strict"), s("unofficial")]);
+    }
     args.extend(["-progress", "pipe:1", "-nostats"].map(s));
     match &spec.output {
         Output::Progressive { file } => {
@@ -1325,14 +1452,26 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 spec.video,
                 Some(
                     ConvertedVideo::Copy {
-                        codec: VideoCodec::Hevc
+                        codec: VideoCodec::Hevc,
+                        ..
                     } | ConvertedVideo::Encode {
                         codec: VideoCodec::Hevc,
                         ..
                     }
                 )
             ) {
-                args.extend([s("-tag:v"), s("hvc1")]);
+                // Dolby Vision profile 5 labelled: `dvh1`, which only a
+                // player that shows Dolby Vision plays; profile 8 keeps
+                // `hvc1`, its base layer playable as HDR10 or HLG
+                // (PGPU-06).
+                let p5 = d.video.as_ref().is_some_and(VideoStream::needs_rpu);
+                let tag = match spec.video {
+                    Some(ConvertedVideo::Copy {
+                        dolby_vision: true, ..
+                    }) if p5 => "dvh1",
+                    _ => "hvc1",
+                };
+                args.extend([s("-tag:v"), s(tag)]);
             }
             // `hvc1` also means the parameter sets are in the sample
             // entry's `hvcC`, and AVPlayer decodes with those alone. A
@@ -1346,10 +1485,25 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
             if matches!(
                 spec.video,
                 Some(ConvertedVideo::Copy {
-                    codec: VideoCodec::Hevc
+                    codec: VideoCodec::Hevc,
+                    ..
                 })
             ) {
-                args.extend([s("-bsf:v"), s("hevc_mp4toannexb")]);
+                // Dolby Vision profile 7's enhancement layer (NAL units of
+                // type 63) is a UHD Blu-ray's second stream, which no
+                // streaming player decodes: left out, the base layer and
+                // its RPU go on as profile 8's do.
+                let p7 = d
+                    .video
+                    .as_ref()
+                    .and_then(|v| v.dolby_vision)
+                    .is_some_and(|dv| dv.profile == 7);
+                let bsf = if p7 {
+                    "hevc_mp4toannexb,filter_units=remove_types=63"
+                } else {
+                    "hevc_mp4toannexb"
+                };
+                args.extend([s("-bsf:v"), s(bsf)]);
             }
             args.extend([
                 s("-f"),
@@ -1422,6 +1576,7 @@ mod tests {
                 frame_rate_millis: Some(23_976),
                 bit_depth: 10,
                 hdr: Some(HdrFormat::Hdr10),
+                dolby_vision: None,
                 bit_rate: None,
             }),
             audio: vec![AudioStream {
@@ -1485,6 +1640,7 @@ mod tests {
             cuda_scale: false,
             cuda_overlay: false,
             libplacebo: Vec::new(),
+            ten_bit: Vec::new(),
             unusable: Vec::new(),
             failed: Vec::new(),
         }
@@ -1835,6 +1991,99 @@ mod tests {
         assert_eq!(made(&spec).decoder, Decoder::Software);
     }
 
+    // PGPU-06: an encode that keeps HDR writes 10 bits.
+
+    /// VA-API's encoders, HEVC's having taken a 10-bit test frame, and
+    /// its decoder for 10-bit HEVC where `decodes`.
+    fn ten_bit_vaapi(decodes: bool) -> Encoders {
+        let mut enc = encoders(true);
+        enc.ten_bit = enc
+            .video
+            .iter()
+            .filter(|e| e.codec == VideoCodec::Hevc)
+            .cloned()
+            .collect();
+        if decodes {
+            enc.hardware_decoders = vec![HardwareDecoder {
+                codec: VideoCodec::Hevc,
+                hardware: Hardware::Vaapi,
+                bit_depth: 10,
+            }];
+        }
+        enc
+    }
+
+    const HEVC_KEPT: ConvertedVideo = ConvertedVideo::Encode {
+        codec: VideoCodec::Hevc,
+        height: 1080,
+        max_bitrate: None,
+        tone_map: false,
+    };
+
+    /// HDR10 HEVC decoded on the GPU and kept: scaled in 10 bits on it,
+    /// encoded Main 10, the HDR colours said.
+    #[test]
+    fn a_kept_hdr_encode_stays_ten_bit_on_the_vaapi_gpu() {
+        let (film, enc) = (film(), ten_bit_vaapi(true));
+        let spec = spec_with(&film, &enc, HEVC_KEPT, None);
+        assert_eq!(decode(&spec), Decode::Gpu);
+        let args = ffmpeg_args(&spec).unwrap();
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[0:0]scale_vaapi=w=-2:h=1080[v]"
+        );
+        assert!(has(&args, &["-c:v", "hevc_vaapi", "-profile:v", "main10"]));
+        assert!(has(
+            &args,
+            &[
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+                "-colorspace",
+                "bt2020nc"
+            ]
+        ));
+    }
+
+    /// The same decoded in memory: uploaded as `p010`, not `nv12`.
+    #[test]
+    fn a_kept_hdr_encode_uploads_ten_bits() {
+        let (film, enc) = (film(), ten_bit_vaapi(false));
+        let args = ffmpeg_args(&spec_with(&film, &enc, HEVC_KEPT, None)).unwrap();
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[0:0]scale=-2:1080,format=p010,hwupload[v]"
+        );
+        assert!(has(&args, &["-profile:v", "main10"]));
+    }
+
+    /// An encoder that took no 10-bit test frame gets 8 bits, and a tone
+    /// map writes 8 bits whatever the encoder: no Main 10, no HDR colours.
+    #[test]
+    fn eight_bits_without_a_ten_bit_encoder_or_with_a_tone_map() {
+        let film = film();
+        let mut enc = ten_bit_vaapi(true);
+        enc.ten_bit.clear();
+        let args = ffmpeg_args(&spec_with(&film, &enc, HEVC_KEPT, None)).unwrap();
+        assert_eq!(
+            after(&args, "-filter_complex"),
+            "[0:0]scale_vaapi=w=-2:h=1080:format=nv12[v]"
+        );
+        assert!(!args.iter().any(|a| a == "main10" || a == "-color_trc"));
+        let enc = ten_bit_vaapi(false);
+        let tone_mapped = ConvertedVideo::Encode {
+            codec: VideoCodec::Hevc,
+            height: 1080,
+            max_bitrate: None,
+            tone_map: true,
+        };
+        let args = ffmpeg_args(&spec_with(&film, &enc, tone_mapped, None)).unwrap();
+        let graph = after(&args, "-filter_complex");
+        assert!(graph.ends_with("format=nv12,hwupload[v]"), "{graph}");
+        assert!(!args.iter().any(|a| a == "main10" || a == "smpte2084"));
+    }
+
     // PGPU-03: NVIDIA's filters on the GPU, `scale_cuda` and `overlay_cuda`.
 
     /// `nvidia()` where detection found these CUDA filters.
@@ -2003,6 +2252,20 @@ mod tests {
             max_bitrate: None,
             tone_map: false,
         };
+        // HEVC keeps the 10 bits where its encoder took a 10-bit test
+        // frame (PGPU-06), and is made 8-bit where it did not.
+        let spec = filtered(&film, &enc, hevc, None);
+        assert_eq!(
+            after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"),
+            "[0:0]scale_cuda=w=-2:h=1080:format=nv12[v]"
+        );
+        let mut enc = enc;
+        enc.ten_bit = enc
+            .video
+            .iter()
+            .filter(|e| e.name == "hevc_nvenc")
+            .cloned()
+            .collect();
         let spec = filtered(&film, &enc, hevc, None);
         assert_eq!(decode(&spec), Decode::Gpu);
         let args = ffmpeg_args(&spec).unwrap();
@@ -2010,7 +2273,9 @@ mod tests {
             after(&args, "-filter_complex"),
             "[0:0]scale_cuda=w=-2:h=1080[v]"
         );
-        assert!(has(&args, &["-c:v", "hevc_nvenc"]));
+        assert!(has(&args, &["-c:v", "hevc_nvenc", "-profile:v", "main10"]));
+        // SDR: no HDR colours to say.
+        assert!(!args.iter().any(|a| a == "-color_trc"));
         let pictures = filtered(&film, &enc, hevc, burn_in(0, SubtitleFormat::Pgs));
         assert_eq!(decode(&pictures), Decode::Hardware);
         let graph = s(after(&ffmpeg_args(&pictures).unwrap(), "-filter_complex"));
@@ -2628,6 +2893,7 @@ mod tests {
 
     const COPY_HEVC: ConvertedVideo = ConvertedVideo::Copy {
         codec: VideoCodec::Hevc,
+        dolby_vision: false,
     };
     const COPY_DTS: AudioAction = AudioAction::Copy {
         codec: AudioCodec::Dts,
@@ -2683,6 +2949,72 @@ mod tests {
             dir: "/scratch/h/0".into(),
             start_number: 1,
         }
+    }
+
+    /// `film()` as Dolby Vision `profile` (HDR10 base, but profile 5).
+    fn dv_film(profile: u8) -> MediaDescriptor {
+        let mut film = film();
+        let video = film.video.as_mut().unwrap();
+        video.hdr = Some(HdrFormat::DolbyVision);
+        video.dolby_vision = Some(spoolframe_media::DolbyVision {
+            profile,
+            level: 6,
+            compatibility: if profile == 5 { 0 } else { 1 },
+        });
+        film
+    }
+
+    /// PGPU-06: a Dolby Vision copy labelled so is muxed with its record
+    /// (`-strict unofficial`): profile 8 tagged `hvc1`, profile 5 `dvh1`.
+    /// Copied as its base layer, it is muxed as any HEVC.
+    #[test]
+    fn a_labelled_dolby_vision_copy_keeps_its_record_and_tag() {
+        let copy = |dolby_vision| ConvertedVideo::Copy {
+            codec: VideoCodec::Hevc,
+            dolby_vision,
+        };
+        let args_for = |film: &MediaDescriptor, video| {
+            ffmpeg_args(&spec(film, &encoders(false), video, COPY_DTS, None, hls())).unwrap()
+        };
+        let p8 = dv_film(8);
+        let args = args_for(&p8, copy(true));
+        assert!(has(&args, &["-strict", "unofficial"]), "{args:?}");
+        assert!(has(&args, &["-tag:v", "hvc1"]));
+        let args = args_for(&p8, copy(false));
+        assert!(!args.iter().any(|a| a == "unofficial"), "{args:?}");
+        assert!(has(&args, &["-tag:v", "hvc1"]));
+        let p5 = dv_film(5);
+        let args = args_for(&p5, copy(true));
+        assert!(has(&args, &["-tag:v", "dvh1"]), "{args:?}");
+        assert!(has(&args, &["-strict", "unofficial"]));
+    }
+
+    /// Profile 7's enhancement layer is left out of a copy.
+    #[test]
+    fn a_profile_7_copy_drops_its_enhancement_layer() {
+        let p7 = dv_film(7);
+        let copy = ConvertedVideo::Copy {
+            codec: VideoCodec::Hevc,
+            dolby_vision: false,
+        };
+        let args = ffmpeg_args(&spec(&p7, &encoders(false), copy, COPY_DTS, None, hls())).unwrap();
+        assert!(
+            has(
+                &args,
+                &["-bsf:v", "hevc_mp4toannexb,filter_units=remove_types=63"]
+            ),
+            "{args:?}"
+        );
+        let args = ffmpeg_args(&spec(
+            &film(),
+            &encoders(false),
+            copy,
+            COPY_DTS,
+            None,
+            hls(),
+        ))
+        .unwrap();
+        assert!(has(&args, &["-bsf:v", "hevc_mp4toannexb"]));
     }
 
     #[test]
@@ -2913,7 +3245,11 @@ mod tests {
         ))
         .unwrap();
         let graph = after(&args, "-filter_complex");
-        assert_eq!(graph, "[0:0]subtitles=filename='/media/Film.mkv':si=1[v]");
+        // 8 bits: the encoder here took no 10-bit test frame (PGPU-06).
+        assert_eq!(
+            graph,
+            "[0:0]subtitles=filename='/media/Film.mkv':si=1,format=yuv420p[v]"
+        );
     }
 
     #[test]
@@ -3471,6 +3807,49 @@ mod tests {
         placebo(with_decoders(true), Hardware::Vaapi, VulkanDevice::Own)
     }
 
+    /// PGPU-06: Dolby Vision profile 5 not tone mapped is made HDR10 by
+    /// libplacebo (its RPU applied), in 10 bits, encoded Main 10 with the
+    /// HDR colours said; tone mapped, it goes through libplacebo whatever
+    /// `transcode.tone_map` says, the only tone map that applies the RPU.
+    #[test]
+    fn dolby_vision_5_goes_through_libplacebo() {
+        let film = dv_film(5);
+        let mut enc = amd_placebo();
+        enc.ten_bit = enc
+            .video
+            .iter()
+            .filter(|e| e.codec == VideoCodec::Hevc)
+            .cloned()
+            .collect();
+        let kept = ConvertedVideo::Encode {
+            codec: VideoCodec::Hevc,
+            height: 1080,
+            max_bitrate: None,
+            tone_map: false,
+        };
+        let spec = spec_with(&film, &enc, kept, None);
+        assert_eq!(
+            libplacebo(&spec),
+            Some((Hardware::Vaapi, VulkanDevice::Own))
+        );
+        let args = ffmpeg_args(&spec).unwrap();
+        let graph = after(&args, "-filter_complex");
+        assert!(graph.contains("apply_dolbyvision=1"), "{graph}");
+        assert!(graph.contains("color_trc=smpte2084"), "{graph}");
+        assert!(graph.ends_with("format=p010,hwupload[v]"), "{graph}");
+        assert!(has(&args, &["-profile:v", "main10"]));
+        assert!(has(&args, &["-color_trc", "smpte2084"]));
+        // Tone mapped with `tone_map = "cpu"`: libplacebo still.
+        let mut mapped = spec_with(&film, &enc, TONE_MAPPED_H264, None);
+        mapped.tone_map = ToneMapSetting::Cpu;
+        assert_eq!(
+            libplacebo(&mapped),
+            Some((Hardware::Vaapi, VulkanDevice::Own))
+        );
+        let graph = s(after(&ffmpeg_args(&mapped).unwrap(), "-filter_complex"));
+        assert!(graph.contains("tonemapping=bt.2390"), "{graph}");
+    }
+
     /// NVIDIA, shared: the 4K HDR10 HEVC film decoded on ffmpeg's NVIDIA
     /// Vulkan device (`-hwaccel vulkan`, frames kept), tone mapped and
     /// scaled by libplacebo there, downloaded in 8 bits to NVENC: the
@@ -3623,11 +4002,11 @@ mod tests {
         );
     }
 
-    /// `"auto"` tone maps on the GPU only with GPU filters on, as it did
-    /// before PGPU-04; a forced method is used whatever they say, and
-    /// `"cpu"` keeps the CPU's.
+    /// `"auto"` tone maps with libplacebo whatever GPU filters say; a
+    /// forced method is used whatever they say, and `"cpu"` keeps the
+    /// CPU's.
     #[test]
-    fn auto_follows_gpu_filters_and_a_forced_method_does_not() {
+    fn auto_takes_libplacebo_whatever_gpu_filters_say() {
         let (film, enc) = (film(), nvidia_placebo());
         let graph = |tone_map: ToneMapSetting, gpu_filters: bool| {
             let mut spec = spec_with(&film, &enc, TONE_MAPPED_H264, None);
@@ -3635,7 +4014,7 @@ mod tests {
             spec.gpu_filters = gpu_filters;
             s(after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"))
         };
-        assert!(graph(ToneMapSetting::Auto, false).contains("tonemap=tonemap=hable"));
+        assert!(graph(ToneMapSetting::Auto, false).contains("libplacebo="));
         assert!(graph(ToneMapSetting::Auto, true).contains("libplacebo="));
         assert!(graph(ToneMapSetting::Libplacebo, false).contains("libplacebo="));
         assert!(graph(ToneMapSetting::Cpu, true).contains("tonemap=tonemap=hable"));
@@ -3655,6 +4034,12 @@ mod tests {
             VulkanDevice::Own,
         );
         let mut spec = spec_with(&film, &both, TONE_MAPPED_H264, None);
+        // The driver's own is a GPU filter: off, auto takes libplacebo.
+        spec.gpu_filters = false;
+        assert_eq!(
+            tone_mapper(&spec),
+            Some(ToneMapper::Libplacebo(VulkanDevice::Own))
+        );
         spec.gpu_filters = true;
         assert_eq!(tone_mapper(&spec), Some(ToneMapper::Vaapi));
         assert!(after(&ffmpeg_args(&spec).unwrap(), "-filter_complex").contains("tonemap_vaapi"));

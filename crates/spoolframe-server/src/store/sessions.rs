@@ -251,22 +251,86 @@ impl Store {
             return Ok(None);
         };
         if now - last_used_at >= RENEW_EVERY_SECS {
-            sqlx::query(
-                "UPDATE sessions SET last_used_at = ?2, expires_at = min(?3, created_at + ?4) \
-                 WHERE token_hash = ?1",
-            )
-            .bind(token_hash)
-            .bind(now)
-            .bind(now + idle_secs)
-            .bind(max_secs)
-            .execute(&self.pool)
-            .await?;
+            self.renew_api_session(token_hash, now, idle_secs, max_secs)
+                .await?;
         }
         Ok(Some(ApiSessionUser {
             user: id,
             role: role(stored),
             authenticated_at,
         }))
+    }
+
+    /// Write the renewal [`Store::use_api_session`] found due, unless
+    /// another request wrote it since: requests that arrive together all
+    /// read the same stale `last_used_at`, and only the first of them
+    /// writes (each write waits for the one before it, and a stalled disk
+    /// held four web UI requests for 2.3 s). Whether this one wrote.
+    async fn renew_api_session(
+        &self,
+        token_hash: &str,
+        now: i64,
+        idle_secs: i64,
+        max_secs: i64,
+    ) -> Result<bool, StoreError> {
+        let renewed = sqlx::query(
+            "UPDATE sessions SET last_used_at = ?2, expires_at = min(?3, created_at + ?4) \
+             WHERE token_hash = ?1 AND last_used_at <= ?5",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .bind(now + idle_secs)
+        .bind(max_secs)
+        .bind(now - RENEW_EVERY_SECS)
+        .execute(&self.pool)
+        .await?;
+        Ok(renewed.rows_affected() > 0)
+    }
+
+    /// Write the renewal [`Store::use_endpoint_session`] found due, with
+    /// the device's and its trust's last use, unless another request wrote
+    /// it since: only the first of requests that arrive together writes,
+    /// as for [`Store::renew_api_session`]. Whether this one wrote.
+    async fn renew_endpoint_session(
+        &self,
+        user: LocalUserId,
+        token_hash: &str,
+        endpoint_id: &str,
+        now: i64,
+        lifetime_secs: i64,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let renewed = sqlx::query(
+            "UPDATE sessions SET last_used_at = ?2, \
+               expires_at = min(?3, coalesce(portable_expires_at, ?3)) \
+             WHERE token_hash = ?1 AND last_used_at <= ?4",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .bind(now + lifetime_secs)
+        .bind(now - RENEW_EVERY_SECS)
+        .execute(&mut *tx)
+        .await?;
+        if renewed.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE devices SET last_seen_at = ?2 WHERE endpoint_id = ?1")
+            .bind(endpoint_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        // A device in use is not idle: its trust does not lapse (P4-01).
+        sqlx::query(
+            "UPDATE trusted_endpoints SET last_used_at = ?3 \
+             WHERE user_id = ?1 AND endpoint_id = ?2",
+        )
+        .bind(user)
+        .bind(endpoint_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Whose session `token_hash` is, live or not, and where it is bound:
@@ -369,33 +433,8 @@ impl Store {
             return Ok(None);
         };
         if now - last_used_at >= RENEW_EVERY_SECS {
-            let mut tx = self.pool.begin().await?;
-            sqlx::query(
-                "UPDATE sessions SET last_used_at = ?2, \
-                   expires_at = min(?3, coalesce(portable_expires_at, ?3)) \
-                 WHERE token_hash = ?1",
-            )
-            .bind(token_hash)
-            .bind(now)
-            .bind(now + lifetime_secs)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("UPDATE devices SET last_seen_at = ?2 WHERE endpoint_id = ?1")
-                .bind(endpoint_id)
-                .bind(now)
-                .execute(&mut *tx)
+            self.renew_endpoint_session(id, token_hash, endpoint_id, now, lifetime_secs)
                 .await?;
-            // A device in use is not idle: its trust does not lapse (P4-01).
-            sqlx::query(
-                "UPDATE trusted_endpoints SET last_used_at = ?3 \
-                 WHERE user_id = ?1 AND endpoint_id = ?2",
-            )
-            .bind(id)
-            .bind(endpoint_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
         }
         Ok(Some(SessionUser {
             user: id,
@@ -755,6 +794,58 @@ mod tests {
         let (used, expires) = last_used(&store, "h").await;
         assert!(now() - used < RENEW_EVERY_SECS);
         assert!(expires >= now() + 999);
+    }
+
+    #[tokio::test]
+    async fn requests_that_find_a_renewal_due_together_write_it_once() {
+        let (store, alice) = store_with_alice("renew-once").await;
+        store
+            .create_session("tv", alice, &endpoint("t"), now() + 60)
+            .await
+            .unwrap();
+        store
+            .create_session("web", alice, &SessionBinding::Api, now() + 60)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sessions SET last_used_at = last_used_at - 120")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        // Requests that all read the stale last use, then renew: the
+        // first writes, the rest find it written.
+        let now = store.now();
+        assert!(
+            store
+                .renew_endpoint_session(alice, "tv", "t", now, 1000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .renew_endpoint_session(alice, "tv", "t", now, 1000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .renew_api_session("web", now, 1000, 5000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .renew_api_session("web", now, 1000, 5000)
+                .await
+                .unwrap()
+        );
+        // A minute on, it is due again.
+        let later = now + RENEW_EVERY_SECS;
+        assert!(
+            store
+                .renew_api_session("web", later, 1000, 5000)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

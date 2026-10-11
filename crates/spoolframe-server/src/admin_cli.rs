@@ -968,6 +968,7 @@ mod tests {
             other_gpus: Vec::new(),
             gpu_notes: Vec::new(),
             routes: Vec::new(),
+            picks: Vec::new(),
         };
         assert_eq!(gpu_tone_maps(&t), "none");
         t.gpu_tone_maps = vec![
@@ -1005,6 +1006,7 @@ mod tests {
             other_gpus: Vec::new(),
             gpu_notes: Vec::new(),
             routes: Vec::new(),
+            picks: Vec::new(),
         };
         assert_eq!(gpu_filters(&t), "off");
         t.gpu_filters = true;

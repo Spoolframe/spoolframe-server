@@ -1533,6 +1533,9 @@ pub fn Server() -> Element {
                     PathCheck {}
                 }
             }
+            // Under "This server"'s encode budget, the whole width: the
+            // cards it is spent on, and where each conversion goes.
+            super::gpus::Gpus {}
         }
     }
 }

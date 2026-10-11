@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use easy_ffprobe::{FfProbe, Ratio, StreamKinds};
+use easy_ffprobe::{FfProbe, Ratio, SideData, StreamKinds};
 use serde::Serialize;
 use spoolframe_types::{
     AudioRole, AudioTrack, HdrFormat, MediaTracks, SubtitleRole, SubtitleTrack, VideoTrack,
@@ -56,6 +56,10 @@ pub struct VideoStream {
     pub bit_depth: u32,
     /// The HDR format, `None` for SDR.
     pub hdr: Option<HdrFormat>,
+    /// Dolby Vision's configuration record, where the stream has one
+    /// (PGPU-06): which profile, and what its base layer shows to a player
+    /// without Dolby Vision.
+    pub dolby_vision: Option<DolbyVision>,
     /// Bits per second of this stream alone: what an MP4 says of it, else
     /// a Matroska muxer's `BPS` statistics tag; `None` where neither does.
     pub bit_rate: Option<u64>,
@@ -82,7 +86,96 @@ impl VideoRange {
     }
 }
 
+/// A Dolby Vision stream's configuration record (the `dvcC` box, the
+/// DOVI side data ffprobe reads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DolbyVision {
+    pub profile: u8,
+    pub level: u8,
+    /// `bl_signal_compatibility_id`: what the base layer is to a player
+    /// without Dolby Vision. 1 HDR10, 2 SDR, 4 HLG, 6 the HDR10 of a UHD
+    /// Blu-ray's profile 7; 0 none (profile 5).
+    pub compatibility: u8,
+}
+
+/// What a Dolby Vision stream's base layer is, played without its own
+/// layer (the RPU).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DvBase {
+    Hdr10,
+    Hlg,
+    Sdr,
+    /// Profile 5: IPTPQc2, which no player shows right without the RPU.
+    None,
+}
+
+impl DolbyVision {
+    /// The record in one of a stream's side data, if it is one.
+    fn of(side: &SideData) -> Option<Self> {
+        let byte = |v: Option<i64>| v.and_then(|v| u8::try_from(v).ok());
+        Some(Self {
+            profile: byte(side.dv_profile)?,
+            level: byte(side.dv_level).unwrap_or(0),
+            compatibility: byte(side.dv_bl_signal_compatibility_id).unwrap_or(0),
+        })
+    }
+
+    /// Its base layer, by profile and compatibility (profile 7 is a UHD
+    /// Blu-ray's, HDR10 under its enhancement layer).
+    pub fn base(&self) -> DvBase {
+        match (self.profile, self.compatibility) {
+            (5, _) => DvBase::None,
+            (7, _) | (_, 1 | 6) => DvBase::Hdr10,
+            (_, 4) => DvBase::Hlg,
+            (_, 2) => DvBase::Sdr,
+            _ => DvBase::None,
+        }
+    }
+
+    /// Whether a player that shows Dolby Vision plays it as Dolby Vision:
+    /// profiles 5 and 8, which Apple's players take; not profile 7, which
+    /// no streaming player does (its enhancement layer is a second
+    /// stream's worth).
+    pub fn streamable(&self) -> bool {
+        matches!(self.profile, 5 | 8)
+    }
+}
+
 impl VideoStream {
+    /// The HDR an encode of this stream can keep (PGPU-06): HDR10 for PQ,
+    /// HLG for HLG, from the base layer. Dolby Vision's own layer (the
+    /// RPU) does not go through an encode, so profiles 7 and 8 keep their
+    /// base layer's HDR; profile 5's base layer is not PQ as a player
+    /// reads it, and keeps nothing here (libplacebo, applying the RPU,
+    /// can make HDR10 of it: see the planner). `None` for SDR.
+    pub fn keepable_hdr(&self) -> Option<HdrFormat> {
+        match self.hdr? {
+            HdrFormat::DolbyVision => match self.dolby_vision.map(|dv| dv.base()) {
+                Some(DvBase::None | DvBase::Sdr) => None,
+                Some(DvBase::Hdr10) => Some(HdrFormat::Hdr10),
+                Some(DvBase::Hlg) => Some(HdrFormat::Hlg),
+                // No record read: the transfer says.
+                None => match self.range() {
+                    VideoRange::Pq => Some(HdrFormat::Hdr10),
+                    VideoRange::Hlg => Some(HdrFormat::Hlg),
+                    VideoRange::Sdr => None,
+                },
+            },
+            HdrFormat::Unknown => match self.range() {
+                VideoRange::Pq => Some(HdrFormat::Hdr10),
+                VideoRange::Hlg => Some(HdrFormat::Hlg),
+                VideoRange::Sdr => None,
+            },
+            kept => Some(kept),
+        }
+    }
+
+    /// Dolby Vision profile 5 (PGPU-06): its picture is right only with
+    /// the RPU applied, which libplacebo does.
+    pub fn needs_rpu(&self) -> bool {
+        self.dolby_vision.is_some_and(|dv| dv.profile == 5)
+    }
+
     /// From the transfer function, not from `hdr`: Dolby Vision is over
     /// either PQ or HLG.
     pub fn range(&self) -> VideoRange {
@@ -189,6 +282,7 @@ impl MediaDescriptor {
                             v.color_transfer.as_deref(),
                             stream.side_data_list.iter().any(|d| d.dv_profile.is_some()),
                         ),
+                        dolby_vision: stream.side_data_list.iter().find_map(DolbyVision::of),
                         bit_rate: positive(
                             v.bit_rate
                                 .or_else(|| v.tags.as_ref().and_then(|t| t.tags.bps)),
@@ -515,6 +609,53 @@ mod tests {
         assert_eq!(sdh[0].language.as_deref(), Some("eng"));
         let forced = d.subtitles.iter().filter(|s| s.forced).count();
         assert_eq!(forced, 9);
+    }
+
+    /// PGPU-06: an encode keeps Dolby Vision's base layer, HDR10 under
+    /// profiles 7 and 8; profile 5 has none to keep; HDR10 stays HDR10.
+    #[test]
+    fn an_encode_keeps_dolby_vision_s_base_layer_only() {
+        let p8 = describe("mkv-forced-subs").video.unwrap();
+        let record = p8.dolby_vision.unwrap();
+        assert_eq!(p8.hdr, Some(HdrFormat::DolbyVision));
+        assert_eq!(
+            (record.profile, record.level, record.compatibility),
+            (8, 6, 1)
+        );
+        assert_eq!(record.base(), DvBase::Hdr10);
+        assert!(record.streamable());
+        assert_eq!(p8.keepable_hdr(), Some(HdrFormat::Hdr10));
+        let p7 = describe("mkv-hevc-pgs").video.unwrap();
+        assert_eq!(p7.dolby_vision.map(|dv| dv.profile), Some(7));
+        assert!(!p7.dolby_vision.unwrap().streamable());
+        assert_eq!(p7.keepable_hdr(), Some(HdrFormat::Hdr10));
+        let p5 = VideoStream {
+            dolby_vision: Some(DolbyVision {
+                profile: 5,
+                level: 6,
+                compatibility: 0,
+            }),
+            ..p8.clone()
+        };
+        assert_eq!(p5.keepable_hdr(), None);
+        assert!(p5.needs_rpu());
+        let hlg_base = DolbyVision {
+            profile: 8,
+            level: 6,
+            compatibility: 4,
+        };
+        assert_eq!(hlg_base.base(), DvBase::Hlg);
+        let hdr10 = describe("mkv-cover-art").video.unwrap();
+        assert_eq!(hdr10.keepable_hdr(), Some(HdrFormat::Hdr10));
+        let hlg = VideoStream {
+            hdr: Some(HdrFormat::Hlg),
+            color_transfer: Some("arib-std-b67".into()),
+            dolby_vision: None,
+            ..hdr10.clone()
+        };
+        assert_eq!(hlg.keepable_hdr(), Some(HdrFormat::Hlg));
+        let sdr = describe("mp4-h264-aac").video.unwrap();
+        assert_eq!(sdr.keepable_hdr(), None);
     }
 
     #[test]

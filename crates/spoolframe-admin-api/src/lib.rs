@@ -1044,7 +1044,7 @@ pub struct TranscodingStatus {
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub budget: Option<EncodeBudget>,
     /// The GPUs encodes run on (PGPU-05), in the order jobs try them:
-    /// what the server's start lines say of each, for the Overview.
+    /// what the server's start lines say of each, for the Server page.
     pub gpus: Vec<GpuCard>,
     /// The host's other GPUs, and why none of their work goes there.
     pub other_gpus: Vec<OtherGpu>,
@@ -1053,8 +1053,51 @@ pub struct TranscodingStatus {
     /// not here`.
     pub gpu_notes: Vec<String>,
     /// Where typical conversions would run now, as the jobs pick
-    /// (PGPU-02, PGPU-05), each card as if it had room.
+    /// (PGPU-02, PGPU-05): the first choice, then each next while the
+    /// ones before are full.
     pub routes: Vec<GpuRoute>,
+    /// The codec the server would convert a 4K HDR10 film to now, for
+    /// each kind of device (PGPU-06): `transcode.video_codecs` and the
+    /// cards here, as the planner takes them.
+    pub picks: Vec<CodecPick>,
+}
+
+/// The codec a 4K HDR10 film is converted to for `device` (PGPU-06), and
+/// whether its HDR is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodecPick {
+    pub device: PickDevice,
+    /// The protocol's codec name: `h264`, `hevc`, `av1`; `None` where
+    /// nothing here encodes a codec it plays.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub codec: Option<String>,
+    pub hdr_kept: bool,
+}
+
+/// A kind of device [`CodecPick`] is asked for: each plays H.264, HEVC
+/// and AV1, decoding as said in hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PickDevice {
+    /// Shows HDR10, decodes AV1 and HEVC in hardware (iPhone 15 Pro, an
+    /// M3 Mac).
+    HdrAv1,
+    /// Shows HDR10, decodes HEVC in hardware, AV1 not (Apple TV 4K).
+    HdrHevc,
+    /// Shows no HDR, decodes all three in hardware.
+    Sdr,
+}
+
+impl PickDevice {
+    /// The device as the Server page names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            PickDevice::HdrAv1 => "An HDR screen that decodes AV1",
+            PickDevice::HdrHevc => "An HDR screen without AV1 (Apple TV 4K)",
+            PickDevice::Sdr => "An SDR screen",
+        }
+    }
 }
 
 /// A GPU the server encodes on (PGPU-05).
@@ -1140,7 +1183,7 @@ pub enum OtherGpuWhy {
     },
 }
 
-/// A typical conversion (PGPU-02), for the Overview's routes.
+/// A typical conversion (PGPU-02), for the Server page's routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RouteJob {
@@ -1148,6 +1191,9 @@ pub enum RouteJob {
     Convert,
     /// A 4K HDR10 source, tone mapped to 1080p SDR.
     ToneMap,
+    /// A 4K HDR10 source to 1080p, its HDR kept (PGPU-06): HEVC and AV1
+    /// only.
+    KeepHdr,
     /// A 1080p source with picture subtitles burned in.
     BurnIn,
 }
@@ -1183,7 +1229,9 @@ impl RouteShare {
     }
 }
 
-/// One cell of the routes: `job` of a `source` video to `target`.
+/// One cell of the routes: `job` of a `source` video to `target`, and
+/// where it goes: the first step the jobs' pick takes, then each next
+/// while every card before it is full.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GpuRoute {
@@ -1191,6 +1239,19 @@ pub struct GpuRoute {
     /// The protocol's codec names: `h264`, `hevc`, `av1`.
     pub source: String,
     pub target: String,
+    /// Never empty. One step with [`RouteShare::None`] when nothing here
+    /// encodes `target`.
+    pub steps: Vec<RouteStep>,
+    /// With every card of `steps` full, the playback is refused as busy
+    /// until one has room: a GPU encode never falls back to the CPU.
+    /// False where the last step takes no GPU slot (a software encode).
+    pub busy_after: bool,
+}
+
+/// Where a route runs at one step: on which card, and what of it there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteStep {
     /// A [`GpuCard::key`]; `None` for one on the CPU alone.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub gpu: Option<String>,
@@ -1202,6 +1263,10 @@ pub struct GpuRoute {
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub tone_mapper: Option<ToneMapper>,
     pub burn_in: FilterPlace,
+    /// Why the tone map or burn-in runs on the CPU here, when one does:
+    /// `GPU filters are off (transcode.gpu_filters)`, `encoded in
+    /// software`, or what the server's own notes say.
+    pub cpu_why: Vec<String>,
 }
 
 /// The encode budget (`transcode.max_jobs`) and the caps beside it, now.
@@ -3722,7 +3787,7 @@ mod required_field_tests {
         }
     }
 
-    /// The Overview's GPUs (PGPU-05): a server and a web UI that
+    /// The Server page's GPUs (PGPU-05): a server and a web UI that
     /// disagree about them fail on the call.
     #[test]
     fn gpu_cards_and_routes() {
@@ -3740,23 +3805,38 @@ mod required_field_tests {
                 other_gpus: Vec::new(),
                 gpu_notes: Vec::new(),
                 routes: Vec::new(),
+                picks: Vec::new(),
             },
-            &["budget", "gpus", "otherGpus", "gpuNotes", "routes"],
+            &["budget", "gpus", "otherGpus", "gpuNotes", "routes", "picks"],
         );
+        assert_each_required(
+            &CodecPick {
+                device: PickDevice::HdrHevc,
+                codec: Some("hevc".into()),
+                hdr_kept: true,
+            },
+            &["codec", "hdrKept"],
+        );
+        let step = RouteStep {
+            gpu: None,
+            share: RouteShare::Cpu,
+            decoder: VideoDecoder::Software,
+            encoder: None,
+            tone_map: FilterPlace::None,
+            tone_mapper: None,
+            burn_in: FilterPlace::None,
+            cpu_why: Vec::new(),
+        };
+        assert_each_required(&step, &["gpu", "share", "encoder", "toneMapper", "cpuWhy"]);
         assert_each_required(
             &GpuRoute {
                 job: RouteJob::Convert,
                 source: "hevc".into(),
                 target: "h264".into(),
-                gpu: None,
-                share: RouteShare::Cpu,
-                decoder: VideoDecoder::Software,
-                encoder: None,
-                tone_map: FilterPlace::None,
-                tone_mapper: None,
-                burn_in: FilterPlace::None,
+                steps: vec![step],
+                busy_after: false,
             },
-            &["gpu", "share", "encoder", "toneMapper"],
+            &["steps", "busyAfter"],
         );
         assert_each_required(
             &OtherGpuWhy::NothingWorks {
@@ -3791,6 +3871,7 @@ mod required_field_tests {
                     other_gpus: Vec::new(),
                     gpu_notes: Vec::new(),
                     routes: Vec::new(),
+                    picks: Vec::new(),
                 },
                 mdns: false,
                 addresses: Vec::new(),

@@ -370,6 +370,57 @@ async fn the_own_relay_serves_tls_from_pem_files() {
     let relay = spoolframe_server::own_relay::spawn(&config, iroh::SecretKey::generate(), &dir)
         .await
         .unwrap();
-    assert!(relay.https_addr().is_some());
+    let https = relay.https_addr().unwrap();
+    let der = cert.cert.der().clone();
+    // TLS 1.3 only (P6-07, glm L-3): a client of 1.2 alone is refused on
+    // the version, and one of 1.3 is served.
+    let tls12 = handshake(https, der.clone(), &rustls::version::TLS12).await;
+    assert!(
+        matches!(
+            tls12,
+            Err(rustls::Error::AlertReceived(
+                rustls::AlertDescription::ProtocolVersion
+            ))
+        ),
+        "{tls12:?}"
+    );
+    let tls13 = handshake(https, der, &rustls::version::TLS13).await;
+    assert_eq!(tls13, Ok(rustls::ProtocolVersion::TLSv1_3));
     relay.shutdown().await.unwrap();
+}
+
+/// A TLS handshake with `addr` as `relay.example.org`, trusting `cert`
+/// and offering only `version`: the version agreed, or why there is none.
+async fn handshake(
+    addr: std::net::SocketAddr,
+    cert: rustls::pki_types::CertificateDer<'static>,
+    version: &'static rustls::SupportedProtocolVersion,
+) -> Result<rustls::ProtocolVersion, rustls::Error> {
+    tokio::task::spawn_blocking(move || {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(&[version])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("relay.example.org").unwrap();
+        let mut tls = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+        let mut tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        while tls.is_handshaking() {
+            if let Err(e) = tls.complete_io(&mut tcp) {
+                return Err(e
+                    .into_inner()
+                    .and_then(|e| e.downcast::<rustls::Error>().ok())
+                    .map(|e| *e)
+                    .unwrap_or_else(|| rustls::Error::General("the connection broke".into())));
+            }
+        }
+        Ok(tls.protocol_version().unwrap())
+    })
+    .await
+    .unwrap()
 }

@@ -100,6 +100,7 @@ fn capabilities() -> ClientCapabilities {
         max_video: None,
         max_audio_channels: None,
         max_bitrate: None,
+        hardware_video: None,
     }
 }
 

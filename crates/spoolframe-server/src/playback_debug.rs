@@ -409,7 +409,7 @@ pub fn plan_view(
                 },
             );
             match video {
-                Some(ConvertedVideo::Copy { codec }) => row(
+                Some(ConvertedVideo::Copy { codec, .. }) => row(
                     K::Video,
                     None,
                     video_source(d),
@@ -895,7 +895,16 @@ impl PlaybackDebug {
             api::PictureSubtitles::BurnIn => planner::Bitmap::Preferred(BitmapPreference::Pictures),
         };
         let detected = self.transcoding.detected();
-        let encoders = detected.encoders.clone();
+        // As the client protocol plans it (PGPU-06): the GPUs' codecs in
+        // `transcode.video_codecs`' order, of the cards with room now.
+        let encoders = match &self.jobs {
+            Some(jobs) => crate::encode::planning_encoders(jobs, &detected),
+            None => crate::encode::pick::planning(
+                &detected,
+                &crate::config::DEFAULT_VIDEO_CODECS,
+                &|_| true,
+            ),
+        };
         // As the client protocol plans it: without capabilities, nothing.
         let plan = match &caps {
             None => planner::plan_without_capabilities(),
@@ -1217,6 +1226,7 @@ mod tests {
                 frame_rate_millis: None,
                 bit_depth: 8,
                 hdr: None,
+                dolby_vision: None,
                 bit_rate: None,
             }),
             audio: Vec::new(),

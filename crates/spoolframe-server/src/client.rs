@@ -2152,7 +2152,10 @@ impl ClientProtocol {
                         caps,
                         selection,
                         bitmap,
-                        &self.services.transcoding.encoders(),
+                        &crate::encode::planning_encoders(
+                            &self.services.jobs,
+                            &self.services.transcoding.detected(),
+                        ),
                         self.services.subtitles.ocr(),
                     ),
                     chosen,
@@ -2179,7 +2182,10 @@ impl ClientProtocol {
                     quality,
                     selection,
                     bitmap,
-                    &self.services.transcoding.encoders(),
+                    &crate::encode::planning_encoders(
+                        &self.services.jobs,
+                        &self.services.transcoding.detected(),
+                    ),
                     self.services.subtitles.ocr(),
                 );
                 let planned_in = requested.elapsed();
@@ -2364,7 +2370,10 @@ impl ClientProtocol {
                     quality,
                     selection,
                     bitmap,
-                    &self.services.transcoding.encoders(),
+                    &crate::encode::planning_encoders(
+                        &self.services.jobs,
+                        &self.services.transcoding.detected(),
+                    ),
                     self.services.subtitles.ocr(),
                 );
                 let (subtitle, (size, file), conversion, _) = self
@@ -2412,7 +2421,10 @@ impl ClientProtocol {
                     quality,
                     selection,
                     bitmap,
-                    &self.services.transcoding.encoders(),
+                    &crate::encode::planning_encoders(
+                        &self.services.jobs,
+                        &self.services.transcoding.detected(),
+                    ),
                     self.services.subtitles.ocr(),
                 );
                 let epoch_now = playback.conversion.as_ref().map_or(0, |c| c.job().epoch);

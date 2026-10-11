@@ -125,8 +125,9 @@ impl Default for TranscodeSettings {
 /// `transcode.tone_map` (PGPU-04): how an HDR source is tone mapped to SDR.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ToneMapSetting {
-    /// The job's GPU's own tone map (`tonemap_vaapi`), else libplacebo,
-    /// else the CPU; on the CPU while `transcode.gpu_filters` is off.
+    /// The job's GPU's own tone map (`tonemap_vaapi`) while
+    /// `transcode.gpu_filters` is on, else libplacebo (whatever
+    /// `gpu_filters` says), else the CPU.
     #[default]
     Auto,
     /// The CPU's (`zscale` and `tonemap=hable`).
@@ -283,6 +284,10 @@ pub struct Encoders {
     pub cuda_overlay: bool,
     /// The families whose GPU tone maps with libplacebo, and how (PGPU-04).
     pub libplacebo: Vec<Libplacebo>,
+    /// The GPU encoders of [`Encoders::video`] that took a 10-bit test
+    /// frame (PGPU-06): what an encode that keeps a film's HDR may run on.
+    /// HEVC and AV1 only; H.264 carries no HDR.
+    pub ten_bit: Vec<VideoEncoder>,
     /// Hardware the settings named that did not work, for the log.
     #[serde(skip)]
     pub unusable: Vec<Hardware>,
@@ -326,9 +331,15 @@ impl Encoders {
             cuda_scale: false,
             cuda_overlay: false,
             libplacebo: Vec::new(),
+            ten_bit: Vec::new(),
             unusable: Vec::new(),
             failed: Vec::new(),
         }
+    }
+
+    /// Whether `encoder` took a 10-bit test frame (PGPU-06).
+    pub fn encodes_ten_bit(&self, encoder: &VideoEncoder) -> bool {
+        self.ten_bit.iter().any(|e| e.name == encoder.name)
     }
 
     /// How libplacebo tone maps on `hardware`'s GPU, if it does.
@@ -463,11 +474,13 @@ impl Encoders {
 }
 
 /// Video codecs Spoolframe encodes to, most widely playable first; each
-/// with its software encoder.
-const VIDEO: [(VideoCodec, &str, &str); 3] = [
-    (VideoCodec::H264, "h264", "libx264"),
-    (VideoCodec::Hevc, "hevc", "libx265"),
-    (VideoCodec::Av1, "av1", "libsvtav1"),
+/// with its software encoder, H.264 alone having one (PGPU-06): x265 or
+/// SVT-AV1 on a 4K film take several cores each, where libx264 is cheap,
+/// so a software encode is always H.264 and the others are not tried.
+const VIDEO: [(VideoCodec, &str, Option<&str>); 3] = [
+    (VideoCodec::H264, "h264", Some("libx264")),
+    (VideoCodec::Hevc, "hevc", None),
+    (VideoCodec::Av1, "av1", None),
 ];
 
 const AUDIO: [(AudioCodec, &str); 4] = [
@@ -518,12 +531,26 @@ fn listed(output: &str) -> Vec<&str> {
         .collect()
 }
 
-/// A one-second encode of a test pattern with `encoder`.
+/// A one-second encode of a test pattern with `encoder`, 8-bit.
 fn encode_args(
     encoder: &str,
     hardware: Option<Hardware>,
     settings: &TranscodeSettings,
 ) -> Vec<String> {
+    depth_encode_args(encoder, hardware, settings, false)
+}
+
+/// A one-second encode of a test pattern with `encoder`, 10-bit
+/// (`p010`) with `ten_bit`: what an encode that keeps HDR gives it
+/// (PGPU-06). A GPU that encodes 8-bit HEVC does not always encode
+/// Main 10.
+fn depth_encode_args(
+    encoder: &str,
+    hardware: Option<Hardware>,
+    settings: &TranscodeSettings,
+    ten_bit: bool,
+) -> Vec<String> {
+    let format = if ten_bit { "p010" } else { "nv12" };
     let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error"]
         .map(String::from)
         .to_vec();
@@ -545,7 +572,9 @@ fn encode_args(
         .map(String::from),
     );
     if hardware == Some(Hardware::Vaapi) {
-        args.extend(["-vf".into(), "format=nv12,hwupload".into()]);
+        args.extend(["-vf".into(), format!("format={format},hwupload")]);
+    } else if ten_bit {
+        args.extend(["-pix_fmt".into(), "p010le".into()]);
     }
     args.extend([
         "-c:v".into(),
@@ -629,7 +658,7 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
             .iter()
             .map(|h| (format!("{prefix}_{}", h.as_str()), Some(*h)))
             .collect();
-        candidates.push((software.to_owned(), None));
+        candidates.extend(software.map(|name| (name.to_owned(), None)));
         for (name, hardware) in candidates {
             if !listed.contains(&name.as_str()) {
                 continue;
@@ -652,6 +681,34 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
                     why,
                 ),
             }
+        }
+    }
+
+    // The GPU encoders that keep 10 bits (PGPU-06), for an encode that
+    // keeps a film's HDR.
+    let mut ten_bit = Vec::new();
+    for encoder in video
+        .iter()
+        .filter(|e| e.hardware.is_some() && e.codec != VideoCodec::H264)
+    {
+        let hardware = encoder.hardware;
+        let gpu = hardware.map_or(GpuUse::None, Hardware::gpu);
+        match ffmpeg
+            .succeeds(
+                &depth_encode_args(&encoder.name, hardware, settings, true),
+                scratch,
+                gpu.into(),
+            )
+            .await
+        {
+            Ok(()) => ten_bit.push(encoder.clone()),
+            Err(why) => failed(
+                &mut failures,
+                hardware,
+                &format!("{} 10-bit", encoder.name),
+                &format!("{} 10-bit encode", encoder.codec.as_str()),
+                why,
+            ),
         }
     }
 
@@ -807,6 +864,7 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
         cuda_scale,
         cuda_overlay,
         libplacebo,
+        ten_bit,
         unusable,
         failed: failures,
     };
@@ -969,6 +1027,17 @@ pub fn libplacebo_filter(height: Option<u32>) -> String {
     format!(
         "libplacebo={size}tonemapping=bt.2390:colorspace=bt709:color_primaries=bt709:\
          color_trc=bt709:range=tv:format=nv12"
+    )
+}
+
+/// libplacebo making HDR10 of a Dolby Vision profile 5 picture (PGPU-06):
+/// it applies the stream's RPU (`apply_dolbyvision`, on by default) and
+/// writes BT.2020 PQ in 10 bits, scaled as [`libplacebo_filter`] scales.
+pub fn libplacebo_hdr10_filter(height: Option<u32>) -> String {
+    let size = height.map_or_else(String::new, |h| format!("w=-2:h={h}:"));
+    format!(
+        "libplacebo={size}apply_dolbyvision=1:colorspace=bt2020nc:color_primaries=bt2020:\
+         color_trc=smpte2084:range=tv:format=p010"
     )
 }
 
@@ -1453,6 +1522,16 @@ mod tests {
                         .map(|i| format!("decode_{}", args[i + 1]))
                 })
                 .unwrap();
+            // A 10-bit test encode (PGPU-06) is its encoder's `@10`.
+            let ten_bit = args
+                .windows(2)
+                .any(|w| w[0] == "-pix_fmt" && w[1] == "p010le")
+                || args.iter().any(|a| a == "format=p010,hwupload");
+            let name = if ten_bit && filter.is_none() {
+                format!("{name}@10")
+            } else {
+                name
+            };
             if self.works.iter().any(|w| *w == name) {
                 Ok(())
             } else {
@@ -1472,8 +1551,9 @@ mod tests {
 
     #[tokio::test]
     async fn working_hardware_comes_before_software_and_listed_but_broken_is_dropped() {
-        // The dev machine: VA-API works for H.264 and HEVC, AV1 only in
-        // software here; NVENC is listed but has no driver.
+        // The dev machine: VA-API works for H.264 and HEVC; NVENC is
+        // listed but has no driver. Software is H.264 alone (PGPU-06):
+        // libx265 and SVT-AV1 would work, and are not tried.
         let ffmpeg = Recorded::new(&[
             "h264_vaapi",
             "hevc_vaapi",
@@ -1488,21 +1568,30 @@ mod tests {
             scratch("auto").await.as_ref(),
         )
         .await;
-        assert_eq!(
-            names(&e),
-            [
-                "h264_vaapi",
-                "libx264",
-                "hevc_vaapi",
-                "libx265",
-                "libsvtav1"
-            ]
-        );
+        assert_eq!(names(&e), ["h264_vaapi", "libx264", "hevc_vaapi"]);
         assert_eq!(
             e.video_encoder(VideoCodec::Hevc).unwrap().name,
             "hevc_vaapi"
         );
-        assert_eq!(e.video_encoder(VideoCodec::Av1).unwrap().name, "libsvtav1");
+        assert_eq!(e.video_encoder(VideoCodec::Av1), None);
+        // Encode tests, not the samples the decode tests are made with.
+        let tried: Vec<String> = ffmpeg
+            .runs
+            .lock()
+            .iter()
+            .filter(|args| args.ends_with(&["null".to_owned(), "-".to_owned()]))
+            .filter_map(|args| {
+                args.iter()
+                    .position(|a| a == "-c:v")
+                    .map(|i| args[i + 1].clone())
+            })
+            .collect();
+        assert!(
+            !tried
+                .iter()
+                .any(|name| name == "libx265" || name == "libsvtav1"),
+            "{tried:?}"
+        );
         assert_eq!(e.unusable, [Hardware::Nvenc, Hardware::Qsv]);
         assert!(
             e.hardware_decoders
@@ -1512,6 +1601,37 @@ mod tests {
         assert_eq!(e.hardware_decoders.len(), 3);
         // Mesa's VA-API tone maps nothing and overlays nothing.
         assert!(!e.gpu_tonemap && !e.gpu_overlay);
+    }
+
+    /// PGPU-06: each GPU HEVC and AV1 encoder is tried with a 10-bit test
+    /// frame, H.264 not; one that refuses it is still used for 8 bits,
+    /// and says what it lacks.
+    #[tokio::test]
+    async fn gpu_hevc_and_av1_encoders_are_tried_at_10_bits() {
+        let ffmpeg = Recorded::new(&[
+            "h264_vaapi",
+            "hevc_vaapi",
+            "hevc_vaapi@10",
+            "av1_vaapi",
+            "libx264",
+        ]);
+        let settings = TranscodeSettings {
+            hardware: HardwarePolicy::Ordered(vec![Hardware::Vaapi]),
+            ..TranscodeSettings::default()
+        };
+        let e = detect(&ffmpeg, &settings, scratch("ten-bit").await.as_ref()).await;
+        let ten: Vec<&str> = e.ten_bit.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(ten, ["hevc_vaapi"]);
+        assert!(e.encodes_ten_bit(e.video_encoder(VideoCodec::Hevc).unwrap()));
+        assert!(!e.encodes_ten_bit(e.video_encoder(VideoCodec::Av1).unwrap()));
+        assert!(e.lacks(Hardware::Vaapi).contains(&"av1 10-bit encode"));
+        let ten_bit_runs = ffmpeg
+            .runs
+            .lock()
+            .iter()
+            .filter(|args| args.iter().any(|a| a == "format=p010,hwupload"))
+            .count();
+        assert_eq!(ten_bit_runs, 2, "HEVC and AV1, not H.264");
     }
 
     /// Each GPU filter is tried with a tiny run, as the encoders are: an

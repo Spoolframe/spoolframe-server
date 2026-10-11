@@ -49,6 +49,9 @@ web-sys = { workspace = true, features = [
     "Url",
     "Document",
     "HtmlAnchorElement",
+    # The output codecs' drag (PGPU-06): the grip keeps the pointer.
+    "PointerEvent",
+    "Element",
 ] }
 
 # dx looks for it even for a web-only bundle.

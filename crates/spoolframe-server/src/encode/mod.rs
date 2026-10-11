@@ -58,6 +58,9 @@ pub struct JobLimits {
     pub gpu_filters: bool,
     /// How HDR is tone mapped (`transcode.tone_map`, PGPU-04).
     pub tone_map: spoolframe_media::encoders::ToneMapSetting,
+    /// The codecs a GPU encodes to, the first preferred
+    /// (`transcode.video_codecs`, PGPU-06).
+    pub video_codecs: Vec<spoolframe_types::VideoCodec>,
 }
 
 /// A playback's conversion: what to encode, and the encode running now.
@@ -610,16 +613,27 @@ impl Conversion {
 
 /// Where `source`'s runs go: the GPU [`pick::choose`] picks for `probe`,
 /// its first run (PGPU-05), passing over a card with no room for another
-/// GPU encode. The card of the conversion it replaces has room: that one
-/// lets go of its place as this one starts.
+/// GPU encode, and with none left a software encode ([`pick::spill`]).
+/// The card of the conversion it replaces has room: that one lets go of
+/// its place as this one starts.
 fn run_on(jobs: &Jobs, source: &ConversionSource<'_>, probe: EncodeSpec<'_>) -> RunOn {
     let replaced = source.slot.as_ref().and_then(Slot::card);
     let room = |gpu: &Gpu| {
         let limit = gpu.limit();
         replaced.is_some_and(|r| r.key == limit.key) || jobs.card_has_room(&limit)
     };
-    let gpu = pick::choose(&probe, &source.gpus.gpus, &room).cloned();
-    RunOn::new(&source.gpus, gpu)
+    pick::run_on(&source.gpus, &probe, &room)
+}
+
+/// What a playback is planned with now (PGPU-06): [`pick::planning`] with
+/// `transcode.video_codecs` and the cards that have room for another GPU
+/// encode.
+pub fn planning_encoders(
+    jobs: &Jobs,
+    detected: &crate::transcode::Detected,
+) -> spoolframe_media::encoders::Encoders {
+    let room = |gpu: &Gpu| jobs.card_has_room(&gpu.limit());
+    pick::planning(detected, &jobs.limits().video_codecs, &room)
 }
 
 /// The video of `rung`: a ladder's rung at its own height and cap, the
@@ -916,6 +930,7 @@ mod tests {
                     stalled_after: Duration::from_secs(60),
                     gpu_filters: false,
                     tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+                    video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
                 },
                 spoolframe_media::sandbox::Tool::unconfined("ffmpeg"),
             )
@@ -995,6 +1010,7 @@ mod tests {
                     stalled_after: Duration::from_secs(60),
                     gpu_filters: false,
                     tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+                    video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
                 },
                 spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
             )
@@ -1018,6 +1034,7 @@ mod tests {
                 frame_rate_millis: Some(24_000),
                 bit_depth: 8,
                 hdr: None::<HdrFormat>,
+                dolby_vision: None,
                 bit_rate: None,
             }),
             audio: Vec::new(),
@@ -1115,6 +1132,7 @@ mod tests {
                     stalled_after: Duration::from_secs(60),
                     gpu_filters: false,
                     tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+                    video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
                 },
                 spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
             )
@@ -1138,6 +1156,7 @@ mod tests {
                 frame_rate_millis: Some(24_000),
                 bit_depth: 10,
                 hdr: Some(HdrFormat::Hdr10),
+                dolby_vision: None,
                 bit_rate: None,
             }),
             audio: Vec::new(),
@@ -1232,6 +1251,7 @@ mod tests {
                     stalled_after: Duration::from_secs(60),
                     gpu_filters: true,
                     tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+                    video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
                 },
                 spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
             )
@@ -1255,6 +1275,7 @@ mod tests {
                 frame_rate_millis: Some(24_000),
                 bit_depth: 8,
                 hdr: None,
+                dolby_vision: None,
                 bit_rate: None,
             }),
             audio: Vec::new(),
@@ -1358,6 +1379,7 @@ mod tests {
                     stalled_after: Duration::from_secs(60),
                     gpu_filters: false,
                     tone_map: spoolframe_media::encoders::ToneMapSetting::Libplacebo,
+                    video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
                 },
                 spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
             )
@@ -1381,6 +1403,7 @@ mod tests {
                 frame_rate_millis: Some(24_000),
                 bit_depth: 10,
                 hdr: Some(HdrFormat::Hdr10),
+                dolby_vision: None,
                 bit_rate: None,
             }),
             audio: Vec::new(),
@@ -1463,6 +1486,7 @@ mod tests {
         use spoolframe_types::{AudioCodec, VideoCodec};
         let copy_video = Some(ConvertedVideo::Copy {
             codec: VideoCodec::H264,
+            dolby_vision: false,
         });
         let encode_video = Some(ConvertedVideo::Encode {
             codec: VideoCodec::H264,
@@ -1494,6 +1518,7 @@ mod tests {
         use spoolframe_types::{AudioCodec, VideoCodec};
         let copy_video = Some(ConvertedVideo::Copy {
             codec: VideoCodec::H264,
+            dolby_vision: false,
         });
         let encode_video = Some(ConvertedVideo::Encode {
             codec: VideoCodec::H264,
@@ -1539,6 +1564,7 @@ mod tests {
         let segments = Segments::at_keyframes(&[0, 2000, 4000], 6000);
         let copy = Some(ConvertedVideo::Copy {
             codec: spoolframe_types::VideoCodec::H264,
+            dolby_vision: false,
         });
         assert_eq!(
             segment_seek(&segments, 2, copy),

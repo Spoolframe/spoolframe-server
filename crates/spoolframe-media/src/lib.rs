@@ -25,6 +25,6 @@ pub mod vobsub;
 pub use probe::{KeyframesFrom, ProbeError, Prober};
 
 pub use descriptor::{
-    AudioStream, MAX_DURATION, MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream,
-    VideoRange, VideoStream,
+    AudioStream, DolbyVision, DvBase, MAX_DURATION, MediaDescriptor, SubtitleKind, SubtitleSource,
+    SubtitleStream, VideoRange, VideoStream,
 };

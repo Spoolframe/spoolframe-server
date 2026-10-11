@@ -104,6 +104,7 @@ pub const SETTINGS: &[Setting] = &[
     live("transcode.read_ahead_secs"),
     live("transcode.gpu_filters"),
     live("transcode.tone_map"),
+    live("transcode.video_codecs"),
     restart("subtitles.ocr"),
     restart("subtitles.ocr_threads"),
     restart("subtitles.cache_dir"),

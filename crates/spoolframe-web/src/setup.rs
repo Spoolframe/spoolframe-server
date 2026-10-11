@@ -505,8 +505,8 @@ pub const TONE_MAPS: [(&str, &str, &str); 4] = [
     (
         "auto",
         "Automatic",
-        "The GPU's own tone map, else libplacebo on the GPU, else the CPU. \
-         On the CPU while GPU filters are off.",
+        "libplacebo on the GPU where it runs, else the CPU. With GPU filters \
+         on, the GPU driver's own tone map comes first (Intel).",
     ),
     (
         "cpu",
@@ -557,6 +557,116 @@ pub fn tone_maps_line(found: &[GpuToneMap]) -> String {
 /// What the experimental section says above its switches.
 pub const EXPERIMENTAL_NOTE: &str =
     "These may change or go away in any release, without notice. The server logs the ones on.";
+
+/// One codec of `transcode.video_codecs` (PGPU-06) as Server › Settings
+/// › Playback orders it: a row of the list, on (in the setting) or off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodecRow {
+    /// `av1`, `hevc` or `h264`.
+    pub codec: &'static str,
+    pub on: bool,
+}
+
+/// The codecs a GPU may encode to, what the page calls each, and what it
+/// is good for.
+pub const VIDEO_CODECS: [(&str, &str, &str); 3] = [
+    (
+        "av1",
+        "AV1",
+        "The smallest for what it shows; HDR kept. Only newer devices decode it in hardware.",
+    ),
+    (
+        "hevc",
+        "HEVC",
+        "About half of H.264's bitrate; HDR kept. Apple devices, TVs and Android decode it.",
+    ),
+    (
+        "h264",
+        "H.264",
+        "Plays everywhere; no HDR, so HDR is tone mapped.",
+    ),
+];
+
+/// What the page says of `transcode.video_codecs`.
+pub const VIDEO_CODECS_NOTE: &str = "The codecs a GPU encodes to, the first preferred. A \
+     conversion takes the first one the device plays (in hardware, where it says) and a GPU \
+     here encodes; an HDR film for a screen that shows HDR keeps it in HEVC or AV1 rather \
+     than being tone mapped. With none left, it is encoded on the CPU, as H.264. Drag to \
+     reorder; untick to leave a codec out.";
+
+/// The rows of the setting's value, its codecs on and in its order, then
+/// the others off. Not set: AV1, HEVC, H.264, all on, the server's
+/// default.
+pub fn codec_rows(value: Option<&serde_json::Value>) -> Vec<CodecRow> {
+    let set: Vec<&str> = match value {
+        Some(serde_json::Value::Array(list)) => list.iter().filter_map(|v| v.as_str()).collect(),
+        _ => VIDEO_CODECS.iter().map(|(codec, ..)| *codec).collect(),
+    };
+    let mut rows: Vec<CodecRow> = set
+        .iter()
+        .filter_map(|word| VIDEO_CODECS.iter().find(|(codec, ..)| codec == word))
+        .map(|(codec, ..)| CodecRow { codec, on: true })
+        .collect();
+    for (codec, ..) in VIDEO_CODECS {
+        if !rows.iter().any(|row| row.codec == codec) {
+            rows.push(CodecRow { codec, on: false });
+        }
+    }
+    rows
+}
+
+/// The setting the rows say: the codecs on, in their order.
+pub fn codecs_setting(rows: &[CodecRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .filter(|row| row.on)
+            .map(|row| serde_json::Value::String(row.codec.to_owned()))
+            .collect(),
+    )
+}
+
+/// Per codec of [`VIDEO_CODECS`], the GPU encoders of `encoders` (ffmpeg's
+/// names, as the status lists them) that encode it, joined; `None` where
+/// none does. Software's (`libx264`) are not a GPU's.
+pub fn gpu_encoders_by_codec(encoders: &[String]) -> Vec<(&'static str, Option<String>)> {
+    VIDEO_CODECS
+        .iter()
+        .map(|(codec, ..)| {
+            let names: Vec<&str> = encoders
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !name.starts_with("lib"))
+                .filter(|name| {
+                    name.strip_prefix(codec)
+                        .is_some_and(|rest| rest.starts_with('_'))
+                })
+                .collect();
+            (*codec, (!names.is_empty()).then(|| names.join(", ")))
+        })
+        .collect()
+}
+
+/// `list` with the item at `from` moved to `to`, the others keeping their
+/// order. Out of range, `list` as it is.
+pub fn reordered<T: Clone>(list: &[T], from: usize, to: usize) -> Vec<T> {
+    let mut list = list.to_vec();
+    if from < list.len() && to < list.len() {
+        let item = list.remove(from);
+        list.insert(to, item);
+    }
+    list
+}
+
+/// Where a row dragged from `from` lands after the pointer moved `moved`
+/// pixels down (up, negative), rows `row` pixels apart, of `count`: the
+/// row it is over, rounded to the nearest, within the list.
+pub fn drag_target(from: usize, count: usize, moved: f64, row: f64) -> usize {
+    if count == 0 || row <= 0.0 {
+        return from;
+    }
+    let steps = (moved / row).round() as i64;
+    (from as i64 + steps).clamp(0, count as i64 - 1) as usize
+}
 
 /// One entry of `transcode.gpus` (PGPU-05) as Server › Settings ›
 /// Playback edits it: as typed, checked at Save.
@@ -1165,5 +1275,68 @@ mod tests {
         assert_eq!(display_name(&"é".repeat(64)), Ok(Some("é".repeat(64))));
         assert!(display_name(&"a".repeat(65)).is_err());
         assert!(display_name("two\nlines").is_err());
+    }
+
+    /// PGPU-06: the codec list's rows are the setting's codecs in order,
+    /// on, then the rest off; not set is the server's default; saving
+    /// writes the ones on in order.
+    #[test]
+    fn the_codec_rows_follow_the_setting() {
+        let order = |rows: &[CodecRow]| -> Vec<(&str, bool)> {
+            rows.iter().map(|r| (r.codec, r.on)).collect()
+        };
+        assert_eq!(
+            order(&codec_rows(None)),
+            [("av1", true), ("hevc", true), ("h264", true)]
+        );
+        let set = serde_json::json!(["h264", "hevc"]);
+        let rows = codec_rows(Some(&set));
+        assert_eq!(
+            order(&rows),
+            [("h264", true), ("hevc", true), ("av1", false)]
+        );
+        assert_eq!(codecs_setting(&rows), set);
+        assert_eq!(
+            order(&codec_rows(Some(&serde_json::json!([])))),
+            [("av1", false), ("hevc", false), ("h264", false)]
+        );
+        assert_eq!(
+            codecs_setting(&codec_rows(Some(&serde_json::json!([])))),
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn each_codec_names_the_gpu_encoders_here() {
+        let found = gpu_encoders_by_codec(&[
+            "h264_vaapi".into(),
+            "libx264".into(),
+            "hevc_vaapi".into(),
+            "hevc_nvenc".into(),
+        ]);
+        assert_eq!(
+            found,
+            [
+                ("av1", None),
+                ("hevc", Some("hevc_vaapi, hevc_nvenc".into())),
+                ("h264", Some("h264_vaapi".into())),
+            ]
+        );
+    }
+
+    /// Dragging, or the arrows, move one row and keep the rest in order.
+    #[test]
+    fn a_row_moves_and_the_rest_keep_their_order() {
+        let list = ["av1", "hevc", "h264"];
+        assert_eq!(reordered(&list, 0, 2), ["hevc", "h264", "av1"]);
+        assert_eq!(reordered(&list, 2, 0), ["h264", "av1", "hevc"]);
+        assert_eq!(reordered(&list, 1, 1), list);
+        assert_eq!(reordered(&list, 3, 0), list, "out of range");
+        // 44 px rows: half a row rounds to the next, and the ends hold.
+        assert_eq!(drag_target(0, 3, 30.0, 44.0), 1);
+        assert_eq!(drag_target(0, 3, 20.0, 44.0), 0);
+        assert_eq!(drag_target(2, 3, -90.0, 44.0), 0);
+        assert_eq!(drag_target(1, 3, 500.0, 44.0), 2);
+        assert_eq!(drag_target(1, 3, -500.0, 44.0), 0);
     }
 }

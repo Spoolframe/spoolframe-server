@@ -549,3 +549,89 @@ async fn a_portable_invite_s_holder_is_a_friend_on_the_relay() {
         drop(relay);
     }
 }
+
+/// A relay connection of `key`'s own to `relay`, as iroh keeps one for
+/// each endpoint: what a device relaying through it holds.
+async fn relay_connection(relay: &RelayServer, key: SecretKey) -> iroh_relay::client::Client {
+    let url: iroh::RelayUrl = format!("http://{}", relay.http_addr().unwrap())
+        .parse()
+        .unwrap();
+    // Plain HTTP: the config is required, and goes unused.
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_no_client_auth();
+    iroh_relay::client::ClientBuilder::new(url, key, iroh::dns::DnsResolver::new())
+        .tls_client_config(tls)
+        .connect()
+        .await
+        .unwrap()
+}
+
+/// Whether `connection` is still carried: it answers a ping.
+async fn carried(connection: &mut iroh_relay::client::Client) -> bool {
+    use futures_util::{SinkExt, StreamExt};
+    use iroh_relay::protos::relay::{ClientToRelayMsg, RelayToClientMsg};
+    if connection
+        .send(ClientToRelayMsg::Ping(*b"carried?"))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let pong = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(message)) = connection.next().await {
+            if message == RelayToClientMsg::Pong(*b"carried?") {
+                return true;
+            }
+        }
+        false
+    });
+    matches!(pong.await, Ok(true))
+}
+
+/// P6-07, glm L-1: a device the relay carries is cut within a recheck of
+/// signing out, though its answer is kept far longer; a device still
+/// signed in is carried on.
+#[tokio::test]
+async fn a_carried_device_signed_out_is_cut_and_one_signed_in_is_not() {
+    let (server, relay) = server_with_own_relay("relay-recheck", deny_but(true, false)).await;
+    server.add_user("alice", PASSWORD, None).await;
+    let leaving = server.client().await;
+    leaving.hello().await;
+    let session = leaving.login("alice", PASSWORD).await;
+    let staying = server.client().await;
+    staying.hello().await;
+    staying.login("alice", PASSWORD).await;
+    let mut leaving_relay = relay_connection(&relay, leaving.endpoint.secret_key().clone()).await;
+    let mut staying_relay = relay_connection(&relay, staying.endpoint.secret_key().clone()).await;
+    assert!(carried(&mut leaving_relay).await);
+    assert!(carried(&mut staying_relay).await);
+
+    assert_eq!(
+        leaving.call(Some(&session), Request::Logout).await,
+        Response::Ok(Reply::LoggedOut)
+    );
+    let signed_out = std::time::Instant::now();
+    // A recheck, one question, and room for a loaded test host.
+    let bound = own_relay::RECHECK + Duration::from_secs(5) + Duration::from_secs(2);
+    let cut = tokio::time::timeout(bound, async {
+        use futures_util::StreamExt;
+        while let Some(Ok(_)) = leaving_relay.next().await {}
+    })
+    .await;
+    assert!(
+        cut.is_ok(),
+        "still carried {:?} after signing out",
+        signed_out.elapsed()
+    );
+    assert!(signed_out.elapsed() < own_relay::CACHE);
+    assert!(carried(&mut staying_relay).await);
+    leaving.close().await;
+    staying.close().await;
+    server.stop().await;
+    drop(relay);
+}

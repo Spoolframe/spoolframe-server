@@ -1597,6 +1597,8 @@ fn PlaybackFields(
         other => other.to_owned(),
     });
     let mut shared_on_amd = use_signal(|| flag(&settings, "experimental.libplacebo_shared_on_amd"));
+    // PGPU-06: Settings only, as the tone map.
+    let codec_rows = use_signal(|| setup::codec_rows(value(&settings, "transcode.video_codecs")));
     // PGPU-05: `transcode.gpus`, advanced; the deprecated `hardware` and
     // `vaapi_device` shown only while a layer of the operator's sets one.
     let set_by = |key: &str| entry(&settings, key).and_then(|e| e.layer);
@@ -1648,6 +1650,10 @@ fn PlaybackFields(
             if settings_tab {
                 changes.push(("previews.when", Some(json!(when()))));
                 changes.push(("transcode.tone_map", Some(json!(tone_map()))));
+                changes.push((
+                    "transcode.video_codecs",
+                    Some(setup::codecs_setting(&codec_rows())),
+                ));
             }
             // Deprecated: saved only while it is set and shown.
             if old_set {
@@ -1740,6 +1746,7 @@ fn PlaybackFields(
         .as_ref()
         .map(|s| setup::tone_maps_line(&s.transcoding.gpu_tone_maps));
     let tone_map_locked = locked(&settings, "transcode.tone_map");
+    let gpu_encodes = setup::gpu_encoders_by_codec(&encoders);
     let hw_locked = locked(&settings, "transcode.hardware");
     let s = settings.clone();
     let convert = move |_| {
@@ -2010,6 +2017,16 @@ fn PlaybackFields(
                 if let Some(found) = tone_maps_found {
                     span { class: "text-xs text-ctp-subtext0", "{found}" }
                 }
+            }
+            div { class: "flex flex-col gap-2",
+                h2 { "Output codecs" }
+                p { class: "text-xs text-ctp-subtext0", {setup::VIDEO_CODECS_NOTE} }
+                super::codecs::CodecOrder {
+                    rows: codec_rows,
+                    locked: locked(&settings, "transcode.video_codecs"),
+                    gpu_encodes: gpu_encodes.clone(),
+                }
+                Note { settings: settings.clone(), setting: "transcode.video_codecs", on_changed: move |_| on_reload.call(()) }
             }
         }
         div { class: "flex flex-col gap-2",

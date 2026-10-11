@@ -356,12 +356,21 @@ transcode {
   # is off. The tone map is tone_map's.
   gpu_filters = false;
   # How HDR is tone mapped to SDR for a screen that shows no HDR:
-  # "auto" uses the job's GPU's own tone map (tonemap_vaapi, Intel), else
-  # libplacebo on the job's GPU through Vulkan (AMD, NVIDIA), else the
-  # CPU; and the CPU while gpu_filters is off. "cpu", "gpu" (the
+  # "auto" uses the job's GPU's own tone map (tonemap_vaapi, Intel) while
+  # gpu_filters is on, else libplacebo on the job's GPU through Vulkan
+  # (AMD, NVIDIA) whatever gpu_filters says, else the CPU. "cpu", "gpu" (the
   # driver's own) or "libplacebo" forces one, whatever gpu_filters says;
   # a job whose GPU cannot run it is tone mapped on the CPU.
   tone_map = "auto";
+  # The codecs a GPU encodes to, the first preferred: "av1", "hevc",
+  # "h264". A conversion takes the first one the client plays (decodes in
+  # hardware, where it says) and a GPU here encodes with room. An HDR film
+  # for a screen that shows HDR keeps it, in HEVC or AV1 at 10 bits,
+  # rather than being tone mapped: the tone map is what a conversion of
+  # HDR costs, not the codec. With no codec left, the conversion is
+  # encoded in software, which is H.264 only (libx264). [] keeps video
+  # off the GPUs.
+  video_codecs = ["av1", "hevc", "h264"];
 }
 
 # Offer bitmap subtitles (PGS, VobSub, DVB) as text, read with tesseract.

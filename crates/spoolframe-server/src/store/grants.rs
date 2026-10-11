@@ -225,22 +225,38 @@ impl Store {
             return Ok(None);
         };
         if now - last_used_at >= super::sessions::RENEW_EVERY_SECS {
-            sqlx::query(
-                "UPDATE portable_sessions SET last_used_at = ?2, \
-                   expires_at = min(?3, coalesce(credential_expires_at, ?3)) \
-                 WHERE token_hash = ?1",
-            )
-            .bind(token_hash)
-            .bind(now)
-            .bind(now + lifetime_secs)
-            .execute(&self.pool)
-            .await?;
+            self.renew_portable_session(token_hash, now, lifetime_secs)
+                .await?;
         }
         let user = parse_id(id)?;
         Ok(Some(PortableSessionUser {
             user,
             display_name: shown_name(user, display_name.as_deref()),
         }))
+    }
+
+    /// Write the renewal [`Store::use_portable_session`] found due,
+    /// unless another request wrote it since: only the first of requests
+    /// that arrive together writes, as for endpoint sessions. Whether this
+    /// one wrote.
+    async fn renew_portable_session(
+        &self,
+        token_hash: &str,
+        now: i64,
+        lifetime_secs: i64,
+    ) -> Result<bool, StoreError> {
+        let renewed = sqlx::query(
+            "UPDATE portable_sessions SET last_used_at = ?2, \
+               expires_at = min(?3, coalesce(credential_expires_at, ?3)) \
+             WHERE token_hash = ?1 AND last_used_at <= ?4",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .bind(now + lifetime_secs)
+        .bind(now - super::sessions::RENEW_EVERY_SECS)
+        .execute(&self.pool)
+        .await?;
+        Ok(renewed.rows_affected() > 0)
     }
 
     /// Whose portable session `token_hash` is, live or not, and its
@@ -320,6 +336,31 @@ mod tests {
         assert_eq!(grant.display_name.as_deref(), Some("Sam"));
         assert_eq!(grant.invite_id.as_deref(), Some("inv"));
         assert!(store.grant_of(user(8)).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn requests_that_find_a_renewal_due_together_write_it_once() {
+        let store = test_store("grant-renew-once").await;
+        store.grant_portable(user(7), None, None).await.unwrap();
+        store
+            .create_portable_session(
+                "h",
+                &binding(&store, 7),
+                "ep",
+                None,
+                Platform::Tvos,
+                store.now() + 3600,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE portable_sessions SET last_used_at = last_used_at - 120")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        // Two requests that both read the stale last use, then renew.
+        let now = store.now();
+        assert!(store.renew_portable_session("h", now, 3600).await.unwrap());
+        assert!(!store.renew_portable_session("h", now, 3600).await.unwrap());
     }
 
     #[tokio::test]

@@ -161,9 +161,28 @@ pub struct ClientCapabilities {
     /// Bits per second, from the client's settings. `None`: no limit.
     #[serde(deserialize_with = "crate::required::option")]
     pub max_bitrate: Option<u64>,
+    /// The video codecs of [`ClientCapabilities::video`] it decodes in
+    /// hardware (PGPU-06): a conversion goes to a codec the GPU encodes
+    /// only if the device decodes it in hardware, so AV1 is not sent to a
+    /// device that would decode it in software, draining its battery.
+    /// `None`: it does not say, and every codec it plays counts. Unlike
+    /// the fields above it may be left out (a revision 14 client does not
+    /// send it), and is `None` then.
+    #[serde(default)]
+    pub hardware_video: Option<BTreeSet<VideoCodec>>,
 }
 
 impl ClientCapabilities {
+    /// Whether it decodes `codec` in hardware, as it says; every codec it
+    /// plays when it does not say (PGPU-06).
+    pub fn decodes_in_hardware(&self, codec: VideoCodec) -> bool {
+        self.video.contains(&codec)
+            && self
+                .hardware_video
+                .as_ref()
+                .is_none_or(|hardware| hardware.contains(&codec))
+    }
+
     /// [`ClientCapabilities::delivery`], with the Phase 1 default filled in.
     pub fn deliveries(&self) -> Vec<Delivery> {
         if self.delivery.is_empty() {
@@ -193,6 +212,30 @@ mod tests {
             serde_json::from_str::<VideoCodec>(r#""h266""#).unwrap(),
             VideoCodec::Unknown
         );
+    }
+
+    /// PGPU-06: a client that leaves `hardware_video` out, as every one
+    /// of revision 14 does, is read, every codec it plays counting as
+    /// hardware; one that says counts only those.
+    #[test]
+    fn hardware_decoders_may_be_left_out() {
+        let old = r#"{"video":["hevc","av1"],"audio":[],"containers":[],"subtitles":[],
+            "delivery":[],"max_video":null,"max_audio_channels":null,"max_bitrate":null}"#;
+        let caps: ClientCapabilities = serde_json::from_str(old).unwrap();
+        assert_eq!(caps.hardware_video, None);
+        assert!(caps.decodes_in_hardware(VideoCodec::Av1));
+        assert!(
+            !caps.decodes_in_hardware(VideoCodec::H264),
+            "not played at all"
+        );
+        let said = ClientCapabilities {
+            hardware_video: Some([VideoCodec::Hevc].into()),
+            ..caps
+        };
+        assert!(said.decodes_in_hardware(VideoCodec::Hevc));
+        assert!(!said.decodes_in_hardware(VideoCodec::Av1));
+        let wire = serde_json::to_value(&said).unwrap();
+        assert_eq!(wire["hardware_video"], serde_json::json!(["hevc"]));
     }
 
     #[test]

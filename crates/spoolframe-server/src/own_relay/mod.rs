@@ -8,21 +8,24 @@
 //! endpoint is in ([`crate::relay_access`]), asked once a minute at most
 //! for each, and the config says which tiers are let through. A device
 //! redeeming an invite connects with the invite holder's token (P6-08),
-//! passed on in the question. Relayed traffic stays encrypted end to end;
-//! the relay learns only which keys talk.
+//! passed on in the question. An endpoint it carries is asked about again
+//! every [`RECHECK`], and cut once it is no longer let through (P6-07,
+//! glm L-1). Relayed traffic stays encrypted end to end; the relay learns
+//! only which keys talk.
 
 pub mod config;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use iroh_relay::server::{
-    AccessControl, AcmeConfig, CertConfig, ClientRequest, QuicConfig, RelayConfig as IrohRelay,
-    Server, ServerConfig, TlsConfig,
+    AccessControl, AcmeConfig, CertConfig, ClientRequest, ConnectionId, QuicConfig,
+    RelayConfig as IrohRelay, Server, ServerConfig, TlsConfig, clients::Clients,
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -34,9 +37,20 @@ use spoolframe_protocol::relay_access::{
 pub use config::{Access, RelayConfig, RelayConfigError, Serve};
 
 /// How long the main server's answer for an endpoint is kept, with or
-/// without an invite token: a device signed out, or an invite revoked, is
-/// let through this much longer at most.
+/// without an invite token. It decides only whether a connection is
+/// admitted: one that is carried is asked about again every [`RECHECK`].
 pub const CACHE: Duration = Duration::from_secs(60);
+/// How often the main server is asked again about each endpoint the relay
+/// carries (P6-07, glm L-1). iroh keeps one relay connection per endpoint
+/// for as long as it can, so a gate run only on connecting let a device
+/// signed out, or an invite revoked, keep relaying until it happened to
+/// reconnect. A carried endpoint no longer let through is cut within this
+/// and one [`ASK_WAIT`].
+pub const RECHECK: Duration = Duration::from_secs(5);
+/// The questions a recheck has open at once: the main server holds each
+/// relay connection to 4 streams, and the questions of endpoints that are
+/// connecting need room too.
+const RECHECK_ASKS: usize = 2;
 /// How long a failed answer is kept: the main server unreachable is asked
 /// again soon, but not on every connection.
 const FAILED_CACHE: Duration = Duration::from_secs(5);
@@ -67,24 +81,51 @@ pub async fn spawn(
     key: SecretKey,
     state_dir: &Path,
 ) -> Result<Server, RelayError> {
-    let gate = Gate::new(config, key).await?;
+    let gate = Arc::new(Gate::new(config, key).await?);
     let mut relay = IrohRelay::new(config.http);
     relay.tls = tls(&config.serve, state_dir).await?;
-    relay.access = Arc::new(gate);
+    relay.access = gate.clone();
     let mut server = ServerConfig::default();
     server.relay = Some(relay);
     server.quic = config.quic.map(QuicConfig::new);
-    Server::spawn(server)
+    let server = Server::spawn(server)
         .await
-        .map_err(|e| RelayError::Spawn(e.to_string()))
+        .map_err(|e| RelayError::Spawn(e.to_string()))?;
+    if let Some(service) = server.relay_service() {
+        tokio::spawn(recheck(Arc::downgrade(&gate), service.clients().clone()));
+    }
+    Ok(server)
 }
 
-/// The relay's TLS, as `serve` says; none behind a proxy.
+/// Ask again, every [`RECHECK`], about each endpoint `gate` carries, and
+/// cut the connections of those no longer let through. It ends when the
+/// relay does: the gate is the relay's, and goes with it.
+async fn recheck(gate: Weak<Gate>, clients: Clients) {
+    let mut every = tokio::time::interval(RECHECK);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        let Some(gate) = gate.upgrade() else {
+            return;
+        };
+        for (endpoint, connection) in gate.revoked().await {
+            tracing::info!(
+                endpoint = %endpoint.fmt_short(),
+                "cutting an endpoint the relay no longer lets through"
+            );
+            clients.disconnect(endpoint, Some(connection));
+        }
+    }
+}
+
+/// The relay's TLS, as `serve` says; none behind a proxy. TLS 1.3 only
+/// (P6-07, glm L-3): every iroh client speaks it, and rustls' defaults
+/// would offer 1.2 as well.
 async fn tls(serve: &Serve, state_dir: &Path) -> Result<Option<TlsConfig>, RelayError> {
     let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
-    .with_safe_default_protocol_versions()
+    .with_protocol_versions(&[&rustls::version::TLS13])
     .map_err(|e| RelayError::Rustls(e.to_string()))?
     .with_no_client_auth();
     Ok(match serve {
@@ -135,6 +176,9 @@ struct Gate {
     access: Access,
     server: EndpointId,
     asker: Asker,
+    /// The connections it let through on the main server's answer, and
+    /// what that answer was for: each is asked about again (L-1).
+    carried: parking_lot::Mutex<HashMap<ConnectionId, Asked>>,
 }
 
 impl Gate {
@@ -143,21 +187,51 @@ impl Gate {
             access: config.access,
             server: config.server.id,
             asker: Asker::new(key, config.server.clone()).await?,
+            carried: parking_lot::Mutex::default(),
         })
     }
 
-    /// Whether `endpoint` may relay through it, connected with `invite`.
-    async fn admits(&self, endpoint: EndpointId, invite: Option<String>) -> bool {
-        // The main server homes on it; and with everyone let through
-        // there is nothing to ask.
-        if endpoint == self.server || self.access.everyone {
-            return true;
-        }
-        match self.asker.tier(endpoint, invite).await {
+    /// Whether `endpoint` is let through without asking: the main server
+    /// homes on it; and with everyone let through there is nothing to ask.
+    fn needs_no_answer(&self, endpoint: EndpointId) -> bool {
+        endpoint == self.server || self.access.everyone
+    }
+
+    /// Whether an endpoint in `tier` may relay through it.
+    fn lets_through(&self, tier: Tier) -> bool {
+        match tier {
             Tier::Owner => self.access.owner,
             Tier::Friend => self.access.friends,
             Tier::Stranger | Tier::Unknown => self.access.everyone,
         }
+    }
+
+    /// The carried connections whose endpoints the main server now puts
+    /// in a tier not let through, each asked about afresh. An endpoint it
+    /// cannot answer for is kept: a main server out of reach does not cut
+    /// every device, and is no worse than before a recheck.
+    async fn revoked(&self) -> Vec<(EndpointId, ConnectionId)> {
+        let carried: Vec<(ConnectionId, Asked)> = self
+            .carried
+            .lock()
+            .iter()
+            .map(|(id, asked)| (*id, asked.clone()))
+            .collect();
+        let asked: HashSet<Asked> = carried.iter().map(|(_, asked)| asked.clone()).collect();
+        let refused: HashSet<Asked> = futures_util::stream::iter(asked)
+            .map(|asked| async move {
+                let tier = self.asker.fresh_tier(&asked).await;
+                tier.filter(|tier| !self.lets_through(*tier)).map(|_| asked)
+            })
+            .buffer_unordered(RECHECK_ASKS)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
+        carried
+            .into_iter()
+            .filter(|(_, asked)| refused.contains(asked))
+            .map(|(id, (endpoint, _))| (endpoint, id))
+            .collect()
     }
 }
 
@@ -169,7 +243,19 @@ impl AccessControl for Gate {
         let invite = request
             .auth_token()
             .filter(|token| parse_invite_token(token).is_some());
-        if self.admits(endpoint, invite).await {
+        let admitted = self.needs_no_answer(endpoint) || {
+            let tier = self.asker.tier(endpoint, invite.clone()).await;
+            let admitted = self.lets_through(tier);
+            if admitted {
+                // Kept until `on_disconnect`, which iroh-relay calls for
+                // every connection let through.
+                self.carried
+                    .lock()
+                    .insert(request.connection_id(), (endpoint, invite));
+            }
+            admitted
+        };
+        if admitted {
             tracing::debug!(endpoint = %endpoint.fmt_short(), "relaying for an endpoint");
             iroh_relay::server::Access::Allow
         } else {
@@ -180,7 +266,9 @@ impl AccessControl for Gate {
         }
     }
 
-    fn on_disconnect(&self, _endpoint: EndpointId, _connection: iroh_relay::server::ConnectionId) {}
+    fn on_disconnect(&self, _endpoint: EndpointId, connection: ConnectionId) {
+        self.carried.lock().remove(&connection);
+    }
 }
 
 /// Asks the main server which tier an endpoint is in, over one kept
@@ -271,19 +359,39 @@ impl Asker {
         if let Some(tier) = self.answers.lock().get(&asked, now) {
             return tier;
         }
-        let (tier, keep) = match tokio::time::timeout(ASK_WAIT, self.ask(&asked)).await {
-            Ok(Ok(tier)) => (tier, CACHE),
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "cannot ask the main server who an endpoint is");
-                (Tier::Stranger, FAILED_CACHE)
-            }
-            Err(_) => {
-                tracing::warn!("the main server did not say who an endpoint is in time");
-                (Tier::Stranger, FAILED_CACHE)
-            }
+        let (tier, keep) = match self.ask_within(&asked).await {
+            Some(tier) => (tier, CACHE),
+            None => (Tier::Stranger, FAILED_CACHE),
         };
         self.answers.lock().keep(asked, tier, now + keep, now);
         tier
+    }
+
+    /// `asked`'s tier, asked now whatever is kept, and kept for the
+    /// connections still to come; `None` if the main server did not say.
+    /// A failure replaces nothing: the answer kept stands.
+    async fn fresh_tier(&self, asked: &Asked) -> Option<Tier> {
+        let now = Instant::now();
+        let tier = self.ask_within(asked).await?;
+        self.answers
+            .lock()
+            .keep(asked.clone(), tier, now + CACHE, now);
+        Some(tier)
+    }
+
+    /// `asked`'s tier from the main server, waiting [`ASK_WAIT`] at most.
+    async fn ask_within(&self, asked: &Asked) -> Option<Tier> {
+        match tokio::time::timeout(ASK_WAIT, self.ask(asked)).await {
+            Ok(Ok(tier)) => Some(tier),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "cannot ask the main server who an endpoint is");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("the main server did not say who an endpoint is in time");
+                None
+            }
+        }
     }
 
     async fn ask(&self, (endpoint, invite): &Asked) -> Result<Tier, String> {

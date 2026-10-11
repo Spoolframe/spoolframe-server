@@ -2,6 +2,102 @@
 
 ## Unreleased
 
+## 0.6.2 (2026-10-10)
+
+- PGPU-06, Dolby Vision: the probe reads the DOVI record's profile,
+  level and base-layer compatibility. A Dolby Vision film for a device
+  that shows its base layer's HDR (HDR10, HLG) but not Dolby Vision is
+  copied as that base layer, no longer converted and tone mapped; for
+  one that shows Dolby Vision, profiles 5 and 8 are copied labelled so
+  (`ConvertedVideo::Copy.dolby_vision`, optional): muxed with
+  `-strict unofficial` so the init segment carries `dvvC` (checked on
+  profile 8.1), profile 8 tagged `hvc1` with
+  `SUPPLEMENTAL-CODECS="dvh1.08.LL/db1p"` (`db4h` HLG), profile 5 tagged
+  and named `dvh1.05.LL`. Profile 7 is always its HDR10 base layer, its
+  enhancement layer left out of an HLS copy. Profile 5, which has no base
+  layer, is converted through libplacebo applying its RPU: to HDR10 in
+  10 bits for a device that shows it, or tone mapped, on a card that
+  runs libplacebo whatever `transcode.tone_map` says.
+- PGPU-06 in the web UI: Settings › Playback has Output codecs, a list
+  of AV1, HEVC and H.264 to drag into order (by a pointer, a finger, the
+  arrow keys on a row's grip, or its up and down buttons), each ticked
+  to be used, saying which GPU here encodes it. The Server page's GPUs
+  card says what a 4K HDR10 film becomes for an HDR screen that decodes
+  AV1, one that does not (Apple TV 4K) and an SDR screen, and on which
+  card (admin API `TranscodingStatus.picks`); its routes table has a
+  row with HDR kept (`RouteJob::KeepHdr`), and a route whose cards are
+  all full ends in "next codec" where a playback takes the next codec,
+  software encoding H.264 alone.
+- PGPU-06, what a kept-HDR encode writes: 10 bits on every path (VA-API
+  scales its decoded frames in `p010` and uploads `p010` from memory;
+  CUDA keeps the depth) on an encoder that took a 10-bit test frame, 8
+  bits on any other; HEVC as Main 10; BT.2020 and the source's transfer
+  said in the stream. HDR10's mastering display and light level metadata
+  come through VA-API and NVENC into the fMP4 init segment (`colr`,
+  `mdcv`, `clli`), checked on an RX 7900 XTX and a GTX 1060; QSV is not
+  checked. The HLS playlist names what is written: Main 10 or AV1 10-bit
+  (`av01.0.<level>M.10`, the level by height and frame rate) and PQ or
+  HLG for kept HDR, Main or 8-bit with SDR for a tone map. Pictures
+  burned into a 10-bit output on VA-API are laid over on the CPU, as on
+  NVIDIA.
+- PGPU-06, the GPU's output codecs: `transcode.video_codecs` orders the
+  codecs a GPU encodes to, `["av1", "hevc", "h264"]` if left out. A
+  conversion takes the first the client plays (and decodes in
+  hardware, where it says: `ClientCapabilities.hardware_video`, new and
+  optional) that a card with room encodes; with none, it is encoded in
+  software, which is now H.264 only: libx265 and SVT-AV1 are no longer
+  tried or used, a spill to software included. An HDR film for a
+  screen that shows its HDR, with 10 bits allowed, keeps it in HEVC or
+  AV1 on a card whose encoder took a 10-bit test frame (detection tries
+  one per GPU HEVC and AV1 encoder) rather than going to H.264 tone
+  mapped: on an RX 7900 XTX 16× real time and 0.4 s of CPU for 30 s of
+  4K HDR10 against 2.0× and 9.2 s with libplacebo's tone map. Dolby
+  Vision keeps its base layer's HDR10 or HLG; profile 5 has none, and is
+  tone mapped. The NixOS module has `transcode.videoCodecs`.
+- A conversion whose GPUs are all full is encoded in software instead
+  of refused as busy: it decodes (and filters, where it can) on the
+  first card that decodes the source and draws on the CPU's budget,
+  `transcode.max_jobs`; only with that full too is it busy. The GPUs
+  card's routes end in "CPU" accordingly, and in "busy" only where
+  software cannot encode the codec either.
+- `transcode.tone_map = "auto"` (the default) tone maps HDR with
+  libplacebo on the job's GPU whatever `transcode.gpu_filters` says; it
+  used to stay on the CPU while GPU filters were off. With GPU filters
+  on, the GPU driver's own tone map (Intel's `tonemap_vaapi`) still
+  comes first. A 4K HDR film to 1080p SDR costs about 2 s of CPU per
+  20 s of film on a GTX 1060, against about 120 s on the CPU. `"cpu"`
+  keeps the old picture where it matters.
+- A session's renewal is written once when requests arrive together:
+  each found it due and wrote it, one after another, so a slow disk held
+  every one of them (four web UI requests waited 2.3 s). Now the first
+  writes and the rest find it written, for web, device and portable
+  sessions alike.
+- The server's own relay serves TLS 1.3 only (glm L-3), from its PEM
+  files and from ACME alike; rustls' defaults had it offer 1.2 as well.
+  Every iroh client speaks 1.3; a client of 1.2 alone is now refused.
+- The server's own relay (P6-04) cuts a device it carries once that
+  device is no longer let through (glm L-1). It asks the main server
+  again about each endpoint it carries every 5 s, so a device signed out,
+  a session ended, or an invite or grant revoked stops being relayed
+  within about 10 s; before, the gate ran only when a connection opened,
+  and iroh keeps one relay connection per endpoint, so such a device
+  kept relaying until it happened to reconnect. The 60 s answer cache now
+  bounds only whether a connection is let through. The wire is
+  unchanged.
+- The GPUs card moves from the Overview to the Server page, under "This
+  server", and says more plainly where conversions go. Each cell of its
+  table is the order the server's pick tries the cards in: the first
+  choice, then each next while the ones before are full (the pick asked
+  again with them counted full), ending in "busy" where a GPU encode is
+  then refused, since it never falls back to the CPU; a next card that
+  does less of the job says so. A tone map or burn-in on the CPU says
+  why, from the server: GPU filters being off (with a pointer to
+  Settings › Playback), a software encode, a CPU decode, or the notes a
+  job logs. What a card lacks names a filter as its API's own ("VA-API
+  tone map (tonemap_vaapi)"), so it no longer reads as contradicting
+  "Tone maps: libplacebo (own)". In the admin API, a route's card and
+  share move into `steps`, beside `busyAfter`; each step has `cpuWhy`.
+
 ## 0.6.1 (2026-10-10)
 
 - The web UI's Overview shows the GPUs (PGPU-05): a card for each GPU

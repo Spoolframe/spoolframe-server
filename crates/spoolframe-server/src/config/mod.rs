@@ -25,7 +25,7 @@ use spoolframe_media::encoders::{Hardware, HardwarePolicy, ToneMapSetting, Trans
 use spoolframe_media::gpus::{GpuEntry, Pick, Which};
 use spoolframe_media::sandbox::Mode as SandboxMode;
 use spoolframe_plex::{PathMap, PathMapping};
-use spoolframe_types::LibraryKind;
+use spoolframe_types::{LibraryKind, VideoCodec};
 
 use crate::admission::Admission;
 use crate::encode::JobLimits;
@@ -730,8 +730,8 @@ impl PreviewsConfig {
 
 /// `transcode { gpus = [ { api = "nvenc"; pick = "all"; } ]; max_jobs = 2;
 /// max_remux = 32; max_gpu_jobs = 3; scratch_dir = "…"; scratch_limit_mb =
-/// 20480; read_ahead_secs = 60; gpu_filters = false; tone_map = "auto"; }`,
-/// all optional.
+/// 20480; read_ahead_secs = 60; gpu_filters = false; tone_map = "auto";
+/// video_codecs = ["av1", "hevc", "h264"]; }`, all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct TranscodeConfig {
@@ -791,13 +791,23 @@ pub struct TranscodeConfig {
     #[ucl(default)]
     pub gpu_filters: Option<bool>,
     /// How HDR is tone mapped to SDR (PGPU-04): `"auto"` (if left out) the
-    /// job's GPU's own tone map (`tonemap_vaapi`), else libplacebo on the
-    /// job's GPU, else the CPU, and the CPU while `gpu_filters` is off;
+    /// job's GPU's own tone map (`tonemap_vaapi`) while `gpu_filters` is
+    /// on, else libplacebo on the job's GPU (whatever `gpu_filters` says),
+    /// else the CPU;
     /// `"cpu"`, `"gpu"` (the driver's own) or `"libplacebo"` forces one,
     /// whatever `gpu_filters` says, a job whose GPU cannot run it tone
     /// mapping on the CPU.
     #[ucl(default)]
     pub tone_map: Option<String>,
+    /// The codecs a GPU encodes to (PGPU-06), the first preferred: of
+    /// `"h264"`, `"hevc"` and `"av1"`, each at most once;
+    /// `["av1", "hevc", "h264"]` if left out. A conversion takes the first
+    /// the client plays (in hardware, where it says) and a GPU here
+    /// encodes, keeping an HDR film's HDR where it can; with none, it is
+    /// encoded in software, which is H.264 only. `[]`: no GPU encodes
+    /// video.
+    #[ucl(default)]
+    pub video_codecs: Option<Vec<String>>,
 }
 
 /// One entry of `transcode.gpus` as written (PGPU-05).
@@ -950,7 +960,45 @@ fn hardware_order(names: &[&str]) -> Result<HardwarePolicy, ConfigError> {
     Ok(HardwarePolicy::Ordered(order))
 }
 
+/// `transcode.video_codecs`' key, for its messages.
+const VIDEO_CODECS: &str = "transcode.video_codecs";
+
+/// `transcode.video_codecs` left out (PGPU-06): AV1 first, the smallest
+/// for what it shows and as cheap as HEVC on a GPU that encodes it, then
+/// HEVC, then H.264.
+pub const DEFAULT_VIDEO_CODECS: [VideoCodec; 3] =
+    [VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264];
+
 impl TranscodeConfig {
+    /// `video_codecs`, in order (PGPU-06).
+    pub fn video_codecs(&self) -> Result<Vec<VideoCodec>, ConfigError> {
+        let Some(words) = &self.video_codecs else {
+            return Ok(DEFAULT_VIDEO_CODECS.to_vec());
+        };
+        let invalid = |message: String| ConfigError::Invalid {
+            key: VIDEO_CODECS,
+            message,
+        };
+        let mut codecs = Vec::new();
+        for word in one_each(VIDEO_CODECS, words, r#"["av1", "hevc", "h264"]"#)? {
+            let codec = match word {
+                "h264" => VideoCodec::H264,
+                "hevc" => VideoCodec::Hevc,
+                "av1" => VideoCodec::Av1,
+                other => {
+                    return Err(invalid(format!(
+                        "{other:?}: expected \"h264\", \"hevc\" or \"av1\""
+                    )));
+                }
+            };
+            if codecs.contains(&codec) {
+                return Err(invalid(format!("{word:?} is listed twice")));
+            }
+            codecs.push(codec);
+        }
+        Ok(codecs)
+    }
+
     /// `tone_map`.
     pub fn tone_map(&self) -> Result<ToneMapSetting, ConfigError> {
         self.tone_map
@@ -989,6 +1037,7 @@ impl TranscodeConfig {
             stalled_after: crate::encode::job::STALLED_AFTER,
             gpu_filters: self.gpu_filters.unwrap_or(false),
             tone_map: self.tone_map()?,
+            video_codecs: self.video_codecs()?,
         })
     }
 
@@ -2567,6 +2616,52 @@ mod tests {
         assert_eq!(limits.read_ahead, Duration::from_secs(60));
         assert!(!limits.gpu_filters);
         assert_eq!(limits.tone_map, ToneMapSetting::Auto);
+    }
+
+    /// PGPU-06: `transcode.video_codecs` orders the GPU's codecs; AV1,
+    /// HEVC, H.264 if left out; a word it does not know, or one twice, is
+    /// refused at load; `[]` is no GPU codec.
+    #[test]
+    fn the_gpu_s_codecs_are_ordered() {
+        let codecs = |section: &str| {
+            plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} transcode {{ {section} }}"#
+            ))
+            .map(|config| {
+                config
+                    .transcode
+                    .limits(Path::new("/"))
+                    .unwrap()
+                    .video_codecs
+            })
+        };
+        assert_eq!(
+            codecs("").unwrap(),
+            [VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264]
+        );
+        assert_eq!(
+            codecs(r#"video_codecs = ["hevc", "h264"];"#).unwrap(),
+            [VideoCodec::Hevc, VideoCodec::H264]
+        );
+        assert_eq!(codecs("video_codecs = [];").unwrap(), []);
+        let unknown = codecs(r#"video_codecs = ["vp9"];"#);
+        assert!(
+            matches!(
+                &unknown,
+                Err(ConfigError::Invalid { key: "transcode.video_codecs", message })
+                    if message.contains("\"av1\"")
+            ),
+            "{unknown:?}"
+        );
+        let twice = codecs(r#"video_codecs = ["hevc", "av1", "hevc"];"#);
+        assert!(
+            matches!(
+                &twice,
+                Err(ConfigError::Invalid { key: "transcode.video_codecs", message })
+                    if message.contains("twice")
+            ),
+            "{twice:?}"
+        );
     }
 
     /// PGPU-04: `transcode.tone_map` is one of four words, for the jobs

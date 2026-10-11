@@ -64,7 +64,7 @@ pub struct Detected {
     /// What the CPU encodes alone: a conversion on no GPU runs with it.
     pub software: Arc<Encoders>,
     /// The host's GPUs that do none of the work, and why: for the
-    /// Overview, as the start lines say them.
+    /// Server page, as the start lines say them.
     pub others: Vec<Other>,
     /// The entries of `transcode.gpus` that took no card, as the log
     /// says them.
@@ -357,7 +357,7 @@ pub(crate) fn entry_label(entries: &[GpuEntry], n: usize) -> String {
 
 /// An entry that took no card: a pick that found none is how the host
 /// is; a device named and missing is a mistake. What it says, for the
-/// Overview too.
+/// Server page too.
 fn log_missing(entries: &[GpuEntry], missed: &Missing) -> String {
     let entry = entry_label(entries, missed.entry);
     if missed.fixed {
@@ -525,6 +525,12 @@ fn merge(software: &Encoders, gpus: &[Arc<Gpu>]) -> Encoders {
             libplacebo.push(*placebo);
         }
     }
+    let mut ten_bit: Vec<VideoEncoder> = Vec::new();
+    for encoder in lists.iter().flat_map(|e| e.ten_bit.iter()) {
+        if !ten_bit.iter().any(|t| t.name == encoder.name) {
+            ten_bit.push(encoder.clone());
+        }
+    }
     let any = |field: fn(&Encoders) -> bool| lists.iter().any(|e| field(e));
     Encoders {
         video,
@@ -535,6 +541,7 @@ fn merge(software: &Encoders, gpus: &[Arc<Gpu>]) -> Encoders {
         cuda_scale: any(|e| e.cuda_scale),
         cuda_overlay: any(|e| e.cuda_overlay),
         libplacebo,
+        ten_bit,
         unusable: software.unusable.clone(),
         failed: software.failed.clone(),
     }
@@ -791,7 +798,7 @@ mod tests {
         );
     }
 
-    /// The Overview's other GPUs: a card no entry takes, and one taken
+    /// The Server page's other GPUs: a card no entry takes, and one taken
     /// whose every test failed, with the first; and an entry that took
     /// none, as the log says it.
     #[tokio::test]

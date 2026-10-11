@@ -1634,6 +1634,25 @@ pub(super) mod tests {
         assert_eq!(budget.lock().gpu_jobs_by_card["vaapi:0000:03:00.0"], 2);
     }
 
+    /// A full card leaves a spilled software encode (`pick::spill`) the
+    /// CPU's budget: it starts while `max_jobs` has room, and only then
+    /// is a conversion refused as busy.
+    #[test]
+    fn a_spill_from_a_full_card_runs_on_the_cpu_budget() {
+        let budget = budget_with(2, 32, 1);
+        let xtx = card("vaapi:0000:03:00.0", None);
+        let _gpu = take_on(&budget, Load::Gpu, &xtx).unwrap();
+        assert!(
+            take_on(&budget, Load::Gpu, &xtx).is_none(),
+            "the card is full"
+        );
+        let _spilled = take(&budget, Load::Software).expect("the CPU has room");
+        assert!(
+            take(&budget, Load::Software).is_none(),
+            "half a job and one more fill 2: busy"
+        );
+    }
+
     /// A job that replaces another counts the replaced one's place as
     /// free, on the card it was on.
     #[test]
@@ -1780,6 +1799,7 @@ pub(super) mod tests {
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+            video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
         };
         let jobs = Jobs::new(limits.clone(), Tool::unconfined("ffmpeg")).unwrap();
         jobs.set_limits(JobLimits {
@@ -1924,6 +1944,7 @@ pub(super) mod tests {
             stalled_after,
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+            video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
         };
         (Jobs::new(limits, Tool::unconfined(bin)).unwrap(), tmp)
     }
@@ -2803,6 +2824,7 @@ pub(super) mod tests {
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+            video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
         };
         (Jobs::new(limits, Tool::unconfined(bin)).unwrap(), tmp)
     }
@@ -2986,6 +3008,7 @@ pub(super) mod tests {
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+            video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
         };
         let jobs = Jobs::new(limits, Tool::unconfined("ffmpeg")).unwrap();
         assert!(!jobs.dir().join("oldhandle").exists());
@@ -3014,6 +3037,7 @@ pub(super) mod tests {
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+            video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
         };
         Jobs::new(limits, Tool::unconfined("ffmpeg")).unwrap();
         assert_eq!(std::fs::read(&key).unwrap(), b"secret");

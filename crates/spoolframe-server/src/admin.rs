@@ -359,6 +359,10 @@ impl StatusSource {
                     }
                     None => Vec::new(),
                 },
+                picks: match &limits {
+                    Some(limits) => crate::gpu_status::picks(&detected, &limits.video_codecs),
+                    None => Vec::new(),
+                },
                 budget: self.jobs.as_ref().map(|jobs| {
                     let now = jobs.budget();
                     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);

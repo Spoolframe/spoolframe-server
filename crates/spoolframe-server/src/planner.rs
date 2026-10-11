@@ -31,18 +31,18 @@
 //!   `Pictures` preference: it no longer forces a burn-in on a client
 //!   that can draw them. The wire value stays (protocol 7).
 
-use spoolframe_media::encoders::Encoders;
+use spoolframe_media::encoders::{Encoders, VideoEncoder};
 use spoolframe_media::ocr::Ocr;
 use spoolframe_media::{
-    MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, VideoStream, codecs,
+    DvBase, MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, VideoStream, codecs,
 };
 use spoolframe_protocol::{
     AudioAction, BitmapSubtitles, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, PlannedAudio,
     PlannedSubtitle, PlaybackPlan, Quality, Selection, SubtitleAction, SubtitleDelivery,
 };
 use spoolframe_types::{
-    AudioCodec, BitmapPreference, ClientCapabilities, Container, Delivery, SubtitleFormat,
-    VideoCodec,
+    AudioCodec, BitmapPreference, ClientCapabilities, Container, Delivery, HdrFormat,
+    SubtitleFormat, VideoCodec,
 };
 
 /// How a picked bitmap subtitle is shown: as the client asked, or, when it
@@ -394,12 +394,69 @@ fn over_limits(video: &VideoStream, caps: &ClientCapabilities) -> Vec<String> {
             video.bit_depth
         ));
     }
-    if let (Some(shown), Some(hdr)) = (&limits.hdr, video.hdr)
-        && !shown.contains(&hdr)
-    {
-        over.push(format!("video: {hdr} is not shown as HDR; tone-mapped"));
+    match (hdr_shown(video, caps), video.hdr) {
+        (Showing::No, Some(HdrFormat::DolbyVision)) if video.needs_rpu() => over.push(
+            "video: dolby_vision profile 5 is not shown, and has no base layer to show instead; \
+             converted"
+                .into(),
+        ),
+        (Showing::No, Some(hdr)) => {
+            over.push(format!("video: {hdr} is not shown as HDR; tone-mapped"));
+        }
+        _ => {}
     }
     over
+}
+
+/// How a client shows `video`'s picture as it is (PGPU-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Showing {
+    /// SDR, or HDR in a format it shows.
+    AsIs,
+    /// Dolby Vision profile 5 or 8, which it shows as Dolby Vision: a copy
+    /// is labelled so.
+    DolbyVision,
+    /// Dolby Vision it does not show as such (or profile 7, which no
+    /// streaming player does), whose base layer it shows: HDR10, HLG or
+    /// SDR. A copy is that base layer, the RPU ignored.
+    Base,
+    /// Neither: the picture is converted.
+    No,
+}
+
+fn hdr_shown(video: &VideoStream, caps: &ClientCapabilities) -> Showing {
+    let Some(hdr) = video.hdr else {
+        return Showing::AsIs;
+    };
+    let shown = caps
+        .max_video
+        .as_ref()
+        .and_then(|limits| limits.hdr.as_ref());
+    let shows = |format: HdrFormat| shown.is_none_or(|shown| shown.contains(&format));
+    if hdr != HdrFormat::DolbyVision {
+        return if shows(hdr) {
+            Showing::AsIs
+        } else {
+            Showing::No
+        };
+    }
+    let streamable = video.dolby_vision.is_none_or(|dv| dv.streamable());
+    if streamable && shows(HdrFormat::DolbyVision) {
+        return Showing::DolbyVision;
+    }
+    let base = match video.dolby_vision.map(|dv| dv.base()) {
+        Some(DvBase::Hdr10) => shows(HdrFormat::Hdr10),
+        Some(DvBase::Hlg) => shows(HdrFormat::Hlg),
+        Some(DvBase::Sdr) => true,
+        Some(DvBase::None) => false,
+        // No record read: the transfer says what the base layer is.
+        None => match video.range() {
+            spoolframe_media::VideoRange::Pq => shows(HdrFormat::Hdr10),
+            spoolframe_media::VideoRange::Hlg => shows(HdrFormat::Hlg),
+            spoolframe_media::VideoRange::Sdr => true,
+        },
+    };
+    if base { Showing::Base } else { Showing::No }
 }
 
 fn mbits(bits: u64) -> String {
@@ -572,6 +629,7 @@ fn converted(
         None => None,
         Some(v) if fit.video.is_empty() && !burn_in => Some(ConvertedVideo::Copy {
             codec: codecs::video_codec(&v.codec),
+            dolby_vision: hdr_shown(v, caps) == Showing::DolbyVision,
         }),
         Some(v) => Some(encode_video(v, caps, encoders, audio.as_ref())?),
     };
@@ -709,32 +767,56 @@ fn worth(height: u32, codec: VideoCodec) -> u64 {
     2 * scaled(least, codec)
 }
 
-/// The first codec, in the server's order of preference (hardware first),
-/// that the client plays.
+/// The video encode for `caps` (PGPU-06): the first of `encoders`' video
+/// encoders, in the order the server prefers them (`transcode.video_codecs`
+/// for the GPUs' codecs, then software H.264), that the client plays. A
+/// GPU's codec counts only where the client decodes it in hardware, as it
+/// says ([`ClientCapabilities::decodes_in_hardware`]); a software encode
+/// only as H.264, the one software codec the server encodes. An HDR film
+/// for a client that shows its HDR, with 10 bits allowed, takes the first
+/// that keeps it: HEVC or AV1 on a GPU encoder that took a 10-bit test
+/// frame. Anything else HDR is tone mapped to SDR.
 fn encode_video(
     video: &VideoStream,
     caps: &ClientCapabilities,
     encoders: &Encoders,
     audio: Option<&ConvertedAudio>,
 ) -> Result<ConvertedVideo, String> {
-    let codec = encoders
-        .video
-        .iter()
-        .map(|e| e.codec)
-        .find(|c| caps.video.contains(c))
-        .ok_or("video: the server can encode no codec this client plays")?;
     let limits = caps.max_video.clone().unwrap_or_default();
     let height = limits
         .height
         .map_or(video.height, |max| video.height.min(max));
-    let hdr_shown = match (&limits.hdr, video.hdr) {
-        (_, None) => true,
-        (None, Some(_)) => true,
-        (Some(shown), Some(hdr)) => shown.contains(&hdr),
-    };
-    // 8-bit output where the client asks for it; H.264 carries no HDR.
+    // 8-bit output where the client asks for it.
     let eight_bit = limits.bit_depth.is_some_and(|b| b < 10);
-    let tone_map = video.hdr.is_some() && (!hdr_shown || eight_bit || codec == VideoCodec::H264);
+    // The HDR an encode of it keeps (Dolby Vision's base layer's), where
+    // the client shows that. Dolby Vision profile 5 has no base layer to
+    // keep, but libplacebo, applying its RPU, makes HDR10 of it.
+    let keepable = if video.needs_rpu() {
+        Some(HdrFormat::Hdr10)
+    } else {
+        video.keepable_hdr()
+    };
+    let keep = keepable
+        .filter(|hdr| limits.hdr.as_ref().is_none_or(|shown| shown.contains(hdr)))
+        .filter(|_| !eight_bit);
+    let mut candidates = encoders.video.iter().filter(|e| match e.hardware {
+        Some(_) => caps.decodes_in_hardware(e.codec),
+        None => e.codec == VideoCodec::H264 && caps.video.contains(&VideoCodec::H264),
+    });
+    let keeps = |e: &VideoEncoder| {
+        keep.is_some()
+            && e.codec != VideoCodec::H264
+            && e.hardware.is_some()
+            && encoders.encodes_ten_bit(e)
+            && (!video.needs_rpu() || e.hardware.is_some_and(|h| encoders.libplacebo(h).is_some()))
+    };
+    let chosen = candidates
+        .clone()
+        .find(|e| keeps(e))
+        .or_else(|| candidates.next())
+        .ok_or("video: the server can encode no codec this client plays")?;
+    let codec = chosen.codec;
+    let tone_map = video.hdr.is_some() && !keeps(chosen);
     // Leave room for the audio inside the client's limit.
     let audio_bits = match audio.map(|a| a.action) {
         Some(AudioAction::Encode { bitrate, .. }) => bitrate,
@@ -935,7 +1017,7 @@ pub fn summary(plan: &PlaybackPlan) -> PlanSummary {
             },
             delivery: *delivery,
             video: video.map_or_else(none, |video| match video {
-                ConvertedVideo::Copy { codec } => format!("copy:{codec}"),
+                ConvertedVideo::Copy { codec, .. } => format!("copy:{codec}"),
                 ConvertedVideo::Encode {
                     codec,
                     height,
@@ -1065,6 +1147,7 @@ mod tests {
             cuda_scale: false,
             cuda_overlay: false,
             libplacebo: Vec::new(),
+            ten_bit: Vec::new(),
             unusable: Vec::new(),
             failed: Vec::new(),
         }
@@ -1116,6 +1199,7 @@ mod tests {
                 frame_rate_millis: Some(23_976),
                 bit_depth: 8,
                 hdr: None,
+                dolby_vision: None,
                 bit_rate: None,
             }),
             audio: vec![audio(1, "dts", true), audio(2, "aac", false)],
@@ -1363,7 +1447,8 @@ mod tests {
         assert_eq!(
             video,
             ConvertedVideo::Copy {
-                codec: VideoCodec::Hevc
+                codec: VideoCodec::Hevc,
+                dolby_vision: false,
             }
         );
         assert_eq!(
@@ -1416,7 +1501,8 @@ mod tests {
         assert_eq!(
             video,
             ConvertedVideo::Copy {
-                codec: VideoCodec::Hevc
+                codec: VideoCodec::Hevc,
+                dolby_vision: false,
             }
         );
         assert_eq!(
@@ -1443,7 +1529,8 @@ mod tests {
         assert_eq!(
             video,
             ConvertedVideo::Copy {
-                codec: VideoCodec::Hevc
+                codec: VideoCodec::Hevc,
+                dolby_vision: false,
             }
         );
         assert_eq!(subtitle, None);
@@ -1470,7 +1557,8 @@ mod tests {
         assert_eq!(
             video,
             ConvertedVideo::Copy {
-                codec: VideoCodec::Hevc
+                codec: VideoCodec::Hevc,
+                dolby_vision: false,
             }
         );
         assert_eq!(subtitle, None);
@@ -1790,6 +1878,338 @@ mod tests {
         );
     }
 
+    /// What the server plans with on a GPU that encodes AV1, HEVC and
+    /// H.264 (PGPU-06): `transcode.video_codecs`' order, then software
+    /// H.264; `ten_bit` the encoders that took a 10-bit frame.
+    fn gpu_encoders(order: &[(VideoCodec, &str)], ten_bit: &[&str]) -> Encoders {
+        let mut encoders = dev_encoders();
+        encoders.video = order
+            .iter()
+            .map(|&(codec, name)| VideoEncoder {
+                codec,
+                name: name.into(),
+                hardware: (!name.starts_with("lib")).then_some(Hardware::Vaapi),
+            })
+            .collect();
+        encoders.ten_bit = encoders
+            .video
+            .iter()
+            .filter(|e| ten_bit.contains(&e.name.as_str()))
+            .cloned()
+            .collect();
+        encoders
+    }
+
+    const AV1_HEVC_H264: [(VideoCodec, &str); 4] = [
+        (VideoCodec::Av1, "av1_vaapi"),
+        (VideoCodec::Hevc, "hevc_vaapi"),
+        (VideoCodec::H264, "h264_vaapi"),
+        (VideoCodec::H264, "libx264"),
+    ];
+
+    /// An Apple TV that plays AV1 too, showing HDR10, over HLS.
+    fn hdr_tv() -> ClientCapabilities {
+        ClientCapabilities {
+            video: [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1].into(),
+            max_video: Some(VideoLimits {
+                height: Some(1080),
+                hdr: Some([HdrFormat::Hdr10].into()),
+                ..VideoLimits::default()
+            }),
+            ..avplayer()
+        }
+    }
+
+    fn encoded(
+        caps: &ClientCapabilities,
+        d: &MediaDescriptor,
+        encoders: &Encoders,
+    ) -> (VideoCodec, bool) {
+        match converted(plan_with(d, Some(caps), picked(1, None), encoders)).2 {
+            ConvertedVideo::Encode {
+                codec, tone_map, ..
+            } => (codec, tone_map),
+            other => panic!("not an encode: {other:?}"),
+        }
+    }
+
+    /// PGPU-06: an HDR10 film for a client that shows HDR10 and decodes
+    /// AV1 in hardware keeps its HDR in AV1, the first of the order, on a
+    /// GPU that writes 10 bits; not H.264 tone mapped.
+    #[test]
+    fn an_hdr_film_keeps_its_hdr_in_the_first_codec_of_the_order() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        assert_eq!(
+            encoded(&hdr_tv(), &hevc_dts(), &encoders),
+            (VideoCodec::Av1, false)
+        );
+    }
+
+    /// A client that says it decodes only HEVC and H.264 in hardware gets
+    /// HEVC, HDR kept: AV1 would be decoded in software.
+    #[test]
+    fn a_codec_the_client_decodes_in_software_is_passed_over() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let caps = ClientCapabilities {
+            hardware_video: Some([VideoCodec::H264, VideoCodec::Hevc].into()),
+            ..hdr_tv()
+        };
+        assert_eq!(
+            encoded(&caps, &hevc_dts(), &encoders),
+            (VideoCodec::Hevc, false)
+        );
+    }
+
+    /// A client that shows no HDR: the first codec, tone mapped.
+    #[test]
+    fn an_hdr_film_for_an_sdr_screen_is_tone_mapped_in_the_first_codec() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let mut caps = hdr_tv();
+        caps.max_video.as_mut().unwrap().hdr = Some(BTreeSet::new());
+        assert_eq!(
+            encoded(&caps, &hevc_dts(), &encoders),
+            (VideoCodec::Av1, true)
+        );
+        // Nor is HDR kept for a client limited to 8 bits.
+        let mut caps = hdr_tv();
+        caps.max_video.as_mut().unwrap().bit_depth = Some(8);
+        assert_eq!(
+            encoded(&caps, &hevc_dts(), &encoders),
+            (VideoCodec::Av1, true)
+        );
+    }
+
+    /// An AV1 encoder that took no 10-bit frame does not keep HDR; HEVC's
+    /// does, so HEVC is taken over AV1, first in the order.
+    #[test]
+    fn hdr_goes_to_the_first_codec_that_keeps_it() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["hevc_vaapi"]);
+        assert_eq!(
+            encoded(&hdr_tv(), &hevc_dts(), &encoders),
+            (VideoCodec::Hevc, false)
+        );
+        // None keeps it: the first, tone mapped.
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &[]);
+        assert_eq!(
+            encoded(&hdr_tv(), &hevc_dts(), &encoders),
+            (VideoCodec::Av1, true)
+        );
+    }
+
+    /// No GPU codec the client plays: software H.264, tone mapped. A
+    /// software HEVC or AV1 encoder, were one listed, is never taken.
+    #[test]
+    fn with_no_gpu_codec_left_it_is_software_h264() {
+        let encoders = gpu_encoders(
+            &[
+                (VideoCodec::Av1, "av1_vaapi"),
+                (VideoCodec::Hevc, "libx265"),
+                (VideoCodec::H264, "libx264"),
+            ],
+            &["av1_vaapi"],
+        );
+        let caps = ClientCapabilities {
+            video: [VideoCodec::H264, VideoCodec::Hevc].into(),
+            ..hdr_tv()
+        };
+        assert_eq!(
+            encoded(&caps, &hevc_dts(), &encoders),
+            (VideoCodec::H264, true)
+        );
+        // `video_codecs = ["h264"]`: H.264 on the GPU, tone mapped.
+        let encoders = gpu_encoders(
+            &[
+                (VideoCodec::H264, "h264_vaapi"),
+                (VideoCodec::H264, "libx264"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            encoded(&hdr_tv(), &hevc_dts(), &encoders),
+            (VideoCodec::H264, true)
+        );
+        // A client that plays only HEVC, and no GPU encodes it: nothing.
+        let hevc_only = ClientCapabilities {
+            video: [VideoCodec::Hevc].into(),
+            ..hdr_tv()
+        };
+        let encoders = gpu_encoders(
+            &[(VideoCodec::Hevc, "libx265"), (VideoCodec::H264, "libx264")],
+            &[],
+        );
+        let plan = plan_with(&hevc_dts(), Some(&hevc_only), picked(1, None), &encoders);
+        assert!(
+            reasons(plan)
+                .iter()
+                .any(|r| r == "video: the server can encode no codec this client plays")
+        );
+    }
+
+    /// Dolby Vision keeps its base layer's HDR10 through an encode, for
+    /// a client that shows HDR10; profile 5 has none, and is tone mapped.
+    #[test]
+    fn dolby_vision_keeps_its_hdr10_base_layer_but_profile_5() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let dv = |profile| {
+            let mut d = hevc_dts();
+            let v = d.video.as_mut().unwrap();
+            v.hdr = Some(HdrFormat::DolbyVision);
+            v.color_transfer = Some("smpte2084".into());
+            v.dolby_vision = Some(spoolframe_media::DolbyVision {
+                profile,
+                level: 6,
+                compatibility: if profile == 5 { 0 } else { 1 },
+            });
+            d
+        };
+        assert_eq!(
+            encoded(&hdr_tv(), &dv(8), &encoders),
+            (VideoCodec::Av1, false)
+        );
+        assert_eq!(
+            encoded(&hdr_tv(), &dv(5), &encoders),
+            (VideoCodec::Av1, true)
+        );
+    }
+
+    /// A 4K Dolby Vision HEVC film of `profile` (and base-layer
+    /// compatibility), its base layer PQ, with DTS sound and subtitles.
+    fn dolby_vision(profile: u8, compatibility: u8) -> MediaDescriptor {
+        let mut d = hevc_dts();
+        let v = d.video.as_mut().unwrap();
+        v.hdr = Some(HdrFormat::DolbyVision);
+        v.color_transfer = Some("smpte2084".into());
+        v.dolby_vision = Some(spoolframe_media::DolbyVision {
+            profile,
+            level: 6,
+            compatibility,
+        });
+        d
+    }
+
+    /// An Apple TV at 4K that shows `shown`, over HLS.
+    fn showing(shown: &[HdrFormat]) -> ClientCapabilities {
+        ClientCapabilities {
+            max_video: Some(VideoLimits {
+                hdr: Some(shown.iter().copied().collect()),
+                ..VideoLimits::default()
+            }),
+            ..avplayer()
+        }
+    }
+
+    fn video_of(plan: PlaybackPlan) -> ConvertedVideo {
+        converted(plan).2
+    }
+
+    /// PGPU-06: profile 8.1 for a client that shows HDR10 but not Dolby
+    /// Vision is its base layer copied, not converted and tone mapped;
+    /// for one that shows Dolby Vision, copied and labelled so; for one
+    /// that shows neither, converted.
+    #[test]
+    fn dolby_vision_8_is_copied_as_its_base_layer_or_labelled() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let plan = |caps: &ClientCapabilities| {
+            video_of(plan_with(
+                &dolby_vision(8, 1),
+                Some(caps),
+                picked(1, None),
+                &encoders,
+            ))
+        };
+        assert_eq!(
+            plan(&showing(&[HdrFormat::Hdr10])),
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+                dolby_vision: false,
+            }
+        );
+        assert_eq!(
+            plan(&showing(&[HdrFormat::Hdr10, HdrFormat::DolbyVision])),
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+                dolby_vision: true,
+            }
+        );
+        assert!(matches!(
+            plan(&showing(&[])),
+            ConvertedVideo::Encode { tone_map: true, .. }
+        ));
+        // An HLG base layer (8.4) is shown where HLG is.
+        let hlg = video_of(plan_with(
+            &dolby_vision(8, 4),
+            Some(&showing(&[HdrFormat::Hlg])),
+            picked(1, None),
+            &encoders,
+        ));
+        assert!(matches!(
+            hlg,
+            ConvertedVideo::Copy {
+                dolby_vision: false,
+                ..
+            }
+        ));
+    }
+
+    /// Profile 7, which no streaming player shows as Dolby Vision, is its
+    /// HDR10 base layer even to a client that shows Dolby Vision.
+    #[test]
+    fn dolby_vision_7_is_its_hdr10_base_layer() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let plan = video_of(plan_with(
+            &dolby_vision(7, 6),
+            Some(&showing(&[HdrFormat::Hdr10, HdrFormat::DolbyVision])),
+            picked(1, None),
+            &encoders,
+        ));
+        assert_eq!(
+            plan,
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+                dolby_vision: false,
+            }
+        );
+    }
+
+    /// Profile 5 has no base layer: copied and labelled for a client that
+    /// shows Dolby Vision; for one that shows only HDR10, converted with
+    /// libplacebo applying the RPU, HDR10 kept, where a GPU here runs it;
+    /// tone mapped where none does.
+    #[test]
+    fn dolby_vision_5_is_labelled_or_made_hdr10_by_libplacebo() {
+        use spoolframe_media::encoders::{Libplacebo, VulkanDevice};
+        let mut encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let p5 = dolby_vision(5, 0);
+        let plan = |caps: &ClientCapabilities, encoders: &Encoders| {
+            video_of(plan_with(&p5, Some(caps), picked(1, None), encoders))
+        };
+        assert_eq!(
+            plan(&showing(&[HdrFormat::DolbyVision]), &encoders),
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+                dolby_vision: true,
+            }
+        );
+        // No libplacebo: tone mapped.
+        assert!(matches!(
+            plan(&showing(&[HdrFormat::Hdr10]), &encoders),
+            ConvertedVideo::Encode { tone_map: true, .. }
+        ));
+        encoders.libplacebo = vec![Libplacebo {
+            hardware: Hardware::Vaapi,
+            device: VulkanDevice::Own,
+        }];
+        assert!(matches!(
+            plan(&showing(&[HdrFormat::Hdr10]), &encoders),
+            // This Apple TV plays no AV1: HEVC.
+            ConvertedVideo::Encode {
+                codec: VideoCodec::Hevc,
+                tone_map: false,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn a_progressive_client_gets_matroska_with_everything_that_fits_copied() {
         let caps = ClientCapabilities {
@@ -1810,7 +2230,8 @@ mod tests {
         assert_eq!(
             video,
             ConvertedVideo::Copy {
-                codec: VideoCodec::H264
+                codec: VideoCodec::H264,
+                dolby_vision: false,
             }
         );
         assert_eq!(
@@ -1856,7 +2277,8 @@ mod tests {
         assert_eq!(
             video,
             ConvertedVideo::Copy {
-                codec: VideoCodec::H264
+                codec: VideoCodec::H264,
+                dolby_vision: false,
             }
         );
         assert!(matches!(audio.action, AudioAction::Copy { .. }));
@@ -2087,7 +2509,8 @@ mod tests {
         assert_eq!(
             video,
             ConvertedVideo::Copy {
-                codec: VideoCodec::H264
+                codec: VideoCodec::H264,
+                dolby_vision: false,
             }
         );
         assert_eq!(
@@ -2161,7 +2584,8 @@ mod tests {
         assert_eq!(
             video,
             ConvertedVideo::Copy {
-                codec: VideoCodec::H264
+                codec: VideoCodec::H264,
+                dolby_vision: false,
             }
         );
         assert_eq!(
@@ -2349,6 +2773,7 @@ mod tests {
             container: Container::Mp4,
             video: Some(ConvertedVideo::Copy {
                 codec: VideoCodec::Hevc,
+                dolby_vision: false,
             }),
             audio: Some(ConvertedAudio {
                 index: 0,
@@ -2440,6 +2865,7 @@ mod tests {
             container: Container::Mp4,
             video: Some(ConvertedVideo::Copy {
                 codec: VideoCodec::H264,
+                dolby_vision: false,
             }),
             audio: Some(ConvertedAudio {
                 index: 0,

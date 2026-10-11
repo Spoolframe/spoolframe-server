@@ -273,6 +273,7 @@ async fn a_gpu_decode_that_fails_at_once_finishes_in_software() {
             stalled_after: Duration::from_secs(60),
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+            video_codecs: spoolframe_server::config::DEFAULT_VIDEO_CODECS.to_vec(),
         },
         Tool::new("ffmpeg", gpu.sandbox.clone()),
     )

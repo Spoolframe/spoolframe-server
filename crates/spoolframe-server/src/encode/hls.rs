@@ -313,23 +313,58 @@ fn stream_inf(
     subtitles: bool,
 ) -> String {
     let mut codecs = Vec::new();
+    let mut supplemental = None;
     let mut resolution = None;
     let mut picture = None;
     let mut rate = Rate::default();
     if let (Some(plan), Some(source)) = (video, &descriptor.video) {
         // A copied stream is the source's; an encode's level is not known
         // before it runs.
-        let (codec, height, cap, level) = match plan {
-            ConvertedVideo::Copy { codec } => (codec, source.height, None, source.level),
+        // What is written: a copy is the source; an encode keeps its depth
+        // only in HEVC or AV1 not tone mapped (PGPU-06), H.264 and a tone
+        // map being 8-bit.
+        let (codec, height, cap, level, depth) = match plan {
+            ConvertedVideo::Copy { codec, .. } => {
+                (codec, source.height, None, source.level, source.bit_depth)
+            }
             ConvertedVideo::Encode {
                 codec,
                 height,
                 max_bitrate,
-                ..
-            } => (codec, height, max_bitrate, None),
-            ConvertedVideo::Unknown => (VideoCodec::Unknown, source.height, None, None),
+                tone_map,
+            } => {
+                let depth = if tone_map || codec == VideoCodec::H264 {
+                    8
+                } else {
+                    source.bit_depth
+                };
+                (codec, height, max_bitrate, None, depth)
+            }
+            ConvertedVideo::Unknown => (VideoCodec::Unknown, source.height, None, None, 8),
         };
-        codecs.push(video_codec_string(codec, source.bit_depth, height, level));
+        let fast = source.frame_rate_millis.is_some_and(|rate| rate > 30_000);
+        // A Dolby Vision copy the client shows as such (PGPU-06): profile
+        // 5 is `dvh1` itself; profile 8 is HEVC with Dolby Vision beside,
+        // its base layer's brand saying what it is without it.
+        let dolby_vision = match plan {
+            ConvertedVideo::Copy {
+                dolby_vision: true, ..
+            } => source.dolby_vision,
+            _ => None,
+        };
+        match dolby_vision {
+            Some(dv) if dv.profile == 5 => codecs.push(format!("dvh1.05.{:02}", dv.level)),
+            Some(dv) => {
+                codecs.push(video_codec_string(codec, depth, height, level, fast));
+                let brand = match dv.compatibility {
+                    4 => "db4h",
+                    2 => "db2g",
+                    _ => "db1p",
+                };
+                supplemental = Some(format!("dvh1.{:02}.{:02}/{brand}", dv.profile, dv.level));
+            }
+            None => codecs.push(video_codec_string(codec, depth, height, level, fast)),
+        }
         let width =
             (u64::from(source.width) * u64::from(height) / u64::from(source.height.max(1))) as u32;
         resolution = Some((width & !1, height));
@@ -337,6 +372,9 @@ fn stream_inf(
         // keeps the source's transfer. No conversion changes the rate.
         let range = match plan {
             ConvertedVideo::Encode { tone_map: true, .. } => VideoRange::Sdr,
+            // Dolby Vision profile 5, labelled or made HDR10: PQ, whatever
+            // its own transfer says.
+            _ if source.needs_rpu() => VideoRange::Pq,
             _ => source.range(),
         };
         picture = Some((source.frame_rate_millis, range));
@@ -370,6 +408,9 @@ fn stream_inf(
     // An empty CODECS is not valid HLS; none is.
     if !codecs.is_empty() {
         let _ = write!(text, ",CODECS=\"{}\"", codecs.join(","));
+    }
+    if let Some(supplemental) = supplemental {
+        let _ = write!(text, ",SUPPLEMENTAL-CODECS=\"{supplemental}\"");
     }
     if let Some((w, h)) = resolution {
         let _ = write!(text, ",RESOLUTION={w}x{h}");
@@ -506,6 +547,7 @@ fn video_codec_string(
     bit_depth: u32,
     height: u32,
     level: Option<u32>,
+    fast: bool,
 ) -> String {
     match codec {
         // High profile; level 4.0 to 1080p, 5.1 above.
@@ -523,7 +565,18 @@ fn video_codec_string(
             let level = level.unwrap_or(if height > 1080 { 153 } else { 120 });
             format!("hvc1.{profile}.L{level}.B0")
         }
-        VideoCodec::Av1 => "av01.0.08M.08".into(),
+        // Main profile, main tier, 8 or 10 bits (PGPU-06); level 4.0
+        // (`08`) to 1080p, above it 5.0 (`12`), 5.1 (`13`) over 30 frames
+        // a second: `seq_level_idx`, as RFC 6381's AV1 form writes it.
+        VideoCodec::Av1 => {
+            let level = match (height > 1080, fast) {
+                (false, _) => 8,
+                (true, false) => 12,
+                (true, true) => 13,
+            };
+            let depth = if bit_depth > 8 { 10 } else { 8 };
+            format!("av01.0.{level:02}M.{depth:02}")
+        }
         other => other.as_str().into(),
     }
 }
@@ -678,11 +731,11 @@ mod tests {
     #[test]
     fn hevc_main_10_at_4k_is_named_for_the_player() {
         assert_eq!(
-            video_codec_string(VideoCodec::Hevc, 10, 2160, None),
+            video_codec_string(VideoCodec::Hevc, 10, 2160, None, false),
             "hvc1.2.4.L153.B0"
         );
         assert_eq!(
-            video_codec_string(VideoCodec::H264, 8, 720, None),
+            video_codec_string(VideoCodec::H264, 8, 720, None, false),
             "avc1.640028"
         );
         assert_eq!(audio_codec_string(AudioCodec::Eac3), Some("ec-3"));
@@ -707,6 +760,7 @@ mod tests {
                 frame_rate_millis: Some(23_976),
                 bit_depth: 10,
                 hdr: None,
+                dolby_vision: None,
                 bit_rate: None,
             }),
             audio: Vec::new(),
@@ -716,6 +770,7 @@ mod tests {
 
     const COPY_HEVC: Option<ConvertedVideo> = Some(ConvertedVideo::Copy {
         codec: VideoCodec::Hevc,
+        dolby_vision: false,
     });
 
     /// The `EXT-X-STREAM-INF` line.
@@ -888,6 +943,86 @@ mod tests {
         // Encoded as it is: still PQ.
         let kept = multivariant_playlist(&pq, encode(VideoCodec::Hevc, false), None, None);
         assert!(variant(&kept).ends_with(",VIDEO-RANGE=PQ"), "{kept}");
+    }
+
+    /// PGPU-06: a Dolby Vision copy labelled so is named so: profile 8.1
+    /// as HEVC with `dvh1.08.LL/db1p` beside it (8.4's `db4h`, HLG),
+    /// profile 5 as `dvh1.05.LL`, PQ; copied as its base layer, plain HEVC.
+    #[test]
+    fn a_dolby_vision_copy_is_named_for_the_player() {
+        let dv = |profile, compatibility, transfer| {
+            let mut film = film(transfer);
+            let video = film.video.as_mut().unwrap();
+            video.hdr = Some(spoolframe_types::HdrFormat::DolbyVision);
+            video.dolby_vision = Some(spoolframe_media::DolbyVision {
+                profile,
+                level: 6,
+                compatibility,
+            });
+            film
+        };
+        let copy = |dolby_vision| {
+            Some(ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+                dolby_vision,
+            })
+        };
+        let p81 = multivariant_playlist(&dv(8, 1, "smpte2084"), copy(true), None, None);
+        let line = variant(&p81);
+        assert!(line.contains("CODECS=\"hvc1.2.4."), "{p81}");
+        assert!(
+            line.contains(",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\""),
+            "{p81}"
+        );
+        assert!(line.ends_with(",VIDEO-RANGE=PQ"), "{p81}");
+        let p84 = multivariant_playlist(&dv(8, 4, "arib-std-b67"), copy(true), None, None);
+        assert!(variant(&p84).contains("dvh1.08.06/db4h"), "{p84}");
+        assert!(variant(&p84).ends_with(",VIDEO-RANGE=HLG"), "{p84}");
+        // Profile 5's transfer as a player reads it says nothing: PQ.
+        let p5 = multivariant_playlist(&dv(5, 0, "unknown"), copy(true), None, None);
+        assert!(variant(&p5).contains("CODECS=\"dvh1.05.06"), "{p5}");
+        assert!(!variant(&p5).contains("SUPPLEMENTAL"), "{p5}");
+        assert!(variant(&p5).ends_with(",VIDEO-RANGE=PQ"), "{p5}");
+        // The base layer alone: HEVC, nothing beside.
+        let base = multivariant_playlist(&dv(8, 1, "smpte2084"), copy(false), None, None);
+        assert!(!variant(&base).contains("dvh1"), "{base}");
+    }
+
+    /// PGPU-06: an encode names what it writes. HEVC or AV1 keeping HDR
+    /// is 10-bit (Main 10, `av01….10`) and PQ; tone mapped, 8-bit and SDR.
+    #[test]
+    fn an_encode_is_named_for_the_depth_it_writes() {
+        let encode = |codec, tone_map| {
+            Some(ConvertedVideo::Encode {
+                codec,
+                height: 1080,
+                max_bitrate: None,
+                tone_map,
+            })
+        };
+        let pq = film("smpte2084");
+        for (codec, tone_map, name, range) in [
+            (VideoCodec::Hevc, false, "hvc1.2.4.L120.B0", "PQ"),
+            (VideoCodec::Hevc, true, "hvc1.1.6.L120.B0", "SDR"),
+            (VideoCodec::Av1, false, "av01.0.08M.10", "PQ"),
+            (VideoCodec::Av1, true, "av01.0.08M.08", "SDR"),
+        ] {
+            let text = multivariant_playlist(&pq, encode(codec, tone_map), None, None);
+            assert!(text.contains(&format!("CODECS=\"{name}")), "{text}");
+            assert!(
+                variant(&text).ends_with(&format!(",VIDEO-RANGE={range}")),
+                "{text}"
+            );
+        }
+        // AV1 above 1080p: level 5.0, and 5.1 over 30 frames a second.
+        assert_eq!(
+            video_codec_string(VideoCodec::Av1, 10, 2160, None, false),
+            "av01.0.12M.10"
+        );
+        assert_eq!(
+            video_codec_string(VideoCodec::Av1, 10, 2160, None, true),
+            "av01.0.13M.10"
+        );
     }
 
     #[test]

@@ -667,6 +667,7 @@ impl TestServer {
                 stalled_after: options.stalled_after,
                 gpu_filters: false,
                 tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+                video_codecs: spoolframe_server::config::DEFAULT_VIDEO_CODECS.to_vec(),
             },
             tool(&options.ffmpeg, &sandbox),
         )

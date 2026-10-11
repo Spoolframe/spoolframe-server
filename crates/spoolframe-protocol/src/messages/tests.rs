@@ -632,6 +632,7 @@ fn every_plan_kind_round_trips_phase_2_ones_included() {
             container: Container::Mp4,
             video: Some(ConvertedVideo::Copy {
                 codec: VideoCodec::Hevc,
+                dolby_vision: false,
             }),
             audio: Some(ConvertedAudio {
                 index: 0,
@@ -674,6 +675,7 @@ fn every_plan_kind_round_trips_phase_2_ones_included() {
             container: Container::Matroska,
             video: Some(ConvertedVideo::Copy {
                 codec: VideoCodec::Hevc,
+                dolby_vision: false,
             }),
             audio: None,
             subtitle: Some(ConvertedSubtitle {

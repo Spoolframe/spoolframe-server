@@ -15,6 +15,8 @@ mod approve;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod catalog;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod gpus;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod invites;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod libraries;

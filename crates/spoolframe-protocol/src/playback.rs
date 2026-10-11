@@ -165,7 +165,17 @@ pub enum PlaybackPlan {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConvertedVideo {
     /// Into the output as it is.
-    Copy { codec: VideoCodec },
+    Copy {
+        codec: VideoCodec,
+        /// Labelled as Dolby Vision (PGPU-06): the client shows it, and
+        /// the stream is Dolby Vision profile 5 or 8, so the output says
+        /// so (`dvcC`/`dvvC`, `dvh1`, HLS's `SUPPLEMENTAL-CODECS`). `false`: a
+        /// Dolby Vision stream copied as its base layer, HDR10 or HLG, or
+        /// any other stream. Unlike the rest of a plan it may be left
+        /// out, as a server before it does, and is `false` then.
+        #[serde(default)]
+        dolby_vision: bool,
+    },
     Encode {
         codec: VideoCodec,
         /// Lines in the output.

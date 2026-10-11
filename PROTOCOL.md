@@ -18,6 +18,12 @@ PX-44 adds three session requests to revision 14, an admin's:
 not know them answers `unsupported` and the revision stays. What they do
 is in "Making invites in an app" under "Invites" below.
 
+PGPU-06 adds one field to revision 14: `ClientCapabilities.hardware_video`,
+the video codecs the device decodes in hardware. It is the one field a
+peer may leave out (a revision-14 client does not send it), read then as
+`null`, so the revision stays. A conversion's codec, and whether an HDR
+film keeps its HDR, follow from it: see "Output codecs and HDR" below.
+
 Revision 13 (P7-04, ties) kept the `spoolframe/client/1` ALPN and sets
 `PROTOCOL_VERSION` to 13. Update the server and SDK together. There are
 three new session requests, `tie_begin` (answered `tie_challenge`),
@@ -168,6 +174,41 @@ both.
 The admin API (JSON-RPC) is the same: every field is required, `null`
 for none, except an error object's `data`, which JSON-RPC 2.0 lets an
 error leave out.
+
+## Output codecs and HDR
+
+Since PGPU-06 a conversion's video codec is the server's to choose, in
+the order its admin set (`transcode.video_codecs`: AV1, HEVC, H.264 by
+default), among the codecs the client plays and a GPU of the server's
+encodes. The server encodes in software only to H.264.
+
+- `ClientCapabilities.hardware_video` (`[codec]` or `null`): the codecs
+  of `video` the device decodes in hardware. A GPU codec is chosen only
+  where the device decodes it in hardware; `null` counts every codec in
+  `video`. An app sends what its platform decodes in hardware (Apple:
+  `VTIsHardwareDecodeSupported`), so a device with no AV1 decoder is not
+  sent AV1 to decode in software.
+- An HDR film for a device whose `max_video.hdr` has its HDR format
+  (`null`: every one), with `max_video.bit_depth` 10 or more (or `null`),
+  keeps its HDR: HEVC Main 10 or AV1 10-bit, BT.2020, the source's
+  transfer, its HDR10 metadata. `ConvertedVideo::Encode`'s `tone_map` is
+  then `false`. Dolby Vision keeps its base layer's HDR (HDR10, or HLG
+  for profile 8.4): a device must show that format. Profile 5 has no
+  such base layer and is tone mapped.
+- Dolby Vision copied (PGPU-06): `ConvertedVideo::Copy.dolby_vision`
+  (`bool`, may be left out, `false` then) says the copy is labelled Dolby
+  Vision, for a device whose `max_video.hdr` has `dolby_vision` (or is
+  `null`), the stream being profile 5 or 8. Otherwise a Dolby Vision
+  stream whose base layer the device shows (HDR10, HLG or SDR; profile 7
+  always) is copied as that base layer, unlabelled, rather than
+  converted. Labelled, profile 8 is named `hvc1.2.4.L…` with
+  `SUPPLEMENTAL-CODECS="dvh1.08.LL/db1p"` (`db4h` HLG, `db2g` SDR) and
+  muxed with its `dvvC`; profile 5 is `dvh1.05.LL`, tagged `dvh1`.
+- The HLS playlist names what is written: `hvc1.2.4.L…` (Main 10) or
+  `av01.0.<level>M.10` for kept HDR, with `VIDEO-RANGE=PQ` or `HLG`; a
+  tone-mapped or 8-bit encode `hvc1.1.6.L…`, `av01.0.<level>M.08` or
+  `avc1…`, with `VIDEO-RANGE=SDR`. The fMP4 init segment carries `colr`,
+  `mdcv` and `clli`, and HEVC is tagged `hvc1`.
 
 ## The server id
 
@@ -1027,6 +1068,19 @@ The relay keeps an answer 60 s and a failure 5 s, at most 10,000 of them,
 by endpoint and token: an endpoint's answer with a token is not its
 answer without one. It lets through the tiers its `access` allows. An
 answer it cannot get is a stranger's.
+
+The kept answer decides only whether a connection is let through. iroh
+keeps one relay connection per endpoint for as long as it can, so the
+relay asks again, every 5 s, about each endpoint (and token) it carries,
+whatever answer it keeps, and keeps the new one. A connection whose
+endpoint is now in a tier `access` does not let through is cut: a device
+signed out, a session ended, an invite or grant revoked stops being
+relayed within 5 s and one question (at most 5 s more), not 60 s. Its
+reconnects are refused on the new answer. An endpoint the main server
+does not answer for in a recheck is carried on until a recheck that
+does. With `access.everyone`, and for the main server itself, nothing is
+asked and nothing rechecked. The questions are the same `/1` frames; at
+most 2 of a recheck are open at once.
 
 ## Picture subtitles
 
