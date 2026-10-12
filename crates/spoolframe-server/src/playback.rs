@@ -49,6 +49,13 @@ pub const NOW_AND_NEXT: usize = 2;
 /// third only while the track before is still read as the next is
 /// prepared, so a broken client cannot run conversions without end.
 pub const DEVICE_MOST: usize = 3;
+/// The most direct playbacks a device holds at once. A direct playback
+/// holds no slot ([`DEVICE_MOST`] counts conversions only), but each is
+/// a handle the server keeps for [`IDLE`]: past this, a new one ends the
+/// device's least recently used that is not being read, so a client
+/// starting playbacks in a loop cannot pile up handles without end.
+/// Gapless audio needs two or three.
+pub const DIRECT_MOST: usize = 16;
 /// How often, while a handle is used, its session is checked again, so a
 /// revoked session or a disabled user stops playback promptly.
 pub const RECHECK: Duration = Duration::from_secs(30);
@@ -938,6 +945,27 @@ impl Playbacks {
                 previous.progress_superseded = true;
             }
         }
+        // A direct playback past the device's DIRECT_MOST ends its least
+        // recently used one that is not being read (review 2026-10-11 M11).
+        let mut surplus: Vec<String> = Vec::new();
+        if opened.conversion.is_none() {
+            let mut direct: Vec<(&String, &Playback)> = handles
+                .iter()
+                .filter(|(_, p)| p.endpoint == opened.endpoint && p.conversion.is_none())
+                .collect();
+            let over = (direct.len() + 1).saturating_sub(DIRECT_MOST);
+            direct.retain(|(_, p)| !p.reading(now));
+            direct.sort_by_key(|(_, p)| (p.last_read, p.last_used, p.order));
+            surplus = direct
+                .iter()
+                .take(over)
+                .map(|(h, _)| (*h).clone())
+                .collect();
+        }
+        let surplus: Vec<(String, Playback)> = surplus
+            .into_iter()
+            .filter_map(|h| handles.remove_entry(&h))
+            .collect();
         handles.insert(
             handle.0.clone(),
             Playback {
@@ -974,6 +1002,7 @@ impl Playbacks {
         );
         drop(handles);
         self.ended_all(idle, EndReason::Idle);
+        self.ended_all(surplus, EndReason::Replaced);
         handle
     }
 
@@ -1612,6 +1641,22 @@ mod tests {
 
     fn start(p: &Playbacks) -> PlaybackHandle {
         start_on(p, "e")
+    }
+
+    /// A device starting direct playbacks in a loop keeps at most
+    /// DIRECT_MOST, the newest; another device's are not touched (review
+    /// 2026-10-11 M11).
+    #[test]
+    fn a_device_holds_at_most_direct_most_direct_playbacks() {
+        let p = Playbacks::default();
+        let other = start_on(&p, "f");
+        let handles: Vec<PlaybackHandle> = (0..DIRECT_MOST + 10).map(|_| start(&p)).collect();
+        let open = |endpoint: &str| p.lock().values().filter(|x| x.endpoint == endpoint).count();
+        assert_eq!(open("e"), DIRECT_MOST);
+        assert_eq!(open("f"), 1);
+        assert!(p.lock().contains_key(&handles.last().unwrap().0));
+        assert!(!p.lock().contains_key(&handles[0].0));
+        assert!(p.lock().contains_key(&other.0));
     }
 
     fn viewer() -> Viewer {

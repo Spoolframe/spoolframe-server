@@ -1350,17 +1350,7 @@ impl ClientProtocol {
             what: id.to_string(),
         };
         let (key, n) = previews::sheet_of(id).ok_or_else(not_found)?;
-        let bytes = self
-            .services
-            .previews
-            .sheet(key, n)
-            .await
-            .ok_or_else(not_found)?;
-        let sheet = Artwork {
-            bytes,
-            content_type: "image/jpeg".into(),
-            etag: format!("{key}-{n}-{}", size.as_str()),
-        };
+        let etag = format!("{key}-{n}-{}", size.as_str());
         let width = match size {
             ArtworkSize::Unknown => {
                 return Err(Error::Malformed {
@@ -1369,17 +1359,19 @@ impl ClientProtocol {
             }
             size => size.width(),
         };
-        let Some(width) = width else {
-            return Ok(sheet);
-        };
-        let etag = sheet.etag.clone();
-        let image = tokio::task::spawn_blocking(move || crate::artwork::resize(sheet, width))
-            .await
-            .map_err(internal)?
-            .map_err(internal)?;
+        let bytes = match width {
+            None => self.services.previews.sheet(key, n).await,
+            Some(width) => self
+                .services
+                .previews
+                .sheet_at(key, n, width)
+                .await
+                .map(|b| b.as_ref().clone()),
+        }
+        .ok_or_else(not_found)?;
         Ok(Artwork {
-            bytes: image.bytes,
-            content_type: image.content_type,
+            bytes,
+            content_type: "image/jpeg".into(),
             etag,
         })
     }

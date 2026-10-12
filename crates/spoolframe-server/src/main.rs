@@ -862,6 +862,7 @@ async fn run(
         },
     )
     .with_context(|| format!("cannot open the previews cache {}", previews_dir.display()))?;
+    previews.watch_catalog(live.changes());
     let name = ServerName::new(config.server_name());
     let status = Arc::new(
         StatusSource::new(name.clone(), server_id.clone(), transcoding.clone())
@@ -881,7 +882,12 @@ async fn run(
     let database = store.clone();
     store.spawn_session_purge();
     // Previews made ahead (P3-13) start with what is being watched.
-    previews::ahead::spawn(&previews, catalog.clone(), store.clone());
+    previews::ahead::spawn(
+        &previews,
+        catalog.clone(),
+        Some(live.clone()),
+        store.clone(),
+    );
     let auth = Auth::new(store).with_trust_idle(config.auth.trust_idle()?);
     let watch = Arc::new(Watch::new(
         auth.store().clone(),
@@ -1143,18 +1149,37 @@ async fn run(
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     tracing::info!(restart = ?restart, "shutting down");
-    server.shutdown().await;
+    // Each step is bounded: a hung endpoint or collector must not hold
+    // the process until the supervisor kills it (review 2026-10-11 L34).
+    within(SHUTDOWN_STEP, "the endpoint", server.shutdown()).await;
     let _ = admin.stop();
-    admin.stopped().await;
+    within(SHUTDOWN_STEP, "the admin API", admin.stopped()).await;
     // What is queued for the collector goes before the process does.
     telemetry.shutdown().await;
-    if tokio::time::timeout(std::time::Duration::from_secs(5), database.close())
-        .await
-        .is_err()
-    {
-        tracing::warn!("the database did not close within 5 seconds");
-    }
+    within(
+        std::time::Duration::from_secs(5),
+        "the database",
+        database.close(),
+    )
+    .await;
     Ok(restart)
+}
+
+/// The most one step of a shutdown may take.
+const SHUTDOWN_STEP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait for `step` at most `limit`, warning when it did not end in time;
+/// whether it did.
+async fn within(limit: std::time::Duration, what: &str, step: impl Future) -> bool {
+    if tokio::time::timeout(limit, step).await.is_ok() {
+        return true;
+    }
+    tracing::warn!(
+        step = what,
+        secs = limit.as_secs(),
+        "a shutdown step did not end in time; going on without it"
+    );
+    false
 }
 
 /// What the setup wizard reaches beyond the server: plex.tv, and Plex's
@@ -1185,7 +1210,9 @@ fn wizard() -> Result<admin::Wizard> {
 const RESTART_EXIT: i32 = 75;
 
 /// SIGINT or SIGTERM, handled from now on. `ctrl_c()` would only start
-/// handling SIGINT once polled.
+/// handling SIGINT once polled. A second one while the server shuts down
+/// ends the process at once: tokio keeps handling the signals, so without
+/// this it would be ignored (review 2026-10-11 L34).
 fn shutdown_signal() -> Result<impl Future<Output = ()>> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut interrupt = signal(SignalKind::interrupt())?;
@@ -1195,8 +1222,20 @@ fn shutdown_signal() -> Result<impl Future<Output = ()>> {
             _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
         }
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            tracing::warn!("a second signal: stopping now, without finishing the shutdown");
+            std::process::exit(SECOND_SIGNAL_EXIT);
+        });
     })
 }
+
+/// The exit status after a second SIGINT or SIGTERM: 128 + SIGINT, as a
+/// shell reports an interrupted program.
+const SECOND_SIGNAL_EXIT: i32 = 130;
 
 /// Check each Plex server and a sample of media paths, and warn about
 /// what is wrong. Plex being down must not stop the server (§32): catalog
@@ -1305,6 +1344,15 @@ fn examples(out: &mut String, what: &str, failures: &Failures) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shutdown step that never ends is given up on after its limit,
+    /// not waited for (review 2026-10-11 L34).
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_shutdown_step_is_given_up_on() {
+        let limit = std::time::Duration::from_secs(10);
+        assert!(!within(limit, "a hung step", std::future::pending::<()>()).await);
+        assert!(within(limit, "a quick step", async {}).await);
+    }
 
     #[test]
     fn the_report_counts_each_library_and_shows_examples() {

@@ -240,6 +240,29 @@ mod tests {
         );
     }
 
+    /// The endpoint's limits are read only at start: a reload that
+    /// changes one waits for a restart instead of "nothing changed"
+    /// (review 2026-10-11 L37).
+    #[test]
+    fn the_endpoint_s_limits_wait_for_a_restart() {
+        let started = table("network { port = 1; }");
+        let after = table(
+            "network { port = 1; max_stranger_connections = 5; \
+             first_frame_timeout_secs = 3; stalled_read_secs = 9; }",
+        );
+        assert_eq!(
+            Reloaded::between(&started, &after, &started),
+            Reloaded {
+                applied: vec![],
+                after_restart: vec![
+                    "network.max_stranger_connections".into(),
+                    "network.first_frame_timeout_secs".into(),
+                    "network.stalled_read_secs".into(),
+                ],
+            }
+        );
+    }
+
     #[test]
     fn the_same_tables_change_nothing() {
         let t = table(r#"name = "A";"#);

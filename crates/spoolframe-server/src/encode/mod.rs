@@ -316,7 +316,7 @@ impl Conversion {
             Some(ConvertedVideo::Copy { .. }) => encoded.unwrap_or(first_video),
             _ => first_video,
         };
-        let run_on = run_on(
+        let run_on = match run_on(
             &jobs,
             &source,
             EncodeSpec {
@@ -336,7 +336,13 @@ impl Conversion {
                     file: PathBuf::new(),
                 },
             },
-        );
+        ) {
+            Ok(run_on) => run_on,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+        };
         let job = spawn(
             &jobs,
             &dir,
@@ -949,13 +955,57 @@ impl Conversion {
 /// GPU encode, and with none left a software encode ([`pick::spill`]).
 /// The card of the conversion it replaces has room: that one lets go of
 /// its place as this one starts.
-fn run_on(jobs: &Jobs, source: &ConversionSource<'_>, probe: EncodeSpec<'_>) -> RunOn {
+///
+/// Neither a spill nor a refusal is silent: a spill is logged once, as the
+/// conversion starts, with the encoder it runs on; an encode that keeps
+/// HDR and finds no 10-bit encoder with room is refused `Busy`, with why.
+fn run_on(
+    jobs: &Jobs,
+    source: &ConversionSource<'_>,
+    probe: EncodeSpec<'_>,
+) -> Result<RunOn, JobError> {
     let replaced = source.slot.as_ref().and_then(Slot::card);
     let room = |gpu: &Gpu| {
         let limit = gpu.limit();
         replaced.is_some_and(|r| r.key == limit.key) || jobs.card_has_room(&limit)
     };
-    pick::run_on(&source.gpus, &probe, &room)
+    let full = || {
+        source
+            .gpus
+            .gpus
+            .iter()
+            .filter(|gpu| !room(gpu))
+            .map(|gpu| gpu.card().place())
+            .collect::<Vec<_>>()
+    };
+    let codec = match probe.video {
+        Some(ConvertedVideo::Encode { codec, .. }) => Some(codec.as_str()),
+        _ => None,
+    };
+    match pick::run_on(&source.gpus, &probe, &room) {
+        Ok(run) => {
+            if run.spilled() {
+                tracing::warn!(
+                    handle = source.handle,
+                    codec,
+                    encoder = run.encoder_name(&probe).as_deref(),
+                    decoder_gpu = run.gpu().map(|g| g.card().place()),
+                    full = ?full(),
+                    "every GPU that encodes this codec is full: the conversion encodes in software"
+                );
+            }
+            Ok(run)
+        }
+        Err(pick::NoTenBit) => {
+            tracing::warn!(
+                handle = source.handle,
+                codec,
+                full = ?full(),
+                "an encode that keeps HDR has no 10-bit encoder with room: refused as busy, not written in 8 bits"
+            );
+            Err(JobError::Busy)
+        }
+    }
 }
 
 /// What a playback is planned with now (PGPU-06): [`pick::planning`] with

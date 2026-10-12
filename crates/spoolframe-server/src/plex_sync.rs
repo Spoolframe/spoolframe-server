@@ -533,7 +533,18 @@ impl WatchSync {
         if let Some(id) = known {
             return Ok(id);
         }
-        let id = plex.machine_id().await?.unwrap_or_default();
+        // A PMS that names no machine is not remembered as "": every
+        // token looked up under it would be none, and the run would say
+        // the account has no access until a restart (review 2026-10-11
+        // L35). The next run asks again.
+        let Some(id) = plex.machine_id().await? else {
+            return Err(CatalogError::Backend {
+                url,
+                call: "GET /identity".into(),
+                item: None,
+                message: "no machineIdentifier in the answer".into(),
+            });
+        };
         self.machines.lock().insert(url, id.clone());
         Ok(id)
     }
@@ -722,20 +733,17 @@ impl WatchSync {
         // Before anything else can link: none is missed.
         let mut links = self.accounts.changes();
         tokio::spawn(async move {
-            match sync.accounts.users().await {
-                Ok(users) => {
-                    for (user, link) in users {
-                        if link.is_some() {
-                            sync.follow(user.id, changes.resubscribe());
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "cannot list who is linked to Plex"),
-            }
+            sync.reconcile(&changes).await;
             loop {
                 let user = match links.recv().await {
                     Ok(user) => user,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // Links made or removed were missed: who is linked is
+                    // read again, as at start (review 2026-10-11 L36).
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, "Plex link changes were missed; reading them again");
+                        sync.reconcile(&changes).await;
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 };
                 match sync.accounts.link(user) {
@@ -745,6 +753,34 @@ impl WatchSync {
                 }
             }
         });
+    }
+
+    /// Follow every user linked to Plex now and no one else: at start,
+    /// and after link changes were missed.
+    async fn reconcile(self: &Arc<Self>, changes: &tokio::sync::broadcast::Receiver<Principal>) {
+        let users = match self.accounts.users().await {
+            Ok(users) => users,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot list who is linked to Plex");
+                return;
+            }
+        };
+        let linked: HashSet<LocalUserId> = users
+            .into_iter()
+            .filter(|(_, link)| link.is_some())
+            .map(|(user, _)| user.id)
+            .collect();
+        let followed: Vec<LocalUserId> = self.tasks.lock().keys().copied().collect();
+        for user in &followed {
+            if !linked.contains(user) {
+                self.unfollow(*user);
+            }
+        }
+        for user in linked {
+            if !followed.contains(&user) {
+                self.follow(user, changes.resubscribe());
+            }
+        }
     }
 
     /// Start (or start again) `user`'s scheduled runs.
@@ -883,6 +919,75 @@ mod tests {
     }
 
     const STARTED: Duration = Duration::from_secs(60);
+
+    fn accounts_at(
+        dir: &spoolframe_test_dir::TestDir,
+        store: crate::store::Store,
+    ) -> Arc<PlexAccounts> {
+        Arc::new(PlexAccounts::new(
+            crate::config::secrets::Secrets::new(dir.as_ref()),
+            store,
+            crate::plex_accounts::PlexSite {
+                api: "http://127.0.0.1:9".parse().unwrap(),
+                app: "http://127.0.0.1:9".parse().unwrap(),
+            },
+            None,
+        ))
+    }
+
+    /// A PMS that names no machine is an error, not "" kept until a
+    /// restart: once it names one, it is found (review 2026-10-11 L35).
+    #[tokio::test]
+    async fn a_pms_that_names_no_machine_is_asked_again() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-sync-machine").await;
+        let store = crate::store::Store::open(dir.as_ref()).await.unwrap();
+        let sync = WatchSync::new(Arc::default(), accounts_at(&dir, store), STARTED, STARTED);
+        let pms = MockServer::start().await;
+        let plex = PlexCatalog::new(pms.uri().parse().unwrap(), None).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/identity"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "MediaContainer": {} })),
+            )
+            .up_to_n_times(1)
+            .mount(&pms)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/identity"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "MediaContainer": { "machineIdentifier": "tower" } }),
+            ))
+            .mount(&pms)
+            .await;
+        assert!(sync.machine(&plex).await.is_err());
+        assert_eq!(sync.machine(&plex).await.unwrap(), "tower");
+    }
+
+    /// After missed link changes, a user followed but no longer linked
+    /// is let go (review 2026-10-11 L36).
+    #[tokio::test]
+    async fn a_reconcile_lets_go_of_who_is_no_longer_linked() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-sync-reconcile").await;
+        let store = crate::store::Store::open(dir.as_ref()).await.unwrap();
+        let alice = store
+            .add_user("alice", None, "phc", spoolframe_types::Role::Consumer)
+            .await
+            .unwrap();
+        let sync = Arc::new(WatchSync::new(
+            Arc::default(),
+            accounts_at(&dir, store),
+            STARTED,
+            STARTED,
+        ));
+        let (_tx, changes) = tokio::sync::broadcast::channel(4);
+        sync.follow(alice, changes.resubscribe());
+        assert!(sync.tasks.lock().contains_key(&alice));
+        sync.reconcile(&changes).await;
+        assert!(!sync.tasks.lock().contains_key(&alice));
+    }
 
     /// The metrics count runs (P3-14): one that cannot sync is a failure,
     /// and a dry run is no run.

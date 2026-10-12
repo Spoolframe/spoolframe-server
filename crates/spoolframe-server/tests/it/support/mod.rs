@@ -716,7 +716,10 @@ impl TestServer {
             },
         )
         .unwrap();
-        spoolframe_server::previews::ahead::spawn(&previews, catalog.clone(), store.clone());
+        if let Some(live) = options.catalog.as_ref() {
+            previews.watch_catalog(live.changes());
+        }
+        spoolframe_server::previews::ahead::spawn(&previews, catalog.clone(), None, store.clone());
         let auth = Auth::with_failure_window(store.clone(), options.failure_window)
             .with_sign_in_lifetime(options.sign_in_lifetime)
             .with_stranger_attempts(options.stranger_attempts);

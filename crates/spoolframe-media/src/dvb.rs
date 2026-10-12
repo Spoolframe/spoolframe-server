@@ -62,12 +62,34 @@ struct Page {
 /// Segments that do not parse end their packet's reading, and what was
 /// read of it still counts.
 pub fn cues(packets: &[Packet]) -> Result<Vec<Cue>, OverBudget> {
-    cues_within(packets, &Budget::DEFAULT)
+    cues_within(packets, &[], &Budget::DEFAULT)
 }
 
-/// The cues of a track's packets, in order. A track that decodes to more
-/// than `budget` is an error.
-pub fn cues_within(packets: &[Packet], budget: &Budget) -> Result<Vec<Cue>, OverBudget> {
+/// The pages of the track that `extradata` names: its first language's
+/// composition and ancillary page ids (two bytes each, as ffmpeg's
+/// demuxers write them). A PID may carry a page per language, interleaved,
+/// and ffmpeg gives them as one stream; only this one's segments are
+/// read, as ffmpeg's own decoder does. Without them (`None`), the first
+/// page id seen is the track's.
+fn pages_of(extradata: &[u8]) -> Option<(u16, u16)> {
+    match extradata {
+        [c0, c1, a0, a1, ..] => Some((
+            u16::from_be_bytes([*c0, *c1]),
+            u16::from_be_bytes([*a0, *a1]),
+        )),
+        _ => None,
+    }
+}
+
+/// The cues of a track's packets, in order, of the page `extradata` names
+/// ([`pages_of`]). A track that decodes to more than `budget` is an
+/// error.
+pub fn cues_within(
+    packets: &[Packet],
+    extradata: &[u8],
+    budget: &Budget,
+) -> Result<Vec<Cue>, OverBudget> {
+    let mut wanted = pages_of(extradata);
     let mut regions = Regions::default();
     let mut cluts: HashMap<u8, Clut> = HashMap::new();
     let mut out = Kept::new(budget);
@@ -84,13 +106,20 @@ pub fn cues_within(packets: &[Packet], budget: &Budget) -> Result<Vec<Cue>, Over
             data = &data[2.min(data.len())..];
         }
         let mut composed = false;
-        while let [0x0f, kind, _, _, high, low, rest @ ..] = data {
+        while let [0x0f, kind, page_hi, page_lo, high, low, rest @ ..] = data {
             let len = usize::from(u16::from_be_bytes([*high, *low]));
             let Some(body) = rest.get(..len) else {
                 broken += 1;
                 break;
             };
             data = &rest[len..];
+            // Another language's page on the same PID (review 2026-10-11
+            // M36): not this track's.
+            let page_id = u16::from_be_bytes([*page_hi, *page_lo]);
+            let (composition, ancillary) = *wanted.get_or_insert((page_id, page_id));
+            if page_id != composition && page_id != ancillary {
+                continue;
+            }
             let parsed = match *kind {
                 PAGE => match page_composition(body) {
                     Some((p, epoch)) => {
@@ -679,7 +708,12 @@ mod tests {
     }
 
     fn segment(out: &mut Vec<u8>, kind: u8, body: &[u8]) {
-        out.extend([0x0f, kind, 0, 1]);
+        segment_on(out, 1, kind, body);
+    }
+
+    fn segment_on(out: &mut Vec<u8>, page_id: u16, kind: u8, body: &[u8]) {
+        out.extend([0x0f, kind]);
+        out.extend(page_id.to_be_bytes());
         out.extend((body.len() as u16).to_be_bytes());
         out.extend(body);
     }
@@ -756,6 +790,45 @@ mod tests {
         packet(pts_ms, data)
     }
 
+    /// `shown`, every segment on page `page_id`.
+    fn shown_on(page_id: u16, time_out: u8) -> Vec<u8> {
+        let one = shown(time_out);
+        let mut data = Vec::new();
+        let mut rest = one.as_slice();
+        while let [0x0f, kind, _, _, high, low, tail @ ..] = rest {
+            let len = usize::from(u16::from_be_bytes([*high, *low]));
+            segment_on(&mut data, page_id, *kind, &tail[..len]);
+            rest = &tail[len..];
+        }
+        data
+    }
+
+    /// Two languages' pages on one PID, interleaved (review 2026-10-11
+    /// M36): the track is the page its extradata names, or the first seen,
+    /// and the other's pages neither show nor end its cues.
+    #[test]
+    fn another_page_on_the_same_pid_is_not_the_track_s() {
+        let packets = vec![
+            packet(0, shown_on(1, 0)),
+            packet(1_000, shown_on(2, 0)),
+            packet(2_000, shown_on(1, 0)),
+            packet(3_000, shown_on(2, 0)),
+        ];
+        let first = cues_within(&packets, &[], &Budget::DEFAULT).unwrap();
+        assert_eq!(
+            first.iter().map(|c| c.start_ms).collect::<Vec<_>>(),
+            [0],
+            "page 1's first cue lasts until its next page"
+        );
+        assert_eq!(first[0].end_ms, 2_000);
+        let second = cues_within(&packets, &[0, 2, 0, 2], &Budget::DEFAULT).unwrap();
+        assert_eq!(
+            second.iter().map(|c| c.start_ms).collect::<Vec<_>>(),
+            [1_000]
+        );
+        assert_eq!(second[0].end_ms, 3_000);
+    }
+
     #[test]
     fn a_track_past_its_budget_of_pixels_is_refused() {
         let packets: Vec<Packet> = (0..8).map(|n| filled(n * 2_000, 1024)).collect();
@@ -766,7 +839,7 @@ mod tests {
             pixels: 3 * picture,
             held: 64 << 20,
         };
-        match cues_within(&packets, &budget) {
+        match cues_within(&packets, &[], &budget) {
             Err(e) => assert_eq!(e, OverBudget::Pixels(budget.pixels)),
             Ok(cues) => panic!(
                 "{} bytes decoded to {} cues of {} pixels",
@@ -785,11 +858,11 @@ mod tests {
             ..Budget::DEFAULT
         };
         assert_eq!(
-            cues_within(&packets, &budget).map(|c| c.len()),
+            cues_within(&packets, &[], &budget).map(|c| c.len()),
             Err(OverBudget::Cues(4))
         );
         assert_eq!(
-            cues_within(&packets, &Budget::DEFAULT).map(|c| c.len()),
+            cues_within(&packets, &[], &Budget::DEFAULT).map(|c| c.len()),
             Ok(5)
         );
     }
@@ -813,7 +886,7 @@ mod tests {
             ..Budget::DEFAULT
         };
         assert_eq!(
-            cues_within(&[packet(0, data)], &budget).map(|c| c.len()),
+            cues_within(&[packet(0, data)], &[], &budget).map(|c| c.len()),
             Err(OverBudget::Held(held))
         );
     }

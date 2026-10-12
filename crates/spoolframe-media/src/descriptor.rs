@@ -268,7 +268,7 @@ impl MediaDescriptor {
                 StreamKinds::Video(v) if video.is_none() && !flag(d.attached_pic) => {
                     video = Some(VideoStream {
                         index,
-                        codec: v.codec_name.clone(),
+                        codec: codec_name(&v.codec_name),
                         profile: v.profile.clone(),
                         // ffprobe says -99 for a level it does not know.
                         level: u32::try_from(v.level).ok().filter(|&l| l > 0),
@@ -294,7 +294,7 @@ impl MediaDescriptor {
                     let title = tags.and_then(|t| t.title.clone());
                     audio.push(AudioStream {
                         index,
-                        codec: a.codec_name.clone(),
+                        codec: codec_name(&a.codec_name),
                         profile: a.profile.clone(),
                         channels: u32::try_from(a.channels).ok().filter(|&c| c > 0),
                         channel_layout: a.channel_layout.clone(),
@@ -310,8 +310,8 @@ impl MediaDescriptor {
                     let role = roles::subtitle_role(flags, title.as_deref());
                     subtitles.push(SubtitleStream {
                         source: SubtitleSource::Embedded { index },
-                        kind: SubtitleKind::of_codec(&s.codec_name),
-                        codec: s.codec_name.clone(),
+                        kind: SubtitleKind::of_codec(&codec_name(&s.codec_name)),
+                        codec: codec_name(&s.codec_name),
                         language: language(tags.and_then(|t| t.language.as_deref())),
                         title,
                         forced: role == SubtitleRole::Forced,
@@ -446,6 +446,12 @@ fn language(tag: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A stream's codec, as ffprobe names it: "unknown", ffprobe's own word,
+/// for one it leaves out because it does not know the codec.
+fn codec_name(name: &Option<String>) -> String {
+    name.clone().unwrap_or_else(|| "unknown".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +579,26 @@ mod tests {
     fn an_undetermined_language_is_none() {
         assert_eq!(language(Some("und")), None);
         assert_eq!(language(Some("eng")).as_deref(), Some("eng"));
+    }
+
+    /// ffprobe leaves `codec_name` out of its JSON for a codec it does not
+    /// know (`print_str_opt`). Such a stream is an unknown codec, not a
+    /// file that cannot be read at all.
+    #[test]
+    fn a_stream_of_an_unknown_codec_is_unknown_not_unreadable() {
+        let path = format!(
+            "{}/tests/fixtures/mp4-h264-aac.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for stream in json["streams"].as_array_mut().unwrap() {
+            stream.as_object_mut().unwrap().remove("codec_name");
+        }
+        let probe: FfProbe = serde_json::from_value(json).unwrap();
+        let d = MediaDescriptor::from_probe(&probe);
+        assert_eq!(d.video.unwrap().codec, "unknown");
+        assert_eq!(d.audio[0].codec, "unknown");
     }
 
     #[test]

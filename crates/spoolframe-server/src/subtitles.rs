@@ -42,6 +42,12 @@ const MAX_MAKING: usize = 64;
 /// Tracks remembered as failed at once (review 2026-10-11 M14).
 const MAX_FAILED: usize = 4096;
 
+/// The most the cache's texts take on disk (review 2026-10-11 M15). A
+/// film's track is some 100 KB, so this is thousands of tracks; past it
+/// the least recently used go, oldest by modification time, which a read
+/// from the cache moves to now.
+const CACHE_LIMIT: u64 = 512 * 1024 * 1024;
+
 /// `subtitles { … }`, with the defaults filled in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OcrSettings {
@@ -144,6 +150,7 @@ impl Subtitles {
         if work.exists() {
             std::fs::remove_dir_all(&work)?;
         }
+        trim(&settings.cache_dir, CACHE_LIMIT);
         Ok(Self {
             ocr: if settings.enabled {
                 ocr
@@ -257,6 +264,7 @@ impl Subtitles {
             .cache_dir
             .join(format!("{key}.{}", extension(source.to)));
         if tokio::fs::try_exists(&text).await.unwrap_or(false) {
+            touch(&text).await;
             return watch::channel(TextState::Ready(text)).1;
         }
         if let Some(reason) = self.failed.lock().get(&key) {
@@ -381,6 +389,8 @@ impl Job {
         tokio::fs::rename(&partial, &self.text)
             .await
             .map_err(|e| e.to_string())?;
+        let dir = self.subtitles.cache_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || trim(&dir, CACHE_LIMIT)).await;
         Ok(self.text.clone())
     }
 
@@ -511,6 +521,57 @@ impl Job {
     }
 }
 
+/// A read of `text` from the cache: it is used now, so it goes last.
+async fn touch(text: &Path) {
+    let text = text.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        std::fs::File::options()
+            .append(true)
+            .open(&text)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+    })
+    .await;
+}
+
+/// Remove the least recently used texts of `dir` (its files; the work
+/// directory is not one) until they take at most `limit` bytes. An entry
+/// that cannot be read is left alone and logged.
+fn trim(dir: &Path, limit: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        match entry.metadata() {
+            Ok(meta) if meta.is_file() => files.push((
+                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                meta.len(),
+                entry.path(),
+            )),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(path = %entry.path().display(), error = %e, "a subtitle text cannot be read");
+            }
+        }
+    }
+    let mut total: u64 = files.iter().map(|(_, len, _)| len).sum();
+    if total <= limit {
+        return;
+    }
+    files.sort();
+    for (_, len, path) in files {
+        if total <= limit {
+            break;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => total = total.saturating_sub(len),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot remove a subtitle text")
+            }
+        }
+    }
+}
+
 /// The track's name in the cache: the file as it is now (path, size,
 /// modification time), the track, how it is made (the OCR language) and
 /// the format. A file replaced by a new rip is made again; so is a
@@ -571,6 +632,32 @@ mod tests {
 
     /// A stand-in ffmpeg, in `bin`, that marks itself running in `dir`
     /// for `secs`, then writes its output (its last argument).
+    /// Past its limit the cache lets the least recently used texts go,
+    /// and a read moves a text to now (review 2026-10-11 M15).
+    #[tokio::test]
+    async fn the_text_cache_keeps_the_most_recently_used_under_its_limit() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-subtitles-trim").await;
+        std::fs::create_dir(dir.path().join("work")).unwrap();
+        let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        for (name, secs) in [("a.vtt", 10), ("b.vtt", 20), ("c.vtt", 30)] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, vec![0u8; 100]).unwrap();
+            std::fs::File::options()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(at(secs))
+                .unwrap();
+        }
+        trim(dir.path(), 250);
+        let left = |name: &str| dir.path().join(name).exists();
+        assert!(!left("a.vtt"), "the oldest goes");
+        assert!(left("b.vtt") && left("c.vtt"));
+        assert!(dir.path().join("work").is_dir());
+        trim(dir.path(), 1000);
+        assert!(left("b.vtt"), "under the limit nothing goes");
+    }
+
     fn slow_ffmpeg(bin: &Path, dir: &Path, secs: &str) -> PathBuf {
         let script = bin.join("ffmpeg");
         crate::test_support::write_script(

@@ -83,6 +83,11 @@ pub const SETTINGS: &[Setting] = &[
     live("network.uplink.max_streams"),
     live("network.uplink.owner_share_percent"),
     restart("network.congestion_control"),
+    // Read once, by the endpoint's options at start (`endpoint_options`):
+    // a reload that changes only these waits for a restart, and says so.
+    restart("network.max_stranger_connections"),
+    restart("network.first_frame_timeout_secs"),
+    restart("network.stalled_read_secs"),
     restart("admin.listen"),
     restart("admin.public_url"),
     restart("admin.trusted_proxies"),

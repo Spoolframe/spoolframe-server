@@ -58,7 +58,9 @@ pub struct AudioStream {
     pub codec_long_name: String,
     /// Short name of the codec used for the video stream.
     /// Example: h264
-    pub codec_name: String,
+    /// Left out by ffprobe for a codec it does not know.
+    #[serde(default)]
+    pub codec_name: Option<String>,
     /// Duration of the video stream in timestamp units.
     pub duration_ts: Option<u64>,
     /// Profile of the codec used for the video stream (e.g., Main, High).

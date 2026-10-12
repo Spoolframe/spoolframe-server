@@ -110,9 +110,8 @@ pub fn decode(
             let track = ocr::track(&bytes, from_file_start)?;
             drop(bytes);
             match format {
-                Format::Dvb => {
-                    dvb::cues_within(&track.packets, budget).map_err(|e| e.to_string())?
-                }
+                Format::Dvb => dvb::cues_within(&track.packets, &track.extradata, budget)
+                    .map_err(|e| e.to_string())?,
                 _ => vobsub::cues_within(&track.extradata, &track.packets, budget)
                     .map_err(|e| e.to_string())?,
             }

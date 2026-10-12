@@ -111,7 +111,19 @@ struct Making {
 }
 
 /// Items queued as played or asked for at once (PX-09 finding 15).
+/// How long a set found still served is not checked again (review
+/// 2026-10-11 M16).
+const VERIFIED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+/// Sheets kept scaled for a client's size: a few sets' worth.
+const RESIZED_KEPT: usize = 32;
+
+/// A sheet scaled for a size: its set's key, its number, the width, and
+/// the picture.
+type Resized = (String, u32, u32, Arc<Vec<u8>>);
+
 const MAX_URGENT: usize = 16;
+/// Played films whose previews are made at once (review 2026-10-11 M17).
+const URGENT_SLOTS: usize = 2;
 
 #[derive(Debug, Default)]
 struct Queue {
@@ -236,6 +248,18 @@ pub struct Previews {
     /// its file still makes the key. Empty at start: a client asks for
     /// the previews again before it fetches their sheets.
     shown: Mutex<HashMap<String, MediaId>>,
+    /// Each set last found still served ([`Previews::sheet`]): when, under
+    /// which catalog (its change number), and its file. Plex is asked
+    /// again only after [`VERIFIED_FOR`] or a catalog change, not per sheet
+    /// fetched; the file is looked at each time (review 2026-10-11 M16).
+    verified: Mutex<HashMap<String, (std::time::Instant, u64, PathBuf)>>,
+    /// The catalog's changes, when it tells them: a change (a library no
+    /// longer served) asks Plex again at once.
+    changes: Mutex<Option<watch::Receiver<u64>>>,
+    /// Sheets made smaller for a size a client asked for, newest last, at
+    /// most [`RESIZED_KEPT`]: a scrub fetches each sheet of a set at one
+    /// size, again and again (review 2026-10-11 M16).
+    resized: Mutex<std::collections::VecDeque<Resized>>,
     /// The server is stopping: the file being made is given up between
     /// two tiles, and nothing more is made.
     stopped: AtomicBool,
@@ -305,6 +329,9 @@ impl Previews {
             wake: Arc::default(),
             failed: Mutex::default(),
             shown: Mutex::default(),
+            verified: Mutex::default(),
+            changes: Mutex::default(),
+            resized: Mutex::default(),
             stopped: AtomicBool::new(false),
             made: Counter::default(),
             failures: Counter::default(),
@@ -468,32 +495,80 @@ impl Previews {
     /// last told of the set for, and its file still makes `key`. Without
     /// that, a sheet's id was enough to fetch it for as long as the cache
     /// kept it, after its library stopped being served too.
+    ///
+    /// Found served, a set's item is not asked of Plex again for
+    /// [`VERIFIED_FOR`] or until the catalog changes: a scrub fetches its
+    /// sheets one after another. Its file is still looked at each time.
     pub async fn sheet(&self, key: &str, n: u32) -> Option<Vec<u8>> {
         let shown = self.shown.lock().get(key).cloned()?;
-        let still = match self.sources.catalog.media_path(&shown).await {
-            Ok(path) => self::key(&path, self.settings().interval)
+        let change = self.changes.lock().as_ref().map_or(0, |c| *c.borrow());
+        let kept = self
+            .verified
+            .lock()
+            .get(key)
+            .filter(|(at, under, _)| at.elapsed() < VERIFIED_FOR && *under == change)
+            .map(|(_, _, path)| path.clone());
+        let path = match &kept {
+            Some(path) => Some(path.clone()),
+            None => self.sources.catalog.media_path(&shown).await.ok(),
+        };
+        let still = match &path {
+            Some(path) => self::key(path, self.settings().interval)
                 .await
                 .is_ok_and(|now| now == key),
-            Err(_) => false,
+            None => false,
         };
         if !still {
             self.shown.lock().remove(key);
+            self.verified.lock().remove(key);
             return None;
+        }
+        if kept.is_none()
+            && let Some(path) = path
+        {
+            self.verified
+                .lock()
+                .insert(key.to_owned(), (std::time::Instant::now(), change, path));
         }
         self.cache.sheet(key, n).await
     }
 
-    /// Make the next played or asked-for item's previews, if one waits.
-    /// `false` when none does.
-    async fn work_urgent(&self) -> bool {
-        if self.stopped.load(Ordering::SeqCst) {
-            return false;
+    /// Ask the catalog again at once, past [`VERIFIED_FOR`], whenever
+    /// `changes` says it changed.
+    pub fn watch_catalog(&self, changes: watch::Receiver<u64>) {
+        *self.changes.lock() = Some(changes);
+    }
+
+    /// Sheet `n` of `key` at most `width` wide: [`Previews::sheet`],
+    /// scaled whole. One scaled already is kept and served again.
+    pub async fn sheet_at(&self, key: &str, n: u32, width: u32) -> Option<Arc<Vec<u8>>> {
+        let bytes = self.sheet(key, n).await?;
+        if let Some((_, _, _, kept)) = self
+            .resized
+            .lock()
+            .iter()
+            .find(|(k, at, w, _)| k == key && *at == n && *w == width)
+        {
+            return Some(kept.clone());
         }
-        let Some(id) = self.lock_queue().pop_urgent() else {
-            return false;
+        let original = crate::artwork::Artwork {
+            bytes,
+            content_type: "image/jpeg".into(),
+            etag: String::new(),
         };
-        self.work(&id, true).await;
-        true
+        let image = tokio::task::spawn_blocking(move || crate::artwork::resize(original, width))
+            .await
+            .ok()?
+            .map_err(|e| tracing::warn!(key, n, error = %e, "a preview sheet cannot be scaled"))
+            .ok()?;
+        let bytes = Arc::new(image.bytes);
+        let mut resized = self.resized.lock();
+        resized.retain(|(k, at, w, _)| !(k == key && *at == n && *w == width));
+        if resized.len() >= RESIZED_KEPT {
+            resized.pop_front();
+        }
+        resized.push_back((key.to_owned(), n, width, bytes.clone()));
+        Some(bytes)
     }
 
     /// Make `id`'s previews, which [`Queue::pop_urgent`] or
@@ -713,20 +788,39 @@ const WORK: &str = "work";
 /// Played and asked-for items, one after another, for as long as the
 /// previews exist.
 async fn urgent_loop(previews: Weak<Previews>, wake: Arc<Notify>) {
+    // Two at once: one slow film (a NAS that answers a tile in minutes)
+    // holds up only itself, not the previews of everything else played
+    // after it (review 2026-10-11 M17).
+    let mut running = tokio::task::JoinSet::new();
     loop {
         let notified = wake.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let Some(previews) = previews.upgrade() else {
+        let Some(now) = previews.upgrade() else {
             return;
         };
-        if previews.stopped.load(Ordering::SeqCst) {
+        if now.stopped.load(Ordering::SeqCst) {
+            drop(now);
+            // Each gives up its film between two tiles and cleans up:
+            // dropping the set would abort them mid-file.
+            while running.join_next().await.is_some() {}
             return;
         }
-        let worked = previews.work_urgent().await;
-        drop(previews);
-        if !worked {
+        while running.len() < URGENT_SLOTS {
+            let Some(id) = now.lock_queue().pop_urgent() else {
+                break;
+            };
+            let previews = now.clone();
+            running.spawn(async move { previews.work(&id, true).await });
+        }
+        drop(now);
+        if running.is_empty() {
             notified.await;
+        } else {
+            tokio::select! {
+                _ = running.join_next() => {}
+                () = &mut notified => {}
+            }
         }
     }
 }

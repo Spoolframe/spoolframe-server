@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- A DVB subtitle track is read for its own page only. A PID that carries
+  a page per language (common in European broadcasts) was read as one
+  track, the languages' cues interleaved and cutting each other short.
+
+- Previews of played films are made two at a time: one slow film, such
+  as one on a NAS that answers each tile in minutes, no longer holds up
+  the previews of every film played after it.
+
+- The subtitle text cache is bounded at 512 MiB: past it the least
+  recently used texts are removed, and a text served from the cache
+  counts as used. It had no bound, and a re-ripped film's old text stayed.
+
+- A device holds at most 16 direct playbacks: a new one past that ends
+  its least recently used one that is not being read. A client starting
+  playbacks in a loop no longer piles up handles for 30 minutes each.
+
+- A conversion that keeps HDR is refused as busy when no 10-bit encoder
+  of its codec has room, instead of spilling to a software encode (or an
+  8-bit card) that wrote 8-bit video under an HDR transfer. Either case is
+  logged, and so is every spill to a software encode, with the encoder it
+  runs on and the GPUs that were full.
+
+- A file with a stream of a codec ffprobe does not know is described
+  with that stream's codec as "unknown", instead of the whole file being
+  unreadable: ffprobe leaves `codec_name` out for such a stream, and the
+  probe failed to parse.
+
 - `network.wan.mapped_port.public_ip = "lookup"` looks the address up
   again every hour, and after a failed lookup. It was looked up once at
   start: a server started before its network was up advertised no

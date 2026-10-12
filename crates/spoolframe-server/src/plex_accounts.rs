@@ -229,7 +229,8 @@ impl PlexAccounts {
     pub async fn begin(&self, user: LocalUserId, forward: Option<&str>) -> Result<Pin, LinkError> {
         let plex_tv = self.plex_tv()?;
         {
-            let now = std::time::Instant::now();
+            // The store's clock, so a test can move past the window.
+            let now = self.store.clock().now();
             let mut begun = self.begun.lock();
             begun.retain(|_, times| {
                 times.retain(|at| now.duration_since(*at) < LINK_BEGIN_WINDOW);
@@ -256,7 +257,7 @@ impl PlexAccounts {
         {
             pins.remove(oldest);
         }
-        pins.insert(pin.id, (user, std::time::Instant::now()));
+        pins.insert(pin.id, (user, self.store.clock().now()));
         Ok(pin)
     }
 
@@ -426,6 +427,43 @@ pub fn token_for_url(resources: &[PlexResource], url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The begin window is timed by the store's clock: a user at the
+    /// limit is let begin again once it has passed (review 2026-10-11
+    /// L42).
+    #[tokio::test]
+    async fn a_user_at_the_begin_limit_may_begin_again_after_the_window() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-link-window").await;
+        let store = crate::store::Store::open(dir.as_ref()).await.unwrap();
+        let clock = store.clock().clone();
+        let alice = store
+            .add_user("alice", None, "phc", spoolframe_types::Role::Consumer)
+            .await
+            .unwrap();
+        let accounts = PlexAccounts::new(
+            crate::config::secrets::Secrets::new(dir.as_ref()),
+            store,
+            PlexSite {
+                // Nothing listens: a begin let through fails reaching it.
+                api: "http://127.0.0.1:9".parse().unwrap(),
+                app: "http://127.0.0.1:9".parse().unwrap(),
+            },
+            None,
+        );
+        accounts.begun.lock().insert(
+            alice,
+            std::iter::repeat_n(clock.now(), MAX_LINK_BEGINS).collect(),
+        );
+        assert!(matches!(
+            accounts.begin(alice, None).await,
+            Err(LinkError::TooMany { .. })
+        ));
+        clock.advance(LINK_BEGIN_WINDOW);
+        assert!(!matches!(
+            accounts.begin(alice, None).await,
+            Err(LinkError::TooMany { .. })
+        ));
+    }
 
     fn resource(name: &str, connections: &[(&str, bool, bool)]) -> PlexResource {
         PlexResource {

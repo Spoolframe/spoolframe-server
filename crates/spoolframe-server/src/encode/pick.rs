@@ -157,12 +157,32 @@ pub fn keeps_hdr(spec: &EncodeSpec<'_>) -> bool {
 /// budget rather than being refused (the user's choice, 2026-10-10: a
 /// slower conversion over none). Only with the CPU's budget full too is
 /// it refused as busy, when its run takes its place.
-pub fn run_on(detected: &Detected, spec: &EncodeSpec<'_>, room: &dyn Fn(&Gpu) -> bool) -> RunOn {
-    match choose(spec, &detected.gpus, room) {
+///
+/// An encode that keeps HDR is refused ([`NoTenBit`]) when where it would
+/// run writes no 10 bits of its codec: a spill (software encodes H.264
+/// only, and not in 10 bits), or no card with a 10-bit encoder of it.
+/// Run anyway, it would write 8-bit video under an HDR transfer, which no
+/// screen shows right; the planner offered HDR while a 10-bit card had
+/// room, and it filled since.
+pub fn run_on(
+    detected: &Detected,
+    spec: &EncodeSpec<'_>,
+    room: &dyn Fn(&Gpu) -> bool,
+) -> Result<RunOn, NoTenBit> {
+    let run = match choose(spec, &detected.gpus, room) {
         Some(gpu) if !room(gpu) => spill(detected, spec),
         gpu => RunOn::new(detected, gpu.cloned()),
+    };
+    if keeps_hdr(spec) && !run.encodes_ten_bit(spec) {
+        return Err(NoTenBit);
     }
+    Ok(run)
 }
+
+/// [`run_on`]'s refusal of an encode that keeps HDR where no 10-bit
+/// encoder of its codec has room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoTenBit;
 
 /// `spec` encoded in software, as when every card that encodes its codec
 /// is full: decoding (and filtering, where it can) on the first card in
@@ -361,7 +381,9 @@ pub fn routes(
             let mut full: Vec<String> = Vec::new();
             let busy_after = loop {
                 let room = |gpu: &Gpu| !full.contains(&gpu.card().key());
-                let run = run_on(detected, &probe, &room);
+                let Ok(run) = run_on(detected, &probe, &room) else {
+                    break true;
+                };
                 let step = step_on(&probe, &run);
                 // Every card full, the run spills to a software encode:
                 // the last step, or busy when software cannot encode the
@@ -547,6 +569,26 @@ impl RunOn {
     pub fn spilled(&self) -> bool {
         self.spilled
     }
+
+    /// Whether the video encoder `spec`'s run picks here writes 10 bits.
+    fn encodes_ten_bit(&self, spec: &EncodeSpec<'_>) -> bool {
+        let on = EncodeSpec {
+            encoders: self.encoders(),
+            vaapi_device: self.vaapi_device(),
+            ..spec.clone()
+        };
+        args::placement(&on).is_some_and(|p| on.encoders.encodes_ten_bit(p.encoder))
+    }
+
+    /// The video encoder `spec`'s run picks here, for the log.
+    pub fn encoder_name(&self, spec: &EncodeSpec<'_>) -> Option<String> {
+        let on = EncodeSpec {
+            encoders: self.encoders(),
+            vaapi_device: self.vaapi_device(),
+            ..spec.clone()
+        };
+        args::placement(&on).map(|p| p.encoder.name.clone())
+    }
 }
 
 #[cfg(test)]
@@ -713,15 +755,15 @@ mod tests {
             move |gpu: &Gpu| !n.iter().any(|p| gpu.card().host.pci == *p)
         };
 
-        let free = run_on(&detected, &probe, &full(&[]));
+        let free = run_on(&detected, &probe, &full(&[])).unwrap();
         assert!(!free.spilled());
         assert_eq!(pci(&free).as_deref(), Some("0000:01:00.0"));
 
-        let one_full = run_on(&detected, &probe, &full(&["0000:01:00.0"]));
+        let one_full = run_on(&detected, &probe, &full(&["0000:01:00.0"])).unwrap();
         assert!(!one_full.spilled());
         assert_eq!(pci(&one_full).as_deref(), Some("0000:02:00.0"));
 
-        let both = run_on(&detected, &probe, &full(&["0000:01:00.0", "0000:02:00.0"]));
+        let both = run_on(&detected, &probe, &full(&["0000:01:00.0", "0000:02:00.0"])).unwrap();
         assert!(both.spilled());
         assert_eq!(pci(&both).as_deref(), Some("0000:01:00.0"));
         let on = EncodeSpec {
@@ -746,7 +788,7 @@ mod tests {
             notes: Vec::new(),
         };
         let av1 = film("av1", 1080);
-        let run = run_on(&detected, &spec(&av1, 720, &software), &|_| false);
+        let run = run_on(&detected, &spec(&av1, 720, &software), &|_| false).unwrap();
         assert!(run.spilled());
         assert!(run.gpu().is_none());
     }
@@ -859,6 +901,64 @@ mod tests {
         assert_eq!(
             picked(&gpus, &encode(true), &[]).as_deref(),
             Some("0000:01:00.0")
+        );
+    }
+
+    /// An encode that keeps HDR never runs 8-bit (review 2026-10-11 M6):
+    /// with its 10-bit card full, a spill to software (no 10 bits) is
+    /// refused, and so is a card whose encoder of the codec is 8-bit only.
+    #[test]
+    fn an_encode_that_keeps_hdr_is_refused_rather_than_written_in_8_bits() {
+        let software = Encoders::software_baseline();
+        let eight = card(1, Hardware::Vaapi, Kind::Discrete, &[HEVC], &[HEVC]);
+        let ten = {
+            let mut encoders = card(2, Hardware::Vaapi, Kind::Integrated, &[HEVC], &[HEVC])
+                .encoders()
+                .clone();
+            encoders.ten_bit = encoders
+                .video
+                .iter()
+                .filter(|e| e.codec == HEVC)
+                .cloned()
+                .collect();
+            Arc::new(test_gpu(2, Hardware::Vaapi, Kind::Integrated, encoders))
+        };
+        let detected = |gpus: Vec<Arc<Gpu>>| Detected {
+            encoders: Arc::new(software.clone()),
+            gpus,
+            software: Arc::new(software.clone()),
+            others: Vec::new(),
+            notes: Vec::new(),
+        };
+        let mut hdr = film("hevc", 2160);
+        {
+            let v = hdr.video.as_mut().unwrap();
+            v.bit_depth = 10;
+            v.hdr = Some(spoolframe_types::HdrFormat::Hdr10);
+            v.color_transfer = Some("smpte2084".into());
+        }
+        let probe = EncodeSpec {
+            video: Some(ConvertedVideo::Encode {
+                codec: HEVC,
+                height: 1080,
+                max_bitrate: None,
+                tone_map: false,
+            }),
+            ..spec(&hdr, 1080, &software)
+        };
+        let both = detected(vec![eight.clone(), ten]);
+        assert!(run_on(&both, &probe, &|_| true).is_ok());
+        assert_eq!(
+            run_on(&both, &probe, &|gpu: &Gpu| gpu.card().host.pci
+                != "0000:02:00.0")
+            .err(),
+            Some(NoTenBit),
+            "the 10-bit card full: no spill to an 8-bit encode"
+        );
+        assert_eq!(
+            run_on(&detected(vec![eight]), &probe, &|_| true).err(),
+            Some(NoTenBit),
+            "an 8-bit card only"
         );
     }
 

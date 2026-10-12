@@ -798,3 +798,55 @@ async fn a_full_cache_asks_plex_nothing_for_previews_made_ahead() {
     setup.previews.make(&id, true).await.unwrap();
     assert_eq!(asked(), 1);
 }
+
+/// A scrub's sheet fetches ask Plex once a minute, not per sheet, and a
+/// sheet scaled for a size is kept and served again (review 2026-10-11
+/// M16).
+#[tokio::test]
+async fn sheets_fetched_again_ask_the_catalog_once_and_scale_once() {
+    let setup = setup_with("sheet-again", settings(), "/nonexistent/ffmpeg").await;
+    let path = setup.tmp.as_ref().join("film.mkv");
+    std::fs::write(&path, b"a film").unwrap();
+    setup.files.files.lock().insert("film".into(), path);
+    setup
+        .files
+        .indexed
+        .lock()
+        .insert("film".into(), plex_frames(60));
+    let (key, _) = setup.ready(&film("film")).await;
+    let asked = || setup.files.asked.load(std::sync::atomic::Ordering::SeqCst);
+    let before = asked();
+    for _ in 0..5 {
+        assert!(setup.previews.sheet(&key, 0).await.is_some());
+    }
+    assert_eq!(asked() - before, 1, "one check for five fetches");
+    let small = setup.previews.sheet_at(&key, 0, 160).await.unwrap();
+    let again = setup.previews.sheet_at(&key, 0, 160).await.unwrap();
+    assert!(Arc::ptr_eq(&small, &again), "scaled once, then kept");
+    let decoded = image::load_from_memory(&small).unwrap();
+    assert!(decoded.width() <= 160);
+}
+
+/// A slow film holds up only itself: a second film played after it has
+/// its previews started while the first is still being made (review
+/// 2026-10-11 M17).
+#[tokio::test]
+async fn a_slow_film_does_not_hold_up_the_next_played() {
+    let mut gated = gated("two-urgent", settings()).await;
+    let a = gated.setup.film("a", 30, 0);
+    let b = gated.setup.film("b", 30, 0);
+    gated.setup.previews.played(&a);
+    gated.setup.previews.played(&b);
+    let mut started = std::collections::HashSet::new();
+    for _ in 0..2 {
+        let (film, _) = tokio::time::timeout(Duration::from_secs(10), gated.asked.recv())
+            .await
+            .expect("only one film is being made")
+            .unwrap();
+        started.insert(film);
+    }
+    assert_eq!(started.len(), 2, "{started:?}");
+    gated.permits.add_permits(1000);
+    gated.setup.ready(&a).await;
+    gated.setup.ready(&b).await;
+}

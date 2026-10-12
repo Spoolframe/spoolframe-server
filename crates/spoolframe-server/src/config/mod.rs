@@ -2104,10 +2104,28 @@ pub struct WatchSyncConfig {
 
 impl WatchSyncConfig {
     pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(120);
+    /// The shortest interval taken: a sync asks Plex for every library's
+    /// watch state, and more often than this only loads the PMS.
+    pub const MIN_INTERVAL_SECS: u64 = 10;
 
     pub fn interval(&self) -> Duration {
         self.interval_secs
-            .map_or(Self::DEFAULT_INTERVAL, |s| Duration::from_secs(s.max(10)))
+            .map_or(Self::DEFAULT_INTERVAL, Duration::from_secs)
+    }
+
+    /// An interval under [`Self::MIN_INTERVAL_SECS`] is refused, not
+    /// quietly raised to it.
+    fn check(&self) -> Result<(), ConfigError> {
+        match self.interval_secs {
+            Some(secs) if secs < Self::MIN_INTERVAL_SECS => Err(ConfigError::Invalid {
+                key: "plex.watch_sync.interval_secs",
+                message: format!(
+                    "{secs}: a sync runs at most every {} seconds",
+                    Self::MIN_INTERVAL_SECS
+                ),
+            }),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -2196,6 +2214,9 @@ impl PlexConfig {
     fn check(&self, libraries: Option<&[LibraryConfig]>) -> Result<(), ConfigError> {
         self.url()?;
         self.path_map()?;
+        if let Some(sync) = &self.watch_sync {
+            sync.check()?;
+        }
         let mut ids = vec![FIRST_PLEX_SERVER];
         for server in &self.servers {
             if !is_server_id(&server.id) {
@@ -3143,6 +3164,29 @@ mod tests {
         let sync = on.plex.unwrap().watch_sync.unwrap();
         assert_eq!(sync.user.as_deref(), Some("andoriyu"));
         assert_eq!(sync.interval(), Duration::from_secs(120));
+    }
+
+    /// An interval too short is refused with its key, not raised to 10 s
+    /// without a word (review 2026-10-11 L33).
+    #[test]
+    fn a_watch_sync_interval_under_ten_seconds_is_refused() {
+        let text = |secs: u64| {
+            format!(
+                r#"plex {{ url = "http://nas:32400"; watch_sync {{ interval_secs = {secs}; }} }}"#
+            )
+        };
+        assert!(matches!(
+            plex(&text(1)),
+            Err(ConfigError::Invalid {
+                key: "plex.watch_sync.interval_secs",
+                ..
+            })
+        ));
+        let ten = plex(&text(10)).unwrap();
+        assert_eq!(
+            ten.plex.unwrap().watch_sync.unwrap().interval(),
+            Duration::from_secs(10)
+        );
     }
 
     /// PX-04's config syncs what it synced: every library of the first
