@@ -300,6 +300,12 @@ pub enum SdkError {
     /// or sign out. Show "Choose a new password".
     #[error("choose a new password first")]
     PasswordChangeRequired,
+    /// [`crate::Session::leave_server`] from the last enabled admin, or
+    /// the last enabled admin with a password (PX-47): make someone else
+    /// an admin, or give one a password, first. Nothing changed, and the
+    /// server is still saved here.
+    #[error("you are the only admin; make someone else an admin first")]
+    LastAdmin,
     /// Pairing this device with a portable identity, or a phone with a
     /// device, did not happen (P7-03); [`PairingError`] says why.
     #[error(transparent)]
@@ -369,6 +375,7 @@ impl SdkError {
             ServerError::NotForPortableUsers => SdkError::NotForPortableUsers,
             ServerError::AdminRequired => SdkError::AdminRequired,
             ServerError::PasswordChangeRequired => SdkError::PasswordChangeRequired,
+            ServerError::LastAdmin => SdkError::LastAdmin,
             other => SdkError::Server(other.to_string()),
         }
     }
@@ -415,6 +422,14 @@ mod tests {
         assert_eq!(
             SdkError::from_server(ServerError::PortableIdTaken),
             SdkError::PortableIdTaken
+        );
+    }
+
+    #[test]
+    fn the_last_admin_is_told_why_they_cannot_leave() {
+        assert_eq!(
+            SdkError::from_server(ServerError::LastAdmin),
+            SdkError::LastAdmin
         );
     }
 

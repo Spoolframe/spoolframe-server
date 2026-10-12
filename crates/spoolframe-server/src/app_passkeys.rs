@@ -409,6 +409,11 @@ fn nonce() -> Vec<u8> {
 /// Its state is JSON with the challenge, base64url, at
 /// `<inner>.challenge`; one that is not is an error, never a state with
 /// the old challenge.
+///
+/// That layout is webauthn-rs's own, not its API (CR-11 L59). The test
+/// `tests::an_app_passkey_is_made_and_signs_in_with_the_challenge_the_app_derives`
+/// runs a registration and a sign-in through this with a soft token: bump
+/// `webauthn-rs` in the workspace `Cargo.toml` only with it passing.
 fn with_challenge<T: Serialize + DeserializeOwned>(
     state: T,
     inner: &str,
@@ -454,5 +459,112 @@ fn asserted(signed: &FinishPasskeySignIn) -> PublicKeyCredential {
         },
         extensions: Default::default(),
         type_: "public-key".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use webauthn_authenticator_rs::AuthenticatorBackend as _;
+    use webauthn_authenticator_rs::softtoken::SoftToken;
+    use webauthn_rs::prelude::{DiscoverableKey, Passkey, Url};
+
+    use super::*;
+
+    /// This server's endpoint id, as the app knows it.
+    const SERVER: [u8; 32] = [0x5a; 32];
+
+    /// `value` again, through its JSON: a ceremony's state is used up by
+    /// finishing it, and webauthn-rs gives it no `Clone`.
+    fn copy<T: Serialize + DeserializeOwned>(value: &T) -> T {
+        serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap()
+    }
+
+    /// CR-11 L59: [`with_challenge`] writes into webauthn-rs's private
+    /// ceremony state. This runs a registration and a sign-in through it,
+    /// with the soft token signing the challenge the app derives
+    /// ([`app_passkey_challenge`]), never the one webauthn-rs made. A
+    /// webauthn-rs whose state no longer has `rs.challenge` or
+    /// `ast.challenge`, or no longer checks the one there, fails here
+    /// rather than every app passkey ceremony in production. Confirming
+    /// (P3-07) uses the sign-in's state type and slot.
+    #[test]
+    fn an_app_passkey_is_made_and_signs_in_with_the_challenge_the_app_derives() {
+        let party = RelyingParty::at("l59.spoolframe.app", "https://l59.spoolframe.app").unwrap();
+        let origin = Url::parse(&party.origin).unwrap();
+        let mut token = SoftToken::new(true).unwrap().0;
+
+        // Registration: the state takes the derived challenge.
+        let handle = Uuid::new_v4();
+        let (creation, state) = party
+            .webauthn
+            .start_passkey_registration(handle, "alice", "Alice", None)
+            .unwrap();
+        let challenge = app_passkey_challenge(&SERVER, &nonce());
+        let unchanged = copy(&state);
+        let state = with_challenge(state, "rs", &challenge).unwrap();
+        let mut options = creation.public_key;
+        options.challenge = challenge.clone().into();
+        let made = token
+            .perform_register(origin.clone(), options, 60_000)
+            .unwrap();
+        let made = registered(&FinishPasskeyRegistration {
+            credential_id: made.raw_id.to_vec(),
+            attestation_object: made.response.attestation_object.to_vec(),
+            client_data_json: made.response.client_data_json.to_vec(),
+            name: "phone".to_owned(),
+        });
+        // The challenge is load-bearing: the state webauthn-rs made
+        // refuses what was signed for the derived one.
+        assert!(party.made(&made, &unchanged).is_err());
+        let (_, json) = party.made(&made, &state).unwrap();
+        let passkey: Passkey = serde_json::from_str(&json).unwrap();
+
+        // Sign-in: the same, with the discoverable ceremony's state.
+        let (_, state) = party.webauthn.start_discoverable_authentication().unwrap();
+        let challenge = app_passkey_challenge(&SERVER, &nonce());
+        let unchanged = copy(&state);
+        let state = with_challenge(state, "ast", &challenge).unwrap();
+        let options = serde_json::from_value(json!({
+            "challenge": URL_SAFE_NO_PAD.encode(&challenge),
+            "rpId": party.rp_id,
+            "allowCredentials": [{
+                "type": "public-key",
+                "id": URL_SAFE_NO_PAD.encode(passkey.cred_id()),
+            }],
+            "userVerification": "required",
+        }))
+        .unwrap();
+        let signed = token.perform_auth(origin, options, 60_000).unwrap();
+        let signed = asserted(&FinishPasskeySignIn {
+            credential_id: signed.raw_id.to_vec(),
+            authenticator_data: signed.response.authenticator_data.to_vec(),
+            client_data_json: signed.response.client_data_json.to_vec(),
+            signature: signed.response.signature.to_vec(),
+            user_handle: Some(handle.as_bytes().to_vec()),
+        });
+        let keys = [DiscoverableKey::from(&passkey)];
+        assert!(
+            party
+                .webauthn
+                .finish_discoverable_authentication(&signed, unchanged, &keys)
+                .is_err()
+        );
+        party
+            .webauthn
+            .finish_discoverable_authentication(&signed, state, &keys)
+            .unwrap();
+    }
+
+    /// A state without the slot is an error, never a state with the
+    /// challenge webauthn-rs made.
+    #[test]
+    fn a_state_without_the_challenge_slot_is_an_error() {
+        let party = RelyingParty::at("l59.spoolframe.app", "https://l59.spoolframe.app").unwrap();
+        let (_, state) = party.webauthn.start_discoverable_authentication().unwrap();
+        let err = with_challenge(state, "rs", &[0; 32])
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.contains("rs.challenge"), "{err}");
     }
 }

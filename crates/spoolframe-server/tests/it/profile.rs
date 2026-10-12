@@ -11,7 +11,7 @@ use spoolframe_admin_api::{
 };
 use spoolframe_protocol::{
     ChosenTracks, Error, Reply, Request, Response, Selection, SessionId, TrackPreferencesInfo,
-    TrackReason, UserSummary,
+    TrackReason, UserSummary, WhoAmIReply,
 };
 use spoolframe_types::{
     MediaId, MediaKind, Namespace, SdhPreference, SubtitleMode, SubtitleRole, TrackPreferences,
@@ -58,7 +58,10 @@ async fn who(client: &TestClient, session: &SessionId) -> Response {
 
 fn shown_as(response: Response) -> String {
     match response {
-        Response::Ok(Reply::WhoAmI(UserSummary { display_name, .. })) => display_name,
+        Response::Ok(Reply::WhoAmI(WhoAmIReply {
+            user: UserSummary { display_name, .. },
+            ..
+        })) => display_name,
         other => panic!("not WhoAmI: {other:?}"),
     }
 }

@@ -814,6 +814,14 @@ async fn pair(
         if credential.user != identity || credential.device_key != device_key {
             return Err(refused(SdkError::NotThisDevice));
         }
+        // A genesis decides which roots are believed: one that does not
+        // hold, or is another identity's, is refused before anything is
+        // kept (install_with_state checks it too).
+        if let Some(genesis) = credential.genesis.as_deref()
+            && (genesis.verify().is_err() || genesis.user() != identity)
+        {
+            return Err(refused(PairingError::CredentialRefused.into()));
+        }
         if let Some(state) = &state {
             state.verify().map_err(|e| refused(e.into()))?;
             if state.user != identity {

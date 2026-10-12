@@ -10,7 +10,7 @@ use spoolframe_protocol::portable::{
     DevicePublicKey, MAX_CREDENTIAL_VALIDITY, PortableIdentityState, PortableUserId, RevokedKey,
     TieProof, UserDeviceCredential, tie_message,
 };
-use spoolframe_protocol::{Error, Reply, Request, Response, SessionId};
+use spoolframe_protocol::{Error, Reply, Request, Response, SessionId, WhoAmIReply};
 use spoolframe_types::Item;
 
 use crate::app_passkeys::web_passkey;
@@ -119,7 +119,7 @@ async fn tie(phone: &TestClient, session: &SessionId, user: u8, username: &str) 
 
 async fn tied_to(phone: &TestClient, session: &SessionId) -> Option<PortableUserId> {
     match phone.call(Some(session), Request::WhoAmI).await {
-        Response::Ok(Reply::WhoAmI(me)) => me.portable,
+        Response::Ok(Reply::WhoAmI(WhoAmIReply { user: me, .. })) => me.portable,
         other => panic!("no WhoAmI: {other:?}"),
     }
 }

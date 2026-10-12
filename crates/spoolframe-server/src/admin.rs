@@ -860,6 +860,17 @@ impl AdminApi {
     /// 24): under one name for all, five wrong codes from anyone kept the
     /// owner from setting the server up. The code is 59 random bits, so
     /// guesses from many places at five each get nowhere.
+    ///
+    /// The code is kept for the process's life, but authorizes nothing
+    /// once any user exists (CR-11 N10, checked at the 2026-10-12
+    /// review): it is made only when the server starts with no users
+    /// (`main.rs`); `setup` and `setupPasskeyFinish` insert the first admin
+    /// only `WHERE NOT EXISTS (SELECT 1 FROM users)` (`add_first_user`),
+    /// and `setupPasskeyBegin` and `/auth/setup/check` ask
+    /// [`AdminApi::setup_open`] after the code; and no user row is ever
+    /// deleted (leaving disables one). So it is one-shot without being
+    /// dropped. What it still answers after setup is whether a guess was
+    /// right, counted as every guess is, about a code that opens nothing.
     fn setup_code(&self, ext: &Extensions, given: &str) -> RpcResult<()> {
         let Some(code) = &self.setup_code else {
             return Err(UserError::AlreadySetUp.into());
@@ -1681,6 +1692,7 @@ fn info(u: UserRecord, limited: Option<std::time::Duration>) -> UserInfo {
         role: u.role,
         created_at: u.created_at,
         disabled: u.disabled_at.is_some(),
+        left_at: u.left_at,
         has_password: u.has_password,
         password_changed_at: u.password_changed_at,
         password_must_change: u.password_must_change,

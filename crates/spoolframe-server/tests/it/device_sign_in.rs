@@ -13,7 +13,7 @@ use jsonrpsee::ws_client::WsClient;
 use spoolframe_admin_api::{MeApiClient, error_code};
 use spoolframe_protocol::{
     AddressNetwork, AuthMethod, DeviceAddress, DeviceSignInRequest, Error, Reply, Request,
-    Response, SessionId,
+    Response, SessionId, WhoAmIReply,
 };
 use spoolframe_types::Platform;
 use support::{ServerOptions, TestClient, TestServer, fresh_dir};
@@ -123,7 +123,7 @@ async fn an_approved_tv_gets_a_session_of_its_own() {
     };
     // Alice's, on the TV.
     match tv.call(Some(&session), Request::WhoAmI).await {
-        Response::Ok(Reply::WhoAmI(user)) => assert_eq!(user.username, "alice"),
+        Response::Ok(Reply::WhoAmI(WhoAmIReply { user, .. })) => assert_eq!(user.username, "alice"),
         other => panic!("{other:?}"),
     }
     // Bound to the TV: useless from the phone.
@@ -346,7 +346,7 @@ async fn a_tv_approved_in_a_browser_gets_a_session_as_the_web_user() {
     };
     // Alice's, on the TV, and one of her devices from now on.
     match tv.call(Some(&session), Request::WhoAmI).await {
-        Response::Ok(Reply::WhoAmI(user)) => assert_eq!(user.username, "alice"),
+        Response::Ok(Reply::WhoAmI(WhoAmIReply { user, .. })) => assert_eq!(user.username, "alice"),
         other => panic!("{other:?}"),
     }
     let devices = alice.devices().await.unwrap();
@@ -393,7 +393,7 @@ async fn a_web_session_made_with_a_passkey_approves_a_tv() {
         other => panic!("not signed in: {other:?}"),
     };
     match tv.call(Some(&session), Request::WhoAmI).await {
-        Response::Ok(Reply::WhoAmI(user)) => assert_eq!(user.username, "alice"),
+        Response::Ok(Reply::WhoAmI(WhoAmIReply { user, .. })) => assert_eq!(user.username, "alice"),
         other => panic!("{other:?}"),
     }
     tv.close().await;

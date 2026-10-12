@@ -598,7 +598,9 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
         UserCommand::List => {
             for user in api.user_list().await.map_err(api_error)? {
                 let mut flags = vec![user.role.as_str().to_owned()];
-                if user.disabled {
+                if user.left_at.is_some() {
+                    flags.push("left (enable restores)".into());
+                } else if user.disabled {
                     flags.push("disabled".into());
                 }
                 if let Some(secs) = user.rate_limited_secs {

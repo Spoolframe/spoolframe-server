@@ -15,9 +15,10 @@ use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
@@ -432,7 +433,9 @@ fn router(
         }
     });
     let web = crate::web::Web::default();
-    Router::new()
+    // Anyone can post to these: a sign-in's or a setup's JSON is a few
+    // hundred bytes, a passkey's a few KiB (CR-11 N10).
+    let auth = Router::new()
         .route("/auth/login", post(login))
         .route("/auth/passkey/begin", post(passkey_begin))
         .route("/auth/passkey/finish", post(passkey_finish))
@@ -440,11 +443,15 @@ fn router(
         .route("/auth/setup/check", post(setup_check))
         .route("/auth/setup/passkey/begin", post(setup_passkey_begin))
         .route("/auth/setup/passkey/finish", post(setup_passkey_finish))
-        .route("/auth/oidc/begin", post(sso_begin))
-        .route("/auth/oidc/callback", get(sso_callback))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/auth/site", get(site))
+        .layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT));
+    Router::new()
+        .merge(auth)
+        // Reads its body itself, held to `SMALL_BODY`.
+        .route("/auth/oidc/begin", post(sso_begin))
+        .route("/auth/oidc/callback", get(sso_callback))
         .route("/catalog/artwork", get(catalog_artwork))
         .route("/metrics", get(metrics_page))
         .with_state(api)
@@ -464,6 +471,7 @@ fn router(
         }))
         .layer(middleware::from_fn_with_state(proxies, credentials))
         .layer(middleware::from_fn_with_state(origins, check_origin))
+        .layer(middleware::from_fn(request_timeout))
         // Outermost: refusals get the headers too.
         .layer(middleware::from_fn(security_headers))
 }
@@ -603,6 +611,44 @@ where
     ) -> impl Future<Output = Self::NotificationResponse> + Send + 'a {
         self.inner.notification(n)
     }
+}
+
+/// The most an `/auth` route's body may be (CR-11 N10): a password
+/// sign-in, a setup or a passkey's assertion or attestation (with no
+/// attestation certificates asked for) is well under it. Past it, 413
+/// before the body is read whole.
+pub const AUTH_BODY_LIMIT: usize = 16 * 1024;
+
+/// How long a request to the admin listener may take, its body read
+/// included, before it is answered 408 and its handler dropped (CR-11
+/// N10): a client that sends its body a byte at a time, or a handler that
+/// hangs on a provider, holds nothing past it.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// [`REQUEST_TIMEOUT`] on every request but the JSON-RPC ones
+/// ([`times_out`]).
+async fn request_timeout(req: Request, next: Next) -> Response<Body> {
+    if !times_out(&req) {
+        return next.run(req).await;
+    }
+    match tokio::time::timeout(REQUEST_TIMEOUT, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => {
+            tracing::debug!(after = ?REQUEST_TIMEOUT, "an admin HTTP request timed out");
+            StatusCode::REQUEST_TIMEOUT.into_response()
+        }
+    }
+}
+
+/// Whether `req` is held to [`REQUEST_TIMEOUT`]. Not a WebSocket upgrade,
+/// on any path: it is the socket's whole life, the web UI's and the CLI's
+/// (and `dx serve`'s hot reload in a debug build). Not a JSON-RPC call
+/// posted to `/jsonrpc`: a method runs as long as it does, and
+/// `uplinkMeasure` takes up to three 25 s uploads. Nothing else streams
+/// or polls: the pages are embedded, `/auth/*`, `/catalog/artwork` and
+/// `/metrics` answer once.
+fn times_out(req: &Request) -> bool {
+    !is_upgrade(req.headers()) && req.uri().path() != "/jsonrpc"
 }
 
 fn is_upgrade(headers: &HeaderMap) -> bool {
@@ -1542,6 +1588,58 @@ mod tests {
         // Live: the next sign-in reads it again.
         cookies.set_insecure(false);
         assert!(cookies.set("abc").to_str().unwrap().contains("Secure"));
+    }
+
+    /// A route that answers after a minute, behind [`request_timeout`]:
+    /// at `/slow`, and at `/jsonrpc` as the socket's path.
+    fn slow_router() -> Router {
+        async fn slow() -> &'static str {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            "done"
+        }
+        Router::new()
+            .route("/slow", get(slow).post(slow))
+            .route("/jsonrpc", get(slow).post(slow))
+            .layer(middleware::from_fn(request_timeout))
+    }
+
+    async fn status_of(request: axum::http::Request<Body>) -> StatusCode {
+        use tower::ServiceExt as _;
+        slow_router().oneshot(request).await.unwrap().status()
+    }
+
+    /// CR-11 N10: a request whose handler (or body) takes too long is
+    /// answered 408, and the handler dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_request_is_answered_request_timeout() {
+        let request = axum::http::Request::post("/slow")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(request).await, StatusCode::REQUEST_TIMEOUT);
+    }
+
+    /// A WebSocket upgrade, on any path, is the socket's whole life: never
+    /// cut by the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_websocket_upgrade_is_not_cut_by_the_timeout() {
+        for path in ["/jsonrpc", "/slow"] {
+            let request = axum::http::Request::get(path)
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(status_of(request).await, StatusCode::OK, "{path}");
+        }
+    }
+
+    /// A JSON-RPC call over a plain POST runs as long as its method does
+    /// (`uplinkMeasure` takes up to three 25 s uploads).
+    #[tokio::test(start_paused = true)]
+    async fn a_json_rpc_post_is_not_cut_by_the_timeout() {
+        let request = axum::http::Request::post("/jsonrpc")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(request).await, StatusCode::OK);
     }
 
     /// A port still held as the server starts again in place is waited

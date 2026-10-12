@@ -38,7 +38,7 @@ pub use messages::{
     DeviceSignInRequest, Error, Event, Hello, HomeScreen, LoginPassword, MAX_HELLO_TEXT,
     ManifestKind, PROTOCOL_VERSION, PinProof, PinState, PortableSignIn, RedeemInvite,
     RedeemPortableInvite, Reply, Request, RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo,
-    SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary,
+    SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary, WhoAmIReply,
 };
 pub use passkeys::{
     FinishPasskeyRegistration, FinishPasskeySignIn, LEGACY_APP_RP_ID, NONCE_LEN, PasskeyCreation,

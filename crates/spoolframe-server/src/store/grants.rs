@@ -43,6 +43,10 @@ pub struct PortableSessionUser {
     pub user: PortableUserId,
     /// Their display name, else their fingerprint.
     pub display_name: String,
+    /// When this session was opened, Unix seconds: when its credential was
+    /// last presented here, which is what a recent sign-in asks of a
+    /// portable user (PX-47).
+    pub authenticated_at: i64,
 }
 
 /// The credential a session was opened with (P7-06, after review): the
@@ -177,22 +181,37 @@ impl Store {
     /// ([`Store::redeem_portable_invite`]), only a newer one.
     pub async fn revoke_grant(&self, portable: PortableUserId) -> Result<bool, StoreError> {
         let mut tx = self.begin_write().await?;
-        sqlx::query("DELETE FROM portable_sessions WHERE portable_user_id = ?1")
-            .bind(portable.to_string())
-            .execute(&mut *tx)
-            .await?;
-        let removed = sqlx::query(
-            "UPDATE portable_grants SET revoked_at = ?2 \
-             WHERE portable_user_id = ?1 AND revoked_at IS NULL",
-        )
-        .bind(portable.to_string())
-        .bind(self.now())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let removed = revoke_grant_in(&mut tx, portable, self.now()).await?;
         tx.commit().await?;
         self.note_sessions_ended();
-        Ok(removed == 1)
+        Ok(removed)
+    }
+
+    /// `portable` leaves this server (PX-47): its grant revoked as
+    /// [`Store::revoke_grant`] revokes it, its sessions ended, and what it
+    /// kept here deleted: watch state, hidden rows, track preferences and
+    /// overrides. `false` if it had no live grant.
+    pub async fn leave_portable(&self, portable: PortableUserId) -> Result<bool, StoreError> {
+        let principal = crate::principal::Principal::PortableUser(portable).to_string();
+        let mut tx = self.begin_write().await?;
+        let removed = revoke_grant_in(&mut tx, portable, self.now()).await?;
+        // The `_ids` tables first: they refer to their parents' rows.
+        for delete in [
+            "DELETE FROM watch_state_ids WHERE principal = ?1",
+            "DELETE FROM watch_state WHERE principal = ?1",
+            "DELETE FROM continue_hidden_ids WHERE principal = ?1",
+            "DELETE FROM continue_hidden WHERE principal = ?1",
+            "DELETE FROM track_overrides WHERE principal = ?1",
+            "DELETE FROM track_preferences WHERE principal = ?1",
+        ] {
+            sqlx::query(delete)
+                .bind(&principal)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        self.note_sessions_ended();
+        Ok(removed)
     }
 
     /// Record a session for granted portable user `credential.user` on
@@ -240,8 +259,8 @@ impl Store {
         lifetime_secs: i64,
     ) -> Result<Option<PortableSessionUser>, StoreError> {
         let now = self.now();
-        let row: Option<(String, Option<String>, i64)> = sqlx::query_as(
-            "SELECT g.portable_user_id, g.display_name, s.last_used_at \
+        let row: Option<(String, Option<String>, i64, i64)> = sqlx::query_as(
+            "SELECT g.portable_user_id, g.display_name, s.last_used_at, s.created_at \
              FROM portable_sessions s \
              JOIN portable_grants g ON g.portable_user_id = s.portable_user_id \
              WHERE s.token_hash = ?1 AND s.endpoint_id = ?2 \
@@ -255,7 +274,7 @@ impl Store {
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((id, display_name, last_used_at)) = row else {
+        let Some((id, display_name, last_used_at, created_at)) = row else {
             return Ok(None);
         };
         if now - last_used_at >= super::sessions::RENEW_EVERY_SECS {
@@ -266,6 +285,7 @@ impl Store {
         Ok(Some(PortableSessionUser {
             user,
             display_name: shown_name(user, display_name.as_deref()),
+            authenticated_at: created_at,
         }))
     }
 
@@ -316,8 +336,31 @@ impl Store {
     /// user's ([`Store::endpoint_signed_in`]) or a portable user's. Such a
     /// device gets the normal connection limits; any other is a stranger.
     pub async fn endpoint_has_any_session(&self, endpoint_id: &str) -> Result<bool, StoreError> {
-        Ok(self.endpoint_signed_in(endpoint_id).await?
-            || self.endpoint_has_portable_session(endpoint_id).await?)
+        Ok(self.endpoint_sessions(endpoint_id).await?.any())
+    }
+
+    /// Which live sessions `endpoint_id` has, in one query: a local user's
+    /// (as [`Store::endpoint_signed_in`] asks) and a portable user's (as
+    /// [`Store::endpoint_has_portable_session`] asks). What every new
+    /// connection is asked before the strangers' cap (CR-11 L17), so one
+    /// round trip, not two.
+    pub async fn endpoint_sessions(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<EndpointSessions, StoreError> {
+        let (local, portable): (bool, bool) = sqlx::query_as(
+            "SELECT \
+               EXISTS (SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id \
+                 WHERE s.kind = 'endpoint' AND s.endpoint_id = ?1 AND s.revoked_at IS NULL \
+                   AND s.expires_at > ?2 AND u.disabled_at IS NULL), \
+               EXISTS (SELECT 1 FROM portable_sessions \
+                 WHERE endpoint_id = ?1 AND revoked_at IS NULL AND expires_at > ?2)",
+        )
+        .bind(endpoint_id)
+        .bind(self.now())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(EndpointSessions { local, portable })
     }
 
     /// Whether `endpoint_id` has a live portable session.
@@ -334,6 +377,45 @@ impl Store {
         .fetch_one(&self.pool)
         .await?)
     }
+}
+
+/// The live sessions an endpoint has ([`Store::endpoint_sessions`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointSessions {
+    /// A local user's: the device is its owner's.
+    pub local: bool,
+    /// A portable user's (P7-06): a guest's.
+    pub portable: bool,
+}
+
+impl EndpointSessions {
+    /// Either: the device gets the normal connection limits.
+    pub fn any(self) -> bool {
+        self.local || self.portable
+    }
+}
+
+/// Revoke `portable`'s grant and delete its sessions, in `tx`: whether it
+/// had a live grant. The grant stays as a tombstone (`revoked_at`).
+async fn revoke_grant_in(
+    tx: &mut sqlx::SqliteConnection,
+    portable: PortableUserId,
+    now: i64,
+) -> Result<bool, StoreError> {
+    sqlx::query("DELETE FROM portable_sessions WHERE portable_user_id = ?1")
+        .bind(portable.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let removed = sqlx::query(
+        "UPDATE portable_grants SET revoked_at = ?2 \
+         WHERE portable_user_id = ?1 AND revoked_at IS NULL",
+    )
+    .bind(portable.to_string())
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    Ok(removed == 1)
 }
 
 #[cfg(test)]
@@ -441,6 +523,65 @@ mod tests {
         );
         assert!(!store.endpoint_has_portable_session("ep").await.unwrap());
         assert!(!store.revoke_grant(user(7)).await.unwrap());
+    }
+
+    /// CR-11 L17: what an unknown connection is asked before the strangers'
+    /// cap, in one query: a live local session on the endpoint, a live
+    /// portable one, both or neither; an expired one of either is none.
+    #[tokio::test]
+    async fn an_endpoint_s_live_sessions_are_told_in_one_answer() {
+        use crate::store::sessions::SessionBinding;
+        let store = test_store("endpoint-sessions").await;
+        let alice = store
+            .add_user("alice", None, "phc", spoolframe_types::Role::Consumer)
+            .await
+            .unwrap();
+        let on = |endpoint: &str| SessionBinding::Endpoint {
+            endpoint_id: endpoint.to_owned(),
+            device_name: None,
+            platform: Platform::Tvos,
+        };
+        store.grant_portable(user(7), None, None).await.unwrap();
+        let now = store.now();
+        for (hash, endpoint, expires_at) in [
+            ("local", "local", now + 3600),
+            ("both-local", "both", now + 3600),
+            ("expired-local", "expired", now - 1),
+        ] {
+            store
+                .create_session(hash, alice, &on(endpoint), expires_at, None)
+                .await
+                .unwrap();
+        }
+        for (hash, endpoint, expires_at) in [
+            ("portable", "portable", now + 3600),
+            ("both-portable", "both", now + 3600),
+            ("expired-portable", "expired", now - 1),
+        ] {
+            store
+                .create_portable_session(
+                    hash,
+                    &binding(&store, 7),
+                    endpoint,
+                    None,
+                    Platform::Ios,
+                    expires_at,
+                )
+                .await
+                .unwrap();
+        }
+        let told = |local, portable| EndpointSessions { local, portable };
+        for (endpoint, expected) in [
+            ("local", told(true, false)),
+            ("portable", told(false, true)),
+            ("both", told(true, true)),
+            ("expired", told(false, false)),
+            ("nobody", told(false, false)),
+        ] {
+            let found = store.endpoint_sessions(endpoint).await.unwrap();
+            assert_eq!(found, expected, "{endpoint}");
+            assert_eq!(found.any(), endpoint != "expired" && endpoint != "nobody");
+        }
     }
 
     #[tokio::test]

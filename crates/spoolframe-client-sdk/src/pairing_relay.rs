@@ -30,7 +30,7 @@ use crate::SdkError;
 use crate::client::{Client, parse_id};
 use crate::pairing::Paired;
 use crate::portable::{
-    DevicePublicKey, IdentityRecord, PortableIdentityState, PortableUserId, RootSigner,
+    DeviceKey, DevicePublicKey, IdentityRecord, PortableIdentityState, PortableUserId, RootSigner,
     SecurityKey, SecurityKeyError, UserDeviceCredential,
 };
 use spoolframe_protocol::portable::{HANDLE_LEN, PORTABLE_RP, root_set};
@@ -336,11 +336,11 @@ impl Client {
         let portable = self.portable();
         let identity = answer.identity;
         let device_key = answer.credential.device_key;
+        // Checked against the pending key, which becomes the identity's
+        // only once the credential is in: a refused answer leaves the key
+        // a guest already here signs in with.
         portable
-            .adopt_pending_device_key(identity, &device_key)
-            .await?;
-        portable
-            .install_with_state(answer.credential, answer.state)
+            .install_with_state_for(answer.credential, answer.state, DeviceKey::Pending)
             .await?;
         let servers = self.save_paired_servers(answer.servers).await?;
         tracing::info!(%identity, %device_key, "paired through a server");
@@ -431,5 +431,98 @@ fn names(record: &IdentityRecord, handle: &[u8; HANDLE_LEN]) -> bool {
     match &record.genesis {
         Some(genesis) => genesis.handle == *handle && genesis.user() == record.user,
         None => record.user.as_bytes() == handle,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use spoolframe_types::{ClientCapabilities, Platform};
+
+    use super::*;
+    use crate::client::{ClientOptions, Device};
+    use crate::portable::{Portable, SoftSecurityKey};
+    use crate::storage::MemoryStorage;
+
+    const SERVER: [u8; 32] = [0x5a; 32];
+    const NONCE: [u8; 32] = [0xa5; 32];
+
+    async fn tv() -> Client {
+        let device = Device {
+            name: "tv".into(),
+            client_name: "sdk-relay-pairing-test".into(),
+            client_version: "0".into(),
+            platform: Platform::Cli,
+            capabilities: ClientCapabilities::default(),
+        };
+        let options = ClientOptions {
+            lan_discovery: false,
+            relays: false,
+            ..ClientOptions::default()
+        };
+        Client::open_with_options(Arc::new(MemoryStorage::default()), device, options)
+            .await
+            .unwrap()
+    }
+
+    /// P3: a guest already here, and a root terminal that still trusts a
+    /// root the device knows was removed. Its answer is refused, and the
+    /// device keeps the key its credential names: it still signs in.
+    #[tokio::test]
+    async fn a_refused_relay_answer_leaves_the_device_key_it_had() {
+        let (a, b) = (SoftSecurityKey::new(), SoftSecurityKey::new());
+        let desktop = Portable::new(Arc::new(MemoryStorage::default()));
+        let id = desktop.create_with_keys(&[&a, &b], "Sam").await.unwrap();
+        let before_removal = desktop.identity_record(id).await.unwrap();
+
+        let tv = tv().await;
+        let guest = tv.portable();
+        guest.set_allow_guests(true).await.unwrap();
+        let tv_key = guest.device_key(id).await.unwrap();
+        let credential = desktop
+            .issue_credential_by(id, RootSigner::Key(&b), tv_key, None)
+            .await
+            .unwrap();
+        guest
+            .install_with_state(credential.clone(), None)
+            .await
+            .unwrap();
+        // A is removed, and the TV learns it.
+        let removed = desktop
+            .remove_root(id, RootSigner::Key(&b), &a.credentials()[0].root())
+            .await
+            .unwrap();
+        assert!(guest.accept_state(removed).await.unwrap());
+
+        // A terminal that last saw the identity before that pairs the TV
+        // again, signing with A.
+        let stale = Portable::new(Arc::new(MemoryStorage::default()));
+        stale.import_record(before_removal, "Sam").await.unwrap();
+        let pending = guest.pending_device_key().await.unwrap();
+        let stale_credential = stale
+            .issue_credential_by(id, RootSigner::Key(&a), pending, None)
+            .await
+            .unwrap();
+        let answer = RelayAnswer {
+            identity: id,
+            credential: stale_credential,
+            state: None,
+            servers: Vec::new(),
+        };
+        assert!(tv.accept_relay_pairing(answer).await.is_err());
+
+        assert_eq!(guest.device_key(id).await.unwrap(), tv_key);
+        assert_eq!(
+            guest.credential(id).await.unwrap(),
+            Some(credential.clone())
+        );
+        let (sent, signature) = guest.prove(id, &SERVER, &NONCE).await.unwrap();
+        assert_eq!(sent, credential);
+        assert_eq!(
+            spoolframe_protocol::portable::verify_device_proof(&sent, &SERVER, &NONCE, &signature),
+            Ok(())
+        );
+        tv.close().await;
     }
 }

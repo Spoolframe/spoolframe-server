@@ -8,6 +8,7 @@ use crate::support;
 
 use spoolframe_protocol::{
     DeviceSignInRequest, Error, LoginPassword, Reply, Request, Response, SessionId, TrustedProfile,
+    WhoAmIReply,
 };
 use spoolframe_types::Platform;
 use support::{ServerOptions, TestClient, TestServer, fresh_dir};
@@ -203,7 +204,7 @@ async fn after_the_session_expires_the_device_resumes_and_no_other_device_can() 
     let alice = user_id(&server, "alice").await;
     let session = resumed(&tv, &alice).await;
     match ok(&tv, &session, Request::WhoAmI).await {
-        Reply::WhoAmI(user) => assert_eq!(user.username, "alice"),
+        Reply::WhoAmI(WhoAmIReply { user, .. }) => assert_eq!(user.username, "alice"),
         other => panic!("{other:?}"),
     }
     // Trust is the device's key: another device is a stranger to it.
@@ -417,7 +418,7 @@ async fn a_resumed_profile_on_a_device_that_asks_for_the_pin_starts_locked() {
     assert!(trusted(&tv).await[0].pin_required);
     let session = resumed(&tv, &user_id(&server, "alice").await).await;
     match ok(&tv, &session, Request::WhoAmI).await {
-        Reply::WhoAmI(user) => assert!(user.locked),
+        Reply::WhoAmI(WhoAmIReply { user, .. }) => assert!(user.locked),
         other => panic!("{other:?}"),
     }
     assert_eq!(

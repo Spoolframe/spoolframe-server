@@ -53,6 +53,9 @@ struct State {
     open: Mutex<Vec<Connection>>,
     /// `Hello` is refused as the server refuses another protocol revision.
     refuse_hellos: AtomicBool,
+    /// Answer `LeaveServer` with `LastAdmin` (PX-47), and `WhoAmI` that
+    /// the user cannot leave.
+    last_admin: AtomicBool,
     /// The protocol revision `ServerInfo` says, when not this build's.
     protocol: Mutex<Option<u32>>,
     /// The server id `ServerInfo` says, when not the one made from the key.
@@ -129,6 +132,12 @@ impl Stub {
         }
     }
 
+    /// Refuse `LeaveServer` as the last admin's (PX-47), and say so in
+    /// `WhoAmI`.
+    pub fn refuse_leaving(&self) {
+        self.state.last_admin.store(true, Ordering::SeqCst);
+    }
+
     /// Refuse every `Hello` from now on, as a server refuses one of
     /// another protocol revision.
     pub fn refuse_hellos(&self) {
@@ -160,6 +169,16 @@ impl Stub {
     /// that is slow at it; everything else, `Ping` too, is answered.
     pub fn stall(&self, kind: &str) {
         self.state.stalled.lock().insert(kind.to_owned());
+    }
+
+    /// How many of the connections it accepted are open still.
+    pub fn open_connections(&self) -> usize {
+        self.state
+            .open
+            .lock()
+            .iter()
+            .filter(|c| c.close_reason().is_none())
+            .count()
     }
 
     /// How many connections it has accepted.
@@ -481,14 +500,21 @@ fn answer(
             password_change_required: login.password == "one-time",
         },
         Request::ChangePassword(_) => Reply::Done,
-        Request::WhoAmI => Reply::WhoAmI(UserSummary {
-            user_id: "local:1".into(),
-            username: "alice".into(),
-            display_name: "Alice".into(),
-            role: Role::Consumer,
-            locked: false,
-            pin: None,
-            portable: None,
+        Request::LeaveServer if state.last_admin.load(Ordering::SeqCst) => {
+            return Response::Err(Error::LastAdmin);
+        }
+        Request::LeaveServer => Reply::Done,
+        Request::WhoAmI => Reply::WhoAmI(spoolframe_protocol::WhoAmIReply {
+            user: UserSummary {
+                user_id: "local:1".into(),
+                username: "alice".into(),
+                display_name: "Alice".into(),
+                role: Role::Consumer,
+                locked: false,
+                pin: None,
+                portable: None,
+            },
+            can_leave: !state.last_admin.load(Ordering::SeqCst),
         }),
         Request::Libraries => Reply::Libraries {
             libraries: Vec::new(),

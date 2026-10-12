@@ -446,6 +446,9 @@ pub struct Session {
     pub(crate) server: EndpointId,
     pub(crate) token: SessionId,
     pub(crate) user: UserSummary,
+    /// Whether `WhoAmI` said the user may leave the server, when this
+    /// session was made (PX-47).
+    pub(crate) can_leave: bool,
     /// Whether the server trusted this device for the user when the
     /// session was made (P4-01); `None` for a session found again rather
     /// than made ([`crate::Client::profiles`]).
@@ -638,7 +641,7 @@ impl Session {
     /// Ask the server who this session is.
     pub async fn whoami(&self) -> Result<UserSummary, SdkError> {
         match self.call(Request::WhoAmI).await? {
-            Reply::WhoAmI(user) => Ok(user),
+            Reply::WhoAmI(spoolframe_protocol::WhoAmIReply { user, .. }) => Ok(user),
             other => Err(unexpected(other)),
         }
     }
@@ -1104,6 +1107,49 @@ impl Session {
     /// [`SdkError::NotFound`].
     pub async fn untie(&self) -> Result<(), SdkError> {
         self.done(Request::Untie).await
+    }
+
+    /// Leave this server (PX-47), then forget it on this device: its pin,
+    /// every session and profile kept for it here ([`crate::Client::forget`]).
+    /// This session ends with it, on the server and here.
+    ///
+    /// What the server does depends on who signed in. A portable user's
+    /// grant goes, and its watch history and settings there are deleted;
+    /// coming back takes a new invite. A local account is set aside: its
+    /// sessions end and it cannot sign in, its data stays, and the
+    /// server's owner can restore it.
+    ///
+    /// Only soon after signing in ([`SdkError::RecentSignInRequired`]): a
+    /// local user confirms ([`Session::confirm_password`] or
+    /// [`Session::begin_confirm_passkey`]); a portable user signs in again
+    /// with its credential ([`crate::Client::sign_in_portable`]), and leaves
+    /// from the new session. The last admin gets [`SdkError::LastAdmin`]. A
+    /// refused leave changes nothing, here or on the server.
+    pub async fn leave_server(&self) -> Result<(), SdkError> {
+        self.done(Request::LeaveServer).await?;
+        self.client.forget(&self.server.to_string()).await
+    }
+
+    /// Whether the user may leave this server ([`Session::leave_server`]),
+    /// as the server said when this session was made: signed in, resumed,
+    /// or listed by [`crate::Client::profiles`]. `false` for the last
+    /// admin, whom leaving would refuse with [`SdkError::LastAdmin`]:
+    /// grey out "Leave this server" then. An admin made or demoted since
+    /// is not seen here; [`Session::can_leave_now`] asks again, and
+    /// leaving is still refused if it must be. A server that does not say
+    /// counts as `true`.
+    pub fn can_leave(&self) -> bool {
+        self.can_leave
+    }
+
+    /// Whether the user may leave this server, as the server says now: as
+    /// [`Session::can_leave`], read again, for a screen that offers
+    /// leaving.
+    pub async fn can_leave_now(&self) -> Result<bool, SdkError> {
+        match self.call(Request::WhoAmI).await? {
+            Reply::WhoAmI(reply) => Ok(reply.can_leave),
+            other => Err(unexpected(other)),
+        }
     }
 
     /// The portable identity this account is tied to, as the server says

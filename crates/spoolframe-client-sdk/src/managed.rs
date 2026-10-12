@@ -303,11 +303,20 @@ struct State {
     /// Where each HLS segment starts (segment `n` at `[n - 1]`), from the
     /// media playlist last read: a segment read says where the player is.
     segments: Vec<Duration>,
-    /// One more each time the handle is replaced.
+    /// One more each time the encode is replaced: with the handle (a
+    /// resume), or under it (a seek, a subtitle or quality change, a
+    /// re-plan for the link), as the server serves segments by number
+    /// from its encode now.
     generation: u64,
-    /// The generation each HLS segment (by rung and number) was last read
-    /// from offset 0 in: the rest of it must come from the same encode.
-    segment_reads: HashMap<(u32, u32), u64>,
+    /// What each HLS segment (by rung and number) was last opened from
+    /// offset 0 under, for a read of its rest that names no
+    /// reader ([`ManagedPlayback::read_segment`] and
+    /// [`ManagedPlayback::segment_stream`] from past 0): the rest must
+    /// come from the same encode. One entry per segment, so with two
+    /// readers of it in different encodes it holds the last to open; a
+    /// [`SegmentStream`] reads on with [`SegmentStream::reopen`], which
+    /// checks its own.
+    segment_reads: HashMap<(u32, u32), Opened>,
     /// Where a resume (not a seek) started the current handle: a reader of
     /// an older handle is told so.
     resumed_at: Option<Duration>,
@@ -327,6 +336,31 @@ struct State {
     /// The share of the server's uplink it was last told (PX-46).
     share: Option<PlaybackShare>,
 }
+
+/// What a segment read was opened under: the handle it went to and the
+/// playback's generation then, taken together before it was awaited. Its
+/// bytes are that encode's, whatever replaced the handle, or the encode
+/// under it, while they were on the link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Opened {
+    handle: PlaybackHandle,
+    generation: u64,
+}
+
+impl Opened {
+    fn now(state: &State) -> Self {
+        Self {
+            handle: state.playback.handle.clone(),
+            generation: state.generation,
+        }
+    }
+
+    /// The playback still runs the encode this was opened in.
+    fn current(&self, state: &State) -> bool {
+        self.generation == state.generation && self.handle == state.playback.handle
+    }
+}
+
 struct Inner {
     backend: Arc<dyn PlaybackBackend>,
     item: MediaId,
@@ -551,21 +585,17 @@ impl ManagedPlayback {
                     };
                     let Some(inner) = weak.upgrade() else { return };
                     let this = ManagedPlayback(inner);
-                    let (mine, position) = {
+                    let mine = {
                         let mut state = this.0.state.lock();
                         let ours = state.playback.handle == share.handle && !state.closed;
                         if ours {
-                            state.share = Some(share);
+                            state.share = Some(share.clone());
                         }
-                        (
-                            ours && state.options.quality == PlaybackQuality::Auto,
-                            state.position.unwrap_or_default(),
-                        )
+                        ours && state.options.quality == PlaybackQuality::Auto
                     };
-                    if mine
-                        && let Err(error) =
-                            this.change_quality(PlaybackQuality::Auto, position).await
-                    {
+                    // Checked again under the control lock: a pick of the
+                    // viewer's on the server now must not be undone.
+                    if mine && let Err(error) = this.follow_share(&share.handle).await {
                         let _ = this.0.errors.send(error);
                     }
                 }
@@ -672,13 +702,18 @@ impl ManagedPlayback {
         Ok(())
     }
     fn live(&self) -> Result<Playback, SdkError> {
+        self.live_opened().map(|(playback, _)| playback)
+    }
+    /// The live playback, and what a read of it now is opened under, taken
+    /// together.
+    fn live_opened(&self) -> Result<(Playback, Opened), SdkError> {
         let state = self.0.state.lock();
         if state.finishing || state.closed {
             Err(SdkError::PlaybackClosed)
         } else if let Some(ended) = &state.ended {
             Err(ended.clone())
         } else {
-            Ok(state.playback.clone())
+            Ok((state.playback.clone(), Opened::now(&state)))
         }
     }
     /// `op` on the live handle; if the server had ended the playback, it
@@ -689,14 +724,29 @@ impl ManagedPlayback {
         F: Fn(Playback) -> Fut,
         Fut: Future<Output = Result<T, SdkError>>,
     {
-        let playback = self.live()?;
+        self.resuming_opened(at, op).await.map(|(answer, _)| answer)
+    }
+    /// [`Self::resuming`], with what the answer was opened under: the
+    /// handle `op` went to and the generation then, taken before it was
+    /// awaited. A resume while it was on the link does not relabel it.
+    async fn resuming_opened<T, F, Fut>(
+        &self,
+        at: Option<Duration>,
+        op: F,
+    ) -> Result<(T, Opened), SdkError>
+    where
+        F: Fn(Playback) -> Fut,
+        Fut: Future<Output = Result<T, SdkError>>,
+    {
+        let (playback, opened) = self.live_opened()?;
         match op(playback.clone()).await {
             Err(SdkError::PlaybackExpired) => {
                 self.restart(&playback.handle, Restart::Resume { at })
                     .await?;
-                op(self.live()?).await
+                let (playback, opened) = self.live_opened()?;
+                op(playback).await.map(|answer| (answer, opened))
             }
-            answer => answer,
+            answer => answer.map(|answer| (answer, opened)),
         }
     }
     /// Up to `length` bytes of a direct playback's file from `offset`. A
@@ -767,7 +817,9 @@ impl ManagedPlayback {
     /// from offset 0 goes on through a resume with no error: the new
     /// playback starts at segment `n`. The rest of a segment read part-way
     /// cannot come from another encode: that read is
-    /// [`SdkError::PlaybackResumed`], and the segment is read again from 0.
+    /// [`SdkError::PlaybackResumed`] (or [`SdkError::PlaybackRestarted`],
+    /// for an encode replaced under the same handle), and the segment is
+    /// read again from 0.
     /// `variant` is a ladder's rung (PX-21), as `v{n}/` in its playlist; 0
     /// for one encode. The rungs share the grid and the segment numbers.
     pub async fn read_segment(
@@ -780,32 +832,18 @@ impl ManagedPlayback {
         let at = self.segment_start(n);
         let backend = &self.0.backend;
         if offset == 0 {
-            let chunk = self
-                .resuming(at, move |p| async move {
+            let (chunk, opened) = self
+                .resuming_opened(at, move |p| async move {
                     backend
                         .read_segment(&p.handle, p.epoch, variant, n, 0, length)
                         .await
                 })
                 .await?;
-            {
-                let mut state = self.0.state.lock();
-                let generation = state.generation;
-                state.segment_reads.insert((variant, n), generation);
-            }
+            self.opened_segment(variant, n, &opened);
             self.segment_read(n, 0, chunk.bytes.len() as u64, chunk.size, chunk.complete);
             return Ok(chunk);
         }
-        let p = self.live()?;
-        let begun = {
-            let state = self.0.state.lock();
-            state
-                .segment_reads
-                .get(&(variant, n))
-                .is_some_and(|g| *g != state.generation)
-        };
-        if begun {
-            return Err(self.resumed_error(at));
-        }
+        let (p, _) = self.rest_of(variant, n, at)?;
         match backend
             .read_segment(&p.handle, p.epoch, variant, n, offset, length)
             .await
@@ -832,6 +870,11 @@ impl ManagedPlayback {
     /// [`SdkError::PlaybackResumed`]. A resume while it is arriving ends it
     /// with that error too: read the segment again from 0. The link meter
     /// and the step-down count it as they count a read.
+    ///
+    /// The stream knows the encode it was opened in: to read on after an
+    /// error part-way, [`SegmentStream::reopen`] checks that encode, where
+    /// a call here from past 0 can only check the last reader of the
+    /// segment to open it.
     pub async fn segment_stream(
         &self,
         variant: u32,
@@ -841,51 +884,109 @@ impl ManagedPlayback {
     ) -> Result<SegmentStream, SdkError> {
         let at = self.segment_start(n);
         let backend = &self.0.backend;
-        let body = if offset == 0 {
-            let body = self
-                .resuming(at, move |p| async move {
+        let (body, opened) = if offset == 0 {
+            let (body, opened) = self
+                .resuming_opened(at, move |p| async move {
                     backend
                         .open_segment(&p.handle, p.epoch, variant, n, 0, length)
                         .await
                 })
                 .await?;
-            let mut state = self.0.state.lock();
-            let generation = state.generation;
-            state.segment_reads.insert((variant, n), generation);
-            body
+            self.opened_segment(variant, n, &opened);
+            (body, opened)
         } else {
-            let p = self.live()?;
-            let begun = {
-                let state = self.0.state.lock();
-                state
-                    .segment_reads
-                    .get(&(variant, n))
-                    .is_some_and(|g| *g != state.generation)
-            };
-            if begun {
-                return Err(self.resumed_error(at));
-            }
-            match backend
-                .open_segment(&p.handle, p.epoch, variant, n, offset, length)
-                .await
-            {
-                Err(SdkError::PlaybackExpired) => {
-                    self.restart(&p.handle, Restart::Resume { at }).await?;
-                    return Err(self.resumed_error(at));
-                }
-                answer => answer?,
-            }
+            let (p, opened) = self.rest_of(variant, n, at)?;
+            let body = self.open_rest(&p, variant, n, offset, length, at).await?;
+            (body, opened)
         };
-        let generation = self.0.state.lock().generation;
         Ok(SegmentStream {
             playback: self.clone(),
             body,
+            variant,
             n,
             offset,
             at,
-            generation,
-            ended: false,
+            opened,
+            counted: false,
         })
+    }
+
+    /// Segment `n` of rung `variant` was opened from 0 under `opened`.
+    fn opened_segment(&self, variant: u32, n: u32, opened: &Opened) {
+        self.0
+            .state
+            .lock()
+            .segment_reads
+            .insert((variant, n), opened.clone());
+    }
+
+    /// The live playback for a read of the rest of segment `n` that names
+    /// no reader: refused ([`Self::segment_moved_on`]) if the segment was
+    /// last opened from 0 in an encode since replaced.
+    fn rest_of(
+        &self,
+        variant: u32,
+        n: u32,
+        at: Option<Duration>,
+    ) -> Result<(Playback, Opened), SdkError> {
+        let (p, opened) = self.live_opened()?;
+        let begun = self
+            .0
+            .state
+            .lock()
+            .segment_reads
+            .get(&(variant, n))
+            .filter(|begun| **begun != opened)
+            .cloned();
+        if let Some(begun) = begun {
+            return Err(self.segment_moved_on(&begun, at));
+        }
+        Ok((p, opened))
+    }
+
+    /// What a reader of a segment opened under `opened` is told now that
+    /// the encode is another: [`SdkError::PlaybackRestarted`] with the
+    /// epoch now if it was replaced under the same handle (a seek, a
+    /// change, a re-plan), as a progressive reader is told; else
+    /// [`SdkError::PlaybackResumed`]. Either way, read the segment again
+    /// from 0.
+    fn segment_moved_on(&self, opened: &Opened, at: Option<Duration>) -> SdkError {
+        {
+            let state = self.0.state.lock();
+            if state.playback.handle == opened.handle {
+                return SdkError::PlaybackRestarted {
+                    epoch: state.playback.epoch,
+                };
+            }
+        }
+        self.resumed_error(at)
+    }
+
+    /// The rest of segment `n` from `offset`, from `p`. A playback the
+    /// server ended is resumed, and the read is
+    /// [`SdkError::PlaybackResumed`]: the rest cannot come from another
+    /// encode.
+    async fn open_rest(
+        &self,
+        p: &Playback,
+        variant: u32,
+        n: u32,
+        offset: u64,
+        length: u64,
+        at: Option<Duration>,
+    ) -> Result<ChunkStream, SdkError> {
+        match self
+            .0
+            .backend
+            .open_segment(&p.handle, p.epoch, variant, n, offset, length)
+            .await
+        {
+            Err(SdkError::PlaybackExpired) => {
+                self.restart(&p.handle, Restart::Resume { at }).await?;
+                Err(self.resumed_error(at))
+            }
+            answer => answer,
+        }
     }
 
     /// [`Self::read_chunk`], its bytes handed on as they arrive (PX-46).
@@ -1113,6 +1214,8 @@ impl ManagedPlayback {
             Ok(epoch) => {
                 let mut state = self.0.state.lock();
                 state.playback.epoch = epoch;
+                // A new encode under the same handle.
+                state.generation += 1;
                 let next = state.playback.clone();
                 drop(state);
                 self.0.changed.send_replace(next);
@@ -1175,6 +1278,8 @@ impl ManagedPlayback {
         state.playback.plan = changed.plan;
         state.playback.size = changed.size;
         state.playback.epoch = changed.epoch;
+        // A new encode under the same handle.
+        state.generation += 1;
         state.selection.get_or_insert(Selection::default()).subtitle = selected;
         state.options.bitmap = bitmap;
         state.position = Some(position);
@@ -1237,6 +1342,8 @@ impl ManagedPlayback {
         state.playback.plan = changed.plan;
         state.playback.size = changed.size;
         state.playback.epoch = changed.epoch;
+        // A new encode under the same handle.
+        state.generation += 1;
         state.position = Some(position);
         let next = state.playback.clone();
         drop(state);
@@ -1275,6 +1382,33 @@ impl ManagedPlayback {
         position: Duration,
     ) -> Result<Playback, SdkError> {
         let _control = self.0.control.lock().await;
+        self.change_quality_locked(quality, position).await
+    }
+    /// A moved share of the uplink for `handle` (PX-46): plan again in
+    /// Auto where the viewer is. Whether to was seen before the control
+    /// lock; a change that held it since (the viewer's own pick, or a
+    /// resume under another handle) wins, and this one is dropped.
+    async fn follow_share(&self, handle: &PlaybackHandle) -> Result<(), SdkError> {
+        let _control = self.0.control.lock().await;
+        let position = {
+            let state = self.0.state.lock();
+            if state.options.quality != PlaybackQuality::Auto
+                || &state.playback.handle != handle
+                || state.closed
+            {
+                return Ok(());
+            }
+            state.position.unwrap_or_default()
+        };
+        self.change_quality_locked(PlaybackQuality::Auto, position)
+            .await
+            .map(drop)
+    }
+    async fn change_quality_locked(
+        &self,
+        quality: PlaybackQuality,
+        position: Duration,
+    ) -> Result<Playback, SdkError> {
         let flushed = self.flush_locked().await;
         let p = self.live()?;
         let bitmap = self.0.state.lock().options.bitmap;
@@ -1309,6 +1443,8 @@ impl ManagedPlayback {
         state.playback.plan = changed.plan;
         state.playback.size = changed.size;
         state.playback.epoch = changed.epoch;
+        // A new encode under the same handle.
+        state.generation += 1;
         let next = state.playback.clone();
         drop(state);
         self.0.changed.send_replace(next.clone());
@@ -1394,14 +1530,18 @@ impl Session {
 pub struct SegmentStream {
     playback: ManagedPlayback,
     body: ChunkStream,
+    variant: u32,
     n: u32,
     offset: u64,
     /// Where the segment starts, for the error a resume ends it with.
     at: Option<Duration>,
-    /// The playback's generation when it was opened: a resume since means
-    /// the rest would come from another encode.
-    generation: u64,
-    ended: bool,
+    /// The handle and generation it was opened under, taken before the
+    /// open was awaited: a resume since means the rest would come from
+    /// another encode. Its own, whatever other readers of the segment
+    /// opened since.
+    opened: Opened,
+    /// Counted for the step-down already.
+    counted: bool,
 }
 
 impl SegmentStream {
@@ -1432,16 +1572,24 @@ impl SegmentStream {
 
     /// The next piece, as much as arrived; `None` once all `sent()` bytes
     /// did. [`SdkError::PlaybackResumed`] if the playback was resumed in
-    /// another encode since it opened: read the segment again from 0. Any
+    /// another encode since it opened, [`SdkError::PlaybackRestarted`] if
+    /// the encode was replaced under the same handle (a seek, a subtitle
+    /// or quality change, a re-plan): read the segment again from 0. Any
     /// other error part-way (a lost connection, a stall): read on from
     /// `offset + received()`.
     pub async fn next(&mut self) -> Result<Option<Vec<u8>>, SdkError> {
-        if self.playback.0.state.lock().generation != self.generation {
-            return Err(self.playback.resumed_error(self.at));
+        if !self.opened.current(&self.playback.0.state.lock()) {
+            return Err(self.playback.segment_moved_on(&self.opened, self.at));
         }
         let piece = self.body.next().await?;
-        if piece.is_none() && !self.ended {
-            self.ended = true;
+        // Counted at the read that hands on a whole segment's last byte: a
+        // consumer that stops once it has the length it promised (the
+        // iOS bridge's hyper does) never reads the end. The end counts it
+        // otherwise; `segment_read` takes only a whole one. Once, either
+        // way.
+        let last = self.body.complete && self.offset + self.body.received() == self.body.size;
+        if (last || piece.is_none()) && !self.counted {
+            self.counted = true;
             self.playback.segment_read(
                 self.n,
                 self.offset,
@@ -1451,6 +1599,35 @@ impl SegmentStream {
             );
         }
         Ok(piece)
+    }
+
+    /// Read on from where this stream stopped, `offset + received()`, up
+    /// to `length` bytes: after an error part-way (a lost connection, a
+    /// stall), or an answer shorter than the segment. The rest comes from
+    /// the encode this stream was opened in, or not at all:
+    /// [`SdkError::PlaybackResumed`] or [`SdkError::PlaybackRestarted`] if
+    /// the encode was replaced since, as [`Self::next`] says; read the
+    /// segment again from 0.
+    pub async fn reopen(&self, length: u64) -> Result<SegmentStream, SdkError> {
+        let playback = &self.playback;
+        let (p, now) = playback.live_opened()?;
+        if now != self.opened {
+            return Err(playback.segment_moved_on(&self.opened, self.at));
+        }
+        let offset = self.offset + self.received();
+        let body = playback
+            .open_rest(&p, self.variant, self.n, offset, length, self.at)
+            .await?;
+        Ok(SegmentStream {
+            playback: playback.clone(),
+            body,
+            variant: self.variant,
+            n: self.n,
+            offset,
+            at: self.at,
+            opened: self.opened.clone(),
+            counted: false,
+        })
     }
 }
 
@@ -1466,6 +1643,8 @@ mod tests {
         stopped: std::sync::atomic::AtomicBool,
         hold_start: std::sync::atomic::AtomicBool,
         hold_seek: std::sync::atomic::AtomicBool,
+        /// Hold the next quality change on the server until `release`.
+        hold_quality: std::sync::atomic::AtomicBool,
         entered: Notify,
         release: Notify,
         /// The server's share events, once a test sends some (PX-46).
@@ -1570,6 +1749,10 @@ mod tests {
                 h.0,
                 position.as_secs()
             ));
+            if self.hold_quality.swap(false, SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
             Ok(PlaybackChange {
                 plan: playback(1).plan,
                 size: 100,
@@ -1648,6 +1831,40 @@ mod tests {
                 .filter(|e| e.starts_with("quality:1:Auto"))
                 .count(),
             1
+        );
+    }
+
+    /// The iOS build 42 review: the viewer picked Original and ended on
+    /// Auto. A share event that arrived while the pick was on the server
+    /// found the playback still in Auto and queued a re-plan for Auto
+    /// behind it; the re-plan must not undo the pick.
+    #[tokio::test]
+    async fn a_share_queued_behind_a_quality_pick_does_not_undo_it() {
+        let b = Arc::new(Backend::default());
+        let (shares, _) = broadcast::channel(4);
+        *b.shares.lock() = Some(shares.clone());
+        let p = open(b.clone()).await;
+        b.hold_quality.store(true, SeqCst);
+        let q = p.clone();
+        let pick = tokio::spawn(async move {
+            q.change_quality(PlaybackQuality::Original, Duration::from_secs(42))
+                .await
+        });
+        b.entered.notified().await;
+        shares.send(share("1", Some(4_500_000))).unwrap();
+        // Taken as this playback's, while it was still in Auto.
+        until(|| p.share().is_some()).await;
+        b.release.notify_one();
+        pick.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(p.quality(), PlaybackQuality::Original);
+        assert!(
+            !b.events
+                .lock()
+                .iter()
+                .any(|e| e.starts_with("quality:1:Auto")),
+            "{:?}",
+            b.events.lock()
         );
     }
 
@@ -1776,6 +1993,23 @@ mod tests {
             asked: std::sync::atomic::AtomicUsize,
             delivery: Mutex<Option<Delivery>>,
             reports: Mutex<Vec<(String, u64)>>,
+            /// Hold the next segment read, once the handle was found live,
+            /// until `release`: an answer still on the link.
+            hold_read: std::sync::atomic::AtomicBool,
+            entered: Notify,
+            release: Notify,
+            /// Each segment's size; 1 byte if unset.
+            segment_len: Mutex<Option<u64>>,
+            /// The link the server is on, once a test measures one.
+            meter: Mutex<Option<Arc<crate::LinkMeter>>>,
+            /// Each link bitrate it was asked to plan for.
+            limits: Mutex<Vec<u64>>,
+            /// When set, a limit replaces the encode under the same handle
+            /// with this epoch, as the server's re-plan for a slow link
+            /// does; else it is refused.
+            replan_epoch: Mutex<Option<u32>>,
+            /// The plan of the last start.
+            plan: Mutex<Option<PlaybackPlan>>,
         }
         impl Server {
             fn expire(&self) {
@@ -1830,6 +2064,7 @@ mod tests {
                         reasons: vec![],
                     };
                 }
+                *self.plan.lock() = Some(p.plan.clone());
                 Ok(p)
             }
             async fn read(&self, h: &PlaybackHandle, _: u64, _: u64) -> Result<Vec<u8>, SdkError> {
@@ -1875,6 +2110,28 @@ mod tests {
                 self.live.lock().remove(&h.0);
                 Ok(())
             }
+            fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
+                self.meter.lock().clone()
+            }
+            async fn limit(
+                &self,
+                h: &PlaybackHandle,
+                link_bitrate: u64,
+                _: BitmapSubtitles,
+                _: Duration,
+            ) -> Result<PlaybackChange, SdkError> {
+                self.alive(h)?;
+                self.limits.lock().push(link_bitrate);
+                match *self.replan_epoch.lock() {
+                    Some(epoch) => Ok(PlaybackChange {
+                        plan: self.plan.lock().clone().expect("started"),
+                        size: 0,
+                        epoch,
+                    }),
+                    // What the plan becomes is not what these tests look at.
+                    None => Err(SdkError::Busy),
+                }
+            }
             async fn manifest(
                 &self,
                 h: &PlaybackHandle,
@@ -1890,13 +2147,19 @@ mod tests {
                 e: u32,
                 _: u32,
                 n: u32,
-                _: u64,
-                _: u64,
+                offset: u64,
+                length: u64,
             ) -> Result<Chunk, SdkError> {
                 self.alive(h)?;
+                if self.hold_read.swap(false, SeqCst) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                let size = self.segment_len.lock().unwrap_or(1);
+                let end = offset.saturating_add(length).min(size);
                 Ok(Chunk {
-                    bytes: vec![n as u8],
-                    size: 1,
+                    bytes: vec![n as u8; end.saturating_sub(offset) as usize],
+                    size,
                     complete: true,
                     epoch: e,
                 })
@@ -2111,6 +2374,132 @@ mod tests {
                     at: Duration::from_secs(6)
                 })
             );
+        }
+
+        /// The iOS build 42 review, (a): a segment's answer still on the
+        /// link when another read resumed the playback is the old encode's,
+        /// though it arrives after the resume. It ends as the resume ends a
+        /// stream, and its rest is not read from the new encode.
+        #[tokio::test]
+        async fn a_segment_opened_across_a_resume_belongs_to_the_old_encode() {
+            let s = Arc::new(Server::default());
+            *s.delivery.lock() = Some(Delivery::Hls);
+            let p = opened(&s).await;
+            p.manifest(ManifestKind::Media, 0).await.unwrap();
+            s.hold_read.store(true, SeqCst);
+            let q = p.clone();
+            let open = tokio::spawn(async move { q.segment_stream(0, 2, 0, 1).await });
+            s.entered.notified().await;
+            s.expire();
+            p.read_segment(0, 3, 0, 1).await.unwrap();
+            assert_eq!(p.snapshot().handle.0, "2");
+            s.release.notify_one();
+            let mut stream = open.await.unwrap().unwrap();
+            let resumed = SdkError::PlaybackResumed {
+                at: Duration::from_secs(6),
+            };
+            assert_eq!(stream.next().await, Err(resumed.clone()));
+            assert_eq!(p.segment_stream(0, 2, 1, 1).await.err(), Some(resumed));
+        }
+
+        /// The iOS build 42 review, (b): two readers of one segment, one
+        /// opened before a resume and one after. The older one reading on
+        /// is refused, though the newer one's open came last; the newer one
+        /// reads on.
+        #[tokio::test]
+        async fn an_older_reader_of_a_segment_does_not_read_on_from_a_newer_encode() {
+            let s = Arc::new(Server::default());
+            *s.delivery.lock() = Some(Delivery::Hls);
+            *s.segment_len.lock() = Some(8);
+            let p = opened(&s).await;
+            p.manifest(ManifestKind::Media, 0).await.unwrap();
+            let mut old = p.segment_stream(0, 2, 0, 4).await.unwrap();
+            assert_eq!(old.next().await, Ok(Some(vec![2; 4])));
+            s.expire();
+            p.read_segment(0, 3, 0, 8).await.unwrap();
+            let mut new = p.segment_stream(0, 2, 0, 4).await.unwrap();
+            assert_eq!(new.next().await, Ok(Some(vec![2; 4])));
+            assert_eq!(
+                old.reopen(4).await.err(),
+                Some(SdkError::PlaybackResumed {
+                    at: Duration::from_secs(6)
+                })
+            );
+            let mut rest = new.reopen(4).await.unwrap();
+            assert_eq!(rest.next().await, Ok(Some(vec![2; 4])));
+        }
+
+        /// B1: a re-plan for a slow link replaces the encode under the same
+        /// handle, and the server serves segments by number from the new
+        /// one. A reader of a segment begun before it does not read its
+        /// rest from the new encode: it is told the playback restarted.
+        #[tokio::test]
+        async fn an_older_reader_of_a_segment_does_not_read_on_after_a_replan() {
+            let s = Arc::new(Server::default());
+            *s.delivery.lock() = Some(Delivery::Hls);
+            *s.segment_len.lock() = Some(8);
+            *s.replan_epoch.lock() = Some(7);
+            let p = opened(&s).await;
+            p.manifest(ManifestKind::Media, 0).await.unwrap();
+            let mut old = p.segment_stream(0, 2, 0, 4).await.unwrap();
+            assert_eq!(old.next().await, Ok(Some(vec![2; 4])));
+            // Half of segment 3 read in the old encode, as a range read.
+            p.read_segment(0, 3, 0, 4).await.unwrap();
+
+            let replanned = p.limit(1_000).await.unwrap();
+            assert_eq!(replanned.handle, p.snapshot().handle);
+            assert_eq!(replanned.epoch, 7);
+            let restarted = SdkError::PlaybackRestarted { epoch: 7 };
+
+            let mut new = p.segment_stream(0, 2, 0, 4).await.unwrap();
+            assert_eq!(new.next().await, Ok(Some(vec![2; 4])));
+            assert_eq!(old.reopen(4).await.err(), Some(restarted.clone()));
+            assert_eq!(old.next().await, Err(restarted.clone()));
+            let mut rest = new.reopen(4).await.unwrap();
+            assert_eq!(rest.next().await, Ok(Some(vec![2; 4])));
+
+            // The rest of segment 3 by offset is refused too; read from 0
+            // in the new encode, it reads on.
+            assert_eq!(p.read_segment(0, 3, 4, 4).await, Err(restarted));
+            p.read_segment(0, 3, 0, 4).await.unwrap();
+            assert_eq!(p.read_segment(0, 3, 4, 4).await.unwrap().bytes, vec![3; 4]);
+        }
+
+        /// A link measured at 1000 bytes/s, far under what 100 kB per
+        /// 6 s segment needs.
+        fn slow_link() -> Arc<crate::LinkMeter> {
+            let meter = Arc::new(crate::LinkMeter::default());
+            let now = std::time::Instant::now();
+            meter.begin(now - Duration::from_secs(3));
+            meter.received(now, 3_000);
+            meter.end(now);
+            meter
+        }
+
+        /// The iOS build 42 review, P1: the bridge (hyper) stops reading a
+        /// segment's body once it has the length it promised the player,
+        /// and never reads the end of it. A segment read to its last byte
+        /// counts as whole for the step-down then, and only once.
+        #[tokio::test]
+        async fn a_streamed_segment_read_to_its_length_counts_once_for_the_step_down() {
+            let s = Arc::new(Server::default());
+            *s.delivery.lock() = Some(Delivery::Hls);
+            *s.segment_len.lock() = Some(100_000);
+            *s.meter.lock() = Some(slow_link());
+            let p = opened(&s).await;
+            p.manifest(ManifestKind::Media, 0).await.unwrap();
+            // Read to its end, and the end read too: one segment, not two.
+            let mut one = p.segment_stream(0, 1, 0, 100_000).await.unwrap();
+            while one.next().await.unwrap().is_some() {}
+            drop(one);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(*s.limits.lock(), Vec::<u64>::new());
+            // Read to its length and dropped, as the bridge does.
+            let mut two = p.segment_stream(0, 2, 0, 100_000).await.unwrap();
+            let piece = two.next().await.unwrap().unwrap();
+            assert_eq!(piece.len() as u64, two.size());
+            drop(two);
+            until(|| !s.limits.lock().is_empty()).await;
         }
 
         /// A different plan on the new start is not swapped in.

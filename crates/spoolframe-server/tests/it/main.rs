@@ -25,6 +25,7 @@ mod hwdec;
 mod invite_admin;
 mod invites;
 mod lan;
+mod leave;
 mod libraries;
 mod license_boundary;
 mod metrics;

@@ -22,7 +22,7 @@ use iroh::Endpoint;
 use iroh::endpoint::{ConnectionError, VarInt};
 use serde_json::{Value, json};
 use spoolframe_protocol::{
-    Error, LoginPassword, PlaybackHandle, Reply, Request, Response, UserSummary, close,
+    Error, LoginPassword, PlaybackHandle, Reply, Request, Response, UserSummary, WhoAmIReply, close,
 };
 use spoolframe_types::{LibraryId, MediaId, MediaKind, Namespace, Role};
 use tokio::sync::Mutex;
@@ -206,7 +206,7 @@ impl AccountState {
             }
         };
         let user = match probe.request(&conn, Some(&session), Request::WhoAmI).await {
-            Ok(Response::Ok(Reply::WhoAmI(user))) => user,
+            Ok(Response::Ok(Reply::WhoAmI(WhoAmIReply { user, .. }))) => user,
             other => {
                 let why = match other {
                     Ok(response) => describe(&response),
@@ -565,7 +565,7 @@ pub(crate) async fn session_bound(
         .request(&signed.conn, Some(&signed.session), Request::WhoAmI)
         .await?;
     f.expect(
-        matches!(&response, Response::Ok(Reply::WhoAmI(u)) if u.username == signed.user.username),
+        matches!(&response, Response::Ok(Reply::WhoAmI(WhoAmIReply { user: u, .. })) if u.username == signed.user.username),
         format!("WhoAmI from its own key after: {}", short_who(&response)),
     );
     Ok(f.done())
@@ -737,7 +737,7 @@ pub(crate) async fn session_reread(
             .request(&signed.conn, Some(&signed.session), Request::WhoAmI)
             .await?;
         f.expect(
-            matches!(&who, Response::Ok(Reply::WhoAmI(u)) if u.username == signed.user.username),
+            matches!(&who, Response::Ok(Reply::WhoAmI(WhoAmIReply { user: u, .. })) if u.username == signed.user.username),
             format!("WhoAmI #{n}: {}", short_who(&who)),
         );
     }
@@ -785,7 +785,7 @@ pub(crate) async fn session_reread(
 /// A `WhoAmI` reply, short: who and how, never more.
 fn short_who(response: &Response) -> String {
     match response {
-        Response::Ok(Reply::WhoAmI(u)) => {
+        Response::Ok(Reply::WhoAmI(WhoAmIReply { user: u, .. })) => {
             format!(
                 "WhoAmI({:?}, {:?}, locked {})",
                 u.username, u.role, u.locked

@@ -412,7 +412,7 @@ fn UserCard(user: UserInfo) -> Element {
                 b { "{shown_name(&user)}" }
                 span {
                     "{user.username} · "
-                    if user.disabled { "disabled" } else { "{seen}" }
+                    if user.left_at.is_some() { "left" } else if user.disabled { "disabled" } else { "{seen}" }
                 }
             }
             RolePill { role: user.role }
@@ -431,6 +431,9 @@ fn RolePill(role: Role) -> Element {
 #[component]
 fn Status(user: UserInfo) -> Element {
     match user_status(&user) {
+        UserStatus::Left => {
+            rsx! { span { class: "pill", title: "Left the server from an app; Restore brings them back", "Left" } }
+        }
         UserStatus::Disabled => rsx! { span { class: "pill", "Disabled" } },
         // WebUsers: Steve's row.
         UserStatus::Limited(why) => {
@@ -791,6 +794,7 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
                     span { class: "text-sm font-medium text-ctp-subtext0",
                         "{user.username} · {role_name(user.role)} · "
                         match user_status(&user) {
+                            UserStatus::Left => rsx! { "Left" },
                             UserStatus::Disabled => rsx! { "Disabled" },
                             UserStatus::Limited(why) => rsx! { span { class: "text-ctp-yellow", title: "{why}", "Rate limited" } },
                             UserStatus::OneTimePassword(_) => rsx! { span { class: "text-ctp-yellow", "One-time password" } },
@@ -813,7 +817,7 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
                     "{role_label}"
                 }
                 if user.disabled {
-                    button { class: "btn", onclick: enable, "Enable" }
+                    button { class: "btn", onclick: enable, if user.left_at.is_some() { "Restore" } else { "Enable" } }
                 } else {
                     button {
                         class: "btn btn-danger",

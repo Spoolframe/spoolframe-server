@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `WhoAmI` answers `can_leave` (PX-47): `false` for the last admin, whom
+  `LeaveServer` would refuse with `LastAdmin`, so an app greys out
+  "Leave this server" before it is asked. Additive at revision 14: left
+  out by an older server, it reads as `true`. The SDK has it as
+  `Session::can_leave()`, as of sign-in (or `Client::profiles`), and
+  `Session::can_leave_now()`, asked again.
+
+- PX-47: a user leaves a server from the app (`LeaveServer`, after a
+  recent sign-in). A portable user's grant is revoked and its data here
+  deleted; a local account is disabled and marked left, with its data
+  kept, for an admin to restore. The last admin cannot leave
+  (`LastAdmin`).
+
 - On VA-API with GPU filters, an HDR film made SDR has its burned-in
   pictures laid over it after the tone map, not before: SDR subtitles
   are no longer mapped with the video, dimmed or shifted, and the GPU's

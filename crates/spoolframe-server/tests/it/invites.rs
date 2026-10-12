@@ -13,7 +13,9 @@ use spoolframe_admin_api::{
 };
 use spoolframe_protocol::invite::{normalize_code, parse_link};
 use spoolframe_protocol::rpc::RpcRequest;
-use spoolframe_protocol::{Error, RedeemInvite, Reply, Request, RequestEnvelope, Response};
+use spoolframe_protocol::{
+    Error, RedeemInvite, Reply, Request, RequestEnvelope, Response, WhoAmIReply,
+};
 use spoolframe_server::admin::{Admin, Origins, StatusSource, TrustedProxies};
 use spoolframe_server::auth::{Bucket, hash_password};
 
@@ -137,7 +139,9 @@ async fn an_invite_makes_an_account_that_signs_in_and_plays() {
     let device = invites.stranger().await;
     let session = logged_in(device.call(None, redeem(&created.code, "Mum")).await);
 
-    let Response::Ok(Reply::WhoAmI(me)) = device.call(Some(&session), Request::WhoAmI).await else {
+    let Response::Ok(Reply::WhoAmI(WhoAmIReply { user: me, .. })) =
+        device.call(Some(&session), Request::WhoAmI).await
+    else {
         panic!("no WhoAmI");
     };
     assert_eq!(
@@ -185,7 +189,9 @@ async fn the_account_has_the_invite_s_role() {
         .await;
     let device = invites.stranger().await;
     let session = logged_in(device.call(None, redeem(&created.code, "cabin")).await);
-    let Response::Ok(Reply::WhoAmI(me)) = device.call(Some(&session), Request::WhoAmI).await else {
+    let Response::Ok(Reply::WhoAmI(WhoAmIReply { user: me, .. })) =
+        device.call(Some(&session), Request::WhoAmI).await
+    else {
         panic!("no WhoAmI");
     };
     assert_eq!(me.role, Role::Admin);
@@ -632,7 +638,7 @@ mod portable {
         let phone = invites.stranger().await;
         let session = logged_in(redeem_as_guest(&invites, &phone, &created.code).await);
         match phone.call(Some(&session), Request::WhoAmI).await {
-            Response::Ok(Reply::WhoAmI(me)) => {
+            Response::Ok(Reply::WhoAmI(WhoAmIReply { user: me, .. })) => {
                 assert_eq!(me.user_id, format!("portable:{}", identity(7)));
                 assert_eq!(me.display_name, "Sam");
             }
@@ -769,7 +775,9 @@ mod portable {
         let device = invites.stranger().await;
         let session = logged_in(redeem_as_guest(&invites, &device, &created.code).await);
         match device.call(Some(&session), Request::WhoAmI).await {
-            Response::Ok(Reply::WhoAmI(me)) => assert_eq!(me.username, "alice"),
+            Response::Ok(Reply::WhoAmI(WhoAmIReply { user: me, .. })) => {
+                assert_eq!(me.username, "alice")
+            }
             other => panic!("no WhoAmI: {other:?}"),
         }
         assert!(invites.root.grant_list().await.unwrap().is_empty());

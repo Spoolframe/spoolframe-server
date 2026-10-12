@@ -178,6 +178,36 @@ async fn setup_needs_the_code_from_the_log() {
     assert!(response.headers().get("set-cookie").is_none());
 }
 
+/// CR-11 N10: a sign-in's body is a few hundred bytes. One past the
+/// `/auth` routes' limit is refused before it is read whole or parsed,
+/// where any other route would take up to 2 MiB.
+#[tokio::test]
+async fn an_oversize_sign_in_body_is_refused_as_too_large() {
+    let (addr, _dir) = server("web-oversize").await;
+    let password = "x".repeat(17 * 1024);
+    for path in ["/auth/login", "/auth/setup", "/auth/passkey/finish"] {
+        let response = post(
+            addr,
+            path,
+            Some(&page(addr)),
+            None,
+            json!({ "username": "root", "password": password, "code": CODE }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+    }
+    // Under the limit, the same route still reads it.
+    let wrong = post(
+        addr,
+        "/auth/login",
+        Some(&page(addr)),
+        None,
+        json!({ "username": "root", "password": "x".repeat(8 * 1024) }),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn logging_in_and_out_from_a_browser() {
     let (addr, _dir) = server("web-login").await;

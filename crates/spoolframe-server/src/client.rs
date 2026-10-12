@@ -34,7 +34,7 @@ use spoolframe_protocol::{
     AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, FinishPasskeySignIn, Hello,
     LoginPassword, PasskeyInfo, PinProof, PinState, PlexLink, PlexSyncSummary, PortableSignIn,
     RedeemInvite, RedeemPortableInvite, Reply, Request, Response, ServerInfo, SessionId,
-    SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary, is_app_rp_id,
+    SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary, WhoAmIReply, is_app_rp_id,
 };
 use spoolframe_types::{ArtworkId, MediaId, Namespace, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -1768,28 +1768,39 @@ impl ClientProtocol {
                     // P7-06: no PIN, no lock, no tie; the id is the
                     // name a device keeps their session by.
                     Who::Portable(portable) => {
-                        return Ok(Reply::WhoAmI(UserSummary {
-                            user_id: principal.to_string(),
-                            username: who.username(),
-                            display_name: portable.display_name.clone(),
-                            role: spoolframe_types::Role::Consumer,
-                            locked: false,
-                            pin: None,
-                            portable: Some(portable.user),
+                        // A portable user is never an admin: it may
+                        // always leave.
+                        return Ok(Reply::WhoAmI(WhoAmIReply {
+                            user: UserSummary {
+                                user_id: principal.to_string(),
+                                username: who.username(),
+                                display_name: portable.display_name.clone(),
+                                role: spoolframe_types::Role::Consumer,
+                                locked: false,
+                                pin: None,
+                                portable: Some(portable.user),
+                            },
+                            can_leave: true,
                         }));
                     }
                 };
                 // Asked while locked too: a PIN pad sizes itself by it.
                 let pin = self.store().pin_info(user.user).await.map_err(internal)?;
                 let tie = self.store().tie_of(user.user).await.map_err(internal)?;
-                Ok(Reply::WhoAmI(UserSummary {
-                    user_id: format!("local:{}", user.user),
-                    username: user.username.clone(),
-                    display_name: user.display_name.clone(),
-                    role: user.role,
-                    locked: state.locks.lock().locked(&session),
-                    pin: pin.map(|p| PinState { digits: p.digits }),
-                    portable: tie.map(|tie| tie.portable),
+                // PX-47: what `LeaveServer` would answer, by its own check,
+                // so an app greys out leaving for the last admin.
+                let can_leave = self.store().can_leave(user.user).await.map_err(internal)?;
+                Ok(Reply::WhoAmI(WhoAmIReply {
+                    user: UserSummary {
+                        user_id: format!("local:{}", user.user),
+                        username: user.username.clone(),
+                        display_name: user.display_name.clone(),
+                        role: user.role,
+                        locked: state.locks.lock().locked(&session),
+                        pin: pin.map(|p| PinState { digits: p.digits }),
+                        portable: tie.map(|tie| tie.portable),
+                    },
+                    can_leave,
                 }))
             }
             Request::BeginPasskeyRegistration => {
@@ -2965,6 +2976,47 @@ impl ClientProtocol {
                         what: "portable identity tie".into(),
                     }),
                 }
+            }
+            // PX-47: a user leaves this server, after a recent sign-in.
+            Request::LeaveServer => {
+                let now = self.services.auth.store().now();
+                match &who {
+                    Who::Local(user) => {
+                        recently_signed_in(user, now)?;
+                        let ended =
+                            self.store()
+                                .leave_local(user.user)
+                                .await
+                                .map_err(|e| match e {
+                                    crate::store::users::UserError::LastAdmin(_)
+                                    | crate::store::users::UserError::LastPasswordAdmin(_) => {
+                                        Error::LastAdmin
+                                    }
+                                    e => internal(e),
+                                })?;
+                        tracing::info!(
+                            user = %user.username,
+                            sessions_ended = ended,
+                            "user left the server, in an app; an admin can restore them"
+                        );
+                    }
+                    Who::Portable(portable) => {
+                        // Its credential, presented again, is a portable
+                        // user's recent sign-in: a session opened lately.
+                        if now - portable.authenticated_at > RECENT_SIGN_IN.as_secs() as i64 {
+                            return Err(Error::RecentSignInRequired);
+                        }
+                        self.store()
+                            .leave_portable(portable.user)
+                            .await
+                            .map_err(internal)?;
+                        tracing::info!(
+                            portable = %portable.user.fingerprint(),
+                            "portable user left the server, in an app: grant revoked, data deleted"
+                        );
+                    }
+                }
+                Ok(Reply::Done)
             }
             // PX-44: the web UI's invite pages, for an admin in an app.
             // The role first, so a consumer is told `AdminRequired`, not
@@ -4157,14 +4209,12 @@ impl ProtocolHandler for ClientProtocol {
         // is a stranger, held only while there is room for one (PX-10).
         // A portable guest's session (P7-06) gives the limits, not a
         // local user's standing with the strangers' budget.
+        // One store query for both (CR-11 L17): every connection asks it
+        // before the strangers' cap is checked. A store error makes it a
+        // stranger, which fails safe.
         let id_text = connection.remote_id().to_string();
-        let sessions = async {
-            let local = self.store().endpoint_signed_in(&id_text).await?;
-            let guest = local || self.store().endpoint_has_portable_session(&id_text).await?;
-            Ok::<_, crate::store::StoreError>((local || guest, local))
-        };
-        let (known, local) = match sessions.await {
-            Ok(found) => found,
+        let (known, local) = match self.store().endpoint_sessions(&id_text).await {
+            Ok(found) => (found.any(), found.local),
             Err(e) => {
                 tracing::warn!(error = %e, "cannot look the device's sessions up");
                 (false, false)

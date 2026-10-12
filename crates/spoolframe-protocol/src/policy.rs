@@ -143,6 +143,8 @@ pub fn retry_safe(request: &Request) -> bool {
         // (PX-44).
         | Request::CreateInvite(_)
         | Request::RevokeInvite { .. }
+        // Leaving ends every session; a second try finds none (PX-47).
+        | Request::LeaveServer
         | Request::Unknown => false,
     }
 }

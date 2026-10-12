@@ -118,6 +118,46 @@ impl std::str::FromStr for Mode {
 pub enum SandboxError {
     #[error("media.sandbox is \"required\", but the media tools cannot be confined here: {reason}")]
     Unavailable { reason: String },
+    #[error(
+        "media.sandbox is \"required\", but {} (kept from the media tools) cannot be resolved: \
+         {error}",
+        dir.display()
+    )]
+    Hidden { dir: PathBuf, error: std::io::Error },
+}
+
+/// `dir` with every symlink in it followed, as the kernel names what is in
+/// it: an input's real path starts with it. One not made yet is its
+/// nearest existing ancestor resolved, with the rest as named: where it
+/// will be once made, so a state directory made after start under a
+/// symlinked parent is still matched. Any error but a missing component
+/// (a parent that cannot be searched, a path through a file, a loop) is
+/// returned.
+fn resolve_dir(dir: &Path) -> std::io::Result<PathBuf> {
+    let dir = std::path::absolute(dir)?;
+    let mut missing = Vec::new();
+    let mut at = dir.as_path();
+    loop {
+        match std::fs::canonicalize(at) {
+            Ok(real) => {
+                return Ok(missing
+                    .iter()
+                    .rev()
+                    .fold(real, |path, name| path.join(name)));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // `..` has no name: what it would lead to is not known.
+                match (at.parent(), at.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        missing.push(name.to_owned());
+                        at = parent;
+                    }
+                    _ => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// The oldest Landlock ABI that confines a run: 3 (Linux 6.2) is the first
@@ -178,10 +218,28 @@ impl Sandbox {
         hidden: Vec<PathBuf>,
         gpu: GpuDevices,
     ) -> Result<Self, SandboxError> {
-        let hidden = hidden
-            .into_iter()
-            .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir))
-            .collect();
+        // Matched against an input's real path (`open_input`), so each is
+        // kept resolved; one that cannot be resolved would silently never
+        // match (CR-11 L63).
+        let mut resolved = Vec::with_capacity(hidden.len());
+        for dir in hidden {
+            match resolve_dir(&dir) {
+                Ok(real) => resolved.push(real),
+                Err(error) if mode == Mode::Required => {
+                    return Err(SandboxError::Hidden { dir, error });
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        %error,
+                        "cannot resolve a directory the media tools are kept out of; it is \
+                         kept as named, so an input reaching it through a symlink is not refused"
+                    );
+                    resolved.push(dir);
+                }
+            }
+        }
+        let hidden = resolved;
         let mut inner = Inner {
             landlock: None,
             seccomp: None,
@@ -1525,6 +1583,86 @@ mod tests {
         let sandbox = with(Mode::Off, landlock_abi()).unwrap();
         assert!(!sandbox.confines());
         assert!(sandbox.0.seccomp.is_none());
+    }
+
+    /// A sandbox kept out of `hidden`, unconfined (the hidden check is the
+    /// same whatever the mode).
+    fn hiding(mode: Mode, hidden: PathBuf) -> Result<Sandbox, SandboxError> {
+        Sandbox::with_landlock(
+            mode,
+            Err("this kernel has no Landlock".into()),
+            vec![hidden],
+            GpuDevices::default(),
+        )
+    }
+
+    /// Whether a run may read `path`: refused as hidden, or not.
+    fn hidden_from(sandbox: &Sandbox, path: &Path) -> bool {
+        match open_input(path, &sandbox.0, &Jail::new(Limits::PROBE)) {
+            Ok(file) => {
+                assert!(file.is_some(), "{} exists", path.display());
+                false
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => true,
+            Err(e) => panic!("{}: {e}", path.display()),
+        }
+    }
+
+    /// CR-11 L63: the state directory named through a symlink is kept by
+    /// where it leads, which is what a run's input resolves to.
+    #[tokio::test]
+    async fn a_hidden_dir_named_through_a_symlink_hides_what_it_leads_to() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-hidden-link").await;
+        std::fs::create_dir_all(tmp.join("real/state")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+        std::fs::write(tmp.join("real/state/db"), b"secret").unwrap();
+        std::fs::write(tmp.join("real/movie.mkv"), b"film").unwrap();
+        let sandbox = hiding(Mode::Off, tmp.join("link/state")).unwrap();
+        assert!(hidden_from(&sandbox, &tmp.join("real/state/db")));
+        assert!(hidden_from(&sandbox, &tmp.join("link/state/db")));
+        assert!(!hidden_from(&sandbox, &tmp.join("real/movie.mkv")));
+    }
+
+    /// One not made yet is kept by where it will be: its nearest existing
+    /// ancestor resolved, the rest as named. Before, it could not be
+    /// resolved, was kept as named, and never matched a run's input.
+    #[tokio::test]
+    async fn a_hidden_dir_not_made_yet_is_kept_by_where_it_will_be() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-hidden-later").await;
+        std::fs::create_dir_all(tmp.join("real")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+        // Not one that cannot be resolved: `required` gets past it, to
+        // the missing Landlock.
+        let err = hiding(Mode::Required, tmp.join("link/state/sub")).unwrap_err();
+        assert!(err.to_string().contains("no Landlock"), "{err}");
+        let sandbox = hiding(Mode::Off, tmp.join("link/state/sub")).unwrap();
+        std::fs::create_dir_all(tmp.join("real/state/sub")).unwrap();
+        std::fs::write(tmp.join("real/state/sub/db"), b"secret").unwrap();
+        assert!(hidden_from(&sandbox, &tmp.join("real/state/sub/db")));
+    }
+
+    /// One that cannot be resolved (here a path through a regular file)
+    /// stops a `required` sandbox, naming it: the check would otherwise
+    /// silently never match.
+    #[tokio::test]
+    async fn required_refuses_a_hidden_dir_that_cannot_be_resolved() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-hidden-bad").await;
+        std::fs::write(tmp.join("file"), b"").unwrap();
+        let bad = tmp.join("file/state");
+        let err = hiding(Mode::Required, bad.clone()).unwrap_err();
+        assert!(err.to_string().contains(&*bad.to_string_lossy()), "{err}");
+    }
+
+    /// Under `auto` or `off` it is kept as named, with a warning.
+    #[tokio::test]
+    async fn auto_keeps_a_hidden_dir_that_cannot_be_resolved_as_named() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-hidden-auto").await;
+        std::fs::write(tmp.join("file"), b"").unwrap();
+        let bad = tmp.join("file/state");
+        for mode in [Mode::Auto, Mode::Off] {
+            let sandbox = hiding(mode, bad.clone()).unwrap();
+            assert_eq!(sandbox.0.hidden, std::slice::from_ref(&bad));
+        }
     }
 
     /// A host with a render node and an NVIDIA card: a VA-API run gets the

@@ -13,6 +13,7 @@ use crate::{
 use crate::{
     AuthMethod, ConfirmPassword, Error, Event, Hello, LoginPassword, PROTOCOL_VERSION, PinProof,
     Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId, SessionInfo, UserSummary,
+    WhoAmIReply,
 };
 use crate::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyInfo, PasskeyRegistrationBegun,
@@ -484,14 +485,17 @@ fn every_reply_round_trips() {
         },
         Reply::Search(search_results()),
         Reply::Tracks(MediaTracks::default()),
-        Reply::WhoAmI(UserSummary {
-            user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
-            username: "alice".into(),
-            display_name: "Alice".into(),
-            role: spoolframe_types::Role::Consumer,
-            locked: true,
-            pin: Some(crate::PinState { digits: Some(6) }),
-            portable: Some(tie_user()),
+        Reply::WhoAmI(WhoAmIReply {
+            user: UserSummary {
+                user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
+                username: "alice".into(),
+                display_name: "Alice".into(),
+                role: spoolframe_types::Role::Consumer,
+                locked: true,
+                pin: Some(crate::PinState { digits: Some(6) }),
+                portable: Some(tie_user()),
+            },
+            can_leave: true,
         }),
         Reply::Devices {
             devices: vec![crate::DeviceInfo {
@@ -2267,5 +2271,65 @@ fn a_change_password_keeps_its_passwords_out_of_the_log() {
     assert!(
         !shown.contains("ABCD") && !shown.contains("horse"),
         "{shown}"
+    );
+}
+
+/// PX-47: leaving goes over the wire as it is, needs a session, and is
+/// never sent twice; `LastAdmin` is its refusal.
+#[test]
+fn leaving_a_server_round_trips_and_is_never_retried() {
+    let request = Request::LeaveServer;
+    assert!(!request.is_pre_auth());
+    assert!(!crate::policy::retry_safe(&request));
+    round_trip(request);
+    round_trip(Response::Err(Error::LastAdmin));
+}
+
+fn admin_who_am_i(can_leave: bool) -> WhoAmIReply {
+    WhoAmIReply {
+        user: UserSummary {
+            user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
+            username: "root".into(),
+            display_name: "Root".into(),
+            role: spoolframe_types::Role::Admin,
+            locked: false,
+            pin: None,
+            portable: Some(tie_user()),
+        },
+        can_leave,
+    }
+}
+
+/// Whether the user may leave rides in `WhoAmI`, beside the user's own
+/// fields: an older client, which reads the answer as a `UserSummary`,
+/// still reads it.
+#[test]
+fn who_am_i_carries_whether_the_user_can_leave() {
+    for can_leave in [false, true] {
+        round_trip(Reply::WhoAmI(admin_who_am_i(can_leave)));
+    }
+    let reply = admin_who_am_i(false);
+    let older: UserSummary = codec::decode(&codec::encode(&reply).unwrap()).unwrap();
+    assert_eq!(older, reply.user);
+}
+
+/// A server before `can_leave` leaves it out: the app offers leaving,
+/// and that server's `LastAdmin` refusal is what stops the last admin.
+#[test]
+fn a_who_am_i_without_can_leave_lets_the_user_leave() {
+    let full: ciborium::Value = ciborium::from_reader(
+        codec::encode(&Reply::WhoAmI(admin_who_am_i(false)))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    let ciborium::Value::Map(mut entries) = full else {
+        panic!("a reply is a map");
+    };
+    entries.retain(|(key, _)| key.as_text() != Some("can_leave"));
+    let older = codec::encode(&ciborium::Value::Map(entries)).unwrap();
+    assert_eq!(
+        codec::decode::<Reply>(&older).unwrap(),
+        Reply::WhoAmI(admin_who_am_i(true))
     );
 }

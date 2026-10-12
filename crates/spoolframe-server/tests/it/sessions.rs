@@ -3,7 +3,9 @@
 
 use crate::support;
 
-use spoolframe_protocol::{Error, PlaybackPlan, Reply, Request, Response, UserSummary};
+use spoolframe_protocol::{
+    Error, PlaybackPlan, Reply, Request, Response, UserSummary, WhoAmIReply,
+};
 use spoolframe_types::{ClientCapabilities, Platform};
 use support::{TestServer, movie};
 
@@ -13,7 +15,10 @@ async fn who(client: &support::TestClient, session: &spoolframe_protocol::Sessio
 
 fn name_of(response: Response) -> String {
     match response {
-        Response::Ok(Reply::WhoAmI(UserSummary { display_name, .. })) => display_name,
+        Response::Ok(Reply::WhoAmI(WhoAmIReply {
+            user: UserSummary { display_name, .. },
+            ..
+        })) => display_name,
         other => panic!("not WhoAmI: {other:?}"),
     }
 }
@@ -46,7 +51,11 @@ async fn who_am_i_names_the_user_by_a_uuidv7() {
     let tv = server.client().await;
     tv.hello().await;
     let session = tv.login("alice", "correct horse").await;
-    let Response::Ok(Reply::WhoAmI(UserSummary { user_id, .. })) = who(&tv, &session).await else {
+    let Response::Ok(Reply::WhoAmI(WhoAmIReply {
+        user: UserSummary { user_id, .. },
+        ..
+    })) = who(&tv, &session).await
+    else {
         panic!("not WhoAmI");
     };
     let uuid = user_id.strip_prefix("local:").expect(&user_id);

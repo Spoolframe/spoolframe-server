@@ -232,6 +232,14 @@ uclicious = { version = "0.10.1", registry = "coldsteel" }
 # Reads the workspace graph for the license-boundary test.
 cargo_metadata = "0.23"
 
+# The server's release build. Thin LTO lets inlining cross crate lines
+# without fat LTO's link time and memory. Line tables only: panic
+# backtraces and Pyroscope profiles keep file and line, without the full
+# debug info's size.
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"
+
 # The web UI's wasm (`dx bundle --profile wasm-release`). binaryen's
 # wasm-opt aborts on a module carrying DWARF, so nothing of it may survive:
 # symbols stripped, no debug info, and one codegen unit with LTO for a

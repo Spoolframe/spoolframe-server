@@ -190,6 +190,17 @@ fn parse(phrase: &str) -> Result<Mnemonic, PhraseError> {
     })
 }
 
+/// Which of this device's keys a credential being installed is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceKey {
+    /// The one kept for its identity ([`Portable::device_key`]).
+    Kept,
+    /// The pending one made for a pairing through a server, before the
+    /// identity was known: adopted as the identity's once the credential
+    /// is accepted.
+    Pending,
+}
+
 /// A portable identity this device holds the root of.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableIdentity {
@@ -313,20 +324,35 @@ impl Portable {
         Ok(issued)
     }
 
-    /// Remove identity `id` from this device: its root and its entry. Its
-    /// phrase still recovers it. Forgetting one not here does nothing.
+    /// Remove identity `id` from this device: its root, its entry, and
+    /// this device's key and credential for it, so the device no longer
+    /// signs in as it (nor lists it as a guest). Its phrase still
+    /// recovers it. What its root issued and revoked here, and its serial,
+    /// stay: a recovered root goes on from them. Forgetting one not here
+    /// does nothing.
     pub async fn forget(&self, id: PortableUserId) -> Result<(), SdkError> {
         let storage = self.storage.as_ref();
         let _saving = self.saving.lock().await;
-        // The secret first: should the list then fail to save, an entry
-        // with no root stays, which forgetting again clears, rather than
-        // a root nothing lists.
+        // The credential first, as forget_guest does: should the rest
+        // fail, nothing acts as the identity, and forgetting again clears
+        // what is left.
+        let mut credentials = load_credentials(storage).await?;
+        if credentials.remove(&id).is_some() {
+            save_credentials(storage, &credentials).await?;
+        }
+        storage
+            .set_secret(&keys::portable_device(&id.to_string()), None)
+            .await?;
+        // The root before the entry: should the list then fail to save,
+        // an entry with no root stays, which forgetting again clears,
+        // rather than a root nothing lists.
         storage
             .set_secret(&keys::portable_root(&id.to_string()), None)
             .await?;
         let mut saved = load(storage).await?;
         saved.retain(|entry| entry.id != id);
         save(storage, &saved).await?;
+        tracing::info!(%id, "forgot a portable identity");
         Ok(())
     }
 
@@ -458,45 +484,38 @@ impl Portable {
         device_key: DevicePublicKey,
         now: i64,
     ) -> Result<PortableIdentityState, SdkError> {
-        let storage = self.storage.as_ref();
-        let root = self.load_root(id).await?;
-        let _saving = self.saving.lock().await;
-        let previous = load_state(storage, id).await?;
-        if let Some(previous) = previous.as_ref().filter(|s| s.revokes(&device_key)) {
-            return Ok(previous.clone());
+        // Without the root here this is UnknownIdentity, before anything
+        // else is read.
+        self.load_root(id).await?;
+        if let Some(previous) = load_state(self.storage.as_ref(), id)
+            .await?
+            .filter(|s| s.revokes(&device_key))
+        {
+            return Ok(previous);
         }
-        let revision = match &previous {
-            None => 1,
-            Some(previous) => previous.revision.checked_add(1).ok_or_else(|| {
-                StorageError(format!(
-                    "the identity state of {id} is at its last revision"
-                ))
-            })?,
-        };
-        let mut union = load_revoked(storage, id).await?;
-        if let Some(previous) = &previous {
-            merge(&mut union, &previous.revoked);
-        }
-        // Revoked from now, unless it already is (from a state accepted
-        // from elsewhere) and that revocation has not lapsed.
-        let revoked_at = union
-            .get(&device_key)
-            .copied()
-            .filter(|&at| !revocation_lapsed(at, now))
-            .unwrap_or(now);
-        union.insert(device_key, revoked_at);
-        let live = union
-            .iter()
-            .filter(|&(_, &at)| !revocation_lapsed(at, now))
-            .map(|(&key, &revoked_at)| RevokedKey { key, revoked_at })
-            .collect();
-        let state =
-            PortableIdentityState::new(id, revision, live, now, |message| root.sign(message))?;
-        // The union first: should the state then fail to save, the key
-        // is still refused here, and revoking it again signs anew.
-        save_revoked(storage, id, &union).await?;
-        save_state(storage, &state).await?;
-        tracing::info!(%id, %device_key, revision, "revoked a portable device key");
+        // Through the same path as `revoke_by`, which carries the roots
+        // added and removed forward: a state built from the revocations
+        // alone would drop a security key the phrase identity added.
+        let state = self
+            .new_state(
+                id,
+                RootSigner::Phrase,
+                None,
+                |changes| {
+                    // Revoked from now, unless it already is (from a state
+                    // accepted from elsewhere) and that revocation has not
+                    // lapsed: lapsed ones are not among `changes.revoked`.
+                    if !changes.revoked.iter().any(|r| r.key == device_key) {
+                        changes.revoked.push(RevokedKey {
+                            key: device_key,
+                            revoked_at: now,
+                        });
+                    }
+                },
+                now,
+            )
+            .await?;
+        tracing::info!(%id, %device_key, revision = state.revision, "revoked a portable device key");
         Ok(state)
     }
 
@@ -557,17 +576,46 @@ impl Portable {
         credential: UserDeviceCredential,
         now: i64,
     ) -> Result<(), SdkError> {
+        self.install_credential_for(credential, now, DeviceKey::Kept)
+            .await
+    }
+
+    /// [`Self::install_credential_at`] for the device key `key` names. A
+    /// pending key ([`DeviceKey::Pending`], a pairing through a server)
+    /// is checked as the kept one is, and becomes the identity's only
+    /// once every check passed, with the credential: a refused credential
+    /// leaves the key this device had, which its credential names.
+    pub(crate) async fn install_credential_for(
+        &self,
+        credential: UserDeviceCredential,
+        now: i64,
+        key: DeviceKey,
+    ) -> Result<(), SdkError> {
         credential.verify(now)?;
         let id = credential.user;
         self.check_signer(&credential).await?;
         let _saving = self.saving.lock().await;
         let storage = self.storage.as_ref();
-        let ours = load_device_key(storage, id).await?;
-        if ours.is_none_or(|key| public_key(&key) != credential.device_key) {
+        let ours = match key {
+            DeviceKey::Kept => load_device_key(storage, id).await?,
+            DeviceKey::Pending => key_roots::load_pending(storage).await?,
+        };
+        let Some(ours) = ours.filter(|k| public_key(k) == credential.device_key) else {
             return Err(SdkError::NotThisDevice);
-        }
+        };
         if is_revoked(storage, id, &credential.device_key).await? {
             return Err(SdkError::DeviceKeyRevoked);
+        }
+        if key == DeviceKey::Pending {
+            storage
+                .set_secret(
+                    &keys::portable_device(&id.to_string()),
+                    Some(Zeroizing::new(ours.to_bytes()).to_vec()),
+                )
+                .await?;
+            storage
+                .set_secret(keys::PORTABLE_PENDING_DEVICE, None)
+                .await?;
         }
         let mut credentials = load_credentials(storage).await?;
         credentials.insert(id, credential);
@@ -1325,7 +1373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forgetting_removes_the_root_and_the_entry_only() {
+    async fn forgetting_removes_one_identity_and_leaves_the_others() {
         let (storage, portable) = portable();
         let (steve, _) = portable.create("Steve").await.unwrap();
         let ann = portable.recover(&zero_phrase(), "Ann").await.unwrap();
@@ -1352,6 +1400,42 @@ mod tests {
         assert_eq!(portable.load_root(ann).await.unwrap().id(), ann);
         // Again: nothing to forget, nothing goes wrong.
         portable.forget(steve).await.unwrap();
+    }
+
+    /// P4: a forgotten identity's device key and credential go with its
+    /// root: this device no longer signs in as it, nor lists it as a
+    /// guest. What its root issued and revoked here stays, as its serial
+    /// does, should the phrase recover it.
+    #[tokio::test]
+    async fn a_forgotten_identity_no_longer_signs_in_here() {
+        let (storage, phone) = portable();
+        let (id, _) = phone.create("Steve").await.unwrap();
+        let now = unix_now();
+        phone.own_credential_at(id, now).await.unwrap();
+        assert!(phone.prove_at(id, &[1; 32], &[2; 32], now).await.is_ok());
+        let issued = phone.issued(id).await.unwrap();
+        let serial = keys::portable_serial(&id.to_string());
+        let serial_before = storage.data(&serial).await.unwrap();
+
+        phone.forget(id).await.unwrap();
+        assert_eq!(
+            phone
+                .prove_at(id, &[1; 32], &[2; 32], now)
+                .await
+                .unwrap_err(),
+            SdkError::UnknownIdentity(id.to_string())
+        );
+        assert_eq!(phone.guests().await.unwrap(), []);
+        assert_eq!(phone.credential(id).await.unwrap(), None);
+        assert_eq!(
+            storage
+                .secret(&keys::portable_device(&id.to_string()))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(phone.issued(id).await.unwrap(), issued);
+        assert_eq!(storage.data(&serial).await.unwrap(), serial_before);
     }
 
     /// Storage whose data cannot be read.

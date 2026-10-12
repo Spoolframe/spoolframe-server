@@ -1089,15 +1089,48 @@ impl Client {
         remembered: bool,
         portable: Option<PortableUserId>,
     ) -> Result<Session, SdkError> {
-        let user = match self.call(server, Some(&token), Request::WhoAmI).await? {
-            Response::Ok(Reply::WhoAmI(user)) => user,
+        let who = match self.call(server, Some(&token), Request::WhoAmI).await? {
+            Response::Ok(Reply::WhoAmI(who)) => who,
             Response::Ok(other) => {
                 return Err(SdkError::Protocol(format!("WhoAmI answered {other:?}")));
             }
             Response::Err(e) => return Err(SdkError::from_server(e)),
         };
+        self.store_session(server, token, who, method, remembered, portable)
+            .await
+    }
+
+    /// The rest of [`Client::keep_session_as`], once the server said who
+    /// `token` is: kept under the user, as their profile here.
+    ///
+    /// The server was pinned when the sign-in was asked for, but may have
+    /// been forgotten while it was on the way: checked again under
+    /// `saving`, which `forget` holds as it unpins. Forgotten, the session
+    /// is not kept but ended on the server, if a connection to it is open
+    /// (best effort, in the background), and the sign-in is
+    /// [`SdkError::NotPinned`].
+    async fn store_session(
+        &self,
+        server: EndpointId,
+        token: SessionId,
+        who: spoolframe_protocol::WhoAmIReply,
+        method: Option<SignInMethod>,
+        remembered: bool,
+        portable: Option<PortableUserId>,
+    ) -> Result<Session, SdkError> {
+        let spoolframe_protocol::WhoAmIReply { user, can_leave } = who;
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
+        let pinned = servers::load(storage)
+            .await?
+            .iter()
+            .any(|s| s.endpoint_id == server.to_string());
+        if !pinned {
+            drop(_saving);
+            tracing::info!(%server, "the server was forgotten during a sign-in; its session is not kept");
+            self.log_out_in_background(server, token);
+            return Err(SdkError::NotPinned(server.to_string()));
+        }
         let mut stored = session::load(storage, &server).await?;
         let kept = StoredSession {
             token: Some(token.0.clone()),
@@ -1132,9 +1165,31 @@ impl Client {
             server,
             token,
             user,
+            can_leave,
             remembered: Some(remembered),
             password_change_required: false,
         })
+    }
+
+    /// End `token` on `server` if a connection to it is open now, without
+    /// waiting for it and without dialling: a session not kept here is
+    /// not left live there.
+    fn log_out_in_background(&self, server: EndpointId, token: SessionId) {
+        let open = self
+            .inner
+            .links
+            .lock()
+            .get(&server)
+            .is_some_and(|link| link.open().is_some());
+        if !open {
+            return;
+        }
+        let client = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.call(server, Some(&token), Request::Logout).await {
+                tracing::debug!(%server, error = %e, "could not end a session not kept");
+            }
+        });
     }
 
     /// "Who's watching": the users signed in on server `endpoint_id` from
@@ -1164,11 +1219,15 @@ impl Client {
                 answer => answer?,
             };
             match answer {
-                Response::Ok(Reply::WhoAmI(user)) => profiles.push(Session {
+                Response::Ok(Reply::WhoAmI(spoolframe_protocol::WhoAmIReply {
+                    user,
+                    can_leave,
+                })) => profiles.push(Session {
                     client: self.clone(),
                     server,
                     token,
                     user,
+                    can_leave,
                     remembered: None,
                     password_change_required: false,
                 }),
@@ -1632,15 +1691,20 @@ impl Client {
     /// asked for a `Ping`; one that does not answer within
     /// [`Timeouts::ping`] is dropped and dialled again in the background,
     /// so the next request goes on a working one instead of waiting out
-    /// its time limit. Servers with no connection are not dialled. Returns
-    /// within about [`Timeouts::ping`]; it is cheap, and safe to call at
-    /// any time.
+    /// its time limit. A server being dialled again after a lost
+    /// connection, waiting between dials, is dialled at once: the network
+    /// may be back. Servers with no connection otherwise are not dialled.
+    /// Returns within about [`Timeouts::ping`]; it is cheap, and safe to
+    /// call at any time.
     pub async fn resume(&self) {
         let links: Vec<Arc<Link>> = self.inner.links.lock().values().cloned().collect();
         let ping = self.inner.timeouts.ping;
         let mut checks = tokio::task::JoinSet::new();
         for link in links {
             let Some(conn) = link.open() else {
+                if link.supervised() {
+                    link.hurry();
+                }
                 continue;
             };
             checks.spawn(async move {
@@ -2279,6 +2343,53 @@ mod tests {
             Some(fingerprint::fingerprint(id.as_bytes())),
             fingerprint::of_hex(&id.to_string())
         );
+    }
+
+    /// C3: the server is forgotten while a sign-in is on the way, and the
+    /// reply comes after: its session is not kept for a server no longer
+    /// pinned.
+    #[tokio::test]
+    async fn a_session_whose_server_was_forgotten_meanwhile_is_not_kept() {
+        let storage = Arc::new(MemoryStorage::default());
+        let client = Client::open(storage.clone(), device()).await.unwrap();
+        let id = SecretKey::generate().public();
+        let pinned: SavedServer = serde_json::from_value(serde_json::json!({
+            "name": "Home",
+            "endpoint_id": id.to_string(),
+        }))
+        .unwrap();
+        servers::save(storage.as_ref(), &[pinned]).await.unwrap();
+        // Pinned when the sign-in was asked for...
+        client.require_pinned(id).await.unwrap();
+        // ...and forgotten before its reply was kept.
+        client.forget(&id.to_string()).await.unwrap();
+        let user = serde_json::from_value(serde_json::json!({
+            "user_id": "local:1",
+            "username": "sam",
+            "display_name": "Sam",
+            "role": "user",
+            "locked": false,
+            "pin": null,
+            "portable": null,
+        }))
+        .unwrap();
+        let kept = client
+            .store_session(
+                id,
+                SessionId("a-token".into()),
+                spoolframe_protocol::WhoAmIReply {
+                    user,
+                    can_leave: true,
+                },
+                Some(SignInMethod::Password),
+                false,
+                None,
+            )
+            .await;
+        assert!(matches!(kept, Err(SdkError::NotPinned(_))), "{kept:?}");
+        let stored = session::load(storage.as_ref(), &id).await.unwrap();
+        assert!(stored.is_empty(), "{} sessions kept", stored.len());
+        client.close().await;
     }
 
     #[tokio::test]

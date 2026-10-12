@@ -81,6 +81,9 @@ pub struct UserRecord {
     pub role: Role,
     pub created_at: i64,
     pub disabled_at: Option<i64>,
+    /// When they left the server from an app (PX-47): disabled too, and
+    /// an admin restores them by enabling them.
+    pub left_at: Option<i64>,
     pub has_password: bool,
     /// When their password was set or last changed; `None` without one.
     pub password_changed_at: Option<i64>,
@@ -398,13 +401,52 @@ impl Store {
         Ok(revoked)
     }
 
-    /// Let a disabled user log in again. Their revoked sessions stay
-    /// revoked.
+    /// A local user leaves the server from an app (PX-47): set aside, not
+    /// deleted. Disabled and marked as left, every session ended and no
+    /// device trusted, as [`Store::disable_user`] does; their data stays
+    /// for an admin to restore ([`Store::enable_user`]). The last enabled
+    /// admin, or the last with a password, cannot leave. How many
+    /// sessions were ended.
+    pub async fn leave_local(&self, id: LocalUserId) -> Result<u64, UserError> {
+        let now = self.now();
+        let mut tx = self.begin_write().await?;
+        let name: Option<String> = sqlx::query_scalar("SELECT username FROM users WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let name = name.ok_or_else(|| UserError::NoSuchUser(id.to_string()))?;
+        keep_an_admin(&mut tx, id, &name).await?;
+        sqlx::query(
+            "UPDATE users SET disabled_at = coalesce(disabled_at, ?2), left_at = ?2 \
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let revoked = end_sessions(&mut tx, id, now, None).await?;
+        tx.commit().await?;
+        self.note_sessions_ended();
+        Ok(revoked)
+    }
+
+    /// Whether local user `id` may leave the server now (PX-47): false
+    /// exactly when [`Store::leave_local`] would refuse them as the last
+    /// enabled admin, or the last enabled admin with a password, by the
+    /// same check. Changes nothing; `WhoAmI` answers it, for an app to
+    /// grey out "Leave this server" before it is asked.
+    pub async fn can_leave(&self, id: LocalUserId) -> Result<bool, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(admin_loss(&mut conn, id).await?.is_none())
+    }
+
+    /// Let a disabled user log in again, one who left (PX-47) too: their
+    /// revoked sessions stay revoked.
     pub async fn enable_user(&self, username: &str) -> Result<(), UserError> {
         let name = normalize_username(username)?;
         let mut tx = self.begin_write().await?;
         let id = user_id(&mut tx, &name).await?;
-        sqlx::query("UPDATE users SET disabled_at = NULL WHERE id = ?1")
+        sqlx::query("UPDATE users SET disabled_at = NULL, left_at = NULL WHERE id = ?1")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -429,7 +471,7 @@ impl Store {
         macro_rules! select {
             () => {
                 "SELECT u.id, u.username, u.display_name, u.role, u.created_at, \
-                    u.disabled_at, \
+                    u.disabled_at, u.left_at, \
                     p.user_id IS NOT NULL AS has_password, p.updated_at AS password_changed_at, \
                     coalesce(p.must_change, 0) AS password_must_change, \
                     p.expires_at AS password_expires_at, \
@@ -480,6 +522,7 @@ impl Store {
                     role: role(row.try_get("role")?),
                     created_at: row.try_get("created_at")?,
                     disabled_at: row.try_get("disabled_at")?,
+                    left_at: row.try_get("left_at")?,
                     has_password: row.try_get("has_password")?,
                     password_changed_at: row.try_get("password_changed_at")?,
                     password_must_change: row.try_get("password_must_change")?,
@@ -704,6 +747,28 @@ async fn keep_an_admin(
     id: LocalUserId,
     name: &str,
 ) -> Result<(), UserError> {
+    match admin_loss(tx, id).await? {
+        None => Ok(()),
+        Some(AdminLoss::LastAdmin) => Err(UserError::LastAdmin(name.to_owned())),
+        Some(AdminLoss::LastPasswordAdmin) => Err(UserError::LastPasswordAdmin(name.to_owned())),
+    }
+}
+
+/// What taking `id` out of the enabled admins would lose.
+enum AdminLoss {
+    /// The last enabled admin.
+    LastAdmin,
+    /// The last enabled admin with a password.
+    LastPasswordAdmin,
+}
+
+/// Whether taking `id` out of the enabled admins would leave none, or
+/// none with a password: [`keep_an_admin`]'s check, which
+/// [`Store::can_leave`] asks without changing anything.
+async fn admin_loss(
+    conn: &mut sqlx::SqliteConnection,
+    id: LocalUserId,
+) -> Result<Option<AdminLoss>, sqlx::Error> {
     let (is_enabled_admin, has_password, others, others_with_password): (bool, bool, i64, i64) =
         sqlx::query_as(
             "SELECT \
@@ -716,15 +781,15 @@ async fn keep_an_admin(
                 WHERE u.id != ?1 AND u.role = 'admin' AND u.disabled_at IS NULL)",
         )
         .bind(id)
-        .fetch_one(tx)
+        .fetch_one(conn)
         .await?;
     if is_enabled_admin && others == 0 {
-        return Err(UserError::LastAdmin(name.to_owned()));
+        return Ok(Some(AdminLoss::LastAdmin));
     }
     if is_enabled_admin && has_password && others_with_password == 0 {
-        return Err(UserError::LastPasswordAdmin(name.to_owned()));
+        return Ok(Some(AdminLoss::LastPasswordAdmin));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Refuse to take the password of `id` if it is the last enabled admin

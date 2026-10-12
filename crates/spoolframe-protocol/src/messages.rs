@@ -636,6 +636,24 @@ pub enum Request {
         id: String,
     },
 
+    /// Leave this server (PX-47): `Done`, and every session of the user
+    /// here is ended, this one too. Needs a recent sign-in
+    /// (`RecentSignInRequired`): a local user confirms with
+    /// `ConfirmPassword` or a passkey; a portable user (P7-06) signs in
+    /// with its credential again, which opens a new session that counts as
+    /// recent. What leaving does depends on who:
+    ///
+    /// - A portable user's grant is taken away, and its data here (watch
+    ///   state, hidden rows, track preferences) is deleted. Coming back
+    ///   takes a new invite.
+    /// - A local account is set aside, not deleted: disabled and marked
+    ///   as left, its sessions ended and its devices no longer trusted;
+    ///   its data stays, and an admin can restore it.
+    ///
+    /// The last enabled admin (or the last with a password) cannot leave:
+    /// `LastAdmin`. Nothing was changed then.
+    LeaveServer,
+
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
     #[serde(other)]
@@ -980,7 +998,7 @@ pub enum Reply {
     },
     Search(SearchResults),
     Tracks(MediaTracks),
-    WhoAmI(UserSummary),
+    WhoAmI(WhoAmIReply),
     LoggedOut,
     Sessions {
         sessions: Vec<SessionInfo>,
@@ -1160,6 +1178,32 @@ pub struct UserSummary {
     /// shown on the account, never as a second one.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub portable: Option<PortableUserId>,
+}
+
+/// What `WhoAmI` answers: the session's user, and whether they may leave
+/// the server. On the wire the user's fields and `can_leave` sit in one
+/// map, as the user's alone did before, so an older client reads it as a
+/// [`UserSummary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WhoAmIReply {
+    #[serde(flatten)]
+    pub user: UserSummary,
+    /// `LeaveServer` would be done, not refused with `LastAdmin` (PX-47):
+    /// false for the last enabled admin, or the last enabled admin with a
+    /// password, so an app can grey out "Leave this server" before it is
+    /// asked. As of this answer: an admin made or demoted later changes
+    /// it. Left out by an older server, true; its refusal still stands.
+    // compat(v1): required at the protocol reset
+    #[serde(default = "WhoAmIReply::can_leave_by_default")]
+    pub can_leave: bool,
+}
+
+impl WhoAmIReply {
+    /// An older server says nothing about leaving: let the app offer it,
+    /// and the server's `LastAdmin` refuse it if it must.
+    fn can_leave_by_default() -> bool {
+        true
+    }
 }
 
 /// A user's PIN as clients may know it.
@@ -1485,6 +1529,11 @@ pub enum Error {
     /// chooses a new password. Nothing was done.
     #[error("choose a new password first")]
     PasswordChangeRequired,
+    /// `LeaveServer` from the last enabled admin, or the last enabled
+    /// admin with a password (PX-47): make someone else an admin, or give
+    /// one a password, first. Nothing was changed.
+    #[error("you are the only admin; make someone else an admin first")]
+    LastAdmin,
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.

@@ -653,6 +653,9 @@ fn minutes(n: u64) -> String {
 /// A user's status on the Users list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserStatus {
+    /// They left the server from an app (PX-47): disabled, and restored
+    /// by enabling them.
+    Left,
     Disabled,
     /// Their password sign-ins are refused for a while (P3-18): why, and
     /// for how long.
@@ -665,6 +668,7 @@ pub enum UserStatus {
 
 pub fn user_status(user: &UserInfo) -> UserStatus {
     match (user.disabled, user.rate_limited_secs) {
+        (true, _) if user.left_at.is_some() => UserStatus::Left,
         (true, _) => UserStatus::Disabled,
         (false, Some(secs)) => UserStatus::Limited(format!(
             "Too many wrong passwords. Password sign-ins as {} are refused for {}.",
@@ -1371,6 +1375,7 @@ mod tests {
             role,
             created_at: 0,
             disabled,
+            left_at: None,
             has_password: true,
             password_changed_at: None,
             password_must_change: false,
@@ -1481,6 +1486,17 @@ mod tests {
         assert_eq!(count(1, "session"), "1 session");
         assert_eq!(count(0, "session"), "0 sessions");
         assert_eq!(count(4, "session"), "4 sessions");
+    }
+
+    #[test]
+    fn a_user_who_left_shows_as_left_not_disabled() {
+        let mut left = user("steve", Role::Consumer, true);
+        left.left_at = Some(1);
+        assert_eq!(user_status(&left), UserStatus::Left);
+        assert_eq!(
+            user_status(&user("steve", Role::Consumer, true)),
+            UserStatus::Disabled
+        );
     }
 
     fn named(name: &str, shown: &str, role: Role) -> UserInfo {

@@ -445,6 +445,11 @@ pub struct UserInfo {
     /// Unix seconds.
     pub created_at: i64,
     pub disabled: bool,
+    /// When they left the server from an app (PX-47), Unix seconds; they
+    /// are `disabled` too, and `userEnable` restores them. `None` for an
+    /// account that did not leave.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub left_at: Option<i64>,
     pub has_password: bool,
     /// When the password was set or last changed, Unix seconds; `None`
     /// without one.
@@ -3806,6 +3811,7 @@ mod required_field_tests {
                 role: Role::Consumer,
                 created_at: 0,
                 disabled: false,
+                left_at: None,
                 has_password: true,
                 password_changed_at: None,
                 password_must_change: true,

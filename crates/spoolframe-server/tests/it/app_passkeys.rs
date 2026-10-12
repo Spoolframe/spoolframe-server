@@ -12,7 +12,7 @@ use serde_json::json;
 use spoolframe_admin_api::{AdminApiClient, MeApiClient, error_code};
 use spoolframe_protocol::{
     Error, FinishPasskeyRegistration, FinishPasskeySignIn, LEGACY_APP_RP_ID, PasskeyCreation,
-    PasskeyInfo, PasskeyRequest, Reply, Request, Response, SessionId,
+    PasskeyInfo, PasskeyRequest, Reply, Request, Response, SessionId, WhoAmIReply,
 };
 use spoolframe_server::auth::hash_password;
 use spoolframe_types::Role;
@@ -291,7 +291,7 @@ fn session_of(response: Response) -> SessionId {
 
 async fn username(device: &TestClient, session: &SessionId) -> String {
     match device.call(Some(session), Request::WhoAmI).await {
-        Response::Ok(Reply::WhoAmI(user)) => user.username,
+        Response::Ok(Reply::WhoAmI(WhoAmIReply { user, .. })) => user.username,
         other => panic!("{other:?}"),
     }
 }

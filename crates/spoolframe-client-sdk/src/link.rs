@@ -26,6 +26,7 @@ use crate::link_meter::LinkMeter;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -199,6 +200,12 @@ pub(crate) struct Link {
     /// One first dial at a time.
     dialing: tokio::sync::Mutex<()>,
     supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Cuts the supervisor's wait between dials short ([`Link::hurry`]).
+    hurry: tokio::sync::Notify,
+    /// [`Link::close`]d: the client dropped it (the server was forgotten,
+    /// or its relays changed). A dial on the way when it closed keeps
+    /// nothing, and no supervisor starts or goes on.
+    closed: AtomicBool,
     /// How fast media comes from the server (P6-06), across connections.
     meter: Arc<LinkMeter>,
 }
@@ -214,6 +221,8 @@ impl Link {
             info: Mutex::default(),
             dialing: tokio::sync::Mutex::default(),
             supervisor: Mutex::default(),
+            hurry: tokio::sync::Notify::new(),
+            closed: AtomicBool::new(false),
             meter: Arc::default(),
         })
     }
@@ -296,26 +305,39 @@ impl Link {
         if let Some(conn) = self.open() {
             return Ok(conn);
         }
-        if self.supervised()
-            && let Some(conn) = self.reconnected().await?
-        {
-            return Ok(conn);
+        if self.supervised() {
+            // A call waits CALL_WAIT; the supervisor's wait may be minutes.
+            self.hurry();
+            if let Some(conn) = self.reconnected().await? {
+                return Ok(conn);
+            }
         }
         let _dialing = self.dialing.lock().await;
         if let Some(conn) = self.open() {
             return Ok(conn);
         }
+        if self.is_closed() {
+            return Err(self.closed_error());
+        }
         self.show(ConnectionState::Connecting);
         match client.dial(self.id).await {
             Ok(conn) => {
                 let conn = Arc::new(conn);
+                // Checked under the supervisor's lock, which `close` takes
+                // after it sets `closed`: either this sees it closed, or
+                // `close` finds the supervisor and the connection set.
+                let mut supervisor = self.supervisor.lock();
+                if self.is_closed() {
+                    drop(supervisor);
+                    conn.conn.close(0u32.into(), b"closed");
+                    return Err(self.closed_error());
+                }
                 self.set(Some(conn.clone()), ConnectionState::Connected);
-                let task = tokio::spawn(supervise(
+                *supervisor = Some(tokio::spawn(supervise(
                     self.clone(),
                     Arc::downgrade(&client.inner),
                     conn.clone(),
-                ));
-                *self.supervisor.lock() = Some(task);
+                )));
                 Ok(conn)
             }
             Err(e) if gives_up(&e) => {
@@ -329,7 +351,25 @@ impl Link {
         }
     }
 
-    fn supervised(&self) -> bool {
+    /// A call, or the app coming back, wants this server now: should the
+    /// supervisor be waiting between dials, it dials at once instead of
+    /// sleeping out a wait of up to [`MAX_RETRY`]. Should it be dialling,
+    /// it dials again at once if that one fails.
+    pub(crate) fn hurry(&self) {
+        self.hurry.notify_one();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// What a dial on a closed link gives: the client no longer keeps
+    /// this server.
+    fn closed_error(&self) -> SdkError {
+        SdkError::UnknownServer(self.id.to_string())
+    }
+
+    pub(crate) fn supervised(&self) -> bool {
         self.supervisor
             .lock()
             .as_ref()
@@ -383,8 +423,10 @@ impl Link {
         conn.conn.close(0u32.into(), b"no answer");
     }
 
-    /// Stop: no more reconnects, and the connection closed.
+    /// Stop: no more reconnects, and the connection closed. For good: a
+    /// dial on the way keeps nothing.
     pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         if let Some(task) = self.supervisor.lock().take() {
             task.abort();
         }
@@ -399,6 +441,9 @@ impl Link {
 /// that one. Ends when the client is gone or forgets the server.
 async fn supervise(link: Arc<Link>, client: Weak<Inner>, mut conn: Arc<ServerConnection>) {
     loop {
+        if link.is_closed() {
+            return;
+        }
         until_lost(&conn.conn, link.id, &client).await;
         let reason = conn.conn.close_reason();
         if reason.as_ref().and_then(closed_by_server) == Some(SdkError::SignInRequired) {
@@ -416,6 +461,10 @@ async fn supervise(link: Arc<Link>, client: Weak<Inner>, mut conn: Arc<ServerCon
             return;
         };
         conn = Arc::new(dialled);
+        if link.is_closed() {
+            conn.conn.close(0u32.into(), b"closed");
+            return;
+        }
         tracing::info!(server = %link.id, attempt, "reconnected");
         link.set(Some(conn.clone()), ConnectionState::Connected);
     }
@@ -445,7 +494,14 @@ where
                 tracing::debug!(server = %link.id, attempt, error = %e, "reconnect failed");
             }
         }
-        tokio::time::sleep(backoff.next_wait()).await;
+        // A call coming in cuts the wait short: the server may be back,
+        // and the call waits only CALL_WAIT.
+        tokio::select! {
+            () = tokio::time::sleep(backoff.next_wait()) => {}
+            () = link.hurry.notified() => {
+                tracing::debug!(server = %link.id, attempt, "hurried; dialling now");
+            }
+        }
         attempt += 1;
     }
 }
@@ -624,6 +680,58 @@ mod tests {
             waits.iter().any(|w| *w >= Duration::from_secs(240)),
             "the waits never grew past {:?}",
             waits.iter().max()
+        );
+    }
+
+    /// After a long outage the supervisor sleeps for minutes between
+    /// dials. A call that comes then hurries it: the server, back by now,
+    /// is dialled at once, well within the call's wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_during_a_long_wait_dials_at_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let link = link();
+        let up = Arc::new(AtomicBool::new(false));
+        let made = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = tokio::spawn({
+            let (link, up, made) = (link.clone(), up.clone(), made.clone());
+            async move {
+                redial(&link, || {
+                    made.lock().push(tokio::time::Instant::now());
+                    let up = up.load(Ordering::SeqCst);
+                    async move {
+                        Some(if up {
+                            Ok(())
+                        } else {
+                            Err(SdkError::Unreachable("down".into()))
+                        })
+                    }
+                })
+                .await
+            }
+        });
+        // Down for long enough that the wait after the 12th dial is
+        // minutes (250 ms doubled 11 times, up to five minutes).
+        while made.lock().len() < 12 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let waits = waits(&made.lock());
+        assert!(
+            waits.last().is_some_and(|w| *w >= Duration::from_secs(100)),
+            "{waits:?}"
+        );
+
+        up.store(true, Ordering::SeqCst);
+        let called = tokio::time::Instant::now();
+        link.hurry();
+        let dialled = tokio::time::timeout(CALL_WAIT, supervisor)
+            .await
+            .expect("the supervisor slept on past the call's wait")
+            .unwrap();
+        assert_eq!(dialled.map(|(_, attempt)| attempt), Some(13));
+        assert!(
+            called.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            called.elapsed()
         );
     }
 

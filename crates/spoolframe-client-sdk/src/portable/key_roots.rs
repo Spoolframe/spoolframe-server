@@ -32,7 +32,7 @@ pub use spoolframe_protocol::portable::{
 use spoolframe_protocol::portable::{root_add_message, root_endorse_message, root_set};
 
 use super::{
-    DevicePublicKey, MAX_CREDENTIAL_VALIDITY, PortableIdentity, PortableIdentityState,
+    DeviceKey, DevicePublicKey, MAX_CREDENTIAL_VALIDITY, PortableIdentity, PortableIdentityState,
     PortableUserId, RevokedKey, StateError, UserDeviceCredential, is_revoked, load,
     load_credentials, load_issued, load_revoked, load_state, merge, public_key, revocation_lapsed,
     save, save_issued, save_revoked, save_state, unix_now,
@@ -500,7 +500,7 @@ impl super::Portable {
     /// A new state for `id` signed by `signer` (P7-08), one revision past
     /// the newest here, with every live revocation and root change kept
     /// and `change` applied. Kept here as the newest; carry it to servers.
-    async fn new_state(
+    pub(super) async fn new_state(
         &self,
         id: PortableUserId,
         signer: RootSigner<'_>,
@@ -790,15 +790,42 @@ impl super::Portable {
     /// root terminal sent it (a pairing, P7-03 or P7-08). The state is
     /// checked and kept first, so a credential a root it adds signed (a
     /// phrase identity's new key) checks out; should the credential then
-    /// be refused, a state this device did not have is dropped again.
+    /// be refused, the state this device had before is put back. Its
+    /// revocations join the ones here only once the credential is in.
+    ///
+    /// A genesis the credential carries must hold and be `id`'s, else
+    /// [`PairingError::CredentialRefused`]: its roots decide which states
+    /// are believed, so an unchecked one would let anyone's phone keep a
+    /// state of its own making for a guest already here.
+    ///
+    /// [`PairingError::CredentialRefused`]: crate::pairing::PairingError::CredentialRefused
     pub(crate) async fn install_with_state(
         &self,
         credential: UserDeviceCredential,
         state: Option<PortableIdentityState>,
     ) -> Result<(), SdkError> {
+        self.install_with_state_for(credential, state, DeviceKey::Kept)
+            .await
+    }
+
+    /// [`Self::install_with_state`] for the device key `key` names: the
+    /// pending one, for a pairing through a server, is adopted only if
+    /// the credential is installed.
+    pub(crate) async fn install_with_state_for(
+        &self,
+        credential: UserDeviceCredential,
+        state: Option<PortableIdentityState>,
+        key: DeviceKey,
+    ) -> Result<(), SdkError> {
         let id = credential.user;
+        if let Some(genesis) = credential.genesis.as_deref()
+            && (genesis.verify().is_err() || genesis.user() != id)
+        {
+            return Err(crate::pairing::PairingError::CredentialRefused.into());
+        }
         let storage = self.storage.as_ref();
         let had = load_state(storage, id).await?;
+        let mut stored = None;
         if let Some(state) = &state {
             state.verify()?;
             if state.user != id {
@@ -816,18 +843,36 @@ impl super::Portable {
                 return Err(SdkError::DeviceKeyRevoked);
             }
             if had.as_ref().is_none_or(|h| h.revision < state.revision) {
-                let union = load_revoked(storage, id).await?;
-                self.keep_state(state, &union).await?;
+                // The state alone for now: the credential's check reads
+                // it, and the revocations wait for the credential.
+                let _saving = self.saving.lock().await;
+                save_state(storage, state).await?;
+                stored = Some(state);
             }
         }
-        if let Err(e) = self.install_credential(credential).await {
-            if had.is_none() && state.is_some() {
+        if let Err(e) = self
+            .install_credential_for(credential, unix_now(), key)
+            .await
+        {
+            if stored.is_some() {
                 let _saving = self.saving.lock().await;
-                storage
-                    .set_data(&keys::portable_state(&id.to_string()), None)
-                    .await?;
+                match &had {
+                    Some(had) => save_state(storage, had).await?,
+                    None => {
+                        storage
+                            .set_data(&keys::portable_state(&id.to_string()), None)
+                            .await?
+                    }
+                }
             }
             return Err(e);
+        }
+        if let Some(state) = stored {
+            let _saving = self.saving.lock().await;
+            let mut union = load_revoked(storage, id).await?;
+            if merge(&mut union, &state.revoked) {
+                save_revoked(storage, id, &union).await?;
+            }
         }
         Ok(())
     }
@@ -846,33 +891,6 @@ impl super::Portable {
             .set_secret(keys::PORTABLE_PENDING_DEVICE, Some(secret.to_vec()))
             .await?;
         Ok(public_key(&ed25519_dalek::SigningKey::from_bytes(&secret)))
-    }
-
-    /// Take the pending device key as this device's key for `id`, if it
-    /// is `key`: the pairing that offered it was answered for `id`.
-    pub(crate) async fn adopt_pending_device_key(
-        &self,
-        id: PortableUserId,
-        key: &DevicePublicKey,
-    ) -> Result<(), SdkError> {
-        let _saving = self.saving.lock().await;
-        let storage = self.storage.as_ref();
-        let Some(pending) = load_pending(storage).await? else {
-            return Err(SdkError::NotThisDevice);
-        };
-        if public_key(&pending) != *key {
-            return Err(SdkError::NotThisDevice);
-        }
-        storage
-            .set_secret(
-                &keys::portable_device(&id.to_string()),
-                Some(pending.to_bytes().to_vec()),
-            )
-            .await?;
-        storage
-            .set_secret(keys::PORTABLE_PENDING_DEVICE, None)
-            .await?;
-        Ok(())
     }
 
     /// Keep `genesis` (and `state`) for its identity, listed as `name`.
@@ -945,7 +963,7 @@ pub(super) async fn load_genesis(
     Ok(Some(genesis))
 }
 
-async fn load_pending(
+pub(super) async fn load_pending(
     storage: &dyn Storage,
 ) -> Result<Option<ed25519_dalek::SigningKey>, StorageError> {
     let Some(bytes) = storage.secret(keys::PORTABLE_PENDING_DEVICE).await? else {
@@ -1088,6 +1106,168 @@ mod tests {
         assert_eq!(credential.signer(), key.credentials()[0].root());
         // A phrase identity carries no genesis: its id is its root.
         assert_eq!(credential.genesis, None);
+    }
+
+    fn some_device(n: u8) -> DevicePublicKey {
+        DevicePublicKey::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[n; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap()
+    }
+
+    /// A stranger's phone pairing as a guest already here, with a genesis
+    /// of its own (or a bogus one) carrying a state its own phrase signs.
+    #[tokio::test]
+    async fn a_second_pairing_with_a_foreign_genesis_changes_nothing_kept() {
+        let phone = portable();
+        let (id, _phrase) = phone.create("Sam").await.unwrap();
+        let storage = Arc::new(MemoryStorage::default());
+        let tv = Portable::new(storage.clone());
+        let tv_key = tv.device_key(id).await.unwrap();
+        // The genuine pairing, with a state that revokes an old device.
+        let genuine_state = phone.revoke(id, some_device(3)).await.unwrap();
+        let genuine = phone
+            .issue_credential(id, tv_key, Some("TV"))
+            .await
+            .unwrap();
+        tv.install_with_state(genuine.clone(), Some(genuine_state.clone()))
+            .await
+            .unwrap();
+        let revoked_before = load_revoked(storage.as_ref(), id).await.unwrap();
+
+        let (stranger, _) = super::super::PortableRoot::generate();
+        let stranger_root = RootKey::phrase_of(&stranger.id());
+        let handle = [7; HANDLE_LEN];
+        let message =
+            IdentityGenesis::message(&handle, std::slice::from_ref(&stranger_root)).unwrap();
+        // A genesis that holds, but is the stranger's identity, not `id`;
+        // and one whose signature does not hold at all.
+        let foreign = IdentityGenesis {
+            handle,
+            roots: vec![stranger_root.clone()],
+            signatures: vec![stranger.sign(&message).into()],
+        };
+        let bogus = IdentityGenesis {
+            signatures: vec![stranger.sign(b"something else").into()],
+            ..foreign.clone()
+        };
+        let now = unix_now();
+        for genesis in [foreign, bogus] {
+            let forged_state = PortableIdentityState::signed_by(
+                id,
+                stranger_root.clone(),
+                999,
+                StateChanges {
+                    revoked: vec![RevokedKey {
+                        key: some_device(4),
+                        revoked_at: now,
+                    }],
+                    ..StateChanges::default()
+                },
+                now,
+                |m| stranger.sign(m).into(),
+            )
+            .unwrap();
+            let mut forged = UserDeviceCredential::signed_by(
+                id,
+                stranger_root.clone(),
+                tv_key,
+                1,
+                now,
+                now + 3600,
+                |m| stranger.sign(m).into(),
+            );
+            forged.genesis = Some(Box::new(genesis));
+
+            let refused = tv.install_with_state(forged, Some(forged_state)).await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(SdkError::Pairing(
+                        crate::pairing::PairingError::CredentialRefused
+                    ))
+                ),
+                "{refused:?}"
+            );
+            assert_eq!(
+                tv.identity_state(id).await.unwrap(),
+                Some(genuine_state.clone())
+            );
+            assert_eq!(
+                load_revoked(storage.as_ref(), id).await.unwrap(),
+                revoked_before
+            );
+            assert_eq!(load_genesis(storage.as_ref(), id).await.unwrap(), None);
+            assert_eq!(tv.credential(id).await.unwrap(), Some(genuine.clone()));
+        }
+        // The guest still signs in with the credential it was given.
+        let (sent, signature) = tv.prove(id, &[0x5a; 32], &[0xa5; 32]).await.unwrap();
+        assert_eq!(sent, genuine);
+        assert_eq!(
+            spoolframe_protocol::portable::verify_device_proof(
+                &sent,
+                &[0x5a; 32],
+                &[0xa5; 32],
+                &signature
+            ),
+            Ok(())
+        );
+    }
+
+    /// A newer state from the root, but a credential the device refuses:
+    /// the state it had is put back, and no revocation joins.
+    #[tokio::test]
+    async fn a_refused_credential_puts_back_the_state_the_guest_had() {
+        let phone = portable();
+        let (id, _phrase) = phone.create("Sam").await.unwrap();
+        let storage = Arc::new(MemoryStorage::default());
+        let tv = Portable::new(storage.clone());
+        let tv_key = tv.device_key(id).await.unwrap();
+        let first = phone.revoke(id, some_device(3)).await.unwrap();
+        let genuine = phone.issue_credential(id, tv_key, None).await.unwrap();
+        tv.install_with_state(genuine, Some(first.clone()))
+            .await
+            .unwrap();
+        let revoked_before = load_revoked(storage.as_ref(), id).await.unwrap();
+
+        let newer = phone.revoke(id, some_device(4)).await.unwrap();
+        let long_ago = unix_now() - MAX_CREDENTIAL_VALIDITY - 60;
+        let expired = phone
+            .issue_credential_at(id, tv_key, None, long_ago)
+            .await
+            .unwrap();
+        assert!(tv.install_with_state(expired, Some(newer)).await.is_err());
+        assert_eq!(tv.identity_state(id).await.unwrap(), Some(first));
+        assert_eq!(
+            load_revoked(storage.as_ref(), id).await.unwrap(),
+            revoked_before
+        );
+    }
+
+    #[tokio::test]
+    async fn a_phrase_revocation_keeps_the_keys_the_identity_added() {
+        let phone = portable();
+        let (id, _phrase) = phone.create("Sam").await.unwrap();
+        let key = SoftSecurityKey::new();
+        phone
+            .add_root(id, RootSigner::Phrase, &key, "Sam")
+            .await
+            .unwrap();
+        let tv = DevicePublicKey::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap();
+        let state = phone.revoke(id, tv).await.unwrap();
+        assert_eq!(state.revision, 2);
+        assert!(state.revokes(&tv));
+        assert_eq!(state.roots_added.len(), 1, "{state:?}");
+        assert_eq!(state.roots_added[0].root, key.credentials()[0].root());
+        // The key is still one of the identity's roots here.
+        phone.pair_self(id, RootSigner::Key(&key)).await.unwrap();
     }
 
     #[tokio::test]

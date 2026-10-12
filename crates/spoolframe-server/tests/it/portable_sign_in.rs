@@ -9,7 +9,9 @@ use spoolframe_protocol::portable::{
     DevicePublicKey, MAX_CREDENTIAL_VALIDITY, PortableIdentityState, PortableUserId, RevokedKey,
     UserDeviceCredential, device_proof_message,
 };
-use spoolframe_protocol::{Error, PortableSignIn, Reply, Request, Response, SessionId};
+use spoolframe_protocol::{
+    Error, PortableSignIn, Reply, Request, Response, SessionId, WhoAmIReply,
+};
 use spoolframe_types::{Item, Role};
 
 use crate::support::{TestClient, TestServer, movie};
@@ -21,7 +23,7 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
-fn identity(seed: u8) -> PortableUserId {
+pub(crate) fn identity(seed: u8) -> PortableUserId {
     PortableUserId::from_bytes(key(seed).verifying_key().to_bytes()).unwrap()
 }
 
@@ -94,11 +96,11 @@ async fn sign_in_as(
 }
 
 /// Sign identity `user` in on `tv` from device `seed`.
-async fn sign_in(tv: &TestClient, user: u8, seed: u8) -> Response {
+pub(crate) async fn sign_in(tv: &TestClient, user: u8, seed: u8) -> Response {
     sign_in_as(tv, credential(user, seed), seed, vec![]).await
 }
 
-fn session(response: Response) -> SessionId {
+pub(crate) fn session(response: Response) -> SessionId {
     match response {
         Response::Ok(Reply::LoggedIn {
             session,
@@ -132,7 +134,7 @@ async fn a_granted_identity_signs_in_as_itself_and_is_no_user() {
     let users = server.store.list_users().await.unwrap();
     let session = session(sign_in(&tv, 7, 9).await);
     match tv.call(Some(&session), Request::WhoAmI).await {
-        Response::Ok(Reply::WhoAmI(me)) => {
+        Response::Ok(Reply::WhoAmI(WhoAmIReply { user: me, .. })) => {
             assert_eq!(me.user_id, format!("portable:{}", identity(7)));
             assert_eq!(me.username, identity(7).to_string());
             assert_eq!(me.display_name, "Sam");
@@ -255,7 +257,7 @@ async fn a_tied_identity_signs_in_as_the_account_even_with_a_grant() {
         .unwrap();
     let session = session(sign_in(&tv, 7, 9).await);
     match tv.call(Some(&session), Request::WhoAmI).await {
-        Response::Ok(Reply::WhoAmI(me)) => {
+        Response::Ok(Reply::WhoAmI(WhoAmIReply { user: me, .. })) => {
             assert_eq!(me.username, "alice");
             assert_eq!(me.user_id, format!("local:{alice}"));
             assert_eq!(me.portable, Some(identity(7)));

@@ -1484,6 +1484,45 @@ fingerprint, tiedAt }` or `null`) and severs it with `admin.userUntie`
 both answer `NO_SUCH_LINK`. Neither ties: the web UI never holds the
 root.
 
+### Leaving a server
+
+`LeaveServer` (PX-47) takes the session's user off this server: `Done`,
+and every session of theirs here ends, the one that asked too. It is a
+mutation, never sent again on a new connection, and needs a session
+that signed in within the last 10 minutes (`RecentSignInRequired`):
+
+- a local user confirms with `ConfirmPassword` or a passkey
+  (`BeginConfirmPasskey`, `FinishConfirmPasskey`), then asks again;
+- a portable user (P7-06) has no password: it signs in again with its
+  device credential (`BeginPortableSignIn`, `FinishPortableSignIn`),
+  and leaves from the new session.
+
+What leaving does:
+
+- **A portable user**: its grant is taken away (kept as a tombstone, as
+  an admin's revoke keeps it, so an invite made before does not bring
+  it back), its sessions here end, and its watch state, hidden rows and
+  track preferences here are deleted. Coming back takes a new invite.
+- **A local account**: set aside, not deleted. It is disabled and marked
+  as left, its sessions end and no device stays trusted for it; its
+  data, passkeys and any tie to a portable identity stay. Signing in is
+  refused as for a disabled account. An admin restores it as they
+  enable one (`admin.userEnable`); the admin API shows `leftAt` on
+  `UserInfo`.
+
+The last enabled admin, or the last enabled admin with a password,
+cannot leave: `LastAdmin`, and nothing changes. A server before PX-47
+answers `Unsupported`.
+
+`WhoAmI` says ahead of time whether leaving would be refused, so an app
+can grey out "Leave this server": `can_leave` is `false` exactly when
+`LeaveServer` would answer `LastAdmin`, by the same check, and `true`
+for everyone else (a portable user always). It is as of that answer;
+an admin made or demoted later changes it, and `LeaveServer` still
+refuses. It sits beside the user's fields, so an older client reads the
+reply as before. A server before it leaves it out: read that as `true`,
+and let the server's `LastAdmin` refuse.
+
 ### Signing in with a device credential
 
 A device with a credential (from pairing, or the phone's own) signs in

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use spoolframe_protocol::{
     ArtworkResponse, ArtworkSize, Error, LoginPassword, MediaReadResponse, PinProof, PinState,
-    Reply, Request, Response, Selection, SessionId,
+    Reply, Request, Response, Selection, SessionId, WhoAmIReply,
 };
 use spoolframe_server::auth::SessionToken;
 use spoolframe_server::store::passkeys::FirstPasskey;
@@ -76,7 +76,7 @@ async fn locked(test: &str, options: ServerOptions) -> (TestServer, TestClient, 
 
 async fn who(client: &TestClient, session: &SessionId) -> bool {
     match ok(client, session, Request::WhoAmI).await {
-        Reply::WhoAmI(user) => user.locked,
+        Reply::WhoAmI(WhoAmIReply { user, .. }) => user.locked,
         other => panic!("not WhoAmI: {other:?}"),
     }
 }
@@ -381,7 +381,7 @@ async fn devices_are_listed_and_set_from_elsewhere() {
 
 async fn pin_state(client: &TestClient, session: &SessionId) -> Option<PinState> {
     match ok(client, session, Request::WhoAmI).await {
-        Reply::WhoAmI(user) => user.pin,
+        Reply::WhoAmI(WhoAmIReply { user, .. }) => user.pin,
         other => panic!("not WhoAmI: {other:?}"),
     }
 }

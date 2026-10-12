@@ -7,10 +7,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use parking_lot::Mutex;
 use spoolframe_client_sdk::types::{ClientCapabilities, Platform};
 use spoolframe_client_sdk::{
-    Client, ClientOptions, ConnectionState, Device, MemoryStorage, SdkError, StateWatch,
+    Client, ClientOptions, ConnectionState, Device, MemoryStorage, SdkError, StateWatch, Storage,
+    StorageError,
 };
+use tokio::sync::Notify;
 
 use crate::stub::Stub;
 
@@ -22,6 +26,10 @@ const HANG: Duration = Duration::from_secs(20);
 const SETTLE: Duration = Duration::from_secs(2);
 
 async fn client() -> Client {
+    client_on(Arc::new(MemoryStorage::default())).await
+}
+
+async fn client_on(storage: Arc<dyn Storage>) -> Client {
     let device = Device {
         name: "phone".into(),
         client_name: "sdk-reconnect-test".into(),
@@ -33,7 +41,7 @@ async fn client() -> Client {
         lan_discovery: false,
         ..ClientOptions::default()
     };
-    Client::open_with_options(Arc::new(MemoryStorage::default()), device, options)
+    Client::open_with_options(storage, device, options)
         .await
         .unwrap()
 }
@@ -140,6 +148,98 @@ async fn a_connect_after_the_cause_is_fixed_clears_the_reason() {
     client.connect(&stub.id()).await.unwrap();
     assert_eq!(state.current(), ConnectionState::Connected);
     assert_eq!(state.stopped(), None);
+    client.close().await;
+    stub.stop().await;
+}
+
+/// Storage that can hold one read of the saved servers, as a slow
+/// keychain would: the `n`th read from when it is armed waits for
+/// `release`.
+#[derive(Default)]
+struct Gated {
+    inner: MemoryStorage,
+    /// Reads of the servers to let through before holding one.
+    armed: Mutex<Option<usize>>,
+    entered: Notify,
+    release: Notify,
+}
+
+impl Gated {
+    fn hold_read_after(&self, passing: usize) {
+        *self.armed.lock() = Some(passing);
+    }
+}
+
+#[async_trait]
+impl Storage for Gated {
+    async fn secret(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.secret(key).await
+    }
+    async fn set_secret(&self, key: &str, value: Option<Vec<u8>>) -> Result<(), StorageError> {
+        self.inner.set_secret(key, value).await
+    }
+    async fn data(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        if key == "servers" {
+            let hold = {
+                let mut armed = self.armed.lock();
+                match *armed {
+                    Some(0) => {
+                        *armed = None;
+                        true
+                    }
+                    Some(n) => {
+                        *armed = Some(n - 1);
+                        false
+                    }
+                    None => false,
+                }
+            };
+            if hold {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+        }
+        self.inner.data(key).await
+    }
+    async fn set_data(&self, key: &str, value: Option<Vec<u8>>) -> Result<(), StorageError> {
+        self.inner.set_data(key, value).await
+    }
+}
+
+/// C2: the server is forgotten while the first dial to it is on the way.
+/// The dial's connection is not kept, and nothing dials it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_forgotten_during_its_first_dial_is_not_kept_connected() {
+    let stub = Stub::start().await;
+    let storage = Arc::new(Gated::default());
+    let client = client_on(storage.clone()).await;
+    client.add_address(&stub.id(), stub.addrs()).unwrap();
+    // `connect` reads the servers once, then the dial reads them again
+    // before it dials: that read is held.
+    storage.hold_read_after(1);
+    let dialling = tokio::spawn({
+        let (client, id) = (client.clone(), stub.id());
+        async move { client.connect(&id).await }
+    });
+    tokio::time::timeout(HANG, storage.entered.notified())
+        .await
+        .expect("the dial never read the servers");
+    client.forget(&stub.id()).await.unwrap();
+    storage.release.notify_one();
+
+    let dialled = tokio::time::timeout(HANG, dialling)
+        .await
+        .expect("the dial hung")
+        .unwrap();
+    assert!(
+        matches!(dialled, Err(SdkError::UnknownServer(_))),
+        "{dialled:?}"
+    );
+    tokio::time::sleep(SETTLE).await;
+    // The one connection the dial made is closed, and no supervisor
+    // dialled another.
+    assert_eq!(stub.connections(), 1);
+    assert_eq!(stub.open_connections(), 0);
     client.close().await;
     stub.stop().await;
 }
