@@ -370,7 +370,14 @@ impl RuntimeSettings {
             .all_servers()
             .into_iter()
             .find(|s| same_url(&s.url, url.trim()))?;
-        layers.server_token(&server, self.secrets()).ok().flatten()
+        match layers.server_token(&server, self.secrets()) {
+            Ok(token) => token,
+            Err(e) => {
+                // Read as no token, but not quietly.
+                tracing::warn!(server = server.id, error = %e, "cannot read a Plex server's token");
+                None
+            }
+        }
     }
 
     /// Whether a Plex server is configured: until one is, the first
@@ -664,11 +671,21 @@ impl RuntimeSettings {
             token_file: None,
             path_mapping: Vec::new(),
         });
-        self.change_keys(
+        let changed = self.change_keys(
             "plex.servers",
             by,
             vec![("plex.servers", Some(servers_value(&more)))],
-        )?;
+        );
+        if let Err(e) = changed {
+            // Its token is not left on disk under an id no server has
+            // (review 2026-10-11 L39).
+            if token.is_some()
+                && let Err(gone) = self.secrets().remove(&plex_token_secret(&id))
+            {
+                tracing::warn!(server = id, error = %gone, "cannot remove a refused server's token");
+            }
+            return Err(e.into());
+        }
         tracing::info!(by, server = id, url, name, "Plex server added");
         Ok(id)
     }
@@ -853,10 +870,18 @@ impl RuntimeSettings {
             tasks.spawn(async move {
                 let status = plex_status(&catalog).await;
                 let paths = match status.reachable {
-                    true => catalog
-                        .check_paths(None, Scope::Sample(PATH_SAMPLE))
-                        .await
-                        .unwrap_or_default(),
+                    true => match catalog.check_paths(None, Scope::Sample(PATH_SAMPLE)).await {
+                        Ok(paths) => paths,
+                        // Shown as no path information; the log says why.
+                        Err(e) => {
+                            tracing::warn!(
+                                url = catalog.base_url(),
+                                error = %e,
+                                "cannot check a Plex server's media paths"
+                            );
+                            Vec::new()
+                        }
+                    },
                     false => Vec::new(),
                 };
                 (i, status, paths)
@@ -931,7 +956,9 @@ impl RuntimeSettings {
                         return LibraryEntry {
                             id: library_id(&l.plex),
                             name: l.name.clone(),
-                            kind: l.kind().unwrap_or(spoolframe_types::LibraryKind::Movies),
+                            kind: l
+                                .kind()
+                                .expect("a library's kind is checked when the config loads"),
                             server: l.plex.server.clone(),
                             server_name,
                             section: l.plex.section.clone(),

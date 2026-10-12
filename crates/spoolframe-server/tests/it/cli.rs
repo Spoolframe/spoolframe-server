@@ -176,9 +176,12 @@ async fn an_unreachable_plex_is_reported_and_the_server_keeps_running() {
     let url = closed_port_url();
     let (_tmp, config) = config_with_state("unreachable-plex", &url).await;
     let (running, log) = Running::start(&config);
+    assert!(log.contains("admin API listening"), "{log}");
+    // Checked in the background once the server is up (review
+    // 2026-10-11 L41).
+    let log = running.log_with("Plex catalog unavailable");
     assert!(log.contains("Plex catalog unavailable"), "{log}");
     assert!(log.contains(&url), "{log}");
-    assert!(log.contains("admin API listening"), "{log}");
     // SIGTERM is a clean stop, not a failure.
     running.stop_cleanly();
 }

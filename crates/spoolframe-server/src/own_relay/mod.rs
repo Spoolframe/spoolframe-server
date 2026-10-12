@@ -91,8 +91,16 @@ pub async fn spawn(
     let server = Server::spawn(server)
         .await
         .map_err(|e| RelayError::Spawn(e.to_string()))?;
-    if let Some(service) = server.relay_service() {
-        tokio::spawn(recheck(Arc::downgrade(&gate), service.clients().clone()));
+    // Always there, for a server spawned with a relay; if it were not,
+    // carried endpoints would never be cut, so it is said, not skipped
+    // (review 2026-10-11 L51).
+    match server.relay_service() {
+        Some(service) => {
+            tokio::spawn(recheck(Arc::downgrade(&gate), service.clients().clone()));
+        }
+        None => tracing::error!(
+            "the relay has no relay service: endpoints it carries are not cut when revoked"
+        ),
     }
     Ok(server)
 }

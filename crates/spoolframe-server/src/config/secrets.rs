@@ -28,6 +28,7 @@ impl Secrets {
     /// Secret `name`, without surrounding whitespace; `None` when it is not
     /// set.
     pub fn get(&self, name: &str) -> std::io::Result<Option<String>> {
+        warn_if_open(&self.path(name));
         match std::fs::read_to_string(self.path(name)) {
             Ok(text) => Ok(Some(text.trim().to_owned()).filter(|t| !t.is_empty())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -47,7 +48,13 @@ impl Secrets {
             .mode(0o700)
             .create(&self.dir)?;
         let path = self.path(name);
-        let partial = self.dir.join(format!(".{name}.new"));
+        // Its own partial file: two writes of one secret at once must not
+        // rename each other's (review 2026-10-11 L40).
+        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let partial = self
+            .dir
+            .join(format!(".{name}.{}.{n}.new", std::process::id()));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -85,6 +92,34 @@ impl Secrets {
     }
 }
 
+/// Whether users other than the server's may read or write `path`: a
+/// token file made by hand with the default 0644. `false` for one that is
+/// not there.
+pub(crate) fn open_to_others(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
+}
+
+/// Warn, once per file, that a token file is open to other users: it is
+/// used all the same (review 2026-10-11 L40).
+pub(crate) fn warn_if_open(path: &Path) {
+    static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    if !open_to_others(path) {
+        return;
+    }
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warned.iter().any(|p| p == path) {
+        return;
+    }
+    warned.push(path.to_owned());
+    tracing::warn!(
+        path = %path.display(),
+        "a token file other users can read: chmod 600 it"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -106,5 +141,36 @@ mod tests {
         assert_eq!(mode(&dir.as_ref().join("secrets")), 0o700);
         assert!(secrets.remove("plex-token").unwrap());
         assert!(!secrets.is_set("plex-token"));
+    }
+
+    /// A token file made with the default 0644 is noticed.
+    #[tokio::test]
+    async fn a_file_other_users_can_read_is_noticed() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-secret-mode").await;
+        let path = dir.as_ref().join("token");
+        std::fs::write(&path, "abc").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_to_others(&path));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!open_to_others(&path));
+    }
+
+    /// Writes of one secret at once each finish: none renames another's
+    /// partial file away from under it.
+    #[tokio::test]
+    async fn writes_of_one_secret_at_once_all_finish() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-secret-race").await;
+        let secrets = Secrets::new(dir.as_ref());
+        std::thread::scope(|scope| {
+            for t in 0..8 {
+                let secrets = &secrets;
+                scope.spawn(move || {
+                    for i in 0..50 {
+                        secrets.set("plex-token", &format!("{t}-{i}")).unwrap();
+                    }
+                });
+            }
+        });
+        assert!(secrets.is_set("plex-token"));
     }
 }

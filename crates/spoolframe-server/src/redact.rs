@@ -29,8 +29,8 @@ pub fn hide(text: &str, secrets: &[&str]) -> String {
 }
 
 /// The value after each `key` (in any case) hidden, up to the next `&`,
-/// quote, `;` or whitespace; with `spaced`, spaces right after the key
-/// are kept and the value after them is hidden.
+/// quote, `;` or whitespace; with `spaced`, spaces and tabs right after
+/// the key are kept and the value after them is hidden.
 fn hide_after(text: &str, key: &str, spaced: bool) -> String {
     let lower = text.to_ascii_lowercase();
     let mut out = String::with_capacity(text.len());
@@ -38,7 +38,10 @@ fn hide_after(text: &str, key: &str, spaced: bool) -> String {
     while let Some(found) = lower[at..].find(key) {
         let mut start = at + found + key.len();
         if spaced {
-            start += text[start..].len() - text[start..].trim_start_matches(' ').len();
+            // Tabs too: `X-Plex-Token:\t<token>` left the token in clear
+            // (review 2026-10-11 L50). Not newlines: a value never follows
+            // its key on the next line.
+            start += text[start..].len() - text[start..].trim_start_matches([' ', '\t']).len();
         }
         let end = text[start..]
             .find(|c: char| c == '&' || c == '\'' || c == '"' || c == ';' || c.is_whitespace())
@@ -91,6 +94,13 @@ mod tests {
             "ffmpeg -i '/var/cache/spoolframe-jobs/<hidden>/input'"
         );
         assert!(!shown.contains(handle));
+    }
+
+    #[test]
+    fn a_token_after_a_tab_is_hidden() {
+        let shown = hide_after("X-Plex-Token:\tsecret123", "token:", true);
+        assert!(!shown.contains("secret123"), "{shown}");
+        assert_eq!(shown, "X-Plex-Token:\t<hidden>");
     }
 
     #[test]

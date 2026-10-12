@@ -573,9 +573,22 @@ impl RuntimeSettings {
     pub fn plex_token(&self) -> Option<String> {
         let layers = self.layers();
         let config = layers.config().ok()?;
-        match &config.plex {
-            Some(plex) => layers.plex_token(plex, &self.secrets).ok().flatten(),
-            None => self.secrets.get(PLEX_TOKEN_SECRET).ok().flatten(),
+        let token = match &config.plex {
+            Some(plex) => layers.plex_token(plex, &self.secrets),
+            None => self.secrets.get(PLEX_TOKEN_SECRET).map_err(|source| {
+                crate::config::ConfigError::Token {
+                    path: self.secrets.path(PLEX_TOKEN_SECRET),
+                    source,
+                }
+            }),
+        };
+        match token {
+            Ok(token) => token,
+            Err(e) => {
+                // Read as no token, but not quietly.
+                tracing::warn!(error = %e, "cannot read the Plex token");
+                None
+            }
         }
     }
 

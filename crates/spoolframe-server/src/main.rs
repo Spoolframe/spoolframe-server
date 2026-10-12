@@ -781,7 +781,13 @@ async fn run(
     let catalog: Arc<dyn Catalog> = live.clone();
     let catalog_changes = live.changes();
     match &plex {
-        Some(plex) => check_catalog(plex).await,
+        // In the background: a PMS that accepts and stalls must not hold
+        // the admin API and the endpoint back; it only logs (review
+        // 2026-10-11 L41).
+        Some(plex) => {
+            let plex = plex.clone();
+            tokio::spawn(async move { check_catalog(&plex).await });
+        }
         None => tracing::warn!(
             "not set up: no Plex server is configured, so clients are told the server is not \
              set up yet; set it up in the web UI"
@@ -1123,7 +1129,10 @@ async fn run(
     status.set_told(told.clone());
     let told: Vec<_> = tokio::task::spawn_blocking(move || told.addrs())
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "listing the told addresses failed");
+            Vec::new()
+        })
         .iter()
         .map(ToString::to_string)
         .collect();

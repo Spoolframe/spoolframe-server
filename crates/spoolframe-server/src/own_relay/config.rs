@@ -109,7 +109,10 @@ impl Default for Access {
 /// How the relay is served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Serve {
-    /// TLS with the operator's certificate chain and key, PEM files.
+    /// TLS with the operator's certificate chain and key, PEM files. Read
+    /// once, at start: a certificate renewed on disk (certbot's every 60
+    /// to 90 days) is served only after the relay restarts, so a renewal
+    /// hook restarts it (review 2026-10-11 L48). `Acme` renews on its own.
     Files {
         https: SocketAddr,
         cert_file: PathBuf,

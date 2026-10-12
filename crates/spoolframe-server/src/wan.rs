@@ -294,7 +294,10 @@ impl Lookup {
             .user_agent(concat!("spoolframe-server/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default();
+            // Not `unwrap_or_default`: the default client fails the same
+            // way, and would follow redirects if it did not (review
+            // 2026-10-11 L46).
+            .expect("an HTTP client with the server's TLS installed at start");
         Self {
             client,
             wtfismyip: WTFISMYIP.parse().expect("a fixed URL"),
@@ -473,6 +476,16 @@ impl PortMapper for RouterMapper {
                             return;
                         }
                         let now = *external.borrow_and_update();
+                        if now.is_none() {
+                            // A grant lapsed: the retries start over, from
+                            // a full wait, rather than firing a sleep that
+                            // ran out long ago or giving up at once on
+                            // retries spent before the grant (review
+                            // 2026-10-11 L49).
+                            retries = MAP_RETRIES.iter();
+                            gave_up = false;
+                            wait.as_mut().reset(tokio::time::Instant::now() + MAP_WAIT);
+                        }
                         tx.send_replace(match now {
                             Some(addr) => Mapping::Granted(addr),
                             // Lost; the mapper asks again on its own.

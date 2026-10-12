@@ -125,7 +125,7 @@ in {
       certFile = lib.mkOption {
         type = lib.types.nullOr lib.types.path;
         default = null;
-        description = "The certificate chain, PEM (`files`); passed as a credential.";
+        description = "The certificate chain, PEM (`files`); passed as a credential. Read once, at start: restart the relay when it is renewed (a certbot or ACME client deploy hook).";
       };
       keyFile = lib.mkOption {
         type = lib.types.nullOr lib.types.path;

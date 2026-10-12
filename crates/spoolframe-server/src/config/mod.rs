@@ -2043,6 +2043,7 @@ pub(crate) fn path_map(
 
 /// A token file's token, without surrounding whitespace.
 fn read_token(path: &Path) -> Result<String, ConfigError> {
+    secrets::warn_if_open(path);
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Token {
         path: path.to_owned(),
         source,

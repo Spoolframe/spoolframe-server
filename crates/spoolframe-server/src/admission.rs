@@ -45,8 +45,12 @@ pub const KNOWN_WINDOW: u32 = 16 << 20;
 
 /// How long a connection may send nothing at all before it is dropped.
 /// Peers send a keep-alive every 5 s (iroh's default), so only a peer that
-/// is gone, or does not keep alive, reaches it.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// is gone, or does not keep alive, reaches it. 30 s, iroh's own limit
+/// for a path through a relay (`RELAY_PATH_MAX_IDLE_TIMEOUT`): the
+/// laggiest link must not get the shortest leash, and a phone app
+/// suspended for a few seconds more than 15 keeps its connection (review
+/// 2026-10-11 L43). The lower of this and the device's limit applies.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a signed-out device's connection may finish the requests it
 /// is answering (its `Logout`'s reply among them) before it is closed.

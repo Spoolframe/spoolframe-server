@@ -171,8 +171,16 @@ pub struct Uplink {
     subnets: Mutex<Option<(Instant, Vec<Network>)>>,
     streams: Mutex<HashMap<String, Stream>>,
     /// Woken at each start and end, for the shares to be worked out again
-    /// once things settle.
-    changed: tokio::sync::Notify,
+    /// once things settle. Shared, so [`tell_shares`] waits on it without
+    /// holding the uplink.
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for Uplink {
+    /// Wake [`tell_shares`], which then finds the uplink gone and ends.
+    fn drop(&mut self) {
+        self.changed.notify_waiters();
+    }
 }
 
 impl Default for Uplink {
@@ -187,7 +195,7 @@ impl Uplink {
             settings: RwLock::new(settings),
             subnets: Mutex::new(None),
             streams: Mutex::new(HashMap::new()),
-            changed: tokio::sync::Notify::new(),
+            changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -395,10 +403,23 @@ pub(crate) async fn tell_shares(
     streams: crate::events::EventStreams,
 ) {
     loop {
+        // The wait holds the notify, not the uplink: holding it across an
+        // indefinite wait kept it alive, and this task with it, after its
+        // server was gone (review 2026-10-11 L45).
+        let Some(changed) = uplink.upgrade().map(|u| u.changed.clone()) else {
+            return;
+        };
+        changed.notified().await;
+        loop {
+            tokio::select! {
+                () = changed.notified() => {}
+                () = tokio::time::sleep(SETTLE) => break,
+            }
+        }
         let Some(this) = uplink.upgrade() else {
             return;
         };
-        let told = this.settled(SETTLE).await;
+        let told = this.rebalance();
         drop(this);
         for t in told {
             tracing::info!(
@@ -520,6 +541,25 @@ pub fn summarize(rates: &[f64]) -> (f64, u64) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The task that tells shares ends once its uplink is dropped, and
+    /// does not keep it alive (review 2026-10-11 L45).
+    #[tokio::test]
+    async fn telling_shares_ends_with_the_uplink() {
+        let uplink = Arc::new(Uplink::default());
+        let task = tokio::spawn(tell_shares(
+            Arc::downgrade(&uplink),
+            crate::events::EventStreams::default(),
+        ));
+        tokio::task::yield_now().await;
+        let weak = Arc::downgrade(&uplink);
+        drop(uplink);
+        assert!(weak.upgrade().is_none(), "the task held the uplink");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the task ended")
+            .unwrap();
+    }
     use super::*;
 
     const MBIT: u64 = 1_000_000;

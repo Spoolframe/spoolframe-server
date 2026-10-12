@@ -30,6 +30,12 @@ use crate::wan::not_public;
 /// How long a relay's name is given to resolve.
 const RESOLVE_WAIT: Duration = Duration::from_secs(5);
 
+/// As [`RESOLVE_WAIT`], before the endpoint binds: the endpoint waits on
+/// it, and [`watch`] places the relays again once it is up, so a boot
+/// without DNS is held back a second, not five a relay (review
+/// 2026-10-11 L47).
+const INITIAL_RESOLVE_WAIT: Duration = Duration::from_secs(1);
+
 /// How often the relays' names are looked up again with nothing else
 /// changed: a name moved to another address.
 const RECHECK: Duration = Duration::from_secs(10 * 60);
@@ -101,6 +107,10 @@ fn custom(relays: &[Relay]) -> Vec<RelayUrl> {
 /// Where `url`'s host points: an IP written in it, or its name's
 /// addresses. Empty when it does not resolve in [`RESOLVE_WAIT`].
 async fn resolve(url: &RelayUrl) -> Vec<IpAddr> {
+    resolve_within(url, RESOLVE_WAIT).await
+}
+
+async fn resolve_within(url: &RelayUrl, wait: Duration) -> Vec<IpAddr> {
     let Some(host) = url.host_str() else {
         return Vec::new();
     };
@@ -109,7 +119,7 @@ async fn resolve(url: &RelayUrl) -> Vec<IpAddr> {
         return vec![ip];
     }
     let port = url.port_or_known_default().unwrap_or(443);
-    match tokio::time::timeout(RESOLVE_WAIT, tokio::net::lookup_host((host, port))).await {
+    match tokio::time::timeout(wait, tokio::net::lookup_host((host, port))).await {
         Ok(Ok(addrs)) => addrs.map(|a| a.ip()).collect(),
         Ok(Err(e)) => {
             tracing::debug!(relay = %url, error = %e, "cannot resolve the relay's name");
@@ -158,8 +168,14 @@ pub async fn initial(relays: &[Relay], public: &[IpAddr]) -> (RelayMap, HashMap<
     let with_n0 = relays.contains(&Relay::Default);
     let own = custom(relays);
     let mut sides = HashMap::new();
-    for url in &own {
-        let side = side(&resolve(url).await, &[], public);
+    // All at once, each for a second at most.
+    let resolved = futures_util::future::join_all(
+        own.iter()
+            .map(|url| resolve_within(url, INITIAL_RESOLVE_WAIT)),
+    )
+    .await;
+    for (url, addrs) in own.iter().zip(resolved) {
+        let side = side(&addrs, &[], public);
         log(url, &side);
         sides.insert(url.clone(), side);
     }

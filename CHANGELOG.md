@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Review 2026-10-11, runtime and network Lows:
+  `plex.watch_sync.interval_secs` under 10 is refused with its key, not
+  quietly raised to 10 (L33). A second SIGINT or SIGTERM during shutdown
+  stops the server at once (exit 130), and each shutdown step is bounded
+  (L34); telemetry's flush on the way out takes at most 5 s (L44). A
+  reload that changes `network.max_stranger_connections`,
+  `first_frame_timeout_secs` or `stalled_read_secs` now says they apply
+  after a restart (L37). A token file other users can read is warned of
+  (L40). The start-up check of each Plex server runs in the background,
+  so a stalled PMS no longer holds the web UI back (L41). Connections
+  may now idle 30 s, server and apps alike, so a phone app suspended a
+  little while keeps its connection (L43). A relay serving its own
+  certificate files must be restarted when they are renewed; the docs
+  now say so (L48).
+
 - A DVB subtitle track is read for its own page only. A PID that carries
   a page per language (common in European broadcasts) was read as one
   track, the languages' cues interleaved and cutting each other short.

@@ -38,10 +38,12 @@ use spoolframe_protocol::rpc::{OPERATION_WINDOW_MS, Operation, RpcRequest};
 /// (iroh's own default, made explicit: the idle timeout below needs it).
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// How long a connection may hear nothing from the server before QUIC
-/// closes it: three keep-alives unanswered. iroh's default is 30 s; its
-/// per-path limit is already 15 s, and a connection is no better than its
-/// paths. The lower of this and the server's own limit applies.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// closes it: six keep-alives unanswered. 30 s, iroh's default and its
+/// limit for a path through a relay, so a connection that has only a
+/// relay left, or an app suspended a little while, is not dropped before
+/// its path is (review 2026-10-11 L43). The lower of this and the
+/// server's own limit applies.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How much the server may send on one stream before this device reads
 /// it (P6-06): a direct read's whole block (`reader::BLOCK`). QUIC's
 /// default, 1.25 MB, lets a stream carry only that per round trip, about
@@ -255,7 +257,7 @@ impl Client {
             .max_idle_timeout(Some(
                 IDLE_TIMEOUT
                     .try_into()
-                    .expect("15 s is a valid idle timeout"),
+                    .expect("30 s is a valid idle timeout"),
             ))
             .build();
         // An empty map, relays on or off: no home relay of its own, and so

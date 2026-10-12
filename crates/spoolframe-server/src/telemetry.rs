@@ -252,8 +252,15 @@ impl Telemetry {
     pub async fn shutdown(&self) {
         let old = self.running.lock().take();
         (self.swap)(None);
-        if let Some(old) = old {
-            old.stop(self.timings).await;
+        if let Some(old) = old
+            && tokio::time::timeout(SHUTDOWN_BUDGET, old.stop(self.timings))
+                .await
+                .is_err()
+        {
+            tracing::warn!(
+                secs = SHUTDOWN_BUDGET.as_secs(),
+                "the OTLP export did not finish before the server stopped; what it held is lost"
+            );
         }
     }
 
@@ -412,8 +419,9 @@ impl Running {
     /// the export timeout. The SDK's shutdown blocks, so it runs off the
     /// runtime's threads.
     async fn stop(self, timings: Timings) {
-        flush(self.spans.clone(), timings).await;
-        flush(self.logs.clone(), timings).await;
+        // At once, not one after the other: a dead collector costs one
+        // wait, not two (review 2026-10-11 L44).
+        flush_both(self.spans.clone(), self.logs.clone(), timings).await;
         let (tracer, logger, meter) = (self.tracer, self.logger, self.meter);
         let shut = tokio::task::spawn_blocking(move || {
             if let Some(meter) = meter {
@@ -434,6 +442,19 @@ impl Running {
         }
     }
 }
+
+async fn flush_both(
+    spans: Option<mpsc::Sender<Msg<SpanData>>>,
+    logs: Option<mpsc::Sender<Msg<LogItem>>>,
+    timings: Timings,
+) {
+    tokio::join!(flush(spans, timings), flush(logs, timings));
+}
+
+/// The most a server's shutdown waits for its exports: what a dead
+/// collector holds is lost after it, rather than a restart in place
+/// waiting a minute for nothing (review 2026-10-11 L44).
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 
 async fn flush<T>(tx: Option<mpsc::Sender<Msg<T>>>, timings: Timings) {
     let Some(tx) = tx else {
@@ -989,5 +1010,24 @@ where
 
     fn on_id_change(&self, old: &tracing::span::Id, new: &tracing::span::Id, ctx: Context<'_, S>) {
         self.0.on_id_change(old, new, ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spans and logs are flushed at once: a collector that never
+    /// answers costs one wait, not two (review 2026-10-11 L44).
+    #[tokio::test(start_paused = true)]
+    async fn spans_and_logs_flush_at_once() {
+        let timings = Timings::default();
+        let (spans, _spans_held) = mpsc::channel::<Msg<SpanData>>(4);
+        let (logs, _logs_held) = mpsc::channel::<Msg<LogItem>>(4);
+        let began = tokio::time::Instant::now();
+        flush_both(Some(spans), Some(logs), timings).await;
+        let took = began.elapsed();
+        assert!(took >= timings.export_timeout * 2, "{took:?}");
+        assert!(took < timings.export_timeout * 3, "{took:?}");
     }
 }
