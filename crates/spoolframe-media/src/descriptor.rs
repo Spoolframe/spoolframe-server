@@ -63,6 +63,13 @@ pub struct VideoStream {
     /// Bits per second of this stream alone: what an MP4 says of it, else
     /// a Matroska muxer's `BPS` statistics tag; `None` where neither does.
     pub bit_rate: Option<u64>,
+    /// Whether its codec record (`avcC`, `hvcC`) holds every parameter set
+    /// it starts with, so a header written before the first packet is
+    /// whole: H.264's SPS and PPS, HEVC's VPS, SPS and PPS. False for a
+    /// record without them (the sets only in the stream, as in some 4K
+    /// WEB-DLs), an MP4 track tagged `avc3` or `hev1`, any other codec,
+    /// and a probe that did not read the record.
+    pub parameter_sets_in_record: bool,
 }
 
 /// The transfer function of the picture, as HLS names it (`VIDEO-RANGE`).
@@ -308,6 +315,11 @@ impl MediaDescriptor {
                             v.bit_rate
                                 .or_else(|| v.tags.as_ref().and_then(|t| t.tags.bps)),
                         ),
+                        parameter_sets_in_record: parameter_sets_in_record(
+                            &codec_name(&v.codec_name),
+                            &stream.codec_tag,
+                            stream.extradata.as_deref(),
+                        ),
                     });
                 }
                 StreamKinds::Audio(a) => {
@@ -467,6 +479,19 @@ fn language(tag: Option<&str>) -> Option<String> {
 /// for one it leaves out because it does not know the codec.
 fn codec_name(name: &Option<String>) -> String {
     name.clone().unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// [`VideoStream::parameter_sets_in_record`] from ffprobe's `codec_tag`
+/// (`0x31637668` read as its bytes, the fourcc backwards) and the record's
+/// hex dump (`-show_data`); none read is no record.
+fn parameter_sets_in_record(codec: &str, codec_tag: &[u8], extradata: Option<&str>) -> bool {
+    let tag = match codec_tag {
+        [a, b, c, d] => [*d, *c, *b, *a],
+        _ => [0; 4],
+    };
+    extradata
+        .and_then(crate::record::hex_dump_bytes)
+        .is_some_and(|record| crate::record::holds_parameter_sets(codec, &tag, &record))
 }
 
 #[cfg(test)]

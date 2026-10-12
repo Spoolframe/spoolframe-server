@@ -1282,6 +1282,7 @@ mod tests {
                 hdr: None,
                 dolby_vision: None,
                 bit_rate: None,
+                parameter_sets_in_record: false,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),

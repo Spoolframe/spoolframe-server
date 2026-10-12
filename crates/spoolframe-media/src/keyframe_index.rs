@@ -52,6 +52,11 @@ pub struct Indexed {
     pub kind: IndexKind,
     /// ms, ascending, deduplicated; one before 0 as 0.
     pub times_ms: Vec<u64>,
+    /// The first keyframe ffmpeg reads, its own time in ms: the last at or
+    /// before 0, which is before 0 where an edit list starts the track
+    /// after it (an MP4 cut with stream copy), though `times_ms` has it at
+    /// 0; any before it ffmpeg leaves out.
+    pub first_ms: i64,
 }
 
 /// Why a file's index cannot be used. None is an error of the file's:
@@ -105,8 +110,14 @@ pub fn ms(seconds: f64) -> u64 {
     (seconds.max(0.0) * 1000.0).round() as u64
 }
 
-/// `times` sorted and deduplicated; none is no index.
-fn finish(kind: IndexKind, mut times_ms: Vec<u64>) -> Result<Indexed, NoIndex> {
+/// `seconds` in ms, rounded as [`ms`] rounds it, before 0 kept.
+pub fn signed_ms(seconds: f64) -> i64 {
+    (seconds * 1000.0).round() as i64
+}
+
+/// `times` sorted and deduplicated; none is no index. `start`: the last
+/// keyframe at or before 0, in s, if any: where ffmpeg starts the track.
+fn finish(kind: IndexKind, mut times_ms: Vec<u64>, start: Option<f64>) -> Result<Indexed, NoIndex> {
     times_ms.sort_unstable();
     times_ms.dedup();
     if times_ms.is_empty() {
@@ -115,7 +126,12 @@ fn finish(kind: IndexKind, mut times_ms: Vec<u64>) -> Result<Indexed, NoIndex> {
             IndexKind::SyncSamples => NoIndex::Malformed("stss"),
         });
     }
-    Ok(Indexed { kind, times_ms })
+    let first_ms = start.map_or(times_ms[0] as i64, signed_ms);
+    Ok(Indexed {
+        kind,
+        times_ms,
+        first_ms,
+    })
 }
 
 /// The file, read only within its length and [`MAX_READ`] in all.
@@ -415,7 +431,8 @@ fn matroska<R: Read + Seek>(file: &mut Bounded<'_, R>) -> Result<Indexed, NoInde
             times.push(ms(time as f64 * scale as f64 / 1e9));
         }
     }
-    finish(IndexKind::Cues, times)
+    // A CueTime is unsigned: none is before 0.
+    finish(IndexKind::Cues, times, None)
 }
 
 /// The data of the element at `pos`, which must be an `id`.
@@ -702,6 +719,9 @@ fn video_track(trak: &[u8], mdia: &[u8], movie_scale: u32) -> Result<Indexed, No
 
     // One pass over the runs, the sync samples in order.
     let mut times = Vec::new();
+    // The last keyframe at or before 0, s: where ffmpeg starts the track,
+    // leaving out any before it.
+    let mut start: Option<f64> = None;
     let mut decode = decode.map(|run| (be32(&run[..4]), be32(&run[4..])));
     let (mut d_run, mut d_first, mut d_base) = (decode.next(), 1u64, 0i64);
     let mut c_run = composition.as_mut().and_then(Iterator::next);
@@ -749,9 +769,12 @@ fn video_track(trak: &[u8], mdia: &[u8], movie_scale: u32) -> Result<Indexed, No
             continue;
         }
         let shown = in_edit as f64 / f64::from(scale) + edit.delay;
+        if shown <= 0.0 {
+            start = Some(start.map_or(shown, |s| s.max(shown)));
+        }
         times.push(ms(shown));
     }
-    finish(IndexKind::SyncSamples, times)
+    finish(IndexKind::SyncSamples, times, start)
 }
 
 /// What a track's edit list does to its times, as ffmpeg applies it.

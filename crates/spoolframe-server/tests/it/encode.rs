@@ -909,7 +909,11 @@ async fn hls_of_a_copied_video_is_cut_at_its_keyframes_and_plays_whole() {
 
     let (durations, (first, last)) =
         play_hls(&server, &client, &session, &handle, "copy.mp4").await;
-    // Keyframes every 2 s: fifteen 2 s segments.
+    // Its record holds its parameter sets and its sound is AAC: cut by
+    // the segment muxer, whose list names no init (review 2026-10-11 M2).
+    let listed = std::fs::read_to_string(server.job_dir(&handle, 0).join("ffmpeg.m3u8")).unwrap();
+    assert!(!listed.contains("#EXT-X-MAP"), "{listed}");
+    // Keyframes every 2 s, cut at 2 s at least: fifteen 2 s segments.
     assert_eq!(durations.len(), 15, "{durations:?}");
     assert!(
         durations.iter().all(|d| (d - 2.0).abs() < 0.05),
@@ -1200,8 +1204,9 @@ async fn hls_of_a_copied_video_with_a_first_keyframe_before_zero_lists_what_ffmp
     server.generate_media_cut_after_a_keyframe(10, "libx264", "ac3");
     let handle = started(&client, &session, None).await;
     let (durations, firsts) = listed_and_written(&server, &client, &session, &handle).await;
-    // One per GOP: the first to 1.96 s.
-    assert_eq!(durations.len(), 5, "{durations:?}");
+    // At least 2 s each, from 0 (review 2026-10-11 M2): the first to
+    // 3.96 s, measured by ffmpeg from the keyframe at -0.04 s.
+    assert_eq!(durations.len(), 4, "{durations:?}");
     for (first, start) in firsts.iter().zip(segment_starts(&durations)) {
         assert!(
             (first - start).abs() < 0.1,
@@ -1941,6 +1946,11 @@ async fn hls_of_a_copied_hevc_video_with_its_parameter_sets_in_the_stream_names_
     for nal in [32, 33, 34] {
         assert!(types.contains(&nal), "hvcC arrays {types:?}, no {nal}");
     }
+    // Cut by the HLS muxer, which writes its header after the first
+    // packets: its own playlist names the init (the segment muxer's list
+    // does not), and every keyframe is a cut.
+    let listed = std::fs::read_to_string(server.job_dir(&handle, 0).join("ffmpeg.m3u8")).unwrap();
+    assert!(listed.contains("#EXT-X-MAP"), "{listed}");
     client.close().await;
     server.stop().await;
 }
@@ -2646,10 +2656,10 @@ async fn a_segment_gone_before_it_is_opened_is_not_an_empty_segment() {
     crate::support::write_script(
         &stub,
         "#!/bin/sh\n\
-         for playlist; do :; done\n\
-         dir=$(dirname \"$playlist\")\n\
+         for last; do :; done\n\
+         dir=$(dirname \"$last\")\n\
          printf 'init' > \"$dir/init.mp4\"\n\
-         printf '#EXTM3U\\n#EXTINF:2.000000,\\nseg1.m4s\\n' > \"$playlist\"\n\
+         printf '#EXTM3U\\n#EXTINF:2.000000,\\nseg1.m4s\\n' > \"$dir/ffmpeg.m3u8\"\n\
          exec sleep 30\n",
     );
     let options = ServerOptions {

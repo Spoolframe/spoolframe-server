@@ -612,9 +612,11 @@ impl Client {
             new = new_id,
             "replaced a server's pin, as the user asked"
         );
+        // Sessions first: stopping between the two writes leaves the old
+        // pin with no sessions, never tokens under a pin no longer saved.
+        storage.set_secret(&keys::sessions(saved_id), None).await?;
         saved[at] = server.clone();
         servers::save(storage, &saved).await?;
-        storage.set_secret(&keys::sessions(saved_id), None).await?;
         self.inner.discovery.changed();
         Ok(self.entry(new, &conn, Some(&server)))
     }
@@ -683,6 +685,13 @@ impl Client {
         }
     }
 
+    /// What server `id` said in its latest Hello on this run, if it was
+    /// reached. Never dials.
+    pub(crate) fn hello(&self, id: EndpointId) -> Option<spoolframe_protocol::ServerInfo> {
+        let link = self.inner.links.lock().get(&id).cloned();
+        link.and_then(|l| l.info())
+    }
+
     /// Where the open connection to `id` reaches it, the path in use
     /// first; nothing without one. Never dials.
     fn in_use(&self, id: EndpointId) -> Vec<SocketAddr> {
@@ -719,18 +728,54 @@ impl Client {
     /// Forget server `endpoint_id`: its pin and every session on it.
     pub async fn forget(&self, endpoint_id: &str) -> Result<(), SdkError> {
         let id = parse_id(endpoint_id)?;
+        // Closed before waiting for `saving`: no reconnect meanwhile.
+        if let Some(link) = self.inner.links.lock().remove(&id) {
+            link.close();
+        }
+        let _saving = self.inner.saving.lock().await;
+        self.forget_saved(id).await
+    }
+
+    /// The user of session `token`, `username`, left server `server`
+    /// (PX-47): take their profile off this device, and forget the server
+    /// as [`Client::forget`] does once no other profile is kept for it.
+    /// One step under `saving`, so a sign-in meanwhile is either kept, and
+    /// the server with it, or comes after and finds it forgotten.
+    pub(crate) async fn left(
+        &self,
+        server: EndpointId,
+        token: &SessionId,
+        username: &str,
+    ) -> Result<(), SdkError> {
+        let storage = self.inner.storage.as_ref();
+        let _saving = self.inner.saving.lock().await;
+        let mut stored = session::load(storage, &server).await?;
+        stored.retain(|s| s.token.as_deref() != Some(token.0.as_str()) && s.username != username);
+        if stored.is_empty() {
+            return self.forget_saved(server).await;
+        }
+        session::save(storage, &server, &stored).await?;
+        Ok(())
+    }
+
+    /// Forget server `id`, its link, pin and sessions; the caller holds
+    /// `saving`.
+    async fn forget_saved(&self, id: EndpointId) -> Result<(), SdkError> {
+        let endpoint_id = id.to_string();
+        let endpoint_id = endpoint_id.as_str();
         if let Some(link) = self.inner.links.lock().remove(&id) {
             link.close();
         }
         let storage = self.inner.storage.as_ref();
-        let _saving = self.inner.saving.lock().await;
+        // Sessions first: stopping between the two writes leaves a pinned
+        // server with no sessions, never tokens for a server not saved.
+        storage
+            .set_secret(&keys::sessions(endpoint_id), None)
+            .await?;
         let mut saved = servers::load(storage).await?;
         saved.retain(|s| s.endpoint_id != endpoint_id);
         servers::save(storage, &saved).await?;
         self.inner.relay_policy.choose(id, None);
-        storage
-            .set_secret(&keys::sessions(endpoint_id), None)
-            .await?;
         self.inner.discovery.changed();
         Ok(())
     }
@@ -844,10 +889,13 @@ impl Client {
                 }
                 Response::Err(e) => return Err(SdkError::from_server(e)),
             };
-        let mut session = self
+        let session = self
             .keep_session(server, token, Some(SignInMethod::Password), remembered)
             .await?;
-        session.password_change_required = password_change_required;
+        session.password_change_required.store(
+            password_change_required,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(session)
     }
 
@@ -1030,12 +1078,15 @@ impl Client {
     /// [`SdkError::SignInDenied`] if it was refused, [`SdkError::SignInExpired`]
     /// once it is over (begin another). Drop the future to stop waiting.
     ///
-    /// [`SdkError::TimedOut`] or [`SdkError::Unreachable`] when the
-    /// connection failed while waiting: call this again with the same
-    /// `sign_in`, which lives on the server until it expires. It is not
-    /// asked again by itself, since an approval the server sent on a
-    /// connection that then died is spent; asking again says
-    /// [`SdkError::SignInExpired`].
+    /// A connection that dies while waiting is replaced, and each round
+    /// is asked once more on the new one with the same operation id. A
+    /// round the server already answered is not run again: it replays the
+    /// `LoggedIn` it sent, so an approval sent on the dead connection
+    /// still brings its session. A server restarted meanwhile refuses the
+    /// operation instead. [`SdkError::TimedOut`] or
+    /// [`SdkError::Unreachable`] when the new connection fails too: call
+    /// this again with the same `sign_in`, which lives on the server until
+    /// it expires.
     pub async fn await_device_sign_in(&self, sign_in: &DeviceSignIn) -> Result<Session, SdkError> {
         let server = parse_id(&sign_in.server)?;
         loop {
@@ -1167,7 +1218,7 @@ impl Client {
             user,
             can_leave,
             remembered: Some(remembered),
-            password_change_required: false,
+            password_change_required: Arc::default(),
         })
     }
 
@@ -1229,7 +1280,7 @@ impl Client {
                     user,
                     can_leave,
                     remembered: None,
-                    password_change_required: false,
+                    password_change_required: Arc::default(),
                 }),
                 Response::Err(spoolframe_protocol::Error::Unauthenticated) => {
                     tracing::info!(
@@ -2389,6 +2440,61 @@ mod tests {
         assert!(matches!(kept, Err(SdkError::NotPinned(_))), "{kept:?}");
         let stored = session::load(storage.as_ref(), &id).await.unwrap();
         assert!(stored.is_empty(), "{} sessions kept", stored.len());
+        client.close().await;
+    }
+
+    /// Memory storage whose session secrets cannot be written once
+    /// `broken`: a crash between two writes, as the next run sees it.
+    #[derive(Default)]
+    struct SessionsUnwritable {
+        inner: MemoryStorage,
+        broken: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl Storage for SessionsUnwritable {
+        async fn secret(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.secret(key).await
+        }
+        async fn set_secret(&self, key: &str, value: Option<Vec<u8>>) -> Result<(), StorageError> {
+            if key.starts_with("sessions/") && self.broken.load(Ordering::SeqCst) {
+                return Err(StorageError("crashed".into()));
+            }
+            self.inner.set_secret(key, value).await
+        }
+        async fn data(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.data(key).await
+        }
+        async fn set_data(&self, key: &str, value: Option<Vec<u8>>) -> Result<(), StorageError> {
+            self.inner.set_data(key, value).await
+        }
+    }
+
+    /// C4: `forget` clears the sessions before the pin, so stopping in
+    /// between leaves a pinned server, never a session token for a server
+    /// no longer saved.
+    #[tokio::test]
+    async fn a_forget_cut_short_leaves_the_pin_not_an_orphaned_session() {
+        let storage = Arc::new(SessionsUnwritable::default());
+        let client = Client::open(storage.clone(), device()).await.unwrap();
+        let id = SecretKey::generate().public();
+        let pinned: SavedServer = serde_json::from_value(serde_json::json!({
+            "name": "Home",
+            "endpoint_id": id.to_string(),
+        }))
+        .unwrap();
+        servers::save(storage.as_ref(), &[pinned]).await.unwrap();
+        storage
+            .set_secret(&keys::sessions(&id.to_string()), Some(b"[]".to_vec()))
+            .await
+            .unwrap();
+        storage.broken.store(true, Ordering::SeqCst);
+        assert!(client.forget(&id.to_string()).await.is_err());
+        let saved = servers::load(storage.as_ref()).await.unwrap();
+        assert!(
+            saved.iter().any(|s| s.endpoint_id == id.to_string()),
+            "the pin went before its sessions"
+        );
         client.close().await;
     }
 

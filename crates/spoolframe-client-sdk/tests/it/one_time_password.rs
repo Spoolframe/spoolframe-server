@@ -9,7 +9,17 @@ use spoolframe_client_sdk::{Client, ClientOptions, Device, MemoryStorage, Timeou
 
 use crate::stub::Stub;
 
-async fn signed_in_with(password: &str) -> (bool, Result<(), spoolframe_client_sdk::SdkError>) {
+/// Sign alice in with `password` and change it: whether the session asked
+/// for a change before, what the change answered, and whether the session
+/// and a clone of it made before still ask after.
+async fn signed_in_with(
+    password: &str,
+) -> (
+    bool,
+    Result<(), spoolframe_client_sdk::SdkError>,
+    bool,
+    bool,
+) {
     let stub = Stub::start().await;
     let client = Client::open_with_options(
         Arc::new(MemoryStorage::default()),
@@ -39,23 +49,37 @@ async fn signed_in_with(password: &str) -> (bool, Result<(), spoolframe_client_s
         .await
         .unwrap();
     let required = session.password_change_required();
+    let clone = session.clone();
     let changed = session
         .change_password(password, "a new password of hers")
         .await;
+    let after = (
+        session.password_change_required(),
+        clone.password_change_required(),
+    );
     client.close().await;
     stub.stop().await;
-    (required, changed)
+    (required, changed, after.0, after.1)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_time_password_s_session_asks_for_a_new_one() {
-    let (required, changed) = signed_in_with("one-time").await;
+    let (required, changed, _, _) = signed_in_with("one-time").await;
     assert!(required);
     changed.unwrap();
 }
 
+/// C5: once changed, the session (and every clone of it) no longer asks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_one_time_password_is_no_longer_asked_for() {
+    let (_, changed, after, clone_after) = signed_in_with("one-time").await;
+    changed.unwrap();
+    assert!(!after, "the session still asks for a new password");
+    assert!(!clone_after, "a clone still asks for a new password");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_ordinary_password_s_session_does_not() {
-    let (required, _) = signed_in_with("correct horse").await;
+    let (required, _, _, _) = signed_in_with("correct horse").await;
     assert!(!required);
 }

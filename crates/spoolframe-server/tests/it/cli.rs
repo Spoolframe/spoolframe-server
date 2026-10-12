@@ -875,6 +875,7 @@ fn config_defaults_prints_every_setting_at_its_default() {
         "{text}"
     );
     assert!(text.contains("max_jobs = 2;"), "{text}");
+    assert!(text.contains("copy_segment_secs = 2;"), "{text}");
 }
 
 /// Whose state directory `id` used: which of `dirs` got the key.

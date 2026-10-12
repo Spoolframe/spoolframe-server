@@ -87,6 +87,7 @@ impl FakeClient {
             grow: self.grow,
             meter: self.meter.clone(),
             limits: Mutex::default(),
+            fail_next_limit: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(TestState::default()),
         }))
     }
@@ -103,6 +104,8 @@ pub struct TestBackend {
     meter: Option<Arc<crate::LinkMeter>>,
     /// The link rates `limit` was asked for.
     pub limits: Mutex<Vec<u64>>,
+    /// The next `limit` fails with [`SdkError::Busy`].
+    pub fail_next_limit: std::sync::atomic::AtomicBool,
     state: Mutex<TestState>,
 }
 impl TestBackend {
@@ -251,6 +254,12 @@ impl PlaybackBackend for TestBackend {
         _: Duration,
     ) -> Result<PlaybackChange, SdkError> {
         self.limits.lock().push(link_bitrate);
+        if self
+            .fail_next_limit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(SdkError::Busy);
+        }
         Ok(PlaybackChange {
             plan: PlaybackPlan::Converted {
                 delivery: Delivery::Progressive,

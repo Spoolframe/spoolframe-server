@@ -19,11 +19,12 @@ pub mod keyframe_index;
 pub mod ocr;
 pub mod pgs;
 mod probe;
+mod record;
 pub mod roles;
 pub mod sandbox;
 pub mod vobsub;
 
-pub use probe::{KeyframesFrom, ProbeError, Prober};
+pub use probe::{KeyframeTimes, KeyframesFrom, ProbeError, Prober};
 
 pub use descriptor::{
     AudioStream, DolbyVision, DvBase, MAX_DURATION, MediaDescriptor, SubtitleKind, SubtitleSource,

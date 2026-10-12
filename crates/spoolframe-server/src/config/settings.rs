@@ -113,6 +113,7 @@ pub const SETTINGS: &[Setting] = &[
     restart("transcode.scratch_dir"),
     live("transcode.scratch_limit_mb"),
     live("transcode.read_ahead_secs"),
+    live("transcode.copy_segment_secs"),
     live("transcode.gpu_filters"),
     live("transcode.tone_map"),
     live("transcode.video_codecs"),

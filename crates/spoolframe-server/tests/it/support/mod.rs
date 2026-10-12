@@ -672,6 +672,7 @@ impl TestServer {
                 scratch_dir: dir.join("cache").join("transcode"),
                 scratch_limit_bytes: options.scratch_limit,
                 read_ahead: options.read_ahead,
+                copy_segment_secs: 2,
                 stalled_after: options.stalled_after,
                 gpu_filters: false,
                 tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,

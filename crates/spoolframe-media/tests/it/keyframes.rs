@@ -113,6 +113,90 @@ async fn an_mp4_cut_after_a_keyframe_lists_it_at_zero() {
     assert_eq!(times[0], 0);
 }
 
+/// The first keyframe's own time, as ffprobe reads its first packet, ms.
+fn first_keyframe_ms(path: &Path) -> i64 {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-show_entries", "packet=pts_time,flags", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let first = text
+        .lines()
+        .find(|l| l.contains(",K"))
+        .and_then(|l| l.split(',').next())
+        .and_then(|t| t.parse::<f64>().ok())
+        .unwrap();
+    (first * 1000.0).round() as i64
+}
+
+/// A copy from such a file's start begins at that keyframe, before 0:
+/// its time is kept, from the index and from every packet alike, though
+/// the list has it at 0.
+#[tokio::test]
+async fn an_mp4_cut_after_a_keyframe_keeps_where_that_keyframe_is() {
+    let dir = scratch("mp4-cut-first").await;
+    let whole = film(dir.as_ref(), "whole.mp4", &[]);
+    let cut = dir.as_ref().join("cut.mp4");
+    let (whole_path, cut_path) = (whole.to_str().unwrap(), cut.to_str().unwrap());
+    ffmpeg(&["-ss", "3.44", "-i", whole_path, "-c", "copy", cut_path]);
+    let expected = first_keyframe_ms(&cut);
+    assert!(expected < 0, "the cut starts at {expected} ms");
+    let prober = prober();
+    let (indexed, from) = prober.keyframes_from(&cut).await.unwrap();
+    assert_eq!(from, KeyframesFrom::Index(IndexKind::SyncSamples));
+    assert_eq!(indexed.first_ms, expected);
+    assert_eq!(
+        prober.scan_keyframes(&cut).await.unwrap().first_ms,
+        expected
+    );
+    // A file from 0 starts at 0.
+    let (uncut, _) = prober.keyframes_from(&whole).await.unwrap();
+    assert_eq!(uncut.first_ms, 0);
+}
+
+/// Keyed every 2 s and cut 40 ms past one, the MP4 keeps an earlier
+/// keyframe too, which ffmpeg drops: the copy starts at the last one
+/// before 0, at -0.04 s, not at the first in the file.
+#[tokio::test]
+async fn an_mp4_cut_keeps_the_keyframe_a_copy_starts_at_not_one_before_it() {
+    let dir = scratch("mp4-cut-two").await;
+    let whole = dir.as_ref().join("whole.mkv");
+    let cut = dir.as_ref().join("cut.mp4");
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=160x90:rate=25",
+        "-t",
+        "12",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "50",
+        "-sc_threshold",
+        "0",
+        "-c:v",
+        "libx264",
+        whole.to_str().unwrap(),
+    ]);
+    let (whole_path, cut_path) = (whole.to_str().unwrap(), cut.to_str().unwrap());
+    ffmpeg(&[
+        "-ss", "2.04", "-i", whole_path, "-c", "copy", "-f", "mp4", cut_path,
+    ]);
+    let expected = first_keyframe_ms(&cut);
+    assert_eq!(expected, -40);
+    let prober = prober();
+    let (indexed, from) = prober.keyframes_from(&cut).await.unwrap();
+    assert_eq!(from, KeyframesFrom::Index(IndexKind::SyncSamples));
+    assert_eq!(indexed.first_ms, expected);
+    assert_eq!(
+        prober.scan_keyframes(&cut).await.unwrap().first_ms,
+        expected
+    );
+}
+
 /// Written to a pipe, the Matroska muxer cannot go back for an index.
 #[tokio::test]
 async fn a_matroska_file_without_cues_is_read_whole() {
@@ -206,8 +290,8 @@ async fn two_callers_at_once_share_one_scan() {
     std::fs::write(&film, b"not a container with an index").unwrap();
     let prober = Prober::new(Tool::unconfined(&ffprobe), Duration::from_secs(30));
     let (a, b) = tokio::join!(prober.keyframes(&film), prober.keyframes(&film));
-    assert_eq!(*a.unwrap(), [0, 2000]);
-    assert_eq!(*b.unwrap(), [0, 2000]);
+    assert_eq!(a.unwrap().times_ms, [0, 2000]);
+    assert_eq!(b.unwrap().times_ms, [0, 2000]);
     let ran = std::fs::read_to_string(&scans).unwrap();
     assert_eq!(ran.lines().count(), 1, "{ran}");
 }

@@ -9,6 +9,7 @@ use spoolframe_types::{ClientCapabilities, Platform};
 
 use super::*;
 use crate::client::{ClientOptions, Device};
+use crate::portable::GuestPairing;
 use crate::storage::{MemoryStorage, Storage, keys};
 
 /// No test takes this long unless something hangs.
@@ -754,6 +755,96 @@ async fn the_phone_hands_the_identity_s_servers_and_the_tv_saves_them() {
             !saved
                 .iter()
                 .any(|s| [&theirs, &clash, &unchecked].contains(&&s.endpoint_id))
+        );
+    })
+    .await;
+}
+
+/// #6: a guest paired by QR is listed with the server its phone handed
+/// first, and when: what a "Shared computer" row shows. Forgetting the
+/// guest takes the record too.
+#[tokio::test]
+async fn a_guest_paired_by_qr_is_listed_with_its_server_and_when() {
+    within(async {
+        let (tv_storage, tv) = tv().await;
+        let (phone_storage, phone) = open("phone").await;
+        let (id, _) = phone.portable().create("Steve").await.unwrap();
+        let home = iroh::SecretKey::from_bytes(&[1; 32]).public().to_string();
+        saved_with_session(
+            &phone_storage,
+            &home,
+            "home-id",
+            "127.0.0.1:7420",
+            true,
+            Some(id),
+        )
+        .await;
+        let before = crate::servers::now();
+        pair(&tv, &phone, id).await;
+
+        let listed = tv.portable().guest_pairings().await.unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].id, id);
+        assert_eq!(
+            listed[0].server,
+            Some(GuestServer {
+                endpoint_id: home,
+                name: "Home Media".into(),
+            })
+        );
+        let at = listed[0].paired_at.expect("when it was paired");
+        assert!(at >= before && at <= crate::servers::now(), "{at}");
+
+        tv.portable().forget_guest(id).await.unwrap();
+        assert!(tv.portable().guest_pairings().await.unwrap().is_empty());
+        assert_eq!(
+            tv_storage
+                .data(&keys::portable_paired(&id.to_string()))
+                .await
+                .unwrap(),
+            None
+        );
+    })
+    .await;
+}
+
+/// #6: a phone that hands no server pairs a guest with no server, but a
+/// time all the same.
+#[tokio::test]
+async fn a_guest_paired_with_no_server_has_none() {
+    within(async {
+        let (_, tv) = tv().await;
+        let (phone, id) = holder("Steve").await;
+        pair(&tv, &phone, id).await;
+        let listed = tv.portable().guest_pairings().await.unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].server, None);
+        assert!(listed[0].paired_at.is_some());
+    })
+    .await;
+}
+
+/// #6: a guest stored before the SDK kept where and when it was paired
+/// is still listed, with neither.
+#[tokio::test]
+async fn a_guest_stored_before_pairings_were_kept_has_neither() {
+    within(async {
+        let (_, tv) = tv().await;
+        let (phone, id) = holder("Steve").await;
+        let key = tv.portable().device_key(id).await.unwrap();
+        let credential = phone
+            .portable()
+            .issue_credential(id, key, None)
+            .await
+            .unwrap();
+        tv.portable().install_credential(credential).await.unwrap();
+        assert_eq!(
+            tv.portable().guest_pairings().await.unwrap(),
+            [GuestPairing {
+                id,
+                server: None,
+                paired_at: None,
+            }]
         );
     })
     .await;

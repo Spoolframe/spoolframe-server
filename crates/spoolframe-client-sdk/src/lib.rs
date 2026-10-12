@@ -49,10 +49,11 @@ pub use spoolframe_protocol::pairing::PairedServer;
 // Portable identities (P7-01) and their device credentials (P7-02).
 pub use pairing_relay::{RelayAnswer, RelayOffer, RelayPairing};
 pub use portable::{
-    CredentialError, DevicePublicKey, HANDLE_LEN, IdentityGenesis, IdentityRecord, KeyAssertion,
-    PORTABLE_RP, PhraseError, Portable, PortableIdentity, PortableIdentityState, PortableRoot,
-    PortableUserId, RecoveryPhrase, RevokedKey, RootKey, RootSet, RootSigner, SecurityKey,
-    SecurityKeyError, SoftSecurityKey, StateError, TieProof, UserDeviceCredential,
+    CredentialError, DevicePublicKey, GuestPairing, GuestServer, HANDLE_LEN, IdentityGenesis,
+    IdentityRecord, KeyAssertion, PORTABLE_RP, PhraseError, Portable, PortableIdentity,
+    PortableIdentityState, PortableRoot, PortableUserId, RecoveryPhrase, RevokedKey, RootKey,
+    RootSet, RootSigner, SecurityKey, SecurityKeyError, SoftSecurityKey, StateError, TieProof,
+    UserDeviceCredential,
 };
 pub use reachability::{
     DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,

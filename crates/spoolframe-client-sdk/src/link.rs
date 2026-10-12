@@ -26,12 +26,12 @@ use crate::link_meter::LinkMeter;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
+use iroh::endpoint::RecvStream;
 use spoolframe_protocol::codec::read_frame;
 use spoolframe_protocol::streams::uni;
 use spoolframe_protocol::{Event, ServerInfo, SessionId};
@@ -204,8 +204,11 @@ pub(crate) struct Link {
     hurry: tokio::sync::Notify,
     /// [`Link::close`]d: the client dropped it (the server was forgotten,
     /// or its relays changed). A dial on the way when it closed keeps
-    /// nothing, and no supervisor starts or goes on.
-    closed: AtomicBool,
+    /// nothing, and no supervisor starts or goes on. A watch, so the
+    /// supervisor's waits end on it ([`Link::closing`]): it stops between
+    /// steps, never inside one, so a write to storage it began is
+    /// finished (C6).
+    closed: watch::Sender<bool>,
     /// How fast media comes from the server (P6-06), across connections.
     meter: Arc<LinkMeter>,
 }
@@ -222,7 +225,7 @@ impl Link {
             dialing: tokio::sync::Mutex::default(),
             supervisor: Mutex::default(),
             hurry: tokio::sync::Notify::new(),
-            closed: AtomicBool::new(false),
+            closed: watch::Sender::new(false),
             meter: Arc::default(),
         })
     }
@@ -360,7 +363,13 @@ impl Link {
     }
 
     fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        *self.closed.borrow()
+    }
+
+    /// Returns once the link is [`Link::close`]d; at once if it is.
+    async fn closing(&self) {
+        // The sender is the link's own, so it outlives this wait.
+        let _ = self.closed.subscribe().wait_for(|closed| *closed).await;
     }
 
     /// What a dial on a closed link gives: the client no longer keeps
@@ -425,11 +434,17 @@ impl Link {
 
     /// Stop: no more reconnects, and the connection closed. For good: a
     /// dial on the way keeps nothing.
+    ///
+    /// The supervisor is not aborted (C6): aborting it in the middle of
+    /// saving what the server told could cut a storage write short. It
+    /// sees the link closed at its next wait, which ends on it, and
+    /// returns. Every step between two waits ends by itself: a dial
+    /// within the client's timeouts, a storage write when the storage is
+    /// done. So no abort is kept even as a fallback.
     pub fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        if let Some(task) = self.supervisor.lock().take() {
-            task.abort();
-        }
+        self.closed.send_replace(true);
+        // Detached, not aborted: it stops on its own.
+        drop(self.supervisor.lock().take());
         if let Some(conn) = self.current.lock().take() {
             conn.conn.close(0u32.into(), b"closed");
         }
@@ -444,7 +459,10 @@ async fn supervise(link: Arc<Link>, client: Weak<Inner>, mut conn: Arc<ServerCon
         if link.is_closed() {
             return;
         }
-        until_lost(&conn.conn, link.id, &client).await;
+        until_lost(&link, &conn.conn, &client).await;
+        if link.is_closed() {
+            return;
+        }
         let reason = conn.conn.close_reason();
         if reason.as_ref().and_then(closed_by_server) == Some(SdkError::SignInRequired) {
             signed_out(&link, &client).await;
@@ -482,6 +500,9 @@ where
     let mut backoff = Backoff::default();
     let mut attempt = 1;
     loop {
+        if link.is_closed() {
+            return None;
+        }
         link.set(None, ConnectionState::Reconnecting { attempt });
         match dial().await? {
             Ok(conn) => return Some((conn, attempt)),
@@ -501,6 +522,7 @@ where
             () = link.hurry.notified() => {
                 tracing::debug!(server = %link.id, attempt, "hurried; dialling now");
             }
+            () = link.closing() => return None,
         }
         attempt += 1;
     }
@@ -572,61 +594,82 @@ async fn signed_out(link: &Link, client: &Weak<Inner>) {
     link.sign_outs.send_modify(|n| *n += 1);
 }
 
-/// Returns when `conn` closes or the server says it is shutting down: then
-/// it is about to close, and dialling can start. Meanwhile the server's
-/// other events on it, from server `id`, are applied.
-async fn until_lost(conn: &Connection, id: EndpointId, client: &Weak<Inner>) {
-    tokio::select! {
-        _ = conn.closed() => {}
-        () = shutting_down(conn, id, client) => {}
+/// Returns when `conn` closes, the server says it is shutting down (then
+/// it is about to close, and dialling can start), or the link is closed.
+/// Meanwhile the server's other events on it are applied. Its addresses
+/// (PX-12), pushed once the device is signed in and when they change,
+/// replace those it told before.
+///
+/// Only reading the next event is cut short by a close: an event read is
+/// applied in full first, so saving the addresses is never stopped
+/// halfway (C6). If the events stream cannot be read, waits for the
+/// connection to close instead.
+async fn until_lost(link: &Link, conn: &Connection, client: &Weak<Inner>) {
+    let stop = async {
+        tokio::select! {
+            _ = conn.closed() => {}
+            () = link.closing() => {}
+        }
+    };
+    tokio::pin!(stop);
+    let mut recv = tokio::select! {
+        () = &mut stop => return,
+        recv = events(conn) => match recv {
+            Some(recv) => recv,
+            None => return stop.await,
+        },
+    };
+    loop {
+        let event = tokio::select! {
+            () = &mut stop => return,
+            event = read_frame::<_, Event>(&mut recv) => event,
+        };
+        let Ok(event) = event else {
+            return stop.await;
+        };
+        if apply(event, link.id, client).await.is_break() {
+            return;
+        }
     }
 }
 
-/// Returns on the server's `ShuttingDown` event. If the events stream
-/// cannot be read, waits for the connection to close instead. Its
-/// addresses (PX-12), pushed once the device is signed in and when they
-/// change, replace those it told before.
-async fn shutting_down(conn: &Connection, id: EndpointId, client: &Weak<Inner>) {
-    let events = async {
-        let mut recv = conn.accept_uni().await.ok()?;
-        if recv.read_u8().await.ok()? != uni::EVENTS {
-            return None;
-        }
-        loop {
-            match read_frame::<_, Event>(&mut recv).await.ok()? {
-                Event::ShuttingDown => return Some(()),
-                Event::ServerAddresses {
-                    addrs,
-                    relays,
-                    lookup,
-                } => {
-                    let Some(inner) = client.upgrade() else {
-                        continue;
-                    };
-                    if let Err(e) = (Client { inner }).told(id, addrs, relays, lookup).await {
-                        tracing::warn!(server = %id, error = %e, "cannot save the addresses the server told");
-                    }
-                }
-                // Followed by the managed playback of `handle` (PX-46).
-                Event::PlaybackShare {
-                    handle,
-                    max_bitrate,
-                } => {
-                    tracing::debug!(server = %id, ?max_bitrate, "a playback's share changed");
-                    if let Some(inner) = client.upgrade() {
-                        let _ = inner.shares.send(crate::PlaybackShare {
-                            handle,
-                            max_bitrate,
-                        });
-                    }
-                }
-                Event::Unknown => {}
+/// The server's events stream on `conn`; `None` if it cannot be read.
+async fn events(conn: &Connection) -> Option<RecvStream> {
+    let mut recv = conn.accept_uni().await.ok()?;
+    (recv.read_u8().await.ok()? == uni::EVENTS).then_some(recv)
+}
+
+/// Apply `event` from server `id`; `Break` on `ShuttingDown`.
+async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::ControlFlow<()> {
+    match event {
+        Event::ShuttingDown => return std::ops::ControlFlow::Break(()),
+        Event::ServerAddresses {
+            addrs,
+            relays,
+            lookup,
+        } => {
+            if let Some(inner) = client.upgrade()
+                && let Err(e) = (Client { inner }).told(id, addrs, relays, lookup).await
+            {
+                tracing::warn!(server = %id, error = %e, "cannot save the addresses the server told");
             }
         }
-    };
-    if events.await.is_none() {
-        std::future::pending::<()>().await;
+        // Followed by the managed playback of `handle` (PX-46).
+        Event::PlaybackShare {
+            handle,
+            max_bitrate,
+        } => {
+            tracing::debug!(server = %id, ?max_bitrate, "a playback's share changed");
+            if let Some(inner) = client.upgrade() {
+                let _ = inner.shares.send(crate::PlaybackShare {
+                    handle,
+                    max_bitrate,
+                });
+            }
+        }
+        Event::Unknown => {}
     }
+    std::ops::ControlFlow::Continue(())
 }
 
 #[cfg(test)]

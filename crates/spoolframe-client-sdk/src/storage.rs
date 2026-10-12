@@ -103,6 +103,14 @@ pub mod keys {
         format!("portable-genesis/{id}")
     }
 
+    /// Data: where and when guest `id` was last paired onto this device,
+    /// JSON (the server the pairing was for, if one was known, and Unix
+    /// seconds): what [`crate::Portable::guest_pairings`] lists. A guest
+    /// paired before this was kept has none.
+    pub fn portable_paired(id: &str) -> String {
+        format!("portable-paired/{id}")
+    }
+
     /// Secret: the device key this device offered a pairing through a
     /// server with (P7-08), before it knows the identity it will act as:
     /// taken as that identity's device key when the pairing is accepted.

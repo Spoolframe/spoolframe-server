@@ -1430,6 +1430,7 @@ mod tests {
                 hdr: None,
                 dolby_vision: None,
                 bit_rate: None,
+                parameter_sets_in_record: false,
             }),
             audio: vec![audio(1, "dts", true), audio(2, "aac", false)],
             subtitles: vec![

@@ -30,8 +30,9 @@
 //! - Audio alone cuts anywhere: a 6 s grid.
 
 use std::fmt::Write as _;
+use std::sync::{Arc, OnceLock};
 
-use spoolframe_media::{MAX_DURATION, MediaDescriptor, SubtitleStream, VideoRange};
+use spoolframe_media::{KeyframeTimes, MAX_DURATION, MediaDescriptor, SubtitleStream, VideoRange};
 use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo};
 use spoolframe_types::{AudioCodec, VideoCodec, language};
 
@@ -46,14 +47,41 @@ const ENCODED_HEAD: u32 = 3;
 
 /// The segments of a converted playback: segment `n` (from 1) starts at
 /// `starts_ms[n - 1]` and ends where the next starts, or at `total_ms`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A copied video has a segment per source GOP: for an all-intra film one
+/// per frame, 172k over two hours (review 2026-10-11 M2). The list is
+/// shared, not copied, with the runs that cut at it
+/// ([`Segments::shared_starts`]), and each playlist is written once, on
+/// its first ask, and handed out after: nothing it is made of changes.
+#[derive(Debug, Clone)]
 pub struct Segments {
-    pub starts_ms: Vec<u64>,
+    starts_ms: Arc<[u64]>,
     pub total_ms: u64,
     /// Segments 1 to `head` are written only by a run from 0: a run for
     /// any of them starts at segment 1 ([`Segments::run_from`]).
     head: u32,
+    /// For a copied video cut at this list by ffmpeg's segment muxer
+    /// ([`Segments::copied`]): where a run from the start begins, its
+    /// first keyframe's own time, ms. `None` for any other.
+    copy_from_ms: Option<i64>,
+    media: OnceLock<String>,
+    subtitles: OnceLock<String>,
 }
+
+/// The same cuts, whichever playlists have been written yet.
+impl PartialEq for Segments {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.starts_ms, self.total_ms, self.head, self.copy_from_ms)
+            == (
+                &other.starts_ms,
+                other.total_ms,
+                other.head,
+                other.copy_from_ms,
+            )
+    }
+}
+
+impl Eq for Segments {}
 
 /// The length an HLS grid is cut over, in ms, from ffprobe's length of
 /// the file: refused past [`MAX_DURATION`], which would make a grid (and
@@ -112,6 +140,33 @@ impl Segments {
         Self::tidy(starts_ms, total_ms, 0)
     }
 
+    /// A copied video cut by ffmpeg's segment muxer (review 2026-10-11 M2):
+    /// from 0, each cut at the first keyframe at least `at_least_secs`
+    /// past the last (`transcode.copy_segment_secs`). Keyframes further
+    /// apart than that are each a cut. Every run cuts at this list,
+    /// whatever it started from: it is the cuts' own times the muxer is
+    /// given, not a length (`args`).
+    pub fn copied(keyframes: &KeyframeTimes, total_ms: u64, at_least_secs: u64) -> Self {
+        let step = at_least_secs.saturating_mul(1000);
+        let mut starts_ms = vec![0];
+        for &t in keyframes.iter().filter(|&&t| t < total_ms) {
+            if t >= starts_ms[starts_ms.len() - 1] + step {
+                starts_ms.push(t);
+            }
+        }
+        Self {
+            copy_from_ms: Some(keyframes.first_ms),
+            ..Self::tidy(starts_ms, total_ms, 0)
+        }
+    }
+
+    /// For a copied video cut by the segment muxer ([`Segments::copied`]),
+    /// where a run from the start begins: its first keyframe, before 0 in
+    /// an MP4 cut with stream copy. `None` for anything else.
+    pub fn copy_from_ms(&self) -> Option<i64> {
+        self.copy_from_ms
+    }
+
     /// A last segment shorter than [`TAIL_MS`] is folded into the one
     /// before: the file's duration often runs a few milliseconds past its
     /// last video frame (the audio), and ffmpeg does not cut there.
@@ -123,10 +178,24 @@ impl Segments {
             starts_ms.pop();
         }
         Self {
-            starts_ms,
+            starts_ms: starts_ms.into(),
             total_ms,
             head,
+            copy_from_ms: None,
+            media: OnceLock::new(),
+            subtitles: OnceLock::new(),
         }
+    }
+
+    /// Where each segment starts, the first's at index 0.
+    pub fn starts_ms(&self) -> &[u64] {
+        &self.starts_ms
+    }
+
+    /// [`Segments::starts_ms`], shared rather than copied: the cuts a
+    /// remux ladder's lower rung is made to cut at, per run.
+    pub fn shared_starts(&self) -> Arc<[u64]> {
+        Arc::clone(&self.starts_ms)
     }
 
     /// The segment a run that is to write segment `n` starts at: `n`
@@ -159,14 +228,16 @@ impl Segments {
     /// The subtitle rendition's playlist (P2-07): WebVTT segments on the
     /// video's own cuts, so a cue is in the segment its picture is in.
     /// URIs (`subs3.vtt`) map to `ReadSubtitleSegment { n: 3 }`.
-    pub fn subtitle_playlist(&self) -> String {
-        self.playlist(None, "subs", "vtt")
+    pub fn subtitle_playlist(&self) -> &str {
+        self.subtitles
+            .get_or_init(|| self.playlist(None, "subs", "vtt"))
     }
 
     /// The VOD media playlist. Segment URIs are relative names
     /// (`seg3.m4s`) that a client maps to a segment read.
-    pub fn media_playlist(&self) -> String {
-        self.playlist(Some("init.mp4"), "seg", "m4s")
+    pub fn media_playlist(&self) -> &str {
+        self.media
+            .get_or_init(|| self.playlist(Some("init.mp4"), "seg", "m4s"))
     }
 
     fn playlist(&self, init: Option<&str>, name: &str, extension: &str) -> String {
@@ -654,7 +725,7 @@ mod tests {
     #[test]
     fn a_grid_covers_the_file_with_a_short_last_segment() {
         let s = Segments::grid(20_000);
-        assert_eq!(s.starts_ms, [0, 6000, 12_000, 18_000]);
+        assert_eq!(s.starts_ms(), [0, 6000, 12_000, 18_000]);
         assert_eq!(s.start(4), Some(18_000));
         assert_eq!(s.start(0), None);
         let playlist = s.media_playlist();
@@ -672,7 +743,7 @@ mod tests {
     #[test]
     fn an_encoded_grid_starts_with_two_second_segments() {
         let s = Segments::encoded(30_000);
-        assert_eq!(s.starts_ms, [0, 2000, 4000, 8000, 14_000, 20_000, 26_000]);
+        assert_eq!(s.starts_ms(), [0, 2000, 4000, 8000, 14_000, 20_000, 26_000]);
         assert_eq!(s.end(1), Some(2000));
         assert_eq!(s.start(4), Some(8000));
         assert_eq!(s.end(7), Some(30_000));
@@ -680,18 +751,19 @@ mod tests {
 
     #[test]
     fn a_short_encoded_film_keeps_what_of_the_head_it_reaches() {
-        assert_eq!(Segments::encoded(0).starts_ms, [0]);
-        assert_eq!(Segments::encoded(1_500).starts_ms, [0]);
-        assert_eq!(Segments::encoded(3_000).starts_ms, [0, 2000]);
-        assert_eq!(Segments::encoded(8_000).starts_ms, [0, 2000, 4000]);
-        assert_eq!(Segments::encoded(8_600).starts_ms, [0, 2000, 4000, 8000]);
+        assert_eq!(Segments::encoded(0).starts_ms(), [0]);
+        assert_eq!(Segments::encoded(1_500).starts_ms(), [0]);
+        assert_eq!(Segments::encoded(3_000).starts_ms(), [0, 2000]);
+        assert_eq!(Segments::encoded(8_000).starts_ms(), [0, 2000, 4000]);
+        assert_eq!(Segments::encoded(8_600).starts_ms(), [0, 2000, 4000, 8000]);
         // A sliver past the head joins its last segment.
-        assert_eq!(Segments::encoded(8_200).starts_ms, [0, 2000, 4000]);
+        assert_eq!(Segments::encoded(8_200).starts_ms(), [0, 2000, 4000]);
     }
 
     #[test]
     fn an_encoded_playlist_lists_the_short_head_and_the_longest_as_its_target() {
-        let playlist = Segments::encoded(20_000).media_playlist();
+        let segments = Segments::encoded(20_000);
+        let playlist = segments.media_playlist();
         let extinf: Vec<&str> = playlist
             .lines()
             .filter(|l| l.starts_with("#EXTINF:"))
@@ -729,12 +801,86 @@ mod tests {
         );
     }
 
+    /// Keyframes at uneven times (the run that showed the HLS muxer's
+    /// cuts drift on a resume).
+    fn uneven() -> KeyframeTimes {
+        KeyframeTimes {
+            times_ms: vec![0, 500, 3500, 3708, 4125, 4333, 5208, 6083, 9000],
+            first_ms: 0,
+        }
+    }
+
+    /// Review 2026-10-11 M2: a copied video is cut at the first keyframe
+    /// at least the setting's length past the last cut, from 0.
+    #[test]
+    fn a_copied_video_is_cut_at_the_first_keyframe_past_each_length() {
+        let one = Segments::copied(&uneven(), 12_000, 1);
+        assert_eq!(one.starts_ms(), [0, 3500, 5208, 9000]);
+        let two = Segments::copied(&uneven(), 12_000, 2);
+        assert_eq!(two.starts_ms(), [0, 3500, 6083, 9000]);
+        // Every one cut where a run from it starts it.
+        assert_eq!(two.run_from(3), 3);
+    }
+
+    /// An all-intra film: 2 s segments, not one per frame.
+    #[test]
+    fn an_all_intra_film_is_cut_every_two_seconds() {
+        // Two hours at 23.976 frames a second, every frame a keyframe.
+        let frames = 172_627u64;
+        let times_ms = (0..frames).map(|n| (n * 1001 + 12) / 24).collect();
+        let film = KeyframeTimes {
+            times_ms,
+            first_ms: 0,
+        };
+        let s = Segments::copied(&film, 7_200_000, 2);
+        // 48 frames, 2.002 s, each.
+        assert_eq!(s.count(), 3597);
+        let longest = (1..s.count()).map(|n| s.end(n).unwrap() - s.start(n).unwrap());
+        assert!(longest.clone().all(|d| (2000..2042).contains(&d)));
+    }
+
+    /// Keyframes further apart than the length: one segment each.
+    #[test]
+    fn sparse_keyframes_are_each_a_cut() {
+        let film = KeyframeTimes {
+            times_ms: vec![0, 5000, 10_000, 15_000],
+            first_ms: 0,
+        };
+        let s = Segments::copied(&film, 20_000, 2);
+        assert_eq!(s.starts_ms(), [0, 5000, 10_000, 15_000]);
+    }
+
+    /// The list and where a run from the start begins are the
+    /// conversion's: a keyframe before 0 (an MP4 cut with stream copy),
+    /// or a late one.
+    #[test]
+    fn a_copied_video_keeps_where_its_first_keyframe_is() {
+        let cut = KeyframeTimes {
+            times_ms: vec![0, 1960, 3960, 5960],
+            first_ms: -40,
+        };
+        let s = Segments::copied(&cut, 8000, 2);
+        assert_eq!(s.starts_ms(), [0, 3960, 5960]);
+        assert_eq!(s.copy_from_ms(), Some(-40));
+        let late = KeyframeTimes {
+            times_ms: vec![520, 2520, 4520],
+            first_ms: 520,
+        };
+        assert_eq!(Segments::copied(&late, 6000, 2).copy_from_ms(), Some(520));
+        // Cut by the HLS muxer: none.
+        assert_eq!(
+            Segments::at_keyframes(&[0, 2000], 4000).copy_from_ms(),
+            None
+        );
+        assert_eq!(Segments::encoded(30_000).copy_from_ms(), None);
+    }
+
     #[test]
     fn a_sliver_at_the_end_joins_the_last_segment() {
         // 30.005 s: the audio runs 5 ms past the last frame.
-        assert_eq!(Segments::grid(30_005).starts_ms.len(), 5);
+        assert_eq!(Segments::grid(30_005).starts_ms().len(), 5);
         assert_eq!(
-            Segments::at_keyframes(&[0, 2000, 4000], 4_010).starts_ms,
+            Segments::at_keyframes(&[0, 2000, 4000], 4_010).starts_ms(),
             [0, 2000]
         );
     }
@@ -742,7 +888,7 @@ mod tests {
     #[test]
     fn keyframes_are_the_cuts_and_the_first_segment_starts_at_zero() {
         let s = Segments::at_keyframes(&[0, 2000, 4000, 9000], 10_000);
-        assert_eq!(s.starts_ms, [0, 2000, 4000, 9000]);
+        assert_eq!(s.starts_ms(), [0, 2000, 4000, 9000]);
         let playlist = s.media_playlist();
         // The longest is 5 s (4000 to 9000).
         assert!(playlist.contains("#EXT-X-TARGETDURATION:5\n"), "{playlist}");
@@ -753,12 +899,26 @@ mod tests {
     #[test]
     fn a_late_first_keyframe_is_not_a_cut() {
         let s = Segments::at_keyframes(&[520, 2520, 4520, 6520, 8520], 10_000);
-        assert_eq!(s.starts_ms, [0, 2520, 4520, 6520, 8520]);
+        assert_eq!(s.starts_ms(), [0, 2520, 4520, 6520, 8520]);
+    }
+
+    /// Review 2026-10-11 M2: a copied film's playlist lists every source
+    /// GOP, megabytes for an all-intra one, and a player asks for it again
+    /// and again: it is written once, not per ask.
+    #[test]
+    fn a_playlist_is_written_once_and_handed_out_again() {
+        let s = Segments::at_keyframes(&[0, 2000, 4000, 9000], 10_000);
+        assert_eq!(s.media_playlist().as_ptr(), s.media_playlist().as_ptr());
+        assert_eq!(
+            s.subtitle_playlist().as_ptr(),
+            s.subtitle_playlist().as_ptr()
+        );
     }
 
     #[test]
     fn the_playlists_parse_as_hls() {
-        let media = Segments::grid(30_000).media_playlist();
+        let grid = Segments::grid(30_000);
+        let media = grid.media_playlist();
         match m3u8_rs::parse_playlist_res(media.as_bytes()).unwrap() {
             m3u8_rs::Playlist::MediaPlaylist(p) => {
                 assert_eq!(p.segments.len(), 5);
@@ -804,6 +964,7 @@ mod tests {
                 hdr: None,
                 dolby_vision: None,
                 bit_rate: None,
+                parameter_sets_in_record: false,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),

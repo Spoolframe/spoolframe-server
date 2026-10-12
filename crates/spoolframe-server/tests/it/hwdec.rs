@@ -270,6 +270,7 @@ async fn a_gpu_decode_that_fails_at_once_finishes_in_software() {
             scratch_dir: dir.join("scratch"),
             scratch_limit_bytes: 1 << 30,
             read_ahead: Duration::from_secs(600),
+            copy_segment_secs: 2,
             stalled_after: Duration::from_secs(60),
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,

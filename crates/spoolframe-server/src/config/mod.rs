@@ -730,8 +730,9 @@ impl PreviewsConfig {
 
 /// `transcode { gpus = [ { api = "nvenc"; pick = "all"; } ]; max_jobs = 2;
 /// max_remux = 32; max_gpu_jobs = 3; scratch_dir = "…"; scratch_limit_mb =
-/// 20480; read_ahead_secs = 60; gpu_filters = false; tone_map = "auto";
-/// video_codecs = ["av1", "hevc", "h264"]; }`, all optional.
+/// 20480; read_ahead_secs = 60; copy_segment_secs = 2; gpu_filters = false;
+/// tone_map = "auto"; video_codecs = ["av1", "hevc", "h264"]; }`, all
+/// optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct TranscodeConfig {
@@ -783,6 +784,14 @@ pub struct TranscodeConfig {
     /// Any value works: 0 holds the encode whenever its reader is behind.
     #[ucl(default)]
     pub read_ahead_secs: Option<u64>,
+    /// How long a copied (remuxed) video's HLS segments are at least, in
+    /// s: each is cut at the first keyframe this far past the last cut
+    /// (review 2026-10-11 M2). 2 if left out; 1 to 10. Shorter switches
+    /// quality and resumes sooner, for more requests and a longer
+    /// playlist. Encodes keep their own grid. A conversion keeps the
+    /// length it started with.
+    #[ucl(default)]
+    pub copy_segment_secs: Option<u64>,
     /// Run a GPU encode's filters on the GPU, where it can, rather than on
     /// the CPU: on VA-API the tone map (`tonemap_vaapi`) and picture
     /// burn-in (`overlay_vaapi`); on NVIDIA the scale (`scale_cuda`) and
@@ -1046,6 +1055,19 @@ impl TranscodeConfig {
                 ),
             });
         }
+        let copy_segment_secs = match self.copy_segment_secs.unwrap_or(2) {
+            secs @ 1..=10 => secs,
+            other => {
+                return Err(ConfigError::Invalid {
+                    key: "transcode.copy_segment_secs",
+                    message: format!(
+                        "{other} s: a copied video's segments are 1 to 10 s long; shorter ones \
+                         make more requests and a longer playlist, longer ones slower quality \
+                         switches and resumes"
+                    ),
+                });
+            }
+        };
         Ok(JobLimits {
             budget: crate::encode::Units::jobs(max_jobs),
             max_remux: max_remux as usize,
@@ -1053,6 +1075,7 @@ impl TranscodeConfig {
             scratch_dir,
             scratch_limit_bytes: self.scratch_limit_mb.unwrap_or(20 * 1024) << 20,
             read_ahead: Duration::from_secs(self.read_ahead_secs.unwrap_or(60)),
+            copy_segment_secs,
             stalled_after: crate::encode::job::STALLED_AFTER,
             gpu_filters: self.gpu_filters.unwrap_or(false),
             tone_map: self.tone_map()?,
@@ -2943,6 +2966,32 @@ mod tests {
         assert!(
             plex(r#"plex { url = "http://nas:32400"; } experimental { shared = true; }"#).is_err()
         );
+    }
+
+    /// Review 2026-10-11 M2: how long a copied video's HLS segments are,
+    /// at least: 2 s if left out, 1 to 10 s.
+    #[test]
+    fn a_copied_video_s_segment_length_is_one_to_ten_seconds() {
+        let secs = |value: Option<u64>| {
+            let section = value.map_or(String::new(), |v| format!("copy_segment_secs = {v};"));
+            plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} transcode {{ {section} }}"#
+            ))
+            .and_then(|config| config.transcode.limits(Path::new("/")))
+            .map(|limits| limits.copy_segment_secs)
+        };
+        assert_eq!(secs(None).unwrap(), 2);
+        assert_eq!(secs(Some(1)).unwrap(), 1);
+        assert_eq!(secs(Some(10)).unwrap(), 10);
+        for out in [0, 11] {
+            match secs(Some(out)) {
+                Err(ConfigError::Invalid { key, message }) => {
+                    assert_eq!(key, "transcode.copy_segment_secs");
+                    assert!(message.contains("1 to 10"), "{message}");
+                }
+                other => panic!("{out} s: {other:?}"),
+            }
+        }
     }
 
     #[test]

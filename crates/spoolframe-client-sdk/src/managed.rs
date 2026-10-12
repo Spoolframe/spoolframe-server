@@ -370,6 +370,10 @@ struct Inner {
     errors: broadcast::Sender<SdkError>,
     notify: Arc<Notify>,
     runtime: tokio::runtime::Handle,
+    /// Never sent: dropped with the playback, which ends the task that
+    /// follows the server's share events (B2). That task holds only a
+    /// weak reference, so nothing else would wake it.
+    gone: watch::Sender<()>,
 }
 
 /// A live playback with shared recovery, bounded progress reporting and cleanup.
@@ -400,14 +404,15 @@ impl Drop for Admission {
         }
     }
 }
+/// Start the playback on `runtime`: the caller's when it opens one, the
+/// playback's own when it starts one again (B5), whatever thread asks.
 async fn admitted(
+    runtime: tokio::runtime::Handle,
     backend: Arc<dyn PlaybackBackend>,
     item: MediaId,
     selection: Option<Selection>,
     options: PlaybackOptions,
 ) -> Result<Admission, SdkError> {
-    let runtime =
-        tokio::runtime::Handle::try_current().map_err(|e| SdkError::InvalidInput(e.to_string()))?;
     let (send, receive) = oneshot::channel();
     runtime.clone().spawn(async move {
         let answer = backend
@@ -521,8 +526,16 @@ impl ManagedPlayback {
         selection: Option<Selection>,
         options: PlaybackOptions,
     ) -> Result<Self, SdkError> {
-        let mut admission =
-            admitted(backend.clone(), item.clone(), selection, options.clone()).await?;
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|e| SdkError::InvalidInput(e.to_string()))?;
+        let mut admission = admitted(
+            runtime,
+            backend.clone(),
+            item.clone(),
+            selection,
+            options.clone(),
+        )
+        .await?;
         let playback = admission.playback.take().expect("admitted playback");
         Ok(Self::adopt(backend, item, selection, options, playback))
     }
@@ -570,15 +583,22 @@ impl ManagedPlayback {
             errors,
             notify: notify.clone(),
             runtime: tokio::runtime::Handle::current(),
+            gone: watch::Sender::new(()),
         });
         // A share of the server's uplink that moved (PX-46): a playback in
         // Auto plans itself again where the viewer is, as the viewer's own
         // quality change would.
         if let Some(mut shares) = inner.backend.shares() {
             let weak = Arc::downgrade(&inner);
+            let mut gone = inner.gone.subscribe();
             inner.runtime.spawn(async move {
                 loop {
-                    let share = match shares.recv().await {
+                    let received = tokio::select! {
+                        received = shares.recv() => received,
+                        // Only ever an error: the playback was dropped.
+                        _ = gone.changed() => return,
+                    };
+                    let share = match received {
                         Ok(share) => share,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => return,
@@ -912,12 +932,19 @@ impl ManagedPlayback {
     }
 
     /// Segment `n` of rung `variant` was opened from 0 under `opened`.
+    /// Opens can finish out of order: one made before a seek or a resume
+    /// may answer after one made since. The newest encode is kept (B3).
+    /// The generation goes up with every new encode, under the handle or
+    /// with a new one, so it alone orders them.
     fn opened_segment(&self, variant: u32, n: u32, opened: &Opened) {
-        self.0
-            .state
-            .lock()
+        let mut state = self.0.state.lock();
+        let entry = state
             .segment_reads
-            .insert((variant, n), opened.clone());
+            .entry((variant, n))
+            .or_insert_with(|| opened.clone());
+        if opened.generation > entry.generation {
+            *entry = opened.clone();
+        }
     }
 
     /// The live playback for a read of the rest of segment `n` that names
@@ -1139,6 +1166,7 @@ impl ManagedPlayback {
             (state.playback.clone(), state.selection, options)
         };
         let admission = admitted(
+            self.0.runtime.clone(),
             self.0.backend.clone(),
             self.0.item.clone(),
             selection,
@@ -1313,24 +1341,32 @@ impl ManagedPlayback {
         if self.quality() != PlaybackQuality::Auto {
             return self.live();
         }
-        self.flush_locked().await?;
+        let flushed = self.flush_locked().await;
         let p = self.live()?;
         let (position, bitmap) = {
             let state = self.0.state.lock();
             (state.position.unwrap_or_default(), state.options.bitmap)
         };
-        let changed = match self
-            .0
-            .backend
-            .limit(&p.handle, link_bitrate, bitmap, position)
-            .await
-        {
+        // A flush that finds the playback ended goes the way the server's
+        // own PlaybackExpired does (B4), as for every other control.
+        let answer = match flushed {
+            Ok(()) => {
+                self.0
+                    .backend
+                    .limit(&p.handle, link_bitrate, bitmap, position)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let changed = match answer {
             Ok(changed) => changed,
             // Started again where the viewer was: the start carries the
             // link's rate, so it is planned for it as well.
             Err(SdkError::PlaybackExpired) => {
                 self.restart_locked(&p.handle, Restart::Control { at: position })
                     .await?;
+                self.0.state.lock().position = Some(position);
+                self.flush_locked().await?;
                 return Ok(self.snapshot());
             }
             Err(error) => return Err(error),
@@ -1866,6 +1902,95 @@ mod tests {
             "{:?}",
             b.events.lock()
         );
+    }
+
+    /// B2: the task that follows the server's share events ends with the
+    /// playback, instead of staying parked on a channel that never closes
+    /// (one task per playback opened, for the life of the app).
+    #[tokio::test]
+    async fn the_share_task_ends_when_the_playback_is_dropped() {
+        let b = Arc::new(Backend::default());
+        let (shares, _) = broadcast::channel(4);
+        *b.shares.lock() = Some(shares.clone());
+        let p = open(b.clone()).await;
+        assert_eq!(shares.receiver_count(), 1);
+        drop(p);
+        until(|| shares.receiver_count() == 0).await;
+    }
+
+    /// B3: two opens of one segment from 0, either side of a seek, whose
+    /// answers come back in the wrong order. The older one, recorded
+    /// last, must not hide the newer: a read of the rest in the current
+    /// encode goes on.
+    #[tokio::test]
+    async fn a_late_older_open_of_a_segment_does_not_hide_a_newer_one() {
+        let b = Arc::new(Backend::default());
+        let p = open(b).await;
+        let older = Opened::now(&p.0.state.lock());
+        p.seek(Duration::from_secs(10)).await.unwrap();
+        let newer = Opened::now(&p.0.state.lock());
+        p.opened_segment(0, 1, &newer);
+        p.opened_segment(0, 1, &older);
+        assert_eq!(p.rest_of(0, 1, None).map(|(_, o)| o), Ok(newer));
+    }
+
+    /// B4: a re-plan for the link whose progress report finds the
+    /// playback ended starts it again where the viewer was, as a seek or
+    /// a quality change does, instead of failing with PlaybackExpired.
+    #[tokio::test]
+    async fn a_limit_that_finds_the_playback_ended_starts_it_again() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        b.expired.store(true, SeqCst);
+        p.report_position(Duration::from_secs(42)).unwrap();
+        let limited = p.limit(1_000_000).await.map(|p| p.handle);
+        assert_eq!(limited, Ok(PlaybackHandle("2".into())));
+        assert!(
+            b.events.lock().contains(&"progress:2:42".into()),
+            "{:?}",
+            b.events.lock()
+        );
+    }
+
+    /// Poll `future` to its end on this thread, with no Tokio runtime
+    /// entered: as a player's own thread calls the SDK.
+    fn block_on_plain_thread<F: Future>(future: F) -> F::Output {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Arc::new(Unpark(std::thread::current())).into();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let std::task::Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+                return out;
+            }
+            std::thread::park();
+        }
+    }
+
+    /// B5: a read from a thread outside any Tokio runtime that finds the
+    /// playback ended resumes it on the playback's own runtime, instead
+    /// of failing with InvalidInput.
+    #[test]
+    fn a_resume_from_outside_a_runtime_starts_the_playback_again() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let b = Arc::new(Backend::default());
+        let p = runtime.block_on(open(b.clone()));
+        b.expired.store(true, SeqCst);
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let read = block_on_plain_thread(p.read(0, 1));
+        assert_eq!(read, Ok(vec![42]));
+        assert_eq!(p.snapshot().handle, PlaybackHandle("2".into()));
+        drop(p);
+        drop(runtime);
     }
 
     #[test]

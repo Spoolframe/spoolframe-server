@@ -170,13 +170,7 @@ impl fmt::Debug for PortableRoot {
 /// The phrase as typed, made canonical: trimmed, single-spaced, lower
 /// case. Then BIP-39's own checks: its count, its words, its checksum.
 fn parse(phrase: &str) -> Result<Mnemonic, PhraseError> {
-    let normalized = Zeroizing::new(
-        phrase
-            .split_whitespace()
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
+    let normalized = normalized(phrase);
     let found = normalized.split(' ').filter(|w| !w.is_empty()).count();
     if found != PHRASE_WORDS {
         return Err(PhraseError::WordCount { found });
@@ -188,6 +182,63 @@ fn parse(phrase: &str) -> Result<Mnemonic, PhraseError> {
         bip39::Error::BadWordCount(found) => PhraseError::WordCount { found },
         _ => PhraseError::Checksum,
     })
+}
+
+/// `phrase` trimmed, single-spaced and lower case, written straight into
+/// one zeroized buffer (P8): no word is copied anywhere else on the heap,
+/// and the buffer is sized first, so it never grows and leaves a freed
+/// copy behind.
+fn normalized(phrase: &str) -> Zeroizing<String> {
+    fn lower(word: &str) -> impl Iterator<Item = char> + '_ {
+        word.chars().flat_map(char::to_lowercase)
+    }
+    let len: usize = phrase
+        .split_whitespace()
+        .map(|word| lower(word).map(char::len_utf8).sum::<usize>() + 1)
+        .sum();
+    let mut out = Zeroizing::new(String::with_capacity(len));
+    let start = out.as_ptr();
+    for word in phrase.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.extend(lower(word));
+    }
+    debug_assert_eq!(out.as_ptr(), start, "the phrase's buffer grew");
+    out
+}
+
+/// A guest on this device ([`Portable::guests`]), with where and when it
+/// was last paired onto it ([`Portable::guest_pairings`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestPairing {
+    pub id: PortableUserId,
+    /// The server the pairing was for: the one a pairing through a server
+    /// went through, or the first server a QR pairing's phone handed
+    /// ([`crate::Paired::servers`]). `None` when there was none, and for
+    /// a guest paired before the SDK kept it.
+    pub server: Option<GuestServer>,
+    /// When it was last paired onto this device, Unix seconds. `None` for
+    /// a guest paired before the SDK kept it.
+    pub paired_at: Option<u64>,
+}
+
+/// The server a guest was paired for ([`GuestPairing::server`]), as this
+/// device knew it then.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestServer {
+    /// Its key, 64 hex digits: a saved server's
+    /// [`crate::ServerEntry::endpoint_id`].
+    pub endpoint_id: String,
+    /// Its name, as saved or as it said in its Hello at the time.
+    pub name: String,
+}
+
+/// What [`keys::portable_paired`] holds.
+#[derive(Serialize, Deserialize)]
+struct PairedRecord {
+    server: Option<GuestServer>,
+    paired_at: u64,
 }
 
 /// Which of this device's keys a credential being installed is for.
@@ -343,6 +394,9 @@ impl Portable {
         storage
             .set_secret(&keys::portable_device(&id.to_string()), None)
             .await?;
+        storage
+            .set_data(&keys::portable_paired(&id.to_string()), None)
+            .await?;
         // The root before the entry: should the list then fail to save,
         // an entry with no root stays, which forgetting again clears,
         // rather than a root nothing lists.
@@ -414,6 +468,11 @@ impl Portable {
     ) -> Result<UserDeviceCredential, SdkError> {
         let storage = self.storage.as_ref();
         let root = self.load_root(id).await?;
+        // A phrase root the identity removed (P7-08) is kept here, but
+        // signs nothing more: devices refuse what it signs.
+        if !self.roots(id).await?.holds(&RootKey::phrase_of(&id)) {
+            return Err(SdkError::NotARoot);
+        }
         let _saving = self.saving.lock().await;
         if is_revoked(storage, id, &device_key).await? {
             return Err(SdkError::DeviceKeyRevoked);
@@ -827,14 +886,16 @@ impl Portable {
         let message = tie_message(server, nonce, &id, username)
             .ok_or_else(|| SdkError::Protocol("the account's username is too long".into()))?;
         match self.load_root(id).await {
-            Ok(root) => {
+            // A phrase root the identity removed (P7-08) signs no tie: the
+            // device's credential, from a root it still has, does.
+            Ok(root) if self.roots(id).await?.holds(&RootKey::phrase_of(&id)) => {
                 return Ok(TieProof::Root {
                     signature: root.sign(&message).into(),
                     root: None,
                     genesis: None,
                 });
             }
-            Err(SdkError::UnknownIdentity(_)) => {}
+            Ok(_) | Err(SdkError::UnknownIdentity(_)) => {}
             Err(e) => return Err(e),
         }
         let storage = self.storage.as_ref();
@@ -894,9 +955,54 @@ impl Portable {
         Ok(())
     }
 
+    /// [`Portable::guests`], each with the server it was paired for and
+    /// when: for a "Shared computer" row, "server name · date". A guest
+    /// paired before the SDK kept these has `None` for both.
+    pub async fn guest_pairings(&self) -> Result<Vec<GuestPairing>, SdkError> {
+        let storage = self.storage.as_ref();
+        let mut listed = Vec::new();
+        for id in self.guests().await? {
+            let key = keys::portable_paired(&id.to_string());
+            let record = match storage.data(&key).await? {
+                None => None,
+                Some(bytes) => {
+                    Some(serde_json::from_slice::<PairedRecord>(&bytes).map_err(|e| {
+                        StorageError(format!("the pairing of guest {id} cannot be read: {e}"))
+                    })?)
+                }
+            };
+            listed.push(GuestPairing {
+                id,
+                server: record.as_ref().and_then(|r| r.server.clone()),
+                paired_at: record.map(|r| r.paired_at),
+            });
+        }
+        Ok(listed)
+    }
+
+    /// Guest `id` was paired onto this device just now, for `server` if
+    /// one was known: kept for [`Portable::guest_pairings`], in place of
+    /// an earlier pairing's.
+    pub(crate) async fn note_paired(
+        &self,
+        id: PortableUserId,
+        server: Option<GuestServer>,
+    ) -> Result<(), SdkError> {
+        let record = PairedRecord {
+            server,
+            paired_at: now(),
+        };
+        let bytes = serde_json::to_vec(&record).expect("a pairing record serializes");
+        self.storage
+            .set_data(&keys::portable_paired(&id.to_string()), Some(bytes))
+            .await?;
+        Ok(())
+    }
+
     /// The identities this device holds a credential for but not the root
     /// of: the guests paired onto it, oldest id first. Each signs out on
-    /// its own ([`Portable::forget_guest`]).
+    /// its own ([`Portable::forget_guest`]). [`Portable::guest_pairings`]
+    /// says where and when each was paired.
     pub async fn guests(&self) -> Result<Vec<PortableUserId>, SdkError> {
         let storage = self.storage.as_ref();
         let mut guests = Vec::new();
@@ -939,6 +1045,9 @@ impl Portable {
             .await?;
         storage
             .set_data(&keys::portable_state(&id.to_string()), None)
+            .await?;
+        storage
+            .set_data(&keys::portable_paired(&id.to_string()), None)
             .await?;
         tracing::info!(%id, "forgot a guest");
         Ok(())
@@ -1249,6 +1358,15 @@ mod tests {
             PortableRoot::recover(&messy).unwrap().id().to_string(),
             ZERO_PHRASE_ID
         );
+    }
+
+    /// P8: the buffer is sized before it is written, even for a letter
+    /// whose lower case is longer than it ("İ", 2 bytes, is "i̇", 3), so
+    /// it never grows and leaves an unzeroized copy of the phrase behind.
+    #[test]
+    fn a_phrase_is_normalized_into_a_buffer_that_never_grows() {
+        let out = normalized("  ABANDON\t\u{130}x \n art ");
+        assert_eq!(out.as_str(), "abandon i\u{307}x art");
     }
 
     #[test]

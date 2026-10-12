@@ -4,6 +4,7 @@
 //! a module here, never as a new file under `tests/`.
 
 mod addresses;
+mod closing;
 mod leave;
 mod one_time_password;
 mod reachability;

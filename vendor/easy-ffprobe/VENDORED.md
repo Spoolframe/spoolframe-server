@@ -23,6 +23,10 @@ output with `serde_json::from_slice::<FfProbe>`.
   (was a required `String`). ffprobe's JSON leaves it out for a codec it
   does not know (`print_str_opt`), so upstream failed the whole file on
   one such stream.
+- `Stream::extradata` (`Option<String>`, absent by default) is added:
+  ffprobe prints a stream's codec record with `-show_data`, as a hex
+  dump. Spoolframe reads it to tell whether an H.264 or HEVC record holds
+  the stream's parameter sets.
 - The `async` feature and `ffprobe_async*` are removed. They ignored
   `Config::ffprobe_bin` (always ran `ffprobe` from `PATH`) and had no
   timeout; Spoolframe runs the process itself.

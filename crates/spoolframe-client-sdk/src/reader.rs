@@ -603,7 +603,8 @@ impl Shared {
     /// Through a long underrun: when the link's measured rate cannot
     /// carry the file (its share of the link, [`LINK_SHARE`], is under
     /// the file's bitrate), ask once for the playback to be planned for
-    /// the link (P6-06). A new plan ends this reader: its reads are then
+    /// the link (P6-06); an ask that failed is made again at the stall's
+    /// next check, while it lasts. A new plan ends this reader: its reads are then
     /// [`BackendError::PlaybackRestarted`], and the player makes a new
     /// one from the playback's snapshot, as after a subtitle change.
     fn limit_if_too_slow(&self, this: &Arc<Self>, state: &mut State) {
@@ -634,8 +635,10 @@ impl Shared {
                     shared.changed.notify_all();
                 }
                 Ok(_) => {}
+                // Not asked after all (B4): the stall may ask again.
                 Err(error) => {
                     tracing::warn!(%error, "could not plan the playback for its link");
+                    shared.lock().limit_asked = false;
                 }
             }
         }));
@@ -1081,6 +1084,32 @@ mod tests {
             }))
         );
         assert_eq!(*session.limits.lock(), [8 << 20]);
+    }
+
+    /// B4: an ask for a plan that fails does not use up the reader's one
+    /// ask: the stall asks again, and the next plan ends the reader.
+    #[test]
+    fn a_failed_ask_for_a_plan_is_asked_again() {
+        let (reader, session) =
+            stalling_reader("reader-limit-again", 1 << 20, Duration::from_secs(2));
+        session
+            .fail_next_limit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        reader.read(BLOCK - 100, 100).unwrap();
+        let reader = Arc::new(reader);
+        let flusher = reader.clone();
+        // Ends the read should the reader never ask again.
+        std::thread::spawn(move || {
+            std::thread::sleep(LIMIT_AFTER + Duration::from_secs(5));
+            flusher.set_flushing(true);
+        });
+        assert_eq!(
+            reader.read(BLOCK, 100),
+            Err(ReadError::Backend(BackendError::PlaybackRestarted {
+                epoch: 1
+            }))
+        );
+        assert_eq!(session.limits.lock().len(), 2);
     }
 
     /// Original quality was the viewer's choice: the link does not

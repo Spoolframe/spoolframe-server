@@ -30,8 +30,8 @@ use crate::SdkError;
 use crate::client::{Client, parse_id};
 use crate::pairing::Paired;
 use crate::portable::{
-    DeviceKey, DevicePublicKey, IdentityRecord, PortableIdentityState, PortableUserId, RootSigner,
-    SecurityKey, SecurityKeyError, UserDeviceCredential,
+    DeviceKey, DevicePublicKey, GuestServer, IdentityRecord, PortableIdentityState, PortableUserId,
+    RootSigner, SecurityKey, SecurityKeyError, UserDeviceCredential,
 };
 use spoolframe_protocol::portable::{HANDLE_LEN, PORTABLE_RP, root_set};
 
@@ -94,6 +94,9 @@ pub struct RelayAnswer {
     credential: UserDeviceCredential,
     state: Option<PortableIdentityState>,
     servers: Vec<PairedServer>,
+    /// The server the pairing went through: the guest's
+    /// [`crate::GuestPairing::server`].
+    server: EndpointId,
 }
 
 impl RelayAnswer {
@@ -231,9 +234,7 @@ impl Client {
         name: &str,
     ) -> Result<RelayPairing, SdkError> {
         let server = parse_id(endpoint_id)?;
-        if !self.portable().allow_guests().await? {
-            return Err(crate::pairing::PairingError::NotAllowed.into());
-        }
+        self.guests_allowed().await?;
         let device_key = self.portable().pending_device_key().await?;
         let mut random = [0u8; RELAY_CODE_LEN];
         getrandom::fill(&mut random).expect("the OS gives random bytes");
@@ -255,14 +256,45 @@ impl Client {
         })
     }
 
+    /// Server `id`'s name: as saved here, else as its latest Hello on
+    /// this run said. `None` if neither is known.
+    async fn server_name(&self, id: EndpointId) -> Option<String> {
+        let saved = match crate::servers::load(self.inner.storage.as_ref()).await {
+            Ok(saved) => saved,
+            Err(e) => {
+                tracing::warn!(server = %id, error = %e, "cannot read the saved servers");
+                Vec::new()
+            }
+        };
+        saved
+            .into_iter()
+            .find(|s| s.endpoint_id == id.to_string())
+            .map(|s| s.name)
+            .or_else(|| self.hello(id).map(|info| info.name))
+    }
+
+    /// [`crate::pairing::PairingError::NotAllowed`] unless this device
+    /// allows guests now: checked at each step of a relay pairing (P5),
+    /// since the person may turn guests off while one is under way.
+    async fn guests_allowed(&self) -> Result<(), SdkError> {
+        if self.portable().allow_guests().await? {
+            Ok(())
+        } else {
+            Err(crate::pairing::PairingError::NotAllowed.into())
+        }
+    }
+
     /// Device: the answer to `pairing`, if one came: checked (a
     /// credential for this device's key that holds, signed by one of its
     /// identity's roots, with a state of that identity) but not kept.
     /// `None` while there is none yet; ask again in a few seconds.
+    /// [`crate::pairing::PairingError::NotAllowed`] once guests were
+    /// turned off since the offer, as a pairing by QR refuses then.
     pub async fn collect_relay_pairing(
         &self,
         pairing: &RelayPairing,
     ) -> Result<Option<RelayAnswer>, SdkError> {
+        self.guests_allowed().await?;
         let answer = match self
             .call(
                 pairing.server,
@@ -325,14 +357,17 @@ impl Client {
             credential,
             state,
             servers,
+            server: pairing.server,
         }))
     }
 
     /// Device: keep `answer`, once the person said it is their identity:
     /// the pending key becomes this device's key for it, the credential
     /// and state are installed, and the servers saved as a pairing saves
-    /// them ([`Paired::servers`]).
+    /// them ([`Paired::servers`]). [`crate::pairing::PairingError::NotAllowed`]
+    /// once guests were turned off since the offer: nothing is kept.
     pub async fn accept_relay_pairing(&self, answer: RelayAnswer) -> Result<Paired, SdkError> {
+        self.guests_allowed().await?;
         let portable = self.portable();
         let identity = answer.identity;
         let device_key = answer.credential.device_key;
@@ -343,6 +378,16 @@ impl Client {
             .install_with_state_for(answer.credential, answer.state, DeviceKey::Pending)
             .await?;
         let servers = self.save_paired_servers(answer.servers).await?;
+        let server = self
+            .server_name(answer.server)
+            .await
+            .map(|name| GuestServer {
+                endpoint_id: answer.server.to_string(),
+                name,
+            });
+        if let Err(e) = self.portable().note_paired(identity, server).await {
+            tracing::warn!(%identity, error = %e, "could not keep where the guest was paired");
+        }
         tracing::info!(%identity, %device_key, "paired through a server");
         Ok(Paired {
             identity,
@@ -509,6 +554,7 @@ mod tests {
             credential: stale_credential,
             state: None,
             servers: Vec::new(),
+            server: iroh::SecretKey::generate().public(),
         };
         assert!(tv.accept_relay_pairing(answer).await.is_err());
 
@@ -523,6 +569,98 @@ mod tests {
             spoolframe_protocol::portable::verify_device_proof(&sent, &SERVER, &NONCE, &signature),
             Ok(())
         );
+        tv.close().await;
+    }
+
+    /// P5: guests turned off after the offer refuse the answer: nothing
+    /// is collected, and nothing accepted.
+    #[tokio::test]
+    async fn guests_turned_off_after_the_offer_refuse_the_answer() {
+        let phone = Portable::new(Arc::new(MemoryStorage::default()));
+        let (id, _phrase) = phone.create("Sam").await.unwrap();
+        let tv = tv().await;
+        let guest = tv.portable();
+        guest.set_allow_guests(true).await.unwrap();
+        let pending = guest.pending_device_key().await.unwrap();
+        let credential = phone.issue_credential(id, pending, None).await.unwrap();
+        let pairing = RelayPairing {
+            server: iroh::SecretKey::generate().public(),
+            code: RelayCode::from_random([7; RELAY_CODE_LEN]),
+            device_key: pending,
+            expires_at: Instant::now() + Duration::from_secs(60),
+        };
+        guest.set_allow_guests(false).await.unwrap();
+
+        let collected = tv.collect_relay_pairing(&pairing).await;
+        assert!(
+            matches!(
+                collected,
+                Err(SdkError::Pairing(crate::pairing::PairingError::NotAllowed))
+            ),
+            "{collected:?}"
+        );
+        let answer = RelayAnswer {
+            identity: id,
+            credential,
+            state: None,
+            servers: Vec::new(),
+            server: pairing.server,
+        };
+        let accepted = tv.accept_relay_pairing(answer).await;
+        assert!(
+            matches!(
+                accepted,
+                Err(SdkError::Pairing(crate::pairing::PairingError::NotAllowed))
+            ),
+            "{accepted:?}"
+        );
+        assert_eq!(guest.credential(id).await.unwrap(), None);
+        tv.close().await;
+    }
+
+    /// #6: a guest accepted through a server is listed with that server,
+    /// by the name it is saved under, and when.
+    #[tokio::test]
+    async fn a_guest_paired_through_a_server_is_listed_with_it() {
+        let phone = Portable::new(Arc::new(MemoryStorage::default()));
+        let (id, _phrase) = phone.create("Sam").await.unwrap();
+        let tv = tv().await;
+        let guest = tv.portable();
+        guest.set_allow_guests(true).await.unwrap();
+        let server = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let storage = tv.inner.storage.as_ref();
+        crate::servers::save(
+            storage,
+            &[crate::servers::SavedServer::pinned_now(
+                "Friend's server".into(),
+                server.to_string(),
+                "friend-id".into(),
+                Vec::new(),
+                true,
+            )],
+        )
+        .await
+        .unwrap();
+        let pending = guest.pending_device_key().await.unwrap();
+        let credential = phone.issue_credential(id, pending, None).await.unwrap();
+        let answer = RelayAnswer {
+            identity: id,
+            credential,
+            state: None,
+            servers: Vec::new(),
+            server,
+        };
+        tv.accept_relay_pairing(answer).await.unwrap();
+        let listed = guest.guest_pairings().await.unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(
+            listed[0].server,
+            Some(crate::portable::GuestServer {
+                endpoint_id: server.to_string(),
+                name: "Friend's server".into(),
+            })
+        );
+        assert!(listed[0].paired_at.is_some());
         tv.close().await;
     }
 }

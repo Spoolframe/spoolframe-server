@@ -1398,7 +1398,17 @@ impl Supervisor {
                         // A job just held back for its reader writes no
                         // more: what it cannot free now it can once the
                         // reader has moved on and it writes again.
-                        if !self.make_room().await && !self.shared.paused.load(Ordering::Relaxed) {
+                        // Nor is an HLS run before its first segment: it has
+                        // nothing yet for its reader, whose wait is what
+                        // frees the space (the segment muxer writes its
+                        // init at once; the HLS muxer wrote nothing until
+                        // then).
+                        let begun = matches!(self.written, Written::Progressive { .. })
+                            || last_segment.is_some();
+                        if !self.make_room().await
+                            && !self.shared.paused.load(Ordering::Relaxed)
+                            && begun
+                        {
                             let _ = child.start_kill();
                             let _ = child.wait().await;
                             return Ended::ScratchFull;
@@ -1647,11 +1657,11 @@ fn measure_listed(written: &Written, dir: &Path) -> (u64, Vec<(u32, u64)>) {
                     .map(|e| e.metadata().map_or(0, |m| m.len()))
                     .sum()
             });
-            // Not the segment files: in fMP4 mode ffmpeg writes a segment's
-            // file only as it closes it, so a file that exists may still be
-            // half written, and the one being encoded does not exist yet.
-            // ffmpeg's playlist is replaced (written aside, then renamed)
-            // right after each segment is closed.
+            // Not the segment files: the HLS muxer writes a segment's file
+            // only as it closes it, the segment muxer as it goes, so a
+            // file that exists may still be half written. Either's list is
+            // replaced (written aside, then renamed) right after each
+            // segment is closed.
             let listed = std::fs::read_to_string(dir.join(PLAYLIST))
                 .map(|text| listed_segments(&text))
                 .unwrap_or_default();
@@ -1678,7 +1688,7 @@ fn dir_size(dir: &Path) -> u64 {
 
 /// Each `seg<n>.m4s` an ffmpeg HLS playlist lists, with the duration its
 /// `#EXTINF` gives it, ms.
-fn listed_segments(playlist: &str) -> Vec<(u32, u64)> {
+pub(super) fn listed_segments(playlist: &str) -> Vec<(u32, u64)> {
     let mut listed = Vec::new();
     let mut duration = None;
     for line in playlist.lines() {
@@ -1942,6 +1952,7 @@ pub(super) mod tests {
             scratch_dir: tmp.as_ref().join("scratch"),
             scratch_limit_bytes: 1 << 30,
             read_ahead: Duration::from_secs(60),
+            copy_segment_secs: 2,
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
@@ -1954,6 +1965,7 @@ pub(super) mod tests {
             max_gpu_jobs: 1,
             scratch_dir: tmp.as_ref().join("elsewhere"),
             read_ahead: Duration::from_secs(5),
+            copy_segment_secs: 2,
             ..limits.clone()
         });
         let now = jobs.limits();
@@ -2094,6 +2106,7 @@ pub(super) mod tests {
             scratch_dir: root.join("scratch"),
             scratch_limit_bytes: 1 << 30,
             read_ahead,
+            copy_segment_secs: 2,
             stalled_after,
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
@@ -3022,6 +3035,7 @@ pub(super) mod tests {
             scratch_dir: root.join("scratch"),
             scratch_limit_bytes: scratch_limit,
             read_ahead: Duration::from_secs(60),
+            copy_segment_secs: 2,
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
@@ -3089,6 +3103,39 @@ pub(super) mod tests {
         assert_eq!(quiet.progress().borrow().done, None);
         assert!(alive(quiet.pid()));
         assert!(kept.exists());
+    }
+
+    /// The segment muxer writes a run's `init.mp4` as it starts, where the
+    /// HLS muxer kept everything in memory until its first segment was
+    /// done. A run restarted beside the one it replaces (kept, stopped,
+    /// with its segments) was ended for a full space before it had a
+    /// segment to give its reader. Before its first segment it is not.
+    #[tokio::test]
+    async fn an_hls_run_is_not_ended_for_a_full_space_before_its_first_segment() {
+        let (jobs, _dir) = jobs_within(
+            "full-before-first",
+            &format!(
+                "while :; do head -c 100 /dev/zero >> \"$1/init.mp4\"\n\
+                 [ -e \"$1/go\" ] && printf 'seg1.m4s\\n' > \"$1/{PLAYLIST}\"\n\
+                 sleep 0.01; done"
+            ),
+            20_000,
+        )
+        .await;
+        let other = jobs.dir().join("c/0");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("out.mkv"), vec![0; 30_000]).unwrap();
+        let dir = jobs.dir().join("a").join("0");
+        let args = vec![dir.display().to_string()];
+        let job = jobs
+            .start(dir.clone(), args, Written::Hls, Load::Remux, 0, 1, 0, None)
+            .unwrap();
+        looked(&job, 3).await;
+        assert_eq!(job.progress().borrow().done, None);
+        // Its first segment done, the space is still full and nothing is
+        // behind its reader: it is the one that fails.
+        std::fs::write(dir.join("go"), b"").unwrap();
+        assert_eq!(done(&job).await.unwrap_err(), FULL);
     }
 
     /// Writes segments 1 to 8 of 1000 bytes into `dir`, as ffmpeg would,
@@ -3230,6 +3277,7 @@ pub(super) mod tests {
             scratch_dir: root.join("scratch"),
             scratch_limit_bytes: 1 << 30,
             read_ahead: Duration::from_secs(60),
+            copy_segment_secs: 2,
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
@@ -3259,6 +3307,7 @@ pub(super) mod tests {
             scratch_dir: root.join("state"),
             scratch_limit_bytes: 1 << 30,
             read_ahead: Duration::from_secs(60),
+            copy_segment_secs: 2,
             stalled_after: STALLED_AFTER,
             gpu_filters: false,
             tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,

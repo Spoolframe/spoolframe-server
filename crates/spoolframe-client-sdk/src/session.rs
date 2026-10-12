@@ -2,6 +2,8 @@
 //! sessions share the device's connection to that server; every call says
 //! which session it is made in.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use iroh::EndpointId;
@@ -454,8 +456,9 @@ pub struct Session {
     /// than made ([`crate::Client::profiles`]).
     pub(crate) remembered: Option<bool>,
     /// Signed in with a one-time password an admin reset to: the session
-    /// may only change the password or sign out until it does.
-    pub(crate) password_change_required: bool,
+    /// may only change the password or sign out until it does. Shared by
+    /// every clone, so a change made through one is seen by all (C5).
+    pub(crate) password_change_required: Arc<AtomicBool>,
 }
 
 /// A profile explicitly selected by the application. All session operations
@@ -1109,9 +1112,12 @@ impl Session {
         self.done(Request::Untie).await
     }
 
-    /// Leave this server (PX-47), then forget it on this device: its pin,
-    /// every session and profile kept for it here ([`crate::Client::forget`]).
-    /// This session ends with it, on the server and here.
+    /// Leave this server (PX-47). Once the server says it is done, this
+    /// device removes this profile, and forgets the server when no other
+    /// profile is kept for it ([`crate::Client::forget`]: its pin too).
+    /// On a shared device, another user's profile and session on the
+    /// server stay, and so does the pin. This session ends, on the server
+    /// and here.
     ///
     /// What the server does depends on who signed in. A portable user's
     /// grant goes, and its watch history and settings there are deleted;
@@ -1127,7 +1133,9 @@ impl Session {
     /// refused leave changes nothing, here or on the server.
     pub async fn leave_server(&self) -> Result<(), SdkError> {
         self.done(Request::LeaveServer).await?;
-        self.client.forget(&self.server.to_string()).await
+        self.client
+            .left(self.server, &self.token, &self.user.username)
+            .await
     }
 
     /// Whether the user may leave this server ([`Session::leave_server`]),
@@ -1177,7 +1185,7 @@ impl Session {
     /// found again ([`crate::Client::profiles`]); such a one answers its
     /// first request with that error instead.
     pub fn password_change_required(&self) -> bool {
-        self.password_change_required
+        self.password_change_required.load(Ordering::Relaxed)
     }
 
     /// Change this user's password from `current` to `new`. A wrong
@@ -1194,7 +1202,11 @@ impl Session {
             new_password: new.to_owned(),
         });
         match self.call(request).await? {
-            Reply::Done => Ok(()),
+            Reply::Done => {
+                self.password_change_required
+                    .store(false, Ordering::Relaxed);
+                Ok(())
+            }
             other => Err(unexpected(other)),
         }
     }

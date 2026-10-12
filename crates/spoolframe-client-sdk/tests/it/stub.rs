@@ -462,6 +462,14 @@ fn answer(
     envelope: spoolframe_protocol::RequestEnvelope,
 ) -> Response {
     let web_url = state.web_url.lock().clone();
+    // Alice's session is "stub-session"; anyone else's names them, so two
+    // profiles on one device are two sessions.
+    let username = envelope
+        .session
+        .as_ref()
+        .and_then(|s| s.0.strip_prefix("stub-session-"))
+        .unwrap_or("alice")
+        .to_owned();
     // Made from its key: two stubs are two servers (PX-14).
     let server_id = state.server_id.lock().clone().unwrap_or_else(|| {
         spoolframe_protocol::ServerId::from_bytes(
@@ -495,7 +503,11 @@ fn answer(
         Request::PlaybackRevision { .. } => Reply::PlaybackRevision { revision: 0 },
         // "one-time" stands for a password an admin reset to.
         Request::LoginPassword(login) => Reply::LoggedIn {
-            session: SessionId("stub-session".into()),
+            session: SessionId(if login.username == "alice" {
+                "stub-session".into()
+            } else {
+                format!("stub-session-{}", login.username)
+            }),
             remembered: false,
             password_change_required: login.password == "one-time",
         },
@@ -506,9 +518,9 @@ fn answer(
         Request::LeaveServer => Reply::Done,
         Request::WhoAmI => Reply::WhoAmI(spoolframe_protocol::WhoAmIReply {
             user: UserSummary {
-                user_id: "local:1".into(),
-                username: "alice".into(),
-                display_name: "Alice".into(),
+                user_id: format!("local:{username}"),
+                display_name: username.clone(),
+                username,
                 role: Role::Consumer,
                 locked: false,
                 pin: None,

@@ -76,8 +76,29 @@ pub struct Prober {
     reading: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 }
 
-/// A file's keyframe times, ms.
-type Keyframes = Arc<Vec<u64>>;
+/// A file's keyframe times, shared.
+type Keyframes = Arc<KeyframeTimes>;
+
+/// The main video stream's keyframes (PX-25): where a copied video can be
+/// cut. Derefs to [`KeyframeTimes::times_ms`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyframeTimes {
+    /// ms, ascending, deduplicated; one before 0 as 0.
+    pub times_ms: Vec<u64>,
+    /// The first keyframe's own time, ms, signed: before 0 in an MP4 cut
+    /// with stream copy, which starts at the keyframe before the cut and
+    /// shows from the cut on. A copy from the file's start begins there.
+    /// 0 for no keyframe.
+    pub first_ms: i64,
+}
+
+impl std::ops::Deref for KeyframeTimes {
+    type Target = [u64];
+
+    fn deref(&self) -> &[u64] {
+        &self.times_ms
+    }
+}
 
 /// The most descriptors kept: a film's is a few KB.
 const MAX_DESCRIPTORS: usize = 4096;
@@ -356,7 +377,10 @@ impl Prober {
         };
         let (times, from) = match indexed {
             Ok(indexed) => (
-                Arc::new(indexed.times_ms),
+                Arc::new(KeyframeTimes {
+                    times_ms: indexed.times_ms,
+                    first_ms: indexed.first_ms,
+                }),
                 KeyframesFrom::Index(indexed.kind),
             ),
             Err(why) => {
@@ -414,7 +438,7 @@ impl Prober {
             .output(cmd, path, MAX_KEYFRAME_LISTING, self.timeout)
             .await
             .map_err(|e| format!("checking the index: {e}"))?;
-        let read = keyframe_times(&String::from_utf8_lossy(&output));
+        let read = keyframe_times(&String::from_utf8_lossy(&output)).times_ms;
         for (from, to) in windows {
             let found: Vec<u64> = read
                 .iter()
@@ -463,6 +487,9 @@ impl Prober {
             "json",
             "-show_format",
             "-show_streams",
+            // Each stream's codec record as a hex dump: whether a video's
+            // holds its parameter sets (`VideoStream::parameter_sets_in_record`).
+            "-show_data",
             // `-i` so a path is never read as an option.
             "-i",
         ])
@@ -554,22 +581,34 @@ fn keyframe_listing(cmd: &mut crate::sandbox::Command, path: &Path, intervals: O
 /// ascending. A keyframe before time 0 counts as at 0: it is still the
 /// file's first keyframe (an MP4 cut with stream copy starts at the
 /// keyframe before the cut), and a list without it would start at the
-/// second.
-fn keyframe_times(csv: &str) -> Vec<u64> {
-    let mut times: Vec<u64> = csv
+/// second. Its own time is kept as [`KeyframeTimes::first_ms`].
+fn keyframe_times(csv: &str) -> KeyframeTimes {
+    let seconds: Vec<f64> = csv
         .lines()
         .filter_map(|line| {
             let (time, flags) = line.trim().split_once(',')?;
             if !flags.starts_with('K') {
                 return None;
             }
-            let seconds: f64 = time.parse().ok()?;
-            Some(keyframe_index::ms(seconds))
+            time.parse().ok()
         })
         .collect();
+    let mut times: Vec<u64> = seconds.iter().map(|&s| keyframe_index::ms(s)).collect();
     times.sort_unstable();
     times.dedup();
-    times
+    // ffmpeg starts at the last keyframe at or before 0; with none, at
+    // the first.
+    let start = seconds
+        .iter()
+        .copied()
+        .filter(|&t| t <= 0.0)
+        .reduce(f64::max)
+        .or_else(|| seconds.iter().copied().reduce(f64::min));
+    let first_ms = start.map_or(0, keyframe_index::signed_ms);
+    KeyframeTimes {
+        times_ms: times,
+        first_ms,
+    }
 }
 
 async fn stamp(path: &Path) -> Result<Stamp, ProbeError> {
@@ -616,7 +655,7 @@ mod tests {
     #[test]
     fn only_keyframes_count_in_order() {
         let csv = "2.000000,K__\n0.040000,___\n0.000000,K__\nN/A,K__\n4.000000,K_D\n";
-        assert_eq!(keyframe_times(csv), [0, 2000, 4000]);
+        assert_eq!(keyframe_times(csv).times_ms, [0, 2000, 4000]);
     }
 
     /// An MP4 cut with stream copy starts at the keyframe before the cut,
@@ -624,6 +663,8 @@ mod tests {
     #[test]
     fn a_keyframe_before_zero_is_the_first_at_zero() {
         let csv = "-0.040000,KD_\n0.000000,___\n1.960000,K__\n3.960000,K__\n";
-        assert_eq!(keyframe_times(csv), [0, 1960, 3960]);
+        let times = keyframe_times(csv);
+        assert_eq!(times.times_ms, [0, 1960, 3960]);
+        assert_eq!(times.first_ms, -40);
     }
 }

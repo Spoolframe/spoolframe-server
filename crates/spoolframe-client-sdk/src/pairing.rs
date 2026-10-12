@@ -39,7 +39,7 @@ use tokio::time::Instant;
 
 use crate::client::Client;
 use crate::error::SdkError;
-use crate::portable::{DevicePublicKey, Portable, PortableUserId};
+use crate::portable::{DevicePublicKey, GuestServer, Portable, PortableUserId};
 use crate::refusals::{self, Refusals};
 
 /// How long a pairing's code is good for: [`CODE_TTL_SECS`].
@@ -418,6 +418,14 @@ impl Client {
                     Err(e) => {
                         tracing::warn!(error = %e, "could not save the servers a pairing handed")
                     }
+                }
+                // For the guest's row: the first server its phone handed.
+                let server = paired.servers.first().map(|s| GuestServer {
+                    endpoint_id: s.endpoint_id.clone(),
+                    name: s.name.clone(),
+                });
+                if let Err(e) = client.portable().note_paired(paired.identity, server).await {
+                    tracing::warn!(identity = %paired.identity, error = %e, "could not keep where the guest was paired");
                 }
             }
             match &outcome {

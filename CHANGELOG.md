@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- HLS of a copied video is cut into segments of at least
+  `transcode.copy_segment_secs` (2 s if left out, 1 to 10; review
+  2026-10-11 M2), each at the first keyframe that far past the last,
+  instead of at every keyframe: an all-intra film was a segment per
+  frame, 172,627 over two hours, now 3,597. A conversion keeps the
+  length it started with. Its runs are cut by ffmpeg's segment muxer at
+  that list, the same from a resume or a quality switch, and a resumed
+  run starts exactly at its segment's keyframe. Where ffmpeg cannot write
+  the header before the first packet (a codec record without its
+  parameter sets, an `avc3`/`hev1` track, or AC-3 or E-AC-3 sound), the
+  video is cut at every keyframe as before. The segments, their names and
+  numbers are as before; they no longer start with a `styp` box.
+
+- SDK review fixes (2026-10-12, C4-C8, P5-P8, B2-B5). Forgetting a
+  server clears its sessions before its pin. `Session::password_change_required()`
+  turns false, on every clone, once `change_password` succeeds. Closing
+  a server's link lets a storage write that is under way finish.
+  Relay pairing refuses with `PairingError::NotAllowed` once guests were
+  turned off after the offer. `add_root` checks the root count before
+  the key registers, and refuses a credential no root can carry
+  instead of panicking. A removed phrase root issues no credentials, and
+  a tie proof then uses the device credential. Recovery phrase words no
+  longer stay in freed memory. A managed playback's share task ends with
+  it. A late, older segment open no longer hides a newer one. A re-plan
+  for the link restarts an ended playback instead of failing, and the
+  direct reader asks again after a failed ask. A resume from a thread
+  outside Tokio starts on the playback's own runtime.
+
+- SDK: `Portable::guest_pairings()` lists each guest with the server it
+  was paired for and when (`GuestPairing { id, server, paired_at }`,
+  `GuestServer { endpoint_id, name }`), for a "Shared computer" row's
+  "server name · date". A pairing through a server keeps that server; a
+  QR pairing keeps the first server the phone handed. Guests paired
+  before this have `None` for both. `Portable::guests()` is unchanged.
+
+- SDK: `Session::leave_server` removes only the leaving user's profile
+  on this device, and forgets the server (pin and all) only when no
+  other profile is kept for it. Before, on a shared device such as a TV
+  with Alice and Bob, Alice leaving also took Bob's saved session and
+  the pin. An app that shows "It's no longer saved here" checks
+  `Client::servers()` after the leave.
 - `WhoAmI` answers `can_leave` (PX-47): `false` for the last admin, whom
   `LeaveServer` would refuse with `LastAdmin`, so an app greys out
   "Leave this server" before it is asked. Additive at revision 14: left

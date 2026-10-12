@@ -32,7 +32,8 @@ pub const SEGMENT_SECS: u32 = 6;
 /// player waits for before the first frame. See `hls::Segments::encoded`.
 pub const FIRST_SEGMENT_SECS: u32 = 2;
 
-/// ffmpeg's own HLS playlist, in the job's directory.
+/// ffmpeg's own list of the segments it has finished, in the job's
+/// directory: the HLS muxer's playlist, or the segment muxer's list.
 pub const PLAYLIST: &str = "ffmpeg.m3u8";
 
 /// Whether `spec`'s run starts at the film's start: a run of HLS
@@ -85,10 +86,18 @@ pub(crate) fn forced_through(cuts: &[u64], start: Option<Duration>) -> Option<u6
 
 fn forced_list(cuts: &[u64], start: Option<Duration>) -> (String, Option<u64>) {
     let from = start.map_or(0, |d| d.as_millis() as u64);
+    time_list(cuts.iter().filter(|&&ms| ms >= from), 0)
+}
+
+/// `cuts` as ffmpeg's comma-separated seconds, each less `base_ms`, as
+/// many as one argument holds ([`MAX_KEYFRAME_LIST`]); and the last
+/// listed when the list stops short of them all.
+fn time_list<'a>(cuts: impl Iterator<Item = &'a u64>, base_ms: i64) -> (String, Option<u64>) {
     let mut list = String::new();
     let mut last = None;
-    for &ms in cuts.iter().filter(|&&ms| ms >= from) {
-        let entry = format!("{}.{:03}", ms / 1000, ms % 1000);
+    for &ms in cuts {
+        let at = (ms as i64).saturating_sub(base_ms).max(0) as u64;
+        let entry = format!("{}.{:03}", at / 1000, at % 1000);
         if list.len() + entry.len() + 1 > MAX_KEYFRAME_LIST {
             return (list, last);
         }
@@ -99,6 +108,34 @@ fn forced_list(cuts: &[u64], start: Option<Duration>) -> (String, Option<u64>) {
         last = Some(ms);
     }
     (list, None)
+}
+
+/// A cut past any film (`MAX_DURATION` is 48 hours): the segment
+/// muxer's list for a run of the last segment, which has no cut after it.
+const NO_CUT: &str = "1000000.000";
+
+/// `-segment_times` for a run of a copied video from segment `from` of
+/// `starts` (numbered from 1), cut by the segment muxer. It measures each time from
+/// the run's first video packet: the segment's own cut for a run from a
+/// seek (which starts exactly there, `segment_seek`), the film's first
+/// keyframe (`from_ms`, before 0 in an MP4 cut with stream copy) for a run
+/// from the start. Only the cuts after the run's first segment: the muxer
+/// cuts at its first time once a segment has a packet.
+fn segment_times(starts: &[u64], from: u32, from_ms: i64) -> (String, Option<u64>) {
+    let first = from.max(1) as usize;
+    let base = match first {
+        1 => from_ms,
+        n => starts.get(n - 1).map_or(from_ms, |&ms| ms as i64),
+    };
+    time_list(starts.iter().skip(first), base)
+}
+
+/// The last of a listed copy's cuts a run from segment `from` is given,
+/// when its list ([`segment_times`]) stops short of the last cut: the
+/// segment from there is not cut where the playlist says. `None` when the
+/// list holds every later cut.
+pub(crate) fn listed_through(starts: &[u64], from: u32, from_ms: i64) -> Option<u64> {
+    segment_times(starts, from, from_ms).1
 }
 
 /// What keeps `encoder` from adding keyframes of its own between the
@@ -154,19 +191,38 @@ fn copied_audio_from_start(spec: &EncodeSpec<'_>) -> Vec<String> {
     }
 }
 
+/// Where an HLS run cuts its segments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Cuts {
+    /// Where the HLS muxer cuts by itself: an encode on its own grid, a
+    /// copied video at every keyframe (its parameter sets only in the
+    /// stream, or a sound the segment muxer cannot write first).
+    #[default]
+    Own,
+    /// An encode with a keyframe forced at each of these and nowhere
+    /// else, the HLS muxer cutting at each: a remux ladder's lower rung,
+    /// cut where its copy is (PX-21). The film's times, ms.
+    Forced(std::sync::Arc<[u64]>),
+    /// A copied video cut by ffmpeg's segment muxer at these, the film's
+    /// times in ms (`hls::Segments::copied`, review 2026-10-11 M2). A run
+    /// from the start begins at `from_ms`, the film's first keyframe.
+    Listed {
+        starts: std::sync::Arc<[u64]>,
+        from_ms: i64,
+    },
+}
+
 /// Where and how the job writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
     /// One Matroska file, readable while it grows (P2-04).
     Progressive { file: PathBuf },
     /// fMP4 segments `seg<n>.m4s` and `init.mp4` in `dir`, numbered from
-    /// `start_number` (P2-05). `cuts`: where an encode is to cut instead of
-    /// its own grid, the film's times in milliseconds (a remux ladder's
-    /// lower rung, PX-21); `None` for its own grid.
+    /// `start_number` (P2-05), cut as `cuts` says.
     Hls {
         dir: PathBuf,
         start_number: u32,
-        cuts: Option<Vec<u64>>,
+        cuts: Cuts,
     },
 }
 
@@ -1544,7 +1600,8 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                     // each of the copy's cuts and nowhere else, so its
                     // segments are the copy's.
                     Output::Hls {
-                        cuts: Some(cuts), ..
+                        cuts: Cuts::Forced(cuts),
+                        ..
                     } => {
                         args.extend([s("-force_key_frames"), keyframes_at(cuts, spec.start)]);
                         args.extend(only_forced_keyframes(&encoder.name));
@@ -1669,7 +1726,7 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
             // whose keyframes are the copy's cuts and no others.
             let cut = match spec.video {
                 Some(ConvertedVideo::Copy { .. }) => s("0.1"),
-                _ if cuts.is_some() => s("0.1"),
+                _ if matches!(cuts, Cuts::Forced(_)) => s("0.1"),
                 _ => s(SEGMENT_SECS),
             };
             // An encoded video's run from 0 cuts its short head (PX-26):
@@ -1679,7 +1736,7 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
             // `hls::Segments::encoded`. The list is ffmpeg's own playlist,
             // which the server reads only for its last segment (`job`).
             let list_size = match spec.video {
-                Some(ConvertedVideo::Encode { .. }) if from_start(spec) && cuts.is_none() => {
+                Some(ConvertedVideo::Encode { .. }) if from_start(spec) && *cuts == Cuts::Own => {
                     args.extend([s("-hls_init_time"), s(FIRST_SEGMENT_SECS)]);
                     s(1)
                 }
@@ -1745,6 +1802,70 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                     "hevc_mp4toannexb"
                 };
                 args.extend([s("-bsf:v"), s(bsf)]);
+            }
+            if let Cuts::Listed { starts, from_ms } = cuts {
+                let Some(ConvertedVideo::Copy { dolby_vision, .. }) = spec.video else {
+                    return Err(s("a segment list is for a copied video only"));
+                };
+                let times = match segment_times(starts, *start_number, *from_ms).0 {
+                    list if list.is_empty() => s(NO_CUT),
+                    list => list,
+                };
+                // The fMP4 the HLS muxer writes: fragments only where the
+                // segment muxer flushes them, at its cuts (`frag_custom`),
+                // with a `sidx` each (`dash`), the film's own times
+                // (`frag_discont`, as below; without `delay_moov` a run
+                // from a seek stores them from 0 all the same). The
+                // segment muxer does not hand its own `-strict` to the MP4
+                // muxer.
+                let mut options = s("movflags=+frag_custom+dash+delay_moov+frag_discont");
+                if dolby_vision {
+                    options.push_str(":strict=unofficial");
+                }
+                // A run from a seek starts at the keyframe at or before
+                // where it is aimed, a millisecond before its cut
+                // (`segment_seek`), and on a source keyed more often than
+                // it is cut, or with B-frames, before the cut: the copied
+                // streams drop what is before the seek, so the run's first
+                // video packet is its cut's keyframe, which the times
+                // above are measured from.
+                if spec.start.is_some_and(|start| !start.is_zero()) {
+                    args.extend([s("-copypriorss"), s("0")]);
+                }
+                args.extend([
+                    s("-f"),
+                    s("segment"),
+                    s("-segment_format"),
+                    s("mp4"),
+                    s("-segment_format_options"),
+                    options,
+                    // The header once, before the first packet, from the
+                    // stream's record: whole only where the record holds
+                    // the parameter sets, and not for AC-3 or E-AC-3,
+                    // whose MP4 entry needs packets first (`encode`
+                    // picks the HLS muxer for those).
+                    s("-segment_header_filename"),
+                    s(dir.join("init.mp4").display()),
+                    s("-individual_header_trailer"),
+                    s("0"),
+                    // The keyframe index rounds to the millisecond: a
+                    // cut's keyframe may be up to half of one early.
+                    s("-segment_time_delta"),
+                    s("0.001"),
+                    s("-segment_times"),
+                    times,
+                    s("-segment_start_number"),
+                    s(start_number),
+                    // Rewritten aside and renamed after each segment is
+                    // closed, as the HLS muxer's playlist is: the server
+                    // reads it to know which segments are finished.
+                    s("-segment_list"),
+                    s(dir.join(PLAYLIST).display()),
+                    s("-segment_list_type"),
+                    s("m3u8"),
+                    s(dir.join("seg%d.m4s").display()),
+                ]);
+                return Ok(args);
             }
             args.extend([
                 s("-f"),
@@ -1819,6 +1940,7 @@ mod tests {
                 hdr: Some(HdrFormat::Hdr10),
                 dolby_vision: None,
                 bit_rate: None,
+                parameter_sets_in_record: false,
             }),
             audio: vec![AudioStream {
                 index: 1,
@@ -3194,7 +3316,7 @@ mod tests {
         let output = Output::Hls {
             dir: "/scratch/h/0".into(),
             start_number: 1,
-            cuts: None,
+            cuts: Cuts::Own,
         };
         let eac3 = AudioAction::Encode {
             codec: AudioCodec::Eac3,
@@ -3224,8 +3346,113 @@ mod tests {
         Output::Hls {
             dir: "/scratch/h/0".into(),
             start_number: 1,
-            cuts: None,
+            cuts: Cuts::Own,
         }
+    }
+
+    /// A copied video cut by the segment muxer at the conversion's list:
+    /// 0, 3.5, 6.083 and 9 s, a run from the start beginning at `from_ms`.
+    fn listed(start_number: u32, from_ms: i64) -> Output {
+        Output::Hls {
+            dir: "/scratch/h/0".into(),
+            start_number,
+            cuts: Cuts::Listed {
+                starts: std::sync::Arc::from(vec![0, 3500, 6083, 9000]),
+                from_ms,
+            },
+        }
+    }
+
+    /// Review 2026-10-11 M2: a copied video whose header can be written
+    /// before its first packet is cut by the segment muxer at the
+    /// conversion's own cuts, which it measures from the run's first
+    /// video packet: here the film's first keyframe, at 0. Its header is
+    /// `init.mp4`, written once; its list says which segments are done.
+    #[test]
+    fn a_listed_copy_is_cut_by_the_segment_muxer_at_the_conversion_s_cuts() {
+        let (film, enc) = (film(), encoders(false));
+        let args =
+            ffmpeg_args(&spec(&film, &enc, COPY_HEVC, COPY_DTS, None, listed(1, 0))).unwrap();
+        assert!(has(&args, &["-f", "segment", "-segment_format", "mp4"]));
+        assert_eq!(
+            after(&args, "-segment_format_options"),
+            "movflags=+frag_custom+dash+delay_moov+frag_discont"
+        );
+        assert_eq!(
+            after(&args, "-segment_header_filename"),
+            "/scratch/h/0/init.mp4"
+        );
+        assert!(has(&args, &["-individual_header_trailer", "0"]));
+        assert_eq!(after(&args, "-segment_times"), "3.500,6.083,9.000");
+        assert_eq!(after(&args, "-segment_time_delta"), "0.001");
+        assert_eq!(after(&args, "-segment_start_number"), "1");
+        assert_eq!(after(&args, "-segment_list"), "/scratch/h/0/ffmpeg.m3u8");
+        assert!(has(&args, &["-segment_list_type", "m3u8"]));
+        assert_eq!(args.last().unwrap(), "/scratch/h/0/seg%d.m4s");
+        assert!(!args.iter().any(|a| a.starts_with("-hls")), "{args:?}");
+        // As the HLS muxer's: `hvc1`, its sets read into the record.
+        assert!(has(&args, &["-tag:v", "hvc1"]));
+        assert!(has(&args, &["-bsf:v", "hevc_mp4toannexb"]));
+        // From the start, nothing comes before.
+        assert!(!args.contains(&s("-copypriorss")));
+    }
+
+    /// The cuts are measured from where the run's video starts: a run
+    /// from the start of an MP4 cut with stream copy starts 40 ms before
+    /// 0, one with a late picture at 0.5 s.
+    #[test]
+    fn a_listed_copy_from_the_start_measures_from_its_first_keyframe() {
+        let (film, enc) = (film(), encoders(false));
+        let times = |from_ms| {
+            let args = ffmpeg_args(&spec(
+                &film,
+                &enc,
+                COPY_HEVC,
+                COPY_DTS,
+                None,
+                listed(1, from_ms),
+            ))
+            .unwrap();
+            after(&args, "-segment_times").to_owned()
+        };
+        assert_eq!(times(-40), "3.540,6.123,9.040");
+        assert_eq!(times(500), "3.000,5.583,8.500");
+    }
+
+    /// A run from segment 3 starts at its cut, 6.083 s: the cuts after it
+    /// are measured from there, and numbered on from 3.
+    #[test]
+    fn a_resumed_listed_copy_measures_from_its_own_cut() {
+        let (film, enc) = (film(), encoders(false));
+        let mut resumed = spec(&film, &enc, COPY_HEVC, COPY_DTS, None, listed(3, 0));
+        resumed.start = Some(Duration::from_millis(6_082));
+        let args = ffmpeg_args(&resumed).unwrap();
+        assert_eq!(after(&args, "-segment_times"), "2.917");
+        assert_eq!(after(&args, "-segment_start_number"), "3");
+        // What the seek lands on before the cut is dropped.
+        assert!(has(&args, &["-copypriorss", "0"]));
+        // The last segment has no cut after it: one past any film.
+        resumed.output = listed(4, 0);
+        resumed.start = Some(Duration::from_millis(8_999));
+        let args = ffmpeg_args(&resumed).unwrap();
+        assert_eq!(after(&args, "-segment_times"), "1000000.000");
+    }
+
+    /// The MP4 muxer writes a Dolby Vision record only with `-strict
+    /// unofficial`, and the segment muxer does not hand its own on.
+    #[test]
+    fn a_listed_dolby_vision_copy_passes_strict_to_the_mp4_muxer() {
+        let film = dv_film(8);
+        let enc = encoders(false);
+        let video = ConvertedVideo::Copy {
+            codec: VideoCodec::Hevc,
+            dolby_vision: true,
+        };
+        let args = ffmpeg_args(&spec(&film, &enc, video, COPY_DTS, None, listed(1, 0))).unwrap();
+        assert_eq!(
+            after(&args, "-segment_format_options"),
+            "movflags=+frag_custom+dash+delay_moov+frag_discont:strict=unofficial"
+        );
     }
 
     /// `film()` as Dolby Vision `profile` (HDR10 base, but profile 5).
@@ -3591,7 +3818,7 @@ mod tests {
             let output = Output::Hls {
                 dir: "/scratch/h/0".into(),
                 start_number: 1,
-                cuts: None,
+                cuts: Cuts::Own,
             };
             let video = ConvertedVideo::Encode {
                 codec,
@@ -3636,7 +3863,7 @@ mod tests {
         let output = Output::Hls {
             dir: "/scratch/h/0".into(),
             start_number,
-            cuts: None,
+            cuts: Cuts::Own,
         };
         let mut spec = spec(&film, &enc, video, COPY_DTS, None, output);
         spec.start = start;
@@ -3687,7 +3914,7 @@ mod tests {
         let output = Output::Hls {
             dir: "/scratch/h/0".into(),
             start_number: 23,
-            cuts: None,
+            cuts: Cuts::Own,
         };
         let mut spec = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, output);
         spec.start = Some(Duration::from_secs(122));
@@ -3705,7 +3932,7 @@ mod tests {
             let output = Output::Hls {
                 dir: "/scratch/h/0".into(),
                 start_number: 632,
-                cuts: None,
+                cuts: Cuts::Own,
             };
             let mut spec = spec(&film, &enc, video, audio, None, output);
             spec.start = start;
@@ -3753,7 +3980,7 @@ mod tests {
             let output = Output::Hls {
                 dir: "/scratch/h/0".into(),
                 start_number,
-                cuts: Some(cuts.clone()),
+                cuts: Cuts::Forced(cuts.clone().into()),
             };
             let mut spec = spec(&film, &enc, video, COPY_DTS, None, output);
             spec.start = start;
@@ -3833,7 +4060,7 @@ mod tests {
         let output = Output::Hls {
             dir: "/scratch/h/0".into(),
             start_number: 1,
-            cuts: None,
+            cuts: Cuts::Own,
         };
         let args = ffmpeg_args(&spec(&film, &enc, COPY_HEVC, COPY_DTS, None, output)).unwrap();
         assert!(!args.contains(&s("-hls_init_time")), "{args:?}");

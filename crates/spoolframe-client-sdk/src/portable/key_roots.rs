@@ -669,17 +669,29 @@ impl super::Portable {
         let handle = load_genesis(self.storage.as_ref(), id)
             .await?
             .map_or(*id.as_bytes(), |g| g.handle);
-        let root = new_key.register(PORTABLE_RP, handle, name).await?;
+        // Checked before the key is asked: each registration takes one of
+        // its few resident slots, and a refused one would leave it there.
         let roots = self.roots(id).await?;
-        if roots.knew(&root) {
-            return Err(SdkError::InvalidInput(
-                "that key is, or was, one of the identity's roots".into(),
-            ));
-        }
         if roots.members.len() >= MAX_ROOTS {
             return Err(SdkError::InvalidInput(format!(
                 "an identity has at most {MAX_ROOTS} roots"
             )));
+        }
+        let root = new_key.register(PORTABLE_RP, handle, name).await?;
+        // A credential no root can carry (an id over 255 bytes) would
+        // panic in `RootKey::bytes`; refused as `create_with_keys` does.
+        if !root.is_valid() {
+            return Err(SecurityKeyError::Other(
+                "it made a credential that is not a P-256 key".into(),
+            )
+            .into());
+        }
+        // Only known once the key made it: a key gives a new credential
+        // each time, so this is a key that answers with one it gave before.
+        if roots.knew(&root) {
+            return Err(SdkError::InvalidInput(
+                "that key is, or was, one of the identity's roots".into(),
+            ));
         }
         let (_, possession) = assert_with(
             new_key,
@@ -995,6 +1007,114 @@ mod tests {
         let (desktop, a, b) = (portable(), SoftSecurityKey::new(), SoftSecurityKey::new());
         let id = desktop.create_with_keys(&[&a, &b], "Sam").await.unwrap();
         (desktop, id, a, b)
+    }
+
+    /// A phrase identity that added key `k` and then removed its phrase
+    /// root, on the phone that still holds the phrase's secret.
+    async fn phrase_removed() -> (Portable, PortableUserId, SoftSecurityKey) {
+        let phone = portable();
+        let (id, _phrase) = phone.create("Sam").await.unwrap();
+        let k = SoftSecurityKey::new();
+        phone
+            .add_root(id, RootSigner::Phrase, &k, "K")
+            .await
+            .unwrap();
+        phone
+            .remove_root(id, RootSigner::Key(&k), &RootKey::phrase_of(&id))
+            .await
+            .unwrap();
+        (phone, id, k)
+    }
+
+    /// P7: a removed phrase root gives no more credentials.
+    #[tokio::test]
+    async fn a_removed_phrase_root_issues_no_credential() {
+        let (phone, id, _k) = phrase_removed().await;
+        let tv_key = portable().device_key(id).await.unwrap();
+        let issued = phone.issue_credential(id, tv_key, None).await;
+        assert!(matches!(issued, Err(SdkError::NotARoot)), "{issued:?}");
+    }
+
+    /// P7: a removed phrase root signs no tie; the phone ties with its
+    /// device credential instead.
+    #[tokio::test]
+    async fn a_removed_phrase_root_ties_with_the_device_credential() {
+        let (phone, id, k) = phrase_removed().await;
+        let credential = phone.pair_self(id, RootSigner::Key(&k)).await.unwrap();
+        let proof = phone
+            .tie_proof(id, &[0x5a; 32], &[0xa5; 32], "sam")
+            .await
+            .unwrap();
+        match proof {
+            spoolframe_protocol::portable::TieProof::Device {
+                credential: sent, ..
+            } => assert_eq!(sent, credential),
+            other => panic!("tied with {other:?}"),
+        }
+    }
+
+    /// A key whose credentials have ids longer than a root may carry.
+    struct LongIdKey;
+
+    #[async_trait]
+    impl SecurityKey for LongIdKey {
+        async fn register(
+            &self,
+            rp: &str,
+            handle: [u8; HANDLE_LEN],
+            name: &str,
+        ) -> Result<RootKey, SdkError> {
+            match SoftSecurityKey::new().register(rp, handle, name).await? {
+                RootKey::SecurityKey { public_key, .. } => Ok(RootKey::SecurityKey {
+                    public_key,
+                    credential_id: vec![7; 300],
+                }),
+                phrase => Ok(phrase),
+            }
+        }
+
+        async fn assert(
+            &self,
+            _: &str,
+            _: [u8; 32],
+            _: &[Vec<u8>],
+        ) -> Result<Vec<KeyAssertion>, SdkError> {
+            Err(SecurityKeyError::NoCredential.into())
+        }
+    }
+
+    /// P6: a key that makes a credential no root can carry is refused, not
+    /// a panic.
+    #[tokio::test]
+    async fn adding_a_key_with_an_overlong_credential_id_is_refused() {
+        let (desktop, id, a, _) = key_identity().await;
+        let added = desktop
+            .add_root(id, RootSigner::Key(&a), &LongIdKey, "Long")
+            .await;
+        assert!(
+            matches!(
+                added,
+                Err(SdkError::SecurityKey(SecurityKeyError::Other(_)))
+            ),
+            "{added:?}"
+        );
+    }
+
+    /// P6: an identity with every root slot taken refuses another key
+    /// before the key is asked to make a credential, which would take one
+    /// of the key's own resident slots for nothing.
+    #[tokio::test]
+    async fn a_full_identity_refuses_a_key_before_it_registers() {
+        let keys: Vec<SoftSecurityKey> = (0..MAX_ROOTS).map(|_| SoftSecurityKey::new()).collect();
+        let refs: Vec<&dyn SecurityKey> = keys.iter().map(|k| k as &dyn SecurityKey).collect();
+        let desktop = portable();
+        let id = desktop.create_with_keys(&refs, "Sam").await.unwrap();
+        let extra = SoftSecurityKey::new();
+        let added = desktop
+            .add_root(id, RootSigner::Key(&keys[0]), &extra, "Extra")
+            .await;
+        assert!(matches!(added, Err(SdkError::InvalidInput(_))), "{added:?}");
+        assert!(extra.credentials().is_empty(), "the key registered anyway");
     }
 
     #[tokio::test]

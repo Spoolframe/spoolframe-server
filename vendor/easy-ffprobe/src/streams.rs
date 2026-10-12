@@ -41,6 +41,10 @@ pub struct Stream {
     pub side_data_list: Vec<SideData>,
     /// The size of the extra data associated with the stream, if available.
     pub extradata_size: Option<i64>,
+    /// The extra data itself, as `-show_data` prints it: a hex dump.
+    /// Absent without that option. Spoolframe vendor change.
+    #[serde(default)]
+    pub extradata: Option<String>,
     /// The real frame rate of the stream.
     pub r_frame_rate: Ratio,
     /// The total number of frames in the stream, if available.

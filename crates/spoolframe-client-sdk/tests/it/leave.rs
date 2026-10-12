@@ -1,5 +1,6 @@
-//! Leaving a server (PX-47): the SDK asks the server, and forgets it on
-//! this device only when the server says it is done.
+//! Leaving a server (PX-47): the SDK asks the server, and only when the
+//! server says it is done removes the profile on this device, and forgets
+//! the server when no other profile is kept for it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -109,4 +110,63 @@ async fn anyone_else_is_told_they_can_leave() {
 #[tokio::test(flavor = "multi_thread")]
 async fn can_leave_is_as_of_sign_in_until_asked_again() {
     assert_eq!(can_leave(false, true).await, (true, false));
+}
+
+/// Alice and Bob both signed in to `stub` on one device (a shared TV):
+/// the client, Alice's session and Bob's.
+async fn two_signed_in(stub: &Stub) -> (Client, Session, Session) {
+    let (client, alice) = signed_in(stub).await;
+    let bob = client
+        .sign_in(&stub.id(), "bob", "correct horse", false)
+        .await
+        .unwrap();
+    (client, alice, bob)
+}
+
+/// The usernames kept for `stub` here, and whether it is still pinned.
+async fn kept(client: &Client, stub: &Stub) -> (Vec<String>, bool) {
+    let profiles = client
+        .saved_profiles(&stub.id())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.username)
+        .collect();
+    let pinned = client
+        .servers()
+        .await
+        .unwrap()
+        .iter()
+        .any(|s| s.endpoint_id == stub.id() && s.pinned);
+    (profiles, pinned)
+}
+
+/// C7: on a shared device, Alice leaving takes only her profile: Bob's
+/// session and the server's pin stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_of_two_profiles_leaving_keeps_the_other_and_the_pin() {
+    let stub = Stub::start().await;
+    let (client, alice, bob) = two_signed_in(&stub).await;
+    alice.leave_server().await.unwrap();
+    let (profiles, pinned) = kept(&client, &stub).await;
+    let bob_still_works = bob.whoami().await.map(|u| u.username);
+    client.close().await;
+    stub.stop().await;
+    assert_eq!(profiles, vec!["bob".to_owned()]);
+    assert!(pinned, "the server was forgotten with Bob still on it");
+    assert_eq!(bob_still_works, Ok("bob".to_owned()));
+}
+
+/// C7: the last profile kept for the server leaving forgets the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_profile_leaving_forgets_the_server() {
+    let stub = Stub::start().await;
+    let (client, alice, bob) = two_signed_in(&stub).await;
+    alice.leave_server().await.unwrap();
+    bob.leave_server().await.unwrap();
+    let (profiles, pinned) = kept(&client, &stub).await;
+    client.close().await;
+    stub.stop().await;
+    assert!(profiles.is_empty(), "{profiles:?} kept");
+    assert!(!pinned, "the server is still pinned with no one on it");
 }
