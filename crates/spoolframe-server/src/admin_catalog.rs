@@ -114,18 +114,26 @@ impl PathChecks {
     }
 
     /// Keep `run`, a check of every library that read `basis`, as the
-    /// last one: in memory, and in the state directory if there is one.
-    pub fn keep_run(&self, basis: &str, run: PathCheckRun) {
+    /// last one: in memory, and in the state directory if there is one,
+    /// written off the async workers.
+    pub async fn keep_run(&self, basis: &str, run: PathCheckRun) {
         let kept = KeptRun {
             basis: basis_hash(basis),
             run,
         };
-        if let Some(file) = &self.file
-            && let Err(e) = write_private(file, &kept)
-        {
+        *self.last_run.lock() = Some(kept.clone());
+        let Some(file) = self.file.clone() else {
+            return;
+        };
+        let written = tokio::task::spawn_blocking({
+            let file = file.clone();
+            move || write_private(&file, &kept)
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        if let Err(e) = written {
             tracing::warn!(path = %file.display(), error = %e, "cannot keep the last path check");
         }
-        *self.last_run.lock() = Some(kept);
     }
 
     /// The last check of every library, while what it read is the same
@@ -210,7 +218,15 @@ impl PathChecks {
                     let library = library.clone();
                     let key = key.clone();
                     tokio::spawn(async move {
-                        let result = on.check_library(&library).await;
+                        // A catalog replaced meanwhile (its settings
+                        // changed) is held by this check alone: its result
+                        // would be dropped, so the scan stops there.
+                        let Some(result) =
+                            while_held_elsewhere(&on, on.check_library(&library)).await
+                        else {
+                            tracing::debug!(%library, "path check of a replaced catalog stopped");
+                            return;
+                        };
                         let state = match result {
                             Ok(check) => State::Done {
                                 at: crate::store::now(),
@@ -240,13 +256,41 @@ impl PathChecks {
     }
 }
 
+/// How often a running check looks whether its catalog was replaced.
+const HELD_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `work`'s output, or `None` once `held` is held by the caller alone:
+/// nobody else keeps it, so nothing will read what `work` makes.
+async fn while_held_elsewhere<H, T, F: std::future::Future<Output = T>>(
+    held: &Arc<H>,
+    work: F,
+) -> Option<T> {
+    let mut work = std::pin::pin!(work);
+    let mut every = tokio::time::interval(HELD_EVERY);
+    every.tick().await;
+    loop {
+        tokio::select! {
+            out = &mut work => return Some(out),
+            _ = every.tick() => {
+                if Arc::strong_count(held) <= 1 {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 /// Write `kept` to `file` whole or not at all: a file beside it first,
 /// readable by the server's user only, then renamed over it.
 fn write_private(file: &Path, kept: &KeptRun) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+    // Each write its own file beside it: two checks that end at once do
+    // not write into one another's.
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = file.parent().unwrap_or(Path::new("."));
-    let partial = dir.join(format!(".{LAST_RUN_FILE}.new"));
+    let partial = dir.join(format!(".{LAST_RUN_FILE}.{}.{n}.new", std::process::id()));
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -497,6 +541,9 @@ impl AdminApi {
             .catalog
             .sections()
             .await
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "cannot read Plex's sections for a library's Plex title");
+            })
             .ok()
             .and_then(|s| s.into_iter().find(|s| s.key == local.key()))
             .map(|s| s.title);
@@ -640,7 +687,11 @@ impl AdminApi {
             markers: found.markers,
         };
         let reply = serde_json::to_value(&reply).map_err(super::internal)?;
-        let libraries = composite.libraries().await.unwrap_or_default();
+        // Only the crumb needs them: an item still shows without one.
+        let libraries = composite.libraries().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "cannot list the libraries for an item's crumb");
+            Vec::new()
+        });
         let library = seen.library.as_ref().and_then(|l| {
             libraries.iter().find(|x| x.id == *l).map(|x| CatalogCrumb {
                 id: x.id.to_string(),
@@ -813,5 +864,64 @@ mod tests {
         assert_eq!(top(LibraryKind::Movies), MediaKind::Movie);
         assert_eq!(top(LibraryKind::Shows), MediaKind::Show);
         assert_eq!(top(LibraryKind::Music), MediaKind::Album);
+    }
+
+    /// Two whole-server checks that end at once each write their own
+    /// file and rename it over the last one: neither fails on the other's,
+    /// and what is left is one of them, whole.
+    /// A check whose catalog is let go of everywhere else stops, and one
+    /// whose catalog is still served runs to its end.
+    #[tokio::test(start_paused = true)]
+    async fn a_check_of_a_replaced_catalog_stops() {
+        // Stands for the catalog: what is held is all that matters.
+        let catalog = Arc::new(());
+        let served = catalog.clone();
+        let done = while_held_elsewhere(&catalog, async {
+            tokio::time::sleep(HELD_EVERY * 3).await;
+            7
+        })
+        .await;
+        assert_eq!(done, Some(7));
+        let check = tokio::spawn(async move {
+            while_held_elsewhere(&catalog, std::future::pending::<()>()).await
+        });
+        tokio::time::sleep(HELD_EVERY * 2).await;
+        assert!(!check.is_finished(), "stopped while the catalog was served");
+        drop(served);
+        tokio::time::sleep(HELD_EVERY * 2).await;
+        assert_eq!(check.await.unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn checks_kept_at_once_each_write_their_own_file() {
+        let dir = spoolframe_test_dir::TestDir::new("path-checks-at-once").await;
+        let checks = Arc::new(PathChecks::kept_in(dir.as_ref()));
+        let runs = (0..16).map(|at| {
+            let checks = checks.clone();
+            tokio::spawn(async move {
+                checks
+                    .keep_run(
+                        "basis",
+                        PathCheckRun {
+                            at,
+                            reports: Vec::new(),
+                        },
+                    )
+                    .await;
+            })
+        });
+        for run in futures_util::future::join_all(runs).await {
+            run.unwrap();
+        }
+        let kept = PathChecks::kept_in(dir.as_ref())
+            .last_run("basis")
+            .expect("no whole last run on disk");
+        assert!((0..16).contains(&kept.at));
+        let left: Vec<_> = std::fs::read_dir(dir.as_ref())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".new"))
+            .collect();
+        assert!(left.is_empty(), "partial files left: {left:?}");
     }
 }

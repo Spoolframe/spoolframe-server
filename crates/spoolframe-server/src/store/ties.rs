@@ -32,12 +32,6 @@ pub enum TieError {
     Store(#[from] StoreError),
 }
 
-impl From<sqlx::Error> for TieError {
-    fn from(e: sqlx::Error) -> Self {
-        TieError::Store(e.into())
-    }
-}
-
 impl Store {
     /// Tie `user`'s account to `portable`, proved by a `proof_kind`
     /// signature. One insert: the account's key and the identity's

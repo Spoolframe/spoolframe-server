@@ -223,7 +223,12 @@ async fn verify_password(password: &str, phc: String) -> bool {
             .unwrap_or(false)
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or_else(|e| {
+        // A panic in the check: refused, as a wrong password is, but not
+        // as one silently.
+        tracing::error!(error = %e, "the password check failed; the sign-in is refused");
+        false
+    })
 }
 
 /// A hash to verify against when the user does not exist, so an unknown
@@ -1106,6 +1111,14 @@ impl Auth {
             return Err(LoginError::InvalidCredentials);
         };
         let username = username.as_str();
+        // Counted as a failure before it is checked: logins sent at once
+        // would otherwise all be checked against a limit none had yet
+        // reached. And before the account is read: a name being guessed
+        // costs no database read once it is limited.
+        let began = self.clock.now();
+        if let Err(retry_after) = self.limiter.begin(username, source, began) {
+            return Err(LoginError::RateLimited { retry_after });
+        }
         let account = self.store.password_login(username).await?;
         let (phc, usable) = match &account {
             Some(a) => (
@@ -1114,13 +1127,6 @@ impl Auth {
             ),
             None => (decoy_hash(), false),
         };
-        // Counted as a failure before it is checked: logins sent at once
-        // would otherwise all be checked against a limit none had yet
-        // reached.
-        let began = self.clock.now();
-        if let Err(retry_after) = self.limiter.begin(username, source, began) {
-            return Err(LoginError::RateLimited { retry_after });
-        }
         let verified = verify_password(password, phc).await;
         // A one-time password past its expiry is a wrong one: only another
         // reset helps, and an attacker learns nothing new from it.
@@ -1354,6 +1360,22 @@ mod tests {
         }
         assert!(matches!(
             login(&auth, "alice", "correct horse").await,
+            Err(LoginError::RateLimited { .. })
+        ));
+    }
+
+    /// A limited name is refused before its account is read: with the
+    /// database gone, the answer is still the limit, not a store error.
+    #[tokio::test]
+    async fn a_limited_name_costs_no_database_read() {
+        let auth = auth_with_alice("limit-no-read").await;
+        for _ in 0..MAX_FAILURES {
+            let _ = login(&auth, "alice", "nope nope").await;
+        }
+        auth.store().close().await;
+        assert!(matches!(
+            auth.check_password("alice", "correct horse", Some("192.0.2.1"))
+                .await,
             Err(LoginError::RateLimited { .. })
         ));
     }

@@ -137,12 +137,6 @@ pub enum InviteError {
     Store(#[from] StoreError),
 }
 
-impl From<sqlx::Error> for InviteError {
-    fn from(e: sqlx::Error) -> Self {
-        InviteError::Store(e.into())
-    }
-}
-
 /// Where an invite stands, by its code's hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InviteState {
@@ -186,10 +180,17 @@ fn origin(row: &sqlx::sqlite::SqliteRow) -> Result<InviteOrigin, sqlx::Error> {
     let origin: String = row.try_get("origin")?;
     Ok(match origin.as_str() {
         "cli" => InviteOrigin::Cli,
+        // Nothing in the schema holds a device's endpoint NOT NULL (0022
+        // added the column to a table SQLite cannot add a CHECK to): a
+        // row without one is refused, not listed as made on a device
+        // with no endpoint.
         "device" => InviteOrigin::Device {
             endpoint_id: row
                 .try_get::<Option<String>, _>("origin_endpoint_id")?
-                .unwrap_or_default(),
+                .ok_or_else(|| sqlx::Error::ColumnDecode {
+                    index: "origin_endpoint_id".into(),
+                    source: "an invite made on a device has no endpoint".into(),
+                })?,
             name: row.try_get("origin_device_name")?,
             platform: row
                 .try_get::<Option<String>, _>("origin_platform")?
@@ -562,6 +563,19 @@ mod tests {
             .redeem_invite(hash, username, Some("Someone"), "$argon2id$x")
             .await
             .unwrap()
+    }
+
+    /// An invite made on a device whose row lost its endpoint is an
+    /// error, not one made on a device with the endpoint "".
+    #[tokio::test]
+    async fn a_device_invite_with_no_endpoint_is_refused() {
+        let store = store_with("invite-device-no-endpoint", "h1", 1).await;
+        sqlx::query("UPDATE invites SET origin = 'device', origin_endpoint_id = NULL")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let e = store.live_invites().await.unwrap_err();
+        assert!(e.to_string().contains("origin_endpoint_id"), "{e}");
     }
 
     #[tokio::test]

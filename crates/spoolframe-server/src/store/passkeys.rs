@@ -57,12 +57,6 @@ pub enum PasskeyError {
     Store(#[from] StoreError),
 }
 
-impl From<sqlx::Error> for PasskeyError {
-    fn from(e: sqlx::Error) -> Self {
-        PasskeyError::Store(e.into())
-    }
-}
-
 /// The longest name a passkey can have.
 pub const MAX_NAME_LEN: usize = 64;
 
@@ -85,20 +79,17 @@ impl Store {
         user: LocalUserId,
         fresh: &str,
     ) -> Result<String, StoreError> {
-        let mut tx = self.begin_write().await?;
-        sqlx::query(
-            "INSERT INTO passkey_users (user_id, handle) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        // One statement: a user who has a handle keeps it (the update
+        // sets it to itself, so RETURNING gives the kept one).
+        Ok(sqlx::query_scalar(
+            "INSERT INTO passkey_users (user_id, handle) VALUES (?1, ?2) \
+             ON CONFLICT (user_id) DO UPDATE SET handle = passkey_users.handle \
+             RETURNING handle",
         )
         .bind(user)
         .bind(fresh)
-        .execute(&mut *tx)
-        .await?;
-        let handle = sqlx::query_scalar("SELECT handle FROM passkey_users WHERE user_id = ?1")
-            .bind(user)
-            .fetch_one(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(handle)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     /// The user whose WebAuthn user handle is `handle`.

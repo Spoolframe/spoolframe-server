@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The web UI's sign-in endpoints answer a refusal with its own HTTP
+  status instead of 500: a sign-in too old for a change is 403, a
+  missing user, session, code or invite 404, the last admin 409, and
+  Plex or a sign-in provider that does not answer 503. The JSON body is
+  as before.
+
 - Picture subtitles read better and fail less (review 2026-10-11 Lows).
   PGS goes through the same text and outline split as DVB and VobSub, so
   a black outline is no longer read as text; one PGS composition placed

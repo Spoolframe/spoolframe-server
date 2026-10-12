@@ -703,13 +703,32 @@ fn failure(e: ErrorObjectOwned) -> Response<Body> {
         error_code::UNAUTHENTICATED
         | error_code::INVALID_CREDENTIALS
         | error_code::PASSKEY_REFUSED => StatusCode::UNAUTHORIZED,
-        error_code::FORBIDDEN | error_code::INVALID_SETUP_CODE => StatusCode::FORBIDDEN,
+        error_code::FORBIDDEN
+        | error_code::INVALID_SETUP_CODE
+        | error_code::RECENT_SIGN_IN_REQUIRED
+        | error_code::PASSWORD_CHANGE_REQUIRED => StatusCode::FORBIDDEN,
         error_code::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
-        error_code::ALREADY_SET_UP | error_code::USER_EXISTS | error_code::SETTING_LOCKED => {
-            StatusCode::CONFLICT
-        }
+        error_code::ALREADY_SET_UP
+        | error_code::USER_EXISTS
+        | error_code::SETTING_LOCKED
+        | error_code::LAST_ADMIN
+        | error_code::LAST_SIGN_IN_METHOD
+        | error_code::LINK_REFUSED
+        | error_code::NO_CONVERSION => StatusCode::CONFLICT,
+        error_code::NO_SUCH_USER
+        | error_code::NO_SUCH_SESSION
+        | error_code::NO_SUCH_DEVICE
+        | error_code::NO_SUCH_PASSKEY
+        | error_code::NO_SUCH_SIGN_IN_CODE
+        | error_code::NO_SUCH_LINK
+        | error_code::NO_SUCH_PLAYBACK
+        | error_code::NO_SUCH_INVITE
+        | error_code::NO_SUCH_GRANT => StatusCode::NOT_FOUND,
         error_code::INVALID_INPUT => StatusCode::BAD_REQUEST,
         error_code::NOT_CONFIGURED => StatusCode::NOT_IMPLEMENTED,
+        // Plex, or a sign-in provider, did not answer: the server is
+        // fine, what it depends on is not.
+        error_code::UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let body = json!({ "code": e.code(), "message": e.message(), "data": e.data() });
@@ -1239,6 +1258,34 @@ async fn metrics_page(State(api): State<AdminApi>, req: Request) -> Response<Bod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal the web UI can act on is not a server error: a stale
+    /// sign-in, a missing row, the last admin, a provider that is down.
+    #[test]
+    fn a_refusal_is_answered_with_its_own_status_not_500() {
+        let status = |code| failure(ErrorObjectOwned::owned::<()>(code, "x", None)).status();
+        assert_eq!(
+            status(error_code::RECENT_SIGN_IN_REQUIRED),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(error_code::PASSWORD_CHANGE_REQUIRED),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(error_code::UNAVAILABLE),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(status(error_code::LAST_ADMIN), StatusCode::CONFLICT);
+        for code in [
+            error_code::NO_SUCH_USER,
+            error_code::NO_SUCH_SIGN_IN_CODE,
+            error_code::NO_SUCH_INVITE,
+        ] {
+            assert_eq!(status(code), StatusCode::NOT_FOUND, "{code}");
+        }
+        assert_eq!(status(-32603), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     #[test]
     fn a_plain_http_sign_in_across_the_network_is_told_apart() {

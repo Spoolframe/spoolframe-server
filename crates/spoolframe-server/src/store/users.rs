@@ -162,10 +162,11 @@ pub enum UserError {
     Store(#[from] StoreError),
 }
 
-impl From<sqlx::Error> for UserError {
-    fn from(e: sqlx::Error) -> Self {
-        UserError::Store(e.into())
-    }
+/// Which users [`Store::users_where`] reads.
+enum Which<'a> {
+    All,
+    Id(LocalUserId),
+    Name(&'a str),
 }
 
 pub(super) fn is_unique_violation(e: &sqlx::Error) -> bool {
@@ -390,7 +391,12 @@ impl Store {
 
     /// One user, by id.
     pub async fn user_by_id(&self, id: LocalUserId) -> Result<Option<UserRecord>, UserError> {
-        Ok(self.users_where(Some(id)).await?.pop())
+        Ok(self.users_where(Which::Id(id)).await?.pop())
+    }
+
+    /// The user named `username` (lowercased, as usernames are kept).
+    pub async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, UserError> {
+        Ok(self.users_where(Which::Name(username)).await?.pop())
     }
 
     /// Whether an enabled admin has a password: the rule every change
@@ -455,12 +461,12 @@ impl Store {
     }
 
     pub async fn list_users(&self) -> Result<Vec<UserRecord>, UserError> {
-        self.users_where(None).await
+        self.users_where(Which::All).await
     }
 
-    /// Every user, or with `one` only that one: the same record either
-    /// way, each column worked out only for the rows asked for.
-    async fn users_where(&self, one: Option<LocalUserId>) -> Result<Vec<UserRecord>, UserError> {
+    /// The users `which` asks for: the same record whichever, each column
+    /// worked out only for the rows asked for.
+    async fn users_where(&self, which: Which<'_>) -> Result<Vec<UserRecord>, UserError> {
         macro_rules! select {
             () => {
                 "SELECT u.id, u.username, u.display_name, u.role, u.created_at, \
@@ -484,17 +490,24 @@ impl Store {
                   LEFT JOIN portable_ties t ON t.local_user_id = u.id "
             };
         }
-        let rows = match one {
-            None => {
+        let rows = match which {
+            Which::All => {
                 sqlx::query(concat!(select!(), "ORDER BY u.username"))
                     .bind(self.now())
                     .fetch_all(&self.pool)
                     .await?
             }
-            Some(id) => {
+            Which::Id(id) => {
                 sqlx::query(concat!(select!(), "WHERE u.id = ?2"))
                     .bind(self.now())
                     .bind(id)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            Which::Name(username) => {
+                sqlx::query(concat!(select!(), "WHERE u.username = ?2"))
+                    .bind(self.now())
+                    .bind(username)
                     .fetch_all(&self.pool)
                     .await?
             }
@@ -1003,6 +1016,11 @@ mod tests {
         }
         let nobody = LocalUserId::from_uuid(uuid::Uuid::from_u128(99));
         assert_eq!(store.user_by_id(nobody).await.unwrap(), None);
+        for name in ["alice", "bob"] {
+            let one = store.user_by_name(name).await.unwrap();
+            assert_eq!(one.as_ref(), listed.iter().find(|u| u.username == name));
+        }
+        assert_eq!(store.user_by_name("mallory").await.unwrap(), None);
     }
 
     #[tokio::test]

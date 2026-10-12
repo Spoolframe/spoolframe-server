@@ -69,6 +69,10 @@ const CLOCK_SKEW_SECS: i64 = 60;
 /// are fetched again: sign-ins begun at once (or a stranger's flood of
 /// them) ask the provider once.
 const DISCOVERY_FRESH: Duration = Duration::from_secs(60);
+/// How long a failed discovery fetch is the answer before it is tried
+/// again: while a provider is down, a begin is told so at once instead of
+/// waiting out the request's timeout each time.
+const DISCOVERY_RETRY: Duration = Duration::from_secs(15);
 
 /// How long the provider is waited for, each request.
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -221,7 +225,20 @@ impl SecretSource {
     /// The secret now, trimmed; `None` when there is none.
     fn read(&self) -> Option<String> {
         let text = match self {
-            SecretSource::File(path) => std::fs::read_to_string(path).ok()?,
+            SecretSource::File(path) => match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                // No file is no secret; a file that cannot be read is one
+                // the admin meant to give, and is said so.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "cannot read a sign-in provider's client secret"
+                    );
+                    return None;
+                }
+            },
             SecretSource::Value(value) => value.clone(),
         };
         Some(text.trim().to_owned()).filter(|s| !s.is_empty())
@@ -338,6 +355,18 @@ pub struct Oidc {
     lifetime: Duration,
     /// Each issuer's discovery document, and when it was fetched.
     discovered: Mutex<HashMap<String, (Instant, Arc<Metadata>)>>,
+    /// Each issuer whose last fetch failed: when, and how.
+    failed: Mutex<HashMap<String, (Instant, Failed)>>,
+    /// One fetch at a time per issuer: begins that come while one runs
+    /// wait for its answer instead of fetching too.
+    fetching: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// How a discovery fetch failed, kept for [`DISCOVERY_RETRY`].
+#[derive(Debug, Clone)]
+enum Failed {
+    NotConfigured(String),
+    Unavailable(String),
 }
 
 impl std::fmt::Debug for Oidc {
@@ -400,6 +429,8 @@ impl Oidc {
             flows: Mutex::default(),
             lifetime: FLOW_LIFETIME,
             discovered: Mutex::default(),
+            failed: Mutex::default(),
+            fetching: Mutex::default(),
         }
     }
 
@@ -527,16 +558,64 @@ impl Oidc {
     /// The provider's discovery document and keys, fetched within the
     /// last [`DISCOVERY_FRESH`].
     async fn discover(&self, provider: &Provider) -> Result<Arc<Metadata>, OidcError> {
+        if let Some(known) = self.known(provider) {
+            return known;
+        }
+        let flight = self
+            .fetching
+            .lock()
+            .entry(provider.issuer.clone())
+            .or_default()
+            .clone();
+        let _flight = flight.lock().await;
+        // Another begin's fetch may have answered while this one waited.
+        if let Some(known) = self.known(provider) {
+            return known;
+        }
+        match self.fetch_discovery(provider).await {
+            Ok(metadata) => {
+                let metadata = Arc::new(metadata);
+                self.failed.lock().remove(&provider.issuer);
+                self.discovered
+                    .lock()
+                    .insert(provider.issuer.clone(), (Instant::now(), metadata.clone()));
+                Ok(metadata)
+            }
+            Err(e) => {
+                let failed = match &e {
+                    OidcError::NotConfigured(why) => Some(Failed::NotConfigured(why.clone())),
+                    OidcError::Unavailable { why, .. } => Some(Failed::Unavailable(why.clone())),
+                    _ => None,
+                };
+                if let Some(failed) = failed {
+                    self.failed
+                        .lock()
+                        .insert(provider.issuer.clone(), (Instant::now(), failed));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The provider's document fetched within [`DISCOVERY_FRESH`], or its
+    /// fetch's failure within [`DISCOVERY_RETRY`]; `None` to fetch.
+    fn known(&self, provider: &Provider) -> Option<Result<Arc<Metadata>, OidcError>> {
         if let Some((at, metadata)) = self.discovered.lock().get(&provider.issuer)
             && at.elapsed() < DISCOVERY_FRESH
         {
-            return Ok(metadata.clone());
+            return Some(Ok(metadata.clone()));
         }
-        let metadata = Arc::new(self.fetch_discovery(provider).await?);
-        self.discovered
-            .lock()
-            .insert(provider.issuer.clone(), (Instant::now(), metadata.clone()));
-        Ok(metadata)
+        let failed = self.failed.lock();
+        let (at, failed) = failed.get(&provider.issuer)?;
+        (at.elapsed() < DISCOVERY_RETRY).then(|| {
+            Err(match failed {
+                Failed::NotConfigured(why) => OidcError::NotConfigured(why.clone()),
+                Failed::Unavailable(why) => OidcError::Unavailable {
+                    provider: provider.name.clone(),
+                    why: why.clone(),
+                },
+            })
+        })
     }
 
     async fn fetch_discovery(&self, provider: &Provider) -> Result<Metadata, OidcError> {
@@ -889,6 +968,48 @@ mod tests {
 
     /// Review 2026-10-11 M38: flows begun from one discovery document
     /// share it with the cache, rather than holding a copy each.
+    /// While a provider is down, begins sent at once fetch its document
+    /// once between them, and the ones after are told at once until
+    /// [`DISCOVERY_RETRY`] is over.
+    #[tokio::test]
+    async fn a_provider_that_is_down_is_asked_once_and_remembered() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
+        let pms = MockServer::start().await;
+        Mock::given(matchers::path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_millis(200)))
+            .expect(1)
+            .mount(&pms)
+            .await;
+        let oidc = Arc::new(Oidc::new(Some("https://media.example.org/"), None));
+        oidc.set_providers(&[OidcConfig {
+            name: "Pocket ID".into(),
+            issuer: pms.uri(),
+            client_id: "x".into(),
+            client_secret_file: None,
+            client_secret: Some("s3cret".into()),
+            scopes: None,
+        }]);
+        let begins = (0..4).map(|_| {
+            let oidc = oidc.clone();
+            tokio::spawn(async move {
+                oidc.begin("Pocket ID", Purpose::SignIn { return_to: None }, None)
+                    .await
+            })
+        });
+        for begun in futures_util::future::join_all(begins).await {
+            assert!(
+                matches!(begun.unwrap(), Err(OidcError::Unavailable { .. })),
+                "a down provider began a flow"
+            );
+        }
+        assert!(matches!(
+            oidc.begin("Pocket ID", Purpose::SignIn { return_to: None }, None)
+                .await,
+            Err(OidcError::Unavailable { .. })
+        ));
+        pms.verify().await;
+    }
+
     #[tokio::test]
     async fn flows_share_the_cached_discovery_document() {
         let oidc = Oidc::new(Some("https://media.example.org/"), None);

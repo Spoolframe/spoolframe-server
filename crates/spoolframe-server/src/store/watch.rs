@@ -194,32 +194,14 @@ impl Store {
         media_id: &str,
         external_ids: &[String],
     ) -> Result<Option<String>, StoreError> {
-        if external_ids.is_empty() {
-            return Ok(None);
-        }
-        let principal = principal.to_string();
-        let has_own: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM continue_hidden WHERE principal = ?1 AND media_id = ?2",
+        self.under_another_key(
+            "continue_hidden",
+            "continue_hidden_ids",
+            principal,
+            media_id,
+            external_ids,
         )
-        .bind(&principal)
-        .bind(media_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        if has_own.is_some() {
-            return Ok(None);
-        }
-        let mut query: QueryBuilder<Sqlite> =
-            QueryBuilder::new("SELECT media_id FROM continue_hidden_ids WHERE principal = ");
-        query.push_bind(&principal).push(" AND external_id IN (");
-        let mut ids = query.separated(", ");
-        for id in external_ids {
-            ids.push_bind(id);
-        }
-        query.push(") LIMIT 1");
-        Ok(query
-            .build_query_scalar()
-            .fetch_optional(&self.pool)
-            .await?)
+        .await
     }
 
     /// Move the hide of `from` to `to` (the item got a new key), unless
@@ -254,22 +236,40 @@ impl Store {
         media_id: &str,
         external_ids: &[String],
     ) -> Result<Option<String>, StoreError> {
+        self.under_another_key(
+            "watch_state",
+            "watch_state_ids",
+            principal,
+            media_id,
+            external_ids,
+        )
+        .await
+    }
+
+    /// The key in `table` that an item with one of `external_ids` is
+    /// under (its ids in `ids_table`), when `media_id` itself is not
+    /// there: one query, the absence of `media_id` in its WHERE.
+    async fn under_another_key(
+        &self,
+        table: &'static str,
+        ids_table: &'static str,
+        principal: Principal,
+        media_id: &str,
+        external_ids: &[String],
+    ) -> Result<Option<String>, StoreError> {
         if external_ids.is_empty() {
             return Ok(None);
         }
         let principal = principal.to_string();
-        let has_own: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM watch_state WHERE principal = ?1 AND media_id = ?2")
-                .bind(&principal)
-                .bind(media_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        if has_own.is_some() {
-            return Ok(None);
-        }
-        let mut query: QueryBuilder<Sqlite> =
-            QueryBuilder::new("SELECT media_id FROM watch_state_ids WHERE principal = ");
-        query.push_bind(&principal).push(" AND external_id IN (");
+        // The table names are this module's constants, never input.
+        let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+            "SELECT i.media_id FROM {ids_table} i WHERE i.principal = "
+        ));
+        query.push_bind(&principal).push(format!(
+            " AND NOT EXISTS (SELECT 1 FROM {table} o WHERE o.principal = i.principal \
+               AND o.media_id = "
+        ));
+        query.push_bind(media_id).push(") AND i.external_id IN (");
         let mut ids = query.separated(", ");
         for id in external_ids {
             ids.push_bind(id);

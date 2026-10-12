@@ -17,7 +17,7 @@
 //! walks MP4's sample tables where they lie in what it read, allocates
 //! nothing from a size or count the file states, keeps at most
 //! [`MAX_KEYFRAMES`] times, and never recurses on the file's nesting: at
-//! most 32 MiB read and 32 MiB of times held, per file.
+//! most 48 MiB read and 32 MiB of times held, per file.
 //! Anything it does not follow is [`NoIndex`]: the caller falls back to
 //! the full scan.
 

@@ -217,7 +217,13 @@ pub async fn server_link(endpoint_id: String, name: String, told: Option<Told>) 
         Some(told) => {
             tokio::task::spawn_blocking(move || (told.addrs(), told.relays(), told.lookup()))
                 .await
-                .unwrap_or_default()
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "cannot read the addresses for an invite link; it names none"
+                    );
+                    Default::default()
+                })
         }
         None => Default::default(),
     };

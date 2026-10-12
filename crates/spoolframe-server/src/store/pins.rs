@@ -52,12 +52,6 @@ pub enum PinError {
     Store(#[from] StoreError),
 }
 
-impl From<sqlx::Error> for PinError {
-    fn from(e: sqlx::Error) -> Self {
-        PinError::Store(e.into())
-    }
-}
-
 impl Store {
     /// `user`'s PIN hash, if they have one.
     pub async fn pin_phc(&self, user: LocalUserId) -> Result<Option<String>, StoreError> {
@@ -129,14 +123,7 @@ impl Store {
         required: bool,
     ) -> Result<(), PinError> {
         let mut tx = self.begin_write().await?;
-        let theirs: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM sessions WHERE user_id = ?1 AND endpoint_id = ?2 LIMIT 1",
-        )
-        .bind(user)
-        .bind(endpoint_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if theirs.is_none() {
+        if !super::user_has_device(&mut tx, user, endpoint_id).await? {
             return Err(PinError::NoSuchDevice);
         }
         if required {
@@ -235,14 +222,7 @@ impl Store {
         endpoint_id: &str,
     ) -> Result<u64, PinError> {
         let mut tx = self.begin_write().await?;
-        let theirs: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM sessions WHERE user_id = ?1 AND endpoint_id = ?2 LIMIT 1",
-        )
-        .bind(user)
-        .bind(endpoint_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if theirs.is_none() {
+        if !super::user_has_device(&mut tx, user, endpoint_id).await? {
             return Err(PinError::NoSuchDevice);
         }
         for delete in [

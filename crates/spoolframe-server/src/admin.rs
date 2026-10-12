@@ -997,9 +997,15 @@ impl AdminApi {
     /// The caller, if an admin. The role is the user's now, not when the
     /// session began: a demoted admin's next `admin.*` call is refused.
     async fn admin(&self, ext: &Extensions) -> RpcResult<ApiSessionUser> {
-        let (_, user) = self.caller(ext).await?;
+        Ok(self.admin_session(ext).await?.1)
+    }
+
+    /// [`Self::admin`], with the session's token: for a call that keeps
+    /// the admin's own session, in one lookup.
+    async fn admin_session(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
+        let (token, user) = self.caller(ext).await?;
         if user.role.is_admin() {
-            Ok(user)
+            Ok((token, user))
         } else {
             Err(error(error_code::FORBIDDEN, "admins only"))
         }
@@ -1020,9 +1026,14 @@ impl AdminApi {
     /// stolen cookie, cannot make one. The role is checked first, so a
     /// consumer is told `FORBIDDEN`, not asked to confirm.
     async fn recent_admin(&self, ext: &Extensions) -> RpcResult<ApiSessionUser> {
-        let user = self.admin(ext).await?;
+        Ok(self.recent_admin_session(ext).await?.1)
+    }
+
+    /// [`Self::recent_admin`], with the session's token, in one lookup.
+    async fn recent_admin_session(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
+        let (token, user) = self.admin_session(ext).await?;
         recent(&user, self.auth.store().now())?;
-        Ok(user)
+        Ok((token, user))
     }
 
     /// The caller, `typed` as a device sign-in code (P3-07) and the guess
@@ -1099,10 +1110,10 @@ impl AdminApi {
 
     async fn user_info(&self, username: &str) -> RpcResult<UserInfo> {
         let name = normalize_username(username)?;
-        let users = self.auth.store().list_users().await?;
-        users
-            .into_iter()
-            .find(|u| u.username == name)
+        self.auth
+            .store()
+            .user_by_name(&name)
+            .await?
             .map(|u| self.info(u))
             .ok_or_else(|| UserError::NoSuchUser(name).into())
     }
@@ -1657,10 +1668,8 @@ impl AdminApi {
         let name = normalize_username(username)?;
         self.auth
             .store()
-            .list_users()
+            .user_by_name(&name)
             .await?
-            .into_iter()
-            .find(|u| u.username == name)
             .ok_or_else(|| UserError::NoSuchUser(name).into())
     }
 }
@@ -1845,7 +1854,7 @@ impl MeApiServer for AdminApi {
         } else {
             // Set up with a passkey, with no password to prove it is them:
             // a recent sign-in does, as for adding a passkey.
-            self.recently_signed_in(ext).await?;
+            recent(&user, self.auth.store().now())?;
         }
         let phc = hash_password(&change.new_password).await?;
         // Every other session of theirs ends, on the web and on devices.
@@ -2492,8 +2501,7 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn user_set_password(&self, ext: &Extensions, credentials: Credentials) -> RpcResult<()> {
-        self.recent_admin(ext).await?;
-        let (token, _) = self.caller(ext).await?;
+        let (token, _) = self.recent_admin_session(ext).await?;
         let phc = hash_password(&credentials.password).await?;
         // Every session of theirs ends; the admin's own is kept, which is
         // one of theirs only when they reset their own password.
@@ -2673,8 +2681,7 @@ impl AdminApiServer for AdminApi {
         ext: &Extensions,
         username: String,
     ) -> RpcResult<Vec<SessionEntry>> {
-        let (token, _) = self.caller(ext).await?;
-        self.admin(ext).await?;
+        let (token, _) = self.admin_session(ext).await?;
         let user = self.record(&username).await?;
         let current = crate::auth::SessionToken(token).hash();
         let sessions = self
@@ -2729,8 +2736,7 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn user_remove_password(&self, ext: &Extensions, username: String) -> RpcResult<()> {
-        self.recent_admin(ext).await?;
-        let (token, _) = self.caller(ext).await?;
+        let (token, _) = self.recent_admin_session(ext).await?;
         // Their own sessions but this one, when an admin takes their own.
         let keep = SessionToken(token).hash();
         let revoked = self
@@ -2884,7 +2890,7 @@ impl AdminApiServer for AdminApi {
         // Only a check of every library stands for the page's.
         if library.is_none() {
             match plex.paths_basis().await {
-                Ok(basis) => self.checks.keep_run(&basis, run.clone()),
+                Ok(basis) => self.checks.keep_run(&basis, run.clone()).await,
                 Err(e) => tracing::warn!(error = %e, "cannot keep the path check"),
             }
         }

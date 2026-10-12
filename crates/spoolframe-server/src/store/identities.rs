@@ -34,12 +34,6 @@ pub enum IdentityError {
     Store(#[from] StoreError),
 }
 
-impl From<sqlx::Error> for IdentityError {
-    fn from(e: sqlx::Error) -> Self {
-        IdentityError::Store(e.into())
-    }
-}
-
 impl Store {
     /// Link `subject` at `issuer` to `user`. An identity that is anyone's
     /// already is refused, never moved, as is a second one of `user`'s at

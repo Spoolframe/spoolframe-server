@@ -184,18 +184,13 @@ pub fn iphone() -> ClientCapabilities {
 }
 
 fn plan_kind(plan: &PlaybackPlan) -> api::PlanKind {
-    match plan {
-        PlaybackPlan::Direct { .. } => api::PlanKind::Direct,
-        PlaybackPlan::Converted { video, audio, .. } => {
-            let encodes = matches!(video, Some(ConvertedVideo::Encode { .. }))
-                || audio.is_some_and(|a| matches!(a.action, AudioAction::Encode { .. }));
-            if encodes {
-                api::PlanKind::Transcode
-            } else {
-                api::PlanKind::Remux
-            }
-        }
-        _ => api::PlanKind::Unsupported,
+    match planner::Kind::of(plan) {
+        planner::Kind::Direct => api::PlanKind::Direct,
+        planner::Kind::Remux => api::PlanKind::Remux,
+        planner::Kind::Transcode => api::PlanKind::Transcode,
+        // The admin API has no `unknown`: a plan this server cannot read
+        // plays no better than one it refused.
+        planner::Kind::Unsupported | planner::Kind::Unknown => api::PlanKind::Unsupported,
     }
 }
 
@@ -541,8 +536,18 @@ pub fn plan_view(
         line: plan_line(plan),
         streams: rows,
         reasons: left,
-        plan: serde_json::to_value(plan).unwrap_or_default(),
+        plan: as_json(plan),
     }
+}
+
+/// `value` as JSON for the admin view: a value that cannot be one (a
+/// map keyed by something not a string) is shown as the error, and
+/// logged, not as `null`.
+fn as_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "a playback plan cannot be shown as JSON");
+        serde_json::json!({ "error": format!("cannot be shown as JSON: {e}") })
+    })
 }
 
 fn row(s: &Snapshot) -> api::PlaybackRow {
@@ -1153,6 +1158,42 @@ fn probe(path: &std::path::Path, d: &MediaDescriptor, size: Option<u64>) -> api:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plan's kind in the admin view is the one its log line names,
+    /// for every plan the API can say (Review 2026-10-11 N6.4).
+    #[test]
+    fn a_plan_s_kind_is_its_log_line_s() {
+        for plan in [
+            PlaybackPlan::Unsupported {
+                reasons: Vec::new(),
+            },
+            PlaybackPlan::Unknown,
+        ] {
+            assert_eq!(plan_kind(&plan), api::PlanKind::Unsupported);
+        }
+        assert_eq!(planner::summary(&PlaybackPlan::Unknown).kind, "unknown");
+        assert_eq!(
+            planner::summary(&PlaybackPlan::Unsupported {
+                reasons: Vec::new()
+            })
+            .kind,
+            "unsupported"
+        );
+    }
+
+    /// A value that cannot be JSON is shown as its error, not as `null`
+    /// (Review 2026-10-11 N6.3).
+    #[test]
+    fn a_value_that_cannot_be_json_shows_its_error() {
+        let keyed_by_pairs: std::collections::BTreeMap<(u8, u8), u8> = [((1, 2), 3)].into();
+        let shown = as_json(&keyed_by_pairs);
+        assert!(
+            shown["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("cannot be shown as JSON")),
+            "{shown}"
+        );
+    }
 
     #[test]
     fn a_reason_goes_to_the_stream_it_names() {

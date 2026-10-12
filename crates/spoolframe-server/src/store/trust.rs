@@ -33,12 +33,6 @@ pub enum TrustError {
     Store(#[from] StoreError),
 }
 
-impl From<sqlx::Error> for TrustError {
-    fn from(e: sqlx::Error) -> Self {
-        TrustError::Store(e.into())
-    }
-}
-
 /// What a trusted device's resume made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resumed {
@@ -124,14 +118,7 @@ impl Store {
         }
         let now = self.now();
         let mut tx = self.begin_write().await?;
-        let theirs: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM sessions WHERE user_id = ?1 AND endpoint_id = ?2 LIMIT 1",
-        )
-        .bind(user)
-        .bind(endpoint_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if theirs.is_none() {
+        if !super::user_has_device(&mut tx, user, endpoint_id).await? {
             return Err(TrustError::NoSuchDevice);
         }
         let mut revoked = 0;
@@ -307,6 +294,7 @@ impl Store {
                 authenticated_at: 0,
                 signed_in_with: SignedInWith::from_column(signed_in_with.as_deref()),
             },
+            None,
         )
         .await?;
         tx.commit().await?;

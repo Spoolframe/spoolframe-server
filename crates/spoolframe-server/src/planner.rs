@@ -1147,14 +1147,55 @@ fn encode_audio(
     })
 }
 
-/// Unknown is never supported, whatever the client claims.
+/// What a plan does, in one word: the kind its log line
+/// ([`PlanSummary::kind`]) and the admin playback views name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Direct,
+    /// A conversion that encodes nothing, only copying its streams into
+    /// another container (PX-24).
+    Remux,
+    Transcode,
+    Unsupported,
+    /// A plan from a newer server this one cannot read.
+    Unknown,
+}
+
+impl Kind {
+    pub fn of(plan: &PlaybackPlan) -> Self {
+        match plan {
+            PlaybackPlan::Direct { .. } => Self::Direct,
+            PlaybackPlan::Converted { video, audio, .. } => {
+                if matches!(video, Some(ConvertedVideo::Encode { .. }))
+                    || audio.is_some_and(|a| matches!(a.action, AudioAction::Encode { .. }))
+                {
+                    Self::Transcode
+                } else {
+                    Self::Remux
+                }
+            }
+            PlaybackPlan::Unsupported { .. } => Self::Unsupported,
+            PlaybackPlan::Unknown => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Remux => "remux",
+            Self::Transcode => "transcode",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// A plan in the words of one log line: what the server decided, each
 /// part short enough to read in a row. `none` is no such stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanSummary {
-    /// `direct`; `remux` when a conversion encodes nothing, only copying
-    /// its streams into another container (PX-24), or `transcode`; or
-    /// `unsupported`.
+    /// [`Kind::as_str`]: `direct`, `remux`, `transcode`, `unsupported`
+    /// or `unknown`.
     pub kind: &'static str,
     pub delivery: Delivery,
     /// `direct:hevc`, `copy:hevc`, `encode:h264:1080p` (`:tonemap` after
@@ -1176,7 +1217,7 @@ pub fn summary(plan: &PlaybackPlan) -> PlanSummary {
             subtitle,
             ..
         } => PlanSummary {
-            kind: "direct",
+            kind: Kind::of(plan).as_str(),
             delivery: Delivery::Range,
             video: video.map_or_else(none, |codec| format!("direct:{codec}")),
             audio: audio.map_or_else(none, |a| format!("direct:{}", a.codec)),
@@ -1196,13 +1237,7 @@ pub fn summary(plan: &PlaybackPlan) -> PlanSummary {
             subtitle,
             ..
         } => PlanSummary {
-            kind: if matches!(video, Some(ConvertedVideo::Encode { .. }))
-                || audio.is_some_and(|a| matches!(a.action, AudioAction::Encode { .. }))
-            {
-                "transcode"
-            } else {
-                "remux"
-            },
+            kind: Kind::of(plan).as_str(),
             delivery: *delivery,
             video: video.map_or_else(none, |video| match video {
                 ConvertedVideo::Copy { codec, .. } => format!("copy:{codec}"),
@@ -1233,11 +1268,7 @@ pub fn summary(plan: &PlaybackPlan) -> PlanSummary {
             }),
         },
         PlaybackPlan::Unsupported { .. } | PlaybackPlan::Unknown => PlanSummary {
-            kind: if matches!(plan, PlaybackPlan::Unknown) {
-                "unknown"
-            } else {
-                "unsupported"
-            },
+            kind: Kind::of(plan).as_str(),
             delivery: Delivery::Unknown,
             video: none(),
             audio: none(),

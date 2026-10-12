@@ -43,12 +43,6 @@ pub enum IdentityStateError {
     Store(#[from] StoreError),
 }
 
-impl From<sqlx::Error> for IdentityStateError {
-    fn from(e: sqlx::Error) -> Self {
-        IdentityStateError::Store(e.into())
-    }
-}
-
 /// What taking in a state changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateAccepted {

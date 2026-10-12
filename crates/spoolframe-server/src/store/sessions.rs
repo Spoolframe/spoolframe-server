@@ -175,6 +175,7 @@ impl Store {
                 authenticated_at: now,
                 signed_in_with,
             },
+            None,
         )
         .await?;
         tx.commit().await?;
@@ -209,17 +210,8 @@ impl Store {
                 authenticated_at: 0,
                 signed_in_with: Some(SignedInWith::PortableCredential),
             },
+            Some(credential),
         )
-        .await?;
-        sqlx::query(
-            "UPDATE sessions SET portable_user_id = ?2, portable_device_key = ?3, \
-               portable_expires_at = ?4 WHERE token_hash = ?1",
-        )
-        .bind(token_hash)
-        .bind(credential.user.to_string())
-        .bind(credential.device_key.to_string())
-        .bind(credential.expires_at)
-        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(())
@@ -233,6 +225,7 @@ impl Store {
         binding: &SessionBinding,
         expires_at: i64,
         stamp: Stamp,
+        credential: Option<&super::grants::CredentialBinding>,
     ) -> Result<(), StoreError> {
         let Stamp {
             now,
@@ -272,8 +265,9 @@ impl Store {
         sqlx::query(
             "INSERT INTO sessions \
                (token_hash, user_id, kind, endpoint_id, created_at, last_used_at, \
-                authenticated_at, expires_at, client, signed_in_with) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?8, ?6, ?7, ?9)",
+                authenticated_at, expires_at, client, signed_in_with, \
+                portable_user_id, portable_device_key, portable_expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?8, ?6, ?7, ?9, ?10, ?11, ?12)",
         )
         .bind(token_hash)
         .bind(user)
@@ -284,6 +278,9 @@ impl Store {
         .bind(client)
         .bind(authenticated_at)
         .bind(signed_in_with.map(SignedInWith::as_str))
+        .bind(credential.map(|c| c.user.to_string()))
+        .bind(credential.map(|c| c.device_key.to_string()))
+        .bind(credential.map(|c| c.expires_at))
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -571,7 +568,11 @@ impl Store {
     /// endpoint and a web one is the admin API's (the CLI's or a browser's).
     pub async fn live_session_counts(&self) -> Result<Vec<(LocalUserId, u64, u64)>, StoreError> {
         let rows: Vec<(LocalUserId, i64, i64)> = sqlx::query_as(
-            "SELECT s.user_id,                     sum(s.kind = 'endpoint'), sum(s.kind = 'api')              FROM sessions s JOIN users u ON u.id = s.user_id              WHERE s.revoked_at IS NULL AND s.expires_at > ?1 AND u.disabled_at IS NULL              GROUP BY s.user_id ORDER BY s.user_id",
+            "SELECT s.user_id, \
+                    sum(s.kind = 'endpoint'), sum(s.kind = 'api') \
+             FROM sessions s JOIN users u ON u.id = s.user_id \
+             WHERE s.revoked_at IS NULL AND s.expires_at > ?1 AND u.disabled_at IS NULL \
+             GROUP BY s.user_id ORDER BY s.user_id",
         )
         .bind(self.now())
         .fetch_all(&self.pool)
