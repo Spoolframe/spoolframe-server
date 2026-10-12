@@ -68,10 +68,10 @@ pub fn cues_within(
         // container says, or at the next; the last of those is dropped, as
         // PGS's is.
         let end_ms = match unit.stop_ms {
-            Some(stop) => Some(packet.pts_ms + stop),
+            Some(stop) => Some(packet.pts_ms.saturating_add(stop)),
             None => packet
                 .duration_ms
-                .map(|d| packet.pts_ms + d)
+                .map(|d| packet.pts_ms.saturating_add(d))
                 .or_else(|| packets.get(i + 1).map(|p| p.pts_ms)),
         };
         let Some(end_ms) = end_ms else {
@@ -81,12 +81,14 @@ pub fn cues_within(
             luma: lumas[usize::from(unit.colours[c] & 0x0f)],
             alpha: unit.alpha[c] * 17,
         });
+        // Counted before the picture is allocated (review 2026-10-11 L68).
+        out.afford(unit.width, unit.height)?;
         let pixels: Vec<Colour> = picture(&packet.data, &unit)
             .into_iter()
             .map(|i| palette[usize::from(i)])
             .collect();
         if let Some(image) = bitmap::text_picture(unit.width, unit.height, &pixels, &out)? {
-            out.push(packet.pts_ms + start, end_ms, image)?;
+            out.push(packet.pts_ms.saturating_add(start), end_ms, image)?;
         }
     }
     if unreadable > 0 {
@@ -172,7 +174,16 @@ fn unit(data: &[u8]) -> Option<Unit> {
                 }
                 // Colour and contrast changes within the picture: skipped,
                 // by the size it starts with.
-                0x07 => pos += be16(data, pos)?,
+                // A size under 2 would leave `pos` on the size itself, read
+                // again as commands: the unit is broken (review 2026-10-11
+                // L71).
+                0x07 => {
+                    let size = be16(data, pos)?;
+                    if size < 2 {
+                        return None;
+                    }
+                    pos += size;
+                }
                 // The end of the sequence, or a command we do not know,
                 // whose length we cannot know either.
                 _ => break,
@@ -247,6 +258,16 @@ impl Nibbles<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// A colour-change command whose size is under 2 would leave the
+    /// parser on its own size bytes, read again as commands: the unit is
+    /// broken. Review 2026-10-11 L71.
+    #[test]
+    fn a_colour_change_of_size_0_is_a_broken_unit() {
+        // Size 12, control at 4: date 0, next 4 (itself), 0x07 of size 0.
+        let data = [0, 12, 0, 4, 0, 0, 0, 4, 0x07, 0, 0, 0xff];
+        assert!(super::unit(&data).is_none());
+    }
+
     use super::*;
     use crate::bitmap::{Budget, OverBudget};
 

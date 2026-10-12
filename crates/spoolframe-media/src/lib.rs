@@ -6,6 +6,7 @@
 //! sees.
 
 pub mod bitmap;
+mod capped;
 pub mod codecs;
 pub mod decode;
 mod descriptor;

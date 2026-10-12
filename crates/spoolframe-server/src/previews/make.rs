@@ -25,6 +25,18 @@ use crate::encode::args::TONE_MAP;
 /// file on a network mount, at the idle I/O priority, behind a busy disk.
 const TILE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How a tile's error begins when ffmpeg could not be started.
+const CANNOT_RUN: &str = "cannot run ";
+/// How a tile's error begins when its ffmpeg ran past [`TILE_TIMEOUT`].
+const TOOK_OVER: &str = "ffmpeg took over ";
+
+/// Whether a set failed for the moment (ffmpeg could not start, a tile
+/// timed out on a slow mount), not for its file: it is tried again at the
+/// next play rather than remembered as failed.
+pub fn passing(reason: &str) -> bool {
+    reason.starts_with(CANNOT_RUN) || reason.starts_with(TOOK_OVER)
+}
+
 /// What ffmpeg says when its one frame never came.
 const NOTHING_WRITTEN: &str = "Nothing was written into output file";
 
@@ -235,7 +247,7 @@ async fn tile(
     }
     let mut command = ffmpeg
         .command(&jail)
-        .map_err(|e| format!("cannot run {}: {e}", ffmpeg.program().display()))?;
+        .map_err(|e| format!("{CANNOT_RUN}{}: {e}", ffmpeg.program().display()))?;
     command
         .args(tile_args(source, hardware, at, out))
         .stdin(Stdio::null())
@@ -245,10 +257,10 @@ async fn tile(
     low_priority(&mut command);
     let child = command
         .spawn()
-        .map_err(|e| format!("cannot run {}: {e}", ffmpeg.program().display()))?;
+        .map_err(|e| format!("{CANNOT_RUN}{}: {e}", ffmpeg.program().display()))?;
     let output = tokio::time::timeout(TILE_TIMEOUT, child.wait_with_output())
         .await
-        .map_err(|_| format!("ffmpeg took over {TILE_TIMEOUT:?} for the tile at {at:?}"))?
+        .map_err(|_| format!("{TOOK_OVER}{TILE_TIMEOUT:?} for the tile at {at:?}"))?
         .map_err(|e| e.to_string())?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     // A seek past the last frame (the sound runs on a little after the

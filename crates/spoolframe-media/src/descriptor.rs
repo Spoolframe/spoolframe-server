@@ -252,7 +252,15 @@ impl MediaDescriptor {
         let mut audio = Vec::new();
         let mut subtitles = Vec::new();
         for stream in &probe.streams {
-            let index = u32::try_from(stream.index).unwrap_or(u32::MAX);
+            // A stream ffmpeg cannot be pointed at: left out, not given a
+            // made-up index (review 2026-10-11 L65).
+            let Ok(index) = u32::try_from(stream.index) else {
+                tracing::warn!(
+                    index = stream.index,
+                    "a stream with no usable index is left out"
+                );
+                continue;
+            };
             let d = &stream.disposition;
             let flags = Flags {
                 forced: flag(d.forced),
@@ -265,7 +273,14 @@ impl MediaDescriptor {
             match &stream.stream {
                 // Cover art is stored as a one-frame video stream; the
                 // first real one is the picture.
-                StreamKinds::Video(v) if video.is_none() && !flag(d.attached_pic) => {
+                StreamKinds::Video(v)
+                    if video.is_none()
+                        && !flag(d.attached_pic)
+                        // No size is no picture: a 0×0 "video" is not
+                        // planned for (review 2026-10-11 L65).
+                        && dimension(v.width) > 0
+                        && dimension(v.height) > 0 =>
+                {
                     video = Some(VideoStream {
                         index,
                         codec: codec_name(&v.codec_name),
@@ -465,6 +480,29 @@ mod tests {
 
     fn describe(name: &str) -> MediaDescriptor {
         MediaDescriptor::from_probe(&probe(name))
+    }
+
+    /// A video with no size is no picture, and a stream with no usable
+    /// index is left out, not given a sentinel. Review 2026-10-11 L65.
+    #[test]
+    fn a_video_with_no_size_and_a_stream_with_no_index_are_left_out() {
+        let path = format!(
+            "{}/tests/fixtures/mp4-h264-aac.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let streams = json["streams"].as_array_mut().unwrap();
+        for stream in streams.iter_mut() {
+            match stream["codec_type"].as_str() {
+                Some("video") => stream["width"] = 0.into(),
+                Some("audio") => stream["index"] = 5_000_000_000u64.into(),
+                _ => {}
+            }
+        }
+        let d = MediaDescriptor::from_probe(&serde_json::from_value(json).unwrap());
+        assert!(d.video.is_none());
+        assert!(d.audio.is_empty());
     }
 
     #[test]

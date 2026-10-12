@@ -97,7 +97,30 @@ pub async fn search(
         // and a group of people knows there are more only by getting one.
         limit: request.limit.saturating_add(1),
     };
-    let found = catalog.search(&query).await?;
+    // Items in other years, asked alongside the search itself: it does not
+    // depend on what the search finds (review 2026-10-11 L27).
+    let any_year = year.and_then(|_| {
+        let kinds: Vec<_> = query
+            .kinds
+            .iter()
+            .copied()
+            .filter(|&k| k != SearchKind::People)
+            .collect();
+        (!kinds.is_empty()).then(|| SearchQuery {
+            year: None,
+            kinds,
+            // Some of them are this year's, already found.
+            limit: 2 * WITHOUT_YEAR as u32,
+            ..query.clone()
+        })
+    });
+    let (found, any_year) = tokio::join!(catalog.search(&query), async {
+        match &any_year {
+            Some(any_year) => Some(catalog.search(any_year).await),
+            None => None,
+        }
+    });
+    let found = found?;
 
     let mut totals: HashMap<SearchKind, u32> =
         found.groups.iter().map(|g| (g.kind, g.total)).collect();
@@ -121,25 +144,10 @@ pub async fn search(
     }
 
     let mut also = Vec::new();
-    if let Some(year) = year {
-        let kinds: Vec<_> = query
-            .kinds
-            .iter()
-            .copied()
-            .filter(|&k| k != SearchKind::People)
-            .collect();
-        if !kinds.is_empty() {
-            let any_year = SearchQuery {
-                year: None,
-                kinds,
-                // Some of them are this year's, already found.
-                limit: 2 * WITHOUT_YEAR as u32,
-                ..query.clone()
-            };
-            match catalog.search(&any_year).await {
-                Ok(any_year) => also = without_year(&query.text, year, &found, any_year),
-                Err(e) => tracing::warn!(error = %e, "search: nothing found without the year"),
-            }
+    if let (Some(year), Some(any_year)) = (year, any_year) {
+        match any_year {
+            Ok(any_year) => also = without_year(&query.text, year, &found, any_year),
+            Err(e) => tracing::warn!(error = %e, "search: nothing found without the year"),
         }
     }
 

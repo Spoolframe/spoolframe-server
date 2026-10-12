@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Picture subtitles read better and fail less (review 2026-10-11 Lows).
+  PGS goes through the same text and outline split as DVB and VobSub, so
+  a black outline is no longer read as text; one PGS composition placed
+  off the screen is skipped instead of failing OCR for the whole film; and
+  DVB and VobSub data that cannot be read is counted as broken instead of
+  read with made-up defaults.
+
+- Previews that failed because a tile timed out (a slow network mount)
+  or ffmpeg would not start are tried again at the next play, instead of
+  staying failed until a restart; two items of the same file make their
+  previews once.
+
 - Review 2026-10-11, runtime and network Lows:
   `plex.watch_sync.interval_secs` under 10 is refused with its key, not
   quietly raised to 10 (L33). A second SIGINT or SIGTERM during shutdown

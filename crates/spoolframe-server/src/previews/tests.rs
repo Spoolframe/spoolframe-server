@@ -484,7 +484,8 @@ fn a_tile_from_an_index_is_its_last_frame_at_or_before_the_tile_s_time() {
     let frames = [frame(0, 0), frame(2000, 1), frame(4000, 2), frame(7000, 3)];
     let tiles = pick(&frames, Duration::from_secs(3)).unwrap();
     // 0 s, 3 s, 6 s: frames 0, 1 (at 2 s) and 2 (at 4 s).
-    assert_eq!(tiles, [vec![0], vec![1], vec![2]]);
+    let bytes: Vec<&[u8]> = tiles.iter().map(|t| &t[..]).collect();
+    assert_eq!(bytes, [[0], [1], [2]]);
     assert!(pick(&[], Duration::from_secs(3)).unwrap().is_empty());
 }
 
@@ -849,4 +850,80 @@ async fn a_slow_film_does_not_hold_up_the_next_played() {
     gated.permits.add_permits(1000);
     gated.setup.ready(&a).await;
     gated.setup.ready(&b).await;
+}
+
+/// Two items of one file (the film in two libraries) make its set once:
+/// the second waits for the first and finds it made. Review 2026-10-11
+/// L20.
+#[tokio::test]
+async fn two_items_of_one_file_make_its_previews_once() {
+    let mut gated = gated("one-file-twice", settings()).await;
+    let a = gated.setup.film("a", 30, 0);
+    let path = gated.setup.files.files.lock()["a"].clone();
+    gated.setup.files.files.lock().insert("twin".into(), path);
+    let twin = film("twin");
+    gated.setup.previews.played(&a);
+    gated.setup.previews.played(&twin);
+    gated.permits.add_permits(1000);
+    let (one, _) = gated.setup.ready(&a).await;
+    let (other, _) = gated.setup.ready(&twin).await;
+    assert_eq!(one, other);
+    let mut asked = 0;
+    while gated.asked.try_recv().is_ok() {
+        asked += 1;
+    }
+    assert_eq!(asked, 3, "30 s at 10 s is 3 tiles, made once");
+}
+
+/// A tile that fails for the moment (a timeout) fails the set, but the next
+/// play tries again rather than finding it failed until a restart. Review
+/// 2026-10-11 L21.
+#[tokio::test]
+async fn a_set_that_timed_out_is_made_again_at_the_next_play() {
+    struct TimesOutOnce(std::sync::atomic::AtomicBool);
+    #[async_trait]
+    impl make::MakeTile for TimesOutOnce {
+        async fn tile(
+            &self,
+            _: &make::Source,
+            _: bool,
+            _: Duration,
+            _: &Path,
+        ) -> Result<Option<Vec<u8>>, String> {
+            if !self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err("ffmpeg took over 120s for the tile at 0s".into());
+            }
+            Ok(Some(sheets::tests::tile(320, 180, 128)))
+        }
+    }
+    let maker = Arc::new(TimesOutOnce(Default::default()));
+    let setup = setup_making("timed-out", settings(), "ffmpeg", Some(maker)).await;
+    let id = setup.film("a", 30, 0);
+    setup.previews.played(&id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while setup.previews.counts().failed == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    setup.previews.played(&id);
+    setup.ready(&id).await;
+}
+
+/// A frame a sparse index repeats over many tiles is one copy, shared.
+/// Review 2026-10-11 L23.
+#[test]
+fn tiles_that_show_one_frame_share_its_bytes() {
+    let frames = [
+        PreviewFrame {
+            at_ms: 0,
+            jpeg: vec![7; 1000],
+        },
+        PreviewFrame {
+            at_ms: 60_000,
+            jpeg: vec![8; 1000],
+        },
+    ];
+    let tiles = pick(&frames, Duration::from_secs(10)).unwrap();
+    assert_eq!(tiles.len(), 7);
+    assert!(tiles[1..6].iter().all(|t| Arc::ptr_eq(t, &tiles[0])));
 }

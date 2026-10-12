@@ -379,9 +379,13 @@ pub(crate) fn track(json: &[u8], from_file_start: bool) -> Result<Track, String>
     let (num, den) = stream
         .time_base
         .split_once('/')
-        .and_then(|(n, d)| Some((n.parse::<i128>().ok()?, d.parse::<i128>().ok()?)))
+        .and_then(|(n, d)| Some((n.parse::<u32>().ok()?, d.parse::<u32>().ok()?)))
         .filter(|&(n, d)| n > 0 && d > 0)
         .ok_or_else(|| format!("a time base of {}", stream.time_base))?;
+    // The time base is the file's: held to u32 parts (ffmpeg's own are
+    // ints), so ticks × num × 1000 stays well inside i128 (review
+    // 2026-10-11 L67).
+    let (num, den) = (i128::from(num), i128::from(den));
     let ms = |ticks: i64| i128::from(ticks) * num * 1000 / den;
     let start = match probed.format.and_then(|f| f.start_time) {
         Some(secs) if from_file_start => {
@@ -393,10 +397,15 @@ pub(crate) fn track(json: &[u8], from_file_start: bool) -> Result<Track, String>
         .packets
         .into_iter()
         // A packet with no time cannot be placed.
+        // One whose time is past what a u64 of milliseconds holds is left
+        // out, not wrapped (review 2026-10-11 L67).
         .filter_map(|p| {
             Some(Packet {
-                pts_ms: (ms(p.pts?) - start).max(0) as u64,
-                duration_ms: p.duration.filter(|&d| d > 0).map(|d| ms(d) as u64),
+                pts_ms: u64::try_from((ms(p.pts?) - start).max(0)).ok()?,
+                duration_ms: p
+                    .duration
+                    .filter(|&d| d > 0)
+                    .and_then(|d| u64::try_from(ms(d)).ok()),
                 data: hexdump(p.data.as_deref().unwrap_or_default()),
             })
         })
@@ -893,6 +902,26 @@ mod tests {
         "streams": [{"time_base": "1/90000", "extradata": "\n00000000: 7061 6c65 7474 653a                      palette:\n"}],
         "format": {"start_time": "1.480000"}
     }"#;
+
+    /// A file's time base or times past what the arithmetic holds are
+    /// refused or left out, not overflowed or wrapped. Review 2026-10-11
+    /// L67.
+    #[test]
+    fn times_past_what_fits_are_refused_not_wrapped() {
+        let huge_base = r#"{"packets": [{"pts": 1000000000000, "data": ""}],
+            "streams": [{"time_base": "99999999999999999999999999999/1"}]}"#;
+        assert!(track(huge_base.as_bytes(), false).is_err());
+        let far = r#"{"packets": [{"pts": 9223372036854775807, "data": ""},
+                                {"pts": 5, "duration": 9223372036854775807, "data": ""}],
+            "streams": [{"time_base": "1/1"}]}"#;
+        let read = track(far.as_bytes(), false).unwrap();
+        let packets: Vec<_> = read
+            .packets
+            .iter()
+            .map(|p| (p.pts_ms, p.duration_ms))
+            .collect();
+        assert_eq!(packets, [(5_000, None)]);
+    }
 
     #[test]
     fn a_probed_track_counts_from_the_file_s_start_and_its_dumps_are_bytes() {

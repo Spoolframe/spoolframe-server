@@ -88,10 +88,17 @@ impl Index {
         self.clock += 1;
         entry.used = self.clock;
         self.total += entry.size;
+        let mut evicted = Vec::new();
+        let file = entry.file.clone();
         if let Some(old) = self.entries.insert(key.clone(), entry) {
             self.total -= old.size;
+            // The same image under another extension (its content type
+            // changed): the old file is nobody's now (review 2026-10-11
+            // L24).
+            if old.file != file {
+                evicted.push(old.file);
+            }
         }
-        let mut evicted = Vec::new();
         while self.total > limit {
             let Some(oldest) = self
                 .entries
@@ -129,6 +136,8 @@ pub struct ArtworkCache {
     /// The catalog's changes ([`crate::catalog::LiveCatalog::changes`]):
     /// a library added, removed or changed forgets every answer.
     changes: Option<tokio::sync::watch::Receiver<u64>>,
+    /// Resizes running at once, one per core.
+    resizes: tokio::sync::Semaphore,
 }
 
 /// How long the catalog's word that an artwork is served is taken: a
@@ -200,7 +209,15 @@ impl ArtworkCache {
         crate::files::private_dir(dir)?;
         let mut found = Vec::new();
         for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
+            // One unreadable entry is skipped, not the whole cache (and the
+            // server's start) refused (review 2026-10-11 L24).
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(dir = %dir.display(), error = %e, "an artwork cache entry cannot be read; skipped");
+                    continue;
+                }
+            };
             let path = entry.path();
             let (Some(stem), Some(ext)) = (
                 path.file_stem().and_then(|s| s.to_str()),
@@ -213,7 +230,13 @@ impl ArtworkCache {
                 let _ = std::fs::remove_file(&path);
                 continue;
             }
-            let meta = entry.metadata()?;
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(e) => {
+                    tracing::warn!(file = %path.display(), error = %e, "an artwork cache file cannot be read; skipped");
+                    continue;
+                }
+            };
             found.push((
                 meta.modified().ok(),
                 stem.to_owned(),
@@ -247,6 +270,9 @@ impl ArtworkCache {
             hits: Counter::default(),
             authorized: Mutex::default(),
             changes: None,
+            resizes: tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(2, |n| n.get()),
+            ),
         })
     }
 
@@ -343,7 +369,7 @@ impl ArtworkCache {
             return Ok((hit, true));
         }
         let image = self.make(id, size).await?;
-        Ok((self.store(&key, &image).await?, false))
+        Ok((self.store(&key, image).await?, false))
     }
 
     async fn make(&self, id: &ArtworkId, size: ArtworkSize) -> Result<Image, ArtworkError> {
@@ -353,6 +379,13 @@ impl ArtworkCache {
         // Every size is made from the cached original, so the catalog is
         // asked once per artwork, not once per size.
         let (original, _) = Box::pin(self.get_authorized(id, ArtworkSize::Original)).await?;
+        // One resize per core at a time: a grid of new sizes is a decode
+        // and a Lanczos3 each, of up to 8192² (review 2026-10-11 L25).
+        let _turn = self
+            .resizes
+            .acquire()
+            .await
+            .map_err(|e| ArtworkError::Image(e.to_string()))?;
         tokio::task::spawn_blocking(move || resize(original, width))
             .await
             .map_err(|e| ArtworkError::Image(e.to_string()))?
@@ -363,6 +396,16 @@ impl ArtworkCache {
             return Ok(None);
         };
         match tokio::fs::read(&entry.file).await {
+            // Empty: a write a power loss cut short (review 2026-10-11
+            // L19). Made again, as if missing.
+            Ok(bytes) if bytes.is_empty() => {
+                tracing::warn!(file = %entry.file.display(), "a cached artwork is empty; made again");
+                let mut index = self.lock();
+                if let Some(gone) = index.entries.remove(key) {
+                    index.total -= gone.size;
+                }
+                Ok(None)
+            }
             Ok(bytes) => Ok(Some(Artwork {
                 bytes,
                 content_type: entry.content_type,
@@ -380,12 +423,12 @@ impl ArtworkCache {
         }
     }
 
-    async fn store(&self, key: &str, image: &Image) -> Result<Artwork, ArtworkError> {
+    async fn store(&self, key: &str, image: Image) -> Result<Artwork, ArtworkError> {
         let file = self
             .dir
             .join(format!("{key}.{}", extension(&image.content_type)));
         let tmp = file.with_extension("tmp");
-        tokio::fs::write(&tmp, &image.bytes).await?;
+        write_synced(&tmp, &image.bytes).await?;
         tokio::fs::rename(&tmp, &file).await?;
         let entry = Entry {
             file,
@@ -398,11 +441,21 @@ impl ArtworkCache {
             let _ = tokio::fs::remove_file(file).await;
         }
         Ok(Artwork {
-            bytes: image.bytes.clone(),
-            content_type: image.content_type.clone(),
+            bytes: image.bytes,
+            content_type: image.content_type,
             etag: key.to_owned(),
         })
     }
+}
+
+/// `bytes` written to `path` and synced before it is renamed into place: a
+/// power loss after the rename never leaves an empty file under the final
+/// name (review 2026-10-11 L19).
+async fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await
 }
 
 /// The widest and tallest artwork decoded (finding 54): the Linux client's
@@ -811,5 +864,37 @@ mod tests {
         let image = resize(artwork(png(800, 400)), 320).unwrap();
         let resized = image::load_from_memory(&image.bytes).unwrap();
         assert_eq!((resized.width(), resized.height()), (320, 160));
+    }
+
+    /// A cached file a power loss left empty is made again, not served
+    /// empty. Review 2026-10-11 L19.
+    #[tokio::test]
+    async fn an_empty_cached_file_is_made_again() {
+        let (cache, catalog, _dir) = cache("empty", u64::MAX).await;
+        cache.get(&id(1), ArtworkSize::Original).await.unwrap();
+        let file = cache.lock().entries.values().next().unwrap().file.clone();
+        std::fs::write(&file, b"").unwrap();
+        let again = cache.get(&id(1), ArtworkSize::Original).await.unwrap();
+        assert!(!again.bytes.is_empty());
+        assert_eq!(fetches(&catalog), 2);
+    }
+
+    /// An image stored again under another content type leaves no file of
+    /// the old one behind. Review 2026-10-11 L24.
+    #[tokio::test]
+    async fn an_image_stored_as_another_type_removes_the_old_file() {
+        let (cache, _, dir) = cache("retype", u64::MAX).await;
+        let image = |content_type: &str| Image {
+            bytes: vec![1, 2, 3],
+            content_type: content_type.to_owned(),
+        };
+        cache.store("k", image("image/png")).await.unwrap();
+        cache.store("k", image("image/jpeg")).await.unwrap();
+        let files: Vec<_> = std::fs::read_dir(dir.as_ref().join("cache"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(files, ["k.jpg"]);
+        assert_eq!(cache.total(), 3);
     }
 }

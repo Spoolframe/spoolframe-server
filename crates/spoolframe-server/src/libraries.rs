@@ -892,7 +892,14 @@ impl RuntimeSettings {
         while let Some(done) = tasks.join_next().await {
             match done {
                 Ok((i, status, paths)) => reports[i] = Some((status, paths)),
-                Err(e) => std::panic::resume_unwind(e.into_panic()),
+                // `into_panic` panics on a cancellation (the runtime
+                // stopping): the overview fails instead (review 2026-10-11
+                // L26).
+                Err(e) => {
+                    return Err(LibraryError::Unavailable(format!(
+                        "asking a Plex server how it is did not finish: {e}"
+                    )));
+                }
             }
         }
         let reports: Vec<(PlexStatus, Vec<LibraryPaths>)> = reports
@@ -918,7 +925,7 @@ impl RuntimeSettings {
             titles
         })
         .await
-        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+        .map_err(|e| LibraryError::Unavailable(format!("reading the section titles did not finish: {e}")))?;
         let served = served_now(&config, &reports[0].0);
         let configured: HashMap<String, PlexServerConfig> = plex
             .all_servers()

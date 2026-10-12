@@ -760,10 +760,13 @@ impl Tool {
             .arg(&target)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
-            .await
-            .map_err(|_| format!("{} did not end", self.program.display()))?
-            .map_err(|e| format!("cannot run {}: {e}", self.program.display()))?;
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            crate::capped::output(&mut command, crate::capped::KEPT),
+        )
+        .await
+        .map_err(|_| format!("{} did not end", self.program.display()))?
+        .map_err(|e| format!("cannot run {}: {e}", self.program.display()))?;
         let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         if output.status.success() {
             return Err(format!(

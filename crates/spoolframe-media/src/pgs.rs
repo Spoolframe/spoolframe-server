@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::bitmap::{Budget, Cue, Image, Kept, MAX_SIDE, OverBudget};
+use crate::bitmap::{self, Budget, Colour, Cue, Image, Kept, MAX_SIDE, OverBudget};
 
 const PCS: u8 = 0x16;
 const WDS: u8 = 0x17;
@@ -57,8 +57,8 @@ struct Object {
     indices: Vec<u8>,
 }
 
-/// A palette entry as grey on black: how bright the pixel shows.
-type Palette = [u8; 256];
+/// A palette's entries as OCR sees them: how bright and how opaque.
+type Palette = [Colour; 256];
 
 /// The cues of a `.sup` stream, in order, within [`Budget::DEFAULT`].
 pub fn cues(stream: &[u8]) -> Result<Vec<Cue>, PgsError> {
@@ -109,16 +109,19 @@ pub fn cues_within(stream: &[u8], budget: &Budget) -> Result<Vec<Cue>, PgsError>
             }
             PDS => {
                 let (&id, entries) = body.split_first().ok_or(PgsError::Short("PDS"))?;
-                let palette = palettes.entry(id).or_insert([0; 256]);
+                let palette = palettes.entry(id).or_insert([Colour::default(); 256]);
                 // After the id: a version byte, then 5-byte entries.
                 for &[index, luma, _, _, alpha] in
                     entries.get(1..).unwrap_or_default().as_chunks::<5>().0
                 {
-                    // Text is light with a dark edge, drawn over the film;
-                    // over black only its fill shows, which is what OCR
-                    // wants.
-                    palette[usize::from(index)] =
-                        ((u16::from(luma) * u16::from(alpha)) / 255) as u8;
+                    // Video range, as DVB's are: an opaque black outline
+                    // (Y = 16) is black, not grey 16, so it is outline and
+                    // not text when the picture's ink is worked out
+                    // (review 2026-10-11 L69).
+                    palette[usize::from(index)] = Colour {
+                        luma: (u32::from(luma.saturating_sub(16)) * 255 / 219).min(255) as u8,
+                        alpha,
+                    };
                 }
             }
             ODS => {
@@ -179,8 +182,8 @@ pub fn cues_within(stream: &[u8], budget: &Budget) -> Result<Vec<Cue>, PgsError>
                 let palette = palettes
                     .get(&composition.palette)
                     .copied()
-                    .unwrap_or([0; 256]);
-                shown = render(&composition, &objects, &palette, &out)?
+                    .unwrap_or([Colour::default(); 256]);
+                shown = render(&composition, &objects, &palette, &mut out)?
                     .map(|image| (composition.pts_ms, image));
             }
             WDS => {}
@@ -288,9 +291,8 @@ fn render(
     composition: &Composition,
     objects: &HashMap<u16, Object>,
     palette: &Palette,
-    kept: &Kept,
+    kept: &mut Kept,
 ) -> Result<Option<Image>, PgsError> {
-    const MARGIN: usize = 16;
     // Each object as it shows: drawn from where it is held, never copied,
     // as a composition may place one object 255 times.
     let placed: Vec<(&Placed, &Object, Visible)> = composition
@@ -311,28 +313,35 @@ fn render(
         return Ok(None);
     };
     let (width, height) = (right - left, bottom - top);
+    // Placed wider than a picture can be (a stale object left at x =
+    // 60000): this composition is skipped, as DVB skips such a page, not
+    // the whole track failed. An object's own size past it is still an
+    // error, at its header (review 2026-10-11 L70).
     if width > MAX_SIDE || height > MAX_SIDE {
-        return Err(PgsError::TooLarge { width, height });
+        tracing::warn!(
+            width,
+            height,
+            "a PGS composition placed too wide to read was left out"
+        );
+        return Ok(None);
     }
-    let (width, height) = (width + 2 * MARGIN, height + 2 * MARGIN);
-    kept.afford(width, height)?;
-    let mut image = Image::blank(width, height, 255);
-    let mut ink = false;
+    // The objects' colours where they show, then through the same text
+    // and outline split DVB and VobSub take (review 2026-10-11 L69).
+    kept.draw(width, height)?;
+    let mut pixels = vec![Colour::default(); width * height];
     for (p, object, v) in &placed {
         for row in 0..v.height {
             for col in 0..v.width {
                 let index = object.indices[(v.y + row) * object.width + v.x + col];
-                let light = palette[usize::from(index)];
-                if light == 0 {
+                let colour = palette[usize::from(index)];
+                if colour.alpha == 0 {
                     continue;
                 }
-                ink = true;
-                let at = (p.y - top + MARGIN + row) * image.width + (p.x - left + MARGIN + col);
-                image.pixels[at] = image.pixels[at].min(255 - light);
+                pixels[(p.y - top + row) * width + (p.x - left + col)] = colour;
             }
         }
     }
-    Ok(ink.then_some(image))
+    Ok(bitmap::text_picture(width, height, &pixels, kept)?)
 }
 
 /// Writes `.sup` streams, for tests: ffmpeg decodes PGS but cannot encode
@@ -605,18 +614,21 @@ mod tests {
     }
 
     /// Small objects placed far apart would make one picture as wide as
-    /// the gap between them.
+    /// the gap between them: that composition is left out, and the rest of
+    /// the track read, not the whole track failed (review 2026-10-11 L70).
     #[test]
-    fn objects_placed_further_apart_than_4096_are_an_error() {
+    fn objects_placed_further_apart_than_4096_are_left_out() {
         assert_eq!(cues(&placed(8, 1, &[0, 3_000])).unwrap().len(), 1);
-        assert!(cues(&placed(8, 1, &[0, 60_000])).is_err());
+        assert!(cues(&placed(8, 1, &[0, 60_000])).unwrap().is_empty());
     }
 
-    /// A bomb cue's picture: the 4096 × 4096 object and its margin.
-    const BOMB_PICTURE: u64 = 4128 * 4128;
+    /// A bomb cue's composite: the 4096 × 4096 object. It is counted
+    /// before it is drawn, though the picture kept is cut to its one pixel
+    /// of text (review 2026-10-11 L69).
+    const BOMB_PICTURE: u64 = 4096 * 4096;
 
     /// Finding 45: under a kilobyte of stream is eight full 4096 × 4096
-    /// pictures. Past its budget the track is refused, not decoded on.
+    /// composites. Past its budget the track is refused, not decoded on.
     #[test]
     fn a_track_past_its_budget_of_pixels_is_refused() {
         let bomb = fixture::bomb(8, 4096);
@@ -724,10 +736,53 @@ mod tests {
         let cues = cues(&sup).unwrap();
         let times: Vec<_> = cues.iter().map(|c| (c.start_ms, c.end_ms)).collect();
         assert_eq!(times, [(1_000, 3_500), (5_000, 7_250)]);
-        // The object, inside a 16-pixel white margin.
-        assert_eq!((cues[0].image.width, cues[0].image.height), (152, 62));
-        let row = &ink(&cues[0].image)[20 * 152..21 * 152];
-        assert!(!row[16 + 39] && row[16 + 40] && row[16 + 79] && !row[16 + 80]);
+        // The text (the middle third of the 120-wide object), cut to it,
+        // inside a 16-pixel white margin.
+        assert_eq!((cues[0].image.width, cues[0].image.height), (72, 62));
+        let row = &ink(&cues[0].image)[20 * 72..21 * 72];
+        assert!(!row[15] && row[16] && row[16 + 39] && !row[16 + 40]);
+    }
+
+    /// An opaque black outline (Y = 16) around light text is outline, not
+    /// text: PGS goes through the same text and outline split as DVB and
+    /// VobSub, its luma de-video-ranged. Review 2026-10-11 L69.
+    #[test]
+    fn a_black_outline_is_not_read_as_text() {
+        let mut out = Vec::new();
+        let mut pcs = fixture::composition(0, 0x80);
+        pcs[10] = 1;
+        pcs.extend([0, 0, 0, 0, 0, 100, 0, 100]);
+        fixture::segment(&mut out, 0, PCS, &pcs);
+        // Index 1 white text, index 2 an opaque black outline.
+        fixture::segment(
+            &mut out,
+            0,
+            PDS,
+            &[0, 0, 1, 235, 128, 128, 255, 2, 16, 128, 128, 255],
+        );
+        // 9 × 9: a 5 × 3 bar of text in a 2-pixel outline.
+        let mask: Vec<u8> = (0..81)
+            .map(|at| match (at % 9, at / 9) {
+                (2..=6, 3..=5) => 1,
+                (0..=8, 1..=7) => 2,
+                _ => 0,
+            })
+            .collect();
+        let rle = fixture::rle(&mask, 9);
+        let mut ods = vec![0, 0, 0, 0xc0];
+        ods.extend(&((rle.len() + 4) as u32).to_be_bytes()[1..]);
+        ods.extend(9u16.to_be_bytes());
+        ods.extend(9u16.to_be_bytes());
+        ods.extend(rle);
+        fixture::segment(&mut out, 0, ODS, &ods);
+        fixture::segment(&mut out, 0, END, &[]);
+        fixture::segment(&mut out, 1_000, PCS, &fixture::composition(1, 0));
+        fixture::segment(&mut out, 1_000, END, &[]);
+        let cues = cues(&out).unwrap();
+        // Only the text's 5 × 3, in its margin; the outline is not ink.
+        let image = &cues[0].image;
+        assert_eq!((image.width, image.height), (5 + 32, 3 + 32));
+        assert_eq!(ink(image).iter().filter(|&&i| i).count(), 15);
     }
 
     /// Continuation fragments past what the object's picture can need

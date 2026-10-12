@@ -442,6 +442,19 @@ pub fn host_cards(roots: &HostRoots) -> Vec<HostCard> {
             minor: minor.unwrap_or(index),
             model: field("Model").filter(|m| !m.is_empty()),
         };
+        // Its runs are let open this node alone: one that is not there
+        // (a guess, above, that was wrong) fails them later inside CUDA,
+        // with nothing to say why (review 2026-10-11 L64).
+        let node = roots.dev.join(format!("nvidia{}", card.minor));
+        if !node.exists() {
+            tracing::warn!(
+                pci,
+                index,
+                node = %node.display(),
+                guessed = minor.is_none(),
+                "the NVIDIA card's device node is missing: its encodes will fail"
+            );
+        }
         match cards.iter_mut().find(|c| c.pci == pci) {
             Some(known) => known.nvidia = Some(card),
             None => {
@@ -858,8 +871,9 @@ pub fn nvenc_name(stderr: &str) -> Option<String> {
     })
 }
 
-/// What runs of no GPU that write nothing gave: the software encoders'
-/// tests, the same for every card.
+/// What runs of no GPU gave that are the same for every card: the
+/// software encoders' tests, and the samples they write into the shared
+/// scratch.
 #[derive(Default)]
 struct Memo {
     runs: Mutex<HashMap<Vec<String>, Result<(), String>>>,
@@ -884,13 +898,23 @@ impl Ffmpeg for Remembered<'_> {
     }
 
     async fn succeeds(&self, args: &[String], scratch: &Path, gpu: TestGpu) -> Result<(), String> {
+        // A software sample writes its file into the scratch every card
+        // shares: remembered too, while the file it wrote is there, so the
+        // decoders' samples are encoded once and not once a card (review
+        // 2026-10-11 L62).
+        let writes = args
+            .last()
+            .map(Path::new)
+            .filter(|out| out.starts_with(scratch));
         let same_everywhere = gpu.gpu == GpuUse::None
             && gpu.vulkan.is_none()
-            && args.ends_with(&["-f".into(), "null".into(), "-".into()]);
+            && (args.ends_with(&["-f".into(), "null".into(), "-".into()]) || writes.is_some());
         if !same_everywhere {
             return self.inner.succeeds(args, scratch, gpu).await;
         }
-        if let Some(known) = self.memo.runs.lock().get(args).cloned() {
+        if let Some(known) = self.memo.runs.lock().get(args).cloned()
+            && (known.is_err() || writes.is_none_or(Path::exists))
+        {
             return known;
         }
         let ran = self.inner.succeeds(args, scratch, gpu).await;
@@ -1540,6 +1564,34 @@ mod tests {
         async fn stderr(&self, args: &[String], scratch: &Path, gpu: GpuUse) -> Option<String> {
             self.0.stderr(args, scratch, gpu).await
         }
+    }
+
+    /// A software sample written into the shared scratch runs once for
+    /// every card, while its file is there; again once it is gone.
+    /// Review 2026-10-11 L62.
+    #[tokio::test]
+    async fn a_software_sample_is_encoded_once_while_its_file_is_there() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-gpus-sample").await;
+        let ffmpeg = TwoCards::default();
+        let memo = Memo::default();
+        let remembered = Remembered {
+            inner: &ffmpeg,
+            memo: &memo,
+        };
+        let file = dir.as_ref().join("sample-h264-8.mkv");
+        let args: Vec<String> = ["-c:v", "libx264", file.to_str().unwrap()]
+            .map(String::from)
+            .to_vec();
+        let run = || remembered.succeeds(&args, dir.as_ref(), GpuUse::None.into());
+        run().await.unwrap();
+        // The stand-in writes nothing: the file it would have.
+        std::fs::write(&file, b"sample").unwrap();
+        run().await.unwrap();
+        run().await.unwrap();
+        assert_eq!(ffmpeg.runs.lock().len(), 1, "once, then remembered");
+        std::fs::remove_file(&file).unwrap();
+        run().await.unwrap();
+        assert_eq!(ffmpeg.runs.lock().len(), 2, "the file gone, made again");
     }
 
     #[tokio::test]

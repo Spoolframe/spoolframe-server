@@ -7,7 +7,7 @@ use std::io::Cursor;
 
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
-use image::{GenericImage, RgbImage};
+use image::{GenericImage, ImageReader, Limits, RgbImage};
 
 /// Tiles across a sheet.
 pub const COLUMNS: u32 = 10;
@@ -33,12 +33,33 @@ pub struct Packed {
     pub sheets: Vec<Vec<u8>>,
 }
 
+/// The widest or tallest tile decoded: a PMS's index frames are far
+/// smaller, and a decoded tile is scaled to the first's size anyway.
+const TILE_MOST_SIDE: u32 = 4096;
+/// The most one tile's decode may allocate.
+const TILE_MOST_ALLOC: u64 = 64 << 20;
+
+/// One tile decoded, held to [`TILE_MOST_SIDE`] and [`TILE_MOST_ALLOC`]: a
+/// tile can be a PMS's JPEG, and the image crate's own limit is 512 MiB
+/// with no cap on the size (review 2026-10-11 L22).
+fn decode(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(TILE_MOST_SIDE);
+    limits.max_image_height = Some(TILE_MOST_SIDE);
+    limits.max_alloc = Some(TILE_MOST_ALLOC);
+    reader.limits(limits);
+    reader.decode()
+}
+
 /// `tiles` (encoded images, in time order) packed into sheets. Every tile
 /// takes the first one's size: they are frames of one film, and one that
-/// differs (a part in another aspect ratio) is scaled to fit.
-pub fn pack(tiles: &[Vec<u8>]) -> Result<Packed, String> {
+/// differs (a part in another aspect ratio) is scaled to fit. A tile that
+/// is the same bytes as the one before it (an index with fewer frames
+/// than tiles) is decoded once.
+pub fn pack<T: AsRef<[u8]>>(tiles: &[T]) -> Result<Packed, String> {
     let first = tiles.first().ok_or("no tiles")?;
-    let first = image::load_from_memory(first).map_err(|e| format!("tile 0: {e}"))?;
+    let first = decode(first.as_ref()).map_err(|e| format!("tile 0: {e}"))?;
     let (tile_width, tile_height) = (first.width(), first.height());
     if tile_width == 0 || tile_height == 0 {
         return Err("tile 0 is empty".into());
@@ -51,21 +72,35 @@ pub fn pack(tiles: &[Vec<u8>]) -> Result<Packed, String> {
         ));
     }
     let mut sheets = Vec::new();
+    // The last tile decoded, and where its bytes are.
+    let mut last: Option<(*const u8, usize, RgbImage)> = None;
     for (n, chunk) in tiles.chunks(PER_SHEET as usize).enumerate() {
         let mut sheet = RgbImage::new(tile_width * COLUMNS, tile_height * ROWS);
         for (i, bytes) in chunk.iter().enumerate() {
             let at = n * PER_SHEET as usize + i;
-            let mut tile = image::load_from_memory(bytes)
-                .map_err(|e| format!("tile {at}: {e}"))?
-                .to_rgb8();
-            if tile.dimensions() != (tile_width, tile_height) {
-                tile =
-                    image::imageops::resize(&tile, tile_width, tile_height, FilterType::Triangle);
+            let bytes = bytes.as_ref();
+            let same = last
+                .as_ref()
+                .is_some_and(|(ptr, len, _)| *ptr == bytes.as_ptr() && *len == bytes.len());
+            if !same {
+                let mut tile = decode(bytes)
+                    .map_err(|e| format!("tile {at}: {e}"))?
+                    .to_rgb8();
+                if tile.dimensions() != (tile_width, tile_height) {
+                    tile = image::imageops::resize(
+                        &tile,
+                        tile_width,
+                        tile_height,
+                        FilterType::Triangle,
+                    );
+                }
+                last = Some((bytes.as_ptr(), bytes.len(), tile));
             }
+            let tile = &last.as_ref().expect("decoded above").2;
             let i = i as u32;
             sheet
                 .copy_from(
-                    &tile,
+                    tile,
                     (i % COLUMNS) * tile_width,
                     (i / COLUMNS) * tile_height,
                 )
@@ -149,8 +184,17 @@ pub(crate) mod tests {
         assert!(pack(&[tile(32, 64, 0)]).is_ok());
     }
 
+    /// Every tile is decoded under limits, not only the first: a later
+    /// one past them is refused. Review 2026-10-11 L22.
+    #[test]
+    fn a_later_tile_past_the_limits_is_refused() {
+        let tiles = [tile(320, 180, 0), tile(TILE_MOST_SIDE + 1, 1, 0)];
+        let err = pack(&tiles).unwrap_err();
+        assert!(err.starts_with("tile 1:"), "{err}");
+    }
+
     #[test]
     fn no_tiles_is_an_error() {
-        assert!(pack(&[]).is_err());
+        assert!(pack::<Vec<u8>>(&[]).is_err());
     }
 }

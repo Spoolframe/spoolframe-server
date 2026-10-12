@@ -636,8 +636,20 @@ fn decode_args(hardware: Hardware, sample: &Path, settings: &TranscodeSettings) 
 /// Find what works. `scratch` is a directory for the test samples the
 /// hardware decoders are tried on.
 pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: &Path) -> Encoders {
-    // Every run is confined to it, so it is there before the first.
-    let scratch_made = std::fs::create_dir_all(scratch).is_ok();
+    // Every run is confined to it, so it is there before the first. Without
+    // it no hardware decoder is tried, and the log says why (review
+    // 2026-10-11 L61): the summary would say only "hardware decoders: none".
+    let scratch_made = match std::fs::create_dir_all(scratch) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                scratch = %scratch.display(),
+                error = %e,
+                "cannot make the encoder test directory; no hardware decoder is tried"
+            );
+            false
+        }
+    };
     let list = match ffmpeg.encoders().await {
         Ok(list) => list,
         Err(e) => {
@@ -1379,11 +1391,13 @@ impl Ffmpeg for FfmpegCommand {
             .map_err(|e| format!("cannot run {path}: {e}"))?;
         let output = tokio::time::timeout(
             self.timeout,
-            command
-                .args(["-hide_banner", "-encoders"])
-                .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .output(),
+            crate::capped::output(
+                command
+                    .args(["-hide_banner", "-encoders"])
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true),
+                crate::capped::KEPT,
+            ),
         )
         .await
         .map_err(|_| format!("{path} -encoders timed out"))?
@@ -1400,13 +1414,10 @@ impl Ffmpeg for FfmpegCommand {
             .tool
             .command(&test_jail(Some(scratch), gpu))
             .map_err(|e| format!("cannot run {path}: {e}"))?;
-        let run = command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output();
+        let run = crate::capped::output(
+            command.args(args).stdin(Stdio::null()).kill_on_drop(true),
+            crate::capped::KEPT,
+        );
         let output = tokio::time::timeout(self.timeout, run)
             .await
             .map_err(|_| format!("{path} took over {:?}", self.timeout))?
@@ -1422,13 +1433,10 @@ impl Ffmpeg for FfmpegCommand {
             .tool
             .command(&test_jail(Some(scratch), gpu.into()))
             .ok()?;
-        let run = command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output();
+        let run = crate::capped::output(
+            command.args(args).stdin(Stdio::null()).kill_on_drop(true),
+            crate::capped::KEPT,
+        );
         let output = tokio::time::timeout(self.timeout, run).await.ok()?.ok()?;
         Some(String::from_utf8_lossy(&output.stderr).into_owned())
     }

@@ -225,7 +225,17 @@ impl Prober {
                 path: path.to_owned(),
             });
         }
-        for file in external::find(path) {
+        // Listing the directory and resolving its links is file-system
+        // work, on a network mount at that: off the async workers (review
+        // 2026-10-11 L60).
+        let media = path.to_owned();
+        let external = tokio::task::spawn_blocking(move || external::find(&media))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "looking for subtitle files did not finish");
+                Vec::new()
+            });
+        for file in external {
             // A broken subtitle file loses that subtitle, not the media.
             match self.external_subtitle(file).await {
                 Ok(Some(sub)) => descriptor.subtitles.push(sub),
@@ -398,7 +408,7 @@ impl Prober {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let mut cmd = self.command(path).map_err(|e| e.to_string())?;
+        let mut cmd = self.command(path).await.map_err(|e| e.to_string())?;
         cmd.args(["-v", "error", "-select_streams", "v:0"])
             .args(["-read_intervals", &intervals])
             .args([
@@ -433,7 +443,7 @@ impl Prober {
     /// The keyframes from every packet of the file, read without
     /// decoding: all of the file is read. Not cached.
     pub async fn scan_keyframes(&self, path: &Path) -> Result<Keyframes, ProbeError> {
-        let mut cmd = self.command(path)?;
+        let mut cmd = self.command(path).await?;
         cmd.args(["-v", "error", "-select_streams", "v:0"])
             .args([
                 "-show_entries",
@@ -450,25 +460,33 @@ impl Prober {
     }
 
     /// ffprobe confined to `path`: a VobSub `.idx` with its `.sub`, which
-    /// ffmpeg opens by the `.idx`'s name.
-    fn command(&self, path: &Path) -> Result<crate::sandbox::Command, ProbeError> {
-        let mut jail = Jail::new(Limits::PROBE).input(path);
-        if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("idx"))
-        {
-            jail = jail.input(path.with_extension("sub"));
-        }
-        self.ffprobe
-            .command(&jail)
-            .map_err(|source| ProbeError::Spawn {
-                ffprobe: self.ffprobe.program().to_owned(),
-                source,
-            })
+    /// ffmpeg opens by the `.idx`'s name. Made on the blocking pool: making
+    /// it opens and resolves the media's path, which on a network mount
+    /// can block for as long as the mount does (review 2026-10-11 L60).
+    async fn command(&self, path: &Path) -> Result<crate::sandbox::Command, ProbeError> {
+        let (ffprobe, path) = (self.ffprobe.clone(), path.to_owned());
+        let program = self.ffprobe.program().to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut jail = Jail::new(Limits::PROBE).input(&path);
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("idx"))
+            {
+                jail = jail.input(path.with_extension("sub"));
+            }
+            ffprobe.command(&jail)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|made| made)
+        .map_err(|source| ProbeError::Spawn {
+            ffprobe: program,
+            source,
+        })
     }
 
     async fn run(&self, path: &Path) -> Result<FfProbe, ProbeError> {
-        let mut cmd = self.command(path)?;
+        let mut cmd = self.command(path).await?;
         cmd.args([
             "-v",
             "error",

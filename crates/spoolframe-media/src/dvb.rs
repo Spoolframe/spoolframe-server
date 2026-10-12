@@ -231,10 +231,13 @@ fn region_composition(
     if width > MAX_SIDE || height > MAX_SIDE {
         return Ok(None);
     }
+    // 0 and 4–7 are reserved: such a region does not parse, rather than
+    // being read as 8-bit (review 2026-10-11 L71).
     let depth = match (head[6] >> 2) & 7 {
         1 => 2,
         2 => 4,
-        _ => 8,
+        3 => 8,
+        _ => return Ok(None),
     };
     let clut = head[7];
     let background = match depth {
@@ -392,6 +395,16 @@ fn object_data(body: &[u8], regions: &mut HashMap<u8, Region>) -> Option<()> {
 }
 
 /// One field's pixel data into `region`, from (`x`, `y`), every other line.
+/// A map table of `N` entries of `width` bits each; `None` if the data
+/// ends first.
+fn read_table<const N: usize>(bits: &mut Bits, width: usize) -> Option<[u8; N]> {
+    let mut table = [0; N];
+    for entry in &mut table {
+        *entry = bits.read(width)? as u8;
+    }
+    Some(table)
+}
+
 fn draw_field(region: &mut Region, data: &[u8], x0: usize, y0: usize, non_modifying: bool) {
     let mut maps = Maps::default();
     let (mut x, mut y) = (x0, y0);
@@ -404,14 +417,25 @@ fn draw_field(region: &mut Region, data: &[u8], x0: usize, y0: usize, non_modify
             0x10 => two_bit(&mut bits, &mut runs),
             0x11 => four_bit(&mut bits, &mut runs),
             0x12 => eight_bit(&mut bits, &mut runs),
+            // A map table cut short ends the field, rather than filling
+            // its missing entries with 0 (review 2026-10-11 L71).
             0x20 => {
-                maps.two_to_four = [0; 4].map(|_| bits.read(4).unwrap_or(0) as u8);
+                let Some(table) = read_table::<4>(&mut bits, 4) else {
+                    return;
+                };
+                maps.two_to_four = table;
             }
             0x21 => {
-                maps.two_to_eight = [0; 4].map(|_| bits.read(8).unwrap_or(0) as u8);
+                let Some(table) = read_table::<4>(&mut bits, 8) else {
+                    return;
+                };
+                maps.two_to_eight = table;
             }
             0x22 => {
-                maps.four_to_eight = std::array::from_fn(|_| bits.read(8).unwrap_or(0) as u8);
+                let Some(table) = read_table::<16>(&mut bits, 8) else {
+                    return;
+                };
+                maps.four_to_eight = table;
             }
             0xf0 => {
                 x = x0;
@@ -579,8 +603,14 @@ fn render(
     let (Some(left), Some(top), Some(right), Some(bottom)) = (
         placed.iter().map(|&(_, x, _)| x).min(),
         placed.iter().map(|&(_, _, y)| y).min(),
-        placed.iter().map(|&(r, x, _)| x + r.width).max(),
-        placed.iter().map(|&(r, _, y)| y + r.height).max(),
+        placed
+            .iter()
+            .map(|&(r, x, _)| x.saturating_add(r.width))
+            .max(),
+        placed
+            .iter()
+            .map(|&(r, _, y)| y.saturating_add(r.height))
+            .max(),
     ) else {
         return Ok(None);
     };
@@ -593,6 +623,9 @@ fn render(
         );
         return Ok(None);
     }
+    // Counted before it is allocated, as the budget's rule says (review
+    // 2026-10-11 L68): the page's colours, then its ink in text_picture.
+    kept.afford(width, height)?;
     let defaults = default_clut();
     let mut pixels = vec![Colour::default(); width * height];
     for (region, x, y) in placed {
@@ -788,6 +821,26 @@ mod tests {
         segment(&mut data, REGION, &region);
         segment(&mut data, END, &[]);
         packet(pts_ms, data)
+    }
+
+    /// A region of a reserved depth code is not read, rather than read as
+    /// 8-bit. Review 2026-10-11 L71.
+    #[test]
+    fn a_region_of_a_reserved_depth_is_not_read() {
+        let with_depth = |code: u8| {
+            let mut data = Vec::new();
+            segment(&mut data, PAGE, &[1, 2 << 2, 0, 0xff, 0, 0, 0, 0]);
+            // Region 0, 16 × 16, filled with 8-bit code 1.
+            let mut region = vec![0, 0x08];
+            region.extend(16u16.to_be_bytes());
+            region.extend(16u16.to_be_bytes());
+            region.extend([code << 2, 0, 1, 0]);
+            segment(&mut data, REGION, &region);
+            segment(&mut data, END, &[]);
+            packet(1_000, data)
+        };
+        assert_eq!(cues(&[with_depth(3)]).len(), 1, "8-bit is read");
+        assert!(cues(&[with_depth(5)]).is_empty());
     }
 
     /// `shown`, every segment on page `page_id`.

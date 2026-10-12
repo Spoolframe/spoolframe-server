@@ -2,7 +2,8 @@
 //! set, `<key>/`, holding `previews.json` and the sheets `0.jpg`, `1.jpg`,
 //! …. A set is the unit of eviction, least recently used first; reading it
 //! counts as using it, and its `previews.json`'s modification time keeps
-//! that order across restarts.
+//! that order across restarts (touched when a sheet is read, off the async
+//! workers).
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -87,7 +88,15 @@ impl Cache {
         crate::files::private_dir(dir)?;
         let mut found = Vec::new();
         for entry in std::fs::read_dir(dir)? {
-            let path = entry?.path();
+            // One unreadable entry is skipped, not the whole cache (and the
+            // server's start) refused (review 2026-10-11 L24).
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(e) => {
+                    tracing::warn!(dir = %dir.display(), error = %e, "a previews cache entry cannot be read; skipped");
+                    continue;
+                }
+            };
             let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
                 continue;
             };
@@ -124,7 +133,7 @@ impl Cache {
             index: Mutex::new(index),
         };
         let gone = cache.lock().evict(None);
-        cache.remove(gone);
+        remove_sets(&cache.dir, gone);
         Ok(cache)
     }
 
@@ -132,11 +141,16 @@ impl Cache {
         self.index.lock()
     }
 
-    fn remove(&self, keys: Vec<String>) {
-        for key in keys {
-            if let Err(e) = std::fs::remove_dir_all(self.dir.join(&key)) {
-                tracing::warn!(key, error = %e, "cannot remove evicted previews");
-            }
+    /// Remove the evicted sets `keys` on the blocking pool: a set is a
+    /// directory of sheets, and a lowered limit can evict hundreds (review
+    /// 2026-10-11 L18).
+    async fn remove(&self, keys: Vec<String>) {
+        if keys.is_empty() {
+            return;
+        }
+        let dir = self.dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || remove_sets(&dir, keys)).await {
+            tracing::warn!(error = %e, "removing evicted previews stopped");
         }
     }
 
@@ -145,14 +159,24 @@ impl Cache {
         self.lock().total
     }
 
-    /// Change the limit; a lower one evicts at once.
+    /// Change the limit; a lower one evicts at once, the sets' files
+    /// removed on the blocking pool.
     pub fn set_limit(&self, limit: u64) {
         let gone = {
             let mut index = self.lock();
             index.limit = limit;
             index.evict(None)
         };
-        self.remove(gone);
+        if gone.is_empty() {
+            return;
+        }
+        let dir = self.dir.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || remove_sets(&dir, gone));
+            }
+            Err(_) => remove_sets(&dir, gone),
+        }
     }
 
     /// Whether another set of the usual size fits without evicting one:
@@ -167,24 +191,15 @@ impl Cache {
         index.total + usual < index.limit
     }
 
-    /// The set under `key`, if it is here; counts as a use.
+    /// The set under `key`, if it is here; counts as a use. Only in
+    /// memory: the file system is touched when a sheet is read (review
+    /// 2026-10-11 L18).
     pub fn get(&self, key: &str) -> Option<SetMeta> {
-        let meta = {
-            let mut index = self.lock();
-            let used = index.tick();
-            let entry = index.sets.get_mut(key)?;
-            entry.used = used;
-            entry.meta
-        };
-        // So the order outlives a restart. Only an order: a failure is
-        // harmless.
-        if let Ok(file) = std::fs::File::options()
-            .write(true)
-            .open(self.dir.join(key).join(META))
-        {
-            let _ = file.set_modified(SystemTime::now());
-        }
-        Some(meta)
+        let mut index = self.lock();
+        let used = index.tick();
+        let entry = index.sets.get_mut(key)?;
+        entry.used = used;
+        Some(entry.meta)
     }
 
     /// Sheet `n` of the set under `key`, if both are here.
@@ -193,12 +208,18 @@ impl Cache {
         if n >= meta.sheets {
             return None;
         }
-        match tokio::fs::read(self.sheet_path(key, n)).await {
-            Ok(bytes) => Some(bytes),
-            Err(e) => {
-                // Removed behind our back: forget the set, so it is made
-                // again.
-                tracing::warn!(key, n, error = %e, "a previews sheet cannot be read");
+        let read = tokio::fs::read(self.sheet_path(key, n)).await;
+        match read {
+            Ok(bytes) if !bytes.is_empty() => {
+                self.touch(key).await;
+                Some(bytes)
+            }
+            // Empty: a write a power loss cut short (review 2026-10-11
+            // L19). Removed behind our back, or that: forget the set, so it
+            // is made again.
+            read => {
+                let error = read.err().map_or("empty".to_owned(), |e| e.to_string());
+                tracing::warn!(key, n, error, "a previews sheet cannot be read");
                 let mut index = self.lock();
                 if let Some(gone) = index.sets.remove(key) {
                     index.total -= gone.size;
@@ -206,6 +227,18 @@ impl Cache {
                 None
             }
         }
+    }
+
+    /// The set under `key` marked used on disk, so the order outlives a
+    /// restart. Only an order: a failure is harmless.
+    async fn touch(&self, key: &str) {
+        let meta = self.dir.join(key).join(META);
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(file) = std::fs::File::options().write(true).open(meta) {
+                let _ = file.set_modified(SystemTime::now());
+            }
+        })
+        .await;
     }
 
     fn sheet_path(&self, key: &str, n: u32) -> PathBuf {
@@ -219,13 +252,15 @@ impl Cache {
         let _ = tokio::fs::remove_dir_all(&partial).await;
         tokio::fs::create_dir_all(&partial).await?;
         let mut size = 0;
+        // Each file synced before the set is renamed into place: after a
+        // power loss a set is whole or not there (review 2026-10-11 L19).
         for (n, sheet) in sheets.iter().enumerate() {
-            tokio::fs::write(partial.join(format!("{n}.jpg")), sheet).await?;
+            write_synced(&partial.join(format!("{n}.jpg")), sheet).await?;
             size += sheet.len() as u64;
         }
         let json = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
         size += json.len() as u64;
-        tokio::fs::write(partial.join(META), json).await?;
+        write_synced(&partial.join(META), &json).await?;
         let whole = self.dir.join(key);
         let _ = tokio::fs::remove_dir_all(&whole).await;
         tokio::fs::rename(&partial, &whole).await?;
@@ -241,9 +276,26 @@ impl Cache {
             }
             index.evict(Some(key))
         };
-        self.remove(gone);
+        self.remove(gone).await;
         Ok(())
     }
+}
+
+/// Remove the sets `keys` from `dir`.
+fn remove_sets(dir: &Path, keys: Vec<String>) {
+    for key in keys {
+        if let Err(e) = std::fs::remove_dir_all(dir.join(&key)) {
+            tracing::warn!(key, error = %e, "cannot remove evicted previews");
+        }
+    }
+}
+
+/// `bytes` written to `path` and synced.
+async fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await
 }
 
 fn dir_size(dir: &Path) -> u64 {
@@ -334,7 +386,7 @@ mod tests {
         put(&cache, "b", 1).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         // a is read last, so after a restart b is the oldest.
-        cache.get("a").unwrap();
+        cache.sheet("a", 0).await.unwrap();
         drop(cache);
         std::fs::create_dir_all(path.join("c.partial")).unwrap();
         let again = Cache::open(&path, 2500).unwrap();
@@ -365,5 +417,43 @@ mod tests {
         assert_eq!(cache.sheet("a", 1).await.map(|s| s.len()), Some(1000));
         assert_eq!(cache.sheet("a", 2).await, None);
         assert_eq!(cache.sheet("b", 0).await, None);
+    }
+
+    /// Looking a set up touches nothing on disk; reading a sheet does, off
+    /// the async workers. Review 2026-10-11 L18.
+    #[tokio::test]
+    async fn looking_a_set_up_touches_nothing_on_disk() {
+        let (_tmp, path) = dir("touch").await;
+        let cache = Cache::open(&path, u64::MAX).unwrap();
+        put(&cache, "a", 1).await;
+        let modified = || {
+            std::fs::metadata(path.join("a").join(META))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        let old = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(path.join("a").join(META))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        cache.get("a").unwrap();
+        assert_eq!(modified(), old);
+        cache.sheet("a", 0).await.unwrap();
+        assert!(modified() > old);
+    }
+
+    /// A sheet a power loss left empty is not served; its set is made
+    /// again. Review 2026-10-11 L19.
+    #[tokio::test]
+    async fn an_empty_sheet_is_not_served() {
+        let (_tmp, path) = dir("empty").await;
+        let cache = Cache::open(&path, u64::MAX).unwrap();
+        put(&cache, "a", 1).await;
+        std::fs::write(path.join("a").join("0.jpg"), b"").unwrap();
+        assert_eq!(cache.sheet("a", 0).await, None);
+        assert!(cache.get("a").is_none());
     }
 }

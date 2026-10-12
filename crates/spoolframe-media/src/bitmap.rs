@@ -79,6 +79,16 @@ impl<'a> Kept<'a> {
         Ok(())
     }
 
+    /// A `width` × `height` composite about to be drawn, counted against
+    /// the budget's pixels before it is allocated, whatever of it is kept:
+    /// a picture is cut to its text afterwards, and a few bytes of stream
+    /// can ask for many full-screen composites (finding 45).
+    pub(crate) fn draw(&mut self, width: usize, height: usize) -> Result<(), OverBudget> {
+        self.afford(width, height)?;
+        self.pixels += (width as u64).saturating_mul(height as u64);
+        Ok(())
+    }
+
     /// Adds a cue, or lengthens the last one when this is the same picture
     /// straight after it (a palette change, as in a fade, or a page sent
     /// again). Only a cue kept counts against the budget.
@@ -203,6 +213,9 @@ pub(crate) fn text_picture(
     kept: &Kept,
 ) -> Result<Option<Image>, OverBudget> {
     const MARGIN: usize = 16;
+    // The ink and its rows are as large as the picture: counted before
+    // they are allocated (review 2026-10-11 L68).
+    kept.afford(width, height)?;
     let ink = ink(width, pixels);
     let text = |at: usize| ink[at] > 0;
     let rows: Vec<usize> = (0..height)
@@ -309,6 +322,26 @@ mod tests {
 
     fn text_picture(width: usize, height: usize, pixels: &[Colour]) -> Option<Image> {
         super::text_picture(width, height, pixels, &Kept::new(&Budget::DEFAULT)).unwrap()
+    }
+
+    /// A picture is counted against the budget at its full size, before
+    /// its ink is allocated, not only once trimmed to its text. Review
+    /// 2026-10-11 L68.
+    #[test]
+    fn a_picture_is_counted_before_its_ink_is_allocated() {
+        let budget = Budget {
+            pixels: 5_000,
+            ..Budget::DEFAULT
+        };
+        // 100 × 100, a 5 × 3 bar of text: trimmed with its margin it
+        // would be 37 × 35, under the budget; whole it is over.
+        let pixels: Vec<Colour> = (0..10_000)
+            .map(|at| match (at % 100, at / 100) {
+                (40..=44, 50..=52) => opaque(255),
+                _ => CLEAR,
+            })
+            .collect();
+        assert!(super::text_picture(100, 100, &pixels, &Kept::new(&budget)).is_err());
     }
 
     fn opaque(luma: u8) -> Colour {

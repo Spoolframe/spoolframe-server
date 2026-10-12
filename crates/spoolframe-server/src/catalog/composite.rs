@@ -154,16 +154,32 @@ impl Composite {
         Fut: Future<Output = Result<T, CatalogError>> + Send + 'static,
     {
         let mut tasks = tokio::task::JoinSet::new();
+        let mut which = std::collections::HashMap::new();
         for (i, source) in self.servers.iter().enumerate() {
             let asked = call(source.catalog.clone());
-            tasks.spawn(async move { (i, asked.await) });
+            let task = tasks.spawn(async move { (i, asked.await) });
+            which.insert(task.id(), i);
         }
         let mut answers: Vec<Option<Result<T, CatalogError>>> =
             self.servers.iter().map(|_| None).collect();
         while let Some(done) = tasks.join_next().await {
             match done {
                 Ok((i, answer)) => answers[i] = Some(answer),
-                Err(e) => std::panic::resume_unwind(e.into_panic()),
+                // A server's call that panicked, or was cancelled (the
+                // runtime stopping), is that server's error, left out like
+                // any other, not the whole merged call's (review 2026-10-11
+                // L26). `into_panic` itself panics on a cancellation.
+                Err(e) => {
+                    let i = which[&e.id()];
+                    let source = &self.servers[i];
+                    tracing::error!(server = source.name, error = %e, "a Plex server's call did not finish");
+                    answers[i] = Some(Err(CatalogError::Backend {
+                        url: source.name.clone(),
+                        call: "the call".into(),
+                        item: None,
+                        message: e.to_string(),
+                    }));
+                }
             }
         }
         self.servers

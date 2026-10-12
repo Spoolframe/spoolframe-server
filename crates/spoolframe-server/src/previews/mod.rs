@@ -243,6 +243,10 @@ pub struct Previews {
     /// Sets that could not be made, by key, and why: not tried again
     /// until the file changes or the server restarts.
     failed: Mutex<HashMap<String, String>>,
+    /// One making of a set at a time, by key: two items of one file (the
+    /// same film in two libraries) would each decode it, and the second
+    /// store would remove the set the first serves (review 2026-10-11 L20).
+    sets: crate::keyed_locks::KeyedLocks,
     /// The item each set was last shown for, by key (PX-09 finding 25): a
     /// sheet is served only while that item is still in the catalog and
     /// its file still makes the key. Empty at start: a client asks for
@@ -328,6 +332,7 @@ impl Previews {
             queue: Mutex::default(),
             wake: Arc::default(),
             failed: Mutex::default(),
+            sets: Default::default(),
             shown: Mutex::default(),
             verified: Mutex::default(),
             changes: Mutex::default(),
@@ -646,8 +651,13 @@ impl Previews {
         let key = key(&path, settings.interval)
             .await
             .map_err(|e| e.to_string())?;
+        let _making = self.sets.lock(&key).await;
+        // Whoever held it before may have made the set, or failed to.
         if self.cache.get(&key).is_some() {
             return Ok(());
+        }
+        if let Some(reason) = self.failed.lock().get(&key) {
+            return Err(reason.clone());
         }
         let started = std::time::Instant::now();
         match self.make_set(id, &path, &key, settings.interval).await {
@@ -665,7 +675,12 @@ impl Previews {
             Err(_) if self.stopped.load(Ordering::SeqCst) => Ok(()),
             Err(reason) => {
                 self.failures.inc();
-                self.failed.lock().insert(key, reason.clone());
+                // A timeout or ffmpeg that would not start is the moment's,
+                // not the file's: the next play tries again (review
+                // 2026-10-11 L21).
+                if !make::passing(&reason) {
+                    self.failed.lock().insert(key, reason.clone());
+                }
                 Err(reason)
             }
         }
@@ -688,13 +703,13 @@ impl Previews {
                 }
                 Err(e) => {
                     tracing::info!(%id, error = %e, "the catalog's previews are refused; making them");
-                    self.decode(id, path, key, interval).await?
+                    self.decoded(id, path, key, interval).await?
                 }
             },
-            Ok(None) => self.decode(id, path, key, interval).await?,
+            Ok(None) => self.decoded(id, path, key, interval).await?,
             Err(e) => {
                 tracing::info!(%id, error = %e, "cannot read the catalog's previews; making them");
-                self.decode(id, path, key, interval).await?
+                self.decoded(id, path, key, interval).await?
             }
         };
         let packed = tokio::task::spawn_blocking(move || sheets::pack(&tiles))
@@ -714,6 +729,18 @@ impl Previews {
             .await
             .map_err(|e| e.to_string())?;
         Ok(meta)
+    }
+
+    /// [`Self::decode`]'s tiles, as [`pick`] gives them.
+    async fn decoded(
+        &self,
+        id: &MediaId,
+        path: &Path,
+        key: &str,
+        interval: Duration,
+    ) -> Result<Vec<Arc<[u8]>>, String> {
+        let tiles = self.decode(id, path, key, interval).await?;
+        Ok(tiles.into_iter().map(Arc::from).collect())
     }
 
     /// The tiles, decoded from the file with ffmpeg.
@@ -908,7 +935,7 @@ const KEY_LEN: usize = 32;
 /// from the catalog (a PMS's index), so an index past the longest film
 /// the decode path makes tiles of is refused (finding 52): no more tiles
 /// than [`make::tiles`] would make.
-fn pick(frames: &[PreviewFrame], interval: Duration) -> Result<Vec<Vec<u8>>, String> {
+fn pick(frames: &[PreviewFrame], interval: Duration) -> Result<Vec<Arc<[u8]>>, String> {
     let Some(last) = frames.last() else {
         return Ok(Vec::new());
     };
@@ -920,10 +947,16 @@ fn pick(frames: &[PreviewFrame], interval: Duration) -> Result<Vec<Vec<u8>>, Str
         ));
     }
     let interval = interval.as_millis().max(1) as u64;
+    // Each frame's bytes once, shared by every tile that shows it: a
+    // sparse index repeats a frame many times (review 2026-10-11 L23).
+    let shared: Vec<Arc<[u8]>> = frames
+        .iter()
+        .map(|f| Arc::from(f.jpeg.as_slice()))
+        .collect();
     Ok((0..=last.at_ms / interval)
         .map(|i| {
             let before = frames.partition_point(|f| f.at_ms <= i * interval);
-            frames[before.saturating_sub(1)].jpeg.clone()
+            shared[before.saturating_sub(1)].clone()
         })
         .collect())
 }
