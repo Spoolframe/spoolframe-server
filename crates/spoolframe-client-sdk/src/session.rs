@@ -12,9 +12,9 @@ use spoolframe_protocol::{
     ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChangePassword, ChosenTracks,
     ConfirmPassword, DeviceInfo, DeviceSignInRequest, FinishPasskeyRegistration,
     FinishPasskeySignIn, HomeScreen, ManifestKind, MediaRead, MediaReadResponse, PasskeyCreation,
-    PasskeyInfo, PasskeyRequest, PinProof, PlaybackHandle, PlaybackPlan, PlexLink, Previews,
-    Quality, Reply, Request, Response, SearchRequest, SearchResults, Selection, SessionId,
-    SessionInfo, TrackPreferencesInfo, UserSummary,
+    PasskeyInfo, PasskeyRequest, PinProof, PlaybackHandle, PlaybackPlan, PlexLink, PortableTie,
+    Previews, Quality, Reply, Request, Response, SearchRequest, SearchResults, Selection,
+    SessionId, SessionInfo, TrackPreferencesInfo, UserSummary,
 };
 use spoolframe_types::{
     ArtworkId, DisplayCapabilities, Item, Library, LibraryId, Marker, MediaId, MediaTracks,
@@ -1065,14 +1065,16 @@ impl Session {
     /// `identity` (P7-04), proved by this device: with the identity's root
     /// if it holds it (the phone), else with its device credential for it
     /// ([`crate::Portable::tie_proof`]). The root is never sent. The
-    /// account then shows the identity ([`UserSummary::portable`]); no
-    /// second account is made.
+    /// account then lists the identity among its ties
+    /// ([`UserSummary::portable`], [`Session::tie_info`]); no second
+    /// account is made. An account ties any number of identities (P7-09):
+    /// its other ties stay.
     ///
     /// Only soon after signing in ([`SdkError::RecentSignInRequired`]:
-    /// confirm, then ask again). An account tied already is
-    /// [`SdkError::AlreadyTied`]; an identity tied to another account here
-    /// [`SdkError::PortableIdTaken`]; a proof the server does not take
-    /// (a key it has seen revoked, say) [`SdkError::InvalidCredentials`].
+    /// confirm, then ask again). An identity tied to another account here
+    /// is [`SdkError::PortableIdTaken`]; one tied to this account already
+    /// is `Ok`, changing nothing. A proof the server does not take (a key
+    /// it has seen revoked, say) is [`SdkError::InvalidCredentials`].
     pub async fn tie(&self, identity: PortableUserId) -> Result<(), SdkError> {
         let nonce = match self.call(Request::TieBegin).await? {
             Reply::TieChallenge { nonce, server, .. } => {
@@ -1104,12 +1106,12 @@ impl Session {
         .await
     }
 
-    /// Sever this account's tie to its portable identity (P7-04). Only the
-    /// link goes: the account, its sessions and its watch state stay. Only
-    /// soon after signing in, as for [`Session::tie`]; no tie is
-    /// [`SdkError::NotFound`].
-    pub async fn untie(&self) -> Result<(), SdkError> {
-        self.done(Request::Untie).await
+    /// Sever this account's tie to `identity` (P7-04, P7-09). Only that
+    /// link goes: the account's other ties, its sessions and its watch
+    /// state stay. Only soon after signing in, as for [`Session::tie`]; no
+    /// tie to `identity` on this account is [`SdkError::NotFound`].
+    pub async fn untie(&self, identity: PortableUserId) -> Result<(), SdkError> {
+        self.done(Request::Untie { user: identity }).await
     }
 
     /// Leave this server (PX-47). Once the server says it is done, this
@@ -1160,9 +1162,11 @@ impl Session {
         }
     }
 
-    /// The portable identity this account is tied to, as the server says
-    /// now (P7-04).
-    pub async fn tie_info(&self) -> Result<Option<PortableUserId>, SdkError> {
+    /// The portable identities this account is tied to, as the server
+    /// says now (P7-04, P7-09): each with when it was tied and last signed
+    /// in, the oldest tie first. Which is this device's own is the app's
+    /// to mark, from [`crate::Portable::list`].
+    pub async fn tie_info(&self) -> Result<Vec<PortableTie>, SdkError> {
         Ok(self.whoami().await?.portable)
     }
 

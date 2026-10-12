@@ -1,7 +1,22 @@
-# Development wire revision 14
+# Development wire revision 15
 
-Revision 14 (P7-06, portable sign-in) keeps the `spoolframe/client/1`
-ALPN and sets `PROTOCOL_VERSION` to 14. Update the server and SDK
+Revision 15 (P7-09, several ties) keeps the `spoolframe/client/1` ALPN
+and sets `PROTOCOL_VERSION` to 15. Update the server and SDK together.
+An account ties to any number of portable identities:
+
+- `UserSummary.portable` (in `WhoAmI`) is a list of ties, the oldest
+  first, each `{ "id": "<PortableUserId>", "tied_at": <unix secs>,
+  "last_used_at": <unix secs> | null }`, every field required. It is
+  empty for an account with none, and for a portable user's own session,
+  whose identity is its `user_id`.
+- `untie` names the identity: `{"type": "untie", "user": "<id>"}`.
+- `tie_begin` and `tie_finish` no longer refuse a tied account. The
+  error `already_tied` is gone.
+
+What they do is in "Ties" under "Portable identities" below.
+
+Revision 14 (P7-06, portable sign-in) kept the `spoolframe/client/1`
+ALPN and set `PROTOCOL_VERSION` to 14. Update the server and SDK
 together. There are two new pre-auth requests,
 `begin_portable_sign_in` (answered `portable_sign_in_begun`) and
 `finish_portable_sign_in` (answered `logged_in`), a third,
@@ -486,7 +501,7 @@ minutes: `ApproveDeviceSignIn`, `BeginPasskeyRegistration`,
 `RemovePasskey`, `SetPin` with no `proof` (a user's first PIN),
 `SetPinRequired` with `required: false`, `SetDeviceTrust` except to
 stop trusting this device, `ForgetDevice`, and `TieBegin`, `TieFinish`
-and `Untie` (P7-04). An older
+and `Untie` (P7-04, P7-09). An older
 session gets `RecentSignInRequired`. The app then asks its user to
 confirm, and sends the request again. It does not sign out.
 
@@ -1350,7 +1365,7 @@ key.
 "spoolframe device credential v1\0"
 user        32 bytes   the PortableUserId
 device_key  32 bytes   the device's public key
-serial      u64        the root's count of credentials issued
+serial      u64        larger for a later credential from one holder
 issued_at   i64        Unix seconds
 expires_at  i64        Unix seconds; required
 ```
@@ -1367,7 +1382,12 @@ Keys are 64 lowercase hex digits (either case is read), the signature
 128. A credential is good at time `now` when the user's root signed it,
 `issued_at <= now + 300` (five minutes of clock skew), `now <
 expires_at`, and `expires_at - issued_at` is at most 90 days. Renewal
-is a new credential for the same key with the next serial.
+is a new credential for the same key with a larger serial. A verifier
+does not read the serial beyond the signature: two credentials are told
+apart by their device key. The SDK gives the issue time in milliseconds,
+or one past the last serial it gave if that is larger, so two devices
+that hold one root almost never give the same serial, and need no count
+in common.
 
 ### Identity state
 
@@ -1401,7 +1421,8 @@ Revocation only grows. A verifier keeps the union of the entries of
 every valid state it has seen for a user, older revisions included, at
 each key's earliest `revoked_at`, and refuses any credential whose
 device key is in that union. Separately it keeps the state of the
-highest revision, to hand on to others. A later state from a second
+highest revision (at one revision, the lower digest; see Rival states),
+to hand on to others. A later state from a second
 holder of the root that did not know of a revocation cannot undo it.
 
 A revocation lapses 90 days and 5 minutes (`REVOCATION_WINDOW`: the
@@ -1431,9 +1452,10 @@ replayed to the same one.
 A local account and a portable identity are one person once the
 identity proves it to the server for that account (P7-04). The tie is a
 link beside the account: sessions, passkeys and watch state stay keyed
-on the local user, and severing the tie removes the link only. One
-account ties to at most one identity, and one identity to at most one
-account on a server. A server never holds the root, so a tie is access
+on the local user, and severing the tie removes the link only. An
+account ties to any number of identities (P7-09: two people sharing an
+account, or one moving to a new identity), and one identity to at most
+one account on a server. A server never holds the root, so a tie is access
 continuity, not recovery.
 
 The identity signs, with its root or with a device key:
@@ -1456,7 +1478,7 @@ id it dialled, never the one the challenge names.
 | `{"type": "tie_begin"}` | `{"type": "tie_challenge", "nonce": bytes(32), "server": bytes(32), "expires_in_secs": 300}` |
 | `{"type": "tie_finish", "user": "<id>", "proof": {"type": "root", "signature": "<128 hex>"}}` | `Done` |
 | `{"type": "tie_finish", "user": "<id>", "proof": {"type": "device", "credential": {…}, "signature": "<128 hex>"}}` | `Done` |
-| `{"type": "untie"}` | `Done` |
+| `{"type": "untie", "user": "<id>"}` | `Done` |
 
 `nonce` and `server` are CBOR byte strings. Each request needs a
 session that signed in within the last 10 minutes
@@ -1473,16 +1495,24 @@ mutations, with an operation ID, never sent again on a new connection.
   credential") and whose key no identity state the server has seen
   revokes. Anything else is `InvalidCredentials`, logged as a refused
   sign-in (`tie proof refused`).
-- An account already tied gets `AlreadyTied` (at `TieBegin` and
-  `TieFinish`): `Untie` first. An identity tied to another account here
-  gets `PortableIdTaken`.
-- `Untie` with no tie is `NotFound`.
-- `WhoAmI`'s `portable` is the tie, or `null`.
+- A tied account ties another identity as it tied the first; its ties
+  stay. An identity tied to this account already is `Done` and changes
+  nothing: its first tie date and proof stand. An identity tied to
+  another account here gets `PortableIdTaken`.
+- `Untie { user }` severs the tie to `user` only. No tie to `user` on
+  this account (none, or another account's) is `NotFound`. The
+  account's other ties stay, and so do its sessions, those opened with
+  `user`'s credential too.
+- `WhoAmI`'s `portable` lists the ties, the oldest first, each with
+  `tied_at` and `last_used_at`: the last sign-in with the identity's
+  credential that landed in this account ("Signing in with a device
+  credential"), `null` until one.
 
-The admin API shows the tie on `UserInfo.portable` (`{ id,
-fingerprint, tiedAt }` or `null`) and severs it with `admin.userUntie`
-(recent admin) and `me.portableUntie` (recent sign-in); with no tie
-both answer `NO_SUCH_LINK`. Neither ties: the web UI never holds the
+The admin API shows the ties on `UserInfo.portable` (a list of `{ id,
+fingerprint, tiedAt, lastUsedAt }`, the oldest first) and severs one with
+`admin.userUntie(username, id)` (recent admin) and
+`me.portableUntie(id)` (recent sign-in); an identity the account is not
+tied to is `NO_SUCH_LINK`. Neither ties: the web UI never holds the
 root.
 
 ### Leaving a server
@@ -1792,6 +1822,38 @@ it already holds as removed: a stolen key cannot backdate its way past
 a removal that reached the verifier first. Two roots that remove each
 other are both gone: the identity is locked, not taken.
 
+**Rival states.** Two holders of the identity's roots (a phone with the
+phrase and a security key, or two devices a phrase root is synced to)
+can each sign a state from one revision. Verifiers never refuse a rival:
+its revocations and removals count, as above. A device keeps up to two
+**heads**: the newest (highest revision, then the lower BLAKE3 of the
+signed message and the signature's CBOR), and a rival the newest does not
+cover. A state is covered when the other heads revoke each key it
+revokes that has not lapsed, add each root it adds, and remove each root
+it removes no later. A sign-in carries every head (`states`, at most 2).
+The next state a holder signs is over the merge of all heads, at one past
+the highest revision: every revocation not lapsed, at its earliest; every
+root added; every root removed, at its earliest. All three only grow, so
+merging needs no choice and loses nothing. The SDK merges as soon as a
+rival arrives where the phrase root is (and with a security key's next
+root action, or `reconcile`). One thing is left out of a merge: a root
+added, by its adder's word, after that adder's own removal. It is no
+member anyway, and a verifier that holds the removal refuses the state
+that brings it. A state refused for that keeps its revocations, in the
+SDK and on a server. A merged state is an ordinary state: a server of
+any revision takes it in as the newest, its revocations into the union,
+and keeps it as a root-changing state.
+
+A server keeps every root-changing state it takes in, up to the newest
+32; an older one is dropped only when the kept ones carry its root
+changes (each root it adds added, each root it removes removed no
+later), so a rival branch's removal is never forgotten. Of two states at
+one revision the newest it hands on is the one with the lower BLAKE3
+digest, whichever came first, so every server hands on the same one.
+(Before this, a server kept the first seen, and dropped root states past
+the newest 32 whatever they said; a merged state, which carries every
+removal, makes either harmless.)
+
 **`identity_record { user }`** answers `{"user", "genesis", "state"}`,
 the genesis and newest state kept for an identity this server knows
 (tied or granted), for a device recovering it with one of its roots.
@@ -1829,9 +1891,10 @@ its own key and shows whose identity it is before keeping it.
 
 `Session::tie(identity)` begins, signs with the root if this device
 holds it (`Portable::tie_proof`), else with its device credential, and
-finishes; the root is never sent. `Session::untie()` severs;
-`Session::tie_info()` reads the tie from `WhoAmI`. The new errors are
-`SdkError::TieChallengeExpired`, `AlreadyTied` and `PortableIdTaken`.
+finishes; the root is never sent. `Session::untie(identity)` severs
+that tie; `Session::tie_info()` reads the ties from `WhoAmI`, a
+`Vec<PortableTie>`. The errors are `SdkError::TieChallengeExpired` and
+`PortableIdTaken` (`AlreadyTied` went with revision 15).
 
 Pairing (P7-03). On the device: `Portable::allow_guests()` /
 `set_allow_guests(bool)`; `Client::start_pairing(name) -> Pairing`,

@@ -263,6 +263,14 @@ pub enum SdkError {
     /// [`Portable::remove_root`]: crate::Portable::remove_root
     #[error("that key is not one of the identity's roots")]
     NotARoot,
+    /// Turning on the sync of a phrase identity's root was refused
+    /// ([`Portable::enable_root_sync`]): which way, so the app says why.
+    /// A phrase root the identity removed is [`Self::NotARoot`] instead;
+    /// no root here, [`Self::UnknownIdentity`].
+    ///
+    /// [`Portable::enable_root_sync`]: crate::Portable::enable_root_sync
+    #[error(transparent)]
+    RootSync(#[from] crate::portable::RootSyncRefused),
     /// A security key did not do what was asked (P7-08); which way, so
     /// the app says the right thing.
     #[error(transparent)]
@@ -271,10 +279,6 @@ pub enum SdkError {
     /// start ([`crate::Session::tie`]).
     #[error("the tie took too long; try again")]
     TieChallengeExpired,
-    /// This account is tied to a portable identity already (P7-04): sever
-    /// it first ([`crate::Session::untie`]).
-    #[error("this account is tied to a portable identity already")]
-    AlreadyTied,
     /// Another account on the server is tied to that identity (P7-04):
     /// one identity, one account per server. Sever that tie first.
     #[error("that identity is tied to another account on this server")]
@@ -369,7 +373,6 @@ impl SdkError {
             ServerError::InviteExhausted => SdkError::InviteExhausted,
             ServerError::UsernameTaken => SdkError::UsernameTaken,
             ServerError::TieChallengeExpired => SdkError::TieChallengeExpired,
-            ServerError::AlreadyTied => SdkError::AlreadyTied,
             ServerError::PortableIdTaken => SdkError::PortableIdTaken,
             ServerError::WrongInviteKind => SdkError::WrongInviteKind,
             ServerError::NotForPortableUsers => SdkError::NotForPortableUsers,
@@ -414,10 +417,6 @@ mod tests {
         assert_eq!(
             SdkError::from_server(ServerError::TieChallengeExpired),
             SdkError::TieChallengeExpired
-        );
-        assert_eq!(
-            SdkError::from_server(ServerError::AlreadyTied),
-            SdkError::AlreadyTied
         );
         assert_eq!(
             SdkError::from_server(ServerError::PortableIdTaken),

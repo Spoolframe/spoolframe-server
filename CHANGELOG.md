@@ -2,6 +2,75 @@
 
 ## Unreleased
 
+- P7-09: a local account ties to any number of portable identities; an
+  identity still ties to one account per server. Wire revision 15
+  (`PROTOCOL_VERSION` 14 -> 15, breaking): `UserSummary.portable` is a
+  list of `{ id, tied_at, last_used_at }`, `Untie { user }` names the
+  identity, `TieBegin`/`TieFinish` no longer refuse a tied account (tying
+  an identity tied here again is `Done` and changes nothing), and
+  `Error::AlreadyTied` is gone. Migration 0028 rebuilds `portable_ties`
+  keyed on the identity, keeping every tie, with `last_used_at`, set by a
+  credential sign-in through the tie. Admin API: `UserInfo.portable` is a
+  list of `{ id, fingerprint, tiedAt, lastUsedAt }`; `me.portableUntie(id)`
+  and `admin.userUntie(username, id)`. SDK: `Session::tie_info()` returns
+  `Vec<PortableTie>`, `Session::untie(identity)`, no
+  `SdkError::AlreadyTied`. The web UI lists the ties on My profile and a
+  user's page, each with Sever (canvas v109 WebTies).
+
+- SDK: a phrase identity's root can sync between the user's own devices
+  (P7-10), opt-in, through the app's storage: every key that starts with
+  `synced/` (`keys::SYNCED_PREFIX`, `keys::is_synced`) is one the app may
+  sync, and nothing else is. `synced/portable-root/<id>` holds the root
+  (`keys::portable_root_synced`), `synced/portable/<id>` the identity's
+  record: its revoked keys, issued devices and states
+  (`keys::portable_synced`), merged with this device's by union before
+  and after every root action, never taken as the last writer left it.
+  `Portable::enable_root_sync`, `adopt_synced`, `merge_synced`,
+  `keep_root_on_device`, `disable_root_sync`, `root_location`
+  (`RootLocation`) and `has_root`. Turning sync on needs a security key
+  root that is still one (`SdkError::RootSync(RootSyncRefused::
+  NoSecurityKey)`), and is refused for a key identity (`KeyRooted`) and a
+  removed phrase root (`NotARoot`). `forget` never removes the synced
+  root. A key revoked by any holder, however long ago, is refused by
+  every holder.
+
+- Server: a root removal is never forgotten. Root-changing states past
+  the newest 32 were dropped whatever they said, so a removal on a rival
+  branch that the newer states never carried went with its state, and
+  the removed security key was a root again. An older state now goes
+  only when the kept ones carry its root changes. Of two states at one
+  revision, the newest handed on is the one with the lower digest, not
+  the first seen, so every server hands on the same one. A state refused
+  because a removed root adds a key through it now counts for its
+  revocations. No migration and no wire change.
+
+- SDK: rival identity states merge instead of one dropping the other.
+  Two holders of an identity's roots (a phone with the phrase and a
+  security key, or two devices a phrase root is synced to) can each sign
+  a state from one revision; the SDK kept only the higher revision and
+  signed the next from it, so a root removed on the other branch came
+  back as a root (a removed security key acting again). A device now
+  keeps up to two heads (`MAX_HEADS`): the newest, and a rival that says
+  something the newest does not. `Portable::roots`, the check of a
+  credential's signer and of a revoked key read every head;
+  `Portable::identity_states(id)` lists them, and a sign-in carries both.
+  The next state is signed over the merge of all heads (every live
+  revocation, every root added, every root removed, each at its earliest)
+  at one past the highest revision. A device with the phrase root merges
+  as soon as a rival arrives; `Portable::reconcile(id, signer)` merges
+  with a security key. `accept_state` returns whether the state was kept
+  as a head. A state refused because a removed root adds a key through it
+  keeps its revocations. `portable-state/<id>` holds one state as before,
+  or an array of two. Protocol: `PortableIdentityState::digest`,
+  `root_changes_covered_by` and `newest_first`.
+
+- SDK: a credential's serial is the issue time in milliseconds, or one
+  past the last serial this device gave if that is larger (it was a
+  count from 1). Two devices that hold one root (a synced phrase root)
+  then almost never give the same serial and need no count in common,
+  and a later renewal still has a larger one. Nothing on a server reads
+  the serial beyond the signature, so old servers take it unchanged;
+  PROTOCOL.md says "a larger serial" where it said "the next".
 - P7-08, Apple: a security key root also signs in WebAuthn form, as
   Apple's system security-key API returns it, so iPhone, iPad and Mac use
   the same key and the same identity as the Linux client. A root's

@@ -1,43 +1,50 @@
-//! The portable identity card (P7-04): the badge a tied account carries,
-//! on a user's page in Users and in My profile, with Sever. Tying is the
-//! identity's phone app's: the web UI never holds the root, so it shows
-//! and severs only. Severing long after signing in asks "Confirm it's
-//! you" first, then tries again.
+//! The portable identity section (P7-04, P7-09; canvas v109 WebTies): the
+//! identities a local account is tied to, on a user's page in Users and in
+//! My profile, each with its fingerprint, when it was tied and last used,
+//! and Sever. Tying is the identity's app's: the web UI never holds the
+//! root, so it shows and severs only. Severing long after signing in asks
+//! "Confirm it's you" first, then tries again.
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{AdminApiClient, MeApiClient, PortableTie};
 
-use super::admin::{CopyButton, Said, say};
+use super::admin::{Said, say};
 use super::profile::{ConfirmItsYou, asks_to_confirm};
-use super::{icons, rpc};
+use super::{icons, now, rpc};
 use crate::logic::ApiError;
 use crate::portable::{
-    CONFIRM_ABOUT, Owner, badge_title, sever_question, severed, tie_line, tied_note, untied_line,
+    CONFIRM_ABOUT, Owner, badge_title, heading_line, sever_question, severed, tie_line, untied_note,
 };
 
-/// Sever the tie `owner` names: the caller's own, or `username`'s.
-async fn sever(owner: &Owner, username: &str) -> Result<(), ApiError> {
+/// Sever the tie to identity `id` that `owner` names: the caller's own, or
+/// `username`'s.
+async fn sever(owner: &Owner, username: &str, id: &str) -> Result<(), ApiError> {
     let client = rpc::client().await?;
     match owner {
-        Owner::Me => client.portable_untie().await.map_err(rpc::error),
+        Owner::Me => client
+            .portable_untie(id.to_owned())
+            .await
+            .map_err(rpc::error),
         Owner::User { .. } => client
-            .user_untie(username.to_owned())
+            .user_untie(username.to_owned(), id.to_owned())
             .await
             .map_err(rpc::error),
     }
 }
 
-/// `tie`, if the account has one, as a badge with Sever; `username` is the
-/// account's, for an admin's sever. `on_severed` hears once it is gone.
+/// The account's `ties`, the oldest first, each with Sever; `username` is
+/// the account's, for an admin's sever. `on_severed` hears the identity's
+/// id once its tie is gone.
 #[component]
 pub(super) fn PortableCard(
     owner: Owner,
     username: String,
-    tie: Option<PortableTie>,
+    ties: Vec<PortableTie>,
     toast: Signal<Option<Said>>,
-    on_severed: EventHandler<()>,
+    on_severed: EventHandler<String>,
 ) -> Element {
-    let mut asking = use_signal(|| false);
+    // The tie whose Sever was pressed: the question is asked about it.
+    let mut asking = use_signal(|| None::<PortableTie>);
     let mut busy = use_signal(|| false);
     // Severing may need "Confirm it's you" first, then is tried again.
     let confirming = use_signal(|| None::<String>);
@@ -45,14 +52,17 @@ pub(super) fn PortableCard(
         let owner = owner.clone();
         let username = username.clone();
         use_callback(move |()| {
+            let Some(tie) = asking() else {
+                return;
+            };
             let owner = owner.clone();
             let username = username.clone();
             busy.set(true);
             spawn(async move {
-                match sever(&owner, &username).await {
+                match sever(&owner, &username, &tie.id).await {
                     Ok(()) => {
-                        say(toast, true, severed(&owner));
-                        on_severed.call(());
+                        say(toast, true, severed(&tie));
+                        on_severed.call(tie.id.clone());
                     }
                     // Kept asking, to try again once confirmed.
                     Err(e) if asks_to_confirm(&e, confirming, CONFIRM_ABOUT) => {
@@ -62,71 +72,85 @@ pub(super) fn PortableCard(
                     Err(e) => say(toast, false, e.explain()),
                 }
                 busy.set(false);
-                asking.set(false);
+                asking.set(None);
             });
         })
     };
-    let (question, consequence) = sever_question(&owner);
-    let head = rsx! {
-        icons::Fingerprint { size: 18 }
-        h2 { "Portable identity" }
-    };
-    let body = match &tie {
-        None => rsx! {
-            p { class: "m-0 text-sm text-ctp-subtext0", {untied_line(&owner)} }
-        },
-        Some(tie) => rsx! {
-            div { class: "row",
-                span { class: "flex min-w-0 items-center gap-3",
-                    span { class: "flex text-ctp-teal", icons::ShieldCheck { size: 18 } }
-                    span { class: "row-what",
-                        b {
-                            span { class: "pill pill-admin font-mono", title: badge_title(tie), "{tie.fingerprint}" }
+    let others = ties.len().saturating_sub(1);
+    let (question, before, after) = sever_question(&owner, others);
+    let seen = now();
+    rsx! {
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| go.call(()) }
+        div { class: "flex flex-col gap-2.5",
+            div { class: "section-head",
+                h2 { "Portable identity" }
+                span { {heading_line(&owner, ties.len())} }
+            }
+            if ties.is_empty() {
+                section { class: "card",
+                    div { class: "card-body",
+                        div { class: "flex items-center gap-3",
+                            span { class: "tie-icon tie-icon-empty", icons::Fingerprint { size: 22 } }
+                            span { class: "row-what",
+                                b { "Portable identity" }
+                                span { class: "tie-sub", "Not tied" }
+                            }
                         }
-                        span { class: "row-sub", {tie_line(tie)} }
+                        p { class: "m-0 text-[13px] text-ctp-subtext1", {untied_note(&owner)} }
                     }
                 }
-                span { class: "row-do",
-                    CopyButton { text: tie.id.clone(), label: "Copy id" }
-                    if !asking() {
-                        button { class: "btn btn-danger", onclick: move |_| asking.set(true),
-                            icons::Unlink { size: 15 }
+            } else {
+                div { class: "tie-list",
+                    for tie in ties {
+                        div { class: "tie-row", key: "{tie.id}",
+                            span { class: "tie-icon", icons::Fingerprint { size: 20 } }
+                            span { class: "tie-what",
+                                span { class: "tie-fp", title: badge_title(&tie), "{tie.fingerprint}" }
+                                span { class: "tie-sub", {tie_line(seen, &tie)} }
+                            }
+                            button {
+                                class: "btn btn-sever",
+                                onclick: {
+                                    let tie = tie.clone();
+                                    move |_| asking.set(Some(tie.clone()))
+                                },
+                                icons::Unlink { size: 14 }
+                                "Sever…"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(tie) = asking() {
+            div { class: "scrim",
+                section { class: "dialog w-[520px]", role: "dialog",
+                    div { class: "dialog-head dialog-head-danger",
+                        icons::Unlink { size: 22 }
+                        h1 { "{question}" }
+                    }
+                    p {
+                        "{before}"
+                        span { class: "tie-fp-inline", "{tie.fingerprint}" }
+                        "{after}"
+                    }
+                    div { class: "dialog-actions",
+                        button {
+                            class: "btn-dialog btn-dialog-outline",
+                            disabled: busy(),
+                            onclick: move |_| asking.set(None),
+                            "Cancel"
+                        }
+                        button {
+                            class: "btn-dialog btn-dialog-danger",
+                            disabled: busy(),
+                            onclick: move |_| go.call(()),
+                            icons::Unlink { size: 16 }
                             "Sever"
                         }
                     }
                 }
             }
-            if asking() {
-                div { class: "flex flex-col gap-2",
-                    b { class: "text-sm", "{question}" }
-                    p { class: "m-0 text-[13px] text-ctp-subtext0", "{consequence}" }
-                    span { class: "flex gap-2",
-                        button { class: "btn btn-danger", disabled: busy(), onclick: move |_| go.call(()), "Sever" }
-                        button { class: "btn", disabled: busy(), onclick: move |_| asking.set(false), "Keep" }
-                    }
-                }
-            }
-            p { class: "m-0 text-xs text-ctp-subtext0", {tied_note(&owner)} }
-        },
-    };
-    rsx! {
-        ConfirmItsYou { asking: confirming, on_confirmed: move |_| go.call(()) }
-        match owner {
-            Owner::Me => rsx! {
-                section { class: "card",
-                    div { class: "card-head", {head} }
-                    div { class: "card-body", {body} }
-                }
-            },
-            Owner::User { name } => rsx! {
-                div { class: "section-head",
-                    h2 { "Portable identity" }
-                    span { "The identity {name}'s account is tied to, if any." }
-                }
-                section { class: "card",
-                    div { class: "card-body", {body} }
-                }
-            },
         }
     }
 }

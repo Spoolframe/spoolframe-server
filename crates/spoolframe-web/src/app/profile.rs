@@ -89,19 +89,19 @@ pub fn Profile() -> Element {
     }
 }
 
-/// The signed-in user's tie to a portable identity (P7-04), as read at
-/// sign-in and kept here: severing it takes the badge away.
+/// The signed-in user's ties to portable identities (P7-04, P7-09), as
+/// read at sign-in and kept here: severing one takes its row away.
 #[component]
-fn MyPortable(tied: Option<spoolframe_admin_api::PortableTie>) -> Element {
+fn MyPortable(tied: Vec<spoolframe_admin_api::PortableTie>) -> Element {
     let toast = use_signal(|| None::<Said>);
-    let mut tie = use_signal(|| tied);
+    let mut ties = use_signal(|| tied);
     rsx! {
         super::portable::PortableCard {
             owner: crate::portable::Owner::Me,
             username: String::new(),
-            tie: tie(),
+            ties: ties(),
             toast,
-            on_severed: move |_| tie.set(None),
+            on_severed: move |id: String| ties.write().retain(|t| t.id != id),
         }
         Toast { said: toast }
     }

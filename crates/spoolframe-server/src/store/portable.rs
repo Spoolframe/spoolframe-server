@@ -2,12 +2,17 @@
 //! credential they refuse is `crate::portable`'s; this is storage, and the
 //! rules that hold whoever calls: revocation only grows (every valid
 //! state adds its keys, whatever its revision), a state replaces the
-//! newest only with a higher revision, and a revocation is dropped only
-//! once it has lapsed, when no credential it could stop still holds.
+//! newest only with a higher revision (or, at the same one, a lower
+//! digest), a revocation is dropped only once it has lapsed, when no
+//! credential it could stop still holds, and a root-changing state is
+//! dropped only once the kept ones carry its root changes.
+
+use std::cmp::Ordering;
 
 use spoolframe_protocol::portable::{
     DevicePublicKey, GenesisError, HANDLE_LEN, IdentityGenesis, PortableIdentityState,
-    PortableUserId, REVOCATION_WINDOW, RootSet, StateError, revocation_lapsed, root_set,
+    PortableUserId, REVOCATION_WINDOW, RootSet, StateError, newest_first, revocation_lapsed,
+    root_set,
 };
 
 use super::{Store, StoreError};
@@ -19,9 +24,10 @@ fn handle_hex(handle: &[u8; HANDLE_LEN]) -> String {
     handle.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The most root-changing states kept for an identity (P7-08). Each
-/// lists every change so far, so the newest few carry it all; more are
-/// kept for rival roots' states.
+/// The root-changing states kept for an identity (P7-08), past which the
+/// older go: each lists every change its signer knew of, so along one
+/// line the newest few carry it all. An older one whose changes these do
+/// not carry (a rival branch's removal) is kept beyond it.
 const MAX_ROOT_STATES: i64 = 32;
 
 #[derive(Debug, thiserror::Error)]
@@ -56,11 +62,13 @@ impl Store {
     /// Take in `state`, if it is valid: its revocations that have not
     /// lapsed at `now` join its user's here, each at its earliest
     /// `revoked_at`, whatever its revision; and it becomes the newest
-    /// if its revision is higher than the newest here. One transaction,
-    /// so two arriving at once leave the higher as the newest and both
-    /// lists in the union. A different state at the same revision (the
-    /// root signed two) is not kept as the newest, and the log says so;
-    /// its revocations count all the same.
+    /// if it comes first by [`newest_first`]: a higher revision, or the
+    /// same one and a lower digest. One transaction, so two arriving at
+    /// once leave the same newest whatever their order, and both lists
+    /// in the union. Two different states at one revision (two holders
+    /// signed one each) are logged; the revocations of both count. A
+    /// state refused because a removed root adds a key through it is
+    /// [`IdentityStateError::NotARoot`], its revocations counted.
     pub async fn accept_identity_state(
         &self,
         state: &PortableIdentityState,
@@ -79,8 +87,24 @@ impl Store {
         }
         // A root removed here adds no one new from now on, whatever time
         // its endorsement claims: a stolen key cannot backdate its way
-        // past a removal this server already has.
+        // past a removal this server already has. The state is refused,
+        // but it is the word of one of the identity's roots, so its
+        // revocations count: a rival branch's revocation is not lost here
+        // for the addition that came with it.
         if before.refuses_additions(&state.roots_added) {
+            let user = state.user.to_string();
+            let mut tx = self.begin_write().await?;
+            let (revocations, ended) = Self::take_revocations(&mut tx, &user, state, now).await?;
+            tx.commit().await?;
+            if ended > 0 {
+                self.note_sessions_ended();
+            }
+            tracing::warn!(
+                user = %state.user,
+                revision = state.revision,
+                revocations,
+                "refused an identity state that adds a root through a removed one; kept its revocations"
+            );
             return Err(IdentityStateError::NotARoot);
         }
         let changes_roots = state.signer.is_some()
@@ -91,48 +115,7 @@ impl Store {
         let user = state.user.to_string();
         let json = serde_json::to_string(state).expect("an identity state always serializes");
         let mut tx = self.begin_write().await?;
-        let mut revocations = 0;
-        let mut ended = 0;
-        for entry in state.revoked.iter() {
-            if revocation_lapsed(entry.revoked_at, now) {
-                continue;
-            }
-            revocations += sqlx::query(
-                "INSERT INTO portable_revoked_keys (user_id, device_key, revoked_at) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (user_id, device_key) DO UPDATE SET revoked_at = excluded.revoked_at \
-                 WHERE excluded.revoked_at < portable_revoked_keys.revoked_at",
-            )
-            .bind(&user)
-            .bind(entry.key.to_string())
-            .bind(entry.revoked_at)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            // The sessions the key opened end with it (P7-06): a guest's,
-            // and a tied account's opened with the credential.
-            let key = entry.key.to_string();
-            ended += sqlx::query(
-                "UPDATE portable_sessions SET revoked_at = ?3 \
-                 WHERE portable_user_id = ?1 AND device_key = ?2 AND revoked_at IS NULL",
-            )
-            .bind(&user)
-            .bind(&key)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            ended += sqlx::query(
-                "UPDATE sessions SET revoked_at = ?3 \
-                 WHERE portable_user_id = ?1 AND portable_device_key = ?2 AND revoked_at IS NULL",
-            )
-            .bind(&user)
-            .bind(&key)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        }
+        let (revocations, ended) = Self::take_revocations(&mut tx, &user, state, now).await?;
         Self::prune_revocations(&mut tx, &user, now).await?;
         if changes_roots {
             let mut digest = blake3::Hasher::new();
@@ -152,33 +135,35 @@ impl Store {
             .bind(&json)
             .execute(&mut *tx)
             .await?;
-            // Bounded: a root that signs many states keeps its newest. Each
-            // lists every change so far, so the newest carry the older's.
+            Self::evict_root_states(&mut tx, &user).await?;
+        }
+        // S2: the newest is the highest revision, then the lower digest,
+        // whichever came first, so every server hands on the same one.
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT state FROM portable_identity_states WHERE user_id = ?1")
+                .bind(&user)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let stored: Option<PortableIdentityState> = stored
+            .map(|json| serde_json::from_str(&json).map_err(super::decode_error))
+            .transpose()?;
+        let newest = stored
+            .as_ref()
+            .is_none_or(|stored| newest_first(state, stored) == Ordering::Less);
+        if newest {
             sqlx::query(
-                "DELETE FROM portable_root_states WHERE user_id = ?1 AND digest NOT IN \
-                 (SELECT digest FROM portable_root_states WHERE user_id = ?1 \
-                  ORDER BY revision DESC LIMIT ?2)",
+                "INSERT INTO portable_identity_states (user_id, revision, state, seen_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (user_id) DO UPDATE SET \
+                   revision = excluded.revision, state = excluded.state, seen_at = excluded.seen_at",
             )
             .bind(&user)
-            .bind(MAX_ROOT_STATES)
+            .bind(revision)
+            .bind(json)
+            .bind(now)
             .execute(&mut *tx)
             .await?;
         }
-        let newest = sqlx::query(
-            "INSERT INTO portable_identity_states (user_id, revision, state, seen_at) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT (user_id) DO UPDATE SET \
-               revision = excluded.revision, state = excluded.state, seen_at = excluded.seen_at \
-             WHERE excluded.revision > portable_identity_states.revision",
-        )
-        .bind(&user)
-        .bind(revision)
-        .bind(json)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            > 0;
         tx.commit().await?;
         if ended > 0 {
             tracing::info!(user = %state.user, sessions = ended, "ended the sessions of revoked device keys");
@@ -193,22 +178,116 @@ impl Store {
                 "took in a portable identity state"
             );
         }
-        if !newest
-            && let Some(stored) = self.identity_state(state.user).await?
+        if let Some(stored) = stored
             && stored.revision == state.revision
             && !stored.same_as(state)
         {
             tracing::warn!(
                 user = %state.user,
                 revision = state.revision,
-                "two different identity states signed at one revision; keeping the first seen \
-                 as the newest, and the revocations of both"
+                "two different identity states signed at one revision; the lower digest is the \
+                 newest, and the revocations of both count"
             );
         }
         Ok(StateAccepted {
             newest,
             revocations,
         })
+    }
+
+    /// Keep the root-changing states of `user` within [`MAX_ROOT_STATES`]
+    /// (S1): the newest that many, and any older one whose root changes
+    /// the kept ones do not carry. Each state lists every change its
+    /// signer knew of, so along one line the newest carry the older's;
+    /// a rival branch's do not, and dropping one would forget a removal
+    /// (a removed key would be a root again here).
+    async fn evict_root_states(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        user: &str,
+    ) -> Result<(), StoreError> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT digest, state FROM portable_root_states WHERE user_id = ?1")
+                .bind(user)
+                .fetch_all(&mut **tx)
+                .await?;
+        if rows.len() <= MAX_ROOT_STATES as usize {
+            return Ok(());
+        }
+        // A row that does not parse is kept: it is not ours to judge.
+        let mut states: Vec<(String, PortableIdentityState)> = rows
+            .into_iter()
+            .filter_map(|(digest, json)| Some((digest, serde_json::from_str(&json).ok()?)))
+            .collect();
+        states.sort_by(|(_, a), (_, b)| newest_first(a, b));
+        let older = states.split_off(MAX_ROOT_STATES as usize);
+        let mut kept: Vec<PortableIdentityState> = states.into_iter().map(|(_, s)| s).collect();
+        for (digest, state) in older {
+            if state.root_changes_covered_by(&kept) {
+                sqlx::query("DELETE FROM portable_root_states WHERE user_id = ?1 AND digest = ?2")
+                    .bind(user)
+                    .bind(&digest)
+                    .execute(&mut **tx)
+                    .await?;
+            } else {
+                kept.push(state);
+            }
+        }
+        Ok(())
+    }
+
+    /// Add `state`'s revocations that have not lapsed at `now` to its
+    /// user's here, each at its earliest, and end the sessions of each
+    /// key revoked. How many it added or made earlier, and how many
+    /// sessions it ended.
+    async fn take_revocations(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        user: &str,
+        state: &PortableIdentityState,
+        now: i64,
+    ) -> Result<(u64, u64), StoreError> {
+        let mut revocations = 0;
+        let mut ended = 0;
+        for entry in state.revoked.iter() {
+            if revocation_lapsed(entry.revoked_at, now) {
+                continue;
+            }
+            revocations += sqlx::query(
+                "INSERT INTO portable_revoked_keys (user_id, device_key, revoked_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (user_id, device_key) DO UPDATE SET revoked_at = excluded.revoked_at \
+                 WHERE excluded.revoked_at < portable_revoked_keys.revoked_at",
+            )
+            .bind(user)
+            .bind(entry.key.to_string())
+            .bind(entry.revoked_at)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+            // The sessions the key opened end with it (P7-06): a guest's,
+            // and a tied account's opened with the credential.
+            let key = entry.key.to_string();
+            ended += sqlx::query(
+                "UPDATE portable_sessions SET revoked_at = ?3 \
+                 WHERE portable_user_id = ?1 AND device_key = ?2 AND revoked_at IS NULL",
+            )
+            .bind(user)
+            .bind(&key)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+            ended += sqlx::query(
+                "UPDATE sessions SET revoked_at = ?3 \
+                 WHERE portable_user_id = ?1 AND portable_device_key = ?2 AND revoked_at IS NULL",
+            )
+            .bind(user)
+            .bind(&key)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+        }
+        Ok((revocations, ended))
     }
 
     /// The newest identity state of `user` seen here, if any: the one to
@@ -445,23 +524,37 @@ pub(crate) mod tests {
         assert_eq!(store.identity_state(user(7)).await.unwrap(), Some(second));
     }
 
+    /// S2: of two states at one revision, the newest is the one with the
+    /// lower digest, whichever came first, so every server hands on the
+    /// same one; the revocations of both count.
     #[tokio::test]
-    async fn another_state_at_the_same_revision_keeps_the_first_and_both_revocations() {
-        let store = test_store("portable-same").await;
-        let first = state(3, &[device(9)]);
-        let rival = state(3, &[device(11)]);
-        assert!(newest(&store, &first).await);
-        let taken = store.accept_identity_state(&rival, T).await.unwrap();
-        assert_eq!(
-            taken,
-            StateAccepted {
-                newest: false,
-                revocations: 1
-            }
-        );
-        assert_eq!(store.identity_state(user(7)).await.unwrap(), Some(first));
-        assert!(store.revokes(user(7), &device(9), T).await.unwrap());
-        assert!(store.revokes(user(7), &device(11), T).await.unwrap());
+    async fn rivals_at_one_revision_keep_the_same_newest_whichever_came_first() {
+        let one = state(3, &[device(9)]);
+        let other = state(3, &[device(11)]);
+        let lower = if one.digest() < other.digest() {
+            one.clone()
+        } else {
+            other.clone()
+        };
+        for (name, first, second) in [
+            ("portable-same-a", &one, &other),
+            ("portable-same-b", &other, &one),
+        ] {
+            let store = test_store(name).await;
+            assert!(newest(&store, first).await);
+            let taken = store.accept_identity_state(second, T).await.unwrap();
+            assert_eq!(taken.revocations, 1);
+            assert_eq!(taken.newest, second.same_as(&lower), "{name}");
+            assert_eq!(
+                store.identity_state(user(7)).await.unwrap().as_ref(),
+                Some(&lower),
+                "{name}"
+            );
+            assert!(store.revokes(user(7), &device(9), T).await.unwrap());
+            assert!(store.revokes(user(7), &device(11), T).await.unwrap());
+            // The same state again changes nothing.
+            assert!(!newest(&store, &lower).await);
+        }
     }
 
     #[tokio::test]
@@ -764,6 +857,131 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
         assert_eq!(kept, MAX_ROOT_STATES);
+    }
+
+    /// S1: a root removed in a state of one branch is still removed after
+    /// the other branch, which never saw it, signs more root-changing
+    /// states than are kept: a state whose changes the kept ones do not
+    /// carry is not dropped.
+    #[tokio::test]
+    async fn a_rival_branch_s_removal_outlives_the_root_state_window() {
+        use spoolframe_protocol::portable::RemovedRoot;
+
+        let store = test_store("portable-rival-removal").await;
+        let (a, b) = (SoftKey::from_seed(3), SoftKey::from_seed(4));
+        let genesis = genesis_of(&[&a, &b]);
+        let user = genesis.user();
+        store.accept_genesis(&genesis, T).await.unwrap();
+        let removal = PortableIdentityState::signed_by(
+            user,
+            a.root(),
+            2,
+            StateChanges {
+                roots_removed: vec![RemovedRoot {
+                    root: b.root(),
+                    removed_at: T,
+                }],
+                ..StateChanges::default()
+            },
+            T,
+            |m| a.assert(m),
+        )
+        .unwrap();
+        store.accept_identity_state(&removal, T).await.unwrap();
+        assert!(
+            !store
+                .root_set(user, None, &[])
+                .await
+                .unwrap()
+                .holds(&b.root())
+        );
+        // The other branch: a's states that never heard of the removal.
+        for revision in 2..=(MAX_ROOT_STATES as u64 + 8) {
+            store
+                .accept_identity_state(&key_state(&genesis, &a, revision), T)
+                .await
+                .unwrap();
+        }
+        let roots = store.root_set(user, None, &[]).await.unwrap();
+        assert!(!roots.holds(&b.root()), "the removed key is back");
+        assert!(roots.holds(&a.root()));
+        // Still bounded: the window, and the one state it does not cover.
+        let (kept,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM portable_root_states WHERE user_id = ?1")
+                .bind(user.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(kept, MAX_ROOT_STATES + 1);
+    }
+
+    /// A state refused because a removed root adds a key through it still
+    /// counts for its revocations: they are one of the identity's roots'
+    /// word, and dropping them would leave a rival branch's revocation
+    /// unheard here.
+    #[tokio::test]
+    async fn a_refused_backdated_state_s_revocations_count() {
+        use spoolframe_protocol::portable::{
+            AddedRoot, RemovedRoot, root_add_message, root_endorse_message,
+        };
+
+        let store = test_store("portable-refused-revokes").await;
+        let (a, b, c) = (
+            SoftKey::from_seed(3),
+            SoftKey::from_seed(4),
+            SoftKey::from_seed(5),
+        );
+        let genesis = genesis_of(&[&a, &b]);
+        let user = genesis.user();
+        store.accept_genesis(&genesis, T).await.unwrap();
+        let removal = PortableIdentityState::signed_by(
+            user,
+            a.root(),
+            1,
+            StateChanges {
+                roots_removed: vec![RemovedRoot {
+                    root: b.root(),
+                    removed_at: T + 10,
+                }],
+                ..StateChanges::default()
+            },
+            T,
+            |m| a.assert(m),
+        )
+        .unwrap();
+        store.accept_identity_state(&removal, T).await.unwrap();
+        let c_added = AddedRoot {
+            root: c.root(),
+            added_by: b.root(),
+            added_at: T + 5,
+            endorsement: b.assert(&root_endorse_message(&user, &c.root(), T + 5)),
+            possession: c.assert(&root_add_message(&user, &c.root())),
+        };
+        let rival = PortableIdentityState::signed_by(
+            user,
+            b.root(),
+            1,
+            StateChanges {
+                revoked: vec![entry(11)],
+                roots_added: vec![c_added],
+                ..StateChanges::default()
+            },
+            T,
+            |m| b.assert(m),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.accept_identity_state(&rival, T).await,
+            Err(IdentityStateError::NotARoot)
+        ));
+        assert!(store.revokes(user, &device(11), T).await.unwrap());
+        assert!(
+            !store
+                .root_set(user, None, &[])
+                .await
+                .unwrap()
+                .holds(&c.root())
+        );
     }
 
     #[tokio::test]

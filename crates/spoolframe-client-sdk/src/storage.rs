@@ -61,6 +61,9 @@ pub mod keys {
     /// Secret: one portable identity's root signing key, 32 bytes
     /// (P7-01). The most valuable secret the SDK keeps: whoever reads it
     /// is that user everywhere, until they recover elsewhere and revoke.
+    /// This device only, never synced or backed up off the device: an
+    /// identity whose root the user chose to sync keeps it under
+    /// [`portable_root_synced`] instead.
     pub fn portable_root(id: &str) -> String {
         format!("portable-root/{id}")
     }
@@ -71,9 +74,11 @@ pub mod keys {
         format!("portable-device/{id}")
     }
 
-    /// Data: the last serial the root of `id` gave a credential, JSON
-    /// (P7-02). Saved before each credential is signed, so no two share
-    /// one.
+    /// Data: the last serial the root of `id` gave a credential here, JSON
+    /// (P7-02). Saved before each credential is signed. The next is the
+    /// issue time in milliseconds, or one past this if that is larger, so
+    /// no two from this device share one, and two devices that hold one
+    /// root almost never do. Never synced: each holder keeps its own.
     pub fn portable_serial(id: &str) -> String {
         format!("portable-serial/{id}")
     }
@@ -115,6 +120,41 @@ pub mod keys {
     /// server with (P7-08), before it knows the identity it will act as:
     /// taken as that identity's device key when the pairing is accepted.
     pub const PORTABLE_PENDING_DEVICE: &str = "portable-device-pending";
+
+    /// What every key the app may sync between the user's devices starts
+    /// with (2026-10-12): an iOS app stores these, and only these, as
+    /// synchronizable keychain items (iCloud Keychain), secrets and data
+    /// alike. Every other key stays on this device, which is also what an
+    /// app that does not know this prefix does: the safe default.
+    pub const SYNCED_PREFIX: &str = "synced/";
+
+    /// Whether the app may sync `key` between the user's devices: it
+    /// starts with [`SYNCED_PREFIX`].
+    pub fn is_synced(key: &str) -> bool {
+        key.starts_with(SYNCED_PREFIX)
+    }
+
+    /// Secret, synced: a phrase identity's root signing key, 32 bytes, once
+    /// the user turned on its sync ([`crate::Portable::enable_root_sync`]).
+    /// The same bytes as [`portable_root`], under a key of its own, so
+    /// nothing else of the identity's goes with it. Whoever's devices
+    /// read it is that user everywhere: only the user's own, through
+    /// their account's end-to-end encrypted keychain.
+    pub fn portable_root_synced(id: &str) -> String {
+        format!("{SYNCED_PREFIX}portable-root/{id}")
+    }
+
+    /// Data, synced: what every holder of a synced root needs of its
+    /// identity, JSON: its name, every device key revoked (however long
+    /// ago), the devices issued credentials, and its newest states. The
+    /// SDK merges it with what is on this device whenever it reads or
+    /// writes it, by union: a write from one device that overwrites
+    /// another's (the keychain keeps the last) loses nothing for good,
+    /// as the other device writes the union back the next time it merges
+    /// ([`crate::Portable::merge_synced`]).
+    pub fn portable_synced(id: &str) -> String {
+        format!("{SYNCED_PREFIX}portable/{id}")
+    }
 }
 
 /// Storage in memory: lost when dropped. For tests, and as the simplest

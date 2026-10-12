@@ -1778,7 +1778,9 @@ impl ClientProtocol {
                                 role: spoolframe_types::Role::Consumer,
                                 locked: false,
                                 pin: None,
-                                portable: Some(portable.user),
+                                // A guest is no account: it has no ties,
+                                // and its identity is its user id.
+                                portable: Vec::new(),
                             },
                             can_leave: true,
                         }));
@@ -1786,7 +1788,7 @@ impl ClientProtocol {
                 };
                 // Asked while locked too: a PIN pad sizes itself by it.
                 let pin = self.store().pin_info(user.user).await.map_err(internal)?;
-                let tie = self.store().tie_of(user.user).await.map_err(internal)?;
+                let ties = self.store().ties_of(user.user).await.map_err(internal)?;
                 // PX-47: what `LeaveServer` would answer, by its own check,
                 // so an app greys out leaving for the last admin.
                 let can_leave = self.store().can_leave(user.user).await.map_err(internal)?;
@@ -1798,7 +1800,14 @@ impl ClientProtocol {
                         role: user.role,
                         locked: state.locks.lock().locked(&session),
                         pin: pin.map(|p| PinState { digits: p.digits }),
-                        portable: tie.map(|tie| tie.portable),
+                        portable: ties
+                            .into_iter()
+                            .map(|tie| spoolframe_protocol::PortableTie {
+                                id: tie.portable,
+                                tied_at: tie.tied_at,
+                                last_used_at: tie.last_used_at,
+                            })
+                            .collect(),
                     },
                     can_leave,
                 }))
@@ -2930,15 +2939,7 @@ impl ClientProtocol {
             Request::TieBegin => {
                 let user = local(&who)?;
                 recently_signed_in(user, self.services.auth.store().now())?;
-                if self
-                    .store()
-                    .tie_of(user.user)
-                    .await
-                    .map_err(internal)?
-                    .is_some()
-                {
-                    return Err(Error::AlreadyTied);
-                }
+                // A tied account ties more (P7-09): no refusal here.
                 let session = SessionToken(session.0.clone()).hash();
                 let (nonce, lasts) =
                     self.ties
@@ -2960,21 +2961,28 @@ impl ClientProtocol {
                 recently_signed_in(user, self.services.auth.store().now())?;
                 self.tie(&session, user, portable, &proof).await
             }
-            Request::Untie => {
+            Request::Untie { user: portable } => {
                 let user = local(&who)?;
                 recently_signed_in(user, self.services.auth.store().now())?;
-                match self.store().untie(user.user).await.map_err(internal)? {
-                    Some(portable) => {
-                        tracing::info!(
-                            user = %user.username,
-                            portable = %portable.fingerprint(),
-                            "portable identity untied by its user, in an app"
-                        );
-                        Ok(Reply::Done)
-                    }
-                    None => Err(Error::NotFound {
+                // Only this tie: the account's others, and its sessions,
+                // those opened with this identity's credential too, stay
+                // (P7-09: "the account's rows and sessions as they were").
+                if self
+                    .store()
+                    .untie(user.user, portable)
+                    .await
+                    .map_err(internal)?
+                {
+                    tracing::info!(
+                        user = %user.username,
+                        portable = %portable.fingerprint(),
+                        "portable identity untied by its user, in an app"
+                    );
+                    Ok(Reply::Done)
+                } else {
+                    Err(Error::NotFound {
                         what: "portable identity tie".into(),
-                    }),
+                    })
                 }
             }
             // PX-47: a user leaves this server, after a recent sign-in.
@@ -3518,6 +3526,11 @@ impl ClientProtocol {
                 portable = %user.fingerprint(),
                 "logged in with a tied portable credential"
             );
+            // P7-09: the tie's last use, which the account's list of ties
+            // shows. The session stands without it.
+            if let Err(e) = store.tie_used(local, user).await {
+                tracing::warn!(error = %e, "a tie's last use not kept");
+            }
             token
         } else if store.grant_of(user).await.map_err(internal)?.is_some() {
             let token = self
@@ -3603,15 +3616,6 @@ impl ClientProtocol {
         else {
             return Err(Error::TieChallengeExpired);
         };
-        if self
-            .store()
-            .tie_of(user.user)
-            .await
-            .map_err(internal)?
-            .is_some()
-        {
-            return Err(Error::AlreadyTied);
-        }
         let now = self.store().clock().unix_secs();
         if let Err(e) = crate::ties::check_tie(
             self.store(),
@@ -3636,11 +3640,11 @@ impl ClientProtocol {
             );
             return Err(Error::InvalidCredentials);
         }
-        self.store()
+        let tied = self
+            .store()
             .tie(user.user, portable, proof.kind())
             .await
             .map_err(|e| match e {
-                crate::store::ties::TieError::AlreadyTied => Error::AlreadyTied,
                 crate::store::ties::TieError::PortableIdTaken => Error::PortableIdTaken,
                 crate::store::ties::TieError::Store(e) => internal(e),
             })?;
@@ -3650,12 +3654,20 @@ impl ClientProtocol {
         {
             tracing::warn!(error = %e, "a tied identity's genesis not kept");
         }
-        tracing::info!(
-            user = %user.username,
-            portable = %portable.fingerprint(),
-            proof = proof.kind(),
-            "portable identity tied, in an app"
-        );
+        match tied {
+            crate::store::ties::Tied::New => tracing::info!(
+                user = %user.username,
+                portable = %portable.fingerprint(),
+                proof = proof.kind(),
+                "portable identity tied, in an app"
+            ),
+            // P7-09: tied here already, a no-op; not a second tie line.
+            crate::store::ties::Tied::Already => tracing::debug!(
+                user = %user.username,
+                portable = %portable.fingerprint(),
+                "portable identity tied again, in an app: nothing changed"
+            ),
+        }
         Ok(Reply::Done)
     }
 

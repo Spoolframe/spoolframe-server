@@ -524,7 +524,7 @@ fn answer(
                 role: Role::Consumer,
                 locked: false,
                 pin: None,
-                portable: None,
+                portable: Vec::new(),
             },
             can_leave: !state.last_admin.load(Ordering::SeqCst),
         }),

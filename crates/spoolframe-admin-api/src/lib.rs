@@ -181,7 +181,8 @@ pub mod error_code {
     /// file can change it.
     pub const SETTING_LOCKED: i32 = -32020;
     /// Not one of the user's linked sign-in provider accounts (P3-04); or,
-    /// to sever, an account tied to no portable identity (P7-04).
+    /// to sever, not a portable identity the account is tied to (P7-04,
+    /// P7-09).
     pub const NO_SUCH_LINK: i32 = -32021;
     /// The provider account is linked to another user, or the user has
     /// one linked at that provider already (P3-04).
@@ -482,14 +483,14 @@ pub struct UserInfo {
     /// too many wrong ones under their username (P1-11, P3-18); `None`
     /// when they are checked now.
     pub rate_limited_secs: Option<u64>,
-    /// The portable identity their account is tied to (P7-04), shown on
-    /// the account as a badge; `None` when it is tied to none.
-    #[serde(deserialize_with = "spoolframe_types::required::option")]
-    pub portable: Option<PortableTie>,
+    /// The portable identities their account is tied to (P7-04, P7-09),
+    /// the oldest tie first, shown on the account, never as other users;
+    /// empty when it is tied to none.
+    pub portable: Vec<PortableTie>,
 }
 
-/// A local account's tie to a portable identity (P7-04). Only the
-/// identity's phone app makes one; the web UI shows and severs it.
+/// One of a local account's ties to a portable identity (P7-04, P7-09).
+/// Only the identity's app makes one; the web UI shows and severs it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortableTie {
@@ -500,6 +501,10 @@ pub struct PortableTie {
     pub fingerprint: String,
     /// Unix seconds.
     pub tied_at: i64,
+    /// Unix seconds of the identity's last sign-in into the account with
+    /// its credential (P7-06); `None` until one.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub last_used_at: Option<i64>,
 }
 
 /// A portable user granted access here (P7-06): someone whose account
@@ -3113,13 +3118,14 @@ pub trait MeApi {
     #[method(name = "ssoUnlink", with_extensions)]
     async fn sso_unlink(&self, issuer: String) -> jsonrpsee::core::RpcResult<()>;
 
-    /// Sever the caller's tie to their portable identity (P7-04): only the
-    /// link goes; the account, its sessions and its watch state stay.
-    /// Needs a recent sign-in. `NO_SUCH_LINK` for an account tied to none.
-    /// Tying is done from the identity's phone app, never here: the web
-    /// UI never holds the root.
+    /// Sever the caller's tie to the portable identity `id` (P7-04,
+    /// P7-09; `PortableTie::id`): only that link goes; the account's other
+    /// ties, its sessions and its watch state stay. Needs a recent
+    /// sign-in. `NO_SUCH_LINK` for an identity the account is not tied to.
+    /// Tying is done from the identity's app, never here: the web UI
+    /// never holds the root.
     #[method(name = "portableUntie", with_extensions)]
-    async fn portable_untie(&self) -> jsonrpsee::core::RpcResult<()>;
+    async fn portable_untie(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
 
     /// The caller, their Plex link and their last sync run (P3-12).
     #[method(name = "plexLink", with_extensions)]
@@ -3333,12 +3339,13 @@ pub trait AdminApi {
         issuer: String,
     ) -> jsonrpsee::core::RpcResult<()>;
 
-    /// Sever `username`'s tie to their portable identity (P7-04), as
-    /// `me.portableUntie` does: only the link goes. Needs a recent sign-in
-    /// (`RECENT_SIGN_IN_REQUIRED`). An admin can sever a tie, never make
-    /// one. `NO_SUCH_LINK` for an account tied to none.
+    /// Sever `username`'s tie to the portable identity `id` (P7-04,
+    /// P7-09), as `me.portableUntie` does: only that link goes. Needs a
+    /// recent sign-in (`RECENT_SIGN_IN_REQUIRED`). An admin can sever a
+    /// tie, never make one. `NO_SUCH_LINK` for an identity the account is
+    /// not tied to.
     #[method(name = "userUntie", with_extensions)]
-    async fn user_untie(&self, username: String) -> jsonrpsee::core::RpcResult<()>;
+    async fn user_untie(&self, username: String, id: String) -> jsonrpsee::core::RpcResult<()>;
 
     /// Keep `secret` as the client secret of the sign-in provider called
     /// `provider` (P3-04), or forget it (`None`): a secret, in the state
@@ -3823,7 +3830,7 @@ mod required_field_tests {
                 device_count: 0,
                 session_count: 0,
                 rate_limited_secs: None,
-                portable: None,
+                portable: Vec::new(),
             },
             &[
                 "displayName",
@@ -3832,6 +3839,15 @@ mod required_field_tests {
                 "passwordMustChange",
                 "passwordExpiresAt",
             ],
+        );
+        assert_each_required(
+            &PortableTie {
+                id: "ab".repeat(32),
+                fingerprint: "K7QX-3MPA-9TRD-WF2H".into(),
+                tied_at: 1_791_504_000,
+                last_used_at: None,
+            },
+            &["id", "fingerprint", "tiedAt", "lastUsedAt"],
         );
         assert_each_required(
             &NewUser {

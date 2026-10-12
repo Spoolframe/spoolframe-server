@@ -2117,20 +2117,43 @@ async fn a_ladder_s_rungs_are_read_by_their_number() {
     server.stop().await;
 }
 
-/// P7-04: the phone holding an identity's root ties alice's account to it,
-/// and the account says so; severing it says so too.
+/// P7-04, P7-09: the phone holding two identities' roots ties alice's
+/// account to both, and the account lists them with their dates; tying one
+/// again changes nothing, and severing one leaves the other.
 #[tokio::test]
-async fn the_phone_ties_the_account_to_its_identity_and_severs_it() {
+async fn the_phone_ties_the_account_to_its_identities_and_severs_one() {
     let (server, client, _) = ready("sdk-tie-root").await;
     let alice = alice(&server, &client).await;
-    let (identity, _phrase) = client.portable().create("Alice").await.unwrap();
-    assert_eq!(alice.tie_info().await.unwrap(), None);
-    alice.tie(identity).await.unwrap();
-    assert_eq!(alice.tie_info().await.unwrap(), Some(identity));
-    assert_eq!(alice.tie(identity).await, Err(SdkError::AlreadyTied));
-    alice.untie().await.unwrap();
-    assert_eq!(alice.tie_info().await.unwrap(), None);
-    assert!(matches!(alice.untie().await, Err(SdkError::NotFound(_))));
+    let (first, _phrase) = client.portable().create("Alice").await.unwrap();
+    let (second, _phrase) = client.portable().create("Alice too").await.unwrap();
+    assert_eq!(alice.tie_info().await.unwrap(), []);
+    alice.tie(first).await.unwrap();
+    alice.tie(second).await.unwrap();
+    let ties = alice.tie_info().await.unwrap();
+    let ids: Vec<_> = ties.iter().map(|t| t.id).collect();
+    assert!(
+        ids.len() == 2 && ids.contains(&first) && ids.contains(&second),
+        "{ties:?}"
+    );
+    assert!(
+        ties.iter()
+            .all(|t| t.tied_at > 0 && t.last_used_at.is_none())
+    );
+    alice.tie(first).await.unwrap();
+    assert_eq!(alice.tie_info().await.unwrap(), ties);
+    alice.untie(first).await.unwrap();
+    let left: Vec<_> = alice
+        .tie_info()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(left, [second]);
+    assert!(matches!(
+        alice.untie(first).await,
+        Err(SdkError::NotFound(_))
+    ));
 }
 
 /// A TV that never sees the root ties with the credential the phone gave
@@ -2150,7 +2173,14 @@ async fn a_device_ties_with_its_credential_and_the_identity_is_taken_after() {
 
     let alice = alice(&server, &tv).await;
     alice.tie(identity).await.unwrap();
-    assert_eq!(alice.tie_info().await.unwrap(), Some(identity));
+    let tied: Vec<_> = alice
+        .tie_info()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(tied, [identity]);
 
     let bob = phone
         .sign_in(&id(&server), "bob", "battery staple", false)

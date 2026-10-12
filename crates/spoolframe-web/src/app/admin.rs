@@ -800,6 +800,10 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
                             UserStatus::OneTimePassword(_) => rsx! { span { class: "text-ctp-yellow", "One-time password" } },
                             UserStatus::Active => rsx! { "Active" },
                         }
+                        if let Some(count) = crate::portable::count_badge(user.portable.len()) {
+                            " "
+                            span { class: "pill pill-tie", icons::Fingerprint { size: 13 } "{count}" }
+                        }
                     }
                 }
             }
@@ -835,7 +839,7 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
         super::portable::PortableCard {
             owner: crate::portable::Owner::User { name: name.clone() },
             username: username.clone(),
-            tie: user.portable.clone(),
+            ties: user.portable.clone(),
             toast,
             on_severed: move |_| on_changed.call(()),
         }

@@ -1,7 +1,8 @@
-//! Tying a local account to a portable identity (P7-04), over a real
-//! connection: the challenge, the proof by the root or by a device key,
-//! every way a proof is refused, the rules that keep one identity to one
-//! account here, and severing, which leaves the account as it was.
+//! Tying a local account to portable identities (P7-04, P7-09), over a
+//! real connection: the challenge, the proof by the root or by a device
+//! key, every way a proof is refused, the rules that let an account tie
+//! several identities and keep each identity to one account here, and
+//! severing one, which leaves the account and its other ties as they were.
 
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use spoolframe_protocol::portable::{
     DevicePublicKey, MAX_CREDENTIAL_VALIDITY, PortableIdentityState, PortableUserId, RevokedKey,
     TieProof, UserDeviceCredential, tie_message,
 };
-use spoolframe_protocol::{Error, Reply, Request, Response, SessionId, WhoAmIReply};
+use spoolframe_protocol::{Error, PortableTie, Reply, Request, Response, SessionId, WhoAmIReply};
 use spoolframe_types::Item;
 
 use crate::app_passkeys::web_passkey;
@@ -117,10 +118,26 @@ async fn tie(phone: &TestClient, session: &SessionId, user: u8, username: &str) 
     phone.call(Some(session), finish(user, proof)).await
 }
 
-async fn tied_to(phone: &TestClient, session: &SessionId) -> Option<PortableUserId> {
+/// The account's ties as `WhoAmI` lists them.
+async fn ties(phone: &TestClient, session: &SessionId) -> Vec<PortableTie> {
     match phone.call(Some(session), Request::WhoAmI).await {
         Response::Ok(Reply::WhoAmI(WhoAmIReply { user: me, .. })) => me.portable,
         other => panic!("no WhoAmI: {other:?}"),
+    }
+}
+
+/// The identities the account is tied to, the oldest tie first.
+async fn tied_to(phone: &TestClient, session: &SessionId) -> Vec<PortableUserId> {
+    ties(phone, session)
+        .await
+        .into_iter()
+        .map(|t| t.id)
+        .collect()
+}
+
+fn untie(user: u8) -> Request {
+    Request::Untie {
+        user: identity(user),
     }
 }
 
@@ -128,9 +145,9 @@ async fn tied_to(phone: &TestClient, session: &SessionId) -> Option<PortableUser
 async fn the_root_ties_the_account_and_no_user_is_added() {
     let (server, phone, session) = alice("tie-root").await;
     let users = server.store.list_users().await.unwrap().len();
-    assert_eq!(tied_to(&phone, &session).await, None);
+    assert_eq!(tied_to(&phone, &session).await, []);
     assert_eq!(tie(&phone, &session, 7, "alice").await, DONE);
-    assert_eq!(tied_to(&phone, &session).await, Some(identity(7)));
+    assert_eq!(tied_to(&phone, &session).await, [identity(7)]);
     assert_eq!(server.store.list_users().await.unwrap().len(), users);
     let alice = server.store.tied_account(identity(7)).await.unwrap();
     let alice_id = server
@@ -143,8 +160,8 @@ async fn the_root_ties_the_account_and_no_user_is_added() {
         .unwrap()
         .id;
     assert_eq!(alice, Some(alice_id));
-    let tie = server.store.tie_of(alice_id).await.unwrap().unwrap();
-    assert_eq!(tie.proof_kind, "root");
+    let ties = server.store.ties_of(alice_id).await.unwrap();
+    assert_eq!(ties[0].proof_kind, "root");
 }
 
 #[tokio::test]
@@ -156,7 +173,7 @@ async fn a_device_with_a_credential_ties_without_the_root() {
         signature: root(9).sign(&message(&phone, &nonce, 7, "alice")),
     };
     assert_eq!(phone.call(Some(&session), finish(7, proof)).await, DONE);
-    assert_eq!(tied_to(&phone, &session).await, Some(identity(7)));
+    assert_eq!(tied_to(&phone, &session).await, [identity(7)]);
     let alice = server
         .store
         .tied_account(identity(7))
@@ -164,13 +181,7 @@ async fn a_device_with_a_credential_ties_without_the_root() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        server
-            .store
-            .tie_of(alice)
-            .await
-            .unwrap()
-            .unwrap()
-            .proof_kind,
+        server.store.ties_of(alice).await.unwrap()[0].proof_kind,
         "device"
     );
 }
@@ -230,7 +241,7 @@ async fn a_proof_made_for_anything_else_is_refused() {
     };
     assert_eq!(phone.call(Some(&session), finish(7, theirs)).await, REFUSED);
 
-    assert_eq!(tied_to(&phone, &session).await, None);
+    assert_eq!(tied_to(&phone, &session).await, []);
 }
 
 #[tokio::test]
@@ -263,7 +274,7 @@ async fn a_challenge_is_used_once_and_not_for_long() {
     let nonce = begin(&phone, &session).await;
     let proof = by_root(&phone, &nonce, 7, "alice");
     assert_eq!(tablet.call(Some(&other), finish(7, proof)).await, OVER);
-    assert_eq!(tied_to(&phone, &session).await, None);
+    assert_eq!(tied_to(&phone, &session).await, []);
 }
 
 #[tokio::test]
@@ -291,7 +302,7 @@ async fn a_revoked_device_key_ties_nothing() {
         signature: root(9).sign(&message(&phone, &nonce, 7, "alice")),
     };
     assert_eq!(phone.call(Some(&session), finish(7, proof)).await, REFUSED);
-    assert_eq!(tied_to(&phone, &session).await, None);
+    assert_eq!(tied_to(&phone, &session).await, []);
 }
 
 #[tokio::test]
@@ -305,26 +316,49 @@ async fn an_identity_tied_here_is_not_tied_to_a_second_account() {
         tie(&laptop, &bob, 7, "bob").await,
         Response::Err(Error::PortableIdTaken)
     );
-    assert_eq!(tied_to(&laptop, &bob).await, None);
+    assert_eq!(tied_to(&laptop, &bob).await, []);
+    // Bob cannot sever alice's tie either.
+    assert!(matches!(
+        laptop.call(Some(&bob), untie(7)).await,
+        Response::Err(Error::NotFound { .. })
+    ));
+    assert_eq!(tied_to(&phone, &alice).await, [identity(7)]);
     // Once alice severs hers, it is free.
-    assert_eq!(phone.call(Some(&alice), Request::Untie).await, DONE);
+    assert_eq!(phone.call(Some(&alice), untie(7)).await, DONE);
     assert_eq!(tie(&laptop, &bob, 7, "bob").await, DONE);
 }
 
+/// P7-09: a tied account ties a second identity without severing the
+/// first, and `WhoAmI` lists both with their dates, the oldest first.
 #[tokio::test]
-async fn a_tied_account_severs_before_tying_again() {
-    let (_server, phone, session) = alice("tie-again").await;
+async fn a_tied_account_ties_another_identity_and_keeps_the_first() {
+    let (server, phone, session) = alice("tie-second").await;
     assert_eq!(tie(&phone, &session, 7, "alice").await, DONE);
-    assert_eq!(
-        phone.call(Some(&session), Request::TieBegin).await,
-        Response::Err(Error::AlreadyTied)
-    );
-    assert_eq!(tied_to(&phone, &session).await, Some(identity(7)));
-    assert_eq!(phone.call(Some(&session), Request::Untie).await, DONE);
+    server.clock.advance(Duration::from_secs(60));
     assert_eq!(tie(&phone, &session, 8, "alice").await, DONE);
-    assert_eq!(tied_to(&phone, &session).await, Some(identity(8)));
+    let ties = ties(&phone, &session).await;
+    assert_eq!(
+        ties.iter().map(|t| t.id).collect::<Vec<_>>(),
+        [identity(7), identity(8)]
+    );
+    assert_eq!(ties[1].tied_at - ties[0].tied_at, 60);
+    assert!(ties.iter().all(|t| t.last_used_at.is_none()), "{ties:?}");
 }
 
+/// Tying an identity tied to this account already is done, and changes
+/// nothing: no second row, the first tie's date stands.
+#[tokio::test]
+async fn tying_an_identity_tied_here_again_changes_nothing() {
+    let (server, phone, session) = alice("tie-again").await;
+    assert_eq!(tie(&phone, &session, 7, "alice").await, DONE);
+    let before = ties(&phone, &session).await;
+    server.clock.advance(Duration::from_secs(60));
+    assert_eq!(tie(&phone, &session, 7, "alice").await, DONE);
+    assert_eq!(ties(&phone, &session).await, before);
+}
+
+/// Severing one tie leaves the others, and the account's rows and
+/// sessions as they were.
 #[tokio::test]
 async fn severing_leaves_the_account_as_it_was() {
     let (server, phone, session) = alice("untie-intact").await;
@@ -340,12 +374,13 @@ async fn severing_leaves_the_account_as_it_was() {
         DONE
     );
     assert_eq!(tie(&phone, &session, 7, "alice").await, DONE);
+    assert_eq!(tie(&phone, &session, 8, "alice").await, DONE);
     let passkeys = phone.call(Some(&session), Request::ListPasskeys).await;
     let sessions = phone.call(Some(&session), Request::ListSessions).await;
 
-    assert_eq!(phone.call(Some(&session), Request::Untie).await, DONE);
+    assert_eq!(phone.call(Some(&session), untie(7)).await, DONE);
 
-    assert_eq!(tied_to(&phone, &session).await, None);
+    assert_eq!(tied_to(&phone, &session).await, [identity(8)]);
     assert_eq!(
         phone.call(Some(&session), Request::ListPasskeys).await,
         passkeys
@@ -366,11 +401,13 @@ async fn severing_leaves_the_account_as_it_was() {
         }) => assert!(movie.playback.watched),
         other => panic!("no item: {other:?}"),
     }
-    // Nothing left to sever.
+    // Nothing left to sever for 7; 8 goes the same way.
     assert!(matches!(
-        phone.call(Some(&session), Request::Untie).await,
+        phone.call(Some(&session), untie(7)).await,
         Response::Err(Error::NotFound { .. })
     ));
+    assert_eq!(phone.call(Some(&session), untie(8)).await, DONE);
+    assert_eq!(tied_to(&phone, &session).await, []);
 }
 
 #[tokio::test]
@@ -388,7 +425,7 @@ async fn tying_and_severing_need_a_recent_sign_in() {
         phone.call(Some(&session), finish(7, proof)).await,
         not_recent
     );
-    assert_eq!(phone.call(Some(&session), Request::Untie).await, not_recent);
+    assert_eq!(phone.call(Some(&session), untie(7)).await, not_recent);
 }
 
 /// A tie and a sever are each one INFO line naming the user and the
@@ -418,38 +455,46 @@ async fn ties_and_refused_proofs_are_logged() {
     assert_eq!(tied[0].field("user"), Some("alice"));
     assert_eq!(tied[0].field("portable"), Some(fingerprint.as_str()));
 
-    assert_eq!(phone.call(Some(&session), Request::Untie).await, DONE);
+    assert_eq!(phone.call(Some(&session), untie(7)).await, DONE);
     let untied = capture.saying("portable identity untied by its user, in an app");
     assert_eq!(untied.len(), 1, "{untied:#?}");
     assert_eq!(untied[0].field("portable"), Some(fingerprint.as_str()));
 }
 
-// The admin API: the tie is a badge on the account, never a second one,
-// and both its user and an admin sever it.
+// The admin API: the ties are badges on the account, never other users,
+// and both its user and an admin sever each.
 
 /// Tie `username`'s account in the state in `dir` to identity `user`, as
-/// a proved tie leaves it.
-async fn tied_in(dir: &std::path::Path, username: &str, user: u8) {
+/// a proved tie leaves it: tied `user` seconds past 1791504000, so ties
+/// list in the order of their seeds, and used `used`.
+async fn tied_in(dir: &std::path::Path, username: &str, user: u8, used: Option<i64>) {
     let pool = sqlx::SqlitePool::connect_with(
         sqlx::sqlite::SqliteConnectOptions::new().filename(dir.join("spoolframe.db")),
     )
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO portable_ties (local_user_id, portable_user_id, tied_at, proof_kind) \
-         SELECT id, ?2, 1791504000, 'root' FROM users WHERE username = ?1",
+        "INSERT INTO portable_ties \
+           (local_user_id, portable_user_id, tied_at, proof_kind, last_used_at) \
+         SELECT id, ?2, ?3, 'root', ?4 FROM users WHERE username = ?1",
     )
     .bind(username)
     .bind(identity(user).to_string())
+    .bind(1_791_504_000 + i64::from(user))
+    .bind(used)
     .execute(&pool)
     .await
     .unwrap();
     pool.close().await;
 }
 
+fn hex(user: u8) -> String {
+    identity(user).to_string()
+}
+
 #[tokio::test]
-async fn the_admin_sees_the_tie_on_the_account_and_severs_it() {
-    use spoolframe_admin_api::{AdminApiClient, NewUser, Role, error_code};
+async fn the_admin_sees_the_ties_on_the_account_and_severs_one() {
+    use spoolframe_admin_api::{AdminApiClient, NewUser, PortableTie, Role, error_code};
     let (_addr, root, dir) = crate::settings::served("tie-admin", "").await;
     root.user_add(NewUser {
         username: "bob".into(),
@@ -459,23 +504,55 @@ async fn the_admin_sees_the_tie_on_the_account_and_severs_it() {
     })
     .await
     .unwrap();
-    tied_in(dir.as_ref(), "bob", 7).await;
+    tied_in(dir.as_ref(), "bob", 7, Some(1_791_590_400)).await;
+    tied_in(dir.as_ref(), "bob", 8, None).await;
     let users = root.user_list().await.unwrap();
     assert_eq!(users.len(), 2, "{users:?}");
     let bob = users.iter().find(|u| u.username == "bob").unwrap();
-    let tie = bob.portable.as_ref().unwrap();
-    assert_eq!(tie.id, identity(7).to_string());
-    assert_eq!(tie.fingerprint, identity(7).fingerprint());
-    assert_eq!(tie.tied_at, 1_791_504_000);
+    assert_eq!(
+        bob.portable,
+        [
+            PortableTie {
+                id: hex(7),
+                fingerprint: identity(7).fingerprint(),
+                tied_at: 1_791_504_007,
+                last_used_at: Some(1_791_590_400),
+            },
+            PortableTie {
+                id: hex(8),
+                fingerprint: identity(8).fingerprint(),
+                tied_at: 1_791_504_008,
+                last_used_at: None,
+            },
+        ]
+    );
     let root_user = users.iter().find(|u| u.username == "root").unwrap();
-    assert_eq!(root_user.portable, None);
+    assert_eq!(root_user.portable, []);
 
-    root.user_untie("bob".into()).await.unwrap();
+    root.user_untie("bob".into(), hex(7)).await.unwrap();
     let users = root.user_list().await.unwrap();
     assert_eq!(users.len(), 2);
-    assert!(users.iter().all(|u| u.portable.is_none()));
+    let bob = users.iter().find(|u| u.username == "bob").unwrap();
     assert_eq!(
-        root.user_untie("bob".into())
+        bob.portable
+            .iter()
+            .map(|t| t.id.clone())
+            .collect::<Vec<_>>(),
+        [hex(8)]
+    );
+    for id in [hex(7), hex(9), "not an identity".into()] {
+        assert_eq!(
+            root.user_untie("bob".into(), id.clone())
+                .await
+                .err()
+                .map(crate::admin::code),
+            Some(error_code::NO_SUCH_LINK),
+            "{id}"
+        );
+    }
+    // Another account's tie is not severed through this one.
+    assert_eq!(
+        root.user_untie("root".into(), hex(8))
             .await
             .err()
             .map(crate::admin::code),
@@ -484,25 +561,40 @@ async fn the_admin_sees_the_tie_on_the_account_and_severs_it() {
 }
 
 #[tokio::test]
-async fn a_user_severs_their_own_tie_from_the_web_after_a_recent_sign_in() {
+async fn a_user_severs_one_of_their_ties_from_the_web_after_a_recent_sign_in() {
     use spoolframe_admin_api::{MeApiClient, error_code};
     let (_addr, root, dir) = crate::settings::served("tie-me", "").await;
-    tied_in(dir.as_ref(), "root", 7).await;
-    let me = root.who_am_i().await.unwrap();
+    tied_in(dir.as_ref(), "root", 7, None).await;
+    tied_in(dir.as_ref(), "root", 8, None).await;
+    let fingerprints = |me: spoolframe_admin_api::UserInfo| {
+        me.portable
+            .into_iter()
+            .map(|tie| tie.fingerprint)
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        me.portable.map(|tie| tie.fingerprint),
-        Some(identity(7).fingerprint())
+        fingerprints(root.who_am_i().await.unwrap()),
+        [identity(7).fingerprint(), identity(8).fingerprint()]
     );
     crate::recent_admin::age(dir.as_ref(), "root").await;
     assert_eq!(
-        root.portable_untie().await.err().map(crate::admin::code),
+        root.portable_untie(hex(7))
+            .await
+            .err()
+            .map(crate::admin::code),
         Some(error_code::RECENT_SIGN_IN_REQUIRED)
     );
     root.confirm_password("correct horse".into()).await.unwrap();
-    root.portable_untie().await.unwrap();
-    assert_eq!(root.who_am_i().await.unwrap().portable, None);
+    root.portable_untie(hex(7)).await.unwrap();
     assert_eq!(
-        root.portable_untie().await.err().map(crate::admin::code),
+        fingerprints(root.who_am_i().await.unwrap()),
+        [identity(8).fingerprint()]
+    );
+    assert_eq!(
+        root.portable_untie(hex(7))
+            .await
+            .err()
+            .map(crate::admin::code),
         Some(error_code::NO_SUCH_LINK)
     );
 }

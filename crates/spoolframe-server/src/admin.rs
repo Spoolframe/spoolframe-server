@@ -1703,36 +1703,45 @@ fn info(u: UserRecord, limited: Option<std::time::Duration>) -> UserInfo {
         has_pin: u.has_pin,
         device_count: u.device_count,
         session_count: u.session_count,
-        portable: u.tie.map(|tie| spoolframe_admin_api::PortableTie {
-            id: tie.portable.to_string(),
-            fingerprint: tie.portable.fingerprint(),
-            tied_at: tie.tied_at,
-        }),
+        portable: u
+            .ties
+            .into_iter()
+            .map(|tie| spoolframe_admin_api::PortableTie {
+                id: tie.portable.to_string(),
+                fingerprint: tie.portable.fingerprint(),
+                tied_at: tie.tied_at,
+                last_used_at: tie.last_used_at,
+            })
+            .collect(),
     }
 }
 
-/// Sever `user`'s tie (P7-04), `by` whom for the log: the identity it
-/// was to, or `NO_SUCH_LINK` for none.
+/// Sever `user`'s tie to the identity `id` (P7-04, P7-09), `by` whom for
+/// the log; `NO_SUCH_LINK` for an identity the account is not tied to,
+/// one that is no identity's id too.
 async fn untie(
     store: &crate::store::Store,
     user: crate::store::users::LocalUserId,
     username: &str,
+    id: &str,
     by: &str,
 ) -> RpcResult<()> {
-    match store.untie(user).await.map_err(internal)? {
-        Some(portable) => {
-            tracing::info!(
-                user = %username,
-                portable = %portable.fingerprint(),
-                "portable identity untied by {by}"
-            );
-            Ok(())
-        }
-        None => Err(error(
+    let no_such = || {
+        error(
             error_code::NO_SUCH_LINK,
-            "the account is tied to no portable identity",
-        )),
+            "the account is not tied to that portable identity",
+        )
+    };
+    let portable: spoolframe_protocol::PortableUserId = id.parse().map_err(|_| no_such())?;
+    if !store.untie(user, portable).await.map_err(internal)? {
+        return Err(no_such());
     }
+    tracing::info!(
+        user = %username,
+        portable = %portable.fingerprint(),
+        "portable identity untied by {by}"
+    );
+    Ok(())
 }
 
 /// A session as the API shows it; `current` is the caller's own.
@@ -2222,10 +2231,10 @@ impl MeApiServer for AdminApi {
         Ok(())
     }
 
-    async fn portable_untie(&self, ext: &Extensions) -> RpcResult<()> {
+    async fn portable_untie(&self, ext: &Extensions, id: String) -> RpcResult<()> {
         let (_, user) = self.recently_signed_in(ext).await?;
         let me = self.account(user).await?;
-        untie(self.auth.store(), me.id, &me.username, "its user").await
+        untie(self.auth.store(), me.id, &me.username, &id, "its user").await
     }
 
     async fn plex_link(&self, ext: &Extensions) -> RpcResult<PlexUser> {
@@ -2787,10 +2796,10 @@ impl AdminApiServer for AdminApi {
         Ok(())
     }
 
-    async fn user_untie(&self, ext: &Extensions, username: String) -> RpcResult<()> {
+    async fn user_untie(&self, ext: &Extensions, username: String, id: String) -> RpcResult<()> {
         self.recent_admin(ext).await?;
         let user = self.record(&username).await?;
-        untie(self.auth.store(), user.id, &user.username, "an admin").await
+        untie(self.auth.store(), user.id, &user.username, &id, "an admin").await
     }
 
     async fn sso_set_client_secret(

@@ -103,8 +103,9 @@ pub struct UserRecord {
     /// Their live sessions: not revoked, not expired, as `list_sessions`
     /// lists them.
     pub session_count: u64,
-    /// Their account's tie to a portable identity (P7-04), if any.
-    pub tie: Option<super::ties::Tie>,
+    /// Their account's ties to portable identities (P7-04, P7-09), the
+    /// oldest first.
+    pub ties: Vec<super::ties::Tie>,
 }
 
 /// What a password login needs about a user.
@@ -485,10 +486,8 @@ impl Store {
                      WHERE s.user_id = u.id) AS device_count, \
                     (SELECT count(*) FROM sessions s \
                      WHERE s.user_id = u.id AND s.revoked_at IS NULL AND s.expires_at > ?1) \
-                        AS session_count, \
-                    t.portable_user_id, t.tied_at, t.proof_kind \
-             FROM users u LEFT JOIN password_credentials p ON p.user_id = u.id \
-                  LEFT JOIN portable_ties t ON t.local_user_id = u.id "
+                        AS session_count \
+             FROM users u LEFT JOIN password_credentials p ON p.user_id = u.id "
             };
         }
         let rows = match which {
@@ -513,7 +512,8 @@ impl Store {
                     .await?
             }
         };
-        rows.into_iter()
+        let mut users = rows
+            .into_iter()
             .map(|row| {
                 Ok(UserRecord {
                     id: row.try_get("id")?,
@@ -533,17 +533,26 @@ impl Store {
                     has_pin: row.try_get("has_pin")?,
                     device_count: row.try_get::<i64, _>("device_count")? as u64,
                     session_count: row.try_get::<i64, _>("session_count")? as u64,
-                    tie: match row.try_get::<Option<String>, _>("portable_user_id")? {
-                        None => None,
-                        Some(portable) => Some(super::ties::Tie {
-                            portable: super::parse_id(portable)?,
-                            tied_at: row.try_get("tied_at")?,
-                            proof_kind: row.try_get("proof_kind")?,
-                        }),
-                    },
+                    ties: Vec::new(),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, UserError>>()?;
+        // Several ties to an account (P7-09) would repeat its row in a
+        // join: read apart, and handed out by account.
+        let mut ties = match which {
+            Which::All => self.all_ties().await?,
+            Which::Id(_) | Which::Name(_) => {
+                let mut ties = std::collections::HashMap::new();
+                for user in &users {
+                    ties.insert(user.id, self.ties_of(user.id).await?);
+                }
+                ties
+            }
+        };
+        for user in &mut users {
+            user.ties = ties.remove(&user.id).unwrap_or_default();
+        }
+        Ok(users)
     }
 
     /// What a password login for `username` needs, or `None` if there is

@@ -33,7 +33,7 @@ use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -594,8 +594,8 @@ pub enum Request {
     /// ([`crate::portable::tie_message`]). The nonce is this session's,
     /// for its user, for `expires_in_secs` (5 minutes), and is used once,
     /// whatever `TieFinish` makes of it. Needs a session signed in within
-    /// the last 10 minutes, or `RecentSignInRequired`. An account already
-    /// tied gets `AlreadyTied`: `Untie` first.
+    /// the last 10 minutes, or `RecentSignInRequired`. An account may be
+    /// tied already: it ties any number of identities (P7-09).
     TieBegin,
     /// Tie the session user's account to `user`, with `proof` that `user`
     /// signed the tie message over the nonce `TieBegin` gave: by the root,
@@ -605,17 +605,22 @@ pub enum Request {
     /// Needs a recent sign-in, as `TieBegin`. A nonce that is not this
     /// session's, is used or is over is `TieChallengeExpired`: begin
     /// again. A proof that does not hold is `InvalidCredentials`. An
-    /// account already tied is `AlreadyTied`; an identity tied to another
-    /// account here is `PortableIdTaken`. Nothing about the account
-    /// moves: the tie is a link beside it.
+    /// identity tied to another account here is `PortableIdTaken`; one
+    /// tied to this account already is `Done`, changing nothing (its
+    /// first tie date stands). The account's other ties stay (P7-09).
+    /// Nothing about the account moves: the tie is a link beside it.
     TieFinish {
         user: PortableUserId,
         proof: TieProof,
     },
-    /// Sever the session user's tie (P7-04): `Done`. Only the link goes;
-    /// the account, its sessions, passkeys and watch state stay as they
-    /// are. Needs a recent sign-in. No tie is `NotFound`.
-    Untie,
+    /// Sever the session user's tie to `user` (P7-04, P7-09): `Done`.
+    /// Only that link goes; the account's other ties, its sessions (those
+    /// opened with `user`'s credential too), passkeys and watch state stay
+    /// as they are. Needs a recent sign-in. No tie to `user` on this
+    /// account is `NotFound`.
+    Untie {
+        user: PortableUserId,
+    },
 
     /// Make an invite (PX-44, [`crate::invite_admin`]), as the web UI's
     /// `inviteCreate` does, with its limits: `InviteCreated`, the code
@@ -1174,10 +1179,23 @@ pub struct UserSummary {
     /// The user's PIN, if they have one (P2-08): for "Set · 4 digits", and
     /// for how many boxes a PIN pad shows. Never the PIN itself.
     pub pin: Option<PinState>,
-    /// The portable identity the account is tied to (P7-04), if any:
-    /// shown on the account, never as a second one.
+    /// The portable identities the account is tied to (P7-04, P7-09),
+    /// the oldest tie first: shown on the account, never as other
+    /// accounts. Empty for an account with none, and for a portable
+    /// user's own session (P7-06), whose identity is its `user_id`.
+    pub portable: Vec<PortableTie>,
+}
+
+/// One of an account's ties to a portable identity (P7-09).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableTie {
+    pub id: PortableUserId,
+    /// Unix seconds.
+    pub tied_at: i64,
+    /// Unix seconds of the identity's last sign-in into the account with
+    /// its credential; `None` until one.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
-    pub portable: Option<PortableUserId>,
+    pub last_used_at: Option<i64>,
 }
 
 /// What `WhoAmI` answers: the session's user, and whether they may leave
@@ -1505,10 +1523,6 @@ pub enum Error {
     /// Begin again.
     #[error("the tie challenge is used or has expired; begin again")]
     TieChallengeExpired,
-    /// The session user's account is tied to a portable identity already
-    /// (P7-04): `Untie` first. Nothing was changed.
-    #[error("this account is tied to a portable identity already")]
-    AlreadyTied,
     /// Another account on this server is tied to that portable identity
     /// (P7-04): one identity ties to one account per server. Sever that
     /// tie first. Nothing was changed.

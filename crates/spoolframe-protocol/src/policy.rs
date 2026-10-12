@@ -138,7 +138,7 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::ClearTrackOverride { .. }
         // A tie uses its nonce up; severing one is a change (P7-04).
         | Request::TieFinish { .. }
-        | Request::Untie
+        | Request::Untie { .. }
         // A second invite would be a second code; a revoke is a change
         // (PX-44).
         | Request::CreateInvite(_)

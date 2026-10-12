@@ -141,7 +141,8 @@ async fn a_granted_identity_signs_in_as_itself_and_is_no_user() {
             assert_eq!(me.role, Role::Consumer);
             assert!(!me.locked);
             assert_eq!(me.pin, None);
-            assert_eq!(me.portable, Some(identity(7)));
+            // A guest's identity is its user id; it has no ties (P7-09).
+            assert_eq!(me.portable, []);
         }
         other => panic!("no WhoAmI: {other:?}"),
     }
@@ -203,7 +204,7 @@ async fn what_only_an_account_here_has_is_refused_to_a_portable_user() {
         Request::ListDevices,
         Request::ListPasskeys,
         Request::TieBegin,
-        Request::Untie,
+        Request::Untie { user: identity(7) },
         Request::BeginPasskeyRegistration,
         Request::SetPin {
             pin: "1234".into(),
@@ -260,7 +261,9 @@ async fn a_tied_identity_signs_in_as_the_account_even_with_a_grant() {
         Response::Ok(Reply::WhoAmI(WhoAmIReply { user: me, .. })) => {
             assert_eq!(me.username, "alice");
             assert_eq!(me.user_id, format!("local:{alice}"));
-            assert_eq!(me.portable, Some(identity(7)));
+            let tied: Vec<_> = me.portable.iter().map(|t| t.id).collect();
+            assert_eq!(tied, [identity(7)]);
+            assert!(me.portable[0].last_used_at.is_some());
         }
         other => panic!("no WhoAmI: {other:?}"),
     }
@@ -286,6 +289,48 @@ async fn a_tied_account_that_is_disabled_is_refused() {
     server.store.tie(alice, identity(7), "root").await.unwrap();
     server.store.disable_user("alice").await.unwrap();
     assert_eq!(sign_in(&tv, 7, 9).await, REFUSED);
+}
+
+/// P7-09: an account tied to two identities; either signs in to it, and
+/// each sign-in is that tie's last use, not the other's.
+#[tokio::test]
+async fn either_tied_identity_signs_in_to_the_account_and_is_its_last_use() {
+    let (server, tv) = living_room("portable-tied-twice").await;
+    let alice = server
+        .store
+        .list_users()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|u| u.username == "alice")
+        .unwrap()
+        .id;
+    server.store.tie(alice, identity(7), "root").await.unwrap();
+    server
+        .store
+        .tie(alice, identity(8), "device")
+        .await
+        .unwrap();
+    for user in [7, 8] {
+        let session = session(sign_in(&tv, user, 9).await);
+        let me = match tv.call(Some(&session), Request::WhoAmI).await {
+            Response::Ok(Reply::WhoAmI(WhoAmIReply { user: me, .. })) => me,
+            other => panic!("no WhoAmI: {other:?}"),
+        };
+        assert_eq!(me.user_id, format!("local:{alice}"));
+        let used: Vec<_> = me
+            .portable
+            .iter()
+            .map(|t| (t.id, t.last_used_at.is_some()))
+            .collect();
+        assert!(
+            used.contains(&(identity(user), true)),
+            "{user}'s sign-in is not its tie's last use: {used:?}"
+        );
+        if user == 7 {
+            assert!(used.contains(&(identity(8), false)), "{used:?}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -511,7 +556,7 @@ async fn a_tied_credential_sign_in_is_not_a_recent_sign_in() {
     let recent = Response::Err(Error::RecentSignInRequired);
     for request in [
         Request::BeginPasskeyRegistration,
-        Request::Untie,
+        Request::Untie { user: identity(7) },
         Request::TieBegin,
     ] {
         let name = format!("{request:?}");

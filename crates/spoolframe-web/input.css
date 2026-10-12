@@ -419,6 +419,72 @@
     flex-direction: column;
     gap: 12px;
   }
+  /* An account's ties to portable identities (P7-09, canvas v109
+   * WebTies): one row each, the fingerprint in mauve, Sever per row. */
+  .tie-list {
+    background: var(--ctp-mantle);
+    border: 1px solid var(--ctp-surface0);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .tie-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 16px;
+  }
+  .tie-row + .tie-row {
+    border-top: 1px solid var(--ctp-surface0);
+  }
+  .tie-icon {
+    width: 36px;
+    height: 36px;
+    flex-shrink: 0;
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--ctp-mauve) 16%, transparent);
+    color: var(--ctp-mauve);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .tie-icon-empty {
+    width: 40px;
+    height: 40px;
+    background: var(--ctp-surface0);
+  }
+  .tie-what {
+    flex-grow: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .tie-fp {
+    font: 14px var(--font-mono);
+    color: var(--ctp-mauve);
+    white-space: nowrap;
+  }
+  .tie-fp-inline {
+    font: 12px var(--font-mono);
+    color: var(--ctp-mauve);
+    white-space: nowrap;
+  }
+  .tie-sub {
+    font-size: 13px;
+    color: var(--ctp-subtext0);
+  }
+  .btn-sever {
+    height: 32px;
+    padding: 0 12px;
+    border-color: var(--ctp-red);
+    color: var(--ctp-red);
+    gap: 6px;
+  }
+  .btn-dialog-danger {
+    background: var(--ctp-red);
+    color: var(--ctp-crust);
+    border: 0;
+  }
   /* A row of a card: what it is on the left, what to do on the right. */
   .row {
     display: flex;
@@ -893,6 +959,15 @@
   .pill-admin {
     background: color-mix(in srgb, var(--ctp-teal) 18%, transparent);
     color: var(--ctp-teal);
+  }
+  /* How many identities open the account (P7-09), by its name. */
+  .pill-tie {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding-left: 6px;
+    background: color-mix(in srgb, var(--ctp-mauve) 16%, transparent);
+    color: var(--ctp-mauve);
   }
   .state {
     font-size: 12px;

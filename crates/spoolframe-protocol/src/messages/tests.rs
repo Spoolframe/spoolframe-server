@@ -493,7 +493,7 @@ fn every_reply_round_trips() {
                 role: spoolframe_types::Role::Consumer,
                 locked: true,
                 pin: Some(crate::PinState { digits: Some(6) }),
-                portable: Some(tie_user()),
+                portable: ties(),
             },
             can_leave: true,
         }),
@@ -1870,7 +1870,7 @@ fn a_reply_missing_a_field_is_refused() {
             role: spoolframe_types::Role::Consumer,
             locked: false,
             pin: None,
-            portable: None,
+            portable: Vec::new(),
         },
         &["locked", "portable"],
     );
@@ -2084,7 +2084,7 @@ fn tie_proofs() -> Vec<crate::TieProof> {
 /// needs a session.
 #[test]
 fn the_tie_messages_round_trip() {
-    let mut requests = vec![Request::TieBegin, Request::Untie];
+    let mut requests = vec![Request::TieBegin, Request::Untie { user: tie_user() }];
     requests.extend(tie_proofs().into_iter().map(|proof| Request::TieFinish {
         user: tie_user(),
         proof,
@@ -2098,13 +2098,38 @@ fn the_tie_messages_round_trip() {
         server: [0x5a; 32],
         expires_in_secs: 300,
     }));
-    for error in [
-        Error::TieChallengeExpired,
-        Error::AlreadyTied,
-        Error::PortableIdTaken,
-    ] {
+    for error in [Error::TieChallengeExpired, Error::PortableIdTaken] {
         round_trip(Response::Err(error));
     }
+}
+
+/// An account's ties (P7-09): two, one used and one never, as `WhoAmI`
+/// lists them.
+fn ties() -> Vec<crate::PortableTie> {
+    vec![
+        crate::PortableTie {
+            id: tie_user(),
+            tied_at: 1_791_504_000,
+            last_used_at: Some(1_791_590_400),
+        },
+        crate::PortableTie {
+            id: crate::PortableUserId::from_bytes([0x33; 32]).unwrap(),
+            tied_at: 1_791_504_100,
+            last_used_at: None,
+        },
+    ]
+}
+
+/// P7-09: `UserSummary.portable` lists the account's ties, each with its
+/// identity, when it was tied and when it was last used, every field
+/// required; `Untie` names the identity to sever.
+#[test]
+fn an_account_s_ties_are_a_list_of_whole_ties() {
+    round_trip(Reply::WhoAmI(admin_who_am_i(true)));
+    for tie in ties() {
+        assert_each_required(&tie, &["id", "tied_at", "last_used_at"]);
+    }
+    assert_each_required(&Request::Untie { user: tie_user() }, &["user"]);
 }
 
 /// Its nonce and server id are CBOR byte strings, and every field is
@@ -2142,7 +2167,7 @@ fn a_tie_challenge_is_bytes_and_whole() {
 fn a_tie_is_never_sent_twice_but_a_challenge_may_be() {
     use crate::policy::retry_safe;
     assert!(retry_safe(&Request::TieBegin));
-    assert!(!retry_safe(&Request::Untie));
+    assert!(!retry_safe(&Request::Untie { user: tie_user() }));
     for proof in tie_proofs() {
         assert!(!retry_safe(&Request::TieFinish {
             user: tie_user(),
@@ -2294,7 +2319,7 @@ fn admin_who_am_i(can_leave: bool) -> WhoAmIReply {
             role: spoolframe_types::Role::Admin,
             locked: false,
             pin: None,
-            portable: Some(tie_user()),
+            portable: ties(),
         },
         can_leave,
     }

@@ -42,7 +42,14 @@ use crate::error::SdkError;
 use crate::servers::now;
 use crate::storage::{Storage, StorageError, keys};
 
+mod heads;
 mod key_roots;
+mod sync;
+
+pub use sync::{RootLocation, RootSyncRefused};
+
+pub use heads::MAX_HEADS;
+use heads::{load_heads, save_heads, take_in};
 
 pub use key_roots::{
     AddedRoot, GenesisError, HANDLE_LEN, IdentityGenesis, IdentityRecord, KeyAssertion,
@@ -261,11 +268,13 @@ pub struct PortableIdentity {
     pub name: String,
     /// Unix seconds: made, or first recovered, here.
     pub created_at: u64,
-    /// Whether its root is here now, as [`Portable::list`] found it. Not
-    /// stored: an app's storage restored from a backup that leaves out
-    /// secrets (the iOS keychain's this-device-only items) lists the
-    /// identity without its root. Without it nothing is issued, revoked
-    /// or tied with the root; recovering from the phrase puts it back.
+    /// Whether its root is here now, as [`Portable::list`] found it: this
+    /// device's own copy, or the synced one ([`Portable::root_location`]).
+    /// Not stored: an app's storage restored from a backup that leaves
+    /// out secrets (the iOS keychain's this-device-only items) lists the
+    /// identity without its own copy, and a synced root can be deleted
+    /// from another device. Without it nothing is issued, revoked or tied
+    /// with the root; recovering from the phrase puts it back.
     #[serde(skip)]
     pub has_root: bool,
     /// Rooted in security keys (P7-08): its genesis is kept here, and its
@@ -347,10 +356,7 @@ impl Portable {
         let storage = self.storage.as_ref();
         let mut listed = load(storage).await?;
         for entry in &mut listed {
-            entry.has_root = storage
-                .secret(&keys::portable_root(&entry.id.to_string()))
-                .await?
-                .is_some();
+            entry.has_root = self.has_root(entry.id).await?;
         }
         Ok(listed)
     }
@@ -363,10 +369,10 @@ impl Portable {
         let storage = self.storage.as_ref();
         let mut issued = load_issued(storage, id).await?;
         let revoked = load_revoked(storage, id).await?;
-        let state = load_state(storage, id).await?;
+        let heads = load_heads(storage, id).await?;
         for entry in &mut issued {
             entry.revoked_at = revoked.get(&entry.device_key).copied().or_else(|| {
-                state
+                heads
                     .iter()
                     .flat_map(|s| &s.revoked)
                     .find(|r| r.key == entry.device_key)
@@ -382,6 +388,14 @@ impl Portable {
     /// recovers it. What its root issued and revoked here, and its serial,
     /// stay: a recovered root goes on from them. Forgetting one not here
     /// does nothing.
+    ///
+    /// **A synced root stays.** Only this device's data goes, never the
+    /// synced root nor the synced record ([`keys::portable_root_synced`],
+    /// [`keys::portable_synced`]): deleting those would delete them on
+    /// every device the app syncs to. The user's other devices keep the
+    /// identity; this one stops acting as it, and
+    /// [`Portable::adopt_synced`] lists it again. To stop syncing, use
+    /// [`Portable::disable_root_sync`].
     pub async fn forget(&self, id: PortableUserId) -> Result<(), SdkError> {
         let storage = self.storage.as_ref();
         let _saving = self.saving.lock().await;
@@ -411,16 +425,10 @@ impl Portable {
         Ok(())
     }
 
-    /// Identity `id`'s root, for signing credentials and states.
+    /// Identity `id`'s root, for signing credentials and states: this
+    /// device's copy, else the synced one ([`keys::portable_root_synced`]).
     pub(crate) async fn load_root(&self, id: PortableUserId) -> Result<PortableRoot, SdkError> {
-        let Some(bytes) = self
-            .storage
-            .secret(&keys::portable_root(&id.to_string()))
-            .await?
-        else {
-            return Err(SdkError::UnknownIdentity(id.to_string()));
-        };
-        let bytes = Zeroizing::new(bytes);
+        let bytes = load_root_bytes(self.storage.as_ref(), id).await?;
         let secret: &[u8; 32] = bytes.as_slice().try_into().map_err(|_| {
             StorageError(format!(
                 "the root of portable identity {id} is {} bytes, not 32",
@@ -441,9 +449,11 @@ impl Portable {
 
     /// A credential from identity `id`'s root for `device_key`, good for
     /// [`MAX_CREDENTIAL_VALIDITY`] from now. Renewal is the same call: a
-    /// new credential for the same key, with the next serial. The serial
-    /// is saved before the credential is signed, so a failure in between
-    /// skips one rather than giving two credentials the same serial.
+    /// new credential for the same key, with a larger serial: the issue
+    /// time in milliseconds, or one past the last here if that is larger.
+    /// The serial is saved before the credential is signed, so a failure
+    /// in between skips one rather than giving two credentials the same
+    /// serial.
     /// Refused for a key revoked here, however long ago.
     ///
     /// Recorded for [`Portable::issued`] under `label`, what the user
@@ -469,6 +479,9 @@ impl Portable {
     ) -> Result<UserDeviceCredential, SdkError> {
         let storage = self.storage.as_ref();
         let root = self.load_root(id).await?;
+        // A synced root acts on what its other holders did: their revoked
+        // keys and root changes first.
+        self.sync_data(id).await?;
         // A phrase root the identity removed (P7-08) is kept here, but
         // signs nothing more: devices refuse what it signs.
         if !self.roots(id).await?.holds(&RootKey::phrase_of(&id)) {
@@ -478,18 +491,7 @@ impl Portable {
         if is_revoked(storage, id, &device_key).await? {
             return Err(SdkError::DeviceKeyRevoked);
         }
-        let serial_key = keys::portable_serial(&id.to_string());
-        let serial = match storage.data(&serial_key).await? {
-            None => 0,
-            Some(bytes) => serde_json::from_slice::<u64>(&bytes).map_err(|e| {
-                StorageError(format!("the credential serial of {id} cannot be read: {e}"))
-            })?,
-        }
-        .checked_add(1)
-        .ok_or_else(|| StorageError(format!("the credential serial of {id} is at its end")))?;
-        storage
-            .set_data(&serial_key, Some(serial.to_string().into_bytes()))
-            .await?;
+        let serial = next_serial(storage, id, now).await?;
         let credential = UserDeviceCredential::new(
             id,
             device_key,
@@ -518,6 +520,8 @@ impl Portable {
             }),
         }
         save_issued(storage, id, &issued).await?;
+        drop(_saving);
+        self.sync_data(id).await?;
         tracing::info!(%id, %device_key, serial, "issued a portable device credential");
         Ok(credential)
     }
@@ -547,11 +551,12 @@ impl Portable {
         // Without the root here this is UnknownIdentity, before anything
         // else is read.
         self.load_root(id).await?;
-        if let Some(previous) = load_state(self.storage.as_ref(), id)
-            .await?
-            .filter(|s| s.revokes(&device_key))
+        // A key the only head revokes already: it, unchanged. With a rival
+        // head, a new state merges them.
+        if let [previous] = load_heads(self.storage.as_ref(), id).await?.as_slice()
+            && previous.revokes(&device_key)
         {
-            return Ok(previous);
+            return Ok(previous.clone());
         }
         // Through the same path as `revoke_by`, which carries the roots
         // added and removed forward: a state built from the revocations
@@ -704,8 +709,7 @@ impl Portable {
         }
         let kept = key_roots::load_genesis(storage, id).await?;
         let genesis = carried.or(kept.as_ref());
-        let states: Vec<PortableIdentityState> =
-            load_state(storage, id).await?.into_iter().collect();
+        let states = load_heads(storage, id).await?;
         let roots = spoolframe_protocol::portable::root_set(&id, genesis, &states);
         if !roots.holds(&credential.signer()) {
             // A credential from elsewhere, not a key in hand: not NotARoot.
@@ -777,28 +781,35 @@ impl Portable {
 
     /// Take in `state`, a state another device brought: its revocations
     /// join the ones here whatever its revision (revocation only grows),
-    /// and it is kept as the newest, to carry on to servers, if its
-    /// revision is higher than the newest here. Whether it was kept as
-    /// the newest. Only for identities this device knows (holds the root
-    /// of, or a credential for); a state for another is
-    /// [`SdkError::UnknownIdentity`].
+    /// and it is kept as a head, to carry on to servers, unless the heads
+    /// here cover it ([`Portable::identity_states`]): the newest if its
+    /// revision is the highest, else a rival that says something the
+    /// heads do not (a root removed on another holder's branch). Whether
+    /// it was kept. A device that holds the phrase root, still a root,
+    /// then merges a rival straight away: one state over both, at one
+    /// past the highest ([`Portable::reconcile`]). Only for identities
+    /// this device knows (holds the root of, or a credential for); a
+    /// state for another is [`SdkError::UnknownIdentity`].
     pub async fn accept_state(&self, state: PortableIdentityState) -> Result<bool, SdkError> {
         state.verify()?;
         let id = state.user;
         let storage = self.storage.as_ref();
         // Signed by one of the identity's roots, ever (P7-08).
         let genesis = key_roots::load_genesis(storage, id).await?;
-        let mut held: Vec<PortableIdentityState> =
-            load_state(storage, id).await?.into_iter().collect();
+        let mut held = load_heads(storage, id).await?;
         let before = spoolframe_protocol::portable::root_set(&id, genesis.as_ref(), &held);
         held.push(state.clone());
         if !spoolframe_protocol::portable::root_set(&id, genesis.as_ref(), &held)
             .knew(&state.signer())
-            || before.refuses_additions(&state.roots_added)
         {
             // A state from elsewhere, not a key in hand: not NotARoot.
             return Err(StateError::BadSignature.into());
         }
+        // A root removed here adds no one new from now on. The state is
+        // refused, but it is one of the identity's roots' word, and its
+        // revocations are kept all the same: refusing them would let a
+        // rival branch's revocation go unheard here.
+        let refused = before.refuses_additions(&state.roots_added);
         let _saving = self.saving.lock().await;
         let known = load(storage).await?.iter().any(|entry| entry.id == id)
             || load_credentials(storage).await?.contains_key(&id);
@@ -809,14 +820,24 @@ impl Portable {
         if merge(&mut union, &state.revoked) {
             save_revoked(storage, id, &union).await?;
         }
-        if load_state(storage, id)
-            .await?
-            .is_some_and(|newest| newest.revision >= state.revision)
-        {
-            return Ok(false);
+        if refused {
+            drop(_saving);
+            self.sync_data(id).await?;
+            tracing::warn!(%id, revision = state.revision, "refused a portable identity state that adds a root through a removed one; kept its revocations");
+            return Err(StateError::BadSignature.into());
         }
-        save_state(storage, &state).await?;
-        tracing::info!(%id, revision = state.revision, "accepted a newer portable identity state");
+        let Some(heads) = take_in(&load_heads(storage, id).await?, &state, unix_now()) else {
+            drop(_saving);
+            self.sync_data(id).await?;
+            return Ok(false);
+        };
+        save_heads(storage, id, &heads).await?;
+        drop(_saving);
+        self.sync_data(id).await?;
+        tracing::info!(%id, revision = state.revision, heads = heads.len(), "accepted a portable identity state");
+        if load_heads(storage, id).await?.len() > 1 {
+            self.merge_heads_if_root_here(id).await?;
+        }
         Ok(true)
     }
 
@@ -1008,11 +1029,7 @@ impl Portable {
         let storage = self.storage.as_ref();
         let mut guests = Vec::new();
         for id in load_credentials(storage).await?.into_keys() {
-            if storage
-                .secret(&keys::portable_root(&id.to_string()))
-                .await?
-                .is_none()
-            {
+            if !self.has_root(id).await? {
                 guests.push(id);
             }
         }
@@ -1025,11 +1042,7 @@ impl Portable {
     /// that). Forgetting one not here does nothing.
     pub async fn forget_guest(&self, id: PortableUserId) -> Result<(), SdkError> {
         let storage = self.storage.as_ref();
-        if storage
-            .secret(&keys::portable_root(&id.to_string()))
-            .await?
-            .is_some()
-        {
+        if self.has_root(id).await? {
             return Err(SdkError::InvalidInput(format!(
                 "this device holds the root of {id}: it is not a guest"
             )));
@@ -1100,6 +1113,30 @@ impl Portable {
     }
 }
 
+/// The stored bytes of `id`'s root: this device's copy, else the synced
+/// one, for an identity listed here (a forgotten one does not act through
+/// the synced root until adopted again). Neither is
+/// [`SdkError::UnknownIdentity`].
+async fn load_root_bytes(
+    storage: &dyn Storage,
+    id: PortableUserId,
+) -> Result<Zeroizing<Vec<u8>>, SdkError> {
+    if let Some(bytes) = storage
+        .secret(&keys::portable_root(&id.to_string()))
+        .await?
+    {
+        return Ok(Zeroizing::new(bytes));
+    }
+    if load(storage).await?.iter().any(|entry| entry.id == id)
+        && let Some(bytes) = storage
+            .secret(&keys::portable_root_synced(&id.to_string()))
+            .await?
+    {
+        return Ok(Zeroizing::new(bytes));
+    }
+    Err(SdkError::UnknownIdentity(id.to_string()))
+}
+
 /// The list; a list that cannot be read is an error, never "none".
 async fn load(storage: &dyn Storage) -> Result<Vec<PortableIdentity>, StorageError> {
     match storage.data(keys::PORTABLE_IDENTITIES).await? {
@@ -1143,17 +1180,21 @@ fn merge(union: &mut Revoked, entries: &[RevokedKey]) -> bool {
     changed
 }
 
-/// Whether `key` is revoked here for `id`: in the union, or in the
-/// newest state.
+/// Whether `key` is revoked here for `id`: in the union, in a head, or in
+/// the synced record ([`keys::portable_synced`]), read as it is now, so a
+/// holder of a synced root never issues to a key another holder revoked,
+/// however long ago.
 async fn is_revoked(
     storage: &dyn Storage,
     id: PortableUserId,
     key: &DevicePublicKey,
 ) -> Result<bool, StorageError> {
     Ok(load_revoked(storage, id).await?.contains_key(key)
-        || load_state(storage, id)
+        || load_heads(storage, id)
             .await?
-            .is_some_and(|state| state.revokes(key)))
+            .iter()
+            .any(|state| state.revokes(key))
+        || sync::synced_revoked(storage, id).await?.contains_key(key))
 }
 
 /// The union for `id`; unreadable is an error, never "none".
@@ -1210,6 +1251,37 @@ async fn save_issued(
     storage
         .set_data(&keys::portable_issued(&id.to_string()), Some(bytes))
         .await
+}
+
+/// The serial for a credential `id`'s root issues at `now` (Unix seconds),
+/// saved before it is used, so a failure in between skips one rather
+/// than giving two credentials the same serial. It is the issue time in
+/// milliseconds, or one past the last serial here if that is larger: it
+/// grows on one holder whatever its clock does, and two holders of one
+/// root (a synced phrase root) almost never give the same one, with no
+/// count shared between them. Nothing checks a serial but its signature;
+/// the device key tells credentials apart.
+async fn next_serial(
+    storage: &dyn Storage,
+    id: PortableUserId,
+    now: i64,
+) -> Result<u64, StorageError> {
+    let serial_key = keys::portable_serial(&id.to_string());
+    let last = match storage.data(&serial_key).await? {
+        None => 0,
+        Some(bytes) => serde_json::from_slice::<u64>(&bytes).map_err(|e| {
+            StorageError(format!("the credential serial of {id} cannot be read: {e}"))
+        })?,
+    };
+    let next = last
+        .checked_add(1)
+        .ok_or_else(|| StorageError(format!("the credential serial of {id} is at its end")))?;
+    let millis = u64::try_from(now).unwrap_or(0).saturating_mul(1000);
+    let serial = next.max(millis);
+    storage
+        .set_data(&serial_key, Some(serial.to_string().into_bytes()))
+        .await?;
+    Ok(serial)
 }
 
 /// Unix seconds now, as credentials count them.
@@ -1274,32 +1346,13 @@ async fn save_credentials(
         .await
 }
 
-/// The newest state of `id` here; unreadable is an error, never "none".
+/// The newest state of `id` here (the first of its heads); unreadable is
+/// an error, never "none".
 async fn load_state(
     storage: &dyn Storage,
     id: PortableUserId,
 ) -> Result<Option<PortableIdentityState>, StorageError> {
-    let Some(bytes) = storage.data(&keys::portable_state(&id.to_string())).await? else {
-        return Ok(None);
-    };
-    let state: PortableIdentityState = serde_json::from_slice(&bytes)
-        .map_err(|e| StorageError(format!("the identity state of {id} cannot be read: {e}")))?;
-    if state.user != id {
-        return Err(StorageError(format!(
-            "the identity state stored for {id} is another identity's"
-        )));
-    }
-    Ok(Some(state))
-}
-
-async fn save_state(
-    storage: &dyn Storage,
-    state: &PortableIdentityState,
-) -> Result<(), StorageError> {
-    let bytes = serde_json::to_vec(state).expect("an identity state always serializes");
-    storage
-        .set_data(&keys::portable_state(&state.user.to_string()), Some(bytes))
-        .await
+    Ok(load_heads(storage, id).await?.into_iter().next())
 }
 
 #[cfg(test)]
@@ -1688,17 +1741,23 @@ mod tests {
         );
     }
 
+    /// The serial is the issue time in milliseconds, so two holders of one
+    /// root (a synced phrase root) almost never give the same one, and a
+    /// later renewal from either is larger; and never less than one past
+    /// the last here, so it grows on one holder even when its clock goes
+    /// back, across a restart too.
     #[tokio::test]
-    async fn the_serial_counts_up_and_survives_a_restart() {
+    async fn the_serial_is_the_time_in_milliseconds_and_always_grows() {
         let (storage, phone) = portable();
         let (id, _) = phone.create("Steve").await.unwrap();
         let key = phone.device_key(id).await.unwrap();
+        let millis = |at: i64| u64::try_from(at).unwrap() * 1000;
         let first = phone.issue_credential_at(id, key, None, T).await.unwrap();
         let renewed = phone
             .issue_credential_at(id, key, None, T + 1)
             .await
             .unwrap();
-        assert_eq!((first.serial, renewed.serial), (1, 2));
+        assert_eq!((first.serial, renewed.serial), (millis(T), millis(T + 1)));
         let restarted = Portable::new(storage);
         assert_eq!(
             restarted
@@ -1706,7 +1765,7 @@ mod tests {
                 .await
                 .unwrap()
                 .serial,
-            3
+            millis(T + 1) + 1
         );
     }
 
@@ -1999,10 +2058,13 @@ mod tests {
         let (_, carrier) = portable();
         carrier.recover(&zero_phrase(), "Ann").await.unwrap();
         assert!(carrier.accept_state(from_first.clone()).await.unwrap());
-        // Not newer, so not kept as the newest; its key is revoked all
-        // the same.
-        assert!(!carrier.accept_state(from_second.clone()).await.unwrap());
-        assert_eq!(carrier.identity_state(id).await.unwrap(), Some(from_first));
+        // A rival at the same revision: kept, and, the root being here,
+        // merged at once into one state at the next revision.
+        assert!(carrier.accept_state(from_second.clone()).await.unwrap());
+        let merged = carrier.identity_states(id).await.unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].revision, 2);
+        assert!(merged[0].revokes(&tv_key) && merged[0].revokes(&laptop_key));
         assert_eq!(
             carrier
                 .issue_credential_at(id, laptop_key, None, T)
@@ -2012,7 +2074,7 @@ mod tests {
         );
         // And its next state carries both.
         let next = carrier.revoke_at(id, some_key(9), T + 1).await.unwrap();
-        assert_eq!(next.revision, 2);
+        assert_eq!(next.revision, 3);
         assert!(next.revokes(&tv_key) && next.revokes(&laptop_key));
         // Each revocation at its earliest.
         assert!(next.revoked.iter().all(|e| e.revoked_at <= T + 1));
@@ -2093,8 +2155,8 @@ mod tests {
         assert_eq!(
             seen,
             [
-                (tv, 3, T + 5, Some("Living room")),
-                (laptop, 2, T, Some("Laptop"))
+                (tv, renewed.serial, T + 5, Some("Living room")),
+                (laptop, T as u64 * 1000 + 1, T, Some("Laptop"))
             ]
         );
         assert_eq!(issued[0].expires_at, renewed.expires_at);

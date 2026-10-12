@@ -36,7 +36,7 @@ pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, Playback
 pub use messages::{
     AddressNetwork, AuthMethod, ChangePassword, ConfirmPassword, DeviceAddress, DeviceInfo,
     DeviceSignInRequest, Error, Event, Hello, HomeScreen, LoginPassword, MAX_HELLO_TEXT,
-    ManifestKind, PROTOCOL_VERSION, PinProof, PinState, PortableSignIn, RedeemInvite,
+    ManifestKind, PROTOCOL_VERSION, PinProof, PinState, PortableSignIn, PortableTie, RedeemInvite,
     RedeemPortableInvite, Reply, Request, RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo,
     SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary, WhoAmIReply,
 };

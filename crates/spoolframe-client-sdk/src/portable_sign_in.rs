@@ -94,11 +94,9 @@ impl Client {
         let portable = self.portable();
         // The id this device dialled, never one a server named.
         let (credential, proof) = portable.prove(identity, server.as_bytes(), &nonce).await?;
-        let states = portable
-            .identity_state(identity)
-            .await?
-            .into_iter()
-            .collect();
+        // Every head: the newest, and a rival it does not cover (at most
+        // MAX_SIGN_IN_STATES), so a server learns both branches' changes.
+        let states = portable.identity_states(identity).await?;
         Ok(PortableSignIn {
             credential,
             proof,

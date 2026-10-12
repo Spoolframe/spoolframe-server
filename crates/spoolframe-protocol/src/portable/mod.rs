@@ -305,12 +305,14 @@ pub enum CredentialError {
 /// key ([`PortableIdentityState::revokes`]).
 ///
 /// Times are Unix seconds. Renewal is a new credential for the same key,
-/// with the next serial.
+/// with a larger serial.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserDeviceCredential {
     pub user: PortableUserId,
     pub device_key: DevicePublicKey,
-    /// The root's count of credentials issued, so two for one key differ.
+    /// Larger for a later credential from one holder of the root, so two
+    /// for one key differ. Only the signature reads it; the SDK gives the
+    /// issue time in milliseconds, or one past its last if that is larger.
     pub serial: u64,
     pub issued_at: i64,
     /// Required: every credential expires (§45 allowed none; P7-02 does
@@ -796,6 +798,49 @@ impl PortableIdentityState {
             && self.signer() == other.signer()
             && self.signed_message() == other.signed_message()
     }
+
+    /// BLAKE3 of what its signer signed and of its signature as CBOR (the
+    /// wire's codec) writes it: one value for one state, whatever order
+    /// its lists are in. Two states of one revision are ordered by it, the
+    /// lower first ([`newest_first`]), so every verifier picks the same
+    /// one as the newest.
+    pub fn digest(&self) -> [u8; 32] {
+        let mut signature = Vec::new();
+        ciborium::into_writer(&self.signature, &mut signature)
+            .expect("a signature always serializes");
+        let mut digest = blake3::Hasher::new();
+        digest.update(&self.signed_message());
+        digest.update(&signature);
+        digest.finalize().into()
+    }
+
+    /// Whether `others` carry every root change this state makes: each
+    /// root it adds is added in one of them, and each root it removes is
+    /// removed in one of them, no later. A state whose changes others
+    /// carry adds nothing to the root set they make. Its revocations are
+    /// not looked at.
+    pub fn root_changes_covered_by(&self, others: &[PortableIdentityState]) -> bool {
+        self.roots_added.iter().all(|added| {
+            others
+                .iter()
+                .any(|o| o.roots_added.iter().any(|a| a.root == added.root))
+        }) && self.roots_removed.iter().all(|removed| {
+            others.iter().any(|o| {
+                o.roots_removed
+                    .iter()
+                    .any(|r| r.root == removed.root && r.removed_at <= removed.removed_at)
+            })
+        })
+    }
+}
+
+/// Newest first: the higher revision, then the lower
+/// [`PortableIdentityState::digest`]. How a verifier picks the newest of
+/// rival states, the same everywhere.
+pub fn newest_first(a: &PortableIdentityState, b: &PortableIdentityState) -> std::cmp::Ordering {
+    b.revision
+        .cmp(&a.revision)
+        .then_with(|| a.digest().cmp(&b.digest()))
 }
 
 /// The roots of `user`, from its genesis (none for a phrase identity
@@ -1141,6 +1186,56 @@ mod tests {
 
     fn state(revision: u64, revoked: Vec<RevokedKey>) -> PortableIdentityState {
         PortableIdentityState::new(id(), revision, revoked, T, |m| root().sign(m)).unwrap()
+    }
+
+    /// A state at `revision` that removes key `seed`'s root at `at`.
+    fn removing(revision: u64, seed: u8, at: i64) -> PortableIdentityState {
+        PortableIdentityState::signed_by(
+            id(),
+            RootKey::phrase_of(&id()),
+            revision,
+            StateChanges {
+                roots_removed: vec![RemovedRoot {
+                    root: soft_key::SoftKey::from_seed(seed).root(),
+                    removed_at: at,
+                }],
+                ..StateChanges::default()
+            },
+            T,
+            |m| root().sign(m).into(),
+        )
+        .unwrap()
+    }
+
+    /// A rival's removal is covered only by a removal of the same root, no
+    /// later: a later one would move the time root additions are judged by.
+    #[test]
+    fn a_removal_is_covered_by_the_same_removal_no_later() {
+        let removal = removing(2, 3, T);
+        assert!(!removal.root_changes_covered_by(&[]));
+        assert!(!removal.root_changes_covered_by(&[state(5, vec![nine()])]));
+        assert!(!removal.root_changes_covered_by(&[removing(5, 4, T)]));
+        assert!(!removal.root_changes_covered_by(&[removing(5, 3, T + 1)]));
+        assert!(removal.root_changes_covered_by(&[removing(5, 3, T)]));
+        assert!(removal.root_changes_covered_by(&[state(5, vec![]), removing(1, 3, T - 1)]));
+        // Revocations alone change no roots: covered by anything.
+        assert!(state(2, vec![nine()]).root_changes_covered_by(&[]));
+    }
+
+    /// Of two states at one revision, every verifier takes the same one
+    /// as the newest, whichever it saw first.
+    #[test]
+    fn rivals_at_one_revision_are_ordered_the_same_everywhere() {
+        let (one, other) = (state(3, vec![nine()]), state(3, vec![eleven()]));
+        assert_ne!(one.digest(), other.digest());
+        let mut seen = [one.clone(), other.clone()];
+        seen.sort_by(newest_first);
+        let mut reversed = [other, one];
+        reversed.sort_by(newest_first);
+        assert_eq!(seen, reversed);
+        let mut by_revision = [state(2, vec![]), state(4, vec![])];
+        by_revision.sort_by(newest_first);
+        assert_eq!(by_revision[0].revision, 4);
     }
 
     #[test]

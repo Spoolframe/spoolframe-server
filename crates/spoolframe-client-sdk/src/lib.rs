@@ -52,8 +52,9 @@ pub use portable::{
     CredentialError, DevicePublicKey, GuestPairing, GuestServer, HANDLE_LEN, IdentityGenesis,
     IdentityRecord, KeyAssertion, PORTABLE_RP, PhraseError, Portable, PortableIdentity,
     PortableIdentityState, PortableRoot, PortableUserId, RecoveryPhrase, RevokedKey, RootKey,
-    RootRegistration, RootSet, RootSignature, RootSigner, SecurityKey, SecurityKeyError,
-    SoftSecurityKey, StateError, TieProof, UserDeviceCredential, WebAuthnError,
+    RootLocation, RootRegistration, RootSet, RootSignature, RootSigner, RootSyncRefused,
+    SecurityKey, SecurityKeyError, SoftSecurityKey, StateError, TieProof, UserDeviceCredential,
+    WebAuthnError,
 };
 pub use reachability::{
     DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,
@@ -68,9 +69,9 @@ pub use session::{
 pub use spoolframe_protocol::{
     AddressNetwork, ArtworkSize, BitmapSubtitles, ChosenTracks, DeviceAddress, DeviceInfo,
     DeviceSignInRequest, HomeScreen, MAX_READ, ManifestKind, PinProof, PinState, PlaybackHandle,
-    PlaybackPlan, PlexLink, PlexSyncSummary, PreviewTile, Previews, SearchCounts, SearchGroup,
-    SearchRequest, SearchResults, Selection, SessionInfo, TopResult, TrackPreferencesInfo,
-    TrackReason, TrustedProfile, UserSummary,
+    PlaybackPlan, PlexLink, PlexSyncSummary, PortableTie, PreviewTile, Previews, SearchCounts,
+    SearchGroup, SearchRequest, SearchResults, Selection, SessionInfo, TopResult,
+    TrackPreferencesInfo, TrackReason, TrustedProfile, UserSummary,
 };
 // Passkeys in the app (P3-19): the raw WebAuthn bytes the platform's
 // passkey API takes and gives. The relying party is each server's own

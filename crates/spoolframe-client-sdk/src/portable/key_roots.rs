@@ -32,11 +32,12 @@ pub use spoolframe_protocol::portable::{
 };
 use spoolframe_protocol::portable::{root_add_message, root_endorse_message, root_set};
 
+use super::heads::merged_changes;
 use super::{
     DeviceKey, DevicePublicKey, MAX_CREDENTIAL_VALIDITY, PortableIdentity, PortableIdentityState,
     PortableUserId, RevokedKey, StateError, UserDeviceCredential, is_revoked, load,
-    load_credentials, load_issued, load_revoked, load_state, merge, public_key, revocation_lapsed,
-    save, save_issued, save_revoked, save_state, unix_now,
+    load_credentials, load_heads, load_issued, load_revoked, load_state, merge, next_serial,
+    public_key, save, save_heads, save_issued, save_revoked, take_in, unix_now,
 };
 use crate::error::SdkError;
 use crate::servers::now;
@@ -520,12 +521,12 @@ impl super::Portable {
     }
 
     /// The roots of `id` as this device knows them (P7-08): from its
-    /// genesis, or the phrase root its id is, and the newest state here.
+    /// genesis, or the phrase root its id is, and every head here
+    /// ([`Self::identity_states`]): a root a rival head removes is gone.
     pub async fn roots(&self, id: PortableUserId) -> Result<RootSet, SdkError> {
         let storage = self.storage.as_ref();
         let genesis = load_genesis(storage, id).await?;
-        let states: Vec<PortableIdentityState> =
-            load_state(storage, id).await?.into_iter().collect();
+        let states = load_heads(storage, id).await?;
         Ok(root_set(&id, genesis.as_ref(), &states))
     }
 
@@ -575,24 +576,14 @@ impl super::Portable {
         now: i64,
     ) -> Result<UserDeviceCredential, SdkError> {
         let storage = self.storage.as_ref();
+        // A synced root acts on what its other holders did first.
+        self.sync_data(id).await?;
         if is_revoked(storage, id, &device_key).await? {
             return Err(SdkError::DeviceKeyRevoked);
         }
         let serial = {
             let _saving = self.saving.lock().await;
-            let serial_key = keys::portable_serial(&id.to_string());
-            let serial = match storage.data(&serial_key).await? {
-                None => 0,
-                Some(bytes) => serde_json::from_slice::<u64>(&bytes).map_err(|e| {
-                    StorageError(format!("the credential serial of {id} cannot be read: {e}"))
-                })?,
-            }
-            .checked_add(1)
-            .ok_or_else(|| StorageError(format!("the credential serial of {id} is at its end")))?;
-            storage
-                .set_data(&serial_key, Some(serial.to_string().into_bytes()))
-                .await?;
-            serial
+            next_serial(storage, id, now).await?
         };
         let expires_at = now.saturating_add(MAX_CREDENTIAL_VALIDITY);
         let message = UserDeviceCredential::message(&id, &device_key, serial, now, expires_at);
@@ -624,13 +615,16 @@ impl super::Portable {
             }),
         }
         save_issued(storage, id, &issued).await?;
+        drop(_saving);
+        self.sync_data(id).await?;
         tracing::info!(%id, %device_key, serial, "issued a portable device credential");
         Ok(credential)
     }
 
     /// A new state for `id` signed by `signer` (P7-08), one revision past
-    /// the newest here, with every live revocation and root change kept
-    /// and `change` applied. Kept here as the newest; carry it to servers.
+    /// the highest head here, over the merge of every head (every live
+    /// revocation, every root added and removed; [`super::heads`]) with
+    /// `change` applied. Kept here as the only head; carry it to servers.
     pub(super) async fn new_state(
         &self,
         id: PortableUserId,
@@ -640,34 +634,22 @@ impl super::Portable {
         now: i64,
     ) -> Result<PortableIdentityState, SdkError> {
         let storage = self.storage.as_ref();
-        let previous = load_state(storage, id).await?;
-        let revision = match &previous {
+        // A synced root signs over its other holders' states too.
+        self.sync_data(id).await?;
+        let heads = load_heads(storage, id).await?;
+        let revision = match heads.iter().map(|h| h.revision).max() {
             None => 1,
-            Some(previous) => previous.revision.checked_add(1).ok_or_else(|| {
+            Some(highest) => highest.checked_add(1).ok_or_else(|| {
                 StorageError(format!(
                     "the identity state of {id} is at its last revision"
                 ))
             })?,
         };
         let mut union = load_revoked(storage, id).await?;
-        if let Some(previous) = &previous {
-            merge(&mut union, &previous.revoked);
+        for head in &heads {
+            merge(&mut union, &head.revoked);
         }
-        let mut changes = StateChanges {
-            revoked: union
-                .iter()
-                .filter(|&(_, &at)| !revocation_lapsed(at, now))
-                .map(|(&key, &revoked_at)| RevokedKey { key, revoked_at })
-                .collect(),
-            roots_added: previous
-                .as_ref()
-                .map(|p| p.roots_added.clone())
-                .unwrap_or_default(),
-            roots_removed: previous
-                .as_ref()
-                .map(|p| p.roots_removed.clone())
-                .unwrap_or_default(),
-        };
+        let mut changes = merged_changes(&heads, &union, now);
         change(&mut changes);
         let roots = self.roots(id).await?;
         let signer_root = match signer {
@@ -741,18 +723,25 @@ impl super::Portable {
         Ok(root)
     }
 
-    /// Keep `state` as the newest here, and `union` with its revocations.
+    /// Keep `state`, just signed over the heads here, as the newest, and
+    /// `union` with its revocations. It covers the heads it was signed
+    /// over, which go; one that arrived while it was signed stays.
     async fn keep_state(
         &self,
         state: &PortableIdentityState,
         union: &super::Revoked,
     ) -> Result<(), SdkError> {
         let storage = self.storage.as_ref();
+        let id = state.user;
         let _saving = self.saving.lock().await;
         let mut union = union.clone();
         merge(&mut union, &state.revoked);
-        save_revoked(storage, state.user, &union).await?;
-        save_state(storage, state).await?;
+        save_revoked(storage, id, &union).await?;
+        let heads = load_heads(storage, id).await?;
+        let heads = take_in(&heads, state, unix_now()).unwrap_or(heads);
+        save_heads(storage, id, &heads).await?;
+        drop(_saving);
+        self.sync_data(id).await?;
         Ok(())
     }
 
@@ -967,7 +956,7 @@ impl super::Portable {
             return Err(crate::pairing::PairingError::CredentialRefused.into());
         }
         let storage = self.storage.as_ref();
-        let had = load_state(storage, id).await?;
+        let had = load_heads(storage, id).await?;
         let mut stored = None;
         if let Some(state) = &state {
             state.verify()?;
@@ -985,11 +974,11 @@ impl super::Portable {
             if state.revokes(&credential.device_key) {
                 return Err(SdkError::DeviceKeyRevoked);
             }
-            if had.as_ref().is_none_or(|h| h.revision < state.revision) {
+            if let Some(heads) = take_in(&had, state, unix_now()) {
                 // The state alone for now: the credential's check reads
                 // it, and the revocations wait for the credential.
                 let _saving = self.saving.lock().await;
-                save_state(storage, state).await?;
+                save_heads(storage, id, &heads).await?;
                 stored = Some(state);
             }
         }
@@ -999,14 +988,7 @@ impl super::Portable {
         {
             if stored.is_some() {
                 let _saving = self.saving.lock().await;
-                match &had {
-                    Some(had) => save_state(storage, had).await?,
-                    None => {
-                        storage
-                            .set_data(&keys::portable_state(&id.to_string()), None)
-                            .await?
-                    }
-                }
+                save_heads(storage, id, &had).await?;
             }
             return Err(e);
         }
@@ -1062,7 +1044,7 @@ impl super::Portable {
     }
 
     /// List `id` as `name`, if it is not listed yet.
-    async fn keep_entry(
+    pub(super) async fn keep_entry(
         &self,
         id: PortableUserId,
         name: &str,
@@ -1519,6 +1501,27 @@ mod tests {
         assert_eq!(state.roots_added[0].root, key.credentials()[0].root());
         // The key is still one of the identity's roots here.
         phone.pair_self(id, RootSigner::Key(&key)).await.unwrap();
+    }
+
+    /// A key's credential takes its serial as a phrase root's does: the
+    /// issue time in milliseconds, never less than one past the last.
+    #[tokio::test]
+    async fn a_key_s_serial_is_the_time_in_milliseconds() {
+        const T: i64 = 1_791_504_000;
+        let (desktop, id, a, _) = key_identity().await;
+        let tv_key = portable().device_key(id).await.unwrap();
+        let first = desktop
+            .issue_credential_by_at(id, RootSigner::Key(&a), tv_key, None, T)
+            .await
+            .unwrap();
+        let again = desktop
+            .issue_credential_by_at(id, RootSigner::Key(&a), tv_key, None, T)
+            .await
+            .unwrap();
+        assert_eq!(
+            (first.serial, again.serial),
+            (T as u64 * 1000, T as u64 * 1000 + 1)
+        );
     }
 
     #[tokio::test]

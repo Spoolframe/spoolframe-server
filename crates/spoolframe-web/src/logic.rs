@@ -1387,7 +1387,7 @@ mod tests {
             device_count: 0,
             session_count: 0,
             rate_limited_secs: None,
-            portable: None,
+            portable: Vec::new(),
         }
     }
 

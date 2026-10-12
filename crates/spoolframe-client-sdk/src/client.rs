@@ -2421,7 +2421,7 @@ mod tests {
             "role": "user",
             "locked": false,
             "pin": null,
-            "portable": null,
+            "portable": [],
         }))
         .unwrap();
         let kept = client
