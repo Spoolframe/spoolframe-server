@@ -272,6 +272,10 @@ pub struct Lookup {
     /// How long to wait before each ask again after a failed one; when
     /// they are spent, the lookup has failed.
     pub backoff: Vec<std::time::Duration>,
+    /// How long until the address is looked up again, after it was found
+    /// or the lookup failed: a server started before its network was up,
+    /// or whose ISP gave it a new address, finds the right one.
+    pub again: std::time::Duration,
 }
 
 /// wtfismyip's plain-text answer, over IPv4: the address IPv4 devices
@@ -296,6 +300,7 @@ impl Lookup {
             wtfismyip: WTFISMYIP.parse().expect("a fixed URL"),
             timeout: std::time::Duration::from_secs(10),
             backoff: [5, 30, 120].map(std::time::Duration::from_secs).to_vec(),
+            again: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -634,11 +639,19 @@ fn looked_up(
 }
 
 /// The operator forwarded `port` (`mode = "manual"`): advertise it with
-/// the public IP written down, or once it is looked up.
+/// the public IP written down, or once it is looked up, and with what each
+/// later lookup ([`Lookup::again`]) finds. A lookup that fails keeps what
+/// an earlier one found.
 async fn forwarded(public: &Public, lookup: &Lookup, mapped: &MappedPort, port: u16) {
-    if let Some(mut found) = public_ip(public, lookup, mapped).await {
-        found.addr.set_port(port);
-        public.set_mapped(Some(found));
+    loop {
+        if let Some(mut found) = public_ip(public, lookup, mapped).await {
+            found.addr.set_port(port);
+            public.set_mapped(Some(found));
+        }
+        if mapped.public_ip != PublicIp::Lookup {
+            return;
+        }
+        tokio::time::sleep(lookup.again).await;
     }
 }
 
@@ -657,10 +670,18 @@ async fn router_mapped(
 ) {
     let mut mapping = mapper.map(local_port);
     // The public IP for a mapping whose external address is not one:
-    // found once, at the first such mapping.
+    // found at the first such mapping, and looked up again every
+    // `lookup.again` while one is advertised with it.
     let mut fallback: Option<Option<PublicAddr>> = None;
     let mut refused = false;
+    let mut look_again = false;
     loop {
+        if look_again {
+            look_again = false;
+            if let Some(found) = public_ip(public, lookup, mapped).await {
+                fallback = Some(Some(found));
+            }
+        }
         let now = mapping.borrow_and_update().clone();
         public.set_mapping(Some((local_port.get(), now.clone())));
         match now {
@@ -711,8 +732,14 @@ async fn router_mapped(
                 public.set_mapped(None);
             }
         }
-        if mapping.changed().await.is_err() {
-            return;
+        let looking = fallback.is_some() && mapped.public_ip == PublicIp::Lookup;
+        tokio::select! {
+            changed = mapping.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep(lookup.again), if looking => look_again = true,
         }
     }
 }

@@ -75,6 +75,7 @@ opentelemetry-appender-tracing = { workspace = true }
 # feature would bring with ring (the workspace Cargo.toml).
 tonic = { workspace = true, features = ["tls-webpki-roots"] }
 parking_lot = { workspace = true }
+bytes = { workspace = true }
 tokio = { workspace = true }
 uclicious = { workspace = true }
 webauthn-rs = { workspace = true }

@@ -15,6 +15,7 @@ use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::server::ServerHandle;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
+use spoolframe_admin_api::OneTimePassword;
 use spoolframe_admin_api::{
     Activity, LogPage, LogQuery, MetricsEndpointStatus, OtlpStatus, PlexServerActivity,
     RefusedScrape, ResourceAttribute, TelemetryStatus, UserSessionCount,
@@ -63,7 +64,7 @@ use crate::store::identities::{IdentityError, IdentityRecord};
 use crate::store::invites::InviteError;
 use crate::store::passkeys::{FirstPasskey, PasskeyError, PasskeyRecord, passkey_name};
 use crate::store::pins::{DeviceRecord, PinError};
-use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionRecord};
+use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionRecord, SignedInWith};
 use crate::store::trust::TrustError;
 use crate::store::users::{UserError, UserRecord, normalize_username};
 use crate::tracks::SubtitleChoice;
@@ -971,6 +972,19 @@ impl AdminApi {
     /// The caller's live session, checked on every call so a revoked
     /// session or a disabled user stops at once.
     async fn caller(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
+        let (token, user) = self.any_caller(ext).await?;
+        if user.password_change_only {
+            return Err(error(
+                error_code::PASSWORD_CHANGE_REQUIRED,
+                "choose a new password first",
+            ));
+        }
+        Ok((token, user))
+    }
+
+    /// The caller, even in a session a one-time password opened, which
+    /// may only choose a new password, sign out, or ask who it is.
+    async fn any_caller(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
         let Some(Bearer(token)) = ext.get::<Bearer>() else {
             return Err(error(error_code::UNAUTHENTICATED, "log in first"));
         };
@@ -996,7 +1010,7 @@ impl AdminApi {
     /// session left open, or its stolen cookie, cannot make one.
     async fn recently_signed_in(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
         let (token, user) = self.caller(ext).await?;
-        recent(&user)?;
+        recent(&user, self.auth.store().now())?;
         Ok((token, user))
     }
 
@@ -1007,7 +1021,7 @@ impl AdminApi {
     /// consumer is told `FORBIDDEN`, not asked to confirm.
     async fn recent_admin(&self, ext: &Extensions) -> RpcResult<ApiSessionUser> {
         let user = self.admin(ext).await?;
-        recent(&user)?;
+        recent(&user, self.auth.store().now())?;
         Ok(user)
     }
 
@@ -1274,8 +1288,8 @@ fn device(d: DeviceRecord) -> DeviceEntry {
 
 /// `RECENT_SIGN_IN_REQUIRED` unless `user` proved who they are in this
 /// session within [`RECENT_SIGN_IN`].
-fn recent(user: &ApiSessionUser) -> RpcResult<()> {
-    let age = crate::store::now() - user.authenticated_at;
+fn recent(user: &ApiSessionUser, now: i64) -> RpcResult<()> {
+    let age = now - user.authenticated_at;
     if age > RECENT_SIGN_IN.as_secs() as i64 {
         return Err(error(
             error_code::RECENT_SIGN_IN_REQUIRED,
@@ -1534,13 +1548,18 @@ impl AdminApi {
                     tracing::info!(username = %record.username, provider, "a disabled user tried to sign in");
                     return Ok(back(page, "failed", Some(provider)));
                 }
-                let token = self.auth.open_api_session(user).await.map_err(internal)?;
+                let token = self
+                    .auth
+                    .open_api_session(user, SignedInWith::Sso)
+                    .await
+                    .map_err(internal)?;
                 tracing::info!(username = %record.username, provider, "signed in with a sign-in provider (API session)");
                 Ok(SsoOutcome::SignedIn {
                     done: LoggedIn {
                         token: token.0,
                         username: record.username,
                         role: record.role,
+                        password_change_required: false,
                     },
                     to: return_to.map_or_else(|| "/".to_owned(), |r| r.as_str().to_owned()),
                 })
@@ -1660,6 +1679,8 @@ fn info(u: UserRecord, limited: Option<std::time::Duration>) -> UserInfo {
         disabled: u.disabled_at.is_some(),
         has_password: u.has_password,
         password_changed_at: u.password_changed_at,
+        password_must_change: u.password_must_change,
+        password_expires_at: u.password_expires_at,
         last_seen_at: u.last_seen_at,
         has_passkey: u.has_passkey,
         has_sso: u.has_sso,
@@ -1738,12 +1759,14 @@ impl MeApiServer for AdminApi {
         tracing::info!(
             username = %username,
             peer = ?ext.get::<Peer>().and_then(|p| p.0),
+            password_change_required = login.password_change_required,
             "signed in with a password (API session)"
         );
         Ok(LoggedIn {
             token: login.token.0,
             username,
             role: login.role,
+            password_change_required: login.password_change_required,
         })
     }
 
@@ -1775,7 +1798,7 @@ impl MeApiServer for AdminApi {
             .await?;
         let token = self
             .auth
-            .open_api_session(user.id)
+            .open_api_session(user.id, SignedInWith::Passkey)
             .await
             .map_err(internal)?;
         tracing::info!(
@@ -1787,16 +1810,17 @@ impl MeApiServer for AdminApi {
             token: token.0,
             username: user.username,
             role: user.role,
+            password_change_required: false,
         })
     }
 
     async fn logout(&self, ext: &Extensions) -> RpcResult<()> {
-        let (token, _) = self.caller(ext).await?;
+        let (token, _) = self.any_caller(ext).await?;
         self.auth.logout(&token).await.map_err(internal)
     }
 
     async fn who_am_i(&self, ext: &Extensions) -> RpcResult<UserInfo> {
-        let (_, user) = self.caller(ext).await?;
+        let (_, user) = self.any_caller(ext).await?;
         let record = self.auth.store().user_by_id(user.user).await?;
         record
             .map(|u| self.info(u))
@@ -1804,13 +1828,20 @@ impl MeApiServer for AdminApi {
     }
 
     async fn set_password(&self, ext: &Extensions, change: PasswordChange) -> RpcResult<()> {
-        let (token, user) = self.caller(ext).await?;
+        // The way out of a session a one-time password opened.
+        let (token, user) = self.any_caller(ext).await?;
         let me = self.account(user).await?;
         if me.has_password {
             let source = source(ext)?;
             self.auth
                 .check_password(&me.username, &change.current_password, source.as_deref())
                 .await?;
+            if change.new_password == change.current_password {
+                return Err(error(
+                    error_code::INVALID_INPUT,
+                    "choose a password other than the current one",
+                ));
+            }
         } else {
             // Set up with a passkey, with no password to prove it is them:
             // a recent sign-in does, as for adding a passkey.
@@ -1824,7 +1855,12 @@ impl MeApiServer for AdminApi {
             .store()
             .set_password(&me.username, &phc, Some(&keep))
             .await?;
-        tracing::info!(username = %me.username, revoked, "password changed by its user");
+        tracing::info!(
+            username = %me.username,
+            revoked,
+            after_reset = user.password_change_only,
+            "password changed by its user"
+        );
         Ok(())
     }
 
@@ -2006,7 +2042,11 @@ impl MeApiServer for AdminApi {
             }
         };
         self.auth.guessed_right(guess);
-        match self.auth.approve_device(user.user, &claim, remember).await {
+        match self
+            .auth
+            .approve_device(user.user, &claim, remember, user.signed_in_with)
+            .await
+        {
             Ok(Approval::SignedIn) => {
                 tracing::info!(
                     user = %user.user,
@@ -2335,12 +2375,17 @@ impl AdminApiServer for AdminApi {
             .store()
             .add_first_admin(&request.username, &phc)
             .await?;
-        let token = self.auth.open_api_session(user).await.map_err(internal)?;
+        let token = self
+            .auth
+            .open_api_session(user, SignedInWith::Password)
+            .await
+            .map_err(internal)?;
         tracing::info!(username = %request.username, "first admin created");
         Ok(LoggedIn {
             token: token.0,
             username: normalize_username(&request.username)?,
             role: Role::Admin,
+            password_change_required: false,
         })
     }
 
@@ -2393,7 +2438,11 @@ impl AdminApiServer for AdminApi {
                 },
             )
             .await?;
-        let token = self.auth.open_api_session(user).await.map_err(internal)?;
+        let token = self
+            .auth
+            .open_api_session(user, SignedInWith::Passkey)
+            .await
+            .map_err(internal)?;
         tracing::info!(
             username = %passkey.username,
             passkey = name,
@@ -2404,6 +2453,7 @@ impl AdminApiServer for AdminApi {
             token: token.0,
             username: passkey.username,
             role: Role::Admin,
+            password_change_required: false,
         })
     }
 
@@ -2455,6 +2505,43 @@ impl AdminApiServer for AdminApi {
             .await?;
         tracing::info!(username = %credentials.username, revoked, "password set by an admin");
         Ok(())
+    }
+
+    async fn user_reset_password(
+        &self,
+        ext: &Extensions,
+        username: String,
+    ) -> RpcResult<OneTimePassword> {
+        let admin = self.recent_admin(ext).await?;
+        let by = self.account(admin).await?;
+        if normalize_username(&username)? == by.username {
+            return Err(error(
+                error_code::INVALID_INPUT,
+                "change your own password in My profile",
+            ));
+        }
+        let password = crate::auth::one_time_password();
+        let phc = hash_password(&password).await?;
+        let expires_at = self.auth.store().now() + crate::auth::ONE_TIME_PASSWORD.as_secs() as i64;
+        let reset = self
+            .auth
+            .store()
+            .reset_password(&username, &phc, expires_at)
+            .await?;
+        tracing::info!(
+            %username,
+            by = %by.username,
+            revoked = reset.revoked,
+            untrusted = reset.untrusted,
+            expires_at,
+            "password reset to a one-time one by an admin"
+        );
+        Ok(OneTimePassword {
+            password,
+            expires_at,
+            revoked_sessions: reset.revoked,
+            untrusted_devices: reset.untrusted,
+        })
     }
 
     async fn user_set_role(
@@ -2783,7 +2870,7 @@ impl AdminApiServer for AdminApi {
             }
         }
         let run = PathCheckRun {
-            at: crate::store::now(),
+            at: self.auth.store().now(),
             reports: reports
                 .into_iter()
                 .map(|r| PathReport {
@@ -3985,7 +4072,10 @@ mod tests {
             .await
             .unwrap();
         let auth = Auth::new(store.clone());
-        let token = auth.open_api_session(root).await.unwrap();
+        let token = auth
+            .open_api_session(root, crate::store::sessions::SignedInWith::Password)
+            .await
+            .unwrap();
         let api = api(auth);
         let mut ext = Extensions::new();
         ext.insert(Bearer(token.0.clone()));
@@ -4011,6 +4101,36 @@ mod tests {
             .unwrap();
     }
 
+    /// A sign-in stops being recent by the store's clock, the one its
+    /// sessions are stamped by (review 2026-10-11 M22): moving that clock
+    /// on is enough, as for every other expiry.
+    #[tokio::test]
+    async fn a_sign_in_stops_being_recent_by_the_store_s_clock() {
+        let dir = crate::store::tests::state_dir("recent-by-clock").await;
+        let clock = crate::clock::Clock::default();
+        let store = crate::store::Store::open(dir.as_ref())
+            .await
+            .unwrap()
+            .with_clock(clock.clone());
+        let root = store.add_first_admin("root", "phc").await.unwrap();
+        store
+            .add_passkey(root, "cred-1", "iPhone", "{}", "media.example.org")
+            .await
+            .unwrap();
+        let auth = Auth::new(store.clone());
+        let token = auth
+            .open_api_session(root, crate::store::sessions::SignedInWith::Password)
+            .await
+            .unwrap();
+        let api = api(auth);
+        let mut ext = Extensions::new();
+        ext.insert(Bearer(token.0.clone()));
+        ext.insert(Peer(Some("127.0.0.1".parse().unwrap())));
+        clock.advance(RECENT_SIGN_IN + std::time::Duration::from_secs(1));
+        let stale = api.password_remove(&ext).await.unwrap_err();
+        assert_eq!(stale.code(), error_code::RECENT_SIGN_IN_REQUIRED);
+    }
+
     /// Removing a password, the caller's or a user's, needs a recent
     /// sign-in; and the last admin with a password keeps it.
     #[tokio::test]
@@ -4031,7 +4151,10 @@ mod tests {
             .await
             .unwrap();
         let auth = Auth::new(store.clone());
-        let token = auth.open_api_session(root).await.unwrap();
+        let token = auth
+            .open_api_session(root, crate::store::sessions::SignedInWith::Password)
+            .await
+            .unwrap();
         let api = api(auth);
         let mut ext = Extensions::new();
         ext.insert(Bearer(token.0.clone()));
@@ -4121,6 +4244,7 @@ mod tests {
                     platform: spoolframe_types::Platform::Tvos,
                 },
                 i64::MAX / 2,
+                None,
             )
             .await
             .unwrap();

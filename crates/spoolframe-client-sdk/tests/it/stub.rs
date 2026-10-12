@@ -474,10 +474,13 @@ fn answer(
         },
         Request::Ping => Reply::Pong,
         Request::PlaybackRevision { .. } => Reply::PlaybackRevision { revision: 0 },
-        Request::LoginPassword(_) => Reply::LoggedIn {
+        // "one-time" stands for a password an admin reset to.
+        Request::LoginPassword(login) => Reply::LoggedIn {
             session: SessionId("stub-session".into()),
             remembered: false,
+            password_change_required: login.password == "one-time",
         },
+        Request::ChangePassword(_) => Reply::Done,
         Request::WhoAmI => Reply::WhoAmI(UserSummary {
             user_id: "local:1".into(),
             username: "alice".into(),

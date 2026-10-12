@@ -46,6 +46,13 @@ phrase identity's credential, state and proof read exactly as before;
 a peer that does not know the requests answers `unsupported`. What they
 do is in "Security key roots" under "Portable identities" below.
 
+Password reset adds, still at revision 14: a session request,
+`change_password { current_password, new_password }` (answered `done`),
+one error, `password_change_required`, and one field,
+`logged_in.password_change_required`, which a peer may leave out (read
+then as `false`). What they do is in "Choosing a new password after a
+reset" below.
+
 Every field above that may be left out is a dev-era leniency, marked
 `compat(v1): required at the protocol reset` in the code: at the reset
 to revision 1 (PX-16) each becomes required.
@@ -248,10 +255,12 @@ encodes. The server encodes in software only to H.264.
 Since PX-46 the server splits its home's upload between the playbacks
 of devices off its LAN (`network.uplink`). A device is on the LAN when
 the address its connection uses is in one of the server's own interface
-subnets (a global IPv6 address in the home's /64 too; tunnels such as
-Tailscale or WireGuard left out), link-local, or in
-`network.lan_prefixes`; a relay path is never the LAN. A private address
-elsewhere is not: a device over a tunnel may be anywhere.
+subnets (a global IPv6 address in the home's /64 too), private,
+carrier-grade NAT, link-local or unique local (a WireGuard or Tailscale
+peer too), or in `network.lan_prefixes`, and not in
+`network.wan_prefixes` (between two ranges that both hold the address,
+the longer prefix decides; `wan_prefixes` on a tie); a relay path is
+never the LAN.
 
 - `StartPlayback` off the LAN with `Quality::Auto` is planned under the
   playback's share of `network.uplink.budget_mbps`, and under the
@@ -509,6 +518,39 @@ is `InvalidCredentials`. A failure counts as a failed passkey sign-in of
 the passkey's user from this endpoint. A user with no app passkey gets
 `NotFound`. When the user's passkey sign-ins are rate-limited, `Begin`
 gets `RateLimited` before a challenge is made.
+
+## Choosing a new password after a reset
+
+An admin may reset a user's password to a one-time one (the admin API's
+`userResetPassword`, the web UI's Users page, or `spoolframe-server user
+reset-password`). The server shows it to the admin once. It works for 7
+days; after that only another reset helps. The reset ends the user's
+sessions that rest on the old password: every session signed in with a
+password, every session a device approval or a trusted device's resume
+made from one, and every session from before the server kept how each
+was signed in. It forgets the devices trusted on the same rule. Sessions
+signed in with a passkey, a sign-on provider or a portable identity's
+credential stay, as do the passkeys, the provider links and the ties.
+
+`login_password` with the one-time password answers `logged_in` with
+`password_change_required: true` and `remembered: false`: the device is
+not trusted, whatever the sign-in asked. That session may send only
+`change_password`, `logout` and `who_am_i`. Everything else, resource
+streams included, is `password_change_required`. The app shows "Choose
+a new password" and sends `change_password` with the one-time password
+as `current_password`.
+
+`change_password` checks `current_password` as `login_password` does: a
+wrong one is `invalid_credentials` and counts towards the same limit. A
+`new_password` that is too short, or the same as the current one, is
+`invalid_input`. A user with no password gets `no_password`, and a
+portable user `not_for_portable_users`. It ends every other session of
+the user's, on the web and on devices, and the session that sent it may
+do anything again. Any user may use it to change their own password,
+after a reset or not.
+
+A passkey or sign-on sign-in while a one-time password is pending is not
+limited: the password is what was reset.
 
 ## App passkeys: a relying party per server
 

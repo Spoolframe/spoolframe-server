@@ -7,12 +7,12 @@ use std::time::Duration;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::{
-    ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChosenTracks, ConfirmPassword,
-    DeviceInfo, DeviceSignInRequest, FinishPasskeyRegistration, FinishPasskeySignIn, HomeScreen,
-    ManifestKind, MediaRead, MediaReadResponse, PasskeyCreation, PasskeyInfo, PasskeyRequest,
-    PinProof, PlaybackHandle, PlaybackPlan, PlexLink, Previews, Quality, Reply, Request, Response,
-    SearchRequest, SearchResults, Selection, SessionId, SessionInfo, TrackPreferencesInfo,
-    UserSummary,
+    ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChangePassword, ChosenTracks,
+    ConfirmPassword, DeviceInfo, DeviceSignInRequest, FinishPasskeyRegistration,
+    FinishPasskeySignIn, HomeScreen, ManifestKind, MediaRead, MediaReadResponse, PasskeyCreation,
+    PasskeyInfo, PasskeyRequest, PinProof, PlaybackHandle, PlaybackPlan, PlexLink, Previews,
+    Quality, Reply, Request, Response, SearchRequest, SearchResults, Selection, SessionId,
+    SessionInfo, TrackPreferencesInfo, UserSummary,
 };
 use spoolframe_types::{
     ArtworkId, DisplayCapabilities, Item, Library, LibraryId, Marker, MediaId, MediaTracks,
@@ -450,6 +450,9 @@ pub struct Session {
     /// session was made (P4-01); `None` for a session found again rather
     /// than made ([`crate::Client::profiles`]).
     pub(crate) remembered: Option<bool>,
+    /// Signed in with a one-time password an admin reset to: the session
+    /// may only change the password or sign out until it does.
+    pub(crate) password_change_required: bool,
 }
 
 /// A profile explicitly selected by the application. All session operations
@@ -1121,6 +1124,35 @@ impl Session {
     /// A user with no password gets [`SdkError::NoPassword`]: offer
     /// [`Session::begin_confirm_passkey`]. A locked profile gets
     /// [`SdkError::ProfileLocked`]. The PIN does not confirm it is them.
+    /// This session was signed in with a one-time password an admin reset
+    /// to (from [`crate::Client::sign_in`]): show "Choose a new password"
+    /// and call [`Session::change_password`]. Every other request is
+    /// [`SdkError::PasswordChangeRequired`] until then. False for a session
+    /// found again ([`crate::Client::profiles`]); such a one answers its
+    /// first request with that error instead.
+    pub fn password_change_required(&self) -> bool {
+        self.password_change_required
+    }
+
+    /// Change this user's password from `current` to `new`. A wrong
+    /// `current` is [`SdkError::InvalidCredentials`], counted as a failed
+    /// sign-in; a `new` the server does not take (too short, or the same
+    /// as `current`) is [`SdkError::InvalidInput`]; a user with no password
+    /// gets [`SdkError::NoPassword`] (they set one in the web UI). Every
+    /// other session of theirs ends, on every device. After a one-time
+    /// password, `current` is that password, and this session may do
+    /// anything again.
+    pub async fn change_password(&self, current: &str, new: &str) -> Result<(), SdkError> {
+        let request = Request::ChangePassword(ChangePassword {
+            current_password: current.to_owned(),
+            new_password: new.to_owned(),
+        });
+        match self.call(request).await? {
+            Reply::Done => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
     pub async fn confirm_password(&self, password: &str) -> Result<(), SdkError> {
         let request = Request::ConfirmPassword(ConfirmPassword {
             password: password.to_owned(),

@@ -84,6 +84,10 @@ pub struct UserRecord {
     pub has_password: bool,
     /// When their password was set or last changed; `None` without one.
     pub password_changed_at: Option<i64>,
+    /// The password is a one-time one an admin reset to, not yet changed.
+    pub password_must_change: bool,
+    /// When that one-time password stops working (Unix seconds).
+    pub password_expires_at: Option<i64>,
     /// When any of their sessions was last used.
     pub last_seen_at: Option<i64>,
     pub has_passkey: bool,
@@ -108,6 +112,21 @@ pub struct PasswordLogin {
     pub disabled: bool,
     /// `None` when the user has no password credential.
     pub phc: Option<String>,
+    /// The password is a one-time one an admin reset to: signing in with
+    /// it gives a session that may only change it.
+    pub must_change: bool,
+    /// When a one-time password stops working (Unix seconds).
+    pub expires_at: Option<i64>,
+}
+
+/// What resetting a password ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reset {
+    /// Sessions revoked: those that rested on the password, or whose
+    /// origin is not known.
+    pub revoked: u64,
+    /// Devices no longer trusted for the user, on the same rule.
+    pub untrusted: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -193,7 +212,7 @@ impl Store {
         role: Role,
     ) -> Result<LocalUserId, UserError> {
         let name = normalize_username(username)?;
-        let display_name = display_name.map(str::trim).filter(|d| !d.is_empty());
+        let display_name = self::display_name(display_name)?;
         let now = self.now();
         let id = LocalUserId::generate();
         let mut tx = self.begin_write().await?;
@@ -249,13 +268,20 @@ impl Store {
         let id = user_id(&mut tx, &name).await?;
         sqlx::query(
             "INSERT INTO password_credentials (user_id, phc, updated_at) VALUES (?1, ?2, ?3) \
-             ON CONFLICT (user_id) DO UPDATE SET phc = excluded.phc, updated_at = excluded.updated_at",
+             ON CONFLICT (user_id) DO UPDATE SET phc = excluded.phc, \
+               updated_at = excluded.updated_at, must_change = 0, expires_at = NULL",
         )
         .bind(id)
         .bind(phc)
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        // The session that set it may do anything again, if it was one a
+        // one-time password opened.
+        sqlx::query("UPDATE sessions SET password_change_only = 0 WHERE token_hash = ?1")
+            .bind(keep)
+            .execute(&mut *tx)
+            .await?;
         let revoked = sqlx::query(
             "UPDATE sessions SET revoked_at = ?2 \
              WHERE user_id = ?1 AND revoked_at IS NULL AND token_hash IS NOT ?3",
@@ -440,6 +466,8 @@ impl Store {
                 "SELECT u.id, u.username, u.display_name, u.role, u.created_at, \
                     u.disabled_at, \
                     p.user_id IS NOT NULL AS has_password, p.updated_at AS password_changed_at, \
+                    coalesce(p.must_change, 0) AS password_must_change, \
+                    p.expires_at AS password_expires_at, \
                     (SELECT max(s.last_used_at) FROM sessions s WHERE s.user_id = u.id) \
                         AS last_seen_at, \
                     EXISTS (SELECT 1 FROM passkeys k WHERE k.user_id = u.id) AS has_passkey, \
@@ -482,6 +510,8 @@ impl Store {
                     disabled_at: row.try_get("disabled_at")?,
                     has_password: row.try_get("has_password")?,
                     password_changed_at: row.try_get("password_changed_at")?,
+                    password_must_change: row.try_get("password_must_change")?,
+                    password_expires_at: row.try_get("password_expires_at")?,
                     last_seen_at: row.try_get("last_seen_at")?,
                     has_passkey: row.try_get("has_passkey")?,
                     has_sso: row.try_get("has_sso")?,
@@ -510,7 +540,8 @@ impl Store {
             return Ok(None);
         };
         let row = sqlx::query(
-            "SELECT u.id, u.role, u.disabled_at IS NOT NULL AS disabled, p.phc \
+            "SELECT u.id, u.role, u.disabled_at IS NOT NULL AS disabled, p.phc, \
+                    coalesce(p.must_change, 0) AS must_change, p.expires_at \
              FROM users u LEFT JOIN password_credentials p ON p.user_id = u.id \
              WHERE u.username = ?1",
         )
@@ -523,9 +554,67 @@ impl Store {
                 role: role(row.try_get("role")?),
                 disabled: row.try_get("disabled")?,
                 phc: row.try_get("phc")?,
+                must_change: row.try_get("must_change")?,
+                expires_at: row.try_get("expires_at")?,
             })
         })
         .transpose()
+    }
+}
+
+impl Store {
+    /// Reset `username`'s password to the one-time `phc`, which they must
+    /// change when they next sign in with it and which stops working at
+    /// `expires_at`. Ends what rested on the old password, in one
+    /// transaction: every live session of theirs signed in with it, or of
+    /// unknown origin (made before sessions kept how they were signed in),
+    /// and every device trusted on the same rule. Sessions signed in with
+    /// a passkey, a sign-on provider or a portable identity's credential
+    /// stay, as do the passkeys, provider links and ties themselves.
+    pub async fn reset_password(
+        &self,
+        username: &str,
+        phc: &str,
+        expires_at: i64,
+    ) -> Result<Reset, UserError> {
+        let name = normalize_username(username)?;
+        let now = self.now();
+        let mut tx = self.begin_write().await?;
+        let id = user_id(&mut tx, &name).await?;
+        sqlx::query(
+            "INSERT INTO password_credentials (user_id, phc, updated_at, must_change, expires_at) \
+             VALUES (?1, ?2, ?3, 1, ?4) \
+             ON CONFLICT (user_id) DO UPDATE SET phc = excluded.phc, \
+               updated_at = excluded.updated_at, must_change = 1, \
+               expires_at = excluded.expires_at",
+        )
+        .bind(id)
+        .bind(phc)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        let revoked = sqlx::query(
+            "UPDATE sessions SET revoked_at = ?2 \
+             WHERE user_id = ?1 AND revoked_at IS NULL \
+               AND (signed_in_with IS NULL OR signed_in_with = 'password')",
+        )
+        .bind(id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let untrusted = sqlx::query(
+            "DELETE FROM trusted_endpoints \
+             WHERE user_id = ?1 AND (signed_in_with IS NULL OR signed_in_with = 'password')",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        self.note_sessions_ended();
+        Ok(Reset { revoked, untrusted })
     }
 }
 
@@ -691,6 +780,26 @@ mod tests {
             store.add_user("ALICE", None, "phc", Role::Consumer).await,
             Err(UserError::Exists(_))
         ));
+    }
+
+    /// An admin adding a user is held to what a user may call themselves
+    /// (review 2026-10-11 M23): no multi-line or over-long name reaches
+    /// "Who's watching".
+    #[tokio::test]
+    async fn an_added_user_s_display_name_is_checked() {
+        let store = store("add-display-name").await;
+        for name in ["two\nlines", "x".repeat(MAX_DISPLAY_NAME_LEN + 1).as_str()] {
+            assert!(
+                matches!(
+                    store
+                        .add_user("bob", Some(name), "phc", Role::Consumer)
+                        .await,
+                    Err(UserError::InvalidDisplayName)
+                ),
+                "{name:?}"
+            );
+        }
+        assert!(store.list_users().await.unwrap().is_empty());
     }
 
     #[tokio::test]

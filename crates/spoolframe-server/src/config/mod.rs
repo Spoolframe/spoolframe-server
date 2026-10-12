@@ -1384,6 +1384,12 @@ pub struct NetworkConfig {
     /// on the LAN is not counted against the uplink budget.
     #[ucl(default)]
     pub lan_prefixes: Option<Vec<String>>,
+    /// Address ranges whose devices are off the LAN even at a private
+    /// address or within `lan_prefixes`: a WireGuard peer known to be
+    /// away. Between two ranges that both hold an address, the longer
+    /// prefix decides.
+    #[ucl(default)]
+    pub wan_prefixes: Option<Vec<String>>,
     /// The WAN uplink budget and its share (PX-46).
     #[ucl(default)]
     pub uplink: UplinkConfig,
@@ -1413,7 +1419,8 @@ pub struct UplinkConfig {
 }
 
 impl NetworkConfig {
-    /// `network.uplink` and `network.lan_prefixes`, checked (PX-46).
+    /// `network.uplink`, `network.lan_prefixes` and `network.wan_prefixes`,
+    /// checked (PX-46).
     pub fn uplink(&self) -> Result<crate::uplink::UplinkSettings, ConfigError> {
         let share = self.uplink.owner_share_percent.map_or(
             Ok(crate::uplink::DEFAULT_OWNER_SHARE_PERCENT),
@@ -1427,18 +1434,19 @@ impl NetworkConfig {
                     })
             },
         )?;
-        let lan_prefixes = self
-            .lan_prefixes
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|text| {
-                text.trim().parse().map_err(|message| ConfigError::Invalid {
-                    key: "network.lan_prefixes",
-                    message,
+        let ranges = |list: &Option<Vec<String>>, key: &'static str| {
+            list.as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|text| {
+                    text.trim()
+                        .parse()
+                        .map_err(|message| ConfigError::Invalid { key, message })
                 })
-            })
-            .collect::<Result<_, _>>()?;
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let lan_prefixes = ranges(&self.lan_prefixes, "network.lan_prefixes")?;
+        let wan_prefixes = ranges(&self.wan_prefixes, "network.wan_prefixes")?;
         Ok(crate::uplink::UplinkSettings {
             budget: self
                 .uplink
@@ -1452,6 +1460,7 @@ impl NetworkConfig {
                 .map(|m| m as usize),
             owner_share_percent: share,
             lan_prefixes,
+            wan_prefixes,
         })
     }
 }
@@ -2720,13 +2729,14 @@ mod tests {
             crate::uplink::UplinkSettings::default()
         );
         let set = uplink(
-            r#"lan_prefixes = ["10.10.0.0/24"]; uplink { budget_mbps = 20; max_streams = 3; owner_share_percent = 60; }"#,
+            r#"lan_prefixes = ["10.10.0.0/24"]; wan_prefixes = ["10.10.0.7/32"]; uplink { budget_mbps = 20; max_streams = 3; owner_share_percent = 60; }"#,
         )
         .unwrap();
         assert_eq!(set.budget, Some(20_000_000));
         assert_eq!(set.max_streams, Some(3));
         assert_eq!(set.owner_share_percent, 60);
         assert!(set.lan_prefixes[0].contains("10.10.0.7".parse().unwrap()));
+        assert_eq!(set.wan_prefixes[0].prefix(), 32);
         let none = uplink("uplink { budget_mbps = 0; max_streams = 0; }").unwrap();
         assert_eq!((none.budget, none.max_streams), (None, None));
         assert!(matches!(
@@ -2740,6 +2750,13 @@ mod tests {
             uplink(r#"lan_prefixes = ["home"];"#),
             Err(ConfigError::Invalid {
                 key: "network.lan_prefixes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            uplink(r#"wan_prefixes = ["away"];"#),
+            Err(ConfigError::Invalid {
+                key: "network.wan_prefixes",
                 ..
             })
         ));

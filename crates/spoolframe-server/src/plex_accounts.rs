@@ -289,7 +289,7 @@ impl PlexAccounts {
             token,
             username: account.username,
             email: account.email,
-            linked_at: crate::store::now(),
+            linked_at: self.store.now(),
         };
         self.save(user, &link)?;
         tracing::info!(

@@ -19,7 +19,9 @@ use spoolframe_types::Role;
 use crate::clock::Clock;
 use crate::device_sign_in::{Claim, DeviceSignIns, Handover};
 use crate::refusals::Refusals;
-use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionOwner, SessionUser};
+use crate::store::sessions::{
+    ApiSessionUser, SessionBinding, SessionOwner, SessionUser, SignedInWith,
+};
 use crate::store::trust::{Resumed, TrustedProfile};
 use crate::store::users::{LocalUserId, PasswordLogin, normalize_username};
 use crate::store::{Store, StoreError};
@@ -58,6 +60,30 @@ impl fmt::Debug for SessionToken {
     }
 }
 
+/// How long a one-time password an admin reset to keeps working: after
+/// it, only another reset helps.
+pub const ONE_TIME_PASSWORD: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// A fresh one-time password: four groups of four Crockford base32
+/// characters (`QW7K-2MFP-XR4T-9HCD`), 80 random bits, typeable from a
+/// note. 256 is a multiple of 32, so one byte a character keeps each as
+/// likely as the next.
+pub fn one_time_password() -> String {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
+        .chunks(4)
+        .map(|group| {
+            group
+                .iter()
+                .map(|b| char::from(CROCKFORD[usize::from(b % 32)]))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 impl SessionToken {
     pub(crate) fn generate() -> Self {
         let mut bytes = [0u8; 32];
@@ -80,6 +106,9 @@ pub struct Login {
     /// Its device is trusted for the user after it (P4-01); always false
     /// for an API session, which has no device.
     pub remembered: bool,
+    /// The password was a one-time one an admin reset to: the session may
+    /// only change it, or sign out, until it does.
+    pub password_change_required: bool,
 }
 
 /// How long a trusted device may go unused before its trust lapses, by
@@ -744,18 +773,51 @@ impl Auth {
     /// told so: then the session, which nobody holds, is revoked, any trust
     /// made for it removed, and the approver is told it expired too. The
     /// device and the approver never hear two different outcomes.
+    ///
+    /// It runs to the end on a task of its own, whatever becomes of the
+    /// caller: a request dropped between opening the session and handing
+    /// it over would leave a 90-day session nobody holds, and the code
+    /// claimed until it expired.
     pub async fn approve_device(
         &self,
         user: LocalUserId,
         claim: &Claim,
         remember: bool,
+        approver_signed_in_with: Option<SignedInWith>,
+    ) -> Result<Approval, StoreError> {
+        let auth = self.clone();
+        let claim = claim.clone();
+        let approving = tokio::spawn(async move {
+            auth.approve_device_to_the_end(user, &claim, remember, approver_signed_in_with)
+                .await
+        });
+        match approving.await {
+            Ok(approved) => approved,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            // Cancelled only as the runtime shuts down: the database goes
+            // with it.
+            Err(_) => Err(StoreError::Db(sqlx::Error::PoolClosed)),
+        }
+    }
+
+    async fn approve_device_to_the_end(
+        &self,
+        user: LocalUserId,
+        claim: &Claim,
+        remember: bool,
+        approver_signed_in_with: Option<SignedInWith>,
     ) -> Result<Approval, StoreError> {
         let binding = SessionBinding::Endpoint {
             endpoint_id: claim.endpoint.clone(),
             device_name: claim.device_name.clone(),
             platform: claim.platform,
         };
-        let token = match self.open_session(user, &binding).await {
+        // The device's session rests on whatever the approver's does: a
+        // password reset that ends the approver's ends it too.
+        let token = match self
+            .open_session(user, &binding, approver_signed_in_with)
+            .await
+        {
             Ok(token) => token,
             Err(e) => {
                 // Failed or already gone, the device stops waiting.
@@ -799,11 +861,14 @@ impl Auth {
     }
 
     /// Open a session bound as `binding` for `user`, who just proved who
-    /// they are some other way than a password (an approval, a passkey).
+    /// they are some other way than a password check here (an approval, a
+    /// passkey, an invite's redemption), signed in as `signed_in_with`
+    /// says: for an approval, the approving session's own.
     pub async fn open_session(
         &self,
         user: LocalUserId,
         binding: &SessionBinding,
+        signed_in_with: Option<SignedInWith>,
     ) -> Result<SessionToken, StoreError> {
         let lifetime = match binding {
             SessionBinding::Endpoint { .. } => ENDPOINT_SESSION,
@@ -816,6 +881,7 @@ impl Auth {
                 user,
                 binding,
                 self.store.now() + lifetime.as_secs() as i64,
+                signed_in_with,
             )
             .await?;
         Ok(token)
@@ -971,14 +1037,28 @@ impl Auth {
         };
 
         let token = SessionToken::generate();
+        let hash = token.hash();
         self.store
             .create_session(
-                &token.hash(),
+                &hash,
                 account.id,
                 &binding,
                 self.store.now() + lifetime.as_secs() as i64,
+                Some(SignedInWith::Password),
             )
             .await?;
+        // A one-time password opens a session that may only change it,
+        // and trusts no device: the next sign-in is with the new one.
+        if account.must_change {
+            self.store.restrict_to_password_change(&hash).await?;
+            return Ok(Login {
+                user: account.id,
+                role: account.role,
+                token,
+                remembered: false,
+                password_change_required: true,
+            });
+        }
         let remembered = self
             .remembered(&token, &binding, account.id, remember)
             .await?;
@@ -987,6 +1067,7 @@ impl Auth {
             role: account.role,
             token,
             remembered,
+            password_change_required: false,
         })
     }
 
@@ -1041,8 +1122,16 @@ impl Auth {
             return Err(LoginError::RateLimited { retry_after });
         }
         let verified = verify_password(password, phc).await;
+        // A one-time password past its expiry is a wrong one: only another
+        // reset helps, and an attacker learns nothing new from it.
+        let lapsed = account.as_ref().is_some_and(|a| {
+            a.must_change && a.expires_at.is_some_and(|at| at <= self.store.now())
+        });
+        if verified && lapsed {
+            tracing::info!(username, "a one-time password past its expiry was refused");
+        }
         match account {
-            Some(account) if verified && usable => {
+            Some(account) if verified && usable && !lapsed => {
                 self.limiter.record_success(username, source, began);
                 Ok(account)
             }
@@ -1051,8 +1140,13 @@ impl Auth {
     }
 
     /// Open an API session for a user who just proved who they are some
-    /// other way (the first-admin setup).
-    pub async fn open_api_session(&self, user: LocalUserId) -> Result<SessionToken, StoreError> {
+    /// other way than a password check here (the first-admin setup, a
+    /// passkey, a sign-on provider), signed in as `signed_in_with` says.
+    pub async fn open_api_session(
+        &self,
+        user: LocalUserId,
+        signed_in_with: SignedInWith,
+    ) -> Result<SessionToken, StoreError> {
         let token = SessionToken::generate();
         self.store
             .create_session(
@@ -1060,6 +1154,7 @@ impl Auth {
                 user,
                 &SessionBinding::Api,
                 self.store.now() + API_SESSION_IDLE.as_secs() as i64,
+                Some(signed_in_with),
             )
             .await?;
         Ok(token)

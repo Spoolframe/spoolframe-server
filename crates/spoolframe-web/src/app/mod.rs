@@ -68,6 +68,10 @@ enum Route {
     Start {},
     #[route("/login")]
     Login {},
+    // After signing in with a one-time password an admin reset to: the one
+    // thing that session may do.
+    #[route("/change-password")]
+    ChangePassword {},
     #[route("/setup")]
     Setup {},
     // The wizard's steps after the first admin (P3-10); signed in.
@@ -177,6 +181,12 @@ fn App() -> Element {
 /// left it, or the signed-in user's pages.
 async fn where_to() -> Result<Route, ApiError> {
     let me = http::me().await?;
+    // A pending one-time password: if this session is the one it opened,
+    // choosing a new password is all it may do. A passkey's session of the
+    // same user may do anything, so ask this session, not the user.
+    if me.as_ref().is_some_and(|u| u.password_must_change) && password_change_only().await? {
+        return Ok(Route::ChangePassword {});
+    }
     let setup_open = match me {
         Some(_) => false,
         None => http::setup_open().await?,
@@ -372,8 +382,13 @@ fn Login() -> Element {
                 sso,
                 said,
                 // The start decides: an admin may have a wizard to finish.
-                on_done: move |_: http::SignedIn| {
-                    nav.replace(Route::Start {});
+                // A one-time password's session may only choose a new one.
+                on_done: move |signed_in: http::SignedIn| {
+                    if signed_in.password_change_required {
+                        nav.replace(Route::ChangePassword {});
+                    } else {
+                        nav.replace(Route::Start {});
+                    }
                 },
             }
         }
@@ -858,6 +873,84 @@ fn PasswordSetup(name: String, why: String, setup_code: String) -> Element {
                 Alert { text }
             }
             button { class: "btn-primary", r#type: "submit", disabled: busy(), "Create admin" }
+        }
+    }
+}
+
+/// Whether this session may only choose a new password: one a one-time
+/// password opened. Asked by a call such a session is refused.
+async fn password_change_only() -> Result<bool, ApiError> {
+    let client = rpc::client().await?;
+    match client.sessions().await.map_err(rpc::error) {
+        Ok(_) => Ok(false),
+        Err(e) if e.code == spoolframe_admin_api::error_code::PASSWORD_CHANGE_REQUIRED => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// "Choose a new password": the page a one-time password signs in to. The
+/// one-time password is the current one; the new one ends every other
+/// session of the user's, and this one may then do anything.
+#[component]
+fn ChangePassword() -> Element {
+    let nav = navigator();
+    let current = use_signal(String::new);
+    let password = use_signal(String::new);
+    let again = use_signal(String::new);
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let submit = move |e: FormEvent| {
+        e.prevent_default();
+        if password() != again() {
+            error.set(Some("The new passwords are not the same.".into()));
+            return;
+        }
+        busy.set(true);
+        spawn(async move {
+            let changed = async {
+                let client = rpc::client().await?;
+                client
+                    .set_password(PasswordChange {
+                        current_password: current(),
+                        new_password: password(),
+                    })
+                    .await
+                    .map_err(rpc::error)
+            };
+            match changed.await {
+                Ok(()) => {
+                    nav.replace(Route::Start {});
+                }
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+        });
+    };
+    let sign_out = move |_| {
+        spawn(async move {
+            // Signed out either way: a failure leaves a session that can
+            // do nothing but this.
+            let _ = http::logout().await;
+            rpc::forget();
+            nav.replace(Route::Login {});
+        });
+    };
+    rsx! {
+        Centered {
+            form { class: "glass-card", onsubmit: submit,
+                h1 { class: "m-0 text-xl font-semibold", "Choose a new password" }
+                p { class: "m-0 text-sm text-ctp-subtext0",
+                    "Your password was reset. Enter the one-time password you were given, then the password you'll use from now on."
+                }
+                Field { label: "One-time password", value: current, kind: "password", autocomplete: "current-password" }
+                Field { label: "New password", value: password, kind: "password", autocomplete: "new-password" }
+                Field { label: "New password again", value: again, kind: "password", autocomplete: "new-password" }
+                if let Some(text) = error() {
+                    Alert { text }
+                }
+                button { class: "btn-primary", r#type: "submit", disabled: busy(), "Save and continue" }
+                button { class: "btn", r#type: "button", onclick: sign_out, "Sign out" }
+            }
         }
     }
 }

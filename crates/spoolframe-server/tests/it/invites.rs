@@ -120,6 +120,7 @@ fn logged_in(response: Response) -> spoolframe_protocol::SessionId {
         Response::Ok(Reply::LoggedIn {
             session,
             remembered: false,
+            password_change_required: false,
         }) => session,
         other => panic!("not signed in: {other:?}"),
     }

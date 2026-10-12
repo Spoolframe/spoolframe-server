@@ -694,6 +694,7 @@ async fn sign_in_on_tv(dir: &std::path::Path) -> String {
                 platform: spoolframe_admin_api::Platform::Tvos,
             },
             i64::MAX / 2,
+            None,
         )
         .await
         .unwrap();
@@ -838,6 +839,7 @@ async fn the_user_list_counts_each_user_s_devices_and_live_sessions() {
                 platform: spoolframe_admin_api::Platform::Tvos,
             },
             i64::MAX / 2,
+            None,
         )
         .await
         .unwrap();

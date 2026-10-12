@@ -295,6 +295,11 @@ pub enum SdkError {
     /// the session's user is not one. Hide what asks for it.
     #[error("only an admin can do that")]
     AdminRequired,
+    /// The session was signed in with a one-time password an admin reset
+    /// to: it may only change the password ([`crate::Session::change_password`])
+    /// or sign out. Show "Choose a new password".
+    #[error("choose a new password first")]
+    PasswordChangeRequired,
     /// Pairing this device with a portable identity, or a phone with a
     /// device, did not happen (P7-03); [`PairingError`] says why.
     #[error(transparent)]
@@ -363,6 +368,7 @@ impl SdkError {
             ServerError::WrongInviteKind => SdkError::WrongInviteKind,
             ServerError::NotForPortableUsers => SdkError::NotForPortableUsers,
             ServerError::AdminRequired => SdkError::AdminRequired,
+            ServerError::PasswordChangeRequired => SdkError::PasswordChangeRequired,
             other => SdkError::Server(other.to_string()),
         }
     }
@@ -409,6 +415,14 @@ mod tests {
         assert_eq!(
             SdkError::from_server(ServerError::PortableIdTaken),
             SdkError::PortableIdTaken
+        );
+    }
+
+    #[test]
+    fn a_one_time_password_session_is_told_to_change_it() {
+        assert_eq!(
+            SdkError::from_server(ServerError::PasswordChangeRequired),
+            SdkError::PasswordChangeRequired
         );
     }
 

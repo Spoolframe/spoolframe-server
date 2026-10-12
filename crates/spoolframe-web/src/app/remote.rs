@@ -614,9 +614,10 @@ fn RelayFields(
     }
 }
 
-/// `network.uplink.*` and `network.lan_prefixes` (PX-46): what the
-/// home's upload carries for playbacks outside it, and how they share
-/// it. The ranges that count as home are advanced.
+/// `network.uplink.*`, `network.lan_prefixes` and `network.wan_prefixes`
+/// (PX-46): what the home's upload carries for playbacks outside it, and
+/// how they share it. The ranges that count as home, or as outside, are
+/// advanced.
 #[component]
 fn UplinkFields(
     settings: Settings,
@@ -628,6 +629,7 @@ fn UplinkFields(
     const STREAMS: &str = "network.uplink.max_streams";
     const OWNER: &str = "network.uplink.owner_share_percent";
     const LAN: &str = "network.lan_prefixes";
+    const WAN: &str = "network.wan_prefixes";
     const CONGESTION: &str = "network.congestion_control";
     let mut congestion = use_signal(|| {
         let saved = text(&settings, CONGESTION);
@@ -641,6 +643,7 @@ fn UplinkFields(
     let streams = use_signal(|| text(&settings, STREAMS));
     let owner = use_signal(|| text(&settings, OWNER));
     let lan = use_signal(|| listed(&settings, LAN));
+    let wan = use_signal(|| listed(&settings, WAN));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let mut measuring = use_signal(|| false);
@@ -655,6 +658,7 @@ fn UplinkFields(
                 (STREAMS, number("The most streams", &streams())?),
                 (OWNER, number("The admins' share", &owner())?),
                 (LAN, list_change(&s, LAN, &lan())),
+                (WAN, list_change(&s, WAN, &wan())),
                 (CONGESTION, Some(serde_json::Value::String(congestion()))),
             ])
         })();
@@ -690,7 +694,7 @@ fn UplinkFields(
             measuring.set(false);
         });
     };
-    let all_fixed = [BUDGET, STREAMS, OWNER, LAN, CONGESTION]
+    let all_fixed = [BUDGET, STREAMS, OWNER, LAN, WAN, CONGESTION]
         .iter()
         .all(|k| locked(&settings, k));
     let meaning = crate::uplink::budget_meaning(&budget());
@@ -737,10 +741,18 @@ fn UplinkFields(
                 div { class: "wan-part",
                     span { class: "flex flex-col gap-0.5",
                         b { class: "text-[15px]", "Also home" }
-                        span { class: "text-[13px] text-ctp-subtext0", "Ranges whose devices count as home besides the server’s own networks: a WireGuard network, another VLAN." }
+                        span { class: "text-[13px] text-ctp-subtext0", "Ranges whose devices count as home besides the server’s own networks and private addresses (a WireGuard or Tailscale peer already is): another VLAN with public addresses." }
                     }
-                    ListField { add: "Add a range", items: lan, placeholder: "10.10.0.0/24", disabled: locked(&settings, LAN) }
+                    ListField { add: "Add a range", items: lan, placeholder: "203.0.113.0/24", disabled: locked(&settings, LAN) }
                     Note { settings: settings.clone(), setting: LAN, on_changed: move |_| on_reload.call(()) }
+                }
+                div { class: "wan-part",
+                    span { class: "flex flex-col gap-0.5",
+                        b { class: "text-[15px]", "Always outside" }
+                        span { class: "text-[13px] text-ctp-subtext0", "Ranges whose devices count as outside your home even at a private address: a WireGuard peer that is always away. Where a range here and one under Also home both hold an address, the narrower one decides." }
+                    }
+                    ListField { add: "Add a range", items: wan, placeholder: "10.10.0.7/32", disabled: locked(&settings, WAN) }
+                    Note { settings: settings.clone(), setting: WAN, on_changed: move |_| on_reload.call(()) }
                 }
                 div { class: "wan-part",
                     span { class: "flex flex-col gap-0.5",

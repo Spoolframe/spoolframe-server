@@ -47,6 +47,7 @@ async fn remembered(client: &TestClient) -> SessionId {
         Reply::LoggedIn {
             session,
             remembered,
+            ..
         } => {
             assert!(remembered);
             session
@@ -100,6 +101,7 @@ async fn resumed(client: &TestClient, user_id: &str) -> SessionId {
         Response::Ok(Reply::LoggedIn {
             session,
             remembered,
+            ..
         }) => {
             assert!(remembered);
             session

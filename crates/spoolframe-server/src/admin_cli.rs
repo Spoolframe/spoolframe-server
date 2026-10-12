@@ -42,6 +42,12 @@ pub enum UserCommand {
         #[arg(long)]
         password_stdin: bool,
     },
+    /// Reset a user's password to a one-time one, printed this once: they
+    /// choose a new one when they sign in with it, and it stops working
+    /// after 7 days. Ends their sessions signed in with a password; those
+    /// signed in with a passkey, a sign-on provider or a portable identity
+    /// stay. Not your own (change it with `user passwd`).
+    ResetPassword { username: String },
     /// Make a user an admin or a consumer. The last enabled admin stays
     /// one.
     Role { username: String, role: Role },
@@ -574,6 +580,21 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
             .map_err(api_error)?;
             println!("password set for {username}");
         }
+        UserCommand::ResetPassword { username } => {
+            let reset = api
+                .user_reset_password(username.clone())
+                .await
+                .map_err(api_error)?;
+            println!(
+                "one-time password for {username}: {}\n\
+                 it works until {}; they choose a new one when they sign in with it\n\
+                 sessions ended: {}, devices no longer trusted: {}",
+                reset.password,
+                when(reset.expires_at),
+                reset.revoked_sessions,
+                reset.untrusted_devices,
+            );
+        }
         UserCommand::List => {
             for user in api.user_list().await.map_err(api_error)? {
                 let mut flags = vec![user.role.as_str().to_owned()];
@@ -585,6 +606,9 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
                 }
                 if !user.has_password {
                     flags.push("no password".into());
+                }
+                if user.password_must_change {
+                    flags.push("one-time password".into());
                 }
                 let mut line = user.username;
                 if let Some(name) = user.display_name {

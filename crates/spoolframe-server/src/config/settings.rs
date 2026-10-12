@@ -78,6 +78,7 @@ pub const SETTINGS: &[Setting] = &[
     // `lookup_via`), so the web UI sets it whole.
     restart("network.wan"),
     live("network.lan_prefixes"),
+    live("network.wan_prefixes"),
     live("network.uplink.budget_mbps"),
     live("network.uplink.max_streams"),
     live("network.uplink.owner_share_percent"),

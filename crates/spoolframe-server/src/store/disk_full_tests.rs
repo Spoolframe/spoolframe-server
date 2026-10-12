@@ -92,7 +92,7 @@ async fn writes_work_again_once_a_full_disk_has_space() {
         .await
         .unwrap();
     store
-        .create_session("h", alice, &SessionBinding::Api, store.now() + 3_600)
+        .create_session("h", alice, &SessionBinding::Api, store.now() + 3_600, None)
         .await
         .unwrap();
     sqlx::query("CREATE TABLE spill (b BLOB)")

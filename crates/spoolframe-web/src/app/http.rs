@@ -10,9 +10,13 @@ use crate::logic::ApiError;
 
 /// Who signed in, as `/auth/login` and `/auth/setup` answer.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SignedIn {
     pub username: String,
     pub role: Role,
+    /// Signed in with a one-time password an admin reset to: the next
+    /// page is "Choose a new password", and nothing else works until then.
+    pub password_change_required: bool,
 }
 
 async fn error_of(response: Response) -> ApiError {

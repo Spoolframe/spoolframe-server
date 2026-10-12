@@ -294,6 +294,7 @@ mod tests {
                         platform: Platform::Linux,
                     },
                     now() + 3600,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -407,6 +408,7 @@ mod tests {
                     platform: Platform::Linux,
                 },
                 now() + 3600,
+                None,
             )
             .await
             .unwrap();
@@ -421,6 +423,7 @@ mod tests {
                     platform: Platform::Linux,
                 },
                 now() + 3600,
+                None,
             )
             .await
             .unwrap();
@@ -435,6 +438,7 @@ mod tests {
                     platform: Platform::Linux,
                 },
                 now() + 3600,
+                None,
             )
             .await
             .unwrap();

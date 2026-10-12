@@ -62,7 +62,7 @@ use crate::principal::Who;
 use crate::refusals::{self, Channel, Kind};
 use crate::store::passkeys::{PasskeyError, PasskeyRecord};
 use crate::store::pins::PinError;
-use crate::store::sessions::{SessionBinding, SessionUser};
+use crate::store::sessions::{SessionBinding, SessionUser, SignedInWith};
 use crate::store::trust::TrustError;
 use crate::subtitles::{TextSource, TextState};
 use crate::tracks::{self, TrackOverride};
@@ -152,7 +152,8 @@ const LOGGED_PATHS: usize = 8;
 /// `addr`, the path a connection goes by, as the log names it: `relay`
 /// and its URL; or `direct` and the address, `lan` for one on the LAN
 /// (PX-46: in one of this host's subnets, a global IPv6 address in the
-/// home's /64 too, private, or in `network.lan_prefixes`). Whether a
+/// home's /64 too, private, or in `network.lan_prefixes`, and not in
+/// `network.wan_prefixes`). Whether a
 /// direct path is a hole punched in NAT or an open port, iroh does not
 /// say.
 fn path_name(addr: &iroh::TransportAddr, uplink: &crate::uplink::Uplink) -> String {
@@ -809,7 +810,7 @@ impl ClientProtocol {
                     device_name: hello.device_name.clone(),
                     client_name: hello.client_name.clone(),
                     platform: hello.platform,
-                    requested_at: crate::store::now(),
+                    requested_at: self.services.auth.store().now(),
                     remember,
                     address: remote_ip(connection),
                 });
@@ -848,6 +849,7 @@ impl ClientProtocol {
                         Ok(Reply::LoggedIn {
                             session: SessionId(handover.token.0),
                             remembered: handover.remembered,
+                            password_change_required: false,
                         })
                     }
                     Outcome::Pending => Ok(Reply::DeviceSignInPending),
@@ -1004,7 +1006,15 @@ impl ClientProtocol {
                         request,
                         Request::ActivateProfile | Request::WhoAmI | Request::UnlockProfile { .. }
                     );
-                    let allowed = if exempt {
+                    // Opened with a one-time password: only choosing a new
+                    // one, or leaving.
+                    let after_reset = matches!(
+                        request,
+                        Request::ChangePassword(_) | Request::Logout | Request::WhoAmI
+                    );
+                    let allowed = if who.password_change_only() && !after_reset {
+                        Err(Error::PasswordChangeRequired)
+                    } else if exempt || who.password_change_only() {
                         Ok(())
                     } else {
                         state.locks.lock().use_session(&session)
@@ -1028,6 +1038,22 @@ impl ClientProtocol {
             },
         };
         reply.into()
+    }
+
+    /// [`Self::authenticate`], refusing a session a one-time password
+    /// opened (`PasswordChangeRequired`): what reads media and artwork use,
+    /// as requests other than choosing a new password do.
+    async fn authenticate_unrestricted(
+        &self,
+        connection: &Connection,
+        state: &ConnectionState,
+        session: Option<SessionId>,
+    ) -> Result<(SessionId, Who), Error> {
+        let (session, who) = self.authenticate(connection, state, session).await?;
+        if who.password_change_only() {
+            return Err(Error::PasswordChangeRequired);
+        }
+        Ok((session, who))
     }
 
     /// The user of `session`, if it is live and bound to this connection's
@@ -1226,7 +1252,9 @@ impl ClientProtocol {
                     ),
                     _ => unreachable!(),
                 };
-                let (session, who) = self.authenticate(connection, state, Some(session)).await?;
+                let (session, who) = self
+                    .authenticate_unrestricted(connection, state, Some(session))
+                    .await?;
                 state.locks.lock().use_session(&session)?;
                 // A stale revision is refused before any work.
                 let now = self
@@ -1622,7 +1650,7 @@ impl ClientProtocol {
         // looked up first, so a new connection does not skip its lock.
         let known = state.locks.lock().knows(&read.session);
         if !known {
-            self.authenticate(connection, state, Some(read.session.clone()))
+            self.authenticate_unrestricted(connection, state, Some(read.session.clone()))
                 .await?;
         }
         state.locks.lock().use_session(&read.session)?;
@@ -1774,7 +1802,7 @@ impl ClientProtocol {
                 let user = local(&who)?;
                 // P3-03's rule, as for a passkey added in the web UI: a
                 // session left signed in on a device does not add one.
-                recently_signed_in(user)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
                 let account = self.account(user).await?;
                 self.services
                     .app_passkeys
@@ -1844,7 +1872,7 @@ impl ClientProtocol {
                 match proof {
                     Some(proof) => self.check_pin_proof(connection, user, proof).await?,
                     None => {
-                        recently_signed_in(user)?;
+                        recently_signed_in(user, self.services.auth.store().now())?;
                         if self
                             .store()
                             .pin_info(user.user)
@@ -1902,7 +1930,7 @@ impl ClientProtocol {
                 let user = local(&who)?;
                 // As the web UI asks: a device left signed in does not
                 // take a way to sign in away.
-                recently_signed_in(user)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
                 self.store()
                     .remove_passkey(user.user, &id)
                     .await
@@ -1919,6 +1947,12 @@ impl ClientProtocol {
                 self.confirm_password(connection, user, &confirm.password)
                     .await?;
                 self.confirmed(&session, user, "password").await
+            }
+            Request::ChangePassword(change) => {
+                let user = local(&who)?;
+                self.change_password(connection, &session, user, &change)
+                    .await?;
+                Ok(Reply::Done)
             }
             Request::BeginConfirmPasskey => {
                 let user = local(&who)?;
@@ -2015,7 +2049,7 @@ impl ClientProtocol {
             Request::SetPinRequired { device, required } => {
                 let user = local(&who)?;
                 if !required {
-                    recently_signed_in(user)?;
+                    recently_signed_in(user, self.services.auth.store().now())?;
                 }
                 let generation = state.locks.lock().generation;
                 let this = connection.remote_id().to_string();
@@ -2080,7 +2114,7 @@ impl ClientProtocol {
                 // grant them, nor end another device's sessions. Stopping
                 // trust on this very device only takes away.
                 if trusted || !own {
-                    recently_signed_in(user)?;
+                    recently_signed_in(user, self.services.auth.store().now())?;
                 }
                 let revoked = self
                     .store()
@@ -2116,7 +2150,7 @@ impl ClientProtocol {
                 }
                 // It ends sessions elsewhere and takes away trust: a
                 // session left signed in does not (P4-03).
-                recently_signed_in(user)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
                 let deleted = self
                     .store()
                     .delete_device(user.user, &device)
@@ -2854,7 +2888,7 @@ impl ClientProtocol {
             }
             Request::ApproveDeviceSignIn { code, remember } => {
                 let user = local(&who)?;
-                recently_signed_in(user)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
                 let (code, guess) = self.sign_in_code(connection, user, &code)?;
                 let approver = connection.remote_id().to_string();
                 let claim = self.services.auth.sign_ins().claim(&code, Some(&approver));
@@ -2873,7 +2907,7 @@ impl ClientProtocol {
                 match self
                     .services
                     .auth
-                    .approve_device(user.user, &claim, remember)
+                    .approve_device(user.user, &claim, remember, user.signed_in_with)
                     .await
                 {
                     Ok(Approval::SignedIn) => {
@@ -2908,7 +2942,7 @@ impl ClientProtocol {
             // the account is reached does.
             Request::TieBegin => {
                 let user = local(&who)?;
-                recently_signed_in(user)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
                 if self
                     .store()
                     .tie_of(user.user)
@@ -2936,12 +2970,12 @@ impl ClientProtocol {
                 proof,
             } => {
                 let user = local(&who)?;
-                recently_signed_in(user)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
                 self.tie(&session, user, portable, &proof).await
             }
             Request::Untie => {
                 let user = local(&who)?;
-                recently_signed_in(user)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
                 match self.store().untie(user.user).await.map_err(internal)? {
                     Some(portable) => {
                         tracing::info!(
@@ -2962,7 +2996,7 @@ impl ClientProtocol {
             // UI's `recent_admin` asks for creating and revoking.
             Request::CreateInvite(create) => {
                 let user = admin(&who)?;
-                recently_signed_in(user)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
                 let hello = state.hello.get();
                 let origin = crate::store::invites::InviteOrigin::Device {
                     endpoint_id: connection.remote_id().to_string(),
@@ -3002,7 +3036,7 @@ impl ClientProtocol {
             }
             Request::RevokeInvite { id } => {
                 let user = admin(&who)?;
-                recently_signed_in(user)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
                 match self.store().revoke_invite(&id).await {
                     Ok(()) => {
                         tracing::info!(%id, by = %user.username, "invite revoked, in an app");
@@ -3090,12 +3124,14 @@ impl ClientProtocol {
                     endpoint = %endpoint_id,
                     user = ?done.user,
                     remembered = done.remembered,
+                    password_change_required = done.password_change_required,
                     "logged in"
                 );
                 self.signed_in(connection, &done.token.0).await;
                 Ok(Reply::LoggedIn {
                     session: SessionId(done.token.0),
                     remembered: done.remembered,
+                    password_change_required: done.password_change_required,
                 })
             }
             Err(e) => Err(login_error(e)),
@@ -3123,7 +3159,8 @@ impl ClientProtocol {
         let token = self
             .services
             .auth
-            .open_session(user, &binding)
+            // The redemption chose the account's password.
+            .open_session(user, &binding, Some(SignedInWith::Password))
             .await
             .map_err(internal)?;
         tracing::info!(
@@ -3136,6 +3173,7 @@ impl ClientProtocol {
         Ok(Reply::LoggedIn {
             session: SessionId(token.0),
             remembered: false,
+            password_change_required: false,
         })
     }
 
@@ -3163,7 +3201,7 @@ impl ClientProtocol {
         let token = self
             .services
             .auth
-            .open_session(user.id, &binding)
+            .open_session(user.id, &binding, Some(SignedInWith::Passkey))
             .await
             .map_err(internal)?;
         let remembered = self
@@ -3182,6 +3220,7 @@ impl ClientProtocol {
         Ok(Reply::LoggedIn {
             session: SessionId(token.0),
             remembered,
+            password_change_required: false,
         })
     }
 
@@ -3512,6 +3551,7 @@ impl ClientProtocol {
         Ok(Reply::LoggedIn {
             session: SessionId(token.0),
             remembered: false,
+            password_change_required: false,
         })
     }
 
@@ -3543,6 +3583,7 @@ impl ClientProtocol {
                 Ok(Reply::LoggedIn {
                     session: SessionId(token.0),
                     remembered: true,
+                    password_change_required: false,
                 })
             }
             Ok(None) => {
@@ -3707,6 +3748,50 @@ impl ClientProtocol {
         if checked.id != user.user {
             return Err(Error::InvalidCredentials);
         }
+        Ok(())
+    }
+
+    /// Change `user`'s password from `change.current_password` (checked
+    /// as a sign-in checks it, so a one-time one works here) to
+    /// `change.new_password`. Every other session of theirs ends; this
+    /// one may do anything again if a one-time password opened it.
+    async fn change_password(
+        &self,
+        connection: &Connection,
+        session: &SessionId,
+        user: &SessionUser,
+        change: &spoolframe_protocol::ChangePassword,
+    ) -> Result<(), Error> {
+        self.confirm_password(connection, user, &change.current_password)
+            .await?;
+        if change.new_password == change.current_password {
+            return Err(Error::InvalidInput {
+                message: "choose a password other than the current one".into(),
+            });
+        }
+        let phc = auth::hash_password(&change.new_password)
+            .await
+            .map_err(|e| match e {
+                auth::PasswordError::TooShort => Error::InvalidInput {
+                    message: e.to_string(),
+                },
+                auth::PasswordError::Hash(_) => internal(e),
+            })?;
+        let revoked = self
+            .store()
+            .set_password(
+                &user.username,
+                &phc,
+                Some(&SessionToken(session.0.clone()).hash()),
+            )
+            .await
+            .map_err(internal)?;
+        tracing::info!(
+            username = %user.username,
+            revoked,
+            after_reset = user.password_change_only,
+            "password changed by its user on a device"
+        );
         Ok(())
     }
 
@@ -4424,6 +4509,7 @@ impl Asked {
                 proof: PinProof::Pin { .. },
             } => asked.credential = Some("wrong PIN"),
             Request::ConfirmPassword(_)
+            | Request::ChangePassword(_)
             | Request::SetPin {
                 proof: Some(PinProof::Password { .. }),
                 ..
@@ -4620,8 +4706,8 @@ fn invite_summary(record: crate::store::invites::InviteRecord) -> InviteSummary 
 
 /// P3-03's rule for what adds or takes away a way to sign in: `user`'s
 /// session proved who they are within [`RECENT_SIGN_IN`].
-fn recently_signed_in(user: &SessionUser) -> Result<(), Error> {
-    let age = crate::store::now() - user.authenticated_at;
+fn recently_signed_in(user: &SessionUser, now: i64) -> Result<(), Error> {
+    let age = now - user.authenticated_at;
     if age > RECENT_SIGN_IN.as_secs() as i64 {
         return Err(Error::RecentSignInRequired);
     }

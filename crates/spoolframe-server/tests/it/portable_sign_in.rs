@@ -103,6 +103,7 @@ fn session(response: Response) -> SessionId {
         Response::Ok(Reply::LoggedIn {
             session,
             remembered,
+            ..
         }) => {
             assert!(!remembered);
             session

@@ -376,6 +376,16 @@ pub enum Request {
     /// never a confirmation: it guards switching profiles on a shared
     /// device, and is weaker than a sign-in.
     ConfirmPassword(ConfirmPassword),
+    /// Change the session user's password: `Done`. `current_password` is
+    /// checked as `LoginPassword` checks it (a wrong one is
+    /// `InvalidCredentials`, counted towards the same limit). A
+    /// `new_password` the server does not take, or the same as the current
+    /// one, is `InvalidInput`. Every other session of the user's ends, on
+    /// the web and on devices. The way out of a session a one-time
+    /// password opened (`PasswordChangeRequired`): this session may then
+    /// do anything again. A user with no password gets `NoPassword`: set
+    /// one in the web UI. Not for a portable user (`NotForPortableUsers`).
+    ChangePassword(ChangePassword),
     /// Begin confirming it is the session user with one of their app
     /// passkeys (P3-19): `PasskeySignInBegun`, a nonce as for
     /// `BeginPasskeySignIn`, listing their app passkeys only. The nonce is
@@ -810,6 +820,20 @@ impl fmt::Debug for ConfirmPassword {
     }
 }
 
+/// The session user's password and the one to replace it with
+/// (`ChangePassword`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangePassword {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+impl fmt::Debug for ChangePassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ChangePassword { <redacted> }")
+    }
+}
+
 /// What proves a PIN change or removal is the user's (P2-08): the PIN
 /// they have, or, when it is forgotten, their account password.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -910,6 +934,14 @@ pub enum Reply {
         /// (P4-01): the sign-in asked to be remembered and it was (by the
         /// approver too, for a device sign-in), or the device already was.
         remembered: bool,
+        /// The password was a one-time one an admin reset to: show "Choose
+        /// a new password" and send `ChangePassword` (its current password
+        /// is the one-time one). Until then the session gets
+        /// `PasswordChangeRequired` for anything else but `Logout` and
+        /// `WhoAmI`, and the device is not trusted.
+        // compat(v1): required at the protocol reset
+        #[serde(default)]
+        password_change_required: bool,
     },
     /// The users this device is trusted for (`TrustedProfiles`), by
     /// username.
@@ -1448,6 +1480,11 @@ pub enum Error {
     /// and the session user is not one. Nothing was changed.
     #[error("only an admin can do that")]
     AdminRequired,
+    /// The session was opened with a one-time password an admin reset to:
+    /// it may only `ChangePassword` (or `Logout`, `WhoAmI`) until the user
+    /// chooses a new password. Nothing was done.
+    #[error("choose a new password first")]
+    PasswordChangeRequired,
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.

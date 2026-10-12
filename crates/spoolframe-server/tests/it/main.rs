@@ -33,6 +33,7 @@ mod nvdec;
 mod passkey_relay;
 mod passkey_setup;
 mod passkeys;
+mod password_reset;
 mod pin;
 mod playback;
 mod playback_authz;

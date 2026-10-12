@@ -628,6 +628,8 @@ impl Oidc {
                 nonce,
                 metadata,
                 began: now,
+                // The system's clock, not the store's: it is held against
+                // the ID token's `iat`, which the provider stamps by its own.
                 began_at: crate::store::now(),
                 source: source.map(str::to_owned),
             },

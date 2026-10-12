@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+- `network.wan.mapped_port.public_ip = "lookup"` looks the address up
+  again every hour, and after a failed lookup. It was looked up once at
+  start: a server started before its network was up advertised no
+  address, and one whose ISP changed its address kept the old one, until
+  a restart.
+
+- Measuring the upload works on slow uploads. Each upload was a fixed
+  10 MiB with 25 s to finish, so under about 3.4 Mbit/s, the homes the
+  budget matters most to, the measurement failed with no suggestion. A
+  1 MiB upload now sizes the measured ones to about 8 s each.
+
+- Plex watch sync follows `watch.started_after_secs` as it changes. It
+  took the threshold once, at start, so after a change in the web UI
+  the sync still judged what is in progress by the old one until a
+  restart.
+
+- A relay config (`spoolframe.relay.v1`) with no `server.addrs` is
+  refused at start, with the key named. The relay dials the main server
+  only there, so it loaded, asked nobody, and turned every device away,
+  the owner's included. The NixOS module's `server.addrs` needs one too.
+
+- A user an admin adds has their display name checked as one they set
+  themselves is: at most 64 characters, no line breaks or other control
+  characters. An admin could add a multi-line or kilobytes-long name
+  that "Who's watching" then showed.
+
+- An admin resets a user's password to a one-time one, shown once (the
+  web UI's Users page, Reset password › One-time password; the admin
+  API's `userResetPassword`; or `spoolframe-server user reset-password
+  <user>`). It works for 7 days.
+  Signing in with it gives a session that may only choose a new
+  password (or sign out), in the apps (`change_password`, a new request;
+  `logged_in.password_change_required`) and on the web, which opens
+  "Choose a new password" after such a sign-in. The reset ends
+  only what rested on the old password: sessions now record how they
+  were signed in (a password, a passkey, a sign-on provider or a
+  portable identity's credential), and a session a device approval or a
+  trusted device's resume made carries its parent's. The reset ends the
+  password ones and the devices trusted from them. Sessions made before
+  this release have no record of it, and a reset treats them as a
+  password's: they end too. A user can now change their own password
+  from an app as well (`change_password`). `user list` and the Users
+  page show a pending one-time password.
+
 - Two library or Plex server edits at once no longer lose one: an edit
   made from settings that changed meanwhile is refused with "changed
   meanwhile; look again and repeat the change". Saving a setting no
@@ -27,10 +71,14 @@
   instead of being saved while the catalog keeps the old one. A config
   reload that names one is refused the same way.
 
-- A device reaching the server over Tailscale or WireGuard no longer
-  counts as on the LAN for being at a private address: it shares the
-  uplink budget like any device outside the home. List the tunnel's
-  network in `network.lan_prefixes` to count it as home.
+- `network.wan_prefixes` (Settings › Remote access, "Always outside")
+  lists address ranges whose devices are off the LAN for the uplink
+  budget and Auto quality even at a private address: a WireGuard peer
+  known to be always away, as `10.10.0.7/32`. A device at a private,
+  carrier-grade NAT or unique local address (a WireGuard or Tailscale
+  peer too) is still on the LAN otherwise. Between a range there and
+  one in `network.lan_prefixes` that both hold an address, the longer
+  prefix decides, `wan_prefixes` on a tie.
 
 - Music and other files with no picture are held to the bitrate cap
   (the app's own, a chosen quality, the link's share and the uplink

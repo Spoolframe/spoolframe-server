@@ -195,6 +195,10 @@ pub mod error_code {
     pub const NO_SUCH_INVITE: i32 = -32025;
     /// Not a portable user with a grant here (P7-06).
     pub const NO_SUCH_GRANT: i32 = -32026;
+    /// The session was signed in with a one-time password an admin reset
+    /// to: it may only `me.setPassword` (with the one-time password as the
+    /// current one), `logout` or `whoAmI` until then.
+    pub const PASSWORD_CHANGE_REQUIRED: i32 = -32027;
 }
 
 /// Invites (P6-01): what an admin makes and sees of them.
@@ -385,6 +389,11 @@ pub struct LoggedIn {
     pub token: String,
     pub username: String,
     pub role: Role,
+    /// Signed in with a one-time password an admin reset to: show "Choose
+    /// a new password" (`me.setPassword`, the one-time password as the
+    /// current one). Every other call is `PASSWORD_CHANGE_REQUIRED` until
+    /// then.
+    pub password_change_required: bool,
 }
 
 impl fmt::Debug for LoggedIn {
@@ -393,6 +402,34 @@ impl fmt::Debug for LoggedIn {
             .field("token", &"<redacted>")
             .field("username", &self.username)
             .field("role", &self.role)
+            .field("password_change_required", &self.password_change_required)
+            .finish()
+    }
+}
+
+/// A one-time password an admin reset a user's to (`userResetPassword`):
+/// shown this once, since the server keeps only its hash.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OneTimePassword {
+    /// As the user types it: `QW7K-2MFP-XR4T-9HCD`.
+    pub password: String,
+    /// When it stops working, Unix seconds: then only another reset helps.
+    pub expires_at: i64,
+    /// The user's sessions it ended: those signed in with a password, or
+    /// from before sessions kept how they were signed in.
+    pub revoked_sessions: u64,
+    /// Devices no longer trusted for them, on the same rule.
+    pub untrusted_devices: u64,
+}
+
+impl fmt::Debug for OneTimePassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OneTimePassword")
+            .field("password", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("revoked_sessions", &self.revoked_sessions)
+            .field("untrusted_devices", &self.untrusted_devices)
             .finish()
     }
 }
@@ -412,6 +449,13 @@ pub struct UserInfo {
     /// When the password was set or last changed, Unix seconds; `None`
     /// without one.
     pub password_changed_at: Option<i64>,
+    /// The password is a one-time one an admin reset to, and the user has
+    /// not chosen a new one yet; `password_expires_at` says until when it
+    /// works.
+    pub password_must_change: bool,
+    /// When that one-time password stops working, Unix seconds.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub password_expires_at: Option<i64>,
     /// When any of their sessions was last used, Unix seconds; `None` if
     /// they have never signed in.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
@@ -3152,6 +3196,20 @@ pub trait AdminApi {
     #[method(name = "userSetPassword", with_extensions)]
     async fn user_set_password(&self, credentials: Credentials) -> jsonrpsee::core::RpcResult<()>;
 
+    /// Reset a user's password to a one-time one, shown this once: they
+    /// must choose a new one when they sign in with it, and it stops
+    /// working after 7 days. Ends their sessions signed in with a
+    /// password (or of unknown origin) and the devices trusted from them;
+    /// passkey, sign-on provider and portable identity sessions stay, as
+    /// do their passkeys, provider links and ties. Needs a recent sign-in
+    /// (PX-10): `RECENT_SIGN_IN_REQUIRED` otherwise. Not the caller's own
+    /// password (`INVALID_INPUT`: use `me.setPassword`).
+    #[method(name = "userResetPassword", with_extensions)]
+    async fn user_reset_password(
+        &self,
+        username: String,
+    ) -> jsonrpsee::core::RpcResult<OneTimePassword>;
+
     /// Change a user's role. The last enabled admin cannot be demoted
     /// (`LAST_ADMIN`). Takes effect on their next call, on every session.
     /// Making an admin needs a recent sign-in (PX-10), as
@@ -3750,6 +3808,8 @@ mod required_field_tests {
                 disabled: false,
                 has_password: true,
                 password_changed_at: None,
+                password_must_change: true,
+                password_expires_at: Some(1),
                 last_seen_at: None,
                 has_passkey: false,
                 has_sso: false,
@@ -3759,7 +3819,13 @@ mod required_field_tests {
                 rate_limited_secs: None,
                 portable: None,
             },
-            &["displayName", "lastSeenAt", "portable"],
+            &[
+                "displayName",
+                "lastSeenAt",
+                "portable",
+                "passwordMustChange",
+                "passwordExpiresAt",
+            ],
         );
         assert_each_required(
             &NewUser {

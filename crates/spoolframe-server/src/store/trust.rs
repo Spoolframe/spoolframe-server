@@ -5,7 +5,7 @@
 //! session or for a device the user has signed in on, it never outlives
 //! what ends it, and at most one user opens by itself on a device.
 
-use super::sessions::SessionBinding;
+use super::sessions::{SessionBinding, SignedInWith, Stamp};
 use super::users::LocalUserId;
 use super::{Store, StoreError};
 
@@ -59,12 +59,14 @@ impl Store {
     pub async fn remember_session_device(&self, token_hash: &str) -> Result<bool, StoreError> {
         let now = self.now();
         let made = sqlx::query(
-            "INSERT INTO trusted_endpoints (user_id, endpoint_id, created_at, last_used_at) \
-             SELECT s.user_id, s.endpoint_id, ?2, ?2 \
+            "INSERT INTO trusted_endpoints \
+               (user_id, endpoint_id, created_at, last_used_at, signed_in_with) \
+             SELECT s.user_id, s.endpoint_id, ?2, ?2, s.signed_in_with \
              FROM sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.token_hash = ?1 AND s.kind = 'endpoint' AND s.revoked_at IS NULL \
                AND s.expires_at > ?2 AND u.disabled_at IS NULL \
-             ON CONFLICT (user_id, endpoint_id) DO UPDATE SET last_used_at = excluded.last_used_at",
+             ON CONFLICT (user_id, endpoint_id) DO UPDATE SET \
+               last_used_at = excluded.last_used_at, signed_in_with = excluded.signed_in_with",
         )
         .bind(token_hash)
         .bind(now)
@@ -264,19 +266,21 @@ impl Store {
         };
         let now = self.now();
         let mut tx = self.begin_write().await?;
-        let renewed = sqlx::query(
+        // The trust's own sign-in method comes back with it: the session
+        // rests on whatever the session that trusted the device did.
+        let renewed: Option<(Option<String>,)> = sqlx::query_as(
             "UPDATE trusted_endpoints SET last_used_at = ?3 \
              WHERE user_id = ?1 AND endpoint_id = ?2 AND last_used_at > ?4 \
-               AND EXISTS (SELECT 1 FROM users u WHERE u.id = ?1 AND u.disabled_at IS NULL)",
+               AND EXISTS (SELECT 1 FROM users u WHERE u.id = ?1 AND u.disabled_at IS NULL) \
+             RETURNING signed_in_with",
         )
         .bind(user)
         .bind(endpoint_id)
         .bind(now)
         .bind(now - idle_secs)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if renewed == 0 {
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((signed_in_with,)) = renewed else {
             sqlx::query(
                 "DELETE FROM trusted_endpoints \
                  WHERE user_id = ?1 AND endpoint_id = ?2 AND last_used_at <= ?3",
@@ -288,11 +292,23 @@ impl Store {
             .await?;
             tx.commit().await?;
             return Ok(Resumed::Refused);
-        }
+        };
         // Nobody proved who they are: the device did. Until its user
         // confirms, the session makes no change that needs a recent
         // sign-in (PX-09).
-        Self::insert_session(&mut tx, token_hash, user, binding, expires_at, now, 0).await?;
+        Self::insert_session(
+            &mut tx,
+            token_hash,
+            user,
+            binding,
+            expires_at,
+            Stamp {
+                now,
+                authenticated_at: 0,
+                signed_in_with: SignedInWith::from_column(signed_in_with.as_deref()),
+            },
+        )
+        .await?;
         tx.commit().await?;
         Ok(Resumed::Session)
     }
@@ -344,7 +360,7 @@ mod tests {
         let store = test_store(test).await;
         let alice = user(&store, "alice").await;
         store
-            .create_session("alice-tv", alice, &on("tv"), now() + 3600)
+            .create_session("alice-tv", alice, &on("tv"), now() + 3600, None)
             .await
             .unwrap();
         assert!(store.remember_session_device("alice-tv").await.unwrap());
@@ -395,7 +411,7 @@ mod tests {
         let (store, _alice) = alice_trusted_on_tv("trust-cross-user").await;
         let bob = user(&store, "bob").await;
         store
-            .create_session("bob-tv", bob, &on("tv"), now() + 3600)
+            .create_session("bob-tv", bob, &on("tv"), now() + 3600, None)
             .await
             .unwrap();
         assert_eq!(resume(&store, "r", bob, "tv").await, Resumed::Refused);
@@ -407,7 +423,7 @@ mod tests {
         let store = test_store("trust-revoked-first").await;
         let alice = user(&store, "alice").await;
         store
-            .create_session("h", alice, &on("tv"), now() + 3600)
+            .create_session("h", alice, &on("tv"), now() + 3600, None)
             .await
             .unwrap();
         store.revoke_session("h").await.unwrap();
@@ -415,7 +431,7 @@ mod tests {
         assert!(!store.device_trusted(alice, "tv").await.unwrap());
         // Nor does an API session, which has no device.
         store
-            .create_session("web", alice, &SessionBinding::Api, now() + 3600)
+            .create_session("web", alice, &SessionBinding::Api, now() + 3600, None)
             .await
             .unwrap();
         assert!(!store.remember_session_device("web").await.unwrap());
@@ -484,12 +500,12 @@ mod tests {
     async fn every_password_change_ends_all_of_the_user_s_trust() {
         let (store, alice) = alice_trusted_on_tv("trust-password").await;
         store
-            .create_session("alice-laptop", alice, &on("laptop"), now() + 3600)
+            .create_session("alice-laptop", alice, &on("laptop"), now() + 3600, None)
             .await
             .unwrap();
         store.remember_session_device("alice-laptop").await.unwrap();
         store
-            .create_session("web", alice, &SessionBinding::Api, now() + 3600)
+            .create_session("web", alice, &SessionBinding::Api, now() + 3600, None)
             .await
             .unwrap();
         // The web session that changes it is kept; trust is not.
@@ -516,7 +532,7 @@ mod tests {
     async fn revoking_a_session_ends_that_device_s_trust_only() {
         let (store, alice) = alice_trusted_on_tv("trust-revoke").await;
         store
-            .create_session("alice-laptop", alice, &on("laptop"), now() + 3600)
+            .create_session("alice-laptop", alice, &on("laptop"), now() + 3600, None)
             .await
             .unwrap();
         store.remember_session_device("alice-laptop").await.unwrap();
@@ -529,7 +545,7 @@ mod tests {
     async fn signing_out_everywhere_else_ends_every_other_device_s_trust() {
         let (store, alice) = alice_trusted_on_tv("trust-others").await;
         store
-            .create_session("alice-laptop", alice, &on("laptop"), now() + 3600)
+            .create_session("alice-laptop", alice, &on("laptop"), now() + 3600, None)
             .await
             .unwrap();
         store.remember_session_device("alice-laptop").await.unwrap();
@@ -552,7 +568,7 @@ mod tests {
     async fn a_session_nobody_holds_is_discarded_without_touching_trust() {
         let (store, alice) = alice_trusted_on_tv("trust-discard").await;
         store
-            .create_session("unheld", alice, &on("tv"), now() + 3600)
+            .create_session("unheld", alice, &on("tv"), now() + 3600, None)
             .await
             .unwrap();
         store.discard_unheld_session("unheld").await.unwrap();
@@ -584,7 +600,7 @@ mod tests {
         let alice = user(&store, "alice").await;
         let bob = user(&store, "bob").await;
         store
-            .create_session("bob-tv", bob, &on("tv"), now() + 3600)
+            .create_session("bob-tv", bob, &on("tv"), now() + 3600, None)
             .await
             .unwrap();
         assert!(matches!(
@@ -607,7 +623,7 @@ mod tests {
         let (store, alice) = alice_trusted_on_tv("trust-auto").await;
         let bob = user(&store, "bob").await;
         store
-            .create_session("bob-tv", bob, &on("tv"), now() + 3600)
+            .create_session("bob-tv", bob, &on("tv"), now() + 3600, None)
             .await
             .unwrap();
         store.set_pin(alice, "pin", 4).await.unwrap();
@@ -653,7 +669,7 @@ mod tests {
     async fn the_devices_list_says_which_are_trusted() {
         let (store, alice) = alice_trusted_on_tv("trust-devices").await;
         store
-            .create_session("alice-laptop", alice, &on("laptop"), now() + 3600)
+            .create_session("alice-laptop", alice, &on("laptop"), now() + 3600, None)
             .await
             .unwrap();
         store
@@ -672,5 +688,48 @@ mod tests {
             devices,
             [("laptop".into(), false, false), ("tv".into(), true, true)]
         );
+    }
+
+    /// A password reset forgets the devices trusted from a password's
+    /// session (or one of unknown origin), and keeps a passkey's; a resume
+    /// carries on how its trust was signed in.
+    #[tokio::test]
+    async fn a_reset_forgets_trust_that_rested_on_the_password() {
+        let store = test_store("trust-reset").await;
+        let alice = user(&store, "alice").await;
+        for (hash, endpoint, with) in [
+            ("on-tv", "tv", Some(SignedInWith::Password)),
+            ("on-phone", "phone", Some(SignedInWith::Passkey)),
+            ("on-laptop", "laptop", None),
+        ] {
+            store
+                .create_session(hash, alice, &on(endpoint), now() + 3600, with)
+                .await
+                .unwrap();
+            assert!(store.remember_session_device(hash).await.unwrap());
+        }
+        let reset = store
+            .reset_password("alice", "one-time phc", now() + 3600)
+            .await
+            .unwrap();
+        assert_eq!((reset.revoked, reset.untrusted), (2, 2));
+        assert_eq!(
+            resume(&store, "again-tv", alice, "tv").await,
+            Resumed::Refused
+        );
+        assert_eq!(
+            resume(&store, "again-laptop", alice, "laptop").await,
+            Resumed::Refused
+        );
+        assert_eq!(
+            resume(&store, "again-phone", alice, "phone").await,
+            Resumed::Session
+        );
+        let resumed = store
+            .use_endpoint_session("again-phone", "phone", 3600)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.signed_in_with, Some(SignedInWith::Passkey));
     }
 }

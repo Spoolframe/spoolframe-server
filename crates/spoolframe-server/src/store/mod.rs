@@ -26,7 +26,7 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 /// The database file's name inside the state directory.
 pub const DB_FILE: &str = "spoolframe.db";
@@ -192,6 +192,14 @@ impl Store {
             .filename(&path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            // NORMAL, not sqlx's FULL: under WAL a commit then writes the
+            // log without an fsync, which only a checkpoint does. A crash
+            // of the server loses nothing; a power loss or a crash of the
+            // host can lose the last commits before it, never the
+            // database's consistency. What is written often (progress,
+            // session renewals) a device sends again anyway, and FULL
+            // paid an fsync for each of those writes.
+            .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
@@ -298,6 +306,20 @@ pub(crate) mod tests {
         let dir = state_dir(test).await;
         let store = Store::open(dir.as_ref()).await.unwrap();
         TestStore { store, _dir: dir }
+    }
+
+    /// WAL with synchronous NORMAL (review 2026-10-11 M21): no fsync per
+    /// commit, only per checkpoint.
+    #[tokio::test]
+    async fn commits_are_not_synced_one_by_one() {
+        let store = test_store("synchronous").await;
+        let mut conn = store.pool.acquire().await.unwrap();
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        // 1 is NORMAL; sqlx's default, FULL, is 2.
+        assert_eq!(synchronous, 1);
     }
 
     #[tokio::test]

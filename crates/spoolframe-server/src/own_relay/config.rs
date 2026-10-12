@@ -234,6 +234,15 @@ fn server(file: &ServerFile) -> Result<EndpointAddr, RelayConfigError> {
     for text in file.addrs.iter().flatten() {
         addrs.push(TransportAddr::Ip(addr("server.addrs", text)?));
     }
+    // The relay dials the server only at these: it has no relay and no
+    // lookup of its own, so with none it could ask nobody who is the
+    // owner's, and would turn every device away, the owner's included.
+    if addrs.is_empty() {
+        return Err(invalid(
+            "server.addrs",
+            "where the relay dials the main server, as [\"ip:port\", …]: at least one".into(),
+        ));
+    }
     Ok(EndpointAddr::from_parts(id, addrs))
 }
 
@@ -348,6 +357,28 @@ mod tests {
             "schema = \"spoolframe.relay.v1\";\nserver {{ key = \"{}\"; addrs = [\"10.0.0.2:7430\"]; }}\n{rest}",
             key()
         ))
+    }
+
+    /// A relay that cannot dial the server cannot ask it anything
+    /// (review 2026-10-11 M32): refused, the key named.
+    #[test]
+    fn a_server_with_nowhere_to_dial_is_refused() {
+        for addrs in ["", "addrs = [];"] {
+            let text = format!(
+                "schema = \"spoolframe.relay.v1\";\nserver {{ key = \"{}\"; {addrs} }}\ntls {{ mode = \"proxy\"; }}",
+                key()
+            );
+            assert!(
+                matches!(
+                    RelayConfig::parse(&text),
+                    Err(RelayConfigError::Invalid {
+                        key: "server.addrs",
+                        ..
+                    })
+                ),
+                "{addrs:?}"
+            );
+        }
     }
 
     #[test]

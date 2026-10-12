@@ -82,10 +82,9 @@ in {
         description = "The main server's key (`spoolframe-server id`'s endpoint id).";
       };
       addrs = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [];
+        type = lib.types.nonEmptyListOf lib.types.str;
         example = ["10.10.0.6:7420"];
-        description = "Where the relay dials the main server, as `ip:port`.";
+        description = "Where the relay dials the main server, as `ip:port`: at least one.";
       };
     };
 

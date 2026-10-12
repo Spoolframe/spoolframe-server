@@ -255,13 +255,38 @@ struct OnServer {
     libraries: Vec<String>,
 }
 
+/// The watch rules' threshold for "in progress" a sync judges by.
+#[derive(Clone)]
+pub enum StartedAfter {
+    /// The same for the server's life (tests).
+    Fixed(Duration),
+    /// The live rules' (`watch.started_after_secs` changes at run time),
+    /// read at each run.
+    Rules(Arc<crate::watch::Watch>),
+}
+
+impl StartedAfter {
+    fn get(&self) -> Duration {
+        match self {
+            Self::Fixed(started) => *started,
+            Self::Rules(watch) => watch.rules().started_after,
+        }
+    }
+}
+
+impl From<Duration> for StartedAfter {
+    fn from(started: Duration) -> Self {
+        Self::Fixed(started)
+    }
+}
+
 /// The watch sync of every linked user.
 pub struct WatchSync {
     /// The Plex servers and libraries as they are at each run: live
     /// settings (P3-10, P3-11).
     catalog: Arc<LiveCatalog>,
     accounts: Arc<PlexAccounts>,
-    started: Duration,
+    started: StartedAfter,
     interval: Duration,
     users: Mutex<HashMap<LocalUserId, Arc<UserRuns>>>,
     /// The section an item only Spoolframe knows is in, by PMS address and
@@ -304,18 +329,18 @@ fn why(server: &str, e: &CatalogError) -> String {
 
 impl WatchSync {
     /// The sync of every user `accounts` links. `started` is the watch
-    /// rules' threshold for "in progress"; `interval` how often each user
-    /// is synced when nothing changes.
+    /// rules' threshold for "in progress", read at each run; `interval`
+    /// how often each user is synced when nothing changes.
     pub fn new(
         catalog: Arc<LiveCatalog>,
         accounts: Arc<PlexAccounts>,
-        started: Duration,
+        started: impl Into<StartedAfter>,
         interval: Duration,
     ) -> Self {
         Self {
             catalog,
             accounts,
-            started,
+            started: started.into(),
             interval,
             users: Mutex::default(),
             sections: Mutex::default(),
@@ -386,7 +411,7 @@ impl WatchSync {
             }
         }
         if !dry_run {
-            *runs.last.lock() = Some(report.run(crate::store::now()));
+            *runs.last.lock() = Some(report.run(self.accounts.store().now()));
         }
         Ok(report)
     }
@@ -566,6 +591,8 @@ impl WatchSync {
         let Principal::LocalUser(user) = principal else {
             return;
         };
+        // The rules as they are now: they change at run time.
+        let started = self.started.get();
         let keys: HashSet<String> = on.sections.keys().cloned().collect();
         let plex = match on.plex.watch_states(Some(&keys)).await {
             Ok(plex) => plex,
@@ -596,7 +623,7 @@ impl WatchSync {
             .iter()
             .map(|w| (w.id.clone(), w.section.clone()))
             .collect();
-        let here = only_here(&rows, &plex, self.started);
+        let here = only_here(&rows, &plex, started);
         section.extend(self.sections_of(&on.plex, &here).await);
         let direction = |id: &MediaId| {
             section
@@ -605,7 +632,7 @@ impl WatchSync {
                 .copied()
                 .unwrap_or(SyncDirection::Off)
         };
-        let planned = plan(&rows, &plex, self.started, direction);
+        let planned = plan(&rows, &plex, started, direction);
         report.skipped += planned.skipped;
         let by_id: HashMap<&MediaId, &PlexWatch> = plex.iter().map(|w| (&w.id, w)).collect();
         for action in planned.actions {
@@ -762,7 +789,7 @@ impl WatchSync {
             Err(e) => {
                 tracing::warn!(user = %user, error = %e, "Plex watch sync; trying again later");
                 *self.runs(user).last.lock() = Some(PlexSyncRun {
-                    at: crate::store::now(),
+                    at: self.accounts.store().now(),
                     notes: vec![format!("Not synced: {e}")],
                     ..PlexSyncRun::default()
                 });
@@ -828,6 +855,32 @@ async fn wait_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sync judges "in progress" by the rules as they are at its run,
+    /// not as they were at start (review 2026-10-11 M27).
+    #[tokio::test]
+    async fn the_live_rules_threshold_is_read_at_each_run() {
+        use crate::watch::{Watch, WatchRules};
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-sync-started").await;
+        let store = crate::store::Store::open(dir.as_ref()).await.unwrap();
+        let watch = Arc::new(Watch::new(
+            store,
+            Arc::new(LiveCatalog::default()),
+            Arc::new(spoolframe_media::Prober::new(
+                spoolframe_media::sandbox::Tool::unconfined("ffprobe"),
+                spoolframe_media::Prober::DEFAULT_TIMEOUT,
+            )),
+            WatchRules::default(),
+        ));
+        let started = StartedAfter::Rules(watch.clone());
+        let later = Duration::from_secs(600);
+        assert_ne!(started.get(), later);
+        watch.set_rules(WatchRules {
+            started_after: later,
+            ..WatchRules::default()
+        });
+        assert_eq!(started.get(), later);
+    }
 
     const STARTED: Duration = Duration::from_secs(60);
 

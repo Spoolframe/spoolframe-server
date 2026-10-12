@@ -454,6 +454,7 @@ fn every_reply_round_trips() {
         Reply::LoggedIn {
             session: SessionId("s".into()),
             remembered: false,
+            password_change_required: true,
         },
         Reply::TrustedProfiles {
             profiles: vec![crate::TrustedProfile {
@@ -2214,5 +2215,57 @@ fn an_identity_record_by_handle_is_its_hex() {
             serde_json::json!({"type": "identity_record_by_handle", "handle": "ab"})
         )
         .is_err()
+    );
+}
+
+/// A server from before one-time passwords sends `LoggedIn` without
+/// `password_change_required`: read as false, not refused.
+#[test]
+fn a_logged_in_without_password_change_required_decodes_as_false() {
+    #[derive(Serialize)]
+    struct LoggedIn {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        session: SessionId,
+        remembered: bool,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Response {
+        Ok(LoggedIn),
+    }
+    let bytes = codec::encode(&Response::Ok(LoggedIn {
+        kind: "logged_in",
+        session: SessionId("s".into()),
+        remembered: true,
+    }))
+    .unwrap();
+    let decoded = codec::decode::<crate::Response>(&bytes).unwrap();
+    assert!(
+        matches!(
+            decoded,
+            crate::Response::Ok(Reply::LoggedIn {
+                remembered: true,
+                password_change_required: false,
+                ..
+            })
+        ),
+        "{decoded:?}"
+    );
+}
+
+/// `ChangePassword` round-trips, and its debug form shows no password.
+#[test]
+fn a_change_password_keeps_its_passwords_out_of_the_log() {
+    let request = Request::ChangePassword(crate::ChangePassword {
+        current_password: "ABCD-EFGH-JKMN-PQRS".into(),
+        new_password: "correct horse battery".into(),
+    });
+    let bytes = codec::encode(&request).unwrap();
+    assert_eq!(codec::decode::<Request>(&bytes).unwrap(), request);
+    let shown = format!("{request:?}");
+    assert!(
+        !shown.contains("ABCD") && !shown.contains("horse"),
+        "{shown}"
     );
 }

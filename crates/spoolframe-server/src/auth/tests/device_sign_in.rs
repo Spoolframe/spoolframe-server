@@ -65,7 +65,7 @@ impl Approvals {
         let claim = self.auth.sign_ins().claim(code, Some("phone")).ok()?;
         Some(
             self.auth
-                .approve_device(self.alice, &claim, false)
+                .approve_device(self.alice, &claim, false, None)
                 .await
                 .unwrap(),
         )
@@ -216,8 +216,40 @@ async fn an_approval_outrun_by_the_code_leaves_no_session() {
     a.clock.advance(LIFETIME);
     assert_eq!(a.wait(&started.request, "tv").await, Outcome::Expired);
     assert_eq!(
-        a.auth.approve_device(a.alice, &claim, false).await.unwrap(),
+        a.auth
+            .approve_device(a.alice, &claim, false, None)
+            .await
+            .unwrap(),
         Approval::Expired
     );
     assert_eq!(a.sessions_on_tv().await, 0);
+}
+
+/// An approval whose request is dropped part-way still ends one way or
+/// the other (review 2026-10-11 M39): the device gets its session, which
+/// is not left open with nobody holding it, nor the code claimed until it
+/// runs out.
+#[tokio::test]
+async fn an_approval_dropped_part_way_still_hands_the_session_over() {
+    let a = approvals("dropped").await;
+    let started = a.tv_begins();
+    let tv = a.tv_awaits(&started.request);
+    let claim = a
+        .auth
+        .sign_ins()
+        .claim(&started.code, Some("phone"))
+        .unwrap();
+    // Polled once, then dropped, as a request whose connection closes.
+    let approving = a.auth.approve_device(a.alice, &claim, false, None);
+    assert!(
+        tokio::time::timeout(Duration::ZERO, approving)
+            .await
+            .is_err()
+    );
+    let told = tokio::time::timeout(Duration::from_secs(10), tv)
+        .await
+        .expect("the TV is told")
+        .unwrap();
+    assert!(matches!(told, Outcome::Approved(_)), "{told:?}");
+    assert_eq!(a.sessions_on_tv().await, 1);
 }

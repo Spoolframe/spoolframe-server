@@ -808,7 +808,11 @@ impl Client {
     }
 
     /// Sign `username` in on server `endpoint_id` with a password (§22),
-    /// and keep the session. With `remember` ("Remember this device",
+    /// and keep the session. A one-time password an admin reset to gives a
+    /// session whose [`Session::password_change_required`] is true: show
+    /// "Choose a new password" and call [`Session::change_password`] with
+    /// the one-time password as the current one; until then every other
+    /// request of the session's is [`SdkError::PasswordChangeRequired`]. With `remember` ("Remember this device",
     /// never ticked by default), the server trusts this device for them
     /// (P4-01): once the session ends, [`Client::resume_profile`] opens
     /// it again without a password, until they sign out here.
@@ -826,18 +830,23 @@ impl Client {
             password: password.to_owned(),
             remember,
         });
-        let (token, remembered) = match self.call(server, None, login).await? {
-            Response::Ok(Reply::LoggedIn {
-                session,
-                remembered,
-            }) => (session, remembered),
-            Response::Ok(other) => {
-                return Err(SdkError::Protocol(format!("login answered {other:?}")));
-            }
-            Response::Err(e) => return Err(SdkError::from_server(e)),
-        };
-        self.keep_session(server, token, Some(SignInMethod::Password), remembered)
-            .await
+        let (token, remembered, password_change_required) =
+            match self.call(server, None, login).await? {
+                Response::Ok(Reply::LoggedIn {
+                    session,
+                    remembered,
+                    password_change_required,
+                }) => (session, remembered, password_change_required),
+                Response::Ok(other) => {
+                    return Err(SdkError::Protocol(format!("login answered {other:?}")));
+                }
+                Response::Err(e) => return Err(SdkError::from_server(e)),
+            };
+        let mut session = self
+            .keep_session(server, token, Some(SignInMethod::Password), remembered)
+            .await?;
+        session.password_change_required = password_change_required;
+        Ok(session)
     }
 
     /// The users this device is trusted for on server `endpoint_id`
@@ -880,6 +889,7 @@ impl Client {
             Response::Ok(Reply::LoggedIn {
                 session,
                 remembered,
+                ..
             }) => (session, remembered),
             Response::Ok(other) => {
                 return Err(SdkError::Protocol(format!(
@@ -960,6 +970,7 @@ impl Client {
             Response::Ok(Reply::LoggedIn {
                 session,
                 remembered,
+                ..
             }) => (session, remembered),
             Response::Ok(other) => {
                 return Err(SdkError::Protocol(format!(
@@ -1035,6 +1046,7 @@ impl Client {
                 Response::Ok(Reply::LoggedIn {
                     session,
                     remembered,
+                    ..
                 }) => {
                     return self
                         .keep_session(server, session, Some(SignInMethod::Device), remembered)
@@ -1119,6 +1131,7 @@ impl Client {
             token,
             user,
             remembered: Some(remembered),
+            password_change_required: false,
         })
     }
 
@@ -1155,6 +1168,7 @@ impl Client {
                     token,
                     user,
                     remembered: None,
+                    password_change_required: false,
                 }),
                 Response::Err(spoolframe_protocol::Error::Unauthenticated) => {
                     tracing::info!(

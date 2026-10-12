@@ -59,7 +59,10 @@ async fn set_up_with_a_passkey(
     assert_eq!(done.status(), StatusCode::OK);
     let session = cookie(&done);
     let body: Value = done.json().await.unwrap();
-    assert_eq!(body, json!({ "username": "root", "role": "admin" }));
+    assert_eq!(
+        body,
+        json!({ "username": "root", "role": "admin", "passwordChangeRequired": false })
+    );
     let token = session.split_once('=').unwrap().1.to_owned();
     (addr, token, dir)
 }

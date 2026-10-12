@@ -33,7 +33,7 @@ use spoolframe_server::passkeys::Passkeys;
 use spoolframe_server::playback::Playbacks;
 use spoolframe_server::playback_debug::PlaybackDebug;
 use spoolframe_server::plex_accounts::{PlexAccounts, configured_owner};
-use spoolframe_server::plex_sync::WatchSync;
+use spoolframe_server::plex_sync::{StartedAfter, WatchSync};
 use spoolframe_server::previews::{self, PreviewSources, Previews};
 use spoolframe_server::runtime::{self, Live, RuntimeSettings, reload};
 use spoolframe_server::store::Store;
@@ -901,7 +901,7 @@ async fn run(
     let plex_sync = Arc::new(WatchSync::new(
         live.clone(),
         accounts.clone(),
-        watch.rules().started_after,
+        StartedAfter::Rules(watch.clone()),
         config
             .plex
             .as_ref()

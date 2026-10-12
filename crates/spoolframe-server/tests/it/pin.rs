@@ -692,6 +692,7 @@ async fn a_user_without_a_password_proves_it_with_the_pin() {
                 platform: Platform::Linux,
             },
             i64::MAX / 2,
+            None,
         )
         .await
         .unwrap();

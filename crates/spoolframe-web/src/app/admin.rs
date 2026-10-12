@@ -436,6 +436,16 @@ fn Status(user: UserInfo) -> Element {
         UserStatus::Limited(why) => {
             rsx! { span { class: "state state-warn", title: "{why}", "Rate limited" } }
         }
+        UserStatus::OneTimePassword(until) => {
+            let why = match until {
+                Some(at) => format!(
+                    "Their password was reset; the one-time password works until {}.",
+                    crate::logic::date(at)
+                ),
+                None => "Their password was reset to a one-time one.".to_owned(),
+            };
+            rsx! { span { class: "state state-warn", title: "{why}", "One-time password" } }
+        }
         UserStatus::Active => rsx! { span { class: "state state-ok", "Active" } },
     }
 }
@@ -456,16 +466,22 @@ fn OnlyYou(on_add: EventHandler<()>) -> Element {
     }
 }
 
-/// "Set a new password for <username>" (WebUsersStates, 3), saying what
-/// it does to `name`, the name the pages show. `on_done` gets what to
-/// say, or `None` when cancelled.
+/// "Reset <username>'s password" (WebUsersStates, 3), saying what it does
+/// to `name`, the name the pages show: a one-time password they change
+/// when they sign in with it (shown here once), or one the admin sets.
+/// One's own is only set: a one-time password is for someone else.
+/// `on_done` gets what to say, or `None` when cancelled.
 #[component]
 fn ResetPassword(
     username: String,
     name: String,
     on_done: EventHandler<Option<(bool, String)>>,
 ) -> Element {
+    let me = use_context::<UserInfo>();
+    let own = me.username == username;
+    let mut one_time = use_signal(move || !own);
     let password = use_signal(String::new);
+    let mut made = use_signal(|| None::<spoolframe_admin_api::OneTimePassword>);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let confirming = use_signal(|| None::<String>);
@@ -474,20 +490,39 @@ fn ResetPassword(
         busy.set(true);
         let username = owner.clone();
         spawn(async move {
-            let set = async {
-                let client = rpc::client().await?;
-                client
+            let client = match rpc::client().await {
+                Ok(client) => client,
+                Err(e) => {
+                    error.set(Some(e.explain()));
+                    busy.set(false);
+                    return;
+                }
+            };
+            if one_time() {
+                match client
+                    .user_reset_password(username.clone())
+                    .await
+                    .map_err(rpc::error)
+                {
+                    Ok(otp) => made.set(Some(otp)),
+                    Err(e) if asks_to_confirm(&e, confirming, "resetting a password") => {}
+                    Err(e) => error.set(Some(user_change_error(&e, &username))),
+                }
+            } else {
+                let set = client
                     .user_set_password(spoolframe_admin_api::Credentials {
                         username: username.clone(),
                         password: password(),
                     })
                     .await
-                    .map_err(rpc::error)
-            };
-            match set.await {
-                Ok(()) => on_done.call(Some((true, format!("New password set for {username}")))),
-                Err(e) if asks_to_confirm(&e, confirming, "setting a password") => {}
-                Err(e) => error.set(Some(user_change_error(&e, &username))),
+                    .map_err(rpc::error);
+                match set {
+                    Ok(()) => {
+                        on_done.call(Some((true, format!("New password set for {username}"))));
+                    }
+                    Err(e) if asks_to_confirm(&e, confirming, "setting a password") => {}
+                    Err(e) => error.set(Some(user_change_error(&e, &username))),
+                }
             }
             busy.set(false);
         });
@@ -496,21 +531,84 @@ fn ResetPassword(
         e.prevent_default();
         attempt.call(());
     };
+    if let Some(otp) = made() {
+        let until = crate::logic::date(otp.expires_at);
+        let ended = otp.revoked_sessions;
+        return rsx! {
+            div { class: "scrim",
+                div { class: "dialog w-[440px]", role: "dialog",
+                    div { class: "dialog-head",
+                        icons::Key { size: 22 }
+                        h1 { "One-time password for {username}" }
+                    }
+                    code { class: "block select-all rounded-lg bg-ctp-surface0 px-4 py-3 text-center font-mono text-lg tracking-wider", "{otp.password}" }
+                    span { class: "hint",
+                        "Give it to {name}. It works until {until}, and they choose their own password when they sign in with it. It is shown only now."
+                    }
+                    if ended > 0 {
+                        span { class: "hint", "{ended} of their sessions signed in with the old password ended." }
+                    }
+                    div { class: "dialog-actions",
+                        button {
+                            class: "btn-dialog btn-dialog-primary",
+                            r#type: "button",
+                            onclick: {
+                                let username = username.clone();
+                                move |_| on_done.call(Some((true, format!("{username}'s password was reset"))))
+                            },
+                            "Done"
+                        }
+                    }
+                }
+            }
+        };
+    }
     rsx! {
         div { class: "scrim",
             form { class: "dialog w-[440px]", role: "dialog", onsubmit: submit,
                 div { class: "dialog-head",
                     icons::Key { size: 22 }
-                    h1 { "Set a new password for {username}" }
+                    h1 { "Reset {username}'s password" }
                 }
-                Field { label: "New password", value: password, kind: "password", autocomplete: "new-password" }
-                span { class: "hint", "{name} will be signed out on every device, and needs the new password to sign in again." }
+                if !own {
+                    div { class: "seg", role: "radiogroup", aria_label: "How",
+                        button {
+                            class: if one_time() { "seg-item seg-item-on" } else { "seg-item" },
+                            r#type: "button",
+                            role: "radio",
+                            aria_checked: "{one_time()}",
+                            onclick: move |_| one_time.set(true),
+                            "One-time password"
+                        }
+                        button {
+                            class: if one_time() { "seg-item" } else { "seg-item seg-item-on" },
+                            r#type: "button",
+                            role: "radio",
+                            aria_checked: "{!one_time()}",
+                            onclick: move |_| one_time.set(false),
+                            "Set a password"
+                        }
+                    }
+                }
+                if one_time() {
+                    span { class: "hint",
+                        "{name} gets a one-time password to sign in with, and chooses their own then. Their sessions signed in with a password end; those signed in with a passkey or a sign-in provider stay."
+                    }
+                } else {
+                    Field { label: "New password", value: password, kind: "password", autocomplete: "new-password" }
+                    span { class: "hint", "{name} will be signed out on every device, and needs the new password to sign in again." }
+                }
                 if let Some(text) = error() {
                     Alert { text }
                 }
                 div { class: "dialog-actions",
                     button { class: "btn-dialog btn-dialog-grey", r#type: "button", onclick: move |_| on_done.call(None), "Cancel" }
-                    button { class: "btn-dialog btn-dialog-primary", r#type: "submit", disabled: busy(), "Set password" }
+                    button {
+                        class: "btn-dialog btn-dialog-primary",
+                        r#type: "submit",
+                        disabled: busy(),
+                        if one_time() { "Make one-time password" } else { "Set password" }
+                    }
                 }
             }
         }
@@ -695,6 +793,7 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
                         match user_status(&user) {
                             UserStatus::Disabled => rsx! { "Disabled" },
                             UserStatus::Limited(why) => rsx! { span { class: "text-ctp-yellow", title: "{why}", "Rate limited" } },
+                            UserStatus::OneTimePassword(_) => rsx! { span { class: "text-ctp-yellow", "One-time password" } },
                             UserStatus::Active => rsx! { "Active" },
                         }
                     }

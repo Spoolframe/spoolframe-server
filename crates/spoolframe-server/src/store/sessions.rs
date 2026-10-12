@@ -22,6 +22,45 @@ pub enum SessionBinding {
     Api,
 }
 
+/// How a session was signed in: what a password reset looks at to end
+/// only the sessions that rest on the password. A session a device
+/// approval or a trusted device's resume made carries its parent's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignedInWith {
+    /// The account password, including the one an invite's redemption or
+    /// the first-admin setup chose.
+    Password,
+    /// A passkey, on the web or in an app.
+    Passkey,
+    /// A single sign-on provider (OIDC).
+    Sso,
+    /// A portable identity's device credential (P7-06).
+    PortableCredential,
+}
+
+impl SignedInWith {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignedInWith::Password => "password",
+            SignedInWith::Passkey => "passkey",
+            SignedInWith::Sso => "sso",
+            SignedInWith::PortableCredential => "portable_credential",
+        }
+    }
+
+    /// What the database wrote; `None` for NULL (made before it was kept,
+    /// or from a parent of unknown origin) and for anything else.
+    pub fn from_column(stored: Option<&str>) -> Option<Self> {
+        match stored? {
+            "password" => Some(SignedInWith::Password),
+            "passkey" => Some(SignedInWith::Passkey),
+            "sso" => Some(SignedInWith::Sso),
+            "portable_credential" => Some(SignedInWith::PortableCredential),
+            _ => None,
+        }
+    }
+}
+
 /// A live API session's user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiSessionUser {
@@ -31,6 +70,11 @@ pub struct ApiSessionUser {
     /// When they last proved who they are in this session (Unix seconds):
     /// at sign-in, or since ([`Store::confirm_session`]).
     pub authenticated_at: i64,
+    /// How the session was signed in; `None` when not known.
+    pub signed_in_with: Option<SignedInWith>,
+    /// Signed in with a one-time password an admin reset to: the session
+    /// may only change the password, or sign out.
+    pub password_change_only: bool,
 }
 
 /// Whose a session is, for the refused-request log.
@@ -56,6 +100,10 @@ pub struct SessionUser {
     /// When they last proved who they are in this session (Unix seconds):
     /// at sign-in.
     pub authenticated_at: i64,
+    /// How the session was signed in; `None` when not known.
+    pub signed_in_with: Option<SignedInWith>,
+    /// As [`ApiSessionUser::password_change_only`].
+    pub password_change_only: bool,
 }
 
 /// One of a user's live sessions, as the user may see it: never the token.
@@ -93,18 +141,42 @@ pub const DEAD_SESSION_KEEP_SECS: i64 = 30 * 86_400;
 /// How often dead sessions are purged.
 const PURGE_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
+/// When and how a session being recorded was signed in.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Stamp {
+    pub now: i64,
+    /// When its user last proved who they are: `now` for a sign-in, 0 for
+    /// a session nobody proved anything for (a resume, a credential).
+    pub authenticated_at: i64,
+    pub signed_in_with: Option<SignedInWith>,
+}
+
 impl Store {
-    /// Record a session for `user`, expiring at `expires_at`.
+    /// Record a session for `user`, expiring at `expires_at`, signed in
+    /// as `signed_in_with` says (`None`: from a parent of unknown origin).
     pub async fn create_session(
         &self,
         token_hash: &str,
         user: LocalUserId,
         binding: &SessionBinding,
         expires_at: i64,
+        signed_in_with: Option<SignedInWith>,
     ) -> Result<(), StoreError> {
         let now = self.now();
         let mut tx = self.begin_write().await?;
-        Self::insert_session(&mut tx, token_hash, user, binding, expires_at, now, now).await?;
+        Self::insert_session(
+            &mut tx,
+            token_hash,
+            user,
+            binding,
+            expires_at,
+            Stamp {
+                now,
+                authenticated_at: now,
+                signed_in_with,
+            },
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -132,8 +204,11 @@ impl Store {
             user,
             binding,
             expires_at.min(credential.expires_at),
-            now,
-            0,
+            Stamp {
+                now,
+                authenticated_at: 0,
+                signed_in_with: Some(SignedInWith::PortableCredential),
+            },
         )
         .await?;
         sqlx::query(
@@ -150,17 +225,20 @@ impl Store {
         Ok(())
     }
 
-    /// [`Store::create_session`] inside `tx`, at `now`, its user last
-    /// proving who they are at `authenticated_at`.
+    /// [`Store::create_session`] inside `tx`, as `stamp` says.
     pub(super) async fn insert_session(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         token_hash: &str,
         user: LocalUserId,
         binding: &SessionBinding,
         expires_at: i64,
-        now: i64,
-        authenticated_at: i64,
+        stamp: Stamp,
     ) -> Result<(), StoreError> {
+        let Stamp {
+            now,
+            authenticated_at,
+            signed_in_with,
+        } = stamp;
         let (kind, endpoint) = match binding {
             SessionBinding::Endpoint {
                 endpoint_id,
@@ -194,8 +272,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO sessions \
                (token_hash, user_id, kind, endpoint_id, created_at, last_used_at, \
-                authenticated_at, expires_at, client) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?8, ?6, ?7)",
+                authenticated_at, expires_at, client, signed_in_with) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?8, ?6, ?7, ?9)",
         )
         .bind(token_hash)
         .bind(user)
@@ -205,6 +283,7 @@ impl Store {
         .bind(expires_at)
         .bind(client)
         .bind(authenticated_at)
+        .bind(signed_in_with.map(SignedInWith::as_str))
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -217,8 +296,9 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<ApiSessionUser>, StoreError> {
-        let row: Option<(LocalUserId, String, i64)> = sqlx::query_as(
-            "SELECT u.id, u.role, s.authenticated_at \
+        let row: Option<(LocalUserId, String, i64, Option<String>, bool)> = sqlx::query_as(
+            "SELECT u.id, u.role, s.authenticated_at, s.signed_in_with, \
+                    s.password_change_only \
              FROM sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.token_hash = ?1 AND s.kind = 'api' AND s.revoked_at IS NULL \
                AND s.expires_at > ?2 AND u.disabled_at IS NULL",
@@ -227,11 +307,15 @@ impl Store {
         .bind(self.now())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, stored, authenticated_at)| ApiSessionUser {
-            user: id,
-            role: role(stored),
-            authenticated_at,
-        }))
+        Ok(row.map(
+            |(id, stored, authenticated_at, with, password_change_only)| ApiSessionUser {
+                user: id,
+                role: role(stored),
+                authenticated_at,
+                signed_in_with: SignedInWith::from_column(with.as_deref()),
+                password_change_only,
+            },
+        ))
     }
 
     /// [`Store::api_session`], as a use: the session is renewed to
@@ -244,8 +328,10 @@ impl Store {
         max_secs: i64,
     ) -> Result<Option<ApiSessionUser>, StoreError> {
         let now = self.now();
-        let row: Option<(LocalUserId, String, i64, i64)> = sqlx::query_as(
-            "SELECT u.id, u.role, s.authenticated_at, s.last_used_at \
+        type Row = (LocalUserId, String, i64, i64, Option<String>, bool);
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT u.id, u.role, s.authenticated_at, s.last_used_at, s.signed_in_with, \
+                    s.password_change_only \
              FROM sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.token_hash = ?1 AND s.kind = 'api' AND s.revoked_at IS NULL \
                AND s.expires_at > ?2 AND u.disabled_at IS NULL",
@@ -254,7 +340,8 @@ impl Store {
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((id, stored, authenticated_at, last_used_at)) = row else {
+        let Some((id, stored, authenticated_at, last_used_at, with, password_change_only)) = row
+        else {
             return Ok(None);
         };
         if now - last_used_at >= RENEW_EVERY_SECS {
@@ -265,6 +352,8 @@ impl Store {
             user: id,
             role: role(stored),
             authenticated_at,
+            signed_in_with: SignedInWith::from_column(with.as_deref()),
+            password_change_only,
         }))
     }
 
@@ -374,6 +463,16 @@ impl Store {
             }))
     }
 
+    /// Limit session `token_hash` to changing its user's password, or
+    /// signing out: one a one-time password opened.
+    pub async fn restrict_to_password_change(&self, token_hash: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE sessions SET password_change_only = 1 WHERE token_hash = ?1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// The session's user proved who they are again, now.
     pub async fn confirm_session(&self, token_hash: &str) -> Result<(), StoreError> {
         sqlx::query("UPDATE sessions SET authenticated_at = ?2 WHERE token_hash = ?1")
@@ -408,13 +507,23 @@ impl Store {
         lifetime_secs: i64,
     ) -> Result<Option<SessionUser>, StoreError> {
         let now = self.now();
-        type Row = (LocalUserId, String, Option<String>, String, i64, bool, i64);
+        type Row = (
+            LocalUserId,
+            String,
+            Option<String>,
+            String,
+            i64,
+            bool,
+            i64,
+            Option<String>,
+            bool,
+        );
         let row: Option<Row> = sqlx::query_as(
             "SELECT u.id, u.username, u.display_name, u.role, s.last_used_at, \
                     EXISTS (SELECT 1 FROM pin_credentials p WHERE p.user_id = u.id) \
                     AND EXISTS (SELECT 1 FROM pin_required r \
                                 WHERE r.user_id = u.id AND r.endpoint_id = s.endpoint_id), \
-                    s.authenticated_at \
+                    s.authenticated_at, s.signed_in_with, s.password_change_only \
              FROM sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.token_hash = ?1 AND s.kind = 'endpoint' AND s.endpoint_id = ?2 \
                AND s.revoked_at IS NULL AND s.expires_at > ?3 AND u.disabled_at IS NULL \
@@ -435,6 +544,8 @@ impl Store {
             last_used_at,
             pin_required,
             authenticated_at,
+            with,
+            password_change_only,
         )) = row
         else {
             return Ok(None);
@@ -450,6 +561,8 @@ impl Store {
             role: role(stored),
             pin_required,
             authenticated_at,
+            signed_in_with: SignedInWith::from_column(with.as_deref()),
+            password_change_only,
         }))
     }
 
@@ -705,7 +818,7 @@ mod tests {
     async fn an_api_session_names_its_user_until_revoked() {
         let (store, alice) = store_with_alice("api").await;
         store
-            .create_session("h", alice, &SessionBinding::Api, now() + 60)
+            .create_session("h", alice, &SessionBinding::Api, now() + 60, None)
             .await
             .unwrap();
         assert_eq!(
@@ -720,7 +833,7 @@ mod tests {
     async fn a_session_is_as_fresh_as_its_sign_in_or_its_last_confirmation() {
         let (store, alice) = store_with_alice("fresh").await;
         store
-            .create_session("h", alice, &SessionBinding::Api, now() + 3600)
+            .create_session("h", alice, &SessionBinding::Api, now() + 3600, None)
             .await
             .unwrap();
         let at = |store: &Store| {
@@ -746,7 +859,7 @@ mod tests {
     async fn an_expired_session_is_not_live() {
         let (store, alice) = store_with_alice("expired").await;
         store
-            .create_session("h", alice, &SessionBinding::Api, now() - 1)
+            .create_session("h", alice, &SessionBinding::Api, now() - 1, None)
             .await
             .unwrap();
         assert_eq!(store.api_session("h").await.unwrap(), None);
@@ -756,7 +869,7 @@ mod tests {
     async fn a_disabled_user_s_session_is_not_live() {
         let (store, alice) = store_with_alice("disabled").await;
         store
-            .create_session("h", alice, &SessionBinding::Api, now() + 60)
+            .create_session("h", alice, &SessionBinding::Api, now() + 60, None)
             .await
             .unwrap();
         store.disable_user("alice").await.unwrap();
@@ -787,7 +900,7 @@ mod tests {
             ("phone", endpoint("phone")),
         ] {
             store
-                .create_session(hash, alice, &binding, now() + 3600)
+                .create_session(hash, alice, &binding, now() + 3600, None)
                 .await
                 .unwrap();
         }
@@ -898,7 +1011,7 @@ mod tests {
             ("gone", SessionBinding::Api, now() + 60),
         ] {
             store
-                .create_session(hash, alice, &binding, expires)
+                .create_session(hash, alice, &binding, expires, None)
                 .await
                 .unwrap();
         }
@@ -920,7 +1033,7 @@ mod tests {
     async fn an_endpoint_session_works_only_from_its_endpoint() {
         let (store, alice) = store_with_alice("own-endpoint").await;
         store
-            .create_session("h", alice, &endpoint("t"), now() + 60)
+            .create_session("h", alice, &endpoint("t"), now() + 60, None)
             .await
             .unwrap();
         let user = store
@@ -940,7 +1053,7 @@ mod tests {
     async fn an_api_session_is_not_an_endpoint_session() {
         let (store, alice) = store_with_alice("api-not-endpoint").await;
         store
-            .create_session("h", alice, &SessionBinding::Api, now() + 60)
+            .create_session("h", alice, &SessionBinding::Api, now() + 60, None)
             .await
             .unwrap();
         assert_eq!(
@@ -953,7 +1066,7 @@ mod tests {
     async fn use_renews_the_session_at_most_once_a_minute() {
         let (store, alice) = store_with_alice("renew").await;
         store
-            .create_session("h", alice, &endpoint("t"), now() + 60)
+            .create_session("h", alice, &endpoint("t"), now() + 60, None)
             .await
             .unwrap();
         // Just created: no write yet.
@@ -976,11 +1089,11 @@ mod tests {
     async fn requests_that_find_a_renewal_due_together_write_it_once() {
         let (store, alice) = store_with_alice("renew-once").await;
         store
-            .create_session("tv", alice, &endpoint("t"), now() + 60)
+            .create_session("tv", alice, &endpoint("t"), now() + 60, None)
             .await
             .unwrap();
         store
-            .create_session("web", alice, &SessionBinding::Api, now() + 60)
+            .create_session("web", alice, &SessionBinding::Api, now() + 60, None)
             .await
             .unwrap();
         sqlx::query("UPDATE sessions SET last_used_at = last_used_at - 120")
@@ -1028,15 +1141,15 @@ mod tests {
     async fn sessions_are_listed_without_dead_ones() {
         let (store, alice) = store_with_alice("list").await;
         store
-            .create_session("a", alice, &endpoint("t"), now() + 60)
+            .create_session("a", alice, &endpoint("t"), now() + 60, None)
             .await
             .unwrap();
         store
-            .create_session("b", alice, &SessionBinding::Api, now() + 60)
+            .create_session("b", alice, &SessionBinding::Api, now() + 60, None)
             .await
             .unwrap();
         store
-            .create_session("c", alice, &endpoint("x"), now() + 60)
+            .create_session("c", alice, &endpoint("x"), now() + 60, None)
             .await
             .unwrap();
         store.revoke_session("c").await.unwrap();
@@ -1061,12 +1174,12 @@ mod tests {
             ("tv", endpoint("t")),
         ] {
             store
-                .create_session(hash, alice, &binding, now() + 60)
+                .create_session(hash, alice, &binding, now() + 60, None)
                 .await
                 .unwrap();
         }
         store
-            .create_session("bobs", bob, &SessionBinding::Api, now() + 60)
+            .create_session("bobs", bob, &SessionBinding::Api, now() + 60, None)
             .await
             .unwrap();
         assert_eq!(store.revoke_other_sessions(alice, "web").await.unwrap(), 2);
@@ -1091,7 +1204,7 @@ mod tests {
             platform: Platform::Tvos,
         };
         store
-            .create_session("h", alice, &binding, now() + 60)
+            .create_session("h", alice, &binding, now() + 60, None)
             .await
             .unwrap();
         let name: Option<String> =

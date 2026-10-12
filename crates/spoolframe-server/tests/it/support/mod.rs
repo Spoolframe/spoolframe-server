@@ -500,6 +500,7 @@ pub fn lookup_at(url: &str, backoff: &[Duration]) -> spoolframe_server::wan::Loo
         wtfismyip: url.parse().unwrap(),
         timeout: Duration::from_secs(5),
         backoff: backoff.to_vec(),
+        again: Duration::from_secs(3600),
     }
 }
 

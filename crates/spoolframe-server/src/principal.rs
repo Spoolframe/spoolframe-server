@@ -67,6 +67,12 @@ impl Who {
         }
     }
 
+    /// The session was opened with a one-time password: it may only
+    /// change the password, or sign out. Never a portable user's.
+    pub fn password_change_only(&self) -> bool {
+        matches!(self, Who::Local(user) if user.password_change_only)
+    }
+
     pub fn display_name(&self) -> &str {
         match self {
             Who::Local(user) => &user.display_name,

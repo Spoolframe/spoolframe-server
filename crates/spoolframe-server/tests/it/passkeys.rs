@@ -535,7 +535,10 @@ async fn a_passkey_signs_its_user_in_without_a_username() {
     // The cookie and the answer a password login gets.
     let session = cookie(&signed_in);
     let body: Value = signed_in.json().await.unwrap();
-    assert_eq!(body, json!({ "username": "alice", "role": "consumer" }));
+    assert_eq!(
+        body,
+        json!({ "username": "alice", "role": "consumer", "passwordChangeRequired": false })
+    );
     assert_eq!(who(addr, &session).await["username"], "alice");
     assert!(alice.passkeys().await.unwrap()[0].last_used_at.is_some());
 

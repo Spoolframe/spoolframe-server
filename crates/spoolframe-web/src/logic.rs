@@ -92,6 +92,9 @@ impl ApiError {
                 "That passkey did not sign you in. Try again, or use your password.".into()
             }
             error_code::RECENT_SIGN_IN_REQUIRED => "Confirm it is you first.".into(),
+            error_code::PASSWORD_CHANGE_REQUIRED => {
+                "Choose a new password first: your password was reset to a one-time one.".into()
+            }
             error_code::NO_SUCH_SIGN_IN_CODE => {
                 "No device is showing that code now. A code lasts 5 minutes: start again on the device."
                     .into()
@@ -654,6 +657,9 @@ pub enum UserStatus {
     /// Their password sign-ins are refused for a while (P3-18): why, and
     /// for how long.
     Limited(String),
+    /// Their password was reset to a one-time one, and they have not
+    /// chosen a new one yet: until when it works.
+    OneTimePassword(Option<i64>),
     Active,
 }
 
@@ -665,6 +671,9 @@ pub fn user_status(user: &UserInfo) -> UserStatus {
             user.username,
             minutes(secs.div_ceil(60))
         )),
+        (false, None) if user.password_must_change => {
+            UserStatus::OneTimePassword(user.password_expires_at)
+        }
         (false, None) => UserStatus::Active,
     }
 }
@@ -1364,6 +1373,8 @@ mod tests {
             disabled,
             has_password: true,
             password_changed_at: None,
+            password_must_change: false,
+            password_expires_at: None,
             last_seen_at: None,
             has_passkey: false,
             has_sso: false,
@@ -1394,6 +1405,20 @@ mod tests {
         // Disabled says more than limited.
         steve.disabled = true;
         assert_eq!(user_status(&steve), UserStatus::Disabled);
+    }
+
+    #[test]
+    fn a_pending_one_time_password_shows_until_it_is_changed() {
+        let mut steve = user("steve", Role::Consumer, false);
+        steve.password_must_change = true;
+        steve.password_expires_at = Some(1_800_000_000);
+        assert_eq!(
+            user_status(&steve),
+            UserStatus::OneTimePassword(Some(1_800_000_000))
+        );
+        // Limited says more: the one-time password is refused meanwhile.
+        steve.rate_limited_secs = Some(60);
+        assert!(matches!(user_status(&steve), UserStatus::Limited(_)));
     }
 
     #[test]

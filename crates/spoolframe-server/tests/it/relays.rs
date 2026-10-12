@@ -495,7 +495,7 @@ async fn the_own_relay_serves_tls_from_pem_files() {
     let server = iroh::SecretKey::generate().public();
     let config = spoolframe_server::own_relay::RelayConfig::parse(&format!(
         r#"schema = "spoolframe.relay.v1";
-           server {{ key = "{server}"; }}
+           server {{ key = "{server}"; addrs = ["127.0.0.1:9"]; }}
            tls {{ mode = "files"; https = "127.0.0.1:0";
                  cert_file = "{}"; key_file = "{}"; }}
            http = "127.0.0.1:0";"#,

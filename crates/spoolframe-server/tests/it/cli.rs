@@ -607,6 +607,32 @@ async fn setup_then_manage_users_from_the_cli() {
     );
     assert!(!out.status.success(), "{out:?}");
 
+    // A reset prints a one-time password once, and the list says so. With
+    // it, bob may only choose a new password: an admin call is refused.
+    let out = cli(&config, &["user", "reset-password", "bob"], "", &alice);
+    assert!(out.status.success(), "{out:?}");
+    let printed = String::from_utf8(out.stdout).unwrap();
+    let otp = printed
+        .strip_prefix("one-time password for bob: ")
+        .and_then(|rest| rest.lines().next())
+        .unwrap_or_else(|| panic!("no one-time password in: {printed}"))
+        .to_owned();
+    assert_eq!(otp.len(), 19, "{otp}");
+    assert!(list(&alice).contains("bob (admin, one-time password)"));
+    let out = cli(
+        &config,
+        &["user", "list"],
+        "",
+        &[
+            ("SPOOLFRAME_ADMIN_USER", "bob"),
+            ("SPOOLFRAME_ADMIN_PASSWORD", &otp),
+        ],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    // Not one's own: that is `user passwd`.
+    let out = cli(&config, &["user", "reset-password", "alice"], "", &alice);
+    assert!(!out.status.success(), "{out:?}");
+
     running.stop();
 }
 

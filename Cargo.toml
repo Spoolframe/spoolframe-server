@@ -29,6 +29,9 @@ tmpdir = "1"
 # parser bug a fuzzer found, must not make every later lock panic too.
 # Already in the build through iroh and tokio.
 parking_lot = "0.12.5"
+# A body shared by every upload of the uplink measurement, sliced.
+# Already in the build through reqwest and iroh.
+bytes = "1.12"
 # Internal crates
 spoolframe-types = { path = "crates/spoolframe-types" }
 spoolframe-policy = { path = "crates/spoolframe-policy" }

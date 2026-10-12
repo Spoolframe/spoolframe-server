@@ -393,6 +393,44 @@ async fn a_forwarded_port_with_its_public_ip_written_is_advertised() {
     server.stop().await;
 }
 
+/// A lookup that failed is tried again later, and what it then finds is
+/// advertised (review 2026-10-11 M31): a server started before its
+/// network was up, or given a new address, does not wait for a restart.
+#[tokio::test]
+async fn a_failed_public_ip_lookup_is_tried_again_later() {
+    let service = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&service)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("203.0.113.7"))
+        .with_priority(2)
+        .mount(&service)
+        .await;
+    let lookup = Lookup {
+        again: Duration::from_millis(200),
+        ..support::lookup_at(&text_url(&service), &[])
+    };
+    let server = server_finding(
+        "wan-lookup-again",
+        forwarded(PublicIp::Lookup, Some(LookupVia::Wtfismyip)),
+        lookup,
+    )
+    .await;
+    let found = public_once(&server, |found| !found.is_empty()).await;
+    assert_eq!(
+        found,
+        [PublicAddr {
+            addr: "203.0.113.7:7420".parse().unwrap(),
+            source: Source::Lookup,
+        }]
+    );
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn a_forwarded_port_with_its_public_ip_looked_up_is_advertised() {
     let service = lookup_service(200, "203.0.113.9\n").await;

@@ -4,9 +4,12 @@
 //!
 //! A device is on the LAN when its address is in one of this host's own
 //! interface subnets (the interface's real prefix: a global IPv6 address
-//! in the home's /64 is the LAN, one on 5G is not), private, link-local
-//! or unique local (as the log always called them), or in
-//! `network.lan_prefixes`. A relay path is never the LAN.
+//! in the home's /64 is the LAN, one on 5G is not), private, link-local,
+//! carrier-grade NAT or unique local (a WireGuard or Tailscale peer
+//! too), or in `network.lan_prefixes`; but not when it is in
+//! `network.wan_prefixes`, where an admin lists a peer known to be
+//! outside (the longer of two matching prefixes decides). A relay path
+//! is never the LAN.
 //!
 //! The budget is split between the WAN playbacks open now: equally, but
 //! while an owner (an admin of this server) plays off the LAN, the
@@ -22,7 +25,8 @@ use std::time::{Duration, Instant};
 
 use crate::admin_http::Network;
 
-/// `network.uplink` and `network.lan_prefixes`, checked.
+/// `network.uplink`, `network.lan_prefixes` and `network.wan_prefixes`,
+/// checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UplinkSettings {
     /// What the WAN playbacks may take together, in bit/s; `None` is
@@ -36,6 +40,10 @@ pub struct UplinkSettings {
     /// Ranges whose devices are on the LAN besides the host's own
     /// subnets.
     pub lan_prefixes: Vec<Network>,
+    /// Ranges whose devices are off the LAN even at a private address or
+    /// in `lan_prefixes` (a longer prefix there wins): a WireGuard peer
+    /// that is always away.
+    pub wan_prefixes: Vec<Network>,
 }
 
 /// `network.uplink.owner_share_percent` left out.
@@ -48,6 +56,7 @@ impl Default for UplinkSettings {
             max_streams: None,
             owner_share_percent: DEFAULT_OWNER_SHARE_PERCENT,
             lan_prefixes: Vec::new(),
+            wan_prefixes: Vec::new(),
         }
     }
 }
@@ -61,35 +70,31 @@ pub enum Class {
     Guest,
 }
 
-/// Whether `ip` is on the LAN: loopback or link-local, or in one of
-/// `subnets` (this host's, tunnels left out) or `extra`
-/// (`network.lan_prefixes`). A private address is not the LAN for being
-/// private (review 2026-10-11 M28): a phone on cellular reaching the
-/// server over Tailscale (100.64.0.0/10) or WireGuard (10.x) has a private
-/// address, and its bytes leave through the home's uplink. A tunnel's
-/// network counts as home only when an admin lists it.
-pub fn is_lan(ip: IpAddr, subnets: &[Network], extra: &[Network]) -> bool {
+/// Whether `ip` is on the LAN. In `wan` (`network.wan_prefixes`) it is
+/// not, unless a longer prefix of `lan` (`network.lan_prefixes`) also
+/// holds it: the more specific range decides, the WAN on a tie, so a
+/// `/32` of one WireGuard peer known to be away is taken out of a `/24`
+/// counted as home. Otherwise it is when it is in `lan`, in one of
+/// `subnets` (this host's), or not public: private, carrier-grade NAT,
+/// link-local, unique local or loopback, so a WireGuard or Tailscale peer
+/// is home unless listed in `wan`.
+pub fn is_lan(ip: IpAddr, subnets: &[Network], lan: &[Network], wan: &[Network]) -> bool {
     let ip = ip.to_canonical();
-    ip.is_loopback()
-        || link_local(ip)
-        || subnets.iter().any(|n| n.contains(ip))
-        || extra.iter().any(|n| n.contains(ip))
-}
-
-fn link_local(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_link_local(),
-        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    let longest = |ranges: &[Network]| {
+        ranges
+            .iter()
+            .filter(|n| n.contains(ip))
+            .map(Network::prefix)
+            .max()
+    };
+    match (longest(wan), longest(lan)) {
+        (Some(wan), Some(lan)) => lan > wan,
+        (Some(_), None) => false,
+        (None, Some(_)) => true,
+        (None, None) => {
+            crate::wan::not_public(ip).is_some() || subnets.iter().any(|n| n.contains(ip))
+        }
     }
-}
-
-/// Whether an interface named `name` is a tunnel (Tailscale, WireGuard,
-/// tun): the devices at its far end are wherever they are, so its
-/// subnet is not the LAN's.
-fn tunnel(name: &str) -> bool {
-    ["tailscale", "wg", "tun", "utun"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
 }
 
 /// How long the host's subnets are kept before they are read again: an
@@ -201,10 +206,11 @@ impl Uplink {
     }
 
     /// Whether `ip` is on the LAN, by this host's subnets as they are now
-    /// and `network.lan_prefixes`.
+    /// and `network.lan_prefixes` / `network.wan_prefixes`.
     pub fn is_lan(&self, ip: IpAddr) -> bool {
         let subnets = self.subnets();
-        is_lan(ip, &subnets, &self.settings.read().lan_prefixes)
+        let settings = self.settings.read();
+        is_lan(ip, &subnets, &settings.lan_prefixes, &settings.wan_prefixes)
     }
 
     fn subnets(&self) -> Vec<Network> {
@@ -333,8 +339,7 @@ impl Uplink {
 pub const SETTLE: Duration = Duration::from_secs(3);
 
 /// This host's interface subnets now: each address with its netmask's
-/// prefix. Loopback ones are left out (`is_lan` takes them anyway), and a
-/// tunnel's ([`tunnel`]) is its own address only.
+/// prefix. Loopback ones are left out (`is_lan` takes them anyway).
 pub fn host_subnets() -> Vec<Network> {
     let mut found = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -354,8 +359,6 @@ pub fn host_subnets() -> Vec<Network> {
             {
                 continue;
             }
-            let tunnel = !ifa.ifa_name.is_null()
-                && tunnel(&std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy());
             let (ip, prefix) = match i32::from((*ifa.ifa_addr).sa_family) {
                 libc::AF_INET => {
                     let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
@@ -378,13 +381,6 @@ pub fn host_subnets() -> Vec<Network> {
             if ip.is_loopback() || prefix == 0 {
                 continue;
             }
-            // A tunnel's own address is this machine's, the LAN: its
-            // network's other devices are not.
-            let prefix = match (tunnel, ip) {
-                (true, IpAddr::V4(_)) => 32,
-                (true, IpAddr::V6(_)) => 128,
-                (false, _) => prefix,
-            };
             found.push(Network::new(ip, prefix));
         }
         libc::freeifaddrs(head);
@@ -428,9 +424,17 @@ pub type SharedUplink = Arc<Uplink>;
 /// test, which takes a POST of any body and answers once it has it.
 pub const SPEED_TEST_UP: &str = "https://speed.cloudflare.com/__up";
 
-/// Each upload's size: long enough that the round trip is a small part
-/// of its time on a fast upload, short enough on a slow one.
+/// The most each upload sends: long enough that the round trip is a
+/// small part of its time on a fast upload.
 pub const MEASURE_BYTES: usize = 10 << 20;
+
+/// The first upload, which sizes the rest: small enough to finish within
+/// [`MEASURE_TIMEOUT`] on an upload of a few hundred kbit/s.
+pub const PROBE_BYTES: usize = 1 << 20;
+
+/// How long each measured upload is sized to take at the probe's rate:
+/// well inside [`MEASURE_TIMEOUT`] should the upload slow down.
+pub const MEASURE_SECS: f64 = 8.0;
 
 /// How many uploads are made; their median is the answer.
 pub const MEASURE_UPLOADS: usize = 3;
@@ -442,9 +446,19 @@ pub const MEASURE_TIMEOUT: Duration = Duration::from_secs(25);
 /// is for everything else the home sends.
 pub const SUGGESTED_PERCENT: u64 = 80;
 
-/// Upload `bytes` to `url` `uploads` times, one after another, and each
-/// one's rate in bit/s: from the request's start to its answer. The body
-/// is not zeros, which a link could compress.
+/// What each measured upload sends after a probe at `probe_rate` bit/s:
+/// [`MEASURE_SECS`] of it, between [`PROBE_BYTES`] and `max`. A fixed
+/// 10 MiB took longer than [`MEASURE_TIMEOUT`] under about 3.4 Mbit/s,
+/// the uploads a budget matters most for, and the measurement failed.
+pub fn upload_size(probe_rate: f64, max: usize) -> usize {
+    let sized = (probe_rate / 8.0 * MEASURE_SECS) as usize;
+    sized.clamp(PROBE_BYTES.min(max), max)
+}
+
+/// Upload to `url` once to size the rest ([`upload_size`], at most
+/// `bytes`), then `uploads` times one after another, and each of those
+/// uploads' rate in bit/s: from the request's start to its answer. The
+/// body is not zeros, which a link could compress, and is made once.
 pub async fn measure_upload(
     client: &reqwest::Client,
     url: &str,
@@ -460,22 +474,31 @@ pub async fn measure_upload(
         let b = x.to_le_bytes();
         chunk.copy_from_slice(&b[..chunk.len()]);
     }
+    let body = bytes::Bytes::from(body);
+    let upload = |len: usize| {
+        let body = body.slice(..len);
+        async move {
+            let started = Instant::now();
+            let answer = client
+                .post(url)
+                .timeout(MEASURE_TIMEOUT)
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| format!("cannot upload to {url}: {e}"))?;
+            if !answer.status().is_success() {
+                return Err(format!("{url} answered {}", answer.status()));
+            }
+            let secs = started.elapsed().as_secs_f64().max(0.001);
+            Ok(len as f64 * 8.0 / secs)
+        }
+    };
+    let probe = upload(PROBE_BYTES.min(bytes)).await?;
+    let size = upload_size(probe, bytes);
     let mut rates = Vec::with_capacity(uploads);
     for _ in 0..uploads {
-        let started = Instant::now();
-        let answer = client
-            .post(url)
-            .timeout(MEASURE_TIMEOUT)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(body.clone())
-            .send()
-            .await
-            .map_err(|e| format!("cannot upload to {url}: {e}"))?;
-        if !answer.status().is_success() {
-            return Err(format!("{url} answered {}", answer.status()));
-        }
-        let secs = started.elapsed().as_secs_f64().max(0.001);
-        rates.push(bytes as f64 * 8.0 / secs);
+        rates.push(upload(size).await?);
     }
     Ok(rates)
 }
@@ -512,39 +535,65 @@ mod tests {
     #[test]
     fn the_home_64_is_the_lan_and_5g_is_not() {
         let subnets = [net("2603:8000:c33e:6ac6::/64"), net("192.168.86.10/24")];
-        assert!(is_lan(ip("2603:8000:c33e:6ac6:5c3e::1"), &subnets, &[]));
-        assert!(!is_lan(ip("2607:fb90:bd81:1d9::1"), &subnets, &[]));
-        assert!(is_lan(ip("192.168.86.134"), &subnets, &[]));
+        assert!(is_lan(
+            ip("2603:8000:c33e:6ac6:5c3e::1"),
+            &subnets,
+            &[],
+            &[]
+        ));
+        assert!(!is_lan(ip("2607:fb90:bd81:1d9::1"), &subnets, &[], &[]));
+        assert!(is_lan(ip("192.168.86.134"), &subnets, &[], &[]));
         // Link-local and loopback always are.
-        assert!(is_lan(ip("fe80::1"), &[], &[]));
-        assert!(is_lan(ip("169.254.1.2"), &[], &[]));
-        assert!(is_lan(ip("127.0.0.1"), &[], &[]));
+        assert!(is_lan(ip("fe80::1"), &[], &[], &[]));
+        assert!(is_lan(ip("169.254.1.2"), &[], &[], &[]));
+        assert!(is_lan(ip("127.0.0.1"), &[], &[], &[]));
         // A public IPv4 address off the host's subnets is the WAN.
-        assert!(!is_lan(ip("76.50.95.40"), &subnets, &[]));
+        assert!(!is_lan(ip("76.50.95.40"), &subnets, &[], &[]));
     }
 
-    /// A private address off the host's subnets is not the LAN for being
-    /// private: a phone on cellular over Tailscale or WireGuard is one,
-    /// and its bytes leave through the uplink. Listed in
-    /// `lan_prefixes`, a tunnel's network is home. Review 2026-10-11 M28.
+    /// A private address is the LAN, a WireGuard or Tailscale peer's
+    /// too, unless `wan_prefixes` takes it out; between a `wan` and a
+    /// `lan` range that both hold an address the longer prefix decides,
+    /// the WAN on a tie.
     #[test]
-    fn a_tunnel_s_private_address_is_not_the_lan_unless_listed() {
+    fn a_tunnel_peer_is_the_lan_unless_listed_as_outside() {
         let subnets = [net("192.168.86.10/24")];
-        assert!(!is_lan(ip("100.101.102.103"), &subnets, &[]));
-        assert!(!is_lan(ip("10.10.0.7"), &subnets, &[]));
-        assert!(!is_lan(ip("fd7a:115c:a1e0::1"), &subnets, &[]));
-        assert!(is_lan(ip("10.10.0.7"), &subnets, &[net("10.10.0.0/24")]));
-        assert!(tunnel("tailscale0") && tunnel("wg0") && tunnel("tun0"));
-        assert!(!tunnel("enp5s0") && !tunnel("wlan0") && !tunnel("br0"));
+        assert!(is_lan(ip("10.10.0.7"), &subnets, &[], &[]));
+        assert!(is_lan(ip("100.101.102.103"), &subnets, &[], &[]));
+        assert!(is_lan(ip("fd7a:115c:a1e0::1"), &subnets, &[], &[]));
+        let away = [net("10.10.0.7/32")];
+        assert!(!is_lan(ip("10.10.0.7"), &subnets, &[], &away));
+        assert!(is_lan(ip("10.10.0.8"), &subnets, &[], &away));
+        // A /32 outside within a /24 counted as home is outside.
+        let home = [net("10.10.0.0/24")];
+        assert!(!is_lan(ip("10.10.0.7"), &subnets, &home, &away));
+        assert!(is_lan(ip("10.10.0.8"), &subnets, &home, &away));
+        // A /32 at home within a /16 outside is home.
+        let wide = [net("10.10.0.0/16")];
+        let one = [net("10.10.3.4/32")];
+        assert!(is_lan(ip("10.10.3.4"), &subnets, &one, &wide));
+        assert!(!is_lan(ip("10.10.3.5"), &subnets, &one, &wide));
+        // The same range on both lists is outside.
+        assert!(!is_lan(ip("10.10.0.9"), &subnets, &home, &home));
+        // A host subnet listed as outside is outside.
+        assert!(!is_lan(
+            ip("192.168.86.50"),
+            &subnets,
+            &[],
+            &[net("192.168.86.50/32")]
+        ));
+        // A public 5G address is the WAN.
+        assert!(!is_lan(ip("2607:fb90:bd81:1d9::1"), &subnets, &[], &[]));
+        assert!(!is_lan(ip("172.58.1.2"), &subnets, &[], &[]));
     }
 
     #[test]
     fn an_admin_s_extra_prefix_is_the_lan() {
         let extra = [net("203.0.113.0/24")];
-        assert!(is_lan(ip("203.0.113.9"), &[], &extra));
-        assert!(!is_lan(ip("203.0.114.9"), &[], &extra));
+        assert!(is_lan(ip("203.0.113.9"), &[], &extra, &[]));
+        assert!(!is_lan(ip("203.0.114.9"), &[], &extra, &[]));
         // An IPv4-mapped IPv6 address is its IPv4 one.
-        assert!(is_lan(ip("::ffff:203.0.113.9"), &[], &extra));
+        assert!(is_lan(ip("::ffff:203.0.113.9"), &[], &extra, &[]));
     }
 
     /// The user's example: budget 20; Samir alone gets 20; Diana joins,
@@ -705,7 +754,22 @@ mod tests {
             .unwrap();
         assert_eq!(rates.len(), 2);
         assert!(rates.iter().all(|r| *r > 0.0));
-        assert_eq!(*received.lock(), [1 << 20, 1 << 20]);
+        // The probe, then the two measured.
+        assert_eq!(*received.lock(), [1 << 20, 1 << 20, 1 << 20]);
+    }
+
+    /// A slow upload is measured with uploads it can finish in time
+    /// (review 2026-10-11 M30): 10 MiB at 2 Mbit/s took 42 s, past the
+    /// 25 s each may take.
+    #[test]
+    fn a_slow_upload_is_sized_to_finish_in_time() {
+        for rate in [0.5e6, 2e6, 3e6] {
+            let size = upload_size(rate, MEASURE_BYTES);
+            let secs = size as f64 * 8.0 / rate;
+            assert!(secs < MEASURE_TIMEOUT.as_secs_f64(), "{rate}: {secs} s");
+        }
+        assert_eq!(upload_size(500e6, MEASURE_BYTES), MEASURE_BYTES);
+        assert_eq!(upload_size(10.0, MEASURE_BYTES), PROBE_BYTES);
     }
 
     #[test]

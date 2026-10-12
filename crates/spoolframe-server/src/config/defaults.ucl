@@ -201,13 +201,18 @@ network {
   # }
   # Address ranges whose devices are on the LAN besides this host's own
   # subnets: a device in one of the host's subnets (a global IPv6
-  # address in the home's /64 too), or at a link-local address, already
-  # is. A private address elsewhere is not: a tunnel's (Tailscale,
-  # WireGuard) devices may be anywhere, their bytes through the uplink.
-  # A WireGuard network to count as home, another VLAN:
-  # ["10.10.0.0/24", "2001:db8:1::/64"]. A playback on the LAN plays the
-  # original under Auto and is not counted against the uplink budget.
+  # address in the home's /64 too), or at a private, carrier-grade NAT,
+  # link-local or unique local address (a WireGuard or Tailscale peer
+  # too), already is. Another VLAN with public addresses:
+  # ["203.0.113.0/24", "2001:db8:1::/64"]. A playback on the LAN plays
+  # the original under Auto and is not counted against the uplink
+  # budget. Applies at once.
   lan_prefixes = [];
+  # Address ranges whose devices are off the LAN all the same: a
+  # WireGuard peer known to be always away, ["10.10.0.7/32"]. Between a
+  # range here and one in lan_prefixes that both hold an address, the
+  # longer prefix decides (here on a tie). Applies at once.
+  wan_prefixes = [];
   # What the home's upload carries for playbacks off the LAN. Applies at
   # once.
   uplink {

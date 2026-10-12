@@ -185,6 +185,7 @@ impl AccountState {
             Response::Ok(Reply::LoggedIn {
                 session,
                 remembered,
+                ..
             }) => {
                 self.note(format!(
                     "QUIC: signed in as {:?} from a fresh key {} named {device:?} \

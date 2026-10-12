@@ -202,6 +202,11 @@ impl Network {
         }
     }
 
+    /// The prefix length: how specific the range is.
+    pub fn prefix(&self) -> u32 {
+        self.prefix
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip.to_canonical()) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {
@@ -736,8 +741,12 @@ async fn signed_in(api: &AdminApi, headers: &HeaderMap, done: LoggedIn) -> Respo
         ),
         None => {}
     }
-    let mut response =
-        axum::Json(json!({ "username": done.username, "role": done.role })).into_response();
+    let mut response = axum::Json(json!({
+        "username": done.username,
+        "role": done.role,
+        "passwordChangeRequired": done.password_change_required,
+    }))
+    .into_response();
     response
         .headers_mut()
         .insert(header::SET_COOKIE, cookies.set(&done.token));

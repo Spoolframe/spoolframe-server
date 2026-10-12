@@ -117,6 +117,8 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::FinishPasskeyRegistration(_)
         | Request::RenamePasskey { .. }
         | Request::RemovePasskey { .. }
+        // A wrong current password counts; a new one ends sessions.
+        | Request::ChangePassword(_)
         // Confirming: a wrong password or passkey counts, a challenge is
         // replaced or used up.
         | Request::ConfirmPassword(_)

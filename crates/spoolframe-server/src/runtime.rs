@@ -59,7 +59,8 @@ pub struct Live {
     /// Not a setting: what a reload detects the encoders again for
     /// (PX-33), as SIGHUP did before.
     pub transcoding: Option<Arc<crate::transcode::Transcoding>>,
-    /// `network.uplink.*` and `network.lan_prefixes` (PX-46).
+    /// `network.uplink.*`, `network.lan_prefixes` and
+    /// `network.wan_prefixes` (PX-46).
     pub uplink: Option<Arc<crate::uplink::Uplink>>,
 }
 

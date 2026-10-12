@@ -233,6 +233,7 @@ impl Client {
             Response::Ok(Reply::LoggedIn {
                 session,
                 remembered,
+                ..
             }) => (session, remembered),
             Response::Ok(other) => {
                 return Err(SdkError::Protocol(format!(

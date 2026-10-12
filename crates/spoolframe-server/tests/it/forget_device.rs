@@ -51,6 +51,7 @@ async fn remembered(client: &TestClient, username: &str, password: &str) -> Sess
         Response::Ok(Reply::LoggedIn {
             session,
             remembered,
+            ..
         }) => {
             assert!(remembered);
             session
