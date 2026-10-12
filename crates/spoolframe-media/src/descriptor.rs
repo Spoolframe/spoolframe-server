@@ -77,6 +77,24 @@ pub enum VideoRange {
 }
 
 impl VideoRange {
+    /// The range of a transfer function, as ffprobe names it.
+    pub fn of_transfer(transfer: Option<&str>) -> Self {
+        match transfer {
+            Some("smpte2084") => Self::Pq,
+            Some("arib-std-b67") => Self::Hlg,
+            _ => Self::Sdr,
+        }
+    }
+
+    /// The HDR an encode keeps of this range: HDR10 for PQ, HLG for HLG.
+    pub fn hdr(self) -> Option<HdrFormat> {
+        match self {
+            Self::Pq => Some(HdrFormat::Hdr10),
+            Self::Hlg => Some(HdrFormat::Hlg),
+            Self::Sdr => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Sdr => "SDR",
@@ -155,17 +173,9 @@ impl VideoStream {
                 Some(DvBase::Hdr10) => Some(HdrFormat::Hdr10),
                 Some(DvBase::Hlg) => Some(HdrFormat::Hlg),
                 // No record read: the transfer says.
-                None => match self.range() {
-                    VideoRange::Pq => Some(HdrFormat::Hdr10),
-                    VideoRange::Hlg => Some(HdrFormat::Hlg),
-                    VideoRange::Sdr => None,
-                },
+                None => self.range().hdr(),
             },
-            HdrFormat::Unknown => match self.range() {
-                VideoRange::Pq => Some(HdrFormat::Hdr10),
-                VideoRange::Hlg => Some(HdrFormat::Hlg),
-                VideoRange::Sdr => None,
-            },
+            HdrFormat::Unknown => self.range().hdr(),
             kept => Some(kept),
         }
     }
@@ -179,11 +189,7 @@ impl VideoStream {
     /// From the transfer function, not from `hdr`: Dolby Vision is over
     /// either PQ or HLG.
     pub fn range(&self) -> VideoRange {
-        match self.color_transfer.as_deref() {
-            Some("smpte2084") => VideoRange::Pq,
-            Some("arib-std-b67") => VideoRange::Hlg,
-            _ => VideoRange::Sdr,
-        }
+        VideoRange::of_transfer(self.color_transfer.as_deref())
     }
 }
 
@@ -425,11 +431,7 @@ fn hdr(transfer: Option<&str>, dolby_vision: bool) -> Option<HdrFormat> {
     if dolby_vision {
         return Some(HdrFormat::DolbyVision);
     }
-    match transfer {
-        Some("smpte2084") => Some(HdrFormat::Hdr10),
-        Some("arib-std-b67") => Some(HdrFormat::Hlg),
-        _ => None,
-    }
+    VideoRange::of_transfer(transfer).hdr()
 }
 
 /// A rate ffprobe gives as a number, where it is one: ffprobe prints 0

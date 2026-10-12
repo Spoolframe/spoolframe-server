@@ -556,10 +556,9 @@ impl Previews {
         {
             return Some(kept.clone());
         }
-        let original = crate::artwork::Artwork {
+        let original = spoolframe_catalog::Image {
             bytes,
             content_type: "image/jpeg".into(),
-            etag: String::new(),
         };
         let image = tokio::task::spawn_blocking(move || crate::artwork::resize(original, width))
             .await
@@ -969,23 +968,15 @@ fn has_pictures(id: &MediaId) -> bool {
 /// A set's name: the file as it is now (path, size, modification time)
 /// and the interval.
 async fn key(path: &Path, interval: Duration) -> std::io::Result<String> {
-    let meta = tokio::fs::metadata(path).await?;
-    let modified = meta
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut hash = blake3::Hasher::new();
-    for part in [
+    let (size, modified) = crate::files::stamp(path).await?;
+    let hash = crate::files::hash_parts(&[
         path.display().to_string(),
-        meta.len().to_string(),
+        size.to_string(),
         modified.to_string(),
         interval.as_millis().to_string(),
         sheets::TILE_WIDTH.to_string(),
-    ] {
-        hash.update(part.as_bytes());
-        hash.update(&[0]);
-    }
-    Ok(hash.finalize().to_hex()[..KEY_LEN].to_owned())
+    ]);
+    Ok(hash.to_hex()[..KEY_LEN].to_owned())
 }
 
 #[cfg(test)]

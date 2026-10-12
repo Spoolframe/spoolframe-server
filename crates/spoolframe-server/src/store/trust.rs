@@ -151,21 +151,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         } else {
-            sqlx::query("DELETE FROM trusted_endpoints WHERE user_id = ?1 AND endpoint_id = ?2")
-                .bind(user)
-                .bind(endpoint_id)
-                .execute(&mut *tx)
-                .await?;
-            revoked = sqlx::query(
-                "UPDATE sessions SET revoked_at = ?3 \
-                 WHERE user_id = ?1 AND endpoint_id = ?2 AND revoked_at IS NULL",
-            )
-            .bind(user)
-            .bind(endpoint_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            revoked = super::end_device(&mut tx, user, endpoint_id, now).await?;
         }
         tx.commit().await?;
         if !trusted {

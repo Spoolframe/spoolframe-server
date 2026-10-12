@@ -110,44 +110,17 @@ pub struct Interface {
 /// This machine's interfaces that are up, now, each with its addresses.
 pub fn interfaces() -> Vec<Interface> {
     let mut found: Vec<Interface> = Vec::new();
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills `head` with a list it allocates, which is
-    // read only until the freeifaddrs below; each entry's name is a C
-    // string, and its address is read as the struct its family names.
-    unsafe {
-        if libc::getifaddrs(&mut head) != 0 {
-            return found;
+    for addr in crate::ifaddrs::up() {
+        if addr.name.is_empty() {
+            continue;
         }
-        let mut entry = head;
-        while let Some(ifa) = entry.as_ref() {
-            entry = ifa.ifa_next;
-            if ifa.ifa_addr.is_null()
-                || ifa.ifa_name.is_null()
-                || ifa.ifa_flags & libc::IFF_UP as u32 == 0
-            {
-                continue;
-            }
-            let ip = match i32::from((*ifa.ifa_addr).sa_family) {
-                libc::AF_INET => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    IpAddr::from(sa.sin_addr.s_addr.to_ne_bytes())
-                }
-                libc::AF_INET6 => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
-                    IpAddr::from(sa.sin6_addr.s6_addr)
-                }
-                _ => continue,
-            };
-            let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
-            match found.iter_mut().find(|i| i.name == name) {
-                Some(interface) => interface.addrs.push(ip),
-                None => found.push(Interface {
-                    name: name.into_owned(),
-                    addrs: vec![ip],
-                }),
-            }
+        match found.iter_mut().find(|i| i.name == addr.name) {
+            Some(interface) => interface.addrs.push(addr.ip),
+            None => found.push(Interface {
+                name: addr.name,
+                addrs: vec![addr.ip],
+            }),
         }
-        libc::freeifaddrs(head);
     }
     found
 }
@@ -208,11 +181,7 @@ impl Announce {
             let addr = match *added {
                 Added::Socket(addr) => addr,
                 Added::Ip(ip) => {
-                    let port = bound
-                        .iter()
-                        .find(|b| b.is_ipv4() == ip.is_ipv4())
-                        .or_else(|| bound.first())
-                        .map(SocketAddr::port);
+                    let port = port_of(bound, ip.is_ipv4());
                     match port {
                         Some(port) => SocketAddr::new(ip, port),
                         None => continue,
@@ -232,6 +201,17 @@ pub(crate) fn is_virtual(name: &str) -> bool {
     VIRTUAL_INTERFACES
         .iter()
         .any(|pattern| Glob(String::from(*pattern)).matches(name))
+}
+
+/// The port of the first of `bound` (the endpoint's sockets) of the
+/// family `ipv4` names, else of the first: the port told with an added
+/// address, and the one a router is asked to map (`network.wan`).
+pub(crate) fn port_of(bound: &[SocketAddr], ipv4: bool) -> Option<u16> {
+    bound
+        .iter()
+        .find(|b| b.is_ipv4() == ipv4)
+        .or_else(|| bound.first())
+        .map(SocketAddr::port)
 }
 
 /// Of `addrs`, the endpoint's own, those another device may reach it at
@@ -317,12 +297,7 @@ impl Told {
     /// The port of the endpoint's first IPv4 socket, else of its first:
     /// the one a router is asked to map (`network.wan`).
     pub fn own_port(&self) -> Option<u16> {
-        let bound = self.endpoint.bound_sockets();
-        bound
-            .iter()
-            .find(|b| b.is_ipv4())
-            .or_else(|| bound.first())
-            .map(SocketAddr::port)
+        port_of(&self.endpoint.bound_sockets(), true)
     }
 
     /// The public addresses (`network.wan`), each with its source.

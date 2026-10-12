@@ -260,6 +260,22 @@ async fn an_update_after_the_throttle_interval_is_written() {
     );
 }
 
+/// What judged the throttle is let go once the throttle has passed:
+/// the server does not remember every item ever played (Review
+/// 2026-10-11 N7.2).
+#[tokio::test]
+async fn writes_past_the_throttle_are_forgotten() {
+    let h = harness("throttle-forgotten").await;
+    let id = movie().id().clone();
+    h.progress(h.alice, &id, 600).await;
+    h.progress(h.bob, &id, 600).await;
+    assert_eq!(h.watch.written.lock().len(), 2);
+    h.clock.advance(h.watch.rules().throttle);
+    h.progress(h.alice, &id, 700).await;
+    // Bob's write is past the throttle and gone; Alice's new one stays.
+    assert_eq!(h.watch.written.lock().len(), 1);
+}
+
 /// The end of an item is throttled like the rest of it: one write at the
 /// crossing into watched, not one per report after it.
 #[tokio::test]

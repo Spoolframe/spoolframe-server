@@ -177,6 +177,15 @@ fn plan_checked(
 
 pub use spoolframe_protocol::playback::LINK_SHARE;
 
+/// The lower of two caps; either one alone when only it is set (not
+/// `Option::min`, for which an unset cap is the lowest).
+fn lower(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// `caps` for a playback of `quality` (P6-06): its `max_bitrate`, the
 /// app's own limit, lowered to [`LINK_SHARE`] of the link for `Auto`, or
 /// to the bitrate chosen, whichever is lower. `Auto` off the LAN is also
@@ -190,10 +199,7 @@ pub fn with_quality(
     let chosen = match quality {
         Quality::Auto { link_bitrate } => {
             let link = link_bitrate.map(|link| (link as f64 * LINK_SHARE) as u64);
-            match (link, share) {
-                (Some(link), Some(share)) => Some(link.min(share)),
-                (link, share) => link.or(share),
-            }
+            lower(link, share)
         }
         Quality::Bitrate { max_bitrate } => Some(max_bitrate),
         Quality::Original | Quality::Unknown => None,
@@ -279,10 +285,15 @@ fn converted_text(stream: &SubtitleStream, caps: &ClientCapabilities) -> Option<
     if format == SubtitleFormat::Unknown || caps.subtitles.contains(&format) {
         return None;
     }
+    sidecar_text(caps).map(|to| Shown::Text { to })
+}
+
+/// The text format a client takes for a subtitle sent beside the file:
+/// SubRip first, then WebVTT.
+fn sidecar_text(caps: &ClientCapabilities) -> Option<SubtitleFormat> {
     [SubtitleFormat::Srt, SubtitleFormat::WebVtt]
         .into_iter()
         .find(|f| caps.subtitles.contains(f))
-        .map(|to| Shown::Text { to })
 }
 
 /// The text format the server would send `stream` as, read with `ocr`;
@@ -308,10 +319,7 @@ fn as_text(
             stream.language.as_deref().unwrap_or("English")
         ));
     }
-    [SubtitleFormat::Srt, SubtitleFormat::WebVtt]
-        .into_iter()
-        .find(|f| caps.subtitles.contains(f))
-        .ok_or_else(|| "the client shows neither SubRip nor WebVTT".into())
+    sidecar_text(caps).ok_or_else(|| "the client shows neither SubRip nor WebVTT".into())
 }
 
 /// What does not fit the client as the file is, per part, each with the
@@ -776,11 +784,7 @@ pub fn plan_for(
         .as_ref()
         .and_then(|limits| limits.height)
         .map_or(source.height, |max| source.height.min(max));
-    let audio_bits = match audio.map(|a| a.action) {
-        Some(AudioAction::Encode { bitrate, .. }) => bitrate,
-        Some(_) => 640_000,
-        None => 0,
-    };
+    let audio_bits = audio_bits(audio.as_ref());
     // The top rung: the source's own rate, or what its height is worth,
     // under the app's own cap.
     let source_bits = descriptor
@@ -789,10 +793,7 @@ pub fn plan_for(
         .unwrap_or_else(|| worth(tallest, codec));
     // Under the uplink share too (PX-46): the ladder's top is what this
     // playback may take of it.
-    let own = match (caps.max_bitrate, share) {
-        (Some(own), Some(share)) => Some(own.min(share)),
-        (own, share) => own.or(share),
-    };
+    let own = lower(caps.max_bitrate, share);
     let top = own.map_or(source_bits, |max| {
         source_bits.min(max.saturating_sub(audio_bits))
     });
@@ -848,11 +849,7 @@ fn remux_ladder(
     else {
         return plan;
     };
-    let audio_bits = match audio.map(|a| a.action) {
-        Some(AudioAction::Encode { bitrate, .. }) => bitrate,
-        Some(_) => 640_000,
-        None => 0,
-    };
+    let audio_bits = audio_bits(audio.as_ref());
     let copy_bits = descriptor
         .bit_rate
         .map(|bits| bits.saturating_sub(audio_bits))
@@ -949,6 +946,19 @@ fn worth(height: u32, codec: VideoCodec) -> u64 {
     2 * scaled(least, codec)
 }
 
+/// What a copied (not re-encoded) audio track is allowed inside a bitrate
+/// budget: E-AC-3 5.1's ceiling.
+const COPIED_AUDIO_BITS: u64 = 640_000;
+
+/// The bits `audio` takes from a video's bitrate budget.
+fn audio_bits(audio: Option<&ConvertedAudio>) -> u64 {
+    match audio.map(|a| a.action) {
+        Some(AudioAction::Encode { bitrate, .. }) => bitrate,
+        Some(_) => COPIED_AUDIO_BITS,
+        None => 0,
+    }
+}
+
 /// The video encode for `caps` (PGPU-06): the first of `encoders`' video
 /// encoders, in the order the server prefers them (`transcode.video_codecs`
 /// for the GPUs' codecs, then software H.264), that the client plays. A
@@ -1000,11 +1010,7 @@ fn encode_video(
     let codec = chosen.codec;
     let tone_map = video.hdr.is_some() && !keeps(chosen);
     // Leave room for the audio inside the client's limit.
-    let audio_bits = match audio.map(|a| a.action) {
-        Some(AudioAction::Encode { bitrate, .. }) => bitrate,
-        Some(_) => 640_000,
-        None => 0,
-    };
+    let audio_bits = audio_bits(audio);
     let max_bitrate = caps
         .max_bitrate
         .map(|max| max.saturating_sub(audio_bits).max(500_000));
@@ -1292,11 +1298,15 @@ fn audio_index(descriptor: &MediaDescriptor, picked: Option<u32>) -> Result<Opti
     match picked {
         Some(picked) if (picked as usize) < descriptor.audio.len() => Ok(Some(picked as usize)),
         Some(picked) => Err(format!("audio {picked}: no such track")),
-        None if descriptor.audio.is_empty() => Ok(None),
-        None => Ok(Some(
-            descriptor.audio.iter().position(|a| a.default).unwrap_or(0),
-        )),
+        None => Ok(default_audio(descriptor)),
     }
+}
+
+/// The file's default audio track: the first marked default, else the
+/// first; none if it has no audio.
+pub(crate) fn default_audio(descriptor: &MediaDescriptor) -> Option<usize> {
+    (!descriptor.audio.is_empty())
+        .then(|| descriptor.audio.iter().position(|a| a.default).unwrap_or(0))
 }
 
 #[cfg(test)]

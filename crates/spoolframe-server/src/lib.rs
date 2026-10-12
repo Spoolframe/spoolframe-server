@@ -22,6 +22,7 @@ mod events;
 pub mod files;
 pub mod gpu_status;
 pub mod identity;
+mod ifaddrs;
 pub mod invites;
 mod keyed_locks;
 pub mod libraries;

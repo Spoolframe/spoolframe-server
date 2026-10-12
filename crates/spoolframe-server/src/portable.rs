@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::portable::{
     CredentialError, GenesisError, PortableIdentityState, PortableUserId, Signature,
-    UserDeviceCredential, verify_device_proof,
+    UserDeviceCredential, root_set, verify_device_proof,
 };
 
 use crate::clock::Clock;
@@ -125,12 +125,16 @@ pub async fn check_presentation(
             return Err(PresentationError::Genesis(GenesisError::BadSignature));
         }
     }
-    let roots = store
-        .root_set(credential.user, credential.genesis.as_deref(), states)
-        .await?;
-    let before = store
-        .root_set(credential.user, credential.genesis.as_deref(), &[])
-        .await?;
+    // The roots this server knows (`before`), and with the states carried
+    // in too (`roots`), from one read of what it keeps.
+    let carried = credential.genesis.as_deref();
+    let (kept, mut all) = store.root_states(credential.user, carried).await?;
+    let genesis = carried
+        .filter(|g| g.user() == credential.user)
+        .or(kept.as_ref());
+    let before = root_set(&credential.user, genesis, &all);
+    all.extend(states.iter().filter(|s| s.user == credential.user).cloned());
+    let roots = root_set(&credential.user, genesis, &all);
     if states.iter().any(|state| {
         state.user != credential.user
             || !roots.knew(&state.signer())

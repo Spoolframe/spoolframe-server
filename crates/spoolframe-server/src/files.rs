@@ -1,6 +1,7 @@
 //! Opening files that someone other than the server can change: media
 //! and the subtitle files beside them (PX-09 B-1). And keeping the
-//! server's own files to its own user (PX-11 finding 35).
+//! server's own files to its own user (PX-11 finding 35), writing them so
+//! a crash leaves them whole, and the stamp a cache keys a file by.
 
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::Path;
@@ -73,6 +74,37 @@ pub async fn is_regular(path: &Path) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::other("not a regular file"))
     }
+}
+
+/// `bytes` written to `path` and synced, ready to be renamed into place:
+/// after a power loss the final name never holds an empty or partial file
+/// (review 2026-10-11 L19).
+pub async fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await
+}
+
+/// A file's size and modification time (nanoseconds).
+pub async fn stamp(path: &Path) -> std::io::Result<(u64, u128)> {
+    let meta = tokio::fs::metadata(path).await?;
+    let modified = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    Ok((meta.len(), modified))
+}
+
+/// A cache key's hash of `parts`, each ended by a NUL so no two lists of
+/// parts run together into one.
+pub fn hash_parts(parts: &[String]) -> blake3::Hash {
+    let mut hash = blake3::Hasher::new();
+    for part in parts {
+        hash.update(part.as_bytes());
+        hash.update(&[0]);
+    }
+    hash.finalize()
 }
 
 #[cfg(test)]

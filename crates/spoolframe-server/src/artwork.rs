@@ -386,6 +386,10 @@ impl ArtworkCache {
             .acquire()
             .await
             .map_err(|e| ArtworkError::Image(e.to_string()))?;
+        let original = Image {
+            bytes: original.bytes,
+            content_type: original.content_type,
+        };
         tokio::task::spawn_blocking(move || resize(original, width))
             .await
             .map_err(|e| ArtworkError::Image(e.to_string()))?
@@ -428,7 +432,7 @@ impl ArtworkCache {
             .dir
             .join(format!("{key}.{}", extension(&image.content_type)));
         let tmp = file.with_extension("tmp");
-        write_synced(&tmp, &image.bytes).await?;
+        crate::files::write_synced(&tmp, &image.bytes).await?;
         tokio::fs::rename(&tmp, &file).await?;
         let entry = Entry {
             file,
@@ -446,16 +450,6 @@ impl ArtworkCache {
             etag: key.to_owned(),
         })
     }
-}
-
-/// `bytes` written to `path` and synced before it is renamed into place: a
-/// power loss after the rename never leaves an empty file under the final
-/// name (review 2026-10-11 L19).
-async fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(path).await?;
-    file.write_all(bytes).await?;
-    file.sync_all().await
 }
 
 /// The widest and tallest artwork decoded (finding 54): the Linux client's
@@ -502,17 +496,14 @@ fn image_error(e: image::ImageError) -> ArtworkError {
 
 /// `original` scaled down to `width` (never up). Transparent images stay
 /// PNG; everything else becomes a JPEG.
-pub(crate) fn resize(original: Artwork, width: u32) -> Result<Image, ArtworkError> {
+pub(crate) fn resize(original: Image, width: u32) -> Result<Image, ArtworkError> {
     // The size from the header first: a picture no wider is served as it
     // is, and is not decoded at all.
     let (wide, _) = reader(&original.bytes)?
         .into_dimensions()
         .map_err(image_error)?;
     if wide <= width {
-        return Ok(Image {
-            bytes: original.bytes,
-            content_type: original.content_type,
-        });
+        return Ok(original);
     }
     let decoded = reader(&original.bytes)?.decode().map_err(image_error)?;
     let scaled = decoded.resize(width, u32::MAX, FilterType::Lanczos3);
@@ -798,11 +789,10 @@ mod tests {
         assert_eq!(fetches(&catalog), 0);
     }
 
-    fn artwork(bytes: Vec<u8>) -> Artwork {
-        Artwork {
+    fn artwork(bytes: Vec<u8>) -> Image {
+        Image {
             bytes,
             content_type: "image/png".into(),
-            etag: "e".into(),
         }
     }
 

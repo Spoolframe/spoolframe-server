@@ -409,16 +409,7 @@ impl Prober {
             .collect::<Vec<_>>()
             .join(",");
         let mut cmd = self.command(path).await.map_err(|e| e.to_string())?;
-        cmd.args(["-v", "error", "-select_streams", "v:0"])
-            .args(["-read_intervals", &intervals])
-            .args([
-                "-show_entries",
-                "packet=pts_time,flags",
-                "-of",
-                "csv=p=0",
-                "-i",
-            ])
-            .arg(path);
+        keyframe_listing(&mut cmd, path, Some(&intervals));
         let output = self
             .output(cmd, path, MAX_KEYFRAME_LISTING, self.timeout)
             .await
@@ -444,45 +435,23 @@ impl Prober {
     /// decoding: all of the file is read. Not cached.
     pub async fn scan_keyframes(&self, path: &Path) -> Result<Keyframes, ProbeError> {
         let mut cmd = self.command(path).await?;
-        cmd.args(["-v", "error", "-select_streams", "v:0"])
-            .args([
-                "-show_entries",
-                "packet=pts_time,flags",
-                "-of",
-                "csv=p=0",
-                "-i",
-            ])
-            .arg(path);
+        keyframe_listing(&mut cmd, path, None);
         let output = self
             .output(cmd, path, MAX_KEYFRAME_LISTING, KEYFRAME_TIMEOUT)
             .await?;
         Ok(Arc::new(keyframe_times(&String::from_utf8_lossy(&output))))
     }
 
-    /// ffprobe confined to `path`: a VobSub `.idx` with its `.sub`, which
-    /// ffmpeg opens by the `.idx`'s name. Made on the blocking pool: making
-    /// it opens and resolves the media's path, which on a network mount
-    /// can block for as long as the mount does (review 2026-10-11 L60).
+    /// ffprobe confined to media `path` ([`Jail::media`]), made off the
+    /// async workers ([`crate::sandbox::Tool::command_off_thread`]).
     async fn command(&self, path: &Path) -> Result<crate::sandbox::Command, ProbeError> {
-        let (ffprobe, path) = (self.ffprobe.clone(), path.to_owned());
-        let program = self.ffprobe.program().to_owned();
-        tokio::task::spawn_blocking(move || {
-            let mut jail = Jail::new(Limits::PROBE).input(&path);
-            if path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("idx"))
-            {
-                jail = jail.input(path.with_extension("sub"));
-            }
-            ffprobe.command(&jail)
-        })
-        .await
-        .map_err(std::io::Error::other)
-        .and_then(|made| made)
-        .map_err(|source| ProbeError::Spawn {
-            ffprobe: program,
-            source,
-        })
+        self.ffprobe
+            .command_off_thread(Jail::new(Limits::PROBE).media(path))
+            .await
+            .map_err(|source| ProbeError::Spawn {
+                ffprobe: self.ffprobe.program().to_owned(),
+                source,
+            })
     }
 
     async fn run(&self, path: &Path) -> Result<FfProbe, ProbeError> {
@@ -561,6 +530,24 @@ async fn read_index(path: &Path) -> Result<keyframe_index::Indexed, String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// ffprobe's listing of `path`'s first video stream's packets, as
+/// [`keyframe_times`] reads it; limited to `intervals`
+/// (`-read_intervals`) when given.
+fn keyframe_listing(cmd: &mut crate::sandbox::Command, path: &Path, intervals: Option<&str>) {
+    cmd.args(["-v", "error", "-select_streams", "v:0"]);
+    if let Some(intervals) = intervals {
+        cmd.args(["-read_intervals", intervals]);
+    }
+    cmd.args([
+        "-show_entries",
+        "packet=pts_time,flags",
+        "-of",
+        "csv=p=0",
+        "-i",
+    ])
+    .arg(path);
 }
 
 /// `pts_time,flags` lines (`12.345000,K__`) → the keyframes' times in ms,

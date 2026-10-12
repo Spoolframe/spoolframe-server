@@ -119,7 +119,7 @@ pub fn cues_within(stream: &[u8], budget: &Budget) -> Result<Vec<Cue>, PgsError>
                     // not text when the picture's ink is worked out
                     // (review 2026-10-11 L69).
                     palette[usize::from(index)] = Colour {
-                        luma: (u32::from(luma.saturating_sub(16)) * 255 / 219).min(255) as u8,
+                        luma: bitmap::video_luma(luma),
                         alpha,
                     };
                 }

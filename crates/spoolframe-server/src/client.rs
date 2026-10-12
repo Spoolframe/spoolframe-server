@@ -580,6 +580,10 @@ impl ClientProtocol {
                 .into();
             }
         };
+        // The session a mutation was authenticated with for its operation,
+        // handed to its execution so it is not looked up twice (Review
+        // 2026-10-11 N2.3): set below, before the execution runs.
+        let known: Arc<std::sync::OnceLock<(SessionId, Who)>> = Arc::default();
         let execute = {
             let this = self.clone();
             let connection = connection.clone();
@@ -588,8 +592,11 @@ impl ClientProtocol {
             let name = name.to_owned();
             let request = wire.envelope.request.clone();
             let expected = wire.expected_revision;
+            let known = known.clone();
             async move {
-                let response = this.answer_once(&connection, &state, &bytes, &name).await;
+                let response = this
+                    .answer_once(&connection, &state, &bytes, &name, known.get().cloned())
+                    .await;
                 let playback = match (&response, request) {
                     (Response::Ok(Reply::PlaybackStarted { handle, .. }), _) => {
                         Some(PlaybackRevision {
@@ -669,6 +676,7 @@ impl ClientProtocol {
                     return Response::Err(error).into();
                 }
                 user = Some(signed_in.principal().to_string());
+                let _ = known.set((session, signed_in));
             }
             operations.begin(
                 crate::operations::Owner {
@@ -701,43 +709,89 @@ impl ClientProtocol {
             });
         }
         let mut outcome = invocation.outcome;
-        loop {
-            let reply = outcome.borrow().clone();
-            if let Some(reply) = reply {
-                // A replay can recover an outcome, but cannot restore a PIN
-                // unlock from another connection or from before a profile switch.
-                if replay
-                    && matches!(reply.response, Response::Ok(_))
-                    && matches!(
-                        wire.envelope.request,
-                        Request::UnlockProfile { .. } | Request::SetPinRequired { .. }
-                    )
-                {
-                    let (session, _) = match self
-                        .authenticate(connection, state, wire.envelope.session.clone())
-                        .await
-                    {
-                        Ok(user) => user,
-                        Err(error) => return Response::Err(error).into(),
-                    };
-                    if state.locks.lock().locked(&session) {
-                        return Response::Err(Error::ProfileLocked).into();
-                    }
-                }
-                return reply;
-            }
-            if outcome.changed().await.is_err() {
-                return Response::Err(Error::Internal).into();
+        let reply = match outcome.wait_for(Option::is_some).await {
+            Ok(reply) => reply.clone().expect("waited for an outcome"),
+            Err(_) => return Response::Err(Error::Internal).into(),
+        };
+        // A replay can recover an outcome, but cannot restore a PIN
+        // unlock from another connection or from before a profile switch.
+        if replay
+            && matches!(reply.response, Response::Ok(_))
+            && matches!(
+                wire.envelope.request,
+                Request::UnlockProfile { .. } | Request::SetPinRequired { .. }
+            )
+        {
+            let (session, _) = match self
+                .authenticate(connection, state, wire.envelope.session.clone())
+                .await
+            {
+                Ok(user) => user,
+                Err(error) => return Response::Err(error).into(),
+            };
+            if state.locks.lock().locked(&session) {
+                return Response::Err(Error::ProfileLocked).into();
             }
         }
+        reply
     }
 
+    /// A Hello: the device's own words kept for the connection, its
+    /// events stream opened, and this server's info as the answer.
+    async fn hello(
+        &self,
+        connection: &Connection,
+        state: &ConnectionState,
+        hello: spoolframe_protocol::Hello,
+    ) -> Response {
+        // Kept, and shown to approvers: each string is bounded
+        // (PX-10, finding 17).
+        let hello = hello.within_bounds();
+        if hello.protocol_version != spoolframe_protocol::PROTOCOL_VERSION {
+            return Response::Err(Error::Unsupported {
+                request: "protocol revision; update the SDK".into(),
+            });
+        }
+        tracing::debug!(?hello, "hello");
+        let platform = hello.platform;
+        if state.hello.set(hello).is_ok() {
+            // A device signed in before platforms were kept gets
+            // one now; a failure costs only the label.
+            let endpoint = connection.remote_id().to_string();
+            if let Some(hello) = state.hello.get() {
+                self.services
+                    .connected
+                    .hello(connection.stable_id(), endpoint.clone(), hello);
+                // As for the events stream: closed meanwhile, the
+                // accept loop's closed() may have come first.
+                if connection.close_reason().is_some() {
+                    self.services.connected.closed(connection.stable_id());
+                }
+            }
+            if let Err(e) = self.store().note_device_platform(&endpoint, platform).await {
+                tracing::warn!(error = %e, %endpoint, "cannot keep the device's platform");
+            }
+            self.open_events(connection).await;
+            // A device that kept a session is signed in already.
+            self.addresses.tell(connection.stable_id());
+        }
+        Ok::<_, Error>(Reply::ServerInfo(ServerInfo {
+            name: self.name.get(),
+            ..(*self.info).clone()
+        }))
+        .into()
+    }
+
+    /// `known`: the session the request names, already authenticated by
+    /// [`Self::answer`] for its operation, used instead of a second look
+    /// up when it is the one the request names.
     async fn answer_once(
         &self,
         connection: &Connection,
         state: &ConnectionState,
         bytes: &[u8],
         name: &str,
+        known: Option<(SessionId, Who)>,
     ) -> Response {
         let wire: RpcRequest = match codec::decode(bytes) {
             Ok(envelope) => envelope,
@@ -748,47 +802,21 @@ impl ClientProtocol {
             }
         };
         let envelope = wire.envelope;
-        let reply = match envelope.request {
-            Request::Hello(hello) => {
-                // Kept, and shown to approvers: each string is bounded
-                // (PX-10, finding 17).
-                let hello = hello.within_bounds();
-                if hello.protocol_version != spoolframe_protocol::PROTOCOL_VERSION {
-                    return Response::Err(Error::Unsupported {
-                        request: "protocol revision; update the SDK".into(),
-                    });
-                }
-                tracing::debug!(?hello, "hello");
-                let platform = hello.platform;
-                if state.hello.set(hello).is_ok() {
-                    // A device signed in before platforms were kept gets
-                    // one now; a failure costs only the label.
-                    let endpoint = connection.remote_id().to_string();
-                    if let Some(hello) = state.hello.get() {
-                        self.services.connected.hello(
-                            connection.stable_id(),
-                            endpoint.clone(),
-                            hello,
-                        );
-                        // As for the events stream: closed meanwhile, the
-                        // accept loop's closed() may have come first.
-                        if connection.close_reason().is_some() {
-                            self.services.connected.closed(connection.stable_id());
-                        }
-                    }
-                    if let Err(e) = self.store().note_device_platform(&endpoint, platform).await {
-                        tracing::warn!(error = %e, %endpoint, "cannot keep the device's platform");
-                    }
-                    self.open_events(connection).await;
-                    // A device that kept a session is signed in already.
-                    self.addresses.tell(connection.stable_id());
-                }
-                Ok(Reply::ServerInfo(ServerInfo {
-                    name: self.name.get(),
-                    ..(*self.info).clone()
-                }))
-            }
-            _ if state.hello.get().is_none() => Err(Error::HandshakeRequired),
+        let request = match envelope.request {
+            Request::Hello(hello) => return self.hello(connection, state, hello).await,
+            request => request,
+        };
+        let Some(hello) = state.hello.get() else {
+            return Response::Err(Error::HandshakeRequired);
+        };
+        // The sign-ins a stranger makes, and what is guessed only at that
+        // rate, draw on the strangers' sign-in budget first (PX-10).
+        if crate::operations::on_strangers_budget(&request)
+            && let Err(e) = self.stranger_attempt(state)
+        {
+            return Response::Err(e);
+        }
+        let reply = match request {
             Request::ReadSubtitle { .. } | Request::ReadSubtitleSegment { .. } => {
                 Err(Error::Unsupported {
                     request: "subtitle bytes require a resource stream".into(),
@@ -801,15 +829,8 @@ impl ClientProtocol {
                 methods: self.info.auth_methods.clone(),
             }),
             Request::Ping => Ok(Reply::Pong),
-            Request::LoginPassword(login) => {
-                let hello = state.hello.get().expect("checked above");
-                match self.stranger_attempt(state) {
-                    Ok(()) => self.login_password(connection, login, hello).await,
-                    Err(e) => Err(e),
-                }
-            }
+            Request::LoginPassword(login) => self.login_password(connection, login, hello).await,
             Request::BeginDeviceSignIn { remember } => {
-                let hello = state.hello.get().expect("checked above");
                 let started = self.services.auth.sign_ins().begin(Waiting {
                     endpoint: connection.remote_id().to_string(),
                     device_name: hello.device_name.clone(),
@@ -850,12 +871,9 @@ impl ClientProtocol {
                             remembered = handover.remembered,
                             "device signed in by approval"
                         );
-                        self.signed_in(connection, &handover.token.0).await;
-                        Ok(Reply::LoggedIn {
-                            session: SessionId(handover.token.0),
-                            remembered: handover.remembered,
-                            password_change_required: false,
-                        })
+                        Ok(self
+                            .logged_in(connection, handover.token, handover.remembered, false)
+                            .await)
                     }
                     Outcome::Pending => Ok(Reply::DeviceSignInPending),
                     Outcome::Denied => Err(Error::DeviceSignInDenied),
@@ -863,12 +881,9 @@ impl ClientProtocol {
                 }
             }
             Request::BeginPasskeySignIn { username } => {
-                let endpoint = connection.remote_id().to_string();
                 // Held per endpoint, and endpoints are free: strangers'
-                // beginnings share their sign-in budget (PX-10).
-                if let Err(e) = self.stranger_attempt(state) {
-                    return Response::Err(e);
-                }
+                // beginnings share their sign-in budget (PX-10), drawn above.
+                let endpoint = connection.remote_id().to_string();
                 self.services
                     .app_passkeys
                     .begin_sign_in(
@@ -881,16 +896,13 @@ impl ClientProtocol {
                     .map(Reply::PasskeySignInBegun)
                     .map_err(sign_in_error)
             }
-            Request::FinishPasskeySignIn { signed, remember } => {
-                let hello = state.hello.get().expect("checked above");
-                match self.stranger_attempt(state).and(user_handle_given(&signed)) {
-                    Ok(()) => {
-                        self.finish_passkey_sign_in(connection, &signed, hello, remember)
-                            .await
-                    }
-                    Err(e) => Err(e),
+            Request::FinishPasskeySignIn { signed, remember } => match user_handle_given(&signed) {
+                Ok(()) => {
+                    self.finish_passkey_sign_in(connection, &signed, hello, remember)
+                        .await
                 }
-            }
+                Err(e) => Err(e),
+            },
             // P4-01. Neither draws on the strangers' sign-in budget: the
             // device's key is the proof, and nothing is guessed here.
             Request::TrustedProfiles => {
@@ -915,14 +927,10 @@ impl ClientProtocol {
                 })
             }
             Request::ResumeProfile { user_id } => {
-                let hello = state.hello.get().expect("checked above");
                 self.resume_profile(connection, &user_id, hello).await
             }
             // P7-06: a sign-in a stranger makes, on the same budget.
             Request::BeginPortableSignIn => {
-                if let Err(e) = self.stranger_attempt(state) {
-                    return Response::Err(e);
-                }
                 let endpoint = connection.remote_id().to_string();
                 match self.portable_sign_ins.begin(&endpoint) {
                     Some(nonce) => Ok(Reply::PortableSignInBegun {
@@ -935,76 +943,50 @@ impl ClientProtocol {
                 }
             }
             Request::FinishPortableSignIn(sign_in) => {
-                let hello = state.hello.get().expect("checked above");
-                match self.stranger_attempt(state) {
-                    Ok(()) => self.portable_sign_in(connection, &sign_in, hello).await,
-                    Err(e) => Err(e),
-                }
+                self.portable_sign_in(connection, &sign_in, hello).await
             }
             // P7-05: a sign-in a stranger makes, on the same budget.
             Request::RedeemPortableInvite(redeem) => {
-                let hello = state.hello.get().expect("checked above");
-                match self.stranger_attempt(state) {
-                    Ok(()) => {
-                        self.redeem_portable_invite(connection, &redeem, hello)
-                            .await
-                    }
-                    Err(e) => Err(e),
-                }
+                self.redeem_portable_invite(connection, &redeem, hello)
+                    .await
             }
             // P7-08: public data, on the strangers' budget.
-            Request::IdentityRecord { user } => match self.stranger_attempt(state) {
-                Ok(()) => self.identity_record(user).await,
-                Err(e) => Err(e),
-            },
-            Request::IdentityRecordByHandle { handle } => match self.stranger_attempt(state) {
-                Ok(()) => self.identity_record_by_handle(&handle).await,
-                Err(e) => Err(e),
-            },
+            Request::IdentityRecord { user } => self.identity_record(user).await,
+            Request::IdentityRecordByHandle { handle } => {
+                self.identity_record_by_handle(&handle).await
+            }
             // P7-08: pairing through this server, the code guessed only at
             // the strangers' rate. Collecting is the offering device's
             // own, every few seconds, and off the budget.
-            Request::OfferPairing(offer) => match self.stranger_attempt(state) {
-                Ok(()) => self
-                    .pairing_relay
-                    .offer(&connection.remote_id().to_string(), offer)
-                    .map(|()| Reply::Done)
-                    .map_err(relay_error),
-                Err(e) => Err(e),
-            },
-            Request::FetchPairing { code } => match self.stranger_attempt(state) {
-                Ok(()) => self
-                    .pairing_relay
-                    .fetch(&code)
-                    .map(Reply::PairingOffered)
-                    .map_err(relay_error),
-                Err(e) => Err(e),
-            },
-            Request::AnswerPairing { code, answer } => match self.stranger_attempt(state) {
-                Ok(()) => self
-                    .pairing_relay
-                    .answer(&code, answer)
-                    .map(|()| Reply::Done)
-                    .map_err(relay_error),
-                Err(e) => Err(e),
-            },
+            Request::OfferPairing(offer) => self
+                .pairing_relay
+                .offer(&connection.remote_id().to_string(), offer)
+                .map(|()| Reply::Done)
+                .map_err(relay_error),
+            Request::FetchPairing { code } => self
+                .pairing_relay
+                .fetch(&code)
+                .map(Reply::PairingOffered)
+                .map_err(relay_error),
+            Request::AnswerPairing { code, answer } => self
+                .pairing_relay
+                .answer(&code, answer)
+                .map(|()| Reply::Done)
+                .map_err(relay_error),
             Request::CollectPairing { code } => self
                 .pairing_relay
                 .collect(&connection.remote_id().to_string(), &code)
                 .map(|answer| Reply::PairingAnswered { answer })
                 .map_err(relay_error),
             // P6-01: a sign-in a stranger makes, on the same budget.
-            Request::RedeemInvite(redeem) => {
-                let hello = state.hello.get().expect("checked above");
-                match self.stranger_attempt(state) {
-                    Ok(()) => self.redeem_invite(connection, &redeem, hello).await,
-                    Err(e) => Err(e),
-                }
-            }
+            Request::RedeemInvite(redeem) => self.redeem_invite(connection, &redeem, hello).await,
             // Everything else needs a session that is live on this
             // endpoint. Each request names its own, so one connection can
             // serve several users at once (§15).
-            request => match self.authenticate(connection, state, envelope.session).await {
+            request => match match known {
+                Some(known) if Some(&known.0) == envelope.session.as_ref() => Ok(known),
+                _ => self.authenticate(connection, state, envelope.session).await,
+            } {
                 Ok((session, who)) => {
                     // Locked, only these two (P2-08).
                     let exempt = matches!(
@@ -1029,6 +1011,7 @@ impl ClientProtocol {
                             self.serve(
                                 connection,
                                 state,
+                                hello,
                                 session,
                                 who,
                                 request,
@@ -1157,9 +1140,9 @@ impl ClientProtocol {
         state: &ConnectionState,
         request: ResourceRequest,
     ) -> Result<(ResourceMetadata, u64, ResourceBody), Error> {
-        if state.hello.get().is_none() {
+        let Some(hello) = state.hello.get() else {
             return Err(Error::HandshakeRequired);
-        }
+        };
         match request {
             ResourceRequest::Artwork { request, max_bytes } => {
                 let image = self.find_artwork(connection, state, request).await?;
@@ -1187,27 +1170,8 @@ impl ClientProtocol {
                 // again after preparation, outside that wait, before labelling
                 // the pinned file with this revision.
                 let _control = self
-                    .services
-                    .playbacks
-                    .control(
-                        &request.handle,
-                        &request.session,
-                        &connection.remote_id().to_string(),
-                    )
-                    .await
-                    .map_err(playback_refusal)?;
-                let current = self
-                    .use_playback_with(
-                        connection,
-                        &request.handle,
-                        &request.session,
-                        Using::Plays,
-                        |p| p.revision,
-                    )
+                    .hold_revision(connection, &request.handle, &request.session, revision)
                     .await?;
-                if current != revision {
-                    return Err(Error::RevisionConflict { revision: current });
-                }
                 // On its chart in playback debug (P3-15).
                 self.services.playbacks.read(
                     &request.handle,
@@ -1262,12 +1226,8 @@ impl ClientProtocol {
                     .await?;
                 state.locks.lock().use_session(&session)?;
                 // A stale revision is refused before any work.
-                let now = self
-                    .use_playback_with(connection, &handle, &session, Using::Plays, |p| p.revision)
+                self.check_revision(connection, &handle, &session, revision)
                     .await?;
-                if now != revision {
-                    return Err(Error::RevisionConflict { revision: now });
-                }
                 // The text is found, or waited for (up to READ_WAIT while
                 // OCR runs), holding no lock: a seek, a subtitle change, a
                 // stop or a progress report on this playback goes on
@@ -1276,20 +1236,11 @@ impl ClientProtocol {
                 // so a subtitle changed meanwhile is never labelled with
                 // this revision.
                 let reply = self
-                    .serve(connection, state, session.clone(), who, read, None)
+                    .serve(connection, state, hello, session.clone(), who, read, None)
                     .await?;
                 let _control = self
-                    .services
-                    .playbacks
-                    .control(&handle, &session, &connection.remote_id().to_string())
-                    .await
-                    .map_err(playback_refusal)?;
-                let now = self
-                    .use_playback_with(connection, &handle, &session, Using::Plays, |p| p.revision)
+                    .hold_revision(connection, &handle, &session, revision)
                     .await?;
-                if now != revision {
-                    return Err(Error::RevisionConflict { revision: now });
-                }
                 let (format, bytes, total, version) = match reply {
                     Reply::SubtitleChunk {
                         format,
@@ -1407,6 +1358,45 @@ impl ClientProtocol {
     ) -> Result<Playback, Error> {
         self.use_playback_with(connection, handle, session, how, Playback::clone)
             .await
+    }
+
+    /// Refuse with `RevisionConflict` unless `handle` is still at
+    /// `revision`.
+    async fn check_revision(
+        &self,
+        connection: &Connection,
+        handle: &PlaybackHandle,
+        session: &SessionId,
+        revision: u64,
+    ) -> Result<(), Error> {
+        let now = self
+            .use_playback_with(connection, handle, session, Using::Plays, |p| p.revision)
+            .await?;
+        if now != revision {
+            return Err(Error::RevisionConflict { revision: now });
+        }
+        Ok(())
+    }
+
+    /// Take `handle`'s control lock, then check `revision` again under it:
+    /// a result prepared without the lock is never labelled with a
+    /// revision replaced meanwhile. The lock is held while the guard is.
+    async fn hold_revision(
+        &self,
+        connection: &Connection,
+        handle: &PlaybackHandle,
+        session: &SessionId,
+        revision: u64,
+    ) -> Result<crate::keyed_locks::Guard<'_>, Error> {
+        let control = self
+            .services
+            .playbacks
+            .control(handle, session, &connection.remote_id().to_string())
+            .await
+            .map_err(playback_refusal)?;
+        self.check_revision(connection, handle, session, revision)
+            .await?;
+        Ok(control)
     }
 
     /// [`Self::use_playback_as`], taking only what `read` reads of the
@@ -1709,10 +1699,15 @@ impl ClientProtocol {
     }
 
     /// A request in a checked session.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the call sites name each part; a struct would only repeat them"
+    )]
     async fn serve(
         &self,
         connection: &Connection,
         state: &ConnectionState,
+        hello: &spoolframe_protocol::Hello,
         session: SessionId,
         who: Who,
         request: Request,
@@ -1741,11 +1736,13 @@ impl ClientProtocol {
         | Request::SeekPlayback { handle, .. }
         | Request::StopPlayback { handle } = &request
         {
-            let playback = self.use_playback(connection, handle, &session).await?;
-            if expected_revision != Some(playback.revision) {
-                return Err(Error::RevisionConflict {
-                    revision: playback.revision,
-                });
+            // Only the session and endpoint that started it may control or
+            // end it; and only at the revision the client expects.
+            let revision = self
+                .use_playback_with(connection, handle, &session, Using::Plays, |p| p.revision)
+                .await?;
+            if expected_revision != Some(revision) {
+                return Err(Error::RevisionConflict { revision });
             }
         }
         match request {
@@ -1755,15 +1752,15 @@ impl ClientProtocol {
             }
             Request::PlaybackProgressSequence { handle } => Ok(Reply::PlaybackProgressSequence {
                 sequence: self
-                    .use_playback(connection, &handle, &session)
-                    .await?
-                    .progress_sequence,
+                    .use_playback_with(connection, &handle, &session, Using::Plays, |p| {
+                        p.progress_sequence
+                    })
+                    .await?,
             }),
             Request::PlaybackRevision { handle } => Ok(Reply::PlaybackRevision {
                 revision: self
-                    .use_playback(connection, &handle, &session)
-                    .await?
-                    .revision,
+                    .use_playback_with(connection, &handle, &session, Using::Plays, |p| p.revision)
+                    .await?,
             }),
             Request::WhoAmI => {
                 let user = match &who {
@@ -2268,22 +2265,20 @@ impl ClientProtocol {
                 // Alive, not played: a paused client reports on (once a
                 // minute, PROTOCOL.md) and must not hold its slot against
                 // its own device's next start.
-                let playback = self
-                    .use_playback_as(connection, &handle, &session, Using::Reports)
+                let item = self
+                    .use_playback_with(connection, &handle, &session, Using::Reports, |p| {
+                        p.item.clone()
+                    })
                     .await?;
                 let _progress = self
                     .services
                     .playbacks
-                    .progress_control(&session, &playback.item)
+                    .progress_control(&session, &item)
                     .await;
                 self.services.playbacks.check_progress(&handle, sequence)?;
                 self.services
                     .watch
-                    .progress(
-                        principal,
-                        &playback.item,
-                        Duration::from_millis(position_ms),
-                    )
+                    .progress(principal, &item, Duration::from_millis(position_ms))
                     .await
                     .map_err(watch_error)?;
                 self.services
@@ -2451,19 +2446,14 @@ impl ClientProtocol {
                     .selection(principal, &id, &descriptor, selection)
                     .await?;
                 let bitmap = self.bitmap(principal, bitmap).await?;
-                let plan = planner::plan_for(
+                let plan = self.plan(
+                    state,
                     &descriptor,
                     caps.as_ref(),
                     quality,
                     share,
-                    !on_lan(&state.path()),
                     selection,
                     bitmap,
-                    &crate::encode::planning_encoders(
-                        &self.services.jobs,
-                        &self.services.transcoding.detected(),
-                    ),
-                    self.services.subtitles.ocr(),
                 );
                 let planned_in = requested.elapsed();
                 // The item's markers go with the playback (P2-10), so a
@@ -2474,7 +2464,6 @@ impl ClientProtocol {
                 if shown.duration_ms.is_none() {
                     shown.duration_ms = descriptor.duration.map(|d| d.as_millis() as u64);
                 }
-                let hello = state.hello.get().expect("served after Hello");
                 let viewer = crate::playback::Viewer {
                     user_id: principal.to_string(),
                     username: who.log_name(),
@@ -2652,19 +2641,14 @@ impl ClientProtocol {
                     subtitle,
                 };
                 let bitmap = self.bitmap(principal, bitmap).await?;
-                let plan = planner::plan_for(
+                let plan = self.plan(
+                    state,
                     &descriptor,
                     caps.as_ref(),
                     quality,
                     share,
-                    !on_lan(&state.path()),
                     selection,
                     bitmap,
-                    &crate::encode::planning_encoders(
-                        &self.services.jobs,
-                        &self.services.transcoding.detected(),
-                    ),
-                    self.services.subtitles.ocr(),
                 );
                 let (subtitle, (size, file), conversion, _) = self
                     .prepare(
@@ -2711,19 +2695,14 @@ impl ClientProtocol {
                 // Its share now (PX-46): a re-plan after `PlaybackShare`
                 // takes the one the event told.
                 let share = self.services.uplink.share_of(&handle.0);
-                let plan = planner::plan_for(
+                let plan = self.plan(
+                    state,
                     &descriptor,
                     caps.as_ref(),
                     quality,
                     share,
-                    !on_lan(&state.path()),
                     selection,
                     bitmap,
-                    &crate::encode::planning_encoders(
-                        &self.services.jobs,
-                        &self.services.transcoding.detected(),
-                    ),
-                    self.services.subtitles.ocr(),
                 );
                 let epoch_now = playback.conversion.as_ref().map_or(0, |c| c.job().epoch);
                 if plan == playback.planned {
@@ -2778,8 +2757,8 @@ impl ClientProtocol {
                 Ok(Reply::PlaybackChanged { plan, size, epoch })
             }
             Request::StopPlayback { handle } => {
-                // Only the session and endpoint that started it may end it.
-                self.use_playback(connection, &handle, &session).await?;
+                // Its session and endpoint were checked above, with its
+                // revision.
                 self.services
                     .playbacks
                     .end(&handle, crate::playback::EndReason::Finished);
@@ -2994,11 +2973,10 @@ impl ClientProtocol {
             Request::CreateInvite(create) => {
                 let user = admin(&who)?;
                 recently_signed_in(user, self.services.auth.store().now())?;
-                let hello = state.hello.get();
                 let origin = crate::store::invites::InviteOrigin::Device {
                     endpoint_id: connection.remote_id().to_string(),
-                    name: hello.and_then(|h| h.device_name.clone()),
-                    platform: hello.map_or(spoolframe_types::Platform::Unknown, |h| h.platform),
+                    name: hello.device_name.clone(),
+                    platform: hello.platform,
                 };
                 let request = crate::invites::InviteRequest {
                     kind: invite_kind(create.kind)?,
@@ -3081,12 +3059,7 @@ impl ClientProtocol {
         if state.peer.signed_in_locally() {
             return Ok(());
         }
-        self.services
-            .auth
-            .stranger_attempt()
-            .map_err(|wait| Error::RateLimited {
-                retry_after_ms: wait.as_millis().max(1) as u64,
-            })
+        self.services.auth.stranger_attempt().map_err(rate_limited)
     }
 
     /// A password login from this connection's endpoint. The session is
@@ -3099,11 +3072,7 @@ impl ClientProtocol {
         hello: &Hello,
     ) -> Result<Reply, Error> {
         let endpoint_id = connection.remote_id().to_string();
-        let binding = SessionBinding::Endpoint {
-            endpoint_id: endpoint_id.clone(),
-            device_name: hello.device_name.clone(),
-            platform: hello.platform,
-        };
+        let binding = endpoint_binding(&endpoint_id, hello);
         match self
             .services
             .auth
@@ -3124,12 +3093,14 @@ impl ClientProtocol {
                     password_change_required = done.password_change_required,
                     "logged in"
                 );
-                self.signed_in(connection, &done.token.0).await;
-                Ok(Reply::LoggedIn {
-                    session: SessionId(done.token.0),
-                    remembered: done.remembered,
-                    password_change_required: done.password_change_required,
-                })
+                Ok(self
+                    .logged_in(
+                        connection,
+                        done.token,
+                        done.remembered,
+                        done.password_change_required,
+                    )
+                    .await)
             }
             Err(e) => Err(login_error(e)),
         }
@@ -3148,11 +3119,7 @@ impl ClientProtocol {
         let (user, role) = crate::invites::redeem(&self.services.auth, &endpoint_id, redeem)
             .await
             .map_err(redeem_error)?;
-        let binding = SessionBinding::Endpoint {
-            endpoint_id: endpoint_id.clone(),
-            device_name: hello.device_name.clone(),
-            platform: hello.platform,
-        };
+        let binding = endpoint_binding(&endpoint_id, hello);
         let token = self
             .services
             .auth
@@ -3166,12 +3133,7 @@ impl ClientProtocol {
             %role,
             "an account was made with an invite"
         );
-        self.signed_in(connection, &token.0).await;
-        Ok(Reply::LoggedIn {
-            session: SessionId(token.0),
-            remembered: false,
-            password_change_required: false,
-        })
+        Ok(self.logged_in(connection, token, false, false).await)
     }
 
     /// A sign-in with an app passkey (P3-19) from this connection's
@@ -3190,11 +3152,7 @@ impl ClientProtocol {
             .finish_sign_in(&self.services.auth, &endpoint_id, signed)
             .await
             .map_err(sign_in_error)?;
-        let binding = SessionBinding::Endpoint {
-            endpoint_id: endpoint_id.clone(),
-            device_name: hello.device_name.clone(),
-            platform: hello.platform,
-        };
+        let binding = endpoint_binding(&endpoint_id, hello);
         let token = self
             .services
             .auth
@@ -3213,12 +3171,19 @@ impl ClientProtocol {
             remembered,
             "logged in with an app passkey"
         );
-        self.signed_in(connection, &token.0).await;
-        Ok(Reply::LoggedIn {
-            session: SessionId(token.0),
-            remembered,
-            password_change_required: false,
-        })
+        Ok(self.logged_in(connection, token, remembered, false).await)
+    }
+
+    /// A portable sign-in's guess, on its endpoint's own failure count: a
+    /// sign-in and an invite redemption share it.
+    fn portable_guess(&self, endpoint_id: &str) -> Result<crate::auth::Guess, Error> {
+        self.services
+            .auth
+            .guess(
+                format!("portable@{endpoint_id}"),
+                Some(endpoint_id.to_owned()),
+            )
+            .map_err(rate_limited)
     }
 
     /// A sign-in with a portable user's device credential (P7-06, §58)
@@ -3238,11 +3203,7 @@ impl ClientProtocol {
     ) -> Result<Reply, Error> {
         let endpoint_id = connection.remote_id().to_string();
         let auth = &self.services.auth;
-        let guess = auth
-            .guess(format!("portable@{endpoint_id}"), Some(endpoint_id.clone()))
-            .map_err(|wait| Error::RateLimited {
-                retry_after_ms: wait.as_millis().max(1) as u64,
-            })?;
+        let guess = self.portable_guess(&endpoint_id)?;
         let credential = self.check_portable(&endpoint_id, sign_in).await?;
         // Kept only for someone this server knows: a stranger's states
         // would fill its disk.
@@ -3268,11 +3229,7 @@ impl ClientProtocol {
     ) -> Result<Reply, Error> {
         let endpoint_id = connection.remote_id().to_string();
         let auth = &self.services.auth;
-        let guess = auth
-            .guess(format!("portable@{endpoint_id}"), Some(endpoint_id.clone()))
-            .map_err(|wait| Error::RateLimited {
-                retry_after_ms: wait.as_millis().max(1) as u64,
-            })?;
+        let guess = self.portable_guess(&endpoint_id)?;
         let credential = self.check_portable(&endpoint_id, &redeem.sign_in).await?;
         let user = credential.user;
         // The credential held: whatever the code makes of it, it was no
@@ -3496,11 +3453,7 @@ impl ClientProtocol {
                 );
                 return Err(Error::InvalidCredentials);
             }
-            let binding = SessionBinding::Endpoint {
-                endpoint_id: endpoint_id.clone(),
-                device_name: hello.device_name.clone(),
-                platform: hello.platform,
-            };
+            let binding = endpoint_binding(&endpoint_id, hello);
             let token = self
                 .services
                 .auth
@@ -3568,20 +3521,11 @@ impl ClientProtocol {
         else {
             return Err(Error::Unauthenticated);
         };
-        let binding = SessionBinding::Endpoint {
-            endpoint_id: endpoint_id.clone(),
-            device_name: hello.device_name.clone(),
-            platform: hello.platform,
-        };
+        let binding = endpoint_binding(&endpoint_id, hello);
         match self.services.auth.resume(user, &binding).await {
             Ok(Some(token)) => {
                 tracing::info!(endpoint = %endpoint_id, user = %user, "resumed on a trusted device");
-                self.signed_in(connection, &token.0).await;
-                Ok(Reply::LoggedIn {
-                    session: SessionId(token.0),
-                    remembered: true,
-                    password_change_required: false,
-                })
+                Ok(self.logged_in(connection, token, true, false).await)
             }
             Ok(None) => {
                 tracing::info!(endpoint = %endpoint_id, user = %user, "a resume was refused");
@@ -3724,12 +3668,7 @@ impl ClientProtocol {
         user: &SessionUser,
         password: &str,
     ) -> Result<(), Error> {
-        let account = self
-            .store()
-            .user_by_id(user.user)
-            .await
-            .map_err(internal)?
-            .ok_or(Error::Unauthenticated)?;
+        let account = self.account(user).await?;
         if !account.has_password {
             return Err(Error::NoPassword);
         }
@@ -3808,9 +3747,7 @@ impl ClientProtocol {
             .services
             .auth
             .guess(what, Some(from))
-            .map_err(|retry_after| Error::RateLimited {
-                retry_after_ms: retry_after.as_millis() as u64,
-            })?;
+            .map_err(rate_limited)?;
         let code = device_sign_in_code(typed).ok_or_else(wrong_sign_in_code)?;
         Ok((code, guess))
     }
@@ -3848,6 +3785,38 @@ impl ClientProtocol {
             .text(TextSource { path, stream, to })
             .await;
         Sidecar::Made { state, format: to }
+    }
+
+    /// The plan for a playback on this connection: off the LAN or not as
+    /// its path is now, with the encoders and OCR as this server has them.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the call sites name each part; a struct would only repeat them"
+    )]
+    fn plan(
+        &self,
+        state: &ConnectionState,
+        descriptor: &spoolframe_media::MediaDescriptor,
+        caps: Option<&spoolframe_types::ClientCapabilities>,
+        quality: spoolframe_protocol::Quality,
+        share: Option<u64>,
+        selection: Selection,
+        bitmap: planner::Bitmap,
+    ) -> PlaybackPlan {
+        planner::plan_for(
+            descriptor,
+            caps,
+            quality,
+            share,
+            !on_lan(&state.path()),
+            selection,
+            bitmap,
+            &crate::encode::planning_encoders(
+                &self.services.jobs,
+                &self.services.transcoding.detected(),
+            ),
+            self.services.subtitles.ocr(),
+        )
     }
 
     /// What `plan` needs to play as `handle`: the subtitle the client
@@ -4098,6 +4067,23 @@ impl ClientProtocol {
         tracks::override_scope(self.services.catalog.as_ref(), id)
             .await
             .map_err(catalog_error)
+    }
+
+    /// A sign-in done: the connection told it is signed in, and the reply
+    /// that hands the device its session.
+    async fn logged_in(
+        &self,
+        connection: &Connection,
+        token: SessionToken,
+        remembered: bool,
+        password_change_required: bool,
+    ) -> Reply {
+        self.signed_in(connection, &token.0).await;
+        Reply::LoggedIn {
+            session: SessionId(token.0),
+            remembered,
+            password_change_required,
+        }
     }
 
     /// `connection`'s device signed in: each of its connections gets the
@@ -4565,7 +4551,6 @@ impl Asked {
     }
 }
 
-/// A redemption that made no account, for the client.
 /// A pairing relay's refusal on the wire (P7-08).
 fn relay_error(e: crate::pairing_relay::RelayError) -> Error {
     use crate::pairing_relay::RelayError;
@@ -4582,6 +4567,7 @@ fn relay_error(e: crate::pairing_relay::RelayError) -> Error {
     }
 }
 
+/// A redemption that made no account, for the client.
 fn redeem_error(e: crate::invites::RedeemError) -> Error {
     use crate::invites::RedeemError;
     match e {
@@ -4591,11 +4577,7 @@ fn redeem_error(e: crate::invites::RedeemError) -> Error {
         RedeemError::UsernameTaken => Error::UsernameTaken,
         RedeemError::WrongKind => Error::WrongInviteKind,
         RedeemError::InvalidInput(message) => Error::InvalidInput { message },
-        RedeemError::RateLimited { retry_after } => Error::RateLimited {
-            retry_after_ms: u64::try_from(retry_after.as_millis())
-                .unwrap_or(u64::MAX)
-                .max(1),
-        },
+        RedeemError::RateLimited { retry_after } => rate_limited(retry_after),
         RedeemError::Store(e) => internal(e),
         RedeemError::Hash(e) => internal(e),
     }
@@ -4606,9 +4588,7 @@ fn redeem_error(e: crate::invites::RedeemError) -> Error {
 fn login_error(e: LoginError) -> Error {
     match e {
         LoginError::InvalidCredentials => Error::InvalidCredentials,
-        LoginError::RateLimited { retry_after } => Error::RateLimited {
-            retry_after_ms: u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX),
-        },
+        LoginError::RateLimited { retry_after } => rate_limited(retry_after),
         LoginError::Internal(e) => {
             tracing::error!(error = %e, "login failed");
             Error::Internal
@@ -4765,9 +4745,7 @@ fn passkey_error(e: PasskeyError, id: &str) -> Error {
 fn sign_in_error(e: SignInError) -> Error {
     match e {
         SignInError::Refused => Error::InvalidCredentials,
-        SignInError::RateLimited { retry_after } => Error::RateLimited {
-            retry_after_ms: u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX),
-        },
+        SignInError::RateLimited { retry_after } => rate_limited(retry_after),
         SignInError::Unavailable(e) | SignInError::Internal(e) => internal(e),
     }
 }
@@ -4802,14 +4780,30 @@ fn ceremony_error(e: CeremonyError) -> Error {
     }
 }
 
+/// The session binding of a sign-in on this endpoint, as its Hello names
+/// the device.
+fn endpoint_binding(endpoint_id: &str, hello: &Hello) -> SessionBinding {
+    SessionBinding::Endpoint {
+        endpoint_id: endpoint_id.to_owned(),
+        device_name: hello.device_name.clone(),
+        platform: hello.platform,
+    }
+}
+
+/// A rate-limit reply for a limiter's `wait`: saturating, and never 0 ms,
+/// so a client always backs off.
+fn rate_limited(wait: Duration) -> Error {
+    Error::RateLimited {
+        retry_after_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1),
+    }
+}
+
 /// A PIN that did not pass, for the client: the same answers wherever it
 /// was entered.
 fn pin_error(e: UnlockError) -> Error {
     match e {
         UnlockError::Wrong => Error::InvalidCredentials,
-        UnlockError::RateLimited { retry_after } => Error::RateLimited {
-            retry_after_ms: retry_after.as_millis() as u64,
-        },
+        UnlockError::RateLimited { retry_after } => rate_limited(retry_after),
         UnlockError::Revoked => Error::Unauthenticated,
         UnlockError::Internal(e) => internal(e),
     }
@@ -5129,9 +5123,6 @@ fn subtitle_version(metadata: &std::fs::Metadata) -> u64 {
     u64::from_le_bytes(first)
 }
 
-/// A conversion that could not start or restart, as the client is told:
-/// a failure to run ffmpeg names where it is, so only the log has it
-/// (PX-09 finding 23).
 /// What a range read uses of its playback (review 2026-10-11 M10).
 struct RangeOf {
     revision: u64,
@@ -5153,6 +5144,9 @@ impl RangeOf {
     }
 }
 
+/// A conversion that could not start or restart, as the client is told:
+/// a failure to run ffmpeg names where it is, so only the log has it
+/// (PX-09 finding 23).
 fn conversion_error(e: JobError) -> Error {
     match e {
         JobError::Busy => Error::Busy,
@@ -5232,9 +5226,6 @@ fn watch_error(e: WatchError) -> Error {
     }
 }
 
-/// The auth methods this server offers.
-/// The failure limit's keys for device sign-in codes tried by `user` on
-/// this connection's endpoint: apart from passwords and PINs.
 /// The answer for a code that is not pending.
 fn wrong_sign_in_code() -> Error {
     Error::NotFound {
@@ -5242,6 +5233,8 @@ fn wrong_sign_in_code() -> Error {
     }
 }
 
+/// The failure limit's keys for device sign-in codes tried by `user` on
+/// this connection's endpoint: apart from passwords and PINs.
 fn sign_in_code_keys(connection: &Connection, user: &SessionUser) -> (String, String) {
     (
         format!("devcode:{}", user.user),
@@ -5249,6 +5242,7 @@ fn sign_in_code_keys(connection: &Connection, user: &SessionUser) -> (String, St
     )
 }
 
+/// The auth methods this server offers.
 pub(crate) fn auth_methods() -> Vec<AuthMethod> {
     vec![AuthMethod::Password, AuthMethod::DeviceApproval]
 }

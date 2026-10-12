@@ -43,6 +43,7 @@ fn card(
     let encoders = &found.encoders;
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     let key = card.key();
+    let does = crate::transcode::card_does(encoders, api);
     api::GpuCard {
         jobs: count(running.get(&key).copied().unwrap_or(0)),
         key,
@@ -54,28 +55,10 @@ fn card(
         entry: crate::transcode::entry_label(entries, card.entry),
         max_jobs: count(gpu.max_jobs.unwrap_or(max_gpu_jobs)),
         own_limit: gpu.max_jobs.is_some(),
-        encodes: encoders
-            .video
-            .iter()
-            .filter(|e| e.hardware == Some(api))
-            .map(|e| e.name.clone())
-            .collect(),
-        decodes: encoders
-            .hardware_decoders
-            .iter()
-            .filter(|d| d.hardware == api)
-            .map(|d| d.label())
-            .collect(),
-        filters: encoders
-            .gpu_filters(api)
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        tone_maps: encoders
-            .gpu_tone_mappers(api)
-            .into_iter()
-            .map(tone_mapper)
-            .collect(),
+        encodes: does.encodes,
+        decodes: does.decodes,
+        filters: does.filters.into_iter().map(str::to_owned).collect(),
+        tone_maps: does.tone_mappers.into_iter().map(tone_mapper).collect(),
         lacks: lacks(encoders, api),
     }
 }

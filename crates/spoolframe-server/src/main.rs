@@ -686,27 +686,14 @@ async fn check_media_sandbox(
     if !ffprobe.sandbox().confines() {
         return Ok(());
     }
-    match ffprobe.check_confined(state_dir).await {
-        // A pass is what is expected: only a failure is worth a line at
-        // INFO or above.
-        Ok(shown) => {
-            tracing::debug!("{shown}");
-            Ok(())
-        }
-        Err(reason) if config.media.sandbox()? == sandbox::Mode::Required => bail!(
-            "media.sandbox is \"required\", but the media tools cannot be shown to be confined: \
-             {reason}"
-        ),
-        Err(reason) => {
-            tracing::error!(
-                reason,
-                "MEDIA TOOLS MAY NOT BE CONFINED: a confined ffprobe was not refused the state \
-                 directory and loopback, as it should be. Set media.sandbox = \"required\" to \
-                 refuse to start then"
-            );
-            Ok(())
-        }
-    }
+    confinement(
+        config,
+        ffprobe.check_confined(state_dir).await,
+        "the media tools cannot be shown to be confined",
+        "MEDIA TOOLS MAY NOT BE CONFINED: a confined ffprobe was not refused the state \
+         directory and loopback, as it should be. Set media.sandbox = \"required\" to \
+         refuse to start then",
+    )
 }
 
 /// Shows the subtitle decoder (this binary, run again) works here, and,
@@ -719,23 +706,36 @@ async fn check_decoder(
     scratch: &Path,
     state_dir: &Path,
 ) -> Result<()> {
-    match decode::check(decoder, scratch, state_dir).await {
+    confinement(
+        config,
+        decode::check(decoder, scratch, state_dir).await,
+        "the subtitle decoder cannot be shown to run confined",
+        "SUBTITLE DECODER MAY NOT WORK OR NOT BE CONFINED: picture subtitles may fail to \
+         read as text",
+    )
+}
+
+/// What a confinement check showed (PX-11 findings 34, 45): a pass at
+/// DEBUG only; a failure, `what` cannot be shown, stops the start under
+/// `media.sandbox = "required"`, and is otherwise `logged` as an error.
+fn confinement(
+    config: &ServerConfig,
+    shown: std::result::Result<String, String>,
+    what: &str,
+    logged: &str,
+) -> Result<()> {
+    match shown {
         // A pass is what is expected: only a failure is worth a line at
         // INFO or above.
         Ok(shown) => {
             tracing::debug!("{shown}");
             Ok(())
         }
-        Err(reason) if config.media.sandbox()? == sandbox::Mode::Required => bail!(
-            "media.sandbox is \"required\", but the subtitle decoder cannot be shown to run \
-             confined: {reason}"
-        ),
+        Err(reason) if config.media.sandbox()? == sandbox::Mode::Required => {
+            bail!("media.sandbox is \"required\", but {what}: {reason}")
+        }
         Err(reason) => {
-            tracing::error!(
-                reason,
-                "SUBTITLE DECODER MAY NOT WORK OR NOT BE CONFINED: picture subtitles may fail to \
-                 read as text"
-            );
+            tracing::error!(reason, "{logged}");
             Ok(())
         }
     }
@@ -870,10 +870,13 @@ async fn run(
     .with_context(|| format!("cannot open the previews cache {}", previews_dir.display()))?;
     previews.watch_catalog(live.changes());
     let name = ServerName::new(config.server_name());
+    // One value for what the status page says and what the endpoint is
+    // built with.
+    let endpoint_options = config.network.endpoint_options()?;
     let status = Arc::new(
         StatusSource::new(name.clone(), server_id.clone(), transcoding.clone())
             .with_jobs(jobs.clone())
-            .with_mdns(config.network.endpoint_options()?.mdns)
+            .with_mdns(endpoint_options.mdns)
             .with_ocr_languages(subtitles.ocr().languages().iter().cloned().collect()),
     );
     let artwork_dir = state_dir.join("cache").join("artwork");
@@ -1097,7 +1100,7 @@ async fn run(
     }
     let server = Server::start(
         key,
-        &config.network.endpoint_options()?,
+        &endpoint_options,
         &name,
         Services {
             public_url,

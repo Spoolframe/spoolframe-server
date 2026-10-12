@@ -556,13 +556,8 @@ pub(crate) fn start(public: &Public, wan: &Wan, endpoint: &iroh::Endpoint, finde
     let Some(mapped) = wan.mapped_port.clone() else {
         return;
     };
-    let bound = endpoint.bound_sockets();
-    let own_port = bound
-        .iter()
-        .find(|b| b.is_ipv4())
-        .or_else(|| bound.first())
-        .map(SocketAddr::port)
-        .and_then(NonZeroU16::new);
+    let own_port =
+        crate::announce::port_of(&endpoint.bound_sockets(), true).and_then(NonZeroU16::new);
     let public = public.clone();
     let lookup = finders.lookup.clone();
     let mapper = finders.mapper.clone();

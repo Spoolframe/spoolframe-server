@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::{StreamExt, TryStreamExt, stream};
+
 use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::Prober;
 use spoolframe_protocol::HomeScreen;
@@ -36,6 +38,10 @@ const SAME_ITEM_CACHE: Duration = Duration::from_secs(60);
 
 const ROW: usize = 20;
 const NEXT_UP_SHOWS: u32 = 20;
+/// The most catalog (Plex) lookups one Home load or one show-wide mark
+/// has in flight at once: they go out a few at a time, and come back in
+/// the order asked, so rows, errors and saves keep their order.
+const CATALOG_FETCHES: usize = 8;
 
 pub struct Watch {
     store: Store,
@@ -43,7 +49,8 @@ pub struct Watch {
     prober: Arc<Prober>,
     /// A live setting (P3-10): read at each use.
     rules: parking_lot::RwLock<WatchRules>,
-    /// Each (principal, item)'s last progress write.
+    /// Each (principal, item)'s last progress write, while it is still
+    /// within the throttle.
     written: Mutex<HashMap<(Principal, String), Written>>,
     next_up: Mutex<HashMap<Principal, (Instant, Vec<Item>)>>,
     /// (Another key, an item): when the catalog last said that the key
@@ -183,7 +190,13 @@ impl Watch {
         let watched = self.rules().is_watched(position, duration, credits);
         self.save(principal, id, &found, Some(position), duration, watched)
             .await?;
-        self.written.lock().insert(
+        // Writes older than the throttle judge nothing more: let them go,
+        // so the map holds what is being played now, not every item ever
+        // played since the server started.
+        let throttle = self.rules().throttle;
+        let mut written = self.written.lock();
+        written.retain(|_, w| self.since(w.at) < throttle);
+        written.insert(
             key,
             Written {
                 at: self.now(),
@@ -262,14 +275,31 @@ impl Watch {
             }
             _ => seasons.push(id.clone()),
         }
-        for season in seasons {
-            let season = self.catalog.item(&season).await?;
-            for child in &season.children {
-                let Item::Episode(e) = child else { continue };
-                let episode = self.catalog.item(&e.id).await?;
-                self.save(principal, &e.id, &episode, None, e.duration, watched)
-                    .await?;
-            }
+        let seasons: Vec<_> = stream::iter(seasons)
+            .map(|season| async move { self.catalog.item(&season).await })
+            .buffered(CATALOG_FETCHES)
+            .try_collect()
+            .await?;
+        let episodes: Vec<(MediaId, Option<Duration>)> = seasons
+            .iter()
+            .flat_map(|season| season.children.iter())
+            .filter_map(|child| match child {
+                Item::Episode(e) => Some((e.id.clone(), e.duration)),
+                _ => None,
+            })
+            .collect();
+        // Fetched a few ahead, saved one by one in order: a failure on one
+        // leaves those before it saved and none after.
+        let mut fetched = stream::iter(episodes)
+            .map(|(id, duration)| async move {
+                let found = self.catalog.item(&id).await;
+                (id, duration, found)
+            })
+            .buffered(CATALOG_FETCHES);
+        while let Some((id, duration, found)) = fetched.next().await {
+            let episode = found?;
+            self.save(principal, &id, &episode, None, duration, watched)
+                .await?;
         }
         Ok(())
     }
@@ -439,20 +469,30 @@ impl Watch {
         let min = ms(self.rules().started_after);
         // As many more as are hidden, so the row stays full.
         let wanted = (ROW + hidden.len()) as u32;
-        for row in self.store.in_progress(principal, min, wanted).await? {
-            if continue_watching.len() == ROW {
+        let ids: Vec<MediaId> = self
+            .store
+            .in_progress(principal, min, wanted)
+            .await?
+            .into_iter()
+            .filter(|row| !hidden.contains(&row.media_id))
+            .filter_map(|row| row.media_id.parse::<MediaId>().ok())
+            .collect();
+        // Looked up a few at a time, in the row's order: one Plex server
+        // down costs one timeout, not one per item on it.
+        let mut found = stream::iter(ids)
+            .map(|id| async move {
+                let item = self.catalog.item(&id).await;
+                (id, item)
+            })
+            .buffered(CATALOG_FETCHES);
+        while continue_watching.len() < ROW {
+            let Some((id, item)) = found.next().await else {
                 break;
-            }
-            if hidden.contains(&row.media_id) {
-                continue;
-            }
-            let Ok(id) = row.media_id.parse::<MediaId>() else {
-                continue;
             };
             // An item gone from the catalog, or in a library not served
             // now, drops out of the row; so does one whose Plex server is
             // down (P3-11), until it is back, while the others still show.
-            match self.catalog.item(&id).await {
+            match item {
                 Ok(found) => continue_watching.push(found.item),
                 Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => {}
                 Err(e) if is_down(&e) => {
@@ -518,16 +558,22 @@ impl Watch {
             return Ok(items.clone());
         }
         let since = self.store.now() - self.rules().next_up_window.as_secs() as i64;
-        let mut next = Vec::new();
-        for show in self
+        let shows: Vec<MediaId> = self
             .store
             .active_shows(principal, since, NEXT_UP_SHOWS)
             .await?
-        {
-            let Ok(show_id) = show.parse::<MediaId>() else {
-                continue;
-            };
-            match self.next_in_show(principal, &show_id).await {
+            .into_iter()
+            .filter_map(|show| show.parse::<MediaId>().ok())
+            .collect();
+        let mut next = Vec::new();
+        let mut found = stream::iter(shows)
+            .map(|show_id| async move {
+                let episode = self.next_in_show(principal, &show_id).await;
+                (show_id, episode)
+            })
+            .buffered(CATALOG_FETCHES);
+        while let Some((show_id, episode)) = found.next().await {
+            match episode {
                 Ok(Some(episode)) => next.push(episode),
                 Ok(None) => {}
                 Err(WatchError::Catalog(e)) if is_down(&e) => {
@@ -570,11 +616,11 @@ impl Watch {
             .collect();
         seasons.sort_by_key(|s| s.season);
         let mut episodes = Vec::new();
-        for season in seasons {
-            let mut in_season: Vec<_> = self
-                .catalog
-                .item(&season.id)
-                .await?
+        let mut fetched = stream::iter(seasons)
+            .map(|season| async move { self.catalog.item(&season.id).await })
+            .buffered(CATALOG_FETCHES);
+        while let Some(season) = fetched.next().await {
+            let mut in_season: Vec<_> = season?
                 .children
                 .into_iter()
                 .filter(|e| matches!(e, Item::Episode(_)))

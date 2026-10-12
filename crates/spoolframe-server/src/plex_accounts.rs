@@ -367,7 +367,10 @@ fn address(resource: &PlexResource) -> Option<(&str, bool)> {
         .map(|c| (c.uri.as_str(), c.local))
 }
 
-fn same_url(a: &str, b: &str) -> bool {
+/// The URL as the catalog keeps it, for telling whether two are the same
+/// server: the add path's "added already" and the account list's badge
+/// agree by sharing it.
+pub(crate) fn same_url(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 

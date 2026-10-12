@@ -255,12 +255,12 @@ impl Cache {
         // Each file synced before the set is renamed into place: after a
         // power loss a set is whole or not there (review 2026-10-11 L19).
         for (n, sheet) in sheets.iter().enumerate() {
-            write_synced(&partial.join(format!("{n}.jpg")), sheet).await?;
+            crate::files::write_synced(&partial.join(format!("{n}.jpg")), sheet).await?;
             size += sheet.len() as u64;
         }
         let json = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
         size += json.len() as u64;
-        write_synced(&partial.join(META), &json).await?;
+        crate::files::write_synced(&partial.join(META), &json).await?;
         let whole = self.dir.join(key);
         let _ = tokio::fs::remove_dir_all(&whole).await;
         tokio::fs::rename(&partial, &whole).await?;
@@ -288,14 +288,6 @@ fn remove_sets(dir: &Path, keys: Vec<String>) {
             tracing::warn!(key, error = %e, "cannot remove evicted previews");
         }
     }
-}
-
-/// `bytes` written to `path` and synced.
-async fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(path).await?;
-    file.write_all(bytes).await?;
-    file.sync_all().await
 }
 
 fn dir_size(dir: &Path) -> u64 {

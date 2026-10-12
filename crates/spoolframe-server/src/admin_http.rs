@@ -388,21 +388,27 @@ fn router(
     let metrics = api.metrics_arc();
     let refusals = api.clone();
     let rpc = tower::service_fn(move |req: Request| {
-        // Each socket counted open while its RPC service lives (P3-14):
-        // jsonrpsee makes one per connection and drops it as the
-        // connection ends.
+        // The service is built per HTTP request. A WebSocket upgrade is one
+        // request for its socket's whole life, so its service lives as long
+        // as the socket: counted open meanwhile (P3-14). A plain POST is a
+        // single call, not a connection, and is not counted (Review
+        // 2026-10-11 N10.11).
+        let socket = is_upgrade(req.headers());
         let metrics = metrics.clone();
         let refusals = refusals.clone();
         let counted = RpcServiceBuilder::new()
             .layer_fn(move |inner| Counted {
                 inner,
-                _open: metrics.as_ref().map(|m| Arc::new(m.web_connection())),
+                _open: metrics
+                    .as_ref()
+                    .filter(|_| socket)
+                    .map(|m| Arc::new(m.web_connection())),
             })
             .layer_fn(move |inner| Refusing {
                 inner,
                 api: refusals.clone(),
             });
-        // Built per connection: building is what gives each its own id.
+        // Built per request, so each socket has its own connection id.
         // No client sends batches; one would carry any number of calls,
         // password checks among them, in one message (PX-10, finding 10).
         let mut service = jsonrpsee::server::ServerBuilder::default()

@@ -539,6 +539,21 @@ impl Jail {
         }
     }
 
+    /// Media file `path` to read: a VobSub `.idx` with its `.sub`, which
+    /// ffmpeg and ffprobe open by the `.idx`'s name.
+    pub fn media(self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let sub = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("idx"))
+            .then(|| path.with_extension("sub"));
+        let jail = self.input(path);
+        match sub {
+            Some(sub) => jail.input(sub),
+            None => jail,
+        }
+    }
+
     /// A file the run reads that someone else may have put there: media,
     /// a subtitle beside it. Opened by the server, following symlinks, and
     /// refused unless a regular file outside the hidden directories; the
@@ -641,6 +656,17 @@ impl Tool {
 
     pub fn sandbox(&self) -> &Sandbox {
         &self.sandbox
+    }
+
+    /// [`Tool::command`], made on the blocking pool: making it opens and
+    /// resolves the jail's inputs, which on a network mount can block for
+    /// as long as the mount does (review 2026-10-11 L60).
+    pub async fn command_off_thread(&self, jail: Jail) -> std::io::Result<Command> {
+        let tool = self.clone();
+        tokio::task::spawn_blocking(move || tool.command(&jail))
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|made| made)
     }
 
     /// A command running the program in `jail`, to add the program's
@@ -1269,14 +1295,27 @@ fn open_input(path: &Path, sandbox: &Inner, jail: &Jail) -> std::io::Result<Opti
 const BPF_MAXINSNS: usize = 4096;
 
 /// The seccomp filters: the calls refused with `EPERM`, then `clone3`
-/// refused with `ENOSYS`, so that the C library starts threads with
-/// `clone`, whose flags the first filter can see.
+/// refused with `ENOSYS` ([`refusing`]).
 fn filters() -> Result<Filters, String> {
+    refusing(
+        refused_calls().map_err(|e| e.to_string())?,
+        libc::EPERM as u32,
+    )
+}
+
+/// Seccomp filters refusing `calls` with `errno`, then `clone3` with
+/// `ENOSYS`, so that the C library starts threads with `clone`, whose
+/// flags the first filter can see. The tools' list and the server's own
+/// deny-list ([`crate::harden`]) are built alike; the lists stay apart.
+pub(crate) fn refusing(
+    calls: BTreeMap<i64, Vec<SeccompRule>>,
+    errno: u32,
+) -> Result<Filters, String> {
     let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(|e| e.to_string())?;
     let refused = SeccompFilter::new(
-        refused_calls().map_err(|e| e.to_string())?,
+        calls,
         SeccompAction::Allow,
-        SeccompAction::Errno(libc::EPERM as u32),
+        SeccompAction::Errno(errno),
         arch,
     )
     .map_err(|e| e.to_string())?;
@@ -1291,7 +1330,7 @@ fn filters() -> Result<Filters, String> {
 }
 
 /// `filters` as BPF, each checked to fit in one program.
-pub(crate) fn compile(filters: impl IntoIterator<Item = SeccompFilter>) -> Result<Filters, String> {
+fn compile(filters: impl IntoIterator<Item = SeccompFilter>) -> Result<Filters, String> {
     let programs = filters
         .into_iter()
         .map(|filter| {

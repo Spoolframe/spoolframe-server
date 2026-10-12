@@ -313,11 +313,6 @@ fn subtitle_role(role: SubtitleRole) -> &'static str {
     }
 }
 
-/// The audio track a plan without one picked plays: the file's default.
-fn default_audio(d: &MediaDescriptor) -> Option<u32> {
-    (!d.audio.is_empty()).then(|| d.audio.iter().position(|a| a.default).unwrap_or(0) as u32)
-}
-
 /// `plan` laid out by stream, the file described by `d` (when it could
 /// be read), the tracks picked `selection`.
 pub fn plan_view(
@@ -412,12 +407,14 @@ pub fn plan_view(
                         codec: codec.to_string(),
                     },
                 ),
-                Some(ConvertedVideo::Encode {
-                    codec,
-                    height,
-                    max_bitrate,
-                    tone_map,
-                }) => row(
+                Some(
+                    encode @ ConvertedVideo::Encode {
+                        codec,
+                        height,
+                        max_bitrate,
+                        tone_map,
+                    },
+                ) => row(
                     K::Video,
                     None,
                     video_source(d),
@@ -431,12 +428,7 @@ pub fn plan_view(
                         encoder: crate::encode::pick::planned_encoder(
                             detected,
                             d,
-                            ConvertedVideo::Encode {
-                                codec: *codec,
-                                height: *height,
-                                max_bitrate: *max_bitrate,
-                                tone_map: *tone_map,
-                            },
+                            *encode,
                             *subtitle,
                             gpu_filters,
                         )
@@ -491,7 +483,10 @@ pub fn plan_view(
             if d.video.is_some() {
                 row(K::Video, None, video_source(d), Out::Direct);
             }
-            if let Some(a) = selection.audio.or_else(|| default_audio(d)) {
+            if let Some(a) = selection
+                .audio
+                .or_else(|| planner::default_audio(d).map(|i| i as u32))
+            {
                 row(K::Audio, Some(a), audio_source(d, a), Out::Direct);
             }
             if let Some(s) = selection.subtitle {

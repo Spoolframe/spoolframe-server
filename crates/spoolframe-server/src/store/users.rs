@@ -217,21 +217,8 @@ impl Store {
         let now = self.now();
         let id = LocalUserId::generate();
         let mut tx = self.begin_write().await?;
-        let inserted = sqlx::query(
-            "INSERT INTO users (id, username, display_name, role, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .bind(id)
-        .bind(&name)
-        .bind(display_name)
-        .bind(stored(role))
-        .bind(now)
-        .execute(&mut *tx)
-        .await;
-        match inserted {
-            Ok(_) => {}
-            Err(e) if is_unique_violation(&e) => return Err(UserError::Exists(name)),
-            Err(e) => return Err(e.into()),
+        if !insert_user(&mut tx, id, &name, display_name, role, now).await? {
+            return Err(UserError::Exists(name));
         }
         add_password(&mut tx, id, phc, now).await?;
         tx.commit().await?;
@@ -283,19 +270,9 @@ impl Store {
             .bind(keep)
             .execute(&mut *tx)
             .await?;
-        let revoked = sqlx::query(
-            "UPDATE sessions SET revoked_at = ?2 \
-             WHERE user_id = ?1 AND revoked_at IS NULL AND token_hash IS NOT ?3",
-        )
-        .bind(id)
-        .bind(now)
-        .bind(keep)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
         // And none of their devices resumes them (P4-01): trust was made
         // under the old password, by whoever knew it.
-        forget_trust(&mut tx, id).await?;
+        let revoked = end_sessions(&mut tx, id, now, keep).await?;
         tx.commit().await?;
         // The other devices' connections are closed (PX-10).
         self.note_sessions_ended();
@@ -336,17 +313,7 @@ impl Store {
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        let revoked = sqlx::query(
-            "UPDATE sessions SET revoked_at = ?2 \
-             WHERE user_id = ?1 AND revoked_at IS NULL AND token_hash IS NOT ?3",
-        )
-        .bind(id)
-        .bind(now)
-        .bind(keep)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        forget_trust(&mut tx, id).await?;
+        let revoked = end_sessions(&mut tx, id, now, keep).await?;
         tx.commit().await?;
         self.note_sessions_ended();
         Ok(revoked)
@@ -424,16 +391,8 @@ impl Store {
             .bind(now)
             .execute(&mut *tx)
             .await?;
-        let revoked = sqlx::query(
-            "UPDATE sessions SET revoked_at = ?2 WHERE user_id = ?1 AND revoked_at IS NULL",
-        )
-        .bind(id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
         // Enabling them again does not bring it back (P4-01).
-        forget_trust(&mut tx, id).await?;
+        let revoked = end_sessions(&mut tx, id, now, None).await?;
         tx.commit().await?;
         self.note_sessions_ended();
         Ok(revoked)
@@ -534,9 +493,7 @@ impl Store {
                     tie: match row.try_get::<Option<String>, _>("portable_user_id")? {
                         None => None,
                         Some(portable) => Some(super::ties::Tie {
-                            portable: portable
-                                .parse()
-                                .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                            portable: super::parse_id(portable)?,
                             tied_at: row.try_get("tied_at")?,
                             proof_kind: row.try_get("proof_kind")?,
                         }),
@@ -631,16 +588,31 @@ impl Store {
     }
 }
 
-/// Remove every device's trust for `user` (P4-01).
-async fn forget_trust(
+/// End every live session of `user` but the one whose token hashes to
+/// `keep`, and remove every device's trust for them (P4-01): their
+/// credentials changed, or they were disabled, so nothing made under the
+/// old state carries on. How many sessions were ended.
+async fn end_sessions(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     user: LocalUserId,
-) -> Result<(), sqlx::Error> {
+    now: i64,
+    keep: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    let revoked = sqlx::query(
+        "UPDATE sessions SET revoked_at = ?2 \
+         WHERE user_id = ?1 AND revoked_at IS NULL AND (?3 IS NULL OR token_hash IS NOT ?3)",
+    )
+    .bind(user)
+    .bind(now)
+    .bind(keep)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
     sqlx::query("DELETE FROM trusted_endpoints WHERE user_id = ?1")
         .bind(user)
         .execute(&mut **tx)
         .await?;
-    Ok(())
+    Ok(revoked)
 }
 
 /// A role as the database stores it. `Unknown` is never stored: the
@@ -679,6 +651,34 @@ pub(super) async fn add_first_user(
         return Err(UserError::AlreadySetUp);
     }
     Ok(id)
+}
+
+/// Insert user `id` named `name` in `tx`: false if the name is taken.
+/// An admin adding a user and an invite redeemed write the one row alike.
+pub(super) async fn insert_user(
+    tx: &mut sqlx::SqliteConnection,
+    id: LocalUserId,
+    name: &str,
+    display_name: Option<&str>,
+    role: Role,
+    now: i64,
+) -> Result<bool, sqlx::Error> {
+    let inserted = sqlx::query(
+        "INSERT INTO users (id, username, display_name, role, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(display_name)
+    .bind(stored(role))
+    .bind(now)
+    .execute(tx)
+    .await;
+    match inserted {
+        Ok(_) => Ok(true),
+        Err(e) if is_unique_violation(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 pub(super) async fn add_password(

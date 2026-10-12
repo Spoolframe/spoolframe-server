@@ -249,24 +249,7 @@ pub fn planned_encoder(
     subtitle: Option<ConvertedSubtitle>,
     gpu_filters: bool,
 ) -> Option<VideoEncoder> {
-    let probe = EncodeSpec {
-        input: Path::new(""),
-        sidecar: None,
-        descriptor,
-        video: Some(video),
-        audio: None,
-        subtitle,
-        encoders: &detected.software,
-        vaapi_device: Path::new(""),
-        hardware_decode: true,
-        gpu_filters,
-        // As `args::planned_encoder` plans (PGPU-04).
-        tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
-        start: None,
-        output: args::Output::Progressive {
-            file: PathBuf::new(),
-        },
-    };
+    let probe = args::planning_spec(&detected.software, descriptor, video, subtitle, gpu_filters);
     let encoders = match choose(&probe, &detected.gpus, &|_| true) {
         Some(gpu) => gpu.encoders(),
         None => &detected.software,
@@ -365,26 +348,19 @@ pub fn routes(
                 ),
             };
             let probe = EncodeSpec {
-                input: Path::new(""),
-                sidecar: None,
-                descriptor: &descriptor,
-                video: Some(ConvertedVideo::Encode {
-                    codec: target,
-                    height,
-                    max_bitrate: None,
-                    tone_map: tone_map_video,
-                }),
-                audio: None,
-                subtitle,
-                encoders: &detected.software,
-                vaapi_device: Path::new(""),
-                hardware_decode: true,
-                gpu_filters,
                 tone_map,
-                start: None,
-                output: args::Output::Progressive {
-                    file: PathBuf::new(),
-                },
+                ..args::planning_spec(
+                    &detected.software,
+                    &descriptor,
+                    ConvertedVideo::Encode {
+                        codec: target,
+                        height,
+                        max_bitrate: None,
+                        tone_map: tone_map_video,
+                    },
+                    subtitle,
+                    gpu_filters,
+                )
             };
             let mut steps: Vec<RouteStep> = Vec::new();
             let mut full: Vec<String> = Vec::new();
@@ -426,11 +402,7 @@ pub fn routes(
 
 /// `probe` run as `run` says: a [`RouteStep`].
 fn step_on(probe: &EncodeSpec<'_>, run: &RunOn) -> RouteStep {
-    let spec = EncodeSpec {
-        encoders: run.encoders(),
-        vaapi_device: run.vaapi_device(),
-        ..probe.clone()
-    };
+    let spec = run.spec(probe);
     let made = args::made(&spec);
     RouteStep {
         share: args::share(&spec),
@@ -579,23 +551,25 @@ impl RunOn {
         self.spilled
     }
 
-    /// Whether the video encoder `spec`'s run picks here writes 10 bits.
-    fn encodes_ten_bit(&self, spec: &EncodeSpec<'_>) -> bool {
-        let on = EncodeSpec {
+    /// `spec` run here: this run's encoders and render node in place of
+    /// its own.
+    pub fn spec<'a>(&'a self, spec: &EncodeSpec<'a>) -> EncodeSpec<'a> {
+        EncodeSpec {
             encoders: self.encoders(),
             vaapi_device: self.vaapi_device(),
             ..spec.clone()
-        };
+        }
+    }
+
+    /// Whether the video encoder `spec`'s run picks here writes 10 bits.
+    fn encodes_ten_bit(&self, spec: &EncodeSpec<'_>) -> bool {
+        let on = self.spec(spec);
         args::placement(&on).is_some_and(|p| on.encoders.encodes_ten_bit(p.encoder))
     }
 
     /// The video encoder `spec`'s run picks here, for the log.
     pub fn encoder_name(&self, spec: &EncodeSpec<'_>) -> Option<String> {
-        let on = EncodeSpec {
-            encoders: self.encoders(),
-            vaapi_device: self.vaapi_device(),
-            ..spec.clone()
-        };
+        let on = self.spec(spec);
         args::placement(&on).map(|p| p.encoder.name.clone())
     }
 }
@@ -798,11 +772,7 @@ mod tests {
         let both = run_on(&detected, &probe, &full(&["0000:01:00.0", "0000:02:00.0"])).unwrap();
         assert!(both.spilled());
         assert_eq!(pci(&both).as_deref(), Some("0000:01:00.0"));
-        let on = EncodeSpec {
-            encoders: both.encoders(),
-            vaapi_device: both.vaapi_device(),
-            ..probe.clone()
-        };
+        let on = both.spec(&probe);
         let place = args::placement(&on).unwrap();
         assert_eq!(place.encoder.hardware, None, "encoded in software");
         assert!(place.decoder.is_some(), "decoded on the card");

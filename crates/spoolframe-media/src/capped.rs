@@ -34,7 +34,7 @@ pub(crate) async fn output(command: &mut Command, keep: usize) -> std::io::Resul
 }
 
 /// Up to `keep` bytes of `pipe`, the rest read to its end and dropped.
-async fn read_some<R: AsyncRead + Unpin>(pipe: Option<R>, keep: usize) -> Vec<u8> {
+pub(crate) async fn read_some<R: AsyncRead + Unpin>(pipe: Option<R>, keep: usize) -> Vec<u8> {
     let Some(mut pipe) = pipe else {
         return Vec::new();
     };

@@ -300,7 +300,7 @@ fn clut_definition(body: &[u8], cluts: &mut HashMap<u8, Clut>) -> Option<()> {
         // Y 0 is fully transparent whatever T says. Otherwise Y is in
         // video range: 16 is black, 235 white.
         let colour = Colour {
-            luma: (u32::from(y.saturating_sub(16)) * 255 / 219).min(255) as u8,
+            luma: bitmap::video_luma(y),
             alpha: if y == 0 { 0 } else { 255 - t },
         };
         let entry = usize::from(entry);

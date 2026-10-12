@@ -7,7 +7,7 @@
 use spoolframe_protocol::portable::{DevicePublicKey, PortableUserId, UserDeviceCredential};
 use spoolframe_types::Platform;
 
-use super::{Store, StoreError};
+use super::{Store, StoreError, parse_id};
 
 /// A grant, as admins see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,9 +67,32 @@ impl CredentialBinding {
     }
 }
 
-fn parse_id(text: String) -> Result<PortableUserId, StoreError> {
-    text.parse()
-        .map_err(|e| StoreError::Db(sqlx::Error::Decode(Box::new(e))))
+/// Grant `portable` here on `db`, calling them `display_name`: one row
+/// for a missing or revoked grant, which is (re)made; none for a live
+/// one, which is left as it is. An admin's grant and an invite's take
+/// this one rule.
+pub(super) async fn upsert_grant<'e>(
+    db: impl sqlx::SqliteExecutor<'e>,
+    portable: &str,
+    display_name: Option<&str>,
+    now: i64,
+    invite_id: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "INSERT INTO portable_grants (portable_user_id, display_name, granted_at, invite_id) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT (portable_user_id) DO UPDATE SET \
+           display_name = excluded.display_name, granted_at = excluded.granted_at, \
+           invite_id = excluded.invite_id, revoked_at = NULL \
+         WHERE portable_grants.revoked_at IS NOT NULL",
+    )
+    .bind(portable)
+    .bind(display_name)
+    .bind(now)
+    .bind(invite_id)
+    .execute(db)
+    .await?
+    .rows_affected())
 }
 
 impl Store {
@@ -83,21 +106,14 @@ impl Store {
         display_name: Option<&str>,
         invite_id: Option<&str>,
     ) -> Result<bool, StoreError> {
-        let made = sqlx::query(
-            "INSERT INTO portable_grants (portable_user_id, display_name, granted_at, invite_id) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT (portable_user_id) DO UPDATE SET \
-               display_name = excluded.display_name, granted_at = excluded.granted_at, \
-               invite_id = excluded.invite_id, revoked_at = NULL \
-             WHERE portable_grants.revoked_at IS NOT NULL",
+        let made = upsert_grant(
+            &self.pool,
+            &portable.to_string(),
+            display_name,
+            self.now(),
+            invite_id,
         )
-        .bind(portable.to_string())
-        .bind(display_name)
-        .bind(self.now())
-        .bind(invite_id)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        .await?;
         Ok(made == 1)
     }
 

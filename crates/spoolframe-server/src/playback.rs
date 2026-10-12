@@ -629,7 +629,6 @@ pub struct Snapshot {
     pub path: PathBuf,
     pub shown: Shown,
     pub planned: PlaybackPlan,
-    pub kind: Plan,
     pub selection: Selection,
     pub revision: u64,
     /// The encode's epoch; 0 for direct play.
@@ -744,7 +743,6 @@ impl Playback {
             path: self.path.clone(),
             shown: self.shown.clone(),
             planned: self.planned.clone(),
-            kind: self.plan(),
             selection: self.selection,
             revision: self.revision,
             epoch: self.conversion.as_ref().map_or(0, |c| c.job().epoch),
@@ -928,15 +926,9 @@ impl Playbacks {
         let now = self.clock.now();
         let mut handles = self.lock();
         // Forget idle handles here rather than on a timer.
-        let idle: Vec<String> = handles
-            .iter()
-            .filter(|(_, p)| now.duration_since(p.last_used) >= self.idle)
-            .map(|(h, _)| h.clone())
-            .collect();
-        let idle: Vec<(String, Playback)> = idle
-            .into_iter()
-            .filter_map(|h| handles.remove_entry(&h))
-            .collect();
+        let idle = take_where(&mut handles, |p| {
+            now.duration_since(p.last_used) >= self.idle
+        });
         self.started.inc();
         // Under the lock, so no two playbacks share one.
         let order = self.started.get();
@@ -1384,15 +1376,7 @@ impl Playbacks {
     /// is told to sign in again. Returns how many.
     pub fn end_session(&self, session: &SessionId) -> usize {
         let mut handles = self.lock();
-        let ending: Vec<String> = handles
-            .iter()
-            .filter(|(_, p)| &p.session == session)
-            .map(|(h, _)| h.clone())
-            .collect();
-        let ended: Vec<(String, Playback)> = ending
-            .into_iter()
-            .filter_map(|h| handles.remove_entry(&h))
-            .collect();
+        let ended = take_where(&mut handles, |p| &p.session == session);
         let now = self.clock.now();
         self.let_go.lock().extend(
             ended
@@ -1407,15 +1391,7 @@ impl Playbacks {
 
     fn end_where(&self, ends: impl Fn(&Playback) -> bool, why: EndReason) -> usize {
         let mut handles = self.lock();
-        let ending: Vec<String> = handles
-            .iter()
-            .filter(|(_, p)| ends(p))
-            .map(|(h, _)| h.clone())
-            .collect();
-        let ended: Vec<(String, Playback)> = ending
-            .into_iter()
-            .filter_map(|h| handles.remove_entry(&h))
-            .collect();
+        let ended = take_where(&mut handles, ends);
         drop(handles);
         let count = ended.len();
         self.ended_all(ended, why);
@@ -1567,9 +1543,14 @@ impl Playbacks {
         if let Some((handle, playback)) = open {
             return Some(Found::Open(playback.snapshot(&handle)));
         }
-        self.ended()
-            .into_iter()
+        // Searched where it is kept, newest first as `ended` lists it: one
+        // cloned, not every ended playback.
+        let mut gone = self.gone_lock();
+        Self::prune(&mut gone, unix_ms());
+        gone.iter()
+            .rev()
             .find(|e| e.last.id == id)
+            .cloned()
             .map(Found::Ended)
     }
 
@@ -1635,6 +1616,20 @@ fn log_link(playback: &str, link: &crate::link_stats::Totals) {
     );
 }
 
+/// Remove and return every playback `picks` picks.
+fn take_where(
+    handles: &mut HashMap<String, Playback>,
+    picks: impl Fn(&Playback) -> bool,
+) -> Vec<(String, Playback)> {
+    let keys: Vec<String> = handles
+        .iter()
+        .filter(|(_, p)| picks(p))
+        .map(|(h, _)| h.clone())
+        .collect();
+    keys.into_iter()
+        .filter_map(|h| handles.remove_entry(&h))
+        .collect()
+}
 #[cfg(test)]
 mod tests {
     use super::*;

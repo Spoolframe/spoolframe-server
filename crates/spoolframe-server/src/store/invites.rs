@@ -15,8 +15,8 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use super::users::{
-    LocalUserId, UserError, add_password, display_name, is_unique_violation, normalize_username,
-    role, stored,
+    LocalUserId, UserError, add_password, display_name, insert_user, normalize_username, role,
+    stored,
 };
 use super::{Store, StoreError};
 
@@ -388,24 +388,9 @@ impl Store {
         };
         let role = role(taken.try_get("role")?);
         let id = LocalUserId::generate();
-        let inserted = sqlx::query(
-            "INSERT INTO users (id, username, display_name, role, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .bind(id)
-        .bind(&name)
-        .bind(display)
-        .bind(stored(role))
-        .bind(now)
-        .execute(&mut *tx)
-        .await;
-        match inserted {
-            Ok(_) => {}
-            Err(e) if is_unique_violation(&e) => {
-                tx.rollback().await?;
-                return Ok(Redeemed::UsernameTaken);
-            }
-            Err(e) => return Err(e.into()),
+        if !insert_user(&mut tx, id, &name, display, role, now).await? {
+            tx.rollback().await?;
+            return Ok(Redeemed::UsernameTaken);
         }
         add_password(&mut tx, id, phc, now).await?;
         tx.commit().await?;
@@ -466,21 +451,8 @@ impl Store {
             }
             _ => {}
         }
-        let granted = sqlx::query(
-            "INSERT INTO portable_grants (portable_user_id, display_name, granted_at, invite_id) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT (portable_user_id) DO UPDATE SET \
-               display_name = excluded.display_name, granted_at = excluded.granted_at, \
-               invite_id = excluded.invite_id, revoked_at = NULL \
-             WHERE portable_grants.revoked_at IS NOT NULL",
-        )
-        .bind(&id)
-        .bind(display)
-        .bind(now)
-        .bind(&invite_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let granted =
+            super::grants::upsert_grant(&mut *tx, &id, display, now, Some(&invite_id)).await?;
         if granted == 0 {
             tx.rollback().await?;
             return Ok(PortableRedeemed::AlreadyGranted);

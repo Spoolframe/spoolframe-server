@@ -70,16 +70,16 @@ impl Store {
         // The signer must be one of the identity's roots, ever (P7-08):
         // the genesis's, or one a root added. A removed root's states
         // still count, for what they remove.
-        let roots = self
-            .root_set(state.user, None, std::slice::from_ref(state))
-            .await?;
+        let (kept, mut all) = self.root_states(state.user, None).await?;
+        let before = root_set(&state.user, kept.as_ref(), &all);
+        all.push(state.clone());
+        let roots = root_set(&state.user, kept.as_ref(), &all);
         if !roots.knew(&state.signer()) {
             return Err(IdentityStateError::NotARoot);
         }
         // A root removed here adds no one new from now on, whatever time
         // its endorsement claims: a stolen key cannot backdate its way
         // past a removal this server already has.
-        let before = self.root_set(state.user, None, &[]).await?;
         if before.refuses_additions(&state.roots_added) {
             return Err(IdentityStateError::NotARoot);
         }
@@ -223,10 +223,8 @@ impl Store {
                 .bind(user.to_string())
                 .fetch_optional(&self.pool)
                 .await?;
-        json.map(|json| {
-            serde_json::from_str(&json).map_err(|e| StoreError::Db(sqlx::Error::Decode(e.into())))
-        })
-        .transpose()
+        json.map(|json| serde_json::from_str(&json).map_err(super::decode_error))
+            .transpose()
     }
 
     /// Whether any valid state seen here revokes `user`'s `key`, by a
@@ -298,13 +296,7 @@ impl Store {
         .bind(handle_hex(handle))
         .fetch_optional(&self.pool)
         .await?;
-        user.map(|user| {
-            user.parse()
-                .map_err(|e: spoolframe_protocol::portable::InvalidPortableUserId| {
-                    StoreError::Db(sqlx::Error::Decode(e.into()))
-                })
-        })
-        .transpose()
+        user.map(super::parse_id).transpose()
     }
 
     /// The genesis of `user` kept here, if any.
@@ -317,10 +309,8 @@ impl Store {
                 .bind(user.to_string())
                 .fetch_optional(&self.pool)
                 .await?;
-        json.map(|json| {
-            serde_json::from_str(&json).map_err(|e| StoreError::Db(sqlx::Error::Decode(e.into())))
-        })
-        .transpose()
+        json.map(|json| serde_json::from_str(&json).map_err(super::decode_error))
+            .transpose()
     }
 
     /// The roots of `user` (P7-08): from its genesis (`genesis`, if given
@@ -333,22 +323,35 @@ impl Store {
         genesis: Option<&IdentityGenesis>,
         states: &[PortableIdentityState],
     ) -> Result<RootSet, StoreError> {
+        let (kept, mut all) = self.root_states(user, genesis).await?;
+        all.extend(states.iter().filter(|s| s.user == user).cloned());
+        let genesis = genesis.filter(|g| g.user() == user).or(kept.as_ref());
+        Ok(root_set(&user, genesis, &all))
+    }
+
+    /// What [`Store::root_set`] works `user`'s roots out from, read once:
+    /// the genesis kept here (only when `genesis` is not `user`'s own),
+    /// and the root-changing states kept here. For a caller that needs
+    /// the set both with and without states of its own.
+    pub async fn root_states(
+        &self,
+        user: PortableUserId,
+        genesis: Option<&IdentityGenesis>,
+    ) -> Result<(Option<IdentityGenesis>, Vec<PortableIdentityState>), StoreError> {
         let kept = match genesis.filter(|g| g.user() == user) {
             Some(_) => None,
             None => self.identity_genesis(user).await?,
         };
-        let genesis = genesis.filter(|g| g.user() == user).or(kept.as_ref());
         let rows: Vec<String> =
             sqlx::query_scalar("SELECT state FROM portable_root_states WHERE user_id = ?1")
                 .bind(user.to_string())
                 .fetch_all(&self.pool)
                 .await?;
-        let mut all: Vec<PortableIdentityState> = rows
+        let states = rows
             .iter()
             .filter_map(|json| serde_json::from_str(json).ok())
             .collect();
-        all.extend(states.iter().filter(|s| s.user == user).cloned());
-        Ok(root_set(&user, genesis, &all))
+        Ok((kept, states))
     }
 
     /// Drop `user`'s revocations that have lapsed at `now`.

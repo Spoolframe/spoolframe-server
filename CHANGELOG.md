@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- On VA-API with GPU filters, an HDR film made SDR has its burned-in
+  pictures laid over it after the tone map, not before: SDR subtitles
+  are no longer mapped with the video, dimmed or shifted, and the GPU's
+  overlay gets 8-bit frames as it expects.
+
+- `transcode.scratch_dir` (or, unset, the state directory it defaults
+  under) with one of `' : \ , ; [ ]` in its path is refused at load, the
+  key named: ffmpeg's subtitle filter reads the film through a link in
+  there and cannot take those characters, so every burned-in text
+  subtitle failed, blamed on a subtitle file. The refusal of a path a
+  burn-in cannot take now names which path it was.
+
 - The web UI's sign-in endpoints answer a refusal with its own HTTP
   status instead of 500: a sign-in too old for a change is 403, a
   missing user, session, code or invite 404, the last admin 409, and

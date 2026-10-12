@@ -190,21 +190,7 @@ impl Store {
         endpoint_id: &str,
     ) -> Result<u64, StoreError> {
         let mut tx = self.begin_write().await?;
-        let revoked = sqlx::query(
-            "UPDATE sessions SET revoked_at = ?3 \
-             WHERE user_id = ?1 AND endpoint_id = ?2 AND revoked_at IS NULL",
-        )
-        .bind(user)
-        .bind(endpoint_id)
-        .bind(self.now())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        sqlx::query("DELETE FROM trusted_endpoints WHERE user_id = ?1 AND endpoint_id = ?2")
-            .bind(user)
-            .bind(endpoint_id)
-            .execute(&mut *tx)
-            .await?;
+        let revoked = super::end_device(&mut tx, user, endpoint_id, self.now()).await?;
         tx.commit().await?;
         self.note_sessions_ended();
         Ok(revoked)

@@ -126,9 +126,16 @@ pub(crate) struct RelyingParty {
 impl RelyingParty {
     /// The relying party `rp_id`, at `origin` only.
     pub(crate) fn at(rp_id: &str, origin: &str) -> Result<Self, String> {
+        Self::at_with(rp_id, origin, false)
+    }
+
+    /// [`RelyingParty::at`], at any port of `origin`'s host if
+    /// `allow_any_port`: on the listener's own host when its port is not
+    /// known.
+    pub(crate) fn at_with(rp_id: &str, origin: &str, allow_any_port: bool) -> Result<Self, String> {
         let url = Url::parse(origin).map_err(|e| format!("{origin:?} is not a URL: {e}"))?;
         let webauthn = WebauthnBuilder::new(rp_id, &url)
-            .map(|builder| builder.rp_name(RP_NAME))
+            .map(|builder| builder.rp_name(RP_NAME).allow_any_port(allow_any_port))
             .and_then(WebauthnBuilder::build)
             .map_err(|e| format!("passkeys cannot be bound to {origin}: {e}"))?;
         Ok(Self {
@@ -577,16 +584,7 @@ fn relying_party(origins: &Origins, port: Option<u16>) -> Result<RelyingParty, S
             "passkeys need HTTPS, and admin.public_url ({origin}) is plain HTTP"
         ));
     }
-    let webauthn = WebauthnBuilder::new(rp_id, &url)
-        .map(|builder| builder.rp_name(RP_NAME).allow_any_port(any_port))
-        .and_then(WebauthnBuilder::build)
-        .map_err(|e| format!("passkeys cannot be bound to {origin}: {e}"))?;
-    Ok(RelyingParty {
-        webauthn,
-        rp_id: rp_id.to_owned(),
-        origin,
-        user_handle_optional: false,
-    })
+    RelyingParty::at_with(rp_id, &origin, any_port)
 }
 
 /// Ask for a passkey the authenticator stores (a discoverable credential:

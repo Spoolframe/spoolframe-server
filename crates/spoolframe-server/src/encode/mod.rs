@@ -242,9 +242,9 @@ impl Conversion {
             epoch => jobs.dir().join(format!("{}~{epoch}", source.handle)),
         };
         std::fs::create_dir_all(&dir).map_err(prepare)?;
-        // What fails from here leaves no directory behind (B-13), as a
-        // failed spawn already did not.
-        let prepared = (|| -> Result<_, JobError> {
+        // Everything from here is in this closure, so whatever fails leaves
+        // no directory behind (B-13).
+        let built = (|| -> Result<Arc<Self>, JobError> {
             // Plain names for ffmpeg's filters (see `args::filter_path`).
             let input = dir.join("input");
             std::os::unix::fs::symlink(source.path, &input).map_err(prepare)?;
@@ -289,107 +289,91 @@ impl Conversion {
                 }
                 _ => None,
             };
-            Ok((input, sidecar, segments))
-        })();
-        let (input, sidecar, segments) = match prepared {
-            Ok(prepared) => prepared,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(e);
-            }
-        };
-        let start_rung = if ladder.is_empty() {
-            0
-        } else {
-            source.start_rung.min(ladder.len() as u32 - 1)
-        };
-        let first_video = rung_video(*video, ladder, start_rung);
-        // An HLS start begins at the segment the position falls in, sought
-        // as the rung it starts on is: a copy only at a keyframe.
-        let (start, first_segment) = playback_seek(segments.as_ref(), start, first_video);
-        // The GPU is picked for an encode (PGPU-05): a remux ladder that
-        // starts on its copy has its encodes picked for, its highest.
-        let encoded = (0..ladder.len() as u32)
-            .map(|n| rung_video(*video, ladder, n))
-            .find(|v| matches!(v, Some(ConvertedVideo::Encode { .. })));
-        let picked_for = match first_video {
-            Some(ConvertedVideo::Copy { .. }) => encoded.unwrap_or(first_video),
-            _ => first_video,
-        };
-        let run_on = match run_on(
-            &jobs,
-            &source,
-            EncodeSpec {
-                input: &input,
-                sidecar: sidecar.as_deref(),
-                descriptor: &source.descriptor,
-                video: picked_for,
+            let start_rung = if ladder.is_empty() {
+                0
+            } else {
+                source.start_rung.min(ladder.len() as u32 - 1)
+            };
+            let first_video = rung_video(*video, ladder, start_rung);
+            // An HLS start begins at the segment the position falls in, sought
+            // as the rung it starts on is: a copy only at a keyframe.
+            let (start, first_segment) = playback_seek(segments.as_ref(), start, first_video);
+            // The GPU is picked for an encode (PGPU-05): a remux ladder that
+            // starts on its copy has its encodes picked for, its highest.
+            let encoded = (0..ladder.len() as u32)
+                .map(|n| rung_video(*video, ladder, n))
+                .find(|v| matches!(v, Some(ConvertedVideo::Encode { .. })));
+            let picked_for = match first_video {
+                Some(ConvertedVideo::Copy { .. }) => encoded.unwrap_or(first_video),
+                _ => first_video,
+            };
+            let (gpu_filters, tone_map) = jobs.filters();
+            let run_on = run_on(
+                &jobs,
+                &source,
+                EncodeSpec {
+                    input: &input,
+                    sidecar: sidecar.as_deref(),
+                    descriptor: &source.descriptor,
+                    video: picked_for,
+                    audio: *audio,
+                    subtitle: *subtitle,
+                    encoders: &source.gpus.software,
+                    vaapi_device: Path::new(""),
+                    hardware_decode: !jobs.hardware_decode_failed(source.path),
+                    gpu_filters,
+                    tone_map,
+                    start: None,
+                    output: Output::Progressive {
+                        file: PathBuf::new(),
+                    },
+                },
+            )?;
+            let job = spawn(
+                &jobs,
+                &dir,
+                source.path,
+                &input,
+                sidecar.as_deref(),
+                &source.descriptor,
+                (*delivery, first_video, *audio, *subtitle),
+                &run_on,
+                source.first_epoch,
+                start,
+                first_segment,
+                source.slot,
+                keyframe_cuts(*video, first_video, segments.as_ref()),
+            )?;
+            Ok(Arc::new(Self {
+                jobs,
+                dir: dir.clone(),
+                file: source.path.to_path_buf(),
+                input,
+                sidecar,
+                descriptor: source.descriptor,
+                delivery: *delivery,
+                video: *video,
                 audio: *audio,
                 subtitle: *subtitle,
-                encoders: &source.gpus.software,
-                vaapi_device: Path::new(""),
-                hardware_decode: !jobs.hardware_decode_failed(source.path),
-                gpu_filters: jobs.limits().gpu_filters,
-                tone_map: jobs.limits().tone_map,
-                start: None,
-                output: Output::Progressive {
-                    file: PathBuf::new(),
-                },
-            },
-        ) {
-            Ok(run_on) => run_on,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(e);
-            }
-        };
-        let job = spawn(
-            &jobs,
-            &dir,
-            source.path,
-            &input,
-            sidecar.as_deref(),
-            &source.descriptor,
-            (*delivery, first_video, *audio, *subtitle),
-            &run_on,
-            source.first_epoch,
-            start,
-            first_segment,
-            source.slot,
-            keyframe_cuts(*video, first_video, segments.as_ref()),
-        );
-        let job = match job {
-            Ok(job) => job,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(e);
-            }
-        };
-        Ok(Arc::new(Self {
-            jobs,
-            dir,
-            file: source.path.to_path_buf(),
-            input,
-            sidecar,
-            descriptor: source.descriptor,
-            delivery: *delivery,
-            video: *video,
-            audio: *audio,
-            subtitle: *subtitle,
-            run_on,
-            segments,
-            ladder: ladder.clone(),
-            first_rung: start_rung,
-            epochs: std::sync::atomic::AtomicU32::new(job.epoch + 1),
-            current: Mutex::new(Current {
-                job,
-                rung: start_rung,
-                left: None,
-            }),
-            ended: Default::default(),
-            #[cfg(test)]
-            switches: Arc::default(),
-        }))
+                run_on,
+                segments,
+                ladder: ladder.clone(),
+                first_rung: start_rung,
+                epochs: std::sync::atomic::AtomicU32::new(job.epoch + 1),
+                current: Mutex::new(Current {
+                    job,
+                    rung: start_rung,
+                    left: None,
+                }),
+                ended: Default::default(),
+                #[cfg(test)]
+                switches: Arc::default(),
+            }))
+        })();
+        if built.is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        built
     }
 
     /// End the conversion where it is (P3-15's End conversion): ffmpeg
@@ -483,6 +467,7 @@ impl Conversion {
     /// 1280×528) is not listed at the size asked for.
     fn written_size(&self, video: ConvertedVideo) -> Option<(u32, u32)> {
         let jobs = &self.jobs;
+        let (gpu_filters, tone_map) = jobs.filters();
         args::written_size(&EncodeSpec {
             input: &self.input,
             sidecar: self.sidecar.as_deref(),
@@ -493,8 +478,8 @@ impl Conversion {
             encoders: self.run_on.encoders(),
             vaapi_device: self.run_on.vaapi_device(),
             hardware_decode: !jobs.hardware_decode_failed(&self.file),
-            gpu_filters: jobs.limits().gpu_filters,
-            tone_map: jobs.limits().tone_map,
+            gpu_filters,
+            tone_map,
             start: None,
             output: Output::Hls {
                 dir: self.dir.clone(),
@@ -530,6 +515,21 @@ impl Conversion {
         Some((segments.start(n)?, segments.end(n)?))
     }
 
+    /// The segment plan of an HLS playback, once `rung` is known to be one
+    /// of its rungs.
+    fn hls_rung(&self, rung: u32) -> Result<&Segments, JobError> {
+        let segments = self
+            .segments
+            .as_ref()
+            .ok_or_else(|| JobError::Prepare("not an HLS playback".into()))?;
+        if rung >= self.rungs() {
+            return Err(JobError::Prepare(format!(
+                "no rung {rung} in this playback"
+            )));
+        }
+        Ok(segments)
+    }
+
     /// The job that writes HLS segment `n` of `rung` (0 for one encode):
     /// the running one, or, if `n` is behind where it started (or behind
     /// what it has kept, with the scratch space full) or far past what it
@@ -540,15 +540,7 @@ impl Conversion {
     /// otherwise the encode moves to that rung at `n`, the running job
     /// kept as the one left, so its segments stay readable.
     pub fn job_for_segment(&self, n: u32, rung: u32) -> Result<Arc<EncodeJob>, JobError> {
-        let segments = self
-            .segments
-            .as_ref()
-            .ok_or_else(|| JobError::Prepare("not an HLS playback".into()))?;
-        if rung >= self.rungs() {
-            return Err(JobError::Prepare(format!(
-                "no rung {rung} in this playback"
-            )));
-        }
+        let segments = self.hls_rung(rung)?;
         let current = self.current.lock();
         if rung != current.rung {
             if let Some((left, job)) = &current.left
@@ -622,32 +614,18 @@ impl Conversion {
         {
             return Ok(old.clone());
         }
-        let (start, from) = run_at(segments, n, rung_video(self.video, &self.ladder, rung));
-        let run = self.next_run(&current, rung, start, from);
-        let replaces = current.job.epoch;
-        drop(current);
-        let next = self.start_run(run)?;
-        let mut current = self.current.lock();
-        if current.job.epoch != replaces || current.rung != rung || self.ended() {
-            // Another read moved the encode meanwhile: this run goes
-            // (stopped, its files removed), and the segment is asked of the
-            // encode as it is now.
-            drop(current);
-            drop(next);
-            return self.job_for_segment(n, rung);
-        }
-        // Kept, stopped, as a switch keeps the run it leaves: its files
-        // serve what the player buffered before it moved.
-        let old = std::mem::replace(&mut current.job, next);
-        old.stop();
-        current.left = Some((rung, old));
-        self.log_switch(
+        // Behind or past the run: a new run on this rung, from `n`. The one
+        // it replaces is kept, stopped, as a switch keeps the run it leaves:
+        // its files serve what the player buffered before it moved.
+        self.switch(
+            current,
             rung,
-            rung,
+            n,
             Asked::Segment(n),
-            Served::NewRun(current.job.clone()),
-        );
-        Ok(current.job.clone())
+            segments,
+            |job| job,
+            || self.job_for_segment(n, rung),
+        )
     }
 
     /// The run that starts `rung` at `start` (segment `from`) in place of
@@ -707,15 +685,7 @@ impl Conversion {
     /// run started there, two ffmpeg starts before the player had a
     /// picture (an iPhone gave up on the init after 6 s).
     pub fn init_for(&self, rung: u32) -> Result<Init, JobError> {
-        let segments = self
-            .segments
-            .as_ref()
-            .ok_or_else(|| JobError::Prepare("not an HLS playback".into()))?;
-        if rung >= self.rungs() {
-            return Err(JobError::Prepare(format!(
-                "no rung {rung} in this playback"
-            )));
-        }
+        let segments = self.hls_rung(rung)?;
         let kept = self.kept_init(rung);
         let current = self.current.lock();
         if kept.exists() {
@@ -781,9 +751,10 @@ impl Conversion {
         }
     }
 
-    /// Move the encode to `rung` at segment `n`: started first in the
-    /// running job's slot, then the running job stopped and kept as the
-    /// one left (the one left before it goes, its files with it).
+    /// Move the encode to `rung` at segment `n`, or restart it there on its
+    /// own rung: started first in the running job's slot, then the running
+    /// job stopped and kept as the one left (the one left before it goes,
+    /// its files with it).
     ///
     /// The run starts with the lock let go (M4); if the encode moved
     /// meanwhile, it goes, and `again` asks of the encode as it is now.
@@ -811,7 +782,11 @@ impl Conversion {
         }
         let left = std::mem::replace(&mut current.job, next);
         left.stop();
-        self.keep_init(current.rung, &left);
+        // A rung's init is kept when the player leaves it; a run restarted
+        // on its own rung keeps its init as it was.
+        if rung != was {
+            self.keep_init(was, &left);
+        }
         self.log_switch(
             current.rung,
             rung,
@@ -1209,6 +1184,7 @@ fn spawn(
             )
         }
     };
+    let (gpu_filters, tone_map) = jobs.filters();
     let spec = EncodeSpec {
         input,
         sidecar,
@@ -1219,8 +1195,8 @@ fn spawn(
         encoders: run_on.encoders(),
         vaapi_device: run_on.vaapi_device(),
         hardware_decode: !jobs.hardware_decode_failed(file),
-        gpu_filters: jobs.limits().gpu_filters,
-        tone_map: jobs.limits().tone_map,
+        gpu_filters,
+        tone_map,
         start,
         output,
     };

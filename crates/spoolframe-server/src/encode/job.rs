@@ -78,11 +78,11 @@ impl Measured {
         (self.ms > 0).then(|| (u128::from(self.bytes) * 8000 / u128::from(self.ms)) as u64)
     }
 
-    /// The segments of `dir`'s ffmpeg `playlist` past [`Measured::through`]
-    /// counted in: their files' sizes and listed durations. A segment
+    /// The segments `listed` in `dir`'s ffmpeg playlist past
+    /// [`Measured::through`] counted in: their files' sizes and listed durations. A segment
     /// whose file is gone already is passed over, not counted.
-    fn count_segments(&mut self, dir: &Path, playlist: &str) {
-        for (n, ms) in listed_segments(playlist) {
+    fn count_segments(&mut self, dir: &Path, listed: &[(u32, u64)]) {
+        for &(n, ms) in listed {
             if self.through.is_some_and(|through| n <= through) {
                 continue;
             }
@@ -588,6 +588,13 @@ impl Jobs {
     /// The limits now.
     pub fn limits(&self) -> JobLimits {
         self.limits.read().clone()
+    }
+
+    /// `transcode.gpu_filters` and `transcode.tone_map` now, read together
+    /// so a spec never mixes two configs.
+    pub fn filters(&self) -> (bool, spoolframe_media::encoders::ToneMapSetting) {
+        let limits = self.limits.read();
+        (limits.gpu_filters, limits.tone_map)
     }
 
     /// Run new jobs under `limits` from now on. Jobs running go on as they
@@ -1346,10 +1353,9 @@ impl Supervisor {
                 },
                 status = child.wait() => break status,
                 _ = tick.tick() => {
-                    let (bytes, last_segment) = self.measure().await;
+                    let (bytes, last_segment, output) = self.measure_and_count(encoded_ms).await;
                     self.count(bytes);
                     self.throttle(encoded_ms, base_ms, bytes, last_segment);
-                    let output = self.output(bytes, encoded_ms, last_segment);
                     self.progress.send_modify(|p| {
                         p.bytes = bytes;
                         p.encoded_ms = encoded_ms;
@@ -1414,10 +1420,9 @@ impl Supervisor {
         while let Ok(Some(line)) = err.next_line().await {
             self.shared.stderr_line(line);
         }
-        let (bytes, last_segment) = self.measure().await;
-        self.count(bytes);
         let encoded_ms = self.progress.borrow().encoded_ms.max(encoded_ms);
-        let output = self.output(bytes, encoded_ms, last_segment);
+        let (bytes, last_segment, output) = self.measure_and_count(encoded_ms).await;
+        self.count(bytes);
         self.progress.send_modify(|p| {
             p.bytes = bytes;
             p.last_segment = last_segment;
@@ -1487,25 +1492,31 @@ impl Supervisor {
         }
     }
 
-    /// [`Progress::output`] now, `bytes` and `last_segment` just measured
-    /// and `encoded_ms` reported: for HLS, the segments finished since it
-    /// last counted added in.
-    fn output(&self, bytes: u64, encoded_ms: u64, last_segment: Option<u32>) -> Measured {
+    /// [`Self::measure`], and [`Progress::output`] now with `encoded_ms`
+    /// reported: for HLS, the segments finished since it last counted
+    /// added in. One read of the playlist on the blocking pool serves both
+    /// (H2): the segment count and the measure come from the same listing.
+    async fn measure_and_count(&self, encoded_ms: u64) -> (u64, Option<u32>, Measured) {
         let mut output = self.progress.borrow().output;
-        match self.written {
-            Written::Progressive { .. } => {
-                output.bytes = bytes;
-                output.ms = encoded_ms.saturating_sub(self.start_ms);
-            }
-            Written::Hls => {
-                if last_segment > output.through
-                    && let Ok(playlist) = std::fs::read_to_string(self.dir.join(PLAYLIST))
-                {
-                    output.count_segments(&self.dir, &playlist);
+        let (written, dir, start_ms) = (self.written.clone(), self.dir.clone(), self.start_ms);
+        tokio::task::spawn_blocking(move || {
+            let (bytes, listed) = measure_listed(&written, &dir);
+            let last = last_of(&listed);
+            match written {
+                Written::Progressive { .. } => {
+                    output.bytes = bytes;
+                    output.ms = encoded_ms.saturating_sub(start_ms);
+                }
+                Written::Hls => {
+                    if last > output.through {
+                        output.count_segments(&dir, &listed);
+                    }
                 }
             }
-        }
-        output
+            (bytes, last, output)
+        })
+        .await
+        .unwrap_or_else(|_| (0, None, self.progress.borrow().output))
     }
 
     /// Pause ffmpeg once it is `read_ahead` past its reader; resume it at
@@ -1618,8 +1629,17 @@ fn make_room(scratch: &Path, limit: u64, hls: bool, shared: &Shared, dir: &Path)
 
 /// Bytes `written` in `dir`, and for HLS the highest segment finished.
 fn measure(written: &Written, dir: &Path) -> (u64, Option<u32>) {
+    let (bytes, listed) = measure_listed(written, dir);
+    (bytes, last_of(&listed))
+}
+
+/// Bytes `written` in `dir`, and for HLS each segment ffmpeg's playlist
+/// lists as finished, with its duration (ms).
+fn measure_listed(written: &Written, dir: &Path) -> (u64, Vec<(u32, u64)>) {
     match written {
-        Written::Progressive { file } => (std::fs::metadata(file).map_or(0, |m| m.len()), None),
+        Written::Progressive { file } => {
+            (std::fs::metadata(file).map_or(0, |m| m.len()), Vec::new())
+        }
         Written::Hls => {
             let bytes = std::fs::read_dir(dir).map_or(0, |entries| {
                 entries
@@ -1632,10 +1652,10 @@ fn measure(written: &Written, dir: &Path) -> (u64, Option<u32>) {
             // half written, and the one being encoded does not exist yet.
             // ffmpeg's playlist is replaced (written aside, then renamed)
             // right after each segment is closed.
-            let last = std::fs::read_to_string(dir.join(PLAYLIST))
-                .ok()
-                .and_then(|text| last_listed(&text));
-            (bytes, last)
+            let listed = std::fs::read_to_string(dir.join(PLAYLIST))
+                .map(|text| listed_segments(&text))
+                .unwrap_or_default();
+            (bytes, listed)
         }
     }
 }
@@ -1679,12 +1699,9 @@ fn listed_segments(playlist: &str) -> Vec<(u32, u64)> {
     listed
 }
 
-/// The highest `seg<n>.m4s` an ffmpeg HLS playlist lists.
-fn last_listed(playlist: &str) -> Option<u32> {
-    playlist
-        .lines()
-        .filter_map(|line| line.strip_prefix("seg")?.strip_suffix(".m4s")?.parse().ok())
-        .max()
+/// The highest segment of those `listed`.
+fn last_of(listed: &[(u32, u64)]) -> Option<u32> {
+    listed.iter().map(|&(n, _)| n).max()
 }
 
 #[cfg(test)]
@@ -1966,8 +1983,11 @@ pub(super) mod tests {
     fn a_segment_is_finished_once_ffmpeg_lists_it() {
         let playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.mp4\"\n\
                         #EXTINF:6.000000,\nseg4.m4s\n#EXTINF:6.000000,\nseg5.m4s\n";
-        assert_eq!(last_listed(playlist), Some(5));
-        assert_eq!(last_listed("#EXTM3U\n#EXT-X-VERSION:7\n"), None);
+        assert_eq!(last_of(&listed_segments(playlist)), Some(5));
+        assert_eq!(
+            last_of(&listed_segments("#EXTM3U\n#EXT-X-VERSION:7\n")),
+            None
+        );
     }
 
     /// PX-24: the measured bitrate is the finished segments' bytes over
@@ -1988,17 +2008,17 @@ pub(super) mod tests {
             )
         };
         let mut huge = Measured::default();
-        huge.count_segments(dir, &listing(1, "1e300"));
-        huge.count_segments(dir, &listing(2, "1e300"));
+        huge.count_segments(dir, &listed_segments(&listing(1, "1e300")));
+        huge.count_segments(dir, &listed_segments(&listing(2, "1e300")));
         assert_eq!(huge.ms, u64::MAX, "a huge duration saturates");
         let mut output = Measured::default();
         assert_eq!(output.bitrate(), None, "nothing written yet");
-        output.count_segments(dir, &listing(1, "2.000000"));
-        output.count_segments(dir, &listing(1, "2.000000"));
+        output.count_segments(dir, &listed_segments(&listing(1, "2.000000")));
+        output.count_segments(dir, &listed_segments(&listing(1, "2.000000")));
         assert_eq!((output.bytes, output.ms), (500_000, 2000), "counted once");
         assert_eq!(output.bitrate(), Some(2_000_000));
-        output.count_segments(dir, &listing(2, "2.000000"));
-        output.count_segments(dir, &listing(3, "4.000000"));
+        output.count_segments(dir, &listed_segments(&listing(2, "2.000000")));
+        output.count_segments(dir, &listed_segments(&listing(3, "4.000000")));
         // 2 MB over 8 s.
         assert_eq!(output.through, Some(3));
         assert_eq!(output.bitrate(), Some(2_000_000));
@@ -2009,7 +2029,7 @@ pub(super) mod tests {
              #EXTINF:4.000000,\nseg4.m4s\n",
             listing(1, "2.000000")
         );
-        output.count_segments(dir, &all);
+        output.count_segments(dir, &listed_segments(&all));
         // 5 MB over 12 s.
         assert_eq!((output.bytes, output.ms), (5_000_000, 12_000));
         assert_eq!(output.bitrate(), Some(3_333_333));

@@ -187,6 +187,15 @@ pub fn plex_catalog(
     ))
 }
 
+/// The admin API's name for the layer a setting's value comes from.
+fn setting_layer(layer: Layer) -> SettingLayer {
+    match layer {
+        Layer::Default => SettingLayer::Default,
+        Layer::File => SettingLayer::File,
+        Layer::Runtime => SettingLayer::Runtime,
+    }
+}
+
 /// Whether `layers` turn insecure cookies on behind an `https` public URL
 /// (PX-11 finding 32). A change that makes it so is refused, whichever of
 /// the two it sets; a config file that already says so only gets the
@@ -278,11 +287,7 @@ impl RuntimeSettings {
                 value: None,
                 secret: true,
                 set: value.is_some(),
-                layer: origin.layer.map(|layer| match layer {
-                    Layer::Default => SettingLayer::Default,
-                    Layer::File => SettingLayer::File,
-                    Layer::Runtime => SettingLayer::Runtime,
-                }),
+                layer: origin.layer.map(setting_layer),
                 locked: origin.locked,
                 overrides: None,
                 apply,
@@ -298,11 +303,7 @@ impl RuntimeSettings {
             value: value.map(|v| layers::shown(setting.key, v).to_json()),
             secret: false,
             set: value.is_some(),
-            layer: origin.layer.map(|layer| match layer {
-                Layer::Default => SettingLayer::Default,
-                Layer::File => SettingLayer::File,
-                Layer::Runtime => SettingLayer::Runtime,
-            }),
+            layer: origin.layer.map(setting_layer),
             locked: origin.locked,
             overrides: origin
                 .overrides

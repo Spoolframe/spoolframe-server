@@ -12,6 +12,7 @@
 //! against the row's `updated_at`. A pull keeps Plex's timestamp, so the
 //! next run finds both sides equal and does nothing: no ping-pong.
 
+use futures_util::stream::{self, StreamExt};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -28,6 +29,10 @@ use crate::principal::Principal;
 use crate::store::StoreError;
 use crate::store::users::LocalUserId;
 use crate::store::watch::{WatchRow, WatchUpdate};
+
+/// The most section lookups a sync asks one PMS at once: the user's own
+/// server, so a modest load.
+const SECTION_LOOKUPS: usize = 8;
 
 /// Positions this close count as the same: a client reports every few
 /// seconds, and Plex rounds.
@@ -555,35 +560,50 @@ impl WatchSync {
         self.access.lock().remove(&user);
     }
 
-    /// The section each of `ids` is in, asked of Plex once per item; left
-    /// out for one Plex does not have.
+    /// The section each of `ids` is in, asked of Plex once per item, up to
+    /// [`SECTION_LOOKUPS`] at once; left out for one Plex does not have.
     async fn sections_of(&self, plex: &PlexCatalog, ids: &[MediaId]) -> HashMap<MediaId, String> {
         let url = plex.base_url().to_owned();
         let mut found = HashMap::new();
-        for id in ids {
-            let key = (url.clone(), id.clone());
-            let cached = self.sections.lock().get(&key).cloned();
-            let section = match cached {
-                Some(section) => section,
-                None => {
-                    let asked = match plex.section_of(id).await {
-                        Ok(section) => Some(section),
-                        // Gone from Plex: nothing to send it to.
-                        Err(CatalogError::NotFound(_)) => Some(None),
-                        // Asked again next run.
-                        Err(e) => {
-                            tracing::debug!(item = %id, error = %e, "cannot tell which library an item is in");
-                            None
-                        }
-                    };
-                    if let Some(section) = &asked {
-                        self.sections.lock().insert(key, section.clone());
+        let mut missing = Vec::new();
+        {
+            let cache = self.sections.lock();
+            for id in ids {
+                match cache.get(&(url.clone(), id.clone())) {
+                    Some(Some(section)) => {
+                        found.insert(id.clone(), section.clone());
                     }
-                    asked.flatten()
+                    Some(None) => {}
+                    None => missing.push(id.clone()),
+                }
+            }
+        }
+        let asked: Vec<_> = stream::iter(missing)
+            .map(|id| async move {
+                let section = plex.section_of(&id).await;
+                (id, section)
+            })
+            .buffer_unordered(SECTION_LOOKUPS)
+            .collect()
+            .await;
+        for (id, section) in asked {
+            let asked = match section {
+                Ok(section) => Some(section),
+                // Gone from Plex: nothing to send it to.
+                Err(CatalogError::NotFound(_)) => Some(None),
+                // Asked again next run.
+                Err(e) => {
+                    tracing::debug!(item = %id, error = %e, "cannot tell which library an item is in");
+                    None
                 }
             };
-            if let Some(section) = section {
-                found.insert(id.clone(), section);
+            if let Some(section) = &asked {
+                self.sections
+                    .lock()
+                    .insert((url.clone(), id.clone()), section.clone());
+            }
+            if let Some(Some(section)) = asked {
+                found.insert(id, section);
             }
         }
         found

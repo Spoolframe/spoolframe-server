@@ -39,7 +39,6 @@ use openidconnect::{
     DiscoveryError, IssuerUrl, JwsSigningAlgorithm, Nonce, PkceCodeChallenge, PkceCodeVerifier,
     ProviderMetadata, RedirectUrl, Scope, TokenResponse,
 };
-use password_hash::rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::config::OidcConfig;
@@ -392,13 +391,6 @@ fn browser_hash(value: &str) -> String {
         .to_string()
 }
 
-/// 32 random bytes, hex.
-fn random() -> String {
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Whether an ID token signed with `alg` may be trusted: with a key from
 /// the provider's key set. Not with the client secret (HMAC), which the
 /// server holds itself, and never unsigned.
@@ -684,7 +676,7 @@ impl Oidc {
             request
         };
         let (url, state, nonce) = request.url();
-        let browser = random();
+        let browser = crate::auth::SessionToken::generate().0;
         let mut flows = self.flows.lock();
         let now = Instant::now();
         flows.retain(|_, f| now.duration_since(f.began) < self.lifetime);

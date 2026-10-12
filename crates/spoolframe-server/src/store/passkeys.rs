@@ -2,7 +2,7 @@
 //! `crate::passkeys`'; this is storage, and the rule that a user keeps a
 //! way to sign in.
 
-use super::users::{LocalUserId, UserError, add_first_user};
+use super::users::{LocalUserId, UserError, add_first_user, is_unique_violation};
 use super::{Store, StoreError};
 
 /// One passkey.
@@ -138,7 +138,7 @@ impl Store {
                 created_at,
                 last_used_at: None,
             }),
-            Err(sqlx::Error::Database(db)) if db.is_unique_violation() => Err(PasskeyError::Exists),
+            Err(e) if is_unique_violation(&e) => Err(PasskeyError::Exists),
             Err(e) => Err(e.into()),
         }
     }

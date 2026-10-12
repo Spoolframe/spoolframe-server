@@ -162,53 +162,15 @@ fn same_network(ip: IpAddr, own: IpAddr, len: u8) -> bool {
 /// The server's on-link networks now: each address on an interface that
 /// is up, with its netmask's prefix length. With no netmask an IPv6
 /// address is taken as a /64, what SLAAC hands out, and an IPv4 one as
-/// itself alone. Kept apart from [`crate::announce::interfaces`], which
-/// does not read netmasks.
+/// itself alone.
 fn own_networks() -> Vec<(IpAddr, u8)> {
-    let mut found = Vec::new();
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills `head` with a list it allocates, which is
-    // read only until the freeifaddrs below; each entry's address and
-    // netmask are read as the struct the address's family names.
-    unsafe {
-        if libc::getifaddrs(&mut head) != 0 {
-            return found;
-        }
-        let mut entry = head;
-        while let Some(ifa) = entry.as_ref() {
-            entry = ifa.ifa_next;
-            if ifa.ifa_addr.is_null() || ifa.ifa_flags & libc::IFF_UP as u32 == 0 {
-                continue;
-            }
-            let mask = ifa.ifa_netmask;
-            let own = match i32::from((*ifa.ifa_addr).sa_family) {
-                libc::AF_INET => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    let len = if mask.is_null() {
-                        32
-                    } else {
-                        let m = &*(mask as *const libc::sockaddr_in);
-                        u32::from_be(m.sin_addr.s_addr).count_ones() as u8
-                    };
-                    (IpAddr::from(sa.sin_addr.s_addr.to_ne_bytes()), len)
-                }
-                libc::AF_INET6 => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
-                    let len = if mask.is_null() {
-                        64
-                    } else {
-                        let m = &*(mask as *const libc::sockaddr_in6);
-                        u128::from_be_bytes(m.sin6_addr.s6_addr).count_ones() as u8
-                    };
-                    (IpAddr::from(sa.sin6_addr.s6_addr), len)
-                }
-                _ => continue,
-            };
-            found.push(own);
-        }
-        libc::freeifaddrs(head);
-    }
-    found
+    crate::ifaddrs::up()
+        .into_iter()
+        .map(|addr| {
+            let unmasked = if addr.ip.is_ipv4() { 32 } else { 64 };
+            (addr.ip, addr.prefix.unwrap_or(unmasked))
+        })
+        .collect()
 }
 
 /// `ip` as an approving app is shown it: an IPv4 address never in its

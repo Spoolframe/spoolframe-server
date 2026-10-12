@@ -77,9 +77,7 @@ impl Store {
         .await?;
         row.map(|(portable, tied_at, proof_kind)| {
             Ok(Tie {
-                portable: portable
-                    .parse()
-                    .map_err(|e| StoreError::Db(sqlx::Error::Decode(Box::new(e))))?,
+                portable: super::parse_id(portable)?,
                 tied_at,
                 proof_kind,
             })
@@ -109,13 +107,7 @@ impl Store {
         .bind(user)
         .fetch_optional(&self.pool)
         .await?;
-        removed
-            .map(|portable| {
-                portable
-                    .parse()
-                    .map_err(|e| StoreError::Db(sqlx::Error::Decode(Box::new(e))))
-            })
-            .transpose()
+        removed.map(super::parse_id).transpose()
     }
 }
 

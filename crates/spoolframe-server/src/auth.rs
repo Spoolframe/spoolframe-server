@@ -370,11 +370,30 @@ impl RateLimiter {
         }
         failures.swept = Some(now);
         failures.by_key.retain(|_, times| {
-            while times.front().is_some_and(|t| self.expired(*t, now)) {
-                times.pop_front();
-            }
+            self.drop_expired(times, now);
             !times.is_empty()
         });
+    }
+
+    /// Drop the failures in `times` older than the window.
+    fn drop_expired(&self, times: &mut VecDeque<Instant>, now: Instant) {
+        while times.front().is_some_and(|t| self.expired(*t, now)) {
+            times.pop_front();
+        }
+    }
+
+    /// Take back the failure `began` counted against `key`, and `key` with
+    /// it if none is left.
+    fn untake(failures: &mut Failures, key: &str, began: Instant) {
+        let Some(times) = failures.by_key.get_mut(key) else {
+            return;
+        };
+        if let Some(at) = times.iter().position(|t| *t == began) {
+            times.remove(at);
+        }
+        if times.is_empty() {
+            failures.by_key.remove(key);
+        }
     }
 
     /// Drop `key`'s failures older than the window, and `key` with them if
@@ -384,9 +403,7 @@ impl RateLimiter {
         let Some(times) = failures.by_key.get_mut(key) else {
             return;
         };
-        while times.front().is_some_and(|t| self.expired(*t, now)) {
-            times.pop_front();
-        }
+        self.drop_expired(times, now);
         if times.is_empty() {
             failures.by_key.remove(key);
         }
@@ -505,14 +522,7 @@ impl RateLimiter {
     pub fn take_back(&self, username: &str, source: Option<&str>, began: Instant) {
         let mut failures = self.failures.lock();
         for key in Self::keys(username, source) {
-            if let Some(times) = failures.by_key.get_mut(&key) {
-                if let Some(at) = times.iter().position(|t| *t == began) {
-                    times.remove(at);
-                }
-                if times.is_empty() {
-                    failures.by_key.remove(&key);
-                }
-            }
+            Self::untake(&mut failures, &key, began);
         }
     }
 
@@ -532,16 +542,8 @@ impl RateLimiter {
             }
             known.push_back(source.to_owned());
         }
-        let Some(source) = source.map(Self::source_key) else {
-            return;
-        };
-        if let Some(times) = failures.by_key.get_mut(&source)
-            && let Some(at) = times.iter().position(|t| *t == began)
-        {
-            times.remove(at);
-            if times.is_empty() {
-                failures.by_key.remove(&source);
-            }
+        if let Some(source) = source {
+            Self::untake(&mut failures, &Self::source_key(source), began);
         }
     }
 }
@@ -866,9 +868,9 @@ impl Auth {
     }
 
     /// Open a session bound as `binding` for `user`, who just proved who
-    /// they are some other way than a password check here (an approval, a
-    /// passkey, an invite's redemption), signed in as `signed_in_with`
-    /// says: for an approval, the approving session's own.
+    /// they are (a password, an approval, a passkey, an invite's
+    /// redemption), signed in as `signed_in_with` says: for an approval,
+    /// the approving session's own. Its lifetime is the binding's.
     pub async fn open_session(
         &self,
         user: LocalUserId,
@@ -1036,22 +1038,10 @@ impl Auth {
         remember: bool,
     ) -> Result<Login, LoginError> {
         let account = self.check_password(username, password, source).await?;
-        let lifetime = match binding {
-            SessionBinding::Endpoint { .. } => ENDPOINT_SESSION,
-            SessionBinding::Api => API_SESSION_IDLE,
-        };
-
-        let token = SessionToken::generate();
-        let hash = token.hash();
-        self.store
-            .create_session(
-                &hash,
-                account.id,
-                &binding,
-                self.store.now() + lifetime.as_secs() as i64,
-                Some(SignedInWith::Password),
-            )
+        let token = self
+            .open_session(account.id, &binding, Some(SignedInWith::Password))
             .await?;
+        let hash = token.hash();
         // A one-time password opens a session that may only change it,
         // and trusts no device: the next sign-in is with the new one.
         if account.must_change {
@@ -1153,26 +1143,26 @@ impl Auth {
         user: LocalUserId,
         signed_in_with: SignedInWith,
     ) -> Result<SessionToken, StoreError> {
-        let token = SessionToken::generate();
-        self.store
-            .create_session(
-                &token.hash(),
-                user,
-                &SessionBinding::Api,
-                self.store.now() + API_SESSION_IDLE.as_secs() as i64,
-                Some(signed_in_with),
-            )
-            .await?;
-        Ok(token)
+        self.open_session(user, &SessionBinding::Api, Some(signed_in_with))
+            .await
     }
 
     /// The user behind an API session token, if it is live. Renews the
     /// session for [`API_SESSION_IDLE`], within [`API_SESSION`] of its
     /// sign-in.
     pub async fn api_session(&self, token: &str) -> Result<Option<ApiSessionUser>, StoreError> {
+        self.api_session_by_hash(&SessionToken(token.to_owned()).hash())
+            .await
+    }
+
+    /// [`Auth::api_session`], for a token already hashed.
+    pub async fn api_session_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<ApiSessionUser>, StoreError> {
         self.store
             .use_api_session(
-                &SessionToken(token.to_owned()).hash(),
+                hash,
                 API_SESSION_IDLE.as_secs() as i64,
                 API_SESSION.as_secs() as i64,
             )

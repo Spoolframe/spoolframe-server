@@ -366,17 +366,17 @@ pub fn share(spec: &EncodeSpec<'_>) -> Option<Share> {
     Some(share_of(spec, family, decodes))
 }
 
-/// The video encoder [`placement`] picks for `video`, an encode of
-/// `descriptor`'s video with `subtitle`: what Server › Playback's plan
-/// names, before or without a run.
-pub fn planned_encoder(
-    encoders: &Encoders,
-    descriptor: &MediaDescriptor,
+/// The spec a plan asks [`placement`] (and [`super::pick::choose`])
+/// about: no file and no run behind it. Tone mapped as
+/// `transcode.tone_map = "auto"` (PGPU-04).
+pub fn planning_spec<'a>(
+    encoders: &'a Encoders,
+    descriptor: &'a MediaDescriptor,
     video: ConvertedVideo,
     subtitle: Option<ConvertedSubtitle>,
     gpu_filters: bool,
-) -> Option<VideoEncoder> {
-    let spec = EncodeSpec {
+) -> EncodeSpec<'a> {
+    EncodeSpec {
         input: Path::new(""),
         sidecar: None,
         descriptor,
@@ -392,8 +392,27 @@ pub fn planned_encoder(
         output: Output::Progressive {
             file: PathBuf::new(),
         },
-    };
-    placement(&spec).map(|place| place.encoder.clone())
+    }
+}
+
+/// The video encoder [`placement`] picks for `video`, an encode of
+/// `descriptor`'s video with `subtitle`: what Server › Playback's plan
+/// names, before or without a run.
+pub fn planned_encoder(
+    encoders: &Encoders,
+    descriptor: &MediaDescriptor,
+    video: ConvertedVideo,
+    subtitle: Option<ConvertedSubtitle>,
+    gpu_filters: bool,
+) -> Option<VideoEncoder> {
+    placement(&planning_spec(
+        encoders,
+        descriptor,
+        video,
+        subtitle,
+        gpu_filters,
+    ))
+    .map(|place| place.encoder.clone())
 }
 
 /// Whether `hardware` decodes `stream`, as far as detection's tests and
@@ -956,12 +975,20 @@ fn s(v: impl ToString) -> String {
 /// have two layers of escaping; rather than get them right for every name
 /// in a library, the job links its inputs into its own directory under
 /// plain names, and a path that would need escaping is refused.
-fn filter_path(path: &Path) -> Result<String, String> {
+/// The characters [`filter_path`] refuses in a path: ffmpeg's filter
+/// syntax would read them as its own.
+pub(crate) const FILTER_SPECIAL: [char; 7] = ['\'', ':', '\\', ',', ';', '[', ']'];
+
+/// `path` as a filter option, or why not, naming `what` the path is: the
+/// encode's scratch space or a subtitle file (Review 2026-10-11 N5.1).
+fn filter_path(path: &Path, what: &str) -> Result<String, String> {
     let raw = path.display().to_string();
-    if raw.contains(['\'', ':', '\\', ',', ';', '[', ']']) {
+    if raw.contains(FILTER_SPECIAL) {
         // Not the path itself: the reason reaches the client (PX-09
         // finding 23).
-        return Err("a subtitle file's path is not one ffmpeg's filters can take".into());
+        return Err(format!(
+            "{what}'s path is not one ffmpeg's filters can take"
+        ));
     }
     Ok(format!("'{raw}'"))
 }
@@ -981,16 +1008,11 @@ fn cpu_graph(
     vaapi: bool,
     ten_bits: bool,
 ) -> Result<String, String> {
-    let d = spec.descriptor;
     let mut chain = Vec::new();
     let mut source = format!("[0:{}]", stream.index);
     if let Some(sub) = spec.subtitle
-        && let SubtitleAction::BurnIn { .. } = sub.action
+        && let Some(picked) = burned(spec)?
     {
-        let picked = d
-            .subtitles
-            .get(sub.index as usize)
-            .ok_or_else(|| format!("subtitle {}: no such track", sub.index))?;
         match (&picked.source, picked.kind) {
             (source_of, SubtitleKind::Bitmap) => {
                 let pictures = pictures_input(source_of);
@@ -1039,12 +1061,17 @@ fn cpu_graph(
     })
 }
 
-/// The video's filters on the GPU, for frames decoded there, in the
-/// CPU's order: burned-in pictures laid over it (`overlay_vaapi`, their
-/// canvas scaled to the video and uploaded), the tone map to 8-bit SDR
-/// ([`TONEMAP_VAAPI`]), and the scale, to an even width as the CPU's
-/// `scale=-2` makes it, and to 8 bits, as the CPU's chain uploads `nv12`
-/// for every VA-API encode. [`decode`] chose this path, so the GPU runs
+/// The video's filters on the GPU, for frames decoded there: the tone map
+/// to 8-bit SDR ([`TONEMAP_VAAPI`]); burned-in pictures laid over it
+/// (`overlay_vaapi`, their canvas scaled to the video and uploaded); and
+/// the scale, to an even width as the CPU's `scale=-2` makes it, and to 8
+/// bits, as the CPU's chain uploads `nv12` for every VA-API encode.
+///
+/// The tone map goes before the overlay (Review 2026-10-11 N5.2): the
+/// pictures are SDR, and laid over PQ video before the tone map they would
+/// be mapped with it, dimmed or shifted; and `overlay_vaapi` is fed the
+/// 8-bit frames [`CpuFilter::PicturesOverTenBits`] counts on, not the
+/// decode's 10-bit ones. [`decode`] chose this path, so the GPU runs
 /// every filter asked for.
 fn gpu_graph(
     spec: &EncodeSpec<'_>,
@@ -1054,9 +1081,6 @@ fn gpu_graph(
     ten_bits: bool,
 ) -> Result<String, String> {
     let mut chain = Vec::new();
-    if tone_map {
-        chain.push(s(TONEMAP_VAAPI));
-    }
     let mut options = Vec::new();
     if height < stream.height {
         options.push(format!("w=-2:h={height}"));
@@ -1071,20 +1095,36 @@ fn gpu_graph(
     let video = format!("[0:{}]", stream.index);
     Ok(match burned(spec)? {
         Some(track) => {
-            let mut graph = format!(
-                "[{}]scale={}:{},format=rgba,hwupload[subs];{video}[subs]overlay_vaapi",
+            let pictures = format!(
+                "[{}]scale={}:{},format=rgba,hwupload[subs];",
                 pictures_input(&track.source),
                 stream.width,
                 stream.height
             );
+            // Tone mapped first, then the pictures laid over the SDR
+            // frames it gives.
+            let base = if tone_map {
+                format!("{video}{TONEMAP_VAAPI}[sdr];[sdr]")
+            } else {
+                video
+            };
+            let mut graph = format!("{pictures}{base}[subs]overlay_vaapi");
             for filter in chain {
                 graph.push(',');
                 graph.push_str(&filter);
             }
             graph + "[v]"
         }
-        None if chain.is_empty() => format!("{video}null[v]"),
-        None => format!("{video}{}[v]", chain.join(",")),
+        None => {
+            if tone_map {
+                chain.insert(0, s(TONEMAP_VAAPI));
+            }
+            if chain.is_empty() {
+                format!("{video}null[v]")
+            } else {
+                format!("{video}{}[v]", chain.join(","))
+            }
+        }
     })
 }
 
@@ -1147,11 +1187,17 @@ fn text_burn_in(
                 .iter()
                 .filter(|s| matches!(s.source, SubtitleSource::Embedded { .. }))
                 .count();
-            format!("subtitles=filename={}:si={nth}", filter_path(spec.input)?)
+            // The job's link to the film, in the scratch space.
+            let input = filter_path(spec.input, "the scratch space (transcode.scratch_dir)")?;
+            format!("subtitles=filename={input}:si={nth}")
         }
         SubtitleSource::External { path } => {
-            let path = spec.sidecar.unwrap_or(path);
-            format!("subtitles=filename={}", filter_path(path)?)
+            // The job's link to it in the scratch space, else the file.
+            let path = match spec.sidecar {
+                Some(link) => filter_path(link, "the scratch space (transcode.scratch_dir)")?,
+                None => filter_path(path, "a subtitle file")?,
+            };
+            format!("subtitles=filename={path}")
         }
     })
 }
@@ -1383,14 +1429,7 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
     // are. (External text is burned in by a filter that reads the file
     // itself.)
     let burned_pictures = sidecar.is_some()
-        && picked.is_some_and(|track| track.kind == SubtitleKind::Bitmap)
-        && matches!(
-            spec.subtitle,
-            Some(ConvertedSubtitle {
-                action: SubtitleAction::BurnIn { .. },
-                ..
-            })
-        );
+        && matches!(burned(spec), Ok(Some(track)) if track.kind == SubtitleKind::Bitmap);
     let mut second_input = false;
     if let (Some(path), Some(sub)) = (&sidecar, spec.subtitle) {
         if burned_pictures {
@@ -1568,11 +1607,10 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
     if let Some(sub) = spec.subtitle
         && matches!(spec.output, Output::Progressive { .. })
     {
-        let from = match &d.subtitles.get(sub.index as usize).map(|t| &t.source) {
-            Some(SubtitleSource::Embedded { index }) => Some(format!("0:{index}")),
-            Some(SubtitleSource::External { .. }) => Some(s("1:0")),
-            None => None,
-        };
+        let from = d
+            .subtitles
+            .get(sub.index as usize)
+            .map(|t| pictures_input(&t.source));
         let codec = match sub.action {
             SubtitleAction::Copy { .. } => Some("copy"),
             SubtitleAction::Convert { to, .. } => Some(match to {
@@ -2990,7 +3028,13 @@ mod tests {
         );
         spec.gpu_filters = true;
         let graph = s(after(&ffmpeg_args(&spec).unwrap(), "-filter_complex"));
-        assert!(graph.contains("tonemap_vaapi") && graph.contains("overlay_vaapi"));
+        // Tone mapped first, then overlaid on the SDR frames: the pictures
+        // are not mapped with the video, and overlay_vaapi is fed 8 bits
+        // (Review 2026-10-11 N5.2).
+        let tone_mapped = graph.find("tonemap_vaapi").expect("a GPU tone map");
+        let overlaid = graph.find("overlay_vaapi").expect("a GPU overlay");
+        assert!(tone_mapped < overlaid, "{graph}");
+        assert!(graph.contains("[sdr];[sdr][subs]overlay_vaapi"), "{graph}");
         let made = made(&spec);
         assert_eq!(made.decoder, Decoder::Hardware(Hardware::Vaapi));
         assert_eq!(made.encoder.map(|e| e.name), Some(s("h264_vaapi")));
@@ -3816,10 +3860,24 @@ mod tests {
     #[test]
     fn a_path_a_filter_would_misread_is_refused() {
         assert_eq!(
-            filter_path(Path::new("/scratch/h/0/input")).unwrap(),
+            filter_path(Path::new("/scratch/h/0/input"), "the scratch space").unwrap(),
             "'/scratch/h/0/input'"
         );
-        assert!(filter_path(Path::new("/m/It's: A Film.srt")).is_err());
+        assert!(filter_path(Path::new("/m/It's: A Film.srt"), "a subtitle file").is_err());
+    }
+
+    /// An embedded text track burned in from a scratch space whose path
+    /// ffmpeg's filters misread is refused for the scratch space, not
+    /// blamed on a subtitle file (Review 2026-10-11 N5.1).
+    #[test]
+    fn a_refused_burn_in_names_the_path_that_failed() {
+        let why = filter_path(
+            Path::new("/srv/scratch:1/h/0/input"),
+            "the scratch space (transcode.scratch_dir)",
+        )
+        .unwrap_err();
+        assert!(why.contains("scratch space"), "{why}");
+        assert!(!why.contains("subtitle"), "{why}");
     }
 
     #[test]

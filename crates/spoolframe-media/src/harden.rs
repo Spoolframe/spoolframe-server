@@ -34,12 +34,9 @@
 
 use std::collections::BTreeMap;
 
-use seccompiler::{
-    SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
-    TargetArch,
-};
+use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
 
-use crate::sandbox::{Filters, compile, install};
+use crate::sandbox::{Filters, install, refusing};
 
 /// What [`harden`] did with the seccomp deny-list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,23 +161,8 @@ fn failed(what: &'static str) -> HardenError {
 /// The deny-list's filters: its calls refused with `errno`, then `clone3`
 /// with `ENOSYS`.
 fn deny_list(errno: i32) -> Result<Filters, String> {
-    let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(|e| e.to_string())?;
     let errno = u32::try_from(errno).map_err(|e| e.to_string())?;
-    let refused = SeccompFilter::new(
-        refused_calls().map_err(|e| e.to_string())?,
-        SeccompAction::Allow,
-        SeccompAction::Errno(errno),
-        arch,
-    )
-    .map_err(|e| e.to_string())?;
-    let clone3 = SeccompFilter::new(
-        BTreeMap::from([(libc::SYS_clone3, Vec::new())]),
-        SeccompAction::Allow,
-        SeccompAction::Errno(libc::ENOSYS as u32),
-        arch,
-    )
-    .map_err(|e| e.to_string())?;
-    compile([refused, clone3])
+    refusing(refused_calls().map_err(|e| e.to_string())?, errno)
 }
 
 /// The namespaces a clone may not make. `CLONE_NEWTIME` is in clone(2)'s

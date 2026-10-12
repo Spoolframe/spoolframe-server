@@ -33,11 +33,6 @@ pub struct Reading {
     pub memory_bytes: Option<u64>,
     pub open_files: Option<u64>,
     pub output_seconds: f64,
-    pub media_reads: u64,
-    pub media_read_bytes: u64,
-    pub artwork_requests: u64,
-    pub artwork_hits: u64,
-    pub subtitle_reads: u64,
     pub plex_requests: u64,
     pub plex_errors: u64,
     pub totals: ActivityTotals,
@@ -80,11 +75,6 @@ impl Reading {
             open_files: number(f, "spoolframe_process_open_files", &[]).map(|v| v as u64),
             output_seconds: number(f, "spoolframe_conversion_output_seconds_total", &[])
                 .unwrap_or(0.0),
-            media_reads: whole(f, "spoolframe_media_reads_total", &[]),
-            media_read_bytes: whole(f, "spoolframe_media_read_bytes_total", &[]),
-            artwork_requests: whole(f, "spoolframe_artwork_requests_total", &[]),
-            artwork_hits: whole(f, "spoolframe_artwork_cache_hits_total", &[]),
-            subtitle_reads: whole(f, "spoolframe_subtitle_reads_total", &[]),
             plex_requests: sum(f, "spoolframe_plex_requests_total"),
             plex_errors: sum(f, "spoolframe_plex_errors_total"),
             totals: ActivityTotals {
@@ -136,9 +126,15 @@ impl Reading {
             _ => 0.0,
         };
         let asked = before.map_or(0, |b| {
-            self.artwork_requests.saturating_sub(b.artwork_requests)
+            self.totals
+                .artwork_requests
+                .saturating_sub(b.totals.artwork_requests)
         });
-        let hit = before.map_or(0, |b| self.artwork_hits.saturating_sub(b.artwork_hits));
+        let hit = before.map_or(0, |b| {
+            self.totals
+                .artwork_hits
+                .saturating_sub(b.totals.artwork_hits)
+        });
         ActivityPoint {
             at: self.at,
             connections_app: self.connections_app,
@@ -149,11 +145,13 @@ impl Reading {
             conversions_running: self.conversions_running,
             conversions_paused: self.conversions_paused,
             output_rate,
-            media_reads_per_sec: rate(self.media_reads, |r| r.media_reads),
-            media_bytes_per_sec: rate(self.media_read_bytes, |r| r.media_read_bytes),
-            artwork_requests_per_sec: rate(self.artwork_requests, |r| r.artwork_requests),
+            media_reads_per_sec: rate(self.totals.media_reads, |r| r.totals.media_reads),
+            media_bytes_per_sec: rate(self.totals.media_read_bytes, |r| r.totals.media_read_bytes),
+            artwork_requests_per_sec: rate(self.totals.artwork_requests, |r| {
+                r.totals.artwork_requests
+            }),
             artwork_hit_rate: (asked > 0).then(|| hit.min(asked) as f64 / asked as f64),
-            subtitle_reads_per_sec: rate(self.subtitle_reads, |r| r.subtitle_reads),
+            subtitle_reads_per_sec: rate(self.totals.subtitle_reads, |r| r.totals.subtitle_reads),
             plex_requests_per_sec: rate(self.plex_requests, |r| r.plex_requests),
             plex_errors_per_sec: rate(self.plex_errors, |r| r.plex_errors),
             previews_queued: self.previews_queued,
@@ -217,11 +215,14 @@ mod tests {
     fn reading(at: i64, reads: u64, requests: u64, hits: u64) -> Reading {
         Reading {
             at,
-            media_reads: reads,
-            media_read_bytes: reads * 1000,
-            artwork_requests: requests,
-            artwork_hits: hits,
             output_seconds: reads as f64 / 2.0,
+            totals: ActivityTotals {
+                media_reads: reads,
+                media_read_bytes: reads * 1000,
+                artwork_requests: requests,
+                artwork_hits: hits,
+                ..ActivityTotals::default()
+            },
             ..Reading::default()
         }
     }

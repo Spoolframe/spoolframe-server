@@ -90,7 +90,7 @@ impl Store {
             .await?;
         }
         if update.unhide {
-            clear_hidden(&mut tx, &principal, update.media_id).await?;
+            clear_hidden(&mut *tx, &principal, update.media_id).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -139,10 +139,9 @@ impl Store {
         principal: Principal,
         media_id: &str,
     ) -> Result<(), StoreError> {
-        let mut tx = self.begin_write().await?;
-        clear_hidden(&mut tx, &principal.to_string(), media_id).await?;
-        tx.commit().await?;
-        Ok(())
+        // One statement: it takes the writer when it starts, so it needs
+        // no transaction of its own.
+        clear_hidden(&self.pool, &principal.to_string(), media_id).await
     }
 
     /// Clear the hide of `media_id` without a state written: progress
@@ -167,10 +166,9 @@ impl Store {
         if !hidden {
             return Ok(());
         }
-        let mut tx = self.begin_write().await?;
-        clear_hidden(&mut tx, &principal.to_string(), media_id).await?;
-        tx.commit().await?;
-        Ok(())
+        // One statement: it takes the writer when it starts, so it needs
+        // no transaction of its own.
+        clear_hidden(&self.pool, &principal.to_string(), media_id).await
     }
 
     /// What `principal` removed from Continue watching or Next up: the
@@ -448,15 +446,15 @@ impl Store {
     }
 }
 
-async fn clear_hidden(
-    tx: &mut sqlx::Transaction<'_, Sqlite>,
+async fn clear_hidden<'e>(
+    db: impl sqlx::SqliteExecutor<'e>,
     principal: &str,
     media_id: &str,
 ) -> Result<(), StoreError> {
     sqlx::query("DELETE FROM continue_hidden WHERE principal = ?1 AND media_id = ?2")
         .bind(principal)
         .bind(media_id)
-        .execute(&mut **tx)
+        .execute(db)
         .await?;
     Ok(())
 }

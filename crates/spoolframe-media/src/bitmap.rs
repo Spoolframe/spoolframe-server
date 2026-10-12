@@ -198,6 +198,13 @@ pub(crate) fn luma(r: u8, g: u8, b: u8) -> u8 {
     ((299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b)) / 1000) as u8
 }
 
+/// A video-range luma (16 black, 235 white) stretched to full range, so
+/// an opaque black outline (Y = 16) counts as black, not grey 16: PGS and
+/// DVB palettes both, so the two split text from outline alike.
+pub(crate) fn video_luma(y: u8) -> u8 {
+    (u32::from(y.saturating_sub(16)) * 255 / 219).min(255) as u8
+}
+
 /// A picture of `width` × `height` pixels, each a colour, as dark text on
 /// white: the text without its outline, cut to the box around it with a
 /// margin (tesseract reads text that touches the edge badly). `None` if no

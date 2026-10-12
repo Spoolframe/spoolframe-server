@@ -295,15 +295,7 @@ impl Catalog for Composite {
             .item(&local)
             .await
             .map_err(|e| named(e, &local, id))?;
-        Ok(ItemWithChildren {
-            item: ids::item(server, found.item),
-            children: found
-                .children
-                .into_iter()
-                .map(|c| ids::item(server, c))
-                .collect(),
-            ..found
-        })
+        Ok(ids::item_with_children(server, found))
     }
 
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
@@ -480,16 +472,7 @@ impl Inspect for Composite {
             .await
             .map_err(|e| named(e, &local, id))?;
         Ok(Inspected {
-            found: ItemWithChildren {
-                item: ids::item(server, seen.found.item),
-                children: seen
-                    .found
-                    .children
-                    .into_iter()
-                    .map(|c| ids::item(server, c))
-                    .collect(),
-                ..seen.found
-            },
+            found: ids::item_with_children(server, seen.found),
             library: seen.library.map(|l| ids::library(server, l)),
             ancestors: seen
                 .ancestors

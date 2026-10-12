@@ -12,7 +12,6 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -186,7 +185,6 @@ impl Ocr {
     ) -> Result<Vec<String>, OcrError> {
         tokio::fs::create_dir_all(work).await?;
         let permits = Arc::new(Semaphore::new(threads.max(1)));
-        let done = Arc::new(AtomicUsize::new(0));
         let mut runs = tokio::task::JoinSet::new();
         for (n, first) in (0..count).step_by(CHUNK).enumerate() {
             let listed: Vec<PathBuf> = (first..(first + CHUNK).min(count))
@@ -199,23 +197,24 @@ impl Ocr {
             }
             tokio::fs::write(&list, text).await?;
             let (tesseract, language) = (self.tesseract.clone(), language.to_owned());
-            let (permits, done) = (permits.clone(), done.clone());
+            let permits = permits.clone();
             let pictures = pictures.to_owned();
             runs.spawn(async move {
                 let _permit = permits.acquire_owned().await.expect("never closed");
                 let pages =
                     read_pages(&tesseract, &list, &pictures, &language, listed.len()).await?;
-                done.fetch_add(pages.len(), Ordering::Relaxed);
                 Ok::<_, OcrError>((first, pages))
             });
         }
         let mut texts = vec![String::new(); count];
+        let mut done = 0;
         while let Some(run) = runs.join_next().await {
             let (first, pages) = run.expect("an OCR run never panics")?;
+            done += pages.len();
             for (i, page) in pages.into_iter().enumerate() {
                 texts[first + i] = page;
             }
-            progress(done.load(Ordering::Relaxed));
+            progress(done);
         }
         Ok(texts)
     }
@@ -234,7 +233,7 @@ async fn read_pages(
     if let Some(dir) = list.parent() {
         jail = jail.reads(dir);
     }
-    let mut command = spawnable(tesseract, &jail)?;
+    let mut command = spawnable(tesseract, jail).await?;
     command
         .arg(list)
         .arg("stdout")
@@ -242,13 +241,10 @@ async fn read_pages(
         // One thread each: the parallelism is the processes, and
         // tesseract's own threads only fight them for cores.
         .env("OMP_THREAD_LIMIT", "1");
-    let output = run(command, "tesseract", Feed::Nothing, MAX_TEXT, OCR_TIMEOUT).await?;
-    if !output.status.success() {
-        return Err(OcrError::Failed {
-            program: "tesseract".into(),
-            reason: last_line(&output.stderr),
-        });
-    }
+    let output = succeeded(
+        run(command, "tesseract", Feed::Nothing, MAX_TEXT, OCR_TIMEOUT).await?,
+        "tesseract",
+    )?;
     // A form feed between pages, none after the last.
     let text = String::from_utf8_lossy(&output.stdout);
     let pages: Vec<String> = text.split('\x0c').map(tidy).collect();
@@ -269,21 +265,7 @@ pub async fn extract_sup(
     index: u32,
     out: &Path,
 ) -> Result<(), OcrError> {
-    let mut command = spawnable(ffmpeg, &writing(Jail::new(Limits::PASS).input(input), out))?;
-    command
-        .args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
-        .arg(input)
-        .args(["-map", &format!("0:{index}"), "-c", "copy", "-f", "sup"])
-        .arg(out);
-    let output = run(command, "ffmpeg", Feed::Nothing, MAX_STDERR, PASS_TIMEOUT).await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(OcrError::Failed {
-            program: "ffmpeg".into(),
-            reason: last_line(&output.stderr),
-        })
-    }
+    copy_stream(ffmpeg, input, index, &["-c", "copy", "-f", "sup"], out).await
 }
 
 /// Subtitle stream `index` (ffprobe's stream index) of `input` as its
@@ -314,14 +296,7 @@ pub async fn read_track_json(
     input: &Path,
     index: u32,
 ) -> Result<Vec<u8>, OcrError> {
-    let mut jail = Jail::new(Limits::PROBE).input(input);
-    if input
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("idx"))
-    {
-        jail = jail.input(input.with_extension("sub"));
-    }
-    let mut command = spawnable(ffprobe, &jail)?;
+    let mut command = spawnable(ffprobe, Jail::new(Limits::PROBE).media(input)).await?;
     command
         .args(["-v", "error", "-select_streams", &index.to_string()])
         .args(["-show_data", "-show_entries"])
@@ -336,13 +311,7 @@ pub async fn read_track_json(
         PASS_TIMEOUT,
     )
     .await?;
-    if !output.status.success() {
-        return Err(OcrError::Failed {
-            program: "ffprobe".into(),
-            reason: last_line(&output.stderr),
-        });
-    }
-    Ok(output.stdout)
+    Ok(succeeded(output, "ffprobe")?.stdout)
 }
 
 /// ffprobe's JSON for one stream's packets, with `-show_data`.
@@ -449,21 +418,29 @@ pub async fn convert_text(
         SubtitleFormat::WebVtt => ("webvtt", "webvtt"),
         _ => ("srt", "srt"),
     };
-    let mut command = spawnable(ffmpeg, &writing(Jail::new(Limits::PASS).input(input), out))?;
+    copy_stream(ffmpeg, input, index, &["-c:s", codec, "-f", format], out).await
+}
+
+/// Subtitle stream `index` of `input` written to `out` by ffmpeg, with
+/// `codec_args` saying how: what [`extract_sup`] and [`convert_text`]
+/// both run.
+async fn copy_stream(
+    ffmpeg: &Tool,
+    input: &Path,
+    index: u32,
+    codec_args: &[&str],
+    out: &Path,
+) -> Result<(), OcrError> {
+    let mut command = spawnable(ffmpeg, writing(Jail::new(Limits::PASS).input(input), out)).await?;
     command
         .args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
         .arg(input)
-        .args(["-map", &format!("0:{index}"), "-c:s", codec, "-f", format])
+        .args(["-map", &format!("0:{index}")])
+        .args(codec_args)
         .arg(out);
     let output = run(command, "ffmpeg", Feed::Nothing, MAX_STDERR, PASS_TIMEOUT).await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(OcrError::Failed {
-            program: "ffmpeg".into(),
-            reason: last_line(&output.stderr),
-        })
-    }
+    succeeded(output, "ffmpeg")?;
+    Ok(())
 }
 
 /// The cues with their text; cues tesseract found no text in are left out.
@@ -615,12 +592,16 @@ fn tesseract_code(tag: &str) -> &str {
     }
 }
 
-/// `tool`'s command in `jail`, or why it cannot run.
-fn spawnable(tool: &Tool, jail: &Jail) -> Result<Command, OcrError> {
-    tool.command(jail).map_err(|source| OcrError::Spawn {
-        program: tool.program().display().to_string(),
-        source,
-    })
+/// `tool`'s command in `jail`, or why it cannot run; made off the async
+/// workers ([`Tool::command_off_thread`]): a media input on a network
+/// mount can block.
+async fn spawnable(tool: &Tool, jail: Jail) -> Result<Command, OcrError> {
+    tool.command_off_thread(jail)
+        .await
+        .map_err(|source| OcrError::Spawn {
+            program: tool.program().display().to_string(),
+            source,
+        })
 }
 
 /// `jail`, writing to `out`'s directory.
@@ -675,7 +656,7 @@ pub(crate) async fn run(
             source,
         })?;
     let mut stdout = child.stdout.take().expect("piped");
-    let mut stderr = child.stderr.take().expect("piped");
+    let stderr = child.stderr.take().expect("piped");
     // Written beside the reads, so neither side waits on a full pipe. A
     // run that stops reading (it failed, or was killed) ends the write.
     if let (Some(bytes), Some(mut pipe)) = (bytes, child.stdin.take()) {
@@ -683,15 +664,7 @@ pub(crate) async fn run(
             let _ = tokio::io::AsyncWriteExt::write_all(&mut pipe, &bytes).await;
         });
     }
-    let errors = tokio::spawn(async move {
-        let mut kept = Vec::new();
-        let _ = (&mut stderr)
-            .take(MAX_STDERR as u64)
-            .read_to_end(&mut kept)
-            .await;
-        let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
-        kept
-    });
+    let errors = tokio::spawn(crate::capped::read_some(Some(stderr), MAX_STDERR));
     let ran = async {
         let mut out = Vec::new();
         (&mut stdout)
@@ -723,6 +696,18 @@ pub(crate) async fn run(
         stdout,
         stderr,
     })
+}
+
+/// `output`, if `program` succeeded; why not, from its last line, if not.
+fn succeeded(output: Ran, program: &str) -> Result<Ran, OcrError> {
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(OcrError::Failed {
+            program: program.into(),
+            reason: last_line(&output.stderr),
+        })
+    }
 }
 
 pub(crate) fn last_line(stderr: &[u8]) -> String {

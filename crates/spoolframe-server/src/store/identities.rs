@@ -2,7 +2,7 @@
 //! The OIDC flows are `crate::oidc`'s; this is storage, and the rule that
 //! a user keeps a way to sign in.
 
-use super::users::LocalUserId;
+use super::users::{LocalUserId, is_unique_violation};
 use super::{Store, StoreError};
 
 /// One linked identity.
@@ -73,7 +73,7 @@ impl Store {
         match inserted {
             Ok(_) => {}
             // The other key: this user's at this issuer.
-            Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            Err(e) if is_unique_violation(&e) => {
                 return Err(IdentityError::ProviderLinked);
             }
             Err(e) => return Err(e.into()),

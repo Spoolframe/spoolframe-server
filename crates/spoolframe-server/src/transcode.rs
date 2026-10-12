@@ -402,6 +402,59 @@ fn log_no_encoder(entries: &[GpuEntry], found: &Found, quiet: bool) {
     );
 }
 
+/// What `api`'s card does: its encoders, its decoders, and its own GPU
+/// filters and tone maps, not every family's as [`Encoders::summary`]
+/// lists them (Review 2026-10-11 N5.3). The start-up line and Server ›
+/// Playback's card both read it.
+pub(crate) struct CardDoes {
+    pub encodes: Vec<String>,
+    pub decodes: Vec<String>,
+    pub filters: Vec<&'static str>,
+    pub tone_mappers: Vec<spoolframe_media::encoders::ToneMapper>,
+}
+
+pub(crate) fn card_does(
+    encoders: &Encoders,
+    api: spoolframe_media::encoders::Hardware,
+) -> CardDoes {
+    CardDoes {
+        encodes: encoders
+            .video
+            .iter()
+            .filter(|e| e.hardware == Some(api))
+            .map(|e| e.name.clone())
+            .collect(),
+        decodes: encoders
+            .hardware_decoders
+            .iter()
+            .filter(|d| d.hardware == api)
+            .map(|d| d.label())
+            .collect(),
+        filters: encoders.gpu_filters(api),
+        tone_mappers: encoders.gpu_tone_mappers(api),
+    }
+}
+
+/// `v` for the log: "none", or its items joined.
+fn listed<S: AsRef<str>>(v: &[S]) -> String {
+    if v.is_empty() {
+        "none".to_owned()
+    } else {
+        v.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// A card's tone mappers, named for the log.
+fn tone_map_labels(does: &CardDoes) -> String {
+    listed(
+        &does
+            .tone_mappers
+            .iter()
+            .map(|m| m.label())
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// One line a card at start: what it is, how it was classified, which
 /// entry took it, what it does; and, if it lacks something, one line
 /// saying what (PGPU-02's, now a card).
@@ -410,35 +463,11 @@ fn log_gpu(entries: &[GpuEntry], gpu: &Gpu) {
     let card = &found.card;
     let api = card.api;
     let encoders = &found.encoders;
-    let names = |v: Vec<String>| {
-        if v.is_empty() {
-            "none".to_owned()
-        } else {
-            v.join(", ")
-        }
-    };
-    let encodes = names(
-        encoders
-            .video
-            .iter()
-            .filter(|e| e.hardware == Some(api))
-            .map(|e| e.name.clone())
-            .collect(),
-    );
-    let decodes = names(
-        encoders
-            .hardware_decoders
-            .iter()
-            .filter(|d| d.hardware == api)
-            .map(|d| d.label())
-            .collect(),
-    );
-    // The summary's own words for the GPU filters: what detection says
-    // of them is its business.
-    let summary = encoders.summary();
-    let filters = summary
-        .split_once("GPU filters: ")
-        .map_or("none", |(_, filters)| filters);
+    let does = card_does(encoders, api);
+    let encodes = listed(&does.encodes);
+    let decodes = listed(&does.decodes);
+    let filters = listed(&does.filters);
+    let tone_maps = tone_map_labels(&does);
     let limit = match gpu.max_jobs {
         Some(max) => format!("up to {max} jobs"),
         None => "up to transcode.max_gpu_jobs".to_owned(),
@@ -451,7 +480,7 @@ fn log_gpu(entries: &[GpuEntry], gpu: &Gpu) {
         classified = card.host.class.how,
         capability = found.capability,
         "GPU {} ({}, {}): {} ({}); {}, {limit}; encodes {encodes}; decodes {decodes}; \
-         GPU filters {filters}",
+         GPU filters {filters}; tone maps {tone_maps}",
         found.name,
         api.as_str(),
         card.place(),
@@ -566,6 +595,32 @@ mod tests {
 
     use super::*;
     use crate::logs::{LogRing, RingLayer};
+
+    /// A card's line names its own family's GPU filters and tone maps,
+    /// not every family's with the summary's tail (Review 2026-10-11
+    /// N5.3).
+    #[test]
+    fn a_card_s_line_names_its_own_filters() {
+        let encoders = Encoders {
+            video: Vec::new(),
+            audio: Vec::new(),
+            hardware_decoders: Vec::new(),
+            gpu_tonemap: true,
+            gpu_overlay: false,
+            cuda_scale: true,
+            cuda_overlay: true,
+            libplacebo: Vec::new(),
+            ten_bit: Vec::new(),
+            unusable: Vec::new(),
+            failed: Vec::new(),
+        };
+        let does = card_does(&encoders, Hardware::Vaapi);
+        assert_eq!(listed(&does.filters), "tone map");
+        assert_eq!(tone_map_labels(&does), "VA-API");
+        let does = card_does(&encoders, Hardware::Nvenc);
+        assert_eq!(listed(&does.filters), "scale, overlay");
+        assert_eq!(tone_map_labels(&does), "none");
+    }
 
     /// A stand-in ffmpeg that lists NVENC and libx264, encodes with
     /// libx264, and fails with NVENC as it does without its driver.

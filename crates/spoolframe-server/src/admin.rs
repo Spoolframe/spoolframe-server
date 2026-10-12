@@ -169,29 +169,15 @@ pub fn log_setup_code(urls: &[String], code: &SetupCode) {
 impl std::fmt::Display for SetupCode {
     /// Grouped by four for reading aloud and typing: `K7QD-M2XP-9RTB`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let groups: Vec<&str> = (0..self.0.len())
-            .step_by(4)
-            .map(|i| &self.0[i..(i + 4).min(self.0.len())])
-            .collect();
-        f.write_str(&groups.join("-"))
+        f.write_str(&spoolframe_protocol::invite::display_code(&self.0))
     }
 }
 
 impl SetupCode {
-    /// No 0/O, 1/I/L or U: nothing to misread.
-    const ALPHABET: &'static [u8] = b"ABCDEFGHJKMNPQRSTVWXYZ23456789";
-    const LEN: usize = 12;
-
-    /// A fresh random code (about 59 bits).
+    /// A fresh random code (about 59 bits), of an invite code's class
+    /// (`invite::CODE_ALPHABET`: no 0/O, 1/I/L or U, nothing to misread).
     pub fn generate() -> Self {
-        use password_hash::rand_core::{OsRng, RngCore};
-        let code = (0..Self::LEN)
-            .map(|_| {
-                let i = OsRng.next_u32() as usize % Self::ALPHABET.len();
-                Self::ALPHABET[i] as char
-            })
-            .collect();
-        Self(code)
+        Self(crate::invites::InviteCode::generate().as_str().to_owned())
     }
 
     /// A code as given; dashes, spaces and case do not matter.
@@ -972,24 +958,32 @@ impl AdminApi {
     /// The caller's live session, checked on every call so a revoked
     /// session or a disabled user stops at once.
     async fn caller(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
-        let (token, user) = self.any_caller(ext).await?;
+        let (session, user) = self.any_caller(ext).await?;
         if user.password_change_only {
             return Err(error(
                 error_code::PASSWORD_CHANGE_REQUIRED,
                 "choose a new password first",
             ));
         }
-        Ok((token, user))
+        Ok((session, user))
     }
 
     /// The caller, even in a session a one-time password opened, which
-    /// may only choose a new password, sign out, or ask who it is.
+    /// may only choose a new password, sign out, or ask who it is; with
+    /// their session's token hash, what the store knows it by. These
+    /// helpers hand out the hash, never the bearer token itself.
     async fn any_caller(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
         let Some(Bearer(token)) = ext.get::<Bearer>() else {
             return Err(error(error_code::UNAUTHENTICATED, "log in first"));
         };
-        match self.auth.api_session(token).await.map_err(internal)? {
-            Some(user) => Ok((token.clone(), user)),
+        let session = SessionToken(token.clone()).hash();
+        match self
+            .auth
+            .api_session_by_hash(&session)
+            .await
+            .map_err(internal)?
+        {
+            Some(user) => Ok((session, user)),
             None => Err(error(error_code::UNAUTHENTICATED, "session is not valid")),
         }
     }
@@ -1000,12 +994,12 @@ impl AdminApi {
         Ok(self.admin_session(ext).await?.1)
     }
 
-    /// [`Self::admin`], with the session's token: for a call that keeps
+    /// [`Self::admin`], with the session's token hash: for a call that keeps
     /// the admin's own session, in one lookup.
     async fn admin_session(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
-        let (token, user) = self.caller(ext).await?;
+        let (session, user) = self.caller(ext).await?;
         if user.role.is_admin() {
-            Ok((token, user))
+            Ok((session, user))
         } else {
             Err(error(error_code::FORBIDDEN, "admins only"))
         }
@@ -1015,9 +1009,9 @@ impl AdminApi {
     /// [`RECENT_SIGN_IN`] (P3-03): what a sensitive change needs, so a
     /// session left open, or its stolen cookie, cannot make one.
     async fn recently_signed_in(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
-        let (token, user) = self.caller(ext).await?;
+        let (session, user) = self.caller(ext).await?;
         recent(&user, self.auth.store().now())?;
-        Ok((token, user))
+        Ok((session, user))
     }
 
     /// The caller, if an admin who signed in within [`RECENT_SIGN_IN`]
@@ -1029,34 +1023,35 @@ impl AdminApi {
         Ok(self.recent_admin_session(ext).await?.1)
     }
 
-    /// [`Self::recent_admin`], with the session's token, in one lookup.
+    /// [`Self::recent_admin`], with the session's token hash, in one lookup.
     async fn recent_admin_session(&self, ext: &Extensions) -> RpcResult<(String, ApiSessionUser)> {
-        let (token, user) = self.admin_session(ext).await?;
+        let (session, user) = self.admin_session(ext).await?;
         recent(&user, self.auth.store().now())?;
-        Ok((token, user))
+        Ok((session, user))
     }
 
-    /// The caller, `typed` as a device sign-in code (P3-07) and the guess
-    /// it is, if they may try one now. Any live web session may: it was
-    /// made by a full sign-in, and the PIN lock (P2-08) is a device's,
-    /// which a browser is not. Codes are short, so guessing them is
+    /// `typed` as a device sign-in code (P3-07) and the guess it is, if
+    /// `user` (the caller, checked live by the handler) may try one now.
+    /// Any live web session may: it was made by a full sign-in, and the
+    /// PIN lock (P2-08) is a device's, which a browser is not. Codes are
+    /// short, so guessing them is
     /// limited as passwords are, against `user` and where they are: the
     /// guess is counted as wrong before it is checked (A-13), and only
     /// [`Auth::guessed_right`] takes it back. A malformed code is a wrong
     /// one.
-    async fn sign_in_code(
+    fn sign_in_code(
         &self,
         ext: &Extensions,
+        user: ApiSessionUser,
         typed: &str,
-    ) -> RpcResult<(ApiSessionUser, String, Guess)> {
-        let (_, user) = self.caller(ext).await?;
+    ) -> RpcResult<(String, Guess)> {
         let (what, from) = sign_in_code_keys(ext, user)?;
         let guess = self
             .auth
             .guess(what, from)
             .map_err(|retry_after| LoginError::RateLimited { retry_after })?;
         match spoolframe_protocol::device_sign_in::normalize(typed) {
-            Some(code) => Ok((user, code, guess)),
+            Some(code) => Ok((code, guess)),
             None => Err(wrong_sign_in_code()),
         }
     }
@@ -1473,17 +1468,17 @@ impl AdminApi {
         let purpose = match purpose {
             "signIn" => Purpose::SignIn { return_to },
             "link" => {
-                let (token, user) = self.recently_signed_in(ext).await?;
+                let (session, user) = self.recently_signed_in(ext).await?;
                 Purpose::Link {
                     user: user.user,
-                    session: SessionToken(token).hash(),
+                    session,
                 }
             }
             "confirm" => {
-                let (token, user) = self.caller(ext).await?;
+                let (session, user) = self.caller(ext).await?;
                 Purpose::Confirm {
                     user: user.user,
-                    session: SessionToken(token).hash(),
+                    session,
                 }
             }
             other => {
@@ -1824,8 +1819,12 @@ impl MeApiServer for AdminApi {
     }
 
     async fn logout(&self, ext: &Extensions) -> RpcResult<()> {
-        let (token, _) = self.any_caller(ext).await?;
-        self.auth.logout(&token).await.map_err(internal)
+        let (session, _) = self.any_caller(ext).await?;
+        self.auth
+            .store()
+            .revoke_session(&session)
+            .await
+            .map_err(internal)
     }
 
     async fn who_am_i(&self, ext: &Extensions) -> RpcResult<UserInfo> {
@@ -1838,7 +1837,7 @@ impl MeApiServer for AdminApi {
 
     async fn set_password(&self, ext: &Extensions, change: PasswordChange) -> RpcResult<()> {
         // The way out of a session a one-time password opened.
-        let (token, user) = self.any_caller(ext).await?;
+        let (session, user) = self.any_caller(ext).await?;
         let me = self.account(user).await?;
         if me.has_password {
             let source = source(ext)?;
@@ -1858,7 +1857,7 @@ impl MeApiServer for AdminApi {
         }
         let phc = hash_password(&change.new_password).await?;
         // Every other session of theirs ends, on the web and on devices.
-        let keep = SessionToken(token).hash();
+        let keep = session;
         let revoked = self
             .auth
             .store()
@@ -1874,8 +1873,8 @@ impl MeApiServer for AdminApi {
     }
 
     async fn sessions(&self, ext: &Extensions) -> RpcResult<Vec<SessionEntry>> {
-        let (token, user) = self.caller(ext).await?;
-        let current = crate::auth::SessionToken(token).hash();
+        let (session, user) = self.caller(ext).await?;
+        let current = session;
         let sessions = self
             .auth
             .store()
@@ -1986,7 +1985,7 @@ impl MeApiServer for AdminApi {
     }
 
     async fn confirm_password(&self, ext: &Extensions, password: String) -> RpcResult<()> {
-        let (token, user) = self.caller(ext).await?;
+        let (session, user) = self.caller(ext).await?;
         let me = self.account(user).await?;
         let source = source(ext)?;
         self.auth
@@ -1994,7 +1993,7 @@ impl MeApiServer for AdminApi {
             .await?;
         self.auth
             .store()
-            .confirm_session(&SessionToken(token).hash())
+            .confirm_session(&session)
             .await
             .map_err(internal)
     }
@@ -2004,7 +2003,8 @@ impl MeApiServer for AdminApi {
         ext: &Extensions,
         code: String,
     ) -> RpcResult<DeviceSignIn> {
-        let (_, code, guess) = self.sign_in_code(ext, &code).await?;
+        let (_, user) = self.caller(ext).await?;
+        let (code, guess) = self.sign_in_code(ext, user, &code)?;
         let Some(waiting) = self.auth.sign_ins().lookup(&code) else {
             return Err(wrong_sign_in_code());
         };
@@ -2040,8 +2040,8 @@ impl MeApiServer for AdminApi {
         code: String,
         remember: bool,
     ) -> RpcResult<()> {
-        self.recently_signed_in(ext).await?;
-        let (user, code, guess) = self.sign_in_code(ext, &code).await?;
+        let (_, user) = self.recently_signed_in(ext).await?;
+        let (code, guess) = self.sign_in_code(ext, user, &code)?;
         // No endpoint approves here: a web session is never the device
         // that waits.
         let claim = match self.auth.sign_ins().claim(&code, None) {
@@ -2076,7 +2076,8 @@ impl MeApiServer for AdminApi {
     }
 
     async fn device_sign_in_deny(&self, ext: &Extensions, code: String) -> RpcResult<()> {
-        let (user, code, guess) = self.sign_in_code(ext, &code).await?;
+        let (_, user) = self.caller(ext).await?;
+        let (code, guess) = self.sign_in_code(ext, user, &code)?;
         if self.auth.sign_ins().deny(&code) {
             self.auth.guessed_right(guess);
             tracing::info!(user = %user.user, "device sign-in denied from the web");
@@ -2092,7 +2093,7 @@ impl MeApiServer for AdminApi {
         ceremony: String,
         credential: serde_json::Value,
     ) -> RpcResult<()> {
-        let (token, user) = self.caller(ext).await?;
+        let (session, user) = self.caller(ext).await?;
         let source = source(ext)?;
         let signed = serde_json::from_value(credential).map_err(|e| {
             error(
@@ -2114,7 +2115,7 @@ impl MeApiServer for AdminApi {
         }
         self.auth
             .store()
-            .confirm_session(&SessionToken(token).hash())
+            .confirm_session(&session)
             .await
             .map_err(internal)
     }
@@ -2134,11 +2135,11 @@ impl MeApiServer for AdminApi {
     }
 
     async fn passkey_add_begin(&self, ext: &Extensions) -> RpcResult<serde_json::Value> {
-        let (token, user) = self.recently_signed_in(ext).await?;
+        let (session, user) = self.recently_signed_in(ext).await?;
         let me = self.account(user).await?;
         let options = self
             .passkeys
-            .begin_registration(self.auth.store(), &SessionToken(token).hash(), &me)
+            .begin_registration(self.auth.store(), &session, &me)
             .await?;
         serde_json::to_value(options).map_err(internal)
     }
@@ -2149,7 +2150,7 @@ impl MeApiServer for AdminApi {
         name: String,
         credential: serde_json::Value,
     ) -> RpcResult<PasskeyEntry> {
-        let (token, user) = self.caller(ext).await?;
+        let (session, user) = self.caller(ext).await?;
         let me = self.account(user).await?;
         let made = serde_json::from_value(credential).map_err(|e| {
             error(
@@ -2159,13 +2160,7 @@ impl MeApiServer for AdminApi {
         })?;
         let record = self
             .passkeys
-            .finish_registration(
-                self.auth.store(),
-                &SessionToken(token).hash(),
-                &me,
-                &name,
-                &made,
-            )
+            .finish_registration(self.auth.store(), &session, &me, &name, &made)
             .await?;
         Ok(self.passkey_entry(record))
     }
@@ -2180,10 +2175,10 @@ impl MeApiServer for AdminApi {
     }
 
     async fn password_remove(&self, ext: &Extensions) -> RpcResult<()> {
-        let (token, user) = self.recently_signed_in(ext).await?;
+        let (session, user) = self.recently_signed_in(ext).await?;
         let me = self.account(user).await?;
         // Every other session of theirs ends, as with a new password.
-        let keep = SessionToken(token).hash();
+        let keep = session;
         let revoked = self
             .auth
             .store()
@@ -2256,11 +2251,11 @@ impl MeApiServer for AdminApi {
     }
 
     async fn revoke_other_sessions(&self, ext: &Extensions) -> RpcResult<u64> {
-        let (token, user) = self.caller(ext).await?;
+        let (session, user) = self.caller(ext).await?;
         let revoked = self
             .auth
             .store()
-            .revoke_other_sessions(user.user, &SessionToken(token).hash())
+            .revoke_other_sessions(user.user, &session)
             .await
             .map_err(internal)?;
         tracing::info!(
@@ -2501,11 +2496,11 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn user_set_password(&self, ext: &Extensions, credentials: Credentials) -> RpcResult<()> {
-        let (token, _) = self.recent_admin_session(ext).await?;
+        let (session, _) = self.recent_admin_session(ext).await?;
         let phc = hash_password(&credentials.password).await?;
         // Every session of theirs ends; the admin's own is kept, which is
         // one of theirs only when they reset their own password.
-        let keep = SessionToken(token).hash();
+        let keep = session;
         let revoked = self
             .auth
             .store()
@@ -2681,9 +2676,9 @@ impl AdminApiServer for AdminApi {
         ext: &Extensions,
         username: String,
     ) -> RpcResult<Vec<SessionEntry>> {
-        let (token, _) = self.admin_session(ext).await?;
+        let (session, _) = self.admin_session(ext).await?;
         let user = self.record(&username).await?;
-        let current = crate::auth::SessionToken(token).hash();
+        let current = session;
         let sessions = self
             .auth
             .store()
@@ -2736,9 +2731,9 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn user_remove_password(&self, ext: &Extensions, username: String) -> RpcResult<()> {
-        let (token, _) = self.recent_admin_session(ext).await?;
+        let (session, _) = self.recent_admin_session(ext).await?;
         // Their own sessions but this one, when an admin takes their own.
-        let keep = SessionToken(token).hash();
+        let keep = session;
         let revoked = self
             .auth
             .store()
@@ -4355,8 +4350,12 @@ mod tests {
     #[test]
     fn generated_codes_use_the_unambiguous_alphabet() {
         let code = SetupCode::generate();
-        assert_eq!(code.0.len(), SetupCode::LEN);
-        assert!(code.0.bytes().all(|b| SetupCode::ALPHABET.contains(&b)));
+        assert_eq!(code.0.len(), spoolframe_protocol::invite::CODE_LEN);
+        assert!(
+            code.0
+                .bytes()
+                .all(|b| spoolframe_protocol::invite::CODE_ALPHABET.contains(&b))
+        );
         assert_ne!(SetupCode::generate(), code);
     }
 }

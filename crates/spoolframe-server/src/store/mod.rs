@@ -131,6 +131,19 @@ from_sqlx_through_store_error!(
     users::UserError,
 );
 
+/// A stored value that does not read back, as the store's error.
+pub(super) fn decode_error(e: impl Into<sqlx::error::BoxDynError>) -> StoreError {
+    StoreError::Db(sqlx::Error::Decode(e.into()))
+}
+
+/// A stored portable user id, read back.
+pub(super) fn parse_id(
+    text: String,
+) -> Result<spoolframe_protocol::portable::PortableUserId, StoreError> {
+    text.parse()
+        .map_err(|e: spoolframe_protocol::portable::InvalidPortableUserId| decode_error(e))
+}
+
 /// Whether `endpoint_id` is one of `user`'s devices: one they have had
 /// a session on.
 async fn user_has_device(
@@ -146,6 +159,32 @@ async fn user_has_device(
     .fetch_optional(conn)
     .await?;
     Ok(theirs.is_some())
+}
+
+/// End `endpoint_id` for `user`: drop its trust for them, so it cannot
+/// resume them (P4-01), and revoke their live sessions on it. How many
+/// sessions were ended; the caller commits, then notes them ended.
+async fn end_device(
+    conn: &mut sqlx::SqliteConnection,
+    user: users::LocalUserId,
+    endpoint_id: &str,
+    now: i64,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query("DELETE FROM trusted_endpoints WHERE user_id = ?1 AND endpoint_id = ?2")
+        .bind(user)
+        .bind(endpoint_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(sqlx::query(
+        "UPDATE sessions SET revoked_at = ?3 \
+         WHERE user_id = ?1 AND endpoint_id = ?2 AND revoked_at IS NULL",
+    )
+    .bind(user)
+    .bind(endpoint_id)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected())
 }
 
 /// Whether a connection given back to the pool may be handed out again:

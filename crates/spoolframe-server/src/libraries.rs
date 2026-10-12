@@ -27,6 +27,7 @@ use crate::config::{
     self, ConfigError, FIRST_PLEX_SERVER, LibraryConfig, PathMappingConfig, PlexLibraryConfig,
     PlexServerConfig, ServerConfig, library_kind_name,
 };
+use crate::plex_accounts::same_url;
 use crate::runtime::{ChangeError, RuntimeSettings};
 
 /// Why a library or Plex server change was not made.
@@ -173,12 +174,6 @@ fn server_id(name: &str, taken: &[String]) -> String {
         .map(|n| format!("{slug}-{n}"))
         .find(|id| free(id))
         .expect("some number is free")
-}
-
-/// The URL as the catalog keeps it, for telling whether two are the same
-/// server.
-fn same_url(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
 /// A Plex server now, as `plexStatus` shows it: reachable or not, and

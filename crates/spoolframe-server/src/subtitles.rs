@@ -353,6 +353,21 @@ struct Job {
 }
 
 impl Job {
+    /// The file ffmpeg or ffprobe reads for this track, and the track's
+    /// stream in it. A sidecar is its own input, its one stream the track;
+    /// never read through a symlink (PX-09 B-1).
+    async fn track_input(&self) -> Result<(&Path, u32), String> {
+        match &self.track {
+            SubtitleSource::Embedded { index } => Ok((self.input.as_path(), *index)),
+            SubtitleSource::External { path } => {
+                crate::files::is_regular(path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok((path.as_path(), 0))
+            }
+        }
+    }
+
     async fn run(&self, state: &watch::Sender<TextState>) -> Result<PathBuf, String> {
         tokio::fs::create_dir_all(&self.work)
             .await
@@ -369,16 +384,7 @@ impl Job {
                     .await
                     .expect("never closed");
                 let _ = state.send(TextState::Reading { done_percent: 0 });
-                // A sidecar is its own input, its one stream the track.
-                let (input, index) = match &self.track {
-                    SubtitleSource::Embedded { index } => (&self.input, *index),
-                    SubtitleSource::External { path } => {
-                        crate::files::is_regular(path)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        (path, 0)
-                    }
-                };
+                let (input, index) = self.track_input().await?;
                 ocr::convert_text(&self.subtitles.ffmpeg, input, index, self.to, &partial)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -462,17 +468,10 @@ impl Job {
     async fn decode(&self, pictures: &Path) -> Result<Vec<CueTime>, String> {
         let decoder = &self.subtitles.decoder;
         if let SubtitleFormat::VobSub | SubtitleFormat::DvbSub = self.format {
+            let (input, index) = self.track_input().await?;
             // An embedded track counts from the file's start; a file of its
             // own already does.
-            let (input, index, from_start) = match &self.track {
-                SubtitleSource::Embedded { index } => (&self.input, *index, true),
-                SubtitleSource::External { path } => {
-                    crate::files::is_regular(path)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    (path, 0, false)
-                }
-            };
+            let from_start = matches!(self.track, SubtitleSource::Embedded { .. });
             let json = ocr::read_track_json(&self.subtitles.ffprobe, input, index)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -578,16 +577,15 @@ fn trim(dir: &Path, limit: u64) {
 /// subtitle file beside it that was edited, which is named as it is now
 /// too.
 async fn key(source: &TextSource<'_>, how: &How) -> std::io::Result<String> {
-    let (size, modified) = stamp(source.path).await?;
+    let (size, modified) = crate::files::stamp(source.path).await?;
     let track = match &source.stream.source {
         SubtitleSource::Embedded { index } => format!("stream {index}"),
         SubtitleSource::External { path } => {
-            let (size, modified) = stamp(path).await?;
+            let (size, modified) = crate::files::stamp(path).await?;
             format!("file {} {size} {modified}", path.display())
         }
     };
-    let mut hash = blake3::Hasher::new();
-    for part in [
+    Ok(crate::files::hash_parts(&[
         source.path.display().to_string(),
         size.to_string(),
         modified.to_string(),
@@ -597,21 +595,9 @@ async fn key(source: &TextSource<'_>, how: &How) -> std::io::Result<String> {
             How::Convert => "convert".to_owned(),
         },
         extension(source.to).to_owned(),
-    ] {
-        hash.update(part.as_bytes());
-        hash.update(&[0]);
-    }
-    Ok(hash.finalize().to_hex().to_string())
-}
-
-/// A file's size and modification time (nanoseconds).
-async fn stamp(path: &Path) -> std::io::Result<(u64, u128)> {
-    let meta = tokio::fs::metadata(path).await?;
-    let modified = meta
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    Ok((meta.len(), modified))
+    ])
+    .to_hex()
+    .to_string())
 }
 
 fn extension(format: SubtitleFormat) -> &'static str {

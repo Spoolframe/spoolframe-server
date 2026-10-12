@@ -290,7 +290,8 @@ impl Telemetry {
         ]
     }
 
-    /// Export what is queued now, and wait for it (or the timeout).
+    /// Export what is queued now, and wait for it (or the timeout): spans
+    /// and logs at once.
     pub async fn flush(&self) {
         let (spans, logs) = {
             let running = self.running.lock();
@@ -299,8 +300,7 @@ impl Telemetry {
                 None => (None, None),
             }
         };
-        flush(spans, self.timings).await;
-        flush(logs, self.timings).await;
+        flush_both(spans, logs, self.timings).await;
     }
 
     fn resource(&self) -> Resource {
@@ -332,7 +332,7 @@ impl Telemetry {
             let (tx, rx) = mpsc::channel(timings.queue);
             tokio::spawn(export_queue(
                 rx,
-                Out::Spans(exporter),
+                exporter,
                 Watch::new(
                     Signal::Traces,
                     self.metrics.clone(),
@@ -360,7 +360,7 @@ impl Telemetry {
             let (tx, rx) = mpsc::channel(timings.queue);
             tokio::spawn(export_queue(
                 rx,
-                Out::Logs(exporter),
+                exporter,
                 Watch::new(Signal::Logs, self.metrics.clone(), status.clone(), timings),
                 timings,
             ));
@@ -600,53 +600,36 @@ impl Watch {
     }
 }
 
-/// Where a queue's batches go.
-enum Out {
-    Spans(opentelemetry_otlp::SpanExporter),
-    Logs(opentelemetry_otlp::LogExporter),
-}
-
-impl Out {
-    async fn spans(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-        match self {
-            Out::Spans(exporter) => exporter.export(batch).await,
-            Out::Logs(_) => Ok(()),
-        }
-    }
-
-    async fn logs(&self, batch: Vec<LogItem>) -> OTelSdkResult {
-        match self {
-            Out::Logs(exporter) => {
-                let refs: Vec<(&SdkLogRecord, &InstrumentationScope)> =
-                    batch.iter().map(|item| (&item.0, &item.1)).collect();
-                exporter.export(LogBatch::new(&refs)).await
-            }
-            Out::Spans(_) => Ok(()),
-        }
-    }
-}
-
-/// What a queue holds, sent out by [`Out`].
+/// What a queue holds, and the exporter that sends it out: a queue of
+/// spans can only be given a span exporter, and one of logs a log one.
 trait Item: Sized + Send + 'static {
-    fn export(out: &Out, batch: Vec<Self>) -> impl Future<Output = OTelSdkResult> + Send;
+    type Exporter: Send + Sync + 'static;
+    fn export(
+        exporter: &Self::Exporter,
+        batch: Vec<Self>,
+    ) -> impl Future<Output = OTelSdkResult> + Send;
 }
 
 impl Item for SpanData {
-    fn export(out: &Out, batch: Vec<Self>) -> impl Future<Output = OTelSdkResult> + Send {
-        out.spans(batch)
+    type Exporter = opentelemetry_otlp::SpanExporter;
+    async fn export(exporter: &Self::Exporter, batch: Vec<Self>) -> OTelSdkResult {
+        exporter.export(batch).await
     }
 }
 
 impl Item for LogItem {
-    fn export(out: &Out, batch: Vec<Self>) -> impl Future<Output = OTelSdkResult> + Send {
-        out.logs(batch)
+    type Exporter = opentelemetry_otlp::LogExporter;
+    async fn export(exporter: &Self::Exporter, batch: Vec<Self>) -> OTelSdkResult {
+        let refs: Vec<(&SdkLogRecord, &InstrumentationScope)> =
+            batch.iter().map(|item| (&item.0, &item.1)).collect();
+        exporter.export(LogBatch::new(&refs)).await
     }
 }
 
 /// Batches from `rx`, exported until every sender is gone.
 async fn export_queue<T: Item>(
     mut rx: mpsc::Receiver<Msg<T>>,
-    out: Out,
+    exporter: T::Exporter,
     watch: Watch,
     timings: Timings,
 ) {
@@ -659,30 +642,35 @@ async fn export_queue<T: Item>(
                 Some(Msg::Item(item)) => {
                     batch.push(item);
                     if batch.len() >= timings.batch {
-                        send(&out, &watch, &mut batch, timings).await;
+                        send(&exporter, &watch, &mut batch, timings).await;
                     }
                 }
                 Some(Msg::Flush(done)) => {
-                    send(&out, &watch, &mut batch, timings).await;
+                    send(&exporter, &watch, &mut batch, timings).await;
                     let _ = done.send(());
                 }
                 None => {
-                    send(&out, &watch, &mut batch, timings).await;
+                    send(&exporter, &watch, &mut batch, timings).await;
                     return;
                 }
             },
-            _ = tick.tick() => send(&out, &watch, &mut batch, timings).await,
+            _ = tick.tick() => send(&exporter, &watch, &mut batch, timings).await,
         }
     }
 }
 
-async fn send<T: Item>(out: &Out, watch: &Watch, batch: &mut Vec<T>, timings: Timings) {
+async fn send<T: Item>(
+    exporter: &T::Exporter,
+    watch: &Watch,
+    batch: &mut Vec<T>,
+    timings: Timings,
+) {
     if batch.is_empty() {
         return;
     }
     let taken = std::mem::take(batch);
     let timeout = timings.export_timeout;
-    match tokio::time::timeout(timeout, T::export(out, taken)).await {
+    match tokio::time::timeout(timeout, T::export(exporter, taken)).await {
         Ok(Ok(())) => watch.ok(),
         Ok(Err(e)) => watch.failed(&e),
         Err(_) => watch.failed(&format!("no answer within {timeout:?}")),

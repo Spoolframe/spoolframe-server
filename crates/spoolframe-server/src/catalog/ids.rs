@@ -9,7 +9,7 @@
 //! database already hold keep working, and clients, which treat IDs as
 //! opaque, need nothing new.
 
-use spoolframe_catalog::{Found, FoundGroup};
+use spoolframe_catalog::{Found, FoundGroup, ItemWithChildren};
 use spoolframe_types::{
     Album, Artist, Artwork, ArtworkId, Episode, Item, LibraryId, MediaId, Movie, Person, PersonId,
     Season, Show, Track,
@@ -69,6 +69,19 @@ pub fn person(server: &str, id: PersonId) -> PersonId {
         return id;
     }
     PersonId::new(id.namespace(), join(server, id.key())).expect("a key with a prefix")
+}
+
+/// A fetched item and its children, every ID in them naming `server`.
+pub fn item_with_children(server: &str, found: ItemWithChildren) -> ItemWithChildren {
+    ItemWithChildren {
+        item: item(server, found.item),
+        children: found
+            .children
+            .into_iter()
+            .map(|c| item(server, c))
+            .collect(),
+        ..found
+    }
 }
 
 /// What a search on `server` found, every ID in it naming that server.

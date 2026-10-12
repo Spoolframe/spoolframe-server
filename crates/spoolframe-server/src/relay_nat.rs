@@ -223,8 +223,10 @@ pub fn watch(
             let mine: Vec<IpAddr> = endpoint.addr().ip_addrs().map(|a| a.ip()).collect();
             let mut known: Vec<IpAddr> = public.addrs().iter().map(|p| p.addr.ip()).collect();
             known.extend(mine.iter().copied().filter(|ip| not_public(*ip).is_none()));
-            for url in &own {
-                let now = side(&resolve(url).await, &mine, &known);
+            // All at once, each for RESOLVE_WAIT at most.
+            let resolved = futures_util::future::join_all(own.iter().map(resolve)).await;
+            for (url, addrs) in own.iter().zip(resolved) {
+                let now = side(&addrs, &mine, &known);
                 if sides.get(url) == Some(&now) {
                     continue;
                 }

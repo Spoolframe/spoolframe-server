@@ -394,19 +394,6 @@ impl Uplink {
         }
         told
     }
-
-    /// Wait for a start, an end or a settings change, then for
-    /// `settle` without another, and work the shares out again.
-    pub async fn settled(&self, settle: Duration) -> Vec<Told> {
-        self.changed.notified().await;
-        loop {
-            tokio::select! {
-                () = self.changed.notified() => {}
-                () = tokio::time::sleep(settle) => break,
-            }
-        }
-        self.rebalance()
-    }
 }
 
 /// How long starts and ends are let settle before the shares are told:
@@ -417,51 +404,13 @@ pub const SETTLE: Duration = Duration::from_secs(3);
 /// This host's interface subnets now: each address with its netmask's
 /// prefix. Loopback ones are left out (`is_lan` takes them anyway).
 pub fn host_subnets() -> Vec<Network> {
-    let mut found = Vec::new();
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills `head` with a list it allocates, read only
-    // until the freeifaddrs below; each entry's address and netmask are
-    // read as the struct their family names.
-    unsafe {
-        if libc::getifaddrs(&mut head) != 0 {
-            return found;
-        }
-        let mut entry = head;
-        while let Some(ifa) = entry.as_ref() {
-            entry = ifa.ifa_next;
-            if ifa.ifa_addr.is_null()
-                || ifa.ifa_netmask.is_null()
-                || ifa.ifa_flags & libc::IFF_UP as u32 == 0
-            {
-                continue;
-            }
-            let (ip, prefix) = match i32::from((*ifa.ifa_addr).sa_family) {
-                libc::AF_INET => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    let mask = &*(ifa.ifa_netmask as *const libc::sockaddr_in);
-                    (
-                        IpAddr::from(sa.sin_addr.s_addr.to_ne_bytes()),
-                        u32::from_be(mask.sin_addr.s_addr).count_ones(),
-                    )
-                }
-                libc::AF_INET6 => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
-                    let mask = &*(ifa.ifa_netmask as *const libc::sockaddr_in6);
-                    (
-                        IpAddr::from(sa.sin6_addr.s6_addr),
-                        u128::from_be_bytes(mask.sin6_addr.s6_addr).count_ones(),
-                    )
-                }
-                _ => continue,
-            };
-            if ip.is_loopback() || prefix == 0 {
-                continue;
-            }
-            found.push(Network::new(ip, prefix));
-        }
-        libc::freeifaddrs(head);
-    }
-    found
+    crate::ifaddrs::up()
+        .into_iter()
+        .filter_map(|addr| {
+            let prefix = addr.prefix?;
+            (!addr.ip.is_loopback() && prefix != 0).then(|| Network::new(addr.ip, prefix.into()))
+        })
+        .collect()
 }
 
 /// Tell each of `told` its new share on its connection's events stream,

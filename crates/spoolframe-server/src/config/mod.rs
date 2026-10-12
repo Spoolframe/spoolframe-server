@@ -1024,14 +1024,33 @@ impl TranscodeConfig {
         let max_jobs = at_least_one("transcode.max_jobs", self.max_jobs, 2)?;
         let max_remux = at_least_one("transcode.max_remux", self.max_remux, 32)?;
         let max_gpu_jobs = at_least_one("transcode.max_gpu_jobs", self.max_gpu_jobs, 3)?;
+        let scratch_dir = self
+            .scratch_dir
+            .clone()
+            .unwrap_or_else(|| state_dir.join("cache").join("transcode"));
+        // Text subtitles are burned in by an ffmpeg filter that reads the
+        // film through the job's link in here: a path its filter syntax
+        // misreads would fail every such burn-in (Review 2026-10-11 N5.1).
+        if scratch_dir
+            .display()
+            .to_string()
+            .contains(crate::encode::args::FILTER_SPECIAL)
+        {
+            return Err(ConfigError::Invalid {
+                key: "transcode.scratch_dir",
+                message: format!(
+                    "{} has one of ' : \\ , ; [ ] in it, which ffmpeg's subtitle filter \
+                     cannot read: burning text subtitles in would fail. Choose a path \
+                     without them",
+                    scratch_dir.display()
+                ),
+            });
+        }
         Ok(JobLimits {
             budget: crate::encode::Units::jobs(max_jobs),
             max_remux: max_remux as usize,
             max_gpu_jobs: max_gpu_jobs as usize,
-            scratch_dir: self
-                .scratch_dir
-                .clone()
-                .unwrap_or_else(|| state_dir.join("cache").join("transcode")),
+            scratch_dir,
             scratch_limit_bytes: self.scratch_limit_mb.unwrap_or(20 * 1024) << 20,
             read_ahead: Duration::from_secs(self.read_ahead_secs.unwrap_or(60)),
             stalled_after: crate::encode::job::STALLED_AFTER,
@@ -2716,6 +2735,30 @@ mod tests {
                 })
             ));
         }
+    }
+
+    /// A scratch space ffmpeg's subtitle filter cannot read is refused at
+    /// load, its key named, here or under the state directory (Review
+    /// 2026-10-11 N5.1).
+    #[test]
+    fn a_scratch_dir_the_subtitle_filter_misreads_is_refused() {
+        assert!(matches!(
+            plex(
+                r#"plex { url = "http://nas:32400"; } transcode { scratch_dir = "/srv/scratch:1"; }"#
+            ),
+            Err(ConfigError::Invalid {
+                key: "transcode.scratch_dir",
+                ..
+            })
+        ));
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert!(matches!(
+            config.transcode.limits(Path::new("/var/lib/[sf]")),
+            Err(ConfigError::Invalid {
+                key: "transcode.scratch_dir",
+                ..
+            })
+        ));
     }
 
     #[test]

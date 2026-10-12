@@ -101,24 +101,36 @@ impl Default for Pools {
     }
 }
 
-impl Pools {
-    /// The pool `request`'s operation is held in, and whether it is an
-    /// anonymous one.
-    pub fn of(&self, request: &Request) -> (&Arc<Operations>, bool) {
-        match request {
-            Request::LoginPassword(_)
+/// Whether `request` draws on the strangers' sign-in budget (PX-10; P6-01,
+/// P7-05, P7-06, P7-08): the sign-ins a stranger makes, and the public
+/// identity data and pairing codes guessed only at that rate. They are
+/// also the anonymous sign-in pool's ([`Pools::of`]); one list for both.
+pub fn on_strangers_budget(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::LoginPassword(_)
             | Request::BeginPasskeySignIn { .. }
             | Request::FinishPasskeySignIn { .. }
             | Request::RedeemInvite(_)
             | Request::BeginPortableSignIn
             | Request::FinishPortableSignIn(_)
             | Request::RedeemPortableInvite(_)
-            // P7-08: on the strangers' budget too.
             | Request::IdentityRecord { .. }
             | Request::IdentityRecordByHandle { .. }
             | Request::OfferPairing(_)
             | Request::FetchPairing { .. }
-            | Request::AnswerPairing { .. } => (&self.sign_in, true),
+            | Request::AnswerPairing { .. }
+    )
+}
+
+impl Pools {
+    /// The pool `request`'s operation is held in, and whether it is an
+    /// anonymous one.
+    pub fn of(&self, request: &Request) -> (&Arc<Operations>, bool) {
+        if on_strangers_budget(request) {
+            return (&self.sign_in, true);
+        }
+        match request {
             Request::BeginDeviceSignIn { .. }
             | Request::AwaitDeviceSignIn { .. }
             | Request::ResumeProfile { .. }
@@ -410,6 +422,21 @@ pub(crate) fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One list says which requests draw on the strangers' budget, and the
+    /// anonymous sign-in pool holds exactly those.
+    #[test]
+    fn the_strangers_budget_and_the_sign_in_pool_are_one_list() {
+        assert!(on_strangers_budget(&Request::BeginPortableSignIn));
+        assert!(on_strangers_budget(&Request::BeginPasskeySignIn {
+            username: None
+        }));
+        assert!(!on_strangers_budget(&Request::BeginDeviceSignIn {
+            remember: false
+        }));
+        assert!(!on_strangers_budget(&Request::Ping));
+        assert!(!on_strangers_budget(&Request::AuthMethods));
+    }
 
     fn operation() -> Operation {
         Operation {

@@ -551,9 +551,7 @@ fn depth_encode_args(
     ten_bit: bool,
 ) -> Vec<String> {
     let format = if ten_bit { "p010" } else { "nv12" };
-    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error"]
-        .map(String::from)
-        .to_vec();
+    let mut args = quiet();
     if hardware == Some(Hardware::Vaapi) {
         args.extend([
             "-vaapi_device".into(),
@@ -617,9 +615,7 @@ pub fn hwaccel_args(hardware: Hardware, vaapi_device: &Path, keep_frames: bool) 
 
 /// A one-second hardware decode of `sample`.
 fn decode_args(hardware: Hardware, sample: &Path, settings: &TranscodeSettings) -> Vec<String> {
-    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error"]
-        .map(String::from)
-        .to_vec();
+    let mut args = quiet();
     // Asking for frames to stay in hardware memory makes a decode that
     // would fall back to software fail instead.
     args.extend(hwaccel_args(hardware, &settings.vaapi_device, true));
@@ -807,6 +803,7 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
             &mut failures,
             (Hardware::Vaapi, "tonemap_vaapi", "tone map"),
             tonemap_args(settings),
+            None,
         )
         .await;
     let gpu_overlay = vaapi
@@ -816,6 +813,7 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
             &mut failures,
             (Hardware::Vaapi, "overlay_vaapi", "overlay"),
             overlay_args(settings),
+            None,
         )
         .await;
     // CUDA filters (PGPU-03) feed NVENC from NVDEC's frames: tried where
@@ -832,6 +830,7 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
                 &mut failures,
                 (Hardware::Nvenc, "scale_cuda", "scale"),
                 cuda_scale_args(&sample),
+                None,
             )
             .await;
             cuda_overlay = gpu_filter(
@@ -840,6 +839,7 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
                 &mut failures,
                 (Hardware::Nvenc, "overlay_cuda", "overlay"),
                 cuda_overlay_args(&sample),
+                None,
             )
             .await;
         }
@@ -919,20 +919,16 @@ async fn vaapi_libplacebo(
             }
         }
     }
-    let own = libplacebo_test(settings, VulkanDevice::Own);
-    match ffmpeg.succeeds(&own, scratch, gpu).await {
-        Ok(()) => Some(VulkanDevice::Own),
-        Err(why) => {
-            failed(
-                failures,
-                Some(Hardware::Vaapi),
-                "libplacebo (own)",
-                LACKS_LIBPLACEBO,
-                why,
-            );
-            None
-        }
-    }
+    gpu_filter(
+        ffmpeg,
+        scratch,
+        failures,
+        (Hardware::Vaapi, "libplacebo (own)", LACKS_LIBPLACEBO),
+        libplacebo_test(settings, VulkanDevice::Own),
+        gpu.vulkan,
+    )
+    .await
+    .then_some(VulkanDevice::Own)
 }
 
 /// Whether libplacebo tone maps on the NVIDIA GPU, on ffmpeg's Vulkan
@@ -942,38 +938,33 @@ async fn nvidia_libplacebo(
     scratch: &Path,
     failures: &mut Vec<FailedTest>,
 ) -> bool {
-    let gpu = TestGpu {
-        gpu: GpuUse::Nvidia,
-        vulkan: Some(Vulkan::default()),
-    };
-    match ffmpeg
-        .succeeds(&nvidia_libplacebo_args(), scratch, gpu)
-        .await
-    {
-        Ok(()) => true,
-        Err(why) => {
-            failed(
-                failures,
-                Some(Hardware::Nvenc),
-                "libplacebo (shared)",
-                LACKS_LIBPLACEBO,
-                why,
-            );
-            false
-        }
-    }
+    gpu_filter(
+        ffmpeg,
+        scratch,
+        failures,
+        (Hardware::Nvenc, "libplacebo (shared)", LACKS_LIBPLACEBO),
+        nvidia_libplacebo_args(),
+        Some(Vulkan::default()),
+    )
+    .await
 }
 
 /// Whether a GPU filter test, `args`, works on `hardware`'s GPU; noted
-/// if not. `test` is the filter's name, `lacks` what lacking it means.
+/// if not. `test` is the filter's name, `lacks` what lacking it means;
+/// `vulkan` the Vulkan device libplacebo's tests use.
 async fn gpu_filter(
     ffmpeg: &dyn Ffmpeg,
     scratch: &Path,
     failures: &mut Vec<FailedTest>,
     (hardware, test, lacks): (Hardware, &str, &str),
     args: Vec<String>,
+    vulkan: Option<Vulkan>,
 ) -> bool {
-    match ffmpeg.succeeds(&args, scratch, hardware.gpu().into()).await {
+    let gpu = TestGpu {
+        gpu: hardware.gpu(),
+        vulkan,
+    };
+    match ffmpeg.succeeds(&args, scratch, gpu).await {
         Ok(()) => true,
         Err(why) => {
             failed(failures, Some(hardware), test, lacks, why);
@@ -1013,17 +1004,23 @@ fn failed(
 /// tone map when the GPU does it.
 pub const TONEMAP_VAAPI: &str = "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709";
 
+/// The start of every probe run: no banner, errors only.
+fn quiet() -> Vec<String> {
+    ["-hide_banner", "-loglevel", "error"]
+        .map(String::from)
+        .to_vec()
+}
+
 /// The start of a one-second VA-API filter test on the render node.
 fn filter_test(settings: &TranscodeSettings) -> Vec<String> {
-    vec![
-        "-hide_banner".into(),
-        "-loglevel".into(),
-        "error".into(),
+    let mut args = quiet();
+    args.extend([
         "-init_hw_device".into(),
         format!("vaapi=va:{}", settings.vaapi_device.display()),
         "-filter_hw_device".into(),
         "va".into(),
-    ]
+    ]);
+    args
 }
 
 /// A second of HDR10 test pattern, 10-bit PQ BT.2020: what the tone map
@@ -1096,21 +1093,20 @@ fn libplacebo_test(settings: &TranscodeSettings, device: VulkanDevice) -> Vec<St
 /// tone mapped by libplacebo there, downloaded and encoded on NVENC: the
 /// measured path, but for the decode.
 fn nvidia_libplacebo_args() -> Vec<String> {
-    let mut args: Vec<String> = [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-init_hw_device",
-        NVIDIA_VULKAN,
-        "-filter_hw_device",
-        "vk",
-        "-f",
-        "lavfi",
-        "-i",
-        HDR10_PATTERN,
-    ]
-    .map(String::from)
-    .to_vec();
+    let mut args = quiet();
+    args.extend(
+        [
+            "-init_hw_device",
+            NVIDIA_VULKAN,
+            "-filter_hw_device",
+            "vk",
+            "-f",
+            "lavfi",
+            "-i",
+            HDR10_PATTERN,
+        ]
+        .map(String::from),
+    );
     args.extend([
         "-vf".into(),
         format!(
@@ -1196,9 +1192,7 @@ fn nvenc_to_null(args: &mut Vec<String>) {
 /// there to 360 lines and an even width, and encoded on NVENC: what a
 /// job scaling on CUDA runs.
 fn cuda_scale_args(sample: &Path) -> Vec<String> {
-    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error"]
-        .map(String::from)
-        .to_vec();
+    let mut args = quiet();
     args.extend(hwaccel_args(Hardware::Nvenc, Path::new(""), true));
     args.extend([
         "-i".into(),
@@ -1214,9 +1208,7 @@ fn cuda_scale_args(sample: &Path) -> Vec<String> {
 /// uploaded to the same device and laid over it, as burned-in subtitles
 /// are: `overlay_cuda` lays `yuva420p` over `yuv420p` only.
 fn cuda_overlay_args(sample: &Path) -> Vec<String> {
-    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error"]
-        .map(String::from)
-        .to_vec();
+    let mut args = quiet();
     args.extend(cuda_device_args());
     args.extend(["-i".into(), sample.display().to_string()]);
     args.extend(
@@ -1327,9 +1319,8 @@ impl Sample {
 
     /// A one-second software encode to `out`.
     fn args(&self, out: &Path) -> Vec<String> {
-        let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-y"]
-            .map(String::from)
-            .to_vec();
+        let mut args = quiet();
+        args.push("-y".into());
         args.extend(
             [
                 "-f",

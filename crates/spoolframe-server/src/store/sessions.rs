@@ -293,26 +293,10 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<ApiSessionUser>, StoreError> {
-        let row: Option<(LocalUserId, String, i64, Option<String>, bool)> = sqlx::query_as(
-            "SELECT u.id, u.role, s.authenticated_at, s.signed_in_with, \
-                    s.password_change_only \
-             FROM sessions s JOIN users u ON u.id = s.user_id \
-             WHERE s.token_hash = ?1 AND s.kind = 'api' AND s.revoked_at IS NULL \
-               AND s.expires_at > ?2 AND u.disabled_at IS NULL",
-        )
-        .bind(token_hash)
-        .bind(self.now())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(
-            |(id, stored, authenticated_at, with, password_change_only)| ApiSessionUser {
-                user: id,
-                role: role(stored),
-                authenticated_at,
-                signed_in_with: SignedInWith::from_column(with.as_deref()),
-                password_change_only,
-            },
-        ))
+        Ok(self
+            .fetch_api_session(token_hash, self.now())
+            .await?
+            .map(|(user, _)| user))
     }
 
     /// [`Store::api_session`], as a use: the session is renewed to
@@ -325,6 +309,23 @@ impl Store {
         max_secs: i64,
     ) -> Result<Option<ApiSessionUser>, StoreError> {
         let now = self.now();
+        let Some((user, last_used_at)) = self.fetch_api_session(token_hash, now).await? else {
+            return Ok(None);
+        };
+        if now - last_used_at >= RENEW_EVERY_SECS {
+            self.renew_api_session(token_hash, now, idle_secs, max_secs)
+                .await?;
+        }
+        Ok(Some(user))
+    }
+
+    /// The live API session whose token hashes to `token_hash` at `now`,
+    /// and when it was last used: one rule for what a live one is.
+    async fn fetch_api_session(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<Option<(ApiSessionUser, i64)>, StoreError> {
         type Row = (LocalUserId, String, i64, i64, Option<String>, bool);
         let row: Option<Row> = sqlx::query_as(
             "SELECT u.id, u.role, s.authenticated_at, s.last_used_at, s.signed_in_with, \
@@ -337,21 +338,18 @@ impl Store {
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((id, stored, authenticated_at, last_used_at, with, password_change_only)) = row
-        else {
-            return Ok(None);
-        };
-        if now - last_used_at >= RENEW_EVERY_SECS {
-            self.renew_api_session(token_hash, now, idle_secs, max_secs)
-                .await?;
-        }
-        Ok(Some(ApiSessionUser {
-            user: id,
-            role: role(stored),
-            authenticated_at,
-            signed_in_with: SignedInWith::from_column(with.as_deref()),
-            password_change_only,
-        }))
+        Ok(row.map(
+            |(id, stored, authenticated_at, last_used_at, with, password_change_only)| {
+                let user = ApiSessionUser {
+                    user: id,
+                    role: role(stored),
+                    authenticated_at,
+                    signed_in_with: SignedInWith::from_column(with.as_deref()),
+                    password_change_only,
+                };
+                (user, last_used_at)
+            },
+        ))
     }
 
     /// Write the renewal [`Store::use_api_session`] found due, unless

@@ -29,7 +29,11 @@ fn parse_preferences(json: &str) -> Option<TrackPreferences> {
     let mut full =
         serde_json::to_value(TrackPreferences::default()).expect("preferences always serialize");
     overlay(&mut full, stored);
-    parse("track preferences", &full.to_string())
+    serde_json::from_value(full)
+        .inspect_err(|e| {
+            tracing::warn!(what = "track preferences", error = %e, "ignoring an unreadable stored document")
+        })
+        .ok()
 }
 
 /// `top` over `base`: objects merge key by key, anything else replaces.
