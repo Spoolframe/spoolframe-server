@@ -19,16 +19,19 @@ pub use ed25519_dalek::Signature;
 
 use crate::fingerprint;
 
+mod client_data;
 mod roots;
 pub(crate) use roots::handle_hex;
 #[cfg(any(test, feature = "soft-key"))]
 pub mod soft_key;
 
 pub use roots::{
-    AddedRoot, GENESIS_DOMAIN, GenesisError, HANDLE_LEN, IdentityGenesis, MAX_AUTHENTICATOR_DATA,
-    MAX_CREDENTIAL_ID, MAX_DER_SIGNATURE, MAX_ROOT_CHANGES, MAX_ROOTS, P256_PUBLIC_KEY_LEN,
-    PORTABLE_RP, ROOT_ADD_DOMAIN, ROOT_ENDORSE_DOMAIN, RemovedRoot, RootChanges, RootKey, RootSet,
-    RootSignature, USER_ID_CONTEXT, portable_rp_id_hash, root_add_message, root_endorse_message,
+    AddedRoot, GENESIS_DOMAIN, GenesisError, HANDLE_LEN, IdentityGenesis, MAX_ATTESTATION_OBJECT,
+    MAX_AUTHENTICATOR_DATA, MAX_CLIENT_DATA_JSON, MAX_CREDENTIAL_ID, MAX_DER_SIGNATURE,
+    MAX_ROOT_CHANGES, MAX_ROOTS, P256_PUBLIC_KEY_LEN, PORTABLE_RP, ROOT_ADD_DOMAIN,
+    ROOT_ENDORSE_DOMAIN, RemovedRoot, RootChanges, RootKey, RootRegistration, RootSet,
+    RootSignature, USER_ID_CONTEXT, WebAuthnError, portable_rp_id_hash, root_add_message,
+    root_endorse_message,
 };
 
 /// Bytes in a [`PortableUserId`]: an Ed25519 public key.

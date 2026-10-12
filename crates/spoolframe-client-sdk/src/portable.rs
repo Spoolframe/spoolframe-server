@@ -46,8 +46,9 @@ mod key_roots;
 
 pub use key_roots::{
     AddedRoot, GenesisError, HANDLE_LEN, IdentityGenesis, IdentityRecord, KeyAssertion,
-    PORTABLE_RP, RENEWAL_DUE, RemovedRoot, RootKey, RootSet, RootSignature, RootSigner,
-    SecurityKey, SecurityKeyError, SoftKey, SoftSecurityKey, StateChanges,
+    PORTABLE_RP, RENEWAL_DUE, RemovedRoot, RootKey, RootRegistration, RootSet, RootSignature,
+    RootSigner, SecurityKey, SecurityKeyError, SoftKey, SoftSecurityKey, StateChanges,
+    WebAuthnError,
 };
 
 /// Words in a recovery phrase: 24, for 256 bits of entropy.

@@ -37,7 +37,8 @@ apply, so the revision stays.
 P7-08 (security key roots) adds, still at revision 14: optional fields
 `root` and `genesis` on a device credential and on a `root` tie proof,
 `signer`, `roots_added` and `roots_removed` on an identity state, and a
-CTAP2 assertion as a second form of a root's `signature`; and six new
+CTAP2 assertion as a second form of a root's `signature`, and a WebAuthn
+assertion as a third (Apple's system security-key API); and six new
 pre-auth requests, `identity_record` and `identity_record_by_handle`
 (both answered `identity_record`),
 `offer_pairing`, `fetch_pairing` (answered `pairing_offered`),
@@ -1690,9 +1691,9 @@ device holds is sent. Turning the setting off, or forgetting the guest
 ### Security key roots
 
 An identity may have more roots than the phrase root its id is (P7-08):
-a FIDO2 security key's P-256 credential, which signs only CTAP2
-assertions under the relying party `portable.spoolframe.app`. Any one
-root is enough to act. A root on the wire:
+a FIDO2 security key's P-256 credential, which signs only assertions
+under the relying party `portable.spoolframe.app`, raw CTAP2 or WebAuthn.
+Any one root is enough to act. A root on the wire:
 
 ```json
 {"type": "phrase", "public_key": "<64 hex>"}
@@ -1706,6 +1707,57 @@ the message being the same bytes a phrase root signs. It holds when
 `authenticator_data` starts with SHA-256 of the RP, its flags have UP
 (0x01) and UV (0x04) set (other bits are ignored), and the P-256
 signature verifies. The counter is not looked at.
+
+A key reached through a platform's WebAuthn API (Apple's
+`ASAuthorizationSecurityKeyPublicKeyCredentialProvider`) cannot be given
+a client data hash: the platform writes a `clientDataJSON` around the
+app's challenge, and the key signs `authenticatorData ‖
+SHA-256(clientDataJSON)`. Its assertion is a third form:
+
+```json
+{"authenticator_data": "<hex, ≤512 bytes>", "client_data_json": "<hex, ≤4096 bytes>", "signature": "<hex DER, ≤72 bytes>"}
+```
+
+`client_data_json` is the exact bytes the platform returned. **The
+challenge is SHA-256(message)**, the bytes the CTAP2 form passes as its
+client data hash, so every message and its domain string is the same in
+both forms. It holds, checked in this order, when:
+
+1. no field is over its bound (`client_data_json` over 4 KiB is refused
+   before it is parsed);
+2. `client_data_json` is a strict JSON object with string `type` and
+   `challenge`, each member once, and `type` is `"webauthn.get"` (a
+   registration's `"webauthn.create"` is refused: a packed
+   self-attestation is signed the same way);
+3. `challenge` is SHA-256(message) as base64url without padding, in that
+   one spelling;
+4. `crossOrigin`, if present, is `false`;
+5. `authenticator_data` starts with SHA-256 of the RP, with UP and UV
+   set;
+6. the P-256 signature verifies over `authenticator_data ‖
+   SHA-256(client_data_json)`.
+
+`origin` is not checked. A native app's platform writes its own (it
+need not be `https://portable.spoolframe.app`), and what binds the
+signature to Spoolframe is the RP id hash, which the platform sets from
+the RP id the app is entitled to and the verifier checks. The counter is
+not looked at.
+
+A credential is bound only to its RP id hash, so both forms verify
+against the same `security_key` root: a key registered on Linux signs on
+an iPhone, and the reverse. The two object forms refuse unknown members,
+so neither reads as the other.
+
+A registration is not on the wire: a root proves itself by signing the
+genesis or its addition. The SDK reads a new root from what the key
+answered: over CTAP2, the public key and credential id as given (the
+client data hash is the handle; the attestation is not checked); over
+WebAuthn, an `attestationObject` (CBOR, ≤8 KiB) and a `clientDataJSON`
+of type `"webauthn.create"` whose challenge is the handle, with the RP
+id hash, UP, UV and AT set, a 1–128 byte credential id and an ES256
+P-256 COSE key. The attestation statement is not checked, whatever its
+`fmt`. The SDK asks for a resident credential with `user.id` = the
+handle, but a registration does not show that, so nothing checks it.
 
 **Genesis.** `{"handle": "<64 hex>", "roots": [...], "signatures":
 [...]}`: 1 to 8 roots, each signing `"spoolframe identity genesis

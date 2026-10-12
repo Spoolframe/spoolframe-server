@@ -18,6 +18,7 @@ the dev shell to fuzz.
 |---|---|---|
 | `protocol_frame` | a stream: a frame (length, then CBOR), a multipart RPC reply | `spoolframe-protocol` `codec.rs` |
 | `invite_link` | an invite link, as pasted or read from a QR code; one that parses must be written back as itself | `spoolframe-protocol` `invite.rs` |
+| `webauthn` | a security key's WebAuthn registration (`attestationObject`, `clientDataJSON`) and assertion, as an Apple device sends them (P7-08) | `spoolframe-protocol` `portable/roots.rs`, `portable/client_data.rs` |
 | `protocol_cbor` | a CBOR payload as `RpcRequest`, `RpcResponse`, `ResourceRequest`, `ResourceResponse`; a decoded request must encode and decode back to itself | `codec.rs`, `rpc.rs`, `resource.rs` |
 | `pgs` | a PGS (`.sup`) stream | `spoolframe-media` `pgs.rs` |
 | `dvb` | a DVB subtitle track's packets | `spoolframe-media` `dvb.rs` |

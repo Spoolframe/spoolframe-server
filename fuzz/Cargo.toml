@@ -43,6 +43,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "webauthn"
+path = "fuzz_targets/webauthn.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "protocol_cbor"
 path = "fuzz_targets/protocol_cbor.rs"
 test = false

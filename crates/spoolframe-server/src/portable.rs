@@ -463,6 +463,49 @@ mod tests {
         check(&store, &bare, &proof(9), T).await.unwrap();
     }
 
+    /// P7-08, Apple: key A, registered through raw CTAP2 on Linux, signs
+    /// a credential through the system WebAuthn API on an iPhone; it holds
+    /// as a CTAP2 one does. One over another message, or by another key
+    /// in A's name, does not (the protocol's tests refuse the rest).
+    #[tokio::test]
+    async fn a_key_identity_s_webauthn_credential_holds_and_a_bad_one_does_not() {
+        use spoolframe_protocol::portable::{CredentialError, RootSignature};
+
+        let store = test_store("presentation-key-webauthn").await;
+        let (genesis, a, b) = key_identity();
+        let signed_by = |sign: &dyn Fn(&[u8]) -> RootSignature| {
+            let mut credential = UserDeviceCredential::signed_by(
+                genesis.user(),
+                a.root(),
+                device(9),
+                1,
+                T,
+                T + MAX_CREDENTIAL_VALIDITY,
+                sign,
+            );
+            credential.genesis = Some(Box::new(genesis.clone()));
+            credential
+        };
+        let good = signed_by(&|m| a.assert_webauthn(m));
+        assert!(matches!(good.signature, RootSignature::WebAuthn { .. }));
+        assert_eq!(
+            check(&store, &good, &proof(9), T).await.unwrap(),
+            genesis.user()
+        );
+        for bad in [
+            signed_by(&|_| a.assert_webauthn(b"another message")),
+            signed_by(&|m| b.assert_webauthn(m)),
+        ] {
+            assert!(
+                matches!(
+                    check(&store, &bad, &proof(9), T).await,
+                    Err(PresentationError::Credential(CredentialError::BadSignature))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_key_that_is_not_the_identity_s_signs_no_credential_for_it() {
         let store = test_store("presentation-key-stranger").await;

@@ -5,7 +5,8 @@
 //! the protocol crate checks them.
 //!
 //! A device talks to its key through [`SecurityKey`]: libfido2 over USB
-//! on Linux, Core NFC on the iPhone, [`SoftSecurityKey`] in tests. The
+//! on Linux (raw CTAP2), Apple's system security-key API on iPhone, iPad
+//! and Mac (WebAuthn form), [`SoftSecurityKey`] in tests (either). The
 //! key is needed only for root actions: creating an identity, issuing,
 //! renewing and revoking credentials, adding and removing roots. Signing
 //! in and playing use the device's own credential, as before.
@@ -27,7 +28,7 @@ use zeroize::Zeroizing;
 pub use spoolframe_protocol::portable::soft_key::SoftKey;
 pub use spoolframe_protocol::portable::{
     AddedRoot, GenesisError, HANDLE_LEN, IdentityGenesis, IdentityRecord, MAX_ROOTS, PORTABLE_RP,
-    RemovedRoot, RootKey, RootSet, RootSignature, StateChanges,
+    RemovedRoot, RootKey, RootRegistration, RootSet, RootSignature, StateChanges, WebAuthnError,
 };
 use spoolframe_protocol::portable::{root_add_message, root_endorse_message, root_set};
 
@@ -84,42 +85,106 @@ pub enum SecurityKeyError {
     #[error("the key was not touched in time")]
     NotTouched,
     /// What it answered does not check out: another site's assertion, or
-    /// one made without the touch or the PIN.
+    /// one made without the touch or the PIN; a WebAuthn assertion of the
+    /// wrong type or challenge; a registration made for another identity
+    /// or with a key no root can be.
     #[error("the key's signature does not check out")]
     BadAssertion,
     /// Anything else, in the transport's words.
     #[error("the security key: {0}")]
     Other(String),
+    /// The key, or the platform between, did not do it, and says no more
+    /// than this (and perhaps a message for the log). Apple's system API
+    /// shows its own PIN screens, and a wrong, locked or missing PIN all
+    /// come back this way.
+    #[error("the security key failed{}", .0.as_deref().map(|m| format!(": {m}")).unwrap_or_default())]
+    Failed(Option<String>),
+    /// The person cancelled: the app says nothing.
+    #[error("the security key action was cancelled")]
+    Cancelled,
 }
 
-/// A FIDO2 security key, as a device reaches it (P7-08): raw CTAP2, not a
-/// platform passkey API, as libfido2's `make_credential` and
-/// `get_assertion` (the Linux client's `spoolframe_linux_core::fido2`).
+/// A FIDO2 security key, as a device reaches it (P7-08): raw CTAP2, as
+/// libfido2's `make_credential` and `get_assertion` (the Linux client's
+/// `spoolframe_linux_core::fido2`), or a platform's WebAuthn API (Apple's
+/// `ASAuthorizationSecurityKeyPublicKeyCredentialProvider`). Object-safe
+/// and `Send + Sync`, so an app may implement it across FFI (a uniffi
+/// foreign trait wrapped by an adapter); each call may wait on a person.
 ///
 /// Both calls need the person's touch and the key's PIN. **The
 /// implementation collects the PIN** (and may keep it for the length of
-/// one root action, which asks the key more than once): the SDK never
-/// sees it. User verification comes from the PIN, so there is no "uv"
-/// option to pass (the user's Feitian key refuses one). The key does not
-/// keep a user name; the handle identifies the identity.
+/// one root action, which asks the key more than once), or leaves it to
+/// the platform: the SDK never sees it. User verification comes from the
+/// PIN, so there is no "uv" option to pass over raw CTAP2 (the user's
+/// Feitian key refuses one); over WebAuthn, ask for
+/// `userVerification = required`. The key does not keep a user name; the
+/// handle identifies the identity.
+///
+/// Register with [`Self::register_root`] (either form) or
+/// [`Self::register`] (raw CTAP2's root as read); each has a default that
+/// uses the other, so implement one. Assert with [`Self::assert`], in
+/// either form.
 #[async_trait]
 pub trait SecurityKey: Send + Sync {
     /// `authenticatorMakeCredential`: a resident (discoverable) ES256
     /// credential under `rp`, for user id `handle`, shown as `name`, with
     /// credProtect 2 (so it is not listed without the PIN). The root it
-    /// makes: its public key and credential id.
+    /// makes: its public key and credential id. Its client data hash is
+    /// `handle`; the attestation is not checked.
+    ///
+    /// The default is for a key that implements only
+    /// [`Self::register_root`]: [`SecurityKeyError::Failed`].
     async fn register(
         &self,
         rp: &str,
         handle: [u8; HANDLE_LEN],
         name: &str,
-    ) -> Result<RootKey, SdkError>;
+    ) -> Result<RootKey, SdkError> {
+        let _ = (rp, handle, name);
+        Err(SecurityKeyError::Failed(Some(
+            "this security key registers through register_root".into(),
+        ))
+        .into())
+    }
+
+    /// Make a credential, as [`Self::register`] does, and answer in
+    /// whichever form the key's API gives it; the SDK reads the root out
+    /// ([`RootRegistration::root`]). This is what the SDK calls.
+    ///
+    /// Over WebAuthn: `rp.id` = `rp`, `challenge` = `handle` (the 32
+    /// bytes), `user.id` = `handle`, `user.name` = `name`, ES256 (-7),
+    /// a resident key required, `userVerification` required; answer
+    /// [`RootRegistration::WebAuthn`] with the `attestationObject` and the
+    /// exact `rawClientDataJSON`. Attestation `none` is enough. That the
+    /// credential is resident with `user.id` = `handle` cannot be checked
+    /// from the answer: ask for it.
+    ///
+    /// The default asks [`Self::register`]: [`RootRegistration::Ctap`].
+    async fn register_root(
+        &self,
+        rp: &str,
+        handle: [u8; HANDLE_LEN],
+        name: &str,
+    ) -> Result<RootRegistration, SdkError> {
+        self.register(rp, handle, name)
+            .await
+            .map(RootRegistration::Ctap)
+    }
 
     /// `authenticatorGetAssertion` under `rp` over `client_data_hash`,
     /// with the credentials in `allowed` (ids), or every discoverable one
     /// the key holds for `rp` when `allowed` is empty: all it answers
     /// with (one per identity on the key), each with its user handle.
     /// None is [`SecurityKeyError::NoCredential`].
+    ///
+    /// `client_data_hash` is SHA-256 of what the root signs. Over raw
+    /// CTAP2 it is the client data hash, and the answer is
+    /// [`RootSignature::Ctap`]. Over WebAuthn, which writes its own client
+    /// data, it is the `challenge` (the 32 bytes as they are, which the
+    /// platform base64url-encodes), and the answer is
+    /// [`RootSignature::WebAuthn`] with the `authenticatorData`, the exact
+    /// `rawClientDataJSON` and the DER signature; `userHandle` is the
+    /// handle.
     async fn assert(
         &self,
         rp: &str,
@@ -132,14 +197,59 @@ pub trait SecurityKey: Send + Sync {
 /// [`SecurityKey::register`], answering as the user's Feitian key does
 /// (32-byte credential ids, flags UP and UV, counter 0). For tests, and
 /// for trying key roots with no key; its secrets are in memory only.
+///
+/// It answers in raw CTAP2 form ([`Self::new`]), as libfido2 does, or in
+/// WebAuthn form ([`Self::webauthn`]), as Apple's system API does.
+/// [`Self::as_webauthn`] and [`Self::as_ctap`] are the same credentials
+/// reached the other way: one key on a Linux desktop and on an iPhone.
 #[derive(Debug, Default, Clone)]
 pub struct SoftSecurityKey {
     credentials: Arc<Mutex<Vec<SoftKey>>>,
+    webauthn: bool,
 }
 
 impl SoftSecurityKey {
+    /// A key that answers in raw CTAP2 form.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A key that answers in WebAuthn form.
+    pub fn webauthn() -> Self {
+        Self::new().as_webauthn()
+    }
+
+    /// The same credentials, answering in WebAuthn form.
+    pub fn as_webauthn(&self) -> Self {
+        Self {
+            credentials: self.credentials.clone(),
+            webauthn: true,
+        }
+    }
+
+    /// The same credentials, answering in raw CTAP2 form.
+    pub fn as_ctap(&self) -> Self {
+        Self {
+            credentials: self.credentials.clone(),
+            webauthn: false,
+        }
+    }
+
+    /// A new credential for `handle` under `rp`, kept.
+    fn make(&self, rp: &str, handle: [u8; HANDLE_LEN]) -> Result<SoftKey, SdkError> {
+        if rp != PORTABLE_RP {
+            return Err(SecurityKeyError::Other(format!("no credentials under {rp}")).into());
+        }
+        let key = loop {
+            let mut random = Zeroizing::new([0u8; 64]);
+            getrandom::fill(random.as_mut()).expect("the OS gives random bytes");
+            if let Some(key) = SoftKey::from_random(*random) {
+                break key;
+            }
+        }
+        .with_handle(handle);
+        self.credentials.lock().push(key.clone());
+        Ok(key)
     }
 
     /// The credentials it holds, newest last.
@@ -156,20 +266,21 @@ impl SecurityKey for SoftSecurityKey {
         handle: [u8; HANDLE_LEN],
         _name: &str,
     ) -> Result<RootKey, SdkError> {
-        if rp != PORTABLE_RP {
-            return Err(SecurityKeyError::Other(format!("no credentials under {rp}")).into());
-        }
-        let key = loop {
-            let mut random = Zeroizing::new([0u8; 64]);
-            getrandom::fill(random.as_mut()).expect("the OS gives random bytes");
-            if let Some(key) = SoftKey::from_random(*random) {
-                break key;
-            }
-        }
-        .with_handle(handle);
-        let root = key.root();
-        self.credentials.lock().push(key);
-        Ok(root)
+        Ok(self.make(rp, handle)?.root())
+    }
+
+    async fn register_root(
+        &self,
+        rp: &str,
+        handle: [u8; HANDLE_LEN],
+        _name: &str,
+    ) -> Result<RootRegistration, SdkError> {
+        let key = self.make(rp, handle)?;
+        Ok(if self.webauthn {
+            key.register_webauthn(&handle)
+        } else {
+            key.register_ctap()
+        })
     }
 
     async fn assert(
@@ -188,7 +299,11 @@ impl SecurityKey for SoftSecurityKey {
             })
             .map(|key| KeyAssertion {
                 credential_id: key.credential_id().to_vec(),
-                signature: key.assert_prehashed(client_data_hash),
+                signature: if self.webauthn {
+                    key.assert_webauthn_prehashed(client_data_hash)
+                } else {
+                    key.assert_prehashed(client_data_hash)
+                },
                 user_handle: key.user_handle(),
             })
             .collect();
@@ -227,6 +342,22 @@ fn credential_id(root: &RootKey) -> Option<Vec<u8>> {
 /// What a security key's root signs, as its `clientDataHash`.
 fn client_data_hash(message: &[u8]) -> [u8; 32] {
     Sha256::digest(message).into()
+}
+
+/// Have `key` make a credential for the identity `handle`, and read its
+/// root: in either form, checked here (a WebAuthn registration for another
+/// identity, or of a key no root can be, is
+/// [`SecurityKeyError::BadAssertion`]).
+async fn register_with(
+    key: &dyn SecurityKey,
+    handle: [u8; HANDLE_LEN],
+    name: &str,
+) -> Result<RootKey, SdkError> {
+    let registration = key.register_root(PORTABLE_RP, handle, name).await?;
+    registration.root(&handle).map_err(|e| {
+        tracing::warn!(error = %e, "a security key's registration does not check out");
+        SecurityKeyError::BadAssertion.into()
+    })
 }
 
 /// Have `key` assert over `message` with one of `roots` (credential ids),
@@ -292,7 +423,7 @@ impl super::Portable {
         getrandom::fill(&mut handle).expect("the OS gives random bytes");
         let mut roots = Vec::with_capacity(keys.len());
         for key in keys {
-            let root = key.register(PORTABLE_RP, handle, name).await?;
+            let root = register_with(*key, handle, name).await?;
             if !root.is_valid() || roots.contains(&root) {
                 return Err(SecurityKeyError::Other(
                     "it made a credential that is not a P-256 key, or one given already".into(),
@@ -677,7 +808,7 @@ impl super::Portable {
                 "an identity has at most {MAX_ROOTS} roots"
             )));
         }
-        let root = new_key.register(PORTABLE_RP, handle, name).await?;
+        let root = register_with(new_key, handle, name).await?;
         // A credential no root can carry (an id over 255 bytes) would
         // panic in `RootKey::bytes`; refused as `create_with_keys` does.
         if !root.is_valid() {
@@ -1472,5 +1603,243 @@ mod tests {
             portable().import_record(forged, "Sam").await,
             Err(SdkError::IdentityState(StateError::BadSignature))
         ));
+    }
+
+    // Apple's system security-key API (WebAuthn form).
+
+    fn is_webauthn(signature: &RootSignature) -> bool {
+        matches!(signature, RootSignature::WebAuthn { .. })
+    }
+
+    /// Every root action, with keys that answer only through WebAuthn (an
+    /// iPhone's system API): the genesis, a credential, a revocation, an
+    /// added and a removed root, all signed in that form, all holding.
+    #[tokio::test]
+    async fn an_identity_rooted_in_webauthn_keys_does_every_root_action() {
+        let (a, b) = (SoftSecurityKey::webauthn(), SoftSecurityKey::webauthn());
+        let phone = portable();
+        let id = phone.create_with_keys(&[&a, &b], "Sam").await.unwrap();
+        let genesis = phone.identity_record(id).await.unwrap().genesis.unwrap();
+        assert_eq!(genesis.verify(), Ok(()));
+        assert!(genesis.signatures.iter().all(is_webauthn), "{genesis:?}");
+        assert_eq!(
+            genesis.roots,
+            [a.credentials()[0].root(), b.credentials()[0].root()]
+        );
+        assert_eq!(a.credentials()[0].user_handle(), Some(genesis.handle));
+
+        let credential = phone.pair_self(id, RootSigner::Key(&a)).await.unwrap();
+        assert!(is_webauthn(&credential.signature));
+        assert_eq!(credential.verify(unix_now()), Ok(()));
+        let tv = some_device(9);
+        let issued = phone
+            .issue_credential_by(id, RootSigner::Key(&b), tv, Some("TV"))
+            .await
+            .unwrap();
+        assert_eq!(issued.signer(), b.credentials()[0].root());
+        let revoked = phone.revoke_by(id, RootSigner::Key(&a), tv).await.unwrap();
+        assert!(is_webauthn(&revoked.signature) && revoked.revokes(&tv));
+        let c = SoftSecurityKey::webauthn();
+        let added = phone
+            .add_root(id, RootSigner::Key(&a), &c, "Sam")
+            .await
+            .unwrap();
+        assert_eq!(added.verify(), Ok(()));
+        let addition = &added.roots_added[0];
+        assert!(is_webauthn(&addition.possession) && is_webauthn(&addition.endorsement));
+        let removed = phone
+            .remove_root(id, RootSigner::Key(&c), &a.credentials()[0].root())
+            .await
+            .unwrap();
+        assert_eq!(removed.verify(), Ok(()));
+        assert!(matches!(
+            phone.pair_self(id, RootSigner::Key(&a)).await,
+            Err(SdkError::NotARoot)
+        ));
+    }
+
+    /// One key, two devices: registered through libfido2 on Linux, it
+    /// acts through the system API on an iPhone, and the reverse.
+    #[tokio::test]
+    async fn a_key_registered_on_linux_acts_through_webauthn_and_the_reverse() {
+        let on_linux = SoftSecurityKey::new();
+        let desktop = portable();
+        let id = desktop.create_with_keys(&[&on_linux], "Sam").await.unwrap();
+        let record = desktop.identity_record(id).await.unwrap();
+        let iphone = portable();
+        iphone.import_record(record, "Sam").await.unwrap();
+        let credential = iphone
+            .pair_self(id, RootSigner::Key(&on_linux.as_webauthn()))
+            .await
+            .unwrap();
+        assert!(is_webauthn(&credential.signature));
+        assert_eq!(credential.signer(), on_linux.credentials()[0].root());
+        assert_eq!(credential.verify(unix_now()), Ok(()));
+
+        let on_iphone = SoftSecurityKey::webauthn();
+        let phone = portable();
+        let id = phone.create_with_keys(&[&on_iphone], "Sam").await.unwrap();
+        let record = phone.identity_record(id).await.unwrap();
+        let linux = portable();
+        linux.import_record(record, "Sam").await.unwrap();
+        let credential = linux
+            .pair_self(id, RootSigner::Key(&on_iphone.as_ctap()))
+            .await
+            .unwrap();
+        assert!(matches!(credential.signature, RootSignature::Ctap { .. }));
+        assert_eq!(credential.signer(), on_iphone.credentials()[0].root());
+    }
+
+    /// A key whose registration is made for another identity, or whose
+    /// assertion is of the wrong type; or one that fails as Apple's API
+    /// fails, with no detail.
+    struct Misbehaving {
+        key: SoftKey,
+        how: Misbehaviour,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Misbehaviour {
+        RegistersForAnotherHandle,
+        SignsAsRegistration,
+        Cancels,
+        Fails,
+    }
+
+    impl Misbehaving {
+        fn new(how: Misbehaviour) -> Self {
+            Self {
+                key: SoftKey::from_seed(7),
+                how,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SecurityKey for Misbehaving {
+        async fn register_root(
+            &self,
+            _: &str,
+            handle: [u8; HANDLE_LEN],
+            _: &str,
+        ) -> Result<RootRegistration, SdkError> {
+            match self.how {
+                Misbehaviour::RegistersForAnotherHandle => {
+                    let mut other = handle;
+                    other[0] ^= 1;
+                    Ok(self.key.register_webauthn(&other))
+                }
+                Misbehaviour::SignsAsRegistration => Ok(self.key.register_webauthn(&handle)),
+                Misbehaviour::Cancels => Err(SecurityKeyError::Cancelled.into()),
+                Misbehaviour::Fails => Err(SecurityKeyError::Failed(None).into()),
+            }
+        }
+
+        async fn assert(
+            &self,
+            _: &str,
+            challenge: [u8; 32],
+            _: &[Vec<u8>],
+        ) -> Result<Vec<KeyAssertion>, SdkError> {
+            use spoolframe_protocol::portable::soft_key::{UP_UV, client_data_json};
+            Ok(vec![KeyAssertion {
+                credential_id: self.key.credential_id().to_vec(),
+                signature: self
+                    .key
+                    .assert_webauthn_with(client_data_json("webauthn.create", &challenge), UP_UV),
+                user_handle: None,
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn a_webauthn_registration_for_another_identity_is_refused_and_nothing_kept() {
+        let phone = portable();
+        let made = phone
+            .create_with_keys(
+                &[&Misbehaving::new(Misbehaviour::RegistersForAnotherHandle)],
+                "Sam",
+            )
+            .await;
+        assert!(
+            matches!(
+                made,
+                Err(SdkError::SecurityKey(SecurityKeyError::BadAssertion))
+            ),
+            "{made:?}"
+        );
+        assert!(phone.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_registration_presented_as_an_assertion_is_refused() {
+        let made = portable()
+            .create_with_keys(
+                &[&Misbehaving::new(Misbehaviour::SignsAsRegistration)],
+                "Sam",
+            )
+            .await;
+        assert!(
+            matches!(
+                made,
+                Err(SdkError::SecurityKey(SecurityKeyError::BadAssertion))
+            ),
+            "{made:?}"
+        );
+    }
+
+    /// Apple's API says only "cancelled" or "failed": the SDK passes that
+    /// on as it is.
+    #[tokio::test]
+    async fn a_plain_cancel_or_failure_comes_back_as_it_was_said() {
+        let (desktop, id, a, _) = key_identity().await;
+        for (how, said) in [
+            (Misbehaviour::Cancels, SecurityKeyError::Cancelled),
+            (Misbehaviour::Fails, SecurityKeyError::Failed(None)),
+        ] {
+            let added = desktop
+                .add_root(id, RootSigner::Key(&a), &Misbehaving::new(how), "K")
+                .await;
+            assert!(
+                matches!(&added, Err(SdkError::SecurityKey(e)) if *e == said),
+                "{added:?}"
+            );
+        }
+        assert_eq!(
+            SecurityKeyError::Failed(Some("the NFC session ended".into())).to_string(),
+            "the security key failed: the NFC session ended"
+        );
+        assert_eq!(
+            SecurityKeyError::Failed(None).to_string(),
+            "the security key failed"
+        );
+    }
+
+    /// A key that implements neither way to register fails plainly
+    /// rather than looping.
+    struct AssertOnly;
+
+    #[async_trait]
+    impl SecurityKey for AssertOnly {
+        async fn assert(
+            &self,
+            _: &str,
+            _: [u8; 32],
+            _: &[Vec<u8>],
+        ) -> Result<Vec<KeyAssertion>, SdkError> {
+            Err(SecurityKeyError::NoCredential.into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_that_cannot_register_fails_plainly() {
+        let made = portable().create_with_keys(&[&AssertOnly], "Sam").await;
+        assert!(
+            matches!(
+                made,
+                Err(SdkError::SecurityKey(SecurityKeyError::Failed(Some(_))))
+            ),
+            "{made:?}"
+        );
     }
 }

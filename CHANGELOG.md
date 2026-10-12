@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- P7-08, Apple: a security key root also signs in WebAuthn form, as
+  Apple's system security-key API returns it, so iPhone, iPad and Mac use
+  the same key and the same identity as the Linux client. A root's
+  `signature` may be `{"authenticator_data", "client_data_json",
+  "signature"}` (hex; additive at revision 14): its challenge is
+  SHA-256 of the message the CTAP2 form signs, its type `webauthn.get`,
+  not cross-origin, under `portable.spoolframe.app` with UP and UV. The
+  origin is not checked; the RP id hash is the binding. Servers take it
+  wherever they take a root's signature. In the SDK, `SecurityKey` gains
+  `register_root`, returning a `RootRegistration` (raw CTAP2's root, or a
+  WebAuthn `attestationObject` and `clientDataJSON` whose challenge is
+  the identity's handle), with `register` and `register_root` each
+  defaulting to the other; `assert`'s `client_data_hash` is the WebAuthn
+  challenge, and it may answer `RootSignature::WebAuthn`.
+  `SecurityKeyError` gains `Failed(Option<String>)` and `Cancelled`, for a
+  platform that shows its own PIN screens. `SoftSecurityKey::webauthn()`,
+  `as_webauthn()` and `as_ctap()` answer in either form. A `webauthn`
+  fuzz target reads registrations and assertions.
+
 - HLS of a copied video is cut into segments of at least
   `transcode.copy_segment_secs` (2 s if left out, 1 to 10; review
   2026-10-11 M2), each at the first keyframe that far past the last,

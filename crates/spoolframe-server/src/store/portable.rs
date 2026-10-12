@@ -685,6 +685,53 @@ pub(crate) mod tests {
         ));
     }
 
+    /// P7-08, Apple: a genesis one key signed in raw CTAP2 (Linux) and
+    /// the other through WebAuthn (an iPhone) is kept and read back as it
+    /// came, and a state the WebAuthn key signs is taken.
+    #[tokio::test]
+    async fn a_genesis_and_state_signed_through_webauthn_are_kept() {
+        let store = test_store("portable-webauthn-genesis").await;
+        let (linux, iphone) = (SoftKey::from_seed(3), SoftKey::from_seed(4));
+        let handle = [0x33; 32];
+        let roots = vec![linux.root(), iphone.root()];
+        let message = IdentityGenesis::message(&handle, &roots).unwrap();
+        let genesis = IdentityGenesis {
+            handle,
+            signatures: vec![linux.assert(&message), iphone.assert_webauthn(&message)],
+            roots,
+        };
+        let user = store.accept_genesis(&genesis, T).await.unwrap();
+        assert_eq!(
+            store.identity_genesis(user).await.unwrap(),
+            Some(genesis.clone())
+        );
+        let state = PortableIdentityState::signed_by(
+            user,
+            iphone.root(),
+            1,
+            StateChanges {
+                revoked: vec![entry(9)],
+                ..StateChanges::default()
+            },
+            T,
+            |m| iphone.assert_webauthn(m),
+        )
+        .unwrap();
+        store.accept_identity_state(&state, T).await.unwrap();
+        assert!(store.revokes(user, &device(9), T).await.unwrap());
+        // The same state in the iPhone key's name, signed by the Linux key.
+        let forged = PortableIdentityState::signed_by(
+            user,
+            iphone.root(),
+            2,
+            StateChanges::default(),
+            T,
+            |m| linux.assert_webauthn(m),
+        )
+        .unwrap();
+        assert!(store.accept_identity_state(&forged, T).await.is_err());
+    }
+
     #[tokio::test]
     async fn a_genesis_that_does_not_hold_is_not_kept() {
         let store = test_store("portable-bad-genesis").await;

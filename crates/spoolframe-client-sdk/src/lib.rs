@@ -52,8 +52,8 @@ pub use portable::{
     CredentialError, DevicePublicKey, GuestPairing, GuestServer, HANDLE_LEN, IdentityGenesis,
     IdentityRecord, KeyAssertion, PORTABLE_RP, PhraseError, Portable, PortableIdentity,
     PortableIdentityState, PortableRoot, PortableUserId, RecoveryPhrase, RevokedKey, RootKey,
-    RootSet, RootSigner, SecurityKey, SecurityKeyError, SoftSecurityKey, StateError, TieProof,
-    UserDeviceCredential,
+    RootRegistration, RootSet, RootSignature, RootSigner, SecurityKey, SecurityKeyError,
+    SoftSecurityKey, StateError, TieProof, UserDeviceCredential, WebAuthnError,
 };
 pub use reachability::{
     DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,

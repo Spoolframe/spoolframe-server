@@ -355,4 +355,39 @@ mod tests {
             Err(TieCheckError::NotARoot)
         ));
     }
+
+    /// P7-08, Apple: a tie by a key root signed through WebAuthn holds; one
+    /// over another tie does not.
+    #[tokio::test]
+    async fn a_key_identity_ties_by_its_root_through_webauthn() {
+        use spoolframe_protocol::portable::soft_key::SoftKey;
+        use spoolframe_protocol::portable::{IdentityGenesis, RootKey};
+
+        let store = test_store("tie-key-root-webauthn").await;
+        let a = SoftKey::from_seed(3);
+        let handle = [0x33; 32];
+        let roots: Vec<RootKey> = vec![a.root()];
+        let message = IdentityGenesis::message(&handle, &roots).unwrap();
+        let genesis = IdentityGenesis {
+            handle,
+            signatures: vec![a.assert_webauthn(&message)],
+            roots,
+        };
+        let user = genesis.user();
+        let tie = tie_message(&SERVER, &NONCE, &user, "alice").unwrap();
+        let by = |signed: &[u8]| TieProof::Root {
+            signature: a.assert_webauthn(signed),
+            root: Some(a.root()),
+            genesis: Some(Box::new(genesis.clone())),
+        };
+        check_tie(&store, &by(&tie), user, &SERVER, &NONCE, "alice", T)
+            .await
+            .unwrap();
+        let other = tie_message(&SERVER, &NONCE, &user, "bob").unwrap();
+        assert!(
+            check_tie(&store, &by(&other), user, &SERVER, &NONCE, "alice", T)
+                .await
+                .is_err()
+        );
+    }
 }

@@ -1284,6 +1284,97 @@ mod sdk {
         invites.server.stop().await;
     }
 
+    /// P7-08, Apple: one key, one identity, two APIs. An identity made on
+    /// a Linux desktop with a key over raw CTAP2 joins a server; an iPhone
+    /// with nothing but that key, reached through the system WebAuthn API,
+    /// finds the identity by the handle the key gives back, pairs itself
+    /// and signs in. Then the reverse: an identity made on the iPhone
+    /// through WebAuthn is recovered by a Linux desktop over CTAP2.
+    #[tokio::test]
+    async fn a_key_identity_crosses_between_ctap_and_webauthn_devices() {
+        use spoolframe_client_sdk::{RootSignature, RootSigner, SoftSecurityKey};
+
+        let invites = invites("sdk-p7-08-webauthn").await;
+        let server = invites.server.server.id().to_string();
+        let find = invites.root.invite_link().await.unwrap();
+        let new_invite = || {
+            invites.create(NewInvite {
+                kind: spoolframe_admin_api::InviteKind::PortableAccount,
+                note: Some("Sam".into()),
+                uses: None,
+                expires: None,
+                role: None,
+            })
+        };
+
+        for made_through_webauthn in [false, true] {
+            let key = if made_through_webauthn {
+                SoftSecurityKey::webauthn()
+            } else {
+                SoftSecurityKey::new()
+            };
+            let other_way = if made_through_webauthn {
+                key.as_ctap()
+            } else {
+                key.as_webauthn()
+            };
+            let maker = new_device().await;
+            let identity = maker
+                .portable()
+                .create_with_keys(&[&key], "Sam")
+                .await
+                .unwrap();
+            maker
+                .portable()
+                .pair_self(identity, RootSigner::Key(&key))
+                .await
+                .unwrap();
+            let created = new_invite().await;
+            maker
+                .redeem_invite_portable(&created.link, identity, Some("Sam"))
+                .await
+                .unwrap();
+
+            let other = new_device().await;
+            other.save_invite_server(&find).await.unwrap();
+            let handle = maker
+                .portable()
+                .identity_record(identity)
+                .await
+                .unwrap()
+                .genesis
+                .unwrap()
+                .handle;
+            let record = other
+                .fetch_identity_record_by_handle(&server, handle)
+                .await
+                .unwrap();
+            assert_eq!(record.user, identity);
+            assert_eq!(
+                other
+                    .recover_with_key(&server, &other_way, "Sam")
+                    .await
+                    .unwrap(),
+                identity
+            );
+            let credential = other
+                .portable()
+                .pair_self(identity, RootSigner::Key(&other_way))
+                .await
+                .unwrap();
+            assert_eq!(
+                matches!(credential.signature, RootSignature::WebAuthn { .. }),
+                !made_through_webauthn,
+                "{credential:?}"
+            );
+            let signed_in = other.sign_in_portable(&server, identity).await.unwrap();
+            assert_eq!(signed_in.user().user_id, format!("portable:{identity}"));
+            maker.close().await;
+            other.close().await;
+        }
+        invites.server.stop().await;
+    }
+
     /// P7-08: a key added to a phrase identity carries the identity's id as
     /// its handle, so a fresh install with only that key finds the
     /// identity by handle too, and keeps its id.
