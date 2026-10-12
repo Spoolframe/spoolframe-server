@@ -29,19 +29,27 @@ pub fn private_file(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-/// `path` opened to read without waiting: a FIFO swapped in for a file
-/// does not hold the read until something writes to it.
+/// `path` opened to read without waiting, if what it leads to is a
+/// regular file: a FIFO swapped in for a file does not hold the read until
+/// something writes to it, and a FIFO, device or directory is refused.
+/// Links are followed: a library's media may be reached through them.
 pub async fn open_nonblocking(path: &Path) -> std::io::Result<tokio::fs::File> {
-    tokio::fs::OpenOptions::new()
+    let file = tokio::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
-        .await
+        .await?;
+    if !file.metadata().await?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
 }
 
-/// `path` opened to read if it is a regular file itself: not through a
-/// symlink, which a consumer who can write to a library folder could point
-/// anywhere the server can read, and not a FIFO or a device. A subtitle
+/// `path` opened to read if it is a regular file and its last component
+/// is not a symlink, which a consumer who can write to a library folder
+/// could point anywhere the server can read; not a FIFO or a device
+/// either. O_NOFOLLOW guards the last component only: a link among the
+/// directories above it is followed, as it is for the media. A subtitle
 /// file may be replaced during its playback (P2-11), so it is checked on
 /// every open rather than pinned at the start.
 pub async fn open_regular(path: &Path) -> std::io::Result<tokio::fs::File> {
@@ -70,6 +78,17 @@ pub async fn is_regular(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn media_that_is_not_a_regular_file_is_not_opened() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-files-media").await;
+        let dir = tmp.as_ref();
+        std::fs::create_dir(dir.join("Movie.mkv")).unwrap();
+        assert!(open_nonblocking(&dir.join("Movie.mkv")).await.is_err());
+        std::fs::write(dir.join("Film.mkv"), b"film").unwrap();
+        std::os::unix::fs::symlink(dir.join("Film.mkv"), dir.join("Linked.mkv")).unwrap();
+        assert!(open_nonblocking(&dir.join("Linked.mkv")).await.is_ok());
+    }
 
     #[tokio::test]
     async fn a_symlink_to_a_regular_file_is_not_opened() {

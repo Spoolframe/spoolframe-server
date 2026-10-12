@@ -87,8 +87,10 @@ impl Measured {
                 continue;
             }
             if let Ok(meta) = std::fs::metadata(dir.join(format!("seg{n}.m4s"))) {
-                self.bytes += meta.len();
-                self.ms += ms;
+                // Durations are parsed text: a huge one saturates rather
+                // than wraps (or panics in a debug build).
+                self.bytes = self.bytes.saturating_add(meta.len());
+                self.ms = self.ms.saturating_add(ms);
             }
             self.through = Some(n);
         }
@@ -1156,6 +1158,19 @@ enum Ended {
     NotRelaunched,
 }
 
+/// Whether a run that `ended` so may have failed for decoding on the GPU:
+/// it exited non-zero, or stalled. A run ended by a signal (the kernel's
+/// OOM killer, an operator, or the server stopping it) says nothing about
+/// the GPU, and is not remembered against the file.
+fn decode_failed(ended: &Ended) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    match ended {
+        Ended::Exited(Ok(status)) => !status.success() && status.signal().is_none(),
+        Ended::Stalled => true,
+        _ => false,
+    }
+}
+
 impl Supervisor {
     async fn run(
         mut self,
@@ -1167,9 +1182,7 @@ impl Supervisor {
         // run started, never twice, whichever ffmpeg encoded it.
         let mut counted_ms = self.start_ms;
         let mut ended = self.attempt(child, stdout, stderr, &mut counted_ms).await;
-        let decode_failed = matches!(ended, Ended::Exited(Ok(status)) if !status.success())
-            || matches!(ended, Ended::Stalled);
-        if decode_failed && self.shared.hardware_decode.load(Ordering::Relaxed) {
+        if decode_failed(&ended) && self.shared.hardware_decode.load(Ordering::Relaxed) {
             if let Some(fallback) = &self.fallback
                 && self.decode_failures.remember(&fallback.file)
             {
@@ -1244,6 +1257,9 @@ impl Supervisor {
         match ended {
             Ended::Exited(Ok(status)) if status.success() => self.finish(Ok(())),
             Ended::Exited(Ok(status)) => {
+                // A failed run holds nothing: its place in the budget goes
+                // to the next job, not to the playback until it is dropped.
+                self.slot.lock().take();
                 let tail = self.shared.stderr_tail();
                 let reason = tail
                     .iter()
@@ -1258,6 +1274,7 @@ impl Supervisor {
                 }));
             }
             Ended::Exited(Err(e)) => {
+                self.slot.lock().take();
                 self.finish(Err(Failure::server(format!("cannot wait for ffmpeg: {e}"))))
             }
             Ended::NotRelaunched => {
@@ -1272,6 +1289,7 @@ impl Supervisor {
                 ))));
             }
             Ended::ScratchFull => {
+                self.slot.lock().take();
                 // Of no use now, and in the way of the other jobs for as
                 // long as the playback lives.
                 if let Err(e) = std::fs::remove_dir_all(&self.dir) {
@@ -1969,6 +1987,10 @@ pub(super) mod tests {
                  #EXTINF:{secs},\nseg{n}.m4s\n"
             )
         };
+        let mut huge = Measured::default();
+        huge.count_segments(dir, &listing(1, "1e300"));
+        huge.count_segments(dir, &listing(2, "1e300"));
+        assert_eq!(huge.ms, u64::MAX, "a huge duration saturates");
         let mut output = Measured::default();
         assert_eq!(output.bitrate(), None, "nothing written yet");
         output.count_segments(dir, &listing(1, "2.000000"));
@@ -2078,6 +2100,54 @@ pub(super) mod tests {
 
     fn stopped(pid: u32) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.contains(") T "))
+    }
+
+    /// A run killed by a signal (the OOM killer) is not a GPU decode
+    /// failure; one that exits non-zero, or stalls, may be.
+    #[test]
+    fn a_run_killed_by_a_signal_is_not_a_decode_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let killed = std::process::ExitStatus::from_raw(9);
+        let failed = std::process::ExitStatus::from_raw(1 << 8);
+        assert!(!decode_failed(&Ended::Exited(Ok(killed))));
+        assert!(decode_failed(&Ended::Exited(Ok(failed))));
+        assert!(decode_failed(&Ended::Stalled));
+        assert!(!decode_failed(&Ended::Exited(Ok(
+            std::process::ExitStatus::from_raw(0)
+        ))));
+    }
+
+    /// A run that failed, still held by its playback, gives up its slot:
+    /// the only one, here, which the next job then takes.
+    #[tokio::test]
+    async fn a_failed_encode_gives_up_its_slot() {
+        let (jobs, _dir) = jobs("fail-slot", "exit 1", 1, Duration::from_secs(60)).await;
+        let scratch = jobs.dir().to_path_buf();
+        let job = jobs
+            .start(
+                scratch.join("a/0"),
+                Vec::new(),
+                Written::Hls,
+                Load::Software,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        assert!(done(&job).await.is_err());
+        assert!(job.slot().is_none());
+        jobs.start(
+            scratch.join("b/0"),
+            Vec::new(),
+            Written::Hls,
+            Load::Software,
+            0,
+            0,
+            0,
+            None,
+        )
+        .unwrap();
     }
 
     #[tokio::test]

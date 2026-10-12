@@ -169,8 +169,11 @@ pub fn run_on(
     spec: &EncodeSpec<'_>,
     room: &dyn Fn(&Gpu) -> bool,
 ) -> Result<RunOn, NoTenBit> {
+    // Only a card that would encode is full: one that only decodes (no
+    // card encodes the codec) takes no card's slot, so its run is no
+    // spill, whatever its room.
     let run = match choose(spec, &detected.gpus, room) {
-        Some(gpu) if !room(gpu) => spill(detected, spec),
+        Some(gpu) if !room(gpu) && encodes_on(spec, gpu) => spill(detected, spec),
         gpu => RunOn::new(detected, gpu.cloned()),
     };
     if keeps_hdr(spec) && !run.encodes_ten_bit(spec) {
@@ -222,6 +225,12 @@ fn software_encode(encoders: &Encoders, software: &Encoders) -> Encoders {
 }
 
 /// `spec` with `gpu`'s detection and render node in place of its own.
+/// Whether `spec` would be encoded on `gpu`, not only decoded there.
+fn encodes_on(spec: &EncodeSpec<'_>, gpu: &Gpu) -> bool {
+    let node = gpu.vaapi_device();
+    args::share(&on_card(spec, gpu, &node)).is_some()
+}
+
 fn on_card<'a>(spec: &EncodeSpec<'a>, gpu: &'a Gpu, node: &'a Path) -> EncodeSpec<'a> {
     EncodeSpec {
         encoders: gpu.encoders(),
@@ -727,6 +736,29 @@ mod tests {
         let hevc = film("hevc", 1080);
         assert_eq!(
             picked(&gpus, &spec(&hevc, 1080, &software), &[]).as_deref(),
+            Some("0000:01:00.0")
+        );
+    }
+
+    /// A card that only decodes (none encodes the codec) has no encode
+    /// slot to be full: its run is no spill, full or not.
+    #[test]
+    fn a_decode_only_card_with_no_room_is_not_a_spill() {
+        let software = Encoders::software_baseline();
+        let gpus = vec![card(1, Hardware::Vaapi, Kind::Discrete, &[], &[HEVC])];
+        let detected = Detected {
+            encoders: Arc::new(software.clone()),
+            gpus,
+            software: Arc::new(software.clone()),
+            others: Vec::new(),
+            notes: Vec::new(),
+        };
+        let hevc = film("hevc", 1080);
+        let probe = spec(&hevc, 720, &software);
+        let run = run_on(&detected, &probe, &|_: &Gpu| false).unwrap();
+        assert!(!run.spilled());
+        assert_eq!(
+            run.gpu().map(|g| g.card().host.pci.clone()).as_deref(),
             Some("0000:01:00.0")
         );
     }

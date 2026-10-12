@@ -29,13 +29,48 @@ pub(crate) type EventStream = Arc<tokio::sync::Mutex<SendStream>>;
 /// The events stream of each connection that said `Hello`, by the
 /// connection's stable id.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct EventStreams(Arc<Mutex<HashMap<usize, EventStream>>>);
+pub(crate) struct EventStreams(Arc<Mutex<HashMap<usize, Pushing>>>);
+
+/// A connection's events stream, and how many events wait for it.
+type Pushing = (EventStream, Arc<Backlog>);
+
+/// The most events waiting for one connection's stream: a client that
+/// never reads its events stream holds every write behind flow control,
+/// and each waiting event is a task. Past it, events are dropped.
+const MAX_WAITING: usize = 32;
+
+/// How many events wait for one stream.
+#[derive(Debug, Default)]
+pub(crate) struct Backlog(std::sync::atomic::AtomicUsize);
+
+impl Backlog {
+    /// A place in the backlog, or none when [`MAX_WAITING`] already wait.
+    fn enter(self: &Arc<Self>) -> Option<Waiting> {
+        use std::sync::atomic::Ordering;
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_WAITING).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Waiting(Arc::clone(self)))
+    }
+}
+
+/// One event's place in a [`Backlog`], given back when it is written.
+struct Waiting(Arc<Backlog>);
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 impl EventStreams {
     pub(crate) fn insert(&self, id: usize, stream: SendStream) {
-        self.0
-            .lock()
-            .insert(id, Arc::new(tokio::sync::Mutex::new(stream)));
+        self.0.lock().insert(
+            id,
+            (Arc::new(tokio::sync::Mutex::new(stream)), Arc::default()),
+        );
     }
 
     pub(crate) fn remove(&self, id: usize) {
@@ -45,16 +80,29 @@ impl EventStreams {
     /// Every stream, taken out: nothing more is written on them but what
     /// the taker writes.
     pub(crate) fn drain(&self) -> Vec<EventStream> {
-        self.0.lock().drain().map(|(_, stream)| stream).collect()
+        self.0
+            .lock()
+            .drain()
+            .map(|(_, (stream, _))| stream)
+            .collect()
     }
 
     /// Write `event` on connection `id`'s stream, in the background; a
     /// connection gone gets nothing.
+    /// Past [`MAX_WAITING`] events waiting for it, the event is dropped.
     pub(crate) fn send(&self, id: usize, event: Event) {
-        let Some(stream) = self.get(id) else {
+        let Some((stream, backlog)) = self.get(id) else {
+            return;
+        };
+        let Some(waiting) = backlog.enter() else {
+            tracing::debug!(
+                max = MAX_WAITING,
+                "a client takes no events; one more is dropped"
+            );
             return;
         };
         tokio::spawn(async move {
+            let _waiting = waiting;
             let mut stream = stream.lock().await;
             if let Err(e) = write_frame(&mut *stream, &event).await {
                 tracing::debug!(error = %e, "cannot push an event");
@@ -62,7 +110,7 @@ impl EventStreams {
         });
     }
 
-    fn get(&self, id: usize) -> Option<EventStream> {
+    fn get(&self, id: usize) -> Option<Pushing> {
         self.0.lock().get(&id).cloned()
     }
 
@@ -84,11 +132,17 @@ impl Addresses {
     /// an events stream and is signed in when its turn comes. A connection
     /// signed out, or gone, gets nothing.
     pub(crate) fn tell(&self, id: usize) {
-        let Some(stream) = self.streams.get(id) else {
+        let Some((stream, backlog)) = self.streams.get(id) else {
+            return;
+        };
+        // The addresses are pushed whole each time: one dropped while the
+        // client takes no events is told again at the next change.
+        let Some(waiting) = backlog.enter() else {
             return;
         };
         let this = self.clone();
         tokio::spawn(async move {
+            let _waiting = waiting;
             let mut stream = stream.lock().await;
             if !this.connections.is_signed_in(id) {
                 return;
@@ -129,5 +183,23 @@ impl Addresses {
     async fn current(&self) -> Option<Event> {
         let told = self.told.clone();
         tokio::task::spawn_blocking(move || told.event()).await.ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stream with [`MAX_WAITING`] events waiting takes no more until
+    /// one is written.
+    #[test]
+    fn a_backlog_holds_at_most_max_waiting() {
+        let backlog = Arc::new(Backlog::default());
+        let held: Vec<Waiting> = (0..MAX_WAITING)
+            .map(|_| backlog.enter().expect("room"))
+            .collect();
+        assert!(backlog.enter().is_none());
+        drop(held);
+        assert!(backlog.enter().is_some());
     }
 }

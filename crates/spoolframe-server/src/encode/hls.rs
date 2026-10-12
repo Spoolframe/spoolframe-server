@@ -552,11 +552,15 @@ fn vtt_cues(vtt: &str) -> Vec<VttCue> {
 /// `hh:mm:ss.ttt` or `mm:ss.ttt`.
 fn parse_time(t: &str) -> Option<u64> {
     let (clock, millis) = t.split_once('.')?;
+    // Parsed text: a time too large for a u64 of milliseconds is no time.
     let mut secs = 0u64;
     for part in clock.split(':') {
-        secs = secs * 60 + part.parse::<u64>().ok()?;
+        secs = secs
+            .checked_mul(60)?
+            .checked_add(part.parse::<u64>().ok()?)?;
     }
-    Some(secs * 1000 + millis.parse::<u64>().ok()?)
+    secs.checked_mul(1000)?
+        .checked_add(millis.parse::<u64>().ok()?)
 }
 
 fn vtt_time(ms: u64) -> String {
@@ -626,6 +630,13 @@ fn audio_codec_string(codec: AudioCodec) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_vtt_time_too_large_is_no_time() {
+        assert_eq!(super::parse_time("01:02:03.004"), Some(3_723_004));
+        assert_eq!(super::parse_time("99999999999999999:00.000"), None);
+        assert_eq!(super::parse_time("18446744073709551.616"), None);
+    }
+
     use super::*;
 
     /// PX-09 B-4: the grid's size comes from ffprobe's length of the file;

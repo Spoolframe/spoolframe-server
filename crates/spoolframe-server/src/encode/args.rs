@@ -1418,7 +1418,12 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
         args.push(s("-copyts"));
     }
 
-    // Video.
+    // Video. A plan with video over a file without any is refused, as an
+    // audio track that is not there is: written as audio alone, it would
+    // play as nothing anyone asked for.
+    if spec.video.is_some() && d.video.is_none() {
+        return Err(s("video: no such stream"));
+    }
     if let (Some(video), Some(stream)) = (spec.video, &d.video) {
         match video {
             ConvertedVideo::Copy { .. } => {
@@ -1492,7 +1497,7 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                         s("-maxrate"),
                         s(rate),
                         s("-bufsize"),
-                        s(rate * 2),
+                        s(rate.saturating_mul(2)),
                     ]);
                 }
                 match &spec.output {
@@ -1842,6 +1847,15 @@ mod tests {
             unusable: Vec::new(),
             failed: Vec::new(),
         }
+    }
+
+    #[test]
+    fn video_planned_over_a_file_without_any_is_refused() {
+        let mut film = film();
+        film.video = None;
+        let enc = encoders(false);
+        let spec = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, hls());
+        assert_eq!(ffmpeg_args(&spec).unwrap_err(), "video: no such stream");
     }
 
     fn spec<'a>(

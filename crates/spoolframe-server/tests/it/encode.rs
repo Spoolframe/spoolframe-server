@@ -1044,8 +1044,10 @@ async fn asking_for_a_late_segment_first_restarts_the_encode_there() {
     let (first, end) = probe(&write(&server, "jump.mp4", &[init, last].concat()));
     assert!((first - 28.0).abs() < 0.1, "first packet at {first}");
     assert!((end - 30.0).abs() < 0.5, "last packet at {end}");
-    // The first run's files are gone; the new one is epoch 1.
-    assert!(!server.job_dir(&handle, 0).exists());
+    // The new run is epoch 1. The first is kept, stopped, for what a
+    // player buffered from it (review 2026-10-11 L6), until the next
+    // restart or switch replaces it.
+    assert!(server.job_dir(&handle, 0).exists());
     assert!(server.job_dir(&handle, 1).exists());
     client.close().await;
     server.stop().await;

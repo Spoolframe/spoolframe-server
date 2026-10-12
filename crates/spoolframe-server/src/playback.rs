@@ -1123,7 +1123,8 @@ impl Playbacks {
         };
         let (epoch, read_ms, converted_ms, mark) = match &conversion {
             None => {
-                let to = offset + sent;
+                // Bounded today by every caller, but not by this type.
+                let to = offset.saturating_add(sent);
                 let read_ms = duration_ms
                     .filter(|_| size > 0)
                     .map(|d| (u128::from(d) * u128::from(to) / u128::from(size)) as u64);
@@ -1143,7 +1144,7 @@ impl Playbacks {
                         job.epoch,
                         Some(job.reader_ms()),
                         Some(converted),
-                        Furthest::Byte(offset + sent),
+                        Furthest::Byte(offset.saturating_add(sent)),
                     ),
                 }
             }
@@ -2307,6 +2308,17 @@ mod tests {
         }
         let kept: Vec<i64> = trace.reads.iter().map(|r| r.at / minute).collect();
         assert_eq!(kept, (10..=20).collect::<Vec<_>>());
+    }
+
+    /// A read's end is saturated, not wrapped: no caller sends one past
+    /// the end of a u64, but nothing here relies on that.
+    #[test]
+    fn a_read_at_the_end_of_a_u64_saturates() {
+        let p = Playbacks::default();
+        let h = start_on(&p, "tv");
+        p.read(&h, u64::MAX, 5, None);
+        let snap = p.snapshots().remove(0);
+        assert_eq!(snap.furthest, Some(Furthest::Byte(u64::MAX)));
     }
 
     /// The furthest read is in the encode now: a seek's new epoch starts

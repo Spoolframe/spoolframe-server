@@ -46,6 +46,36 @@ pub struct UplinkSettings {
     pub wan_prefixes: Vec<Network>,
 }
 
+/// A WAN start's place, held from its admission until it starts
+/// ([`Admission::started`]) or fails (dropped).
+#[must_use]
+pub struct Admission {
+    uplink: Arc<Uplink>,
+    ticket: u64,
+    class: Class,
+    share: Option<u64>,
+}
+
+impl Admission {
+    /// The share the playback is planned with.
+    pub fn share(&self) -> Option<u64> {
+        self.share
+    }
+
+    /// The playback `handle` opened on `connection`: its place is its own.
+    pub fn started(self, handle: &str, connection: usize) {
+        self.uplink
+            .started(handle, self.class, connection, self.share);
+        // Dropped here: the place is let go after the stream holds one.
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.uplink.pending.lock().remove(&self.ticket);
+    }
+}
+
 /// `network.uplink.owner_share_percent` left out.
 pub const DEFAULT_OWNER_SHARE_PERCENT: u8 = 50;
 
@@ -170,6 +200,11 @@ pub struct Uplink {
     settings: RwLock<UplinkSettings>,
     subnets: Mutex<Option<(Instant, Vec<Network>)>>,
     streams: Mutex<HashMap<String, Stream>>,
+    /// WAN starts admitted and not yet started ([`Uplink::reserve`]): each
+    /// one's class, by its ticket. They count against `max_streams` and in
+    /// the shares, so two starts at once cannot both take the last place.
+    pending: Mutex<HashMap<u64, Class>>,
+    next_ticket: std::sync::atomic::AtomicU64,
     /// Woken at each start and end, for the shares to be worked out again
     /// once things settle. Shared, so [`tell_shares`] waits on it without
     /// holding the uplink.
@@ -195,6 +230,8 @@ impl Uplink {
             settings: RwLock::new(settings),
             subnets: Mutex::new(None),
             streams: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            next_ticket: std::sync::atomic::AtomicU64::new(0),
             changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -237,10 +274,20 @@ impl Uplink {
     /// the ones open now; `None` with no budget. `Full` when one more
     /// would be over `max_streams`.
     pub fn admit(&self, class: Class) -> Result<Option<u64>, Full> {
-        let settings = self.settings.read().clone();
         let streams = self.streams.lock();
+        let pending = self.pending.lock();
+        self.admit_locked(class, &streams, &pending)
+    }
+
+    fn admit_locked(
+        &self,
+        class: Class,
+        streams: &HashMap<String, Stream>,
+        pending: &HashMap<u64, Class>,
+    ) -> Result<Option<u64>, Full> {
+        let settings = self.settings.read().clone();
         if let Some(max) = settings.max_streams
-            && streams.len() >= max
+            && streams.len() + pending.len() >= max
         {
             return Err(Full { max });
         }
@@ -248,10 +295,31 @@ impl Uplink {
             return Ok(None);
         };
         let mut classes: Vec<Class> = streams.values().map(|s| s.class).collect();
+        classes.extend(pending.values().copied());
         classes.push(class);
         Ok(shares(budget, settings.owner_share_percent, &classes)
             .last()
             .copied())
+    }
+
+    /// [`Uplink::admit`], holding the place until the playback is
+    /// [`Admission::started`] or the admission is dropped (a start that
+    /// failed on the way): two WAN starts that arrive together at
+    /// `max_streams - 1` do not both pass.
+    pub fn reserve(self: &Arc<Self>, class: Class) -> Result<Admission, Full> {
+        let streams = self.streams.lock();
+        let mut pending = self.pending.lock();
+        let share = self.admit_locked(class, &streams, &pending)?;
+        let ticket = self
+            .next_ticket
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pending.insert(ticket, class);
+        Ok(Admission {
+            uplink: Arc::clone(self),
+            ticket,
+            class,
+            share,
+        })
     }
 
     /// A WAN playback opened, planned with `share`: the others' shares
@@ -678,6 +746,22 @@ mod tests {
         assert_eq!(up.admit(Class::Guest), Ok(Some(10 * MBIT)));
         up.started("diana", Class::Guest, 2, Some(10 * MBIT));
         assert_eq!(up.admit(Class::Owner), Ok(Some(10 * MBIT)));
+    }
+
+    /// Two WAN starts admitted together at max - 1 do not both pass: the
+    /// first holds its place until it starts or fails.
+    #[test]
+    fn a_reserved_start_holds_its_place_until_it_starts_or_fails() {
+        let up = Arc::new(uplink(20, Some(2)));
+        up.started("a", Class::Guest, 1, Some(20 * MBIT));
+        let first = up.reserve(Class::Guest).unwrap();
+        assert_eq!(first.share(), Some(10 * MBIT));
+        assert!(matches!(up.reserve(Class::Guest), Err(Full { max: 2 })));
+        drop(first);
+        let again = up.reserve(Class::Guest).unwrap();
+        again.started("b", 2);
+        assert_eq!(up.wan_streams(), 2);
+        assert!(matches!(up.reserve(Class::Guest), Err(Full { max: 2 })));
     }
 
     #[test]

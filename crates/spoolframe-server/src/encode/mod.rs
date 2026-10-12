@@ -611,6 +611,17 @@ impl Conversion {
         {
             return Ok(job.clone());
         }
+        // Behind the run: the one this rung's restart replaced may have it
+        // (a player still fetching what it buffered before a seek), as
+        // the run a switch left has for its rung.
+        if let Some((left, old)) = &current.left
+            && *left == rung
+            && n < job.first_kept()
+            && old.has_segment(n)
+            && Self::aligned(old, n)
+        {
+            return Ok(old.clone());
+        }
         let (start, from) = run_at(segments, n, rung_video(self.video, &self.ladder, rung));
         let run = self.next_run(&current, rung, start, from);
         let replaces = current.job.epoch;
@@ -625,8 +636,11 @@ impl Conversion {
             drop(next);
             return self.job_for_segment(n, rung);
         }
-        current.job.stop();
-        current.job = next;
+        // Kept, stopped, as a switch keeps the run it leaves: its files
+        // serve what the player buffered before it moved.
+        let old = std::mem::replace(&mut current.job, next);
+        old.stop();
+        current.left = Some((rung, old));
         self.log_switch(
             rung,
             rung,
@@ -1019,6 +1033,12 @@ pub fn planning_encoders(
     pick::planning(detected, &jobs.limits().video_codecs, &room)
 }
 
+/// Where the job's link `link` leads, or why that cannot be read.
+fn link_target(link: &Path) -> Result<PathBuf, JobError> {
+    std::fs::read_link(link)
+        .map_err(|e| JobError::Prepare(format!("cannot read the link {}: {e}", link.display())))
+}
+
 /// The cuts an encode of a remux ladder's lower rung (PX-21) makes: the
 /// copied original's, at the source's keyframes, so every variant has the
 /// same segments and AVPlayer can move between them at any one. The
@@ -1254,12 +1274,20 @@ fn spawn(
     let start_ms = start.map_or(0, |s| s.as_millis() as u64);
     // ffmpeg reads the job's links (PX-11 finding 34): the conversion's
     // directory, and the files they lead to, bound in confined.
+    // A link that cannot be read is a failure to prepare, said as such,
+    // not an input left out of the jail for ffmpeg to fail on in its own
+    // words. Only a VobSub's pictures may be missing: an .idx names them,
+    // other subtitle files have none.
     let vobsub_pictures = sidecar.map(|s| s.with_extension("sub"));
-    let inputs = [Some(input), sidecar, vobsub_pictures.as_deref()]
-        .into_iter()
-        .flatten()
-        .filter_map(|link| std::fs::read_link(link).ok())
-        .collect();
+    let mut inputs = vec![link_target(input)?];
+    if let Some(sidecar) = sidecar {
+        inputs.push(link_target(sidecar)?);
+    }
+    if let Some(pictures) = vobsub_pictures.as_deref()
+        && pictures.symlink_metadata().is_ok()
+    {
+        inputs.push(link_target(pictures)?);
+    }
     jobs.start(
         job_dir,
         Run {
@@ -1337,6 +1365,23 @@ fn encodes(video: Option<ConvertedVideo>, audio: Option<ConvertedAudio>) -> bool
 pub(crate) mod tests {
     use super::*;
     use spoolframe_types::VideoCodec;
+
+    /// A link that cannot be read fails the preparation, naming it.
+    #[tokio::test]
+    async fn a_link_that_cannot_be_read_fails_the_preparation() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-encode-links").await;
+        let link = dir.as_ref().join("input");
+        std::os::unix::fs::symlink("/somewhere/film.mkv", &link).unwrap();
+        assert_eq!(
+            link_target(&link).unwrap(),
+            PathBuf::from("/somewhere/film.mkv")
+        );
+        let missing = dir.as_ref().join("missing");
+        let Err(JobError::Prepare(why)) = link_target(&missing) else {
+            panic!("a missing link is a failure to prepare");
+        };
+        assert!(why.contains("missing"), "{why}");
+    }
 
     const COPY: ConvertedVideo = ConvertedVideo::Copy {
         codec: VideoCodec::H264,
@@ -1690,6 +1735,30 @@ pub(crate) mod tests {
             "the next segment started run {} after the init's {}",
             next.epoch,
             init.epoch
+        );
+    }
+
+    /// A restart on the same rung keeps the run it replaces: a segment the
+    /// player buffered from it before the seek is served from it, not by
+    /// a third run.
+    #[tokio::test]
+    async fn a_restart_keeps_the_run_it_replaces_for_what_was_buffered() {
+        let (conversion, _tmp) = resumed_ladder("spoolframe-conversion-restart-keeps").await;
+        let first = conversion.job();
+        let start = first.first_segment;
+        written(&first).await;
+        let far = start + SEGMENTS_AHEAD + 20;
+        let moved = conversion.job_for_segment(far, 3).unwrap();
+        assert!(
+            !Arc::ptr_eq(&moved, &first),
+            "a seek far ahead starts a run"
+        );
+        let back = conversion.job_for_segment(start, 3).unwrap();
+        assert!(
+            Arc::ptr_eq(&back, &first),
+            "a buffered segment started run {} after {}",
+            back.epoch,
+            moved.epoch
         );
     }
 

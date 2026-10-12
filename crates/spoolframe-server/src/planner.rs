@@ -202,8 +202,15 @@ pub fn with_quality(
     if let Some(chosen) = chosen {
         caps.max_bitrate = Some(caps.max_bitrate.map_or(chosen, |own| own.min(chosen)));
     }
+    // The app's word, held to what any stream could need: an encode's
+    // -bufsize is twice it, and u64::MAX of it is no bitrate.
+    caps.max_bitrate = caps.max_bitrate.map(|bits| bits.min(MAX_BITRATE));
     caps
 }
+
+/// The highest bitrate a client may ask for, bits per second: far over
+/// any film's, and well inside the arithmetic an encode does with it.
+pub const MAX_BITRATE: u64 = 1_000_000_000;
 
 /// The plan for a client that sent no capabilities: nothing can be
 /// promised to play.
@@ -1410,6 +1417,25 @@ mod tests {
     /// A file with no picture over the client's cap converts its audio
     /// to fit, as a film's video does; under it, it plays as it is.
     /// Review 2026-10-11 M9.
+    /// A bitrate the app asks for is held to [`MAX_BITRATE`]: u64::MAX
+    /// would overflow an encode's -bufsize.
+    #[test]
+    fn a_client_s_bitrate_is_held_to_what_any_stream_needs() {
+        let huge = Quality::Bitrate {
+            max_bitrate: u64::MAX,
+        };
+        assert_eq!(
+            with_quality(&avplayer(), huge, None).max_bitrate,
+            Some(MAX_BITRATE)
+        );
+        let mut caps = avplayer();
+        caps.max_bitrate = Some(u64::MAX);
+        assert_eq!(
+            with_quality(&caps, Quality::Original, None).max_bitrate,
+            Some(MAX_BITRATE)
+        );
+    }
+
     #[test]
     fn audio_alone_over_the_cap_is_encoded_to_fit() {
         let mut flac = dts_aac_pgs();

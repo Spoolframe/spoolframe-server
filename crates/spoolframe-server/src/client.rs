@@ -770,6 +770,11 @@ impl ClientProtocol {
                             endpoint.clone(),
                             hello,
                         );
+                        // As for the events stream: closed meanwhile, the
+                        // accept loop's closed() may have come first.
+                        if connection.close_reason().is_some() {
+                            self.services.connected.closed(connection.stable_id());
+                        }
                     }
                     if let Err(e) = self.store().note_device_platform(&endpoint, platform).await {
                         tracing::warn!(error = %e, %endpoint, "cannot keep the device's platform");
@@ -2430,15 +2435,17 @@ impl ClientProtocol {
                 // Off the LAN, this playback takes a share of the uplink
                 // (PX-46), and may be one too many.
                 let wan = (!on_lan(&state.path())).then(|| uplink_class(&who));
-                let share =
-                    match wan {
-                        Some(class) => self.services.uplink.admit(class).map_err(|full| {
-                            Error::WanStreamsFull {
-                                max: u32::try_from(full.max).unwrap_or(u32::MAX),
-                            }
-                        })?,
-                        None => None,
-                    };
+                // The place is held from here: a start that fails on the
+                // way gives it back when `admission` is dropped.
+                let admission = match wan {
+                    Some(class) => Some(self.services.uplink.reserve(class).map_err(|full| {
+                        Error::WanStreamsFull {
+                            max: u32::try_from(full.max).unwrap_or(u32::MAX),
+                        }
+                    })?),
+                    None => None,
+                };
+                let share = admission.as_ref().and_then(|a| a.share());
                 let (path, descriptor) = self.describe(&id).await?;
                 let (selection, chosen) = self
                     .selection(principal, &id, &descriptor, selection)
@@ -2581,10 +2588,8 @@ impl ClientProtocol {
                 );
                 // Counted off the LAN from now (PX-46): the others' shares
                 // follow once starts settle.
-                if let Some(class) = wan {
-                    self.services
-                        .uplink
-                        .started(&handle.0, class, connection.stable_id(), share);
+                if let Some(admission) = admission {
+                    admission.started(&handle.0, connection.stable_id());
                 }
                 // What was decided, so a playback that then goes quiet
                 // can be read from the log; the endpoint as the
@@ -4133,13 +4138,25 @@ impl ClientProtocol {
             stream.write_u8(uni::EVENTS).await?;
             Ok::<_, std::io::Error>(stream)
         };
-        match opened.await {
-            Ok(stream) => {
-                self.addresses
-                    .streams
-                    .insert(connection.stable_id(), stream);
+        // A client whose transport allows no stream of the server's own
+        // would hold its Hello's answer for the connection's life: it is
+        // given what a first frame is, then goes without events.
+        let within = self.connections.admission().first_frame;
+        match tokio::time::timeout(within, opened).await {
+            Ok(Ok(stream)) => {
+                let id = connection.stable_id();
+                self.addresses.streams.insert(id, stream);
+                // Closed while the stream opened: the accept loop's
+                // remove() may have run before this insert.
+                if connection.close_reason().is_some() {
+                    self.addresses.streams.remove(id);
+                }
             }
-            Err(e) => tracing::debug!(error = %e, "cannot open the events stream"),
+            Ok(Err(e)) => tracing::debug!(error = %e, "cannot open the events stream"),
+            Err(_) => tracing::debug!(
+                ?within,
+                "the client opened no stream for the server's events in time; it gets none"
+            ),
         }
     }
 }
@@ -4326,6 +4343,9 @@ fn remote_ip(connection: &Connection) -> Option<std::net::IpAddr> {
 /// The size of each part of a resource sent: what one write waits on.
 const RESOURCE_PART: usize = 64 << 10;
 
+/// The size of each read of a file a resource is copied from.
+const READ_PART: usize = 1 << 20;
+
 /// `bytes` written to `send`, unless the reader takes none of a part for
 /// `stall` (PX-09 finding 14): then an error, and the stream is reset.
 async fn send_unless_stalled(
@@ -4350,7 +4370,11 @@ async fn copy_unless_stalled(
     send: &mut SendStream,
     stall: Duration,
 ) -> std::io::Result<u64> {
-    let mut part = vec![0u8; RESOURCE_PART];
+    // Read in parts of READ_PART: a tokio::fs::File read is a hop to the
+    // blocking pool and a copy, so 64 KiB at a time cost 256 of them per
+    // 16 MiB. The writes still go RESOURCE_PART at a time, each with its
+    // own stall timeout.
+    let mut part = vec![0u8; READ_PART];
     let mut copied = 0u64;
     loop {
         let n = from.read(&mut part).await?;

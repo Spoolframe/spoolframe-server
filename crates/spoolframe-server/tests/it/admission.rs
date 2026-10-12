@@ -258,6 +258,50 @@ async fn a_stream_whose_first_frame_stalls_is_reset_and_the_connection_stays() {
     server.stop().await;
 }
 
+/// A client whose transport allows no stream of the server's own gets its
+/// Hello answered all the same, without events, once the server has given
+/// the events stream what a first frame is (review 2026-10-11 L13).
+#[tokio::test]
+async fn a_client_that_takes_no_server_stream_still_has_its_hello_answered() {
+    use iroh::endpoint::{QuicTransportConfig, presets};
+    let server = server_with(
+        "no-uni",
+        Admission {
+            first_frame: Duration::from_millis(200),
+            ..Admission::default()
+        },
+    )
+    .await;
+    let transport = QuicTransportConfig::builder()
+        .max_concurrent_uni_streams(VarInt::from_u32(0))
+        .build();
+    let endpoint = iroh::Endpoint::builder(presets::Minimal)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .transport_config(transport)
+        .bind()
+        .await
+        .unwrap();
+    let conn = endpoint
+        .connect(server.server.addr(), spoolframe_protocol::CLIENT_ALPN)
+        .await
+        .unwrap();
+    let client = support::TestClient {
+        endpoint,
+        conn,
+        instance: Default::default(),
+        controls: Default::default(),
+    };
+    let answer = tokio::time::timeout(AT_ONCE, client.hello_as(None))
+        .await
+        .expect("the Hello was never answered");
+    assert!(
+        matches!(answer, Response::Ok(Reply::ServerInfo(_))),
+        "{answer:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
 fn login(username: &str, password: &str) -> Request {
     Request::LoginPassword(LoginPassword {
         username: username.into(),
