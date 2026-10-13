@@ -1219,7 +1219,8 @@ mod tests {
     }
 
     /// On a host with amdgpu render nodes: the ioctl answers, for the
-    /// device sysfs names. Nothing to check on a host without one. On the
+    /// device sysfs names. Nothing to check on a host without one, nor for
+    /// a card whose render node is not in this /dev. On the
     /// dev machine: the RX 7900 XTX (744c) is not an APU, the 7950X3D's
     /// Raphael iGPU (164e) is.
     #[test]
@@ -1228,6 +1229,16 @@ mod tests {
             let (Some(render), "amdgpu") = (&card.render, card.driver.as_str()) else {
                 continue;
             };
+            // A container sees the host's sysfs, so the card, but /dev
+            // holds only the nodes it was given.
+            if !render.exists() {
+                eprintln!(
+                    "skipped {:04x}: sysfs names {}, which is not here",
+                    card.device_id,
+                    render.display()
+                );
+                continue;
+            }
             let info =
                 AmdgpuDevInfo::read(render).unwrap_or_else(|e| panic!("{}: {e}", render.display()));
             assert_eq!(
