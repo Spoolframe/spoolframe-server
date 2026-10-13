@@ -223,11 +223,9 @@ serde_json = "1"
 thiserror = "2"
 anyhow = "1"
 
-# Server configuration is UCL, as in kiln and steward. From the coldsteel
-# registry — the crates.io `uclicious` is a stale 0.1.x. Not a path dep: the
-# subflake is copied to the store without its siblings, so `../uclicious`
-# would not exist in the nix build.
-uclicious = { version = "0.10.1", registry = "coldsteel" }
+# Server configuration is UCL, as in kiln and steward. From crates.io, so a
+# build needs no private registry.
+uclicious = "0.10.1"
 
 # Reads the workspace graph for the license-boundary test.
 cargo_metadata = "0.23"

@@ -33,9 +33,8 @@
     fonts = ["Outfit" "Figtree" "JetBrains Mono" "Bricolage Grotesque"];
   };
 
-  # lib.cleanSource (not a .rs/.toml filter) so `.cargo/config.toml` — which
-  # declares the coldsteel registry for vendoring — is kept in the build source.
-  # Less what .gitignore leaves out: in a checkout with no .git (a jj
+  # lib.cleanSource (not a .rs/.toml filter): the web UI's assets, CSS and
+  # migrations are build inputs too. Less what .gitignore leaves out: in a checkout with no .git (a jj
   # workspace) cleanSource kept every build's target/ and fuzz/'s corpus,
   # some 27 GB copied per build, and a server rebuilt whenever they changed.
   # fuzz/ is its own workspace, not a member.

@@ -1,4 +1,0 @@
-# Cross-project deps (uclicious) come from the coldsteel registry. Declared here
-# so offline/sandboxed builds (crane, CI) can resolve the registry index.
-[registries.coldsteel]
-index = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"

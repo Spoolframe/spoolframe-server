@@ -34,15 +34,8 @@
         system,
         ...
       }: let
-        craneLibBase = inputs.crane.mkLib pkgs;
-        # Teach crane how to download crates from the coldsteel sparse registry
-        # (where first-party deps like uclicious live). Reads are anonymous.
-        craneLib = craneLibBase.appendCrateRegistries [
-          (craneLibBase.registryFromSparse {
-            indexUrl = "https://cargo.coldsteel.casa/api/v1/crates/";
-            configSha256 = "sha256-HqSvh8XOBRcuVdl0VYapaNbQfPXNgjiZOG0oe17zziA=";
-          })
-        ];
+        # Every crate comes from crates.io, so crane needs no extra registry.
+        craneLib = inputs.crane.mkLib pkgs;
         # Named versions, not ports' floating `dioxus-cli`: dx, the dioxus
         # crate and wasm-bindgen move together, and dx refuses to bundle on a
         # mismatch (scribe's FD-451 found the floating one moving under it).
