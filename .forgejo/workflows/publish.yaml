@@ -31,6 +31,22 @@ jobs:
     runs-on: beefy
     steps:
       - uses: actions/checkout@v4
+      # crates.io through the kellnr proxy on cargo.coldsteel.casa, in our
+      # CI only. Cargo does not read [source.*] from environment variables
+      # (tested), so this writes a config file in the checkout's parent:
+      # cargo reads every ancestor's .cargo/config.toml, so the build sees
+      # it while the repo stays clean (cargo publish checks that) and a
+      # public checkout keeps building against crates.io.
+      - name: Cargo through our crates.io mirror
+        run: |
+          mkdir -p ../.cargo
+          cat > ../.cargo/config.toml <<'TOML'
+          [source.crates-io]
+          replace-with = "coldsteel-mirror"
+
+          [source.coldsteel-mirror]
+          registry = "sparse+https://cargo.coldsteel.casa/api/v1/cratesio/"
+          TOML
 
       # Inside the ci profile's shell, as CI's tasks run: `cargo publish`
       # verify-builds each crate and needs the pinned toolchain.
