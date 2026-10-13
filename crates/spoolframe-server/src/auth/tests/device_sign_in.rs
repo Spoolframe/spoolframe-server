@@ -239,13 +239,15 @@ async fn an_approval_dropped_part_way_still_hands_the_session_over() {
         .sign_ins()
         .claim(&started.code, Some("phone"))
         .unwrap();
-    // Polled once, then dropped, as a request whose connection closes.
-    let approving = a.auth.approve_device(a.alice, &claim, false, None);
-    assert!(
-        tokio::time::timeout(Duration::ZERO, approving)
-            .await
-            .is_err()
-    );
+    // Polled once, then dropped, as a request whose connection closes. One
+    // poll exactly: a zero timeout also polls the timer, which may still be
+    // pending (it rounds up to the next millisecond), and the await then
+    // yields and lets the approval finish before it is dropped.
+    let mut approving = Box::pin(a.auth.approve_device(a.alice, &claim, false, None));
+    let first =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(approving.as_mut().poll(cx))).await;
+    assert!(first.is_pending());
+    drop(approving);
     let told = tokio::time::timeout(Duration::from_secs(10), tv)
         .await
         .expect("the TV is told")

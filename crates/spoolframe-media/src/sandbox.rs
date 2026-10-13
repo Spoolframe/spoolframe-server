@@ -1119,6 +1119,21 @@ fn environment(sandbox: &Inner, jail: &Jail) -> Vec<(OsString, OsString)> {
     for key in ["HOME", "TMPDIR", "XDG_CACHE_HOME"] {
         env.push((key.into(), home.clone()));
     }
+    // Under `cargo llvm-cov` the server's own binary, run here confined (the
+    // subtitle decoder), is instrumented too and writes a profile as it
+    // exits. Where the parent's LLVM_PROFILE_FILE points, and the working
+    // directory it falls back to, the jail refuses; the runtime's complaint
+    // is then the last line on stderr, which is what a failed run reports.
+    // Into the run's own directory instead. Only when the server itself has
+    // the variable: a release build never does, and no other tool reads it.
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some()
+        && let Some(dir) = jail.writes.first()
+    {
+        env.push((
+            "LLVM_PROFILE_FILE".into(),
+            dir.join("llvm-%p.profraw").into_os_string(),
+        ));
+    }
     if let Some(vulkan) = &jail.vulkan {
         // Shaders compiled again each run: a cache in the job's directory
         // would count against its scratch space and help no other job.
