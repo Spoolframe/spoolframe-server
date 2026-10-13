@@ -35,7 +35,26 @@
 
   # lib.cleanSource (not a .rs/.toml filter) so `.cargo/config.toml` — which
   # declares the coldsteel registry for vendoring — is kept in the build source.
-  src = lib.cleanSource ./..;
+  # Less what .gitignore leaves out: in a checkout with no .git (a jj
+  # workspace) cleanSource kept every build's target/ and fuzz/'s corpus,
+  # some 27 GB copied per build, and a server rebuilt whenever they changed.
+  # fuzz/ is its own workspace, not a member.
+  src = let
+    root = toString ./..;
+  in
+    lib.cleanSourceWith {
+      src = lib.cleanSource ./..;
+      filter = path: type: let
+        rel = lib.removePrefix "${root}/" (toString path);
+        base = baseNameOf path;
+      in
+        !(
+          (type == "directory" && base == "target")
+          || lib.hasPrefix ".devenv" base
+          || base == ".direnv"
+          || lib.elem rel ["fuzz" ".dev-state" "dev.ucl" "dev-server.log" "crates/spoolframe-web/dist"]
+        );
+    };
 
   commonArgs = {
     inherit src;
