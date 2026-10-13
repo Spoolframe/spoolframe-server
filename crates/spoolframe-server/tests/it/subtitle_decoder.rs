@@ -61,7 +61,14 @@ async fn read(dir: &Path, sup: &[u8]) -> TextState {
             to: SubtitleFormat::Srt,
         })
         .await;
-    tokio::time::timeout(Duration::from_secs(60), state.wait_for(TextState::finished))
+    // The pixel bomb is 1 Gi pixels of real work, about 30 s of one core
+    // in a debug build here and past 60 s under llvm-cov in CI's 4-CPU
+    // container. A wall-clock deadline guessed at that is a race with the
+    // machine's load; the bound that holds is the child's own: it is
+    // killed after Limits::DECODE's CPU seconds. Twice that in wall time
+    // is a hang, not a slow machine.
+    let hung = Duration::from_secs(2 * Limits::DECODE.cpu_secs);
+    tokio::time::timeout(hung, state.wait_for(TextState::finished))
         .await
         .expect("made or failed in time")
         .unwrap()
