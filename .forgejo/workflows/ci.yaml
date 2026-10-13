@@ -1,0 +1,149 @@
+name: CI
+
+# Adapted from foundry's ci.yaml when spoolframe left the monorepo. One
+# project at the repo root, so there is no changed-project matrix: every run
+# checks the whole workspace and builds the flake.
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+
+env:
+  CI: "true"
+  # devenv / cargo / nix draw progress bars when stdout looks like a TTY,
+  # and the runner muddies that detection; flatten the output.
+  TERM: dumb
+  NO_COLOR: "1"
+  # Every Nix input is on github.com. Anonymous API calls share the
+  # runner's public IP and hit GitHub's 60 req/h limit under bursty CI
+  # load. GH_PAT is a read-only PAT.
+  NIX_CONFIG: "access-tokens = github.com=${{ secrets.GH_PAT }}"
+
+# Forgejo blocks a job forever when a job in its `needs` produced zero
+# instances (a skipped `if:`). Neither job here is conditional, so `notify`
+# can depend on both.
+jobs:
+  check:
+    name: "check"
+    runs-on: beefy
+    # The LAN tests (crates/spoolframe-server/tests/it/lan.rs) run in a
+    # private network namespace: `unshare` then `ip`. Under podman's default
+    # seccomp profile unshare(CLONE_NEWUSER) needs CAP_SYS_ADMIN, so the
+    # job's container gets it (as foundry's check job did). No `image:`:
+    # the `beefy` label's default image still applies.
+    container:
+      options: --cap-add SYS_ADMIN --security-opt seccomp=unconfined
+    # Forgejo injects ACTIONS_ID_TOKEN_REQUEST_* only with this flag.
+    enable-openid-connect: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tool versions
+        run: |
+          nix --version
+          devenv --version
+
+      # Each phase runs inside the ci profile's shell, so devenv's generated
+      # files (.config/nextest.toml) exist before a task reads them. Default
+      # step semantics stop at the first failing phase.
+      #
+      # ci:static runs spoolframe:licenses first (scripts/check-licenses.sh:
+      # cargo deny over the server, the SDK and the fuzz workspace), then
+      # clippy for the host and for wasm32.
+      - name: ci:static
+        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
+        run: devenv --no-tui tasks run --profile ci ci:static
+
+      # ci:style runs spoolframe:tailwind-fresh first (the committed
+      # stylesheet matches a fresh Tailwind build), then rustfmt.
+      - name: ci:style
+        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
+        run: devenv --no-tui tasks run --profile ci ci:style
+
+      - name: ci:test
+        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
+        run: devenv --no-tui tasks run --profile ci ci:test
+
+      - name: Publish JUnit results
+        if: always()
+        uses: actions/action-junit-report@v4
+        with:
+          report_paths: target/nextest/ci/junit.xml
+          check_name: tests
+          fail_on_failure: true
+          require_tests: false
+          comment: true
+          updateComment: true
+          detailed_summary: true
+
+      # Only when ci:test got as far as writing lcov: genhtml errors on no
+      # input and would hide the real failure.
+      - name: Setup lcov
+        if: github.event_name == 'pull_request' && hashFiles('target/lcov.info') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          LCOV_BIN=$(nix build --print-out-paths --no-link nixpkgs#lcov)/bin
+          echo "$LCOV_BIN" >> "$GITHUB_PATH"
+          "$LCOV_BIN/genhtml" --version | head -1
+
+      - name: Coverage report
+        if: github.event_name == 'pull_request' && hashFiles('target/lcov.info') != ''
+        uses: actions/github-actions-report-lcov@v7.0.10
+        with:
+          coverage-files: target/lcov.info
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          update-comment: true
+
+      # Pinned to v3 deliberately: v4's @actions/artifact v2 talks only to
+      # GitHub.com's backend and aborts against Forgejo.
+      - name: Upload coverage + test artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: tests
+          path: |
+            target/nextest/ci/junit.xml
+            target/lcov.info
+          if-no-files-found: ignore
+
+  # Every flake output for x86_64-linux: the server package (with the web UI
+  # bundle), ffmpeg, the three docker images, the NixOS module checks
+  # (nixos-module is a VM test: the runner needs KVM, as foundry's
+  # `nix:spoolframe` job had) and the dev shell.
+  nix:
+    name: "nix"
+    runs-on: beefy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tool versions
+        run: |
+          nix --version
+          om --version
+
+      - name: om ci run
+        run: om ci run --systems x86_64-linux .
+
+  notify:
+    name: "notify"
+    needs: [check, nix]
+    if: always()
+    runs-on: smol
+    steps:
+      - name: Discord status (check)
+        uses: actions/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          status: ${{ needs.check.result }}
+          title: "spoolframe-server ci: check"
+
+      - name: Discord status (nix)
+        uses: actions/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          status: ${{ needs.nix.result }}
+          title: "spoolframe-server ci: nix"
