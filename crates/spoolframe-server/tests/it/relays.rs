@@ -328,14 +328,29 @@ async fn a_device_with_only_the_key_finds_the_server_through_its_record() {
     };
     let server = TestServer::start_with(support::fresh_dir("pkarr-found").await, options).await;
     assert_eq!(server.server.told().lookup(), Some(lookup.to_string()));
-    // Published once it has its home relay.
+    // Published once it has its home relay. iroh publishes what it knows
+    // as soon as it binds, and the server publishes no private address:
+    // on a host with none public (a CI container) that first record names
+    // nothing at all, and a device that reads it finds no way to the
+    // server. So the wait is for the record that names the relay, its TXT
+    // `relay=http://127.0.0.1:port/` in the signed DNS packet.
+    let relay_attr = format!("relay={}", iroh::RelayUrl::from(url.clone()));
+    let names_relay = || {
+        record.lock().as_ref().is_some_and(|r| {
+            r.windows(relay_attr.len())
+                .any(|w| w == relay_attr.as_bytes())
+        })
+    };
     let published = tokio::time::timeout(Duration::from_secs(10), async {
-        while record.lock().is_none() {
+        while !names_relay() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await;
-    assert!(published.is_ok(), "nothing was published");
+    assert!(
+        published.is_ok(),
+        "no record naming {relay_attr} was published"
+    );
     let link = Invite {
         server: server.server.id().to_string(),
         lookup: Some(lookup.to_string()),
