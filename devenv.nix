@@ -174,6 +174,57 @@ in {
   # CI's phases: `devenv --profile ci tasks run ci:static ci:style ci:test`
   # (.forgejo/workflows/ci.yaml runs exactly these). The tools they call
   # live in the profile, so a plain `devenv shell` stays lean.
+  # Coldsteel's own infrastructure: crates.io through the kellnr proxy on
+  # cargo.coldsteel.casa, and kache, the shared compiler cache in the
+  # Garage bucket. Not for anyone else's machine: CI extends it, and so does
+  # the user's own account on every machine (profiles.user.andoriyu), so a
+  # public checkout never touches either.
+  profiles.coldsteel.module = {pkgs, ...}: let
+    kacheConfig = (pkgs.formats.toml {}).generate "kache.toml" {
+      cache.remote = {
+        type = "s3";
+        bucket = "kache";
+        endpoint = "https://s3.coldsteel.casa";
+        region = "garage";
+      };
+    };
+  in {
+    packages = [pkgs.kache];
+    env = {
+      RUSTC_WRAPPER = "kache";
+      KACHE_CONFIG = "${kacheConfig}";
+    };
+    # The mirror is a cargo config file: cargo does not read [source.*]
+    # from environment variables (tested). It goes in cargo's home, never
+    # the repo (cargo publish wants a clean tree), and a home config that
+    # already replaces crates.io is left alone. kache's Garage credentials
+    # are rendered by vault-agent on hosts and runners; without them kache
+    # caches locally only.
+    enterShell = ''
+      cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
+      if ! grep -qs '^\[source.crates-io\]' "$cargo_home/config.toml"; then
+        mkdir -p "$cargo_home"
+        cat >> "$cargo_home/config.toml" <<'TOML'
+      [source.crates-io]
+      replace-with = "coldsteel-mirror"
+
+      [source.coldsteel-mirror]
+      registry = "sparse+https://cargo.coldsteel.casa/api/v1/cratesio/"
+      TOML
+      fi
+      unset cargo_home
+      kache_env="''${KACHE_CREDENTIALS_FILE:-/run/kache/s3.env}"
+      if [ -r "$kache_env" ]; then
+        set -a
+        . "$kache_env"
+        set +a
+      fi
+      unset kache_env
+    '';
+  };
+  profiles.user.andoriyu.extends = ["coldsteel"];
+
+  profiles.ci.extends = ["coldsteel"];
   profiles.ci.module = {pkgs, ...}: {
     # devenv's automatic cachix setup fails under a pure flake eval and an
     # untrusted runner user; substituters are configured on the runner host.

@@ -44,28 +44,6 @@ jobs:
           if [ -n "$GH_PAT" ]; then
             echo "NIX_CONFIG=access-tokens = github.com=$GH_PAT" >> "$GITHUB_ENV"
           fi
-      # crates.io through the kellnr proxy on cargo.coldsteel.casa, in our
-      # CI only. Cargo does not read [source.*] from environment variables
-      # (tested), so this writes it into cargo's home config: the repo
-      # stays clean (cargo publish checks that) and a public checkout keeps
-      # building against crates.io. The checkout's parent is not writable
-      # in the job's container. A home config that already replaces
-      # crates.io (a host runner's own) is left alone.
-      - name: Cargo through our crates.io mirror
-        run: |
-          home="${CARGO_HOME:-$HOME/.cargo}"
-          mkdir -p "$home"
-          if grep -qs '^\[source.crates-io\]' "$home/config.toml"; then
-            echo "$home/config.toml already replaces crates.io; left as it is"
-            exit 0
-          fi
-          cat >> "$home/config.toml" <<'TOML'
-          [source.crates-io]
-          replace-with = "coldsteel-mirror"
-
-          [source.coldsteel-mirror]
-          registry = "sparse+https://cargo.coldsteel.casa/api/v1/cratesio/"
-          TOML
 
       - name: Tool versions
         run: |
@@ -92,6 +70,13 @@ jobs:
       - name: ci:test
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
         run: devenv --no-tui tasks run --profile ci ci:test
+
+      # kache (the coldsteel profile, devenv.nix) queues uploads in a daemon,
+      # and the job's container may go before it drains them.
+      - name: kache flush
+        if: always()
+        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
+        run: kache daemon stop || true
 
       - name: Publish JUnit results
         if: always()
