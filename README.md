@@ -10,6 +10,32 @@ cargo run -p spoolframe-server -- --config dev.ucl --state-dir .dev-state
 devenv --no-tui tasks run --profile ci ci:static ci:style ci:test
 ```
 
+Everything comes from public sources: the Nix inputs from GitHub (pinned in
+`flake.lock` and `devenv.lock`; keep both on one nixpkgs revision), crates
+from crates.io. `ci:static` runs the license check
+(`scripts/check-licenses.sh`) and clippy for the host and for wasm32;
+`ci:style` checks rustfmt and that the committed Tailwind stylesheet is
+fresh; `ci:test` runs nextest under llvm-cov. The LAN tests need
+unprivileged user namespaces (`unshare`).
+
+### CI and publishing
+
+`.forgejo/workflows/ci.yaml` runs the three `ci:*` tasks and
+`om ci run` (every flake output, NixOS VM test included) on pull requests
+to `master` and on pushes to it. `.forgejo/workflows/publish.yaml` runs
+`scripts/publish-changed.sh` on every push to `master`: each crate with
+`publish = ["coldsteel"]` (types, protocol, policy, client-sdk, test-dir)
+whose version is not on the Coldsteel registry yet is published, in
+dependency order. To see what it would do:
+
+```bash
+devenv shell -- scripts/publish-changed.sh .
+```
+
+A crate published there names its workspace dependencies with
+`registry = "coldsteel"` (Cargo.toml), which is why `.cargo/config.toml`
+declares the registry; building never reads it.
+
 `dev.ucl` is your own config and is not tracked: write one for your Plex
 server, paths and listeners (`cargo run -p spoolframe-server -- config
 defaults` prints every key). Without one, or without its `plex`, the server

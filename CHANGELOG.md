@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- The server and SDK live in their own repository,
+  `Spoolframe/spoolframe-server`, moved out of the foundry monorepo with
+  their history. They build from public inputs alone: Nix inputs from
+  GitHub instead of Coldsteel/molds and Coldsteel/ports (dx and
+  wasm-bindgen-cli are packaged in `nix/dioxus-cli`), and `uclicious` from
+  crates.io instead of the Coldsteel registry. CI and publishing are this
+  repository's own: on every push to master, spoolframe-types, -protocol,
+  -policy, -client-sdk and -test-dir publish to the Coldsteel registry
+  when their version is not there yet. The other crates are
+  `publish = false`.
+
 ## 0.7.0 (2026-10-12)
 
 - SDK: `Portable::rename(id, name)` renames a portable identity on this
