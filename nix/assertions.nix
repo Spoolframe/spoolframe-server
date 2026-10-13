@@ -69,6 +69,7 @@
               enable = true;
               package = pkgs.emptyDirectory;
               server.key = "0000000000000000000000000000000000000000000000000000000000000000";
+              server.addrs = ["10.10.0.6:7420"];
             }
             // settings;
         }
