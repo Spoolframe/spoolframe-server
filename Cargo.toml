@@ -90,6 +90,9 @@ password-hash = { version = "0.5", features = ["getrandom"] }
 blake3 = "1"
 # Server key fingerprints (P1-21): SHA-256, as the format specifies.
 sha2 = "0.10"
+# Tests probe a UDP port as iroh binds it: IPv6 only, which std cannot
+# ask for. The version already in the graph through tokio and netwatch.
+socket2 = "0.6"
 
 # Portable identities (P7-01). Ed25519 for the root key: the version iroh
 # already builds, so the graph carries one curve, not two. Its defaults

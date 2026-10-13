@@ -285,7 +285,7 @@ impl Stub {
 async fn until_free(addrs: &[SocketAddr]) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     for addr in addrs {
-        while let Err(err) = std::net::UdpSocket::bind(addr) {
+        while let Err(err) = probe(*addr) {
             assert!(
                 err.kind() == std::io::ErrorKind::AddrInUse
                     && tokio::time::Instant::now() < deadline,
@@ -294,6 +294,20 @@ async fn until_free(addrs: &[SocketAddr]) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
+}
+
+/// Bind `addr` as iroh does, and let it go. iroh's IPv6 socket is IPv6
+/// only; std's would be dual-stack, and so also need the IPv4 port of the
+/// same number, which any other socket on the machine may hold for as
+/// long as it likes (another test's endpoint, in CI: "[::]:59305 was
+/// never freed").
+fn probe(addr: SocketAddr) -> std::io::Result<()> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.bind(&addr.into())
 }
 
 async fn accept(endpoint: Endpoint, state: Arc<State>) {
@@ -547,4 +561,27 @@ fn answer(
         }
     };
     Response::Ok(reply)
+}
+
+/// Another socket on the machine holds the IPv4 port of the number the
+/// stub's IPv6 socket had, as another test's endpoint may: the stub still
+/// stops, as nothing of its own is left.
+#[tokio::test]
+async fn a_stub_stops_while_another_socket_holds_its_ipv6_port_on_ipv4() {
+    let (stub, _other) = loop {
+        let stub = Stub::start().await;
+        let v6 = stub
+            .bound()
+            .into_iter()
+            .find(SocketAddr::is_ipv6)
+            .expect("bound on IPv6");
+        // Taken already when the stub's own IPv4 socket has that number.
+        if let Ok(other) = std::net::UdpSocket::bind(("0.0.0.0", v6.port())) {
+            break (stub, other);
+        }
+        stub.stop().await;
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), stub.stop())
+        .await
+        .expect("stopped");
 }
