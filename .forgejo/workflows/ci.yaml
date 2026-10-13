@@ -19,18 +19,12 @@ env:
   NO_COLOR: "1"
 
 jobs:
-  check:
-    name: "check"
+  # Formatting and clippy: no tests, so no network namespace and no
+  # SYS_ADMIN. Still beefy: clippy builds the whole workspace twice (host
+  # and wasm32).
+  lint:
+    name: "lint"
     runs-on: beefy
-    # The LAN tests (crates/spoolframe-server/tests/it/lan.rs) run in a
-    # private network namespace: `unshare` then `ip`. Under podman's default
-    # seccomp profile unshare(CLONE_NEWUSER) needs CAP_SYS_ADMIN, so the
-    # job's container gets it (as foundry's check job did). No `image:`:
-    # the `beefy` label's default image still applies.
-    container:
-      options: --cap-add SYS_ADMIN --security-opt seccomp=unconfined
-    # Forgejo injects ACTIONS_ID_TOKEN_REQUEST_* only with this flag.
-    enable-openid-connect: true
     steps:
       - uses: actions/checkout@v4
       # GitHub's API limit for Nix's github: inputs: a read-only GH_PAT
@@ -54,6 +48,13 @@ jobs:
       # files (.config/nextest.toml) exist before a task reads them. Default
       # step semantics stop at the first failing phase.
       #
+      # ci:style runs spoolframe:tailwind-fresh first (the committed
+      # stylesheet matches a fresh Tailwind build), then rustfmt. It goes
+      # first: it is the cheap one.
+      - name: ci:style
+        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
+        run: devenv --no-tui tasks run --profile ci ci:style
+
       # ci:static runs spoolframe:licenses first (scripts/check-licenses.sh:
       # cargo deny over the server, the SDK and the fuzz workspace), then
       # clippy for the host and for wasm32.
@@ -61,11 +62,53 @@ jobs:
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
         run: devenv --no-tui tasks run --profile ci ci:static
 
-      # ci:style runs spoolframe:tailwind-fresh first (the committed
-      # stylesheet matches a fresh Tailwind build), then rustfmt.
-      - name: ci:style
+      # kache (the coldsteel profile, devenv.nix) queues uploads in a daemon,
+      # and the job's container may go before it drains them.
+      - name: kache flush
+        if: always()
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
-        run: devenv --no-tui tasks run --profile ci ci:style
+        run: kache daemon stop || true
+
+  # The suite in two halves, one per job, in parallel: nextest's
+  # `--partition count:N/2` (ci:test reads NEXTEST_PARTITION) deals the
+  # tests out round-robin, so each half runs once and none twice. Each job
+  # builds the whole workspace; the tests themselves are what is split.
+  test:
+    name: "test (${{ matrix.partition }}/2)"
+    runs-on: beefy
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
+    # The LAN tests (crates/spoolframe-server/tests/it/lan.rs) run in a
+    # private network namespace: `unshare` then `ip`. Under podman's default
+    # seccomp profile unshare(CLONE_NEWUSER) needs CAP_SYS_ADMIN, so the
+    # job's container gets it (as foundry's check job did). No `image:`:
+    # the `beefy` label's default image still applies.
+    container:
+      options: --cap-add SYS_ADMIN --security-opt seccomp=unconfined
+    # Forgejo injects ACTIONS_ID_TOKEN_REQUEST_* only with this flag.
+    enable-openid-connect: true
+    env:
+      NEXTEST_PARTITION: count:${{ matrix.partition }}/2
+    steps:
+      - uses: actions/checkout@v4
+      # GitHub's API limit for Nix's github: inputs: a read-only GH_PAT
+      # raises it from 60 to 5,000 requests an hour. Forgejo withholds
+      # secrets from pull_request runs, and an empty token is worse than
+      # none, so NIX_CONFIG is set only when the run has one.
+      - name: GitHub token for Nix, when this run has one
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -n "$GH_PAT" ]; then
+            echo "NIX_CONFIG=access-tokens = github.com=$GH_PAT" >> "$GITHUB_ENV"
+          fi
+
+      - name: Tool versions
+        run: |
+          nix --version
+          devenv --version
 
       - name: ci:test
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
@@ -83,43 +126,83 @@ jobs:
         uses: actions/action-junit-report@v4
         with:
           report_paths: target/nextest/ci/junit.xml
-          check_name: tests
+          check_name: tests (${{ matrix.partition }}/2)
           fail_on_failure: true
           require_tests: false
           comment: true
           updateComment: true
           detailed_summary: true
 
-      # Only when ci:test got as far as writing lcov: genhtml errors on no
-      # input and would hide the real failure.
-      - name: Setup lcov
-        if: github.event_name == 'pull_request' && hashFiles('target/lcov.info') != ''
+      # Pinned to v3 deliberately: v4's @actions/artifact v2 talks only to
+      # GitHub.com's backend and aborts against Forgejo. The coverage job
+      # below merges the two halves' lcov.
+      - name: Upload coverage + test artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: tests-${{ matrix.partition }}
+          path: |
+            target/nextest/ci/junit.xml
+            target/lcov.info
+          if-no-files-found: ignore
+
+  # One coverage report for the PR: each half's lcov covers only the tests
+  # it ran, so they are merged (lcov -a sums the hits) before the report.
+  # `always()` so a failing test still gets its coverage reported; `test`
+  # always has its two instances, so this never waits on a skipped job.
+  coverage:
+    name: "coverage"
+    needs: [test]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: beefy
+    steps:
+      # genhtml reads the sources the lcov names.
+      - uses: actions/checkout@v4
+      # GitHub's API limit for Nix's github: inputs: a read-only GH_PAT
+      # raises it from 60 to 5,000 requests an hour. Forgejo withholds
+      # secrets from pull_request runs, and an empty token is worse than
+      # none, so NIX_CONFIG is set only when the run has one.
+      - name: GitHub token for Nix, when this run has one
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -n "$GH_PAT" ]; then
+            echo "NIX_CONFIG=access-tokens = github.com=$GH_PAT" >> "$GITHUB_ENV"
+          fi
+
+      - name: Download test artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: halves
+
+      # Only the halves that got as far as writing lcov: genhtml errors on
+      # no input and would hide the real failure.
+      - name: Merge lcov
+        id: merge
         shell: bash
         run: |
           set -euo pipefail
           LCOV_BIN=$(nix build --print-out-paths --no-link nixpkgs#lcov)/bin
           echo "$LCOV_BIN" >> "$GITHUB_PATH"
           "$LCOV_BIN/genhtml" --version | head -1
+          args=()
+          for f in halves/tests-*/lcov.info; do
+            [ -s "$f" ] && args+=(-a "$f")
+          done
+          if [ "${#args[@]}" -eq 0 ]; then
+            echo "no lcov from either half"
+            exit 0
+          fi
+          mkdir -p target
+          "$LCOV_BIN/lcov" "${args[@]}" -o target/lcov.info
 
       - name: Coverage report
-        if: github.event_name == 'pull_request' && hashFiles('target/lcov.info') != ''
+        if: hashFiles('target/lcov.info') != ''
         uses: actions/github-actions-report-lcov@v7.0.10
         with:
           coverage-files: target/lcov.info
           github-token: ${{ secrets.GITHUB_TOKEN }}
           update-comment: true
-
-      # Pinned to v3 deliberately: v4's @actions/artifact v2 talks only to
-      # GitHub.com's backend and aborts against Forgejo.
-      - name: Upload coverage + test artifacts
-        if: always()
-        uses: actions/upload-artifact@v3
-        with:
-          name: tests
-          path: |
-            target/nextest/ci/junit.xml
-            target/lcov.info
-          if-no-files-found: ignore
 
   # Every flake output for x86_64-linux: the server package (with the web UI
   # bundle), ffmpeg, the three docker images, the NixOS module checks

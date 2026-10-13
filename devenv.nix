@@ -253,10 +253,18 @@ in {
         '';
       };
       # JUnit (nextest's ci profile) at target/nextest/ci/junit.xml and lcov
-      # at target/lcov.info; the workflow publishes both.
+      # at target/lcov.info; the workflow publishes both. CI splits the
+      # suite over two jobs: NEXTEST_PARTITION (e.g. count:1/2) runs only
+      # that share of the tests, and each job's lcov covers only its share.
+      # nextest has no environment variable for --partition, hence this one.
+      # Unset, the whole suite runs, as it does on a workstation.
       "ci:test" = {
         description = "Tests with nextest under llvm-cov (JUnit + lcov)";
-        exec = "cargo llvm-cov nextest --locked --profile ci --no-tests=warn --lcov --output-path target/lcov.info";
+        exec = ''
+          cargo llvm-cov nextest --locked --profile ci --no-tests=warn \
+            ''${NEXTEST_PARTITION:+--partition "$NEXTEST_PARTITION"} \
+            --lcov --output-path target/lcov.info
+        '';
       };
       "ci:audit" = {
         description = "Audit dependencies for known vulnerabilities";
