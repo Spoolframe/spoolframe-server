@@ -20,8 +20,6 @@ env:
   CI: "true"
   TERM: dumb
   NO_COLOR: "1"
-  # The devenv shell's Nix inputs are on github.com; see ci.yaml.
-  NIX_CONFIG: "access-tokens = github.com=${{ secrets.GH_PAT }}"
   # The registry itself is named in .cargo/config.toml; reads are anonymous.
   # The write token is scoped to the publish step alone, below.
 
@@ -31,16 +29,33 @@ jobs:
     runs-on: beefy
     steps:
       - uses: actions/checkout@v4
+      # GitHub's API limit for Nix's github: inputs: a read-only GH_PAT
+      # raises it from 60 to 5,000 requests an hour. Forgejo withholds
+      # secrets from pull_request runs, and an empty token is worse than
+      # none, so NIX_CONFIG is set only when the run has one.
+      - name: GitHub token for Nix, when this run has one
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -n "$GH_PAT" ]; then
+            echo "NIX_CONFIG=access-tokens = github.com=$GH_PAT" >> "$GITHUB_ENV"
+          fi
       # crates.io through the kellnr proxy on cargo.coldsteel.casa, in our
       # CI only. Cargo does not read [source.*] from environment variables
-      # (tested), so this writes a config file in the checkout's parent:
-      # cargo reads every ancestor's .cargo/config.toml, so the build sees
-      # it while the repo stays clean (cargo publish checks that) and a
-      # public checkout keeps building against crates.io.
+      # (tested), so this writes it into cargo's home config: the repo
+      # stays clean (cargo publish checks that) and a public checkout keeps
+      # building against crates.io. The checkout's parent is not writable
+      # in the job's container. A home config that already replaces
+      # crates.io (a host runner's own) is left alone.
       - name: Cargo through our crates.io mirror
         run: |
-          mkdir -p ../.cargo
-          cat > ../.cargo/config.toml <<'TOML'
+          home="${CARGO_HOME:-$HOME/.cargo}"
+          mkdir -p "$home"
+          if grep -qs '^\[source.crates-io\]' "$home/config.toml"; then
+            echo "$home/config.toml already replaces crates.io; left as it is"
+            exit 0
+          fi
+          cat >> "$home/config.toml" <<'TOML'
           [source.crates-io]
           replace-with = "coldsteel-mirror"
 
