@@ -258,11 +258,15 @@ in {
       # that share of the tests, and each job's lcov covers only its share.
       # nextest has no environment variable for --partition, hence this one.
       # Unset, the whole suite runs, as it does on a workstation.
+      # Coverage is of this repo's code only: lines a dependency's macro
+      # expands into (tokio's select!) otherwise land in the lcov under the
+      # registry's path in CARGO_HOME, which the report step cannot read.
       "ci:test" = {
         description = "Tests with nextest under llvm-cov (JUnit + lcov)";
         exec = ''
           cargo llvm-cov nextest --locked --profile ci --no-tests=warn \
             ''${NEXTEST_PARTITION:+--partition "$NEXTEST_PARTITION"} \
+            --ignore-filename-regex '/\.cargo/(registry|git)/|/rustc/' \
             --lcov --output-path target/lcov.info
         '';
       };
