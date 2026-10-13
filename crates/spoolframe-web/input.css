@@ -1,9 +1,9 @@
-@import "tailwindcss";
+@import "tailwindcss" source(none);
 
-/* Only this crate's sources. Tailwind v4 also scans the whole repository
- * for anything word-shaped, prose included, so a stray word in another
- * crate can add a rule; if `ci:style` shows a utility nothing here asked
- * for, grep the tree for that word (scribe met this). */
+/* Only this crate's sources. Left to itself Tailwind v4 scans the whole
+ * repository for anything word-shaped, prose included, so editing a
+ * README added or dropped rules ("transition" left ARCHITECTURE.md and
+ * ci:style failed); `source(none)` above turns that scan off. */
 @source "./src/**/*.rs";
 
 /* Catppuccin: Latte when the browser prefers light, Mocha when it prefers
