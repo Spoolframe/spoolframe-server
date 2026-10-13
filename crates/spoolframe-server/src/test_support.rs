@@ -19,6 +19,11 @@ use spoolframe_types::{
     MediaKind, Movie, Namespace, PersonId, PlaybackState, SearchKind, Season, Show,
 };
 
+/// The RPC request frames read as an `RpcRequest`, by every server in the
+/// process: a count only a test run alone can read as its own.
+pub static RPC_REQUEST_DECODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// The fake catalog's one image.
 pub const POSTER: &str = "/library/metadata/1/thumb/1";
 

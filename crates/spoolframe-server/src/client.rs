@@ -571,7 +571,7 @@ impl ClientProtocol {
         bytes: &[u8],
         name: &str,
     ) -> RpcReply {
-        let wire: RpcRequest = match codec::decode(bytes) {
+        let wire = match decode_request(bytes) {
             Ok(wire) => wire,
             Err(e) => {
                 return Response::Err(Error::Malformed {
@@ -584,18 +584,28 @@ impl ClientProtocol {
         // handed to its execution so it is not looked up twice (Review
         // 2026-10-11 N2.3): set below, before the execution runs.
         let known: Arc<std::sync::OnceLock<(SessionId, Who)>> = Arc::default();
+        // The request as decoded above, handed to its execution: its frame
+        // is read once (review 2026-10-12). Owned, as a mutation's
+        // execution is spawned.
         let execute = {
             let this = self.clone();
             let connection = connection.clone();
             let state = state.clone();
-            let bytes = bytes.to_vec();
             let name = name.to_owned();
-            let request = wire.envelope.request.clone();
-            let expected = wire.expected_revision;
             let known = known.clone();
-            async move {
+            move |wire: RpcRequest| async move {
+                let expected = wire.expected_revision;
+                // What the revision below is told from, kept before the
+                // request goes to its answer.
+                let request = match &wire.envelope.request {
+                    request @ (Request::ChangeQuality { .. }
+                    | Request::ChangeSubtitle { .. }
+                    | Request::SeekPlayback { .. }
+                    | Request::PlaybackRevision { .. }) => Some(request.clone()),
+                    _ => None,
+                };
                 let response = this
-                    .answer_once(&connection, &state, &bytes, &name, known.get().cloned())
+                    .answer_once(&connection, &state, wire, &name, known.get().cloned())
                     .await;
                 let playback = match (&response, request) {
                     (Response::Ok(Reply::PlaybackStarted { handle, .. }), _) => {
@@ -608,7 +618,7 @@ impl ClientProtocol {
                     // its revision stays: told as it is.
                     (
                         Response::Ok(Reply::PlaybackChanged { .. }),
-                        Request::ChangeQuality { handle, .. },
+                        Some(Request::ChangeQuality { handle, .. }),
                     ) => this
                         .services
                         .playbacks
@@ -616,15 +626,17 @@ impl ClientProtocol {
                         .map(|revision| PlaybackRevision { handle, revision }),
                     (
                         Response::Ok(Reply::PlaybackChanged { .. } | Reply::PlaybackSeeked { .. }),
-                        Request::ChangeSubtitle { handle, .. }
-                        | Request::SeekPlayback { handle, .. },
+                        Some(
+                            Request::ChangeSubtitle { handle, .. }
+                            | Request::SeekPlayback { handle, .. },
+                        ),
                     ) => Some(PlaybackRevision {
                         handle,
                         revision: expected.expect("checked by control") + 1,
                     }),
                     (
                         Response::Ok(Reply::PlaybackRevision { revision }),
-                        Request::PlaybackRevision { handle },
+                        Some(Request::PlaybackRevision { handle }),
                     ) => Some(PlaybackRevision {
                         handle,
                         revision: *revision,
@@ -637,13 +649,13 @@ impl ClientProtocol {
         if spoolframe_protocol::policy::retry_safe(&wire.envelope.request)
             || matches!(wire.envelope.request, Request::Unknown)
         {
-            return execute.await;
+            return execute(wire).await;
         }
         // Preserve the handshake error even for an old or anonymous request.
         if state.hello.get().is_none() {
             return Response::Err(Error::HandshakeRequired).into();
         }
-        let Some(operation) = wire.operation else {
+        let Some(operation) = wire.operation.clone() else {
             return Response::Err(Error::Malformed {
                 message: "mutation requires an operation ID".into(),
             })
@@ -695,8 +707,16 @@ impl ClientProtocol {
             Err(error) => return Response::Err(error).into(),
         };
         let replay = invocation.execute.is_none();
+        // What a replay below reads of the request, which its execution
+        // may take.
+        let relocked = matches!(
+            wire.envelope.request,
+            Request::UnlockProfile { .. } | Request::SetPinRequired { .. }
+        );
+        let session = wire.envelope.session.clone();
         if let Some(send) = invocation.execute {
             let operations = operations.clone();
+            let execute = execute(wire);
             tokio::spawn(async move {
                 let reply = execute.await;
                 operations.finish(
@@ -715,17 +735,8 @@ impl ClientProtocol {
         };
         // A replay can recover an outcome, but cannot restore a PIN
         // unlock from another connection or from before a profile switch.
-        if replay
-            && matches!(reply.response, Response::Ok(_))
-            && matches!(
-                wire.envelope.request,
-                Request::UnlockProfile { .. } | Request::SetPinRequired { .. }
-            )
-        {
-            let (session, _) = match self
-                .authenticate(connection, state, wire.envelope.session.clone())
-                .await
-            {
+        if replay && matches!(reply.response, Response::Ok(_)) && relocked {
+            let (session, _) = match self.authenticate(connection, state, session).await {
                 Ok(user) => user,
                 Err(error) => return Response::Err(error).into(),
             };
@@ -782,25 +793,18 @@ impl ClientProtocol {
         .into()
     }
 
-    /// `known`: the session the request names, already authenticated by
+    /// `wire`: the request as [`Self::answer`] decoded it. `known`: the
+    /// session the request names, already authenticated by
     /// [`Self::answer`] for its operation, used instead of a second look
     /// up when it is the one the request names.
     async fn answer_once(
         &self,
         connection: &Connection,
         state: &ConnectionState,
-        bytes: &[u8],
+        wire: RpcRequest,
         name: &str,
         known: Option<(SessionId, Who)>,
     ) -> Response {
-        let wire: RpcRequest = match codec::decode(bytes) {
-            Ok(envelope) => envelope,
-            Err(e) => {
-                return Response::Err(Error::Malformed {
-                    message: e.to_string(),
-                });
-            }
-        };
         let envelope = wire.envelope;
         let request = match envelope.request {
             Request::Hello(hello) => return self.hello(connection, state, hello).await,
@@ -4473,6 +4477,14 @@ fn plex_link(
         }),
         syncing,
     })
+}
+
+/// An RPC request's frame, read as the request it is: once for each
+/// request answered (review 2026-10-12).
+fn decode_request(bytes: &[u8]) -> Result<RpcRequest, codec::CodecError> {
+    #[cfg(any(test, feature = "test-support"))]
+    crate::test_support::RPC_REQUEST_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    codec::decode(bytes)
 }
 
 /// A refused request's frame, as it came in on its stream.

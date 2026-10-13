@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-catalog"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "spoolframe-types",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-media"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "easy-ffprobe",
@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-plex"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-protocol"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1528,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-types"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "serde",
  "thiserror",

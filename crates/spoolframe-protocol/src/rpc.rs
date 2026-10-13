@@ -102,6 +102,39 @@ mod tests {
         );
     }
 
+    /// Review 2026-10-12: the whole announced length was reserved as soon
+    /// as it was read, so a reply announcing 64 MiB and sending 100 bytes
+    /// held 64 MiB.
+    #[tokio::test]
+    async fn a_reply_that_stalls_holds_little_more_than_what_arrived() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+        use tokio::io::AsyncWriteExt;
+        let (mut reader, mut writer) = tokio::io::duplex(1 << 16);
+        // The largest reply announced, and 100 bytes of its first frame
+        // sent. The writer stays open: the read waits for the rest.
+        let head = [
+            (MAX_REPLY as u64).to_be_bytes().as_slice(),
+            MAX_FRAME.to_be_bytes().as_slice(),
+            &[0; 100],
+        ]
+        .concat();
+        writer.write_all(&head).await.unwrap();
+        let mut bytes = Vec::new();
+        {
+            let read = std::pin::pin!(codec::read_reply_bytes(&mut reader, &mut bytes));
+            // One poll reads all that was sent, then waits.
+            let polled = read.poll(&mut Context::from_waker(Waker::noop()));
+            assert!(polled.is_pending());
+        }
+        assert!(
+            bytes.capacity() <= 64 << 10,
+            "{} bytes held for 100 received",
+            bytes.capacity()
+        );
+        drop(writer);
+    }
+
     #[tokio::test]
     async fn oversized_and_malformed_replies_are_refused_before_allocation_or_decode() {
         for length in [0, MAX_REPLY as u64 + 1, u64::MAX] {

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.7.0 (2026-10-12)
+
+- SDK: `Portable::rename(id, name)` renames a portable identity on this
+  device. It needs no root and signs nothing; the name never goes to a
+  server. The name is trimmed; empty or over `MAX_IDENTITY_NAME` (64)
+  characters is `SdkError::InvalidInput`. `PortableIdentity` gains
+  `name_set_at` (unix seconds of the last rename, 0 for the name it was
+  made, recovered or adopted with). For a synced identity the record
+  carries the name with its `name_set_at`, and the newest rename wins on
+  every device on merge; before, a remote name was never listed and
+  overwrote a local rename in the record. Stored lists and records
+  without `name_set_at` load as 0. No wire change.
+
 - P7-09: a local account ties to any number of portable identities; an
   identity still ties to one account per server. Wire revision 15
   (`PROTOCOL_VERSION` 14 -> 15, breaking): `UserSummary.portable` is a

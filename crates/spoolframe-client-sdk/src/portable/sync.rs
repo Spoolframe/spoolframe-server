@@ -8,15 +8,17 @@
 //! [`keys::SYNCED_PREFIX`] ([`keys::is_synced`]), and nothing else:
 //!
 //! - [`keys::portable_root_synced`]: secret, the root's 32 bytes;
-//! - [`keys::portable_synced`]: data, a record of the identity: its name,
-//!   every device key revoked (however long ago), the devices issued
-//!   credentials, and its newest states.
+//! - [`keys::portable_synced`]: data, a record of the identity: the name
+//!   the user gave it, with when it was last renamed (it goes to their
+//!   own devices only, never to a server), every device key revoked
+//!   (however long ago), the devices issued credentials, and its newest
+//!   states.
 //!
 //! A keychain keeps the last write of an item, so the record is never
 //! taken as it comes: the SDK merges it with what is on this device, by
 //! union (a revoked key at its earliest, a device at its newest
-//! credential, states by [`super::heads`]), and writes the union back to
-//! both. A write from one device that overwrites another's loses nothing
+//! credential, states by [`super::heads`]; the name, the newest rename),
+//! and writes the union back to both. A write from one device that overwrites another's loses nothing
 //! for good: the other writes the union back the next time it merges.
 //! It merges before and after every root action, and on
 //! [`Portable::merge_synced`], which the app calls when the keychain says
@@ -56,7 +58,7 @@ use super::Portable;
 use super::heads::{load_heads, save_heads, take_in};
 use super::{
     IssuedCredential, PortableIdentityState, PortableRoot, PortableUserId, Revoked, RootKey, load,
-    load_issued, load_revoked, save_issued, save_revoked, unix_now,
+    load_issued, load_revoked, save, save_issued, save_revoked, unix_now,
 };
 use crate::error::SdkError;
 use crate::storage::{Storage, StorageError, keys};
@@ -93,6 +95,10 @@ pub enum RootSyncRefused {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct SyncRecord {
     name: String,
+    /// When `name` was set by a rename ([`super::PortableIdentity::name_set_at`]).
+    // compat(v1): required at the protocol reset
+    #[serde(default)]
+    name_set_at: u64,
     created_at: u64,
     #[serde(default)]
     revoked: Revoked,
@@ -271,10 +277,31 @@ impl super::Portable {
             return Ok(false);
         }
         let _saving = self.saving.lock().await;
-        let Some(entry) = load(storage).await?.into_iter().find(|e| e.id == id) else {
+        let mut saved = load(storage).await?;
+        let Some(entry) = saved.iter_mut().find(|e| e.id == id) else {
             return Ok(false);
         };
         let remote = load_synced(storage, id).await?;
+        // The newest rename wins: a newer one in the record is listed
+        // here, and a newer one here goes in the record. On a tie the
+        // record keeps its name and this device its own, as before names
+        // had a time: a name made, recovered or adopted with is 0.
+        let renamed = match &remote {
+            Some(r) if r.name_set_at > entry.name_set_at => {
+                entry.name.clone_from(&r.name);
+                entry.name_set_at = r.name_set_at;
+                true
+            }
+            _ => false,
+        };
+        let (name, name_set_at) = match &remote {
+            Some(r) if r.name_set_at >= entry.name_set_at => (r.name.clone(), r.name_set_at),
+            _ => (entry.name.clone(), entry.name_set_at),
+        };
+        let created_at = remote.as_ref().map_or(entry.created_at, |r| r.created_at);
+        if renamed {
+            save(storage, &saved).await?;
+        }
         let mut revoked = load_revoked(storage, id).await?;
         let mut issued = load_issued(storage, id).await?;
         let mut heads = load_heads(storage, id).await?;
@@ -305,8 +332,9 @@ impl super::Portable {
             save_heads(storage, id, &heads).await?;
         }
         let record = SyncRecord {
-            name: remote.as_ref().map_or(entry.name, |r| r.name.clone()),
-            created_at: remote.as_ref().map_or(entry.created_at, |r| r.created_at),
+            name,
+            name_set_at,
+            created_at,
             revoked,
             issued,
             heads,
@@ -317,7 +345,7 @@ impl super::Portable {
                 .set_data(&keys::portable_synced(&id.to_string()), Some(bytes))
                 .await?;
         }
-        Ok(changed.0 || changed.1 || changed.2)
+        Ok(renamed || changed.0 || changed.1 || changed.2)
     }
 
     /// Whether a state from the synced record is one to keep as a head:
@@ -736,6 +764,86 @@ mod tests {
         );
         phone.issue_credential(id, key(1), None).await.unwrap();
         ipad.issue_credential(id, key(2), None).await.unwrap();
+    }
+
+    /// A phone and an iPad holding one synced identity, both listing it.
+    async fn two_synced_devices() -> (
+        (Arc<MemoryStorage>, Portable),
+        (Arc<MemoryStorage>, Portable),
+        PortableUserId,
+    ) {
+        let (a_storage, phone, id, _k) = phone_with_key().await;
+        phone.enable_root_sync(id).await.unwrap();
+        let (b_storage, ipad) = device();
+        deliver(&a_storage, &b_storage, id).await;
+        ipad.adopt_synced(id, "Sam").await.unwrap();
+        ((a_storage, phone), (b_storage, ipad), id)
+    }
+
+    async fn name_of(holder: &Portable, id: PortableUserId) -> String {
+        let listed = holder.list().await.unwrap();
+        listed.into_iter().find(|e| e.id == id).unwrap().name
+    }
+
+    #[tokio::test]
+    async fn a_rename_reaches_the_other_synced_device() {
+        let ((a_storage, phone), (b_storage, ipad), id) = two_synced_devices().await;
+        phone.rename(id, "Samantha").await.unwrap();
+        deliver(&a_storage, &b_storage, id).await;
+        assert!(ipad.merge_synced(id).await.unwrap());
+        assert_eq!(name_of(&ipad, id).await, "Samantha");
+        assert_eq!(name_of(&phone, id).await, "Samantha");
+    }
+
+    /// The iPad renames after it heard of the phone's rename: its rename
+    /// is the newer, and both end with it.
+    #[tokio::test]
+    async fn a_later_rename_on_the_other_device_wins() {
+        let ((a_storage, phone), (b_storage, ipad), id) = two_synced_devices().await;
+        phone.rename(id, "Samantha").await.unwrap();
+        deliver(&a_storage, &b_storage, id).await;
+        ipad.merge_synced(id).await.unwrap();
+        ipad.rename(id, "Sammy").await.unwrap();
+        deliver(&b_storage, &a_storage, id).await;
+        phone.merge_synced(id).await.unwrap();
+        assert_eq!(name_of(&phone, id).await, "Sammy");
+        assert_eq!(name_of(&ipad, id).await, "Sammy");
+    }
+
+    /// Both rename before either hears from the other, and the keychain
+    /// keeps the older rename's record: the newer rename still wins on
+    /// both, as the device that made it writes it back.
+    #[tokio::test]
+    async fn the_newer_of_two_unheard_renames_wins_whoever_wrote_last() {
+        let ((a_storage, phone), (b_storage, ipad), id) = two_synced_devices().await;
+        let now = crate::servers::now();
+        phone.rename_at(id, "Samantha", now - 10).await.unwrap();
+        ipad.rename_at(id, "Sammy", now).await.unwrap();
+        // The phone wrote last: its record replaces the iPad's.
+        deliver(&a_storage, &b_storage, id).await;
+        ipad.merge_synced(id).await.unwrap();
+        deliver(&b_storage, &a_storage, id).await;
+        assert!(phone.merge_synced(id).await.unwrap());
+        assert_eq!(name_of(&phone, id).await, "Sammy");
+        assert_eq!(name_of(&ipad, id).await, "Sammy");
+    }
+
+    /// A record synced before names had a time still merges, its name
+    /// taken as the oldest.
+    #[tokio::test]
+    async fn a_record_synced_without_a_name_time_merges() {
+        let ((a_storage, phone), (b_storage, ipad), id) = two_synced_devices().await;
+        let old = br#"{"name":"Old","created_at":1700000000}"#.to_vec();
+        b_storage
+            .set_data(&keys::portable_synced(&id.to_string()), Some(old))
+            .await
+            .unwrap();
+        ipad.merge_synced(id).await.unwrap();
+        // A rename beats the record's untimed name.
+        ipad.rename(id, "New").await.unwrap();
+        deliver(&b_storage, &a_storage, id).await;
+        phone.merge_synced(id).await.unwrap();
+        assert_eq!(name_of(&phone, id).await, "New");
     }
 
     #[tokio::test]

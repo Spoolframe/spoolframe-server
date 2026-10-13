@@ -260,12 +260,26 @@ pub(crate) enum DeviceKey {
     Pending,
 }
 
+/// The longest name [`Portable::rename`] takes, in characters, once
+/// trimmed. Generous for a person's name or a label like "Work", short
+/// enough for a list row.
+pub const MAX_IDENTITY_NAME: usize = 64;
+
 /// A portable identity this device holds the root of.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableIdentity {
     pub id: PortableUserId,
-    /// What the user called it on this device; theirs alone, never sent.
+    /// What the user calls it ([`Portable::rename`]); theirs alone, never
+    /// sent to a server. With its root synced it goes, in the synced
+    /// record, to the user's own devices only, and the newest name
+    /// ([`Self::name_set_at`]) is the one every device lists.
     pub name: String,
+    /// Unix seconds: when [`Self::name`] was last set by a rename, here or
+    /// on another synced device. 0 for the name it was made, recovered or
+    /// adopted with, so any rename beats that one.
+    // compat(v1): required at the protocol reset
+    #[serde(default)]
+    pub name_set_at: u64,
     /// Unix seconds: made, or first recovered, here.
     pub created_at: u64,
     /// Whether its root is here now, as [`Portable::list`] found it: this
@@ -422,6 +436,52 @@ impl Portable {
         saved.retain(|entry| entry.id != id);
         save(storage, &saved).await?;
         tracing::info!(%id, "forgot a portable identity");
+        Ok(())
+    }
+
+    /// Call identity `id` `name` (trimmed) from now on. Needs no root and
+    /// signs nothing: the name is the user's own and goes to no server.
+    /// With its root synced, the new name goes to the user's other
+    /// devices in the synced record, and the newest rename wins there.
+    /// An empty name, or one longer than [`MAX_IDENTITY_NAME`]
+    /// characters, is [`SdkError::InvalidInput`]; one not listed here is
+    /// [`SdkError::UnknownIdentity`]. The name it has already changes
+    /// nothing.
+    pub async fn rename(&self, id: PortableUserId, name: &str) -> Result<(), SdkError> {
+        self.rename_at(id, name, now()).await
+    }
+
+    async fn rename_at(&self, id: PortableUserId, name: &str, now: u64) -> Result<(), SdkError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(SdkError::InvalidInput("the name is empty".into()));
+        }
+        if name.chars().count() > MAX_IDENTITY_NAME {
+            return Err(SdkError::InvalidInput(format!(
+                "the name is longer than {MAX_IDENTITY_NAME} characters"
+            )));
+        }
+        // The synced record first: a rename made on another device is
+        // the one this rename has to be newer than.
+        self.sync_data(id).await?;
+        let storage = self.storage.as_ref();
+        let saving = self.saving.lock().await;
+        let mut saved = load(storage).await?;
+        let entry = saved
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| SdkError::UnknownIdentity(id.to_string()))?;
+        if entry.name == name {
+            return Ok(());
+        }
+        entry.name = name.to_owned();
+        // Newer than the last, even with the clock behind it.
+        entry.name_set_at = (entry.name_set_at + 1).max(now);
+        save(storage, &saved).await?;
+        // sync_data takes the lock itself.
+        drop(saving);
+        self.sync_data(id).await?;
+        tracing::info!(%id, "renamed a portable identity");
         Ok(())
     }
 
@@ -1103,6 +1163,7 @@ impl Portable {
             saved.push(PortableIdentity {
                 id,
                 name: name.to_owned(),
+                name_set_at: 0,
                 created_at: now(),
                 has_root: true,
                 key_rooted: false,
@@ -2327,5 +2388,91 @@ mod tests {
         let given = tv.credential(id).await.unwrap().unwrap();
         let late = given.expires_at - OWN_CREDENTIAL_RENEW + 1;
         assert_eq!(tv.own_credential_at(id, late).await.unwrap(), given);
+    }
+
+    #[tokio::test]
+    async fn a_renamed_identity_is_listed_by_its_new_name() {
+        let (_, portable) = portable();
+        let (id, _) = portable.create("Steve").await.unwrap();
+        portable.rename(id, "  Stephen ").await.unwrap();
+        let listed = portable.list().await.unwrap();
+        assert_eq!((listed[0].id, listed[0].name.as_str()), (id, "Stephen"));
+    }
+
+    #[tokio::test]
+    async fn renaming_an_identity_not_here_is_unknown() {
+        let (_, portable) = portable();
+        let (other, _) = PortableRoot::generate();
+        assert_eq!(
+            portable.rename(other.id(), "Ann").await.unwrap_err(),
+            SdkError::UnknownIdentity(other.id().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_blank_name_is_refused_and_the_old_one_kept() {
+        let (_, portable) = portable();
+        let (id, _) = portable.create("Steve").await.unwrap();
+        for blank in ["", "   ", "\t\n"] {
+            assert!(
+                matches!(
+                    portable.rename(id, blank).await.unwrap_err(),
+                    SdkError::InvalidInput(_)
+                ),
+                "{blank:?}"
+            );
+        }
+        assert_eq!(portable.list().await.unwrap()[0].name, "Steve");
+    }
+
+    #[tokio::test]
+    async fn a_name_over_the_limit_is_refused() {
+        let (_, portable) = portable();
+        let (id, _) = portable.create("Steve").await.unwrap();
+        let longest = "é".repeat(MAX_IDENTITY_NAME);
+        portable.rename(id, &longest).await.unwrap();
+        assert!(matches!(
+            portable
+                .rename(id, &format!("{longest}e"))
+                .await
+                .unwrap_err(),
+            SdkError::InvalidInput(_)
+        ));
+        assert_eq!(portable.list().await.unwrap()[0].name, longest);
+    }
+
+    #[tokio::test]
+    async fn renaming_to_the_same_name_changes_nothing() {
+        let (_, portable) = portable();
+        let (id, _) = portable.create("Steve").await.unwrap();
+        portable.rename(id, "Stephen").await.unwrap();
+        let before = portable.list().await.unwrap();
+        portable.rename(id, " Stephen").await.unwrap();
+        assert_eq!(portable.list().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn each_rename_here_is_newer_than_the_one_before() {
+        let (_, portable) = portable();
+        let (id, _) = portable.create("Steve").await.unwrap();
+        assert_eq!(portable.list().await.unwrap()[0].name_set_at, 0);
+        portable.rename(id, "A").await.unwrap();
+        let first = portable.list().await.unwrap()[0].name_set_at;
+        portable.rename(id, "B").await.unwrap();
+        assert!(portable.list().await.unwrap()[0].name_set_at > first);
+    }
+
+    /// A list saved before names had a time still loads, every name at 0.
+    #[tokio::test]
+    async fn a_list_saved_without_name_times_loads() {
+        let (storage, portable) = portable();
+        let id = PortableRoot::recover(&zero_phrase()).unwrap().id();
+        let old = format!(r#"[{{"id":"{id}","name":"Ann","created_at":1700000000}}]"#);
+        storage
+            .set_data(keys::PORTABLE_IDENTITIES, Some(old.into_bytes()))
+            .await
+            .unwrap();
+        let listed = portable.list().await.unwrap();
+        assert_eq!((listed[0].name.as_str(), listed[0].name_set_at), ("Ann", 0));
     }
 }

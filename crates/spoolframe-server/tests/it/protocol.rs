@@ -318,6 +318,41 @@ async fn unauthenticated_mutations_cannot_exhaust_replay_capacity() {
     close(server, client).await;
 }
 
+/// Review 2026-10-12: `answer` read a request's frame, and the
+/// `answer_once` it ran read the same frame again. A read and a mutation
+/// are each read once.
+#[tokio::test]
+async fn a_request_s_frame_is_decoded_once() {
+    use spoolframe_server::test_support::RPC_REQUEST_DECODES;
+    use std::sync::atomic::Ordering;
+    // The count is the whole process's: only this test's server adds to it.
+    if !support::alone("protocol::a_request_s_frame_is_decoded_once") {
+        return;
+    }
+    let (server, client) = connect("decoded-once").await;
+    server.add_user("alice", "correct horse", None).await;
+    client.hello().await;
+    let session = client.login("alice", "correct horse").await;
+    let decodes = |before: usize| RPC_REQUEST_DECODES.load(Ordering::Relaxed) - before;
+
+    let before = RPC_REQUEST_DECODES.load(Ordering::Relaxed);
+    assert_eq!(
+        client.call(None, Request::Ping).await,
+        Response::Ok(Reply::Pong)
+    );
+    let ping = decodes(before);
+
+    let before = RPC_REQUEST_DECODES.load(Ordering::Relaxed);
+    assert_eq!(
+        client.call(Some(&session), Request::Logout).await,
+        Response::Ok(Reply::LoggedOut)
+    );
+    let logout = decodes(before);
+
+    assert_eq!((ping, logout), (1, 1), "decodes of (Ping, Logout)");
+    close(server, client).await;
+}
+
 /// PX-09 finding 17 (C-6): an anonymous device's Hello strings are kept
 /// and shown to approvers, so each is cut to a bound.
 #[tokio::test]

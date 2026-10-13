@@ -1057,6 +1057,7 @@ impl super::Portable {
             saved.push(PortableIdentity {
                 id,
                 name: name.to_owned(),
+                name_set_at: 0,
                 created_at: now(),
                 has_root: false,
                 key_rooted,

@@ -50,11 +50,11 @@ pub use spoolframe_protocol::pairing::PairedServer;
 pub use pairing_relay::{RelayAnswer, RelayOffer, RelayPairing};
 pub use portable::{
     CredentialError, DevicePublicKey, GuestPairing, GuestServer, HANDLE_LEN, IdentityGenesis,
-    IdentityRecord, KeyAssertion, PORTABLE_RP, PhraseError, Portable, PortableIdentity,
-    PortableIdentityState, PortableRoot, PortableUserId, RecoveryPhrase, RevokedKey, RootKey,
-    RootLocation, RootRegistration, RootSet, RootSignature, RootSigner, RootSyncRefused,
-    SecurityKey, SecurityKeyError, SoftSecurityKey, StateError, TieProof, UserDeviceCredential,
-    WebAuthnError,
+    IdentityRecord, KeyAssertion, MAX_IDENTITY_NAME, PORTABLE_RP, PhraseError, Portable,
+    PortableIdentity, PortableIdentityState, PortableRoot, PortableUserId, RecoveryPhrase,
+    RevokedKey, RootKey, RootLocation, RootRegistration, RootSet, RootSignature, RootSigner,
+    RootSyncRefused, SecurityKey, SecurityKeyError, SoftSecurityKey, StateError, TieProof,
+    UserDeviceCredential, WebAuthnError,
 };
 pub use reachability::{
     DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,

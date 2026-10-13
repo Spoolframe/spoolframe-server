@@ -76,25 +76,52 @@ pub async fn write_reply<W: AsyncWrite + Unpin, T: Serialize>(
 pub async fn read_reply<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
 ) -> Result<T, CodecError> {
+    let mut bytes = Vec::new();
+    read_reply_bytes(reader, &mut bytes).await?;
+    decode(&bytes)
+}
+
+/// A reply's bytes, read into `bytes`: kept by the caller so a test can
+/// see what was held for a reply that stalls.
+pub(crate) async fn read_reply_bytes<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    bytes: &mut Vec<u8>,
+) -> Result<(), CodecError> {
     let length = reader.read_u64().await?;
     if length == 0 || length > MAX_REPLY as u64 {
         return Err(CodecError::TooLarge { len: length });
     }
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(length as usize)
-        .map_err(|e| CodecError::Decode(e.to_string()))?;
-    while bytes.len() < length as usize {
+    let length = length as usize;
+    while bytes.len() < length {
         let chunk = reader.read_u32().await?;
-        if chunk == 0 || chunk > MAX_FRAME || chunk as usize > length as usize - bytes.len() {
+        if chunk == 0 || chunk > MAX_FRAME || chunk as usize > length - bytes.len() {
             return Err(CodecError::Decode("invalid RPC reply chunk length".into()));
         }
-        let offset = bytes.len();
-        bytes.resize(offset + chunk as usize, 0);
-        reader.read_exact(&mut bytes[offset..]).await?;
+        // Held as it arrives, a step at a time: a reply that announces
+        // 64 MiB and sends little holds little (review 2026-10-12).
+        let mut left = chunk as usize;
+        while left > 0 {
+            let offset = bytes.len();
+            let step = left.min(READ_STEP);
+            if bytes.capacity() - offset < step {
+                // Doubled as it fills, so the copies stay linear, and never
+                // past the announced length.
+                let grow = offset.max(READ_STEP).min(length - offset);
+                bytes
+                    .try_reserve_exact(grow)
+                    .map_err(|e| CodecError::Decode(e.to_string()))?;
+            }
+            bytes.resize(offset + step, 0);
+            reader.read_exact(&mut bytes[offset..]).await?;
+            left -= step;
+        }
     }
-    decode(&bytes)
+    Ok(())
 }
+
+/// The step [`read_reply`] reads a reply in, and the least its buffer
+/// grows by: it holds at most twice what arrived, or this much past it.
+const READ_STEP: usize = 64 << 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
