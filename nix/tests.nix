@@ -24,6 +24,9 @@ pkgs.testers.runNixOSTest {
   nodes.server = {
     imports = [spoolframeModule];
     environment.systemPackages = [pkgs.curl];
+    # A confinement check that passes logs at DEBUG only (main.rs,
+    # `confinement`); the script reads what it showed from the journal.
+    systemd.services.spoolframe.environment.SPOOLFRAME_LOG = "info,spoolframe_server=debug";
     # Root-only, as a real secret is: the service reads it as a credential.
     environment.etc."spoolframe-oidc-secret" = {
       text = "oidc-client-secret";
@@ -71,6 +74,9 @@ pkgs.testers.runNixOSTest {
   nodes.fresh = {
     imports = [spoolframeModule];
     environment.systemPackages = [pkgs.curl];
+    # A confinement check that passes logs at DEBUG only (main.rs,
+    # `confinement`); the script reads what it showed from the journal.
+    systemd.services.spoolframe.environment.SPOOLFRAME_LOG = "info,spoolframe_server=debug";
     services.spoolframe = {
       enable = true;
       package = spoolframePackage;
@@ -103,7 +109,7 @@ pkgs.testers.runNixOSTest {
     # PX-11 finding 34: the media tools confined, or no server.
     assert 'media.sandbox = "required";  # config file, locked' in shown, shown
     fresh.wait_until_succeeds("journalctl -u spoolframe.service | grep -q 'media tools run confined: Landlock ABI'")
-    fresh.wait_until_succeeds("journalctl -u spoolframe.service | grep -q 'a confined .*ffprobe could not read /var/lib/spoolframe'")
+    fresh.wait_until_succeeds("journalctl -u spoolframe.service | grep -q 'the media tools are confined: a test ffprobe was refused reading /var/lib/spoolframe'")
     # Its state where the module says, the service's own.
     fresh.succeed("test -s /var/lib/spoolframe/endpoint.key")
     fresh.succeed("test -s /var/lib/spoolframe/spoolframe.db")
@@ -154,17 +160,17 @@ pkgs.testers.runNixOSTest {
     confined = [line for line in journal().splitlines() if "media tools run confined" in line]
     assert confined, journal()
     print(confined[-1])
-    shown = [line for line in journal().splitlines() if "a confined" in line and "ffprobe" in line]
+    shown = [line for line in journal().splitlines() if "the media tools are confined" in line]
     assert shown, journal()
-    assert "could not read /var/lib/spoolframe nor connect to 127.0.0.1:" in shown[-1], shown[-1]
+    assert "was refused reading /var/lib/spoolframe and connecting to 127.0.0.1:" in shown[-1], shown[-1]
     for loud in ["MEDIA TOOLS RUN WITHOUT LANDLOCK", "MEDIA TOOLS RUN UNCONFINED", "MEDIA TOOLS MAY NOT BE CONFINED"]:
         assert loud not in journal(), loud
     # Finding 45: picture subtitles are decoded by the server's own binary
     # run again, confined as the tools are. At start, from inside the
     # unit, it decoded a one-cue track and was refused the state directory.
-    decoder = [line for line in journal().splitlines() if "a confined subtitle decoder" in line]
+    decoder = [line for line in journal().splitlines() if "the subtitle decoder is confined" in line]
     assert decoder, journal()
-    assert "could not write /var/lib/spoolframe" in decoder[-1], decoder[-1]
+    assert "was refused writing /var/lib/spoolframe" in decoder[-1], decoder[-1]
     assert "SUBTITLE DECODER MAY NOT WORK" not in journal()
 
     # No GPU in the VM: detection finds software encoders only.
