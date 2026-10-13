@@ -503,10 +503,32 @@ impl Memory {
     /// The bytes on this machine.
     pub fn bytes(self) -> u64 {
         static CORES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let cores = *CORES
-            .get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get() as u64));
+        let cores = *CORES.get_or_init(ffmpeg_cores);
         self.base
             .saturating_add(self.per_core.saturating_mul(cores))
+    }
+}
+
+/// The cores ffmpeg sizes its threads by: every CPU this process may run
+/// on, as `av_cpu_count` counts them with sched_getaffinity(2). Not
+/// `available_parallelism`, which also takes a cgroup's CPU quota: in a
+/// container started with `--cpus 2` on a 32-core host that says 2, while
+/// ffmpeg still starts threads for 32, and their stacks overrun a budget
+/// sized for 2 (`ff_frame_thread_encoder_init failed`, EAGAIN). The quota
+/// limits the time those threads get, not how many there are.
+fn ffmpeg_cores() -> u64 {
+    // SAFETY: an all-zero cpu_set_t is an empty set; sched_getaffinity(2)
+    // writes at most `size_of::<cpu_set_t>()` bytes into it, and CPU_COUNT
+    // only reads it.
+    let counted = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0)
+            .then(|| libc::CPU_COUNT(&set))
+    };
+    match counted {
+        Some(n) if n > 0 => n as u64,
+        // More CPUs than a cpu_set_t holds (1024), or no answer at all.
+        _ => std::thread::available_parallelism().map_or(1, |n| n.get() as u64),
     }
 }
 
@@ -1554,6 +1576,32 @@ fn refused_calls() -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::Backe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every CPU in the affinity mask, as the kernel lists it in
+    /// /proc/self/status; a CPU quota leaves the list alone. Under a quota
+    /// (`systemd-run -p CPUQuota=200%`, a container's `--cpus`)
+    /// available_parallelism says fewer; the budget must not.
+    #[test]
+    fn the_memory_budget_counts_every_cpu_ffmpeg_starts_threads_for() {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let list = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .unwrap()
+            .trim();
+        let allowed: u64 = list
+            .split(',')
+            .map(|range| match range.split_once('-') {
+                Some((a, b)) => b.parse::<u64>().unwrap() - a.parse::<u64>().unwrap() + 1,
+                None => 1,
+            })
+            .sum();
+        let per_core = Memory {
+            base: 0,
+            per_core: 1,
+        };
+        assert_eq!(per_core.bytes(), allowed, "allowed: {list}");
+    }
 
     #[test]
     fn the_filters_compile_for_this_machine() {
