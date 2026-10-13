@@ -1,20 +1,13 @@
 ---
+# Public inputs only: a fresh clone enters the shell with no SSH key and no
+# access to private infrastructure. The Rust toolchain, the ci:* tasks and
+# the wasm target that came from a shared module set are in devenv.nix.
 inputs:
-  molds:
-    url: git+ssh://forgejo@git.coldsteel.casa/Coldsteel/molds.git
   nixpkgs:
-    follows: molds/nixpkgs-unstable
-  nixpkgs-unstable:
-    follows: molds/nixpkgs-unstable
+    url: github:NixOS/nixpkgs/nixpkgs-unstable
+  # languages.rust's toolchain (devenv reads it from this input name).
   rust-overlay:
-    follows: molds/rust-overlay
-  # The web UI's tools (P3-01): `dx` and `wasm-bindgen-cli`, pinned with
-  # the `dioxus` and `wasm-bindgen` crates.
-  ports:
-    url: git+ssh://forgejo@git.coldsteel.casa/Coldsteel/ports.git
-    flake: true
-imports:
-  - molds/devenv/common
-  - molds/devenv/rust
-  # The wasm32 target, for spoolframe-web.
-  - molds/devenv/rust-wasm
+    url: github:oxalica/rust-overlay
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
