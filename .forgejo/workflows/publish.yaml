@@ -43,16 +43,3 @@ jobs:
         env:
           CARGO_REGISTRIES_COLDSTEEL_TOKEN: ${{ secrets.CARGO_REGISTRIES_COLDSTEEL_TOKEN }}
         run: scripts/publish-changed.sh --publish .
-
-  notify:
-    name: "notify"
-    needs: [publish]
-    if: always()
-    runs-on: smol
-    steps:
-      - name: Discord status (publish)
-        uses: actions/actions-status-discord@v1
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          status: ${{ needs.publish.result }}
-          title: "spoolframe-server publish"

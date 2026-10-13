@@ -22,9 +22,6 @@ env:
   # load. GH_PAT is a read-only PAT.
   NIX_CONFIG: "access-tokens = github.com=${{ secrets.GH_PAT }}"
 
-# Forgejo blocks a job forever when a job in its `needs` produced zero
-# instances (a skipped `if:`). Neither job here is conditional, so `notify`
-# can depend on both.
 jobs:
   check:
     name: "check"
@@ -127,23 +124,3 @@ jobs:
 
       - name: om ci run
         run: om ci run --systems x86_64-linux .
-
-  notify:
-    name: "notify"
-    needs: [check, nix]
-    if: always()
-    runs-on: smol
-    steps:
-      - name: Discord status (check)
-        uses: actions/actions-status-discord@v1
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          status: ${{ needs.check.result }}
-          title: "spoolframe-server ci: check"
-
-      - name: Discord status (nix)
-        uses: actions/actions-status-discord@v1
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          status: ${{ needs.nix.result }}
-          title: "spoolframe-server ci: nix"
