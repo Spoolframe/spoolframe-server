@@ -1,5 +1,5 @@
 //! The admin API server: JSON-RPC over WebSocket on TCP (ARCHITECTURE
-//! §35), as the other foundry services serve theirs. The listener's HTTP
+//! §35), as kiln and scribe serve theirs. The listener's HTTP
 //! side (the browser's sign-in, the pages) is `crate::admin_http`.
 //!
 //! On every interface by default (P3-10): passwords and session tokens

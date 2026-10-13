@@ -13,7 +13,7 @@ exclude = ["vendor"]
 version = "0.7.0"
 edition = "2024"
 authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
-repository = "https://git.coldsteel.casa/Coldsteel/foundry"
+repository = "https://git.coldsteel.casa/Spoolframe/spoolframe-server"
 
 [workspace.dependencies]
 # The server's global allocator, the one mainframe's daemons use. Built
@@ -32,17 +32,20 @@ parking_lot = "0.12.5"
 # A body shared by every upload of the uplink measurement, sliced.
 # Already in the build through reqwest and iroh.
 bytes = "1.12"
-# Internal crates
-spoolframe-types = { path = "crates/spoolframe-types" }
-spoolframe-policy = { path = "crates/spoolframe-policy" }
+# Internal crates. The ones the SDK publishes (`publish = ["coldsteel"]`:
+# types, protocol, policy, client-sdk, test-dir) carry the workspace version
+# as well, which `cargo publish` needs to turn the path into a registry
+# dependency; bump it with `workspace.package.version`.
+spoolframe-types = { path = "crates/spoolframe-types", version = "0.7.0", registry = "coldsteel" }
+spoolframe-policy = { path = "crates/spoolframe-policy", version = "0.7.0", registry = "coldsteel" }
 spoolframe-catalog = { path = "crates/spoolframe-catalog" }
 spoolframe-plex = { path = "crates/spoolframe-plex" }
 spoolframe-media = { path = "crates/spoolframe-media" }
-spoolframe-protocol = { path = "crates/spoolframe-protocol" }
+spoolframe-protocol = { path = "crates/spoolframe-protocol", version = "0.7.0", registry = "coldsteel" }
 spoolframe-admin-api = { path = "crates/spoolframe-admin-api" }
-spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk" }
+spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk", version = "0.7.0", registry = "coldsteel" }
 spoolframe-probe = { path = "crates/spoolframe-probe" }
-spoolframe-test-dir = { path = "crates/spoolframe-test-dir" }
+spoolframe-test-dir = { path = "crates/spoolframe-test-dir", version = "0.7.0", registry = "coldsteel" }
 
 # Vendored (vendor/easy-ffprobe/VENDORED.md). Only the typed model of
 # ffprobe's JSON is used.
@@ -126,7 +129,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # The software authenticator the passkey tests sign with.
 webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softtoken"] }
 
-# The admin API: JSON-RPC over WebSocket, as the other foundry services
+# The admin API: JSON-RPC over WebSocket, as kiln and scribe
 # serve theirs. Crates opt into server/client features.
 jsonrpsee = { version = "0.25", default-features = false }
 # Admin CLI password prompts.

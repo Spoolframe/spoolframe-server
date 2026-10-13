@@ -1,6 +1,6 @@
 //! What naming a request costs in heap, measured by a counting allocator.
 //!
-//! A binary of its own (docs/agent_guide/integration_test_binaries.md): a
+//! A binary of its own (one test binary per crate is the rule elsewhere): a
 //! `#[global_allocator]` is process-wide. The count is kept per thread, so
 //! the tests here may still run at once.
 //!

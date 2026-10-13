@@ -6,6 +6,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "AGPL-3.0-or-later"
+publish = false
 
 [[bin]]
 name = "spoolframe-server"

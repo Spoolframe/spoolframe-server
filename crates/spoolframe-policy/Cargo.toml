@@ -6,6 +6,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "GPL-3.0-or-later"
+publish = ["coldsteel"]
 
 [dependencies]
 spoolframe-types = { workspace = true }
