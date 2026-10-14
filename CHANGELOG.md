@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.7.1 (2026-10-13)
+
 - The server and SDK live in their own repository,
   `Spoolframe/spoolframe-server`, moved out of the foundry monorepo with
   their history. They build from public inputs alone: Nix inputs from
